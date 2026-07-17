@@ -1641,6 +1641,23 @@ pub const RegionResult = struct {
         }
     }
 
+    /// E3 exit transfer: move every shard's stores out as an OwnedChunks
+    /// handle (shard order preserved; empty shards ride along as 0-row
+    /// chunks — the adopter appends no views for them and their stores
+    /// sweep normally). The result is left empty and safe to deinit.
+    pub fn takeOwnedChunks(self: *RegionResult) !exec.OwnedChunks {
+        const chunks = try self.alloc.alloc(exec.OwnedChunk, self.shards.len);
+        for (self.shards, chunks) |*s, *c| {
+            c.* = .{ .stores = s.cols, .rows = s.rows };
+            s.cols = &.{};
+            s.rows = 0;
+        }
+        const shards = self.shards;
+        self.shards = &.{};
+        self.alloc.free(shards);
+        return .{ .chunks = chunks, .alloc = self.alloc };
+    }
+
     pub fn totalRows(self: *const RegionResult) usize {
         var n: usize = 0;
         for (self.shards) |s| n += s.rows;
@@ -1982,6 +1999,136 @@ fn accumMaxBy(cells: []AccCell, ord_of: []const u32, ord_v: ColumnView, base: us
         else => unreachable,
     }
 }
+
+// ---------------------------------------------------------------------------
+// E3: the region as a Query operator. The staged compiler wraps it in a
+// forced materialize; Stage.ensureRun's takeOwnedChunks probe then adopts
+// the per-shard output stores zero-copy (the same seam materialize-mode
+// ParallelScan uses), so downstream MatScan / chunk machinery is unchanged.
+// Unstaged callers pull normally — one batch per non-empty shard.
+// ---------------------------------------------------------------------------
+
+pub const RegionExecOp = struct {
+    allocator: Allocator,
+    scan_schema: []const Column,
+    /// Owned; drained by the run and released immediately after it.
+    sources: []exec.Query,
+    entry_derived: []const compute_mod.Derived,
+    prog: *const Program,
+    opts: DriverOpts,
+    /// Plan-owned pool for repeated executions; null = one-shot.
+    pool: ?*RegionPool,
+    /// Compile-time output row bound (the scan's upper bound; a region
+    /// never invents rows beyond TVF appends — callers pass their best
+    /// estimate, it only sizes downstream buffers).
+    upper_rows: u64,
+    result: ?RegionResult = null,
+    emit_shard: usize = 0,
+    views_buf: []ColumnView,
+
+    pub fn create(
+        allocator: Allocator,
+        scan_schema: []const Column,
+        sources: []exec.Query,
+        entry_derived: []const compute_mod.Derived,
+        prog: *const Program,
+        opts: DriverOpts,
+        pool: ?*RegionPool,
+        upper_rows: u64,
+    ) !exec.Query {
+        const views_buf = try allocator.alloc(ColumnView, prog.output_schema.len);
+        errdefer allocator.free(views_buf);
+        const self = try allocator.create(RegionExecOp);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .scan_schema = scan_schema,
+            .sources = sources,
+            .entry_derived = entry_derived,
+            .prog = prog,
+            .opts = opts,
+            .pool = pool,
+            .upper_rows = upper_rows,
+            .views_buf = views_buf,
+        };
+        return exec.makeQuery(allocator, self);
+    }
+
+    pub fn deinit(self: *RegionExecOp) void {
+        for (self.sources) |*s| s.deinit();
+        self.allocator.free(self.sources);
+        if (self.result) |*r| r.deinit();
+        self.allocator.free(self.views_buf);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    pub fn ensureExecuted(self: *RegionExecOp) !void {
+        if (self.result != null) return;
+        var result = try RegionResult.init(self.allocator, self.prog.output_schema, self.opts.n_shards);
+        errdefer result.deinit();
+        if (self.pool) |p| {
+            try runRegionPooled(self.scan_schema, self.sources, self.entry_derived, self.prog, self.opts, &result, p);
+        } else {
+            try runRegion(self.allocator, self.scan_schema, self.sources, self.entry_derived, self.prog, self.opts, &result);
+        }
+        // The scans' buffers are dead weight from here — release them now.
+        for (self.sources) |*s| s.deinit();
+        self.allocator.free(self.sources);
+        self.sources = &.{};
+        self.result = result;
+    }
+
+    /// Stage-adoption seam: run the region and hand the per-shard stores
+    /// over. After this the operator has nothing left to emit.
+    pub fn takeOwnedChunks(self: *RegionExecOp) !?exec.OwnedChunks {
+        try self.ensureExecuted();
+        const oc = try self.result.?.takeOwnedChunks();
+        self.emit_shard = self.opts.n_shards;
+        return oc;
+    }
+
+    pub fn next(self: *RegionExecOp) !?Batch {
+        try self.ensureExecuted();
+        const r = &self.result.?;
+        while (self.emit_shard < r.shards.len) {
+            const s = &r.shards[self.emit_shard];
+            self.emit_shard += 1;
+            if (s.rows == 0) continue;
+            for (s.cols, self.views_buf) |*c, *v| v.* = c.view();
+            return Batch{
+                .schema = self.prog.output_schema,
+                .values = self.views_buf,
+                .row_count = s.rows,
+            };
+        }
+        return null;
+    }
+
+    pub fn outputSchema(self: *RegionExecOp) []const Column {
+        return self.prog.output_schema;
+    }
+
+    pub fn addPrune(self: *RegionExecOp, pred: exec.Predicate) !void {
+        _ = self;
+        _ = pred;
+    }
+
+    pub fn stats(self: *RegionExecOp) exec.PipelineStats {
+        const rows: u64 = if (self.result) |*r| @intCast(r.totalRows()) else self.upper_rows;
+        return .{ .upper_rows = rows, .sort_state = .{ .keys = &.{}, .global = false } };
+    }
+
+    pub fn accountant(self: *RegionExecOp) ?*exec.memory.MemoryAccountant {
+        _ = self;
+        return null;
+    }
+
+    pub fn explain(self: *RegionExecOp, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        _ = self;
+        try exec.explainLine(out, allocator, depth, "RegionExec");
+    }
+};
 
 fn appendI64As(alloc: Allocator, dst: *ColumnStore, v: i64) !void {
     switch (dst.data) {
@@ -2960,6 +3107,93 @@ test "region pool: repeated runs reuse cleared state; cap evicts at release" {
     try testing.expectEqual(@as(usize, 3), result.totalRows());
     try testing.expect(pool.ex == null);
     try testing.expectEqual(@as(usize, 0), pool.retainedBytes());
+}
+
+fn tMakeRegionOp(alloc: Allocator, prog: *const Program, entry: []const Column, views: []ColumnView, rows: usize) !exec.Query {
+    const sources = try alloc.alloc(exec.Query, 1);
+    errdefer alloc.free(sources);
+    sources[0] = try single_batch.SingleBatchSource.create(alloc, .{
+        .schema = entry,
+        .values = views,
+        .row_count = rows,
+    });
+    const sort_cols_static = struct {
+        const cols = [_]OrderCol{.{ .col = 0, .kind = .string }};
+    };
+    return RegionExecOp.create(alloc, entry, sources, &.{}, prog, .{
+        .n_threads = 1,
+        .n_shards = 4,
+        .key_col = 0,
+        .sort_cols = &sort_cols_static.cols,
+        .group_prefix = 1,
+    }, null, rows);
+}
+
+test "region exec op: takeOwnedChunks adoption seam and next() drain" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var stores: [3]ColumnStore = undefined;
+    stores[0] = try ColumnStore.init(alloc, .string, true);
+    stores[1] = try ColumnStore.init(alloc, .int, true);
+    stores[2] = try ColumnStore.init(alloc, .bigint, true);
+    defer for (&stores) |*c| c.deinit(alloc);
+    const K = [_]?[]const u8{ "a", "b", "a", "c" };
+    const V = [_]?i64{ 10, 20, 30, 40 };
+    for (K, V) |k, v| {
+        try tAppendStr(alloc, &stores[0], k);
+        try tAppendInt(alloc, &stores[1], 1);
+        try tAppendI64(alloc, &stores[2], v);
+    }
+    var views: [3]ColumnView = undefined;
+    for (&views, &stores) |*v, *c| v.* = c.view();
+
+    const agg_out = [_]AggOut{
+        .{ .name = "k", .kind = .{ .first = 0 } },
+        .{ .name = "sum_v", .kind = .{ .sum_int = 2 } },
+    };
+    const emit_cols = [_]usize{ 0, 1 };
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &.{}, .out = &agg_out } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+
+    // Adoption seam: the stage-side contract (take before any next()).
+    {
+        var q = try tMakeRegionOp(alloc, &prog, &entry, &views, K.len);
+        defer q.deinit();
+        const oc = (try q.takeOwnedChunks()).?;
+        var rows: usize = 0;
+        var sum: i64 = 0;
+        for (oc.chunks) |c| {
+            try testing.expectEqual(@as(usize, 2), c.stores.len);
+            rows += c.rows;
+            const sv = c.stores[1].view();
+            for (0..c.rows) |i| sum += sv.data.bigint[i];
+        }
+        try testing.expectEqual(@as(usize, 3), rows);
+        try testing.expectEqual(@as(i64, 100), sum);
+        exec.deinitOwnedChunks(oc);
+    }
+
+    // Pull path: one batch per non-empty shard.
+    {
+        var q = try tMakeRegionOp(alloc, &prog, &entry, &views, K.len);
+        defer q.deinit();
+        var rows: usize = 0;
+        var sum: i64 = 0;
+        while (try q.next()) |batch| {
+            rows += batch.row_count;
+            for (0..batch.row_count) |i| sum += batch.values[1].data.bigint[i];
+        }
+        try testing.expectEqual(@as(usize, 3), rows);
+        try testing.expectEqual(@as(i64, 100), sum);
+    }
 }
 
 test "appendStoreRange: contiguous copy preserves values and validity" {
