@@ -130,6 +130,37 @@ pub fn appendRowValue(alloc: Allocator, dst: *ColumnStore, v: ColumnView, i: usi
     if (dst.nulls != null) try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
 }
 
+/// LEFT-probe payload sentinel: no build-side match for this row.
+const NO_MATCH: u32 = std.math.maxInt(u32);
+
+/// Gather `ords` rows of `src` onto `dst`, appending NULL where the ordinal
+/// is NO_MATCH. `dst` must be nullable (probe payloads always are).
+fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: []const u32) !void {
+    const base = dst.rowCount();
+    switch (src.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |vals, tag| {
+            const l = &@field(dst.data, @tagName(tag));
+            try l.ensureUnusedCapacity(alloc, ords.len);
+            for (ords) |o| l.appendAssumeCapacity(if (o == NO_MATCH) 0 else vals[o]);
+        },
+        .varchar, .string, .char, .json => |sv| switch (dst.data) {
+            .varchar, .string, .char, .json => |*d| {
+                var bytes: usize = 0;
+                for (ords) |o| {
+                    if (o != NO_MATCH) bytes += sv.rowBytes(o).len;
+                }
+                try d.ensureUnusedValueCapacity(alloc, ords.len, bytes);
+                for (ords) |o| d.appendValueAssumeCapacity(if (o == NO_MATCH) "" else sv.rowBytes(o));
+            },
+            else => unreachable,
+        },
+        else => return error.UnsupportedQueryShape,
+    }
+    for (ords, 0..) |o, k| {
+        try dst.appendValidBit(alloc, base + k, o != NO_MATCH and src.isValid(o));
+    }
+}
+
 /// Append `count` copies of row `row` of `v` onto `dst` (fill_last emission).
 fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, count: usize) !void {
     if (!v.isValid(row)) return dst.appendNulls(alloc, count);
@@ -1451,20 +1482,31 @@ pub const RegionWorker = struct {
         try self.kernelOverRange(t, s, views, g_start, out.cols[0].rowCount(), out_ptrs);
     }
 
+    /// Lever 6: one hoisted-type pass resolves every row's build-side
+    /// ordinal (NO_MATCH on miss/NULL probe); payload fills are then bulk
+    /// typed gathers instead of per-row typed appends.
+    fn probeMatchOrds(sa: Allocator, map: *const KeyMap, v: ColumnView, rows: usize) ![]u32 {
+        const ords = try sa.alloc(u32, rows);
+        switch (v.data) {
+            inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| {
+                for (ords, 0..) |*slot, i| {
+                    slot.* = if (v.isValid(i)) (map.get(vals[i]) orelse NO_MATCH) else NO_MATCH;
+                }
+            },
+            else => unreachable, // build-validated int family
+        }
+        return ords;
+    }
+
     fn runHashProbe(self: *RegionWorker, h: anytype, s: anytype, fr: *Frame) !void {
         const alloc = self.alloc;
+        const sa = self.scratch.allocator();
         for (s.pay) |*c| c.clear();
+        const ords = try probeMatchOrds(sa, h.map, fr.views[h.probe], fr.rows);
 
         if (!h.inner) {
-            for (0..fr.rows) |i| {
-                const m: ?u32 = if (viewI64(fr.views[h.probe], i)) |k| h.map.get(k) else null;
-                for (h.payload, s.pay) |p, *dst| {
-                    if (m) |row| {
-                        try appendRowValue(alloc, dst, p.view, row);
-                    } else {
-                        try dst.appendNulls(alloc, 1);
-                    }
-                }
+            for (h.payload, s.pay) |p, *dst| {
+                try gatherColumnOpt(alloc, dst, p.view, ords);
             }
             for (s.pay, fr.views[fr.width..][0..s.pay.len]) |*c, *v| v.* = c.view();
             fr.width += s.pay.len;
@@ -1473,7 +1515,6 @@ pub const RegionWorker = struct {
 
         for (s.cols) |*c| c.clear();
         s.ranges.clearRetainingCapacity();
-        const sa = self.scratch.allocator();
         var keep: std.ArrayListUnmanaged(u32) = .empty;
         var match: std.ArrayListUnmanaged(u32) = .empty;
 
@@ -1481,17 +1522,16 @@ pub const RegionWorker = struct {
             keep.clearRetainingCapacity();
             match.clearRetainingCapacity();
             for (rng[0]..rng[1]) |i| {
-                const k = viewI64(fr.views[h.probe], i) orelse continue;
-                const row = h.map.get(k) orelse continue;
+                if (ords[i] == NO_MATCH) continue;
                 try keep.append(sa, @intCast(i));
-                try match.append(sa, row);
+                try match.append(sa, ords[i]);
             }
             const start: u32 = @intCast(s.cols[0].rowCount());
             for (s.cols, fr.views[0..fr.width]) |*dst, v| {
                 try scatterColumn(alloc, dst, v, keep.items);
             }
             for (h.payload, s.pay) |p, *dst| {
-                for (match.items) |row| try appendRowValue(alloc, dst, p.view, row);
+                try gatherColumnOpt(alloc, dst, p.view, match.items);
             }
             try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
         }
@@ -2205,6 +2245,59 @@ test "region program: inner probe drops non-matching sub-groups" {
     try testing.expectEqual(@as(i64, 7), sv.data.bigint[1]);
     try testing.expectEqualStrings("one", stringViewOf(nv).rowBytes(0));
     try testing.expectEqualStrings("one", stringViewOf(nv).rowBytes(1));
+}
+
+test "region program: left probe carries a NULL payload value on a matched key" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var sd = try tBuildShard(alloc, &entry);
+    defer sd.deinit(alloc);
+
+    // g=1 matches a NULL name; g=2 matches "two"; NULL/unmapped miss.
+    var names = try ColumnStore.init(alloc, .string, true);
+    defer names.deinit(alloc);
+    try tAppendStr(alloc, &names, null);
+    try tAppendStr(alloc, &names, "two");
+    var map = KeyMap.empty;
+    defer map.deinit(alloc);
+    try map.put(alloc, 1, 0);
+    try map.put(alloc, 2, 1);
+
+    const payload = [_]Payload{.{ .name = "nm", .view = names.view(), .out_type = .string }};
+    const emit_cols = [_]usize{ 1, 3 };
+    const ops = [_]RegionOp{
+        .{ .hash_probe = .{ .probe = 1, .map = &map, .payload = &payload, .inner = false } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+    var worker = try RegionWorker.init(alloc, &prog);
+    defer worker.deinit();
+    const out = try alloc.alloc(ColumnStore, prog.output_schema.len);
+    defer {
+        for (out) |*c| c.deinit(alloc);
+        alloc.free(out);
+    }
+    for (out, prog.output_schema) |*c, col| c.* = try ColumnStore.init(alloc, col.type, col.nullable);
+
+    try worker.runShard(&sd, out);
+
+    try testing.expectEqual(@as(usize, 6), out[0].rowCount());
+    const gv = out[0].view();
+    const nv = out[1].view();
+    for (0..6) |i| {
+        if (!gv.isValid(i)) {
+            try testing.expect(!nv.isValid(i)); // NULL probe misses
+        } else if (gv.data.int[i] == 1) {
+            try testing.expect(!nv.isValid(i)); // matched, payload NULL
+        } else {
+            try testing.expectEqualStrings("two", stringViewOf(nv).rowBytes(i));
+        }
+    }
 }
 
 test "region program: compute op runs the engine expression evaluator per shard" {
