@@ -423,6 +423,15 @@ pub const ShardData = struct {
     }
 };
 
+/// Per-group hook run during consolidation, after a group's rows land in
+/// `out` (rows [g_start..current)) and before its range closes — the hook
+/// may append more rows (a union-append TVF's estimates land at the group
+/// tail during the ONE gather, never via a second range copy).
+pub const GroupTail = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, out: *ShardData, g_start: u32) anyerror!void,
+};
+
 /// Gather one shard from the exchange buckets in sort order, recording the
 /// group ranges (equal leading `group_prefix` sort columns). `scratch` is a
 /// per-thread arena reset by the caller between shards.
@@ -433,6 +442,18 @@ pub fn consolidateOrdered(
     group_prefix: usize,
     out: *ShardData,
     scratch: Allocator,
+) !void {
+    return consolidateOrderedTail(ex, shard, sort_cols, group_prefix, out, scratch, null);
+}
+
+pub fn consolidateOrderedTail(
+    ex: *Exchange,
+    shard: usize,
+    sort_cols: []const OrderCol,
+    group_prefix: usize,
+    out: *ShardData,
+    scratch: Allocator,
+    tail: ?GroupTail,
 ) !void {
     const total = ex.shardRows(shard);
     try out.ensure(ex.alloc, ex.schema);
@@ -528,6 +549,7 @@ pub fn consolidateOrdered(
         for (out.cols, 0..) |*dst, ci| {
             try gatherColumn(ex.alloc, dst, views[ci * ex.n_workers ..][0..ex.n_workers], grefs[g_start..g_end]);
         }
+        if (tail) |t| try t.run(t.ctx, out, base);
         try out.ranges.append(ex.alloc, .{ base, @intCast(out.cols[0].rowCount()) });
         g_start = g_end;
     }
@@ -1042,18 +1064,25 @@ pub const RegionWorker = struct {
     /// Run the program over one consolidated shard, appending the emitted
     /// rows onto `out` (one store per program output column, caller-owned).
     pub fn runShard(self: *RegionWorker, sd: *const ShardData, out: []ColumnStore) !void {
+        return self.runShardFrom(sd, out, 0);
+    }
+
+    /// `start_op` > 0 when leading ops were pre-applied during consolidation
+    /// (the union-append tail fusion): the shard data already carries their
+    /// output and the frame schema at start_op equals the entry schema.
+    pub fn runShardFrom(self: *RegionWorker, sd: *const ShardData, out: []ColumnStore, start_op: usize) !void {
         if (sd.rows == 0) return;
         defer _ = self.scratch.reset(.retain_capacity);
 
         var fr = Frame{
             .views = self.views,
-            .width = self.prog.schema_at[0].len,
+            .width = self.prog.schema_at[start_op].len,
             .rows = sd.rows,
             .ranges = sd.ranges.items,
         };
         for (sd.cols, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
 
-        for (self.prog.ops, self.states, 0..) |op, *st, oi| {
+        for (self.prog.ops[start_op..], self.states[start_op..], start_op..) |op, *st, oi| {
             switch (op) {
                 .compute => {
                     const b = try st.compute.ptr.evalBatch(.{
@@ -1298,14 +1327,11 @@ pub const RegionWorker = struct {
 
     fn runTvfGrouped(self: *RegionWorker, t: anytype, s: *TvfState, fr: *Frame) !void {
         const alloc = self.alloc;
-        const spec: TvfSpec = t.spec;
         for (s.out) |*c| c.clear();
         s.ranges.clearRetainingCapacity();
         const sa = self.scratch.allocator();
         const out_ptrs = try sa.alloc(*ColumnStore, s.out.len);
         for (s.out, out_ptrs) |*c, *p| p.* = c;
-        const in_views = try sa.alloc(ColumnView, spec.inputs.len);
-        var kin: std.ArrayListUnmanaged(u32) = .empty;
 
         for (fr.ranges) |rng| {
             const start: u32 = @intCast(s.out[0].rowCount());
@@ -1314,27 +1340,7 @@ pub const RegionWorker = struct {
                     try appendViewRange(alloc, dst, v, rng[0], rng[1]);
                 }
             }
-
-            // Kernel-visible input: the (filtered) range, copied contiguous.
-            kin.clearRetainingCapacity();
-            if (t.input_filter) |f| {
-                for (rng[0]..rng[1]) |i| {
-                    const v = viewI64(fr.views[f.col], i) orelse continue;
-                    if (v >= f.lo and v <= f.hi) try kin.append(sa, @intCast(i));
-                }
-            } else {
-                try kin.ensureUnusedCapacity(sa, rng[1] - rng[0]);
-                for (rng[0]..rng[1]) |i| kin.appendAssumeCapacity(@intCast(i));
-            }
-
-            if (kin.items.len > 0) {
-                for (s.in_scratch) |*c| c.clear();
-                for (s.in_scratch, spec.inputs) |*dst, ci| {
-                    try scatterColumn(alloc, dst, fr.views[ci], kin.items);
-                }
-                for (s.in_scratch, in_views) |*c, *v| v.* = c.view();
-                try self.callTvf(spec, s, in_views, kin.items.len, out_ptrs, null);
-            }
+            try self.kernelOverRange(t, s, fr.views[0..fr.width], rng[0], rng[1], out_ptrs);
             try s.ranges.append(alloc, .{ start, @intCast(s.out[0].rowCount()) });
         }
 
@@ -1342,6 +1348,72 @@ pub const RegionWorker = struct {
         for (s.out, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
         fr.rows = s.out[0].rowCount();
         fr.ranges = s.ranges.items;
+    }
+
+    /// Select the kernel-visible rows of [lo,hi) per the input filter, copy
+    /// them contiguous into the op's scratch partition, and call the kernel
+    /// appending onto `out_ptrs`. Shared by the unfused per-range path and
+    /// the consolidation-tail fusion.
+    fn kernelOverRange(
+        self: *RegionWorker,
+        t: anytype,
+        s: *TvfState,
+        views: []const ColumnView,
+        lo: usize,
+        hi: usize,
+        out_ptrs: []*ColumnStore,
+    ) !void {
+        const sa = self.scratch.allocator();
+        var kin: std.ArrayListUnmanaged(u32) = .empty;
+        if (t.input_filter) |f| {
+            for (lo..hi) |i| {
+                const v = viewI64(views[f.col], i) orelse continue;
+                if (v >= f.lo and v <= f.hi) try kin.append(sa, @intCast(i));
+            }
+        } else {
+            try kin.ensureUnusedCapacity(sa, hi - lo);
+            for (lo..hi) |i| kin.appendAssumeCapacity(@intCast(i));
+        }
+        if (kin.items.len == 0) return;
+
+        for (s.in_scratch) |*c| c.clear();
+        for (s.in_scratch, t.spec.inputs) |*dst, ci| {
+            try scatterColumn(self.alloc, dst, views[ci], kin.items);
+        }
+        const in_views = try sa.alloc(ColumnView, t.spec.inputs.len);
+        for (s.in_scratch, in_views) |*c, *v| v.* = c.view();
+        try self.callTvf(t.spec, s, in_views, kin.items.len, out_ptrs, null);
+    }
+
+    /// Lever-1 fusion (general region rule): a program whose FIRST op is a
+    /// union-append grouped TVF runs it as a consolidation tail — its rows
+    /// land during the ONE gather and the interpreter starts at op 1. The
+    /// unfused path in runTvfGrouped remains for mid-program union-appends
+    /// and direct runShard callers.
+    pub fn fusedFirstTail(self: *RegionWorker) ?GroupTail {
+        if (self.prog.ops.len == 0) return null;
+        switch (self.prog.ops[0]) {
+            .tvf_grouped => |t| if (t.union_append) {
+                return .{ .ctx = self, .run = fusedTailRun };
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn fusedTailRun(ctx: *anyopaque, out: *ShardData, g_start: u32) anyerror!void {
+        const self: *RegionWorker = @ptrCast(@alignCast(ctx));
+        const t = self.prog.ops[0].tvf_grouped;
+        const s = &self.states[0].tvf;
+        const sa = self.scratch.allocator();
+        const width = self.prog.schema_at[0].len;
+        // Views taken before the kernel appends (appends may regrow the
+        // stores); they are only read during the input copy.
+        const views = try sa.alloc(ColumnView, width);
+        for (out.cols[0..width], views) |*c, *v| v.* = c.view();
+        const out_ptrs = try sa.alloc(*ColumnStore, width);
+        for (out.cols[0..width], out_ptrs) |*c, *p| p.* = c;
+        try self.kernelOverRange(t, s, views, g_start, out.cols[0].rowCount(), out_ptrs);
     }
 
     fn runHashProbe(self: *RegionWorker, h: anytype, s: anytype, fr: *Frame) !void {
@@ -1528,6 +1600,8 @@ const ShardPhase = struct {
         defer sd.deinit(alloc);
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
+        const tail = rw.fusedFirstTail();
+        const start_op: usize = if (tail != null) 1 else 0;
 
         while (true) {
             const oi = self.next.fetchAdd(1, .monotonic);
@@ -1535,9 +1609,9 @@ const ShardPhase = struct {
             const s = self.order[oi];
             if (self.ex.shardRows(s) == 0) continue;
             _ = scratch.reset(.retain_capacity);
-            try consolidateOrdered(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &sd, scratch.allocator());
+            try consolidateOrderedTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &sd, scratch.allocator(), tail);
             const out = &self.result.shards[s];
-            try rw.runShard(&sd, out.cols);
+            try rw.runShardFrom(&sd, out.cols, start_op);
             out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
         }
     }
@@ -2243,6 +2317,85 @@ test "region driver: parallel workers match serial (thread-safe allocator)" {
     // std.testing.allocator is single-threaded; the parallel claim path
     // runs on the smp allocator (no leak check — the serial twin has it).
     try tRunDriver(std.heap.smp_allocator, 3);
+}
+
+test "region driver: leading union-append TVF fuses into the consolidation gather" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+
+    var stores: [3]ColumnStore = undefined;
+    stores[0] = try ColumnStore.init(alloc, .string, true);
+    stores[1] = try ColumnStore.init(alloc, .int, true);
+    stores[2] = try ColumnStore.init(alloc, .bigint, true);
+    defer for (&stores) |*c| c.deinit(alloc);
+    const K = [_]?[]const u8{ "a", "b", "a", "c", "b", "a" };
+    const G = [_]?i32{ 1, 1, 2, 3, 1, 1 };
+    const V = [_]?i64{ 10, 20, 30, 50, 40, 60 };
+    for (K, G, V) |k, g, v| {
+        try tAppendStr(alloc, &stores[0], k);
+        try tAppendInt(alloc, &stores[1], g);
+        try tAppendI64(alloc, &stores[2], v);
+    }
+    var views: [3]ColumnView = undefined;
+    for (&views, &stores) |*v, *c| v.* = c.view();
+
+    const sources = try alloc.alloc(exec.Query, 1);
+    defer alloc.free(sources);
+    sources[0] = try single_batch.SingleBatchSource.create(alloc, .{
+        .schema = &entry,
+        .values = &views,
+        .row_count = K.len,
+    });
+    defer sources[0].deinit();
+
+    const inputs = [_]usize{ 0, 1, 2 };
+    const emit_cols = [_]usize{ 0, 1, 2 };
+    const ops = [_]RegionOp{
+        .{ .tvf_grouped = .{
+            .spec = .{ .process = tKernelEstimate, .inputs = &inputs, .out = &entry },
+            .union_append = true,
+            .input_filter = .{ .col = 2, .lo = 10, .hi = 30 },
+        } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+
+    var result = try RegionResult.init(alloc, prog.output_schema, 4);
+    defer result.deinit();
+    const sort_cols = [_]OrderCol{.{ .col = 0, .kind = .string }};
+    try runRegion(alloc, &entry, sources, &.{}, &prog, .{
+        .n_threads = 1,
+        .n_shards = 4,
+        .key_col = 0,
+        .sort_cols = &sort_cols,
+        .group_prefix = 1,
+    }, &result);
+
+    // Filter keeps v in [10,30]: "a" {10,30} -> +1 row (a,99,2);
+    // "b" {20} -> +1 row (b,99,1); "c" {} -> no kernel call.
+    try testing.expectEqual(@as(usize, 8), result.totalRows());
+    var appended: usize = 0;
+    for (result.shards) |s| {
+        if (s.rows == 0) continue;
+        const kv = s.cols[0].view();
+        const gv = s.cols[1].view();
+        const vv = s.cols[2].view();
+        for (0..s.rows) |i| {
+            if (gv.isValid(i) and gv.data.int[i] == 99) {
+                appended += 1;
+                const k = stringViewOf(kv).rowBytes(i);
+                const want: i64 = if (std.mem.eql(u8, k, "a")) 2 else 1;
+                try testing.expect(!std.mem.eql(u8, k, "c"));
+                try testing.expectEqual(want, vv.data.bigint[i]);
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), appended);
 }
 
 test "appendStoreRange: contiguous copy preserves values and validity" {
