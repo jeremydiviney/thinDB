@@ -288,6 +288,20 @@ pub fn build(b: *std.Build) void {
     const tvf_ab_step = b.step("tvf-walk-ab", "Rollforward gap-fill walk: table UDF vs 6-CTE chain, values + wall-clock (pass -Doptimize=ReleaseFast)");
     tvf_ab_step.dependOn(&run_tvf_ab.step);
 
+    // ---- rf_custom: purpose-built wayroll rollforward pipeline (task #183) ----
+    const rf_custom_mod = b.createModule(.{
+        .root_source_file = b.path("bench/rf_custom.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rf_custom_mod.addImport("thindb", thindb_mod);
+    const rf_custom_exe = b.addExecutable(.{
+        .name = "rf_custom",
+        .root_module = rf_custom_mod,
+    });
+    const rf_custom_step = b.step("rf-custom", "Build the purpose-built rollforward pipeline probe (pass -Doptimize=ReleaseFast)");
+    rf_custom_step.dependOn(&b.addInstallArtifact(rf_custom_exe, .{}).step);
+
     // ---- thindb-server executable: standalone multi-wire server -------------
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/cmd/server.zig"),
