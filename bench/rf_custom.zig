@@ -317,28 +317,78 @@ fn scanWorker(sh: *ScanShared, w: usize) void {
     };
 }
 
+/// Exchange scatter, batch-at-a-time (region mechanism): pass 1 routes each
+/// row to its shard by key hash; pass 2 appends per (shard, column) with the
+/// type dispatch hoisted out of the row loop.
 fn scanWorkerInner(sh: *ScanShared, w: usize) !void {
     const my = sh.worker_shards[w * sh.n_shards .. (w + 1) * sh.n_shards];
     var lc_buf: [512]u8 = undefined;
+    const idx_lists = try sh.alloc.alloc(std.ArrayListUnmanaged(u32), sh.n_shards);
+    defer {
+        for (idx_lists) |*l| l.deinit(sh.alloc);
+        sh.alloc.free(idx_lists);
+    }
+    for (idx_lists) |*l| l.* = .empty;
+
     while (true) {
         const i = sh.next.fetchAdd(1, .monotonic);
         if (i >= sh.scans.len) break;
         const scan = sh.scans[i];
         while (try scan.next()) |batch| {
+            for (idx_lists) |*l| l.clearRetainingCapacity();
+            const cust_v = batch.values[sh.cust_ci];
             for (0..batch.row_count) |r| {
-                const cust = strOrNull(batch.values[sh.cust_ci], r);
-                const lc: ?[]const u8 = if (cust) |cn| asciiLower(&lc_buf, cn) else null;
-                const shard = std.hash.Wyhash.hash(0x9e3779b9, lc orelse "") % sh.n_shards;
+                const cust = strOrNull(cust_v, r);
+                const lc: []const u8 = if (cust) |cn| asciiLower(&lc_buf, cn) else "";
+                const shard = std.hash.Wyhash.hash(0x9e3779b9, lc) % sh.n_shards;
+                try idx_lists[shard].append(sh.alloc, @intCast(r));
+            }
+            for (0..sh.n_shards) |shard| {
+                const rows = idx_lists[shard].items;
+                if (rows.len == 0) continue;
                 const sb = &my[shard];
                 for (0..SCAN_COLS.len) |ci| {
-                    try appendFromView(sh.alloc, &sb.cols[sh.scan_to_shard[ci]], batch.values[ci], r);
+                    try scatterColumn(sh.alloc, &sb.cols[sh.scan_to_shard[ci]], batch.values[ci], rows);
                 }
-                try sb.cols[SH.parentCustomerNumber].appendNulls(sh.alloc, 1);
-                try sb.cols[SH.parentCustomerName].appendNulls(sh.alloc, 1);
-                try appendStr(sh.alloc, &sb.cols[SH.customerNumberLC], lc);
-                sb.rows += 1;
+                try sb.cols[SH.parentCustomerNumber].appendNulls(sh.alloc, rows.len);
+                try sb.cols[SH.parentCustomerName].appendNulls(sh.alloc, rows.len);
+                const lc_store = &sb.cols[SH.customerNumberLC];
+                for (rows) |r| {
+                    const cust = strOrNull(cust_v, r);
+                    try appendStr(sh.alloc, lc_store, if (cust) |cn| asciiLower(&lc_buf, cn) else null);
+                }
+                sb.rows += rows.len;
             }
         }
+    }
+}
+
+fn scatterColumn(alloc: std.mem.Allocator, store: *ColumnStore, v: ColumnView, rows: []const u32) !void {
+    const base = store.rowCount();
+    switch (v.data) {
+        .int => |s| {
+            const l = &store.data.int;
+            try l.ensureUnusedCapacity(alloc, rows.len);
+            for (rows) |r| l.appendAssumeCapacity(s[r]);
+        },
+        .date => |s| {
+            const l = &store.data.date;
+            try l.ensureUnusedCapacity(alloc, rows.len);
+            for (rows) |r| l.appendAssumeCapacity(s[r]);
+        },
+        .varchar, .string, .char => |s| switch (store.data) {
+            .varchar, .string, .char, .json => |*d| {
+                var bytes: usize = 0;
+                for (rows) |r| bytes += s.rowBytes(r).len;
+                try d.ensureUnusedValueCapacity(alloc, rows.len, bytes);
+                for (rows) |r| d.appendValueAssumeCapacity(s.rowBytes(r));
+            },
+            else => unreachable,
+        },
+        else => unreachable,
+    }
+    if (store.nulls != null) {
+        for (rows, 0..) |r, k| try store.appendValidBit(alloc, base + k, v.isValid(r));
     }
 }
 
@@ -424,6 +474,8 @@ const Shard = struct {
     est_rows: usize = 0,
     /// After the gather-reorder: contiguous [start,end) per group.
     ranges: std.ArrayListUnmanaged([2]u32) = .empty,
+    /// union (base + estimates) row count for reporting.
+    out_rows: usize = 0,
     /// rf_currency computed columns, row-aligned with buf.
     cur: [CU.N]ColumnStore = undefined,
     /// customer_agg_by_month output (month-sorted rows per group).
@@ -610,7 +662,62 @@ const StageShared = struct {
     rate_part: *const tdb.TvfPartition,
     plan_part: *const tdb.TvfPartition,
     bc: *const Broadcasts,
+    /// Shard ids in descending row count — whales first, so the tail of the
+    /// phase is small shards, not the biggest one (region scheduler policy).
+    order: []u32,
+    /// Off = skip the p3/p5/p6 validation probes (they are checking
+    /// machinery, not query work). p15 is the query output — always on.
+    validate: bool,
+    /// Per-thread phase tick sums: 0 sortkeys 1 build(gather+estimates)
+    /// 2 currency 3 prerecords+agg 4 gapfill/updown/tail.
+    phase_ticks: [][5]u64,
 };
+
+/// Bulk gather: append `refs` rows (worker w in the top byte, bucket row in
+/// the low 24 bits) of one logical column from the per-worker bucket views
+/// into `dst` — the exchange-merge inner loop, monomorphized per type arm.
+fn gatherColumn(
+    alloc: std.mem.Allocator,
+    dst: *ColumnStore,
+    srcs: []const ColumnView,
+    refs: []const u32,
+) !void {
+    const base = dst.rowCount();
+    switch (dst.data) {
+        .int => |*l| {
+            try l.ensureUnusedCapacity(alloc, refs.len);
+            for (refs) |r| l.appendAssumeCapacity(srcs[r >> 24].data.int[r & 0xFFFFFF]);
+        },
+        .date => |*l| {
+            try l.ensureUnusedCapacity(alloc, refs.len);
+            for (refs) |r| l.appendAssumeCapacity(srcs[r >> 24].data.date[r & 0xFFFFFF]);
+        },
+        .varchar, .string, .char, .json => |*s| {
+            var bytes: usize = 0;
+            for (refs) |r| {
+                const sv = switch (srcs[r >> 24].data) {
+                    .varchar, .string, .char, .json => |x| x,
+                    else => unreachable,
+                };
+                bytes += sv.rowBytes(r & 0xFFFFFF).len;
+            }
+            try s.ensureUnusedValueCapacity(alloc, refs.len, bytes);
+            for (refs) |r| {
+                const sv = switch (srcs[r >> 24].data) {
+                    .varchar, .string, .char, .json => |x| x,
+                    else => unreachable,
+                };
+                s.appendValueAssumeCapacity(sv.rowBytes(r & 0xFFFFFF));
+            }
+        },
+        else => unreachable,
+    }
+    if (dst.nulls != null) {
+        for (refs, 0..) |r, k| {
+            try dst.appendValidBit(alloc, base + k, srcs[r >> 24].isValid(r & 0xFFFFFF));
+        }
+    }
+}
 
 fn stageWorker(sh: *StageShared, w: usize) void {
     stageWorkerInner(sh, w) catch |e| {
@@ -628,56 +735,75 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
     defer state_arena.deinit();
     var worker_state: ?*anyopaque = null;
 
+    const prof = thindb.exec.prof;
+    var est_scratch: [SH.N]ColumnStore = undefined;
+    for (&est_scratch, SHARD_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+    defer for (&est_scratch) |*c| c.deinit(alloc);
+
     while (true) {
-        const s = sh.next.fetchAdd(1, .monotonic);
-        if (s >= sh.shards.len) break;
+        const oi = sh.next.fetchAdd(1, .monotonic);
+        if (oi >= sh.order.len) break;
+        const s: usize = sh.order[oi];
         const shard = &sh.shards[s];
 
-        // ---- consolidate this shard from every scan worker's bucket ----
+        // ---- S1: sort keys straight from the exchange buckets -------------
+        // Region mechanism: the ordering contract is computed over the
+        // scatter buckets, so the ONE consolidation gather below produces
+        // the region's required order directly — no rematerialize pass.
+        var t0 = prof.nowTicks();
         var total: usize = 0;
         for (0..sh.n_threads) |sw| total += sh.worker_shards[sw * sh.n_shards + s].rows;
         if (total == 0) continue;
-        shard.buf = try ShardBuf.init(alloc);
-        for (0..sh.n_threads) |sw| {
-            const src = &sh.worker_shards[sw * sh.n_shards + s];
-            if (src.rows == 0) continue;
-            for (&shard.buf.cols, &src.cols) |*dst, *from| {
-                try appendViewAll(alloc, dst, from.view(), src.rows);
-            }
-        }
-        shard.buf.rows = total;
 
-        // ---- sort keys + argsort (custLC, div, invoiceId, date) ----
         _ = scratch_arena.reset(.retain_capacity);
         const sa = scratch_arena.allocator();
         const keys = try sa.alloc(SortKey, total);
+        const refs = try sa.alloc(u32, total);
+        const view_store = try sa.alloc(ColumnView, SH.N * sh.n_threads);
+        var bsrc: [SH.N][]ColumnView = undefined;
+        for (0..SH.N) |ci| {
+            bsrc[ci] = view_store[ci * sh.n_threads ..][0..sh.n_threads];
+            for (0..sh.n_threads) |sw| bsrc[ci][sw] = sh.worker_shards[sw * sh.n_shards + s].cols[ci].view();
+        }
         {
-            const lc_v = shard.buf.cols[SH.customerNumberLC].view();
-            const div_v = shard.buf.cols[SH.divisionId].view();
-            const inv_v = shard.buf.cols[SH.invoiceId].view();
-            const date_v = shard.buf.cols[SH.date].view();
-            for (0..total) |i| {
-                keys[i] = .{
-                    .lc = strOrNull(lc_v, i) orelse "",
-                    .lc_null = !lc_v.isValid(i),
-                    .div = if (div_v.isValid(i)) div_v.data.int[i] else 0,
-                    .div_null = !div_v.isValid(i),
-                    .inv = strOrNull(inv_v, i) orelse "",
-                    .date = date_v.data.date[i],
-                };
+            var k: usize = 0;
+            for (0..sh.n_threads) |sw| {
+                const bucket_rows = sh.worker_shards[sw * sh.n_shards + s].rows;
+                const lc_v = bsrc[SH.customerNumberLC][sw];
+                const div_v = bsrc[SH.divisionId][sw];
+                const inv_v = bsrc[SH.invoiceId][sw];
+                const date_v = bsrc[SH.date][sw];
+                for (0..bucket_rows) |i| {
+                    refs[k] = @intCast((sw << 24) | i);
+                    keys[k] = .{
+                        .lc = strOrNull(lc_v, i) orelse "",
+                        .lc_null = !lc_v.isValid(i),
+                        .div = if (div_v.isValid(i)) div_v.data.int[i] else 0,
+                        .div_null = !div_v.isValid(i),
+                        .inv = strOrNull(inv_v, i) orelse "",
+                        .date = date_v.data.date[i],
+                    };
+                    k += 1;
+                }
             }
         }
         const order = try sa.alloc(u32, total);
         for (order, 0..) |*o, i| o.* = @intCast(i);
         std.mem.sortUnstable(u32, order, keys, struct {
-            fn less(k: []const SortKey, x: u32, y: u32) bool {
-                return keyLess(k, x, y);
+            fn less(k2: []const SortKey, x: u32, y: u32) bool {
+                return keyLess(k2, x, y);
             }
         }.less);
+        sh.phase_ticks[w][0] += @intCast(prof.nowTicks() - t0);
 
-        // ---- walk groups; run rf_estimates on the date-windowed subset ----
+        // ---- S2: single ordered gather + rf_estimates in place ------------
+        // Groups land contiguously; the estimates writer appends its rows
+        // right at its group's tail, so downstream run-contiguity holds by
+        // construction (no second physical reorder).
+        t0 = prof.nowTicks();
         const win_lo = tdb.Date.fromYmd(.{ .y = 2026, .m = 5, .d = 1 }).days();
         const win_hi = tdb.Date.fromYmd(.{ .y = 2026, .m = 7, .d = 31 }).days();
+        shard.buf = try ShardBuf.init(alloc);
 
         var est_arena = std.heap.ArenaAllocator.init(alloc);
         defer est_arena.deinit();
@@ -685,38 +811,37 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
         var g_start: usize = 0;
         while (g_start < total) {
             var g_end = g_start + 1;
-            while (g_end < total and sameGroup(keys[order[g_start]], keys[order[g_end]])) g_end += 1;
-
-            var grp = Shard.Group{};
-            try grp.rows.ensureTotalCapacity(alloc, g_end - g_start);
-            var any_window = false;
-            for (order[g_start..g_end]) |ri| {
-                grp.rows.appendAssumeCapacity(ri);
-                const d = keys[ri].date;
+            var any_window = keys[order[g_start]].date >= win_lo and keys[order[g_start]].date <= win_hi;
+            while (g_end < total and sameGroup(keys[order[g_start]], keys[order[g_end]])) {
+                const d = keys[order[g_end]].date;
                 if (d >= win_lo and d <= win_hi) any_window = true;
+                g_end += 1;
+            }
+            const base0: u32 = @intCast(shard.buf.cols[0].rowCount());
+            const grefs = try sa.alloc(u32, g_end - g_start);
+            for (grefs, order[g_start..g_end]) |*g2, oi2| g2.* = refs[oi2];
+            for (&shard.buf.cols, 0..) |*dst, ci| {
+                try gatherColumn(alloc, dst, bsrc[ci], grefs);
             }
 
             if (any_window) {
                 _ = est_arena.reset(.retain_capacity);
                 const ea = est_arena.allocator();
-                // Gather the windowed rows (already in invoiceId,date order)
-                // into a compact 21-col partition.
-                var part_stores: [SH.N]ColumnStore = undefined;
-                for (&part_stores, SHARD_META) |*c, m| c.* = try ColumnStore.init(ea, m.t, m.n);
+                for (&est_scratch) |*c| c.clear();
                 var views: [SH.N]ColumnView = undefined;
                 for (&views, &shard.buf.cols) |*v, *c| v.* = c.view();
                 var k: usize = 0;
-                for (order[g_start..g_end]) |ri| {
-                    const d = keys[ri].date;
+                for (order[g_start..g_end], 0..) |oi2, off| {
+                    const d = keys[oi2].date;
                     if (d < win_lo or d > win_hi) continue;
-                    for (&part_stores, views) |*dst, srcv| {
-                        try appendFromView(ea, dst, srcv, ri);
+                    for (&est_scratch, views) |*dst, srcv| {
+                        try appendFromView(alloc, dst, srcv, base0 + off);
                     }
                     k += 1;
                 }
                 if (k > 0) {
                     var pviews: [SH.N]ColumnView = undefined;
-                    for (&pviews, &part_stores) |*v, *c| v.* = c.view();
+                    for (&pviews, &est_scratch) |*v, *c| v.* = c.view();
                     const raw_part = tdb.TvfPartition{ .columns = &pviews, .row_count = k, .keys = &.{} };
                     const p = tdb.Partition(rf_estimates.Input){ .raw = &raw_part, .len = k };
 
@@ -732,17 +857,18 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                     };
                     const before = shard.buf.cols[0].rowCount();
                     try rf_estimates.process(&ctx, .{ .curMonth = CUR_MONTH, .currentDate = CURRENT_DATE }, p, &writer);
-                    const after = shard.buf.cols[0].rowCount();
-                    for (before..after) |nri| try grp.rows.append(alloc, @intCast(nri));
-                    shard.est_rows += after - before;
+                    shard.est_rows += shard.buf.cols[0].rowCount() - before;
                 }
             }
-            try shard.groups.append(alloc, grp);
+            try shard.ranges.append(alloc, .{ base0, @intCast(shard.buf.cols[0].rowCount()) });
             g_start = g_end;
         }
         shard.buf.rows = shard.buf.cols[0].rowCount();
+        shard.out_rows = shard.buf.rows;
+        sh.phase_ticks[w][1] += @intCast(prof.nowTicks() - t0);
 
-        // ---- p3 cap partial over the union rows ----
+        // ---- p3 cap partial over the union rows (validation only) ----
+        if (sh.validate) {
         const cap = &sh.caps[w];
         var views: [SH.N]ColumnView = undefined;
         for (&views, &shard.buf.cols) |*v, *c| v.* = c.view();
@@ -770,28 +896,10 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
             try cap.takeStr(alloc, 12, strOrNull(views[SH.customerEmail], i));
             if (views[SH.amount].isValid(i)) cap.sum_amount += views[SH.amount].data.int[i];
         }
-
-        // ---- gather-reorder: apply group order physically -----------------
-        {
-            var obuf = try ShardBuf.init(alloc);
-            var oviews: [SH.N]ColumnView = undefined;
-            for (&oviews, &shard.buf.cols) |*v, *c| v.* = c.view();
-            for (shard.groups.items) |*grp| {
-                const start: u32 = @intCast(obuf.cols[0].rowCount());
-                for (grp.rows.items) |ri| {
-                    for (&obuf.cols, oviews) |*dst, srcv| try appendFromView(alloc, dst, srcv, ri);
-                }
-                try shard.ranges.append(alloc, .{ start, @intCast(obuf.cols[0].rowCount()) });
-            }
-            obuf.rows = obuf.cols[0].rowCount();
-            shard.buf.deinit(alloc);
-            shard.buf = obuf;
-            for (shard.groups.items) |*g| g.rows.deinit(alloc);
-            shard.groups.deinit(alloc);
-            shard.groups = .empty;
         }
 
         // ---- rf_currency_convert: one row-aligned call over the shard -----
+        t0 = prof.nowTicks();
         const nrows = shard.buf.rows;
         for (&shard.cur, CUR_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
         if (nrows > 0) {
@@ -818,8 +926,10 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
             };
             try rf_currency.process(&cctx, .{ .targetCurrency = "USD", .useDivision = 0 }, cp, rp, pp, &cwriter);
         }
+        sh.phase_ticks[w][2] += @intCast(prof.nowTicks() - t0);
 
         // ---- rollforward_pre_records_temp + customer_agg_by_month ---------
+        t0 = prof.nowTicks();
         for (&shard.agg, AGG_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
         var bviews: [SH.N]ColumnView = undefined;
         for (&bviews, &shard.buf.cols) |*v, *c| v.* = c.view();
@@ -904,7 +1014,7 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 std.mem.sortUnstable(u32, ord, c1, Ctx1.less2);
                 for (ord, 1..) |li, rk| rn2[li] = @intCast(rk);
             }
-            {
+            if (sh.validate) {
                 const p5 = &sh.p5sums[w];
                 for (0..n) |li| {
                     const i = s0 + li;
@@ -1048,6 +1158,7 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 try appendOptInt(alloc, &cols[AG.planId], acc.plan_val);
                 try appendOptInt(alloc, &cols[AG.hasAdjustment], acc.has_adj);
 
+                if (sh.validate) {
                 const p6c = &sh.p6caps[w];
                 p6c.rows += 1;
                 i32MaxInto(&p6c.max_proj, g_pid);
@@ -1072,12 +1183,15 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 if (er_out) |e| p6c.sum_er += e;
                 if (acc.plan_val) |v| p6c.sum_plan += v;
                 p6c.sum_hadj += acc.has_adj;
+                }
             }
             try shard.agg_ranges.append(alloc, .{ astart, @intCast(shard.agg[0].rowCount()) });
         }
         shard.agg_rows = shard.agg[0].rowCount();
+        sh.phase_ticks[w][3] += @intCast(prof.nowTicks() - t0);
 
         // ---- D: rf_gap_fill -> rf_updown_chain -> tail -> p15 cap ---------
+        t0 = prof.nowTicks();
         var aviews: [AG.N]ColumnView = undefined;
         for (&aviews, &shard.agg) |*v, *c| v.* = c.view();
         const p15c = &sh.p15caps[w];
@@ -1090,6 +1204,19 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
             .{ .t = .int, .n = true },    .{ .t = .int, .n = true },    .{ .t = .date, .n = true }, .{ .t = .string, .n = false },
             .{ .t = .int, .n = false },   .{ .t = .bigint, .n = false },
         };
+
+        // Worker-lifetime scratch for the per-group kernels (region
+        // mechanism: partitioned operators reuse cleared stores instead of
+        // re-initializing ~10M stores across ~230K tiny groups).
+        var d_ga: [AG.N]ColumnStore = undefined;
+        for (&d_ga, AGG_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+        defer for (&d_ga) |*c| c.deinit(alloc);
+        var d_gb: [AG.N]ColumnStore = undefined;
+        for (&d_gb, AGG_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+        defer for (&d_gb) |*c| c.deinit(alloc);
+        var d_uc: [10]ColumnStore = undefined;
+        for (&d_uc, UD_META) |*c, m| c.* = try ColumnStore.init(alloc, m.t, m.n);
+        defer for (&d_uc) |*c| c.deinit(alloc);
 
         for (shard.agg_ranges.items) |arng| {
             const a0: usize = arng[0];
@@ -1111,29 +1238,27 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 prev_lc_set = true;
             }
 
-            // Gather the group (AG layout) into a compact partition.
-            var ga: [AG.N]ColumnStore = undefined;
-            for (&ga, AGG_META) |*c, m| c.* = try ColumnStore.init(da, m.t, m.n);
+            // Gather the group (AG layout) into the reused scratch partition.
+            for (&d_ga) |*c| c.clear();
             for (a0..a1) |ri| {
-                for (&ga, aviews) |*dst, srcv| try appendFromView(da, dst, srcv, ri);
+                for (&d_ga, aviews) |*dst, srcv| try appendFromView(alloc, dst, srcv, ri);
             }
             var gviews: [AG.N]ColumnView = undefined;
-            for (&gviews, &ga) |*v, *c| v.* = c.view();
+            for (&gviews, &d_ga) |*v, *c| v.* = c.view();
             const graw = tdb.TvfPartition{ .columns = &gviews, .row_count = a1 - a0, .keys = &.{} };
             const gp = tdb.Partition(rf_gap_fill.Input){ .raw = &graw, .len = a1 - a0 };
 
-            var gb: [AG.N]ColumnStore = undefined;
-            for (&gb, AGG_META) |*c, m| c.* = try ColumnStore.init(da, m.t, m.n);
+            for (&d_gb) |*c| c.clear();
             var gb_ptrs: [AG.N]*ColumnStore = undefined;
-            for (&gb_ptrs, &gb) |*p, *c| p.* = c;
-            var graw_out = tdb.TvfOutput{ .columns = &gb_ptrs, .allocator = da };
+            for (&gb_ptrs, &d_gb) |*p, *c| p.* = c;
+            var graw_out = tdb.TvfOutput{ .columns = &gb_ptrs, .allocator = alloc };
             var gwriter = tdb.Writer(rf_gap_fill.Output){ .raw = &graw_out };
             var gctx = tdb.Ctx{ .arena = da, .worker_arena = state_arena.allocator(), .worker_state = &worker_state };
             try rf_gap_fill.process(&gctx, .{ .comparisonMonths = 1 }, gp, &gwriter);
-            const gn = gb[0].rowCount();
+            const gn = d_gb[0].rowCount();
             if (gn == 0) continue;
             var gbv: [AG.N]ColumnView = undefined;
-            for (&gbv, &gb) |*v, *c| v.* = c.view();
+            for (&gbv, &d_gb) |*v, *c| v.* = c.view();
 
             // rf_updown_chain over the gap-filled group (computed cols are
             // not observed by the p15 cap — ctc/ctl are empty — but the
@@ -1147,11 +1272,10 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 for (&uviews, uin) |*v, si| v.* = gbv[si];
                 const uraw = tdb.TvfPartition{ .columns = &uviews, .row_count = gn, .keys = &.{} };
                 const up = tdb.Partition(rf_updown.Input){ .raw = &uraw, .len = gn };
-                var uc: [10]ColumnStore = undefined;
-                for (&uc, UD_META) |*c, m| c.* = try ColumnStore.init(da, m.t, m.n);
+                for (&d_uc) |*c| c.clear();
                 var uc_ptrs: [10]*ColumnStore = undefined;
-                for (&uc_ptrs, &uc) |*p, *c| p.* = c;
-                var uraw_out = tdb.TvfOutput{ .columns = &uc_ptrs, .allocator = da };
+                for (&uc_ptrs, &d_uc) |*p, *c| p.* = c;
+                var uraw_out = tdb.TvfOutput{ .columns = &uc_ptrs, .allocator = alloc };
                 var uwriter = tdb.Writer(rf_updown.Computed){ .raw = &uraw_out };
                 var uctx = tdb.Ctx{ .arena = da, .worker_arena = state_arena.allocator(), .worker_state = &worker_state };
                 try rf_updown.process(&uctx, .{ .comparisonMonths = 1 }, up, &uwriter);
@@ -1221,6 +1345,7 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
             std.mem.doNotOptimizeAway(lag_touch);
         }
         p15c.sum_rn += @divExact(lc_count * (lc_count + 1), 2);
+        sh.phase_ticks[w][4] += @intCast(prof.nowTicks() - t0);
     }
 }
 
@@ -1397,8 +1522,33 @@ pub fn main() !void {
     for (errs) |e| if (e) |err| return err;
     const scan_ms = prof.ticksToMs(prof.nowTicks() - t);
 
-    // ---- phase 2 (milestone B) -------------------------------------------
+    // ---- phase 2: the keyed region ----------------------------------------
     t = prof.nowTicks();
+    const validate = getenv("RF_VALIDATE") != null;
+
+    // Whales first: claim shards in descending row count so the phase tail
+    // is small shards.
+    const order_arr = try allocator.alloc(u32, n_shards);
+    defer allocator.free(order_arr);
+    {
+        const totals = try allocator.alloc(usize, n_shards);
+        defer allocator.free(totals);
+        @memset(totals, 0);
+        for (0..n_threads) |w2| {
+            for (0..n_shards) |s2| totals[s2] += worker_shards[w2 * n_shards + s2].rows;
+        }
+        for (order_arr, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sortUnstable(u32, order_arr, totals, struct {
+            fn less(t2: []const usize, a: u32, b: u32) bool {
+                return t2[a] > t2[b];
+            }
+        }.less);
+    }
+
+    const phase_ticks = try allocator.alloc([5]u64, n_threads);
+    defer allocator.free(phase_ticks);
+    for (phase_ticks) |*p| p.* = @splat(0);
+
     const shards = try allocator.alloc(Shard, n_shards);
     for (shards) |*s| s.* = .{ .buf = undefined };
     const caps = try allocator.alloc(P3Cap, n_threads);
@@ -1425,6 +1575,9 @@ pub fn main() !void {
         .rate_part = &bc.rate_part,
         .plan_part = &bc.plan_part,
         .bc = &bc,
+        .order = order_arr,
+        .validate = validate,
+        .phase_ticks = phase_ticks,
     };
     for (0..n_threads - 1) |w| {
         threads[w] = try std.Thread.spawn(.{}, stageWorker, .{ &stage, w });
@@ -1448,9 +1601,11 @@ pub fn main() !void {
     }
     var est_total: usize = 0;
     var agg_total: usize = 0;
+    var union_total: usize = 0;
     for (shards) |*s| {
         est_total += s.est_rows;
         agg_total += s.agg_rows;
+        union_total += s.out_rows;
     }
 
     var p5 = P5Sums{};
@@ -1504,11 +1659,23 @@ pub fn main() !void {
     var d0: [12]u8 = undefined;
     var d1: [12]u8 = undefined;
     var d2: [12]u8 = undefined;
+    var ph: [5]u64 = @splat(0);
+    for (phase_ticks) |p| {
+        for (0..5) |k| ph[k] += p[k];
+    }
     std.debug.print(
         "rf_custom D: open={d:.0}ms bc={d:.0}ms build={d:.0}ms scan={d:.0}ms stages={d:.0}ms total={d:.0}ms union_rows={d} est_rows={d} agg_rows={d} final_rows={d}\n",
-        .{ open_ms, bc_ms, build_ms, scan_ms, stage_ms, prof.ticksToMs(prof.nowTicks() - t_all), cap.rows, est_total, agg_total, p15.rows },
+        .{ open_ms, bc_ms, build_ms, scan_ms, stage_ms, prof.ticksToMs(prof.nowTicks() - t_all), union_total, est_total, agg_total, p15.rows },
     );
     std.debug.print(
+        "stage core-time (summed over {d} threads): sortkeys={d:.0}ms gather+est={d:.0}ms currency={d:.0}ms prerecords+agg={d:.0}ms gapfill+updown+tail={d:.0}ms\n",
+        .{
+            n_threads,
+            prof.ticksToMs(@intCast(ph[0])), prof.ticksToMs(@intCast(ph[1])), prof.ticksToMs(@intCast(ph[2])),
+            prof.ticksToMs(@intCast(ph[3])), prof.ticksToMs(@intCast(ph[4])),
+        },
+    );
+    if (validate) std.debug.print(
         "p5sums: sum_planId={d} sum_rn1={d} sum_rn2={d} sum_hasAdjustment={d}\n",
         .{ p5.ipid, p5.rn1, p5.rn2, p5.hadj },
     );
@@ -1517,7 +1684,7 @@ pub fn main() !void {
         var b1: [12]u8 = undefined;
         var b2: [12]u8 = undefined;
         var b3: [12]u8 = undefined;
-        std.debug.print(
+        if (validate) std.debug.print(
             "p6cap: g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={s} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={s} s9={d} s10={d} s11={d} s12={d} s13={s} s14={d} s15={d:.6} s16={d} s17={d}\n",
             .{
                 p6.max_proj,                   p6.max_div,
@@ -1554,7 +1721,7 @@ pub fn main() !void {
             },
         );
     }
-    std.debug.print(
+    if (validate) std.debug.print(
         "p3cap: rows_out=1 g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={d} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={s} s9={s} s10={d} s11={s} s12={s} s13={s} s14={s} s15={s} s16={d}\n",
         .{
             cap.max_int[0],                 cap.max_int[1],
