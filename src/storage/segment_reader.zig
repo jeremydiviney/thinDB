@@ -12,8 +12,8 @@ extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// `THINDB_LZ4_CACHE_DECODED=1`: cache at-rest LZ4 string blocks DECODED
 /// (trading resident bytes for skipping the per-borrow whole-block
-/// decompress). A/B lever for concurrent-scan workloads — SEPARABLE slice
-/// pipelines borrow the same blocks N times per query.
+/// decompress). A/B lever for concurrent-scan workloads that borrow the
+/// same blocks N times per query.
 fn cacheDecodedOverride() bool {
     return getenv("THINDB_LZ4_CACHE_DECODED") != null;
 }

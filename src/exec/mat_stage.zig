@@ -85,11 +85,11 @@ pub const MaterializedResult = struct {
         /// bitmaps slice cleanly.
         views: []ColumnView = &.{},
         rows: usize = 0,
-        /// SEPARABLE sliced results: this chunk's slice-key range —
-        /// values are in (key_lo, key_hi], null bound = unbounded. A
-        /// slice-range reader skips chunks with disjoint ranges (see
-        /// MatScan.setSliceSkip). Defaults are the "no information"
-        /// state: never skipped.
+        /// Keyed-region exit graft (slice-adopted results): this chunk's
+        /// slice-key range — values are in (key_lo, key_hi], null bound =
+        /// unbounded. A slice-range reader skips chunks with disjoint
+        /// ranges (see MatScan.setSliceSkip). Defaults are the "no
+        /// information" state: never skipped.
         key_lo: ?types.Value = null,
         key_hi: ?types.Value = null,
         key_nulls: bool = true,
@@ -115,12 +115,13 @@ pub const MaterializedResult = struct {
         self.total_rows = rows;
     }
 
-    /// SEPARABLE sliced fill: adopt N slice sinks' contiguous stores as this
-    /// result's chunks, in slice order — a deterministic concat (disjoint key
-    /// ranges in ascending slice order also preserve a leading-slice-key
-    /// sort). Takes full ownership: the sinks' store/arena arrays are copied
-    /// into one flat Adopted record and their top-level arrays freed; the
-    /// arena-backed column data frees with the result's normal adopted sweep.
+    /// Keyed-region exit graft: adopt N slice sinks' contiguous stores as
+    /// this result's chunks, in slice order — a deterministic concat
+    /// (disjoint key ranges in ascending slice order also preserve a
+    /// leading-slice-key sort). Takes full ownership: the sinks' store/arena
+    /// arrays are copied into one flat Adopted record and their top-level
+    /// arrays freed; the arena-backed column data frees with the result's
+    /// normal adopted sweep.
     pub const SliceKey = struct {
         col: []const u8,
         /// Ascending slice boundaries: slice i holds (bounds[i-1], bounds[i]],
@@ -416,10 +417,9 @@ pub const Stage = struct {
     col_stats: []exec.ColStat,
     result: ?*MaterializedResult = null,
     /// Consumers bound at compile time / consumers finished. When the last
-    /// finishes, the result frees in the background. Atomic: SEPARABLE
-    /// slice pipelines register (compile) and release (deinit) from their
-    /// own threads; the FINAL release is still single-threaded — the fill
-    /// holds a guard use per input stage until every slice has joined.
+    /// finishes, the result frees in the background. Atomic: concurrent
+    /// consumer pipelines may register (compile) and release (deinit) from
+    /// their own threads; the FINAL release is still single-threaded.
     uses_total: std.atomic.Value(usize) = .init(0),
     uses_done: std.atomic.Value(usize) = .init(0),
     free_thread: ?std.Thread = null,
@@ -463,26 +463,6 @@ pub const Stage = struct {
     /// its 700MB contiguous copy in parallel instead of one serial append
     /// loop. Set by the staged compiler alongside `want_contiguous`.
     fill_dop: usize = 1,
-    /// SEPARABLE BY: the stage fills by running N per-key-range slice
-    /// pipelines concurrently and adopting their outputs in slice order,
-    /// instead of draining `query`. Installed by the staged compiler; the
-    /// hook lives in net/cte_stages (it re-enters the block compiler), so
-    /// the coupling stays behind opaque fn pointers — same philosophy as
-    /// `adopt_window`. `query` still compiles normally (it provides the
-    /// schema/stats and is torn down undrained).
-    sliced_fill: ?SlicedFill = null,
-    /// Created INSIDE a slice pipeline (per-slice StageSet): its content is
-    /// already range-restricted, so the slice compiler must not layer the
-    /// range filter over reads of it again.
-    slice_local: bool = false,
-
-    pub const SlicedFill = struct {
-        ctx: *anyopaque,
-        /// Returns false to DECLINE (no sliceable input, degenerate bounds):
-        /// ensureRun then falls through to the normal drain of `query`.
-        run: *const fn (ctx: *anyopaque, stage: *Stage, res: *MaterializedResult) anyerror!bool,
-        drop: *const fn (ctx: *anyopaque) void,
-    };
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
@@ -501,18 +481,7 @@ pub const Stage = struct {
         errdefer res.deinitChunks();
         errdefer self.releaseReserved();
         const row_bytes = exec.memory.estimateRowBytes(self.schema);
-        var sliced = false;
-        if (self.sliced_fill) |sf| {
-            sliced = try sf.run(sf.ctx, self, res);
-            if (sliced) {
-                if (self.accountant) |acct| {
-                    const bytes = row_bytes * @as(usize, @intCast(res.total_rows));
-                    try acct.reserve(.materialize, bytes);
-                    self.reserved_bytes += bytes;
-                }
-            }
-        }
-        if (sliced) {} else if (self.adopt_window) |win| {
+        if (self.adopt_window) |win| {
             try win.ensureDrained();
             if (self.accountant) |acct| {
                 // Borrowed pass-through columns are shallow references into
@@ -769,7 +738,6 @@ pub const Stage = struct {
     }
 
     pub fn deinit(self: *Stage) void {
-        if (self.sliced_fill) |sf| sf.drop(sf.ctx);
         if (self.free_thread) |th| th.join();
         if (self.result) |res| freeResultThread(res);
         self.releaseReserved();
@@ -903,12 +871,12 @@ pub const MatScan = struct {
         return exec.makeQuery(allocator, self);
     }
 
-    /// SEPARABLE slice reader hint: this scan feeds a range filter
-    /// `col > lo AND col <= hi` (null bound = open; `want_null` when the
-    /// filter also passes NULL keys). Chunks of a slice-adopted result carry
-    /// key ranges — disjoint chunks are skipped wholesale. Pure optimization:
-    /// the filter above still evaluates, so a wrong hint can only cost rows
-    /// it would have discarded anyway... never invent rows.
+    /// Keyed-region exit graft (slice-range reader hint): this scan feeds a
+    /// range filter `col > lo AND col <= hi` (null bound = open; `want_null`
+    /// when the filter also passes NULL keys). Chunks of a slice-adopted
+    /// result carry key ranges — disjoint chunks are skipped wholesale. Pure
+    /// optimization: the filter above still evaluates, so a wrong hint can
+    /// only cost rows it would have discarded anyway... never invent rows.
     pub fn setSliceSkip(self: *MatScan, col: []const u8, lo: ?types.Value, hi: ?types.Value, want_null: bool) void {
         self.skip_col = col;
         self.skip_lo = lo;

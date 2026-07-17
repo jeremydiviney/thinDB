@@ -544,11 +544,6 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
                     if (!gop.found_existing) ctx.changed = true;
                 }
             }
-            if (m.separable) |sp| {
-                for (sp.cols) |c| {
-                    if (mn.set.add(ctx.arena, c)) ctx.changed = true;
-                }
-            }
             // One body visit per pass: shared consumers accumulate first,
             // the fixpoint loop carries growth inward on the next round.
             if (ctx.visited.contains(op)) return;

@@ -115,7 +115,7 @@ pub const Window = struct {
     /// Compile-proven grouping: the staged compiler PAIRED this window with
     /// an upstream same-partition window that emits in its sorted order
     /// through a grouping-preserving chain, so `groupedByPartition` holds
-    /// without a stats claim. Set only inside SEPARABLE slice compiles.
+    /// without a stats claim.
     assume_grouped: bool = false,
     /// Streaming next() emits in `sorted_perm` order (per-batch gather into
     /// `emit_gather_cols`) instead of the zero-copy original-order views —
@@ -874,8 +874,8 @@ pub const Window = struct {
             src.ensureRun() catch break :bind;
             const res = src.result orelse break :bind;
             const ad = res.adopted orelse break :bind;
-            // One contiguous store per column only — a SEPARABLE sliced fill
-            // adopts N stores per column (slice parts), which can't be
+            // One contiguous store per column only — a slice-adopted result
+            // holds N stores per column (slice parts), which can't be
             // shallow-referenced as single columns. Degrade to accumulation.
             if (ad.stores.len != res.schema.len) break :bind;
             for (self.borrow_map, 0..) |m, ci| {
@@ -1606,9 +1606,8 @@ pub const Window = struct {
     /// WITHIN each partition by the spec keys. Replaces one n·log n sort
     /// over wide composite keys with an O(n) boundary walk plus tiny
     /// per-partition sorts (partitions in the target workloads average a
-    /// few dozen rows). The DRAM traffic that a full permutation sort
-    /// generates is what dilates concurrent SEPARABLE slices — this path
-    /// is their window engine.
+    /// few dozen rows). Avoids the DRAM traffic a full permutation sort
+    /// generates — the window engine for grouped-input consumers.
     fn buildPermutationGrouped(self: *Window, si: SpecIndices) ![]u32 {
         const n: usize = @intCast(self.accumulated_rows);
         const perm = try self.allocator.alloc(u32, n);

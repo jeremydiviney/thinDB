@@ -4,8 +4,8 @@
 //! invokes the registered function's process callback once per partition —
 //! or exactly once with everything when the call is GLOBAL (no PARTITION
 //! BY). Output is the function's declared output schema; the concat of
-//! per-partition emissions is the operator's contract (same strong
-//! contract as SEPARABLE BY).
+//! per-partition emissions is the operator's contract (rows with different
+//! partition keys never interact).
 //!
 //! The TYPE CONTRACT enforced at create (= query compile):
 //!   - the input subquery's schema must carry every declared input column,
@@ -442,8 +442,8 @@ pub const TableFnExec = struct {
             src.ensureRun() catch break :bind;
             const res = src.result orelse break :bind;
             const ad = res.adopted orelse break :bind;
-            // One contiguous store per column only — a SEPARABLE sliced
-            // fill adopts N stores per column (slice parts), which can't be
+            // One contiguous store per column only — a slice-adopted result
+            // holds N stores per column (slice parts), which can't be
             // shallow-referenced as single columns.
             if (ad.stores.len != res.schema.len) break :bind;
             for (self.borrow_map, 0..) |m, ci| {

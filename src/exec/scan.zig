@@ -1103,7 +1103,7 @@ pub const Scan = struct {
         var coerced = expr;
         try predicate.validateExpr(&coerced, self.table.schema.columns);
         if (self.fused_filter) |existing| {
-            // SECOND fusion (a SEPARABLE slice range, or any filter layered
+            // SECOND fusion (any filter layered
             // over a block whose WHERE already fused): conjoin. Only when the
             // new predicate references projected columns exclusively — the
             // eval state built for the first filter (its unprojected-column
