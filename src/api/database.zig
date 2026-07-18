@@ -47,6 +47,32 @@ pub const Database = struct {
 
     schemas_mutex: Io.Mutex = .init,
 
+    /// Opaque per-database slot for the net layer's region recognizer cache
+    /// (src/net/region_rollforward.zig): compiled region programs + pooled
+    /// buffers reused across queries. The net layer owns the pointee and
+    /// registers the destructor; `closeInPlace` runs it so cached programs
+    /// die with the database. Opaque to keep api/ free of net/ imports.
+    region_cache: ?*anyopaque = null,
+    region_cache_deinit: ?*const fn (*anyopaque) void = null,
+    /// Guards slot creation only (CAS spinlock — touched once per query at
+    /// most; std.Thread.Mutex is gone in Zig 0.16 and Io.Mutex would force
+    /// an Io through the recognizer for a two-instruction critical section).
+    region_cache_lock: RegionCacheLock = .{},
+
+    pub const RegionCacheLock = struct {
+        state: std.atomic.Value(bool) = .{ .raw = false },
+
+        pub fn lock(self: *RegionCacheLock) void {
+            while (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        pub fn unlock(self: *RegionCacheLock) void {
+            self.state.store(false, .release);
+        }
+    };
+
     /// Open a database rooted at `data_dir`. Back-compat entry point —
     /// internally spins up a Catalog + "main" database + "public" schema
     /// and returns the Database. Reopen-safe: if the on-disk layout
@@ -145,6 +171,10 @@ pub const Database = struct {
     /// Catalog. Called by `Catalog.close` and by `close()` when this
     /// Database has no implicit Catalog of its own.
     pub fn closeInPlace(self: *Database) void {
+        if (self.region_cache) |p| {
+            self.region_cache_deinit.?(p);
+            self.region_cache = null;
+        }
         var it = self.schemas.iterator();
         while (it.next()) |entry| entry.value_ptr.*.close();
         self.schemas.deinit();

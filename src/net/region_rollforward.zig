@@ -72,6 +72,9 @@ pub fn tryRecognize(input: engine_v2.CompileInput, root: *const ir.Op) ?Recogniz
     while (depth < 16) : (depth += 1) {
         switch (cur.*) {
             .materialize => |m| {
+                if (tryCachedAt(input, cur)) |q| {
+                    return .{ .anchor = cur, .query = q };
+                }
                 if (recognizeAt(input, cur)) |q| {
                     return .{ .anchor = cur, .query = q };
                 } else |e| {
@@ -101,6 +104,555 @@ pub fn tryRecognize(input: engine_v2.CompileInput, root: *const ir.Op) ?Recogniz
         }
     }
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-run region cache — the probe's pooled-buffer discipline in engine
+// form. One entry per Database, keyed by a deterministic deep hash of the
+// anchor IR subtree (post-fold, so folded dates/constants are captured). A
+// hit revalidates everything the program BAKED at recognize time — broadcast
+// and proof tables via a data-version fingerprint, kernel identity via
+// process pointers — then rebuilds only the scans against a fresh snapshot
+// and reuses the compiled Program plus its RegionPool, so exchange buckets,
+// shard buffers, and op stores keep their capacities across queries.
+// ---------------------------------------------------------------------------
+
+const Unhashable = error.RegionUnhashable;
+
+const TableVersion = struct { name: []const u8, version: u64 };
+const KernelCheck = struct { name: []const u8, process: udf_mod.TvfProcess };
+
+/// CAS spinlock (std.Thread.Mutex is gone in Zig 0.16; Io.Mutex would drag
+/// an Io through the recognizer). Critical sections here are flag flips —
+/// version validation runs outside the lock.
+const SpinLock = struct {
+    state: std.atomic.Value(bool) = .{ .raw = false },
+
+    fn lock(self: *SpinLock) void {
+        while (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.state.store(false, .release);
+    }
+};
+
+const Cache = struct {
+    alloc: Allocator,
+    mu: SpinLock = .{},
+    hash: u64 = 0,
+    ctx: ?*Ctx = null,
+    /// Checked out by a running query (the RegionExecOp releases on deinit).
+    /// While busy the entry can be neither reused nor replaced — a second
+    /// concurrent identical query just runs one-shot.
+    busy: bool = false,
+
+    fn deinitErased(p: *anyopaque) void {
+        const self: *Cache = @ptrCast(@alignCast(p));
+        const alloc = self.alloc;
+        if (self.ctx) |c| Ctx.destroyErased(c);
+        alloc.destroy(self);
+    }
+
+    fn releaseErased(p: *anyopaque) void {
+        const self: *Cache = @ptrCast(@alignCast(p));
+        self.mu.lock();
+        self.busy = false;
+        self.mu.unlock();
+    }
+};
+
+/// Get-or-create the per-database cache slot. Uses the DATABASE allocator —
+/// the cache must outlive any single query or connection.
+fn cacheFor(db: anytype) ?*Cache {
+    db.region_cache_lock.lock();
+    defer db.region_cache_lock.unlock();
+    if (db.region_cache) |p| return @ptrCast(@alignCast(p));
+    const c = db.allocator.create(Cache) catch return null;
+    c.* = .{ .alloc = db.allocator };
+    db.region_cache = c;
+    db.region_cache_deinit = Cache.deinitErased;
+    return c;
+}
+
+fn poolCapBytes() usize {
+    // Default sized for the rollforward-class region: worker-slot stores
+    // ratchet toward n_workers × whale-shard footprint and plateau ~4GB on
+    // the 3.6M-row workload — 6GB leaves margin so the retention policy
+    // doesn't reset the pool right at steady state.
+    if (getenv("THINDB_REGION_POOL_MB")) |v| {
+        const mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 6144;
+        return mb << 20;
+    }
+    return 6144 << 20;
+}
+
+/// Data-version fingerprint of one table: memtable generation (bumped by
+/// every retire-swap — flush/delete/update/alter) + memtable row count
+/// (catches appends within a generation) + the segment set. Read under the
+/// table mutex so the triple is coherent. Compaction changes the segment set
+/// without changing values — a spurious invalidation, which is safe.
+fn tableVersionOf(db: anytype, name: []const u8) ?u64 {
+    const t = db.openTable(name, .{}) catch return null;
+    t.mutex.lockUncancelable(t.io);
+    defer t.mutex.unlock(t.io);
+    var h = std.hash.Wyhash.init(0x7461626c65);
+    hu(&h, t.memtable_gen);
+    hu(&h, t.memtable.row_count);
+    for (t.manifest.segments.items) |e| {
+        hu(&h, e.segment_id);
+        hu(&h, e.row_count);
+    }
+    return h.final();
+}
+
+/// Record data-versions for every table a compile-time-executed subtree
+/// reads. Capture happens BEFORE the drain: a write landing after capture
+/// makes the recorded version stale relative to the drained data, which the
+/// next query detects as a mismatch and re-recognizes — the safe direction.
+fn recordSubtreeVersions(b: *Builder, node: *const ir.Op) void {
+    if (b.ctx.uncacheable) return;
+    collectVersions(b, node) catch {
+        b.ctx.uncacheable = true;
+    };
+}
+
+fn collectVersions(b: *Builder, node: *const ir.Op) !void {
+    switch (node.*) {
+        .scan => |s| try recordTableVersion(b, s.table.name),
+        .alias => |x| try collectVersions(b, x.upstream),
+        .select, .exclude => |p| try collectVersions(b, p.upstream),
+        .filter => |f| try collectVersions(b, f.upstream),
+        .group_by => |g| try collectVersions(b, g.upstream),
+        .compute => |c| try collectVersions(b, c.upstream),
+        .limit => |l| try collectVersions(b, l.upstream),
+        .order_by => |o| try collectVersions(b, o.upstream),
+        .materialize => |m| try collectVersions(b, m.upstream),
+        .window => |w| try collectVersions(b, w.upstream),
+        .join => |j| {
+            try collectVersions(b, j.left);
+            try collectVersions(b, j.right);
+        },
+        .set_union => |u| {
+            try collectVersions(b, u.left);
+            try collectVersions(b, u.right);
+        },
+        .table_fn => |t| for (t.inputs) |inp| try collectVersions(b, inp),
+        .single_row => {},
+        else => return Unhashable,
+    }
+}
+
+fn recordTableVersion(b: *Builder, name: []const u8) !void {
+    for (b.ctx.versions.items) |v| {
+        if (std.ascii.eqlIgnoreCase(v.name, name)) return;
+    }
+    const ver = tableVersionOf(b.input.db, name) orelse return Unhashable;
+    try b.ctx.versions.append(b.a, .{ .name = try b.a.dupe(u8, name), .version = ver });
+}
+
+/// True when everything the cached program baked at recognize time is still
+/// current: kernel identities and consumed-table data versions.
+fn cacheValid(input: engine_v2.CompileInput, ctx: *Ctx) bool {
+    if (ctx.uncacheable) return false;
+    const registry = input.udf_registry orelse return false;
+    for (ctx.kernels.items) |k| {
+        const e = registry.tableByName(k.name) orelse return false;
+        if (e.process != k.process) return false;
+    }
+    for (ctx.versions.items) |v| {
+        const now = tableVersionOf(input.db, v.name) orelse return false;
+        if (now != v.version) return false;
+    }
+    return true;
+}
+
+fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op) ?exec.Query {
+    const hash = hashAnchor(anchor) orelse return null;
+    const cache = cacheFor(input.db) orelse return null;
+
+    cache.mu.lock();
+    if (cache.busy or cache.ctx == null or cache.hash != hash) {
+        cache.mu.unlock();
+        return null;
+    }
+    cache.busy = true;
+    cache.mu.unlock();
+
+    const ctx = cache.ctx.?;
+    if (!cacheValid(input, ctx)) {
+        cache.mu.lock();
+        cache.ctx = null;
+        cache.busy = false;
+        cache.mu.unlock();
+        Ctx.destroyErased(ctx);
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] cache invalidated (data changed)\n", .{});
+        }
+        return null;
+    }
+
+    const q = runCached(input, anchor, ctx) catch |e| {
+        Cache.releaseErased(cache);
+        if (e != error.OutOfMemory and getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] cache hit declined: {s}\n", .{@errorName(e)});
+        }
+        return null;
+    };
+    const op = exec.queryAs(region.RegionExecOp, q) orelse {
+        var qq = q;
+        qq.deinit();
+        Cache.releaseErased(cache);
+        return null;
+    };
+    op.setOwnedCtx(cache, Cache.releaseErased);
+    if (getenv("THINDB_REGION_TRACE") != null) {
+        std.debug.print("[region] cache hit — pooled run (retained ~{d}MB)\n", .{ctx.pool.retainedBytes() >> 20});
+    }
+    return q;
+}
+
+/// The hit path: fresh spine walk (validates shape, provides IR-backed scan
+/// recipe + entry compute), fresh snapshot scans, then the cached Program +
+/// pool. The entry schema is compared against the cached program's — any
+/// DDL drift on the scan table declines back to a full recognize.
+fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !exec.Query {
+    const sp = try walkSpine(anchor);
+    const qa = input.allocator;
+
+    var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
+    defer prune_leaves.deinit(qa);
+    try collectAndLeaves(qa, sp.f65, &prune_leaves);
+
+    var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer scan_cols.deinit(qa);
+    outer: for (sp.s63.columns) |col| {
+        for (sp.entry_derived) |d| {
+            if (std.ascii.eqlIgnoreCase(d.name, col)) continue :outer;
+        }
+        try scan_cols.append(qa, col);
+    }
+
+    const table = input.db.openTable(sp.scan66.table.name, .{}) catch return NoMatch;
+    const n_threads = @max(input.effectiveDop(), 1);
+    const bs = try buildScanSources(input, table, prune_leaves.items, sp.f65, scan_cols.items, n_threads);
+    var sources_owned = true;
+    errdefer if (sources_owned) {
+        for (bs.sources) |*s| s.deinit();
+        qa.free(bs.sources);
+    };
+
+    const scan_schema = bs.sources[0].outputSchema();
+    const want = ctx.entry_schema;
+    if (scan_schema.len + sp.entry_derived.len != want.len) return NoMatch;
+    const rowloc_entry = scan_schema.len - 1;
+    for (scan_schema, want[0..scan_schema.len], 0..) |src, w, i| {
+        if (!std.ascii.eqlIgnoreCase(src.name, w.name)) return NoMatch;
+        if (!std.meta.eql(src.type, w.type)) return NoMatch;
+        const want_nullable = if (i == rowloc_entry) true else src.nullable;
+        if (w.nullable != want_nullable) return NoMatch;
+    }
+    for (sp.entry_derived, want[scan_schema.len..]) |d, w| {
+        if (!std.ascii.eqlIgnoreCase(d.name, w.name)) return NoMatch;
+    }
+
+    var opts = ctx.opts;
+    opts.n_threads = n_threads;
+
+    const q = try region.RegionExecOp.create(
+        qa,
+        ctx.entry_schema,
+        bs.sources,
+        sp.entry_derived,
+        &ctx.prog,
+        opts,
+        &ctx.pool,
+        bs.total_rows * 2,
+    );
+    sources_owned = false;
+    return q;
+}
+
+// ---- anchor-subtree fingerprint -------------------------------------------
+// Deterministic deep hash of the post-pass IR the recognizer consumes:
+// structure, names, literals, folded constants, expressions. Equal hashes ⇒
+// the recognizer builds the identical program (given unchanged consumed
+// data, which the cache validates separately). Variants outside the SELECT
+// shapes a spine can contain return null — that query is never cached.
+
+fn hashAnchor(anchor: *const ir.Op) ?u64 {
+    var h = std.hash.Wyhash.init(0x726567696f6e);
+    hashOp(&h, anchor) catch return null;
+    return h.final();
+}
+
+fn hu(h: *std.hash.Wyhash, v: u64) void {
+    h.update(std.mem.asBytes(&v));
+}
+
+fn hstr(h: *std.hash.Wyhash, s: []const u8) void {
+    hu(h, s.len);
+    h.update(s);
+}
+
+fn hostr(h: *std.hash.Wyhash, s: ?[]const u8) void {
+    if (s) |x| {
+        hu(h, 1);
+        hstr(h, x);
+    } else hu(h, 0);
+}
+
+fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
+    hu(h, @intFromEnum(std.meta.activeTag(op.*)));
+    switch (op.*) {
+        .scan => |s| {
+            hostr(h, s.table.database);
+            hostr(h, s.table.schema);
+            hstr(h, s.table.name);
+            hostr(h, s.alias);
+        },
+        .limit => |l| {
+            hu(h, l.n);
+            hu(h, l.offset);
+            try hashOp(h, l.upstream);
+        },
+        .select, .exclude => |p| {
+            hu(h, p.columns.len);
+            for (p.columns) |c| hstr(h, c);
+            if (p.outputs) |outs| {
+                hu(h, outs.len + 1);
+                for (outs) |o| hostr(h, o);
+            } else hu(h, 0);
+            if (p.replace_on_collision) |rs| {
+                hu(h, rs.len + 1);
+                for (rs) |r| hu(h, @intFromBool(r));
+            } else hu(h, 0);
+            hu(h, p.star_skip_trailing);
+            try hashOp(h, p.upstream);
+        },
+        .filter => |f| {
+            try hashPred(h, f.predicate);
+            try hashOp(h, f.upstream);
+        },
+        .order_by => |o| {
+            hashSorts(h, o.specs);
+            try hashOp(h, o.upstream);
+        },
+        .group_by => |g| {
+            // top_k / emit_limit are post-decode planner hints; a group-by
+            // carrying them is above a Limit and outside region shapes.
+            if (g.top_k != null or g.emit_limit != null) return Unhashable;
+            hu(h, g.group_cols.len);
+            for (g.group_cols) |c| hstr(h, c);
+            hu(h, g.aggs.len);
+            for (g.aggs) |spec| {
+                if (spec.out_type_override != null) return Unhashable;
+                hu(h, @intFromEnum(spec.func));
+                hostr(h, spec.udf_name);
+                hu(h, spec.udf_arg_cols.len);
+                for (spec.udf_arg_cols) |c| hstr(h, c);
+                hostr(h, spec.col);
+                hostr(h, spec.arg2_col);
+                hstr(h, spec.as);
+                switch (spec.params) {
+                    .none => hu(h, 0),
+                    .percentile => |p| {
+                        hu(h, 1);
+                        hu(h, @bitCast(p));
+                    },
+                    .separator => |s| {
+                        hu(h, 2);
+                        hstr(h, s);
+                    },
+                }
+            }
+            try hashOp(h, g.upstream);
+        },
+        .compute => |c| {
+            hu(h, c.derived.len);
+            for (c.derived) |d| {
+                hstr(h, d.name);
+                try hashExpr(h, d.expr);
+            }
+            try hashOp(h, c.upstream);
+        },
+        .join => |j| {
+            hu(h, @intFromEnum(j.algorithm));
+            hu(h, @intFromEnum(j.join_type));
+            hu(h, j.on.len);
+            for (j.on) |p| {
+                hstr(h, p.left);
+                hstr(h, p.right);
+            }
+            hu(h, j.ranges.len);
+            for (j.ranges) |r| {
+                hstr(h, r.left);
+                hu(h, @intFromEnum(r.op));
+                hstr(h, r.right);
+            }
+            if (j.extra_predicate) |p| {
+                hu(h, 1);
+                try hashPred(h, p);
+            } else hu(h, 0);
+            try hashOp(h, j.left);
+            try hashOp(h, j.right);
+        },
+        .materialize => |m| {
+            hu(h, @intFromBool(m.forced));
+            try hashOp(h, m.upstream);
+        },
+        .window => |w| {
+            hu(h, w.specs.len);
+            for (w.specs) |spec| {
+                hu(h, spec.partition_by.len);
+                for (spec.partition_by) |c| hstr(h, c);
+                hashSorts(h, spec.order_by);
+                hu(h, @intFromEnum(spec.frame.kind));
+                hashBound(h, spec.frame.start);
+                hashBound(h, spec.frame.end);
+            }
+            hu(h, w.calls.len);
+            for (w.calls) |c| {
+                hu(h, c.spec_idx);
+                hu(h, @intFromEnum(c.func));
+                hu(h, c.args.len);
+                for (c.args) |e| try hashExpr(h, e);
+                hu(h, @intFromBool(c.ignore_nulls));
+                hstr(h, c.output_name);
+            }
+            try hashOp(h, w.upstream);
+        },
+        .set_union => |u| {
+            hu(h, @intFromBool(u.all));
+            try hashOp(h, u.left);
+            try hashOp(h, u.right);
+        },
+        .alias => |a| {
+            hstr(h, a.alias);
+            try hashOp(h, a.upstream);
+        },
+        .table_fn => |t| {
+            hstr(h, t.name);
+            hu(h, t.args.len);
+            for (t.args) |arg| {
+                if (arg) |v| {
+                    hu(h, 1);
+                    hashValue(h, v);
+                } else hu(h, 0);
+            }
+            hu(h, t.partition_by.len);
+            for (t.partition_by) |c| hstr(h, c);
+            hashSorts(h, t.order_by);
+            hostr(h, t.alias);
+            hu(h, t.inputs.len);
+            for (t.inputs) |inp| try hashOp(h, inp);
+        },
+        .single_row => {},
+        else => return Unhashable,
+    }
+}
+
+fn hashSorts(h: *std.hash.Wyhash, specs: []const ir.SortSpec) void {
+    hu(h, specs.len);
+    for (specs) |s| {
+        hstr(h, s.col);
+        hu(h, @intFromBool(s.desc));
+    }
+}
+
+fn hashBound(h: *std.hash.Wyhash, b: ir.FrameBound) void {
+    hu(h, @intFromEnum(std.meta.activeTag(b)));
+    switch (b) {
+        .preceding, .following => |n| hu(h, n),
+        else => {},
+    }
+}
+
+fn hashValue(h: *std.hash.Wyhash, v: Value) void {
+    hu(h, @intFromEnum(std.meta.activeTag(v)));
+    switch (v) {
+        .tinyint => |x| hu(h, @bitCast(@as(i64, x))),
+        .smallint => |x| hu(h, @bitCast(@as(i64, x))),
+        .int => |x| hu(h, @bitCast(@as(i64, x))),
+        .date => |x| hu(h, @bitCast(@as(i64, x))),
+        .bigint => |x| hu(h, @bitCast(x)),
+        .datetime => |x| hu(h, @bitCast(x)),
+        .decimal64 => |x| hu(h, @bitCast(x)),
+        .boolean => |x| hu(h, @intFromBool(x)),
+        .float => |x| hu(h, @as(u32, @bitCast(x))),
+        .double => |x| hu(h, @bitCast(x)),
+        .text => |s| hstr(h, s),
+        .largeint => |x| h.update(std.mem.asBytes(&x)),
+        .decimal128 => |x| h.update(std.mem.asBytes(&x)),
+        .uuid => |x| h.update(std.mem.asBytes(&x)),
+    }
+}
+
+fn hashType(h: *std.hash.Wyhash, t: types.Type) void {
+    std.hash.autoHash(h, t);
+}
+
+fn hashExpr(h: *std.hash.Wyhash, e: Expr) error{RegionUnhashable}!void {
+    hu(h, @intFromEnum(std.meta.activeTag(e)));
+    switch (e) {
+        .col_ref => |n| hstr(h, n),
+        .lit => |v| hashValue(h, v),
+        .null_lit => |t| hashType(h, t),
+        .call => |c| {
+            hstr(h, c.fn_name);
+            hu(h, c.args.len);
+            for (c.args) |a| try hashExpr(h, a);
+        },
+        .case => |c| {
+            hu(h, c.branches.len);
+            for (c.branches) |br| {
+                try hashPred(h, br.cond);
+                try hashExpr(h, br.then);
+            }
+            if (c.else_branch) |eb| {
+                hu(h, 1);
+                try hashExpr(h, eb.*);
+            } else hu(h, 0);
+        },
+        .scalar_subquery, .exists_subquery, .var_ref => return Unhashable,
+    }
+}
+
+fn hashPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void {
+    hu(h, @intFromEnum(std.meta.activeTag(p)));
+    switch (p) {
+        .leaf, .day_leaf => |l| {
+            hstr(h, l.col);
+            hu(h, @intFromEnum(l.op));
+            hashValue(h, l.val);
+        },
+        .leaf_col_col => |l| {
+            hstr(h, l.left);
+            hu(h, @intFromEnum(l.op));
+            hstr(h, l.right);
+        },
+        .is_null, .is_not_null => |c| hstr(h, c),
+        .like => |l| {
+            hstr(h, l.col);
+            hstr(h, l.pattern);
+        },
+        .@"and", .@"or" => |kids| {
+            hu(h, kids.len);
+            for (kids) |k| try hashPred(h, k);
+        },
+        .not => |k| try hashPred(h, k.*),
+        .always => |b| hu(h, @intFromBool(b)),
+        .unknown => {},
+        .in_set => |s| {
+            hstr(h, s.col);
+            hu(h, @intFromBool(s.negate));
+            hu(h, s.values.len);
+            for (s.values) |v| hashValue(h, v);
+        },
+        else => return Unhashable,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,10 +982,22 @@ const Ctx = struct {
     arena: std.heap.ArenaAllocator,
     prog: region.Program = undefined,
     prog_built: bool = false,
+    /// Buffer pool for the region run. When the ctx is cached, the pool —
+    /// and every capacity it grew — survives to the next query.
+    pool: region.RegionPool,
+    /// Cache-entry state (all arena-owned): the program's entry schema for
+    /// drift checks, the driver opts to replay, the data-versions of every
+    /// table a compile-time drain consumed, and the kernel identities.
+    entry_schema: []const Column = &.{},
+    opts: region.DriverOpts = undefined,
+    versions: std.ArrayListUnmanaged(TableVersion) = .empty,
+    kernels: std.ArrayListUnmanaged(KernelCheck) = .empty,
+    uncacheable: bool = false,
 
     fn destroyErased(p: *anyopaque) void {
         const self: *Ctx = @ptrCast(@alignCast(p));
         const gpa = self.gpa;
+        self.pool.deinit();
         if (self.prog_built) self.prog.deinit();
         var arena = self.arena;
         gpa.destroy(self);
@@ -776,6 +1340,7 @@ const DrainedBlock = struct {
 };
 
 fn compileAndDrain(b: *Builder, node: *const ir.Op, drain: bool) !DrainedBlock {
+    recordSubtreeVersions(b, node);
     var local_map: StageMap = .empty;
     defer local_map.deinit(b.input.allocator);
     var q = cte_stages.compileBlock(b.input, node, &local_map) catch return NoMatch;
@@ -846,7 +1411,9 @@ fn i64At(v: ColumnView, i: usize) ?i64 {
 // ---------------------------------------------------------------------------
 
 fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exec.Query {
+    var tm: i64 = exec.prof.nowTicks();
     const sp = try walkSpine(anchor);
+    traceMark("walk", &tm);
 
     const registry = input.udf_registry orelse return NoMatch;
     const ent_est = registry.tableByName("rf_estimates") orelse return NoMatch;
@@ -866,17 +1433,31 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     if (!kernelReadsAll(ent_est) or ent_est.passthrough.len != 0) return NoMatch;
     if (ent_cur.input_schemas.len != 3 or ent_cur.broadcast_inputs.len != 2) return NoMatch;
 
-    const gpa = input.allocator;
+    // A cacheable recognize builds its ctx from the DATABASE allocator so
+    // the entry can outlive this query/connection; otherwise query-lifetime.
+    const anchor_hash = hashAnchor(anchor);
+    const cache: ?*Cache = if (anchor_hash != null) cacheFor(input.db) else null;
+    const gpa = if (cache != null) input.db.allocator else input.allocator;
+    const qa = input.allocator;
     const ctx = try gpa.create(Ctx);
-    ctx.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+    ctx.* = .{
+        .gpa = gpa,
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .pool = region.RegionPool.init(gpa, poolCapBytes()),
+    };
     errdefer Ctx.destroyErased(ctx);
     const a = ctx.arena.allocator();
+    if (cache == null) ctx.uncacheable = true;
 
     var b = Builder{ .input = input, .ctx = ctx, .a = a, .fb = .{ .a = a } };
 
+    for ([_]*const udf_mod.TableEntry{ ent_est, ent_cur, ent_gap, ent_ud }) |e| {
+        try ctx.kernels.append(a, .{ .name = try a.dupe(u8, e.name), .process = e.process });
+    }
+
     // ---- scan filter: probe-side projectId literal + prune leaves --------
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
-    try collectAndLeaves(&b, sp.f65, &prune_leaves);
+    try collectAndLeaves(a, sp.f65, &prune_leaves);
     for (prune_leaves.items) |l| {
         if (std.ascii.eqlIgnoreCase(l.col, "projectId") and l.op == .eq) {
             b.project_lit = l.val;
@@ -906,52 +1487,15 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         break :blk 64;
     };
 
-    table.ddl_lock.lockSharedUncancelable(table.io);
-    defer table.ddl_lock.unlockShared(table.io);
-    const snap = try Scan.captureSnapshotAlloc(table, gpa);
-    defer gpa.free(snap.segments);
-    var pin_held = true;
-    defer if (pin_held) snap.memtable_snap.release();
-
-    var total_rgs: usize = 0;
-    var total_rows: u64 = snap.memtable_row_count;
-    const seg_start = try a.alloc(usize, snap.segment_count + 1);
-    for (snap.segments, 0..) |e, i| {
-        seg_start[i] = total_rgs;
-        total_rgs += e.row_group_count;
-        total_rows += e.row_count;
-    }
-    seg_start[snap.segment_count] = total_rgs;
-    const n_chunks = @max(n_threads, @min(n_threads * 4, @max(total_rgs, 1)));
-
-    const sources = try gpa.alloc(exec.Query, n_chunks);
-    var built: usize = 0;
+    const bs = try buildScanSources(input, table, prune_leaves.items, sp.f65, scan_cols.items, n_threads);
+    const sources = bs.sources;
+    const total_rows = bs.total_rows;
     var sources_owned = true; // RegionExecOp takes them over on create
     errdefer if (sources_owned) {
-        for (sources[0..built]) |*q| q.deinit();
-        gpa.free(sources);
+        for (sources) |*q| q.deinit();
+        qa.free(sources);
     };
-    for (0..n_chunks) |i| {
-        const lo = i * total_rgs / n_chunks;
-        const hi = if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks;
-        // emit_loc: the physical row locator rides through the exchange as
-        // the FINAL consolidation sort key, so (invoiceId, date) ties inside
-        // a group keep the table's physical order — the same order the
-        // engine's staged path presents to the estimates kernel, whose
-        // representative-row picks are input-order-sensitive ("first row
-        // wins"). Without it those picks are scatter-arrival nondeterministic.
-        const s = Scan.allocWithProjectionLoc(gpa, table, input.accountant, scan_cols.items, true, snap) catch return NoMatch;
-        sources[i] = exec.makeQuery(gpa, s);
-        built += 1;
-        const start = flatToCoord(lo, seg_start, snap.segment_count);
-        const end = flatToCoord(hi, seg_start, snap.segment_count);
-        s.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
-        for (prune_leaves.items) |l| s.addPrune(l) catch {};
-        const fused = s.tryFuseFilter(sp.f65) catch return NoMatch;
-        if (!fused) return NoMatch;
-    }
-    snap.memtable_snap.release();
-    pin_held = false;
+    traceMark("scan_build", &tm);
 
     // ---- entry schema = scan output ++ entry-computed columns ------------
     const scan_schema = sources[0].outputSchema();
@@ -971,6 +1515,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         _ = try b.fb.addColNamed(col.name, col.type, col.nullable);
         try b.fb.setVis(col.name, i);
     }
+    ctx.entry_schema = entry_schema;
 
     const pj_entry = (b.fb.resolve("projectId") orelse return NoMatch).idx;
     const lc_entry = (b.fb.resolve("customerNumberLC") orelse return NoMatch).idx;
@@ -1022,6 +1567,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     const extra_parts = try a.alloc(udf_mod.TvfPartition, 2);
     extra_parts[0] = rates_part;
     extra_parts[1] = plans_part;
+    traceMark("broadcasts", &tm);
 
     // ---- op 1: rf_currency aligned over the whole shard ------------------
     // (kernel groups internally by its useDivision argument — call-site
@@ -1205,6 +1751,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         } });
         try b.fb.setVis(ext_name, pay_idx);
     }
+    traceMark("div_plan_probes", &tm);
 
     try b.applySelect(sp.s31);
     try b.applySelect(sp.s29);
@@ -1236,6 +1783,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         try b.null_sides.append(a, .{ .alias = pcc_alias, .schema = pcc_blk.schema });
         try b.null_sides.append(a, .{ .alias = pcl_alias, .schema = pcl_blk.schema });
     }
+    traceMark("empty_proofs", &tm);
 
     // exclude (join-internal computed key): drop from vis if present.
     for (sp.x23.columns) |col| b.fb.removeVis(col);
@@ -1297,6 +1845,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     // ---- compile the program ---------------------------------------------
     ctx.prog = region.Program.build(gpa, entry_schema, b.ops.items, registry) catch return NoMatch;
     ctx.prog_built = true;
+    traceMark("prog_build", &tm);
     // Emit-column NAMES for the stage schema: the program derives them from
     // the frame (canonical); patch to the SQL-visible names the group-by
     // above resolves against.
@@ -1315,15 +1864,16 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         .sort_cols = sort_cols,
         .group_prefix = 3,
     };
+    ctx.opts = opts;
 
     var q = try region.RegionExecOp.create(
-        gpa,
+        qa,
         entry_schema,
         sources,
         sp.entry_derived,
         &ctx.prog,
         opts,
-        null,
+        &ctx.pool,
         total_rows * 2,
     );
     sources_owned = false; // the query owns sources (and, below, the ctx)
@@ -1331,6 +1881,29 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         q.deinit();
         return NoMatch;
     };
+
+    // Publish into the per-database cache when possible: the cache then owns
+    // the ctx (program + pool) and the op only releases the busy pin at
+    // query teardown. Otherwise the op owns the ctx (today's one-shot).
+    if (cache) |c| blk: {
+        if (ctx.uncacheable) break :blk;
+        c.mu.lock();
+        if (c.busy) {
+            c.mu.unlock();
+            break :blk;
+        }
+        const old = c.ctx;
+        c.ctx = ctx;
+        c.hash = anchor_hash.?;
+        c.busy = true;
+        c.mu.unlock();
+        if (old) |o| Ctx.destroyErased(o);
+        op.setOwnedCtx(c, Cache.releaseErased);
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] cache store ({x})\n", .{anchor_hash.?});
+        }
+        return q;
+    }
     op.setOwnedCtx(ctx, Ctx.destroyErased);
     return q;
 }
@@ -1339,12 +1912,79 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
 // Helpers for the build pass.
 // ---------------------------------------------------------------------------
 
-fn collectAndLeaves(b: *Builder, p: PredicateExpr, out: *std.ArrayListUnmanaged(predicate_mod.Predicate)) !void {
+fn collectAndLeaves(a: Allocator, p: PredicateExpr, out: *std.ArrayListUnmanaged(predicate_mod.Predicate)) !void {
     switch (p) {
-        .leaf => |l| try out.append(b.a, l),
-        .@"and" => |kids| for (kids) |k| try collectAndLeaves(b, k, out),
+        .leaf => |l| try out.append(a, l),
+        .@"and" => |kids| for (kids) |k| try collectAndLeaves(a, k, out),
         else => {},
     }
+}
+
+const BuiltSources = struct {
+    sources: []exec.Query,
+    total_rows: u64,
+};
+
+/// Chunked fused-filter scans over the base table (the rf_custom recipe):
+/// snapshot once, split row groups into ~4×DOP ranges, prune + fuse the
+/// filter into every chunk. Scratch is query-lifetime — nothing here may
+/// grow a cached ctx arena. Caller owns `sources` until the op takes them.
+fn buildScanSources(
+    input: engine_v2.CompileInput,
+    table: anytype,
+    prune_leaves: []const predicate_mod.Predicate,
+    filter: PredicateExpr,
+    scan_cols: []const []const u8,
+    n_threads: usize,
+) !BuiltSources {
+    const qa = input.allocator;
+    table.ddl_lock.lockSharedUncancelable(table.io);
+    defer table.ddl_lock.unlockShared(table.io);
+    const snap = try Scan.captureSnapshotAlloc(table, qa);
+    defer qa.free(snap.segments);
+    var pin_held = true;
+    defer if (pin_held) snap.memtable_snap.release();
+
+    var total_rgs: usize = 0;
+    var total_rows: u64 = snap.memtable_row_count;
+    const seg_start = try qa.alloc(usize, snap.segment_count + 1);
+    defer qa.free(seg_start);
+    for (snap.segments, 0..) |e, i| {
+        seg_start[i] = total_rgs;
+        total_rgs += e.row_group_count;
+        total_rows += e.row_count;
+    }
+    seg_start[snap.segment_count] = total_rgs;
+    const n_chunks = @max(n_threads, @min(n_threads * 4, @max(total_rgs, 1)));
+
+    const sources = try qa.alloc(exec.Query, n_chunks);
+    var built: usize = 0;
+    errdefer {
+        for (sources[0..built]) |*q| q.deinit();
+        qa.free(sources);
+    }
+    for (0..n_chunks) |i| {
+        const lo = i * total_rgs / n_chunks;
+        const hi = if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks;
+        // emit_loc: the physical row locator rides through the exchange as
+        // the FINAL consolidation sort key, so (invoiceId, date) ties inside
+        // a group keep the table's physical order — the same order the
+        // engine's staged path presents to the estimates kernel, whose
+        // representative-row picks are input-order-sensitive ("first row
+        // wins"). Without it those picks are scatter-arrival nondeterministic.
+        const s = Scan.allocWithProjectionLoc(qa, table, input.accountant, scan_cols, true, snap) catch return NoMatch;
+        sources[i] = exec.makeQuery(qa, s);
+        built += 1;
+        const start = flatToCoord(lo, seg_start, snap.segment_count);
+        const end = flatToCoord(hi, seg_start, snap.segment_count);
+        s.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
+        for (prune_leaves) |l| s.addPrune(l) catch {};
+        const fused = s.tryFuseFilter(filter) catch return NoMatch;
+        if (!fused) return NoMatch;
+    }
+    snap.memtable_snap.release();
+    pin_held = false;
+    return .{ .sources = sources, .total_rows = total_rows };
 }
 
 const Coord = struct { seg: usize, rg: usize };
@@ -1362,6 +2002,13 @@ fn orderKind(t: types.Type) !region.OrderKind {
         .varchar, .string, .char => .string,
         else => NoMatch,
     };
+}
+
+fn traceMark(name: []const u8, last: *i64) void {
+    if (getenv("THINDB_REGION_TRACE") == null) return;
+    const now = exec.prof.nowTicks();
+    std.debug.print("[region] compile {s}={d:.1}ms\n", .{ name, exec.prof.ticksToMs(now - last.*) });
+    last.* = now;
 }
 
 fn lastSegment(name: []const u8) []const u8 {

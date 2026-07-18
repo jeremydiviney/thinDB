@@ -2003,6 +2003,12 @@ pub const RegionPool = struct {
         } else {
             self.ex.?.clear();
         }
+        // Tick counters are per-RUN in the trace output; without this the
+        // pooled path accumulates across runs and the per-op report lies.
+        for (self.slots.items) |slot| {
+            slot.rw.consolidate_ticks = 0;
+            if (slot.rw.op_ticks) |ticks| @memset(ticks, 0);
+        }
         while (self.slots.items.len < opts.n_threads) {
             const slot = try self.alloc.create(WorkerSlot);
             errdefer self.alloc.destroy(slot);
