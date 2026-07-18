@@ -471,6 +471,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
 
     var opts = ctx.opts;
     opts.n_threads = n_threads;
+    opts.iv_rows_est = bs.iv_rows;
 
     const q = try region.RegionExecOp.create(
         qa,
@@ -887,6 +888,9 @@ const Ctx = struct {
     /// table a compile-time drain consumed, and the kernel identities.
     entry_schema: []const Column = &.{},
     opts: region.DriverOpts = undefined,
+    /// Ordered mode: measured per-interval cost, filled by the first run
+    /// and frozen — LPT weights for every later hit (arena-owned).
+    iv_cost: []i64 = &.{},
     versions: std.ArrayListUnmanaged(TableVersion) = .empty,
     kernels: std.ArrayListUnmanaged(KernelCheck) = .empty,
     uncacheable: bool = false,
@@ -1621,6 +1625,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
     const sources = bs.sources;
     const total_rows = bs.total_rows;
+    const iv_rows_est = bs.iv_rows;
     if (order_aligned and getenv("THINDB_REGION_TRACE") != null) {
         std.debug.print("[region] order-aligned: {d} key intervals ride table order_key\n", .{sources.len});
     }
@@ -1782,6 +1787,10 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     }
     ctx.prog.output_schema = patched;
 
+    if (order_aligned) {
+        ctx.iv_cost = try a.alloc(i64, sources.len);
+        @memset(ctx.iv_cost, 0);
+    }
     const opts = region.DriverOpts{
         .n_threads = n_threads,
         .n_shards = if (order_aligned) sources.len else n_shards,
@@ -1790,8 +1799,14 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         .group_prefix = group_prefix,
         .ordered = order_aligned,
         .loc_col = rowloc_entry,
+        .iv_rows_est = iv_rows_est,
+        .iv_cost_slot = if (order_aligned) ctx.iv_cost else null,
     };
     ctx.opts = opts;
+    // The estimate slice is query-lifetime (scan-source scratch) — never
+    // let the cached ctx carry it across runs; each run supplies its own.
+    // (iv_cost_slot IS ctx-owned and deliberately persists.)
+    ctx.opts.iv_rows_est = &.{};
 
     var q = try region.RegionExecOp.create(
         qa,
@@ -2208,6 +2223,10 @@ fn collectAndLeaves(a: Allocator, p: PredicateExpr, out: *std.ArrayListUnmanaged
 const BuiltSources = struct {
     sources: []exec.Query,
     total_rows: u64,
+    /// Ordered mode only: per-interval row estimates from the RG quantile
+    /// weights (boundary RGs count toward the interval owning their min) —
+    /// drives the fused scan+exec LPT assignment.
+    iv_rows: []u64 = &.{},
 };
 
 /// Chunked fused-filter scans over the base table (the rf_custom recipe):
@@ -2358,9 +2377,13 @@ fn buildOrderedSources(
         }
     }.less);
 
+    // 2×threads intervals: 4× measured WORSE (per-interval scan setup ~37ms
+    // CPU each outweighs the finer LPT quantum; scan_cpu 3.3→4.2s @48).
     const n_iv = @max(1, @min(2 * n_threads, rgs.items.len));
     var bounds: std.ArrayListUnmanaged([]const u8) = .empty;
     defer bounds.deinit(qa);
+    var bound_mins: std.ArrayListUnmanaged(i128) = .empty;
+    defer bound_mins.deinit(qa);
     {
         var seg_rows: u64 = 0;
         for (rgs.items) |r| seg_rows += r.rows;
@@ -2374,6 +2397,7 @@ fn buildOrderedSources(
                     !std.mem.eql(u8, bounds.items[bounds.items.len - 1], s)))
                 {
                     try bounds.append(qa, s);
+                    try bound_mins.append(qa, r.min);
                 } else qa.free(s);
                 next_cut += 1;
             }
@@ -2381,6 +2405,15 @@ fn buildOrderedSources(
     }
 
     const n_src = bounds.items.len + 1;
+    const iv_rows = try qa.alloc(u64, n_src);
+    @memset(iv_rows, 0);
+    {
+        var iv: usize = 0;
+        for (rgs.items) |r| {
+            while (iv < bound_mins.items.len and r.min >= bound_mins.items[iv]) iv += 1;
+            iv_rows[iv] += r.rows;
+        }
+    }
     const sources = try qa.alloc(exec.Query, n_src);
     var built: usize = 0;
     errdefer {
@@ -2420,7 +2453,7 @@ fn buildOrderedSources(
     }
     snap.memtable_snap.release();
     pin_held = false;
-    return .{ .sources = sources, .total_rows = total_rows };
+    return .{ .sources = sources, .total_rows = total_rows, .iv_rows = iv_rows };
 }
 
 const Coord = struct { seg: usize, rg: usize };

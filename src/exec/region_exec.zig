@@ -23,6 +23,7 @@ const ColumnView = storage.ColumnView;
 const store_mod = @import("../engine/store.zig");
 const ColumnStore = store_mod.ColumnStore;
 const exec = @import("exec.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const Batch = exec.Batch;
 const compute_mod = @import("compute.zig");
 const single_batch = @import("single_batch.zig");
@@ -2010,6 +2011,16 @@ pub const DriverOpts = struct {
     /// row-loc column that detects run boundaries is `loc_col`.
     ordered: bool = false,
     loc_col: usize = 0,
+    /// Ordered mode: pre-scan per-interval row estimates (from RG quantile
+    /// weights) driving the fused scan+exec LPT assignment. Empty = assume
+    /// equal-sized intervals (the quantile bounds target that anyway).
+    iv_rows_est: []const u64 = &.{},
+    /// Ordered mode: cache-ctx-owned measured-cost slot (len n_shards).
+    /// All-zero = unfilled: the first run fills it with measured
+    /// per-interval ticks (scan+exec), then it is frozen — later runs LPT
+    /// on real costs (row counts miss group/append skew) while the
+    /// assignment stays deterministic, keeping pooled slot high-waters put.
+    iv_cost_slot: ?[]i64 = null,
 };
 
 /// Per-shard program outputs. Shards with zero input rows have empty stores.
@@ -2254,6 +2265,8 @@ const ScanPhase = struct {
     errs: []?anyerror,
 
     fn worker(self: *ScanPhase, w: usize) void {
+        var lease = core_scheduler.global().tryAcquire();
+        defer lease.release();
         self.workerInner(w) catch |e| {
             self.errs[w] = e;
         };
@@ -2407,6 +2420,8 @@ const ShardPhase = struct {
     errs: []?anyerror,
 
     fn worker(self: *ShardPhase, w: usize) void {
+        var lease = core_scheduler.global().tryAcquire();
+        defer lease.release();
         self.workerInner(w) catch |e| {
             self.errs[w] = e;
         };
@@ -2470,63 +2485,40 @@ const OrderedInterval = struct {
     last_valid: bool = true,
 };
 
-const OrderedPhase = struct {
-    schema: []const Column,
-    sources: []exec.Query,
-    intervals: []OrderedInterval,
-    next: std.atomic.Value(usize) = .init(0),
-    entry_derived: []const compute_mod.Derived,
-    scan_schema: []const Column,
-    registry: ?*const udf_mod.UdfRegistry,
-    loc_col: usize,
+fn drainOrderedInterval(
     alloc: Allocator,
-    errs: []?anyerror,
-
-    fn worker(self: *OrderedPhase, w: usize) void {
-        self.workerInner(w) catch |e| {
-            self.errs[w] = e;
-        };
-    }
-
-    fn workerInner(self: *OrderedPhase, w: usize) !void {
-        _ = w;
-        var inst: ?ComputeInstance = null;
-        defer if (inst) |*i| i.q.deinit();
-        if (self.entry_derived.len > 0) {
-            inst = try makeComputeInstance(self.alloc, self.scan_schema, self.entry_derived, self.registry);
+    schema: []const Column,
+    src: *exec.Query,
+    iv: *OrderedInterval,
+    inst: ?*ComputeInstance,
+    loc_col: usize,
+) !void {
+    try iv.sd.ensure(alloc, schema);
+    while (try src.next()) |batch| {
+        const routed = if (inst) |ci| try ci.ptr.evalBatch(batch) else batch;
+        if (routed.row_count == 0) continue;
+        const base: u32 = @intCast(iv.sd.cols[0].rowCount());
+        for (iv.sd.cols, routed.values) |*store, v| {
+            try appendViewRange(alloc, store, v, 0, routed.row_count);
         }
-        while (true) {
-            const i = self.next.fetchAdd(1, .monotonic);
-            if (i >= self.sources.len) break;
-            const iv = &self.intervals[i];
-            try iv.sd.ensure(self.alloc, self.schema);
-            while (try self.sources[i].next()) |batch| {
-                const routed = if (inst) |*ci| try ci.ptr.evalBatch(batch) else batch;
-                if (routed.row_count == 0) continue;
-                const base: u32 = @intCast(iv.sd.cols[0].rowCount());
-                for (iv.sd.cols, routed.values) |*store, v| {
-                    try appendViewRange(self.alloc, store, v, 0, routed.row_count);
-                }
-                // Run boundaries: the locator ascends within one segment's
-                // rows; any non-ascent (segment change, memtable residue)
-                // starts a new run.
-                const lv = routed.values[self.loc_col];
-                for (0..routed.row_count) |r| {
-                    const valid = lv.isValid(r);
-                    const loc: i64 = if (valid) lv.data.bigint[r] else std.math.minInt(i64);
-                    if (iv.runs.items.len == 0 or loc <= iv.last_loc or valid != iv.last_valid) {
-                        if (iv.runs.items.len == 0 or base + r > iv.runs.items[iv.runs.items.len - 1]) {
-                            try iv.runs.append(self.alloc, base + @as(u32, @intCast(r)));
-                        }
-                    }
-                    iv.last_loc = loc;
-                    iv.last_valid = valid;
+        // Run boundaries: the locator ascends within one segment's rows;
+        // any non-ascent (segment change, memtable residue) starts a new
+        // run.
+        const lv = routed.values[loc_col];
+        for (0..routed.row_count) |r| {
+            const valid = lv.isValid(r);
+            const loc: i64 = if (valid) lv.data.bigint[r] else std.math.minInt(i64);
+            if (iv.runs.items.len == 0 or loc <= iv.last_loc or valid != iv.last_valid) {
+                if (iv.runs.items.len == 0 or base + r > iv.runs.items[iv.runs.items.len - 1]) {
+                    try iv.runs.append(alloc, base + @as(u32, @intCast(r)));
                 }
             }
-            iv.sd.rows = iv.sd.cols[0].rowCount();
+            iv.last_loc = loc;
+            iv.last_valid = valid;
         }
     }
-};
+    iv.sd.rows = iv.sd.cols[0].rowCount();
+}
 
 pub fn runRegionOrdered(
     scan_schema: []const Column,
@@ -2552,50 +2544,47 @@ pub fn runRegionOrdered(
     if (pool.ivs.len != sources.len) return error.UnsupportedQueryShape;
     const intervals = pool.ivs;
 
-    var scan_phase = OrderedPhase{
-        .schema = prog.schema_at[0],
-        .sources = sources,
-        .intervals = intervals,
-        .entry_derived = entry_derived,
-        .scan_schema = scan_schema,
-        .registry = prog.registry,
-        .loc_col = opts.loc_col,
-        .alloc = alloc,
-        .errs = errs,
+    // Static LPT assignment of intervals to workers BEFORE the scan (RG
+    // quantile row estimates as the cost proxy, whales placed first), so
+    // each worker scans its own intervals and executes them immediately —
+    // no scan/exec barrier. Deterministic across runs, so each pooled
+    // slot's op-state high-water stays put instead of every slot growing
+    // to whale size over successive runs (which tipped the pool over its
+    // cap and forced full resets).
+    const have_est = opts.iv_rows_est.len == intervals.len;
+    const cost_filled = blk: {
+        const s = opts.iv_cost_slot orelse break :blk false;
+        if (s.len != intervals.len) break :blk false;
+        for (s) |c| {
+            if (c != 0) break :blk true;
+        }
+        break :blk false;
     };
-    var spawned: usize = 0;
-    for (0..opts.n_threads - 1) |w| {
-        threads[w] = try std.Thread.spawn(.{}, OrderedPhase.worker, .{ &scan_phase, w });
-        spawned += 1;
-    }
-    scan_phase.worker(opts.n_threads - 1);
-    for (threads[0..spawned]) |t| t.join();
-    for (errs) |e| if (e) |err| return err;
-
-    const t1 = if (trace) exec.prof.nowTicks() else 0;
-
-    @memset(errs, null);
-
-    // Static LPT assignment of intervals to workers (row count as the cost
-    // proxy, whales placed first). Deterministic across runs, so each pooled
-    // slot's op-state high-water stays put instead of every slot growing to
-    // whale size over successive runs (which tipped the pool over its cap).
     const order = try alloc.alloc(u32, intervals.len);
     defer alloc.free(order);
     for (order, 0..) |*o, oi| o.* = @intCast(oi);
     const SizeDesc = struct {
-        ivs: []OrderedInterval,
+        est: []const u64,
+        cost: []const i64,
+        fn weight(c: @This(), i: u32) u64 {
+            if (c.cost.len > 0 and c.cost[i] > 0) return @intCast(c.cost[i]);
+            return if (c.est.len > 0) c.est[i] else 1;
+        }
         fn less(c: @This(), a: u32, b: u32) bool {
-            const ra = c.ivs[a].sd.rows;
-            const rb = c.ivs[b].sd.rows;
+            const ra = c.weight(a);
+            const rb = c.weight(b);
             if (ra != rb) return ra > rb;
             return a < b;
         }
     };
-    std.mem.sortUnstable(u32, order, SizeDesc{ .ivs = intervals }, SizeDesc.less);
+    const sd_ctx = SizeDesc{
+        .est = if (have_est) opts.iv_rows_est else &.{},
+        .cost = if (cost_filled) opts.iv_cost_slot.? else &.{},
+    };
+    std.mem.sortUnstable(u32, order, sd_ctx, SizeDesc.less);
     const assign_col = try alloc.alloc(usize, intervals.len);
     defer alloc.free(assign_col);
-    const loads = try alloc.alloc(usize, opts.n_threads);
+    const loads = try alloc.alloc(u64, opts.n_threads);
     defer alloc.free(loads);
     @memset(loads, 0);
     for (order) |ivi| {
@@ -2604,35 +2593,54 @@ pub fn runRegionOrdered(
             if (l < loads[best]) best = w;
         }
         assign_col[ivi] = best;
-        loads[best] += intervals[ivi].sd.rows;
+        loads[best] += sd_ctx.weight(ivi);
     }
 
-    var exec_phase = OrderedExecPhase{
+    const scan_ticks = try alloc.alloc(i64, opts.n_threads);
+    defer alloc.free(scan_ticks);
+    @memset(scan_ticks, 0);
+    const iv_ticks = try alloc.alloc(i64, intervals.len);
+    defer alloc.free(iv_ticks);
+    @memset(iv_ticks, 0);
+
+    var phase = OrderedExecPhase{
         .opts = opts,
         .schema = prog.schema_at[0],
+        .sources = sources,
+        .entry_derived = entry_derived,
+        .scan_schema = scan_schema,
+        .registry = prog.registry,
         .intervals = intervals,
         .order = order,
         .assign = assign_col,
+        .scan_ticks = scan_ticks,
+        .iv_ticks = iv_ticks,
         .result = result,
         .slots = pool.slots.items[0..opts.n_threads],
         .alloc = alloc,
         .errs = errs,
     };
-    spawned = 0;
+    var spawned: usize = 0;
     for (0..opts.n_threads - 1) |w| {
-        threads[w] = try std.Thread.spawn(.{}, OrderedExecPhase.worker, .{ &exec_phase, w });
+        threads[w] = try std.Thread.spawn(.{}, OrderedExecPhase.worker, .{ &phase, w });
         spawned += 1;
     }
-    exec_phase.worker(opts.n_threads - 1);
+    phase.worker(opts.n_threads - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
+
+    if (opts.iv_cost_slot) |s| {
+        if (!cost_filled and s.len == iv_ticks.len) @memcpy(s, iv_ticks);
+    }
 
     if (trace) {
         const t2 = exec.prof.nowTicks();
         var rows: usize = 0;
         for (result.shards) |s| rows += s.rows;
-        std.debug.print("[region] ORDERED scan={d:.0}ms intervals={d} direct={d} exec={d:.0}ms out_rows={d} threads={d}\n", .{
-            exec.prof.ticksToMs(t1 - t0), sources.len, exec_phase.direct.load(.monotonic), exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads,
+        var scan_cpu: i64 = 0;
+        for (scan_ticks) |t| scan_cpu += t;
+        std.debug.print("[region] ORDERED FUSED total={d:.0}ms intervals={d} direct={d} scan_cpu={d:.0}ms out_rows={d} threads={d}\n", .{
+            exec.prof.ticksToMs(t2 - t0), sources.len, phase.direct.load(.monotonic), exec.prof.ticksToMs(scan_cpu), rows, opts.n_threads,
         });
         var con: i64 = 0;
         for (pool.slots.items[0..opts.n_threads]) |slot| con += slot.rw.consolidate_ticks;
@@ -2652,9 +2660,15 @@ pub fn runRegionOrdered(
 const OrderedExecPhase = struct {
     opts: DriverOpts,
     schema: []const Column,
+    sources: []exec.Query,
+    entry_derived: []const compute_mod.Derived,
+    scan_schema: []const Column,
+    registry: ?*const udf_mod.UdfRegistry,
     intervals: []OrderedInterval,
     order: []const u32,
     assign: []const usize,
+    scan_ticks: []i64,
+    iv_ticks: []i64,
     direct: std.atomic.Value(usize) = .init(0),
     result: *RegionResult,
     slots: []const *RegionPool.WorkerSlot,
@@ -2662,6 +2676,8 @@ const OrderedExecPhase = struct {
     errs: []?anyerror,
 
     fn worker(self: *OrderedExecPhase, w: usize) void {
+        var lease = core_scheduler.global().tryAcquire();
+        defer lease.release();
         self.workerInner(w) catch |e| {
             self.errs[w] = e;
         };
@@ -2675,10 +2691,30 @@ const OrderedExecPhase = struct {
         const sort_cols = self.opts.sort_cols;
         const n_sort = sort_cols.len;
 
+        var inst: ?ComputeInstance = null;
+        defer if (inst) |*ci| ci.q.deinit();
+        if (self.entry_derived.len > 0) {
+            inst = try makeComputeInstance(self.alloc, self.scan_schema, self.entry_derived, self.registry);
+        }
+
         for (self.order) |ivi| {
             if (self.assign[ivi] != w) continue;
             const i: usize = ivi;
             const iv = &self.intervals[i];
+            const t_iv = exec.prof.nowTicks();
+            defer self.iv_ticks[i] = exec.prof.nowTicks() - t_iv;
+
+            const t_scan = if (rw.op_ticks != null) exec.prof.nowTicks() else 0;
+            try drainOrderedInterval(
+                self.alloc,
+                self.schema,
+                &self.sources[i],
+                iv,
+                if (inst) |*ci| ci else null,
+                self.opts.loc_col,
+            );
+            if (rw.op_ticks != null) self.scan_ticks[w] += exec.prof.nowTicks() - t_scan;
+
             const total = iv.sd.rows;
             if (total == 0) continue;
             _ = slot.scratch.reset(.retain_capacity);
