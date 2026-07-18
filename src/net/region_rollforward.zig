@@ -107,6 +107,138 @@ pub fn tryRecognize(input: engine_v2.CompileInput, root: *const ir.Op) ?Recogniz
 }
 
 // ---------------------------------------------------------------------------
+// Declared regions: `WITH KEYED BY (k1, ...)`. The declaration is a HARD
+// contract — the block must verify (every GROUP BY / window PARTITION BY /
+// TVF PARTITION BY along the pipeline contains the declared keys) and must
+// compile as a region; violations and unsupported constructs are compile
+// errors, never a silent fall-back to the staged path. Join right sides and
+// secondary TVF inputs are exempt from the key check: they are broadcast /
+// empty-proof candidates the region compiler validates by executing them.
+// ---------------------------------------------------------------------------
+
+/// Entry for the declared path (no env gate). Returns null when the query
+/// declares no keyed block; errors when it declares one that can't run.
+pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerror!?Recognized {
+    // Find the topmost CTE boundary carrying declared keys.
+    var cur = root;
+    var depth: usize = 0;
+    const top: *const ir.Op = blk: {
+        while (depth < 16) : (depth += 1) {
+            switch (cur.*) {
+                .materialize => |m| {
+                    if (m.region_keys != null) break :blk cur;
+                    cur = m.upstream;
+                },
+                .select => |p| cur = p.upstream,
+                .exclude => |p| cur = p.upstream,
+                .filter => |f| cur = f.upstream,
+                .group_by => |g| cur = g.upstream,
+                .compute => |c| cur = c.upstream,
+                .limit => |l| cur = l.upstream,
+                .order_by => |o| cur = o.upstream,
+                else => return null,
+            }
+        }
+        return null;
+    };
+    const keys = top.materialize.region_keys.?;
+
+    try verifyKeyContract(top, keys, 0);
+
+    // Compile: try the marked boundary, then boundaries below it — the
+    // program anchor can sit under the outermost CTE (e.g. when the final
+    // CTE is a plain projection the staged path composes above the region).
+    cur = top;
+    depth = 0;
+    while (depth < 16) : (depth += 1) {
+        switch (cur.*) {
+            .materialize => |m| {
+                if (tryCachedAt(input, cur)) |q| {
+                    return .{ .anchor = cur, .query = q };
+                }
+                if (recognizeAt(input, cur)) |q| {
+                    return .{ .anchor = cur, .query = q };
+                } else |e| {
+                    if (e == error.OutOfMemory) return e;
+                    if (getenv("THINDB_REGION_TRACE") != null) {
+                        std.debug.print("[region] declared block declined at {*}: {s}\n", .{ cur, @errorName(e) });
+                    }
+                }
+                cur = m.upstream;
+            },
+            .select => |p| cur = p.upstream,
+            .exclude => |p| cur = p.upstream,
+            .filter => |f| cur = f.upstream,
+            .group_by => |g| cur = g.upstream,
+            .compute => |c| cur = c.upstream,
+            .limit => |l| cur = l.upstream,
+            .order_by => |o| cur = o.upstream,
+            else => break,
+        }
+    }
+    std.debug.print("[region] KEYED BY block did not compile: no boundary matches a supported region shape\n", .{});
+    return error.RegionUnsupportedConstruct;
+}
+
+/// Static half of the contract: walk the block's pipeline (left/primary
+/// spine) and require every partition-defining construct to contain every
+/// declared key. Stages may partition FINER (extra columns), never coarser —
+/// that is what guarantees no row ever needs another shard's data.
+fn verifyKeyContract(op: *const ir.Op, keys: []const []const u8, depth: usize) anyerror!void {
+    if (depth > 64) return error.RegionUnsupportedConstruct;
+    var cur = op;
+    var guard: usize = 0;
+    while (guard < 256) : (guard += 1) {
+        switch (cur.*) {
+            .scan, .single_row, .file_scan => return,
+            .materialize => |m| cur = m.upstream,
+            .alias => |a| cur = a.upstream,
+            .select => |p| cur = p.upstream,
+            .exclude => |p| cur = p.upstream,
+            .filter => |f| cur = f.upstream,
+            .compute => |c| cur = c.upstream,
+            .limit => |l| cur = l.upstream,
+            .order_by => |o| cur = o.upstream,
+            .group_by => |g| {
+                try requireKeys(keys, g.group_cols, "GROUP BY");
+                cur = g.upstream;
+            },
+            .window => |w| {
+                for (w.specs) |spec| try requireKeys(keys, spec.partition_by, "window PARTITION BY");
+                cur = w.upstream;
+            },
+            .table_fn => |t| {
+                if (t.partition_by.len > 0) try requireKeys(keys, t.partition_by, "TABLE(...) PARTITION BY");
+                if (t.inputs.len == 0) return;
+                cur = t.inputs[0];
+            },
+            .join => |j| cur = j.left,
+            .set_union => |u| {
+                try verifyKeyContract(u.left, keys, depth + 1);
+                cur = u.right;
+            },
+            else => {
+                std.debug.print("[region] KEYED BY contract: unsupported construct '{s}' inside the block\n", .{@tagName(std.meta.activeTag(cur.*))});
+                return error.RegionUnsupportedConstruct;
+            },
+        }
+    }
+    return error.RegionUnsupportedConstruct;
+}
+
+fn requireKeys(keys: []const []const u8, cols: []const []const u8, what: []const u8) !void {
+    outer: for (keys) |k| {
+        for (cols) |c| {
+            if (std.ascii.eqlIgnoreCase(lastSegment(c), lastSegment(k))) continue :outer;
+        }
+        std.debug.print("[region] KEYED BY contract violation: a {s} does not include declared key '{s}' (partitions on:", .{ what, k });
+        for (cols) |c| std.debug.print(" {s}", .{c});
+        std.debug.print(")\n", .{});
+        return error.RegionKeyContractViolation;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cross-run region cache — the probe's pooled-buffer discipline in engine
 // form. One entry per Database, keyed by a deterministic deep hash of the
 // anchor IR subtree (post-fold, so folded dates/constants are captured). A
@@ -501,6 +633,10 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
         },
         .materialize => |m| {
             hu(h, @intFromBool(m.forced));
+            if (m.region_keys) |keys| {
+                hu(h, keys.len + 1);
+                for (keys) |k| hstr(h, k);
+            } else hu(h, 0);
             try hashOp(h, m.upstream);
         },
         .window => |w| {

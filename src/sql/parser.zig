@@ -263,6 +263,7 @@ pub fn parseWithContext(
         try statements.append(arena, op);
         // Reset CTE state — each statement parses with a fresh scope.
         parser.ctes.clearRetainingCapacity();
+        parser.region_keys = null;
 
         // Consume any number of `;` and stop at EOF.
         var saw_sep = false;
@@ -414,6 +415,10 @@ pub const Parser = struct {
     /// Flat scope: nested SELECTs can reference outer CTEs but
     /// redefining an existing name errors.
     ctes: std.StringHashMapUnmanaged(CteEntry) = .empty,
+    /// `WITH KEYED BY (...)` declaration for the current statement's CTE
+    /// block; stamped onto every CTE materialize boundary so the region
+    /// compiler can find and verify the block. First declaration wins.
+    region_keys: ?[]const []const u8 = null,
     /// Named windows declared in the trailing `WINDOW name AS (...)`
     /// clause of the current SELECT. Populated by `parseWindowClause`
     /// before projection lowering; consumed by `parseWindowSpecOrRef`
@@ -3103,12 +3108,35 @@ pub const Parser = struct {
     /// call sees the already-populated map).
     fn parseCteList(self: *Parser) ParseError!void {
         try self.advance(); // consume WITH
+        var first = true;
         while (true) {
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             // CTE names are object names: stored/looked up lowercased so
             // `WITH Foo ... FROM foo` resolves (idents now lex as-typed).
             const name = try std.ascii.allocLowerString(self.arena, self.cur.text);
             try self.advance();
+
+            // `WITH KEYED BY (k1, k2, ...) cte AS (...)`: declared keyed-
+            // region block. Disambiguated one token late — a CTE actually
+            // named `keyed` is followed by AS, never BY.
+            if (first and self.cur.tag == .kw_by and std.mem.eql(u8, name, "keyed")) {
+                first = false;
+                try self.advance();
+                try self.expect(.lparen);
+                var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+                while (true) {
+                    if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+                    try keys.append(self.arena, try self.arena.dupe(u8, self.cur.text));
+                    try self.advance();
+                    if (self.cur.tag != .comma) break;
+                    try self.advance();
+                }
+                try self.expect(.rparen);
+                if (self.region_keys == null) self.region_keys = keys.items;
+                continue;
+            }
+            first = false;
+
             if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
             try self.advance();
 
@@ -4114,6 +4142,7 @@ pub const Parser = struct {
             cte_op.* = .{
                 .materialize = .{
                     .upstream = inner,
+                    .region_keys = self.region_keys,
                     // Explicit AS MATERIALIZED: the staged compiler must buffer
                     // even a single-reference body it would otherwise inline.
                     .forced = entry.value_ptr.hint == .force,
@@ -4692,4 +4721,30 @@ test "structural materialize CSE is limited to independent expansions" {
     const regenerated_mat = firstMaterializeForTest(regenerated);
     try std.testing.expect(regenerated_mat != null);
     try std.testing.expect(regenerated_mat.?.materialize.structural_cse);
+}
+
+test "WITH KEYED BY marks CTE boundaries; a CTE named keyed still parses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const declared = try parse(aa, "WITH KEYED BY (projectId, custLC) c AS (SELECT projectId, custLC FROM t GROUP BY projectId, custLC) SELECT * FROM c");
+    const mat = firstMaterializeForTest(declared);
+    try std.testing.expect(mat != null);
+    const keys = mat.?.materialize.region_keys.?;
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("projectId", keys[0]);
+    try std.testing.expectEqualStrings("custLC", keys[1]);
+
+    // `keyed` as an ordinary CTE name: disambiguated by the following AS.
+    const plain = try parse(aa, "WITH keyed AS (SELECT x FROM t) SELECT x FROM keyed");
+    const plain_mat = firstMaterializeForTest(plain);
+    try std.testing.expect(plain_mat != null);
+    try std.testing.expect(plain_mat.?.materialize.region_keys == null);
+
+    // Undeclared WITH: no keys on the boundary.
+    const undeclared = try parse(aa, "WITH c AS (SELECT x FROM t) SELECT x FROM c");
+    const undeclared_mat = firstMaterializeForTest(undeclared);
+    try std.testing.expect(undeclared_mat != null);
+    try std.testing.expect(undeclared_mat.?.materialize.region_keys == null);
 }

@@ -764,6 +764,13 @@ pub const Op = union(OpTag) {
         /// every nested body would make deep CTE stacks quadratic. This is a
         /// parse-time compilation hint, not part of the serialized IR.
         structural_cse: bool = false,
+        /// `WITH KEYED BY (k1, ...)`: the CTE block this boundary belongs to
+        /// is contractually partitioned by these keys — every GROUP BY /
+        /// PARTITION BY inside must contain them, which the region compiler
+        /// verifies and then executes shard-parallel with zero inner
+        /// materializations. A violation is a compile ERROR (the declaration
+        /// is a promise, not a hint). Parse-time only, not serialized.
+        region_keys: ?[]const []const u8 = null,
     };
 
 

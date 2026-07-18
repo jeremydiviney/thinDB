@@ -84,19 +84,26 @@ pub fn compileStaged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage
         cse.canon.deinit(input.allocator);
     }
     try countMatRefs(input.allocator, root, &cse);
-    // Keyed pipeline regions (task #184, THINDB_REGION=1): a recognized
-    // subtree pre-registers its stage here, BEFORE the window-wrap rewrite
-    // mutates nodes below its anchor; collectStages' map hit then stops the
-    // walk at the anchor and compileBlock reads the region output as an
-    // ordinary stage.
-    if (getenv("THINDB_REGION") != null) {
-        if (@import("region_rollforward.zig").tryRecognize(input, root)) |rec| {
-            const stage = try set.addStage(rec.query, input.accountant);
-            const rep = cse.canon.get(rec.anchor) orelse rec.anchor;
-            try map.put(input.allocator, rep, stage);
-            if (rep != rec.anchor) try map.put(input.allocator, rec.anchor, stage);
-            std.debug.print("[region] rollforward region engaged\n", .{});
+    // Keyed pipeline regions: a recognized subtree pre-registers its stage
+    // here, BEFORE the window-wrap rewrite mutates nodes below its anchor;
+    // collectStages' map hit then stops the walk at the anchor and
+    // compileBlock reads the region output as an ordinary stage.
+    //
+    // Two triggers: a `WITH KEYED BY (...)` declaration (hard contract —
+    // verification/compile failures are query errors), or the THINDB_REGION=1
+    // auto-recognizer (best effort — declines fall back silently).
+    region: {
+        const region_mod = @import("region_rollforward.zig");
+        var rec_opt = try region_mod.compileDeclared(input, root);
+        if (rec_opt == null and getenv("THINDB_REGION") != null) {
+            rec_opt = region_mod.tryRecognize(input, root);
         }
+        const rec = rec_opt orelse break :region;
+        const stage = try set.addStage(rec.query, input.accountant);
+        const rep = cse.canon.get(rec.anchor) orelse rec.anchor;
+        try map.put(input.allocator, rep, stage);
+        if (rep != rec.anchor) try map.put(input.allocator, rec.anchor, stage);
+        std.debug.print("[region] region engaged\n", .{});
     }
     wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse) catch {};
     try collectStages(input, root, set, &map, &cse);
