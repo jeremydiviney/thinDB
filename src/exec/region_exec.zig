@@ -1782,10 +1782,15 @@ pub const RegionWorker = struct {
         for (s.out) |*c| c.clear();
         s.ranges.clearRetainingCapacity();
         const sa = self.scratch.allocator();
-        const out_ptrs = try sa.alloc(*ColumnStore, s.out.len);
+        // union_append: one out pointer PER KERNEL OUTPUT (spec.inputs maps
+        // each back onto its frame column; partial coverage means fewer
+        // outputs than frame columns — mirroring fusedTailRun). Sizing this
+        // to s.out.len zipped garbage past spec.inputs' end.
+        const out_ptrs = if (t.union_append)
+            try sa.alloc(*ColumnStore, t.spec.inputs.len)
+        else
+            try sa.alloc(*ColumnStore, s.out.len);
         if (t.union_append) {
-            // Kernel outputs are in the kernel's declared order; `inputs`
-            // maps each one back onto its frame column.
             for (out_ptrs, t.spec.inputs) |*p, ci| p.* = &s.out[ci];
         } else {
             for (s.out, out_ptrs) |*c, *p| p.* = c;
