@@ -84,21 +84,13 @@ pub fn compileStaged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage
         cse.canon.deinit(input.allocator);
     }
     try countMatRefs(input.allocator, root, &cse);
-    // Keyed pipeline regions: a recognized subtree pre-registers its stage
-    // here, BEFORE the window-wrap rewrite mutates nodes below its anchor;
-    // collectStages' map hit then stops the walk at the anchor and
-    // compileBlock reads the region output as an ordinary stage.
-    //
-    // Two triggers: a `WITH KEYED BY (...)` declaration (hard contract —
-    // verification/compile failures are query errors), or the THINDB_REGION=1
-    // auto-recognizer (best effort — declines fall back silently).
-    region: {
-        const region_mod = @import("region_rollforward.zig");
-        var rec_opt = try region_mod.compileDeclared(input, root);
-        if (rec_opt == null and getenv("THINDB_REGION") != null) {
-            rec_opt = region_mod.tryRecognize(input, root);
-        }
-        const rec = rec_opt orelse break :region;
+    // Keyed pipeline regions (`WITH KEYED BY (...)`): a declared block
+    // pre-registers its stage here, BEFORE the window-wrap rewrite mutates
+    // nodes below its anchor; collectStages' map hit then stops the walk at
+    // the anchor and compileBlock reads the region output as an ordinary
+    // stage. The declaration is a hard contract — verification/compile
+    // failures are query errors, never a silent fall-back.
+    if (try @import("region_rollforward.zig").compileDeclared(input, root)) |rec| {
         const stage = try set.addStage(rec.query, input.accountant);
         const rep = cse.canon.get(rec.anchor) orelse rec.anchor;
         try map.put(input.allocator, rep, stage);

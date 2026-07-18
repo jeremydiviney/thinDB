@@ -44,7 +44,7 @@ const tdb = @import("thindb").tdb;
 
 pub const spec = tdb.TableFnSpec{
     .name = "rf_currency_convert",
-    .execution = .partitioned,
+    .execution = .either,
     .row_aligned = true,
     .broadcast_inputs = &.{ 1, 2 },
 };

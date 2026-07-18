@@ -1,23 +1,22 @@
-//! Keyed-pipeline-region recognizer for the wayroll rollforward shape
-//! (task #184 P0, REGION_PLAN.md §7). Behind THINDB_REGION=1.
+//! Keyed pipeline regions: the compiler for `WITH KEYED BY (...)` blocks
+//! (tasks #184/#185, REGION_PLAN.md §7).
 //!
-//! Matches the post-pass IR of the 15-CTE rollforward query (ground truth:
-//! the four rf_* TVF calls chained over one invoice scan, keyed end-to-end
-//! by customerNumberLC) and compiles the whole subtree into ONE region
-//! program: exchange-scatter the scan by wyhash(customerNumberLC), then per
-//! shard run estimates-union → currency kernel → computes → in-group ranks
-//! → keyed group-agg → gap-fill → up/down chain → broadcast probes → final
-//! ranks, with zero stage materializations. The region's output becomes an
-//! ordinary Stage (per-shard chunks adopted zero-copy); the keyed GROUP BY
-//! above it and the rest of the query compile normally.
+//! The declaration is a hard contract: every GROUP BY / window PARTITION BY
+//! / TVF PARTITION BY in the block contains the declared keys (statically
+//! verified — violations are compile errors, never silent fallback). A
+//! verified block compiles into ONE region program: exchange-scatter the
+//! base scan by a declared key's hash, then run the whole chain
+//! shard-locally with zero stage materializations. There is no fixed query
+//! shape — the block's IR is collected into an ordered step list and each
+//! step dispatches on STRUCTURE and kernel SDK METADATA (execution mode,
+//! passthrough, broadcast inputs), never on names. The region's output
+//! becomes an ordinary Stage (per-shard chunks adopted zero-copy); the rest
+//! of the query compiles normally above it.
 //!
-//! Matching is strict: any structural deviation declines (returns null) and
-//! the staged compiler proceeds untouched. Two semantic preconditions are
-//! verified by EXECUTING small subtrees at compile time (same precedent as
-//! scalar-subquery resolution): the customer-totals build side must be
-//! EMPTY (its four LEFT joins then reduce to typed NULL columns — exact),
-//! and the broadcast lookups (division / external_plan / currency rates)
-//! are drained into in-memory maps/partitions.
+//! Semantic preconditions are verified by EXECUTING small subtrees at
+//! compile time (same precedent as scalar-subquery resolution): LEFT-join
+//! build sides proven empty reduce to typed NULL columns; small join sides
+//! and secondary TVF inputs are drained into broadcast maps/partitions.
 //!
 //! Name discipline: the region frame only ever APPENDS columns (no
 //! pruning), so the engine's suffix-based column resolution would misbind
@@ -61,51 +60,6 @@ pub const Recognized = struct {
     anchor: *const ir.Op,
     query: exec.Query,
 };
-
-/// Entry point (called from compileStaged behind THINDB_REGION=1). Returns
-/// the region query + its anchor materialize node on success; null when the
-/// plan doesn't match. Never fails the compile: every error except OOM is a
-/// decline.
-pub fn tryRecognize(input: engine_v2.CompileInput, root: *const ir.Op) ?Recognized {
-    var cur = root;
-    var depth: usize = 0;
-    while (depth < 16) : (depth += 1) {
-        switch (cur.*) {
-            .materialize => |m| {
-                if (tryCachedAt(input, cur)) |q| {
-                    return .{ .anchor = cur, .query = q };
-                }
-                if (recognizeAt(input, cur)) |q| {
-                    return .{ .anchor = cur, .query = q };
-                } else |e| {
-                    if (e == error.OutOfMemory) return null;
-                    if (getenv("THINDB_REGION_TRACE") != null) {
-                        std.debug.print("[region] decline at materialize {*}: {s}\n", .{ cur, @errorName(e) });
-                        if (@errorReturnTrace()) |t| {
-                            const n = @min(t.index, t.instruction_addresses.len);
-                            const st = std.debug.StackTrace{
-                                .return_addresses = t.instruction_addresses[0..n],
-                                .skipped = .none,
-                            };
-                            std.debug.dumpStackTrace(&st);
-                        }
-                    }
-                }
-                cur = m.upstream;
-            },
-            .select => |p| cur = p.upstream,
-            .exclude => |p| cur = p.upstream,
-            .filter => |f| cur = f.upstream,
-            .group_by => |g| cur = g.upstream,
-            .compute => |c| cur = c.upstream,
-            .limit => |l| cur = l.upstream,
-            .order_by => |o| cur = o.upstream,
-            else => return null,
-        }
-    }
-    return null;
-}
-
 // ---------------------------------------------------------------------------
 // Declared regions: `WITH KEYED BY (k1, ...)`. The declaration is a HARD
 // contract — the block must verify (every GROUP BY / window PARTITION BY /
@@ -156,12 +110,20 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                 if (tryCachedAt(input, cur)) |q| {
                     return .{ .anchor = cur, .query = q };
                 }
-                if (recognizeAt(input, cur)) |q| {
+                if (buildRegion(input, cur, keys)) |q| {
                     return .{ .anchor = cur, .query = q };
                 } else |e| {
                     if (e == error.OutOfMemory) return e;
                     if (getenv("THINDB_REGION_TRACE") != null) {
                         std.debug.print("[region] declared block declined at {*}: {s}\n", .{ cur, @errorName(e) });
+                        if (@errorReturnTrace()) |t| {
+                            const n = @min(t.index, t.instruction_addresses.len);
+                            const st = std.debug.StackTrace{
+                                .return_addresses = t.instruction_addresses[0..n],
+                                .skipped = .none,
+                            };
+                            std.debug.dumpStackTrace(&st);
+                        }
                     }
                 }
                 cur = m.upstream;
@@ -446,30 +408,34 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op) ?exec.Query 
     return q;
 }
 
-/// The hit path: fresh spine walk (validates shape, provides IR-backed scan
-/// recipe + entry compute), fresh snapshot scans, then the cached Program +
-/// pool. The entry schema is compared against the cached program's — any
-/// DDL drift on the scan table declines back to a full recognize.
+/// The hit path: fresh pipeline collection (validates shape, provides the
+/// IR-backed scan recipe + entry computes), fresh snapshot scans, then the
+/// cached Program + pool. The entry schema is compared against the cached
+/// program's — any DDL drift on the scan table declines to a full build.
 fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !exec.Query {
-    const sp = try walkSpine(anchor);
     const qa = input.allocator;
+    const pl = try collectPipeline(input.node_arena, anchor);
 
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
     defer prune_leaves.deinit(qa);
-    try collectAndLeaves(qa, sp.f65, &prune_leaves);
+    try collectAndLeaves(qa, pl.entry_filter, &prune_leaves);
 
     var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
     defer scan_cols.deinit(qa);
-    outer: for (sp.s63.columns) |col| {
-        for (sp.entry_derived) |d| {
-            if (std.ascii.eqlIgnoreCase(d.name, col)) continue :outer;
+    var scan_cols_opt: ?[]const []const u8 = null;
+    if (pl.entry_sel) |sel| {
+        outer: for (sel.columns) |col| {
+            for (pl.entry_derived) |d| {
+                if (std.ascii.eqlIgnoreCase(d.name, col)) continue :outer;
+            }
+            try scan_cols.append(qa, col);
         }
-        try scan_cols.append(qa, col);
+        scan_cols_opt = scan_cols.items;
     }
 
-    const table = input.db.openTable(sp.scan66.table.name, .{}) catch return NoMatch;
+    const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
     const n_threads = @max(input.effectiveDop(), 1);
-    const bs = try buildScanSources(input, table, prune_leaves.items, sp.f65, scan_cols.items, n_threads);
+    const bs = try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
     var sources_owned = true;
     errdefer if (sources_owned) {
         for (bs.sources) |*s| s.deinit();
@@ -478,7 +444,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
 
     const scan_schema = bs.sources[0].outputSchema();
     const want = ctx.entry_schema;
-    if (scan_schema.len + sp.entry_derived.len != want.len) return NoMatch;
+    if (scan_schema.len + pl.entry_derived.len != want.len) return NoMatch;
     const rowloc_entry = scan_schema.len - 1;
     for (scan_schema, want[0..scan_schema.len], 0..) |src, w, i| {
         if (!std.ascii.eqlIgnoreCase(src.name, w.name)) return NoMatch;
@@ -486,7 +452,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         const want_nullable = if (i == rowloc_entry) true else src.nullable;
         if (w.nullable != want_nullable) return NoMatch;
     }
-    for (sp.entry_derived, want[scan_schema.len..]) |d, w| {
+    for (pl.entry_derived, want[scan_schema.len..]) |d, w| {
         if (!std.ascii.eqlIgnoreCase(d.name, w.name)) return NoMatch;
     }
 
@@ -497,7 +463,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         qa,
         ctx.entry_schema,
         bs.sources,
-        sp.entry_derived,
+        pl.entry_derived,
         &ctx.prog,
         opts,
         &ctx.pool,
@@ -792,229 +758,6 @@ fn hashPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void 
 }
 
 // ---------------------------------------------------------------------------
-// Spine walk: strict top-down capture of every node in the rollforward shape.
-// ---------------------------------------------------------------------------
-
-const Spine = struct {
-    /// The keyed monthly GROUP BY directly above the projection — present
-    /// when the anchor is the materialize ABOVE it (the aggregation then
-    /// runs in-region as a merged-span group_agg).
-    g12: ?*const ir.Op.GroupBy,
-    s14: *const ir.Op.Project,
-    w15: *const ir.WindowOp,
-    c16: []const Derived,
-    s18: *const ir.Op.Project,
-    c19: []const Derived,
-    c20: []const Derived,
-    j21: *const ir.Op.Join, // pc_last
-    j22: *const ir.Op.Join, // pc_current
-    x23: *const ir.Op.Project,
-    j24: *const ir.Op.Join, // ctl
-    j26: *const ir.Op.Join, // ctc
-    s29: *const ir.Op.Project,
-    s31: *const ir.Op.Project,
-    j32: *const ir.Op.Join, // pc plan probe
-    j33: *const ir.Op.Join, // division
-    s36: *const ir.Op.Project,
-    tf37: *const ir.Op.TableFn, // rf_updown_chain
-    s38: *const ir.Op.Project,
-    c39: []const Derived,
-    s41: *const ir.Op.Project,
-    tf42: *const ir.Op.TableFn, // rf_gap_fill
-    s45: *const ir.Op.Project,
-    w46: *const ir.WindowOp,
-    s48: *const ir.Op.Project,
-    c49: []const Derived,
-    g50: *const ir.Op.GroupBy,
-    c51: []const Derived,
-    s53: *const ir.Op.Project,
-    w54: *const ir.WindowOp,
-    c55: []const Derived,
-    s57: *const ir.Op.Project,
-    tf58: *const ir.Op.TableFn, // rf_currency_convert
-    s59: *const ir.Op.Project,
-    u61: *const ir.SetUnion,
-    base_mat: *const ir.Op, // shared materialize of the invoice base
-    s63: *const ir.Op.Project,
-    entry_derived: []const Derived, // c64
-    f65: PredicateExpr,
-    scan66: *const ir.Op.Scan,
-    s68: *const ir.Op.Project,
-    tf69: *const ir.Op.TableFn, // rf_estimates
-    f71: PredicateExpr, // estimates date window
-};
-
-const Cursor = struct {
-    cur: *const ir.Op,
-
-    fn mat(w: *Cursor) !void {
-        if (w.cur.* != .materialize) return NoMatch;
-        w.cur = w.cur.materialize.upstream;
-    }
-    fn sel(w: *Cursor) !*const ir.Op.Project {
-        if (w.cur.* != .select) return NoMatch;
-        const p = &w.cur.select;
-        w.cur = p.upstream;
-        return p;
-    }
-    fn excl(w: *Cursor) !*const ir.Op.Project {
-        if (w.cur.* != .exclude) return NoMatch;
-        const p = &w.cur.exclude;
-        w.cur = p.upstream;
-        return p;
-    }
-    fn comp(w: *Cursor) ![]const Derived {
-        if (w.cur.* != .compute) return NoMatch;
-        const c = &w.cur.compute;
-        w.cur = c.upstream;
-        return c.derived;
-    }
-    fn win(w: *Cursor) !*const ir.WindowOp {
-        if (w.cur.* != .window) return NoMatch;
-        const ww = &w.cur.window;
-        w.cur = ww.upstream;
-        return ww;
-    }
-    fn joinLeft(w: *Cursor) !*const ir.Op.Join {
-        if (w.cur.* != .join) return NoMatch;
-        const j = &w.cur.join;
-        if (j.join_type != .left) return NoMatch;
-        w.cur = j.left;
-        return j;
-    }
-    fn joinInner(w: *Cursor) !*const ir.Op.Join {
-        if (w.cur.* != .join) return NoMatch;
-        const j = &w.cur.join;
-        if (j.join_type != .inner) return NoMatch;
-        w.cur = j.left;
-        return j;
-    }
-    fn alias(w: *Cursor) ![]const u8 {
-        if (w.cur.* != .alias) return NoMatch;
-        const a = &w.cur.alias;
-        w.cur = a.upstream;
-        return a.alias;
-    }
-    fn tvf(w: *Cursor, name: []const u8) !*const ir.Op.TableFn {
-        if (w.cur.* != .table_fn) return NoMatch;
-        const t = &w.cur.table_fn;
-        if (!std.ascii.eqlIgnoreCase(t.name, name)) return NoMatch;
-        if (t.inputs.len < 1) return NoMatch;
-        w.cur = t.inputs[0];
-        return t;
-    }
-    fn filt(w: *Cursor) !PredicateExpr {
-        if (w.cur.* != .filter) return NoMatch;
-        const f = &w.cur.filter;
-        w.cur = f.upstream;
-        return f.predicate;
-    }
-};
-
-fn walkSpine(root_mat: *const ir.Op) !Spine {
-    if (root_mat.* != .materialize) return NoMatch;
-    var w = Cursor{ .cur = root_mat.materialize.upstream };
-    var sp: Spine = undefined;
-
-    sp.g12 = null;
-    if (w.cur.* == .group_by) {
-        sp.g12 = &w.cur.group_by;
-        w.cur = w.cur.group_by.upstream;
-        try w.mat();
-    }
-    sp.s14 = try w.sel();
-    sp.w15 = try w.win();
-    sp.c16 = try w.comp();
-    try w.mat();
-    sp.s18 = try w.sel();
-    sp.c19 = try w.comp();
-    sp.c20 = try w.comp();
-    sp.j21 = try w.joinLeft();
-    sp.j22 = try w.joinLeft();
-    sp.x23 = try w.excl();
-    sp.j24 = try w.joinLeft();
-    _ = try w.comp(); // __join_on_left_3 (join-internal; build side is empty)
-    sp.j26 = try w.joinLeft();
-    if (!std.ascii.eqlIgnoreCase(try w.alias(), "r")) return NoMatch;
-    try w.mat();
-    sp.s29 = try w.sel();
-    try w.mat();
-    sp.s31 = try w.sel();
-    sp.j32 = try w.joinLeft();
-    sp.j33 = try w.joinInner();
-    if (!std.ascii.eqlIgnoreCase(try w.alias(), "r")) return NoMatch;
-    try w.mat();
-    sp.s36 = try w.sel();
-    sp.tf37 = try w.tvf("rf_updown_chain");
-    sp.s38 = try w.sel();
-    sp.c39 = try w.comp();
-    try w.mat();
-    sp.s41 = try w.sel();
-    sp.tf42 = try w.tvf("rf_gap_fill");
-    _ = try w.sel(); // s43: identity projection over the agg stage
-    try w.mat();
-    sp.s45 = try w.sel();
-    sp.w46 = try w.win();
-    try w.mat();
-    sp.s48 = try w.sel();
-    sp.c49 = try w.comp();
-    if (w.cur.* != .group_by) return NoMatch;
-    sp.g50 = &w.cur.group_by;
-    w.cur = sp.g50.upstream;
-    sp.c51 = try w.comp();
-    try w.mat();
-    sp.s53 = try w.sel();
-    sp.w54 = try w.win();
-    sp.c55 = try w.comp();
-    try w.mat();
-    sp.s57 = try w.sel();
-    sp.tf58 = try w.tvf("rf_currency_convert");
-    if (sp.tf58.inputs.len != 3) return NoMatch;
-    sp.s59 = try w.sel();
-    try w.mat();
-    if (w.cur.* != .set_union) return NoMatch;
-    sp.u61 = &w.cur.set_union;
-    if (!sp.u61.all) return NoMatch;
-
-    // Base arm: materialize -> select -> compute(entry) -> filter -> scan.
-    sp.base_mat = sp.u61.left;
-    var wb = Cursor{ .cur = sp.base_mat };
-    try wb.mat();
-    sp.s63 = try wb.sel();
-    sp.entry_derived = try wb.comp();
-    sp.f65 = try wb.filt();
-    if (wb.cur.* != .scan) return NoMatch;
-    sp.scan66 = &wb.cur.scan;
-
-    // Estimates arm: materialize -> select -> rf_estimates(select -> filter
-    // -> SAME base materialize node).
-    var we = Cursor{ .cur = sp.u61.right };
-    try we.mat();
-    sp.s68 = try we.sel();
-    sp.tf69 = try we.tvf("rf_estimates");
-    _ = try we.sel(); // s70
-    sp.f71 = try we.filt();
-    if (we.cur != sp.base_mat) return NoMatch;
-
-    // Entry compute shape: two string NULL literals + LOWER(customerNumber).
-    if (sp.entry_derived.len != 3) return NoMatch;
-    var lower_seen = false;
-    for (sp.entry_derived) |d| {
-        switch (d.expr) {
-            .null_lit => |t| if (t != .string) return NoMatch,
-            .call => |c| {
-                if (!std.ascii.eqlIgnoreCase(c.fn_name, "LOWER") or c.args.len != 1) return NoMatch;
-                if (c.args[0] != .col_ref) return NoMatch;
-                lower_seen = true;
-            },
-            else => return NoMatch,
-        }
-    }
-    if (!lower_seen) return NoMatch;
-    return sp;
-}
-
-// ---------------------------------------------------------------------------
 // Frame + visible-name map (types.findColumn rules over recognizer state).
 // ---------------------------------------------------------------------------
 
@@ -1113,6 +856,11 @@ const NullSide = struct {
     schema: []const Column, // arena copy of the compiled right-side schema
 };
 
+const PinnedCol = struct {
+    name: []const u8,
+    val: Value,
+};
+
 const Ctx = struct {
     gpa: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -1147,8 +895,15 @@ const Builder = struct {
     a: Allocator, // ctx arena allocator
     fb: FrameB,
     ops: std.ArrayListUnmanaged(region.RegionOp) = .empty,
-    /// Range-key SQL names (resolved on demand at each partition check).
-    key_names: [3][]const u8 = .{ "projectId", "customerNumberLC", "divisionId" },
+    /// Consolidation range-key NAMES, resolved against the CURRENT frame at
+    /// every partition check — frame-replacing ops (group_agg, replace-TVF)
+    /// keep the names by contract, so name resolution survives epochs that
+    /// indices would not.
+    range_key_names: []const []const u8 = &.{},
+    /// Scan-filter eq-literal columns — per-run constants tracked by NAME
+    /// (matched on the last segment, ci) so the fact survives frame
+    /// replacement. Span merges and probe-pair elimination use them.
+    pinned: std.ArrayListUnmanaged(PinnedCol) = .empty,
     /// LEFT-join sides proven all-NULL; refs against them append typed NULL
     /// columns on demand.
     null_sides: std.ArrayListUnmanaged(NullSide) = .empty,
@@ -1156,9 +911,6 @@ const Builder = struct {
     /// Frame columns known constant (folded literal computes): groupings
     /// skip them as subkeys — a constant can't split groups.
     const_idxs: std.ArrayListUnmanaged(usize) = .empty,
-    /// Probe-side projectId literal (from the scan filter) for the
-    /// external_plan map build.
-    project_lit: ?Value = null,
 
     fn resolveIdx(b: *Builder, name: []const u8) !usize {
         if (b.fb.resolve(name)) |e| return e.idx;
@@ -1197,18 +949,21 @@ const Builder = struct {
         try b.ops.append(b.a, .{ .compute = .{ .derived = derived } });
     }
 
-    fn rangeKeyIdxs(b: *Builder) ![3]usize {
-        var out: [3]usize = undefined;
-        for (b.key_names, 0..) |n, i| {
+    /// Range-key column indices resolved against the CURRENT frame.
+    fn rangeKeyIdxs(b: *Builder, out: *[8]usize) ![]const usize {
+        if (b.range_key_names.len > 8) return NoMatch;
+        for (b.range_key_names, 0..) |n, i| {
             out[i] = (b.fb.resolve(n) orelse return NoMatch).idx;
         }
-        return out;
+        return out[0..b.range_key_names.len];
     }
 
+    /// Set-equality of a partition column list against the range keys.
     fn partitionMatchesRangeKeys(b: *Builder, part: []const []const u8) !bool {
-        if (part.len != 3) return false;
-        const keys = try b.rangeKeyIdxs();
-        var seen = [3]bool{ false, false, false };
+        if (part.len != b.range_key_names.len or part.len > 8) return false;
+        var buf: [8]usize = undefined;
+        const keys = try b.rangeKeyIdxs(&buf);
+        var seen = [_]bool{false} ** 8;
         for (part) |p| {
             const idx = (b.fb.resolve(p) orelse return NoMatch).idx;
             var found = false;
@@ -1221,7 +976,45 @@ const Builder = struct {
             }
             if (!found) return false;
         }
-        return seen[0] and seen[1] and seen[2];
+        for (seen[0..part.len]) |s| {
+            if (!s) return false;
+        }
+        return true;
+    }
+
+    const PartClass = union(enum) {
+        range_exact,
+        /// Partition strictly coarser than the range keys: adjacent ranges
+        /// equal on this (single non-constant) column merge into one span.
+        merged_span: usize,
+    };
+
+    fn classifyPartition(b: *Builder, part: []const []const u8) !PartClass {
+        if (try b.partitionMatchesRangeKeys(part)) return .range_exact;
+        var buf: [8]usize = undefined;
+        const keys = try b.rangeKeyIdxs(&buf);
+        var merge: ?usize = null;
+        for (part) |p| {
+            const idx = (b.fb.resolve(p) orelse return NoMatch).idx;
+            if (std.mem.indexOfScalar(usize, keys, idx) == null) return NoMatch;
+            if (b.pinnedName(p) == null and !b.isConstIdx(idx)) {
+                if (merge != null) return NoMatch; // one merge column (runtime limit)
+                merge = idx;
+            }
+        }
+        return .{ .merged_span = merge orelse return NoMatch };
+    }
+
+    fn pinnedName(b: *Builder, name: []const u8) ?Value {
+        const tail = lastSegment(name);
+        for (b.pinned.items) |p| {
+            if (std.ascii.eqlIgnoreCase(lastSegment(p.name), tail)) return p.val;
+        }
+        return null;
+    }
+
+    fn isConstIdx(b: *Builder, idx: usize) bool {
+        return std.mem.indexOfScalar(usize, b.const_idxs.items, idx) != null;
     }
 
     // ---- expression cloning (col_ref rewrite to canonical frame names) ----
@@ -1541,36 +1334,192 @@ fn i64At(v: ColumnView, i: usize) ?i64 {
         else => null,
     };
 }
-
 // ---------------------------------------------------------------------------
-// The full recognize + build pass.
+// Pipeline collection: the block's IR walked ONCE into an ordered step list.
+// No fixed shape — any interleaving of the supported constructs compiles;
+// the builder dispatches the steps bottom-up over the frame.
 // ---------------------------------------------------------------------------
 
-fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exec.Query {
-    var tm: i64 = exec.prof.nowTicks();
-    const sp = try walkSpine(anchor);
-    traceMark("walk", &tm);
+const UnionTvf = struct {
+    tvf: *const ir.Op.TableFn,
+    /// Filter between the TVF's input and the shared base (the kernel's
+    /// input rows are the base rows passing it).
+    input_filter: ?PredicateExpr,
+};
 
-    const registry = input.udf_registry orelse return NoMatch;
-    const ent_est = registry.tableByName("rf_estimates") orelse return NoMatch;
-    const ent_cur = registry.tableByName("rf_currency_convert") orelse return NoMatch;
-    const ent_gap = registry.tableByName("rf_gap_fill") orelse return NoMatch;
-    const ent_ud = registry.tableByName("rf_updown_chain") orelse return NoMatch;
-    if (getenv("THINDB_REGION_TRACE") != null) {
-        for ([_]*const udf_mod.TableEntry{ ent_est, ent_cur, ent_gap, ent_ud }) |e| {
-            std.debug.print("[region] entry {s}: in0={d} kic={d} pass={d} out={d} bcast={d}\n", .{
-                e.name, e.input_schemas[0].len, e.kernel_input_cols, e.passthrough.len, e.output_schema.len, e.broadcast_inputs.len,
-            });
+const Step = union(enum) {
+    select: *const ir.Op.Project,
+    exclude: *const ir.Op.Project,
+    compute: []const Derived,
+    alias_name: []const u8,
+    filt: PredicateExpr,
+    group_by: *const ir.Op.GroupBy,
+    window: *const ir.WindowOp,
+    table_fn: *const ir.Op.TableFn,
+    join: *const ir.Op.Join,
+    /// `base UNION ALL TVF(SELECT .. FROM base [WHERE f])` over the SAME
+    /// base node: the TVF appends rows at each consolidation group's tail
+    /// (fused), and its PARTITION BY / ORDER BY define the region's
+    /// range/order contract. Must be the bottom-most structural step.
+    union_tvf: UnionTvf,
+};
+
+const Pipeline = struct {
+    /// Top-down (steps[0] nearest the anchor); dispatched in reverse.
+    steps: []const Step,
+    entry_sel: ?*const ir.Op.Project,
+    /// Entry computes in evaluation (bottom-up) order — run per batch
+    /// during the scatter, before the exchange.
+    entry_derived: []const Derived,
+    entry_filter: PredicateExpr,
+    scan: *const ir.Op.Scan,
+};
+
+fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
+    if (anchor.* != .materialize) return NoMatch;
+    var steps: std.ArrayListUnmanaged(Step) = .empty;
+    var cur: *const ir.Op = anchor.materialize.upstream;
+    var guard: usize = 0;
+    const scan: *const ir.Op.Scan = blk: while (guard < 512) : (guard += 1) {
+        switch (cur.*) {
+            .materialize => |m| cur = m.upstream,
+            .select => |*p| {
+                try steps.append(a, .{ .select = p });
+                cur = p.upstream;
+            },
+            .exclude => |*p| {
+                try steps.append(a, .{ .exclude = p });
+                cur = p.upstream;
+            },
+            .compute => |c| {
+                try steps.append(a, .{ .compute = c.derived });
+                cur = c.upstream;
+            },
+            .alias => |al| {
+                try steps.append(a, .{ .alias_name = al.alias });
+                cur = al.upstream;
+            },
+            .filter => |f| {
+                try steps.append(a, .{ .filt = f.predicate });
+                cur = f.upstream;
+            },
+            .group_by => |*g| {
+                try steps.append(a, .{ .group_by = g });
+                cur = g.upstream;
+            },
+            .window => |*w| {
+                try steps.append(a, .{ .window = w });
+                cur = w.upstream;
+            },
+            .join => |*j| {
+                try steps.append(a, .{ .join = j });
+                cur = j.left;
+            },
+            .table_fn => |*t| {
+                if (t.inputs.len == 0) return NoMatch;
+                try steps.append(a, .{ .table_fn = t });
+                cur = t.inputs[0];
+            },
+            .set_union => |*u| {
+                const arm = unionTvfArm(u) orelse return NoMatch;
+                try steps.append(a, .{ .union_tvf = arm.ut });
+                cur = arm.base;
+            },
+            .scan => |*s| break :blk s,
+            else => return NoMatch,
+        }
+    } else return NoMatch;
+
+    // Split off the entry cluster: the trailing run of select/compute/filter
+    // steps below the last structural step becomes the scan projection, the
+    // scatter-time computes, and the fused scan filter.
+    var split = steps.items.len;
+    while (split > 0) : (split -= 1) {
+        switch (steps.items[split - 1]) {
+            .select, .compute, .filt => {},
+            else => break,
         }
     }
-    // Union-append / replace kernels must write EVERY output themselves: no
-    // pass-through pairs and no carry split (kic 0 or == full input width).
-    if (!kernelReadsAll(ent_gap) or ent_gap.passthrough.len != 0) return NoMatch;
-    if (!kernelReadsAll(ent_est) or ent_est.passthrough.len != 0) return NoMatch;
-    if (ent_cur.input_schemas.len != 3 or ent_cur.broadcast_inputs.len != 2) return NoMatch;
+    var entry_sel: ?*const ir.Op.Project = null;
+    var entry_derived: std.ArrayListUnmanaged(Derived) = .empty;
+    var filters: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    var i = steps.items.len;
+    while (i > split) : (i -= 1) {
+        switch (steps.items[i - 1]) {
+            .select => |p| {
+                if (entry_sel != null) return NoMatch; // one entry projection
+                entry_sel = p;
+            },
+            .compute => |d| try entry_derived.appendSlice(a, d),
+            .filt => |p| try filters.append(a, p),
+            else => unreachable,
+        }
+    }
+    if (filters.items.len == 0) return NoMatch; // an unfiltered full scan is never a region win
+    const entry_filter: PredicateExpr = if (filters.items.len == 1)
+        filters.items[0]
+    else
+        .{ .@"and" = filters.items };
 
-    // A cacheable recognize builds its ctx from the DATABASE allocator so
-    // the entry can outlive this query/connection; otherwise query-lifetime.
+    return .{
+        .steps = steps.items[0..split],
+        .entry_sel = entry_sel,
+        .entry_derived = entry_derived.items,
+        .entry_filter = entry_filter,
+        .scan = scan,
+    };
+}
+
+fn unionTvfArm(u: *const ir.SetUnion) ?struct { base: *const ir.Op, ut: UnionTvf } {
+    if (!u.all) return null;
+    if (matchTvfArm(u.right, u.left)) |ut| return .{ .base = u.left, .ut = ut };
+    if (matchTvfArm(u.left, u.right)) |ut| return .{ .base = u.right, .ut = ut };
+    return null;
+}
+
+fn matchTvfArm(arm: *const ir.Op, base: *const ir.Op) ?UnionTvf {
+    var cur = arm;
+    var guard: usize = 0;
+    const tvf: *const ir.Op.TableFn = blk: while (guard < 8) : (guard += 1) {
+        switch (cur.*) {
+            .materialize => |m| cur = m.upstream,
+            .select => |p| cur = p.upstream,
+            .table_fn => |*t| break :blk t,
+            else => return null,
+        }
+    } else return null;
+    if (tvf.inputs.len == 0) return null;
+    cur = tvf.inputs[0];
+    var input_filter: ?PredicateExpr = null;
+    guard = 0;
+    while (guard < 8) : (guard += 1) {
+        if (cur == base) return .{ .tvf = tvf, .input_filter = input_filter };
+        switch (cur.*) {
+            .materialize => |m| cur = m.upstream,
+            .select => |p| cur = p.upstream,
+            .filter => |f| {
+                if (input_filter != null) return null;
+                input_filter = f.predicate;
+                cur = f.upstream;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// The general region builder: entry + range contract derivation, then each
+// pipeline step dispatched bottom-up. Kernel handling is driven by SDK
+// metadata (execution mode, passthrough, broadcast inputs) — never by name.
+// ---------------------------------------------------------------------------
+
+fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8) anyerror!exec.Query {
+    var tm: i64 = exec.prof.nowTicks();
+    const registry = input.udf_registry orelse return NoMatch;
+
+    // A cacheable build uses the DATABASE allocator for its ctx so the
+    // entry can outlive this query/connection; otherwise query-lifetime.
     const anchor_hash = hashAnchor(anchor);
     const cache: ?*Cache = if (anchor_hash != null) cacheFor(input.db) else null;
     const gpa = if (cache != null) input.db.allocator else input.allocator;
@@ -1587,31 +1536,27 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
 
     var b = Builder{ .input = input, .ctx = ctx, .a = a, .fb = .{ .a = a } };
 
-    for ([_]*const udf_mod.TableEntry{ ent_est, ent_cur, ent_gap, ent_ud }) |e| {
-        try ctx.kernels.append(a, .{ .name = try a.dupe(u8, e.name), .process = e.process });
-    }
+    // Query-lifetime arena: the step list and the entry-derived slice are
+    // borrowed by the operator (never by the cached ctx).
+    const pl = try collectPipeline(input.node_arena, anchor);
+    traceMark("walk", &tm);
 
-    // ---- scan filter: probe-side projectId literal + prune leaves --------
+    // ---- entry: prune leaves + literal-pinned columns --------------------
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
-    try collectAndLeaves(a, sp.f65, &prune_leaves);
-    for (prune_leaves.items) |l| {
-        if (std.ascii.eqlIgnoreCase(l.col, "projectId") and l.op == .eq) {
-            b.project_lit = l.val;
-        }
-    }
-    if (b.project_lit == null) return NoMatch; // merge_on + plan-map packing need it
+    try collectAndLeaves(a, pl.entry_filter, &prune_leaves);
 
-    // ---- sources: chunked fused-filter scans (rf_custom recipe) ----------
-    const table = input.db.openTable(sp.scan66.table.name, .{}) catch return NoMatch;
+    const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
 
-    // Scan projection = the base select's items minus the entry-computed
-    // names (they exist only after the entry compute).
     var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
-    outer: for (sp.s63.columns) |col| {
-        for (sp.entry_derived) |d| {
-            if (std.ascii.eqlIgnoreCase(d.name, col)) continue :outer;
+    var scan_cols_opt: ?[]const []const u8 = null;
+    if (pl.entry_sel) |sel| {
+        outer: for (sel.columns) |col| {
+            for (pl.entry_derived) |d| {
+                if (std.ascii.eqlIgnoreCase(d.name, col)) continue :outer;
+            }
+            try scan_cols.append(a, col);
         }
-        try scan_cols.append(a, col);
+        scan_cols_opt = scan_cols.items;
     }
 
     const dop = input.effectiveDop();
@@ -1623,7 +1568,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         break :blk 64;
     };
 
-    const bs = try buildScanSources(input, table, prune_leaves.items, sp.f65, scan_cols.items, n_threads);
+    const bs = try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
     const sources = bs.sources;
     const total_rows = bs.total_rows;
     var sources_owned = true; // RegionExecOp takes them over on create
@@ -1635,7 +1580,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
 
     // ---- entry schema = scan output ++ entry-computed columns ------------
     const scan_schema = sources[0].outputSchema();
-    const entry_schema = try a.alloc(Column, scan_schema.len + sp.entry_derived.len);
+    const entry_schema = try a.alloc(Column, scan_schema.len + pl.entry_derived.len);
     for (scan_schema, entry_schema[0..scan_schema.len]) |src, *dst| {
         dst.* = src;
         dst.name = try a.dupe(u8, src.name);
@@ -1644,8 +1589,14 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     // (which have no physical location) NULL-pad it.
     const rowloc_entry = scan_schema.len - 1;
     entry_schema[rowloc_entry].nullable = true;
-    for (sp.entry_derived, entry_schema[scan_schema.len..]) |d, *dst| {
-        dst.* = .{ .name = try a.dupe(u8, d.name), .type = .string, .nullable = true };
+    if (pl.entry_derived.len > 0) {
+        // Engine-exact types for the scatter-time computes; forced nullable
+        // (kernel-appended rows NULL-pad every entry-derived column).
+        const typed = region.computeOutputSchema(qa, a, scan_schema, pl.entry_derived, registry) catch return NoMatch;
+        if (typed.len != scan_schema.len + pl.entry_derived.len) return NoMatch;
+        for (pl.entry_derived, typed[scan_schema.len..], entry_schema[scan_schema.len..]) |d, t, *dst| {
+            dst.* = .{ .name = try a.dupe(u8, d.name), .type = t.type, .nullable = true };
+        }
     }
     for (entry_schema, 0..) |col, i| {
         _ = try b.fb.addColNamed(col.name, col.type, col.nullable);
@@ -1653,324 +1604,106 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     }
     ctx.entry_schema = entry_schema;
 
-    if (b.fb.resolve("projectId") == null) return NoMatch;
-    const lc_entry = (b.fb.resolve("customerNumberLC") orelse return NoMatch).idx;
-    const div_entry = (b.fb.resolve("divisionId") orelse return NoMatch).idx;
-
-    // Consolidation contract: prefix (projectId, customerNumberLC,
-    // divisionId) — lc before div so equal-(project,lc) ranges are ADJACENT
-    // (the final window merges across divisions via merge_on) — then the
-    // estimates order (invoiceId, date) inside each range.
-    if (sp.tf69.order_by.len != 2) return NoMatch;
-    for (sp.tf69.order_by) |ob| if (ob.desc) return NoMatch;
-    const est_o0 = (b.fb.resolve(sp.tf69.order_by[0].col) orelse return NoMatch).idx;
-    const est_o1 = (b.fb.resolve(sp.tf69.order_by[1].col) orelse return NoMatch).idx;
-    // projectId is NOT a sort key: the scan filter pins it to one literal
-    // (project_lit, required above), so every row compares equal — sorting
-    // on (lc, div, ...) yields the identical order with one fewer key pass.
-    const sort_cols = try a.alloc(region.OrderCol, 5);
-    sort_cols[0] = .{ .col = lc_entry, .kind = try orderKind(entry_schema[lc_entry].type) };
-    sort_cols[1] = .{ .col = div_entry, .kind = try orderKind(entry_schema[div_entry].type) };
-    sort_cols[2] = .{ .col = est_o0, .kind = try orderKind(entry_schema[est_o0].type) };
-    sort_cols[3] = .{ .col = est_o1, .kind = try orderKind(entry_schema[est_o1].type) };
-    sort_cols[4] = .{ .col = rowloc_entry, .kind = .int64 };
-
-    // ---- visible map at the estimates input ------------------------------
-    try b.applySelect(sp.s63);
-
-    // ---- op 0: rf_estimates union-append (fused consolidation tail) ------
-    if (!try b.partitionMatchesRangeKeys(sp.tf69.partition_by)) return NoMatch;
-    const est_inputs = try tvfInputs(&b, ent_est, ent_est.input_schemas[0].len);
-    const est_out = try a.alloc(Column, est_inputs.len);
-    for (est_out, est_inputs) |*o, ci| o.* = b.fb.cols.items[ci];
-    const est_filter = try dateWindow(sp.f71, &b);
-    try b.ops.append(a, .{ .tvf_grouped = .{
-        .spec = .{
-            .process = ent_est.process,
-            .user_data = ent_est.user_data,
-            .args = try cloneArgs(&b, sp.tf69.args),
-            .inputs = est_inputs,
-            .out = est_out,
-        },
-        .union_append = true,
-        .input_filter = .{ .col = est_filter.col, .lo = est_filter.lo, .hi = est_filter.hi },
-    } });
-    try b.applySelect(sp.s59);
-
-    // ---- broadcast partitions for rf_currency (rates + plans) ------------
-    const rates_blk = try compileAndDrain(&b, sp.tf58.inputs[1], true);
-    const plans_blk = try compileAndDrain(&b, sp.tf58.inputs[2], true);
-    const rates_part = try blockPartition(&b, ent_cur.input_schemas[1], rates_blk);
-    const plans_part = try blockPartition(&b, ent_cur.input_schemas[2], plans_blk);
-    const extra_parts = try a.alloc(udf_mod.TvfPartition, 2);
-    extra_parts[0] = rates_part;
-    extra_parts[1] = plans_part;
-    traceMark("broadcasts", &tm);
-
-    // ---- op 1: rf_currency aligned over the whole shard ------------------
-    // (kernel groups internally by its useDivision argument — call-site
-    // partition granularity is irrelevant to its output values).
-    try pushAlignedTvf(&b, ent_cur, extra_parts, sp.tf58.args, false);
-    try b.applySelect(sp.s57);
-
-    // ---- computes + in-group ranks + keyed aggregation -------------------
-    try b.pushCompute(sp.c55);
-    try pushRanksFromWindow(&b, sp.w54, null);
-    try b.applySelect(sp.s53);
-    try b.pushCompute(sp.c51);
-    {
-        const keys = try b.rangeKeyIdxs();
-        try pushGroupAgg(&b, sp.g50, &keys, null);
-    }
-    try b.pushCompute(sp.c49);
-    try b.applySelect(sp.s48);
-    try pushFillLast(&b, sp.w46);
-    try b.applySelect(sp.s45);
-
-    // ---- rf_gap_fill: per-range replace ----------------------------------
-    if (!try b.partitionMatchesRangeKeys(sp.tf42.partition_by)) return NoMatch;
-    try checkMonthOrder(&b, sp.tf42.order_by);
-    {
-        const inputs = try tvfInputs(&b, ent_gap, ent_gap.input_schemas[0].len);
-        const out = try a.alloc(Column, ent_gap.output_schema.len);
-        for (ent_gap.output_schema, out) |src, *dst| {
-            dst.* = .{ .name = try b.fb.canonName(src.name), .type = src.type, .nullable = true };
-        }
-        try b.flushPending();
-        try b.ops.append(a, .{ .tvf_grouped = .{ .spec = .{
-            .process = ent_gap.process,
-            .user_data = ent_gap.user_data,
-            .args = try cloneArgs(&b, sp.tf42.args),
-            .inputs = inputs,
-            .out = out,
-        } } });
-        // Frame REPLACED by the kernel output.
-        b.fb.cols.clearRetainingCapacity();
-        b.fb.vis.clearRetainingCapacity();
-        for (ent_gap.output_schema, out) |src, o| {
-            const idx = b.fb.cols.items.len;
-            try b.fb.cols.append(a, o);
-            _ = src;
-            try b.fb.setVis(ent_gap.output_schema[idx].name, idx);
-        }
-    }
-    try b.applySelect(sp.s41);
-    try b.pushCompute(sp.c39);
-    try b.applySelect(sp.s38);
-
-    // ---- rf_updown_chain: per-range aligned append -----------------------
-    if (!try b.partitionMatchesRangeKeys(sp.tf37.partition_by)) return NoMatch;
-    try checkMonthOrder(&b, sp.tf37.order_by);
-    try pushAlignedTvf(&b, ent_ud, &.{}, sp.tf37.args, true);
-    try b.applySelect(sp.s36);
-    try b.applyAlias("r");
-
-    // ---- division INNER probe --------------------------------------------
-    {
-        if (sp.j33.on.len != 1 or sp.j33.extra_predicate != null or sp.j33.ranges.len != 0) return NoMatch;
-        const div_blk = try compileAndDrain(&b, sp.j33.right, true);
-        const key_ci = types.findColumn(div_blk.schema, sp.j33.on[0].right) orelse return NoMatch;
-        const map = try a.create(region.KeyMap);
-        map.* = .empty;
-        if (div_blk.rows > 0) {
-            const kv = div_blk.stores[key_ci].view();
-            for (0..div_blk.rows) |i| {
-                if (i64At(kv, i)) |k| try map.put(a, k, @intCast(i));
-            }
-        }
-        const probe = try b.resolveIdx(sp.j33.on[0].left);
-        try b.flushPending();
-        try b.ops.append(a, .{ .hash_probe = .{
-            .probe = probe,
-            .map = map,
-            .payload = &.{},
-            .inner = true,
-        } });
+    // Literal-pinned entry columns: an eq-literal conjunct in the scan
+    // filter makes the column a per-run constant — groupings and span
+    // merges may skip it, and probe key pairs against it eliminate.
+    for (prune_leaves.items) |l| {
+        if (l.op != .eq) continue;
+        if (b.fb.resolve(l.col) == null) continue;
+        try b.pinned.append(a, .{ .name = try a.dupe(u8, l.col), .val = l.val });
     }
 
-    // ---- external_plan LEFT probe (packed icid<<32 + id key) -------------
+    // ---- range/order contract from the bottom-most partitioned step ------
+    var range_names: []const []const u8 = declared_keys;
+    var order_specs: []const ir.SortSpec = &.{};
     {
-        if (sp.j32.on.len != 3 or sp.j32.extra_predicate != null or sp.j32.ranges.len != 0) return NoMatch;
-        const plan_blk = try compileAndDrain(&b, sp.j32.right, true);
-        var left_pj: ?[]const u8 = null;
-        var left_ic: ?[]const u8 = null;
-        var left_id: ?[]const u8 = null;
-        var right_pj: ?usize = null;
-        var right_ic: ?usize = null;
-        var right_id: ?usize = null;
-        for (sp.j32.on) |pair| {
-            const tail = lastSegment(pair.left);
-            const rci = types.findColumn(plan_blk.schema, pair.right) orelse return NoMatch;
-            if (std.ascii.eqlIgnoreCase(tail, "projectId")) {
-                left_pj = pair.left;
-                right_pj = rci;
-            } else if (std.ascii.eqlIgnoreCase(tail, "integrationConfigId")) {
-                left_ic = pair.left;
-                right_ic = rci;
-            } else if (std.ascii.eqlIgnoreCase(tail, "planId")) {
-                left_id = pair.left;
-                right_id = rci;
-            } else return NoMatch;
-        }
-        if (left_pj == null or left_ic == null or left_id == null) return NoMatch;
-
-        const map = try a.create(region.KeyMap);
-        map.* = .empty;
-        const pay_store = try a.create(ColumnStore);
-        pay_store.* = try ColumnStore.init(a, .string, true);
-        // Build rows: skip NULL keys (SQL join can't match them); a project
-        // mismatch vs the probe-side literal can never match either.
-        const probe_pj: i64 = valueI64(b.project_lit.?) orelse return NoMatch;
-        // Payload: the single right-side column the projection above
-        // consumes (everything else it selects is r.* / computed).
-        const ext_ci = blk: {
-            for (sp.s31.columns) |col| {
-                const dot = std.mem.indexOfScalar(u8, col, '.') orelse continue;
-                if (std.ascii.eqlIgnoreCase(col[0..dot], "r")) continue;
-                break :blk types.findColumn(plan_blk.schema, col) orelse return NoMatch;
-            }
-            return NoMatch;
-        };
-        if (plan_blk.rows > 0) {
-            const pjv = plan_blk.stores[right_pj.?].view();
-            const icv = plan_blk.stores[right_ic.?].view();
-            const idv = plan_blk.stores[right_id.?].view();
-            const extv = plan_blk.stores[ext_ci].view();
-            var kept: u32 = 0;
-            for (0..plan_blk.rows) |i| {
-                const pj = i64At(pjv, i) orelse continue;
-                if (pj != probe_pj) continue;
-                const ic = i64At(icv, i) orelse continue;
-                const id = i64At(idv, i) orelse continue;
-                const key = ic * 4294967296 + id;
-                const gop = try map.getOrPut(a, key);
-                if (gop.found_existing) return NoMatch; // dup key would change LEFT-join row counts
-                gop.value_ptr.* = kept;
-                if (extv.isValid(i)) {
-                    switch (extv.data) {
-                        .varchar, .string, .char, .json => |s| {
-                            try pay_store.data.string.appendValue(a, s.rowBytes(i));
-                            try pay_store.appendValidBit(a, pay_store.rowCount() - 1, true);
-                        },
-                        else => return NoMatch,
+        var i = pl.steps.len;
+        found: while (i > 0) : (i -= 1) {
+            switch (pl.steps[i - 1]) {
+                .union_tvf => |u| {
+                    if (i != pl.steps.len) return NoMatch; // fused tail must be bottom-most
+                    range_names = u.tvf.partition_by;
+                    order_specs = u.tvf.order_by;
+                    break :found;
+                },
+                .table_fn => |t| {
+                    if (t.partition_by.len > 0) {
+                        range_names = t.partition_by;
+                        order_specs = t.order_by;
+                        break :found;
                     }
-                } else {
-                    try pay_store.appendNulls(a, 1);
-                }
-                kept += 1;
+                },
+                .group_by => |g| {
+                    range_names = g.group_cols;
+                    break :found;
+                },
+                .window => |w| {
+                    if (w.specs.len > 0) {
+                        range_names = w.specs[0].partition_by;
+                        break :found;
+                    }
+                },
+                else => {},
             }
         }
-
-        // Probe key compute: to_bigint(icid) * 2^32 + to_bigint(planId);
-        // NULL on either side propagates → probe miss, matching SQL.
-        const ic_idx = try b.resolveIdx(left_ic.?);
-        const id_idx = try b.resolveIdx(left_id.?);
-        const mul_args = try a.alloc(Expr, 2);
-        mul_args[0] = .{ .call = .{ .fn_name = "to_bigint", .args = try dupExpr(a, .{ .col_ref = b.fb.cols.items[ic_idx].name }) } };
-        mul_args[1] = .{ .lit = .{ .bigint = 4294967296 } };
-        const add_args = try a.alloc(Expr, 2);
-        add_args[0] = .{ .call = .{ .fn_name = "mul", .args = mul_args } };
-        add_args[1] = .{ .call = .{ .fn_name = "to_bigint", .args = try dupExpr(a, .{ .col_ref = b.fb.cols.items[id_idx].name }) } };
-        const key_idx = try b.fb.addCol("plan_key", .bigint, true);
-        const key_derived = try a.alloc(Derived, 1);
-        key_derived[0] = .{ .name = b.fb.cols.items[key_idx].name, .expr = .{ .call = .{ .fn_name = "add", .args = add_args } } };
-        try b.flushPending();
-        try b.ops.append(a, .{ .compute = .{ .derived = key_derived } });
-
-        const ext_name = plan_blk.schema[ext_ci].name;
-        const payload = try a.alloc(region.Payload, 1);
-        const pay_idx = try b.fb.addCol(ext_name, .string, true);
-        payload[0] = .{ .name = b.fb.cols.items[pay_idx].name, .view = pay_store.view(), .out_type = .string };
-        try b.ops.append(a, .{ .hash_probe = .{
-            .probe = key_idx,
-            .map = map,
-            .payload = payload,
-            .inner = false,
-        } });
-        try b.fb.setVis(ext_name, pay_idx);
     }
-    traceMark("div_plan_probes", &tm);
-
-    try b.applySelect(sp.s31);
-    try b.applySelect(sp.s29);
-    try b.applyAlias("r");
-
-    // ---- customer-totals cluster: prove empty, then all four LEFT joins
-    // collapse to typed NULL columns (appended lazily on first reference).
-    {
-        const ctc_alias = try rightAliasName(sp.j26.right);
-        const ctl_alias = try rightAliasName(sp.j24.right);
-        const pcc_alias = try rightAliasName(sp.j22.right);
-        const pcl_alias = try rightAliasName(sp.j21.right);
-
-        const ctc_blk = try compileAndDrain(&b, sp.j26.right, true);
-        if (ctc_blk.rows != 0) return NoMatch;
-        const ctl_blk = try compileAndDrain(&b, sp.j24.right, true);
-        if (ctl_blk.rows != 0) return NoMatch;
-        const pcc_blk = try compileAndDrain(&b, sp.j22.right, false);
-        const pcl_blk = try compileAndDrain(&b, sp.j21.right, false);
-
-        // pc_current / pc_last are NOT empty tables — their joins only
-        // collapse because a join key comes from the empty ctc/ctl side
-        // (all-NULL ⇒ never matches). Require that structurally.
-        if (!joinKeyTouchesAlias(sp.j22, ctc_alias) and !joinKeyTouchesAlias(sp.j22, ctl_alias)) return NoMatch;
-        if (!joinKeyTouchesAlias(sp.j21, ctc_alias) and !joinKeyTouchesAlias(sp.j21, ctl_alias)) return NoMatch;
-
-        try b.null_sides.append(a, .{ .alias = ctc_alias, .schema = ctc_blk.schema });
-        try b.null_sides.append(a, .{ .alias = ctl_alias, .schema = ctl_blk.schema });
-        try b.null_sides.append(a, .{ .alias = pcc_alias, .schema = pcc_blk.schema });
-        try b.null_sides.append(a, .{ .alias = pcl_alias, .schema = pcl_blk.schema });
+    const range_keys = try a.alloc(usize, range_names.len);
+    const key_names_owned = try a.alloc([]const u8, range_names.len);
+    for (range_names, range_keys, key_names_owned) |n, *dst, *nm| {
+        dst.* = (b.fb.resolve(n) orelse return NoMatch).idx;
+        nm.* = try a.dupe(u8, n);
     }
-    traceMark("empty_proofs", &tm);
+    b.range_key_names = key_names_owned;
+    // Routing: any single declared key suffices (every partition in the
+    // block contains all of them — the verifier's guarantee), and it must
+    // itself be a range key.
+    const route_idx = (b.fb.resolve(declared_keys[0]) orelse return NoMatch).idx;
+    if (std.mem.indexOfScalar(usize, range_keys, route_idx) == null) return NoMatch;
 
-    // exclude (join-internal computed key): drop from vis if present.
-    for (sp.x23.columns) |col| b.fb.removeVis(col);
-
-    try b.pushCompute(sp.c20);
-    try b.pushCompute(sp.c19);
-    try b.applySelect(sp.s18);
-    try b.pushCompute(sp.c16);
-
-    // ---- final ranks: partition (projectId, customerNumberLC) — coarser
-    // than the range keys; adjacent equal-lc ranges merge (projectId is a
-    // scan-filter constant, verified above).
-    {
-        const wc = sp.w15;
-        if (wc.calls.len != 1 or wc.calls[0].func != .row_number) return NoMatch;
-        const spec = wc.specs[wc.calls[0].spec_idx];
-        if (spec.partition_by.len != 2) return NoMatch;
-        const keys = try b.rangeKeyIdxs();
-        var part_idx: [2]usize = undefined;
-        for (spec.partition_by, 0..) |p, i| {
-            part_idx[i] = (b.fb.resolve(p) orelse return NoMatch).idx;
+    // Sort order within the consolidation: DECLARED keys first — every
+    // coarser partition (span merge) retains exactly the declared keys, so
+    // putting them first keeps its spans adjacent regardless of the SQL's
+    // PARTITION BY column order — then the remaining range keys. Pinned
+    // constants can't split the order and are dropped.
+    var sort_list: std.ArrayListUnmanaged(region.OrderCol) = .empty;
+    for (declared_keys) |n| {
+        const idx = (b.fb.resolve(n) orelse return NoMatch).idx;
+        if (std.mem.indexOfScalar(usize, range_keys, idx) == null) return NoMatch;
+        if (b.pinnedName(n) != null) continue;
+        try sort_list.append(a, .{ .col = idx, .kind = try orderKind(entry_schema[idx].type) });
+    }
+    for (range_names, range_keys) |n, k| {
+        if (b.pinnedName(n) != null) continue; // constants can't split the order
+        var is_declared = false;
+        for (sort_list.items) |sc| {
+            if (sc.col == k) {
+                is_declared = true;
+                break;
+            }
         }
-        const pj_idx = keys[0];
-        const lc_idx = keys[1];
-        const part_ok = (part_idx[0] == pj_idx and part_idx[1] == lc_idx) or
-            (part_idx[0] == lc_idx and part_idx[1] == pj_idx);
-        if (!part_ok) return NoMatch;
-        const order = try cloneOrder(&b, spec.order_by);
-        try b.flushPending();
-        const rank_idx = try b.fb.addCol(wc.calls[0].output_name, .bigint, false);
-        try b.ops.append(a, .{ .ranks = .{
-            .name = b.fb.cols.items[rank_idx].name,
-            .order = order,
-            .merge_on = lc_idx,
-        } });
-        try b.fb.setVis(wc.calls[0].output_name, rank_idx);
+        if (is_declared) continue;
+        try sort_list.append(a, .{ .col = k, .kind = try orderKind(entry_schema[k].type) });
     }
+    const group_prefix = sort_list.items.len;
+    for (order_specs) |ob| {
+        if (ob.desc) return NoMatch;
+        const idx = (b.fb.resolve(ob.col) orelse return NoMatch).idx;
+        try sort_list.append(a, .{ .col = idx, .kind = try orderKind(entry_schema[idx].type) });
+    }
+    try sort_list.append(a, .{ .col = rowloc_entry, .kind = .int64 });
+    const sort_cols = sort_list.items;
 
-    // ---- projection above the final window, then (when the anchor sits
-    // above it) the keyed monthly GROUP BY runs in-region: spans merge
-    // adjacent equal-customer ranges (projectId is a scan-filter constant;
-    // divisionId became a literal, so it degrades to a constant subkey).
-    try b.applySelect(sp.s14);
-    if (sp.g12) |g12| {
-        const pj = (b.fb.resolve("projectId") orelse return NoMatch).idx;
-        const lc = (b.fb.resolve("customerNumberLC") orelse return NoMatch).idx;
-        const required = [_]usize{ pj, lc };
-        try pushGroupAgg(&b, g12, &required, lc);
+    if (pl.entry_sel) |sel| try b.applySelect(sel);
+
+    // ---- dispatch the pipeline bottom-up ---------------------------------
+    {
+        var i = pl.steps.len;
+        while (i > 0) : (i -= 1) {
+            try dispatchStep(&b, registry, pl.steps[i - 1], pl.steps[0 .. i - 1]);
+        }
     }
+    traceMark("dispatch", &tm);
+
     const emit_cols = try a.alloc(usize, b.fb.vis.items.len);
     const emit_names = try a.alloc([]const u8, b.fb.vis.items.len);
     for (b.fb.vis.items, emit_cols, emit_names) |e, *ec, *en| {
@@ -1985,8 +1718,8 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     ctx.prog_built = true;
     traceMark("prog_build", &tm);
     // Emit-column NAMES for the stage schema: the program derives them from
-    // the frame (canonical); patch to the SQL-visible names the group-by
-    // above resolves against.
+    // the frame (canonical); patch to the SQL-visible names the query above
+    // resolves against.
     if (ctx.prog.output_schema.len != emit_names.len) return NoMatch;
     const patched = try a.alloc(Column, ctx.prog.output_schema.len);
     for (ctx.prog.output_schema, emit_names, patched) |src, name, *dst| {
@@ -1998,9 +1731,9 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     const opts = region.DriverOpts{
         .n_threads = n_threads,
         .n_shards = n_shards,
-        .key_col = lc_entry,
+        .key_col = route_idx,
         .sort_cols = sort_cols,
-        .group_prefix = 2,
+        .group_prefix = group_prefix,
     };
     ctx.opts = opts;
 
@@ -2008,7 +1741,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         qa,
         entry_schema,
         sources,
-        sp.entry_derived,
+        pl.entry_derived,
         &ctx.prog,
         opts,
         &ctx.pool,
@@ -2022,7 +1755,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
 
     // Publish into the per-database cache when possible: the cache then owns
     // the ctx (program + pool) and the op only releases the busy pin at
-    // query teardown. Otherwise the op owns the ctx (today's one-shot).
+    // query teardown. Otherwise the op owns the ctx (one-shot).
     if (cache) |c| blk: {
         if (ctx.uncacheable) break :blk;
         c.mu.lock();
@@ -2044,6 +1777,364 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     }
     op.setOwnedCtx(ctx, Ctx.destroyErased);
     return q;
+}
+
+fn dispatchStep(b: *Builder, registry: *const udf_mod.UdfRegistry, step: Step, above: []const Step) anyerror!void {
+    switch (step) {
+        .select => |p| try b.applySelect(p),
+        .exclude => |p| for (p.columns) |col| b.fb.removeVis(col),
+        .compute => |d| try b.pushCompute(d),
+        .alias_name => |nm| try b.applyAlias(nm),
+        .filt => return NoMatch, // mid-stream filters have no region op yet
+        .group_by => |g| try pushGroupAggAuto(b, g),
+        .window => |w| try dispatchWindow(b, w),
+        .union_tvf => |u| try dispatchUnionTvf(b, registry, u),
+        .table_fn => |t| try dispatchTvf(b, registry, t),
+        .join => |j| try dispatchJoin(b, j, above),
+    }
+}
+
+/// Column names the remaining (not-yet-dispatched) steps can reference —
+/// the probe payload liveness set. Null when the steps above contain a
+/// construct whose references can't be enumerated (a kernel's declared
+/// input names live in the registry, not the step) — then keep everything.
+/// A wrongly-dropped payload can only fail resolution later (a compile
+/// decline), never produce wrong values.
+fn liveNamesAbove(a: Allocator, steps: []const Step) !?[]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var any_select = false;
+    for (steps) |s| {
+        switch (s) {
+            .select => |p| {
+                any_select = true;
+                for (p.columns) |c| try out.append(a, c);
+            },
+            .exclude => |p| for (p.columns) |c| try out.append(a, c),
+            .compute => |d| for (d) |dd| try exprColNames(a, dd.expr, &out),
+            .alias_name => {},
+            .filt => |p| try predColNames(a, p, &out),
+            .group_by => |g| {
+                for (g.group_cols) |c| try out.append(a, c);
+                for (g.aggs) |spec| {
+                    if (spec.col) |c| try out.append(a, c);
+                    if (spec.arg2_col) |c| try out.append(a, c);
+                    for (spec.udf_arg_cols) |c| try out.append(a, c);
+                }
+            },
+            .window => |w| {
+                for (w.specs) |spec| {
+                    for (spec.partition_by) |c| try out.append(a, c);
+                    for (spec.order_by) |ob| try out.append(a, ob.col);
+                }
+                for (w.calls) |call| {
+                    for (call.args) |e| try exprColNames(a, e, &out);
+                }
+            },
+            .join => |j| for (j.on) |pair| try out.append(a, pair.left),
+            .table_fn, .union_tvf => return null,
+        }
+    }
+    if (!any_select) return null; // without a projection, anything may emit
+    return out.items;
+}
+
+fn exprColNames(a: Allocator, e: Expr, out: *std.ArrayListUnmanaged([]const u8)) anyerror!void {
+    switch (e) {
+        .col_ref => |n| try out.append(a, n),
+        .call => |c| for (c.args) |arg| try exprColNames(a, arg, out),
+        .case => |c| {
+            for (c.branches) |br| {
+                try predColNames(a, br.cond, out);
+                try exprColNames(a, br.then, out);
+            }
+            if (c.else_branch) |eb| try exprColNames(a, eb.*, out);
+        },
+        else => {},
+    }
+}
+
+fn predColNames(a: Allocator, p: PredicateExpr, out: *std.ArrayListUnmanaged([]const u8)) anyerror!void {
+    switch (p) {
+        .leaf, .day_leaf => |l| try out.append(a, l.col),
+        .leaf_col_col => |l| {
+            try out.append(a, l.left);
+            try out.append(a, l.right);
+        },
+        .is_null, .is_not_null => |c| try out.append(a, c),
+        .like => |l| try out.append(a, l.col),
+        .@"and", .@"or" => |kids| for (kids) |k| try predColNames(a, k, out),
+        .not => |k| try predColNames(a, k.*, out),
+        .in_set => |s| try out.append(a, s.col),
+        else => {},
+    }
+}
+
+/// The fused-tail union arm: the kernel appends rows at each consolidation
+/// group's tail during the ONE gather. Requires a write-everything kernel.
+fn dispatchUnionTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, u: UnionTvf) anyerror!void {
+    const ent = registry.tableByName(u.tvf.name) orelse return NoMatch;
+    try recordKernel(b, ent);
+    if (!kernelReadsAll(ent) or ent.passthrough.len != 0) return NoMatch;
+    if (u.tvf.inputs.len != 1) return NoMatch;
+    if (!try b.partitionMatchesRangeKeys(u.tvf.partition_by)) return NoMatch;
+    const inputs = try tvfInputs(b, ent, ent.input_schemas[0].len);
+    const out = try b.a.alloc(Column, inputs.len);
+    for (out, inputs) |*o, ci| o.* = b.fb.cols.items[ci];
+    const filt = u.input_filter orelse return NoMatch;
+    const win = try dateWindow(filt, b);
+    try b.ops.append(b.a, .{ .tvf_grouped = .{
+        .spec = .{
+            .process = ent.process,
+            .user_data = ent.user_data,
+            .args = try cloneArgs(b, u.tvf.args),
+            .inputs = inputs,
+            .out = out,
+        },
+        .union_append = true,
+        .input_filter = .{ .col = win.col, .lo = win.lo, .hi = win.hi },
+    } });
+}
+
+/// Mid-stream TVF. Granularity is a kernel CONTRACT, decided by metadata:
+/// partition == range keys → one call per range (`.partitioned` honored);
+/// partition coarser → whole-shard call, legal only when the kernel
+/// declares `.either` (correct at any granularity). Secondary inputs are
+/// compile-time-drained broadcasts.
+fn dispatchTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, t: *const ir.Op.TableFn) anyerror!void {
+    const ent = registry.tableByName(t.name) orelse return NoMatch;
+    try recordKernel(b, ent);
+
+    var extra_parts: []udf_mod.TvfPartition = &.{};
+    if (t.inputs.len > 1) {
+        if (ent.input_schemas.len != t.inputs.len) return NoMatch;
+        if (ent.broadcast_inputs.len != t.inputs.len - 1) return NoMatch;
+        extra_parts = try b.a.alloc(udf_mod.TvfPartition, t.inputs.len - 1);
+        for (t.inputs[1..], extra_parts, 1..) |inp, *dst, si| {
+            const blk = try compileAndDrain(b, inp, true);
+            dst.* = try blockPartition(b, ent.input_schemas[si], blk);
+        }
+    }
+
+    const pc = try b.classifyPartition(t.partition_by);
+    switch (pc) {
+        .range_exact => {
+            try checkRangeOrder(b, t.order_by);
+            if (ent.passthrough.len != 0) {
+                try pushAlignedTvf(b, ent, extra_parts, t.args, true);
+            } else if (kernelReadsAll(ent)) {
+                try pushReplaceTvf(b, ent, t.args);
+            } else return NoMatch;
+        },
+        .merged_span => {
+            if (ent.execution != .either) return NoMatch;
+            if (t.order_by.len != 0) return NoMatch;
+            if (ent.passthrough.len == 0) return NoMatch;
+            try pushAlignedTvf(b, ent, extra_parts, t.args, false);
+        },
+    }
+}
+
+/// Frame-replacing kernel (writes every output, no passthrough): per-range
+/// calls; the frame becomes the kernel's output schema.
+fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Value) !void {
+    const a = b.a;
+    const inputs = try tvfInputs(b, ent, ent.input_schemas[0].len);
+    const out = try a.alloc(Column, ent.output_schema.len);
+    for (ent.output_schema, out) |src, *dst| {
+        dst.* = .{ .name = try b.fb.canonName(src.name), .type = src.type, .nullable = true };
+    }
+    try b.flushPending();
+    try b.ops.append(a, .{ .tvf_grouped = .{ .spec = .{
+        .process = ent.process,
+        .user_data = ent.user_data,
+        .args = try cloneArgs(b, args),
+        .inputs = inputs,
+        .out = out,
+    } } });
+    b.fb.cols.clearRetainingCapacity();
+    b.fb.vis.clearRetainingCapacity();
+    for (ent.output_schema, out) |src, o| {
+        const idx = b.fb.cols.items.len;
+        try b.fb.cols.append(a, o);
+        try b.fb.setVis(src.name, idx);
+    }
+    // Range keys re-resolve by NAME against the new frame (the kernel keeps
+    // partition-column names — SDK schema contract); verify they survive.
+    var buf: [8]usize = undefined;
+    _ = try b.rangeKeyIdxs(&buf);
+    // Stale per-frame bookkeeping: forgotten constants become real subkeys
+    // (correct, at worst a hair slower).
+    b.const_idxs.clearRetainingCapacity();
+}
+
+fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
+    var all_ranks = true;
+    var all_fill = true;
+    for (w.calls) |call| {
+        if (call.func != .row_number) all_ranks = false;
+        if (call.func != .last_value) all_fill = false;
+    }
+    if (all_ranks) return pushRanksFromWindow(b, w);
+    if (all_fill) return pushFillLast(b, w);
+    return NoMatch;
+}
+
+fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror!void {
+    if (j.extra_predicate != null or j.ranges.len != 0) return NoMatch;
+    switch (j.join_type) {
+        .left => {
+            const ralias = rightAliasName(j.right) catch null;
+            // Keys sourced from a proven-NULL side can never match: the
+            // right side collapses to typed NULL columns without draining.
+            if (ralias != null and joinKeyTouchesNullSides(b, j)) {
+                const blk = try compileAndDrain(b, j.right, false);
+                try b.null_sides.append(b.a, .{ .alias = ralias.?, .schema = blk.schema });
+                return;
+            }
+            const blk = try compileAndDrain(b, j.right, true);
+            if (blk.rows == 0) {
+                const alias = ralias orelse return NoMatch;
+                try b.null_sides.append(b.a, .{ .alias = alias, .schema = blk.schema });
+                return;
+            }
+            if (blk.rows > (1 << 20)) return NoMatch;
+            try pushProbe(b, j, ralias, blk, false, try liveNamesAbove(b.input.node_arena, above));
+        },
+        .inner => {
+            const blk = try compileAndDrain(b, j.right, true);
+            if (blk.rows > (1 << 20)) return NoMatch;
+            try pushProbe(b, j, rightAliasName(j.right) catch null, blk, true, try liveNamesAbove(b.input.node_arena, above));
+        },
+        else => return NoMatch,
+    }
+}
+
+/// Small-side hash probe (both join types). Probe-side key pairs pinned to
+/// an entry literal eliminate at build (right rows filtered to the
+/// literal); the remaining int keys pack into one i64. Every non-key right
+/// column rides as a payload so downstream references resolve.
+fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: DrainedBlock, inner: bool, live: ?[]const []const u8) anyerror!void {
+    const a = b.a;
+    if (j.on.len == 0) return NoMatch;
+
+    var live_left: std.ArrayListUnmanaged([]const u8) = .empty;
+    var live_right: std.ArrayListUnmanaged(usize) = .empty;
+    var pin_right: std.ArrayListUnmanaged(usize) = .empty;
+    var pin_vals: std.ArrayListUnmanaged(Value) = .empty;
+    var key_right = try a.alloc(bool, blk.schema.len);
+    @memset(key_right, false);
+    for (j.on) |pair| {
+        const rci = types.findColumn(blk.schema, pair.right) orelse return NoMatch;
+        key_right[rci] = true;
+        if (b.pinnedName(pair.left)) |v| {
+            try pin_right.append(a, rci);
+            try pin_vals.append(a, v);
+        } else {
+            try live_left.append(a, pair.left);
+            try live_right.append(a, rci);
+        }
+    }
+    if (live_left.items.len == 0 or live_left.items.len > 2) return NoMatch;
+
+    // Build the map (and kept-row list) over rows matching every pinned
+    // literal, with NULL keys skipped (SQL join semantics).
+    const map = try a.create(region.KeyMap);
+    map.* = .empty;
+    var kept: std.ArrayListUnmanaged(u32) = .empty;
+    rows: for (0..blk.rows) |i| {
+        for (pin_right.items, pin_vals.items) |rci, want| {
+            const rv = blk.stores[rci].view();
+            const got = i64At(rv, i) orelse continue :rows;
+            const want_i = valueI64(want) orelse return NoMatch;
+            if (got != want_i) continue :rows;
+        }
+        var key: i64 = 0;
+        for (live_right.items) |rci| {
+            const kv = i64At(blk.stores[rci].view(), i) orelse continue :rows;
+            key = key * 4294967296 + kv;
+        }
+        const gop = try map.getOrPut(a, key);
+        if (gop.found_existing) {
+            if (!inner) return NoMatch; // dup key changes LEFT row counts
+            continue :rows;
+        }
+        gop.value_ptr.* = @intCast(kept.items.len);
+        try kept.append(a, @intCast(i));
+    }
+
+    // Probe key: single live key probes directly; two pack as k1*2^32+k2.
+    var probe_idx: usize = undefined;
+    if (live_left.items.len == 1) {
+        probe_idx = try b.resolveIdx(live_left.items[0]);
+    } else {
+        const hi_idx = try b.resolveIdx(live_left.items[0]);
+        const lo_idx = try b.resolveIdx(live_left.items[1]);
+        const mul_args = try a.alloc(Expr, 2);
+        mul_args[0] = .{ .call = .{ .fn_name = "to_bigint", .args = try dupExpr(a, .{ .col_ref = b.fb.cols.items[hi_idx].name }) } };
+        mul_args[1] = .{ .lit = .{ .bigint = 4294967296 } };
+        const add_args = try a.alloc(Expr, 2);
+        add_args[0] = .{ .call = .{ .fn_name = "mul", .args = mul_args } };
+        add_args[1] = .{ .call = .{ .fn_name = "to_bigint", .args = try dupExpr(a, .{ .col_ref = b.fb.cols.items[lo_idx].name }) } };
+        probe_idx = try b.fb.addCol("probe_key", .bigint, true);
+        const key_derived = try a.alloc(Derived, 1);
+        key_derived[0] = .{ .name = b.fb.cols.items[probe_idx].name, .expr = .{ .call = .{ .fn_name = "add", .args = add_args } } };
+        try b.flushPending();
+        try b.ops.append(a, .{ .compute = .{ .derived = key_derived } });
+    }
+
+    // Payloads: every non-key right column the steps above can reference,
+    // gathered to kept-row order.
+    var payloads: std.ArrayListUnmanaged(region.Payload) = .empty;
+    for (blk.schema, 0..) |col, ci| {
+        if (key_right[ci]) continue;
+        if (live) |names| {
+            const tail = lastSegment(col.name);
+            var referenced = false;
+            for (names) |n| {
+                if (std.ascii.eqlIgnoreCase(lastSegment(n), tail)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) continue;
+        }
+        const store = try a.create(ColumnStore);
+        store.* = try ColumnStore.init(a, col.type, true);
+        const src = blk.stores[ci].view();
+        for (kept.items) |ri| {
+            try region.appendViewRange(a, store, src, ri, ri + 1);
+        }
+        const idx = try b.fb.addCol(col.name, col.type, true);
+        try payloads.append(a, .{
+            .name = b.fb.cols.items[idx].name,
+            .view = store.view(),
+            .out_type = col.type,
+        });
+        try b.fb.setVis(col.name, idx);
+        if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+    }
+
+    try b.flushPending();
+    try b.ops.append(a, .{ .hash_probe = .{
+        .probe = probe_idx,
+        .map = map,
+        .payload = payloads.items,
+        .inner = inner,
+    } });
+}
+
+fn joinKeyTouchesNullSides(b: *Builder, j: *const ir.Op.Join) bool {
+    for (b.null_sides.items) |ns| {
+        if (joinKeyTouchesAlias(j, ns.alias)) return true;
+    }
+    return false;
+}
+
+fn recordKernel(b: *Builder, ent: *const udf_mod.TableEntry) !void {
+    for (b.ctx.kernels.items) |k| {
+        if (std.ascii.eqlIgnoreCase(k.name, ent.name)) return;
+    }
+    try b.ctx.kernels.append(b.a, .{ .name = try b.a.dupe(u8, ent.name), .process = ent.process });
 }
 
 // ---------------------------------------------------------------------------
@@ -2072,7 +2163,7 @@ fn buildScanSources(
     table: anytype,
     prune_leaves: []const predicate_mod.Predicate,
     filter: PredicateExpr,
-    scan_cols: []const []const u8,
+    scan_cols: ?[]const []const u8,
     n_threads: usize,
 ) !BuiltSources {
     const qa = input.allocator;
@@ -2307,13 +2398,16 @@ fn cloneOrder(b: *Builder, specs: []const ir.SortSpec) ![]const region.OrderBy {
     return out;
 }
 
-/// Every ROW_NUMBER call of a window node whose partition equals the range
-/// keys becomes one ranks op.
-fn pushRanksFromWindow(b: *Builder, w: *const ir.WindowOp, merge_on: ?usize) !void {
+/// Every ROW_NUMBER call becomes one ranks op; a partition coarser than the
+/// range keys ranks over merged spans.
+fn pushRanksFromWindow(b: *Builder, w: *const ir.WindowOp) !void {
     for (w.calls) |call| {
         if (call.func != .row_number or call.args.len != 0) return NoMatch;
         const spec = w.specs[call.spec_idx];
-        if (!try b.partitionMatchesRangeKeys(spec.partition_by)) return NoMatch;
+        const merge_on: ?usize = switch (try b.classifyPartition(spec.partition_by)) {
+            .range_exact => null,
+            .merged_span => |m| m,
+        };
         const order = try cloneOrder(b, spec.order_by);
         try b.flushPending();
         const idx = try b.fb.addCol(call.output_name, .bigint, false);
@@ -2334,7 +2428,7 @@ fn pushFillLast(b: *Builder, w: *const ir.WindowOp) !void {
         if (call.args[0] != .col_ref) return NoMatch;
         const spec = w.specs[call.spec_idx];
         if (!try b.partitionMatchesRangeKeys(spec.partition_by)) return NoMatch;
-        try checkMonthOrder(b, spec.order_by);
+        try checkRangeOrder(b, spec.order_by);
         const src = try b.resolveIdx(call.args[0].col_ref);
         if (spec.frame.end != .unbounded_following) {
             try b.fb.setVis(call.output_name, src);
@@ -2352,6 +2446,56 @@ fn pushFillLast(b: *Builder, w: *const ir.WindowOp) !void {
 /// span merges adjacent ranges via `merge_on`); the rest become int-family
 /// subkeys. The region emits sub-groups subkey-ascending per span, which is
 /// exactly the month order downstream ops require.
+/// GROUP BY dispatch: group cols covering all range keys aggregate per
+/// range (extras become subkeys); a grouping strictly coarser aggregates
+/// over merged spans (one non-constant range key carries the merge).
+fn pushGroupAggAuto(b: *Builder, g: *const ir.Op.GroupBy) anyerror!void {
+    var buf: [8]usize = undefined;
+    const keys = try b.rangeKeyIdxs(&buf);
+    // Per-range aggregation is only valid when the grouping still
+    // distinguishes every range. Three key states:
+    //   pinned  — one literal everywhere; never splits, ignore.
+    //   degraded — the column the NAME now resolves to is a folded
+    //              constant, but the RANGES still split by the original
+    //              values (the -2 cross-division literal case). Grouping by
+    //              it is COARSER than the ranges → merge path required.
+    //   live    — must appear among the group columns for per-range.
+    var degraded = false;
+    var live_uncovered = false;
+    for (b.range_key_names, keys) |n, k| {
+        if (b.pinnedName(n) != null) continue;
+        if (b.isConstIdx(k)) {
+            degraded = true;
+            continue;
+        }
+        var covered = false;
+        for (g.group_cols) |gc| {
+            const e = b.fb.resolve(gc) orelse return NoMatch;
+            if (e.idx == k) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) live_uncovered = true;
+    }
+    if (!degraded and !live_uncovered) {
+        return pushGroupAgg(b, g, keys, null);
+    }
+    var part: std.ArrayListUnmanaged(usize) = .empty;
+    var merge: ?usize = null;
+    for (g.group_cols) |gc| {
+        const idx = (b.fb.resolve(gc) orelse return NoMatch).idx;
+        if (std.mem.indexOfScalar(usize, keys, idx) == null) continue;
+        try part.append(b.a, idx);
+        if (b.pinnedName(gc) == null and !b.isConstIdx(idx)) {
+            if (merge != null) return NoMatch; // one merge column (runtime limit)
+            merge = idx;
+        }
+    }
+    if (part.items.len == 0) return NoMatch;
+    return pushGroupAgg(b, g, part.items, merge orelse return NoMatch);
+}
+
 fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, merge_on: ?usize) !void {
     const a = b.a;
     var subkeys: std.ArrayListUnmanaged(usize) = .empty;
@@ -2463,7 +2607,8 @@ fn intFamilyIdx(b: *Builder, name: []const u8) !usize {
 /// Downstream per-range order requirement: single ascending key that is the
 /// aggregation's month subkey (the region emits sub-groups month-ascending,
 /// so the order already holds — this just verifies the SQL asked for it).
-fn checkMonthOrder(b: *Builder, specs: []const ir.SortSpec) !void {
+fn checkRangeOrder(b: *Builder, specs: []const ir.SortSpec) !void {
+    if (specs.len == 0) return;
     if (specs.len != 1 or specs[0].desc) return NoMatch;
     _ = try b.resolveIdx(specs[0].col);
 }
