@@ -340,22 +340,6 @@ pub const Exchange = struct {
         return total;
     }
 
-    /// Shard ids in descending row count: whales first, so the phase tail
-    /// is small shards (region scheduler policy). Caller frees.
-    pub fn shardOrderDesc(self: *const Exchange, alloc: Allocator) ![]u32 {
-        const totals = try alloc.alloc(usize, self.n_shards);
-        defer alloc.free(totals);
-        for (0..self.n_shards) |s| totals[s] = self.shardRows(s);
-        const order = try alloc.alloc(u32, self.n_shards);
-        for (order, 0..) |*o, i| o.* = @intCast(i);
-        std.mem.sortUnstable(u32, order, totals, struct {
-            fn less(t: []const usize, a: u32, b: u32) bool {
-                return t[a] > t[b];
-            }
-        }.less);
-        return order;
-    }
-
     /// Per-worker scatter state (reused row-index lists per batch).
     pub const Worker = struct {
         ex: *Exchange,
@@ -646,8 +630,24 @@ pub fn consolidateOrderedTail(
     scratch: Allocator,
     tail: ?GroupTail,
 ) !void {
-    const total = ex.shardRows(shard);
     try out.ensure(ex.alloc, ex.schema);
+    try consolidateAppendTail(ex, shard, sort_cols, group_prefix, out, scratch, tail);
+}
+
+/// Append-mode consolidation: like `consolidateOrderedTail` but the caller
+/// owns `out`'s lifecycle — an execution bin consolidates each of its member
+/// route partitions into ONE ShardData (partitions never share a key, so
+/// concatenating their sorted groups is exactly the per-shard semantics).
+pub fn consolidateAppendTail(
+    ex: *Exchange,
+    shard: usize,
+    sort_cols: []const OrderCol,
+    group_prefix: usize,
+    out: *ShardData,
+    scratch: Allocator,
+    tail: ?GroupTail,
+) !void {
+    const total = ex.shardRows(shard);
     if (total == 0) return;
 
     // Per-column, per-worker source views.
@@ -2244,10 +2244,122 @@ const ScanPhase = struct {
     }
 };
 
+/// One execution bin: a set of route partitions consolidated into one
+/// ShardData and run through the program ONCE. LPT bin-packing over the
+/// measured partition sizes decouples routing granularity (many partitions
+/// so whales isolate) from execution granularity (few program runs).
+const Bin = struct {
+    members: []const u32, // route partition ids, ascending (deterministic order)
+    rows: usize,
+};
+
+/// LPT bin-packing: partitions descending by size into the least-loaded of
+/// ~2×threads bins. Deterministic: ties break on partition id / bin index.
+/// Returned bins are ordered descending by load — claim order IS whale-first.
+fn packBins(alloc: Allocator, ex: *const Exchange, n_threads: usize) ![]Bin {
+    const m = ex.n_shards;
+    const totals = try alloc.alloc(usize, m);
+    defer alloc.free(totals);
+    var n_nonzero: usize = 0;
+    for (0..m) |s| {
+        totals[s] = ex.shardRows(s);
+        if (totals[s] > 0) n_nonzero += 1;
+    }
+    if (n_nonzero == 0) return try alloc.alloc(Bin, 0);
+
+    const by_size = try alloc.alloc(u32, n_nonzero);
+    defer alloc.free(by_size);
+    {
+        var i: usize = 0;
+        for (0..m) |s| {
+            if (totals[s] > 0) {
+                by_size[i] = @intCast(s);
+                i += 1;
+            }
+        }
+    }
+    std.mem.sortUnstable(u32, by_size, totals, struct {
+        fn less(t: []const usize, a: u32, b: u32) bool {
+            if (t[a] != t[b]) return t[a] > t[b];
+            return a < b;
+        }
+    }.less);
+
+    const n_bins = @min(@max(2 * n_threads, 1), n_nonzero);
+    const load = try alloc.alloc(usize, n_bins);
+    defer alloc.free(load);
+    @memset(load, 0);
+    const bin_of = try alloc.alloc(u32, m);
+    defer alloc.free(bin_of);
+    for (by_size) |s| {
+        var best: usize = 0;
+        for (load, 0..) |l, b| {
+            if (l < load[best]) best = b;
+        }
+        bin_of[s] = @intCast(best);
+        load[best] += totals[s];
+    }
+
+    // Members flat-packed per bin, ascending partition id (walk ids in order).
+    const members = try alloc.alloc(u32, n_nonzero);
+    errdefer alloc.free(members);
+    const offsets = try alloc.alloc(usize, n_bins);
+    defer alloc.free(offsets);
+    {
+        const counts = try alloc.alloc(usize, n_bins);
+        defer alloc.free(counts);
+        @memset(counts, 0);
+        for (by_size) |s| counts[bin_of[s]] += 1;
+        var off: usize = 0;
+        for (offsets, counts) |*o, c| {
+            o.* = off;
+            off += c;
+        }
+        const cursor = try alloc.alloc(usize, n_bins);
+        defer alloc.free(cursor);
+        @memcpy(cursor, offsets);
+        for (0..m) |s| {
+            if (totals[s] == 0) continue;
+            const b = bin_of[s];
+            members[cursor[b]] = @intCast(s);
+            cursor[b] += 1;
+        }
+    }
+
+    const bins = try alloc.alloc(Bin, n_bins);
+    errdefer alloc.free(bins);
+    for (bins, 0..) |*bin, b| {
+        const end = if (b + 1 < n_bins) offsets[b + 1] else n_nonzero;
+        bin.* = .{ .members = members[offsets[b]..end], .rows = load[b] };
+    }
+    std.mem.sortUnstable(Bin, bins, {}, struct {
+        fn less(_: void, a: Bin, b: Bin) bool {
+            if (a.rows != b.rows) return a.rows > b.rows;
+            return a.members[0] < b.members[0];
+        }
+    }.less);
+    return bins;
+}
+
+fn freeBins(alloc: Allocator, bins: []Bin) void {
+    if (bins.len > 0) {
+        // members slices all view one flat allocation starting at bin with
+        // the lowest offset — recover it via the minimum pointer.
+        var base = bins[0].members.ptr;
+        var total: usize = 0;
+        for (bins) |b| {
+            if (@intFromPtr(b.members.ptr) < @intFromPtr(base)) base = b.members.ptr;
+            total += b.members.len;
+        }
+        alloc.free(base[0..total]);
+    }
+    alloc.free(bins);
+}
+
 const ShardPhase = struct {
     ex: *Exchange,
     opts: DriverOpts,
-    order: []const u32,
+    bins: []const Bin,
     next: std.atomic.Value(usize) = .init(0),
     result: *RegionResult,
     slots: []const *RegionPool.WorkerSlot,
@@ -2266,15 +2378,17 @@ const ShardPhase = struct {
         const start_op: usize = if (tail != null) 1 else 0;
 
         while (true) {
-            const oi = self.next.fetchAdd(1, .monotonic);
-            if (oi >= self.order.len) break;
-            const s = self.order[oi];
-            if (self.ex.shardRows(s) == 0) continue;
+            const bi = self.next.fetchAdd(1, .monotonic);
+            if (bi >= self.bins.len) break;
+            const bin = self.bins[bi];
             _ = slot.scratch.reset(.retain_capacity);
             const t_con = if (rw.op_ticks != null) exec.prof.nowTicks() else 0;
-            try consolidateOrderedTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
+            try slot.sd.ensure(self.ex.alloc, self.ex.schema);
+            for (bin.members) |s| {
+                try consolidateAppendTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
+            }
             if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
-            const out = &self.result.shards[s];
+            const out = &self.result.shards[bi];
             try rw.runShardFrom(&slot.sd, out.cols, start_op);
             out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
         }
@@ -2343,13 +2457,13 @@ pub fn runRegionPooled(
 
     const t1 = if (trace) exec.prof.nowTicks() else 0;
 
-    const order = try ex.shardOrderDesc(alloc);
-    defer alloc.free(order);
+    const bins = try packBins(alloc, ex, opts.n_threads);
+    defer freeBins(alloc, bins);
     @memset(errs, null);
     var shard_phase = ShardPhase{
         .ex = ex,
         .opts = opts,
-        .order = order,
+        .bins = bins,
         .result = result,
         .slots = pool.slots.items[0..opts.n_threads],
         .errs = errs,
@@ -2368,8 +2482,9 @@ pub fn runRegionPooled(
         const t2 = exec.prof.nowTicks();
         var rows: usize = 0;
         for (result.shards) |s| rows += s.rows;
-        std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d}\n", .{
-            exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads,
+        const max_bin: usize = if (bins.len > 0) bins[0].rows else 0;
+        std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d} parts={d} bins={d} max_bin={d}\n", .{
+            exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads, opts.n_shards, bins.len, max_bin,
         });
         // Per-op CPU (summed across workers; wall ≈ sum / threads when
         // load-balanced). Consolidation reported the same way.
@@ -2758,10 +2873,7 @@ test "region exchange + ordered consolidation: multiset, order, group ranges" {
     var sum_v: i64 = 0;
     var total_rows: usize = 0;
     var total_groups: usize = 0;
-    const order = try ex.shardOrderDesc(alloc);
-    defer alloc.free(order);
-
-    for (order) |s| {
+    for (0..ex.n_shards) |s| {
         var sd = ShardData{};
         defer sd.deinit(alloc);
         _ = arena.reset(.retain_capacity);

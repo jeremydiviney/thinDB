@@ -1564,11 +1564,15 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     const dop = input.effectiveDop();
     const n_threads = @max(dop, 1);
+    // Route partitions, not execution units: the driver LPT-packs nonzero
+    // partitions into ~2×threads execution bins, so a finer fan-out isolates
+    // whale keys without multiplying program runs (the 192-executed-shards
+    // experiment that regressed).
     const n_shards: usize = blk: {
         if (getenv("THINDB_REGION_SHARDS")) |v| {
-            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 64;
+            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 256;
         }
-        break :blk 64;
+        break :blk 256;
     };
 
     const bs = try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
