@@ -453,6 +453,9 @@ const Builder = struct {
     /// columns on demand.
     null_sides: std.ArrayListUnmanaged(NullSide) = .empty,
     pending_nulls: std.ArrayListUnmanaged(Derived) = .empty,
+    /// Frame columns known constant (folded literal computes): groupings
+    /// skip them as subkeys — a constant can't split groups.
+    const_idxs: std.ArrayListUnmanaged(usize) = .empty,
     /// Probe-side projectId literal (from the scan filter) for the
     /// external_plan map build.
     project_lit: ?Value = null,
@@ -632,29 +635,98 @@ const Builder = struct {
     /// later type-driven decisions (sum int vs float, int-family checks)
     /// can never disagree with execution.
     fn pushCompute(b: *Builder, derived: []const Derived) !void {
-        // Clone FIRST (may append pending null columns), flush those, then
-        // append this op — execution order preserved.
-        const out = try b.a.alloc(Derived, derived.len);
-        for (derived, out) |src, *dst| {
+        // Clone everything first (may append pending null columns) and let
+        // the engine type the FULL list once — folded constants then carry
+        // exactly the type the engine evaluator would have produced.
+        const cloned = try b.a.alloc(Derived, derived.len);
+        for (derived, cloned) |src, *dst| {
             const expr = try b.cloneExpr(src.expr);
             dst.* = .{ .name = try b.fb.canonName(src.name), .expr = expr };
         }
         try b.flushPending();
-
+        const base = b.fb.cols.items.len;
         const typed = region.computeOutputSchema(
             b.input.allocator,
             b.a,
             b.fb.cols.items,
-            out,
+            cloned,
             b.input.udf_registry,
         ) catch return NoMatch;
-        if (typed.len != b.fb.cols.items.len + derived.len) return NoMatch;
-        try b.ops.append(b.a, .{ .compute = .{ .derived = out } });
-        for (derived, typed[b.fb.cols.items.len..]) |src, col| {
-            const idx = b.fb.cols.items.len;
-            try b.fb.cols.append(b.a, col);
-            try b.fb.setVis(src.name, idx);
+        if (typed.len != base + derived.len) return NoMatch;
+
+        // Constant deriveds (literals, typed literal casts, NULL literals)
+        // fold into a bulk-fill const_cols op — per-row evaluation for e.g.
+        // sixteen zero columns is pure waste — and their frame columns are
+        // remembered so groupings can skip them as subkeys.
+        var const_cols: std.ArrayListUnmanaged(Column) = .empty;
+        var const_vals: std.ArrayListUnmanaged(?Value) = .empty;
+        var rest: std.ArrayListUnmanaged(Derived) = .empty;
+        var rest_src: std.ArrayListUnmanaged(usize) = .empty;
+        for (derived, cloned, 0..) |src, cl, i| {
+            const t = typed[base + i].type;
+            if (foldConst(cl.expr, t)) |fv| {
+                const idx = b.fb.cols.items.len;
+                try b.fb.cols.append(b.a, .{ .name = cl.name, .type = t, .nullable = true });
+                try const_cols.append(b.a, b.fb.cols.items[idx]);
+                try const_vals.append(b.a, fv);
+                try b.fb.setVis(src.name, idx);
+                try b.const_idxs.append(b.a, idx);
+            } else {
+                try rest.append(b.a, cl);
+                try rest_src.append(b.a, i);
+            }
         }
+        if (const_cols.items.len > 0) {
+            try b.ops.append(b.a, .{ .const_cols = .{
+                .cols = const_cols.items,
+                .values = const_vals.items,
+            } });
+        }
+        if (rest.items.len == 0) return;
+        try b.ops.append(b.a, .{ .compute = .{ .derived = rest.items } });
+        for (rest.items, rest_src.items) |cl, i| {
+            const idx = b.fb.cols.items.len;
+            var col = typed[base + i];
+            col.name = cl.name;
+            try b.fb.cols.append(b.a, col);
+            try b.fb.setVis(derived[i].name, idx);
+        }
+    }
+
+    /// Constant expressions the fill op can represent, coerced to the type
+    /// the engine evaluator derived for the derived column: NULL literals,
+    /// int-family literals, and single-arg typed casts of them. Returns the
+    /// fill value (?? = the outer optional is "not foldable"; the inner is
+    /// the NULL fill). Anything else stays with the engine evaluator.
+    fn foldConst(e: ir.Expr, t: types.Type) ??Value {
+        const lit: ?Value = switch (e) {
+            .null_lit => null,
+            .lit => |v| v,
+            .call => |c| blk: {
+                if (c.args.len != 1) return null;
+                const known = std.ascii.eqlIgnoreCase(c.fn_name, "to_bigint") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "to_int") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "to_smallint") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "to_double");
+                if (!known) return null;
+                break :blk switch (c.args[0]) {
+                    .null_lit => null,
+                    .lit => |v| v,
+                    else => return null,
+                };
+            },
+            else => return null,
+        };
+        const v = lit orelse return @as(??Value, @as(?Value, null));
+        const iv = valueI64(v) orelse return null;
+        return switch (t) {
+            .bigint => @as(?Value, .{ .bigint = iv }),
+            .int => @as(?Value, .{ .int = std.math.cast(i32, iv) orelse return null }),
+            .smallint => @as(?Value, .{ .smallint = std.math.cast(i16, iv) orelse return null }),
+            .tinyint => @as(?Value, .{ .tinyint = std.math.cast(i8, iv) orelse return null }),
+            .double => @as(?Value, .{ .double = @floatFromInt(iv) }),
+            else => null,
+        };
     }
 
     fn applySelect(b: *Builder, p: *const ir.Op.Project) !void {
@@ -1510,7 +1582,16 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
                 break;
             }
         }
-        if (!is_span_key) try subkeys.append(a, idx);
+        if (!is_span_key) {
+            var is_const = false;
+            for (b.const_idxs.items) |ci| {
+                if (ci == idx) {
+                    is_const = true;
+                    break;
+                }
+            }
+            if (!is_const) try subkeys.append(a, idx);
+        }
     }
     for (covered) |c| {
         if (!c) return NoMatch;

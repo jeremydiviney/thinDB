@@ -686,6 +686,10 @@ pub const RegionOp = union(enum) {
         /// union_append the filtered-out rows still flow through the copy.
         input_filter: ?struct { col: usize, lo: i64, hi: i64 } = null,
     },
+    /// Recognizer-folded constant columns: append `values[i]` to every
+    /// frame row (NULL when null). Skips per-row expression evaluation for
+    /// literal-only computes (e.g. blocks of typed zero columns).
+    const_cols: struct { cols: []const Column, values: []const ?types.Value },
     /// Final projection into the caller's per-shard output stores. Must be
     /// the program's last op.
     emit: struct { cols: []const usize },
@@ -877,6 +881,16 @@ pub const Program = struct {
                     }
                     break :blk try dupeSchema(a, t.spec.out);
                 },
+                .const_cols => |cc| blk: {
+                    if (cc.cols.len != cc.values.len) return error.UnsupportedQueryShape;
+                    const cols = try a.alloc(Column, in.len + cc.cols.len);
+                    @memcpy(cols[0..in.len], in);
+                    for (cc.cols, cols[in.len..]) |src, *col| {
+                        col.* = src;
+                        col.name = try a.dupe(u8, src.name);
+                    }
+                    break :blk cols;
+                },
                 .emit => |e| blk: {
                     const cols = try a.alloc(Column, e.cols.len);
                     for (e.cols, cols) |c, *col| {
@@ -997,6 +1011,7 @@ pub const RegionWorker = struct {
             ranges: std.ArrayListUnmanaged([2]u32) = .empty,
         },
         tvf: TvfState,
+        const_cols: struct { out: []ColumnStore },
         emit: void,
     };
 
@@ -1091,6 +1106,11 @@ pub const RegionWorker = struct {
                         .worker_arena = std.heap.ArenaAllocator.init(alloc),
                     } };
                 },
+                .const_cols => |cc| blk: {
+                    const out = try initStores(alloc, prog.schema_at[oi + 1][prog.schema_at[oi].len..]);
+                    _ = cc;
+                    break :blk .{ .const_cols = .{ .out = out } };
+                },
                 .emit => .{ .emit = {} },
             };
             built += 1;
@@ -1165,6 +1185,7 @@ pub const RegionWorker = struct {
                 s.call_arena.deinit();
                 s.worker_arena.deinit();
             },
+            .const_cols => |*s| freeStores(alloc, s.out),
             .emit => {},
         };
     }
@@ -1175,6 +1196,9 @@ pub const RegionWorker = struct {
         var n: usize = self.scratch.queryCapacity();
         for (self.states) |*st| switch (st.*) {
             .compute, .emit => {},
+            .const_cols => |*s| for (s.out) |*c| {
+                n += storeRetainedBytes(c);
+            },
             .ranks => |*s| n += storeRetainedBytes(&s.out),
             .fill_last => |*s| n += storeRetainedBytes(&s.out),
             .lag => |*s| n += storeRetainedBytes(&s.out),
@@ -1272,6 +1296,15 @@ pub const RegionWorker = struct {
                     try self.runTvfGroupedAligned(t, &st.tvf, &fr)
                 else
                     try self.runTvfGrouped(t, &st.tvf, &fr),
+                .const_cols => |cc| {
+                    const s = &st.const_cols;
+                    for (s.out, cc.values) |*store, v| {
+                        store.clear();
+                        try fillConst(self.alloc, store, v, fr.rows);
+                    }
+                    for (s.out, fr.views[fr.width..][0..s.out.len]) |*c, *v| v.* = c.view();
+                    fr.width += s.out.len;
+                },
                 .emit => |e| {
                     for (e.cols, out) |c, *dst| {
                         try appendViewRange(self.alloc, dst, fr.views[c], 0, fr.rows);
@@ -1480,30 +1513,65 @@ pub const RegionWorker = struct {
                 std.mem.sortUnstable(u32, sord, ctx, SubOrdCtx.less);
             }
 
+            // Emission is column-major with the agg kind (and the value
+            // type inside scatterColumn) hoisted out of the group loop —
+            // the same discipline as the accumulate sweeps. Row-sourced
+            // kinds bulk-gather via scatterColumn when every sub-group has
+            // a winner (the overwhelmingly common case) and fall back to
+            // the per-group append only when NULL groups exist.
             const start: u32 = @intCast(if (s.cols.len > 0) s.cols[0].rowCount() else 0);
-            for (sord) |gi| {
-                for (g.out, s.cells, s.cols) |spec, *cells, *dst| {
-                    const cell = &cells.items[gi];
-                    switch (spec.kind) {
-                        .first => |c| try appendRowValue(alloc, dst, fr.views[c], s.sub_first.items[gi]),
-                        .sum_int => if (cell.seen) {
+            const rows_buf = try sa.alloc(u32, nsub);
+            for (g.out, s.cells, s.cols) |spec, *cells, *dst| {
+                switch (spec.kind) {
+                    .first => |c| {
+                        for (sord, rows_buf) |gi, *r| r.* = s.sub_first.items[gi];
+                        try scatterColumn(alloc, dst, fr.views[c], rows_buf);
+                    },
+                    .sum_int => for (sord) |gi| {
+                        const cell = &cells.items[gi];
+                        if (cell.seen) {
                             try dst.data.bigint.append(alloc, cell.i);
                             try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
-                        } else try dst.appendNulls(alloc, 1),
-                        .sum_float => if (cell.seen) {
+                        } else try dst.appendNulls(alloc, 1);
+                    },
+                    .sum_float => for (sord) |gi| {
+                        const cell = &cells.items[gi];
+                        if (cell.seen) {
                             try dst.data.double.append(alloc, cell.f);
                             try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
-                        } else try dst.appendNulls(alloc, 1),
-                        .min_int, .max_int => if (cell.seen) {
+                        } else try dst.appendNulls(alloc, 1);
+                    },
+                    .min_int, .max_int => for (sord) |gi| {
+                        const cell = &cells.items[gi];
+                        if (cell.seen) {
                             try appendI64As(alloc, dst, cell.i);
-                        } else try dst.appendNulls(alloc, 1),
-                        .max_str => |c| if (cell.seen) {
-                            try appendRowValue(alloc, dst, fr.views[c], cell.row);
-                        } else try dst.appendNulls(alloc, 1),
-                        .max_by => |mb| if (cell.seen) {
-                            try appendRowValue(alloc, dst, fr.views[mb.val], cell.row);
-                        } else try dst.appendNulls(alloc, 1),
-                    }
+                        } else try dst.appendNulls(alloc, 1);
+                    },
+                    .max_str, .max_by => {
+                        const src = switch (spec.kind) {
+                            .max_str => |c| fr.views[c],
+                            .max_by => |mb| fr.views[mb.val],
+                            else => unreachable,
+                        };
+                        var all_seen = true;
+                        for (sord) |gi| {
+                            if (!cells.items[gi].seen) {
+                                all_seen = false;
+                                break;
+                            }
+                        }
+                        if (all_seen) {
+                            for (sord, rows_buf) |gi, *r| r.* = cells.items[gi].row;
+                            try scatterColumn(alloc, dst, src, rows_buf);
+                        } else {
+                            for (sord) |gi| {
+                                const cell = &cells.items[gi];
+                                if (cell.seen) {
+                                    try appendRowValue(alloc, dst, src, cell.row);
+                                } else try dst.appendNulls(alloc, 1);
+                            }
+                        }
+                    },
                 }
             }
             try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
@@ -2400,6 +2468,55 @@ pub const RegionExecOp = struct {
         try exec.explainLine(out, allocator, depth, "RegionExec");
     }
 };
+
+/// Bulk-fill a store with one constant (NULL when `v` is null).
+fn fillConst(alloc: Allocator, store: *ColumnStore, v: ?types.Value, n: usize) !void {
+    if (n == 0) return;
+    const val = v orelse return store.appendNulls(alloc, n);
+    switch (store.data) {
+        .tinyint => |*l| try l.appendNTimes(alloc, @intCast(constI64(val)), n),
+        .smallint => |*l| try l.appendNTimes(alloc, @intCast(constI64(val)), n),
+        .int => |*l| try l.appendNTimes(alloc, @intCast(constI64(val)), n),
+        .bigint => |*l| try l.appendNTimes(alloc, constI64(val), n),
+        .date => |*l| try l.appendNTimes(alloc, @intCast(constI64(val)), n),
+        .datetime => |*l| try l.appendNTimes(alloc, constI64(val), n),
+        .float => |*l| try l.appendNTimes(alloc, @floatCast(constF64(val)), n),
+        .double => |*l| try l.appendNTimes(alloc, constF64(val), n),
+        .varchar, .string, .char, .json => |*d| {
+            const s = switch (val) {
+                .text => |t| t,
+                else => return error.UnsupportedQueryShape,
+            };
+            for (0..n) |_| try d.appendValue(alloc, s);
+        },
+        else => return error.UnsupportedQueryShape,
+    }
+    if (store.nulls != null) {
+        const base = store.rowCount() - n;
+        for (0..n) |i| try store.appendValidBit(alloc, base + i, true);
+    }
+}
+
+fn constI64(v: types.Value) i64 {
+    return switch (v) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        .date => |x| x,
+        .datetime => |x| x,
+        .boolean => |x| @intFromBool(x),
+        else => 0,
+    };
+}
+
+fn constF64(v: types.Value) f64 {
+    return switch (v) {
+        .double => |x| x,
+        .float => |x| x,
+        else => @floatFromInt(constI64(v)),
+    };
+}
 
 fn appendI64As(alloc: Allocator, dst: *ColumnStore, v: i64) !void {
     switch (dst.data) {
