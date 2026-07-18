@@ -40,21 +40,20 @@ pub fn main(init: std.process.Init) !u8 {
     const db = try root_db.owned_catalog.?.createOrOpenDatabase(db_name);
 
     if (table_name) |name| {
+        // Named table: full merge-all compaction to a single segment (the
+        // order-aligned region fast path wants one global sorted run).
         const t = try db.openTable(name, .{});
         std.debug.print("{s}: {d} segments before\n", .{ name, t.manifest.segments.items.len });
-    }
-
-    var sweeps: usize = 0;
-    while (try db.backgroundCompactSweep()) {
-        sweeps += 1;
-        std.debug.print("sweep {d} merged something\n", .{sweeps});
-        if (sweeps > 200) break; // runaway guard
-    }
-    std.debug.print("quiescent after {d} sweeps\n", .{sweeps});
-
-    if (table_name) |name| {
-        const t = try db.openTable(name, .{});
+        try t.compact();
         std.debug.print("{s}: {d} segments after\n", .{ name, t.manifest.segments.items.len });
+    } else {
+        var sweeps: usize = 0;
+        while (try db.backgroundCompactSweep()) {
+            sweeps += 1;
+            std.debug.print("sweep {d} merged something\n", .{sweeps});
+            if (sweeps > 200) break; // runaway guard
+        }
+        std.debug.print("quiescent after {d} sweeps\n", .{sweeps});
     }
     return 0;
 }

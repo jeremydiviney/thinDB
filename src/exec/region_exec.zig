@@ -2575,10 +2575,44 @@ pub fn runRegionOrdered(
     const t1 = if (trace) exec.prof.nowTicks() else 0;
 
     @memset(errs, null);
+
+    // Static LPT assignment of intervals to workers (row count as the cost
+    // proxy, whales placed first). Deterministic across runs, so each pooled
+    // slot's op-state high-water stays put instead of every slot growing to
+    // whale size over successive runs (which tipped the pool over its cap).
+    const order = try alloc.alloc(u32, intervals.len);
+    defer alloc.free(order);
+    for (order, 0..) |*o, oi| o.* = @intCast(oi);
+    const SizeDesc = struct {
+        ivs: []OrderedInterval,
+        fn less(c: @This(), a: u32, b: u32) bool {
+            const ra = c.ivs[a].sd.rows;
+            const rb = c.ivs[b].sd.rows;
+            if (ra != rb) return ra > rb;
+            return a < b;
+        }
+    };
+    std.mem.sortUnstable(u32, order, SizeDesc{ .ivs = intervals }, SizeDesc.less);
+    const assign_col = try alloc.alloc(usize, intervals.len);
+    defer alloc.free(assign_col);
+    const loads = try alloc.alloc(usize, opts.n_threads);
+    defer alloc.free(loads);
+    @memset(loads, 0);
+    for (order) |ivi| {
+        var best: usize = 0;
+        for (loads[1..], 1..) |l, w| {
+            if (l < loads[best]) best = w;
+        }
+        assign_col[ivi] = best;
+        loads[best] += intervals[ivi].sd.rows;
+    }
+
     var exec_phase = OrderedExecPhase{
         .opts = opts,
         .schema = prog.schema_at[0],
         .intervals = intervals,
+        .order = order,
+        .assign = assign_col,
         .result = result,
         .slots = pool.slots.items[0..opts.n_threads],
         .alloc = alloc,
@@ -2597,9 +2631,20 @@ pub fn runRegionOrdered(
         const t2 = exec.prof.nowTicks();
         var rows: usize = 0;
         for (result.shards) |s| rows += s.rows;
-        std.debug.print("[region] ORDERED scan={d:.0}ms intervals={d} exec={d:.0}ms out_rows={d} threads={d}\n", .{
-            exec.prof.ticksToMs(t1 - t0), sources.len, exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads,
+        std.debug.print("[region] ORDERED scan={d:.0}ms intervals={d} direct={d} exec={d:.0}ms out_rows={d} threads={d}\n", .{
+            exec.prof.ticksToMs(t1 - t0), sources.len, exec_phase.direct.load(.monotonic), exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads,
         });
+        var con: i64 = 0;
+        for (pool.slots.items[0..opts.n_threads]) |slot| con += slot.rw.consolidate_ticks;
+        std.debug.print("[region]   consolidate={d:.0}ms(cpu)", .{exec.prof.ticksToMs(con)});
+        for (prog.ops, 0..) |op, oi| {
+            var t: i64 = 0;
+            for (pool.slots.items[0..opts.n_threads]) |slot| {
+                if (slot.rw.op_ticks) |ticks| t += ticks[oi];
+            }
+            std.debug.print(" op{d}:{s}={d:.0}ms", .{ oi, @tagName(op), exec.prof.ticksToMs(t) });
+        }
+        std.debug.print("\n", .{});
     }
     pool.releaseRun();
 }
@@ -2608,7 +2653,9 @@ const OrderedExecPhase = struct {
     opts: DriverOpts,
     schema: []const Column,
     intervals: []OrderedInterval,
-    next: std.atomic.Value(usize) = .init(0),
+    order: []const u32,
+    assign: []const usize,
+    direct: std.atomic.Value(usize) = .init(0),
     result: *RegionResult,
     slots: []const *RegionPool.WorkerSlot,
     alloc: Allocator,
@@ -2628,9 +2675,9 @@ const OrderedExecPhase = struct {
         const sort_cols = self.opts.sort_cols;
         const n_sort = sort_cols.len;
 
-        while (true) {
-            const i = self.next.fetchAdd(1, .monotonic);
-            if (i >= self.intervals.len) break;
+        for (self.order) |ivi| {
+            if (self.assign[ivi] != w) continue;
+            const i: usize = ivi;
             const iv = &self.intervals[i];
             const total = iv.sd.rows;
             if (total == 0) continue;
@@ -2647,9 +2694,46 @@ const OrderedExecPhase = struct {
             for (sort_cols, 0..) |sc, kc| {
                 try fillRowKeys(keys, n_sort, kc, sc.kind, views[sc.col], total);
             }
+            const n_runs = iv.runs.items.len;
+
+            // Direct run: ONE locator run whose keys verify ascending means
+            // the interval store already IS the consolidated frame — walk
+            // group boundaries in place and execute over it. No order
+            // permutation, no merge, no gather (the copy that made v1 lose
+            // to the hash path). A union-append first op runs unfused
+            // (start_op 0); its own group copy costs what the gather did,
+            // so direct still nets out the exchange scatter.
+            if (n_runs == 1) one_run: {
+                iv.sd.ranges.clearRetainingCapacity();
+                var g_start: u32 = 0;
+                var r: u32 = 1;
+                const totn: u32 = @intCast(total);
+                while (r < totn) : (r += 1) {
+                    const prev_k = keys[(r - 1) * n_sort ..][0..n_sort];
+                    const cur_k = keys[r * n_sort ..][0..n_sort];
+                    switch (keyCmp(cur_k, prev_k)) {
+                        .lt => {
+                            iv.sd.ranges.clearRetainingCapacity();
+                            break :one_run;
+                        },
+                        .gt => if (!keyEqPrefix(prev_k, cur_k, self.opts.group_prefix)) {
+                            try iv.sd.ranges.append(self.alloc, .{ g_start, r });
+                            g_start = r;
+                        },
+                        .eq => {},
+                    }
+                }
+                try iv.sd.ranges.append(self.alloc, .{ g_start, totn });
+                if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
+                _ = self.direct.fetchAdd(1, .monotonic);
+                const out = &self.result.shards[i];
+                try rw.runShardFrom(&iv.sd, out.cols, 0);
+                out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
+                continue;
+            }
+
             const ord = try scratch.alloc(u32, total);
             for (ord, 0..) |*o, r| o.* = @intCast(r);
-            const n_runs = iv.runs.items.len;
             const runs = try scratch.alloc(RunState, n_runs);
             const KCtx = struct {
                 keys: []const RowKey,
