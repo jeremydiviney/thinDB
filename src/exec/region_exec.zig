@@ -20,7 +20,8 @@ const types = @import("../types.zig");
 const Column = types.Column;
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
-const ColumnStore = @import("../engine/store.zig").ColumnStore;
+const store_mod = @import("../engine/store.zig");
+const ColumnStore = store_mod.ColumnStore;
 const exec = @import("exec.zig");
 const Batch = exec.Batch;
 const compute_mod = @import("compute.zig");
@@ -82,9 +83,31 @@ pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnVie
         },
         else => return error.UnsupportedQueryShape,
     }
-    if (dst.nulls != null) {
-        for (refs, 0..) |r, k| {
-            try dst.appendValidBit(alloc, base + k, srcs[r >> REF_ROW_BITS].isValid(r & REF_ROW_MASK));
+    if (dst.nulls != null) try appendGatherValidity(alloc, dst, srcs, refs, base);
+}
+
+/// Validity for a gathered append: grow the bitmap once, then set bits with
+/// no per-row allocation path. Fresh bytes arrive zeroed (invalid), so only
+/// true bits are written — same invariant `appendValidityRange` relies on.
+fn appendGatherValidity(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnView, refs: []const u32, base: usize) !void {
+    const nb = &dst.nulls.?;
+    const need = (base + refs.len + 7) / 8;
+    if (nb.items.len < need) try nb.appendNTimes(alloc, 0, need - nb.items.len);
+    const bytes = nb.items;
+    var all_valid = true;
+    for (srcs) |s| {
+        if (s.nulls != null) {
+            all_valid = false;
+            break;
+        }
+    }
+    if (all_valid) {
+        store_mod.setBitRangeTrue(bytes, base, refs.len);
+        return;
+    }
+    for (refs, base..) |r, row| {
+        if (srcs[r >> REF_ROW_BITS].isValid(r & REF_ROW_MASK)) {
+            bytes[row >> 3] |= @as(u8, 1) << @intCast(row & 7);
         }
     }
 }
@@ -110,7 +133,7 @@ pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start
     }
     if (dst.nulls != null) {
         const base = dst.rowCount() - (end - start);
-        for (start..end, 0..) |i, k| try dst.appendValidBit(alloc, base + k, v.isValid(i));
+        try dst.appendValidityRangeFrom(alloc, base, v.nulls, start, end - start);
     }
 }
 
@@ -492,48 +515,62 @@ pub fn consolidateOrderedTail(
         }
     }
 
-    // Normalized keys, columnar: keys[kc * total + row].
+    // Normalized keys, row-major (keys[row * n_sort + kc]): one row's whole
+    // key tuple shares cache lines during the sort's random-access compares.
+    // The fill hoists the kind/type dispatch out of the row loop — one
+    // monomorphized sweep per (sort col, bucket).
+    const n_sort = sort_cols.len;
     const refs = try scratch.alloc(u32, total);
-    const keys = try scratch.alloc(RowKey, sort_cols.len * total);
+    const keys = try scratch.alloc(RowKey, n_sort * total);
     {
-        var k: usize = 0;
+        var base_k: usize = 0;
         for (0..ex.n_workers) |w| {
             const bucket_rows = ex.bucket(w, shard).rows;
-            for (0..bucket_rows) |i| {
-                refs[k] = @intCast((w << REF_ROW_BITS) | i);
-                for (sort_cols, 0..) |sc, kc| {
-                    const v = views[sc.col * ex.n_workers + w];
-                    const valid = v.isValid(i);
-                    keys[kc * total + k] = switch (sc.kind) {
-                        .string => blk: {
-                            const s: []const u8 = if (valid) stringViewOf(v).rowBytes(i) else "";
-                            break :blk .{ .norm = normStrPrefix(valid, s), .str = s };
-                        },
-                        .int32 => .{ .norm = normI32(valid, switch (v.data) {
-                            .int => |s| s[i],
-                            .date => |s| s[i],
+            for (0..bucket_rows) |i| refs[base_k + i] = @intCast((w << REF_ROW_BITS) | i);
+            for (sort_cols, 0..) |sc, kc| {
+                const v = views[sc.col * ex.n_workers + w];
+                switch (sc.kind) {
+                    .string => {
+                        const sv = stringViewOf(v);
+                        for (0..bucket_rows) |i| {
+                            const valid = v.isValid(i);
+                            const s: []const u8 = if (valid) sv.rowBytes(i) else "";
+                            keys[(base_k + i) * n_sort + kc] = .{ .norm = normStrPrefix(valid, s), .str = s };
+                        }
+                    },
+                    .int32 => {
+                        const vals: []const i32 = switch (v.data) {
+                            .int => |s| s,
+                            .date => |s| s,
                             else => return error.UnsupportedQueryShape,
-                        }), .str = "" },
-                        .int64 => .{ .norm = normI64(valid, switch (v.data) {
-                            .bigint => |s| s[i],
-                            .datetime => |s| s[i],
+                        };
+                        for (0..bucket_rows) |i| {
+                            keys[(base_k + i) * n_sort + kc] = .{ .norm = normI32(v.isValid(i), vals[i]), .str = "" };
+                        }
+                    },
+                    .int64 => {
+                        const vals: []const i64 = switch (v.data) {
+                            .bigint => |s| s,
+                            .datetime => |s| s,
                             else => return error.UnsupportedQueryShape,
-                        }), .str = "" },
-                    };
+                        };
+                        for (0..bucket_rows) |i| {
+                            keys[(base_k + i) * n_sort + kc] = .{ .norm = normI64(v.isValid(i), vals[i]), .str = "" };
+                        }
+                    },
                 }
-                k += 1;
             }
+            base_k += bucket_rows;
         }
     }
 
     const Ctx = struct {
         keys: []const RowKey,
         n_sort: usize,
-        total: usize,
         fn less(c: @This(), x: u32, y: u32) bool {
-            for (0..c.n_sort) |kc| {
-                const a = c.keys[kc * c.total + x];
-                const b = c.keys[kc * c.total + y];
+            const ka = c.keys[x * c.n_sort ..][0..c.n_sort];
+            const kb = c.keys[y * c.n_sort ..][0..c.n_sort];
+            for (ka, kb) |a, b| {
                 if (a.norm != b.norm) return a.norm < b.norm;
                 if (a.str.len != 0 or b.str.len != 0) {
                     switch (std.mem.order(u8, a.str, b.str)) {
@@ -546,16 +583,16 @@ pub fn consolidateOrderedTail(
             return x < y; // stable tie-break on arrival order
         }
         fn sameGroup(c: @This(), prefix: usize, x: u32, y: u32) bool {
-            for (0..prefix) |kc| {
-                const a = c.keys[kc * c.total + x];
-                const b = c.keys[kc * c.total + y];
+            const ka = c.keys[x * c.n_sort ..][0..prefix];
+            const kb = c.keys[y * c.n_sort ..][0..prefix];
+            for (ka, kb) |a, b| {
                 if (a.norm != b.norm) return false;
                 if ((a.str.len != 0 or b.str.len != 0) and !std.mem.eql(u8, a.str, b.str)) return false;
             }
             return true;
         }
     };
-    const ctx = Ctx{ .keys = keys, .n_sort = sort_cols.len, .total = total };
+    const ctx = Ctx{ .keys = keys, .n_sort = n_sort };
 
     const order = try scratch.alloc(u32, total);
     for (order, 0..) |*o, i| o.* = @intCast(i);

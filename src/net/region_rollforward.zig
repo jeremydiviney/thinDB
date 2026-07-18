@@ -1517,7 +1517,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     }
     ctx.entry_schema = entry_schema;
 
-    const pj_entry = (b.fb.resolve("projectId") orelse return NoMatch).idx;
+    if (b.fb.resolve("projectId") == null) return NoMatch;
     const lc_entry = (b.fb.resolve("customerNumberLC") orelse return NoMatch).idx;
     const div_entry = (b.fb.resolve("divisionId") orelse return NoMatch).idx;
 
@@ -1529,13 +1529,15 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
     for (sp.tf69.order_by) |ob| if (ob.desc) return NoMatch;
     const est_o0 = (b.fb.resolve(sp.tf69.order_by[0].col) orelse return NoMatch).idx;
     const est_o1 = (b.fb.resolve(sp.tf69.order_by[1].col) orelse return NoMatch).idx;
-    const sort_cols = try a.alloc(region.OrderCol, 6);
-    sort_cols[0] = .{ .col = pj_entry, .kind = try orderKind(entry_schema[pj_entry].type) };
-    sort_cols[1] = .{ .col = lc_entry, .kind = try orderKind(entry_schema[lc_entry].type) };
-    sort_cols[2] = .{ .col = div_entry, .kind = try orderKind(entry_schema[div_entry].type) };
-    sort_cols[3] = .{ .col = est_o0, .kind = try orderKind(entry_schema[est_o0].type) };
-    sort_cols[4] = .{ .col = est_o1, .kind = try orderKind(entry_schema[est_o1].type) };
-    sort_cols[5] = .{ .col = rowloc_entry, .kind = .int64 };
+    // projectId is NOT a sort key: the scan filter pins it to one literal
+    // (project_lit, required above), so every row compares equal — sorting
+    // on (lc, div, ...) yields the identical order with one fewer key pass.
+    const sort_cols = try a.alloc(region.OrderCol, 5);
+    sort_cols[0] = .{ .col = lc_entry, .kind = try orderKind(entry_schema[lc_entry].type) };
+    sort_cols[1] = .{ .col = div_entry, .kind = try orderKind(entry_schema[div_entry].type) };
+    sort_cols[2] = .{ .col = est_o0, .kind = try orderKind(entry_schema[est_o0].type) };
+    sort_cols[3] = .{ .col = est_o1, .kind = try orderKind(entry_schema[est_o1].type) };
+    sort_cols[4] = .{ .col = rowloc_entry, .kind = .int64 };
 
     // ---- visible map at the estimates input ------------------------------
     try b.applySelect(sp.s63);
@@ -1862,7 +1864,7 @@ fn recognizeAt(input: engine_v2.CompileInput, anchor: *const ir.Op) anyerror!exe
         .n_shards = n_shards,
         .key_col = lc_entry,
         .sort_cols = sort_cols,
-        .group_prefix = 3,
+        .group_prefix = 2,
     };
     ctx.opts = opts;
 
