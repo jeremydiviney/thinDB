@@ -2003,6 +2003,13 @@ pub const DriverOpts = struct {
     /// `group_prefix` columns define the region-key group ranges.
     sort_cols: []const OrderCol,
     group_prefix: usize,
+    /// Order-aligned mode (#186): sources are per-key-interval scans over a
+    /// table physically ordered by the declared keys — no hash exchange;
+    /// each source's output is per-segment key-sorted runs (memtable
+    /// residue last, unsorted) merged directly into the shard frame. The
+    /// row-loc column that detects run boundaries is `loc_col`.
+    ordered: bool = false,
+    loc_col: usize = 0,
 };
 
 /// Per-shard program outputs. Shards with zero input rows have empty stores.
@@ -2101,6 +2108,8 @@ pub const RegionPool = struct {
     prog: ?*const Program = null,
     n_shards: usize = 0,
     ex: ?Exchange = null,
+    /// Ordered-mode per-interval stores (pooled instead of exchange buckets).
+    ivs: []OrderedInterval = &.{},
     slots: std.ArrayListUnmanaged(*WorkerSlot) = .empty,
 
     pub const WorkerSlot = struct {
@@ -2122,6 +2131,12 @@ pub const RegionPool = struct {
     fn reset(self: *RegionPool) void {
         if (self.ex) |*ex| ex.deinit();
         self.ex = null;
+        for (self.ivs) |*iv| {
+            iv.sd.deinit(self.alloc);
+            iv.runs.deinit(self.alloc);
+        }
+        self.alloc.free(self.ivs);
+        self.ivs = &.{};
         for (self.slots.items) |slot| {
             slot.rw.deinit();
             slot.sd.deinit(self.alloc);
@@ -2133,17 +2148,40 @@ pub const RegionPool = struct {
     }
 
     /// Prepare the pool for a run of `prog`: reuse (clear) when the program
-    /// and shape match the previous run, rebuild otherwise.
+    /// and shape match the previous run, rebuild otherwise. Ordered mode
+    /// pools per-interval stores instead of exchange buckets.
     fn acquire(self: *RegionPool, prog: *const Program, opts: DriverOpts) !void {
-        const match = self.prog == prog and self.n_shards == opts.n_shards and
-            self.ex != null and self.ex.?.n_workers == opts.n_threads;
-        if (!match) {
-            self.reset();
-            self.ex = try Exchange.init(self.alloc, prog.schema_at[0], opts.n_threads, opts.n_shards, opts.key_col);
-            self.prog = prog;
-            self.n_shards = opts.n_shards;
+        if (opts.ordered) {
+            const match = self.prog == prog and self.ivs.len == opts.n_shards;
+            if (!match) {
+                self.reset();
+                self.ivs = try self.alloc.alloc(OrderedInterval, opts.n_shards);
+                @memset(self.ivs, .{});
+                self.prog = prog;
+                self.n_shards = opts.n_shards;
+            } else {
+                for (self.ivs) |*iv| {
+                    if (iv.sd.built) {
+                        for (iv.sd.cols) |*c| c.clear();
+                        iv.sd.ranges.clearRetainingCapacity();
+                        iv.sd.rows = 0;
+                    }
+                    iv.runs.clearRetainingCapacity();
+                    iv.last_loc = std.math.minInt(i64);
+                    iv.last_valid = true;
+                }
+            }
         } else {
-            self.ex.?.clear();
+            const match = self.prog == prog and self.n_shards == opts.n_shards and
+                self.ex != null and self.ex.?.n_workers == opts.n_threads;
+            if (!match) {
+                self.reset();
+                self.ex = try Exchange.init(self.alloc, prog.schema_at[0], opts.n_threads, opts.n_shards, opts.key_col);
+                self.prog = prog;
+                self.n_shards = opts.n_shards;
+            } else {
+                self.ex.?.clear();
+            }
         }
         // Tick counters are per-RUN in the trace output; without this the
         // pooled path accumulates across runs and the per-op report lies.
@@ -2179,6 +2217,9 @@ pub const RegionPool = struct {
             for (ex.buckets) |b| {
                 for (b.cols) |*c| n += storeRetainedBytes(c);
             }
+        }
+        for (self.ivs) |*iv| {
+            for (iv.sd.cols) |*c| n += storeRetainedBytes(c);
         }
         for (self.slots.items) |slot| {
             n += slot.rw.retainedBytes();
@@ -2415,6 +2456,287 @@ pub fn runRegion(
     return runRegionPooled(scan_schema, sources, entry_derived, prog, opts, result, &pool);
 }
 
+/// Order-aligned driver (#186): each source IS one key interval of a table
+/// physically ordered by the declared keys. Phase 1 drains each interval
+/// into its own columnar store, recording run boundaries wherever the row
+/// locator stops ascending (segment transitions; the memtable residue is
+/// the trailing unsorted run). Phase 2 sorts only the residue run, merges
+/// the runs with the standard RowKey machinery, gathers group ranges, and
+/// executes the program — one interval, one program run, no exchange.
+const OrderedInterval = struct {
+    sd: ShardData = .{},
+    runs: std.ArrayListUnmanaged(u32) = .empty, // run start offsets
+    last_loc: i64 = std.math.minInt(i64),
+    last_valid: bool = true,
+};
+
+const OrderedPhase = struct {
+    schema: []const Column,
+    sources: []exec.Query,
+    intervals: []OrderedInterval,
+    next: std.atomic.Value(usize) = .init(0),
+    entry_derived: []const compute_mod.Derived,
+    scan_schema: []const Column,
+    registry: ?*const udf_mod.UdfRegistry,
+    loc_col: usize,
+    alloc: Allocator,
+    errs: []?anyerror,
+
+    fn worker(self: *OrderedPhase, w: usize) void {
+        self.workerInner(w) catch |e| {
+            self.errs[w] = e;
+        };
+    }
+
+    fn workerInner(self: *OrderedPhase, w: usize) !void {
+        _ = w;
+        var inst: ?ComputeInstance = null;
+        defer if (inst) |*i| i.q.deinit();
+        if (self.entry_derived.len > 0) {
+            inst = try makeComputeInstance(self.alloc, self.scan_schema, self.entry_derived, self.registry);
+        }
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.sources.len) break;
+            const iv = &self.intervals[i];
+            try iv.sd.ensure(self.alloc, self.schema);
+            while (try self.sources[i].next()) |batch| {
+                const routed = if (inst) |*ci| try ci.ptr.evalBatch(batch) else batch;
+                if (routed.row_count == 0) continue;
+                const base: u32 = @intCast(iv.sd.cols[0].rowCount());
+                for (iv.sd.cols, routed.values) |*store, v| {
+                    try appendViewRange(self.alloc, store, v, 0, routed.row_count);
+                }
+                // Run boundaries: the locator ascends within one segment's
+                // rows; any non-ascent (segment change, memtable residue)
+                // starts a new run.
+                const lv = routed.values[self.loc_col];
+                for (0..routed.row_count) |r| {
+                    const valid = lv.isValid(r);
+                    const loc: i64 = if (valid) lv.data.bigint[r] else std.math.minInt(i64);
+                    if (iv.runs.items.len == 0 or loc <= iv.last_loc or valid != iv.last_valid) {
+                        if (iv.runs.items.len == 0 or base + r > iv.runs.items[iv.runs.items.len - 1]) {
+                            try iv.runs.append(self.alloc, base + @as(u32, @intCast(r)));
+                        }
+                    }
+                    iv.last_loc = loc;
+                    iv.last_valid = valid;
+                }
+            }
+            iv.sd.rows = iv.sd.cols[0].rowCount();
+        }
+    }
+};
+
+pub fn runRegionOrdered(
+    scan_schema: []const Column,
+    sources: []exec.Query,
+    entry_derived: []const compute_mod.Derived,
+    prog: *const Program,
+    opts: DriverOpts,
+    result: *RegionResult,
+    pool: *RegionPool,
+) !void {
+    const alloc = pool.alloc;
+    try pool.acquire(prog, opts);
+
+    const errs = try alloc.alloc(?anyerror, opts.n_threads);
+    defer alloc.free(errs);
+    @memset(errs, null);
+    const threads = try alloc.alloc(std.Thread, opts.n_threads);
+    defer alloc.free(threads);
+
+    const trace = getenv("THINDB_REGION_TRACE") != null;
+    const t0 = if (trace) exec.prof.nowTicks() else 0;
+
+    if (pool.ivs.len != sources.len) return error.UnsupportedQueryShape;
+    const intervals = pool.ivs;
+
+    var scan_phase = OrderedPhase{
+        .schema = prog.schema_at[0],
+        .sources = sources,
+        .intervals = intervals,
+        .entry_derived = entry_derived,
+        .scan_schema = scan_schema,
+        .registry = prog.registry,
+        .loc_col = opts.loc_col,
+        .alloc = alloc,
+        .errs = errs,
+    };
+    var spawned: usize = 0;
+    for (0..opts.n_threads - 1) |w| {
+        threads[w] = try std.Thread.spawn(.{}, OrderedPhase.worker, .{ &scan_phase, w });
+        spawned += 1;
+    }
+    scan_phase.worker(opts.n_threads - 1);
+    for (threads[0..spawned]) |t| t.join();
+    for (errs) |e| if (e) |err| return err;
+
+    const t1 = if (trace) exec.prof.nowTicks() else 0;
+
+    @memset(errs, null);
+    var exec_phase = OrderedExecPhase{
+        .opts = opts,
+        .schema = prog.schema_at[0],
+        .intervals = intervals,
+        .result = result,
+        .slots = pool.slots.items[0..opts.n_threads],
+        .alloc = alloc,
+        .errs = errs,
+    };
+    spawned = 0;
+    for (0..opts.n_threads - 1) |w| {
+        threads[w] = try std.Thread.spawn(.{}, OrderedExecPhase.worker, .{ &exec_phase, w });
+        spawned += 1;
+    }
+    exec_phase.worker(opts.n_threads - 1);
+    for (threads[0..spawned]) |t| t.join();
+    for (errs) |e| if (e) |err| return err;
+
+    if (trace) {
+        const t2 = exec.prof.nowTicks();
+        var rows: usize = 0;
+        for (result.shards) |s| rows += s.rows;
+        std.debug.print("[region] ORDERED scan={d:.0}ms intervals={d} exec={d:.0}ms out_rows={d} threads={d}\n", .{
+            exec.prof.ticksToMs(t1 - t0), sources.len, exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads,
+        });
+    }
+    pool.releaseRun();
+}
+
+const OrderedExecPhase = struct {
+    opts: DriverOpts,
+    schema: []const Column,
+    intervals: []OrderedInterval,
+    next: std.atomic.Value(usize) = .init(0),
+    result: *RegionResult,
+    slots: []const *RegionPool.WorkerSlot,
+    alloc: Allocator,
+    errs: []?anyerror,
+
+    fn worker(self: *OrderedExecPhase, w: usize) void {
+        self.workerInner(w) catch |e| {
+            self.errs[w] = e;
+        };
+    }
+
+    fn workerInner(self: *OrderedExecPhase, w: usize) !void {
+        const slot = self.slots[w];
+        const rw = &slot.rw;
+        const tail = rw.fusedFirstTail();
+        const start_op: usize = if (tail != null) 1 else 0;
+        const sort_cols = self.opts.sort_cols;
+        const n_sort = sort_cols.len;
+
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.intervals.len) break;
+            const iv = &self.intervals[i];
+            const total = iv.sd.rows;
+            if (total == 0) continue;
+            _ = slot.scratch.reset(.retain_capacity);
+            const scratch = slot.scratch.allocator();
+            const t_con = if (rw.op_ticks != null) exec.prof.nowTicks() else 0;
+
+            // Keys for the whole interval, then per-run merge. Runs from the
+            // scan are key-sorted (physical table order) EXCEPT any residue
+            // run that contains non-ascending locators — sort those.
+            const keys = try scratch.alloc(RowKey, total * n_sort);
+            const views = try scratch.alloc(ColumnView, iv.sd.cols.len);
+            for (iv.sd.cols, views) |*c, *v| v.* = c.view();
+            for (sort_cols, 0..) |sc, kc| {
+                try fillRowKeys(keys, n_sort, kc, sc.kind, views[sc.col], total);
+            }
+            const ord = try scratch.alloc(u32, total);
+            for (ord, 0..) |*o, r| o.* = @intCast(r);
+            const n_runs = iv.runs.items.len;
+            const runs = try scratch.alloc(RunState, n_runs);
+            const KCtx = struct {
+                keys: []const RowKey,
+                n_sort: usize,
+                fn less(c: @This(), x: u32, y: u32) bool {
+                    return switch (keyCmp(
+                        c.keys[x * c.n_sort ..][0..c.n_sort],
+                        c.keys[y * c.n_sort ..][0..c.n_sort],
+                    )) {
+                        .lt => true,
+                        .gt => false,
+                        .eq => x < y,
+                    };
+                }
+            };
+            for (0..n_runs) |ri| {
+                const lo = iv.runs.items[ri];
+                const hi: u32 = if (ri + 1 < n_runs) iv.runs.items[ri + 1] else @intCast(total);
+                const slice = ord[lo..hi];
+                // A run is sorted by construction only if its keys really
+                // ascend — verify cheaply and sort when not (residue runs).
+                var sorted = true;
+                var r: u32 = lo;
+                while (r + 1 < hi) : (r += 1) {
+                    if (keyCmp(keys[(r + 1) * n_sort ..][0..n_sort], keys[r * n_sort ..][0..n_sort]) == .lt) {
+                        sorted = false;
+                        break;
+                    }
+                }
+                if (!sorted) {
+                    std.mem.sortUnstable(u32, slice, KCtx{ .keys = keys, .n_sort = n_sort }, KCtx.less);
+                }
+                runs[ri] = .{ .w = @intCast(ri), .keys = keys, .ord = slice, .pos = 0 };
+            }
+
+            const mctx = MergeCtx{ .runs = runs, .n_sort = n_sort };
+            const heap = try scratch.alloc(u32, n_runs);
+            for (heap, 0..) |*h, hi2| h.* = @intCast(hi2);
+            var hb = n_runs / 2;
+            while (hb > 0) {
+                hb -= 1;
+                mctx.siftDown(heap, hb);
+            }
+            const grefs = try scratch.alloc(u32, total);
+            var bnds: std.ArrayListUnmanaged(u32) = .empty;
+            var heap_len = n_runs;
+            var prev: ?[]const RowKey = null;
+            var out_i: u32 = 0;
+            while (heap_len > 0) {
+                const rr = &runs[heap[0]];
+                const row = rr.ord[rr.pos];
+                const hk = rr.keys[row * n_sort ..][0..n_sort];
+                if (prev == null or !keyEqPrefix(prev.?, hk, self.opts.group_prefix)) {
+                    try bnds.append(scratch, out_i);
+                }
+                prev = hk;
+                grefs[out_i] = row;
+                out_i += 1;
+                rr.pos += 1;
+                if (rr.pos == rr.ord.len) {
+                    heap[0] = heap[heap_len - 1];
+                    heap_len -= 1;
+                }
+                mctx.siftDown(heap[0..heap_len], 0);
+            }
+            try bnds.append(scratch, @intCast(total));
+
+            // Gather group-by-group into the worker frame, then run ops.
+            try slot.sd.ensure(self.alloc, self.schema);
+            for (bnds.items[0 .. bnds.items.len - 1], bnds.items[1..]) |g_start, g_end| {
+                const base: u32 = @intCast(slot.sd.cols[0].rowCount());
+                for (slot.sd.cols, 0..) |*dst, ci| {
+                    try gatherColumn(self.alloc, dst, views[ci .. ci + 1], grefs[g_start..g_end]);
+                }
+                if (tail) |t| try t.run(t.ctx, &slot.sd, base);
+                try slot.sd.ranges.append(self.alloc, .{ base, @intCast(slot.sd.cols[0].rowCount()) });
+            }
+            slot.sd.rows = slot.sd.cols[0].rowCount();
+            if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
+
+            const out = &self.result.shards[i];
+            try rw.runShardFrom(&slot.sd, out.cols, start_op);
+            out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
+        }
+    }
+};
+
 pub fn runRegionPooled(
     scan_schema: []const Column,
     sources: []exec.Query,
@@ -2424,6 +2746,7 @@ pub fn runRegionPooled(
     result: *RegionResult,
     pool: *RegionPool,
 ) !void {
+    if (opts.ordered) return runRegionOrdered(scan_schema, sources, entry_derived, prog, opts, result, pool);
     const alloc = pool.alloc;
     try pool.acquire(prog, opts);
     const ex = &pool.ex.?;

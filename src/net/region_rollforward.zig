@@ -438,7 +438,17 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
 
     const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
     const n_threads = @max(input.effectiveDop(), 1);
-    const bs = try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
+    const bs = if (ctx.opts.ordered)
+        try buildOrderedSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, ctx.opts.n_threads, lastSegment(anchor.materialize.region_keys.?[0]))
+    else
+        try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
+    // Interval count is deterministic given identical data versions (the
+    // hit precondition); a drift means the snapshot changed under us.
+    if (ctx.opts.ordered and bs.sources.len != ctx.opts.n_shards) {
+        for (bs.sources) |*s| s.deinit();
+        qa.free(bs.sources);
+        return NoMatch;
+    }
     var sources_owned = true;
     errdefer if (sources_owned) {
         for (bs.sources) |*s| s.deinit();
@@ -1575,9 +1585,45 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         break :blk 256;
     };
 
-    const bs = try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
+    // Order-aligned fast path (#186): the declared keys form a contiguous
+    // run of the table's physical order_key immediately after the leading
+    // eq-pinned columns, and the route key is a stored column — the table
+    // order replaces the hash exchange (key-interval scans arrive
+    // pre-grouped; consolidation is a small run merge).
+    const order_aligned = blk: {
+        // Opt-in while the exec phase trails the hash exchange (~2.0s vs
+        // 1.24s on the sorted bench table): correct and value-verified, but
+        // the single-sorted-run fast case still pays a gather it doesn't
+        // need. Flip default once ops run directly over sorted interval
+        // stores.
+        if (getenv("THINDB_REGION_ORDERED") == null) break :blk false;
+        for (pl.entry_derived) |d| {
+            if (std.ascii.eqlIgnoreCase(d.name, lastSegment(declared_keys[0]))) break :blk false;
+        }
+        const ok = table.schema.order_key;
+        var oi: usize = 0;
+        outer: while (oi < ok.len) : (oi += 1) {
+            for (prune_leaves.items) |l| {
+                if (l.op == .eq and std.ascii.eqlIgnoreCase(lastSegment(l.col), ok[oi])) continue :outer;
+            }
+            break;
+        }
+        if (ok.len - oi < declared_keys.len) break :blk false;
+        for (declared_keys, ok[oi..][0..declared_keys.len]) |dk, okc| {
+            if (!std.ascii.eqlIgnoreCase(lastSegment(dk), okc)) break :blk false;
+        }
+        break :blk true;
+    };
+
+    const bs = if (order_aligned)
+        try buildOrderedSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads, lastSegment(declared_keys[0]))
+    else
+        try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
     const sources = bs.sources;
     const total_rows = bs.total_rows;
+    if (order_aligned and getenv("THINDB_REGION_TRACE") != null) {
+        std.debug.print("[region] order-aligned: {d} key intervals ride table order_key\n", .{sources.len});
+    }
     var sources_owned = true; // RegionExecOp takes them over on create
     errdefer if (sources_owned) {
         for (sources) |*q| q.deinit();
@@ -1667,6 +1713,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     const route_idx = (b.fb.resolve(declared_keys[0]) orelse return NoMatch).idx;
     if (std.mem.indexOfScalar(usize, range_keys, route_idx) == null) return NoMatch;
 
+
     // Sort order within the consolidation: DECLARED keys first — every
     // coarser partition (span merge) retains exactly the declared keys, so
     // putting them first keeps its spans adjacent regardless of the SQL's
@@ -1737,10 +1784,12 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     const opts = region.DriverOpts{
         .n_threads = n_threads,
-        .n_shards = n_shards,
+        .n_shards = if (order_aligned) sources.len else n_shards,
         .key_col = route_idx,
         .sort_cols = sort_cols,
         .group_prefix = group_prefix,
+        .ordered = order_aligned,
+        .loc_col = rowloc_entry,
     };
     ctx.opts = opts;
 
@@ -2216,6 +2265,157 @@ fn buildScanSources(
         s.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
         for (prune_leaves) |l| s.addPrune(l) catch {};
         const fused = s.tryFuseFilter(filter) catch return NoMatch;
+        if (!fused) return NoMatch;
+    }
+    snap.memtable_snap.release();
+    pin_held = false;
+    return .{ .sources = sources, .total_rows = total_rows };
+}
+
+/// Decode a footer string stat (format.encodeStringPrefix) back to its
+/// ≤16-byte prefix string. Safe as an interval boundary: every row of one
+/// key shares one full value, so no key group straddles any bound string.
+fn statPrefixString(qa: Allocator, stat: i128) ![]const u8 {
+    const u: u128 = @as(u128, @bitCast(stat)) ^ (@as(u128, 1) << 127);
+    var buf: [16]u8 = undefined;
+    std.mem.writeInt(u128, &buf, u, .big);
+    var n: usize = 16;
+    while (n > 0 and buf[n - 1] == 0) n -= 1;
+    return try qa.dupe(u8, buf[0..n]);
+}
+
+/// Order-aligned sources (#186): one fused-filter Scan per route-key
+/// interval, bounds from row-weighted quantiles of per-RG footer mins.
+/// The bounds are BOTH zonemap prunes and row-level conjuncts — boundary
+/// row groups hold rows of two intervals, so prunes alone are not
+/// row-exact. Interval 0 additionally admits NULL keys (leaf compares
+/// fail on NULL; without the OR IS NULL arm those rows would vanish).
+/// Each source scans segments sequentially, so its output is per-segment
+/// key-sorted runs — no hash exchange.
+fn buildOrderedSources(
+    input: engine_v2.CompileInput,
+    table: anytype,
+    prune_leaves: []const predicate_mod.Predicate,
+    filter: PredicateExpr,
+    scan_cols: ?[]const []const u8,
+    n_threads: usize,
+    route_name: []const u8,
+) !BuiltSources {
+    const qa = input.allocator;
+    table.ddl_lock.lockSharedUncancelable(table.io);
+    defer table.ddl_lock.unlockShared(table.io);
+    const snap = try Scan.captureSnapshotAlloc(table, qa);
+    defer qa.free(snap.segments);
+    var pin_held = true;
+    defer if (pin_held) snap.memtable_snap.release();
+
+    const route_phys = table.schema.columnIndex(route_name) orelse return NoMatch;
+
+    // Weight the quantiles by rows that can SURVIVE the eq-pinned prunes
+    // (e.g. projectId = N): the table clusters on the pinned prefix, so RG
+    // stats decide accurately — without this the boundaries reflect every
+    // project's keys and the queried project's rows skew into few intervals.
+    const fmt = @import("../storage/format.zig");
+    const EqPin = struct { phys: usize, v: i128 };
+    var pins: std.ArrayListUnmanaged(EqPin) = .empty;
+    defer pins.deinit(qa);
+    for (prune_leaves) |l| {
+        if (l.op != .eq) continue;
+        const phys = table.schema.columnIndex(lastSegment(l.col)) orelse continue;
+        const v: i128 = switch (l.val) {
+            .tinyint => |x| x,
+            .smallint => |x| x,
+            .int => |x| x,
+            .bigint => |x| x,
+            .date => |x| x,
+            .datetime => |x| x,
+            .text => |t| fmt.encodeStringPrefix(t),
+            else => continue,
+        };
+        try pins.append(qa, .{ .phys = phys, .v = v });
+    }
+
+    const RgMin = struct { min: i128, rows: u64 };
+    var rgs: std.ArrayListUnmanaged(RgMin) = .empty;
+    defer rgs.deinit(qa);
+    var total_rows: u64 = snap.memtable_row_count;
+    for (snap.segments) |e| {
+        const handle = try table.acquireSegment(e.segment_id);
+        defer table.releaseSegment(handle);
+        rg_loop: for (handle.seg.info.row_groups) |rg| {
+            for (pins.items) |p| {
+                const s = rg.stats[p.phys];
+                if (p.v < s.min or p.v > s.max) continue :rg_loop;
+            }
+            try rgs.append(qa, .{ .min = rg.stats[route_phys].min, .rows = rg.row_count });
+        }
+        total_rows += e.row_count;
+    }
+    if (rgs.items.len == 0) return NoMatch;
+    std.mem.sortUnstable(RgMin, rgs.items, {}, struct {
+        fn less(_: void, x: RgMin, y: RgMin) bool {
+            return x.min < y.min;
+        }
+    }.less);
+
+    const n_iv = @max(1, @min(2 * n_threads, rgs.items.len));
+    var bounds: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer bounds.deinit(qa);
+    {
+        var seg_rows: u64 = 0;
+        for (rgs.items) |r| seg_rows += r.rows;
+        var acc: u64 = 0;
+        var next_cut: usize = 1;
+        for (rgs.items) |r| {
+            acc += r.rows;
+            while (next_cut < n_iv and acc >= seg_rows * next_cut / n_iv) {
+                const s = try statPrefixString(qa, r.min);
+                if (s.len > 0 and (bounds.items.len == 0 or
+                    !std.mem.eql(u8, bounds.items[bounds.items.len - 1], s)))
+                {
+                    try bounds.append(qa, s);
+                } else qa.free(s);
+                next_cut += 1;
+            }
+        }
+    }
+
+    const n_src = bounds.items.len + 1;
+    const sources = try qa.alloc(exec.Query, n_src);
+    var built: usize = 0;
+    errdefer {
+        for (sources[0..built]) |*q| q.deinit();
+        qa.free(sources);
+    }
+    for (0..n_src) |i| {
+        const s = Scan.allocWithProjectionLoc(qa, table, input.accountant, scan_cols, true, snap) catch return NoMatch;
+        sources[i] = exec.makeQuery(qa, s);
+        built += 1;
+        for (prune_leaves) |l| s.addPrune(l) catch {};
+        var conj: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        try conj.append(qa, filter);
+        if (i > 0) {
+            const p = predicate_mod.Predicate{ .col = route_name, .op = .gte, .val = .{ .text = bounds.items[i - 1] } };
+            s.addPrune(p) catch {};
+            try conj.append(qa, .{ .leaf = p });
+        }
+        if (i < bounds.items.len) {
+            const p = predicate_mod.Predicate{ .col = route_name, .op = .lt, .val = .{ .text = bounds.items[i] } };
+            if (i > 0) s.addPrune(p) catch {}; // interval 0 keeps NULL-bearing RGs
+            if (i == 0) {
+                const arms = try qa.alloc(PredicateExpr, 2);
+                arms[0] = .{ .leaf = p };
+                arms[1] = .{ .is_null = route_name };
+                try conj.append(qa, .{ .@"or" = arms });
+            } else {
+                try conj.append(qa, .{ .leaf = p });
+            }
+        }
+        const fexpr: PredicateExpr = if (conj.items.len == 1) blk: {
+            conj.deinit(qa);
+            break :blk filter;
+        } else .{ .@"and" = try conj.toOwnedSlice(qa) };
+        const fused = s.tryFuseFilter(fexpr) catch return NoMatch;
         if (!fused) return NoMatch;
     }
     snap.memtable_snap.release();
