@@ -277,10 +277,13 @@ fn poolCapBytes() usize {
     // the 3.6M-row workload — 6GB leaves margin so the retention policy
     // doesn't reset the pool right at steady state.
     if (getenv("THINDB_REGION_POOL_MB")) |v| {
-        const mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 6144;
+        const mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8192;
         return mb << 20;
     }
-    return 6144 << 20;
+    // DOP-24 worker slots plateau ~6.0GB on the 3.6M-row workload; a cap
+    // inside the plateau resets the pool at steady state (measured: every
+    // run repays cold allocations, 1.4s -> 5.6s warm).
+    return 8192 << 20;
 }
 
 /// Data-version fingerprint of one table: memtable generation (bumped by

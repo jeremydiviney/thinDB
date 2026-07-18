@@ -254,10 +254,16 @@ fn stringViewOf(v: ColumnView) storage.StringView {
 
 /// One (worker, shard) bucket: a private columnar buffer only its producing
 /// worker appends to, so the scatter is lock-free. Consolidation reads all
-/// workers' buckets for one shard.
+/// workers' buckets for one shard. After its worker's scan finishes, the
+/// bucket also carries its rows' normalized sort keys and a sorted
+/// permutation — consolidation then merges pre-sorted runs instead of
+/// sorting the whole shard, which moves the sort work into the scan phase
+/// where it is balanced by input chunks rather than bounded by key skew.
 const Bucket = struct {
     cols: []ColumnStore,
     rows: usize = 0,
+    keys: std.ArrayListUnmanaged(RowKey) = .empty,
+    order: std.ArrayListUnmanaged(u32) = .empty,
 };
 
 pub const Exchange = struct {
@@ -308,6 +314,8 @@ pub const Exchange = struct {
         for (self.buckets) |*b| {
             for (b.cols) |*c| c.deinit(self.alloc);
             self.alloc.free(b.cols);
+            b.keys.deinit(self.alloc);
+            b.order.deinit(self.alloc);
         }
         self.alloc.free(self.buckets);
     }
@@ -317,6 +325,8 @@ pub const Exchange = struct {
         for (self.buckets) |*b| {
             for (b.cols) |*c| c.clear();
             b.rows = 0;
+            b.keys.clearRetainingCapacity();
+            b.order.clearRetainingCapacity();
         }
     }
 
@@ -479,6 +489,140 @@ pub const GroupTail = struct {
     run: *const fn (ctx: *anyopaque, out: *ShardData, g_start: u32) anyerror!void,
 };
 
+/// Fill one bucket column's normalized keys (row-major slot `kc` of
+/// `n_sort`). One monomorphized sweep per (sort col, bucket) — the same
+/// dispatch-hoisting discipline the old whole-shard fill used.
+fn fillRowKeys(keys: []RowKey, n_sort: usize, kc: usize, kind: OrderKind, v: ColumnView, rows: usize) !void {
+    switch (kind) {
+        .string => {
+            const sv = stringViewOf(v);
+            for (0..rows) |i| {
+                const valid = v.isValid(i);
+                const s: []const u8 = if (valid) sv.rowBytes(i) else "";
+                keys[i * n_sort + kc] = .{ .norm = normStrPrefix(valid, s), .str = s };
+            }
+        },
+        .int32 => {
+            const vals: []const i32 = switch (v.data) {
+                .int => |s| s,
+                .date => |s| s,
+                else => return error.UnsupportedQueryShape,
+            };
+            for (0..rows) |i| {
+                keys[i * n_sort + kc] = .{ .norm = normI32(v.isValid(i), vals[i]), .str = "" };
+            }
+        },
+        .int64 => {
+            const vals: []const i64 = switch (v.data) {
+                .bigint => |s| s,
+                .datetime => |s| s,
+                else => return error.UnsupportedQueryShape,
+            };
+            for (0..rows) |i| {
+                keys[i * n_sort + kc] = .{ .norm = normI64(v.isValid(i), vals[i]), .str = "" };
+            }
+        },
+    }
+}
+
+fn keyCmp(a: []const RowKey, b: []const RowKey) std.math.Order {
+    for (a, b) |x, y| {
+        if (x.norm != y.norm) return if (x.norm < y.norm) .lt else .gt;
+        if (x.str.len != 0 or y.str.len != 0) {
+            const o = std.mem.order(u8, x.str, y.str);
+            if (o != .eq) return o;
+        }
+    }
+    return .eq;
+}
+
+fn keyEqPrefix(a: []const RowKey, b: []const RowKey, prefix: usize) bool {
+    for (a[0..prefix], b[0..prefix]) |x, y| {
+        if (x.norm != y.norm) return false;
+        if ((x.str.len != 0 or y.str.len != 0) and !std.mem.eql(u8, x.str, y.str)) return false;
+    }
+    return true;
+}
+
+/// Build one bucket's keys and sorted permutation. Runs in the scan phase
+/// (each worker sorts its own buckets — a whale key's rows are spread over
+/// every worker's buckets by the row-chunk scan, so this work is balanced
+/// regardless of key skew); consolidation falls back to it lazily for
+/// callers that pushed rows without a scan phase.
+pub fn sortBucketKeys(ex: *Exchange, w: usize, shard: usize, sort_cols: []const OrderCol) !void {
+    const b = ex.bucket(w, shard);
+    b.keys.clearRetainingCapacity();
+    b.order.clearRetainingCapacity();
+    const rows = b.rows;
+    if (rows == 0) return;
+    const n_sort = sort_cols.len;
+    try b.keys.ensureTotalCapacity(ex.alloc, rows * n_sort);
+    b.keys.items.len = rows * n_sort;
+    for (sort_cols, 0..) |sc, kc| {
+        try fillRowKeys(b.keys.items, n_sort, kc, sc.kind, b.cols[sc.col].view(), rows);
+    }
+    try b.order.ensureTotalCapacity(ex.alloc, rows);
+    b.order.items.len = rows;
+    for (b.order.items, 0..) |*o, i| o.* = @intCast(i);
+    const Ctx = struct {
+        keys: []const RowKey,
+        n_sort: usize,
+        fn less(c: @This(), x: u32, y: u32) bool {
+            return switch (keyCmp(
+                c.keys[x * c.n_sort ..][0..c.n_sort],
+                c.keys[y * c.n_sort ..][0..c.n_sort],
+            )) {
+                .lt => true,
+                .gt => false,
+                .eq => x < y, // stable tie-break on arrival order
+            };
+        }
+    };
+    std.mem.sortUnstable(u32, b.order.items, Ctx{ .keys = b.keys.items, .n_sort = n_sort }, Ctx.less);
+}
+
+/// One pre-sorted bucket run being merged.
+const RunState = struct {
+    w: u32,
+    keys: []const RowKey,
+    ord: []const u32,
+    pos: usize,
+};
+
+const MergeCtx = struct {
+    runs: []RunState,
+    n_sort: usize,
+
+    fn headKey(c: *const MergeCtx, ri: u32) []const RowKey {
+        const r = &c.runs[ri];
+        return r.keys[r.ord[r.pos] * c.n_sort ..][0..c.n_sort];
+    }
+
+    /// Run order on key ties = worker index — reproduces the old global
+    /// stable sort exactly (refs were laid out worker-major, arrival-minor).
+    fn less(c: *const MergeCtx, a: u32, b: u32) bool {
+        return switch (keyCmp(c.headKey(a), c.headKey(b))) {
+            .lt => true,
+            .gt => false,
+            .eq => c.runs[a].w < c.runs[b].w,
+        };
+    }
+
+    fn siftDown(c: *const MergeCtx, heap: []u32, start: usize) void {
+        var i = start;
+        while (true) {
+            const l = 2 * i + 1;
+            if (l >= heap.len) break;
+            var m = l;
+            const r = l + 1;
+            if (r < heap.len and c.less(heap[r], heap[l])) m = r;
+            if (!c.less(heap[m], heap[i])) break;
+            std.mem.swap(u32, &heap[i], &heap[m]);
+            i = m;
+        }
+    }
+};
+
 /// Gather one shard from the exchange buckets in sort order, recording the
 /// group ranges (equal leading `group_prefix` sort columns). `scratch` is a
 /// per-thread arena reset by the caller between shards.
@@ -515,104 +659,65 @@ pub fn consolidateOrderedTail(
         }
     }
 
-    // Normalized keys, row-major (keys[row * n_sort + kc]): one row's whole
-    // key tuple shares cache lines during the sort's random-access compares.
-    // The fill hoists the kind/type dispatch out of the row loop — one
-    // monomorphized sweep per (sort col, bucket).
+    // K-way merge of the pre-sorted per-worker bucket runs (keys and
+    // permutations built during the scan phase; lazy fallback for callers
+    // that pushed rows without one). Output order is byte-identical to the
+    // old whole-shard sort: comparator unchanged, run-index tie-break
+    // reproduces the worker-major stable arrival order.
     const n_sort = sort_cols.len;
-    const refs = try scratch.alloc(u32, total);
-    const keys = try scratch.alloc(RowKey, n_sort * total);
-    {
-        var base_k: usize = 0;
-        for (0..ex.n_workers) |w| {
-            const bucket_rows = ex.bucket(w, shard).rows;
-            for (0..bucket_rows) |i| refs[base_k + i] = @intCast((w << REF_ROW_BITS) | i);
-            for (sort_cols, 0..) |sc, kc| {
-                const v = views[sc.col * ex.n_workers + w];
-                switch (sc.kind) {
-                    .string => {
-                        const sv = stringViewOf(v);
-                        for (0..bucket_rows) |i| {
-                            const valid = v.isValid(i);
-                            const s: []const u8 = if (valid) sv.rowBytes(i) else "";
-                            keys[(base_k + i) * n_sort + kc] = .{ .norm = normStrPrefix(valid, s), .str = s };
-                        }
-                    },
-                    .int32 => {
-                        const vals: []const i32 = switch (v.data) {
-                            .int => |s| s,
-                            .date => |s| s,
-                            else => return error.UnsupportedQueryShape,
-                        };
-                        for (0..bucket_rows) |i| {
-                            keys[(base_k + i) * n_sort + kc] = .{ .norm = normI32(v.isValid(i), vals[i]), .str = "" };
-                        }
-                    },
-                    .int64 => {
-                        const vals: []const i64 = switch (v.data) {
-                            .bigint => |s| s,
-                            .datetime => |s| s,
-                            else => return error.UnsupportedQueryShape,
-                        };
-                        for (0..bucket_rows) |i| {
-                            keys[(base_k + i) * n_sort + kc] = .{ .norm = normI64(v.isValid(i), vals[i]), .str = "" };
-                        }
-                    },
-                }
-            }
-            base_k += bucket_rows;
+    const runs = try scratch.alloc(RunState, ex.n_workers);
+    var n_runs: usize = 0;
+    for (0..ex.n_workers) |w| {
+        const b = ex.bucket(w, shard);
+        if (b.rows == 0) continue;
+        if (b.order.items.len != b.rows or b.keys.items.len != b.rows * n_sort) {
+            try sortBucketKeys(ex, w, shard, sort_cols);
         }
+        runs[n_runs] = .{ .w = @intCast(w), .keys = b.keys.items, .ord = b.order.items, .pos = 0 };
+        n_runs += 1;
     }
 
-    const Ctx = struct {
-        keys: []const RowKey,
-        n_sort: usize,
-        fn less(c: @This(), x: u32, y: u32) bool {
-            const ka = c.keys[x * c.n_sort ..][0..c.n_sort];
-            const kb = c.keys[y * c.n_sort ..][0..c.n_sort];
-            for (ka, kb) |a, b| {
-                if (a.norm != b.norm) return a.norm < b.norm;
-                if (a.str.len != 0 or b.str.len != 0) {
-                    switch (std.mem.order(u8, a.str, b.str)) {
-                        .lt => return true,
-                        .gt => return false,
-                        .eq => {},
-                    }
-                }
-            }
-            return x < y; // stable tie-break on arrival order
-        }
-        fn sameGroup(c: @This(), prefix: usize, x: u32, y: u32) bool {
-            const ka = c.keys[x * c.n_sort ..][0..prefix];
-            const kb = c.keys[y * c.n_sort ..][0..prefix];
-            for (ka, kb) |a, b| {
-                if (a.norm != b.norm) return false;
-                if ((a.str.len != 0 or b.str.len != 0) and !std.mem.eql(u8, a.str, b.str)) return false;
-            }
-            return true;
-        }
-    };
-    const ctx = Ctx{ .keys = keys, .n_sort = n_sort };
+    const mctx = MergeCtx{ .runs = runs[0..n_runs], .n_sort = n_sort };
+    const heap = try scratch.alloc(u32, n_runs);
+    for (heap, 0..) |*h, i| h.* = @intCast(i);
+    var i = n_runs / 2;
+    while (i > 0) {
+        i -= 1;
+        mctx.siftDown(heap, i);
+    }
 
-    const order = try scratch.alloc(u32, total);
-    for (order, 0..) |*o, i| o.* = @intCast(i);
-    std.mem.sortUnstable(u32, order, ctx, Ctx.less);
-
-    // Single ordered gather, group ranges recorded as we go.
+    // Merged refs + group starts in one pass; the gather below is unchanged.
     const grefs = try scratch.alloc(u32, total);
-    for (grefs, order) |*g, oi| g.* = refs[oi];
+    var bounds: std.ArrayListUnmanaged(u32) = .empty;
+    var heap_len = n_runs;
+    var prev: ?[]const RowKey = null;
+    var out_i: u32 = 0;
+    while (heap_len > 0) {
+        const r = &runs[heap[0]];
+        const row = r.ord[r.pos];
+        const hk = r.keys[row * n_sort ..][0..n_sort];
+        if (prev == null or !keyEqPrefix(prev.?, hk, group_prefix)) {
+            try bounds.append(scratch, out_i);
+        }
+        prev = hk;
+        grefs[out_i] = (r.w << REF_ROW_BITS) | row;
+        out_i += 1;
+        r.pos += 1;
+        if (r.pos == r.ord.len) {
+            heap[0] = heap[heap_len - 1];
+            heap_len -= 1;
+        }
+        mctx.siftDown(heap[0..heap_len], 0);
+    }
+    try bounds.append(scratch, @intCast(total));
 
-    var g_start: usize = 0;
-    while (g_start < total) {
-        var g_end = g_start + 1;
-        while (g_end < total and ctx.sameGroup(group_prefix, order[g_start], order[g_end])) g_end += 1;
+    for (bounds.items[0 .. bounds.items.len - 1], bounds.items[1..]) |g_start, g_end| {
         const base: u32 = @intCast(out.cols[0].rowCount());
         for (out.cols, 0..) |*dst, ci| {
             try gatherColumn(ex.alloc, dst, views[ci * ex.n_workers ..][0..ex.n_workers], grefs[g_start..g_end]);
         }
         if (tail) |t| try t.run(t.ctx, out, base);
         try out.ranges.append(ex.alloc, .{ base, @intCast(out.cols[0].rowCount()) });
-        g_start = g_end;
     }
     out.rows = out.cols[0].rowCount();
 }
@@ -2065,6 +2170,11 @@ pub const RegionPool = struct {
 
     pub fn retainedBytes(self: *const RegionPool) usize {
         var n: usize = 0;
+        // Bucket merge keys/orders are deliberately NOT counted: they are
+        // input-proportional scratch (~24B/row × sort cols), and counting
+        // them tipped the DOP-24 plateau over the cap — resetting the whole
+        // pool every run. Freeing them per run instead caused the Windows
+        // soft-fault drift pooling exists to prevent. They retain untracked.
         if (self.ex) |*ex| {
             for (ex.buckets) |b| {
                 for (b.cols) |*c| n += storeRetainedBytes(c);
@@ -2099,6 +2209,7 @@ const ScanPhase = struct {
     entry_derived: []const compute_mod.Derived,
     scan_schema: []const Column,
     registry: ?*const udf_mod.UdfRegistry,
+    sort_cols: []const OrderCol,
     errs: []?anyerror,
 
     fn worker(self: *ScanPhase, w: usize) void {
@@ -2124,6 +2235,11 @@ const ScanPhase = struct {
                 const routed = if (inst) |*ci| try ci.ptr.evalBatch(batch) else batch;
                 try wk.push(routed);
             }
+        }
+        // This worker's buckets are complete — sort them here, where the
+        // work is balanced by input chunks, not by key skew.
+        for (0..self.ex.n_shards) |s| {
+            try sortBucketKeys(self.ex, w, s, self.sort_cols);
         }
     }
 };
@@ -2213,6 +2329,7 @@ pub fn runRegionPooled(
         .entry_derived = entry_derived,
         .scan_schema = scan_schema,
         .registry = prog.registry,
+        .sort_cols = opts.sort_cols,
         .errs = errs,
     };
     var spawned: usize = 0;
@@ -2245,6 +2362,7 @@ pub fn runRegionPooled(
     shard_phase.worker(opts.n_threads - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
+
 
     if (trace) {
         const t2 = exec.prof.nowTicks();
