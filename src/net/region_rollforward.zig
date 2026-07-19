@@ -97,32 +97,48 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     };
     const keys = top.materialize.region_keys.?;
 
-    try verifyKeyContract(top, keys, 0);
-
     // Compile: try the marked boundary, then boundaries below it — the
     // program anchor can sit under the outermost CTE (e.g. when the final
-    // CTE is a plain projection the staged path composes above the region).
+    // CTE is a plain projection the staged path composes above the region,
+    // or when the chain ends in a cross-key rollup like the API's
+    // date × upDownType aggregate). The contract is verified PER BOUNDARY:
+    // a boundary whose subtree contains a coarser-than-keys partition is
+    // not a legal region root, but a boundary BELOW that partition can be —
+    // the rollup then consumes the region's output in the normal engine.
+    // The hard RegionKeyContractViolation remains when NO boundary
+    // conforms (the declaration is then a genuine mistake).
+    var any_conforming = false;
     cur = top;
     depth = 0;
     while (depth < 16) : (depth += 1) {
         switch (cur.*) {
             .materialize => |m| {
-                if (tryCachedAt(input, cur)) |q| {
-                    return .{ .anchor = cur, .query = q };
-                }
-                if (buildRegion(input, cur, keys)) |q| {
-                    return .{ .anchor = cur, .query = q };
-                } else |e| {
-                    if (e == error.OutOfMemory) return e;
-                    if (getenv("THINDB_REGION_TRACE") != null) {
-                        std.debug.print("[region] declared block declined at {*}: {s}\n", .{ cur, @errorName(e) });
-                        if (@errorReturnTrace()) |t| {
-                            const n = @min(t.index, t.instruction_addresses.len);
-                            const st = std.debug.StackTrace{
-                                .return_addresses = t.instruction_addresses[0..n],
-                                .skipped = .none,
-                            };
-                            std.debug.dumpStackTrace(&st);
+                const conforms = blk: {
+                    verifyKeyContract(cur, keys, 0) catch |e| {
+                        if (e == error.OutOfMemory) return e;
+                        break :blk false;
+                    };
+                    break :blk true;
+                };
+                if (conforms) {
+                    any_conforming = true;
+                    if (tryCachedAt(input, cur)) |q| {
+                        return .{ .anchor = cur, .query = q };
+                    }
+                    if (buildRegion(input, cur, keys)) |q| {
+                        return .{ .anchor = cur, .query = q };
+                    } else |e| {
+                        if (e == error.OutOfMemory) return e;
+                        if (getenv("THINDB_REGION_TRACE") != null) {
+                            std.debug.print("[region] declared block declined at {*}: {s}\n", .{ cur, @errorName(e) });
+                            if (@errorReturnTrace()) |t| {
+                                const n = @min(t.index, t.instruction_addresses.len);
+                                const st = std.debug.StackTrace{
+                                    .return_addresses = t.instruction_addresses[0..n],
+                                    .skipped = .none,
+                                };
+                                std.debug.dumpStackTrace(&st);
+                            }
                         }
                     }
                 }
@@ -138,7 +154,11 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
             else => break,
         }
     }
-    std.debug.print("[region] KEYED BY block did not compile: no boundary matches a supported region shape\n", .{});
+    if (!any_conforming) {
+        std.debug.print("[region] KEYED BY block did not compile: no boundary satisfies the key contract\n", .{});
+        return error.RegionKeyContractViolation;
+    }
+    std.debug.print("[region] KEYED BY block did not compile: no conforming boundary matches a supported region shape\n", .{});
     return error.RegionUnsupportedConstruct;
 }
 
@@ -1351,6 +1371,28 @@ fn i64At(v: ColumnView, i: usize) ?i64 {
         else => null,
     };
 }
+
+/// One row of a drained store as a const-column Value; null = SQL NULL.
+/// Errors (never nulls) on types const_cols can't carry, so a real value
+/// can't silently degrade to NULL.
+fn valueAtRow(v: ColumnView, i: usize) !?Value {
+    if (!v.isValid(i)) return null;
+    return switch (v.data) {
+        .tinyint => |s| .{ .tinyint = s[i] },
+        .smallint => |s| .{ .smallint = s[i] },
+        .int => |s| .{ .int = s[i] },
+        .bigint => |s| .{ .bigint = s[i] },
+        .date => |s| .{ .date = s[i] },
+        .datetime => |s| .{ .datetime = s[i] },
+        .float => |s| .{ .float = s[i] },
+        .double => |s| .{ .double = s[i] },
+        .largeint => |s| .{ .largeint = s[i] },
+        .decimal64 => |s| .{ .decimal64 = s[i] },
+        .decimal128 => |s| .{ .decimal128 = s[i] },
+        .varchar, .string, .char, .json => |s| .{ .text = s.rowBytes(i) },
+        else => NoMatch,
+    };
+}
 // ---------------------------------------------------------------------------
 // Pipeline collection: the block's IR walked ONCE into an ordered step list.
 // No fixed shape — any interleaving of the supported constructs compiles;
@@ -1555,7 +1597,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     // Query-lifetime arena: the step list and the entry-derived slice are
     // borrowed by the operator (never by the cached ctx).
-    const pl = try collectPipeline(input.node_arena, anchor);
+    var pl = try collectPipeline(input.node_arena, anchor);
     traceMark("walk", &tm);
 
     // ---- entry: prune leaves + literal-pinned columns --------------------
@@ -1563,6 +1605,48 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     try collectAndLeaves(a, pl.entry_filter, &prune_leaves);
 
     const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
+
+    // Hoist scatter-safe computes past bottom-most joins into the entry: a
+    // per-row compute whose inputs are all BASE TABLE columns commutes with
+    // any join below it (a probe only adds payload columns and filters
+    // rows), so it can run at scan time. Without this the plan-selection
+    // temp-table join strands LOWER(customerNumber) above itself and the
+    // declared route key never reaches the entry frame.
+    {
+        const na = input.node_arena;
+        var kept: std.ArrayListUnmanaged(Step) = .empty;
+        var hoisted: std.ArrayListUnmanaged(Derived) = .empty;
+        var stop = false;
+        var j = pl.steps.len;
+        while (j > 0) : (j -= 1) {
+            const st = pl.steps[j - 1];
+            if (!stop) switch (st) {
+                .join => {},
+                .compute => |d| blk: {
+                    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+                    for (d) |dv| try exprColNames(na, dv.expr, &refs);
+                    for (refs.items) |n| {
+                        if (table.schema.columnIndex(lastSegment(n)) == null) {
+                            stop = true;
+                            break :blk;
+                        }
+                    }
+                    try hoisted.appendSlice(na, d);
+                    continue;
+                },
+                else => stop = true,
+            };
+            try kept.append(na, st);
+        }
+        if (hoisted.items.len > 0) {
+            std.mem.reverse(Step, kept.items);
+            var merged: std.ArrayListUnmanaged(Derived) = .empty;
+            try merged.appendSlice(na, pl.entry_derived);
+            try merged.appendSlice(na, hoisted.items);
+            pl.steps = kept.items;
+            pl.entry_derived = merged.items;
+        }
+    }
 
     var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
     var scan_cols_opt: ?[]const []const u8 = null;
@@ -1662,6 +1746,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     }
     ctx.entry_schema = entry_schema;
 
+    traceMark("entry_schema", &tm);
     // Literal-pinned entry columns: an eq-literal conjunct in the scan
     // filter makes the column a per-run constant — groupings and span
     // merges may skip it, and probe key pairs against it eliminate.
@@ -1679,7 +1764,10 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         found: while (i > 0) : (i -= 1) {
             switch (pl.steps[i - 1]) {
                 .union_tvf => |u| {
-                    if (i != pl.steps.len) return NoMatch; // fused tail must be bottom-most
+                    // Not necessarily bottom-most: steps below it (e.g. the
+                    // plan-selection temp-table probe) become leading ops and
+                    // the union-append TVF then runs UNFUSED mid-program
+                    // (fusedFirstTail only fuses when it lands at op 0).
                     range_names = u.tvf.partition_by;
                     order_specs = u.tvf.order_by;
                     break :found;
@@ -1708,7 +1796,14 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     const range_keys = try a.alloc(usize, range_names.len);
     const key_names_owned = try a.alloc([]const u8, range_names.len);
     for (range_names, range_keys, key_names_owned) |n, *dst, *nm| {
-        dst.* = (b.fb.resolve(n) orelse return NoMatch).idx;
+        dst.* = (b.fb.resolve(n) orelse {
+            if (getenv("THINDB_REGION_TRACE") != null) {
+                std.debug.print("[region] range key '{s}' does not resolve in the entry frame (steps:", .{n});
+                for (pl.steps) |s| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(s))});
+                std.debug.print(")\n", .{});
+            }
+            return NoMatch;
+        }).idx;
         nm.* = try a.dupe(u8, n);
     }
     b.range_key_names = key_names_owned;
@@ -1752,13 +1847,31 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     try sort_list.append(a, .{ .col = rowloc_entry, .kind = .int64 });
     const sort_cols = sort_list.items;
 
+    traceMark("contract", &tm);
     if (pl.entry_sel) |sel| try b.applySelect(sel);
 
     // ---- dispatch the pipeline bottom-up ---------------------------------
     {
         var i = pl.steps.len;
         while (i > 0) : (i -= 1) {
-            try dispatchStep(&b, registry, pl.steps[i - 1], pl.steps[0 .. i - 1]);
+            dispatchStep(&b, registry, pl.steps[i - 1], pl.steps[0 .. i - 1]) catch |e| {
+                if (getenv("THINDB_REGION_TRACE") != null) {
+                    std.debug.print("[region] dispatch declined on step {d}/{d} '{s}': {s}", .{
+                        i, pl.steps.len, @tagName(std.meta.activeTag(pl.steps[i - 1])), @errorName(e),
+                    });
+                    switch (pl.steps[i - 1]) {
+                        .join => |jj| {
+                            const nm = rightAliasName(jj.right) catch null;
+                            std.debug.print(" (right: {s}, type: {s}, extra_pred: {}, on: {d})", .{
+                                nm orelse "?", @tagName(jj.join_type), jj.extra_predicate != null, jj.on.len,
+                            });
+                        },
+                        else => {},
+                    }
+                    std.debug.print("\n", .{});
+                }
+                return e;
+            };
         }
     }
     traceMark("dispatch", &tm);
@@ -2105,7 +2218,63 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
             try live_right.append(a, rci);
         }
     }
-    if (live_left.items.len == 0 or live_left.items.len > 2) return NoMatch;
+    if (live_left.items.len > 2) return NoMatch;
+
+    if (live_left.items.len == 0) {
+        // Fully-pinned join: every ON pair binds to an entry literal, so
+        // every left row sees the SAME matching right rows — the join
+        // degenerates to constant columns (e.g. INNER JOIN division ON
+        // division.id = r.divisionId under a single-division filter).
+        // More than one matching right row would multiply left rows —
+        // unsupported; zero matches empties an INNER region (decline to
+        // the mono path) while LEFT attaches typed NULLs.
+        var match_row: ?usize = null;
+        rows: for (0..blk.rows) |i| {
+            for (pin_right.items, pin_vals.items) |rci, want| {
+                const rv = blk.stores[rci].view();
+                const got = i64At(rv, i) orelse continue :rows;
+                const want_i = valueI64(want) orelse return NoMatch;
+                if (got != want_i) continue :rows;
+            }
+            if (match_row != null) return NoMatch;
+            match_row = i;
+        }
+        const mi = match_row orelse {
+            if (inner) return NoMatch;
+            const alias = ralias orelse return NoMatch;
+            try b.null_sides.append(a, .{ .alias = alias, .schema = blk.schema });
+            return;
+        };
+        var ccols: std.ArrayListUnmanaged(Column) = .empty;
+        var cvals: std.ArrayListUnmanaged(?Value) = .empty;
+        for (blk.schema, 0..) |col, ci| {
+            if (key_right[ci]) continue;
+            if (live) |names| {
+                const tail = lastSegment(col.name);
+                var referenced = false;
+                for (names) |n| {
+                    if (std.ascii.eqlIgnoreCase(lastSegment(n), tail)) {
+                        referenced = true;
+                        break;
+                    }
+                }
+                if (!referenced) continue;
+            }
+            const idx = try b.fb.addCol(col.name, col.type, true);
+            try ccols.append(a, b.fb.cols.items[idx]);
+            try cvals.append(a, try valueAtRow(blk.stores[ci].view(), mi));
+            try b.fb.setVis(col.name, idx);
+            if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+        }
+        if (ccols.items.len > 0) {
+            try b.flushPending();
+            try b.ops.append(a, .{ .const_cols = .{
+                .cols = ccols.items,
+                .values = cvals.items,
+            } });
+        }
+        return;
+    }
 
     // Build the map (and kept-row list) over rows matching every pinned
     // literal, with NULL keys skipped (SQL join semantics).
