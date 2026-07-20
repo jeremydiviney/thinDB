@@ -824,12 +824,34 @@ pub const BroadcastSide = struct {
 /// main scan); the schema/derived slices must outlive the run.
 pub const SideInput = struct {
     scan_schema: []const Column,
-    /// Side frame schema: scan output ++ entry-derived columns.
+    /// Exchange (pre-aggregation) frame schema: scan output ++ entry-derived
+    /// columns. Same slice as `schema` when `agg` is null.
+    pre_schema: []const Column,
+    /// Probe-visible side schema (post-aggregation when `agg` is set).
     schema: []const Column,
     sources: []exec.Query,
     entry_derived: []const compute_mod.Derived,
-    /// Route key column in the side frame schema.
+    /// Route key column in the pre-aggregation frame schema.
     key_col: usize,
+    /// Per-bin GROUP BY applied after the scatter, before the probe map is
+    /// built. Only valid because the group keys include the route key —
+    /// every row of a group lands in the same shard, so shard-local
+    /// aggregation is globally exact.
+    agg: ?SideAgg = null,
+};
+
+pub const MAX_SIDE_GROUP_KEYS = 6;
+
+/// SUM-only side GROUP BY (the rollforward CMT collapse shape). Post-agg
+/// schema layout: col i < group_srcs.len is pre_schema[group_srcs[i]]
+/// (group key, value from the group's first row); col group_srcs.len + k
+/// is SUM(pre_schema[agg_srcs[k]]) with the engine's canonical widening.
+/// `key_srcs` is the DISTINCT set of group sources — the map keys; alias
+/// copies appear only in group_srcs (emission).
+pub const SideAgg = struct {
+    group_srcs: []const usize,
+    key_srcs: []const usize,
+    agg_srcs: []const usize,
 };
 
 pub const RegionOp = union(enum) {
@@ -871,12 +893,12 @@ pub const RegionOp = union(enum) {
         inner: bool,
     },
     /// Generalized probe: multi-column keys, int and string kinds. The build
-    /// side is either a compile-time-drained broadcast block or a
-    /// co-partitioned side table (`shard` = index into the run's sides; the
-    /// per-bin map is built in worker scratch — build keys must be UNIQUE,
-    /// a dup is a hard error because a LEFT 1:N match would change row
-    /// counts). Emit semantics match hash_probe (LEFT append / INNER
-    /// restructure).
+    /// side is either a compile-time-drained broadcast block (build keys
+    /// must be UNIQUE — a dup is a hard error) or a co-partitioned side
+    /// table (`shard` = index into the run's sides; the per-bin map is
+    /// built in worker scratch, dup build keys chain and the probe expands
+    /// 1:N via a frame restructure). Emit semantics match hash_probe (LEFT
+    /// append / INNER restructure) on unique builds.
     keyed_probe: struct {
         pairs: []const KeyedPair,
         side: union(enum) {
@@ -1343,7 +1365,9 @@ pub const RegionWorker = struct {
                     const n_in = out_schema.len - k.payload.len;
                     const pay = try initStores(alloc, out_schema[n_in..]);
                     errdefer freeStores(alloc, pay);
-                    const cols: []ColumnStore = if (k.inner)
+                    // Shard sides may hold dup build keys → the 1:N
+                    // expansion restructures even a LEFT probe.
+                    const cols: []ColumnStore = if (k.inner or k.side == .shard)
                         try initStores(alloc, out_schema[0..n_in])
                     else
                         try alloc.alloc(ColumnStore, 0);
@@ -2090,6 +2114,8 @@ pub const RegionWorker = struct {
         var interners_buf: [MAX_KEYED_PAIRS]?*const StrInterner = @splat(null);
         var interners: []const ?*const StrInterner = undefined;
         var build_views: []const ColumnView = undefined;
+        var next: ?[]u32 = null;
+        var has_dups = false;
 
         switch (k.side) {
             .broadcast => |b| {
@@ -2100,6 +2126,9 @@ pub const RegionWorker = struct {
             .shard => |si| {
                 // Co-partitioned side: build the map over THIS bin's side
                 // rows (scratch-lifetime; capacity retained by the arena).
+                // Dup build keys chain (newest at head, walked in reverse
+                // for build order) and route the probe through the 1:N
+                // expansion emit.
                 const sd = &self.side_data[si];
                 const views = try sa.alloc(ColumnView, sd.cols.len);
                 for (sd.cols, views) |*c, *v| v.* = c.view();
@@ -2107,7 +2136,9 @@ pub const RegionWorker = struct {
                 for (k.pairs, 0..) |p, pi| {
                     if (p.kind == .str) interners_buf[pi] = &interner_storage[pi];
                 }
+                next = try sa.alloc(u32, sd.rows);
                 rows: for (0..sd.rows) |i| {
+                    next.?[i] = NO_MATCH;
                     var key: MultiKey = @splat(0);
                     for (k.pairs, 0..) |p, pi| {
                         const v = views[p.build];
@@ -2127,10 +2158,13 @@ pub const RegionWorker = struct {
                         }
                     }
                     const gop = try map_storage.getOrPut(sa, key);
-                    // A dup build key would make a LEFT match 1:N and change
-                    // row counts — a hard error, never a silent pick.
-                    if (gop.found_existing) return error.UnsupportedQueryShape;
-                    gop.value_ptr.* = @intCast(i);
+                    if (gop.found_existing) {
+                        next.?[i] = gop.value_ptr.*;
+                        gop.value_ptr.* = @intCast(i);
+                        has_dups = true;
+                    } else {
+                        gop.value_ptr.* = @intCast(i);
+                    }
                 }
                 map = &map_storage;
                 interners = interners_buf[0..k.pairs.len];
@@ -2165,7 +2199,11 @@ pub const RegionWorker = struct {
 
         const pay_views = try sa.alloc(ColumnView, k.payload.len);
         for (k.payload, pay_views) |p, *v| v.* = build_views[p.src];
-        try self.emitProbe(s, fr, ords, pay_views, k.inner);
+        if (has_dups) {
+            try self.emitProbeExpand(s, fr, ords, next.?, pay_views, k.inner);
+        } else {
+            try self.emitProbe(s, fr, ords, pay_views, k.inner);
+        }
     }
 
     /// Shared probe emit: LEFT appends payload columns (NULL on miss);
@@ -2210,6 +2248,61 @@ pub const RegionWorker = struct {
                 if (ords[i] == NO_MATCH) continue;
                 try keep.append(sa, @intCast(i));
                 try match.append(sa, ords[i]);
+            }
+            const start: u32 = @intCast(s.cols[0].rowCount());
+            for (s.cols, fr.views[0..fr.width]) |*dst, v| {
+                try scatterColumn(alloc, dst, v, keep.items);
+            }
+            for (pay_views, s.pay) |pv, *dst| {
+                try gatherColumnOpt(alloc, dst, pv, match.items);
+            }
+            try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
+        }
+
+        fr.width = s.cols.len + s.pay.len;
+        for (s.cols, fr.views[0..s.cols.len]) |*c, *v| v.* = c.view();
+        for (s.pay, fr.views[s.cols.len..fr.width]) |*c, *v| v.* = c.view();
+        fr.rows = s.cols[0].rowCount();
+        fr.ranges = s.ranges.items;
+    }
+
+    /// 1:N probe emit (dup build keys): a probe row with M chained matches
+    /// becomes M output rows (LEFT: a matchless row becomes one NULL-payload
+    /// row; INNER: it is dropped). Full frame restructure — probe columns
+    /// scatter with repetition, ranges rewritten; expanded rows stay inside
+    /// their range, so downstream range/group contracts hold.
+    fn emitProbeExpand(self: *RegionWorker, s: *ProbeState, fr: *Frame, heads: []const u32, next: []const u32, pay_views: []const ColumnView, inner: bool) !void {
+        const alloc = self.alloc;
+        const sa = self.scratch.allocator();
+        for (s.cols) |*c| c.clear();
+        for (s.pay) |*c| c.clear();
+        s.ranges.clearRetainingCapacity();
+        var keep: std.ArrayListUnmanaged(u32) = .empty;
+        var match: std.ArrayListUnmanaged(u32) = .empty;
+        var chain: std.ArrayListUnmanaged(u32) = .empty;
+
+        for (fr.ranges) |rng| {
+            keep.clearRetainingCapacity();
+            match.clearRetainingCapacity();
+            for (rng[0]..rng[1]) |i| {
+                const head = heads[i];
+                if (head == NO_MATCH) {
+                    if (!inner) {
+                        try keep.append(sa, @intCast(i));
+                        try match.append(sa, NO_MATCH);
+                    }
+                    continue;
+                }
+                // Chains are prepend-built (newest first) — walk then
+                // reverse so matches emit in build order.
+                chain.clearRetainingCapacity();
+                var m = head;
+                while (m != NO_MATCH) : (m = next[m]) try chain.append(sa, m);
+                std.mem.reverse(u32, chain.items);
+                for (chain.items) |m2| {
+                    try keep.append(sa, @intCast(i));
+                    try match.append(sa, m2);
+                }
             }
             const start: u32 = @intCast(s.cols[0].rowCount());
             for (s.cols, fr.views[0..fr.width]) |*dst, v| {
@@ -2462,7 +2555,7 @@ pub const RegionPool = struct {
                     self.alloc.free(side_ex);
                 }
                 for (sides, side_ex) |side, *ex| {
-                    ex.* = try Exchange.init(self.alloc, side.schema, opts.n_threads, opts.n_shards, side.key_col);
+                    ex.* = try Exchange.init(self.alloc, side.pre_schema, opts.n_threads, opts.n_shards, side.key_col);
                     built += 1;
                 }
                 self.side_ex = side_ex;
@@ -2705,6 +2798,93 @@ fn packBins(alloc: Allocator, ex: *const Exchange, n_threads: usize) ![]Bin {
     return bins;
 }
 
+/// Per-bin side GROUP BY: fold every bucket row of the bin's partitions
+/// into groups keyed by the agg's group columns (strings interned in
+/// scratch; a NULL key is its own group via the mask word). Each group's
+/// key values append to `ssd` at first sight (group order = first-seen
+/// order), the SUM columns append after the fold. Shard-local grouping is
+/// globally exact because the group keys include the route key.
+fn aggregateSideBin(sex: *Exchange, ag: SideAgg, bin: Bin, ssd: *ShardData, sa: Allocator) !void {
+    const n_keys = ag.group_srcs.len;
+    const GroupKey = [MAX_SIDE_GROUP_KEYS + 1]i64;
+    const Acc = struct { i: i128 = 0, f: f64 = 0, seen: bool = false };
+    var map: std.AutoHashMapUnmanaged(GroupKey, u32) = .empty;
+    var interners: [MAX_SIDE_GROUP_KEYS]StrInterner = @splat(.empty);
+    const accs = try sa.alloc(std.ArrayListUnmanaged(Acc), ag.agg_srcs.len);
+    @memset(accs, .empty);
+    const views = try sa.alloc(ColumnView, sex.schema.len);
+    var count: u32 = 0;
+
+    for (bin.members) |s| {
+        for (0..sex.n_workers) |sw| {
+            const bkt = sex.bucket(sw, s);
+            if (bkt.rows == 0) continue;
+            for (bkt.cols, views) |*c, *v| v.* = c.view();
+            for (0..bkt.rows) |i| {
+                var key: GroupKey = @splat(0);
+                var mask: i64 = 0;
+                for (ag.key_srcs, 0..) |src, ki| {
+                    const v = views[src];
+                    if (!v.isValid(i)) {
+                        mask |= @as(i64, 1) << @intCast(ki);
+                        continue;
+                    }
+                    switch (v.data) {
+                        inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| key[ki] = vals[i],
+                        .varchar, .string, .char => {
+                            // Bucket bytes are exchange-arena-backed — they
+                            // outlive this map, so the slice keys directly.
+                            const gop = try interners[ki].getOrPut(sa, stringViewOf(v).rowBytes(i));
+                            if (!gop.found_existing) gop.value_ptr.* = @intCast(interners[ki].count());
+                            key[ki] = gop.value_ptr.*;
+                        },
+                        else => return error.UnsupportedQueryShape,
+                    }
+                }
+                key[MAX_SIDE_GROUP_KEYS] = mask;
+                const gop = try map.getOrPut(sa, key);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = count;
+                    count += 1;
+                    for (ag.group_srcs, 0..) |src, ki| {
+                        try appendRowValue(sex.alloc, &ssd.cols[ki], views[src], i);
+                    }
+                    for (accs) |*lane| try lane.append(sa, .{});
+                }
+                const ord = gop.value_ptr.*;
+                for (ag.agg_srcs, accs) |src, *lane| {
+                    const v = views[src];
+                    if (!v.isValid(i)) continue;
+                    const a = &lane.items[ord];
+                    switch (v.data) {
+                        inline .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => |vals| a.i += vals[i],
+                        inline .float, .double => |vals| a.f += vals[i],
+                        else => return error.UnsupportedQueryShape,
+                    }
+                    a.seen = true;
+                }
+            }
+        }
+    }
+
+    for (accs, 0..) |lane, k| {
+        const dst = &ssd.cols[n_keys + k];
+        for (lane.items) |a| {
+            if (!a.seen) {
+                try dst.appendNulls(sex.alloc, 1);
+                continue;
+            }
+            switch (dst.data) {
+                .bigint => |*l| try l.append(sex.alloc, std.math.cast(i64, a.i) orelse return error.UnsupportedQueryShape),
+                .largeint, .decimal128 => |*l| try l.append(sex.alloc, a.i),
+                .double => |*l| try l.append(sex.alloc, a.f),
+                else => return error.UnsupportedQueryShape,
+            }
+            if (dst.nulls != null) try dst.appendValidBit(sex.alloc, dst.rowCount() - 1, true);
+        }
+    }
+}
+
 fn freeBins(alloc: Allocator, bins: []Bin) void {
     if (bins.len > 0) {
         // members slices all view one flat allocation starting at bin with
@@ -2728,6 +2908,7 @@ const ShardPhase = struct {
     result: *RegionResult,
     slots: []const *RegionPool.WorkerSlot,
     side_ex: []Exchange,
+    sides: []const SideInput,
     errs: []?anyerror,
 
     fn worker(self: *ShardPhase, w: usize) void {
@@ -2755,15 +2936,21 @@ const ShardPhase = struct {
                 try consolidateAppendTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
             }
             // Side frames for this bin: plain per-partition bucket appends —
-            // no sort, the keyed_probe map is order-insensitive.
-            for (self.side_ex, slot.sides) |*sex, *ssd| {
-                try ssd.ensure(sex.alloc, sex.schema);
-                for (bin.members) |s| {
-                    for (0..sex.n_workers) |sw| {
-                        const bkt = sex.bucket(sw, s);
-                        if (bkt.rows == 0) continue;
-                        for (ssd.cols, bkt.cols) |*dst, *src| {
-                            try appendViewRange(sex.alloc, dst, src.view(), 0, bkt.rows);
+            // no sort, the keyed_probe map is order-insensitive. Aggregating
+            // sides fold their buckets through the per-bin GROUP BY instead
+            // of copying raw rows.
+            for (self.side_ex, self.sides, slot.sides) |*sex, *side, *ssd| {
+                try ssd.ensure(sex.alloc, side.schema);
+                if (side.agg) |ag| {
+                    try aggregateSideBin(sex, ag, bin, ssd, slot.scratch.allocator());
+                } else {
+                    for (bin.members) |s| {
+                        for (0..sex.n_workers) |sw| {
+                            const bkt = sex.bucket(sw, s);
+                            if (bkt.rows == 0) continue;
+                            for (ssd.cols, bkt.cols) |*dst, *src| {
+                                try appendViewRange(sex.alloc, dst, src.view(), 0, bkt.rows);
+                            }
                         }
                     }
                 }
@@ -3252,6 +3439,7 @@ pub fn runRegionPooled(
         .result = result,
         .slots = pool.slots.items[0..opts.n_threads],
         .side_ex = pool.side_ex,
+        .sides = sides,
         .errs = errs,
     };
     spawned = 0;

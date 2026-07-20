@@ -40,6 +40,7 @@ const predicate_mod = @import("../exec/predicate.zig");
 const types = @import("../types.zig");
 const udf_mod = @import("../udf.zig");
 const cte_stages = @import("cte_stages.zig");
+const aggregate_mod = @import("../exec/aggregate.zig");
 
 const Column = types.Column;
 const Value = types.Value;
@@ -570,10 +571,12 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         const sbs = try buildScanSources(input, st, spec.prune, spec.filter, spec.scan_cols, n_threads);
         s.* = .{
             .scan_schema = spec.scan_schema,
+            .pre_schema = spec.pre_schema,
             .schema = spec.schema,
             .sources = sbs.sources,
             .entry_derived = spec.entry_derived,
             .key_col = spec.key_col,
+            .agg = spec.agg,
         };
         sides_built += 1;
         const ss = sbs.sources[0].outputSchema();
@@ -1031,10 +1034,15 @@ const SideSpec = struct {
     scan_cols: ?[]const []const u8,
     entry_derived: []const Derived,
     scan_schema: []const Column,
-    /// Side frame schema: scan output ++ entry-derived columns.
+    /// Exchange (pre-agg) schema: scan output ++ entry-derived columns.
+    pre_schema: []const Column,
+    /// Probe-visible schema (post-agg when `agg` is set; == pre otherwise).
     schema: []const Column,
-    /// Route key column in the side frame schema.
+    /// Route key column in the pre-agg schema.
     key_col: usize,
+    /// Per-bin GROUP BY spec (crossplans CMT collapse), indices into
+    /// `pre_schema`.
+    agg: ?region.SideAgg,
 };
 
 const Builder = struct {
@@ -2126,6 +2134,14 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     {
         var i = pl.steps.len;
         while (i > 0) : (i -= 1) {
+            if (getenv("THINDB_REGION_STEPS") != null) {
+                std.debug.print("[region] step {d} '{s}'", .{ i, @tagName(std.meta.activeTag(pl.steps[i - 1])) });
+                switch (pl.steps[i - 1]) {
+                    .exclude, .select => |p| for (p.columns) |c| std.debug.print(" {s}", .{c}),
+                    else => {},
+                }
+                std.debug.print("\n", .{});
+            }
             dispatchStep(&b, registry, pl.steps[i - 1], pl.steps[0 .. i - 1]) catch |e| {
                 if (getenv("THINDB_REGION_TRACE") != null) {
                     std.debug.print("[region] dispatch declined on step {d}/{d} '{s}': {s}", .{
@@ -2204,10 +2220,12 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     for (ctx.side_specs.items, b.side_sources.items, op_sides) |spec, srcs, *s| {
         s.* = .{
             .scan_schema = spec.scan_schema,
+            .pre_schema = spec.pre_schema,
             .schema = spec.schema,
             .sources = srcs,
             .entry_derived = spec.entry_derived,
             .key_col = spec.key_col,
+            .agg = spec.agg,
         };
     }
     var q = try region.RegionExecOp.create(
@@ -2849,19 +2867,27 @@ fn sideColIdx(schema: []const Column, name: []const u8) ?usize {
 const SideEntry = struct {
     scan: *const ir.Op.Scan,
     top_select: ?[]const []const u8,
-    /// Bottom-up evaluation order.
+    /// Bottom-up evaluation order (below the aggregate when one exists).
     derived: []const Derived,
     filters: []const PredicateExpr,
+    /// A single GROUP BY between the top and the scan (the crossplans CMT
+    /// collapse). Derived collected ABOVE it land in `above_derived` —
+    /// trySideJoin only accepts constants there (the `-2 AS divisionId`
+    /// class), pushed below the aggregate as extra group keys.
+    agg: ?*const ir.Op.GroupBy = null,
+    above_derived: []const Derived = &.{},
 };
 
 /// Walk a join right side that is nothing but scan + computes + filters +
-/// projections (the rf_customer_monthly_totals class). Anything structural
-/// (join/group/window/TVF) declines — those need the drain path (or, for
-/// the crossplans GROUP BY collapse, a future side-aggregate step).
+/// projections (the rf_customer_monthly_totals class), with at most one
+/// GROUP BY on the way down (the crossplans CMT collapse). Anything else
+/// structural (join/window/TVF) declines — those need the drain path.
 fn collectSideEntry(na: Allocator, node: *const ir.Op) !SideEntry {
     var top_select: ?[]const []const u8 = null;
     var derived: std.ArrayListUnmanaged(Derived) = .empty;
+    var above_derived: std.ArrayListUnmanaged(Derived) = .empty;
     var filters: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    var agg: ?*const ir.Op.GroupBy = null;
     var cur = node;
     var guard: usize = 0;
     const scan: *const ir.Op.Scan = blk: while (guard < 64) : (guard += 1) {
@@ -2883,6 +2909,16 @@ fn collectSideEntry(na: Allocator, node: *const ir.Op) !SideEntry {
                 try filters.append(na, f.predicate);
                 cur = f.upstream;
             },
+            .group_by => |*g| {
+                if (agg != null) return NoMatch;
+                // Filters collected so far sit ABOVE the aggregate — a
+                // HAVING, which the per-bin fold can't apply.
+                if (filters.items.len > 0) return NoMatch;
+                agg = g;
+                above_derived = derived;
+                derived = .empty;
+                cur = g.upstream;
+            },
             .scan => |*s| break :blk s,
             else => return NoMatch,
         }
@@ -2890,11 +2926,14 @@ fn collectSideEntry(na: Allocator, node: *const ir.Op) !SideEntry {
     if (filters.items.len == 0) return NoMatch; // unfiltered side scan: not worth a region side
     // Computes were collected top-down; evaluation is bottom-up.
     std.mem.reverse(Derived, derived.items);
+    std.mem.reverse(Derived, above_derived.items);
     return .{
         .scan = scan,
         .top_select = top_select,
         .derived = derived.items,
         .filters = filters.items,
+        .agg = agg,
+        .above_derived = above_derived.items,
     };
 }
 
@@ -2919,6 +2958,13 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
     // every possible match — land in the same shard on both sides).
     const route_idx = (b.fb.resolve(b.route_name) orelse {
         sideTrace("route name '{s}' unresolved", .{b.route_name});
+        if (getenv("THINDB_REGION_STEPS") != null) {
+            for (b.fb.vis.items) |e| {
+                if (std.ascii.indexOfIgnoreCase(e.name, lastSegment(b.route_name)) != null) {
+                    std.debug.print("[region]   vis '{s}' -> {d}\n", .{ e.name, e.idx });
+                }
+            }
+        }
         return NoMatch;
     }).idx;
     var route_pair: ?usize = null;
@@ -2953,6 +2999,66 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             return e;
         };
 
+        // Aggregating side: the effective group-key set is the declared
+        // GROUP BY keys plus every above-aggregate derived that is a
+        // constant (`-2 AS divisionId`, pushed below the aggregate) or an
+        // alias of a key already in the set (the parser's
+        // `__join_on_right_N` copies, resolved to their source column —
+        // never materialized). Grouping additionally on a constant or a
+        // key copy changes nothing. Anything else above declines.
+        const AggKey = struct { name: []const u8, src: []const u8 };
+        var agg_keys: std.ArrayListUnmanaged(AggKey) = .empty;
+        if (se.agg) |g| {
+            for (g.group_cols) |c| {
+                try agg_keys.append(a, .{ .name = lastSegment(c), .src = lastSegment(c) });
+            }
+            for (se.above_derived) |d| {
+                const src: ?[]const u8 = switch (d.expr) {
+                    .lit, .null_lit => d.name,
+                    .col_ref => |r| blk: {
+                        const t = lastSegment(r);
+                        for (agg_keys.items) |k| {
+                            if (std.ascii.eqlIgnoreCase(k.name, t)) break :blk k.src;
+                        }
+                        break :blk null;
+                    },
+                    else => null,
+                };
+                if (src == null) {
+                    sideTrace("derived '{s}' above side aggregate is neither constant nor a key alias", .{d.name});
+                    return NoMatch;
+                }
+                var present = false;
+                for (agg_keys.items) |k| {
+                    if (std.ascii.eqlIgnoreCase(k.name, d.name)) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present) try agg_keys.append(a, .{ .name = d.name, .src = src.? });
+            }
+            // Per-bin aggregation is only globally exact when the route
+            // key is a group key (every row of a group is shard-local).
+            const rt = lastSegment(j.on[route_pair.?].right);
+            var route_grouped = false;
+            for (agg_keys.items) |k| {
+                if (std.ascii.eqlIgnoreCase(k.name, rt)) {
+                    route_grouped = true;
+                    break;
+                }
+            }
+            if (!route_grouped) {
+                sideTrace("side GROUP BY omits route '{s}'", .{rt});
+                return NoMatch;
+            }
+            for (g.aggs) |sp| {
+                if (sp.func != .sum or sp.col == null or sp.arg2_col != null or sp.udf_name != null) {
+                    sideTrace("side aggregate '{s}' is not a plain SUM", .{sp.as});
+                    return NoMatch;
+                }
+            }
+        }
+
         var filt_list: std.ArrayListUnmanaged(PredicateExpr) = .empty;
         for (se.filters) |f| {
             const cloned = try clonePredPlain(a, f);
@@ -2967,10 +3073,25 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
         // Pinned ON pairs (left bound to an entry literal) filter the side
         // scan directly when the side column is a stored column; the pair
         // still participates in the key so unpinnable ones stay correct.
-        for (j.on) |pair| {
+        // With a side aggregate the filter runs BELOW the GROUP BY, which
+        // only commutes when the pinned column is a group key.
+        pin: for (j.on) |pair| {
             const v = b.pinnedName(pair.left) orelse continue;
             const tail = lastSegment(pair.right);
             if (side_table.schema.columnIndex(tail) == null) continue;
+            if (se.agg) |g| {
+                for (g.group_cols) |kc| {
+                    if (std.ascii.eqlIgnoreCase(lastSegment(kc), tail)) {
+                        try filt_list.append(a, .{ .leaf = .{
+                            .col = try a.dupe(u8, tail),
+                            .op = .eq,
+                            .val = try cloneValuePlain(a, v),
+                        } });
+                        continue :pin;
+                    }
+                }
+                continue :pin;
+            }
             try filt_list.append(a, .{ .leaf = .{
                 .col = try a.dupe(u8, tail),
                 .op = .eq,
@@ -2993,18 +3114,50 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
                 .expr = try substDerivedRefs(a, cloned, side_derived.items),
             });
         }
+        // Constant derived above the aggregate (the `-2 AS divisionId`
+        // class) evaluate with the scan; key aliases resolve at compile
+        // and are never materialized.
+        for (se.above_derived) |d| switch (d.expr) {
+            .lit, .null_lit => try side_derived.append(a, .{
+                .name = try a.dupe(u8, d.name),
+                .expr = try cloneExprPlain(a, d.expr),
+            }),
+            else => {},
+        };
 
         // Scan projection: the visible set minus derived names, plus every
-        // stored column the derived exprs read.
+        // stored column the derived exprs read. An aggregating side scans
+        // its group-key sources and SUM sources instead of the (post-agg)
+        // visible set.
         var scan_cols_opt: ?[]const []const u8 = null;
-        if (se.top_select) |sel| {
+        scan_cols: {
             var cols: std.ArrayListUnmanaged([]const u8) = .empty;
-            outer: for (sel) |col| {
-                for (side_derived.items) |d| {
-                    if (std.ascii.eqlIgnoreCase(d.name, lastSegment(col))) continue :outer;
+            if (se.agg) |g| {
+                var want: std.ArrayListUnmanaged([]const u8) = .empty;
+                for (g.group_cols) |c| try want.append(a, c);
+                for (g.aggs) |sp| try want.append(a, sp.col.?);
+                outer: for (want.items) |col| {
+                    const tail = lastSegment(col);
+                    for (side_derived.items) |d| {
+                        if (std.ascii.eqlIgnoreCase(d.name, tail)) continue :outer;
+                    }
+                    if (side_table.schema.columnIndex(tail) == null) {
+                        sideTrace("side agg column '{s}' neither stored nor derived", .{col});
+                        return NoMatch;
+                    }
+                    for (cols.items) |c| {
+                        if (std.ascii.eqlIgnoreCase(lastSegment(c), tail)) continue :outer;
+                    }
+                    try cols.append(a, try a.dupe(u8, tail));
                 }
-                try cols.append(a, try a.dupe(u8, lastSegment(col)));
-            }
+            } else if (se.top_select) |sel| {
+                outer: for (sel) |col| {
+                    for (side_derived.items) |d| {
+                        if (std.ascii.eqlIgnoreCase(d.name, lastSegment(col))) continue :outer;
+                    }
+                    try cols.append(a, try a.dupe(u8, lastSegment(col)));
+                }
+            } else break :scan_cols;
             for (side_derived.items) |d| {
                 var refs: std.ArrayListUnmanaged([]const u8) = .empty;
                 try exprColNames(b.input.node_arena, d.expr, &refs);
@@ -3054,10 +3207,82 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             side_schema = typed;
         }
 
-        const key_col = sideColIdx(side_schema, j.on[route_pair.?].right) orelse {
-            sideTrace("route side col '{s}' not in side schema", .{j.on[route_pair.?].right});
+        // Exchange route column in the PRE schema: alias names (never
+        // materialized below an aggregate) resolve to their source.
+        var route_src = lastSegment(j.on[route_pair.?].right);
+        for (agg_keys.items) |k| {
+            if (std.ascii.eqlIgnoreCase(k.name, route_src)) {
+                route_src = k.src;
+                break;
+            }
+        }
+        const key_col = sideColIdx(side_schema, route_src) orelse {
+            sideTrace("route side col '{s}' not in side schema", .{route_src});
             return NoMatch;
         };
+
+        // Aggregating side: probes and payloads resolve against the
+        // post-agg schema — group keys (declared ++ pushed-down consts)
+        // then the SUM outputs with the engine's canonical widening.
+        var probe_schema = side_schema;
+        var side_agg: ?region.SideAgg = null;
+        if (se.agg) |g| {
+            const n_keys = agg_keys.items.len;
+            const post = try a.alloc(Column, n_keys + g.aggs.len);
+            const group_srcs = try a.alloc(usize, n_keys);
+            const agg_srcs = try a.alloc(usize, g.aggs.len);
+            // Map keys dedupe to the distinct source columns — alias copies
+            // (same pre column twice) add nothing to the grouping.
+            var key_srcs: std.ArrayListUnmanaged(usize) = .empty;
+            for (agg_keys.items, group_srcs, post[0..n_keys]) |k, *src, *col| {
+                const ki = sideColIdx(side_schema, k.src) orelse {
+                    sideTrace("side group key '{s}' (src '{s}') not in side schema", .{ k.name, k.src });
+                    return NoMatch;
+                };
+                const kt = side_schema[ki].type;
+                if (!(isIntFamilyType(kt) or isStringFamilyType(kt))) {
+                    sideTrace("side group key '{s}' has unsupported type {s}", .{ k.name, @tagName(kt) });
+                    return NoMatch;
+                }
+                src.* = ki;
+                col.* = .{ .name = try a.dupe(u8, k.name), .type = kt, .nullable = side_schema[ki].nullable };
+                var seen = false;
+                for (key_srcs.items) |ks| {
+                    if (ks == ki) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try key_srcs.append(a, ki);
+            }
+            if (key_srcs.items.len > region.MAX_SIDE_GROUP_KEYS) {
+                sideTrace("side aggregate has {d} distinct group keys (max {d})", .{ key_srcs.items.len, region.MAX_SIDE_GROUP_KEYS });
+                return NoMatch;
+            }
+            for (g.aggs, agg_srcs, post[n_keys..]) |sp, *src, *col| {
+                const si2 = sideColIdx(side_schema, sp.col.?) orelse {
+                    sideTrace("side SUM source '{s}' not in side schema", .{sp.col.?});
+                    return NoMatch;
+                };
+                const st2 = side_schema[si2].type;
+                switch (st2) {
+                    .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128 => {},
+                    else => {
+                        sideTrace("side SUM('{s}') has unsupported type {s}", .{ sp.col.?, @tagName(st2) });
+                        return NoMatch;
+                    },
+                }
+                const ot = aggregate_mod.aggOutputTypeFor(sp, st2) catch {
+                    sideTrace("side SUM('{s}') output type unresolved", .{sp.col.?});
+                    return NoMatch;
+                };
+                src.* = si2;
+                col.* = .{ .name = try a.dupe(u8, sp.as), .type = ot, .nullable = true };
+            }
+            probe_schema = post;
+            side_agg = .{ .group_srcs = group_srcs, .key_srcs = key_srcs.items, .agg_srcs = agg_srcs };
+        }
+
         try b.side_nodes.append(a, j.right);
         try b.ctx.side_specs.append(a, .{
             .table = try a.dupe(u8, se.scan.table.name),
@@ -3066,8 +3291,10 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             .scan_cols = scan_cols_opt,
             .entry_derived = side_derived.items,
             .scan_schema = scan_schema,
-            .schema = side_schema,
+            .pre_schema = side_schema,
+            .schema = probe_schema,
             .key_col = key_col,
+            .agg = side_agg,
         });
         try b.side_sources.append(a, bs.sources);
         sources_owned = false;
@@ -3149,7 +3376,11 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
                         break;
                     }
                 }
-            } else qualified_ref = true;
+            }
+            // Unknown liveness (a TVF above hides the reference set) must
+            // NOT register speculatively: a qualified key-tail entry makes
+            // bare resolution of the spine's own key — including the route
+            // key — ambiguous for every later step.
             if (!qualified_ref) continue;
         }
         const idx = try b.fb.addCol(col.name, col.type, true);
