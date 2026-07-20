@@ -376,12 +376,14 @@ pub const Exchange = struct {
 
         /// Route one batch: pass 1 assigns each row a shard by key hash
         /// (NULL keys hash as empty — one shard, matching NULL-group
-        /// semantics); pass 2 appends per (shard, column).
-        pub fn push(self: *Worker, batch: Batch) !void {
+        /// semantics); pass 2 appends per (shard, column). Rows where
+        /// `keep` is false are dropped before routing (member filters).
+        pub fn push(self: *Worker, batch: Batch, keep: ?[]const bool) !void {
             const ex = self.ex;
             for (self.idx) |*l| l.clearRetainingCapacity();
             const kv = batch.values[ex.key_col];
             for (0..batch.row_count) |r| {
+                if (keep) |k| if (!k[r]) continue;
                 const key: []const u8 = if (kv.isValid(r)) stringViewOf(kv).rowBytes(r) else "";
                 const shard = std.hash.Wyhash.hash(HASH_SEED, key) % ex.n_shards;
                 try self.idx[shard].append(ex.alloc, @intCast(r));
@@ -867,6 +869,65 @@ pub const SideAgg = struct {
     key_srcs: []const usize,
     agg_srcs: []const usize,
 };
+
+/// Scan-fused membership filter: a compile-time-drained semi-join (INNER
+/// equality join against a small distinct key set with no live payload)
+/// or a large IN list, applied to entry batches BEFORE the exchange
+/// scatter. Keys are sorted unique; the per-row test is a binary search —
+/// no per-op frame restructure, and rows drop before they are ever
+/// scattered.
+pub const MemberFilter = struct {
+    /// Entry-frame column (post entry compute) the filter tests.
+    col: usize,
+    /// Int-family probes: sorted unique key values.
+    ints: []const i64 = &.{},
+    /// String probes: sorted unique byte strings.
+    strs: []const []const u8 = &.{},
+    is_str: bool,
+
+    /// NULL probe values never match (INNER-join equality semantics).
+    pub fn mask(self: *const MemberFilter, v: ColumnView, n: usize, out: []bool) !void {
+        if (self.is_str) {
+            const sv = switch (v.data) {
+                .varchar, .string, .char, .json => stringViewOf(v),
+                else => return error.UnsupportedQueryShape,
+            };
+            for (0..n) |i| {
+                if (!v.isValid(i)) {
+                    out[i] = false;
+                    continue;
+                }
+                out[i] = sortedBytesContains(self.strs, sv.rowBytes(i));
+            }
+        } else {
+            for (0..n) |i| {
+                const key = intAt(v, i) orelse {
+                    out[i] = false;
+                    continue;
+                };
+                out[i] = std.sort.binarySearch(i64, self.ints, key, struct {
+                    fn order(k: i64, item: i64) std.math.Order {
+                        return std.math.order(k, item);
+                    }
+                }.order) != null;
+            }
+        }
+    }
+};
+
+fn sortedBytesContains(items: []const []const u8, key: []const u8) bool {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (std.mem.order(u8, key, items[mid])) {
+            .eq => return true,
+            .lt => hi = mid,
+            .gt => lo = mid + 1,
+        }
+    }
+    return false;
+}
 
 pub const RegionOp = union(enum) {
     /// Row-wise derived columns via the engine expression evaluator (one
@@ -2422,6 +2483,10 @@ pub const DriverOpts = struct {
     /// weights) driving the fused scan+exec LPT assignment. Empty = assume
     /// equal-sized intervals (the quantile bounds target that anyway).
     iv_rows_est: []const u64 = &.{},
+    /// Scan-fused membership filters (compile-converted semi-joins),
+    /// applied to entry batches before the exchange scatter. Hash-exchange
+    /// path only — the compiler declines the conversion in ordered mode.
+    member_filters: []const MemberFilter = &.{},
     /// Ordered mode: cache-ctx-owned measured-cost slot (len n_shards).
     /// All-zero = unfilled: the first run fills it with measured
     /// per-interval ticks (scan+exec), then it is frozen — later runs LPT
@@ -2700,6 +2765,7 @@ const ScanPhase = struct {
     scan_schema: []const Column,
     registry: ?*const udf_mod.UdfRegistry,
     sort_cols: []const OrderCol,
+    member_filters: []const MemberFilter = &.{},
     /// Co-partitioned side tables: one exchange + claim counter each; side
     /// buckets are never sorted (the probe map doesn't need order).
     sides: []SideScan,
@@ -2729,12 +2795,27 @@ const ScanPhase = struct {
         if (self.entry_derived.len > 0) {
             inst = try makeComputeInstance(self.ex.alloc, self.scan_schema, self.entry_derived, self.registry);
         }
+        var mask_buf: std.ArrayListUnmanaged(bool) = .empty;
+        defer mask_buf.deinit(self.ex.alloc);
+        var scratch_buf: std.ArrayListUnmanaged(bool) = .empty;
+        defer scratch_buf.deinit(self.ex.alloc);
         while (true) {
             const i = self.next.fetchAdd(1, .monotonic);
             if (i >= self.sources.len) break;
             while (try self.sources[i].next()) |batch| {
                 const routed = if (inst) |*ci| try ci.ptr.evalBatch(batch) else batch;
-                try wk.push(routed);
+                var keep: ?[]const bool = null;
+                if (self.member_filters.len > 0) {
+                    try mask_buf.resize(self.ex.alloc, routed.row_count);
+                    try self.member_filters[0].mask(routed.values[self.member_filters[0].col], routed.row_count, mask_buf.items);
+                    for (self.member_filters[1..]) |*f| {
+                        try scratch_buf.resize(self.ex.alloc, routed.row_count);
+                        try f.mask(routed.values[f.col], routed.row_count, scratch_buf.items);
+                        for (mask_buf.items, scratch_buf.items) |*m, s| m.* = m.* and s;
+                    }
+                    keep = mask_buf.items;
+                }
+                try wk.push(routed, keep);
             }
         }
         for (self.sides) |*side| {
@@ -2750,7 +2831,7 @@ const ScanPhase = struct {
                 if (i >= side.input.sources.len) break;
                 while (try side.input.sources[i].next()) |batch| {
                     const routed = if (sinst) |*ci| try ci.ptr.evalBatch(batch) else batch;
-                    try swk.push(routed);
+                    try swk.push(routed, null);
                 }
             }
         }
@@ -3500,6 +3581,7 @@ pub fn runRegionPooled(
         .scan_schema = scan_schema,
         .registry = prog.registry,
         .sort_cols = opts.sort_cols,
+        .member_filters = opts.member_filters,
         .sides = side_scans,
         .errs = errs,
     };
@@ -3948,7 +4030,7 @@ test "region exchange + ordered consolidation: multiset, order, group ranges" {
         var views = [_]ColumnView{ kc.view(), gc.view(), vc.view() };
         var wk = try ex.worker(w);
         defer wk.deinit();
-        try wk.push(.{ .schema = &schema, .values = &views, .row_count = n });
+        try wk.push(.{ .schema = &schema, .values = &views, .row_count = n }, null);
     }
 
     // Consolidate every shard ordered by (k, g), grouped by k.

@@ -1058,6 +1058,9 @@ const Builder = struct {
     /// Side-table dedupe: the IR node each side spec was compiled from
     /// (ctc/ctl reference the SAME materialized CTE — one side, two probes).
     side_nodes: std.ArrayListUnmanaged(*const ir.Op) = .empty,
+    /// Semi-joins converted to scan-fused membership filters (applied
+    /// pre-exchange by the driver; no program op).
+    member_filters: std.ArrayListUnmanaged(region.MemberFilter) = .empty,
     /// Per-side scan sources (query-lifetime; the RegionExecOp takes them).
     side_sources: std.ArrayListUnmanaged([]exec.Query) = .empty,
     /// Consolidation range-key NAMES, resolved against the CURRENT frame at
@@ -2209,6 +2212,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         .loc_col = rowloc_entry,
         .iv_rows_est = iv_rows_est,
         .iv_cost_slot = if (order_aligned) ctx.iv_cost else null,
+        .member_filters = b.member_filters.items,
     };
     ctx.opts = opts;
     // The estimate slice is query-lifetime (scan-source scratch) — never
@@ -2797,6 +2801,55 @@ fn pushKeyedBroadcast(
             return NoMatch; // dup key: 1:N changes row counts
         }
         gop.value_ptr.* = @intCast(i);
+    }
+
+    // Scan-fused membership filter: an INNER single-pair probe as the
+    // program's FIRST op drops exactly the rows whose key misses the map —
+    // pre-cutting those at the exchange scatter is semantics-neutral (the
+    // op still runs, now on the all-match fast path, so its restructure
+    // emit disappears) and the cut lands before scatter/consolidation.
+    // The map build above already proved build keys unique. Ordered mode
+    // has no scatter stage to mask — skip.
+    if (inner and pairs.len == 1 and b.ops.items.len == 0 and
+        b.pending_nulls.items.len == 0 and !b.order_aligned)
+    {
+        const p = pairs[0];
+        const bv = views[p.build];
+        if (p.kind == .str) {
+            var vals: std.ArrayListUnmanaged([]const u8) = .empty;
+            rows: for (0..blk.rows) |i| {
+                for (pin_right, pin_vals) |rci, want| {
+                    if (!try pinMatches(views[rci], i, want)) continue :rows;
+                }
+                const bytes = strBytesAt(bv, i) orelse continue :rows;
+                try vals.append(a, try a.dupe(u8, bytes));
+            }
+            std.mem.sortUnstable([]const u8, vals.items, {}, struct {
+                fn less(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.order(u8, x, y) == .lt;
+                }
+            }.less);
+            try b.member_filters.append(a, .{ .col = p.probe, .strs = vals.items, .is_str = true });
+        } else {
+            var vals: std.ArrayListUnmanaged(i64) = .empty;
+            rows: for (0..blk.rows) |i| {
+                for (pin_right, pin_vals) |rci, want| {
+                    if (!try pinMatches(views[rci], i, want)) continue :rows;
+                }
+                const key = switch (p.kind) {
+                    .int => i64At(bv, i) orelse continue :rows,
+                    .int_from_str_build => k: {
+                        const bytes = strBytesAt(bv, i) orelse continue :rows;
+                        break :k std.fmt.parseInt(i64, bytes, 10) catch continue :rows;
+                    },
+                    .str => unreachable,
+                };
+                try vals.append(a, key);
+            }
+            std.mem.sortUnstable(i64, vals.items, {}, std.sort.asc(i64));
+            try b.member_filters.append(a, .{ .col = p.probe, .ints = vals.items, .is_str = false });
+        }
+        sideTrace("semi member filter registered ({d} build rows)", .{blk.rows});
     }
 
     var payloads: std.ArrayListUnmanaged(region.KeyedPayload) = .empty;
