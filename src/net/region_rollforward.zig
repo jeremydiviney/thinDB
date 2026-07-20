@@ -267,9 +267,36 @@ const Cache = struct {
     /// While busy the entry can be neither reused nor replaced — a second
     /// concurrent identical query just runs one-shot.
     busy: bool = false,
+    /// In-flight background ctx destroys (eviction/invalidation) — a big
+    /// pool frees seconds of allocator work, which must never sit on the
+    /// incoming query's critical path. Database close waits for them.
+    reaps_pending: std.atomic.Value(usize) = .init(0),
+
+    /// Destroy an evicted/invalidated ctx off-thread. The ctx is exclusively
+    /// owned by the caller at this point (it left the cache slot while
+    /// busy-held), so the only ordering requirement is that the database —
+    /// whose allocator the ctx frees into — outlives the reap, which
+    /// deinitErased's wait guarantees.
+    fn destroyCtxAsync(self: *Cache, ctx: *Ctx) void {
+        _ = self.reaps_pending.fetchAdd(1, .acquire);
+        const t = std.Thread.spawn(.{}, reap, .{ self, ctx }) catch {
+            Ctx.destroyErased(ctx);
+            _ = self.reaps_pending.fetchSub(1, .release);
+            return;
+        };
+        t.detach();
+    }
+
+    fn reap(self: *Cache, ctx: *Ctx) void {
+        Ctx.destroyErased(ctx);
+        _ = self.reaps_pending.fetchSub(1, .release);
+    }
 
     fn deinitErased(p: *anyopaque) void {
         const self: *Cache = @ptrCast(@alignCast(p));
+        while (self.reaps_pending.load(.acquire) != 0) {
+            std.Thread.yield() catch {};
+        }
         const alloc = self.alloc;
         if (self.ctx) |c| Ctx.destroyErased(c);
         alloc.destroy(self);
@@ -431,7 +458,7 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash:
         cache.ctx = null;
         cache.busy = false;
         cache.mu.unlock();
-        Ctx.destroyErased(ctx);
+        cache.destroyCtxAsync(ctx);
         if (getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] cache invalidated (data changed)\n", .{});
         }
@@ -2216,7 +2243,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         c.hash = anchor_hash.?;
         c.busy = true;
         c.mu.unlock();
-        if (old) |o| Ctx.destroyErased(o);
+        if (old) |o| c.destroyCtxAsync(o);
         op.setOwnedCtx(c, Cache.releaseErased);
         if (getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] cache store ({x})\n", .{anchor_hash.?});

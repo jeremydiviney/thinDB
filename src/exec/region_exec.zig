@@ -268,7 +268,18 @@ const Bucket = struct {
 };
 
 pub const Exchange = struct {
+    /// Thread-safe base allocator: the bucket ARRAY, consolidation
+    /// out-side stores, and per-run worker scratch (freed each run — arena
+    /// memory is never reclaimed until reset, so per-run allocations there
+    /// would accumulate across warm runs).
     alloc: Allocator,
+    /// One arena per scan worker, owning that worker's bucket stores and
+    /// merge keys. A worker only ever grows its own row of buckets, so the
+    /// arenas see single-threaded use — and teardown of the exchange's
+    /// multi-GB retained capacity collapses from ~10^5 individual frees to
+    /// n_workers arena releases (the inline-teardown seconds the pool's
+    /// eviction path used to pay).
+    arenas: []std.heap.ArenaAllocator,
     schema: []const Column,
     n_workers: usize,
     n_shards: usize,
@@ -277,32 +288,33 @@ pub const Exchange = struct {
     key_col: usize,
     buckets: []Bucket,
 
+    /// Single-threaded by contract: only scan worker `w` (which owns bucket
+    /// row w exclusively) may allocate from arena w. The consolidation-side
+    /// lazy sortBucketKeys fallback also lands here — it never fires when a
+    /// scan phase ran (every bucket is pre-sorted), and direct callers
+    /// without one are single-threaded.
+    fn workerAlloc(self: *Exchange, w: usize) Allocator {
+        return self.arenas[w].allocator();
+    }
+
     pub fn init(alloc: Allocator, schema: []const Column, n_workers: usize, n_shards: usize, key_col: usize) !Exchange {
+        const arenas = try alloc.alloc(std.heap.ArenaAllocator, n_workers);
+        errdefer alloc.free(arenas);
+        for (arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(alloc);
+        errdefer for (arenas) |*ar| ar.deinit();
         const buckets = try alloc.alloc(Bucket, n_workers * n_shards);
-        var built: usize = 0;
-        errdefer {
-            for (buckets[0..built]) |*b| {
-                for (b.cols) |*c| c.deinit(alloc);
-                alloc.free(b.cols);
-            }
-            alloc.free(buckets);
-        }
-        for (buckets) |*b| {
-            const cols = try alloc.alloc(ColumnStore, schema.len);
-            var inited: usize = 0;
-            errdefer {
-                for (cols[0..inited]) |*c| c.deinit(alloc);
-                alloc.free(cols);
-            }
+        errdefer alloc.free(buckets);
+        for (buckets, 0..) |*b, i| {
+            const wa = arenas[i / n_shards].allocator();
+            const cols = try wa.alloc(ColumnStore, schema.len);
             for (cols, schema) |*c, col| {
-                c.* = try ColumnStore.init(alloc, col.type, col.nullable);
-                inited += 1;
+                c.* = try ColumnStore.init(wa, col.type, col.nullable);
             }
             b.* = .{ .cols = cols };
-            built += 1;
         }
         return .{
             .alloc = alloc,
+            .arenas = arenas,
             .schema = schema,
             .n_workers = n_workers,
             .n_shards = n_shards,
@@ -312,12 +324,8 @@ pub const Exchange = struct {
     }
 
     pub fn deinit(self: *Exchange) void {
-        for (self.buckets) |*b| {
-            for (b.cols) |*c| c.deinit(self.alloc);
-            self.alloc.free(b.cols);
-            b.keys.deinit(self.alloc);
-            b.order.deinit(self.alloc);
-        }
+        for (self.arenas) |*ar| ar.deinit();
+        self.alloc.free(self.arenas);
         self.alloc.free(self.buckets);
     }
 
@@ -364,12 +372,13 @@ pub const Exchange = struct {
                 const shard = std.hash.Wyhash.hash(HASH_SEED, key) % ex.n_shards;
                 try self.idx[shard].append(ex.alloc, @intCast(r));
             }
+            const wa = ex.workerAlloc(self.w);
             for (0..ex.n_shards) |shard| {
                 const rows = self.idx[shard].items;
                 if (rows.len == 0) continue;
                 const b = ex.bucket(self.w, shard);
                 for (b.cols, batch.values) |*store, v| {
-                    try scatterColumn(ex.alloc, store, v, rows);
+                    try scatterColumn(wa, store, v, rows);
                 }
                 b.rows += rows.len;
             }
@@ -541,12 +550,12 @@ pub fn sortBucketKeys(ex: *Exchange, w: usize, shard: usize, sort_cols: []const 
     const rows = b.rows;
     if (rows == 0) return;
     const n_sort = sort_cols.len;
-    try b.keys.ensureTotalCapacity(ex.alloc, rows * n_sort);
+    try b.keys.ensureTotalCapacity(ex.workerAlloc(w), rows * n_sort);
     b.keys.items.len = rows * n_sort;
     for (sort_cols, 0..) |sc, kc| {
         try fillRowKeys(b.keys.items, n_sort, kc, sc.kind, b.cols[sc.col].view(), rows);
     }
-    try b.order.ensureTotalCapacity(ex.alloc, rows);
+    try b.order.ensureTotalCapacity(ex.workerAlloc(w), rows);
     b.order.items.len = rows;
     for (b.order.items, 0..) |*o, i| o.* = @intCast(i);
     const Ctx = struct {
@@ -2491,20 +2500,15 @@ pub const RegionPool = struct {
 
     pub fn retainedBytes(self: *const RegionPool) usize {
         var n: usize = 0;
-        // Bucket merge keys/orders are deliberately NOT counted: they are
-        // input-proportional scratch (~24B/row × sort cols), and counting
-        // them tipped the DOP-24 plateau over the cap — resetting the whole
-        // pool every run. Freeing them per run instead caused the Windows
-        // soft-fault drift pooling exists to prevent. They retain untracked.
+        // Exchanges are arena-backed: count the arenas' real footprint
+        // (store capacities + growth history + merge keys) — the honest
+        // number, since that is exactly what a reset now releases (and
+        // releasing it is cheap: n_workers arena frees).
         if (self.ex) |*ex| {
-            for (ex.buckets) |b| {
-                for (b.cols) |*c| n += storeRetainedBytes(c);
-            }
+            for (ex.arenas) |*ar| n += ar.queryCapacity();
         }
         for (self.side_ex) |*ex| {
-            for (ex.buckets) |b| {
-                for (b.cols) |*c| n += storeRetainedBytes(c);
-            }
+            for (ex.arenas) |*ar| n += ar.queryCapacity();
         }
         for (self.ivs) |*iv| {
             for (iv.sd.cols) |*c| n += storeRetainedBytes(c);
