@@ -2712,9 +2712,80 @@ pub const RegionPool = struct {
     }
 
     /// End-of-run retention policy: keep everything (cleared) for the next
-    /// run unless the retained capacity exceeds the cap.
+    /// run while under the cap. Over the cap, release PARTIALLY: the
+    /// exchanges track live data (re-scattered every run — retaining them
+    /// is pure fault avoidance), while worker-slot stores ratchet toward
+    /// whale-bin × slots and carry the blowup — free the fattest slots
+    /// first until under the cap. Full reset only when the exchanges alone
+    /// exceed it (or on any rebuild failure).
     pub fn releaseRun(self: *RegionPool) void {
-        if (self.retainedBytes() > self.max_retained_bytes) self.reset();
+        var total = self.retainedBytes();
+        if (total <= self.max_retained_bytes) return;
+
+        const n = self.slots.items.len;
+        if (n == 0 or n > 128 or self.prog == null) {
+            self.reset();
+            return;
+        }
+        var sizes: [128]usize = undefined;
+        var slot_total: usize = 0;
+        for (self.slots.items, 0..) |slot, i| {
+            sizes[i] = slotRetainedBytes(slot);
+            slot_total += sizes[i];
+        }
+        if (total - slot_total > self.max_retained_bytes) {
+            self.reset();
+            return;
+        }
+        var released: usize = 0;
+        while (total > self.max_retained_bytes) {
+            var big: usize = 0;
+            for (sizes[0..n], 0..) |s, i| {
+                if (s > sizes[big]) big = i;
+            }
+            if (sizes[big] == 0) break;
+            if (!self.releaseSlotStores(self.slots.items[big])) {
+                self.reset();
+                return;
+            }
+            total -= @min(sizes[big], total);
+            sizes[big] = 0;
+            released += 1;
+        }
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] partial release: {d}/{d} slots freed, retained ~{d}MB\n", .{
+                released, n, self.retainedBytes() >> 20,
+            });
+        }
+    }
+
+    fn slotRetainedBytes(slot: *const WorkerSlot) usize {
+        var n: usize = slot.rw.retainedBytes();
+        for (slot.sd.cols) |*c| n += storeRetainedBytes(c);
+        for (slot.sides) |*sd| {
+            for (sd.cols) |*c| n += storeRetainedBytes(c);
+        }
+        n += slot.scratch.queryCapacity();
+        return n;
+    }
+
+    /// Free one slot's ratcheted stores in place, leaving the slot valid
+    /// for the next acquire (fresh empty op states; TVF worker state
+    /// rebuilds lazily). Returns false when the rebuild fails — the caller
+    /// falls back to a full reset.
+    fn releaseSlotStores(self: *RegionPool, slot: *WorkerSlot) bool {
+        const prog = self.prog orelse return false;
+        const fresh = RegionWorker.init(self.alloc, prog) catch return false;
+        slot.rw.deinit();
+        slot.rw = fresh;
+        slot.sd.deinit(self.alloc);
+        slot.sd = .{};
+        for (slot.sides) |*sd| {
+            sd.deinit(self.alloc);
+            sd.* = .{};
+        }
+        _ = slot.scratch.reset(.free_all);
+        return true;
     }
 
     pub fn retainedBytes(self: *const RegionPool) usize {
