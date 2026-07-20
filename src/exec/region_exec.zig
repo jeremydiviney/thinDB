@@ -67,7 +67,9 @@ pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows:
 
 /// scatterColumn for keep-lists dominated by consecutive-index runs (probe
 /// restructure emits keep most rows and expand mostly 1:1): each maximal
-/// run bulk-copies values and validity as a slice.
+/// run bulk-copies values and validity as a slice. For run-poor lists the
+/// per-run call overhead loses to scatterColumn's per-element loop — the
+/// emit picks per keep-list via runsDominate.
 pub fn scatterColumnRuns(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows: []const u32) !void {
     var i: usize = 0;
     while (i < rows.len) {
@@ -77,6 +79,21 @@ pub fn scatterColumnRuns(alloc: Allocator, store: *ColumnStore, v: ColumnView, r
         try appendViewRange(alloc, store, v, start, start + (j - i));
         i = j;
     }
+}
+
+/// True when bulk-copyable runs (length ≥ 4) cover at least half the list.
+/// One scan per EMIT (not per column) — the statistics are identical for
+/// every column of the frame.
+fn runsDominate(rows: []const u32) bool {
+    var covered: usize = 0;
+    var i: usize = 0;
+    while (i < rows.len) {
+        var j = i + 1;
+        while (j < rows.len and rows[j] == rows[j - 1] + 1) : (j += 1) {}
+        if (j - i >= 4) covered += j - i;
+        i = j;
+    }
+    return covered * 2 >= rows.len;
 }
 
 /// Append `refs` rows gathered across per-worker source views (worker in
@@ -2371,8 +2388,12 @@ pub const RegionWorker = struct {
             try s.ranges.append(alloc, .{ range_start, range_end });
             range_start = range_end;
         }
+        const use_runs = runsDominate(keep.items);
         for (s.cols, fr.views[0..fr.width]) |*dst, v| {
-            try scatterColumnRuns(alloc, dst, v, keep.items);
+            if (use_runs)
+                try scatterColumnRuns(alloc, dst, v, keep.items)
+            else
+                try scatterColumn(alloc, dst, v, keep.items);
         }
         for (pay_views, s.pay) |pv, *dst| {
             try gatherColumnOpt(alloc, dst, pv, match.items);
@@ -2428,8 +2449,12 @@ pub const RegionWorker = struct {
             try s.ranges.append(alloc, .{ range_start, range_end });
             range_start = range_end;
         }
+        const use_runs = runsDominate(keep.items);
         for (s.cols, fr.views[0..fr.width]) |*dst, v| {
-            try scatterColumnRuns(alloc, dst, v, keep.items);
+            if (use_runs)
+                try scatterColumnRuns(alloc, dst, v, keep.items)
+            else
+                try scatterColumn(alloc, dst, v, keep.items);
         }
         for (pay_views, s.pay) |pv, *dst| {
             try gatherColumnOpt(alloc, dst, pv, match.items);
