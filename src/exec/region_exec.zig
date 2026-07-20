@@ -65,6 +65,20 @@ pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows:
     }
 }
 
+/// scatterColumn for keep-lists dominated by consecutive-index runs (probe
+/// restructure emits keep most rows and expand mostly 1:1): each maximal
+/// run bulk-copies values and validity as a slice.
+pub fn scatterColumnRuns(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows: []const u32) !void {
+    var i: usize = 0;
+    while (i < rows.len) {
+        var j = i + 1;
+        while (j < rows.len and rows[j] == rows[j - 1] + 1) : (j += 1) {}
+        const start: usize = rows[i];
+        try appendViewRange(alloc, store, v, start, start + (j - i));
+        i = j;
+    }
+}
+
 /// Append `refs` rows gathered across per-worker source views (worker in
 /// the top byte, bucket row in the low 24 bits) — the exchange-merge loop.
 pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnView, refs: []const u32) !void {
@@ -1274,6 +1288,10 @@ pub const RegionWorker = struct {
     views: []ColumnView,
     /// Per-op wall ticks (THINDB_REGION_TRACE only; null otherwise).
     op_ticks: ?[]i64 = null,
+    /// Per-op probe sub-phase ticks [map build, probe loop, emit]
+    /// (THINDB_REGION_TRACE only; null otherwise).
+    probe_ticks: ?[][3]i64 = null,
+    cur_op: usize = 0,
     consolidate_ticks: i64 = 0,
     /// Co-partitioned side frames for the CURRENT bin (set by the shard
     /// phase before runShardFrom; indexed by keyed_probe.side.shard).
@@ -1420,10 +1438,14 @@ pub const RegionWorker = struct {
             built += 1;
         }
         var op_ticks: ?[]i64 = null;
+        var probe_ticks: ?[][3]i64 = null;
         if (getenv("THINDB_REGION_TRACE") != null) {
             const t = try alloc.alloc(i64, prog.ops.len);
             @memset(t, 0);
             op_ticks = t;
+            const pt = try alloc.alloc([3]i64, prog.ops.len);
+            @memset(pt, .{ 0, 0, 0 });
+            probe_ticks = pt;
         }
         return .{
             .alloc = alloc,
@@ -1432,6 +1454,7 @@ pub const RegionWorker = struct {
             .scratch = std.heap.ArenaAllocator.init(alloc),
             .views = try alloc.alloc(ColumnView, prog.max_width),
             .op_ticks = op_ticks,
+            .probe_ticks = probe_ticks,
         };
     }
 
@@ -1440,6 +1463,7 @@ pub const RegionWorker = struct {
         self.alloc.free(self.states);
         self.alloc.free(self.views);
         if (self.op_ticks) |t| self.alloc.free(t);
+        if (self.probe_ticks) |t| self.alloc.free(t);
         self.scratch.deinit();
         self.* = undefined;
     }
@@ -1553,6 +1577,7 @@ pub const RegionWorker = struct {
 
         const tick_ops = self.op_ticks != null;
         for (self.prog.ops[start_op..], self.states[start_op..], start_op..) |op, *st, oi| {
+            self.cur_op = oi;
             const t_op = if (tick_ops) exec.prof.nowTicks() else 0;
             defer if (tick_ops) {
                 self.op_ticks.?[oi] += exec.prof.nowTicks() - t_op;
@@ -2099,14 +2124,21 @@ pub const RegionWorker = struct {
 
     fn runHashProbe(self: *RegionWorker, h: anytype, s: *ProbeState, fr: *Frame) !void {
         const sa = self.scratch.allocator();
+        const tick = self.probe_ticks != null;
+        const t0 = if (tick) exec.prof.nowTicks() else 0;
         const ords = try probeMatchOrds(sa, h.map, fr.views[h.probe], fr.rows);
+        const t1 = if (tick) exec.prof.nowTicks() else 0;
+        if (tick) self.probe_ticks.?[self.cur_op][1] += t1 - t0;
         const pay_views = try sa.alloc(ColumnView, h.payload.len);
         for (h.payload, pay_views) |p, *v| v.* = p.view;
         try self.emitProbe(s, fr, ords, pay_views, h.inner);
+        if (tick) self.probe_ticks.?[self.cur_op][2] += exec.prof.nowTicks() - t1;
     }
 
     fn runKeyedProbe(self: *RegionWorker, k: anytype, s: *ProbeState, fr: *Frame) !void {
         const sa = self.scratch.allocator();
+        const tick = self.probe_ticks != null;
+        const t0 = if (tick) exec.prof.nowTicks() else 0;
 
         var map_storage: MultiKeyMap = .empty;
         var interner_storage: [MAX_KEYED_PAIRS]StrInterner = @splat(.empty);
@@ -2170,7 +2202,13 @@ pub const RegionWorker = struct {
                 interners = interners_buf[0..k.pairs.len];
             },
         }
+        const t1 = if (tick) exec.prof.nowTicks() else 0;
+        if (tick) self.probe_ticks.?[self.cur_op][0] += t1 - t0;
 
+        // A build-side dup chain only matters if some probe row actually
+        // hits it — bins where no probed key is duplicated take the cheap
+        // non-expanding emit.
+        var dup_probed = false;
         const ords = try sa.alloc(u32, fr.rows);
         rows: for (0..fr.rows) |i| {
             var key: MultiKey = @splat(0);
@@ -2194,16 +2232,25 @@ pub const RegionWorker = struct {
                     },
                 }
             }
-            ords[i] = map.get(key) orelse NO_MATCH;
+            const hit = map.get(key) orelse {
+                ords[i] = NO_MATCH;
+                continue :rows;
+            };
+            ords[i] = hit;
+            if (has_dups and next.?[hit] != NO_MATCH) dup_probed = true;
         }
+
+        const t2 = if (tick) exec.prof.nowTicks() else 0;
+        if (tick) self.probe_ticks.?[self.cur_op][1] += t2 - t1;
 
         const pay_views = try sa.alloc(ColumnView, k.payload.len);
         for (k.payload, pay_views) |p, *v| v.* = build_views[p.src];
-        if (has_dups) {
+        if (dup_probed) {
             try self.emitProbeExpand(s, fr, ords, next.?, pay_views, k.inner);
         } else {
             try self.emitProbe(s, fr, ords, pay_views, k.inner);
         }
+        if (tick) self.probe_ticks.?[self.cur_op][2] += exec.prof.nowTicks() - t2;
     }
 
     /// Shared probe emit: LEFT appends payload columns (NULL on miss);
@@ -2223,9 +2270,11 @@ pub const RegionWorker = struct {
             return;
         }
 
-        // Pure-filter inner probe (no payload) where every row matches:
-        // the frame is untouched — skip the full restructure copy.
-        if (pay_views.len == 0) {
+        // Inner probe where every row matches: no row drops, so the frame
+        // layout is untouched — payloads append LEFT-style and the full
+        // restructure copy is skipped (the dominant probe cost on
+        // high-match joins).
+        {
             var all_match = true;
             for (ords) |o| {
                 if (o == NO_MATCH) {
@@ -2233,7 +2282,14 @@ pub const RegionWorker = struct {
                     break;
                 }
             }
-            if (all_match) return;
+            if (all_match) {
+                for (pay_views, s.pay) |pv, *dst| {
+                    try gatherColumnOpt(alloc, dst, pv, ords);
+                }
+                for (s.pay, fr.views[fr.width..][0..s.pay.len]) |*c, *v| v.* = c.view();
+                fr.width += s.pay.len;
+                return;
+            }
         }
 
         for (s.cols) |*c| c.clear();
@@ -2241,22 +2297,24 @@ pub const RegionWorker = struct {
         var keep: std.ArrayListUnmanaged(u32) = .empty;
         var match: std.ArrayListUnmanaged(u32) = .empty;
 
+        // One keep/match list across all ranges, then one scatter per
+        // column — range boundaries recorded as output offsets.
+        var range_start: u32 = 0;
         for (fr.ranges) |rng| {
-            keep.clearRetainingCapacity();
-            match.clearRetainingCapacity();
             for (rng[0]..rng[1]) |i| {
                 if (ords[i] == NO_MATCH) continue;
                 try keep.append(sa, @intCast(i));
                 try match.append(sa, ords[i]);
             }
-            const start: u32 = @intCast(s.cols[0].rowCount());
-            for (s.cols, fr.views[0..fr.width]) |*dst, v| {
-                try scatterColumn(alloc, dst, v, keep.items);
-            }
-            for (pay_views, s.pay) |pv, *dst| {
-                try gatherColumnOpt(alloc, dst, pv, match.items);
-            }
-            try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
+            const range_end: u32 = @intCast(keep.items.len);
+            try s.ranges.append(alloc, .{ range_start, range_end });
+            range_start = range_end;
+        }
+        for (s.cols, fr.views[0..fr.width]) |*dst, v| {
+            try scatterColumnRuns(alloc, dst, v, keep.items);
+        }
+        for (pay_views, s.pay) |pv, *dst| {
+            try gatherColumnOpt(alloc, dst, pv, match.items);
         }
 
         fr.width = s.cols.len + s.pay.len;
@@ -2281,9 +2339,10 @@ pub const RegionWorker = struct {
         var match: std.ArrayListUnmanaged(u32) = .empty;
         var chain: std.ArrayListUnmanaged(u32) = .empty;
 
+        // One keep/match list across all ranges, then one scatter per
+        // column — range boundaries recorded as output offsets.
+        var range_start: u32 = 0;
         for (fr.ranges) |rng| {
-            keep.clearRetainingCapacity();
-            match.clearRetainingCapacity();
             for (rng[0]..rng[1]) |i| {
                 const head = heads[i];
                 if (head == NO_MATCH) {
@@ -2304,14 +2363,15 @@ pub const RegionWorker = struct {
                     try match.append(sa, m2);
                 }
             }
-            const start: u32 = @intCast(s.cols[0].rowCount());
-            for (s.cols, fr.views[0..fr.width]) |*dst, v| {
-                try scatterColumn(alloc, dst, v, keep.items);
-            }
-            for (pay_views, s.pay) |pv, *dst| {
-                try gatherColumnOpt(alloc, dst, pv, match.items);
-            }
-            try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
+            const range_end: u32 = @intCast(keep.items.len);
+            try s.ranges.append(alloc, .{ range_start, range_end });
+            range_start = range_end;
+        }
+        for (s.cols, fr.views[0..fr.width]) |*dst, v| {
+            try scatterColumnRuns(alloc, dst, v, keep.items);
+        }
+        for (pay_views, s.pay) |pv, *dst| {
+            try gatherColumnOpt(alloc, dst, pv, match.items);
         }
 
         fr.width = s.cols.len + s.pay.len;
@@ -2569,6 +2629,7 @@ pub const RegionPool = struct {
         for (self.slots.items) |slot| {
             slot.rw.consolidate_ticks = 0;
             if (slot.rw.op_ticks) |ticks| @memset(ticks, 0);
+            if (slot.rw.probe_ticks) |ticks| @memset(ticks, .{ 0, 0, 0 });
         }
         while (self.slots.items.len < opts.n_threads) {
             const slot = try self.alloc.create(WorkerSlot);
@@ -3167,8 +3228,32 @@ pub fn runRegionOrdered(
             std.debug.print(" op{d}:{s}={d:.0}ms", .{ oi, @tagName(op), exec.prof.ticksToMs(t) });
         }
         std.debug.print("\n", .{});
+        printProbePhases(pool, prog, opts.n_threads);
     }
     pool.releaseRun();
+}
+
+/// Probe sub-phase breakdown (map build / probe loop / emit), CPU summed
+/// across workers; only ops with nonzero probe ticks print.
+fn printProbePhases(pool: *RegionPool, prog: *const Program, n_threads: usize) void {
+    var any = false;
+    for (prog.ops, 0..) |op, oi| {
+        var p: [3]i64 = .{ 0, 0, 0 };
+        for (pool.slots.items[0..n_threads]) |slot| {
+            if (slot.rw.probe_ticks) |ticks| {
+                for (0..3) |k| p[k] += ticks[oi][k];
+            }
+        }
+        if (p[0] + p[1] + p[2] == 0) continue;
+        if (!any) {
+            std.debug.print("[region]   probe-phases", .{});
+            any = true;
+        }
+        std.debug.print(" op{d}:{s}[map={d:.0} probe={d:.0} emit={d:.0}]", .{
+            oi, @tagName(op), exec.prof.ticksToMs(p[0]), exec.prof.ticksToMs(p[1]), exec.prof.ticksToMs(p[2]),
+        });
+    }
+    if (any) std.debug.print("\n", .{});
 }
 
 const OrderedExecPhase = struct {
@@ -3473,6 +3558,7 @@ pub fn runRegionPooled(
             std.debug.print(" op{d}:{s}={d:.0}ms", .{ oi, @tagName(op), exec.prof.ticksToMs(t) });
         }
         std.debug.print("\n", .{});
+        printProbePhases(pool, prog, opts.n_threads);
     }
 
     pool.releaseRun();
