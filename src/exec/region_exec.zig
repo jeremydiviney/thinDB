@@ -765,6 +765,64 @@ pub const Payload = struct {
     out_type: types.Type,
 };
 
+// ---- keyed_probe: generalized (multi-key, string-capable) probe -----------
+
+pub const MAX_KEYED_PAIRS = 4;
+/// Composite probe key: one i64 word per pair (ints verbatim, strings as
+/// build-side interner ids). Unused trailing words stay 0.
+pub const MultiKey = [MAX_KEYED_PAIRS]i64;
+pub const MultiKeyMap = std.AutoHashMapUnmanaged(MultiKey, u32);
+/// Build-side string domain: bytes → dense id (1-based; 0 never used so a
+/// probe-side miss can never collide with a real key word).
+pub const StrInterner = std.StringHashMapUnmanaged(u32);
+
+/// `int_from_str_build`: SQL numeric coercion across an int-probe /
+/// text-build equi-join (the report table stores externalPlanId as int, the
+/// plan catalog as text) — build strings parse to i64; unparsable build
+/// rows can never match an int and drop from the map.
+pub const KeyedPairKind = enum { int, str, int_from_str_build };
+pub const KeyedPair = struct {
+    /// Frame column (probe side).
+    probe: usize,
+    /// Side/build column (index into the side schema / broadcast views).
+    build: usize,
+    kind: KeyedPairKind,
+};
+
+pub const KeyedPayload = struct {
+    name: []const u8,
+    /// Side/build column the payload gathers from.
+    src: usize,
+    out_type: types.Type,
+};
+
+/// Compile-time-drained build side (small broadcast joins): map and
+/// interners are built once by the recognizer and shared read-only.
+pub const BroadcastSide = struct {
+    map: *const MultiKeyMap,
+    /// One interner per pair; null for int pairs.
+    interners: []const ?*const StrInterner,
+    /// Every build column as a view (indexed by KeyedPair.build /
+    /// KeyedPayload.src).
+    views: []const ColumnView,
+    rows: usize,
+};
+
+/// One co-partitioned side table of a region run: its own chunked scan +
+/// entry computes, scattered through its own exchange by the SAME route
+/// hash as the main scan — every potential match is then shard-local by
+/// construction. Sources are query-lifetime (rebuilt per run, like the
+/// main scan); the schema/derived slices must outlive the run.
+pub const SideInput = struct {
+    scan_schema: []const Column,
+    /// Side frame schema: scan output ++ entry-derived columns.
+    schema: []const Column,
+    sources: []exec.Query,
+    entry_derived: []const compute_mod.Derived,
+    /// Route key column in the side frame schema.
+    key_col: usize,
+};
+
 pub const RegionOp = union(enum) {
     /// Row-wise derived columns via the engine expression evaluator (one
     /// exec.Compute instance per worker, evalBatch over the whole shard).
@@ -801,6 +859,22 @@ pub const RegionOp = union(enum) {
         probe: usize,
         map: *const KeyMap,
         payload: []const Payload,
+        inner: bool,
+    },
+    /// Generalized probe: multi-column keys, int and string kinds. The build
+    /// side is either a compile-time-drained broadcast block or a
+    /// co-partitioned side table (`shard` = index into the run's sides; the
+    /// per-bin map is built in worker scratch — build keys must be UNIQUE,
+    /// a dup is a hard error because a LEFT 1:N match would change row
+    /// counts). Emit semantics match hash_probe (LEFT append / INNER
+    /// restructure).
+    keyed_probe: struct {
+        pairs: []const KeyedPair,
+        side: union(enum) {
+            broadcast: BroadcastSide,
+            shard: usize,
+        },
+        payload: []const KeyedPayload,
         inner: bool,
     },
     /// Row-aligned TVF over the whole shard (rf_currency class): one raw-ABI
@@ -900,6 +974,9 @@ pub const Program = struct {
         var max_width: usize = entry_schema.len;
 
         for (ops, 0..) |op, oi| {
+            errdefer if (getenv("THINDB_REGION_TRACE") != null) {
+                std.debug.print("[region] Program.build failed at op {d} ({s}), in width {d}\n", .{ oi, @tagName(op), schema_at[oi].len });
+            };
             if (output_schema.len != 0) return error.UnsupportedQueryShape;
             const in = schema_at[oi];
             schema_at[oi + 1] = switch (op) {
@@ -974,6 +1051,24 @@ pub const Program = struct {
                     }
                     break :blk cols;
                 },
+                .keyed_probe => |k| blk: {
+                    if (k.pairs.len == 0 or k.pairs.len > MAX_KEYED_PAIRS) return error.UnsupportedQueryShape;
+                    for (k.pairs) |p| {
+                        switch (p.kind) {
+                            .int, .int_from_str_build => try requireIntFamily(in, p.probe),
+                            .str => switch (in[try checkCol(in, p.probe)].type) {
+                                .varchar, .string, .char => {},
+                                else => return error.UnsupportedQueryShape,
+                            },
+                        }
+                    }
+                    const cols = try a.alloc(Column, in.len + k.payload.len);
+                    @memcpy(cols[0..in.len], in);
+                    for (k.payload, cols[in.len..]) |p, *col| {
+                        col.* = .{ .name = try a.dupe(u8, p.name), .type = p.out_type, .nullable = true };
+                    }
+                    break :blk cols;
+                },
                 .tvf_aligned => |t| blk: {
                     for (t.inputs) |c| _ = try checkCol(in, c);
                     const cols = try a.alloc(Column, in.len + t.out.len);
@@ -1001,12 +1096,27 @@ pub const Program = struct {
                         const seen = try a.alloc(bool, in.len);
                         @memset(seen, false);
                         for (t.spec.out, t.spec.inputs) |o, ci| {
-                            if (seen[ci]) return error.UnsupportedQueryShape;
+                            if (seen[ci]) {
+                                if (getenv("THINDB_REGION_TRACE") != null) {
+                                    std.debug.print("[region] union_append: dup coverage of frame col {d} '{s}'\n", .{ ci, in[ci].name });
+                                }
+                                return error.UnsupportedQueryShape;
+                            }
                             seen[ci] = true;
-                            if (!std.meta.eql(o.type, in[ci].type)) return error.UnsupportedQueryShape;
+                            if (!std.meta.eql(o.type, in[ci].type)) {
+                                if (getenv("THINDB_REGION_TRACE") != null) {
+                                    std.debug.print("[region] union_append: type clash on frame col {d} '{s}' ({s} vs {s})\n", .{ ci, in[ci].name, @tagName(in[ci].type), @tagName(o.type) });
+                                }
+                                return error.UnsupportedQueryShape;
+                            }
                         }
                         for (seen, in) |covered, in_col| {
-                            if (!covered and !in_col.nullable) return error.UnsupportedQueryShape;
+                            if (!covered and !in_col.nullable) {
+                                if (getenv("THINDB_REGION_TRACE") != null) {
+                                    std.debug.print("[region] union_append: uncovered non-nullable col '{s}'\n", .{in_col.name});
+                                }
+                                return error.UnsupportedQueryShape;
+                            }
                         }
                         break :blk in;
                     }
@@ -1134,6 +1244,9 @@ pub const RegionWorker = struct {
     /// Per-op wall ticks (THINDB_REGION_TRACE only; null otherwise).
     op_ticks: ?[]i64 = null,
     consolidate_ticks: i64 = 0,
+    /// Co-partitioned side frames for the CURRENT bin (set by the shard
+    /// phase before runShardFrom; indexed by keyed_probe.side.shard).
+    side_data: []const ShardData = &.{},
 
     const OpState = union(enum) {
         compute: ComputeInstance,
@@ -1147,15 +1260,19 @@ pub const RegionWorker = struct {
             sub_first: std.ArrayListUnmanaged(u32) = .empty,
             map: std.AutoHashMapUnmanaged(SubKey, u32) = .empty,
         },
-        hash_probe: struct {
-            /// Full-frame compaction stores (inner only; empty for LEFT).
-            cols: []ColumnStore,
-            pay: []ColumnStore,
-            ranges: std.ArrayListUnmanaged([2]u32) = .empty,
-        },
+        hash_probe: ProbeState,
+        keyed_probe: ProbeState,
         tvf: TvfState,
         const_cols: struct { out: []ColumnStore },
         emit: void,
+    };
+
+    /// Shared state shape for both probe op kinds.
+    const ProbeState = struct {
+        /// Full-frame compaction stores (inner only; empty for LEFT).
+        cols: []ColumnStore,
+        pay: []ColumnStore,
+        ranges: std.ArrayListUnmanaged([2]u32) = .empty,
     };
 
     /// Shared state shape for both TVF op kinds. The worker arena + state
@@ -1211,6 +1328,17 @@ pub const RegionWorker = struct {
                     else
                         try alloc.alloc(ColumnStore, 0);
                     break :blk .{ .hash_probe = .{ .cols = cols, .pay = pay } };
+                },
+                .keyed_probe => |k| blk: {
+                    const out_schema = prog.schema_at[oi + 1];
+                    const n_in = out_schema.len - k.payload.len;
+                    const pay = try initStores(alloc, out_schema[n_in..]);
+                    errdefer freeStores(alloc, pay);
+                    const cols: []ColumnStore = if (k.inner)
+                        try initStores(alloc, out_schema[0..n_in])
+                    else
+                        try alloc.alloc(ColumnStore, 0);
+                    break :blk .{ .keyed_probe = .{ .cols = cols, .pay = pay } };
                 },
                 .tvf_aligned => blk: {
                     const out = try initStores(alloc, prog.schema_at[oi + 1][prog.schema_at[oi].len..]);
@@ -1316,7 +1444,7 @@ pub const RegionWorker = struct {
                 s.sub_first.deinit(alloc);
                 s.map.deinit(alloc);
             },
-            .hash_probe => |*s| {
+            .hash_probe, .keyed_probe => |*s| {
                 freeStores(alloc, s.cols);
                 freeStores(alloc, s.pay);
                 s.ranges.deinit(alloc);
@@ -1349,7 +1477,7 @@ pub const RegionWorker = struct {
                 for (s.cols) |*c| n += storeRetainedBytes(c);
                 for (s.cells) |*l| n += l.capacity * @sizeOf(AccCell);
             },
-            .hash_probe => |*s| {
+            .hash_probe, .keyed_probe => |*s| {
                 for (s.cols) |*c| n += storeRetainedBytes(c);
                 for (s.pay) |*c| n += storeRetainedBytes(c);
             },
@@ -1434,6 +1562,7 @@ pub const RegionWorker = struct {
                 },
                 .group_agg => |g| try self.runGroupAgg(g, &st.group_agg, &fr),
                 .hash_probe => |h| try self.runHashProbe(h, &st.hash_probe, &fr),
+                .keyed_probe => |k| try self.runKeyedProbe(k, &st.keyed_probe, &fr),
                 .tvf_aligned => |t| try self.runTvfAligned(t, &st.tvf, &fr),
                 .tvf_grouped => |t| if (t.aligned_append)
                     try self.runTvfGroupedAligned(t, &st.tvf, &fr)
@@ -1935,15 +2064,112 @@ pub const RegionWorker = struct {
         return ords;
     }
 
-    fn runHashProbe(self: *RegionWorker, h: anytype, s: anytype, fr: *Frame) !void {
+    fn runHashProbe(self: *RegionWorker, h: anytype, s: *ProbeState, fr: *Frame) !void {
+        const sa = self.scratch.allocator();
+        const ords = try probeMatchOrds(sa, h.map, fr.views[h.probe], fr.rows);
+        const pay_views = try sa.alloc(ColumnView, h.payload.len);
+        for (h.payload, pay_views) |p, *v| v.* = p.view;
+        try self.emitProbe(s, fr, ords, pay_views, h.inner);
+    }
+
+    fn runKeyedProbe(self: *RegionWorker, k: anytype, s: *ProbeState, fr: *Frame) !void {
+        const sa = self.scratch.allocator();
+
+        var map_storage: MultiKeyMap = .empty;
+        var interner_storage: [MAX_KEYED_PAIRS]StrInterner = @splat(.empty);
+        var map: *const MultiKeyMap = undefined;
+        var interners_buf: [MAX_KEYED_PAIRS]?*const StrInterner = @splat(null);
+        var interners: []const ?*const StrInterner = undefined;
+        var build_views: []const ColumnView = undefined;
+
+        switch (k.side) {
+            .broadcast => |b| {
+                map = b.map;
+                interners = b.interners;
+                build_views = b.views;
+            },
+            .shard => |si| {
+                // Co-partitioned side: build the map over THIS bin's side
+                // rows (scratch-lifetime; capacity retained by the arena).
+                const sd = &self.side_data[si];
+                const views = try sa.alloc(ColumnView, sd.cols.len);
+                for (sd.cols, views) |*c, *v| v.* = c.view();
+                build_views = views;
+                for (k.pairs, 0..) |p, pi| {
+                    if (p.kind == .str) interners_buf[pi] = &interner_storage[pi];
+                }
+                rows: for (0..sd.rows) |i| {
+                    var key: MultiKey = @splat(0);
+                    for (k.pairs, 0..) |p, pi| {
+                        const v = views[p.build];
+                        switch (p.kind) {
+                            .int => key[pi] = intAt(v, i) orelse continue :rows,
+                            .int_from_str_build => {
+                                if (!v.isValid(i)) continue :rows;
+                                const bytes = stringViewOf(v).rowBytes(i);
+                                key[pi] = std.fmt.parseInt(i64, bytes, 10) catch continue :rows;
+                            },
+                            .str => {
+                                if (!v.isValid(i)) continue :rows;
+                                const gop = try interner_storage[pi].getOrPut(sa, stringViewOf(v).rowBytes(i));
+                                if (!gop.found_existing) gop.value_ptr.* = @intCast(interner_storage[pi].count());
+                                key[pi] = gop.value_ptr.*;
+                            },
+                        }
+                    }
+                    const gop = try map_storage.getOrPut(sa, key);
+                    // A dup build key would make a LEFT match 1:N and change
+                    // row counts — a hard error, never a silent pick.
+                    if (gop.found_existing) return error.UnsupportedQueryShape;
+                    gop.value_ptr.* = @intCast(i);
+                }
+                map = &map_storage;
+                interners = interners_buf[0..k.pairs.len];
+            },
+        }
+
+        const ords = try sa.alloc(u32, fr.rows);
+        rows: for (0..fr.rows) |i| {
+            var key: MultiKey = @splat(0);
+            for (k.pairs, 0..) |p, pi| {
+                const v = fr.views[p.probe];
+                switch (p.kind) {
+                    .int, .int_from_str_build => key[pi] = intAt(v, i) orelse {
+                        ords[i] = NO_MATCH;
+                        continue :rows;
+                    },
+                    .str => {
+                        if (!v.isValid(i)) {
+                            ords[i] = NO_MATCH;
+                            continue :rows;
+                        }
+                        const interner = interners[pi].?;
+                        key[pi] = interner.get(stringViewOf(v).rowBytes(i)) orelse {
+                            ords[i] = NO_MATCH;
+                            continue :rows;
+                        };
+                    },
+                }
+            }
+            ords[i] = map.get(key) orelse NO_MATCH;
+        }
+
+        const pay_views = try sa.alloc(ColumnView, k.payload.len);
+        for (k.payload, pay_views) |p, *v| v.* = build_views[p.src];
+        try self.emitProbe(s, fr, ords, pay_views, k.inner);
+    }
+
+    /// Shared probe emit: LEFT appends payload columns (NULL on miss);
+    /// INNER additionally drops non-matching rows (frame restructure,
+    /// ranges rewritten).
+    fn emitProbe(self: *RegionWorker, s: *ProbeState, fr: *Frame, ords: []const u32, pay_views: []const ColumnView, inner: bool) !void {
         const alloc = self.alloc;
         const sa = self.scratch.allocator();
         for (s.pay) |*c| c.clear();
-        const ords = try probeMatchOrds(sa, h.map, fr.views[h.probe], fr.rows);
 
-        if (!h.inner) {
-            for (h.payload, s.pay) |p, *dst| {
-                try gatherColumnOpt(alloc, dst, p.view, ords);
+        if (!inner) {
+            for (pay_views, s.pay) |pv, *dst| {
+                try gatherColumnOpt(alloc, dst, pv, ords);
             }
             for (s.pay, fr.views[fr.width..][0..s.pay.len]) |*c, *v| v.* = c.view();
             fr.width += s.pay.len;
@@ -1952,7 +2178,7 @@ pub const RegionWorker = struct {
 
         // Pure-filter inner probe (no payload) where every row matches:
         // the frame is untouched — skip the full restructure copy.
-        if (h.payload.len == 0) {
+        if (pay_views.len == 0) {
             var all_match = true;
             for (ords) |o| {
                 if (o == NO_MATCH) {
@@ -1980,8 +2206,8 @@ pub const RegionWorker = struct {
             for (s.cols, fr.views[0..fr.width]) |*dst, v| {
                 try scatterColumn(alloc, dst, v, keep.items);
             }
-            for (h.payload, s.pay) |p, *dst| {
-                try gatherColumnOpt(alloc, dst, p.view, match.items);
+            for (pay_views, s.pay) |pv, *dst| {
+                try gatherColumnOpt(alloc, dst, pv, match.items);
             }
             try s.ranges.append(alloc, .{ start, @intCast(s.cols[0].rowCount()) });
         }
@@ -1993,6 +2219,20 @@ pub const RegionWorker = struct {
         fr.ranges = s.ranges.items;
     }
 };
+
+/// Int-family view read (NULL → null). Mirrors the recognizer's i64At.
+fn intAt(v: ColumnView, i: usize) ?i64 {
+    if (!v.isValid(i)) return null;
+    return switch (v.data) {
+        .tinyint => |s| s[i],
+        .smallint => |s| s[i],
+        .int => |s| s[i],
+        .bigint => |s| s[i],
+        .date => |s| s[i],
+        .datetime => |s| s[i],
+        else => null,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Region driver: E1 (parallel drain + entry compute + exchange scatter) and
@@ -2124,6 +2364,9 @@ pub const RegionPool = struct {
     prog: ?*const Program = null,
     n_shards: usize = 0,
     ex: ?Exchange = null,
+    /// One exchange per co-partitioned side table (same n_shards / route
+    /// hash as the main exchange).
+    side_ex: []Exchange = &.{},
     /// Ordered-mode per-interval stores (pooled instead of exchange buckets).
     ivs: []OrderedInterval = &.{},
     slots: std.ArrayListUnmanaged(*WorkerSlot) = .empty,
@@ -2131,6 +2374,8 @@ pub const RegionPool = struct {
     pub const WorkerSlot = struct {
         rw: RegionWorker,
         sd: ShardData = .{},
+        /// Per-side gathered frames for the slot's CURRENT bin.
+        sides: []ShardData = &.{},
         scratch: std.heap.ArenaAllocator,
     };
 
@@ -2147,6 +2392,9 @@ pub const RegionPool = struct {
     fn reset(self: *RegionPool) void {
         if (self.ex) |*ex| ex.deinit();
         self.ex = null;
+        for (self.side_ex) |*ex| ex.deinit();
+        self.alloc.free(self.side_ex);
+        self.side_ex = &.{};
         for (self.ivs) |*iv| {
             iv.sd.deinit(self.alloc);
             iv.runs.deinit(self.alloc);
@@ -2156,6 +2404,8 @@ pub const RegionPool = struct {
         for (self.slots.items) |slot| {
             slot.rw.deinit();
             slot.sd.deinit(self.alloc);
+            for (slot.sides) |*sd| sd.deinit(self.alloc);
+            self.alloc.free(slot.sides);
             slot.scratch.deinit();
             self.alloc.destroy(slot);
         }
@@ -2166,7 +2416,7 @@ pub const RegionPool = struct {
     /// Prepare the pool for a run of `prog`: reuse (clear) when the program
     /// and shape match the previous run, rebuild otherwise. Ordered mode
     /// pools per-interval stores instead of exchange buckets.
-    fn acquire(self: *RegionPool, prog: *const Program, opts: DriverOpts) !void {
+    fn acquire(self: *RegionPool, prog: *const Program, opts: DriverOpts, sides: []const SideInput) !void {
         if (opts.ordered) {
             const match = self.prog == prog and self.ivs.len == opts.n_shards;
             if (!match) {
@@ -2189,14 +2439,27 @@ pub const RegionPool = struct {
             }
         } else {
             const match = self.prog == prog and self.n_shards == opts.n_shards and
-                self.ex != null and self.ex.?.n_workers == opts.n_threads;
+                self.ex != null and self.ex.?.n_workers == opts.n_threads and
+                self.side_ex.len == sides.len;
             if (!match) {
                 self.reset();
                 self.ex = try Exchange.init(self.alloc, prog.schema_at[0], opts.n_threads, opts.n_shards, opts.key_col);
                 self.prog = prog;
                 self.n_shards = opts.n_shards;
+                const side_ex = try self.alloc.alloc(Exchange, sides.len);
+                var built: usize = 0;
+                errdefer {
+                    for (side_ex[0..built]) |*ex| ex.deinit();
+                    self.alloc.free(side_ex);
+                }
+                for (sides, side_ex) |side, *ex| {
+                    ex.* = try Exchange.init(self.alloc, side.schema, opts.n_threads, opts.n_shards, side.key_col);
+                    built += 1;
+                }
+                self.side_ex = side_ex;
             } else {
                 self.ex.?.clear();
+                for (self.side_ex) |*ex| ex.clear();
             }
         }
         // Tick counters are per-RUN in the trace output; without this the
@@ -2208,8 +2471,12 @@ pub const RegionPool = struct {
         while (self.slots.items.len < opts.n_threads) {
             const slot = try self.alloc.create(WorkerSlot);
             errdefer self.alloc.destroy(slot);
+            const slot_sides = try self.alloc.alloc(ShardData, sides.len);
+            errdefer self.alloc.free(slot_sides);
+            @memset(slot_sides, .{});
             slot.* = .{
                 .rw = try RegionWorker.init(self.alloc, prog),
+                .sides = slot_sides,
                 .scratch = std.heap.ArenaAllocator.init(self.alloc),
             };
             try self.slots.append(self.alloc, slot);
@@ -2234,12 +2501,20 @@ pub const RegionPool = struct {
                 for (b.cols) |*c| n += storeRetainedBytes(c);
             }
         }
+        for (self.side_ex) |*ex| {
+            for (ex.buckets) |b| {
+                for (b.cols) |*c| n += storeRetainedBytes(c);
+            }
+        }
         for (self.ivs) |*iv| {
             for (iv.sd.cols) |*c| n += storeRetainedBytes(c);
         }
         for (self.slots.items) |slot| {
             n += slot.rw.retainedBytes();
             for (slot.sd.cols) |*c| n += storeRetainedBytes(c);
+            for (slot.sides) |*sd| {
+                for (sd.cols) |*c| n += storeRetainedBytes(c);
+            }
             n += slot.scratch.queryCapacity();
         }
         return n;
@@ -2267,7 +2542,16 @@ const ScanPhase = struct {
     scan_schema: []const Column,
     registry: ?*const udf_mod.UdfRegistry,
     sort_cols: []const OrderCol,
+    /// Co-partitioned side tables: one exchange + claim counter each; side
+    /// buckets are never sorted (the probe map doesn't need order).
+    sides: []SideScan,
     errs: []?anyerror,
+
+    const SideScan = struct {
+        ex: *Exchange,
+        input: *const SideInput,
+        next: std.atomic.Value(usize) = .init(0),
+    };
 
     fn worker(self: *ScanPhase, w: usize) void {
         var lease = core_scheduler.global().tryAcquire();
@@ -2293,6 +2577,23 @@ const ScanPhase = struct {
             while (try self.sources[i].next()) |batch| {
                 const routed = if (inst) |*ci| try ci.ptr.evalBatch(batch) else batch;
                 try wk.push(routed);
+            }
+        }
+        for (self.sides) |*side| {
+            var swk = try side.ex.worker(w);
+            defer swk.deinit();
+            var sinst: ?ComputeInstance = null;
+            defer if (sinst) |*i| i.q.deinit();
+            if (side.input.entry_derived.len > 0) {
+                sinst = try makeComputeInstance(side.ex.alloc, side.input.scan_schema, side.input.entry_derived, self.registry);
+            }
+            while (true) {
+                const i = side.next.fetchAdd(1, .monotonic);
+                if (i >= side.input.sources.len) break;
+                while (try side.input.sources[i].next()) |batch| {
+                    const routed = if (sinst) |*ci| try ci.ptr.evalBatch(batch) else batch;
+                    try swk.push(routed);
+                }
             }
         }
         // This worker's buckets are complete — sort them here, where the
@@ -2422,6 +2723,7 @@ const ShardPhase = struct {
     next: std.atomic.Value(usize) = .init(0),
     result: *RegionResult,
     slots: []const *RegionPool.WorkerSlot,
+    side_ex: []Exchange,
     errs: []?anyerror,
 
     fn worker(self: *ShardPhase, w: usize) void {
@@ -2448,6 +2750,22 @@ const ShardPhase = struct {
             for (bin.members) |s| {
                 try consolidateAppendTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
             }
+            // Side frames for this bin: plain per-partition bucket appends —
+            // no sort, the keyed_probe map is order-insensitive.
+            for (self.side_ex, slot.sides) |*sex, *ssd| {
+                try ssd.ensure(sex.alloc, sex.schema);
+                for (bin.members) |s| {
+                    for (0..sex.n_workers) |sw| {
+                        const bkt = sex.bucket(sw, s);
+                        if (bkt.rows == 0) continue;
+                        for (ssd.cols, bkt.cols) |*dst, *src| {
+                            try appendViewRange(sex.alloc, dst, src.view(), 0, bkt.rows);
+                        }
+                    }
+                }
+                ssd.rows = if (ssd.cols.len > 0) ssd.cols[0].rowCount() else 0;
+            }
+            rw.side_data = slot.sides;
             if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
             const out = &self.result.shards[bi];
             try rw.runShardFrom(&slot.sd, out.cols, start_op);
@@ -2473,7 +2791,7 @@ pub fn runRegion(
 ) !void {
     var pool = RegionPool.init(alloc, 0);
     defer pool.deinit();
-    return runRegionPooled(scan_schema, sources, entry_derived, prog, opts, result, &pool);
+    return runRegionPooled(scan_schema, sources, entry_derived, &.{}, prog, opts, result, &pool);
 }
 
 /// Order-aligned driver (#186): each source IS one key interval of a table
@@ -2535,7 +2853,7 @@ pub fn runRegionOrdered(
     pool: *RegionPool,
 ) !void {
     const alloc = pool.alloc;
-    try pool.acquire(prog, opts);
+    try pool.acquire(prog, opts, &.{});
 
     const errs = try alloc.alloc(?anyerror, opts.n_threads);
     defer alloc.free(errs);
@@ -2866,14 +3184,24 @@ pub fn runRegionPooled(
     scan_schema: []const Column,
     sources: []exec.Query,
     entry_derived: []const compute_mod.Derived,
+    sides: []const SideInput,
     prog: *const Program,
     opts: DriverOpts,
     result: *RegionResult,
     pool: *RegionPool,
 ) !void {
-    if (opts.ordered) return runRegionOrdered(scan_schema, sources, entry_derived, prog, opts, result, pool);
+    if (opts.ordered) {
+        // Order-aligned mode has no exchange to co-partition a side through.
+        if (sides.len > 0) return error.UnsupportedQueryShape;
+        return runRegionOrdered(scan_schema, sources, entry_derived, prog, opts, result, pool);
+    }
     const alloc = pool.alloc;
-    try pool.acquire(prog, opts);
+    const trace = getenv("THINDB_REGION_TRACE") != null;
+    const t_acq = if (trace) exec.prof.nowTicks() else 0;
+    try pool.acquire(prog, opts, sides);
+    if (trace) {
+        std.debug.print("[region] pool acquire={d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - t_acq)});
+    }
     const ex = &pool.ex.?;
 
     const errs = try alloc.alloc(?anyerror, opts.n_threads);
@@ -2882,9 +3210,13 @@ pub fn runRegionPooled(
     const threads = try alloc.alloc(std.Thread, opts.n_threads);
     defer alloc.free(threads);
 
-    const trace = getenv("THINDB_REGION_TRACE") != null;
     const t0 = if (trace) exec.prof.nowTicks() else 0;
 
+    const side_scans = try alloc.alloc(ScanPhase.SideScan, sides.len);
+    defer alloc.free(side_scans);
+    for (sides, pool.side_ex, side_scans) |*side, *sex, *ss| {
+        ss.* = .{ .ex = sex, .input = side };
+    }
     var scan_phase = ScanPhase{
         .ex = ex,
         .sources = sources,
@@ -2892,6 +3224,7 @@ pub fn runRegionPooled(
         .scan_schema = scan_schema,
         .registry = prog.registry,
         .sort_cols = opts.sort_cols,
+        .sides = side_scans,
         .errs = errs,
     };
     var spawned: usize = 0;
@@ -2914,6 +3247,7 @@ pub fn runRegionPooled(
         .bins = bins,
         .result = result,
         .slots = pool.slots.items[0..opts.n_threads],
+        .side_ex = pool.side_ex,
         .errs = errs,
     };
     spawned = 0;
@@ -3064,6 +3398,8 @@ pub const RegionExecOp = struct {
     /// Owned; drained by the run and released immediately after it.
     sources: []exec.Query,
     entry_derived: []const compute_mod.Derived,
+    /// Co-partitioned side tables (owned; side sources drained by the run).
+    sides: []SideInput,
     prog: *const Program,
     opts: DriverOpts,
     /// Plan-owned pool for repeated executions; null = one-shot.
@@ -3091,6 +3427,7 @@ pub const RegionExecOp = struct {
         scan_schema: []const Column,
         sources: []exec.Query,
         entry_derived: []const compute_mod.Derived,
+        sides: []SideInput,
         prog: *const Program,
         opts: DriverOpts,
         pool: ?*RegionPool,
@@ -3105,6 +3442,7 @@ pub const RegionExecOp = struct {
             .scan_schema = scan_schema,
             .sources = sources,
             .entry_derived = entry_derived,
+            .sides = sides,
             .prog = prog,
             .opts = opts,
             .pool = pool,
@@ -3114,9 +3452,19 @@ pub const RegionExecOp = struct {
         return exec.makeQuery(allocator, self);
     }
 
+    fn releaseSides(self: *RegionExecOp) void {
+        for (self.sides) |*side| {
+            for (side.sources) |*s| s.deinit();
+            self.allocator.free(side.sources);
+        }
+        self.allocator.free(self.sides);
+        self.sides = &.{};
+    }
+
     pub fn deinit(self: *RegionExecOp) void {
         for (self.sources) |*s| s.deinit();
         self.allocator.free(self.sources);
+        self.releaseSides();
         if (self.result) |*r| r.deinit();
         self.allocator.free(self.views_buf);
         const owned_ctx = self.owned_ctx;
@@ -3128,17 +3476,24 @@ pub const RegionExecOp = struct {
 
     pub fn ensureExecuted(self: *RegionExecOp) !void {
         if (self.result != null) return;
+        const trace = getenv("THINDB_REGION_TRACE") != null;
+        const t_all = if (trace) exec.prof.nowTicks() else 0;
         var result = try RegionResult.init(self.allocator, self.prog.output_schema, self.opts.n_shards);
         errdefer result.deinit();
+        defer if (trace) {
+            std.debug.print("[region] ensureExecuted total={d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - t_all)});
+        };
         if (self.pool) |p| {
-            try runRegionPooled(self.scan_schema, self.sources, self.entry_derived, self.prog, self.opts, &result, p);
+            try runRegionPooled(self.scan_schema, self.sources, self.entry_derived, self.sides, self.prog, self.opts, &result, p);
         } else {
+            if (self.sides.len > 0) return error.UnsupportedQueryShape;
             try runRegion(self.allocator, self.scan_schema, self.sources, self.entry_derived, self.prog, self.opts, &result);
         }
         // The scans' buffers are dead weight from here — release them now.
         for (self.sources) |*s| s.deinit();
         self.allocator.free(self.sources);
         self.sources = &.{};
+        self.releaseSides();
         self.result = result;
     }
 
@@ -3170,6 +3525,14 @@ pub const RegionExecOp = struct {
 
     pub fn outputSchema(self: *RegionExecOp) []const Column {
         return self.prog.output_schema;
+    }
+
+    /// Emitted views point at the materialized per-shard result stores,
+    /// which live until deinit/takeOwnedChunks — batches stay valid across
+    /// next() calls, so a contiguous-stage consumer may fill in parallel.
+    pub fn stableData(self: *RegionExecOp) bool {
+        _ = self;
+        return true;
     }
 
     pub fn addPrune(self: *RegionExecOp, pred: exec.Predicate) !void {
@@ -4277,7 +4640,7 @@ test "region pool: repeated runs reuse cleared state; cap evicts at release" {
             .row_count = K.len,
         })};
         defer srcs[0].deinit();
-        try runRegionPooled(&entry, &srcs, &.{}, &prog, opts, &result, &pool);
+        try runRegionPooled(&entry, &srcs, &.{}, &.{}, &prog, opts, &result, &pool);
         try testing.expectEqual(@as(usize, 3), result.totalRows());
         var sum: i64 = 0;
         for (result.shards) |s| {
@@ -4300,7 +4663,7 @@ test "region pool: repeated runs reuse cleared state; cap evicts at release" {
         .row_count = K.len,
     })};
     defer srcs[0].deinit();
-    try runRegionPooled(&entry, &srcs, &.{}, &prog, opts, &result, &pool);
+    try runRegionPooled(&entry, &srcs, &.{}, &.{}, &prog, opts, &result, &pool);
     try testing.expectEqual(@as(usize, 3), result.totalRows());
     try testing.expect(pool.ex == null);
     try testing.expectEqual(@as(usize, 0), pool.retainedBytes());
@@ -4317,7 +4680,7 @@ fn tMakeRegionOp(alloc: Allocator, prog: *const Program, entry: []const Column, 
     const sort_cols_static = struct {
         const cols = [_]OrderCol{.{ .col = 0, .kind = .string }};
     };
-    return RegionExecOp.create(alloc, entry, sources, &.{}, prog, .{
+    return RegionExecOp.create(alloc, entry, sources, &.{}, &.{}, prog, .{
         .n_threads = 1,
         .n_shards = 4,
         .key_col = 0,

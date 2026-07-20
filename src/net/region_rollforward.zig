@@ -122,10 +122,15 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                 };
                 if (conforms) {
                     any_conforming = true;
-                    if (tryCachedAt(input, cur)) |q| {
+                    // Hash ONCE per boundary and share it between the hit
+                    // attempt and the store: recognize-time subtree drains
+                    // can benignly rewrite IR (scalar resolution), and a
+                    // recomputed hash would never match its own store.
+                    const bh = hashAnchor(cur);
+                    if (tryCachedAt(input, cur, bh)) |q| {
                         return .{ .anchor = cur, .query = q };
                     }
-                    if (buildRegion(input, cur, keys)) |q| {
+                    if (buildRegion(input, cur, keys, bh)) |q| {
                         return .{ .anchor = cur, .query = q };
                     } else |e| {
                         if (e == error.OutOfMemory) return e;
@@ -311,11 +316,25 @@ fn poolCapBytes() usize {
 /// (catches appends within a generation) + the segment set. Read under the
 /// table mutex so the triple is coherent. Compaction changes the segment set
 /// without changing values — a spurious invalidation, which is safe.
-fn tableVersionOf(db: anytype, name: []const u8) ?u64 {
-    const t = db.openTable(name, .{}) catch return null;
+fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
+    var is_temp = false;
+    const t = blk: {
+        if (input.session.temp_namespace) |ns| {
+            if (ns.findTable(name)) |tt| {
+                is_temp = true;
+                break :blk tt;
+            }
+        }
+        break :blk input.db.openTable(name, .{}) catch return null;
+    };
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
     var h = std.hash.Wyhash.init(0x7461626c65);
+    // Temp tables: gen/row counters restart on DROP+CREATE, so identical
+    // counts with DIFFERENT contents would validate a stale drained block.
+    // The instance pointer makes every recreation an invalidation; only
+    // same-session reuse of the same temp instance can hit.
+    if (is_temp) hu(&h, @intFromPtr(t));
     hu(&h, t.memtable_gen);
     hu(&h, t.memtable.row_count);
     for (t.manifest.segments.items) |e| {
@@ -366,7 +385,12 @@ fn recordTableVersion(b: *Builder, name: []const u8) !void {
     for (b.ctx.versions.items) |v| {
         if (std.ascii.eqlIgnoreCase(v.name, name)) return;
     }
-    const ver = tableVersionOf(b.input.db, name) orelse return Unhashable;
+    const ver = tableVersionOf(b.input, name) orelse {
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] table '{s}' unversionable — ctx uncacheable\n", .{name});
+        }
+        return Unhashable;
+    };
     try b.ctx.versions.append(b.a, .{ .name = try b.a.dupe(u8, name), .version = ver });
 }
 
@@ -380,18 +404,21 @@ fn cacheValid(input: engine_v2.CompileInput, ctx: *Ctx) bool {
         if (e.process != k.process) return false;
     }
     for (ctx.versions.items) |v| {
-        const now = tableVersionOf(input.db, v.name) orelse return false;
+        const now = tableVersionOf(input, v.name) orelse return false;
         if (now != v.version) return false;
     }
     return true;
 }
 
-fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op) ?exec.Query {
-    const hash = hashAnchor(anchor) orelse return null;
+fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash: ?u64) ?exec.Query {
+    const hash = anchor_hash orelse return null;
     const cache = cacheFor(input.db) orelse return null;
 
     cache.mu.lock();
     if (cache.busy or cache.ctx == null or cache.hash != hash) {
+        if (cache.ctx != null and cache.hash != hash and getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] cache miss: hash {x} vs stored {x}\n", .{ hash, cache.hash });
+        }
         cache.mu.unlock();
         return null;
     }
@@ -437,11 +464,16 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op) ?exec.Query 
 /// program's — any DDL drift on the scan table declines to a full build.
 fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !exec.Query {
     const qa = input.allocator;
-    const pl = try collectPipeline(input.node_arena, anchor);
+    var pl = try collectPipeline(input.node_arena, anchor);
 
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
     defer prune_leaves.deinit(qa);
     try collectAndLeaves(qa, pl.entry_filter, &prune_leaves);
+
+    const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
+    // Same entry transformation as the build path — the cached program's
+    // entry schema was derived post-hoist.
+    try hoistEntryComputes(input.node_arena, table, &pl);
 
     var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
     defer scan_cols.deinit(qa);
@@ -455,8 +487,6 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         }
         scan_cols_opt = scan_cols.items;
     }
-
-    const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
     const n_threads = @max(input.effectiveDop(), 1);
     const bs = if (ctx.opts.ordered)
         try buildOrderedSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, ctx.opts.n_threads, lastSegment(anchor.materialize.region_keys.?[0]))
@@ -477,13 +507,16 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
 
     const scan_schema = bs.sources[0].outputSchema();
     const want = ctx.entry_schema;
-    if (scan_schema.len + pl.entry_derived.len != want.len) return NoMatch;
-    const rowloc_entry = scan_schema.len - 1;
-    for (scan_schema, want[0..scan_schema.len], 0..) |src, w, i| {
+    if (scan_schema.len + pl.entry_derived.len != want.len) {
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] cached entry drift: widths {d}+{d} vs {d}\n", .{ scan_schema.len, pl.entry_derived.len, want.len });
+        }
+        return NoMatch;
+    }
+    for (scan_schema, want[0..scan_schema.len]) |src, w| {
         if (!std.ascii.eqlIgnoreCase(src.name, w.name)) return NoMatch;
         if (!std.meta.eql(src.type, w.type)) return NoMatch;
-        const want_nullable = if (i == rowloc_entry) true else src.nullable;
-        if (w.nullable != want_nullable) return NoMatch;
+        if (!w.nullable) return NoMatch; // entry cols are always forced nullable
     }
     for (pl.entry_derived, want[scan_schema.len..]) |d, w| {
         if (!std.ascii.eqlIgnoreCase(d.name, w.name)) return NoMatch;
@@ -493,17 +526,50 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     opts.n_threads = n_threads;
     opts.iv_rows_est = bs.iv_rows;
 
+    // Side tables: fresh snapshot scans from the cached recipes, with the
+    // same schema-drift guard the entry gets.
+    const op_sides = try qa.alloc(region.SideInput, ctx.side_specs.items.len);
+    var sides_built: usize = 0;
+    var sides_owned = true;
+    errdefer if (sides_owned) {
+        for (op_sides[0..sides_built]) |*side| {
+            for (side.sources) |*sq| sq.deinit();
+            qa.free(side.sources);
+        }
+        qa.free(op_sides);
+    };
+    for (ctx.side_specs.items, op_sides) |*spec, *s| {
+        const st = input.db.openTable(spec.table, .{}) catch return NoMatch;
+        const sbs = try buildScanSources(input, st, spec.prune, spec.filter, spec.scan_cols, n_threads);
+        s.* = .{
+            .scan_schema = spec.scan_schema,
+            .schema = spec.schema,
+            .sources = sbs.sources,
+            .entry_derived = spec.entry_derived,
+            .key_col = spec.key_col,
+        };
+        sides_built += 1;
+        const ss = sbs.sources[0].outputSchema();
+        if (ss.len != spec.scan_schema.len) return NoMatch;
+        for (ss, spec.scan_schema) |src, w| {
+            if (!std.ascii.eqlIgnoreCase(src.name, w.name)) return NoMatch;
+            if (!std.meta.eql(src.type, w.type)) return NoMatch;
+        }
+    }
+
     const q = try region.RegionExecOp.create(
         qa,
         ctx.entry_schema,
         bs.sources,
         pl.entry_derived,
+        op_sides,
         &ctx.prog,
         opts,
         &ctx.pool,
         bs.total_rows * 2,
     );
     sources_owned = false;
+    sides_owned = false;
     return q;
 }
 
@@ -911,6 +977,10 @@ const Ctx = struct {
     /// Ordered mode: measured per-interval cost, filled by the first run
     /// and frozen — LPT weights for every later hit (arena-owned).
     iv_cost: []i64 = &.{},
+    /// Co-partitioned side tables: everything needed to rebuild a side's
+    /// scan sources per run (all arena-owned — the sources themselves are
+    /// query-lifetime and never cached).
+    side_specs: std.ArrayListUnmanaged(SideSpec) = .empty,
     versions: std.ArrayListUnmanaged(TableVersion) = .empty,
     kernels: std.ArrayListUnmanaged(KernelCheck) = .empty,
     uncacheable: bool = false,
@@ -926,12 +996,35 @@ const Ctx = struct {
     }
 };
 
+/// One co-partitioned side table (ctx-arena-owned rebuild recipe).
+const SideSpec = struct {
+    table: []const u8,
+    prune: []const predicate_mod.Predicate,
+    filter: PredicateExpr,
+    scan_cols: ?[]const []const u8,
+    entry_derived: []const Derived,
+    scan_schema: []const Column,
+    /// Side frame schema: scan output ++ entry-derived columns.
+    schema: []const Column,
+    /// Route key column in the side frame schema.
+    key_col: usize,
+};
+
 const Builder = struct {
     input: engine_v2.CompileInput,
     ctx: *Ctx,
     a: Allocator, // ctx arena allocator
     fb: FrameB,
     ops: std.ArrayListUnmanaged(region.RegionOp) = .empty,
+    /// Canonical frame name of the route key (declared_keys[0]) — the side
+    /// of a co-partitioned join must bind to it through an ON pair.
+    route_name: []const u8 = &.{},
+    order_aligned: bool = false,
+    /// Side-table dedupe: the IR node each side spec was compiled from
+    /// (ctc/ctl reference the SAME materialized CTE — one side, two probes).
+    side_nodes: std.ArrayListUnmanaged(*const ir.Op) = .empty,
+    /// Per-side scan sources (query-lifetime; the RegionExecOp takes them).
+    side_sources: std.ArrayListUnmanaged([]exec.Query) = .empty,
     /// Consolidation range-key NAMES, resolved against the CURRENT frame at
     /// every partition check — frame-replacing ops (group_agg, replace-TVF)
     /// keep the names by contract, so name resolution survives epochs that
@@ -1393,6 +1486,142 @@ fn valueAtRow(v: ColumnView, i: usize) !?Value {
         else => NoMatch,
     };
 }
+
+// ---- plain deep clones (no frame rewriting) --------------------------------
+// Side-table expressions resolve against the SIDE scan — a FLAT single-table
+// namespace — so every col_ref normalizes to its last segment (the IR
+// qualifies refs with CTE/join aliases the hand-built side has no alias
+// nodes to resolve). Cloned into the ctx arena for the cached per-run
+// rebuild.
+
+fn cloneValuePlain(a: Allocator, v: Value) !Value {
+    return switch (v) {
+        .text => |s| .{ .text = try a.dupe(u8, s) },
+        else => v,
+    };
+}
+
+fn cloneExprPlain(a: Allocator, e: Expr) anyerror!Expr {
+    return switch (e) {
+        .col_ref => |name| .{ .col_ref = try a.dupe(u8, lastSegment(name)) },
+        .lit => |v| .{ .lit = try cloneValuePlain(a, v) },
+        .null_lit => |t| .{ .null_lit = t },
+        .call => |c| blk: {
+            const args = try a.alloc(Expr, c.args.len);
+            for (c.args, args) |src, *dst| dst.* = try cloneExprPlain(a, src);
+            break :blk .{ .call = .{ .fn_name = try a.dupe(u8, c.fn_name), .args = args } };
+        },
+        .case => |c| blk: {
+            const branches = try a.alloc(Expr.Branch, c.branches.len);
+            for (c.branches, branches) |src, *dst| {
+                dst.* = .{ .cond = try clonePredPlain(a, src.cond), .then = try cloneExprPlain(a, src.then) };
+            }
+            var else_branch: ?*const Expr = null;
+            if (c.else_branch) |eb| {
+                const p = try a.create(Expr);
+                p.* = try cloneExprPlain(a, eb.*);
+                else_branch = p;
+            }
+            break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch } };
+        },
+        else => NoMatch,
+    };
+}
+
+fn clonePredPlain(a: Allocator, p: PredicateExpr) anyerror!PredicateExpr {
+    return switch (p) {
+        .leaf => |l| .{ .leaf = try cloneLeafPlain(a, l) },
+        .day_leaf => |l| .{ .day_leaf = try cloneLeafPlain(a, l) },
+        .leaf_col_col => |cc| .{ .leaf_col_col = .{
+            .left = try a.dupe(u8, lastSegment(cc.left)),
+            .op = cc.op,
+            .right = try a.dupe(u8, lastSegment(cc.right)),
+        } },
+        .is_null => |name| .{ .is_null = try a.dupe(u8, lastSegment(name)) },
+        .is_not_null => |name| .{ .is_not_null = try a.dupe(u8, lastSegment(name)) },
+        .like => |l| .{ .like = .{
+            .col = try a.dupe(u8, lastSegment(l.col)),
+            .pattern = try a.dupe(u8, l.pattern),
+        } },
+        .@"and" => |kids| blk: {
+            const out = try a.alloc(PredicateExpr, kids.len);
+            for (kids, out) |src, *dst| dst.* = try clonePredPlain(a, src);
+            break :blk .{ .@"and" = out };
+        },
+        .@"or" => |kids| blk: {
+            const out = try a.alloc(PredicateExpr, kids.len);
+            for (kids, out) |src, *dst| dst.* = try clonePredPlain(a, src);
+            break :blk .{ .@"or" = out };
+        },
+        .not => |child| blk: {
+            const out = try a.create(PredicateExpr);
+            out.* = try clonePredPlain(a, child.*);
+            break :blk .{ .not = out };
+        },
+        .always => |v| .{ .always = v },
+        .in_set => |s| blk: {
+            const vals = try a.alloc(Value, s.values.len);
+            for (s.values, vals) |src, *dst| dst.* = try cloneValuePlain(a, src);
+            break :blk .{ .in_set = .{
+                .col = try a.dupe(u8, lastSegment(s.col)),
+                .values = vals,
+                .negate = s.negate,
+            } };
+        },
+        else => NoMatch,
+    };
+}
+
+fn cloneLeafPlain(a: Allocator, l: predicate_mod.Predicate) !predicate_mod.Predicate {
+    return .{ .col = try a.dupe(u8, lastSegment(l.col)), .op = l.op, .val = try cloneValuePlain(a, l.val) };
+}
+
+/// Inline earlier derived outputs into a later expr: the side runs ONE
+/// compute over the scan schema, so a col_ref to a sibling derived (the IR
+/// had them in separate compute nodes) must become that sibling's
+/// expression. Shared subtrees are fine — expressions are read-only.
+fn substDerivedRefs(a: Allocator, e: Expr, earlier: []const Derived) anyerror!Expr {
+    return switch (e) {
+        .col_ref => |name| blk: {
+            for (earlier) |d| {
+                if (std.ascii.eqlIgnoreCase(d.name, name)) break :blk d.expr;
+            }
+            break :blk e;
+        },
+        .call => |c| blk: {
+            const args = try a.alloc(Expr, c.args.len);
+            for (c.args, args) |src, *dst| dst.* = try substDerivedRefs(a, src, earlier);
+            break :blk .{ .call = .{ .fn_name = c.fn_name, .args = args } };
+        },
+        .case => |c| blk: {
+            const branches = try a.alloc(Expr.Branch, c.branches.len);
+            for (c.branches, branches) |src, *dst| {
+                dst.* = .{ .cond = src.cond, .then = try substDerivedRefs(a, src.then, earlier) };
+            }
+            var else_branch = c.else_branch;
+            if (c.else_branch) |eb| {
+                const p = try a.create(Expr);
+                p.* = try substDerivedRefs(a, eb.*, earlier);
+                else_branch = p;
+            }
+            break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch } };
+        },
+        else => e,
+    };
+}
+
+fn predAlwaysFalse(p: PredicateExpr) bool {
+    return switch (p) {
+        .always => |v| !v,
+        .@"and" => |kids| blk: {
+            for (kids) |k| {
+                if (predAlwaysFalse(k)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
 // ---------------------------------------------------------------------------
 // Pipeline collection: the block's IR walked ONCE into an ordered step list.
 // No fixed shape — any interleaving of the supported constructs compiles;
@@ -1573,13 +1802,57 @@ fn matchTvfArm(arm: *const ir.Op, base: *const ir.Op) ?UnionTvf {
 // metadata (execution mode, passthrough, broadcast inputs) — never by name.
 // ---------------------------------------------------------------------------
 
-fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8) anyerror!exec.Query {
+/// Hoist scatter-safe computes past bottom-most joins into the entry: a
+/// per-row compute whose inputs are all BASE TABLE columns commutes with
+/// any join below it (a probe only adds payload columns and filters rows),
+/// so it can run at scan time. Without this the plan-selection temp-table
+/// join strands LOWER(customerNumber) above itself and the declared route
+/// key never reaches the entry frame. Applied identically on the cached
+/// path — the entry schema must be reproducible.
+fn hoistEntryComputes(na: Allocator, table: anytype, pl: *Pipeline) !void {
+    var kept: std.ArrayListUnmanaged(Step) = .empty;
+    var hoisted: std.ArrayListUnmanaged(Derived) = .empty;
+    var stop = false;
+    var j = pl.steps.len;
+    while (j > 0) : (j -= 1) {
+        const st = pl.steps[j - 1];
+        if (!stop) switch (st) {
+            .join => {},
+            .compute => |d| blk: {
+                var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+                for (d) |dv| try exprColNames(na, dv.expr, &refs);
+                for (refs.items) |n| {
+                    if (table.schema.columnIndex(lastSegment(n)) == null) {
+                        stop = true;
+                        break :blk;
+                    }
+                }
+                try hoisted.appendSlice(na, d);
+                continue;
+            },
+            else => stop = true,
+        };
+        try kept.append(na, st);
+    }
+    if (hoisted.items.len > 0) {
+        std.mem.reverse(Step, kept.items);
+        var merged: std.ArrayListUnmanaged(Derived) = .empty;
+        try merged.appendSlice(na, pl.entry_derived);
+        try merged.appendSlice(na, hoisted.items);
+        pl.steps = kept.items;
+        pl.entry_derived = merged.items;
+    }
+}
+
+fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64) anyerror!exec.Query {
     var tm: i64 = exec.prof.nowTicks();
     const registry = input.udf_registry orelse return NoMatch;
 
     // A cacheable build uses the DATABASE allocator for its ctx so the
     // entry can outlive this query/connection; otherwise query-lifetime.
-    const anchor_hash = hashAnchor(anchor);
+    if (anchor_hash == null and getenv("THINDB_REGION_TRACE") != null) {
+        std.debug.print("[region] anchor unhashable — never cached\n", .{});
+    }
     const cache: ?*Cache = if (anchor_hash != null) cacheFor(input.db) else null;
     const gpa = if (cache != null) input.db.allocator else input.allocator;
     const qa = input.allocator;
@@ -1594,6 +1867,13 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     if (cache == null) ctx.uncacheable = true;
 
     var b = Builder{ .input = input, .ctx = ctx, .a = a, .fb = .{ .a = a } };
+    var sides_owned = true;
+    errdefer if (sides_owned) {
+        for (b.side_sources.items) |srcs| {
+            for (srcs) |*sq| sq.deinit();
+            qa.free(srcs);
+        }
+    };
 
     // Query-lifetime arena: the step list and the entry-derived slice are
     // borrowed by the operator (never by the cached ctx).
@@ -1606,47 +1886,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
 
-    // Hoist scatter-safe computes past bottom-most joins into the entry: a
-    // per-row compute whose inputs are all BASE TABLE columns commutes with
-    // any join below it (a probe only adds payload columns and filters
-    // rows), so it can run at scan time. Without this the plan-selection
-    // temp-table join strands LOWER(customerNumber) above itself and the
-    // declared route key never reaches the entry frame.
-    {
-        const na = input.node_arena;
-        var kept: std.ArrayListUnmanaged(Step) = .empty;
-        var hoisted: std.ArrayListUnmanaged(Derived) = .empty;
-        var stop = false;
-        var j = pl.steps.len;
-        while (j > 0) : (j -= 1) {
-            const st = pl.steps[j - 1];
-            if (!stop) switch (st) {
-                .join => {},
-                .compute => |d| blk: {
-                    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
-                    for (d) |dv| try exprColNames(na, dv.expr, &refs);
-                    for (refs.items) |n| {
-                        if (table.schema.columnIndex(lastSegment(n)) == null) {
-                            stop = true;
-                            break :blk;
-                        }
-                    }
-                    try hoisted.appendSlice(na, d);
-                    continue;
-                },
-                else => stop = true,
-            };
-            try kept.append(na, st);
-        }
-        if (hoisted.items.len > 0) {
-            std.mem.reverse(Step, kept.items);
-            var merged: std.ArrayListUnmanaged(Derived) = .empty;
-            try merged.appendSlice(na, pl.entry_derived);
-            try merged.appendSlice(na, hoisted.items);
-            pl.steps = kept.items;
-            pl.entry_derived = merged.items;
-        }
-    }
+    try hoistEntryComputes(input.node_arena, table, &pl);
 
     var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
     var scan_cols_opt: ?[]const []const u8 = null;
@@ -1703,6 +1943,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         break :blk true;
     };
 
+    b.order_aligned = order_aligned;
     const bs = if (order_aligned)
         try buildOrderedSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads, lastSegment(declared_keys[0]))
     else
@@ -1726,11 +1967,14 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     for (scan_schema, entry_schema[0..scan_schema.len]) |src, *dst| {
         dst.* = src;
         dst.name = try a.dupe(u8, src.name);
+        // Every entry column is nullable: a union-append kernel NULL-pads
+        // whatever it doesn't cover, and which columns those are depends on
+        // the variant's projection (plans carries invoiceItemId the
+        // estimates kernel never writes). The all-valid bulk append keeps
+        // the bitmap cost negligible.
+        dst.nullable = true;
     }
-    // The __rowloc tie-break column: nullable so kernel-generated rows
-    // (which have no physical location) NULL-pad it.
     const rowloc_entry = scan_schema.len - 1;
-    entry_schema[rowloc_entry].nullable = true;
     if (pl.entry_derived.len > 0) {
         // Engine-exact types for the scatter-time computes; forced nullable
         // (kernel-appended rows NULL-pad every entry-derived column).
@@ -1812,6 +2056,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     // itself be a range key.
     const route_idx = (b.fb.resolve(declared_keys[0]) orelse return NoMatch).idx;
     if (std.mem.indexOfScalar(usize, range_keys, route_idx) == null) return NoMatch;
+    b.route_name = b.fb.cols.items[route_idx].name;
 
 
     // Sort order within the consolidation: DECLARED keys first — every
@@ -1886,7 +2131,14 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     try b.ops.append(a, .{ .emit = .{ .cols = emit_cols } });
 
     // ---- compile the program ---------------------------------------------
-    ctx.prog = region.Program.build(gpa, entry_schema, b.ops.items, registry) catch return NoMatch;
+    ctx.prog = region.Program.build(gpa, entry_schema, b.ops.items, registry) catch |pe| {
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] program build failed: {s} (ops:", .{@errorName(pe)});
+            for (b.ops.items) |op| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(op))});
+            std.debug.print(")\n", .{});
+        }
+        return NoMatch;
+    };
     ctx.prog_built = true;
     traceMark("prog_build", &tm);
     // Emit-column NAMES for the stage schema: the program derives them from
@@ -1921,17 +2173,29 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     // (iv_cost_slot IS ctx-owned and deliberately persists.)
     ctx.opts.iv_rows_est = &.{};
 
+    const op_sides = try qa.alloc(region.SideInput, ctx.side_specs.items.len);
+    for (ctx.side_specs.items, b.side_sources.items, op_sides) |spec, srcs, *s| {
+        s.* = .{
+            .scan_schema = spec.scan_schema,
+            .schema = spec.schema,
+            .sources = srcs,
+            .entry_derived = spec.entry_derived,
+            .key_col = spec.key_col,
+        };
+    }
     var q = try region.RegionExecOp.create(
         qa,
         entry_schema,
         sources,
         pl.entry_derived,
+        op_sides,
         &ctx.prog,
         opts,
         &ctx.pool,
         total_rows * 2,
     );
     sources_owned = false; // the query owns sources (and, below, the ctx)
+    sides_owned = false;
     const op = exec.queryAs(region.RegionExecOp, q) orelse {
         q.deinit();
         return NoMatch;
@@ -2175,6 +2439,17 @@ fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror
                 try b.null_sides.append(b.a, .{ .alias = ralias.?, .schema = blk.schema });
                 return;
             }
+            // Co-partitioned side table first: a scan-shaped right side with
+            // an ON pair on the route key builds+probes shard-locally and
+            // never drains through the mono engine (the LIVE
+            // customer_monthly_totals class — millions of rows).
+            side: {
+                trySideJoin(b, j, ralias, try liveNamesAbove(b.input.node_arena, above)) catch |e| {
+                    if (e == error.OutOfMemory) return e;
+                    break :side;
+                };
+                return;
+            }
             const blk = try compileAndDrain(b, j.right, true);
             if (blk.rows == 0) {
                 const alias = ralias orelse return NoMatch;
@@ -2216,6 +2491,18 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
         } else {
             try live_left.append(a, pair.left);
             try live_right.append(a, rci);
+        }
+    }
+    // String keys or >2 live pairs route to the generalized keyed_probe
+    // (broadcast form); the packed-i64 fast path below stays for the proven
+    // 1-2 int-key shapes.
+    if (live_left.items.len > 0) {
+        var needs_keyed = live_left.items.len > 2;
+        for (live_right.items) |rci| {
+            if (isStringFamilyType(blk.schema[rci].type)) needs_keyed = true;
+        }
+        if (needs_keyed) {
+            return pushKeyedBroadcast(b, ralias, blk, inner, live, pin_right.items, pin_vals.items, live_left.items, live_right.items, key_right);
         }
     }
     if (live_left.items.len > 2) return NoMatch;
@@ -2360,6 +2647,500 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
         .map = map,
         .payload = payloads.items,
         .inner = inner,
+    } });
+}
+
+fn strBytesAt(v: ColumnView, i: usize) ?[]const u8 {
+    if (!v.isValid(i)) return null;
+    return switch (v.data) {
+        .varchar, .string, .char, .json => |s| s.rowBytes(i),
+        else => null,
+    };
+}
+
+fn pinMatches(v: ColumnView, i: usize, want: Value) !bool {
+    switch (want) {
+        .text => |s| {
+            const got = strBytesAt(v, i) orelse return false;
+            return std.mem.eql(u8, got, s);
+        },
+        else => {
+            const got = i64At(v, i) orelse return false;
+            const want_i = valueI64(want) orelse return NoMatch;
+            return got == want_i;
+        },
+    }
+}
+
+/// The broadcast form of keyed_probe: a small compile-time-drained build
+/// side with string and/or >2 live key pairs. Map + interners live in the
+/// ctx arena beside the drained block, so cache hits replay them for free.
+fn pushKeyedBroadcast(
+    b: *Builder,
+    ralias: ?[]const u8,
+    blk: DrainedBlock,
+    inner: bool,
+    live: ?[]const []const u8,
+    pin_right: []const usize,
+    pin_vals: []const Value,
+    live_left: []const []const u8,
+    live_right: []const usize,
+    key_right: []const bool,
+) anyerror!void {
+    const a = b.a;
+    if (live_left.len > region.MAX_KEYED_PAIRS) return NoMatch;
+
+    const views = try a.alloc(ColumnView, blk.schema.len);
+    for (blk.stores, views) |*st, *v| v.* = st.view();
+
+    const pairs = try a.alloc(region.KeyedPair, live_left.len);
+    const interners = try a.alloc(?*const region.StrInterner, live_left.len);
+    const interner_ptrs = try a.alloc(?*region.StrInterner, live_left.len);
+    for (live_left, live_right, pairs, interners, interner_ptrs) |ln, rci, *pp, *ip, *mp| {
+        const probe = try b.resolveIdx(ln);
+        const pt = b.fb.cols.items[probe].type;
+        const bt = blk.schema[rci].type;
+        const kind: region.KeyedPairKind = if (isIntFamilyType(pt) and isIntFamilyType(bt))
+            .int
+        else if (isStringFamilyType(pt) and isStringFamilyType(bt))
+            .str
+        else if (isIntFamilyType(pt) and isStringFamilyType(bt))
+            .int_from_str_build
+        else {
+            sideTrace("broadcast pair '{s}' type mismatch ({s} vs {s})", .{ ln, @tagName(pt), @tagName(bt) });
+            return NoMatch;
+        };
+        pp.* = .{ .probe = probe, .build = rci, .kind = kind };
+        if (kind == .str) {
+            const it = try a.create(region.StrInterner);
+            it.* = .empty;
+            ip.* = it;
+            mp.* = it;
+        } else {
+            ip.* = null;
+            mp.* = null;
+        }
+    }
+
+    const map = try a.create(region.MultiKeyMap);
+    map.* = .empty;
+    rows: for (0..blk.rows) |i| {
+        for (pin_right, pin_vals) |rci, want| {
+            if (!try pinMatches(views[rci], i, want)) continue :rows;
+        }
+        var key: region.MultiKey = @splat(0);
+        for (pairs, 0..) |p, pi| {
+            const v = views[p.build];
+            switch (p.kind) {
+                .int => key[pi] = i64At(v, i) orelse continue :rows,
+                .int_from_str_build => {
+                    const bytes = strBytesAt(v, i) orelse continue :rows;
+                    key[pi] = std.fmt.parseInt(i64, bytes, 10) catch continue :rows;
+                },
+                .str => {
+                    const bytes = strBytesAt(v, i) orelse continue :rows;
+                    const it = interner_ptrs[pi].?;
+                    const gop = try it.getOrPut(a, bytes);
+                    if (!gop.found_existing) gop.value_ptr.* = @intCast(it.count());
+                    key[pi] = gop.value_ptr.*;
+                },
+            }
+        }
+        const gop = try map.getOrPut(a, key);
+        if (gop.found_existing) {
+            sideTrace("broadcast dup build key (row {d})", .{i});
+            return NoMatch; // dup key: 1:N changes row counts
+        }
+        gop.value_ptr.* = @intCast(i);
+    }
+
+    var payloads: std.ArrayListUnmanaged(region.KeyedPayload) = .empty;
+    for (blk.schema, 0..) |col, ci| {
+        if (key_right[ci]) continue;
+        if (live) |names| {
+            const tail = lastSegment(col.name);
+            var referenced = false;
+            for (names) |n| {
+                if (std.ascii.eqlIgnoreCase(lastSegment(n), tail)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) continue;
+        }
+        const idx = try b.fb.addCol(col.name, col.type, true);
+        try payloads.append(a, .{
+            .name = b.fb.cols.items[idx].name,
+            .src = ci,
+            .out_type = col.type,
+        });
+        try b.fb.setVis(col.name, idx);
+        if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+    }
+
+    try b.flushPending();
+    try b.ops.append(a, .{ .keyed_probe = .{
+        .pairs = pairs,
+        .side = .{ .broadcast = .{
+            .map = map,
+            .interners = interners,
+            .views = views,
+            .rows = blk.rows,
+        } },
+        .payload = payloads.items,
+        .inner = inner,
+    } });
+}
+
+fn isIntFamilyType(t: types.Type) bool {
+    return switch (t) {
+        .tinyint, .smallint, .int, .bigint, .date, .datetime => true,
+        else => false,
+    };
+}
+
+fn isStringFamilyType(t: types.Type) bool {
+    return switch (t) {
+        .varchar, .string, .char => true,
+        else => false,
+    };
+}
+
+/// Side column resolution: last match wins (entry-derived columns sit after
+/// the scan columns and shadow same-named ones — exec.Compute's contract is
+/// replace-in-place for same names, so a clash can't actually occur; the
+/// backward search just mirrors the frame's precedence rule).
+fn sideColIdx(schema: []const Column, name: []const u8) ?usize {
+    const tail = lastSegment(name);
+    var i = schema.len;
+    while (i > 0) : (i -= 1) {
+        if (std.ascii.eqlIgnoreCase(lastSegment(schema[i - 1].name), tail)) return i - 1;
+    }
+    return null;
+}
+
+const SideEntry = struct {
+    scan: *const ir.Op.Scan,
+    top_select: ?[]const []const u8,
+    /// Bottom-up evaluation order.
+    derived: []const Derived,
+    filters: []const PredicateExpr,
+};
+
+/// Walk a join right side that is nothing but scan + computes + filters +
+/// projections (the rf_customer_monthly_totals class). Anything structural
+/// (join/group/window/TVF) declines — those need the drain path (or, for
+/// the crossplans GROUP BY collapse, a future side-aggregate step).
+fn collectSideEntry(na: Allocator, node: *const ir.Op) !SideEntry {
+    var top_select: ?[]const []const u8 = null;
+    var derived: std.ArrayListUnmanaged(Derived) = .empty;
+    var filters: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    var cur = node;
+    var guard: usize = 0;
+    const scan: *const ir.Op.Scan = blk: while (guard < 64) : (guard += 1) {
+        switch (cur.*) {
+            .materialize => |m| cur = m.upstream,
+            .alias => |al| cur = al.upstream,
+            .select => |p| {
+                // The topmost projection defines the side's visible set;
+                // deeper ones only narrow (SQL validity guarantees they
+                // contain everything the top one needs).
+                if (top_select == null) top_select = p.columns;
+                cur = p.upstream;
+            },
+            .compute => |c| {
+                try derived.appendSlice(na, c.derived);
+                cur = c.upstream;
+            },
+            .filter => |f| {
+                try filters.append(na, f.predicate);
+                cur = f.upstream;
+            },
+            .scan => |*s| break :blk s,
+            else => return NoMatch,
+        }
+    } else return NoMatch;
+    if (filters.items.len == 0) return NoMatch; // unfiltered side scan: not worth a region side
+    // Computes were collected top-down; evaluation is bottom-up.
+    std.mem.reverse(Derived, derived.items);
+    return .{
+        .scan = scan,
+        .top_select = top_select,
+        .derived = derived.items,
+        .filters = filters.items,
+    };
+}
+
+/// Compile a LEFT join whose right side is a scan-shaped subtree
+/// co-partitioned with the region (an ON pair binds the route key): the
+/// side gets its own chunked scan + exchange scatter and each shard builds
+/// a local multi-key map — the mono engine never materializes it.
+fn sideTrace(comptime fmt: []const u8, args: anytype) void {
+    if (getenv("THINDB_REGION_TRACE") != null) {
+        std.debug.print("[region] side decline: " ++ fmt ++ "\n", args);
+    }
+}
+
+fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]const []const u8) anyerror!void {
+    const a = b.a;
+    if (b.order_aligned) return NoMatch; // no exchange to co-partition through
+    if (j.on.len == 0 or j.on.len > region.MAX_KEYED_PAIRS) return NoMatch;
+    const registry = b.input.udf_registry orelse return NoMatch;
+
+    // Co-partition requirement: some ON pair's LEFT is the route key column
+    // (scatter hashes ONLY that column, so equal route keys — and therefore
+    // every possible match — land in the same shard on both sides).
+    const route_idx = (b.fb.resolve(b.route_name) orelse {
+        sideTrace("route name '{s}' unresolved", .{b.route_name});
+        return NoMatch;
+    }).idx;
+    var route_pair: ?usize = null;
+    for (j.on, 0..) |pair, pi| {
+        const e = b.fb.resolve(pair.left) orelse {
+            sideTrace("ON left '{s}' unresolved", .{pair.left});
+            return NoMatch;
+        };
+        if (e.idx == route_idx) {
+            route_pair = pi;
+            break;
+        }
+    }
+    if (route_pair == null) {
+        sideTrace("no ON pair binds route '{s}' (idx {d})", .{ b.route_name, route_idx });
+        return NoMatch;
+    }
+
+    // Dedupe: ctc/ctl reference the SAME materialized CTE node — one side
+    // spec + one scatter, two probe ops.
+    var side_idx: ?usize = null;
+    for (b.side_nodes.items, 0..) |n, i| {
+        if (n == j.right) {
+            side_idx = i;
+            break;
+        }
+    }
+
+    if (side_idx == null) {
+        const se = collectSideEntry(b.input.node_arena, j.right) catch |e| {
+            sideTrace("right subtree not scan-shaped ({s})", .{@errorName(e)});
+            return e;
+        };
+
+        var filt_list: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        for (se.filters) |f| {
+            const cloned = try clonePredPlain(a, f);
+            // A folded-false side (the non-plans variants' 1=0 CMT) belongs
+            // to the empty-proof NULL-collapse path, not a side scatter.
+            if (predAlwaysFalse(cloned)) return NoMatch;
+            try filt_list.append(a, cloned);
+        }
+
+        const side_table = b.input.db.openTable(se.scan.table.name, .{}) catch return NoMatch;
+
+        // Pinned ON pairs (left bound to an entry literal) filter the side
+        // scan directly when the side column is a stored column; the pair
+        // still participates in the key so unpinnable ones stay correct.
+        for (j.on) |pair| {
+            const v = b.pinnedName(pair.left) orelse continue;
+            const tail = lastSegment(pair.right);
+            if (side_table.schema.columnIndex(tail) == null) continue;
+            try filt_list.append(a, .{ .leaf = .{
+                .col = try a.dupe(u8, tail),
+                .op = .eq,
+                .val = try cloneValuePlain(a, v),
+            } });
+        }
+
+        const side_filter: PredicateExpr = if (filt_list.items.len == 1)
+            filt_list.items[0]
+        else
+            .{ .@"and" = filt_list.items };
+        var prune_list: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
+        try collectAndLeaves(a, side_filter, &prune_list);
+
+        var side_derived: std.ArrayListUnmanaged(Derived) = .empty;
+        for (se.derived) |d| {
+            const cloned = try cloneExprPlain(a, d.expr);
+            try side_derived.append(a, .{
+                .name = try a.dupe(u8, d.name),
+                .expr = try substDerivedRefs(a, cloned, side_derived.items),
+            });
+        }
+
+        // Scan projection: the visible set minus derived names, plus every
+        // stored column the derived exprs read.
+        var scan_cols_opt: ?[]const []const u8 = null;
+        if (se.top_select) |sel| {
+            var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+            outer: for (sel) |col| {
+                for (side_derived.items) |d| {
+                    if (std.ascii.eqlIgnoreCase(d.name, lastSegment(col))) continue :outer;
+                }
+                try cols.append(a, try a.dupe(u8, lastSegment(col)));
+            }
+            for (side_derived.items) |d| {
+                var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+                try exprColNames(b.input.node_arena, d.expr, &refs);
+                ref: for (refs.items) |n| {
+                    const tail = lastSegment(n);
+                    if (side_table.schema.columnIndex(tail) == null) continue;
+                    for (cols.items) |c| {
+                        if (std.ascii.eqlIgnoreCase(lastSegment(c), tail)) continue :ref;
+                    }
+                    try cols.append(a, try a.dupe(u8, tail));
+                }
+            }
+            scan_cols_opt = cols.items;
+        }
+
+        recordSubtreeVersions(b, j.right);
+        const n_threads = @max(b.input.effectiveDop(), 1);
+        const bs = try buildScanSources(b.input, side_table, prune_list.items, side_filter, scan_cols_opt, n_threads);
+        var sources_owned = true;
+        errdefer if (sources_owned) {
+            for (bs.sources) |*q| q.deinit();
+            b.input.allocator.free(bs.sources);
+        };
+
+        const raw_scan_schema = bs.sources[0].outputSchema();
+        const scan_schema = try a.alloc(Column, raw_scan_schema.len);
+        for (raw_scan_schema, scan_schema) |src, *dst| {
+            dst.* = src;
+            dst.name = try a.dupe(u8, src.name);
+        }
+        var side_schema: []const Column = scan_schema;
+        if (side_derived.items.len > 0) {
+            const typed = region.computeOutputSchema(b.input.allocator, a, scan_schema, side_derived.items, registry) catch |ce| {
+                if (getenv("THINDB_REGION_TRACE") != null) {
+                    std.debug.print("[region] side decline: entry compute failed ({s}); derived:", .{@errorName(ce)});
+                    for (side_derived.items) |d| std.debug.print(" {s}", .{d.name});
+                    std.debug.print("; scan cols:", .{});
+                    for (scan_schema) |c| std.debug.print(" {s}", .{c.name});
+                    std.debug.print("\n", .{});
+                }
+                return NoMatch;
+            };
+            if (typed.len != scan_schema.len + side_derived.items.len) {
+                sideTrace("side entry compute replaced a column", .{});
+                return NoMatch;
+            }
+            side_schema = typed;
+        }
+
+        const key_col = sideColIdx(side_schema, j.on[route_pair.?].right) orelse {
+            sideTrace("route side col '{s}' not in side schema", .{j.on[route_pair.?].right});
+            return NoMatch;
+        };
+        try b.side_nodes.append(a, j.right);
+        try b.ctx.side_specs.append(a, .{
+            .table = try a.dupe(u8, se.scan.table.name),
+            .prune = prune_list.items,
+            .filter = side_filter,
+            .scan_cols = scan_cols_opt,
+            .entry_derived = side_derived.items,
+            .scan_schema = scan_schema,
+            .schema = side_schema,
+            .key_col = key_col,
+        });
+        try b.side_sources.append(a, bs.sources);
+        sources_owned = false;
+        side_idx = b.side_nodes.items.len - 1;
+    }
+
+    const spec = &b.ctx.side_specs.items[side_idx.?];
+
+    // Key pairs: every ON pair keys the map (pinned pairs included — the
+    // frame carries their column, constant or not).
+    const pairs = try a.alloc(region.KeyedPair, j.on.len);
+    const key_build = try a.alloc(bool, spec.schema.len);
+    @memset(key_build, false);
+    for (j.on, pairs) |pair, *dst| {
+        const probe = try b.resolveIdx(pair.left);
+        const build = sideColIdx(spec.schema, pair.right) orelse {
+            sideTrace("ON right '{s}' not in side schema", .{pair.right});
+            return NoMatch;
+        };
+        const pt = b.fb.cols.items[probe].type;
+        const bt = spec.schema[build].type;
+        const kind: region.KeyedPairKind = if (isIntFamilyType(pt) and isIntFamilyType(bt))
+            .int
+        else if (isStringFamilyType(pt) and isStringFamilyType(bt))
+            .str
+        else if (isIntFamilyType(pt) and isStringFamilyType(bt))
+            .int_from_str_build
+        else {
+            sideTrace("pair '{s}'/'{s}' type mismatch ({s} vs {s})", .{ pair.left, pair.right, @tagName(pt), @tagName(bt) });
+            return NoMatch;
+        };
+        dst.* = .{ .probe = probe, .build = build, .kind = kind };
+        key_build[build] = true;
+    }
+
+    // Payloads: every non-key side column the steps above can reference. A
+    // column whose name matches a join-key tail (the parser leaves the
+    // original columns behind its __join_on_right duplicates) gets ONLY the
+    // alias-qualified name — bare visibility would shadow the main frame's
+    // key column and corrupt every later bare reference (including the
+    // route key itself for the NEXT side join).
+    var payloads: std.ArrayListUnmanaged(region.KeyedPayload) = .empty;
+    for (spec.schema, 0..) |col, ci| {
+        if (key_build[ci]) continue;
+        const tail = lastSegment(col.name);
+        if (live) |names| {
+            var referenced = false;
+            for (names) |n| {
+                if (std.ascii.eqlIgnoreCase(lastSegment(n), tail)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) continue;
+        }
+        var key_tail = false;
+        for (j.on) |pair| {
+            if (std.ascii.eqlIgnoreCase(tail, lastSegment(pair.left)) or
+                std.ascii.eqlIgnoreCase(tail, lastSegment(pair.right)))
+            {
+                key_tail = true;
+                break;
+            }
+        }
+        if (key_tail) {
+            // Carry only under an ACTUAL alias-qualified reference — a bare
+            // liveness hit comes from the spine's own key column, and even
+            // registering the qualified name would make bare resolution of
+            // that key ambiguous for every later step.
+            const al = ralias orelse continue;
+            var qualified_ref = false;
+            if (live) |names| {
+                for (names) |n| {
+                    const dot = std.mem.lastIndexOfScalar(u8, n, '.') orelse continue;
+                    if (std.ascii.eqlIgnoreCase(n[0..dot], al) and
+                        std.ascii.eqlIgnoreCase(n[dot + 1 ..], tail))
+                    {
+                        qualified_ref = true;
+                        break;
+                    }
+                }
+            } else qualified_ref = true;
+            if (!qualified_ref) continue;
+        }
+        const idx = try b.fb.addCol(col.name, col.type, true);
+        try payloads.append(a, .{
+            .name = b.fb.cols.items[idx].name,
+            .src = ci,
+            .out_type = col.type,
+        });
+        if (!key_tail) try b.fb.setVis(col.name, idx);
+        if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+    }
+
+    try b.flushPending();
+    try b.ops.append(a, .{ .keyed_probe = .{
+        .pairs = pairs,
+        .side = .{ .shard = side_idx.? },
+        .payload = payloads.items,
+        .inner = false,
     } });
 }
 
