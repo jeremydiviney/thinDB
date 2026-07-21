@@ -2096,10 +2096,12 @@ pub const RegionWorker = struct {
         fr.width += s.out.len;
     }
 
-    /// Select the kernel-visible rows of [lo,hi) per the input filter, copy
-    /// them contiguous into the op's scratch partition, and call the kernel
-    /// appending onto `out_ptrs`. Shared by the unfused per-range path and
-    /// the consolidation-tail fusion.
+    /// Select the kernel-visible rows of [lo,hi) per the input filter and
+    /// call the kernel appending onto `out_ptrs`. Unfiltered inputs pass
+    /// ZERO-COPY range-sliced views (a range is a contiguous frame span);
+    /// filtered inputs copy the surviving rows contiguous into the op's
+    /// scratch partition. Shared by the unfused per-range path and the
+    /// consolidation-tail fusion.
     fn kernelOverRange(
         self: *RegionWorker,
         t: anytype,
@@ -2111,15 +2113,19 @@ pub const RegionWorker = struct {
         expect_rows: ?usize,
     ) !void {
         const sa = self.scratch.allocator();
+        if (t.input_filter == null) {
+            if (hi == lo) return;
+            const in_views = try sa.alloc(ColumnView, t.spec.inputs.len);
+            for (t.spec.inputs, in_views) |ci, *v| v.* = try sliceViewRange(sa, views[ci], lo, hi);
+            try self.callTvf(t.spec, s, in_views, hi - lo, out_ptrs, expect_rows);
+            return;
+        }
+
         var kin: std.ArrayListUnmanaged(u32) = .empty;
-        if (t.input_filter) |f| {
-            for (lo..hi) |i| {
-                const v = viewI64(views[f.col], i) orelse continue;
-                if (v >= f.lo and v <= f.hi) try kin.append(sa, @intCast(i));
-            }
-        } else {
-            try kin.ensureUnusedCapacity(sa, hi - lo);
-            for (lo..hi) |i| kin.appendAssumeCapacity(@intCast(i));
+        const f = t.input_filter.?;
+        for (lo..hi) |i| {
+            const v = viewI64(views[f.col], i) orelse continue;
+            if (v >= f.lo and v <= f.hi) try kin.append(sa, @intCast(i));
         }
         if (kin.items.len == 0) return;
 
@@ -2467,6 +2473,36 @@ pub const RegionWorker = struct {
         fr.ranges = s.ranges.items;
     }
 };
+
+/// Zero-copy view over rows [lo,hi) of `v`. Fixed-width data slices
+/// directly; string views slice their offsets (byte positions are absolute
+/// into the shared bytes buffer, so no rebase is needed). The validity
+/// bitmap slices in place on byte-aligned lo and otherwise re-bases into
+/// `sa` scratch — rows/8 bytes, ~1/64 of the data a full copy would move.
+fn sliceViewRange(sa: Allocator, v: ColumnView, lo: usize, hi: usize) !ColumnView {
+    const data: @TypeOf(v.data) = switch (v.data) {
+        inline .int, .bigint, .boolean, .float, .double, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .uuid => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), s[lo..hi]),
+        inline .varchar, .string, .char, .json => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), .{
+            .offsets = s.offsets[lo .. hi + 1],
+            .bytes = s.bytes,
+        }),
+    };
+    var nulls: ?[]const u8 = null;
+    if (v.nulls) |bm| {
+        if (lo % 8 == 0) {
+            nulls = bm[lo / 8 .. (hi + 7) / 8];
+        } else {
+            const n = hi - lo;
+            const buf = try sa.alloc(u8, (n + 7) / 8);
+            @memset(buf, 0);
+            for (0..n) |i| {
+                if (storage.column.isValidBit(bm, lo + i)) buf[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+            }
+            nulls = buf;
+        }
+    }
+    return .{ .data = data, .nulls = nulls };
+}
 
 /// Int-family view read (NULL → null). Mirrors the recognizer's i64At.
 fn intAt(v: ColumnView, i: usize) ?i64 {
