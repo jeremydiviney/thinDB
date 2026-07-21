@@ -2335,6 +2335,99 @@ fn liveNamesAbove(a: Allocator, steps: []const Step) !?[]const []const u8 {
     return out.items;
 }
 
+/// Liveness for the not-yet-dispatched steps: the enumerating walk first,
+/// the projection-bounded walk when a TVF defeats it.
+fn liveNames(a: Allocator, steps: []const Step) !?[]const []const u8 {
+    if (try liveNamesAbove(a, steps)) |l| return l;
+    return liveNamesBounded(a, steps);
+}
+
+/// Fallback liveness when `liveNamesAbove` gives up on a TVF: walk from
+/// the step NEAREST the join upward and STOP at the first namespace-closing
+/// step — an explicit SELECT projection, a GROUP BY, or a frame-replacing
+/// table_fn. SQL scoping means everything higher references columns only
+/// THROUGH that step, so the set collected up to and including it is
+/// complete. TVF steps contribute their call-site references (partition/
+/// order keys + input-subquery projections/filters); a union-append TVF
+/// passes the frame through, so the walk continues past it. Same safety
+/// contract as liveNamesAbove: a wrongly-dropped payload fails resolution
+/// later (compile decline), never wrong values.
+fn liveNamesBounded(a: Allocator, steps: []const Step) !?[]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var i = steps.len;
+    while (i > 0) {
+        i -= 1;
+        switch (steps[i]) {
+            .select => |p| {
+                for (p.columns) |c| try out.append(a, c);
+                return out.items;
+            },
+            .group_by => |g| {
+                for (g.group_cols) |c| try out.append(a, c);
+                for (g.aggs) |spec| {
+                    if (spec.col) |c| try out.append(a, c);
+                    if (spec.arg2_col) |c| try out.append(a, c);
+                    for (spec.udf_arg_cols) |c| try out.append(a, c);
+                }
+                return out.items;
+            },
+            .table_fn => |t| {
+                try tvfRefNames(a, t, &out);
+                return out.items;
+            },
+            .exclude => |p| for (p.columns) |c| try out.append(a, c),
+            .compute => |d| for (d) |dd| try exprColNames(a, dd.expr, &out),
+            .alias_name => {},
+            .filt => |p| try predColNames(a, p, &out),
+            .window => |w| {
+                for (w.specs) |spec| {
+                    for (spec.partition_by) |c| try out.append(a, c);
+                    for (spec.order_by) |ob| try out.append(a, ob.col);
+                }
+                for (w.calls) |call| {
+                    for (call.args) |e| try exprColNames(a, e, &out);
+                }
+            },
+            .join => |j| for (j.on) |pair| try out.append(a, pair.left),
+            .union_tvf => |u| {
+                try tvfRefNames(a, u.tvf, &out);
+                if (u.input_filter) |f| try predColNames(a, f, &out);
+            },
+        }
+    }
+    return null; // no closing step below the anchor — keep everything
+}
+
+/// References a TVF call site makes against the frame: partition/order
+/// keys plus each input subquery's projection columns, filters, and
+/// derived-column refs, walked toward the shared base. An unrecognized
+/// node ends that input's walk — deeper refs are against other sources
+/// (broadcast inputs) and cannot name frame columns.
+fn tvfRefNames(a: Allocator, tf: *const ir.Op.TableFn, out: *std.ArrayListUnmanaged([]const u8)) anyerror!void {
+    for (tf.partition_by) |c| try out.append(a, c);
+    for (tf.order_by) |ob| try out.append(a, ob.col);
+    for (tf.inputs) |sub| {
+        var node: *const ir.Op = sub;
+        walk: while (true) {
+            switch (node.*) {
+                .select, .exclude => |p| {
+                    for (p.columns) |c| try out.append(a, c);
+                    node = p.upstream;
+                },
+                .filter => |f| {
+                    try predColNames(a, f.predicate, out);
+                    node = f.upstream;
+                },
+                .compute => |c| {
+                    for (c.derived) |d| try exprColNames(a, d.expr, out);
+                    node = c.upstream;
+                },
+                else => break :walk,
+            }
+        }
+    }
+}
+
 fn exprColNames(a: Allocator, e: Expr, out: *std.ArrayListUnmanaged([]const u8)) anyerror!void {
     switch (e) {
         .col_ref => |n| try out.append(a, n),
@@ -2493,7 +2586,7 @@ fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror
             // never drains through the mono engine (the LIVE
             // customer_monthly_totals class — millions of rows).
             side: {
-                trySideJoin(b, j, ralias, try liveNamesAbove(b.input.node_arena, above)) catch |e| {
+                trySideJoin(b, j, ralias, try liveNames(b.input.node_arena, above)) catch |e| {
                     if (e == error.OutOfMemory) return e;
                     break :side;
                 };
@@ -2506,12 +2599,12 @@ fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror
                 return;
             }
             if (blk.rows > (1 << 20)) return NoMatch;
-            try pushProbe(b, j, ralias, blk, false, try liveNamesAbove(b.input.node_arena, above));
+            try pushProbe(b, j, ralias, blk, false, try liveNames(b.input.node_arena, above));
         },
         .inner => {
             const blk = try compileAndDrain(b, j.right, true);
             if (blk.rows > (1 << 20)) return NoMatch;
-            try pushProbe(b, j, rightAliasName(j.right) catch null, blk, true, try liveNamesAbove(b.input.node_arena, above));
+            try pushProbe(b, j, rightAliasName(j.right) catch null, blk, true, try liveNames(b.input.node_arena, above));
         },
         else => return NoMatch,
     }
@@ -2810,9 +2903,11 @@ fn pushKeyedBroadcast(
     // emit disappears) and the cut lands before scatter/consolidation.
     // The map build above already proved build keys unique. Ordered mode
     // has no scatter stage to mask — skip.
+    var semi_converted = false;
     if (inner and pairs.len == 1 and b.ops.items.len == 0 and
         b.pending_nulls.items.len == 0 and !b.order_aligned)
     {
+        semi_converted = true;
         const p = pairs[0];
         const bv = views[p.build];
         if (p.kind == .str) {
@@ -2874,6 +2969,15 @@ fn pushKeyedBroadcast(
         });
         try b.fb.setVis(col.name, idx);
         if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+    }
+
+    // Member filter + zero live payloads: the probe op is a complete
+    // no-op (the filter already dropped every row it would drop, and it
+    // appends nothing) — elide it. This also restores the union-append
+    // TVF fusion when the plan-filter join was the only thing below it.
+    if (semi_converted and payloads.items.len == 0) {
+        sideTrace("semi member filter absorbs probe op (no live payloads)", .{});
+        return;
     }
 
     try b.flushPending();
