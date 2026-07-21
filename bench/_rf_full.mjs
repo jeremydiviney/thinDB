@@ -35,6 +35,6 @@ async function bench(name, cfg, runs) {
 const t = await bench("thinDB", { host: "127.0.0.1", port: 7950, user: "root", password: "", database: "wayroll", rowsAsArray: true }, RUNS);
 let s = null;
 if (process.env.SR_PWD) {
-  s = await bench("StarRocks", { host: "64.20.36.26", port: 9030, user: "root", password: process.env.SR_PWD, database: "wayroll", rowsAsArray: true }, Math.min(RUNS, 4));
+  s = await bench("StarRocks", { host: process.env.SR_HOST, port: 9030, user: "root", password: process.env.SR_PWD, database: "wayroll", rowsAsArray: true }, Math.min(RUNS, 4));
 }
 if (t != null && s != null) console.log(`\nthinDB / StarRocks = ${(t / s).toFixed(2)}x`);

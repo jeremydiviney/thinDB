@@ -56,7 +56,7 @@ def bench(label, host, port, db, prefix, pw=None):
 
 
 print('RTT note: ICMP min ~103ms to StarRocks; the baseline subtraction below removes it regardless.')
-sr_min, sr_med = bench('StarRocks (query cache OFF)', '64.20.36.26', 9030, 'wayroll',
+sr_min, sr_med = bench('StarRocks (query cache OFF)', os.environ['SR_HOST'], 9030, 'wayroll',
                        'SET enable_query_cache=false;\n', PW)
 th_min, th_med = bench('thinDB', '127.0.0.1', 7881, 'wayroll__public', '')
 

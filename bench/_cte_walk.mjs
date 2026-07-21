@@ -36,7 +36,7 @@ const fullQuery = sql + "\nLIMIT 100";
 const tdb = await mysql.createConnection({ host:"127.0.0.1", port:7950, user:"root", password:"", database:"wayroll", rowsAsArray:true });
 let sr = null;
 if (process.env.SR_PWD){
-  sr = await mysql.createConnection({ host:"64.20.36.26", port:9030, user:"root", password:process.env.SR_PWD, database:"wayroll", rowsAsArray:true });
+  sr = await mysql.createConnection({ host:process.env.SR_HOST, port:9030, user:"root", password:process.env.SR_PWD, database:"wayroll", rowsAsArray:true });
   await sr.query("SET query_timeout=1200");
 }
 

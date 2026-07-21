@@ -36,7 +36,7 @@ run `rollforward_1000054_full_inline_cte.sql` against it, building CTE-by-CTE.
 - thinDB server: `./zig-out/bin/thindb-server.exe --data-dir .wayroll-db --mysql-port 7881 --max-dop 12 --query-memory-budget 8589934592`
   (separate port/data-dir from the clickbench server on 7880, runs in background)
 - DB name over the wire: **`wayroll__public`** (thinDB uses `<db>__<schema>`, default schema `public`).
-- Source: StarRocks/Doris `wayroll` @ 64.20.36.26:9030 (creds via env `SR_PWD`, never committed).
+- Source: StarRocks/Doris `wayroll` @ $SR_HOST:9030 (creds via env `SR_PWD`, never committed).
 - Loader: `tests/bun/wayroll_load.mjs` (bun + mysql2). Streams source, batched bulk INSERT.
   Run: `cd tests/bun && SR_PWD='...' bun run wayroll_load.mjs`
 
