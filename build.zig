@@ -302,6 +302,20 @@ pub fn build(b: *std.Build) void {
     const rf_custom_step = b.step("rf-custom", "Build the purpose-built rollforward pipeline probe (pass -Doptimize=ReleaseFast)");
     rf_custom_step.dependOn(&b.addInstallArtifact(rf_custom_exe, .{}).step);
 
+    // Region recognizer IR-dump tool (debugging aid for the keyed-region compiler).
+    const region_dump_mod = b.createModule(.{
+        .root_source_file = b.path("bench/region_dump.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    region_dump_mod.addImport("thindb", thindb_mod);
+    const region_dump_exe = b.addExecutable(.{
+        .name = "region_dump",
+        .root_module = region_dump_mod,
+    });
+    const region_dump_step = b.step("region-dump", "Dump post-pass IR for a SQL file (region recognizer input)");
+    region_dump_step.dependOn(&b.addInstallArtifact(region_dump_exe, .{}).step);
+
     // ---- thindb-server executable: standalone multi-wire server -------------
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/cmd/server.zig"),
