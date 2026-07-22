@@ -1,11 +1,14 @@
 name: release
 
 # Every push to main builds the five platform bundles (server + matching Zig
-# toolchain) and publishes them as a GitHub Release. Assets are uploaded twice:
-# once version-named (thindb-<sha>-<platform>) and once stable-named
-# (thindb-<platform>) so /releases/latest/download/thindb-<platform>.tar.gz is
-# a permanent URL that always serves the newest build — the doc site links
-# those directly and never needs a rebuild.
+# toolchain) and publishes them as a GitHub Release tagged vX.Y.Z: X.Y comes
+# from the VERSION file (human-controlled), Z auto-increments as the number
+# of commits since VERSION last changed — bumping VERSION resets it to 0.
+# Assets are uploaded twice: once version-named (thindb-X.Y.Z-<platform>) and
+# once stable-named (thindb-<platform>) so
+# /releases/latest/download/thindb-<platform>.tar.gz is a permanent URL that
+# always serves the newest build — the doc site links those directly and
+# never needs a rebuild.
 
 # workflow_dispatch allows an on-demand bundle build from ANY branch (Actions
 # tab → release → Run workflow): bundles upload as a workflow artifact, but a
@@ -53,7 +56,18 @@ jobs:
           path: .dist-cache
           key: zig-toolchains-${{ env.ZIG_VERSION }}
 
+      - name: Compute version
+        id: version
+        run: |
+          base=$(tr -d ' \n' < VERSION)
+          anchor=$(git log -1 --format=%H -- VERSION)
+          patch=$(git rev-list --count "$anchor..HEAD")
+          echo "version=$base.$patch" >> "$GITHUB_OUTPUT"
+          echo "thinDB version: $base.$patch"
+
       - name: Build bundles
+        env:
+          THINDB_VERSION: ${{ steps.version.outputs.version }}
         run: bun scripts/make_dist.mjs
 
       - name: Add stable-named copies
@@ -81,7 +95,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="build-$(git rev-parse --short HEAD)"
+          tag="v${{ steps.version.outputs.version }}"
+          # Idempotent republish: a workflow re-run of the same commit
+          # produces the same version — replace, don't fail.
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" \
             --title "thinDB $tag" \
             --notes "Automated build of ${{ github.sha }}. Stable links: releases/latest/download/thindb-<platform>.{tar.gz,zip}" \
@@ -94,5 +111,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release list --limit 100 --json tagName --jq '.[].tagName' \
-            | grep '^build-' | tail -n +11 \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | tail -n +11 \
+            | xargs -r -n1 -I{} gh release delete {} --yes --cleanup-tag
+          # Retire the pre-semver build-<sha> releases entirely.
+          gh release list --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^build-' \
             | xargs -r -n1 -I{} gh release delete {} --yes --cleanup-tag
