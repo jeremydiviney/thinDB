@@ -59,6 +59,7 @@ test {
     _ = @import("literal_lhs_test.zig");
     _ = @import("agg_on_expr_test.zig");
     _ = @import("temporal_group_agg_test.zig");
+    _ = @import("keyed_region_test.zig");
     _ = @import("qualified_col_test.zig");
     _ = @import("range_correlated_test.zig");
     _ = @import("case_subquery_test.zig");

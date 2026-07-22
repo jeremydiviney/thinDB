@@ -280,6 +280,20 @@ fn stringViewOf(v: ColumnView) storage.StringView {
     };
 }
 
+/// Route-hash bytes for one key value: string payload bytes, or the raw
+/// value bytes for fixed-width types. Rows with equal key values always
+/// produce identical bytes, which is all shard routing needs. The builder
+/// never routes on floats (bit-pattern hashing vs value equality); any
+/// other unhashable type degrades to one shard, which is correct, just
+/// unbalanced.
+fn routeKeyBytes(v: ColumnView, r: usize) []const u8 {
+    return switch (v.data) {
+        .varchar, .string, .char, .json => |s| s.rowBytes(r),
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
+        else => "",
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Exchange: hash-scatter into (worker × shard) buckets
 // ---------------------------------------------------------------------------
@@ -401,7 +415,7 @@ pub const Exchange = struct {
             const kv = batch.values[ex.key_col];
             for (0..batch.row_count) |r| {
                 if (keep) |k| if (!k[r]) continue;
-                const key: []const u8 = if (kv.isValid(r)) stringViewOf(kv).rowBytes(r) else "";
+                const key: []const u8 = if (kv.isValid(r)) routeKeyBytes(kv, r) else "";
                 const shard = std.hash.Wyhash.hash(HASH_SEED, key) % ex.n_shards;
                 try self.idx[shard].append(ex.alloc, @intCast(r));
             }

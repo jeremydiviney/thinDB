@@ -2091,8 +2091,22 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     b.range_key_names = key_names_owned;
     // Routing: any single declared key suffices (every partition in the
     // block contains all of them — the verifier's guarantee), and it must
-    // itself be a range key.
-    const route_idx = (b.fb.resolve(declared_keys[0]) orelse return NoMatch).idx;
+    // itself be a range key. Floats can't route: the exchange hashes raw
+    // value bytes, and float bit patterns diverge from value equality
+    // (-0.0 vs 0.0), so prefer any non-float key.
+    const route_idx = blk: {
+        for (declared_keys) |dk| {
+            const idx = (b.fb.resolve(dk) orelse return NoMatch).idx;
+            switch (entry_schema[idx].type) {
+                .float, .double => continue,
+                else => break :blk idx,
+            }
+        }
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] no routable declared key (all float-typed)\n", .{});
+        }
+        return NoMatch;
+    };
     if (std.mem.indexOfScalar(usize, range_keys, route_idx) == null) return NoMatch;
     b.route_name = b.fb.cols.items[route_idx].name;
 
@@ -4130,7 +4144,16 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     for (covered) |c| {
         if (!c) return NoMatch;
     }
-    if (subkeys.items.len == 0 or subkeys.items.len > 3) return NoMatch;
+    if (subkeys.items.len == 0 or subkeys.items.len > 3) {
+        if (getenv("THINDB_REGION_TRACE") != null) {
+            std.debug.print("[region] pushGroupAgg decline: subkeys={d} group_cols={d} required={d}\n", .{ subkeys.items.len, g.group_cols.len, required.len });
+            for (g.group_cols) |gc| {
+                const e = b.fb.resolve(gc);
+                std.debug.print("[region]   gc '{s}' idx={?d} const={}\n", .{ gc, if (e) |ee| ee.idx else null, if (e) |ee| b.isConstIdx(ee.idx) else false });
+            }
+        }
+        return NoMatch;
+    }
 
     var out: std.ArrayListUnmanaged(region.AggOut) = .empty;
     var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
