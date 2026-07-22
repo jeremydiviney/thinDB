@@ -11,6 +11,7 @@
 //! -> top-N.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const win = std.os.windows;
 const exec_mod = @import("exec.zig");
 const api_mod = @import("../api/api.zig");
@@ -136,24 +137,42 @@ fn chunkProfileDump() void {
 }
 
 fn nowTicks() i64 {
-    var c: win.LARGE_INTEGER = 0;
-    _ = win.ntdll.RtlQueryPerformanceCounter(&c);
-    return c;
+    switch (builtin.os.tag) {
+        .windows => {
+            var c: win.LARGE_INTEGER = 0;
+            _ = win.ntdll.RtlQueryPerformanceCounter(&c);
+            return c;
+        },
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+            return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+        },
+        else => return 0,
+    }
 }
 
 fn perfFreq() i64 {
-    var f: win.LARGE_INTEGER = 0;
-    _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
-    return if (f == 0) 1 else f;
+    switch (builtin.os.tag) {
+        .windows => {
+            var f: win.LARGE_INTEGER = 0;
+            _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
+            return if (f == 0) 1 else f;
+        },
+        .linux => return 1_000_000_000,
+        else => return 1,
+    }
 }
 
 fn ticksToMs(ticks: i64, freq: i64) f64 {
     return @as(f64, @floatFromInt(ticks)) * 1000.0 / @as(f64, @floatFromInt(freq));
 }
 
-extern "kernel32" fn GetCurrentThread() callconv(.winapi) win.HANDLE;
-extern "kernel32" fn SetThreadAffinityMask(hThread: win.HANDLE, mask: usize) callconv(.winapi) usize;
-extern "kernel32" fn GetLogicalProcessorInformation(buf: ?[*]LogicalProcInfo, len: *u32) callconv(.winapi) win.BOOL;
+const WinAffinity = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn GetCurrentThread() callconv(.winapi) win.HANDLE;
+    extern "kernel32" fn SetThreadAffinityMask(hThread: win.HANDLE, mask: usize) callconv(.winapi) usize;
+    extern "kernel32" fn GetLogicalProcessorInformation(buf: ?[*]LogicalProcInfo, len: *u32) callconv(.winapi) win.BOOL;
+} else struct {};
 
 const RelationProcessorCore: u32 = 0;
 const LogicalProcInfo = extern struct {
@@ -173,9 +192,18 @@ pub const CpuLayout = struct {
 };
 
 pub fn cpuLayout(allocator: Allocator) !CpuLayout {
+    if (builtin.os.tag != .windows) {
+        // No SMT-topology query off-Windows yet: identity order, every logical
+        // CPU counted as physical. Good enough for pinning; SMT-aware
+        // primary-first ordering is a Linux-port follow-up.
+        const n_cpus = std.Thread.getCpuCount() catch 1;
+        const order = try allocator.alloc(usize, n_cpus);
+        for (order, 0..) |*o, i| o.* = i;
+        return .{ .order = order, .physical_count = n_cpus };
+    }
     var buf: [256]LogicalProcInfo = undefined;
     var len: u32 = @intCast(@sizeOf(LogicalProcInfo) * buf.len);
-    if (!GetLogicalProcessorInformation(&buf, &len).toBool()) return error.QueryFailed;
+    if (!WinAffinity.GetLogicalProcessorInformation(&buf, &len).toBool()) return error.QueryFailed;
     const n = len / @sizeOf(LogicalProcInfo);
 
     var primaries: std.ArrayListUnmanaged(usize) = .empty;
@@ -205,8 +233,20 @@ pub fn cpuLayout(allocator: Allocator) !CpuLayout {
 }
 
 pub fn pinToCpu(cpu: usize) void {
-    if (cpu < @bitSizeOf(usize)) {
-        _ = SetThreadAffinityMask(GetCurrentThread(), @as(usize, 1) << @intCast(cpu));
+    switch (builtin.os.tag) {
+        .windows => {
+            if (cpu < @bitSizeOf(usize)) {
+                _ = WinAffinity.SetThreadAffinityMask(WinAffinity.GetCurrentThread(), @as(usize, 1) << @intCast(cpu));
+            }
+        },
+        .linux => {
+            var set: std.os.linux.cpu_set_t = @splat(0);
+            if (cpu < @bitSizeOf(std.os.linux.cpu_set_t)) {
+                set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+                std.os.linux.sched_setaffinity(0, &set) catch {};
+            }
+        },
+        else => {},
     }
 }
 

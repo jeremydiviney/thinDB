@@ -591,8 +591,11 @@ fn installSignalHandler() void {
 
 fn installPosixHandler() void {
     if (builtin.os.tag == .windows) return;
+    // The handler's parameter type is OS-specific in std (enum on linux, i32
+    // elsewhere) — derive it from the canonical Sigaction.handler_fn alias.
+    const SigParam = @typeInfo(@typeInfo(std.posix.Sigaction.handler_fn).pointer.child).@"fn".params[0].type.?;
     const handler = struct {
-        fn onSignal(_: i32) callconv(.c) void {
+        fn onSignal(_: SigParam) callconv(.c) void {
             stop_flag.store(true, .release);
         }
     };
