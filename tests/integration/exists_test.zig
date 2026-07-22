@@ -32,7 +32,9 @@ test "EXISTS: non-empty inner makes WHERE pass every row" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE EXISTS (SELECT k FROM other) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -47,7 +49,9 @@ test "EXISTS: empty inner makes WHERE filter out everything" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE EXISTS (SELECT k FROM other WHERE k = 999)",
     );
     defer allocator.free(ids);
@@ -62,7 +66,9 @@ test "NOT EXISTS: empty inner passes all rows" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE NOT EXISTS (SELECT k FROM other WHERE k = 999) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -78,7 +84,9 @@ test "EXISTS: composes with AND" {
     defer db.close();
 
     // EXISTS is TRUE (other has rows); AND qty > 15 → ids 2, 3.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE EXISTS (SELECT k FROM other) AND qty > 15 ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -93,7 +101,9 @@ test "EXISTS in projection emits boolean column" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, EXISTS(SELECT k FROM other) AS has FROM t ORDER BY id ASC LIMIT 2",
     );
     defer q.deinit();
@@ -112,7 +122,9 @@ test "EXISTS in projection — empty inner gives FALSE" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT EXISTS(SELECT k FROM other WHERE k = 999) AS has FROM t LIMIT 1",
     );
     defer q.deinit();

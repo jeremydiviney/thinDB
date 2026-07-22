@@ -717,11 +717,10 @@ test "V2 staged window: LAG/ROW_NUMBER with partition, multi-spec, tie determini
     const t = try db.openTable("events", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
-        "SELECT id, LAG(val, 1) OVER (PARTITION BY grp ORDER BY ord) AS prev, " ++
-            "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY ord) AS rn, " ++
-            "SUM(val) OVER (PARTITION BY grp) AS tot " ++
-            "FROM events ORDER BY id");
+    var q = try runSql(allocator, db, "SELECT id, LAG(val, 1) OVER (PARTITION BY grp ORDER BY ord) AS prev, " ++
+        "ROW_NUMBER() OVER (PARTITION BY grp ORDER BY ord) AS rn, " ++
+        "SUM(val) OVER (PARTITION BY grp) AS tot " ++
+        "FROM events ORDER BY id");
     defer q.deinit();
 
     var ids: std.ArrayList(i64) = .empty;
@@ -781,21 +780,18 @@ test "V2 staged window: parallel partition buckets match analytic expectations" 
     try t.flush();
 
     // ROW_NUMBER within each partition must equal o+1 for every row.
-    const rn_bad = try helpers.collectBigints(allocator, db,
-        "SELECT COUNT(*) FROM (SELECT o + 1 AS want, ROW_NUMBER() OVER (PARTITION BY p ORDER BY o) AS rn FROM big) t WHERE rn <> want");
+    const rn_bad = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT o + 1 AS want, ROW_NUMBER() OVER (PARTITION BY p ORDER BY o) AS rn FROM big) t WHERE rn <> want");
     defer allocator.free(rn_bad);
     try std.testing.expectEqualSlices(i64, &[_]i64{0}, rn_bad);
 
     // LAG(id) must be id-1 within a partition and NULL at each partition's
     // first row — exactly 1000 NULLs.
-    const lag_bad = try helpers.collectBigints(allocator, db,
-        "SELECT COUNT(*) FROM (SELECT o, id - 1 AS idm, LAG(id, 1) OVER (PARTITION BY p ORDER BY o) AS prev FROM big) t " ++
-            "WHERE (o = 0 AND prev IS NOT NULL) OR (o > 0 AND prev <> idm)");
+    const lag_bad = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT o, id - 1 AS idm, LAG(id, 1) OVER (PARTITION BY p ORDER BY o) AS prev FROM big) t " ++
+        "WHERE (o = 0 AND prev IS NOT NULL) OR (o > 0 AND prev <> idm)");
     defer allocator.free(lag_bad);
     try std.testing.expectEqualSlices(i64, &[_]i64{0}, lag_bad);
 
-    const lag_nulls = try helpers.collectBigints(allocator, db,
-        "SELECT COUNT(*) FROM (SELECT o, LAG(id, 1) OVER (PARTITION BY p ORDER BY o) AS prev FROM big) t WHERE prev IS NULL");
+    const lag_nulls = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT o, LAG(id, 1) OVER (PARTITION BY p ORDER BY o) AS prev FROM big) t WHERE prev IS NULL");
     defer allocator.free(lag_nulls);
     try std.testing.expectEqualSlices(i64, &[_]i64{1000}, lag_nulls);
 
@@ -803,13 +799,11 @@ test "V2 staged window: parallel partition buckets match analytic expectations" 
     // id order equals each row's dense position; RANK over the heavily
     // tied p column equals p*100+1 for every row (tied keys split across
     // range buckets, serial eval walks the concatenated perm).
-    const grn_bad = try helpers.collectBigints(allocator, db,
-        "SELECT COUNT(*) FROM (SELECT p * 100 + o + 1 AS want, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM big) t WHERE rn <> want");
+    const grn_bad = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT p * 100 + o + 1 AS want, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM big) t WHERE rn <> want");
     defer allocator.free(grn_bad);
     try std.testing.expectEqualSlices(i64, &[_]i64{0}, grn_bad);
 
-    const grk_bad = try helpers.collectBigints(allocator, db,
-        "SELECT COUNT(*) FROM (SELECT p * 100 + 1 AS want, RANK() OVER (ORDER BY p) AS rk FROM big) t WHERE rk <> want");
+    const grk_bad = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT p * 100 + 1 AS want, RANK() OVER (ORDER BY p) AS rk FROM big) t WHERE rk <> want");
     defer allocator.free(grk_bad);
     try std.testing.expectEqualSlices(i64, &[_]i64{0}, grk_bad);
 }
@@ -824,10 +818,9 @@ test "V2 staged window: RANK + QUALIFY above a grouped block" {
 
     // Below-window block = the V2 group handler in all-groups mode; the
     // window ranks the 12 group rows; QUALIFY filters on the window output.
-    var q = try runSql(allocator, db,
-        "SELECT UserID, c, RANK() OVER (ORDER BY c DESC) AS rnk " ++
-            "FROM (SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID) t " ++
-            "QUALIFY rnk <= 3 ORDER BY rnk");
+    var q = try runSql(allocator, db, "SELECT UserID, c, RANK() OVER (ORDER BY c DESC) AS rnk " ++
+        "FROM (SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID) t " ++
+        "QUALIFY rnk <= 3 ORDER BY rnk");
     defer q.deinit();
 
     var users: std.ArrayList(i64) = .empty;

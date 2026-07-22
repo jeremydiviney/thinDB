@@ -91,7 +91,7 @@ pub fn writeSegment(
     // when BOTH the segment-local NDV and the global NDV (this segment merged
     // with every coexisting segment's sketch) are ≤ the cap. Above it the column
     // stays raw — query-time coding would decline a high-card column anyway, and
-    // per-block dicts would only add decode cost. See NARROW_ENCODING_PLAN §2/§3.
+    // per-block dicts would only add decode cost. See docs/plans/NARROW_ENCODING_PLAN.md §2/§3.
     const dict_eligible = try allocator.alloc(bool, columns.len);
     defer allocator.free(dict_eligible);
     for (dict_eligible, 0..) |*elig, ci| {

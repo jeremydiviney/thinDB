@@ -1,5 +1,5 @@
 //! `CREATE FUNCTION name LANGUAGE zig AS $$...$$` — the server-side
-//! compile pipeline for Zig table UDFs (TABLE_UDF_PLAN.md P2).
+//! compile pipeline for Zig table UDFs (docs/plans/TABLE_UDF_PLAN.md P2).
 //!
 //! The submitted source is a complete SDK function file (`spec` + `Input` +
 //! `Output` + `process`, importing the SDK as `@import("tdb")`). The server
@@ -644,7 +644,7 @@ pub fn loadAndRegister(
         .passthrough = passthrough,
         .kernel_input_cols = @intCast(desc.kernel_input_cols),
         .process = dllShim,
-        .user_data = @constCast(@ptrCast(process_fn)),
+        .user_data = @ptrCast(@constCast(process_fn)),
     });
 
     return .{

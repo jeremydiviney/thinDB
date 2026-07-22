@@ -14,10 +14,14 @@ const collectBigints = helpers.collectBigints;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, label VARCHAR(8) NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, qty, label) VALUES " ++
             "(1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')",
     );

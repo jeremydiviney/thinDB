@@ -44,11 +44,16 @@ test "thindb-server binary: starts, accepts a mysql connection, shuts down clean
 
     const argv = [_][]const u8{
         binary_rel_path,
-        "--data-dir",        data_dir,
-        "--bind",            "127.0.0.1",
-        "--mysql-port",      mysql_port_str,
-        "--pg-port",         pg_port_str,
-        "--native-port",     native_port_str,
+        "--data-dir",
+        data_dir,
+        "--bind",
+        "127.0.0.1",
+        "--mysql-port",
+        mysql_port_str,
+        "--pg-port",
+        pg_port_str,
+        "--native-port",
+        native_port_str,
     };
 
     var child = try std.process.spawn(io, .{

@@ -110,10 +110,16 @@ test "temp tables: CREATE TEMP TABLE + INSERT + SELECT round-trip" {
 
     const session: thindb.api.Session = .{ .temp_namespace = ns };
 
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "CREATE TEMP TABLE scratch (id BIGINT PRIMARY KEY, qty INT)",
     );
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "INSERT INTO scratch VALUES (1, 10), (2, 20), (3, 30)",
     );
 
@@ -141,7 +147,10 @@ test "temp tables: other sessions can't see this session's temps" {
     const session_a: thindb.api.Session = .{ .temp_namespace = ns_a };
     const session_b: thindb.api.Session = .{ .temp_namespace = ns_b };
 
-    try runAndDrain(allocator, db, session_a,
+    try runAndDrain(
+        allocator,
+        db,
+        session_a,
         "CREATE TEMP TABLE only_a (id BIGINT PRIMARY KEY)",
     );
 
@@ -185,7 +194,10 @@ test "temp tables: temp shadows persistent table for creating session only" {
     const session_b: thindb.api.Session = .{ .temp_namespace = ns_b };
 
     // session_a shadows with a different schema (same name).
-    try runAndDrain(allocator, db, session_a,
+    try runAndDrain(
+        allocator,
+        db,
+        session_a,
         "CREATE TEMP TABLE shared (id BIGINT PRIMARY KEY, qty INT)",
     );
     try runAndDrain(allocator, db, session_a, "INSERT INTO shared VALUES (1, 999)");
@@ -228,7 +240,10 @@ test "temp tables: DROP TABLE removes the shadowing temp; persistent stays" {
     defer ns.close();
     const session: thindb.api.Session = .{ .temp_namespace = ns };
 
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "CREATE TEMP TABLE shared (id BIGINT PRIMARY KEY, qty INT)",
     );
     try runAndDrain(allocator, db, session, "INSERT INTO shared VALUES (1, 999)");
@@ -256,7 +271,10 @@ test "temp tables: DROP TEMP TABLE keyword form is accepted" {
     defer ns.close();
     const session: thindb.api.Session = .{ .temp_namespace = ns };
 
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "CREATE TEMP TABLE scratch (id BIGINT PRIMARY KEY)",
     );
     try runAndDrain(allocator, db, session, "DROP TEMP TABLE scratch");
@@ -277,7 +295,10 @@ test "temp tables: SHOW TABLES from creating session lists the temp" {
     defer ns.close();
     const session: thindb.api.Session = .{ .temp_namespace = ns };
 
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "CREATE TEMP TABLE my_temp (id BIGINT PRIMARY KEY)",
     );
 
@@ -309,10 +330,16 @@ test "temp tables: auto-flush spill keeps data readable" {
     defer ns.close();
     const session: thindb.api.Session = .{ .temp_namespace = ns };
 
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "CREATE TEMP TABLE spillable (id BIGINT PRIMARY KEY, val INT)",
     );
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "INSERT INTO spillable VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
     );
 
@@ -347,10 +374,16 @@ test "temp tables: namespace close removes the per-session dir" {
     {
         var ns = try thindb.TempNamespace.open(allocator, io, catalog.root_dir, 99, catalog.config);
         const session: thindb.api.Session = .{ .temp_namespace = ns };
-        try runAndDrain(allocator, db, session,
+        try runAndDrain(
+            allocator,
+            db,
+            session,
             "CREATE TEMP TABLE doomed (id BIGINT PRIMARY KEY)",
         );
-        try runAndDrain(allocator, db, session,
+        try runAndDrain(
+            allocator,
+            db,
+            session,
             "INSERT INTO doomed VALUES (1), (2), (3)",
         );
         ns.close();
@@ -381,7 +414,10 @@ test "temp tables: duplicate CREATE TEMP TABLE returns TableAlreadyExists" {
     defer ns.close();
     const session: thindb.api.Session = .{ .temp_namespace = ns };
 
-    try runAndDrain(allocator, db, session,
+    try runAndDrain(
+        allocator,
+        db,
+        session,
         "CREATE TEMP TABLE dup (id BIGINT PRIMARY KEY)",
     );
     try expectCompileError(

@@ -1,6 +1,6 @@
 // LANGUAGE zig lifecycle regression: create/compile/call/dup/bad-source/
 // drop over the mysql wire. Needs a server on :7951 with a WRITABLE
-// scratch data dir (NOT the wayroll/clickbench DBs):
+// scratch data dir (not a shared/production data dir):
 //   ./zig-out/bin/thindb-server.exe --data-dir .zigfn-db --mysql-port 7951 \
 //     --pg-port 0 --native-port 0 --max-dop 4
 // and the zig toolchain on PATH (exact server version).

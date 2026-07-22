@@ -2,7 +2,7 @@
 //!
 //! Generated CTE stacks re-list every column at every level, so a column can
 //! ride 3M+ rows through ten materialized stages after its last real use
-//! (the wayroll rollforward carries seven dead string columns through the
+//! (a production rollforward workload carries seven dead string columns through the
 //! whole window tail). The flat projection analysis (`analyzeProjection`)
 //! can't catch this: each CTE's own select list "references" the column and
 //! keeps it alive forever.

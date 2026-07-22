@@ -885,8 +885,8 @@ test "lexer: operators including != <> <= >=" {
     defer arena.deinit();
     var lx = Lexer.init(arena.allocator(), "a != b <> c <= d >= e < f > g = h");
     const expected_tags = [_]TokenTag{
-        .identifier, .neq, .identifier, .neq, .identifier, .lte, .identifier,
-        .gte,        .identifier, .lt, .identifier, .gt, .identifier, .eq,
+        .identifier, .neq,        .identifier, .neq,        .identifier, .lte,        .identifier,
+        .gte,        .identifier, .lt,         .identifier, .gt,         .identifier, .eq,
         .identifier,
     };
     for (expected_tags) |tag| {
@@ -936,9 +936,9 @@ test "lexer: question mark outside strings produces .question token" {
     defer arena.deinit();
     var lx = Lexer.init(arena.allocator(), "SELECT * FROM t WHERE a = ? AND b = ?");
     const tags = [_]TokenTag{
-        .kw_select, .star, .kw_from, .identifier, .kw_where,
-        .identifier, .eq, .question, .kw_and, .identifier,
-        .eq, .question, .eof,
+        .kw_select,  .star,     .kw_from,  .identifier, .kw_where,
+        .identifier, .eq,       .question, .kw_and,     .identifier,
+        .eq,         .question, .eof,
     };
     for (tags) |tag| {
         try std.testing.expectEqual(tag, (try lx.next()).tag);
@@ -960,8 +960,8 @@ test "lexer: $N outside strings produces .dollar_param token with index" {
     defer arena.deinit();
     var lx = Lexer.init(arena.allocator(), "SELECT * FROM t WHERE a = $1 AND b = $42");
     const expected_tags = [_]TokenTag{
-        .kw_select,  .star, .kw_from,      .identifier, .kw_where,
-        .identifier, .eq,   .dollar_param, .kw_and,     .identifier,
+        .kw_select,  .star,         .kw_from,      .identifier, .kw_where,
+        .identifier, .eq,           .dollar_param, .kw_and,     .identifier,
         .eq,         .dollar_param,
     };
     var idx: u32 = 0;

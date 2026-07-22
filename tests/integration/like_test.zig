@@ -11,7 +11,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(32) NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, name) VALUES (1, 'alpha'), (2, 'alphabet'), (3, 'beta'), (4, 'gamma'), (5, 'al')",
     );
     const t = try db.openTable("t", .{});

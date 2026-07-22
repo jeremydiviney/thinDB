@@ -1017,7 +1017,7 @@ test "appendMaskedColumn fixed-width: trailing filtered-out row never overruns" 
         .{ .src = [_]i64{ 10, 20, 30, 40, 50 }, .mask = [_]bool{ true, false, true, false, false }, .want = [_]i64{ 10, 30 } },
         .{ .src = [_]i64{ 1, 2, 3 }, .mask = [_]bool{ false, false, false }, .want = [_]i64{} }, // all out
         .{ .src = [_]i64{ 7, 8, 9 }, .mask = [_]bool{ true, true, true }, .want = [_]i64{ 7, 8, 9 } }, // none out
-        .{ .src = [_]i64{ 5 }, .mask = [_]bool{false}, .want = [_]i64{} }, // single, filtered
+        .{ .src = [_]i64{5}, .mask = [_]bool{false}, .want = [_]i64{} }, // single, filtered
     };
     inline for (cases) |c| {
         var src = c.src; // runtime copies — comptime-var pointers can't reach a runtime fn

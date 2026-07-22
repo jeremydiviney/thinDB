@@ -94,8 +94,8 @@ pub const CountingAllocator = struct {
 
 pub fn dump(label: []const u8, s: Stats) void {
     std.debug.print("[mem] {s}: allocs={d} resizes={d} remaps={d} frees={d}  bytes_alloc={d} bytes_freed={d}  peak_live={d}  in_alloc={d:.3}ms\n", .{
-        label,        s.n_alloc, s.n_resize, s.n_remap,
-        s.n_free,     s.bytes_alloc, s.bytes_freed, s.peak,
+        label,                             s.n_alloc,     s.n_resize,    s.n_remap,
+        s.n_free,                          s.bytes_alloc, s.bytes_freed, s.peak,
         prof.ticksToMs(@intCast(s.ticks)),
     });
 }

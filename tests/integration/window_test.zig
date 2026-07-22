@@ -43,12 +43,16 @@ fn collectValidity(allocator: std.mem.Allocator, q: *RunResult, col_idx: usize) 
 }
 
 fn seedSimple(allocator: std.mem.Allocator, db: anytype) !void {
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, grp BIGINT, qty BIGINT)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 2, 100), (5, 2, 200)",
     );
     defer q2.deinit();
@@ -66,7 +70,9 @@ test "window: ROW_NUMBER over single partition" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, row_number() OVER (ORDER BY id ASC) AS rn FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -84,7 +90,9 @@ test "window: ROW_NUMBER with PARTITION BY" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, row_number() OVER (PARTITION BY grp ORDER BY id ASC) AS rn FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -102,12 +110,16 @@ test "window: RANK and DENSE_RANK with ties" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1, 90), (2, 90), (3, 80), (4, 70), (5, 70)",
     );
     defer q2.deinit();
@@ -115,14 +127,18 @@ test "window: RANK and DENSE_RANK with ties" {
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, rank() OVER (ORDER BY score DESC) AS rk, dense_rank() OVER (ORDER BY score DESC) AS drk FROM t ORDER BY id ASC",
     );
     defer q.deinit();
     const rks = try collectRows(i64, allocator, &q, 1);
     defer allocator.free(rks);
     // q.next() consumed the batch; re-run for dense
-    var q3 = try runSql(allocator, db,
+    var q3 = try runSql(
+        allocator,
+        db,
         "SELECT id, dense_rank() OVER (ORDER BY score DESC) AS drk FROM t ORDER BY id ASC",
     );
     defer q3.deinit();
@@ -145,11 +161,15 @@ test "window: LAG with default 1-row offset and NULL fallback" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, lag(qty) OVER (PARTITION BY grp ORDER BY id ASC) AS prev_qty FROM t ORDER BY id ASC",
     );
     defer q.deinit();
-    var qq = try runSql(allocator, db,
+    var qq = try runSql(
+        allocator,
+        db,
         "SELECT id, lag(qty) OVER (PARTITION BY grp ORDER BY id ASC) AS prev_qty FROM t ORDER BY id ASC",
     );
     defer qq.deinit();
@@ -176,7 +196,9 @@ test "window: LAG with literal default" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, lag(qty, 1, 0) OVER (PARTITION BY grp ORDER BY id ASC) AS prev_qty FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -197,7 +219,9 @@ test "window: LAG with column-ref default (StarRocks v4 extension)" {
 
     // LAG(qty, 1, qty) — at the first row of each partition, falls
     // back to the current row's qty (so a delta calc gives 0).
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, lag(qty, 1, qty) OVER (PARTITION BY grp ORDER BY id ASC) AS prev_qty FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -217,7 +241,9 @@ test "window: LEAD with default offset" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, lead(qty, 1, 0) OVER (PARTITION BY grp ORDER BY id ASC) AS next_qty FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -237,7 +263,9 @@ test "window: FIRST_VALUE per partition" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, first_value(qty) OVER (PARTITION BY grp ORDER BY id ASC) AS first_q FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -256,7 +284,9 @@ test "window: SUM as running total (default frame)" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, sum(qty) OVER (PARTITION BY grp ORDER BY id ASC) AS running_sum FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -275,7 +305,9 @@ test "window: SUM over whole partition (no ORDER BY)" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, sum(qty) OVER (PARTITION BY grp) AS total FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -294,7 +326,9 @@ test "window: COUNT(*) over partition" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, count(*) OVER (PARTITION BY grp) AS n FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -312,7 +346,9 @@ test "window: AVG as running average" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, avg(qty) OVER (PARTITION BY grp ORDER BY id ASC) AS avg_so_far FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -332,7 +368,9 @@ test "window: MIN/MAX over running frame" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var qa = try runSql(allocator, db,
+    var qa = try runSql(
+        allocator,
+        db,
         "SELECT id, min(qty) OVER (PARTITION BY grp ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer qa.deinit();
@@ -340,7 +378,9 @@ test "window: MIN/MAX over running frame" {
     defer allocator.free(mins);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 10, 10, 100, 100 }, mins);
 
-    var qb = try runSql(allocator, db,
+    var qb = try runSql(
+        allocator,
+        db,
         "SELECT id, max(qty) OVER (PARTITION BY grp ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer qb.deinit();
@@ -358,7 +398,9 @@ test "window: ROWS BETWEEN 1 PRECEDING AND CURRENT ROW (trailing window)" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, sum(qty) OVER (PARTITION BY grp ORDER BY id ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS trailing FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -411,12 +453,16 @@ test "window: LAG IGNORE NULLS skips null source rows when computing offset" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty BIGINT)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1, 10), (2, NULL), (3, NULL), (4, 40), (5, 50)",
     );
     defer q2.deinit();
@@ -424,11 +470,15 @@ test "window: LAG IGNORE NULLS skips null source rows when computing offset" {
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, lag(qty) IGNORE NULLS OVER (ORDER BY id ASC) AS prev FROM t ORDER BY id ASC",
     );
     defer q.deinit();
-    var qv = try runSql(allocator, db,
+    var qv = try runSql(
+        allocator,
+        db,
         "SELECT id, lag(qty) IGNORE NULLS OVER (ORDER BY id ASC) AS prev FROM t ORDER BY id ASC",
     );
     defer qv.deinit();
@@ -457,12 +507,16 @@ test "window: FIRST_VALUE IGNORE NULLS finds first non-null in partition" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty BIGINT)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 30), (4, 40)",
     );
     defer q2.deinit();
@@ -470,7 +524,9 @@ test "window: FIRST_VALUE IGNORE NULLS finds first non-null in partition" {
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, first_value(qty) IGNORE NULLS OVER (ORDER BY id ASC) AS fv FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -488,12 +544,16 @@ test "window: NTILE(4) divides 10 rows into 4 buckets of 3,3,2,2" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)",
     );
     defer q2.deinit();
@@ -501,7 +561,9 @@ test "window: NTILE(4) divides 10 rows into 4 buckets of 3,3,2,2" {
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, ntile(4) OVER (ORDER BY id ASC) AS bucket FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -520,12 +582,16 @@ test "window: PERCENT_RANK + CUME_DIST on ties" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1, 10), (2, 20), (3, 20), (4, 30)",
     );
     defer q2.deinit();
@@ -544,7 +610,9 @@ test "window: PERCENT_RANK + CUME_DIST on ties" {
     //   id=2: 3/4 = 0.75 (peer)
     //   id=3: 3/4 = 0.75
     //   id=4: 4/4 = 1.0
-    var qa = try runSql(allocator, db,
+    var qa = try runSql(
+        allocator,
+        db,
         "SELECT id, percent_rank() OVER (ORDER BY score ASC) AS pr FROM t ORDER BY id ASC",
     );
     defer qa.deinit();
@@ -555,7 +623,9 @@ test "window: PERCENT_RANK + CUME_DIST on ties" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 3.0), pr[2], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), pr[3], 1e-9);
 
-    var qb = try runSql(allocator, db,
+    var qb = try runSql(
+        allocator,
+        db,
         "SELECT id, cume_dist() OVER (ORDER BY score ASC) AS cd FROM t ORDER BY id ASC",
     );
     defer qb.deinit();
@@ -579,11 +649,15 @@ test "window: NTH_VALUE returns NULL when n exceeds frame size, value otherwise"
     // NTH_VALUE(qty, 2) OVER (PARTITION BY grp ORDER BY id) with default
     // frame (UNBOUNDED PRECEDING TO CURRENT ROW). Row 1 of each partition
     // has only 1 row in its frame → NULL. Row 2+ sees the second value.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, nth_value(qty, 2) OVER (PARTITION BY grp ORDER BY id ASC) AS second FROM t ORDER BY id ASC",
     );
     defer q.deinit();
-    var qv = try runSql(allocator, db,
+    var qv = try runSql(
+        allocator,
+        db,
         "SELECT id, nth_value(qty, 2) OVER (PARTITION BY grp ORDER BY id ASC) AS second FROM t ORDER BY id ASC",
     );
     defer qv.deinit();
@@ -607,12 +681,16 @@ test "window: LAG on string column round-trips bytes" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
     );
     defer q2.deinit();
@@ -620,7 +698,9 @@ test "window: LAG on string column round-trips bytes" {
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, lag(name) OVER (ORDER BY id ASC) AS prev FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -643,12 +723,16 @@ test "window: MIN over string column finds lexicographically smallest" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    var q1 = try runSql(allocator, db,
+    var q1 = try runSql(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, grp BIGINT, name TEXT NOT NULL)",
     );
     defer q1.deinit();
     _ = try q1.next();
-    var q2 = try runSql(allocator, db,
+    var q2 = try runSql(
+        allocator,
+        db,
         "INSERT INTO t VALUES (1, 1, 'zeta'), (2, 1, 'alpha'), (3, 1, 'mu'), (4, 2, 'omega'), (5, 2, 'beta')",
     );
     defer q2.deinit();
@@ -656,7 +740,9 @@ test "window: MIN over string column finds lexicographically smallest" {
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, min(name) OVER (PARTITION BY grp) AS smallest FROM t ORDER BY id ASC",
     );
     defer q.deinit();

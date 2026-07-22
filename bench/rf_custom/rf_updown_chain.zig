@@ -117,16 +117,16 @@ pub const Output = struct {
 };
 
 pub const passthrough = .{
-    "projectId",                   "divisionId",                 "customerNumber",     "customerNumberLC",
-    "customerName",                "customerEmail",              "customerNumberHash", "parentCustomerNumber",
-    "parentCustomerName",          "date",                       "minDate",            "month",
-    "amount",                      "originalAmount",             "nonRecurringAmount", "originalNonRecurringAmount",
-    "currency",                    "integrationConfigId",        "exchangeRate",       "planId",
-    "hasAdjustment",               "childAddedToParentCount",    "childRemovedFromParentCount",
-    "childAddedPlanCount",         "childRemovedPlanCount",      "childUpCount",       "childDownCount",
-    "childAddedToParentAmount",    "childRemovedFromParentAmount",
-    "childAddedPlanAmount",        "childRemovedPlanAmount",     "childUpAmount",      "childDownAmount",
-    "crossSellCount",              "crossChurnCount",            "crossSellAmount",    "crossChurnAmount",
+    "projectId",                    "divisionId",              "customerNumber",              "customerNumberLC",
+    "customerName",                 "customerEmail",           "customerNumberHash",          "parentCustomerNumber",
+    "parentCustomerName",           "date",                    "minDate",                     "month",
+    "amount",                       "originalAmount",          "nonRecurringAmount",          "originalNonRecurringAmount",
+    "currency",                     "integrationConfigId",     "exchangeRate",                "planId",
+    "hasAdjustment",                "childAddedToParentCount", "childRemovedFromParentCount", "childAddedPlanCount",
+    "childRemovedPlanCount",        "childUpCount",            "childDownCount",              "childAddedToParentAmount",
+    "childRemovedFromParentAmount", "childAddedPlanAmount",    "childRemovedPlanAmount",      "childUpAmount",
+    "childDownAmount",              "crossSellCount",          "crossChurnCount",             "crossSellAmount",
+    "crossChurnAmount",
 };
 
 pub const Computed = struct {

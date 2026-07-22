@@ -223,4 +223,3 @@ test "pgTypeOf maps thinDB types to expected OIDs" {
     try std.testing.expectEqual(@as(i16, -1), pgTypeOf(.string).type_size);
     try std.testing.expectEqual(@as(i16, 8), pgTypeOf(.bigint).type_size);
 }
-

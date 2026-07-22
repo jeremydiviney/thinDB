@@ -480,7 +480,6 @@ const RawRows = struct {
             .u128 => dst.keyU128All()[dst_idx] = src.keyU128All()[src_idx],
         }
     }
-
 };
 
 pub const GroupKeyWidth = enum {
@@ -1288,11 +1287,9 @@ const GroupRows = struct {
             .u128 => self.keyU128All()[idx] = key,
         }
     }
-
 };
 
 const PartBucket = struct {
-
     fn deinit(self: *PartBucket, _: Allocator) void {
         self.* = .{};
     }
@@ -4772,7 +4769,7 @@ inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) 
     const h = routeHashRowBits(@truncate(key), @truncate(key >> 64));
     return if (std.math.isPowerOfTwo(bucket_count))
         (@as(usize, @truncate(h)) & (bucket_count - 1))
-        else
+    else
         bucketIndexHash(h, bucket_count);
 }
 
@@ -5373,9 +5370,9 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
         if (job.profile) job.local.sched_decision_ticks += nowTicks() - decision_t0;
 
         if (job.raw_group_mode == .staged_final) {
-        const scan_choice = if (scan_claims_available) minUnlockedScanLane(job.shared.raw_scan_queues, job.worker_index) else null;
-        const stage_choice = maxUnlockedQueueLaneRows(job.shared.raw_scan_queues, job.worker_index);
-        const group_choice = maxUnlockedQueueLaneRows(job.shared.raw_group_queues, job.worker_index);
+            const scan_choice = if (scan_claims_available) minUnlockedScanLane(job.shared.raw_scan_queues, job.worker_index) else null;
+            const stage_choice = maxUnlockedQueueLaneRows(job.shared.raw_scan_queues, job.worker_index);
+            const group_choice = maxUnlockedQueueLaneRows(job.shared.raw_group_queues, job.worker_index);
             const max_stage_rows = if (stage_choice) |choice| choice.rows else 0;
             const max_group_rows = if (group_choice) |choice| choice.rows else 0;
             const downstream_max_rows = @max(max_stage_rows, max_group_rows);
@@ -5394,22 +5391,22 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
             }
 
             if (max_stage_rows > max_group_rows) {
-            if (stage_choice) |choice| {
-                if (claimRawQueueLaneExact(job.shared.raw_scan_queues, choice.lane)) {
-                    const did_stage = try drainRawDedicatedStageSharedBuilders(
-                        job.shared.allocator,
-                        job.shared,
-                        job.local,
-                        choice.lane,
-                        job.raw_chunk_rows,
-                        job.raw_group_chunk_rows,
-                        job.raw_batch_chunks,
-                        job.profile,
-                    );
-                    if (did_stage) {
-                        job.local.sched_stage_jobs += 1;
-                        idle_spins = 0;
-                        continue;
+                if (stage_choice) |choice| {
+                    if (claimRawQueueLaneExact(job.shared.raw_scan_queues, choice.lane)) {
+                        const did_stage = try drainRawDedicatedStageSharedBuilders(
+                            job.shared.allocator,
+                            job.shared,
+                            job.local,
+                            choice.lane,
+                            job.raw_chunk_rows,
+                            job.raw_group_chunk_rows,
+                            job.raw_batch_chunks,
+                            job.profile,
+                        );
+                        if (did_stage) {
+                            job.local.sched_stage_jobs += 1;
+                            idle_spins = 0;
+                            continue;
                         }
                         job.local.sched_group_misses += 1;
                     }

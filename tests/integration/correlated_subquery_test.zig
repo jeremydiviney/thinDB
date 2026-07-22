@@ -19,10 +19,14 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE orders (o_id BIGINT PRIMARY KEY, o_total INT NOT NULL)");
     try exec(allocator, db, "CREATE TABLE lineitem (l_id BIGINT PRIMARY KEY, l_orderid BIGINT NOT NULL, l_qty INT NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO orders (o_id, o_total) VALUES (1, 100), (2, 200), (3, 300), (4, 400)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO lineitem (l_id, l_orderid, l_qty) VALUES (1, 1, 5), (2, 1, 10), (3, 2, 50), (4, 4, 200)",
     );
     const t1 = try db.openTable("orders", .{});
@@ -133,16 +137,24 @@ test "correlated EXISTS: multi-key correlation" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE ps (ps_part BIGINT NOT NULL, ps_supp BIGINT NOT NULL, PRIMARY KEY (ps_part, ps_supp))",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE li (li_id BIGINT PRIMARY KEY, li_part BIGINT NOT NULL, li_supp BIGINT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO ps (ps_part, ps_supp) VALUES (1, 10), (1, 20), (2, 10), (3, 30)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO li (li_id, li_part, li_supp) VALUES (1, 1, 10), (2, 2, 10), (3, 3, 99)",
     );
     const t1 = try db.openTable("ps", .{});

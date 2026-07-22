@@ -31,4 +31,3 @@ pub fn tryBuildLowCardGroup(
 ) !?exec.Query {
     return v2_lowcard_group.tryBuild(allocator, table, request);
 }
-

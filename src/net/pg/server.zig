@@ -1089,7 +1089,7 @@ fn commandTagFor(op: ir.Op) []const u8 {
             .truncate_table => "TRUNCATE TABLE",
             .use_schema, .use_database_schema => "SET",
             .create_sql_function => "CREATE FUNCTION",
-        .create_zig_function => "CREATE FUNCTION",
+            .create_zig_function => "CREATE FUNCTION",
             .drop_sql_function => "DROP FUNCTION",
             .create_view => |cv| if (cv.materialized) "CREATE MATERIALIZED VIEW" else "CREATE VIEW",
             .drop_view => |dv| if (dv.materialized) "DROP MATERIALIZED VIEW" else "DROP VIEW",

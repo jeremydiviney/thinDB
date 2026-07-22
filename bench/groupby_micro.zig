@@ -726,9 +726,8 @@ fn q32_radix_dist(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
         const stddev = std.math.sqrt(sq / @as(f64, @floatFromInt(P)));
         std.debug.print("\n[2-pass radix bucket distribution]  P={d}  N={d}\n", .{ P, N });
         std.debug.print("  mean={d:.1}  min={d}  max={d}  stddev={d:.1}  spread max/mean={d:.4}  min/mean={d:.4}\n", .{
-            mean, mn, mx, stddev,
-            @as(f64, @floatFromInt(mx)) / mean,
-            @as(f64, @floatFromInt(mn)) / mean,
+            mean,                               mn,                                 mx, stddev,
+            @as(f64, @floatFromInt(mx)) / mean, @as(f64, @floatFromInt(mn)) / mean,
         });
         std.debug.print("  per-bucket row counts (16/line):\n", .{});
         for (counts, 0..) |c, idx| {

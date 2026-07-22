@@ -773,7 +773,6 @@ pub const Op = union(OpTag) {
         region_keys: ?[]const []const u8 = null,
     };
 
-
     pub const Alias = struct {
         alias: []const u8,
         upstream: *Op,

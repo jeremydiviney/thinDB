@@ -1055,7 +1055,7 @@ pub const ParallelScan = struct {
         if (self.stage_deferred) return false;
         if (self.mode != .unset) return false;
         // CASE over a TABLE scan stays serial by MEASUREMENT, not capability:
-        // the wayroll A/B (2026-07-11, table-source) showed fusing CASE-heavy
+        // a production-workload A/B (2026-07-11, table-source) showed fusing CASE-heavy
         // chains there is a net loss — the scan is memory-bandwidth-bound, so
         // N workers buy nothing while per-chunk operator instances add cost.
         // Over a BUFFER (stage) scan the same fusion is a clear win (block-6
@@ -1121,8 +1121,8 @@ pub const ParallelScan = struct {
     /// `agg_q[i]` OWNS `workers[i]`; `agg_built` drives the deinit ownership split.
     /// (The partial aggregates touch the shared, non-thread-safe accountant only
     /// to bump a fixed per-source usize counter — benign undercounting under
-    /// concurrency; the materialize step does the real byte reservation. TODO:
-    /// null the partial accountant before enabling this path by default.)
+    /// concurrency; the materialize step does the real byte reservation. The
+    /// partial accountant must be nulled before this path can default on.)
     /// Accept a join-probe sink when nothing else has claimed the workers'
     /// output. Works in both modes: round workers stage the sink's joined
     /// batches directly; materialize-mode (fused-filter) workers drain their
@@ -1647,13 +1647,12 @@ pub const ParallelScan = struct {
             .chunk => {},
         };
         std.debug.print("[pscan] threads={d}(eff={d}) chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
-            self.n_threads,                       self.eff_threads,                     self.workers.len,                                        drain_wall_ms,                        rows,
+            self.n_threads,                       self.eff_threads,                     self.workers.len,                                        drain_wall_ms, rows,
             exec.prof.ticksToMs(@intCast(min_t)), exec.prof.ticksToMs(@intCast(max_t)), exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
         });
         std.debug.print("[pscan] rowgroups: considered={d} scanned={d} pruned={d} ({d:.1}%)  rows_decoded={d}  busiest_worker_rgs={d}\n", .{
-            considered,                  scanned, considered - scanned,
-            if (considered > 0) @as(f64, @floatFromInt(considered - scanned)) * 100.0 / @as(f64, @floatFromInt(considered)) else 0.0,
-            rows_in,                     max_rgs,
+            considered,                                                                                                               scanned, considered - scanned,
+            if (considered > 0) @as(f64, @floatFromInt(considered - scanned)) * 100.0 / @as(f64, @floatFromInt(considered)) else 0.0, rows_in, max_rgs,
         });
         switch (self.workers[0]) {
             .segment => |w0| std.debug.print("[pscan] prune hints on worker0: leaf={d} in_set={d} seg_skip={}\n", .{

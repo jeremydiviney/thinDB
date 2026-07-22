@@ -126,7 +126,6 @@ pub const NestedLoopJoin = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
@@ -561,4 +560,3 @@ fn isStringTag(t: TypeTag) bool {
         else => false,
     };
 }
-

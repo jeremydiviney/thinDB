@@ -38,7 +38,9 @@ fn insertChunked(allocator: std.mem.Allocator, db: anytype, n: i64) !void {
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype, n: i64) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT NOT NULL, b BIGINT NOT NULL, c INT NOT NULL, d INT NOT NULL)",
     );
     try insertChunked(allocator, db, n);

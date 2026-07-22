@@ -16,10 +16,14 @@ const exec = helpers.exec;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE nt (id BIGINT PRIMARY KEY, v BIGINT, s VARCHAR(16), grp VARCHAR(8) NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO nt (id, v, s, grp) VALUES " ++
             "(1, 10, 'a', 'x'), (2, NULL, NULL, 'x'), (3, 20, 'b', 'x'), " ++
             "(4, NULL, NULL, 'y'), (5, NULL, NULL, 'y'), (6, 30, NULL, 'z')",
@@ -204,7 +208,9 @@ test "null basics: COUNT variants, aggregate NULL skipping, DISTINCT exclusion" 
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT COUNT(*) AS a, COUNT(v) AS b, COUNT(s) AS c, COUNT(DISTINCT v) AS d FROM nt",
     );
     defer q.deinit();
@@ -224,7 +230,9 @@ test "null aggregates: zero qualifying rows finalize to NULL (COUNT stays 0)" {
     defer db.close();
 
     // Empty input: SUM/AVG/MIN/MAX are NULL, COUNTs are 0.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs FROM nt WHERE id > 100",
     );
     defer q.deinit();
@@ -247,7 +255,9 @@ test "null aggregates: an all-NULL input column finalizes to NULL" {
     defer db.close();
 
     // Rows EXIST (4 and 5) but every v is NULL.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs FROM nt WHERE grp = 'y'",
     );
     defer q.deinit();
@@ -271,7 +281,9 @@ test "null aggregates: grouped all-NULL group emits NULL aggregates" {
     // grp y = two rows, both v NULL → SUM/AVG/MIN/MAX NULL, COUNT(v) 0,
     // COUNT(*) 2. grp x mixes (10, NULL, 20) → SUM 30, AVG 15 (non-NULL
     // denominator), COUNT(v) 2, COUNT(*) 3.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT grp, SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs " ++
             "FROM nt GROUP BY grp ORDER BY grp",
     );
@@ -310,7 +322,9 @@ test "null aggregates: metadata lane (bare global, flushed, no WHERE) emits NULL
     const t = try db.openTable("allnull", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi, COUNT(v) AS cv, COUNT(*) AS cs FROM allnull",
     );
     defer q.deinit();
@@ -406,10 +420,14 @@ test "null group keys: memtable-only rows (unflushed) group correctly" {
 
     // Same fixture, never flushed — the V1 legacy hash path segfaulted on
     // exactly this shape (memtable string-key GROUP BY with NULL rows).
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE mt (id BIGINT PRIMARY KEY, v BIGINT, s VARCHAR(16))",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO mt (id, v, s) VALUES (1, 10, 'a'), (2, NULL, NULL), (3, 20, 'b'), (4, NULL, NULL)",
     );
 
@@ -442,7 +460,9 @@ test "null group keys: NULL-keyed group aggregates its values normally" {
 
     // GROUP BY s: the NULL group holds ids {2,4,5,6} with v = NULL,NULL,NULL,30
     // → SUM(v)=30, COUNT(v)=1, COUNT(*)=4.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT s, SUM(v) AS sv, COUNT(v) AS cv, COUNT(*) AS cs FROM nt GROUP BY s ORDER BY s",
     );
     defer q.deinit();
@@ -487,7 +507,9 @@ test "null window: PARTITION BY nullable key — NULLs form one partition" {
     defer db.close();
 
     // v partitions: {1}(v=10), {2,4,5}(NULL), {3}(20), {6}(30).
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, COUNT(*) OVER (PARTITION BY v) AS c, SUM(id) OVER (PARTITION BY v) AS si FROM nt ORDER BY id",
     );
     defer q.deinit();
@@ -554,10 +576,14 @@ test "null agg inputs: all-NULL group emits NULL for SUM/AVG/MIN/MAX, 0 for coun
 
     // grp 'a': v = 10, NULL, 30 / s = 'm', NULL, ''   (mixed)
     // grp 'b': v = NULL, NULL  / s = NULL, NULL       (all-NULL)
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE na (id BIGINT PRIMARY KEY, grp VARCHAR(8) NOT NULL, v BIGINT, s VARCHAR(16))",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO na (id, grp, v, s) VALUES " ++
             "(1, 'a', 10, 'm'), (2, 'a', NULL, NULL), (3, 'a', 30, ''), " ++
             "(4, 'b', NULL, NULL), (5, 'b', NULL, NULL)",
@@ -565,7 +591,9 @@ test "null agg inputs: all-NULL group emits NULL for SUM/AVG/MIN/MAX, 0 for coun
     const t = try db.openTable("na", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT grp, SUM(v) AS sv, AVG(v) AS av, MIN(v) AS lo, MAX(v) AS hi, " ++
             "COUNT(v) AS cv, COUNT(*) AS cs, COUNT(DISTINCT v) AS dv, MIN(s) AS ms " ++
             "FROM na GROUP BY grp ORDER BY grp",
@@ -608,10 +636,14 @@ test "grouped variance/stddev: welford per group, NULL skips, 1-row samp is NULL
     // grp 'a': x = 1..5         → var_pop 2.0, var_samp 2.5
     // grp 'b': x = 42           → var_pop 0, var_samp NULL (n < 2)
     // grp 'c': x = NULL, 10, 20 → NULL skipped: var_pop 25, var_samp 50
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE wv (id BIGINT PRIMARY KEY, grp VARCHAR(8) NOT NULL, x DOUBLE)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO wv (id, grp, x) VALUES " ++
             "(1,'a',1), (2,'a',2), (3,'a',3), (4,'a',4), (5,'a',5), " ++
             "(6,'b',42), (7,'c',NULL), (8,'c',10), (9,'c',20)",
@@ -619,7 +651,9 @@ test "grouped variance/stddev: welford per group, NULL skips, 1-row samp is NULL
     const t = try db.openTable("wv", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT grp, VAR_POP(x) AS vp, VAR_SAMP(x) AS vs, STDDEV_POP(x) AS sp, STDDEV_SAMP(x) AS ss " ++
             "FROM wv GROUP BY grp ORDER BY grp",
     );
@@ -652,10 +686,14 @@ test "group_concat: skips NULLs, all-NULL group emits NULL, custom separator, ro
     const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE gc (id BIGINT PRIMARY KEY, grp VARCHAR(8) NOT NULL, s VARCHAR(16))",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO gc (id, grp, s) VALUES " ++
             "(1,'a','x'), (2,'a',NULL), (3,'a','y'), (4,'a',''), " ++
             "(5,'b',NULL), (6,'b',NULL)",
@@ -663,7 +701,9 @@ test "group_concat: skips NULLs, all-NULL group emits NULL, custom separator, ro
     const t = try db.openTable("gc", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT grp, GROUP_CONCAT(s, '|') AS cs, COUNT(*) AS c FROM gc GROUP BY grp ORDER BY grp",
     );
     defer q.deinit();

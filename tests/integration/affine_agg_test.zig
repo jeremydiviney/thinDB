@@ -19,11 +19,15 @@ const exec = helpers.exec;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, w SMALLINT NOT NULL, g BIGINT NOT NULL, f DOUBLE NOT NULL)",
     );
     // w in [10, 60]; g in {1, 2} for grouped tests; f mirrors w as a double.
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, w, g, f) VALUES " ++
             "(1, 10, 1, 10.0), (2, 20, 1, 20.0), (3, 30, 2, 30.0), " ++
             "(4, 40, 2, 40.0), (5, 50, 1, 50.0), (6, 60, 2, 60.0)",
@@ -42,7 +46,9 @@ test "affine-agg: Q29-shape SUM(w+k) identical to SUM(w)+k*COUNT(w)" {
     defer db.close();
 
     // SUM(w) = 210, COUNT(w) = 6. SUM(w+k) = 210 + 6k.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(w), SUM(w + 1), SUM(w + 5), SUM(w + 89) FROM t",
     );
     defer q.deinit();
@@ -68,7 +74,9 @@ test "affine-agg: SUM with sub and mul affine args" {
     // SUM(w - 3)   = 210 - 18 = 192
     // SUM(3 - w)   = 18 - 210 = -192
     // SUM(2 * w)   = 420
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(w - 3), SUM(3 - w), SUM(2 * w), SUM(w) FROM t",
     );
     defer q.deinit();
@@ -91,7 +99,9 @@ test "affine-agg: MIN/MAX over affine args (value selection, bit-identical)" {
     // w in [10, 60]. MIN(w)=10, MAX(w)=60.
     // MIN(w-2) = 8, MAX(w+5) = 65, MIN(3-w) = 3-60 = -57 (a<0 flips to MAX),
     // MAX(2*w) = 120.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT MIN(w), MIN(w - 2), MAX(w + 5), MIN(3 - w), MAX(2 * w) FROM t",
     );
     defer q.deinit();
@@ -114,7 +124,9 @@ test "affine-agg: grouped SUM(w+k) per group identical" {
     defer db.close();
 
     // g=1: w in {10,20,50} → SUM=80, COUNT=3. g=2: w in {30,40,60} → SUM=130, COUNT=3.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT g, SUM(w), SUM(w + 10) FROM t GROUP BY g ORDER BY g ASC",
     );
     defer q.deinit();
@@ -146,7 +158,9 @@ test "affine-agg: grouped reduction fires for 3+ aggs (V2 group-topn path)" {
     // Three affine SUMs collapse to one base set {SUM(w), COUNT(w)}; the core
     // computes those and the three outputs derive per group. g=1: SUM=80,N=3.
     // g=2: SUM=130,N=3. SUM(w+k) = SUM + k*N.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT g, SUM(w), SUM(w + 1), SUM(w + 2) FROM t GROUP BY g ORDER BY g ASC",
     );
     defer q.deinit();
@@ -178,7 +192,9 @@ test "affine-agg: ORDER BY a reduced agg keeps it direct for ranking" {
 
     // s1 is in ORDER BY, so it must stay a direct core aggregate (the core ranks
     // on it); s0 and s2 still reduce. Top group by s1 DESC is g=2 (133 > 83).
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT g, SUM(w) s0, SUM(w + 1) s1, SUM(w + 2) s2 FROM t GROUP BY g ORDER BY s1 DESC",
     );
     defer q.deinit();
@@ -210,7 +226,9 @@ test "affine-agg: float SUM is NOT reduced (stays direct, correct)" {
 
     // f mirrors w: SUM(f)=210.0. SUM(f+1.0)=216.0. Float SUM is non-associative
     // so the rewrite must skip it — but the direct result is still correct here.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(f), SUM(f + 1.0) FROM t",
     );
     defer q.deinit();
@@ -229,7 +247,9 @@ test "affine-agg: non-affine arg (w*w) is NOT reduced (stays direct, correct)" {
     defer db.close();
 
     // w*w: 100+400+900+1600+2500+3600 = 9100. Non-affine → left direct.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(w * w), SUM(w) FROM t",
     );
     defer q.deinit();
@@ -249,7 +269,9 @@ test "affine-agg: SUM overflow raises ArithmeticOverflow identically" {
     try exec(allocator, db, "CREATE TABLE big (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)");
     // Three rows near i64 max so Σc overflows i64 — the reduced SUM(c) must
     // narrow with the same i64 range check the direct SUM finalize uses.
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO big (id, c) VALUES (1, 9000000000000000000), (2, 9000000000000000000), (3, 9000000000000000000)",
     );
     const t = try db.openTable("big", .{});

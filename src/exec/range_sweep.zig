@@ -48,7 +48,6 @@ const transform = @import("../engine/transform.zig");
 const join_mod = @import("join.zig");
 const Spec = join_mod.Spec;
 
-
 const output_batch_rows: usize = 8192;
 
 pub const RangeSweepJoin = struct {
@@ -92,7 +91,6 @@ pub const RangeSweepJoin = struct {
     // continues while cur_emit_pos < cur_emit_hi.
     cur_emit_hi: u32 = 0,
     cur_emit_pos: u32 = 0,
-
 
     // Output staging. Matched (A,B) row pairs accumulate in `a_rows`/
     // `b_rows` and flush through a bulk per-column gather — never a
@@ -559,4 +557,3 @@ fn cmpInColumn(col: ColumnView, a: u32, b: u32) std.math.Order {
         .json => std.mem.order(u8, col.data.json.rowBytes(a), col.data.json.rowBytes(b)),
     };
 }
-

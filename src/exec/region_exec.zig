@@ -1,4 +1,4 @@
-//! Keyed pipeline region runtime — data plane (REGION_PLAN.md, P0).
+//! Keyed pipeline region runtime — data plane (docs/plans/REGION_PLAN.md, P0).
 //!
 //! A region partitions its input ONCE by a key's hash into `n_shards`
 //! buckets at scan time, then runs its whole operator chain shard-locally
@@ -788,7 +788,7 @@ pub fn consolidateAppendTail(
 // columns without moving rows; restructuring ops (group_agg, inner
 // hash_probe) replace the frame and rewrite the ranges. There is no
 // materialization and no generic operator chain between ops — this IS the
-// region's fused path (REGION_PLAN.md §6).
+// region's fused path (docs/plans/REGION_PLAN.md §6).
 // ---------------------------------------------------------------------------
 
 pub const OrderBy = struct { col: usize, desc: bool = false };
@@ -3764,7 +3764,6 @@ pub fn runRegionPooled(
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
 
-
     if (trace) {
         const t2 = exec.prof.nowTicks();
         var rows: usize = 0;
@@ -4859,16 +4858,18 @@ test "region program: tvf_grouped union_append with input filter" {
     const inputs = [_]usize{ 0, 1, 2 };
     const emit_cols = [_]usize{ 0, 1, 2 };
     const ops = [_]RegionOp{
-        .{ .tvf_grouped = .{
-            .spec = .{
-                .process = tKernelEstimate,
-                .inputs = &inputs,
-                .out = &entry,
+        .{
+            .tvf_grouped = .{
+                .spec = .{
+                    .process = tKernelEstimate,
+                    .inputs = &inputs,
+                    .out = &entry,
+                },
+                .union_append = true,
+                // Only v in [10, 30] feeds the kernel; range "b" (v=7) gets none.
+                .input_filter = .{ .col = 2, .lo = 10, .hi = 30 },
             },
-            .union_append = true,
-            // Only v in [10, 30] feeds the kernel; range "b" (v=7) gets none.
-            .input_filter = .{ .col = 2, .lo = 10, .hi = 30 },
-        } },
+        },
         .{ .emit = .{ .cols = &emit_cols } },
     };
 

@@ -2614,7 +2614,14 @@ pub const Scan = struct {
     }
 
     fn fcmpFor(comptime o: PredicateOp, v: i128, w: i128) bool {
-        return switch (o) { .eq => v == w, .neq => v != w, .lt => v < w, .lte => v <= w, .gt => v > w, .gte => v >= w };
+        return switch (o) {
+            .eq => v == w,
+            .neq => v != w,
+            .lt => v < w,
+            .lte => v <= w,
+            .gt => v > w,
+            .gte => v >= w,
+        };
     }
 
     /// Run-aware analogue of `forCompareInto`: evaluate `value <op> want` ONCE

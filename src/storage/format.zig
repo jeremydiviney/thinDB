@@ -475,7 +475,7 @@ test "encodeFloatOrder is monotonic across the f64 range" {
     // Ascending by numeric value; encoded keys must be strictly increasing.
     const ordered = [_]f64{
         -std.math.inf(f64), -1e308, -1.5, -1.0, -0.5, -1e-308, -0.0,
-        0.0,               1e-308, 0.5,  1.0,  1.5,  1e308,    std.math.inf(f64),
+        0.0,                1e-308, 0.5,  1.0,  1.5,  1e308,   std.math.inf(f64),
     };
     var prev = encodeFloatOrder(ordered[0]);
     for (ordered[1..]) |f| {

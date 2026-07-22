@@ -392,4 +392,3 @@ pub fn sendSingleColumnRows(
     }
     try sendResultTerminator(allocator, w, seq_id, client_caps);
 }
-

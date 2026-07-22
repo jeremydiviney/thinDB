@@ -19,7 +19,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     try exec(allocator, db, "CREATE TABLE customer (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL)");
     try exec(allocator, db, "CREATE TABLE premium (cust_id BIGINT PRIMARY KEY)");
     try exec(allocator, db, "CREATE TABLE blocked (cust_id BIGINT NULL, note VARCHAR(8) NULL, PRIMARY KEY (note))");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO customer (id, region) VALUES (1, 'east'), (2, 'east'), (3, 'west'), (4, 'north'), (5, 'west')",
     );
     try exec(allocator, db, "INSERT INTO premium (cust_id) VALUES (2), (4)");
@@ -42,7 +44,9 @@ test "IN (subquery): basic set membership" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM customer WHERE id IN (SELECT cust_id FROM premium) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -57,7 +61,9 @@ test "NOT IN (subquery) with no NULLs in the set" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM customer WHERE id NOT IN (SELECT cust_id FROM premium) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -75,7 +81,9 @@ test "NOT IN (subquery) with NULL in set — thinDB dialect drops the NULL" {
     // blocked.cust_id = [3, NULL]. Dialect: NULL dropped → set is {3}.
     // SQL-standard would filter out every row (NULL contamination).
     // thinDB returns all customers whose id != 3.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM customer WHERE id NOT IN (SELECT cust_id FROM blocked) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -92,7 +100,9 @@ test "IN (subquery): text column" {
 
     try exec(allocator, db, "CREATE TABLE products (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL)");
     try exec(allocator, db, "CREATE TABLE active_regions (name VARCHAR(8) PRIMARY KEY)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO products (id, region) VALUES (1, 'east'), (2, 'west'), (3, 'south'), (4, 'east')",
     );
     try exec(allocator, db, "INSERT INTO active_regions (name) VALUES ('east'), ('west')");
@@ -101,7 +111,9 @@ test "IN (subquery): text column" {
     const t2 = try db.openTable("active_regions", .{});
     try t2.flush();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM products WHERE region IN (SELECT name FROM active_regions) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -116,7 +128,9 @@ test "IN (subquery): empty inner makes IN always-false" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM customer WHERE id IN (SELECT cust_id FROM premium WHERE cust_id = 999)",
     );
     defer allocator.free(ids);
@@ -131,7 +145,9 @@ test "NOT IN (subquery): empty inner passes every row" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM customer WHERE id NOT IN (SELECT cust_id FROM premium WHERE cust_id = 999) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -148,7 +164,8 @@ test "IN (subquery): multi-column inner rejected" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(),
+    const root = try thindb.sql.parse(
+        arena.allocator(),
         "SELECT id FROM customer WHERE id IN (SELECT cust_id, 1 AS marker FROM premium)",
     );
     const cq = thindb.net.compile(allocator, db, root);

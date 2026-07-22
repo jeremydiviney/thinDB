@@ -374,7 +374,7 @@ test "cache acquire/insert round-trip + hit/miss counters" {
     try std.testing.expect(c.acquire(k) == null);
     try std.testing.expectEqual(@as(u64, 1), c.misses);
 
-    const e1 = try c.insertPinned(k, try adup(allocator,"hello"), .raw);
+    const e1 = try c.insertPinned(k, try adup(allocator, "hello"), .raw);
     try std.testing.expectEqualStrings("hello", e1.bytes);
     c.release(e1);
 
@@ -392,7 +392,7 @@ test "cache evicts unpinned LRU entries when over budget" {
     // Four 10-byte entries, all released so they're evictable; the fourth
     // pushes us to 40 > 30, evicting the LRU tail (rg 0).
     inline for (0..4) |i| {
-        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try adup(allocator,"0123456789"));
+        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try adup(allocator, "0123456789"));
     }
 
     try std.testing.expect(c.acquire(.{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }) == null);
@@ -408,15 +408,15 @@ test "cache LRU order updated on acquire" {
 
     const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
     const k2 = Key{ .segment_id = 1, .row_group_idx = 1, .column_idx = 0 };
-    try put(&c, k1, try adup(allocator,"0123456789"));
-    try put(&c, k2, try adup(allocator,"abcdefghij"));
+    try put(&c, k1, try adup(allocator, "0123456789"));
+    try put(&c, k2, try adup(allocator, "abcdefghij"));
 
     // Touch k1 → MRU; k2 becomes the LRU tail.
     c.release(c.acquire(k1).?);
 
     // Inserting a third 10-byte entry over a cap of 20 evicts the tail (k2).
     const k3 = Key{ .segment_id = 1, .row_group_idx = 2, .column_idx = 0 };
-    try put(&c, k3, try adup(allocator,"XXXXXXXXXX"));
+    try put(&c, k3, try adup(allocator, "XXXXXXXXXX"));
 
     try std.testing.expect(c.acquire(k2) == null);
     c.release(c.acquire(k1).?);
@@ -430,11 +430,11 @@ test "cache never evicts a pinned entry, even over budget" {
 
     // Hold k1 pinned (in-use) the whole time.
     const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
-    const pinned = try c.insertPinned(k1, try adup(allocator,"0123456789"), .raw);
+    const pinned = try c.insertPinned(k1, try adup(allocator, "0123456789"), .raw);
 
     // Flood the cache well past budget while k1 — the oldest entry — stays pinned.
     inline for (1..4) |i| {
-        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try adup(allocator,"XXXXXXXXXX"));
+        try put(&c, .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, try adup(allocator, "XXXXXXXXXX"));
     }
 
     // k1 must still be resident despite being LRU and us being over budget.
@@ -450,10 +450,10 @@ test "cache insertPinned dedupes a racing duplicate key" {
     defer c.deinit();
 
     const k = Key{ .segment_id = 7, .row_group_idx = 2, .column_idx = 3 };
-    const first = try c.insertPinned(k, try adup(allocator,"AAAA"), .raw);
+    const first = try c.insertPinned(k, try adup(allocator, "AAAA"), .raw);
     // Second insert of the same key (simulating a lost decompress race) must
     // free the redundant bytes and hand back the existing entry.
-    const second = try c.insertPinned(k, try adup(allocator,"BBBB"), .raw);
+    const second = try c.insertPinned(k, try adup(allocator, "BBBB"), .raw);
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqualStrings("AAAA", second.bytes);
     try std.testing.expectEqual(@as(usize, 4), c.current_bytes);

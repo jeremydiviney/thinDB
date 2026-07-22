@@ -324,9 +324,9 @@ test "kernelFor: same-type returns null" {
 
 test "kernelFor: every allowed cast has a kernel" {
     const tags = [_]TypeTag{
-        .tinyint, .smallint, .int, .bigint, .largeint, .boolean,
-        .float,   .double,   .date, .datetime,
-        .string,  .varchar,  .char, .uuid,
+        .tinyint, .smallint, .int,  .bigint,   .largeint, .boolean,
+        .float,   .double,   .date, .datetime, .string,   .varchar,
+        .char,    .uuid,
     };
     for (tags) |f| for (tags) |t| {
         const has_cost = castCost(f, t) != null;

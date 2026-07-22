@@ -489,4 +489,3 @@ fn readRecord(bytes: []const u8, off: usize) !ReadRecord {
         .cursor_after = payload_end + record_trailer_size,
     };
 }
-

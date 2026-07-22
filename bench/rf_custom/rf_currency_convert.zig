@@ -130,11 +130,11 @@ pub const Output = struct {
 };
 
 pub const passthrough = .{
-    "projectId",              "divisionId",           "customerNumber",     "customerName",
-    "customerNumberLC",       "parentCustomerNumber", "parentCustomerName", "customerNumberHash",
-    "date",                   "invoiceDate",          "invoiceId",          "originalCustomerNumber",
-    "originalCustomerName",   "planId",               "lineItemType",       "integrationConfigId",
-    "startDate",              "customerEmail",
+    "projectId",            "divisionId",           "customerNumber",     "customerName",
+    "customerNumberLC",     "parentCustomerNumber", "parentCustomerName", "customerNumberHash",
+    "date",                 "invoiceDate",          "invoiceId",          "originalCustomerNumber",
+    "originalCustomerName", "planId",               "lineItemType",       "integrationConfigId",
+    "startDate",            "customerEmail",
 };
 
 pub const Computed = struct {

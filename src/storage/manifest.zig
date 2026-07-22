@@ -527,4 +527,3 @@ test "manifest atomic rename replaces existing manifest" {
     defer read.deinit();
     try std.testing.expectEqual(@as(usize, 2), read.segments.items.len);
 }
-

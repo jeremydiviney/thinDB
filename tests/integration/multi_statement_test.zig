@@ -77,9 +77,8 @@ test "multi-statement: CREATE + INSERT applies both" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    _ = try drainBatch(allocator, db,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL); " ++
-            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    _ = try drainBatch(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL); " ++
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
     const t = try db.openTable("t", .{});
     try t.flush();
     const seen = try drainBatch(allocator, db, "SELECT id FROM t");
@@ -96,10 +95,9 @@ test "multi-statement: CREATE + INSERT + SELECT returns inserted rows" {
 
     // SELECT runs against the memtable inserted in the previous statement
     // (same connection, same compileWithSession run).
-    const final_rows = try drainBatch(allocator, db,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL); " ++
-            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30); " ++
-            "SELECT id FROM t");
+    const final_rows = try drainBatch(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL); " ++
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30); " ++
+        "SELECT id FROM t");
     try std.testing.expectEqual(@as(usize, 3), final_rows);
 }
 
@@ -167,9 +165,8 @@ test "multi-statement: quoted semicolon is not a separator" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    _ = try drainBatch(allocator, db,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, tag TEXT NOT NULL); " ++
-            "INSERT INTO t VALUES (1, 'a;b;c')");
+    _ = try drainBatch(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag TEXT NOT NULL); " ++
+        "INSERT INTO t VALUES (1, 'a;b;c')");
     const t = try db.openTable("t", .{});
     try t.flush();
     const seen = try drainBatch(allocator, db, "SELECT id FROM t");

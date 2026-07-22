@@ -28,7 +28,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, d) VALUES (1, '2024-01-15'), (2, '2024-01-31'), (3, '2024-02-29')",
     );
     const t = try db.openTable("t", .{});
@@ -83,7 +85,9 @@ test "INTERVAL: YEAR add clamps Feb-29 in non-leap year" {
     defer db.close();
 
     // 2024-02-29 + 1 year → 2025-02-28
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT EXTRACT(YEAR FROM d + INTERVAL '1' YEAR) AS y, EXTRACT(MONTH FROM d + INTERVAL '1' YEAR) AS m, EXTRACT(DAY FROM d + INTERVAL '1' YEAR) AS dd FROM t WHERE id = 3",
     );
     defer q.deinit();
@@ -102,7 +106,9 @@ test "INTERVAL: bare integer accepted (PG-style)" {
     defer db.close();
 
     // INTERVAL 7 DAY  vs  INTERVAL '7' DAY — both should work.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT EXTRACT(DAY FROM d + INTERVAL 7 DAY) AS dd FROM t WHERE id = 1",
     );
     defer q.deinit();

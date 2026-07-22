@@ -4,6 +4,23 @@ zig-out/
 # Release bundles (scripts/make_dist.mjs) + cached Zig toolchain downloads.
 .dist/
 .dist-cache/
+# Local-only workload material and ops scripts (kept out of the public repo).
+/testSQL/
+/dave/
+tests/bun/_gen_cdc.mjs
+tests/bun/_sync_watchdog.mjs
+tests/bun/_project_backfill.mjs
+tests/bun/_bulk_load.mjs
+tests/bun/_tvf_ride_probe.mjs
+bench/_*.mjs
+# Session scratch: server logs, probe output, local bench databases.
+/*.log
+/_*.out
+/_*.err
+/_bench_bin/
+/_prod_bin/
+/.*-db/
+/.*-db2/
 .zig-global-cache*/
 .tools/
 # Local Zig package cache (populated by build.zig.zon deps).
