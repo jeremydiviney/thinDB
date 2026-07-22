@@ -1,5 +1,17 @@
 const std = @import("std");
 
+/// Run a test binary as a plain process (pass/fail = exit code) instead of
+/// the build runner's `--listen` IPC mode: on Windows the IPC read wedges
+/// intermittently ("test runner failed to respond") while the exact same
+/// binaries pass standalone every time — an unresolved upstream issue
+/// (ziggit.dev/t/6079 class: lingering threads interfere with the
+/// listen-mode stdin read). Revert to `addRunArtifact` when fixed.
+fn runTestStandalone(b: *std.Build, test_exe: *std.Build.Step.Compile) *std.Build.Step.Run {
+    const run = std.Build.Step.Run.create(b, b.fmt("run {s}", .{test_exe.name}));
+    run.addArtifactArg(test_exe);
+    return run;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -69,7 +81,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- Unit tests: every `test` block in src/root.zig and its imports ----
     const lib_tests = b.addTest(.{ .root_module = thindb_mod, .filters = b.option([]const []const u8, "test-filter", "only run unit tests whose name contains this substring") orelse &.{} });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
+    const run_lib_tests = runTestStandalone(b, lib_tests);
 
     // ---- Integration tests: tests/integration/all.zig pulls in scenario files ----
     const integration_mod = b.createModule(.{
@@ -79,7 +91,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_mod.addImport("thindb", thindb_mod);
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const run_integration_tests = runTestStandalone(b, integration_tests);
 
     // ---- Client/server integration tests: tests/integration_client/all.zig ----
     // Exercises the new thindb.local() / Connection / ClientQuery surface
@@ -93,7 +105,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_client_mod.addImport("thindb", thindb_mod);
     const integration_client_tests = b.addTest(.{ .root_module = integration_client_mod });
-    const run_integration_client_tests = b.addRunArtifact(integration_client_tests);
+    const run_integration_client_tests = runTestStandalone(b, integration_client_tests);
 
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_lib_tests.step);
@@ -110,7 +122,7 @@ pub fn build(b: *std.Build) void {
     });
     v2_integration_mod.addImport("thindb", thindb_mod);
     const v2_integration_tests = b.addTest(.{ .root_module = v2_integration_mod });
-    const run_v2_integration_tests = b.addRunArtifact(v2_integration_tests);
+    const run_v2_integration_tests = runTestStandalone(b, v2_integration_tests);
     const test_v2_step = b.step("test-v2", "Run V2-engine integration tests (default engine)");
     test_v2_step.dependOn(&run_v2_integration_tests.step);
 
