@@ -1,18 +1,15 @@
-//! Simplified real-data pipeline for:
-//!   SELECT ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth)
-//!   FROM hits
-//!   GROUP BY ClientIP
-//!   ORDER BY c DESC
-//!   LIMIT 10;
-//!
-//! This intentionally bypasses the SQL planner and production GROUP BY
-//! operators. It still uses the real table scan/decode path, then runs a small
-//! fixed pipeline: range scan -> hash/radix partition -> bucket-owned GROUP BY
-//! -> top-N.
+//! Silo grouped-aggregation core: the parallel range-scan -> hash/radix
+//! partition -> bucket-owned GROUP BY -> top-N machinery behind the V2
+//! grouped engines (v2_group_topn_engine, v2_global_aggregate,
+//! v2_lowcard_group, v2_shape_group_topn, zonemap_topn). Each worker owns
+//! its partition's groups outright ("silo"), so the hot loops run without
+//! sharing or locks; per-chunk validity constants monomorphize the inner
+//! loops. Born as a ClickBench Q32 harness and promoted to the production
+//! path — the workspace/profile plumbing doubles as the gbmicro bench
+//! surface (bench/clientip_pipeline.zig).
 
 const std = @import("std");
-const builtin = @import("builtin");
-const win = std.os.windows;
+const platform = @import("../util/platform.zig");
 const exec_mod = @import("exec.zig");
 const api_mod = @import("../api/api.zig");
 const storage_mod = @import("../storage/storage.zig");
@@ -133,120 +130,6 @@ fn chunkProfileDump() void {
         if (chunks > 0) @as(f64, @floatFromInt(rows)) / @as(f64, @floatFromInt(chunks)) else 0,
         if (rows > 0) @as(f64, @floatFromInt(str_bytes)) / @as(f64, @floatFromInt(rows)) else 0,
     });
-}
-
-fn nowTicks() i64 {
-    switch (builtin.os.tag) {
-        .windows => {
-            var c: win.LARGE_INTEGER = 0;
-            _ = win.ntdll.RtlQueryPerformanceCounter(&c);
-            return c;
-        },
-        .linux => {
-            var ts: std.os.linux.timespec = undefined;
-            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
-            return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
-        },
-        else => return 0,
-    }
-}
-
-fn perfFreq() i64 {
-    switch (builtin.os.tag) {
-        .windows => {
-            var f: win.LARGE_INTEGER = 0;
-            _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
-            return if (f == 0) 1 else f;
-        },
-        .linux => return 1_000_000_000,
-        else => return 1,
-    }
-}
-
-fn ticksToMs(ticks: i64, freq: i64) f64 {
-    return @as(f64, @floatFromInt(ticks)) * 1000.0 / @as(f64, @floatFromInt(freq));
-}
-
-const WinAffinity = if (builtin.os.tag == .windows) struct {
-    extern "kernel32" fn GetCurrentThread() callconv(.winapi) win.HANDLE;
-    extern "kernel32" fn SetThreadAffinityMask(hThread: win.HANDLE, mask: usize) callconv(.winapi) usize;
-    extern "kernel32" fn GetLogicalProcessorInformation(buf: ?[*]LogicalProcInfo, len: *u32) callconv(.winapi) win.BOOL;
-} else struct {};
-
-const RelationProcessorCore: u32 = 0;
-const LogicalProcInfo = extern struct {
-    processor_mask: usize,
-    relationship: u32,
-    _pad: u32 = 0,
-    _union: [16]u8 = [_]u8{0} ** 16,
-};
-
-pub const CpuLayout = struct {
-    order: []usize,
-    physical_count: usize,
-
-    pub fn deinit(self: CpuLayout, allocator: Allocator) void {
-        allocator.free(self.order);
-    }
-};
-
-pub fn cpuLayout(allocator: Allocator) !CpuLayout {
-    if (builtin.os.tag != .windows) {
-        // No SMT-topology query off-Windows yet: identity order, every logical
-        // CPU counted as physical. Good enough for pinning; SMT-aware
-        // primary-first ordering is a Linux-port follow-up.
-        const n_cpus = std.Thread.getCpuCount() catch 1;
-        const order = try allocator.alloc(usize, n_cpus);
-        for (order, 0..) |*o, i| o.* = i;
-        return .{ .order = order, .physical_count = n_cpus };
-    }
-    var buf: [256]LogicalProcInfo = undefined;
-    var len: u32 = @intCast(@sizeOf(LogicalProcInfo) * buf.len);
-    if (!WinAffinity.GetLogicalProcessorInformation(&buf, &len).toBool()) return error.QueryFailed;
-    const n = len / @sizeOf(LogicalProcInfo);
-
-    var primaries: std.ArrayListUnmanaged(usize) = .empty;
-    var siblings: std.ArrayListUnmanaged(usize) = .empty;
-    for (buf[0..n]) |info| {
-        if (info.relationship != RelationProcessorCore) continue;
-        var mask = info.processor_mask;
-        var first = true;
-        while (mask != 0) {
-            const bit: usize = @ctz(mask);
-            mask &= mask - 1;
-            if (first) {
-                try primaries.append(allocator, bit);
-                first = false;
-            } else {
-                try siblings.append(allocator, bit);
-            }
-        }
-    }
-    const physical_count = primaries.items.len;
-    try primaries.appendSlice(allocator, siblings.items);
-    siblings.deinit(allocator);
-    return .{
-        .order = try primaries.toOwnedSlice(allocator),
-        .physical_count = physical_count,
-    };
-}
-
-pub fn pinToCpu(cpu: usize) void {
-    switch (builtin.os.tag) {
-        .windows => {
-            if (cpu < @bitSizeOf(usize)) {
-                _ = WinAffinity.SetThreadAffinityMask(WinAffinity.GetCurrentThread(), @as(usize, 1) << @intCast(cpu));
-            }
-        },
-        .linux => {
-            var set: std.os.linux.cpu_set_t = @splat(0);
-            if (cpu < @bitSizeOf(std.os.linux.cpu_set_t)) {
-                set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
-                std.os.linux.sched_setaffinity(0, &set) catch {};
-            }
-        },
-        else => {},
-    }
 }
 
 const Coord = struct { seg: usize, rg: usize };
@@ -1827,21 +1710,21 @@ pub const WorkspaceProfile = struct {
     teardown_worker_total_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = [_]i64{0} ** MAX_WORKSPACE_PROFILE_WORKERS,
 
     pub fn printSetup(self: *const WorkspaceProfile, query: []const u8, bucket_count: usize, local_reserve_per_bucket: usize, expected_groups_per_bucket: usize) void {
-        const freq = perfFreq();
+        const freq = platform.perfFreq();
         std.debug.print(
             "[workspace-setup-detail] query={s} total={d:.1}ms parts_alloc={d:.3}ms parts_zero={d:.3}ms buckets_alloc={d:.3}ms flags_alloc={d:.3}ms thread_alloc={d:.3}ms job_alloc={d:.3}ms spawn={d:.3}ms join={d:.1}ms assign={d:.3}ms workers={} buckets={} local_reserve={} expected_groups_per_bucket={}\n",
             .{
                 query,
-                ticksToMs(self.setup_total_ticks, freq),
-                ticksToMs(self.setup_parts_alloc_ticks, freq),
-                ticksToMs(self.setup_parts_zero_ticks, freq),
-                ticksToMs(self.setup_buckets_alloc_ticks, freq),
-                ticksToMs(self.setup_flags_alloc_ticks, freq),
-                ticksToMs(self.setup_thread_alloc_ticks, freq),
-                ticksToMs(self.setup_job_alloc_ticks, freq),
-                ticksToMs(self.setup_spawn_ticks, freq),
-                ticksToMs(self.setup_join_ticks, freq),
-                ticksToMs(self.setup_assign_ticks, freq),
+                platform.ticksToMs(self.setup_total_ticks, freq),
+                platform.ticksToMs(self.setup_parts_alloc_ticks, freq),
+                platform.ticksToMs(self.setup_parts_zero_ticks, freq),
+                platform.ticksToMs(self.setup_buckets_alloc_ticks, freq),
+                platform.ticksToMs(self.setup_flags_alloc_ticks, freq),
+                platform.ticksToMs(self.setup_thread_alloc_ticks, freq),
+                platform.ticksToMs(self.setup_job_alloc_ticks, freq),
+                platform.ticksToMs(self.setup_spawn_ticks, freq),
+                platform.ticksToMs(self.setup_join_ticks, freq),
+                platform.ticksToMs(self.setup_assign_ticks, freq),
                 self.workers,
                 bucket_count,
                 local_reserve_per_bucket,
@@ -1852,28 +1735,28 @@ pub const WorkspaceProfile = struct {
             "[workspace-setup-workers] query={s} part_sum={d:.1}ms part_max={d:.1}ms bucket_sum={d:.1}ms bucket_max={d:.1}ms total_sum={d:.1}ms total_max={d:.1}ms\n",
             .{
                 query,
-                ticksToMs(profileSum(self.setup_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileMax(self.setup_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileSum(self.setup_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileMax(self.setup_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileSum(self.setup_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileMax(self.setup_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileSum(self.setup_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileMax(self.setup_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileSum(self.setup_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileMax(self.setup_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileSum(self.setup_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileMax(self.setup_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
             },
         );
     }
 
     pub fn printTeardown(self: *const WorkspaceProfile, query: []const u8, bucket_count: usize) void {
-        const freq = perfFreq();
+        const freq = platform.perfFreq();
         std.debug.print(
             "[workspace-teardown-detail] query={s} total={d:.1}ms thread_alloc={d:.3}ms job_alloc={d:.3}ms spawn={d:.3}ms join={d:.1}ms outer_free={d:.3}ms workers={} buckets={}\n",
             .{
                 query,
-                ticksToMs(self.teardown_total_ticks, freq),
-                ticksToMs(self.teardown_thread_alloc_ticks, freq),
-                ticksToMs(self.teardown_job_alloc_ticks, freq),
-                ticksToMs(self.teardown_spawn_ticks, freq),
-                ticksToMs(self.teardown_join_ticks, freq),
-                ticksToMs(self.teardown_outer_free_ticks, freq),
+                platform.ticksToMs(self.teardown_total_ticks, freq),
+                platform.ticksToMs(self.teardown_thread_alloc_ticks, freq),
+                platform.ticksToMs(self.teardown_job_alloc_ticks, freq),
+                platform.ticksToMs(self.teardown_spawn_ticks, freq),
+                platform.ticksToMs(self.teardown_join_ticks, freq),
+                platform.ticksToMs(self.teardown_outer_free_ticks, freq),
                 self.workers,
                 bucket_count,
             },
@@ -1882,12 +1765,12 @@ pub const WorkspaceProfile = struct {
             "[workspace-teardown-workers] query={s} part_sum={d:.1}ms part_max={d:.1}ms bucket_sum={d:.1}ms bucket_max={d:.1}ms total_sum={d:.1}ms total_max={d:.1}ms\n",
             .{
                 query,
-                ticksToMs(profileSum(self.teardown_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileMax(self.teardown_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileSum(self.teardown_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileMax(self.teardown_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileSum(self.teardown_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
-                ticksToMs(profileMax(self.teardown_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileSum(self.teardown_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileMax(self.teardown_worker_part_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileSum(self.teardown_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileMax(self.teardown_worker_bucket_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileSum(self.teardown_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
+                platform.ticksToMs(profileMax(self.teardown_worker_total_ticks[0..profileWorkerCount(self.workers)]), freq),
             },
         );
     }
@@ -1950,33 +1833,33 @@ pub const SiloGridWorkspace = struct {
     }
 
     pub fn deinitParallel(self: *SiloGridWorkspace, allocator: Allocator, n_workers: usize, cpus: []const usize, profile: ?*WorkspaceProfile) void {
-        const total_t0 = if (profile != null) nowTicks() else 0;
+        const total_t0 = if (profile != null) platform.nowTicks() else 0;
         const workers = @max(@as(usize, 1), @min(n_workers, @max(cpus.len, 1)));
         if (profile) |p| p.workers = profileWorkerCount(workers);
         if (workers == 1 or (self.parts.len + self.buckets.len) < 128) {
             self.deinit(allocator);
-            if (profile) |p| p.teardown_total_ticks = nowTicks() - total_t0;
+            if (profile) |p| p.teardown_total_ticks = platform.nowTicks() - total_t0;
             return;
         }
-        const threads_alloc_t0 = if (profile != null) nowTicks() else 0;
+        const threads_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
         const threads = allocator.alloc(std.Thread, workers) catch {
             self.deinit(allocator);
-            if (profile) |p| p.teardown_total_ticks = nowTicks() - total_t0;
+            if (profile) |p| p.teardown_total_ticks = platform.nowTicks() - total_t0;
             return;
         };
-        if (profile) |p| p.teardown_thread_alloc_ticks = nowTicks() - threads_alloc_t0;
+        if (profile) |p| p.teardown_thread_alloc_ticks = platform.nowTicks() - threads_alloc_t0;
         defer allocator.free(threads);
-        const jobs_alloc_t0 = if (profile != null) nowTicks() else 0;
+        const jobs_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
         const jobs = allocator.alloc(WorkspaceDeinitJob, workers) catch {
             self.deinit(allocator);
-            if (profile) |p| p.teardown_total_ticks = nowTicks() - total_t0;
+            if (profile) |p| p.teardown_total_ticks = platform.nowTicks() - total_t0;
             return;
         };
-        if (profile) |p| p.teardown_job_alloc_ticks = nowTicks() - jobs_alloc_t0;
+        if (profile) |p| p.teardown_job_alloc_ticks = platform.nowTicks() - jobs_alloc_t0;
         defer allocator.free(jobs);
 
         var i: usize = 0;
-        const spawn_t0 = if (profile != null) nowTicks() else 0;
+        const spawn_t0 = if (profile != null) platform.nowTicks() else 0;
         while (i < workers) : (i += 1) {
             jobs[i] = .{
                 .workspace = self,
@@ -1988,16 +1871,16 @@ pub const SiloGridWorkspace = struct {
             };
             threads[i] = std.Thread.spawn(.{}, workspaceDeinitWorker, .{&jobs[i]}) catch unreachable;
         }
-        if (profile) |p| p.teardown_spawn_ticks = nowTicks() - spawn_t0;
-        const join_t0 = if (profile != null) nowTicks() else 0;
+        if (profile) |p| p.teardown_spawn_ticks = platform.nowTicks() - spawn_t0;
+        const join_t0 = if (profile != null) platform.nowTicks() else 0;
         for (threads) |thread| thread.join();
-        if (profile) |p| p.teardown_join_ticks = nowTicks() - join_t0;
-        const free_t0 = if (profile != null) nowTicks() else 0;
+        if (profile) |p| p.teardown_join_ticks = platform.nowTicks() - join_t0;
+        const free_t0 = if (profile != null) platform.nowTicks() else 0;
         if (self.parts.len > 0) allocator.free(self.parts);
         if (self.buckets.len > 0) allocator.free(self.buckets);
         if (profile) |p| {
-            p.teardown_outer_free_ticks = nowTicks() - free_t0;
-            p.teardown_total_ticks = nowTicks() - total_t0;
+            p.teardown_outer_free_ticks = platform.nowTicks() - free_t0;
+            p.teardown_total_ticks = platform.nowTicks() - total_t0;
         }
         self.* = .{};
     }
@@ -2012,27 +1895,27 @@ pub const SiloGridWorkspace = struct {
         cpus: []const usize,
         profile: ?*WorkspaceProfile,
     ) !void {
-        const total_t0 = if (profile != null) nowTicks() else 0;
-        const parts_alloc_t0 = if (profile != null) nowTicks() else 0;
+        const total_t0 = if (profile != null) platform.nowTicks() else 0;
+        const parts_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
         const parts = try allocator.alloc(WorkerParts, n_workers);
-        if (profile) |p| p.setup_parts_alloc_ticks = nowTicks() - parts_alloc_t0;
+        if (profile) |p| p.setup_parts_alloc_ticks = platform.nowTicks() - parts_alloc_t0;
         errdefer allocator.free(parts);
-        const parts_zero_t0 = if (profile != null) nowTicks() else 0;
+        const parts_zero_t0 = if (profile != null) platform.nowTicks() else 0;
         for (parts) |*p| p.* = .{};
-        if (profile) |p| p.setup_parts_zero_ticks = nowTicks() - parts_zero_t0;
+        if (profile) |p| p.setup_parts_zero_ticks = platform.nowTicks() - parts_zero_t0;
         errdefer {
             for (parts) |*p| p.deinit(allocator);
         }
 
-        const buckets_alloc_t0 = if (profile != null) nowTicks() else 0;
+        const buckets_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
         const buckets = try allocator.alloc(PipeBucket, bucket_count);
-        if (profile) |p| p.setup_buckets_alloc_ticks = nowTicks() - buckets_alloc_t0;
+        if (profile) |p| p.setup_buckets_alloc_ticks = platform.nowTicks() - buckets_alloc_t0;
         errdefer allocator.free(buckets);
-        const flags_alloc_t0 = if (profile != null) nowTicks() else 0;
+        const flags_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
         const bucket_inited = try allocator.alloc(bool, bucket_count);
         defer allocator.free(bucket_inited);
         @memset(bucket_inited, false);
-        if (profile) |p| p.setup_flags_alloc_ticks = nowTicks() - flags_alloc_t0;
+        if (profile) |p| p.setup_flags_alloc_ticks = platform.nowTicks() - flags_alloc_t0;
         errdefer {
             for (buckets, bucket_inited) |*bucket, inited| {
                 if (inited) bucket.deinit(allocator);
@@ -2041,7 +1924,7 @@ pub const SiloGridWorkspace = struct {
 
         try initWorkspaceFreshParallel(allocator, parts, buckets, bucket_inited, bucket_count, local_reserve_per_bucket, expected_groups_per_bucket, n_workers, cpus, profile);
 
-        const assign_t0 = if (profile != null) nowTicks() else 0;
+        const assign_t0 = if (profile != null) platform.nowTicks() else 0;
         self.* = .{
             .parts = parts,
             .buckets = buckets,
@@ -2051,8 +1934,8 @@ pub const SiloGridWorkspace = struct {
             .expected_groups_per_bucket = expected_groups_per_bucket,
         };
         if (profile) |p| {
-            p.setup_assign_ticks = nowTicks() - assign_t0;
-            p.setup_total_ticks = nowTicks() - total_t0;
+            p.setup_assign_ticks = platform.nowTicks() - assign_t0;
+            p.setup_total_ticks = platform.nowTicks() - total_t0;
         }
     }
 
@@ -2107,16 +1990,16 @@ const WorkspaceDeinitJob = struct {
 };
 
 fn workspaceDeinitWorker(job: *WorkspaceDeinitJob) void {
-    const total_t0 = if (job.profile != null) nowTicks() else 0;
-    if (job.cpu) |cpu| pinToCpu(cpu);
-    const part_t0 = if (job.profile != null) nowTicks() else 0;
+    const total_t0 = if (job.profile != null) platform.nowTicks() else 0;
+    if (job.cpu) |cpu| platform.pinToCpu(cpu);
+    const part_t0 = if (job.profile != null) platform.nowTicks() else 0;
     var part_i = job.worker_index;
     while (part_i < job.workspace.parts.len) : (part_i += job.worker_count) {
         job.workspace.parts[part_i].deinit(job.allocator);
     }
-    const part_ticks = if (job.profile != null) nowTicks() - part_t0 else 0;
+    const part_ticks = if (job.profile != null) platform.nowTicks() - part_t0 else 0;
 
-    const bucket_t0 = if (job.profile != null) nowTicks() else 0;
+    const bucket_t0 = if (job.profile != null) platform.nowTicks() else 0;
     const bucket_count = job.workspace.buckets.len;
     const start = job.worker_index * bucket_count / job.worker_count;
     const end = (job.worker_index + 1) * bucket_count / job.worker_count;
@@ -2127,14 +2010,14 @@ fn workspaceDeinitWorker(job: *WorkspaceDeinitJob) void {
     if (job.profile) |profile| {
         if (job.worker_index < MAX_WORKSPACE_PROFILE_WORKERS) {
             profile.teardown_worker_part_ticks[job.worker_index] = part_ticks;
-            profile.teardown_worker_bucket_ticks[job.worker_index] = nowTicks() - bucket_t0;
-            profile.teardown_worker_total_ticks[job.worker_index] = nowTicks() - total_t0;
+            profile.teardown_worker_bucket_ticks[job.worker_index] = platform.nowTicks() - bucket_t0;
+            profile.teardown_worker_total_ticks[job.worker_index] = platform.nowTicks() - total_t0;
         }
     }
 }
 
 fn workspaceResetWorker(job: *WorkspaceResetJob) void {
-    if (job.cpu) |cpu| pinToCpu(cpu);
+    if (job.cpu) |cpu| platform.pinToCpu(cpu);
     var part_i = job.worker_index;
     while (part_i < job.workspace.parts.len) : (part_i += job.worker_count) {
         resetWorkerParts(&job.workspace.parts[part_i], part_i);
@@ -2179,14 +2062,14 @@ fn initWorkspaceFreshParallel(
     const workers = @max(@as(usize, 1), @min(n_workers, @max(cpus.len, 1)));
     if (profile) |p| p.workers = profileWorkerCount(workers);
     if (workers == 1) {
-        const total_t0 = if (profile != null) nowTicks() else 0;
-        const part_t0 = if (profile != null) nowTicks() else 0;
+        const total_t0 = if (profile != null) platform.nowTicks() else 0;
+        const part_t0 = if (profile != null) platform.nowTicks() else 0;
         for (parts, 0..) |*p, i| {
             p.* = try WorkerParts.init(allocator, bucket_count, local_reserve_per_bucket);
             p.worker_index = i;
         }
-        const part_ticks = if (profile != null) nowTicks() - part_t0 else 0;
-        const bucket_t0 = if (profile != null) nowTicks() else 0;
+        const part_ticks = if (profile != null) platform.nowTicks() - part_t0 else 0;
+        const bucket_t0 = if (profile != null) platform.nowTicks() else 0;
         for (buckets, 0..) |*bucket, i| {
             bucket.* = try PipeBucket.init(allocator, expected_groups_per_bucket);
             bucket_inited[i] = true;
@@ -2195,23 +2078,23 @@ fn initWorkspaceFreshParallel(
         }
         if (profile) |p| {
             p.setup_worker_part_ticks[0] = part_ticks;
-            p.setup_worker_bucket_ticks[0] = nowTicks() - bucket_t0;
-            p.setup_worker_total_ticks[0] = nowTicks() - total_t0;
+            p.setup_worker_bucket_ticks[0] = platform.nowTicks() - bucket_t0;
+            p.setup_worker_total_ticks[0] = platform.nowTicks() - total_t0;
         }
         return;
     }
 
-    const threads_alloc_t0 = if (profile != null) nowTicks() else 0;
+    const threads_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
     const threads = try allocator.alloc(std.Thread, workers);
-    if (profile) |p| p.setup_thread_alloc_ticks = nowTicks() - threads_alloc_t0;
+    if (profile) |p| p.setup_thread_alloc_ticks = platform.nowTicks() - threads_alloc_t0;
     defer allocator.free(threads);
-    const jobs_alloc_t0 = if (profile != null) nowTicks() else 0;
+    const jobs_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
     var jobs = try allocator.alloc(WorkspaceFreshInitJob, workers);
-    if (profile) |p| p.setup_job_alloc_ticks = nowTicks() - jobs_alloc_t0;
+    if (profile) |p| p.setup_job_alloc_ticks = platform.nowTicks() - jobs_alloc_t0;
     defer allocator.free(jobs);
 
     var i: usize = 0;
-    const spawn_t0 = if (profile != null) nowTicks() else 0;
+    const spawn_t0 = if (profile != null) platform.nowTicks() else 0;
     while (i < workers) : (i += 1) {
         jobs[i] = .{
             .allocator = allocator,
@@ -2228,18 +2111,18 @@ fn initWorkspaceFreshParallel(
         };
         threads[i] = try std.Thread.spawn(.{}, workspaceFreshInitWorker, .{&jobs[i]});
     }
-    if (profile) |p| p.setup_spawn_ticks = nowTicks() - spawn_t0;
-    const join_t0 = if (profile != null) nowTicks() else 0;
+    if (profile) |p| p.setup_spawn_ticks = platform.nowTicks() - spawn_t0;
+    const join_t0 = if (profile != null) platform.nowTicks() else 0;
     for (threads) |thread| thread.join();
-    if (profile) |p| p.setup_join_ticks = nowTicks() - join_t0;
+    if (profile) |p| p.setup_join_ticks = platform.nowTicks() - join_t0;
     for (jobs) |job| if (job.err) |err| return err;
 }
 
 fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
-    const total_t0 = if (job.profile != null) nowTicks() else 0;
-    if (job.cpu) |cpu| pinToCpu(cpu);
+    const total_t0 = if (job.profile != null) platform.nowTicks() else 0;
+    if (job.cpu) |cpu| platform.pinToCpu(cpu);
 
-    const part_t0 = if (job.profile != null) nowTicks() else 0;
+    const part_t0 = if (job.profile != null) platform.nowTicks() else 0;
     if (job.worker_index < job.parts.len) {
         job.parts[job.worker_index] = WorkerParts.init(job.allocator, job.bucket_count, job.local_reserve_per_bucket) catch |err| {
             job.err = err;
@@ -2247,9 +2130,9 @@ fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
         };
         job.parts[job.worker_index].worker_index = job.worker_index;
     }
-    const part_ticks = if (job.profile != null) nowTicks() - part_t0 else 0;
+    const part_ticks = if (job.profile != null) platform.nowTicks() - part_t0 else 0;
 
-    const bucket_t0 = if (job.profile != null) nowTicks() else 0;
+    const bucket_t0 = if (job.profile != null) platform.nowTicks() else 0;
     const bucket_total = job.buckets.len;
     const start = job.worker_index * bucket_total / job.worker_count;
     const end = (job.worker_index + 1) * bucket_total / job.worker_count;
@@ -2269,8 +2152,8 @@ fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
     if (job.profile) |profile| {
         if (job.worker_index < MAX_WORKSPACE_PROFILE_WORKERS) {
             profile.setup_worker_part_ticks[job.worker_index] = part_ticks;
-            profile.setup_worker_bucket_ticks[job.worker_index] = nowTicks() - bucket_t0;
-            profile.setup_worker_total_ticks[job.worker_index] = nowTicks() - total_t0;
+            profile.setup_worker_bucket_ticks[job.worker_index] = platform.nowTicks() - bucket_t0;
+            profile.setup_worker_total_ticks[job.worker_index] = platform.nowTicks() - total_t0;
         }
     }
 }
@@ -2430,9 +2313,9 @@ fn lockSpin(mutex: *std.atomic.Mutex) void {
 }
 
 fn acquireRawRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !RawRows {
-    const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
-    if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     if (shared.raw_recycled_rows.items.len > 0) {
         const idx = shared.raw_recycled_rows.items.len - 1;
         var rows = shared.raw_recycled_rows.items[idx];
@@ -2456,17 +2339,17 @@ fn recycleRawRows(shared: *PipeShared, rows_raw: RawRows, reserve_rows: usize, l
     if (rows.capacity() < reserve_rows or !sameRowsLayout(rows.layout, shared.group_rows_layout)) {
         try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
     }
-    const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
-    if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     defer shared.raw_recycle_lock.unlock();
     try shared.raw_recycled_rows.append(shared.allocator, rows);
 }
 
 fn acquireGroupRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !GroupRows {
-    const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
-    if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     if (shared.group_recycled_rows.items.len > 0) {
         const idx = shared.group_recycled_rows.items.len - 1;
         var rows = shared.group_recycled_rows.items[idx];
@@ -2486,9 +2369,9 @@ fn recycleGroupRows(shared: *PipeShared, rows_group: GroupRows, reserve_rows: us
     var rows = rows_group;
     rows.clearRetainingCapacity();
     if (rows.capacity() < reserve_rows) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
-    const lock_t0 = if (lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
-    if (lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     defer shared.raw_recycle_lock.unlock();
     try shared.group_recycled_rows.append(shared.allocator, rows);
 }
@@ -2506,9 +2389,9 @@ fn publishRawRows(shared: *PipeShared, owner_worker: usize, rows_ptr: *RawRows, 
 
     _ = shared.outstanding_chunks.fetchAdd(1, .release);
     _ = shared.outstanding_rows.fetchAdd(row_count, .release);
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (queue_lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_queue_lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (queue_lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     errdefer {
         _ = shared.outstanding_chunks.fetchSub(1, .release);
         _ = shared.outstanding_rows.fetchSub(row_count, .release);
@@ -2541,9 +2424,9 @@ fn publishRawRowsToQueue(
 
     _ = chunks_counter.fetchAdd(1, .release);
     _ = rows_counter.fetchAdd(row_count, .release);
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (queue_lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&queue.lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (queue_lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     errdefer {
         _ = chunks_counter.fetchSub(1, .release);
         _ = rows_counter.fetchSub(row_count, .release);
@@ -2567,9 +2450,9 @@ fn publishGroupChunkToQueue(
     const row_count: u64 = @intCast(chunk.rows.len());
     _ = chunks_counter.fetchAdd(1, .release);
     _ = rows_counter.fetchAdd(row_count, .release);
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (queue_lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&queue.lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (queue_lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     errdefer {
         _ = chunks_counter.fetchSub(1, .release);
         _ = rows_counter.fetchSub(row_count, .release);
@@ -2584,9 +2467,9 @@ fn publishGroupChunkToQueue(
 
 fn popRawChunkBatchFromQueue(queue: *RawQueue, out: *[MAX_RAW_BATCH_CHUNKS]RawChunk, max_chunks_raw: usize, queue_lock_ticks: ?*i64) usize {
     const max_chunks = @max(@as(usize, 1), @min(max_chunks_raw, MAX_RAW_BATCH_CHUNKS));
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (queue_lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&queue.lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (queue_lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     defer queue.lock.unlock();
 
     var popped: usize = 0;
@@ -2604,9 +2487,9 @@ fn popRawChunkBatchFromQueue(queue: *RawQueue, out: *[MAX_RAW_BATCH_CHUNKS]RawCh
 
 fn popGroupChunkBatchFromQueue(queue: *GroupQueue, out: *[MAX_RAW_BATCH_CHUNKS]GroupChunk, max_chunks_raw: usize, queue_lock_ticks: ?*i64) usize {
     const max_chunks = @max(@as(usize, 1), @min(max_chunks_raw, MAX_RAW_BATCH_CHUNKS));
-    const lock_t0 = if (queue_lock_ticks != null) nowTicks() else 0;
+    const lock_t0 = if (queue_lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&queue.lock);
-    if (queue_lock_ticks) |ticks| ticks.* += nowTicks() - lock_t0;
+    if (queue_lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     defer queue.lock.unlock();
 
     var popped: usize = 0;
@@ -3085,7 +2968,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         };
     } else &.{};
 
-    const route_t0 = if (profile) nowTicks() else 0;
+    const route_t0 = if (profile) platform.nowTicks() else 0;
     var accepted: u64 = 0;
     var r: usize = 0;
     while (r < batch.row_count) {
@@ -3157,7 +3040,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     }
     parts.scanned_count += batch.row_count;
     parts.row_count += accepted;
-    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+    if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
 }
 
 // Native-width key bits from a run value (sign-extended i64), matching
@@ -3188,7 +3071,7 @@ fn appendBatchRunsWeighted(
     profile: bool,
 ) !void {
     if (row_count == 0) return;
-    const route_t0 = if (profile) nowTicks() else 0;
+    const route_t0 = if (profile) platform.nowTicks() else 0;
     var accepted: u64 = 0;
     var run_idx = [_]usize{0} ** MAX_GENERIC_GROUP_KEYS;
     var run_left: [MAX_GENERIC_GROUP_KEYS]usize = undefined;
@@ -3243,7 +3126,7 @@ fn appendBatchRunsWeighted(
     }
     parts.scanned_count += row_count;
     parts.row_count += accepted;
-    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+    if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
 }
 
 fn appendBatchRawChunksGenericFast(
@@ -3326,7 +3209,7 @@ fn appendBatchRawChunksGenericKey1I64(
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
-    const route_t0 = if (profile) nowTicks() else 0;
+    const route_t0 = if (profile) platform.nowTicks() else 0;
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
@@ -3360,7 +3243,7 @@ fn appendBatchRawChunksGenericKey1I64(
         }
         parts.scanned_count += row_count;
         parts.row_count += accepted;
-        if (profile) parts.partition_ticks += nowTicks() - route_t0;
+        if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
         return;
     }
     while (r < row_count) {
@@ -3378,7 +3261,7 @@ fn appendBatchRawChunksGenericKey1I64(
     }
     parts.scanned_count += row_count;
     parts.row_count += accepted;
-    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+    if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
 }
 
 fn appendBatchRawChunksGenericKeyI16I32(
@@ -3395,7 +3278,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
-    const route_t0 = if (profile) nowTicks() else 0;
+    const route_t0 = if (profile) platform.nowTicks() else 0;
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
@@ -3427,7 +3310,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
         }
         parts.scanned_count += row_count;
         parts.row_count += accepted;
-        if (profile) parts.partition_ticks += nowTicks() - route_t0;
+        if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
         return;
     }
     while (r < row_count) {
@@ -3446,7 +3329,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     }
     parts.scanned_count += row_count;
     parts.row_count += accepted;
-    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+    if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
 }
 
 fn appendBatchRawChunksGenericKeyI64I32(
@@ -3463,7 +3346,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
-    const route_t0 = if (profile) nowTicks() else 0;
+    const route_t0 = if (profile) platform.nowTicks() else 0;
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
@@ -3497,7 +3380,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
         }
         parts.scanned_count += row_count;
         parts.row_count += accepted;
-        if (profile) parts.partition_ticks += nowTicks() - route_t0;
+        if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
         return;
     }
     while (r < row_count) {
@@ -3517,7 +3400,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     }
     parts.scanned_count += row_count;
     parts.row_count += accepted;
-    if (profile) parts.partition_ticks += nowTicks() - route_t0;
+    if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
 }
 
 // Copy one payload element (1/2/4/8-byte typed move per element size — so each
@@ -4877,9 +4760,9 @@ fn appendSharedStageBuilderRawSlice(
 ) !void {
     if (count == 0 or bucket_idx >= shared.stage_builders.len) return;
     const builder = &shared.stage_builders[bucket_idx];
-    const lock_t0 = if (profile) nowTicks() else 0;
+    const lock_t0 = if (profile) platform.nowTicks() else 0;
     lockSpin(&builder.lock);
-    if (profile) local.raw_stage_builder_lock_ticks += nowTicks() - lock_t0;
+    if (profile) local.raw_stage_builder_lock_ticks += platform.nowTicks() - lock_t0;
     defer builder.lock.unlock();
 
     var pos: usize = 0;
@@ -4911,21 +4794,21 @@ fn flushSharedStageBuilders(
     profile: bool,
 ) !bool {
     if (shared.stage_builder_rows.load(.acquire) == 0) return false;
-    const publish_t0 = if (profile) nowTicks() else 0;
+    const publish_t0 = if (profile) platform.nowTicks() else 0;
     var flushed = false;
     var b: usize = 0;
     while (b < shared.stage_builders.len) : (b += 1) {
         const builder = &shared.stage_builders[b];
-        const lock_t0 = if (profile) nowTicks() else 0;
+        const lock_t0 = if (profile) platform.nowTicks() else 0;
         lockSpin(&builder.lock);
-        if (profile) local.raw_stage_builder_lock_ticks += nowTicks() - lock_t0;
+        if (profile) local.raw_stage_builder_lock_ticks += platform.nowTicks() - lock_t0;
         if (builder.rows.len() > 0) {
             try publishSharedStageBuilderLocked(shared, builder, b, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
             flushed = true;
         }
         builder.lock.unlock();
     }
-    if (profile) local.raw_stage_publish_ticks += nowTicks() - publish_t0;
+    if (profile) local.raw_stage_publish_ticks += platform.nowTicks() - publish_t0;
     return flushed;
 }
 
@@ -4943,9 +4826,9 @@ fn drainRawDedicatedStageSharedBuilders(
     if (scan_lane >= shared.raw_scan_queues.len) return false;
     defer releaseRawQueueLane(shared.raw_scan_queues, scan_lane);
 
-    var pop_t0 = if (profile) nowTicks() else 0;
+    var pop_t0 = if (profile) platform.nowTicks() else 0;
     var popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
-    if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
+    if (profile) local.raw_stage_pop_ticks += platform.nowTicks() - pop_t0;
     if (popped_total == 0) return false;
 
     _ = shared.active_stage_jobs.fetchAdd(1, .release);
@@ -4965,12 +4848,12 @@ fn drainRawDedicatedStageSharedBuilders(
         _ = shared.outstanding_chunks.fetchSub(popped_total, .release);
         if (total_rows == 0) {
             i = 0;
-            const recycle_t0 = if (profile) nowTicks() else 0;
+            const recycle_t0 = if (profile) platform.nowTicks() else 0;
             while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
-            if (profile) local.raw_stage_recycle_ticks += nowTicks() - recycle_t0;
-            pop_t0 = if (profile) nowTicks() else 0;
+            if (profile) local.raw_stage_recycle_ticks += platform.nowTicks() - recycle_t0;
+            pop_t0 = if (profile) platform.nowTicks() else 0;
             popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
-            if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
+            if (profile) local.raw_stage_pop_ticks += platform.nowTicks() - pop_t0;
             continue;
         }
 
@@ -4980,7 +4863,7 @@ fn drainRawDedicatedStageSharedBuilders(
         const flat_str_cols = shared.group_rows_layout.str_columns.len;
         if (flat_has_str) local.flat_raw_rows.str.clear();
 
-        const stage_t0 = if (profile) nowTicks() else 0;
+        const stage_t0 = if (profile) platform.nowTicks() else 0;
         @memset(local.flat_counts[0..bucket_count], 0);
         var row_idx: usize = 0;
         i = 0;
@@ -5082,9 +4965,9 @@ fn drainRawDedicatedStageSharedBuilders(
                 }
             },
         }
-        if (profile) local.raw_stage_ticks += nowTicks() - stage_t0;
+        if (profile) local.raw_stage_ticks += platform.nowTicks() - stage_t0;
 
-        const append_t0 = if (profile) nowTicks() else 0;
+        const append_t0 = if (profile) platform.nowTicks() else 0;
         b = 0;
         while (b < bucket_count) : (b += 1) {
             const count: usize = local.flat_counts[b];
@@ -5092,16 +4975,16 @@ fn drainRawDedicatedStageSharedBuilders(
             const start: usize = local.flat_offsets[b];
             try appendSharedStageBuilderRawSlice(shared, local, b, local.flat_raw_rows, start, count, raw_group_chunk_rows, profile);
         }
-        if (profile) local.raw_stage_slice_ticks += nowTicks() - append_t0;
+        if (profile) local.raw_stage_slice_ticks += platform.nowTicks() - append_t0;
 
         i = 0;
-        const recycle_t0 = if (profile) nowTicks() else 0;
+        const recycle_t0 = if (profile) platform.nowTicks() else 0;
         while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
-        if (profile) local.raw_stage_recycle_ticks += nowTicks() - recycle_t0;
+        if (profile) local.raw_stage_recycle_ticks += platform.nowTicks() - recycle_t0;
 
-        pop_t0 = if (profile) nowTicks() else 0;
+        pop_t0 = if (profile) platform.nowTicks() else 0;
         popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
-        if (profile) local.raw_stage_pop_ticks += nowTicks() - pop_t0;
+        if (profile) local.raw_stage_pop_ticks += platform.nowTicks() - pop_t0;
     }
     return true;
 }
@@ -5132,13 +5015,13 @@ fn drainRawDedicatedGroupLane(
     while (i < popped_total) : (i += 1) {
         const rows = group_chunks[i].rows;
         total_rows += @intCast(rows.len());
-        const lock_t0 = if (profile) nowTicks() else 0;
+        const lock_t0 = if (profile) platform.nowTicks() else 0;
         lockSpin(&bucket.agg_lock);
-        if (profile) local.raw_agg_lock_ticks += nowTicks() - lock_t0;
-        const g0 = if (profile) nowTicks() else 0;
+        if (profile) local.raw_agg_lock_ticks += platform.nowTicks() - lock_t0;
+        const g0 = if (profile) platform.nowTicks() else 0;
         try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), rows);
         bucket.row_count += rows.len();
-        if (profile) group_ticks.* += nowTicks() - g0;
+        if (profile) group_ticks.* += platform.nowTicks() - g0;
         bucket.agg_lock.unlock();
         chunks.* += 1;
         try recycleGroupRows(shared, group_chunks[i].rows, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
@@ -5149,7 +5032,7 @@ fn drainRawDedicatedGroupLane(
 }
 
 fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize, top_out: *TopSet, top_ticks: *i64, profile: bool) !void {
-    const top_t0 = if (profile) nowTicks() else 0;
+    const top_t0 = if (profile) platform.nowTicks() else 0;
     if (top_out.items.len == 0) return;
     var b = worker_index;
     const has_str = shared.group_rows_layout.has_str_payload;
@@ -5172,7 +5055,7 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
             while (gid < bkt.states.len) : (gid += 1) top_out.consider(topRowFromState(bkt.states.ref(gid)));
         }
     }
-    if (profile) top_ticks.* += nowTicks() - top_t0;
+    if (profile) top_ticks.* += platform.nowTicks() - top_t0;
 }
 
 // Join group `gid`'s collected GROUP_CONCAT items into the TopRow's str slot:
@@ -5286,40 +5169,40 @@ fn claimScanTile(job: SiloGridJob) ?ScanTile {
 fn openGridScanTile(job: SiloGridJob, tile: ScanTile) void {
     const start = flatToCoord(tile.lo, job.seg_start, job.segment_count, job.shared.total_scan_rgs);
     const end = flatToCoord(tile.hi, job.seg_start, job.segment_count, job.shared.total_scan_rgs);
-    const reset_t0 = if (job.profile) nowTicks() else 0;
+    const reset_t0 = if (job.profile) platform.nowTicks() else 0;
     job.scan.resetRange(start.seg, start.rg, end.seg, end.rg, tile.hi == job.shared.total_scan_rgs);
-    if (job.profile) job.local.scan_reset_ticks += nowTicks() - reset_t0;
+    if (job.profile) job.local.scan_reset_ticks += platform.nowTicks() - reset_t0;
     job.local.scan_tiles += 1;
 }
 
 fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *bool) !void {
-    const claim_t0 = if (job.profile) nowTicks() else 0;
+    const claim_t0 = if (job.profile) platform.nowTicks() else 0;
     const tile = claimScanTile(job) orelse {
-        if (job.profile) job.local.sched_scan_claim_ticks += nowTicks() - claim_t0;
+        if (job.profile) job.local.sched_scan_claim_ticks += platform.nowTicks() - claim_t0;
         scan_exhausted.* = true;
         try markGridScanDone(job, marked_scan_done);
         return;
     };
-    if (job.profile) job.local.sched_scan_claim_ticks += nowTicks() - claim_t0;
+    if (job.profile) job.local.sched_scan_claim_ticks += platform.nowTicks() - claim_t0;
     job.local.sched_scan_jobs += 1;
     errdefer _ = job.shared.active_scan_jobs.fetchSub(1, .release);
     openGridScanTile(job, tile);
 
     job.local.scan_quanta += 1;
     while (true) {
-        const t0 = if (job.profile) nowTicks() else 0;
+        const t0 = if (job.profile) platform.nowTicks() else 0;
         const maybe_batch = try job.drive.next();
-        if (job.profile) job.local.scan_ticks += nowTicks() - t0;
+        if (job.profile) job.local.scan_ticks += platform.nowTicks() - t0;
         const batch = maybe_batch orelse break;
         job.local.scan_batches += 1;
         try appendBatchRawChunks(job.local, job.shared, batch, job.raw_chunk_rows, job.profile, job.filter_fused);
     }
 
     if (job.raw_group_mode != .off and job.shared.raw_scan_queues.len > 0) {
-        const publish_t0 = if (job.profile) nowTicks() else 0;
+        const publish_t0 = if (job.profile) platform.nowTicks() else 0;
         const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
         try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.outstanding_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
-        if (job.profile) job.local.publish_ticks += nowTicks() - publish_t0;
+        if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
 
     if (tile.hi == job.shared.total_scan_rgs) {
@@ -5331,12 +5214,12 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
 fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
     if (marked_scan_done.*) return;
     if (job.raw_group_mode != .off) {
-        const publish_t0 = if (job.profile) nowTicks() else 0;
+        const publish_t0 = if (job.profile) platform.nowTicks() else 0;
         if (job.shared.raw_scan_queues.len > 0) {
             const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
             try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.outstanding_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
         }
-        if (job.profile) job.local.publish_ticks += nowTicks() - publish_t0;
+        if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
     _ = job.shared.scans_done.fetchAdd(1, .release);
     marked_scan_done.* = true;
@@ -5355,18 +5238,18 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
         // error is already recorded; ours would just race it).
         if (job.shared.aborted.load(.acquire)) break;
         job.local.sched_loops += 1;
-        const decision_t0 = if (job.profile) nowTicks() else 0;
+        const decision_t0 = if (job.profile) platform.nowTicks() else 0;
         const scan_claims_available = !scan_exhausted and job.shared.next_scan_rg.load(.acquire) < job.shared.total_scan_rgs;
         const global_scan_finished = job.shared.next_scan_rg.load(.acquire) >= job.shared.total_scan_rgs and
             job.shared.active_scan_jobs.load(.acquire) == 0;
         if (global_scan_finished and !marked_scan_done) {
-            if (job.profile) job.local.sched_decision_ticks += nowTicks() - decision_t0;
+            if (job.profile) job.local.sched_decision_ticks += platform.nowTicks() - decision_t0;
             scan_exhausted = true;
             try markGridScanDone(job, &marked_scan_done);
             idle_spins = 0;
             continue;
         }
-        if (job.profile) job.local.sched_decision_ticks += nowTicks() - decision_t0;
+        if (job.profile) job.local.sched_decision_ticks += platform.nowTicks() - decision_t0;
 
         if (job.raw_group_mode == .staged_final) {
             const scan_choice = if (scan_claims_available) minUnlockedScanLane(job.shared.raw_scan_queues, job.worker_index) else null;
@@ -5470,7 +5353,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                 break;
             }
 
-            const idle_t0 = if (job.profile) nowTicks() else 0;
+            const idle_t0 = if (job.profile) platform.nowTicks() else 0;
             job.local.sched_idle_loops += 1;
             idle_spins += 1;
             if (idle_spins < 256) {
@@ -5479,7 +5362,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                 std.Thread.yield() catch {};
                 idle_spins = 0;
             }
-            if (job.profile) job.idle_ticks.* += nowTicks() - idle_t0;
+            if (job.profile) job.idle_ticks.* += platform.nowTicks() - idle_t0;
             continue;
         }
     }
@@ -5625,8 +5508,8 @@ fn chooseGridScanTileRgs(cfg_scan_tile_rgs: usize, scan_tile_rgs_set: bool) usiz
 }
 
 pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const usize, cfg: RunConfig) !void {
-    const freq = perfFreq();
-    const function_t0 = nowTicks();
+    const freq = platform.perfFreq();
+    const function_t0 = platform.nowTicks();
     g_cp_on = PROFILING and (getenv("THINDB_V2_CHUNK_PROFILE") != null);
     if (comptime PROFILING) chunkProfileReset();
     defer chunkProfileDump();
@@ -5635,7 +5518,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if ((PROFILING and cfg.trace_timing) and pre_return_ticks != 0) {
             std.debug.print("[harness-core-cleanup] query={s} total_cleanup_after_return={d:.1}ms\n", .{
                 "generic",
-                ticksToMs(nowTicks() - pre_return_ticks, freq),
+                platform.ticksToMs(platform.nowTicks() - pre_return_ticks, freq),
             });
         }
     }
@@ -5651,7 +5534,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const scan_tile_rgs = chooseGridScanTileRgs(cfg.scan_tile_rgs, cfg.scan_tile_rgs_set);
     const scan_coalesce_tiles = cfg.scan_coalesce_tiles;
 
-    const snapshot_setup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
+    const snapshot_setup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
     table.ddl_lock.lockSharedUncancelable(table.io);
     defer table.ddl_lock.unlockShared(table.io);
 
@@ -5680,11 +5563,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const scan_columns = cfg.scan_columns orelse &[_][]const u8{};
     var stats_scan = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
     defer {
-        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
         stats_scan.deinit();
         if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} stats_scan={d:.3}ms\n", .{
             "generic",
-            ticksToMs(nowTicks() - cleanup_t0, freq),
+            platform.ticksToMs(platform.nowTicks() - cleanup_t0, freq),
         });
     }
     // Right-size the worker fleet to the work that survives zone-map pruning:
@@ -5736,7 +5619,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         @intCast(@min((total + @as(u64, @intCast(n_workers)) - 1) / @as(u64, @intCast(n_workers)), @as(u64, @intCast(chunk_rows * 16))))
     else
         0;
-    const snapshot_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - snapshot_setup_t0 else 0;
+    const snapshot_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - snapshot_setup_t0 else 0;
 
     if (PROFILING and !cfg.quiet) {
         std.debug.print(
@@ -5761,16 +5644,16 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer allocator.free(drives);
     var built_scans: usize = 0;
     defer {
-        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
         for (drives[0..built_scans]) |*d| d.deinit();
         if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} worker_scans={d:.1}ms count={d}\n", .{
             "generic",
-            ticksToMs(nowTicks() - cleanup_t0, freq),
+            platform.ticksToMs(platform.nowTicks() - cleanup_t0, freq),
             built_scans,
         });
     }
 
-    const bucket_setup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
+    const bucket_setup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
     const using_workspace = cfg.workspace != null;
     var workspace_profile: WorkspaceProfile = .{};
     const workspace_profile_ptr: ?*WorkspaceProfile = if ((PROFILING and cfg.trace_timing) and using_workspace) &workspace_profile else null;
@@ -5778,11 +5661,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer if (!using_workspace and owned_parts.len > 0) allocator.free(owned_parts);
     var built_parts: usize = 0;
     defer if (!using_workspace) {
-        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
         for (owned_parts[0..built_parts]) |*p| p.deinit(allocator);
         if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} worker_parts={d:.1}ms count={d}\n", .{
             "generic",
-            ticksToMs(nowTicks() - cleanup_t0, freq),
+            platform.ticksToMs(platform.nowTicks() - cleanup_t0, freq),
             built_parts,
         });
     };
@@ -5790,11 +5673,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer if (!using_workspace and owned_buckets.len > 0) allocator.free(owned_buckets);
     var built_buckets: usize = 0;
     defer if (!using_workspace) {
-        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
+        const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
         for (owned_buckets[0..built_buckets]) |*bkt| bkt.deinit(allocator);
         if ((PROFILING and cfg.trace_timing)) std.debug.print("[harness-core-cleanup] query={s} pipe_buckets={d:.1}ms count={d}\n", .{
             "generic",
-            ticksToMs(nowTicks() - cleanup_t0, freq),
+            platform.ticksToMs(platform.nowTicks() - cleanup_t0, freq),
             built_buckets,
         });
     };
@@ -5820,7 +5703,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try buckets[b].chunks.ensureTotalCapacity(allocator, 8);
         }
     }
-    const bucket_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - bucket_setup_t0 else 0;
+    const bucket_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - bucket_setup_t0 else 0;
     if (workspace_profile_ptr) |profile| {
         profile.printSetup("generic", bucket_count, worker_local_reserve_per_bucket, init_groups_per_bucket);
     }
@@ -5877,7 +5760,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (shared.raw_group_queues) |*queue| try queue.chunks.ensureTotalCapacity(allocator, 8);
     }
     var i: usize = 0;
-    const worker_setup_t0 = if ((PROFILING and cfg.trace_timing)) nowTicks() else 0;
+    const worker_setup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
     while (i < n_workers) : (i += 1) {
         if (!using_workspace) {
             parts[i] = try WorkerParts.init(allocator, bucket_count, worker_local_reserve_per_bucket);
@@ -5916,7 +5799,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         scans[i].setRange(0, 0, 0, 0, false);
     }
-    const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) nowTicks() - worker_setup_t0 else 0;
+    const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;
     snap.memtable_snap.release();
     pin_held = false;
 
@@ -5941,18 +5824,18 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const top_k_eff: usize = if (cfg.result_all_groups) 0 else cfg.top_k;
     for (worker_tops) |*t| t.* = try TopSet.init(allocator, top_k_eff);
 
-    const setup_ticks = nowTicks() - function_t0;
+    const setup_ticks = platform.nowTicks() - function_t0;
     if ((PROFILING and cfg.trace_timing)) {
         std.debug.print("[harness-core-setup] query={s} total={d:.1}ms snapshot_stats={d:.1}ms pipe_buckets={d:.1}ms worker_parts_scans={d:.1}ms other={d:.1}ms\n", .{
             "generic",
-            ticksToMs(setup_ticks, freq),
-            ticksToMs(snapshot_setup_ticks, freq),
-            ticksToMs(bucket_setup_ticks, freq),
-            ticksToMs(worker_setup_ticks, freq),
-            ticksToMs(setup_ticks - snapshot_setup_ticks - bucket_setup_ticks - worker_setup_ticks, freq),
+            platform.ticksToMs(setup_ticks, freq),
+            platform.ticksToMs(snapshot_setup_ticks, freq),
+            platform.ticksToMs(bucket_setup_ticks, freq),
+            platform.ticksToMs(worker_setup_ticks, freq),
+            platform.ticksToMs(setup_ticks - snapshot_setup_ticks - bucket_setup_ticks - worker_setup_ticks, freq),
         });
     }
-    const total_t0 = nowTicks();
+    const total_t0 = platform.nowTicks();
     var threads = try allocator.alloc(std.Thread, n_workers);
     defer allocator.free(threads);
     var errs = try allocator.alloc(?anyerror, n_workers);
@@ -5993,7 +5876,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     i = 0;
     while (i < n_workers) : (i += 1) threads[i].join();
-    const worker_wall_ticks = nowTicks() - total_t0;
+    const worker_wall_ticks = platform.nowTicks() - total_t0;
     for (errs) |maybe_err| if (maybe_err) |e| return e;
 
     var scan_cpu_ticks: i64 = 0;
@@ -6075,7 +5958,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     for (top_ticks) |ticks| top_cpu_ticks += ticks;
     for (chunks) |chunk_count| total_chunks += chunk_count;
 
-    const final_t0 = nowTicks();
+    const final_t0 = platform.nowTicks();
     var top = try TopSet.init(allocator, top_k_eff);
     defer top.deinit(allocator);
     var group_count: u64 = 0;
@@ -6088,9 +5971,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (worker_top.items[0..worker_top.len]) |candidate| top.consider(candidate);
     }
     std.mem.sort(TopRow, top.items[0..top.len], {}, topLess);
-    const final_merge_ticks = nowTicks() - final_t0;
-    const total_ticks = nowTicks() - total_t0;
-    const function_ticks = nowTicks() - function_t0;
+    const final_merge_ticks = platform.nowTicks() - final_t0;
+    const total_ticks = platform.nowTicks() - total_t0;
+    const function_ticks = platform.nowTicks() - function_t0;
     if (cfg.result_out) |out| {
         const has_str_out = cfg.group_rows_layout.has_str_payload;
         const has_udf_out = cfg.group_rows_layout.has_udf;
@@ -6145,15 +6028,15 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             "[harness-core-timing] query={s} full={d:.1}ms setup_before_workers={d:.1}ms worker_and_final={d:.1}ms final_merge={d:.3}ms result_rows={d}\n",
             .{
                 "generic",
-                ticksToMs(function_ticks, freq),
-                ticksToMs(setup_ticks, freq),
-                ticksToMs(total_ticks, freq),
-                ticksToMs(final_merge_ticks, freq),
+                platform.ticksToMs(function_ticks, freq),
+                platform.ticksToMs(setup_ticks, freq),
+                platform.ticksToMs(total_ticks, freq),
+                platform.ticksToMs(final_merge_ticks, freq),
                 top.len,
             },
         );
     }
-    pre_return_ticks = nowTicks();
+    pre_return_ticks = platform.nowTicks();
     if (cfg.defer_heavy_teardown) heavy_teardown_scheduled = scheduleHeavyTeardown(&shared);
 
     if (PROFILING and !cfg.quiet and cfg.no_profile) {
@@ -6173,9 +6056,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 filtered_rows,
                 grouped_rows,
                 group_count,
-                ticksToMs(total_ticks, freq),
-                ticksToMs(worker_wall_ticks, freq),
-                ticksToMs(final_merge_ticks, freq),
+                platform.ticksToMs(total_ticks, freq),
+                platform.ticksToMs(worker_wall_ticks, freq),
+                platform.ticksToMs(final_merge_ticks, freq),
             },
         );
     } else if (PROFILING and !cfg.quiet) {
@@ -6189,10 +6072,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 filtered_rows,
                 grouped_rows,
                 group_count,
-                ticksToMs(total_ticks, freq),
+                platform.ticksToMs(total_ticks, freq),
                 n_workers,
-                ticksToMs(worker_wall_ticks, freq),
-                ticksToMs(final_merge_ticks, freq),
+                platform.ticksToMs(worker_wall_ticks, freq),
+                platform.ticksToMs(final_merge_ticks, freq),
                 cfg.group_lease_buckets,
                 cfg.group_lease_rows,
             },
@@ -6201,15 +6084,15 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             "[clientip-silo-grid-stages] query={s} scan_decode_cpu={d:.1}ms scan_reset_cpu={d:.3}ms route_partition_cpu={d:.1}ms raw_stage_cpu={d:.1}ms publish_queue_cpu={d:.1}ms aggregate_cpu={d:.1}ms idle_cpu={d:.1}ms local_topn_cpu={d:.1}ms final_merge_wall={d:.3}ms chunks={d} rows_per_chunk={d:.1} scan_ranges={d} scan_quanta={d} scan_batches={d} segments_opened={d} fused_scans={d}/{d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} final_scan_queue_rows={d} final_stage_queue_rows={d} final_scan_buffered_rows={d} active_scan_jobs={d} active_stage_jobs={d} active_group_jobs={d}\n",
             .{
                 "generic",
-                ticksToMs(scan_cpu_ticks, freq),
-                ticksToMs(scan_reset_ticks, freq),
-                ticksToMs(partition_cpu_ticks, freq),
-                ticksToMs(raw_stage_ticks, freq),
-                ticksToMs(publish_cpu_ticks, freq),
-                ticksToMs(group_cpu_ticks, freq),
-                ticksToMs(idle_cpu_ticks, freq),
-                ticksToMs(top_cpu_ticks, freq),
-                ticksToMs(final_merge_ticks, freq),
+                platform.ticksToMs(scan_cpu_ticks, freq),
+                platform.ticksToMs(scan_reset_ticks, freq),
+                platform.ticksToMs(partition_cpu_ticks, freq),
+                platform.ticksToMs(raw_stage_ticks, freq),
+                platform.ticksToMs(publish_cpu_ticks, freq),
+                platform.ticksToMs(group_cpu_ticks, freq),
+                platform.ticksToMs(idle_cpu_ticks, freq),
+                platform.ticksToMs(top_cpu_ticks, freq),
+                platform.ticksToMs(final_merge_ticks, freq),
                 total_chunks,
                 if (total_chunks == 0) 0.0 else @as(f64, @floatFromInt(grouped_rows)) / @as(f64, @floatFromInt(total_chunks)),
                 total_scan_tiles,
@@ -6236,11 +6119,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             "[clientip-silo-grid-scheduler] query={s} scheduler_cpu={d:.3}ms decision={d:.3}ms scan_claim={d:.3}ms group_pick={d:.3}ms group_lock={d:.3}ms loops={d} scan_jobs={d} stage_jobs={d} group_jobs={d} group_misses={d} idle_loops={d}\n",
             .{
                 "generic",
-                ticksToMs(sched_cpu_ticks, freq),
-                ticksToMs(sched_decision_ticks, freq),
-                ticksToMs(sched_scan_claim_ticks, freq),
-                ticksToMs(sched_group_pick_ticks, freq),
-                ticksToMs(sched_group_lock_ticks, freq),
+                platform.ticksToMs(sched_cpu_ticks, freq),
+                platform.ticksToMs(sched_decision_ticks, freq),
+                platform.ticksToMs(sched_scan_claim_ticks, freq),
+                platform.ticksToMs(sched_group_pick_ticks, freq),
+                platform.ticksToMs(sched_group_lock_ticks, freq),
                 sched_loops,
                 sched_scan_jobs,
                 sched_stage_jobs,
@@ -6253,12 +6136,12 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             "[clientip-raw-stage-breakdown] query={s} pop_cpu={d:.3}ms cluster_cpu={d:.3}ms slice_copy_alloc_cpu={d:.3}ms publish_group_queue_cpu={d:.3}ms recycle_input_cpu={d:.3}ms total_stage_measured={d:.3}ms input_chunks={d} avg_input_chunks_per_stage_job={d:.2}\n",
             .{
                 "generic",
-                ticksToMs(raw_stage_pop_ticks, freq),
-                ticksToMs(raw_stage_ticks, freq),
-                ticksToMs(raw_stage_slice_ticks, freq),
-                ticksToMs(raw_stage_publish_ticks, freq),
-                ticksToMs(raw_stage_recycle_ticks, freq),
-                ticksToMs(raw_stage_pop_ticks + raw_stage_ticks + raw_stage_slice_ticks + raw_stage_publish_ticks + raw_stage_recycle_ticks, freq),
+                platform.ticksToMs(raw_stage_pop_ticks, freq),
+                platform.ticksToMs(raw_stage_ticks, freq),
+                platform.ticksToMs(raw_stage_slice_ticks, freq),
+                platform.ticksToMs(raw_stage_publish_ticks, freq),
+                platform.ticksToMs(raw_stage_recycle_ticks, freq),
+                platform.ticksToMs(raw_stage_pop_ticks + raw_stage_ticks + raw_stage_slice_ticks + raw_stage_publish_ticks + raw_stage_recycle_ticks, freq),
                 raw_stage_input_chunks,
                 if (sched_stage_jobs == 0) 0.0 else @as(f64, @floatFromInt(raw_stage_input_chunks)) / @as(f64, @floatFromInt(sched_stage_jobs)),
             },
@@ -6267,19 +6150,19 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             "[clientip-raw-contention] query={s} raw_queue_lock={d:.3}ms raw_scan_queue_lock={d:.3}ms raw_group_queue_lock={d:.3}ms raw_recycle_lock={d:.3}ms stage_builder_lock={d:.3}ms central_group_lock={d:.3}ms total_raw_lock={d:.3}ms\n",
             .{
                 "generic",
-                ticksToMs(raw_queue_lock_ticks, freq),
-                ticksToMs(raw_scan_queue_lock_ticks, freq),
-                ticksToMs(raw_group_queue_lock_ticks, freq),
-                ticksToMs(raw_recycle_lock_ticks, freq),
-                ticksToMs(raw_stage_builder_lock_ticks, freq),
-                ticksToMs(raw_agg_lock_ticks, freq),
-                ticksToMs(raw_queue_lock_ticks + raw_scan_queue_lock_ticks + raw_group_queue_lock_ticks + raw_recycle_lock_ticks + raw_stage_builder_lock_ticks + raw_agg_lock_ticks, freq),
+                platform.ticksToMs(raw_queue_lock_ticks, freq),
+                platform.ticksToMs(raw_scan_queue_lock_ticks, freq),
+                platform.ticksToMs(raw_group_queue_lock_ticks, freq),
+                platform.ticksToMs(raw_recycle_lock_ticks, freq),
+                platform.ticksToMs(raw_stage_builder_lock_ticks, freq),
+                platform.ticksToMs(raw_agg_lock_ticks, freq),
+                platform.ticksToMs(raw_queue_lock_ticks + raw_scan_queue_lock_ticks + raw_group_queue_lock_ticks + raw_recycle_lock_ticks + raw_stage_builder_lock_ticks + raw_agg_lock_ticks, freq),
             },
         );
         std.debug.print("[clientip-silo-grid-workers] query={s} aggregate_cpu_by_worker_ms=", .{"generic"});
         for (group_ticks, 0..) |ticks, worker_idx| {
             if (worker_idx != 0) std.debug.print(",", .{});
-            std.debug.print("{d:.1}", .{ticksToMs(ticks, freq)});
+            std.debug.print("{d:.1}", .{platform.ticksToMs(ticks, freq)});
         }
         std.debug.print(" chunks_by_worker=", .{});
         for (chunks, 0..) |chunk_count, worker_idx| {

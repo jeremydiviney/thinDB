@@ -25,7 +25,7 @@ const Table = api.Table;
 pub const memory = @import("../memory.zig");
 
 pub const prof = @import("../util/prof.zig");
-pub const group_topn_harness_core = @import("group_topn_harness_core.zig");
+pub const silo_group_core = @import("silo_group_core.zig");
 pub const table_fn = @import("table_fn.zig");
 pub const v2_group_topn_engine = @import("v2_group_topn_engine.zig");
 
