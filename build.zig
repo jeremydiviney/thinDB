@@ -321,6 +321,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cmd/server.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = b.option(bool, "strip", "strip debug info (release bundles)") orelse false,
     });
     server_mod.addImport("thindb", thindb_mod);
 
@@ -335,4 +336,11 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_server.addArgs(args);
     const server_step = b.step("server", "Run thindb-server (pass --data-dir etc via -- ...)");
     server_step.dependOn(&run_server.step);
+
+    // ---- dist: install ONLY the server executable ---------------------------
+    // Used by scripts/make_dist.mjs to cross-compile release bundles. The
+    // default install step drags in bench/harness tools that use host-only
+    // APIs; a distribution needs just the server (the UDF SDK is embedded).
+    const dist_step = b.step("dist", "Install only thindb-server (for release bundles; pass -Dtarget/-Doptimize)");
+    dist_step.dependOn(&b.addInstallArtifact(server_exe, .{}).step);
 }
