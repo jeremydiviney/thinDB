@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # workflow_run events default to the branch head at trigger time;
@@ -60,7 +60,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q libarchive-tools
 
       - name: Cache bundled toolchains
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .dist-cache
           key: zig-toolchains-${{ env.ZIG_VERSION }}
@@ -91,7 +91,7 @@ jobs:
             thindb-windows-x86_64.zip >> SHA256SUMS
 
       - name: Upload bundles as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: thindb-bundles-${{ github.sha }}
           path: |

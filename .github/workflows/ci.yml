@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
@@ -44,7 +44,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         shell: pwsh
@@ -54,7 +54,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\zig-x86_64-windows-$env:ZIG_VERSION"
 
       - name: Cache zig build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .zig-cache
           key: zig-cache-windows-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
@@ -85,7 +85,7 @@ jobs:
             zig_arch_os: aarch64-macos
             experimental: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
@@ -93,7 +93,7 @@ jobs:
           echo "$RUNNER_TEMP/zig-${{ matrix.zig_arch_os }}-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
       - name: Cache zig build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .zig-cache
           key: zig-cache-${{ matrix.name }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
