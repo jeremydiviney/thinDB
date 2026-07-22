@@ -1,5 +1,6 @@
 ---
 import DocsLayout from '../layouts/DocsLayout.astro'
+import { withBase } from '../lib/base'
 import PageHeader from '../components/PageHeader.astro'
 import CodeBlock from '../components/CodeBlock.astro'
 import Callout from '../components/Callout.astro'
@@ -16,10 +17,10 @@ const headings = [
   <PageHeader eyebrow="thinDB documentation" title="Columnar analytics without the distributed machinery" description="thinDB is a single-node analytics database written in Zig. Use it as an embedded library or run the standalone server with MySQL, PostgreSQL, and native wire endpoints." />
 
   <div class="feature-grid">
-    <a class="feature-card" href="/getting-started/"><strong>Build and run</strong><p>Compile with Zig 0.16, start the multi-wire server, and create the first table.</p><span>Start here &rarr;</span></a>
-    <a class="feature-card" href="/connect/"><strong>Use existing clients</strong><p>Connect through mysql2, node-postgres, the MySQL CLI, psql, or thinDB's native protocol.</p><span>Connection guide &rarr;</span></a>
-    <a class="feature-card" href="/sql/queries/"><strong>Write analytical SQL</strong><p>Use joins, CTEs, correlated subqueries, grouping, windows, and columnar file scans.</p><span>SQL guide &rarr;</span></a>
-    <a class="feature-card" href="/functions/zig/"><strong>Extend with Zig</strong><p>Compile table functions from submitted source or load a prebuilt dynamic library.</p><span>Function guide &rarr;</span></a>
+    <a class="feature-card" href={withBase('/getting-started/')}><strong>Build and run</strong><p>Compile with Zig 0.16, start the multi-wire server, and create the first table.</p><span>Start here &rarr;</span></a>
+    <a class="feature-card" href={withBase('/connect/')}><strong>Use existing clients</strong><p>Connect through mysql2, node-postgres, the MySQL CLI, psql, or thinDB's native protocol.</p><span>Connection guide &rarr;</span></a>
+    <a class="feature-card" href={withBase('/sql/queries/')}><strong>Write analytical SQL</strong><p>Use joins, CTEs, correlated subqueries, grouping, windows, and columnar file scans.</p><span>SQL guide &rarr;</span></a>
+    <a class="feature-card" href={withBase('/functions/zig/')}><strong>Extend with Zig</strong><p>Compile table functions from submitted source or load a prebuilt dynamic library.</p><span>Function guide &rarr;</span></a>
   </div>
 
   <h2 id="what-thindb-is">What thinDB is</h2>
@@ -27,7 +28,7 @@ const headings = [
   <p>The engine is deliberately local. There is no coordinator, distributed shuffle, replica protocol, or cost-based optimizer. Query structure stays visible and predictable while the engine selects bounded physical paths such as hash versus sort grouping and join algorithms.</p>
 
   <Callout type="note" title="Release status">
-    <p>The SQL server and wire protocols are present and tested, but the project still reports itself as a technical preview. Review <a href="/reference/compatibility/">compatibility and limitations</a> before adopting thinDB as a drop-in replacement for MySQL or PostgreSQL.</p>
+    <p>The SQL server and wire protocols are present and tested, but the project still reports itself as a technical preview. Review <a href={withBase('/reference/compatibility/')}>compatibility and limitations</a> before adopting thinDB as a drop-in replacement for MySQL or PostgreSQL.</p>
   </Callout>
 
   <h2 id="first-query">First query</h2>

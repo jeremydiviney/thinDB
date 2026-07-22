@@ -1,5 +1,6 @@
 ---
 import DocsLayout from '../../layouts/DocsLayout.astro'
+import { withBase } from '../../lib/base'
 import PageHeader from '../../components/PageHeader.astro'
 import CodeBlock from '../../components/CodeBlock.astro'
 import Callout from '../../components/Callout.astro'
@@ -77,7 +78,7 @@ try db.registerTableFn(running_total);`} />
         });
     }
 }`} />
-  <p>Use <code>Args</code> on the function struct for scalar configuration values supplied after the input subquery, and <code>Input2</code> for a second co-grouped input relation. Execution mode declares whether the function requires one global partition, accepts independent partitions, or supports either. The <a href="/functions/zig/">Zig functions guide</a> covers source submission, scalar <code>Args</code>, multiple inputs, SQL call syntax, and prebuilt libraries.</p>
+  <p>Use <code>Args</code> on the function struct for scalar configuration values supplied after the input subquery, and <code>Input2</code> for a second co-grouped input relation. Execution mode declares whether the function requires one global partition, accepts independent partitions, or supports either. The <a href={withBase('/functions/zig/')}>Zig functions guide</a> covers source submission, scalar <code>Args</code>, multiple inputs, SQL call syntax, and prebuilt libraries.</p>
 
   <h2 id="scalar-udfs">Scalar UDFs</h2>
   <Callout type="note" title="Embedded registration only"><p>Native scalar Zig UDFs are registered by the embedding application. <code>CREATE FUNCTION ... LANGUAGE zig</code> currently compiles table functions, not scalar kernels, and thinDB does not yet provide SQL DDL for scalar UDFs.</p></Callout>
