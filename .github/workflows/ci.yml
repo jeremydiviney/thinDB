@@ -1,9 +1,11 @@
 name: ci
 
-# Test suite on every push to every branch (and PRs). Windows and Linux both
-# gate: the suite is green on both platforms (1373/1376) since the _xa
-# iterate fix. macOS/ARM runners can join the same pattern when we want
-# native coverage of those bundles.
+# Test suite on every push to every branch (and PRs). Windows and Linux
+# x86-64 are blocking gates (suite green on both, 1373/1376, since the _xa
+# iterate fix). Linux ARM64 and macOS Apple Silicon run the same suite on
+# native runners but are non-blocking (experimental) until they prove green —
+# same promotion path Linux took. macOS Intel is build-only (runner class
+# retired by GitHub; least important target).
 
 on:
   push:
@@ -40,23 +42,41 @@ jobs:
       - name: Run test suite
         run: zig build test
 
-  test-linux:
-    runs-on: ubuntu-latest
+  test-unix:
+    name: test-${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            zig_arch_os: x86_64-linux
+            experimental: false
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            zig_arch_os: aarch64-linux
+            experimental: true
+          - name: macos-aarch64
+            runner: macos-latest
+            zig_arch_os: aarch64-macos
+            experimental: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_arch_os }}-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-${{ matrix.zig_arch_os }}-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
       - name: Cache zig build cache
         uses: actions/cache@v4
         with:
           path: .zig-cache
-          key: zig-cache-linux-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
-          restore-keys: zig-cache-linux-${{ env.ZIG_VERSION }}-
+          key: zig-cache-${{ matrix.name }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: zig-cache-${{ matrix.name }}-${{ env.ZIG_VERSION }}-
 
       - name: Run test suite
         run: zig build test
