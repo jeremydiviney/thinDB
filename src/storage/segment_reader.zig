@@ -95,7 +95,7 @@ pub const ReadSegment = struct {
         schema: TableSchema,
         row_group_idx: usize,
         column_idx: usize,
-        c: ?*storage_cache.Cache,
+        c: ?storage_cache.TableCache,
     ) !OwnedColumn {
         std.debug.assert(column_idx < schema.columns.len);
         const col_type = schema.columns[column_idx].type;
@@ -104,8 +104,10 @@ pub const ReadSegment = struct {
         // `has_nulls` is fixed by the schema — no need to read the block header.
         const flags = format.ColumnBlockFlags{ .has_nulls = schema.columns[column_idx].nullable };
 
-        if (c) |cc| {
+        if (c) |tc| {
+            const cc = tc.cache;
             const key = storage_cache.Key{
+                .table_uid = tc.table_uid,
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
@@ -192,12 +194,12 @@ pub const ReadSegment = struct {
         /// onto the owned-decode path. Freed on `release`. Null for raw blocks.
         expanded: ?OwnedColumn = null,
 
-        pub fn release(self: *BorrowedBlock, allocator: Allocator, c: ?*storage_cache.Cache) void {
+        pub fn release(self: *BorrowedBlock, allocator: Allocator, c: ?storage_cache.TableCache) void {
             if (self.entry) |e| {
-                if (c) |cc| cc.release(e);
+                if (c) |tc| tc.cache.release(e);
             }
             if (self.owned) |b| {
-                if (self.pooled) c.?.releaseScratch(b) else allocator.free(b);
+                if (self.pooled) c.?.cache.releaseScratch(b) else allocator.free(b);
             }
             if (self.expanded) |*col| col.deinit(allocator);
             self.* = undefined;
@@ -216,11 +218,13 @@ pub const ReadSegment = struct {
         allocator: Allocator,
         row_group_idx: usize,
         column_idx: usize,
-        c: ?*storage_cache.Cache,
+        c: ?storage_cache.TableCache,
     ) !BorrowedBlock {
         const rg = self.info.row_groups[row_group_idx];
-        if (c) |cc| {
+        if (c) |tc| {
+            const cc = tc.cache;
             const key = storage_cache.Key{
+                .table_uid = tc.table_uid,
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
@@ -1188,11 +1192,12 @@ pub fn fsstViewOf(raw: []const u8, row_count: u32, flags: format.ColumnBlockFlag
 /// stays held (the nulls bitmap aliases the entry's bytes).
 pub fn expandFsstPooled(
     block: *ReadSegment.BorrowedBlock,
-    cc: *storage_cache.Cache,
+    tc: storage_cache.TableCache,
     col_type: Type,
     row_count: u32,
     flags: format.ColumnBlockFlags,
 ) !ColumnView {
+    const cc = tc.cache;
     const fv = try fsstViewOf(block.bytes, row_count, flags);
     const n: usize = row_count;
     const offsets_bytes = (n + 1) * @sizeOf(u32);

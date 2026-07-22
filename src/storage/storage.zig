@@ -272,18 +272,18 @@ test "lz4 string blocks: large raw block caches compressed, borrow decompresses"
     // Borrow through the cache: an LZ4-at-rest block hands back an OWNED
     // decompressed buffer (entry == null) rather than pinned cache bytes —
     // that's the signature that the compressed-at-rest path engaged.
-    var bb = try seg.borrowColumnBlock(allocator, 0, 1, &c);
+    var bb = try seg.borrowColumnBlock(allocator, 0, 1, .{ .cache = &c, .table_uid = 0 });
     try std.testing.expectEqual(format.Encoding.raw, bb.encoding);
     try std.testing.expect(bb.owned != null);
     try std.testing.expect(bb.entry == null);
-    bb.release(allocator, &c);
+    bb.release(allocator, .{ .cache = &c, .table_uid = 0 });
 
     // The cached entry holds FEWER bytes than the raw payload (compressed at
     // rest), and a warm re-borrow round-trips the values.
     const raw_payload = 4 + (n + 1) * 4 + bytes.items.len;
     try std.testing.expect(c.current_bytes < raw_payload);
 
-    var col = try seg.decodeColumnMaybeCached(allocator, schema, 0, 1, &c);
+    var col = try seg.decodeColumnMaybeCached(allocator, schema, 0, 1, .{ .cache = &c, .table_uid = 0 });
     defer col.deinit(allocator);
     const sv = col.view().data.string;
     for (0..n) |i| {
@@ -291,9 +291,9 @@ test "lz4 string blocks: large raw block caches compressed, borrow decompresses"
     }
 
     // The plain-int sibling block stays on the decompressed-at-fill path.
-    var bb2 = try seg.borrowColumnBlock(allocator, 0, 0, &c);
+    var bb2 = try seg.borrowColumnBlock(allocator, 0, 0, .{ .cache = &c, .table_uid = 0 });
     try std.testing.expect(bb2.entry != null);
-    bb2.release(allocator, &c);
+    bb2.release(allocator, .{ .cache = &c, .table_uid = 0 });
 }
 
 test "MergedSegmentWriter: parallel encode output is byte-identical to serial" {
@@ -547,8 +547,8 @@ test "borrowed view matches owned decode byte-for-byte (fixed + string)" {
         var owned = try seg.decodeColumn(allocator, schema, 0, col_idx);
         defer owned.deinit(allocator);
 
-        var block = try seg.borrowColumnBlock(allocator, 0, col_idx, &c);
-        defer block.release(allocator, &c);
+        var block = try seg.borrowColumnBlock(allocator, 0, col_idx, .{ .cache = &c, .table_uid = 0 });
+        defer block.release(allocator, .{ .cache = &c, .table_uid = 0 });
 
         const col_type = schema.columns[col_idx].type;
         const flags = format.ColumnBlockFlags{ .has_nulls = schema.columns[col_idx].nullable };
@@ -699,8 +699,8 @@ fn buildSeqStringCol(a: Allocator, n: usize) !DictCols {
 fn blockEncodingOf(allocator: Allocator, seg: *ReadSegment, rg_idx: usize, col_idx: usize) !format.Encoding {
     var c = cache.Cache.init(allocator, 1 << 20);
     defer c.deinit();
-    var block = try seg.borrowColumnBlock(allocator, rg_idx, col_idx, &c);
-    defer block.release(allocator, &c);
+    var block = try seg.borrowColumnBlock(allocator, rg_idx, col_idx, .{ .cache = &c, .table_uid = 0 });
+    defer block.release(allocator, .{ .cache = &c, .table_uid = 0 });
     return block.encoding;
 }
 
@@ -926,8 +926,8 @@ test "dict block stores a lexicographically sorted dictionary" {
 
     var c = cache.Cache.init(allocator, 1 << 20);
     defer c.deinit();
-    var block = try seg.borrowColumnBlock(allocator, 0, 0, &c);
-    defer block.release(allocator, &c);
+    var block = try seg.borrowColumnBlock(allocator, 0, 0, .{ .cache = &c, .table_uid = 0 });
+    defer block.release(allocator, .{ .cache = &c, .table_uid = 0 });
     try std.testing.expectEqual(format.Encoding.dict, block.encoding);
 
     // Non-nullable column → no validity bitmap → the payload is the dict body.

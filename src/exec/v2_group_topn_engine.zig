@@ -685,8 +685,8 @@ fn keyColumnsRunStructured(table: *api.Table, key_columns: []const SiloCore.Grou
             }
             return false;
         };
-        var block = seg.borrowColumnBlock(table.allocator, rg, phys, &table.cache) catch return false;
-        defer block.release(table.allocator, &table.cache);
+        var block = seg.borrowColumnBlock(table.allocator, rg, phys, table.cacheRef()) catch return false;
+        defer block.release(table.allocator, table.cacheRef());
         if (block.encoding != .rle) return false;
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = table.schema.columns[phys].nullable };
         composite_runs += storage.segment_reader.rleViewOf(block.bytes, rg_count, flags).block.n_runs;

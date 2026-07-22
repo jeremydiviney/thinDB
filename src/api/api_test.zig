@@ -26,6 +26,45 @@ test "Database open/close with no tables" {
     defer db.close();
 }
 
+test "tables across databases and schemas share one global block cache" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const schema = TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const t1 = try db.table("t1", schema, .{ .order_key = &.{"id"} });
+    const t2 = try db.table("t2", schema, .{ .order_key = &.{"id"} });
+    const aux = try db.createSchema("aux");
+    const t3 = try aux.table("t3", schema, .{ .order_key = &.{"id"} });
+    const db2 = try db.owned_catalog.?.createOrOpenDatabase("second");
+    const t4 = try db2.table("t4", schema, .{ .order_key = &.{"id"} });
+
+    // One cache instance for the whole Catalog — same schema, sibling
+    // schema, and sibling database all draw from the same budget...
+    try std.testing.expectEqual(t1.cache, t2.cache);
+    try std.testing.expectEqual(t1.cache, t3.cache);
+    try std.testing.expectEqual(t1.cache, t4.cache);
+    try std.testing.expect(!t1.owned_cache);
+    // ...with distinct per-table key namespaces.
+    try std.testing.expect(t1.cache_uid != t2.cache_uid);
+    try std.testing.expect(t2.cache_uid != t3.cache_uid);
+    try std.testing.expect(t3.cache_uid != t4.cache_uid);
+
+    // TRUNCATE re-mints the namespace so the old generation's blocks are
+    // unreachable (segment IDs restart).
+    const old_uid = t1.cache_uid;
+    try t1.truncate();
+    try std.testing.expect(t1.cache_uid != old_uid);
+}
+
 test "Table insert + flush writes a segment, manifest reflects it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -675,9 +714,10 @@ test "streaming merge: dict-eligible string column round-trips" {
     // The color column's first block is dict-encoded (low global NDV).
     var cache = storage.cache.Cache.init(allocator, 1 << 20);
     defer cache.deinit();
-    var block = try seg.borrowColumnBlock(allocator, 0, 1, &cache);
+    const tc = storage.cache.TableCache{ .cache = &cache, .table_uid = 0 };
+    var block = try seg.borrowColumnBlock(allocator, 0, 1, tc);
     const enc = block.encoding;
-    block.release(allocator, &cache);
+    block.release(allocator, tc);
     try std.testing.expectEqual(storage.format.Encoding.dict, enc);
 
     // Every row's (id, color) survives the merge intact, in id order.

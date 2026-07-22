@@ -50,10 +50,11 @@ const usage_text =
     \\                          concurrent queries can't sum past the box (default: auto, ~50% of
     \\                          physical RAM, floored at 256 MiB). Accepts raw bytes or a K/M/G
     \\                          suffix. 0 disables the shared pool (per-query budgets still apply).
-    \\  --cache-size B          Per-table decompressed-block buffer-pool budget (default: auto,
-    \\                          ~50% of physical RAM, floored at 256 MiB). Accepts raw bytes or a
-    \\                          K/M/G suffix (e.g. 8G). Shared across all queries against a table;
-    \\                          blocks in use are pinned and never evicted.
+    \\  --cache-size B          GLOBAL decompressed-block buffer-pool budget, shared by every
+    \\                          table across all databases (default: auto, ~35% of physical RAM,
+    \\                          floored at 256 MiB). Accepts raw bytes or a K/M/G suffix (e.g.
+    \\                          8G). The LRU evicts the coldest block process-wide; blocks in
+    \\                          use are pinned and never evicted.
     \\  --file-root PATH        Enable SQL file scans for paths under PATH. Without this flag,
     \\                          thindb-server rejects read_csv/read_json/read_parquet and
     \\                          FROM 'file.csv' sources.

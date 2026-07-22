@@ -909,8 +909,8 @@ pub const Scan = struct {
             // skip rather than hand consumers placeholders as identity.
             if (self.table.schema.columns[phys].nullable) continue;
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = false };
-            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-            defer block.release(self.allocator, &self.table.cache);
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+            defer block.release(self.allocator, self.table.cacheRef());
             if (block.encoding != .rle) continue;
             const rb = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags).block;
             switch (rb.value_width) {
@@ -1592,8 +1592,8 @@ pub const Scan = struct {
         const codes = self.code_bufs[j].items[0..rg_count];
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-        defer block.release(self.allocator, &self.table.cache);
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
             const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -1629,7 +1629,7 @@ pub const Scan = struct {
         } else {
             const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             defer if (exec.prof.enabled) exec.prof.add("dict-code (raw intern per-row)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
-            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
                 .varchar, .string, .char, .json => |s| s.view(),
@@ -1651,8 +1651,8 @@ pub const Scan = struct {
         const digests = self.hash_bufs[j].items[0..rg_count];
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-        defer block.release(self.allocator, &self.table.cache);
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
             var values = block.bytes;
@@ -1700,7 +1700,7 @@ pub const Scan = struct {
             };
             for (0..rg_count) |i| digests[i] = exec.stringKeyDigest(sv.rowBytes(i));
         } else {
-            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
                 .varchar, .string, .char, .json => |s| s.view(),
@@ -1824,7 +1824,7 @@ pub const Scan = struct {
                         self.table.schema,
                         self.cur_rg_idx,
                         phys,
-                        &self.table.cache,
+                        self.table.cacheRef(),
                     );
                 }
                 decoded_cols += 1;
@@ -2062,7 +2062,7 @@ pub const Scan = struct {
         // Fast path: borrow views over cache bytes. Bail to copy if any column
         // can't be viewed (misalignment / big-endian).
         if (try self.tryBorrowViews(seg, rg_idx, rg_count)) |borrow| {
-            defer for (borrow.blocks) |*b| b.release(self.allocator, &self.table.cache);
+            defer for (borrow.blocks) |*b| b.release(self.allocator, self.table.cacheRef());
             return self.evalAndCompactSegment(seg, rg_idx, rg_count, borrow.views, tomb_mask, expr, .{ .segment = rg_idx });
         }
 
@@ -2082,7 +2082,7 @@ pub const Scan = struct {
             return self.evalAndCompact(out_views, self.out_schema, out_views.len, rg_count, tomb_mask, expr, loc);
         }
         for (self.filter_phys, 0..) |phys, j| {
-            self.filter_decoded[j] = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            self.filter_decoded[j] = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
         }
         self.filter_decoded_valid = true;
         defer self.releaseFilterDecoded();
@@ -2198,8 +2198,8 @@ pub const Scan = struct {
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
         const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, &self.table.cache);
-        defer block.release(self.allocator, &self.table.cache);
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
         if (exec.prof.enabled) exec.prof.add("scan.leaf.borrow_block", @intCast(@max(0, exec.prof.nowTicks() - _tb)));
 
         // Dict-encoded string column: test the comparison against each distinct
@@ -2497,8 +2497,8 @@ pub const Scan = struct {
         }
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, &self.table.cache);
-        defer block.release(self.allocator, &self.table.cache);
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
             evalDictLike(block, rg_count, flags, lp.pattern, negate, out);
@@ -2682,8 +2682,8 @@ pub const Scan = struct {
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = false };
         const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-        defer block.release(self.allocator, &self.table.cache);
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
         if (exec.prof.enabled) self.scan_borrow_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tb));
         const filtered = try self.ensureFilteredBuffers();
         const _tk = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -2928,8 +2928,8 @@ pub const Scan = struct {
                 continue;
             }
 
-            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-            defer block.release(self.allocator, &self.table.cache);
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+            defer block.release(self.allocator, self.table.cacheRef());
 
             if (block.encoding == .for_) {
                 const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
@@ -2955,7 +2955,7 @@ pub const Scan = struct {
             if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
                 try engine.memtable.appendMaskedColumn(self.allocator, view, mask, &filtered_cols[j]);
             } else {
-                var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+                var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
                 defer owned.deinit(self.allocator);
                 try engine.memtable.appendMaskedColumn(self.allocator, owned.view(), mask, &filtered_cols[j]);
             }
@@ -3002,8 +3002,8 @@ pub const Scan = struct {
         try self.code_bufs[j].resize(self.allocator, matched);
         const codes = self.code_bufs[j].items[0..matched];
 
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-        defer block.release(self.allocator, &self.table.cache);
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
             var values = block.bytes;
@@ -3017,7 +3017,7 @@ pub const Scan = struct {
                 k += 1;
             };
         } else {
-            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
                 .varchar, .string, .char, .json => |s| s.view(),
@@ -3049,8 +3049,8 @@ pub const Scan = struct {
         try self.hash_bufs[j].resize(self.allocator, matched);
         const digests = self.hash_bufs[j].items[0..matched];
 
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-        defer block.release(self.allocator, &self.table.cache);
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
             var values = block.bytes;
@@ -3100,7 +3100,7 @@ pub const Scan = struct {
                 k += 1;
             };
         } else {
-            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, &self.table.cache);
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
                 .varchar, .string, .char, .json => |s| s.view(),
@@ -3282,20 +3282,20 @@ pub const Scan = struct {
         const blocks = try self.ensureBorrowBlocks();
 
         var got: usize = 0;
-        errdefer for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+        errdefer for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
 
         for (self.out_phys, 0..) |phys, j| {
             const col_type = self.table.schema.columns[phys].type;
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
-            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
 
             if (block.encoding == .fsst) {
                 // FSST: expand once into the cache's recycled scratch pool
                 // (returned on `block.release`) — a fresh allocation per
                 // borrow re-faults zeroed pages every scan `next()`.
-                const view = storage.segment_reader.expandFsstPooled(&block, &self.table.cache, col_type, rg_count, flags) catch |e| {
-                    block.release(self.allocator, &self.table.cache);
-                    for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+                const view = storage.segment_reader.expandFsstPooled(&block, self.table.cacheRef(), col_type, rg_count, flags) catch |e| {
+                    block.release(self.allocator, self.table.cacheRef());
+                    for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                     return e;
                 };
                 blocks[j] = block;
@@ -3318,8 +3318,8 @@ pub const Scan = struct {
                     flags,
                     block.encoding,
                 ) catch |e| {
-                    block.release(self.allocator, &self.table.cache);
-                    for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+                    block.release(self.allocator, self.table.cacheRef());
+                    for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                     return e;
                 };
                 blocks[j] = block;
@@ -3331,8 +3331,8 @@ pub const Scan = struct {
             const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse {
                 // Misaligned / big-endian raw: release this block and abandon the
                 // fast path for the whole row group (release the rest too).
-                block.release(self.allocator, &self.table.cache);
-                for (blocks[0..got]) |*b| b.release(self.allocator, &self.table.cache);
+                block.release(self.allocator, self.table.cacheRef());
+                for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                 return null;
             };
             blocks[j] = block;
@@ -3357,7 +3357,7 @@ pub const Scan = struct {
                 self.table.schema,
                 rg_idx,
                 phys,
-                &self.table.cache,
+                self.table.cacheRef(),
             );
             decoded_cols += 1;
         }

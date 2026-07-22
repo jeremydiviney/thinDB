@@ -641,7 +641,7 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
             z.table.schema,
             ref.rg_idx,
             phys,
-            &z.table.cache,
+            z.table.cacheRef(),
         );
         decoded_n += 1;
     }

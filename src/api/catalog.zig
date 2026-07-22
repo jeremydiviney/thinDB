@@ -18,6 +18,7 @@ const snapshot = @import("../util/snapshot.zig");
 const udf_mod = @import("../udf.zig");
 const zigfn = @import("zigfn.zig");
 const memory = @import("../memory.zig");
+const storage = @import("../storage/storage.zig");
 
 var zig_fn_seq: u64 = 1;
 
@@ -49,6 +50,11 @@ pub const Catalog = struct {
     /// caller owns). Destroyed last in `close` — every query's accountant
     /// holds a pointer into it.
     owned_pool: ?*memory.MemoryPool = null,
+    /// The shared decompressed-block cache, when this Catalog minted it from
+    /// `Config.cache_size_bytes` (vs. adopting a caller-provided one, which
+    /// the caller owns). One global budget across every table; destroyed in
+    /// `close` after all databases (and their tables) are gone.
+    owned_block_cache: ?*storage.cache.Cache = null,
     /// True when the Catalog allocator-owns its struct (the user called
     /// `Catalog.open` and gets a `*Catalog`). False when the Catalog is
     /// nested inside another owner (currently unused; reserved).
@@ -94,6 +100,22 @@ pub const Catalog = struct {
         }
         errdefer if (owned_pool) |p| allocator.destroy(p);
 
+        // The shared decompressed-block cache — same ownership pattern as the
+        // pool: adopt a caller-provided cache as-is, else mint one from the
+        // resolved GLOBAL budget. Every Table opened under this Catalog draws
+        // from it, so eviction is oldest-block-first across all tables.
+        var owned_block_cache: ?*storage.cache.Cache = null;
+        if (cfg.block_cache == null) {
+            const bc = try allocator.create(storage.cache.Cache);
+            bc.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes));
+            owned_block_cache = bc;
+            cfg.block_cache = bc;
+        }
+        errdefer if (owned_block_cache) |bc| {
+            bc.deinit();
+            allocator.destroy(bc);
+        };
+
         const self = try allocator.create(Catalog);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -102,6 +124,7 @@ pub const Catalog = struct {
             .root_dir = root_dir,
             .config = cfg,
             .owned_pool = owned_pool,
+            .owned_block_cache = owned_block_cache,
             .udfs = udf_mod.UdfRegistry.init(allocator),
             .sql_fns = udf_mod.SqlFnRegistry.init(allocator),
             .views = udf_mod.ViewRegistry.init(allocator),
@@ -527,6 +550,10 @@ pub const Catalog = struct {
         self.xa.deinit();
         self.databases.deinit();
         const allocator = self.allocator;
+        if (self.owned_block_cache) |bc| {
+            bc.deinit();
+            allocator.destroy(bc);
+        }
         if (self.owned_pool) |p| allocator.destroy(p);
         allocator.destroy(self);
     }

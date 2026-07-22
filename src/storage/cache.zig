@@ -1,8 +1,9 @@
 //! Pinning LRU buffer pool for decompressed column blocks, shared across all
-//! queries against a `Table`.
+//! queries against ALL tables of a Catalog — one global budget, so the LRU
+//! evicts the coldest block process-wide regardless of which table owns it.
 //!
-//! Keyed by `(segment_id, row_group_idx, column_idx)`. Value is the raw,
-//! decompressed (but not decoded) bytes of one column block. A cache hit
+//! Keyed by `(table_uid, segment_id, row_group_idx, column_idx)`. Value is the
+//! raw, decompressed (but not decoded) bytes of one column block. A cache hit
 //! still pays a cheap decode step but skips the expensive zstd decompress.
 //!
 //! Bounded by total cached bytes (`capacity_bytes`). The cache does NOT assume
@@ -11,9 +12,10 @@
 //! capacity rather than free a block someone is reading.
 //!
 //! ## Concurrency
-//! Thread-per-connection servers share one cache per table. All metadata
-//! mutations (map, LRU links, byte counter, pin counts) are guarded by `mutex`,
-//! held only for the O(1) bookkeeping — never across decompress or decode.
+//! Thread-per-connection servers share the one cache across every connection
+//! and table. All metadata mutations (map, LRU links, byte counter, pin counts)
+//! are guarded by `mutex`, held only for the O(1) bookkeeping — never across
+//! decompress or decode.
 //!
 //! ## Pinning (in-use accounting)
 //! `acquire`/`insertPinned` return an entry with its pin count incremented;
@@ -24,11 +26,16 @@
 //! error mid-decode, so a failed query can't leak a pin and wedge a block.
 //!
 //! ## Coherence
-//! Segments are immutable once written and segment IDs come from a monotonic,
-//! never-reused counter, so a cached block is valid for the entire life of its
-//! segment and keys never collide with a future segment. Retired segments (post
-//! compaction) are simply never looked up again and age out via LRU. There is
-//! no in-place mutation to invalidate, and the memtable is never cached here.
+//! Segments are immutable once written and, within one table generation,
+//! segment IDs come from a monotonic never-reused counter — so a cached block
+//! is valid for the entire life of its segment. Retired segments (post
+//! compaction) are simply never looked up again and age out via LRU. Segment
+//! IDs are PER-TABLE counters though, and TRUNCATE/ALTER reset them — the
+//! `table_uid` key component scopes every entry to one table GENERATION: each
+//! `Table.open` (and each truncate/alter re-init) takes a fresh uid via
+//! `newTableUid`, which invalidates that table's entries in O(1) — the old
+//! uid's keys become unreachable and age out (or are eagerly freed via
+//! `purgeTable`). The memtable is never cached here.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,10 +43,30 @@ const format = @import("format.zig");
 const huge_page = @import("../util/huge_page.zig");
 
 pub const Key = struct {
+    /// Table-generation namespace (see the Coherence section above). 0 in
+    /// unit tests that exercise a cache directly.
+    table_uid: u64 = 0,
     segment_id: u64,
     row_group_idx: u32,
     column_idx: u32,
 };
+
+/// A table's handle into the shared block cache: the cache plus the table's
+/// uid namespace within it. Passed by value down the segment-read path so key
+/// construction at the storage boundary can scope entries to the table
+/// generation without the reader knowing about `Table`.
+pub const TableCache = struct {
+    cache: *Cache,
+    table_uid: u64,
+};
+
+var next_table_uid = std.atomic.Value(u64).init(1);
+
+/// Mint a process-unique table-generation uid. Never reused, so bumping a
+/// table's uid is an O(1) whole-table cache invalidation.
+pub fn newTableUid() u64 {
+    return next_table_uid.fetchAdd(1, .monotonic);
+}
 
 /// CAS-based spinlock. Zig 0.16's stdlib `std.Thread.Mutex` is gone and
 /// `Io.Mutex` requires an `Io` the decode path doesn't carry. The cache's
@@ -331,6 +358,30 @@ pub const Cache = struct {
         }
     }
 
+    /// Eagerly free every unpinned entry belonging to `table_uid`. Correctness
+    /// comes from the uid bump alone (the old uid's keys are never looked up
+    /// again); this just returns the dead bytes to the budget immediately —
+    /// table close, TRUNCATE, ALTER. Pinned entries are skipped (a concurrent
+    /// reader may still be decoding from them) and age out via LRU.
+    pub fn purgeTable(self: *Cache, table_uid: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var cur = self.tail;
+        while (cur) |e| {
+            const prev = e.prev;
+            if (e.key.table_uid == table_uid and e.pins == 0) {
+                self.unlink(e);
+                _ = self.map.remove(e.key);
+                const resident = huge_page.cellSize(e.bytes.len);
+                self.current_bytes -= resident;
+                _ = g_cache_bytes.fetchSub(resident, .monotonic);
+                self.pool.allocator().free(e.bytes);
+                self.allocator.destroy(e);
+            }
+            cur = prev;
+        }
+    }
+
     fn touch(self: *Cache, entry: *Entry) void {
         if (self.head == entry) return;
         self.unlink(entry);
@@ -459,6 +510,51 @@ test "cache insertPinned dedupes a racing duplicate key" {
     try std.testing.expectEqual(@as(usize, 4), c.current_bytes);
     c.release(first);
     c.release(second);
+}
+
+test "shared cache evicts globally: oldest block goes regardless of table" {
+    const allocator = std.testing.allocator;
+    var c: Cache = .init(allocator, 30);
+    defer c.deinit();
+
+    // Table A inserts two blocks, then table B inserts two. Same (segment, rg,
+    // col) coordinates on both tables — the uid keeps them distinct. The fourth
+    // insert pushes 40 > 30 and must evict the globally-oldest block (table
+    // A's rg 0), not something scoped to the inserting table.
+    try put(&c, .{ .table_uid = 1, .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }, try adup(allocator, "AAAAAAAAAA"));
+    try put(&c, .{ .table_uid = 1, .segment_id = 1, .row_group_idx = 1, .column_idx = 0 }, try adup(allocator, "aaaaaaaaaa"));
+    try put(&c, .{ .table_uid = 2, .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }, try adup(allocator, "BBBBBBBBBB"));
+    try put(&c, .{ .table_uid = 2, .segment_id = 1, .row_group_idx = 1, .column_idx = 0 }, try adup(allocator, "bbbbbbbbbb"));
+
+    try std.testing.expect(c.acquire(.{ .table_uid = 1, .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }) == null);
+    const b0 = c.acquire(.{ .table_uid = 2, .segment_id = 1, .row_group_idx = 0, .column_idx = 0 }).?;
+    try std.testing.expectEqualStrings("BBBBBBBBBB", b0.bytes);
+    c.release(b0);
+    try std.testing.expectEqual(@as(u64, 1), c.evictions);
+}
+
+test "purgeTable frees one table's unpinned entries, leaves other tables and pins" {
+    const allocator = std.testing.allocator;
+    var c: Cache = .init(allocator, 1024);
+    defer c.deinit();
+
+    const dead_free = Key{ .table_uid = 5, .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
+    const dead_pinned = Key{ .table_uid = 5, .segment_id = 1, .row_group_idx = 1, .column_idx = 0 };
+    const live = Key{ .table_uid = 6, .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
+    try put(&c, dead_free, try adup(allocator, "XXXX"));
+    const pinned = try c.insertPinned(dead_pinned, try adup(allocator, "YYYY"), .raw);
+    try put(&c, live, try adup(allocator, "ZZZZ"));
+
+    c.purgeTable(5);
+
+    try std.testing.expect(c.acquire(dead_free) == null);
+    c.release(c.acquire(live).?);
+    // The pinned entry survives the purge (a reader may be mid-decode) and is
+    // simply unreachable once the table's uid moves on; it drains via LRU.
+    try std.testing.expectEqualStrings("YYYY", pinned.bytes);
+    c.release(pinned);
+    c.purgeTable(5);
+    try std.testing.expect(c.acquire(dead_pinned) == null);
 }
 
 // ---------------------------------------------------------------------------

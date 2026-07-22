@@ -33,8 +33,16 @@ pub const Table = struct {
     row_group_size: usize,
     order_key_indices: []usize,
 
-    /// LRU cache of decompressed column-block bytes. Lifetime = Table.
-    cache: storage.cache.Cache,
+    /// The shared (Catalog-wide) LRU cache of decompressed column-block
+    /// bytes. Entries this table inserts are scoped by `cache_uid`; the byte
+    /// budget and LRU order are global across every table sharing the cache.
+    cache: *storage.cache.Cache,
+    /// This table generation's namespace in `cache`. Re-minted (invalidating
+    /// every cached block in O(1)) on TRUNCATE and ALTER.
+    cache_uid: u64,
+    /// Set when no shared cache was in the Config (direct `Table.open`, no
+    /// Catalog — tests) and this table minted a private one to free at close.
+    owned_cache: bool = false,
 
     /// Opened-segment cache: parsed footers + tombstone state, shared across
     /// queries and scan workers (footer parse is ~ms; segments are immutable).
@@ -208,6 +216,18 @@ pub const Table = struct {
             order_key_indices[i] = schema.columnIndex(k) orelse return Error.SchemaMismatch;
         }
 
+        var owned_cache = false;
+        const cache_ptr = cfg.block_cache orelse blk: {
+            const c = try allocator.create(storage.cache.Cache);
+            c.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes));
+            owned_cache = true;
+            break :blk c;
+        };
+        errdefer if (owned_cache) {
+            cache_ptr.deinit();
+            allocator.destroy(cache_ptr);
+        };
+
         const self = try allocator.create(Table);
         errdefer allocator.destroy(self);
 
@@ -220,7 +240,9 @@ pub const Table = struct {
             .schema_fingerprint = fp,
             .row_group_size = row_group_size,
             .order_key_indices = order_key_indices,
-            .cache = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes)),
+            .cache = cache_ptr,
+            .cache_uid = storage.cache.newTableUid(),
+            .owned_cache = owned_cache,
             .auto_flush_bytes = cfg.auto_flush_bytes,
             .auto_flush_rows = cfg.auto_flush_rows,
             .auto_flush_secs = cfg.auto_flush_secs,
@@ -275,7 +297,12 @@ pub const Table = struct {
         self.upsert_idx.deinit(allocator);
         if (self.upsert_idx_arena) |*a| a.deinit();
         self.seg_handles.deinit(allocator);
-        self.cache.deinit();
+        if (self.owned_cache) {
+            self.cache.deinit();
+            allocator.destroy(self.cache);
+        } else {
+            self.cache.purgeTable(self.cache_uid);
+        }
         // Drop the Table's reference. If scans pinned a snapshot, the
         // memtable stays alive until the last reader releases it.
         self.memtable.release();
@@ -873,9 +900,10 @@ pub const Table = struct {
         self.next_segment_id.store(self.manifest.nextSegmentId(), .monotonic);
         self.first_write_ts = null;
 
-        const old_cache_capacity = self.cache.capacity_bytes;
-        self.cache.deinit();
-        self.cache = storage.cache.Cache.init(self.allocator, old_cache_capacity);
+        // Segment IDs restart after a truncate, so the old generation's cached
+        // blocks must become unreachable: purge them and move to a fresh uid.
+        self.cache.purgeTable(self.cache_uid);
+        self.cache_uid = storage.cache.newTableUid();
         self.seg_handles.clear(self.allocator);
     }
 
@@ -885,6 +913,12 @@ pub const Table = struct {
         self.compact_lock.lockUncancelable(self.io);
         defer self.compact_lock.unlock(self.io);
         try @import("compact.zig").execCompact(self);
+    }
+
+    /// This table generation's handle into the shared block cache — what the
+    /// segment-read path takes to build uid-scoped cache keys.
+    pub fn cacheRef(self: *const Table) storage.cache.TableCache {
+        return .{ .cache = self.cache, .table_uid = self.cache_uid };
     }
 
     /// Get-or-open the cached parsed segment (pinned; pair with
