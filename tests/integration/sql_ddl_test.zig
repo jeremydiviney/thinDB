@@ -807,3 +807,56 @@ test "sql ddl: StarRocks CREATE TABLE — DISTRIBUTED BY HASH key + BUCKETS + re
     const b2 = (try q2.next()).?;
     try std.testing.expectEqual(@as(i64, 1), b2.values[0].data.bigint[0]);
 }
+
+test "sql ddl: global block cache — two tables share it; TRUNCATE never serves stale blocks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE ca (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)");
+    try exec(allocator, db, "CREATE TABLE cb (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO ca VALUES (1, 10), (2, 20), (3, 30)");
+    try exec(allocator, db, "INSERT INTO cb VALUES (1, 7), (2, 14)");
+    const ta = try db.openTable("ca", .{});
+    const tb = try db.openTable("cb", .{});
+    try ta.flush();
+    try tb.flush();
+
+    // Real segment scans on both tables must land blocks in the SAME cache
+    // instance, each keyed under its own table uid.
+    const va = try collectBigints(allocator, db, "SELECT v FROM ca ORDER BY id");
+    defer allocator.free(va);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, va);
+    const vb = try collectBigints(allocator, db, "SELECT v FROM cb ORDER BY id");
+    defer allocator.free(vb);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 14 }, vb);
+
+    try std.testing.expectEqual(ta.cache, tb.cache);
+    var blocks_a: usize = 0;
+    var blocks_b: usize = 0;
+    var it = ta.cache.map.keyIterator();
+    while (it.next()) |k| {
+        if (k.table_uid == ta.cache_uid) blocks_a += 1;
+        if (k.table_uid == tb.cache_uid) blocks_b += 1;
+    }
+    try std.testing.expect(blocks_a > 0);
+    try std.testing.expect(blocks_b > 0);
+
+    // TRUNCATE restarts the table's segment IDs at the same coordinates the
+    // cached blocks used. A re-read must serve the NEW generation's bytes —
+    // the uid bump makes the old entries unreachable.
+    try exec(allocator, db, "TRUNCATE TABLE ca");
+    try exec(allocator, db, "INSERT INTO ca VALUES (1, 111), (2, 222), (3, 333)");
+    try ta.flush();
+    const va2 = try collectBigints(allocator, db, "SELECT v FROM ca ORDER BY id");
+    defer allocator.free(va2);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 111, 222, 333 }, va2);
+
+    // The sibling table's cached blocks were untouched by the truncate.
+    const vb2 = try collectBigints(allocator, db, "SELECT v FROM cb ORDER BY id");
+    defer allocator.free(vb2);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 14 }, vb2);
+}

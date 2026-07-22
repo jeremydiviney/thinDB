@@ -95,11 +95,13 @@ pub const Config = struct {
     auto_flush_min_rows: u64 = 1,
     auto_flush_min_bytes: usize = 0,
 
-    /// LRU cache budget for decompressed column blocks. The special value
-    /// `0` means "auto" — resolved at open time to ~60% of physical RAM
-    /// (floored at 256 MiB) by `autoCacheSizeBytes`. Set an explicit non-zero
-    /// value to pin the budget; there is no separate "disable cache" — a tiny
-    /// explicit value (e.g. 1) is the way to effectively turn it off.
+    /// GLOBAL LRU cache budget for decompressed column blocks — one budget
+    /// shared by every table (across all databases/schemas) of the Catalog,
+    /// evicting the coldest block process-wide. The special value `0` means
+    /// "auto" — resolved at open time to ~35% of physical RAM (floored at
+    /// 256 MiB) by `autoCacheSizeBytes`. Set an explicit non-zero value to pin
+    /// the budget; there is no separate "disable cache" — a tiny explicit
+    /// value (e.g. 1) is the way to effectively turn it off.
     cache_size_bytes: usize = 0,
 
     /// Background-compactor threshold. When a table has at least this many
@@ -192,6 +194,15 @@ pub const Config = struct {
     /// then uses it as-is and does not own it.
     memory_pool: ?*@import("../memory.zig").MemoryPool = null,
 
+    /// The shared decompressed-block cache itself. Normally null in
+    /// user-built Configs — the Catalog creates one sized from
+    /// `cache_size_bytes` at open and threads the pointer through this field
+    /// to every Database and Table it owns. An embedding application that
+    /// opens MULTIPLE Catalogs in one process can pass its own cache here to
+    /// make them share one budget; the Catalog then uses it as-is and does
+    /// not own it. (Same ownership contract as `memory_pool`.)
+    block_cache: ?*@import("../storage/storage.zig").cache.Cache = null,
+
     /// Maximum intra-query degree of parallelism (worker threads per query for
     /// the parallel scan/filter leaf). `1` (default) = fully serial, byte-
     /// identical to the single-threaded engine — the canonical result and the
@@ -227,12 +238,6 @@ pub const Config = struct {
     file_scan_access: FileScanAccess = .process,
 };
 
-/// Resolve the decompressed-block cache budget. A non-zero `configured` is
-/// honored verbatim; `0` means "auto" — ~50% of physical RAM, floored at
-/// 256 MiB so small machines still get a usable pool. The LRU fills lazily and
-/// evicts to this bound, so a large auto budget on a big box costs nothing
-/// until the workload's hot set actually grows into it. Falls back to the
-/// floor if the OS can't report total memory.
 /// Resolve `Config.compact_threads`: non-zero is honored verbatim; `0` means
 /// "auto" — ~25% of the physical cores (cross-OS, SMT-aware: see
 /// `affinity.physicalCoreCount`), so a background merge speeds up
@@ -250,6 +255,13 @@ pub fn physicalCoreCount(allocator: std.mem.Allocator) usize {
     return @import("../util/affinity.zig").physicalCoreCount(allocator);
 }
 
+/// Resolve the GLOBAL decompressed-block cache budget (one cache shared by
+/// every table of the Catalog). A non-zero `configured` is honored verbatim;
+/// `0` means "auto" — ~35% of physical RAM, floored at 256 MiB so small
+/// machines still get a usable pool. The LRU fills lazily and evicts to this
+/// bound, so a large auto budget on a big box costs nothing until the
+/// workload's hot set actually grows into it. Falls back to the floor if the
+/// OS can't report total memory.
 pub fn autoCacheSizeBytes(configured: usize) usize {
     if (configured != 0) return configured;
     const floor: u64 = 256 * 1024 * 1024;

@@ -405,10 +405,12 @@ fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64) !void {
     t.manifest.deinit();
     t.manifest = new_manifest;
 
-    const old_cache_capacity = t.cache.capacity_bytes;
-    t.cache.deinit();
-    t.cache = storage.cache.Cache.init(allocator, old_cache_capacity);
-    // The parsed footers embed schema-derived structures — drop them too.
+    // The rewritten table restarts segment IDs and reshapes columns, so the
+    // old generation's cached blocks must become unreachable: purge and move
+    // to a fresh uid. The parsed footers embed schema-derived structures —
+    // drop them too.
+    t.cache.purgeTable(t.cache_uid);
+    t.cache_uid = storage.cache.newTableUid();
     t.seg_handles.clear(allocator);
 
     const new_indices = try allocator.alloc(usize, t.schema.order_key.len);

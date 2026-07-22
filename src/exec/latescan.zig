@@ -306,8 +306,8 @@ pub const LateScan = struct {
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
             const out = &self.output_columns[out_idx];
 
-            var bb = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, &self.table.cache);
-            defer bb.release(self.allocator, &self.table.cache);
+            var bb = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+            defer bb.release(self.allocator, self.table.cacheRef());
 
             switch (bb.encoding) {
                 .dict => try appendDictRows(self.allocator, bb.bytes, rc, flags, offsets, out),
