@@ -5,9 +5,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const exec = @import("../../exec/exec.zig");
-const Batch = exec.Batch;
-
 const types = @import("../../types.zig");
 const Column = types.Column;
 const Type = types.Type;

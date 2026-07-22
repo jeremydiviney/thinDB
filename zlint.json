@@ -1,0 +1,10 @@
+{
+  "rules": {
+    "unused-decls": "error",
+    "no-catch-return": "error",
+    "suppressed-errors": "off",
+    "no-print": "off",
+    "unsafe-undefined": "off",
+    "avoid-as": "off"
+  }
+}

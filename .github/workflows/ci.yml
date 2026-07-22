@@ -19,7 +19,7 @@ env:
   ZIG_VERSION: 0.16.0
 
 jobs:
-  fmt:
+  lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -32,6 +32,13 @@ jobs:
 
       - name: zig fmt --check
         run: zig fmt --check src tests bench build.zig scripts
+
+      - name: zlint (rules in zlint.json)
+        run: |
+          curl -fL --retry 3 -o "$RUNNER_TEMP/zlint" \
+            "https://github.com/DonIsaac/zlint/releases/download/v0.9.0/zlint-linux-x86_64"
+          chmod +x "$RUNNER_TEMP/zlint"
+          git ls-files 'src/**/*.zig' 'src/*.zig' | "$RUNNER_TEMP/zlint" -S -f github --deny-warnings
 
   test-windows:
     runs-on: windows-latest

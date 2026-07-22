@@ -29,8 +29,6 @@
 
 const std = @import("std");
 const types = @import("../types.zig");
-const Column = types.Column;
-const ValueTag = types.ValueTag;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -38,7 +36,6 @@ const ColumnView = storage.ColumnView;
 const exec = @import("../exec/exec.zig");
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
-const Memtable = engine.Memtable;
 
 const api = @import("api.zig");
 const Table = api.Table;

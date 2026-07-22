@@ -139,7 +139,7 @@ fn boundary(child_op: *const ir.Op, child: Info) void {
 
 fn analyze(arena: Allocator, op: *const ir.Op, memo: *std.AutoHashMapUnmanaged(*const ir.Op, Info)) !Info {
     if (memo.get(op)) |hit| return hit;
-    const info = analyzeInner(arena, op, memo) catch |e| return e;
+    const info = try analyzeInner(arena, op, memo);
     try memo.put(arena, op, info);
     return info;
 }

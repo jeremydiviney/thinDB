@@ -12,7 +12,6 @@ const Value = types.Value;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
-const sformat = @import("../storage/format.zig");
 const hll = @import("../util/hll.zig");
 const bloom_util = @import("../util/bloom.zig");
 const comparison = @import("../api/comparison.zig");
@@ -60,7 +59,6 @@ const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
 const PredicateOp = predicate.PredicateOp;
-const statsOverlapPredicate = predicate.statsOverlapPredicate;
 const filter_mod = @import("filter.zig");
 
 const rowloc = @import("rowloc.zig");

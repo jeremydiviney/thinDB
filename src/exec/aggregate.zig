@@ -38,7 +38,6 @@ const CodedKey = struct { dict: *exec.GlobalDict };
 
 const group_table = @import("group_table.zig");
 const ByteGroupTable = group_table.ByteGroupTable;
-const IntGroupTable = group_table.IntGroupTable;
 /// Per-tier integer group tables. The active one is selected by
 /// `int_layout.?.tier`; the unused two stay `null`.
 const IntTable32 = group_table.IntKeyTable(32);

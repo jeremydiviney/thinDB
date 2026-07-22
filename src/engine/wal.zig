@@ -41,19 +41,10 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
-const Type = types.Type;
-const TableSchema = types.TableSchema;
-const TypeTag = types.TypeTag;
 const ValueTag = types.ValueTag;
-const Value = types.Value;
 
 const storage = @import("../storage/storage.zig");
 const format = storage.format;
-const ColumnView = storage.ColumnView;
-const column_mod = storage.column;
-
-const store = @import("store.zig");
-const ColumnStore = store.ColumnStore;
 
 const memtable_mod = @import("memtable.zig");
 const Memtable = memtable_mod.Memtable;

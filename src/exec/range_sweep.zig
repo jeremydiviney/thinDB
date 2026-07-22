@@ -42,7 +42,6 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
-const PredicateOp = predicate.PredicateOp;
 
 const transform = @import("../engine/transform.zig");
 const join_mod = @import("join.zig");

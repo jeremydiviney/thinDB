@@ -63,7 +63,6 @@ const GRID_SCAN_YIELD_CHUNKS: usize = 16384;
 const DEFAULT_ROUTE_BLOCK_ROWS: usize = 2048;
 const MAX_ROUTE_BLOCK_ROWS: usize = 2048;
 const AUTO_ROUTE_BLOCK_ROWS: usize = 0;
-const MAX_GROUP_LEASE_BUCKETS: usize = 64;
 const MAX_WORKSPACE_PROFILE_WORKERS: usize = 128;
 const MAX_RAW_BATCH_CHUNKS: usize = 64;
 const MAX_GENERIC_GROUP_KEYS: usize = 8;

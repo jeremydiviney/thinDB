@@ -28,7 +28,6 @@ const ColumnStore = engine.ColumnStore;
 const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
-const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
 const transform = @import("../engine/transform.zig");

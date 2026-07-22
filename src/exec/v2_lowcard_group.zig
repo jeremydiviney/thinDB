@@ -48,7 +48,6 @@ const Column = types.Column;
 const Type = types.Type;
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
-const ValueView = storage.column.ValueView;
 const store = @import("../engine/store.zig");
 const ColumnStore = store.ColumnStore;
 

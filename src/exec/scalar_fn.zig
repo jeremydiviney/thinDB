@@ -24,7 +24,6 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const Type = types.Type;
 const TypeTag = types.TypeTag;
-const Value = types.Value;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -33,8 +32,6 @@ const store = @import("../engine/store.zig");
 const ColumnStore = store.ColumnStore;
 
 const Expr = @import("expr.zig").Expr;
-const exec = @import("exec.zig");
-const Error = exec.Error;
 
 const cast = @import("cast.zig");
 const CastKernel = cast.CastKernel;

@@ -18,7 +18,6 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const Type = types.Type;
-const TypeTag = types.TypeTag;
 const DecimalSpec = types.DecimalSpec;
 
 const common = @import("scalar_fn_common.zig");

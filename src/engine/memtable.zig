@@ -6,7 +6,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
-const Type = types.Type;
 const TableSchema = types.TableSchema;
 
 const storage = @import("../storage/storage.zig");

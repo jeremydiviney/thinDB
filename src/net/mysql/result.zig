@@ -8,19 +8,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const exec = @import("../../exec/exec.zig");
-const Batch = exec.Batch;
-
 const types = @import("../../types.zig");
 const Column = types.Column;
-const TypeTag = types.TypeTag;
 
 const json_binary = @import("../../exec/json_binary.zig");
 
 const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
 const errors = @import("errors.zig");
-const canned = @import("canned.zig");
 const wire_format = @import("../wire_format.zig");
 
 pub const MYSQL_TYPE_TINY: u8 = 0x01;

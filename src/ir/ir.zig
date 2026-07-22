@@ -29,7 +29,6 @@ const Value = types.Value;
 const ValueTag = types.ValueTag;
 
 const exec_predicate = @import("../exec/predicate.zig");
-const Predicate = exec_predicate.Predicate;
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 

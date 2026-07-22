@@ -52,7 +52,6 @@ const ColumnView = storage.ColumnView;
 
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
-const Memtable = engine.Memtable;
 const transform = engine.transform;
 
 const api = @import("../api/api.zig");
@@ -61,7 +60,6 @@ const Table = api.Table;
 const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
-const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");

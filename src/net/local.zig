@@ -40,7 +40,6 @@ const TableSchema = types.TableSchema;
 const Value = types.Value;
 
 const exec = @import("../exec/exec.zig");
-const group_route = @import("../exec/group_route.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const cte_stages = @import("cte_stages.zig");
 const Query = exec.Query;

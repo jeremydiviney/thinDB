@@ -26,11 +26,9 @@ const TypeTag = types.TypeTag;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
-const StringView = storage.StringView;
 
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
-const StringStore = engine.StringStore;
 
 const exec = @import("exec.zig");
 const Query = exec.Query;
