@@ -1,0 +1,64 @@
+name: ci
+
+# Test suite on every push to every branch (and PRs). Windows is the gating
+# job — it's the platform the suite is proven on. The Linux job runs the same
+# suite but is non-blocking for now: the Linux port is compile-clean and this
+# is how we surface runtime gaps without holding branches hostage to them.
+# Promote it to blocking once the Linux soak is done.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        shell: pwsh
+        run: |
+          curl.exe -fL "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip" -o "$env:RUNNER_TEMP\zig.zip"
+          Expand-Archive "$env:RUNNER_TEMP\zig.zip" -DestinationPath "$env:RUNNER_TEMP"
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\zig-x86_64-windows-$env:ZIG_VERSION"
+
+      - name: Cache zig build cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-windows-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: zig-cache-windows-${{ env.ZIG_VERSION }}-
+
+      - name: Run test suite
+        run: zig build test
+
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Cache zig build cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-linux-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: zig-cache-linux-${{ env.ZIG_VERSION }}-
+
+      - name: Run test suite (non-blocking — Linux port in progress)
+        run: zig build test
