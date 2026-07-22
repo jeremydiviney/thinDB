@@ -1,5 +1,6 @@
 ---
 import { flatNavigation } from '../data/navigation'
+import { withBase } from '../lib/base'
 ---
 
 <dialog class="search-dialog" data-search-dialog>
@@ -11,7 +12,7 @@ import { flatNavigation } from '../data/navigation'
     </label>
     <div class="search-results" data-search-results>
       {flatNavigation.map((item) => (
-        <a href={item.href} data-search-item data-search-text={`${item.label} ${item.description}`.toLowerCase()}>
+        <a href={withBase(item.href)} data-search-item data-search-text={`${item.label} ${item.description}`.toLowerCase()}>
           <strong>{item.label}</strong>
           <span>{item.description}</span>
         </a>

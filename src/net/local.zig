@@ -1264,13 +1264,9 @@ pub fn compileWithSession(
     // before projection analysis so the flat set shrinks with the tree.
     prune_columns.pruneDeadColumns(ctx.nodeArena(), @constCast(root));
     // Partition-key subtree report (THINDB_TRACE_PARTKEYS, no plan changes):
-    // Phase 1 of partition-parallel execution — prints each maximal subtree
-    // a single hash-partition exchange could parallelize end-to-end.
+    // prints each maximal subtree a single hash-partition exchange could
+    // parallelize end-to-end.
     partition_keys.report(ctx.nodeArena(), root);
-    // Phase 2 (THINDB_AUTO_SEP=1, A/B-gated): auto-inject a synthetic
-    // SEPARABLE spec at each detected maximal K-subtree root so the staged
-    // compiler's sliced fill partition-parallelizes it end-to-end.
-    partition_keys.applyAutoSeparable(ctx.nodeArena(), @constCast(root));
     // Projection pushdown: after subqueries are resolved to constants,
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);

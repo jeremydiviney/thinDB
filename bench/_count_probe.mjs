@@ -7,7 +7,7 @@ const sql=readFileSync("testSQL/rollforward_template.sql","utf8").replaceAll("{{
 const {flat}=flatten(sql);
 const KS=(process.env.KS||"1,9,10,13,17,20,22,23,28,36,37").split(",").map(Number);
 const t=await mysql.createConnection({host:"127.0.0.1",port:7950,user:"root",password:"",database:"wayroll",rowsAsArray:true});
-const s=await mysql.createConnection({host:"64.20.36.26",port:9030,user:"root",password:process.env.SR_PWD,database:"wayroll",rowsAsArray:true});
+const s=await mysql.createConnection({host:process.env.SR_HOST,port:9030,user:"root",password:process.env.SR_PWD,database:"wayroll",rowsAsArray:true});
 await s.query("SET query_timeout=1200");
 console.log("  K  target                                          thinDB       SR         match");
 for(const K of KS){

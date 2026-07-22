@@ -44,13 +44,6 @@ pub const AggParams = exec_aggregate.AggParams;
 const exec_compute = @import("../exec/compute.zig");
 pub const Derived = exec_compute.Derived;
 
-/// `SEPARABLE BY (cols)` declaration carried on a Materialize node: the
-/// partition key columns as written by the user, resolved against the
-/// block's inputs at stage-fill time.
-pub const SeparableSpec = struct {
-    cols: []const []const u8,
-};
-
 const exec_join = @import("../exec/join.zig");
 pub const JoinSpec = exec_join.Spec;
 pub const JoinKeyPair = exec_join.KeyPair;
@@ -771,11 +764,13 @@ pub const Op = union(OpTag) {
         /// every nested body would make deep CTE stacks quadratic. This is a
         /// parse-time compilation hint, not part of the serialized IR.
         structural_cse: bool = false,
-        /// `SEPARABLE BY (cols)` on the wrapped block: the author asserts no
-        /// output row depends on rows with a different key, so the stage may
-        /// fill as N disjoint key-range slices run concurrently and
-        /// concatenated — never re-aggregated. Implies `forced`.
-        separable: ?SeparableSpec = null,
+        /// `WITH KEYED BY (k1, ...)`: the CTE block this boundary belongs to
+        /// is contractually partitioned by these keys — every GROUP BY /
+        /// PARTITION BY inside must contain them, which the region compiler
+        /// verifies and then executes shard-parallel with zero inner
+        /// materializations. A violation is a compile ERROR (the declaration
+        /// is a promise, not a hint). Parse-time only, not serialized.
+        region_keys: ?[]const []const u8 = null,
     };
 
 

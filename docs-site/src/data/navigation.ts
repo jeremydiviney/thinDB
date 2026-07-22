@@ -14,6 +14,7 @@ export const navigation: NavGroup[] = [
     label: 'Start',
     items: [
       { label: 'Overview', href: '/', description: 'What thinDB is and where it fits' },
+      { label: 'Download', href: '/download/', description: 'Prebuilt server bundles for Linux, macOS, and Windows' },
       { label: 'Install and run', href: '/getting-started/', description: 'Build the server and run your first query' },
       { label: 'Connect a client', href: '/connect/', description: 'MySQL, PostgreSQL, and native wire connections' },
     ],

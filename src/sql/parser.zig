@@ -71,10 +71,6 @@ pub const ParseError = error{
     SqlOnNonEquiUnsupported,
     SqlCteRedefined,
     SqlSubqueryNeedsAlias,
-    /// `SEPARABLE BY` in an unsupported position: v1 accepts it only as the
-    /// trailing clause of a CTE body (LOCAL scope). GLOBAL, statement-root,
-    /// subquery, and duplicate declarations reject here.
-    SqlSeparableScope,
     /// COPY with a file-path source/target. thinDB only speaks
     /// `STDIN`/`STDOUT`; server-side file paths have auth implications
     /// we don't want to inherit from upstream PG.
@@ -260,9 +256,6 @@ pub fn parseWithContext(
 
     while (true) {
         const op = try parser.parseStatement();
-        // A SEPARABLE BY still pending here terminated the OUTERMOST select
-        // — not a CTE body. v1 supports LOCAL (CTE) scope only.
-        if (parser.pending_separable != null) return ParseError.SqlSeparableScope;
         // Post-parse pass: wrap each shared CTE root in Materialize (every
         // boundary materializes; see applyAutoMaterialize). CTE scope is
         // per-statement.
@@ -270,6 +263,7 @@ pub fn parseWithContext(
         try statements.append(arena, op);
         // Reset CTE state — each statement parses with a fresh scope.
         parser.ctes.clearRetainingCapacity();
+        parser.region_keys = null;
 
         // Consume any number of `;` and stop at EOF.
         var saw_sep = false;
@@ -383,7 +377,6 @@ pub const MaterializeHint = enum { auto, force, never };
 const CteEntry = struct {
     op: *ir.Op,
     hint: MaterializeHint,
-    separable: ?ir.SeparableSpec = null,
 };
 
 const FromTarget = struct {
@@ -422,11 +415,10 @@ pub const Parser = struct {
     /// Flat scope: nested SELECTs can reference outer CTEs but
     /// redefining an existing name errors.
     ctes: std.StringHashMapUnmanaged(CteEntry) = .empty,
-    /// Trailing `SEPARABLE BY` clause parsed at the end of a SELECT block,
-    /// waiting for its owner: parseCteList moves it onto the CTE entry it
-    /// terminates. Non-null at any other boundary = clause in an
-    /// unsupported position.
-    pending_separable: ?ir.SeparableSpec = null,
+    /// `WITH KEYED BY (...)` declaration for the current statement's CTE
+    /// block; stamped onto every CTE materialize boundary so the region
+    /// compiler can find and verify the block. First declaration wins.
+    region_keys: ?[]const []const u8 = null,
     /// Named windows declared in the trailing `WINDOW name AS (...)`
     /// clause of the current SELECT. Populated by `parseWindowClause`
     /// before projection lowering; consumed by `parseWindowSpecOrRef`
@@ -1158,45 +1150,7 @@ pub const Parser = struct {
             } });
         }
 
-        try self.parseSeparableClause();
         return root;
-    }
-
-    /// Trailing `[GLOBAL | LOCAL] SEPARABLE BY (col[, col...])` — the block
-    /// separability declaration. The clause belongs to the CTE whose body it
-    /// terminates; parseCteList consumes `pending_separable` and attaches it
-    /// to that CTE's materialize node. A clause left pending anywhere else
-    /// (statement root, subquery, union arm) is rejected — v1 supports LOCAL
-    /// CTE scope only.
-    fn parseSeparableClause(self: *Parser) ParseError!void {
-        if (self.cur.tag != .identifier) return;
-        var global = false;
-        if (std.ascii.eqlIgnoreCase(self.cur.text, "global")) {
-            global = true;
-        } else if (std.ascii.eqlIgnoreCase(self.cur.text, "local")) {
-            global = false;
-        } else if (!std.ascii.eqlIgnoreCase(self.cur.text, "separable")) {
-            return;
-        }
-        if (global or std.ascii.eqlIgnoreCase(self.cur.text, "local")) {
-            try self.advance();
-            if (self.cur.tag != .identifier or !std.ascii.eqlIgnoreCase(self.cur.text, "separable"))
-                return ParseError.SqlExpectedKeyword;
-        }
-        try self.advance(); // SEPARABLE
-        if (global) return ParseError.SqlSeparableScope; // v1: LOCAL only
-        if (self.cur.tag != .kw_by) return ParseError.SqlExpectedKeyword;
-        try self.advance();
-        try self.expect(.lparen);
-        var cols: std.ArrayListUnmanaged([]const u8) = .empty;
-        while (true) {
-            try cols.append(self.arena, try self.dupedIdent());
-            if (self.cur.tag != .comma) break;
-            try self.advance();
-        }
-        try self.expect(.rparen);
-        if (self.pending_separable != null) return ParseError.SqlSeparableScope;
-        self.pending_separable = .{ .cols = cols.items };
     }
 
     pub fn parseTableRef(self: *Parser) ParseError!ir.TableRef {
@@ -2365,7 +2319,6 @@ pub const Parser = struct {
             try self.expect(.lparen);
             if (self.cur.tag != .kw_select and self.cur.tag != .kw_with) return ParseError.SqlExpectedSelect;
             const source = try self.parseStatement();
-            if (self.pending_separable != null) return ParseError.SqlSeparableScope;
             try self.expect(.rparen);
             return ir.Expr{ .exists_subquery = @ptrCast(source) };
         }
@@ -2467,7 +2420,6 @@ pub const Parser = struct {
                 try self.advance();
                 if (self.cur.tag == .kw_select or self.cur.tag == .kw_with) {
                     const source = try self.parseStatement();
-                    if (self.pending_separable != null) return ParseError.SqlSeparableScope;
                     try self.expect(.rparen);
                     return ir.Expr{ .scalar_subquery = @ptrCast(source) };
                 }
@@ -2588,7 +2540,7 @@ pub const Parser = struct {
         }
         // Implicit alias: `expr alias_ident` (no AS keyword) — common
         // in MySQL/StarRocks. Only if next token is a bare identifier.
-        if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
+        if (self.cur.tag == .identifier) {
             // But we have to be careful — keywords like FROM are NOT
             // identifiers, so the lookahead naturally stops at them.
             const name = self.cur.text;
@@ -2596,18 +2548,6 @@ pub const Parser = struct {
             return try self.arena.dupe(u8, name);
         }
         return fallback;
-    }
-
-    /// The trailing separability clause starts with a bare identifier
-    /// (SEPARABLE / GLOBAL / LOCAL are not keywords), so implicit AS-less
-    /// alias positions must not swallow its lead-in. An alias literally
-    /// named one of these still works with an explicit AS.
-    fn identStartsSeparable(self: *const Parser) bool {
-        if (self.cur.tag != .identifier) return false;
-        const t = self.cur.text;
-        return std.ascii.eqlIgnoreCase(t, "separable") or
-            std.ascii.eqlIgnoreCase(t, "global") or
-            std.ascii.eqlIgnoreCase(t, "local");
     }
 
     // -----------------------------------------------------------------------
@@ -2697,7 +2637,6 @@ pub const Parser = struct {
             // and the outer block scans the buffered result.
             try self.advance();
             const op = try self.parseStatement();
-            if (self.pending_separable != null) return ParseError.SqlSeparableScope;
             try self.expect(.rparen);
             const wrapped = try self.allocOp(.{ .materialize = .{
                 .upstream = op,
@@ -2792,7 +2731,7 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
-        } else if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
+        } else if (self.cur.tag == .identifier) {
             // Implicit alias: bare identifier after the FROM target.
             // SQL clause keywords (JOIN/WHERE/ON/...) aren't .identifier
             // tokens so they don't trigger this.
@@ -2822,7 +2761,6 @@ pub const Parser = struct {
             if (self.cur.tag == .lparen) {
                 try self.advance();
                 const inner = try self.parseStatement();
-                if (self.pending_separable != null) return ParseError.SqlSeparableScope;
                 try self.expect(.rparen);
                 try inputs.append(self.arena, inner);
             } else if (self.cur.tag == .kw_null) {
@@ -2875,7 +2813,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_as) {
             try self.advance();
             resolved_name = try self.dupedIdent();
-        } else if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
+        } else if (self.cur.tag == .identifier) {
             resolved_name = try self.dupedIdent();
         }
         const op = try self.allocOp(.{ .table_fn = .{
@@ -2921,7 +2859,6 @@ pub const Parser = struct {
         };
         try sub.advance();
         const op = try sub.parseStatement();
-        if (sub.pending_separable != null) return ParseError.SqlSeparableScope;
         try sub.applyAutoMaterialize();
         if (sub.cur.tag != .eof and sub.cur.tag != .semicolon) return ParseError.SqlExpectedToken;
         return try self.allocOp(.{ .materialize = .{
@@ -2975,7 +2912,6 @@ pub const Parser = struct {
         };
         try sub.advance(); // load the first body token (with param interception)
         const op = try sub.parseStatement();
-        if (sub.pending_separable != null) return ParseError.SqlSeparableScope;
         try sub.applyAutoMaterialize();
         if (sub.cur.tag != .eof and sub.cur.tag != .semicolon) return ParseError.SqlExpectedToken;
         return try self.allocOp(.{ .materialize = .{
@@ -3043,7 +2979,7 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
-        } else if (self.cur.tag == .identifier and !self.identStartsSeparable()) {
+        } else if (self.cur.tag == .identifier) {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
@@ -3172,12 +3108,35 @@ pub const Parser = struct {
     /// call sees the already-populated map).
     fn parseCteList(self: *Parser) ParseError!void {
         try self.advance(); // consume WITH
+        var first = true;
         while (true) {
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             // CTE names are object names: stored/looked up lowercased so
             // `WITH Foo ... FROM foo` resolves (idents now lex as-typed).
             const name = try std.ascii.allocLowerString(self.arena, self.cur.text);
             try self.advance();
+
+            // `WITH KEYED BY (k1, k2, ...) cte AS (...)`: declared keyed-
+            // region block. Disambiguated one token late — a CTE actually
+            // named `keyed` is followed by AS, never BY.
+            if (first and self.cur.tag == .kw_by and std.mem.eql(u8, name, "keyed")) {
+                first = false;
+                try self.advance();
+                try self.expect(.lparen);
+                var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+                while (true) {
+                    if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+                    try keys.append(self.arena, try self.arena.dupe(u8, self.cur.text));
+                    try self.advance();
+                    if (self.cur.tag != .comma) break;
+                    try self.advance();
+                }
+                try self.expect(.rparen);
+                if (self.region_keys == null) self.region_keys = keys.items;
+                continue;
+            }
+            first = false;
+
             if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
             try self.advance();
 
@@ -3199,13 +3158,10 @@ pub const Parser = struct {
             try self.expect(.lparen);
             const op = try self.parseStatement();
             try self.expect(.rparen);
-            // A trailing SEPARABLE BY inside the parens belongs to THIS CTE.
-            const separable = self.pending_separable;
-            self.pending_separable = null;
 
             const gop = try self.ctes.getOrPut(self.arena, name);
             if (gop.found_existing) return ParseError.SqlCteRedefined;
-            gop.value_ptr.* = .{ .op = op, .hint = hint, .separable = separable };
+            gop.value_ptr.* = .{ .op = op, .hint = hint };
 
             if (self.cur.tag != .comma) break;
             try self.advance();
@@ -4171,7 +4127,7 @@ pub const Parser = struct {
             // REGENERATED (.never — parseFromTarget already wrapped each
             // reference in its own node, so the body stays bare here).
             const should_wrap = switch (entry.value_ptr.hint) {
-                .never => entry.value_ptr.separable != null,
+                .never => false,
                 .force, .auto => true,
             };
             if (!should_wrap) continue;
@@ -4186,15 +4142,10 @@ pub const Parser = struct {
             cte_op.* = .{
                 .materialize = .{
                     .upstream = inner,
+                    .region_keys = self.region_keys,
                     // Explicit AS MATERIALIZED: the staged compiler must buffer
                     // even a single-reference body it would otherwise inline.
-                    // SEPARABLE implies the same demand — the marked block is
-                    // the slice fan-in point, so it must be a real stage. An
-                    // outer mark's private closure swallows inner marks BEFORE
-                    // any staging decision, so blanket-marking a stack still
-                    // creates exactly one fan-in stage, not one per mark.
-                    .forced = entry.value_ptr.hint == .force or entry.value_ptr.separable != null,
-                    .separable = entry.value_ptr.separable,
+                    .forced = entry.value_ptr.hint == .force,
                 },
             };
         }
@@ -4770,4 +4721,30 @@ test "structural materialize CSE is limited to independent expansions" {
     const regenerated_mat = firstMaterializeForTest(regenerated);
     try std.testing.expect(regenerated_mat != null);
     try std.testing.expect(regenerated_mat.?.materialize.structural_cse);
+}
+
+test "WITH KEYED BY marks CTE boundaries; a CTE named keyed still parses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const declared = try parse(aa, "WITH KEYED BY (projectId, custLC) c AS (SELECT projectId, custLC FROM t GROUP BY projectId, custLC) SELECT * FROM c");
+    const mat = firstMaterializeForTest(declared);
+    try std.testing.expect(mat != null);
+    const keys = mat.?.materialize.region_keys.?;
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("projectId", keys[0]);
+    try std.testing.expectEqualStrings("custLC", keys[1]);
+
+    // `keyed` as an ordinary CTE name: disambiguated by the following AS.
+    const plain = try parse(aa, "WITH keyed AS (SELECT x FROM t) SELECT x FROM keyed");
+    const plain_mat = firstMaterializeForTest(plain);
+    try std.testing.expect(plain_mat != null);
+    try std.testing.expect(plain_mat.?.materialize.region_keys == null);
+
+    // Undeclared WITH: no keys on the boundary.
+    const undeclared = try parse(aa, "WITH c AS (SELECT x FROM t) SELECT x FROM c");
+    const undeclared_mat = firstMaterializeForTest(undeclared);
+    try std.testing.expect(undeclared_mat != null);
+    try std.testing.expect(undeclared_mat.?.materialize.region_keys == null);
 }

@@ -156,8 +156,8 @@ pub const Server = struct {
                 .profile = self.profile,
             };
             // Query compilation recurses per IR op; a deep CTE chain compiled
-            // as ONE block (e.g. a SEPARABLE closure privatizing a ~130-CTE
-            // statement) overflows the 16 MiB default stack — silent segfault
+            // as ONE block (a ~130-CTE statement's inlined closure)
+            // overflows the 16 MiB default stack — silent segfault
             // on Windows. Reserve-only cost: pages commit lazily.
             const thread = std.Thread.spawn(.{ .stack_size = 1024 << 20 }, ConnJob.run, .{job}) catch {
                 self.limiter.release();

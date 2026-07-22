@@ -1,5 +1,6 @@
 ---
 import DocsLayout from '../layouts/DocsLayout.astro'
+import { withBase } from '../lib/base'
 import PageHeader from '../components/PageHeader.astro'
 import CodeBlock from '../components/CodeBlock.astro'
 import Callout from '../components/Callout.astro'
@@ -19,6 +20,7 @@ const headings = [
   <Callout type="warning" title="Version requirement"><p>thinDB targets Zig 0.16. Zig language and standard-library APIs are not stable across older releases, so builds with 0.14 or 0.15 are not supported.</p></Callout>
 
   <h2 id="build">Build</h2>
+  <Callout type="tip" title="Prefer a prebuilt server?"><p><a href={withBase('/download/')}>Download</a> a self-contained bundle for Linux, macOS, or Windows — no Zig toolchain or build step required.</p></Callout>
   <CodeBlock language="powershell" code={`git clone <repository-url> thindb
 cd thindb
 zig version

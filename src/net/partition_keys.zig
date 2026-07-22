@@ -23,29 +23,11 @@
 //!             of a valid K is itself valid (coarser groups), so shrinking
 //!             is always sound — it just costs partition-balance cardinality.
 //!
-//! Phase 1 is REPORT-ONLY: `THINDB_TRACE_PARTKEYS` prints each maximal
+//! This analysis is REPORT-ONLY: `THINDB_TRACE_PARTKEYS` prints each maximal
 //! K-subtree (where K dies at the parent, or the root) with the surviving
 //! keys and how many windows/aggregates the subtree covers. No plan changes.
-//!
-//! Phase 2 (`THINDB_AUTO_SEP=1`, A/B-gated): mark the topmost qualifying
-//! materialize node(s) with a synthetic SEPARABLE spec — the exact
-//! annotation `SEPARABLE BY (cols)` SQL syntax would carry — so the staged
-//! compiler's sliced-fill machinery partitions the whole subtree: bounds
-//! sampled from staged inputs, N range-disjoint slice pipelines, private
-//! table-backed blocks pre-partitioned by ONE full-DOP scan. The fill
-//! declines gracefully (degenerate bounds, contiguous borrowers), so a bad
-//! mark costs at most a forced stage buffer.
-//!
-//! A/B verdict (2026-07-11, AirDNA agg, live 32M-row data): value-exact
-//! (identical result hash) but 2.3x SLOWER than mono (13.8s vs 5.9s at
-//! min_keys=3; 3.4x at min_keys=1 where project+division collapsed to 2
-//! slices). Two structural losses: (a) slices run dop_cap=1 pipelines that
-//! bypass every fused parallel operator the mono path has (probe fusion,
-//! parallel windows, radix agg); (b) range slices on customer keys are
-//! whale-skewed — the largest slice carried 51% of rows, so the phase
-//! equals its slowest slice. Stays default-off until slice pipelines can
-//! be compiled once and re-parameterized per range, or an exchange feeds
-//! fused operators instead of serial slice plans.
+//! The keyed pipeline regions runtime (exec/region_exec.zig) reuses this
+//! bottom-up key IR analysis.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -79,82 +61,6 @@ pub fn report(arena: Allocator, root: *const ir.Op) void {
         if (k.len > 0) emit("root", root, info);
     } else if (info.windows + info.groups > 0) {
         emit("root(top)", root, info);
-    }
-}
-
-pub const AutoSepOpts = struct {
-    /// Minimum surviving keys at the mark site. 1 accepts the coarse top
-    /// boundary (e.g. project+division after the final rollup); 3 forces
-    /// the finer per-customer placement on the wayroll shape.
-    min_keys: usize = 1,
-    /// Minimum windows+groups the subtree must cover — a single window is
-    /// already well-parallelized by the window operator itself; slicing
-    /// earns its stage tax on CHAINS.
-    min_cover: u32 = 3,
-};
-
-/// Phase 2 — auto-exchange. Walk top-down; at the first (topmost)
-/// materialize whose subtree analysis yields >= min_keys surviving keys
-/// covering >= min_cover windows+groups, attach the synthetic SEPARABLE
-/// spec and stop descending (never nest fan-outs). Siblings (join arms,
-/// union arms) are still walked — disjoint subtrees mark independently.
-pub fn applyAutoSeparable(arena: Allocator, root: *ir.Op) void {
-    if (getenv_pk("THINDB_AUTO_SEP") == null) return;
-    const opts = AutoSepOpts{
-        .min_keys = envInt(usize, "THINDB_AUTO_SEP_MIN_KEYS", 1),
-        .min_cover = envInt(u32, "THINDB_AUTO_SEP_MIN_COVER", 3),
-    };
-    var memo: std.AutoHashMapUnmanaged(*const ir.Op, Info) = .empty;
-    _ = autoSepMark(arena, root, opts, &memo) catch {};
-}
-
-fn envInt(comptime T: type, name: [*:0]const u8, default: T) T {
-    const v = getenv_pk(name) orelse return default;
-    return std.fmt.parseInt(T, std.mem.span(v), 10) catch default;
-}
-
-fn autoSepMark(
-    arena: Allocator,
-    op: *ir.Op,
-    opts: AutoSepOpts,
-    memo: *std.AutoHashMapUnmanaged(*const ir.Op, Info),
-) anyerror!u32 {
-    switch (op.*) {
-        .materialize => |*m| {
-            // A manual SEPARABLE BY rules its block; don't second-guess or
-            // nest inside it.
-            if (m.separable != null) return 0;
-            const info = try analyze(arena, op, memo);
-            if (info.keys) |k| {
-                if (k.len >= opts.min_keys and info.windows + info.groups >= opts.min_cover) {
-                    m.separable = .{ .cols = k };
-                    m.forced = true;
-                    if (getenv_pk("THINDB_TRACE_PARTKEYS") != null) emit("auto-sep", op, info);
-                    return 1;
-                }
-            }
-            return autoSepMark(arena, m.upstream, opts, memo);
-        },
-        .filter => |f| return autoSepMark(arena, f.upstream, opts, memo),
-        .limit => |l| return autoSepMark(arena, l.upstream, opts, memo),
-        .alias => |a| return autoSepMark(arena, a.upstream, opts, memo),
-        .order_by => |o| return autoSepMark(arena, o.upstream, opts, memo),
-        .window => |w| return autoSepMark(arena, w.upstream, opts, memo),
-        .group_by => |g| return autoSepMark(arena, g.upstream, opts, memo),
-        .compute => |c| return autoSepMark(arena, c.upstream, opts, memo),
-        .select => |p| return autoSepMark(arena, p.upstream, opts, memo),
-        .exclude => |p| return autoSepMark(arena, p.upstream, opts, memo),
-        .join => |j| {
-            const l = try autoSepMark(arena, j.left, opts, memo);
-            const r = try autoSepMark(arena, j.right, opts, memo);
-            return l + r;
-        },
-        .set_union => |u| {
-            const l = try autoSepMark(arena, u.left, opts, memo);
-            const r = try autoSepMark(arena, u.right, opts, memo);
-            return l + r;
-        },
-        else => return 0,
     }
 }
 
@@ -470,52 +376,6 @@ test "narrower group keys shrink K; global aggregate kills it" {
     var memo2: std.AutoHashMapUnmanaged(*const ir.Op, Info) = .empty;
     const ti = try analyze(arena, &g2, &memo2);
     try testing.expect(ti.isBottom());
-}
-
-test "autoSepMark: topmost qualifying materialize gets the spec, thin ones don't" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // materialize( group_by( window( window( scan )))) — covers 3, keys 2.
-    var base = scanOp();
-    const part = [_][]const u8{ "proj", "cust" };
-    const spec1 = [_]ir.WindowSpec{.{ .partition_by = &part, .order_by = &.{}, .frame = ir.Frame.default_no_order }};
-    var w1 = ir.Op{ .window = .{ .specs = &spec1, .calls = &.{}, .upstream = &base } };
-    var w2 = ir.Op{ .window = .{ .specs = &spec1, .calls = &.{}, .upstream = &w1 } };
-    const gcols = [_][]const u8{ "proj", "cust" };
-    var g = ir.Op{ .group_by = .{ .group_cols = &gcols, .aggs = &.{}, .upstream = &w2 } };
-    var mat = ir.Op{ .materialize = .{ .upstream = &g } };
-    var sel_cols = [_][]const u8{"*"};
-    var root = ir.Op{ .select = .{ .columns = &sel_cols, .upstream = &mat } };
-
-    var memo: std.AutoHashMapUnmanaged(*const ir.Op, Info) = .empty;
-    const marked = try autoSepMark(arena, &root, .{}, &memo);
-    try testing.expectEqual(@as(u32, 1), marked);
-    try testing.expect(mat.materialize.separable != null);
-    try testing.expect(mat.materialize.forced);
-    const cols = mat.materialize.separable.?.cols;
-    try testing.expectEqual(@as(usize, 2), cols.len);
-    try testing.expectEqualStrings("proj", cols[0]);
-    try testing.expectEqualStrings("cust", cols[1]);
-
-    // A single-window block stays unmarked (cover 1 < min_cover 3): the
-    // window operator already parallelizes itself.
-    var base2 = scanOp();
-    var w_only = ir.Op{ .window = .{ .specs = &spec1, .calls = &.{}, .upstream = &base2 } };
-    var mat2 = ir.Op{ .materialize = .{ .upstream = &w_only } };
-    var memo2: std.AutoHashMapUnmanaged(*const ir.Op, Info) = .empty;
-    const marked2 = try autoSepMark(arena, &mat2, .{}, &memo2);
-    try testing.expectEqual(@as(u32, 0), marked2);
-    try testing.expect(mat2.materialize.separable == null);
-
-    // min_keys=3 skips the 2-key top block and finds nothing deeper here.
-    var g3 = ir.Op{ .group_by = .{ .group_cols = &gcols, .aggs = &.{}, .upstream = &w2 } };
-    var mat3 = ir.Op{ .materialize = .{ .upstream = &g3 } };
-    var memo3: std.AutoHashMapUnmanaged(*const ir.Op, Info) = .empty;
-    const marked3 = try autoSepMark(arena, &mat3, .{ .min_keys = 3 }, &memo3);
-    try testing.expectEqual(@as(u32, 0), marked3);
-    try testing.expect(mat3.materialize.separable == null);
 }
 
 test "select rename tracks the key; compute replacing it drops it" {

@@ -1,0 +1,98 @@
+name: release
+
+# Every push to main builds the five platform bundles (server + matching Zig
+# toolchain) and publishes them as a GitHub Release. Assets are uploaded twice:
+# once version-named (thindb-<sha>-<platform>) and once stable-named
+# (thindb-<platform>) so /releases/latest/download/thindb-<platform>.tar.gz is
+# a permanent URL that always serves the newest build — the doc site links
+# those directly and never needs a rebuild.
+
+# workflow_dispatch allows an on-demand bundle build from ANY branch (Actions
+# tab → release → Run workflow): bundles upload as a workflow artifact, but a
+# GitHub Release is only ever published from main.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Install Bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Install bsdtar
+        run: sudo apt-get update -q && sudo apt-get install -y -q libarchive-tools
+
+      - name: Cache bundled toolchains
+        uses: actions/cache@v4
+        with:
+          path: .dist-cache
+          key: zig-toolchains-${{ env.ZIG_VERSION }}
+
+      - name: Build bundles
+        run: bun scripts/make_dist.mjs
+
+      - name: Add stable-named copies
+        run: |
+          cd .dist
+          for plat in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
+            cp thindb-*-"$plat".tar.gz "thindb-$plat.tar.gz"
+          done
+          cp thindb-*-windows-x86_64.zip thindb-windows-x86_64.zip
+          sha256sum thindb-linux-x86_64.tar.gz thindb-linux-aarch64.tar.gz \
+            thindb-macos-x86_64.tar.gz thindb-macos-aarch64.tar.gz \
+            thindb-windows-x86_64.zip >> SHA256SUMS
+
+      - name: Upload bundles as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thindb-bundles-${{ github.sha }}
+          path: |
+            .dist/thindb-*
+            .dist/SHA256SUMS
+          retention-days: 14
+
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-$(git rev-parse --short HEAD)"
+          gh release create "$tag" \
+            --title "thinDB $tag" \
+            --notes "Automated build of ${{ github.sha }}. Stable links: releases/latest/download/thindb-<platform>.{tar.gz,zip}" \
+            --latest \
+            .dist/thindb-* .dist/SHA256SUMS
+
+      - name: Prune old automated builds (keep 10)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^build-' | tail -n +11 \
+            | xargs -r -n1 -I{} gh release delete {} --yes --cleanup-tag

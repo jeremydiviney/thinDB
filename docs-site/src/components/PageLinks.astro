@@ -1,4 +1,6 @@
 ---
+import { withBase } from '../lib/base'
+
 interface Props {
   previous?: { label: string; href: string }
   next?: { label: string; href: string }
@@ -8,6 +10,6 @@ const { previous, next } = Astro.props
 ---
 
 <nav class="page-links" aria-label="Previous and next pages">
-  {previous ? <a href={previous.href}><span>Previous</span><strong>{previous.label}</strong></a> : <span></span>}
-  {next ? <a href={next.href} class="next"><span>Next</span><strong>{next.label}</strong></a> : <span></span>}
+  {previous ? <a href={withBase(previous.href)}><span>Previous</span><strong>{previous.label}</strong></a> : <span></span>}
+  {next ? <a href={withBase(next.href)} class="next"><span>Next</span><strong>{next.label}</strong></a> : <span></span>}
 </nav>

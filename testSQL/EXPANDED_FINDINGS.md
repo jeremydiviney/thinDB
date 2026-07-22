@@ -78,4 +78,4 @@ aggregation.
 - `testSQL/_transform_expanded.mjs` (DIV env = optional single-division shrink; PLANARG = comma plans)
 - `testSQL/_probe_expanded.mjs` — lifts expanded_metrics_pipline_mat1's inner CTEs to top-level for COUNT bisect
 - `/tmp/_fp2.mjs` — fingerprint (COUNT + column SUMs), arg `thindb`|`sr`
-- StarRocks: 64.20.36.26:9030, db wayroll, `SET query_mem_limit = 34000000000` before the query.
+- StarRocks: $SR_HOST:9030, db wayroll, `SET query_mem_limit = 34000000000` before the query.

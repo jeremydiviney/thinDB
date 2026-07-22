@@ -75,20 +75,12 @@ pub const CompileInput = struct {
     /// for its chains. Scoped: callers set it on a COPY of the input.
     force_ordered: bool = false,
     /// Cap on parallelism for this compile, below the server's max_dop.
-    /// A SEPARABLE slice pipeline compiles with dop_cap = 1 — the slices
-    /// themselves are the parallelism. Read via `effectiveDop()`.
+    /// Read via `effectiveDop()`.
     dop_cap: ?usize = null,
-    /// SEPARABLE slice predicate: applied (as a fused Filter) on top of
-    /// every LEAF this compile produces whose schema carries all of
-    /// `slice_cols` — base-table scans and shared-stage reads alike. The
-    /// body IR is shared read-only across slice compiles; the predicate is
-    /// a compile parameter, never an IR mutation.
-    slice_pred: ?exec.predicate.PredicateExpr = null,
-    slice_cols: []const []const u8 = &.{},
-    /// SEPARABLE slice compiles only: IR-node → compiled-Window registry for
-    /// the window-chain pairing (an upstream same-partition window emits
-    /// sorted so this one skips its own sort — see cte_stages). Opaque
-    /// pointers keep this module window-agnostic; null everywhere else.
+    /// IR-node → compiled-Window/Join registry for the window-chain pairing
+    /// (an upstream same-partition window emits sorted so this one skips
+    /// its own sort — see cte_stages) and crossed-join ride verification.
+    /// Opaque pointers keep this module window-agnostic.
     win_registry: ?*std.AutoHashMapUnmanaged(*const anyopaque, *anyopaque) = null,
 
     pub fn effectiveDop(self: *const CompileInput) usize {

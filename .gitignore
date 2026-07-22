@@ -1,6 +1,9 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+# Release bundles (scripts/make_dist.mjs) + cached Zig toolchain downloads.
+.dist/
+.dist-cache/
 .zig-global-cache*/
 .tools/
 # Local Zig package cache (populated by build.zig.zon deps).

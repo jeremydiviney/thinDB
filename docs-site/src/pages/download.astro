@@ -1,0 +1,44 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro'
+import { withBase } from '../lib/base'
+import PageHeader from '../components/PageHeader.astro'
+import CodeBlock from '../components/CodeBlock.astro'
+import Callout from '../components/Callout.astro'
+const headings = [
+  { depth: 2, slug: 'downloads', text: 'Downloads' },
+  { depth: 2, slug: 'run', text: 'Extract and run' },
+  { depth: 2, slug: 'whats-inside', text: "What's inside" },
+]
+const base = 'https://github.com/jeremydiviney/thinDB/releases/latest/download'
+const bundles = [
+  { platform: 'Linux x86-64', file: 'thindb-linux-x86_64.tar.gz' },
+  { platform: 'Linux ARM64', file: 'thindb-linux-aarch64.tar.gz' },
+  { platform: 'macOS Apple Silicon', file: 'thindb-macos-aarch64.tar.gz' },
+  { platform: 'macOS Intel', file: 'thindb-macos-x86_64.tar.gz' },
+  { platform: 'Windows x86-64', file: 'thindb-windows-x86_64.zip' },
+]
+---
+<DocsLayout title="Download" description="Prebuilt thinDB server bundles for Linux, macOS, and Windows." headings={headings}>
+  <PageHeader eyebrow="Start" title="Download thinDB" description="Self-contained server bundles, rebuilt automatically from every commit to main. No install step: extract the archive and run the binary." />
+
+  <h2 id="downloads">Downloads</h2>
+  <p>These links always serve the newest build. Version-stamped archives for every recent build, plus <code>SHA256SUMS</code>, are on the <a href={'https://github.com/jeremydiviney/thinDB/releases'}>releases page</a>.</p>
+  <div class="table-scroll"><table><thead><tr><th>Platform</th><th>Bundle</th></tr></thead><tbody>
+    {bundles.map((b) => (
+      <tr><td>{b.platform}</td><td><a href={`${base}/${b.file}`}><code>{b.file}</code></a></td></tr>
+    ))}
+  </tbody></table></div>
+
+  <h2 id="run">Extract and run</h2>
+  <CodeBlock language="bash" title="Linux / macOS" code={`tar -xzf thindb-linux-x86_64.tar.gz
+cd thindb-*-linux-x86_64
+./thindb-server --data-dir ./data --mysql-port 3306`} />
+  <CodeBlock language="powershell" title="Windows" code={`Expand-Archive thindb-windows-x86_64.zip
+cd thindb-windows-x86_64\\thindb-*-windows-x86_64
+.\\thindb-server.exe --data-dir .\\data --mysql-port 3306`} />
+  <p>Then connect with any MySQL or PostgreSQL client — see <a href={withBase('/connect/')}>Connect a client</a>.</p>
+
+  <h2 id="whats-inside">What's inside</h2>
+  <p>Each bundle contains the <code>thindb-server</code> binary and a <code>zig/</code> directory holding the exact Zig toolchain the server was built with. The server uses that toolchain to compile <a href={withBase('/functions/zig/')}>Zig functions</a> submitted at runtime (<code>CREATE FUNCTION … LANGUAGE zig</code>).</p>
+  <Callout type="warning" title="Keep zig/ beside the binary"><p>The server only accepts a compiler whose version exactly matches its own build — compiled functions share in-memory structures with the server, so a mismatched toolchain is unsafe and is refused. Moving the binary without the <code>zig/</code> directory disables runtime Zig function compilation (set <code>THINDB_ZIG_PATH</code> to relocate it explicitly).</p></Callout>
+</DocsLayout>

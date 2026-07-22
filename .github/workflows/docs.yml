@@ -1,0 +1,54 @@
+name: docs
+
+# Build the Astro doc site and deploy it to GitHub Pages on every push to main
+# that touches docs-site/. Served at https://jeremydiviney.github.io/thinDB/
+# (DOCS_BASE below; drop it to '/' if the site moves to a custom domain).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs-site/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Build site
+        working-directory: docs-site
+        env:
+          DOCS_BASE: /thinDB/
+          DOCS_SITE: https://jeremydiviney.github.io
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-site/dist
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

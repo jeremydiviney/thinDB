@@ -38,7 +38,7 @@ def split(out):
 
 
 print('running StarRocks...', file=sys.stderr)
-sr_out, sr_t = run('64.20.36.26', 9030, 'wayroll', PW)
+sr_out, sr_t = run(os.environ['SR_HOST'], 9030, 'wayroll', PW)
 print('running thinDB...', file=sys.stderr)
 td_out, td_t = run('127.0.0.1', 7881, 'wayroll__public')
 

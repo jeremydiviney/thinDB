@@ -23,4 +23,4 @@ async function run(name, cfg){
   await c.end();
 }
 await run("thinDB", { host:"127.0.0.1", port:7950, user:"root", password:"", database:"wayroll", rowsAsArray:true });
-if (process.env.SR_PWD) await run("SR", { host:"64.20.36.26", port:9030, user:"root", password:process.env.SR_PWD, database:"wayroll", rowsAsArray:true });
+if (process.env.SR_PWD) await run("SR", { host:process.env.SR_HOST, port:9030, user:"root", password:process.env.SR_PWD, database:"wayroll", rowsAsArray:true });
