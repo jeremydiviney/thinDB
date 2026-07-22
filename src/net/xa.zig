@@ -84,8 +84,12 @@ pub const XaManager = struct {
     /// Point the manager at a persistent `_xa/` dir (opened/created under the
     /// catalog root) and load any prepared branches left by a prior run.
     pub fn setStorage(self: *XaManager, io: Io, root: Io.Dir) void {
+        // The fallback must also open with .iterate: a dir opened without it
+        // cannot be listed on Linux (O_PATH fd), only Windows tolerates that.
         const dir = root.openDir(io, "_xa", .{ .iterate = true }) catch
-            (root.createDirPathOpen(io, "_xa", .{}) catch return);
+            (root.createDirPathOpen(io, "_xa", .{
+                .open_options = .{ .iterate = true },
+            }) catch return);
         self.io = io;
         self.dir = dir;
         self.loadAll() catch {};

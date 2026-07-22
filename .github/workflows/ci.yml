@@ -1,10 +1,9 @@
 name: ci
 
-# Test suite on every push to every branch (and PRs). Windows is the gating
-# job — it's the platform the suite is proven on. The Linux job runs the same
-# suite but is non-blocking for now: the Linux port is compile-clean and this
-# is how we surface runtime gaps without holding branches hostage to them.
-# Promote it to blocking once the Linux soak is done.
+# Test suite on every push to every branch (and PRs). Windows and Linux both
+# gate: the suite is green on both platforms (1373/1376) since the _xa
+# iterate fix. macOS/ARM runners can join the same pattern when we want
+# native coverage of those bundles.
 
 on:
   push:
@@ -44,7 +43,6 @@ jobs:
   test-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -60,5 +58,5 @@ jobs:
           key: zig-cache-linux-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: zig-cache-linux-${{ env.ZIG_VERSION }}-
 
-      - name: Run test suite (non-blocking — Linux port in progress)
+      - name: Run test suite
         run: zig build test
