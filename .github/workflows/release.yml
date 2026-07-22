@@ -10,12 +10,17 @@ name: release
 # always serves the newest build — the doc site links those directly and
 # never needs a rebuild.
 
-# workflow_dispatch allows an on-demand bundle build from ANY branch (Actions
-# tab → release → Run workflow): bundles upload as a workflow artifact, but a
-# GitHub Release is only ever published from main.
+# Chained behind ci: a push to main runs the four-platform test matrix
+# first, and only a fully green ci run triggers the release build — a
+# commit that fails tests never publishes. workflow_dispatch remains for
+# on-demand bundle builds from ANY branch (Actions tab → release → Run
+# workflow): bundles upload as a workflow artifact, but a GitHub Release
+# is only ever published from main.
 
 on:
-  push:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -32,10 +37,14 @@ env:
 jobs:
   release:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # workflow_run events default to the branch head at trigger time;
+          # pin to the exact commit the ci run tested.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
@@ -94,14 +103,16 @@ jobs:
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
           tag="v${{ steps.version.outputs.version }}"
           # Idempotent republish: a workflow re-run of the same commit
           # produces the same version — replace, don't fail.
           gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" \
+            --target "$RELEASE_SHA" \
             --title "thinDB $tag" \
-            --notes "Automated build of ${{ github.sha }}. Stable links: releases/latest/download/thindb-<platform>.{tar.gz,zip}" \
+            --notes "Automated build of $RELEASE_SHA. Stable links: releases/latest/download/thindb-<platform>.{tar.gz,zip}" \
             --latest \
             .dist/thindb-* .dist/SHA256SUMS
 
