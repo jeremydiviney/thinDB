@@ -29,7 +29,6 @@ const Value = types.Value;
 const ValueTag = types.ValueTag;
 
 const exec_predicate = @import("../exec/predicate.zig");
-const Predicate = exec_predicate.Predicate;
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
@@ -772,7 +771,6 @@ pub const Op = union(OpTag) {
         /// is a promise, not a hint). Parse-time only, not serialized.
         region_keys: ?[]const []const u8 = null,
     };
-
 
     pub const Alias = struct {
         alias: []const u8,

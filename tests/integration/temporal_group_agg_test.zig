@@ -15,10 +15,14 @@ const exec = helpers.exec;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE ev (id BIGINT PRIMARY KEY, pid INT NOT NULL, ts DATETIME, d DATE NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO ev (id, pid, ts, d) VALUES " ++
             "(1, 10, '2026-07-01 08:00:00.000001', '2026-07-01'), " ++
             "(2, 10, '2026-07-10 05:56:45.455833', '2026-07-10'), " ++
@@ -55,7 +59,9 @@ test "grouped MAX/MIN over nullable datetime (silo path)" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT pid, MAX(ts) AS mx, MIN(ts) AS mn FROM ev GROUP BY pid ORDER BY pid",
     );
     defer q.deinit();

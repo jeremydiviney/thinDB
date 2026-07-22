@@ -422,8 +422,7 @@ test "table UDF SDK: row iterator and at() match columnar access" {
     try seed(db);
     try db.registerTableFn(iter_fn);
 
-    var res = try run(allocator, db,
-        "SELECT total FROM TABLE(iter_sum((SELECT id, g, amt FROM t)))");
+    var res = try run(allocator, db, "SELECT total FROM TABLE(iter_sum((SELECT id, g, amt FROM t)))");
     defer res.deinit();
     const batch = (try res.next()).?;
     try std.testing.expectEqual(@as(i64, 150), batch.values[0].data.bigint[0]);

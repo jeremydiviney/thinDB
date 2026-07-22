@@ -11,8 +11,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
-const Type = types.Type;
-const TypeTag = types.TypeTag;
 const ValueTag = types.ValueTag;
 const Value = types.Value;
 

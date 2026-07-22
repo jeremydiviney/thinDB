@@ -19,6 +19,27 @@ env:
   ZIG_VERSION: 0.16.0
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: zig fmt --check
+        run: zig fmt --check src tests bench build.zig scripts
+
+      - name: zlint (rules in zlint.json)
+        run: |
+          curl -fL --retry 3 -o "$RUNNER_TEMP/zlint" \
+            "https://github.com/DonIsaac/zlint/releases/download/v0.9.0/zlint-linux-x86_64"
+          chmod +x "$RUNNER_TEMP/zlint"
+          git ls-files 'src/**/*.zig' 'src/*.zig' | "$RUNNER_TEMP/zlint" -S -f github --deny-warnings
+
   test-windows:
     runs-on: windows-latest
     timeout-minutes: 90

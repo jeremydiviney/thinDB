@@ -33,8 +33,6 @@ const Database = api.Database;
 const ir = @import("../ir/ir.zig");
 
 const exec = @import("../exec/exec.zig");
-const Query = exec.Query;
-const Predicate = exec.Predicate;
 const PredicateExpr = exec.PredicateExpr;
 
 const local = @import("../net/local.zig");

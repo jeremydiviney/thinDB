@@ -836,8 +836,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                 if (p.cur.tag == .lparen) {
                     var depth: usize = 0;
                     while (true) {
-                        if (p.cur.tag == .lparen) depth += 1
-                        else if (p.cur.tag == .rparen) {
+                        if (p.cur.tag == .lparen) depth += 1 else if (p.cur.tag == .rparen) {
                             depth -= 1;
                             if (depth == 0) {
                                 try p.advance();

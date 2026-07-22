@@ -32,17 +32,14 @@ const Query = exec.Query;
 const PredicateExpr = exec.PredicateExpr;
 const SortSpec = exec.SortSpec;
 const AggSpec = exec.AggSpec;
-const HarnessCore = exec.group_topn_harness_core;
+const SiloCore = exec.silo_group_core;
 const GroupTopNEngine = exec.v2_group_topn_engine;
 
 const DEFAULT_DOP: usize = 12;
 const DEFAULT_BUCKET_COUNT: usize = 256;
 const DEFAULT_CHUNK_ROWS: usize = 8192;
-const DEFAULT_SCAN_TILE_RGS: usize = 16;
 const DEFAULT_ROUTE_BLOCK_ROWS: usize = 2048;
-const DEFAULT_GROUP_LEASE_BUCKETS: usize = 8;
 const DEFAULT_GROUP_INIT_CAP: usize = 0;
-const DEFAULT_RAW_CHUNK_ROWS: usize = 8192;
 const DEFAULT_RAW_GROUP_CHUNK_ROWS: usize = 8192;
 const DEFAULT_RAW_BATCH_CHUNKS: usize = 12;
 const MAX_GROUP_KEYS: usize = 8;
@@ -55,7 +52,7 @@ const MAX_STRING_AGG_INPUTS: usize = 2;
 const MAX_STRING_AGG_SLOTS: usize = 2;
 // Mirrors the harness core's MAX_GROUP_CONCAT_SLOTS.
 const MAX_CONCAT_SLOTS: usize = 2;
-// Must match HarnessCore.MAX_GROUP_DISTINCT_SLOTS (one combined set per field).
+// Must match SiloCore.MAX_GROUP_DISTINCT_SLOTS (one combined set per field).
 const MAX_DISTINCT_AGG_SLOTS: usize = 8;
 
 pub const Request = struct {
@@ -147,7 +144,7 @@ const AggregatePlan = struct {
     udf_entry: ?udf_mod.AggregateEntry = null,
     udf_state_index: u16 = 0,
     udf_arg_count: u8 = 0,
-    udf_arg_input_indices: [HarnessCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** HarnessCore.MAX_GROUP_UDF_ARGS,
+    udf_arg_input_indices: [SiloCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** SiloCore.MAX_GROUP_UDF_ARGS,
 };
 
 const StringAggInputPlan = struct {
@@ -198,7 +195,7 @@ const ExecutionContext = struct {
 
 const TopRows = struct {
     allocator: Allocator,
-    items: []HarnessCore.TopRow = &.{},
+    items: []SiloCore.TopRow = &.{},
 
     fn deinit(self: *TopRows) void {
         const allocator = self.allocator;
@@ -214,7 +211,7 @@ const TopRows = struct {
 
 const FinalRows = struct {
     allocator: Allocator,
-    items: []HarnessCore.TopRow = &.{},
+    items: []SiloCore.TopRow = &.{},
     owned: bool = false,
 
     fn deinit(self: *FinalRows) void {
@@ -568,7 +565,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             // active, survivors also count toward the cap so the emit can stop
             // early.
             .emit_filter = if (ctx.request.having_filter != null)
-                HarnessCore.EmitFilter{ .ctx = ctx, .pass = havingEmitPass }
+                SiloCore.EmitFilter{ .ctx = ctx, .pass = havingEmitPass }
             else
                 null,
             .hashed = ctx.plan.hashed,
@@ -618,7 +615,7 @@ fn unorderedLimitCap(ctx: *const ExecutionContext) usize {
     return ctx.request.limit + ctx.request.offset;
 }
 
-fn prepareFinalRows(op: *GroupTopNPipeline, rows: []HarnessCore.TopRow) !FinalRows {
+fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows {
     if (rows.len == 0) return .{ .allocator = op.allocator };
     if (op.request.order_specs.len == 0) {
         const start = @min(op.request.offset, rows.len);
@@ -627,7 +624,7 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []HarnessCore.TopRow) !FinalRo
     }
 
     if (op.request.limit == 0) {
-        std.mem.sort(HarnessCore.TopRow, rows, op, finalRowLess);
+        std.mem.sort(SiloCore.TopRow, rows, op, finalRowLess);
         return .{ .allocator = op.allocator, .items = rows };
     }
 
@@ -639,12 +636,12 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []HarnessCore.TopRow) !FinalRo
     // and each replacement walks ~keep entries. Sorting everything is
     // O(n log n) and strictly cheaper there.
     if (keep * 2 >= rows.len) {
-        std.mem.sort(HarnessCore.TopRow, rows, op, finalRowLess);
+        std.mem.sort(SiloCore.TopRow, rows, op, finalRowLess);
         const start = @min(op.request.offset, rows.len);
         const end = limitEnd(start, rows.len, op.request.limit);
         return .{ .allocator = op.allocator, .items = rows[start..end] };
     }
-    var candidates = try op.allocator.alloc(HarnessCore.TopRow, keep);
+    var candidates = try op.allocator.alloc(SiloCore.TopRow, keep);
     errdefer op.allocator.free(candidates);
     var len: usize = 0;
     var worst_i: usize = 0;
@@ -663,11 +660,11 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []HarnessCore.TopRow) !FinalRo
             if (finalRowLess(op, candidates[worst_i], candidates[i])) worst_i = i;
         }
     }
-    std.mem.sort(HarnessCore.TopRow, candidates[0..len], op, finalRowLess);
+    std.mem.sort(SiloCore.TopRow, candidates[0..len], op, finalRowLess);
     const start = @min(op.request.offset, len);
     const end = limitEnd(start, len, op.request.limit);
     const emit_len = end - start;
-    if (start != 0 and emit_len != 0) std.mem.copyForwards(HarnessCore.TopRow, candidates[0..emit_len], candidates[start..end]);
+    if (start != 0 and emit_len != 0) std.mem.copyForwards(SiloCore.TopRow, candidates[0..emit_len], candidates[start..end]);
     return .{ .allocator = op.allocator, .items = candidates[0..emit_len], .owned = true };
 }
 
@@ -676,7 +673,7 @@ fn limitEnd(start: usize, len: usize, limit: usize) usize {
     return @min(len, start + limit);
 }
 
-fn finalRowLess(op: *GroupTopNPipeline, a: HarnessCore.TopRow, b: HarnessCore.TopRow) bool {
+fn finalRowLess(op: *GroupTopNPipeline, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
     for (op.request.order_specs) |spec| {
         const cmp = compareOutputValue(op, spec.col, a, b) catch 0;
         if (cmp == 0) continue;
@@ -685,7 +682,7 @@ fn finalRowLess(op: *GroupTopNPipeline, a: HarnessCore.TopRow, b: HarnessCore.To
     return a.key < b.key;
 }
 
-fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: HarnessCore.TopRow, b: HarnessCore.TopRow) !i8 {
+fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: SiloCore.TopRow, b: SiloCore.TopRow) !i8 {
     for (op.plan.layout.parts[0..op.plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) {
             const a_null = keyPartIsNull(part, a.key);
@@ -705,7 +702,7 @@ fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: HarnessCore.T
     return error.UnsupportedOrderBy;
 }
 
-fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: HarnessCore.TopRow) i8 {
+fn compareAggregateValue(agg_plan: AggregatePlan, a: SiloCore.TopRow, b: SiloCore.TopRow) i8 {
     // NULL aggregate results (all-NULL input group) order nulls-first,
     // matching the validity-aware sort convention.
     const a_null = aggIsNull(a, agg_plan);
@@ -734,19 +731,19 @@ fn compareAggregateValue(agg_plan: AggregatePlan, a: HarnessCore.TopRow, b: Harn
 
 // COUNT(*) and a non-nullable COUNT(col) mirror the group row count; a
 // nullable COUNT(col) accumulates its own state slot.
-fn countValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) i128 {
+fn countValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) i128 {
     if (agg_plan.state_index != 0) return rowStateValueNarrow(row, agg_plan.state_index);
     return @intCast(row.count);
 }
 
 // AVG denominator and the SUM/AVG/MIN/MAX all-NULL signal: the companion
 // valid-count slot when the input is nullable, the group row count otherwise.
-fn aggDenom(row: HarnessCore.TopRow, agg_plan: AggregatePlan) u64 {
+fn aggDenom(row: SiloCore.TopRow, agg_plan: AggregatePlan) u64 {
     if (agg_plan.valid_count_index != 0) return @intCast(rowStateValueNarrow(row, agg_plan.valid_count_index));
     return row.count;
 }
 
-fn aggIsNull(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
+fn aggIsNull(row: SiloCore.TopRow, agg_plan: AggregatePlan) bool {
     if (agg_plan.is_string or agg_plan.is_concat) return !row.str_present[agg_plan.str_state_index];
     // The UDAF's present bit rides the slot one past its value slot; finalize
     // sets it to 1 for a value, 0 for a NULL (or an all-skipped fold).
@@ -759,7 +756,7 @@ fn aggIsNull(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
     };
 }
 
-fn welfordDefined(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
+fn welfordDefined(row: SiloCore.TopRow, agg_plan: AggregatePlan) bool {
     const n = rowStateValueNarrow(row, agg_plan.state_index);
     return switch (agg_plan.func) {
         .var_pop, .stddev_pop => n >= 1,
@@ -767,7 +764,7 @@ fn welfordDefined(row: HarnessCore.TopRow, agg_plan: AggregatePlan) bool {
     };
 }
 
-fn welfordValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
+fn welfordValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) f64 {
     if (!welfordDefined(row, agg_plan)) return 0.0;
     const n: f64 = @floatFromInt(@as(i64, @intCast(rowStateValueNarrow(row, agg_plan.state_index))));
     const m2 = rowStateFloat(row, agg_plan.state_index + 2);
@@ -778,7 +775,7 @@ fn welfordValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
     return if (agg_plan.func == .stddev_pop or agg_plan.func == .stddev_samp) @sqrt(variance) else variance;
 }
 
-fn avgValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
+fn avgValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) f64 {
     const denom = aggDenom(row, agg_plan);
     if (denom == 0) return 0.0;
     // DECIMAL: the accumulated value is a mantissa-sum, so divide by 10^scale too.
@@ -786,24 +783,24 @@ fn avgValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
     return @as(f64, @floatFromInt(rowStateValue(row, agg_plan.state_index, agg_plan.wide))) / @as(f64, @floatFromInt(denom)) / scale_div;
 }
 
-fn rowStateValue(row: HarnessCore.TopRow, state_index: u16, wide: bool) i128 {
-    if (wide) return HarnessCore.wideStateValue(&row.slots, state_index);
+fn rowStateValue(row: SiloCore.TopRow, state_index: u16, wide: bool) i128 {
+    if (wide) return SiloCore.wideStateValue(&row.slots, state_index);
     return rowStateValueNarrow(row, state_index);
 }
 
-fn rowStateValueNarrow(row: HarnessCore.TopRow, state_index: u16) i128 {
+fn rowStateValueNarrow(row: SiloCore.TopRow, state_index: u16) i128 {
     if (state_index == 0) return @intCast(row.count);
     if (state_index - 1 >= row.slots.len) return 0;
     return row.slots[state_index - 1];
 }
 
 // Float aggregates carry their f64 accumulator in the i64 slot bits.
-fn rowStateFloat(row: HarnessCore.TopRow, state_index: u16) f64 {
+fn rowStateFloat(row: SiloCore.TopRow, state_index: u16) f64 {
     const bits: i64 = if (state_index >= 1 and state_index - 1 < row.slots.len) row.slots[state_index - 1] else 0;
     return @bitCast(bits);
 }
 
-fn avgFloatValue(row: HarnessCore.TopRow, agg_plan: AggregatePlan) f64 {
+fn avgFloatValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) f64 {
     const denom = aggDenom(row, agg_plan);
     return if (denom == 0) 0.0 else rowStateFloat(row, agg_plan.state_index) / @as(f64, @floatFromInt(denom));
 }
@@ -847,7 +844,7 @@ fn compareF64(a: f64, b: f64) i8 {
     return 0;
 }
 
-fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !void {
+fn emitResultStage(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) !void {
     if (op.plan.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, rows);
     for (rows) |row| {
         for (op.plan.layout.parts[0..op.plan.layout.part_count], 0..) |part, i| {
@@ -866,7 +863,7 @@ fn emitResultStage(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !vo
 // Aggregates still come straight from the grouped TopRow. Single-threaded, per
 // the scan/staging/group-only-parallel policy; survivors are bounded by LIMIT
 // for top-N queries.
-fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRow) !void {
+fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) !void {
     if (rows.len == 0) return;
     const allocator = op.allocator;
     const part_count = op.plan.layout.part_count;
@@ -908,7 +905,7 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const HarnessCore.TopRo
     defer allocator.free(loc_order);
     for (0..rows.len) |i| loc_order[i] = @intCast(i);
     std.mem.sortUnstable(u32, loc_order, rows, struct {
-        fn less(rs: []const HarnessCore.TopRow, a: u32, b: u32) bool {
+        fn less(rs: []const SiloCore.TopRow, a: u32, b: u32) bool {
             return rs[a].rowref < rs[b].rowref;
         }
     }.less);
@@ -972,7 +969,7 @@ fn appendStringAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type
     }
 }
 
-fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: HarnessCore.TopRow) !void {
+fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: AggregatePlan, row: SiloCore.TopRow) !void {
     // All-NULL-input groups emit NULL (a no-op valid bit on the non-nullable
     // COUNT-family columns). The data append still runs with a default value
     // so the column stays rectangular.
@@ -1227,12 +1224,12 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     &[_][]const u8{c}
                 else
                     &.{};
-                if (arg_cols.len > HarnessCore.MAX_GROUP_UDF_ARGS) return traceDecline(request, "udf arg count");
-                if (next_udf_state_index >= HarnessCore.MAX_GROUP_UDF_SLOTS) return traceDecline(request, "udf slot count");
+                if (arg_cols.len > SiloCore.MAX_GROUP_UDF_ARGS) return traceDecline(request, "udf arg count");
+                if (next_udf_state_index >= SiloCore.MAX_GROUP_UDF_SLOTS) return traceDecline(request, "udf slot count");
                 // value slot + present slot (one past) must both fit.
                 if (next_numeric_state_index + 1 > MAX_AGGS) return traceDecline(request, "udf state count");
-                var arg_input_indices = [_]u16{0} ** HarnessCore.MAX_GROUP_UDF_ARGS;
-                var arg_types_buf: [HarnessCore.MAX_GROUP_UDF_ARGS]Type = undefined;
+                var arg_input_indices = [_]u16{0} ** SiloCore.MAX_GROUP_UDF_ARGS;
+                var arg_types_buf: [SiloCore.MAX_GROUP_UDF_ARGS]Type = undefined;
                 for (arg_cols, 0..) |col_name, k| {
                     const arg_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "udf arg type");
                     if (!udfSiloArgSupported(arg_type)) return traceDecline(request, "udf arg unsupported");
@@ -1363,7 +1360,7 @@ fn havingExprSupported(parts: []const KeyPart, aggregates: []const AggregatePlan
 // Null when `name` is a NULL group-key part or a NULL aggregate result: any
 // comparison against it is UNKNOWN, so the HAVING leaf excludes the group
 // (SQL 3VL).
-fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.TopRow) ?Num {
+fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: SiloCore.TopRow) ?Num {
     for (plan.layout.parts[0..plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) {
             if (keyPartIsNull(part, row.key)) return null;
@@ -1390,7 +1387,7 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: HarnessCore.To
 }
 
 // Null when `name` is neither a packed group-key part nor an aggregate.
-fn keyPartNullInRow(plan: *const ShapePlan, name: []const u8, row: HarnessCore.TopRow) ?bool {
+fn keyPartNullInRow(plan: *const ShapePlan, name: []const u8, row: SiloCore.TopRow) ?bool {
     for (plan.layout.parts[0..plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) return keyPartIsNull(part, row.key);
     }
@@ -1400,7 +1397,7 @@ fn keyPartNullInRow(plan: *const ShapePlan, name: []const u8, row: HarnessCore.T
     return null;
 }
 
-fn havingPasses(plan: *const ShapePlan, expr: PredicateExpr, row: HarnessCore.TopRow) bool {
+fn havingPasses(plan: *const ShapePlan, expr: PredicateExpr, row: SiloCore.TopRow) bool {
     return switch (expr) {
         .leaf => |p| {
             const lhs = havingOutputNum(plan, p.col, row) orelse return false;
@@ -1435,13 +1432,13 @@ fn havingPasses(plan: *const ShapePlan, expr: PredicateExpr, row: HarnessCore.To
 // Callback bridge so the core's all-groups emit can apply HAVING per group
 // (before the string key is materialized) and count only survivors toward the
 // cap. `ctx` is the owning pipeline; its plan + request supply the predicate.
-fn havingEmitPass(ctx: ?*anyopaque, row: HarnessCore.TopRow) bool {
+fn havingEmitPass(ctx: ?*anyopaque, row: SiloCore.TopRow) bool {
     const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
     const expr = ec.request.having_filter orelse return true;
     return havingPasses(&ec.plan, expr, row);
 }
 
-fn applyHaving(op: *GroupTopNPipeline, expr: PredicateExpr, rows: []HarnessCore.TopRow) []HarnessCore.TopRow {
+fn applyHaving(op: *GroupTopNPipeline, expr: PredicateExpr, rows: []SiloCore.TopRow) []SiloCore.TopRow {
     var w: usize = 0;
     for (rows) |row| {
         if (havingPasses(&op.plan, expr, row)) {

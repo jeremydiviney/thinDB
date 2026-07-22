@@ -44,7 +44,9 @@ test "UNION ALL: WHERE filters applied per side" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM a WHERE id > 1 UNION ALL SELECT id FROM b WHERE id < 4",
     );
     defer allocator.free(ids);
@@ -59,7 +61,9 @@ test "UNION ALL: chained 3-way" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM a WHERE id = 1 UNION ALL SELECT id FROM a WHERE id = 2 UNION ALL SELECT id FROM b WHERE id = 4",
     );
     defer allocator.free(ids);
@@ -79,7 +83,8 @@ test "UNION ALL: schema width mismatch rejected" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(),
+    const root = try thindb.sql.parse(
+        arena.allocator(),
         "SELECT * FROM one UNION ALL SELECT * FROM two",
     );
     const cq = thindb.net.compile(allocator, db, root);

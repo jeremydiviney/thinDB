@@ -14,10 +14,14 @@ const collectBigints = helpers.collectBigints;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE shipments (id BIGINT PRIMARY KEY, ship_date DATE NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO shipments (id, ship_date) VALUES (1, '2024-01-15'), (2, '2024-03-01'), (3, '2024-06-10'), (4, '2024-12-31')",
     );
     const t = try db.openTable("shipments", .{});
@@ -33,7 +37,9 @@ test "DATE typed literal: filter by exact match" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM shipments WHERE ship_date = DATE '2024-03-01'",
     );
     defer allocator.free(ids);
@@ -48,7 +54,9 @@ test "DATE typed literal: range filter" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM shipments WHERE ship_date > DATE '2024-03-01' ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -63,7 +71,9 @@ test "DATE typed literal: case-insensitive keyword" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM shipments WHERE ship_date < date '2024-04-01' ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -78,16 +88,22 @@ test "DATETIME typed literal: round trip" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE events (id BIGINT PRIMARY KEY, ts DATETIME NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO events (id, ts) VALUES (1, '2024-01-15 09:30:00'), (2, '2024-01-15 18:45:00')",
     );
     const t = try db.openTable("events", .{});
     try t.flush();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM events WHERE ts > DATETIME '2024-01-15 12:00:00'",
     );
     defer allocator.free(ids);
@@ -102,16 +118,22 @@ test "TIMESTAMP alias for DATETIME" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE events (id BIGINT PRIMARY KEY, ts DATETIME NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO events (id, ts) VALUES (1, '2024-01-15 09:30:00')",
     );
     const t = try db.openTable("events", .{});
     try t.flush();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM events WHERE ts = TIMESTAMP '2024-01-15 09:30:00'",
     );
     defer allocator.free(ids);

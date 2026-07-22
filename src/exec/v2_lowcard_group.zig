@@ -48,14 +48,14 @@ const Column = types.Column;
 const Type = types.Type;
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
-const ValueView = storage.column.ValueView;
 const store = @import("../engine/store.zig");
 const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
 const Scan = @import("scan.zig").Scan;
-const HarnessCore = exec.group_topn_harness_core;
+const SiloCore = exec.silo_group_core;
+const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const group_table = exec.group_table;
 
@@ -67,7 +67,7 @@ const SortSpec = exec.SortSpec;
 pub const Request = @import("v2_shape_group_topn.zig").Request;
 
 const GroupTable = group_table.IntKeyMemsetTable(64);
-const DistinctSet = HarnessCore.DistinctSet;
+const DistinctSet = SiloCore.DistinctSet;
 const CountSlotTable = group_table.CountSlotTable;
 
 const MAX_KEYS: usize = 8;
@@ -1119,7 +1119,7 @@ const LowCardGroup = struct {
         }
         seg_start[snap.segment_count] = total_rgs;
 
-        var layout = HarnessCore.cpuLayout(allocator) catch HarnessCore.CpuLayout{ .order = &.{}, .physical_count = 0 };
+        var layout = platform.cpuLayout(allocator) catch platform.CpuLayout{ .order = &.{}, .physical_count = 0 };
         defer layout.deinit(allocator);
         const cpu_count = @max(@as(usize, 1), layout.order.len);
         var n_workers = @max(@as(usize, 1), @min(self.dop, cpu_count));

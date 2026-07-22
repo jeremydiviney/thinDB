@@ -3,7 +3,7 @@
 Validates the JDBC ingest path with a **real Flink job + real Connector/J**
 (what mysql2 smoke tests can't cover). thinDB runs natively on the host
 (Windows/Linux) on **port 13306**; Flink (and a MySQL CDC source) run in Docker
-and reach thinDB via `host.docker.internal`. See `../../INGEST_DESIGN.md`.
+and reach thinDB via `host.docker.internal`. See `../../docs/plans/INGEST_DESIGN.md`.
 
 Two harnesses share this compose stack:
 - **`job.sql`** — datagen → thinDB upsert (basic JDBC-sink sanity).
@@ -76,5 +76,5 @@ CDC changelog: `+U` → `ON DUPLICATE KEY UPDATE`, `-D` → `DELETE WHERE pk=?`.
   which thinDB maps to its last-writer-wins upsert.
 - Guarantee here is **effectively-once** (at-least-once delivery + idempotent
   upsert). True exactly-once for keyless/append tables is Stage 2 (Stream Load +
-  2PC / XA) — see INGEST_DESIGN.md.
+  2PC / XA) — see docs/plans/INGEST_DESIGN.md.
 - Connector/jar versions are pinned in `Dockerfile.flink`; bump them together.

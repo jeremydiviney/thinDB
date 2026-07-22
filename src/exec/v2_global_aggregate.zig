@@ -35,7 +35,8 @@ const compute = @import("compute.zig");
 const udf_mod = @import("../udf.zig");
 const expr = @import("expr.zig");
 const Scan = @import("scan.zig").Scan;
-const HarnessCore = exec.group_topn_harness_core;
+const SiloCore = exec.silo_group_core;
+const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const group_table = exec.group_table;
 
@@ -140,7 +141,7 @@ const MAX_GLOBAL_UDF_ARGS: usize = 16;
 // the lanes per distinct field via DistinctSet.mergeInto. The full 128-bit key
 // space is free (no gid to pack), so every column type maps to a lossless or
 // collision-negligible u128 key — see foldDistinctGlobal.
-const DistinctSet = HarnessCore.DistinctSet;
+const DistinctSet = SiloCore.DistinctSet;
 
 // How a COUNT(DISTINCT) column's value becomes its u128 set key:
 //   .int    — ≤64-bit integer family, zero-extended bit pattern (lossless)
@@ -1288,7 +1289,7 @@ const GlobalAggregate = struct {
         // then hyperthread siblings). Capping at the logical count means
         // workers stack evenly — e.g. dop=24 on a 12-core/24-thread host pins
         // 2 lanes per physical core (one on each of its logical CPUs).
-        var layout = HarnessCore.cpuLayout(self.allocator) catch HarnessCore.CpuLayout{ .order = &.{}, .physical_count = 0 };
+        var layout = platform.cpuLayout(self.allocator) catch platform.CpuLayout{ .order = &.{}, .physical_count = 0 };
         defer layout.deinit(self.allocator);
         const cpu_count = @max(@as(usize, 1), layout.order.len);
         var n_workers = @max(@as(usize, 1), @min(self.dop, cpu_count));

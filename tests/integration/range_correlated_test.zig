@@ -16,17 +16,25 @@ const collectBigints = helpers.collectBigints;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE orders (id BIGINT PRIMARY KEY, threshold INT NOT NULL, region VARCHAR(8) NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO orders (id, threshold, region) VALUES " ++
             "(1, 50, 'east'), (2, 100, 'east'), (3, 200, 'west'), (4, 500, 'west')",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE payments (id BIGINT PRIMARY KEY, amount INT NOT NULL, region VARCHAR(8) NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO payments (id, amount, region) VALUES " ++
             "(1, 75, 'east'), (2, 150, 'east'), (3, 250, 'west')",
     );
@@ -48,7 +56,9 @@ test "range EXISTS: amount > o.threshold (any payment beats this order's thresho
     // Inner: SELECT p.id FROM payments p WHERE p.amount > o.threshold.
     // payments.amount values: {75, 150, 250}, max = 250.
     // Orders with threshold < 250: ids 1 (50), 2 (100), 3 (200).
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT o.id FROM orders AS o " ++
             "WHERE EXISTS (SELECT p.id FROM payments AS p WHERE p.amount > o.threshold) " ++
             "ORDER BY o.id ASC",
@@ -67,7 +77,9 @@ test "range NOT EXISTS: amount > o.threshold (no payment beats threshold)" {
 
     // NOT EXISTS — orders where no payment beats their threshold.
     // max(amount) = 250. Order with threshold >= 250: id 4 (500).
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT o.id FROM orders AS o " ++
             "WHERE NOT EXISTS (SELECT p.id FROM payments AS p WHERE p.amount > o.threshold) " ++
             "ORDER BY o.id ASC",
@@ -86,7 +98,9 @@ test "range EXISTS: <= op (some payment <= threshold)" {
 
     // min(amount) = 75. Orders with threshold >= 75: ids 1 (50? no),
     // 2 (100), 3 (200), 4 (500). Wait, 50 < 75, so id=1 fails.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT o.id FROM orders AS o " ++
             "WHERE EXISTS (SELECT p.id FROM payments AS p WHERE p.amount <= o.threshold) " ++
             "ORDER BY o.id ASC",
@@ -107,7 +121,9 @@ test "range EXISTS: mixed equi + range correlation" {
     // east payments: 75, 150. west payments: 250.
     // east orders (id 1, 2) thresholds (50, 100): both < 150 → both match.
     // west orders (id 3, 4) thresholds (200, 500): 200 < 250 → id 3 matches; 500 >= 250 → id 4 no.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT o.id FROM orders AS o " ++
             "WHERE EXISTS (SELECT p.id FROM payments AS p WHERE p.region = o.region AND p.amount > o.threshold) " ++
             "ORDER BY o.id ASC",
@@ -126,17 +142,25 @@ test "range EXISTS: BETWEEN-against-outer (closed range)" {
 
     // Customers with subscription windows; events have timestamps.
     // Question: which customers had any event during their subscription window?
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE customers (id BIGINT PRIMARY KEY, sub_start INT NOT NULL, sub_end INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO customers (id, sub_start, sub_end) VALUES " ++
             "(1, 100, 200), (2, 300, 400), (3, 500, 600)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE events (id BIGINT PRIMARY KEY, ts INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO events (id, ts) VALUES (1, 150), (2, 350), (3, 700)",
     );
     const t1 = try db.openTable("customers", .{});
@@ -148,7 +172,9 @@ test "range EXISTS: BETWEEN-against-outer (closed range)" {
     // c1 (100-200) → event at 150 matches.
     // c2 (300-400) → event at 350 matches.
     // c3 (500-600) → no event in window.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT c.id FROM customers AS c " ++
             "WHERE EXISTS (SELECT e.id FROM events AS e WHERE e.ts >= c.sub_start AND e.ts <= c.sub_end) " ++
             "ORDER BY c.id ASC",
@@ -165,17 +191,25 @@ test "range NOT EXISTS: BETWEEN-against-outer (closed range)" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE customers (id BIGINT PRIMARY KEY, sub_start INT NOT NULL, sub_end INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO customers (id, sub_start, sub_end) VALUES " ++
             "(1, 100, 200), (2, 300, 400), (3, 500, 600)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE events (id BIGINT PRIMARY KEY, ts INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO events (id, ts) VALUES (1, 150), (2, 350), (3, 700)",
     );
     const t1 = try db.openTable("customers", .{});
@@ -184,7 +218,9 @@ test "range NOT EXISTS: BETWEEN-against-outer (closed range)" {
     try t2.flush();
 
     // Customers with NO event in their window: only c3.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT c.id FROM customers AS c " ++
             "WHERE NOT EXISTS (SELECT e.id FROM events AS e WHERE e.ts >= c.sub_start AND e.ts <= c.sub_end) " ++
             "ORDER BY c.id ASC",
@@ -201,19 +237,27 @@ test "range EXISTS: equi + closed range (per-user date window)" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE customers (id BIGINT PRIMARY KEY, sub_start INT NOT NULL, sub_end INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO customers (id, sub_start, sub_end) VALUES " ++
             "(1, 100, 200), (2, 300, 400), (3, 500, 600)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE events (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, ts INT NOT NULL)",
     );
     // c1 has an event at 150 (in window). c2 has an event at 500 (NOT in c2's
     // window 300-400; it's in c3's window but the user_id is 2). c3 has none.
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO events (id, user_id, ts) VALUES (1, 1, 150), (2, 2, 500), (3, 1, 350)",
     );
     const t1 = try db.openTable("customers", .{});
@@ -225,7 +269,9 @@ test "range EXISTS: equi + closed range (per-user date window)" {
     // c1: event (id=1, user_id=1, ts=150) in window [100,200] → match.
     // c2: event (id=2, user_id=2, ts=500) NOT in window [300,400] → no.
     // c3: no events for user_id=3 → no.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT c.id FROM customers AS c " ++
             "WHERE EXISTS (SELECT e.id FROM events AS e WHERE e.user_id = c.id " ++
             "AND e.ts >= c.sub_start AND e.ts <= c.sub_end) " ++
@@ -247,7 +293,9 @@ test "range EXISTS: with inner-local filter applied before materialization" {
     // Effective inner amounts: {150, 250}, max = 250.
     // Same as the first test but with max bumped from 75-relevant to 150.
     // Orders with threshold < 250: ids 1, 2, 3.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT o.id FROM orders AS o " ++
             "WHERE EXISTS (SELECT p.id FROM payments AS p WHERE p.id >= 2 AND p.amount > o.threshold) " ++
             "ORDER BY o.id ASC",

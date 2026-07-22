@@ -18,14 +18,18 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE part (p_id BIGINT PRIMARY KEY)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE li (l_id BIGINT PRIMARY KEY, l_partid BIGINT NOT NULL, l_qty INT NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO part (p_id) VALUES (1), (2), (3)");
     // part 1: qty values {10, 30, 50}, avg = 30
     // part 2: qty values {100, 200},   avg = 150
     // part 3: qty values {5},          avg = 5
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO li (l_id, l_partid, l_qty) VALUES (1,1,10), (2,1,30), (3,1,50), (4,2,100), (5,2,200), (6,3,5)",
     );
     const t1 = try db.openTable("part", .{});
@@ -70,7 +74,9 @@ test "correlated scalar: missing inner key → row filtered" {
     defer db.close();
 
     try exec(allocator, db, "CREATE TABLE outer_t (k BIGINT PRIMARY KEY)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE inner_t (i_id BIGINT PRIMARY KEY, i_k BIGINT NOT NULL, i_v INT NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO outer_t (k) VALUES (1), (2), (3)");

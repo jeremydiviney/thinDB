@@ -27,9 +27,6 @@ const Config = thindb_api.Config;
 const database_mod = @import("../api/database.zig");
 const back_compat_database_name = database_mod.back_compat_database_name;
 
-const exec = @import("../exec/exec.zig");
-const Query = exec.Query;
-
 const ir = @import("../ir/ir.zig");
 const wire = @import("wire.zig");
 const local = @import("local.zig");

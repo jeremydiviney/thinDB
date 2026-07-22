@@ -33,8 +33,8 @@ const DATE_CEIL_M = 7;
 const DATE_CEIL_D = 16;
 
 const LINE_ITEM_TYPES = [_][]const u8{
-    "credit",               "credit-prorated",        "discount-nonrecurring",
-    "discount-recurring",   "revenue-recurring",      "adjustment-recurring",
+    "credit",               "credit-prorated",         "discount-nonrecurring",
+    "discount-recurring",   "revenue-recurring",       "adjustment-recurring",
     "revenue-nonrecurring", "adjustment-nonrecurring",
 };
 
@@ -78,12 +78,12 @@ const SH = struct {
 /// Shard column names in SH order (for the runtime scan-batch mapping —
 /// the scan emits columns in TABLE-PHYSICAL order, not request order).
 const SHARD_NAMES = [SH.N][]const u8{
-    "projectId",              "divisionId",           "customerNumberHash", "date",
-    "originalAmount",         "invoiceId",            "invoiceDate",        "startDate",
-    "originalCustomerNumber", "originalCustomerName", "originalCurrency",   "planId",
-    "lineItemType",           "integrationConfigId",  "parentCustomerNumber",
-    "parentCustomerName",     "customerNumber",       "customerNumberLC",   "customerName",
-    "customerEmail",          "amount",
+    "projectId",              "divisionId",           "customerNumberHash",   "date",
+    "originalAmount",         "invoiceId",            "invoiceDate",          "startDate",
+    "originalCustomerNumber", "originalCustomerName", "originalCurrency",     "planId",
+    "lineItemType",           "integrationConfigId",  "parentCustomerNumber", "parentCustomerName",
+    "customerNumber",         "customerNumberLC",     "customerName",         "customerEmail",
+    "amount",
 };
 
 const ColumnStore = tdb.ColumnStore;
@@ -91,11 +91,11 @@ const ColumnType = tdb.ColumnType;
 const ColumnView = tdb.ColumnView;
 
 const SHARD_META = [SH.N]struct { t: ColumnType, n: bool }{
-    .{ .t = .int, .n = false },   .{ .t = .int, .n = true },    .{ .t = .string, .n = true },  .{ .t = .date, .n = false },
-    .{ .t = .int, .n = true },    .{ .t = .string, .n = false }, .{ .t = .date, .n = true },    .{ .t = .date, .n = true },
-    .{ .t = .string, .n = true }, .{ .t = .string, .n = true }, .{ .t = .string, .n = true },  .{ .t = .string, .n = true },
-    .{ .t = .string, .n = true }, .{ .t = .int, .n = false },   .{ .t = .string, .n = true },  .{ .t = .string, .n = true },
-    .{ .t = .string, .n = true }, .{ .t = .string, .n = true }, .{ .t = .string, .n = true },  .{ .t = .string, .n = true },
+    .{ .t = .int, .n = false },   .{ .t = .int, .n = true },     .{ .t = .string, .n = true }, .{ .t = .date, .n = false },
+    .{ .t = .int, .n = true },    .{ .t = .string, .n = false }, .{ .t = .date, .n = true },   .{ .t = .date, .n = true },
+    .{ .t = .string, .n = true }, .{ .t = .string, .n = true },  .{ .t = .string, .n = true }, .{ .t = .string, .n = true },
+    .{ .t = .string, .n = true }, .{ .t = .int, .n = false },    .{ .t = .string, .n = true }, .{ .t = .string, .n = true },
+    .{ .t = .string, .n = true }, .{ .t = .string, .n = true },  .{ .t = .string, .n = true }, .{ .t = .string, .n = true },
     .{ .t = .int, .n = true },
 };
 
@@ -221,9 +221,7 @@ fn loadBroadcasts(allocator: std.mem.Allocator, db: *thindb.Database, b: *Broadc
     }.sink);
 
     const PlanCtx = struct { a: std.mem.Allocator, b: *Broadcasts };
-    try runSql(allocator, db,
-        "SELECT projectId, integrationConfigId, externalPlanId, id, planName FROM external_plan WHERE projectId = 1000073",
-        PlanCtx{ .a = a, .b = b }, struct {
+    try runSql(allocator, db, "SELECT projectId, integrationConfigId, externalPlanId, id, planName FROM external_plan WHERE projectId = 1000073", PlanCtx{ .a = a, .b = b }, struct {
         fn sink(c: PlanCtx, batch: thindb.exec.Batch) anyerror!void {
             for (0..batch.row_count) |i| {
                 const row = c.b.plan_id.items.len;
@@ -241,9 +239,7 @@ fn loadBroadcasts(allocator: std.mem.Allocator, db: *thindb.Database, b: *Broadc
     }.sink);
 
     const RateCtx = struct { a: std.mem.Allocator, b: *Broadcasts };
-    try runSql(allocator, db,
-        "SELECT currencyTo, date, CAST(rate * 1000000 AS BIGINT) AS rateMicros FROM currency_exchange_rate WHERE currencyBase = 'USD'",
-        RateCtx{ .a = a, .b = b }, struct {
+    try runSql(allocator, db, "SELECT currencyTo, date, CAST(rate * 1000000 AS BIGINT) AS rateMicros FROM currency_exchange_rate WHERE currencyBase = 'USD'", RateCtx{ .a = a, .b = b }, struct {
         fn sink(c: RateCtx, batch: thindb.exec.Batch) anyerror!void {
             for (0..batch.row_count) |i| {
                 if (!batch.values[1].isValid(i) or !batch.values[2].isValid(i)) continue;
@@ -918,33 +914,33 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
 
         // ---- p3 cap partial over the union rows (validation only) ----
         if (sh.validate) {
-        const cap = &sh.caps[w];
-        var views: [SH.N]ColumnView = undefined;
-        for (&views, &shard.buf.cols) |*v, *c| v.* = c.view();
-        cap.rows += shard.buf.rows;
-        for (0..shard.buf.rows) |i| {
-            cap.takeInt(0, views[SH.projectId].data.int[i]);
-            cap.takeInt(1, if (views[SH.divisionId].isValid(i)) views[SH.divisionId].data.int[i] else null);
-            try cap.takeStr(alloc, 0, strOrNull(views[SH.customerNumberLC], i));
-            cap.takeDate(0, views[SH.date].data.date[i]);
-            try cap.takeStr(alloc, 1, strOrNull(views[SH.customerNumberHash], i));
-            if (views[SH.originalAmount].isValid(i)) cap.sum_orig += views[SH.originalAmount].data.int[i];
-            try cap.takeStr(alloc, 2, strOrNull(views[SH.invoiceId], i));
-            cap.takeDate(1, if (views[SH.invoiceDate].isValid(i)) views[SH.invoiceDate].data.date[i] else null);
-            cap.takeDate(2, if (views[SH.startDate].isValid(i)) views[SH.startDate].data.date[i] else null);
-            try cap.takeStr(alloc, 3, strOrNull(views[SH.originalCustomerNumber], i));
-            try cap.takeStr(alloc, 4, strOrNull(views[SH.originalCustomerName], i));
-            try cap.takeStr(alloc, 5, strOrNull(views[SH.originalCurrency], i));
-            try cap.takeStr(alloc, 6, strOrNull(views[SH.planId], i));
-            try cap.takeStr(alloc, 7, strOrNull(views[SH.lineItemType], i));
-            cap.sum_icid += views[SH.integrationConfigId].data.int[i];
-            try cap.takeStr(alloc, 8, strOrNull(views[SH.parentCustomerNumber], i));
-            try cap.takeStr(alloc, 9, strOrNull(views[SH.parentCustomerName], i));
-            try cap.takeStr(alloc, 10, strOrNull(views[SH.customerNumber], i));
-            try cap.takeStr(alloc, 11, strOrNull(views[SH.customerName], i));
-            try cap.takeStr(alloc, 12, strOrNull(views[SH.customerEmail], i));
-            if (views[SH.amount].isValid(i)) cap.sum_amount += views[SH.amount].data.int[i];
-        }
+            const cap = &sh.caps[w];
+            var views: [SH.N]ColumnView = undefined;
+            for (&views, &shard.buf.cols) |*v, *c| v.* = c.view();
+            cap.rows += shard.buf.rows;
+            for (0..shard.buf.rows) |i| {
+                cap.takeInt(0, views[SH.projectId].data.int[i]);
+                cap.takeInt(1, if (views[SH.divisionId].isValid(i)) views[SH.divisionId].data.int[i] else null);
+                try cap.takeStr(alloc, 0, strOrNull(views[SH.customerNumberLC], i));
+                cap.takeDate(0, views[SH.date].data.date[i]);
+                try cap.takeStr(alloc, 1, strOrNull(views[SH.customerNumberHash], i));
+                if (views[SH.originalAmount].isValid(i)) cap.sum_orig += views[SH.originalAmount].data.int[i];
+                try cap.takeStr(alloc, 2, strOrNull(views[SH.invoiceId], i));
+                cap.takeDate(1, if (views[SH.invoiceDate].isValid(i)) views[SH.invoiceDate].data.date[i] else null);
+                cap.takeDate(2, if (views[SH.startDate].isValid(i)) views[SH.startDate].data.date[i] else null);
+                try cap.takeStr(alloc, 3, strOrNull(views[SH.originalCustomerNumber], i));
+                try cap.takeStr(alloc, 4, strOrNull(views[SH.originalCustomerName], i));
+                try cap.takeStr(alloc, 5, strOrNull(views[SH.originalCurrency], i));
+                try cap.takeStr(alloc, 6, strOrNull(views[SH.planId], i));
+                try cap.takeStr(alloc, 7, strOrNull(views[SH.lineItemType], i));
+                cap.sum_icid += views[SH.integrationConfigId].data.int[i];
+                try cap.takeStr(alloc, 8, strOrNull(views[SH.parentCustomerNumber], i));
+                try cap.takeStr(alloc, 9, strOrNull(views[SH.parentCustomerName], i));
+                try cap.takeStr(alloc, 10, strOrNull(views[SH.customerNumber], i));
+                try cap.takeStr(alloc, 11, strOrNull(views[SH.customerName], i));
+                try cap.takeStr(alloc, 12, strOrNull(views[SH.customerEmail], i));
+                if (views[SH.amount].isValid(i)) cap.sum_amount += views[SH.amount].data.int[i];
+            }
         }
 
         // ---- rf_currency_convert: one row-aligned call over the shard -----
@@ -955,9 +951,9 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
         } else for (&shard.cur) |*c| c.clear();
         if (nrows > 0) {
             const cin = [_]usize{
-                SH.projectId,    SH.divisionId,   SH.customerNumberLC, SH.invoiceDate,
-                SH.originalCurrency, SH.amount,   SH.originalAmount,   SH.lineItemType,
-                SH.planId,       SH.integrationConfigId, SH.date,      SH.startDate,
+                SH.projectId,        SH.divisionId,          SH.customerNumberLC, SH.invoiceDate,
+                SH.originalCurrency, SH.amount,              SH.originalAmount,   SH.lineItemType,
+                SH.planId,           SH.integrationConfigId, SH.date,             SH.startDate,
             };
             var cviews: [12]ColumnView = undefined;
             for (&cviews, cin) |*v, si| v.* = shard.buf.cols[si].view();
@@ -1212,30 +1208,30 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
                 try appendOptInt(alloc, &cols[AG.hasAdjustment], acc.has_adj);
 
                 if (sh.validate) {
-                const p6c = &sh.p6caps[w];
-                p6c.rows += 1;
-                i32MaxInto(&p6c.max_proj, g_pid);
-                i32MaxInto(&p6c.max_div, g_div);
-                i32MaxInto(&p6c.max_month, acc.month);
-                try strMax(alloc, &p6c.max_str[0], g_lc);
-                try strMax(alloc, &p6c.max_str[1], acc.cust_num);
-                try strMax(alloc, &p6c.max_str[2], acc.cust_name);
-                try strMax(alloc, &p6c.max_str[3], acc.cust_email);
-                try strMax(alloc, &p6c.max_str[4], acc.any_hash);
-                try strMax(alloc, &p6c.max_str[5], acc.parent_num);
-                try strMax(alloc, &p6c.max_str[6], acc.parent_name);
-                try strMax(alloc, &p6c.max_str[7], acc.any_currency);
-                i32MaxInto(&p6c.max_bill, acc.max_bill);
-                i32MaxInto(&p6c.max_min, acc.min_bill);
-                i32MaxInto(&p6c.max_invd, acc.max_invd);
-                if (acc.sum_amount) |v| p6c.sum_amount += v;
-                if (acc.sum_orig) |v| p6c.sum_orig += v;
-                if (acc.sum_nonrec) |v| p6c.sum_nonrec += v;
-                if (acc.sum_orignonrec) |v| p6c.sum_orignonrec += v;
-                if (acc.icid) |v| p6c.sum_icid += v;
-                if (er_out) |e| p6c.sum_er += e;
-                if (acc.plan_val) |v| p6c.sum_plan += v;
-                p6c.sum_hadj += acc.has_adj;
+                    const p6c = &sh.p6caps[w];
+                    p6c.rows += 1;
+                    i32MaxInto(&p6c.max_proj, g_pid);
+                    i32MaxInto(&p6c.max_div, g_div);
+                    i32MaxInto(&p6c.max_month, acc.month);
+                    try strMax(alloc, &p6c.max_str[0], g_lc);
+                    try strMax(alloc, &p6c.max_str[1], acc.cust_num);
+                    try strMax(alloc, &p6c.max_str[2], acc.cust_name);
+                    try strMax(alloc, &p6c.max_str[3], acc.cust_email);
+                    try strMax(alloc, &p6c.max_str[4], acc.any_hash);
+                    try strMax(alloc, &p6c.max_str[5], acc.parent_num);
+                    try strMax(alloc, &p6c.max_str[6], acc.parent_name);
+                    try strMax(alloc, &p6c.max_str[7], acc.any_currency);
+                    i32MaxInto(&p6c.max_bill, acc.max_bill);
+                    i32MaxInto(&p6c.max_min, acc.min_bill);
+                    i32MaxInto(&p6c.max_invd, acc.max_invd);
+                    if (acc.sum_amount) |v| p6c.sum_amount += v;
+                    if (acc.sum_orig) |v| p6c.sum_orig += v;
+                    if (acc.sum_nonrec) |v| p6c.sum_nonrec += v;
+                    if (acc.sum_orignonrec) |v| p6c.sum_orignonrec += v;
+                    if (acc.icid) |v| p6c.sum_icid += v;
+                    if (er_out) |e| p6c.sum_er += e;
+                    if (acc.plan_val) |v| p6c.sum_plan += v;
+                    p6c.sum_hadj += acc.has_adj;
                 }
             }
             try shard.agg_ranges.append(alloc, .{ astart, @intCast(shard.agg[0].rowCount()) });
@@ -1253,8 +1249,8 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
         var prev_lc_set = false;
 
         const UD_META = [10]struct { t: ColumnType, n: bool }{
-            .{ .t = .bigint, .n = true }, .{ .t = .bigint, .n = true }, .{ .t = .int, .n = true },  .{ .t = .double, .n = true },
-            .{ .t = .int, .n = true },    .{ .t = .int, .n = true },    .{ .t = .date, .n = true }, .{ .t = .string, .n = false },
+            .{ .t = .bigint, .n = true }, .{ .t = .bigint, .n = true },  .{ .t = .int, .n = true },  .{ .t = .double, .n = true },
+            .{ .t = .int, .n = true },    .{ .t = .int, .n = true },     .{ .t = .date, .n = true }, .{ .t = .string, .n = false },
             .{ .t = .int, .n = false },   .{ .t = .bigint, .n = false },
         };
 
@@ -1319,8 +1315,8 @@ fn stageWorkerInner(sh: *StageShared, w: usize) !void {
             // full query computes them, so we pay the kernel here).
             {
                 const uin = [_]usize{
-                    AG.projectId, AG.divisionId, AG.customerNumberLC, AG.month, AG.minDate,
-                    AG.amount,    AG.originalAmount, AG.exchangeRate, AG.planId,
+                    AG.projectId, AG.divisionId,     AG.customerNumberLC, AG.month,  AG.minDate,
+                    AG.amount,    AG.originalAmount, AG.exchangeRate,     AG.planId,
                 };
                 var uviews: [9]ColumnView = undefined;
                 for (&uviews, uin) |*v, si| v.* = gbv[si];
@@ -1482,326 +1478,329 @@ pub fn main() !void {
     for (0..passes) |pass| {
         const t_pass = prof.nowTicks();
 
-    // ---- phase 1: scan + scatter ----------------------------------------
-    t = prof.nowTicks();
+        // ---- phase 1: scan + scatter ----------------------------------------
+        t = prof.nowTicks();
 
-    table.ddl_lock.lockSharedUncancelable(table.io);
-    defer table.ddl_lock.unlockShared(table.io);
-    const Scan = thindb.exec.Scan;
-    const snap = try Scan.captureSnapshotAlloc(table, allocator);
-    defer allocator.free(snap.segments);
-    var orch_pin_held = true;
-    defer if (orch_pin_held) snap.memtable_snap.release();
+        table.ddl_lock.lockSharedUncancelable(table.io);
+        defer table.ddl_lock.unlockShared(table.io);
+        const Scan = thindb.exec.Scan;
+        const snap = try Scan.captureSnapshotAlloc(table, allocator);
+        defer allocator.free(snap.segments);
+        var orch_pin_held = true;
+        defer if (orch_pin_held) snap.memtable_snap.release();
 
-    var total_rgs: usize = 0;
-    const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
-    defer allocator.free(seg_start);
-    for (snap.segments, 0..) |e, i| {
-        seg_start[i] = total_rgs;
-        total_rgs += e.row_group_count;
-    }
-    seg_start[snap.segment_count] = total_rgs;
+        var total_rgs: usize = 0;
+        const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
+        defer allocator.free(seg_start);
+        for (snap.segments, 0..) |e, i| {
+            seg_start[i] = total_rgs;
+            total_rgs += e.row_group_count;
+        }
+        seg_start[snap.segment_count] = total_rgs;
 
-    const n_chunks = @max(n_threads, @min(n_threads * 4, @max(total_rgs, 1)));
+        const n_chunks = @max(n_threads, @min(n_threads * 4, @max(total_rgs, 1)));
 
-    const P = thindb.exec.PredicateExpr;
-    var in_arms: [LINE_ITEM_TYPES.len]P = undefined;
-    for (LINE_ITEM_TYPES, 0..) |lt, i| {
-        in_arms[i] = .{ .leaf = .{ .col = "lineItemType", .op = .eq, .val = .{ .text = lt } } };
-    }
-    const date_ceil = tdb.Date.fromYmd(.{ .y = DATE_CEIL_Y, .m = DATE_CEIL_M, .d = DATE_CEIL_D }).days();
-    const conj = [_]P{
-        .{ .leaf = .{ .col = "projectId", .op = .eq, .val = .{ .int = PROJECT_ID } } },
-        .{ .leaf = .{ .col = "modelType", .op = .eq, .val = .{ .text = MODEL_TYPE } } },
-        .{ .leaf = .{ .col = "deleted", .op = .eq, .val = .{ .smallint = 0 } } },
-        .{ .leaf = .{ .col = "date", .op = .lte, .val = .{ .date = date_ceil } } },
-        .{ .@"or" = &in_arms },
-    };
-    const filter_expr = P{ .@"and" = &conj };
+        const P = thindb.exec.PredicateExpr;
+        var in_arms: [LINE_ITEM_TYPES.len]P = undefined;
+        for (LINE_ITEM_TYPES, 0..) |lt, i| {
+            in_arms[i] = .{ .leaf = .{ .col = "lineItemType", .op = .eq, .val = .{ .text = lt } } };
+        }
+        const date_ceil = tdb.Date.fromYmd(.{ .y = DATE_CEIL_Y, .m = DATE_CEIL_M, .d = DATE_CEIL_D }).days();
+        const conj = [_]P{
+            .{ .leaf = .{ .col = "projectId", .op = .eq, .val = .{ .int = PROJECT_ID } } },
+            .{ .leaf = .{ .col = "modelType", .op = .eq, .val = .{ .text = MODEL_TYPE } } },
+            .{ .leaf = .{ .col = "deleted", .op = .eq, .val = .{ .smallint = 0 } } },
+            .{ .leaf = .{ .col = "date", .op = .lte, .val = .{ .date = date_ceil } } },
+            .{ .@"or" = &in_arms },
+        };
+        const filter_expr = P{ .@"and" = &conj };
 
-    const scans = try allocator.alloc(*Scan, n_chunks);
-    defer allocator.free(scans);
-    var scans_built: usize = 0;
-    defer for (scans[0..scans_built]) |s| s.deinit();
-    for (0..n_chunks) |i| {
-        const lo = i * total_rgs / n_chunks;
-        const hi = if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks;
-        const s = try Scan.allocWithProjectionLoc(allocator, table, null, &SCAN_COLS, false, snap);
-        scans[i] = s;
-        scans_built += 1;
-        const start = flatToCoord(lo, seg_start, snap.segment_count);
-        const end = flatToCoord(hi, seg_start, snap.segment_count);
-        s.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
-        try s.addPrune(.{ .col = "projectId", .op = .eq, .val = .{ .int = PROJECT_ID } });
-        try s.addPrune(.{ .col = "date", .op = .lte, .val = .{ .date = date_ceil } });
-        const fused = try s.tryFuseFilter(filter_expr);
-        if (!fused) return error.FilterNotFused;
-    }
-    snap.memtable_snap.release();
-    orch_pin_held = false;
+        const scans = try allocator.alloc(*Scan, n_chunks);
+        defer allocator.free(scans);
+        var scans_built: usize = 0;
+        defer for (scans[0..scans_built]) |s| s.deinit();
+        for (0..n_chunks) |i| {
+            const lo = i * total_rgs / n_chunks;
+            const hi = if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks;
+            const s = try Scan.allocWithProjectionLoc(allocator, table, null, &SCAN_COLS, false, snap);
+            scans[i] = s;
+            scans_built += 1;
+            const start = flatToCoord(lo, seg_start, snap.segment_count);
+            const end = flatToCoord(hi, seg_start, snap.segment_count);
+            s.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
+            try s.addPrune(.{ .col = "projectId", .op = .eq, .val = .{ .int = PROJECT_ID } });
+            try s.addPrune(.{ .col = "date", .op = .lte, .val = .{ .date = date_ceil } });
+            const fused = try s.tryFuseFilter(filter_expr);
+            if (!fused) return error.FilterNotFused;
+        }
+        snap.memtable_snap.release();
+        orch_pin_held = false;
 
-    var scan_to_shard: [SCAN_COLS.len]usize = undefined;
-    var cust_ci: usize = 0;
-    {
-        const os = scans[0].outputSchema();
-        if (os.len != SCAN_COLS.len) return error.UnexpectedScanSchema;
-        for (os, 0..) |col, ci| {
-            var found = false;
-            for (SHARD_NAMES, 0..) |sn, si| {
-                if (std.mem.eql(u8, col.name, sn)) {
-                    scan_to_shard[ci] = si;
-                    found = true;
-                    break;
+        var scan_to_shard: [SCAN_COLS.len]usize = undefined;
+        var cust_ci: usize = 0;
+        {
+            const os = scans[0].outputSchema();
+            if (os.len != SCAN_COLS.len) return error.UnexpectedScanSchema;
+            for (os, 0..) |col, ci| {
+                var found = false;
+                for (SHARD_NAMES, 0..) |sn, si| {
+                    if (std.mem.eql(u8, col.name, sn)) {
+                        scan_to_shard[ci] = si;
+                        found = true;
+                        break;
+                    }
                 }
+                if (!found) return error.UnknownScanColumn;
+                if (std.mem.eql(u8, col.name, "customerNumber")) cust_ci = ci;
             }
-            if (!found) return error.UnknownScanColumn;
-            if (std.mem.eql(u8, col.name, "customerNumber")) cust_ci = ci;
         }
-    }
-    const build_ms = prof.ticksToMs(prof.nowTicks() - t);
+        const build_ms = prof.ticksToMs(prof.nowTicks() - t);
 
-    t = prof.nowTicks();
-    for (worker_shards) |*sb| {
-        for (&sb.cols) |*c| c.clear();
-        sb.rows = 0;
-    }
-
-    const errs = try allocator.alloc(?anyerror, n_threads);
-    defer allocator.free(errs);
-    @memset(errs, null);
-
-    var shared = ScanShared{
-        .scans = scans,
-        .n_shards = n_shards,
-        .alloc = allocator,
-        .worker_shards = worker_shards,
-        .errs = errs,
-        .scan_to_shard = scan_to_shard,
-        .cust_ci = cust_ci,
-    };
-
-    const threads = try allocator.alloc(std.Thread, n_threads);
-    defer allocator.free(threads);
-    for (0..n_threads - 1) |w| {
-        threads[w] = try std.Thread.spawn(.{}, scanWorker, .{ &shared, w });
-    }
-    scanWorker(&shared, n_threads - 1);
-    for (0..n_threads - 1) |w| threads[w].join();
-    for (errs) |e| if (e) |err| return err;
-    const scan_ms = prof.ticksToMs(prof.nowTicks() - t);
-
-    // ---- phase 2: the keyed region ----------------------------------------
-    t = prof.nowTicks();
-    const validate = getenv("RF_VALIDATE") != null;
-
-    // Whales first: claim shards in descending row count so the phase tail
-    // is small shards.
-    const order_arr = try allocator.alloc(u32, n_shards);
-    defer allocator.free(order_arr);
-    {
-        const totals = try allocator.alloc(usize, n_shards);
-        defer allocator.free(totals);
-        @memset(totals, 0);
-        for (0..n_threads) |w2| {
-            for (0..n_shards) |s2| totals[s2] += worker_shards[w2 * n_shards + s2].rows;
+        t = prof.nowTicks();
+        for (worker_shards) |*sb| {
+            for (&sb.cols) |*c| c.clear();
+            sb.rows = 0;
         }
-        for (order_arr, 0..) |*o, i| o.* = @intCast(i);
-        std.mem.sortUnstable(u32, order_arr, totals, struct {
-            fn less(t2: []const usize, a: u32, b: u32) bool {
-                return t2[a] > t2[b];
+
+        const errs = try allocator.alloc(?anyerror, n_threads);
+        defer allocator.free(errs);
+        @memset(errs, null);
+
+        var shared = ScanShared{
+            .scans = scans,
+            .n_shards = n_shards,
+            .alloc = allocator,
+            .worker_shards = worker_shards,
+            .errs = errs,
+            .scan_to_shard = scan_to_shard,
+            .cust_ci = cust_ci,
+        };
+
+        const threads = try allocator.alloc(std.Thread, n_threads);
+        defer allocator.free(threads);
+        for (0..n_threads - 1) |w| {
+            threads[w] = try std.Thread.spawn(.{}, scanWorker, .{ &shared, w });
+        }
+        scanWorker(&shared, n_threads - 1);
+        for (0..n_threads - 1) |w| threads[w].join();
+        for (errs) |e| if (e) |err| return err;
+        const scan_ms = prof.ticksToMs(prof.nowTicks() - t);
+
+        // ---- phase 2: the keyed region ----------------------------------------
+        t = prof.nowTicks();
+        const validate = getenv("RF_VALIDATE") != null;
+
+        // Whales first: claim shards in descending row count so the phase tail
+        // is small shards.
+        const order_arr = try allocator.alloc(u32, n_shards);
+        defer allocator.free(order_arr);
+        {
+            const totals = try allocator.alloc(usize, n_shards);
+            defer allocator.free(totals);
+            @memset(totals, 0);
+            for (0..n_threads) |w2| {
+                for (0..n_shards) |s2| totals[s2] += worker_shards[w2 * n_shards + s2].rows;
             }
-        }.less);
-    }
+            for (order_arr, 0..) |*o, i| o.* = @intCast(i);
+            std.mem.sortUnstable(u32, order_arr, totals, struct {
+                fn less(t2: []const usize, a: u32, b: u32) bool {
+                    return t2[a] > t2[b];
+                }
+            }.less);
+        }
 
-    const phase_ticks = try allocator.alloc([5]u64, n_threads);
-    defer allocator.free(phase_ticks);
-    for (phase_ticks) |*p| p.* = @splat(0);
-    const caps = try allocator.alloc(P3Cap, n_threads);
-    for (caps) |*c| c.* = .{};
-    const p5sums = try allocator.alloc(P5Sums, n_threads);
-    for (p5sums) |*c| c.* = .{};
-    const p6caps = try allocator.alloc(P6Cap, n_threads);
-    for (p6caps) |*c| c.* = .{};
-    const p15caps = try allocator.alloc(P15Cap, n_threads);
-    for (p15caps) |*c| c.* = .{};
-    @memset(errs, null);
+        const phase_ticks = try allocator.alloc([5]u64, n_threads);
+        defer allocator.free(phase_ticks);
+        for (phase_ticks) |*p| p.* = @splat(0);
+        const caps = try allocator.alloc(P3Cap, n_threads);
+        for (caps) |*c| c.* = .{};
+        const p5sums = try allocator.alloc(P5Sums, n_threads);
+        for (p5sums) |*c| c.* = .{};
+        const p6caps = try allocator.alloc(P6Cap, n_threads);
+        for (p6caps) |*c| c.* = .{};
+        const p15caps = try allocator.alloc(P15Cap, n_threads);
+        for (p15caps) |*c| c.* = .{};
+        @memset(errs, null);
 
-    var stage = StageShared{
-        .shards = shards,
-        .n_threads = n_threads,
-        .n_shards = n_shards,
-        .worker_shards = worker_shards,
-        .alloc = allocator,
-        .errs = errs,
-        .caps = caps,
-        .p5sums = p5sums,
-        .p6caps = p6caps,
-        .p15caps = p15caps,
-        .rate_part = &bc.rate_part,
-        .plan_part = &bc.plan_part,
-        .bc = &bc,
-        .order = order_arr,
-        .validate = validate,
-        .phase_ticks = phase_ticks,
-    };
-    for (0..n_threads - 1) |w| {
-        threads[w] = try std.Thread.spawn(.{}, stageWorker, .{ &stage, w });
-    }
-    stageWorker(&stage, n_threads - 1);
-    for (0..n_threads - 1) |w| threads[w].join();
-    for (errs) |e| if (e) |err| return err;
-    const stage_ms = prof.ticksToMs(prof.nowTicks() - t);
+        var stage = StageShared{
+            .shards = shards,
+            .n_threads = n_threads,
+            .n_shards = n_shards,
+            .worker_shards = worker_shards,
+            .alloc = allocator,
+            .errs = errs,
+            .caps = caps,
+            .p5sums = p5sums,
+            .p6caps = p6caps,
+            .p15caps = p15caps,
+            .rate_part = &bc.rate_part,
+            .plan_part = &bc.plan_part,
+            .bc = &bc,
+            .order = order_arr,
+            .validate = validate,
+            .phase_ticks = phase_ticks,
+        };
+        for (0..n_threads - 1) |w| {
+            threads[w] = try std.Thread.spawn(.{}, stageWorker, .{ &stage, w });
+        }
+        stageWorker(&stage, n_threads - 1);
+        for (0..n_threads - 1) |w| threads[w].join();
+        for (errs) |e| if (e) |err| return err;
+        const stage_ms = prof.ticksToMs(prof.nowTicks() - t);
 
-    // ---- combine + report -------------------------------------------------
-    var cap = P3Cap{};
-    for (caps) |*c| {
-        cap.rows += c.rows;
-        cap.sum_orig += c.sum_orig;
-        cap.sum_icid += c.sum_icid;
-        cap.sum_amount += c.sum_amount;
-        for (0..13) |slot| try cap.takeStr(allocator, slot, c.max_str[slot]);
-        for (0..4) |slot| cap.takeDate(slot, c.max_date[slot]);
-        cap.takeInt(0, c.max_int[0]);
-        cap.takeInt(1, c.max_int[1]);
-    }
-    var est_total: usize = 0;
-    var agg_total: usize = 0;
-    var union_total: usize = 0;
-    for (shards) |*s| {
-        est_total += s.est_rows;
-        agg_total += s.agg_rows;
-        union_total += s.out_rows;
-    }
+        // ---- combine + report -------------------------------------------------
+        var cap = P3Cap{};
+        for (caps) |*c| {
+            cap.rows += c.rows;
+            cap.sum_orig += c.sum_orig;
+            cap.sum_icid += c.sum_icid;
+            cap.sum_amount += c.sum_amount;
+            for (0..13) |slot| try cap.takeStr(allocator, slot, c.max_str[slot]);
+            for (0..4) |slot| cap.takeDate(slot, c.max_date[slot]);
+            cap.takeInt(0, c.max_int[0]);
+            cap.takeInt(1, c.max_int[1]);
+        }
+        var est_total: usize = 0;
+        var agg_total: usize = 0;
+        var union_total: usize = 0;
+        for (shards) |*s| {
+            est_total += s.est_rows;
+            agg_total += s.agg_rows;
+            union_total += s.out_rows;
+        }
 
-    var p5 = P5Sums{};
-    for (p5sums) |*c| {
-        p5.ipid += c.ipid;
-        p5.rn1 += c.rn1;
-        p5.rn2 += c.rn2;
-        p5.hadj += c.hadj;
-    }
+        var p5 = P5Sums{};
+        for (p5sums) |*c| {
+            p5.ipid += c.ipid;
+            p5.rn1 += c.rn1;
+            p5.rn2 += c.rn2;
+            p5.hadj += c.hadj;
+        }
 
-    // p6 / p15 cap combines.
-    var p6 = P6Cap{};
-    for (p6caps) |*c| {
-        p6.rows += c.rows;
-        i32MaxInto(&p6.max_proj, c.max_proj);
-        i32MaxInto(&p6.max_div, c.max_div);
-        i32MaxInto(&p6.max_month, c.max_month);
-        for (0..8) |s| try strMax(allocator, &p6.max_str[s], c.max_str[s]);
-        i32MaxInto(&p6.max_bill, c.max_bill);
-        i32MaxInto(&p6.max_min, c.max_min);
-        i32MaxInto(&p6.max_invd, c.max_invd);
-        p6.sum_amount += c.sum_amount;
-        p6.sum_orig += c.sum_orig;
-        p6.sum_nonrec += c.sum_nonrec;
-        p6.sum_orignonrec += c.sum_orignonrec;
-        p6.sum_icid += c.sum_icid;
-        p6.sum_er += c.sum_er;
-        p6.sum_plan += c.sum_plan;
-        p6.sum_hadj += c.sum_hadj;
-    }
-    var p15 = P15Cap{};
-    for (p15caps) |*c| {
-        p15.rows += c.rows;
-        i32MaxInto(&p15.max_proj, c.max_proj);
-        i32MaxInto(&p15.max_div, c.max_div);
-        i32MaxInto(&p15.max_month, c.max_month);
-        i32MaxInto(&p15.max_date, c.max_date);
-        i32MaxInto(&p15.max_min, c.max_min);
-        for (0..8) |s| try strMax(allocator, &p15.max_str[s], c.max_str[s]);
-        p15.sum_amount += c.sum_amount;
-        p15.sum_orig += c.sum_orig;
-        p15.sum_nonrec += c.sum_nonrec;
-        p15.sum_orignonrec += c.sum_orignonrec;
-        p15.sum_er += c.sum_er;
-        p15.sum_hadj += c.sum_hadj;
-        p15.sum_icid += c.sum_icid;
-        p15.sum_plan += c.sum_plan;
-        p15.sum_rn += c.sum_rn;
-    }
+        // p6 / p15 cap combines.
+        var p6 = P6Cap{};
+        for (p6caps) |*c| {
+            p6.rows += c.rows;
+            i32MaxInto(&p6.max_proj, c.max_proj);
+            i32MaxInto(&p6.max_div, c.max_div);
+            i32MaxInto(&p6.max_month, c.max_month);
+            for (0..8) |s| try strMax(allocator, &p6.max_str[s], c.max_str[s]);
+            i32MaxInto(&p6.max_bill, c.max_bill);
+            i32MaxInto(&p6.max_min, c.max_min);
+            i32MaxInto(&p6.max_invd, c.max_invd);
+            p6.sum_amount += c.sum_amount;
+            p6.sum_orig += c.sum_orig;
+            p6.sum_nonrec += c.sum_nonrec;
+            p6.sum_orignonrec += c.sum_orignonrec;
+            p6.sum_icid += c.sum_icid;
+            p6.sum_er += c.sum_er;
+            p6.sum_plan += c.sum_plan;
+            p6.sum_hadj += c.sum_hadj;
+        }
+        var p15 = P15Cap{};
+        for (p15caps) |*c| {
+            p15.rows += c.rows;
+            i32MaxInto(&p15.max_proj, c.max_proj);
+            i32MaxInto(&p15.max_div, c.max_div);
+            i32MaxInto(&p15.max_month, c.max_month);
+            i32MaxInto(&p15.max_date, c.max_date);
+            i32MaxInto(&p15.max_min, c.max_min);
+            for (0..8) |s| try strMax(allocator, &p15.max_str[s], c.max_str[s]);
+            p15.sum_amount += c.sum_amount;
+            p15.sum_orig += c.sum_orig;
+            p15.sum_nonrec += c.sum_nonrec;
+            p15.sum_orignonrec += c.sum_orignonrec;
+            p15.sum_er += c.sum_er;
+            p15.sum_hadj += c.sum_hadj;
+            p15.sum_icid += c.sum_icid;
+            p15.sum_plan += c.sum_plan;
+            p15.sum_rn += c.sum_rn;
+        }
 
-    var d0: [12]u8 = undefined;
-    var d1: [12]u8 = undefined;
-    var d2: [12]u8 = undefined;
-    var ph: [5]u64 = @splat(0);
-    for (phase_ticks) |p| {
-        for (0..5) |k| ph[k] += p[k];
-    }
-    std.debug.print(
-        "rf_custom D pass={d}: open={d:.0}ms bc={d:.0}ms build={d:.0}ms scan={d:.0}ms stages={d:.0}ms wall={d:.0}ms total={d:.0}ms union_rows={d} est_rows={d} agg_rows={d} final_rows={d}\n",
-        .{ pass, open_ms, bc_ms, build_ms, scan_ms, stage_ms, prof.ticksToMs(prof.nowTicks() - t_pass), prof.ticksToMs(prof.nowTicks() - t_all), union_total, est_total, agg_total, p15.rows },
-    );
-    std.debug.print(
-        "stage core-time (summed over {d} threads): sortkeys={d:.0}ms gather+est={d:.0}ms currency={d:.0}ms prerecords+agg={d:.0}ms gapfill+updown+tail={d:.0}ms\n",
-        .{
-            n_threads,
-            prof.ticksToMs(@intCast(ph[0])), prof.ticksToMs(@intCast(ph[1])), prof.ticksToMs(@intCast(ph[2])),
-            prof.ticksToMs(@intCast(ph[3])), prof.ticksToMs(@intCast(ph[4])),
-        },
-    );
-    if (validate) std.debug.print(
-        "p5sums: sum_planId={d} sum_rn1={d} sum_rn2={d} sum_hasAdjustment={d}\n",
-        .{ p5.ipid, p5.rn1, p5.rn2, p5.hadj },
-    );
-    {
-        var b0: [12]u8 = undefined;
-        var b1: [12]u8 = undefined;
-        var b2: [12]u8 = undefined;
-        var b3: [12]u8 = undefined;
-        if (validate) std.debug.print(
-            "p6cap: g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={s} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={s} s9={d} s10={d} s11={d} s12={d} s13={s} s14={d} s15={d:.6} s16={d} s17={d}\n",
-            .{
-                p6.max_proj,                   p6.max_div,
-                p6.max_str[0] orelse "null",   dateStr(&b0, p6.max_month),
-                p6.max_str[1] orelse "null",   p6.max_str[2] orelse "null",
-                p6.max_str[3] orelse "null",   p6.max_str[4] orelse "null",
-                p6.max_str[5] orelse "null",   p6.max_str[6] orelse "null",
-                dateStr(&b1, p6.max_bill),     dateStr(&b2, p6.max_min),
-                dateStr(&b3, p6.max_invd),     p6.sum_amount,
-                p6.sum_orig,                   p6.sum_nonrec,
-                p6.sum_orignonrec,             p6.max_str[7] orelse "null",
-                p6.sum_icid,                   p6.sum_er,
-                p6.sum_plan,                   p6.sum_hadj,
-            },
-        );
-        var c0: [12]u8 = undefined;
-        var c1: [12]u8 = undefined;
-        var c2: [12]u8 = undefined;
+        var d0: [12]u8 = undefined;
+        var d1: [12]u8 = undefined;
+        var d2: [12]u8 = undefined;
+        var ph: [5]u64 = @splat(0);
+        for (phase_ticks) |p| {
+            for (0..5) |k| ph[k] += p[k];
+        }
         std.debug.print(
-            "p15cap: rows_out=1 g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={s} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={d} s9={d} s10={d} s11={d} s12={d:.6} s13={d} s14={s} s15={d} s16={d} s17..32=0 s33={d} (cap_groups~{d})\n",
+            "rf_custom D pass={d}: open={d:.0}ms bc={d:.0}ms build={d:.0}ms scan={d:.0}ms stages={d:.0}ms wall={d:.0}ms total={d:.0}ms union_rows={d} est_rows={d} agg_rows={d} final_rows={d}\n",
+            .{ pass, open_ms, bc_ms, build_ms, scan_ms, stage_ms, prof.ticksToMs(prof.nowTicks() - t_pass), prof.ticksToMs(prof.nowTicks() - t_all), union_total, est_total, agg_total, p15.rows },
+        );
+        std.debug.print(
+            "stage core-time (summed over {d} threads): sortkeys={d:.0}ms gather+est={d:.0}ms currency={d:.0}ms prerecords+agg={d:.0}ms gapfill+updown+tail={d:.0}ms\n",
             .{
-                p15.max_proj,                  p15.max_div,
-                p15.max_str[0] orelse "null",  dateStr(&c0, p15.max_month),
-                p15.max_str[1] orelse "null",  p15.max_str[2] orelse "null",
-                p15.max_str[3] orelse "null",  p15.max_str[4] orelse "null",
-                p15.max_str[5] orelse "null",  p15.max_str[6] orelse "null",
-                dateStr(&c1, p15.max_date),    dateStr(&c2, p15.max_min),
-                p15.sum_amount,                p15.sum_orig,
-                p15.sum_nonrec,                p15.sum_orignonrec,
-                p15.sum_er,                    p15.sum_hadj,
-                p15.max_str[7] orelse "null",  p15.sum_icid,
-                p15.sum_plan,                  p15.sum_rn,
-                p15.rows,
+                n_threads,
+                prof.ticksToMs(@intCast(ph[0])),
+                prof.ticksToMs(@intCast(ph[1])),
+                prof.ticksToMs(@intCast(ph[2])),
+                prof.ticksToMs(@intCast(ph[3])),
+                prof.ticksToMs(@intCast(ph[4])),
             },
         );
-    }
-    if (validate) std.debug.print(
-        "p3cap: rows_out=1 g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={d} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={s} s9={s} s10={d} s11={s} s12={s} s13={s} s14={s} s15={s} s16={d}\n",
-        .{
-            cap.max_int[0],                 cap.max_int[1],
-            cap.max_str[0] orelse "null",   dateStr(&d0, cap.max_date[0]),
-            cap.max_str[1] orelse "null",   cap.sum_orig,
-            cap.max_str[2] orelse "null",   dateStr(&d1, cap.max_date[1]),
-            dateStr(&d2, cap.max_date[2]),  cap.max_str[3] orelse "null",
-            cap.max_str[4] orelse "null",   cap.max_str[5] orelse "null",
-            cap.max_str[6] orelse "null",   cap.max_str[7] orelse "null",
-            cap.sum_icid,                   cap.max_str[8] orelse "null",
-            cap.max_str[9] orelse "null",   cap.max_str[10] orelse "null",
-            cap.max_str[11] orelse "null",  cap.max_str[12] orelse "null",
-            cap.sum_amount,
-        },
-    );
+        if (validate) std.debug.print(
+            "p5sums: sum_planId={d} sum_rn1={d} sum_rn2={d} sum_hasAdjustment={d}\n",
+            .{ p5.ipid, p5.rn1, p5.rn2, p5.hadj },
+        );
+        {
+            var b0: [12]u8 = undefined;
+            var b1: [12]u8 = undefined;
+            var b2: [12]u8 = undefined;
+            var b3: [12]u8 = undefined;
+            if (validate) std.debug.print(
+                "p6cap: g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={s} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={s} s9={d} s10={d} s11={d} s12={d} s13={s} s14={d} s15={d:.6} s16={d} s17={d}\n",
+                .{
+                    p6.max_proj,                 p6.max_div,
+                    p6.max_str[0] orelse "null", dateStr(&b0, p6.max_month),
+                    p6.max_str[1] orelse "null", p6.max_str[2] orelse "null",
+                    p6.max_str[3] orelse "null", p6.max_str[4] orelse "null",
+                    p6.max_str[5] orelse "null", p6.max_str[6] orelse "null",
+                    dateStr(&b1, p6.max_bill),   dateStr(&b2, p6.max_min),
+                    dateStr(&b3, p6.max_invd),   p6.sum_amount,
+                    p6.sum_orig,                 p6.sum_nonrec,
+                    p6.sum_orignonrec,           p6.max_str[7] orelse "null",
+                    p6.sum_icid,                 p6.sum_er,
+                    p6.sum_plan,                 p6.sum_hadj,
+                },
+            );
+            var c0: [12]u8 = undefined;
+            var c1: [12]u8 = undefined;
+            var c2: [12]u8 = undefined;
+            std.debug.print(
+                "p15cap: rows_out=1 g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={s} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={d} s9={d} s10={d} s11={d} s12={d:.6} s13={d} s14={s} s15={d} s16={d} s17..32=0 s33={d} (cap_groups~{d})\n",
+                .{
+                    p15.max_proj,                 p15.max_div,
+                    p15.max_str[0] orelse "null", dateStr(&c0, p15.max_month),
+                    p15.max_str[1] orelse "null", p15.max_str[2] orelse "null",
+                    p15.max_str[3] orelse "null", p15.max_str[4] orelse "null",
+                    p15.max_str[5] orelse "null", p15.max_str[6] orelse "null",
+                    dateStr(&c1, p15.max_date),   dateStr(&c2, p15.max_min),
+                    p15.sum_amount,               p15.sum_orig,
+                    p15.sum_nonrec,               p15.sum_orignonrec,
+                    p15.sum_er,                   p15.sum_hadj,
+                    p15.max_str[7] orelse "null", p15.sum_icid,
+                    p15.sum_plan,                 p15.sum_rn,
+                    p15.rows,
+                },
+            );
+        }
+        if (validate) std.debug.print(
+            "p3cap: rows_out=1 g0={?d} g1={?d} g2={s} g3={s} s0={s} s1={d} s2={s} s3={s} s4={s} s5={s} s6={s} s7={s} s8={s} s9={s} s10={d} s11={s} s12={s} s13={s} s14={s} s15={s} s16={d}\n",
+            .{
+                cap.max_int[0],                cap.max_int[1],
+                cap.max_str[0] orelse "null",  dateStr(&d0, cap.max_date[0]),
+                cap.max_str[1] orelse "null",  cap.sum_orig,
+                cap.max_str[2] orelse "null",  dateStr(&d1, cap.max_date[1]),
+                dateStr(&d2, cap.max_date[2]), cap.max_str[3] orelse "null",
+                cap.max_str[4] orelse "null",  cap.max_str[5] orelse "null",
+                cap.max_str[6] orelse "null",  cap.max_str[7] orelse "null",
+                cap.sum_icid,                  cap.max_str[8] orelse "null",
+                cap.max_str[9] orelse "null",  cap.max_str[10] orelse "null",
+                cap.max_str[11] orelse "null", cap.max_str[12] orelse "null",
+                cap.sum_amount,
+            },
+        );
 
         // Per-pass teardown (shard/exchange buffers are pooled — see above).
         allocator.free(caps);

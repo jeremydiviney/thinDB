@@ -147,7 +147,9 @@ test "snapshot: scan straddling a flush sees pre-flush rows; writer keeps progre
     }
     // New scan sees the flushed segment (id=100) and any subsequent memtable rows.
     var has100: bool = false;
-    for (ids2.items) |id| if (id == 100) { has100 = true; };
+    for (ids2.items) |id| if (id == 100) {
+        has100 = true;
+    };
     try std.testing.expect(has100);
 }
 

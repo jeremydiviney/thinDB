@@ -11,7 +11,6 @@ const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
 const Column = types.Column;
 const Type = types.Type;
-const Value = types.Value;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;

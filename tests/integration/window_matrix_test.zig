@@ -92,7 +92,9 @@ test "row_number: single partition basics" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
     try f.exec(allocator, "INSERT INTO t VALUES (1), (2), (3), (4)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT row_number() OVER (ORDER BY id ASC) AS rn FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -107,7 +109,9 @@ test "row_number: PARTITION BY restarts per group" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 2)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT row_number() OVER (PARTITION BY g ORDER BY id ASC) AS rn FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -122,7 +126,9 @@ test "row_number: singleton partition emits just 1" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT row_number() OVER (PARTITION BY g ORDER BY id ASC) AS rn FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -141,7 +147,9 @@ test "rank: all-tied partition gets rank 1 everywhere" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 100), (2, 100), (3, 100)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT rank() OVER (ORDER BY score ASC) AS rk FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -156,7 +164,9 @@ test "rank: gaps after ties" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 90), (2, 90), (3, 80), (4, 70), (5, 70)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT rank() OVER (ORDER BY score DESC) AS rk FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -171,7 +181,9 @@ test "dense_rank: no gaps after ties" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 90), (2, 90), (3, 80), (4, 70), (5, 70)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT dense_rank() OVER (ORDER BY score DESC) AS drk FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -190,7 +202,9 @@ test "lag: default offset=1 with NULL fallback" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT lag(v) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -205,7 +219,9 @@ test "lag: offset=2" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT lag(v, 2, 0) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -220,7 +236,9 @@ test "lag: offset larger than partition uses default" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT lag(v, 5, 999) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -235,7 +253,9 @@ test "lead: symmetric to lag, forward offset" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT lead(v, 1, 0) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -250,7 +270,9 @@ test "lag: column-ref default returns current row's value" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT lag(v, 1, v) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -292,7 +314,8 @@ test "window output schema tracks guaranteed nullability" {
     try std.testing.expectEqual(@as(usize, 15), schema.len);
     const expected_nullable = [_]bool{
         false, false, false, false, false, false, false,
-        true, false, false, true, true, true, true, true,
+        true,  false, false, true,  true,  true,  true,
+        true,
     };
     for (schema, expected_nullable) |column, nullable| {
         try std.testing.expectEqual(nullable, column.nullable);
@@ -315,7 +338,9 @@ test "first_value: returns partition's first value" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 1, 100), (2, 1, 200), (3, 2, 999)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT first_value(v) OVER (PARTITION BY g ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -332,7 +357,9 @@ test "last_value: with default frame returns current row's value" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT last_value(v) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -347,7 +374,9 @@ test "last_value: with ROWS UNBOUNDED FOLLOWING returns partition's last" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT last_value(v) OVER (ORDER BY id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -362,11 +391,15 @@ test "nth_value: returns NULL when n exceeds frame, value otherwise" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT nth_value(v, 2) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
-    var qv = try runSql(allocator, f.db,
+    var qv = try runSql(
+        allocator,
+        f.db,
         "SELECT nth_value(v, 2) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer qv.deinit();
@@ -389,7 +422,9 @@ test "sum: running, single partition" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT sum(v) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -404,7 +439,9 @@ test "sum: whole-partition broadcast" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 100)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT sum(v) OVER (PARTITION BY g) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -419,7 +456,9 @@ test "sum: ROWS BETWEEN 1 PRECEDING AND CURRENT ROW" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT sum(v) OVER (ORDER BY id ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -434,7 +473,9 @@ test "count(*): partition size broadcast" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 1), (2, 1), (3, 1), (4, 2)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT count(*) OVER (PARTITION BY g) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -449,7 +490,9 @@ test "avg: running average over running frame" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT avg(v) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -464,7 +507,9 @@ test "min: running" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20), (4, 5)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT min(v) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -479,7 +524,9 @@ test "max: running" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20), (4, 50)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT max(v) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -494,7 +541,9 @@ test "min: string column lexicographic" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT NOT NULL)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 'zeta'), (2, 'alpha'), (3, 'mu')");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT min(name) OVER () FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -514,7 +563,9 @@ test "ntile: 10 rows / 4 buckets → 3,3,2,2 distribution" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
     try f.exec(allocator, "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT ntile(4) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -529,7 +580,9 @@ test "ntile: n > N gives each row its own bucket" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
     try f.exec(allocator, "INSERT INTO t VALUES (1), (2), (3)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT ntile(10) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -545,7 +598,9 @@ test "ntile: n = 1 puts every row in bucket 1" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
     try f.exec(allocator, "INSERT INTO t VALUES (1), (2), (3), (4)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT ntile(1) OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -564,7 +619,9 @@ test "percent_rank: singleton partition returns 0" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
     try f.exec(allocator, "INSERT INTO t VALUES (1)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT percent_rank() OVER (ORDER BY id ASC) FROM t",
     );
     defer q.deinit();
@@ -579,7 +636,9 @@ test "percent_rank: distinct values, distributed evenly" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
     try f.exec(allocator, "INSERT INTO t VALUES (1), (2), (3), (4), (5)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT percent_rank() OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -594,7 +653,9 @@ test "cume_dist: distinct values give 1/N, 2/N, ..." {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
     try f.exec(allocator, "INSERT INTO t VALUES (1), (2), (3), (4)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT cume_dist() OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -609,7 +670,9 @@ test "cume_dist: peer rows share the value" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 20), (4, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT cume_dist() OVER (ORDER BY score ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -628,11 +691,15 @@ test "lag IGNORE NULLS: skips null source rows" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, NULL), (4, 40)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT lag(v) IGNORE NULLS OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
-    var qv = try runSql(allocator, f.db,
+    var qv = try runSql(
+        allocator,
+        f.db,
         "SELECT lag(v) IGNORE NULLS OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer qv.deinit();
@@ -653,7 +720,9 @@ test "first_value IGNORE NULLS: skips leading nulls" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 30)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT first_value(v) IGNORE NULLS OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -668,7 +737,9 @@ test "first_value IGNORE NULLS: all-null partition returns NULL" {
     defer f.close();
     try f.exec(allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     try f.exec(allocator, "INSERT INTO t VALUES (1, NULL), (2, NULL)");
-    var q = try runSql(allocator, f.db,
+    var q = try runSql(
+        allocator,
+        f.db,
         "SELECT first_value(v) IGNORE NULLS OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
     );
     defer q.deinit();

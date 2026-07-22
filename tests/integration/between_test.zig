@@ -51,7 +51,9 @@ test "BETWEEN: composes with AND/OR" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE qty BETWEEN 10 AND 30 AND id > 2 ORDER BY id ASC",
     );
     defer allocator.free(ids);

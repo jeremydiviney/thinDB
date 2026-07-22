@@ -17,10 +17,14 @@ const collectBigints = helpers.collectBigints;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30)",
     );
     const tt = try db.openTable("t", .{});
@@ -36,7 +40,9 @@ test "qualified col: t.col against unaliased scan resolves via prefix strip" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT t.id FROM t WHERE t.qty > 15 ORDER BY t.id ASC",
     );
     defer allocator.free(ids);
@@ -51,7 +57,9 @@ test "qualified col: bare col against aliased scan resolves via suffix match" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t AS a WHERE qty > 15 ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -66,7 +74,9 @@ test "qualified col: aliased a.col resolves directly" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT a.id FROM t AS a WHERE a.qty >= 20 ORDER BY a.id ASC",
     );
     defer allocator.free(ids);
@@ -81,7 +91,9 @@ test "qualified col: aliased col vs literal predicate" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT a.id FROM t AS a WHERE a.qty = 20",
     );
     defer allocator.free(ids);
@@ -96,16 +108,22 @@ test "qualified col: self-join on aliased copies of same table" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE emp (id BIGINT PRIMARY KEY, manager_id BIGINT NOT NULL, name VARCHAR(16) NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO emp (id, manager_id, name) VALUES (1, 0, 'alice'), (2, 1, 'bob'), (3, 1, 'carol'), (4, 2, 'dave')",
     );
     const tt = try db.openTable("emp", .{});
     try tt.flush();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT e.id FROM emp AS e JOIN emp AS m ON e.manager_id = m.id ORDER BY e.id ASC",
     );
     defer allocator.free(ids);
@@ -120,7 +138,9 @@ test "qualified col: aliased col in ORDER BY" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT a.id FROM t AS a ORDER BY a.qty DESC",
     );
     defer allocator.free(ids);

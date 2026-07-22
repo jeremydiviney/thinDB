@@ -24,14 +24,18 @@ test "CASE WHEN: literal branches, ELSE present" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 5), (2, 50), (3, 500)");
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT CASE WHEN qty < 10 THEN 'small' WHEN qty < 100 THEN 'medium' ELSE 'large' END AS bucket FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -50,14 +54,18 @@ test "CASE WHEN: ELSE-less form emits NULL for unmatched rows" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 5), (2, 50)");
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT CASE WHEN qty < 10 THEN 'small' END AS bucket FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -76,14 +84,18 @@ test "CASE WHEN: integer branches via column ref" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO t (id, a, b) VALUES (1, 10, 20), (2, 30, 5)");
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT CASE WHEN a < 25 THEN a ELSE b END AS picked FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -101,7 +113,9 @@ test "CASE WHEN: first-true wins across overlapping conditions" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 5)");
@@ -109,7 +123,9 @@ test "CASE WHEN: first-true wins across overlapping conditions" {
     try t.flush();
 
     // qty=5 matches BOTH conditions; first one wins.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT CASE WHEN qty < 100 THEN 'small' WHEN qty < 1000 THEN 'medium' ELSE 'large' END AS bucket FROM t",
     );
     defer q.deinit();
@@ -125,16 +141,22 @@ test "CASE WHEN: AND/OR conditions in WHEN" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, region VARCHAR(8) NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, qty, region) VALUES (1, 5, 'east'), (2, 50, 'west'), (3, 5, 'west')",
     );
     const t = try db.openTable("t", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT CASE WHEN qty < 10 AND region = 'west' THEN 'small-west' ELSE 'other' END AS label FROM t ORDER BY id ASC",
     );
     defer q.deinit();
@@ -156,7 +178,8 @@ test "CASE WHEN: rejects branches with mismatched types" {
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(),
+    const root = try thindb.sql.parse(
+        arena.allocator(),
         "SELECT CASE WHEN qty < 10 THEN 1 ELSE 'big' END AS mix FROM t",
     );
     const cq = thindb.net.compile(allocator, db, root);

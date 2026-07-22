@@ -451,7 +451,6 @@ fn sendCommandComplete(allocator: Allocator, w: *std.Io.Writer, rows: u64) !void
     try result.sendCommandComplete(allocator, w, tag);
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

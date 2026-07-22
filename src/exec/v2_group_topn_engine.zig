@@ -15,7 +15,8 @@ const types = @import("../types.zig");
 const exec = @import("exec.zig");
 const storage = @import("../storage/storage.zig");
 
-const HarnessCore = exec.group_topn_harness_core;
+const SiloCore = exec.silo_group_core;
+const platform = @import("../util/platform.zig");
 const udf_mod = @import("../udf.zig");
 
 const DEFAULT_DOP: usize = 12;
@@ -441,7 +442,7 @@ pub const AggregateSpec = struct {
     udf_entry: ?udf_mod.AggregateEntry = null,
     udf_state_index: u16 = 0,
     udf_arg_count: u8 = 0,
-    udf_arg_input_indices: [HarnessCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** HarnessCore.MAX_GROUP_UDF_ARGS,
+    udf_arg_input_indices: [SiloCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** SiloCore.MAX_GROUP_UDF_ARGS,
 };
 
 pub const StringAggInput = struct {
@@ -476,7 +477,7 @@ pub const Shape = struct {
     // Per-group HAVING predicate applied during the capped all-groups emit, so
     // only HAVING survivors count toward `emit_all_groups_cap`. Null when there
     // is no HAVING.
-    emit_filter: ?HarnessCore.EmitFilter = null,
+    emit_filter: ?SiloCore.EmitFilter = null,
     // The group key is a hash of the key columns (string / >128-bit keys); each
     // staged row carries its __rowloc so the real key values are recovered at
     // emit via late materialization. Forces the u128 key lane + rowref region.
@@ -521,7 +522,7 @@ pub const Times = struct {
 
 pub const Result = struct {
     allocator: Allocator,
-    rows: []HarnessCore.TopRow = &.{},
+    rows: []SiloCore.TopRow = &.{},
     params: Params,
     times: Times = .{},
 
@@ -533,7 +534,7 @@ pub const Result = struct {
 
 const AsyncWorkspaceTeardownTask = struct {
     allocator: Allocator,
-    workspace: HarnessCore.SiloGridWorkspace,
+    workspace: SiloCore.SiloGridWorkspace,
     cpus: []usize,
     n_workers: usize,
     trace_timing: bool,
@@ -566,7 +567,7 @@ pub fn run(allocator: Allocator, request: RunRequest) !Result {
     try validateGroupChunkShape(request.shape, request.params);
 
     const t_layout = exec.prof.nowTicks();
-    var layout = try HarnessCore.cpuLayout(allocator);
+    var layout = try platform.cpuLayout(allocator);
     defer layout.deinit(allocator);
     var times = Times{ .cpu_layout_ticks = exec.prof.nowTicks() - t_layout };
 
@@ -614,14 +615,14 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     const arena_allocator = arena.allocator();
     errdefer arena.deinit();
 
-    var workspace: HarnessCore.SiloGridWorkspace = .{};
-    var rows: std.ArrayListUnmanaged(HarnessCore.TopRow) = .empty;
+    var workspace: SiloCore.SiloGridWorkspace = .{};
+    var rows: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
     try runHarness(arena_allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
-    const owned = try allocator.dupe(HarnessCore.TopRow, rows.items);
+    const owned = try allocator.dupe(SiloCore.TopRow, rows.items);
     times.result_copy_ticks = exec.prof.nowTicks() - copy_t0;
 
     const teardown_t0 = exec.prof.nowTicks();
@@ -631,10 +632,10 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
 }
 
 fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const usize, times: *Times) !Result {
-    var workspace: HarnessCore.SiloGridWorkspace = .{};
+    var workspace: SiloCore.SiloGridWorkspace = .{};
     errdefer workspace.deinitParallel(allocator, cpus.len, cpus, null);
 
-    var rows: std.ArrayListUnmanaged(HarnessCore.TopRow) = .empty;
+    var rows: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
@@ -664,7 +665,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
 // run count (≈ the union of all columns' run boundaries, conservatively their
 // sum) must leave an average run of ≥4 rows. Derived keys (absent from the
 // schema) and segment-less tables decline — per-row staging is the default.
-fn keyColumnsRunStructured(table: *api.Table, key_columns: []const HarnessCore.GroupKeyColumnSpec) bool {
+fn keyColumnsRunStructured(table: *api.Table, key_columns: []const SiloCore.GroupKeyColumnSpec) bool {
     if (key_columns.len == 0) return false;
     const segs = table.manifest.segments.items;
     if (segs.len == 0) return false;
@@ -702,10 +703,10 @@ fn runHarness(
     scan_columns: ?[]const []const u8,
     derived: []const exec.Derived,
     filter_expr: ?exec.PredicateExpr,
-    rows: *std.ArrayListUnmanaged(HarnessCore.TopRow),
-    workspace: *HarnessCore.SiloGridWorkspace,
+    rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
+    workspace: *SiloCore.SiloGridWorkspace,
 ) !void {
-    var group_key_columns_buf: [8]HarnessCore.GroupKeyColumnSpec = undefined;
+    var group_key_columns_buf: [8]SiloCore.GroupKeyColumnSpec = undefined;
     if (shape.group_key_inputs.len > group_key_columns_buf.len) return error.UnsupportedOperatorForType;
     for (shape.group_key_inputs, 0..) |input, i| {
         group_key_columns_buf[i] = .{
@@ -716,7 +717,7 @@ fn runHarness(
             .nullable = input.nullable,
         };
     }
-    var group_columns_buf: [16]HarnessCore.GroupColumnSpec = undefined;
+    var group_columns_buf: [16]SiloCore.GroupColumnSpec = undefined;
     if (shape.aggregate_inputs.len > group_columns_buf.len) return error.UnsupportedOperatorForType;
     var n_valid_lanes: u16 = 0;
     for (shape.aggregate_inputs, 0..) |input, i| {
@@ -731,12 +732,12 @@ fn runHarness(
         }, .source = try harnessColumnSource(input.source_name), .source_name = input.source_name, .nullable = input.nullable, .valid_index = n_valid_lanes };
         if (input.nullable) n_valid_lanes += 1;
     }
-    var group_str_columns_buf: [4]HarnessCore.GroupStrColumnSpec = undefined;
+    var group_str_columns_buf: [4]SiloCore.GroupStrColumnSpec = undefined;
     if (shape.string_aggregate_inputs.len > group_str_columns_buf.len) return error.UnsupportedOperatorForType;
     for (shape.string_aggregate_inputs, 0..) |sin, i| {
         group_str_columns_buf[i] = .{ .source_name = sin.source_name };
     }
-    var group_aggregates_buf: [16]HarnessCore.GroupAggregateSpec = undefined;
+    var group_aggregates_buf: [16]SiloCore.GroupAggregateSpec = undefined;
     if (shape.aggregate_program.len > group_aggregates_buf.len) return error.UnsupportedOperatorForType;
     var distinct_slot_count: u16 = 0;
     var has_udf = false;
@@ -838,7 +839,7 @@ fn runHarness(
     for (shape.aggregate_program) |agg| {
         if (agg.is_concat) has_concat = true;
     }
-    const group_rows_layout = HarnessCore.GroupRowsLayout{
+    const group_rows_layout = SiloCore.GroupRowsLayout{
         .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..shape.aggregate_inputs.len],
@@ -882,7 +883,7 @@ fn runHarness(
         }
     }
 
-    try HarnessCore.runSiloGrid(allocator, table, cpus, .{
+    try SiloCore.runSiloGrid(allocator, table, cpus, .{
         .dop = params.dop,
         .bucket_count = params.bucket_count,
         .silo_grid = true,
@@ -931,13 +932,13 @@ fn derivedReadsColumn(allocator: Allocator, d: exec.Derived, name: []const u8) !
     return false;
 }
 
-fn harnessColumnSource(name: []const u8) !HarnessCore.GroupColumnSource {
+fn harnessColumnSource(name: []const u8) !SiloCore.GroupColumnSource {
     if (types.columnNameEql(name, "IsRefresh")) return .is_refresh;
     if (types.columnNameEql(name, "ResolutionWidth")) return .resolution_width;
     return .is_refresh;
 }
 
-inline fn harnessKeyWidth(width: KeyWidth) HarnessCore.GroupKeyWidth {
+inline fn harnessKeyWidth(width: KeyWidth) SiloCore.GroupKeyWidth {
     return switch (width) {
         .u32 => .u32,
         .u64 => .u64,
@@ -948,7 +949,7 @@ inline fn harnessKeyWidth(width: KeyWidth) HarnessCore.GroupKeyWidth {
 
 fn scheduleWorkspaceTeardown(
     allocator: Allocator,
-    workspace: *HarnessCore.SiloGridWorkspace,
+    workspace: *SiloCore.SiloGridWorkspace,
     n_workers: usize,
     cpus: []const usize,
     params: Params,
@@ -956,8 +957,8 @@ fn scheduleWorkspaceTeardown(
 ) i64 {
     const t0 = exec.prof.nowTicks();
     if (params.sync_teardown) {
-        var teardown_profile: HarnessCore.WorkspaceProfile = .{};
-        const profile_ptr: ?*HarnessCore.WorkspaceProfile = if (params.trace_timing) &teardown_profile else null;
+        var teardown_profile: SiloCore.WorkspaceProfile = .{};
+        const profile_ptr: ?*SiloCore.WorkspaceProfile = if (params.trace_timing) &teardown_profile else null;
         workspace.deinitParallel(allocator, n_workers, cpus, profile_ptr);
         if (profile_ptr) |profile| profile.printTeardown(query_label, params.bucket_count);
         return exec.prof.nowTicks() - t0;
@@ -983,8 +984,8 @@ fn scheduleWorkspaceTeardown(
     };
     workspace.* = .{};
     const thread = std.Thread.spawn(.{}, asyncWorkspaceTeardown, .{task}) catch {
-        var teardown_profile: HarnessCore.WorkspaceProfile = .{};
-        const profile_ptr: ?*HarnessCore.WorkspaceProfile = if (params.trace_timing) &teardown_profile else null;
+        var teardown_profile: SiloCore.WorkspaceProfile = .{};
+        const profile_ptr: ?*SiloCore.WorkspaceProfile = if (params.trace_timing) &teardown_profile else null;
         task.workspace.deinitParallel(allocator, n_workers, cpus_copy, profile_ptr);
         if (profile_ptr) |profile| profile.printTeardown(query_label, params.bucket_count);
         allocator.free(cpus_copy);
@@ -996,8 +997,8 @@ fn scheduleWorkspaceTeardown(
 }
 
 fn asyncWorkspaceTeardown(task: *AsyncWorkspaceTeardownTask) void {
-    var teardown_profile: HarnessCore.WorkspaceProfile = .{};
-    const profile_ptr: ?*HarnessCore.WorkspaceProfile = if (task.trace_timing) &teardown_profile else null;
+    var teardown_profile: SiloCore.WorkspaceProfile = .{};
+    const profile_ptr: ?*SiloCore.WorkspaceProfile = if (task.trace_timing) &teardown_profile else null;
     task.workspace.deinitParallel(task.allocator, task.n_workers, task.cpus, profile_ptr);
     if (profile_ptr) |profile| {
         profile.printTeardown(task.query_label, task.bucket_count);

@@ -41,8 +41,6 @@ const join_mod = @import("join.zig");
 const Spec = join_mod.Spec;
 
 const cell_io = @import("cell_io.zig");
-const appendNullTo = cell_io.appendNullTo;
-const appendOneFromBuild = cell_io.appendOneFromBuild;
 
 const output_batch_rows: usize = 1024;
 
@@ -126,7 +124,6 @@ pub const NestedLoopJoin = struct {
         right: Query,
         spec: Spec,
     ) !Query {
-
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
@@ -561,4 +558,3 @@ fn isStringTag(t: TypeTag) bool {
         else => false,
     };
 }
-

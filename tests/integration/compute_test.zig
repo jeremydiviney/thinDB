@@ -474,14 +474,22 @@ test "compute: conversion — numeric widening, narrowing, parsing, stringifying
     defer q.deinit();
 
     // Schema is: id, i, bi, d, s, b, then 12 derived → 18 cols total.
-    var i_to_bi: std.ArrayList(i64) = .empty; defer i_to_bi.deinit(allocator);
-    var i_to_d: std.ArrayList(f64) = .empty; defer i_to_d.deinit(allocator);
-    var bi_to_i: std.ArrayList(i32) = .empty; defer bi_to_i.deinit(allocator);
-    var d_to_i: std.ArrayList(i32) = .empty; defer d_to_i.deinit(allocator);
-    var s_to_i: std.ArrayList(i32) = .empty; defer s_to_i.deinit(allocator);
-    var s_to_d: std.ArrayList(f64) = .empty; defer s_to_d.deinit(allocator);
-    var i_to_s_concat: std.ArrayList(u8) = .empty; defer i_to_s_concat.deinit(allocator);
-    var b_to_s_concat: std.ArrayList(u8) = .empty; defer b_to_s_concat.deinit(allocator);
+    var i_to_bi: std.ArrayList(i64) = .empty;
+    defer i_to_bi.deinit(allocator);
+    var i_to_d: std.ArrayList(f64) = .empty;
+    defer i_to_d.deinit(allocator);
+    var bi_to_i: std.ArrayList(i32) = .empty;
+    defer bi_to_i.deinit(allocator);
+    var d_to_i: std.ArrayList(i32) = .empty;
+    defer d_to_i.deinit(allocator);
+    var s_to_i: std.ArrayList(i32) = .empty;
+    defer s_to_i.deinit(allocator);
+    var s_to_d: std.ArrayList(f64) = .empty;
+    defer s_to_d.deinit(allocator);
+    var i_to_s_concat: std.ArrayList(u8) = .empty;
+    defer i_to_s_concat.deinit(allocator);
+    var b_to_s_concat: std.ArrayList(u8) = .empty;
+    defer b_to_s_concat.deinit(allocator);
 
     while (try q.next()) |b| {
         try i_to_bi.appendSlice(allocator, b.values[6].data.bigint[0..b.row_count]);
@@ -542,10 +550,14 @@ test "compute: hash — md5, sha1, sha256, crc32 produce expected digests" {
     });
     defer q.deinit();
 
-    var md5_concat: std.ArrayList(u8) = .empty; defer md5_concat.deinit(allocator);
-    var sha1_concat: std.ArrayList(u8) = .empty; defer sha1_concat.deinit(allocator);
-    var sha256_concat: std.ArrayList(u8) = .empty; defer sha256_concat.deinit(allocator);
-    var crc: std.ArrayList(i64) = .empty; defer crc.deinit(allocator);
+    var md5_concat: std.ArrayList(u8) = .empty;
+    defer md5_concat.deinit(allocator);
+    var sha1_concat: std.ArrayList(u8) = .empty;
+    defer sha1_concat.deinit(allocator);
+    var sha256_concat: std.ArrayList(u8) = .empty;
+    defer sha256_concat.deinit(allocator);
+    var crc: std.ArrayList(i64) = .empty;
+    defer crc.deinit(allocator);
 
     while (try q.next()) |b| {
         const m = b.values[2].data.string;
@@ -593,9 +605,9 @@ test "compute: encoding — hex/unhex + base64 round-trips" {
     defer db.close();
     const t = try db.table("e", schema_basic, opts_basic);
     try t.insert(&.{
-        .{ .id = @as(i64, 1), .name = "Hi" },         // hex: 4869; base64: SGk=
-        .{ .id = @as(i64, 2), .name = "" },           // hex: ""; base64: ""
-        .{ .id = @as(i64, 3), .name = "thinDB!" },    // hex: 7468696e44422!; base64 ends with =
+        .{ .id = @as(i64, 1), .name = "Hi" }, // hex: 4869; base64: SGk=
+        .{ .id = @as(i64, 2), .name = "" }, // hex: ""; base64: ""
+        .{ .id = @as(i64, 3), .name = "thinDB!" }, // hex: 7468696e44422!; base64 ends with =
     });
     try t.flush();
 
@@ -612,8 +624,10 @@ test "compute: encoding — hex/unhex + base64 round-trips" {
     });
     defer q.deinit();
 
-    var hex_concat: std.ArrayList(u8) = .empty; defer hex_concat.deinit(allocator);
-    var b64_concat: std.ArrayList(u8) = .empty; defer b64_concat.deinit(allocator);
+    var hex_concat: std.ArrayList(u8) = .empty;
+    defer hex_concat.deinit(allocator);
+    var b64_concat: std.ArrayList(u8) = .empty;
+    defer b64_concat.deinit(allocator);
     while (try q.next()) |b| {
         const h = b.values[2].data.string;
         const b64 = b.values[3].data.string;
@@ -688,18 +702,18 @@ test "compute: kitchen sink — every registered scalar function asserts" {
     const schema_all = thindb.TableSchema{
         .columns = &.{
             .{ .name = "id", .type = .bigint },
-            .{ .name = "s", .type = .string },     // "  Hello  "
-            .{ .name = "ws", .type = .string },    // "world"
-            .{ .name = "i1", .type = .int },       // 7
-            .{ .name = "i2", .type = .int },       // 3
-            .{ .name = "bi1", .type = .bigint },   // 10
-            .{ .name = "bi2", .type = .bigint },   // 4
-            .{ .name = "d1", .type = .double },    // -2.5
-            .{ .name = "d2", .type = .double },    // 8.0
-            .{ .name = "dt", .type = .date },      // 20589 (2026-05-16)
-            .{ .name = "ts", .type = .datetime },  // 1779424200 * 1_000_000
+            .{ .name = "s", .type = .string }, // "  Hello  "
+            .{ .name = "ws", .type = .string }, // "world"
+            .{ .name = "i1", .type = .int }, // 7
+            .{ .name = "i2", .type = .int }, // 3
+            .{ .name = "bi1", .type = .bigint }, // 10
+            .{ .name = "bi2", .type = .bigint }, // 4
+            .{ .name = "d1", .type = .double }, // -2.5
+            .{ .name = "d2", .type = .double }, // 8.0
+            .{ .name = "dt", .type = .date }, // 20589 (2026-05-16)
+            .{ .name = "ts", .type = .datetime }, // 1779424200 * 1_000_000
             .{ .name = "num_str", .type = .string }, // "42"
-            .{ .name = "off1", .type = .int },     // 1
+            .{ .name = "off1", .type = .int }, // 1
         },
         .order_key = &.{"id"},
         .unique = true,
@@ -715,9 +729,12 @@ test "compute: kitchen sink — every registered scalar function asserts" {
             .id = @as(i64, 1),
             .s = @as([]const u8, "  Hello  "),
             .ws = @as([]const u8, "world"),
-            .i1 = @as(i32, 7), .i2 = @as(i32, 3),
-            .bi1 = @as(i64, 10), .bi2 = @as(i64, 4),
-            .d1 = @as(f64, -2.5), .d2 = @as(f64, 8.0),
+            .i1 = @as(i32, 7),
+            .i2 = @as(i32, 3),
+            .bi1 = @as(i64, 10),
+            .bi2 = @as(i64, 4),
+            .d1 = @as(f64, -2.5),
+            .d2 = @as(f64, 8.0),
             .dt = thindb.types.Date.fromDays(20589),
             .ts = thindb.types.DateTime.fromMicros(1_779_424_200_000_000),
             .num_str = @as([]const u8, "42"),
@@ -735,48 +752,48 @@ test "compute: kitchen sink — every registered scalar function asserts" {
     var base = try thindb.scan(allocator, t);
     var q = try base.compute(&.{
         // --- strings ---
-        .{ .name = "lower", .expr = try F.lower(aa, E.col("s")) },          // "  hello  "
-        .{ .name = "ltrim", .expr = try F.ltrim(aa, E.col("s")) },          // "Hello  "
-        .{ .name = "rtrim", .expr = try F.rtrim(aa, E.col("s")) },          // "  Hello"
-        .{ .name = "reverse", .expr = try F.reverse(aa, E.col("ws")) },     // "dlrow"
+        .{ .name = "lower", .expr = try F.lower(aa, E.col("s")) }, // "  hello  "
+        .{ .name = "ltrim", .expr = try F.ltrim(aa, E.col("s")) }, // "Hello  "
+        .{ .name = "rtrim", .expr = try F.rtrim(aa, E.col("s")) }, // "  Hello"
+        .{ .name = "reverse", .expr = try F.reverse(aa, E.col("ws")) }, // "dlrow"
         .{ .name = "concat", .expr = try F.concat(aa, &.{ E.col("ws"), E.col("ws") }) }, // "worldworld"
         .{ .name = "replace", .expr = try F.replace(aa, E.col("ws"), E.col("ws"), E.col("num_str")) }, // "42"
-        .{ .name = "octet_length", .expr = try F.octetLength(aa, E.col("ws")) },  // 5
-        .{ .name = "char_length", .expr = try F.charLength(aa, E.col("ws")) },    // 5
+        .{ .name = "octet_length", .expr = try F.octetLength(aa, E.col("ws")) }, // 5
+        .{ .name = "char_length", .expr = try F.charLength(aa, E.col("ws")) }, // 5
 
         // --- math ---
-        .{ .name = "abs_bi", .expr = try F.abs(aa, E.col("bi1")) },          // 10
-        .{ .name = "abs_d", .expr = try F.abs(aa, E.col("d1")) },             // 2.5
-        .{ .name = "round_d", .expr = try F.round(aa, E.col("d1")) },         // round(-2.5) = -3 (banker's) or -2? Zig @round → -3
-        .{ .name = "sign_d", .expr = try F.sign(aa, E.col("d1")) },           // -1
+        .{ .name = "abs_bi", .expr = try F.abs(aa, E.col("bi1")) }, // 10
+        .{ .name = "abs_d", .expr = try F.abs(aa, E.col("d1")) }, // 2.5
+        .{ .name = "round_d", .expr = try F.round(aa, E.col("d1")) }, // round(-2.5) = -3 (banker's) or -2? Zig @round → -3
+        .{ .name = "sign_d", .expr = try F.sign(aa, E.col("d1")) }, // -1
         .{ .name = "mod_i", .expr = try F.mod(aa, E.col("i1"), E.col("i2")) }, // 7 % 3 = 1
         .{ .name = "mod_bi", .expr = try F.mod(aa, E.col("bi1"), E.col("bi2")) }, // 10 % 4 = 2
         .{ .name = "pow_d", .expr = try F.pow(aa, E.col("d2"), E.col("d2")) }, // 8^8 = 16777216
-        .{ .name = "sqrt_d", .expr = try F.sqrt(aa, E.col("d2")) },           // sqrt(8) ≈ 2.828
-        .{ .name = "exp_d", .expr = try F.exp(aa, E.col("d2")) },             // exp(8) ≈ 2980.958
-        .{ .name = "ln_d", .expr = try F.ln(aa, E.col("d2")) },               // ln(8) ≈ 2.079
-        .{ .name = "log10_d", .expr = try F.log10(aa, E.col("d2")) },         // log10(8) ≈ 0.903
-        .{ .name = "log2_d", .expr = try F.log2(aa, E.col("d2")) },           // log2(8) = 3.0
-        .{ .name = "greatest_i", .expr = try F.greatest(aa, E.col("i1"), E.col("i2")) },  // 7
+        .{ .name = "sqrt_d", .expr = try F.sqrt(aa, E.col("d2")) }, // sqrt(8) ≈ 2.828
+        .{ .name = "exp_d", .expr = try F.exp(aa, E.col("d2")) }, // exp(8) ≈ 2980.958
+        .{ .name = "ln_d", .expr = try F.ln(aa, E.col("d2")) }, // ln(8) ≈ 2.079
+        .{ .name = "log10_d", .expr = try F.log10(aa, E.col("d2")) }, // log10(8) ≈ 0.903
+        .{ .name = "log2_d", .expr = try F.log2(aa, E.col("d2")) }, // log2(8) = 3.0
+        .{ .name = "greatest_i", .expr = try F.greatest(aa, E.col("i1"), E.col("i2")) }, // 7
         .{ .name = "greatest_bi", .expr = try F.greatest(aa, E.col("bi1"), E.col("bi2")) }, // 10
         .{ .name = "greatest_d", .expr = try F.greatest(aa, E.col("d1"), E.col("d2")) }, // 8.0
-        .{ .name = "least_i", .expr = try F.least(aa, E.col("i1"), E.col("i2")) },        // 3
-        .{ .name = "least_bi", .expr = try F.least(aa, E.col("bi1"), E.col("bi2")) },     // 4
-        .{ .name = "least_d", .expr = try F.least(aa, E.col("d1"), E.col("d2")) },        // -2.5
+        .{ .name = "least_i", .expr = try F.least(aa, E.col("i1"), E.col("i2")) }, // 3
+        .{ .name = "least_bi", .expr = try F.least(aa, E.col("bi1"), E.col("bi2")) }, // 4
+        .{ .name = "least_d", .expr = try F.least(aa, E.col("d1"), E.col("d2")) }, // -2.5
 
         // --- date ---
-        .{ .name = "minute_ts", .expr = try F.minute(aa, E.col("ts")) },  // 30
-        .{ .name = "second_ts", .expr = try F.second(aa, E.col("ts")) },  // 0
-        .{ .name = "d_plus1", .expr = try F.dateAdd(aa, E.col("dt"), E.col("off1")) },  // 20590 days
+        .{ .name = "minute_ts", .expr = try F.minute(aa, E.col("ts")) }, // 30
+        .{ .name = "second_ts", .expr = try F.second(aa, E.col("ts")) }, // 0
+        .{ .name = "d_plus1", .expr = try F.dateAdd(aa, E.col("dt"), E.col("off1")) }, // 20590 days
         .{ .name = "d_minus1", .expr = try F.dateSub(aa, E.col("dt"), E.col("off1")) }, // 20588 days
-        .{ .name = "ut", .expr = try F.unixTimestamp(aa, E.col("ts")) },  // 1779424200
+        .{ .name = "ut", .expr = try F.unixTimestamp(aa, E.col("ts")) }, // 1779424200
         .{ .name = "fut", .expr = try F.fromUnixtime(aa, E.col("bi1")) }, // 10 * 1_000_000
 
         // --- conversion (backfill) ---
-        .{ .name = "bi_to_d", .expr = try F.toDouble(aa, E.col("bi1")) },  // 10.0
+        .{ .name = "bi_to_d", .expr = try F.toDouble(aa, E.col("bi1")) }, // 10.0
         .{ .name = "ns_to_bi", .expr = try F.toBigint(aa, E.col("num_str")) }, // 42
-        .{ .name = "bi_to_s", .expr = try F.toString(aa, E.col("bi1")) },  // "10"
-        .{ .name = "d_to_s", .expr = try F.toString(aa, E.col("d2")) },    // "8" (or "8.0e0" depending on fmt)
+        .{ .name = "bi_to_s", .expr = try F.toString(aa, E.col("bi1")) }, // "10"
+        .{ .name = "d_to_s", .expr = try F.toString(aa, E.col("d2")) }, // "8" (or "8.0e0" depending on fmt)
     });
     defer q.deinit();
 
@@ -877,10 +894,10 @@ test "compute: coalesce returns first non-null + bookkeeps the output bitmap" {
     defer db.close();
     const t = try db.table("vals", schema_nullable, opts);
     try t.insert(&[_]struct { id: i64, a: ?[]const u8, b: ?[]const u8 }{
-        .{ .id = 1, .a = "alpha", .b = null },     // → "alpha", valid
-        .{ .id = 2, .a = null,    .b = "beta" },    // → "beta",  valid
-        .{ .id = 3, .a = "gamma", .b = "delta" },   // → "gamma", valid (first wins)
-        .{ .id = 4, .a = null,    .b = null },      // → null
+        .{ .id = 1, .a = "alpha", .b = null }, // → "alpha", valid
+        .{ .id = 2, .a = null, .b = "beta" }, // → "beta",  valid
+        .{ .id = 3, .a = "gamma", .b = "delta" }, // → "gamma", valid (first wins)
+        .{ .id = 4, .a = null, .b = null }, // → null
     });
     try t.flush();
 
@@ -918,4 +935,3 @@ test "compute: coalesce returns first non-null + bookkeeps the output bitmap" {
 
 // Coercion + the expanded scalar-function set (lpad/position/dayofweek/
 // date_format/etc) live in compute_scalar_test.zig.
-

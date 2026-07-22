@@ -1,5 +1,5 @@
 //! Keyed pipeline regions: the compiler for `WITH KEYED BY (...)` blocks
-//! (tasks #184/#185, REGION_PLAN.md §7).
+//! (tasks #184/#185, docs/plans/REGION_PLAN.md §7).
 //!
 //! The declaration is a hard contract: every GROUP BY / window PARTITION BY
 //! / TVF PARTITION BY in the block contains the declared keys (statically
@@ -2109,7 +2109,6 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     };
     if (std.mem.indexOfScalar(usize, range_keys, route_idx) == null) return NoMatch;
     b.route_name = b.fb.cols.items[route_idx].name;
-
 
     // Sort order within the consolidation: DECLARED keys first — every
     // coarser partition (span merge) retains exactly the declared keys, so

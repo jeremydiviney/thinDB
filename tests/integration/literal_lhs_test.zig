@@ -15,7 +15,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30)",
     );
     const tt = try db.openTable("t", .{});
@@ -83,7 +85,9 @@ test "literal-on-LHS: composes with AND" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE 1 = 1 AND 15 < qty ORDER BY id ASC",
     );
     defer allocator.free(ids);

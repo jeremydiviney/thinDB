@@ -14,13 +14,17 @@ const collectBigints = helpers.collectBigints;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL, c INT NOT NULL)",
     );
     // Chosen so a<5 / b=20 / c=30 each fall inside the observed column
     // range (no provable always-true/false collapse), and so AND-tighter
     // vs OR-tighter give different row sets — row 1 is the discriminator.
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, a, b, c) VALUES (1, 1, 99, 99), (2, 99, 20, 30), (3, 99, 20, 99), (4, 99, 99, 99)",
     );
     const t = try db.openTable("t", .{});
@@ -41,7 +45,9 @@ test "precedence: AND binds tighter than OR (no parens)" {
     //   row2: b=20 AND c=30 → T.                    ✓
     //   row3: a<5 F, b=20 AND c=30 F (c=99).        ✗
     //   row4: all F.                                ✗
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE a < 5 OR b = 20 AND c = 30 ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -58,7 +64,9 @@ test "precedence: explicit parens override the default grouping" {
 
     // (a<5 OR b=20) AND c=30 — forcing the other grouping drops row 1
     // (c=99), leaving only row 2. Proves parens reshape the tree.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE (a < 5 OR b = 20) AND c = 30 ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -75,7 +83,9 @@ test "precedence: NOT binds tighter than AND (no parens)" {
 
     // NOT a<5 AND b=20  ==  (NOT (a<5)) AND b=20 → a>=5 and b=20 → {2,3}.
     // If NOT bound looser (NOT (a<5 AND b=20)) every row would match.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE NOT a < 5 AND b = 20 ORDER BY id ASC",
     );
     defer allocator.free(ids);

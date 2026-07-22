@@ -14,7 +14,7 @@
 //!   order_by  BOTTOM (a global sort interleaves everything). A top-level
 //!             ORDER BY could be merge-finalized later; conservative for now.
 //!   join      K flows from the PRESERVED side (probe); the other side is
-//!             assumed broadcast (all wayroll joins are small dimensions —
+//!             assumed broadcast (the target workloads join small dimensions —
 //!             Phase 2 verifies with stats). FULL joins ⇒ BOTTOM.
 //!   union     K := name-meet of both arms (the rollforward arms share
 //!             names; positional mapping is a Phase-2 refinement).
@@ -139,7 +139,7 @@ fn boundary(child_op: *const ir.Op, child: Info) void {
 
 fn analyze(arena: Allocator, op: *const ir.Op, memo: *std.AutoHashMapUnmanaged(*const ir.Op, Info)) !Info {
     if (memo.get(op)) |hit| return hit;
-    const info = analyzeInner(arena, op, memo) catch |e| return e;
+    const info = try analyzeInner(arena, op, memo);
     try memo.put(arena, op, info);
     return info;
 }

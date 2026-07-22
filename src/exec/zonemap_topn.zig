@@ -52,7 +52,6 @@ const ColumnView = storage.ColumnView;
 
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
-const Memtable = engine.Memtable;
 const transform = engine.transform;
 
 const api = @import("../api/api.zig");
@@ -61,7 +60,6 @@ const Table = api.Table;
 const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
-const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
@@ -71,7 +69,7 @@ const SortSpec = @import("sort.zig").SortSpec;
 const rowloc = @import("rowloc.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
-const HarnessCore = exec.group_topn_harness_core;
+const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 
 /// One row group's identity + the offset of its best-corner prefix tuple in the
@@ -327,7 +325,7 @@ pub const ZonemapTopN = struct {
     /// loop inline on the main heap — the serial reference behavior.
     fn visitRowGroups(self: *ZonemapTopN, refs: []const RgRef) !void {
         const allocator = self.allocator;
-        var layout = HarnessCore.cpuLayout(allocator) catch HarnessCore.CpuLayout{ .order = &.{}, .physical_count = 0 };
+        var layout = platform.cpuLayout(allocator) catch platform.CpuLayout{ .order = &.{}, .physical_count = 0 };
         defer layout.deinit(allocator);
         const cpu_count = @max(@as(usize, 1), layout.order.len);
         const n_workers = @max(@as(usize, 1), @min(self.dop, @min(cpu_count, refs.len)));

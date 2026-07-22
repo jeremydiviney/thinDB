@@ -18,12 +18,16 @@ const exec = helpers.exec;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, ip BIGINT NOT NULL, region BIGINT NOT NULL)",
     );
     // Three distinct ip values; region varies independently of ip so the
     // two-independent-column control has real cross products.
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, ip, region) VALUES " ++
             "(1, 100, 1), (2, 100, 1), (3, 100, 2), " ++
             "(4, 200, 1), (5, 200, 2), " ++
@@ -50,7 +54,8 @@ test "fd-collapse: Q35-shape drops derived keys, recomputes above the aggregate"
     // GROUP BY ip, ip-1, ip-2 — the two subtractions are pure functions of
     // `ip`, so they collapse. The GroupBy groups on `ip` alone; a Compute
     // above it recomputes the dropped keys for output order.
-    const text = try planText(arena.allocator(),
+    const text = try planText(
+        arena.allocator(),
         "SELECT ip, ip - 1, ip - 2, COUNT(*) AS c FROM t GROUP BY ip, ip - 1, ip - 2 ORDER BY c DESC LIMIT 10",
     );
     try std.testing.expectEqualStrings(
@@ -73,7 +78,9 @@ test "fd-collapse: Q35-shape results identical to grouping on ip alone" {
     defer db.close();
 
     // Deterministic tiebreak: ORDER BY c DESC, ip ASC.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT ip, ip - 1, ip - 2, COUNT(*) AS c FROM t GROUP BY ip, ip - 1, ip - 2 ORDER BY c DESC, ip ASC",
     );
     defer q.deinit();
@@ -106,7 +113,8 @@ test "fd-collapse: constant group key (GROUP BY 1, col) drops the constant" {
 
     // SELECT item 1 is the literal `1`; GROUP BY 1 references it by ordinal.
     // A constant key adds no distinctions → collapses, recomputed above.
-    const text = try planText(arena.allocator(),
+    const text = try planText(
+        arena.allocator(),
         "SELECT 1, region, COUNT(*) AS c FROM t GROUP BY 1, region ORDER BY c DESC LIMIT 10",
     );
     try std.testing.expectEqualStrings(
@@ -128,7 +136,9 @@ test "fd-collapse: constant group key results identical" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT 1, region, COUNT(*) AS c FROM t GROUP BY 1, region ORDER BY c DESC, region ASC",
     );
     defer q.deinit();
@@ -160,7 +170,8 @@ test "fd-collapse: two independent columns are NOT collapsed (control)" {
     // `ip` and `region` are independent plain columns — neither is a function
     // of the other, so the GroupBy keeps both keys and no extra Compute is
     // inserted. The plan must be byte-identical to the pre-rewrite shape.
-    const text = try planText(arena.allocator(),
+    const text = try planText(
+        arena.allocator(),
         "SELECT ip, region, COUNT(*) AS c FROM t GROUP BY ip, region ORDER BY c DESC LIMIT 10",
     );
     try std.testing.expectEqualStrings(
@@ -180,7 +191,8 @@ test "fd-collapse: non-collapsible derived key (function of a NON-key) stays bel
     // `region - 1` references `region`, which is NOT a group key here — so it
     // is not a function of the retained keys and must stay a below-aggregate
     // derived key (computed once per input row, grouped on directly).
-    const text = try planText(arena.allocator(),
+    const text = try planText(
+        arena.allocator(),
         "SELECT ip, region - 1, COUNT(*) AS c FROM t GROUP BY ip, region - 1 ORDER BY c DESC LIMIT 10",
     );
     try std.testing.expectEqualStrings(
@@ -202,7 +214,8 @@ test "fd-collapse: all-constant GROUP BY is left alone (no anchor to collapse on
     // GROUP BY 1 — the only key is a constant. Collapsing it would turn the
     // aggregate global, which differs on empty input. With no plain-column
     // anchor to retain, the rewrite bails and the key stays below.
-    const text = try planText(arena.allocator(),
+    const text = try planText(
+        arena.allocator(),
         "SELECT 1, COUNT(*) AS c FROM t GROUP BY 1",
     );
     try std.testing.expectEqualStrings(

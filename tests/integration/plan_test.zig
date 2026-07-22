@@ -97,7 +97,7 @@ test "plan: linear pipeline — scan + filter + select via PlanBuilder" {
         &.{ "id", "label" },
     );
 
-    var q = try pb.compile(allocator, db,root);
+    var q = try pb.compile(allocator, db, root);
     defer q.deinit();
 
     var ids: std.ArrayList(i64) = .empty;
@@ -127,7 +127,7 @@ test "plan: multi-branched — join two independently scanned tables" {
         .algorithm = .auto,
     });
 
-    var q = try pb.compile(allocator, db,joined);
+    var q = try pb.compile(allocator, db, joined);
     defer q.deinit();
 
     var rows: usize = 0;
@@ -163,7 +163,7 @@ test "plan: filter both branches independently before joining" {
         .algorithm = .auto,
     });
 
-    var q = try pb.compile(allocator, db,joined);
+    var q = try pb.compile(allocator, db, joined);
     defer q.deinit();
 
     var matched: usize = 0;
@@ -202,7 +202,7 @@ test "plan: join-of-join (A ⋈ B) ⋈ C" {
         },
     );
 
-    var q = try pb.compile(allocator, db,abc);
+    var q = try pb.compile(allocator, db, abc);
     defer q.deinit();
 
     var matched: usize = 0;
@@ -261,7 +261,7 @@ test "plan: compute on one branch before joining + aggregate over result" {
     // Aggregate: count joined rows.
     const counted = try pb.groupBy(joined, &.{}, &.{.{ .func = .count, .as = "n" }});
 
-    var q = try pb.compile(allocator, db,counted);
+    var q = try pb.compile(allocator, db, counted);
     defer q.deinit();
 
     const batch = (try q.next()).?;

@@ -331,7 +331,6 @@ pub const LateScan = struct {
         }
     }
 
-
     fn appendMemtableRow(self: *LateScan, row: usize) !void {
         const snap = self.materialize_snap_override orelse self.inner_scan.memtableSnap();
         const one = [_]u32{@intCast(row)};

@@ -17,10 +17,14 @@ const exec = helpers.exec;
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE li (id BIGINT PRIMARY KEY, price BIGINT NOT NULL, qty BIGINT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO li (id, price, qty) VALUES (1, 100, 2), (2, 200, 3), (3, 50, 5)",
     );
     const t = try db.openTable("li", .{});
@@ -67,7 +71,9 @@ test "agg on expr: mixed with plain col agg" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(price) AS total_price, SUM(price * qty) AS rev FROM li",
     );
     defer q.deinit();
@@ -86,16 +92,22 @@ test "agg on expr: GROUP BY column with agg-on-expr" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE sales (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL, price BIGINT NOT NULL, qty BIGINT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO sales (id, region, price, qty) VALUES (1, 'east', 10, 2), (2, 'east', 20, 3), (3, 'west', 30, 1)",
     );
     const t = try db.openTable("sales", .{});
     try t.flush();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT region, SUM(price * qty) AS rev FROM sales GROUP BY region ORDER BY region ASC",
     );
     defer q.deinit();
@@ -133,10 +145,14 @@ test "agg on expr: SUM(CASE WHEN ...) with GROUP BY" {
     defer tmp.cleanup();
     const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE sales (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL, amount INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO sales (id, region, amount) VALUES " ++
             "(1, 'east', 50), (2, 'east', 150), (3, 'east', 80), " ++
             "(4, 'west', 200), (5, 'west', 90)",
@@ -145,7 +161,9 @@ test "agg on expr: SUM(CASE WHEN ...) with GROUP BY" {
     try tt.flush();
 
     // big_count: count of orders with amount > 100, per region.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT region, SUM(CASE WHEN amount > 100 THEN 1 ELSE 0 END) AS big_count " ++
             "FROM sales GROUP BY region ORDER BY region ASC",
     );
@@ -166,10 +184,14 @@ test "agg on expr: SUM(CASE WHEN ...) — revenue when active" {
     defer tmp.cleanup();
     const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE orders (id BIGINT PRIMARY KEY, status VARCHAR(8) NOT NULL, amount INT NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO orders (id, status, amount) VALUES " ++
             "(1, 'active', 100), (2, 'cancel', 50), (3, 'active', 200), (4, 'active', 75)",
     );
@@ -177,7 +199,9 @@ test "agg on expr: SUM(CASE WHEN ...) — revenue when active" {
     try tt.flush();
 
     // SUM(CASE WHEN status='active' THEN amount ELSE 0) = sum of active amounts.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(CASE WHEN status = 'active' THEN amount ELSE 0 END) AS active_rev FROM orders",
     );
     defer q.deinit();

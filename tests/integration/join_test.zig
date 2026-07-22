@@ -2269,7 +2269,7 @@ test "skew: no-skew query with detection enabled runs normally" {
     defer tmp.cleanup();
 
     const schema_l = thindb.TableSchema{
-        .columns = &.{ .{ .name = "k", .type = .bigint } },
+        .columns = &.{.{ .name = "k", .type = .bigint }},
         .order_key = &.{"k"},
         .unique = true,
     };
@@ -2368,7 +2368,7 @@ test "memory: budget = 0 disables tracking (default)" {
     defer db.close();
 
     const schema = thindb.TableSchema{
-        .columns = &.{ .{ .name = "id", .type = .bigint } },
+        .columns = &.{.{ .name = "id", .type = .bigint }},
         .order_key = &.{"id"},
         .unique = true,
     };

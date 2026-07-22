@@ -394,10 +394,14 @@ test "wal: SQL DELETE FROM survives close-without-flush + reopen" {
             .auto_flush_bytes = 64 * 1024 * 1024,
         });
         defer db.close();
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
         );
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
         );
         try sql_helpers.exec(allocator, db, "DELETE FROM t WHERE qty > 20");
@@ -421,15 +425,21 @@ test "wal: SQL DELETE with AND/OR predicate replays correctly" {
     {
         var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
         defer db.close();
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, region VARCHAR(8) NOT NULL)",
         );
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "INSERT INTO t (id, qty, region) VALUES " ++
                 "(1, 10, 'east'), (2, 20, 'east'), (3, 30, 'west'), (4, 100, 'west')",
         );
         // (region = 'east' AND qty > 15) OR id = 4 → ids 2 + 4.
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "DELETE FROM t WHERE (region = 'east' AND qty > 15) OR id = 4",
         );
     }
@@ -450,10 +460,14 @@ test "wal: SQL UPDATE replays via DELETE + INSERT entries" {
     {
         var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
         defer db.close();
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
         );
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30)",
         );
         try sql_helpers.exec(allocator, db, "UPDATE t SET qty = 999 WHERE id = 2");
@@ -480,10 +494,14 @@ test "wal: DELETE FROM t (no WHERE) wipes the memtable on replay" {
     {
         var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
         defer db.close();
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
         );
-        try sql_helpers.exec(allocator, db,
+        try sql_helpers.exec(
+            allocator,
+            db,
             "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20)",
         );
         try sql_helpers.exec(allocator, db, "DELETE FROM t");
@@ -495,4 +513,3 @@ test "wal: DELETE FROM t (no WHERE) wipes the memtable on replay" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{}, ids);
 }
-

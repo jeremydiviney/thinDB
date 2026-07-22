@@ -19,7 +19,6 @@ const Type = types.Type;
 const Value = types.Value;
 const Column = types.Column;
 const TableSchema = types.TableSchema;
-const TypeTag = types.TypeTag;
 const ValueTag = types.ValueTag;
 
 const storage = @import("../storage/storage.zig");

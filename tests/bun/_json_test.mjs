@@ -1,5 +1,5 @@
 // JSON type + extraction regression over the mysql wire. Needs a server on
-// :7953 with a WRITABLE scratch data dir (NOT the wayroll/clickbench DBs):
+// :7953 with a WRITABLE scratch data dir (not a shared/production data dir):
 //   ./zig-out/bin/thindb-server.exe --data-dir .json-db --mysql-port 7953 \
 //     --pg-port 0 --native-port 0 --max-dop 4
 import mysql from "mysql2/promise";

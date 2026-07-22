@@ -20,7 +20,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
     );
     const t = try db.openTable("t", .{});
@@ -37,7 +39,9 @@ test "scalar subquery: WHERE col > (SELECT MIN(...))" {
     defer db.close();
 
     // MIN(qty) = 10 → rows with qty > 10 are ids 2, 3, 4, 5.
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE qty > (SELECT MIN(qty) FROM t) ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -52,7 +56,9 @@ test "scalar subquery: WHERE col = (SELECT MAX(...))" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE qty = (SELECT MAX(qty) FROM t)",
     );
     defer allocator.free(ids);
@@ -67,7 +73,9 @@ test "scalar subquery: projection — (SELECT ...) AS alias" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT id, (SELECT MAX(qty) FROM t) AS top FROM t ORDER BY id ASC LIMIT 2",
     );
     defer q.deinit();
@@ -88,14 +96,18 @@ test "scalar subquery: composes with HAVING" {
     defer db.close();
 
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL, qty INT NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, region, qty) VALUES (1, 'east', 5), (2, 'east', 100), (3, 'west', 10), (4, 'west', 50)",
     );
     const t = try db.openTable("t", .{});
     try t.flush();
 
     // total_qty per region > (SELECT MIN(qty) FROM t) = 5
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT region, SUM(qty) AS total FROM t GROUP BY region HAVING total > (SELECT MIN(qty) FROM t) ORDER BY region ASC",
     );
     defer q.deinit();
@@ -113,7 +125,8 @@ test "scalar subquery: multi-row error" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(),
+    const root = try thindb.sql.parse(
+        arena.allocator(),
         "SELECT id FROM t WHERE qty > (SELECT qty FROM t)",
     );
     const cq = thindb.net.compile(allocator, db, root);
@@ -136,7 +149,8 @@ test "scalar subquery: multi-column error" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(),
+    const root = try thindb.sql.parse(
+        arena.allocator(),
         "SELECT id FROM t WHERE qty > (SELECT id, qty FROM t LIMIT 1)",
     );
     const cq = thindb.net.compile(allocator, db, root);

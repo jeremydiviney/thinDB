@@ -31,8 +31,8 @@ fn usToStr(buf: []u8, us: i128) []const u8 {
         d -= ml;
     }
     return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
-        year,                             month + 1,                      d + 1,
-        @divFloor(secs_in_day, 3600),     @mod(@divFloor(secs_in_day, 60), 60), @mod(secs_in_day, 60),
+        year,                         month + 1,                            d + 1,
+        @divFloor(secs_in_day, 3600), @mod(@divFloor(secs_in_day, 60), 60), @mod(secs_in_day, 60),
     }) catch "?";
 }
 
@@ -192,10 +192,10 @@ pub fn main(init: std.process.Init) !u8 {
                 const understated = !bad_sentinel and (actual_max > claimed.max or actual_min < claimed.min);
                 if (bad_sentinel or understated) {
                     std.debug.print("segment {d} rg {d} rows={d}: VIOLATION claimed[{d},{d}] actual[{d},{d}] ({s}..{s}) nulls claimed={d} actual={d}\n", .{
-                        entry.segment_id,          rgi,                        rg.row_count,
-                        claimed.min,               claimed.max,                actual_min,
-                        actual_max,                encFmt(&buf1, actual_min), encFmt(&buf2, actual_max),
-                        claimed.null_count,        actual_nulls,
+                        entry.segment_id,   rgi,                       rg.row_count,
+                        claimed.min,        claimed.max,               actual_min,
+                        actual_max,         encFmt(&buf1, actual_min), encFmt(&buf2, actual_max),
+                        claimed.null_count, actual_nulls,
                     });
                     seg_violations += 1;
                 }

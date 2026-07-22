@@ -11,7 +11,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL, qty INT NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, region, qty) VALUES (1, 'east', 10), (2, 'east', 20), (3, 'west', 5), (4, 'north', 100), (5, 'east', 30)",
     );
     const t = try db.openTable("t", .{});
@@ -27,7 +29,9 @@ test "HAVING: filters by aggregate alias" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT region, COUNT(id) AS cnt FROM t GROUP BY region HAVING cnt > 1 ORDER BY region ASC",
     );
     defer q.deinit();
@@ -45,7 +49,9 @@ test "HAVING: filters by grouped column" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT region, SUM(qty) AS total FROM t GROUP BY region HAVING region = 'east'",
     );
     defer q.deinit();

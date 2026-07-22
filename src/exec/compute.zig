@@ -38,7 +38,6 @@ const scalar_fn = @import("scalar_fn.zig");
 const scalar_common = @import("scalar_fn_common.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const simd = @import("../util/simd.zig");
-const NullStrategy = scalar_fn.NullStrategy;
 const udf_mod = @import("../udf.zig");
 
 const cast = @import("cast.zig");

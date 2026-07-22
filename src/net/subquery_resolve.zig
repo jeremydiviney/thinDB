@@ -34,7 +34,6 @@ const TableSchema = types.TableSchema;
 const Value = types.Value;
 
 const exec = @import("../exec/exec.zig");
-const Query = exec.Query;
 const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
 

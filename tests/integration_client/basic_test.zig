@@ -211,9 +211,9 @@ test "where: leaf predicate filters rows server-side" {
     const db = thindb.net.underlyingDb(conn);
     const orders = try db.table("orders", schema_v1, opts_v1);
     try orders.insert(&.{
-        .{ .id = @as(i64, 1), .qty = @as(i32, 100), .active = true,  .tag = "a" },
-        .{ .id = @as(i64, 2), .qty = @as(i32, 50),  .active = false, .tag = "b" },
-        .{ .id = @as(i64, 3), .qty = @as(i32, 200), .active = true,  .tag = "c" },
+        .{ .id = @as(i64, 1), .qty = @as(i32, 100), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 50), .active = false, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 200), .active = true, .tag = "c" },
     });
     try orders.flush();
 
@@ -241,7 +241,7 @@ test "where alias filter: same behavior under both names" {
     const db = thindb.net.underlyingDb(conn);
     const orders = try db.table("orders", schema_v1, opts_v1);
     try orders.insert(&.{
-        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true,  .tag = "x" },
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "x" },
         .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "y" },
     });
     try orders.flush();
@@ -367,11 +367,11 @@ test "where + orderBy + limit chain (top-N)" {
     const db = thindb.net.underlyingDb(conn);
     const orders = try db.table("orders", schema_v1, opts_v1);
     try orders.insert(&.{
-        .{ .id = @as(i64, 1), .qty = @as(i32, 30), .active = true,  .tag = "c" },
-        .{ .id = @as(i64, 2), .qty = @as(i32, 10), .active = true,  .tag = "a" },
+        .{ .id = @as(i64, 1), .qty = @as(i32, 30), .active = true, .tag = "c" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 10), .active = true, .tag = "a" },
         .{ .id = @as(i64, 3), .qty = @as(i32, 50), .active = false, .tag = "e" },
-        .{ .id = @as(i64, 4), .qty = @as(i32, 20), .active = true,  .tag = "b" },
-        .{ .id = @as(i64, 5), .qty = @as(i32, 40), .active = true,  .tag = "d" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 20), .active = true, .tag = "b" },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 40), .active = true, .tag = "d" },
     });
     try orders.flush();
 
@@ -402,11 +402,11 @@ test "groupBy: sum with group, ordered desc — the canonical analytics query" {
     const db = thindb.net.underlyingDb(conn);
     const orders = try db.table("orders", schema_v1, opts_v1);
     try orders.insert(&.{
-        .{ .id = @as(i64, 1), .qty = @as(i32, 100), .active = true,  .tag = "a" },
-        .{ .id = @as(i64, 2), .qty = @as(i32, 200), .active = true,  .tag = "b" },
-        .{ .id = @as(i64, 3), .qty = @as(i32, 50),  .active = false, .tag = "a" },
-        .{ .id = @as(i64, 4), .qty = @as(i32, 75),  .active = true,  .tag = "a" },
-        .{ .id = @as(i64, 5), .qty = @as(i32, 300), .active = true,  .tag = "b" },
+        .{ .id = @as(i64, 1), .qty = @as(i32, 100), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 200), .active = true, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 50), .active = false, .tag = "a" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 75), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 5), .qty = @as(i32, 300), .active = true, .tag = "b" },
     });
     try orders.flush();
 
@@ -456,9 +456,9 @@ test "aggregate: global (no group keys) emits one row" {
 
     var base = try conn.scan("orders");
     var q = try base.aggregate(&.{
-        .{ .func = .count, .col = null,  .as = "n" },
-        .{ .func = .sum,   .col = "qty", .as = "total" },
-        .{ .func = .avg,   .col = "qty", .as = "avg_q" },
+        .{ .func = .count, .col = null, .as = "n" },
+        .{ .func = .sum, .col = "qty", .as = "total" },
+        .{ .func = .avg, .col = "qty", .as = "avg_q" },
     });
     defer q.deinit();
 
@@ -538,9 +538,9 @@ test "pipe: compose a sub-pipeline as a Query→Query function" {
     const db = thindb.net.underlyingDb(conn);
     const orders = try db.table("orders", schema_v1, opts_v1);
     try orders.insert(&.{
-        .{ .id = @as(i64, 1), .qty = @as(i32, 5),   .active = true,  .tag = "a" },
-        .{ .id = @as(i64, 2), .qty = @as(i32, 50),  .active = false, .tag = "b" },
-        .{ .id = @as(i64, 3), .qty = @as(i32, 500), .active = true,  .tag = "c" },
+        .{ .id = @as(i64, 1), .qty = @as(i32, 5), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 50), .active = false, .tag = "b" },
+        .{ .id = @as(i64, 3), .qty = @as(i32, 500), .active = true, .tag = "c" },
     });
     try orders.flush();
 

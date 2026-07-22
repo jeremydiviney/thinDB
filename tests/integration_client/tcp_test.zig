@@ -194,9 +194,9 @@ test "tcp: insert rows + read back via scan, all over the socket" {
 
     const Row = struct { id: i64, qty: i32, active: bool, tag: []const u8 };
     try conn.insert("orders", &[_]Row{
-        .{ .id = 1, .qty = 10, .active = true,  .tag = "a" },
+        .{ .id = 1, .qty = 10, .active = true, .tag = "a" },
         .{ .id = 2, .qty = 20, .active = false, .tag = "bb" },
-        .{ .id = 3, .qty = 30, .active = true,  .tag = "ccc" },
+        .{ .id = 3, .qty = 30, .active = true, .tag = "ccc" },
     });
     try conn.flush("orders");
 
@@ -282,9 +282,9 @@ test "tcp: insert with nullable fields preserves nulls through scan" {
 
     const Row = struct { id: i64, qty: ?i32, note: ?[]const u8 };
     try conn.insert("events", &[_]Row{
-        .{ .id = 1, .qty = 10,   .note = "hello" },
+        .{ .id = 1, .qty = 10, .note = "hello" },
         .{ .id = 2, .qty = null, .note = "world" },
-        .{ .id = 3, .qty = 30,   .note = null },
+        .{ .id = 3, .qty = 30, .note = null },
         .{ .id = 4, .qty = null, .note = null },
     });
     try conn.flush("events");
@@ -353,7 +353,7 @@ test "tcp: insert accepts the &.{ ... } tuple shape over the wire" {
     defer conn.close();
 
     try conn.insert("orders", &.{
-        .{ .id = @as(i64, 100), .qty = @as(i32, 1), .active = true,  .tag = @as([]const u8, "x") },
+        .{ .id = @as(i64, 100), .qty = @as(i32, 1), .active = true, .tag = @as([]const u8, "x") },
         .{ .id = @as(i64, 200), .qty = @as(i32, 2), .active = false, .tag = @as([]const u8, "y") },
     });
     try conn.flush("orders");
@@ -726,10 +726,10 @@ test "tcp: delete with leaf predicate removes matching rows + returns count" {
 
     const t = try server.db.table("orders", schema_v1, opts_v1);
     try t.insert(&.{
-        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true,  .tag = "a" },
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
         .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
         .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = false, .tag = "c" },
-        .{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true,  .tag = "d" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true, .tag = "d" },
     });
     try t.flush();
 
@@ -788,10 +788,10 @@ test "tcp: query with where + limit returns the right rows" {
 
     const t = try server.db.table("orders", schema_v1, opts_v1);
     try t.insert(&.{
-        .{ .id = @as(i64, 1), .qty = @as(i32, 10),  .active = true,  .tag = "a" },
-        .{ .id = @as(i64, 2), .qty = @as(i32, 100), .active = true,  .tag = "b" },
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 100), .active = true, .tag = "b" },
         .{ .id = @as(i64, 3), .qty = @as(i32, 200), .active = false, .tag = "c" },
-        .{ .id = @as(i64, 4), .qty = @as(i32, 300), .active = true,  .tag = "d" },
+        .{ .id = @as(i64, 4), .qty = @as(i32, 300), .active = true, .tag = "d" },
     });
     try t.flush();
 

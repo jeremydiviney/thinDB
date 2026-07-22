@@ -19,7 +19,9 @@ test "DEFAULT: integer literal fills omitted column" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL DEFAULT 100)",
     );
     try exec(allocator, db, "INSERT INTO t (id) VALUES (1), (2)");
@@ -42,7 +44,9 @@ test "DEFAULT: text literal fills omitted column" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, role VARCHAR(16) NOT NULL DEFAULT 'member')",
     );
     try exec(allocator, db, "INSERT INTO t (id) VALUES (1)");
@@ -66,7 +70,9 @@ test "DEFAULT: boolean literal" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, active BOOLEAN NOT NULL DEFAULT TRUE)",
     );
     try exec(allocator, db, "INSERT INTO t (id) VALUES (1)");
@@ -87,11 +93,15 @@ test "DEFAULT: NOT NULL without DEFAULT still rejects omitted column" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)",
     );
     // qty is NOT NULL with no default → omitting it must error.
-    try expectRunError(allocator, db,
+    try expectRunError(
+        allocator,
+        db,
         "INSERT INTO t (id) VALUES (1)",
         thindb.net.Error.ColumnNotFound,
     );
@@ -105,7 +115,9 @@ test "DEFAULT: provided value overrides default" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL DEFAULT 100)",
     );
     try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 5), (2, 200)");
@@ -129,7 +141,9 @@ test "DEFAULT: type mismatch rejected at CREATE TABLE" {
 
     // BIGINT column with a text DEFAULT — the literal's value tag
     // doesn't match the declared column type.
-    try expectRunError(allocator, db,
+    try expectRunError(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY, qty BIGINT DEFAULT 'oops')",
         thindb.net.Error.TypeMismatch,
     );
@@ -145,7 +159,9 @@ test "DEFAULT: survives reopen via schema.bin (v3 round-trip)" {
     {
         var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
         defer db.close();
-        try exec(allocator, db,
+        try exec(
+            allocator,
+            db,
             "CREATE TABLE t (id BIGINT PRIMARY KEY, role VARCHAR(8) NOT NULL DEFAULT 'guest')",
         );
         try exec(allocator, db, "INSERT INTO t (id) VALUES (1)");

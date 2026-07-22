@@ -5,9 +5,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const exec = @import("../../exec/exec.zig");
-const Batch = exec.Batch;
-
 const types = @import("../../types.zig");
 const Column = types.Column;
 const Type = types.Type;
@@ -223,4 +220,3 @@ test "pgTypeOf maps thinDB types to expected OIDs" {
     try std.testing.expectEqual(@as(i16, -1), pgTypeOf(.string).type_size);
     try std.testing.expectEqual(@as(i16, 8), pgTypeOf(.bigint).type_size);
 }
-

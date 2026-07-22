@@ -12,7 +12,6 @@ const Value = types.Value;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
-const sformat = @import("../storage/format.zig");
 const hll = @import("../util/hll.zig");
 const bloom_util = @import("../util/bloom.zig");
 const comparison = @import("../api/comparison.zig");
@@ -60,7 +59,6 @@ const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
 const PredicateOp = predicate.PredicateOp;
-const statsOverlapPredicate = predicate.statsOverlapPredicate;
 const filter_mod = @import("filter.zig");
 
 const rowloc = @import("rowloc.zig");
@@ -2614,7 +2612,14 @@ pub const Scan = struct {
     }
 
     fn fcmpFor(comptime o: PredicateOp, v: i128, w: i128) bool {
-        return switch (o) { .eq => v == w, .neq => v != w, .lt => v < w, .lte => v <= w, .gt => v > w, .gte => v >= w };
+        return switch (o) {
+            .eq => v == w,
+            .neq => v != w,
+            .lt => v < w,
+            .lte => v <= w,
+            .gt => v > w,
+            .gte => v >= w,
+        };
     }
 
     /// Run-aware analogue of `forCompareInto`: evaluate `value <op> want` ONCE

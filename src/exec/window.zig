@@ -28,7 +28,6 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const Column = types.Column;
 const Type = types.Type;
-const TypeTag = types.TypeTag;
 const Value = types.Value;
 
 const ir = @import("../ir/ir.zig");

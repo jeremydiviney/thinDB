@@ -1608,7 +1608,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // union is cast-free: rebatched()'s serial per-batch kernels
             // disappear, and a join's probe sink can forward into BOTH arms
             // (a cast arm otherwise pins the union's serial lane — on the
-            // wayroll rollforward that lane carried the heavy 3.2M-row arm).
+            // production rollforward workload that lane carried the heavy 3.2M-row arm).
             // The cast Compute fuses into the arm's stripe workers, or rides
             // the ChainForward terminal push when a probe later chains
             // through it; worst case it evaluates where rebatched would

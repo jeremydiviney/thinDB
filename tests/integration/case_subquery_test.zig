@@ -13,17 +13,25 @@ const runSql = helpers.runSql;
 fn setupUsersPayments(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR(16) NOT NULL)",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
     );
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE payments (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, amount INT NOT NULL)",
     );
     // alice has 2 payments, bob has 1, carol has 0.
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO payments (id, user_id, amount) VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)",
     );
     const t1 = try db.openTable("users", .{});
@@ -41,7 +49,9 @@ test "CASE WHEN EXISTS(correlated) — flag users with any payment" {
     var db = try setupUsersPayments(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT u.id, " ++
             "CASE WHEN EXISTS (SELECT p.id FROM payments AS p WHERE p.user_id = u.id) " ++
             "THEN 'yes' ELSE 'no' END AS has_payment " ++
@@ -63,7 +73,9 @@ test "CASE WHEN NOT EXISTS(correlated) — flag users without payment" {
     var db = try setupUsersPayments(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT u.id, " ++
             "CASE WHEN NOT EXISTS (SELECT p.id FROM payments AS p WHERE p.user_id = u.id) " ++
             "THEN 1 ELSE 0 END AS no_pmt " ++
@@ -85,7 +97,9 @@ test "SUM(CASE WHEN EXISTS(correlated) ...) — count users with payments" {
     var db = try setupUsersPayments(allocator, io, tmp.dir);
     defer db.close();
 
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT SUM(CASE WHEN EXISTS (SELECT p.id FROM payments AS p WHERE p.user_id = u.id) " ++
             "THEN 1 ELSE 0 END) AS active_users " ++
             "FROM users AS u",
@@ -105,7 +119,9 @@ test "CASE WHEN IN(correlated) — flag big spenders" {
 
     // u.id IN (SELECT p.user_id FROM payments p WHERE p.amount > 100)
     //   payments > 100: id=2 (user 1, amount 200). So only u.id=1 matches.
-    var q = try runSql(allocator, db,
+    var q = try runSql(
+        allocator,
+        db,
         "SELECT u.id, " ++
             "CASE WHEN u.id IN (SELECT p.user_id FROM payments AS p WHERE p.amount > 100) " ++
             "THEN 'big' ELSE 'small' END AS tier " ++

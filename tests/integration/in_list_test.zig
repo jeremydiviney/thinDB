@@ -13,7 +13,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, region VARCHAR(8) NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, region) VALUES (1, 'east'), (2, 'west'), (3, 'north'), (4, 'south'), (5, 'east')",
     );
     const t = try db.openTable("t", .{});
@@ -42,7 +44,9 @@ test "IN: text list" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE region IN ('east', 'west') ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -57,7 +61,9 @@ test "IN: NOT IN inverts" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE region NOT IN ('east', 'west') ORDER BY id ASC",
     );
     defer allocator.free(ids);

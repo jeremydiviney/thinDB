@@ -15,7 +15,9 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL)");
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "INSERT INTO t (id, a, b) VALUES (1, 10, 20), (2, 30, 30), (3, 50, 40), (4, 5, 5), (5, 100, 99)",
     );
     const t = try db.openTable("t", .{});
@@ -31,7 +33,9 @@ test "col op col: a < b" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE a < b ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -46,7 +50,9 @@ test "col op col: a = b" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE a = b ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -61,7 +67,9 @@ test "col op col: a > b" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE a > b ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -76,7 +84,9 @@ test "col op col: composes with AND on a col-vs-literal predicate" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const ids = try collectBigints(allocator, db,
+    const ids = try collectBigints(
+        allocator,
+        db,
         "SELECT id FROM t WHERE a > b AND id > 3 ORDER BY id ASC",
     );
     defer allocator.free(ids);
@@ -90,13 +100,16 @@ test "col op col: rejected when type tags differ" {
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE m (id BIGINT PRIMARY KEY, name VARCHAR(8) NOT NULL, qty INT NOT NULL)",
     );
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(),
+    const root = try thindb.sql.parse(
+        arena.allocator(),
         "SELECT id FROM m WHERE qty = name",
     );
     const cq = thindb.net.compile(allocator, db, root);

@@ -21,7 +21,9 @@ test "AUTO_INCREMENT: fills omitted column with monotonic counter" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO t (label) VALUES ('a'), ('b'), ('c')");
@@ -41,7 +43,9 @@ test "AUTO_INCREMENT: explicit value advances counter past it" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)",
     );
     // Caller supplies 50 explicitly — counter jumps to 51.
@@ -64,7 +68,9 @@ test "AUTO_INCREMENT: explicit value below counter leaves counter unchanged" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)",
     );
     // Burn ids 1..3 via omitted inserts.
@@ -90,7 +96,9 @@ test "AUTO_INCREMENT: explicit NULL on AI column behaves like omitted" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO t (id, label) VALUES (NULL, 'a'), (NULL, 'b')");
@@ -111,7 +119,9 @@ test "AUTO_INCREMENT: counter survives reopen (manifest v5 round-trip)" {
     {
         var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
         defer db.close();
-        try exec(allocator, db,
+        try exec(
+            allocator,
+            db,
             "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)",
         );
         try exec(allocator, db, "INSERT INTO t (label) VALUES ('a'), ('b'), ('c')");
@@ -138,7 +148,9 @@ test "AUTO_INCREMENT: rejected on non-integer types" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try expectRunError(allocator, db,
+    try expectRunError(
+        allocator,
+        db,
         "CREATE TABLE t (id VARCHAR(8) PRIMARY KEY AUTO_INCREMENT)",
         thindb.net.Error.TypeMismatch,
     );
@@ -152,7 +164,9 @@ test "AUTO_INCREMENT: rejected when two columns declare it" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try expectRunError(allocator, db,
+    try expectRunError(
+        allocator,
+        db,
         "CREATE TABLE t (a BIGINT PRIMARY KEY AUTO_INCREMENT, b BIGINT NOT NULL AUTO_INCREMENT)",
         thindb.net.Error.UnsupportedOp,
     );
@@ -166,7 +180,9 @@ test "AUTO_INCREMENT: rejected with DEFAULT alongside" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try expectRunError(allocator, db,
+    try expectRunError(
+        allocator,
+        db,
         "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT DEFAULT 42)",
         thindb.net.Error.UnsupportedOp,
     );
@@ -180,7 +196,9 @@ test "AUTO_INCREMENT: INT column width is respected" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try exec(allocator, db,
+    try exec(
+        allocator,
+        db,
         "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)",
     );
     try exec(allocator, db, "INSERT INTO t (label) VALUES ('a'), ('b')");

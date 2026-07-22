@@ -655,5 +655,4 @@ pub const Catalog = struct {
             if (!worked) Io.sleep(sleeper_io, duration, .awake) catch return;
         }
     }
-
 };
