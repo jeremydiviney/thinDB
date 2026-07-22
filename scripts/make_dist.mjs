@@ -58,7 +58,10 @@ try {
 } catch {
   gitVersion = "unknown";
 }
-const version = gitVersion.replace(/[^A-Za-z0-9._-]/g, "-");
+// Release builds pass THINDB_VERSION (x.y.z, computed by the workflow from
+// the VERSION file + commit distance); local/dev builds fall back to the git
+// describe string.
+const version = (process.env.THINDB_VERSION || gitVersion).replace(/[^A-Za-z0-9._-]/g, "-");
 
 const only = (() => {
   const i = process.argv.indexOf("--targets");
@@ -115,7 +118,7 @@ for (const t of targets) {
   }
 
   writeFileSync(join(bundle, "README.txt"),
-`thinDB ${version} (${t.plat})
+`thinDB ${version} (${t.plat}, ${gitVersion})
 ==============================
 
 Quick start:
