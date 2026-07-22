@@ -14,6 +14,7 @@
 //! linearly. Key `0` is the empty sentinel; a real key `0` is held in side fields.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -120,14 +121,30 @@ test "racy memory-pattern scaling (isolates atomics vs DRAM)" {
     const win = std.os.windows;
     const qpc = struct {
         fn now() i64 {
-            var c: win.LARGE_INTEGER = undefined;
-            _ = win.ntdll.RtlQueryPerformanceCounter(&c);
-            return c;
+            switch (builtin.os.tag) {
+                .windows => {
+                    var c: win.LARGE_INTEGER = undefined;
+                    _ = win.ntdll.RtlQueryPerformanceCounter(&c);
+                    return c;
+                },
+                .linux => {
+                    var ts: std.os.linux.timespec = undefined;
+                    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+                    return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+                },
+                else => return 0,
+            }
         }
         fn freq() i64 {
-            var f: win.LARGE_INTEGER = undefined;
-            _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
-            return f;
+            switch (builtin.os.tag) {
+                .windows => {
+                    var f: win.LARGE_INTEGER = undefined;
+                    _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
+                    return f;
+                },
+                .linux => return 1_000_000_000,
+                else => return 1,
+            }
         }
     };
     var threads: [64]std.Thread = undefined;
@@ -167,14 +184,30 @@ test "ConcurrentIntTable: throughput (Q9-shaped: 100M bumps, ~17M distinct, 12 t
     const win = std.os.windows;
     const qpc = struct {
         fn now() i64 {
-            var c: win.LARGE_INTEGER = undefined;
-            _ = win.ntdll.RtlQueryPerformanceCounter(&c);
-            return c;
+            switch (builtin.os.tag) {
+                .windows => {
+                    var c: win.LARGE_INTEGER = undefined;
+                    _ = win.ntdll.RtlQueryPerformanceCounter(&c);
+                    return c;
+                },
+                .linux => {
+                    var ts: std.os.linux.timespec = undefined;
+                    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+                    return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+                },
+                else => return 0,
+            }
         }
         fn freq() i64 {
-            var f: win.LARGE_INTEGER = undefined;
-            _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
-            return f;
+            switch (builtin.os.tag) {
+                .windows => {
+                    var f: win.LARGE_INTEGER = undefined;
+                    _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
+                    return f;
+                },
+                .linux => return 1_000_000_000,
+                else => return 1,
+            }
         }
     };
     var threads: [64]std.Thread = undefined;

@@ -22,14 +22,30 @@ fn envStr(name: [*:0]const u8) ?[]const u8 {
 // ---------------------------------------------------------------- timing
 const win = std.os.windows;
 fn qpcNow() i64 {
-    var c: win.LARGE_INTEGER = undefined;
-    _ = win.ntdll.RtlQueryPerformanceCounter(&c);
-    return c;
+    switch (builtin.os.tag) {
+        .windows => {
+            var c: win.LARGE_INTEGER = undefined;
+            _ = win.ntdll.RtlQueryPerformanceCounter(&c);
+            return c;
+        },
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+            return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+        },
+        else => return 0,
+    }
 }
 fn qpcFreq() i64 {
-    var f: win.LARGE_INTEGER = undefined;
-    _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
-    return f;
+    switch (builtin.os.tag) {
+        .windows => {
+            var f: win.LARGE_INTEGER = undefined;
+            _ = win.ntdll.RtlQueryPerformanceFrequency(&f);
+            return f;
+        },
+        .linux => return 1_000_000_000,
+        else => return 1,
+    }
 }
 fn msSince(t0: i64) f64 {
     return @as(f64, @floatFromInt(qpcNow() - t0)) / @as(f64, @floatFromInt(qpcFreq())) * 1000.0;
