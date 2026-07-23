@@ -20,14 +20,20 @@ pub const HASH_LEN: usize = 20;
 
 var salt_state: random_seed.State = .{ .anchor_mix = 0xA5A5_5A5A_DEAD_BEEF };
 
-/// Fill `out` with 20 unpredictable non-zero bytes. The salt is sent
-/// in cleartext as part of the HandshakeV10 packet, so the security
-/// requirement is only that a passive observer can't predict the
-/// next connection's salt from THIS one. Zero bytes are scrubbed
-/// because MySQL frames the salt with a NUL terminator.
+/// Fill `out` with 20 unpredictable bytes in the printable-ASCII range
+/// (0x21..0x7e). The salt is sent in cleartext in the HandshakeV10 packet,
+/// so the only security requirement is unpredictability across connections.
+///
+/// The printable-ASCII constraint matches what real MySQL and StarRocks send,
+/// and it is REQUIRED for compatibility: MySQL Connector/J (Java) mishandles
+/// salt bytes > 0x7f (signed-byte / charset decoding), computing its scramble
+/// against a corrupted salt and failing auth with "Access denied" — even
+/// though the C client (libmysqlclient) and Node mysql2 handle raw bytes and
+/// authenticate fine. Constraining to printable ASCII also keeps NUL out (the
+/// salt is framed with a NUL terminator in the packet).
 pub fn randomSalt(out: *[SALT_LEN]u8) void {
     random_seed.fill(&salt_state, out);
-    random_seed.replaceZeroBytes(out);
+    for (out) |*b| b.* = 0x21 + (b.* % 94);
 }
 
 /// Compute the expected 20-byte hash for a given password + salt.
@@ -174,8 +180,13 @@ test "verify accepts empty client_response when password is empty" {
     try std.testing.expect(!verify("", salt, "anything"));
 }
 
-test "randomSalt produces non-zero bytes" {
+test "randomSalt produces only printable-ASCII bytes" {
+    // MySQL Connector/J mishandles salt bytes > 0x7f, so the salt must stay in
+    // the printable-ASCII range (0x21..0x7e) — also NUL-free for packet framing.
     var s: [SALT_LEN]u8 = undefined;
-    randomSalt(&s);
-    for (s[0..]) |b| try std.testing.expect(b != 0);
+    var iter: usize = 0;
+    while (iter < 64) : (iter += 1) {
+        randomSalt(&s);
+        for (s[0..]) |b| try std.testing.expect(b >= 0x21 and b <= 0x7e);
+    }
 }
