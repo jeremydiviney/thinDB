@@ -48,14 +48,6 @@ pub fn fill(state: *State, out: []u8) void {
     @memcpy(out, digest[0..out.len]);
 }
 
-/// Mutate every zero byte to 1. MySQL's salt encoding embeds a NUL
-/// terminator after the salt bytes, so the salt itself must be NUL-free.
-pub fn replaceZeroBytes(buf: []u8) void {
-    for (buf) |*b| if (b.* == 0) {
-        b.* = 1;
-    };
-}
-
 test "fill produces deterministic output for the same state pair" {
     var s1: State = .{ .anchor_mix = 0xDEAD_BEEF };
     var s2: State = .{ .anchor_mix = 0xDEAD_BEEF };
