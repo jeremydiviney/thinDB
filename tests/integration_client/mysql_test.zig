@@ -551,6 +551,7 @@ test "mysql wire: standalone client handshake + SELECT 1" {
     const port: u16 = test_port_base + 0;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -589,6 +590,7 @@ test "mysql wire: SHOW DATABASES returns flattened db__schema" {
     const port: u16 = test_port_base + 1;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -640,6 +642,7 @@ test "mysql wire: COM_QUERY against seeded table returns rows" {
     const port: u16 = test_port_base + 2;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -696,6 +699,7 @@ test "mysql wire: Workbench metadata probes reflect catalog tables" {
     const port: u16 = test_port_base + 210;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -782,6 +786,7 @@ test "mysql wire: SHOW COLUMNS reports DEFAULT and auto_increment Extra" {
     const port: u16 = test_port_base + 211;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -820,6 +825,7 @@ test "mysql wire: SELECT NOW() returns real wall-clock, not 1970" {
     const port: u16 = test_port_base + 212;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -856,6 +862,7 @@ test "mysql wire: SET / SHOW VARIABLES probes return canned OK / rows" {
     const port: u16 = test_port_base + 3;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -901,6 +908,7 @@ test "mysql wire: CREATE DATABASE then SHOW DATABASES includes new db" {
     const port: u16 = test_port_base + 5;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -949,6 +957,7 @@ test "mysql wire: COM_INIT_DB on bogus name returns ER_BAD_DB" {
     const port: u16 = test_port_base + 4;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -990,6 +999,7 @@ test "mysql wire: legacy client (no DEPRECATE_EOF) gets two EOF packets" {
     const port: u16 = test_port_base + 6;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1048,6 +1058,7 @@ test "mysql wire: empty initial_db leaves session at main/public" {
     const port: u16 = test_port_base + 7;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1085,6 +1096,7 @@ test "mysql wire: COM_RESET_CONNECTION (0x1F) clears session state" {
     const port: u16 = test_port_base + 20;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1152,6 +1164,7 @@ test "mysql wire: user variables persist across statements and clear on RESET" {
     const port: u16 = test_port_base + 21;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1217,6 +1230,7 @@ test "mysql wire: RESET CONNECTION returns OK" {
     const port: u16 = test_port_base + 8;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1250,6 +1264,7 @@ test "mysql wire: auth — trust mode accepts any password" {
     const port: u16 = test_port_base + 30;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     // auth_password stays null → trust mode.
 
@@ -1278,6 +1293,7 @@ test "mysql wire: auth — correct password accepted" {
     const port: u16 = test_port_base + 31;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.auth_password = "hunter2";
 
@@ -1305,6 +1321,7 @@ test "mysql wire: auth — wrong password rejected with 1045 / 28000" {
     const port: u16 = test_port_base + 32;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.auth_password = "hunter2";
 
@@ -1333,6 +1350,7 @@ test "mysql wire: auth — empty client response rejected when password set" {
     const port: u16 = test_port_base + 33;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.auth_password = "hunter2";
 
@@ -1362,6 +1380,7 @@ test "mysql wire: caching_sha2_password — correct password accepted" {
     const port: u16 = test_port_base + 50;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.auth_password = "hunter2";
 
@@ -1390,6 +1409,7 @@ test "mysql wire: caching_sha2_password — wrong password rejected" {
     const port: u16 = test_port_base + 51;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.auth_password = "hunter2";
 
@@ -1417,6 +1437,7 @@ test "mysql wire: caching_sha2_password — trust mode accepts any hash" {
     const port: u16 = test_port_base + 52;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     // auth_password stays null — trust mode.
 
@@ -1448,6 +1469,7 @@ test "mysql wire: COM_CHANGE_USER (0x11) — trust mode resets session state" {
     const port: u16 = test_port_base + 40;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     // Trust mode — no auth_password set.
 
@@ -1500,6 +1522,7 @@ test "mysql wire: COM_CHANGE_USER — correct password accepted" {
     const port: u16 = test_port_base + 41;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.auth_password = "hunter2";
 
@@ -1535,6 +1558,7 @@ test "mysql wire: COM_CHANGE_USER — wrong password rejected with 1045 / 28000"
     const port: u16 = test_port_base + 42;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.auth_password = "hunter2";
 
@@ -1576,6 +1600,7 @@ test "mysql wire: KILL <unknown_id> → ER_NO_SUCH_THREAD (1094)" {
     const port: u16 = test_port_base + 60;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.registry = &registry;
 
@@ -1615,6 +1640,7 @@ test "mysql wire: KILL <self_id> sets the cancel flag (no registry → no-op suc
     const port: u16 = test_port_base + 61;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.registry = &registry;
 
@@ -1654,6 +1680,7 @@ test "mysql wire: limiter at zero capacity emits ER_CON_COUNT_ERROR on accept" {
     const port: u16 = test_port_base + 9;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, &limiter);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1749,6 +1776,7 @@ test "mysql CLI: SELECT @@version round-trips when mysql is on PATH" {
     const port: u16 = test_port_base + 100;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1793,6 +1821,7 @@ test "mysql CLI: SELECT * FROM orders streams seeded rows when mysql is on PATH"
     const port: u16 = test_port_base + 101;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1848,6 +1877,7 @@ test "mysql wire: COM_STMT_PREPARE on parameterized SELECT returns param + colum
     const port: u16 = test_port_base + 200;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1893,6 +1923,7 @@ test "mysql wire: COM_STMT_EXECUTE returns rows matching the bound int param" {
     const port: u16 = test_port_base + 201;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1949,6 +1980,7 @@ test "mysql wire: COM_STMT_PREPARE on bogus table returns ERR" {
     const port: u16 = test_port_base + 202;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1999,6 +2031,7 @@ test "mysql wire: COM_STMT_EXECUTE on unknown statement_id returns ER_UNKNOWN_ST
     const port: u16 = test_port_base + 203;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2040,6 +2073,7 @@ test "mysql wire: COM_STMT_CLOSE then COM_STMT_EXECUTE on same id → ERR" {
     const port: u16 = test_port_base + 204;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2090,6 +2124,7 @@ test "mysql wire: COM_STMT_PREPARE + EXECUTE for parameterized INSERT writes row
     const port: u16 = test_port_base + 205;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2167,6 +2202,7 @@ test "mysql wire: two COM_STMT_PREPARE in one connection get independent stateme
     const port: u16 = test_port_base + 206;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2200,6 +2236,7 @@ test "mysql wire: COM_STMT_PREPARE on DDL — EXECUTE returns OK with no rows" {
     const port: u16 = test_port_base + 207;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2247,6 +2284,7 @@ test "mysql wire: COM_STMT_EXECUTE with new_params_bound_flag=0 reuses prior typ
     const port: u16 = test_port_base + 208;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2306,6 +2344,7 @@ test "mysql wire: COM_STMT_SEND_LONG_DATA accumulates string consumed by EXECUTE
     const port: u16 = test_port_base + 209;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2372,6 +2411,7 @@ test "mysql wire: CREATE TEMP TABLE round-trip + RESET CONNECTION drops it" {
     const port: u16 = test_port_base + 210;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2439,6 +2479,7 @@ test "mysql wire: COM_RESET_CONNECTION binary command drops temp namespace" {
     const port: u16 = test_port_base + 211;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2489,6 +2530,7 @@ test "mysql wire: two connections, A's temp invisible to B" {
     const port: u16 = test_port_base + 212;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     // Two sessions need two concurrent server threads — `acceptOne` runs

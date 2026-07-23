@@ -8,6 +8,7 @@
 //! hierarchy (no MySQL-style flattening).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -77,8 +78,21 @@ pub const Server = struct {
         }
     }
 
+    /// Wake any thread blocked in `accept` and close the listening socket.
+    /// POSIX close() does not interrupt an in-flight accept, so shut the
+    /// socket down first. Frees nothing — call `destroy` after joining
+    /// the accept thread.
     pub fn close(self: *Server) void {
+        if (builtin.os.tag != .windows) {
+            // Windows closesocket aborts a pending accept on its own; the
+            // shutdown there fails with a noisy NTSTATUS on a listener.
+            const listen_stream: Io.net.Stream = .{ .socket = self.listener.socket };
+            listen_stream.shutdown(self.io, .both) catch {};
+        }
         self.listener.socket.close(self.io);
+    }
+
+    pub fn destroy(self: *Server) void {
         if (self.owns_limiter) self.allocator.destroy(self.limiter);
         self.allocator.destroy(self);
     }
