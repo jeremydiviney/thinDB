@@ -265,10 +265,23 @@ pub const WalWriter = struct {
         }
         self.in_progress = true;
         self.coord_mu.unlock(self.io);
+        // A failure below must not leave `in_progress` set: the next flush of
+        // this table would park forever on `coord_cv` while holding the table
+        // mutex — wedging the table, and (via the core leases every parked
+        // statement keeps holding) eventually the whole server.
+        errdefer {
+            self.coord_mu.lockUncancelable(self.io);
+            self.in_progress = false;
+            self.coord_cv.broadcast(self.io);
+            self.coord_mu.unlock(self.io);
+        }
 
-        // Close, recreate (truncates), write header, sync.
+        // Recreate before closing the old handle (createFile truncates the
+        // existing file in place) so a createFile failure leaves `self.file`
+        // valid for retry.
+        const new_file = try self.dir.createFile(self.io, wal_filename, .{});
         self.file.close(self.io);
-        self.file = try self.dir.createFile(self.io, wal_filename, .{});
+        self.file = new_file;
 
         var hdr: [header_size]u8 = undefined;
         @memcpy(hdr[0..4], &wal_magic);
