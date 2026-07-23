@@ -141,6 +141,7 @@ pub const Server = struct {
     pub fn run(self: *Server, should_stop: *std.atomic.Value(bool)) !void {
         while (!should_stop.load(.acquire)) {
             const stream = self.listener.accept(self.io) catch |err| {
+                if (should_stop.load(.acquire)) return;
                 std.debug.print("mysql: accept error: {s}\n", .{@errorName(err)});
                 continue;
             };

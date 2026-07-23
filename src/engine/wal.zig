@@ -37,6 +37,7 @@
 //!     max_segment_id u64   (records BEFORE this marker are redundant)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -492,4 +493,32 @@ fn readRecord(bytes: []const u8, off: usize) !ReadRecord {
         .payload = bytes[off + record_header_size .. payload_end],
         .cursor_after = payload_end + record_trailer_size,
     };
+}
+
+test "truncate failure clears the group-commit coordinator" {
+    // Windows refuses to delete a directory with open handles, which is the
+    // fault lever this test uses; the code under test is platform-neutral.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wal_dir = try tmp.dir.createDirPathOpen(io, "wal_dir", .{});
+    defer wal_dir.close(io);
+    var w = try WalWriter.create(allocator, io, wal_dir, 0xabc);
+    defer w.deinit();
+
+    // Delete the directory out from under the writer so truncate's
+    // createFile fails mid-operation.
+    try tmp.dir.deleteTree(io, "wal_dir");
+
+    try std.testing.expectError(error.FileNotFound, w.truncate(0xabc));
+    // The regression: a failed truncate must not leave `in_progress` set —
+    // a poisoned flag makes the NEXT flush park forever holding the table
+    // mutex. A retry must error again immediately, never hang.
+    try std.testing.expect(!w.in_progress);
+    try std.testing.expectError(error.FileNotFound, w.truncate(0xabc));
+    try std.testing.expect(!w.in_progress);
 }
