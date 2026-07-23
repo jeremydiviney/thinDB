@@ -6,10 +6,26 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const thindb = @import("thindb");
+const config = @import("config.zig");
 
 const Io = std.Io;
 
 const default_bind: []const u8 = "0.0.0.0";
+
+/// Argument source for the parse loop: the config-file-derived tokens followed
+/// by the real command-line tokens, so a command-line flag overrides the same
+/// setting given in the file. A tiny slice cursor exposing just `next`.
+const ArgvIter = struct {
+    items: []const []const u8,
+    idx: usize = 0,
+
+    fn next(self: *ArgvIter) ?[]const u8 {
+        if (self.idx >= self.items.len) return null;
+        const v = self.items[self.idx];
+        self.idx += 1;
+        return v;
+    }
+};
 
 /// One acceptable global: the SIGINT/Ctrl+C handler can't carry context.
 /// `main` owns the flag's lifetime; the signal handler only writes,
@@ -26,6 +42,11 @@ const usage_text =
     \\  --data-dir PATH         Root directory for the Catalog (will be created if missing).
     \\
     \\Optional:
+    \\  --config PATH           Read settings from a flat `key = value` file (keys mirror these
+    \\                          flag names without the leading --, e.g. `mysql-port = 13310`).
+    \\                          A command-line flag overrides the same setting from the file.
+    \\                          A password set in the file is NOT exposed in `ps`. Also read
+    \\                          from THINDB_CONFIG if the flag is absent.
     \\  --mysql-port PORT       MySQL wire listener port (default 3306; 0 disables).
     \\  --pg-port PORT          Postgres wire listener port (default 5432; 0 disables).
     \\  --native-port PORT      Native thinDB wire listener port (default 7878; 0 disables).
@@ -75,6 +96,7 @@ const usage_text =
     \\  --version               Print version and exit.
     \\
     \\Environment:
+    \\  THINDB_CONFIG=PATH      Config file to read when --config is not given.
     \\  THINDB_MYSQL_PROFILE=1  Log per-connection MySQL protocol phase timings.
     \\
     \\Examples:
@@ -90,6 +112,57 @@ pub fn main(init: std.process.Init) !u8 {
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer args_iter.deinit();
     _ = args_iter.skip();
+
+    // Arena for every argument string: the real CLI tokens (duped) plus the
+    // synthetic tokens the config file expands to. Lives the whole of `main`,
+    // so `Config` slices that point into these tokens stay valid.
+    var arg_arena = std.heap.ArenaAllocator.init(gpa);
+    defer arg_arena.deinit();
+    const aa = arg_arena.allocator();
+
+    var stderr_buf0: [4096]u8 = undefined;
+    var stderr_writer0 = std.Io.File.stderr().writer(io, &stderr_buf0);
+    const early_err = &stderr_writer0.interface;
+
+    var cli_args: std.ArrayList([]const u8) = .empty;
+    while (args_iter.next()) |a| try cli_args.append(aa, try aa.dupe(u8, a));
+
+    // Config path: --config <path> / --config=PATH wins; else THINDB_CONFIG.
+    var config_path: ?[]const u8 = null;
+    {
+        var i: usize = 0;
+        while (i < cli_args.items.len) : (i += 1) {
+            const a = cli_args.items[i];
+            if (std.mem.eql(u8, a, "--config")) {
+                if (i + 1 < cli_args.items.len) config_path = cli_args.items[i + 1];
+            } else if (std.mem.startsWith(u8, a, "--config=")) {
+                config_path = a["--config=".len..];
+            }
+        }
+    }
+    if (config_path == null) {
+        if (init.environ_map.get("THINDB_CONFIG")) |p| {
+            if (p.len > 0) config_path = try aa.dupe(u8, p);
+        }
+    }
+
+    // File tokens are applied BEFORE the CLI tokens so a command-line flag
+    // overrides the same setting from the file.
+    var effective_args: std.ArrayList([]const u8) = .empty;
+    if (config_path) |p| {
+        const text = Io.Dir.cwd().readFileAlloc(io, p, aa, .limited(1 << 20)) catch |err| {
+            try early_err.print("thindb-server: failed to read --config '{s}': {t}\n", .{ p, err });
+            try early_err.flush();
+            return 1;
+        };
+        config.parseInto(aa, text, &effective_args) catch |err| {
+            try early_err.print("thindb-server: invalid config file '{s}': {t}\n", .{ p, err });
+            try early_err.flush();
+            return 1;
+        };
+    }
+    try effective_args.appendSlice(aa, cli_args.items);
+    var iter = ArgvIter{ .items = effective_args.items };
 
     var data_dir_opt: ?[]const u8 = null;
     var mysql_port: u16 = thindb.mysql_default_port;
@@ -127,7 +200,7 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const out_w = &stdout_writer.interface;
 
-    while (args_iter.next()) |arg| {
+    while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try out_w.writeAll(usage_text);
             try out_w.flush();
@@ -138,6 +211,8 @@ pub fn main(init: std.process.Init) !u8 {
             try out_w.flush();
             return 0;
         }
+        // Already resolved and expanded in the pre-scan; consume and skip.
+        if (try takeValue(arg, "--config", &iter, err_w)) |_| continue;
         if (std.mem.eql(u8, arg, "--profile-ops")) {
             thindb.exec.prof.enabled = true;
             continue;
@@ -146,7 +221,7 @@ pub fn main(init: std.process.Init) !u8 {
             thindb.exec.trace_group_by = true;
             continue;
         }
-        if (try takeValue(arg, "--scan-batch", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--scan-batch", &iter, err_w)) |v| {
             thindb.exec.scan_sub_batch = std.fmt.parseInt(usize, v, 10) catch {
                 try err_w.print("thindb-server: --scan-batch must be an integer, got: {s}\n", .{v});
                 try err_w.flush();
@@ -154,7 +229,7 @@ pub fn main(init: std.process.Init) !u8 {
             };
             continue;
         }
-        if (try takeValue(arg, "--force-group-by", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--force-group-by", &iter, err_w)) |v| {
             if (std.mem.eql(u8, v, "hash")) {
                 thindb.exec.force_group_by = .hash;
             } else if (std.mem.eql(u8, v, "sort")) {
@@ -170,27 +245,27 @@ pub fn main(init: std.process.Init) !u8 {
             }
             continue;
         }
-        if (try takeValue(arg, "--data-dir", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--data-dir", &iter, err_w)) |v| {
             data_dir_opt = v;
             continue;
         }
-        if (try takeValue(arg, "--bind", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--bind", &iter, err_w)) |v| {
             bind = v;
             continue;
         }
-        if (try takePort(arg, "--mysql-port", &args_iter, err_w)) |p| {
+        if (try takePort(arg, "--mysql-port", &iter, err_w)) |p| {
             mysql_port = p;
             continue;
         }
-        if (try takePort(arg, "--pg-port", &args_iter, err_w)) |p| {
+        if (try takePort(arg, "--pg-port", &iter, err_w)) |p| {
             pg_port = p;
             continue;
         }
-        if (try takePort(arg, "--native-port", &args_iter, err_w)) |p| {
+        if (try takePort(arg, "--native-port", &iter, err_w)) |p| {
             native_port = p;
             continue;
         }
-        if (try takeU32(arg, "--xa-timeout-secs", &args_iter, err_w)) |v| {
+        if (try takeU32(arg, "--xa-timeout-secs", &iter, err_w)) |v| {
             xa_timeout_secs = v;
             continue;
         }
@@ -202,23 +277,23 @@ pub fn main(init: std.process.Init) !u8 {
             enable_wal = false;
             continue;
         }
-        if (try takeU32(arg, "--max-connections", &args_iter, err_w)) |v| {
+        if (try takeU32(arg, "--max-connections", &iter, err_w)) |v| {
             max_connections = v;
             continue;
         }
-        if (try takeU32(arg, "--idle-timeout-secs", &args_iter, err_w)) |v| {
+        if (try takeU32(arg, "--idle-timeout-secs", &iter, err_w)) |v| {
             idle_timeout_secs = v;
             continue;
         }
-        if (try takeU32(arg, "--max-dop", &args_iter, err_w)) |v| {
+        if (try takeU32(arg, "--max-dop", &iter, err_w)) |v| {
             max_dop = v;
             continue;
         }
-        if (try takeU32(arg, "--compact-threads", &args_iter, err_w)) |v| {
+        if (try takeU32(arg, "--compact-threads", &iter, err_w)) |v| {
             compact_threads = v;
             continue;
         }
-        if (try takeValue(arg, "--query-memory-budget", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--query-memory-budget", &iter, err_w)) |v| {
             query_memory_budget = std.fmt.parseInt(usize, v, 10) catch {
                 try err_w.print("thindb-server: invalid --query-memory-budget: {s}\n", .{v});
                 try err_w.flush();
@@ -226,7 +301,7 @@ pub fn main(init: std.process.Init) !u8 {
             };
             continue;
         }
-        if (try takeValue(arg, "--memory-budget", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--memory-budget", &iter, err_w)) |v| {
             memory_budget = parseSize(v) catch {
                 try err_w.print("thindb-server: invalid --memory-budget: {s} (use bytes, or a K/M/G suffix)\n", .{v});
                 try err_w.flush();
@@ -234,7 +309,7 @@ pub fn main(init: std.process.Init) !u8 {
             };
             continue;
         }
-        if (try takeValue(arg, "--cache-size", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--cache-size", &iter, err_w)) |v| {
             cache_size_bytes = parseSize(v) catch {
                 try err_w.print("thindb-server: invalid --cache-size: {s} (use bytes, or a K/M/G suffix)\n", .{v});
                 try err_w.flush();
@@ -242,15 +317,15 @@ pub fn main(init: std.process.Init) !u8 {
             };
             continue;
         }
-        if (try takeValue(arg, "--file-root", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--file-root", &iter, err_w)) |v| {
             file_root = v;
             continue;
         }
-        if (try takeValue(arg, "--mysql-password", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--mysql-password", &iter, err_w)) |v| {
             mysql_password = v;
             continue;
         }
-        if (try takeValue(arg, "--pg-password", &args_iter, err_w)) |v| {
+        if (try takeValue(arg, "--pg-password", &iter, err_w)) |v| {
             pg_password = v;
             continue;
         }
@@ -499,7 +574,7 @@ const ReaperCtx = struct {
 fn takeValue(
     arg: []const u8,
     name: []const u8,
-    iter: *std.process.Args.Iterator,
+    iter: *ArgvIter,
     err_w: *std.Io.Writer,
 ) !?[]const u8 {
     if (std.mem.eql(u8, arg, name)) {
@@ -519,7 +594,7 @@ fn takeValue(
 fn takePort(
     arg: []const u8,
     name: []const u8,
-    iter: *std.process.Args.Iterator,
+    iter: *ArgvIter,
     err_w: *std.Io.Writer,
 ) !?u16 {
     const v = try takeValue(arg, name, iter, err_w) orelse return null;
@@ -533,7 +608,7 @@ fn takePort(
 fn takeU32(
     arg: []const u8,
     name: []const u8,
-    iter: *std.process.Args.Iterator,
+    iter: *ArgvIter,
     err_w: *std.Io.Writer,
 ) !?u32 {
     const v = try takeValue(arg, name, iter, err_w) orelse return null;
