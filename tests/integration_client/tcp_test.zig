@@ -49,6 +49,7 @@ test "tcp: scan round-trips a small batch over a real socket" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     // Seed via the underlying Database (until createTable RPC lands).
@@ -106,6 +107,7 @@ test "tcp: createTable round-trips a full schema (columns + order_key + unique)"
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     const ServerCtx = struct {
@@ -165,6 +167,7 @@ test "tcp: insert rows + read back via scan, all over the socket" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     // Pre-create the table in-process (createTable RPC is tested separately).
@@ -241,6 +244,7 @@ test "tcp: insert with nullable fields preserves nulls through scan" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     const nullable_schema = thindb.TableSchema{
@@ -327,6 +331,7 @@ test "tcp: insert accepts the &.{ ... } tuple shape over the wire" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     _ = try server.db.table("orders", schema_v1, opts_v1);
@@ -383,6 +388,7 @@ test "tcp: alterTable add column populates default + appears in scan output" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     // Seed in-process so we have rows to verify the default-fill against.
@@ -460,6 +466,7 @@ test "tcp: auth accepts matching token, rejects missing + wrong token" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
     server.auth_token = "s3cret-token-do-not-reuse";
 
@@ -535,6 +542,7 @@ test "tcp: compression round-trips a large scan when both sides opt in" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
     server.compress_writes = true; // opt-in on the server side
 
@@ -603,6 +611,7 @@ test "tcp: resp_error carries a typed code, client maps to typed Error" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     // Seed one table so we can trigger TableAlreadyExists too.
@@ -663,6 +672,7 @@ test "tcp: dropTable removes the table and frees its directory" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     const t = try server.db.table("victims", schema_v1, opts_v1);
@@ -722,6 +732,7 @@ test "tcp: delete with leaf predicate removes matching rows + returns count" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     const t = try server.db.table("orders", schema_v1, opts_v1);
@@ -784,6 +795,7 @@ test "tcp: query with where + limit returns the right rows" {
         .port = port,
     } };
     var server = try thindb.serveTcp(allocator, io, tmp.dir, listen_addr, .{});
+    defer server.destroy();
     defer server.close();
 
     const t = try server.db.table("orders", schema_v1, opts_v1);

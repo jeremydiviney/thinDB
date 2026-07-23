@@ -101,3 +101,24 @@ jobs:
 
       - name: Run test suite
         run: zig build test
+
+      # The test suite exercises in-process servers only. This boots the real
+      # binary and asserts SIGTERM produces a clean exit — the exact lifecycle
+      # that hung forever on Linux (close() doesn't wake a blocked accept)
+      # while every test stayed green.
+      - name: Server SIGTERM smoke
+        run: |
+          zig build
+          ./zig-out/bin/thindb-server --data-dir "$RUNNER_TEMP/smoke-db" \
+            --mysql-port 13311 --pg-port 0 --native-port 0 &
+          pid=$!
+          sleep 3
+          kill -0 "$pid"
+          kill -TERM "$pid"
+          for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || { echo "clean exit after SIGTERM"; exit 0; }
+            sleep 0.5
+          done
+          echo "::error::thindb-server did not exit within 10s of SIGTERM"
+          kill -9 "$pid"
+          exit 1

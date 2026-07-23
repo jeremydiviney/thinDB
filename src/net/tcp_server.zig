@@ -16,6 +16,7 @@
 //!   - `server.close()` deinits the Database and the listening socket.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -67,8 +68,21 @@ pub const Server = struct {
     /// must outlive the Server.
     auth_token: ?[]const u8 = null,
 
+    /// Wake any thread blocked in `accept` and close the listening socket.
+    /// POSIX close() does not interrupt an in-flight accept, so shut the
+    /// socket down first. Frees nothing — call `destroy` after joining
+    /// the accept thread.
     pub fn close(self: *Server) void {
+        if (builtin.os.tag != .windows) {
+            // Windows closesocket aborts a pending accept on its own; the
+            // shutdown there fails with a noisy NTSTATUS on a listener.
+            const listen_stream: std.Io.net.Stream = .{ .socket = self.listener.socket };
+            listen_stream.shutdown(self.io, .both) catch {};
+        }
         self.listener.socket.close(self.io);
+    }
+
+    pub fn destroy(self: *Server) void {
         if (self.owns_db) self.db.close();
         if (self.owns_limiter) self.allocator.destroy(self.limiter);
         self.allocator.destroy(self);
@@ -103,6 +117,7 @@ pub const Server = struct {
     pub fn run(self: *Server, should_stop: *std.atomic.Value(bool)) !void {
         while (!should_stop.load(.acquire)) {
             const stream = self.listener.accept(self.io) catch |err| {
+                if (should_stop.load(.acquire)) return;
                 std.debug.print("tcp_server: accept error: {s}\n", .{@errorName(err)});
                 continue;
             };

@@ -475,6 +475,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (listeners[0..n_listeners]) |*l| l.close();
     closed = true;
     for (threads[0..n_listeners]) |t| t.join();
+    for (listeners[0..n_listeners]) |*l| l.destroy();
     flusher_thread.join();
     if (compactor_thread) |t| t.join();
     if (reaper_thread) |t| t.join();
@@ -500,6 +501,12 @@ const Listener = union(WireKind) {
     fn close(self: *Listener) void {
         switch (self.*) {
             inline else => |s| s.close(),
+        }
+    }
+
+    fn destroy(self: *Listener) void {
+        switch (self.*) {
+            inline else => |s| s.destroy(),
         }
     }
 

@@ -525,6 +525,7 @@ test "pg wire: startup + SELECT 1" {
     const port: u16 = test_port_base + 0;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -562,6 +563,7 @@ test "pg wire: SELECT version() returns canned PostgreSQL banner" {
     const port: u16 = test_port_base + 1;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -607,6 +609,7 @@ test "pg wire: SELECT * FROM orders returns seeded rows" {
     const port: u16 = test_port_base + 2;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -657,6 +660,7 @@ test "pg wire: query against missing table returns 42P01 error" {
     const port: u16 = test_port_base + 3;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -691,6 +695,7 @@ test "pg wire: CREATE DATABASE round-trips" {
     const port: u16 = test_port_base + 4;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -734,6 +739,7 @@ test "pg wire: SET search_path switches the session schema" {
     const port: u16 = test_port_base + 5;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -775,6 +781,7 @@ test "pg wire: SSLRequest is denied with N + startup continues" {
     const port: u16 = test_port_base + 6;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -815,6 +822,7 @@ test "pg wire: DISCARD ALL returns CommandComplete with DISCARD ALL tag" {
     const port: u16 = test_port_base + 7;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -849,6 +857,7 @@ test "pg wire: RESET ALL returns CommandComplete with RESET ALL tag" {
     const port: u16 = test_port_base + 8;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -886,6 +895,7 @@ test "pg wire: limiter at zero capacity emits 53300 too_many_connections" {
     const port: u16 = test_port_base + 9;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, &limiter);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -933,6 +943,7 @@ test "pg wire: pg_cancel_backend on unknown pid returns 'f'" {
     const port: u16 = test_port_base + 11;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.registry = &registry;
 
@@ -972,6 +983,7 @@ test "pg wire: pg_cancel_backend on self returns 't' and sets the cancel flag" {
     const port: u16 = test_port_base + 12;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
     server.registry = &registry;
 
@@ -1010,6 +1022,7 @@ test "pg wire: BEGIN/COMMIT/ROLLBACK flip the ReadyForQuery tx_status byte" {
     const port: u16 = test_port_base + 10;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1096,6 +1109,7 @@ test "pg wire: COPY FROM STDIN happy path inserts three rows" {
     const port: u16 = test_port_base + 30;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1170,6 +1184,7 @@ test "pg wire: COPY FROM STDIN honours an explicit column list" {
     const port: u16 = test_port_base + 31;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1229,6 +1244,7 @@ test "pg wire: COPY FROM STDIN parses \\N as NULL on a nullable column" {
     const port: u16 = test_port_base + 32;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1281,6 +1297,7 @@ test "pg wire: COPY FROM STDIN round-trips embedded escapes" {
     const port: u16 = test_port_base + 33;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1338,6 +1355,7 @@ test "pg wire: COPY FROM STDIN CopyFail aborts cleanly" {
     const port: u16 = test_port_base + 34;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1402,6 +1420,7 @@ test "pg wire: COPY TO STDOUT streams three rows" {
     const port: u16 = test_port_base + 35;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1453,6 +1472,7 @@ test "pg wire: COPY TO STDOUT escapes tab newline backslash in cells" {
     const port: u16 = test_port_base + 36;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1494,6 +1514,7 @@ test "pg wire: COPY FROM file path is rejected with 0A000" {
     const port: u16 = test_port_base + 37;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1580,6 +1601,7 @@ test "psql CLI: SELECT 1 when psql is on PATH" {
     const port: u16 = test_port_base + 100;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1615,6 +1637,7 @@ test "psql CLI: \\l lists databases when psql is on PATH" {
     const port: u16 = test_port_base + 101;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1659,6 +1682,7 @@ test "psql CLI: SELECT * FROM seeded table when psql is on PATH" {
     const port: u16 = test_port_base + 102;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1721,6 +1745,7 @@ test "pg wire ext: Parse + Bind (text params) + Execute returns matching row" {
     const port: u16 = test_port_base + 60;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1774,6 +1799,7 @@ test "pg wire ext: Parse + Describe(S) on SELECT returns ParamDescription + RowD
     const port: u16 = test_port_base + 61;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1820,6 +1846,7 @@ test "pg wire ext: Parse + Describe(S) on INSERT returns ParamDescription + NoDa
     const port: u16 = test_port_base + 62;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1869,6 +1896,7 @@ test "pg wire ext: rebinding the unnamed portal cleanly replaces the prior" {
     const port: u16 = test_port_base + 63;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1925,6 +1953,7 @@ test "pg wire ext: Parse + Bind (binary int4 param) + Execute returns matching r
     const port: u16 = test_port_base + 64;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -1978,6 +2007,7 @@ test "pg wire ext: syntax error → ErrorResponse + frames skipped until Sync" {
     const port: u16 = test_port_base + 65;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2034,6 +2064,7 @@ test "pg wire ext: Close statement → Bind on its name returns UnknownStatement
     const port: u16 = test_port_base + 66;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2077,6 +2108,7 @@ test "pg wire ext: Close portal → Execute on it returns UnknownPortal" {
     const port: u16 = test_port_base + 67;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2124,6 +2156,7 @@ test "pg wire ext: parameterized INSERT via Extended Query lands rows" {
     const port: u16 = test_port_base + 68;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2192,6 +2225,7 @@ test "pg wire ext: pipelined Parse + Bind + Execute + Sync collects all replies"
     const port: u16 = test_port_base + 69;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2236,6 +2270,7 @@ test "pg wire: CREATE TEMP TABLE round-trip + DISCARD ALL drops it" {
     const port: u16 = test_port_base + 70;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2303,6 +2338,7 @@ test "pg wire: DISCARD TEMP drops temp tables" {
     const port: u16 = test_port_base + 71;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2355,6 +2391,7 @@ test "pg wire: RESET ALL does NOT drop temp tables (PG spec)" {
     const port: u16 = test_port_base + 72;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
@@ -2413,6 +2450,7 @@ test "pg wire: two connections, A's temp invisible to B" {
     const port: u16 = test_port_base + 73;
     const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
     var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
     defer server.close();
 
     // Two sessions need two concurrent server threads — `acceptOne` runs
