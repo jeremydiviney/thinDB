@@ -1,0 +1,38 @@
+# thinDB server config — a flat `key = value` file.
+#
+#   thindb-server --data-dir /var/lib/thindb --config /etc/thindb/thindb.conf
+#
+# Keys mirror the command-line flag names without the leading `--`. Anything
+# set here can be overridden on the command line (CLI flag > config > default).
+# Comments must be on their own line (so a value may contain `#`); wrap a value
+# in quotes to keep leading/trailing spaces. A password set here is read into
+# memory and does NOT appear in `ps`.
+
+# --- data ---
+data-dir = /var/lib/thindb/data
+
+# --- wires (0 disables a listener) ---
+bind = 0.0.0.0
+mysql-port = 13310
+pg-port = 0
+native-port = 0
+
+# --- auth (per-wire shared password; omit for trust mode) ---
+# mysql-password = change-me
+# pg-password = change-me
+
+# --- memory (accept a K/M/G suffix; omit for the RAM-fraction auto-default) ---
+cache-size = 12G
+memory-budget = 8G
+# query-memory-budget takes RAW BYTES only (no suffix): 4G = 4294967296
+query-memory-budget = 4294967296
+
+# --- execution ---
+max-dop = 16
+max-connections = 256
+# compact-threads = 0        # 0 = auto (~25% of physical cores)
+# idle-timeout-secs = 0
+
+# --- toggles (boolean: true/false) ---
+# no-wal = false
+# no-compaction = false

@@ -107,10 +107,20 @@ pub fn build(b: *std.Build) void {
     const integration_client_tests = b.addTest(.{ .root_module = integration_client_mod });
     const run_integration_client_tests = runTestStandalone(b, integration_client_tests);
 
+    // ---- Server config-file parser tests (src/cmd/config.zig, pure std) ----
+    const config_mod = b.createModule(.{
+        .root_source_file = b.path("src/cmd/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const config_tests = b.addTest(.{ .root_module = config_mod });
+    const run_config_tests = runTestStandalone(b, config_tests);
+
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_client_tests.step);
+    test_step.dependOn(&run_config_tests.step);
 
     // ---- V2-engine integration tests: tests/integration/v2_group_topn_test.zig ----
     // A focused battery for the grouped V2 handlers, kept as its own step so
