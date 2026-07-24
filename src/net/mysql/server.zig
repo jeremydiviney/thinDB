@@ -3589,13 +3589,14 @@ fn runSingleStatement(
     extra_status: u16,
     profiler: *MysqlProfiler,
 ) !bool {
-    // Serial-stage core lease: pin this connection thread to one core for the
-    // whole statement (compile + execute + drain). Parallel-scan workers lease
-    // ADDITIONAL cores per stage and release between them; this thread reuses
-    // its lease as the inline worker (the scheduler's no-hold-and-wait guard).
-    // For a single-threaded query this is the only lease — it still gets a
-    // reserved core. Blocking here when the machine is saturated is the
-    // intended admission control. Best-effort: a no-op when pinning is off/unsupported.
+    // Serial-stage core lease held for the whole statement (compile + execute
+    // + drain). Parallel-scan workers lease ADDITIONAL cores per stage and
+    // release between them; this thread reuses its lease as the inline worker
+    // (the scheduler's no-hold-and-wait guard). Blocking here when the machine
+    // is saturated is the intended admission control. On Windows the lease also
+    // pins this thread to its core; on Linux it is accounting-only — this
+    // thread spawns every exec worker for the statement, and spawned threads
+    // inherit the spawner's affinity mask there (see core_scheduler.PIN_THREADS).
     var qlease = core_scheduler.global().acquire();
     defer qlease.release();
 

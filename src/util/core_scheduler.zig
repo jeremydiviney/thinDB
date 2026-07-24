@@ -28,6 +28,25 @@ const std = @import("std");
 const builtin = @import("builtin");
 const affinity = @import("affinity.zig");
 
+/// Whether a lease also PINS the calling thread to its core. Windows only.
+///
+/// Windows: SetThreadAffinityMask affects just the calling thread — threads it
+/// later spawns start with the process-wide mask, so a pinned connection thread
+/// still fans its exec workers across every core. Pinning there is a measured
+/// ~40% scaling win (see util/affinity.zig).
+///
+/// Linux: a spawned thread INHERITS the spawner's affinity mask (clone
+/// semantics). The admission lease in mysql/server.zig runs on the connection
+/// thread, which spawns every exec worker for the statement — pinning it to
+/// one core silently trapped all non-re-pinning workers on that core (whole
+/// queries at ~1 core of CPU; 7-9× slower on heavy rollforwards). Measured
+/// unpinned Linux runs at parity with pinned Windows per-clock, so leases on
+/// Linux do accounting only. If Linux worker pinning is ever revisited, every
+/// spawn under a narrowed mask needs a child-side affinity reset first.
+///
+/// Lease ACCOUNTING (admission control) is platform-independent and unaffected.
+const PIN_THREADS = builtin.os.tag == .windows;
+
 /// Per-thread flag: does THIS thread already hold a real core slot? Read by
 /// `acquire` to honor the no-hold-and-wait invariant (a holder never blocks).
 threadlocal var thread_holds_core: bool = false;
@@ -125,7 +144,7 @@ pub const CoreScheduler = struct {
                 const mask = self.cores[idx].mask;
                 self.lock.unlock();
                 thread_holds_core = true;
-                affinity.pinCurrentThread(mask);
+                if (PIN_THREADS) affinity.pinCurrentThread(mask);
                 return .{ .sched = self, .core_index = @intCast(idx), .owns = true };
             }
             self.lock.unlock();
@@ -148,7 +167,7 @@ pub const CoreScheduler = struct {
             const mask = self.cores[idx].mask;
             self.lock.unlock();
             thread_holds_core = true;
-            affinity.pinCurrentThread(mask);
+            if (PIN_THREADS) affinity.pinCurrentThread(mask);
             return .{ .sched = self, .core_index = @intCast(idx), .owns = true };
         }
         self.lock.unlock();
@@ -163,7 +182,7 @@ pub const CoreScheduler = struct {
         if (self.cores[idx].leased > 0) self.cores[idx].leased -= 1;
         self.lock.unlock();
         thread_holds_core = false;
-        affinity.unpinCurrentThread(self.all_mask);
+        if (PIN_THREADS) affinity.unpinCurrentThread(self.all_mask);
     }
 
     /// Least-loaded core with a free slot (fills distinct cores before doubling
@@ -268,6 +287,36 @@ test "holder never takes a second slot (no hold-and-wait)" {
     inner.release(); // no-op
     outer.release();
     for (s.cores) |c| try std.testing.expectEqual(@as(u16, 0), c.leased);
+}
+
+test "linux: leases never narrow thread affinity (spawned workers must inherit the full mask)" {
+    // Regression for the datacenter 7-9× slowdown: Linux child threads inherit
+    // the spawner's affinity mask, so a pinned admission thread trapped every
+    // exec worker it spawned on one CPU. Leases must be accounting-only here.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var s = try CoreScheduler.init(std.testing.allocator);
+    defer s.deinit();
+    if (s.cores.len == 0) return error.SkipZigTest;
+
+    const before = linuxCurrentAffinity();
+    var lease = s.acquire();
+    try std.testing.expect(lease.owns);
+    try std.testing.expectEqual(before, linuxCurrentAffinity());
+    lease.release();
+    try std.testing.expectEqual(before, linuxCurrentAffinity());
+
+    var tl = s.tryAcquire();
+    try std.testing.expect(tl.owns);
+    try std.testing.expectEqual(before, linuxCurrentAffinity());
+    tl.release();
+    try std.testing.expectEqual(before, linuxCurrentAffinity());
+}
+
+fn linuxCurrentAffinity() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var set = [_]u8{0} ** 128;
+    _ = std.os.linux.syscall3(.sched_getaffinity, 0, set.len, @intFromPtr(&set));
+    return std.mem.readInt(u64, set[0..8], .little);
 }
 
 test "blocked waiter resolves when a core frees" {

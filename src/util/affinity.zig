@@ -7,6 +7,12 @@
 //! is best-effort and degrades to a no-op where the OS doesn't support pinning
 //! (notably macOS, which deliberately ignores hard thread-to-core placement).
 //!
+//! The CoreScheduler only PINS on Windows (core_scheduler.PIN_THREADS): Linux
+//! child threads inherit the spawner's affinity mask, so pinning a thread that
+//! spawns workers traps them all on its core. pinCurrentThread/unpinCurrentThread
+//! keep their Linux arms for explicit child-side pinning (platform.pinToCpu-style
+//! callers that pin themselves at worker entry, which is inheritance-safe).
+//!
 //! Mask model: a "core" is one physical core, identified by the bitmask of the
 //! logical CPUs that belong to it (1 bit non-SMT, 2 bits with hyperthreading).
 //! Pinning sets the thread's affinity to that whole mask, keeping it on the
