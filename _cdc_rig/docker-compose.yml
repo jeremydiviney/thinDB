@@ -1,0 +1,96 @@
+name: cdcrig
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: rig-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rigroot
+    command:
+      - --server-id=1
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      # default binlog_row_event_max_size=8192 kept deliberately: matches the
+      # ~8KB events observed in the prod incident
+    ports:
+      - "3316:3306"
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-prigroot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  proxy:
+    image: node:20-alpine
+    container_name: rig-proxy
+    working_dir: /app
+    command: node proxy.js
+    environment:
+      TARGET_HOST: mysql
+      TARGET_PORT: "3306"
+      LISTEN_PORT: "3307"
+      CTRL_PORT: "8123"
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./proxy:/app:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  thindb:
+    image: ubuntu:24.04
+    container_name: rig-thindb
+    command: >
+      bash -c "cp /bin_ro/thindb-server /tmp/thindb-server && chmod +x /tmp/thindb-server &&
+      exec /tmp/thindb-server --data-dir /data --bind 0.0.0.0 --mysql-port 13310
+      --pg-port 0 --native-port 0 --cache-size 1G --memory-budget 2G
+      --query-memory-budget 1073741824 --max-dop 4"
+    ports:
+      - "13399:13310"
+    volumes:
+      - ./thindb-server:/bin_ro/thindb-server:ro
+      - rig_thindb_data:/data
+
+  jobmanager:
+    image: flink:1.20.3-scala_2.12-java17
+    container_name: rig-jobmanager
+    command: jobmanager
+    ports:
+      - "8091:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        state.checkpoints.dir: file:///ckpt
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    volumes:
+      - ./jars/${CDC_JAR:-flink-sql-connector-mysql-cdc-3.3.0.jar}:/opt/flink/lib/zz-cdc.jar:ro
+      - ./jars/flink-connector-jdbc-3.3.0-1.20.jar:/opt/flink/lib/zz-jdbc.jar:ro
+      - ./jars/mysql-connector-j-8.4.0.jar:/opt/flink/lib/zz-mysqlj.jar:ro
+      - ./sql:/sql:ro
+      - rig_ckpt:/ckpt
+
+  taskmanager:
+    image: flink:1.20.3-scala_2.12-java17
+    container_name: rig-taskmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.checkpoints.dir: file:///ckpt
+    volumes:
+      - ./jars/${CDC_JAR:-flink-sql-connector-mysql-cdc-3.3.0.jar}:/opt/flink/lib/zz-cdc.jar:ro
+      - ./jars/flink-connector-jdbc-3.3.0-1.20.jar:/opt/flink/lib/zz-jdbc.jar:ro
+      - ./jars/mysql-connector-j-8.4.0.jar:/opt/flink/lib/zz-mysqlj.jar:ro
+      - rig_ckpt:/ckpt
+    depends_on:
+      - jobmanager
+
+volumes:
+  rig_thindb_data:
+  rig_ckpt:

@@ -84,3 +84,7 @@ bench/clickbench/coverage*.json
 /build_err.txt
 tests/flink/_checkpoints/
 .wayroll-prod-db/
+
+# deployment-specific CDC material (customer schemas, prod job config)
+_cdc_rig/consolidated/
+_cdc_rig/box-scripts/

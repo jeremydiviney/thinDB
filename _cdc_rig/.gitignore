@@ -1,0 +1,7 @@
+jars/
+thindb-server
+harness/node_modules/
+consolidated/target/
+consolidated/dependency-reduced-pom.xml
+consolidated/rig-config-switch.json
+consolidated/prod_columns.tsv
