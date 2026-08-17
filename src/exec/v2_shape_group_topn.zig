@@ -1344,9 +1344,29 @@ fn numOrder(a: Num, b: Num) std.math.Order {
     return std.math.order(a.i, b.i);
 }
 
+// A value leaf must resolve to something havingOutputNum can actually
+// evaluate — matching by NAME alone accepted aggregates whose func has no
+// evaluator arm, and the emit filter then silently rejected every group
+// (the leaf read as false, not as an error). Keep this switch in lockstep
+// with havingOutputNum's.
+fn havingLeafColSupported(parts: []const KeyPart, aggregates: []const AggregatePlan, name: []const u8) bool {
+    for (parts) |part| if (types.columnNameEql(part.name, name)) return true;
+    for (aggregates) |agg| {
+        if (!types.columnNameEql(agg.name, name)) continue;
+        if (agg.is_string or agg.is_concat or agg.is_udf) return false;
+        return switch (agg.func) {
+            .count, .count_distinct, .sum, .min, .max, .avg, .stddev_pop, .stddev_samp, .var_pop, .var_samp => true,
+            else => false,
+        };
+    }
+    return false;
+}
+
 fn havingExprSupported(parts: []const KeyPart, aggregates: []const AggregatePlan, expr: PredicateExpr) bool {
     return switch (expr) {
-        .leaf => |p| outputColumnExists(parts, aggregates, p.col) and valueAsNum(p.val) != null,
+        .leaf => |p| havingLeafColSupported(parts, aggregates, p.col) and valueAsNum(p.val) != null,
+        // NULL tests never read the value slot — aggIsNull covers every func
+        // (string/concat/UDAF included), so name existence is enough here.
         .is_null, .is_not_null => |name| outputColumnExists(parts, aggregates, name),
         .not => |child| havingExprSupported(parts, aggregates, child.*),
         .@"and", .@"or" => |children| {
@@ -1373,6 +1393,10 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: SiloCore.TopRo
             const float_input = isFloatPhysical(agg_plan.input_type);
             return switch (agg_plan.func) {
                 .count => .{ .i = countValue(row, agg_plan) },
+                // The distinct count is final by emit time (a group's rows all
+                // land in one partition), and the final-sort comparator and
+                // output materialization already read this same slot.
+                .count_distinct => .{ .i = rowStateValue(row, agg_plan.state_index, agg_plan.wide) },
                 .sum, .min, .max => if (float_input)
                     Num{ .f = rowStateFloat(row, agg_plan.state_index) }
                 else
