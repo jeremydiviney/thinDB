@@ -1,0 +1,43 @@
+{
+  "source": {
+    "hostname": "mysql.example.com",
+    "port": 3306,
+    "username": "cdc_reader",
+    "password": "CHANGE_ME",
+    "database": "mydb",
+    "serverId": "5601-5604",
+    "startupMode": "initial"
+  },
+  "sink": {
+    "url": "jdbc:mysql://127.0.0.1:13310/mydb__public?rewriteBatchedStatements=true&maxAllowedPacket=67108864",
+    "username": "root",
+    "password": "",
+    "flushRows": 2000,
+    "flushIntervalMs": 1000
+  },
+  "tables": [
+    {
+      "name": "orders",
+      "columns": [
+        {"name": "id", "type": "BIGINT"},
+        {"name": "customer_id", "type": "BIGINT"},
+        {"name": "status", "type": "STRING"},
+        {"name": "amount", "type": "DECIMAL"},
+        {"name": "created_on", "type": "DATE"},
+        {"name": "updated_at", "type": "DATETIME"}
+      ],
+      "pk": ["id"]
+    },
+    {
+      "name": "order_lines",
+      "columns": [
+        {"name": "order_id", "type": "BIGINT"},
+        {"name": "line_no", "type": "INT"},
+        {"name": "sku", "type": "STRING"},
+        {"name": "qty", "type": "INT"},
+        {"name": "updated_at", "type": "DATETIME"}
+      ],
+      "pk": ["order_id", "line_no"]
+    }
+  ]
+}

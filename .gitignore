@@ -88,3 +88,7 @@ tests/flink/_checkpoints/
 # deployment-specific CDC material (customer schemas, prod job config)
 _cdc_rig/consolidated/
 _cdc_rig/box-scripts/
+
+# flink-cdc integration build artifacts
+integrations/flink-cdc/target/
+integrations/flink-cdc/dependency-reduced-pom.xml
