@@ -915,7 +915,20 @@ pub fn parseColumnType(p: anytype) !types.Type {
     if (asciiEqlAny(name, &.{ "boolean", "bool" })) return .boolean;
     if (asciiEqlAny(name, &.{"date"})) return .date;
     // timestamptz is accepted as a synonym; thinDB datetimes are UTC-naive.
-    if (asciiEqlAny(name, &.{ "datetime", "timestamp", "timestamptz" })) return .datetime;
+    if (asciiEqlAny(name, &.{ "datetime", "timestamp", "timestamptz" })) {
+        // MySQL/PG fractional-seconds precision, e.g. DATETIME(6). Storage is
+        // always microseconds, so the value is range-checked (0-6, both
+        // dialects' maximum) and otherwise ignored — never rounded to.
+        if (p.cur.tag == .lparen) {
+            try p.advance();
+            if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+            const fsp = p.cur.value.integer;
+            try p.advance();
+            try p.expect(.rparen);
+            if (fsp < 0 or fsp > 6) return PE.SqlExpectedValue;
+        }
+        return .datetime;
+    }
     if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
     if (asciiEqlAny(name, &.{ "json", "jsonb" })) return .json;
     return PE.SqlExpectedKeyword;

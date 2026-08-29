@@ -537,6 +537,40 @@ test "sql roundtrip: DATETIME column with microseconds" {
     try std.testing.expectEqual(expected, b.values[0].data.datetime[0]);
 }
 
+test "sql ddl: DATETIME/TIMESTAMP fractional-seconds precision accepted 0-6, ignored, rejected above 6" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, a DATETIME(6) NOT NULL, b TIMESTAMP(0), c TIMESTAMPTZ(3))");
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db, "INSERT INTO t VALUES (1, '2024-01-15 12:30:45.123456', '2024-01-15 12:30:45.123456', NULL)");
+    defer q2.deinit();
+    _ = try q2.next();
+
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q3 = try runSql(allocator, db, "SELECT a, b FROM t");
+    defer q3.deinit();
+    const batch = (try q3.next()).?;
+    const expected: i64 = @as(i64, 19737) * 86_400 * 1_000_000 + @as(i64, 12 * 3600 + 30 * 60 + 45) * 1_000_000 + 123_456;
+    try std.testing.expectEqual(expected, batch.values[0].data.datetime[0]);
+    // Declared precision never rounds: TIMESTAMP(0) still keeps full micros.
+    try std.testing.expectEqual(expected, batch.values[1].data.datetime[0]);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        thindb.sql.ParseError.SqlExpectedValue,
+        thindb.sql.parse(arena.allocator(), "CREATE TABLE bad (id BIGINT PRIMARY KEY, ts DATETIME(7))"),
+    );
+}
+
 test "sql roundtrip: DECIMAL column from string literal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
