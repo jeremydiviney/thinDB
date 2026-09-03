@@ -81,6 +81,11 @@ function* genQueries() {
       yield `SELECT id FROM c WHERE ABS(${a}) > 2 AND id < 6 ORDER BY id`
       yield `SELECT id FROM c WHERE NOT (${a} > 2 OR id > 5) ORDER BY id`
    }
+   // Fractional literals against integer columns (MySQL folding semantics).
+   for (const cmp of CMPS) yield `SELECT id FROM c WHERE i ${cmp} 2.5 ORDER BY id`
+   yield `SELECT id FROM c WHERE i IN (2.5, 7, 12) ORDER BY id`
+   yield `SELECT id FROM c WHERE i NOT IN (2.5, 7) AND i > 0 ORDER BY id`
+   yield `SELECT id FROM c WHERE b IN (1000, 3000.0, 5000) ORDER BY id`
    yield `SELECT id FROM c WHERE n IS NULL ORDER BY id`
    yield `SELECT id FROM c WHERE n IS NOT NULL AND n > 2 ORDER BY id`
    yield `SELECT id FROM c WHERE s = 'alpha' ORDER BY id`

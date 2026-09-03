@@ -34,6 +34,7 @@ const ir = @import("../ir/ir.zig");
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
+const predicate_mod = @import("predicate.zig");
 
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
@@ -2517,32 +2518,15 @@ fn broadcastOutputCell(cell: OutCell, src_row: u32, dst_row: u32) !void {
     try copyCell(cell.column.*, src_row, cell.column, dst_row);
 }
 
-/// An integer default literal against a decimal value column scales at plan
-/// time (`LAG(amount, 1, 0)`) — writeLiteral dispatches on the column type
-/// and cannot recover the scale from a raw int payload.
+/// A default literal against a differently-typed value column adopts the
+/// column's type when losslessly representable (`LAG(amount, 1, 0)` over a
+/// decimal column scales the 0 at plan time — writeLiteral dispatches on
+/// the column type and cannot recover a scale from a raw int payload).
+/// Non-coercible literals pass through for the writer to accept or reject.
 fn coerceDefaultLit(v: Value, col_type: Type) !Value {
-    const spec = col_type.decimalSpec() orelse return v;
-    const raw: i128 = switch (v) {
-        .int => |x| x,
-        .bigint => |x| x,
-        .smallint => |x| x,
-        .tinyint => |x| x,
-        .largeint => |x| x,
-        else => return v,
-    };
-    var scaled: i128 = raw;
-    var k: u8 = 0;
-    while (k < spec.s) : (k += 1) {
-        scaled = std.math.mul(i128, scaled, 10) catch return Error.WindowUnsupported;
-    }
-    return switch (std.meta.activeTag(col_type)) {
-        .decimal64 => if (scaled >= std.math.minInt(i64) and scaled <= std.math.maxInt(i64))
-            Value{ .decimal64 = @intCast(scaled) }
-        else
-            Error.WindowUnsupported,
-        .decimal128 => Value{ .decimal128 = scaled },
-        else => unreachable,
-    };
+    var out = v;
+    predicate_mod.coerceValue(&out, col_type) catch return v;
+    return out;
 }
 
 fn writeLiteralCell(cell: OutCell, row: u32, lit: Value) !void {

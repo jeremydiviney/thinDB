@@ -428,17 +428,9 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             const col_tag = ValueTag.fromType(col_type);
             const val_tag = std.meta.activeTag(p.val);
             if (col_tag != val_tag) {
-                // Decimal needs the column scale (which `tryWidenLiteral` can't
-                // see from the tag) to align the literal mantissa to the column.
-                if (col_type.decimalSpec()) |spec| {
-                    coerceLiteralToDecimal(&p.val, spec, col_type == .decimal128) catch {
-                        return Error.PredicateTypeMismatch;
-                    };
-                } else {
-                    tryWidenLiteral(&p.val, col_tag) catch {
-                        return Error.PredicateTypeMismatch;
-                    };
-                }
+                coerceValue(&p.val, col_type) catch {
+                    if (!foldFractionalComparison(expr, col_type)) return Error.PredicateTypeMismatch;
+                };
             }
         },
         .day_leaf => |*p| {
@@ -498,14 +490,39 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // `.always` is a constant-bool resolved form; nothing to
         // validate against schema.
         .always => {},
-        // `.in_set` — column must exist and types must agree. The
-        // pre-compile pass already type-checked at resolution; this
-        // is a safety net.
-        .in_set => |s| {
+        // `.in_set` — column must exist; each value coerces to the column
+        // type. A literal that CANNOT represent in the column type can never
+        // equal it (`x IN (2.5, 5)` on an INT column: 2.5 matches nothing)
+        // and is dropped from the set — correct for the negated form too
+        // (`x <> 2.5` is always true for an INT x under this dialect's
+        // NULL-skipping NOT IN). Values are arena-owned parse output;
+        // in-place rewrite mirrors the `.leaf` arm.
+        .in_set => |*s| {
             const col_idx = types.findColumn(schema, s.col) orelse return Error.ColumnNotFound;
-            const col_tag = ValueTag.fromType(schema[col_idx].type);
+            const col_type = schema[col_idx].type;
+            const col_tag = ValueTag.fromType(col_type);
+            var needs_rewrite = false;
             for (s.values) |v| {
-                if (std.meta.activeTag(v) != col_tag) return Error.PredicateTypeMismatch;
+                if (std.meta.activeTag(v) != col_tag) {
+                    needs_rewrite = true;
+                    break;
+                }
+            }
+            // Write only when a coercion is actually needed — like the
+            // `.leaf` arm, matching-tag predicates stay untouched so
+            // statically-built IR (rodata value slices) never faults.
+            if (needs_rewrite) {
+                const vals = @constCast(s.values);
+                var keep: usize = 0;
+                for (s.values) |v| {
+                    var c = v;
+                    if (std.meta.activeTag(c) != col_tag) {
+                        coerceValue(&c, col_type) catch continue;
+                    }
+                    vals[keep] = c;
+                    keep += 1;
+                }
+                s.values = vals[0..keep];
             }
         },
         // `.correlated_set` — every outer_col must exist; per-row
@@ -567,6 +584,51 @@ fn findCol(schema: []const Column, name: []const u8) ?usize {
 /// Pub: the keyed-access bloom gate (api/comparison.appendPredicateValueBytes)
 /// must coerce literals identically to predicate evaluation, or a single
 /// text-vs-DATE key column silently disables bloom pruning for the statement.
+/// A fractional numeric literal compared against an integer-family column
+/// can never be equal; instead of erroring, comparisons fold to the
+/// equivalent integer form — MySQL semantics: `x = 2.5` matches nothing,
+/// `x <> 2.5` matches every non-NULL row, `x < 2.5` ⇔ `x < 3`,
+/// `x <= 2.5` ⇔ `x <= 2`, `x > 2.5` ⇔ `x > 2`, `x >= 2.5` ⇔ `x >= 3`.
+/// Returns false when the shape doesn't apply (caller errors).
+fn foldFractionalComparison(expr: *PredicateExpr, col_type: types.Type) bool {
+    const p = expr.leaf;
+    if (!col_type.isInteger()) return false;
+    const f: f64 = switch (p.val) {
+        .double => |v| v,
+        .float => |v| v,
+        else => return false,
+    };
+    if (!std.math.isFinite(f) or @trunc(f) == f) return false;
+    switch (p.op) {
+        .eq => {
+            expr.* = .{ .always = false };
+            return true;
+        },
+        .neq => {
+            expr.* = .{ .is_not_null = p.col };
+            return true;
+        },
+        .lt, .gte, .lte, .gt => {
+            const bound = if (p.op == .lt or p.op == .gte) @ceil(f) else @floor(f);
+            if (@abs(bound) >= 9.2e18) return false;
+            var v = types.Value{ .bigint = @intFromFloat(bound) };
+            coerceValue(&v, col_type) catch return false;
+            expr.* = .{ .leaf = .{ .col = p.col, .op = p.op, .val = v } };
+            return true;
+        },
+    }
+}
+
+/// THE literal-coercion entry: adopt `target`'s type when the value is
+/// losslessly representable there (int-family widening/narrow-with-fit,
+/// int/float → decimal at the target's scale, text → temporal by parsing,
+/// float → double). Callers that can tolerate a non-coercible literal
+/// (a writer that handles the raw tag) `catch` and keep the original.
+pub fn coerceValue(val: *Value, target: types.Type) error{NoWidening}!void {
+    if (target.decimalSpec()) |spec| return coerceLiteralToDecimal(val, spec, target == .decimal128);
+    return tryWidenLiteral(val, ValueTag.fromType(target));
+}
+
 pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
     // Text literal compared against a temporal column: parse it.
     if (val.* == .text) {
@@ -587,12 +649,9 @@ pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
 
     // Integer-family literal → integer-family / boolean column. Widening
     // is always safe; narrowing is gated on the value fitting the target.
-    if (val.* == .float) {
-        if (target == .double) {
-            val.* = .{ .double = val.float };
-            return;
-        }
-        return error.NoWidening;
+    if (val.* == .float and target == .double) {
+        val.* = .{ .double = val.float };
+        return;
     }
     const iv: i128 = switch (val.*) {
         .tinyint => |v| v,
@@ -601,6 +660,18 @@ pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
         .bigint => |v| v,
         .largeint => |v| v,
         .boolean => |v| @intFromBool(v),
+        // A whole-valued float literal adopts an integer target exactly
+        // (`x = 2.0` on an INT column). Fractional values stay NoWidening —
+        // comparison folding (foldFractionalComparison) handles those.
+        .float => |v| blk: {
+            const f: f64 = v;
+            if (!std.math.isFinite(f) or @trunc(f) != f or @abs(f) >= 1.7e38) return error.NoWidening;
+            break :blk @intFromFloat(f);
+        },
+        .double => |v| blk: {
+            if (!std.math.isFinite(v) or @trunc(v) != v or @abs(v) >= 1.7e38) return error.NoWidening;
+            break :blk @intFromFloat(v);
+        },
         else => return error.NoWidening,
     };
     switch (target) {

@@ -82,3 +82,40 @@ test "IN: single-element list still works" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{4}, ids);
 }
+
+test "in-list: fractional literals against an integer column follow MySQL semantics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const h = @import("sql_helpers.zig");
+    try h.exec(allocator, db, "CREATE TABLE fx (id BIGINT PRIMARY KEY, x INT)");
+    try h.exec(allocator, db, "INSERT INTO fx VALUES (1, 2), (2, 5), (3, NULL)");
+
+    const in_ids = try h.collectBigints(allocator, db, "SELECT id FROM fx WHERE x IN (2.5, 5) ORDER BY id");
+    defer allocator.free(in_ids);
+    try std.testing.expectEqualSlices(i64, &.{2}, in_ids);
+
+    const eq_ids = try h.collectBigints(allocator, db, "SELECT id FROM fx WHERE x = 2.5 ORDER BY id");
+    defer allocator.free(eq_ids);
+    try std.testing.expectEqual(@as(usize, 0), eq_ids.len);
+
+    const whole_ids = try h.collectBigints(allocator, db, "SELECT id FROM fx WHERE x = 2.0 ORDER BY id");
+    defer allocator.free(whole_ids);
+    try std.testing.expectEqualSlices(i64, &.{1}, whole_ids);
+
+    const neq_ids = try h.collectBigints(allocator, db, "SELECT id FROM fx WHERE x <> 2.5 ORDER BY id");
+    defer allocator.free(neq_ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, neq_ids);
+
+    const lt_ids = try h.collectBigints(allocator, db, "SELECT id FROM fx WHERE x < 2.5 ORDER BY id");
+    defer allocator.free(lt_ids);
+    try std.testing.expectEqualSlices(i64, &.{1}, lt_ids);
+
+    const gt_ids = try h.collectBigints(allocator, db, "SELECT id FROM fx WHERE x > 2.5 ORDER BY id");
+    defer allocator.free(gt_ids);
+    try std.testing.expectEqualSlices(i64, &.{2}, gt_ids);
+}
