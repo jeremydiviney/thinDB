@@ -849,8 +849,7 @@ test "window: SUM and AVG over DECIMAL inputs (running and framed)" {
     try helpers2.exec(allocator, db, "CREATE TABLE dts (id BIGINT PRIMARY KEY, grp BIGINT, amt DECIMAL(16,6))");
     try helpers2.exec(allocator, db, "INSERT INTO dts VALUES (1, 1, '1.500000'), (2, 1, '2.250000'), (3, 1, '3.000000')");
 
-    var q = try runSql(allocator, db,
-        "SELECT id, SUM(amt) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs, AVG(amt) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS fa FROM dts ORDER BY id ASC");
+    var q = try runSql(allocator, db, "SELECT id, SUM(amt) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs, AVG(amt) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS fa FROM dts ORDER BY id ASC");
     defer q.deinit();
     const b = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 3), b.row_count);
@@ -876,8 +875,7 @@ test "window: LAG over DECIMAL with integer default, and CASE mixing decimal wit
     try helpers3.exec(allocator, db, "CREATE TABLE dl (id BIGINT PRIMARY KEY, grp BIGINT, amt DECIMAL(10,2))");
     try helpers3.exec(allocator, db, "INSERT INTO dl VALUES (1, 1, '1.50'), (2, 1, '2.25'), (3, 1, '3.75')");
 
-    var q = try runSql(allocator, db,
-        "SELECT id, LAG(amt, 1, 0) OVER (PARTITION BY grp ORDER BY id) AS prev, LAG(CASE WHEN id > 1 THEN amt ELSE 0 END, 1, 0) OVER (PARTITION BY grp ORDER BY id) AS prev_gated FROM dl ORDER BY id ASC");
+    var q = try runSql(allocator, db, "SELECT id, LAG(amt, 1, 0) OVER (PARTITION BY grp ORDER BY id) AS prev, LAG(CASE WHEN id > 1 THEN amt ELSE 0 END, 1, 0) OVER (PARTITION BY grp ORDER BY id) AS prev_gated FROM dl ORDER BY id ASC");
     defer q.deinit();
     const b = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 3), b.row_count);
