@@ -517,7 +517,7 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
                 depth -= 1;
                 if (depth == 0) break;
             },
-            .plus, .minus, .star, .slash, .percent => {
+            .plus, .minus, .star, .slash, .percent, .kw_div => {
                 if (depth == 1) saw_arithmetic = true;
             },
             else => {},

@@ -831,6 +831,12 @@ const GlobalAggregatePlan = struct {
     having_filter: ?ir.Op.Filter,
     group_by: ir.Op.GroupBy,
     derived: []const ir.Derived = &.{},
+    /// Post-aggregate scalar expressions over the aggregate outputs
+    /// (`SELECT SUM(a) / COUNT(*)` hoists to hidden aggs + this layer).
+    post_derived: []const ir.Derived = &.{},
+    /// SELECT-list columns when a post layer exists (drops hidden
+    /// `__agg_expr_*` outputs); null = emit the aggregate output as-is.
+    output_names: ?[]const []const u8 = null,
 };
 
 fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
@@ -844,6 +850,14 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
     if (op.* == .limit) op = op.limit.upstream;
     if (op.* == .order_by) op = op.order_by.upstream;
 
+    // Post-aggregate Compute: scalar expressions over the aggregate outputs
+    // (hidden `__agg_expr_*` refs from `SELECT SUM(a) / COUNT(*)` shapes).
+    var post_derived: []const ir.Derived = &.{};
+    if (op.* == .compute) {
+        post_derived = op.compute.derived;
+        op = op.compute.upstream;
+    }
+
     var having_filter: ?ir.Op.Filter = null;
     if (op.* == .filter) {
         having_filter = op.filter;
@@ -852,8 +866,32 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
     if (op.* != .group_by) return null;
     const group_by = op.group_by;
     if (group_by.group_cols.len != 0) return null;
+    var output_names: ?[]const []const u8 = null;
     if (top_project) |p| {
-        if (!projectMatchesGroupOutput(p, group_by)) return null;
+        if (post_derived.len == 0) {
+            if (!projectMatchesGroupOutput(p, group_by)) return null;
+        } else {
+            // Every projected column must be an aggregate output or a
+            // post-computed name; the project then drops the hidden aggs.
+            for (p.columns) |c| {
+                var found = false;
+                for (group_by.aggs) |a| {
+                    if (types.columnNameEql(a.as, c)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) for (post_derived) |d| {
+                    if (types.columnNameEql(d.name, c)) {
+                        found = true;
+                        break;
+                    }
+                };
+                if (!found) return null;
+            }
+            if (p.outputs != null) return null;
+            output_names = p.columns;
+        }
     }
 
     // Peel an optional row-local Compute (derived aggregate inputs, e.g.
@@ -885,12 +923,23 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
         .having_filter = having_filter,
         .group_by = group_by,
         .derived = derived,
+        .post_derived = post_derived,
+        .output_names = output_names,
     };
 }
 
 fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchGlobalAggregate(root) orelse return null;
+    var base = (try buildGlobalAggregateBase(input, plan)) orelse return null;
+    if (plan.post_derived.len > 0) {
+        errdefer base.deinit();
+        base = try base.computeWithRegistry(plan.post_derived, input.udf_registry);
+        if (plan.output_names) |names| base = try base.project(names);
+    }
+    return base;
+}
 
+fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?exec.Query {
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
     // GROUP_CONCAT (no UDAF): a variable-state aggregate the parallel reducer
@@ -922,7 +971,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // metadata lane: a reduced integer SUM narrows through `__narrow_bigint`'s
     // i64 range check (the documented overflow dialect), which the metadata
     // lane's canonical-type emit would silently skip.
-    if (plan.having_filter == null) {
+    if (plan.having_filter == null and plan.post_derived.len == 0) {
         if (try affine_agg.reduce(input.node_arena, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
             return try buildGlobalAggregateReduced(input, table, plan, red);
         }
@@ -936,7 +985,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // types, and for any stats-dependent spec an empty memtable and zero
     // tombstones) and returns null to fall through to the scan pipeline
     // whenever any fails.
-    if (plan.where_filter == null and plan.having_filter == null and plan.derived.len == 0) {
+    if (plan.where_filter == null and plan.having_filter == null and plan.derived.len == 0 and plan.post_derived.len == 0) {
         if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs)) |q| return q;
     }
 
