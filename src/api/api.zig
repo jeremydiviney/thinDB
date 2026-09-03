@@ -23,6 +23,10 @@ pub const Error = error{
     FunctionAlreadyExists,
     FunctionInvalidDefinition,
     FunctionNotFound,
+    /// A WAL file was found inside the table's segments directory. It holds
+    /// acknowledged rows that replay would never see; the table refuses to
+    /// open until an operator moves the log into place or aside.
+    WalOrphaned,
 };
 
 pub const SyncMode = enum { none, per_flush };

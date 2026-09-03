@@ -619,7 +619,10 @@ SchemaMismatch, UnsupportedUniqueKeyType, UpsertRequiresUniqueKey,
 TableNotFound, TableAlreadyExists, ColumnNotFound,
 ColumnAlreadyExists, UnsupportedAlterOp,
 FunctionAlreadyExists, FunctionInvalidDefinition,
+WalOrphaned,
 ```
+
+`WalOrphaned`: a `wal` file sits inside the table's `segments/` directory. Replay only reads the log beside the manifest, so that file holds acknowledged rows a normal open would silently drop; the table refuses to open until an operator moves the log into place (same schema fingerprint) or aside.
 
 **Execution-level (`src/exec/exec.zig`):**
 ```

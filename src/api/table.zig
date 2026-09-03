@@ -178,6 +178,17 @@ pub const Table = struct {
         var segments_dir = try table_dir.createDirPathOpen(io, "segments", .{});
         errdefer segments_dir.close(io);
 
+        // The log belongs beside the manifest. One inside segments/ is the
+        // footprint of a writer that outlived a directory swap and holds
+        // acked rows the replay below would never see; opening anyway would
+        // drop them silently.
+        if (segments_dir.access(io, engine.wal.wal_filename, .{})) |_| {
+            return Error.WalOrphaned;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
         var manifest = try storage.readManifest(allocator, io, table_dir, fp);
         errdefer manifest.deinit();
         // Fresh manifests (no file on disk) carry column_count=0; set
