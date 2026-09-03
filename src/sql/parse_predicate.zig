@@ -24,6 +24,7 @@ const PredicateOp = exec_predicate.PredicateOp;
 const types = @import("../types.zig");
 const Value = types.Value;
 const ir = @import("../ir/ir.zig");
+const parse_window = @import("parse_window.zig");
 
 pub fn parseBoolExpr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     return try parseOr(p);
@@ -226,6 +227,34 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .lparen) {
         var saw_distinct = false;
         const args = try p.parseCallArgList(&saw_distinct);
+        // Window call in a predicate position — only where the projection's
+        // hoisting channels are live (CASE WHEN conditions inside the select
+        // list); WHERE/HAVING contexts keep rejecting OVER. Checked before
+        // the aggregate arm so `SUM(x) OVER (...)` hoists as a window.
+        if (p.cur.tag == .kw_over and p.aggregateExprRefsEnabled()) {
+            if (saw_distinct) return PE.SqlInvalidProjection;
+            try p.advance();
+            const spec_kind = try parse_window.parseWindowSpecOrRef(p);
+            const wfunc = ir.windowFuncForName(col_dup) orelse return PE.SqlInvalidProjection;
+            parse_window.validateWindowCall(wfunc, args, false) catch return PE.SqlInvalidProjection;
+            const hidden = try p.materializeWindowExpr(.{
+                .func = wfunc,
+                .args = args,
+                .ignore_nulls = false,
+                .spec_kind = spec_kind,
+            });
+            const lhs = try p.continueBinaryFrom(.{ .col_ref = hidden });
+            if (isComparisonToken(p.cur.tag)) {
+                const op = try parseComparisonToken(p);
+                const rhs = try p.parseAddSub();
+                return try makeExprComparisonPredicate(p, lhs, op, rhs);
+            }
+            const anchored = switch (lhs) {
+                .col_ref => |c| c,
+                else => try p.materializePredicateExpr(lhs),
+            };
+            return try parseColOps(p, anchored);
+        }
         if (p.aggregateFuncForName(col_dup)) |func| {
             if (p.aggregateExprRefsEnabled()) {
                 col_dup = try p.materializeAggregateExpr(col_dup, func, args, saw_distinct);
@@ -238,23 +267,57 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref) {
             return try makeDayComparison(p, args[0].col_ref);
         } else {
-            const lhs = ir.Expr{ .call = .{
+            var lhs = ir.Expr{ .call = .{
                 .fn_name = try p.arena.dupe(u8, col_dup),
                 .args = args,
             } };
-            if (!isComparisonToken(p.cur.tag)) {
-                return try makeExprComparisonPredicate(
+            lhs = try p.continueBinaryFrom(lhs);
+            if (isComparisonToken(p.cur.tag)) {
+                const op = try parseComparisonToken(p);
+                const rhs = try p.parseAddSub();
+                return try makeExprComparisonPredicate(p, lhs, op, rhs);
+            }
+            switch (p.cur.tag) {
+                // `ABS(x) BETWEEN ...`, `fn(x) IN (...)`, `fn(x) IS NULL`:
+                // anchor the call to a hidden computed column and reuse the
+                // operator tail.
+                .kw_is, .kw_not, .kw_between, .kw_like, .kw_in => {
+                    const anchored = try p.materializePredicateExpr(lhs);
+                    return try parseColOps(p, anchored);
+                },
+                // Bare call = truthiness (`WHERE fn(x)`).
+                else => return try makeExprComparisonPredicate(
                     p,
                     lhs,
                     .eq,
                     .{ .lit = .{ .boolean = true } },
-                );
+                ),
             }
-            const op = try parseComparisonToken(p);
-            const rhs = try p.parseAddSub();
-            return try makeExprComparisonPredicate(p, lhs, op, rhs);
         }
     }
+
+    // Arithmetic continuation from a bare column (`i + 1 > 3`,
+    // `qty * 2 IN (...)`): the expression materializes to a hidden
+    // computed column and the normal operator tail anchors to it.
+    if (isArithToken(p.cur.tag)) {
+        const lhs = try p.continueBinaryFrom(.{ .col_ref = col_dup });
+        col_dup = try p.materializePredicateExpr(lhs);
+    }
+    return try parseColOps(p, col_dup);
+}
+
+fn isArithToken(tag: anytype) bool {
+    return switch (tag) {
+        .plus, .minus, .star, .slash, .percent, .kw_div => true,
+        else => false,
+    };
+}
+
+/// The operator tail shared by every LHS that resolves to a column name —
+/// plain columns, hidden computed columns, hidden window/aggregate outputs:
+/// IS [NOT] NULL, [NOT] BETWEEN, [NOT] LIKE, [NOT] IN, comparisons.
+fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
+    const PE = @TypeOf(p.*).Err;
 
     // IS NULL / IS NOT NULL.
     if (p.cur.tag == .kw_is) {
@@ -525,16 +588,28 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
     }
     if (!saw_arithmetic and !case_start) return false;
     const op_tok = try look.next();
-    return isComparisonToken(op_tok.tag);
+    return isComparisonToken(op_tok.tag) or switch (op_tok.tag) {
+        // `(expr) BETWEEN/IN/IS/LIKE/NOT ...` — the group anchors to a
+        // hidden computed column and takes the normal operator tail.
+        .kw_between, .kw_in, .kw_is, .kw_like, .kw_not => true,
+        else => false,
+    };
 }
 
 fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     try p.expect(.lparen);
     const lhs = try p.parseAddSub();
     try p.expect(.rparen);
-    const op = try parseComparisonToken(p);
-    const rhs = try p.parseAddSub();
-    return try makeExprComparisonPredicate(p, lhs, op, rhs);
+    if (isComparisonToken(p.cur.tag)) {
+        const op = try parseComparisonToken(p);
+        const rhs = try p.parseAddSub();
+        return try makeExprComparisonPredicate(p, lhs, op, rhs);
+    }
+    const anchored = switch (lhs) {
+        .col_ref => |c| c,
+        else => try p.materializePredicateExpr(lhs),
+    };
+    return try parseColOps(p, anchored);
 }
 
 fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {

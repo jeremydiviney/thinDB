@@ -1641,7 +1641,7 @@ pub const Parser = struct {
     /// `parseProjItem` (which has already consumed the leading
     /// identifier/call/dotted-col but not yet checked for an
     /// operator). Returns `atom` unchanged if no operator follows.
-    fn continueBinaryFrom(self: *Parser, atom: ir.Expr) ParseError!ir.Expr {
+    pub fn continueBinaryFrom(self: *Parser, atom: ir.Expr) ParseError!ir.Expr {
         // JSON `->`/`->>` bind tighter than arithmetic — consume any that
         // trail the already-parsed atom before climbing precedence levels.
         var lhs = try self.consumeJsonArrows(atom);
@@ -2068,7 +2068,7 @@ pub const Parser = struct {
         return name;
     }
 
-    fn materializeWindowExpr(self: *Parser, call: ParsedWindowCall) ParseError![]const u8 {
+    pub fn materializeWindowExpr(self: *Parser, call: ParsedWindowCall) ParseError![]const u8 {
         const name = std.fmt.allocPrint(self.arena, "__window_expr_{d}", .{self.window_expr_counter}) catch return ParseError.OutOfMemory;
         self.window_expr_counter += 1;
         try self.window_expr_refs.append(self.arena, .{ .name = name, .call = call });

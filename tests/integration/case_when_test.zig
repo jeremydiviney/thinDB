@@ -257,3 +257,29 @@ test "case: bare NULL branch adopts the typed branches' type" {
     try std.testing.expectEqual(@as(u8, 0), nulls[0] & 1);
     try std.testing.expectEqual(@as(u8, 2), nulls[0] & 2);
 }
+
+test "case: window call inside a WHEN condition hoists in projection context" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE wt (id BIGINT PRIMARY KEY, g INT, qty INT)");
+    try exec(allocator, db, "INSERT INTO wt VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)");
+    const t = try db.openTable("wt", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db, "SELECT id, CASE WHEN ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) < 2 THEN qty ELSE 0 END AS v FROM wt ORDER BY id ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    try std.testing.expectEqual(@as(i32, 10), b.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 0), b.values[1].data.int[1]);
+    try std.testing.expectEqual(@as(i32, 30), b.values[1].data.int[2]);
+
+    // Windows stay illegal in WHERE.
+    const bad = runSql(allocator, db, "SELECT id FROM wt WHERE ROW_NUMBER() OVER (ORDER BY id) < 2");
+    try std.testing.expectError(error.SqlTrailingTokens, bad);
+}
