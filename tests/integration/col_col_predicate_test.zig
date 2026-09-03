@@ -142,3 +142,36 @@ test "col-col: mixed numeric types widen (double vs int)" {
     defer allocator.free(ids2);
     try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, ids2);
 }
+
+test "predicate: expression-led LHS anchors to a hidden computed column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const h = @import("sql_helpers.zig");
+    try h.exec(allocator, db, "CREATE TABLE ex (id BIGINT PRIMARY KEY, i INT, d DOUBLE)");
+    try h.exec(allocator, db, "INSERT INTO ex VALUES (1, 3, 1.5), (2, 12, 3.5), (3, -4, -2.5)");
+
+    const a = try h.collectBigints(allocator, db, "SELECT id FROM ex WHERE i + 1 > 3 ORDER BY id");
+    defer allocator.free(a);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, a);
+
+    const b = try h.collectBigints(allocator, db, "SELECT id FROM ex WHERE (i * 2) BETWEEN 1 AND 20 ORDER BY id");
+    defer allocator.free(b);
+    try std.testing.expectEqualSlices(i64, &.{1}, b);
+
+    const c = try h.collectBigints(allocator, db, "SELECT id FROM ex WHERE i + 1 IN (4, 8, 13) ORDER BY id");
+    defer allocator.free(c);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, c);
+
+    const e = try h.collectBigints(allocator, db, "SELECT id FROM ex WHERE ABS(d) BETWEEN 2 AND 3 ORDER BY id");
+    defer allocator.free(e);
+    try std.testing.expectEqualSlices(i64, &.{3}, e);
+
+    const f = try h.collectBigints(allocator, db, "SELECT id FROM ex WHERE d * 2 NOT IN (3.0, 9.0) AND id < 3 ORDER BY id");
+    defer allocator.free(f);
+    try std.testing.expectEqualSlices(i64, &.{2}, f);
+}
