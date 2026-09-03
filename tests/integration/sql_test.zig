@@ -2538,13 +2538,35 @@ test "sql: unsupported JOIN ON predicates fail clearly" {
 
     try std.testing.expectError(
         thindb.sql.ParseError.SqlOnNonEquiUnsupported,
-        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a JOIN t AS b ON a.k > 1", .neutral),
-    );
-
-    try std.testing.expectError(
-        thindb.sql.ParseError.SqlOnNonEquiUnsupported,
         thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a LEFT JOIN t AS b ON a.k < b.k", .neutral),
     );
+}
+
+test "sql: JOIN ON with only side-local filters is a filtered cross product" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const cases = .{
+        // left-side filter keeps id 5 only; every right row pairs with it
+        .{ .sql = "SELECT COUNT(*) AS n, COUNT(b.id) AS nb FROM t AS a JOIN t AS b ON a.k > 200", .n = 5, .nb = 5 },
+        // right-side filter keeps ids 1,2; every left row pairs with both
+        .{ .sql = "SELECT COUNT(*) AS n, COUNT(b.id) AS nb FROM t AS a JOIN t AS b ON b.k = 100", .n = 10, .nb = 10 },
+        // LEFT JOIN against an empty filtered right side still pads every left row
+        .{ .sql = "SELECT COUNT(*) AS n, COUNT(b.id) AS nb FROM t AS a LEFT JOIN t AS b ON b.k > 1000", .n = 5, .nb = 0 },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 1), b.row_count);
+        try std.testing.expectEqual(@as(i64, c.n), b.values[0].data.bigint[0]);
+        try std.testing.expectEqual(@as(i64, c.nb), b.values[1].data.bigint[0]);
+    }
 }
 
 test "sql: three-table JOIN (A JOIN B ON ... JOIN C ON ...)" {

@@ -914,7 +914,14 @@ pub const ParallelScan = struct {
                 for (self.compute_q) |*wq| wq.* = try wq.compute(derived);
             }
         }
-        if (self.compute_fused) self.out_schema = self.compute_q[0].outputSchema();
+        // A probe sink bound before the barrier already re-typed the
+        // emission to ITS output (tryFuseProbe / rechainProbeSink); the
+        // fused computes feed that sink, so their schema is internal to the
+        // worker pipeline. Overwriting here would report the pre-sink
+        // layout for batches shaped by the sink — consumers that re-read
+        // the schema lazily (aggregate accumulator typing) would then bind
+        // to the wrong columns.
+        if (self.compute_fused and self.probe_sink == null) self.out_schema = self.compute_q[0].outputSchema();
     }
 
     pub fn deinit(self: *ParallelScan) void {
@@ -1109,6 +1116,7 @@ pub const ParallelScan = struct {
     pub fn rechainProbeSink(self: *ParallelScan, sink: exec.ProbeSink) !bool {
         if (self.mode != .unset) return false;
         if (self.probe_sink == null or self.agg_fused or self.owns_out_schema) return false;
+        if (!self.probeMapInRange(sink)) return false;
         try sink.bind(sink.ctx, self.plannedChunks(), self.worker_alloc);
         self.out_schema = sink.out_schema;
         return true;
@@ -1151,6 +1159,10 @@ pub const ParallelScan = struct {
             if (trace_jf) std.debug.print("[jf]   ps decline: emit_keep={} owns_schema={}\n", .{ self.emit_keep != null, self.owns_out_schema });
             return false;
         }
+        if (!self.probeMapInRange(sink)) {
+            if (trace_jf) std.debug.print("[jf]   ps decline: probe_map exceeds chunk schema ({d} cols)\n", .{self.out_schema.len});
+            return false;
+        }
         if (sink.probe_map) |m| {
             const slices = try self.allocator.alloc([]ColumnView, self.plannedChunks());
             var built: usize = 0;
@@ -1184,6 +1196,19 @@ pub const ParallelScan = struct {
         return .{ .schema = batch.schema, .values = vs, .row_count = batch.row_count };
     }
 
+    /// A probe map must address the columns this scan's chunks actually
+    /// emit. A map composed through a subtree that layers computes or
+    /// joins can carry indices into THAT op's wider output — accepting it
+    /// would read past the chunk batch, so the offer declines and the join
+    /// keeps its serial streaming probe.
+    fn probeMapInRange(self: *const ParallelScan, sink: exec.ProbeSink) bool {
+        const m = sink.probe_map orelse return true;
+        for (m) |src| {
+            if (src >= self.out_schema.len) return false;
+        }
+        return true;
+    }
+
     pub fn tryFuseAggregate(self: *ParallelScan, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
         if (self.stage_deferred and self.workers.len == 0) {
             // Deferred leaf: the chunk scans don't exist yet, but with a
@@ -1193,7 +1218,7 @@ pub const ParallelScan = struct {
             // worker count yield empty partials). Without a probe sink
             // there is nothing chunk-shaped to wrap; decline.
             if (self.probe_sink == null) return false;
-            if (self.mode != .unset or self.compute_fused or self.agg_fused) return false;
+            if (self.mode != .unset or self.compute_fused or self.pending_computes.items.len > 0 or self.agg_fused) return false;
             const n = self.plannedChunks();
             const q = try self.allocator.alloc(Query, n);
             self.agg_q = q;
@@ -1207,7 +1232,7 @@ pub const ParallelScan = struct {
             self.agg_fused = true;
             return true;
         }
-        if (self.mode != .unset or self.compute_fused or self.agg_fused) return false;
+        if (self.mode != .unset or self.compute_fused or self.pending_computes.items.len > 0 or self.agg_fused) return false;
         const q = try self.allocator.alloc(Query, self.workers.len);
         self.agg_q = q;
         for (self.workers, 0..) |w, i| {
