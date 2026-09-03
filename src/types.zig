@@ -346,6 +346,10 @@ pub const Column = struct {
     /// this column from their column list. The value's tag must match
     /// the column type (the parser + compile path enforce this).
     default_value: ?Value = null,
+    /// `DEFAULT CURRENT_TIMESTAMP`: INSERT fills an omitted column with
+    /// the wall-clock time. Datetime columns only; exclusive with
+    /// `default_value`.
+    default_now: bool = false,
     /// MySQL-style AUTO_INCREMENT attribute. At most one column per
     /// table; type must be an integer width. The owning Table holds
     /// a monotonic counter in its manifest; INSERT fills omitted /

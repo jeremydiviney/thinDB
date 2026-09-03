@@ -605,7 +605,7 @@ fn buildAttribute(a: Allocator, catalog: *Catalog, session: Session, self: *PgCa
                     try attnum.append(a, @intCast(ci + 1));
                     try attnotnull.append(a, if (col.nullable) 0 else 1);
                     try attlen.append(a, typeLen(col.type));
-                    try atthasdef.append(a, if (col.default_value != null) 1 else 0);
+                    try atthasdef.append(a, if (col.default_value != null or col.default_now) 1 else 0);
                 }
             }
         }

@@ -319,7 +319,7 @@ fn collectStages(
             // (Stage.adopt_window); output pruning would wrap a Project over
             // the window and break the root identity — and with adoption the
             // copy it would save no longer exists.
-            const win_root = exec.queryAs(window_op.Window, q);
+            const win_root: ?*window_op.Window = if (exec.queryAs(window_op.Window, q)) |w| (if (w.adoptable()) w else null) else null;
             // A TVF-rooted body hands its output stores to the stage the
             // same way (adopt_table_fn) — and like the window case, pruning
             // would wrap a Project over the root and break its identity.

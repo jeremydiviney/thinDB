@@ -2583,6 +2583,48 @@ test "sql: expression-led WHERE composes with global and grouped aggregates" {
     }
 }
 
+test "sql: StarRocks-dialect DDL, CURRENT_TIMESTAMP defaults, and truthiness" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // Table-level PRIMARY KEY after the column list, ENGINE/DISTRIBUTED/
+    // PROPERTIES noise, column COMMENTs, int(11) display widths, quoted
+    // defaults, and a wall-clock default — the seeder DDL the app's tests use.
+    var c = try helpers.runSqlMysql(allocator, db,
+        \\CREATE TABLE IF NOT EXISTS `flags` (
+        \\  `id` int(11) NOT NULL COMMENT "",
+        \\  `active` tinyint NOT NULL DEFAULT "0" COMMENT "",
+        \\  `note` varchar(32) NULL DEFAULT 'n/a',
+        \\  `seen` datetime NULL DEFAULT "1970-01-01 00:00:00",
+        \\  `createdAt` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP
+        \\) ENGINE=OLAP
+        \\PRIMARY KEY(`id`)
+        \\DISTRIBUTED BY HASH(`id`) BUCKETS 10
+        \\PROPERTIES ("replication_num" = "1", "storage_medium" = "SSD")
+    );
+    defer c.deinit();
+    _ = try c.next();
+    var ins = try runSql(allocator, db, "INSERT INTO flags (id, active) VALUES (1, 1), (2, 0), (3, 2)");
+    defer ins.deinit();
+    _ = try ins.next();
+
+    // Defaults: the quoted literals coerced, the wall clock filled.
+    var q = try runSql(allocator, db, "SELECT COUNT(*) AS n FROM flags WHERE note = 'n/a' AND seen = '1970-01-01 00:00:00' AND createdAt > '2020-01-01 00:00:00'");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 3), b.values[0].data.bigint[0]);
+
+    // A bare column in a boolean position is MySQL truthiness (non-zero).
+    var q2 = try runSql(allocator, db, "SELECT SUM(IF(active, 1, 0)) AS on_count FROM flags");
+    defer q2.deinit();
+    const b2 = (try q2.next()).?;
+    try std.testing.expectEqual(@as(i64, 2), b2.values[0].data.bigint[0]);
+}
+
 test "sql: JOIN ON with only side-local filters is a filtered cross product" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

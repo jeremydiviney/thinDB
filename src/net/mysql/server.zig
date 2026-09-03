@@ -1753,6 +1753,8 @@ fn allocCreateTableText(allocator: Allocator, t: *Table) ![]u8 {
                 .text => try out.print(allocator, " DEFAULT '{s}'", .{dtext}),
                 else => try out.print(allocator, " DEFAULT {s}", .{dtext}),
             }
+        } else if (col.default_now) {
+            try out.appendSlice(allocator, " DEFAULT CURRENT_TIMESTAMP");
         }
         if (col.auto_increment) try out.appendSlice(allocator, " AUTO_INCREMENT");
     }
@@ -2274,6 +2276,7 @@ fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
 /// SHOW COLUMNS / DESCRIBE, or null when there is no default. Caller owns
 /// the returned slice.
 fn allocColumnDefaultText(allocator: Allocator, col: types.Column) !?[]const u8 {
+    if (col.default_now) return try allocator.dupe(u8, "CURRENT_TIMESTAMP");
     const v = col.default_value orelse return null;
     return switch (v) {
         .boolean => |b| try allocator.dupe(u8, if (b) "1" else "0"),

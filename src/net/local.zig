@@ -2063,18 +2063,16 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     if (!c.column_type.isInteger()) return Error.TypeMismatch;
                     saw_auto_increment = true;
                 }
-                // Validate DEFAULT value-tag matches the column type so a
+                // Coerce the DEFAULT literal to the column type so a
                 // mismatch errors at CREATE TABLE rather than first INSERT.
-                if (c.default_value) |dv| {
-                    if (types.ValueTag.fromType(c.column_type) != std.meta.activeTag(dv)) {
-                        return Error.TypeMismatch;
-                    }
-                }
+                const dflt: ?Value = if (c.default_value) |dv| try coerceDefaultLiteral(dv, c.column_type) else null;
+                if (c.default_now and c.column_type != .datetime) return Error.TypeMismatch;
                 cols[ci] = .{
                     .name = c.name,
                     .type = c.column_type,
                     .nullable = c.nullable,
-                    .default_value = c.default_value,
+                    .default_value = dflt,
+                    .default_now = c.default_now,
                     .auto_increment = c.auto_increment,
                 };
             }
@@ -2154,17 +2152,14 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             }
             const target = try resolvePersistentTableTarget(catalog, ctx.session.*, at.table);
             const c = at.column;
-            if (c.auto_increment) return Error.UnsupportedOp;
-            if (c.default_value) |dv| {
-                if (types.ValueTag.fromType(c.column_type) != std.meta.activeTag(dv)) return Error.TypeMismatch;
-            } else if (!c.nullable) {
-                return Error.UnsupportedOp;
-            }
+            if (c.auto_increment or c.default_now) return Error.UnsupportedOp;
+            const add_default: ?Value = if (c.default_value) |dv| try coerceDefaultLiteral(dv, c.column_type) else null;
+            if (add_default == null and !c.nullable) return Error.UnsupportedOp;
             var ops = [_]AlterOp{.{ .add = .{
                 .name = c.name,
                 .type = c.column_type,
                 .nullable = c.nullable,
-                .default = c.default_value,
+                .default = add_default,
             } }};
             target.schema.alterTable(target.table_name, &ops) catch |e| return thindb_api.remapError(Error, e);
         },
@@ -2390,6 +2385,34 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
 }
 
+/// MySQL / StarRocks DDL quotes defaults freely (`DEFAULT "0"`,
+/// `DEFAULT '1970-01-01 00:00:00'`): a text literal adopts the column's
+/// type by parsing; any other literal widens through the predicate
+/// coercion rules. A literal the column can't hold is a TypeMismatch.
+fn coerceDefaultLiteral(dv: Value, col_type: types.Type) !Value {
+    var v = dv;
+    if (v == .text and !col_type.isString()) {
+        const s = std.mem.trim(u8, v.text, " ");
+        v = switch (col_type) {
+            .tinyint, .smallint, .int, .bigint, .largeint => .{ .bigint = std.fmt.parseInt(i64, s, 10) catch return Error.TypeMismatch },
+            .float, .double, .decimal64, .decimal128 => .{ .double = std.fmt.parseFloat(f64, s) catch return Error.TypeMismatch },
+            .boolean => .{ .boolean = std.mem.eql(u8, s, "1") or std.ascii.eqlIgnoreCase(s, "true") },
+            else => v,
+        };
+    }
+    if (types.ValueTag.fromType(col_type) != std.meta.activeTag(v)) {
+        exec.predicate.coerceValue(&v, col_type) catch return Error.TypeMismatch;
+    }
+    return v;
+}
+
+/// Wall-clock fill for a `DEFAULT CURRENT_TIMESTAMP` column omitted from an
+/// INSERT (microseconds since the epoch, the datetime storage unit).
+fn nowDatetime(ctx: *CompileCtx) Value {
+    const ts = std.Io.Clock.real.now(ctx.db.io);
+    return .{ .datetime = @intCast(@divTrunc(ts.nanoseconds, 1000)) };
+}
+
 fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, op.table);
@@ -2425,7 +2448,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         // values. AUTO_INCREMENT cols also auto-fill, so they don't
         // require an explicit source. NOT NULL columns without any of
         // these still error.
-        if (maybe_src == null and !col.nullable and col.default_value == null and !col.auto_increment) {
+        if (maybe_src == null and !col.nullable and col.default_value == null and !col.default_now and !col.auto_increment) {
             return Error.ColumnNotFound;
         }
     }
@@ -2485,6 +2508,8 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
                     row[src]
                 else if (col.default_value) |dv|
                     dv
+                else if (col.default_now)
+                    nowDatetime(ctx)
                 else
                     null;
                 try builder.appendCell(si, col, cell);
@@ -2499,13 +2524,16 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
                 // Resolution order for the cell:
                 //   1. User-supplied value (incl. an explicit NULL on a
                 //      nullable column).
-                //   2. Column DEFAULT, when no source AND a default exists.
+                //   2. Column DEFAULT, when no source AND a default exists
+                //      (a literal, or the wall clock for CURRENT_TIMESTAMP).
                 //   3. NULL (the column must be nullable to reach this
                 //      branch — validation above ensures it).
                 const cell: ?Value = if (maybe_src) |src|
                     row[src]
                 else if (col.default_value) |dv|
                     dv
+                else if (col.default_now)
+                    nowDatetime(ctx)
                 else
                     null;
                 try builder.appendCell(si, col, cell);
