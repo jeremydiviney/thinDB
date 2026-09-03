@@ -3339,7 +3339,17 @@ pub const Parser = struct {
         // A column range join (`l.a < r.b`) only has well-defined semantics for
         // an inner join; outer joins would need true ON-extra-predicate support.
         if (jtype != .inner and ranges.items.len > 0) return ParseError.SqlOnNonEquiUnsupported;
-        if (pairs.items.len == 0 and ranges.items.len == 0) return ParseError.SqlOnNonEquiUnsupported;
+        if (pairs.items.len == 0 and ranges.items.len == 0) {
+            // Every conjunct sided with one input (`ON r.currencyTo = 'USD'
+            // AND r.currencyBase = 'USD'`): a filtered cross product. Lower it
+            // to an equi join on a synthesized constant key so every row pairs
+            // with every filtered row and outer-join NULL padding works as-is.
+            if (left_filters.items.len == 0 and right_filters.items.len == 0) return ParseError.SqlOnNonEquiUnsupported;
+            const one = ir.Expr{ .lit = .{ .int = 1 } };
+            const left_name = try self.materializeJoinOperand(one, .left, &left_derived, &right_derived, &hidden_left, &synth_counter);
+            const right_name = try self.materializeJoinOperand(one, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
+            try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
+        }
         self.dropRedundantOuterJoinNotNullFilters(jtype, &left_filters, &right_filters, pairs.items, ranges.items);
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
