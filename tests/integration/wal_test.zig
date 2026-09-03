@@ -513,3 +513,150 @@ test "wal: DELETE FROM t (no WHERE) wipes the memtable on replay" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{}, ids);
 }
+
+test "wal: rows written after ALTER TABLE survive close-without-flush + reopen" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const altered_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "quantity", .type = .int },
+            .{ .name = "active", .type = .boolean },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+            .wal_enabled = true,
+            .auto_flush_secs = 0,
+            .auto_flush_rows = 1_000_000,
+            .auto_flush_bytes = 64 * 1024 * 1024,
+        });
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+            .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+        });
+        try t.flush();
+
+        // The shadow swap replaces the whole table directory, log included.
+        try db.alterTable("orders", &.{
+            .{ .rename = .{ .from = "qty", .to = "quantity" } },
+        });
+
+        try t.insert(&.{
+            .{ .id = @as(i64, 3), .quantity = @as(i32, 30), .active = true, .tag = "c" },
+            .{ .id = @as(i64, 4), .quantity = @as(i32, 40), .active = false, .tag = "d" },
+        });
+        // NO flush: rows 3 and 4 exist only in the memtable + WAL.
+        try std.testing.expectEqual(@as(u64, 2), t.memtable.row_count);
+    }
+
+    // The log must be exactly where reopen looks for it, and nowhere else.
+    try tmp.dir.access(io, "main/public/orders/wal", .{});
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io, "main/public/orders/segments/wal", .{}),
+    );
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    const t = try db.table("orders", altered_schema, opts_v1);
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4 }, ids.items);
+}
+
+test "wal: open refuses a table whose log sits inside segments/" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+        });
+        try t.flush();
+    }
+
+    // A log inside segments/ is the footprint of a writer that outlived a
+    // directory swap; it holds acked rows replay would never see.
+    {
+        var stray = try tmp.dir.createFile(io, "main/public/orders/segments/wal", .{});
+        defer stray.close(io);
+        try stray.writeStreamingAll(io, "tDBW");
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    try std.testing.expectError(error.WalOrphaned, db.table("orders", schema_v1, opts_v1));
+}
+
+test "wal: clean close flushes WAL-backed tables, leaving a segment and an empty log" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+            .wal_enabled = true,
+            .auto_flush_secs = 0,
+            .auto_flush_rows = 1_000_000,
+            .auto_flush_bytes = 64 * 1024 * 1024,
+        });
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+            .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+            .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "c" },
+        });
+        // NO explicit flush: the clean close must do it.
+        try std.testing.expectEqual(@as(usize, 0), t.segmentCount());
+    }
+
+    // Restart durability no longer hinges on replay finding the log: the
+    // rows are already in a segment and the log holds only its header.
+    var seg_dir = try tmp.dir.openDir(io, "main/public/orders/segments", .{ .iterate = true });
+    defer seg_dir.close(io);
+    var dat_files: usize = 0;
+    var it = seg_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".dat")) dat_files += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), dat_files);
+    {
+        var log = try tmp.dir.openFile(io, "main/public/orders/wal", .{});
+        defer log.close(io);
+        try std.testing.expectEqual(@as(u64, thindb.engine.wal.header_size), (try log.stat(io)).size);
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids.items);
+}

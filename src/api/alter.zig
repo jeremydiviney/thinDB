@@ -255,7 +255,18 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     try storage.writeManifest(t.io, shadow_dir, new_manifest, sync);
 
     // 5. Swap on disk: close current + shadow handles, delete original tree,
-    //    rename shadow into place.
+    //    rename shadow into place. The WAL file lives in the original tree,
+    //    so the writer is closed before deleteTree unlinks it and recreated
+    //    in reInitTableState. A writer that outlives the swap keeps a stale
+    //    dir handle whose fd number gets reused, and its next truncate lands
+    //    in whatever directory owns that number by then (2026-08-29: the
+    //    segments dir — a log replay never looked at). Step 1 flushed, so the
+    //    log carries nothing live. Mirrors NsSchema.renameTable.
+    const had_wal = t.wal != null;
+    if (had_wal) {
+        t.wal.?.deinit();
+        t.wal = null;
+    }
     t.segments_dir.close(t.io);
     t.table_dir.close(t.io);
     shadow_segs.close(t.io);
@@ -266,7 +277,7 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     try s.schema_dir.rename(shadow_name, s.schema_dir, t.name, t.io);
 
     // 6. Re-open Table state under the new schema.
-    try reInitTableState(s, t, new_fp);
+    try reInitTableState(s, t, new_fp, had_wal);
 }
 
 /// Build a new segment in `shadow_segs` carrying `entry`'s rows but reshaped
@@ -388,12 +399,15 @@ fn fillNull(
 /// Re-initialize the Table after the on-disk swap. Reopens dir handles,
 /// reloads schema + manifest, replaces the memtable with a fresh one
 /// matching the new schema. Caller holds `table.mutex`.
-fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64) !void {
+fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64, recreate_wal: bool) !void {
     const allocator = t.allocator;
     const io = t.io;
 
     t.table_dir = try s.schema_dir.openDir(io, t.name, .{});
     t.segments_dir = try t.table_dir.openDir(io, "segments", .{});
+    if (recreate_wal) {
+        t.wal = try engine.wal.WalWriter.create(allocator, io, t.table_dir, new_fp);
+    }
 
     var new_owner = try storage.schema_file.readSchema(allocator, io, t.table_dir);
     t.schema_owner.deinit();
