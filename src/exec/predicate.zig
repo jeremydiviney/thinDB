@@ -431,9 +431,13 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                 // Decimal needs the column scale (which `tryWidenLiteral` can't
                 // see from the tag) to align the literal mantissa to the column.
                 if (col_type.decimalSpec()) |spec| {
-                    coerceLiteralToDecimal(&p.val, spec, col_type == .decimal128) catch return Error.PredicateTypeMismatch;
+                    coerceLiteralToDecimal(&p.val, spec, col_type == .decimal128) catch {
+                        return Error.PredicateTypeMismatch;
+                    };
                 } else {
-                    tryWidenLiteral(&p.val, col_tag) catch return Error.PredicateTypeMismatch;
+                    tryWidenLiteral(&p.val, col_tag) catch {
+                        return Error.PredicateTypeMismatch;
+                    };
                 }
             }
         },
@@ -451,11 +455,27 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             const lt = schema[li].type;
             const rt = schema[ri].type;
             // String columns only support eq / neq (same as col-vs-literal).
-            if (lt.isString() != rt.isString()) return Error.PredicateTypeMismatch;
+            if (lt.isString() != rt.isString()) {
+                return Error.PredicateTypeMismatch;
+            }
             if (lt.isString() and lc.op != .eq and lc.op != .neq) return Error.UnsupportedOperatorForType;
-            // Numeric / temporal: both sides must share the same tag.
-            // No widening for col-vs-col in v1.
-            if (std.meta.activeTag(lt) != std.meta.activeTag(rt)) return Error.PredicateTypeMismatch;
+            // Numeric sides widen per row in evaluateColColMask; anything
+            // else (temporal vs numeric, decimal mixes — scale unavailable
+            // at eval level) must share the same tag.
+            if (std.meta.activeTag(lt) != std.meta.activeTag(rt)) {
+                const lt_tag = std.meta.activeTag(lt);
+                const rt_tag = std.meta.activeTag(rt);
+                const numeric_mix = switch (lt_tag) {
+                    .int, .bigint, .smallint, .tinyint, .largeint, .float, .double => switch (rt_tag) {
+                        .int, .bigint, .smallint, .tinyint, .largeint, .float, .double => true,
+                        else => false,
+                    },
+                    else => false,
+                };
+                if (!numeric_mix) {
+                    return Error.PredicateTypeMismatch;
+                }
+            }
         },
         .is_null, .is_not_null => |col_name| {
             _ = types.findColumn(schema, col_name) orelse return Error.ColumnNotFound;
@@ -1446,7 +1466,59 @@ fn evalInSetStringy(sv: anytype, values: []const Value, negate: bool, view: Colu
 /// Per-row col-vs-col comparison. Both views must share the same
 /// primitive type tag (validateExpr enforces). NULL on either side
 /// → mask[i] = false (two-valued logic).
+fn plainNumericTag(tag: anytype) bool {
+    return switch (tag) {
+        .int, .bigint, .smallint, .tinyint, .largeint, .float, .double => true,
+        else => false,
+    };
+}
+
+fn intFamilyTag(tag: anytype) bool {
+    return switch (tag) {
+        .int, .bigint, .smallint, .tinyint, .largeint => true,
+        else => false,
+    };
+}
+
+fn numAsI128(view: ColumnView, i: usize) i128 {
+    return switch (view.data) {
+        .int => |l| l[i],
+        .bigint => |l| l[i],
+        .smallint => |l| l[i],
+        .tinyint => |l| l[i],
+        .largeint => |l| l[i],
+        else => unreachable,
+    };
+}
+
+fn numAsF64(view: ColumnView, i: usize) f64 {
+    return switch (view.data) {
+        .int => |l| @floatFromInt(l[i]),
+        .bigint => |l| @floatFromInt(l[i]),
+        .smallint => |l| @floatFromInt(l[i]),
+        .tinyint => |l| @floatFromInt(l[i]),
+        .largeint => |l| @floatFromInt(l[i]),
+        .float => |l| @floatCast(l[i]),
+        .double => |l| l[i],
+        else => unreachable,
+    };
+}
+
 pub fn evaluateColColMask(left: ColumnView, right: ColumnView, op: PredicateOp, n: usize, mask: []bool) !void {
+    // Mixed plain-numeric tags (a computed double against a passed-through
+    // int, etc.) widen per row: exact i128 when both sides are integers,
+    // f64 when a float side is involved. Decimal mixes stay rejected by the
+    // validator — the scale isn't available at this level.
+    const lt = std.meta.activeTag(left.data);
+    const rt = std.meta.activeTag(right.data);
+    if (lt != rt and plainNumericTag(lt) and plainNumericTag(rt)) {
+        if (intFamilyTag(lt) and intFamilyTag(rt)) {
+            for (0..n) |i| mask[i] = cmp(i128, numAsI128(left, i), numAsI128(right, i), op);
+        } else {
+            for (0..n) |i| mask[i] = cmp(f64, numAsF64(left, i), numAsF64(right, i), op);
+        }
+        return;
+    }
     switch (left.data) {
         .int => |l| {
             const r = right.data.int;

@@ -2748,3 +2748,28 @@ test "join: pass-through declines on duplicate build keys (fallback intact)" {
     try std.testing.expectEqual(@as(usize, 4), rows); // 2 + 1 + 1 null-extended
     try std.testing.expectEqual(@as(usize, 2), uid1_rows);
 }
+
+test "join: CROSS JOIN parses without ON and produces the cartesian product" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE base (k BIGINT PRIMARY KEY)");
+    try helpers.exec(allocator, db, "INSERT INTO base VALUES (10), (20), (30)");
+    try helpers.exec(allocator, db, "CREATE TABLE spine (id BIGINT PRIMARY KEY)");
+    try helpers.exec(allocator, db, "INSERT INTO spine VALUES (1), (2), (3), (4), (5)");
+
+    const full = try helpers.collectBigints(allocator, db, "SELECT k + id AS s FROM base CROSS JOIN spine ORDER BY s");
+    defer allocator.free(full);
+    try std.testing.expectEqual(@as(usize, 15), full.len);
+
+    // One-sided WHERE restricting the spine — the rollforward month-spine shape.
+    const filtered = try helpers.collectBigints(allocator, db, "SELECT k + id AS s FROM base CROSS JOIN spine WHERE id <= 2 ORDER BY s");
+    defer allocator.free(filtered);
+    try std.testing.expectEqualSlices(i64, &.{ 11, 12, 21, 22, 31, 32 }, filtered);
+}

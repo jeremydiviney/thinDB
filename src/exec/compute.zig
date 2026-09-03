@@ -118,6 +118,10 @@ const ArgPlan = union(enum) {
 /// `row_count` copies of `value`.
 const LitSlot = struct {
     value: types.Value,
+    /// Kept beside the value because decimal Values carry only the raw
+    /// scaled payload — literalType() can't recover precision/scale after
+    /// a plan-time literal coercion (CASE `ELSE 0` against a decimal arm).
+    ty: Type,
     buf: ColumnStore,
 };
 
@@ -1433,6 +1437,7 @@ fn resolveDerived(
             const slot = try aa.create(LitSlot);
             slot.* = .{
                 .value = v,
+                .ty = literalType(v),
                 .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
             };
             return .{
@@ -1486,6 +1491,86 @@ fn resolveDerived(
 
 /// CASE result branches use the scalar implicit-cast lattice to find a common
 /// output type. Branches that cannot widen to a shared type are rejected.
+const CaseUnifyState = struct {
+    /// True while every integer-typed contribution so far was a literal —
+    /// only then may a later decimal branch take over the unified type.
+    int_contribs_all_lits: bool = true,
+    /// True while every branch so far was a bare NULL (whose parser
+    /// placeholder type must not pin the CASE's type).
+    only_null_so_far: bool = true,
+};
+
+/// commonCaseType plus two plan-time-only widenings the cast lattice can't
+/// express: an integer LITERAL branch (`ELSE 0`) unifies with a decimal
+/// branch, and a bare NULL branch (`ELSE NULL`) is typeless and adopts
+/// whatever the typed branches unify to. normalizeBranchSrc rewrites the
+/// affected slots once the final type is known.
+fn unifyCaseType(current: ?Type, next: Type, next_src: BranchSrc, st: *CaseUnifyState) ?Type {
+    if (next_src == .null_lit) return current orelse next;
+    defer st.only_null_so_far = false;
+    if (next.decimalSpec() == null and next.isInteger() and next_src != .lit) {
+        st.int_contribs_all_lits = false;
+    }
+    if (st.only_null_so_far and current != null) return next;
+    if (commonCaseType(current, next)) |t| return t;
+    const cur = current orelse return next;
+    if (cur.decimalSpec() != null and next.isInteger() and next_src == .lit) return cur;
+    if (next.decimalSpec() != null and cur.isInteger() and st.int_contribs_all_lits) return next;
+    return null;
+}
+
+/// Post-unification slot repair: bare-NULL branches take the unified type,
+/// and integer literals against a decimal result scale into it.
+fn normalizeBranchSrc(runtime_allocator: Allocator, src: BranchSrc, out_type: Type) !void {
+    switch (src) {
+        .lit => if (out_type.decimalSpec() != null) try coerceIntLitToDecimal(runtime_allocator, src, out_type),
+        .null_lit => |slot| {
+            if (std.meta.activeTag(slot.ty) == std.meta.activeTag(out_type)) return;
+            slot.ty = out_type;
+            slot.buf.deinit(runtime_allocator);
+            slot.buf = try ColumnStore.init(runtime_allocator, out_type, true);
+        },
+        else => {},
+    }
+}
+
+fn intValueAsI128(v: types.Value) ?i128 {
+    return switch (v) {
+        .int => |x| x,
+        .bigint => |x| x,
+        .smallint => |x| x,
+        .tinyint => |x| x,
+        .largeint => |x| x,
+        else => null,
+    };
+}
+
+/// Rewrite an integer-literal branch source into a scaled decimal literal
+/// of `out_type` (same idiom as coerceTemporalStringLiterals). No-op for
+/// non-literal or non-integer sources.
+fn coerceIntLitToDecimal(runtime_allocator: Allocator, src: BranchSrc, out_type: Type) !void {
+    if (src != .lit) return;
+    const slot = src.lit;
+    const raw = intValueAsI128(slot.value) orelse return;
+    const spec = out_type.decimalSpec().?;
+    var scaled: i128 = raw;
+    var k: u8 = 0;
+    while (k < spec.s) : (k += 1) {
+        scaled = std.math.mul(i128, scaled, 10) catch return Error.ComputeUnsupportedExpr;
+    }
+    slot.value = switch (std.meta.activeTag(out_type)) {
+        .decimal64 => if (scaled >= std.math.minInt(i64) and scaled <= std.math.maxInt(i64))
+            types.Value{ .decimal64 = @intCast(scaled) }
+        else
+            return Error.ComputeUnsupportedExpr,
+        .decimal128 => types.Value{ .decimal128 = scaled },
+        else => unreachable,
+    };
+    slot.ty = out_type;
+    slot.buf.deinit(runtime_allocator);
+    slot.buf = try ColumnStore.init(runtime_allocator, out_type, false);
+}
+
 fn commonCaseType(current: ?Type, next: Type) ?Type {
     const cur = current orelse return next;
     const cur_tag: types.TypeTag = std.meta.activeTag(cur);
@@ -1513,7 +1598,9 @@ fn attachCaseCast(
     if (src_tag == out_tag) return;
     // Same StringView representation across the string family — pass through.
     if (foldStringTag(src_tag) == .string and foldStringTag(out_tag) == .string) return;
-    const k = cast.kernelFor(src_tag, out_tag) orelse return Error.ComputeUnsupportedExpr;
+    const k = cast.kernelFor(src_tag, out_tag) orelse {
+        return Error.ComputeUnsupportedExpr;
+    };
     const buf = try runtime_allocator.create(ColumnStore);
     errdefer runtime_allocator.destroy(buf);
     buf.* = try ColumnStore.init(runtime_allocator, out_type, branchSrcNullable(src, up_schema));
@@ -1542,11 +1629,12 @@ fn buildCasePlan(
     }
 
     var inferred_type: ?Type = null;
+    var unify_state: CaseUnifyState = .{};
     var may_null = cs.else_branch == null;
     for (cs.branches, branches) |src, *dst| {
         const then_src = try buildBranchSrc(runtime_allocator, aa, src.then, up_schema, udf_registry);
         const t = branchSrcType(then_src, up_schema);
-        inferred_type = commonCaseType(inferred_type, t) orelse {
+        inferred_type = unifyCaseType(inferred_type, t, then_src, &unify_state) orelse {
             freeBranchSrc(runtime_allocator, then_src);
             return Error.ComputeUnsupportedExpr;
         };
@@ -1574,7 +1662,7 @@ fn buildCasePlan(
     if (cs.else_branch) |eb| {
         const es = try buildBranchSrc(runtime_allocator, aa, eb.*, up_schema, udf_registry);
         const t = branchSrcType(es, up_schema);
-        inferred_type = commonCaseType(inferred_type, t) orelse {
+        inferred_type = unifyCaseType(inferred_type, t, es, &unify_state) orelse {
             freeBranchSrc(runtime_allocator, es);
             return Error.ComputeUnsupportedExpr;
         };
@@ -1583,6 +1671,8 @@ fn buildCasePlan(
     }
 
     const out_type = inferred_type orelse return Error.ComputeUnsupportedExpr;
+    for (branches[0..built]) |*br| try normalizeBranchSrc(runtime_allocator, br.then_src, out_type);
+    if (else_src) |es| try normalizeBranchSrc(runtime_allocator, es, out_type);
     for (branches[0..built]) |*br| {
         try attachCaseCast(runtime_allocator, br.then_src, up_schema, out_type, &br.cast_kernel, &br.cast_buf);
     }
@@ -1625,6 +1715,7 @@ fn buildBranchSrc(
             const slot = try aa.create(LitSlot);
             slot.* = .{
                 .value = v,
+                .ty = literalType(v),
                 .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
             };
             break :blk BranchSrc{ .lit = slot };
@@ -1652,7 +1743,7 @@ fn buildBranchSrc(
 fn branchSrcType(s: BranchSrc, up_schema: []const Column) Type {
     return switch (s) {
         .col => |idx| up_schema[idx].type,
-        .lit => |slot| literalType(slot.value),
+        .lit => |slot| slot.ty,
         .null_lit => |slot| slot.ty,
         .call => |plan| plan.output_type,
         .case => |plan| plan.output_type,
@@ -1726,7 +1817,9 @@ fn buildCallPlan(
     for (c.args, 0..) |arg, i| {
         switch (arg) {
             .col_ref => |name| {
-                const idx = columnIndex(up_schema, name) orelse return Error.ComputeUnsupportedExpr;
+                const idx = columnIndex(up_schema, name) orelse {
+                    return Error.ComputeUnsupportedExpr;
+                };
                 arg_plans[i] = .{ .col = idx };
                 arg_types[i] = up_schema[idx].type;
             },
@@ -1734,6 +1827,7 @@ fn buildCallPlan(
                 const slot = try aa.create(LitSlot);
                 slot.* = .{
                     .value = v,
+                    .ty = literalType(v),
                     .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
                 };
                 arg_plans[i] = .{ .lit = slot };
@@ -1758,7 +1852,9 @@ fn buildCallPlan(
                 arg_plans[i] = .{ .case = sub };
                 arg_types[i] = sub.output_type;
             },
-            .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
+            .scalar_subquery, .exists_subquery, .var_ref => {
+                return Error.ComputeUnsupportedExpr;
+            },
         }
     }
 
@@ -1849,6 +1945,7 @@ fn coerceTemporalStringLiterals(
             const new_val = litTemporalValue(arg_plans[i], declared) orelse continue;
             const slot = arg_plans[i].lit;
             slot.value = new_val;
+            slot.ty = literalType(new_val);
             slot.buf.deinit(runtime_allocator);
             slot.buf = try ColumnStore.init(runtime_allocator, literalType(new_val), false);
             at.* = literalType(new_val);
@@ -2178,7 +2275,8 @@ fn fillLiteralColumn(allocator: Allocator, buf: *ColumnStore, v: types.Value, n:
         .text => |s| while (i < n) : (i += 1) try buf.data.string.appendValue(allocator, s),
         .date => |x| while (i < n) : (i += 1) try buf.data.date.append(allocator, x),
         .datetime => |x| while (i < n) : (i += 1) try buf.data.datetime.append(allocator, x),
-        .decimal64, .decimal128 => unreachable, // literalType() panics before we get here
+        .decimal64 => |x| while (i < n) : (i += 1) try buf.data.decimal64.append(allocator, x),
+        .decimal128 => |x| while (i < n) : (i += 1) try buf.data.decimal128.append(allocator, x),
         .uuid => |x| while (i < n) : (i += 1) try buf.data.uuid.append(allocator, x),
     }
 }

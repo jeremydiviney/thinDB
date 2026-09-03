@@ -812,3 +812,81 @@ test "window: named window via WINDOW clause" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 1, 2 }, rns);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 30, 60, 100, 300 }, rss);
 }
+
+test "window: leading window call continued by arithmetic hoists to hidden column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    var q = try runSql(allocator, db,
+        \\SELECT id, SUM(qty) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) / 2 AS h
+        \\FROM t
+        \\ORDER BY id ASC
+    );
+    defer q.deinit();
+    var rows: std.ArrayList(i64) = .empty;
+    defer rows.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try rows.append(allocator, v);
+    }
+    // Running sums 10,30,60 | 100,300 halved.
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 15, 30, 50, 150 }, rows.items);
+}
+
+test "window: SUM and AVG over DECIMAL inputs (running and framed)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers2 = @import("sql_helpers.zig");
+    try helpers2.exec(allocator, db, "CREATE TABLE dts (id BIGINT PRIMARY KEY, grp BIGINT, amt DECIMAL(16,6))");
+    try helpers2.exec(allocator, db, "INSERT INTO dts VALUES (1, 1, '1.500000'), (2, 1, '2.250000'), (3, 1, '3.000000')");
+
+    var q = try runSql(allocator, db,
+        "SELECT id, SUM(amt) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs, AVG(amt) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS fa FROM dts ORDER BY id ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    // Running sums at scale 6: 1.5, 3.75, 6.75.
+    try std.testing.expectEqual(@as(i128, 1_500_000), b.values[1].data.decimal128[0]);
+    try std.testing.expectEqual(@as(i128, 3_750_000), b.values[1].data.decimal128[1]);
+    try std.testing.expectEqual(@as(i128, 6_750_000), b.values[1].data.decimal128[2]);
+    // Framed averages: 1.5, 1.875, 2.625.
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), b.values[2].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.875), b.values[2].data.double[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.625), b.values[2].data.double[2], 1e-9);
+}
+
+test "window: LAG over DECIMAL with integer default, and CASE mixing decimal with int literal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers3 = @import("sql_helpers.zig");
+    try helpers3.exec(allocator, db, "CREATE TABLE dl (id BIGINT PRIMARY KEY, grp BIGINT, amt DECIMAL(10,2))");
+    try helpers3.exec(allocator, db, "INSERT INTO dl VALUES (1, 1, '1.50'), (2, 1, '2.25'), (3, 1, '3.75')");
+
+    var q = try runSql(allocator, db,
+        "SELECT id, LAG(amt, 1, 0) OVER (PARTITION BY grp ORDER BY id) AS prev, LAG(CASE WHEN id > 1 THEN amt ELSE 0 END, 1, 0) OVER (PARTITION BY grp ORDER BY id) AS prev_gated FROM dl ORDER BY id ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), b.row_count);
+    // prev at scale 2: 0.00, 1.50, 2.25
+    try std.testing.expectEqual(@as(i64, 0), b.values[1].data.decimal64[0]);
+    try std.testing.expectEqual(@as(i64, 150), b.values[1].data.decimal64[1]);
+    try std.testing.expectEqual(@as(i64, 225), b.values[1].data.decimal64[2]);
+    // prev_gated: 0.00 (default), 0.00 (id=1 gated to 0), 2.25
+    try std.testing.expectEqual(@as(i64, 0), b.values[2].data.decimal64[0]);
+    try std.testing.expectEqual(@as(i64, 0), b.values[2].data.decimal64[1]);
+    try std.testing.expectEqual(@as(i64, 225), b.values[2].data.decimal64[2]);
+}

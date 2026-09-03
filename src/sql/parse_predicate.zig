@@ -499,8 +499,17 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
     var look = p.lex.*;
     var depth: usize = 1;
     var saw_arithmetic = false;
+    // `(CASE ... END) > x` carries no depth-1 arithmetic but is still a
+    // scalar comparison: parseAddSub dispatches CASE, and no predicate
+    // grammar accepts a CASE-led paren group, so this only widens parses.
+    var case_start = false;
+    var first_tok = true;
     while (true) {
         const tok = try look.next();
+        if (first_tok) {
+            first_tok = false;
+            case_start = tok.tag == .kw_case;
+        }
         switch (tok.tag) {
             .eof => return false,
             .lparen => depth += 1,
@@ -514,7 +523,7 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
             else => {},
         }
     }
-    if (!saw_arithmetic) return false;
+    if (!saw_arithmetic and !case_start) return false;
     const op_tok = try look.next();
     return isComparisonToken(op_tok.tag);
 }

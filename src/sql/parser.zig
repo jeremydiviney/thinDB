@@ -1291,7 +1291,8 @@ pub const Parser = struct {
         // would also handle it (parseCallAtom dispatches on CASE), but
         // taking it here lets the projection alias the result.
         if (self.cur.tag == .kw_case) {
-            const expr = try self.parseCaseExpr();
+            var expr = try self.parseCaseExpr();
+            expr = try self.continueBinaryFrom(expr);
             const default_name = try self.exprDefaultName(expr);
             const alias = try self.maybeAlias(default_name);
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
@@ -1435,6 +1436,16 @@ pub const Parser = struct {
                     const hidden_name = try self.materializeWindowExpr(call);
                     const expr = try self.windowNullCheckExpr(hidden_name, negated);
                     const default_name: []const u8 = if (negated) "is_not_null" else "is_null";
+                    const alias = try self.maybeAlias(default_name);
+                    return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                }
+                // A leading window call continued by an operator
+                // (`SUM(x) OVER (...) / 12`) hoists like the IS NULL
+                // form: hidden window column + expression over it.
+                if (isBinaryOpToken(self.cur.tag)) {
+                    const hidden_name = try self.materializeWindowExpr(call);
+                    const expr = try self.continueBinaryFrom(ir.Expr{ .col_ref = hidden_name });
+                    const default_name = try self.exprDefaultName(expr);
                     const alias = try self.maybeAlias(default_name);
                     return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
                 }
@@ -2578,6 +2589,28 @@ pub const Parser = struct {
         defer left_names.deinit(self.arena);
 
         while (isJoinStart(self.cur.tag)) {
+            // CROSS JOIN takes no ON clause; empty key/range sets route the
+            // executor to its nested-loop (cartesian) path.
+            if (self.cur.tag == .kw_cross) {
+                try self.advance();
+                if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
+                try self.advance();
+                const right = try self.parseFromTarget();
+                root = try self.allocOp(.{ .join = .{
+                    .algorithm = .auto,
+                    .join_type = .inner,
+                    .on = &.{},
+                    .ranges = &.{},
+                    .extra_predicate = null,
+                    .skew_ratio_threshold = 0.3,
+                    .skew_absolute_threshold = 20_000,
+                    .skew_sample_interval = 10,
+                    .left = root,
+                    .right = right.op,
+                } });
+                try left_names.append(self.arena, right.name);
+                continue;
+            }
             const jtype = try self.parseJoinKind();
             const right = try self.parseFromTarget();
 
@@ -3170,7 +3203,7 @@ pub const Parser = struct {
 
     fn isJoinStart(tag: TokenTag) bool {
         return switch (tag) {
-            .kw_join, .kw_inner, .kw_left, .kw_right, .kw_full => true,
+            .kw_join, .kw_cross, .kw_inner, .kw_left, .kw_right, .kw_full => true,
             else => false,
         };
     }

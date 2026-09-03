@@ -1951,6 +1951,19 @@ pub const Window = struct {
                     if (saw_any) try writeDouble(out, perm[i], sum) else setNull(out, perm[i]);
                 }
             },
+            inline .decimal64, .decimal128 => |l| {
+                const items = l.items;
+                var sum: i128 = 0;
+                var saw_any = false;
+                var i: usize = p_start;
+                while (i < p_end) : (i += 1) {
+                    if (isValid(view, perm[i])) {
+                        sum += @as(i128, items[perm[i]]);
+                        saw_any = true;
+                    }
+                    if (saw_any) try writeDecimal128(out, perm[i], sum) else setNull(out, perm[i]);
+                }
+            },
             else => return Error.WindowUnsupported,
         }
     }
@@ -1978,6 +1991,20 @@ pub const Window = struct {
                         n += 1;
                     }
                     if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], sum / @as(f64, @floatFromInt(n)));
+                }
+            },
+            inline .decimal64, .decimal128 => |l| {
+                const spec = self.input_schema[plan.value_col].type.decimalSpec().?;
+                const divisor = std.math.pow(f64, 10, @floatFromInt(spec.s));
+                const items = l.items;
+                var scaled_sum: i128 = 0;
+                var i: usize = p_start;
+                while (i < p_end) : (i += 1) {
+                    if (isValid(view, perm[i])) {
+                        scaled_sum += @as(i128, items[perm[i]]);
+                        n += 1;
+                    }
+                    if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], @as(f64, @floatFromInt(scaled_sum)) / divisor / @as(f64, @floatFromInt(n)));
                 }
             },
             else => return Error.WindowUnsupported,
@@ -2099,6 +2126,18 @@ pub const Window = struct {
                 }
                 if (!saw_value) setNull(out, out_idx) else try writeDouble(out, out_idx, sum);
             },
+            inline .decimal64, .decimal128 => |l| {
+                const items = l.items;
+                var sum: i128 = 0;
+                var k: usize = lo;
+                while (k <= hi) : (k += 1) {
+                    const r = perm[k];
+                    if (!isValid(view, r)) continue;
+                    saw_value = true;
+                    sum += @as(i128, items[r]);
+                }
+                if (!saw_value) setNull(out, out_idx) else try writeDecimal128(out, out_idx, sum);
+            },
             else => return Error.WindowUnsupported,
         }
     }
@@ -2136,6 +2175,20 @@ pub const Window = struct {
                     sum += @floatCast(items[r]);
                     n += 1;
                 }
+            },
+            inline .decimal64, .decimal128 => |l| {
+                const spec = self.input_schema[plan.value_col].type.decimalSpec().?;
+                const divisor = std.math.pow(f64, 10, @floatFromInt(spec.s));
+                const items = l.items;
+                var scaled_sum: i128 = 0;
+                var k: usize = lo;
+                while (k <= hi) : (k += 1) {
+                    const r = perm[k];
+                    if (!isValid(view, r)) continue;
+                    scaled_sum += @as(i128, items[r]);
+                    n += 1;
+                }
+                sum = @as(f64, @floatFromInt(scaled_sum)) / divisor;
             },
             else => return Error.WindowUnsupported,
         }
@@ -2203,7 +2256,7 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
                     },
                     .lit => |v| {
                         plan.default_kind = .literal;
-                        plan.default_literal = v;
+                        plan.default_literal = try coerceDefaultLit(v, schema[plan.value_col].type);
                     },
                     .null_lit => {
                         plan.default_kind = .none;
@@ -2248,6 +2301,9 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
         .count => .bigint,
         .sum => blk: {
             const t = schema[plan.value_col].type;
+            // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s), matching
+            // the aggregate operator.
+            if (t.decimalSpec()) |spec| break :blk Type{ .decimal128 = .{ .p = 38, .s = spec.s } };
             switch (t) {
                 .int, .bigint, .tinyint, .smallint => break :blk Type{ .bigint = {} },
                 .largeint => break :blk Type{ .largeint = {} },
@@ -2459,6 +2515,34 @@ fn broadcastOutputCell(cell: OutCell, src_row: u32, dst_row: u32) !void {
         return;
     }
     try copyCell(cell.column.*, src_row, cell.column, dst_row);
+}
+
+/// An integer default literal against a decimal value column scales at plan
+/// time (`LAG(amount, 1, 0)`) — writeLiteral dispatches on the column type
+/// and cannot recover the scale from a raw int payload.
+fn coerceDefaultLit(v: Value, col_type: Type) !Value {
+    const spec = col_type.decimalSpec() orelse return v;
+    const raw: i128 = switch (v) {
+        .int => |x| x,
+        .bigint => |x| x,
+        .smallint => |x| x,
+        .tinyint => |x| x,
+        .largeint => |x| x,
+        else => return v,
+    };
+    var scaled: i128 = raw;
+    var k: u8 = 0;
+    while (k < spec.s) : (k += 1) {
+        scaled = std.math.mul(i128, scaled, 10) catch return Error.WindowUnsupported;
+    }
+    return switch (std.meta.activeTag(col_type)) {
+        .decimal64 => if (scaled >= std.math.minInt(i64) and scaled <= std.math.maxInt(i64))
+            Value{ .decimal64 = @intCast(scaled) }
+        else
+            Error.WindowUnsupported,
+        .decimal128 => Value{ .decimal128 = scaled },
+        else => unreachable,
+    };
 }
 
 fn writeLiteralCell(cell: OutCell, row: u32, lit: Value) !void {
@@ -2927,6 +3011,14 @@ fn writeLargeint(out: *ColumnStore, row: u32, v: i128) !void {
     setValid(out, row);
 }
 
+fn writeDecimal128(out: *ColumnStore, row: u32, v: i128) !void {
+    switch (out.data) {
+        .decimal128 => |*l| l.items[row] = v,
+        else => return Error.WindowUnsupported,
+    }
+    setValid(out, row);
+}
+
 fn writeDouble(out: *ColumnStore, row: u32, v: f64) !void {
     switch (out.data) {
         .double => |*l| l.items[row] = v,
@@ -2945,6 +3037,17 @@ fn writeLiteral(out: *ColumnStore, row: u32, lit: Value) !void {
         .bigint => |*l| l.items[row] = switch (lit) {
             .int => |x| x,
             .bigint => |x| x,
+            else => return Error.WindowUnsupported,
+        },
+        // Decimal literals arrive pre-scaled: buildCallPlan coerces integer
+        // default literals to the value column's scale at plan time.
+        .decimal64 => |*l| l.items[row] = switch (lit) {
+            .decimal64 => |x| x,
+            else => return Error.WindowUnsupported,
+        },
+        .decimal128 => |*l| l.items[row] = switch (lit) {
+            .decimal128 => |x| x,
+            .decimal64 => |x| x,
             else => return Error.WindowUnsupported,
         },
         .boolean => |*l| l.items[row] = switch (lit) {
