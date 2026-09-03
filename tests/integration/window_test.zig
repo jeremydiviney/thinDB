@@ -81,6 +81,29 @@ test "window: ROW_NUMBER over single partition" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3, 4, 5 }, rns);
 }
 
+test "window: output named after an input column replaces it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    // `... AS qty` must resolve to the window output, not the source column
+    // it shadows (the rollforward name broadcast relies on this).
+    var q = try runSql(
+        allocator,
+        db,
+        "SELECT id, LAST_VALUE(qty) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS qty FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 2), q.outputSchema().len);
+    const qtys = try collectRows(i64, allocator, &q, 1);
+    defer allocator.free(qtys);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 30, 30, 200, 200 }, qtys);
+}
+
 test "window: ROW_NUMBER with PARTITION BY" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

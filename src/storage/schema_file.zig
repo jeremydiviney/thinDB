@@ -90,6 +90,7 @@ pub const SchemaOwner = struct {
                 .type = c.type,
                 .nullable = c.nullable,
                 .default_value = if (c.default_value) |dv| try cloneValue(aa, dv) else null,
+                .default_now = c.default_now,
                 .auto_increment = c.auto_increment,
             };
         }
@@ -132,8 +133,9 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator)
             else => 0,
         };
         try appendU32(scratch, &buf, extra);
-        // v3: column DEFAULT value. 0 = none, 1 = present (+ payload).
-        try encodeDefault(scratch, &buf, c.default_value);
+        // v3: column DEFAULT value. 0 = none, 1 = present (+ payload),
+        // 2 = CURRENT_TIMESTAMP (no payload).
+        try encodeDefault(scratch, &buf, c.default_value, c.default_now);
         // v4: AUTO_INCREMENT flag.
         try buf.append(scratch, @intFromBool(c.auto_increment));
     }
@@ -214,7 +216,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .uuid => .uuid,
             .json => .json,
         };
-        const default_value = try decodeDefault(aa, bytes, &cursor);
+        const dflt = try decodeDefault(aa, bytes, &cursor);
         if (cursor + 1 > bytes.len) return Error.SchemaCorrupt;
         const auto_increment = bytes[cursor] != 0;
         cursor += 1;
@@ -222,7 +224,8 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .name = name,
             .type = t,
             .nullable = nullable,
-            .default_value = default_value,
+            .default_value = dflt.value,
+            .default_now = dflt.now,
             .auto_increment = auto_increment,
         };
     }
@@ -297,10 +300,15 @@ const appendU16 = format.appendU16;
 const appendU32 = format.appendU32;
 
 /// Encode an optional `DEFAULT` value into the schema buffer (v3+).
-/// Layout: 1 presence byte (0 = no default, 1 = present). When present:
-/// 1 byte ValueTag + the type's payload bytes (little-endian for ints,
-/// IEEE-754 little-endian for floats, length-prefixed bytes for text).
-fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), v: ?types.Value) !void {
+/// Layout: 1 presence byte (0 = no default, 1 = present, 2 =
+/// CURRENT_TIMESTAMP with no payload). When present: 1 byte ValueTag + the
+/// type's payload bytes (little-endian for ints, IEEE-754 little-endian
+/// for floats, length-prefixed bytes for text).
+fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), v: ?types.Value, default_now: bool) !void {
+    if (default_now) {
+        try buf.append(scratch, 2);
+        return;
+    }
     const dv = v orelse {
         try buf.append(scratch, 0);
         return;
@@ -362,11 +370,18 @@ fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), v: ?types.Value) !
     }
 }
 
-fn decodeDefault(arena: Allocator, bytes: []const u8, cursor: *usize) !?types.Value {
+const DecodedDefault = struct { value: ?types.Value = null, now: bool = false };
+
+fn decodeDefault(arena: Allocator, bytes: []const u8, cursor: *usize) !DecodedDefault {
     if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
     const present = bytes[cursor.*];
     cursor.* += 1;
-    if (present == 0) return null;
+    if (present == 0) return .{};
+    if (present == 2) return .{ .now = true };
+    return .{ .value = try decodeDefaultValue(arena, bytes, cursor) };
+}
+
+fn decodeDefaultValue(arena: Allocator, bytes: []const u8, cursor: *usize) !?types.Value {
     if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;

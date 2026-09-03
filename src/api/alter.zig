@@ -87,6 +87,7 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
             .type = c.type,
             .nullable = c.nullable,
             .default_value = if (c.default_value) |v| try cloneValue(aa, v) else null,
+            .default_now = c.default_now,
             .auto_increment = c.auto_increment,
         });
         try sources.append(aa, .{ .from_old = idx });

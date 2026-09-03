@@ -472,6 +472,42 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
                 if (p.cur.tag != .integer) return PE.SqlExpectedKeyword;
                 try p.advance();
             }
+        } else if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "engine")) {
+            // MySQL / StarRocks `ENGINE = name`: no single-node meaning.
+            try p.advance();
+            try p.expect(.eq);
+            if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
+            try p.advance();
+        } else if (p.cur.tag == .kw_primary) {
+            // StarRocks places the key clause AFTER the column list.
+            if (table_pk != null or inline_pk != null) return PE.SqlInvalidProjection;
+            try p.advance();
+            if (p.cur.tag != .kw_key) return PE.SqlExpectedKeyword;
+            try p.advance();
+            try p.expect(.lparen);
+            table_pk = try p.parseIdentList();
+            try p.expect(.rparen);
+        } else if (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "unique", "duplicate" })) {
+            // StarRocks `UNIQUE KEY (cols)` upserts like PRIMARY KEY;
+            // `DUPLICATE KEY (cols)` is a non-unique sort key.
+            const is_unique = std.ascii.eqlIgnoreCase(p.cur.text, "unique");
+            try p.advance();
+            if (p.cur.tag != .kw_key) return PE.SqlExpectedKeyword;
+            try p.advance();
+            try p.expect(.lparen);
+            const key_cols = try p.parseIdentList();
+            try p.expect(.rparen);
+            if (is_unique) {
+                if (table_pk != null or inline_pk != null) return PE.SqlInvalidProjection;
+                table_pk = key_cols;
+            } else {
+                if (sort_key != null) return PE.SqlInvalidProjection;
+                sort_key = key_cols;
+            }
+        } else if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "comment")) {
+            // Table COMMENT: accepted, not stored.
+            try p.advance();
+            _ = try parsePropertyText(p);
         } else break;
     }
 
@@ -497,9 +533,10 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
                     .lz4_fsst
                 else
                     return PE.SqlInvalidProjection;
-            } else if (std.ascii.eqlIgnoreCase(key, "replication_num")) {
-                // StarRocks replication factor — no single-node meaning.
-                // Accepted so SR-dialect DDL runs verbatim; value ignored.
+            } else if (std.ascii.eqlIgnoreCase(key, "replication_num") or std.ascii.eqlIgnoreCase(key, "storage_medium")) {
+                // StarRocks replication factor / storage tier — no
+                // single-node meaning. Accepted so SR-dialect DDL runs
+                // verbatim; values ignored.
             } else {
                 return PE.SqlInvalidProjection;
             }
@@ -781,6 +818,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
     var is_pk = false;
     var saw_not_null = false;
     var default_value: ?types.Value = null;
+    var default_now = false;
     while (true) {
         switch (p.cur.tag) {
             .kw_not => {
@@ -809,7 +847,16 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             // (the compile path validates it once the schema is known).
             .kw_default => {
                 try p.advance();
-                default_value = try p.parseValue();
+                if (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "current_timestamp", "now", "localtimestamp" })) {
+                    try p.advance();
+                    if (p.cur.tag == .lparen) {
+                        try p.advance();
+                        try p.expect(.rparen);
+                    }
+                    default_now = true;
+                } else {
+                    default_value = try p.parseValue();
+                }
             },
             .kw_auto_increment => {
                 try p.advance();
@@ -820,6 +867,12 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             // AUTO_INCREMENT + NOT NULL; any sequence-option parenthesis
             // is consumed and ignored.
             .identifier => {
+                // MySQL / StarRocks column COMMENT: accepted, not stored.
+                if (std.ascii.eqlIgnoreCase(p.cur.text, "comment")) {
+                    try p.advance();
+                    _ = try parsePropertyText(p);
+                    continue;
+                }
                 if (!std.ascii.eqlIgnoreCase(p.cur.text, "generated")) break;
                 try p.advance();
                 if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "always")) {
@@ -858,10 +911,24 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             .column_type = ty,
             .nullable = nullable,
             .default_value = default_value,
+            .default_now = default_now,
             .auto_increment = auto_increment,
         },
         .is_pk = is_pk,
     };
+}
+
+/// MySQL integer display width (`int(11)`): a formatting hint with no
+/// storage meaning — consumed and ignored.
+fn skipDisplayWidth(p: anytype, ty: types.Type) !types.Type {
+    const PE = @TypeOf(p.*).Err;
+    if (p.cur.tag == .lparen) {
+        try p.advance();
+        if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+        try p.advance();
+        try p.expect(.rparen);
+    }
+    return ty;
 }
 
 pub fn parseColumnType(p: anytype) !types.Type {
@@ -872,10 +939,10 @@ pub fn parseColumnType(p: anytype) !types.Type {
 
     // PG type-name aliases (int4/int8/...) sit alongside the standard
     // names so DDL and casts emitted by PG clients/ORMs parse unchanged.
-    if (asciiEqlAny(name, &.{ "bigint", "int8" })) return .bigint;
-    if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return .int;
-    if (asciiEqlAny(name, &.{ "smallint", "int2" })) return .smallint;
-    if (asciiEqlAny(name, &.{"tinyint"})) return .smallint;
+    if (asciiEqlAny(name, &.{ "bigint", "int8" })) return skipDisplayWidth(p, .bigint);
+    if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return skipDisplayWidth(p, .int);
+    if (asciiEqlAny(name, &.{ "smallint", "int2" })) return skipDisplayWidth(p, .smallint);
+    if (asciiEqlAny(name, &.{"tinyint"})) return skipDisplayWidth(p, .smallint);
     if (asciiEqlAny(name, &.{ "float", "real", "float4" })) return .float;
     if (asciiEqlAny(name, &.{"float8"})) return .double;
     if (asciiEqlAny(name, &.{"double"})) {

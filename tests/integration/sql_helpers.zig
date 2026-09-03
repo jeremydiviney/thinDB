@@ -40,9 +40,19 @@ pub const RunResult = struct {
 /// final statement that the caller drains. Caller owns the returned
 /// `RunResult` and must `deinit` it.
 pub fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
+    return runSqlDialect(allocator, db, sql, .neutral);
+}
+
+/// `runSql` under the MySQL dialect (backtick identifiers, double-quoted
+/// strings) — what the MySQL wire parses.
+pub fn runSqlMysql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
+    return runSqlDialect(allocator, db, sql, .mysql);
+}
+
+pub fn runSqlDialect(allocator: std.mem.Allocator, db: anytype, sql: []const u8, dialect: thindb.types.Dialect) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
-    const root = try thindb.sql.parse(arena.allocator(), sql);
+    const root = try thindb.sql.parseDialect(arena.allocator(), sql, dialect);
 
     if (root.* != .batch) {
         const cq = try thindb.net.compile(allocator, db, root);

@@ -145,6 +145,14 @@ pub const Window = struct {
     emit_offset: usize = 0,
     out_output_columns: []ColumnStore, // staging for output cols per batch
     views: []ColumnView, // input + output views, parallel to schema
+    /// Emitted schema. A call whose output name matches an input column
+    /// REPLACES that slot (Compute semantics) instead of appending a
+    /// duplicate name that downstream name resolution would miss; the
+    /// internal layout stays input + one output per call, and `out_map`
+    /// (null when no call collides) maps emitted positions onto it.
+    out_schema: []Column,
+    out_map: ?[]usize,
+    out_views: []ColumnView,
 
     const batch_size: usize = 8192;
 
@@ -305,6 +313,46 @@ pub const Window = struct {
             };
         }
 
+        // A call named after an input column replaces that slot in the
+        // emitted schema (`LAST_VALUE(name) OVER (...) AS name`).
+        var replaced_calls: usize = 0;
+        for (calls) |c| {
+            if (types.findColumn(input_schema, c.output_name) != null) replaced_calls += 1;
+        }
+        var out_schema: []Column = schema;
+        var out_map: ?[]usize = null;
+        if (replaced_calls > 0) {
+            const n_out = schema.len - replaced_calls;
+            const map = try allocator.alloc(usize, n_out);
+            errdefer allocator.free(map);
+            const emitted = try allocator.alloc(Column, n_out);
+            errdefer allocator.free(emitted);
+            var k: usize = 0;
+            for (input_schema, 0..) |col, i| {
+                var src = i;
+                for (calls, 0..) |c, ci| {
+                    if (types.columnNameEql(c.output_name, col.name)) src = input_schema.len + ci;
+                }
+                map[k] = src;
+                emitted[k] = schema[src];
+                k += 1;
+            }
+            for (calls, 0..) |c, ci| {
+                if (types.findColumn(input_schema, c.output_name) != null) continue;
+                map[k] = input_schema.len + ci;
+                emitted[k] = schema[input_schema.len + ci];
+                k += 1;
+            }
+            out_schema = emitted;
+            out_map = map;
+        }
+        errdefer if (out_map) |m| {
+            allocator.free(m);
+            allocator.free(out_schema);
+        };
+        const out_views = try allocator.alloc(ColumnView, out_schema.len);
+        errdefer allocator.free(out_views);
+
         // Allocate column buffers for input and output (one per schema col).
         // Every accumulated column's allocations flow through its own arena
         // (see the field doc); the stores themselves need no per-store
@@ -370,6 +418,9 @@ pub const Window = struct {
             .string_outputs = string_outputs,
             .out_output_columns = out_output_columns,
             .views = views,
+            .out_schema = out_schema,
+            .out_map = out_map,
+            .out_views = out_views,
             .dop = @max(1, dop),
         };
         return makeQuery(allocator, self);
@@ -397,6 +448,11 @@ pub const Window = struct {
         for (self.out_output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.out_output_columns);
         self.allocator.free(self.views);
+        self.allocator.free(self.out_views);
+        if (self.out_map) |m| {
+            self.allocator.free(m);
+            self.allocator.free(self.out_schema);
+        }
         if (self.emit_gather_cols.len > 0) {
             for (self.emit_gather_cols) |*c| c.deinit(self.allocator);
             self.allocator.free(self.emit_gather_cols);
@@ -411,7 +467,15 @@ pub const Window = struct {
     }
 
     pub fn outputSchema(self: *Window) []const Column {
-        return self.schema;
+        return self.out_schema;
+    }
+
+    /// Emit `n` rows from the internal views, remapped when a call replaced
+    /// an input slot.
+    fn emitBatch(self: *Window, n: usize) Batch {
+        const map = self.out_map orelse return .{ .schema = self.schema, .values = self.views, .row_count = n };
+        for (map, self.out_views) |src, *v| v.* = self.views[src];
+        return .{ .schema = self.out_schema, .values = self.out_views, .row_count = n };
     }
 
     pub fn addPrune(self: *Window, pred: Predicate) !void {
@@ -566,6 +630,13 @@ pub const Window = struct {
     /// here — the same appendStringScratchRange work per-batch emit would
     /// have done, minus the re-copy into stage chunks. Leaves the window in
     /// its post-evict state (emits nothing; deinit stays uniform).
+    /// The zero-copy handover carries the internal input + one-per-call
+    /// layout; a window that replaced an input slot emits a different shape,
+    /// so its stage pull-copies through `next()` instead.
+    pub fn adoptable(self: *const Window) bool {
+        return self.out_map == null;
+    }
+
     pub fn adoptBuffers(self: *Window) !AdoptedBuffers {
         std.debug.assert(self.drained and self.emit_offset == 0 and !self.evicted);
         if (self.sorted_perm) |perm| return self.adoptBuffersSorted(perm);
@@ -691,7 +762,7 @@ pub const Window = struct {
                     self.views[goff + ci] = self.emit_gather_cols[goff + ci].view();
                 }
                 self.emit_offset = hi;
-                return Batch{ .schema = self.schema, .values = self.views, .row_count = n };
+                return self.emitBatch(n);
             }
         }
 
@@ -715,7 +786,7 @@ pub const Window = struct {
         }
 
         self.emit_offset = hi;
-        return Batch{ .schema = self.schema, .values = self.views, .row_count = n };
+        return self.emitBatch(n);
     }
 
     /// Shared control block for the parallel drain. Each batch runs two

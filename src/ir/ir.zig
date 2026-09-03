@@ -191,6 +191,10 @@ pub const ColumnDef = struct {
     /// values are accepted. Threads into `types.Column.default_value`
     /// at compile time; INSERT fills omitted columns from this.
     default_value: ?@import("../types.zig").Value = null,
+    /// `DEFAULT CURRENT_TIMESTAMP` / `DEFAULT NOW()`: an omitted-column
+    /// INSERT fills the wall-clock time at insert. Datetime columns only;
+    /// exclusive with `default_value`.
+    default_now: bool = false,
     /// MySQL-style AUTO_INCREMENT attribute. When set, the column is
     /// integer-typed and the table maintains a per-table monotonic
     /// counter that fills NULL/omitted inserts. Counter advances past
@@ -1300,6 +1304,8 @@ fn encodeColumnDef(allocator: Allocator, out: *std.ArrayList(u8), c: ColumnDef) 
     if (c.default_value) |dv| {
         try out.append(allocator, 1);
         try encodeValue(allocator, out, dv);
+    } else if (c.default_now) {
+        try out.append(allocator, 2);
     } else {
         try out.append(allocator, 0);
     }
@@ -2469,7 +2475,7 @@ fn decodeColumnDef(bytes: []const u8, cursor: *usize) DecodeError!ColumnDef {
     const has_default = bytes[cursor.*];
     cursor.* += 1;
     const default_value: ?Value = switch (has_default) {
-        0 => null,
+        0, 2 => null,
         1 => try decodeValue(bytes, cursor),
         else => return Error.IrCorrupt,
     };
@@ -2481,6 +2487,7 @@ fn decodeColumnDef(bytes: []const u8, cursor: *usize) DecodeError!ColumnDef {
         .column_type = ty,
         .nullable = nullable,
         .default_value = default_value,
+        .default_now = has_default == 2,
         .auto_increment = auto_increment,
     };
 }

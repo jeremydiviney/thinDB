@@ -313,6 +313,16 @@ fn isArithToken(tag: anytype) bool {
     };
 }
 
+/// Tokens that close a predicate: the call/CASE punctuation around an IF
+/// or WHEN condition, boolean connectives, and the clause keywords that
+/// can follow a WHERE / HAVING.
+fn isPredicateEnd(tag: anytype) bool {
+    return switch (tag) {
+        .rparen, .comma, .kw_and, .kw_or, .kw_then, .eof, .semicolon, .kw_group, .kw_order, .kw_limit, .kw_having => true,
+        else => false,
+    };
+}
+
 /// The operator tail shared by every LHS that resolves to a column name —
 /// plain columns, hidden computed columns, hidden window/aggregate outputs:
 /// IS [NOT] NULL, [NOT] BETWEEN, [NOT] LIKE, [NOT] IN, comparisons.
@@ -420,6 +430,12 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     // Any other use of bare NOT inside parseAtom is a parse error —
     // boolean-level NOT was already consumed by parseNot.
     if (negate_predicate) return PE.SqlExpectedKeyword;
+
+    // A bare column where the predicate ends (`IF(isActive, 1, 0)`,
+    // `WHERE flag AND ...`) is MySQL truthiness: non-zero and non-NULL.
+    if (isPredicateEnd(p.cur.tag)) {
+        return .{ .leaf = .{ .col = col_dup, .op = .neq, .val = .{ .int = 0 } } };
+    }
 
     // Comparison.
     const op: PredicateOp = switch (p.cur.tag) {
