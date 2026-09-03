@@ -119,7 +119,7 @@ test "sql: SELECT DISTINCT with WHERE / LIMIT / expression projections" {
     try std.testing.expectEqualSlices(i32, &[_]i32{ 100, 200 }, ks.items);
 
     // Expression projection: k / 100 collapses 5 rows to 3 distinct values.
-    var q3 = try runSql(allocator, db, "SELECT DISTINCT k / 100 AS h FROM t ORDER BY h");
+    var q3 = try runSql(allocator, db, "SELECT DISTINCT k DIV 100 AS h FROM t ORDER BY h");
     defer q3.deinit();
     var n: usize = 0;
     while (try q3.next()) |b| n += b.row_count;
@@ -2257,7 +2257,7 @@ test "sql: nested call with literal arg — lpad(upper(tag), 3, '_')" {
     try std.testing.expectEqualStrings("__A|__B|__A|__B|__C|", got.items);
 }
 
-test "sql: nested aggregate-inside-scalar rejected" {
+test "sql: aggregate-inside-scalar goes through overload resolution" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2266,9 +2266,10 @@ test "sql: nested aggregate-inside-scalar rejected" {
     defer db.close();
     _ = try seedT(db);
 
-    // Aggregates inside scalar calls aren't allowed.
+    // The aggregate hoists to a hidden output; upper() then has no
+    // bigint overload, so this fails at resolution, not at parse.
     const res = runSql(allocator, db, "SELECT upper(count(*)) FROM t");
-    try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, res);
+    try std.testing.expectError(error.ComputeNoSuchOverload, res);
 }
 
 test "sql: scalar functions over grouped keys are allowed alongside aggregates" {
@@ -3113,4 +3114,40 @@ test "sql: unit-first date functions and aggregate aliases execute" {
     try std.testing.expectApproxEqAbs(@as(f64, 19.0 / 12.0), b.values[10].data.double[0], 1e-9);
     try std.testing.expectEqualStrings("a", b.values[11].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("c", b.values[12].data.string.rowBytes(0));
+}
+
+test "sql: slash is true division; DIV is integer division" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q = try runSql(allocator, db, "SELECT 7 / 2 AS t, 7 DIV 2 AS i");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), b.values[0].data.double[0], 1e-12);
+    try std.testing.expectEqual(@as(i32, 3), b.values[1].data.int[0]);
+}
+
+test "sql: aggregate expressions in global (ungrouped) selects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const h = @import("sql_helpers.zig");
+    try h.exec(allocator, db, "CREATE TABLE ag (id BIGINT PRIMARY KEY, a INT)");
+    try h.exec(allocator, db, "INSERT INTO ag VALUES (1, 10), (2, 20), (3, 33)");
+
+    var q = try runSql(allocator, db, "SELECT SUM(a) / COUNT(*) AS ratio, ROUND(SUM(a)) AS rs, 1 + SUM(a) AS ps FROM ag");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectApproxEqAbs(@as(f64, 21.0), b.values[0].data.double[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 63.0), b.values[1].data.double[0], 1e-12);
+    try std.testing.expectEqual(@as(i64, 64), b.values[2].data.bigint[0]);
 }

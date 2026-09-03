@@ -95,7 +95,7 @@ test "binary arith: column * literal (DOUBLE)" {
     try std.testing.expectApproxEqAbs(@as(f64, 7.0), got[2], 1e-9);
 }
 
-test "binary arith: division produces integer truncation" {
+test "binary arith: slash true-divides, DIV truncates" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -104,12 +104,19 @@ test "binary arith: division produces integer truncation" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db, "SELECT qty / 7 AS d FROM t ORDER BY id ASC");
+    var q = try runSql(allocator, db, "SELECT qty / 7 AS d, qty DIV 7 AS i FROM t ORDER BY id ASC");
     defer q.deinit();
-    const got = try collectBigint(allocator, &q, 0);
-    defer allocator.free(got);
-    // 10/7=1, 20/7=2, 30/7=4 (integer truncation)
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 4 }, got);
+    var n: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            const expected_d = [_]f64{ 10.0 / 7.0, 20.0 / 7.0, 30.0 / 7.0 };
+            const expected_i = [_]i64{ 1, 2, 4 };
+            try std.testing.expectApproxEqAbs(expected_d[n], b.values[0].data.double[r], 1e-12);
+            try std.testing.expectEqual(expected_i[n], b.values[1].data.bigint[r]);
+            n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
 }
 
 test "binary arith: modulo" {
@@ -213,7 +220,7 @@ test "binary arith: scalar call as binary operand" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 91, 82, 73 }, got);
 }
 
-test "binary arith: division by zero returns 0 (integer)" {
+test "binary arith: division by zero — slash follows IEEE, DIV returns 0" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -222,11 +229,20 @@ test "binary arith: division by zero returns 0 (integer)" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    var q = try runSql(allocator, db, "SELECT qty / 0 AS d FROM t ORDER BY id ASC");
+    // `/` widens to double, so /0 is IEEE infinity (MySQL's NULL-on-zero is
+    // a dialect follow-up — kernels don't write validity today). DIV keeps
+    // the integer-kernel convention of 0.
+    var q = try runSql(allocator, db, "SELECT qty / 0 AS d, qty DIV 0 AS i FROM t ORDER BY id ASC");
     defer q.deinit();
-    const got = try collectBigint(allocator, &q, 0);
-    defer allocator.free(got);
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 0, 0, 0 }, got);
+    var n: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            try std.testing.expect(std.math.isInf(b.values[0].data.double[r]));
+            try std.testing.expectEqual(@as(i64, 0), b.values[1].data.bigint[r]);
+            n += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
 }
 
 // Known limitation: combining binary arithmetic with a window function

@@ -92,3 +92,4 @@ _cdc_rig/box-scripts/
 # flink-cdc integration build artifacts
 integrations/flink-cdc/target/
 integrations/flink-cdc/dependency-reduced-pom.xml
+/_conformance_results.jsonl

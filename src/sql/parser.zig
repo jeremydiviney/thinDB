@@ -745,7 +745,6 @@ pub const Parser = struct {
             break :blk false;
         };
         const has_group = group_exprs.len > 0;
-        if (aggregate_expr_refs.len > 0 and !has_group) return ParseError.SqlInvalidProjection;
         var hidden_agg_cols: []const []const u8 = &.{};
         if (aggregate_expr_refs.len > 0) {
             const cols = try self.arena.alloc([]const u8, aggregate_expr_refs.len);
@@ -1471,6 +1470,16 @@ pub const Parser = struct {
             // aggregate lowering expects. Aggregates only accept a single
             // column-ref arg (or `*` for COUNT(*)); reject anything else.
             if (self.aggregateFuncForName(first)) |func| {
+                // An aggregate continued by an operator (`SUM(a) / COUNT(*)`)
+                // hoists to a hidden aggregate output exactly like the nested
+                // form, then keeps parsing the expression.
+                if (isBinaryOpToken(self.cur.tag)) {
+                    const agg_name = try self.materializeAggregateExpr(first, func, args, saw_distinct);
+                    const expr = try self.continueBinaryFrom(ir.Expr{ .col_ref = agg_name });
+                    const default_name = try self.exprDefaultName(expr);
+                    const alias = try self.maybeAlias(default_name);
+                    return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                }
                 if (saw_distinct) {
                     const distinct_func: ir.AggFunc = switch (func) {
                         .count => .count_distinct,
@@ -1616,7 +1625,7 @@ pub const Parser = struct {
     /// recognize in expression position (+ - * / %).
     fn isBinaryOpToken(tag: TokenTag) bool {
         return switch (tag) {
-            .plus, .minus, .star, .slash, .percent, .pipe_pipe, .arrow, .arrow2 => true,
+            .plus, .minus, .star, .slash, .percent, .kw_div, .pipe_pipe, .arrow, .arrow2 => true,
             else => false,
         };
     }
@@ -1636,11 +1645,12 @@ pub const Parser = struct {
         // JSON `->`/`->>` bind tighter than arithmetic — consume any that
         // trail the already-parsed atom before climbing precedence levels.
         var lhs = try self.consumeJsonArrows(atom);
-        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent) {
+        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent or self.cur.tag == .kw_div) {
             const fn_name: []const u8 = switch (self.cur.tag) {
                 .star => "mul",
                 .slash => "div",
                 .percent => "mod",
+                .kw_div => "intdiv",
                 else => unreachable,
             };
             try self.advance();
@@ -2126,11 +2136,12 @@ pub const Parser = struct {
     /// Left-associative.
     fn parseMulDiv(self: *Parser) ParseError!ir.Expr {
         var lhs = try self.parseCallAtom();
-        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent) {
+        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent or self.cur.tag == .kw_div) {
             const fn_name: []const u8 = switch (self.cur.tag) {
                 .star => "mul",
                 .slash => "div",
                 .percent => "mod",
+                .kw_div => "intdiv",
                 else => unreachable,
             };
             try self.advance();
@@ -4707,13 +4718,13 @@ test "sql table function: CREATE parse, body capture, validation, expansion" {
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const stmt = "CREATE FUNCTION t_f(pid INT, div INT) RETURNS TABLE AS (SELECT c FROM t WHERE a = pid AND b = div)";
+    const stmt = "CREATE FUNCTION t_f(pid INT, dv INT) RETURNS TABLE AS (SELECT c FROM t WHERE a = pid AND b = dv)";
     const op = try parse(aa, stmt);
     try std.testing.expect(op.* == .ddl);
     const cf = op.ddl.create_sql_function;
     try std.testing.expectEqualStrings("t_f", cf.name);
     try std.testing.expectEqual(@as(usize, 2), cf.param_names.len);
-    try std.testing.expectEqualStrings("SELECT c FROM t WHERE a = pid AND b = div", cf.body);
+    try std.testing.expectEqualStrings("SELECT c FROM t WHERE a = pid AND b = dv", cf.body);
     try validateFnBody(aa, cf.body, cf.param_names, null);
 }
 

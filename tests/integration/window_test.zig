@@ -828,13 +828,13 @@ test "window: leading window call continued by arithmetic hoists to hidden colum
         \\ORDER BY id ASC
     );
     defer q.deinit();
-    var rows: std.ArrayList(i64) = .empty;
+    var rows: std.ArrayList(f64) = .empty;
     defer rows.deinit(allocator);
     while (try q.next()) |b| {
-        for (b.values[1].data.bigint[0..b.row_count]) |v| try rows.append(allocator, v);
+        for (b.values[1].data.double[0..b.row_count]) |v| try rows.append(allocator, v);
     }
-    // Running sums 10,30,60 | 100,300 halved.
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 15, 30, 50, 150 }, rows.items);
+    // Running sums 10,30,60 | 100,300 halved; `/` is true division (double).
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 5, 15, 30, 50, 150 }, rows.items);
 }
 
 test "window: SUM and AVG over DECIMAL inputs (running and framed)" {

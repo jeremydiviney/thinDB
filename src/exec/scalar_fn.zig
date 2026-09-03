@@ -520,9 +520,12 @@ pub const builtins = [_]ScalarFn{
     // Internal checked i128 → i64 narrow for the affine-aggregate reduction.
     // Errors on out-of-i64-range exactly like the SUM finalize. Not user-facing.
     .{ .name = "__narrow_bigint", .arg_types = &.{.largeint}, .return_type = .bigint, .kernel = math.narrowBigintKernel },
-    .{ .name = "div", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.divIntKernel },
-    .{ .name = "div", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.divBigintKernel },
+    // `/` is true division per MySQL/StarRocks: integer operands widen to
+    // double via the implicit-cast lattice (7 / 2 = 3.5). Explicit integer
+    // division is the `DIV` operator, which lowers to `intdiv`.
     .{ .name = "div", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.divDoubleKernel },
+    .{ .name = "intdiv", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.divIntKernel },
+    .{ .name = "intdiv", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.divBigintKernel },
     .{ .name = "pow", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.powKernel },
     .{ .name = "sqrt", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sqrtKernel },
     .{ .name = "exp", .arg_types = &.{.double}, .return_type = .double, .kernel = math.expKernel },
