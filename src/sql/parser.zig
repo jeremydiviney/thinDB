@@ -661,6 +661,7 @@ pub const Parser = struct {
         }
 
         // Optional WHERE.
+        var where_derived_count: u32 = 0;
         if (self.cur.tag == .kw_where) {
             try self.advance();
             const derived_mark = self.predicate_derived.items.len;
@@ -672,6 +673,7 @@ pub const Parser = struct {
                 const derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[derived_mark..]);
                 self.predicate_derived.shrinkRetainingCapacity(derived_mark);
                 root = try self.allocOp(.{ .compute = .{ .derived = derived, .upstream = root } });
+                where_derived_count = @intCast(derived.len);
             }
             root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
         }
@@ -1120,8 +1122,13 @@ pub const Parser = struct {
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
             }
-            if (!isBareStarProjection(proj)) {
-                root = try self.addSelectProject(root, proj, selectDerivedCount(proj));
+            // Hidden computed columns trail the row — the WHERE's predicate
+            // anchors, the projection's own predicate anchors, then the
+            // SELECT-list exprs/windows. `*` stops before all of them, so
+            // even a bare star projects when any exist.
+            const hidden_trailing = selectDerivedCount(proj) + where_derived_count + @as(u32, @intCast(projection_predicate_derived.len));
+            if (!isBareStarProjection(proj) or hidden_trailing > 0) {
+                root = try self.addSelectProject(root, proj, hidden_trailing);
             }
         }
         // Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit,

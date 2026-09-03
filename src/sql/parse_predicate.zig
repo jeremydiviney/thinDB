@@ -749,18 +749,6 @@ fn compareLiterals(a: Value, op: PredicateOp, b: Value) !bool {
     };
 }
 
-fn makeBetween(p: anytype, col: []const u8, lo: Value, hi: Value, negate: bool) !PredicateExpr {
-    const kids = try p.arena.alloc(PredicateExpr, 2);
-    if (negate) {
-        kids[0] = .{ .leaf = .{ .col = col, .op = .lt, .val = lo } };
-        kids[1] = .{ .leaf = .{ .col = col, .op = .gt, .val = hi } };
-        return .{ .@"or" = kids };
-    }
-    kids[0] = .{ .leaf = .{ .col = col, .op = .gte, .val = lo } };
-    kids[1] = .{ .leaf = .{ .col = col, .op = .lte, .val = hi } };
-    return .{ .@"and" = kids };
-}
-
 fn makeBetweenExpr(p: anytype, col: []const u8, lo: ir.Expr, hi: ir.Expr, negate: bool) @TypeOf(p.*).Err!PredicateExpr {
     const kids = try p.arena.alloc(PredicateExpr, 2);
     if (negate) {

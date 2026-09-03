@@ -2525,7 +2525,7 @@ fn broadcastOutputCell(cell: OutCell, src_row: u32, dst_row: u32) !void {
 /// Non-coercible literals pass through for the writer to accept or reject.
 fn coerceDefaultLit(v: Value, col_type: Type) !Value {
     var out = v;
-    predicate_mod.coerceValue(&out, col_type) catch return v;
+    predicate_mod.coerceValueRounded(&out, col_type) catch return v;
     return out;
 }
 

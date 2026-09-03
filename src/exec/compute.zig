@@ -1543,7 +1543,7 @@ fn coerceLitBranch(runtime_allocator: Allocator, src: BranchSrc, out_type: Type)
     const slot = src.lit;
     if (std.meta.activeTag(slot.ty) == std.meta.activeTag(out_type)) return;
     var v = slot.value;
-    predicate_mod.coerceValue(&v, out_type) catch return;
+    predicate_mod.coerceValueRounded(&v, out_type) catch return;
     slot.value = v;
     slot.ty = out_type;
     slot.buf.deinit(runtime_allocator);

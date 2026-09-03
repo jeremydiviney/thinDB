@@ -186,6 +186,33 @@ test "decimal: comparison against int and float literals" {
     try std.testing.expectEqualSlices(i32, &[_]i32{2}, ids2);
 }
 
+test "decimal: literal digits past the scale never round into a match" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seed(allocator, db);
+
+    // b DECIMAL(10,2): 4.00, 3.00, NULL. 3.999 is not representable at scale 2,
+    // so it folds MySQL-style instead of rounding to 4.00.
+    const cases = .{
+        .{ .sql = "SELECT id FROM d WHERE b = 3.999 ORDER BY id", .ids = &[_]i32{} },
+        .{ .sql = "SELECT id FROM d WHERE b <> 3.999 ORDER BY id", .ids = &[_]i32{ 1, 2 } },
+        .{ .sql = "SELECT id FROM d WHERE b <= 3.999 ORDER BY id", .ids = &[_]i32{2} },
+        .{ .sql = "SELECT id FROM d WHERE b > 3.999 ORDER BY id", .ids = &[_]i32{1} },
+        .{ .sql = "SELECT id FROM d WHERE b IN (3.999, 3.0) ORDER BY id", .ids = &[_]i32{2} },
+        .{ .sql = "SELECT id FROM d WHERE b = 4.0 ORDER BY id", .ids = &[_]i32{1} },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        const ids = try collectInt(allocator, &q, 0);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i32, c.ids, ids);
+    }
+}
+
 test "decimal: SUM widens to DECIMAL(38,s), AVG divides out scale" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
