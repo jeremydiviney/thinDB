@@ -584,21 +584,25 @@ fn findCol(schema: []const Column, name: []const u8) ?usize {
 /// Pub: the keyed-access bloom gate (api/comparison.appendPredicateValueBytes)
 /// must coerce literals identically to predicate evaluation, or a single
 /// text-vs-DATE key column silently disables bloom pruning for the statement.
-/// A fractional numeric literal compared against an integer-family column
-/// can never be equal; instead of erroring, comparisons fold to the
-/// equivalent integer form — MySQL semantics: `x = 2.5` matches nothing,
-/// `x <> 2.5` matches every non-NULL row, `x < 2.5` ⇔ `x < 3`,
-/// `x <= 2.5` ⇔ `x <= 2`, `x > 2.5` ⇔ `x > 2`, `x >= 2.5` ⇔ `x >= 3`.
+/// A numeric literal with more fractional digits than the column can hold —
+/// any fraction against an integer-family column, or digits past a DECIMAL's
+/// scale — can never be equal; instead of erroring, comparisons fold to the
+/// nearest representable form — MySQL semantics at the column's scale:
+/// `x = 2.5` matches nothing, `x <> 2.5` matches every non-NULL row,
+/// `x < 2.5` ⇔ `x < 3`, `x <= 2.5` ⇔ `x <= 2`, `x > 2.5` ⇔ `x > 2`,
+/// `x >= 2.5` ⇔ `x >= 3` (and `dc < 10.499` ⇔ `dc < 10.50` at scale 2).
 /// Returns false when the shape doesn't apply (caller errors).
 fn foldFractionalComparison(expr: *PredicateExpr, col_type: types.Type) bool {
     const p = expr.leaf;
-    if (!col_type.isInteger()) return false;
+    const scale: u8 = if (col_type.isInteger()) 0 else if (col_type.decimalSpec()) |spec| spec.s else return false;
     const f: f64 = switch (p.val) {
         .double => |v| v,
         .float => |v| v,
         else => return false,
     };
-    if (!std.math.isFinite(f) or @trunc(f) == f) return false;
+    if (!std.math.isFinite(f)) return false;
+    const scaled = f * std.math.pow(f64, 10.0, @floatFromInt(scale));
+    if (scaledIsIntegral(scaled)) return false;
     switch (p.op) {
         .eq => {
             expr.* = .{ .always = false };
@@ -609,10 +613,16 @@ fn foldFractionalComparison(expr: *PredicateExpr, col_type: types.Type) bool {
             return true;
         },
         .lt, .gte, .lte, .gt => {
-            const bound = if (p.op == .lt or p.op == .gte) @ceil(f) else @floor(f);
+            const bound = if (p.op == .lt or p.op == .gte) @ceil(scaled) else @floor(scaled);
             if (@abs(bound) >= 9.2e18) return false;
             var v = types.Value{ .bigint = @intFromFloat(bound) };
-            coerceValue(&v, col_type) catch return false;
+            if (col_type.isInteger()) {
+                coerceValue(&v, col_type) catch return false;
+            } else if (col_type == .decimal128) {
+                v = .{ .decimal128 = @intFromFloat(bound) };
+            } else {
+                v = .{ .decimal64 = @intFromFloat(bound) };
+            }
             expr.* = .{ .leaf = .{ .col = p.col, .op = p.op, .val = v } };
             return true;
         },
@@ -625,7 +635,20 @@ fn foldFractionalComparison(expr: *PredicateExpr, col_type: types.Type) bool {
 /// float → double). Callers that can tolerate a non-coercible literal
 /// (a writer that handles the raw tag) `catch` and keep the original.
 pub fn coerceValue(val: *Value, target: types.Type) error{NoWidening}!void {
-    if (target.decimalSpec()) |spec| return coerceLiteralToDecimal(val, spec, target == .decimal128);
+    return coerceValueMode(val, target, .exact);
+}
+
+/// Result-unification coercion (CASE branches, LAG defaults): a fractional
+/// literal ROUNDS to the decimal target's scale, as the MySQL cast does.
+/// Comparisons must not use this — `dc = 10.499` would silently match 10.50.
+pub fn coerceValueRounded(val: *Value, target: types.Type) error{NoWidening}!void {
+    return coerceValueMode(val, target, .round);
+}
+
+const DecimalFit = enum { exact, round };
+
+fn coerceValueMode(val: *Value, target: types.Type, fit: DecimalFit) error{NoWidening}!void {
+    if (target.decimalSpec()) |spec| return coerceLiteralToDecimal(val, spec, target == .decimal128, fit);
     return tryWidenLiteral(val, ValueTag.fromType(target));
 }
 
@@ -705,7 +728,7 @@ fn fitInt(comptime T: type, v: i128) error{OutOfRange}!T {
 /// so the comparison kernel — which compares raw mantissas — sees both operands
 /// at the same scale. A literal beyond the column precision still coerces (the
 /// comparison just resolves to a constant); only an i128 overflow is rejected.
-fn coerceLiteralToDecimal(val: *Value, spec: types.DecimalSpec, is128: bool) error{NoWidening}!void {
+fn coerceLiteralToDecimal(val: *Value, spec: types.DecimalSpec, is128: bool, fit: DecimalFit) error{NoWidening}!void {
     const m: i128 = switch (val.*) {
         .tinyint => |v| try intToDecimalMantissa(v, spec.s),
         .smallint => |v| try intToDecimalMantissa(v, spec.s),
@@ -713,8 +736,8 @@ fn coerceLiteralToDecimal(val: *Value, spec: types.DecimalSpec, is128: bool) err
         .bigint => |v| try intToDecimalMantissa(v, spec.s),
         .largeint => |v| try intToDecimalMantissa(v, spec.s),
         .boolean => |v| try intToDecimalMantissa(@intFromBool(v), spec.s),
-        .float => |v| try floatToDecimalMantissa(v, spec.s),
-        .double => |v| try floatToDecimalMantissa(v, spec.s),
+        .float => |v| try floatToDecimalMantissa(v, spec.s, fit),
+        .double => |v| try floatToDecimalMantissa(v, spec.s, fit),
         .decimal64 => |v| v,
         .decimal128 => |v| v,
         else => return error.NoWidening,
@@ -733,11 +756,20 @@ fn intToDecimalMantissa(iv: i128, scale: u8) error{NoWidening}!i128 {
     return m;
 }
 
-fn floatToDecimalMantissa(v: f64, scale: u8) error{NoWidening}!i128 {
+fn floatToDecimalMantissa(v: f64, scale: u8, fit: DecimalFit) error{NoWidening}!i128 {
     const factor = std.math.pow(f64, 10.0, @floatFromInt(scale));
-    const scaled = @round(v * factor);
-    if (!std.math.isFinite(scaled) or @abs(scaled) >= std.math.pow(f64, 2.0, 127.0)) return error.NoWidening;
-    return @intFromFloat(scaled);
+    const scaled = v * factor;
+    const rounded = @round(scaled);
+    if (!std.math.isFinite(rounded) or @abs(rounded) >= std.math.pow(f64, 2.0, 127.0)) return error.NoWidening;
+    if (fit == .exact and !scaledIsIntegral(scaled)) return error.NoWidening;
+    return @intFromFloat(rounded);
+}
+
+/// The scale product carries float noise (0.1 × 10 is not exactly 1.0), so
+/// integrality is judged at ulp scale rather than by `@trunc`.
+fn scaledIsIntegral(scaled: f64) bool {
+    const rounded = @round(scaled);
+    return @abs(scaled - rounded) <= @abs(rounded) * 1e-12 + 1e-9;
 }
 
 fn parseDateString(s: []const u8) !i32 {

@@ -2542,6 +2542,47 @@ test "sql: unsupported JOIN ON predicates fail clearly" {
     );
 }
 
+test "sql: expression-led WHERE keeps its hidden anchor out of star" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    var q = try runSql(allocator, db, "SELECT * FROM t WHERE k + 1 > 150 ORDER BY id");
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 4), q.outputSchema().len);
+    try std.testing.expectEqualStrings("tag", q.outputSchema()[3].name);
+    const b = (try q.next()).?;
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4, 5 }, b.values[0].data.bigint[0..b.row_count]);
+}
+
+test "sql: expression-led WHERE composes with global and grouped aggregates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    {
+        var q = try runSql(allocator, db, "SELECT COUNT(*) AS n FROM t WHERE k + 1 > 150");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(i64, 3), b.values[0].data.bigint[0]);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT tag, COUNT(*) AS n FROM t WHERE ABS(k) > 150 GROUP BY tag ORDER BY tag");
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 3), b.row_count);
+        try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1 }, b.values[1].data.bigint[0..b.row_count]);
+    }
+}
+
 test "sql: JOIN ON with only side-local filters is a filtered cross product" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -81,6 +81,19 @@ function* genQueries() {
       yield `SELECT id FROM c WHERE ABS(${a}) > 2 AND id < 6 ORDER BY id`
       yield `SELECT id FROM c WHERE NOT (${a} > 2 OR id > 5) ORDER BY id`
    }
+   // Expression-led predicates: the hidden anchor must not leak into `*`,
+   // and must compose with aggregates (it lives below the Filter).
+   yield `SELECT * FROM c WHERE i + 1 > 3 ORDER BY id`
+   yield `SELECT *, i + 1 AS j FROM c WHERE ABS(i) > 3 ORDER BY id`
+   yield `SELECT COUNT(*) AS v FROM c WHERE i + 1 > 3`
+   yield `SELECT SUM(i) AS v FROM c WHERE ABS(i) > 3`
+   yield `SELECT g, COUNT(*) AS v FROM c WHERE i + 1 > 3 GROUP BY g ORDER BY g`
+   yield `SELECT g, SUM(d) AS v FROM c WHERE (CASE WHEN i > 0 THEN 1 ELSE 0 END) = 1 GROUP BY g ORDER BY g`
+   // Fractional literals against DECIMAL columns: digits past the scale never
+   // round into a match.
+   for (const cmp of CMPS) yield `SELECT id FROM c WHERE dc ${cmp} 10.499 ORDER BY id`
+   yield `SELECT id FROM c WHERE dc IN (10.499, 99.99) ORDER BY id`
+   yield `SELECT id FROM c WHERE dc = 10.5 ORDER BY id`
    // Fractional literals against integer columns (MySQL folding semantics).
    for (const cmp of CMPS) yield `SELECT id FROM c WHERE i ${cmp} 2.5 ORDER BY id`
    yield `SELECT id FROM c WHERE i IN (2.5, 7, 12) ORDER BY id`
@@ -126,7 +139,6 @@ function* genQueries() {
 // KNOWN_DIFF instead of VALUE_DIFF/errors. Keep this list SHORT and justified.
 // ---------------------------------------------------------------------------
 const KNOWN_DIFF = [
-   { re: /%/, why: 'MOD sign/typing differs between engines for negative and float operands' },
    { re: /INTERVAL/, why: 'DuckDB returns TIMESTAMP for date+interval; thinDB (like MySQL) returns DATE' },
    { re: /dc \//, why: 'MySQL DECIMAL division keeps scale+4 (few sig figs for small values); DuckDB widens to DOUBLE' },
 ]
@@ -213,7 +225,9 @@ async function main() {
       else if (!t.ok && d.ok) cls = 'THINDB_ERR'
       else if (t.ok && !d.ok) cls = 'DUCK_ERR'
       else cls = 'BOTH_ERR'
-      if (cls !== 'MATCH' && KNOWN_DIFF.some(k => k.re.test(sql))) cls = 'KNOWN_DIFF'
+      // Only a value difference can be a known dialect difference; an error
+      // on either side is always reported.
+      if (cls === 'VALUE_DIFF' && KNOWN_DIFF.some(k => k.re.test(sql))) cls = 'KNOWN_DIFF'
       counts[cls] += 1
       results.push({ cls, sql, thindb: t.ok ? undefined : t.err, duckdb: d.ok ? undefined : d.err })
    }
@@ -228,7 +242,7 @@ async function main() {
    }
    kill()
    try { rmSync(dataDir, { recursive: true, force: true }) } catch { /* best effort */ }
-   process.exit(0)
+   process.exit(counts.THINDB_ERR + counts.VALUE_DIFF > 0 ? 1 : 0)
 }
 
 main().catch(e => { console.error(e); process.exit(2) })

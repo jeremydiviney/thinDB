@@ -188,13 +188,25 @@ pub const TableFnExec = struct {
         for (0..n_in) |i| {
             const decl_schema = entry.input_schemas[i];
             const up_schema = upstreams[i].outputSchema();
-            if (up_schema.len != decl_schema.len) return Error.TableFnInputMismatch;
+            if (up_schema.len != decl_schema.len) {
+                std.debug.print("[table_fn] {s} input {d}: {d} columns supplied, {d} declared\n", .{ entry.name, i, up_schema.len, decl_schema.len });
+                return Error.TableFnInputMismatch;
+            }
             const imap = try allocator.alloc(usize, decl_schema.len);
             errdefer allocator.free(imap);
             for (decl_schema, imap) |decl, *slot| {
-                const ui = types.findColumn(up_schema, decl.name) orelse return Error.TableFnInputMismatch;
-                if (!inputTypeMatches(up_schema[ui].type, decl.type)) return Error.TableFnInputMismatch;
-                if (up_schema[ui].nullable and !decl.nullable) return Error.TableFnInputMismatch;
+                const ui = types.findColumn(up_schema, decl.name) orelse {
+                    std.debug.print("[table_fn] {s} input {d}: declared column '{s}' not supplied\n", .{ entry.name, i, decl.name });
+                    return Error.TableFnInputMismatch;
+                };
+                if (!inputTypeMatches(up_schema[ui].type, decl.type)) {
+                    std.debug.print("[table_fn] {s} input {d}: column '{s}' is {s}, declared {s}\n", .{ entry.name, i, decl.name, @tagName(std.meta.activeTag(up_schema[ui].type)), @tagName(std.meta.activeTag(decl.type)) });
+                    return Error.TableFnInputMismatch;
+                }
+                if (up_schema[ui].nullable and !decl.nullable) {
+                    std.debug.print("[table_fn] {s} input {d}: column '{s}' is nullable, declared NOT NULL\n", .{ entry.name, i, decl.name });
+                    return Error.TableFnInputMismatch;
+                }
                 slot.* = ui;
             }
             // Broadcast inputs are never co-grouped: the call keys need

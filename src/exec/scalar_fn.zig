@@ -498,6 +498,9 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "random", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
     .{ .name = "mod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.modIntKernel },
     .{ .name = "mod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.modBigintKernel },
+    // A floating operand on either side: MySQL MOD keeps the dividend's sign
+    // (fmod), same as `%`.
+    .{ .name = "mod", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.modDoubleKernel },
     .{ .name = "pmod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.pmodIntKernel },
     .{ .name = "pmod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.pmodBigintKernel },
     .{ .name = "fmod", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.fmodKernel },

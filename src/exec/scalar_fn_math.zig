@@ -405,6 +405,19 @@ pub fn fmodKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, @mod(a[i], b[i]));
 }
 
+/// `%` / MOD with a floating operand: the remainder keeps the dividend's
+/// sign (MySQL, DuckDB), unlike `fmod()` above which floors. MOD by 0 is 0,
+/// the same convention as the integer kernels.
+pub fn modDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.double;
+    const b = args[1].data.double;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const r: f64 = if (b[i] == 0) 0 else @rem(a[i], b[i]);
+        try out.data.double.append(allocator, r);
+    }
+}
+
 pub fn pmodIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0].data.int;
     const b = args[1].data.int;

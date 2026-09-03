@@ -537,8 +537,7 @@ fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan)
         try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
-    if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
     q = try q.udfGroupBy(plan.group_by.group_cols, plan.group_by.aggs, registry);
     // HAVING runs as a generic filter over the (small) grouped output.
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
@@ -568,8 +567,7 @@ fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNP
         try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
-    if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
     q = try q.groupBy(plan.group_by.group_cols, plan.group_by.aggs);
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
     if (plan.order_by) |o| {
@@ -688,6 +686,12 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         }
     }
 
+    // The silo cores fuse the WHERE into the scan, below the Compute that
+    // materializes hidden predicate anchors; the operator pipeline orders them.
+    if (eff_where) |w| {
+        if (predicateRefsDerived(w, plan.derived)) return try buildOperatorGroupBy(input, table, plan);
+    }
+
     const request = v2_pipeline.GroupTopNRequest{
         .group_cols = plan.group_by.group_cols,
         .aggs = eff_aggs,
@@ -765,6 +769,24 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
 fn nameInDerivedList(derived: []const ir.Derived, name: []const u8) bool {
     for (derived) |d| if (types.columnNameEql(d.name, name)) return true;
     return false;
+}
+
+/// A WHERE anchored on a hidden computed column (`WHERE i + 1 > 3` lowers to
+/// `__pred_expr_0 > 3` over a Compute) can only run above that Compute.
+fn predicateRefsDerived(pred: exec.PredicateExpr, derived: []const ir.Derived) bool {
+    for (derived) |d| if (exec.predicate.touchesColumn(pred, d.name)) return true;
+    return false;
+}
+
+/// WHERE + row-local derived, ordered by dependency: the filter runs first so
+/// the exprs evaluate on survivors only, unless it reads a derived column.
+fn applyWhereAndDerived(input: CompileInput, q: *exec.Query, where: ?ir.Op.Filter, derived: []const ir.Derived) !void {
+    const filter_last = if (where) |f| predicateRefsDerived(f.predicate, derived) else false;
+    if (!filter_last) {
+        if (where) |f| q.* = try q.*.filter(f.predicate);
+    }
+    if (derived.len > 0) q.* = try computeDerivedFused(input.allocator, q.*, derived, input.udf_registry);
+    if (filter_last) q.* = try q.*.filter(where.?.predicate);
 }
 
 // Push the fusable subset of derived columns DOWN into the ParallelScan workers
@@ -941,6 +963,13 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
 fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?exec.Query {
     const table = try resolveTable(input.db, input.session, plan.scan.table);
+
+    // The parallel reducer fuses the WHERE into its scan, below the Compute
+    // that materializes hidden predicate anchors; only the operator pipeline
+    // can order them.
+    if (plan.where_filter) |f| {
+        if (predicateRefsDerived(f.predicate, plan.derived)) return try buildGlobalOperatorAggregate(input, table, plan);
+    }
 
     // GROUP_CONCAT (no UDAF): a variable-state aggregate the parallel reducer
     // doesn't host — route onto the engine-neutral hash Aggregate operator.
@@ -1157,11 +1186,12 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
                 op = c.upstream;
             },
             .filter => |f| {
-                // A filter above the computes is the WHERE (post-compute if it
-                // reads a derived col); a filter reached AFTER peeling a
-                // compute sits below them, directly over the scan, and is
-                // pushable. Allow one of each.
-                if (compute_layer_count == 0) {
+                // A filter directly over the scan is pushable. One above any
+                // compute — at the top, or between the SELECT list's compute
+                // and the WHERE's hidden-anchor compute — is the WHERE; the
+                // builder places it after the computes when it reads a
+                // derived column. Allow one of each.
+                if (compute_layer_count == 0 or f.upstream.* == .compute) {
                     if (where_filter != null) return null;
                     where_filter = f;
                 } else {
@@ -1536,8 +1566,7 @@ fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: Gl
         try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
-    if (plan.where_filter) |f| q = try q.filter(f.predicate);
-    if (plan.derived.len > 0) q = try computeDerivedFused(allocator, q, plan.derived, input.udf_registry);
+    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
     if (hasUdfAgg(plan.group_by.aggs)) {
         const registry = input.udf_registry orelse return error.UnsupportedQueryShape;
         q = try q.udfGroupBy(&.{}, plan.group_by.aggs, registry);
