@@ -1523,7 +1523,7 @@ fn unifyCaseType(current: ?Type, next: Type, next_src: BranchSrc, st: *CaseUnify
 /// and integer literals against a decimal result scale into it.
 fn normalizeBranchSrc(runtime_allocator: Allocator, src: BranchSrc, out_type: Type) !void {
     switch (src) {
-        .lit => if (out_type.decimalSpec() != null) try coerceIntLitToDecimal(runtime_allocator, src, out_type),
+        .lit => try coerceLitBranch(runtime_allocator, src, out_type),
         .null_lit => |slot| {
             if (std.meta.activeTag(slot.ty) == std.meta.activeTag(out_type)) return;
             slot.ty = out_type;
@@ -1534,38 +1534,17 @@ fn normalizeBranchSrc(runtime_allocator: Allocator, src: BranchSrc, out_type: Ty
     }
 }
 
-fn intValueAsI128(v: types.Value) ?i128 {
-    return switch (v) {
-        .int => |x| x,
-        .bigint => |x| x,
-        .smallint => |x| x,
-        .tinyint => |x| x,
-        .largeint => |x| x,
-        else => null,
-    };
-}
-
-/// Rewrite an integer-literal branch source into a scaled decimal literal
-/// of `out_type` (same idiom as coerceTemporalStringLiterals). No-op for
-/// non-literal or non-integer sources.
-fn coerceIntLitToDecimal(runtime_allocator: Allocator, src: BranchSrc, out_type: Type) !void {
+/// Rewrite a literal branch to the unified type when the value is
+/// losslessly representable there (predicate.coerceValue — the shared
+/// literal-coercion entry). A non-coercible literal is left alone for
+/// attachCaseCast's kernel lattice to convert or reject.
+fn coerceLitBranch(runtime_allocator: Allocator, src: BranchSrc, out_type: Type) !void {
     if (src != .lit) return;
     const slot = src.lit;
-    const raw = intValueAsI128(slot.value) orelse return;
-    const spec = out_type.decimalSpec().?;
-    var scaled: i128 = raw;
-    var k: u8 = 0;
-    while (k < spec.s) : (k += 1) {
-        scaled = std.math.mul(i128, scaled, 10) catch return Error.ComputeUnsupportedExpr;
-    }
-    slot.value = switch (std.meta.activeTag(out_type)) {
-        .decimal64 => if (scaled >= std.math.minInt(i64) and scaled <= std.math.maxInt(i64))
-            types.Value{ .decimal64 = @intCast(scaled) }
-        else
-            return Error.ComputeUnsupportedExpr,
-        .decimal128 => types.Value{ .decimal128 = scaled },
-        else => unreachable,
-    };
+    if (std.meta.activeTag(slot.ty) == std.meta.activeTag(out_type)) return;
+    var v = slot.value;
+    predicate_mod.coerceValue(&v, out_type) catch return;
+    slot.value = v;
     slot.ty = out_type;
     slot.buf.deinit(runtime_allocator);
     slot.buf = try ColumnStore.init(runtime_allocator, out_type, false);

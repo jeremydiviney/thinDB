@@ -1177,6 +1177,10 @@ fn sendSyntheticWorkbenchSelect(
 
     if (!std.mem.startsWith(u8, lc, "select ")) return false;
 
+    // A set operation is never shim-able: answering only the first arm
+    // would silently drop the rest. The engine handles it.
+    if (topLevelKeyword(lc, "union") != null) return false;
+
     const from_idx = topLevelKeyword(lc, "from");
     if (from_idx) |idx| {
         const tail = lc[idx..];
