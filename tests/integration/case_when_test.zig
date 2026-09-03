@@ -191,3 +191,69 @@ test "CASE WHEN: rejects branches with mismatched types" {
         try std.testing.expectEqual(thindb.exec.Error.ComputeUnsupportedExpr, err);
     }
 }
+
+test "case: parenthesized CASE as a WHEN comparison operand" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 5), (2, 50), (3, 500)");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db, "SELECT id, CASE WHEN (CASE WHEN qty > 40 THEN qty ELSE 0 END) > 0 THEN 1 ELSE 0 END AS flag FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), batch.row_count);
+    try std.testing.expectEqual(@as(i32, 0), batch.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 1), batch.values[1].data.int[1]);
+    try std.testing.expectEqual(@as(i32, 1), batch.values[1].data.int[2]);
+}
+
+test "case: CASE expression continued by arithmetic over a window call" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 5), (2, 50), (3, 500)");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db, "SELECT id, CASE WHEN qty > 40 THEN 1 ELSE 0 END - LAG(CASE WHEN qty > 40 THEN 1 ELSE 0 END, 1, 0) OVER (ORDER BY id) AS chg FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), batch.row_count);
+    try std.testing.expectEqual(@as(i32, 0), batch.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 1), batch.values[1].data.int[1]);
+    try std.testing.expectEqual(@as(i32, 0), batch.values[1].data.int[2]);
+}
+
+test "case: bare NULL branch adopts the typed branches' type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, d DATE NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, qty, d) VALUES (1, 5, '2026-01-05'), (2, 50, '2026-02-07')");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(allocator, db, "SELECT id, CASE WHEN qty > 10 THEN d ELSE NULL END AS gated FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), b.row_count);
+    const nulls = b.values[1].nulls.?;
+    try std.testing.expectEqual(@as(u8, 0), nulls[0] & 1);
+    try std.testing.expectEqual(@as(u8, 2), nulls[0] & 2);
+}

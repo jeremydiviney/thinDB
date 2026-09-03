@@ -121,3 +121,24 @@ test "col op col: rejected when type tags differ" {
         try std.testing.expectEqual(thindb.exec.Error.PredicateTypeMismatch, err);
     }
 }
+
+test "col-col: mixed numeric types widen (double vs int)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const h = @import("sql_helpers.zig");
+    try h.exec(allocator, db, "CREATE TABLE mx (id BIGINT PRIMARY KEY, a DOUBLE, b INT)");
+    try h.exec(allocator, db, "INSERT INTO mx VALUES (1, 1.5, 1), (2, 2.0, 3), (3, 4.0, 4)");
+
+    const ids = try h.collectBigints(allocator, db, "SELECT id FROM mx WHERE a > b ORDER BY id");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{1}, ids);
+
+    const ids2 = try h.collectBigints(allocator, db, "SELECT id FROM mx WHERE b >= a ORDER BY id");
+    defer allocator.free(ids2);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, ids2);
+}
