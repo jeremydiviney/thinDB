@@ -1,4 +1,5 @@
-//! Cross-platform CPU topology + thread affinity. Used by the engine's
+//! Cross-platform CPU topology + thread affinity, plus the host-resource
+//! probes that size pools (physical cores, usable memory). Used by the engine's
 //! CoreScheduler (engine/core_scheduler.zig) to pin query worker threads to
 //! physical cores so the OS can't park two of our threads on one core's SMT
 //! siblings while another core idles (measured ~40% scaling loss otherwise).
@@ -187,6 +188,33 @@ fn readSysfsInt(path: [:0]const u8) ?u64 {
     return std.fmt.parseInt(u64, s, 10) catch null;
 }
 
+/// Memory this process may actually use: physical RAM, capped by the cgroup
+/// memory limit when one is set (Linux containers). `sysinfo` reports the
+/// HOST's RAM inside a container, so pools sized from it alone would plan for
+/// memory the kernel will OOM-kill the process for touching. Null when neither
+/// source answers.
+pub fn totalMemoryBytes() ?u64 {
+    const physical: ?u64 = std.process.totalSystemMemory() catch null;
+    const limit = cgroupMemoryLimit();
+    if (physical) |p| return if (limit) |l| @min(p, l) else p;
+    return limit;
+}
+
+/// cgroup v2 first (`memory.max` reads "max" when unlimited, which fails the
+/// integer parse), then the v1 controller.
+fn cgroupMemoryLimit() ?u64 {
+    if (builtin.os.tag != .linux) return null;
+    if (readSysfsInt("/sys/fs/cgroup/memory.max")) |v| return cgroupLimitValue(v);
+    if (readSysfsInt("/sys/fs/cgroup/memory/memory.limit_in_bytes")) |v| return cgroupLimitValue(v);
+    return null;
+}
+
+/// v1 reports "no limit" as a page-rounded maxInt(i64); nothing that large is
+/// a real cap.
+fn cgroupLimitValue(v: u64) ?u64 {
+    return if (v >= (@as(u64, 1) << 62)) null else v;
+}
+
 fn macosPhysicalCoreCount() !usize {
     if (builtin.os.tag != .macos) return error.QueryFailed;
     var n: c_int = 0;
@@ -243,6 +271,17 @@ fn detectWindows(allocator: std.mem.Allocator) !Topology {
         .smt = smt,
         .real = true,
     };
+}
+
+test "cgroupLimitValue treats the v1 unlimited sentinel as no cap" {
+    try std.testing.expectEqual(@as(?u64, null), cgroupLimitValue(9223372036854771712));
+    try std.testing.expectEqual(@as(?u64, null), cgroupLimitValue(std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(?u64, 4294967296), cgroupLimitValue(4294967296));
+}
+
+test "totalMemoryBytes reports usable memory" {
+    const total = totalMemoryBytes() orelse return error.SkipZigTest;
+    try std.testing.expect(total >= 64 * 1024 * 1024);
 }
 
 test "physicalCoreCount is sane" {

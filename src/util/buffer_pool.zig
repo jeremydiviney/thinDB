@@ -25,6 +25,7 @@
 //! huge-page slab pool — a machine resource shared by every query.
 
 const std = @import("std");
+const affinity = @import("affinity.zig");
 const Allocator = std.mem.Allocator;
 
 const SpinLock = struct {
@@ -194,15 +195,25 @@ var g_ready = std.atomic.Value(bool).init(false);
 /// Default retention cap: bounded scratch recycling, deliberately small relative
 /// to the block cache (which owns the ~35%-of-RAM working set). 1 GiB holds a
 /// few full sets of 12-worker decode buffers — enough to recycle across
-/// back-to-back queries without competing with the cache for RAM.
+/// back-to-back queries without competing with the cache for RAM. Inside a
+/// memory-limited container the cap is an eighth of the limit instead (floored
+/// at 64 MiB): retained scratch must not crowd out the cache and the budgets.
 const default_cap_bytes: usize = 1 << 30;
+const min_cap_bytes: usize = 64 << 20;
+
+pub fn defaultCapFor(total_memory: ?u64) usize {
+    const total = total_memory orelse return default_cap_bytes;
+    const share: u64 = @min(total / 8, @as(u64, default_cap_bytes));
+    const share_bytes: usize = @intCast(share);
+    return @max(share_bytes, min_cap_bytes);
+}
 
 pub fn global() *Pool {
     if (!g_ready.load(.acquire)) {
         g_init.lock();
         defer g_init.unlock();
         if (g_pool == null) {
-            g_pool = Pool.init(std.heap.c_allocator, default_cap_bytes);
+            g_pool = Pool.init(std.heap.c_allocator, defaultCapFor(affinity.totalMemoryBytes()));
             g_ready.store(true, .release);
         }
     }
@@ -298,4 +309,11 @@ test "concurrent alloc/free across workers stays consistent and leak-free" {
     for (threads) |t| t.join();
     // drain (deferred) returns all retained blocks to testing.allocator — a leak
     // or double-free trips std.testing.allocator.
+}
+
+test "defaultCapFor scales with a container limit and floors small ones" {
+    try std.testing.expectEqual(default_cap_bytes, defaultCapFor(null));
+    try std.testing.expectEqual(default_cap_bytes, defaultCapFor(64 << 30));
+    try std.testing.expectEqual(@as(usize, 512 << 20), defaultCapFor(4 << 30));
+    try std.testing.expectEqual(min_cap_bytes, defaultCapFor(256 << 20));
 }
