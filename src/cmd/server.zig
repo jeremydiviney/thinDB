@@ -64,15 +64,16 @@ const usage_text =
     \\                          count is also bounded by a global ~(cores-1) worker-slot budget.
     \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
     \\                          (default 0 = auto: ~25% of the physical cores; 1 = serial).
-    \\  --query-memory-budget B Per-query memory budget in bytes (default: auto, ~25% of physical
-    \\                          RAM, floored at 256 MiB; also gates the hash-vs-sort GROUP BY
-    \\                          decision). Separate bucket from --cache-size. 0 disables tracking.
+    \\  --query-memory-budget B Per-query memory budget (default: auto, ~25% of usable RAM,
+    \\                          floored at 256 MiB; also gates the hash-vs-sort GROUP BY
+    \\                          decision). Accepts raw bytes or a K/M/G suffix. Separate bucket
+    \\                          from --cache-size. 0 disables tracking.
     \\  --memory-budget B       Process-shared query-memory pool ALL queries draw from, so
     \\                          concurrent queries can't sum past the box (default: auto, ~50% of
-    \\                          physical RAM, floored at 256 MiB). Accepts raw bytes or a K/M/G
+    \\                          usable RAM, floored at 256 MiB). Accepts raw bytes or a K/M/G
     \\                          suffix. 0 disables the shared pool (per-query budgets still apply).
     \\  --cache-size B          GLOBAL decompressed-block buffer-pool budget, shared by every
-    \\                          table across all databases (default: auto, ~35% of physical RAM,
+    \\                          table across all databases (default: auto, ~35% of usable RAM,
     \\                          floored at 256 MiB). Accepts raw bytes or a K/M/G suffix (e.g.
     \\                          8G). The LRU evicts the coldest block process-wide; blocks in
     \\                          use are pinned and never evicted.
@@ -294,8 +295,8 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         }
         if (try takeValue(arg, "--query-memory-budget", &iter, err_w)) |v| {
-            query_memory_budget = std.fmt.parseInt(usize, v, 10) catch {
-                try err_w.print("thindb-server: invalid --query-memory-budget: {s}\n", .{v});
+            query_memory_budget = parseSize(v) catch {
+                try err_w.print("thindb-server: invalid --query-memory-budget: {s} (use bytes, or a K/M/G suffix)\n", .{v});
                 try err_w.flush();
                 return 1;
             };
@@ -393,6 +394,7 @@ pub fn main(init: std.process.Init) !u8 {
     installSignalHandler();
 
     try out_w.print("thindb-server starting\n  data-dir: {s}\n", .{data_dir});
+    try printMemoryBanner(out_w, cfg);
 
     var listeners: [3]Listener = undefined;
     var n_listeners: usize = 0;
@@ -632,6 +634,25 @@ fn parseBind(bind: []const u8, port: u16) !std.Io.net.IpAddress {
 
 /// Parse a byte size: a plain integer, or an integer with a single binary
 /// suffix `K`/`M`/`G` (×1024, ×1024², ×1024³). Case-insensitive on the suffix.
+/// The resolved budgets, so a container operator can see at a glance that
+/// the "auto" sizes came from the cgroup limit rather than the host's RAM.
+fn printMemoryBanner(out_w: anytype, cfg: thindb.Config) !void {
+    const mib: u64 = 1024 * 1024;
+    const usable = thindb.totalMemoryBytes();
+    const physical: ?u64 = std.process.totalSystemMemory() catch null;
+    const limited = usable != null and physical != null and usable.? < physical.?;
+    if (usable) |u| {
+        try out_w.print("  memory:   usable {d} MiB{s}", .{ u / mib, if (limited) " (cgroup limit)" else "" });
+    } else {
+        try out_w.print("  memory:   usable unknown", .{});
+    }
+    try out_w.print(", cache {d} MiB, query budget {d} MiB, shared budget {d} MiB\n", .{
+        thindb.autoCacheSizeBytes(cfg.cache_size_bytes) / mib,
+        thindb.autoQueryBudgetBytes(cfg.query_memory_budget) / mib,
+        thindb.autoMemoryBudgetBytes(cfg.memory_budget) / mib,
+    });
+}
+
 fn parseSize(s: []const u8) !usize {
     if (s.len == 0) return error.Empty;
     const last = s[s.len - 1];

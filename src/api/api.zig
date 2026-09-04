@@ -259,17 +259,24 @@ pub fn physicalCoreCount(allocator: std.mem.Allocator) usize {
     return @import("../util/affinity.zig").physicalCoreCount(allocator);
 }
 
+/// Memory the process may actually use: physical RAM, or the container's
+/// cgroup limit when that is smaller. What every "auto" budget is sized from.
+pub fn totalMemoryBytes() ?u64 {
+    return @import("../util/affinity.zig").totalMemoryBytes();
+}
+
 /// Resolve the GLOBAL decompressed-block cache budget (one cache shared by
 /// every table of the Catalog). A non-zero `configured` is honored verbatim;
-/// `0` means "auto" — ~35% of physical RAM, floored at 256 MiB so small
-/// machines still get a usable pool. The LRU fills lazily and evicts to this
+/// `0` means "auto" — ~35% of usable RAM (physical, or the container's cgroup
+/// limit when that is smaller), floored at 256 MiB so small machines still get
+/// a usable pool. The LRU fills lazily and evicts to this
 /// bound, so a large auto budget on a big box costs nothing until the
 /// workload's hot set actually grows into it. Falls back to the floor if the
 /// OS can't report total memory.
 pub fn autoCacheSizeBytes(configured: usize) usize {
     if (configured != 0) return configured;
     const floor: u64 = 256 * 1024 * 1024;
-    const total = std.process.totalSystemMemory() catch return @intCast(floor);
+    const total = @import("../util/affinity.zig").totalMemoryBytes() orelse return @intCast(floor);
     // 35% of system memory (not 50%): a larger decompressed-block cache stops
     // paying off once the OS starts trimming the working set — re-faulting those
     // pages on access costs more than the decompression the cache avoids (the
@@ -284,13 +291,13 @@ pub fn autoCacheSizeBytes(configured: usize) usize {
 pub const auto_query_budget: usize = std.math.maxInt(usize);
 
 /// Resolve the per-query memory budget. The `auto_query_budget` sentinel (the
-/// `Config` default) means "auto" — ~25% of physical RAM, floored at 256 MiB.
+/// `Config` default) means "auto" — ~25% of usable RAM, floored at 256 MiB.
 /// Any other value (including `0` = disable tracking) is honored verbatim.
 /// Falls back to the floor if the OS can't report total memory.
 pub fn autoQueryBudgetBytes(configured: usize) usize {
     if (configured != auto_query_budget) return configured;
     const floor: u64 = 256 * 1024 * 1024;
-    const total = std.process.totalSystemMemory() catch return @intCast(floor);
+    const total = @import("../util/affinity.zig").totalMemoryBytes() orelse return @intCast(floor);
     return @intCast(@max(total / 4, floor));
 }
 
@@ -299,13 +306,13 @@ pub fn autoQueryBudgetBytes(configured: usize) usize {
 pub const auto_memory_budget: usize = std.math.maxInt(usize);
 
 /// Resolve the process-shared memory-pool budget. The sentinel default →
-/// ~50% of physical RAM, floored at 256 MiB; `0` = no shared pool; any
+/// ~50% of usable RAM, floored at 256 MiB; `0` = no shared pool; any
 /// other value verbatim. Sits alongside the ~35% block cache: together
 /// they bound the process's two growth buckets below the box.
 pub fn autoMemoryBudgetBytes(configured: usize) usize {
     if (configured != auto_memory_budget) return configured;
     const floor: u64 = 256 * 1024 * 1024;
-    const total = std.process.totalSystemMemory() catch return @intCast(floor);
+    const total = @import("../util/affinity.zig").totalMemoryBytes() orelse return @intCast(floor);
     return @intCast(@max(total / 2, floor));
 }
 
