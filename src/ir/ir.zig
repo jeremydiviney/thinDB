@@ -55,7 +55,7 @@ pub const Expr = exec_expr.Expr;
 
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v5: create_table carries a table-compression byte.
-pub const version: u16 = 5;
+pub const version: u16 = 6;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -106,10 +106,10 @@ pub const FileScan = struct {
 /// `Query` returns null on the first `next()` call after invoking the
 /// side effect against the active Session.
 pub const DdlOp = union(enum) {
-    create_database: []const u8,
-    drop_database: []const u8,
-    create_schema: []const u8,
-    drop_schema: []const u8,
+    create_database: CreateNamespace,
+    drop_database: DropNamespace,
+    create_schema: CreateNamespace,
+    drop_schema: DropNamespace,
     /// `USE name` — set current schema (one identifier).
     use_schema: []const u8,
     /// `USE db.schema` — set current database AND schema.
@@ -223,6 +223,18 @@ pub const CreateTable = struct {
 pub const DropTable = struct {
     table: TableRef,
     if_exists: bool,
+};
+
+/// `CREATE DATABASE|SCHEMA [IF NOT EXISTS] name`.
+pub const CreateNamespace = struct {
+    name: []const u8,
+    if_not_exists: bool = false,
+};
+
+/// `DROP DATABASE|SCHEMA [IF EXISTS] name`.
+pub const DropNamespace = struct {
+    name: []const u8,
+    if_exists: bool = false,
 };
 
 pub const RenameTable = struct {
@@ -1314,25 +1326,29 @@ fn encodeColumnDef(allocator: Allocator, out: *std.ArrayList(u8), c: ColumnDef) 
 
 fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeError!void {
     switch (d) {
-        .create_database => |n| {
+        .create_database => |ns| {
             try out.append(allocator, @intFromEnum(DdlTag.create_database));
-            try appendU32(allocator, out, @intCast(n.len));
-            try out.appendSlice(allocator, n);
+            try appendU32(allocator, out, @intCast(ns.name.len));
+            try out.appendSlice(allocator, ns.name);
+            try out.append(allocator, @intFromBool(ns.if_not_exists));
         },
-        .drop_database => |n| {
+        .drop_database => |ns| {
             try out.append(allocator, @intFromEnum(DdlTag.drop_database));
-            try appendU32(allocator, out, @intCast(n.len));
-            try out.appendSlice(allocator, n);
+            try appendU32(allocator, out, @intCast(ns.name.len));
+            try out.appendSlice(allocator, ns.name);
+            try out.append(allocator, @intFromBool(ns.if_exists));
         },
-        .create_schema => |n| {
+        .create_schema => |ns| {
             try out.append(allocator, @intFromEnum(DdlTag.create_schema));
-            try appendU32(allocator, out, @intCast(n.len));
-            try out.appendSlice(allocator, n);
+            try appendU32(allocator, out, @intCast(ns.name.len));
+            try out.appendSlice(allocator, ns.name);
+            try out.append(allocator, @intFromBool(ns.if_not_exists));
         },
-        .drop_schema => |n| {
+        .drop_schema => |ns| {
             try out.append(allocator, @intFromEnum(DdlTag.drop_schema));
-            try appendU32(allocator, out, @intCast(n.len));
-            try out.appendSlice(allocator, n);
+            try appendU32(allocator, out, @intCast(ns.name.len));
+            try out.appendSlice(allocator, ns.name);
+            try out.append(allocator, @intFromBool(ns.if_exists));
         },
         .use_schema => |n| {
             try out.append(allocator, @intFromEnum(DdlTag.use_schema));
@@ -2492,6 +2508,23 @@ fn decodeColumnDef(bytes: []const u8, cursor: *usize) DecodeError!ColumnDef {
     };
 }
 
+fn decodeFlag(bytes: []const u8, cursor: *usize) DecodeError!bool {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const v = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    return v;
+}
+
+fn decodeCreateNamespace(bytes: []const u8, cursor: *usize) DecodeError!CreateNamespace {
+    const name = try readString(bytes, cursor);
+    return .{ .name = name, .if_not_exists = try decodeFlag(bytes, cursor) };
+}
+
+fn decodeDropNamespace(bytes: []const u8, cursor: *usize) DecodeError!DropNamespace {
+    const name = try readString(bytes, cursor);
+    return .{ .name = name, .if_exists = try decodeFlag(bytes, cursor) };
+}
+
 fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!DdlOp {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
@@ -2499,10 +2532,10 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
     if (t > @intFromEnum(DdlTag.create_zig_function)) return Error.IrCorrupt;
     const tag: DdlTag = @enumFromInt(t);
     return switch (tag) {
-        .create_database => DdlOp{ .create_database = try readString(bytes, cursor) },
-        .drop_database => DdlOp{ .drop_database = try readString(bytes, cursor) },
-        .create_schema => DdlOp{ .create_schema = try readString(bytes, cursor) },
-        .drop_schema => DdlOp{ .drop_schema = try readString(bytes, cursor) },
+        .create_database => DdlOp{ .create_database = try decodeCreateNamespace(bytes, cursor) },
+        .drop_database => DdlOp{ .drop_database = try decodeDropNamespace(bytes, cursor) },
+        .create_schema => DdlOp{ .create_schema = try decodeCreateNamespace(bytes, cursor) },
+        .drop_schema => DdlOp{ .drop_schema = try decodeDropNamespace(bytes, cursor) },
         .use_schema => DdlOp{ .use_schema = try readString(bytes, cursor) },
         .use_database_schema => blk: {
             const db = try readString(bytes, cursor);
@@ -3101,6 +3134,46 @@ test "ir: decode rejects truncated input" {
     const allocator = std.testing.allocator;
     const short = [_]u8{ 't', 'D', 'B' };
     try std.testing.expectError(Error.IrTooSmall, decode(allocator, &short));
+}
+
+test "ir: database and schema ddl round-trip with their existence flags" {
+    const allocator = std.testing.allocator;
+    const cases = [_]Op{
+        .{ .ddl = .{ .create_database = .{ .name = "d", .if_not_exists = true } } },
+        .{ .ddl = .{ .drop_database = .{ .name = "d", .if_exists = true } } },
+        .{ .ddl = .{ .create_schema = .{ .name = "s" } } },
+        .{ .ddl = .{ .drop_schema = .{ .name = "s", .if_exists = true } } },
+    };
+
+    for (cases) |root| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try encode(allocator, &buf, root);
+
+        var decoded = try decode(allocator, buf.items);
+        defer decoded.deinitDecoded(allocator);
+
+        try std.testing.expect(decoded == .ddl);
+        switch (decoded.ddl) {
+            .create_database => |ns| {
+                try std.testing.expectEqualStrings(root.ddl.create_database.name, ns.name);
+                try std.testing.expectEqual(root.ddl.create_database.if_not_exists, ns.if_not_exists);
+            },
+            .drop_database => |ns| {
+                try std.testing.expectEqualStrings(root.ddl.drop_database.name, ns.name);
+                try std.testing.expectEqual(root.ddl.drop_database.if_exists, ns.if_exists);
+            },
+            .create_schema => |ns| {
+                try std.testing.expectEqualStrings(root.ddl.create_schema.name, ns.name);
+                try std.testing.expectEqual(root.ddl.create_schema.if_not_exists, ns.if_not_exists);
+            },
+            .drop_schema => |ns| {
+                try std.testing.expectEqualStrings(root.ddl.drop_schema.name, ns.name);
+                try std.testing.expectEqual(root.ddl.drop_schema.if_exists, ns.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "ir: ddl rename alter-add and truncate round-trip" {

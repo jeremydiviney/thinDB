@@ -1970,8 +1970,16 @@ fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
 fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     switch (d) {
-        .create_database => |name| _ = catalog.createDatabase(name) catch |e| return thindb_api.remapError(Error, e),
-        .drop_database => |name| catalog.dropDatabase(name) catch |e| return thindb_api.remapError(Error, e),
+        .create_database => |ns| {
+            if (catalog.createDatabase(ns.name)) |_| {} else |e| switch (e) {
+                error.DatabaseAlreadyExists => if (!ns.if_not_exists) return Error.DatabaseAlreadyExists,
+                else => return thindb_api.remapError(Error, e),
+            }
+        },
+        .drop_database => |ns| catalog.dropDatabase(ns.name) catch |e| switch (e) {
+            error.DatabaseNotFound => if (!ns.if_exists) return Error.DatabaseNotFound,
+            else => return thindb_api.remapError(Error, e),
+        },
         .create_sql_function => |cf| {
             // Trial-parse the body (every parameter bound to NULL) so
             // syntax errors surface at CREATE, not at first call. Column
@@ -2006,13 +2014,19 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             }
             if (!existed and !df.if_exists) return Error.FunctionNotFound;
         },
-        .create_schema => |name| {
+        .create_schema => |ns| {
             const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
-            _ = db.createSchema(name) catch |e| return thindb_api.remapError(Error, e);
+            if (db.createSchema(ns.name)) |_| {} else |e| switch (e) {
+                error.SchemaAlreadyExists => if (!ns.if_not_exists) return Error.SchemaAlreadyExists,
+                else => return thindb_api.remapError(Error, e),
+            }
         },
-        .drop_schema => |name| {
+        .drop_schema => |ns| {
             const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
-            db.dropSchema(name) catch |e| return thindb_api.remapError(Error, e);
+            db.dropSchema(ns.name) catch |e| switch (e) {
+                error.SchemaNotFound => if (!ns.if_exists) return Error.SchemaNotFound,
+                else => return thindb_api.remapError(Error, e),
+            };
         },
         .use_schema => |name| {
             // Accept MySQL-style `USE db__schema` by splitting on `__`.
