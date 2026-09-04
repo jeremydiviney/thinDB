@@ -642,8 +642,6 @@ pub const Parser = struct {
         const proj = try self.parseProjection();
         self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
         self.predicate_derived_enabled = old_predicate_derived_enabled;
-        const aggregate_expr_refs = try self.arena.dupe(AggExprRef, self.aggregate_expr_refs.items[agg_ref_mark..]);
-        self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
         const window_expr_refs = try self.arena.dupe(WindowExprRef, self.window_expr_refs.items[window_ref_mark..]);
         self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
         const projection_predicate_derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[projection_pred_mark..]);
@@ -694,9 +692,14 @@ pub const Parser = struct {
         // reference grouped columns and aggregate aliases declared
         // in the projection. Validation happens at compile time
         // against the post-GroupBy output schema.
+        // An aggregate the SELECT list did not declare (`HAVING SUM(v) > 50`
+        // under `SELECT k`) hoists into a hidden aggregate output through the
+        // projection's channel; the final Project drops it.
         var pending_having: ?PredicateExpr = null;
         if (self.cur.tag == .kw_having) {
             try self.advance();
+            self.aggregate_expr_refs_enabled = true;
+            defer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
             pending_having = try self.parseBoolExpr();
         }
 
@@ -719,6 +722,60 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_qualify) {
             try self.advance();
             pending_qualify = try self.parseBoolExpr();
+        }
+
+        // Parse-time peek for ORDER BY and LIMIT clauses — we need to
+        // know the pipeline shape before deciding where to insert
+        // OrderBy. Specifically: for non-aggregated queries, OrderBy
+        // must come BEFORE the Project so it sees the full upstream
+        // schema (SQL's "ORDER BY references original columns" rule).
+        // For aggregated queries it comes AFTER GroupBy because the
+        // grouped schema is the only one available.
+        var pending_order_specs: ?[]const @import("../exec/sort.zig").SortSpec = null;
+        if (self.cur.tag == .kw_order) {
+            try self.advance();
+            try self.expect(.kw_by);
+            self.aggregate_expr_refs_enabled = true;
+            defer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
+            pending_order_specs = try self.parseOrderBy(proj);
+        }
+        const aggregate_expr_refs = try self.arena.dupe(AggExprRef, self.aggregate_expr_refs.items[agg_ref_mark..]);
+        self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
+
+        // Optional LIMIT, in either of MySQL's two forms:
+        //   LIMIT count
+        //   LIMIT offset, count        (offset first)
+        //   LIMIT count OFFSET offset  (OFFSET keyword)
+        var pending_limit: ?u64 = null;
+        var pending_offset: u64 = 0;
+        if (self.cur.tag == .kw_limit) {
+            try self.advance();
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            const n = self.cur.value.integer;
+            try self.advance();
+            if (n < 0) return ParseError.SqlExpectedValue;
+            if (self.cur.tag == .comma) {
+                // LIMIT offset, count — first number is the offset.
+                try self.advance();
+                if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+                const count = self.cur.value.integer;
+                try self.advance();
+                if (count < 0) return ParseError.SqlExpectedValue;
+                pending_offset = @intCast(n);
+                pending_limit = @intCast(count);
+            } else {
+                pending_limit = @intCast(n);
+                if (self.cur.tag == .kw_offset) {
+                    try self.advance();
+                    if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+                    const off = self.cur.value.integer;
+                    try self.advance();
+                    if (off < 0) return ParseError.SqlExpectedValue;
+                    pending_offset = @intCast(off);
+                }
+            }
+        } else {
+            try self.parseFetchOffset(&pending_limit, &pending_offset);
         }
 
         // Decide between a Project, a Group-by, or a Group-by + Project
@@ -817,56 +874,6 @@ pub const Parser = struct {
                 .window => {},
                 .star => return ParseError.SqlMixedAggAndPlainProjection,
             };
-        }
-
-        // Parse-time peek for ORDER BY and LIMIT clauses — we need to
-        // know the pipeline shape before deciding where to insert
-        // OrderBy. Specifically: for non-aggregated queries, OrderBy
-        // must come BEFORE the Project so it sees the full upstream
-        // schema (SQL's "ORDER BY references original columns" rule).
-        // For aggregated queries it comes AFTER GroupBy because the
-        // grouped schema is the only one available.
-        var pending_order_specs: ?[]const @import("../exec/sort.zig").SortSpec = null;
-        if (self.cur.tag == .kw_order) {
-            try self.advance();
-            try self.expect(.kw_by);
-            pending_order_specs = try self.parseOrderBy(proj);
-        }
-
-        // Optional LIMIT, in either of MySQL's two forms:
-        //   LIMIT count
-        //   LIMIT offset, count        (offset first)
-        //   LIMIT count OFFSET offset  (OFFSET keyword)
-        var pending_limit: ?u64 = null;
-        var pending_offset: u64 = 0;
-        if (self.cur.tag == .kw_limit) {
-            try self.advance();
-            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-            const n = self.cur.value.integer;
-            try self.advance();
-            if (n < 0) return ParseError.SqlExpectedValue;
-            if (self.cur.tag == .comma) {
-                // LIMIT offset, count — first number is the offset.
-                try self.advance();
-                if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-                const count = self.cur.value.integer;
-                try self.advance();
-                if (count < 0) return ParseError.SqlExpectedValue;
-                pending_offset = @intCast(n);
-                pending_limit = @intCast(count);
-            } else {
-                pending_limit = @intCast(n);
-                if (self.cur.tag == .kw_offset) {
-                    try self.advance();
-                    if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-                    const off = self.cur.value.integer;
-                    try self.advance();
-                    if (off < 0) return ParseError.SqlExpectedValue;
-                    pending_offset = @intCast(off);
-                }
-            }
-        } else {
-            try self.parseFetchOffset(&pending_limit, &pending_offset);
         }
 
         if (has_agg or has_group or distinct) {
@@ -1001,8 +1008,12 @@ pub const Parser = struct {
             // DISTINCT contributes no aggregates of its own, but the grouped
             // cores require at least one — add a hidden COUNT(*); the forced
             // Project below drops it from the output.
+            var hidden_group_count = false;
             if (distinct) {
                 try aggs_buf.append(self.arena, .{ .func = .count, .col = null, .as = "__distinct_count" });
+            } else if (aggs_buf.items.len == 0) {
+                try aggs_buf.append(self.arena, .{ .func = .count, .col = null, .as = "__group_count" });
+                hidden_group_count = true;
             }
 
             const aggs_slice = try aggs_buf.toOwnedSlice(self.arena);
@@ -1064,7 +1075,7 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            if (distinct or has_window or aggregate_expr_refs.len > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            if (distinct or hidden_group_count or has_window or aggregate_expr_refs.len > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
         } else {
@@ -3811,7 +3822,17 @@ pub const Parser = struct {
                     // to the aggregate's canonical output column name (the
                     // sort runs after the aggregate). Aliased aggregates are
                     // referenced by alias via the plain-ident path.
-                    if (self.aggregateFuncForName(first) != null) break :blk try self.aggSortName(first, args);
+                    if (self.aggregateFuncForName(first)) |func| {
+                        if (self.aggregate_expr_refs_enabled) {
+                            if (!distinct) {
+                                if (self.aggSortName(first, args)) |canonical| {
+                                    if (try self.aggAliasFor(proj, canonical)) |alias| break :blk alias;
+                                } else |_| {}
+                            }
+                            break :blk try self.materializeAggregateExpr(first, func, args, distinct);
+                        }
+                        break :blk try self.aggSortName(first, args);
+                    }
                     // `ORDER BY scalar_fn(args)` (e.g. ORDER BY DATE_TRUNC(...))
                     // binds to the matching SELECT expression's output column.
                     const fname = try self.arena.dupe(u8, first);

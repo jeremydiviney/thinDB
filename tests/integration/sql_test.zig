@@ -199,6 +199,90 @@ test "sql: GROUP BY on the sorted order key streams and aggregates correctly" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 70, 100, 40 }, totals.items);
 }
 
+fn seedGroups(db: anytype) !void {
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .int },
+            .{ .name = "grp", .type = .int },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("grp_rows", schema, .{ .order_key = &ok, .unique = true });
+    try t.insert(&.{
+        .{ .id = @as(i32, 1), .grp = @as(i32, 2), .v = @as(i32, 10) },
+        .{ .id = @as(i32, 2), .grp = @as(i32, 1), .v = @as(i32, 20) },
+        .{ .id = @as(i32, 3), .grp = @as(i32, 2), .v = @as(i32, 30) },
+        .{ .id = @as(i32, 4), .grp = @as(i32, 3), .v = @as(i32, 40) },
+        .{ .id = @as(i32, 5), .grp = @as(i32, 1), .v = @as(i32, 50) },
+        .{ .id = @as(i32, 6), .grp = @as(i32, 2), .v = @as(i32, 60) },
+    });
+    try t.flush();
+}
+
+fn collectFirstInts(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expect_cols: usize) ![]i32 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    try std.testing.expectEqual(expect_cols, q.outputSchema().len);
+    var out: std.ArrayList(i32) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.int[0..b.row_count]) |x| try out.append(allocator, x);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "sql: GROUP BY with no projected aggregate yields the distinct keys" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedGroups(db);
+
+    const keys = try collectFirstInts(allocator, db, "SELECT grp FROM grp_rows GROUP BY grp ORDER BY grp", 1);
+    defer allocator.free(keys);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2, 3 }, keys);
+}
+
+test "sql: ORDER BY and HAVING bind aggregates the SELECT list did not declare" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedGroups(db);
+
+    // grp 2 has 3 rows, grp 1 has 2, grp 3 has 1; the hidden COUNT(*) sorts
+    // but does not reach the output (one column).
+    const by_count = try collectFirstInts(allocator, db, "SELECT grp FROM grp_rows GROUP BY grp ORDER BY COUNT(*) DESC, grp", 1);
+    defer allocator.free(by_count);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 1, 3 }, by_count);
+
+    // sums: grp1 = 70, grp2 = 100, grp3 = 40.
+    const by_sum = try collectFirstInts(allocator, db, "SELECT grp FROM grp_rows GROUP BY grp HAVING SUM(v) > 50 ORDER BY grp", 1);
+    defer allocator.free(by_sum);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2 }, by_sum);
+
+    // An aliased projection of the same aggregate is bound, not duplicated:
+    // the output keeps exactly the two declared columns.
+    const aliased = try collectFirstInts(allocator, db, "SELECT grp, COUNT(*) AS n FROM grp_rows GROUP BY grp ORDER BY COUNT(*) DESC, grp", 2);
+    defer allocator.free(aliased);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 1, 3 }, aliased);
+
+    const by_total = try collectFirstInts(allocator, db, "SELECT grp, SUM(v) AS total FROM grp_rows GROUP BY grp ORDER BY SUM(v) DESC", 2);
+    defer allocator.free(by_total);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 1, 3 }, by_total);
+
+    const with_limit = try collectFirstInts(allocator, db, "SELECT grp FROM grp_rows GROUP BY grp ORDER BY SUM(v) DESC LIMIT 1", 1);
+    defer allocator.free(with_limit);
+    try std.testing.expectEqualSlices(i32, &[_]i32{2}, with_limit);
+}
+
 test "sql: EXPLAIN returns the physical plan as a QUERY PLAN result set" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
