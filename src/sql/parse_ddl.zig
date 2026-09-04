@@ -13,21 +13,39 @@ const Value = types.Value;
 
 pub const ColDefResult = struct { def: ir.ColumnDef, is_pk: bool };
 
+fn parseIfNotExists(p: anytype) !bool {
+    const PE = @TypeOf(p.*).Err;
+    if (p.cur.tag != .kw_if) return false;
+    try p.advance();
+    if (p.cur.tag != .kw_not) return PE.SqlExpectedKeyword;
+    try p.advance();
+    if (p.cur.tag != .kw_exists) return PE.SqlExpectedKeyword;
+    try p.advance();
+    return true;
+}
+
+fn parseIfExists(p: anytype) !bool {
+    const PE = @TypeOf(p.*).Err;
+    if (p.cur.tag != .kw_if) return false;
+    try p.advance();
+    if (p.cur.tag != .kw_exists) return PE.SqlExpectedKeyword;
+    try p.advance();
+    return true;
+}
+
 pub fn parseDdl(p: anytype) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     const head = p.cur.tag;
     try p.advance();
     switch (head) {
         .kw_create => {
-            if (p.cur.tag == .kw_database) {
+            if (p.cur.tag == .kw_database or p.cur.tag == .kw_schema) {
+                const is_database = p.cur.tag == .kw_database;
                 try p.advance();
-                const name = try p.dupedIdentLower();
-                return try p.allocOp(.{ .ddl = .{ .create_database = name } });
-            }
-            if (p.cur.tag == .kw_schema) {
-                try p.advance();
-                const name = try p.dupedIdentLower();
-                return try p.allocOp(.{ .ddl = .{ .create_schema = name } });
+                const if_not_exists = try parseIfNotExists(p);
+                const ns: ir.CreateNamespace = .{ .name = try p.dupedIdentLower(), .if_not_exists = if_not_exists };
+                const d: ir.DdlOp = if (is_database) .{ .create_database = ns } else .{ .create_schema = ns };
+                return try p.allocOp(.{ .ddl = d });
             }
             // CREATE [OR REPLACE] FUNCTION — `function`/`returns` are
             // contextual keywords (matched by identifier text) so columns
@@ -68,15 +86,13 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             return PE.SqlExpectedKeyword;
         },
         .kw_drop => {
-            if (p.cur.tag == .kw_database) {
+            if (p.cur.tag == .kw_database or p.cur.tag == .kw_schema) {
+                const is_database = p.cur.tag == .kw_database;
                 try p.advance();
-                const name = try p.dupedIdentLower();
-                return try p.allocOp(.{ .ddl = .{ .drop_database = name } });
-            }
-            if (p.cur.tag == .kw_schema) {
-                try p.advance();
-                const name = try p.dupedIdentLower();
-                return try p.allocOp(.{ .ddl = .{ .drop_schema = name } });
+                const if_exists = try parseIfExists(p);
+                const ns: ir.DropNamespace = .{ .name = try p.dupedIdentLower(), .if_exists = if_exists };
+                const d: ir.DdlOp = if (is_database) .{ .drop_database = ns } else .{ .drop_schema = ns };
+                return try p.allocOp(.{ .ddl = d });
             }
             if (isIdentText(p, "function")) {
                 try p.advance();

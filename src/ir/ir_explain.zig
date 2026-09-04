@@ -358,10 +358,10 @@ fn writeTableRef(allocator: Allocator, out: *std.ArrayList(u8), ref: TableRef) !
 
 fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
     switch (d) {
-        .create_database => |n| try writeAll(allocator, out, "CreateDatabase ", n, "\n"),
-        .drop_database => |n| try writeAll(allocator, out, "DropDatabase ", n, "\n"),
-        .create_schema => |n| try writeAll(allocator, out, "CreateSchema ", n, "\n"),
-        .drop_schema => |n| try writeAll(allocator, out, "DropSchema ", n, "\n"),
+        .create_database => |ns| try writeAll(allocator, out, "CreateDatabase ", ns.name, "\n"),
+        .drop_database => |ns| try writeAll(allocator, out, "DropDatabase ", ns.name, "\n"),
+        .create_schema => |ns| try writeAll(allocator, out, "CreateSchema ", ns.name, "\n"),
+        .drop_schema => |ns| try writeAll(allocator, out, "DropSchema ", ns.name, "\n"),
         .use_schema => |n| try writeAll(allocator, out, "Use ", n, "\n"),
         .use_database_schema => |p| {
             try out.appendSlice(allocator, "Use ");

@@ -353,6 +353,87 @@ test "sql namespace: CREATE DATABASE twice errors" {
     try std.testing.expectError(thindb.net.Error.DatabaseAlreadyExists, thindb.net.compile(allocator, db, root));
 }
 
+test "sql namespace: CREATE DATABASE IF NOT EXISTS is idempotent and DROP DATABASE IF EXISTS tolerates absence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db, "CREATE DATABASE IF NOT EXISTS idem");
+    defer q1.deinit();
+    try std.testing.expect((try q1.next()) == null);
+    var q2 = try runSql(allocator, db, "CREATE DATABASE IF NOT EXISTS idem");
+    defer q2.deinit();
+    try std.testing.expect((try q2.next()) == null);
+
+    var q3 = try runSql(allocator, db, "SHOW DATABASES");
+    defer q3.deinit();
+    var names = try collectStrings(allocator, &q3);
+    defer freeStrings(allocator, &names);
+    try std.testing.expect(containsString(names, "idem"));
+
+    var q4 = try runSql(allocator, db, "DROP DATABASE IF EXISTS idem");
+    defer q4.deinit();
+    try std.testing.expect((try q4.next()) == null);
+    var q5 = try runSql(allocator, db, "DROP DATABASE IF EXISTS idem");
+    defer q5.deinit();
+    try std.testing.expect((try q5.next()) == null);
+
+    var q6 = try runSql(allocator, db, "SHOW DATABASES");
+    defer q6.deinit();
+    var after = try collectStrings(allocator, &q6);
+    defer freeStrings(allocator, &after);
+    try std.testing.expect(!containsString(after, "idem"));
+}
+
+test "sql namespace: CREATE SCHEMA IF NOT EXISTS and DROP SCHEMA IF EXISTS" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db, "CREATE SCHEMA IF NOT EXISTS staging");
+    defer q1.deinit();
+    try std.testing.expect((try q1.next()) == null);
+    var q2 = try runSql(allocator, db, "CREATE SCHEMA IF NOT EXISTS staging");
+    defer q2.deinit();
+    try std.testing.expect((try q2.next()) == null);
+
+    var q3 = try runSql(allocator, db, "SHOW SCHEMAS");
+    defer q3.deinit();
+    var names = try collectStrings(allocator, &q3);
+    defer freeStrings(allocator, &names);
+    try std.testing.expect(containsString(names, "staging"));
+
+    var q4 = try runSql(allocator, db, "DROP SCHEMA IF EXISTS staging");
+    defer q4.deinit();
+    try std.testing.expect((try q4.next()) == null);
+    var q5 = try runSql(allocator, db, "DROP SCHEMA IF EXISTS staging");
+    defer q5.deinit();
+    try std.testing.expect((try q5.next()) == null);
+}
+
+test "sql namespace: existence clauses need the full keyword sequence and do not mask other errors" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.SqlExpectedKeyword, thindb.sql.parse(arena.allocator(), "CREATE DATABASE IF EXISTS x"));
+    try std.testing.expectError(error.SqlExpectedKeyword, thindb.sql.parse(arena.allocator(), "DROP DATABASE IF NOT EXISTS x"));
+    try std.testing.expectError(error.SqlExpectedKeyword, thindb.sql.parse(arena.allocator(), "CREATE SCHEMA IF x"));
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const root = try thindb.sql.parse(arena.allocator(), "DROP DATABASE ghost");
+    try std.testing.expectError(thindb.net.Error.DatabaseNotFound, thindb.net.compile(allocator, db, root));
+}
+
 test "sql namespace: USE nonexistent db errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
