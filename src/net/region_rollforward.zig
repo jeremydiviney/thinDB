@@ -3645,6 +3645,8 @@ fn buildScanSources(
         for (sources[0..built]) |*q| q.deinit();
         qa.free(sources);
     }
+    const scans = try qa.alloc(*Scan, n_chunks);
+    defer qa.free(scans);
     for (0..n_chunks) |i| {
         const lo = i * total_rgs / n_chunks;
         const hi = if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks;
@@ -3656,6 +3658,7 @@ fn buildScanSources(
         // wins"). Without it those picks are scatter-arrival nondeterministic.
         const s = Scan.allocWithProjectionLoc(qa, table, input.accountant, scan_cols, true, snap) catch return NoMatch;
         sources[i] = exec.makeQuery(qa, s);
+        scans[i] = s;
         built += 1;
         const start = flatToCoord(lo, seg_start, snap.segment_count);
         const end = flatToCoord(hi, seg_start, snap.segment_count);
@@ -3664,9 +3667,48 @@ fn buildScanSources(
         const fused = s.tryFuseFilter(filter) catch return NoMatch;
         if (!fused) return NoMatch;
     }
+    recutSourcesForPruning(qa, scans, seg_start, snap.segment_count, total_rgs);
     snap.memtable_snap.release();
     pin_held = false;
     return .{ .sources = sources, .total_rows = total_rows };
+}
+
+/// ParallelScan.rebalanceChunksForPruning for the region's chunk scans. The
+/// even row-group split lands a selective query's few surviving row groups
+/// (contiguous under the table order key) on one or two workers while the
+/// rest idle — the exchange then runs at the pace of one thread decoding
+/// every survivor. Re-cut the same flat index space so each chunk holds
+/// ~equal SURVIVING row groups; bounds stay ascending, so chunk emission
+/// order (and the emit_loc tie order riding it) is unchanged. Only when at
+/// most half the groups survive — above that the even split is the better
+/// work model.
+fn recutSourcesForPruning(qa: Allocator, scans: []const *Scan, seg_start: []const usize, n_segs: usize, total: usize) void {
+    if (scans.len <= 1) return;
+    const mask = scans[0].survivingMask(qa) orelse return;
+    defer qa.free(mask);
+    if (mask.len != total) return;
+    var surviving: usize = 0;
+    for (mask) |m| surviving += @intFromBool(m);
+    if (surviving == 0 or surviving > total / 2) return;
+
+    const n = scans.len;
+    var lo: usize = 0;
+    var seen: usize = 0;
+    var cut: usize = 0;
+    for (scans, 0..) |s, c| {
+        const target = (c + 1) * surviving / n + @intFromBool((c + 1) * surviving % n != 0);
+        while (cut < total and seen < target) : (cut += 1) {
+            if (mask[cut]) seen += 1;
+        }
+        const hi = if (c == n - 1) total else cut;
+        const start = flatToCoord(lo, seg_start, n_segs);
+        const end = flatToCoord(hi, seg_start, n_segs);
+        s.resetRange(start.seg, start.rg, end.seg, end.rg, c == n - 1);
+        lo = hi;
+    }
+    if (getenv("THINDB_REGION_TRACE") != null) {
+        std.debug.print("[region] prune-recut: surviving={d}/{d} rgs across {d} chunks\n", .{ surviving, total, n });
+    }
 }
 
 /// Decode a footer string stat (format.encodeStringPrefix) back to its

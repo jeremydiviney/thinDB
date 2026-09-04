@@ -2476,6 +2476,148 @@ test "fused filter: byte-identical survivors across selectivity (selective/none/
     }
 }
 
+test "fused filter: guided IN-list, OR and NOT IN shapes stay block-sourced and byte-identical" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+            .{ .name = "ratio", .type = .double },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    const rows = [_]FuseRow{
+        .{ .id = 1, .qty = 10, .ratio = 1.5, .tag = "apple" },
+        .{ .id = 2, .qty = 20, .ratio = 2.5, .tag = "apricot" },
+        .{ .id = 3, .qty = 30, .ratio = 3.5, .tag = "banana" },
+        .{ .id = 4, .qty = 40, .ratio = 4.5, .tag = "blueberry" },
+        .{ .id = 5, .qty = 50, .ratio = 5.5, .tag = "cherry" },
+        .{ .id = 6, .qty = 60, .ratio = 6.5, .tag = "apex" },
+    };
+    inline for (rows) |r| {
+        try t.insert(&.{.{ .id = r.id, .qty = r.qty, .ratio = r.ratio, .tag = r.tag }});
+    }
+    try t.flush();
+
+    // `col IN (...)` parses to an OR of equality leaves; NOT IN over a
+    // subquery materializes to `.in_set` with negate.
+    const tag_in = [_]PredicateExpr{ leafExpr("tag", .eq, .{ .text = "apple" }), leafExpr("tag", .eq, .{ .text = "cherry" }), leafExpr("tag", .eq, .{ .text = "zzz" }) };
+    const qty_in = [_]PredicateExpr{ leafExpr("qty", .eq, .{ .int = 20 }), leafExpr("qty", .eq, .{ .int = 60 }), leafExpr("qty", .eq, .{ .int = 999 }) };
+    const tag_in3 = [_]PredicateExpr{ leafExpr("tag", .eq, .{ .text = "apple" }), leafExpr("tag", .eq, .{ .text = "banana" }), leafExpr("tag", .eq, .{ .text = "apex" }) };
+    const and_with_or = [_]PredicateExpr{ leafExpr("qty", .gte, .{ .int = 20 }), .{ .@"or" = &tag_in3 } };
+    const mixed_or = [_]PredicateExpr{ leafExpr("qty", .eq, .{ .int = 10 }), .{ .like = .{ .col = "tag", .pattern = "ch%" } } };
+    const bare_or = [_]PredicateExpr{ leafExpr("qty", .lt, .{ .int = 20 }), leafExpr("qty", .gt, .{ .int = 50 }) };
+    const not_in_tags = [_]types.Value{ .{ .text = "apple" }, .{ .text = "banana" } };
+    const not_in_ids = [_]types.Value{ .{ .bigint = 1 }, .{ .bigint = 2 } };
+    const in_ids = [_]types.Value{ .{ .bigint = 4 }, .{ .bigint = 6 }, .{ .bigint = 40 } };
+
+    const Case = struct {
+        name: []const u8,
+        expr: PredicateExpr,
+        keep: *const fn (FuseRow) bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "string IN", .expr = .{ .@"or" = &tag_in }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return std.mem.eql(u8, r.tag, "apple") or std.mem.eql(u8, r.tag, "cherry");
+            }
+        }.f },
+        .{ .name = "int IN", .expr = .{ .@"or" = &qty_in }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.qty == 20 or r.qty == 60;
+            }
+        }.f },
+        .{ .name = "AND with IN child", .expr = .{ .@"and" = &and_with_or }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.qty >= 20 and (std.mem.eql(u8, r.tag, "apple") or std.mem.eql(u8, r.tag, "banana") or std.mem.eql(u8, r.tag, "apex"));
+            }
+        }.f },
+        .{ .name = "OR of leaf and LIKE", .expr = .{ .@"or" = &mixed_or }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.qty == 10 or std.mem.startsWith(u8, r.tag, "ch");
+            }
+        }.f },
+        .{ .name = "bare OR of ranges", .expr = .{ .@"or" = &bare_or }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.qty < 20 or r.qty > 50;
+            }
+        }.f },
+        .{ .name = "string NOT IN", .expr = .{ .in_set = .{ .col = "tag", .values = &not_in_tags, .negate = true } }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return !(std.mem.eql(u8, r.tag, "apple") or std.mem.eql(u8, r.tag, "banana"));
+            }
+        }.f },
+        .{ .name = "bigint NOT IN", .expr = .{ .in_set = .{ .col = "id", .values = &not_in_ids, .negate = true } }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.id != 1 and r.id != 2;
+            }
+        }.f },
+        .{ .name = "bigint IN set", .expr = .{ .in_set = .{ .col = "id", .values = &in_ids, .negate = false } }, .keep = struct {
+            fn f(r: FuseRow) bool {
+                return r.id == 4 or r.id == 6;
+            }
+        }.f },
+    };
+
+    inline for (cases) |c| {
+        var base = try scan(allocator, t);
+        var q = try base.filter(c.expr);
+        defer q.deinit();
+
+        const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+        try std.testing.expect(filter_op.fused);
+
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        var qty: std.ArrayList(i32) = .empty;
+        defer qty.deinit(allocator);
+        var ratio: std.ArrayList(f64) = .empty;
+        defer ratio.deinit(allocator);
+        var tags: std.ArrayList(u8) = .empty;
+        defer tags.deinit(allocator);
+        var tag_off: std.ArrayList(usize) = .empty;
+        defer tag_off.deinit(allocator);
+        try collectFused(allocator, &q, &ids, &qty, &ratio, &tags, &tag_off);
+
+        // Every shape above must take the block-sourced path, not the
+        // decode-then-filter fallback.
+        const s: *exec.Scan = @ptrCast(@alignCast(filter_op.upstream.ptr));
+        try std.testing.expect(s.rgs_guided > 0);
+
+        var e_ids: std.ArrayList(i64) = .empty;
+        defer e_ids.deinit(allocator);
+        var e_qty: std.ArrayList(i32) = .empty;
+        defer e_qty.deinit(allocator);
+        var e_ratio: std.ArrayList(f64) = .empty;
+        defer e_ratio.deinit(allocator);
+        var e_tags: std.ArrayList(u8) = .empty;
+        defer e_tags.deinit(allocator);
+        inline for (rows) |r| {
+            if (c.keep(r)) {
+                try e_ids.append(allocator, r.id);
+                try e_qty.append(allocator, r.qty);
+                try e_ratio.append(allocator, r.ratio);
+                try e_tags.appendSlice(allocator, r.tag);
+            }
+        }
+
+        try std.testing.expectEqualSlices(i64, e_ids.items, ids.items);
+        try std.testing.expectEqualSlices(i32, e_qty.items, qty.items);
+        try std.testing.expectEqualSlices(f64, e_ratio.items, ratio.items);
+        try std.testing.expectEqualSlices(u8, e_tags.items, tags.items);
+    }
+}
+
 test "fused filter: applies to unflushed memtable rows too" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

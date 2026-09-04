@@ -362,6 +362,7 @@ pub const Scan = struct {
     /// additional leaf's per-row result before ANDing it into `mask_buf`.
     /// Grown on demand; reused across `next()` calls; freed in `deinit`.
     mask_buf2: []bool = &.{},
+    mask_buf3: []bool = &.{},
     /// Scratch array of borrowed cache blocks for the fused-filter fast path,
     /// one slot per projected column. Reused across `next()` calls; the pins
     /// it holds are released within each call. Freed in `deinit`.
@@ -420,6 +421,9 @@ pub const Scan = struct {
     /// is the zone-map row-group prune count for this scan.
     rgs_considered: u64 = 0,
     rgs_scanned: u64 = 0,
+    /// Row groups the block-sourced guided filter evaluated (a subset of
+    /// `rgs_scanned`; the rest went through the decode-then-filter paths).
+    rgs_guided: u64 = 0,
     rows_scanned: u64 = 0,
 
     /// Tight scan-kernel accounting (--profile-ops): ticks spent in the per-row-
@@ -984,6 +988,7 @@ pub const Scan = struct {
         self.closeCurSegment();
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
         if (self.mask_buf2.len > 0) self.allocator.free(self.mask_buf2);
+        if (self.mask_buf3.len > 0) self.allocator.free(self.mask_buf3);
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
@@ -2112,14 +2117,15 @@ pub const Scan = struct {
     ) !?usize {
         const mask = try self.ensureMask(rg_count);
         switch (expr) {
-            .leaf, .like, .not => {
+            .leaf, .like, .not, .in_set, .@"or" => {
+                if (!guidedChildShape(expr)) return null;
                 if (!try self.buildGuidedChild(seg, rg_idx, rg_count, expr, null, mask[0..rg_count])) return null;
             },
             .@"and" => |children| {
                 if (children.len == 0) return null;
-                // Every child must be a comparison leaf or a (NOT) LIKE we can
-                // evaluate block-sourced; otherwise decline the whole AND
-                // (mixed shapes fall back).
+                // Every child must be a comparison leaf, an IN-list, or a
+                // (NOT) LIKE we can evaluate block-sourced; otherwise decline
+                // the whole AND (mixed shapes fall back).
                 for (children) |c| if (!guidedChildShape(c)) return null;
 
                 if (!try self.buildGuidedChild(seg, rg_idx, rg_count, children[0], null, mask[0..rg_count])) return null;
@@ -2153,6 +2159,7 @@ pub const Scan = struct {
             },
             else => return null,
         }
+        self.rgs_guided += 1;
 
         if (tomb_mask) |tm| {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
@@ -2374,6 +2381,282 @@ pub const Scan = struct {
         }
     }
 
+    /// Evaluate an OR of guided arms into `out`. An OR of equality leaves on
+    /// one column (the parse of `col IN (v1, ...)`) folds into one IN-list
+    /// evaluation: one membership test per distinct dict value or one
+    /// compressed compare per row, instead of one full pass per literal.
+    /// Any other arm mix ORs the arms' masks through the third scratch mask.
+    fn buildOrMask(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        arms: []const PredicateExpr,
+        active: ?[]const bool,
+        out: []bool,
+    ) !bool {
+        var vals: [64]Value = undefined;
+        const folded = blk: {
+            if (arms.len > vals.len) break :blk false;
+            const col = switch (arms[0]) {
+                .leaf => |l| l.col,
+                else => break :blk false,
+            };
+            for (arms, 0..) |arm, i| {
+                const l = switch (arm) {
+                    .leaf => |l| l,
+                    else => break :blk false,
+                };
+                if (l.op != .eq or !@import("../types.zig").columnNameEql(l.col, col)) break :blk false;
+                vals[i] = l.val;
+            }
+            break :blk true;
+        };
+        if (folded) {
+            const set = predicate.InSet{ .col = arms[0].leaf.col, .values = vals[0..arms.len], .negate = false };
+            if (try self.buildInSetMask(seg, rg_idx, rg_count, set, active, out)) return true;
+        }
+
+        if (!try self.buildOrArm(seg, rg_idx, rg_count, arms[0], active, out)) return false;
+        if (arms.len == 1) return true;
+        const scratch = try self.ensureMask3(rg_count);
+        for (arms[1..]) |arm| {
+            if (!try self.buildOrArm(seg, rg_idx, rg_count, arm, active, scratch[0..rg_count])) return false;
+            for (out[0..rg_count], scratch[0..rg_count]) |*m, hit| m.* = m.* or hit;
+        }
+        return true;
+    }
+
+    /// The arm shapes `guidedChildShape` admits under an OR, dispatched
+    /// directly (not through `buildGuidedChild`, which would make the two
+    /// inferred error sets depend on each other).
+    fn buildOrArm(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        arm: PredicateExpr,
+        active: ?[]const bool,
+        out: []bool,
+    ) !bool {
+        return switch (arm) {
+            .leaf => |leaf| self.buildLeafMask(seg, rg_idx, rg_count, leaf, out),
+            .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, false, active, out),
+            .not => |inner| switch (inner.*) {
+                .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, true, active, out),
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Evaluate `col [NOT] IN (v1, ...)` for the current row group into `out`,
+    /// block-sourced, so an IN-list conjunct no longer declines the whole
+    /// guided AND (which sent every conjunct of the filter down the
+    /// decode-everything path). Dict blocks test each distinct value once into
+    /// a matched-codes bitset; FSST blocks compare in the compressed domain
+    /// against the literals encoded under the block's own table; raw string
+    /// blocks compare over the zero-copy view; int/bigint FOR, RLE and raw
+    /// blocks OR the per-literal equality masks built by the leaf kernels.
+    /// NULL rows clear to false under both IN and NOT IN (the dialect's
+    /// NULL-skipping NOT IN, same as the generic evaluator). Returns false
+    /// (no pins held) for shapes the narrow path can't evaluate.
+    fn buildInSetMask(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        set: predicate.InSet,
+        active: ?[]const bool,
+        out: []bool,
+    ) !bool {
+        const pred_phys = blk: {
+            for (self.table.schema.columns, 0..) |col, phys| {
+                if (@import("../types.zig").columnNameEql(col.name, set.col)) break :blk phys;
+            }
+            return false;
+        };
+        const col_type = self.table.schema.columns[pred_phys].type;
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
+
+        if (block.encoding == .dict) {
+            evalDictInSet(block, rg_count, flags, set.values, set.negate, out);
+            return true;
+        }
+        switch (col_type) {
+            .varchar, .string, .char, .json => {
+                if (block.encoding == .fsst) {
+                    return try evalFsstInSet(self.allocator, block.bytes, rg_count, flags, set.values, set.negate, active, out);
+                }
+                if (block.encoding != .raw) return false;
+                const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
+                switch (view.data) {
+                    .varchar => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
+                    .string => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
+                    .char => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
+                    .json => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
+                    else => return false,
+                }
+                return true;
+            },
+            // The generic IN evaluator supports exactly these numeric types;
+            // anything else declines so behaviour (an error) is unchanged.
+            .int, .bigint => {},
+            else => return false,
+        }
+
+        const scratch = try self.ensureMask3(rg_count);
+        @memset(out[0..rg_count], false);
+        for (set.values) |v| {
+            const want = predicate.valueToRangeI128(v) orelse continue;
+            switch (block.encoding) {
+                .for_ => {
+                    const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
+                    const col_stats = seg.info.row_groups[rg_idx].stats[pred_phys];
+                    if (col_stats.max < fv.block.base) return false;
+                    const span: u128 = @intCast(col_stats.max - fv.block.base);
+                    const plan = predicate.translateForLeaf(fv.block.base, span, .eq, v) orelse return false;
+                    switch (plan) {
+                        .none => continue,
+                        .all => @memset(scratch[0..rg_count], true),
+                        .compare => |cp| storage.segment_reader.forCompareInto(fv.block, cmpOpToSimd(cp.op), cp.code, rg_count, scratch[0..rg_count]),
+                    }
+                },
+                .rle => {
+                    const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
+                    if (!rleCompareInto(rv.block, rg_count, .eq, want, scratch[0..rg_count])) return false;
+                },
+                else => {
+                    const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
+                    predicate.evaluateMaskWithPred(view, .{ .col = set.col, .op = .eq, .val = v }, rg_count, scratch[0..rg_count]) catch return false;
+                },
+            }
+            for (out[0..rg_count], scratch[0..rg_count]) |*m, hit| m.* = m.* or hit;
+        }
+        if (set.negate) {
+            for (out[0..rg_count]) |*m| m.* = !m.*;
+        }
+        if (flags.has_nulls) {
+            const nulls: ?[]const u8 = block.bytes[0..storage.column.bitmapBytes(rg_count)];
+            for (0..rg_count) |i| {
+                if (!storage.column.isValidBit(nulls, i)) out[i] = false;
+            }
+        }
+        return true;
+    }
+
+    fn rawStringInSet(sv: anytype, view: anytype, rg_count: u32, values: []const Value, negate: bool, active: ?[]const bool, out: []bool) void {
+        for (0..rg_count) |i| {
+            if (active != null and !active.?[i]) {
+                out[i] = false;
+                continue;
+            }
+            if (!view.isValid(i)) {
+                out[i] = false;
+                continue;
+            }
+            out[i] = textInSet(sv.rowBytes(i), values) != negate;
+        }
+    }
+
+    fn textInSet(cell: []const u8, values: []const Value) bool {
+        for (values) |v| {
+            if (v == .text and std.mem.eql(u8, v.text, cell)) return true;
+        }
+        return false;
+    }
+
+    /// IN-list over a DICT block: membership is decided once per distinct
+    /// value (NOT IN folds into the bitset), then mapped per row via the code.
+    fn evalDictInSet(
+        block: storage.ReadSegment.BorrowedBlock,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        values: []const Value,
+        negate: bool,
+        out: []bool,
+    ) void {
+        const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        defer if (exec.prof.enabled) exec.prof.add("dict-filter (in-set per-distinct)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
+
+        var nulls: ?[]const u8 = null;
+        var bytes = block.bytes;
+        if (flags.has_nulls) {
+            const bm_len = storage.column.bitmapBytes(rg_count);
+            nulls = block.bytes[0..bm_len];
+            bytes = block.bytes[bm_len..];
+        }
+        const db = storage.segment_reader.dictBlockOf(bytes, rg_count);
+
+        var matched: [8192]u8 = undefined; // 65536 codes / 8
+        const nbytes = (db.ndv + 7) / 8;
+        @memset(matched[0..nbytes], 0);
+        var c: u32 = 0;
+        while (c < db.ndv) : (c += 1) {
+            if (textInSet(db.dictValue(c), values) != negate) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
+        }
+
+        for (0..rg_count) |i| {
+            if (storage.column.isValidBit(nulls, i)) {
+                const code = db.rowCode(i);
+                out[i] = (matched[code >> 3] & (@as(u8, 1) << @intCast(code & 7))) != 0;
+            } else {
+                out[i] = false;
+            }
+        }
+    }
+
+    /// IN-list over an FSST block in the compressed domain: every text literal
+    /// is encoded once under the block's table, then each live row's
+    /// compressed slice is compared against those (equal plaintext <=> equal
+    /// compressed bytes under one table). No decode at all.
+    fn evalFsstInSet(
+        allocator: Allocator,
+        raw: []const u8,
+        rg_count: u32,
+        flags: storage.format.ColumnBlockFlags,
+        values: []const Value,
+        negate: bool,
+        active: ?[]const bool,
+        out: []bool,
+    ) !bool {
+        const fv = try storage.segment_reader.fsstViewOf(raw, rg_count, flags);
+        var comp: std.ArrayListUnmanaged(u8) = .empty;
+        defer comp.deinit(allocator);
+        var ends: std.ArrayListUnmanaged(usize) = .empty;
+        defer ends.deinit(allocator);
+        for (values) |v| {
+            if (v != .text) continue;
+            try comp.ensureUnusedCapacity(allocator, storage.fsst.encodedSizeBound(v.text.len));
+            fv.block.table.encodeAppend(v.text, &comp);
+            try ends.append(allocator, comp.items.len);
+        }
+        for (0..rg_count) |i| {
+            if (active != null and !active.?[i]) {
+                out[i] = false;
+                continue;
+            }
+            if (!storage.column.isValidBit(fv.nulls, i)) {
+                out[i] = false;
+                continue;
+            }
+            const row = fv.block.rowComp(i);
+            var found = false;
+            var start: usize = 0;
+            for (ends.items) |end| {
+                if (std.mem.eql(u8, row, comp.items[start..end])) {
+                    found = true;
+                    break;
+                }
+                start = end;
+            }
+            out[i] = found != negate;
+        }
+        return true;
+    }
+
     fn cmpStringBytes(v: []const u8, literal: []const u8, op: predicate.PredicateOp) bool {
         return switch (op) {
             .eq => std.mem.eql(u8, v, literal),
@@ -2433,19 +2716,33 @@ pub const Scan = struct {
         }
     }
 
-    /// Dispatch one guided-filter child (a comparison `.leaf` or a `.like`) into
-    /// `out`. Returns false (declining the whole guided path) for any other shape
-    /// or any block the narrow path can't handle.
     /// True when `c` is a shape `buildGuidedChild` can evaluate block-sourced:
-    /// a comparison leaf, a LIKE, or a NOT directly over a LIKE.
+    /// a comparison leaf, an IN-list, a LIKE, a NOT directly over a LIKE, or an
+    /// OR whose arms are comparison leaves / LIKEs (`col IN (v1, ...)` parses
+    /// to an OR of equality leaves).
     fn guidedChildShape(c: PredicateExpr) bool {
         return switch (c) {
-            .leaf, .like => true,
+            .leaf, .like, .in_set => true,
             .not => |inner| inner.* == .like,
+            .@"or" => |arms| blk: {
+                if (arms.len == 0) break :blk false;
+                for (arms) |arm| {
+                    const ok = switch (arm) {
+                        .leaf, .like => true,
+                        .not => |inner| inner.* == .like,
+                        else => false,
+                    };
+                    if (!ok) break :blk false;
+                }
+                break :blk true;
+            },
             else => false,
         };
     }
 
+    /// Dispatch one guided-filter child into `out`. Returns false (declining
+    /// the whole guided path) for any other shape or any block the narrow path
+    /// can't handle.
     fn buildGuidedChild(
         self: *Scan,
         seg: *storage.ReadSegment,
@@ -2457,6 +2754,8 @@ pub const Scan = struct {
     ) !bool {
         return switch (child) {
             .leaf => |leaf| self.buildLeafMask(seg, rg_idx, rg_count, leaf, out),
+            .in_set => |set| self.buildInSetMask(seg, rg_idx, rg_count, set, active, out),
+            .@"or" => |arms| self.buildOrMask(seg, rg_idx, rg_count, arms, active, out),
             .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, false, active, out),
             .not => |inner| switch (inner.*) {
                 .like => |lp| self.buildLikeMask(seg, rg_idx, rg_count, lp, true, active, out),
@@ -2937,6 +3236,19 @@ pub const Scan = struct {
                 continue;
             }
 
+            if (block.encoding == .dict) {
+                var values = block.bytes;
+                var nulls: ?[]const u8 = null;
+                if (flags.has_nulls) {
+                    const bm_len = storage.column.bitmapBytes(rg_count);
+                    nulls = block.bytes[0..bm_len];
+                    values = block.bytes[bm_len..];
+                }
+                const db = storage.segment_reader.dictBlockOf(values, rg_count);
+                try self.appendDictSurvivors(db, nulls, mask, &filtered_cols[j]);
+                continue;
+            }
+
             if (block.encoding == .rle) {
                 const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
                 try self.appendRleSurvivors(rv, mask, &filtered_cols[j]);
@@ -3208,6 +3520,40 @@ pub const Scan = struct {
     /// Survivor-only FSST expansion: decode just the masked rows off the
     /// cached compressed block — the full row-group string column never
     /// materializes. The scratch holds one decoded value at a time.
+    /// Dict sibling of `appendFsstSurvivors`: gather only the survivors'
+    /// values straight out of the block's sorted dictionary. The previous
+    /// route expanded every row of the block to an owned string column and
+    /// then compacted it — for a selective filter that is most of the scan's
+    /// per-row-group cost. One pass sizes the destination from the survivors'
+    /// dict lengths, one pass copies, so the string store never grows per row.
+    fn appendDictSurvivors(self: *Scan, db: storage.segment_reader.DictBlock, nulls: ?[]const u8, mask: []const bool, out: *ColumnStore) !void {
+        var matched: usize = 0;
+        var total_bytes: usize = 0;
+        for (mask, 0..) |m, row| {
+            if (!m) continue;
+            matched += 1;
+            total_bytes += db.dictValue(db.rowCode(row)).len;
+        }
+        switch (out.data) {
+            .varchar, .string, .char, .json => |*ss| {
+                try ss.ensureUnusedValueCapacity(self.allocator, matched, total_bytes);
+                for (mask, 0..) |m, row| {
+                    if (m) ss.appendValueAssumeCapacity(db.dictValue(db.rowCode(row)));
+                }
+            },
+            else => unreachable, // the writer only dict-encodes string-family columns
+        }
+
+        if (out.nulls != null) {
+            var j: usize = 0;
+            for (mask, 0..) |m, src_row| {
+                if (!m) continue;
+                try out.appendValidBit(self.allocator, j, storage.column.isValidBit(nulls, src_row));
+                j += 1;
+            }
+        }
+    }
+
     fn appendFsstSurvivors(self: *Scan, fv: storage.segment_reader.FsstView, mask: []const bool, out: *ColumnStore) !void {
         var scratch: std.ArrayListUnmanaged(u8) = .empty;
         defer scratch.deinit(self.allocator);
@@ -3490,6 +3836,17 @@ pub const Scan = struct {
             self.mask_buf2 = try self.allocator.alloc(bool, n);
         }
         return self.mask_buf2;
+    }
+
+    /// Third scratch mask: a guided child that itself ORs several per-literal
+    /// masks (IN-list over a numeric block) needs one below the AND driver's
+    /// running mask and per-child scratch.
+    fn ensureMask3(self: *Scan, n: usize) ![]bool {
+        if (self.mask_buf3.len < n) {
+            if (self.mask_buf3.len > 0) self.allocator.free(self.mask_buf3);
+            self.mask_buf3 = try self.allocator.alloc(bool, n);
+        }
+        return self.mask_buf3;
     }
 
     fn ensureBorrowBlocks(self: *Scan) ![]storage.ReadSegment.BorrowedBlock {
