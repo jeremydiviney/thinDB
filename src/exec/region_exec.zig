@@ -60,8 +60,24 @@ pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows:
         },
         else => return error.UnsupportedQueryShape,
     }
-    if (store.nulls != null) {
-        for (rows, 0..) |r, k| try store.appendValidBit(alloc, base + k, v.isValid(r));
+    if (store.nulls != null) try appendScatterValidity(alloc, store, v, rows, base);
+}
+
+/// Validity for a scattered append: grow the bitmap once, then set only the
+/// valid bits (fresh bytes arrive zeroed — the same invariant
+/// `appendGatherValidity` relies on). An all-valid source sets the range in
+/// bulk.
+fn appendScatterValidity(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows: []const u32, base: usize) !void {
+    const nb = &store.nulls.?;
+    const need = (base + rows.len + 7) / 8;
+    if (nb.items.len < need) try nb.appendNTimes(alloc, 0, need - nb.items.len);
+    if (v.nulls == null) {
+        store_mod.setBitRangeTrue(nb.items, base, rows.len);
+        return;
+    }
+    const bytes = nb.items;
+    for (rows, base..) |r, row| {
+        if (v.isValid(r)) bytes[row >> 3] |= @as(u8, 1) << @intCast(row & 7);
     }
 }
 
@@ -2916,6 +2932,9 @@ const ScanPhase = struct {
     /// buckets are never sorted (the probe map doesn't need order).
     sides: []SideScan,
     errs: []?anyerror,
+    /// Per-worker phase ticks [source scan, entry compute, route+scatter,
+    /// bucket sort] (THINDB_REGION_TRACE only; null otherwise).
+    ticks: ?[][4]i64 = null,
 
     const SideScan = struct {
         ex: *Exchange,
@@ -2945,11 +2964,19 @@ const ScanPhase = struct {
         defer mask_buf.deinit(self.ex.alloc);
         var scratch_buf: std.ArrayListUnmanaged(bool) = .empty;
         defer scratch_buf.deinit(self.ex.alloc);
+        const timed = self.ticks != null;
+        var tk: [4]i64 = .{ 0, 0, 0, 0 };
         while (true) {
             const i = self.next.fetchAdd(1, .monotonic);
             if (i >= self.sources.len) break;
-            while (try self.sources[i].next()) |batch| {
+            while (true) {
+                const t_scan = if (timed) exec.prof.nowTicks() else 0;
+                const next = try self.sources[i].next();
+                if (timed) tk[0] += exec.prof.nowTicks() - t_scan;
+                const batch = next orelse break;
+                const t_cmp = if (timed) exec.prof.nowTicks() else 0;
                 const routed = if (inst) |*ci| try ci.ptr.evalBatch(batch) else batch;
+                if (timed) tk[1] += exec.prof.nowTicks() - t_cmp;
                 var keep: ?[]const bool = null;
                 if (self.member_filters.len > 0) {
                     try mask_buf.resize(self.ex.alloc, routed.row_count);
@@ -2961,7 +2988,9 @@ const ScanPhase = struct {
                     }
                     keep = mask_buf.items;
                 }
+                const t_push = if (timed) exec.prof.nowTicks() else 0;
                 try wk.push(routed, keep);
+                if (timed) tk[2] += exec.prof.nowTicks() - t_push;
             }
         }
         for (self.sides) |*side| {
@@ -2983,9 +3012,36 @@ const ScanPhase = struct {
         }
         // This worker's buckets are complete — sort them here, where the
         // work is balanced by input chunks, not by key skew.
+        const t_sort = if (timed) exec.prof.nowTicks() else 0;
         for (0..self.ex.n_shards) |s| {
             try sortBucketKeys(self.ex, w, s, self.sort_cols);
         }
+        if (timed) tk[3] += exec.prof.nowTicks() - t_sort;
+        if (self.ticks) |t| t[w] = tk;
+    }
+
+    /// Phase CPU summed across workers plus the busiest worker's total —
+    /// wall ≈ busiest; the gap to sum/threads is the load imbalance.
+    fn printTrace(self: *const ScanPhase) void {
+        const t = self.ticks orelse return;
+        var sum: [4]i64 = .{ 0, 0, 0, 0 };
+        var busiest: i64 = 0;
+        for (t) |wt| {
+            var tot: i64 = 0;
+            for (wt, 0..) |v, k| {
+                sum[k] += v;
+                tot += v;
+            }
+            busiest = @max(busiest, tot);
+        }
+        std.debug.print("[region]   scan-phase cpu: scan={d:.0}ms compute={d:.0}ms scatter={d:.0}ms sort={d:.0}ms  busiest worker={d:.0}ms of {d} sources\n", .{
+            exec.prof.ticksToMs(sum[0]), exec.prof.ticksToMs(sum[1]), exec.prof.ticksToMs(sum[2]), exec.prof.ticksToMs(sum[3]), exec.prof.ticksToMs(busiest), self.sources.len,
+        });
+        std.debug.print("[region]   scan-phase per-worker ms:", .{});
+        for (t) |wt| {
+            std.debug.print(" {d:.0}", .{exec.prof.ticksToMs(wt[0] + wt[1] + wt[2] + wt[3])});
+        }
+        std.debug.print("\n", .{});
     }
 };
 
@@ -3198,6 +3254,8 @@ const ShardPhase = struct {
     side_ex: []Exchange,
     sides: []const SideInput,
     errs: []?anyerror,
+    /// Per-worker busy ticks (THINDB_REGION_TRACE only; null otherwise).
+    busy: ?[]i64 = null,
 
     fn worker(self: *ShardPhase, w: usize) void {
         var lease = core_scheduler.global().tryAcquire();
@@ -3212,6 +3270,10 @@ const ShardPhase = struct {
         const rw = &slot.rw;
         const tail = rw.fusedFirstTail();
         const start_op: usize = if (tail != null) 1 else 0;
+        const t_busy = if (self.busy != null) exec.prof.nowTicks() else 0;
+        defer if (self.busy) |b| {
+            b[w] = exec.prof.nowTicks() - t_busy;
+        };
 
         while (true) {
             const bi = self.next.fetchAdd(1, .monotonic);
@@ -3250,6 +3312,22 @@ const ShardPhase = struct {
             try rw.runShardFrom(&slot.sd, out.cols, start_op);
             out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
         }
+    }
+
+    fn printTrace(self: *const ShardPhase) void {
+        const b = self.busy orelse return;
+        var lo: i64 = std.math.maxInt(i64);
+        var hi: i64 = 0;
+        var sum: i64 = 0;
+        for (b) |v| {
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+            sum += v;
+        }
+        const mean = @divTrunc(sum, @as(i64, @intCast(@max(b.len, 1))));
+        std.debug.print("[region]   shard-phase workers: busiest={d:.0}ms idlest={d:.0}ms mean={d:.0}ms bins={d}\n", .{
+            exec.prof.ticksToMs(hi), exec.prof.ticksToMs(lo), exec.prof.ticksToMs(mean), self.bins.len,
+        });
     }
 };
 
@@ -3720,6 +3798,9 @@ pub fn runRegionPooled(
     for (sides, pool.side_ex, side_scans) |*side, *sex, *ss| {
         ss.* = .{ .ex = sex, .input = side };
     }
+    const scan_ticks: ?[][4]i64 = if (trace) try alloc.alloc([4]i64, opts.n_threads) else null;
+    defer if (scan_ticks) |t| alloc.free(t);
+    if (scan_ticks) |t| @memset(t, .{ 0, 0, 0, 0 });
     var scan_phase = ScanPhase{
         .ex = ex,
         .sources = sources,
@@ -3730,6 +3811,7 @@ pub fn runRegionPooled(
         .member_filters = opts.member_filters,
         .sides = side_scans,
         .errs = errs,
+        .ticks = scan_ticks,
     };
     var spawned: usize = 0;
     for (0..opts.n_threads - 1) |w| {
@@ -3741,6 +3823,9 @@ pub fn runRegionPooled(
     for (errs) |e| if (e) |err| return err;
 
     const t1 = if (trace) exec.prof.nowTicks() else 0;
+    const shard_busy: ?[]i64 = if (trace) try alloc.alloc(i64, opts.n_threads) else null;
+    defer if (shard_busy) |b| alloc.free(b);
+    if (shard_busy) |b| @memset(b, 0);
 
     const bins = try packBins(alloc, ex, opts.n_threads);
     defer freeBins(alloc, bins);
@@ -3754,6 +3839,7 @@ pub fn runRegionPooled(
         .side_ex = pool.side_ex,
         .sides = sides,
         .errs = errs,
+        .busy = shard_busy,
     };
     spawned = 0;
     for (0..opts.n_threads - 1) |w| {
@@ -3772,6 +3858,8 @@ pub fn runRegionPooled(
         std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d} parts={d} bins={d} max_bin={d}\n", .{
             exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads, opts.n_shards, bins.len, max_bin,
         });
+        scan_phase.printTrace();
+        shard_phase.printTrace();
         // Per-op CPU (summed across workers; wall ≈ sum / threads when
         // load-balanced). Consolidation reported the same way.
         var con: i64 = 0;
