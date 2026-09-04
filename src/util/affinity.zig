@@ -189,10 +189,10 @@ fn readSysfsInt(path: [:0]const u8) ?u64 {
 }
 
 /// Memory this process may actually use: physical RAM, capped by the cgroup
-/// memory limit when one is set (Linux containers). `sysinfo` reports the
-/// HOST's RAM inside a container, so pools sized from it alone would plan for
-/// memory the kernel will OOM-kill the process for touching. Null when neither
-/// source answers.
+/// memory limit when one is set (a container, or a systemd unit with
+/// MemoryMax). `sysinfo` reports the HOST's RAM inside either, so pools sized
+/// from it alone would plan for memory the kernel will OOM-kill the process
+/// for touching. Null when neither source answers.
 pub fn totalMemoryBytes() ?u64 {
     const physical: ?u64 = std.process.totalSystemMemory() catch null;
     const limit = cgroupMemoryLimit();
@@ -200,13 +200,86 @@ pub fn totalMemoryBytes() ?u64 {
     return limit;
 }
 
-/// cgroup v2 first (`memory.max` reads "max" when unlimited, which fails the
-/// integer parse), then the v1 controller.
+/// The process's own cgroup and every ancestor, v2 first then the v1 memory
+/// controller: a systemd service's cap is written at
+/// /sys/fs/cgroup/system.slice/<unit>/memory.max, a slice cap one level up,
+/// and a container's at the root of its cgroup namespace. `memory.max` reads
+/// "max" when unlimited, which fails the integer parse and is skipped.
 fn cgroupMemoryLimit() ?u64 {
     if (builtin.os.tag != .linux) return null;
+    var buf: [4096]u8 = undefined;
+    const self_cgroup = readSmallFile("/proc/self/cgroup", &buf) orelse "";
+    if (cgroupV2SelfPath(self_cgroup)) |path| {
+        if (minLimitAlongPath("/sys/fs/cgroup", path, "memory.max")) |v| return v;
+    }
+    if (cgroupV1MemoryPath(self_cgroup)) |path| {
+        if (minLimitAlongPath("/sys/fs/cgroup/memory", path, "memory.limit_in_bytes")) |v| return v;
+    }
+    // No readable self path: the mount roots still describe a container's own
+    // cgroup under a cgroup namespace.
     if (readSysfsInt("/sys/fs/cgroup/memory.max")) |v| return cgroupLimitValue(v);
     if (readSysfsInt("/sys/fs/cgroup/memory/memory.limit_in_bytes")) |v| return cgroupLimitValue(v);
     return null;
+}
+
+/// Smallest numeric limit at `path` or any ancestor under `mount`. A child
+/// cgroup can never exceed its parent, but the parent's file is where a slice
+/// cap is written, so every level counts. Missing or "max" entries are skipped.
+fn minLimitAlongPath(mount: []const u8, path: []const u8, file: []const u8) ?u64 {
+    var best: ?u64 = null;
+    var cur: ?[]const u8 = path;
+    while (cur) |p| : (cur = parentCgroupPath(p)) {
+        var path_buf: [512]u8 = undefined;
+        const dir = if (std.mem.eql(u8, p, "/")) "" else p;
+        const full = std.fmt.bufPrintZ(&path_buf, "{s}{s}/{s}", .{ mount, dir, file }) catch break;
+        const v = readSysfsInt(full) orelse continue;
+        const lim = cgroupLimitValue(v) orelse continue;
+        best = if (best) |b| @min(b, lim) else lim;
+    }
+    return best;
+}
+
+/// "/a/b" -> "/a", "/a" -> "/", "/" -> null.
+fn parentCgroupPath(p: []const u8) ?[]const u8 {
+    if (p.len <= 1) return null;
+    const cut = std.mem.lastIndexOfScalar(u8, p, '/') orelse return null;
+    return if (cut == 0) p[0..1] else p[0..cut];
+}
+
+/// The unified-hierarchy line of /proc/self/cgroup: `0::/system.slice/x.service`.
+fn cgroupV2SelfPath(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "0::")) return std.mem.trim(u8, line[3..], " \r");
+    }
+    return null;
+}
+
+/// The v1 memory-controller line: `N:memory:/path` or `N:cpu,memory:/path`.
+fn cgroupV1MemoryPath(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var parts = std.mem.splitScalar(u8, line, ':');
+        _ = parts.next() orelse continue;
+        const controllers = parts.next() orelse continue;
+        const path = parts.rest();
+        if (controllers.len == 0 or path.len == 0) continue;
+        var names = std.mem.splitScalar(u8, controllers, ',');
+        while (names.next()) |n| {
+            if (std.mem.eql(u8, n, "memory")) return std.mem.trim(u8, path, " \r");
+        }
+    }
+    return null;
+}
+
+fn readSmallFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    const fd = linuxOpenReadonly(path, false) orelse return null;
+    defer _ = linux.close(fd);
+    const rc = linux.read(fd, buf.ptr, buf.len);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return buf[0..rc];
 }
 
 /// v1 reports "no limit" as a page-rounded maxInt(i64); nothing that large is
@@ -271,6 +344,20 @@ fn detectWindows(allocator: std.mem.Allocator) !Topology {
         .smt = smt,
         .real = true,
     };
+}
+
+test "cgroup self-path parsing: v2 unified line and v1 memory controller" {
+    try std.testing.expectEqualStrings("/system.slice/thindb.service", cgroupV2SelfPath("0::/system.slice/thindb.service\n").?);
+    try std.testing.expectEqualStrings("/", cgroupV2SelfPath("12:pids:/x\n0::/\n").?);
+    try std.testing.expect(cgroupV2SelfPath("11:memory:/docker/abc\n") == null);
+    try std.testing.expectEqualStrings("/docker/abc", cgroupV1MemoryPath("12:pids:/x\n11:cpu,memory:/docker/abc\n").?);
+    try std.testing.expect(cgroupV1MemoryPath("0::/\n") == null);
+}
+
+test "parentCgroupPath walks to the root and stops" {
+    try std.testing.expectEqualStrings("/system.slice", parentCgroupPath("/system.slice/thindb.service").?);
+    try std.testing.expectEqualStrings("/", parentCgroupPath("/system.slice").?);
+    try std.testing.expect(parentCgroupPath("/") == null);
 }
 
 test "cgroupLimitValue treats the v1 unlimited sentinel as no cap" {
