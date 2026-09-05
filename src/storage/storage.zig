@@ -221,7 +221,7 @@ test "footer stats carry sum / null_count / blank-excluded string min" {
     try std.testing.expectEqual(@as(u64, 0), entry.column_stats[2].null_count);
 }
 
-test "lz4 string blocks: large raw block caches compressed, borrow decompresses" {
+test "lz4 string blocks: large raw block is cached decompressed and borrowed in place" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -238,8 +238,8 @@ test "lz4 string blocks: large raw block caches compressed, borrow decompresses"
     };
     try schema.validate();
 
-    // 2000 distinct ~70B URLs ≈ 140KB raw — over the 64KB LZ4 threshold,
-    // NDV == n so dict declines (and FSST is off).
+    // 2000 distinct ~70B URLs ≈ 140KB raw — NDV == n so dict declines (and
+    // FSST is off), leaving a raw LZ4-compressed string block.
     const n: usize = 2000;
     const ids = try allocator.alloc(i64, n);
     defer allocator.free(ids);
@@ -269,19 +269,21 @@ test "lz4 string blocks: large raw block caches compressed, borrow decompresses"
     var c = cache.Cache.init(allocator, 1 << 24);
     defer c.deinit();
 
-    // Borrow through the cache: an LZ4-at-rest block hands back an OWNED
-    // decompressed buffer (entry == null) rather than pinned cache bytes —
-    // that's the signature that the compressed-at-rest path engaged.
+    // Borrow through the cache: the block is decompressed once at fill and
+    // every borrow views the pinned cache bytes in place — no owned copy, and
+    // a warm re-borrow hands back the very same bytes.
     var bb = try seg.borrowColumnBlock(allocator, 0, 1, .{ .cache = &c, .table_uid = 0 });
     try std.testing.expectEqual(format.Encoding.raw, bb.encoding);
-    try std.testing.expect(bb.owned != null);
-    try std.testing.expect(bb.entry == null);
+    try std.testing.expect(bb.owned == null);
+    try std.testing.expect(bb.entry != null);
+    const first_ptr = bb.bytes.ptr;
     bb.release(allocator, .{ .cache = &c, .table_uid = 0 });
 
-    // The cached entry holds FEWER bytes than the raw payload (compressed at
-    // rest), and a warm re-borrow round-trips the values.
-    const raw_payload = 4 + (n + 1) * 4 + bytes.items.len;
-    try std.testing.expect(c.current_bytes < raw_payload);
+    var again = try seg.borrowColumnBlock(allocator, 0, 1, .{ .cache = &c, .table_uid = 0 });
+    try std.testing.expectEqual(first_ptr, again.bytes.ptr);
+    try std.testing.expect(again.bytes.len > bytes.items.len);
+    again.release(allocator, .{ .cache = &c, .table_uid = 0 });
+    try std.testing.expectEqual(@as(u64, 1), c.misses);
 
     var col = try seg.decodeColumnMaybeCached(allocator, schema, 0, 1, .{ .cache = &c, .table_uid = 0 });
     defer col.deinit(allocator);
