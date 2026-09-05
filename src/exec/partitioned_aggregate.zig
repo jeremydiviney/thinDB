@@ -28,6 +28,7 @@ const engine = @import("../engine/engine.zig");
 const storage = @import("../storage/storage.zig");
 const aggregate = @import("aggregate.zig");
 const ir = @import("../ir/ir.zig");
+const hll = @import("../util/hll.zig");
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -172,12 +173,12 @@ pub const PartitionedAggregate = struct {
     emit_part: usize = 0,
     emit_chunk: usize = 0,
     views: []ColumnView,
-    /// Chosen by the partition-0 probe: near-unique groups with heavy
-    /// per-group states (MAX_BY/ANY_VALUE/...) make the hash core pay a
-    /// heap state + string dupes for EVERY group; sort+stream holds one
-    /// live group. Low-NDV shapes keep the hash core — the sort would be
-    /// pure loss there.
-    sorted_stream_rest: bool = false,
+    /// Chosen from a distinct-key estimate over the scatter hashes:
+    /// near-unique groups with heavy per-group states (MAX_BY/ANY_VALUE/...)
+    /// make the hash core pay a heap state + string dupes for EVERY group;
+    /// sort+stream holds one live group. Low-NDV shapes keep the hash core —
+    /// the sort would be pure loss there.
+    sorted_stream: bool = false,
 
     pub fn create(
         allocator: Allocator,
@@ -415,7 +416,7 @@ pub const PartitionedAggregate = struct {
         // These columns are already stable in the partition arena, so sort a
         // row permutation directly. The environment switch retains the prior
         // generic Sort path as an operational fallback.
-        var agg = if (self.sorted_stream_rest and getenv_pa("THINDB_PAGG_BUFFERED_SORT") == null) blk: {
+        var agg = if (self.sorted_stream and getenv_pa("THINDB_PAGG_BUFFERED_SORT") == null) blk: {
             const perm = try aa.alloc(u32, part.in_rows);
             for (perm, 0..) |*row, i| row.* = @intCast(i);
             const SortCtx = struct {
@@ -428,7 +429,10 @@ pub const PartitionedAggregate = struct {
                         if (order == .lt) return true;
                         if (order == .gt) return false;
                     }
-                    return false;
+                    // pdq is unstable; the row index keeps a group's rows in
+                    // input order, as the hash core sees them (ANY_VALUE,
+                    // FIRST/LAST, MAX_BY ties).
+                    return a < b;
                 }
             };
             std.sort.pdq(u32, perm, SortCtx{
@@ -438,10 +442,10 @@ pub const PartitionedAggregate = struct {
             permuted_scan = try PermutedInputScan.init(aa, up_schema, in_views, perm);
             const src = exec.makeQuery(aa, &permuted_scan);
             break :blk try src.streamGroupBy(self.group_cols, self.aggs);
-        } else if (self.sorted_stream_rest) blk: {
-            // Near-unique groups (probe verdict): sort this partition by the
-            // group keys and stream — one live group's state instead of a
-            // hash table holding a heap state per group.
+        } else if (self.sorted_stream) blk: {
+            // Near-unique groups: sort this partition by the group keys and
+            // stream — one live group's state instead of a hash table
+            // holding a heap state per group.
             const specs = try aa.alloc(exec.SortSpec, self.group_cols.len);
             for (self.group_cols, specs) |gc, *s| s.* = .{ .col = gc, .desc = false };
             const src = exec.makeQuery(aa, &scan);
@@ -501,6 +505,9 @@ pub const PartitionedAggregate = struct {
         // thread's phase work.
         const spawn_ok = spawned == self.n_parts - 1;
 
+        const heavy_aggs = heavyStateAggCount(self.aggs);
+        var ndv: hll.Hll = .{};
+        var rows_in: u64 = 0;
         var pull_ticks: i64 = 0;
         var hash_ticks: i64 = 0;
         var copy_ticks: i64 = 0;
@@ -513,10 +520,15 @@ pub const PartitionedAggregate = struct {
             try hashes.resize(self.allocator, batch.row_count);
             @memset(hashes.items, 0x9e3779b97f4a7c15);
             for (self.group_indices) |ci| hashColumnInto(batch.values[ci], hashes.items);
-            for (idx_lists) |*l| l.clearRetainingCapacity();
-            for (hashes.items, 0..) |h, row| {
-                try idx_lists[h % self.n_parts].append(self.allocator, @intCast(row));
+            for (idx_lists) |*l| {
+                l.clearRetainingCapacity();
+                try l.ensureTotalCapacity(self.allocator, batch.row_count);
             }
+            for (hashes.items, 0..) |h, row| {
+                idx_lists[h % self.n_parts].appendAssumeCapacity(@intCast(row));
+            }
+            if (heavy_aggs >= 2) for (hashes.items) |h| ndv.add(h);
+            rows_in += batch.row_count;
             const c0 = if (prof_on) exec.prof.nowTicks() else 0;
             if (prof_on) hash_ticks += c0 - h0;
             pool.batch = batch;
@@ -529,23 +541,20 @@ pub const PartitionedAggregate = struct {
         }
         const t1 = if (prof_on) exec.prof.nowTicks() else 0;
 
-        // Core-selection probe: aggregate partition 0 on this thread with the
-        // hash core, then read its groups/rows ratio. Near-unique groups with
-        // heavy per-group states send the REMAINING partitions down the
-        // sort+stream core (partition 0 keeps its hash result — same output
-        // either way, only the core differs).
-        self.aggregateOne(&self.parts[0]);
-        // ≥90% unique: at moderate ratios (measured: 73% unique, 3.6M rows)
-        // the hash core still wins — the sort's row-bound cost only pays off
-        // when nearly every row opens a fresh group's heap states.
-        if (self.parts[0].in_rows >= 4096 and
-            self.parts[0].out_rows * 10 >= self.parts[0].in_rows * 9 and
-            heavyStateAggCount(self.aggs) >= 2)
-        {
-            self.sorted_stream_rest = true;
+        // Core selection: the scatter hashes identify each row's group, so a
+        // HyperLogLog over them (~3% error) gives the group count before any
+        // partition runs — every partition then aggregates in the one
+        // parallel phase (a serial hash-core probe of partition 0 used to
+        // precede it). ≥90% unique: at moderate ratios (measured: 73%
+        // unique, 3.6M rows) the hash core still wins — the sort's row-bound
+        // cost only pays off when nearly every row opens a fresh group's
+        // heap states.
+        if (heavy_aggs >= 2 and rows_in >= 4096 * self.n_parts) {
+            const est = ndv.estimate();
+            self.sorted_stream = est * 10 >= rows_in * 9;
             if (prof_on) std.debug.print(
-                "[hprof] pagg.probe: groups/rows={d}/{d} heavy_aggs={d} -> sort+stream rest\n",
-                .{ self.parts[0].out_rows, self.parts[0].in_rows, heavyStateAggCount(self.aggs) },
+                "[hprof] pagg.core: est_groups/rows={d}/{d} heavy_aggs={d} -> {s}\n",
+                .{ est, rows_in, heavy_aggs, if (self.sorted_stream) "sort+stream" else "hash" },
             );
         }
 
@@ -716,6 +725,68 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
     ser.deinit();
 
     try testing.expectEqual(@as(usize, 7), ser_lines.len);
+    try testing.expectEqual(ser_lines.len, par_lines.len);
+    for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
+}
+
+test "PartitionedAggregate sort+stream core keeps a group's rows in input order" {
+    const a = testing.allocator;
+    const row_count = 24_000;
+    const group_count = 23_500;
+
+    const schema = [_]Column{
+        .{ .name = "key", .type = .string, .nullable = false },
+        .{ .name = "ord", .type = .bigint, .nullable = false },
+        .{ .name = "tie", .type = .bigint, .nullable = false },
+        .{ .name = "label", .type = .string, .nullable = false },
+    };
+    var stores: [4]engine_store = undefined;
+    for (&stores, schema) |*s, col| s.* = try engine_store.init(a, col.type, col.nullable);
+    defer for (&stores) |*s| s.deinit(a);
+
+    for (0..row_count) |i| {
+        const group_id = i % group_count;
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "g{d}", .{group_id});
+        try stores[0].data.string.appendValue(a, key);
+        try stores[1].data.bigint.append(a, @intCast(i));
+        try stores[2].data.bigint.append(a, @intCast(group_id));
+        var label_buf: [16]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buf, "L{d}", .{i});
+        try stores[3].data.string.appendValue(a, label);
+    }
+
+    var views: [4]ColumnView = undefined;
+    for (&views, &stores) |*v, *s| v.* = s.view();
+    const group_cols = [_][]const u8{"key"};
+    // The repeated groups carry a different ord/label per row and an equal
+    // MAX_BY argument, so the order the core sees the rows in decides the
+    // ANY_VALUE and MAX_BY results.
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .any_value, .col = "ord", .as = "v" },
+        .{ .func = .max_by, .col = "label", .arg2_col = "tie", .as = "mb" },
+    };
+
+    var scan_p = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var pa = try PartitionedAggregate.create(a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
+    const par_lines = try testCollectSorted(a, &pa);
+    defer {
+        for (par_lines) |line| a.free(line);
+        a.free(par_lines);
+    }
+    pa.deinit();
+
+    var scan_s = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var ser = try aggregate.Aggregate.create(a, exec.makeQuery(a, &scan_s), &group_cols, &aggs, null, null);
+    const ser_lines = try testCollectSorted(a, &ser);
+    defer {
+        for (ser_lines) |line| a.free(line);
+        a.free(ser_lines);
+    }
+    ser.deinit();
+
+    try testing.expectEqual(@as(usize, group_count), par_lines.len);
     try testing.expectEqual(ser_lines.len, par_lines.len);
     for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
 }
