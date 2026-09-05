@@ -349,7 +349,11 @@ pub fn perGroupTableBytes(
             const idx = types.findColumn(schema, name) orelse break :blk null;
             break :blk schema[idx].type;
         } else null;
-        raw += exec.aggregate_op.aggStateWidth(a.func, in_t);
+        const key_t: ?types.Type = if (a.arg2_col) |name| blk: {
+            const idx = types.findColumn(schema, name) orelse break :blk null;
+            break :blk schema[idx].type;
+        } else null;
+        raw += exec.aggregate_op.aggStateWidth(a.func, in_t, key_t);
     }
     return raw * 4 / 3; // 0.75 load-factor headroom
 }
