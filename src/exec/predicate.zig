@@ -181,6 +181,48 @@ pub fn touchesColumn(expr: PredicateExpr, name: []const u8) bool {
     };
 }
 
+/// Structural equality: column names case-insensitively, literals by
+/// value, children in order. Forms backed by a subquery never compare
+/// equal — each is its own evaluation.
+pub fn eql(a: PredicateExpr, b: PredicateExpr) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .leaf => |l| leafEql(l, b.leaf),
+        .day_leaf => |l| leafEql(l, b.day_leaf),
+        .leaf_col_col => |c| c.op == b.leaf_col_col.op and
+            types.columnNameEql(c.left, b.leaf_col_col.left) and
+            types.columnNameEql(c.right, b.leaf_col_col.right),
+        .is_null => |c| types.columnNameEql(c, b.is_null),
+        .is_not_null => |c| types.columnNameEql(c, b.is_not_null),
+        .like => |l| types.columnNameEql(l.col, b.like.col) and std.mem.eql(u8, l.pattern, b.like.pattern),
+        .@"and" => |arms| armsEql(arms, b.@"and"),
+        .@"or" => |arms| armsEql(arms, b.@"or"),
+        .not => |n| eql(n.*, b.not.*),
+        .always => |v| v == b.always,
+        .in_set => |s| blk: {
+            const o = b.in_set;
+            if (s.negate != o.negate or s.values.len != o.values.len or !types.columnNameEql(s.col, o.col)) break :blk false;
+            for (s.values, o.values) |x, y| if (!x.eql(y)) break :blk false;
+            break :blk true;
+        },
+        .leaf_var => |v| v.op == b.leaf_var.op and
+            types.columnNameEql(v.col, b.leaf_var.col) and
+            std.mem.eql(u8, v.var_name, b.leaf_var.var_name),
+        .unknown => true,
+        .scalar_subquery, .exists_subquery, .in_subquery, .correlated_set, .correlated_scalar, .correlated_range => false,
+    };
+}
+
+fn leafEql(a: Predicate, b: Predicate) bool {
+    return a.op == b.op and types.columnNameEql(a.col, b.col) and a.val.eql(b.val);
+}
+
+fn armsEql(a: []const PredicateExpr, b: []const PredicateExpr) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!eql(x, y)) return false;
+    return true;
+}
+
 pub const CorrelatedScalarRow = struct {
     key: []const Value,
     value: Value,

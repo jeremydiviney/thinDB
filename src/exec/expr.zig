@@ -145,6 +145,36 @@ pub fn deepCloneRenamed(out_arena: Allocator, e: Expr, renames: []const predicat
     };
 }
 
+/// Structural equality: the same tree, with column references and
+/// function names matched case-insensitively and literals by value.
+/// Subquery nodes never compare equal — each is its own evaluation.
+pub fn eql(a: Expr, b: Expr) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .col_ref => |name| types.columnNameEql(name, b.col_ref),
+        .lit => |v| v.eql(b.lit),
+        .null_lit => |t| std.meta.eql(t, b.null_lit),
+        .call => |c| blk: {
+            const o = b.call;
+            if (c.args.len != o.args.len or !std.ascii.eqlIgnoreCase(c.fn_name, o.fn_name)) break :blk false;
+            for (c.args, o.args) |x, y| if (!eql(x, y)) break :blk false;
+            break :blk true;
+        },
+        .case => |cs| blk: {
+            const o = b.case;
+            if (cs.branches.len != o.branches.len) break :blk false;
+            if ((cs.else_branch == null) != (o.else_branch == null)) break :blk false;
+            for (cs.branches, o.branches) |x, y| {
+                if (!predicate_mod.eql(x.cond, y.cond) or !eql(x.then, y.then)) break :blk false;
+            }
+            if (cs.else_branch) |eb| if (!eql(eb.*, o.else_branch.?.*)) break :blk false;
+            break :blk true;
+        },
+        .scalar_subquery, .exists_subquery => false,
+        .var_ref => |name| std.mem.eql(u8, name, b.var_ref),
+    };
+}
+
 fn cloneValue(out_arena: Allocator, v: Value) Allocator.Error!Value {
     return switch (v) {
         .text => |s| .{ .text = try out_arena.dupe(u8, s) },
@@ -165,6 +195,27 @@ test "expr: col + lit + call construction" {
     try std.testing.expectEqualStrings("upper", e.call.fn_name);
     try std.testing.expect(e.call.args[0] == .col_ref);
     try std.testing.expectEqualStrings("name", e.call.args[0].col_ref);
+}
+
+test "expr: eql is structural, case-insensitive on identifiers, exact on literals" {
+    const a = Expr{ .call = .{ .fn_name = "lower", .args = &.{col("Name")} } };
+    const b = Expr{ .call = .{ .fn_name = "LOWER", .args = &.{col("name")} } };
+    try std.testing.expect(eql(a, b));
+    try std.testing.expect(!eql(a, Expr{ .call = .{ .fn_name = "upper", .args = &.{col("name")} } }));
+    try std.testing.expect(eql(lit(.{ .text = "x" }), lit(.{ .text = "x" })));
+    try std.testing.expect(!eql(lit(.{ .text = "x" }), lit(.{ .text = "X" })));
+    try std.testing.expect(!eql(lit(.{ .int = 1 }), lit(.{ .bigint = 1 })));
+
+    const cond = PredicateExpr{ .leaf = .{ .col = "qty", .op = .gt, .val = .{ .int = 1 } } };
+    const cond_other = PredicateExpr{ .leaf = .{ .col = "qty", .op = .gte, .val = .{ .int = 1 } } };
+    const case_a = Expr{ .case = .{ .branches = &.{.{ .cond = cond, .then = lit(.{ .text = "big" }) }}, .else_branch = null } };
+    const case_b = Expr{ .case = .{ .branches = &.{.{ .cond = cond, .then = lit(.{ .text = "big" }) }}, .else_branch = null } };
+    const case_c = Expr{ .case = .{ .branches = &.{.{ .cond = cond_other, .then = lit(.{ .text = "big" }) }}, .else_branch = null } };
+    const else_lit = lit(.{ .text = "small" });
+    const case_d = Expr{ .case = .{ .branches = &.{.{ .cond = cond, .then = lit(.{ .text = "big" }) }}, .else_branch = &else_lit } };
+    try std.testing.expect(eql(case_a, case_b));
+    try std.testing.expect(!eql(case_a, case_c));
+    try std.testing.expect(!eql(case_a, case_d));
 }
 
 test "expr: deepClone produces an owned tree" {

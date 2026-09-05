@@ -331,6 +331,16 @@ pub const Value = union(ValueTag) {
             },
         };
     }
+
+    /// Same tag and same payload (`.text` by bytes). Floats compare with
+    /// `==`, so NaN never equals itself.
+    pub fn eql(self: Value, other: Value) bool {
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+        return switch (self) {
+            .text => |a| std.mem.eql(u8, a, other.text),
+            inline else => |a, tag| a == @field(other, @tagName(tag)),
+        };
+    }
 };
 
 pub const Column = struct {

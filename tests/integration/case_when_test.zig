@@ -283,3 +283,77 @@ test "case: window call inside a WHEN condition hoists in projection context" {
     const bad = runSql(allocator, db, "SELECT id FROM wt WHERE ROW_NUMBER() OVER (ORDER BY id) < 2");
     try std.testing.expectError(error.SqlTrailingTokens, bad);
 }
+
+test "CASE WHEN: one CASE repeated across derived flags evaluates once and agrees" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 5), (2, 50), (3, 500), (4, 7)");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    var q = try runSql(
+        allocator,
+        db,
+        "SELECT CASE WHEN qty < 10 THEN 'small' WHEN qty < 100 THEN 'medium' ELSE 'large' END AS bucket, " ++
+            "CASE WHEN (CASE WHEN qty < 10 THEN 'small' WHEN qty < 100 THEN 'medium' ELSE 'large' END) = 'small' THEN 1 ELSE 0 END AS is_small, " ++
+            "CASE WHEN (CASE WHEN qty < 10 THEN 'small' WHEN qty < 100 THEN 'medium' ELSE 'large' END) = 'large' THEN qty ELSE 0 END AS large_qty " ++
+            "FROM t ORDER BY id ASC",
+    );
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 4), batch.row_count);
+    try std.testing.expectEqual(@as(usize, 3), batch.values.len);
+    const buckets = [_][]const u8{ "small", "medium", "large", "small" };
+    for (buckets, 0..) |want, i| try std.testing.expectEqualStrings(want, batch.values[0].data.string.rowBytes(i));
+    try std.testing.expectEqualSlices(i32, &.{ 1, 0, 0, 1 }, batch.values[1].data.int[0..4]);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 500, 0 }, batch.values[2].data.int[0..4]);
+}
+
+test "CASE WHEN: nullable column branches beside literal branches" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, note STRING, n2 INT)");
+    try exec(allocator, db, "INSERT INTO t (id, qty, note, n2) VALUES (1, 5, 'a', 3), (2, 50, NULL, 4), (3, 500, 'c', NULL), (4, 7, NULL, NULL)");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    {
+        var q = try runSql(allocator, db, "SELECT CASE WHEN qty < 10 THEN note WHEN qty < 100 THEN 'mid' END AS s FROM t ORDER BY id ASC");
+        defer q.deinit();
+        const batch = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 4), batch.row_count);
+        const col = batch.values[0];
+        try std.testing.expect(col.isValid(0));
+        try std.testing.expectEqualStrings("a", col.data.string.rowBytes(0));
+        try std.testing.expect(col.isValid(1));
+        try std.testing.expectEqualStrings("mid", col.data.string.rowBytes(1));
+        // Unmatched row and a NULL source row are both NULL.
+        try std.testing.expect(!col.isValid(2));
+        try std.testing.expect(!col.isValid(3));
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT CASE WHEN qty < 10 THEN n2 ELSE 0 END AS v FROM t ORDER BY id ASC");
+        defer q.deinit();
+        const batch = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 4), batch.row_count);
+        const col = batch.values[0];
+        try std.testing.expect(col.isValid(0));
+        try std.testing.expectEqual(@as(i32, 3), col.data.int[0]);
+        try std.testing.expect(col.isValid(1));
+        try std.testing.expectEqual(@as(i32, 0), col.data.int[1]);
+        try std.testing.expect(col.isValid(2));
+        try std.testing.expectEqual(@as(i32, 0), col.data.int[2]);
+        try std.testing.expect(!col.isValid(3));
+    }
+}
