@@ -3270,35 +3270,27 @@ pub const Scan = struct {
             if (block.encoding == .for_) {
                 mat_kind = 3;
                 const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
-                try self.appendForSurvivors(fv, rows, &filtered_cols[j]);
+                try engine.transform.appendForRows(self.allocator, fv, rows, &filtered_cols[j]);
                 continue;
             }
 
             if (block.encoding == .dict) {
                 mat_kind = 4;
-                var values = block.bytes;
-                var nulls: ?[]const u8 = null;
-                if (flags.has_nulls) {
-                    const bm_len = storage.column.bitmapBytes(rg_count);
-                    nulls = block.bytes[0..bm_len];
-                    values = block.bytes[bm_len..];
-                }
-                const db = storage.segment_reader.dictBlockOf(values, rg_count);
-                try self.appendDictSurvivors(db, nulls, rows, &filtered_cols[j]);
+                try engine.transform.appendDictRows(self.allocator, block.bytes, rg_count, flags, rows, &filtered_cols[j]);
                 continue;
             }
 
             if (block.encoding == .rle) {
                 mat_kind = 5;
                 const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
-                try self.appendRleSurvivors(rv, rows, &filtered_cols[j]);
+                try engine.transform.appendRleRows(self.allocator, rv, rows, &filtered_cols[j]);
                 continue;
             }
 
             if (block.encoding == .fsst) {
                 mat_kind = 6;
                 const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
-                try self.appendFsstSurvivors(fv, rows, &filtered_cols[j]);
+                try engine.transform.appendFsstRows(self.allocator, fv, rows, &filtered_cols[j]);
                 continue;
             }
 
@@ -3346,17 +3338,6 @@ pub const Scan = struct {
             if (try engine.memtable.appendGatheredColumn(self.allocator, view, rows, out)) return;
         }
         try engine.memtable.appendMaskedColumn(self.allocator, view, mask, out);
-    }
-
-    /// The survivors' validity bits, appended after their values: one all-valid
-    /// range when the block carries no bitmap, else one bit per survivor.
-    fn appendSurvivorValidity(self: *Scan, nulls: ?[]const u8, rows: []const u32, out: *ColumnStore) !void {
-        if (out.nulls == null) return;
-        const dst_start = out.data.rowCount() - rows.len;
-        if (nulls == null) return out.appendValidityRange(self.allocator, dst_start, null, rows.len);
-        for (rows, 0..) |row, j| {
-            try out.appendValidBit(self.allocator, dst_start + j, storage.column.isValidBit(nulls, row));
-        }
     }
 
     /// Late-mat: append each survivor's packed `__rowloc` into the trailing
@@ -3494,125 +3475,6 @@ pub const Scan = struct {
             },
             else => unreachable,
         }
-    }
-
-    /// A FOR column's survivors (`base + code` at each survivor row) into a
-    /// `ColumnStore`, gathered straight off the narrow codes. The per-survivor
-    /// validity bit is carried so a NULL row that happens to survive (not the
-    /// current single-leaf shape, which already cleared NULLs, but kept correct
-    /// for any future composed mask) materializes as NULL.
-    fn appendForSurvivors(self: *Scan, fv: storage.segment_reader.ForView, rows: []const u32, out: *ColumnStore) !void {
-        switch (out.data) {
-            .int => |*list| try self.gatherForInto(i32, fv.block, rows, list),
-            .date => |*list| try self.gatherForInto(i32, fv.block, rows, list),
-            .bigint => |*list| try self.gatherForInto(i64, fv.block, rows, list),
-            .datetime => |*list| try self.gatherForInto(i64, fv.block, rows, list),
-            .decimal64 => |*list| try self.gatherForInto(i64, fv.block, rows, list),
-            .smallint => |*list| try self.gatherForInto(i16, fv.block, rows, list),
-            .tinyint => |*list| try self.gatherForInto(i8, fv.block, rows, list),
-            .boolean => |*list| try self.gatherForInto(u8, fv.block, rows, list),
-            else => unreachable,
-        }
-        try self.appendSurvivorValidity(fv.nulls, rows, out);
-    }
-
-    fn gatherForInto(
-        self: *Scan,
-        comptime T: type,
-        fb: storage.segment_reader.ForBlock,
-        rows: []const u32,
-        list: *std.ArrayList(T),
-    ) !void {
-        if (rows.len == 0) return;
-        try list.ensureUnusedCapacity(self.allocator, rows.len);
-        const start = list.items.len;
-        list.items.len = start + rows.len;
-        storage.segment_reader.forGatherRows(T, fb, rows, list.items[start..]);
-    }
-
-    /// RLE sibling of `appendForSurvivors`: walk the runs and the ascending
-    /// survivor rows together — O(survivors + runs), never the full row width.
-    fn appendRleSurvivors(self: *Scan, rv: storage.segment_reader.RleView, rows: []const u32, out: *ColumnStore) !void {
-        switch (out.data) {
-            .int => |*list| try self.gatherRleInto(i32, rv.block, rows, list),
-            .date => |*list| try self.gatherRleInto(i32, rv.block, rows, list),
-            .bigint => |*list| try self.gatherRleInto(i64, rv.block, rows, list),
-            .datetime => |*list| try self.gatherRleInto(i64, rv.block, rows, list),
-            .decimal64 => |*list| try self.gatherRleInto(i64, rv.block, rows, list),
-            .smallint => |*list| try self.gatherRleInto(i16, rv.block, rows, list),
-            .tinyint => |*list| try self.gatherRleInto(i8, rv.block, rows, list),
-            .boolean => |*list| try self.gatherRleInto(u8, rv.block, rows, list),
-            else => unreachable,
-        }
-        try self.appendSurvivorValidity(rv.nulls, rows, out);
-    }
-
-    fn gatherRleInto(
-        self: *Scan,
-        comptime T: type,
-        rb: storage.segment_reader.RleBlock,
-        rows: []const u32,
-        list: *std.ArrayList(T),
-    ) !void {
-        if (rows.len == 0) return;
-        try list.ensureUnusedCapacity(self.allocator, rows.len);
-        const start = list.items.len;
-        list.items.len = start + rows.len;
-        const out = list.items[start..];
-        var run: usize = 0;
-        var run_end: usize = rb.runLength(0);
-        var v = rleRunValue(T, rb, 0);
-        for (rows, out) |r, *o| {
-            if (r >= run_end) {
-                while (r >= run_end) {
-                    run += 1;
-                    run_end += rb.runLength(run);
-                }
-                v = rleRunValue(T, rb, run);
-            }
-            o.* = v;
-        }
-    }
-
-    fn rleRunValue(comptime T: type, rb: storage.segment_reader.RleBlock, run: usize) T {
-        return std.mem.readInt(T, rb.values[run * @sizeOf(T) ..][0..@sizeOf(T)], .little);
-    }
-
-    /// Dict sibling of `appendFsstSurvivors`: gather only the survivors' values
-    /// straight out of the block's sorted dictionary. One pass sizes the
-    /// destination from the survivors' dict lengths, one pass copies, so the
-    /// string store never grows per row.
-    fn appendDictSurvivors(self: *Scan, db: storage.segment_reader.DictBlock, nulls: ?[]const u8, rows: []const u32, out: *ColumnStore) !void {
-        var total_bytes: usize = 0;
-        for (rows) |row| total_bytes += db.dictValue(db.rowCode(row)).len;
-        switch (out.data) {
-            .varchar, .string, .char, .json => |*ss| {
-                try ss.ensureUnusedValueCapacity(self.allocator, rows.len, total_bytes);
-                for (rows) |row| ss.appendValueAssumeCapacity(db.dictValue(db.rowCode(row)));
-            },
-            else => unreachable, // the writer only dict-encodes string-family columns
-        }
-        try self.appendSurvivorValidity(nulls, rows, out);
-    }
-
-    /// Survivor-only FSST expansion: decode just the survivor rows off the
-    /// cached compressed block — the full row-group string column never
-    /// materializes. The scratch holds one decoded value at a time.
-    fn appendFsstSurvivors(self: *Scan, fv: storage.segment_reader.FsstView, rows: []const u32, out: *ColumnStore) !void {
-        var scratch: std.ArrayListUnmanaged(u8) = .empty;
-        defer scratch.deinit(self.allocator);
-        switch (out.data) {
-            .varchar, .string, .char, .json => |*ss| {
-                for (rows) |row| {
-                    const comp = fv.block.rowComp(row);
-                    try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
-                    const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
-                    try ss.appendValue(self.allocator, scratch.items[0..n]);
-                }
-            },
-            else => unreachable, // the writer only FSST-encodes string-family columns
-        }
-        try self.appendSurvivorValidity(fv.nulls, rows, out);
     }
 
     const Borrow = struct {

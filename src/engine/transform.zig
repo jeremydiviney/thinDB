@@ -508,6 +508,149 @@ pub fn appendOneRow(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-encoding row gathers off a borrowed column block: the ascending `rows`
+// of one row group appended to `out` without decoding the rest of the block.
+// Shared by the filtered scan (survivors of a predicate mask) and the late
+// materialization fetch (survivor locations of a top-N / group emit).
+// ---------------------------------------------------------------------------
+
+/// A FOR column's rows (`base + code` at each row) into a `ColumnStore`,
+/// gathered straight off the narrow codes. The per-row validity bit is
+/// carried so a NULL row that is asked for materializes as NULL.
+pub fn appendForRows(allocator: Allocator, fv: storage.segment_reader.ForView, rows: []const u32, out: *ColumnStore) !void {
+    switch (out.data) {
+        .int => |*list| try gatherForInto(allocator, i32, fv.block, rows, list),
+        .date => |*list| try gatherForInto(allocator, i32, fv.block, rows, list),
+        .bigint => |*list| try gatherForInto(allocator, i64, fv.block, rows, list),
+        .datetime => |*list| try gatherForInto(allocator, i64, fv.block, rows, list),
+        .decimal64 => |*list| try gatherForInto(allocator, i64, fv.block, rows, list),
+        .smallint => |*list| try gatherForInto(allocator, i16, fv.block, rows, list),
+        .tinyint => |*list| try gatherForInto(allocator, i8, fv.block, rows, list),
+        .boolean => |*list| try gatherForInto(allocator, u8, fv.block, rows, list),
+        else => unreachable,
+    }
+    try appendRowsValidity(allocator, fv.nulls, rows, out);
+}
+
+fn gatherForInto(
+    allocator: Allocator,
+    comptime T: type,
+    fb: storage.segment_reader.ForBlock,
+    rows: []const u32,
+    list: *std.ArrayList(T),
+) !void {
+    if (rows.len == 0) return;
+    try list.ensureUnusedCapacity(allocator, rows.len);
+    const start = list.items.len;
+    list.items.len = start + rows.len;
+    storage.segment_reader.forGatherRows(T, fb, rows, list.items[start..]);
+}
+
+/// RLE sibling of `appendForRows`: walk the runs and the ascending rows
+/// together — O(rows + runs), never the full row width.
+pub fn appendRleRows(allocator: Allocator, rv: storage.segment_reader.RleView, rows: []const u32, out: *ColumnStore) !void {
+    switch (out.data) {
+        .int => |*list| try gatherRleInto(allocator, i32, rv.block, rows, list),
+        .date => |*list| try gatherRleInto(allocator, i32, rv.block, rows, list),
+        .bigint => |*list| try gatherRleInto(allocator, i64, rv.block, rows, list),
+        .datetime => |*list| try gatherRleInto(allocator, i64, rv.block, rows, list),
+        .decimal64 => |*list| try gatherRleInto(allocator, i64, rv.block, rows, list),
+        .smallint => |*list| try gatherRleInto(allocator, i16, rv.block, rows, list),
+        .tinyint => |*list| try gatherRleInto(allocator, i8, rv.block, rows, list),
+        .boolean => |*list| try gatherRleInto(allocator, u8, rv.block, rows, list),
+        else => unreachable,
+    }
+    try appendRowsValidity(allocator, rv.nulls, rows, out);
+}
+
+fn gatherRleInto(
+    allocator: Allocator,
+    comptime T: type,
+    rb: storage.segment_reader.RleBlock,
+    rows: []const u32,
+    list: *std.ArrayList(T),
+) !void {
+    if (rows.len == 0) return;
+    try list.ensureUnusedCapacity(allocator, rows.len);
+    const start = list.items.len;
+    list.items.len = start + rows.len;
+    const out = list.items[start..];
+    var run: usize = 0;
+    var run_end: usize = rb.runLength(0);
+    var v = rleRunValue(T, rb, 0);
+    for (rows, out) |r, *o| {
+        if (r >= run_end) {
+            while (r >= run_end) {
+                run += 1;
+                run_end += rb.runLength(run);
+            }
+            v = rleRunValue(T, rb, run);
+        }
+        o.* = v;
+    }
+}
+
+fn rleRunValue(comptime T: type, rb: storage.segment_reader.RleBlock, run: usize) T {
+    return std.mem.readInt(T, rb.values[run * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+}
+
+/// Dict sibling of `appendFsstRows`: gather only the survivors' values
+/// straight out of the block's sorted dictionary. One pass sizes the
+/// destination from the survivors' dict lengths, one pass copies, so the
+/// string store never grows per row.
+pub fn appendDictRows(allocator: Allocator, raw: []const u8, row_count: u32, flags: storage.format.ColumnBlockFlags, rows: []const u32, out: *ColumnStore) !void {
+    var values = raw;
+    var nulls: ?[]const u8 = null;
+    if (flags.has_nulls) {
+        const bm_len = storage.column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+    const db = storage.segment_reader.dictBlockOf(values, row_count);
+    var total_bytes: usize = 0;
+    for (rows) |row| total_bytes += db.dictValue(db.rowCode(row)).len;
+    switch (out.data) {
+        .varchar, .string, .char, .json => |*ss| {
+            try ss.ensureUnusedValueCapacity(allocator, rows.len, total_bytes);
+            for (rows) |row| ss.appendValueAssumeCapacity(db.dictValue(db.rowCode(row)));
+        },
+        else => unreachable, // the writer only dict-encodes string-family columns
+    }
+    try appendRowsValidity(allocator, nulls, rows, out);
+}
+
+/// Survivor-only FSST expansion: decode just the survivor rows off the
+/// cached compressed block — the full row-group string column never
+/// materializes. The scratch holds one decoded value at a time.
+pub fn appendFsstRows(allocator: Allocator, fv: storage.segment_reader.FsstView, rows: []const u32, out: *ColumnStore) !void {
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(allocator);
+    switch (out.data) {
+        .varchar, .string, .char, .json => |*ss| {
+            for (rows) |row| {
+                const comp = fv.block.rowComp(row);
+                try scratch.resize(allocator, storage.fsst.decodedSizeBound(comp.len));
+                const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
+                try ss.appendValue(allocator, scratch.items[0..n]);
+            }
+        },
+        else => unreachable, // the writer only FSST-encodes string-family columns
+    }
+    try appendRowsValidity(allocator, fv.nulls, rows, out);
+}
+
+/// The survivors' validity bits, appended after their values: one all-valid
+/// range when the block carries no bitmap, else one bit per survivor.
+pub fn appendRowsValidity(allocator: Allocator, nulls: ?[]const u8, rows: []const u32, out: *ColumnStore) !void {
+    if (out.nulls == null) return;
+    const dst_start = out.data.rowCount() - rows.len;
+    if (nulls == null) return out.appendValidityRange(allocator, dst_start, null, rows.len);
+    for (rows, 0..) |row, j| {
+        try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(nulls, row));
+    }
+}
+
 /// Append rows from `view` to `out`, picking by the given indices into `view`.
 /// Used by Sort to materialize batches in permutation order. Validity bits
 /// are carried across via `view.nulls`.
