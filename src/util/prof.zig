@@ -164,14 +164,14 @@ pub fn snapSlots() SlotSnap {
 /// full wall (incl. nested) and realized rows. The indented lines split the
 /// execute time across the operator layers (scan / filter / group / window)
 /// that ran during this stage only — current slots minus the pre-drain snapshot.
-pub fn dumpStageDelta(stage_id: usize, rows: u64, self_ticks: i64, wall_ticks: i64, setup_ticks: i64, teardown_ticks: i64, before: SlotSnap) void {
+pub fn dumpStageDelta(stage_id: usize, name: []const u8, rows: u64, self_ticks: i64, wall_ticks: i64, setup_ticks: i64, teardown_ticks: i64, before: SlotSnap) void {
     if (!enabled) return;
     const hz: f64 = @floatFromInt(freq());
     const self_ms = @as(f64, @floatFromInt(@max(self_ticks, 0))) * 1000.0 / hz;
     const wall_ms = @as(f64, @floatFromInt(@max(wall_ticks, 0))) * 1000.0 / hz;
     const setup_ms = @as(f64, @floatFromInt(@max(setup_ticks, 0))) * 1000.0 / hz;
     const teardown_ms = @as(f64, @floatFromInt(@max(teardown_ticks, 0))) * 1000.0 / hz;
-    std.debug.print("[cte] stage#{d: <3} rows={d: <9} setup={d: >7.2}ms execute={d: >8.2}ms teardown={d: >6.2}ms  (wall={d: >8.2}ms, all wall-clock)\n", .{ stage_id, rows, setup_ms, self_ms, teardown_ms, wall_ms });
+    std.debug.print("[cte] stage#{d: <3} {s: <40} rows={d: <9} setup={d: >7.2}ms execute={d: >8.2}ms teardown={d: >6.2}ms  (wall={d: >8.2}ms, all wall-clock)\n", .{ stage_id, name, rows, setup_ms, self_ms, teardown_ms, wall_ms });
     for (slots[0..count]) |s| {
         var prev: u64 = 0;
         for (0..before.n) |j| {
@@ -205,7 +205,7 @@ fn shortOpName(name: []const u8) []const u8 {
 // construction / teardown), kept apart from the per-operator `slots` above so
 // the execute-time `reset()` doesn't clobber construction timings. Accumulate
 // with `addPhase`, clear with `resetPhases`, print with `dumpPhases`.
-threadlocal var phase_slots: [32]Slot = undefined;
+threadlocal var phase_slots: [64]Slot = undefined;
 threadlocal var phase_count: usize = 0;
 
 pub inline fn addPhase(name: []const u8, ticks: u64) void {

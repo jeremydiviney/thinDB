@@ -1243,15 +1243,21 @@ pub fn compileWithSession(
     // subquery once, replacing the `.scalar_subquery` marker with a
     // concrete `.leaf` / `.lit`. After this pass operators never see
     // subquery nodes — they're a parse-time-only construct.
+    const t_resolve_subqueries = exec.prof.nowTicks();
     try subquery_resolve.resolveSubqueriesInOp(&ctx, @constCast(root));
+    exec.prof.addPhase("compile.resolve_subqueries", @intCast(exec.prof.nowTicks() - t_resolve_subqueries));
     // Predicate pushdown: relocate single-side WHERE conjuncts below their join
     // so the source is narrowed before the join runs. Pure plan rewrite shared
     // by every handler. Runs on resolved predicates (concrete leaves).
+    const t_push_join_filters = exec.prof.nowTicks();
     try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
+    exec.prof.addPhase("compile.push_join_filters", @intCast(exec.prof.nowTicks() - t_push_join_filters));
     // Compute-through-union: split a Compute over UNION ALL into per-arm
     // computes so stage-backed arms parallelise the evaluation (terminal
     // compute push); the union'd operator itself has nothing to fuse into.
+    const t_push_compute_unions = exec.prof.nowTicks();
     try predicate_pushdown.pushComputeThroughUnions(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
+    exec.prof.addPhase("compile.push_compute_unions", @intCast(exec.prof.nowTicks() - t_push_compute_unions));
     // Dead-branch elimination: prune UNION arms that provably yield zero rows
     // (constant-false filters — the parser already folds literal comparisons
     // to `.always`) and unlink WHERE-TRUE plumbing. Runs before projection
@@ -1284,7 +1290,9 @@ pub fn compileWithSession(
     // SET/SHOW/EXPLAIN/...) compile on the statement router.
     if (engine_v2.isSelectQuery(root)) {
         if (cte_stages.needsStaging(root) or referencesPgCatalog(root, session_cell.*)) {
+            const t_staged_total = exec.prof.nowTicks();
             const q = try cte_stages.compileStaged(v2_input, root, &ctx.stage_count);
+            exec.prof.addPhase("compile.staged_total", @intCast(exec.prof.nowTicks() - t_staged_total));
             return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
         }
         const q = try engine_v2.compileSelectBlock(v2_input, root);

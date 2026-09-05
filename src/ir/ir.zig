@@ -786,6 +786,9 @@ pub const Op = union(OpTag) {
         /// materializations. A violation is a compile ERROR (the declaration
         /// is a promise, not a hint). Parse-time only, not serialized.
         region_keys: ?[]const []const u8 = null,
+        /// The CTE this boundary came from — labels its stage in the
+        /// `--profile-ops` `[cte]` lines. Parse-time only, not serialized.
+        name: ?[]const u8 = null,
     };
 
     pub const Alias = struct {

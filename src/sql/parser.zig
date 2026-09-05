@@ -2752,6 +2752,7 @@ pub const Parser = struct {
                 try self.allocOp(.{ .materialize = .{
                     .upstream = entry.op,
                     .structural_cse = true,
+                    .name = first_dup,
                 } })
             else
                 entry.op;
@@ -4225,6 +4226,7 @@ pub const Parser = struct {
                 .materialize = .{
                     .upstream = inner,
                     .region_keys = self.region_keys,
+                    .name = entry.key_ptr.*,
                     // Explicit AS MATERIALIZED: the staged compiler must buffer
                     // even a single-reference body it would otherwise inline.
                     .forced = entry.value_ptr.hint == .force,

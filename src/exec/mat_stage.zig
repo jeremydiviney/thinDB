@@ -432,6 +432,9 @@ pub const Stage = struct {
     /// Compile-order index in the StageSet — a stable label for `--profile-ops`
     /// per-CTE timing (`[cte]` lines), nothing more.
     id: usize = 0,
+    /// The CTE name behind this stage (empty for synthetic wraps), shown
+    /// next to the id on the `[cte]` lines.
+    name: []const u8 = "",
     /// `--profile-ops` only: ticks spent compiling this block's body (setup),
     /// recorded by the staged compiler before the drain runs.
     setup_ticks: i64 = 0,
@@ -571,8 +574,11 @@ pub const Stage = struct {
             // Nested upstream stages triggered lazily during this drain charge
             // their own wall to cte_child_ticks; subtract so this line is SELF.
             const children: i64 = @intCast(exec.prof.cteChildTicks() - child0);
-            exec.prof.dumpStageDelta(self.id, res.total_rows, wall - children, wall, self.setup_ticks, teardown, snap);
-            exec.prof.addCteChildTicks(@intCast(@max(wall, 0)));
+            exec.prof.dumpStageDelta(self.id, self.name, res.total_rows, wall - children, wall, self.setup_ticks, teardown, snap);
+            // Charge the parent this stage's SELF wall: the nested runs
+            // below already charged theirs, so a full wall here would
+            // count grandchildren twice at the parent.
+            exec.prof.addCteChildTicks(@intCast(@max(wall - children, 0)));
             if (append_ticks > 0) std.debug.print("[stage-append] stage#{d} copy={d:.1}ms rows={d} contig={}\n", .{
                 self.id, exec.prof.ticksToMs(append_ticks), res.total_rows, self.want_contiguous,
             });
