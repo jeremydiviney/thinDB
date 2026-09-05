@@ -108,7 +108,9 @@ fn waitForBanner(allocator: std.mem.Allocator, io: Io, child: *std.process.Child
     const r = &stdout_reader.interface;
 
     var deadline_iters: usize = 0;
-    while (deadline_iters < 200) : (deadline_iters += 1) {
+    // Bounded by bytes, not time: the banner follows the data-dir and
+    // memory-sizing lines, so allow a few KiB before giving up.
+    while (deadline_iters < 4096) : (deadline_iters += 1) {
         const byte = r.takeByte() catch |err| switch (err) {
             error.EndOfStream => return false,
             else => return err,
