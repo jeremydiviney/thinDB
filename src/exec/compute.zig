@@ -329,6 +329,8 @@ const ChainForward = struct {
             cf.map_views = &.{};
         }
         cf.bind_alloc = alloc;
+        const t_bind = exec.prof.nowTicks();
+        defer exec.prof.addPhase("compute.chain.bind_clones", @intCast(exec.prof.nowTicks() - t_bind));
         const qs = try alloc.alloc(Query, n_chunks);
         errdefer alloc.free(qs);
         const stubs = try alloc.alloc(*SchemaStub, n_chunks);
@@ -378,6 +380,8 @@ const ChainForward = struct {
     }
 
     fn deinitAll(cf: *ChainForward, owner_alloc: Allocator) void {
+        const t_free = exec.prof.nowTicks();
+        defer exec.prof.addPhase("compute.chain.deinit_clones", @intCast(exec.prof.nowTicks() - t_free));
         for (cf.per_chunk, cf.stubs) |*q, st| {
             q.deinit();
             cf.bind_alloc.destroy(st);
