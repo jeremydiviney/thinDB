@@ -1648,6 +1648,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner);
             errdefer left.deinit();
             const right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner);
+            markJoinBuildContiguous(input, j.join_type, left, right);
             const t_join = exec.prof.nowTicks();
             const jq = try left.join(right, joinSpecOf(j, input.force_ordered));
             exec.prof.addPhase("compile.op.join", @intCast(exec.prof.nowTicks() - t_join));
@@ -2209,6 +2210,20 @@ fn columnRefMatchesName(column_name: []const u8, ref_name: []const u8) bool {
     return false;
 }
 
+/// A hash join whose build side is a stage reads the stage's columns in
+/// place and shares one FastTable per key set (Join.bindSharedStageBuild);
+/// that needs the result contiguous, so ask for that layout before the
+/// stage runs. A stage that already ran eagerly just gets copied once.
+fn markJoinBuildContiguous(input: engine_v2.CompileInput, join_type: exec.JoinType, left: exec.Query, right: exec.Query) void {
+    const build = if (exec.Join.buildIsLeft(join_type, left, right)) left else right;
+    var src = (mat_stage.stageBehind(input.allocator, build) catch return) orelse return;
+    defer src.deinit(input.allocator);
+    const stage = src.stage;
+    if (stage.result != null or stage.adopt_window != null or stage.adopt_table_fn != null) return;
+    stage.want_contiguous = true;
+    stage.fill_dop = @max(stage.fill_dop, input.effectiveDop());
+}
+
 fn joinSpecOf(j: anytype, force_ordered: bool) ir.JoinSpec {
     return .{
         .join_type = j.join_type,
@@ -2287,6 +2302,7 @@ fn compileFilteredJoin(
 
     left_owned = false;
     right_owned = false;
+    markJoinBuildContiguous(input, j.join_type, left, right);
     var joined = try left.join(right, joinSpecOf(j, input.force_ordered));
     if (input.win_registry) |reg| {
         if (exec.queryAs(join_mod.Join, joined)) |jop| {

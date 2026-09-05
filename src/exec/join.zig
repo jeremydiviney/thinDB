@@ -44,6 +44,7 @@ const Predicate = predicate.Predicate;
 const transform = @import("../engine/transform.zig");
 
 const cell_io = @import("cell_io.zig");
+const mat_stage = @import("mat_stage.zig");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -64,7 +65,6 @@ fn keyValueAt(v: ColumnView, row: usize) ?types.Value {
     };
 }
 const appendNullTo = cell_io.appendNullTo;
-const appendOneFromBuild = cell_io.appendOneFromBuild;
 const appendOneFromView = cell_io.appendOneFromView;
 
 /// One column-pair equality in the ON clause.
@@ -382,7 +382,7 @@ fn fastKindOfType(t: TypeTag) ?FastKeyKind {
 
 /// Most key columns a compound FastTable carries. More falls back to the
 /// general compound-key hash path (never seen in practice).
-const MAX_FAST_KEYS: usize = 8;
+pub const MAX_FAST_KEYS: usize = 8;
 
 /// Digest one key cell for compound-key slotting: int-family values by
 /// their widened 64-bit pattern, strings by wyhash of the bytes. Only used
@@ -428,7 +428,7 @@ fn compoundRowsEqual(probe_views: []const ColumnView, probe_row: u32, build_view
 /// `heads[slot]` → `next[...]` visits ascending build rows — the same
 /// per-key match order as the general bucket path, keeping output
 /// row order identical between the two probe implementations.
-const FastTable = struct {
+pub const FastTable = struct {
     kind: FastKeyKind,
     /// `heads[slot] == FAST_EMPTY` marks an empty slot; otherwise
     /// `slot_keys[slot]` identifies the key resident there.
@@ -439,12 +439,107 @@ const FastTable = struct {
     /// slot has exactly one row and the array would never be read.
     next: []u32,
     /// View over the build key column, captured after buildPhase
-    /// (build_columns are immutable from then on). Single-key kinds only.
+    /// (build views are immutable from then on). Single-key kinds only.
     build_key_view: ColumnView,
     /// `.compound` only: one view per key column, in `on`-pair order.
     /// Arena-owned; empty for single-key kinds.
     build_key_views: []const ColumnView = &.{},
 };
+
+pub const FastBuild = struct {
+    table: FastTable,
+    keys_unique: bool,
+};
+
+/// Bytes a FastTable over `n` rows occupies, for memory accounting.
+pub fn fastTableBytes(n: usize, needs_chain: bool) usize {
+    const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, n * 2));
+    return cap * (@sizeOf(u64) + @sizeOf(u32)) + (if (needs_chain) n * @sizeOf(u32) else 0);
+}
+
+/// Build the vectorized-probe FastTable over `key_views` (one per join
+/// key, on-pair order, each spanning all `n` build rows) into `aa`.
+/// Null for a key type the fast lanes don't cover (the caller keeps its
+/// general path). Rows insert in descending order so a duplicate chain
+/// walks ascending build rows. `needs_chain` allocates the chain up
+/// front: a FULL join reads it even when every key is unique.
+pub fn buildFastTable(aa: Allocator, key_views: []const ColumnView, n: u32, needs_chain: bool) !?FastBuild {
+    const key_view = key_views[0];
+    const kind: FastKeyKind = if (key_views.len > 1) .compound else switch (key_view.data) {
+        .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
+        .varchar, .string, .char, .json => .string,
+        else => return null,
+    };
+    var owned_key_views: []ColumnView = &.{};
+    if (kind == .compound) owned_key_views = try aa.dupe(ColumnView, key_views);
+
+    const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, @as(usize, n) * 2));
+    const slot_keys = try aa.alloc(u64, cap);
+    const heads = try aa.alloc(u32, cap);
+    @memset(heads, FAST_EMPTY);
+    var chain_next: []u32 = &.{};
+    if (needs_chain) {
+        chain_next = try aa.alloc(u32, n);
+        @memset(chain_next, FAST_EMPTY);
+    }
+    const mask: u64 = cap - 1;
+    var keys_unique = true;
+
+    var row: u32 = n;
+    while (row > 0) {
+        row -= 1;
+        const key = switch (kind) {
+            .int => blk: {
+                if (!key_view.isValid(row)) continue;
+                break :blk fastIntKey(key_view, row);
+            },
+            .string => blk: {
+                if (!key_view.isValid(row)) continue;
+                break :blk std.hash.Wyhash.hash(0, stringRowBytes(key_view, row));
+            },
+            .compound => blk: {
+                if (anyViewNull(owned_key_views, row)) continue;
+                break :blk fastCompoundDigest(owned_key_views, row);
+            },
+        };
+        var slot = (if (kind == .int) fastMix(key) else key) & mask;
+        while (true) {
+            if (heads[slot] == FAST_EMPTY) {
+                slot_keys[slot] = key;
+                heads[slot] = row;
+                break;
+            }
+            if (slot_keys[slot] == key) {
+                // Same key (or same digest, for string/compound kinds —
+                // treated as a duplicate conservatively) already
+                // resident: chains of length > 1 exist, so pass-through
+                // can't assume one match per probe row.
+                keys_unique = false;
+                if (chain_next.len == 0) {
+                    chain_next = try aa.alloc(u32, n);
+                    @memset(chain_next, FAST_EMPTY);
+                }
+                chain_next[row] = heads[slot];
+                heads[slot] = row;
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    return .{
+        .table = .{
+            .kind = kind,
+            .slot_keys = slot_keys,
+            .heads = heads,
+            .mask = mask,
+            .next = chain_next,
+            .build_key_view = key_view,
+            .build_key_views = owned_key_views,
+        },
+        .keys_unique = keys_unique,
+    };
+}
 
 /// murmur3 finalizer — raw int keys need mixing before masking.
 fn fastMix(x0: u64) u64 {
@@ -554,6 +649,10 @@ pub const Join = struct {
 
     /// Materialized build side. One ColumnStore per build-side column.
     build_columns: []ColumnStore,
+    /// One view per build column spanning every build row, set once the
+    /// build is complete: either `build_columns` (drained copy) or a
+    /// stage's own contiguous columns (`bindSharedStageBuild`).
+    build_views: []ColumnView,
     build_rows: u32 = 0,
 
     /// Hash table: compound key bytes → list of row indices into
@@ -849,17 +948,7 @@ pub const Join = struct {
         @memcpy(right_kept_mask_owned, right_kept_mask);
         errdefer allocator.free(right_kept_mask_owned);
 
-        // Build-side selection. INNER + FULL: pick smaller side (less
-        // memory, less hashing). LEFT/RIGHT: build is the NON-preserved
-        // side (the preserved side must be the probe so we walk every
-        // row and know per-row whether a match occurred).
-        const left_stats = left.stats();
-        const right_stats = right.stats();
-        const build_is_left = switch (spec.join_type) {
-            .inner, .full => left_stats.upper_rows <= right_stats.upper_rows,
-            .left => false, // preserve left → probe = left → build = right
-            .right => true, // preserve right → probe = right → build = left
-        };
+        const build_is_left = buildIsLeft(spec.join_type, left, right);
 
         const build_schema = if (build_is_left) left_schema else right_schema;
 
@@ -872,6 +961,8 @@ pub const Join = struct {
             build_columns[i] = try ColumnStore.init(allocator, col.type, col.nullable);
             binited += 1;
         }
+        const build_views = try allocator.alloc(ColumnView, build_schema.len);
+        errdefer allocator.free(build_views);
 
         // Output staging.
         const output_columns = try allocator.alloc(ColumnStore, output_schema.len);
@@ -913,6 +1004,7 @@ pub const Join = struct {
             .right_kept_mask = right_kept_mask_owned,
             .cached_stats = cached_stats,
             .build_columns = build_columns,
+            .build_views = build_views,
             .hash_table = .empty,
             .key_scratch = .empty,
             .output_columns = output_columns,
@@ -996,7 +1088,19 @@ pub const Join = struct {
         return q;
     }
 
+    /// Which input a hash join materializes: the preserved side of an outer
+    /// join must stream (probe), and an inner / full join builds the side
+    /// with the smaller row bound.
+    pub fn buildIsLeft(join_type: JoinType, left: Query, right: Query) bool {
+        return switch (join_type) {
+            .inner, .full => left.stats().upper_rows <= right.stats().upper_rows,
+            .left => false,
+            .right => true,
+        };
+    }
+
     pub fn deinit(self: *Join) void {
+        self.allocator.free(self.build_views);
         if (self.transferred_to_skew) {
             // skew_smj owns left, right, and build_columns. Calling
             // its deinit cascades to those resources.
@@ -1328,11 +1432,11 @@ pub const Join = struct {
         keys: for (build_names, probe_names) |bname, pname| {
             const bci = columnIndex(build_schema, bname) orelse continue;
             const pci = columnIndex(probe_schema, pname) orelse continue;
-            if (bci >= self.build_columns.len) continue;
+            if (bci >= self.build_views.len) continue;
             // Mismatched physical types would make the Value comparison in
             // predicate eval subtly wrong — only prune same-typed keys.
             if (!std.meta.eql(build_schema[bci].type, probe_schema[pci].type)) continue;
-            const view = self.build_columns[bci].view();
+            const view = self.build_views[bci];
             var mn: ?types.Value = null;
             var mx: ?types.Value = null;
             var row: usize = 0;
@@ -1353,6 +1457,7 @@ pub const Join = struct {
     }
 
     fn buildPhase(self: *Join) !void {
+        if (try self.bindSharedStageBuild()) return;
         var up = if (self.build_is_left) &self.left else &self.right;
         const key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
         const acc = up.accountant();
@@ -1424,6 +1529,7 @@ pub const Join = struct {
             }
             self.build_rows += @intCast(n);
         }
+        for (self.build_columns, self.build_views) |*c, *v| v.* = c.view();
 
         // After build, check skew via two-gate AND:
         //   ratio:    top_freq / observed_total >= skew_ratio_threshold
@@ -1456,91 +1562,75 @@ pub const Join = struct {
         try self.tryBuildFastTable();
     }
 
+    /// A build side that is a materialized stage (seen through alias and
+    /// column-projection wrappers) is read in place: the stage's contiguous
+    /// columns become the build views and its FastTable for this key set is
+    /// built once and shared with every other join over the same stage —
+    /// a query tail commonly joins one CTE several times on the same keys.
+    /// Declines when the join isn't fast-eligible or the skew route (which
+    /// hands a private build copy to a sort-merge join) is armed.
+    fn bindSharedStageBuild(self: *Join) !bool {
+        if (!self.fast_eligible or self.skew_smj != null) return false;
+        if (self.skew_detector != null and self.join_type == .inner) return false;
+        const build_q = if (self.build_is_left) self.left else self.right;
+        var src = (try mat_stage.stageBehind(self.allocator, build_q)) orelse {
+            if (getenv("THINDB_TRACE_JOINFUSE") != null) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(std.heap.page_allocator);
+                build_q.explain(&buf, std.heap.page_allocator, 0) catch {};
+                var it = std.mem.splitScalar(u8, buf.items, '\n');
+                var depth: usize = 0;
+                std.debug.print("[jf] shared build declined: no stage behind the build side:\n", .{});
+                while (it.next()) |line| : (depth += 1) {
+                    if (depth >= 8 or line.len == 0) break;
+                    std.debug.print("[jf]     build: {s}\n", .{std.mem.trim(u8, line, " ")});
+                }
+            }
+            return false;
+        };
+        defer src.deinit(self.allocator);
+        const key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
+        var keys: [MAX_FAST_KEYS]mat_stage.KeySpec = undefined;
+        for (key_indices, 0..) |ki, i| keys[i] = .{ .col = src.map[ki], .cast = src.casts[ki] };
+        var casts: [mat_stage.MAX_STAGE_CASTS]mat_stage.ColumnCast = undefined;
+        var ncasts: usize = 0;
+        for (src.map, src.casts) |col, slot_cast| {
+            const fn_name = slot_cast orelse continue;
+            const spec: mat_stage.ColumnCast = .{ .col = col, .fn_name = fn_name };
+            var seen = false;
+            for (casts[0..ncasts]) |c| {
+                if (c.eql(spec)) seen = true;
+            }
+            if (seen) continue;
+            if (ncasts == casts.len) return false;
+            casts[ncasts] = spec;
+            ncasts += 1;
+        }
+        const shared = (try src.stage.sharedJoinBuild(keys[0..key_indices.len], casts[0..ncasts], self.join_type == .full)) orelse return false;
+        for (self.build_views, src.map, src.casts) |*v, col, slot_cast| v.* = shared.viewFor(col, slot_cast);
+        self.build_rows = shared.rows;
+        self.fast_table = shared.table;
+        self.build_keys_unique = shared.keys_unique;
+        if (getenv("THINDB_TRACE_JOINFUSE") != null) {
+            std.debug.print("[jf] shared stage build stage#{d} rows={d} keys={d} casts={d}\n", .{ src.stage.id, shared.rows, key_indices.len, ncasts });
+        }
+        return true;
+    }
+
     /// Build the vectorized-probe FastTable when the join shape
-    /// qualifies: exactly one join key, int-family or string type,
-    /// no range predicates, not skew-routed. Float/decimal/uuid keys
-    /// stay on the general path (rare in practice; float bit-equality
-    /// vs compound-key bit-equality is the same, but not worth a lane).
+    /// qualifies: int-family or string keys, no range predicates, not
+    /// skew-routed. Float/decimal/uuid keys stay on the general path
+    /// (rare in practice; float bit-equality vs compound-key bit-equality
+    /// is the same, but not worth a lane).
     fn tryBuildFastTable(self: *Join) !void {
         if (self.skew_smj != null) return;
         if (!self.fast_eligible) return;
-        const aa = self.arena.allocator();
         const build_key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
-        const key_view = self.build_columns[build_key_indices[0]].view();
-        const kind: FastKeyKind = if (build_key_indices.len > 1) .compound else switch (key_view.data) {
-            .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
-            .varchar, .string, .char, .json => .string,
-            else => return,
-        };
-        var key_views: []ColumnView = &.{};
-        if (kind == .compound) {
-            key_views = try aa.alloc(ColumnView, build_key_indices.len);
-            for (build_key_indices, key_views) |ki, *v| v.* = self.build_columns[ki].view();
-        }
-
-        const n: usize = self.build_rows;
-        const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, n * 2));
-        const slot_keys = try aa.alloc(u64, cap);
-        const heads = try aa.alloc(u32, cap);
-        @memset(heads, FAST_EMPTY);
-        var chain_next: []u32 = &.{};
-        if (self.join_type == .full) {
-            chain_next = try aa.alloc(u32, n);
-            @memset(chain_next, FAST_EMPTY);
-        }
-        const mask: u64 = cap - 1;
-
-        var row: u32 = @intCast(n);
-        while (row > 0) {
-            row -= 1;
-            const key = switch (kind) {
-                .int => blk: {
-                    if (!key_view.isValid(row)) continue;
-                    break :blk fastIntKey(key_view, row);
-                },
-                .string => blk: {
-                    if (!key_view.isValid(row)) continue;
-                    break :blk std.hash.Wyhash.hash(0, stringRowBytes(key_view, row));
-                },
-                .compound => blk: {
-                    if (anyViewNull(key_views, row)) continue;
-                    break :blk fastCompoundDigest(key_views, row);
-                },
-            };
-            var slot = (if (kind == .int) fastMix(key) else key) & mask;
-            while (true) {
-                if (heads[slot] == FAST_EMPTY) {
-                    slot_keys[slot] = key;
-                    heads[slot] = row;
-                    break;
-                }
-                if (slot_keys[slot] == key) {
-                    // Same key (or same digest, for string/compound kinds —
-                    // treated as a duplicate conservatively) already
-                    // resident: chains of length > 1 exist, so pass-through
-                    // can't assume one match per probe row.
-                    self.build_keys_unique = false;
-                    if (chain_next.len == 0) {
-                        chain_next = try aa.alloc(u32, n);
-                        @memset(chain_next, FAST_EMPTY);
-                    }
-                    chain_next[row] = heads[slot];
-                    heads[slot] = row;
-                    break;
-                }
-                slot = (slot + 1) & mask;
-            }
-        }
-
-        self.fast_table = .{
-            .kind = kind,
-            .slot_keys = slot_keys,
-            .heads = heads,
-            .mask = mask,
-            .next = chain_next,
-            .build_key_view = key_view,
-            .build_key_views = key_views,
-        };
+        var key_views: [MAX_FAST_KEYS]ColumnView = undefined;
+        for (build_key_indices, 0..) |ki, i| key_views[i] = self.build_views[ki];
+        const built = (try buildFastTable(self.arena.allocator(), key_views[0..build_key_indices.len], self.build_rows, self.join_type == .full)) orelse return;
+        self.fast_table = built.table;
+        if (!built.keys_unique) self.build_keys_unique = false;
     }
 
     fn routeToSmjOnSkew(self: *Join) !void {
@@ -1775,7 +1865,7 @@ pub const Join = struct {
         if (self.build_is_left) {
             var i: usize = 0;
             while (i < left_count) : (i += 1) {
-                try gatherBuildColumn(alloc, self.build_columns[i].view(), build_rows, &out_cols[out_idx]);
+                try gatherBuildColumn(alloc, self.build_views[i], build_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
             for (batch.values, 0..) |v, idx2| {
@@ -1789,9 +1879,9 @@ pub const Join = struct {
                 try transform.appendByIndices(alloc, batch.values[i], probe_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
-            for (self.build_columns, 0..) |*bc, idx2| {
+            for (self.build_views, 0..) |bv, idx2| {
                 if (!self.right_kept_mask[idx2]) continue;
-                try gatherBuildColumn(alloc, bc.view(), build_rows, &out_cols[out_idx]);
+                try gatherBuildColumn(alloc, bv, build_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
         }
@@ -2003,7 +2093,7 @@ pub const Join = struct {
             while (i < left_count) : (i += 1) {
                 const store = &out_cols[out_idx];
                 store.clear();
-                try gatherBuildColumn(alloc, self.build_columns[i].view(), rows, store);
+                try gatherBuildColumn(alloc, self.build_views[i], rows, store);
                 out_views[out_idx] = store.view();
                 out_idx += 1;
             }
@@ -2018,11 +2108,11 @@ pub const Join = struct {
                 out_views[out_idx] = batch.values[i];
                 out_idx += 1;
             }
-            for (self.build_columns, 0..) |*bc, idx2| {
+            for (self.build_views, 0..) |bv, idx2| {
                 if (!self.right_kept_mask[idx2]) continue;
                 const store = &out_cols[out_idx];
                 store.clear();
-                try gatherBuildColumn(alloc, bc.view(), rows, store);
+                try gatherBuildColumn(alloc, bv, rows, store);
                 out_views[out_idx] = store.view();
                 out_idx += 1;
             }
@@ -2254,7 +2344,7 @@ pub const Join = struct {
                 // Left side = build. All build columns are left.
                 var i: usize = 0;
                 while (i < left_count) : (i += 1) {
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], &self.build_columns[i], build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], self.build_views[i], build_row);
                     out_idx += 1;
                 }
             } else {
@@ -2276,9 +2366,9 @@ pub const Join = struct {
                 }
             } else {
                 // Right side = build. Skip right-key columns.
-                for (self.build_columns, 0..) |*bc, i| {
+                for (self.build_views, 0..) |bv, i| {
                     if (!self.right_kept_mask[i]) continue;
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], bc, build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], bv, build_row);
                     out_idx += 1;
                 }
             }
@@ -2313,13 +2403,13 @@ pub const Join = struct {
     fn passesAllRanges(self: Join, batch: Batch, probe_row: u32, build_row: u32) bool {
         for (self.ranges) |rg| {
             const left_view: ColumnView = if (self.build_is_left)
-                self.build_columns[rg.left_col].view()
+                self.build_views[rg.left_col]
             else
                 batch.values[rg.left_col];
             const right_view: ColumnView = if (self.build_is_left)
                 batch.values[rg.right_col]
             else
-                self.build_columns[rg.right_col].view();
+                self.build_views[rg.right_col];
             const lrow: u32 = if (self.build_is_left) build_row else probe_row;
             const rrow: u32 = if (self.build_is_left) probe_row else build_row;
             if (!compareCellsOp(left_view, lrow, right_view, rrow, rg.op)) return false;
@@ -2434,7 +2524,7 @@ pub const Join = struct {
                 // right cols NULL (skipping dropped right-key cols).
                 var i: usize = 0;
                 while (i < left_count) : (i += 1) {
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], &self.build_columns[i], build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], self.build_views[i], build_row);
                     out_idx += 1;
                 }
                 for (self.right_kept_mask) |kept| {
@@ -2450,9 +2540,9 @@ pub const Join = struct {
                     try appendNullTo(self.allocator, &self.output_columns[out_idx]);
                     out_idx += 1;
                 }
-                for (self.build_columns, 0..) |*bc, idx2| {
+                for (self.build_views, 0..) |bv, idx2| {
                     if (!self.right_kept_mask[idx2]) continue;
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], bc, build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], bv, build_row);
                     out_idx += 1;
                 }
             }

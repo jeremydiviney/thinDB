@@ -30,6 +30,8 @@ const Allocator = std.mem.Allocator;
 const exec = @import("exec.zig");
 const window_mod = @import("window.zig");
 const table_fn_mod = @import("table_fn.zig");
+const join_mod = @import("join.zig");
+const project_limit = @import("project_limit.zig");
 const types = @import("../types.zig");
 const engine = @import("../engine/engine.zig");
 const storage = @import("../storage/storage.zig");
@@ -63,6 +65,10 @@ pub const MaterializedResult = struct {
     /// The slice-key column name when this result was slice-adopted (chunks
     /// carry key ranges); readers validate their skip column against it.
     sliced_key: ?[]const u8 = null,
+    /// Hash-join builds over this result, one per distinct key set, shared
+    /// by every join that binds the stage as its build side. Freed with
+    /// the chunks they view.
+    join_builds: std.ArrayListUnmanaged(SharedJoinBuild) = .empty,
 
     /// Ownership record for adopted contiguous columns: entries flagged in
     /// `arena_backed` are reclaimed wholesale by sweeping `arenas`; the
@@ -315,7 +321,42 @@ pub const MaterializedResult = struct {
         };
     }
 
+    /// One view per column spanning every row, presented as the schema
+    /// types. Adopted results and single-chunk pull copies are contiguous
+    /// already; anything else is concatenated once into `copies`
+    /// (owned by the result's allocator, freed by the caller).
+    fn contiguousViews(self: *MaterializedResult, views: []ColumnView, copies: *[]engine.ColumnStore) !void {
+        if (self.adopted) |ad| {
+            if (ad.stores.len == self.schema.len) {
+                for (ad.stores, self.schema, views) |*st, sc, *v| v.* = presentAsSchemaType(st.view(), sc.type);
+                return;
+            }
+        } else if (self.chunks.items.len == 1 and self.chunks.items[0].cols.len == self.schema.len) {
+            for (self.chunks.items[0].cols, views) |*col, *v| v.* = col.view();
+            return;
+        }
+        const stores = try self.allocator.alloc(engine.ColumnStore, self.schema.len);
+        errdefer self.allocator.free(stores);
+        var inited: usize = 0;
+        errdefer for (stores[0..inited]) |*st| st.deinit(self.allocator);
+        for (self.schema, stores) |sc, *st| {
+            st.* = try engine.ColumnStore.init(self.allocator, sc.type, sc.nullable);
+            inited += 1;
+        }
+        for (self.chunks.items) |c| {
+            if (c.rows == 0) continue;
+            for (stores, 0..) |*st, i| {
+                const src = if (c.views.len > 0) c.views[i] else c.cols[i].view();
+                try engine.transform.appendAllColumn(self.allocator, src, st);
+            }
+        }
+        for (stores, views) |*st, *v| v.* = st.view();
+        copies.* = stores;
+    }
+
     fn deinitChunks(self: *MaterializedResult) void {
+        for (self.join_builds.items) |*jb| jb.deinit(self.allocator);
+        self.join_builds.deinit(self.allocator);
         for (self.chunks.items) |*c| {
             for (c.cols) |*col| col.deinit(self.allocator);
             if (c.cols.len > 0) self.allocator.free(c.cols);
@@ -334,6 +375,213 @@ pub const MaterializedResult = struct {
         }
     }
 };
+
+/// A hash-join build over a stage result: contiguous column views plus
+/// the FastTable for one key set. Built once by the first join that
+/// binds the stage with these keys; later joins with the same keys reuse
+/// it (`Stage.sharedJoinBuild`).
+pub const SharedJoinBuild = struct {
+    keys: []const KeySpec,
+    casts: []const ColumnCast,
+    needs_chain: bool,
+    arena: std.heap.ArenaAllocator,
+    /// Concatenated copy of a chunked result; empty when the result was
+    /// contiguous and the views borrow it directly.
+    copies: []engine.ColumnStore,
+    /// One store per entry of `casts`, holding that cast's full-column output.
+    cast_stores: []engine.ColumnStore,
+    views: []ColumnView,
+    rows: u32,
+    table: join_mod.FastTable,
+    keys_unique: bool,
+
+    fn matches(self: *const SharedJoinBuild, keys: []const KeySpec, casts: []const ColumnCast, needs_chain: bool) bool {
+        if (self.needs_chain != needs_chain or self.keys.len != keys.len or self.casts.len != casts.len) return false;
+        for (self.keys, keys) |a, b| if (!a.eql(b)) return false;
+        for (self.casts, casts) |a, b| if (!a.eql(b)) return false;
+        return true;
+    }
+
+    /// The view a slot reading stage column `col` under `cast` sees. Every
+    /// cast a consumer asks for is in `casts` (it matched or built this).
+    pub fn viewFor(self: *const SharedJoinBuild, col: usize, cast: ?[]const u8) ColumnView {
+        const fn_name = cast orelse return self.views[col];
+        for (self.casts, self.cast_stores) |c, *st| {
+            if (c.col == col and std.ascii.eqlIgnoreCase(c.fn_name, fn_name)) return st.view();
+        }
+        unreachable;
+    }
+
+    fn deinit(self: *SharedJoinBuild, allocator: Allocator) void {
+        for (self.copies) |*c| c.deinit(allocator);
+        if (self.copies.len > 0) allocator.free(self.copies);
+        for (self.cast_stores) |*c| c.deinit(allocator);
+        if (self.cast_stores.len > 0) allocator.free(self.cast_stores);
+        self.arena.deinit();
+    }
+};
+
+/// One join key over a stage: the stage column and the same-named cast
+/// (a `to_*` function name) the build side applies to it, if any.
+pub const KeySpec = struct {
+    col: usize,
+    cast: ?[]const u8,
+
+    pub fn eql(a: KeySpec, b: KeySpec) bool {
+        if (a.col != b.col) return false;
+        const ac = a.cast orelse return b.cast == null;
+        const bc = b.cast orelse return false;
+        return std.ascii.eqlIgnoreCase(ac, bc);
+    }
+};
+
+/// A same-named single-column cast a Compute lays over the stage's
+/// output: slot `col` (a stage column index) reads `fn_name` of that
+/// column. Join-key type coercion puts one above a build side.
+pub const ColumnCast = struct {
+    col: usize,
+    fn_name: []const u8,
+
+    pub fn eql(a: ColumnCast, b: ColumnCast) bool {
+        return a.col == b.col and std.ascii.eqlIgnoreCase(a.fn_name, b.fn_name);
+    }
+};
+
+pub const MAX_STAGE_CASTS: usize = 8;
+
+/// Evaluate `fn_name(src)` over every row of one stage column through the
+/// overload a Compute would pick, into a store owned by `allocator`. Null
+/// when the overload isn't a plain null-propagating kernel (the join then
+/// keeps its own build).
+fn castStageColumn(
+    allocator: Allocator,
+    aa: Allocator,
+    fn_name: []const u8,
+    src: ColumnView,
+    src_type: types.Type,
+    rows: usize,
+) !?engine.ColumnStore {
+    const ov = (try exec.scalar_fn.resolve(aa, fn_name, &.{src_type})) orelse return null;
+    if (ov.func.null_strategy != .propagates or ov.func.udf_kernel != null) return null;
+    var arg = src;
+    var arg_buf: ?engine.ColumnStore = null;
+    defer if (arg_buf) |*b| b.deinit(allocator);
+    if (ov.arg_casts) |ac| {
+        if (ac[0]) |k| {
+            arg_buf = try engine.ColumnStore.init(allocator, ov.func.arg_types[0], true);
+            var one = [_]ColumnView{src};
+            try k(allocator, &one, &arg_buf.?, rows);
+            arg = arg_buf.?.view();
+        }
+    }
+    var out = try engine.ColumnStore.init(allocator, ov.func.return_type, true);
+    errdefer out.deinit(allocator);
+    var args = [_]ColumnView{arg};
+    if (ov.func.typed_kernel) |tk| {
+        try tk(allocator, &.{src_type}, ov.func.return_type, &args, &out, rows);
+    } else if (ov.func.kernel) |k| {
+        try k(allocator, &args, &out, rows);
+    } else return null;
+    try out.appendValidityRange(allocator, 0, arg.nulls, rows);
+    return out;
+}
+
+/// The stage a query reads, seen through its wrappers, with what each of
+/// the query's output slots reads from it.
+pub const StageSource = struct {
+    stage: *Stage,
+    /// Per output slot: the stage column it reads.
+    map: []usize,
+    /// Per output slot: the same-named `to_*` cast applied over it, or null.
+    casts: []?[]const u8,
+
+    pub fn deinit(self: *StageSource, allocator: Allocator) void {
+        allocator.free(self.map);
+        allocator.free(self.casts);
+    }
+};
+
+/// Peel `q_in` down to the stage it reads through AliasRename, a column
+/// Project and Computes that only rename (a `col_ref` derived — the
+/// parser's hidden `__join_on_*` key columns) or cast a slot in place
+/// (`to_*(slot)` — join-key type coercion). Null for anything else, a
+/// probe-fused wrapper, or a MatScan with a slice-skip hint (it doesn't
+/// read every chunk).
+pub fn stageBehind(allocator: Allocator, q_in: exec.Query) !?StageSource {
+    const n = q_in.outputSchema().len;
+    const map = try allocator.alloc(usize, n);
+    errdefer allocator.free(map);
+    for (map, 0..) |*m, i| m.* = i;
+    const casts = try allocator.alloc(?[]const u8, n);
+    errdefer allocator.free(casts);
+    @memset(casts, null);
+    var q = q_in;
+    const stage: ?*Stage = while (true) {
+        if (exec.queryAs(MatScan, q)) |ms| {
+            if (ms.skip_col != null) break null;
+            break ms.stage;
+        }
+        if (exec.queryAs(exec.AliasRename, q)) |ar| {
+            if (ar.probe_fused) break null;
+            q = ar.upstream;
+            continue;
+        }
+        if (exec.queryAs(project_limit.Project, q)) |p| {
+            if (p.probe_fused) break null;
+            for (map) |*m| m.* = p.column_map[m.*];
+            q = p.upstream;
+            continue;
+        }
+        if (exec.queryAs(exec.Compute, q)) |c| {
+            if (c.chain != null) break null;
+            if (!peelComputeSlots(c, map, casts)) break null;
+            q = c.upstream;
+            continue;
+        }
+        break null;
+    };
+    const st = stage orelse {
+        allocator.free(map);
+        allocator.free(casts);
+        return null;
+    };
+    return .{ .stage = st, .map = map, .casts = casts };
+}
+
+/// Rewrite `map`/`casts` (in `c`'s output space) into `c`'s upstream space.
+/// False when a slot reads anything but a rename or an in-place `to_*` cast.
+fn peelComputeSlots(c: *const exec.Compute, map: []usize, casts: []?[]const u8) bool {
+    for (map, casts) |*m, *cast| {
+        const k = derivedIndexAt(c, m.*) orelse continue;
+        switch (c.derived[k].kind) {
+            .rename => |rn| m.* = rn.src_idx,
+            .call => {
+                if (cast.* != null or c.udf_registry != null) return false;
+                const call = switch (c.derived_ir[k].expr) {
+                    .call => |cl| cl,
+                    else => return false,
+                };
+                if (call.args.len != 1 or !std.ascii.startsWithIgnoreCase(call.fn_name, "to_")) return false;
+                const arg = switch (call.args[0]) {
+                    .col_ref => |name| name,
+                    else => return false,
+                };
+                if (!types.columnNameEql(arg, c.derived_ir[k].name)) return false;
+                if (m.* >= c.upstream.outputSchema().len) return false;
+                cast.* = call.fn_name;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn derivedIndexAt(c: *const exec.Compute, out_idx: usize) ?usize {
+    for (c.derived_output_indices, 0..) |oi, k| {
+        if (oi == out_idx) return k;
+    }
+    return null;
+}
 
 /// Accumulates a stage's pull-copied result as ONE contiguous store per
 /// column (adopted-style; per-column arenas so the sweep-free ownership
@@ -429,6 +677,10 @@ pub const Stage = struct {
     /// memory, never touches accounting.
     accountant: ?*exec.memory.MemoryAccountant = null,
     reserved_bytes: usize = 0,
+    /// FastTable bytes reserved for shared join builds (released with the
+    /// result, under the join-build category).
+    join_build_reserved: usize = 0,
+    join_build_lock: std.atomic.Mutex = .unlocked,
     /// Compile-order index in the StageSet — a stable label for `--profile-ops`
     /// per-CTE timing (`[cte]` lines), nothing more.
     id: usize = 0,
@@ -708,9 +960,85 @@ pub const Stage = struct {
     }
 
     fn releaseReserved(self: *Stage) void {
-        if (self.reserved_bytes == 0) return;
-        if (self.accountant) |acct| acct.release(.materialize, self.reserved_bytes);
+        if (self.accountant) |acct| {
+            if (self.reserved_bytes > 0) acct.release(.materialize, self.reserved_bytes);
+            if (self.join_build_reserved > 0) acct.release(.join_build, self.join_build_reserved);
+        }
         self.reserved_bytes = 0;
+        self.join_build_reserved = 0;
+    }
+
+    /// The hash-join build over this stage's result for `keys` (stage
+    /// columns with their casts, in join-pair order), with every cast in
+    /// `casts` evaluated once over its column; built on first request and
+    /// shared afterwards. `needs_chain` distinguishes a FULL join's table.
+    /// Runs the stage if it hasn't run. Null when the key types have no
+    /// fast lane or a cast has no plain kernel (the join keeps its own
+    /// general build).
+    pub fn sharedJoinBuild(self: *Stage, keys: []const KeySpec, casts: []const ColumnCast, needs_chain: bool) !?SharedJoinBuild {
+        try self.ensureRun();
+        const res = self.result orelse return null;
+        if (res.total_rows > std.math.maxInt(u32)) return null;
+        while (!self.join_build_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.join_build_lock.unlock();
+        for (res.join_builds.items) |*jb| {
+            if (jb.matches(keys, casts, needs_chain)) return jb.*;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const aa = arena.allocator();
+        const views = try aa.alloc(ColumnView, res.schema.len);
+        var copies: []engine.ColumnStore = &.{};
+        try res.contiguousViews(views, &copies);
+        errdefer {
+            for (copies) |*c| c.deinit(self.allocator);
+            if (copies.len > 0) self.allocator.free(copies);
+        }
+        const rows: u32 = @intCast(res.total_rows);
+        var cast_stores: []engine.ColumnStore = &.{};
+        if (casts.len > 0) cast_stores = try self.allocator.alloc(engine.ColumnStore, casts.len);
+        var casts_done: usize = 0;
+        errdefer {
+            for (cast_stores[0..casts_done]) |*c| c.deinit(self.allocator);
+            if (cast_stores.len > 0) self.allocator.free(cast_stores);
+        }
+        for (casts, 0..) |cst, i| {
+            if (cst.col >= res.schema.len) return null;
+            cast_stores[i] = (try castStageColumn(self.allocator, aa, cst.fn_name, views[cst.col], res.schema[cst.col].type, rows)) orelse return null;
+            casts_done += 1;
+        }
+        var key_views: [join_mod.MAX_FAST_KEYS]ColumnView = undefined;
+        for (keys, 0..) |k, i| {
+            key_views[i] = if (k.cast) |fn_name| blk: {
+                for (casts, cast_stores) |c, *st| {
+                    if (c.col == k.col and std.ascii.eqlIgnoreCase(c.fn_name, fn_name)) break :blk st.view();
+                }
+                return null;
+            } else views[k.col];
+        }
+        const bytes = join_mod.fastTableBytes(rows, needs_chain);
+        if (self.accountant) |acct| try acct.reserve(.join_build, bytes);
+        errdefer if (self.accountant) |acct| acct.release(.join_build, bytes);
+        const built = (try join_mod.buildFastTable(aa, key_views[0..keys.len], rows, needs_chain)) orelse return null;
+        self.join_build_reserved += bytes;
+        const owned_casts = try aa.alloc(ColumnCast, casts.len);
+        for (casts, owned_casts) |c, *o| o.* = .{ .col = c.col, .fn_name = try aa.dupe(u8, c.fn_name) };
+        const owned_keys = try aa.alloc(KeySpec, keys.len);
+        for (keys, owned_keys) |k, *o| o.* = .{ .col = k.col, .cast = if (k.cast) |f| try aa.dupe(u8, f) else null };
+        const jb: SharedJoinBuild = .{
+            .keys = owned_keys,
+            .casts = owned_casts,
+            .needs_chain = needs_chain,
+            .arena = arena,
+            .copies = copies,
+            .cast_stores = cast_stores,
+            .views = views,
+            .rows = rows,
+            .table = built.table,
+            .keys_unique = built.keys_unique,
+        };
+        try res.join_builds.append(self.allocator, jb);
+        return jb;
     }
 
     /// Register a consumer at compile time — parity with `MatScan.create`'s
