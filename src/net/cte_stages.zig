@@ -2216,7 +2216,7 @@ fn columnRefMatchesName(column_name: []const u8, ref_name: []const u8) bool {
 /// stage runs. A stage that already ran eagerly just gets copied once.
 fn markJoinBuildContiguous(input: engine_v2.CompileInput, join_type: exec.JoinType, left: exec.Query, right: exec.Query) void {
     const build = if (exec.Join.buildIsLeft(join_type, left, right)) left else right;
-    var src = (mat_stage.stageBehind(input.allocator, build) catch return) orelse return;
+    var src = (mat_stage.stageBehind(input.allocator, build, null) catch return) orelse return;
     defer src.deinit(input.allocator);
     const stage = src.stage;
     if (stage.result != null or stage.adopt_window != null or stage.adopt_table_fn != null) return;

@@ -1707,14 +1707,15 @@ pub const Join = struct {
         if (!self.fast_eligible or self.skew_smj != null) return false;
         if (self.skew_detector != null and self.join_type == .inner) return false;
         const build_q = if (self.build_is_left) self.left else self.right;
-        var src = (try mat_stage.stageBehind(self.allocator, build_q)) orelse {
+        var why: []const u8 = "";
+        var src = (try mat_stage.stageBehind(self.allocator, build_q, &why)) orelse {
             if (getenv("THINDB_TRACE_JOINFUSE") != null) {
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(std.heap.page_allocator);
                 build_q.explain(&buf, std.heap.page_allocator, 0) catch {};
                 var it = std.mem.splitScalar(u8, buf.items, '\n');
                 var depth: usize = 0;
-                std.debug.print("[jf] shared build declined: no stage behind the build side:\n", .{});
+                std.debug.print("[jf] shared build declined ({s}):\n", .{why});
                 while (it.next()) |line| : (depth += 1) {
                     if (depth >= 8 or line.len == 0) break;
                     std.debug.print("[jf]     build: {s}\n", .{std.mem.trim(u8, line, " ")});

@@ -3422,6 +3422,54 @@ test "sql: FULL join whose build side is a shared CTE stage drains unmatched bui
     try std.testing.expectEqual(@as(i64, 71), b.values[3].data.bigint[0]);
 }
 
+// At DOP > 1 the CTE is read by a parallel buffer scan and the key cast
+// above it is self-pushed into that scan's workers (a terminal chain); the
+// shared build still sees through it to the stage columns.
+test "sql: shared CTE stage build sees through a self-pushed key cast at DOP > 1" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seedRefAndT(allocator, db);
+    for ([_][]const u8{
+        "CREATE TABLE tb (p BIGINT, k VARCHAR(8), m INT) ORDER BY (p, k, m)",
+        "INSERT INTO tb VALUES (1, 'a', 2), (1, 'b', 2), (2, 'a', 1), (3, 'c', 1), (2, 'b', 3)",
+    }) |stmt| {
+        var q0 = try runSql(allocator, db, stmt);
+        defer q0.deinit();
+        _ = try q0.next();
+    }
+
+    var q = try runSql(allocator, db,
+        \\WITH ref_m AS (SELECT p, k, m, v FROM ref)
+        \\SELECT tb.p, tb.k, cur.v AS cur_v, prev.v AS prev_v, again.v AS again_v
+        \\FROM tb
+        \\LEFT JOIN ref_m cur ON cur.p = tb.p AND cur.k = tb.k AND cur.m = tb.m
+        \\LEFT JOIN ref_m prev ON prev.p = tb.p AND prev.k = tb.k AND prev.m = tb.m - 1
+        \\LEFT JOIN ref_m again ON again.p = tb.p AND again.k = tb.k AND again.m = tb.m
+        \\ORDER BY tb.p, tb.k
+    );
+    defer q.deinit();
+    var cur: std.ArrayList(?i32) = .empty;
+    defer cur.deinit(allocator);
+    var prev: std.ArrayList(?i32) = .empty;
+    defer prev.deinit(allocator);
+    var again: std.ArrayList(?i32) = .empty;
+    defer again.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            try cur.append(allocator, if (b.values[2].isValid(i)) b.values[2].data.int[i] else null);
+            try prev.append(allocator, if (b.values[3].isValid(i)) b.values[3].data.int[i] else null);
+            try again.append(allocator, if (b.values[4].isValid(i)) b.values[4].data.int[i] else null);
+        }
+    }
+    try std.testing.expectEqualSlices(?i32, &[_]?i32{ 11, null, 30, null, null }, cur.items);
+    try std.testing.expectEqualSlices(?i32, &[_]?i32{ 10, 20, null, null, null }, prev.items);
+    try std.testing.expectEqualSlices(?i32, &[_]?i32{ 11, null, 30, null, null }, again.items);
+}
+
 // A BIGINT probe key against the CTE's INT key puts a to_bigint cast
 // above the build side; the shared build applies that cast to the stage
 // column once and both joins read it.

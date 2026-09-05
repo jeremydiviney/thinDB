@@ -507,7 +507,9 @@ pub const StageSource = struct {
 /// (`to_*(slot)` — join-key type coercion). Null for anything else, a
 /// probe-fused wrapper, or a MatScan with a slice-skip hint (it doesn't
 /// read every chunk).
-pub fn stageBehind(allocator: Allocator, q_in: exec.Query) !?StageSource {
+/// `reason`, when given, names the operator that stopped the peel on a null
+/// return (join-fusion trace).
+pub fn stageBehind(allocator: Allocator, q_in: exec.Query, reason: ?*[]const u8) !?StageSource {
     const n = q_in.outputSchema().len;
     const map = try allocator.alloc(usize, n);
     errdefer allocator.free(map);
@@ -516,29 +518,40 @@ pub fn stageBehind(allocator: Allocator, q_in: exec.Query) !?StageSource {
     errdefer allocator.free(casts);
     @memset(casts, null);
     var q = q_in;
+    // A Compute whose evaluation was self-pushed into the scan's workers
+    // (a terminal chain) still maps its slots the same way; the scan then
+    // checks that the sink it carries is exactly that chain.
+    var terminal_chain: ?*anyopaque = null;
     const stage: ?*Stage = while (true) {
         if (exec.queryAs(MatScan, q)) |ms| {
-            if (ms.skip_col != null) break null;
+            if (ms.skip_col != null) break declined(reason, "MatScan with a slice-range skip");
             break ms.stage;
         }
+        if (exec.queryAs(exec.ParallelScan, q)) |ps| {
+            break ps.plainStageSource(map, terminal_chain) orelse declined(reason, "ParallelScan already started or carrying fused/pending work");
+        }
         if (exec.queryAs(exec.AliasRename, q)) |ar| {
-            if (ar.probe_fused) break null;
+            if (ar.probe_fused and terminal_chain == null) break declined(reason, "AliasRename with a fused probe");
             q = ar.upstream;
             continue;
         }
         if (exec.queryAs(project_limit.Project, q)) |p| {
-            if (p.probe_fused) break null;
+            if (p.probe_fused) break declined(reason, "Project with a fused probe");
             for (map) |*m| m.* = p.column_map[m.*];
             q = p.upstream;
             continue;
         }
         if (exec.queryAs(exec.Compute, q)) |c| {
-            if (c.chain != null) break null;
-            if (!peelComputeSlots(c, map, casts)) break null;
+            if (c.chain) |cf| {
+                if (cf.inner != null) break declined(reason, "Compute chained under a join's probe");
+                if (terminal_chain != null) break declined(reason, "stacked self-pushed Computes");
+                terminal_chain = cf;
+            }
+            if (!peelComputeSlots(c, map, casts)) break declined(reason, "Compute deriving more than renames / in-place casts");
             q = c.upstream;
             continue;
         }
-        break null;
+        break declined(reason, "operator is not a stage read, alias, projection or compute");
     };
     const st = stage orelse {
         allocator.free(map);
@@ -546,6 +559,11 @@ pub fn stageBehind(allocator: Allocator, q_in: exec.Query) !?StageSource {
         return null;
     };
     return .{ .stage = st, .map = map, .casts = casts };
+}
+
+fn declined(reason: ?*[]const u8, why: []const u8) ?*Stage {
+    if (reason) |r| r.* = why;
+    return null;
 }
 
 /// Rewrite `map`/`casts` (in `c`'s output space) into `c`'s upstream space.
@@ -1342,13 +1360,33 @@ pub const ChunkRangeScan = struct {
     stage: *Stage,
     result: *const MaterializedResult,
     views: []ColumnView,
-    chunk_lo: usize,
-    chunk_hi: usize,
+    range: Range,
     cursor: usize,
+
+    /// Chunks [chunk_lo, chunk_hi) of the result, entered at `row_lo` of
+    /// the first and left at `row_hi` of the last — a row stripe that may
+    /// start and end mid-chunk, so a scan's units aren't bound to the
+    /// stage's chunk count. `chunk_lo == chunk_hi` is empty. Mid-chunk
+    /// bounds must be multiples of 8 (validity bitmaps slice by byte).
+    pub const Range = struct {
+        chunk_lo: usize,
+        chunk_hi: usize,
+        row_lo: usize,
+        row_hi: usize,
+
+        pub fn whole(result: *const MaterializedResult, lo: usize, hi: usize) Range {
+            return .{
+                .chunk_lo = lo,
+                .chunk_hi = hi,
+                .row_lo = 0,
+                .row_hi = if (hi > lo) result.chunks.items[hi - 1].rows else 0,
+            };
+        }
+    };
 
     /// Raw constructor returning the concrete pointer — the parallel buffer
     /// scan stores these in its worker array (parity with `Scan`'s raw alloc).
-    pub fn alloc(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !*ChunkRangeScan {
+    pub fn alloc(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, range: Range) !*ChunkRangeScan {
         const views = try allocator.alloc(ColumnView, stage.schema.len);
         errdefer allocator.free(views);
         const self = try allocator.create(ChunkRangeScan);
@@ -1357,34 +1395,47 @@ pub const ChunkRangeScan = struct {
             .stage = stage,
             .result = result,
             .views = views,
-            .chunk_lo = chunk_lo,
-            .chunk_hi = chunk_hi,
-            .cursor = chunk_lo,
+            .range = range,
+            .cursor = range.chunk_lo,
         };
         return self;
     }
 
-    pub fn create(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !exec.Query {
-        return exec.makeQuery(allocator, try alloc(allocator, stage, result, chunk_lo, chunk_hi));
+    pub fn create(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, range: Range) !exec.Query {
+        return exec.makeQuery(allocator, try alloc(allocator, stage, result, range));
     }
 
     pub fn next(self: *ChunkRangeScan) !?exec.Batch {
-        while (self.cursor < self.chunk_hi) {
-            const chunk = self.result.chunks.items[self.cursor];
+        while (self.cursor < self.range.chunk_hi) {
+            const ci = self.cursor;
             self.cursor += 1;
-            if (chunk.rows == 0) continue;
-            if (chunk.views.len > 0) {
+            const chunk = self.result.chunks.items[ci];
+            const lo = if (ci == self.range.chunk_lo) self.range.row_lo else 0;
+            const hi = if (ci + 1 == self.range.chunk_hi) self.range.row_hi else chunk.rows;
+            if (hi <= lo) continue;
+            if (lo == 0 and hi == chunk.rows) {
+                if (chunk.views.len > 0) {
+                    return exec.Batch{
+                        .schema = self.stage.schema,
+                        .values = chunk.views,
+                        .row_count = chunk.rows,
+                    };
+                }
+                for (chunk.cols, 0..) |*col, i| self.views[i] = col.view();
                 return exec.Batch{
                     .schema = self.stage.schema,
-                    .values = chunk.views,
+                    .values = self.views,
                     .row_count = chunk.rows,
                 };
             }
-            for (chunk.cols, 0..) |*col, i| self.views[i] = col.view();
+            for (self.views, 0..) |*v, i| {
+                const full = if (chunk.views.len > 0) chunk.views[i] else chunk.cols[i].view();
+                v.* = engine.transform.subViewAligned(full, lo, hi - lo);
+            }
             return exec.Batch{
                 .schema = self.stage.schema,
                 .values = self.views,
-                .row_count = chunk.rows,
+                .row_count = hi - lo,
             };
         }
         return null;
@@ -1414,8 +1465,9 @@ pub const ChunkRangeScan = struct {
     }
 
     pub fn explain(self: *ChunkRangeScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        var buf: [80]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "ChunkRangeScan cols={d} chunks=[{d},{d})", .{ self.stage.schema.len, self.chunk_lo, self.chunk_hi }) catch "ChunkRangeScan";
+        var buf: [120]u8 = undefined;
+        const r = self.range;
+        const line = std.fmt.bufPrint(&buf, "ChunkRangeScan cols={d} chunks=[{d},{d}) row_lo={d} row_hi={d}", .{ self.stage.schema.len, r.chunk_lo, r.chunk_hi, r.row_lo, r.row_hi }) catch "ChunkRangeScan";
         try exec.explainLine(out, allocator, depth, line);
     }
 };
@@ -1535,26 +1587,37 @@ test "ChunkRangeScan: disjoint stripes cover every row exactly once" {
         const res = stage.result.?;
         try std.testing.expectEqual(@as(u64, n), res.total_rows);
 
-        // Split the chunk list into two disjoint stripes and confirm together
-        // they read every row exactly once, in order.
+        // Split the result two ways — whole-chunk stripes, then row stripes
+        // cut inside the first chunk — and confirm each pair reads every row
+        // exactly once, in order.
         const n_chunks = res.chunks.items.len;
         const mid = n_chunks / 2;
-        var seen: u64 = 0;
-        var expect_val: i64 = 0;
-        const ranges = [_][2]usize{ .{ 0, mid }, .{ mid, n_chunks } };
-        for (ranges) |r| {
-            var leaf = try ChunkRangeScan.create(allocator, stage, res, r[0], r[1]);
-            defer leaf.deinit();
-            while (try leaf.next()) |batch| {
-                const vals = batch.values[0].data.bigint;
-                for (vals) |v| {
-                    try std.testing.expectEqual(expect_val, v);
-                    expect_val += 1;
-                    seen += 1;
+        const last_rows = res.chunks.items[n_chunks - 1].rows;
+        const cut: usize = if (res.chunks.items[0].rows >= 64) 64 else 0;
+        const stripe_sets = [_][2]ChunkRangeScan.Range{
+            .{ ChunkRangeScan.Range.whole(res, 0, mid), ChunkRangeScan.Range.whole(res, mid, n_chunks) },
+            .{
+                .{ .chunk_lo = 0, .chunk_hi = 1, .row_lo = 0, .row_hi = cut },
+                .{ .chunk_lo = 0, .chunk_hi = n_chunks, .row_lo = cut, .row_hi = last_rows },
+            },
+        };
+        for (stripe_sets) |ranges| {
+            var seen: u64 = 0;
+            var expect_val: i64 = 0;
+            for (ranges) |r| {
+                var leaf = try ChunkRangeScan.create(allocator, stage, res, r);
+                defer leaf.deinit();
+                while (try leaf.next()) |batch| {
+                    const vals = batch.values[0].data.bigint;
+                    for (vals) |v| {
+                        try std.testing.expectEqual(expect_val, v);
+                        expect_val += 1;
+                        seen += 1;
+                    }
                 }
             }
+            try std.testing.expectEqual(@as(u64, n), seen);
         }
-        try std.testing.expectEqual(@as(u64, n), seen);
     }
 }
 
