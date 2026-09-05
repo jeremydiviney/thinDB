@@ -25,8 +25,10 @@
 //! huge-page slab pool — a machine resource shared by every query.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const affinity = @import("affinity.zig");
 const Allocator = std.mem.Allocator;
+const getenv = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
 
 const SpinLock = struct {
     state: std.atomic.Value(bool) = .{ .raw = false },
@@ -66,6 +68,11 @@ pub const Pool = struct {
     classes: [class_count]Class = [_]Class{.{}} ** class_count,
     retained_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
     cap_bytes: usize,
+    hits: std.atomic.Value(usize) = .{ .raw = 0 },
+    misses: std.atomic.Value(usize) = .{ .raw = 0 },
+    minted_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
+    evictions: std.atomic.Value(usize) = .{ .raw = 0 },
+    evicted_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
 
     pub fn init(backing: Allocator, cap_bytes: usize) Pool {
         return .{ .backing = backing, .cap_bytes = cap_bytes };
@@ -93,6 +100,29 @@ pub const Pool = struct {
 
     pub fn allocator(self: *Pool) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Profiling: cumulative traffic counters plus the retained blocks per
+    /// class (a class that never drains marks a client whose blocks nobody
+    /// else can reuse).
+    pub fn dumpStats(self: *Pool) void {
+        const mib = 1024 * 1024;
+        std.debug.print("[hprof] bufpool retained={d} MiB cap={d} MiB hits={d} misses={d} minted={d} MiB evictions={d} evicted={d} MiB  classes:", .{
+            self.retained_bytes.load(.monotonic) / mib,
+            self.cap_bytes / mib,
+            self.hits.load(.monotonic),
+            self.misses.load(.monotonic),
+            self.minted_bytes.load(.monotonic) / mib,
+            self.evictions.load(.monotonic),
+            self.evicted_bytes.load(.monotonic) / mib,
+        });
+        for (&self.classes, 0..) |*cls, i| {
+            cls.lock.lock();
+            const n = cls.count;
+            cls.lock.unlock();
+            if (n > 0) std.debug.print(" {d}K×{d}", .{ classSize(i) / 1024, n });
+        }
+        std.debug.print("\n", .{});
     }
 
     const vtable: Allocator.VTable = .{
@@ -129,10 +159,13 @@ pub const Pool = struct {
             cls.count -= 1;
             cls.lock.unlock();
             _ = self.retained_bytes.fetchSub(classSize(idx), .monotonic);
+            _ = self.hits.fetchAdd(1, .monotonic);
             return @ptrCast(n);
         }
         cls.lock.unlock();
         // Miss: mint a fresh, over-aligned, class-sized block from the backing.
+        _ = self.misses.fetchAdd(1, .monotonic);
+        _ = self.minted_bytes.fetchAdd(classSize(idx), .monotonic);
         return self.backing.rawAlloc(classSize(idx), .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
     }
 
@@ -145,6 +178,8 @@ pub const Pool = struct {
         // minted class-sized + max-aligned, so free it exactly that way).
         const prior = self.retained_bytes.load(.monotonic);
         if (prior + sz > self.cap_bytes) {
+            _ = self.evictions.fetchAdd(1, .monotonic);
+            _ = self.evicted_bytes.fetchAdd(sz, .monotonic);
             const base: [*]u8 = buf.ptr;
             return self.backing.rawFree(base[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
         }
@@ -192,18 +227,29 @@ var g_pool: ?Pool = null;
 var g_init = SpinLock{};
 var g_ready = std.atomic.Value(bool).init(false);
 
-/// Default retention cap: bounded scratch recycling, deliberately small relative
-/// to the block cache (which owns the ~35%-of-RAM working set). 1 GiB holds a
-/// few full sets of 12-worker decode buffers — enough to recycle across
-/// back-to-back queries without competing with the cache for RAM. Inside a
-/// memory-limited container the cap is an eighth of the limit instead (floored
-/// at 64 MiB): retained scratch must not crowd out the cache and the budgets.
+/// Default retention cap: an eighth of the machine's (or container's) memory,
+/// clamped to [64 MiB, 8 GiB]; 1 GiB when the memory size is unknown. The cap
+/// bounds IDLE scratch, not a reservation — the pool only ever holds blocks a
+/// query already touched — but it must cover a wide query's steady-state
+/// scratch, because every block past it is minted and released at the OS on
+/// each use. Measured on a 12-worker rollforward over 200K-3.4M-row stages:
+/// ~3 GiB steady state; a 1 GiB cap minted and evicted ~6 GiB per query
+/// (page faults + release ≈ 130 ms), 4 GiB and 8 GiB evicted nothing.
 const default_cap_bytes: usize = 1 << 30;
 const min_cap_bytes: usize = 64 << 20;
+const max_cap_bytes: usize = 8 << 30;
+
+/// `THINDB_BUFPOOL_CAP_MB=<n>` pins the retention cap for an A/B without a
+/// rebuild.
+fn capFromEnv() ?usize {
+    const v = getenv("THINDB_BUFPOOL_CAP_MB") orelse return null;
+    const mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return null;
+    return mb << 20;
+}
 
 pub fn defaultCapFor(total_memory: ?u64) usize {
     const total = total_memory orelse return default_cap_bytes;
-    const share: u64 = @min(total / 8, @as(u64, default_cap_bytes));
+    const share: u64 = @min(total / 8, @as(u64, max_cap_bytes));
     const share_bytes: usize = @intCast(share);
     return @max(share_bytes, min_cap_bytes);
 }
@@ -213,7 +259,7 @@ pub fn global() *Pool {
         g_init.lock();
         defer g_init.unlock();
         if (g_pool == null) {
-            g_pool = Pool.init(std.heap.c_allocator, defaultCapFor(affinity.totalMemoryBytes()));
+            g_pool = Pool.init(std.heap.c_allocator, capFromEnv() orelse defaultCapFor(affinity.totalMemoryBytes()));
             g_ready.store(true, .release);
         }
     }
@@ -224,6 +270,23 @@ pub fn global() *Pool {
 /// thread-safe `worker_alloc`.
 pub fn allocator() Allocator {
     return global().allocator();
+}
+
+pub fn dumpGlobalStats() void {
+    global().dumpStats();
+}
+
+/// The allocator worker-side operators draw their large short-lived buffers
+/// from (per-worker decode buffers, partition arenas): the shared pool in
+/// production; `base` under `THINDB_NO_BUFPOOL=1` (an A/B without a
+/// rebuild) and in tests, where leak detection must observe every free — the
+/// pool retains blocks, which a leak detector would flag.
+pub fn workerAllocator(base: Allocator) Allocator {
+    if (builtin.is_test) return base;
+    if (getenv("THINDB_NO_BUFPOOL")) |v| {
+        if (v[0] == '1') return base;
+    }
+    return allocator();
 }
 
 // ---------------------------------------------------------------------------
@@ -311,9 +374,11 @@ test "concurrent alloc/free across workers stays consistent and leak-free" {
     // or double-free trips std.testing.allocator.
 }
 
-test "defaultCapFor scales with a container limit and floors small ones" {
+test "defaultCapFor scales with the memory size and clamps both ends" {
     try std.testing.expectEqual(default_cap_bytes, defaultCapFor(null));
-    try std.testing.expectEqual(default_cap_bytes, defaultCapFor(64 << 30));
+    try std.testing.expectEqual(@as(usize, 4 << 30), defaultCapFor(32 << 30));
+    try std.testing.expectEqual(max_cap_bytes, defaultCapFor(64 << 30));
+    try std.testing.expectEqual(max_cap_bytes, defaultCapFor(256 << 30));
     try std.testing.expectEqual(@as(usize, 512 << 20), defaultCapFor(4 << 30));
     try std.testing.expectEqual(min_cap_bytes, defaultCapFor(256 << 20));
 }

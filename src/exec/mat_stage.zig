@@ -25,11 +25,14 @@
 //! lives inside table-sourced stages (which run the regular V2 handlers).
 
 const std = @import("std");
+const buffer_pool = @import("../util/buffer_pool.zig");
 const Allocator = std.mem.Allocator;
 
 const exec = @import("exec.zig");
 const window_mod = @import("window.zig");
 const table_fn_mod = @import("table_fn.zig");
+const join_mod = @import("join.zig");
+const project_limit = @import("project_limit.zig");
 const types = @import("../types.zig");
 const engine = @import("../engine/engine.zig");
 const storage = @import("../storage/storage.zig");
@@ -63,6 +66,10 @@ pub const MaterializedResult = struct {
     /// The slice-key column name when this result was slice-adopted (chunks
     /// carry key ranges); readers validate their skip column against it.
     sliced_key: ?[]const u8 = null,
+    /// Hash-join builds over this result, one per distinct key set, shared
+    /// by every join that binds the stage as its build side. Freed with
+    /// the chunks they view.
+    join_builds: std.ArrayListUnmanaged(SharedJoinBuild) = .empty,
 
     /// Ownership record for adopted contiguous columns: entries flagged in
     /// `arena_backed` are reclaimed wholesale by sweeping `arenas`; the
@@ -315,7 +322,42 @@ pub const MaterializedResult = struct {
         };
     }
 
+    /// One view per column spanning every row, presented as the schema
+    /// types. Adopted results and single-chunk pull copies are contiguous
+    /// already; anything else is concatenated once into `copies`
+    /// (owned by the result's allocator, freed by the caller).
+    fn contiguousViews(self: *MaterializedResult, views: []ColumnView, copies: *[]engine.ColumnStore) !void {
+        if (self.adopted) |ad| {
+            if (ad.stores.len == self.schema.len) {
+                for (ad.stores, self.schema, views) |*st, sc, *v| v.* = presentAsSchemaType(st.view(), sc.type);
+                return;
+            }
+        } else if (self.chunks.items.len == 1 and self.chunks.items[0].cols.len == self.schema.len) {
+            for (self.chunks.items[0].cols, views) |*col, *v| v.* = col.view();
+            return;
+        }
+        const stores = try self.allocator.alloc(engine.ColumnStore, self.schema.len);
+        errdefer self.allocator.free(stores);
+        var inited: usize = 0;
+        errdefer for (stores[0..inited]) |*st| st.deinit(self.allocator);
+        for (self.schema, stores) |sc, *st| {
+            st.* = try engine.ColumnStore.init(self.allocator, sc.type, sc.nullable);
+            inited += 1;
+        }
+        for (self.chunks.items) |c| {
+            if (c.rows == 0) continue;
+            for (stores, 0..) |*st, i| {
+                const src = if (c.views.len > 0) c.views[i] else c.cols[i].view();
+                try engine.transform.appendAllColumn(self.allocator, src, st);
+            }
+        }
+        for (stores, views) |*st, *v| v.* = st.view();
+        copies.* = stores;
+    }
+
     fn deinitChunks(self: *MaterializedResult) void {
+        for (self.join_builds.items) |*jb| jb.deinit(self.allocator);
+        self.join_builds.deinit(self.allocator);
         for (self.chunks.items) |*c| {
             for (c.cols) |*col| col.deinit(self.allocator);
             if (c.cols.len > 0) self.allocator.free(c.cols);
@@ -334,6 +376,231 @@ pub const MaterializedResult = struct {
         }
     }
 };
+
+/// A hash-join build over a stage result: contiguous column views plus
+/// the FastTable for one key set. Built once by the first join that
+/// binds the stage with these keys; later joins with the same keys reuse
+/// it (`Stage.sharedJoinBuild`).
+pub const SharedJoinBuild = struct {
+    keys: []const KeySpec,
+    casts: []const ColumnCast,
+    needs_chain: bool,
+    arena: std.heap.ArenaAllocator,
+    /// Concatenated copy of a chunked result; empty when the result was
+    /// contiguous and the views borrow it directly.
+    copies: []engine.ColumnStore,
+    /// One store per entry of `casts`, holding that cast's full-column output.
+    cast_stores: []engine.ColumnStore,
+    views: []ColumnView,
+    rows: u32,
+    table: join_mod.FastTable,
+    keys_unique: bool,
+
+    fn matches(self: *const SharedJoinBuild, keys: []const KeySpec, casts: []const ColumnCast, needs_chain: bool) bool {
+        if (self.needs_chain != needs_chain or self.keys.len != keys.len or self.casts.len != casts.len) return false;
+        for (self.keys, keys) |a, b| if (!a.eql(b)) return false;
+        for (self.casts, casts) |a, b| if (!a.eql(b)) return false;
+        return true;
+    }
+
+    /// The view a slot reading stage column `col` under `cast` sees. Every
+    /// cast a consumer asks for is in `casts` (it matched or built this).
+    pub fn viewFor(self: *const SharedJoinBuild, col: usize, cast: ?[]const u8) ColumnView {
+        const fn_name = cast orelse return self.views[col];
+        for (self.casts, self.cast_stores) |c, *st| {
+            if (c.col == col and std.ascii.eqlIgnoreCase(c.fn_name, fn_name)) return st.view();
+        }
+        unreachable;
+    }
+
+    fn deinit(self: *SharedJoinBuild, allocator: Allocator) void {
+        for (self.copies) |*c| c.deinit(allocator);
+        if (self.copies.len > 0) allocator.free(self.copies);
+        for (self.cast_stores) |*c| c.deinit(allocator);
+        if (self.cast_stores.len > 0) allocator.free(self.cast_stores);
+        self.arena.deinit();
+    }
+};
+
+/// One join key over a stage: the stage column and the same-named cast
+/// (a `to_*` function name) the build side applies to it, if any.
+pub const KeySpec = struct {
+    col: usize,
+    cast: ?[]const u8,
+
+    pub fn eql(a: KeySpec, b: KeySpec) bool {
+        if (a.col != b.col) return false;
+        const ac = a.cast orelse return b.cast == null;
+        const bc = b.cast orelse return false;
+        return std.ascii.eqlIgnoreCase(ac, bc);
+    }
+};
+
+/// A same-named single-column cast a Compute lays over the stage's
+/// output: slot `col` (a stage column index) reads `fn_name` of that
+/// column. Join-key type coercion puts one above a build side.
+pub const ColumnCast = struct {
+    col: usize,
+    fn_name: []const u8,
+
+    pub fn eql(a: ColumnCast, b: ColumnCast) bool {
+        return a.col == b.col and std.ascii.eqlIgnoreCase(a.fn_name, b.fn_name);
+    }
+};
+
+pub const MAX_STAGE_CASTS: usize = 8;
+
+/// Evaluate `fn_name(src)` over every row of one stage column through the
+/// overload a Compute would pick, into a store owned by `allocator`. Null
+/// when the overload isn't a plain null-propagating kernel (the join then
+/// keeps its own build).
+fn castStageColumn(
+    allocator: Allocator,
+    aa: Allocator,
+    fn_name: []const u8,
+    src: ColumnView,
+    src_type: types.Type,
+    rows: usize,
+) !?engine.ColumnStore {
+    const ov = (try exec.scalar_fn.resolve(aa, fn_name, &.{src_type})) orelse return null;
+    if (ov.func.null_strategy != .propagates or ov.func.udf_kernel != null) return null;
+    var arg = src;
+    var arg_buf: ?engine.ColumnStore = null;
+    defer if (arg_buf) |*b| b.deinit(allocator);
+    if (ov.arg_casts) |ac| {
+        if (ac[0]) |k| {
+            arg_buf = try engine.ColumnStore.init(allocator, ov.func.arg_types[0], true);
+            var one = [_]ColumnView{src};
+            try k(allocator, &one, &arg_buf.?, rows);
+            arg = arg_buf.?.view();
+        }
+    }
+    var out = try engine.ColumnStore.init(allocator, ov.func.return_type, true);
+    errdefer out.deinit(allocator);
+    var args = [_]ColumnView{arg};
+    if (ov.func.typed_kernel) |tk| {
+        try tk(allocator, &.{src_type}, ov.func.return_type, &args, &out, rows);
+    } else if (ov.func.kernel) |k| {
+        try k(allocator, &args, &out, rows);
+    } else return null;
+    try out.appendValidityRange(allocator, 0, arg.nulls, rows);
+    return out;
+}
+
+/// The stage a query reads, seen through its wrappers, with what each of
+/// the query's output slots reads from it.
+pub const StageSource = struct {
+    stage: *Stage,
+    /// Per output slot: the stage column it reads.
+    map: []usize,
+    /// Per output slot: the same-named `to_*` cast applied over it, or null.
+    casts: []?[]const u8,
+
+    pub fn deinit(self: *StageSource, allocator: Allocator) void {
+        allocator.free(self.map);
+        allocator.free(self.casts);
+    }
+};
+
+/// Peel `q_in` down to the stage it reads through AliasRename, a column
+/// Project and Computes that only rename (a `col_ref` derived — the
+/// parser's hidden `__join_on_*` key columns) or cast a slot in place
+/// (`to_*(slot)` — join-key type coercion). Null for anything else, a
+/// probe-fused wrapper, or a MatScan with a slice-skip hint (it doesn't
+/// read every chunk).
+/// `reason`, when given, names the operator that stopped the peel on a null
+/// return (join-fusion trace).
+pub fn stageBehind(allocator: Allocator, q_in: exec.Query, reason: ?*[]const u8) !?StageSource {
+    const n = q_in.outputSchema().len;
+    const map = try allocator.alloc(usize, n);
+    errdefer allocator.free(map);
+    for (map, 0..) |*m, i| m.* = i;
+    const casts = try allocator.alloc(?[]const u8, n);
+    errdefer allocator.free(casts);
+    @memset(casts, null);
+    var q = q_in;
+    // A Compute whose evaluation was self-pushed into the scan's workers
+    // (a terminal chain) still maps its slots the same way; the scan then
+    // checks that the sink it carries is exactly that chain.
+    var terminal_chain: ?*anyopaque = null;
+    const stage: ?*Stage = while (true) {
+        if (exec.queryAs(MatScan, q)) |ms| {
+            if (ms.skip_col != null) break declined(reason, "MatScan with a slice-range skip");
+            break ms.stage;
+        }
+        if (exec.queryAs(exec.ParallelScan, q)) |ps| {
+            break ps.plainStageSource(map, terminal_chain) orelse declined(reason, "ParallelScan already started or carrying fused/pending work");
+        }
+        if (exec.queryAs(exec.AliasRename, q)) |ar| {
+            if (ar.probe_fused and terminal_chain == null) break declined(reason, "AliasRename with a fused probe");
+            q = ar.upstream;
+            continue;
+        }
+        if (exec.queryAs(project_limit.Project, q)) |p| {
+            if (p.probe_fused) break declined(reason, "Project with a fused probe");
+            for (map) |*m| m.* = p.column_map[m.*];
+            q = p.upstream;
+            continue;
+        }
+        if (exec.queryAs(exec.Compute, q)) |c| {
+            if (c.chain) |cf| {
+                if (cf.inner != null) break declined(reason, "Compute chained under a join's probe");
+                if (terminal_chain != null) break declined(reason, "stacked self-pushed Computes");
+                terminal_chain = cf;
+            }
+            if (!peelComputeSlots(c, map, casts)) break declined(reason, "Compute deriving more than renames / in-place casts");
+            q = c.upstream;
+            continue;
+        }
+        break declined(reason, "operator is not a stage read, alias, projection or compute");
+    };
+    const st = stage orelse {
+        allocator.free(map);
+        allocator.free(casts);
+        return null;
+    };
+    return .{ .stage = st, .map = map, .casts = casts };
+}
+
+fn declined(reason: ?*[]const u8, why: []const u8) ?*Stage {
+    if (reason) |r| r.* = why;
+    return null;
+}
+
+/// Rewrite `map`/`casts` (in `c`'s output space) into `c`'s upstream space.
+/// False when a slot reads anything but a rename or an in-place `to_*` cast.
+fn peelComputeSlots(c: *const exec.Compute, map: []usize, casts: []?[]const u8) bool {
+    for (map, casts) |*m, *cast| {
+        const k = derivedIndexAt(c, m.*) orelse continue;
+        switch (c.derived[k].kind) {
+            .rename => |rn| m.* = rn.src_idx,
+            .call => {
+                if (cast.* != null or c.udf_registry != null) return false;
+                const call = switch (c.derived_ir[k].expr) {
+                    .call => |cl| cl,
+                    else => return false,
+                };
+                if (call.args.len != 1 or !std.ascii.startsWithIgnoreCase(call.fn_name, "to_")) return false;
+                const arg = switch (call.args[0]) {
+                    .col_ref => |name| name,
+                    else => return false,
+                };
+                if (!types.columnNameEql(arg, c.derived_ir[k].name)) return false;
+                if (m.* >= c.upstream.outputSchema().len) return false;
+                cast.* = call.fn_name;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn derivedIndexAt(c: *const exec.Compute, out_idx: usize) ?usize {
+    for (c.derived_output_indices, 0..) |oi, k| {
+        if (oi == out_idx) return k;
+    }
+    return null;
+}
 
 /// Accumulates a stage's pull-copied result as ONE contiguous store per
 /// column (adopted-style; per-column arenas so the sweep-free ownership
@@ -355,7 +622,8 @@ pub const ContigSink = struct {
         const arena_backed = try allocator.alloc(bool, schema.len);
         errdefer allocator.free(arena_backed);
         @memset(arena_backed, true);
-        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        const arena_backing = buffer_pool.workerAllocator(std.heap.c_allocator);
+        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
         errdefer for (arenas) |*a| a.deinit();
         for (schema, stores, arenas) |sc, *st, *ar| {
             st.* = try engine.ColumnStore.initCapacity(ar.allocator(), sc.type, sc.nullable, expect_rows, 0);
@@ -368,6 +636,12 @@ pub const ContigSink = struct {
             try engine.transform.appendAllColumn(ar.allocator(), batch.values[ci], st);
         }
         self.rows += batch.row_count;
+    }
+
+    /// Size every store once for a fill whose totals are known up front.
+    pub fn reserve(self: *ContigSink, rows: usize, str_bytes: []const u64) !void {
+        const total: usize = @as(usize, @intCast(self.rows)) + rows;
+        for (self.stores, self.arenas, str_bytes) |*st, *ar, b| try st.reserveTotal(ar.allocator(), total, @intCast(b));
     }
 
     /// Append only the picked rows — the scan-once partition router's gather.
@@ -429,9 +703,16 @@ pub const Stage = struct {
     /// memory, never touches accounting.
     accountant: ?*exec.memory.MemoryAccountant = null,
     reserved_bytes: usize = 0,
+    /// FastTable bytes reserved for shared join builds (released with the
+    /// result, under the join-build category).
+    join_build_reserved: usize = 0,
+    join_build_lock: std.atomic.Mutex = .unlocked,
     /// Compile-order index in the StageSet — a stable label for `--profile-ops`
     /// per-CTE timing (`[cte]` lines), nothing more.
     id: usize = 0,
+    /// The CTE name behind this stage (empty for synthetic wraps), shown
+    /// next to the id on the `[cte]` lines.
+    name: []const u8 = "",
     /// `--profile-ops` only: ticks spent compiling this block's body (setup),
     /// recorded by the staged compiler before the drain runs.
     setup_ticks: i64 = 0,
@@ -571,8 +852,11 @@ pub const Stage = struct {
             // Nested upstream stages triggered lazily during this drain charge
             // their own wall to cte_child_ticks; subtract so this line is SELF.
             const children: i64 = @intCast(exec.prof.cteChildTicks() - child0);
-            exec.prof.dumpStageDelta(self.id, res.total_rows, wall - children, wall, self.setup_ticks, teardown, snap);
-            exec.prof.addCteChildTicks(@intCast(@max(wall, 0)));
+            exec.prof.dumpStageDelta(self.id, self.name, res.total_rows, wall - children, wall, self.setup_ticks, teardown, snap);
+            // Charge the parent this stage's SELF wall: the nested runs
+            // below already charged theirs, so a full wall here would
+            // count grandchildren twice at the parent.
+            exec.prof.addCteChildTicks(@intCast(@max(wall - children, 0)));
             if (append_ticks > 0) std.debug.print("[stage-append] stage#{d} copy={d:.1}ms rows={d} contig={}\n", .{
                 self.id, exec.prof.ticksToMs(append_ticks), res.total_rows, self.want_contiguous,
             });
@@ -629,6 +913,10 @@ pub const Stage = struct {
             }
         }
 
+        // Each (batch, column) prepare below would otherwise regrow the
+        // store, and a source that emits many batches (a parallel group
+        // emit) regrew it many times: size each once for the total.
+        try contig.reserve(total, str_bytes);
         const preps = try a.alloc(engine.transform.PreparedAppend, batches.items.len * ncols);
         for (batches.items, 0..) |b, bi| {
             for (0..ncols) |ci| {
@@ -702,9 +990,85 @@ pub const Stage = struct {
     }
 
     fn releaseReserved(self: *Stage) void {
-        if (self.reserved_bytes == 0) return;
-        if (self.accountant) |acct| acct.release(.materialize, self.reserved_bytes);
+        if (self.accountant) |acct| {
+            if (self.reserved_bytes > 0) acct.release(.materialize, self.reserved_bytes);
+            if (self.join_build_reserved > 0) acct.release(.join_build, self.join_build_reserved);
+        }
         self.reserved_bytes = 0;
+        self.join_build_reserved = 0;
+    }
+
+    /// The hash-join build over this stage's result for `keys` (stage
+    /// columns with their casts, in join-pair order), with every cast in
+    /// `casts` evaluated once over its column; built on first request and
+    /// shared afterwards. `needs_chain` distinguishes a FULL join's table.
+    /// Runs the stage if it hasn't run. Null when the key types have no
+    /// fast lane or a cast has no plain kernel (the join keeps its own
+    /// general build).
+    pub fn sharedJoinBuild(self: *Stage, keys: []const KeySpec, casts: []const ColumnCast, needs_chain: bool) !?SharedJoinBuild {
+        try self.ensureRun();
+        const res = self.result orelse return null;
+        if (res.total_rows > std.math.maxInt(u32)) return null;
+        while (!self.join_build_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.join_build_lock.unlock();
+        for (res.join_builds.items) |*jb| {
+            if (jb.matches(keys, casts, needs_chain)) return jb.*;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const aa = arena.allocator();
+        const views = try aa.alloc(ColumnView, res.schema.len);
+        var copies: []engine.ColumnStore = &.{};
+        try res.contiguousViews(views, &copies);
+        errdefer {
+            for (copies) |*c| c.deinit(self.allocator);
+            if (copies.len > 0) self.allocator.free(copies);
+        }
+        const rows: u32 = @intCast(res.total_rows);
+        var cast_stores: []engine.ColumnStore = &.{};
+        if (casts.len > 0) cast_stores = try self.allocator.alloc(engine.ColumnStore, casts.len);
+        var casts_done: usize = 0;
+        errdefer {
+            for (cast_stores[0..casts_done]) |*c| c.deinit(self.allocator);
+            if (cast_stores.len > 0) self.allocator.free(cast_stores);
+        }
+        for (casts, 0..) |cst, i| {
+            if (cst.col >= res.schema.len) return null;
+            cast_stores[i] = (try castStageColumn(self.allocator, aa, cst.fn_name, views[cst.col], res.schema[cst.col].type, rows)) orelse return null;
+            casts_done += 1;
+        }
+        var key_views: [join_mod.MAX_FAST_KEYS]ColumnView = undefined;
+        for (keys, 0..) |k, i| {
+            key_views[i] = if (k.cast) |fn_name| blk: {
+                for (casts, cast_stores) |c, *st| {
+                    if (c.col == k.col and std.ascii.eqlIgnoreCase(c.fn_name, fn_name)) break :blk st.view();
+                }
+                return null;
+            } else views[k.col];
+        }
+        const bytes = join_mod.fastTableBytes(rows, needs_chain);
+        if (self.accountant) |acct| try acct.reserve(.join_build, bytes);
+        errdefer if (self.accountant) |acct| acct.release(.join_build, bytes);
+        const built = (try join_mod.buildFastTable(aa, self.allocator, key_views[0..keys.len], rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
+        self.join_build_reserved += bytes;
+        const owned_casts = try aa.alloc(ColumnCast, casts.len);
+        for (casts, owned_casts) |c, *o| o.* = .{ .col = c.col, .fn_name = try aa.dupe(u8, c.fn_name) };
+        const owned_keys = try aa.alloc(KeySpec, keys.len);
+        for (keys, owned_keys) |k, *o| o.* = .{ .col = k.col, .cast = if (k.cast) |f| try aa.dupe(u8, f) else null };
+        const jb: SharedJoinBuild = .{
+            .keys = owned_keys,
+            .casts = owned_casts,
+            .needs_chain = needs_chain,
+            .arena = arena,
+            .copies = copies,
+            .cast_stores = cast_stores,
+            .views = views,
+            .rows = rows,
+            .table = built.table,
+            .keys_unique = built.keys_unique,
+        };
+        try res.join_builds.append(self.allocator, jb);
+        return jb;
     }
 
     /// Register a consumer at compile time — parity with `MatScan.create`'s
@@ -1008,13 +1372,33 @@ pub const ChunkRangeScan = struct {
     stage: *Stage,
     result: *const MaterializedResult,
     views: []ColumnView,
-    chunk_lo: usize,
-    chunk_hi: usize,
+    range: Range,
     cursor: usize,
+
+    /// Chunks [chunk_lo, chunk_hi) of the result, entered at `row_lo` of
+    /// the first and left at `row_hi` of the last — a row stripe that may
+    /// start and end mid-chunk, so a scan's units aren't bound to the
+    /// stage's chunk count. `chunk_lo == chunk_hi` is empty. Mid-chunk
+    /// bounds must be multiples of 8 (validity bitmaps slice by byte).
+    pub const Range = struct {
+        chunk_lo: usize,
+        chunk_hi: usize,
+        row_lo: usize,
+        row_hi: usize,
+
+        pub fn whole(result: *const MaterializedResult, lo: usize, hi: usize) Range {
+            return .{
+                .chunk_lo = lo,
+                .chunk_hi = hi,
+                .row_lo = 0,
+                .row_hi = if (hi > lo) result.chunks.items[hi - 1].rows else 0,
+            };
+        }
+    };
 
     /// Raw constructor returning the concrete pointer — the parallel buffer
     /// scan stores these in its worker array (parity with `Scan`'s raw alloc).
-    pub fn alloc(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !*ChunkRangeScan {
+    pub fn alloc(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, range: Range) !*ChunkRangeScan {
         const views = try allocator.alloc(ColumnView, stage.schema.len);
         errdefer allocator.free(views);
         const self = try allocator.create(ChunkRangeScan);
@@ -1023,34 +1407,47 @@ pub const ChunkRangeScan = struct {
             .stage = stage,
             .result = result,
             .views = views,
-            .chunk_lo = chunk_lo,
-            .chunk_hi = chunk_hi,
-            .cursor = chunk_lo,
+            .range = range,
+            .cursor = range.chunk_lo,
         };
         return self;
     }
 
-    pub fn create(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, chunk_lo: usize, chunk_hi: usize) !exec.Query {
-        return exec.makeQuery(allocator, try alloc(allocator, stage, result, chunk_lo, chunk_hi));
+    pub fn create(allocator: Allocator, stage: *Stage, result: *const MaterializedResult, range: Range) !exec.Query {
+        return exec.makeQuery(allocator, try alloc(allocator, stage, result, range));
     }
 
     pub fn next(self: *ChunkRangeScan) !?exec.Batch {
-        while (self.cursor < self.chunk_hi) {
-            const chunk = self.result.chunks.items[self.cursor];
+        while (self.cursor < self.range.chunk_hi) {
+            const ci = self.cursor;
             self.cursor += 1;
-            if (chunk.rows == 0) continue;
-            if (chunk.views.len > 0) {
+            const chunk = self.result.chunks.items[ci];
+            const lo = if (ci == self.range.chunk_lo) self.range.row_lo else 0;
+            const hi = if (ci + 1 == self.range.chunk_hi) self.range.row_hi else chunk.rows;
+            if (hi <= lo) continue;
+            if (lo == 0 and hi == chunk.rows) {
+                if (chunk.views.len > 0) {
+                    return exec.Batch{
+                        .schema = self.stage.schema,
+                        .values = chunk.views,
+                        .row_count = chunk.rows,
+                    };
+                }
+                for (chunk.cols, 0..) |*col, i| self.views[i] = col.view();
                 return exec.Batch{
                     .schema = self.stage.schema,
-                    .values = chunk.views,
+                    .values = self.views,
                     .row_count = chunk.rows,
                 };
             }
-            for (chunk.cols, 0..) |*col, i| self.views[i] = col.view();
+            for (self.views, 0..) |*v, i| {
+                const full = if (chunk.views.len > 0) chunk.views[i] else chunk.cols[i].view();
+                v.* = engine.transform.subViewAligned(full, lo, hi - lo);
+            }
             return exec.Batch{
                 .schema = self.stage.schema,
                 .values = self.views,
-                .row_count = chunk.rows,
+                .row_count = hi - lo,
             };
         }
         return null;
@@ -1080,8 +1477,9 @@ pub const ChunkRangeScan = struct {
     }
 
     pub fn explain(self: *ChunkRangeScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        var buf: [80]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "ChunkRangeScan cols={d} chunks=[{d},{d})", .{ self.stage.schema.len, self.chunk_lo, self.chunk_hi }) catch "ChunkRangeScan";
+        var buf: [120]u8 = undefined;
+        const r = self.range;
+        const line = std.fmt.bufPrint(&buf, "ChunkRangeScan cols={d} chunks=[{d},{d}) row_lo={d} row_hi={d}", .{ self.stage.schema.len, r.chunk_lo, r.chunk_hi, r.row_lo, r.row_hi }) catch "ChunkRangeScan";
         try exec.explainLine(out, allocator, depth, line);
     }
 };
@@ -1201,26 +1599,37 @@ test "ChunkRangeScan: disjoint stripes cover every row exactly once" {
         const res = stage.result.?;
         try std.testing.expectEqual(@as(u64, n), res.total_rows);
 
-        // Split the chunk list into two disjoint stripes and confirm together
-        // they read every row exactly once, in order.
+        // Split the result two ways — whole-chunk stripes, then row stripes
+        // cut inside the first chunk — and confirm each pair reads every row
+        // exactly once, in order.
         const n_chunks = res.chunks.items.len;
         const mid = n_chunks / 2;
-        var seen: u64 = 0;
-        var expect_val: i64 = 0;
-        const ranges = [_][2]usize{ .{ 0, mid }, .{ mid, n_chunks } };
-        for (ranges) |r| {
-            var leaf = try ChunkRangeScan.create(allocator, stage, res, r[0], r[1]);
-            defer leaf.deinit();
-            while (try leaf.next()) |batch| {
-                const vals = batch.values[0].data.bigint;
-                for (vals) |v| {
-                    try std.testing.expectEqual(expect_val, v);
-                    expect_val += 1;
-                    seen += 1;
+        const last_rows = res.chunks.items[n_chunks - 1].rows;
+        const cut: usize = if (res.chunks.items[0].rows >= 64) 64 else 0;
+        const stripe_sets = [_][2]ChunkRangeScan.Range{
+            .{ ChunkRangeScan.Range.whole(res, 0, mid), ChunkRangeScan.Range.whole(res, mid, n_chunks) },
+            .{
+                .{ .chunk_lo = 0, .chunk_hi = 1, .row_lo = 0, .row_hi = cut },
+                .{ .chunk_lo = 0, .chunk_hi = n_chunks, .row_lo = cut, .row_hi = last_rows },
+            },
+        };
+        for (stripe_sets) |ranges| {
+            var seen: u64 = 0;
+            var expect_val: i64 = 0;
+            for (ranges) |r| {
+                var leaf = try ChunkRangeScan.create(allocator, stage, res, r);
+                defer leaf.deinit();
+                while (try leaf.next()) |batch| {
+                    const vals = batch.values[0].data.bigint;
+                    for (vals) |v| {
+                        try std.testing.expectEqual(expect_val, v);
+                        expect_val += 1;
+                        seen += 1;
+                    }
                 }
             }
+            try std.testing.expectEqual(@as(u64, n), seen);
         }
-        try std.testing.expectEqual(@as(u64, n), seen);
     }
 }
 

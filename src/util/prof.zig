@@ -63,7 +63,12 @@ pub fn reset() void {
     count = 0;
     cte_child_ticks = 0;
     self_count = 0;
+    while (!inst_mutex.tryLock()) std.atomic.spinLoopHint();
+    inst_map.clearRetainingCapacity();
+    inst_mutex.unlock();
     op_child_acc = 0;
+    deinit_count = 0;
+    deinit_child_acc = 0;
 }
 
 // Exclusive (self) per-operator time. The inclusive `slots` above double-count
@@ -83,7 +88,7 @@ pub inline fn selfEnter() u64 {
     return saved;
 }
 
-pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) void {
+pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) u64 {
     const children = op_child_acc;
     const self_t: u64 = if (incl > children) incl - children else 0;
     var i: usize = 0;
@@ -98,6 +103,111 @@ pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) void {
         self_count += 1;
     }
     op_child_acc = saved_parent +% incl;
+    return self_t;
+}
+
+// Per-INSTANCE exclusive wall keyed by the operator pointer, so a fat [self]
+// row (one type, many instances) traces to the plan node that spent it. One
+// process-wide map under a mutex, not thread-local: an operator inside a
+// fused scan-worker pipeline (a probe sink, a chained compute) runs on many
+// threads, and its entry sums them all — a thread bit set gives the reader
+// the approximate thread count to divide by. The next() wrapper adds each
+// call's self time; the deinit() wrapper takes the entry back and prints
+// instances above INST_PRINT_MS with the head of their plan. The lock is
+// uncontended in practice (one take per call, thousands of rows apart) and
+// this is a profiling build only. Bounded so never-taken entries cannot grow
+// without limit.
+pub const InstStat = struct {
+    ticks: u64 = 0,
+    calls: u64 = 0,
+    rows: u64 = 0,
+    thread_bits: u64 = 0,
+
+    pub fn threads(self: InstStat) u32 {
+        return @popCount(self.thread_bits);
+    }
+};
+pub const INST_PRINT_MS: f64 = 3.0;
+const INST_MAP_CAP: usize = 1 << 16;
+var inst_mutex: std.atomic.Mutex = .unlocked;
+var inst_map: std.AutoHashMapUnmanaged(usize, InstStat) = .empty;
+
+pub fn instAdd(ptr: *const anyopaque, self_ticks: u64, rows: u64) void {
+    const tid: u64 = std.Thread.getCurrentId();
+    while (!inst_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer inst_mutex.unlock();
+    if (inst_map.count() >= INST_MAP_CAP) return;
+    const gop = inst_map.getOrPut(std.heap.page_allocator, @intFromPtr(ptr)) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    gop.value_ptr.ticks += self_ticks;
+    gop.value_ptr.calls += 1;
+    gop.value_ptr.rows += rows;
+    gop.value_ptr.thread_bits |= @as(u64, 1) << @intCast(tid % 64);
+}
+
+pub fn instTake(ptr: *const anyopaque) ?InstStat {
+    while (!inst_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer inst_mutex.unlock();
+    if (inst_map.fetchRemove(@intFromPtr(ptr))) |kv| return kv.value;
+    return null;
+}
+
+// Exclusive per-operator deinit wall, bracketed the same way by the deinit()
+// wrapper: a parent's deinit tears down its children, so the subtraction
+// leaves each operator's own frees (buffer pools, arenas, pinned stages).
+threadlocal var deinit_slots: [48]Slot = undefined;
+threadlocal var deinit_count: usize = 0;
+threadlocal var deinit_child_acc: u64 = 0;
+
+pub inline fn deinitEnter() u64 {
+    const saved = deinit_child_acc;
+    deinit_child_acc = 0;
+    return saved;
+}
+
+pub inline fn deinitLeave(name: []const u8, incl: u64, saved_parent: u64) void {
+    const children = deinit_child_acc;
+    const self_t: u64 = if (incl > children) incl - children else 0;
+    var i: usize = 0;
+    while (i < deinit_count) : (i += 1) {
+        if (deinit_slots[i].name.ptr == name.ptr) {
+            deinit_slots[i].ticks += self_t;
+            deinit_slots[i].calls += 1;
+            break;
+        }
+    } else if (deinit_count < deinit_slots.len) {
+        deinit_slots[deinit_count] = .{ .name = name, .ticks = self_t, .calls = 1 };
+        deinit_count += 1;
+    }
+    deinit_child_acc = saved_parent +% incl;
+}
+
+fn dumpDeinit() void {
+    if (deinit_count == 0) return;
+    const hz: f64 = @floatFromInt(freq());
+    var order: [48]usize = undefined;
+    for (0..deinit_count) |i| order[i] = i;
+    var a: usize = 0;
+    while (a < deinit_count) : (a += 1) {
+        var b = a + 1;
+        while (b < deinit_count) : (b += 1) {
+            if (deinit_slots[order[b]].ticks > deinit_slots[order[a]].ticks) {
+                const t = order[a];
+                order[a] = order[b];
+                order[b] = t;
+            }
+        }
+    }
+    var total: u64 = 0;
+    for (deinit_slots[0..deinit_count]) |s| total +%= s.ticks;
+    std.debug.print("[deinit] per-operator EXCLUSIVE teardown wall:\n", .{});
+    for (order[0..deinit_count]) |idx| {
+        const s = deinit_slots[idx];
+        const ms = @as(f64, @floatFromInt(s.ticks)) * 1000.0 / hz;
+        if (ms < 0.05) continue;
+        std.debug.print("[deinit]   {s: <44} {d: >9.2} ms  ({d} calls)\n", .{ shortOpName(s.name), ms, s.calls });
+    }
+    std.debug.print("[deinit]   {s: <44} {d: >9.2} ms\n", .{ "TOTAL", @as(f64, @floatFromInt(total)) * 1000.0 / hz });
 }
 
 pub fn dumpSelf(label: []const u8) void {
@@ -126,6 +236,7 @@ pub fn dumpSelf(label: []const u8) void {
         std.debug.print("[self]   {s: <44} {d: >9.2} ms  {d: >5.1}%  ({d} calls)\n", .{ shortOpName(s.name), ms, pct, s.calls });
     }
     std.debug.print("[self]   {s: <44} {d: >9.2} ms  100.0%\n", .{ "TOTAL (connection-thread wall)", @as(f64, @floatFromInt(total)) * 1000.0 / hz });
+    dumpDeinit();
 }
 
 // Per-CTE-stage profiling. Each `Stage.ensureRun` drains one CTE block serially
@@ -164,14 +275,14 @@ pub fn snapSlots() SlotSnap {
 /// full wall (incl. nested) and realized rows. The indented lines split the
 /// execute time across the operator layers (scan / filter / group / window)
 /// that ran during this stage only — current slots minus the pre-drain snapshot.
-pub fn dumpStageDelta(stage_id: usize, rows: u64, self_ticks: i64, wall_ticks: i64, setup_ticks: i64, teardown_ticks: i64, before: SlotSnap) void {
+pub fn dumpStageDelta(stage_id: usize, name: []const u8, rows: u64, self_ticks: i64, wall_ticks: i64, setup_ticks: i64, teardown_ticks: i64, before: SlotSnap) void {
     if (!enabled) return;
     const hz: f64 = @floatFromInt(freq());
     const self_ms = @as(f64, @floatFromInt(@max(self_ticks, 0))) * 1000.0 / hz;
     const wall_ms = @as(f64, @floatFromInt(@max(wall_ticks, 0))) * 1000.0 / hz;
     const setup_ms = @as(f64, @floatFromInt(@max(setup_ticks, 0))) * 1000.0 / hz;
     const teardown_ms = @as(f64, @floatFromInt(@max(teardown_ticks, 0))) * 1000.0 / hz;
-    std.debug.print("[cte] stage#{d: <3} rows={d: <9} setup={d: >7.2}ms execute={d: >8.2}ms teardown={d: >6.2}ms  (wall={d: >8.2}ms, all wall-clock)\n", .{ stage_id, rows, setup_ms, self_ms, teardown_ms, wall_ms });
+    std.debug.print("[cte] stage#{d: <3} {s: <40} rows={d: <9} setup={d: >7.2}ms execute={d: >8.2}ms teardown={d: >6.2}ms  (wall={d: >8.2}ms, all wall-clock)\n", .{ stage_id, name, rows, setup_ms, self_ms, teardown_ms, wall_ms });
     for (slots[0..count]) |s| {
         var prev: u64 = 0;
         for (0..before.n) |j| {
@@ -193,7 +304,7 @@ pub fn dumpStageDelta(stage_id: usize, rows: u64, self_ticks: i64, wall_ticks: i
 
 /// Trim the long `exec.foo.Bar` operator type name to its leaf for the per-CTE
 /// breakdown (the full names already appear in the global `[oprof]` dump).
-fn shortOpName(name: []const u8) []const u8 {
+pub fn shortOpName(name: []const u8) []const u8 {
     var i = name.len;
     while (i > 0) : (i -= 1) {
         if (name[i - 1] == '.') return name[i..];
@@ -205,7 +316,7 @@ fn shortOpName(name: []const u8) []const u8 {
 // construction / teardown), kept apart from the per-operator `slots` above so
 // the execute-time `reset()` doesn't clobber construction timings. Accumulate
 // with `addPhase`, clear with `resetPhases`, print with `dumpPhases`.
-threadlocal var phase_slots: [32]Slot = undefined;
+threadlocal var phase_slots: [64]Slot = undefined;
 threadlocal var phase_count: usize = 0;
 
 pub inline fn addPhase(name: []const u8, ticks: u64) void {

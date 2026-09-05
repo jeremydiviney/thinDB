@@ -249,6 +249,19 @@ const CasePlan = struct {
     may_produce_null: bool,
 };
 
+const MAX_CASE_BRANCHES: usize = 16;
+
+/// One CASE branch's THEN (or the ELSE) value for the current batch. A
+/// scalar source holds a single row that every row it wins reads.
+const CaseSrc = struct {
+    view: ColumnView,
+    scalar: bool,
+
+    fn row(self: CaseSrc, i: usize) usize {
+        return if (self.scalar) 0 else i;
+    }
+};
+
 /// Schema-only upstream for detached per-chunk Compute clones inside a probe
 /// pipeline (evalBatch is the only entry used; next() is never pulled).
 const SchemaStub = struct {
@@ -316,6 +329,8 @@ const ChainForward = struct {
             cf.map_views = &.{};
         }
         cf.bind_alloc = alloc;
+        const t_bind = exec.prof.nowTicks();
+        defer exec.prof.addPhase("compute.chain.bind_clones", @intCast(exec.prof.nowTicks() - t_bind));
         const qs = try alloc.alloc(Query, n_chunks);
         errdefer alloc.free(qs);
         const stubs = try alloc.alloc(*SchemaStub, n_chunks);
@@ -365,6 +380,8 @@ const ChainForward = struct {
     }
 
     fn deinitAll(cf: *ChainForward, owner_alloc: Allocator) void {
+        const t_free = exec.prof.nowTicks();
+        defer exec.prof.addPhase("compute.chain.deinit_clones", @intCast(exec.prof.nowTicks() - t_free));
         for (cf.per_chunk, cf.stubs) |*q, st| {
             q.deinit();
             cf.bind_alloc.destroy(st);
@@ -913,21 +930,30 @@ pub const Compute = struct {
     ///      matches and there's no ELSE).
     fn evalCase(self: *Compute, plan: *CasePlan, in_values: []const ColumnView, n: usize) anyerror!void {
         plan.output.clear();
+        if (plan.branches.len > MAX_CASE_BRANCHES) return Error.ComputeTooManyArgs;
 
-        var branch_views_buf: [16]ColumnView = undefined;
-        if (plan.branches.len > branch_views_buf.len) return Error.ComputeTooManyArgs;
-        const branch_views = branch_views_buf[0..plan.branches.len];
-        for (plan.branches, branch_views) |br, *bv| {
-            bv.* = try self.materializeCaseSrc(br.then_src, br.cast_kernel, br.cast_buf, in_values, n);
+        var srcs_buf: [MAX_CASE_BRANCHES + 1]CaseSrc = undefined;
+        for (plan.branches, 0..) |br, bi| {
+            srcs_buf[bi] = try self.caseSrc(br.then_src, br.cast_kernel, br.cast_buf, in_values, n);
         }
-        var else_view: ?ColumnView = null;
-        if (plan.else_src) |es| else_view = try self.materializeCaseSrc(es, plan.else_cast_kernel, plan.else_cast_buf, in_values, n);
+        var src_count = plan.branches.len;
+        if (plan.else_src) |es| {
+            srcs_buf[src_count] = try self.caseSrc(es, plan.else_cast_kernel, plan.else_cast_buf, in_values, n);
+            src_count += 1;
+        }
+        const srcs = srcs_buf[0..src_count];
 
+        // winners[i] indexes `srcs`: the first branch whose condition holds,
+        // else the ELSE slot; with no ELSE, `srcs.len` marks an unmatched
+        // (NULL) row.
+        const winners = try self.allocator.alloc(u8, n);
+        defer self.allocator.free(winners);
+        @memset(winners, @as(u8, @intCast(plan.branches.len)));
         const cond_buf = try self.allocator.alloc(bool, n);
         defer self.allocator.free(cond_buf);
-        const winners = try self.allocator.alloc(i32, n);
-        defer self.allocator.free(winners);
-        @memset(winners, -1);
+        const open = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(open);
+        @memset(open, true);
 
         const fake_batch: Batch = .{
             .schema = plan.upstream_schema,
@@ -935,60 +961,51 @@ pub const Compute = struct {
             .row_count = n,
         };
         for (plan.branches, 0..) |br, bi| {
+            // Rows an earlier branch won are inactive: the guided evaluator
+            // may skip them, and their mask bits are ignored here.
             @memset(cond_buf, false);
-            try predicate_mod.evaluatePredicate(self.allocator, br.cond, plan.upstream_schema, fake_batch, cond_buf);
-            for (cond_buf, winners) |c, *w| {
-                if (c and w.* == -1) w.* = @intCast(bi);
+            try predicate_mod.evaluateExprGuided(self.allocator, br.cond, plan.upstream_schema, fake_batch, cond_buf, open);
+            for (cond_buf, open, winners) |c, *o, *w| {
+                if (o.* and c) {
+                    w.* = @intCast(bi);
+                    o.* = false;
+                }
             }
         }
 
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const w = winners[i];
-            if (w == -1) {
-                if (else_view) |ev| {
-                    try appendCellFromView(self.allocator, plan.output, ev, i);
-                } else {
-                    try plan.output.data.appendNullPlaceholder(self.allocator);
-                    if (plan.output.nulls != null) {
-                        const row = plan.output.data.rowCount() - 1;
-                        try plan.output.appendValidBit(self.allocator, row, false);
-                    }
-                }
-            } else {
-                try appendCellFromView(self.allocator, plan.output, branch_views[@intCast(w)], i);
-            }
+        switch (plan.output.data) {
+            .varchar, .string, .char, .json => |*ss| try assembleCaseStrings(self.allocator, ss, plan.output, srcs, winners),
+            inline else => |*list, tag| try assembleCaseFixed(self.allocator, list, tag, plan.output, srcs, winners),
         }
     }
 
-    fn materializeCaseSrc(
+    /// The batch value of one THEN/ELSE clause. Literals and bare NULLs
+    /// materialize once as a single row (marked scalar); columns, calls and
+    /// nested CASEs yield a row per input row. A branch cast runs over
+    /// whichever it produced.
+    fn caseSrc(
         self: *Compute,
         s: BranchSrc,
         cast_kernel: ?CastKernel,
         cast_buf: ?*ColumnStore,
         in_values: []const ColumnView,
         n: usize,
-    ) anyerror!ColumnView {
-        const raw = try self.materializeBranchSrc(s, in_values, n);
-        const k = cast_kernel orelse return raw;
-        const buf = cast_buf.?;
-        buf.clear();
-        var one_arg = [_]ColumnView{raw};
-        try k(self.allocator, &one_arg, buf, n);
-        return buf.view();
-    }
-
-    fn materializeBranchSrc(self: *Compute, s: BranchSrc, in_values: []const ColumnView, n: usize) anyerror!ColumnView {
-        return switch (s) {
+    ) anyerror!CaseSrc {
+        const scalar = s == .lit or s == .null_lit;
+        const raw: ColumnView = switch (s) {
             .col => |idx| in_values[idx],
             .lit => |slot| blk: {
-                slot.buf.clear();
-                try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
+                if (slot.buf.rowCount() != 1) {
+                    slot.buf.clear();
+                    try fillLiteralColumn(self.allocator, &slot.buf, slot.value, 1);
+                }
                 break :blk slot.buf.view();
             },
             .null_lit => |slot| blk: {
-                slot.buf.clear();
-                try fillNullColumn(self.allocator, &slot.buf, n);
+                if (slot.buf.rowCount() != 1) {
+                    slot.buf.clear();
+                    try fillNullColumn(self.allocator, &slot.buf, 1);
+                }
                 break :blk slot.buf.view();
             },
             .call => |sub| blk: {
@@ -1000,6 +1017,12 @@ pub const Compute = struct {
                 break :blk sub.output.view();
             },
         };
+        const k = cast_kernel orelse return .{ .view = raw, .scalar = scalar };
+        const buf = cast_buf.?;
+        buf.clear();
+        var one_arg = [_]ColumnView{raw};
+        try k(self.allocator, &one_arg, buf, if (scalar) 1 else n);
+        return .{ .view = buf.view(), .scalar = scalar };
     }
 
     /// Evaluate a fused `col <op> const` directly into `out_col` in one
@@ -2166,75 +2189,76 @@ fn appendCopiedColumn(
     _ = n;
 }
 
-/// Append the single cell at `src_idx` from `src` into `dst`. Used by
-/// the CASE evaluator to assemble the per-row winning value. `src`
-/// and `dst` must share the same primitive type (validated at resolve
-/// time for CASE branches).
-fn appendCellFromView(
+/// Fixed-width CASE output: size the column once, then one pass reads each
+/// row from its winning source (a scalar source replicates through a zero
+/// stride; an unmatched row reads a zero placeholder and is NULL).
+fn assembleCaseFixed(
     allocator: Allocator,
-    dst: *ColumnStore,
-    src: ColumnView,
-    src_idx: usize,
+    list: anytype,
+    comptime tag: types.TypeTag,
+    out: *ColumnStore,
+    srcs: []const CaseSrc,
+    winners: []const u8,
 ) !void {
-    switch (dst.data) {
-        .int => |*l| try l.append(allocator, src.data.int[src_idx]),
-        .bigint => |*l| try l.append(allocator, src.data.bigint[src_idx]),
-        .smallint => |*l| try l.append(allocator, src.data.smallint[src_idx]),
-        .tinyint => |*l| try l.append(allocator, src.data.tinyint[src_idx]),
-        .largeint => |*l| try l.append(allocator, src.data.largeint[src_idx]),
-        .float => |*l| try l.append(allocator, src.data.float[src_idx]),
-        .double => |*l| try l.append(allocator, src.data.double[src_idx]),
-        .boolean => |*l| try l.append(allocator, src.data.boolean[src_idx]),
-        .date => |*l| try l.append(allocator, src.data.date[src_idx]),
-        .datetime => |*l| try l.append(allocator, src.data.datetime[src_idx]),
-        .decimal64 => |*l| try l.append(allocator, src.data.decimal64[src_idx]),
-        .decimal128 => |*l| try l.append(allocator, src.data.decimal128[src_idx]),
-        .uuid => |*l| try l.append(allocator, src.data.uuid[src_idx]),
-        .varchar => |*s| {
-            const bytes = switch (src.data) {
-                .varchar => |sv| sv.rowBytes(src_idx),
-                .string => |sv| sv.rowBytes(src_idx),
-                .char => |sv| sv.rowBytes(src_idx),
-                .json => |sv| sv.rowBytes(src_idx),
-                else => unreachable,
-            };
-            try s.appendValue(allocator, bytes);
-        },
-        .string => |*s| {
-            const bytes = switch (src.data) {
-                .varchar => |sv| sv.rowBytes(src_idx),
-                .string => |sv| sv.rowBytes(src_idx),
-                .char => |sv| sv.rowBytes(src_idx),
-                .json => |sv| sv.rowBytes(src_idx),
-                else => unreachable,
-            };
-            try s.appendValue(allocator, bytes);
-        },
-        .char => |*s| {
-            const bytes = switch (src.data) {
-                .varchar => |sv| sv.rowBytes(src_idx),
-                .string => |sv| sv.rowBytes(src_idx),
-                .char => |sv| sv.rowBytes(src_idx),
-                .json => |sv| sv.rowBytes(src_idx),
-                else => unreachable,
-            };
-            try s.appendValue(allocator, bytes);
-        },
-        .json => |*s| {
-            const bytes = switch (src.data) {
-                .varchar => |sv| sv.rowBytes(src_idx),
-                .string => |sv| sv.rowBytes(src_idx),
-                .char => |sv| sv.rowBytes(src_idx),
-                .json => |sv| sv.rowBytes(src_idx),
-                else => unreachable,
-            };
-            try s.appendValue(allocator, bytes);
-        },
+    const T = std.meta.Child(@TypeOf(list.items));
+    try list.resize(allocator, winners.len);
+    var ptrs: [MAX_CASE_BRANCHES + 2][*]const T = undefined;
+    var strides: [MAX_CASE_BRANCHES + 2]usize = undefined;
+    for (srcs, 0..) |s, k| {
+        ptrs[k] = @field(s.view.data, @tagName(tag)).ptr;
+        strides[k] = @intFromBool(!s.scalar);
     }
-    if (dst.nulls != null) {
-        const row = dst.data.rowCount() - 1;
-        try dst.appendValidBit(allocator, row, src.isValid(src_idx));
+    const placeholder: [1]T = .{std.mem.zeroes(T)};
+    ptrs[srcs.len] = &placeholder;
+    strides[srcs.len] = 0;
+    for (list.items, winners, 0..) |*o, w, i| o.* = ptrs[w][i * strides[w]];
+    try setCaseValidity(allocator, out, srcs, winners);
+}
+
+/// String CASE output: append each row's bytes straight from its winning
+/// source; an unmatched row is an empty NULL placeholder.
+fn assembleCaseStrings(
+    allocator: Allocator,
+    ss: *store.StringStore,
+    out: *ColumnStore,
+    srcs: []const CaseSrc,
+    winners: []const u8,
+) !void {
+    const unmatched: u8 = @intCast(srcs.len);
+    for (winners, 0..) |w, i| {
+        if (w == unmatched) {
+            try ss.appendValue(allocator, "");
+            try out.appendValidBit(allocator, i, false);
+            continue;
+        }
+        const s = srcs[w];
+        const r = s.row(i);
+        try ss.appendValue(allocator, stringRowBytes(s.view, r));
+        if (out.nulls != null) try out.appendValidBit(allocator, i, s.view.isValid(r));
     }
+}
+
+/// Validity of an assembled fixed-width CASE column: a row is NULL when it
+/// matched no branch of an ELSE-less CASE or its winning source is NULL
+/// there. Outputs proven non-null at plan time carry no bitmap.
+fn setCaseValidity(allocator: Allocator, out: *ColumnStore, srcs: []const CaseSrc, winners: []const u8) !void {
+    const bits: *std.ArrayList(u8) = if (out.nulls) |*b| b else return;
+    try bits.resize(allocator, (winners.len + 7) >> 3);
+    @memset(bits.items, 0);
+    const unmatched: u8 = @intCast(srcs.len);
+    for (winners, 0..) |w, i| {
+        if (w == unmatched) continue;
+        if (!srcs[w].view.isValid(srcs[w].row(i))) continue;
+        bits.items[i >> 3] |= @as(u8, 1) << @as(u3, @intCast(i & 7));
+    }
+}
+
+fn stringRowBytes(view: ColumnView, row: usize) []const u8 {
+    return switch (view.data) {
+        .varchar, .string, .char, .json => |sv| sv.rowBytes(row),
+        // CASE branches unify to one type family at plan time.
+        else => unreachable,
+    };
 }
 
 /// Append `n` copies of `v` into `buf`. Used by Compute's call path to

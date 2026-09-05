@@ -72,6 +72,10 @@ pub const LateScan = struct {
     /// its own pinned snapshot); the normal `fetch` path leaves it null.
     materialize_snap_override: ?*engine.Memtable = null,
 
+    /// Scratch for one (segment, row-group) run of survivor offsets; reused
+    /// across runs so a multi-million-row emit does not grow a list per run.
+    offsets: std.ArrayListUnmanaged(u32) = .empty,
+
     pub fn create(
         allocator: Allocator,
         inner: Query,
@@ -120,6 +124,7 @@ pub const LateScan = struct {
         var inner = self.inner;
         inner.deinit();
         for (self.output_columns) |*c| c.deinit(self.allocator);
+        self.offsets.deinit(self.allocator);
         self.allocator.free(self.output_columns);
         self.allocator.free(self.views);
         self.allocator.free(self.out_schema);
@@ -233,15 +238,14 @@ pub const LateScan = struct {
                     // Gather the maximal run of consecutive survivors sharing
                     // this (segment, row group) so each column decodes once.
                     var run_end = i;
-                    var offsets: std.ArrayListUnmanaged(u32) = .empty;
-                    defer offsets.deinit(self.allocator);
+                    self.offsets.clearRetainingCapacity();
                     while (run_end < locs.len) : (run_end += 1) {
                         const loc = rowloc.unpack(locs[run_end]);
                         if (loc != .segment) break;
                         if (loc.segment.seg_idx != seg.seg_idx or loc.segment.rg_idx != seg.rg_idx) break;
-                        try offsets.append(self.allocator, @intCast(loc.segment.offset));
+                        try self.offsets.append(self.allocator, @intCast(loc.segment.offset));
                     }
-                    try self.appendSegmentRows(&cur_entry.?.seg, seg.rg_idx, offsets.items);
+                    try self.appendSegmentRows(&cur_entry.?.seg, seg.rg_idx, self.offsets.items);
                     i = run_end;
                 },
             }
@@ -258,12 +262,7 @@ pub const LateScan = struct {
         const n = locs.len;
         const order = try self.allocator.alloc(u32, n);
         defer self.allocator.free(order);
-        for (order, 0..) |*o, i| o.* = @intCast(i);
-        std.mem.sortUnstable(u32, order, locs, struct {
-            fn less(ls: []const i64, a: u32, b: u32) bool {
-                return ls[a] < ls[b];
-            }
-        }.less);
+        try rowloc.sortedOrder(self.allocator, locs, order);
         const sorted = try self.allocator.alloc(i64, n);
         defer self.allocator.free(sorted);
         for (order, 0..) |oi, j| sorted[j] = locs[oi];
@@ -291,13 +290,12 @@ pub const LateScan = struct {
         }
     }
 
-    /// Fetch only the survivor `offsets` of each output column from one row
-    /// group — decode just those rows, never the full 65,536-row block. The
-    /// block is decompressed once (cached pin), then:
-    ///   - raw  : an in-place borrowed view; `appendByIndices` copies only the
-    ///            survivor offsets (zero full-block materialization),
-    ///   - dict : index each survivor's code into the dict directly (no expand),
-    ///   - FOR  : expand the block (cheap, vectorized) then gather the offsets.
+    /// Fetch only the survivor `offsets` (ascending within the row group) of
+    /// each output column from one row group — never the full 65,536-row
+    /// block. The block is decompressed once (cached pin), then gathered by
+    /// the same per-encoding row gathers the filtered scan uses: FOR and RLE
+    /// straight off the narrow codes, dict through the sorted dictionary, FSST
+    /// decoding only the survivor rows, raw through an in-place borrowed view.
     fn appendSegmentRows(self: *LateScan, seg: *storage.ReadSegment, rg_idx: usize, offsets: []const u32) !void {
         const sr = storage.segment_reader;
         const rc = seg.info.row_groups[rg_idx].row_count;
@@ -310,8 +308,10 @@ pub const LateScan = struct {
             defer bb.release(self.allocator, self.table.cacheRef());
 
             switch (bb.encoding) {
-                .dict => try appendDictRows(self.allocator, bb.bytes, rc, flags, offsets, out),
-                .fsst => try appendFsstRows(self.allocator, bb.bytes, rc, flags, offsets, out),
+                .for_ => try engine.transform.appendForRows(self.allocator, sr.forViewOf(bb.bytes, rc, flags), offsets, out),
+                .rle => try engine.transform.appendRleRows(self.allocator, sr.rleViewOf(bb.bytes, rc, flags), offsets, out),
+                .dict => try engine.transform.appendDictRows(self.allocator, bb.bytes, rc, flags, offsets, out),
+                .fsst => try engine.transform.appendFsstRows(self.allocator, try sr.fsstViewOf(bb.bytes, rc, flags), offsets, out),
                 .raw => {
                     if (sr.viewRawColumn(col_type, bb.bytes, rc, flags, .raw)) |view| {
                         try engine.transform.appendByIndices(self.allocator, view, offsets, out);
@@ -321,11 +321,6 @@ pub const LateScan = struct {
                         defer col.deinit(self.allocator);
                         try engine.transform.appendByIndices(self.allocator, col.view(), offsets, out);
                     }
-                },
-                .for_, .rle => |enc| {
-                    var col = try sr.decodeColumnPayload(self.allocator, col_type, bb.bytes, rc, flags, enc);
-                    defer col.deinit(self.allocator);
-                    try engine.transform.appendByIndices(self.allocator, col.view(), offsets, out);
                 },
             }
         }
@@ -344,79 +339,3 @@ pub const LateScan = struct {
         }
     }
 };
-
-/// Gather only `offsets`' rows of a dict-encoded string block into `out` by
-/// indexing each row's code into the sorted dict — never expanding the full
-/// block (the late-mat survivor fetch is ≤ k rows scattered across 65,536-row
-/// blocks). `raw` is the decompressed payload; the validity handling mirrors
-/// `transform.appendByIndices`.
-fn appendDictRows(
-    allocator: Allocator,
-    raw: []const u8,
-    row_count: u32,
-    flags: storage.format.ColumnBlockFlags,
-    offsets: []const u32,
-    out: *ColumnStore,
-) !void {
-    var values = raw;
-    var nulls: ?[]const u8 = null;
-    if (flags.has_nulls) {
-        const bm = storage.column.bitmapBytes(row_count);
-        nulls = raw[0..bm];
-        values = raw[bm..];
-    }
-    const db = storage.segment_reader.dictBlockOf(values, row_count);
-    const dst_start = out.data.rowCount();
-    switch (out.data) {
-        .varchar, .string, .char, .json => |*ss| {
-            for (offsets) |off| try ss.appendValue(allocator, db.dictValue(db.rowCode(off)));
-        },
-        else => unreachable, // the writer only dict-encodes string-family columns
-    }
-    if (out.nulls != null) {
-        for (offsets, 0..) |off, j| {
-            try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(nulls, off));
-        }
-    }
-}
-
-/// Gather only `offsets`' rows of an FSST-encoded string block into `out`,
-/// decoding just those rows — the whole point of pairing late
-/// materialization with compressed strings: a LIMIT-k query decodes k
-/// strings, not 65,536.
-fn appendFsstRows(
-    allocator: Allocator,
-    raw: []const u8,
-    row_count: u32,
-    flags: storage.format.ColumnBlockFlags,
-    offsets: []const u32,
-    out: *ColumnStore,
-) !void {
-    var values = raw;
-    var nulls: ?[]const u8 = null;
-    if (flags.has_nulls) {
-        const bm = storage.column.bitmapBytes(row_count);
-        nulls = raw[0..bm];
-        values = raw[bm..];
-    }
-    const fb = try storage.segment_reader.fsstBlockOf(values, row_count);
-    var scratch: std.ArrayListUnmanaged(u8) = .empty;
-    defer scratch.deinit(allocator);
-    const dst_start = out.data.rowCount();
-    switch (out.data) {
-        .varchar, .string, .char, .json => |*ss| {
-            for (offsets) |off| {
-                const comp = fb.rowComp(off);
-                try scratch.resize(allocator, storage.fsst.decodedSizeBound(comp.len));
-                const n = fb.table.decodeIntoUnchecked(comp, scratch.items);
-                try ss.appendValue(allocator, scratch.items[0..n]);
-            }
-        },
-        else => unreachable, // the writer only FSST-encodes string-family columns
-    }
-    if (out.nulls != null) {
-        for (offsets, 0..) |off, j| {
-            try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(nulls, off));
-        }
-    }
-}

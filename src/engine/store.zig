@@ -218,6 +218,19 @@ pub const ColumnStore = struct {
         };
     }
 
+    /// Capacity for `rows_total` rows (and `bytes_total` string bytes) in
+    /// one allocation — for a fill whose total is known before it starts.
+    pub fn reserveTotal(self: *ColumnStore, allocator: Allocator, rows_total: usize, bytes_total: usize) Allocator.Error!void {
+        if (self.nulls) |*nb| try nb.ensureTotalCapacityPrecise(allocator, (rows_total + 7) >> 3);
+        switch (self.data) {
+            .varchar, .string, .char, .json => |*ss| {
+                try ss.offsets.ensureTotalCapacityPrecise(allocator, rows_total + 1);
+                try ss.bytes.ensureTotalCapacityPrecise(allocator, bytes_total);
+            },
+            inline else => |*list| try list.ensureTotalCapacityPrecise(allocator, rows_total),
+        }
+    }
+
     pub fn deinit(self: *ColumnStore, allocator: Allocator) void {
         self.data.deinit(allocator);
         if (self.nulls) |*n| n.deinit(allocator);

@@ -31,6 +31,7 @@ const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 
 const exec = @import("exec.zig");
+const parallel = @import("../util/parallel.zig");
 const Query = exec.Query;
 
 const Batch = exec.Batch;
@@ -44,6 +45,7 @@ const Predicate = predicate.Predicate;
 const transform = @import("../engine/transform.zig");
 
 const cell_io = @import("cell_io.zig");
+const mat_stage = @import("mat_stage.zig");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -64,7 +66,6 @@ fn keyValueAt(v: ColumnView, row: usize) ?types.Value {
     };
 }
 const appendNullTo = cell_io.appendNullTo;
-const appendOneFromBuild = cell_io.appendOneFromBuild;
 const appendOneFromView = cell_io.appendOneFromView;
 
 /// One column-pair equality in the ON clause.
@@ -382,7 +383,7 @@ fn fastKindOfType(t: TypeTag) ?FastKeyKind {
 
 /// Most key columns a compound FastTable carries. More falls back to the
 /// general compound-key hash path (never seen in practice).
-const MAX_FAST_KEYS: usize = 8;
+pub const MAX_FAST_KEYS: usize = 8;
 
 /// Digest one key cell for compound-key slotting: int-family values by
 /// their widened 64-bit pattern, strings by wyhash of the bytes. Only used
@@ -428,23 +429,501 @@ fn compoundRowsEqual(probe_views: []const ColumnView, probe_row: u32, build_view
 /// `heads[slot]` → `next[...]` visits ascending build rows — the same
 /// per-key match order as the general bucket path, keeping output
 /// row order identical between the two probe implementations.
-const FastTable = struct {
+pub const FastTable = struct {
     kind: FastKeyKind,
     /// `heads[slot] == FAST_EMPTY` marks an empty slot; otherwise
     /// `slot_keys[slot]` identifies the key resident there.
     slot_keys: []u64,
     heads: []u32,
     mask: u64,
+    /// Probe-sequence wrap: a slot's successor is `nextSlot(slot, wrap_mask)`.
+    /// Equal to `mask` for a table built as one range; a large table is
+    /// built in `PARALLEL_INSERT_RANGES` equal slot ranges on parallel
+    /// threads, and every probe sequence wraps within its home range.
+    wrap_mask: u64,
     /// Duplicate-key chains. Empty for unique non-FULL joins, where every
     /// slot has exactly one row and the array would never be read.
     next: []u32,
     /// View over the build key column, captured after buildPhase
-    /// (build_columns are immutable from then on). Single-key kinds only.
+    /// (build views are immutable from then on). Single-key kinds only.
     build_key_view: ColumnView,
     /// `.compound` only: one view per key column, in `on`-pair order.
     /// Arena-owned; empty for single-key kinds.
     build_key_views: []const ColumnView = &.{},
 };
+
+pub const FastBuild = struct {
+    table: FastTable,
+    keys_unique: bool,
+};
+
+/// Bytes a FastTable over `n` rows occupies, for memory accounting.
+pub fn fastTableBytes(n: usize, needs_chain: bool) usize {
+    const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, n * 2));
+    const chain = needs_chain or n >= PARALLEL_INSERT_MIN_ROWS;
+    return cap * (@sizeOf(u64) + @sizeOf(u32)) + (if (chain) n * @sizeOf(u32) else 0);
+}
+
+/// Build the vectorized-probe FastTable over `key_views` (one per join
+/// key, on-pair order, each spanning all `n` build rows) into `aa`.
+/// Null for a key type the fast lanes don't cover (the caller keeps its
+/// general path). Rows insert in descending order so a duplicate chain
+/// walks ascending build rows. `needs_chain` allocates the chain up
+/// front: a FULL join reads it even when every key is unique.
+/// Rows per digest worker; a smaller build hashes on the calling thread.
+const DIGEST_ROWS_PER_WORKER: u32 = 262144;
+const MAX_DIGEST_WORKERS: usize = 16;
+/// Insert-loop prefetch distance in rows: enough independent slots in
+/// flight to cover a DRAM miss on the table.
+const INSERT_PREFETCH_DIST: u32 = 8;
+/// A build over at least this many rows inserts in parallel: the slot array
+/// splits into `PARALLEL_INSERT_RANGES` equal ranges, the rows are grouped
+/// by the range their home slot falls in, and one job per range inserts its
+/// rows with probe sequences wrapping inside the range, so no two threads
+/// touch one slot. The chain array is allocated up front for such a build
+/// (workers cannot allocate lazily). Below the threshold the whole table is
+/// one range on the calling thread. Many ranges keep each job's slots
+/// cache-resident and balance the jobs over the threads; the count is
+/// bounded by the u8 range tag (NULL_RANGE) and the per-thread scatter
+/// streams.
+const PARALLEL_INSERT_MIN_ROWS: u32 = 1 << 18;
+const PARALLEL_INSERT_RANGES: usize = 128;
+const NULL_RANGE: u8 = 0xFF;
+
+inline fn nextSlot(slot: u64, wrap_mask: u64) u64 {
+    return (slot & ~wrap_mask) | ((slot + 1) & wrap_mask);
+}
+
+inline fn homeSlot(comptime kind: FastKeyKind, digest: u64, mask: u64) u64 {
+    return (if (kind == .int) fastMix(digest) else digest) & mask;
+}
+
+inline fn prefetchSlot(slot_keys: []u64, heads: []u32, slot: usize) void {
+    @prefetch(&heads[slot], .{ .rw = .write, .locality = 3, .cache = .data });
+    @prefetch(&slot_keys[slot], .{ .rw = .write, .locality = 3, .cache = .data });
+}
+
+const Place = enum { placed, chained, needs_chain, full };
+
+/// Probe from `home` (wrapping under `wrap_mask`) and insert `row`: into
+/// the first empty slot, or onto the chain of an equal resident key.
+/// `needs_chain` means an equal key sits there but no chain array exists
+/// yet; the caller allocates one and places the row again. `full` means
+/// the probe walked the whole wrap region without an empty slot.
+inline fn placeRow(slot_keys: []u64, heads: []u32, chain_next: []u32, key: u64, row: u32, home: u64, wrap_mask: u64) Place {
+    var slot = home;
+    var steps: u64 = 0;
+    while (true) {
+        if (heads[slot] == FAST_EMPTY) {
+            slot_keys[slot] = key;
+            heads[slot] = row;
+            return .placed;
+        }
+        if (slot_keys[slot] == key) {
+            // Same key (or same digest, for string/compound kinds — treated
+            // as a duplicate conservatively) already resident: chains of
+            // length > 1 exist, so pass-through can't assume one match per
+            // probe row.
+            if (chain_next.len == 0) return .needs_chain;
+            chain_next[row] = heads[slot];
+            heads[slot] = row;
+            return .chained;
+        }
+        slot = nextSlot(slot, wrap_mask);
+        steps += 1;
+        if (steps > wrap_mask) return .full;
+    }
+}
+
+/// The single-range insert: walks every digest in REVERSE row order (so a
+/// duplicate chain reads ascending, see FastTable) on the calling thread.
+const InsertJob = struct {
+    kind: FastKeyKind,
+    key_view: ColumnView,
+    key_views: []const ColumnView,
+    digests: []const u64,
+    slot_keys: []u64,
+    heads: []u32,
+    chain_next: []u32,
+    mask: u64,
+    /// Allocates the chain on the first duplicate; null when the chain was
+    /// allocated up front.
+    lazy_chain: ?Allocator = null,
+    keys_unique: bool = true,
+    alloc_failed: bool = false,
+
+    fn run(job: *InsertJob) void {
+        switch (job.kind) {
+            inline else => |k| job.insertRows(k),
+        }
+    }
+
+    fn insertRows(job: *InsertJob, comptime kind: FastKeyKind) void {
+        const n: u32 = @intCast(job.digests.len);
+        const mask = job.mask;
+        var row: u32 = n;
+        while (row > 0) {
+            row -= 1;
+            if (row >= INSERT_PREFETCH_DIST) {
+                const ahead = job.digests[row - INSERT_PREFETCH_DIST];
+                prefetchSlot(job.slot_keys, job.heads, @intCast(homeSlot(kind, ahead, mask)));
+            }
+            const valid = switch (kind) {
+                .int, .string => job.key_view.isValid(row),
+                .compound => !anyViewNull(job.key_views, row),
+            };
+            if (!valid) continue;
+            const key = job.digests[row];
+            const home = homeSlot(kind, key, mask);
+            switch (placeRow(job.slot_keys, job.heads, job.chain_next, key, row, home, mask)) {
+                .placed => {},
+                .chained => job.keys_unique = false,
+                .needs_chain => {
+                    job.keys_unique = false;
+                    const a = job.lazy_chain orelse unreachable;
+                    job.chain_next = a.alloc(u32, n) catch {
+                        job.alloc_failed = true;
+                        return;
+                    };
+                    @memset(job.chain_next, FAST_EMPTY);
+                    _ = placeRow(job.slot_keys, job.heads, job.chain_next, key, row, home, mask);
+                },
+                // The whole table is the wrap region and holds at most half
+                // its slots, so a probe always finds an empty slot.
+                .full => unreachable,
+            }
+        }
+    }
+};
+
+/// A parallel build's valid rows grouped by slot range: range r's rows are
+/// `rows[bounds[r]..bounds[r + 1]]` in ascending row order and `digests`
+/// holds their digests at the same positions, so a range's insert reads
+/// one contiguous strip and never touches another range's rows.
+const RangedRows = struct {
+    rows: []u32,
+    digests: []u64,
+    bounds: [PARALLEL_INSERT_RANGES + 1]u32,
+
+    fn free(self: RangedRows, scratch: Allocator) void {
+        scratch.free(self.rows);
+        scratch.free(self.digests);
+    }
+};
+
+/// Two passes over the key rows on `workers` threads, each thread over the
+/// same row block both times: digest the block's rows, tag each with its
+/// range and count the block's rows per range; then, after a prefix sum,
+/// scatter rows and digests through per-(block, range) cursors laid out
+/// range-major.
+const PartitionPass = struct {
+    kind: FastKeyKind,
+    views: []const ColumnView,
+    digests: []u64,
+    mask: u64,
+    range_shift: u6,
+    range_of: []u8,
+    out: RangedRows,
+    /// Per (block, range): the block's row count after `digestAndTag`, its
+    /// start position after the prefix sum.
+    cursors: [MAX_DIGEST_WORKERS][PARALLEL_INSERT_RANGES]u32,
+
+    fn digestAndTag(p: *PartitionPass, w: usize, lo: usize, hi: usize) void {
+        switch (p.kind) {
+            inline else => |k| p.tagRows(k, w, lo, hi),
+        }
+    }
+
+    fn tagRows(p: *PartitionPass, comptime kind: FastKeyKind, w: usize, lo: usize, hi: usize) void {
+        var c: [PARALLEL_INSERT_RANGES]u32 = .{0} ** PARALLEL_INSERT_RANGES;
+        var row: u32 = @intCast(lo);
+        while (row < hi) : (row += 1) {
+            const digest = digestRow(kind, p.views, row) orelse {
+                p.digests[row] = 0;
+                p.range_of[row] = NULL_RANGE;
+                continue;
+            };
+            p.digests[row] = digest;
+            const r: u8 = @intCast(homeSlot(kind, digest, p.mask) >> p.range_shift);
+            p.range_of[row] = r;
+            c[r] += 1;
+        }
+        p.cursors[w] = c;
+    }
+
+    fn scatter(p: *PartitionPass, w: usize, lo: usize, hi: usize) void {
+        var cursor = p.cursors[w];
+        var row: u32 = @intCast(lo);
+        while (row < hi) : (row += 1) {
+            const r = p.range_of[row];
+            if (r == NULL_RANGE) continue;
+            const at = cursor[r];
+            cursor[r] += 1;
+            p.out.rows[at] = row;
+            p.out.digests[at] = p.digests[row];
+        }
+    }
+};
+
+fn partitionRows(scratch: Allocator, kind: FastKeyKind, views: []const ColumnView, digests: []u64, mask: u64, range_shift: u6, workers: usize) !RangedRows {
+    const n = digests.len;
+    const range_of = try scratch.alloc(u8, n);
+    defer scratch.free(range_of);
+    const rows = try scratch.alloc(u32, n);
+    errdefer scratch.free(rows);
+    const out_digests = try scratch.alloc(u64, n);
+    errdefer scratch.free(out_digests);
+    var pass = PartitionPass{
+        .kind = kind,
+        .views = views,
+        .digests = digests,
+        .mask = mask,
+        .range_shift = range_shift,
+        .range_of = range_of,
+        .out = .{ .rows = rows, .digests = out_digests, .bounds = undefined },
+        .cursors = undefined,
+    };
+    parallel.forRanges(workers, n, &pass, PartitionPass.digestAndTag);
+    var at: u32 = 0;
+    for (0..PARALLEL_INSERT_RANGES) |r| {
+        pass.out.bounds[r] = at;
+        for (0..workers) |w| {
+            const c = pass.cursors[w][r];
+            pass.cursors[w][r] = at;
+            at += c;
+        }
+    }
+    pass.out.bounds[PARALLEL_INSERT_RANGES] = at;
+    parallel.forRanges(workers, n, &pass, PartitionPass.scatter);
+    return pass.out;
+}
+
+/// One job per slot range of a parallel build: inserts the range's rows in
+/// REVERSE row order (so chains read ascending) with probes wrapping inside
+/// the range. Results land per range, so jobs never share a field.
+const RangeInsert = struct {
+    kind: FastKeyKind,
+    ranged: RangedRows,
+    slot_keys: []u64,
+    heads: []u32,
+    chain_next: []u32,
+    mask: u64,
+    wrap_mask: u64,
+    keys_unique: [PARALLEL_INSERT_RANGES]bool = .{true} ** PARALLEL_INSERT_RANGES,
+    range_full: [PARALLEL_INSERT_RANGES]bool = .{false} ** PARALLEL_INSERT_RANGES,
+
+    fn job(self: *RangeInsert, _: usize, r: usize) void {
+        switch (self.kind) {
+            inline else => |k| self.insertRange(k, r),
+        }
+    }
+
+    fn insertRange(self: *RangeInsert, comptime kind: FastKeyKind, r: usize) void {
+        const lo = self.ranged.bounds[r];
+        const rows = self.ranged.rows;
+        const digests = self.ranged.digests;
+        var unique = true;
+        var j = self.ranged.bounds[r + 1];
+        while (j > lo) {
+            j -= 1;
+            if (j >= lo + INSERT_PREFETCH_DIST) {
+                const ahead = digests[j - INSERT_PREFETCH_DIST];
+                prefetchSlot(self.slot_keys, self.heads, @intCast(homeSlot(kind, ahead, self.mask)));
+            }
+            const key = digests[j];
+            switch (placeRow(self.slot_keys, self.heads, self.chain_next, key, rows[j], homeSlot(kind, key, self.mask), self.wrap_mask)) {
+                .placed => {},
+                .chained => unique = false,
+                // A parallel build allocates the chain up front.
+                .needs_chain => unreachable,
+                .full => {
+                    self.range_full[r] = true;
+                    return;
+                },
+            }
+        }
+        self.keys_unique[r] = unique;
+    }
+};
+
+/// Threads for a build that has no DOP of its own (a private join build):
+/// the machine's cores, capped — the pre-pass is short and memory-bound.
+pub fn defaultBuildThreads() usize {
+    const cores = std.Thread.getCpuCount() catch 1;
+    return @min(cores, @as(usize, 8));
+}
+
+/// `scratch` holds the per-row digests only for the duration of the build;
+/// `threads` bounds the digest pre-pass workers.
+pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const ColumnView, n: u32, needs_chain: bool, threads: usize) !?FastBuild {
+    const key_view = key_views[0];
+    const kind: FastKeyKind = if (key_views.len > 1) .compound else switch (key_view.data) {
+        .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
+        .varchar, .string, .char, .json => .string,
+        else => return null,
+    };
+    var owned_key_views: []ColumnView = &.{};
+    if (kind == .compound) owned_key_views = try aa.dupe(ColumnView, key_views);
+
+    const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, @as(usize, n) * 2));
+    const slot_keys = try aa.alloc(u64, cap);
+    const heads = try aa.alloc(u32, cap);
+    @memset(heads, FAST_EMPTY);
+    var chain_next: []u32 = &.{};
+    if (needs_chain) {
+        chain_next = try aa.alloc(u32, n);
+        @memset(chain_next, FAST_EMPTY);
+    }
+    const mask: u64 = cap - 1;
+
+    // Hashing every key row is independent work, so it runs ahead on
+    // worker threads; the insert then only walks the table, with the slots
+    // of upcoming rows prefetched. A large build also groups the rows by
+    // slot range in that pre-pass and inserts the ranges on parallel
+    // threads. Rows insert in REVERSE order so duplicate chains read
+    // ascending (see FastTable).
+    const t_start = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+    const digests = try scratch.alloc(u64, n);
+    defer scratch.free(digests);
+    const digest_views: []const ColumnView = if (kind == .compound) owned_key_views else key_views[0..1];
+    const ranged_build = n >= PARALLEL_INSERT_MIN_ROWS;
+    if (!ranged_build) digestAll(kind, digest_views, digests, threads);
+
+    if (ranged_build and chain_next.len == 0) {
+        chain_next = try aa.alloc(u32, n);
+        @memset(chain_next, FAST_EMPTY);
+    }
+    var job = InsertJob{
+        .kind = kind,
+        .key_view = key_view,
+        .key_views = owned_key_views,
+        .digests = digests,
+        .slot_keys = slot_keys,
+        .heads = heads,
+        .chain_next = chain_next,
+        .mask = mask,
+        .lazy_chain = aa,
+    };
+    var keys_unique = true;
+    var ranged = false;
+    var t_insert: i64 = 0;
+    if (ranged_build) {
+        const range_len: u64 = cap / PARALLEL_INSERT_RANGES;
+        const workers: usize = @max(@as(usize, 1), @min(threads, MAX_DIGEST_WORKERS));
+        const ranged_rows = try partitionRows(scratch, kind, digest_views, digests, mask, std.math.log2_int(u64, range_len), workers);
+        defer ranged_rows.free(scratch);
+        t_insert = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        var ins = RangeInsert{
+            .kind = kind,
+            .ranged = ranged_rows,
+            .slot_keys = slot_keys,
+            .heads = heads,
+            .chain_next = chain_next,
+            .mask = mask,
+            .wrap_mask = range_len - 1,
+        };
+        parallel.forJobs(workers, PARALLEL_INSERT_RANGES, &ins, RangeInsert.job);
+        var range_full = false;
+        for (0..PARALLEL_INSERT_RANGES) |r| {
+            if (!ins.keys_unique[r]) keys_unique = false;
+            if (ins.range_full[r]) range_full = true;
+        }
+        ranged = !range_full;
+        if (range_full) {
+            // The digests were far from uniform and one range overfilled:
+            // rebuild the whole table as a single range.
+            @memset(heads, FAST_EMPTY);
+            @memset(chain_next, FAST_EMPTY);
+            job.lazy_chain = null;
+            job.run();
+            keys_unique = job.keys_unique;
+        }
+    } else {
+        t_insert = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        job.run();
+        keys_unique = job.keys_unique;
+        chain_next = job.chain_next;
+        if (job.alloc_failed) return error.OutOfMemory;
+    }
+    const wrap_mask: u64 = if (ranged) cap / PARALLEL_INSERT_RANGES - 1 else mask;
+    if (exec.prof.enabled and n >= 65536) {
+        std.debug.print("[hprof] fasttable rows={d} kind={s} threads={d} ranged={} prep={d:.1}ms insert={d:.1}ms\n", .{
+            n,
+            @tagName(kind),
+            threads,
+            ranged,
+            exec.prof.ticksToMs(t_insert - t_start),
+            exec.prof.ticksToMs(exec.prof.nowTicks() - t_insert),
+        });
+    }
+
+    return .{
+        .table = .{
+            .kind = kind,
+            .slot_keys = slot_keys,
+            .heads = heads,
+            .mask = mask,
+            .wrap_mask = wrap_mask,
+            .next = chain_next,
+            .build_key_view = key_view,
+            .build_key_views = owned_key_views,
+        },
+        .keys_unique = keys_unique,
+    };
+}
+
+const DigestJob = struct {
+    kind: FastKeyKind,
+    views: []const ColumnView,
+    digests: []u64,
+    start: u32,
+    end: u32,
+
+    fn run(job: *const DigestJob) void {
+        switch (job.kind) {
+            inline else => |k| digestRange(k, job.views, job.digests, job.start, job.end),
+        }
+    }
+};
+
+/// A key row's digest; null for a NULL key, which never enters the table.
+inline fn digestRow(comptime kind: FastKeyKind, views: []const ColumnView, row: u32) ?u64 {
+    const kv = views[0];
+    return switch (kind) {
+        .int => if (kv.isValid(row)) fastIntKey(kv, row) else null,
+        .string => if (kv.isValid(row)) std.hash.Wyhash.hash(0, stringRowBytes(kv, row)) else null,
+        .compound => if (anyViewNull(views, row)) null else fastCompoundDigest(views, row),
+    };
+}
+
+/// A NULL key row gets digest 0; the insert re-checks validity and skips
+/// it, so the value is never used.
+fn digestRange(comptime kind: FastKeyKind, views: []const ColumnView, digests: []u64, start: u32, end: u32) void {
+    var row = start;
+    while (row < end) : (row += 1) digests[row] = digestRow(kind, views, row) orelse 0;
+}
+
+fn digestAll(kind: FastKeyKind, views: []const ColumnView, digests: []u64, threads: usize) void {
+    const n: u32 = @intCast(digests.len);
+    const by_rows: usize = n / DIGEST_ROWS_PER_WORKER;
+    const workers: usize = @max(@as(usize, 1), @min(@min(threads, by_rows), MAX_DIGEST_WORKERS));
+    var jobs: [MAX_DIGEST_WORKERS]DigestJob = undefined;
+    for (0..workers) |w| {
+        jobs[w] = .{
+            .kind = kind,
+            .views = views,
+            .digests = digests,
+            .start = @intCast(@as(usize, n) * w / workers),
+            .end = @intCast(if (w + 1 == workers) n else @as(usize, n) * (w + 1) / workers),
+        };
+    }
+    var handles: [MAX_DIGEST_WORKERS]?std.Thread = .{null} ** MAX_DIGEST_WORKERS;
+    for (1..workers) |w| handles[w] = std.Thread.spawn(.{}, DigestJob.run, .{&jobs[w]}) catch null;
+    jobs[0].run();
+    for (1..workers) |w| {
+        if (handles[w]) |t| t.join() else jobs[w].run();
+    }
+}
 
 /// murmur3 finalizer — raw int keys need mixing before masking.
 fn fastMix(x0: u64) u64 {
@@ -554,7 +1033,15 @@ pub const Join = struct {
 
     /// Materialized build side. One ColumnStore per build-side column.
     build_columns: []ColumnStore,
+    /// One view per build column spanning every build row, set once the
+    /// build is complete: either `build_columns` (drained copy) or a
+    /// stage's own contiguous columns (`bindSharedStageBuild`).
+    build_views: []ColumnView,
     build_rows: u32 = 0,
+    prof_build_ticks: i64 = 0,
+    prof_probe_ticks: i64 = 0,
+    prof_out_rows: u64 = 0,
+    prof_shared_build: bool = false,
 
     /// Hash table: compound key bytes → list of row indices into
     /// `build_columns`. Multiple matches per key carried as a list.
@@ -849,17 +1336,7 @@ pub const Join = struct {
         @memcpy(right_kept_mask_owned, right_kept_mask);
         errdefer allocator.free(right_kept_mask_owned);
 
-        // Build-side selection. INNER + FULL: pick smaller side (less
-        // memory, less hashing). LEFT/RIGHT: build is the NON-preserved
-        // side (the preserved side must be the probe so we walk every
-        // row and know per-row whether a match occurred).
-        const left_stats = left.stats();
-        const right_stats = right.stats();
-        const build_is_left = switch (spec.join_type) {
-            .inner, .full => left_stats.upper_rows <= right_stats.upper_rows,
-            .left => false, // preserve left → probe = left → build = right
-            .right => true, // preserve right → probe = right → build = left
-        };
+        const build_is_left = buildIsLeft(spec.join_type, left, right);
 
         const build_schema = if (build_is_left) left_schema else right_schema;
 
@@ -872,6 +1349,8 @@ pub const Join = struct {
             build_columns[i] = try ColumnStore.init(allocator, col.type, col.nullable);
             binited += 1;
         }
+        const build_views = try allocator.alloc(ColumnView, build_schema.len);
+        errdefer allocator.free(build_views);
 
         // Output staging.
         const output_columns = try allocator.alloc(ColumnStore, output_schema.len);
@@ -913,6 +1392,7 @@ pub const Join = struct {
             .right_kept_mask = right_kept_mask_owned,
             .cached_stats = cached_stats,
             .build_columns = build_columns,
+            .build_views = build_views,
             .hash_table = .empty,
             .key_scratch = .empty,
             .output_columns = output_columns,
@@ -996,7 +1476,19 @@ pub const Join = struct {
         return q;
     }
 
+    /// Which input a hash join materializes: the preserved side of an outer
+    /// join must stream (probe), and an inner / full join builds the side
+    /// with the smaller row bound.
+    pub fn buildIsLeft(join_type: JoinType, left: Query, right: Query) bool {
+        return switch (join_type) {
+            .inner, .full => left.stats().upper_rows <= right.stats().upper_rows,
+            .left => false,
+            .right => true,
+        };
+    }
+
     pub fn deinit(self: *Join) void {
+        self.allocator.free(self.build_views);
         if (self.transferred_to_skew) {
             // skew_smj owns left, right, and build_columns. Calling
             // its deinit cascades to those resources.
@@ -1234,17 +1726,34 @@ pub const Join = struct {
                         if (try self.nextProbe()) |first| {
                             self.peeked_probe = first;
                         } else {
-                            self.phase = .done;
+                            self.finishPhase();
                             return null;
                         }
                     }
+                    const _bt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
                     try self.buildPhase();
+                    if (exec.prof.enabled) {
+                        self.prof_build_ticks += exec.prof.nowTicks() - _bt;
+                        if (exec.prof.ticksToMs(self.prof_build_ticks) > 30.0 and !self.prof_shared_build) {
+                            const build_q = if (self.build_is_left) self.left else self.right;
+                            var buf: std.ArrayList(u8) = .empty;
+                            defer buf.deinit(std.heap.page_allocator);
+                            build_q.explain(&buf, std.heap.page_allocator, 0) catch {};
+                            std.debug.print("[hprof] join slow build ({d:.1} ms, {d} rows, {s} on={d}) build-side plan:\n{s}\n", .{
+                                exec.prof.ticksToMs(self.prof_build_ticks),
+                                self.build_rows,
+                                @tagName(self.join_type),
+                                self.left_key_indices.len,
+                                buf.items,
+                            });
+                        }
+                    }
                     if (self.skew_smj) |*sm| return sm.next();
                     // Empty-build short-circuit: with nothing to match and
                     // no preserved probe side, the join produces nothing —
                     // skip streaming the probe entirely.
                     if (self.build_rows == 0 and !self.probeSidePreserved()) {
-                        self.phase = .done;
+                        self.finishPhase();
                         return null;
                     }
                     // Sideways info passing: an INNER join only emits probe
@@ -1268,9 +1777,16 @@ pub const Join = struct {
                     self.phase = .probing;
                 },
                 .probing => {
+                    const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+                    defer if (exec.prof.enabled) {
+                        self.prof_probe_ticks += exec.prof.nowTicks() - _pt;
+                    };
                     if (self.probe_fused) {
-                        if (try self.nextProbe()) |batch| return batch;
-                        self.phase = .done;
+                        if (try self.nextProbe()) |batch| {
+                            self.prof_out_rows += batch.row_count;
+                            return batch;
+                        }
+                        self.finishPhase();
                         return null;
                     }
                     const step = if (self.passthrough)
@@ -1279,7 +1795,10 @@ pub const Join = struct {
                         try self.probeStepFast(ft)
                     else
                         try self.probeStep();
-                    if (step) |batch| return batch;
+                    if (step) |batch| {
+                        self.prof_out_rows += batch.row_count;
+                        return batch;
+                    }
                     // probeStep returned null → exhausted
                     if (self.join_type == .full) {
                         self.phase = .draining_unmatched;
@@ -1287,13 +1806,13 @@ pub const Join = struct {
                         // appending into the same output buffer.
                         continue;
                     }
-                    self.phase = .done;
+                    self.finishPhase();
                     if (try self.flushOutput()) |batch| return batch;
                     return null;
                 },
                 .draining_unmatched => {
                     if (try self.drainStep()) |batch| return batch;
-                    self.phase = .done;
+                    self.finishPhase();
                     if (try self.flushOutput()) |batch| return batch;
                     return null;
                 },
@@ -1315,6 +1834,37 @@ pub const Join = struct {
     /// comparison is byte order for strings — the same order the zonemap
     /// stats use. Best-effort: any unsupported type or rejection just means
     /// no pruning for that column.
+    fn finishPhase(self: *Join) void {
+        self.phase = .done;
+        if (exec.prof.enabled) self.reportProfile();
+    }
+
+    fn reportProfile(self: *Join) void {
+        const build_ms = exec.prof.ticksToMs(self.prof_build_ticks);
+        const probe_ms = exec.prof.ticksToMs(self.prof_probe_ticks);
+        if (build_ms + probe_ms < 0.5) return;
+        const mode: []const u8 = if (self.prof_shared_build)
+            "shared"
+        else if (self.probe_fused)
+            "fused"
+        else if (self.passthrough)
+            "pass"
+        else if (self.fast_table != null)
+            "fast"
+        else
+            "general";
+        std.debug.print("[hprof] join {s} on={d} build_rows={d} build={d:.1}ms probe={d:.1}ms out_rows={d} out_cols={d} mode={s}\n", .{
+            @tagName(self.join_type),
+            self.left_key_indices.len,
+            self.build_rows,
+            build_ms,
+            probe_ms,
+            self.prof_out_rows,
+            self.output_schema.len,
+            mode,
+        });
+    }
+
     fn offerBuildKeyPrunes(self: *Join) void {
         const build_names = if (self.build_is_left) self.left_key_names else self.right_key_names;
         const probe_names = if (self.build_is_left) self.right_key_names else self.left_key_names;
@@ -1328,11 +1878,11 @@ pub const Join = struct {
         keys: for (build_names, probe_names) |bname, pname| {
             const bci = columnIndex(build_schema, bname) orelse continue;
             const pci = columnIndex(probe_schema, pname) orelse continue;
-            if (bci >= self.build_columns.len) continue;
+            if (bci >= self.build_views.len) continue;
             // Mismatched physical types would make the Value comparison in
             // predicate eval subtly wrong — only prune same-typed keys.
             if (!std.meta.eql(build_schema[bci].type, probe_schema[pci].type)) continue;
-            const view = self.build_columns[bci].view();
+            const view = self.build_views[bci];
             var mn: ?types.Value = null;
             var mx: ?types.Value = null;
             var row: usize = 0;
@@ -1353,6 +1903,10 @@ pub const Join = struct {
     }
 
     fn buildPhase(self: *Join) !void {
+        if (try self.bindSharedStageBuild()) {
+            self.prof_shared_build = true;
+            return;
+        }
         var up = if (self.build_is_left) &self.left else &self.right;
         const key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
         const acc = up.accountant();
@@ -1424,6 +1978,7 @@ pub const Join = struct {
             }
             self.build_rows += @intCast(n);
         }
+        for (self.build_columns, self.build_views) |*c, *v| v.* = c.view();
 
         // After build, check skew via two-gate AND:
         //   ratio:    top_freq / observed_total >= skew_ratio_threshold
@@ -1456,91 +2011,76 @@ pub const Join = struct {
         try self.tryBuildFastTable();
     }
 
+    /// A build side that is a materialized stage (seen through alias and
+    /// column-projection wrappers) is read in place: the stage's contiguous
+    /// columns become the build views and its FastTable for this key set is
+    /// built once and shared with every other join over the same stage —
+    /// a query tail commonly joins one CTE several times on the same keys.
+    /// Declines when the join isn't fast-eligible or the skew route (which
+    /// hands a private build copy to a sort-merge join) is armed.
+    fn bindSharedStageBuild(self: *Join) !bool {
+        if (!self.fast_eligible or self.skew_smj != null) return false;
+        if (self.skew_detector != null and self.join_type == .inner) return false;
+        const build_q = if (self.build_is_left) self.left else self.right;
+        var why: []const u8 = "";
+        var src = (try mat_stage.stageBehind(self.allocator, build_q, &why)) orelse {
+            if (getenv("THINDB_TRACE_JOINFUSE") != null) {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(std.heap.page_allocator);
+                build_q.explain(&buf, std.heap.page_allocator, 0) catch {};
+                var it = std.mem.splitScalar(u8, buf.items, '\n');
+                var depth: usize = 0;
+                std.debug.print("[jf] shared build declined ({s}):\n", .{why});
+                while (it.next()) |line| : (depth += 1) {
+                    if (depth >= 8 or line.len == 0) break;
+                    std.debug.print("[jf]     build: {s}\n", .{std.mem.trim(u8, line, " ")});
+                }
+            }
+            return false;
+        };
+        defer src.deinit(self.allocator);
+        const key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
+        var keys: [MAX_FAST_KEYS]mat_stage.KeySpec = undefined;
+        for (key_indices, 0..) |ki, i| keys[i] = .{ .col = src.map[ki], .cast = src.casts[ki] };
+        var casts: [mat_stage.MAX_STAGE_CASTS]mat_stage.ColumnCast = undefined;
+        var ncasts: usize = 0;
+        for (src.map, src.casts) |col, slot_cast| {
+            const fn_name = slot_cast orelse continue;
+            const spec: mat_stage.ColumnCast = .{ .col = col, .fn_name = fn_name };
+            var seen = false;
+            for (casts[0..ncasts]) |c| {
+                if (c.eql(spec)) seen = true;
+            }
+            if (seen) continue;
+            if (ncasts == casts.len) return false;
+            casts[ncasts] = spec;
+            ncasts += 1;
+        }
+        const shared = (try src.stage.sharedJoinBuild(keys[0..key_indices.len], casts[0..ncasts], self.join_type == .full)) orelse return false;
+        for (self.build_views, src.map, src.casts) |*v, col, slot_cast| v.* = shared.viewFor(col, slot_cast);
+        self.build_rows = shared.rows;
+        self.fast_table = shared.table;
+        self.build_keys_unique = shared.keys_unique;
+        if (getenv("THINDB_TRACE_JOINFUSE") != null) {
+            std.debug.print("[jf] shared stage build stage#{d} rows={d} keys={d} casts={d}\n", .{ src.stage.id, shared.rows, key_indices.len, ncasts });
+        }
+        return true;
+    }
+
     /// Build the vectorized-probe FastTable when the join shape
-    /// qualifies: exactly one join key, int-family or string type,
-    /// no range predicates, not skew-routed. Float/decimal/uuid keys
-    /// stay on the general path (rare in practice; float bit-equality
-    /// vs compound-key bit-equality is the same, but not worth a lane).
+    /// qualifies: int-family or string keys, no range predicates, not
+    /// skew-routed. Float/decimal/uuid keys stay on the general path
+    /// (rare in practice; float bit-equality vs compound-key bit-equality
+    /// is the same, but not worth a lane).
     fn tryBuildFastTable(self: *Join) !void {
         if (self.skew_smj != null) return;
         if (!self.fast_eligible) return;
-        const aa = self.arena.allocator();
         const build_key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
-        const key_view = self.build_columns[build_key_indices[0]].view();
-        const kind: FastKeyKind = if (build_key_indices.len > 1) .compound else switch (key_view.data) {
-            .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
-            .varchar, .string, .char, .json => .string,
-            else => return,
-        };
-        var key_views: []ColumnView = &.{};
-        if (kind == .compound) {
-            key_views = try aa.alloc(ColumnView, build_key_indices.len);
-            for (build_key_indices, key_views) |ki, *v| v.* = self.build_columns[ki].view();
-        }
-
-        const n: usize = self.build_rows;
-        const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, n * 2));
-        const slot_keys = try aa.alloc(u64, cap);
-        const heads = try aa.alloc(u32, cap);
-        @memset(heads, FAST_EMPTY);
-        var chain_next: []u32 = &.{};
-        if (self.join_type == .full) {
-            chain_next = try aa.alloc(u32, n);
-            @memset(chain_next, FAST_EMPTY);
-        }
-        const mask: u64 = cap - 1;
-
-        var row: u32 = @intCast(n);
-        while (row > 0) {
-            row -= 1;
-            const key = switch (kind) {
-                .int => blk: {
-                    if (!key_view.isValid(row)) continue;
-                    break :blk fastIntKey(key_view, row);
-                },
-                .string => blk: {
-                    if (!key_view.isValid(row)) continue;
-                    break :blk std.hash.Wyhash.hash(0, stringRowBytes(key_view, row));
-                },
-                .compound => blk: {
-                    if (anyViewNull(key_views, row)) continue;
-                    break :blk fastCompoundDigest(key_views, row);
-                },
-            };
-            var slot = (if (kind == .int) fastMix(key) else key) & mask;
-            while (true) {
-                if (heads[slot] == FAST_EMPTY) {
-                    slot_keys[slot] = key;
-                    heads[slot] = row;
-                    break;
-                }
-                if (slot_keys[slot] == key) {
-                    // Same key (or same digest, for string/compound kinds —
-                    // treated as a duplicate conservatively) already
-                    // resident: chains of length > 1 exist, so pass-through
-                    // can't assume one match per probe row.
-                    self.build_keys_unique = false;
-                    if (chain_next.len == 0) {
-                        chain_next = try aa.alloc(u32, n);
-                        @memset(chain_next, FAST_EMPTY);
-                    }
-                    chain_next[row] = heads[slot];
-                    heads[slot] = row;
-                    break;
-                }
-                slot = (slot + 1) & mask;
-            }
-        }
-
-        self.fast_table = .{
-            .kind = kind,
-            .slot_keys = slot_keys,
-            .heads = heads,
-            .mask = mask,
-            .next = chain_next,
-            .build_key_view = key_view,
-            .build_key_views = key_views,
-        };
+        var key_views: [MAX_FAST_KEYS]ColumnView = undefined;
+        for (build_key_indices, 0..) |ki, i| key_views[i] = self.build_views[ki];
+        const built = (try buildFastTable(self.arena.allocator(), self.allocator, key_views[0..build_key_indices.len], self.build_rows, self.join_type == .full, defaultBuildThreads())) orelse return;
+        self.fast_table = built.table;
+        if (!built.keys_unique) self.build_keys_unique = false;
     }
 
     fn routeToSmjOnSkew(self: *Join) !void {
@@ -1680,7 +2220,7 @@ pub const Join = struct {
                             }
                             break;
                         }
-                        slot = (slot + 1) & ft.mask;
+                        slot = nextSlot(slot, ft.wrap_mask);
                     }
                 },
                 .string => {
@@ -1708,7 +2248,7 @@ pub const Join = struct {
                             }
                             break;
                         }
-                        slot = (slot + 1) & ft.mask;
+                        slot = nextSlot(slot, ft.wrap_mask);
                     }
                 },
                 .compound => {
@@ -1735,7 +2275,7 @@ pub const Join = struct {
                             }
                             break;
                         }
-                        slot = (slot + 1) & ft.mask;
+                        slot = nextSlot(slot, ft.wrap_mask);
                     }
                 },
             }
@@ -1775,7 +2315,7 @@ pub const Join = struct {
         if (self.build_is_left) {
             var i: usize = 0;
             while (i < left_count) : (i += 1) {
-                try gatherBuildColumn(alloc, self.build_columns[i].view(), build_rows, &out_cols[out_idx]);
+                try gatherBuildColumn(alloc, self.build_views[i], build_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
             for (batch.values, 0..) |v, idx2| {
@@ -1789,9 +2329,9 @@ pub const Join = struct {
                 try transform.appendByIndices(alloc, batch.values[i], probe_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
-            for (self.build_columns, 0..) |*bc, idx2| {
+            for (self.build_views, 0..) |bv, idx2| {
                 if (!self.right_kept_mask[idx2]) continue;
-                try gatherBuildColumn(alloc, bc.view(), build_rows, &out_cols[out_idx]);
+                try gatherBuildColumn(alloc, bv, build_rows, &out_cols[out_idx]);
                 out_idx += 1;
             }
         }
@@ -1891,7 +2431,7 @@ pub const Join = struct {
                 while (true) {
                     if (ft.heads[slot] == FAST_EMPTY) return FAST_EMPTY;
                     if (ft.slot_keys[slot] == key) return ft.heads[slot];
-                    slot = (slot + 1) & ft.mask;
+                    slot = nextSlot(slot, ft.wrap_mask);
                 }
             },
             .string => {
@@ -1911,7 +2451,7 @@ pub const Join = struct {
                         }
                         return FAST_EMPTY;
                     }
-                    slot = (slot + 1) & ft.mask;
+                    slot = nextSlot(slot, ft.wrap_mask);
                 }
             },
             .compound => {
@@ -1930,7 +2470,7 @@ pub const Join = struct {
                         }
                         return FAST_EMPTY;
                     }
-                    slot = (slot + 1) & ft.mask;
+                    slot = nextSlot(slot, ft.wrap_mask);
                 }
             },
         }
@@ -2003,7 +2543,7 @@ pub const Join = struct {
             while (i < left_count) : (i += 1) {
                 const store = &out_cols[out_idx];
                 store.clear();
-                try gatherBuildColumn(alloc, self.build_columns[i].view(), rows, store);
+                try gatherBuildColumn(alloc, self.build_views[i], rows, store);
                 out_views[out_idx] = store.view();
                 out_idx += 1;
             }
@@ -2018,11 +2558,11 @@ pub const Join = struct {
                 out_views[out_idx] = batch.values[i];
                 out_idx += 1;
             }
-            for (self.build_columns, 0..) |*bc, idx2| {
+            for (self.build_views, 0..) |bv, idx2| {
                 if (!self.right_kept_mask[idx2]) continue;
                 const store = &out_cols[out_idx];
                 store.clear();
-                try gatherBuildColumn(alloc, bc.view(), rows, store);
+                try gatherBuildColumn(alloc, bv, rows, store);
                 out_views[out_idx] = store.view();
                 out_idx += 1;
             }
@@ -2254,7 +2794,7 @@ pub const Join = struct {
                 // Left side = build. All build columns are left.
                 var i: usize = 0;
                 while (i < left_count) : (i += 1) {
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], &self.build_columns[i], build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], self.build_views[i], build_row);
                     out_idx += 1;
                 }
             } else {
@@ -2276,9 +2816,9 @@ pub const Join = struct {
                 }
             } else {
                 // Right side = build. Skip right-key columns.
-                for (self.build_columns, 0..) |*bc, i| {
+                for (self.build_views, 0..) |bv, i| {
                     if (!self.right_kept_mask[i]) continue;
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], bc, build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], bv, build_row);
                     out_idx += 1;
                 }
             }
@@ -2313,13 +2853,13 @@ pub const Join = struct {
     fn passesAllRanges(self: Join, batch: Batch, probe_row: u32, build_row: u32) bool {
         for (self.ranges) |rg| {
             const left_view: ColumnView = if (self.build_is_left)
-                self.build_columns[rg.left_col].view()
+                self.build_views[rg.left_col]
             else
                 batch.values[rg.left_col];
             const right_view: ColumnView = if (self.build_is_left)
                 batch.values[rg.right_col]
             else
-                self.build_columns[rg.right_col].view();
+                self.build_views[rg.right_col];
             const lrow: u32 = if (self.build_is_left) build_row else probe_row;
             const rrow: u32 = if (self.build_is_left) probe_row else build_row;
             if (!compareCellsOp(left_view, lrow, right_view, rrow, rg.op)) return false;
@@ -2434,7 +2974,7 @@ pub const Join = struct {
                 // right cols NULL (skipping dropped right-key cols).
                 var i: usize = 0;
                 while (i < left_count) : (i += 1) {
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], &self.build_columns[i], build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], self.build_views[i], build_row);
                     out_idx += 1;
                 }
                 for (self.right_kept_mask) |kept| {
@@ -2450,9 +2990,9 @@ pub const Join = struct {
                     try appendNullTo(self.allocator, &self.output_columns[out_idx]);
                     out_idx += 1;
                 }
-                for (self.build_columns, 0..) |*bc, idx2| {
+                for (self.build_views, 0..) |bv, idx2| {
                     if (!self.right_kept_mask[idx2]) continue;
-                    try appendOneFromBuild(self.allocator, &self.output_columns[out_idx], bc, build_row);
+                    try appendOneFromView(self.allocator, &self.output_columns[out_idx], bv, build_row);
                     out_idx += 1;
                 }
             }
@@ -2655,4 +3195,82 @@ fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
         .gt => ord == .gt,
         .gte => ord != .lt,
     };
+}
+
+fn expectSameFastTable(a: FastBuild, b: FastBuild) !void {
+    try std.testing.expectEqual(a.keys_unique, b.keys_unique);
+    try std.testing.expectEqual(a.table.mask, b.table.mask);
+    try std.testing.expectEqual(a.table.wrap_mask, b.table.wrap_mask);
+    try std.testing.expectEqualSlices(u32, a.table.heads, b.table.heads);
+    try std.testing.expectEqualSlices(u32, a.table.next, b.table.next);
+    for (a.table.heads, 0..) |head, slot| {
+        if (head == FAST_EMPTY) continue;
+        try std.testing.expectEqual(a.table.slot_keys[slot], b.table.slot_keys[slot]);
+    }
+}
+
+test "join: FastTable build is identical with threaded digests" {
+    const allocator = std.testing.allocator;
+    const n: u32 = 4 * DIGEST_ROWS_PER_WORKER + 12345;
+    const vals = try allocator.alloc(i64, n);
+    defer allocator.free(vals);
+    const small = try allocator.alloc(i32, n);
+    defer allocator.free(small);
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    for (vals, small, 0..) |*v, *sm, i| {
+        v.* = if (i % 97 == 0) @intCast(i / 97) else rnd.intRangeAtMost(i64, 0, 200000);
+        sm.* = @intCast(i % 1009);
+    }
+    const bm = try allocator.alloc(u8, (n + 7) / 8);
+    defer allocator.free(bm);
+    @memset(bm, 0xFF);
+    bm[0] = 0xFE;
+    const key = ColumnView{ .data = .{ .bigint = vals }, .nulls = bm };
+    const key2 = ColumnView{ .data = .{ .int = small } };
+
+    inline for (.{ false, true }) |compound| {
+        const views: []const ColumnView = if (compound) &.{ key, key2 } else &.{key};
+        var arena_a = std.heap.ArenaAllocator.init(allocator);
+        defer arena_a.deinit();
+        var arena_b = std.heap.ArenaAllocator.init(allocator);
+        defer arena_b.deinit();
+        const serial = (try buildFastTable(arena_a.allocator(), allocator, views, n, compound, 1)).?;
+        const threaded = (try buildFastTable(arena_b.allocator(), allocator, views, n, compound, 4)).?;
+        try expectSameFastTable(serial, threaded);
+        try std.testing.expect(!serial.keys_unique);
+    }
+}
+
+test "join: FastTable ranged parallel build finds every key" {
+    const allocator = std.testing.allocator;
+    const n: u32 = PARALLEL_INSERT_MIN_ROWS + 4321;
+    const vals = try allocator.alloc(i64, n);
+    defer allocator.free(vals);
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    for (vals, 0..) |*v, i| v.* = if (i % 5 == 0) @intCast(i / 5) else rnd.intRangeAtMost(i64, 0, 4_000_000);
+    const key = ColumnView{ .data = .{ .bigint = vals } };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const built = (try buildFastTable(arena.allocator(), allocator, &.{key}, n, false, 4)).?;
+    try std.testing.expect(built.table.wrap_mask < built.table.mask);
+    try std.testing.expect(!built.keys_unique);
+    var arena_one = std.heap.ArenaAllocator.init(allocator);
+    defer arena_one.deinit();
+    const one_thread = (try buildFastTable(arena_one.allocator(), allocator, &.{key}, n, false, 1)).?;
+    try expectSameFastTable(one_thread, built);
+
+    var first = std.AutoHashMap(i64, u32).init(allocator);
+    defer first.deinit();
+    for (vals, 0..) |v, i| {
+        const gop = try first.getOrPut(v);
+        if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+    }
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        try std.testing.expectEqual(first.get(vals[i]).?, Join.fastLookupFirst(&built.table, key, &.{}, i));
+    }
+    const absent = ColumnView{ .data = .{ .bigint = &.{-1} } };
+    try std.testing.expectEqual(FAST_EMPTY, Join.fastLookupFirst(&built.table, absent, &.{}, 0));
 }

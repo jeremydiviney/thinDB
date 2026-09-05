@@ -23,6 +23,7 @@
 //! through Io; std.time exposes only constants — see util/prof.zig).
 //!
 //! Run:  zig build gbmicro -Doptimize=ReleaseFast
+//!       zig build gbmicro -Doptimize=ReleaseFast -- rf    (rollforward-shaped block only)
 
 const std = @import("std");
 const win = std.os.windows;
@@ -1587,11 +1588,20 @@ fn q32_real_fullemit(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     return .{ .ticks = nowTicks() - t0, .cksum = ck };
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const a = gpa.allocator();
     const hz: f64 = @floatFromInt(perfFreq());
+
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, a);
+    defer args_iter.deinit();
+    _ = args_iter.skip();
+    var only_rf = false;
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "rf")) only_rf = true;
+    }
+    if (only_rf) return @import("groupby_micro_rf.zig").run(a, hz);
     const hashes = try a.alloc(u64, N);
     defer a.free(hashes);
 

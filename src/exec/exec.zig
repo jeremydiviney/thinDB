@@ -745,12 +745,46 @@ fn OpWrapper(comptime Op: type) type {
             const d = prof.nowTicks() - t0;
             const incl: u64 = if (d > 0) @intCast(d) else 0;
             prof.add(@typeName(Op), incl);
-            prof.selfLeave(@typeName(Op), incl, saved);
+            const self_t = prof.selfLeave(@typeName(Op), incl, saved);
+            const rows: u64 = if (r) |maybe| (if (maybe) |b| @intCast(b.row_count) else 0) else |_| 0;
+            prof.instAdd(ptr, self_t, rows);
             return r;
         }
         fn deinitWrap(ptr: *anyopaque) void {
             const o: *Op = @ptrCast(@alignCast(ptr));
+            if (!prof.enabled) return o.deinit();
+            if (prof.instTake(ptr)) |st| {
+                if (prof.ticksToMs(@intCast(st.ticks)) >= prof.INST_PRINT_MS) printInstance(o, st);
+            }
+            const saved = prof.deinitEnter();
+            const t0 = prof.nowTicks();
             o.deinit();
+            const d = prof.nowTicks() - t0;
+            prof.deinitLeave(@typeName(Op), if (d > 0) @intCast(d) else 0, saved);
+        }
+        fn printInstance(o: *Op, st: prof.InstStat) void {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(std.heap.page_allocator);
+            o.explain(&buf, std.heap.page_allocator, 0) catch {};
+            var head: [200]u8 = undefined;
+            var n: usize = 0;
+            var lines = std.mem.splitScalar(u8, buf.items, '\n');
+            var taken: usize = 0;
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " ");
+                if (line.len == 0) continue;
+                if (taken == 3 or n + line.len + 3 > head.len) break;
+                if (taken > 0) {
+                    @memcpy(head[n .. n + 3], " | ");
+                    n += 3;
+                }
+                @memcpy(head[n .. n + line.len], line);
+                n += line.len;
+                taken += 1;
+            }
+            std.debug.print("[inst] {s: <22} {d: >8.2} ms  ({d} calls, {d} rows, ~{d} thr)  {s}\n", .{
+                prof.shortOpName(@typeName(Op)), prof.ticksToMs(@intCast(st.ticks)), st.calls, st.rows, st.threads(), head[0..n],
+            });
         }
         fn outputSchemaWrap(ptr: *anyopaque) []const Column {
             const o: *Op = @ptrCast(@alignCast(ptr));
@@ -1162,6 +1196,7 @@ test {
     _ = Aggregate;
     _ = UdfAggregate;
     _ = @import("exec_test.zig");
+    _ = @import("aggregate_test.zig");
     _ = @import("scalar_fn_test.zig");
     _ = @import("scalar_fn_json.zig");
     _ = @import("json_binary.zig");

@@ -44,6 +44,7 @@ const LexError = lexer_mod.LexError;
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
 const Value = types.Value;
+const exec_expr = @import("../exec/expr.zig");
 const exec_predicate = @import("../exec/predicate.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
@@ -442,6 +443,10 @@ pub const Parser = struct {
     predicate_derived: std.ArrayList(ir.Derived) = .empty,
     predicate_derived_counter: usize = 0,
     predicate_derived_enabled: bool = false,
+    /// Start of the innermost open anchoring scope in `predicate_derived`
+    /// (a SELECT list or a WHERE); anchors dedupe only within it, since
+    /// every scope lands in its own Compute.
+    predicate_derived_scope: usize = 0,
     aggregate_expr_refs: std.ArrayList(AggExprRef) = .empty,
     aggregate_expr_counter: usize = 0,
     aggregate_expr_refs_enabled: bool = false,
@@ -631,10 +636,13 @@ pub const Parser = struct {
         const projection_pred_mark = self.predicate_derived.items.len;
         const old_aggregate_expr_refs_enabled = self.aggregate_expr_refs_enabled;
         const old_predicate_derived_enabled = self.predicate_derived_enabled;
+        const old_predicate_derived_scope = self.predicate_derived_scope;
         self.aggregate_expr_refs_enabled = true;
         self.predicate_derived_enabled = true;
+        self.predicate_derived_scope = projection_pred_mark;
         errdefer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
         errdefer self.predicate_derived_enabled = old_predicate_derived_enabled;
+        errdefer self.predicate_derived_scope = old_predicate_derived_scope;
         errdefer self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
         errdefer self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
         errdefer self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
@@ -642,6 +650,7 @@ pub const Parser = struct {
         const proj = try self.parseProjection();
         self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
         self.predicate_derived_enabled = old_predicate_derived_enabled;
+        self.predicate_derived_scope = old_predicate_derived_scope;
         const window_expr_refs = try self.arena.dupe(WindowExprRef, self.window_expr_refs.items[window_ref_mark..]);
         self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
         const projection_predicate_derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[projection_pred_mark..]);
@@ -664,8 +673,11 @@ pub const Parser = struct {
             try self.advance();
             const derived_mark = self.predicate_derived.items.len;
             const old_enabled = self.predicate_derived_enabled;
+            const old_scope = self.predicate_derived_scope;
             self.predicate_derived_enabled = true;
+            self.predicate_derived_scope = derived_mark;
             defer self.predicate_derived_enabled = old_enabled;
+            defer self.predicate_derived_scope = old_scope;
             const pred = try self.parseBoolExpr();
             if (self.predicate_derived.items.len > derived_mark) {
                 const derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[derived_mark..]);
@@ -1095,7 +1107,7 @@ pub const Parser = struct {
                 for (proj, 0..) |p, i| switch (p.kind) {
                     .expr => |e| {
                         if (i < post_window_expr.len and post_window_expr[i]) continue;
-                        try derived_buf.append(self.arena, .{ .name = p.name, .expr = e });
+                        try derived_buf.append(self.arena, .{ .name = p.name, .expr = self.sharedHiddenRef(projection_predicate_derived, e) });
                     },
                     else => {},
                 };
@@ -2752,6 +2764,7 @@ pub const Parser = struct {
                 try self.allocOp(.{ .materialize = .{
                     .upstream = entry.op,
                     .structural_cse = true,
+                    .name = first_dup,
                 } })
             else
                 entry.op;
@@ -4181,10 +4194,50 @@ pub const Parser = struct {
 
     pub fn materializePredicateExpr(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
         if (!self.predicate_derived_enabled) return ParseError.SqlInvalidProjection;
+        // The same expression anchored again in this scope (generated SQL
+        // repeats one CASE per derived flag) reads the column it already has.
+        if (self.exprShareable(expr)) {
+            for (self.predicate_derived.items[self.predicate_derived_scope..]) |d| {
+                if (exec_expr.eql(d.expr, expr)) return d.name;
+            }
+        }
         const name = std.fmt.allocPrint(self.arena, "__pred_expr_{d}", .{self.predicate_derived_counter}) catch return ParseError.OutOfMemory;
         self.predicate_derived_counter += 1;
         try self.predicate_derived.append(self.arena, .{ .name = name, .expr = expr });
         return name;
+    }
+
+    /// Whether two textual copies of `e` may evaluate once: not when a
+    /// call in it is volatile (RAND, NOW, a VOLATILE UDF) or it embeds a
+    /// subquery — each copy of those is its own draw or its own run.
+    fn exprShareable(self: *Parser, e: ir.Expr) bool {
+        return switch (e) {
+            .col_ref, .lit, .null_lit, .var_ref => true,
+            .call => |c| blk: {
+                if (!(self.joinScalarAllowed(c.fn_name) catch false)) break :blk false;
+                for (c.args) |a| if (!self.exprShareable(a)) break :blk false;
+                break :blk true;
+            },
+            .case => |cs| blk: {
+                for (cs.branches) |br| if (!self.exprShareable(br.then)) break :blk false;
+                if (cs.else_branch) |eb| if (!self.exprShareable(eb.*)) break :blk false;
+                break :blk true;
+            },
+            .scalar_subquery, .exists_subquery => false,
+        };
+    }
+
+    /// A SELECT-list expression this list already anchored as a hidden
+    /// predicate column (`CASE ... END AS kind` beside
+    /// `CASE WHEN (CASE ... END) = 'x' THEN 1 ...`) reads that column — the
+    /// scalar Compute sits directly above the anchors' Compute — instead of
+    /// evaluating the expression a second time.
+    fn sharedHiddenRef(self: *Parser, hidden: []const ir.Derived, e: ir.Expr) ir.Expr {
+        if (!self.exprShareable(e)) return e;
+        for (hidden) |d| {
+            if (exec_expr.eql(d.expr, e)) return .{ .col_ref = d.name };
+        }
+        return e;
     }
 
     pub fn predicateDerivedEnabled(self: *const Parser) bool {
@@ -4225,6 +4278,7 @@ pub const Parser = struct {
                 .materialize = .{
                     .upstream = inner,
                     .region_keys = self.region_keys,
+                    .name = entry.key_ptr.*,
                     // Explicit AS MATERIALIZED: the staged compiler must buffer
                     // even a single-reference body it would otherwise inline.
                     .forced = entry.value_ptr.hint == .force,
@@ -4782,6 +4836,61 @@ fn firstMaterializeForTest(op: *const ir.Op) ?*const ir.Op {
         .set_union => |u| firstMaterializeForTest(u.left) orelse firstMaterializeForTest(u.right),
         else => null,
     };
+}
+
+fn computeChainForTest(op: *const ir.Op) ?*const ir.Op {
+    return switch (op.*) {
+        .compute => op,
+        .select => |p| computeChainForTest(p.upstream),
+        .exclude => |p| computeChainForTest(p.upstream),
+        .order_by => |o| computeChainForTest(o.upstream),
+        .limit => |l| computeChainForTest(l.upstream),
+        else => null,
+    };
+}
+
+test "a SELECT list evaluates a repeated expression once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const stmt =
+        "SELECT CASE WHEN a > 1 THEN 'x' ELSE 'y' END AS kind, " ++
+        "CASE WHEN (CASE WHEN a > 1 THEN 'x' ELSE 'y' END) = 'x' THEN 1 ELSE 0 END AS is_x, " ++
+        "CASE WHEN (CASE WHEN a > 1 THEN 'x' ELSE 'y' END) = 'y' THEN 1 ELSE 0 END AS is_y, " ++
+        "CASE WHEN (CASE WHEN a > 2 THEN 'x' ELSE 'y' END) = 'y' THEN 1 ELSE 0 END AS other " ++
+        "FROM t";
+    const op = try parse(aa, stmt);
+    const scalars = computeChainForTest(op) orelse return error.TestUnexpectedResult;
+    const anchors = computeChainForTest(scalars.compute.upstream) orelse return error.TestUnexpectedResult;
+    // Three anchored comparisons, two distinct CASE expressions.
+    try std.testing.expectEqual(@as(usize, 2), anchors.compute.derived.len);
+    try std.testing.expectEqual(@as(usize, 4), scalars.compute.derived.len);
+    const kind = scalars.compute.derived[0];
+    try std.testing.expectEqualStrings("kind", kind.name);
+    try std.testing.expect(kind.expr == .col_ref);
+    try std.testing.expectEqualStrings(anchors.compute.derived[0].name, kind.expr.col_ref);
+    // is_x and is_y compare the same anchor; other compares the second one.
+    const is_x = scalars.compute.derived[1].expr.case.branches[0].cond.leaf;
+    const is_y = scalars.compute.derived[2].expr.case.branches[0].cond.leaf;
+    const other = scalars.compute.derived[3].expr.case.branches[0].cond.leaf;
+    try std.testing.expectEqualStrings(anchors.compute.derived[0].name, is_x.col);
+    try std.testing.expectEqualStrings(anchors.compute.derived[0].name, is_y.col);
+    try std.testing.expectEqualStrings(anchors.compute.derived[1].name, other.col);
+}
+
+test "volatile expressions are never shared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const stmt = "SELECT RAND() AS r, CASE WHEN RAND() > 0.5 THEN 1 ELSE 0 END AS a, CASE WHEN RAND() > 0.5 THEN 1 ELSE 0 END AS b FROM t";
+    const op = try parse(aa, stmt);
+    const scalars = computeChainForTest(op) orelse return error.TestUnexpectedResult;
+    const anchors = computeChainForTest(scalars.compute.upstream) orelse return error.TestUnexpectedResult;
+    // Each RAND() is its own draw: two anchors, and `r` stays a call.
+    try std.testing.expectEqual(@as(usize, 2), anchors.compute.derived.len);
+    try std.testing.expect(scalars.compute.derived[0].expr == .call);
 }
 
 test "structural materialize CSE is limited to independent expansions" {

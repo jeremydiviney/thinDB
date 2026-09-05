@@ -662,31 +662,24 @@ fn cmpScalar(comptime U: type, a: U, b: U, op: simd_mod.CmpOp) bool {
     };
 }
 
-/// Reconstruct the native value `base + code` for each row whose `mask` bit is
-/// set, appending the survivors in order into `out` (sized to the survivor
-/// count). Only survivors are expanded — the bandwidth win is that the full
-/// column was already filtered narrow; materialization touches survivors only.
-pub fn forExpandSurvivors(comptime T: type, fb: ForBlock, mask: []const bool, out: []T) void {
+/// `out[k] = base + codes[rows[k]]` — the survivors' native values gathered
+/// straight off the narrow deltas (no i128, no per-row temp copy).
+pub fn forGatherRows(comptime T: type, fb: ForBlock, rows: []const u32, out: []T) void {
     const base: T = @intCast(fb.base);
     switch (fb.width) {
-        1 => expandSurvivorsW(T, u8, base, fb.codes, mask, out),
-        2 => expandSurvivorsW(T, u16, base, fb.codes, mask, out),
-        4 => expandSurvivorsW(T, u32, base, fb.codes, mask, out),
-        8 => expandSurvivorsW(T, u64, base, fb.codes, mask, out),
+        1 => gatherRowsW(T, u8, base, fb.codes, rows, out),
+        2 => gatherRowsW(T, u16, base, fb.codes, rows, out),
+        4 => gatherRowsW(T, u32, base, fb.codes, rows, out),
+        8 => gatherRowsW(T, u64, base, fb.codes, rows, out),
         else => unreachable,
     }
 }
 
-/// `out[j++] = base + codes[i]` for each set `mask[i]` — native add (no i128),
-/// reading the delta directly at its width instead of via a per-row temp copy.
-inline fn expandSurvivorsW(comptime T: type, comptime W: type, base: T, codes: []const u8, mask: []const bool, out: []T) void {
+inline fn gatherRowsW(comptime T: type, comptime W: type, base: T, codes: []const u8, rows: []const u32, out: []T) void {
     const wsz = @sizeOf(W);
-    var j: usize = 0;
-    for (mask, 0..) |m, i| {
-        if (!m) continue;
-        const d = std.mem.readInt(W, codes[i * wsz ..][0..wsz], .little);
-        out[j] = base +% @as(T, @intCast(d));
-        j += 1;
+    for (rows, out) |r, *o| {
+        const d = std.mem.readInt(W, codes[@as(usize, r) * wsz ..][0..wsz], .little);
+        o.* = base +% @as(T, @intCast(d));
     }
 }
 

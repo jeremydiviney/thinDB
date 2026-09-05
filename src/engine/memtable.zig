@@ -22,6 +22,7 @@ pub const appendAllColumn = transform.appendAllColumn;
 pub const appendByIndices = transform.appendByIndices;
 pub const appendOneRow = transform.appendOneRow;
 pub const appendMaskedColumn = transform.appendMaskedColumn;
+pub const appendGatheredColumn = transform.appendGatheredColumn;
 pub const compareInColumn = transform.compareInColumn;
 pub const compareViewRows = transform.compareViewRows;
 

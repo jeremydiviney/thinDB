@@ -43,6 +43,7 @@ const prepared = @import("prepared.zig");
 const sql_text_mod = @import("../sql_text.zig");
 const conn_registry = @import("../conn_registry.zig");
 const oprof = @import("../../util/prof.zig");
+const buffer_pool = @import("../../util/buffer_pool.zig");
 const counting_allocator = @import("../../util/counting_allocator.zig");
 const rg_cache = @import("../../storage/cache.zig");
 const scan_mod = @import("../../exec/scan.zig");
@@ -3624,11 +3625,15 @@ fn runSingleStatement(
     // Under --profile-ops, route the handler-thread's query allocations through
     // a counting wrapper (operator construction + teardown; parallel-scan
     // workers allocate from the table allocator, not this one) and reset the
-    // sub-phase timers so construction timings survive the execute-time reset.
+    // operator and sub-phase timers before compile, so the per-operator tables
+    // include the CTE stages that compile drains eagerly.
     var mem_stats = counting_allocator.Stats{};
     var counter = counting_allocator.CountingAllocator.init(allocator, &mem_stats);
     const qalloc = if (oprof.enabled) counter.allocator() else allocator;
-    if (oprof.enabled) oprof.resetPhases();
+    if (oprof.enabled) {
+        oprof.resetPhases();
+        oprof.reset();
+    }
 
     // Inside an XA branch, stage writes instead of executing them; XA COMMIT
     // replays the staged statements. Only DML is staged — Flink sends only
@@ -3717,7 +3722,6 @@ fn runSingleStatement(
         return true;
     }
 
-    oprof.reset();
     const write_start = profiler.start();
     try result.sendQueryResultStatus(
         allocator,
@@ -3731,6 +3735,7 @@ fn runSingleStatement(
     );
     profiler.recordSince(.query_execute_write, write_start);
     oprof.dumpSelf("query");
+    if (oprof.enabled) buffer_pool.dumpGlobalStats();
     oprof.dump("query");
     if (oprof.enabled) {
         const cs = rg_cache.globalStats();

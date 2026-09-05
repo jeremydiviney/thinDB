@@ -33,7 +33,6 @@
 //! two of our threads on one core's SMT siblings while another core idles.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const buffer_pool = @import("../util/buffer_pool.zig");
@@ -49,7 +48,8 @@ const Batch = exec.Batch;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
-const Scan = @import("scan.zig").Scan;
+const scan_mod = @import("scan.zig");
+const Scan = scan_mod.Scan;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -61,6 +61,7 @@ const core_scheduler = @import("../util/core_scheduler.zig");
 const Expr = @import("expr.zig").Expr;
 const ChunkRangeScan = @import("mat_stage.zig").ChunkRangeScan;
 const Stage = @import("mat_stage.zig").Stage;
+const MaterializedResult = @import("mat_stage.zig").MaterializedResult;
 
 /// A (segment, row_group) coordinate over the flat row-group list.
 const Coord = struct { seg: usize, rg: usize };
@@ -72,6 +73,90 @@ const Coord = struct { seg: usize, rg: usize };
 /// the join. Survivor count (the real cost for filter+regex) isn't predictable
 /// from bytes, so static per-thread slices leave imbalance that stealing fixes.
 const CHUNK_FACTOR: usize = 4;
+
+/// Buffer-scan striping. A stage holds 64K-row chunks (or one chunk per
+/// producer batch), so a 200K-row CTE has four — and a probe- or
+/// compute-fused scan over it ran on four threads whatever the DOP. With
+/// fewer chunks than `dop × CHUNK_FACTOR` the units are therefore
+/// near-equal ROW ranges cut inside chunks, one per thread: a round is a
+/// barrier, and stripes of a buffer are uniform work, so oversubscribing
+/// them only lengthens the tail (measured: 25 stripes on 12 threads lost
+/// what 4 → 12 threads gained). A stripe smaller than one batch isn't
+/// worth a thread, so the thread count follows rows too. Chunk-rich
+/// stages keep `dop × CHUNK_FACTOR` chunk ranges — the deferred leaf's
+/// planned bound either way.
+const MIN_STRIPE_ROWS: usize = 8192;
+/// Mid-chunk cuts land on this alignment so validity bitmaps slice by byte.
+const STRIPE_ALIGN: usize = 64;
+
+const BufferPlan = struct {
+    units: []ChunkRangeScan.Range,
+    threads: usize,
+};
+
+/// An ordered scan emits one batch per unit per round, so its units never
+/// cross a chunk (pieces of each chunk in order); an unordered one takes
+/// global row cuts, which may span chunks.
+fn planBufferUnits(allocator: Allocator, chunks: []const MaterializedResult.Chunk, dop: usize, ordered: bool) !BufferPlan {
+    var total_rows: usize = 0;
+    for (chunks) |c| total_rows += c.rows;
+    const by_rows = (total_rows + MIN_STRIPE_ROWS - 1) / MIN_STRIPE_ROWS;
+    const threads = @max(@as(usize, 1), @min(dop, by_rows));
+    const target = if (chunks.len >= dop * CHUNK_FACTOR) dop * CHUNK_FACTOR else threads;
+
+    var units: std.ArrayListUnmanaged(ChunkRangeScan.Range) = .empty;
+    errdefer units.deinit(allocator);
+    if (total_rows == 0) {
+        try units.append(allocator, .{ .chunk_lo = 0, .chunk_hi = chunks.len, .row_lo = 0, .row_hi = 0 });
+    } else if (ordered) {
+        const ideal = (total_rows + target - 1) / target;
+        for (chunks, 0..) |c, ci| {
+            if (c.rows == 0) continue;
+            const pieces = @max(@as(usize, 1), c.rows / ideal);
+            for (0..pieces) |p| {
+                const lo = alignDownStripe(c.rows * p / pieces);
+                const hi = if (p + 1 == pieces) c.rows else alignDownStripe(c.rows * (p + 1) / pieces);
+                if (hi <= lo) continue;
+                try units.append(allocator, .{ .chunk_lo = ci, .chunk_hi = ci + 1, .row_lo = lo, .row_hi = hi });
+            }
+        }
+    } else {
+        var prev = StripeCut{ .chunk = 0, .row = 0 };
+        for (1..target + 1) |i| {
+            const g = if (i == target) total_rows else total_rows * i / target;
+            const here = locateStripeCut(chunks, g);
+            try units.append(allocator, unitBetween(chunks, prev, here));
+            prev = here;
+        }
+    }
+    // Ordered pieces floor per chunk, so there can be fewer units than
+    // threads; the pool must never outnumber the units it is sized for.
+    const n_units = units.items.len;
+    return .{ .units = try units.toOwnedSlice(allocator), .threads = @min(threads, n_units) };
+}
+
+const StripeCut = struct { chunk: usize, row: usize };
+
+fn alignDownStripe(row: usize) usize {
+    return row - row % STRIPE_ALIGN;
+}
+
+/// The (chunk, aligned row) position of global row `g`; `(chunks.len, 0)`
+/// at the end. Cuts are monotone in `g`, so consecutive ones tile.
+fn locateStripeCut(chunks: []const MaterializedResult.Chunk, g: usize) StripeCut {
+    var base: usize = 0;
+    for (chunks, 0..) |c, ci| {
+        if (g < base + c.rows) return .{ .chunk = ci, .row = alignDownStripe(g - base) };
+        base += c.rows;
+    }
+    return .{ .chunk = chunks.len, .row = 0 };
+}
+
+fn unitBetween(chunks: []const MaterializedResult.Chunk, a: StripeCut, b: StripeCut) ChunkRangeScan.Range {
+    if (a.chunk == b.chunk and a.row == b.row) return .{ .chunk_lo = a.chunk, .chunk_hi = a.chunk, .row_lo = 0, .row_hi = 0 };
+    if (b.row == 0) return .{ .chunk_lo = a.chunk, .chunk_hi = b.chunk, .row_lo = a.row, .row_hi = chunks[b.chunk - 1].rows };
+    return .{ .chunk_lo = a.chunk, .chunk_hi = b.chunk + 1, .row_lo = a.row, .row_hi = b.row };
+}
 
 /// Selective-query right-sizing: one worker thread per this many surviving
 /// (post-zone-map) row groups, so a point lookup that touches 13 of 958 row
@@ -101,18 +186,11 @@ const WorkerBuf = struct {
 };
 
 /// The thread-safe allocator the per-worker scans/aggregates/survivor buffers
-/// draw from. In production this is the process-global retaining buffer pool
-/// (recycles the large decode buffers instead of `munmap`-ing them every scan);
-/// `THINDB_NO_BUFPOOL=1` reverts to the raw backing allocator for an A/B without
-/// a rebuild. Tests pass their own (`testing.allocator`/`c_allocator`) so leak
-/// detection observes every free — the pool retains blocks, which a leak
-/// detector would flag.
+/// draw from: the process-global retaining buffer pool (recycles the large
+/// decode buffers instead of `munmap`-ing them every scan), or the raw
+/// backing allocator in tests and under `THINDB_NO_BUFPOOL=1`.
 fn workerAlloc(base: Allocator) Allocator {
-    if (builtin.is_test) return base;
-    if (getenv("THINDB_NO_BUFPOOL")) |v| {
-        if (v[0] == '1') return base;
-    }
-    return buffer_pool.allocator();
+    return buffer_pool.workerAllocator(base);
 }
 
 test "createOverStage: parallel buffer scan preserves the row multiset" {
@@ -248,6 +326,157 @@ test "createOverStageOrdered: emission is the stage's exact row order" {
         }
     }
     try std.testing.expectEqual(@as(i64, @intCast(n)), expect_next);
+}
+
+test "planBufferUnits: stripes tile the chunks in order, aligned, within the planned bound" {
+    const allocator = std.testing.allocator;
+    const Chunk = MaterializedResult.Chunk;
+    const cases = .{
+        // Five uneven pull-copied chunks, DOP 12: far more stripes than chunks.
+        .{ .rows = [_]usize{ 40_000, 40_000, 40_000, 40_000, 3_934 }, .dop = 12, .ordered = false, .min_units = 12 },
+        // More chunks than dop × CHUNK_FACTOR: stripes span chunks.
+        .{ .rows = [_]usize{65_536} ** 13 ++ [_]usize{5}, .dop = 2, .ordered = false, .min_units = 8 },
+        // Ordered: pieces stay inside their chunk; an empty chunk gets none.
+        .{ .rows = [_]usize{ 40_000, 0, 40_000, 3_934 }, .dop = 12, .ordered = true, .min_units = 4 },
+        // One 100K-row ordered chunk: 11 pieces for 12 threads.
+        .{ .rows = [_]usize{100_000}, .dop = 12, .ordered = true, .min_units = 11 },
+        .{ .rows = [_]usize{100}, .dop = 12, .ordered = false, .min_units = 1 },
+        .{ .rows = [_]usize{ 0, 0 }, .dop = 4, .ordered = false, .min_units = 1 },
+    };
+    inline for (cases) |c| {
+        var chunks: [c.rows.len]Chunk = undefined;
+        for (&chunks, c.rows) |*ch, r| ch.* = .{ .rows = r };
+        const plan = try planBufferUnits(allocator, &chunks, c.dop, c.ordered);
+        defer allocator.free(plan.units);
+        try std.testing.expect(plan.units.len >= c.min_units);
+        try std.testing.expect(plan.units.len <= c.dop * CHUNK_FACTOR + chunks.len);
+        try std.testing.expect(plan.threads >= 1 and plan.threads <= c.dop);
+        try std.testing.expect(plan.threads <= plan.units.len);
+
+        // Walk the pieces exactly as ChunkRangeScan.next cuts them: they must
+        // tile every non-empty chunk's rows in order, on aligned bounds.
+        var cur_chunk: usize = 0;
+        var cur_row: usize = 0;
+        for (plan.units) |u| {
+            if (c.ordered) try std.testing.expectEqual(u.chunk_lo + 1, u.chunk_hi);
+            var ci = u.chunk_lo;
+            while (ci < u.chunk_hi) : (ci += 1) {
+                const lo = if (ci == u.chunk_lo) u.row_lo else 0;
+                const hi = if (ci + 1 == u.chunk_hi) u.row_hi else chunks[ci].rows;
+                if (hi <= lo) continue;
+                while (cur_chunk < chunks.len and cur_row == chunks[cur_chunk].rows) {
+                    cur_chunk += 1;
+                    cur_row = 0;
+                }
+                try std.testing.expectEqual(cur_chunk, ci);
+                try std.testing.expectEqual(cur_row, lo);
+                try std.testing.expect(hi <= chunks[ci].rows);
+                try std.testing.expectEqual(@as(usize, 0), lo % STRIPE_ALIGN);
+                try std.testing.expect(hi == chunks[ci].rows or hi % STRIPE_ALIGN == 0);
+                cur_row = hi;
+            }
+        }
+        while (cur_chunk < chunks.len and cur_row == chunks[cur_chunk].rows) {
+            cur_chunk += 1;
+            cur_row = 0;
+        }
+        try std.testing.expectEqual(chunks.len, cur_chunk);
+    }
+}
+
+test "createOverStage: row-striped units keep every row and its validity bit" {
+    const allocator = std.testing.allocator;
+    const mat_stage = @import("mat_stage.zig");
+
+    const EmitStub = struct {
+        allocator: Allocator,
+        schema: [2]Column = .{
+            .{ .name = "v", .type = .{ .bigint = {} }, .nullable = false },
+            .{ .name = "w", .type = .{ .int = {} }, .nullable = true },
+        },
+        v: []i64,
+        w: []i32,
+        w_nulls: []u8,
+        per: usize,
+        offset: usize = 0,
+        views: [2]ColumnView = undefined,
+
+        pub fn next(self: *@This()) !?Batch {
+            if (self.offset >= self.v.len) return null;
+            const take = @min(self.per, self.v.len - self.offset);
+            self.views[0] = transform.subViewAligned(.{ .data = .{ .bigint = self.v } }, self.offset, take);
+            self.views[1] = transform.subViewAligned(.{ .data = .{ .int = self.w }, .nulls = self.w_nulls }, self.offset, take);
+            self.offset += take;
+            return Batch{ .schema = &self.schema, .values = &self.views, .row_count = take };
+        }
+        pub fn deinit(self: *@This()) void {
+            self.allocator.destroy(self);
+        }
+        pub fn outputSchema(self: *@This()) []const Column {
+            return &self.schema;
+        }
+        pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
+        pub fn stats(_: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), out: *std.ArrayList(u8), a: Allocator, depth: usize) !void {
+            try exec.explainLine(out, a, depth, "EmitStub");
+        }
+    };
+
+    // Five uneven producer batches → five pull-copied chunks, far fewer than
+    // DOP × CHUNK_FACTOR, so the units are cut mid-chunk; the nullable
+    // column checks the bitmap slices land on the right rows.
+    const n: usize = 4 * 20_000 + 3_934;
+    const v = try allocator.alloc(i64, n);
+    defer allocator.free(v);
+    const w = try allocator.alloc(i32, n);
+    defer allocator.free(w);
+    const w_nulls = try allocator.alloc(u8, (n + 7) / 8);
+    defer allocator.free(w_nulls);
+    @memset(w_nulls, 0);
+    for (0..n) |i| {
+        v[i] = @intCast(i);
+        w[i] = @intCast(i * 7 % 1000);
+        if (i % 3 != 0) w_nulls[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+    }
+
+    const stub = try allocator.create(EmitStub);
+    stub.* = .{ .allocator = allocator, .v = v, .w = w, .w_nulls = w_nulls, .per = 20_000 };
+    const sq = exec.makeQuery(allocator, stub);
+
+    const set = try mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(sq, null);
+
+    var q = try ParallelScan.createOverStage(allocator, allocator, stage, null, 12);
+    defer q.deinit();
+    const ps = exec.queryAs(ParallelScan, q).?;
+    try std.testing.expect(ps.workers.len > stage.result.?.chunks.items.len);
+
+    const seen = try allocator.alloc(bool, n);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var count: usize = 0;
+    while (try q.next()) |batch| {
+        const vs = batch.values[0].data.bigint;
+        const ws = batch.values[1];
+        try std.testing.expectEqual(batch.row_count, vs.len);
+        for (vs, 0..) |val, r| {
+            const idx: usize = @intCast(val);
+            try std.testing.expect(idx < n);
+            try std.testing.expect(!seen[idx]);
+            seen[idx] = true;
+            count += 1;
+            try std.testing.expectEqual(idx % 3 != 0, ws.isValid(r));
+            if (idx % 3 != 0) try std.testing.expectEqual(@as(i32, @intCast(idx * 7 % 1000)), ws.data.int[r]);
+        }
+    }
+    try std.testing.expectEqual(n, count);
+    for (seen) |s| try std.testing.expect(s);
 }
 
 test "createOverStage + fused partial aggregate drains without corruption" {
@@ -479,6 +708,9 @@ pub const ParallelScan = struct {
     pool_shutdown: std.atomic.Value(bool) = .{ .raw = false },
     prof_round_ticks: i64 = 0,
     prof_rounds: usize = 0,
+    prof_pool_ticks: i64 = 0,
+    prof_steal_ticks: i64 = 0,
+    prof_wait_ticks: i64 = 0,
 
     // Materialize-mode state (fused-filter path). Chosen lazily on the first
     // next() once we know whether a filter was fused in. `wbufs`/`emit_views`
@@ -725,19 +957,16 @@ pub const ParallelScan = struct {
         const dop = @max(@as(usize, 1), max_dop);
 
         // The barrier: drain the producer once. After this the result is frozen
-        // and N workers read disjoint chunk stripes lock-free.
+        // and N workers read disjoint row stripes lock-free.
         try stage.ensureRun();
         const result = stage.result orelse return error.UnsupportedQueryShape;
         const total_chunks = result.chunks.items.len;
         if (ordered and total_chunks > ORDERED_MAX_CHUNKS) return error.UnsupportedQueryShape;
 
-        // Each 65536-row chunk is a uniform work unit, so equal-count stripes are
-        // already byte-balanced (no footer-weighted partition needed).
-        const n_threads = @max(@as(usize, 1), @min(dop, @max(total_chunks, 1)));
-        const n_chunks = if (ordered)
-            @max(total_chunks, 1)
-        else
-            @max(n_threads, @min(dop * CHUNK_FACTOR, @max(total_chunks, 1)));
+        const plan = try planBufferUnits(allocator, result.chunks.items, dop, ordered);
+        defer allocator.free(plan.units);
+        const n_threads = plan.threads;
+        const n_chunks = plan.units.len;
 
         const workers = try allocator.alloc(Leaf, n_chunks);
         var built: usize = 0;
@@ -745,10 +974,8 @@ pub const ParallelScan = struct {
             for (workers[0..built]) |w| w.deinit();
             allocator.free(workers);
         }
-        for (0..n_chunks) |i| {
-            const lo = i * total_chunks / n_chunks;
-            const hi = if (i == n_chunks - 1) total_chunks else (i + 1) * total_chunks / n_chunks;
-            const w = try ChunkRangeScan.alloc(worker_alloc, stage, result, lo, hi);
+        for (plan.units, 0..) |u, i| {
+            const w = try ChunkRangeScan.alloc(worker_alloc, stage, result, u);
             workers[i] = .{ .chunk = w };
             built += 1;
         }
@@ -854,10 +1081,10 @@ pub const ParallelScan = struct {
         const stage = self.stage.?;
         try stage.ensureRun();
         const result = stage.result orelse return error.UnsupportedQueryShape;
-        const total_chunks = result.chunks.items.len;
-        const dop = self.deferred_dop;
-        const n_threads = @max(@as(usize, 1), @min(dop, @max(total_chunks, 1)));
-        const n_chunks = @max(n_threads, @min(dop * CHUNK_FACTOR, @max(total_chunks, 1)));
+        const plan = try planBufferUnits(self.allocator, result.chunks.items, self.deferred_dop, false);
+        defer self.allocator.free(plan.units);
+        const n_threads = plan.threads;
+        const n_chunks = plan.units.len;
 
         const workers = try self.allocator.alloc(Leaf, n_chunks);
         var built: usize = 0;
@@ -865,10 +1092,8 @@ pub const ParallelScan = struct {
             for (workers[0..built]) |w| w.deinit();
             self.allocator.free(workers);
         }
-        for (0..n_chunks) |i| {
-            const lo = i * total_chunks / n_chunks;
-            const hi = if (i == n_chunks - 1) total_chunks else (i + 1) * total_chunks / n_chunks;
-            const w = try ChunkRangeScan.alloc(self.worker_alloc, stage, result, lo, hi);
+        for (plan.units, 0..) |u, i| {
+            const w = try ChunkRangeScan.alloc(self.worker_alloc, stage, result, u);
             workers[i] = .{ .chunk = w };
             built += 1;
         }
@@ -1291,6 +1516,33 @@ pub const ParallelScan = struct {
         return est *| 4 <= st.upper_rows;
     }
 
+    /// The stage this scan reads in place, rewriting `map` (slots in the
+    /// scan's pre-sink output space) to the stage columns behind them — for
+    /// a consumer that binds the stage result directly instead of draining
+    /// the scan (the shared join build). Null once anything would run
+    /// inside the workers (fused filter / compute / aggregate / probe) or
+    /// after the scan has started. The one sink allowed is
+    /// `terminal_chain`: a Compute's self-pushed evaluation, whose slots
+    /// the caller already mapped through — the chunk batches it sees are
+    /// the stage columns as cut here.
+    pub fn plainStageSource(self: *const ParallelScan, map: []usize, terminal_chain: ?*anyopaque) ?*Stage {
+        const stage = self.stage orelse return null;
+        if (self.table != null or self.mode != .unset) return null;
+        if (self.compute_fused or self.agg_fused) return null;
+        if (self.pending_computes.items.len != 0 or self.pending_schema_qs.items.len != 0) return null;
+        for (self.workers) |w| if (w.fusedActive()) return null;
+        if (self.probe_sink) |sink| {
+            const chain = terminal_chain orelse return null;
+            if (sink.ctx != chain or sink.probe_map != null or self.emit_keep != null) return null;
+        }
+        const n_src = if (self.emit_keep) |keep| keep.len else stage.schema.len;
+        for (map) |m| if (m >= n_src) return null;
+        if (self.emit_keep) |keep| {
+            for (map) |*m| m.* = keep[m.*];
+        }
+        return stage;
+    }
+
     fn applyEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
         if (self.emit_keep != null) return;
         const full = self.out_schema;
@@ -1605,6 +1857,9 @@ pub const ParallelScan = struct {
     /// so the workers' prune hints are installed. No hints → full DOP.
     fn effectiveThreads(self: *ParallelScan) usize {
         if (self.n_threads <= 1) return self.n_threads;
+        // A buffer stripe with nothing fused into it is a view slice — no
+        // work to spread, only a pool to spawn and join.
+        if (self.table == null and !self.compute_fused and !self.agg_fused and self.probe_sink == null) return 1;
         const surviving = self.workers[0].survivingWorkUnits() orelse return self.n_threads;
         const want = (surviving + RGS_PER_THREAD - 1) / RGS_PER_THREAD;
         return @max(@as(usize, 1), @min(self.n_threads, want));
@@ -1692,16 +1947,33 @@ pub const ParallelScan = struct {
         // bytes. Everything else in drain_wall is loop/decision/farm-out overhead.
         var borrow_ticks: u64 = 0;
         var kernel_ticks: u64 = 0;
+        var materialize_ticks: u64 = 0;
+        var kind_ticks = [_]u64{0} ** scan_mod.MAT_KINDS;
+        var kind_cols = [_]u64{0} ** scan_mod.MAT_KINDS;
         for (self.workers) |w| switch (w) {
             .segment => |s| {
                 borrow_ticks +%= s.scan_borrow_ticks;
                 kernel_ticks +%= s.scan_kernel_ticks;
+                materialize_ticks +%= s.scan_materialize_ticks;
+                for (0..scan_mod.MAT_KINDS) |k| {
+                    kind_ticks[k] +%= s.scan_mat_kind_ticks[k];
+                    kind_cols[k] += s.scan_mat_kind_cols[k];
+                }
             },
             .chunk => {},
         };
-        std.debug.print("[pscan] scan-kernel core-time (summed over workers): borrow={d:.2}ms kernel(compare/gather)={d:.2}ms  rows_decoded={d} → {d:.1} M rows/core-sec in kernel\n", .{
+        if (materialize_ticks > 0) {
+            std.debug.print("[pscan] materialize by kind (col-RGs, ms):", .{});
+            for (0..scan_mod.MAT_KINDS) |k| {
+                if (kind_cols[k] == 0) continue;
+                std.debug.print(" {s}={d}/{d:.2}", .{ scan_mod.matKindName(k), kind_cols[k], exec.prof.ticksToMs(@intCast(kind_ticks[k])) });
+            }
+            std.debug.print("\n", .{});
+        }
+        std.debug.print("[pscan] scan-kernel core-time (summed over workers): borrow={d:.2}ms kernel(compare/gather)={d:.2}ms materialize(survivors)={d:.2}ms  rows_decoded={d} → {d:.1} M rows/core-sec in kernel\n", .{
             exec.prof.ticksToMs(@intCast(borrow_ticks)),
             exec.prof.ticksToMs(@intCast(kernel_ticks)),
+            exec.prof.ticksToMs(@intCast(materialize_ticks)),
             rows_in,
             if (kernel_ticks > 0) @as(f64, @floatFromInt(rows_in)) / (exec.prof.ticksToMs(@intCast(kernel_ticks)) * 1000.0) else 0.0,
         });
@@ -1760,6 +2032,8 @@ pub const ParallelScan = struct {
             self.prof_rounds += 1;
         };
         if (!self.pool_started) self.startRoundPool();
+        const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        if (exec.prof.enabled) self.prof_pool_ticks += @max(0, _pt - _rt);
 
         for (self.round) |*r| r.* = null;
         for (self.werr) |*e| e.* = null;
@@ -1773,9 +2047,12 @@ pub const ParallelScan = struct {
 
         // The calling thread is a worker too; it would otherwise just block here.
         self.roundSteal();
+        const _st = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        if (exec.prof.enabled) self.prof_steal_ticks += @max(0, _st - _pt);
 
         // Wait until every chunk has been run this round (one increment each).
         while (self.round_done.load(.acquire) < n) std.Thread.yield() catch {};
+        if (exec.prof.enabled) self.prof_wait_ticks += @max(0, exec.prof.nowTicks() - _st);
 
         // Propagate the first worker error (others' batches are discarded).
         for (self.werr) |e| if (e) |err| return err;
@@ -1793,13 +2070,16 @@ pub const ParallelScan = struct {
         if (all) {
             self.shutdownRoundPool();
             if (exec.prof.enabled) {
-                std.debug.print("[hprof] pscan.rounds ordered={} chunks={d} threads={d} rounds={d} round_wall={d:.2} ms compute_fused={}\n", .{
+                std.debug.print("[hprof] pscan.rounds ordered={} chunks={d} threads={d} rounds={d} round_wall={d:.2} ms compute_fused={} pool={d:.2} steal={d:.2} wait={d:.2}\n", .{
                     self.ordered,
                     n,
                     self.eff_threads,
                     self.prof_rounds,
                     exec.prof.ticksToMs(self.prof_round_ticks),
                     self.compute_fused,
+                    exec.prof.ticksToMs(self.prof_pool_ticks),
+                    exec.prof.ticksToMs(self.prof_steal_ticks),
+                    exec.prof.ticksToMs(self.prof_wait_ticks),
                 });
             }
         }

@@ -200,6 +200,11 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
                     return;
                 }
             }
+            // Star-free: the trailing-skip count only shapes `*` expansion,
+            // and it describes an upstream this pass may shrink (dead derived
+            // and window columns), so it must not survive as a bound on the
+            // narrowed schema.
+            if (ctx.mode == .mutate) p.star_skip_trailing = 0;
             if (p.replace_on_collision != null) {
                 // The parser marks every expression/renamed item replace-
                 // capable, but replacement only ever fires when two items
@@ -919,4 +924,38 @@ test "compute with every derived dead is spliced out (never an empty Compute)" {
     try testing.expect(cmp == .select);
     try testing.expectEqual(@as(usize, 1), cmp.select.columns.len);
     try testing.expectEqualStrings("x", cmp.select.columns[0]);
+}
+
+test "a narrowed star-free select drops its trailing star-skip count" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var base = scanOp();
+    const derived = [_]ir.Derived{
+        .{ .name = "h", .expr = .{ .col_ref = "v" } },
+        .{ .name = "h2", .expr = .{ .col_ref = "z" } },
+    };
+    var cmp = ir.Op{ .compute = .{ .derived = &derived, .upstream = &base } };
+    const specs = [_]ir.WindowSpec{.{
+        .partition_by = &.{"k"},
+        .order_by = &.{},
+        .frame = ir.Frame.default_no_order,
+    }};
+    const calls = [_]ir.WindowCall{.{
+        .spec_idx = 0,
+        .func = .row_number,
+        .args = &.{},
+        .ignore_nulls = false,
+        .output_name = "rn",
+    }};
+    var win = ir.Op{ .window = .{ .specs = &specs, .calls = &calls, .upstream = &cmp } };
+    // The parser counted the two derived + one window output as hidden
+    // trailing columns; after pruning only `rn` (and the scan) remain.
+    var inner = ir.Op{ .select = .{ .columns = &.{ "k", "h", "h2", "rn" }, .star_skip_trailing = 3, .upstream = &win } };
+    var outer = ir.Op{ .select = .{ .columns = &.{"rn"}, .upstream = &inner } };
+    pruneDeadColumns(arena, &outer);
+    try testing.expectEqual(@as(usize, 1), inner.select.columns.len);
+    try testing.expectEqual(@as(u32, 0), inner.select.star_skip_trailing);
+    try testing.expect(cmp == .scan);
 }

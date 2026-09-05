@@ -25,7 +25,8 @@ const udf_mod = @import("../udf.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
-const transform = @import("../engine/engine.zig").transform;
+const parallel = @import("../util/parallel.zig");
+const rowloc = @import("rowloc.zig");
 
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -335,6 +336,10 @@ const GroupTopNPipeline = struct {
     emitted: bool = false,
     built: bool = false,
     row_count: usize = 0,
+    /// A parallel emit leaves its ranges here; `next` hands each one out as
+    /// a batch. A serial emit fills `output_cols` and emits once.
+    ranges: ?EmitRanges = null,
+    range_cursor: usize = 0,
 
     fn init(allocator: Allocator, table: *api.Table, request: Request, plan: ShapePlan) !GroupTopNPipeline {
         const owned_needed = if (request.needed) |needed| try allocator.dupe([]const u8, needed) else null;
@@ -387,6 +392,7 @@ const GroupTopNPipeline = struct {
     }
 
     pub fn deinit(self: *GroupTopNPipeline) void {
+        if (self.ranges) |*r| r.deinit();
         for (self.output_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
@@ -420,14 +426,29 @@ const GroupTopNPipeline = struct {
     }
 
     pub fn next(self: *GroupTopNPipeline) !?Batch {
-        if (self.emitted) return null;
         if (!self.built) {
             try self.execute();
             self.built = true;
         }
+        if (self.ranges) |r| {
+            while (self.range_cursor < r.jobs.len) {
+                const job = r.jobs[self.range_cursor];
+                self.range_cursor += 1;
+                if (job.g1 == job.g0) continue;
+                for (job.cols, 0..) |c, i| self.views[i] = c.view();
+                return .{ .schema = self.output_schema, .values = self.views, .row_count = job.g1 - job.g0 };
+            }
+            return null;
+        }
+        if (self.emitted) return null;
         self.emitted = true;
         for (self.output_cols, 0..) |c, i| self.views[i] = c.view();
         return .{ .schema = self.output_schema, .values = self.views, .row_count = self.row_count };
+    }
+
+    /// Every batch views stores (range or serial) that live until deinit.
+    pub fn stableData(_: *GroupTopNPipeline) bool {
+        return true;
     }
 
     fn execute(self: *GroupTopNPipeline) !void {
@@ -846,23 +867,204 @@ fn compareF64(a: f64, b: f64) i8 {
 
 fn emitResultStage(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) !void {
     if (op.plan.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, rows);
+    if (rows.len == 0) return;
+    const workers = emitWorkerCount(op, rows.len);
+    if (workers <= 1) {
+        try emitPackedRange(op.allocator, op, rows, op.output_cols);
+        op.row_count += rows.len;
+        return;
+    }
+    var ranges = try EmitRanges.init(op, workers, rows.len);
+    errdefer ranges.deinit();
+    for (ranges.jobs) |*job| job.rows = rows[job.g0..job.g1];
+    try ranges.run(emitPackedWorker);
+    op.ranges = ranges;
+    op.row_count += rows.len;
+}
+
+/// Groups per emit worker: below this a range isn't worth a thread.
+const EMIT_ROWS_PER_WORKER: usize = 65536;
+const MAX_EMIT_WORKERS: usize = 64;
+
+fn emitWorkerCount(op: *GroupTopNPipeline, rows: usize) usize {
+    const dop: usize = if (op.request.dop == 0) DEFAULT_DOP else op.request.dop;
+    const by_rows: usize = rows / EMIT_ROWS_PER_WORKER;
+    return @max(@as(usize, 1), @min(@min(dop, by_rows), MAX_EMIT_WORKERS));
+}
+
+fn emitPackedRange(allocator: Allocator, op: *GroupTopNPipeline, rows: []const SiloCore.TopRow, cols: []ColumnStore) !void {
+    const part_count = op.plan.layout.part_count;
     for (rows) |row| {
-        for (op.plan.layout.parts[0..op.plan.layout.part_count], 0..) |part, i| {
-            try appendKeyPart(op.allocator, &op.output_cols[i], part, row.key);
+        for (op.plan.layout.parts[0..part_count], 0..) |part, i| {
+            try appendKeyPart(allocator, &cols[i], part, row.key);
         }
         for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
-            try appendAggregateValue(op.allocator, &op.output_cols[op.plan.layout.part_count + i], agg_plan, row);
+            try appendAggregateValue(allocator, &cols[part_count + i], agg_plan, row);
         }
-        op.row_count += 1;
     }
+}
+
+fn emitPackedWorker(job: *EmitRange) void {
+    emitPackedRange(EmitRanges.worker_alloc, job.op, job.rows, job.cols) catch |e| {
+        job.err = e;
+    };
+}
+
+fn emitHashedWorker(job: *EmitRange) void {
+    emitHashedRange(EmitRanges.worker_alloc, job.op, job.rows, job.idx, job.parts, job.part_starts, job.cols) catch |e| {
+        job.err = e;
+    };
+}
+
+/// One contiguous range of the result rows (group order) and the column
+/// stores it appends into — emitted afterwards as one batch. Hashed emits
+/// also carry the range's slice of the inverse permutation and the
+/// late-materialized partitions it reads.
+const EmitRange = struct {
+    op: *GroupTopNPipeline,
+    g0: usize,
+    g1: usize,
+    cols: []ColumnStore,
+    rows: []const SiloCore.TopRow = &.{},
+    idx: []const u32 = &.{},
+    parts: []const MatPartition = &.{},
+    part_starts: []const usize = &.{},
+    err: ?anyerror = null,
+};
+
+const EmitRanges = struct {
+    /// Worker allocations must be thread-safe; the query allocator isn't.
+    const worker_alloc = std.heap.c_allocator;
+
+    allocator: Allocator,
+    jobs: []EmitRange,
+    threads: []?std.Thread,
+
+    fn init(op: *GroupTopNPipeline, workers: usize, total: usize) !EmitRanges {
+        const jobs = try op.allocator.alloc(EmitRange, workers);
+        errdefer op.allocator.free(jobs);
+        const threads = try op.allocator.alloc(?std.Thread, workers);
+        errdefer op.allocator.free(threads);
+        @memset(threads, null);
+        var inited: usize = 0;
+        errdefer for (jobs[0..inited]) |*j| freeRangeCols(j.cols);
+        // Range bounds on 64-row multiples: the batches they become then
+        // start on validity-byte boundaries, which a contiguous consumer
+        // needs to fill them on parallel workers.
+        var g0: usize = 0;
+        for (jobs, 0..) |*job, w| {
+            const g1 = if (w + 1 == workers) total else (total * (w + 1) / workers) & ~@as(usize, 63);
+            job.* = .{
+                .op = op,
+                .g0 = g0,
+                .g1 = g1,
+                .cols = try initRangeCols(op.output_schema),
+            };
+            g0 = g1;
+            inited += 1;
+        }
+        return .{ .allocator = op.allocator, .jobs = jobs, .threads = threads };
+    }
+
+    fn initRangeCols(schema: []const Column) ![]ColumnStore {
+        const cols = try worker_alloc.alloc(ColumnStore, schema.len);
+        errdefer worker_alloc.free(cols);
+        var n: usize = 0;
+        errdefer for (cols[0..n]) |*c| c.deinit(worker_alloc);
+        for (schema, cols) |sc, *c| {
+            c.* = try ColumnStore.init(worker_alloc, sc.type, sc.nullable);
+            n += 1;
+        }
+        return cols;
+    }
+
+    fn freeRangeCols(cols: []ColumnStore) void {
+        for (cols) |*c| c.deinit(worker_alloc);
+        worker_alloc.free(cols);
+    }
+
+    /// Run `worker` over every range on its own thread (inline when a
+    /// spawn fails) and surface the first range error.
+    fn run(self: *EmitRanges, comptime worker: fn (*EmitRange) void) !void {
+        for (self.jobs, self.threads) |*job, *t| {
+            t.* = std.Thread.spawn(.{}, worker, .{job}) catch null;
+            if (t.* == null) worker(job);
+        }
+        for (self.threads) |*t| {
+            if (t.*) |th| th.join();
+            t.* = null;
+        }
+        for (self.jobs) |job| {
+            if (job.err) |e| return e;
+        }
+    }
+
+    fn deinit(self: *EmitRanges) void {
+        for (self.jobs) |*j| freeRangeCols(j.cols);
+        self.allocator.free(self.jobs);
+        self.allocator.free(self.threads);
+    }
+};
+
+/// One location-ordered slice of the survivors' source rows, late-materialized
+/// (key base columns, plus recomputed derived keys) by one worker. Its
+/// `result` batch is read by every emit range afterwards.
+const MatPartition = struct {
+    allocator: Allocator,
+    late_q: Query,
+    late: *LateScan,
+    scan: *Scan,
+    locs: []const i64,
+    derived: []const compute.Derived,
+    views: []ColumnView = &.{},
+    compute_q: ?Query = null,
+    result: Batch = undefined,
+    err: ?anyerror = null,
+    fetch_ticks: i64 = 0,
+    compute_ticks: i64 = 0,
+
+    fn create(allocator: Allocator, op: *GroupTopNPipeline, names: []const []const u8, derived: []const compute.Derived, locs: []const i64) !MatPartition {
+        const scan_ptr = try Scan.allocWithProjectionLoc(allocator, op.table, null, names, false, null);
+        var inner = exec.makeQuery(allocator, scan_ptr);
+        errdefer inner.deinit();
+        const late_q = try LateScan.create(allocator, inner, scan_ptr, op.table, names);
+        const late = exec.queryAs(LateScan, late_q) orelse return error.UnsupportedQueryShape;
+        return .{ .allocator = allocator, .late_q = late_q, .late = late, .scan = scan_ptr, .locs = locs, .derived = derived };
+    }
+
+    fn materialize(self: *MatPartition) !void {
+        const t0 = exec.prof.nowTicks();
+        try self.late.materializeInto(self.locs, self.scan.memtableSnap());
+        const m = self.late.outputColumns();
+        self.views = try self.allocator.alloc(ColumnView, m.columns.len);
+        for (m.columns, self.views) |*c, *v| v.* = c.view();
+        self.result = .{ .schema = m.schema, .values = self.views, .row_count = self.locs.len };
+        const t1 = exec.prof.nowTicks();
+        self.fetch_ticks = t1 - t0;
+        if (self.derived.len == 0) return;
+        const src = try SingleBatchSource.create(self.allocator, self.result);
+        self.compute_q = try compute.Compute.create(self.allocator, src, self.derived);
+        self.result = (try self.compute_q.?.next()) orelse return error.UnsupportedQueryShape;
+        self.compute_ticks = exec.prof.nowTicks() - t1;
+    }
+
+    fn deinit(self: *MatPartition) void {
+        if (self.compute_q) |*q| q.deinit();
+        if (self.views.len > 0) self.allocator.free(self.views);
+        self.late_q.deinit();
+    }
+};
+
+fn matPartitionWorker(p: *MatPartition) void {
+    p.materialize() catch |e| {
+        p.err = e;
+    };
 }
 
 // Hashed-key emit: the group key is a hash, so the real key column values are
 // recovered by late-materializing each survivor's carried __rowloc against the
 // base table (reusing LateScan's per-(segment,row-group) single-row reader).
-// Aggregates still come straight from the grouped TopRow. Single-threaded, per
-// the scan/staging/group-only-parallel policy; survivors are bounded by LIMIT
-// for top-N queries.
+// Aggregates still come straight from the grouped TopRow.
 fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) !void {
     if (rows.len == 0) return;
     const allocator = op.allocator;
@@ -885,15 +1087,7 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
         }
     }
     const names = base_names.items;
-
-    const scan_ptr = try Scan.allocWithProjectionLoc(allocator, op.table, null, names, false, null);
-    var inner = exec.makeQuery(allocator, scan_ptr);
-    var late_built = false;
-    errdefer if (!late_built) inner.deinit();
-    var late_q = try LateScan.create(allocator, inner, scan_ptr, op.table, names);
-    late_built = true;
-    defer late_q.deinit();
-    const late: *LateScan = @ptrCast(@alignCast(late_q.ptr));
+    const derived = derived_keys[0..n_derived];
 
     // Materialize in LOCATION order, not group order: sorted locs form
     // maximal per-(segment,row-group) runs, so each touched block decodes
@@ -901,63 +1095,236 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
     // 3M+ groups meant 3M+ single-row block borrows). The key gather below
     // already reads through an index buffer, so emitting in group order
     // costs nothing extra: the buffer becomes the inverse permutation.
+    // One compact pass lifts the locations out of the 200-byte TopRows;
+    // rowloc.sortedOrder then orders them per row group in linear time
+    // (an indirect comparison sort through the rows was cache-miss bound).
+    // The lift, the order's own passes and the placement stripe the rows
+    // over the emit workers: memory-bound and row-independent.
+    const workers = emitWorkerCount(op, rows.len);
+    var order = OrderTimes{};
+    const t_lift = exec.prof.nowTicks();
+    const rowrefs = try allocator.alloc(i64, rows.len);
+    defer allocator.free(rowrefs);
+    const lift = OrderLift{ .rows = rows, .rowrefs = rowrefs };
+    parallel.forRanges(workers, rows.len, &lift, OrderLift.run);
     const loc_order = try allocator.alloc(u32, rows.len);
     defer allocator.free(loc_order);
-    for (0..rows.len) |i| loc_order[i] = @intCast(i);
-    std.mem.sortUnstable(u32, loc_order, rows, struct {
-        fn less(rs: []const SiloCore.TopRow, a: u32, b: u32) bool {
-            return rs[a].rowref < rs[b].rowref;
-        }
-    }.less);
+    const t_sort = exec.prof.nowTicks();
+    order.lift_ms = exec.prof.ticksToMs(t_sort - t_lift);
+    try rowloc.sortedOrderOn(allocator, rowrefs, loc_order, workers);
+    const t_place = exec.prof.nowTicks();
+    order.sort_ms = exec.prof.ticksToMs(t_place - t_sort);
     const locs = try allocator.alloc(i64, rows.len);
     defer allocator.free(locs);
-    for (loc_order, 0..) |ri, j| locs[j] = rows[ri].rowref;
-
-    const t_mat = exec.prof.nowTicks();
-    try late.materializeInto(locs, scan_ptr.memtableSnap());
-    const materialized = late.outputColumns();
-    const mat_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_mat);
-
-    // Recompute any derived key columns over the materialized source rows with
-    // the standard Compute operator; the result batch then carries every key
-    // column (plain + derived) by name.
-    const mat_views = try allocator.alloc(ColumnView, materialized.columns.len);
-    defer allocator.free(mat_views);
-    for (materialized.columns, 0..) |*c, i| mat_views[i] = c.view();
-    const mat_batch = Batch{ .schema = materialized.schema, .values = mat_views, .row_count = rows.len };
-
-    var compute_q: ?Query = null;
-    defer if (compute_q) |*q| q.deinit();
-    var result = mat_batch;
-    if (n_derived > 0) {
-        const src = try SingleBatchSource.create(allocator, mat_batch);
-        compute_q = try compute.Compute.create(allocator, src, derived_keys[0..n_derived]);
-        result = (try compute_q.?.next()) orelse return error.UnsupportedQueryShape;
-    }
-
     // Inverse permutation: output row i (group order) reads materialized
     // row idx_buf[i] (location order).
     const idx_buf = try allocator.alloc(u32, rows.len);
     defer allocator.free(idx_buf);
-    for (loc_order, 0..) |ri, j| idx_buf[ri] = @intCast(j);
+    const place = OrderPlace{ .rowrefs = rowrefs, .loc_order = loc_order, .locs = locs, .idx_buf = idx_buf };
+    parallel.forRanges(workers, rows.len, &place, OrderPlace.run);
+    order.place_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_place);
 
-    const t_keys = exec.prof.nowTicks();
-    for (op.plan.layout.parts[0..part_count], 0..) |part, j| {
-        const ci = types.findColumn(result.schema, part.name) orelse return error.UnsupportedQueryShape;
-        try transform.appendByIndices(allocator, result.values[ci], idx_buf, &op.output_cols[j]);
+    const t_mat = exec.prof.nowTicks();
+    if (workers <= 1) {
+        var part = try MatPartition.create(allocator, op, names, derived, locs);
+        defer part.deinit();
+        try part.materialize();
+        const mat_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_mat);
+        const t_emit = exec.prof.nowTicks();
+        const starts = [_]usize{0};
+        try emitHashedRange(allocator, op, rows, idx_buf, @as(*const [1]MatPartition, &part), &starts, op.output_cols);
+        traceEmit(rows.len, 1, order, mat_ms, exec.prof.ticksToMs(exec.prof.nowTicks() - t_emit));
+        op.row_count += rows.len;
+        return;
     }
-    const t_aggs = exec.prof.nowTicks();
-    for (rows) |row| {
-        for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
-            try appendAggregateValue(allocator, &op.output_cols[part_count + i], agg_plan, row);
-        }
+
+    // The location-ordered rows split into one contiguous slice per worker,
+    // so every touched block decodes on exactly one thread; the group-order
+    // ranges then gather their keys across the partitions.
+    const parts = try allocator.alloc(MatPartition, workers);
+    defer allocator.free(parts);
+    const part_starts = try allocator.alloc(usize, workers);
+    defer allocator.free(part_starts);
+    var created: usize = 0;
+    defer for (parts[0..created]) |*p| p.deinit();
+    for (parts, 0..) |*p, w| {
+        const p0 = rows.len * w / workers;
+        const p1 = if (w + 1 == workers) rows.len else rows.len * (w + 1) / workers;
+        part_starts[w] = p0;
+        p.* = try MatPartition.create(EmitRanges.worker_alloc, op, names, derived, locs[p0..p1]);
+        created += 1;
     }
+    const mat_threads = try allocator.alloc(?std.Thread, workers);
+    defer allocator.free(mat_threads);
+    for (parts, mat_threads) |*p, *t| {
+        t.* = std.Thread.spawn(.{}, matPartitionWorker, .{p}) catch null;
+        if (t.* == null) matPartitionWorker(p);
+    }
+    for (mat_threads) |t| if (t) |th| th.join();
+    for (parts) |p| {
+        if (p.err) |e| return e;
+    }
+    const mat_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_mat);
     if (comptime build_options.profiling) {
         if (getenv("THINDB_V2_PIPELINE_TRACE") != null) {
-            std.debug.print("[v2-emit] rows={d} late_mat={d:.1}ms keys={d:.1}ms aggs={d:.1}ms\n", .{ rows.len, mat_ms, exec.prof.ticksToMs(t_aggs - t_keys), exec.prof.ticksToMs(exec.prof.nowTicks() - t_aggs) });
+            var fetch_max: i64 = 0;
+            var compute_max: i64 = 0;
+            for (parts) |p| {
+                fetch_max = @max(fetch_max, p.fetch_ticks);
+                compute_max = @max(compute_max, p.compute_ticks);
+            }
+            std.debug.print("[v2-emit] late_mat split: fetch max={d:.1}ms compute max={d:.1}ms partitions={d}\n", .{
+                exec.prof.ticksToMs(fetch_max), exec.prof.ticksToMs(compute_max), parts.len,
+            });
         }
     }
+
+    const t_emit = exec.prof.nowTicks();
+    var ranges = try EmitRanges.init(op, workers, rows.len);
+    errdefer ranges.deinit();
+    for (ranges.jobs) |*job| {
+        job.rows = rows[job.g0..job.g1];
+        job.idx = idx_buf[job.g0..job.g1];
+        job.parts = parts;
+        job.part_starts = part_starts;
+    }
+    try ranges.run(emitHashedWorker);
+    traceEmit(rows.len, workers, order, mat_ms, exec.prof.ticksToMs(exec.prof.nowTicks() - t_emit));
+    op.ranges = ranges;
     op.row_count += rows.len;
+}
+
+const OrderTimes = struct { lift_ms: f64 = 0, sort_ms: f64 = 0, place_ms: f64 = 0 };
+
+fn traceEmit(rows: usize, workers: usize, order: OrderTimes, mat_ms: f64, emit_ms: f64) void {
+    if (comptime build_options.profiling) {
+        if (getenv("THINDB_V2_PIPELINE_TRACE") != null) {
+            std.debug.print("[v2-emit] rows={d} workers={d} order={d:.1}ms (lift {d:.1} sort {d:.1} place {d:.1}) late_mat={d:.1}ms keys+aggs={d:.1}ms\n", .{
+                rows, workers, order.lift_ms + order.sort_ms + order.place_ms, order.lift_ms, order.sort_ms, order.place_ms, mat_ms, emit_ms,
+            });
+        }
+    }
+}
+
+const OrderLift = struct {
+    rows: []const SiloCore.TopRow,
+    rowrefs: []i64,
+
+    fn run(c: *const OrderLift, _: usize, lo: usize, hi: usize) void {
+        for (c.rows[lo..hi], c.rowrefs[lo..hi]) |row, *r| r.* = row.rowref;
+    }
+};
+
+const OrderPlace = struct {
+    rowrefs: []const i64,
+    loc_order: []const u32,
+    locs: []i64,
+    idx_buf: []u32,
+
+    fn run(c: *const OrderPlace, _: usize, lo: usize, hi: usize) void {
+        for (c.loc_order[lo..hi], lo..) |ri, j| {
+            c.locs[j] = c.rowrefs[ri];
+            c.idx_buf[ri] = @intCast(j);
+        }
+    }
+};
+
+/// Append one group-order range: each key column gathers its rows from the
+/// partitions through the range's slice of the inverse permutation; the
+/// aggregates read the range's TopRows.
+fn emitHashedRange(
+    allocator: Allocator,
+    op: *GroupTopNPipeline,
+    rows: []const SiloCore.TopRow,
+    idx: []const u32,
+    parts: []const MatPartition,
+    part_starts: []const usize,
+    cols: []ColumnStore,
+) !void {
+    const part_count = op.plan.layout.part_count;
+    var srcs: [MAX_EMIT_WORKERS]ColumnView = undefined;
+    for (op.plan.layout.parts[0..part_count], 0..) |part, j| {
+        for (parts, 0..) |*p, w| {
+            const ci = types.findColumn(p.result.schema, part.name) orelse return error.UnsupportedQueryShape;
+            srcs[w] = p.result.values[ci];
+        }
+        try gatherAcrossPartitions(allocator, srcs[0..parts.len], part_starts, idx, &cols[j]);
+    }
+    // Aggregate-major: one output column at a time keeps the append path
+    // and its type dispatch hot across the whole range.
+    for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
+        const col = &cols[part_count + i];
+        for (rows) |row| try appendAggregateValue(allocator, col, agg_plan, row);
+    }
+}
+
+/// The partition holding location-ordered row `j` of `total`: partitions
+/// are the contiguous slices cut at `total * w / workers`, so the arithmetic
+/// estimate is exact or one low — one bounds check settles it. Every key
+/// column of every emitted row resolves through here; the linear walk it
+/// replaces was a third of the keys+aggs time at 3M+ groups.
+fn partitionOf(part_starts: []const usize, total: usize, j: usize) usize {
+    const workers = part_starts.len;
+    var w = j * workers / total;
+    if (w + 1 < workers and part_starts[w + 1] <= j) w += 1;
+    return w;
+}
+
+fn stringRowBytes(view: ColumnView, row: usize) []const u8 {
+    return switch (view.data) {
+        .varchar, .string, .char, .json => |sv| sv.rowBytes(row),
+        // Key base columns and their casts agree in type family with the
+        // output column.
+        else => unreachable,
+    };
+}
+
+/// Gather output rows from per-partition source views: `idx[i]` is the
+/// location-ordered row of output row `i`, resolved to (partition, local
+/// row). Types match the output column, as in `transform.appendByIndices`.
+fn gatherAcrossPartitions(
+    allocator: Allocator,
+    srcs: []const ColumnView,
+    part_starts: []const usize,
+    idx: []const u32,
+    out: *ColumnStore,
+) !void {
+    const dst_start = out.data.rowCount();
+    const rows_total = part_starts[part_starts.len - 1] + srcs[srcs.len - 1].rowCount();
+    switch (out.data) {
+        .varchar, .string, .char, .json => |*ss| {
+            var total: usize = 0;
+            for (idx) |j| {
+                const w = partitionOf(part_starts, rows_total, j);
+                total += stringRowBytes(srcs[w], j - part_starts[w]).len;
+            }
+            if (ss.isWide() or ss.bytes.items.len + total > std.math.maxInt(u32)) {
+                for (idx) |j| {
+                    const w = partitionOf(part_starts, rows_total, j);
+                    try ss.appendValue(allocator, stringRowBytes(srcs[w], j - part_starts[w]));
+                }
+            } else {
+                try ss.ensureUnusedValueCapacity(allocator, idx.len, total);
+                for (idx) |j| {
+                    const w = partitionOf(part_starts, rows_total, j);
+                    ss.appendValueAssumeCapacity(stringRowBytes(srcs[w], j - part_starts[w]));
+                }
+            }
+        },
+        inline else => |*list, tag| {
+            try list.ensureUnusedCapacity(allocator, idx.len);
+            for (idx) |j| {
+                const w = partitionOf(part_starts, rows_total, j);
+                list.appendAssumeCapacity(@field(srcs[w].data, @tagName(tag))[j - part_starts[w]]);
+            }
+        },
+    }
+    if (out.nulls != null) {
+        for (idx, 0..) |j, i| {
+            const w = partitionOf(part_starts, rows_total, j);
+            try out.appendValidBit(allocator, dst_start + i, srcs[w].isValid(j - part_starts[w]));
+        }
+    }
 }
 
 fn appendStringAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type, bytes: []const u8) !void {

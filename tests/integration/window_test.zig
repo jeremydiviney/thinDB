@@ -911,3 +911,23 @@ test "window: LAG over DECIMAL with integer default, and CASE mixing decimal wit
     try std.testing.expectEqual(@as(i64, 0), b.values[2].data.decimal64[1]);
     try std.testing.expectEqual(@as(i64, 225), b.values[2].data.decimal64[2]);
 }
+
+test "window: a narrowed CTE keeps a window column when every derived sibling dies" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    var q = try runSql(
+        allocator,
+        db,
+        "WITH c AS (SELECT id, IF(qty = 0, 0, 1) AS h, IF(qty = 1, 0, 1) AS h2, IF(qty = 2, 0, 1) AS h3, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY qty) AS rn2 FROM t) SELECT MAX(rn) AS n FROM c",
+    );
+    defer q.deinit();
+    const ns = try collectRows(i64, allocator, &q, 0);
+    defer allocator.free(ns);
+    try std.testing.expectEqualSlices(i64, &[_]i64{3}, ns);
+}

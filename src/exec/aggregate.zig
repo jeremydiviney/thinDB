@@ -361,6 +361,53 @@ fn maxByUpdate(aa: Allocator, s: *AccState, value_view: ColumnView, key_view: Co
     }
 }
 
+/// Row loop of the narrow MAX_BY scatter, specialized per key slice type and
+/// payload kind (`vs`: a scalar slice, a `StringView`, or `{}` for
+/// MAX_BY_KEY). Same rules as `maxByUpdate`: a row with a NULL payload or a
+/// NULL key is skipped, a strictly greater key replaces the cell, ties keep
+/// the first.
+fn maxByNarrowRows(bank: *StringBank, aa: Allocator, col: []MaxByNarrow, gids: []const u32, key_view: ColumnView, ks: anytype, value_view: ColumnView, vs: anytype) !void {
+    const V = @TypeOf(vs);
+    const key_nulls = key_view.nulls != null;
+    const value_nulls = value_view.nulls != null;
+    for (gids, 0..) |g, r| {
+        if (value_nulls and !value_view.isValid(r)) continue;
+        if (key_nulls and !key_view.isValid(r)) continue;
+        const k: i64 = ks[r];
+        const s = &col[g];
+        if (s.seen and k <= s.key) continue;
+        s.key = k;
+        if (V == storage.StringView) {
+            const bytes = vs.rowBytes(r);
+            s.val = .{ .str = (try bank.dupe(aa, bytes)).ptr };
+            s.len = @intCast(bytes.len);
+        } else if (V != void) {
+            s.val = .{ .int = vs[r] };
+        }
+        s.seen = true;
+    }
+}
+
+/// Row loop of the narrow ANY_VALUE / FIRST scatter: the first non-NULL row
+/// of a group fills its cell, every later row is one load + branch.
+fn anyValueNarrowRows(bank: *StringBank, aa: Allocator, col: []ValueNarrow, gids: []const u32, view: ColumnView, vs: anytype) !void {
+    const V = @TypeOf(vs);
+    const has_nulls = view.nulls != null;
+    for (gids, 0..) |g, r| {
+        const s = &col[g];
+        if (s.seen) continue;
+        if (has_nulls and !view.isValid(r)) continue;
+        if (V == storage.StringView) {
+            const bytes = vs.rowBytes(r);
+            s.val = .{ .str = (try bank.dupe(aa, bytes)).ptr };
+            s.len = @intCast(bytes.len);
+        } else {
+            s.val = .{ .int = vs[r] };
+        }
+        s.seen = true;
+    }
+}
+
 fn appendValueToColumn(allocator: Allocator, col: *ColumnStore, out_type: Type, value: types.Value) !void {
     switch (out_type) {
         .int => try col.data.int.append(allocator, value.int),
@@ -452,6 +499,8 @@ const AggCol = union(enum) {
     max_int: []?i64,
     min_float: []?f64,
     max_float: []?f64,
+    max_by_narrow: []MaxByNarrow,
+    value_narrow: []ValueNarrow,
     other: []AccState,
 };
 
@@ -462,9 +511,9 @@ const AggCol = union(enum) {
 /// percentile, group_concat) lands in `.other`. Combined-distinct aggregates
 /// (`cd[ai] != null`) also use `.other` — their cell value is unused (the count
 /// is read from the combined counter), so a default-initialized `AccState` does.
-const AggColKind = enum { count, sum_int, sum_float, avg, min_int, max_int, min_float, max_float, other };
+const AggColKind = enum { count, sum_int, sum_float, avg, min_int, max_int, min_float, max_float, max_by_narrow, value_narrow, other };
 
-fn aggColKind(func: AggFunc, in: ?Type) AggColKind {
+fn aggColKind(func: AggFunc, in: ?Type, key_t: ?Type) AggColKind {
     return switch (func) {
         .count, .count_if => .count,
         .sum => if (in != null and in.?.isFloat()) .sum_float else .sum_int,
@@ -481,6 +530,14 @@ fn aggColKind(func: AggFunc, in: ?Type) AggColKind {
             .other
         else
             .max_int,
+        // ANY_VALUE / FIRST over a string or ≤64-bit scalar, and MAX_BY /
+        // MAX_BY_KEY ordered by a ≤64-bit scalar, keep a compact cell (an i64
+        // key, 8 payload bytes, a length, a seen flag) instead of the
+        // `types.Value`-carrying AccState. Float / 128-bit keys or payloads
+        // and `.last` (overwrites, so it is not a first-wins load) stay wide.
+        .any_value, .first => if (in != null and narrowPayload(in.?)) .value_narrow else .other,
+        .max_by => if (key_t != null and narrowScalar(key_t.?) and in != null and narrowPayload(in.?)) .max_by_narrow else .other,
+        .max_by_key => if (key_t != null and narrowScalar(key_t.?)) .max_by_narrow else .other,
         else => .other,
     };
 }
@@ -490,14 +547,16 @@ fn aggColKind(func: AggFunc, in: ?Type) AggColKind {
 /// router (net/local.zig) sums these to size the hash table against the budget,
 /// so it must track the real column widths rather than a flat per-AccState
 /// estimate.
-pub fn aggStateWidth(func: AggFunc, in: ?Type) usize {
-    return switch (aggColKind(func, in)) {
+pub fn aggStateWidth(func: AggFunc, in: ?Type, key_t: ?Type) usize {
+    return switch (aggColKind(func, in, key_t)) {
         .count => @sizeOf(u64),
         .sum_int => @sizeOf(SumIntAcc),
         .sum_float => @sizeOf(SumFloatAcc),
         .avg => @sizeOf(AvgAcc),
         .min_int, .max_int => @sizeOf(?i64),
         .min_float, .max_float => @sizeOf(?f64),
+        .max_by_narrow => @sizeOf(MaxByNarrow),
+        .value_narrow => @sizeOf(ValueNarrow),
         .other => @sizeOf(AccState),
     };
 }
@@ -541,6 +600,89 @@ const MaxByAcc = struct {
     key: types.Value = .{ .int = 0 },
     value: types.Value = .{ .int = 0 },
 };
+
+/// Types whose every value widens losslessly into an i64: the MAX_BY order
+/// keys and the fixed-width payloads the narrow cells hold.
+fn narrowScalar(t: Type) bool {
+    return switch (t) {
+        .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64 => true,
+        else => false,
+    };
+}
+
+fn narrowPayload(t: Type) bool {
+    return t.isString() or narrowScalar(t);
+}
+
+/// Payload of a narrow cell: the widened scalar bits, or the start of a
+/// string kept in the operator's `StringBank` (the length sits beside it).
+/// Which field is live is fixed per aggregate by its input column's type.
+const NarrowVal = union {
+    int: i64,
+    str: [*]const u8,
+};
+
+/// MAX_BY / MAX_BY_KEY cell for a ≤64-bit order key: the `.max_by` AccState's
+/// meaning (seen, running max key, the payload it carried) in 24 B instead of
+/// ~96. MAX_BY_KEY never captures the payload.
+const MaxByNarrow = struct {
+    key: i64 = 0,
+    val: NarrowVal = .{ .int = 0 },
+    len: u32 = 0,
+    seen: bool = false,
+};
+
+/// ANY_VALUE / FIRST cell: the first non-NULL payload, 16 B.
+const ValueNarrow = struct {
+    val: NarrowVal = .{ .int = 0 },
+    len: u32 = 0,
+    seen: bool = false,
+};
+
+/// Chunked byte bank for the string payloads the narrow cells keep: one arena
+/// chunk at a time instead of one arena `dupe` per improving row. Chunks
+/// never move, so a pointer into one stays valid for the operator's life; a
+/// superseded payload is abandoned in place (as the arena dupes were).
+const StringBank = struct {
+    chunk: []u8 = &.{},
+    used: usize = 0,
+
+    const CHUNK_BYTES: usize = 256 * 1024;
+
+    fn dupe(self: *StringBank, aa: Allocator, bytes: []const u8) ![]const u8 {
+        if (bytes.len > CHUNK_BYTES / 4) return aa.dupe(u8, bytes);
+        if (self.used + bytes.len > self.chunk.len) {
+            self.chunk = try aa.alloc(u8, CHUNK_BYTES);
+            self.used = 0;
+        }
+        const dst = self.chunk[self.used .. self.used + bytes.len];
+        @memcpy(dst, bytes);
+        self.used += bytes.len;
+        return dst;
+    }
+};
+
+/// The `types.Value` a narrow scalar cell stands for, tagged by the column
+/// type it was filled from (the reverse of the kernels' i64 widening). Only
+/// `narrowScalar` types ever reach a narrow cell.
+fn narrowScalarValue(t: Type, bits: i64) types.Value {
+    return switch (t) {
+        .boolean => .{ .boolean = bits != 0 },
+        .tinyint => .{ .tinyint = @intCast(bits) },
+        .smallint => .{ .smallint = @intCast(bits) },
+        .int => .{ .int = @intCast(bits) },
+        .bigint => .{ .bigint = bits },
+        .date => .{ .date = @intCast(bits) },
+        .datetime => .{ .datetime = bits },
+        .decimal64 => .{ .decimal64 = bits },
+        else => unreachable,
+    };
+}
+
+fn narrowValue(t: Type, v: NarrowVal, len: u32) types.Value {
+    if (t.isString()) return .{ .text = v.str[0..len] };
+    return narrowScalarValue(t, v.int);
+}
 
 const BitwiseAcc = struct {
     seen: bool = false,
@@ -628,6 +770,10 @@ pub const Aggregate = struct {
     group_col_indices: []usize,
     /// For each agg, index in upstream schema (or null for COUNT(*)).
     agg_col_indices: []?usize,
+    /// Index of each aggregate's second argument (the MAX_BY order column) in
+    /// the upstream schema, or null. Resolved once at create; the scatter used
+    /// to re-find it by name on every batch.
+    agg_key_indices: []?usize,
     /// Each agg's spec (borrowed from caller).
     aggs: []const AggSpec,
 
@@ -693,6 +839,8 @@ pub const Aggregate = struct {
     /// per-aggregate columns cut a COUNT/SUM/AVG group from 96 B to ~40 B.
     /// Arena-owned (the backing slices live in `arena`), like `gstate` was.
     agg_cols: []AggCol = &.{},
+    /// Byte bank for the narrow cells' string payloads; arena-backed.
+    str_bank: StringBank = .{},
     /// Reused scratch (arena, length `aggs.len`) into which the emit paths
     /// gather one group's columns back into `[]AccState`, so the existing
     /// `appendGroupRow` / `topkEntry` (which take `[]AccState`) run unchanged.
@@ -841,12 +989,15 @@ pub const Aggregate = struct {
             };
         }
 
-        for (aggs, agg_col_indices) |a, maybe_idx| {
+        const agg_key_indices = try allocator.alloc(?usize, aggs.len);
+        errdefer allocator.free(agg_key_indices);
+        for (aggs, agg_col_indices, agg_key_indices) |a, maybe_idx, *key_idx| {
             const t = if (maybe_idx) |idx| up_schema[idx].type else null;
-            const arg2_t: ?Type = if (a.arg2_col) |name| blk: {
-                const idx = types.findColumn(up_schema, name) orelse return Error.ColumnNotFound;
-                break :blk up_schema[idx].type;
-            } else null;
+            key_idx.* = if (a.arg2_col) |name|
+                (types.findColumn(up_schema, name) orelse return Error.ColumnNotFound)
+            else
+                null;
+            const arg2_t: ?Type = if (key_idx.*) |idx| up_schema[idx].type else null;
             try validateAggFn(a.func, t, a.params, arg2_t);
         }
 
@@ -900,6 +1051,7 @@ pub const Aggregate = struct {
             .upstream = upstream,
             .group_col_indices = group_col_indices,
             .agg_col_indices = agg_col_indices,
+            .agg_key_indices = agg_key_indices,
             .aggs = aggs,
             .output_schema = output_schema,
             .output_columns = output_columns,
@@ -1127,6 +1279,7 @@ pub const Aggregate = struct {
         self.allocator.free(self.output_schema);
         self.allocator.free(self.group_col_indices);
         self.allocator.free(self.agg_col_indices);
+        self.allocator.free(self.agg_key_indices);
         self.allocator.free(self.single_state);
         self.allocator.free(self.cd);
         if (self.top_k) |r| self.allocator.free(r.keys);
@@ -1398,8 +1551,14 @@ pub const Aggregate = struct {
                         try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
-                .max_by, .max_by_key => try self.scatterMaxBy(ai, a, gids, batch, aa_state),
-                .any_value, .first => try self.scatterAnyValue(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state),
+                .max_by, .max_by_key => switch (self.agg_cols[ai]) {
+                    .max_by_narrow => |col| try self.scatterMaxByNarrow(col, ai, a.func == .max_by_key, gids, batch, aa_state),
+                    else => try self.scatterMaxBy(ai, gids, batch, aa_state),
+                },
+                .any_value, .first => switch (self.agg_cols[ai]) {
+                    .value_narrow => |col| try self.scatterAnyValueNarrow(col, gids, batch.values[self.agg_col_indices[ai].?], aa_state),
+                    else => try self.scatterAnyValue(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state),
+                },
                 else => {
                     const col = self.agg_cols[ai].other;
                     var r: u32 = 0;
@@ -1513,14 +1672,10 @@ pub const Aggregate = struct {
         }
     }
 
-    /// MAX_BY scatter. Mirrors `maxByUpdate` exactly, but resolves the order
-    /// column ONCE per batch — the per-row `updateStateRow` fallback paid a
-    /// linear `findColumn` (string compares over the whole schema) for every
-    /// single row.
-    fn scatterMaxBy(self: *Aggregate, ai: usize, a: AggSpec, gids: []const u32, batch: Batch, aa: Allocator) !void {
-        const key_name = a.arg2_col orelse return Error.AggregateColumnRequired;
-        const key_idx = types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound;
-        const key_view = batch.values[key_idx];
+    /// MAX_BY scatter for the wide (`.other`) cell — a float / 128-bit key or
+    /// payload. Mirrors `maxByUpdate` exactly.
+    fn scatterMaxBy(self: *Aggregate, ai: usize, gids: []const u32, batch: Batch, aa: Allocator) !void {
+        const key_view = batch.values[self.agg_key_indices[ai].?];
         const value_view = batch.values[self.agg_col_indices[ai].?];
         const col = self.agg_cols[ai].other;
         var r: u32 = 0;
@@ -1547,6 +1702,37 @@ pub const Aggregate = struct {
             if (!view.isValid(r)) continue;
             s.value_acc.value = try valueFromRow(aa, view, r);
             s.value_acc.seen = true;
+        }
+    }
+
+    /// MAX_BY / MAX_BY_KEY scatter for the narrow cell. The key widens to i64
+    /// (booleans as 0/1, dates as day numbers) so the compare is one integer
+    /// branch; the payload is the widened scalar or a copy of the string bytes
+    /// in `str_bank`. MAX_BY_KEY only tracks the key, so its payload column
+    /// contributes validity alone and may be any type.
+    fn scatterMaxByNarrow(self: *Aggregate, col: []MaxByNarrow, ai: usize, key_only: bool, gids: []const u32, batch: Batch, aa: Allocator) !void {
+        const key_view = batch.values[self.agg_key_indices[ai].?];
+        const value_view = batch.values[self.agg_col_indices[ai].?];
+        switch (key_view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |ks| {
+                if (key_only) {
+                    try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, {});
+                } else switch (value_view.data) {
+                    inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
+                    inline .varchar, .string, .char, .json => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
+                    else => unreachable,
+                }
+            },
+            else => unreachable,
+        }
+    }
+
+    /// ANY_VALUE / FIRST scatter for the narrow cell.
+    fn scatterAnyValueNarrow(self: *Aggregate, col: []ValueNarrow, gids: []const u32, view: ColumnView, aa: Allocator) !void {
+        switch (view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
+            inline .varchar, .string, .char, .json => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
+            else => unreachable,
         }
     }
 
@@ -1871,9 +2057,10 @@ pub const Aggregate = struct {
     fn allocAggCols(self: *Aggregate, aa: Allocator, capacity: usize) !void {
         const up_schema = self.upstream.outputSchema();
         const cols = try aa.alloc(AggCol, self.aggs.len);
-        for (self.aggs, self.agg_col_indices, 0..) |a, maybe_idx, ai| {
+        for (self.aggs, self.agg_col_indices, self.agg_key_indices, 0..) |a, maybe_idx, maybe_key, ai| {
             const in_t: ?Type = if (maybe_idx) |i| up_schema[i].type else null;
-            cols[ai] = try initAggCol(aa, a.func, in_t, capacity);
+            const key_t: ?Type = if (maybe_key) |i| up_schema[i].type else null;
+            cols[ai] = try initAggCol(aa, a.func, in_t, key_t, capacity);
         }
         self.agg_cols = cols;
     }
@@ -1931,7 +2118,7 @@ pub const Aggregate = struct {
     fn readGroupState(self: *Aggregate, gid: u32) []AccState {
         const g: usize = gid;
         const out = self.state_scratch;
-        for (self.agg_cols, out) |col, *dst| {
+        for (self.agg_cols, out, 0..) |col, *dst, ai| {
             dst.* = switch (col) {
                 .count => |s| .{ .count = s[g] },
                 .sum_int => |s| .{ .sum_int = s[g] },
@@ -1941,10 +2128,32 @@ pub const Aggregate = struct {
                 .max_int => |s| .{ .max_int = s[g] },
                 .min_float => |s| .{ .min_float = s[g] },
                 .max_float => |s| .{ .max_float = s[g] },
+                .max_by_narrow => |s| self.wrapMaxByNarrow(ai, s[g]),
+                .value_narrow => |s| self.wrapValueNarrow(ai, s[g]),
                 .other => |s| s[g],
             };
         }
         return out;
+    }
+
+    /// Widen a narrow MAX_BY cell back into the `.max_by` AccState the emit
+    /// paths read (`appendGroupRow` / `topkEntry`), re-tagging key and payload
+    /// with their column types. An unseen cell maps to the initial state.
+    fn wrapMaxByNarrow(self: *Aggregate, ai: usize, s: MaxByNarrow) AccState {
+        if (!s.seen) return .{ .max_by = .{} };
+        const up_schema = self.upstream.outputSchema();
+        const key_t = up_schema[self.agg_key_indices[ai].?].type;
+        const value: types.Value = if (self.aggs[ai].func == .max_by_key)
+            .{ .int = 0 }
+        else
+            narrowValue(up_schema[self.agg_col_indices[ai].?].type, s.val, s.len);
+        return .{ .max_by = .{ .seen = true, .key = narrowScalarValue(key_t, s.key), .value = value } };
+    }
+
+    fn wrapValueNarrow(self: *Aggregate, ai: usize, s: ValueNarrow) AccState {
+        if (!s.seen) return .{ .value_acc = .{} };
+        const value_t = self.upstream.outputSchema()[self.agg_col_indices[ai].?].type;
+        return .{ .value_acc = .{ .seen = true, .value = narrowValue(value_t, s.val, s.len) } };
     }
 
     /// Integer fast path: pack each row's group columns into a u128 (phase a),
@@ -2669,8 +2878,8 @@ fn foldMaxFloat(s: *AccState, m: f64) void {
 /// Allocate one aggregate's accumulator column to `capacity` cells and fill it
 /// with the aggregate's initial value (mirroring `initialState`). The narrow
 /// kinds get a typed slice; everything else gets a `[]AccState` (`.other`).
-fn initAggCol(aa: Allocator, func: AggFunc, in: ?Type, capacity: usize) !AggCol {
-    return switch (aggColKind(func, in)) {
+fn initAggCol(aa: Allocator, func: AggFunc, in: ?Type, key_t: ?Type, capacity: usize) !AggCol {
+    return switch (aggColKind(func, in, key_t)) {
         .count => blk: {
             const s = try aa.alloc(u64, capacity);
             @memset(s, 0);
@@ -2710,6 +2919,16 @@ fn initAggCol(aa: Allocator, func: AggFunc, in: ?Type, capacity: usize) !AggCol 
             const s = try aa.alloc(?f64, capacity);
             @memset(s, null);
             break :blk .{ .max_float = s };
+        },
+        .max_by_narrow => blk: {
+            const s = try aa.alloc(MaxByNarrow, capacity);
+            @memset(s, .{});
+            break :blk .{ .max_by_narrow = s };
+        },
+        .value_narrow => blk: {
+            const s = try aa.alloc(ValueNarrow, capacity);
+            @memset(s, .{});
+            break :blk .{ .value_narrow = s };
         },
         .other => blk: {
             const s = try aa.alloc(AccState, capacity);
@@ -2753,6 +2972,16 @@ fn growAggCol(aa: Allocator, col: *AggCol, func: AggFunc, in: ?Type, new_capacit
             const old = s.len;
             s.* = try aa.realloc(s.*, new_capacity);
             @memset(s.*[old..], null);
+        },
+        .max_by_narrow => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], .{});
+        },
+        .value_narrow => |*s| {
+            const old = s.len;
+            s.* = try aa.realloc(s.*, new_capacity);
+            @memset(s.*[old..], .{});
         },
         .other => |*s| {
             const old = s.len;
