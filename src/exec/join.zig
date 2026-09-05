@@ -1432,7 +1432,22 @@ pub const Join = struct {
                     }
                     const _bt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
                     try self.buildPhase();
-                    if (exec.prof.enabled) self.prof_build_ticks += exec.prof.nowTicks() - _bt;
+                    if (exec.prof.enabled) {
+                        self.prof_build_ticks += exec.prof.nowTicks() - _bt;
+                        if (exec.prof.ticksToMs(self.prof_build_ticks) > 30.0 and !self.prof_shared_build) {
+                            const build_q = if (self.build_is_left) self.left else self.right;
+                            var buf: std.ArrayList(u8) = .empty;
+                            defer buf.deinit(std.heap.page_allocator);
+                            build_q.explain(&buf, std.heap.page_allocator, 0) catch {};
+                            std.debug.print("[hprof] join slow build ({d:.1} ms, {d} rows, {s} on={d}) build-side plan:\n{s}\n", .{
+                                exec.prof.ticksToMs(self.prof_build_ticks),
+                                self.build_rows,
+                                @tagName(self.join_type),
+                                self.left_key_indices.len,
+                                buf.items,
+                            });
+                        }
+                    }
                     if (self.skew_smj) |*sm| return sm.next();
                     // Empty-build short-circuit: with nothing to match and
                     // no preserved probe side, the join produces nothing —

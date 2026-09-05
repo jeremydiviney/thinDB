@@ -1020,6 +1020,8 @@ const MatPartition = struct {
     compute_q: ?Query = null,
     result: Batch = undefined,
     err: ?anyerror = null,
+    fetch_ticks: i64 = 0,
+    compute_ticks: i64 = 0,
 
     fn create(allocator: Allocator, op: *GroupTopNPipeline, names: []const []const u8, derived: []const compute.Derived, locs: []const i64) !MatPartition {
         const scan_ptr = try Scan.allocWithProjectionLoc(allocator, op.table, null, names, false, null);
@@ -1031,15 +1033,19 @@ const MatPartition = struct {
     }
 
     fn materialize(self: *MatPartition) !void {
+        const t0 = exec.prof.nowTicks();
         try self.late.materializeInto(self.locs, self.scan.memtableSnap());
         const m = self.late.outputColumns();
         self.views = try self.allocator.alloc(ColumnView, m.columns.len);
         for (m.columns, self.views) |*c, *v| v.* = c.view();
         self.result = .{ .schema = m.schema, .values = self.views, .row_count = self.locs.len };
+        const t1 = exec.prof.nowTicks();
+        self.fetch_ticks = t1 - t0;
         if (self.derived.len == 0) return;
         const src = try SingleBatchSource.create(self.allocator, self.result);
         self.compute_q = try compute.Compute.create(self.allocator, src, self.derived);
         self.result = (try self.compute_q.?.next()) orelse return error.UnsupportedQueryShape;
+        self.compute_ticks = exec.prof.nowTicks() - t1;
     }
 
     fn deinit(self: *MatPartition) void {
@@ -1159,6 +1165,19 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
         if (p.err) |e| return e;
     }
     const mat_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_mat);
+    if (comptime build_options.profiling) {
+        if (getenv("THINDB_V2_PIPELINE_TRACE") != null) {
+            var fetch_max: i64 = 0;
+            var compute_max: i64 = 0;
+            for (parts) |p| {
+                fetch_max = @max(fetch_max, p.fetch_ticks);
+                compute_max = @max(compute_max, p.compute_ticks);
+            }
+            std.debug.print("[v2-emit] late_mat split: fetch max={d:.1}ms compute max={d:.1}ms partitions={d}\n", .{
+                exec.prof.ticksToMs(fetch_max), exec.prof.ticksToMs(compute_max), parts.len,
+            });
+        }
+    }
 
     const t_emit = exec.prof.nowTicks();
     var ranges = try EmitRanges.init(op, workers, rows.len);
@@ -1239,11 +1258,15 @@ fn emitHashedRange(
     }
 }
 
-/// The partition holding location-ordered row `j`: partitions are
-/// contiguous, ascending slices of that order.
-fn partitionOf(part_starts: []const usize, j: usize) usize {
-    var w: usize = part_starts.len - 1;
-    while (part_starts[w] > j) w -= 1;
+/// The partition holding location-ordered row `j` of `total`: partitions
+/// are the contiguous slices cut at `total * w / workers`, so the arithmetic
+/// estimate is exact or one low — one bounds check settles it. Every key
+/// column of every emitted row resolves through here; the linear walk it
+/// replaces was a third of the keys+aggs time at 3M+ groups.
+fn partitionOf(part_starts: []const usize, total: usize, j: usize) usize {
+    const workers = part_starts.len;
+    var w = j * workers / total;
+    if (w + 1 < workers and part_starts[w + 1] <= j) w += 1;
     return w;
 }
 
@@ -1267,22 +1290,23 @@ fn gatherAcrossPartitions(
     out: *ColumnStore,
 ) !void {
     const dst_start = out.data.rowCount();
+    const rows_total = part_starts[part_starts.len - 1] + srcs[srcs.len - 1].rowCount();
     switch (out.data) {
         .varchar, .string, .char, .json => |*ss| {
             var total: usize = 0;
             for (idx) |j| {
-                const w = partitionOf(part_starts, j);
+                const w = partitionOf(part_starts, rows_total, j);
                 total += stringRowBytes(srcs[w], j - part_starts[w]).len;
             }
             if (ss.isWide() or ss.bytes.items.len + total > std.math.maxInt(u32)) {
                 for (idx) |j| {
-                    const w = partitionOf(part_starts, j);
+                    const w = partitionOf(part_starts, rows_total, j);
                     try ss.appendValue(allocator, stringRowBytes(srcs[w], j - part_starts[w]));
                 }
             } else {
                 try ss.ensureUnusedValueCapacity(allocator, idx.len, total);
                 for (idx) |j| {
-                    const w = partitionOf(part_starts, j);
+                    const w = partitionOf(part_starts, rows_total, j);
                     ss.appendValueAssumeCapacity(stringRowBytes(srcs[w], j - part_starts[w]));
                 }
             }
@@ -1290,14 +1314,14 @@ fn gatherAcrossPartitions(
         inline else => |*list, tag| {
             try list.ensureUnusedCapacity(allocator, idx.len);
             for (idx) |j| {
-                const w = partitionOf(part_starts, j);
+                const w = partitionOf(part_starts, rows_total, j);
                 list.appendAssumeCapacity(@field(srcs[w].data, @tagName(tag))[j - part_starts[w]]);
             }
         },
     }
     if (out.nulls != null) {
         for (idx, 0..) |j, i| {
-            const w = partitionOf(part_starts, j);
+            const w = partitionOf(part_starts, rows_total, j);
             try out.appendValidBit(allocator, dst_start + i, srcs[w].isValid(j - part_starts[w]));
         }
     }

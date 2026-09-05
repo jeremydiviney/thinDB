@@ -220,6 +220,16 @@ pub var g_fsst_digest_ticks = std.atomic.Value(u64).init(0);
 pub var g_fsst_digest_rows = std.atomic.Value(u64).init(0);
 pub var g_fsst_digest_bytes = std.atomic.Value(u64).init(0);
 
+pub const MAT_KINDS = 9;
+/// Below one survivor per this many rows an index gather (only the survivors'
+/// rows touched) beats the branchless masked compaction, which streams the
+/// whole block; above it the sequential pass wins.
+const SPARSE_GATHER_DIVISOR = 4;
+const MAT_KIND_NAMES = [MAT_KINDS][]const u8{ "other", "coded", "hashed", "for", "dict", "rle", "fsst", "rawview", "rawowned" };
+pub fn matKindName(k: usize) []const u8 {
+    return MAT_KIND_NAMES[k];
+}
+
 pub const Scan = struct {
     allocator: Allocator,
     io: Io,
@@ -363,6 +373,9 @@ pub const Scan = struct {
     /// Grown on demand; reused across `next()` calls; freed in `deinit`.
     mask_buf2: []bool = &.{},
     mask_buf3: []bool = &.{},
+    /// The current row group's survivor row indices (`survivorRows`), shared
+    /// by every projected column's gather.
+    survivor_rows: []u32 = &.{},
     /// Scratch array of borrowed cache blocks for the fused-filter fast path,
     /// one slot per projected column. Reused across `next()` calls; the pins
     /// it holds are released within each call. Freed in `deinit`.
@@ -433,6 +446,11 @@ pub const Scan = struct {
     /// decisions, segment opening, and the ParallelScan worker farm-out.
     scan_borrow_ticks: u64 = 0,
     scan_kernel_ticks: u64 = 0,
+    /// The guided filtered path's survivor materialization (per-survivor
+    /// decode of every projected column), summed like the two above.
+    scan_materialize_ticks: u64 = 0,
+    scan_mat_kind_ticks: [MAT_KINDS]u64 = [_]u64{0} ** MAT_KINDS,
+    scan_mat_kind_cols: [MAT_KINDS]u32 = [_]u32{0} ** MAT_KINDS,
 
     /// Phase 4.2 (Option A): when set, the projected column at `out_phys[code_col]`
     /// is emitted as global dict CODES (via the `Batch.coded` sidecar) instead of
@@ -989,6 +1007,7 @@ pub const Scan = struct {
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
         if (self.mask_buf2.len > 0) self.allocator.free(self.mask_buf2);
         if (self.mask_buf3.len > 0) self.allocator.free(self.mask_buf3);
+        if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
@@ -2116,6 +2135,7 @@ pub const Scan = struct {
         expr: PredicateExpr,
     ) !?usize {
         const mask = try self.ensureMask(rg_count);
+        const _tp = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         switch (expr) {
             .leaf, .like, .not, .in_set, .@"or" => {
                 if (!guidedChildShape(expr)) return null;
@@ -2160,6 +2180,7 @@ pub const Scan = struct {
             else => return null,
         }
         self.rgs_guided += 1;
+        if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tp));
 
         if (tomb_mask) |tm| {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
@@ -2173,7 +2194,11 @@ pub const Scan = struct {
 
         const _tm = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
-        if (exec.prof.enabled) exec.prof.add("scan.materialize_survivors", @intCast(@max(0, exec.prof.nowTicks() - _tm)));
+        if (exec.prof.enabled) {
+            const dm: u64 = @intCast(@max(0, exec.prof.nowTicks() - _tm));
+            exec.prof.add("scan.materialize_survivors", dm);
+            self.scan_materialize_ticks +%= dm;
+        }
         return matched;
     }
 
@@ -3185,34 +3210,43 @@ pub const Scan = struct {
         };
     }
 
-    /// Compact the masked survivors of every projected column into `filtered`.
-    /// Each column is borrowed from the cache; a FOR-encoded block expands only
-    /// its survivors to native (`forExpandSurvivors`), a raw block is viewed in
-    /// place and run through the shared masked-compaction. The borrow pins are
-    /// released before returning.
+    /// Compact the survivors of every projected column into `filtered`. The
+    /// mask becomes a survivor row list once per row group and every column
+    /// gathers by index — a selective filter over a wide projection otherwise
+    /// re-walks the full mask per column (30 columns × 64K rows for ~3K
+    /// survivors) and the raw-view compaction streams every row of every
+    /// block. A dense mask keeps the branchless full pass for raw fixed-width
+    /// columns, where it beats the gather. Each column is borrowed from the
+    /// cache; the borrow pins are released before returning.
     fn materializeSurvivors(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, mask: []const bool) !void {
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
+        var mat_kind: usize = 0;
 
+        const rows = try self.survivorRows(mask);
+        const matched = rows.len;
         const coding = self.n_coded > 0;
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
         const hashing = self.n_hashed > 0;
         const hash_slots: ?[]?[]const u128 = if (hashing) try self.ensureHashedSlots() else null;
-        var matched: usize = 0;
-        if (coding or hashing) {
-            for (mask) |m| matched += @intFromBool(m);
-        }
 
         for (self.out_phys, 0..) |phys, j| {
             const col_type = self.table.schema.columns[phys].type;
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+            const _tc = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+            mat_kind = 0;
+            defer if (exec.prof.enabled) {
+                self.scan_mat_kind_ticks[mat_kind] +%= @intCast(@max(0, exec.prof.nowTicks() - _tc));
+                self.scan_mat_kind_cols[mat_kind] += 1;
+            };
 
             // Coded group key: translate only the survivors' codes into the code
             // buffer (dict block → LUT, raw block → intern), never expanding the
             // full block to strings. `values[j]` gets an empty-string placeholder
             // (the aggregate reads the sidecar codes, not the value column).
             if (coding and self.coded_dicts_by_j[j] != null) {
-                try self.codeSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, mask, matched);
+                mat_kind = 1;
+                try self.codeSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, rows);
                 try self.fillEmptyStrings(&filtered_cols[j], matched);
                 slots.?[j] = .{ .codes = self.code_bufs[j].items[0..matched], .dict = self.coded_dicts_by_j[j].? };
                 continue;
@@ -3221,22 +3255,27 @@ pub const Scan = struct {
             // Hashed group key: digest only the survivors, same no-expansion
             // rule as the coded path.
             if (hashing and self.hash_cols_by_j[j]) {
-                try self.hashSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, mask, matched);
+                mat_kind = 2;
+                try self.hashSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, rows);
                 try self.fillEmptyStrings(&filtered_cols[j], matched);
                 hash_slots.?[j] = self.hash_bufs[j].items[0..matched];
                 continue;
             }
 
+            const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
             defer block.release(self.allocator, self.table.cacheRef());
+            if (exec.prof.enabled) self.scan_borrow_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tb));
 
             if (block.encoding == .for_) {
+                mat_kind = 3;
                 const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
-                try self.appendForSurvivors(fv, mask, &filtered_cols[j]);
+                try self.appendForSurvivors(fv, rows, &filtered_cols[j]);
                 continue;
             }
 
             if (block.encoding == .dict) {
+                mat_kind = 4;
                 var values = block.bytes;
                 var nulls: ?[]const u8 = null;
                 if (flags.has_nulls) {
@@ -3245,60 +3284,103 @@ pub const Scan = struct {
                     values = block.bytes[bm_len..];
                 }
                 const db = storage.segment_reader.dictBlockOf(values, rg_count);
-                try self.appendDictSurvivors(db, nulls, mask, &filtered_cols[j]);
+                try self.appendDictSurvivors(db, nulls, rows, &filtered_cols[j]);
                 continue;
             }
 
             if (block.encoding == .rle) {
+                mat_kind = 5;
                 const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
-                try self.appendRleSurvivors(rv, mask, &filtered_cols[j]);
+                try self.appendRleSurvivors(rv, rows, &filtered_cols[j]);
                 continue;
             }
 
             if (block.encoding == .fsst) {
+                mat_kind = 6;
                 const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
-                try self.appendFsstSurvivors(fv, mask, &filtered_cols[j]);
+                try self.appendFsstSurvivors(fv, rows, &filtered_cols[j]);
                 continue;
             }
 
-            // Raw block: borrow a native view in place when possible, else fall
-            // back to an owned decode just for this column. Both feed the shared
-            // masked-compaction.
+            // Raw block: a native view in place when possible, else an owned
+            // decode just for this column.
             if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
-                try engine.memtable.appendMaskedColumn(self.allocator, view, mask, &filtered_cols[j]);
+                mat_kind = 7;
+                try self.appendRawSurvivors(view, mask, rows, &filtered_cols[j]);
             } else {
+                mat_kind = 8;
                 var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
                 defer owned.deinit(self.allocator);
-                try engine.memtable.appendMaskedColumn(self.allocator, owned.view(), mask, &filtered_cols[j]);
+                try self.appendRawSurvivors(owned.view(), mask, rows, &filtered_cols[j]);
             }
         }
-        if (self.emit_loc) try self.appendSurvivorLocs(mask, rg_idx);
+        if (self.emit_loc) try self.appendSurvivorLocs(rows, rg_idx);
         self.filtered_coded = slots;
         self.filtered_hashed = hash_slots;
     }
 
-    /// Late-mat: append each survivor's packed `__rowloc` into the trailing
-    /// filtered buffer (a bigint `ColumnStore`), in the same mask order the
-    /// projected columns were compacted — so loc[k] matches survivor row k.
-    /// `rg_idx` non-null → segment row group (pack seg/rg/in-group-offset);
-    /// null → memtable (pack the row index). The local offset `i` is exactly
-    /// what `LateScan` unpacks to re-fetch the survivor's wide columns.
-    fn appendSurvivorLocs(self: *Scan, mask: []const bool, rg_idx: ?usize) !void {
-        const loc_col = &self.filtered.?[self.out_phys.len];
+    /// The set rows of `mask` as ascending indices, in a scratch reused across
+    /// row groups. Branchless: one store per row, the cursor advances only on
+    /// survivors (the throw-away store lands at most one slot past the last
+    /// survivor, always inside the mask-sized scratch).
+    fn survivorRows(self: *Scan, mask: []const bool) ![]const u32 {
+        if (self.survivor_rows.len < mask.len) {
+            if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
+            self.survivor_rows = try self.allocator.alloc(u32, mask.len);
+        }
+        const buf = self.survivor_rows;
+        var pos: usize = 0;
         for (mask, 0..) |m, i| {
-            if (!m) continue;
+            buf[pos] = @intCast(i);
+            pos += @intFromBool(m);
+        }
+        return buf[0..pos];
+    }
+
+    /// A raw (natively viewable) column's survivors: a sparse mask gathers by
+    /// index, a dense one takes the branchless masked compaction — which is
+    /// also the route for a converting (schema-evolved) source/destination
+    /// pair the gather declines.
+    fn appendRawSurvivors(self: *Scan, view: ColumnView, mask: []const bool, rows: []const u32, out: *ColumnStore) !void {
+        if (rows.len * SPARSE_GATHER_DIVISOR < mask.len) {
+            if (try engine.memtable.appendGatheredColumn(self.allocator, view, rows, out)) return;
+        }
+        try engine.memtable.appendMaskedColumn(self.allocator, view, mask, out);
+    }
+
+    /// The survivors' validity bits, appended after their values: one all-valid
+    /// range when the block carries no bitmap, else one bit per survivor.
+    fn appendSurvivorValidity(self: *Scan, nulls: ?[]const u8, rows: []const u32, out: *ColumnStore) !void {
+        if (out.nulls == null) return;
+        const dst_start = out.data.rowCount() - rows.len;
+        if (nulls == null) return out.appendValidityRange(self.allocator, dst_start, null, rows.len);
+        for (rows, 0..) |row, j| {
+            try out.appendValidBit(self.allocator, dst_start + j, storage.column.isValidBit(nulls, row));
+        }
+    }
+
+    /// Late-mat: append each survivor's packed `__rowloc` into the trailing
+    /// filtered buffer (a bigint `ColumnStore`), in survivor order — so loc[k]
+    /// matches survivor row k. `rg_idx` non-null → segment row group (pack
+    /// seg/rg/in-group-offset); null → memtable (pack the row index). The local
+    /// offset is exactly what `LateScan` unpacks to re-fetch the survivor's
+    /// wide columns.
+    fn appendSurvivorLocs(self: *Scan, rows: []const u32, rg_idx: ?usize) !void {
+        const list = &self.filtered.?[self.out_phys.len].data.bigint;
+        try list.ensureUnusedCapacity(self.allocator, rows.len);
+        for (rows) |i| {
             const loc: i64 = if (rg_idx) |rg|
                 rowloc.packSegment(self.cur_seg_idx, rg, i)
             else
                 rowloc.packMemtable(i);
-            try loc_col.data.bigint.append(self.allocator, loc);
+            list.appendAssumeCapacity(loc);
         }
     }
 
-    /// Fill `code_bufs[j]` with the global dict codes of just the surviving rows
-    /// (`mask`) of one row group's column — dict blocks LUT-translate the local
+    /// Fill `code_bufs[j]` with the global dict codes of just the surviving
+    /// rows of one row group's column — dict blocks LUT-translate the local
     /// codes, raw blocks decode + intern per survivor. No full-block string
-    /// expansion. `matched` is the survivor count.
+    /// expansion.
     fn codeSurvivorsFromBlock(
         self: *Scan,
         seg: *storage.ReadSegment,
@@ -3307,12 +3389,11 @@ pub const Scan = struct {
         j: usize,
         rg_count: u32,
         flags: storage.format.ColumnBlockFlags,
-        mask: []const bool,
-        matched: usize,
+        rows: []const u32,
     ) !void {
         const gdict = self.coded_dicts_by_j[j].?;
-        try self.code_bufs[j].resize(self.allocator, matched);
-        const codes = self.code_bufs[j].items[0..matched];
+        try self.code_bufs[j].resize(self.allocator, rows.len);
+        const codes = self.code_bufs[j].items[0..rows.len];
 
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
         defer block.release(self.allocator, self.table.cacheRef());
@@ -3323,11 +3404,7 @@ pub const Scan = struct {
             const db = storage.segment_reader.dictBlockOf(values, rg_count);
             const lut = try gdict.buildLut(self.allocator, db);
             defer self.allocator.free(lut);
-            var k: usize = 0;
-            for (mask, 0..) |m, row| if (m) {
-                codes[k] = lut[db.rowCode(row)];
-                k += 1;
-            };
+            for (rows, codes) |row, *c| c.* = lut[db.rowCode(row)];
         } else {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
@@ -3335,15 +3412,11 @@ pub const Scan = struct {
                 .varchar, .string, .char, .json => |s| s.view(),
                 else => unreachable,
             };
-            var k: usize = 0;
-            for (mask, 0..) |m, row| if (m) {
-                codes[k] = try gdict.intern(self.allocator, sv.rowBytes(row));
-                k += 1;
-            };
+            for (rows, codes) |row, *c| c.* = try gdict.intern(self.allocator, sv.rowBytes(row));
         }
     }
 
-    /// Survivor-granular sibling of `fillKeyHashes`: digest just the masked
+    /// Survivor-granular sibling of `fillKeyHashes`: digest just the surviving
     /// rows of one row group's string column — dict block via a per-distinct
     /// digest LUT, raw block via the in-place view, owned decode as fallback.
     fn hashSurvivorsFromBlock(
@@ -3354,12 +3427,11 @@ pub const Scan = struct {
         j: usize,
         rg_count: u32,
         flags: storage.format.ColumnBlockFlags,
-        mask: []const bool,
-        matched: usize,
+        rows: []const u32,
     ) !void {
         const col_type = self.table.schema.columns[phys].type;
-        try self.hash_bufs[j].resize(self.allocator, matched);
-        const digests = self.hash_bufs[j].items[0..matched];
+        try self.hash_bufs[j].resize(self.allocator, rows.len);
+        const digests = self.hash_bufs[j].items[0..rows.len];
 
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
         defer block.release(self.allocator, self.table.cacheRef());
@@ -3371,11 +3443,7 @@ pub const Scan = struct {
             const lut = try self.allocator.alloc(u128, db.ndv);
             defer self.allocator.free(lut);
             for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
-            var k: usize = 0;
-            for (mask, 0..) |m, row| if (m) {
-                digests[k] = lut[db.rowCode(row)];
-                k += 1;
-            };
+            for (rows, digests) |row, *d| d.* = lut[db.rowCode(row)];
         } else if (block.encoding == .fsst) {
             // Digest straight off the compressed rows: decode each survivor
             // into a one-value scratch — no full-column expansion, no offsets
@@ -3389,8 +3457,7 @@ pub const Scan = struct {
             defer scratch.deinit(self.allocator);
             var prev_comp: []const u8 = &.{};
             var prev_val: u128 = 0;
-            var k: usize = 0;
-            for (mask, 0..) |m, row| if (m) {
+            for (rows, digests, 0..) |row, *d, k| {
                 const comp = fv.block.rowComp(row);
                 if (k == 0 or !std.mem.eql(u8, prev_comp, comp)) {
                     try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
@@ -3398,19 +3465,14 @@ pub const Scan = struct {
                     prev_val = exec.stringKeyDigest(scratch.items[0..n]);
                     prev_comp = comp;
                 }
-                digests[k] = prev_val;
-                k += 1;
-            };
+                d.* = prev_val;
+            }
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
             const sv = switch (view.data) {
                 .varchar, .string, .char, .json => |s| s,
                 else => return error.TypeMismatch,
             };
-            var k: usize = 0;
-            for (mask, 0..) |m, row| if (m) {
-                digests[k] = exec.stringKeyDigest(sv.rowBytes(row));
-                k += 1;
-            };
+            for (rows, digests) |row, *d| d.* = exec.stringKeyDigest(sv.rowBytes(row));
         } else {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
@@ -3418,11 +3480,7 @@ pub const Scan = struct {
                 .varchar, .string, .char, .json => |s| s.view(),
                 else => return error.TypeMismatch,
             };
-            var k: usize = 0;
-            for (mask, 0..) |m, row| if (m) {
-                digests[k] = exec.stringKeyDigest(sv.rowBytes(row));
-                k += 1;
-            };
+            for (rows, digests) |row, *d| d.* = exec.stringKeyDigest(sv.rowBytes(row));
         }
     }
 
@@ -3438,129 +3496,114 @@ pub const Scan = struct {
         }
     }
 
-    /// Expand a FOR column's survivors (`base + code` for set mask bits) into a
-    /// `ColumnStore`. Only survivors are reconstructed — `forExpandSurvivors`
-    /// writes them compactly into a scratch native slice, which is appended to
-    /// the destination list. The per-survivor validity bit is carried so a NULL
-    /// row that happens to survive (not the current single-leaf shape, which
-    /// already cleared NULLs, but kept correct for any future composed mask)
-    /// materializes as NULL.
-    fn appendForSurvivors(self: *Scan, fv: storage.segment_reader.ForView, mask: []const bool, out: *ColumnStore) !void {
-        var matched: usize = 0;
-        for (mask) |m| matched += @intFromBool(m);
-
+    /// A FOR column's survivors (`base + code` at each survivor row) into a
+    /// `ColumnStore`, gathered straight off the narrow codes. The per-survivor
+    /// validity bit is carried so a NULL row that happens to survive (not the
+    /// current single-leaf shape, which already cleared NULLs, but kept correct
+    /// for any future composed mask) materializes as NULL.
+    fn appendForSurvivors(self: *Scan, fv: storage.segment_reader.ForView, rows: []const u32, out: *ColumnStore) !void {
         switch (out.data) {
-            .int => |*list| try self.expandForInto(i32, fv.block, mask, matched, list),
-            .date => |*list| try self.expandForInto(i32, fv.block, mask, matched, list),
-            .bigint => |*list| try self.expandForInto(i64, fv.block, mask, matched, list),
-            .datetime => |*list| try self.expandForInto(i64, fv.block, mask, matched, list),
-            .decimal64 => |*list| try self.expandForInto(i64, fv.block, mask, matched, list),
-            .smallint => |*list| try self.expandForInto(i16, fv.block, mask, matched, list),
-            .tinyint => |*list| try self.expandForInto(i8, fv.block, mask, matched, list),
-            .boolean => |*list| try self.expandForInto(u8, fv.block, mask, matched, list),
+            .int => |*list| try self.gatherForInto(i32, fv.block, rows, list),
+            .date => |*list| try self.gatherForInto(i32, fv.block, rows, list),
+            .bigint => |*list| try self.gatherForInto(i64, fv.block, rows, list),
+            .datetime => |*list| try self.gatherForInto(i64, fv.block, rows, list),
+            .decimal64 => |*list| try self.gatherForInto(i64, fv.block, rows, list),
+            .smallint => |*list| try self.gatherForInto(i16, fv.block, rows, list),
+            .tinyint => |*list| try self.gatherForInto(i8, fv.block, rows, list),
+            .boolean => |*list| try self.gatherForInto(u8, fv.block, rows, list),
             else => unreachable,
         }
-
-        if (out.nulls != null) {
-            var j: usize = 0;
-            for (mask, 0..) |m, src_row| {
-                if (!m) continue;
-                const valid = storage.column.isValidBit(fv.nulls, src_row);
-                try out.appendValidBit(self.allocator, j, valid);
-                j += 1;
-            }
-        }
+        try self.appendSurvivorValidity(fv.nulls, rows, out);
     }
 
-    fn expandForInto(
+    fn gatherForInto(
         self: *Scan,
         comptime T: type,
         fb: storage.segment_reader.ForBlock,
-        mask: []const bool,
-        matched: usize,
+        rows: []const u32,
         list: *std.ArrayList(T),
     ) !void {
-        if (matched == 0) return;
-        try list.ensureUnusedCapacity(self.allocator, matched);
+        if (rows.len == 0) return;
+        try list.ensureUnusedCapacity(self.allocator, rows.len);
         const start = list.items.len;
-        list.items.len = start + matched;
-        storage.segment_reader.forExpandSurvivors(T, fb, mask, list.items[start..]);
+        list.items.len = start + rows.len;
+        storage.segment_reader.forGatherRows(T, fb, rows, list.items[start..]);
     }
 
-    /// RLE sibling of `appendForSurvivors`: read each run's value once and walk
-    /// only its mask range — never the full row-width expansion
-    /// `decodeRleColumn` pays.
-    fn appendRleSurvivors(self: *Scan, rv: storage.segment_reader.RleView, mask: []const bool, out: *ColumnStore) !void {
-        var matched: usize = 0;
-        for (mask) |m| matched += @intFromBool(m);
-
+    /// RLE sibling of `appendForSurvivors`: walk the runs and the ascending
+    /// survivor rows together — O(survivors + runs), never the full row width.
+    fn appendRleSurvivors(self: *Scan, rv: storage.segment_reader.RleView, rows: []const u32, out: *ColumnStore) !void {
         switch (out.data) {
-            .int => |*list| try self.expandRleInto(i32, rv.block, mask, matched, list),
-            .date => |*list| try self.expandRleInto(i32, rv.block, mask, matched, list),
-            .bigint => |*list| try self.expandRleInto(i64, rv.block, mask, matched, list),
-            .datetime => |*list| try self.expandRleInto(i64, rv.block, mask, matched, list),
-            .decimal64 => |*list| try self.expandRleInto(i64, rv.block, mask, matched, list),
-            .smallint => |*list| try self.expandRleInto(i16, rv.block, mask, matched, list),
-            .tinyint => |*list| try self.expandRleInto(i8, rv.block, mask, matched, list),
-            .boolean => |*list| try self.expandRleInto(u8, rv.block, mask, matched, list),
+            .int => |*list| try self.gatherRleInto(i32, rv.block, rows, list),
+            .date => |*list| try self.gatherRleInto(i32, rv.block, rows, list),
+            .bigint => |*list| try self.gatherRleInto(i64, rv.block, rows, list),
+            .datetime => |*list| try self.gatherRleInto(i64, rv.block, rows, list),
+            .decimal64 => |*list| try self.gatherRleInto(i64, rv.block, rows, list),
+            .smallint => |*list| try self.gatherRleInto(i16, rv.block, rows, list),
+            .tinyint => |*list| try self.gatherRleInto(i8, rv.block, rows, list),
+            .boolean => |*list| try self.gatherRleInto(u8, rv.block, rows, list),
             else => unreachable,
         }
+        try self.appendSurvivorValidity(rv.nulls, rows, out);
+    }
 
-        if (out.nulls != null) {
-            var j: usize = 0;
-            for (mask, 0..) |m, src_row| {
-                if (!m) continue;
-                const valid = storage.column.isValidBit(rv.nulls, src_row);
-                try out.appendValidBit(self.allocator, j, valid);
-                j += 1;
+    fn gatherRleInto(
+        self: *Scan,
+        comptime T: type,
+        rb: storage.segment_reader.RleBlock,
+        rows: []const u32,
+        list: *std.ArrayList(T),
+    ) !void {
+        if (rows.len == 0) return;
+        try list.ensureUnusedCapacity(self.allocator, rows.len);
+        const start = list.items.len;
+        list.items.len = start + rows.len;
+        const out = list.items[start..];
+        var run: usize = 0;
+        var run_end: usize = rb.runLength(0);
+        var v = rleRunValue(T, rb, 0);
+        for (rows, out) |r, *o| {
+            if (r >= run_end) {
+                while (r >= run_end) {
+                    run += 1;
+                    run_end += rb.runLength(run);
+                }
+                v = rleRunValue(T, rb, run);
             }
+            o.* = v;
         }
     }
 
-    /// Survivor-only FSST expansion: decode just the masked rows off the
-    /// cached compressed block — the full row-group string column never
-    /// materializes. The scratch holds one decoded value at a time.
-    /// Dict sibling of `appendFsstSurvivors`: gather only the survivors'
-    /// values straight out of the block's sorted dictionary. The previous
-    /// route expanded every row of the block to an owned string column and
-    /// then compacted it — for a selective filter that is most of the scan's
-    /// per-row-group cost. One pass sizes the destination from the survivors'
-    /// dict lengths, one pass copies, so the string store never grows per row.
-    fn appendDictSurvivors(self: *Scan, db: storage.segment_reader.DictBlock, nulls: ?[]const u8, mask: []const bool, out: *ColumnStore) !void {
-        var matched: usize = 0;
+    fn rleRunValue(comptime T: type, rb: storage.segment_reader.RleBlock, run: usize) T {
+        return std.mem.readInt(T, rb.values[run * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+    }
+
+    /// Dict sibling of `appendFsstSurvivors`: gather only the survivors' values
+    /// straight out of the block's sorted dictionary. One pass sizes the
+    /// destination from the survivors' dict lengths, one pass copies, so the
+    /// string store never grows per row.
+    fn appendDictSurvivors(self: *Scan, db: storage.segment_reader.DictBlock, nulls: ?[]const u8, rows: []const u32, out: *ColumnStore) !void {
         var total_bytes: usize = 0;
-        for (mask, 0..) |m, row| {
-            if (!m) continue;
-            matched += 1;
-            total_bytes += db.dictValue(db.rowCode(row)).len;
-        }
+        for (rows) |row| total_bytes += db.dictValue(db.rowCode(row)).len;
         switch (out.data) {
             .varchar, .string, .char, .json => |*ss| {
-                try ss.ensureUnusedValueCapacity(self.allocator, matched, total_bytes);
-                for (mask, 0..) |m, row| {
-                    if (m) ss.appendValueAssumeCapacity(db.dictValue(db.rowCode(row)));
-                }
+                try ss.ensureUnusedValueCapacity(self.allocator, rows.len, total_bytes);
+                for (rows) |row| ss.appendValueAssumeCapacity(db.dictValue(db.rowCode(row)));
             },
             else => unreachable, // the writer only dict-encodes string-family columns
         }
-
-        if (out.nulls != null) {
-            var j: usize = 0;
-            for (mask, 0..) |m, src_row| {
-                if (!m) continue;
-                try out.appendValidBit(self.allocator, j, storage.column.isValidBit(nulls, src_row));
-                j += 1;
-            }
-        }
+        try self.appendSurvivorValidity(nulls, rows, out);
     }
 
-    fn appendFsstSurvivors(self: *Scan, fv: storage.segment_reader.FsstView, mask: []const bool, out: *ColumnStore) !void {
+    /// Survivor-only FSST expansion: decode just the survivor rows off the
+    /// cached compressed block — the full row-group string column never
+    /// materializes. The scratch holds one decoded value at a time.
+    fn appendFsstSurvivors(self: *Scan, fv: storage.segment_reader.FsstView, rows: []const u32, out: *ColumnStore) !void {
         var scratch: std.ArrayListUnmanaged(u8) = .empty;
         defer scratch.deinit(self.allocator);
         switch (out.data) {
             .varchar, .string, .char, .json => |*ss| {
-                for (mask, 0..) |m, row| {
-                    if (!m) continue;
+                for (rows) |row| {
                     const comp = fv.block.rowComp(row);
                     try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
                     const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
@@ -3569,45 +3612,7 @@ pub const Scan = struct {
             },
             else => unreachable, // the writer only FSST-encodes string-family columns
         }
-
-        if (out.nulls != null) {
-            var j: usize = 0;
-            for (mask, 0..) |m, src_row| {
-                if (!m) continue;
-                const valid = storage.column.isValidBit(fv.nulls, src_row);
-                try out.appendValidBit(self.allocator, j, valid);
-                j += 1;
-            }
-        }
-    }
-
-    fn expandRleInto(
-        self: *Scan,
-        comptime T: type,
-        rb: storage.segment_reader.RleBlock,
-        mask: []const bool,
-        matched: usize,
-        list: *std.ArrayList(T),
-    ) !void {
-        if (matched == 0) return;
-        try list.ensureUnusedCapacity(self.allocator, matched);
-        const start = list.items.len;
-        list.items.len = start + matched;
-        const out = list.items[start..];
-        var j: usize = 0;
-        var pos: usize = 0;
-        var run: usize = 0;
-        while (run < rb.n_runs and pos < mask.len) : (run += 1) {
-            const v = std.mem.readInt(T, rb.values[run * @sizeOf(T) ..][0..@sizeOf(T)], .little);
-            const len = @min(@as(usize, rb.runLength(run)), mask.len - pos);
-            for (mask[pos .. pos + len]) |m| {
-                if (m) {
-                    out[j] = v;
-                    j += 1;
-                }
-            }
-            pos += len;
-        }
+        try self.appendSurvivorValidity(fv.nulls, rows, out);
     }
 
     const Borrow = struct {
@@ -3798,10 +3803,13 @@ pub const Scan = struct {
             }
             try engine.memtable.appendMaskedColumn(self.allocator, src, mask[0..n], dst);
         }
-        if (self.emit_loc) switch (loc) {
-            .segment => |rg| try self.appendSurvivorLocs(mask[0..n], rg),
-            .memtable => try self.appendSurvivorLocs(mask[0..n], null),
-        };
+        if (self.emit_loc) {
+            const rows = try self.survivorRows(mask[0..n]);
+            switch (loc) {
+                .segment => |rg| try self.appendSurvivorLocs(rows, rg),
+                .memtable => try self.appendSurvivorLocs(rows, null),
+            }
+        }
         self.filtered_coded = slots;
         self.filtered_hashed = hash_slots;
         return matched;

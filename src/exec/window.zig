@@ -1059,7 +1059,7 @@ pub const Window = struct {
                 self.borrowing,
                 self.calls.len,
             });
-            if (exec.prof.ticksToMs(drain_up_ticks) > 100.0) explain: {
+            if (exec.prof.ticksToMs(drain_up_ticks) > 30.0) explain: {
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.allocator);
                 self.upstream.explain(&buf, self.allocator, 2) catch break :explain;

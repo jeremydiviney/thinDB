@@ -48,7 +48,8 @@ const Batch = exec.Batch;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
-const Scan = @import("scan.zig").Scan;
+const scan_mod = @import("scan.zig");
+const Scan = scan_mod.Scan;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -1946,16 +1947,33 @@ pub const ParallelScan = struct {
         // bytes. Everything else in drain_wall is loop/decision/farm-out overhead.
         var borrow_ticks: u64 = 0;
         var kernel_ticks: u64 = 0;
+        var materialize_ticks: u64 = 0;
+        var kind_ticks = [_]u64{0} ** scan_mod.MAT_KINDS;
+        var kind_cols = [_]u64{0} ** scan_mod.MAT_KINDS;
         for (self.workers) |w| switch (w) {
             .segment => |s| {
                 borrow_ticks +%= s.scan_borrow_ticks;
                 kernel_ticks +%= s.scan_kernel_ticks;
+                materialize_ticks +%= s.scan_materialize_ticks;
+                for (0..scan_mod.MAT_KINDS) |k| {
+                    kind_ticks[k] +%= s.scan_mat_kind_ticks[k];
+                    kind_cols[k] += s.scan_mat_kind_cols[k];
+                }
             },
             .chunk => {},
         };
-        std.debug.print("[pscan] scan-kernel core-time (summed over workers): borrow={d:.2}ms kernel(compare/gather)={d:.2}ms  rows_decoded={d} → {d:.1} M rows/core-sec in kernel\n", .{
+        if (materialize_ticks > 0) {
+            std.debug.print("[pscan] materialize by kind (col-RGs, ms):", .{});
+            for (0..scan_mod.MAT_KINDS) |k| {
+                if (kind_cols[k] == 0) continue;
+                std.debug.print(" {s}={d}/{d:.2}", .{ scan_mod.matKindName(k), kind_cols[k], exec.prof.ticksToMs(@intCast(kind_ticks[k])) });
+            }
+            std.debug.print("\n", .{});
+        }
+        std.debug.print("[pscan] scan-kernel core-time (summed over workers): borrow={d:.2}ms kernel(compare/gather)={d:.2}ms materialize(survivors)={d:.2}ms  rows_decoded={d} → {d:.1} M rows/core-sec in kernel\n", .{
             exec.prof.ticksToMs(@intCast(borrow_ticks)),
             exec.prof.ticksToMs(@intCast(kernel_ticks)),
+            exec.prof.ticksToMs(@intCast(materialize_ticks)),
             rows_in,
             if (kernel_ticks > 0) @as(f64, @floatFromInt(rows_in)) / (exec.prof.ticksToMs(@intCast(kernel_ticks)) * 1000.0) else 0.0,
         });

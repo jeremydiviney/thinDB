@@ -811,6 +811,61 @@ pub fn appendMaskedColumn(
     }
 }
 
+/// Index-gather sibling of `appendMaskedColumn` for a sparse mask: `rows` are
+/// the survivors' ascending indices, so only their values are read and
+/// written where the masked compaction streams every row of the block.
+/// Same-type source/destination pairs only (the filtered scan's case);
+/// returns false, appending nothing, for a converting pair so the caller
+/// takes the masked route.
+pub fn appendGatheredColumn(allocator: Allocator, view: ColumnView, rows: []const u32, out: *ColumnStore) !bool {
+    const dst_start = out.data.rowCount();
+    switch (view.data) {
+        .varchar, .string, .char, .json => |sv| try appendGatheredStringy(allocator, sv, rows, out),
+        inline else => |s, tag| switch (out.data) {
+            tag => |*list| try gatherInto(std.meta.Child(@TypeOf(s)), allocator, s, rows, list),
+            else => return false,
+        },
+    }
+    if (out.nulls != null) {
+        if (view.nulls == null) {
+            try out.appendValidityRange(allocator, dst_start, null, rows.len);
+        } else {
+            for (rows, 0..) |row, j| {
+                try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(view.nulls, row));
+            }
+        }
+    }
+    return true;
+}
+
+fn gatherInto(
+    comptime T: type,
+    allocator: Allocator,
+    src: []const T,
+    rows: []const u32,
+    list: *std.ArrayList(T),
+) !void {
+    if (rows.len == 0) return;
+    try list.ensureUnusedCapacity(allocator, rows.len);
+    const start = list.items.len;
+    list.items.len = start + rows.len;
+    for (rows, list.items[start..]) |r, *o| o.* = src[r];
+}
+
+/// String gather: one pass sizes the destination from the survivors' lengths,
+/// one pass copies, so the store never grows per row.
+fn appendGatheredStringy(allocator: Allocator, sv: anytype, rows: []const u32, out: *ColumnStore) !void {
+    var total: usize = 0;
+    for (rows) |row| total += sv.offsets[row + 1] - sv.offsets[row];
+    switch (out.data) {
+        .varchar, .string, .char, .json => |*ss| {
+            try ss.ensureUnusedValueCapacity(allocator, rows.len, total);
+            for (rows) |row| ss.appendValueAssumeCapacity(sv.rowBytes(row));
+        },
+        else => unreachable,
+    }
+}
+
 /// Copy mask-selected rows from any string-family source view
 /// (varchar/string/char) into any string-family destination
 /// ColumnStore. Used by appendMaskedColumn to bridge the case where
@@ -1029,6 +1084,32 @@ test "appendMaskedColumn fixed-width: trailing filtered-out row never overruns" 
         try appendMaskedColumn(testing.allocator, view, &mask, &out);
         try testing.expectEqualSlices(i64, &want, out.data.bigint.items);
     }
+}
+
+test "appendGatheredColumn gathers survivor rows with their validity, declines converting pairs" {
+    const testing = std.testing;
+    var src = [_]i64{ 10, 20, 30, 40, 50 };
+    const nulls = [_]u8{0b00010101}; // rows 1 and 3 NULL
+    const rows = [_]u32{ 0, 1, 3, 4 };
+    var out = try ColumnStore.init(testing.allocator, .bigint, true);
+    defer out.deinit(testing.allocator);
+    try testing.expect(try appendGatheredColumn(testing.allocator, .{ .data = .{ .bigint = &src }, .nulls = &nulls }, &rows, &out));
+    try testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 40, 50 }, out.data.bigint.items);
+    try testing.expectEqual(@as(u8, 0b1001), out.nulls.?.items[0]);
+
+    const offsets = [_]u32{ 0, 1, 3, 6 };
+    const sv = storage.column.StringView{ .offsets = &offsets, .bytes = "abbccc" };
+    var sout = try ColumnStore.init(testing.allocator, .{ .varchar = 16 }, false);
+    defer sout.deinit(testing.allocator);
+    try testing.expect(try appendGatheredColumn(testing.allocator, .{ .data = .{ .varchar = sv } }, &[_]u32{ 0, 2 }, &sout));
+    try testing.expectEqual(@as(usize, 2), sout.data.rowCount());
+    try testing.expectEqualStrings("ccc", sout.data.varchar.view().rowBytes(1));
+
+    var narrow = [_]i32{ 1, 2 };
+    var wide = try ColumnStore.init(testing.allocator, .bigint, false);
+    defer wide.deinit(testing.allocator);
+    try testing.expect(!try appendGatheredColumn(testing.allocator, .{ .data = .{ .int = &narrow } }, &[_]u32{0}, &wide));
+    try testing.expectEqual(@as(usize, 0), wide.data.rowCount());
 }
 
 test "appendMaskedColumn converts across numeric widths (UPDATE literal-width bug)" {
