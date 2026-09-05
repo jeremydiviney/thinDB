@@ -636,6 +636,12 @@ pub const ContigSink = struct {
         self.rows += batch.row_count;
     }
 
+    /// Size every store once for a fill whose totals are known up front.
+    pub fn reserve(self: *ContigSink, rows: usize, str_bytes: []const u64) !void {
+        const total: usize = @as(usize, @intCast(self.rows)) + rows;
+        for (self.stores, self.arenas, str_bytes) |*st, *ar, b| try st.reserveTotal(ar.allocator(), total, @intCast(b));
+    }
+
     /// Append only the picked rows — the scan-once partition router's gather.
     pub fn appendIndices(self: *ContigSink, batch: exec.Batch, indices: []const u32) !void {
         for (self.stores, self.arenas, 0..) |*st, *ar, ci| {
@@ -905,6 +911,10 @@ pub const Stage = struct {
             }
         }
 
+        // Each (batch, column) prepare below would otherwise regrow the
+        // store, and a source that emits many batches (a parallel group
+        // emit) regrew it many times: size each once for the total.
+        try contig.reserve(total, str_bytes);
         const preps = try a.alloc(engine.transform.PreparedAppend, batches.items.len * ncols);
         for (batches.items, 0..) |b, bi| {
             for (0..ncols) |ci| {

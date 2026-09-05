@@ -841,3 +841,69 @@ test "V2 staged window: RANK + QUALIFY above a grouped block" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 12, 11, 10 }, counts.items);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ranks.items);
 }
+
+// 200K single-row groups at max_dop=4 put the result emit on three range
+// workers (65536+ groups each), and the pipeline hands each range out as
+// its own batch. The BIGINT key takes the packed emit; the VARCHAR key the
+// hashed emit, whose key values come back through the location order and
+// its inverse permutation (both strided over the workers).
+test "V2 group emit: parallel ranges emit every group once, as batches" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+
+    const n_groups: usize = 200_000;
+    try exec(allocator, db, "CREATE TABLE big (id BIGINT PRIMARY KEY, s VARCHAR(12) NOT NULL, v BIGINT NOT NULL)");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var next_id: usize = 0;
+    while (next_id < n_groups) {
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(allocator, "INSERT INTO big VALUES ");
+        for (0..200) |i| {
+            if (i != 0) try buf.appendSlice(allocator, ",");
+            var row: [64]u8 = undefined;
+            try buf.appendSlice(allocator, try std.fmt.bufPrint(&row, "({d},'k{d}',{d})", .{ next_id, next_id, next_id * 2 }));
+            next_id += 1;
+        }
+        try exec(allocator, db, buf.items);
+    }
+    const t = try db.openTable("big", .{});
+    try t.flush();
+
+    const seen = try allocator.alloc(bool, n_groups);
+    defer allocator.free(seen);
+    inline for (.{
+        .{ .sql = "SELECT id, MAX(v) AS mv FROM big GROUP BY id", .string_key = false },
+        .{ .sql = "SELECT s, MAX(v) AS mv FROM big GROUP BY s", .string_key = true },
+    }) |c| {
+        @memset(seen, false);
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        var batches: usize = 0;
+        var rows: usize = 0;
+        while (try q.next()) |b| {
+            batches += 1;
+            for (0..b.row_count) |r| {
+                const key: usize = if (c.string_key) blk: {
+                    const bytes = switch (b.values[0].data) {
+                        .varchar, .string => |sv| sv.rowBytes(r),
+                        else => return error.TestUnexpectedResult,
+                    };
+                    try std.testing.expectEqual(@as(u8, 'k'), bytes[0]);
+                    break :blk try std.fmt.parseInt(usize, bytes[1..], 10);
+                } else @intCast(b.values[0].data.bigint[r]);
+                try std.testing.expect(key < n_groups);
+                try std.testing.expect(!seen[key]);
+                seen[key] = true;
+                try std.testing.expectEqual(@as(i64, @intCast(key * 2)), b.values[1].data.bigint[r]);
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(n_groups, rows);
+        try std.testing.expect(batches >= 3);
+    }
+}
