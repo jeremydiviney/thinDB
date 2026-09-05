@@ -1019,7 +1019,7 @@ pub const Stage = struct {
         const bytes = join_mod.fastTableBytes(rows, needs_chain);
         if (self.accountant) |acct| try acct.reserve(.join_build, bytes);
         errdefer if (self.accountant) |acct| acct.release(.join_build, bytes);
-        const built = (try join_mod.buildFastTable(aa, key_views[0..keys.len], rows, needs_chain)) orelse return null;
+        const built = (try join_mod.buildFastTable(aa, self.allocator, key_views[0..keys.len], rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
         self.join_build_reserved += bytes;
         const owned_casts = try aa.alloc(ColumnCast, casts.len);
         for (casts, owned_casts) |c, *o| o.* = .{ .col = c.col, .fn_name = try aa.dupe(u8, c.fn_name) };
