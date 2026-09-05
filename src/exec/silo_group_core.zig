@@ -2612,6 +2612,69 @@ pub const EmitFilter = struct {
     pass: *const fn (?*anyopaque, TopRow) bool,
 };
 
+const ALL_GROUPS_FILL_ROWS_PER_WORKER: usize = 65536;
+
+/// Numeric all-groups result (no string/UDAF payload, no cap, no HAVING
+/// filter): one append sized to the group total, filled from the bucket
+/// records by up to `n_workers` threads over disjoint bucket ranges. The
+/// per-row `append` this replaces spent most of a multi-million-group emit
+/// on one thread, growing the list and copying 200-byte rows.
+fn emitAllGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.ArrayListUnmanaged(TopRow), n_workers: usize) !void {
+    const cum = try allocator.alloc(usize, buckets.len + 1);
+    defer allocator.free(cum);
+    cum[0] = 0;
+    for (buckets, 0..) |*b, i| cum[i + 1] = cum[i] + b.states.len;
+    const total = cum[buckets.len];
+    if (total == 0) return;
+    try out.ensureUnusedCapacity(allocator, total);
+    const dst = out.items.ptr[out.items.len .. out.items.len + total];
+    out.items.len += total;
+    const workers: usize = @max(1, @min(n_workers, total / ALL_GROUPS_FILL_ROWS_PER_WORKER));
+    if (workers <= 1) {
+        fillAllGroupRows(buckets, dst);
+        return;
+    }
+    const jobs = try allocator.alloc(AllGroupsFillJob, workers);
+    defer allocator.free(jobs);
+    const threads = try allocator.alloc(?std.Thread, workers);
+    defer allocator.free(threads);
+    var b_start: usize = 0;
+    for (jobs, 1..) |*job, w| {
+        var b_end = b_start;
+        if (w == workers) {
+            b_end = buckets.len;
+        } else {
+            const target = total * w / workers;
+            while (b_end < buckets.len and cum[b_end] < target) b_end += 1;
+        }
+        job.* = .{ .buckets = buckets[b_start..b_end], .dst = dst[cum[b_start]..cum[b_end]] };
+        b_start = b_end;
+    }
+    for (jobs, threads) |*job, *t| {
+        t.* = std.Thread.spawn(.{}, allGroupsFillWorker, .{job}) catch null;
+        if (t.* == null) allGroupsFillWorker(job);
+    }
+    for (threads) |t| if (t) |th| th.join();
+}
+
+const AllGroupsFillJob = struct { buckets: []PipeBucket, dst: []TopRow };
+
+fn allGroupsFillWorker(job: *AllGroupsFillJob) void {
+    fillAllGroupRows(job.buckets, job.dst);
+}
+
+fn fillAllGroupRows(buckets: []PipeBucket, dst: []TopRow) void {
+    var pos: usize = 0;
+    for (buckets) |*bucket| {
+        var gid: usize = 0;
+        while (gid < bucket.states.len) : (gid += 1) {
+            dst[pos] = topRowFromState(bucket.states.ref(gid));
+            pos += 1;
+        }
+    }
+    std.debug.assert(pos == dst.len);
+}
+
 inline fn topRowFromState(ref: StateRef) TopRow {
     var row: TopRow = .{
         .key = ref.head.key,
@@ -5982,7 +6045,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (cfg.result_all_groups) {
             const cap = cfg.result_all_groups_cap;
             const filter = cfg.result_emit_filter;
+            const numeric_uncapped = !has_str_out and !has_udf_out and cap == 0 and filter == null;
+            if (numeric_uncapped) try emitAllGroupsNumeric(allocator, buckets, out, n_workers);
             emit_all: for (buckets) |*bucket| {
+                if (numeric_uncapped) break;
                 if (cap != 0 and out.items.len >= cap) break;
                 if (has_str_out or has_udf_out) {
                     const has_concat_out = cfg.group_rows_layout.has_concat;

@@ -26,6 +26,7 @@ const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
 const transform = @import("../engine/engine.zig").transform;
+const rowloc = @import("rowloc.zig");
 
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -901,17 +902,20 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
     // 3M+ groups meant 3M+ single-row block borrows). The key gather below
     // already reads through an index buffer, so emitting in group order
     // costs nothing extra: the buffer becomes the inverse permutation.
+    // One compact pass lifts the locations out of the 200-byte TopRows;
+    // rowloc.sortedOrder then orders them per row group in linear time
+    // (an indirect comparison sort through the rows was cache-miss bound).
+    const t_order = exec.prof.nowTicks();
+    const rowrefs = try allocator.alloc(i64, rows.len);
+    defer allocator.free(rowrefs);
+    for (rows, rowrefs) |row, *r| r.* = row.rowref;
     const loc_order = try allocator.alloc(u32, rows.len);
     defer allocator.free(loc_order);
-    for (0..rows.len) |i| loc_order[i] = @intCast(i);
-    std.mem.sortUnstable(u32, loc_order, rows, struct {
-        fn less(rs: []const SiloCore.TopRow, a: u32, b: u32) bool {
-            return rs[a].rowref < rs[b].rowref;
-        }
-    }.less);
+    try rowloc.sortedOrder(allocator, rowrefs, loc_order);
     const locs = try allocator.alloc(i64, rows.len);
     defer allocator.free(locs);
-    for (loc_order, 0..) |ri, j| locs[j] = rows[ri].rowref;
+    for (loc_order, locs) |ri, *l| l.* = rowrefs[ri];
+    const order_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_order);
 
     const t_mat = exec.prof.nowTicks();
     try late.materializeInto(locs, scan_ptr.memtableSnap());
@@ -929,11 +933,13 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
     var compute_q: ?Query = null;
     defer if (compute_q) |*q| q.deinit();
     var result = mat_batch;
+    const t_derived = exec.prof.nowTicks();
     if (n_derived > 0) {
         const src = try SingleBatchSource.create(allocator, mat_batch);
         compute_q = try compute.Compute.create(allocator, src, derived_keys[0..n_derived]);
         result = (try compute_q.?.next()) orelse return error.UnsupportedQueryShape;
     }
+    const derived_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_derived);
 
     // Inverse permutation: output row i (group order) reads materialized
     // row idx_buf[i] (location order).
@@ -947,14 +953,15 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
         try transform.appendByIndices(allocator, result.values[ci], idx_buf, &op.output_cols[j]);
     }
     const t_aggs = exec.prof.nowTicks();
-    for (rows) |row| {
-        for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
-            try appendAggregateValue(allocator, &op.output_cols[part_count + i], agg_plan, row);
-        }
+    // Aggregate-major: one output column at a time keeps the append path
+    // and its type dispatch hot across the whole row set.
+    for (op.plan.aggregates[0..op.plan.aggregate_count], 0..) |agg_plan, i| {
+        const col = &op.output_cols[part_count + i];
+        for (rows) |row| try appendAggregateValue(allocator, col, agg_plan, row);
     }
     if (comptime build_options.profiling) {
         if (getenv("THINDB_V2_PIPELINE_TRACE") != null) {
-            std.debug.print("[v2-emit] rows={d} late_mat={d:.1}ms keys={d:.1}ms aggs={d:.1}ms\n", .{ rows.len, mat_ms, exec.prof.ticksToMs(t_aggs - t_keys), exec.prof.ticksToMs(exec.prof.nowTicks() - t_aggs) });
+            std.debug.print("[v2-emit] rows={d} order={d:.1}ms late_mat={d:.1}ms derived={d:.1}ms keys={d:.1}ms aggs={d:.1}ms\n", .{ rows.len, order_ms, mat_ms, derived_ms, exec.prof.ticksToMs(t_aggs - t_keys), exec.prof.ticksToMs(exec.prof.nowTicks() - t_aggs) });
         }
     }
     op.row_count += rows.len;

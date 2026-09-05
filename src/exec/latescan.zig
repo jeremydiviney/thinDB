@@ -258,12 +258,7 @@ pub const LateScan = struct {
         const n = locs.len;
         const order = try self.allocator.alloc(u32, n);
         defer self.allocator.free(order);
-        for (order, 0..) |*o, i| o.* = @intCast(i);
-        std.mem.sortUnstable(u32, order, locs, struct {
-            fn less(ls: []const i64, a: u32, b: u32) bool {
-                return ls[a] < ls[b];
-            }
-        }.less);
+        try rowloc.sortedOrder(self.allocator, locs, order);
         const sorted = try self.allocator.alloc(i64, n);
         defer self.allocator.free(sorted);
         for (order, 0..) |oi, j| sorted[j] = locs[oi];
