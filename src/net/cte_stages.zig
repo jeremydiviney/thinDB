@@ -1125,6 +1125,33 @@ fn compileUnionArm(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageM
     return compileBlock(input, op, map);
 }
 
+/// A window's input chain. The window is a barrier — it accumulates every
+/// row and never forwards aggregate fusion — so, like a UNION arm, it can
+/// take the see-through seam the generic gate declines: a streaming chain
+/// whose stage sits behind a single-ref inline CTE wrapper (five computes
+/// over a 55-column stage ran ~110 ms on the connection thread through a
+/// serial MatScan). ORDERED rather than deferred: the window emits in input
+/// order and breaks ORDER BY ties by arrival, so the parallel chain must
+/// deliver exactly the serial chain's row order. A ride/borrow input
+/// (force_ordered) already routes through the generic ordered seam; a
+/// stage too large for the ordered scan compiles serial as before.
+fn compileWindowInput(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+    if (input.effectiveDop() > 1 and !input.force_ordered and
+        getenv("THINDB_NO_ORDERED_PSCAN") == null and
+        !streamingChainOverStage(op, map, true, false) and
+        streamingChainOverStage(op, map, true, true))
+    {
+        if (buildFusedStreamOverStage(input, op, map, .ordered)) |q| {
+            if (getenv("THINDB_TRACE_OPSCAN") != null) std.debug.print("[opscan] window-input ordered seam ENGAGED\n", .{});
+            return q;
+        } else |err| switch (err) {
+            error.UnsupportedQueryShape => {},
+            else => return err,
+        }
+    }
+    return compileBlock(input, op, map);
+}
+
 fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     if (input.effectiveDop() > 1 and (streamingChainOverStage(op, map, true, false) or
         // Ordered only: window-input chains usually reach the previous
@@ -1150,7 +1177,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 else => return err,
             }
         }
-    } else if (input.force_ordered and input.effectiveDop() > 1 and getenv("THINDB_TRACE_OPSCAN") != null) {
+    } else if (input.effectiveDop() > 1 and getenv("THINDB_TRACE_OPSCAN") != null) {
         var cur = op;
         var depth: usize = 0;
         const stop: []const u8 = blk: while (depth < 32) : (depth += 1) {
@@ -1169,7 +1196,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 else => break :blk @tagName(cur.*),
             }
         } else "deep";
-        std.debug.print("[opscan] force_ordered chain declined: root={s} stop={s}\n", .{ @tagName(op.*), stop });
+        std.debug.print("[opscan] chain declined (ordered={}): root={s} stop={s}\n", .{ input.force_ordered, @tagName(op.*), stop });
     }
     switch (op.*) {
         .scan => |s| {
@@ -1524,7 +1551,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 }
             }
             const t_up = exec.prof.nowTicks();
-            var up = try compileBlock(eff_input, w.upstream, map);
+            var up = try compileWindowInput(eff_input, w.upstream, map);
             errdefer up.deinit();
             exec.prof.addPhase("compile.win.up_incl", @intCast(exec.prof.nowTicks() - t_up));
             // A ride that crossed LEFT joins holds only if the compiled

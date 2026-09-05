@@ -33,7 +33,6 @@
 //! two of our threads on one core's SMT siblings while another core idles.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const buffer_pool = @import("../util/buffer_pool.zig");
