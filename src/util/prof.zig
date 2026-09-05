@@ -63,6 +63,7 @@ pub fn reset() void {
     count = 0;
     cte_child_ticks = 0;
     self_count = 0;
+    inst_map.clearRetainingCapacity();
     op_child_acc = 0;
     deinit_count = 0;
     deinit_child_acc = 0;
@@ -85,7 +86,7 @@ pub inline fn selfEnter() u64 {
     return saved;
 }
 
-pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) void {
+pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) u64 {
     const children = op_child_acc;
     const self_t: u64 = if (incl > children) incl - children else 0;
     var i: usize = 0;
@@ -100,6 +101,32 @@ pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) void {
         self_count += 1;
     }
     op_child_acc = saved_parent +% incl;
+    return self_t;
+}
+
+// Per-INSTANCE exclusive wall on this thread, keyed by the operator pointer,
+// so a fat [self] row (one type, many instances) traces to the plan node that
+// spent it. The next() wrapper adds each call's self time; the deinit() wrapper
+// takes the entry back and prints instances above INST_PRINT_MS with the head
+// of their plan. Bounded so a worker thread's never-taken entries cannot grow
+// without limit.
+pub const InstStat = struct { ticks: u64 = 0, calls: u64 = 0, rows: u64 = 0 };
+pub const INST_PRINT_MS: f64 = 3.0;
+const INST_MAP_CAP: usize = 1 << 16;
+threadlocal var inst_map: std.AutoHashMapUnmanaged(usize, InstStat) = .empty;
+
+pub fn instAdd(ptr: *const anyopaque, self_ticks: u64, rows: u64) void {
+    if (inst_map.count() >= INST_MAP_CAP) return;
+    const gop = inst_map.getOrPut(std.heap.page_allocator, @intFromPtr(ptr)) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    gop.value_ptr.ticks += self_ticks;
+    gop.value_ptr.calls += 1;
+    gop.value_ptr.rows += rows;
+}
+
+pub fn instTake(ptr: *const anyopaque) ?InstStat {
+    if (inst_map.fetchRemove(@intFromPtr(ptr))) |kv| return kv.value;
+    return null;
 }
 
 // Exclusive per-operator deinit wall, bracketed the same way by the deinit()
@@ -254,7 +281,7 @@ pub fn dumpStageDelta(stage_id: usize, name: []const u8, rows: u64, self_ticks: 
 
 /// Trim the long `exec.foo.Bar` operator type name to its leaf for the per-CTE
 /// breakdown (the full names already appear in the global `[oprof]` dump).
-fn shortOpName(name: []const u8) []const u8 {
+pub fn shortOpName(name: []const u8) []const u8 {
     var i = name.len;
     while (i > 0) : (i -= 1) {
         if (name[i - 1] == '.') return name[i..];
