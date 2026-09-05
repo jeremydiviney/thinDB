@@ -64,6 +64,8 @@ pub fn reset() void {
     cte_child_ticks = 0;
     self_count = 0;
     op_child_acc = 0;
+    deinit_count = 0;
+    deinit_child_acc = 0;
 }
 
 // Exclusive (self) per-operator time. The inclusive `slots` above double-count
@@ -100,6 +102,64 @@ pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) void {
     op_child_acc = saved_parent +% incl;
 }
 
+// Exclusive per-operator deinit wall, bracketed the same way by the deinit()
+// wrapper: a parent's deinit tears down its children, so the subtraction
+// leaves each operator's own frees (buffer pools, arenas, pinned stages).
+threadlocal var deinit_slots: [48]Slot = undefined;
+threadlocal var deinit_count: usize = 0;
+threadlocal var deinit_child_acc: u64 = 0;
+
+pub inline fn deinitEnter() u64 {
+    const saved = deinit_child_acc;
+    deinit_child_acc = 0;
+    return saved;
+}
+
+pub inline fn deinitLeave(name: []const u8, incl: u64, saved_parent: u64) void {
+    const children = deinit_child_acc;
+    const self_t: u64 = if (incl > children) incl - children else 0;
+    var i: usize = 0;
+    while (i < deinit_count) : (i += 1) {
+        if (deinit_slots[i].name.ptr == name.ptr) {
+            deinit_slots[i].ticks += self_t;
+            deinit_slots[i].calls += 1;
+            break;
+        }
+    } else if (deinit_count < deinit_slots.len) {
+        deinit_slots[deinit_count] = .{ .name = name, .ticks = self_t, .calls = 1 };
+        deinit_count += 1;
+    }
+    deinit_child_acc = saved_parent +% incl;
+}
+
+fn dumpDeinit() void {
+    if (deinit_count == 0) return;
+    const hz: f64 = @floatFromInt(freq());
+    var order: [48]usize = undefined;
+    for (0..deinit_count) |i| order[i] = i;
+    var a: usize = 0;
+    while (a < deinit_count) : (a += 1) {
+        var b = a + 1;
+        while (b < deinit_count) : (b += 1) {
+            if (deinit_slots[order[b]].ticks > deinit_slots[order[a]].ticks) {
+                const t = order[a];
+                order[a] = order[b];
+                order[b] = t;
+            }
+        }
+    }
+    var total: u64 = 0;
+    for (deinit_slots[0..deinit_count]) |s| total +%= s.ticks;
+    std.debug.print("[deinit] per-operator EXCLUSIVE teardown wall:\n", .{});
+    for (order[0..deinit_count]) |idx| {
+        const s = deinit_slots[idx];
+        const ms = @as(f64, @floatFromInt(s.ticks)) * 1000.0 / hz;
+        if (ms < 0.05) continue;
+        std.debug.print("[deinit]   {s: <44} {d: >9.2} ms  ({d} calls)\n", .{ shortOpName(s.name), ms, s.calls });
+    }
+    std.debug.print("[deinit]   {s: <44} {d: >9.2} ms\n", .{ "TOTAL", @as(f64, @floatFromInt(total)) * 1000.0 / hz });
+}
+
 pub fn dumpSelf(label: []const u8) void {
     if (!enabled or self_count == 0) return;
     const hz: f64 = @floatFromInt(freq());
@@ -126,6 +186,7 @@ pub fn dumpSelf(label: []const u8) void {
         std.debug.print("[self]   {s: <44} {d: >9.2} ms  {d: >5.1}%  ({d} calls)\n", .{ shortOpName(s.name), ms, pct, s.calls });
     }
     std.debug.print("[self]   {s: <44} {d: >9.2} ms  100.0%\n", .{ "TOTAL (connection-thread wall)", @as(f64, @floatFromInt(total)) * 1000.0 / hz });
+    dumpDeinit();
 }
 
 // Per-CTE-stage profiling. Each `Stage.ensureRun` drains one CTE block serially

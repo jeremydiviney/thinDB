@@ -750,7 +750,12 @@ fn OpWrapper(comptime Op: type) type {
         }
         fn deinitWrap(ptr: *anyopaque) void {
             const o: *Op = @ptrCast(@alignCast(ptr));
+            if (!prof.enabled) return o.deinit();
+            const saved = prof.deinitEnter();
+            const t0 = prof.nowTicks();
             o.deinit();
+            const d = prof.nowTicks() - t0;
+            prof.deinitLeave(@typeName(Op), if (d > 0) @intCast(d) else 0, saved);
         }
         fn outputSchemaWrap(ptr: *anyopaque) []const Column {
             const o: *Op = @ptrCast(@alignCast(ptr));

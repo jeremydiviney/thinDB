@@ -186,18 +186,11 @@ const WorkerBuf = struct {
 };
 
 /// The thread-safe allocator the per-worker scans/aggregates/survivor buffers
-/// draw from. In production this is the process-global retaining buffer pool
-/// (recycles the large decode buffers instead of `munmap`-ing them every scan);
-/// `THINDB_NO_BUFPOOL=1` reverts to the raw backing allocator for an A/B without
-/// a rebuild. Tests pass their own (`testing.allocator`/`c_allocator`) so leak
-/// detection observes every free — the pool retains blocks, which a leak
-/// detector would flag.
+/// draw from: the process-global retaining buffer pool (recycles the large
+/// decode buffers instead of `munmap`-ing them every scan), or the raw
+/// backing allocator in tests and under `THINDB_NO_BUFPOOL=1`.
 fn workerAlloc(base: Allocator) Allocator {
-    if (builtin.is_test) return base;
-    if (getenv("THINDB_NO_BUFPOOL")) |v| {
-        if (v[0] == '1') return base;
-    }
-    return buffer_pool.allocator();
+    return buffer_pool.workerAllocator(base);
 }
 
 test "createOverStage: parallel buffer scan preserves the row multiset" {

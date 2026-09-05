@@ -43,6 +43,7 @@ const prepared = @import("prepared.zig");
 const sql_text_mod = @import("../sql_text.zig");
 const conn_registry = @import("../conn_registry.zig");
 const oprof = @import("../../util/prof.zig");
+const buffer_pool = @import("../../util/buffer_pool.zig");
 const counting_allocator = @import("../../util/counting_allocator.zig");
 const rg_cache = @import("../../storage/cache.zig");
 const scan_mod = @import("../../exec/scan.zig");
@@ -3734,6 +3735,7 @@ fn runSingleStatement(
     );
     profiler.recordSince(.query_execute_write, write_start);
     oprof.dumpSelf("query");
+    if (oprof.enabled) buffer_pool.dumpGlobalStats();
     oprof.dump("query");
     if (oprof.enabled) {
         const cs = rg_cache.globalStats();

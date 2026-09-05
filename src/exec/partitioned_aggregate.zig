@@ -29,6 +29,7 @@ const storage = @import("../storage/storage.zig");
 const aggregate = @import("aggregate.zig");
 const ir = @import("../ir/ir.zig");
 const hll = @import("../util/hll.zig");
+const buffer_pool = @import("../util/buffer_pool.zig");
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -202,8 +203,12 @@ pub const PartitionedAggregate = struct {
         errdefer allocator.free(parts);
         var inited: usize = 0;
         errdefer for (parts[0..inited]) |*p| p.arena.deinit();
+        // Partition arenas churn hundreds of MB per stage; the retaining pool
+        // hands back warm, already-faulted blocks and takes them back without
+        // an OS release (the arena's node frees are class-sized pool returns).
+        const arena_backing = buffer_pool.workerAllocator(std.heap.c_allocator);
         for (parts) |*p| {
-            p.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.c_allocator), .in_cols = &.{} };
+            p.* = .{ .arena = std.heap.ArenaAllocator.init(arena_backing), .in_cols = &.{} };
             const aa = p.arena.allocator();
             p.in_cols = try aa.alloc(engine.ColumnStore, up_schema.len);
             for (up_schema, p.in_cols) |sc, *store| {
@@ -350,28 +355,6 @@ pub const PartitionedAggregate = struct {
             }
         }
     };
-
-    /// Each partition's arena holds its gathered input plus retained output —
-    /// hundreds of MB total on multi-million-row groups, and OS page release
-    /// dominates teardown. The arenas are independent and exclusively owned
-    /// here, so free them concurrently.
-    fn freeArenasParallel(parts: []Partition) void {
-        if (parts.len < 2) {
-            for (parts) |*p| p.arena.deinit();
-            return;
-        }
-        var threads: [MAX_PARTS]?std.Thread = .{null} ** MAX_PARTS;
-        for (parts[1..], 1..) |*p, i| {
-            threads[i] = std.Thread.spawn(.{}, freeOneArena, .{p}) catch null;
-            if (threads[i] == null) p.arena.deinit();
-        }
-        parts[0].arena.deinit();
-        for (threads[1..parts.len]) |maybe| if (maybe) |th| th.join();
-    }
-
-    fn freeOneArena(part: *Partition) void {
-        part.arena.deinit();
-    }
 
     fn copyPartition(_: *PartitionedAggregate, part: *Partition, batch: Batch, indices: []const u32) !void {
         if (indices.len == 0) return;
@@ -620,7 +603,9 @@ pub const PartitionedAggregate = struct {
 
     pub fn deinit(self: *PartitionedAggregate) void {
         self.up.deinit();
-        freeArenasParallel(self.parts);
+        const t_free = exec.prof.nowTicks();
+        for (self.parts) |*p| p.arena.deinit();
+        exec.prof.addPhase("pagg.deinit.arenas", @intCast(exec.prof.nowTicks() - t_free));
         self.allocator.free(self.parts);
         self.allocator.free(self.group_indices);
         self.allocator.free(self.output_schema);

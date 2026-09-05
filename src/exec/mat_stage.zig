@@ -25,6 +25,7 @@
 //! lives inside table-sourced stages (which run the regular V2 handlers).
 
 const std = @import("std");
+const buffer_pool = @import("../util/buffer_pool.zig");
 const Allocator = std.mem.Allocator;
 
 const exec = @import("exec.zig");
@@ -621,7 +622,8 @@ pub const ContigSink = struct {
         const arena_backed = try allocator.alloc(bool, schema.len);
         errdefer allocator.free(arena_backed);
         @memset(arena_backed, true);
-        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        const arena_backing = buffer_pool.workerAllocator(std.heap.c_allocator);
+        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
         errdefer for (arenas) |*a| a.deinit();
         for (schema, stores, arenas) |sc, *st, *ar| {
             st.* = try engine.ColumnStore.initCapacity(ar.allocator(), sc.type, sc.nullable, expect_rows, 0);
