@@ -31,6 +31,7 @@ const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 
 const exec = @import("exec.zig");
+const parallel = @import("../util/parallel.zig");
 const Query = exec.Query;
 
 const Batch = exec.Batch;
@@ -435,6 +436,11 @@ pub const FastTable = struct {
     slot_keys: []u64,
     heads: []u32,
     mask: u64,
+    /// Probe-sequence wrap: a slot's successor is `nextSlot(slot, wrap_mask)`.
+    /// Equal to `mask` for a table built as one range; a large table is
+    /// built in `PARALLEL_INSERT_RANGES` equal slot ranges on parallel
+    /// threads, and every probe sequence wraps within its home range.
+    wrap_mask: u64,
     /// Duplicate-key chains. Empty for unique non-FULL joins, where every
     /// slot has exactly one row and the array would never be read.
     next: []u32,
@@ -454,7 +460,8 @@ pub const FastBuild = struct {
 /// Bytes a FastTable over `n` rows occupies, for memory accounting.
 pub fn fastTableBytes(n: usize, needs_chain: bool) usize {
     const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, n * 2));
-    return cap * (@sizeOf(u64) + @sizeOf(u32)) + (if (needs_chain) n * @sizeOf(u32) else 0);
+    const chain = needs_chain or n >= PARALLEL_INSERT_MIN_ROWS;
+    return cap * (@sizeOf(u64) + @sizeOf(u32)) + (if (chain) n * @sizeOf(u32) else 0);
 }
 
 /// Build the vectorized-probe FastTable over `key_views` (one per join
@@ -469,6 +476,275 @@ const MAX_DIGEST_WORKERS: usize = 16;
 /// Insert-loop prefetch distance in rows: enough independent slots in
 /// flight to cover a DRAM miss on the table.
 const INSERT_PREFETCH_DIST: u32 = 8;
+/// A build over at least this many rows inserts in parallel: the slot array
+/// splits into `PARALLEL_INSERT_RANGES` equal ranges, the rows are grouped
+/// by the range their home slot falls in, and one job per range inserts its
+/// rows with probe sequences wrapping inside the range, so no two threads
+/// touch one slot. The chain array is allocated up front for such a build
+/// (workers cannot allocate lazily). Below the threshold the whole table is
+/// one range on the calling thread. Many ranges keep each job's slots
+/// cache-resident and balance the jobs over the threads; the count is
+/// bounded by the u8 range tag (NULL_RANGE) and the per-thread scatter
+/// streams.
+const PARALLEL_INSERT_MIN_ROWS: u32 = 1 << 18;
+const PARALLEL_INSERT_RANGES: usize = 128;
+const NULL_RANGE: u8 = 0xFF;
+
+inline fn nextSlot(slot: u64, wrap_mask: u64) u64 {
+    return (slot & ~wrap_mask) | ((slot + 1) & wrap_mask);
+}
+
+inline fn homeSlot(comptime kind: FastKeyKind, digest: u64, mask: u64) u64 {
+    return (if (kind == .int) fastMix(digest) else digest) & mask;
+}
+
+inline fn prefetchSlot(slot_keys: []u64, heads: []u32, slot: usize) void {
+    @prefetch(&heads[slot], .{ .rw = .write, .locality = 3, .cache = .data });
+    @prefetch(&slot_keys[slot], .{ .rw = .write, .locality = 3, .cache = .data });
+}
+
+const Place = enum { placed, chained, needs_chain, full };
+
+/// Probe from `home` (wrapping under `wrap_mask`) and insert `row`: into
+/// the first empty slot, or onto the chain of an equal resident key.
+/// `needs_chain` means an equal key sits there but no chain array exists
+/// yet; the caller allocates one and places the row again. `full` means
+/// the probe walked the whole wrap region without an empty slot.
+inline fn placeRow(slot_keys: []u64, heads: []u32, chain_next: []u32, key: u64, row: u32, home: u64, wrap_mask: u64) Place {
+    var slot = home;
+    var steps: u64 = 0;
+    while (true) {
+        if (heads[slot] == FAST_EMPTY) {
+            slot_keys[slot] = key;
+            heads[slot] = row;
+            return .placed;
+        }
+        if (slot_keys[slot] == key) {
+            // Same key (or same digest, for string/compound kinds — treated
+            // as a duplicate conservatively) already resident: chains of
+            // length > 1 exist, so pass-through can't assume one match per
+            // probe row.
+            if (chain_next.len == 0) return .needs_chain;
+            chain_next[row] = heads[slot];
+            heads[slot] = row;
+            return .chained;
+        }
+        slot = nextSlot(slot, wrap_mask);
+        steps += 1;
+        if (steps > wrap_mask) return .full;
+    }
+}
+
+/// The single-range insert: walks every digest in REVERSE row order (so a
+/// duplicate chain reads ascending, see FastTable) on the calling thread.
+const InsertJob = struct {
+    kind: FastKeyKind,
+    key_view: ColumnView,
+    key_views: []const ColumnView,
+    digests: []const u64,
+    slot_keys: []u64,
+    heads: []u32,
+    chain_next: []u32,
+    mask: u64,
+    /// Allocates the chain on the first duplicate; null when the chain was
+    /// allocated up front.
+    lazy_chain: ?Allocator = null,
+    keys_unique: bool = true,
+    alloc_failed: bool = false,
+
+    fn run(job: *InsertJob) void {
+        switch (job.kind) {
+            inline else => |k| job.insertRows(k),
+        }
+    }
+
+    fn insertRows(job: *InsertJob, comptime kind: FastKeyKind) void {
+        const n: u32 = @intCast(job.digests.len);
+        const mask = job.mask;
+        var row: u32 = n;
+        while (row > 0) {
+            row -= 1;
+            if (row >= INSERT_PREFETCH_DIST) {
+                const ahead = job.digests[row - INSERT_PREFETCH_DIST];
+                prefetchSlot(job.slot_keys, job.heads, @intCast(homeSlot(kind, ahead, mask)));
+            }
+            const valid = switch (kind) {
+                .int, .string => job.key_view.isValid(row),
+                .compound => !anyViewNull(job.key_views, row),
+            };
+            if (!valid) continue;
+            const key = job.digests[row];
+            const home = homeSlot(kind, key, mask);
+            switch (placeRow(job.slot_keys, job.heads, job.chain_next, key, row, home, mask)) {
+                .placed => {},
+                .chained => job.keys_unique = false,
+                .needs_chain => {
+                    job.keys_unique = false;
+                    const a = job.lazy_chain orelse unreachable;
+                    job.chain_next = a.alloc(u32, n) catch {
+                        job.alloc_failed = true;
+                        return;
+                    };
+                    @memset(job.chain_next, FAST_EMPTY);
+                    _ = placeRow(job.slot_keys, job.heads, job.chain_next, key, row, home, mask);
+                },
+                // The whole table is the wrap region and holds at most half
+                // its slots, so a probe always finds an empty slot.
+                .full => unreachable,
+            }
+        }
+    }
+};
+
+/// A parallel build's valid rows grouped by slot range: range r's rows are
+/// `rows[bounds[r]..bounds[r + 1]]` in ascending row order and `digests`
+/// holds their digests at the same positions, so a range's insert reads
+/// one contiguous strip and never touches another range's rows.
+const RangedRows = struct {
+    rows: []u32,
+    digests: []u64,
+    bounds: [PARALLEL_INSERT_RANGES + 1]u32,
+
+    fn free(self: RangedRows, scratch: Allocator) void {
+        scratch.free(self.rows);
+        scratch.free(self.digests);
+    }
+};
+
+/// Two passes over the key rows on `workers` threads, each thread over the
+/// same row block both times: digest the block's rows, tag each with its
+/// range and count the block's rows per range; then, after a prefix sum,
+/// scatter rows and digests through per-(block, range) cursors laid out
+/// range-major.
+const PartitionPass = struct {
+    kind: FastKeyKind,
+    views: []const ColumnView,
+    digests: []u64,
+    mask: u64,
+    range_shift: u6,
+    range_of: []u8,
+    out: RangedRows,
+    /// Per (block, range): the block's row count after `digestAndTag`, its
+    /// start position after the prefix sum.
+    cursors: [MAX_DIGEST_WORKERS][PARALLEL_INSERT_RANGES]u32,
+
+    fn digestAndTag(p: *PartitionPass, w: usize, lo: usize, hi: usize) void {
+        switch (p.kind) {
+            inline else => |k| p.tagRows(k, w, lo, hi),
+        }
+    }
+
+    fn tagRows(p: *PartitionPass, comptime kind: FastKeyKind, w: usize, lo: usize, hi: usize) void {
+        var c: [PARALLEL_INSERT_RANGES]u32 = .{0} ** PARALLEL_INSERT_RANGES;
+        var row: u32 = @intCast(lo);
+        while (row < hi) : (row += 1) {
+            const digest = digestRow(kind, p.views, row) orelse {
+                p.digests[row] = 0;
+                p.range_of[row] = NULL_RANGE;
+                continue;
+            };
+            p.digests[row] = digest;
+            const r: u8 = @intCast(homeSlot(kind, digest, p.mask) >> p.range_shift);
+            p.range_of[row] = r;
+            c[r] += 1;
+        }
+        p.cursors[w] = c;
+    }
+
+    fn scatter(p: *PartitionPass, w: usize, lo: usize, hi: usize) void {
+        var cursor = p.cursors[w];
+        var row: u32 = @intCast(lo);
+        while (row < hi) : (row += 1) {
+            const r = p.range_of[row];
+            if (r == NULL_RANGE) continue;
+            const at = cursor[r];
+            cursor[r] += 1;
+            p.out.rows[at] = row;
+            p.out.digests[at] = p.digests[row];
+        }
+    }
+};
+
+fn partitionRows(scratch: Allocator, kind: FastKeyKind, views: []const ColumnView, digests: []u64, mask: u64, range_shift: u6, workers: usize) !RangedRows {
+    const n = digests.len;
+    const range_of = try scratch.alloc(u8, n);
+    defer scratch.free(range_of);
+    const rows = try scratch.alloc(u32, n);
+    errdefer scratch.free(rows);
+    const out_digests = try scratch.alloc(u64, n);
+    errdefer scratch.free(out_digests);
+    var pass = PartitionPass{
+        .kind = kind,
+        .views = views,
+        .digests = digests,
+        .mask = mask,
+        .range_shift = range_shift,
+        .range_of = range_of,
+        .out = .{ .rows = rows, .digests = out_digests, .bounds = undefined },
+        .cursors = undefined,
+    };
+    parallel.forRanges(workers, n, &pass, PartitionPass.digestAndTag);
+    var at: u32 = 0;
+    for (0..PARALLEL_INSERT_RANGES) |r| {
+        pass.out.bounds[r] = at;
+        for (0..workers) |w| {
+            const c = pass.cursors[w][r];
+            pass.cursors[w][r] = at;
+            at += c;
+        }
+    }
+    pass.out.bounds[PARALLEL_INSERT_RANGES] = at;
+    parallel.forRanges(workers, n, &pass, PartitionPass.scatter);
+    return pass.out;
+}
+
+/// One job per slot range of a parallel build: inserts the range's rows in
+/// REVERSE row order (so chains read ascending) with probes wrapping inside
+/// the range. Results land per range, so jobs never share a field.
+const RangeInsert = struct {
+    kind: FastKeyKind,
+    ranged: RangedRows,
+    slot_keys: []u64,
+    heads: []u32,
+    chain_next: []u32,
+    mask: u64,
+    wrap_mask: u64,
+    keys_unique: [PARALLEL_INSERT_RANGES]bool = .{true} ** PARALLEL_INSERT_RANGES,
+    range_full: [PARALLEL_INSERT_RANGES]bool = .{false} ** PARALLEL_INSERT_RANGES,
+
+    fn job(self: *RangeInsert, _: usize, r: usize) void {
+        switch (self.kind) {
+            inline else => |k| self.insertRange(k, r),
+        }
+    }
+
+    fn insertRange(self: *RangeInsert, comptime kind: FastKeyKind, r: usize) void {
+        const lo = self.ranged.bounds[r];
+        const rows = self.ranged.rows;
+        const digests = self.ranged.digests;
+        var unique = true;
+        var j = self.ranged.bounds[r + 1];
+        while (j > lo) {
+            j -= 1;
+            if (j >= lo + INSERT_PREFETCH_DIST) {
+                const ahead = digests[j - INSERT_PREFETCH_DIST];
+                prefetchSlot(self.slot_keys, self.heads, @intCast(homeSlot(kind, ahead, self.mask)));
+            }
+            const key = digests[j];
+            switch (placeRow(self.slot_keys, self.heads, self.chain_next, key, rows[j], homeSlot(kind, key, self.mask), self.wrap_mask)) {
+                .placed => {},
+                .chained => unique = false,
+                // A parallel build allocates the chain up front.
+                .needs_chain => unreachable,
+                .full => {
+                    self.range_full[r] = true;
+                    return;
+                },
+            }
+        }
+        self.keys_unique[r] = unique;
+    }
+};
 
 /// Threads for a build that has no DOP of its own (a private join build):
 /// the machine's cores, capped — the pre-pass is short and memory-bound.
@@ -499,64 +775,84 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
         @memset(chain_next, FAST_EMPTY);
     }
     const mask: u64 = cap - 1;
-    var keys_unique = true;
 
     // Hashing every key row is independent work, so it runs ahead on
-    // worker threads; the serial insert below then only walks the table,
-    // with the slots of upcoming rows prefetched. Rows insert in REVERSE
-    // order so duplicate chains read ascending (see FastTable).
-    const t_digest = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+    // worker threads; the insert then only walks the table, with the slots
+    // of upcoming rows prefetched. A large build also groups the rows by
+    // slot range in that pre-pass and inserts the ranges on parallel
+    // threads. Rows insert in REVERSE order so duplicate chains read
+    // ascending (see FastTable).
+    const t_start = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
     const digests = try scratch.alloc(u64, n);
     defer scratch.free(digests);
     const digest_views: []const ColumnView = if (kind == .compound) owned_key_views else key_views[0..1];
-    digestAll(kind, digest_views, digests, threads);
-    const t_insert = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+    const ranged_build = n >= PARALLEL_INSERT_MIN_ROWS;
+    if (!ranged_build) digestAll(kind, digest_views, digests, threads);
 
-    var row: u32 = n;
-    while (row > 0) {
-        row -= 1;
-        if (row >= INSERT_PREFETCH_DIST) {
-            const ahead = digests[row - INSERT_PREFETCH_DIST];
-            const ps: usize = @intCast((if (kind == .int) fastMix(ahead) else ahead) & mask);
-            @prefetch(&heads[ps], .{ .rw = .write, .locality = 3, .cache = .data });
-            @prefetch(&slot_keys[ps], .{ .rw = .write, .locality = 3, .cache = .data });
-        }
-        const valid = switch (kind) {
-            .int, .string => key_view.isValid(row),
-            .compound => !anyViewNull(owned_key_views, row),
-        };
-        if (!valid) continue;
-        const key = digests[row];
-        var slot = (if (kind == .int) fastMix(key) else key) & mask;
-        while (true) {
-            if (heads[slot] == FAST_EMPTY) {
-                slot_keys[slot] = key;
-                heads[slot] = row;
-                break;
-            }
-            if (slot_keys[slot] == key) {
-                // Same key (or same digest, for string/compound kinds —
-                // treated as a duplicate conservatively) already
-                // resident: chains of length > 1 exist, so pass-through
-                // can't assume one match per probe row.
-                keys_unique = false;
-                if (chain_next.len == 0) {
-                    chain_next = try aa.alloc(u32, n);
-                    @memset(chain_next, FAST_EMPTY);
-                }
-                chain_next[row] = heads[slot];
-                heads[slot] = row;
-                break;
-            }
-            slot = (slot + 1) & mask;
-        }
+    if (ranged_build and chain_next.len == 0) {
+        chain_next = try aa.alloc(u32, n);
+        @memset(chain_next, FAST_EMPTY);
     }
+    var job = InsertJob{
+        .kind = kind,
+        .key_view = key_view,
+        .key_views = owned_key_views,
+        .digests = digests,
+        .slot_keys = slot_keys,
+        .heads = heads,
+        .chain_next = chain_next,
+        .mask = mask,
+        .lazy_chain = aa,
+    };
+    var keys_unique = true;
+    var ranged = false;
+    var t_insert: i64 = 0;
+    if (ranged_build) {
+        const range_len: u64 = cap / PARALLEL_INSERT_RANGES;
+        const workers: usize = @max(@as(usize, 1), @min(threads, MAX_DIGEST_WORKERS));
+        const ranged_rows = try partitionRows(scratch, kind, digest_views, digests, mask, std.math.log2_int(u64, range_len), workers);
+        defer ranged_rows.free(scratch);
+        t_insert = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        var ins = RangeInsert{
+            .kind = kind,
+            .ranged = ranged_rows,
+            .slot_keys = slot_keys,
+            .heads = heads,
+            .chain_next = chain_next,
+            .mask = mask,
+            .wrap_mask = range_len - 1,
+        };
+        parallel.forJobs(workers, PARALLEL_INSERT_RANGES, &ins, RangeInsert.job);
+        var range_full = false;
+        for (0..PARALLEL_INSERT_RANGES) |r| {
+            if (!ins.keys_unique[r]) keys_unique = false;
+            if (ins.range_full[r]) range_full = true;
+        }
+        ranged = !range_full;
+        if (range_full) {
+            // The digests were far from uniform and one range overfilled:
+            // rebuild the whole table as a single range.
+            @memset(heads, FAST_EMPTY);
+            @memset(chain_next, FAST_EMPTY);
+            job.lazy_chain = null;
+            job.run();
+            keys_unique = job.keys_unique;
+        }
+    } else {
+        t_insert = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        job.run();
+        keys_unique = job.keys_unique;
+        chain_next = job.chain_next;
+        if (job.alloc_failed) return error.OutOfMemory;
+    }
+    const wrap_mask: u64 = if (ranged) cap / PARALLEL_INSERT_RANGES - 1 else mask;
     if (exec.prof.enabled and n >= 65536) {
-        std.debug.print("[hprof] fasttable rows={d} kind={s} threads={d} digest={d:.1}ms insert={d:.1}ms\n", .{
+        std.debug.print("[hprof] fasttable rows={d} kind={s} threads={d} ranged={} prep={d:.1}ms insert={d:.1}ms\n", .{
             n,
             @tagName(kind),
             threads,
-            exec.prof.ticksToMs(t_insert - t_digest),
+            ranged,
+            exec.prof.ticksToMs(t_insert - t_start),
             exec.prof.ticksToMs(exec.prof.nowTicks() - t_insert),
         });
     }
@@ -567,6 +863,7 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
             .slot_keys = slot_keys,
             .heads = heads,
             .mask = mask,
+            .wrap_mask = wrap_mask,
             .next = chain_next,
             .build_key_view = key_view,
             .build_key_views = owned_key_views,
@@ -589,18 +886,21 @@ const DigestJob = struct {
     }
 };
 
+/// A key row's digest; null for a NULL key, which never enters the table.
+inline fn digestRow(comptime kind: FastKeyKind, views: []const ColumnView, row: u32) ?u64 {
+    const kv = views[0];
+    return switch (kind) {
+        .int => if (kv.isValid(row)) fastIntKey(kv, row) else null,
+        .string => if (kv.isValid(row)) std.hash.Wyhash.hash(0, stringRowBytes(kv, row)) else null,
+        .compound => if (anyViewNull(views, row)) null else fastCompoundDigest(views, row),
+    };
+}
+
 /// A NULL key row gets digest 0; the insert re-checks validity and skips
 /// it, so the value is never used.
 fn digestRange(comptime kind: FastKeyKind, views: []const ColumnView, digests: []u64, start: u32, end: u32) void {
-    const kv = views[0];
     var row = start;
-    while (row < end) : (row += 1) {
-        digests[row] = switch (kind) {
-            .int => if (kv.isValid(row)) fastIntKey(kv, row) else 0,
-            .string => if (kv.isValid(row)) std.hash.Wyhash.hash(0, stringRowBytes(kv, row)) else 0,
-            .compound => if (anyViewNull(views, row)) 0 else fastCompoundDigest(views, row),
-        };
-    }
+    while (row < end) : (row += 1) digests[row] = digestRow(kind, views, row) orelse 0;
 }
 
 fn digestAll(kind: FastKeyKind, views: []const ColumnView, digests: []u64, threads: usize) void {
@@ -1920,7 +2220,7 @@ pub const Join = struct {
                             }
                             break;
                         }
-                        slot = (slot + 1) & ft.mask;
+                        slot = nextSlot(slot, ft.wrap_mask);
                     }
                 },
                 .string => {
@@ -1948,7 +2248,7 @@ pub const Join = struct {
                             }
                             break;
                         }
-                        slot = (slot + 1) & ft.mask;
+                        slot = nextSlot(slot, ft.wrap_mask);
                     }
                 },
                 .compound => {
@@ -1975,7 +2275,7 @@ pub const Join = struct {
                             }
                             break;
                         }
-                        slot = (slot + 1) & ft.mask;
+                        slot = nextSlot(slot, ft.wrap_mask);
                     }
                 },
             }
@@ -2131,7 +2431,7 @@ pub const Join = struct {
                 while (true) {
                     if (ft.heads[slot] == FAST_EMPTY) return FAST_EMPTY;
                     if (ft.slot_keys[slot] == key) return ft.heads[slot];
-                    slot = (slot + 1) & ft.mask;
+                    slot = nextSlot(slot, ft.wrap_mask);
                 }
             },
             .string => {
@@ -2151,7 +2451,7 @@ pub const Join = struct {
                         }
                         return FAST_EMPTY;
                     }
-                    slot = (slot + 1) & ft.mask;
+                    slot = nextSlot(slot, ft.wrap_mask);
                 }
             },
             .compound => {
@@ -2170,7 +2470,7 @@ pub const Join = struct {
                         }
                         return FAST_EMPTY;
                     }
-                    slot = (slot + 1) & ft.mask;
+                    slot = nextSlot(slot, ft.wrap_mask);
                 }
             },
         }
@@ -2899,6 +3199,8 @@ fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
 
 fn expectSameFastTable(a: FastBuild, b: FastBuild) !void {
     try std.testing.expectEqual(a.keys_unique, b.keys_unique);
+    try std.testing.expectEqual(a.table.mask, b.table.mask);
+    try std.testing.expectEqual(a.table.wrap_mask, b.table.wrap_mask);
     try std.testing.expectEqualSlices(u32, a.table.heads, b.table.heads);
     try std.testing.expectEqualSlices(u32, a.table.next, b.table.next);
     for (a.table.heads, 0..) |head, slot| {
@@ -2938,4 +3240,37 @@ test "join: FastTable build is identical with threaded digests" {
         try expectSameFastTable(serial, threaded);
         try std.testing.expect(!serial.keys_unique);
     }
+}
+
+test "join: FastTable ranged parallel build finds every key" {
+    const allocator = std.testing.allocator;
+    const n: u32 = PARALLEL_INSERT_MIN_ROWS + 4321;
+    const vals = try allocator.alloc(i64, n);
+    defer allocator.free(vals);
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    for (vals, 0..) |*v, i| v.* = if (i % 5 == 0) @intCast(i / 5) else rnd.intRangeAtMost(i64, 0, 4_000_000);
+    const key = ColumnView{ .data = .{ .bigint = vals } };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const built = (try buildFastTable(arena.allocator(), allocator, &.{key}, n, false, 4)).?;
+    try std.testing.expect(built.table.wrap_mask < built.table.mask);
+    try std.testing.expect(!built.keys_unique);
+    var arena_one = std.heap.ArenaAllocator.init(allocator);
+    defer arena_one.deinit();
+    const one_thread = (try buildFastTable(arena_one.allocator(), allocator, &.{key}, n, false, 1)).?;
+    try expectSameFastTable(one_thread, built);
+
+    var first = std.AutoHashMap(i64, u32).init(allocator);
+    defer first.deinit();
+    for (vals, 0..) |v, i| {
+        const gop = try first.getOrPut(v);
+        if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+    }
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        try std.testing.expectEqual(first.get(vals[i]).?, Join.fastLookupFirst(&built.table, key, &.{}, i));
+    }
+    const absent = ColumnView{ .data = .{ .bigint = &.{-1} } };
+    try std.testing.expectEqual(FAST_EMPTY, Join.fastLookupFirst(&built.table, absent, &.{}, 0));
 }
