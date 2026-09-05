@@ -782,8 +782,8 @@ fn OpWrapper(comptime Op: type) type {
                 n += line.len;
                 taken += 1;
             }
-            std.debug.print("[inst] {s: <22} {d: >8.2} ms  ({d} calls, {d} rows)  {s}\n", .{
-                prof.shortOpName(@typeName(Op)), prof.ticksToMs(@intCast(st.ticks)), st.calls, st.rows, head[0..n],
+            std.debug.print("[inst] {s: <22} {d: >8.2} ms  ({d} calls, {d} rows, ~{d} thr)  {s}\n", .{
+                prof.shortOpName(@typeName(Op)), prof.ticksToMs(@intCast(st.ticks)), st.calls, st.rows, st.threads(), head[0..n],
             });
         }
         fn outputSchemaWrap(ptr: *anyopaque) []const Column {

@@ -63,7 +63,9 @@ pub fn reset() void {
     count = 0;
     cte_child_ticks = 0;
     self_count = 0;
+    while (!inst_mutex.tryLock()) std.atomic.spinLoopHint();
     inst_map.clearRetainingCapacity();
+    inst_mutex.unlock();
     op_child_acc = 0;
     deinit_count = 0;
     deinit_child_acc = 0;
@@ -104,27 +106,48 @@ pub inline fn selfLeave(name: []const u8, incl: u64, saved_parent: u64) u64 {
     return self_t;
 }
 
-// Per-INSTANCE exclusive wall on this thread, keyed by the operator pointer,
-// so a fat [self] row (one type, many instances) traces to the plan node that
-// spent it. The next() wrapper adds each call's self time; the deinit() wrapper
-// takes the entry back and prints instances above INST_PRINT_MS with the head
-// of their plan. Bounded so a worker thread's never-taken entries cannot grow
+// Per-INSTANCE exclusive wall keyed by the operator pointer, so a fat [self]
+// row (one type, many instances) traces to the plan node that spent it. One
+// process-wide map under a mutex, not thread-local: an operator inside a
+// fused scan-worker pipeline (a probe sink, a chained compute) runs on many
+// threads, and its entry sums them all — a thread bit set gives the reader
+// the approximate thread count to divide by. The next() wrapper adds each
+// call's self time; the deinit() wrapper takes the entry back and prints
+// instances above INST_PRINT_MS with the head of their plan. The lock is
+// uncontended in practice (one take per call, thousands of rows apart) and
+// this is a profiling build only. Bounded so never-taken entries cannot grow
 // without limit.
-pub const InstStat = struct { ticks: u64 = 0, calls: u64 = 0, rows: u64 = 0 };
+pub const InstStat = struct {
+    ticks: u64 = 0,
+    calls: u64 = 0,
+    rows: u64 = 0,
+    thread_bits: u64 = 0,
+
+    pub fn threads(self: InstStat) u32 {
+        return @popCount(self.thread_bits);
+    }
+};
 pub const INST_PRINT_MS: f64 = 3.0;
 const INST_MAP_CAP: usize = 1 << 16;
-threadlocal var inst_map: std.AutoHashMapUnmanaged(usize, InstStat) = .empty;
+var inst_mutex: std.atomic.Mutex = .unlocked;
+var inst_map: std.AutoHashMapUnmanaged(usize, InstStat) = .empty;
 
 pub fn instAdd(ptr: *const anyopaque, self_ticks: u64, rows: u64) void {
+    const tid: u64 = std.Thread.getCurrentId();
+    while (!inst_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer inst_mutex.unlock();
     if (inst_map.count() >= INST_MAP_CAP) return;
     const gop = inst_map.getOrPut(std.heap.page_allocator, @intFromPtr(ptr)) catch return;
     if (!gop.found_existing) gop.value_ptr.* = .{};
     gop.value_ptr.ticks += self_ticks;
     gop.value_ptr.calls += 1;
     gop.value_ptr.rows += rows;
+    gop.value_ptr.thread_bits |= @as(u64, 1) << @intCast(tid % 64);
 }
 
 pub fn instTake(ptr: *const anyopaque) ?InstStat {
+    while (!inst_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer inst_mutex.unlock();
     if (inst_map.fetchRemove(@intFromPtr(ptr))) |kv| return kv.value;
     return null;
 }
