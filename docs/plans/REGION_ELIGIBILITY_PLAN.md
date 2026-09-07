@@ -264,5 +264,6 @@ Each item is independently shippable; verify with the harness after each one
   locally for the same binary and data; 68% user-space spin at three
   addresses, hypothesis: memtable rows appended by live CDC. Not part of this
   round.
-- PR #35 (decoded block cache) is open and awaiting a decision; it adds about
-  14 GB peak working set on the 100M ClickBench table.
+- PR #35 (decoded block cache) merged 2026-09-07 (51b4541). It adds about
+  14 GB peak working set on the 100M ClickBench table and is not on the box
+  yet (deployed v0.1.81 predates it).
