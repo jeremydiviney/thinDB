@@ -125,15 +125,12 @@ pub const Encoding = enum(u8) {
 };
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is
-/// prefixed by a validity bitmap). Bit 1 = at_rest. Remaining bits reserved.
+/// prefixed by a validity bitmap). Bit 1 was the v12 "cache compressed at
+/// rest" hint; the cache now decompresses every block at fill, so the reader
+/// ignores it and the writer leaves it clear. Remaining bits reserved.
 pub const ColumnBlockFlags = packed struct(u8) {
     has_nulls: bool = false,
-    /// The block cache keeps this block's payload still-compressed and
-    /// decompresses per access (set by the writer for large raw string blocks
-    /// under `TableCompression.lz4`). Without the flag, an LZ4 block is
-    /// decompressed once at cache fill like any zstd block.
-    at_rest: bool = false,
-    _reserved: u6 = 0,
+    _reserved: u7 = 0,
 
     pub fn toByte(self: ColumnBlockFlags) u8 {
         return @bitCast(self);

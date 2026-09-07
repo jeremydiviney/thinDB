@@ -386,14 +386,13 @@ pub const TableCompression = enum(u8) {
     /// zstd-3 on every block; the cache holds decompressed bytes. Fastest hot
     /// reads, largest resident set, best ratio.
     zstd = 1,
-    /// LZ4HC on every block (decode ~4 GB/s). Large raw string blocks
-    /// additionally stay compressed IN CACHE and decompress per access into
-    /// recycled scratch — a much smaller resident set for string-heavy data.
+    /// LZ4HC on every block (decode ~4 GB/s); every block is decompressed
+    /// once at cache fill.
     lz4 = 2,
-    /// `.lz4` everywhere, except large string blocks are FSST-encoded
-    /// instead of LZ4-at-rest: the cache holds the FSST form (per-string
-    /// random access — kernels with per-row lanes decode only the rows they
-    /// touch), and the FSST bytes are themselves LZ4'd on disk.
+    /// `.lz4` everywhere, except large string blocks are FSST-encoded: the
+    /// cache holds the FSST form (per-string random access — kernels with
+    /// per-row lanes decode only the rows they touch), and the FSST bytes are
+    /// themselves LZ4'd on disk.
     lz4_fsst = 3,
 };
 

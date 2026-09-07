@@ -2856,7 +2856,7 @@ pub const Scan = struct {
     /// `col [NOT] LIKE pattern` over an FSST block: decode each ACTIVE row
     /// into a reused scratch and match the compiled plan — rows an earlier
     /// conjunct already eliminated never decode at all. This is the per-
-    /// survivor decode that whole-block compression (LZ4-at-rest) cannot do.
+    /// survivor decode a raw block cannot offer.
     fn evalFsstLike(
         allocator: Allocator,
         raw: []const u8,

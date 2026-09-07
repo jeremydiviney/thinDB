@@ -8,16 +8,6 @@ const Allocator = std.mem.Allocator;
 
 const native_endian = builtin.cpu.arch.endian();
 
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-
-/// `THINDB_LZ4_CACHE_DECODED=1`: cache at-rest LZ4 string blocks DECODED
-/// (trading resident bytes for skipping the per-borrow whole-block
-/// decompress). A/B lever for concurrent-scan workloads that borrow the
-/// same blocks N times per query.
-fn cacheDecodedOverride() bool {
-    return getenv("THINDB_LZ4_CACHE_DECODED") != null;
-}
-
 /// Decode a packed fixed-width column block into a typed array. The on-disk
 /// layout is little-endian and contiguous, so on a little-endian host it is
 /// bit-identical to the in-memory `[]T` — one bulk copy at memory-bandwidth
@@ -114,16 +104,6 @@ pub const ReadSegment = struct {
             };
             const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, rg, column_idx);
             defer cc.release(entry);
-            // LZ4-at-rest entries decompress per use (into recycled scratch —
-            // a fresh alloc per access would re-fault freshly-zeroed pages
-            // every time); plain entries decode in place.
-            if (entry.compression == .lz4) {
-                const scratch = try cc.acquireScratch(entry.uncompressed_size);
-                defer cc.releaseScratch(scratch);
-                const plain = scratch[0..entry.uncompressed_size];
-                try compression_mod.lz4DecompressInto(entry.bytes, plain);
-                return decodeColumnPayload(allocator, col_type, plain, rg.row_count, flags, entry.encoding);
-            }
             return decodeColumnPayload(allocator, col_type, entry.bytes, rg.row_count, flags, entry.encoding);
         }
 
@@ -132,13 +112,12 @@ pub const ReadSegment = struct {
         return decodeBlock(allocator, block, 0, col_type, rg.row_count, flags);
     }
 
-    /// Cache-miss fill: pread the block and insert it pinned. Most blocks are
-    /// decompressed at fill (a hit costs only the decode); blocks the writer
-    /// flagged `at_rest` (large raw string blocks under `.lz4` tables) instead
-    /// cache the still-compressed payload — they trade a whole-block LZ4
-    /// decompress per access for a much smaller resident set. The persistent
-    /// payload lives in the cache's huge-page pool, so it's both allocated and
-    /// (on eviction) freed there.
+    /// Cache-miss fill: pread the block, decompress it and insert it pinned,
+    /// so a hit costs only the decode. Every block is cached decompressed
+    /// (still encoded — raw / FOR / dict / RLE / FSST); the resident set is the
+    /// LRU's problem, not a per-access decompress. The payload lives in the
+    /// cache's huge-page pool, so it's both allocated and (on eviction) freed
+    /// there.
     fn fillCacheEntry(
         self: ReadSegment,
         allocator: Allocator,
@@ -151,19 +130,6 @@ pub const ReadSegment = struct {
         defer allocator.free(block);
         const encoding = blockEncoding(block, 0);
         const block_alloc = cc.blockAllocator();
-
-        const kind_byte = block[0];
-        const flags = format.ColumnBlockFlags.fromByte(block[1]);
-        if (kind_byte == @intFromEnum(format.Compression.lz4) and flags.at_rest and !cacheDecodedOverride()) {
-            const uncompressed_size = format.readU32(block[4..8]);
-            const compressed_size = format.readU32(block[8..12]);
-            const payload_start = format.column_block_header_size;
-            const copy = try block_alloc.alignedAlloc(u8, .@"16", compressed_size);
-            errdefer block_alloc.free(copy);
-            @memcpy(copy, block[payload_start .. payload_start + compressed_size]);
-            return cc.insertPinnedCompressed(key, copy, encoding, .lz4, uncompressed_size);
-        }
-
         const raw = try getDecompressedBytes(block_alloc, block, 0);
         errdefer block_alloc.free(raw);
         return cc.insertPinned(key, raw, encoding);
@@ -185,8 +151,8 @@ pub const ReadSegment = struct {
         encoding: format.Encoding = .raw,
         entry: ?*storage_cache.Cache.Entry = null,
         owned: ?[]align(16) u8 = null,
-        /// `owned` came from the cache's scratch pool (LZ4-at-rest decompress)
-        /// rather than `allocator` — `release` returns it to the pool. Only set
+        /// `owned` came from the cache's scratch pool (FSST expansion) rather
+        /// than `allocator` — `release` returns it to the pool. Only set
         /// alongside a non-null cache.
         pooled: bool = false,
         /// Native-width expansion of a FOR-encoded block, allocated by the
@@ -230,24 +196,6 @@ pub const ReadSegment = struct {
                 .column_idx = @intCast(column_idx),
             };
             const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, rg, column_idx);
-            // LZ4-at-rest: decompress the whole block into recycled scratch
-            // and drop the pin immediately — the borrow then behaves exactly
-            // like the cacheless owned path, and every downstream consumer
-            // sees plain decompressed bytes. Scratch (not a fresh alloc): a
-            // per-access alloc re-faults freshly-zeroed pages on every borrow.
-            if (entry.compression == .lz4) {
-                const encoding = entry.encoding;
-                defer cc.release(entry);
-                const scratch = try cc.acquireScratch(entry.uncompressed_size);
-                errdefer cc.releaseScratch(scratch);
-                try compression_mod.lz4DecompressInto(entry.bytes, scratch[0..entry.uncompressed_size]);
-                return .{
-                    .bytes = scratch[0..entry.uncompressed_size],
-                    .encoding = encoding,
-                    .owned = scratch,
-                    .pooled = true,
-                };
-            }
             return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
         }
         const block = try self.readColumnBlock(allocator, rg, column_idx);
@@ -1179,10 +1127,10 @@ pub fn fsstViewOf(raw: []const u8, row_count: u32, flags: format.ColumnBlockFlag
 /// Expand a borrowed FSST block into the cache's recycled scratch pool —
 /// `[offsets (row_count+1 × u32)][bytes]` in one buffer — and return a
 /// borrowed string view over it. A fresh allocation per borrow re-faults
-/// freshly-zeroed pages on every scan `next()` (the same cost class the
-/// LZ4-at-rest scratch pool eliminated). The scratch rides `block.owned` /
-/// `block.pooled` and returns to the pool on `block.release`; the cache pin
-/// stays held (the nulls bitmap aliases the entry's bytes).
+/// freshly-zeroed pages on every scan `next()`; the recycled pool pays the
+/// page commit once. The scratch rides `block.owned` / `block.pooled` and
+/// returns to the pool on `block.release`; the cache pin stays held (the
+/// nulls bitmap aliases the entry's bytes).
 pub fn expandFsstPooled(
     block: *ReadSegment.BorrowedBlock,
     tc: storage_cache.TableCache,

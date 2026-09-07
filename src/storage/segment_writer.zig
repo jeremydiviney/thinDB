@@ -584,7 +584,7 @@ fn writeColumnBlock(
     else if (dict_eligible and try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
         .dict
     else if (table_compression == .lz4_fsst and
-        try tryEncodeFsst(allocator, &scratch, view, row_start, row_end, lz4_string_min_block_bytes, fsst_threads))
+        try tryEncodeFsst(allocator, &scratch, view, row_start, row_end, fsst_min_block_bytes, fsst_threads))
         .fsst
     else blk: {
         try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
@@ -594,19 +594,10 @@ fn writeColumnBlock(
     const raw_size: u32 = @intCast(scratch.items.len);
 
     // Block compression per the table's `compression` option (a kept block is
-    // only compressed when that actually shrinks it). Under `.lz4`, large raw
-    // string blocks are additionally flagged `at_rest`: the cache keeps them
-    // compressed and pays a whole-block decompress per access (LZ4 decodes at
-    // multi-GB/s), trading CPU for a much smaller resident set. Every other
-    // block — any algorithm — decompresses once at cache fill.
-    // Under `.lz4_fsst` an FSST block is the at-rest form itself: the cache
-    // holds the FSST bytes (decompressed once at fill if the on-disk LZ4
-    // wrapper below shrank them), never the raw expansion. Large raw string
-    // blocks FSST declined (ratio gate) fall back to LZ4-at-rest as in `.lz4`.
-    const want_at_rest = (table_compression == .lz4 or table_compression == .lz4_fsst) and
-        encoding == .raw and
-        isStringView(view) and scratch.items.len >= lz4_string_min_block_bytes;
-
+    // only compressed when that actually shrinks it). Every block — any
+    // algorithm — decompresses once at cache fill. Under `.lz4_fsst` the
+    // cache holds the FSST bytes (decompressed once at fill if the on-disk
+    // LZ4 wrapper below shrank them), never the raw expansion.
     var compressed: ?[]u8 = null;
     defer if (compressed) |c| allocator.free(c);
     var kind: format.Compression = .none;
@@ -628,10 +619,7 @@ fn writeColumnBlock(
     else
         raw_size;
 
-    const flags = format.ColumnBlockFlags{
-        .has_nulls = has_nulls,
-        .at_rest = want_at_rest and kind == .lz4,
-    };
+    const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls };
 
     // Header: kind (u8) + flags (u8) + encoding (u8) + 1 reserved + uncompressed_size (u32) + compressed_size (u32)
     try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + payload_size);
@@ -993,19 +981,9 @@ fn tryEncodeDict(
     return true;
 }
 
-/// Raw string blocks at least this large compress with LZ4HC and stay
-/// compressed in the block cache. Below it, the per-access decompress isn't
-/// worth the bookkeeping and zstd's ratio wins.
-const lz4_string_min_block_bytes: usize = 64 * 1024;
-
-/// True when the view is a string-family column (the LZ4 cache policy is
-/// strings-only: that's where the resident bytes live).
-fn isStringView(view: ColumnView) bool {
-    return switch (view.data) {
-        .varchar, .string, .char, .json => true,
-        else => false,
-    };
-}
+/// Raw string blocks at least this large are offered to FSST under
+/// `.lz4_fsst`; smaller blocks can't amortize the symbol table.
+const fsst_min_block_bytes: usize = 64 * 1024;
 
 /// Minimum average value length. Below this the per-row offset overhead
 /// dominates and symbols rarely cover enough to pay.
@@ -1031,9 +1009,8 @@ fn tryEncodeFsst(
     view: ColumnView,
     row_start: usize,
     row_end: usize,
-    /// Minimum raw string bytes before FSST is attempted. Callers pass the
-    /// same threshold that gates LZ4-at-rest — FSST replaces exactly that
-    /// tier; smaller blocks can't amortize the symbol table anyway.
+    /// Minimum raw string bytes before FSST is attempted; smaller blocks
+    /// can't amortize the symbol table.
     min_total_bytes: usize,
     /// Row-encode lanes (1 = serial). Lane splits are byte-balanced and
     /// contiguous, so the output is byte-identical at any lane count.

@@ -1,3 +1,58 @@
+# ClickBench 100M — 2026-09-05 rerun: decoded block cache vs main, DuckDB per-process
+
+- Same box, same `.clickbench-db` (`clickbench__public`, 99,997,497 rows, LZ4 at rest), both thinDB binaries ReleaseFast, `--max-dop 12 --query-memory-budget 32G`, default cache size (35% of RAM). Each thinDB arm ran the suite twice on a fresh server (best of 3 per query per pass); the table shows the better pass per query. DuckDB v1.4.4, threads=12, fresh process per query, best of 3.
+- **main (add919a): 16.7s. Decoded block cache (this branch): 15.0s. DuckDB: 48.7s.** thinDB faster than DuckDB on 29/43.
+- The decoded cache wins 12 queries outright, all of them scans over the wide string columns (URL, Title, Referer, SearchPhrase) that used to decompress per borrow: Q21 349→84 ms, Q22 768→95, Q27 1063→547, Q20 431→276, Q33/Q34 ~950→~800. Three int-key GROUP BYs (Q8, Q15, Q32) run 6-9% slower on both passes; the server's peak working set rose from 24.4 GB to 38.8 GB on this table (the decoded string blocks fill the 22 GiB cache budget), which is the likely cause.
+- Artifacts: `tests/bun/dop12_2026-09-05_main.json`, `tests/bun/dop12_2026-09-05_decoded_cache.json`, `bench/clickbench/duckdb/duck_isolated_12_2026-09-05.txt`.
+
+| Query | main ms | decoded cache ms | DuckDB ms | |
+|---|---:|---:|---:|:--|
+| Q0 | 0 | 0 | 0 |  |
+| Q1 | 5 | 5 | 2 |  |
+| Q2 | 0 | 0 | 12 |  |
+| Q3 | 0 | 0 | 15 |  |
+| Q4 | 215 | 226 | 231 |  |
+| Q5 | 208 | 180 | 500 | win |
+| Q6 | 0 | 0 | 4 |  |
+| Q7 | 3 | 3 | 3 |  |
+| Q8 | 336 | 358 | 287 |  |
+| Q9 | 382 | 389 | 369 |  |
+| Q10 | 68 | 69 | 113 |  |
+| Q11 | 73 | 73 | 118 |  |
+| Q12 | 170 | 130 | 512 | win |
+| Q13 | 392 | 356 | 1287 |  |
+| Q14 | 178 | 151 | 586 | win |
+| Q15 | 171 | 188 | 278 |  |
+| Q16 | 600 | 583 | 2013 |  |
+| Q17 | 608 | 573 | 1251 |  |
+| Q18 | 958 | 932 | 4727 |  |
+| Q19 | 8 | 8 | 3 |  |
+| Q20 | 431 | 276 | 704 | win |
+| Q21 | 349 | 84 | 679 | win |
+| Q22 | 768 | 95 | 1652 | win |
+| Q23 | 69 | 44 | 114 | win |
+| Q24 | 10 | 9 | 17 |  |
+| Q25 | 10 | 6 | 17 |  |
+| Q26 | 10 | 9 | 17 |  |
+| Q27 | 1063 | 547 | 735 | win |
+| Q28 | 5842 | 6297 | 6958 |  |
+| Q29 | 14 | 16 | 15 |  |
+| Q30 | 169 | 128 | 318 | win |
+| Q31 | 207 | 191 | 375 |  |
+| Q32 | 1124 | 1199 | 3621 |  |
+| Q33 | 950 | 822 | 10650 | win |
+| Q34 | 959 | 795 | 10079 | win |
+| Q35 | 150 | 154 | 318 |  |
+| Q36 | 39 | 24 | 23 |  |
+| Q37 | 27 | 21 | 13 |  |
+| Q38 | 22 | 11 | 10 |  |
+| Q39 | 82 | 61 | 49 | win |
+| Q40 | 6 | 7 | 5 |  |
+| Q41 | 15 | 15 | 6 |  |
+| Q42 | 13 | 13 | 6 |  |
+
+---
+
 # ClickBench 100M — thinDB vs DuckDB @ DOP 12 (corrected, fair)
 
 - Hardware: 12 physical / 24 logical cores, 64 GiB RAM. 100M-row hits table.

@@ -3,8 +3,9 @@
 //! evicts the coldest block process-wide regardless of which table owns it.
 //!
 //! Keyed by `(table_uid, segment_id, row_group_idx, column_idx)`. Value is the
-//! raw, decompressed (but not decoded) bytes of one column block. A cache hit
-//! still pays a cheap decode step but skips the expensive zstd decompress.
+//! decompressed (but still encoded) bytes of one column block — nothing in
+//! the cache is ever held compressed. A cache hit still pays a cheap decode
+//! step but skips the block decompress.
 //!
 //! Bounded by total cached bytes (`capacity_bytes`). The cache does NOT assume
 //! the dataset fits in memory: when over budget it evicts unpinned LRU entries,
@@ -133,12 +134,12 @@ pub const Cache = struct {
     /// bookkeeping; never across a decompress or decode.
     mutex: SpinLock = .{},
 
-    /// Reusable LZ4-decompress scratch buffers. LZ4-at-rest entries decompress
-    /// on EVERY access into a transient multi-MB buffer; a fresh heap alloc per
-    /// access hands back freshly-zeroed pages each time (the Windows soft-fault
-    /// storm the huge-page pool exists to kill for resident entries). A small
-    /// pool of recycled buffers pays the page-commit cost once and amortizes it
-    /// across every later access.
+    /// Reusable scratch buffers for transient per-borrow expansions (FSST
+    /// blocks expand to `[offsets][bytes]` on every access). A fresh heap alloc
+    /// per access hands back freshly-zeroed pages each time (the Windows
+    /// soft-fault storm the huge-page pool exists to kill for resident
+    /// entries); a small pool of recycled buffers pays the page-commit cost
+    /// once and amortizes it across every later access.
     scratch: [scratch_slots]?[]align(16) u8 = @splat(null),
     scratch_lock: SpinLock = .{},
 
@@ -147,7 +148,7 @@ pub const Cache = struct {
     misses: u64 = 0,
     evictions: u64 = 0,
 
-    /// 32 ≈ max-dop workers × a few concurrently-borrowed string columns; the
+    /// 32 ≈ max-dop workers × a few concurrently-expanded string columns; the
     /// pool self-bounds at the 32 largest hot block sizes (~5 MB each on the
     /// 100M ClickBench table → ~160 MB worst case, outside the cache budget).
     const scratch_slots = 32;
@@ -164,13 +165,6 @@ pub const Cache = struct {
         /// the decode path needs it to interpret `bytes` (raw vs FOR). Defaults
         /// to `.raw` so callers that don't set it (and tests) behave as before.
         encoding: format.Encoding = .raw,
-        /// `.lz4` ⟺ `bytes` is the still-compressed on-disk payload (large raw
-        /// string blocks stay compressed at rest in the cache — see
-        /// `format.Compression.lz4`); accessors must decompress to
-        /// `uncompressed_size` per use. `.none` ⟺ `bytes` is directly usable.
-        /// `.zstd` never appears here (zstd blocks are decompressed at fill).
-        compression: format.Compression = .none,
-        uncompressed_size: u32 = 0,
     };
 
     pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
@@ -207,7 +201,7 @@ pub const Cache = struct {
     }
 
     /// Check out a scratch buffer of at least `min_len` bytes for a transient
-    /// LZ4 decompress. Best-fit from the pool; on a dry pool, allocates rounded
+    /// expansion. Best-fit from the pool; on a dry pool, allocates rounded
     /// up to 1 MiB granularity so blocks of similar size reuse it later. Return
     /// the FULL slice via `releaseScratch` (callers slice to their length).
     pub fn acquireScratch(self: *Cache, min_len: usize) ![]align(16) u8 {
@@ -280,13 +274,6 @@ pub const Cache = struct {
     /// instead. On allocation failure the entry is not stored and `bytes` is left
     /// for the caller to free. Caller MUST `release`.
     pub fn insertPinned(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !*Entry {
-        return self.insertPinnedCompressed(key, bytes, encoding, .none, 0);
-    }
-
-    /// `insertPinned` variant for blocks cached at rest in compressed form
-    /// (`compression == .lz4`): `bytes` is the on-disk payload and
-    /// `uncompressed_size` its decompressed length.
-    pub fn insertPinnedCompressed(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding, compression: format.Compression, uncompressed_size: u32) !*Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -307,8 +294,6 @@ pub const Cache = struct {
             .next = null,
             .pins = 1,
             .encoding = encoding,
-            .compression = compression,
-            .uncompressed_size = uncompressed_size,
         };
 
         try self.map.put(self.allocator, key, entry);
