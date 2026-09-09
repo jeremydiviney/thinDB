@@ -327,7 +327,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
 
     // ---- Phase 1: sort (buildSortedSnapshot) ----
     const t_sort_start = Io.Clock.awake.now(io);
-    var snapshot = try t.memtable.buildSortedSnapshot(allocator, t.order_key_indices);
+    var snapshot = try t.memtable.buildSortedSnapshot(allocator, t.order_key_indices, 1);
     defer snapshot.deinit();
     const sort_ns = elapsedNs(io, t_sort_start);
 
@@ -339,7 +339,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
             .bigint => |s| s.len * 8,
             .boolean => |s| s.len,
             .varchar => |sv| sv.offsets.len * 4 + sv.bytes.len,
-            .string => |sv| sv.offsets.len * 4 + sv.bytes.len,
+            .string, .json => |sv| sv.offsets.len * 4 + sv.bytes.len,
             .float => |s| s.len * 4,
             .double => |s| s.len * 8,
             .date => |s| s.len * 4,
@@ -375,6 +375,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
         snapshot.views,
         &.{},
         false, // no fsync — measuring compress+write throughput, not durability
+        1,
     );
     defer info.deinit(allocator);
     const compress_and_write_ns = elapsedNs(io, t_write_start);

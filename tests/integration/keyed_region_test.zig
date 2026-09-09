@@ -11,7 +11,11 @@ const thindb = @import("thindb");
 const helpers = @import("sql_helpers.zig");
 
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
-    const db = try thindb.Database.open(allocator, io, dir, .{});
+    return setup_with_dop(allocator, io, dir, 1);
+}
+
+fn setup_with_dop(allocator: std.mem.Allocator, io: anytype, dir: anytype, dop: usize) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, io, dir, .{ .max_dop = dop });
     errdefer db.close();
     try helpers.exec(allocator, db,
         \\CREATE TABLE inv (
@@ -61,11 +65,28 @@ fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Datab
 /// so keyed and mono results compare with expectEqualStrings and a failure
 /// shows the exact diverging row.
 fn runToText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]u8 {
+    return run_to_text(allocator, db, sql, null);
+}
+
+fn run_to_text(allocator: std.mem.Allocator, db: anytype, sql: []const u8, region_column: ?[]const u8) ![]u8 {
     var q = try helpers.runSql(allocator, db, sql);
     defer q.deinit();
+    if (std.mem.indexOf(u8, sql, "KEYED BY") != null) {
+        const staged = thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, q.cq.query) orelse
+            return error.TestExpectedEqual;
+        var region_found = false;
+        for (staged.set.stages.items) |stage| {
+            if (region_column) |name| {
+                if (thindb.types.findColumn(stage.schema, name) == null) continue;
+            }
+            if (stage.is_keyed_region) region_found = true;
+        }
+        try std.testing.expect(region_found);
+    }
     const schema = q.outputSchema();
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
+    for (schema) |col| try out.print(allocator, "{s}:{any}\n", .{ col.name, col.type });
     while (try q.next()) |batch| {
         for (0..batch.row_count) |r| {
             for (schema, 0..) |col, ci| {
@@ -201,4 +222,452 @@ test "keyed region: declared block that violates the key contract is a hard erro
         \\)
         \\SELECT custLC, SUM(rn) AS s FROM r GROUP BY custLC ORDER BY custLC ASC
     , error.RegionKeyContractViolation);
+}
+
+fn expect_keyed_matches(allocator: std.mem.Allocator, db: *thindb.Database, comptime body: []const u8, region_column: []const u8) !void {
+    const mono = try runToText(allocator, db, "WITH " ++ body);
+    defer allocator.free(mono);
+    try std.testing.expect(mono.len > 0);
+    for (0..2) |_| {
+        const keyed = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, region_column);
+        defer allocator.free(keyed);
+        try std.testing.expectEqualStrings(mono, keyed);
+    }
+}
+
+test "keyed region: boundaries below joins retain duplicate matches and unmatched rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    inline for (.{
+        .{ "FULL", "p.custLC = d.custLC" },
+        .{ "INNER", "p.custLC = d.custLC AND p.month < d.month" },
+    }) |join_case| {
+        try expect_keyed_matches(allocator, db,
+            \\r AS (
+            \\  SELECT custLC, month, amount AS amt,
+            \\         ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+            \\  FROM inv WHERE projectId = 100
+            \\), j AS (
+            \\  SELECT p.custLC, p.month, p.amt, p.rn, d.month AS other_month
+            \\  FROM r p
+        ++ " " ++ join_case[0] ++ " JOIN inv d ON " ++ join_case[1] ++ "\n" ++
+            \\)
+            \\SELECT custLC, month, amt, rn, other_month FROM j
+            \\ORDER BY custLC, month, other_month
+        , "rn");
+    }
+}
+
+test "keyed region: cached inner boundaries preserve fresh outer joins and changed declarations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE sides (id INT PRIMARY KEY, custLC VARCHAR(32), extra INT)");
+    try helpers.exec(allocator, db, "INSERT INTO sides VALUES (1,'cust_0',7),(2,'outside',9)");
+    const side = try db.openTable("sides", .{});
+    try side.flush();
+    const body =
+        \\r AS (
+        \\  SELECT custLC, month, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\  FROM inv WHERE projectId = 100
+        \\), j AS (
+        \\  SELECT p.custLC, p.month, p.rn, d.extra
+        \\  FROM r p FULL JOIN sides d ON p.custLC = d.custLC
+        \\)
+        \\SELECT custLC, month, rn, extra FROM j ORDER BY custLC, month, extra
+    ;
+    const before = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, "rn");
+    defer allocator.free(before);
+    try expect_keyed_matches(allocator, db, body, "rn");
+    try helpers.exec(allocator, db, "INSERT INTO sides VALUES (1,'cust_0',17),(3,'cust_0',27)");
+    try side.flush();
+    try expect_keyed_matches(allocator, db, body, "rn");
+    const after = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, "rn");
+    defer allocator.free(after);
+    try std.testing.expect(!std.mem.eql(u8, before, after));
+    try helpers.expectRunError(allocator, db, "WITH KEYED BY (month) " ++ body, error.RegionKeyContractViolation);
+    try helpers.exec(allocator, db, "ALTER TABLE sides ADD COLUMN more INT DEFAULT 5");
+    try expect_keyed_matches(allocator, db, body, "rn");
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\  SELECT custLC, month, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\  FROM inv WHERE projectId = 100
+        \\), j AS (
+        \\  SELECT p.custLC, p.month, p.rn, d.rn AS other_rn
+        \\  FROM r p LEFT JOIN r d ON p.custLC = d.custLC
+        \\)
+        \\SELECT custLC, month, rn, other_rn FROM j ORDER BY custLC, month, other_rn
+    , "rn");
+}
+
+test "keyed region: entry computes replace input names without losing their source values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\  SELECT LOWER(custLC) AS custLC, month, amount + 9 AS amount,
+        \\         amount AS original_amount
+        \\  FROM inv WHERE projectId = 100
+        \\), w AS (
+        \\  SELECT *, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn FROM r
+        \\), m AS (
+        \\  SELECT custLC, month, SUM(amount) AS amt, SUM(original_amount) AS original, MAX(rn) AS rn
+        \\  FROM w GROUP BY custLC, month
+        \\)
+        \\SELECT custLC, month, amt, original, rn FROM m ORDER BY custLC, month
+    , "amt");
+}
+
+test "keyed region: consecutive entry projections preserve aliases and compute order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    inline for (.{
+        .{ .suffix = "", .region_column = "prior" },
+        .{ .suffix = " WHERE amount > 20", .region_column = "amount" },
+    }) |case| {
+        try expect_keyed_matches(allocator, db,
+            \\base AS (
+            \\  SELECT custLC, month, amount AS base_amount FROM inv WHERE projectId = 100
+            \\), adjusted AS (
+            \\  SELECT custLC, month, base_amount + 9 AS amount FROM base
+            \\), projected AS (
+            \\  SELECT custLC, month, amount AS total FROM adjusted
+        ++ case.suffix ++ "\n" ++
+            \\), w AS (
+            \\  SELECT custLC, month, total,
+            \\    LAG(total) OVER (PARTITION BY custLC ORDER BY month) AS prior
+            \\  FROM projected
+            \\)
+            \\SELECT custLC, month, total, prior FROM w ORDER BY custLC, month
+        , case.region_column);
+    }
+}
+
+test "keyed region: flexible TVF lets downstream windows choose finer ranges" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    const tdb = thindb.tdb;
+    const adjust = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "adjust", .execution = .either, .row_aligned = true };
+        pub const Input = struct { amount: ?i64 };
+        pub const Carry = struct { projectId: ?i64, custLC: ?[]const u8, month: ?i32 };
+        pub const Output = struct { projectId: ?i64, custLC: ?[]const u8, month: ?i32, adjusted: ?i64 };
+        pub const Computed = struct { adjusted: ?i64 };
+        pub const passthrough = .{ "projectId", "custLC", "month" };
+
+        pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Computed)) !void {
+            var rows = p.iter();
+            while (rows.next()) |row| {
+                try out.row(.{ .adjusted = if (row.amount) |amount| amount + 7 else null });
+            }
+        }
+    };
+    try db.registerTableFn(adjust);
+    inline for (.{ " WHERE projectId >= 100", " WHERE projectId = 100" }) |filter| {
+        inline for (.{ "projectId, custLC", "custLC" }) |partition| {
+            try expect_keyed_matches(allocator, db,
+                \\adjusted AS (
+                \\  SELECT * FROM TABLE(adjust((SELECT amount, projectId, custLC, month FROM inv
+            ++ filter ++
+                \\)) PARTITION BY custLC)
+                \\), w AS (
+                \\  SELECT projectId, custLC, month, adjusted,
+                \\    LAG(adjusted) OVER (PARTITION BY
+            ++ " " ++ partition ++
+                \\ ORDER BY month, projectId) AS prior
+                \\  FROM adjusted
+                \\)
+                \\SELECT * FROM w ORDER BY projectId, custLC, month
+            , "prior");
+        }
+    }
+}
+
+test "keyed region: TVF passthrough binds sources before computed output aliases" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    const tdb = thindb.tdb;
+    const adjust = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "adjust_alias", .execution = .either, .row_aligned = true };
+        pub const Input = struct { amount: ?i64 };
+        pub const Carry = struct { custLC: ?[]const u8, month: ?i32, original: ?i64 };
+        pub const Output = struct { amount: ?i64, custLC: ?[]const u8, month: ?i32, original: ?i64 };
+        pub const Computed = struct { amount: ?i64 };
+        pub const passthrough = .{ "custLC", "month", "original" };
+        pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Computed)) !void {
+            var rows = p.iter();
+            while (rows.next()) |row|
+                try out.row(.{ .amount = if (row.amount) |amount| amount + 7 else null });
+        }
+    };
+    var descriptor = tdb.descriptorFor(adjust);
+    var pairs: [3]thindb.udf.PassPair = undefined;
+    @memcpy(&pairs, descriptor.passthrough);
+    for (&pairs) |*pair| {
+        if (pair.out_idx == 3) pair.in_idx = 0;
+    }
+    descriptor.passthrough = &pairs;
+    try db.registerTableUdf(descriptor);
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT * FROM TABLE(adjust_alias((
+        \\   SELECT amount, custLC, month, amount + 100 AS original FROM inv WHERE projectId = 100
+        \\ )) PARTITION BY custLC)
+        \\), w AS (
+        \\ SELECT custLC, month, amount, original,
+        \\        LAG(original) OVER (PARTITION BY custLC ORDER BY month) AS prior
+        \\ FROM r
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, month
+    , "prior");
+}
+
+test "keyed region: LAG honors partition boundaries offsets source NULLs and independent orders" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try helpers.exec(allocator, db, "INSERT INTO inv VALUES (1001,100,'cust_0',9,NULL),(1002,100,'cust_0',8,400)");
+    const table = try db.openTable("inv", .{});
+    try table.flush();
+    inline for (.{ "0", "1", "3", "99" }) |offset| {
+        try expect_keyed_matches(allocator, db,
+            \\w AS (
+            \\  SELECT custLC, month, amount,
+            \\    ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn,
+            \\    LAG(amount,
+        ++ offset ++
+            \\) OVER (PARTITION BY custLC ORDER BY month DESC) AS lagged,
+            \\    LAG(custLC) OVER (PARTITION BY custLC ORDER BY amount, month DESC) AS prior_customer
+            \\  FROM inv WHERE projectId = 100
+            \\)
+            \\SELECT custLC, month, amount, rn, lagged, prior_customer FROM w ORDER BY custLC, month
+        , "lagged");
+    }
+}
+
+test "keyed region: BIGINT sums preserve widening and values beyond i64" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try helpers.exec(
+        allocator,
+        db,
+        "INSERT INTO inv VALUES (1001,100,'wide',1,9223372036854775807),(1002,100,'wide',1,9223372036854775807)",
+    );
+    const table = try db.openTable("inv", .{});
+    try table.flush();
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\  SELECT custLC, month, amount,
+        \\    ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY id) AS rn
+        \\  FROM inv WHERE projectId = 100
+        \\), m AS (
+        \\  SELECT custLC, month, SUM(amount) AS total, MAX(rn) AS rn
+        \\  FROM r GROUP BY custLC, month
+        \\)
+        \\SELECT custLC, month, total, rn FROM m ORDER BY custLC, month
+    , "total");
+}
+
+test "keyed region: shadowed filter keys do not retain stale literal values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\  SELECT projectId + 1 AS projectId, custLC, month, amount
+        \\  FROM inv WHERE projectId = 100
+        \\), w AS (
+        \\  SELECT projectId, custLC, month, amount,
+        \\    ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\  FROM r
+        \\), j AS (
+        \\  SELECT p.custLC, p.month, p.amount, p.rn, d.amount AS other_amount
+        \\  FROM w p LEFT JOIN inv d ON p.custLC = d.custLC AND p.projectId = d.projectId AND p.month = d.month
+        \\)
+        \\SELECT custLC, month, amount, rn, other_amount FROM j ORDER BY custLC, month
+    , "other_amount");
+}
+
+test "keyed region: LAG uses substituted offsets across cached executions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    const body =
+        \\w AS (
+        \\  SELECT custLC, month, LAG(amount, @distance) OVER (PARTITION BY custLC ORDER BY month) AS prior
+        \\  FROM inv WHERE projectId = 100
+        \\)
+        \\SELECT custLC, month, prior FROM w ORDER BY custLC, month
+    ;
+    inline for (.{ "1", "3", "3", "1" }) |offset| {
+        const prefix = "SET @distance = " ++ offset ++ "; WITH ";
+        const mono = try runToText(allocator, db, prefix ++ body);
+        defer allocator.free(mono);
+        const keyed = try run_to_text(allocator, db, prefix ++ "KEYED BY (custLC) " ++ body, "prior");
+        defer allocator.free(keyed);
+        try std.testing.expectEqualStrings(mono, keyed);
+    }
+}
+
+test "keyed region: UNION ALL preserves overlapping rows NULLs and downstream groups" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "INSERT INTO inv VALUES (1001,100,NULL,9,NULL),(1002,101,'cust_0',9,NULL)");
+    const table = try db.openTable("inv", .{});
+    try table.flush();
+    inline for (.{ "projectId = 100", "projectId = 101", "projectId = 999" }) |right_filter| {
+        try expect_keyed_matches(allocator, db,
+            \\u AS (
+            \\  SELECT custLC, id, month, amount FROM inv WHERE projectId = 100
+            \\  UNION ALL
+            \\  SELECT custLC, id, month, amount FROM inv WHERE
+        ++ " " ++ right_filter ++
+            \\), w AS (
+            \\  SELECT *, LAG(amount) OVER (PARTITION BY custLC, month ORDER BY id) AS prior FROM u
+            \\), g AS (
+            \\  SELECT custLC, month, SUM(amount) AS total, SUM(prior) AS previous
+            \\  FROM w GROUP BY custLC, month
+            \\)
+            \\SELECT * FROM g ORDER BY custLC, month
+        , "total");
+    }
+    const counts = try run_to_text(allocator, db,
+        \\WITH KEYED BY (custLC) u AS (
+        \\  SELECT custLC, month, amount FROM inv WHERE id = 1001
+        \\  UNION ALL SELECT custLC, month, amount FROM inv WHERE id = 1001
+        \\), g AS (SELECT custLC, SUM(month) AS n, SUM(amount) AS total FROM u GROUP BY custLC)
+        \\SELECT n, total FROM g
+    , "n");
+    defer allocator.free(counts);
+    try std.testing.expect(std.mem.endsWith(u8, counts, "18|~\n"));
+}
+
+test "keyed region: UNION ALL positional names numeric widening and ordered entry expressions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    inline for (.{ "projectId = 100", "projectId = 999" }) |left_filter| {
+        inline for (.{ "projectId = 101", "projectId = 999" }) |right_filter| {
+            try expect_keyed_matches(allocator, db,
+                \\u AS (
+                \\  SELECT custLC, id, month AS amount FROM inv WHERE
+            ++ " " ++ left_filter ++
+                \\  UNION ALL
+                \\  SELECT custLC AS other_key, id AS other_id, amount AS other_value FROM inv WHERE
+            ++ " " ++ right_filter ++
+                \\  UNION ALL
+                \\  SELECT custLC, id, amount FROM inv WHERE projectId = 999
+                \\), adjusted AS (
+                \\  SELECT custLC, id, amount + 7 AS amount, amount AS original FROM u
+                \\), filtered AS (
+                \\  SELECT custLC, id, amount AS total, original FROM adjusted WHERE amount > 8
+                \\), w AS (
+                \\  SELECT *, LAG(total) OVER (PARTITION BY custLC ORDER BY id) AS prior FROM filtered
+                \\)
+                \\SELECT * FROM w ORDER BY custLC, id
+            , "prior");
+        }
+    }
+}
+
+test "keyed region: UNION ALL shared materialized branches retain their SQL results" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    inline for (.{ "", "MATERIALIZED " }) |hint| {
+        try expect_keyed_matches(allocator, db, "base AS " ++ hint ++
+            \\(
+            \\  SELECT custLC, id, amount,
+            \\    ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY id) AS original_rank
+            \\  FROM inv WHERE projectId = 100
+            \\), u AS (
+            \\  SELECT custLC, id, amount, original_rank FROM base WHERE id < 20
+            \\  UNION ALL
+            \\  SELECT custLC, id, amount, original_rank FROM base WHERE id >= 20
+            \\), w AS (
+            \\  SELECT *, LAG(amount) OVER (PARTITION BY custLC ORDER BY id DESC) AS prior FROM u
+            \\)
+            \\SELECT * FROM w ORDER BY custLC, id
+        , "prior");
+    }
+}
+
+test "keyed region: UNION ALL cached executions refresh both branches and their schemas" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE right_arm (id BIGINT PRIMARY KEY, custLC VARCHAR(32), amount INT)");
+    try helpers.exec(allocator, db, "INSERT INTO right_arm VALUES (1001,'cust_0',900)");
+    const right = try db.openTable("right_arm", .{});
+    try right.flush();
+    const body =
+        \\u AS (
+        \\  SELECT custLC, id, month AS amount FROM inv WHERE projectId = 100
+        \\  UNION ALL SELECT custLC, id, amount FROM right_arm
+        \\), w AS (
+        \\  SELECT *, LAG(amount) OVER (PARTITION BY custLC ORDER BY id DESC) AS prior FROM u
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, id
+    ;
+    try expect_keyed_matches(allocator, db, body, "prior");
+    try helpers.exec(allocator, db, "INSERT INTO right_arm VALUES (1002,'cust_0',NULL),(1003,NULL,901)");
+    try right.flush();
+    try expect_keyed_matches(allocator, db, body, "prior");
+    try helpers.exec(allocator, db, "INSERT INTO inv VALUES (2001,100,'cust_0',9,1234)");
+    const left = try db.openTable("inv", .{});
+    try left.flush();
+    try expect_keyed_matches(allocator, db, body, "prior");
+    try helpers.exec(allocator, db, "ALTER TABLE right_arm ADD COLUMN extra BIGINT DEFAULT 4");
+    try expect_keyed_matches(allocator, db, body, "prior");
+    try helpers.exec(allocator, db, "DROP TABLE right_arm");
+    try helpers.exec(allocator, db, "CREATE TABLE right_arm (id BIGINT PRIMARY KEY, custLC VARCHAR(32), amount BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO right_arm VALUES (1001,'cust_0',9223372036854775807)");
+    const replacement = try db.openTable("right_arm", .{});
+    try replacement.flush();
+    try expect_keyed_matches(allocator, db, body, "prior");
+    try helpers.expectRunError(allocator, db, "WITH KEYED BY (id) " ++ body, error.RegionUnsupportedConstruct);
+    try helpers.expectRunError(allocator, db,
+        \\WITH KEYED BY (custLC) u AS (
+        \\  SELECT custLC, amount FROM inv UNION ALL SELECT custLC FROM right_arm
+        \\), g AS (SELECT custLC, SUM(amount) AS total FROM u GROUP BY custLC)
+        \\SELECT * FROM g
+    , error.RegionUnsupportedConstruct);
 }

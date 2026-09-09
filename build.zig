@@ -150,6 +150,7 @@ pub fn build(b: *std.Build) void {
     });
     thindb_fast.linkLibrary(fast_zstd.artifact("zstd"));
     thindb_fast.linkLibrary(lz4_dep.artifact("lz4"));
+    thindb_fast.addOptions("build_options", build_opts);
 
     // ---- Benchmarks: bench/main.zig ----------------------------------------
     const bench_mod = b.createModule(.{
@@ -174,6 +175,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run benchmarks (always built ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    const region_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/window_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    region_bench_mod.addImport("thindb", thindb_fast);
+    const region_bench = b.addExecutable(.{ .name = "thindb_region_bench", .root_module = region_bench_mod });
+    const run_region_bench = b.addRunArtifact(region_bench);
+    b.step("bench-regions", "Compare staged and keyed SQL window pipelines (ReleaseFast)").dependOn(&run_region_bench.step);
 
     // ---- Isolated GROUP BY probe microbench: bench/groupby_micro.zig -------
     // Standalone (imports group_table.zig directly — no thindb module), so it
