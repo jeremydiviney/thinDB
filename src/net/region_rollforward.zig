@@ -78,25 +78,20 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     var cur = root;
     var depth: usize = 0;
     const top: *const ir.Op = blk: {
-        while (depth < 16) : (depth += 1) {
+        while (depth < 256) : (depth += 1) {
             switch (cur.*) {
                 .materialize => |m| {
                     if (m.region_keys != null) break :blk cur;
                     cur = m.upstream;
                 },
-                .select => |p| cur = p.upstream,
-                .exclude => |p| cur = p.upstream,
-                .filter => |f| cur = f.upstream,
-                .group_by => |g| cur = g.upstream,
-                .compute => |c| cur = c.upstream,
-                .limit => |l| cur = l.upstream,
-                .order_by => |o| cur = o.upstream,
-                else => return null,
+                else => cur = region_spine_upstream(cur) orelse return null,
             }
         }
         return null;
     };
     const keys = top.materialize.region_keys.?;
+    const declaration_hash = hash_declaration(input, top);
+    if (try_cached_declaration(input, top, keys, declaration_hash)) |recognized| return recognized;
 
     // Compile: try the marked boundary, then boundaries below it — the
     // program anchor can sit under the outermost CTE (e.g. when the final
@@ -111,7 +106,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     var any_conforming = false;
     cur = top;
     depth = 0;
-    while (depth < 16) : (depth += 1) {
+    while (depth < 256) : (depth += 1) {
         switch (cur.*) {
             .materialize => |m| {
                 const conforms = blk: {
@@ -128,10 +123,11 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                     // can benignly rewrite IR (scalar resolution), and a
                     // recomputed hash would never match its own store.
                     const bh = hashAnchor(cur);
-                    if (tryCachedAt(input, cur, bh)) |q| {
+                    const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = depth } else null;
+                    if (tryCachedAt(input, cur, bh, declaration)) |q| {
                         return .{ .anchor = cur, .query = q };
                     }
-                    if (buildRegion(input, cur, keys, bh)) |q| {
+                    if (buildRegion(input, cur, keys, bh, declaration)) |q| {
                         return .{ .anchor = cur, .query = q };
                     } else |e| {
                         if (e == error.OutOfMemory) return e;
@@ -150,14 +146,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                 }
                 cur = m.upstream;
             },
-            .select => |p| cur = p.upstream,
-            .exclude => |p| cur = p.upstream,
-            .filter => |f| cur = f.upstream,
-            .group_by => |g| cur = g.upstream,
-            .compute => |c| cur = c.upstream,
-            .limit => |l| cur = l.upstream,
-            .order_by => |o| cur = o.upstream,
-            else => break,
+            else => cur = region_spine_upstream(cur) orelse break,
         }
     }
     if (!any_conforming) {
@@ -166,6 +155,23 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     }
     std.debug.print("[region] KEYED BY block did not compile: no conforming boundary matches a supported region shape\n", .{});
     return error.RegionUnsupportedConstruct;
+}
+
+fn region_spine_upstream(op: *const ir.Op) ?*const ir.Op {
+    return switch (op.*) {
+        .materialize => |m| m.upstream,
+        .select, .exclude => |p| p.upstream,
+        .filter => |f| f.upstream,
+        .group_by => |g| g.upstream,
+        .compute => |c| c.upstream,
+        .alias => |a| a.upstream,
+        .limit => |l| l.upstream,
+        .order_by => |o| o.upstream,
+        .window => |w| w.upstream,
+        .join => |j| j.left,
+        .table_fn => |t| if (t.inputs.len > 0) t.inputs[0] else null,
+        else => null,
+    };
 }
 
 /// Static half of the contract: walk the block's pipeline (left/primary
@@ -241,6 +247,7 @@ const Unhashable = error.RegionUnhashable;
 
 const TableVersion = struct { name: []const u8, version: u64 };
 const KernelCheck = struct { name: []const u8, process: udf_mod.TvfProcess };
+const DeclaredBoundary = struct { hash: u64, depth: usize };
 
 /// CAS spinlock (std.Thread.Mutex is gone in Zig 0.16; Io.Mutex would drag
 /// an Io through the recognizer). Critical sections here are flag flips —
@@ -358,11 +365,39 @@ fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
     var h = std.hash.Wyhash.init(0x7461626c65);
-    // Temp tables: gen/row counters restart on DROP+CREATE, so identical
-    // counts with DIFFERENT contents would validate a stale drained block.
-    // The instance pointer makes every recreation an invalidation; only
-    // same-session reuse of the same temp instance can hit.
-    if (is_temp) hu(&h, @intFromPtr(t));
+    if (is_temp) {
+        // Recreated small lookup tables can retain a program and its worker
+        // state only when their complete schema and ordered contents match.
+        // Counters restart, and allocator reuse makes pointer identity unsafe.
+        if (t.manifest.segments.items.len != 0 or t.memtable.row_count > 16384 or
+            t.memtable.byteSize() > 4 * 1024 * 1024) return null;
+        hu(&h, 1);
+        hu(&h, t.memtable.row_count);
+        hu(&h, @intFromBool(t.schema.unique));
+        hu(&h, t.schema.order_key.len);
+        for (t.schema.order_key) |key| hstr(&h, key);
+        hu(&h, t.schema.columns.len);
+        for (t.schema.columns, t.memtable.columns) |col, store| {
+            hstr(&h, col.name);
+            hashType(&h, col.type);
+            hu(&h, @intFromBool(col.nullable));
+            const view = store.view();
+            if (view.nulls) |bits| {
+                hu(&h, 1);
+                h.update(bits[0..@intCast((t.memtable.row_count + 7) / 8)]);
+            } else hu(&h, 0);
+            switch (view.data) {
+                .varchar, .string, .char, .json => |strings| {
+                    h.update(std.mem.sliceAsBytes(strings.offsets));
+                    hu(&h, strings.bytes.len);
+                    h.update(strings.bytes);
+                },
+                inline else => |values| h.update(std.mem.sliceAsBytes(values)),
+            }
+        }
+        return h.final();
+    }
+    hu(&h, 0);
     hu(&h, t.memtable_gen);
     hu(&h, t.memtable.row_count);
     for (t.manifest.segments.items) |e| {
@@ -438,7 +473,38 @@ fn cacheValid(input: engine_v2.CompileInput, ctx: *Ctx) bool {
     return true;
 }
 
-fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash: ?u64) ?exec.Query {
+fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys: []const []const u8, declaration_hash: ?u64) ?Recognized {
+    const hash = declaration_hash orelse {
+        if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] declaration unhashable: search boundaries\n", .{});
+        return null;
+    };
+    const cache = cacheFor(input.db) orelse return null;
+    const selected = blk: {
+        cache.mu.lock();
+        defer cache.mu.unlock();
+        if (cache.busy) return null;
+        const ctx = cache.ctx orelse return null;
+        const declaration = ctx.declaration orelse return null;
+        if (declaration.hash != hash) {
+            if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] declaration cache miss: hash {x} vs stored {x}\n", .{ hash, declaration.hash });
+            return null;
+        }
+        break :blk .{ .depth = declaration.depth, .anchor_hash = cache.hash };
+    };
+    var anchor = top;
+    for (0..selected.depth) |_| anchor = region_spine_upstream(anchor) orelse return null;
+    if (anchor.* != .materialize) return null;
+    verifyKeyContract(anchor, keys, 0) catch return null;
+    // Failed outer candidates can drain whole join inputs. The unchanged
+    // declaration identifies the subtree BEFORE those drains rewrite shared
+    // IR. Its current anchor hash need not match the post-drain cache hash;
+    // tryCachedAt uses the stored hash to identify the program, then checks
+    // kernel/table versions and rebuilds scans against fresh snapshots.
+    const query = tryCachedAt(input, anchor, selected.anchor_hash, null) orelse return null;
+    return .{ .anchor = anchor, .query = query };
+}
+
+fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
     const hash = anchor_hash orelse return null;
     const cache = cacheFor(input.db) orelse return null;
 
@@ -479,6 +545,7 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash:
         Cache.releaseErased(cache);
         return null;
     };
+    if (declaration) |d| ctx.declaration = d;
     op.setOwnedCtx(cache, Cache.releaseErased);
     if (getenv("THINDB_REGION_TRACE") != null) {
         std.debug.print("[region] cache hit — pooled run (retained ~{d}MB)\n", .{ctx.pool.retainedBytes() >> 20});
@@ -498,28 +565,23 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     defer prune_leaves.deinit(qa);
     try collectAndLeaves(qa, pl.entry_filter, &prune_leaves);
 
-    const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
+    const table = switch (pl.entry) {
+        .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
+        .union_all => null,
+    };
     // Same entry transformation as the build path — the cached program's
     // entry schema was derived post-hoist.
-    try hoistEntryComputes(input.node_arena, table, &pl);
+    if (table) |t| try hoistEntryComputes(input.node_arena, t, &pl);
 
-    var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer scan_cols.deinit(qa);
-    var scan_cols_opt: ?[]const []const u8 = null;
-    if (pl.entry_sel) |sel| {
-        outer: for (sel.columns) |col| {
-            for (pl.entry_derived) |d| {
-                if (std.ascii.eqlIgnoreCase(d.name, col)) continue :outer;
-            }
-            try scan_cols.append(qa, col);
-        }
-        scan_cols_opt = scan_cols.items;
-    }
+    const scan_cols_opt = try entry_scan_columns(input.node_arena, pl);
     const n_threads = @max(input.effectiveDop(), 1);
-    const bs = if (ctx.opts.ordered)
-        try buildOrderedSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, ctx.opts.n_threads, lastSegment(anchor.materialize.region_keys.?[0]))
-    else
-        try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
+    const bs = switch (pl.entry) {
+        .union_all => |root| try build_union_source(input, root),
+        .scan => if (ctx.opts.ordered)
+            try buildOrderedSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, ctx.opts.n_threads, lastSegment(anchor.materialize.region_keys.?[0]))
+        else
+            try buildScanSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads),
+    };
     // Interval count is deterministic given identical data versions (the
     // hit precondition); a drift means the snapshot changed under us.
     if (ctx.opts.ordered and bs.sources.len != ctx.opts.n_shards) {
@@ -534,6 +596,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     };
 
     const scan_schema = bs.sources[0].outputSchema();
+    const entry_derived = try rename_entry_outputs(input.node_arena, scan_schema, pl.entry_derived);
     const want = ctx.entry_schema;
     if (scan_schema.len + pl.entry_derived.len != want.len) {
         if (getenv("THINDB_REGION_TRACE") != null) {
@@ -546,7 +609,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         if (!std.meta.eql(src.type, w.type)) return NoMatch;
         if (!w.nullable) return NoMatch; // entry cols are always forced nullable
     }
-    for (pl.entry_derived, want[scan_schema.len..]) |d, w| {
+    for (entry_derived, want[scan_schema.len..]) |d, w| {
         if (!std.ascii.eqlIgnoreCase(d.name, w.name)) return NoMatch;
     }
 
@@ -591,12 +654,12 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         qa,
         ctx.entry_schema,
         bs.sources,
-        pl.entry_derived,
+        entry_derived,
         op_sides,
         &ctx.prog,
         opts,
         &ctx.pool,
-        bs.total_rows * 2,
+        bs.total_rows *| 2,
     );
     sources_owned = false;
     sides_owned = false;
@@ -614,6 +677,51 @@ fn hashAnchor(anchor: *const ir.Op) ?u64 {
     var h = std.hash.Wyhash.init(0x726567696f6e);
     hashOp(&h, anchor) catch return null;
     return h.final();
+}
+
+fn hash_declaration(input: engine_v2.CompileInput, top: *const ir.Op) ?u64 {
+    var h = std.hash.Wyhash.init(0x6465636c617265);
+    hashOp(&h, top) catch return null;
+    // An outer candidate may resolve a data-dependent expression in shared
+    // IR before declining. Cover its source tables even when the selected
+    // inner program no longer references them after that resolution.
+    hash_declaration_sources(input, &h, top) catch return null;
+    return h.final();
+}
+
+fn hash_declaration_sources(input: engine_v2.CompileInput, h: *std.hash.Wyhash, node: *const ir.Op) error{RegionUnhashable}!void {
+    switch (node.*) {
+        .scan => |s| {
+            if (s.table.database) |db| if (!std.ascii.eqlIgnoreCase(db, input.db.name)) return Unhashable;
+            if (s.table.schema) |schema| if (!std.ascii.eqlIgnoreCase(schema, "public")) return Unhashable;
+            hu(h, tableVersionOf(input, s.table.name) orelse return Unhashable);
+        },
+        .materialize => |m| try hash_declaration_sources(input, h, m.upstream),
+        .alias => |a| try hash_declaration_sources(input, h, a.upstream),
+        .select, .exclude => |p| try hash_declaration_sources(input, h, p.upstream),
+        .filter => |f| try hash_declaration_sources(input, h, f.upstream),
+        .group_by => |g| try hash_declaration_sources(input, h, g.upstream),
+        .compute => |c| try hash_declaration_sources(input, h, c.upstream),
+        .limit => |l| try hash_declaration_sources(input, h, l.upstream),
+        .order_by => |o| try hash_declaration_sources(input, h, o.upstream),
+        .window => |w| try hash_declaration_sources(input, h, w.upstream),
+        .join => |j| {
+            try hash_declaration_sources(input, h, j.left);
+            try hash_declaration_sources(input, h, j.right);
+        },
+        .set_union => |u| {
+            try hash_declaration_sources(input, h, u.left);
+            try hash_declaration_sources(input, h, u.right);
+        },
+        .table_fn => |t| {
+            const registry = input.udf_registry orelse return Unhashable;
+            const entry = registry.tableByName(t.name) orelse return Unhashable;
+            h.update(std.mem.asBytes(&entry.process));
+            for (t.inputs) |source| try hash_declaration_sources(input, h, source);
+        },
+        .single_row => {},
+        else => return Unhashable,
+    }
 }
 
 fn hu(h: *std.hash.Wyhash, v: u64) void {
@@ -1004,6 +1112,7 @@ const Ctx = struct {
     /// table a compile-time drain consumed, and the kernel identities.
     entry_schema: []const Column = &.{},
     opts: region.DriverOpts = undefined,
+    declaration: ?DeclaredBoundary = null,
     /// Ordered mode: measured per-interval cost, filled by the first run
     /// and frozen — LPT weights for every later hit (arena-owned).
     iv_cost: []i64 = &.{},
@@ -1391,17 +1500,24 @@ const Builder = struct {
     }
 
     fn applySelect(b: *Builder, p: *const ir.Op.Project) !void {
-        var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
-        for (p.columns, 0..) |col, i| {
+        for (p.columns) |col| {
+            if (std.mem.eql(u8, col, "*") or std.mem.endsWith(u8, col, ".*")) continue;
             if (b.fb.resolve(col) == null) _ = try b.tryNullAppend(col);
+        }
+        const schema = try b.a.alloc(Column, b.fb.vis.items.len);
+        for (b.fb.vis.items, schema) |visible, *col| {
+            col.* = b.fb.cols.items[visible.idx];
+            col.name = visible.name;
+        }
+        const names = try @import("local.zig").resolve_select_project(b.a, schema, p.*);
+        defer names.deinit(b.a);
+        var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
+        for (names.sources, names.outputs) |col, output| {
             const e = b.fb.resolve(col) orelse return NoMatch;
-            var out_name: []const u8 = e.name;
-            if (p.outputs) |outs| {
-                if (i < outs.len) {
-                    if (outs[i]) |o| out_name = o;
-                }
+            for (new_vis.items) |prior| {
+                if (types.columnNameEql(prior.name, output)) return NoMatch;
             }
-            try new_vis.append(b.a, .{ .name = try b.a.dupe(u8, out_name), .idx = e.idx });
+            try new_vis.append(b.a, .{ .name = try b.a.dupe(u8, output), .idx = e.idx });
         }
         try b.flushPending();
         b.fb.vis = new_vis;
@@ -1698,13 +1814,18 @@ const Pipeline = struct {
     /// during the scatter, before the exchange.
     entry_derived: []const Derived,
     entry_filter: PredicateExpr,
-    scan: *const ir.Op.Scan,
+    entry: union(enum) {
+        scan: *const ir.Op.Scan,
+        union_all: *const ir.Op,
+    },
 };
 
 fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
     if (anchor.* != .materialize) return NoMatch;
     var steps: std.ArrayListUnmanaged(Step) = .empty;
     var cur: *const ir.Op = anchor.materialize.upstream;
+    var entry_root = cur;
+    var structural_end: usize = 0;
     var guard: usize = 0;
     const scan: *const ir.Op.Scan = blk: while (guard < 512) : (guard += 1) {
         switch (cur.*) {
@@ -1732,24 +1853,45 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
             .group_by => |*g| {
                 try steps.append(a, .{ .group_by = g });
                 cur = g.upstream;
+                entry_root = cur;
+                structural_end = steps.items.len;
             },
             .window => |*w| {
                 try steps.append(a, .{ .window = w });
                 cur = w.upstream;
+                entry_root = cur;
+                structural_end = steps.items.len;
             },
             .join => |*j| {
                 try steps.append(a, .{ .join = j });
                 cur = j.left;
+                entry_root = cur;
+                structural_end = steps.items.len;
             },
             .table_fn => |*t| {
                 if (t.inputs.len == 0) return NoMatch;
                 try steps.append(a, .{ .table_fn = t });
                 cur = t.inputs[0];
+                entry_root = cur;
+                structural_end = steps.items.len;
             },
             .set_union => |*u| {
-                const arm = unionTvfArm(u) orelse return NoMatch;
+                const arm = unionTvfArm(u) orelse {
+                    if (!u.all or structural_end == 0) return NoMatch;
+                    // Keep the entry's projections and filters in their SQL
+                    // order, including positional aliases and union casts.
+                    return .{
+                        .steps = steps.items[0..structural_end],
+                        .entry_sel = null,
+                        .entry_derived = &.{},
+                        .entry_filter = .{ .@"and" = &.{} },
+                        .entry = .{ .union_all = entry_root },
+                    };
+                };
                 try steps.append(a, .{ .union_tvf = arm.ut });
                 cur = arm.base;
+                entry_root = cur;
+                structural_end = steps.items.len;
             },
             .scan => |*s| break :blk s,
             else => return NoMatch,
@@ -1765,6 +1907,18 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
             .select, .compute, .filt => {},
             else => break,
         }
+    }
+    var first_projection: ?usize = null;
+    var entry_index = steps.items.len;
+    while (entry_index > split) : (entry_index -= 1) {
+        if (steps.items[entry_index - 1] != .select) continue;
+        if (first_projection) |first| {
+            // Later projections may rename inputs used by intervening
+            // computes or filters. Keep their evaluation order in-region.
+            split = first;
+            break;
+        }
+        first_projection = entry_index - 1;
     }
     var entry_sel: ?*const ir.Op.Project = null;
     var entry_derived: std.ArrayListUnmanaged(Derived) = .empty;
@@ -1792,7 +1946,7 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
         .entry_sel = entry_sel,
         .entry_derived = entry_derived.items,
         .entry_filter = entry_filter,
-        .scan = scan,
+        .entry = .{ .scan = scan },
     };
 }
 
@@ -1882,7 +2036,58 @@ fn hoistEntryComputes(na: Allocator, table: anytype, pl: *Pipeline) !void {
     }
 }
 
-fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64) anyerror!exec.Query {
+fn entry_scan_columns(arena: Allocator, pl: Pipeline) !?[]const []const u8 {
+    const sel = pl.entry_sel orelse return null;
+    for (sel.columns) |col| {
+        if (std.mem.eql(u8, col, "*") or std.mem.endsWith(u8, col, ".*")) return null;
+    }
+    var columns: std.ArrayListUnmanaged([]const u8) = .empty;
+    outer: for (sel.columns) |col| {
+        for (pl.entry_derived) |d| {
+            if (types.columnNameEql(d.name, col)) continue :outer;
+        }
+        try columns.append(arena, col);
+    }
+    // A replacement still reads its original input, even when SELECT only
+    // exposes the replacement. Scatter computes need those hidden inputs.
+    for (pl.entry_derived) |d| try compute_mod.collectColumnRefs(arena, &columns, d.expr);
+    return columns.items;
+}
+
+fn rename_entry_outputs(arena: Allocator, scan_schema: []const Column, derived: []const Derived) ![]const Derived {
+    if (derived.len == 0) return derived;
+    const renamed = try arena.dupe(Derived, derived);
+    errdefer arena.free(renamed);
+    var next_id: usize = 0;
+    for (derived, renamed, 0..) |d, *dst, i| {
+        for (derived[0..i]) |prior| {
+            if (types.columnNameEql(prior.name, d.name)) return NoMatch;
+        }
+        if (types.findColumn(scan_schema, d.name) == null) continue;
+        // Compute replaces matching output slots; the region frame must
+        // retain the original slots and append every scatter-time output.
+        while (true) {
+            const name = try std.fmt.allocPrint(arena, "__region_entry_{d}", .{next_id});
+            next_id += 1;
+            const used = blk: {
+                if (types.findColumn(scan_schema, name) != null) break :blk true;
+                for (derived) |other| {
+                    if (types.columnNameEql(other.name, name)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (used) {
+                arena.free(name);
+                continue;
+            }
+            dst.name = name;
+            break;
+        }
+    }
+    return renamed;
+}
+
+fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) anyerror!exec.Query {
     var tm: i64 = exec.prof.nowTicks();
     const registry = input.udf_registry orelse return NoMatch;
 
@@ -1899,6 +2104,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         .gpa = gpa,
         .arena = std.heap.ArenaAllocator.init(gpa),
         .pool = region.RegionPool.init(gpa, poolCapBytes()),
+        .declaration = declaration,
     };
     errdefer Ctx.destroyErased(ctx);
     const a = ctx.arena.allocator();
@@ -1922,21 +2128,14 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
     try collectAndLeaves(a, pl.entry_filter, &prune_leaves);
 
-    const table = input.db.openTable(pl.scan.table.name, .{}) catch return NoMatch;
+    const table = switch (pl.entry) {
+        .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
+        .union_all => null,
+    };
 
-    try hoistEntryComputes(input.node_arena, table, &pl);
+    if (table) |t| try hoistEntryComputes(input.node_arena, t, &pl);
 
-    var scan_cols: std.ArrayListUnmanaged([]const u8) = .empty;
-    var scan_cols_opt: ?[]const []const u8 = null;
-    if (pl.entry_sel) |sel| {
-        outer: for (sel.columns) |col| {
-            for (pl.entry_derived) |d| {
-                if (std.ascii.eqlIgnoreCase(d.name, col)) continue :outer;
-            }
-            try scan_cols.append(a, col);
-        }
-        scan_cols_opt = scan_cols.items;
-    }
+    const scan_cols_opt = try entry_scan_columns(input.node_arena, pl);
 
     const dop = input.effectiveDop();
     const n_threads = @max(dop, 1);
@@ -1963,10 +2162,11 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         // need. Flip default once ops run directly over sorted interval
         // stores.
         if (getenv("THINDB_REGION_ORDERED") == null) break :blk false;
+        const t = table orelse break :blk false;
         for (pl.entry_derived) |d| {
             if (std.ascii.eqlIgnoreCase(d.name, lastSegment(declared_keys[0]))) break :blk false;
         }
-        const ok = table.schema.order_key;
+        const ok = t.schema.order_key;
         var oi: usize = 0;
         outer: while (oi < ok.len) : (oi += 1) {
             for (prune_leaves.items) |l| {
@@ -1982,10 +2182,16 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     };
 
     b.order_aligned = order_aligned;
-    const bs = if (order_aligned)
-        try buildOrderedSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads, lastSegment(declared_keys[0]))
-    else
-        try buildScanSources(input, table, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads);
+    const bs = switch (pl.entry) {
+        .union_all => |root| blk: {
+            recordSubtreeVersions(&b, root);
+            break :blk try build_union_source(input, root);
+        },
+        .scan => if (order_aligned)
+            try buildOrderedSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads, lastSegment(declared_keys[0]))
+        else
+            try buildScanSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads),
+    };
     const sources = bs.sources;
     const total_rows = bs.total_rows;
     const iv_rows_est = bs.iv_rows;
@@ -2001,6 +2207,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     // ---- entry schema = scan output ++ entry-computed columns ------------
     const scan_schema = sources[0].outputSchema();
+    const entry_derived = try rename_entry_outputs(input.node_arena, scan_schema, pl.entry_derived);
     const entry_schema = try a.alloc(Column, scan_schema.len + pl.entry_derived.len);
     for (scan_schema, entry_schema[0..scan_schema.len]) |src, *dst| {
         dst.* = src;
@@ -2012,19 +2219,21 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         // the bitmap cost negligible.
         dst.nullable = true;
     }
-    const rowloc_entry = scan_schema.len - 1;
+    const rowloc_entry: ?usize = if (pl.entry == .scan) scan_schema.len - 1 else null;
     if (pl.entry_derived.len > 0) {
         // Engine-exact types for the scatter-time computes; forced nullable
         // (kernel-appended rows NULL-pad every entry-derived column).
-        const typed = region.computeOutputSchema(qa, a, scan_schema, pl.entry_derived, registry) catch return NoMatch;
+        const typed = region.computeOutputSchema(qa, a, scan_schema, entry_derived, registry) catch return NoMatch;
         if (typed.len != scan_schema.len + pl.entry_derived.len) return NoMatch;
-        for (pl.entry_derived, typed[scan_schema.len..], entry_schema[scan_schema.len..]) |d, t, *dst| {
+        for (entry_derived, typed[scan_schema.len..], entry_schema[scan_schema.len..]) |d, t, *dst| {
             dst.* = .{ .name = try a.dupe(u8, d.name), .type = t.type, .nullable = true };
         }
     }
     for (entry_schema, 0..) |col, i| {
         _ = try b.fb.addColNamed(col.name, col.type, col.nullable);
-        try b.fb.setVis(col.name, i);
+        if (i == rowloc_entry) continue;
+        const visible_name = if (i < scan_schema.len) col.name else pl.entry_derived[i - scan_schema.len].name;
+        try b.fb.setVis(visible_name, i);
     }
     ctx.entry_schema = entry_schema;
 
@@ -2032,13 +2241,16 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     // Literal-pinned entry columns: an eq-literal conjunct in the scan
     // filter makes the column a per-run constant — groupings and span
     // merges may skip it, and probe key pairs against it eliminate.
-    for (prune_leaves.items) |l| {
+    pinned: for (prune_leaves.items) |l| {
         if (l.op != .eq) continue;
         if (b.fb.resolve(l.col) == null) continue;
+        for (pl.entry_derived) |d| {
+            if (types.columnNameEql(lastSegment(d.name), lastSegment(l.col))) continue :pinned;
+        }
         try b.pinned.append(a, .{ .name = try a.dupe(u8, l.col), .val = l.val });
     }
 
-    // ---- range/order contract from the bottom-most partitioned step ------
+    // ---- range/order contract from the first granularity-sensitive step --
     var range_names: []const []const u8 = declared_keys;
     var order_specs: []const ir.SortSpec = &.{};
     {
@@ -2058,6 +2270,14 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
                     if (t.partition_by.len > 0) {
                         range_names = t.partition_by;
                         order_specs = t.order_by;
+                        if (registry.tableByName(t.name)) |ent| {
+                            // An unordered, row-aligned .either kernel can
+                            // run over a shard even when a later operation
+                            // requires finer ranges. Its call partition need
+                            // not constrain the rest of the pipeline.
+                            if (ent.execution == .either and ent.passthrough.len != 0 and t.order_by.len == 0)
+                                continue;
+                        }
                         break :found;
                     }
                 },
@@ -2140,8 +2360,17 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         const idx = (b.fb.resolve(ob.col) orelse return NoMatch).idx;
         try sort_list.append(a, .{ .col = idx, .kind = try orderKind(entry_schema[idx].type) });
     }
-    try sort_list.append(a, .{ .col = rowloc_entry, .kind = .int64 });
+    // Scan chunks need a locator to recover physical tie order. A union
+    // enters through one stream; stable consolidation retains its tie order.
+    if (rowloc_entry) |loc| try sort_list.append(a, .{ .col = loc, .kind = .int64 });
     const sort_cols = sort_list.items;
+    if (getenv("THINDB_REGION_STEPS") != null) {
+        std.debug.print("[region] range keys:", .{});
+        for (range_names) |name| std.debug.print(" {s}", .{name});
+        std.debug.print("; sort prefix {d}:", .{group_prefix});
+        for (sort_cols) |col| std.debug.print(" {s}", .{entry_schema[col.col].name});
+        std.debug.print("\n", .{});
+    }
 
     traceMark("contract", &tm);
     if (pl.entry_sel) |sel| try b.applySelect(sel);
@@ -2222,7 +2451,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         .sort_cols = sort_cols,
         .group_prefix = group_prefix,
         .ordered = order_aligned,
-        .loc_col = rowloc_entry,
+        .loc_col = rowloc_entry orelse 0,
         .iv_rows_est = iv_rows_est,
         .iv_cost_slot = if (order_aligned) ctx.iv_cost else null,
         .member_filters = b.member_filters.items,
@@ -2249,12 +2478,12 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         qa,
         entry_schema,
         sources,
-        pl.entry_derived,
+        entry_derived,
         op_sides,
         &ctx.prog,
         opts,
         &ctx.pool,
-        total_rows * 2,
+        total_rows *| 2,
     );
     sources_owned = false; // the query owns sources (and, below, the ctx)
     sides_owned = false;
@@ -2571,15 +2800,48 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Va
 }
 
 fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
-    var all_ranks = true;
     var all_fill = true;
     for (w.calls) |call| {
-        if (call.func != .row_number) all_ranks = false;
         if (call.func != .last_value) all_fill = false;
     }
-    if (all_ranks) return pushRanksFromWindow(b, w);
     if (all_fill) return pushFillLast(b, w);
-    return NoMatch;
+    for (w.calls, 0..) |call, i| {
+        const single = ir.WindowOp{ .upstream = w.upstream, .specs = w.specs, .calls = w.calls[i .. i + 1] };
+        switch (call.func) {
+            .row_number => try pushRanksFromWindow(b, &single),
+            .lag => try push_lag(b, w.specs[call.spec_idx], call),
+            else => return NoMatch,
+        }
+    }
+}
+
+fn push_lag(b: *Builder, spec: ir.WindowSpec, call: ir.WindowCall) !void {
+    if (call.ignore_nulls or call.args.len == 0 or call.args.len > 3) return NoMatch;
+    if (call.args[0] != .col_ref) return NoMatch;
+    if (call.args.len == 3 and call.args[2] != .null_lit) return NoMatch;
+    if (!try b.partitionMatchesRangeKeys(spec.partition_by)) return NoMatch;
+    const offset: usize = if (call.args.len > 1) blk: {
+        if (call.args[1] != .lit) return NoMatch;
+        const value: i64 = switch (call.args[1].lit) {
+            .tinyint => |v| v,
+            .smallint => |v| v,
+            .int => |v| v,
+            .bigint => |v| v,
+            else => return NoMatch,
+        };
+        break :blk std.math.cast(usize, value) orelse return NoMatch;
+    } else 1;
+    const src = try b.resolveIdx(call.args[0].col_ref);
+    const order = try cloneOrder(b, spec.order_by);
+    try b.flushPending();
+    const idx = try b.fb.addCol(call.output_name, b.fb.cols.items[src].type, true);
+    try b.ops.append(b.a, .{ .lag = .{
+        .name = b.fb.cols.items[idx].name,
+        .src = src,
+        .offset = offset,
+        .order = order,
+    } });
+    try b.fb.setVis(call.output_name, idx);
 }
 
 fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror!void {
@@ -3607,6 +3869,13 @@ const BuiltSources = struct {
     iv_rows: []u64 = &.{},
 };
 
+fn build_union_source(input: engine_v2.CompileInput, root: *const ir.Op) !BuiltSources {
+    const sources = try input.allocator.alloc(exec.Query, 1);
+    errdefer input.allocator.free(sources);
+    sources[0] = try cte_stages.compile_region_input(input, root);
+    return .{ .sources = sources, .total_rows = sources[0].stats().upper_rows };
+}
+
 /// Chunked fused-filter scans over the base table (the rf_custom recipe):
 /// snapshot once, split row groups into ~4×DOP ranges, prune + fuse the
 /// filter into every chunk. Scratch is query-lifetime — nothing here may
@@ -3991,6 +4260,12 @@ fn pushAlignedTvf(
     const a = b.a;
     const kic: usize = if (ent.kernel_input_cols == 0) ent.input_schemas[0].len else ent.kernel_input_cols;
     const inputs = try tvfInputs(b, ent, kic);
+    const pass_sources = try a.alloc(usize, ent.passthrough.len);
+    errdefer a.free(pass_sources);
+    for (ent.passthrough, pass_sources) |pp, *source| {
+        if (pp.in_idx >= ent.input_schemas[0].len) return NoMatch;
+        source.* = (b.fb.resolve(ent.input_schemas[0][pp.in_idx].name) orelse return NoMatch).idx;
+    }
 
     var is_pass = try a.alloc(bool, ent.output_schema.len);
     @memset(is_pass, false);
@@ -4042,12 +4317,18 @@ fn pushAlignedTvf(
         try b.fb.setVis(col.name, idx);
         oi += 1;
     }
-    for (ent.passthrough) |pp| {
-        if (pp.in_idx >= ent.input_schemas[0].len) return NoMatch;
-        const src_name = ent.input_schemas[0][pp.in_idx].name;
-        const src = b.fb.resolve(src_name) orelse return NoMatch;
-        try b.fb.setVis(ent.output_schema[pp.out_idx].name, src.idx);
+    var views: std.ArrayListUnmanaged(region.ViewCol) = .empty;
+    for (ent.passthrough, pass_sources) |pp, source| {
+        const declared = ent.output_schema[pp.out_idx];
+        const idx = if (std.meta.eql(b.fb.cols.items[source].type, declared.type)) source else blk: {
+            const idx = try b.fb.addCol(declared.name, declared.type, declared.nullable);
+            try views.append(a, .{ .src = source, .column = b.fb.cols.items[idx] });
+            if (b.isConstIdx(source)) try b.const_idxs.append(a, idx);
+            break :blk idx;
+        };
+        try b.fb.setVis(declared.name, idx);
     }
+    if (views.items.len != 0) try b.ops.append(a, .{ .view_cols = views.items });
 }
 
 fn cloneOrder(b: *Builder, specs: []const ir.SortSpec) ![]const region.OrderBy {
@@ -4185,7 +4466,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     for (covered) |c| {
         if (!c) return NoMatch;
     }
-    if (subkeys.items.len == 0 or subkeys.items.len > 3) {
+    if (subkeys.items.len > 3) {
         if (getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] pushGroupAgg decline: subkeys={d} group_cols={d} required={d}\n", .{ subkeys.items.len, g.group_cols.len, required.len });
             for (g.group_cols) |gc| {
@@ -4224,7 +4505,8 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
                 const idx = try b.resolveIdx(spec.col orelse return NoMatch);
                 const t = b.fb.cols.items[idx].type;
                 break :blk switch (t) {
-                    .tinyint, .smallint, .int, .bigint, .date, .datetime => .{ .sum_int = idx },
+                    .tinyint, .smallint, .int, .date, .datetime => .{ .sum_int = idx },
+                    .bigint, .largeint => .{ .sum_large = idx },
                     .float, .double => .{ .sum_float = idx },
                     else => return NoMatch,
                 };
@@ -4253,6 +4535,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
             .max_by => |mb| in_cols[mb.val].type,
             .min_int, .max_int, .max_str => |c| in_cols[c].type,
             .sum_int => .bigint,
+            .sum_large => .largeint,
             .sum_float => .double,
         };
         try new_cols.append(a, .{ .name = o.name, .type = t, .nullable = true });

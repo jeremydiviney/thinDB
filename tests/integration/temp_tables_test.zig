@@ -428,3 +428,81 @@ test "temp tables: duplicate CREATE TEMP TABLE returns TableAlreadyExists" {
         error.TableAlreadyExists,
     );
 }
+
+test "keyed region: recreated temporary lookups validate contents schema and session" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE facts (id BIGINT PRIMARY KEY, k VARCHAR(8), seq INT)");
+    try helpers.exec(allocator, db, "INSERT INTO facts VALUES (1,'a',1),(2,'a',2),(3,'b',1),(4,'b',2)");
+    const facts = try db.openTable("facts", .{});
+    try facts.flush();
+    const catalog = thindb.net.catalogFor(db).?;
+    const query =
+        \\WITH KEYED BY (k) r AS (
+        \\ SELECT k, seq, ROW_NUMBER() OVER (PARTITION BY k ORDER BY seq) AS rn
+        \\ FROM facts WHERE id > 0
+        \\), j AS (
+        \\ SELECT r.k, r.seq, r.rn, d.payload AS actual
+        \\ FROM r LEFT JOIN lookup_values d ON r.k = d.k
+        \\)
+        \\SELECT actual FROM j ORDER BY k, seq
+    ;
+    var extra_rows: std.ArrayList(u8) = .empty;
+    defer extra_rows.deinit(allocator);
+    try extra_rows.appendSlice(allocator, "INSERT INTO lookup_values VALUES ");
+    for (0..6000) |i| {
+        if (i != 0) try extra_rows.append(allocator, ',');
+        try extra_rows.print(allocator, "('x{d}',{d})", .{ i, i });
+    }
+    for ([_]u32{ 71, 72 }) |backend| {
+        const ns = try thindb.TempNamespace.open(allocator, io, catalog.root_dir, backend, catalog.config);
+        defer ns.close();
+        const session = thindb.api.Session{ .temp_namespace = ns };
+        inline for (.{
+            .{ "BIGINT", "('a',7),('b',NULL)", [4]?i64{ 7, 7, null, null }, thindb.Type.bigint, false },
+            .{ "BIGINT", "('a',7),('b',NULL)", [4]?i64{ 7, 7, null, null }, thindb.Type.bigint, false },
+            .{ "BIGINT", "('a',17),('b',0)", [4]?i64{ 17, 17, 0, 0 }, thindb.Type.bigint, false },
+            .{ "INT", "('a',17),('b',0)", [4]?i64{ 17, 17, 0, 0 }, thindb.Type.int, false },
+            .{ "BIGINT", "('b',11),('a',99)", [4]?i64{ 99, 99, 11, 11 }, thindb.Type.bigint, false },
+            .{ "BIGINT", "('b',11),('a',99)", [4]?i64{ 99, 99, 11, 11 }, thindb.Type.bigint, true },
+            .{ "BIGINT", "('b',12),('a',98)", [4]?i64{ 98, 98, 12, 12 }, thindb.Type.bigint, true },
+        }) |case| {
+            try runAndDrain(allocator, db, session, "DROP TEMP TABLE IF EXISTS lookup_values");
+            try runAndDrain(allocator, db, session, "CREATE TEMP TABLE lookup_values (k VARCHAR(8) PRIMARY KEY, payload " ++ case[0] ++ ")");
+            try runAndDrain(allocator, db, session, "INSERT INTO lookup_values VALUES " ++ case[1]);
+            try runAndDrain(allocator, db, session, extra_rows.items);
+            if (case[4]) try ns.findTable("lookup_values").?.flush();
+            for (0..2) |_| {
+                var result = try runSqlSession(allocator, db, session, query);
+                defer result.deinit();
+                try std.testing.expectEqual(@as(thindb.Type, case[3]), result.outputSchema()[0].type);
+                const staged = thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, result.cq.query) orelse return error.TestExpectedEqual;
+                var lookup_in_region = false;
+                for (staged.set.stages.items) |stage| {
+                    if (stage.is_keyed_region and thindb.types.findColumn(stage.schema, "actual") != null)
+                        lookup_in_region = true;
+                }
+                try std.testing.expect(lookup_in_region);
+                var row: usize = 0;
+                while (try result.next()) |batch| {
+                    const values = batch.values[0];
+                    for (0..batch.row_count) |i| {
+                        const value: ?i64 = if (!values.isValid(i)) null else switch (values.data) {
+                            .int => |v| v[i],
+                            .bigint => |v| v[i],
+                            else => return error.TestUnexpectedResult,
+                        };
+                        try std.testing.expect(row < case[2].len);
+                        try std.testing.expectEqual(case[2][row], value);
+                        row += 1;
+                    }
+                }
+                try std.testing.expectEqual(case[2].len, row);
+            }
+        }
+    }
+}

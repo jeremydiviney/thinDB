@@ -1791,7 +1791,22 @@ fn effectiveStarSkip(schema: []const types.Column, p: ir.Op.Project) u32 {
 }
 
 pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Project) !Query {
-    const schema = upstream.outputSchema();
+    const names = try resolve_select_project(allocator, upstream.outputSchema(), p);
+    defer names.deinit(allocator);
+    return upstream.projectNamed(names.sources, names.outputs);
+}
+
+pub const ProjectionNames = struct {
+    sources: [][]const u8,
+    outputs: [][]const u8,
+
+    pub fn deinit(self: ProjectionNames, allocator: Allocator) void {
+        allocator.free(self.sources);
+        allocator.free(self.outputs);
+    }
+};
+
+pub fn resolve_select_project(allocator: Allocator, schema: []const types.Column, p: ir.Op.Project) !ProjectionNames {
     if (p.star_skip_trailing > schema.len) return Error.BadRequest;
     const star_skip = effectiveStarSkip(schema, p);
     const star_schema = schema[0 .. schema.len - star_skip];
@@ -1839,10 +1854,9 @@ pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Proj
     }
 
     const source_slice = try sources.toOwnedSlice(allocator);
-    defer allocator.free(source_slice);
+    errdefer allocator.free(source_slice);
     const output_slice = try outputs.toOwnedSlice(allocator);
-    defer allocator.free(output_slice);
-    return upstream.projectNamed(source_slice, output_slice);
+    return .{ .sources = source_slice, .outputs = output_slice };
 }
 
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {

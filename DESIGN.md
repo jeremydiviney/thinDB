@@ -385,6 +385,79 @@ The LRU cache is bounded by a configurable size (default **2 GB**, set at `Datab
 
 ---
 
+### 6.5 Keyed pipeline regions
+
+SQL blocks declared with `WITH KEYED BY (...)` can compile a supported CTE
+subtree into one region: partition once at entry, execute the operator chain
+within each shard, and publish its output as an ordinary materialized stage.
+The compiler verifies the key contract at each candidate boundary. It may
+select an inner CTE below a join, window, alias, or primary TVF input; the
+outer operations then execute through the staged engine. A declaration with
+no valid boundary still fails with `RegionKeyContractViolation` or
+`RegionUnsupportedConstruct`; unsupported declarations do not silently fall
+back to fully staged execution.
+
+Entry expressions may replace SQL-visible input names while retaining their
+original inputs under distinct physical slots. Projection expansion uses the
+same rules as ordinary SQL. Cached runs reconstruct the same entry recipe
+against fresh snapshots.
+
+Ordinary `UNION ALL` can feed a region without table functions. Its branches
+and entry projections/filters compile through the staged SQL compiler,
+preserving positional column naming, type widening, duplicates, and shared
+or explicitly materialized CTEs. The resulting stream is partitioned once;
+supported downstream operations execute within the region. Union ingress
+currently uses one scatter worker, with normal parallel execution available
+inside its SQL branches. When there are fewer input streams than workers,
+bucket sort buffers are reserved after ingress and the independent sorts run
+in the parallel shard phase. This preserves arrival-order tie breaks without
+concurrent allocation from the input worker's arena.
+Every cached run rebuilds the source against fresh
+snapshots. Grouping exactly by the current range keys is supported as one
+aggregate group per range, including NULL keys and all-NULL values.
+
+Consecutive entry projections preserve their evaluation order: only the
+lowest projection is absorbed into the scan entry; later projections and
+their intervening computes execute in the region. An unordered, row-aligned
+table function with an `.either` execution contract does not fix the initial
+range granularity when a later operation requires a different partition.
+The existing partition checks still determine whether each call can run
+per range or over the complete shard.
+Passthrough TVF outputs use their declared string-family type even when the
+input uses another compatible string type. Borrowed views preserve the
+original bytes and NULL bitmap without copying or changing input columns.
+
+For an unchanged declaration, the cache remembers which inner CTE boundary
+compiled successfully. Repeated queries validate that boundary directly,
+avoiding repeated evaluation of join inputs for unsupported outer candidates.
+The declaration fingerprint covers the original subtree, source table
+versions, and table-function identities before compilation's shared-IR
+rewrites; the stored anchor hash identifies its cached program.
+The key contract, kernel identities, consumed table versions, and fresh scan
+schemas are revalidated. Operations above the cached boundary compile
+normally against current data.
+For temporary tables held entirely in memory, up to 16,384 rows and 4 MiB,
+cache validation fingerprints the complete read schema and ordered contents
+under the table lock. Identical replacements can reuse the program across
+sessions; changed values, NULLs, types, or ordering invalidate it. Larger or
+spilled temporary tables disable this program cache instead of relying on
+reusable allocation addresses as table identities.
+
+Regional `LAG` supports nonnegative constant offsets (including substituted
+session variables), an omitted/NULL default, and partitions equal to the
+region ranges. Each call applies its requested order within a range and
+appends results in the original row positions, so independent window orders
+can coexist. Integer sums retain ordinary SQL promotion: `SUM(BIGINT)` and
+`SUM(LARGEINT)` use checked i128 accumulation and return `LARGEINT`.
+Consolidation keys retain all 64 integer bits plus a distinct NULL marker;
+adjacent BIGINT values must never collapse into one partition.
+
+See [REGION_PLAN.md](docs/plans/REGION_PLAN.md) and
+[REGION_ELIGIBILITY_PLAN.md](docs/plans/REGION_ELIGIBILITY_PLAN.md) for the
+runtime design, supported constructs, and remaining work.
+
+---
+
 ## 7. Compaction
 
 ### 7.1 Triggers

@@ -505,4 +505,104 @@ pub fn runAll(allocator: Allocator, io: Io) !void {
     std.debug.print("\nWindow partition cardinality\n", .{});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
     try benchPartitionSweep(allocator, io);
+    try run_keyed_regions(allocator, io);
+}
+
+pub fn main(init: std.process.Init) !void {
+    try run_keyed_regions(init.gpa, init.io);
+}
+
+const RegionMeasurement = struct { elapsed_ns: u64, totals: [2]i128 };
+
+fn measure_region_sql(allocator: Allocator, io: Io, db: *thindb.Database, sql: []const u8) !RegionMeasurement {
+    const start = Io.Clock.awake.now(io);
+    var totals = [_]i128{ 0, 0 };
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const plan = try thindb.sql.parse(arena.allocator(), sql);
+        var query = try thindb.net.compile(allocator, db, plan);
+        defer query.deinit();
+        if (std.mem.indexOf(u8, sql, "KEYED BY") != null) {
+            const staged = thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, query.query) orelse return error.RegionNotEngaged;
+            var region_found = false;
+            for (staged.set.stages.items) |stage| {
+                if (stage.is_keyed_region and thindb.types.findColumn(stage.schema, "next_prior") != null) region_found = true;
+            }
+            if (!region_found) return error.RegionNotEngaged;
+        }
+        var rows: usize = 0;
+        while (try query.next()) |batch| {
+            rows += batch.row_count;
+            for (0..batch.row_count) |row| {
+                for (batch.values, &totals) |value, *total| {
+                    if (!value.isValid(row)) return error.UnexpectedNull;
+                    total.* += switch (value.data) {
+                        .bigint => |values| values[row],
+                        .largeint => |values| values[row],
+                        else => return error.UnexpectedType,
+                    };
+                }
+            }
+        }
+        if (rows != 1) return error.UnexpectedRowCount;
+    }
+    return .{ .elapsed_ns = elapsedNs(io, start), .totals = totals };
+}
+
+fn run_keyed_regions(allocator: Allocator, io: Io) !void {
+    var dir = try freshDir(io, ".bench-data/window_keyed_regions");
+    defer dir.close(io);
+    const db = try thindb.Database.open(allocator, io, dir, .{ .max_dop = 12 });
+    defer db.close();
+    const table = try db.table("t", bench_schema, bench_options);
+    const rows = try buildRows(allocator, bench_rows);
+    defer allocator.free(rows);
+    try table.insert(rows);
+    try table.flush();
+
+    const body =
+        \\w AS (
+        \\  SELECT grp_hi, id, qty,
+        \\    ROW_NUMBER() OVER (PARTITION BY grp_hi ORDER BY id) AS rn,
+        \\    LAG(qty) OVER (PARTITION BY grp_hi ORDER BY id) AS prior
+        \\  FROM input_rows
+        \\), s AS (
+        \\  SELECT grp_hi, id, rn, prior,
+        \\    LAG(prior, 3) OVER (PARTITION BY grp_hi ORDER BY id DESC) AS next_prior
+        \\  FROM w
+        \\)
+        \\SELECT SUM(prior) AS total, SUM(next_prior) AS next_total FROM s
+    ;
+    inline for (.{
+        .{ .label = "scan", .entry = "input_rows AS (SELECT grp_hi, id, qty FROM t WHERE id >= 0), " },
+        .{ .label = "UNION ALL", .entry =
+        \\input_rows AS (
+        \\  SELECT grp_hi, id, qty FROM t WHERE id < 500000
+        \\  UNION ALL
+        \\  SELECT grp_hi, id, qty FROM t WHERE id >= 500000
+        \\),
+        },
+    }) |case| {
+        const queries = [_][]const u8{ "WITH " ++ case.entry ++ body, "WITH KEYED BY (grp_hi) " ++ case.entry ++ body };
+        const baseline = try measure_region_sql(allocator, io, db, queries[0]);
+        const warm = try measure_region_sql(allocator, io, db, queries[1]);
+        if (!std.meta.eql(baseline.totals, warm.totals)) return error.ResultMismatch;
+        var samples: [2][5]u64 = undefined;
+        for (0..5) |iteration| {
+            for (0..2) |position| {
+                const arm = (iteration + position) % 2;
+                const measurement = try measure_region_sql(allocator, io, db, queries[arm]);
+                if (!std.meta.eql(baseline.totals, measurement.totals)) return error.ResultMismatch;
+                samples[arm][iteration] = measurement.elapsed_ns;
+            }
+        }
+        for (&samples) |*arm| std.mem.sort(u64, arm, {}, std.sort.asc(u64));
+        std.debug.print("\nKeyed regions ({s}): {d} rows, DOP 12, five alternating runs after warmup\n", .{ case.label, bench_rows });
+        try report("staged window SQL", bench_rows, samples[0][2], null);
+        try report("keyed window SQL", bench_rows, samples[1][2], null);
+        std.debug.print("value-exact totals={any}; speedup={d:.2}x\n", .{
+            baseline.totals, @as(f64, @floatFromInt(samples[0][2])) / @as(f64, @floatFromInt(samples[1][2])),
+        });
+    }
 }

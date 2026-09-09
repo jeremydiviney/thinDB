@@ -675,6 +675,9 @@ pub const Stage = struct {
     /// upstream cutting the plan short).
     query: exec.Query,
     query_alive: bool = true,
+    /// Provenance survives eager materialization, which destroys `query`
+    /// before diagnostics or callers can inspect its operator type.
+    is_keyed_region: bool = false,
     /// Deep copy of the pipeline's output schema (StageSet arena) — the
     /// pipeline itself is gone after `ensureRun`, but MatScan batches and
     /// the result keep referring to this.

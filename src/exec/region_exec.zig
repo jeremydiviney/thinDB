@@ -282,11 +282,7 @@ fn viewOrderRows(v: ColumnView, a: usize, b: usize) std.math.Order {
         if (av == bv) return .eq;
         return if (!av) .lt else .gt;
     }
-    return switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.math.order(s[a], s[b]),
-        .varchar, .string, .char, .json => |s| std.mem.order(u8, s.rowBytes(a), s.rowBytes(b)),
-        else => .eq,
-    };
+    return @import("../engine/transform.zig").compareViewRows(v, a, v, b);
 }
 
 fn stringViewOf(v: ColumnView) storage.StringView {
@@ -350,7 +346,9 @@ pub const Exchange = struct {
     buckets: []Bucket,
 
     /// Single-threaded by contract: only scan worker `w` (which owns bucket
-    /// row w exclusively) may allocate from arena w. The consolidation-side
+    /// row w exclusively) may allocate from arena w during ingress. Deferred
+    /// sort buffers are reserved by the caller after all scan workers join.
+    /// The consolidation-side
     /// lazy sortBucketKeys fallback also lands here — it never fires when a
     /// scan phase ran (every bucket is pre-sorted), and direct callers
     /// without one are single-threaded.
@@ -469,11 +467,11 @@ pub const OrderCol = struct {
     kind: OrderKind,
 };
 
-/// Normalized per-row sort key: u64 primary word per order column (strings
+/// Normalized per-row sort key: u128 primary word per order column (strings
 /// carry a big-endian prefix and fall back to byte compare on prefix ties).
 /// NULLs order first, encoded below every non-null value.
 const RowKey = struct {
-    norm: u64,
+    norm: u128,
     str: []const u8, // empty unless string kind and prefix may tie
 };
 
@@ -482,11 +480,11 @@ fn normI32(valid: bool, v: i32) u64 {
     return (@as(u64, 1) << 33) | @as(u64, @as(u32, @bitCast(v)) ^ 0x8000_0000);
 }
 
-fn normI64(valid: bool, v: i64) u64 {
-    // Loses the low bit of i64 range to keep the null flag in-word; exact
-    // for every engine value today (dates/datetimes/ids are far smaller).
+fn normI64(valid: bool, v: i64) u128 {
+    // Consolidation uses normalized-key equality as partition identity;
+    // every integer bit must survive alongside the NULL discriminator.
     if (!valid) return 0;
-    return (@as(u64, 1) << 63) | (@as(u64, @as(u64, @bitCast(v)) ^ 0x8000_0000_0000_0000) >> 1);
+    return (@as(u128, 1) << 64) | (@as(u64, @bitCast(v)) ^ 0x8000_0000_0000_0000);
 }
 
 fn normStrPrefix(valid: bool, s: []const u8) u64 {
@@ -497,6 +495,19 @@ fn normStrPrefix(valid: bool, s: []const u8) u64 {
     var w: u64 = 1; // non-null flag above the 56 prefix bits
     for (b) |ch| w = (w << 8) | ch;
     return w;
+}
+
+test "region sort keys distinguish adjacent BIGINT values extremes and NULL" {
+    const values = [_]?i64{ null, std.math.minInt(i64), std.math.minInt(i64) + 1, -2, -1, 0, 1, 2, std.math.maxInt(i64) - 1, std.math.maxInt(i64) };
+    for (values, 0..) |value, i| {
+        const key = [_]RowKey{.{ .norm = normI64(value != null, value orelse 0), .str = "" }};
+        try std.testing.expect(keyEqPrefix(&key, &key, 1));
+        for (values[i + 1 ..]) |next| {
+            const other = [_]RowKey{.{ .norm = normI64(next != null, next orelse 0), .str = "" }};
+            try std.testing.expectEqual(std.math.Order.lt, keyCmp(&key, &other));
+            try std.testing.expect(!keyEqPrefix(&key, &other, 1));
+        }
+    }
 }
 
 /// Consolidated shard: the region operators run over these columns; group
@@ -607,19 +618,31 @@ fn keyEqPrefix(a: []const RowKey, b: []const RowKey, prefix: usize) bool {
 /// regardless of key skew); consolidation falls back to it lazily for
 /// callers that pushed rows without a scan phase.
 pub fn sortBucketKeys(ex: *Exchange, w: usize, shard: usize, sort_cols: []const OrderCol) !void {
+    try prepare_bucket_sort(ex, w, shard, sort_cols.len);
+    try sort_prepared_bucket(ex.bucket(w, shard), sort_cols);
+}
+
+fn prepare_bucket_sort(ex: *Exchange, w: usize, shard: usize, n_sort: usize) !void {
     const b = ex.bucket(w, shard);
     b.keys.clearRetainingCapacity();
     b.order.clearRetainingCapacity();
     const rows = b.rows;
     if (rows == 0) return;
-    const n_sort = sort_cols.len;
     try b.keys.ensureTotalCapacity(ex.workerAlloc(w), rows * n_sort);
     b.keys.items.len = rows * n_sort;
+    try b.order.ensureTotalCapacity(ex.workerAlloc(w), rows);
+    b.order.items.len = rows;
+}
+
+// Prepared buffers let distinct shard workers sort buckets from the same
+// producer without concurrently allocating from that producer's arena.
+fn sort_prepared_bucket(b: *Bucket, sort_cols: []const OrderCol) !void {
+    const rows = b.rows;
+    if (rows == 0) return;
+    const n_sort = sort_cols.len;
     for (sort_cols, 0..) |sc, kc| {
         try fillRowKeys(b.keys.items, n_sort, kc, sc.kind, b.cols[sc.col].view(), rows);
     }
-    try b.order.ensureTotalCapacity(ex.workerAlloc(w), rows);
-    b.order.items.len = rows;
     for (b.order.items, 0..) |*o, i| o.* = @intCast(i);
     const Ctx = struct {
         keys: []const RowKey,
@@ -819,6 +842,7 @@ pub const AggOut = struct {
     kind: union(enum) {
         first: usize,
         sum_int: usize,
+        sum_large: usize,
         sum_float: usize,
         min_int: usize,
         max_int: usize,
@@ -982,6 +1006,9 @@ pub const RegionOp = union(enum) {
     /// Same-named derived columns REPLACE their frame slot, others append —
     /// exec.Compute's contract.
     compute: struct { derived: []const compute_mod.Derived },
+    /// String-family TVF passthroughs retain their declared output type
+    /// while borrowing the input bytes and validity bitmap.
+    view_cols: []const ViewCol,
     /// ROW_NUMBER over each rank partition: argsort by `order`, ranks 1..n
     /// appended as a non-null bigint column. Stable on arrival order. A
     /// partition is one region-key range, or — when `merge_on` is set — a
@@ -996,7 +1023,12 @@ pub const RegionOp = union(enum) {
     /// LAG(src, offset) over the frame's current in-range order: NULL for
     /// the first `offset` rows of each range, the value `offset` rows back
     /// otherwise.
-    lag: struct { name: []const u8, src: usize, offset: usize },
+    lag: struct {
+        name: []const u8,
+        src: usize,
+        offset: usize,
+        order: ?[]const OrderBy = null,
+    },
     /// Keyed aggregation: groups are (range × subkeys). Output rows are
     /// emitted per range, sub-groups ordered by subkey values ascending
     /// NULLS FIRST; ranges rewritten to the per-range output spans. With
@@ -1065,6 +1097,15 @@ pub const RegionOp = union(enum) {
     emit: struct { cols: []const usize },
 };
 
+pub const ViewCol = struct { src: usize, column: Column };
+
+fn is_string_view_type(t: types.Type) bool {
+    return switch (t) {
+        .varchar, .string, .char, .json => true,
+        else => false,
+    };
+}
+
 /// One TVF call site, resolved from a udf.TableEntry by the recognizer.
 /// `extra_parts` are prebuilt broadcast partitions (whole lookup tables),
 /// passed verbatim to every call — TVF ABI6.
@@ -1083,7 +1124,7 @@ pub const TvfSpec = struct {
 
 const MAX_SUBKEYS = 3;
 const SubKey = struct { v: [MAX_SUBKEYS]u64, valid: u8 };
-const AccCell = struct { i: i64 = 0, f: f64 = 0, row: u32 = 0, seen: bool = false };
+const AccCell = struct { i: i128 = 0, f: f64 = 0, row: u32 = 0, seen: bool = false };
 
 fn requireIntFamily(schema: []const Column, c: usize) !void {
     if (c >= schema.len) return error.UnsupportedQueryShape;
@@ -1153,6 +1194,10 @@ pub const Program = struct {
                 },
                 .lag => |l| blk: {
                     if (l.src >= in.len) return error.UnsupportedQueryShape;
+                    try require_window_value(in[l.src].type);
+                    if (l.order) |order| {
+                        for (order) |ob| try require_window_value(in[try checkCol(in, ob.col)].type);
+                    }
                     break :blk try appendedSchema(a, in, .{
                         .name = try a.dupe(u8, l.name),
                         .type = in[l.src].type,
@@ -1170,6 +1215,10 @@ pub const Program = struct {
                             .sum_int => |c| t: {
                                 try requireIntFamily(in, c);
                                 break :t .bigint;
+                            },
+                            .sum_large => |c| t: {
+                                if (in[try checkCol(in, c)].type != .largeint) try requireIntFamily(in, c);
+                                break :t .largeint;
                             },
                             .sum_float => |c| t: {
                                 try requireFloatFamily(in, c);
@@ -1229,6 +1278,18 @@ pub const Program = struct {
                     for (t.out, cols[in.len..]) |src, *col| {
                         col.* = src;
                         col.name = try a.dupe(u8, src.name);
+                    }
+                    break :blk cols;
+                },
+                .view_cols => |views| blk: {
+                    const cols = try a.alloc(Column, in.len + views.len);
+                    @memcpy(cols[0..in.len], in);
+                    for (views, cols[in.len..]) |view, *col| {
+                        const source = in[try checkCol(in, view.src)].type;
+                        if (!is_string_view_type(source) or !is_string_view_type(view.column.type))
+                            return error.UnsupportedQueryShape;
+                        col.* = view.column;
+                        col.name = try a.dupe(u8, col.name);
                     }
                     break :blk cols;
                 },
@@ -1362,6 +1423,28 @@ pub fn computeOutputSchema(
     return dupeSchema(a, inst.ptr.output_schema);
 }
 
+fn require_window_value(t: types.Type) !void {
+    switch (t) {
+        .tinyint,
+        .smallint,
+        .int,
+        .bigint,
+        .largeint,
+        .float,
+        .double,
+        .date,
+        .datetime,
+        .decimal64,
+        .decimal128,
+        .varchar,
+        .string,
+        .char,
+        .json,
+        => {},
+        else => return error.UnsupportedQueryShape,
+    }
+}
+
 const ComputeInstance = struct { q: exec.Query, ptr: *compute_mod.Compute };
 
 /// A Compute over a zero-row SingleBatchSource: never pulled as a Query —
@@ -1379,8 +1462,12 @@ fn makeComputeInstance(
         .values = &.{},
         .row_count = 0,
     });
-    const q = try compute_mod.Compute.createWithRegistry(gpa, src, derived, registry);
-    const ptr = exec.queryAs(compute_mod.Compute, q) orelse return error.UnsupportedQueryShape;
+    const q = compute_mod.Compute.createWithRegistry(gpa, src, derived, registry) catch |err| {
+        var owned_src = src;
+        owned_src.deinit();
+        return err;
+    };
+    const ptr = exec.queryAs(compute_mod.Compute, q).?;
     return .{ .q = q, .ptr = ptr };
 }
 
@@ -1422,6 +1509,7 @@ pub const RegionWorker = struct {
         tvf: TvfState,
         const_cols: struct { out: []ColumnStore },
         emit: void,
+        view_cols: void,
     };
 
     /// Shared state shape for both probe op kinds.
@@ -1542,6 +1630,7 @@ pub const RegionWorker = struct {
                     break :blk .{ .const_cols = .{ .out = out } };
                 },
                 .emit => .{ .emit = {} },
+                .view_cols => .{ .view_cols = {} },
             };
             built += 1;
         }
@@ -1622,7 +1711,7 @@ pub const RegionWorker = struct {
                 s.worker_arena.deinit();
             },
             .const_cols => |*s| freeStores(alloc, s.out),
-            .emit => {},
+            .emit, .view_cols => {},
         };
     }
 
@@ -1631,7 +1720,7 @@ pub const RegionWorker = struct {
     pub fn retainedBytes(self: *const RegionWorker) usize {
         var n: usize = self.scratch.queryCapacity();
         for (self.states) |*st| switch (st.*) {
-            .compute, .emit => {},
+            .compute, .emit, .view_cols => {},
             .const_cols => |*s| for (s.out) |*c| {
                 n += storeRetainedBytes(c);
             },
@@ -1700,6 +1789,23 @@ pub const RegionWorker = struct {
                     @memcpy(fr.views[0..b.values.len], b.values);
                     fr.width = b.values.len;
                 },
+                .view_cols => |views| {
+                    for (views) |view| {
+                        const source = fr.views[view.src];
+                        const strings = stringViewOf(source);
+                        fr.views[fr.width] = .{
+                            .data = switch (view.column.type) {
+                                .varchar => .{ .varchar = strings },
+                                .string => .{ .string = strings },
+                                .char => .{ .char = strings },
+                                .json => .{ .json = strings },
+                                else => unreachable, // Program.build validates the view types.
+                            },
+                            .nulls = source.nulls,
+                        };
+                        fr.width += 1;
+                    }
+                },
                 .ranks => |r| try self.runRanks(r, &st.ranks.out, &fr),
                 .fill_last => |f| {
                     const s = &st.fill_last;
@@ -1713,6 +1819,10 @@ pub const RegionWorker = struct {
                 },
                 .lag => |l| {
                     const s = &st.lag;
+                    if (l.order) |order| {
+                        try self.run_ordered_lag(l, order, &s.out, &fr);
+                        continue;
+                    }
                     s.out.clear();
                     for (fr.ranges) |rng| {
                         const n: usize = rng[1] - rng[0];
@@ -1802,7 +1912,7 @@ pub const RegionWorker = struct {
             inline .bigint, .datetime => |vals| {
                 const ks = try sa.alloc(RowKey, rows);
                 for (ks, 0..) |*k, i| k.* = .{ .norm = normI64(v.isValid(i), vals[i]), .str = "" };
-                return .{ .keys = ks, .lossy = true };
+                return .{ .keys = ks, .lossy = false };
             },
             .varchar, .string, .char, .json => |sv| {
                 const ks = try sa.alloc(RowKey, rows);
@@ -1872,6 +1982,40 @@ pub const RegionWorker = struct {
         return k;
     }
 
+    fn run_ordered_lag(self: *RegionWorker, lag: anytype, order: []const OrderBy, store: *ColumnStore, fr: *Frame) !void {
+        store.clear();
+        const arena = self.scratch.allocator();
+        const norms = try arena.alloc(NormCol, order.len);
+        for (order, norms) |ob, *nc| nc.* = try buildNormKeys(arena, fr.views[ob.col], fr.rows);
+        const sources = try arena.alloc(u32, fr.rows);
+        const missing = try arena.alloc(bool, fr.rows);
+        for (fr.ranges) |range| {
+            const lo = range[0];
+            const n = range[1] - lo;
+            const permutation = try arena.alloc(u32, n);
+            for (permutation, 0..) |*row, i| row.* = @intCast(i);
+            const ctx = RankCtx{
+                .views = fr.views[0..fr.width],
+                .order = order,
+                .norms = norms,
+                .base = lo,
+            };
+            std.mem.sortUnstable(u32, permutation, ctx, RankCtx.less);
+            for (permutation, 0..) |row, i| {
+                missing[lo + row] = i < lag.offset;
+                sources[lo + row] = lo + if (i < lag.offset) row else permutation[i - lag.offset];
+            }
+        }
+        // Each window owns its permutation: append aligned values without
+        // changing the row order observed by other calls in the same SELECT.
+        try scatterColumn(self.alloc, store, fr.views[lag.src], sources);
+        for (missing, 0..) |is_missing, i| {
+            if (is_missing) try store.appendValidBit(self.alloc, i, false);
+        }
+        fr.views[fr.width] = store.view();
+        fr.width += 1;
+    }
+
     const SubOrdCtx = struct {
         views: []const ColumnView,
         subkeys: []const usize,
@@ -1930,7 +2074,7 @@ pub const RegionWorker = struct {
             for (g.out, s.cells) |spec, *cells| {
                 switch (spec.kind) {
                     .first => {},
-                    .sum_int => |c| accumSumInt(cells.items, ord_of, fr.views[c], rng[0]),
+                    .sum_int, .sum_large => |c| try accumSumInt(cells.items, ord_of, fr.views[c], rng[0]),
                     .sum_float => |c| accumSumFloat(cells.items, ord_of, fr.views[c], rng[0]),
                     .min_int => |c| accumMinMax(false, cells.items, ord_of, fr.views[c], rng[0]),
                     .max_int => |c| accumMinMax(true, cells.items, ord_of, fr.views[c], rng[0]),
@@ -1965,10 +2109,14 @@ pub const RegionWorker = struct {
                         for (sord, rows_buf) |gi, *r| r.* = s.sub_first.items[gi];
                         try scatterColumn(alloc, dst, fr.views[c], rows_buf);
                     },
-                    .sum_int => for (sord) |gi| {
+                    .sum_int, .sum_large => for (sord) |gi| {
                         const cell = &cells.items[gi];
                         if (cell.seen) {
-                            try dst.data.bigint.append(alloc, cell.i);
+                            switch (dst.data) {
+                                .bigint => |*values| try values.append(alloc, std.math.cast(i64, cell.i) orelse return error.ArithmeticOverflow),
+                                .largeint => |*values| try values.append(alloc, cell.i),
+                                else => unreachable,
+                            }
                             try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
                         } else try dst.appendNulls(alloc, 1);
                     },
@@ -1982,7 +2130,7 @@ pub const RegionWorker = struct {
                     .min_int, .max_int => for (sord) |gi| {
                         const cell = &cells.items[gi];
                         if (cell.seen) {
-                            try appendI64As(alloc, dst, cell.i);
+                            try appendI64As(alloc, dst, @intCast(cell.i));
                         } else try dst.appendNulls(alloc, 1);
                     },
                     .max_str, .max_by => {
@@ -2927,6 +3075,7 @@ const ScanPhase = struct {
     scan_schema: []const Column,
     registry: ?*const udf_mod.UdfRegistry,
     sort_cols: []const OrderCol,
+    defer_sort: bool = false,
     member_filters: []const MemberFilter = &.{},
     /// Co-partitioned side tables: one exchange + claim counter each; side
     /// buckets are never sorted (the probe map doesn't need order).
@@ -3013,8 +3162,10 @@ const ScanPhase = struct {
         // This worker's buckets are complete — sort them here, where the
         // work is balanced by input chunks, not by key skew.
         const t_sort = if (timed) exec.prof.nowTicks() else 0;
-        for (0..self.ex.n_shards) |s| {
-            try sortBucketKeys(self.ex, w, s, self.sort_cols);
+        if (!self.defer_sort) {
+            for (0..self.ex.n_shards) |s| {
+                try sortBucketKeys(self.ex, w, s, self.sort_cols);
+            }
         }
         if (timed) tk[3] += exec.prof.nowTicks() - t_sort;
         if (self.ticks) |t| t[w] = tk;
@@ -3254,6 +3405,7 @@ const ShardPhase = struct {
     side_ex: []Exchange,
     sides: []const SideInput,
     errs: []?anyerror,
+    deferred_sort: bool = false,
     /// Per-worker busy ticks (THINDB_REGION_TRACE only; null otherwise).
     busy: ?[]i64 = null,
 
@@ -3283,6 +3435,11 @@ const ShardPhase = struct {
             const t_con = if (rw.op_ticks != null) exec.prof.nowTicks() else 0;
             try slot.sd.ensure(self.ex.alloc, self.ex.schema);
             for (bin.members) |s| {
+                if (self.deferred_sort) {
+                    for (0..self.ex.n_workers) |sw| {
+                        try sort_prepared_bucket(self.ex.bucket(sw, s), self.opts.sort_cols);
+                    }
+                }
                 try consolidateAppendTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
             }
             // Side frames for this bin: plain per-partition bucket appends —
@@ -3801,6 +3958,9 @@ pub fn runRegionPooled(
     const scan_ticks: ?[][4]i64 = if (trace) try alloc.alloc([4]i64, opts.n_threads) else null;
     defer if (scan_ticks) |t| alloc.free(t);
     if (scan_ticks) |t| @memset(t, .{ 0, 0, 0, 0 });
+    // Few input streams cannot occupy all scan workers. Shard bins can
+    // share their sort work once ingress has finished and buffers exist.
+    const defer_sort = sources.len < opts.n_threads;
     var scan_phase = ScanPhase{
         .ex = ex,
         .sources = sources,
@@ -3808,6 +3968,7 @@ pub fn runRegionPooled(
         .scan_schema = scan_schema,
         .registry = prog.registry,
         .sort_cols = opts.sort_cols,
+        .defer_sort = defer_sort,
         .member_filters = opts.member_filters,
         .sides = side_scans,
         .errs = errs,
@@ -3821,6 +3982,14 @@ pub fn runRegionPooled(
     scan_phase.worker(opts.n_threads - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
+
+    if (defer_sort) {
+        for (0..ex.n_workers) |w| {
+            for (0..ex.n_shards) |s| {
+                try prepare_bucket_sort(ex, w, s, opts.sort_cols.len);
+            }
+        }
+    }
 
     const t1 = if (trace) exec.prof.nowTicks() else 0;
     const shard_busy: ?[]i64 = if (trace) try alloc.alloc(i64, opts.n_threads) else null;
@@ -3840,6 +4009,7 @@ pub fn runRegionPooled(
         .sides = sides,
         .errs = errs,
         .busy = shard_busy,
+        .deferred_sort = defer_sort,
     };
     spawned = 0;
     for (0..opts.n_threads - 1) |w| {
@@ -3884,18 +4054,18 @@ pub fn runRegionPooled(
 // no-validity fast path skips the per-row bit check. The `unreachable`s
 // hold by construction — Program.build rejects columns outside the family.
 
-fn accumSumInt(cells: []AccCell, ord_of: []const u32, v: ColumnView, base: usize) void {
+fn accumSumInt(cells: []AccCell, ord_of: []const u32, v: ColumnView, base: usize) !void {
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .date, .datetime => |vals| {
             if (v.nulls == null) {
                 for (ord_of, vals[base..][0..ord_of.len]) |gi, x| {
-                    cells[gi].i += x;
+                    cells[gi].i = std.math.add(i128, cells[gi].i, x) catch return error.ArithmeticOverflow;
                     cells[gi].seen = true;
                 }
             } else {
                 for (ord_of, 0..) |gi, li| {
                     if (!v.isValid(base + li)) continue;
-                    cells[gi].i += vals[base + li];
+                    cells[gi].i = std.math.add(i128, cells[gi].i, vals[base + li]) catch return error.ArithmeticOverflow;
                     cells[gi].seen = true;
                 }
             }
@@ -4502,7 +4672,7 @@ test "region program: group_agg min/max/sum_float sweeps (validity hoisted)" {
     try testing.expect(!mx.isValid(1));
 }
 
-test "region program: ranks normalized keys — lossy i64 ties and string prefix ties" {
+test "region program: ranks normalized keys distinguish adjacent integers and string prefix ties" {
     const alloc = testing.allocator;
     const entry = [_]Column{
         .{ .name = "k", .type = .string, .nullable = true },
@@ -4512,8 +4682,7 @@ test "region program: ranks normalized keys — lossy i64 ties and string prefix
     var sd = ShardData{};
     defer sd.deinit(alloc);
     try sd.ensure(alloc, &entry);
-    // v pairs 6/7 collapse to one norm word (low bit folds into the null
-    // flag); s shares the 7-byte prefix "prefix0" so the norm ties too.
+    // String prefixes tie, while every adjacent integer stays distinct.
     const S = [_]?[]const u8{ "prefix0b", "prefix0a", null, "prefix0a" };
     const V = [_]?i64{ 7, 6, 6, null };
     for (S, V) |s, v| {
@@ -4590,6 +4759,68 @@ test "region program: lag op shifts within ranges" {
             try testing.expectEqual(x, lv.data.bigint[i]);
         } else try testing.expect(!lv.isValid(i));
     }
+}
+
+test "region program: ordered lag uses SQL float order for NaNs and signed zero" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "sort_value", .type = .double, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var shard = ShardData{};
+    defer shard.deinit(alloc);
+    try shard.ensure(alloc, &entry);
+    const values = [_]f64{ std.math.nan(f64), 0.0, -0.0, -std.math.inf(f64), std.math.inf(f64), 2.0 };
+    for (values, 0..) |v, i| {
+        try tAppendStr(alloc, &shard.cols[0], "key");
+        try shard.cols[1].data.double.append(alloc, v);
+        try shard.cols[1].appendValidBit(alloc, i, true);
+        try tAppendI64(alloc, &shard.cols[2], @intCast((i + 1) * 10));
+    }
+    shard.rows = values.len;
+    try shard.ranges.append(alloc, .{ 0, values.len });
+    const ops = [_]RegionOp{
+        .{ .lag = .{ .name = "prior", .src = 2, .offset = 1, .order = &.{.{ .col = 1 }} } },
+        .{ .emit = .{ .cols = &.{3} } },
+    };
+    var program = try Program.build(alloc, &entry, &ops, null);
+    defer program.deinit();
+    var worker = try RegionWorker.init(alloc, &program);
+    defer worker.deinit();
+    var out = [_]ColumnStore{try ColumnStore.init(alloc, .bigint, true)};
+    defer out[0].deinit(alloc);
+    try worker.runShard(&shard, &out);
+    const expected = [_]?i64{ 50, 40, 20, null, 60, 30 };
+    const view = out[0].view();
+    for (expected, 0..) |v, i| {
+        try testing.expectEqual(v != null, view.isValid(i));
+        if (v) |value| try testing.expectEqual(value, view.data.bigint[i]);
+    }
+}
+
+test "region program: wide sum reports i128 overflow" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "v", .type = .largeint },
+    };
+    var shard = ShardData{};
+    defer shard.deinit(alloc);
+    try shard.ensure(alloc, &entry);
+    try shard.cols[0].data.largeint.appendSlice(alloc, &.{ std.math.maxInt(i128), 1 });
+    shard.rows = 2;
+    try shard.ranges.append(alloc, .{ 0, 2 });
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &.{}, .out = &.{.{ .name = "total", .kind = .{ .sum_large = 0 } }} } },
+        .{ .emit = .{ .cols = &.{0} } },
+    };
+    var program = try Program.build(alloc, &entry, &ops, null);
+    defer program.deinit();
+    var worker = try RegionWorker.init(alloc, &program);
+    defer worker.deinit();
+    var out = [_]ColumnStore{try ColumnStore.init(alloc, .largeint, true)};
+    defer out[0].deinit(alloc);
+    try testing.expectError(error.ArithmeticOverflow, worker.runShard(&shard, &out));
 }
 
 test "region program: ranks merge_on spans adjacent same-key ranges" {
@@ -4832,6 +5063,47 @@ fn tKernelEstimate(ctx: *const udf_mod.TvfContext, parts: []const udf_mod.TvfPar
     try out.columns[1].appendValidBit(out.allocator, out.columns[1].rowCount() - 1, true);
     try out.columns[2].data.bigint.append(out.allocator, @intCast(p.row_count));
     try out.columns[2].appendValidBit(out.allocator, out.columns[2].rowCount() - 1, true);
+}
+
+test "region program: string views preserve types NULLs and borrowed bytes" {
+    const alloc = testing.allocator;
+    const families = [_]types.Type{ .string, .{ .varchar = 128 }, .{ .char = 128 }, .json };
+    inline for (families) |source_type| {
+        const entry = [_]Column{.{ .name = "source", .type = source_type, .nullable = true }};
+        var sd = ShardData{};
+        defer sd.deinit(alloc);
+        try sd.ensure(alloc, &entry);
+        const values = [_]?[]const u8{ null, "", "long UTF-8 text: caf\xc3\xa9 \xe2\x98\x95" };
+        for (values) |value| try tAppendStr(alloc, &sd.cols[0], value);
+        sd.rows = values.len;
+        try sd.ranges.append(alloc, .{ 0, values.len });
+        inline for (families) |target_type| {
+            const views = [_]ViewCol{.{ .src = 0, .column = .{ .name = "declared", .type = target_type, .nullable = true } }};
+            const ops = [_]RegionOp{ .{ .view_cols = &views }, .{ .emit = .{ .cols = &.{1} } } };
+            var prog = try Program.build(alloc, &entry, &ops, null);
+            defer prog.deinit();
+            var worker = try RegionWorker.init(alloc, &prog);
+            defer worker.deinit();
+            var out = [_]ColumnStore{try ColumnStore.init(alloc, target_type, true)};
+            defer out[0].deinit(alloc);
+            try worker.runShard(&sd, &out);
+            try testing.expectEqual(target_type, prog.output_schema[0].type);
+            try testing.expectEqual(std.meta.activeTag(target_type), std.meta.activeTag(worker.views[1].data));
+            try testing.expect(stringViewOf(worker.views[0]).bytes.ptr == stringViewOf(worker.views[1]).bytes.ptr);
+            try testing.expectEqual(values.len, out[0].rowCount());
+            const result = out[0].view();
+            for (values, 0..) |value, i| {
+                try testing.expectEqual(value != null, result.isValid(i));
+                if (value) |bytes| try testing.expectEqualStrings(bytes, stringViewOf(result).rowBytes(i));
+            }
+        }
+    }
+    const numeric = [_]Column{.{ .name = "n", .type = .bigint }};
+    const invalid = [_]RegionOp{
+        .{ .view_cols = &.{.{ .src = 0, .column = .{ .name = "s", .type = .string } }} },
+        .{ .emit = .{ .cols = &.{1} } },
+    };
+    try testing.expectError(error.UnsupportedQueryShape, Program.build(alloc, &numeric, &invalid, null));
 }
 
 test "region program: tvf_aligned appends computed columns (broadcast part)" {

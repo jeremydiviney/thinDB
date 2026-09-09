@@ -63,6 +63,17 @@ pub fn needsStaging(op: *const ir.Op) bool {
 /// plan compiled to — the V2 analogue of the legacy `ctx.materialized`
 /// count, used by introspection-style tests.
 pub fn compileStaged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage_count_out: ?*u32) anyerror!exec.Query {
+    return compile_staged(input_in, root, stage_count_out, true);
+}
+
+/// Region ingress already has a verified key contract. Compile its ordinary
+/// SQL subtree without recursively recognizing the same declaration, while
+/// preserving shared and explicitly materialized CTEs inside that subtree.
+pub fn compile_region_input(input: engine_v2.CompileInput, root: *const ir.Op) anyerror!exec.Query {
+    return compile_staged(input, root, null, false);
+}
+
+fn compile_staged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage_count_out: ?*u32, recognize_regions: bool) anyerror!exec.Query {
     // Compiled-join registry (IR node → operator): lets a rider that
     // crossed a join through rideSource verify the compiled operator's
     // order guarantees post-compile. Compile-lifetime only.
@@ -93,10 +104,11 @@ pub fn compileStaged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage
     // stage. The declaration is a hard contract — verification/compile
     // failures are query errors, never a silent fall-back.
     const t_region_declared = exec.prof.nowTicks();
-    const declared = try @import("region_rollforward.zig").compileDeclared(input, root);
+    const declared = if (recognize_regions) try @import("region_rollforward.zig").compileDeclared(input, root) else null;
     exec.prof.addPhase("compile.region_declared", @intCast(exec.prof.nowTicks() - t_region_declared));
     if (declared) |rec| {
         const stage = try set.addStage(rec.query, input.accountant);
+        stage.is_keyed_region = true;
         const rep = cse.canon.get(rec.anchor) orelse rec.anchor;
         try map.put(input.allocator, rep, stage);
         if (rep != rec.anchor) try map.put(input.allocator, rec.anchor, stage);
