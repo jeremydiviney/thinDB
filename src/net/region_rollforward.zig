@@ -32,7 +32,6 @@ const ir = @import("../ir/ir.zig");
 const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const region = @import("../exec/region_exec.zig");
-const mat_stage = @import("../exec/mat_stage.zig");
 const compute_mod = @import("../exec/compute.zig");
 const expr_mod = @import("../exec/expr.zig");
 const predicate_mod = @import("../exec/predicate.zig");

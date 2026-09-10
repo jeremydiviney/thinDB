@@ -2984,7 +2984,7 @@ const FrameCursor = struct {
         const current = self.perm[self.peer_start];
         if (!view.isValid(current)) return @intCast(if (is_start) self.peer_start else self.peer_end - 1);
         const desc = self.spec.order_desc[0];
-        const delta: i256 = if (preceding != desc) -@as(i256, offset) else @as(i256, offset);
+        const delta: i128 = if (preceding != desc) -@as(i128, offset) else @as(i128, offset);
         var lo = self.start;
         var hi = self.end;
         while (lo < hi) {
@@ -2998,14 +2998,14 @@ const FrameCursor = struct {
     }
 };
 
-fn range_order(view: ColumnView, t: Type, candidate: usize, current: usize, delta: i256) !std.math.Order {
+fn range_order(view: ColumnView, t: Type, candidate: usize, current: usize, delta: i128) !std.math.Order {
     return switch (view.data) {
         inline .tinyint, .smallint, .int, .bigint, .largeint => |values| std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + delta),
         inline .float, .double => |values| std.math.order(@as(f64, values[candidate]), @as(f64, values[current]) + @as(f64, @floatFromInt(delta))),
         inline .decimal64, .decimal128 => |values| blk: {
             var scale: i256 = 1;
             for (0..t.decimalSpec().?.s) |_| scale *= 10;
-            break :blk std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + delta * scale);
+            break :blk std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + @as(i256, delta) * scale);
         },
         else => Error.WindowUnsupported,
     };
