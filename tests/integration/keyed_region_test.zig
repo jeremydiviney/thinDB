@@ -637,6 +637,147 @@ test "keyed region: TVF passthrough binds sources before computed output aliases
     , "prior");
 }
 
+test "keyed region: route provenance survives replacing TVFs and aggregation in one region" {
+    const allocator = std.testing.allocator;
+    const tdb = thindb.tdb;
+    const expand_rows = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "expand_rows", .execution = .partitioned, .ordered_output = true };
+        pub const Input = struct { custLC: ?[]const u8, month: ?i32, amount: ?i64 };
+        pub const Output = Input;
+        pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+            var rows = p.iter();
+            while (rows.next()) |row| {
+                const month = if (row.month) |m| m * 2 else null;
+                try out.row(.{ .custLC = row.custLC, .month = month, .amount = row.amount });
+                try out.row(.{ .custLC = row.custLC, .month = if (month) |m| m + 1 else null, .amount = null });
+            }
+        }
+    };
+    const body =
+        \\seed AS (
+        \\ SELECT custLC, month, amount,
+        \\   ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS seed_rank
+        \\ FROM inv WHERE projectId = 100
+        \\), expanded AS (
+        \\ SELECT * FROM TABLE(expand_rows((SELECT custLC, month, amount + seed_rank AS amount FROM seed))
+        \\   PARTITION BY custLC ORDER BY month)
+        \\), ranked AS (
+        \\ SELECT *, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS mid_rank FROM expanded
+        \\), grouped AS (
+        \\ SELECT custLC, month, MAX(amount) AS amount, MAX(mid_rank) AS mid_rank
+        \\ FROM ranked GROUP BY custLC, month
+        \\), joined AS (
+        \\ SELECT g.custLC, g.month, g.amount + COALESCE(l.bonus, 0) AS amount, g.mid_rank
+        \\ FROM grouped g LEFT JOIN (SELECT * FROM route_lookup WHERE id > 0) l ON g.custLC = l.custLC
+        \\), lagged AS (
+        \\ SELECT custLC, month, LAG(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY month) + mid_rank AS amount
+        \\ FROM joined
+        \\), expanded_again AS (
+        \\ SELECT * FROM TABLE(expand_rows((SELECT custLC, month, amount FROM lagged))
+        \\   PARTITION BY custLC ORDER BY month)
+        \\), final_window AS (
+        \\ SELECT *, LEAD(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY month) AS after_udf FROM expanded_again
+        \\)
+        \\SELECT * FROM final_window ORDER BY custLC, month
+    ;
+    for ([_]usize{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, dop);
+        defer db.close();
+        try db.registerTableFn(expand_rows);
+        try helpers.exec(allocator, db, "CREATE TABLE route_lookup (id INT PRIMARY KEY, custLC VARCHAR(32), bonus BIGINT)");
+        try helpers.exec(allocator, db, "INSERT INTO route_lookup VALUES (1,'cust_0',9),(2,'cust_3',11),(3,NULL,13)");
+        const lookup = try db.openTable("route_lookup", .{});
+        try lookup.flush();
+        for (0..2) |_| {
+            var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+            defer query.deinit();
+            const root = thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, query.cq.query).?;
+            var found = false;
+            for (root.set.stages.items) |stage| {
+                if (!stage.is_keyed_region or thindb.types.findColumn(stage.schema, "after_udf") == null) continue;
+                const region = thindb.exec.queryAs(thindb.exec.region_exec.RegionExecOp, stage.query).?;
+                var windows: usize = 0;
+                var replacements: usize = 0;
+                var groups: usize = 0;
+                for (region.prog.ops) |op| switch (op) {
+                    .window => windows += 1,
+                    .tvf_grouped => |tvf| if (!tvf.aligned_append and !tvf.union_append) {
+                        replacements += 1;
+                    },
+                    .group_agg => groups += 1,
+                    else => {},
+                };
+                try std.testing.expectEqual(@as(usize, 4), windows);
+                try std.testing.expectEqual(@as(usize, 2), replacements);
+                try std.testing.expectEqual(@as(usize, 1), groups);
+                try std.testing.expectEqual(@as(usize, 1), region.sides.len);
+                found = true;
+            }
+            try std.testing.expect(found);
+            while (try query.next()) |_| {}
+        }
+        try expect_keyed_matches(allocator, db, body, "after_udf");
+    }
+}
+
+test "keyed region: replacing TVF without a key preservation contract falls back" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    const tdb = thindb.tdb;
+    const rekey = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "rekey", .execution = .partitioned };
+        pub const Input = struct { custLC: ?[]const u8, month: ?i32, amount: ?i64 };
+        pub const Output = Input;
+        pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+            var rows = p.iter();
+            while (rows.next()) |row| try out.row(.{ .custLC = "merged", .month = row.month, .amount = row.amount });
+        }
+    };
+    try db.registerTableFn(rekey);
+    try expect_fallback_matches(allocator, db, "custLC",
+        \\changed AS (
+        \\ SELECT * FROM TABLE(rekey((SELECT custLC, month, amount FROM inv WHERE projectId = 100))
+        \\   PARTITION BY custLC ORDER BY month)
+        \\), w AS (
+        \\ SELECT *, LAG(amount) OVER (PARTITION BY custLC ORDER BY amount) AS prior FROM changed
+        \\)
+        \\SELECT * FROM w ORDER BY amount
+    );
+}
+
+test "keyed region: computed replacement after aggregation does not inherit route provenance" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    const body =
+        \\r AS (
+        \\ SELECT custLC, month, amount, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM inv WHERE projectId = 100
+        \\), g AS (
+        \\ SELECT custLC, month, MAX(amount) AS amount, MAX(rn) AS rn FROM r GROUP BY custLC, month
+        \\), changed AS (
+        \\ SELECT CAST('merged' AS VARCHAR(32)) AS custLC, amount + rn AS amount FROM g
+        \\), w AS (
+        \\ SELECT *, LAG(amount) OVER (PARTITION BY custLC ORDER BY amount) AS prior FROM changed
+        \\)
+        \\SELECT * FROM w ORDER BY amount
+    ;
+    const mono = try runToText(allocator, db, "WITH " ++ body);
+    defer allocator.free(mono);
+    for (0..2) |_| {
+        const keyed = try run_to_text_checked(allocator, db, "WITH KEYED BY (custLC) " ++ body, "prior", false);
+        defer allocator.free(keyed);
+        try std.testing.expectEqualStrings(mono, keyed);
+    }
+}
+
 test "keyed region: LAG honors partition boundaries offsets source NULLs and independent orders" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

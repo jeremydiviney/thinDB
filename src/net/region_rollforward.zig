@@ -2946,7 +2946,7 @@ fn dispatchTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, t: *const ir.O
             if (ent.passthrough.len != 0) {
                 try pushAlignedTvf(b, ent, extra_parts, t.args, true);
             } else if (kernelReadsAll(ent)) {
-                try pushReplaceTvf(b, ent, t.args);
+                try pushReplaceTvf(b, ent, t);
             } else return NoMatch;
         },
         .merged_span => {
@@ -2960,18 +2960,28 @@ fn dispatchTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, t: *const ir.O
 
 /// Frame-replacing kernel (writes every output, no passthrough): per-range
 /// calls; the frame becomes the kernel's output schema.
-fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Value) !void {
+fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, t: *const ir.Op.TableFn) !void {
+    // Equal output names alone say nothing about their values. This is the
+    // same partition-key preservation contract used by tvfEmitKeys.
+    if (!ent.ordered_output or t.inputs.len != 1) return NoMatch;
     const a = b.a;
     const inputs = try tvfInputs(b, ent, ent.input_schemas[0].len);
     const out = try a.alloc(Column, ent.output_schema.len);
     for (ent.output_schema, out) |src, *dst| {
         dst.* = .{ .name = try b.fb.canonName(src.name), .type = src.type, .nullable = true };
     }
+    var route_name: ?[]const u8 = null;
+    for (t.partition_by) |name| {
+        const input_idx = try b.resolveIdx(name);
+        const output_idx = types.findColumn(ent.output_schema, name) orelse return NoMatch;
+        if (std.mem.eql(u8, b.fb.cols.items[input_idx].name, b.route_name)) route_name = out[output_idx].name;
+    }
+    const next_route = route_name orelse return NoMatch;
     try b.flushPending();
     try b.ops.append(a, .{ .tvf_grouped = .{ .spec = .{
         .process = ent.process,
         .user_data = ent.user_data,
-        .args = try cloneArgs(b, args),
+        .args = try cloneArgs(b, t.args),
         .inputs = inputs,
         .out = out,
     } } });
@@ -2982,6 +2992,7 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Va
         try b.fb.cols.append(a, o);
         try b.fb.setVis(src.name, idx);
     }
+    b.route_name = next_route;
     // Range keys re-resolve by NAME against the new frame (the kernel keeps
     // partition-column names — SDK schema contract); verify they survive.
     var buf: [8]usize = undefined;
@@ -3558,7 +3569,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
     // Co-partition requirement: some ON pair's LEFT is the route key column
     // (scatter hashes ONLY that column, so equal route keys — and therefore
     // every possible match — land in the same shard on both sides).
-    const route_idx = (b.fb.resolve(b.route_name) orelse {
+    const route_idx = types.findColumn(b.fb.cols.items, b.route_name) orelse {
         sideTrace("route name '{s}' unresolved", .{b.route_name});
         if (getenv("THINDB_REGION_STEPS") != null) {
             for (b.fb.vis.items) |e| {
@@ -3568,7 +3579,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             }
         }
         return NoMatch;
-    }).idx;
+    };
     var route_pair: ?usize = null;
     for (j.on, 0..) |pair, pi| {
         const e = b.fb.resolve(pair.left) orelse {
@@ -4601,13 +4612,19 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
 
     var out: std.ArrayListUnmanaged(region.AggOut) = .empty;
     var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
+    var new_consts: std.ArrayListUnmanaged(usize) = .empty;
+    var route_name: ?[]const u8 = null;
 
     // Group keys first (constant within their sub-group → .first).
     for (g.group_cols) |gc| {
         const e = b.fb.resolve(gc) orelse return NoMatch;
-        try out.append(a, .{ .name = try nameFor(b, gc), .kind = .{ .first = e.idx } });
+        const name = try nameFor(b, gc);
+        if (std.mem.eql(u8, b.fb.cols.items[e.idx].name, b.route_name)) route_name = name;
+        if (b.isConstIdx(e.idx)) try new_consts.append(a, out.items.len);
+        try out.append(a, .{ .name = name, .kind = .{ .first = e.idx } });
         try new_vis.append(a, .{ .name = try a.dupe(u8, gc), .idx = new_vis.items.len });
     }
+    const next_route = route_name orelse return NoMatch;
     for (g.aggs) |spec| {
         const kind: @FieldType(region.AggOut, "kind") = switch (spec.func) {
             .any_value => .{ .first = try b.resolveIdx(spec.col orelse return NoMatch) },
@@ -4664,6 +4681,8 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     }
     b.fb.cols = new_cols;
     b.fb.vis = new_vis;
+    b.route_name = next_route;
+    b.const_idxs = new_consts;
 }
 
 fn nameFor(b: *Builder, hint: []const u8) ![]const u8 {
