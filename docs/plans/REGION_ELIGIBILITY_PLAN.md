@@ -1,5 +1,60 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Five-arm server sweep: SQL gains and UDF coverage regression (2026-09-10)
+
+The complete Sierra/AirDNA sweep ran on starrocks1 with engine `6a216c4`
+(Linux ReleaseFast, SHA256
+`ddc30341a5aabbb519bf92555e377f47ca4305dc1a4e2d5fb93461d2d5930e8c`)
+and Wayroll query generation `b5359d9e`. All five arms used the prior query
+dates and three customer-hash buckets `[a,d)`, with one warmup and three
+measured runs. Clients ran on localhost and discarded final row packets
+without value decoding. StarRocks completed before the candidate started.
+
+Totals below are sums of the fifteen case medians:
+
+| Dataset | SR SQL | thinDB SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 11.01 s | 9.48 s | 6.61 s | 4.44 s | 3.08 s |
+| AirDNA | 47.26 s | 46.00 s | 38.13 s | 39.08 s | 27.53 s |
+
+All 150 dataset/variant/arm combinations completed without query errors.
+All 240 timed keyed executions engaged a region. All four thinDB modes
+returned matching row counts in every variant. A separate untimed pass
+computed order-independent row-packet fingerprints: all 30 SQL keyed/unkeyed
+pairs and all 30 UDF keyed/unkeyed pairs matched. This validates paired wire
+outputs; it is not a value comparison with StarRocks live data. Sierra source
+counts match the copy, while AirDNA live StarRocks has about 0.02% more rows.
+
+**The new build regresses some UDF cross-division pipelines despite region
+engagement.** AirDNA UDF-plus-regions base-cross increased from 493 to 1,453 ms;
+expanded-cross from 600 to 11,833 ms. Sierra expanded-cross increased from
+203 to 821 ms. The prior AirDNA base-cross region contained 29 operations,
+including ranking, aggregation, and later UDF stages. The new one emits
+after 13 operations: a subsequent window declines and the remaining work
+stages ordinarily. SQL windows now enter regions, but the SQL path also hits
+later GROUP BY coverage limits. Engagement alone is not full pipeline coverage.
+
+The likely UDF blocker is physical route-key identity after a frame-replacing
+TVF: `pushReplaceTvf` generates new physical names and resets the frame;
+`dispatchWindow` compares its partition columns with the earlier `route_name`.
+Next priority is preserving **proven** routed-key identity across these
+transitions, with a regression test that requires the later window and UDF
+stages inside the region. Do not remove the guard without a value-preservation
+proof. Then address the SQL GROUP BY declines and repeat the five-arm sweep.
+This diagnosis is supported by source and traces; no fix was applied during
+this benchmark run.
+
+The candidate retained DOP 16, an 8 GiB cache, 24 GiB shared query budget, and
+16 GiB per-query budget. Its OS ceiling was 34 GiB to preserve 12 GiB initial
+headroom; peak cgroup usage was 32.74 GiB with zero ceiling-pressure/OOM events.
+The temporary server was stopped after validation. Production thinDB, StarRocks
+BE, and CDC remained running with their original PIDs/job ID.
+
+The complete timing matrix, exact CSV medians, raw samples, SQL captures,
+traces, fingerprints, source counts, and health metadata remain in ignored
+`.bench-data/five-arm-6a216c4/`. The report is
+`report/benchmark-report.md`; the CSV is `report/benchmark-results.csv`.
+
 ### Shared SQL windows and ordinary fallback (2026-09-10)
 
 The follow-up implementation replaces the SQL window whitelist with a
