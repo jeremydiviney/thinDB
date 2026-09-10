@@ -392,10 +392,29 @@ subtree into one region: partition once at entry, execute the operator chain
 within each shard, and publish its output as an ordinary materialized stage.
 The compiler verifies the key contract at each candidate boundary. It may
 select an inner CTE below a join, window, alias, or primary TVF input; the
-outer operations then execute through the staged engine. A declaration with
-no valid boundary still fails with `RegionKeyContractViolation` or
-`RegionUnsupportedConstruct`; unsupported declarations do not silently fall
-back to fully staged execution.
+outer operations then execute through the staged engine. The declaration
+requests regional execution wherever compatible; a block with no valid
+region uses ordinary execution. Incompatible window partitions, coarser
+groups, and global sort/limit boundaries can feed a later region through
+staged ingress. Earlier compatible CTEs can independently form regions within
+that ingress, preserving the user's operator order. Invalid SQL still raises
+its ordinary error. Stage provenance and region traces distinguish actual
+engagement from fallback.
+
+SQL windows use the ordinary window evaluator on complete shard-local
+partitions. The compiler resolves partition, order, argument, and output
+names once, and verifies that every window partition retains the routed key.
+Different specs share sorting when their partition/order keys match; frame
+and NULL behavior remains per call. Worker instances borrow input columns
+and retain output buffers. Ranking, distribution, offset, value, and aggregate
+window functions therefore share semantics with ordinary SQL rather than
+requiring separate regional implementations.
+
+Frame evaluation distinguishes physical rows (`ROWS`), peers (`RANGE`), and
+peer groups (`GROUPS`). Bounded `RANGE` currently accepts one numeric order
+column; decimal offsets respect the order column's scale. `FIRST_VALUE`,
+`LAST_VALUE`, and `NTH_VALUE` honor the actual frame, including empty frames
+and `IGNORE NULLS`. Temporal range offsets and `EXCLUDE` remain unsupported.
 
 Entry expressions may replace SQL-visible input names while retaining their
 original inputs under distinct physical slots. Projection expansion uses the
@@ -433,7 +452,7 @@ avoiding repeated evaluation of join inputs for unsupported outer candidates.
 The declaration fingerprint covers the original subtree, source table
 versions, and table-function identities before compilation's shared-IR
 rewrites; the stored anchor hash identifies its cached program.
-The key contract, kernel identities, consumed table versions, and fresh scan
+The declared keys, kernel identities, consumed table versions, and fresh scan
 schemas are revalidated. Operations above the cached boundary compile
 normally against current data.
 For temporary tables held entirely in memory, up to 16,384 rows and 4 MiB,

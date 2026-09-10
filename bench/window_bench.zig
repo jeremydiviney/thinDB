@@ -561,7 +561,7 @@ fn run_keyed_regions(allocator: Allocator, io: Io) !void {
     try table.insert(rows);
     try table.flush();
 
-    const body =
+    const lag_body =
         \\w AS (
         \\  SELECT grp_hi, id, qty,
         \\    ROW_NUMBER() OVER (PARTITION BY grp_hi ORDER BY id) AS rn,
@@ -574,35 +574,52 @@ fn run_keyed_regions(allocator: Allocator, io: Io) !void {
         \\)
         \\SELECT SUM(prior) AS total, SUM(next_prior) AS next_total FROM s
     ;
-    inline for (.{
-        .{ .label = "scan", .entry = "input_rows AS (SELECT grp_hi, id, qty FROM t WHERE id >= 0), " },
-        .{ .label = "UNION ALL", .entry =
-        \\input_rows AS (
-        \\  SELECT grp_hi, id, qty FROM t WHERE id < 500000
-        \\  UNION ALL
-        \\  SELECT grp_hi, id, qty FROM t WHERE id >= 500000
-        \\),
-        },
-    }) |case| {
-        const queries = [_][]const u8{ "WITH " ++ case.entry ++ body, "WITH KEYED BY (grp_hi) " ++ case.entry ++ body };
-        const baseline = try measure_region_sql(allocator, io, db, queries[0]);
-        const warm = try measure_region_sql(allocator, io, db, queries[1]);
-        if (!std.meta.eql(baseline.totals, warm.totals)) return error.ResultMismatch;
-        var samples: [2][5]u64 = undefined;
-        for (0..5) |iteration| {
-            for (0..2) |position| {
-                const arm = (iteration + position) % 2;
-                const measurement = try measure_region_sql(allocator, io, db, queries[arm]);
-                if (!std.meta.eql(baseline.totals, measurement.totals)) return error.ResultMismatch;
-                samples[arm][iteration] = measurement.elapsed_ns;
+    const generic_body =
+        \\w AS (
+        \\ SELECT grp_hi, id, qty,
+        \\   LAG(qty, 1, 0) OVER (PARTITION BY grp_hi ORDER BY id) AS prior
+        \\ FROM input_rows
+        \\), s AS (
+        \\ SELECT grp_hi, id, prior,
+        \\   SUM(prior) OVER (PARTITION BY grp_hi ORDER BY id ROWS UNBOUNDED PRECEDING) AS running,
+        \\   LAST_VALUE(qty) OVER (PARTITION BY grp_hi ORDER BY qty DESC, id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_qty
+        \\ FROM w
+        \\), combined AS (
+        \\ SELECT grp_hi, id, prior, running + last_qty AS next_prior FROM s
+        \\)
+        \\SELECT SUM(prior) AS total, SUM(next_prior) AS next_total FROM combined
+    ;
+    inline for (.{ .{ .label = "LAG", .body = lag_body }, .{ .label = "mixed windows", .body = generic_body } }) |shape| {
+        inline for (.{
+            .{ .label = "scan", .entry = "input_rows AS (SELECT grp_hi, id, qty FROM t WHERE id >= 0), " },
+            .{ .label = "UNION ALL", .entry =
+            \\input_rows AS (
+            \\  SELECT grp_hi, id, qty FROM t WHERE id < 500000
+            \\  UNION ALL
+            \\  SELECT grp_hi, id, qty FROM t WHERE id >= 500000
+            \\),
+            },
+        }) |case| {
+            const queries = [_][]const u8{ "WITH " ++ case.entry ++ shape.body, "WITH KEYED BY (grp_hi) " ++ case.entry ++ shape.body };
+            const baseline = try measure_region_sql(allocator, io, db, queries[0]);
+            const warm = try measure_region_sql(allocator, io, db, queries[1]);
+            if (!std.meta.eql(baseline.totals, warm.totals)) return error.ResultMismatch;
+            var samples: [2][5]u64 = undefined;
+            for (0..5) |iteration| {
+                for (0..2) |position| {
+                    const arm = (iteration + position) % 2;
+                    const measurement = try measure_region_sql(allocator, io, db, queries[arm]);
+                    if (!std.meta.eql(baseline.totals, measurement.totals)) return error.ResultMismatch;
+                    samples[arm][iteration] = measurement.elapsed_ns;
+                }
             }
+            for (&samples) |*arm| std.mem.sort(u64, arm, {}, std.sort.asc(u64));
+            std.debug.print("\nKeyed regions ({s}, {s}): {d} rows, DOP 12, five alternating runs after warmup\n", .{ shape.label, case.label, bench_rows });
+            try report("staged window SQL", bench_rows, samples[0][2], null);
+            try report("keyed window SQL", bench_rows, samples[1][2], null);
+            std.debug.print("value-exact totals={any}; speedup={d:.2}x\n", .{
+                baseline.totals, @as(f64, @floatFromInt(samples[0][2])) / @as(f64, @floatFromInt(samples[1][2])),
+            });
         }
-        for (&samples) |*arm| std.mem.sort(u64, arm, {}, std.sort.asc(u64));
-        std.debug.print("\nKeyed regions ({s}): {d} rows, DOP 12, five alternating runs after warmup\n", .{ case.label, bench_rows });
-        try report("staged window SQL", bench_rows, samples[0][2], null);
-        try report("keyed window SQL", bench_rows, samples[1][2], null);
-        std.debug.print("value-exact totals={any}; speedup={d:.2}x\n", .{
-            baseline.totals, @as(f64, @floatFromInt(samples[0][2])) / @as(f64, @floatFromInt(samples[1][2])),
-        });
     }
 }

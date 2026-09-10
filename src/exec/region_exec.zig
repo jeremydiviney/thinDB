@@ -28,6 +28,8 @@ const Batch = exec.Batch;
 const compute_mod = @import("compute.zig");
 const single_batch = @import("single_batch.zig");
 const udf_mod = @import("../udf.zig");
+const window_mod = @import("window.zig");
+const ir = @import("../ir/ir.zig");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -1001,6 +1003,7 @@ fn sortedBytesContains(items: []const []const u8, key: []const u8) bool {
 }
 
 pub const RegionOp = union(enum) {
+    window: struct { specs: []const ir.WindowSpec, calls: []const ir.WindowCall },
     /// Row-wise derived columns via the engine expression evaluator (one
     /// exec.Compute instance per worker, evalBatch over the whole shard).
     /// Same-named derived columns REPLACE their frame slot, others append —
@@ -1174,6 +1177,11 @@ pub const Program = struct {
             if (output_schema.len != 0) return error.UnsupportedQueryShape;
             const in = schema_at[oi];
             schema_at[oi + 1] = switch (op) {
+                .window => |w| blk: {
+                    var inst = try make_window_instance(base_alloc, in, w.specs, w.calls);
+                    defer inst.q.deinit();
+                    break :blk try dupeSchema(a, inst.ptr.outputSchema());
+                },
                 .compute => |c| try computeOutputSchema(base_alloc, a, in, c.derived, registry),
                 .ranks => |r| blk: {
                     for (r.order) |ob| if (ob.col >= in.len) return error.UnsupportedQueryShape;
@@ -1446,6 +1454,14 @@ fn require_window_value(t: types.Type) !void {
 }
 
 const ComputeInstance = struct { q: exec.Query, ptr: *compute_mod.Compute };
+const WindowInstance = struct { q: exec.Query, ptr: *window_mod.Window };
+
+fn make_window_instance(gpa: Allocator, schema: []const Column, specs: []const ir.WindowSpec, calls: []const ir.WindowCall) !WindowInstance {
+    var src = try single_batch.SingleBatchSource.create(gpa, .{ .schema = schema, .values = &.{}, .row_count = 0 });
+    errdefer src.deinit();
+    const q = try window_mod.Window.create(gpa, src, specs, calls, 1);
+    return .{ .q = q, .ptr = exec.queryAs(window_mod.Window, q).? };
+}
 
 /// A Compute over a zero-row SingleBatchSource: never pulled as a Query —
 /// the interpreter drives it via evalBatch, the source exists to carry the
@@ -1493,6 +1509,7 @@ pub const RegionWorker = struct {
     side_data: []const ShardData = &.{},
 
     const OpState = union(enum) {
+        window: WindowInstance,
         compute: ComputeInstance,
         ranks: struct { out: ColumnStore },
         fill_last: struct { out: ColumnStore },
@@ -1544,6 +1561,7 @@ pub const RegionWorker = struct {
         }
         for (prog.ops, states, 0..) |op, *st, oi| {
             st.* = switch (op) {
+                .window => |w| .{ .window = try make_window_instance(alloc, prog.schema_at[oi], w.specs, w.calls) },
                 .compute => |c| .{
                     .compute = try makeComputeInstance(alloc, prog.schema_at[oi], c.derived, prog.registry),
                 },
@@ -1687,6 +1705,7 @@ pub const RegionWorker = struct {
     fn deinitStates(alloc: Allocator, states: []OpState) void {
         for (states) |*st| switch (st.*) {
             .compute => |*c| c.q.deinit(),
+            .window => |*w| w.q.deinit(),
             .ranks => |*s| s.out.deinit(alloc),
             .fill_last => |*s| s.out.deinit(alloc),
             .lag => |*s| s.out.deinit(alloc),
@@ -1720,6 +1739,11 @@ pub const RegionWorker = struct {
     pub fn retainedBytes(self: *const RegionWorker) usize {
         var n: usize = self.scratch.queryCapacity();
         for (self.states) |*st| switch (st.*) {
+            .window => |*w| {
+                for (w.ptr.output_columns) |*c| n += storeRetainedBytes(c);
+                for (w.ptr.string_outputs) |s| n += s.len * @sizeOf(?[]const u8);
+                for (w.ptr.acc_arenas) |a| n += a.queryCapacity();
+            },
             .compute, .emit, .view_cols => {},
             .const_cols => |*s| for (s.out) |*c| {
                 n += storeRetainedBytes(c);
@@ -1780,6 +1804,15 @@ pub const RegionWorker = struct {
                 self.op_ticks.?[oi] += exec.prof.nowTicks() - t_op;
             };
             switch (op) {
+                .window => {
+                    const batch = try st.window.ptr.eval_batch(.{
+                        .schema = self.prog.schema_at[oi],
+                        .values = fr.views[0..fr.width],
+                        .row_count = fr.rows,
+                    });
+                    @memcpy(fr.views[0..batch.values.len], batch.values);
+                    fr.width = batch.values.len;
+                },
                 .compute => {
                     const b = try st.compute.ptr.evalBatch(.{
                         .schema = self.prog.schema_at[oi],

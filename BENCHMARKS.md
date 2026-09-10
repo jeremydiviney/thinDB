@@ -7,6 +7,26 @@ Snapshot of `zig build bench -Doptimize=ReleaseFast` results, captured for refer
 
 To regenerate: `zig build bench` (always built ReleaseFast regardless of `-Doptimize`).
 
+## SQL window regions (2026-09-10)
+
+`zig build bench-regions` compares ordinary and explicitly keyed SQL over
+1,000,000 rows at DOP 12. Each arm receives one warmup and five alternating
+measured runs. The harness requires actual region engagement through the
+downstream window and matching aggregate totals. It also runs within
+`zig build bench`; the following medians come from that full local run:
+
+| Pipeline | Input | Ordinary SQL | Keyed SQL | Speedup |
+|---|---|---:|---:|---:|
+| LAG chain | Scan | 63.07 ms | 54.69 ms | 1.15x |
+| LAG chain | UNION ALL | 65.10 ms | 36.71 ms | 1.77x |
+| LAG default, running SUM, ordered LAST_VALUE | Scan | 98.49 ms | 66.98 ms | 1.47x |
+| LAG default, running SUM, ordered LAST_VALUE | UNION ALL | 101.41 ms | 49.76 ms | 2.04x |
+
+The separate focused run measured 1.37–1.69x across these cases. These are
+synthetic SQL measurements, not Sierra/AirDNA rollforward results. See
+[the implementation handoff](docs/plans/REGION_ELIGIBILITY_PLAN.md) for
+coverage, frame semantics, fallback behavior, and validation.
+
 ---
 
 ## Core operations (1 M rows)

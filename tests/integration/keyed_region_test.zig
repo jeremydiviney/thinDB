@@ -3,8 +3,8 @@
 //! validated by value-equality against the identical pipeline without the
 //! declaration (mono engine). Data is tie-free within each key partition so
 //! both paths are deterministic and comparable row-for-row. Also covers the
-//! hard-decline contract (a declared block that can't compile is a query
-//! error, never a silent fallback) and NULL-key rows.
+//! ordinary fallback for incompatible partitions, regional reentry across
+//! CTE boundaries, explicit frame results, and NULL-key rows.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -69,6 +69,10 @@ fn runToText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]u8 {
 }
 
 fn run_to_text(allocator: std.mem.Allocator, db: anytype, sql: []const u8, region_column: ?[]const u8) ![]u8 {
+    return run_to_text_checked(allocator, db, sql, region_column, true);
+}
+
+fn run_to_text_checked(allocator: std.mem.Allocator, db: anytype, sql: []const u8, region_column: ?[]const u8, require_region: bool) ![]u8 {
     var q = try helpers.runSql(allocator, db, sql);
     defer q.deinit();
     if (std.mem.indexOf(u8, sql, "KEYED BY") != null) {
@@ -81,7 +85,7 @@ fn run_to_text(allocator: std.mem.Allocator, db: anytype, sql: []const u8, regio
             }
             if (stage.is_keyed_region) region_found = true;
         }
-        try std.testing.expect(region_found);
+        try std.testing.expectEqual(require_region, region_found);
     }
     const schema = q.outputSchema();
     var out: std.ArrayList(u8) = .empty;
@@ -202,7 +206,7 @@ test "keyed region: filter below the block composes and matches mono" {
     try std.testing.expectEqualStrings(mono, keyed);
 }
 
-test "keyed region: declared block that violates the key contract is a hard error" {
+test "keyed region: incompatible partition uses ordinary execution" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -210,18 +214,24 @@ test "keyed region: declared block that violates the key contract is a hard erro
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    // The window partitions by a non-key column: per-key execution cannot
-    // honor it, and a DECLARED block must fail the query — no silent
-    // fallback to the mono engine.
-    try helpers.expectRunError(allocator, db,
-        \\WITH KEYED BY (custLC)
+    try expect_fallback_matches(allocator, db, "custLC",
         \\r AS (
         \\  SELECT custLC, month,
         \\         ROW_NUMBER() OVER (PARTITION BY month ORDER BY custLC) AS rn
         \\  FROM inv
         \\)
         \\SELECT custLC, SUM(rn) AS s FROM r GROUP BY custLC ORDER BY custLC ASC
-    , error.RegionKeyContractViolation);
+    );
+}
+
+fn expect_fallback_matches(allocator: std.mem.Allocator, db: *thindb.Database, comptime keys: []const u8, comptime body: []const u8) !void {
+    const mono = try runToText(allocator, db, "WITH " ++ body);
+    defer allocator.free(mono);
+    for (0..2) |_| {
+        const keyed = try run_to_text_checked(allocator, db, "WITH KEYED BY (" ++ keys ++ ") " ++ body, null, false);
+        defer allocator.free(keyed);
+        try std.testing.expectEqualStrings(mono, keyed);
+    }
 }
 
 fn expect_keyed_matches(allocator: std.mem.Allocator, db: *thindb.Database, comptime body: []const u8, region_column: []const u8) !void {
@@ -292,7 +302,7 @@ test "keyed region: cached inner boundaries preserve fresh outer joins and chang
     const after = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, "rn");
     defer allocator.free(after);
     try std.testing.expect(!std.mem.eql(u8, before, after));
-    try helpers.expectRunError(allocator, db, "WITH KEYED BY (month) " ++ body, error.RegionKeyContractViolation);
+    try expect_fallback_matches(allocator, db, "month", body);
     try helpers.exec(allocator, db, "ALTER TABLE sides ADD COLUMN more INT DEFAULT 5");
     try expect_keyed_matches(allocator, db, body, "rn");
     try expect_keyed_matches(allocator, db,
@@ -653,6 +663,91 @@ test "keyed region: LAG honors partition boundaries offsets source NULLs and ind
     }
 }
 
+test "keyed region: SQL window probe LAG defaults and ordered LAST_VALUE" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+
+    inline for (.{
+        "LAG(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY month, id)",
+        "LAST_VALUE(amount) OVER (PARTITION BY custLC ORDER BY month DESC, id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+    }) |window| {
+        try expect_keyed_matches(allocator, db, "w AS (SELECT id, custLC, " ++ window ++ " AS probe FROM inv WHERE projectId = 100) " ++
+            "SELECT id, custLC, probe FROM w ORDER BY id", "probe");
+    }
+}
+
+test "keyed region: SQL windows share all function families and multiple partition orders" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "INSERT INTO inv VALUES (1001,100,'cust_0',9,NULL),(1002,100,'cust_0',8,400)");
+    const table = try db.openTable("inv", .{});
+    try table.flush();
+
+    inline for (.{
+        "ROW_NUMBER()",        "RANK()",             "DENSE_RANK()",         "NTILE(3)",                         "PERCENT_RANK()",                  "CUME_DIST()",
+        "LAG(amount)",         "LEAD(amount, 2, 0)", "LAG(amount, 99, id)",  "LEAD(custLC, 1, 'missing')",       "LAG(amount) IGNORE NULLS",        "LEAD(amount) IGNORE NULLS",
+        "FIRST_VALUE(amount)", "LAST_VALUE(amount)", "NTH_VALUE(amount, 2)", "FIRST_VALUE(amount) IGNORE NULLS", "LAST_VALUE(amount) IGNORE NULLS", "NTH_VALUE(amount, 2) IGNORE NULLS",
+        "SUM(amount)",         "AVG(amount)",        "COUNT(*)",             "COUNT(amount)",                    "MIN(amount)",                     "MAX(amount)",
+        "MIN(custLC)",         "MAX(custLC)",
+    }) |call| {
+        try expect_keyed_matches(allocator, db, "w AS (SELECT id, projectId, custLC, " ++ call ++
+            " OVER (PARTITION BY projectId, custLC ORDER BY month DESC, id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS probe, " ++
+            "SUM(amount) OVER (PARTITION BY custLC) AS all_projects, " ++
+            "ROW_NUMBER() OVER (PARTITION BY custLC, month ORDER BY id DESC) AS month_rank FROM inv) " ++
+            "SELECT id, probe, all_projects, month_rank FROM w ORDER BY id", "probe");
+    }
+}
+
+test "keyed region: SQL window frames have explicit peer and empty-frame results" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE frames (id BIGINT PRIMARY KEY, custLC VARCHAR(32), ord INT, amount BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO frames VALUES (1,'a',1,10),(2,'a',1,20),(3,'a',3,NULL),(4,'a',4,40),(5,'b',1,100),(6,NULL,1,200)");
+    const table = try db.openTable("frames", .{});
+    try table.flush();
+
+    inline for (.{
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY ord)", [4]i64{ 30, 30, 30, 70 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY ord RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)", [4]i64{ 30, 30, -99, 40 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY decimal_ord RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)", [4]i64{ 30, 30, -99, 40 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY double_ord RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)", [4]i64{ 30, 30, -99, 40 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY ord DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)", [4]i64{ 30, 30, 40, 40 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY ord GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)", [4]i64{ 30, 30, 30, 40 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY ord DESC GROUPS BETWEEN 1 FOLLOWING AND 1 FOLLOWING)", [4]i64{ -99, -99, 30, -99 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY ord, id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)", [4]i64{ 10, 30, 20, 40 } },
+        .{ "LAST_VALUE(amount) OVER (PARTITION BY custLC ORDER BY ord)", [4]i64{ 20, 20, -99, 40 } },
+        .{ "FIRST_VALUE(amount) IGNORE NULLS OVER (PARTITION BY custLC ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)", [4]i64{ 10, 20, 40, 40 } },
+        .{ "FIRST_VALUE(amount) IGNORE NULLS OVER (PARTITION BY custLC ORDER BY amount)", [4]i64{ 10, 10, -99, 10 } },
+        .{ "FIRST_VALUE(amount) OVER (PARTITION BY custLC ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING)", [4]i64{ 20, -99, 40, -99 } },
+        .{ "NTH_VALUE(amount, 2) OVER (PARTITION BY custLC ORDER BY id)", [4]i64{ -99, 20, 20, 20 } },
+        .{ "LEAD(amount, 9223372036854775807, 7) OVER (PARTITION BY custLC ORDER BY id)", [4]i64{ 7, 7, 7, 7 } },
+        .{ "LAG(amount, 9223372036854775807, 7) OVER (PARTITION BY custLC ORDER BY id)", [4]i64{ 7, 7, 7, 7 } },
+        .{ "COUNT(*) OVER (PARTITION BY custLC ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING)", [4]i64{ 2, 1, 0, 0 } },
+        .{ "SUM(amount) OVER (PARTITION BY custLC ORDER BY ord RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING)", [4]i64{ -99, -99, 40, -99 } },
+    }) |case| {
+        const body = "frame_input AS (SELECT *, CAST(ord AS DECIMAL(10,2)) AS decimal_ord, CAST(ord AS DOUBLE) AS double_ord FROM frames), " ++
+            "w AS (SELECT id, custLC, " ++ case[0] ++ " AS probe FROM frame_input) " ++
+            "SELECT COALESCE(probe, -99) AS result FROM w WHERE custLC = 'a' ORDER BY id";
+        try expect_keyed_matches(allocator, db, body, "probe");
+        const actual = try helpers.collectBigints(allocator, db, "WITH " ++ body);
+        defer allocator.free(actual);
+        const expected = case[1];
+        try std.testing.expectEqualSlices(i64, &expected, actual);
+    }
+    inline for (.{ "", "KEYED BY (custLC) " }) |declaration| {
+        try helpers.expectRunError(allocator, db, "WITH " ++ declaration ++ "w AS (SELECT SUM(amount) OVER (PARTITION BY custLC ORDER BY ord, id RANGE 1 PRECEDING) AS probe FROM frames) SELECT * FROM w", error.WindowUnsupported);
+    }
+}
+
 test "keyed region: BIGINT sums preserve widening and values beyond i64" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -849,11 +944,58 @@ test "keyed region: UNION ALL cached executions refresh both branches and their 
     const replacement = try db.openTable("right_arm", .{});
     try replacement.flush();
     try expect_keyed_matches(allocator, db, body, "prior");
-    try helpers.expectRunError(allocator, db, "WITH KEYED BY (id) " ++ body, error.RegionUnsupportedConstruct);
+    try expect_fallback_matches(allocator, db, "id", body);
     try helpers.expectRunError(allocator, db,
         \\WITH KEYED BY (custLC) u AS (
         \\  SELECT custLC, amount FROM inv UNION ALL SELECT custLC FROM right_arm
         \\), g AS (SELECT custLC, SUM(amount) AS total FROM u GROUP BY custLC)
         \\SELECT * FROM g
-    , error.RegionUnsupportedConstruct);
+    , error.TypeMismatch);
+}
+
+fn region_count(query: thindb.exec.Query) usize {
+    if (thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, query)) |root| {
+        var count: usize = 0;
+        for (root.set.stages.items) |stage| count += region_count(stage.query);
+        return count;
+    }
+    if (thindb.exec.queryAs(thindb.exec.region_exec.RegionExecOp, query)) |region| {
+        var count: usize = 1;
+        for (region.sources) |source| count += region_count(source);
+        return count;
+    }
+    return 0;
+}
+
+test "keyed region: SQL windows reenter regions around a global window CTE" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    const body =
+        \\local_window AS (
+        \\ SELECT id, custLC, month, amount,
+        \\   LAG(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY id) AS prior
+        \\ FROM inv
+        \\), global_window AS (
+        \\ SELECT *, SUM(amount) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS global_sum
+        \\ FROM local_window
+        \\), local_again AS (
+        \\ SELECT *, LEAD(global_sum, 1, 0) OVER (PARTITION BY custLC ORDER BY id) AS next_sum
+        \\ FROM global_window
+        \\)
+        \\SELECT id, custLC, prior, global_sum, next_sum FROM local_again ORDER BY id
+    ;
+    for (0..2) |_| {
+        var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+        defer query.deinit();
+        try std.testing.expectEqual(@as(usize, 2), region_count(query.cq.query));
+        while (try query.next()) |_| {}
+    }
+    try expect_keyed_matches(allocator, db, body, "next_sum");
+    try helpers.exec(allocator, db, "INSERT INTO inv VALUES (2001,100,'cust_0',12,321)");
+    const table = try db.openTable("inv", .{});
+    try table.flush();
+    try expect_keyed_matches(allocator, db, body, "next_sum");
 }

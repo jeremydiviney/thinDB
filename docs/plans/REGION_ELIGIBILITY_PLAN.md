@@ -1,5 +1,72 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Shared SQL windows and ordinary fallback (2026-09-10)
+
+The follow-up implementation replaces the SQL window whitelist with a
+regional `window` operation backed by `exec/window.zig`. Ordinary and keyed
+execution now share the evaluator for all sixteen existing window function
+kinds: ranking/distribution, LAG/LEAD, FIRST/LAST/NTH_VALUE, and aggregates.
+Partition and order references, arguments, defaults, output types, and aliases
+are resolved once. Each worker borrows its complete shard input and reuses
+output stores. Regional admission checks that every partition retains the
+actual routed key; compatible partitions may have different extra columns
+and sort orders. TVF passthrough views preserve route-key identity.
+
+The initial LAG-with-default probe failed before the change. It and the
+multi-column LAST_VALUE probe now execute inside regions with value parity. Broader tests
+cover mixed specs, ascending/descending orders, NULL keys/values, string
+results, default columns, large offsets, cached execution, and source changes.
+
+Shared evaluation exposed existing frame bugs: FIRST_VALUE ignored its frame,
+and RANGE/GROUPS were evaluated as physical ROWS. Frame-aware value functions
+now respect frame bounds, including IGNORE NULLS and empty frames. RANGE
+includes peers and supports integer offsets over one numeric order column
+(including scaled decimals); GROUPS advances by peer groups. Prefix aggregate
+frames retain a linear evaluation path with peer broadcasting. The old
+whole-partition FIRST_VALUE tests now specify that frame explicitly, and new
+tests assert expected values separately from keyed/ordinary parity. Temporal
+RANGE offsets and EXCLUDE remain unsupported. Semantics reference:
+[PostgreSQL window functions](https://www.postgresql.org/docs/current/functions-window.html).
+
+As requested, KEYED BY now permits ordinary fallback instead of making lack
+of regional coverage a query error. This supersedes the older hard-decline
+contract below. Incompatible window/group partitions and global sort/limit
+boundaries can become staged ingress for a later region. Earlier compatible
+CTEs within that ingress can independently use regions. A regression test
+asserts exactly two regions around a global window and compares every value,
+including cached runs and changed input. Invalid SQL still reports its normal
+semantic error; fallback tests explicitly verify that no region engaged.
+Declared keys are retained in cache entries and compared before reuse.
+
+The focused local ReleaseFast benchmark uses 1,000,000 synthetic rows, DOP 12,
+one warmup and five alternating measured runs per arm. Every keyed execution
+must include the downstream window in its region; aggregate totals must match.
+Medians from `.bench-data/sql-window-bench.log`:
+
+| SQL pipeline | Ingress | Ordinary | Keyed | Speedup |
+|---|---|---:|---:|---:|
+| LAG chain | Scan | 63.40 ms | 46.20 ms | 1.37x |
+| LAG chain | UNION ALL | 61.52 ms | 38.32 ms | 1.61x |
+| LAG default + running SUM + ordered LAST_VALUE | Scan | 95.93 ms | 56.91 ms | 1.69x |
+| LAG default + running SUM + ordered LAST_VALUE | UNION ALL | 94.67 ms | 59.49 ms | 1.59x |
+
+Validation: `zig build test -j2` completed with exit 0: 823 integration tests,
+113 client/server tests, and 533 unit tests passed; five existing unit tests
+were skipped. After helper naming cleanup, the focused window/region suite
+was rerun. `zig build bench-regions -j2` and `zig build bench -j2` both completed
+with exit 0. In the full general benchmark run, the four keyed comparisons
+measured 1.15x, 1.77x, 1.47x, and 2.04x respectively; retain both runs rather
+than treating the small synthetic timing differences as a stable gain.
+Logs are `.bench-data/sql-window-full-test-final.log`,
+`sql-window-final-targeted.log`, and `sql-window-full-bench.log`.
+
+These are local synthetic comparisons, not new Sierra/AirDNA results. The
+next application-level measurement must replay the full SQL rollforward arm,
+verify values and regional coverage, and retain the bounded, separate-phase
+server procedure documented below. A mixed-spec window operator with an
+incompatible partition currently stages as a unit; adjacent compatible CTEs
+can still use regions.
+
 ### Plain SQL region eligibility and UDF attribution (2026-09-10)
 
 Checkpoint commit `516c454` preserves the earlier benchmark documentation and

@@ -1,11 +1,10 @@
 //! Keyed pipeline regions: the compiler for `WITH KEYED BY (...)` blocks
 //! (tasks #184/#185, docs/plans/REGION_PLAN.md §7).
 //!
-//! The declaration is a hard contract: every GROUP BY / window PARTITION BY
-//! / TVF PARTITION BY in the block contains the declared keys (statically
-//! verified — violations are compile errors, never silent fallback). A
-//! verified block compiles into ONE region program: exchange-scatter the
-//! base scan by a declared key's hash, then run the whole chain
+//! The compiler checks partitions against the declared keys before forming
+//! a region. Incompatible operators execute through ordinary stages; a
+//! later compatible CTE can enter a new region. Each region partitions its
+//! input by a declared key's hash, then runs its operator chain
 //! shard-locally with zero stage materializations. There is no fixed query
 //! shape — the block's IR is collected into an ordered step list and each
 //! step dispatches on STRUCTURE and kernel SDK METADATA (execution mode,
@@ -62,17 +61,15 @@ pub const Recognized = struct {
     query: exec.Query,
 };
 // ---------------------------------------------------------------------------
-// Declared regions: `WITH KEYED BY (k1, ...)`. The declaration is a HARD
-// contract — the block must verify (every GROUP BY / window PARTITION BY /
-// TVF PARTITION BY along the pipeline contains the declared keys) and must
-// compile as a region; violations and unsupported constructs are compile
-// errors, never a silent fall-back to the staged path. Join right sides and
-// secondary TVF inputs are exempt from the key check: they are broadcast /
+// Declared regions: `WITH KEYED BY (k1, ...)`. Only compatible portions run
+// within regions; unsupported portions retain ordinary SQL execution.
+// Join right sides and secondary TVF inputs are exempt from the key check:
+// they are broadcast /
 // empty-proof candidates the region compiler validates by executing them.
 // ---------------------------------------------------------------------------
 
-/// Entry for the declared path (no env gate). Returns null when the query
-/// declares no keyed block; errors when it declares one that can't run.
+/// Returns null when no declared boundary can run regionally. Ordinary SQL
+/// compilation then preserves both query results and semantic errors.
 pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerror!?Recognized {
     // Find the topmost CTE boundary carrying declared keys.
     var cur = root;
@@ -124,8 +121,8 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     // a boundary whose subtree contains a coarser-than-keys partition is
     // not a legal region root, but a boundary BELOW that partition can be —
     // the rollup then consumes the region's output in the normal engine.
-    // The hard RegionKeyContractViolation remains when NO boundary
-    // conforms (the declaration is then a genuine mistake).
+    // Incompatible windows may also become ordinary ingress for a region
+    // above them; collectPipeline makes that cut before adding the window.
     var any_conforming = false;
     cur = top;
     depth = 0;
@@ -147,7 +144,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                     // recomputed hash would never match its own store.
                     const bh = hashAnchor(cur);
                     const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = depth } else null;
-                    if (tryCachedAt(input, cur, bh, declaration)) |q| {
+                    if (tryCachedAt(input, cur, keys, bh, declaration)) |q| {
                         if (shape_hash) |shape| if (cacheFor(input.db)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     }
@@ -174,12 +171,10 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
             else => cur = region_spine_upstream(cur) orelse break,
         }
     }
-    if (!any_conforming) {
-        std.debug.print("[region] KEYED BY block did not compile: no boundary satisfies the key contract\n", .{});
-        return error.RegionKeyContractViolation;
+    if (getenv("THINDB_REGION_TRACE") != null) {
+        std.debug.print("[region] ordinary execution: {s}\n", .{if (any_conforming) "no supported region boundary" else "no compatible key boundary"});
     }
-    std.debug.print("[region] KEYED BY block did not compile: no conforming boundary matches a supported region shape\n", .{});
-    return error.RegionUnsupportedConstruct;
+    return null;
 }
 
 fn region_spine_upstream(op: *const ir.Op) ?*const ir.Op {
@@ -200,9 +195,8 @@ fn region_spine_upstream(op: *const ir.Op) ?*const ir.Op {
 }
 
 /// Static half of the contract: walk the block's pipeline (left/primary
-/// spine) and require every partition-defining construct to contain every
-/// declared key. Stages may partition FINER (extra columns), never coarser —
-/// that is what guarantees no row ever needs another shard's data.
+/// spine) until an ordinary ingress boundary is needed. Each regional
+/// partition contains the declared keys, so it never needs another shard.
 fn verifyKeyContract(op: *const ir.Op, keys: []const []const u8, depth: usize) anyerror!void {
     if (depth > 64) return error.RegionUnsupportedConstruct;
     var cur = op;
@@ -219,15 +213,15 @@ fn verifyKeyContract(op: *const ir.Op, keys: []const []const u8, depth: usize) a
             .limit => |l| cur = l.upstream,
             .order_by => |o| cur = o.upstream,
             .group_by => |g| {
-                try requireKeys(keys, g.group_cols, "GROUP BY");
+                if (!contains_keys(keys, g.group_cols)) return;
                 cur = g.upstream;
             },
             .window => |w| {
-                for (w.specs) |spec| try requireKeys(keys, spec.partition_by, "window PARTITION BY");
+                for (w.specs) |spec| if (!contains_keys(keys, spec.partition_by)) return;
                 cur = w.upstream;
             },
             .table_fn => |t| {
-                if (t.partition_by.len > 0) try requireKeys(keys, t.partition_by, "TABLE(...) PARTITION BY");
+                if (t.partition_by.len > 0 and !contains_keys(keys, t.partition_by)) return;
                 if (t.inputs.len == 0) return;
                 cur = t.inputs[0];
             },
@@ -245,16 +239,14 @@ fn verifyKeyContract(op: *const ir.Op, keys: []const []const u8, depth: usize) a
     return error.RegionUnsupportedConstruct;
 }
 
-fn requireKeys(keys: []const []const u8, cols: []const []const u8, what: []const u8) !void {
+fn contains_keys(keys: []const []const u8, cols: []const []const u8) bool {
     outer: for (keys) |k| {
         for (cols) |c| {
             if (std.ascii.eqlIgnoreCase(lastSegment(c), lastSegment(k))) continue :outer;
         }
-        std.debug.print("[region] KEYED BY contract violation: a {s} does not include declared key '{s}' (partitions on:", .{ what, k });
-        for (cols) |c| std.debug.print(" {s}", .{c});
-        std.debug.print(")\n", .{});
-        return error.RegionKeyContractViolation;
+        return false;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -691,16 +683,20 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
     // IR. Its current anchor hash need not match the post-drain cache hash;
     // tryCachedAt uses the stored hash to identify the program, then checks
     // kernel/table versions and rebuilds scans against fresh snapshots.
-    const query = tryCachedAt(input, anchor, selected.anchor_hash, null) orelse return null;
+    const query = tryCachedAt(input, anchor, keys, selected.anchor_hash, null) orelse return null;
     return .{ .anchor = anchor, .query = query };
 }
 
-fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
+fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
     const hash = anchor_hash orelse return null;
     const cache = cacheFor(input.db) orelse return null;
 
     const entry = cache.checkout(hash) orelse return null;
     const ctx = entry.ctx.?;
+    if (ctx.keys.len != keys.len or !contains_keys(ctx.keys, keys)) {
+        CacheEntry.releaseErased(entry);
+        return null;
+    }
     if (!cacheValid(input, ctx)) {
         cache.discard(entry);
         if (getenv("THINDB_REGION_TRACE") != null) {
@@ -736,7 +732,7 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash:
 /// program's — any DDL drift on the scan table declines to a full build.
 fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !exec.Query {
     const qa = input.allocator;
-    var pl = try collectPipeline(input.node_arena, anchor);
+    var pl = try collectPipeline(input.node_arena, anchor, ctx.keys);
 
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
     defer prune_leaves.deinit(qa);
@@ -744,7 +740,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
 
     const table = switch (pl.entry) {
         .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
-        .union_all => null,
+        .staged => null,
     };
     // Same entry transformation as the build path — the cached program's
     // entry schema was derived post-hoist.
@@ -753,7 +749,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     const scan_cols_opt = try entry_scan_columns(input.node_arena, pl);
     const n_threads = @max(input.effectiveDop(), 1);
     const bs = switch (pl.entry) {
-        .union_all => |root| try build_union_source(input, root),
+        .staged => |root| try build_staged_source(input, root, ctx.keys),
         .scan => if (ctx.opts.ordered)
             try buildOrderedSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, ctx.opts.n_threads, lastSegment(anchor.materialize.region_keys.?[0]))
         else
@@ -1290,6 +1286,7 @@ const Ctx = struct {
     entry_schema: []const Column = &.{},
     opts: region.DriverOpts = undefined,
     declaration: ?DeclaredBoundary = null,
+    keys: []const []const u8 = &.{},
     /// Ordered mode: measured per-interval cost, filled by the first run
     /// and frozen — LPT weights for every later hit (arena-owned).
     iv_cost: []i64 = &.{},
@@ -2008,11 +2005,22 @@ const Pipeline = struct {
     entry_filter: PredicateExpr,
     entry: union(enum) {
         scan: *const ir.Op.Scan,
-        union_all: *const ir.Op,
+        staged: *const ir.Op,
     },
 };
 
-fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
+fn staged_pipeline(steps: []const Step, structural_end: usize, entry_root: *const ir.Op) !Pipeline {
+    if (structural_end == 0) return NoMatch;
+    return .{
+        .steps = steps[0..structural_end],
+        .entry_sel = null,
+        .entry_derived = &.{},
+        .entry_filter = .{ .@"and" = &.{} },
+        .entry = .{ .staged = entry_root },
+    };
+}
+
+fn collectPipeline(a: Allocator, anchor: *const ir.Op, keys: []const []const u8) !Pipeline {
     if (anchor.* != .materialize) return NoMatch;
     var steps: std.ArrayListUnmanaged(Step) = .empty;
     var cur: *const ir.Op = anchor.materialize.upstream;
@@ -2043,12 +2051,16 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
                 cur = f.upstream;
             },
             .group_by => |*g| {
+                if (!contains_keys(keys, g.group_cols)) return staged_pipeline(steps.items, structural_end, entry_root);
                 try steps.append(a, .{ .group_by = g });
                 cur = g.upstream;
                 entry_root = cur;
                 structural_end = steps.items.len;
             },
             .window => |*w| {
+                for (w.specs) |spec| {
+                    if (!contains_keys(keys, spec.partition_by)) return staged_pipeline(steps.items, structural_end, entry_root);
+                }
                 try steps.append(a, .{ .window = w });
                 cur = w.upstream;
                 entry_root = cur;
@@ -2062,6 +2074,7 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
             },
             .table_fn => |*t| {
                 if (t.inputs.len == 0) return NoMatch;
+                if (t.partition_by.len > 0 and !contains_keys(keys, t.partition_by)) return staged_pipeline(steps.items, structural_end, entry_root);
                 try steps.append(a, .{ .table_fn = t });
                 cur = t.inputs[0];
                 entry_root = cur;
@@ -2072,13 +2085,7 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
                     if (!u.all or structural_end == 0) return NoMatch;
                     // Keep the entry's projections and filters in their SQL
                     // order, including positional aliases and union casts.
-                    return .{
-                        .steps = steps.items[0..structural_end],
-                        .entry_sel = null,
-                        .entry_derived = &.{},
-                        .entry_filter = .{ .@"and" = &.{} },
-                        .entry = .{ .union_all = entry_root },
-                    };
+                    return staged_pipeline(steps.items, structural_end, entry_root);
                 };
                 try steps.append(a, .{ .union_tvf = arm.ut });
                 cur = arm.base;
@@ -2086,6 +2093,7 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
                 structural_end = steps.items.len;
             },
             .scan => |*s| break :blk s,
+            .order_by, .limit => return staged_pipeline(steps.items, structural_end, entry_root),
             else => return NoMatch,
         }
     } else return NoMatch;
@@ -2300,6 +2308,9 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     errdefer Ctx.destroyErased(ctx);
     const a = ctx.arena.allocator();
     if (cache == null) ctx.uncacheable = true;
+    const keys = try a.alloc([]const u8, declared_keys.len);
+    for (declared_keys, keys) |key, *copy| copy.* = try a.dupe(u8, key);
+    ctx.keys = keys;
 
     var b = Builder{ .input = input, .ctx = ctx, .a = a, .fb = .{ .a = a } };
     var sides_owned = true;
@@ -2312,7 +2323,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     // Query-lifetime arena: the step list and the entry-derived slice are
     // borrowed by the operator (never by the cached ctx).
-    var pl = try collectPipeline(input.node_arena, anchor);
+    var pl = try collectPipeline(input.node_arena, anchor, declared_keys);
     traceMark("walk", &tm);
 
     // ---- entry: prune leaves + literal-pinned columns --------------------
@@ -2321,7 +2332,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     const table = switch (pl.entry) {
         .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
-        .union_all => null,
+        .staged => null,
     };
 
     if (table) |t| try hoistEntryComputes(input.node_arena, t, &pl);
@@ -2374,9 +2385,9 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     b.order_aligned = order_aligned;
     const bs = switch (pl.entry) {
-        .union_all => |root| blk: {
+        .staged => |root| blk: {
             recordSubtreeVersions(&b, root);
-            break :blk try build_union_source(input, root);
+            break :blk try build_staged_source(input, root, declared_keys);
         },
         .scan => if (order_aligned)
             try buildOrderedSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads, lastSegment(declared_keys[0]))
@@ -2981,48 +2992,43 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Va
 }
 
 fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
-    var all_fill = true;
-    for (w.calls) |call| {
-        if (call.func != .last_value) all_fill = false;
-    }
-    if (all_fill) return pushFillLast(b, w);
-    for (w.calls, 0..) |call, i| {
-        const single = ir.WindowOp{ .upstream = w.upstream, .specs = w.specs, .calls = w.calls[i .. i + 1] };
-        switch (call.func) {
-            .row_number => try pushRanksFromWindow(b, &single),
-            .lag => try push_lag(b, w.specs[call.spec_idx], call),
-            else => return NoMatch,
+    const specs = try b.a.alloc(ir.WindowSpec, w.specs.len);
+    for (w.specs, specs) |src, *dst| {
+        const part = try b.a.alloc([]const u8, src.partition_by.len);
+        var contains_route_key = false;
+        for (src.partition_by, part) |name, *physical| {
+            physical.* = b.fb.cols.items[try b.resolveIdx(name)].name;
+            if (std.mem.eql(u8, physical.*, b.route_name)) contains_route_key = true;
         }
-    }
-}
-
-fn push_lag(b: *Builder, spec: ir.WindowSpec, call: ir.WindowCall) !void {
-    if (call.ignore_nulls or call.args.len == 0 or call.args.len > 3) return NoMatch;
-    if (call.args[0] != .col_ref) return NoMatch;
-    if (call.args.len == 3 and call.args[2] != .null_lit) return NoMatch;
-    if (!try b.partitionMatchesRangeKeys(spec.partition_by)) return NoMatch;
-    const offset: usize = if (call.args.len > 1) blk: {
-        if (call.args[1] != .lit) return NoMatch;
-        const value: i64 = switch (call.args[1].lit) {
-            .tinyint => |v| v,
-            .smallint => |v| v,
-            .int => |v| v,
-            .bigint => |v| v,
-            else => return NoMatch,
+        if (!contains_route_key) return NoMatch;
+        const order = try b.a.alloc(ir.SortSpec, src.order_by.len);
+        for (src.order_by, order) |ob, *physical| physical.* = .{
+            .col = b.fb.cols.items[try b.resolveIdx(ob.col)].name,
+            .desc = ob.desc,
         };
-        break :blk std.math.cast(usize, value) orelse return NoMatch;
-    } else 1;
-    const src = try b.resolveIdx(call.args[0].col_ref);
-    const order = try cloneOrder(b, spec.order_by);
+        dst.* = .{ .partition_by = part, .order_by = order, .frame = src.frame };
+    }
+    const calls = try b.a.alloc(ir.WindowCall, w.calls.len);
+    const replaced = try b.a.alloc(?usize, w.calls.len);
+    for (w.calls, calls, replaced) |src, *dst, *prior| {
+        prior.* = if (b.fb.resolve(src.output_name)) |entry| entry.idx else null;
+        const args = try b.a.alloc(ir.Expr, src.args.len);
+        for (src.args, args) |arg, *cloned| {
+            cloned.* = if (arg == .col_ref and std.mem.eql(u8, arg.col_ref, "*")) .{ .col_ref = "*" } else try b.cloneExpr(arg);
+        }
+        dst.* = src;
+        dst.args = args;
+        dst.output_name = try b.fb.canonName(src.output_name);
+    }
     try b.flushPending();
-    const idx = try b.fb.addCol(call.output_name, b.fb.cols.items[src].type, true);
-    try b.ops.append(b.a, .{ .lag = .{
-        .name = b.fb.cols.items[idx].name,
-        .src = src,
-        .offset = offset,
-        .order = order,
-    } });
-    try b.fb.setVis(call.output_name, idx);
+    const columns = try b.a.alloc(Column, calls.len);
+    for (calls, columns) |call, *col| col.* = try @import("../exec/window.zig").output_column(call, b.fb.cols.items);
+    try b.ops.append(b.a, .{ .window = .{ .specs = specs, .calls = calls } });
+    for (w.calls, columns, replaced) |src, col, prior| {
+        const idx = b.fb.cols.items.len;
+        try b.fb.cols.append(b.a, col);
+        try b.bind_compute_output(src.output_name, idx, prior);
+    }
 }
 
 fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror!void {
@@ -4033,10 +4039,12 @@ const BuiltSources = struct {
     iv_rows: []u64 = &.{},
 };
 
-fn build_union_source(input: engine_v2.CompileInput, root: *const ir.Op) !BuiltSources {
+fn build_staged_source(input: engine_v2.CompileInput, root: *const ir.Op, keys: []const []const u8) !BuiltSources {
     const sources = try input.allocator.alloc(exec.Query, 1);
     errdefer input.allocator.free(sources);
-    sources[0] = try cte_stages.compile_region_input(input, root);
+    const entry = try input.node_arena.create(ir.Op);
+    entry.* = .{ .materialize = .{ .upstream = @constCast(root), .region_keys = keys } };
+    sources[0] = try cte_stages.compileStaged(input, entry, null);
     return .{ .sources = sources, .total_rows = sources[0].stats().upper_rows };
 }
 
@@ -4490,60 +4498,10 @@ fn pushAlignedTvf(
             if (b.isConstIdx(source)) try b.const_idxs.append(a, idx);
             break :blk idx;
         };
+        if (std.mem.eql(u8, b.fb.cols.items[source].name, b.route_name)) b.route_name = b.fb.cols.items[idx].name;
         try b.fb.setVis(declared.name, idx);
     }
     if (views.items.len != 0) try b.ops.append(a, .{ .view_cols = views.items });
-}
-
-fn cloneOrder(b: *Builder, specs: []const ir.SortSpec) ![]const region.OrderBy {
-    const out = try b.a.alloc(region.OrderBy, specs.len);
-    for (specs, out) |src, *dst| {
-        dst.* = .{ .col = try b.resolveIdx(src.col), .desc = src.desc };
-    }
-    return out;
-}
-
-/// Every ROW_NUMBER call becomes one ranks op; a partition coarser than the
-/// range keys ranks over merged spans.
-fn pushRanksFromWindow(b: *Builder, w: *const ir.WindowOp) !void {
-    for (w.calls) |call| {
-        if (call.func != .row_number or call.args.len != 0) return NoMatch;
-        const spec = w.specs[call.spec_idx];
-        const merge_on: ?usize = switch (try b.classifyPartition(spec.partition_by)) {
-            .range_exact => null,
-            .merged_span => |m| m,
-        };
-        const order = try cloneOrder(b, spec.order_by);
-        try b.flushPending();
-        const idx = try b.fb.addCol(call.output_name, .bigint, false);
-        try b.ops.append(b.a, .{ .ranks = .{
-            .name = b.fb.cols.items[idx].name,
-            .order = order,
-            .merge_on = merge_on,
-        } });
-        try b.fb.setVis(call.output_name, idx);
-    }
-}
-
-/// LAST_VALUE(col) with an unbounded-following frame over the range keys →
-/// fill_last; a current-row frame is per-row identity (vis re-point only).
-fn pushFillLast(b: *Builder, w: *const ir.WindowOp) !void {
-    for (w.calls) |call| {
-        if (call.func != .last_value or call.args.len != 1) return NoMatch;
-        if (call.args[0] != .col_ref) return NoMatch;
-        const spec = w.specs[call.spec_idx];
-        if (!try b.partitionMatchesRangeKeys(spec.partition_by)) return NoMatch;
-        try checkRangeOrder(b, spec.order_by);
-        const src = try b.resolveIdx(call.args[0].col_ref);
-        if (spec.frame.end != .unbounded_following) {
-            try b.fb.setVis(call.output_name, src);
-            continue;
-        }
-        try b.flushPending();
-        const idx = try b.fb.addCol(call.output_name, b.fb.cols.items[src].type, true);
-        try b.ops.append(b.a, .{ .fill_last = .{ .name = b.fb.cols.items[idx].name, .src = src } });
-        try b.fb.setVis(call.output_name, idx);
-    }
 }
 
 /// Keyed aggregation: group cols must cover every `required` frame column

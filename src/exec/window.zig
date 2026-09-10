@@ -16,10 +16,10 @@
 //!     FOLLOWING otherwise)
 //!   - ROWS BETWEEN <preceding|current|following> AND <...>
 //!
-//! Out of scope (Tier 2+): RANGE framing with N PRECEDING, GROUPS
-//! framing, EXCLUDE clauses, NTH_VALUE, NTILE/PERCENT_RANK/CUME_DIST,
-//! IGNORE NULLS semantics in the operator (parsed but not honored),
-//! string outputs from window functions.
+//! Also supports value/distribution functions, IGNORE NULLS, string outputs,
+//! peer-aware RANGE/GROUPS frames, and numeric offsets for RANGE over a single
+//! order column. EXCLUDE clauses and temporal RANGE offsets are unsupported.
+//! Regional execution borrows a complete shard and calls the same evaluator.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -275,6 +275,13 @@ pub const Window = struct {
             for (sp.order_by, 0..) |s, i| {
                 ocols[i] = lookupCol(input_schema, s.col) orelse return Error.ColumnNotFound;
                 odesc[i] = s.desc;
+            }
+            if (sp.frame.kind == .range and (offset_bound(sp.frame.start) or offset_bound(sp.frame.end))) {
+                if (ocols.len != 1) return Error.WindowUnsupported;
+                switch (input_schema[ocols[0]].type) {
+                    .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128 => {},
+                    else => return Error.WindowUnsupported,
+                }
             }
             spec_indices[si] = .{
                 .partition_cols = pcols,
@@ -540,6 +547,29 @@ pub const Window = struct {
     /// barrier calls this instead of pulling `next()`).
     pub fn ensureDrained(self: *Window) !void {
         if (!self.drained) try self.drainAndEvaluate();
+    }
+
+    /// Regional callers own the complete partitions in this batch. Input
+    /// stores are read-only aliases; only window outputs belong to this
+    /// instance. Reusing the ordinary evaluator keeps frame and NULL rules
+    /// identical without accumulating the shard's input columns again.
+    pub fn eval_batch(self: *Window, batch: Batch) !Batch {
+        if (batch.values.len != self.input_schema.len or self.evicted) return Error.WindowUnsupported;
+        for (batch.values, self.accumulated) |view, *store| store.* = borrowed_store(view);
+        self.accumulated_rows = batch.row_count;
+        try self.evaluate_accumulated();
+        @memcpy(self.views[0..batch.values.len], batch.values);
+        for (self.output_columns, 0..) |*out, ci| {
+            if (isStringType(self.schema[self.input_schema.len + ci].type)) {
+                out.clear();
+                try appendStringScratchRange(self.allocator, self.string_outputs[ci], 0, batch.row_count, out);
+            }
+            self.views[self.input_schema.len + ci] = out.view();
+        }
+        if (self.out_map) |map| {
+            for (map, self.out_views) |src, *dst| dst.* = self.views[src];
+        } else @memcpy(self.out_views, self.views);
+        return .{ .schema = self.out_schema, .values = self.out_views, .row_count = batch.row_count };
     }
 
     /// Sorted variant of the handover: gather EVERY adopted column by the
@@ -1069,8 +1099,13 @@ pub const Window = struct {
         // Borrowed stores are row-aligned by the compile-time contract
         // (no filters in the chain); a mismatch means that contract broke.
         if (self.borrowing and self.accumulated_rows != borrow_expect) return Error.WindowUnsupported;
+        try self.evaluate_accumulated();
+    }
+
+    fn evaluate_accumulated(self: *Window) !void {
         const n: usize = @intCast(self.accumulated_rows);
         if (n == 0) {
+            for (self.output_columns) |*out| out.clear();
             self.drained = true;
             return;
         }
@@ -1085,9 +1120,10 @@ pub const Window = struct {
         for (self.output_columns, 0..) |*out, ci| {
             const out_type = self.schema[self.input_schema.len + ci].type;
             if (isStringType(out_type)) {
-                const scratch = try self.allocator.alloc(?[]const u8, n);
-                for (scratch) |*e| e.* = null;
-                self.string_outputs[ci] = scratch;
+                if (self.string_outputs[ci].len < n) {
+                    self.string_outputs[ci] = try self.allocator.realloc(self.string_outputs[ci], n);
+                }
+                @memset(self.string_outputs[ci][0..n], null);
             } else {
                 try preSizeColumn(self.allocator, out, out_type, n);
             }
@@ -1751,9 +1787,7 @@ pub const Window = struct {
             .dense_rank => try fillRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column, true),
             .lag => try self.fillLagLead(plan, perm, p_start, p_end, cell, true),
             .lead => try self.fillLagLead(plan, perm, p_start, p_end, cell, false),
-            .first_value => try fillFirstValue(self.accumulated[plan.value_col], perm, p_start, p_end, cell, plan.ignore_nulls),
-            .last_value => try self.fillLastValue(plan, spec, perm, p_start, p_end, cell),
-            .nth_value => try self.fillNthValue(plan, spec, perm, p_start, p_end, cell),
+            .first_value, .last_value, .nth_value => try self.fill_value_window(plan, spec, perm, p_start, p_end, cell),
             .ntile => try fillNtile(plan, perm, p_start, p_end, cell.column),
             .percent_rank => try fillPercentRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
             .cume_dist => try fillCumeDist(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
@@ -1813,7 +1847,7 @@ pub const Window = struct {
         }
     }
 
-    fn fillNthValue(
+    fn fill_value_window(
         self: *Window,
         plan: CallPlan,
         spec: ir.WindowSpec,
@@ -1825,57 +1859,28 @@ pub const Window = struct {
         const value_col = self.accumulated[plan.value_col];
         const view = value_col.view();
         const n: i64 = plan.nth_offset;
+        var frame = FrameCursor.init(self, plan.spec_idx, perm, p_start, p_end);
         var i: usize = p_start;
         while (i < p_end) : (i += 1) {
             const orig = perm[i];
-            const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
+            const fb = try frame.bounds(spec.frame, i);
             const fs: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
             const fe: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
             if (fe < fs) {
                 setNullCell(cell, orig);
                 continue;
             }
-            const src_idx: ?usize = if (plan.ignore_nulls)
-                nthNonNullInRange(view, perm, @intCast(fs), @intCast(fe), n)
-            else blk: {
-                // 1-based offset → absolute index in perm.
-                const target: i64 = fs + (n - 1);
-                if (target > fe) break :blk null;
-                break :blk @as(?usize, @intCast(target));
+            const src_idx: ?usize = if (plan.ignore_nulls) switch (plan.func) {
+                .first_value => firstNonNullInRange(view, perm, @intCast(fs), @intCast(fe)),
+                .last_value => lastNonNullInRange(view, perm, @intCast(fs), @intCast(fe)),
+                .nth_value => nthNonNullInRange(view, perm, @intCast(fs), @intCast(fe), n),
+                else => unreachable,
+            } else switch (plan.func) {
+                .first_value => @intCast(fs),
+                .last_value => @intCast(fe),
+                .nth_value => if (n - 1 > fe - fs) null else @intCast(fs + (n - 1)),
+                else => unreachable,
             };
-            if (src_idx) |idx| {
-                try copyCellTo(value_col, perm[idx], cell, orig);
-            } else {
-                setNullCell(cell, orig);
-            }
-        }
-    }
-
-    fn fillLastValue(
-        self: *Window,
-        plan: CallPlan,
-        spec: ir.WindowSpec,
-        perm: []const u32,
-        p_start: usize,
-        p_end: usize,
-        cell: OutCell,
-    ) !void {
-        const value_col = self.accumulated[plan.value_col];
-        const view = value_col.view();
-        var i: usize = p_start;
-        while (i < p_end) : (i += 1) {
-            const orig = perm[i];
-            const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
-            const frame_end_clamped: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
-            const frame_start_clamped: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
-            if (frame_end_clamped < frame_start_clamped) {
-                setNullCell(cell, orig);
-                continue;
-            }
-            const src_idx: ?usize = if (plan.ignore_nulls)
-                lastNonNullInRange(view, perm, @intCast(frame_start_clamped), @intCast(frame_end_clamped))
-            else
-                @as(usize, @intCast(frame_end_clamped));
             if (src_idx) |idx| {
                 try copyCellTo(value_col, perm[idx], cell, orig);
             } else {
@@ -1896,14 +1901,28 @@ pub const Window = struct {
         const shape = classifyFrame(spec.frame);
         switch (shape) {
             .whole_partition => return self.fillAggregateWholePartition(plan, perm, p_start, p_end, cell),
-            .prefix_to_current => return self.fillAggregatePrefix(plan, perm, p_start, p_end, cell),
+            .prefix_to_current => {
+                try self.fillAggregatePrefix(plan, perm, p_start, p_end, cell);
+                if (spec.frame.kind != .rows) {
+                    const order = self.spec_indices[plan.spec_idx].order_cols;
+                    var lo = p_start;
+                    while (lo < p_end) {
+                        var hi = lo + 1;
+                        while (hi < p_end and orderEquals(self.accumulated, order, perm[lo], perm[hi])) : (hi += 1) {}
+                        for (lo..hi - 1) |row| try broadcastOutputCell(cell, perm[hi - 1], perm[row]);
+                        lo = hi;
+                    }
+                }
+                return;
+            },
             .general => {},
         }
 
+        var frame = FrameCursor.init(self, plan.spec_idx, perm, p_start, p_end);
         var i: usize = p_start;
         while (i < p_end) : (i += 1) {
             const orig = perm[i];
-            const fb = computeFrameBounds(spec.frame, i, p_start, p_end);
+            const fb = try frame.bounds(spec.frame, i);
             const lo_i: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
             const hi_i: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
             if (lo_i > hi_i) {
@@ -2368,6 +2387,11 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
     return plan;
 }
 
+pub fn output_column(c: ir.WindowCall, schema: []const Column) !Column {
+    const plan = try buildCallPlan(c, schema);
+    return .{ .name = c.output_name, .type = try outputType(c, plan, schema), .nullable = outputNullable(c, plan, schema) };
+}
+
 fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !Type {
     return switch (c.func) {
         .row_number, .rank, .dense_rank => .bigint,
@@ -2436,6 +2460,21 @@ fn freeSpecIndices(allocator: Allocator, specs: []Window.SpecIndices, n: usize) 
         allocator.free(si.order_desc);
     }
     allocator.free(specs);
+}
+
+// These aliases only feed the evaluator's read side. The input arenas stay
+// empty and teardown never deinitializes the borrowed stores themselves.
+fn borrowed_store(view: ColumnView) ColumnStore {
+    return .{
+        .nulls = if (view.nulls) |bits| .{ .items = @constCast(bits), .capacity = 0 } else null,
+        .data = switch (view.data) {
+            inline .varchar, .string, .char, .json => |strings, tag| @unionInit(@import("../engine/store.zig").DataStore, @tagName(tag), .{
+                .offsets = .{ .items = @constCast(strings.offsets), .capacity = 0 },
+                .bytes = .{ .items = @constCast(strings.bytes), .capacity = 0 },
+            }),
+            inline else => |values, tag| @unionInit(@import("../engine/store.zig").DataStore, @tagName(tag), .{ .items = @constCast(values), .capacity = 0 }),
+        },
+    };
 }
 
 /// Pre-size an output ColumnStore to `n` rows, initial state = all NULL
@@ -2688,39 +2727,15 @@ fn orderEquals(
     return true;
 }
 
-fn fillFirstValue(
-    value_col: ColumnStore,
-    perm: []const u32,
-    p_start: usize,
-    p_end: usize,
-    cell: OutCell,
-    ignore_nulls: bool,
-) !void {
-    if (p_start >= p_end) return;
-    const view = value_col.view();
-    const first_src_idx: ?usize = if (ignore_nulls)
-        firstNonNullInRange(view, perm, p_start, p_end - 1)
-    else
-        @as(?usize, p_start);
-    var i: usize = p_start;
-    while (i < p_end) : (i += 1) {
-        if (first_src_idx) |idx| {
-            try copyCellTo(value_col, perm[idx], cell, perm[i]);
-        } else {
-            setNullCell(cell, perm[i]);
-        }
-    }
-}
-
 /// Direct offset for non-IGNORE-NULLS LAG/LEAD: just `cur ± offset`,
 /// clamped to partition bounds (returns null if out of range).
 fn directOffset(cur: usize, p_start: usize, p_end: usize, offset: i64, is_lag: bool) ?usize {
-    const target: i64 = if (is_lag)
-        @as(i64, @intCast(cur)) - offset
+    const target: i128 = if (is_lag)
+        @as(i128, cur) - offset
     else
-        @as(i64, @intCast(cur)) + offset;
-    if (target < @as(i64, @intCast(p_start))) return null;
-    if (target >= @as(i64, @intCast(p_end))) return null;
+        @as(i128, cur) + offset;
+    if (target < p_start) return null;
+    if (target >= p_end) return null;
     return @intCast(target);
 }
 
@@ -2879,6 +2894,123 @@ const FrameBounds = struct {
     end_inclusive: i64,
 };
 
+fn offset_bound(bound: ir.FrameBound) bool {
+    return bound == .preceding or bound == .following;
+}
+
+const FrameCursor = struct {
+    window: *const Window,
+    spec: Window.SpecIndices,
+    perm: []const u32,
+    start: usize,
+    end: usize,
+    peer_start: usize,
+    peer_end: usize,
+    peer_number: usize = 0,
+    group_start: GroupCursor,
+    group_end: GroupCursor,
+    cached: FrameBounds = undefined,
+
+    const GroupCursor = struct { number: usize = 0, start: usize, end: usize };
+
+    fn init(window: *const Window, spec_idx: usize, perm: []const u32, start: usize, end: usize) FrameCursor {
+        return .{
+            .window = window,
+            .spec = window.spec_indices[spec_idx],
+            .perm = perm,
+            .start = start,
+            .end = end,
+            .peer_start = start,
+            .peer_end = start,
+            .group_start = .{ .start = start, .end = start },
+            .group_end = .{ .start = start, .end = start },
+        };
+    }
+
+    fn find_peer_end(self: *const FrameCursor, row: usize) usize {
+        var lo = row + 1;
+        var hi = self.end;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (orderEquals(self.window.accumulated, self.spec.order_cols, self.perm[row], self.perm[mid])) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    fn bounds(self: *FrameCursor, frame: ir.Frame, row: usize) !FrameBounds {
+        if (frame.kind == .rows) return computeFrameBounds(frame, row, self.start, self.end);
+        if (row >= self.peer_end) {
+            if (self.peer_end > self.start) self.peer_number += 1;
+            self.peer_start = row;
+            self.peer_end = self.find_peer_end(row);
+            self.cached = .{
+                .start = try self.bound(frame.kind, frame.start, true),
+                .end_inclusive = try self.bound(frame.kind, frame.end, false),
+            };
+        }
+        return self.cached;
+    }
+
+    fn bound(self: *FrameCursor, kind: ir.FrameKind, b: ir.FrameBound, is_start: bool) !i64 {
+        return switch (b) {
+            .unbounded_preceding => @intCast(self.start),
+            .unbounded_following => @intCast(self.end - 1),
+            .current_row => @intCast(if (is_start) self.peer_start else self.peer_end - 1),
+            .preceding, .following => |n| if (kind == .groups)
+                self.group_bound(n, b == .preceding, is_start)
+            else
+                try self.range_bound(n, b == .preceding, is_start),
+        };
+    }
+
+    fn group_bound(self: *FrameCursor, offset: u64, preceding: bool, is_start: bool) i64 {
+        const target = @as(i128, self.peer_number) + (if (preceding) -@as(i128, offset) else @as(i128, offset));
+        if (target < 0) return @as(i64, @intCast(self.start)) - 1;
+        const cursor = if (is_start) &self.group_start else &self.group_end;
+        if (cursor.end == self.start) cursor.end = self.find_peer_end(self.start);
+        while (cursor.number < target) {
+            if (cursor.end == self.end) return @intCast(self.end);
+            cursor.start = cursor.end;
+            cursor.end = self.find_peer_end(cursor.start);
+            cursor.number += 1;
+        }
+        return @intCast(if (is_start) cursor.start else cursor.end - 1);
+    }
+
+    fn range_bound(self: *const FrameCursor, offset: u64, preceding: bool, is_start: bool) !i64 {
+        if (self.spec.order_cols.len != 1) return Error.WindowUnsupported;
+        const ci = self.spec.order_cols[0];
+        const view = self.window.accumulated[ci].view();
+        const current = self.perm[self.peer_start];
+        if (!view.isValid(current)) return @intCast(if (is_start) self.peer_start else self.peer_end - 1);
+        const desc = self.spec.order_desc[0];
+        const delta: i256 = if (preceding != desc) -@as(i256, offset) else @as(i256, offset);
+        var lo = self.start;
+        var hi = self.end;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const candidate = self.perm[mid];
+            const raw = if (!view.isValid(candidate)) std.math.Order.lt else try range_order(view, self.window.input_schema[ci].type, candidate, current, delta);
+            const cmp = if (desc) raw.invert() else raw;
+            if (cmp == .lt or (!is_start and cmp == .eq)) lo = mid + 1 else hi = mid;
+        }
+        return @as(i64, @intCast(lo)) - @as(i64, if (is_start) 0 else 1);
+    }
+};
+
+fn range_order(view: ColumnView, t: Type, candidate: usize, current: usize, delta: i256) !std.math.Order {
+    return switch (view.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |values| std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + delta),
+        inline .float, .double => |values| std.math.order(@as(f64, values[candidate]), @as(f64, values[current]) + @as(f64, @floatFromInt(delta))),
+        inline .decimal64, .decimal128 => |values| blk: {
+            var scale: i256 = 1;
+            for (0..t.decimalSpec().?.s) |_| scale *= 10;
+            break :blk std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + delta * scale);
+        },
+        else => Error.WindowUnsupported,
+    };
+}
+
 fn computeFrameBounds(frame: ir.Frame, cur: usize, p_start: usize, p_end: usize) FrameBounds {
     const c: i64 = @intCast(cur);
     const ps: i64 = @intCast(p_start);
@@ -2916,9 +3048,9 @@ fn boundToIndex(b: ir.FrameBound, cur: i64, p_start: i64, p_end_inclusive: i64, 
     _ = is_start;
     return switch (b) {
         .unbounded_preceding => p_start,
-        .preceding => |n| cur - @as(i64, @intCast(n)),
+        .preceding => |n| @intCast(@max(std.math.minInt(i64), @as(i128, cur) - n)),
         .current_row => cur,
-        .following => |n| cur + @as(i64, @intCast(n)),
+        .following => |n| @intCast(@min(std.math.maxInt(i64), @as(i128, cur) + n)),
         .unbounded_following => p_end_inclusive,
     };
 }

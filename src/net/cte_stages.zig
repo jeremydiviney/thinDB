@@ -101,8 +101,8 @@ fn compile_staged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage_co
     // pre-registers its stage here, BEFORE the window-wrap rewrite mutates
     // nodes below its anchor; collectStages' map hit then stops the walk at
     // the anchor and compileBlock reads the region output as an ordinary
-    // stage. The declaration is a hard contract — verification/compile
-    // failures are query errors, never a silent fall-back.
+    // stage. Unsupported portions keep ordinary staging; the region builder
+    // can compile an earlier region inside a later region's staged ingress.
     const t_region_declared = exec.prof.nowTicks();
     const declared = if (recognize_regions) try @import("region_rollforward.zig").compileDeclared(input, root) else null;
     exec.prof.addPhase("compile.region_declared", @intCast(exec.prof.nowTicks() - t_region_declared));

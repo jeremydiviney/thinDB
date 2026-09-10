@@ -780,11 +780,9 @@ pub const Op = union(OpTag) {
         /// parse-time compilation hint, not part of the serialized IR.
         structural_cse: bool = false,
         /// `WITH KEYED BY (k1, ...)`: the CTE block this boundary belongs to
-        /// is contractually partitioned by these keys — every GROUP BY /
-        /// PARTITION BY inside must contain them, which the region compiler
-        /// verifies and then executes shard-parallel with zero inner
-        /// materializations. A violation is a compile ERROR (the declaration
-        /// is a promise, not a hint). Parse-time only, not serialized.
+        /// requests regional execution where partitions contain these keys.
+        /// Incompatible portions retain ordinary staging; compatible CTEs
+        /// can reenter regions downstream. Parse-time only, not serialized.
         region_keys: ?[]const []const u8 = null,
         /// The CTE this boundary came from — labels its stage in the
         /// `--profile-ops` `[cte]` lines. Parse-time only, not serialized.
