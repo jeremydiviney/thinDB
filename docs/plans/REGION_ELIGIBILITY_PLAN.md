@@ -1,5 +1,62 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Plain SQL region eligibility and UDF attribution (2026-09-10)
+
+Checkpoint commit `516c454` preserves the earlier benchmark documentation and
+the reusable packet-discard helper. The following experiment uses the same
+`0258e6d` engine and `b5359d9e` Wayroll application; no engine changes were made.
+
+Adding `KEYED BY (customerNumberLC)` to the outer full-SQL `WITH`, with all
+SQL/Zig UDF switches disabled, was rejected with `RegionUnsupportedConstruct`
+in all 30 Sierra/AirDNA configurations. The requested SQL-plus-regions column
+is therefore **unsupported**, with no valid timing. The benchmark captures
+verify the declaration was inserted and no `rf_*` functions were present.
+
+The traces show boundary search declining SQL windows. The shared currency
+normalization uses `LAST_VALUE(originalCurrency)` ordered by both
+`invoiceDate` and `originalCurrency`; the regional `pushFillLast` path accepts
+only one ascending order column. Later windows also exceed current coverage:
+`LAG` with a non-NULL default, partition-wide `MIN`/`MAX`, and cumulative
+`SUM`. See `dispatchWindow`, `push_lag`, `pushFillLast`, and `checkRangeOrder`
+in `src/net/region_rollforward.zig`. The final date/type aggregate belongs
+outside the customer region; its key-contract decline alone is expected.
+The complete SQL pipeline fails because no supported inner boundary is found.
+This does not mean ordinary SQL fundamentally cannot use keyed regions.
+
+An additional Zig-without-regions control measures the regional contribution
+to the existing UDF-shaped pipeline. All 15 variants per dataset used three
+hash buckets `[a,d)`, one warmup, and three measured runs, with result packets
+consumed without decoding values. Totals are sums of per-case medians:
+
+| Dataset | thinDB SQL | Zig only | Zig + regions | SQL / Zig only | Zig only / Zig + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 10.03 s | 4.89 s | 2.13 s | 2.05x | 2.30x |
+| AirDNA | 39.13 s | 33.50 s | 10.22 s | 1.17x | 3.28x |
+
+AirDNA expanded-cross illustrates the difference: SQL took 9,593 ms,
+Zig only 10,139 ms, and Zig plus regions 600 ms. These ratios measure regions
+on the UDF-shaped queries; they cannot substitute for the still-unavailable
+SQL-to-keyed-SQL comparison or predict the speed of generic SQL windows.
+
+All 120 keyed Zig executions engaged a region; plain SQL and Zig-only did
+not. Successful thinDB arms returned matching row counts. Captured Zig
+queries and parameters match after removing the keyed declaration and
+consistently normalizing generated CTE names; the SQL arms match under the
+same check. Value-level correctness was not rechecked in this timing run.
+
+Measurements ran via localhost on starrocks1, using the isolated thinDB data
+copy on 13311. The temporary instance retained the previous memory limits,
+recorded zero memory-limit/OOM events, and was stopped before StarRocks
+benchmarking. Production thinDB and CDC were left running. Raw queries,
+traces and phase results are in ignored `.bench-data/sql-keyed-results-thin/`
+and `sql-keyed-results-sr/`; the combined report and CSV are in
+`.bench-data/sql-keyed-results/`.
+
+Next engine work: support general ordered `LAST_VALUE`, non-NULL `LAG`
+defaults, and aggregate windows in regions, with full value parity tests.
+Then rerun the explicit plain-SQL arm and inspect which expensive stages
+actually execute inside regions before attributing the remaining UDF benefit.
+
 ### Server benchmark checkpoint (2026-09-10)
 
 Engine changes are committed as `0258e6d`; companion Wayroll changes as
@@ -44,11 +101,11 @@ Full matrices, raw samples, source counts and procedure remain in the ignored
 `region-drain-results/` and `region-scale-runbook.md`. Deployment-specific
 scripts, credentials, copied databases and customer results stay outside git.
 
-Next comparison: add full SQL with an explicit keyed declaration while all
-SQL/Zig UDF switches remain off. Compare SQL vs keyed SQL for the regional
-benefit, then keyed SQL vs keyed Zig for the additional UDF benefit. Record
-actual region coverage as well as timings; engagement alone can represent a
-small inner boundary rather than the expensive portion of the query.
+The next comparison at this checkpoint was full SQL with an explicit keyed
+declaration while all SQL/Zig UDF switches remained off, to isolate regional
+and UDF contributions. Its findings appear above. Actual region coverage
+matters alongside timings: engagement alone can represent a small inner
+boundary rather than the expensive portion of the query.
 
 ### Coverage and cold preparation follow-up (2026-09-09)
 
