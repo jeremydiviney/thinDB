@@ -50,7 +50,6 @@ const PredicateExpr = predicate_mod.PredicateExpr;
 const Derived = compute_mod.Derived;
 const Scan = exec.Scan;
 
-const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
