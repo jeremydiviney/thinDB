@@ -1,5 +1,110 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Preserve routed keys across frame replacements (2026-09-10)
+
+Engine commit `bdec8da` fixes the physical route-key identity lost when a
+TVF or aggregation replaces the regional frame. Replacing TVFs now carry
+the route through their existing `ordered_output` partition-value contract;
+matching output names alone are insufficient. GROUP BY carries it through
+an unchanged group column and remaps constant-column indices to the new
+frame. Co-partitioned joins resolve the route against physical columns,
+rather than the SQL-visible alias map. No Wayroll-specific recognition or
+function changes were added. Unmarked TVFs and computed key replacements
+retain ordinary fallback.
+
+The new regression failed before the fix. It requires four windows, two
+row-generating TVFs, an aggregation, and a co-partitioned join in one region,
+then compares all output values with ordinary execution. It covers DOP 1
+and 4, NULL keys and values, and cached runs. Separate negative cases verify
+that a TVF merging customer keys, and a computed key replacement after
+aggregation, cannot inherit the old route.
+
+Validation: full `zig build test -j2` passed (826 integration, 113
+client/server, 533 unit, and 5 config tests; 5 existing unit skips).
+`zig build bench -j2` passed, including exact-result regional window checks.
+Local regional/ordinary window speedups were 1.12x (LAG scan), 1.46x (LAG
+UNION ALL), 1.21x (mixed scan), and 1.58x (mixed UNION ALL).
+
+Follow-up `54578b3` also invalidates entry-filter constants when a replacement
+does not prove their values survive: TVFs retain only partition-key literals,
+and aggregates retain only group-column literals. The new regression changed
+a non-partition project column from 100 to 101; the regional join incorrectly
+returned the lookup for 100 before the guard. TVF and aggregate replacements
+now match the ordinary join values, including cached runs. The final full
+test run passed 827 integration, 113 client/server, 533 unit, and 5 config
+tests (1,478 total; 5 existing skips).
+
+A separate mixed-width join schema issue surfaced during this check:
+ordinary execution widens a selected INT key joined to BIGINT, while the
+regional join retains INT. The constant-provenance regression uses matching
+BIGINT keys to isolate the value bug. Mixed-width join output-type parity
+remains a follow-up alongside the remaining SQL GROUP BY coverage limits.
+
+The server follow-up exposed a separate memory/configuration constraint.
+The default retained-region cache has its own 8 GiB budget, independent of
+the block cache and active query budget. One benchmark attempt reached its
+33 GiB OS ceiling; a subsequent attempt with a 6 GiB block cache was killed
+inside its 32 GiB cgroup. Production thinDB, StarRocks, and CDC stayed healthy.
+These attempts are archived and excluded from final timing results.
+An overly small 2 GiB region-cache budget evicted the compiled cross pipeline
+and lost its warm-run benefit. The follow-up configuration uses a 6 GiB block
+cache, `THINDB_REGION_POOL_MB=4096`, DOP 16, a 24 GiB shared query budget,
+and a 16 GiB per-query budget, retaining 12 GiB initial host headroom.
+Each arm's warmup and three measurements run consecutively: interleaving
+different SQL/UDF programs can churn this smaller cache and measure repeated
+compilation instead. Fresh candidates separate the datasets. Memory-aware
+region-cache sizing/accounting remains a follow-up concern for deployment;
+this repair does not change those budgets automatically.
+
+The full five-arm sweep at `bdec8da` completed all 30 dataset/variant cases
+with one warmup and three measured samples per arm, on starrocks1 via
+localhost, retaining the three hash buckets a/b/c and prior case dates.
+Final result packets were discarded without Node value decoding. All 60
+SQL/UDF keyed-versus-unkeyed wire fingerprints matched, and all four thinDB
+arms returned matching row counts in every case. Eight source-count checks
+match the preceding snapshot exactly. The full timing phase peaked at
+22.77 GiB with zero memory-ceiling-pressure or OOM events.
+
+Totals (sum of the fifteen medians, seconds):
+
+| Dataset | SR SQL | thinDB SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 10.47 | 12.76 | 8.90 | 6.41 | 3.12 |
+| AirDNA | 47.21 | 45.00 | 35.30 | 35.84 | 12.21 |
+
+After the stale-constant guard, final head `54578b3` was compared with
+`6a216c4` on the six affected UDF+regions cases using matched 6 GiB data / 4 GiB
+region-cache settings. These focused controls are separate from the matrix
+above. Median milliseconds, three measured runs after warmup:
+
+| Dataset | Variant | Before | Final | Speedup |
+|---|---|---:|---:|---:|
+| Sierra | base cross | 310 | 153 | 2.03x |
+| Sierra | expanded cross | 871 | 177 | 4.92x |
+| Sierra | detail cross | 304 | 196 | 1.55x |
+| AirDNA | base cross | 1,472 | 580 | 2.54x |
+| AirDNA | expanded cross | 9,241 | 604 | 15.29x |
+| AirDNA | detail cross | 2,540 | 1,460 | 1.74x |
+
+All six final-head fingerprints match both their unkeyed controls and the
+earlier matrix outputs. Regional operation sequences are unchanged by the
+constant guard. Both datasets' UDF cross programs extend from the regressed
+13 operations to 28 (base), 31 (expanded), and 25 (detail), including later
+windows, aggregation, and UDF stages. SQL cross programs still stop at the
+later GROUP BY boundary (17–18 operations). Shared-host load and cache
+behavior explain why focused-control medians differ from matrix medians;
+neither matched timing phase recorded memory pressure.
+
+Final Linux ReleaseFast SHA256:
+`dc47d31b5b83591cfbe84d94028678b5c70d1f4633637647296762da30ac885b`.
+Both candidates were stopped. Production thinDB PID 256623, StarRocks BE PID
+848762, and the original running CDC job remained healthy. No production
+binary was replaced. Full matrix, CSV, raw queries/traces, fingerprints,
+failed-attempt archives, and matched controls are in ignored
+`.bench-data/five-arm-bdec8da/`, `.bench-data/five-arm-54578b3/`, and
+`.bench-data/five-arm-routebase-6a216c4/`. The combined report is
+`.bench-data/five-arm-bdec8da/report/benchmark-report.md`.
+
 ### Five-arm server sweep: SQL gains and UDF coverage regression (2026-09-10)
 
 The complete Sierra/AirDNA sweep ran on starrocks1 with engine `6a216c4`
