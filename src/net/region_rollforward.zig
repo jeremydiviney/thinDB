@@ -50,7 +50,6 @@ const PredicateExpr = predicate_mod.PredicateExpr;
 const Derived = compute_mod.Derived;
 const Scan = exec.Scan;
 
-
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 const NoMatch = error.RegionNoMatch;
