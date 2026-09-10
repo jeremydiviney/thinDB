@@ -778,6 +778,60 @@ test "keyed region: computed replacement after aggregation does not inherit rout
     }
 }
 
+test "keyed region: replaced frames discard stale pinned values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    const tdb = thindb.tdb;
+    const rewrite_project = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "rewrite_project", .execution = .partitioned, .ordered_output = true };
+        pub const Input = struct { projectId: ?i64, custLC: ?[]const u8, month: ?i32, amount: ?i64 };
+        pub const Output = Input;
+        pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+            var rows = p.iter();
+            while (rows.next()) |row| try out.row(.{
+                .projectId = if (row.projectId) |project| project + 1 else null,
+                .custLC = row.custLC,
+                .month = row.month,
+                .amount = row.amount,
+            });
+        }
+    };
+    try db.registerTableFn(rewrite_project);
+    try helpers.exec(allocator, db, "CREATE TABLE project_lookup (id BIGINT PRIMARY KEY, extra INT)");
+    try helpers.exec(allocator, db, "INSERT INTO project_lookup VALUES (1,21),(2,22),(3,23),(4,24),(5,25),(100,7),(101,17)");
+    const lookup = try db.openTable("project_lookup", .{});
+    try lookup.flush();
+    inline for (.{
+        \\changed AS (
+        \\ SELECT * FROM TABLE(rewrite_project((SELECT projectId, custLC, month, amount FROM inv WHERE projectId = 100))
+        \\   PARTITION BY custLC ORDER BY month)
+        \\)
+        ,
+        \\r AS (
+        \\ SELECT custLC, month, amount, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM inv WHERE projectId = 100
+        \\), changed AS (
+        \\ SELECT custLC, month, MAX(rn) AS projectId, MAX(amount) AS amount
+        \\ FROM r GROUP BY custLC, month
+        \\)
+        ,
+    }) |prefix| {
+        try expect_keyed_matches(allocator, db, prefix ++
+            \\, w AS (
+            \\ SELECT projectId, custLC, month, amount, LAG(amount) OVER (PARTITION BY custLC ORDER BY month) AS prior
+            \\ FROM changed
+            \\), j AS (
+            \\ SELECT t.projectId, t.custLC, t.month, t.amount, t.prior, l.extra
+            \\ FROM w t LEFT JOIN project_lookup l ON t.projectId = l.id
+            \\)
+            \\SELECT * FROM j ORDER BY custLC, month
+        , "extra");
+    }
+}
+
 test "keyed region: LAG honors partition boundaries offsets source NULLs and independent orders" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

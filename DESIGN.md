@@ -453,6 +453,10 @@ Aggregation similarly carries provenance through an unchanged group key,
 and remaps constant-column bookkeeping to the new frame. Windows and
 co-partitioned joins check this physical identity, not a reused SQL alias;
 computing a replacement key does not inherit it.
+Entry-filter constants survive a replacing TVF only when its partition-value
+contract preserves them, and survive aggregation only through group columns.
+Reusing their names for changed outputs cannot keep an earlier literal join
+shortcut.
 
 For an unchanged declaration, the cache remembers which inner CTE boundary
 compiled successfully. Repeated queries validate that boundary directly,

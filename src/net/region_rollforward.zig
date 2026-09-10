@@ -2971,10 +2971,12 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, t: *const ir.Op.T
         dst.* = .{ .name = try b.fb.canonName(src.name), .type = src.type, .nullable = true };
     }
     var route_name: ?[]const u8 = null;
+    var pinned: std.ArrayListUnmanaged(PinnedCol) = .empty;
     for (t.partition_by) |name| {
         const input_idx = try b.resolveIdx(name);
         const output_idx = types.findColumn(ent.output_schema, name) orelse return NoMatch;
         if (std.mem.eql(u8, b.fb.cols.items[input_idx].name, b.route_name)) route_name = out[output_idx].name;
+        if (b.pinnedName(name)) |value| try pinned.append(a, .{ .name = ent.output_schema[output_idx].name, .val = value });
     }
     const next_route = route_name orelse return NoMatch;
     try b.flushPending();
@@ -2993,6 +2995,9 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, t: *const ir.Op.T
         try b.fb.setVis(src.name, idx);
     }
     b.route_name = next_route;
+    // The output contract preserves partition values, not arbitrary fields
+    // that happened to be fixed by the entry filter.
+    b.pinned = pinned;
     // Range keys re-resolve by NAME against the new frame (the kernel keeps
     // partition-column names — SDK schema contract); verify they survive.
     var buf: [8]usize = undefined;
@@ -4613,6 +4618,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     var out: std.ArrayListUnmanaged(region.AggOut) = .empty;
     var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
     var new_consts: std.ArrayListUnmanaged(usize) = .empty;
+    var new_pinned: std.ArrayListUnmanaged(PinnedCol) = .empty;
     var route_name: ?[]const u8 = null;
 
     // Group keys first (constant within their sub-group → .first).
@@ -4621,6 +4627,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
         const name = try nameFor(b, gc);
         if (std.mem.eql(u8, b.fb.cols.items[e.idx].name, b.route_name)) route_name = name;
         if (b.isConstIdx(e.idx)) try new_consts.append(a, out.items.len);
+        if (b.pinnedName(gc)) |value| try new_pinned.append(a, .{ .name = gc, .val = value });
         try out.append(a, .{ .name = name, .kind = .{ .first = e.idx } });
         try new_vis.append(a, .{ .name = try a.dupe(u8, gc), .idx = new_vis.items.len });
     }
@@ -4683,6 +4690,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     b.fb.vis = new_vis;
     b.route_name = next_route;
     b.const_idxs = new_consts;
+    b.pinned = new_pinned;
 }
 
 fn nameFor(b: *Builder, hint: []const u8) ![]const u8 {
