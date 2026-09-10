@@ -1,5 +1,55 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Server benchmark checkpoint (2026-09-10)
+
+Engine changes are committed as `0258e6d`; companion Wayroll changes as
+`b5359d9e` on its local `rollforward-thindb-local` branch. The Linux candidate
+was benchmarked on starrocks1 against a separate production-data copy on
+13311. The production thinDB listener on 13310 remains on v0.1.89.
+
+The benchmark now consumes MySQL row packets without constructing Node rows.
+The reusable decoder bypass is `bench/mysql_packet_drain.cjs`. With identical
+AirDNA detail queries, alternating decoded/discard controls changed Zig
+simple from 2,198 to 506 ms and cross from 2,545 to 585 ms. All result bytes
+were still transmitted. The adapter passed protocol checks on both engines.
+
+The three-bucket range `[a,d)` selects a, b and c together. It increases
+AirDNA invoice input by 2.99x and Sierra input by 2.56x simple / 2.96x cross.
+Matched one/three-bucket runs cover all 15 variants on both datasets, with
+one warmup and three measured runs per arm and no row-value decoding.
+All 120 three-bucket Zig queries engaged regions; thinDB SQL/Zig row counts
+matched. Summed case medians (three buckets):
+
+| Dataset | StarRocks SQL | thinDB SQL | thinDB Zig + regions | Zig vs SR, one to three buckets |
+|---|---:|---:|---:|---:|
+| Sierra | 12.11 s | 11.39 s | 2.39 s | 5.11x to 5.06x |
+| AirDNA | 53.45 s | 50.11 s | 13.20 s | 4.41x to 4.05x |
+
+An initial cohosted attempt exhausted RAM and the OS killed StarRocks BE at
+06:38:20 UTC. The extra thinDB instance was retaining about 28 GiB alongside
+production services. The benchmark client and candidate were stopped, the
+existing BE startup script restored StarRocks, and backend readiness, an empty
+blacklist and a table query were verified. Production thinDB and CDC stayed
+running. That attempt is excluded from the results.
+
+Final measurements ran StarRocks with the temporary thinDB instance stopped,
+then thinDB SQL/Zig with no StarRocks benchmark queries running. Both thinDB
+sizes used DOP 16, cache 8 GiB, shared query budget 24 GiB, per-query budget
+16 GiB and a 36 GiB OS ceiling. No ceiling-pressure or OOM event occurred in
+the final runs. The temporary instance has been stopped. Future three-bucket
+work must retain separate phases and a bounded temporary instance.
+
+Full matrices, raw samples, source counts and procedure remain in the ignored
+`.bench-data/region-scale-results/`, `region-scale-baseline/`,
+`region-drain-results/` and `region-scale-runbook.md`. Deployment-specific
+scripts, credentials, copied databases and customer results stay outside git.
+
+Next comparison: add full SQL with an explicit keyed declaration while all
+SQL/Zig UDF switches remain off. Compare SQL vs keyed SQL for the regional
+benefit, then keyed SQL vs keyed Zig for the additional UDF benefit. Record
+actual region coverage as well as timings; engagement alone can represent a
+small inner boundary rather than the expensive portion of the query.
+
 ### Coverage and cold preparation follow-up (2026-09-09)
 
 Active branch: `region-coverage-and-cold-start`, based on released v0.1.89.

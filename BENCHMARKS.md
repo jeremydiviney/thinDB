@@ -275,6 +275,24 @@ Honest list of things competitors do that we don't:
 
 ## Reproducing
 
+For MySQL wire benchmarks, `bench/mysql_packet_drain.cjs` exports
+`drainQuery(callbackConnection, sql, values)`. It accepts a mysql2 callback
+connection and fully consumes the response without decoding row values or
+constructing JavaScript result rows. It returns the final result's row count,
+column count and payload bytes, plus counts for every result set. Server
+execution, serialization, socket transfer and packet framing remain measured.
+
+The helper uses mysql2 3.16.0 internals. Its end-to-end checks cover empty and
+multiple result sets, NULLs, large packets, SQL errors and connection reuse
+against thinDB and StarRocks. Recheck those behaviors when changing drivers.
+Keep correctness comparisons separate from packet-discard timings.
+
+When benchmarking engines on a shared production host, size aggregate memory
+headroom for all resident processes. The three-bucket rollforward comparison
+uses separate engine phases and a bounded temporary thinDB instance; see
+`docs/plans/REGION_ELIGIBILITY_PLAN.md` for results and the incident that led
+to that procedure.
+
 ```
 zig build bench -Doptimize=ReleaseFast
 ```
