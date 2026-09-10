@@ -245,6 +245,7 @@ test "keyed region: boundaries below joins retain duplicate matches and unmatche
     inline for (.{
         .{ "FULL", "p.custLC = d.custLC" },
         .{ "INNER", "p.custLC = d.custLC AND p.month < d.month" },
+        .{ "INNER", "p.month = d.month" },
     }) |join_case| {
         try expect_keyed_matches(allocator, db,
             \\r AS (
@@ -304,6 +305,191 @@ test "keyed region: cached inner boundaries preserve fresh outer joins and chang
         \\)
         \\SELECT custLC, month, rn, other_rn FROM j ORDER BY custLC, month, other_rn
     , "rn");
+}
+
+test "keyed region: broadcast branches share windowed CTEs and refresh changed source values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE lookup (id INT PRIMARY KEY, month INT, value BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO lookup VALUES (1,1,10),(2,2,20),(3,3,30),(4,4,40),(5,5,50)");
+    const lookup = try db.openTable("lookup", .{});
+    try lookup.flush();
+    const body =
+        \\ranked AS (
+        \\  SELECT id, month, value, ROW_NUMBER() OVER (PARTITION BY month ORDER BY id) AS rn
+        \\  FROM lookup
+        \\), side AS (
+        \\  SELECT a.month, a.value + b.value AS extra
+        \\  FROM ranked a INNER JOIN ranked b ON a.month = b.month AND a.rn = b.rn
+        \\), r AS (
+        \\  SELECT custLC, month, amount, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\  FROM inv WHERE projectId = 100
+        \\), j AS (
+        \\  SELECT p.custLC, p.month, p.rn, p.amount + d.extra AS total
+        \\  FROM r p LEFT JOIN side d ON p.month = d.month
+        \\)
+        \\SELECT custLC, month, rn, total FROM j ORDER BY custLC, month
+    ;
+    const before = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, "total");
+    defer allocator.free(before);
+    try expect_keyed_matches(allocator, db, body, "total");
+    try helpers.exec(allocator, db, "INSERT INTO lookup VALUES (3,3,300)");
+    try lookup.flush();
+    try expect_keyed_matches(allocator, db, body, "total");
+    const after = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, "total");
+    defer allocator.free(after);
+    try std.testing.expect(!std.mem.eql(u8, before, after));
+}
+
+test "keyed region: MAX_BY preserves computed ranking keys NULLs and extreme order keys" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE choices (id INT PRIMARY KEY, custLC VARCHAR(32), grp INT, ord BIGINT, amount DOUBLE, label VARCHAR(32))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO choices VALUES
+        \\(1,'a',1,-9223372036854775807,1.25,'low'),
+        \\(2,'a',1,9223372036854775807,9.5,'high'),
+        \\(3,'a',1,NULL,3.0,'no-key'),
+        \\(4,'a',1,-5,NULL,NULL),
+        \\(5,'a',2,NULL,5.0,'no-key'),
+        \\(6,'a',2,1,NULL,NULL),
+        \\(7,'b',1,-7,2.5,'only'),
+        \\(8,NULL,1,-2,4.5,'null-group')
+    );
+    const choices = try db.openTable("choices", .{});
+    try choices.flush();
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT custLC, grp, ord, amount, label,
+        \\ ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY id) AS rn FROM choices
+        \\), grouped AS (
+        \\ SELECT custLC, grp, MAX_BY(amount, -rn) AS low_amount, MAX_BY(amount, ord) AS high_amount,
+        \\ MAX_BY(label, -rn) AS low_label, MAX_BY(label, ord) AS high_label, MAX(rn) AS last_rank
+        \\ FROM r GROUP BY custLC, grp
+        \\)
+        \\SELECT * FROM grouped ORDER BY custLC, grp
+    , "low_amount");
+}
+
+test "keyed region: broadcast joins preserve full width composite integer keys and NULLs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE probe_keys (id INT PRIMARY KEY, custLC VARCHAR(32), a BIGINT, b BIGINT)");
+    try helpers.exec(allocator, db, "CREATE TABLE build_keys (id INT PRIMARY KEY, a BIGINT, b BIGINT, extra INT)");
+    try helpers.exec(allocator, db, "INSERT INTO probe_keys VALUES (1,'p',0,4294967296),(2,'p',1,0),(3,'p',9223372036854775807,0),(4,'p',-9223372036854775807,-1),(5,'p',4,NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO build_keys VALUES (1,1,0,10),(2,9223372036854775807,0,20),(3,-9223372036854775807,-1,30),(4,4,NULL,40)");
+    const probes = try db.openTable("probe_keys", .{});
+    try probes.flush();
+    const builds = try db.openTable("build_keys", .{});
+    try builds.flush();
+    inline for (.{ "LEFT", "INNER" }) |join_type| {
+        try expect_keyed_matches(allocator, db,
+            \\r AS (
+            \\ SELECT id, custLC, a, b, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY id) AS rn
+            \\ FROM probe_keys WHERE id > 0
+            \\), j AS (
+            \\ SELECT p.id, p.custLC, p.a, p.b, p.rn, d.extra FROM r p
+        ++ " " ++ join_type ++ " JOIN build_keys d ON p.a = d.a AND p.b = d.b\n" ++
+            \\)
+            \\SELECT * FROM j ORDER BY id
+        , "extra");
+    }
+}
+
+test "keyed region: broadcast joins honor pinned string keys" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE pinned_lookup (id INT PRIMARY KEY, custLC VARCHAR(32), extra INT)");
+    try helpers.exec(allocator, db, "INSERT INTO pinned_lookup VALUES (1,'cust_0',7),(2,'other',9)");
+    const lookup = try db.openTable("pinned_lookup", .{});
+    try lookup.flush();
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT custLC, month, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM inv WHERE projectId = 100 AND custLC = 'cust_0'
+        \\), j AS (
+        \\ SELECT p.custLC, p.month, p.rn, d.extra FROM r p LEFT JOIN pinned_lookup d ON p.custLC = d.custLC
+        \\)
+        \\SELECT * FROM j ORDER BY month
+    , "extra");
+}
+
+test "keyed region: broadcast joins retain nullable LARGEINT aggregate payloads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE broadcast_values (id INT PRIMARY KEY, month INT, amount BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO broadcast_values VALUES (1,1,9000000000000000000),(2,1,9000000000000000000),(3,2,NULL),(4,3,-9000000000000000000)");
+    const values = try db.openTable("broadcast_values", .{});
+    try values.flush();
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT custLC, month, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM inv WHERE projectId = 100
+        \\), side AS (
+        \\ SELECT month, SUM(amount) AS wide FROM broadcast_values GROUP BY month
+        \\), j AS (
+        \\ SELECT p.custLC, p.month, p.rn, d.wide FROM r p LEFT JOIN side d ON p.month = d.month
+        \\)
+        \\SELECT * FROM j ORDER BY custLC, month
+    , "wide");
+}
+
+test "keyed region: qualified projection aliases follow computed output replacement" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT custLC, month, amount, custLC AS status,
+        \\ ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn FROM inv WHERE projectId = 100
+        \\), z AS (
+        \\ SELECT r.custLC, r.month, r.rn, r.amount + 100 AS amount, r.amount AS original_amount, r.amount + 0 AS input_amount,
+        \\ CAST(CASE WHEN r.month = 1 THEN 'changed' ELSE r.status END AS VARCHAR(50)) AS status,
+        \\ r.status AS original_status FROM r r
+        \\)
+        \\SELECT * FROM z ORDER BY custLC, month
+    , "original_status");
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT custLC, month, amount, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM inv WHERE projectId = 100
+        \\), changed AS (
+        \\ SELECT r.*, r.amount + 100 AS amount, r.amount AS copied FROM r r
+        \\)
+        \\SELECT * FROM changed ORDER BY custLC, month
+    , "copied");
+    try helpers.exec(allocator, db, "CREATE TABLE projection_lookup (id BIGINT PRIMARY KEY, extra INT)");
+    try helpers.exec(allocator, db, "INSERT INTO projection_lookup VALUES (100,7),(101,17)");
+    const lookup = try db.openTable("projection_lookup", .{});
+    try lookup.flush();
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT projectId, custLC, month, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM inv WHERE projectId = 100
+        \\), changed AS (
+        \\ SELECT projectId + 1 AS projectId, custLC, month, rn FROM r
+        \\), j AS (
+        \\ SELECT p.custLC, p.month, p.rn, d.extra FROM changed p LEFT JOIN projection_lookup d ON p.projectId = d.id
+        \\)
+        \\SELECT * FROM j ORDER BY custLC, month
+    , "extra");
 }
 
 test "keyed region: entry computes replace input names without losing their source values" {

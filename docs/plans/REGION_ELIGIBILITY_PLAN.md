@@ -1,6 +1,87 @@
 # Keyed Regions — eligibility round (hand-off)
 
-Status: IN PROGRESS (2026-09-09), branch `region-eligibility`. Predecessor
+### Coverage and cold preparation follow-up (2026-09-09)
+
+Active branch: `region-coverage-and-cold-start`, based on released v0.1.89.
+The owner requested continued implementation until the Sierra/AirDNA
+rollforward matrix uses keyed execution correctly wherever its partitions
+permit it. Diagnosis and all read-only production replay samples are in
+`.bench-data/region-diagnosis-report.md` and
+`.bench-data/region-diagnosis-local/production-results/`.
+
+Priorities for this round:
+
+1. Compile region broadcast branches with normal CTE sharing and staging;
+   cold expanded preparation currently re-executes shared branches.
+2. Retain several bounded region programs and independent structural
+   boundary hints. Rebuild data-dependent state after source changes;
+   never bypass version checks to obtain a cache hit.
+3. Validate and remove the remaining application exclusions for the
+   fifteen matrix shapes, including explicit deterministic SQL selection
+   wherever arbitrary aggregate picks prevent stable detail comparisons.
+4. Measure both cold and interleaved warm queries, assert actual region
+   provenance, and preserve valid boundaries where parent/division
+   regrouping changes the partition key. Region engagement alone is not
+   evidence that the expensive part was accelerated.
+
+Completed and validated locally on 2026-09-09:
+
+- Broadcast inputs now use ordinary CTE staging and the shared typed bulk
+  copier. The latter fixes rejection of widened `SUM(BIGINT)` payloads after
+  expensive preparation, allowing expanded-cross's outer lookup joins into
+  the main region.
+- The per-database cache retains up to 32 programs under a combined retained
+  byte budget, with idle LRU eviction and pinned live borrowers. Independent
+  boundary hints rebuild fresh inputs after source changes; data-version and
+  kernel checks still guard all cached programs.
+- Explicit unfiltered scan/window regions are supported. Broadcast joins
+  preserve full-width composite keys and pinned strings. Duplicate build
+  keys decline the one-match broadcast path, preserving join multiplicity
+  through ordinary staging above a valid inner region.
+- Computed output replacement now follows ordinary SQL compilation for
+  qualified aliases, simultaneous expressions, and subsequent projections,
+  including invalidation of replaced literal-pinned facts.
+- The companion Wayroll worktree enables all ordinary rollforward variants
+  in Zig mode. Hooks remain excluded. Cross-division ranking runs before
+  replacing the source division, and zero-sum exchange rates use an explicit
+  ranked selection in place of `ANY_VALUE`.
+
+The original 30 Sierra/AirDNA cases plus 12 combined-option cases pass.
+All 84 keyed SELECTs engaged a region. Keyed and unkeyed UDF values and wire
+column names/types match exactly across all 42 configurations. Plain SQL is
+exact in 39 configurations; the remaining differences affect only the two
+exchange-rate columns, at most `6.661338147750939e-16`. Full row multiplicities
+and all other fields match. Interleaved cache reuse and changed-lookup
+rebuilding also pass. These checks validate the listed configurations, not
+every possible SQL or hook pipeline.
+
+Final validation: `zig build test test-v2 -j2` passes 1,491 tests (five
+skipped); `zig build bench -j2` passes. The three companion application suites
+pass 58 tests, and changed files introduce no additional ESLint violations.
+Final ordinary-SQL scan/window and UNION/window benchmarks show 1.53x and
+2.48x speedups with exact totals.
+
+Local warm samples improve AirDNA expanded-simple from 3,242 ms unkeyed UDF
+to 337 ms keyed, and expanded-cross from 3,592 ms to 247 ms. These are single
+samples with profiling, not production medians. Compound variants can still
+pay substantial preparation/staged-operation costs, and large detail output
+still pays sorting, serialization, and transfer costs.
+
+The full local matrix, measurement method, limitations, and raw artifact
+locations are in `.bench-data/region-coverage-results-report.md`; exact
+counts and binary/source hashes are in `region-coverage-summary.json` in
+the same directory. Final replay folders are
+`region-coverage-verified-results/` and
+`region-coverage-verified-extra-results/`. Validation logs use the
+`region-coverage-green-` prefix.
+
+Production remained a read-only diagnostic reference. The candidate ran
+only against the separate local bench database on port 13311 and was stopped
+after validation. This round has not been deployed to production.
+
+### Earlier eligibility implementation (historical hand-off)
+
+Branch `region-eligibility`, preceding the follow-up above. Predecessor
 design: [REGION_PLAN.md](./REGION_PLAN.md). Owner's direction: broaden keyed
 regions for general SQL constructs while preserving functionality. Wayroll
 is a validation workload; engine eligibility is the primary objective.
