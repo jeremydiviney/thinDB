@@ -7,6 +7,26 @@ Snapshot of `zig build bench -Doptimize=ReleaseFast` results, captured for refer
 
 To regenerate: `zig build bench` (always built ReleaseFast regardless of `-Doptimize`).
 
+## SQL window regions (2026-09-10)
+
+`zig build bench-regions` compares ordinary and explicitly keyed SQL over
+1,000,000 rows at DOP 12. Each arm receives one warmup and five alternating
+measured runs. The harness requires actual region engagement through the
+downstream window and matching aggregate totals. It also runs within
+`zig build bench`; the following medians come from that full local run:
+
+| Pipeline | Input | Ordinary SQL | Keyed SQL | Speedup |
+|---|---|---:|---:|---:|
+| LAG chain | Scan | 63.07 ms | 54.69 ms | 1.15x |
+| LAG chain | UNION ALL | 65.10 ms | 36.71 ms | 1.77x |
+| LAG default, running SUM, ordered LAST_VALUE | Scan | 98.49 ms | 66.98 ms | 1.47x |
+| LAG default, running SUM, ordered LAST_VALUE | UNION ALL | 101.41 ms | 49.76 ms | 2.04x |
+
+The separate focused run measured 1.37–1.69x across these cases. These are
+synthetic SQL measurements, not Sierra/AirDNA rollforward results. See
+[the implementation handoff](docs/plans/REGION_ELIGIBILITY_PLAN.md) for
+coverage, frame semantics, fallback behavior, and validation.
+
 ---
 
 ## Core operations (1 M rows)
@@ -274,6 +294,24 @@ Honest list of things competitors do that we don't:
 ---
 
 ## Reproducing
+
+For MySQL wire benchmarks, `bench/mysql_packet_drain.cjs` exports
+`drainQuery(callbackConnection, sql, values)`. It accepts a mysql2 callback
+connection and fully consumes the response without decoding row values or
+constructing JavaScript result rows. It returns the final result's row count,
+column count and payload bytes, plus counts for every result set. Server
+execution, serialization, socket transfer and packet framing remain measured.
+
+The helper uses mysql2 3.16.0 internals. Its end-to-end checks cover empty and
+multiple result sets, NULLs, large packets, SQL errors and connection reuse
+against thinDB and StarRocks. Recheck those behaviors when changing drivers.
+Keep correctness comparisons separate from packet-discard timings.
+
+When benchmarking engines on a shared production host, size aggregate memory
+headroom for all resident processes. The three-bucket rollforward comparison
+uses separate engine phases and a bounded temporary thinDB instance; see
+`docs/plans/REGION_ELIGIBILITY_PLAN.md` for results and the incident that led
+to that procedure.
 
 ```
 zig build bench -Doptimize=ReleaseFast

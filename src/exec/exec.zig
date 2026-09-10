@@ -27,6 +27,7 @@ pub const memory = @import("../memory.zig");
 pub const prof = @import("../util/prof.zig");
 pub const silo_group_core = @import("silo_group_core.zig");
 pub const table_fn = @import("table_fn.zig");
+pub const region_exec = @import("region_exec.zig");
 pub const v2_group_topn_engine = @import("v2_group_topn_engine.zig");
 
 /// Diagnostic override for the GROUP BY path selection (see net/local.zig).

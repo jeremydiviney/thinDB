@@ -1,11 +1,10 @@
 //! Keyed pipeline regions: the compiler for `WITH KEYED BY (...)` blocks
 //! (tasks #184/#185, docs/plans/REGION_PLAN.md §7).
 //!
-//! The declaration is a hard contract: every GROUP BY / window PARTITION BY
-//! / TVF PARTITION BY in the block contains the declared keys (statically
-//! verified — violations are compile errors, never silent fallback). A
-//! verified block compiles into ONE region program: exchange-scatter the
-//! base scan by a declared key's hash, then run the whole chain
+//! The compiler checks partitions against the declared keys before forming
+//! a region. Incompatible operators execute through ordinary stages; a
+//! later compatible CTE can enter a new region. Each region partitions its
+//! input by a declared key's hash, then runs its operator chain
 //! shard-locally with zero stage materializations. There is no fixed query
 //! shape — the block's IR is collected into an ordered step list and each
 //! step dispatches on STRUCTURE and kernel SDK METADATA (execution mode,
@@ -33,7 +32,6 @@ const ir = @import("../ir/ir.zig");
 const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const region = @import("../exec/region_exec.zig");
-const mat_stage = @import("../exec/mat_stage.zig");
 const compute_mod = @import("../exec/compute.zig");
 const expr_mod = @import("../exec/expr.zig");
 const predicate_mod = @import("../exec/predicate.zig");
@@ -51,8 +49,6 @@ const PredicateExpr = predicate_mod.PredicateExpr;
 const Derived = compute_mod.Derived;
 const Scan = exec.Scan;
 
-const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
-
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 const NoMatch = error.RegionNoMatch;
@@ -62,17 +58,15 @@ pub const Recognized = struct {
     query: exec.Query,
 };
 // ---------------------------------------------------------------------------
-// Declared regions: `WITH KEYED BY (k1, ...)`. The declaration is a HARD
-// contract — the block must verify (every GROUP BY / window PARTITION BY /
-// TVF PARTITION BY along the pipeline contains the declared keys) and must
-// compile as a region; violations and unsupported constructs are compile
-// errors, never a silent fall-back to the staged path. Join right sides and
-// secondary TVF inputs are exempt from the key check: they are broadcast /
+// Declared regions: `WITH KEYED BY (k1, ...)`. Only compatible portions run
+// within regions; unsupported portions retain ordinary SQL execution.
+// Join right sides and secondary TVF inputs are exempt from the key check:
+// they are broadcast /
 // empty-proof candidates the region compiler validates by executing them.
 // ---------------------------------------------------------------------------
 
-/// Entry for the declared path (no env gate). Returns null when the query
-/// declares no keyed block; errors when it declares one that can't run.
+/// Returns null when no declared boundary can run regionally. Ordinary SQL
+/// compilation then preserves both query results and semantic errors.
 pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerror!?Recognized {
     // Find the topmost CTE boundary carrying declared keys.
     var cur = root;
@@ -90,8 +84,31 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
         return null;
     };
     const keys = top.materialize.region_keys.?;
+    const shape_hash = hashAnchor(top);
     const declaration_hash = hash_declaration(input, top);
     if (try_cached_declaration(input, top, keys, declaration_hash)) |recognized| return recognized;
+
+    // This hint retains no rows or resolved expressions. Rebuild the selected
+    // subtree from fresh IR after a data change instead of re-executing outer
+    // candidates that previously failed. A stale hint still has to compile.
+    if (shape_hash) |shape| if (cacheFor(input.db)) |cache| {
+        if (cache.boundary(shape)) |selected_depth| hint: {
+            var anchor = top;
+            for (0..selected_depth) |_| anchor = region_spine_upstream(anchor) orelse break :hint;
+            if (anchor.* != .materialize) break :hint;
+            verifyKeyContract(anchor, keys, 0) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                break :hint;
+            };
+            const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = selected_depth } else null;
+            if (buildRegion(input, anchor, keys, hashAnchor(anchor), declaration)) |q| {
+                if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] boundary hint rebuilt depth={d}\n", .{selected_depth});
+                return .{ .anchor = anchor, .query = q };
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+            }
+        }
+    };
 
     // Compile: try the marked boundary, then boundaries below it — the
     // program anchor can sit under the outermost CTE (e.g. when the final
@@ -101,8 +118,8 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     // a boundary whose subtree contains a coarser-than-keys partition is
     // not a legal region root, but a boundary BELOW that partition can be —
     // the rollup then consumes the region's output in the normal engine.
-    // The hard RegionKeyContractViolation remains when NO boundary
-    // conforms (the declaration is then a genuine mistake).
+    // Incompatible windows may also become ordinary ingress for a region
+    // above them; collectPipeline makes that cut before adding the window.
     var any_conforming = false;
     cur = top;
     depth = 0;
@@ -124,10 +141,12 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                     // recomputed hash would never match its own store.
                     const bh = hashAnchor(cur);
                     const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = depth } else null;
-                    if (tryCachedAt(input, cur, bh, declaration)) |q| {
+                    if (tryCachedAt(input, cur, keys, bh, declaration)) |q| {
+                        if (shape_hash) |shape| if (cacheFor(input.db)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     }
                     if (buildRegion(input, cur, keys, bh, declaration)) |q| {
+                        if (shape_hash) |shape| if (cacheFor(input.db)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     } else |e| {
                         if (e == error.OutOfMemory) return e;
@@ -149,12 +168,10 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
             else => cur = region_spine_upstream(cur) orelse break,
         }
     }
-    if (!any_conforming) {
-        std.debug.print("[region] KEYED BY block did not compile: no boundary satisfies the key contract\n", .{});
-        return error.RegionKeyContractViolation;
+    if (getenv("THINDB_REGION_TRACE") != null) {
+        std.debug.print("[region] ordinary execution: {s}\n", .{if (any_conforming) "no supported region boundary" else "no compatible key boundary"});
     }
-    std.debug.print("[region] KEYED BY block did not compile: no conforming boundary matches a supported region shape\n", .{});
-    return error.RegionUnsupportedConstruct;
+    return null;
 }
 
 fn region_spine_upstream(op: *const ir.Op) ?*const ir.Op {
@@ -175,9 +192,8 @@ fn region_spine_upstream(op: *const ir.Op) ?*const ir.Op {
 }
 
 /// Static half of the contract: walk the block's pipeline (left/primary
-/// spine) and require every partition-defining construct to contain every
-/// declared key. Stages may partition FINER (extra columns), never coarser —
-/// that is what guarantees no row ever needs another shard's data.
+/// spine) until an ordinary ingress boundary is needed. Each regional
+/// partition contains the declared keys, so it never needs another shard.
 fn verifyKeyContract(op: *const ir.Op, keys: []const []const u8, depth: usize) anyerror!void {
     if (depth > 64) return error.RegionUnsupportedConstruct;
     var cur = op;
@@ -194,15 +210,15 @@ fn verifyKeyContract(op: *const ir.Op, keys: []const []const u8, depth: usize) a
             .limit => |l| cur = l.upstream,
             .order_by => |o| cur = o.upstream,
             .group_by => |g| {
-                try requireKeys(keys, g.group_cols, "GROUP BY");
+                if (!contains_keys(keys, g.group_cols)) return;
                 cur = g.upstream;
             },
             .window => |w| {
-                for (w.specs) |spec| try requireKeys(keys, spec.partition_by, "window PARTITION BY");
+                for (w.specs) |spec| if (!contains_keys(keys, spec.partition_by)) return;
                 cur = w.upstream;
             },
             .table_fn => |t| {
-                if (t.partition_by.len > 0) try requireKeys(keys, t.partition_by, "TABLE(...) PARTITION BY");
+                if (t.partition_by.len > 0 and !contains_keys(keys, t.partition_by)) return;
                 if (t.inputs.len == 0) return;
                 cur = t.inputs[0];
             },
@@ -220,21 +236,19 @@ fn verifyKeyContract(op: *const ir.Op, keys: []const []const u8, depth: usize) a
     return error.RegionUnsupportedConstruct;
 }
 
-fn requireKeys(keys: []const []const u8, cols: []const []const u8, what: []const u8) !void {
+fn contains_keys(keys: []const []const u8, cols: []const []const u8) bool {
     outer: for (keys) |k| {
         for (cols) |c| {
             if (std.ascii.eqlIgnoreCase(lastSegment(c), lastSegment(k))) continue :outer;
         }
-        std.debug.print("[region] KEYED BY contract violation: a {s} does not include declared key '{s}' (partitions on:", .{ what, k });
-        for (cols) |c| std.debug.print(" {s}", .{c});
-        std.debug.print(")\n", .{});
-        return error.RegionKeyContractViolation;
+        return false;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // Cross-run region cache — the probe's pooled-buffer discipline in engine
-// form. One entry per Database, keyed by a deterministic deep hash of the
+// form. Bounded entries per Database, keyed by a deterministic deep hash of the
 // anchor IR subtree (post-fold, so folded dates/constants are captured). A
 // hit revalidates everything the program BAKED at recognize time — broadcast
 // and proof tables via a data-version fingerprint, kernel identity via
@@ -248,6 +262,7 @@ const Unhashable = error.RegionUnhashable;
 const TableVersion = struct { name: []const u8, version: u64 };
 const KernelCheck = struct { name: []const u8, process: udf_mod.TvfProcess };
 const DeclaredBoundary = struct { hash: u64, depth: usize };
+const BoundaryHint = struct { shape_hash: u64, depth: usize, used: u64 };
 
 /// CAS spinlock (std.Thread.Mutex is gone in Zig 0.16; Io.Mutex would drag
 /// an Io through the recognizer). Critical sections here are flag flips —
@@ -269,12 +284,11 @@ const SpinLock = struct {
 const Cache = struct {
     alloc: Allocator,
     mu: SpinLock = .{},
-    hash: u64 = 0,
-    ctx: ?*Ctx = null,
-    /// Checked out by a running query (the RegionExecOp releases on deinit).
-    /// While busy the entry can be neither reused nor replaced — a second
-    /// concurrent identical query just runs one-shot.
-    busy: bool = false,
+    // Bound tiny-program metadata separately from the combined byte budget.
+    entries: [32]CacheEntry = @splat(.{}),
+    boundaries: [64]?BoundaryHint = @splat(null),
+    clock: u64 = 0,
+    max_retained_bytes: usize,
     /// In-flight background ctx destroys (eviction/invalidation) — a big
     /// pool frees seconds of allocator work, which must never sit on the
     /// incoming query's critical path. Database close waits for them.
@@ -306,17 +320,184 @@ const Cache = struct {
             std.Thread.yield() catch {};
         }
         const alloc = self.alloc;
-        if (self.ctx) |c| Ctx.destroyErased(c);
+        for (&self.entries) |*entry| if (entry.ctx) |ctx| Ctx.destroyErased(ctx);
         alloc.destroy(self);
     }
 
-    fn releaseErased(p: *anyopaque) void {
-        const self: *Cache = @ptrCast(@alignCast(p));
+    fn checkout(self: *Cache, hash: u64) ?*CacheEntry {
         self.mu.lock();
-        self.busy = false;
+        defer self.mu.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.ctx == null or entry.busy or entry.hash != hash) continue;
+            entry.busy = true;
+            self.clock +%= 1;
+            entry.used = self.clock;
+            return entry;
+        }
+        return null;
+    }
+
+    fn publish(self: *Cache, hash: u64, ctx: *Ctx) ?*CacheEntry {
+        self.mu.lock();
+        const selected = blk: {
+            var oldest: ?*CacheEntry = null;
+            var empty: ?*CacheEntry = null;
+            for (&self.entries) |*entry| {
+                if (entry.busy) continue;
+                if (entry.ctx == null) {
+                    if (empty == null) empty = entry;
+                    continue;
+                }
+                if (entry.hash == hash) break :blk entry;
+                if (oldest == null or entry.used < oldest.?.used) oldest = entry;
+            }
+            break :blk empty orelse oldest orelse {
+                self.mu.unlock();
+                return null;
+            };
+        };
+        const old = selected.ctx;
+        self.clock +%= 1;
+        selected.* = .{
+            .owner = self,
+            .hash = hash,
+            .ctx = ctx,
+            .busy = true,
+            .used = self.clock,
+            .retained_bytes = ctx.retained_bytes(),
+        };
         self.mu.unlock();
+        if (old) |c| self.destroyCtxAsync(c);
+        return selected;
+    }
+
+    fn discard(self: *Cache, entry: *CacheEntry) void {
+        self.mu.lock();
+        const ctx = entry.ctx.?;
+        entry.ctx = null;
+        entry.busy = false;
+        entry.retained_bytes = 0;
+        self.mu.unlock();
+        self.destroyCtxAsync(ctx);
+    }
+
+    fn trim(self: *Cache) void {
+        var evicted: [32]*Ctx = undefined;
+        var n: usize = 0;
+        self.mu.lock();
+        var total: usize = 0;
+        for (&self.entries) |*entry| total +|= entry.retained_bytes;
+        while (total > self.max_retained_bytes) {
+            var oldest: ?*CacheEntry = null;
+            for (&self.entries) |*entry| {
+                if (entry.ctx == null or entry.busy) continue;
+                if (oldest == null or entry.used < oldest.?.used) oldest = entry;
+            }
+            const entry = oldest orelse break;
+            evicted[n] = entry.ctx.?;
+            n += 1;
+            total -|= entry.retained_bytes;
+            entry.ctx = null;
+            entry.retained_bytes = 0;
+        }
+        self.mu.unlock();
+        for (evicted[0..n]) |ctx| self.destroyCtxAsync(ctx);
+    }
+
+    fn boundary(self: *Cache, shape_hash: u64) ?usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (&self.boundaries) |*hint| {
+            if (hint.*) |*h| if (h.shape_hash == shape_hash) {
+                self.clock +%= 1;
+                h.used = self.clock;
+                return h.depth;
+            };
+        }
+        return null;
+    }
+
+    fn remember_boundary(self: *Cache, shape_hash: u64, depth: usize) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var oldest: usize = 0;
+        for (self.boundaries, 0..) |hint, i| {
+            if (hint == null or hint.?.shape_hash == shape_hash) {
+                oldest = i;
+                break;
+            }
+            if (hint.?.used < self.boundaries[oldest].?.used) oldest = i;
+        }
+        self.clock +%= 1;
+        self.boundaries[oldest] = .{ .shape_hash = shape_hash, .depth = depth, .used = self.clock };
     }
 };
+
+const CacheEntry = struct {
+    owner: *Cache = undefined,
+    hash: u64 = 0,
+    ctx: ?*Ctx = null,
+    busy: bool = false,
+    used: u64 = 0,
+    retained_bytes: usize = 0,
+
+    fn releaseErased(p: *anyopaque) void {
+        const self: *CacheEntry = @ptrCast(@alignCast(p));
+        const owner = self.owner;
+        const bytes = self.ctx.?.retained_bytes();
+        owner.mu.lock();
+        self.retained_bytes = bytes;
+        self.busy = false;
+        owner.mu.unlock();
+        owner.trim();
+    }
+};
+
+test "region cache retains independent programs and never evicts a borrowed entry" {
+    const allocator = std.testing.allocator;
+    const cache = try allocator.create(Cache);
+    cache.* = .{ .alloc = allocator, .max_retained_bytes = std.math.maxInt(usize) };
+    defer Cache.deinitErased(cache);
+    for (0..cache.entries.len) |i| {
+        const ctx = try allocator.create(Ctx);
+        ctx.* = .{ .gpa = allocator, .arena = std.heap.ArenaAllocator.init(allocator), .pool = region.RegionPool.init(allocator, 0) };
+        const entry = cache.publish(i, ctx).?;
+        CacheEntry.releaseErased(entry);
+    }
+    const first = cache.checkout(0).?;
+    try std.testing.expect(cache.checkout(0) == null);
+    const second = cache.checkout(1).?;
+    CacheEntry.releaseErased(second);
+    const next = try allocator.create(Ctx);
+    next.* = .{ .gpa = allocator, .arena = std.heap.ArenaAllocator.init(allocator), .pool = region.RegionPool.init(allocator, 0) };
+    const published = cache.publish(cache.entries.len, next).?;
+    try std.testing.expect(cache.checkout(2) == null);
+    try std.testing.expectEqual(@as(u64, 0), first.hash);
+    CacheEntry.releaseErased(published);
+    CacheEntry.releaseErased(first);
+    const reused = cache.checkout(0).?;
+    try std.testing.expectEqual(first, reused);
+    CacheEntry.releaseErased(reused);
+}
+
+test "region cache combined byte budget includes program arenas and preserves structural hints" {
+    const allocator = std.testing.allocator;
+    const cache = try allocator.create(Cache);
+    cache.* = .{ .alloc = allocator, .max_retained_bytes = 0 };
+    defer Cache.deinitErased(cache);
+    cache.remember_boundary(17, 3);
+    const ctx = try allocator.create(Ctx);
+    ctx.* = .{ .gpa = allocator, .arena = std.heap.ArenaAllocator.init(allocator), .pool = region.RegionPool.init(allocator, 0) };
+    const entry = cache.publish(17, ctx).?;
+    _ = try ctx.arena.allocator().alloc(u8, 1024);
+    cache.trim();
+    try std.testing.expect(entry.ctx != null);
+    CacheEntry.releaseErased(entry);
+    try std.testing.expect(cache.checkout(17) == null);
+    try std.testing.expectEqual(@as(?usize, 3), cache.boundary(17));
+    cache.remember_boundary(17, 4);
+    try std.testing.expectEqual(@as(?usize, 4), cache.boundary(17));
+}
 
 /// Get-or-create the per-database cache slot. Uses the DATABASE allocator —
 /// the cache must outlive any single query or connection.
@@ -325,7 +506,7 @@ fn cacheFor(db: anytype) ?*Cache {
     defer db.region_cache_lock.unlock();
     if (db.region_cache) |p| return @ptrCast(@alignCast(p));
     const c = db.allocator.create(Cache) catch return null;
-    c.* = .{ .alloc = db.allocator };
+    c.* = .{ .alloc = db.allocator, .max_retained_bytes = poolCapBytes() };
     db.region_cache = c;
     db.region_cache_deinit = Cache.deinitErased;
     return c;
@@ -482,14 +663,13 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
     const selected = blk: {
         cache.mu.lock();
         defer cache.mu.unlock();
-        if (cache.busy) return null;
-        const ctx = cache.ctx orelse return null;
-        const declaration = ctx.declaration orelse return null;
-        if (declaration.hash != hash) {
-            if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] declaration cache miss: hash {x} vs stored {x}\n", .{ hash, declaration.hash });
-            return null;
+        for (&cache.entries) |*entry| {
+            if (entry.busy) continue;
+            const ctx = entry.ctx orelse continue;
+            const declaration = ctx.declaration orelse continue;
+            if (declaration.hash == hash) break :blk .{ .depth = declaration.depth, .anchor_hash = entry.hash };
         }
-        break :blk .{ .depth = declaration.depth, .anchor_hash = cache.hash };
+        return null;
     };
     var anchor = top;
     for (0..selected.depth) |_| anchor = region_spine_upstream(anchor) orelse return null;
@@ -500,32 +680,22 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
     // IR. Its current anchor hash need not match the post-drain cache hash;
     // tryCachedAt uses the stored hash to identify the program, then checks
     // kernel/table versions and rebuilds scans against fresh snapshots.
-    const query = tryCachedAt(input, anchor, selected.anchor_hash, null) orelse return null;
+    const query = tryCachedAt(input, anchor, keys, selected.anchor_hash, null) orelse return null;
     return .{ .anchor = anchor, .query = query };
 }
 
-fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
+fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
     const hash = anchor_hash orelse return null;
     const cache = cacheFor(input.db) orelse return null;
 
-    cache.mu.lock();
-    if (cache.busy or cache.ctx == null or cache.hash != hash) {
-        if (cache.ctx != null and cache.hash != hash and getenv("THINDB_REGION_TRACE") != null) {
-            std.debug.print("[region] cache miss: hash {x} vs stored {x}\n", .{ hash, cache.hash });
-        }
-        cache.mu.unlock();
+    const entry = cache.checkout(hash) orelse return null;
+    const ctx = entry.ctx.?;
+    if (ctx.keys.len != keys.len or !contains_keys(ctx.keys, keys)) {
+        CacheEntry.releaseErased(entry);
         return null;
     }
-    cache.busy = true;
-    cache.mu.unlock();
-
-    const ctx = cache.ctx.?;
     if (!cacheValid(input, ctx)) {
-        cache.mu.lock();
-        cache.ctx = null;
-        cache.busy = false;
-        cache.mu.unlock();
-        cache.destroyCtxAsync(ctx);
+        cache.discard(entry);
         if (getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] cache invalidated (data changed)\n", .{});
         }
@@ -533,7 +703,7 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash:
     }
 
     const q = runCached(input, anchor, ctx) catch |e| {
-        Cache.releaseErased(cache);
+        CacheEntry.releaseErased(entry);
         if (e != error.OutOfMemory and getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] cache hit declined: {s}\n", .{@errorName(e)});
         }
@@ -542,11 +712,11 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash:
     const op = exec.queryAs(region.RegionExecOp, q) orelse {
         var qq = q;
         qq.deinit();
-        Cache.releaseErased(cache);
+        CacheEntry.releaseErased(entry);
         return null;
     };
     if (declaration) |d| ctx.declaration = d;
-    op.setOwnedCtx(cache, Cache.releaseErased);
+    op.setOwnedCtx(entry, CacheEntry.releaseErased);
     if (getenv("THINDB_REGION_TRACE") != null) {
         std.debug.print("[region] cache hit — pooled run (retained ~{d}MB)\n", .{ctx.pool.retainedBytes() >> 20});
     }
@@ -559,7 +729,7 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, anchor_hash:
 /// program's — any DDL drift on the scan table declines to a full build.
 fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !exec.Query {
     const qa = input.allocator;
-    var pl = try collectPipeline(input.node_arena, anchor);
+    var pl = try collectPipeline(input.node_arena, anchor, ctx.keys);
 
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
     defer prune_leaves.deinit(qa);
@@ -567,7 +737,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
 
     const table = switch (pl.entry) {
         .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
-        .union_all => null,
+        .staged => null,
     };
     // Same entry transformation as the build path — the cached program's
     // entry schema was derived post-hoist.
@@ -576,7 +746,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     const scan_cols_opt = try entry_scan_columns(input.node_arena, pl);
     const n_threads = @max(input.effectiveDop(), 1);
     const bs = switch (pl.entry) {
-        .union_all => |root| try build_union_source(input, root),
+        .staged => |root| try build_staged_source(input, root, ctx.keys),
         .scan => if (ctx.opts.ordered)
             try buildOrderedSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, ctx.opts.n_threads, lastSegment(anchor.materialize.region_keys.?[0]))
         else
@@ -1113,6 +1283,7 @@ const Ctx = struct {
     entry_schema: []const Column = &.{},
     opts: region.DriverOpts = undefined,
     declaration: ?DeclaredBoundary = null,
+    keys: []const []const u8 = &.{},
     /// Ordered mode: measured per-interval cost, filled by the first run
     /// and frozen — LPT weights for every later hit (arena-owned).
     iv_cost: []i64 = &.{},
@@ -1123,6 +1294,10 @@ const Ctx = struct {
     versions: std.ArrayListUnmanaged(TableVersion) = .empty,
     kernels: std.ArrayListUnmanaged(KernelCheck) = .empty,
     uncacheable: bool = false,
+
+    fn retained_bytes(self: *const Ctx) usize {
+        return self.arena.queryCapacity() +| self.pool.retainedBytes();
+    }
 
     fn destroyErased(p: *anyopaque) void {
         const self: *Ctx = @ptrCast(@alignCast(p));
@@ -1409,7 +1584,9 @@ const Builder = struct {
         // the engine type the FULL list once — folded constants then carry
         // exactly the type the engine evaluator would have produced.
         const cloned = try b.a.alloc(Derived, derived.len);
-        for (derived, cloned) |src, *dst| {
+        const replaced = try b.a.alloc(?usize, derived.len);
+        for (derived, cloned, replaced) |src, *dst, *prior| {
+            prior.* = if (b.fb.resolve(src.name)) |entry| entry.idx else null;
             const expr = try b.cloneExpr(src.expr);
             dst.* = .{ .name = try b.fb.canonName(src.name), .expr = expr };
         }
@@ -1439,7 +1616,7 @@ const Builder = struct {
                 try b.fb.cols.append(b.a, .{ .name = cl.name, .type = t, .nullable = true });
                 try const_cols.append(b.a, b.fb.cols.items[idx]);
                 try const_vals.append(b.a, fv);
-                try b.fb.setVis(src.name, idx);
+                try b.bind_compute_output(src.name, idx, replaced[i]);
                 try b.const_idxs.append(b.a, idx);
             } else {
                 try rest.append(b.a, cl);
@@ -1459,7 +1636,34 @@ const Builder = struct {
             var col = typed[base + i];
             col.name = cl.name;
             try b.fb.cols.append(b.a, col);
-            try b.fb.setVis(derived[i].name, idx);
+            try b.bind_compute_output(derived[i].name, idx, replaced[i]);
+        }
+    }
+
+    fn bind_compute_output(b: *Builder, name: []const u8, idx: usize, replaced: ?usize) !void {
+        // Compute replaces one logical output slot after binding every RHS.
+        // Keeping its old qualified alias would let a later Project read the
+        // original value even though ordinary SQL now exposes the replacement.
+        var bound = false;
+        var i: usize = 0;
+        while (i < b.fb.vis.items.len) {
+            const entry = b.fb.vis.items[i];
+            if (replaced != null and entry.idx == replaced.? and std.ascii.eqlIgnoreCase(lastSegment(entry.name), lastSegment(name))) {
+                if (bound) {
+                    _ = b.fb.vis.orderedRemove(i);
+                    continue;
+                }
+                b.fb.vis.items[i] = .{ .name = name, .idx = idx };
+                bound = true;
+            }
+            i += 1;
+        }
+        if (!bound) try b.fb.setVis(name, idx);
+        i = 0;
+        while (i < b.pinned.items.len) {
+            if (std.ascii.eqlIgnoreCase(lastSegment(b.pinned.items[i].name), lastSegment(name))) {
+                _ = b.pinned.swapRemove(i);
+            } else i += 1;
         }
     }
 
@@ -1554,9 +1758,12 @@ const DrainedBlock = struct {
 
 fn compileAndDrain(b: *Builder, node: *const ir.Op, drain: bool) !DrainedBlock {
     recordSubtreeVersions(b, node);
-    var local_map: StageMap = .empty;
-    defer local_map.deinit(b.input.allocator);
-    var q = cte_stages.compileBlock(b.input, node, &local_map) catch return NoMatch;
+    // Side branches can share CTEs and window results. The ordinary stage
+    // compiler must retain those boundaries even during region preparation.
+    var q = cte_stages.compile_region_input(b.input, node) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return NoMatch;
+    };
     defer q.deinit();
 
     const src_schema = q.outputSchema();
@@ -1582,28 +1789,7 @@ fn compileAndDrain(b: *Builder, node: *const ir.Op, drain: bool) !DrainedBlock {
 }
 
 fn appendViewAll(a: Allocator, store: *ColumnStore, v: ColumnView, n: usize) !void {
-    for (0..n) |i| {
-        if (!v.isValid(i)) {
-            try store.appendNulls(a, 1);
-            continue;
-        }
-        switch (v.data) {
-            .tinyint => |s| try store.data.tinyint.append(a, s[i]),
-            .smallint => |s| try store.data.smallint.append(a, s[i]),
-            .int => |s| try store.data.int.append(a, s[i]),
-            .bigint => |s| try store.data.bigint.append(a, s[i]),
-            .date => |s| try store.data.date.append(a, s[i]),
-            .datetime => |s| try store.data.datetime.append(a, s[i]),
-            .float => |s| try store.data.float.append(a, s[i]),
-            .double => |s| try store.data.double.append(a, s[i]),
-            .varchar, .string, .char, .json => |s| switch (store.data) {
-                .varchar, .string, .char, .json => |*d| try d.appendValue(a, s.rowBytes(i)),
-                else => return NoMatch,
-            },
-            else => return NoMatch,
-        }
-        if (store.nulls != null) try store.appendValidBit(a, store.rowCount() - 1, true);
-    }
+    try region.appendViewRange(a, store, v, 0, n);
 }
 
 fn i64At(v: ColumnView, i: usize) ?i64 {
@@ -1816,11 +2002,22 @@ const Pipeline = struct {
     entry_filter: PredicateExpr,
     entry: union(enum) {
         scan: *const ir.Op.Scan,
-        union_all: *const ir.Op,
+        staged: *const ir.Op,
     },
 };
 
-fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
+fn staged_pipeline(steps: []const Step, structural_end: usize, entry_root: *const ir.Op) !Pipeline {
+    if (structural_end == 0) return NoMatch;
+    return .{
+        .steps = steps[0..structural_end],
+        .entry_sel = null,
+        .entry_derived = &.{},
+        .entry_filter = .{ .@"and" = &.{} },
+        .entry = .{ .staged = entry_root },
+    };
+}
+
+fn collectPipeline(a: Allocator, anchor: *const ir.Op, keys: []const []const u8) !Pipeline {
     if (anchor.* != .materialize) return NoMatch;
     var steps: std.ArrayListUnmanaged(Step) = .empty;
     var cur: *const ir.Op = anchor.materialize.upstream;
@@ -1851,12 +2048,16 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
                 cur = f.upstream;
             },
             .group_by => |*g| {
+                if (!contains_keys(keys, g.group_cols)) return staged_pipeline(steps.items, structural_end, entry_root);
                 try steps.append(a, .{ .group_by = g });
                 cur = g.upstream;
                 entry_root = cur;
                 structural_end = steps.items.len;
             },
             .window => |*w| {
+                for (w.specs) |spec| {
+                    if (!contains_keys(keys, spec.partition_by)) return staged_pipeline(steps.items, structural_end, entry_root);
+                }
                 try steps.append(a, .{ .window = w });
                 cur = w.upstream;
                 entry_root = cur;
@@ -1870,6 +2071,7 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
             },
             .table_fn => |*t| {
                 if (t.inputs.len == 0) return NoMatch;
+                if (t.partition_by.len > 0 and !contains_keys(keys, t.partition_by)) return staged_pipeline(steps.items, structural_end, entry_root);
                 try steps.append(a, .{ .table_fn = t });
                 cur = t.inputs[0];
                 entry_root = cur;
@@ -1880,13 +2082,7 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
                     if (!u.all or structural_end == 0) return NoMatch;
                     // Keep the entry's projections and filters in their SQL
                     // order, including positional aliases and union casts.
-                    return .{
-                        .steps = steps.items[0..structural_end],
-                        .entry_sel = null,
-                        .entry_derived = &.{},
-                        .entry_filter = .{ .@"and" = &.{} },
-                        .entry = .{ .union_all = entry_root },
-                    };
+                    return staged_pipeline(steps.items, structural_end, entry_root);
                 };
                 try steps.append(a, .{ .union_tvf = arm.ut });
                 cur = arm.base;
@@ -1894,6 +2090,7 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
                 structural_end = steps.items.len;
             },
             .scan => |*s| break :blk s,
+            .order_by, .limit => return staged_pipeline(steps.items, structural_end, entry_root),
             else => return NoMatch,
         }
     } else return NoMatch;
@@ -1935,7 +2132,6 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op) !Pipeline {
             else => unreachable,
         }
     }
-    if (filters.items.len == 0) return NoMatch; // an unfiltered full scan is never a region win
     const entry_filter: PredicateExpr = if (filters.items.len == 1)
         filters.items[0]
     else
@@ -2109,6 +2305,9 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     errdefer Ctx.destroyErased(ctx);
     const a = ctx.arena.allocator();
     if (cache == null) ctx.uncacheable = true;
+    const keys = try a.alloc([]const u8, declared_keys.len);
+    for (declared_keys, keys) |key, *copy| copy.* = try a.dupe(u8, key);
+    ctx.keys = keys;
 
     var b = Builder{ .input = input, .ctx = ctx, .a = a, .fb = .{ .a = a } };
     var sides_owned = true;
@@ -2121,7 +2320,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     // Query-lifetime arena: the step list and the entry-derived slice are
     // borrowed by the operator (never by the cached ctx).
-    var pl = try collectPipeline(input.node_arena, anchor);
+    var pl = try collectPipeline(input.node_arena, anchor, declared_keys);
     traceMark("walk", &tm);
 
     // ---- entry: prune leaves + literal-pinned columns --------------------
@@ -2130,7 +2329,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     const table = switch (pl.entry) {
         .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
-        .union_all => null,
+        .staged => null,
     };
 
     if (table) |t| try hoistEntryComputes(input.node_arena, t, &pl);
@@ -2183,9 +2382,9 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     b.order_aligned = order_aligned;
     const bs = switch (pl.entry) {
-        .union_all => |root| blk: {
+        .staged => |root| blk: {
             recordSubtreeVersions(&b, root);
-            break :blk try build_union_source(input, root);
+            break :blk try build_staged_source(input, root, declared_keys);
         },
         .scan => if (order_aligned)
             try buildOrderedSources(input, table.?, prune_leaves.items, pl.entry_filter, scan_cols_opt, n_threads, lastSegment(declared_keys[0]))
@@ -2497,18 +2696,8 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     // query teardown. Otherwise the op owns the ctx (one-shot).
     if (cache) |c| blk: {
         if (ctx.uncacheable) break :blk;
-        c.mu.lock();
-        if (c.busy) {
-            c.mu.unlock();
-            break :blk;
-        }
-        const old = c.ctx;
-        c.ctx = ctx;
-        c.hash = anchor_hash.?;
-        c.busy = true;
-        c.mu.unlock();
-        if (old) |o| c.destroyCtxAsync(o);
-        op.setOwnedCtx(c, Cache.releaseErased);
+        const entry = c.publish(anchor_hash.?, ctx) orelse break :blk;
+        op.setOwnedCtx(entry, CacheEntry.releaseErased);
         if (getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] cache store ({x})\n", .{anchor_hash.?});
         }
@@ -2754,7 +2943,7 @@ fn dispatchTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, t: *const ir.O
             if (ent.passthrough.len != 0) {
                 try pushAlignedTvf(b, ent, extra_parts, t.args, true);
             } else if (kernelReadsAll(ent)) {
-                try pushReplaceTvf(b, ent, t.args);
+                try pushReplaceTvf(b, ent, t);
             } else return NoMatch;
         },
         .merged_span => {
@@ -2768,18 +2957,30 @@ fn dispatchTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, t: *const ir.O
 
 /// Frame-replacing kernel (writes every output, no passthrough): per-range
 /// calls; the frame becomes the kernel's output schema.
-fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Value) !void {
+fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, t: *const ir.Op.TableFn) !void {
+    // Equal output names alone say nothing about their values. This is the
+    // same partition-key preservation contract used by tvfEmitKeys.
+    if (!ent.ordered_output or t.inputs.len != 1) return NoMatch;
     const a = b.a;
     const inputs = try tvfInputs(b, ent, ent.input_schemas[0].len);
     const out = try a.alloc(Column, ent.output_schema.len);
     for (ent.output_schema, out) |src, *dst| {
         dst.* = .{ .name = try b.fb.canonName(src.name), .type = src.type, .nullable = true };
     }
+    var route_name: ?[]const u8 = null;
+    var pinned: std.ArrayListUnmanaged(PinnedCol) = .empty;
+    for (t.partition_by) |name| {
+        const input_idx = try b.resolveIdx(name);
+        const output_idx = types.findColumn(ent.output_schema, name) orelse return NoMatch;
+        if (std.mem.eql(u8, b.fb.cols.items[input_idx].name, b.route_name)) route_name = out[output_idx].name;
+        if (b.pinnedName(name)) |value| try pinned.append(a, .{ .name = ent.output_schema[output_idx].name, .val = value });
+    }
+    const next_route = route_name orelse return NoMatch;
     try b.flushPending();
     try b.ops.append(a, .{ .tvf_grouped = .{ .spec = .{
         .process = ent.process,
         .user_data = ent.user_data,
-        .args = try cloneArgs(b, args),
+        .args = try cloneArgs(b, t.args),
         .inputs = inputs,
         .out = out,
     } } });
@@ -2790,6 +2991,10 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Va
         try b.fb.cols.append(a, o);
         try b.fb.setVis(src.name, idx);
     }
+    b.route_name = next_route;
+    // The output contract preserves partition values, not arbitrary fields
+    // that happened to be fixed by the entry filter.
+    b.pinned = pinned;
     // Range keys re-resolve by NAME against the new frame (the kernel keeps
     // partition-column names — SDK schema contract); verify they survive.
     var buf: [8]usize = undefined;
@@ -2800,48 +3005,43 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Va
 }
 
 fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
-    var all_fill = true;
-    for (w.calls) |call| {
-        if (call.func != .last_value) all_fill = false;
-    }
-    if (all_fill) return pushFillLast(b, w);
-    for (w.calls, 0..) |call, i| {
-        const single = ir.WindowOp{ .upstream = w.upstream, .specs = w.specs, .calls = w.calls[i .. i + 1] };
-        switch (call.func) {
-            .row_number => try pushRanksFromWindow(b, &single),
-            .lag => try push_lag(b, w.specs[call.spec_idx], call),
-            else => return NoMatch,
+    const specs = try b.a.alloc(ir.WindowSpec, w.specs.len);
+    for (w.specs, specs) |src, *dst| {
+        const part = try b.a.alloc([]const u8, src.partition_by.len);
+        var contains_route_key = false;
+        for (src.partition_by, part) |name, *physical| {
+            physical.* = b.fb.cols.items[try b.resolveIdx(name)].name;
+            if (std.mem.eql(u8, physical.*, b.route_name)) contains_route_key = true;
         }
-    }
-}
-
-fn push_lag(b: *Builder, spec: ir.WindowSpec, call: ir.WindowCall) !void {
-    if (call.ignore_nulls or call.args.len == 0 or call.args.len > 3) return NoMatch;
-    if (call.args[0] != .col_ref) return NoMatch;
-    if (call.args.len == 3 and call.args[2] != .null_lit) return NoMatch;
-    if (!try b.partitionMatchesRangeKeys(spec.partition_by)) return NoMatch;
-    const offset: usize = if (call.args.len > 1) blk: {
-        if (call.args[1] != .lit) return NoMatch;
-        const value: i64 = switch (call.args[1].lit) {
-            .tinyint => |v| v,
-            .smallint => |v| v,
-            .int => |v| v,
-            .bigint => |v| v,
-            else => return NoMatch,
+        if (!contains_route_key) return NoMatch;
+        const order = try b.a.alloc(ir.SortSpec, src.order_by.len);
+        for (src.order_by, order) |ob, *physical| physical.* = .{
+            .col = b.fb.cols.items[try b.resolveIdx(ob.col)].name,
+            .desc = ob.desc,
         };
-        break :blk std.math.cast(usize, value) orelse return NoMatch;
-    } else 1;
-    const src = try b.resolveIdx(call.args[0].col_ref);
-    const order = try cloneOrder(b, spec.order_by);
+        dst.* = .{ .partition_by = part, .order_by = order, .frame = src.frame };
+    }
+    const calls = try b.a.alloc(ir.WindowCall, w.calls.len);
+    const replaced = try b.a.alloc(?usize, w.calls.len);
+    for (w.calls, calls, replaced) |src, *dst, *prior| {
+        prior.* = if (b.fb.resolve(src.output_name)) |entry| entry.idx else null;
+        const args = try b.a.alloc(ir.Expr, src.args.len);
+        for (src.args, args) |arg, *cloned| {
+            cloned.* = if (arg == .col_ref and std.mem.eql(u8, arg.col_ref, "*")) .{ .col_ref = "*" } else try b.cloneExpr(arg);
+        }
+        dst.* = src;
+        dst.args = args;
+        dst.output_name = try b.fb.canonName(src.output_name);
+    }
     try b.flushPending();
-    const idx = try b.fb.addCol(call.output_name, b.fb.cols.items[src].type, true);
-    try b.ops.append(b.a, .{ .lag = .{
-        .name = b.fb.cols.items[idx].name,
-        .src = src,
-        .offset = offset,
-        .order = order,
-    } });
-    try b.fb.setVis(call.output_name, idx);
+    const columns = try b.a.alloc(Column, calls.len);
+    for (calls, columns) |call, *col| col.* = try @import("../exec/window.zig").output_column(call, b.fb.cols.items);
+    try b.ops.append(b.a, .{ .window = .{ .specs = specs, .calls = calls } });
+    for (w.calls, columns, replaced) |src, col, prior| {
+        const idx = b.fb.cols.items.len;
+        try b.fb.cols.append(b.a, col);
+        try b.bind_compute_output(src.output_name, idx, prior);
+    }
 }
 
 fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror!void {
@@ -2900,7 +3100,10 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
     var key_right = try a.alloc(bool, blk.schema.len);
     @memset(key_right, false);
     for (j.on) |pair| {
-        const rci = types.findColumn(blk.schema, pair.right) orelse return NoMatch;
+        const rci = types.findColumn(blk.schema, pair.right) orelse {
+            sideTrace("broadcast build column '{s}' unresolved", .{pair.right});
+            return NoMatch;
+        };
         key_right[rci] = true;
         if (b.pinnedName(pair.left)) |v| {
             try pin_right.append(a, rci);
@@ -2910,19 +3113,19 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
             try live_right.append(a, rci);
         }
     }
-    // String keys or >2 live pairs route to the generalized keyed_probe
-    // (broadcast form); the packed-i64 fast path below stays for the proven
-    // 1-2 int-key shapes.
+    // Composite keys retain every component's bits in the general probe.
+    // Packing two BIGINTs into one integer can alias distinct SQL keys.
     if (live_left.items.len > 0) {
-        var needs_keyed = live_left.items.len > 2;
+        var needs_keyed = live_left.items.len > 1;
         for (live_right.items) |rci| {
             if (isStringFamilyType(blk.schema[rci].type)) needs_keyed = true;
         }
         if (needs_keyed) {
             return pushKeyedBroadcast(b, ralias, blk, inner, live, pin_right.items, pin_vals.items, live_left.items, live_right.items, key_right);
         }
+        const probe = try b.resolveIdx(live_left.items[0]);
+        if (!isIntFamilyType(b.fb.cols.items[probe].type) or !isIntFamilyType(blk.schema[live_right.items[0]].type)) return NoMatch;
     }
-    if (live_left.items.len > 2) return NoMatch;
 
     if (live_left.items.len == 0) {
         // Fully-pinned join: every ON pair binds to an entry literal, so
@@ -2935,12 +3138,12 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
         var match_row: ?usize = null;
         rows: for (0..blk.rows) |i| {
             for (pin_right.items, pin_vals.items) |rci, want| {
-                const rv = blk.stores[rci].view();
-                const got = i64At(rv, i) orelse continue :rows;
-                const want_i = valueI64(want) orelse return NoMatch;
-                if (got != want_i) continue :rows;
+                if (!try pinMatches(blk.stores[rci].view(), i, want)) continue :rows;
             }
-            if (match_row != null) return NoMatch;
+            if (match_row != null) {
+                sideTrace("fully pinned broadcast has multiple matching rows", .{});
+                return NoMatch;
+            }
             match_row = i;
         }
         const mi = match_row orelse {
@@ -2987,44 +3190,18 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
     var kept: std.ArrayListUnmanaged(u32) = .empty;
     rows: for (0..blk.rows) |i| {
         for (pin_right.items, pin_vals.items) |rci, want| {
-            const rv = blk.stores[rci].view();
-            const got = i64At(rv, i) orelse continue :rows;
-            const want_i = valueI64(want) orelse return NoMatch;
-            if (got != want_i) continue :rows;
+            if (!try pinMatches(blk.stores[rci].view(), i, want)) continue :rows;
         }
-        var key: i64 = 0;
-        for (live_right.items) |rci| {
-            const kv = i64At(blk.stores[rci].view(), i) orelse continue :rows;
-            key = key * 4294967296 + kv;
-        }
+        const key = i64At(blk.stores[live_right.items[0]].view(), i) orelse continue :rows;
         const gop = try map.getOrPut(a, key);
-        if (gop.found_existing) {
-            if (!inner) return NoMatch; // dup key changes LEFT row counts
-            continue :rows;
-        }
+        // A broadcast probe emits at most one match. Both INNER and LEFT
+        // joins must remain staged when the build side would multiply rows.
+        if (gop.found_existing) return NoMatch;
         gop.value_ptr.* = @intCast(kept.items.len);
         try kept.append(a, @intCast(i));
     }
 
-    // Probe key: single live key probes directly; two pack as k1*2^32+k2.
-    var probe_idx: usize = undefined;
-    if (live_left.items.len == 1) {
-        probe_idx = try b.resolveIdx(live_left.items[0]);
-    } else {
-        const hi_idx = try b.resolveIdx(live_left.items[0]);
-        const lo_idx = try b.resolveIdx(live_left.items[1]);
-        const mul_args = try a.alloc(Expr, 2);
-        mul_args[0] = .{ .call = .{ .fn_name = "to_bigint", .args = try dupExpr(a, .{ .col_ref = b.fb.cols.items[hi_idx].name }) } };
-        mul_args[1] = .{ .lit = .{ .bigint = 4294967296 } };
-        const add_args = try a.alloc(Expr, 2);
-        add_args[0] = .{ .call = .{ .fn_name = "mul", .args = mul_args } };
-        add_args[1] = .{ .call = .{ .fn_name = "to_bigint", .args = try dupExpr(a, .{ .col_ref = b.fb.cols.items[lo_idx].name }) } };
-        probe_idx = try b.fb.addCol("probe_key", .bigint, true);
-        const key_derived = try a.alloc(Derived, 1);
-        key_derived[0] = .{ .name = b.fb.cols.items[probe_idx].name, .expr = .{ .call = .{ .fn_name = "add", .args = add_args } } };
-        try b.flushPending();
-        try b.ops.append(a, .{ .compute = .{ .derived = key_derived } });
-    }
+    const probe_idx = try b.resolveIdx(live_left.items[0]);
 
     // Payloads: every non-key right column the steps above can reference,
     // gathered to kept-row order.
@@ -3090,7 +3267,7 @@ fn pinMatches(v: ColumnView, i: usize, want: Value) !bool {
 }
 
 /// The broadcast form of keyed_probe: a small compile-time-drained build
-/// side with string and/or >2 live key pairs. Map + interners live in the
+/// side with string or composite keys. Map + interners live in the
 /// ctx arena beside the drained block, so cache hits replay them for free.
 fn pushKeyedBroadcast(
     b: *Builder,
@@ -3105,7 +3282,10 @@ fn pushKeyedBroadcast(
     key_right: []const bool,
 ) anyerror!void {
     const a = b.a;
-    if (live_left.len > region.MAX_KEYED_PAIRS) return NoMatch;
+    if (live_left.len > region.MAX_KEYED_PAIRS) {
+        sideTrace("broadcast has {d} key pairs (max {d})", .{ live_left.len, region.MAX_KEYED_PAIRS });
+        return NoMatch;
+    }
 
     const views = try a.alloc(ColumnView, blk.schema.len);
     for (blk.stores, views) |*st, *v| v.* = st.view();
@@ -3114,7 +3294,10 @@ fn pushKeyedBroadcast(
     const interners = try a.alloc(?*const region.StrInterner, live_left.len);
     const interner_ptrs = try a.alloc(?*region.StrInterner, live_left.len);
     for (live_left, live_right, pairs, interners, interner_ptrs) |ln, rci, *pp, *ip, *mp| {
-        const probe = try b.resolveIdx(ln);
+        const probe = b.resolveIdx(ln) catch |err| {
+            sideTrace("broadcast probe column '{s}' unresolved", .{ln});
+            return err;
+        };
         const pt = b.fb.cols.items[probe].type;
         const bt = blk.schema[rci].type;
         const kind: region.KeyedPairKind = if (isIntFamilyType(pt) and isIntFamilyType(bt))
@@ -3388,7 +3571,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
     // Co-partition requirement: some ON pair's LEFT is the route key column
     // (scatter hashes ONLY that column, so equal route keys — and therefore
     // every possible match — land in the same shard on both sides).
-    const route_idx = (b.fb.resolve(b.route_name) orelse {
+    const route_idx = types.findColumn(b.fb.cols.items, b.route_name) orelse {
         sideTrace("route name '{s}' unresolved", .{b.route_name});
         if (getenv("THINDB_REGION_STEPS") != null) {
             for (b.fb.vis.items) |e| {
@@ -3398,7 +3581,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             }
         }
         return NoMatch;
-    }).idx;
+    };
     var route_pair: ?usize = null;
     for (j.on, 0..) |pair, pi| {
         const e = b.fb.resolve(pair.left) orelse {
@@ -3869,10 +4052,12 @@ const BuiltSources = struct {
     iv_rows: []u64 = &.{},
 };
 
-fn build_union_source(input: engine_v2.CompileInput, root: *const ir.Op) !BuiltSources {
+fn build_staged_source(input: engine_v2.CompileInput, root: *const ir.Op, keys: []const []const u8) !BuiltSources {
     const sources = try input.allocator.alloc(exec.Query, 1);
     errdefer input.allocator.free(sources);
-    sources[0] = try cte_stages.compile_region_input(input, root);
+    const entry = try input.node_arena.create(ir.Op);
+    entry.* = .{ .materialize = .{ .upstream = @constCast(root), .region_keys = keys } };
+    sources[0] = try cte_stages.compileStaged(input, entry, null);
     return .{ .sources = sources, .total_rows = sources[0].stats().upper_rows };
 }
 
@@ -4326,60 +4511,10 @@ fn pushAlignedTvf(
             if (b.isConstIdx(source)) try b.const_idxs.append(a, idx);
             break :blk idx;
         };
+        if (std.mem.eql(u8, b.fb.cols.items[source].name, b.route_name)) b.route_name = b.fb.cols.items[idx].name;
         try b.fb.setVis(declared.name, idx);
     }
     if (views.items.len != 0) try b.ops.append(a, .{ .view_cols = views.items });
-}
-
-fn cloneOrder(b: *Builder, specs: []const ir.SortSpec) ![]const region.OrderBy {
-    const out = try b.a.alloc(region.OrderBy, specs.len);
-    for (specs, out) |src, *dst| {
-        dst.* = .{ .col = try b.resolveIdx(src.col), .desc = src.desc };
-    }
-    return out;
-}
-
-/// Every ROW_NUMBER call becomes one ranks op; a partition coarser than the
-/// range keys ranks over merged spans.
-fn pushRanksFromWindow(b: *Builder, w: *const ir.WindowOp) !void {
-    for (w.calls) |call| {
-        if (call.func != .row_number or call.args.len != 0) return NoMatch;
-        const spec = w.specs[call.spec_idx];
-        const merge_on: ?usize = switch (try b.classifyPartition(spec.partition_by)) {
-            .range_exact => null,
-            .merged_span => |m| m,
-        };
-        const order = try cloneOrder(b, spec.order_by);
-        try b.flushPending();
-        const idx = try b.fb.addCol(call.output_name, .bigint, false);
-        try b.ops.append(b.a, .{ .ranks = .{
-            .name = b.fb.cols.items[idx].name,
-            .order = order,
-            .merge_on = merge_on,
-        } });
-        try b.fb.setVis(call.output_name, idx);
-    }
-}
-
-/// LAST_VALUE(col) with an unbounded-following frame over the range keys →
-/// fill_last; a current-row frame is per-row identity (vis re-point only).
-fn pushFillLast(b: *Builder, w: *const ir.WindowOp) !void {
-    for (w.calls) |call| {
-        if (call.func != .last_value or call.args.len != 1) return NoMatch;
-        if (call.args[0] != .col_ref) return NoMatch;
-        const spec = w.specs[call.spec_idx];
-        if (!try b.partitionMatchesRangeKeys(spec.partition_by)) return NoMatch;
-        try checkRangeOrder(b, spec.order_by);
-        const src = try b.resolveIdx(call.args[0].col_ref);
-        if (spec.frame.end != .unbounded_following) {
-            try b.fb.setVis(call.output_name, src);
-            continue;
-        }
-        try b.flushPending();
-        const idx = try b.fb.addCol(call.output_name, b.fb.cols.items[src].type, true);
-        try b.ops.append(b.a, .{ .fill_last = .{ .name = b.fb.cols.items[idx].name, .src = src } });
-        try b.fb.setVis(call.output_name, idx);
-    }
 }
 
 /// Keyed aggregation: group cols must cover every `required` frame column
@@ -4479,13 +4614,21 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
 
     var out: std.ArrayListUnmanaged(region.AggOut) = .empty;
     var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
+    var new_consts: std.ArrayListUnmanaged(usize) = .empty;
+    var new_pinned: std.ArrayListUnmanaged(PinnedCol) = .empty;
+    var route_name: ?[]const u8 = null;
 
     // Group keys first (constant within their sub-group → .first).
     for (g.group_cols) |gc| {
         const e = b.fb.resolve(gc) orelse return NoMatch;
-        try out.append(a, .{ .name = try nameFor(b, gc), .kind = .{ .first = e.idx } });
+        const name = try nameFor(b, gc);
+        if (std.mem.eql(u8, b.fb.cols.items[e.idx].name, b.route_name)) route_name = name;
+        if (b.isConstIdx(e.idx)) try new_consts.append(a, out.items.len);
+        if (b.pinnedName(gc)) |value| try new_pinned.append(a, .{ .name = gc, .val = value });
+        try out.append(a, .{ .name = name, .kind = .{ .first = e.idx } });
         try new_vis.append(a, .{ .name = try a.dupe(u8, gc), .idx = new_vis.items.len });
     }
+    const next_route = route_name orelse return NoMatch;
     for (g.aggs) |spec| {
         const kind: @FieldType(region.AggOut, "kind") = switch (spec.func) {
             .any_value => .{ .first = try b.resolveIdx(spec.col orelse return NoMatch) },
@@ -4542,6 +4685,9 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     }
     b.fb.cols = new_cols;
     b.fb.vis = new_vis;
+    b.route_name = next_route;
+    b.const_idxs = new_consts;
+    b.pinned = new_pinned;
 }
 
 fn nameFor(b: *Builder, hint: []const u8) ![]const u8 {

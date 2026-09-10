@@ -1,6 +1,421 @@
 # Keyed Regions — eligibility round (hand-off)
 
-Status: IN PROGRESS (2026-09-09), branch `region-eligibility`. Predecessor
+### Preserve routed keys across frame replacements (2026-09-10)
+
+Engine commit `bdec8da` fixes the physical route-key identity lost when a
+TVF or aggregation replaces the regional frame. Replacing TVFs now carry
+the route through their existing `ordered_output` partition-value contract;
+matching output names alone are insufficient. GROUP BY carries it through
+an unchanged group column and remaps constant-column indices to the new
+frame. Co-partitioned joins resolve the route against physical columns,
+rather than the SQL-visible alias map. No Wayroll-specific recognition or
+function changes were added. Unmarked TVFs and computed key replacements
+retain ordinary fallback.
+
+The new regression failed before the fix. It requires four windows, two
+row-generating TVFs, an aggregation, and a co-partitioned join in one region,
+then compares all output values with ordinary execution. It covers DOP 1
+and 4, NULL keys and values, and cached runs. Separate negative cases verify
+that a TVF merging customer keys, and a computed key replacement after
+aggregation, cannot inherit the old route.
+
+Validation: full `zig build test -j2` passed (826 integration, 113
+client/server, 533 unit, and 5 config tests; 5 existing unit skips).
+`zig build bench -j2` passed, including exact-result regional window checks.
+Local regional/ordinary window speedups were 1.12x (LAG scan), 1.46x (LAG
+UNION ALL), 1.21x (mixed scan), and 1.58x (mixed UNION ALL).
+
+Follow-up `54578b3` also invalidates entry-filter constants when a replacement
+does not prove their values survive: TVFs retain only partition-key literals,
+and aggregates retain only group-column literals. The new regression changed
+a non-partition project column from 100 to 101; the regional join incorrectly
+returned the lookup for 100 before the guard. TVF and aggregate replacements
+now match the ordinary join values, including cached runs. The final full
+test run passed 827 integration, 113 client/server, 533 unit, and 5 config
+tests (1,478 total; 5 existing skips).
+
+A separate mixed-width join schema issue surfaced during this check:
+ordinary execution widens a selected INT key joined to BIGINT, while the
+regional join retains INT. The constant-provenance regression uses matching
+BIGINT keys to isolate the value bug. Mixed-width join output-type parity
+remains a follow-up alongside the remaining SQL GROUP BY coverage limits.
+
+The server follow-up exposed a separate memory/configuration constraint.
+The default retained-region cache has its own 8 GiB budget, independent of
+the block cache and active query budget. One benchmark attempt reached its
+33 GiB OS ceiling; a subsequent attempt with a 6 GiB block cache was killed
+inside its 32 GiB cgroup. Production thinDB, StarRocks, and CDC stayed healthy.
+These attempts are archived and excluded from final timing results.
+An overly small 2 GiB region-cache budget evicted the compiled cross pipeline
+and lost its warm-run benefit. The follow-up configuration uses a 6 GiB block
+cache, `THINDB_REGION_POOL_MB=4096`, DOP 16, a 24 GiB shared query budget,
+and a 16 GiB per-query budget, retaining 12 GiB initial host headroom.
+Each arm's warmup and three measurements run consecutively: interleaving
+different SQL/UDF programs can churn this smaller cache and measure repeated
+compilation instead. Fresh candidates separate the datasets. Memory-aware
+region-cache sizing/accounting remains a follow-up concern for deployment;
+this repair does not change those budgets automatically.
+
+The full five-arm sweep at `bdec8da` completed all 30 dataset/variant cases
+with one warmup and three measured samples per arm, on starrocks1 via
+localhost, retaining the three hash buckets a/b/c and prior case dates.
+Final result packets were discarded without Node value decoding. All 60
+SQL/UDF keyed-versus-unkeyed wire fingerprints matched, and all four thinDB
+arms returned matching row counts in every case. Eight source-count checks
+match the preceding snapshot exactly. The full timing phase peaked at
+22.77 GiB with zero memory-ceiling-pressure or OOM events.
+
+Totals (sum of the fifteen medians, seconds):
+
+| Dataset | SR SQL | thinDB SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 10.47 | 12.76 | 8.90 | 6.41 | 3.12 |
+| AirDNA | 47.21 | 45.00 | 35.30 | 35.84 | 12.21 |
+
+After the stale-constant guard, final head `54578b3` was compared with
+`6a216c4` on the six affected UDF+regions cases using matched 6 GiB data / 4 GiB
+region-cache settings. These focused controls are separate from the matrix
+above. Median milliseconds, three measured runs after warmup:
+
+| Dataset | Variant | Before | Final | Speedup |
+|---|---|---:|---:|---:|
+| Sierra | base cross | 310 | 153 | 2.03x |
+| Sierra | expanded cross | 871 | 177 | 4.92x |
+| Sierra | detail cross | 304 | 196 | 1.55x |
+| AirDNA | base cross | 1,472 | 580 | 2.54x |
+| AirDNA | expanded cross | 9,241 | 604 | 15.29x |
+| AirDNA | detail cross | 2,540 | 1,460 | 1.74x |
+
+All six final-head fingerprints match both their unkeyed controls and the
+earlier matrix outputs. Regional operation sequences are unchanged by the
+constant guard. Both datasets' UDF cross programs extend from the regressed
+13 operations to 28 (base), 31 (expanded), and 25 (detail), including later
+windows, aggregation, and UDF stages. SQL cross programs still stop at the
+later GROUP BY boundary (17–18 operations). Shared-host load and cache
+behavior explain why focused-control medians differ from matrix medians;
+neither matched timing phase recorded memory pressure.
+
+Final Linux ReleaseFast SHA256:
+`dc47d31b5b83591cfbe84d94028678b5c70d1f4633637647296762da30ac885b`.
+Both candidates were stopped. Production thinDB PID 256623, StarRocks BE PID
+848762, and the original running CDC job remained healthy. No production
+binary was replaced. Full matrix, CSV, raw queries/traces, fingerprints,
+failed-attempt archives, and matched controls are in ignored
+`.bench-data/five-arm-bdec8da/`, `.bench-data/five-arm-54578b3/`, and
+`.bench-data/five-arm-routebase-6a216c4/`. The combined report is
+`.bench-data/five-arm-bdec8da/report/benchmark-report.md`.
+
+### Five-arm server sweep: SQL gains and UDF coverage regression (2026-09-10)
+
+The complete Sierra/AirDNA sweep ran on starrocks1 with engine `6a216c4`
+(Linux ReleaseFast, SHA256
+`ddc30341a5aabbb519bf92555e377f47ca4305dc1a4e2d5fb93461d2d5930e8c`)
+and Wayroll query generation `b5359d9e`. All five arms used the prior query
+dates and three customer-hash buckets `[a,d)`, with one warmup and three
+measured runs. Clients ran on localhost and discarded final row packets
+without value decoding. StarRocks completed before the candidate started.
+
+Totals below are sums of the fifteen case medians:
+
+| Dataset | SR SQL | thinDB SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 11.01 s | 9.48 s | 6.61 s | 4.44 s | 3.08 s |
+| AirDNA | 47.26 s | 46.00 s | 38.13 s | 39.08 s | 27.53 s |
+
+All 150 dataset/variant/arm combinations completed without query errors.
+All 240 timed keyed executions engaged a region. All four thinDB modes
+returned matching row counts in every variant. A separate untimed pass
+computed order-independent row-packet fingerprints: all 30 SQL keyed/unkeyed
+pairs and all 30 UDF keyed/unkeyed pairs matched. This validates paired wire
+outputs; it is not a value comparison with StarRocks live data. Sierra source
+counts match the copy, while AirDNA live StarRocks has about 0.02% more rows.
+
+**The new build regresses some UDF cross-division pipelines despite region
+engagement.** AirDNA UDF-plus-regions base-cross increased from 493 to 1,453 ms;
+expanded-cross from 600 to 11,833 ms. Sierra expanded-cross increased from
+203 to 821 ms. The prior AirDNA base-cross region contained 29 operations,
+including ranking, aggregation, and later UDF stages. The new one emits
+after 13 operations: a subsequent window declines and the remaining work
+stages ordinarily. SQL windows now enter regions, but the SQL path also hits
+later GROUP BY coverage limits. Engagement alone is not full pipeline coverage.
+
+The likely UDF blocker is physical route-key identity after a frame-replacing
+TVF: `pushReplaceTvf` generates new physical names and resets the frame;
+`dispatchWindow` compares its partition columns with the earlier `route_name`.
+Next priority is preserving **proven** routed-key identity across these
+transitions, with a regression test that requires the later window and UDF
+stages inside the region. Do not remove the guard without a value-preservation
+proof. Then address the SQL GROUP BY declines and repeat the five-arm sweep.
+This diagnosis is supported by source and traces; no fix was applied during
+this benchmark run.
+
+The candidate retained DOP 16, an 8 GiB cache, 24 GiB shared query budget, and
+16 GiB per-query budget. Its OS ceiling was 34 GiB to preserve 12 GiB initial
+headroom; peak cgroup usage was 32.74 GiB with zero ceiling-pressure/OOM events.
+The temporary server was stopped after validation. Production thinDB, StarRocks
+BE, and CDC remained running with their original PIDs/job ID.
+
+The complete timing matrix, exact CSV medians, raw samples, SQL captures,
+traces, fingerprints, source counts, and health metadata remain in ignored
+`.bench-data/five-arm-6a216c4/`. The report is
+`report/benchmark-report.md`; the CSV is `report/benchmark-results.csv`.
+
+### Shared SQL windows and ordinary fallback (2026-09-10)
+
+The follow-up implementation replaces the SQL window whitelist with a
+regional `window` operation backed by `exec/window.zig`. Ordinary and keyed
+execution now share the evaluator for all sixteen existing window function
+kinds: ranking/distribution, LAG/LEAD, FIRST/LAST/NTH_VALUE, and aggregates.
+Partition and order references, arguments, defaults, output types, and aliases
+are resolved once. Each worker borrows its complete shard input and reuses
+output stores. Regional admission checks that every partition retains the
+actual routed key; compatible partitions may have different extra columns
+and sort orders. TVF passthrough views preserve route-key identity.
+
+The initial LAG-with-default probe failed before the change. It and the
+multi-column LAST_VALUE probe now execute inside regions with value parity. Broader tests
+cover mixed specs, ascending/descending orders, NULL keys/values, string
+results, default columns, large offsets, cached execution, and source changes.
+
+Shared evaluation exposed existing frame bugs: FIRST_VALUE ignored its frame,
+and RANGE/GROUPS were evaluated as physical ROWS. Frame-aware value functions
+now respect frame bounds, including IGNORE NULLS and empty frames. RANGE
+includes peers and supports integer offsets over one numeric order column
+(including scaled decimals); GROUPS advances by peer groups. Prefix aggregate
+frames retain a linear evaluation path with peer broadcasting. The old
+whole-partition FIRST_VALUE tests now specify that frame explicitly, and new
+tests assert expected values separately from keyed/ordinary parity. Temporal
+RANGE offsets and EXCLUDE remain unsupported. Semantics reference:
+[PostgreSQL window functions](https://www.postgresql.org/docs/current/functions-window.html).
+
+As requested, KEYED BY now permits ordinary fallback instead of making lack
+of regional coverage a query error. This supersedes the older hard-decline
+contract below. Incompatible window/group partitions and global sort/limit
+boundaries can become staged ingress for a later region. Earlier compatible
+CTEs within that ingress can independently use regions. A regression test
+asserts exactly two regions around a global window and compares every value,
+including cached runs and changed input. Invalid SQL still reports its normal
+semantic error; fallback tests explicitly verify that no region engaged.
+Declared keys are retained in cache entries and compared before reuse.
+
+The focused local ReleaseFast benchmark uses 1,000,000 synthetic rows, DOP 12,
+one warmup and five alternating measured runs per arm. Every keyed execution
+must include the downstream window in its region; aggregate totals must match.
+Medians from `.bench-data/sql-window-bench.log`:
+
+| SQL pipeline | Ingress | Ordinary | Keyed | Speedup |
+|---|---|---:|---:|---:|
+| LAG chain | Scan | 63.40 ms | 46.20 ms | 1.37x |
+| LAG chain | UNION ALL | 61.52 ms | 38.32 ms | 1.61x |
+| LAG default + running SUM + ordered LAST_VALUE | Scan | 95.93 ms | 56.91 ms | 1.69x |
+| LAG default + running SUM + ordered LAST_VALUE | UNION ALL | 94.67 ms | 59.49 ms | 1.59x |
+
+Validation: `zig build test -j2` completed with exit 0: 823 integration tests,
+113 client/server tests, and 533 unit tests passed; five existing unit tests
+were skipped. After helper naming cleanup, the focused window/region suite
+was rerun. `zig build bench-regions -j2` and `zig build bench -j2` both completed
+with exit 0. In the full general benchmark run, the four keyed comparisons
+measured 1.15x, 1.77x, 1.47x, and 2.04x respectively; retain both runs rather
+than treating the small synthetic timing differences as a stable gain.
+Logs are `.bench-data/sql-window-full-test-final.log`,
+`sql-window-final-targeted.log`, and `sql-window-full-bench.log`.
+
+These are local synthetic comparisons, not new Sierra/AirDNA results. The
+next application-level measurement must replay the full SQL rollforward arm,
+verify values and regional coverage, and retain the bounded, separate-phase
+server procedure documented below. A mixed-spec window operator with an
+incompatible partition currently stages as a unit; adjacent compatible CTEs
+can still use regions.
+
+### Plain SQL region eligibility and UDF attribution (2026-09-10)
+
+Checkpoint commit `516c454` preserves the earlier benchmark documentation and
+the reusable packet-discard helper. The following experiment uses the same
+`0258e6d` engine and `b5359d9e` Wayroll application; no engine changes were made.
+
+Adding `KEYED BY (customerNumberLC)` to the outer full-SQL `WITH`, with all
+SQL/Zig UDF switches disabled, was rejected with `RegionUnsupportedConstruct`
+in all 30 Sierra/AirDNA configurations. The requested SQL-plus-regions column
+is therefore **unsupported**, with no valid timing. The benchmark captures
+verify the declaration was inserted and no `rf_*` functions were present.
+
+The traces show boundary search declining SQL windows. The shared currency
+normalization uses `LAST_VALUE(originalCurrency)` ordered by both
+`invoiceDate` and `originalCurrency`; the regional `pushFillLast` path accepts
+only one ascending order column. Later windows also exceed current coverage:
+`LAG` with a non-NULL default, partition-wide `MIN`/`MAX`, and cumulative
+`SUM`. See `dispatchWindow`, `push_lag`, `pushFillLast`, and `checkRangeOrder`
+in `src/net/region_rollforward.zig`. The final date/type aggregate belongs
+outside the customer region; its key-contract decline alone is expected.
+The complete SQL pipeline fails because no supported inner boundary is found.
+This does not mean ordinary SQL fundamentally cannot use keyed regions.
+
+An additional Zig-without-regions control measures the regional contribution
+to the existing UDF-shaped pipeline. All 15 variants per dataset used three
+hash buckets `[a,d)`, one warmup, and three measured runs, with result packets
+consumed without decoding values. Totals are sums of per-case medians:
+
+| Dataset | thinDB SQL | Zig only | Zig + regions | SQL / Zig only | Zig only / Zig + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 10.03 s | 4.89 s | 2.13 s | 2.05x | 2.30x |
+| AirDNA | 39.13 s | 33.50 s | 10.22 s | 1.17x | 3.28x |
+
+AirDNA expanded-cross illustrates the difference: SQL took 9,593 ms,
+Zig only 10,139 ms, and Zig plus regions 600 ms. These ratios measure regions
+on the UDF-shaped queries; they cannot substitute for the still-unavailable
+SQL-to-keyed-SQL comparison or predict the speed of generic SQL windows.
+
+All 120 keyed Zig executions engaged a region; plain SQL and Zig-only did
+not. Successful thinDB arms returned matching row counts. Captured Zig
+queries and parameters match after removing the keyed declaration and
+consistently normalizing generated CTE names; the SQL arms match under the
+same check. Value-level correctness was not rechecked in this timing run.
+
+Measurements ran via localhost on starrocks1, using the isolated thinDB data
+copy on 13311. The temporary instance retained the previous memory limits,
+recorded zero memory-limit/OOM events, and was stopped before StarRocks
+benchmarking. Production thinDB and CDC were left running. Raw queries,
+traces and phase results are in ignored `.bench-data/sql-keyed-results-thin/`
+and `sql-keyed-results-sr/`; the combined report and CSV are in
+`.bench-data/sql-keyed-results/`.
+
+Next engine work: support general ordered `LAST_VALUE`, non-NULL `LAG`
+defaults, and aggregate windows in regions, with full value parity tests.
+Then rerun the explicit plain-SQL arm and inspect which expensive stages
+actually execute inside regions before attributing the remaining UDF benefit.
+
+### Server benchmark checkpoint (2026-09-10)
+
+Engine changes are committed as `0258e6d`; companion Wayroll changes as
+`b5359d9e` on its local `rollforward-thindb-local` branch. The Linux candidate
+was benchmarked on starrocks1 against a separate production-data copy on
+13311. The production thinDB listener on 13310 remains on v0.1.89.
+
+The benchmark now consumes MySQL row packets without constructing Node rows.
+The reusable decoder bypass is `bench/mysql_packet_drain.cjs`. With identical
+AirDNA detail queries, alternating decoded/discard controls changed Zig
+simple from 2,198 to 506 ms and cross from 2,545 to 585 ms. All result bytes
+were still transmitted. The adapter passed protocol checks on both engines.
+
+The three-bucket range `[a,d)` selects a, b and c together. It increases
+AirDNA invoice input by 2.99x and Sierra input by 2.56x simple / 2.96x cross.
+Matched one/three-bucket runs cover all 15 variants on both datasets, with
+one warmup and three measured runs per arm and no row-value decoding.
+All 120 three-bucket Zig queries engaged regions; thinDB SQL/Zig row counts
+matched. Summed case medians (three buckets):
+
+| Dataset | StarRocks SQL | thinDB SQL | thinDB Zig + regions | Zig vs SR, one to three buckets |
+|---|---:|---:|---:|---:|
+| Sierra | 12.11 s | 11.39 s | 2.39 s | 5.11x to 5.06x |
+| AirDNA | 53.45 s | 50.11 s | 13.20 s | 4.41x to 4.05x |
+
+An initial cohosted attempt exhausted RAM and the OS killed StarRocks BE at
+06:38:20 UTC. The extra thinDB instance was retaining about 28 GiB alongside
+production services. The benchmark client and candidate were stopped, the
+existing BE startup script restored StarRocks, and backend readiness, an empty
+blacklist and a table query were verified. Production thinDB and CDC stayed
+running. That attempt is excluded from the results.
+
+Final measurements ran StarRocks with the temporary thinDB instance stopped,
+then thinDB SQL/Zig with no StarRocks benchmark queries running. Both thinDB
+sizes used DOP 16, cache 8 GiB, shared query budget 24 GiB, per-query budget
+16 GiB and a 36 GiB OS ceiling. No ceiling-pressure or OOM event occurred in
+the final runs. The temporary instance has been stopped. Future three-bucket
+work must retain separate phases and a bounded temporary instance.
+
+Full matrices, raw samples, source counts and procedure remain in the ignored
+`.bench-data/region-scale-results/`, `region-scale-baseline/`,
+`region-drain-results/` and `region-scale-runbook.md`. Deployment-specific
+scripts, credentials, copied databases and customer results stay outside git.
+
+The next comparison at this checkpoint was full SQL with an explicit keyed
+declaration while all SQL/Zig UDF switches remained off, to isolate regional
+and UDF contributions. Its findings appear above. Actual region coverage
+matters alongside timings: engagement alone can represent a small inner
+boundary rather than the expensive portion of the query.
+
+### Coverage and cold preparation follow-up (2026-09-09)
+
+Active branch: `region-coverage-and-cold-start`, based on released v0.1.89.
+The owner requested continued implementation until the Sierra/AirDNA
+rollforward matrix uses keyed execution correctly wherever its partitions
+permit it. Diagnosis and all read-only production replay samples are in
+`.bench-data/region-diagnosis-report.md` and
+`.bench-data/region-diagnosis-local/production-results/`.
+
+Priorities for this round:
+
+1. Compile region broadcast branches with normal CTE sharing and staging;
+   cold expanded preparation currently re-executes shared branches.
+2. Retain several bounded region programs and independent structural
+   boundary hints. Rebuild data-dependent state after source changes;
+   never bypass version checks to obtain a cache hit.
+3. Validate and remove the remaining application exclusions for the
+   fifteen matrix shapes, including explicit deterministic SQL selection
+   wherever arbitrary aggregate picks prevent stable detail comparisons.
+4. Measure both cold and interleaved warm queries, assert actual region
+   provenance, and preserve valid boundaries where parent/division
+   regrouping changes the partition key. Region engagement alone is not
+   evidence that the expensive part was accelerated.
+
+Completed and validated locally on 2026-09-09:
+
+- Broadcast inputs now use ordinary CTE staging and the shared typed bulk
+  copier. The latter fixes rejection of widened `SUM(BIGINT)` payloads after
+  expensive preparation, allowing expanded-cross's outer lookup joins into
+  the main region.
+- The per-database cache retains up to 32 programs under a combined retained
+  byte budget, with idle LRU eviction and pinned live borrowers. Independent
+  boundary hints rebuild fresh inputs after source changes; data-version and
+  kernel checks still guard all cached programs.
+- Explicit unfiltered scan/window regions are supported. Broadcast joins
+  preserve full-width composite keys and pinned strings. Duplicate build
+  keys decline the one-match broadcast path, preserving join multiplicity
+  through ordinary staging above a valid inner region.
+- Computed output replacement now follows ordinary SQL compilation for
+  qualified aliases, simultaneous expressions, and subsequent projections,
+  including invalidation of replaced literal-pinned facts.
+- The companion Wayroll worktree enables all ordinary rollforward variants
+  in Zig mode. Hooks remain excluded. Cross-division ranking runs before
+  replacing the source division, and zero-sum exchange rates use an explicit
+  ranked selection in place of `ANY_VALUE`.
+
+The original 30 Sierra/AirDNA cases plus 12 combined-option cases pass.
+All 84 keyed SELECTs engaged a region. Keyed and unkeyed UDF values and wire
+column names/types match exactly across all 42 configurations. Plain SQL is
+exact in 39 configurations; the remaining differences affect only the two
+exchange-rate columns, at most `6.661338147750939e-16`. Full row multiplicities
+and all other fields match. Interleaved cache reuse and changed-lookup
+rebuilding also pass. These checks validate the listed configurations, not
+every possible SQL or hook pipeline.
+
+Final validation: `zig build test test-v2 -j2` passes 1,491 tests (five
+skipped); `zig build bench -j2` passes. The three companion application suites
+pass 58 tests, and changed files introduce no additional ESLint violations.
+Final ordinary-SQL scan/window and UNION/window benchmarks show 1.53x and
+2.48x speedups with exact totals.
+
+Local warm samples improve AirDNA expanded-simple from 3,242 ms unkeyed UDF
+to 337 ms keyed, and expanded-cross from 3,592 ms to 247 ms. These are single
+samples with profiling, not production medians. Compound variants can still
+pay substantial preparation/staged-operation costs, and large detail output
+still pays sorting, serialization, and transfer costs.
+
+The full local matrix, measurement method, limitations, and raw artifact
+locations are in `.bench-data/region-coverage-results-report.md`; exact
+counts and binary/source hashes are in `region-coverage-summary.json` in
+the same directory. Final replay folders are
+`region-coverage-verified-results/` and
+`region-coverage-verified-extra-results/`. Validation logs use the
+`region-coverage-green-` prefix.
+
+Production remained a read-only diagnostic reference. The candidate ran
+only against the separate local bench database on port 13311 and was stopped
+after validation. This round has not been deployed to production.
+
+### Earlier eligibility implementation (historical hand-off)
+
+Branch `region-eligibility`, preceding the follow-up above. Predecessor
 design: [REGION_PLAN.md](./REGION_PLAN.md). Owner's direction: broaden keyed
 regions for general SQL constructs while preserving functionality. Wayroll
 is a validation workload; engine eligibility is the primary objective.

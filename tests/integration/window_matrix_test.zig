@@ -723,7 +723,7 @@ test "first_value IGNORE NULLS: skips leading nulls" {
     var q = try runSql(
         allocator,
         f.db,
-        "SELECT first_value(v) IGNORE NULLS OVER (ORDER BY id ASC) FROM t ORDER BY id ASC",
+        "SELECT first_value(v) IGNORE NULLS OVER (ORDER BY id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY id ASC",
     );
     defer q.deinit();
     const got = try collectI64(allocator, &q, 0);

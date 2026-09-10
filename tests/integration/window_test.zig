@@ -550,7 +550,7 @@ test "window: FIRST_VALUE IGNORE NULLS finds first non-null in partition" {
     var q = try runSql(
         allocator,
         db,
-        "SELECT id, first_value(qty) IGNORE NULLS OVER (ORDER BY id ASC) AS fv FROM t ORDER BY id ASC",
+        "SELECT id, first_value(qty) IGNORE NULLS OVER (ORDER BY id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS fv FROM t ORDER BY id ASC",
     );
     defer q.deinit();
     const vals = try collectRows(i64, allocator, &q, 1);

@@ -392,10 +392,29 @@ subtree into one region: partition once at entry, execute the operator chain
 within each shard, and publish its output as an ordinary materialized stage.
 The compiler verifies the key contract at each candidate boundary. It may
 select an inner CTE below a join, window, alias, or primary TVF input; the
-outer operations then execute through the staged engine. A declaration with
-no valid boundary still fails with `RegionKeyContractViolation` or
-`RegionUnsupportedConstruct`; unsupported declarations do not silently fall
-back to fully staged execution.
+outer operations then execute through the staged engine. The declaration
+requests regional execution wherever compatible; a block with no valid
+region uses ordinary execution. Incompatible window partitions, coarser
+groups, and global sort/limit boundaries can feed a later region through
+staged ingress. Earlier compatible CTEs can independently form regions within
+that ingress, preserving the user's operator order. Invalid SQL still raises
+its ordinary error. Stage provenance and region traces distinguish actual
+engagement from fallback.
+
+SQL windows use the ordinary window evaluator on complete shard-local
+partitions. The compiler resolves partition, order, argument, and output
+names once, and verifies that every window partition retains the routed key.
+Different specs share sorting when their partition/order keys match; frame
+and NULL behavior remains per call. Worker instances borrow input columns
+and retain output buffers. Ranking, distribution, offset, value, and aggregate
+window functions therefore share semantics with ordinary SQL rather than
+requiring separate regional implementations.
+
+Frame evaluation distinguishes physical rows (`ROWS`), peers (`RANGE`), and
+peer groups (`GROUPS`). Bounded `RANGE` currently accepts one numeric order
+column; decimal offsets respect the order column's scale. `FIRST_VALUE`,
+`LAST_VALUE`, and `NTH_VALUE` honor the actual frame, including empty frames
+and `IGNORE NULLS`. Temporal range offsets and `EXCLUDE` remain unsupported.
 
 Entry expressions may replace SQL-visible input names while retaining their
 original inputs under distinct physical slots. Projection expansion uses the
@@ -426,6 +445,18 @@ per range or over the complete shard.
 Passthrough TVF outputs use their declared string-family type even when the
 input uses another compatible string type. Borrowed views preserve the
 original bytes and NULL bitmap without copying or changing input columns.
+Frame-replacing TVFs retain routed-key provenance only under their existing
+`ordered_output` contract: the call's partition columns must be present in
+the output and preserve their values. The compiler binds the route to that
+new physical output column. Unmarked kernels use ordinary execution.
+Aggregation similarly carries provenance through an unchanged group key,
+and remaps constant-column bookkeeping to the new frame. Windows and
+co-partitioned joins check this physical identity, not a reused SQL alias;
+computing a replacement key does not inherit it.
+Entry-filter constants survive a replacing TVF only when its partition-value
+contract preserves them, and survive aggregation only through group columns.
+Reusing their names for changed outputs cannot keep an earlier literal join
+shortcut.
 
 For an unchanged declaration, the cache remembers which inner CTE boundary
 compiled successfully. Repeated queries validate that boundary directly,
@@ -433,7 +464,7 @@ avoiding repeated evaluation of join inputs for unsupported outer candidates.
 The declaration fingerprint covers the original subtree, source table
 versions, and table-function identities before compilation's shared-IR
 rewrites; the stored anchor hash identifies its cached program.
-The key contract, kernel identities, consumed table versions, and fresh scan
+The declared keys, kernel identities, consumed table versions, and fresh scan
 schemas are revalidated. Operations above the cached boundary compile
 normally against current data.
 For temporary tables held entirely in memory, up to 16,384 rows and 4 MiB,
@@ -443,11 +474,8 @@ sessions; changed values, NULLs, types, or ordering invalidate it. Larger or
 spilled temporary tables disable this program cache instead of relying on
 reusable allocation addresses as table identities.
 
-Regional `LAG` supports nonnegative constant offsets (including substituted
-session variables), an omitted/NULL default, and partitions equal to the
-region ranges. Each call applies its requested order within a range and
-appends results in the original row positions, so independent window orders
-can coexist. Integer sums retain ordinary SQL promotion: `SUM(BIGINT)` and
+Regional windows append results in the original row positions, so independent
+window orders can coexist. Integer sums retain ordinary SQL promotion: `SUM(BIGINT)` and
 `SUM(LARGEINT)` use checked i128 accumulation and return `LARGEINT`.
 Consolidation keys retain all 64 integer bits plus a distinct NULL marker;
 adjacent BIGINT values must never collapse into one partition.
