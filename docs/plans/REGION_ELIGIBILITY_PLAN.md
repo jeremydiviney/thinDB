@@ -1,5 +1,57 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Confirm SQL regional preparation regression (2026-09-11)
+
+Controlled comparison of parent 062b8c7 (same engine as d4b66ca) against
+7b99d27 confirms that the shared-branch fusion change introduced a broad
+SQL regional regression. Both binaries used DOP 12, the same private
+snapshot and saved SQL/parameters, hash buckets a/b/c, cache/pool 2/4 GiB,
+query/shared budgets 16 GiB and service ceiling 20 GiB. Each arm received
+a fresh service, one warmup, three measured queries and one fingerprint
+query. These controls exclude application SQL generation/setup and are
+separate from the full application benchmark. Build order alternated.
+
+Median milliseconds:
+
+| Case | Parent SQL | Current SQL | Parent SQL + regions | Current SQL + regions |
+|---|---:|---:|---:|---:|
+| Sierra base simple | 337 | 346 | 204 | 791 |
+| Sierra expanded simple | 925 | 961 | 221 | 786 |
+| Sierra expanded cross | 1,699 | 1,663 | 1,817 | 2,883 |
+| AirDNA base simple | 1,827 | 1,757 | 1,653 | 2,667 |
+| AirDNA expanded simple | 7,458 | 6,946 | 1,777 | 2,894 |
+| AirDNA expanded cross | 12,238 | 15,812 | 12,301 | 13,468 |
+
+The last case's ordinary-SQL control shifted materially on the shared host;
+do not attribute its entire difference to regional compilation. The other
+five cases hold ordinary SQL within about 7%, while regions regress 59-288%.
+
+For Sierra base-simple, the successful region still takes 114/115 ms on
+parent/current. The extra ~587 ms is outside that execution. Current
+traces show a failed sql_union attempt while preparing the staged input,
+followed by the same cached smaller region. dispatchJoin can compile and
+drain join inputs during speculative branch construction; a later decline
+discards that work before the fallback builds its ordinary input. This
+repeats even on warmed queries. All six current controls show one failed
+union attempt per timed query; parent controls show none.
+
+Priority: make failed shared-branch preparation cheap and avoid repeating
+it in cached/unsupported staged inputs, while preserving supported fusion
+and invalidation for changed data, schemas, kernels and CTE sharing. Keep
+the fix structural and general. Recheck the saved controls, generic cache
+invalidation/fallback tests, then the full application matrix. No engine
+fix was applied during this diagnosis.
+
+All four arm fingerprints match in all six cases. The 96 warmup/timing and
+24 untimed validation queries succeeded; 24 services peaked at 17.07 GiB
+with no memory-limit/OOM events. The diagnostic service stopped and 13311
+was released. Production PID 2579063 and restart count stayed unchanged;
+CDC remained RUNNING. No deployment occurred.
+
+Evidence: `.bench-data/sql-region-regression-7b99d27/`, mirrored under
+`/home/ubuntu/wayroll-bench/sql-region-regression-7b99d27`. The parent
+checkout is `.bench-data/sql-region-parent-control` (detached 062b8c7).
+
 ### DOP 12 rerun of all thinDB arms (2026-09-11)
 
 Reran all four thinDB arms for both companies and all 15 variants on
