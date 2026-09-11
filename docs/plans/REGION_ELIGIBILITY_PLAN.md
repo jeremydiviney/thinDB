@@ -1,5 +1,57 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Full five-arm rollforward rerun (2026-09-11)
+
+Engine commit `7b99d27`, Linux ReleaseFast, ran on starrocks1 localhost
+against the private snapshot on port 13311. StarRocks used live production
+data on 9030. Both companies ran all 15 variants with hash buckets a/b/c,
+the archived Wayroll b5359d9e generator, and the prior per-case dates.
+The production thinDB service on 13310 was not deployed or restarted.
+
+Final procedure: DOP 4, 2 GiB data cache, 4 GiB retained-region budget,
+16 GiB query/shared budgets, and a 20 GiB service ceiling. Each thinDB arm
+started a fresh isolated service, warmed once, ran three timed queries, then
+ran one untimed fingerprint query. Startup, shutdown and fingerprint work
+are excluded from timings. Final row packets are discarded without Node
+value decoding. These settings differ from the preceding DOP 16 production
+run; this is not a controlled historical before/after comparison.
+
+All 30 variants completed with no query errors in the accepted results;
+60/60 keyed/unkeyed fingerprint pairs matched. All 60 keyed case/arm
+combinations engaged an existing region, but **none used the new SQL
+`union_all` opcode**. SQL+regions was slower than ordinary SQL in 24/30
+cases. Traces show failed shared-fork attempts before falling back to a
+smaller existing region; avoid paying that preparation work repeatedly
+before pursuing more general branch coverage. UDF+regions had the lowest
+median in 29/30 cases (Sierra FX average favored unkeyed UDF slightly).
+
+Sums of the fifteen case medians, seconds:
+
+| Dataset | SR SQL | thinDB SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 10.53 | 11.21 | 16.62 | 3.95 | 1.58 |
+| AirDNA | 49.89 | 54.81 | 57.72 | 42.95 | 15.22 |
+
+Sierra source counts matched. AirDNA's live StarRocks data had slightly more
+rows/customers than the frozen copy; detail output differed by about 300
+rows. The fingerprint checks establish keyed/unkeyed equivalence within
+thinDB, not cross-engine value equivalence.
+
+An initial attempt with an 8 GiB query budget and retained service state
+across variants hit the budget and then the isolated cgroup OOM limit. It
+and the pilot were excluded, and the thinDB phase was rerun. A service-job
+cancellation interrupted the last case; its partial samples were excluded
+and all four arms of that case were rerun with unchanged settings. The
+restart helper now checks the actual service PID. All 120 accepted service
+instances have memory receipts: peak 16.55 GiB, no limit/OOM events.
+The final candidate was stopped and port 13311 released. Production remained
+at PID 2579063 with zero automatic restarts; CDC remained RUNNING.
+
+Full tables, CSV, source counts, validation and raw traces are in
+`.bench-data/five-arm-7b99d27/benchmark-report.md`, `timings.csv`,
+`matrix.json` and the sibling result directories. Matching evidence is on
+starrocks1 under `/home/ubuntu/wayroll-bench/five-arm-7b99d27`.
+
 ### Fuse shared SQL branches within one region (2026-09-10)
 
 Branch: `region-shared-sql-branches`, based on `062b8c7`. This implements
