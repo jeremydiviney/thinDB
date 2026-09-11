@@ -46,7 +46,7 @@ const REF_ROW_MASK: u32 = (1 << REF_ROW_BITS) - 1;
 pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows: []const u32) !void {
     const base = store.rowCount();
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             const l = &@field(store.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, rows.len);
             for (rows) |r| l.appendAssumeCapacity(s[r]);
@@ -60,7 +60,6 @@ pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows:
             },
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (store.nulls != null) try appendScatterValidity(alloc, store, v, rows, base);
 }
@@ -119,7 +118,7 @@ fn runsDominate(rows: []const u32) bool {
 pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnView, refs: []const u32) !void {
     const base = dst.rowCount();
     switch (dst.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |*l, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |*l, tag| {
             try l.ensureUnusedCapacity(alloc, refs.len);
             for (refs) |r| {
                 l.appendAssumeCapacity(@field(srcs[r >> REF_ROW_BITS].data, @tagName(tag))[r & REF_ROW_MASK]);
@@ -131,7 +130,6 @@ pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnVie
             try d.ensureUnusedValueCapacity(alloc, refs.len, bytes);
             for (refs) |r| d.appendValueAssumeCapacity(stringViewOf(srcs[r >> REF_ROW_BITS]).rowBytes(r & REF_ROW_MASK));
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) try appendGatherValidity(alloc, dst, srcs, refs, base);
 }
@@ -172,14 +170,13 @@ pub fn appendStoreRange(alloc: Allocator, dst: *ColumnStore, src: *const ColumnS
 /// Range append from a view (same contract as `appendStoreRange`).
 pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start: usize, end: usize) !void {
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             try @field(dst.data, @tagName(tag)).appendSlice(alloc, s[start..end]);
         },
         .varchar, .string, .char, .json => |sv| switch (dst.data) {
             .varchar, .string, .char, .json => |*d| try d.appendRange(alloc, sv, start, end),
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) {
         const base = dst.rowCount() - (end - start);
@@ -193,14 +190,13 @@ pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start
 pub fn appendRowValue(alloc: Allocator, dst: *ColumnStore, v: ColumnView, i: usize) !void {
     if (!v.isValid(i)) return dst.appendNulls(alloc, 1);
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             try @field(dst.data, @tagName(tag)).append(alloc, s[i]);
         },
         .varchar, .string, .char, .json => |s| switch (dst.data) {
             .varchar, .string, .char, .json => |*d| try d.appendValue(alloc, s.rowBytes(i)),
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
 }
@@ -213,7 +209,7 @@ const NO_MATCH: u32 = std.math.maxInt(u32);
 fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: []const u32) !void {
     const base = dst.rowCount();
     switch (src.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |vals, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |vals, tag| {
             const l = &@field(dst.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, ords.len);
             for (ords) |o| l.appendAssumeCapacity(if (o == NO_MATCH) 0 else vals[o]);
@@ -229,7 +225,6 @@ fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: [
             },
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     for (ords, 0..) |o, k| {
         try dst.appendValidBit(alloc, base + k, o != NO_MATCH and src.isValid(o));
@@ -240,7 +235,7 @@ fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: [
 fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, count: usize) !void {
     if (!v.isValid(row)) return dst.appendNulls(alloc, count);
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             const l = &@field(dst.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, count);
             l.appendNTimesAssumeCapacity(s[row], count);
@@ -253,7 +248,6 @@ fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, 
             },
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) {
         const base = dst.rowCount() - count;
@@ -303,8 +297,7 @@ fn stringViewOf(v: ColumnView) storage.StringView {
 fn routeKeyBytes(v: ColumnView, r: usize) []const u8 {
     return switch (v.data) {
         .varchar, .string, .char, .json => |s| s.rowBytes(r),
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
-        else => "",
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
     };
 }
 
@@ -3090,13 +3083,12 @@ pub const RegionPool = struct {
 /// Approximate retained capacity of one store (validity bitmap excluded).
 fn storeRetainedBytes(c: *const ColumnStore) usize {
     return switch (c.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
         .varchar, .string, .char, .json => |s| blk: {
             var n: usize = s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity;
             if (s.wide_offsets) |w| n += w.capacity * @sizeOf(u64);
             break :blk n;
         },
-        else => 0,
     };
 }
 
@@ -4419,6 +4411,34 @@ fn appendI64As(alloc: Allocator, dst: *ColumnStore, v: i64) !void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "region column movement preserves boolean and UUID payloads and NULLs" {
+    const alloc = testing.allocator;
+    inline for (.{ types.Type.boolean, types.Type.uuid }) |column_type| {
+        const T = if (column_type == .boolean) u8 else u128;
+        const high: T = if (column_type == .boolean) 1 else std.math.maxInt(u128);
+        const values = [_]T{ 0, 1, high };
+        const source = ColumnView{ .data = @unionInit(storage.column.ValueView, @tagName(column_type), &values), .nulls = &.{5} };
+        var out = try ColumnStore.init(alloc, column_type, true);
+        defer out.deinit(alloc);
+        try scatterColumn(alloc, &out, source, &.{ 2, 1, 0 });
+        try gatherColumn(alloc, &out, &.{ source, source }, &.{ 1 << REF_ROW_BITS, 2 });
+        try appendViewRange(alloc, &out, source, 0, 3);
+        try appendRowValue(alloc, &out, source, 1);
+        try appendRowValue(alloc, &out, source, 2);
+        try gatherColumnOpt(alloc, &out, source, &.{ 1, NO_MATCH, 0 });
+        try appendRepeat(alloc, &out, source, 2, 2);
+        try appendRepeat(alloc, &out, source, 1, 1);
+        const expected = [_]?T{ high, null, 0, 0, high, 0, null, high, null, high, null, null, 0, high, high, null };
+        try testing.expectEqual(expected.len, out.rowCount());
+        const result = out.view();
+        for (expected, 0..) |value, i| {
+            try testing.expectEqual(value != null, result.isValid(i));
+            if (value) |v| try testing.expectEqual(v, @field(result.data, @tagName(column_type))[i]);
+        }
+        try testing.expect(storeRetainedBytes(&out) >= expected.len * @sizeOf(T));
+    }
+}
 
 test "region exchange + ordered consolidation: multiset, order, group ranges" {
     const alloc = testing.allocator;

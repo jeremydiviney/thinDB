@@ -435,6 +435,16 @@ Every cached run rebuilds the source against fresh
 snapshots. Grouping exactly by the current range keys is supported as one
 aggregate group per range, including NULL keys and all-NULL values.
 
+Regions whose program folds to only emission use the ordinary scan path,
+avoiding an exchange and consolidation without shard-local work. Column
+movement supports every stored payload type, including Boolean and UUID
+values and their validity bits. Broadcast and co-partitioned join payloads
+retain their right-side qualifier; they cannot overwrite a same-named left
+column. Explicitly selected right join keys retain their own values and NULLs.
+Cached lookup and emptiness proofs include the table's cache UID and
+tombstone generation, so recreating a table or deleting only persisted rows
+invalidates them even when memtable and manifest counters are unchanged.
+
 Consecutive entry projections preserve their evaluation order: only the
 lowest projection is absorbed into the scan entry; later projections and
 their intervening computes execute in the region. An unordered, row-aligned

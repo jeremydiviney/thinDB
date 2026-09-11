@@ -104,6 +104,7 @@ fn run_to_text_checked(allocator: std.mem.Allocator, db: anytype, sql: []const u
                     .bigint => try out.print(allocator, "{d}", .{v.data.bigint[r]}),
                     .largeint => try out.print(allocator, "{d}", .{v.data.largeint[r]}),
                     .int => try out.print(allocator, "{d}", .{v.data.int[r]}),
+                    .boolean => try out.print(allocator, "{d}", .{v.data.boolean[r]}),
                     .double => try out.print(allocator, "{d}", .{v.data.double[r]}),
                     .string => try out.appendSlice(allocator, v.data.string.rowBytes(r)),
                     .varchar => try out.appendSlice(allocator, v.data.varchar.rowBytes(r)),
@@ -1163,6 +1164,57 @@ fn region_count(query: thindb.exec.Query) usize {
         return count;
     }
     return 0;
+}
+
+test "keyed region: boolean payloads cross SQL union and window regions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "INSERT INTO inv VALUES (2001,100,'cust_0',12,NULL),(2002,100,'cust_0',13,0)");
+    const table = try db.openTable("inv", .{});
+    try table.flush();
+    const body =
+        \\base AS (
+        \\ SELECT id, custLC, month, CAST(amount AS BOOLEAN) AS active,
+        \\   ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY id) AS rn FROM inv
+        \\), combined AS (
+        \\ SELECT * FROM base WHERE month <= 3 UNION ALL SELECT * FROM base WHERE month >= 3
+        \\), result AS (
+        \\ SELECT *, SUM(rn) OVER (PARTITION BY custLC) AS total FROM combined
+        \\)
+        \\SELECT * FROM result ORDER BY id
+    ;
+    try expect_keyed_matches(allocator, db, body, "total");
+}
+
+test "keyed region: overlapping join payload names preserve the left columns" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE dimension (id INT PRIMARY KEY, projectId BIGINT, month INT, amount INT)");
+    try helpers.exec(allocator, db, "INSERT INTO dimension VALUES (1,100,1,999),(2,100,2,NULL)");
+    const dimension = try db.openTable("dimension", .{});
+    try dimension.flush();
+    const body =
+        \\base AS (
+        \\ SELECT *, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY id) AS rn FROM inv
+        \\), joined AS (
+        \\ SELECT base.id, base.custLC, base.projectId, base.month, base.amount, base.rn,
+        \\   dimension.amount AS other_amount, dimension.projectId AS other_project,
+        \\   dimension.month AS other_month
+        \\ FROM base LEFT JOIN dimension dimension
+        \\ ON dimension.projectId = base.projectId AND dimension.month = base.month
+        \\)
+        \\SELECT * FROM joined ORDER BY id
+    ;
+    try expect_keyed_matches(allocator, db, body, "other_amount");
+    try helpers.exec(allocator, db, "DELETE FROM dimension");
+    try dimension.flush();
+    try expect_keyed_matches(allocator, db, body, "other_amount");
 }
 
 test "keyed region: SQL windows reenter regions around a global window CTE" {

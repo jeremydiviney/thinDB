@@ -529,7 +529,8 @@ fn poolCapBytes() usize {
 
 /// Data-version fingerprint of one table: memtable generation (bumped by
 /// every retire-swap — flush/delete/update/alter) + memtable row count
-/// (catches appends within a generation) + the segment set. Read under the
+/// (catches appends within a generation) + the segment set and tombstone
+/// generation. The cache UID distinguishes recreated tables. Read under the
 /// table mutex so the triple is coherent. Compaction changes the segment set
 /// without changing values — a spurious invalidation, which is safe.
 fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
@@ -579,6 +580,8 @@ fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
         return h.final();
     }
     hu(&h, 0);
+    hu(&h, t.cache_uid);
+    hu(&h, t.seg_handles.tombstone_generation.load(.monotonic));
     hu(&h, t.memtable_gen);
     hu(&h, t.memtable.row_count);
     for (t.manifest.segments.items) |e| {
@@ -1365,6 +1368,11 @@ const Builder = struct {
     const_idxs: std.ArrayListUnmanaged(usize) = .empty,
 
     fn resolveIdx(b: *Builder, name: []const u8) !usize {
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+            for (b.null_sides.items) |side| {
+                if (std.ascii.eqlIgnoreCase(side.alias, name[0..dot])) return b.tryNullAppend(name);
+            }
+        }
         if (b.fb.resolve(name)) |e| return e.idx;
         return b.tryNullAppend(name);
     }
@@ -1372,6 +1380,9 @@ const Builder = struct {
     /// A ref that doesn't resolve may target one of the proven-empty join
     /// sides: append a typed NULL frame column for it.
     fn tryNullAppend(b: *Builder, name: []const u8) !usize {
+        for (b.fb.vis.items) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.idx;
+        }
         errdefer if (getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] unresolved ref '{s}' (vis: ", .{name});
             for (b.fb.vis.items) |e| std.debug.print("{s} ", .{e.name});
@@ -1705,8 +1716,16 @@ const Builder = struct {
 
     fn applySelect(b: *Builder, p: *const ir.Op.Project) !void {
         for (p.columns) |col| {
-            if (std.mem.eql(u8, col, "*") or std.mem.endsWith(u8, col, ".*")) continue;
-            if (b.fb.resolve(col) == null) _ = try b.tryNullAppend(col);
+            if (std.mem.eql(u8, col, "*") or std.mem.endsWith(u8, col, ".*")) {
+                for (b.null_sides.items) |side| {
+                    if (col.len > 1 and !std.ascii.eqlIgnoreCase(col[0 .. col.len - 2], side.alias)) continue;
+                    for (side.schema) |right_col| {
+                        _ = try b.tryNullAppend(try visKeyFor(b.a, side.alias, right_col.name));
+                    }
+                }
+                continue;
+            }
+            _ = try b.resolveIdx(col);
         }
         const schema = try b.a.alloc(Column, b.fb.vis.items.len);
         for (b.fb.vis.items, schema) |visible, *col| {
@@ -1740,9 +1759,21 @@ const Builder = struct {
 
 fn visKeyFor(a: Allocator, alias: []const u8, col_name: []const u8) ![]const u8 {
     // The compiled right side already qualifies names ("ctc.amount"); keep
-    // them verbatim, otherwise qualify with the alias.
+    // them verbatim, otherwise qualify with the alias. A right payload must
+    // never replace the unqualified binding of a same-named left column.
     if (std.mem.indexOfScalar(u8, col_name, '.') != null) return a.dupe(u8, col_name);
     return std.fmt.allocPrint(a, "{s}.{s}", .{ alias, col_name });
+}
+
+fn right_key_referenced(alias: ?[]const u8, column: []const u8, live: ?[]const []const u8) bool {
+    const al = alias orelse return false;
+    const names = live orelse return true;
+    for (names) |name| {
+        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse continue;
+        if (std.ascii.eqlIgnoreCase(name[0..dot], al) and
+            std.ascii.eqlIgnoreCase(name[dot + 1 ..], lastSegment(column))) return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2615,6 +2646,9 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         en.* = e.name;
     }
     try b.flushPending();
+    // A fully folded pipeline has no shard-local work to amortize the
+    // exchange and consolidation; its ordinary scan already runs in parallel.
+    if (b.ops.items.len == 0) return NoMatch;
     try b.ops.append(a, .{ .emit = .{ .cols = emit_cols } });
 
     // ---- compile the program ---------------------------------------------
@@ -3155,7 +3189,7 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
         var ccols: std.ArrayListUnmanaged(Column) = .empty;
         var cvals: std.ArrayListUnmanaged(?Value) = .empty;
         for (blk.schema, 0..) |col, ci| {
-            if (key_right[ci]) continue;
+            if (key_right[ci] and !right_key_referenced(ralias, col.name, live)) continue;
             if (live) |names| {
                 const tail = lastSegment(col.name);
                 var referenced = false;
@@ -3170,8 +3204,7 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
             const idx = try b.fb.addCol(col.name, col.type, true);
             try ccols.append(a, b.fb.cols.items[idx]);
             try cvals.append(a, try valueAtRow(blk.stores[ci].view(), mi));
-            try b.fb.setVis(col.name, idx);
-            if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+            try b.fb.setVis(if (ralias) |al| try visKeyFor(a, al, col.name) else col.name, idx);
         }
         if (ccols.items.len > 0) {
             try b.flushPending();
@@ -3207,7 +3240,7 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
     // gathered to kept-row order.
     var payloads: std.ArrayListUnmanaged(region.Payload) = .empty;
     for (blk.schema, 0..) |col, ci| {
-        if (key_right[ci]) continue;
+        if (key_right[ci] and !right_key_referenced(ralias, col.name, live)) continue;
         if (live) |names| {
             const tail = lastSegment(col.name);
             var referenced = false;
@@ -3231,8 +3264,7 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
             .view = store.view(),
             .out_type = col.type,
         });
-        try b.fb.setVis(col.name, idx);
-        if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+        try b.fb.setVis(if (ralias) |al| try visKeyFor(a, al, col.name) else col.name, idx);
     }
 
     try b.flushPending();
@@ -3407,7 +3439,7 @@ fn pushKeyedBroadcast(
 
     var payloads: std.ArrayListUnmanaged(region.KeyedPayload) = .empty;
     for (blk.schema, 0..) |col, ci| {
-        if (key_right[ci]) continue;
+        if (key_right[ci] and !right_key_referenced(ralias, col.name, live)) continue;
         if (live) |names| {
             const tail = lastSegment(col.name);
             var referenced = false;
@@ -3425,8 +3457,7 @@ fn pushKeyedBroadcast(
             .src = ci,
             .out_type = col.type,
         });
-        try b.fb.setVis(col.name, idx);
-        if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+        try b.fb.setVis(if (ralias) |al| try visKeyFor(a, al, col.name) else col.name, idx);
     }
 
     // Member filter + zero live payloads: the probe op is a complete
@@ -4004,8 +4035,9 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             .src = ci,
             .out_type = col.type,
         });
-        if (!key_tail) try b.fb.setVis(col.name, idx);
-        if (ralias) |al| try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+        if (ralias) |al| {
+            try b.fb.setVis(try visKeyFor(a, al, col.name), idx);
+        } else if (!key_tail) try b.fb.setVis(col.name, idx);
     }
 
     try b.flushPending();
@@ -4721,8 +4753,14 @@ fn rightAliasName(op: *const ir.Op) ![]const u8 {
     while (depth < 8) : (depth += 1) {
         switch (cur.*) {
             .alias => |al| return al.alias,
+            .scan => |s| return s.alias orelse s.table.name,
+            .materialize => |m| {
+                if (m.name) |name| return name;
+                cur = m.upstream;
+            },
             .compute => |c| cur = c.upstream,
             .select => |p| cur = p.upstream,
+            .filter => |f| cur = f.upstream,
             else => return NoMatch,
         }
     }
