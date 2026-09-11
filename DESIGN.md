@@ -454,6 +454,21 @@ path at the same boundary. Cached programs recheck both the source versions
 and the branch-sharing recipe before reuse. These are structural SQL rules;
 no query text, table name or UDF name selects the optimization.
 
+Branch collection checks join kind, range conditions and residual predicates
+before preparing sources or lookup tables. A branch already filtered to false
+also retains ordinary staging so its joins can be pruned. These structurally
+unsupported forks do not execute speculative join inputs before fallback;
+compatible regions above or below the fork remain available.
+
+Failures that still require data-dependent proofs, such as duplicate lookup
+keys, can reuse a bounded per-database rejection hint. Its fingerprint includes
+the input/table versions, declared keys, CTE sharing, session/compile context
+and immutable scalar kernel identity. Changed inputs retry; volatile calls,
+unversionable sources and UDFs without an immutable execution contract do not
+retain rejection hints. The hint stores no rows and only skips fusion; the
+ordinary fallback always recompiles. Join-input compilation/execution errors
+retain their error identity instead of becoming cached eligibility failures.
+
 Regions whose program folds to only emission use the ordinary scan path,
 avoiding an exchange and consolidation without shard-local work. Column
 movement supports every stored payload type, including Boolean and UUID

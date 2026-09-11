@@ -264,6 +264,7 @@ const TableVersion = struct { name: []const u8, version: u64 };
 const KernelCheck = struct { name: []const u8, process: udf_mod.TvfProcess };
 const DeclaredBoundary = struct { hash: u64, depth: usize };
 const BoundaryHint = struct { shape_hash: u64, depth: usize, used: u64 };
+const RejectedFusion = struct { hash: u64, used: u64 };
 
 /// CAS spinlock (std.Thread.Mutex is gone in Zig 0.16; Io.Mutex would drag
 /// an Io through the recognizer). Critical sections here are flag flips —
@@ -288,6 +289,7 @@ const Cache = struct {
     // Bound tiny-program metadata separately from the combined byte budget.
     entries: [32]CacheEntry = @splat(.{}),
     boundaries: [64]?BoundaryHint = @splat(null),
+    rejected_fusions: [64]?RejectedFusion = @splat(null),
     clock: u64 = 0,
     max_retained_bytes: usize,
     /// In-flight background ctx destroys (eviction/invalidation) — a big
@@ -432,6 +434,34 @@ const Cache = struct {
         self.clock +%= 1;
         self.boundaries[oldest] = .{ .shape_hash = shape_hash, .depth = depth, .used = self.clock };
     }
+
+    fn fusion_rejected(self: *Cache, hash: u64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (&self.rejected_fusions) |*slot| {
+            if (slot.*) |*entry| if (entry.hash == hash) {
+                self.clock +%= 1;
+                entry.used = self.clock;
+                return true;
+            };
+        }
+        return false;
+    }
+
+    fn remember_rejected_fusion(self: *Cache, hash: u64) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var oldest: usize = 0;
+        for (self.rejected_fusions, 0..) |entry, i| {
+            if (entry == null or entry.?.hash == hash) {
+                oldest = i;
+                break;
+            }
+            if (entry.?.used < self.rejected_fusions[oldest].?.used) oldest = i;
+        }
+        self.clock +%= 1;
+        self.rejected_fusions[oldest] = .{ .hash = hash, .used = self.clock };
+    }
 };
 
 const CacheEntry = struct {
@@ -498,6 +528,75 @@ test "region cache combined byte budget includes program arenas and preserves st
     try std.testing.expectEqual(@as(?usize, 3), cache.boundary(17));
     cache.remember_boundary(17, 4);
     try std.testing.expectEqual(@as(?usize, 4), cache.boundary(17));
+}
+
+test "region fusion rejections stay bounded and preserve recently reused entries" {
+    var cache = Cache{ .alloc = std.testing.allocator, .max_retained_bytes = 0 };
+    for (0..cache.rejected_fusions.len) |i| cache.remember_rejected_fusion(i);
+    try std.testing.expect(cache.fusion_rejected(0));
+    cache.remember_rejected_fusion(cache.rejected_fusions.len);
+    try std.testing.expect(cache.fusion_rejected(0));
+    try std.testing.expect(!cache.fusion_rejected(1));
+    try std.testing.expect(cache.fusion_rejected(cache.rejected_fusions.len));
+    cache.trim();
+    try std.testing.expect(cache.fusion_rejected(0));
+}
+
+test "region fusion rejection fingerprints distinguish keys sharing and execution context" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try @import("../api/api.zig").Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    var leaf = ir.Op{ .single_row = {} };
+    var anchor = ir.Op{ .materialize = .{ .upstream = &leaf } };
+    var equivalent = ir.Op{ .materialize = .{ .upstream = &leaf } };
+    var refs: RefCounts = .empty;
+    defer refs.deinit(allocator);
+    try refs.put(allocator, &anchor, 2);
+    try refs.put(allocator, &equivalent, 2);
+    var input = engine_v2.CompileInput{ .allocator = allocator, .node_arena = allocator, .db = db, .session = .{}, .region_ref_counts = &refs };
+    const first = hash_fusion_attempt(input, &anchor, &.{"key"}).?;
+    try std.testing.expectEqual(first, hash_fusion_attempt(input, &equivalent, &.{"key"}).?);
+    try std.testing.expect(first != hash_fusion_attempt(input, &anchor, &.{"other"}).?);
+    try refs.put(allocator, &anchor, 3);
+    try std.testing.expect(first != hash_fusion_attempt(input, &anchor, &.{"key"}).?);
+    try refs.put(allocator, &anchor, 2);
+    input.force_ordered = true;
+    try std.testing.expect(first != hash_fusion_attempt(input, &anchor, &.{"key"}).?);
+    input.force_ordered = false;
+    input.dop_cap = 1;
+    try std.testing.expect(first != hash_fusion_attempt(input, &anchor, &.{"key"}).?);
+    input.dop_cap = null;
+    input.session.current_schema = "other";
+    try std.testing.expect(first != hash_fusion_attempt(input, &anchor, &.{"key"}).?);
+}
+
+test "region fusion rejection fingerprints exclude volatile calls and track immutable kernels" {
+    const allocator = std.testing.allocator;
+    const Kernels = struct {
+        fn first(_: *const udf_mod.ScalarContext, _: []const ColumnView, _: *ColumnStore, _: usize) anyerror!void {
+            return error.FirstKernel;
+        }
+        fn second(_: *const udf_mod.ScalarContext, _: []const ColumnView, _: *ColumnStore, _: usize) anyerror!void {
+            return error.SecondKernel;
+        }
+    };
+    var registry = udf_mod.UdfRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerScalar(.{ .name = "fusion_value", .arg_types = &.{}, .return_type = .bigint, .volatility = .immutable, .kernel = Kernels.first });
+    const call = Expr{ .call = .{ .fn_name = "fusion_value", .args = &.{} } };
+    var first = std.hash.Wyhash.init(0);
+    try hash_fusion_expr(&registry, &first, call);
+    registry.scalars.items[0].kernel = Kernels.second;
+    var second = std.hash.Wyhash.init(0);
+    try hash_fusion_expr(&registry, &second, call);
+    try std.testing.expect(first.final() != second.final());
+    registry.scalars.items[0].volatility = .@"volatile";
+    try std.testing.expectError(Unhashable, hash_fusion_expr(&registry, &second, call));
+    inline for (.{ "random", "uuid", "current_timestamp", "curdate", "utc_timestamp", "curtime", "utc_date" }) |name| {
+        try std.testing.expectError(Unhashable, hash_fusion_expr(null, &second, .{ .call = .{ .fn_name = name, .args = &.{} } }));
+    }
 }
 
 /// Get-or-create the per-database cache slot. Uses the DATABASE allocator —
@@ -862,6 +961,87 @@ fn hash_declaration(input: engine_v2.CompileInput, top: *const ir.Op) ?u64 {
     // inner program no longer references them after that resolution.
     hash_declaration_sources(input, &h, top) catch return null;
     return h.final();
+}
+
+fn hash_fusion_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8) ?u64 {
+    const shape = hash_declaration(input, anchor) orelse return null;
+    var h = std.hash.Wyhash.init(0x6661696c66757365);
+    hu(&h, shape);
+    hu(&h, keys.len);
+    for (keys) |key| hstr(&h, key);
+    hstr(&h, input.session.current_db);
+    hstr(&h, input.session.current_schema);
+    hu(&h, @intFromEnum(input.session.dialect));
+    hu(&h, input.effectiveDop());
+    hu(&h, @intFromBool(input.force_ordered));
+    if (input.prune_names) |names| {
+        hu(&h, names.len + 1);
+        for (names) |name| hstr(&h, name);
+    } else hu(&h, 0);
+    hash_fusion_context(input, &h, anchor, 0) catch return null;
+    return h.final();
+}
+
+fn hash_fusion_context(input: engine_v2.CompileInput, h: *std.hash.Wyhash, node: *const ir.Op, depth: usize) error{RegionUnhashable}!void {
+    if (depth > 256) return Unhashable;
+    switch (node.*) {
+        .materialize => {
+            // The same subtree can become eligible when its outer consumers
+            // change, even if its SQL and every source table are unchanged.
+            const refs = if (input.region_ref_counts) |counts| counts.get(node) else null;
+            if (refs) |count| {
+                hu(h, 1);
+                hu(h, count);
+            } else hu(h, 0);
+        },
+        .compute => |c| for (c.derived) |derived| try hash_fusion_expr(input.udf_registry, h, derived.expr),
+        .window => |w| for (w.calls) |call| {
+            for (call.args) |arg| try hash_fusion_expr(input.udf_registry, h, arg);
+        },
+        .group_by => |g| for (g.aggs) |agg| {
+            // Table and aggregate UDFs do not expose a complete immutable
+            // execution contract for their user data. Retry those plans.
+            if (agg.udf_name != null) return Unhashable;
+        },
+        .table_fn => return Unhashable,
+        .set_union => |u| {
+            try hash_fusion_context(input, h, u.left, depth + 1);
+            try hash_fusion_context(input, h, u.right, depth + 1);
+            return;
+        },
+        .join => |j| {
+            try hash_fusion_context(input, h, j.left, depth + 1);
+            try hash_fusion_context(input, h, j.right, depth + 1);
+            return;
+        },
+        else => {},
+    }
+    if (region_spine_upstream(node)) |child| try hash_fusion_context(input, h, child, depth + 1);
+}
+
+fn hash_fusion_expr(registry: ?*const udf_mod.UdfRegistry, h: *std.hash.Wyhash, expr: Expr) error{RegionUnhashable}!void {
+    switch (expr) {
+        .call => |call| {
+            if (@import("../sql/parser.zig").isNondeterministicFn(call.fn_name)) return Unhashable;
+            if (registry) |udfs| for (udfs.scalarEntries()) |entry| {
+                if (!std.ascii.eqlIgnoreCase(entry.name, call.fn_name)) continue;
+                if (entry.volatility != .immutable or entry.user_data != null) return Unhashable;
+                hstr(h, entry.name);
+                hu(h, entry.arg_types.len);
+                for (entry.arg_types) |arg_type| hashType(h, arg_type);
+                hashType(h, entry.return_type);
+                hu(h, @intFromEnum(entry.null_strategy));
+                h.update(std.mem.asBytes(&entry.kernel));
+            };
+            for (call.args) |arg| try hash_fusion_expr(registry, h, arg);
+        },
+        .case => |case| {
+            for (case.branches) |branch| try hash_fusion_expr(registry, h, branch.then);
+            if (case.else_branch) |other| try hash_fusion_expr(registry, h, other.*);
+        },
+        .col_ref, .lit, .null_lit => {},
+        .scalar_subquery, .exists_subquery, .var_ref => return Unhashable,
+    }
 }
 
 fn hash_declaration_sources(input: engine_v2.CompileInput, h: *std.hash.Wyhash, node: *const ir.Op) error{RegionUnhashable}!void {
@@ -1803,8 +1983,8 @@ fn compileAndDrain(b: *Builder, node: *const ir.Op, drain: bool) !DrainedBlock {
     // Side branches can share CTEs and window results. The ordinary stage
     // compiler must retain those boundaries even during region preparation.
     var q = cte_stages.compile_region_input(b.input, node) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        return NoMatch;
+        sideTrace("join input compilation failed: {s}", .{@errorName(err)});
+        return err;
     };
     defer q.deinit();
 
@@ -1820,7 +2000,10 @@ fn compileAndDrain(b: *Builder, node: *const ir.Op, drain: bool) !DrainedBlock {
     if (drain) {
         stores = try b.a.alloc(ColumnStore, schema.len);
         for (stores, schema) |*s, col| s.* = try ColumnStore.init(b.a, col.type, true);
-        while (q.next() catch return NoMatch) |batch| {
+        while (q.next() catch |err| {
+            sideTrace("join input execution failed: {s}", .{@errorName(err)});
+            return err;
+        }) |batch| {
             for (stores, 0..) |*s, ci| {
                 try appendViewAll(b.a, s, batch.values[ci], batch.row_count);
             }
@@ -2108,6 +2291,13 @@ fn collect_branch(input: engine_v2.CompileInput, root: *const ir.Op, base: *cons
                 cur = c.upstream;
             },
             .filter => |f| {
+                // Ordinary staging prunes an empty branch before preparing
+                // its joins. Speculative fusion would prepare those joins
+                // before its filter could discard their rows.
+                if (f.predicate == .always and !f.predicate.always) {
+                    sideTrace("constant-empty SQL branch uses staged pruning", .{});
+                    return NoMatch;
+                }
                 try steps.append(a, .{ .filt = f.predicate });
                 cur = f.upstream;
             },
@@ -2121,6 +2311,10 @@ fn collect_branch(input: engine_v2.CompileInput, root: *const ir.Op, base: *cons
                 cur = w.upstream;
             },
             .join => |*j| {
+                if (!supports_region_join(j)) {
+                    sideTrace("SQL branch join needs ordinary staging", .{});
+                    return NoMatch;
+                }
                 var refs: RefCounts = .empty;
                 var nodes: NodeSet = .empty;
                 try graph_refs(a, j.right, &refs, &nodes, 0);
@@ -2483,14 +2677,25 @@ fn rename_entry_outputs(arena: Allocator, scan_schema: []const Column, derived: 
 }
 
 fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) anyerror!exec.Query {
-    var fused = false;
-    return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, true, &fused) catch |err| {
+    const pipeline = try collectPipeline(input, anchor, declared_keys, true);
+    const fused = blk: {
+        for (pipeline.steps) |step| if (step == .sql_union) break :blk true;
+        break :blk false;
+    };
+    const rejection_hash = if (fused) hash_fusion_attempt(input, anchor, declared_keys) else null;
+    const cache = if (rejection_hash != null) cacheFor(input.db) else null;
+    if (cache) |c| if (c.fusion_rejected(rejection_hash.?)) {
+        if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] rejected fusion reused: staged fallback\n", .{});
+        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, null);
+    };
+    return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, true, pipeline) catch |err| {
         if (err == error.OutOfMemory or !fused) return err;
-        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, &fused);
+        if (err == NoMatch) if (cache) |c| c.remember_rejected_fusion(rejection_hash.?);
+        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, null);
     };
 }
 
-fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary, union_fusion: bool, fused: *bool) anyerror!exec.Query {
+fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary, union_fusion: bool, collected: ?Pipeline) anyerror!exec.Query {
     var tm: i64 = exec.prof.nowTicks();
     const registry = input.udf_registry orelse return NoMatch;
 
@@ -2527,11 +2732,7 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
 
     // Query-lifetime arena: the step list and the entry-derived slice are
     // borrowed by the operator (never by the cached ctx).
-    var pl = try collectPipeline(input, anchor, declared_keys, union_fusion);
-    for (pl.steps) |step| if (step == .sql_union) {
-        fused.* = true;
-        break;
-    };
+    var pl = collected orelse try collectPipeline(input, anchor, declared_keys, union_fusion);
     ctx.pipeline_recipe = pipeline_recipe_hash(pl.steps);
     ctx.union_fusion = union_fusion;
     traceMark("walk", &tm);
@@ -3004,7 +3205,10 @@ fn dispatch_branch(b: *Builder, registry: *const udf_mod.UdfRegistry, steps: []c
     var i = steps.len;
     while (i > 0) {
         i -= 1;
-        try dispatchStep(b, registry, steps[i], steps[0..i]);
+        dispatchStep(b, registry, steps[i], steps[0..i]) catch |err| {
+            if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] SQL branch declined on '{s}': {s}\n", .{ @tagName(std.meta.activeTag(steps[i])), @errorName(err) });
+            return err;
+        };
     }
     try b.flushPending();
 }
@@ -3021,7 +3225,10 @@ fn dispatch_sql_union(b: *Builder, registry: *const udf_mod.UdfRegistry, u: SqlU
     try b.ops.append(b.a, .{ .restore_frame = saved_base });
     try restore_namespace(b, base);
     try dispatch_branch(b, registry, u.right);
-    if (left.frame.vis.items.len != b.fb.vis.items.len) return NoMatch;
+    if (left.frame.vis.items.len != b.fb.vis.items.len) {
+        sideTrace("SQL union output widths differ: {d} and {d}", .{ left.frame.vis.items.len, b.fb.vis.items.len });
+        return NoMatch;
+    }
 
     const count = left.frame.vis.items.len;
     const left_cols = try b.a.alloc(usize, count);
@@ -3057,8 +3264,14 @@ fn dispatch_sql_union(b: *Builder, registry: *const udf_mod.UdfRegistry, u: SqlU
                 }
             }
         }
-        const i = position orelse return NoMatch;
-        if (!std.mem.eql(u8, b.column_origin(b.fb.cols.items[right_cols[i]].name), origin)) return NoMatch;
+        const i = position orelse {
+            sideTrace("SQL union left branch replaced range key '{s}'", .{key});
+            return NoMatch;
+        };
+        if (!std.mem.eql(u8, b.column_origin(b.fb.cols.items[right_cols[i]].name), origin)) {
+            sideTrace("SQL union right branch replaced range key '{s}'", .{key});
+            return NoMatch;
+        }
         new_key.* = output.vis.items[i].name;
         if (std.mem.eql(u8, physical, base.route_name)) route = output.cols.items[i].name;
     }
@@ -3394,8 +3607,12 @@ fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
     }
 }
 
+fn supports_region_join(j: *const ir.Op.Join) bool {
+    return (j.join_type == .left or j.join_type == .inner) and j.extra_predicate == null and j.ranges.len == 0;
+}
+
 fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror!void {
-    if (j.extra_predicate != null or j.ranges.len != 0) return NoMatch;
+    if (!supports_region_join(j)) return NoMatch;
     switch (j.join_type) {
         .left => {
             const ralias = rightAliasName(j.right) catch null;
@@ -3423,12 +3640,18 @@ fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror
                 try b.null_sides.append(b.a, .{ .alias = alias, .schema = blk.schema });
                 return;
             }
-            if (blk.rows > (1 << 20)) return NoMatch;
+            if (blk.rows > (1 << 20)) {
+                sideTrace("broadcast exceeds row limit: {d}", .{blk.rows});
+                return NoMatch;
+            }
             try pushProbe(b, j, ralias, blk, false, try liveNames(b.input.node_arena, above));
         },
         .inner => {
             const blk = try compileAndDrain(b, j.right, true);
-            if (blk.rows > (1 << 20)) return NoMatch;
+            if (blk.rows > (1 << 20)) {
+                sideTrace("broadcast exceeds row limit: {d}", .{blk.rows});
+                return NoMatch;
+            }
             try pushProbe(b, j, rightAliasName(j.right) catch null, blk, true, try liveNames(b.input.node_arena, above));
         },
         else => return NoMatch,
@@ -3474,7 +3697,10 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
             return pushKeyedBroadcast(b, ralias, blk, inner, live, pin_right.items, pin_vals.items, live_left.items, live_right.items, key_right);
         }
         const probe = try b.resolveIdx(live_left.items[0]);
-        if (!isIntFamilyType(b.fb.cols.items[probe].type) or !isIntFamilyType(blk.schema[live_right.items[0]].type)) return NoMatch;
+        if (!isIntFamilyType(b.fb.cols.items[probe].type) or !isIntFamilyType(blk.schema[live_right.items[0]].type)) {
+            sideTrace("broadcast integer probe needs compatible types: {s}, {s}", .{ @tagName(b.fb.cols.items[probe].type), @tagName(blk.schema[live_right.items[0]].type) });
+            return NoMatch;
+        }
     }
 
     if (live_left.items.len == 0) {
@@ -3545,7 +3771,10 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
         const gop = try map.getOrPut(a, key);
         // A broadcast probe emits at most one match. Both INNER and LEFT
         // joins must remain staged when the build side would multiply rows.
-        if (gop.found_existing) return NoMatch;
+        if (gop.found_existing) {
+            sideTrace("broadcast duplicate integer key", .{});
+            return NoMatch;
+        }
         gop.value_ptr.* = @intCast(kept.items.len);
         try kept.append(a, @intCast(i));
     }

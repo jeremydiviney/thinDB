@@ -1351,15 +1351,18 @@ test "keyed region: shared SQL branches preserve multiplying and filtering joins
     const sides = try db.openTable("sides", .{});
     try sides.flush();
     inline for (.{
-        .{ .join_type = "LEFT", .source = "(SELECT * FROM sides WHERE id <= 3)", .fused = true },
-        .{ .join_type = "INNER", .source = "(SELECT * FROM sides WHERE id = 1)", .fused = true },
-        .{ .join_type = "LEFT", .source = "sides", .fused = false },
+        .{ .join_type = "LEFT", .source = "(SELECT * FROM sides WHERE id <= 3)", .predicate = "", .fused = true },
+        .{ .join_type = "INNER", .source = "(SELECT * FROM sides WHERE id = 1)", .predicate = "", .fused = true },
+        .{ .join_type = "LEFT", .source = "sides", .predicate = "", .fused = false },
+        .{ .join_type = "INNER", .source = "sides", .predicate = " AND b.amount < s.extra", .fused = false },
+        .{ .join_type = "LEFT", .source = "sides", .predicate = " AND b.amount > 0", .fused = false },
     }) |case| {
         const body =
             \\base AS (SELECT * FROM inv), combined AS (
             \\ SELECT b.custLC, b.id, s.extra AS value, 1 AS arm FROM base b
         ++ " " ++ case.join_type ++ " JOIN " ++ case.source ++
             \\ s ON b.custLC = s.custLC
+        ++ case.predicate ++
             \\ UNION ALL SELECT custLC, id, amount AS value, 2 AS arm FROM base WHERE month < 3
             \\), result AS (
             \\ SELECT *, LAG(value, 1, 0) OVER (PARTITION BY custLC ORDER BY id, arm, value) AS prior FROM combined
@@ -1399,6 +1402,83 @@ test "keyed region: shared SQL branches reject unsafe fusion while retaining sta
         try std.testing.expectEqual(@as(usize, 0), regional_op_count(query.cq.query, .union_all));
         while (try query.next()) |_| {}
         try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
+test "keyed region: constant-empty SQL branches retain ordinary pruning and later regions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE lookup (id INT PRIMARY KEY, month INT, value BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO lookup VALUES (1,1,100),(2,2,200)");
+    const lookup = try db.openTable("lookup", .{});
+    try lookup.flush();
+    inline for (.{ false, true, false }) |enabled| {
+        const body =
+            \\base AS (SELECT * FROM inv), combined AS (
+            \\ SELECT b.custLC, b.id, l.value, 1 AS arm FROM base b LEFT JOIN lookup l ON b.month = l.month
+        ++ (if (enabled) " WHERE 1=1" else " WHERE 1=0") ++
+            \\ UNION ALL SELECT custLC, id, amount AS value, 2 AS arm FROM base WHERE month >= 3
+            \\), result AS (
+            \\ SELECT *, LAG(value, 1, 0) OVER (PARTITION BY custLC ORDER BY id, arm) AS prior FROM combined
+            \\)
+            \\SELECT * FROM result ORDER BY custLC, id, arm
+        ;
+        for (0..2) |_| {
+            var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+            defer query.deinit();
+            try std.testing.expectEqual(@as(usize, @intFromBool(enabled)), regional_op_count(query.cq.query, .union_all));
+            try std.testing.expectEqual(@as(usize, 1), region_count(query.cq.query));
+            while (try query.next()) |_| {}
+            try expect_keyed_matches(allocator, db, body, "prior");
+        }
+    }
+}
+
+test "keyed region: rejected SQL fusion retries after changed lookup data and schema" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE lookup (id INT PRIMARY KEY, month INT, value BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO lookup VALUES (1,1,100),(2,1,200)");
+    var lookup = try db.openTable("lookup", .{});
+    try lookup.flush();
+    const body =
+        \\base AS (SELECT * FROM inv), combined AS (
+        \\ SELECT b.custLC, b.id, l.value, 1 AS arm FROM base b LEFT JOIN lookup l ON b.month = l.month
+        \\ UNION ALL SELECT custLC, id, amount AS value, 2 AS arm FROM base WHERE month >= 3
+        \\), result AS (
+        \\ SELECT *, LAG(value, 1, 0) OVER (PARTITION BY custLC ORDER BY id, arm, value) AS prior FROM combined
+        \\)
+        \\SELECT * FROM result ORDER BY custLC, id, arm, value
+    ;
+    for (0..5) |stage| {
+        if (stage == 1) {
+            try helpers.exec(allocator, db, "DELETE FROM lookup WHERE id = 2");
+            try lookup.flush();
+        } else if (stage == 2) {
+            try helpers.exec(allocator, db, "INSERT INTO lookup VALUES (2,1,300)");
+            try lookup.flush();
+        } else if (stage == 3) {
+            try helpers.exec(allocator, db, "ALTER TABLE lookup ADD COLUMN extra INT DEFAULT 7");
+        } else if (stage == 4) {
+            try helpers.exec(allocator, db, "DROP TABLE lookup");
+            try helpers.exec(allocator, db, "CREATE TABLE lookup (id INT PRIMARY KEY, month INT, value INT)");
+            try helpers.exec(allocator, db, "INSERT INTO lookup VALUES (1,1,400)");
+            lookup = try db.openTable("lookup", .{});
+            try lookup.flush();
+        }
+        for (0..3) |_| {
+            var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+            defer query.deinit();
+            try std.testing.expectEqual(@as(usize, if (stage == 1 or stage == 4) 1 else 0), regional_op_count(query.cq.query, .union_all));
+            while (try query.next()) |_| {}
+            try expect_keyed_matches(allocator, db, body, "prior");
+        }
     }
 }
 

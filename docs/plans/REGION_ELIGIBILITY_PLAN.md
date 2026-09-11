@@ -1,5 +1,71 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Reject unsupported SQL fusion before preparation (2026-09-11)
+
+The general fix checks branch join eligibility during collection, before
+preparing sources or draining lookup inputs. Collection and dispatch share
+one predicate for supported join kinds, range conditions and residual ON
+predicates. The rollforward gap-fill branch contains a range join; previously
+the fused attempt prepared earlier joins before reaching that rejection.
+Known-empty branch filters also retain ordinary staging and its pruning.
+Supported branches still fuse, and compatible regions around unsupported
+branches remain available. No query, table or UDF names select these rules.
+
+A bounded per-database rejection cache additionally avoids repeating
+data-dependent fusion failures when inputs are unchanged. Its fingerprint
+includes table/data/schema identity, declared keys, CTE sharing, session and
+compile context, and immutable scalar kernel identity. Volatile calls and
+unversionable inputs are excluded. Data/schema changes retry; actual join
+input compilation/execution errors preserve their error identity. The first
+data-dependent proof after a change still costs work. This cache alone did
+not resolve the first pilot; the early structural check removes the measured
+rollforward failure even on the first execution.
+
+Matched 7b99d27/candidate controls used DOP 12, the same private snapshot on
+starrocks1 port 13311, saved SQL and hash buckets a/b/c. Each arm had one
+warmup, three measured raw-packet-discard queries and one untimed fingerprint.
+Fresh services used cache/pool 2/4 GiB, shared/query budgets 16 GiB, service
+ceiling 20 GiB; build order alternated. Headroom checks paused between arms
+when necessary. These are six saved-SQL controls, not a fresh full five-arm
+application matrix; they exclude application generation/setup. Shared-host
+load can still affect elapsed time. Median milliseconds:
+
+| Case | Regressed SQL + regions | Fixed SQL + regions | Speedup |
+|---|---:|---:|---:|
+| Sierra base simple | 809 | 251 | 3.23x |
+| Sierra expanded simple | 1,036 | 283 | 3.67x |
+| Sierra expanded cross | 3,205 | 2,346 | 1.37x |
+| AirDNA base simple | 2,508 | 1,467 | 1.71x |
+| AirDNA expanded simple | 2,511 | 1,209 | 2.08x |
+| AirDNA expanded cross | 11,086 | 9,649 | 1.15x |
+
+Each regressed query attempted and rejected one fused union; every fixed
+query had zero expensive failed union attempts, including the warmup.
+Every arm retained one successful region. Rejection-cache hits were zero in
+all six fixed controls, confirming that the structural check accounts for
+this recovery. All six result fingerprints match each other and the earlier
+ordinary-SQL reference, including row/column counts. All 48 warmup/timing
+queries and 12 validation queries completed. Peak service memory was
+17.64 GiB with zero memory-limit/OOM events. Production PID 2579063
+and restart count remained unchanged; CDC stayed RUNNING. The diagnostic
+service stopped and port 13311 was released. No production deployment.
+
+Validation: `zig build test -j1 --summary all` passed 1,495 tests, with five
+known skips. Coverage includes range/residual join fallback, empty/nonempty
+branches, changed lookup data, ALTER/DROP/recreate, CTE sharing and cache
+fingerprint context/kernel/volatility changes. `zig build bench` passed during
+implementation; final `zig build bench-regions` passed exact-value checks.
+Generic shared-window branch cases retained 1.59-2.13x speedups over ordinary
+SQL. A high-cardinality grouped-reduction microbenchmark still ran at 0.81x;
+regional execution is not universally faster. The full application five-arm
+sweep remains the next comparison after this fix is integrated.
+
+Evidence: `.bench-data/sql-region-rejection-fix/`, mirrored under
+`/home/ubuntu/wayroll-bench/sql-region-rejection-fix`. Full receipts, traces,
+health/memory audits and summaries are in `control-results.tgz`; exact binary
+hashes are in `full-metadata.json`. Candidate Linux ReleaseFast SHA-256:
+`87b120dbe6be6b4f4e1967dca46b4a7031f0474ff959348689e807c78eb17796`.
+
 ### Confirm SQL regional preparation regression (2026-09-11)
 
 Controlled comparison of parent 062b8c7 (same engine as d4b66ca) against

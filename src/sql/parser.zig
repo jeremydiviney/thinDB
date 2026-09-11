@@ -4350,12 +4350,10 @@ fn countAggs(proj: []const ProjItem) usize {
 /// pure function of the other keys, so it must never be collapsed. The
 /// registry doesn't expose these yet, but list them so the rewrite stays
 /// correct the moment they land.
-fn isNondeterministicFn(name: []const u8) bool {
+pub fn isNondeterministicFn(name: []const u8) bool {
+    if (bareTemporalFn(name) != null) return true;
     const names = [_][]const u8{
-        "now",          "current_date", "current_timestamp",
-        "current_time", "localtime",    "localtimestamp",
-        "random",       "rand",         "uuid",
-        "uuid_short",   "sysdate",      "unix_timestamp",
+        "now", "random", "rand", "uuid", "uuid_short", "sysdate", "unix_timestamp",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
     return false;
