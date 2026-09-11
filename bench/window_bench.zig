@@ -514,6 +514,22 @@ pub fn main(init: std.process.Init) !void {
 
 const RegionMeasurement = struct { elapsed_ns: u64, totals: [2]i128 };
 
+fn fused_union_count(query: thindb.exec.Query) usize {
+    var count: usize = 0;
+    if (thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, query)) |root| {
+        for (root.set.stages.items) |stage| if (stage.query_alive) {
+            count += fused_union_count(stage.query);
+        };
+    }
+    if (thindb.exec.queryAs(thindb.exec.region_exec.RegionExecOp, query)) |region| {
+        for (region.prog.ops) |op| if (op == .union_all) {
+            count += 1;
+        };
+        for (region.sources) |source| count += fused_union_count(source);
+    }
+    return count;
+}
+
 fn measure_region_sql(allocator: Allocator, io: Io, db: *thindb.Database, sql: []const u8) !RegionMeasurement {
     const start = Io.Clock.awake.now(io);
     var totals = [_]i128{ 0, 0 };
@@ -619,6 +635,87 @@ fn run_keyed_regions(allocator: Allocator, io: Io) !void {
             try report("keyed window SQL", bench_rows, samples[1][2], null);
             std.debug.print("value-exact totals={any}; speedup={d:.2}x\n", .{
                 baseline.totals, @as(f64, @floatFromInt(samples[0][2])) / @as(f64, @floatFromInt(samples[1][2])),
+            });
+        }
+    }
+    try run_shared_branches(allocator, io, db);
+}
+
+fn run_shared_branches(allocator: Allocator, io: Io, db: *thindb.Database) !void {
+    inline for (.{ "grp_lo", "grp_hi" }) |key| {
+        inline for (.{
+            .{ .label = "shared window, overlapping filters", .unions = 1, .base = "SELECT " ++ key ++ ", id, qty, LAG(qty, 1, 0) OVER (PARTITION BY " ++ key ++ " ORDER BY id) AS prior FROM t", .body =
+            \\combined AS (
+            \\ SELECT {key}, id, prior, 1 AS arm FROM base WHERE qty <= 500
+            \\ UNION ALL SELECT {key}, id, prior * 2 AS prior, 2 AS arm FROM base WHERE qty >= 250
+            \\), result AS (
+            \\ SELECT {key}, prior, LAG(prior, 1, 0) OVER (PARTITION BY {key} ORDER BY id, arm) AS next_prior FROM combined
+            \\)
+            \\SELECT SUM(prior), SUM(next_prior) FROM result
+            },
+            .{ .label = "three branches, independent windows", .unions = 2, .base = "SELECT " ++ key ++ ", id, qty FROM t", .body =
+            \\combined AS (
+            \\ SELECT {key}, id, SUM(qty) OVER (PARTITION BY {key} ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS prior, 1 AS arm FROM base WHERE qty < 500
+            \\ UNION ALL
+            \\ SELECT {key}, id, LEAD(qty, 2, 0) OVER (PARTITION BY {key} ORDER BY id DESC) AS prior, 2 AS arm FROM base WHERE qty >= 250
+            \\ UNION ALL SELECT {key}, id, qty AS prior, 3 AS arm FROM base WHERE qty >= 750
+            \\), result AS (
+            \\ SELECT {key}, prior, LAG(prior, 1, 0) OVER (PARTITION BY {key} ORDER BY id, arm) AS next_prior FROM combined
+            \\)
+            \\SELECT SUM(prior), SUM(next_prior) FROM result
+            },
+            .{ .label = "filtered projections, grouped reduction", .unions = 1, .base = "SELECT " ++ key ++ ", id, qty FROM t", .body =
+            \\combined AS (
+            \\ SELECT {key}, qty AS prior FROM base WHERE qty < 500
+            \\ UNION ALL SELECT {key}, qty * 2 AS prior FROM base WHERE qty >= 250
+            \\), result AS (
+            \\ SELECT {key}, SUM(prior) AS prior, MAX(prior) AS next_prior FROM combined GROUP BY {key}
+            \\)
+            \\SELECT SUM(prior), SUM(next_prior) FROM result
+            },
+        }) |shape| {
+            const body = try std.mem.replaceOwned(u8, allocator, shape.body, "{key}", key);
+            defer allocator.free(body);
+            const queries = [_][]const u8{
+                try std.fmt.allocPrint(allocator, "WITH base AS ({s}), {s}", .{ shape.base, body }),
+                try std.fmt.allocPrint(allocator, "WITH KEYED BY ({s}) base AS MATERIALIZED ({s}), {s}", .{ key, shape.base, body }),
+                try std.fmt.allocPrint(allocator, "WITH KEYED BY ({s}) base AS ({s}), {s}", .{ key, shape.base, body }),
+            };
+            defer for (queries) |sql| allocator.free(sql);
+            var baseline: ?RegionMeasurement = null;
+            for (queries, 0..) |sql, arm| {
+                // A final scalar aggregate may eagerly drain and destroy its
+                // input during compilation. Inspect the live producer first.
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const inspected_sql = try std.mem.replaceOwned(u8, arena.allocator(), sql, "SELECT SUM(prior), SUM(next_prior) FROM result", "SELECT prior, next_prior FROM result");
+                const plan = try thindb.sql.parse(arena.allocator(), inspected_sql);
+                var inspected = try thindb.net.compile(allocator, db, plan);
+                defer inspected.deinit();
+                if (fused_union_count(inspected.query) != (if (arm == 2) @as(usize, shape.unions) else 0)) return error.UnexpectedFusion;
+                const warm = try measure_region_sql(allocator, io, db, sql);
+                if (baseline) |reference| {
+                    if (!std.meta.eql(reference.totals, warm.totals)) return error.ResultMismatch;
+                } else baseline = warm;
+            }
+            var samples: [3][5]u64 = undefined;
+            for (0..5) |iteration| {
+                for (0..3) |position| {
+                    const arm = (iteration + position) % 3;
+                    const measurement = try measure_region_sql(allocator, io, db, queries[arm]);
+                    if (!std.meta.eql(baseline.?.totals, measurement.totals)) return error.ResultMismatch;
+                    samples[arm][iteration] = measurement.elapsed_ns;
+                }
+            }
+            for (&samples) |*arm| std.mem.sort(u64, arm, {}, std.sort.asc(u64));
+            std.debug.print("\nShared SQL branches ({s}, {s}): {d} rows, DOP 12, five rotating runs after warmup\n", .{ shape.label, key, bench_rows });
+            try report("ordinary SQL", bench_rows, samples[0][2], null);
+            try report("keyed materialized base", bench_rows, samples[1][2], null);
+            try report("keyed shared branches", bench_rows, samples[2][2], null);
+            std.debug.print("value-exact totals={any}; speedup ordinary={d:.2}x staged={d:.2}x\n", .{
+                baseline.?.totals,
+                @as(f64, @floatFromInt(samples[0][2])) / @as(f64, @floatFromInt(samples[2][2])),
+                @as(f64, @floatFromInt(samples[1][2])) / @as(f64, @floatFromInt(samples[2][2])),
             });
         }
     }

@@ -82,6 +82,9 @@ pub const CompileInput = struct {
     /// its own sort — see cte_stages) and crossed-join ride verification.
     /// Opaque pointers keep this module window-agnostic.
     win_registry: ?*std.AutoHashMapUnmanaged(*const anyopaque, *anyopaque) = null,
+    /// Whole-query materialize references bound before regional compilation.
+    /// A fused fork must not privately re-evaluate an externally shared CTE.
+    region_ref_counts: ?*const std.AutoHashMapUnmanaged(*const ir.Op, u32) = null,
 
     pub fn effectiveDop(self: *const CompileInput) usize {
         const base = self.db.config.max_dop;

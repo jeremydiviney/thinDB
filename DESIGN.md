@@ -435,6 +435,25 @@ Every cached run rebuilds the source against fresh
 snapshots. Grouping exactly by the current range keys is supported as one
 aggregate group per range, including NULL keys and all-NULL values.
 
+`UNION ALL` branches that reference the same CTE input can instead remain
+inside one region. The compiler retains the shared frame, executes each
+branch's filters, projections, expressions, compatible windows and joins,
+then concatenates their outputs within each declared-key partition. Nested
+unions use the same rule. Frame snapshots borrow column buffers; each
+branch owns its result buffers until the union consumes them. Filters and
+joins retain empty range positions so branches can be aligned without
+another exchange. Positional names, casts and NULLability use the ordinary
+union's column planner, and left-before-right order preserves window ties.
+
+Fusion requires value-identical partition keys in corresponding output
+positions and an exclusively consumed shared input. Forced materialization,
+externally shared CTEs, key replacements, incompatible windows, branch
+aggregation/table functions and joins depending on the retained input keep
+ordinary staging. A failed fusion attempt retries the existing staged-ingress
+path at the same boundary. Cached programs recheck both the source versions
+and the branch-sharing recipe before reuse. These are structural SQL rules;
+no query text, table name or UDF name selects the optimization.
+
 Regions whose program folds to only emission use the ordinary scan path,
 avoiding an exchange and consolidation without shard-local work. Column
 movement supports every stored payload type, including Boolean and UUID

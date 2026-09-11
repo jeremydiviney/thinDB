@@ -96,6 +96,7 @@ fn compile_staged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage_co
     }
     const t_count_mat_refs = exec.prof.nowTicks();
     try countMatRefs(input.allocator, root, &cse);
+    if (input.region_ref_counts == null) input.region_ref_counts = &cse.refs;
     exec.prof.addPhase("compile.count_mat_refs", @intCast(exec.prof.nowTicks() - t_count_mat_refs));
     // Keyed pipeline regions (`WITH KEYED BY (...)`): a declared block
     // pre-registers its stage here, BEFORE the window-wrap rewrite mutates

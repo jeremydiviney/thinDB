@@ -93,18 +93,14 @@ pub const SetUnion = struct {
         errdefer allocator.free(views);
 
         for (left_schema, right_schema, out_schema, left_casts, right_casts, left_cast_cols, right_cast_cols) |l, r, *o, *lk, *rk, *lc, *rc| {
-            const out_type = commonUnionType(l.type, r.type) orelse return Error.TypeMismatch;
-            const out_nullable = l.nullable or r.nullable;
-            o.* = .{ .name = l.name, .type = out_type, .nullable = out_nullable };
+            const plan = try plan_column(l, r);
+            o.* = plan.column;
+            lk.* = plan.left_cast;
+            rk.* = plan.right_cast;
 
-            lk.* = castFor(l.type, out_type);
-            if (lk.* == null and !sameRepr(l.type, out_type)) return Error.TypeMismatch;
-            rk.* = castFor(r.type, out_type);
-            if (rk.* == null and !sameRepr(r.type, out_type)) return Error.TypeMismatch;
-
-            lc.* = try ColumnStore.init(allocator, out_type, out_nullable);
+            lc.* = try ColumnStore.init(allocator, plan.column.type, plan.column.nullable);
             left_cols_inited += 1;
-            rc.* = try ColumnStore.init(allocator, out_type, out_nullable);
+            rc.* = try ColumnStore.init(allocator, plan.column.type, plan.column.nullable);
             right_cols_inited += 1;
         }
 
@@ -328,6 +324,25 @@ pub const SetUnion = struct {
         };
     }
 };
+
+pub const ColumnPlan = struct {
+    column: Column,
+    left_cast: ?CastKernel,
+    right_cast: ?CastKernel,
+};
+
+pub fn plan_column(left: Column, right: Column) !ColumnPlan {
+    const out_type = commonUnionType(left.type, right.type) orelse return Error.TypeMismatch;
+    const left_cast = castFor(left.type, out_type);
+    if (left_cast == null and !sameRepr(left.type, out_type)) return Error.TypeMismatch;
+    const right_cast = castFor(right.type, out_type);
+    if (right_cast == null and !sameRepr(right.type, out_type)) return Error.TypeMismatch;
+    return .{
+        .column = .{ .name = left.name, .type = out_type, .nullable = left.nullable or right.nullable },
+        .left_cast = left_cast,
+        .right_cast = right_cast,
+    };
+}
 
 fn typeTag(t: Type) TypeTag {
     return std.meta.activeTag(t);

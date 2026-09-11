@@ -1,5 +1,84 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Fuse shared SQL branches within one region (2026-09-10)
+
+Branch: `region-shared-sql-branches`, based on `062b8c7`. This implements
+the shared-input approach below. The independent-region discovery
+experiment at `62eedfe` remains excluded. No production deployment or
+production benchmark was performed in this round.
+
+A common CTE input is retained once inside a keyed region. Compatible
+UNION ALL branches run over borrowed frame snapshots, then concatenate
+within each declared-key partition. Nested branches follow the same rule.
+Supported branch steps include filters, projections, expressions, aliases,
+SQL windows, and existing eligible joins. Ordinary UNION type planning is
+shared with regional execution. Filters preserve empty range positions;
+left-before-right concatenation preserves tied window ordering. Key
+provenance survives nested unions only for value-identical output slots.
+
+This is structural SQL support with no table, query-text or UDF-name
+recognizers. Forced materialization, external CTE consumers, changed keys,
+incompatible windows and unsupported branch operators retain ordinary
+staging. A declined fusion retries the original staged-ingress path at the
+same boundary. Cache reuse revalidates the sharing recipe and table
+versions. Existing restrictions still apply: branch GROUP BY/TVFs,
+unfiltered co-partitioned sides and duplicate-key broadcast joins are not
+newly enabled. Supported grouped reductions can follow the combined frame.
+
+Validation covers two/three branches, different window frames and order
+specs, ties, positional numeric widening, duplicates, NULL keys/payloads,
+empty branches/ranges, typed Boolean/UUID movement, dimension joins,
+multiplying LEFT joins, filtering INNER joins, cached source updates and
+changed external sharing. The benchmark's plan inspection checks live
+producers separately because a final scalar aggregate may already have
+destroyed its input operator during compilation.
+The final full test run passed 1,490 tests with five existing skips;
+formatting and whitespace checks passed.
+
+Local Windows in-process measurements, ReleaseFast, 1M input rows, DOP 12,
+one warmup per arm and five rotating measurements; medians in milliseconds.
+Every execution checks exact aggregate totals against ordinary SQL, and
+separate plan checks require the expected fused UNION op count. The
+materialized arm explicitly retains the common CTE with `AS MATERIALIZED`;
+this compares execution modes in the candidate, not different commits.
+There is no MySQL transfer or Node decoding in these measurements.
+
+`zig build bench-regions` uses the C allocator, matching the ReleaseFast
+server's process allocator on this platform:
+
+| SQL shape | Partitions | Ordinary SQL | Keyed materialized base | Keyed fused branches | Fused speedup vs materialized |
+|---|---:|---:|---:|---:|---:|
+| Shared window + overlapping filters | 100 | 103.85 | 93.93 | 50.54 | 1.86x |
+| Three branches + independent windows | 100 | 130.46 | 97.11 | 54.91 | 1.77x |
+| Filtered projections + grouped reduction | 100 | 20.89 | 21.09 | 18.08 | 1.17x |
+| Shared window + overlapping filters | 10,000 | 85.42 | 100.83 | 49.75 | 2.03x |
+| Three branches + independent windows | 10,000 | 126.66 | 108.21 | 53.08 | 2.04x |
+| Filtered projections + grouped reduction | 10,000 | 20.90 | 25.26 | 23.71 | 1.07x |
+
+The full `zig build bench` suite also passed. It explicitly uses
+`DebugAllocator` even in ReleaseFast and ran the same cases with these
+results; do not blend the two harnesses into one baseline:
+
+| SQL shape | Partitions | Ordinary SQL | Keyed materialized base | Keyed fused branches |
+|---|---:|---:|---:|---:|
+| Shared window + overlapping filters | 100 | 86.69 | 80.68 | 55.03 |
+| Three branches + independent windows | 100 | 125.58 | 108.75 | 60.67 |
+| Filtered projections + grouped reduction | 100 | 22.92 | 26.16 | 27.74 |
+| Shared window + overlapping filters | 10,000 | 81.16 | 100.62 | 79.57 |
+| Three branches + independent windows | 10,000 | 105.86 | 107.00 | 72.57 |
+| Filtered projections + grouped reduction | 10,000 | 25.87 | 32.65 | 40.02 |
+
+Window-heavy forks benefit in both harnesses. Small reductions can lose to
+ordinary SQL and can also regress against staged keyed execution; fusion
+still pays filtering, copying and exchange costs. No universal speedup or
+new production rollforward result is claimed.
+
+Evidence: `.bench-data/shared-branch-bench.log`,
+`.bench-data/shared-branch-full-bench.log`, and
+`.bench-data/shared-branch-final-tests.log`. Next: compare this branch with
+the correctness baseline on the private Linux FX snapshot, then use the
+remaining rejection traces to prioritize further general operator support.
+
 ### UNION experiment and prerequisite correctness fixes (2026-09-10)
 
 Current branch: `region-payload-and-cache-correctness`, engine commit

@@ -533,7 +533,7 @@ test "keyed region: consecutive entry projections preserve aliases and compute o
     defer db.close();
     inline for (.{
         .{ .suffix = "", .region_column = "prior" },
-        .{ .suffix = " WHERE amount > 20", .region_column = "amount" },
+        .{ .suffix = " WHERE amount > 20", .region_column = "prior" },
     }) |case| {
         try expect_keyed_matches(allocator, db,
             \\base AS (
@@ -1155,7 +1155,9 @@ test "keyed region: UNION ALL cached executions refresh both branches and their 
 fn region_count(query: thindb.exec.Query) usize {
     if (thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, query)) |root| {
         var count: usize = 0;
-        for (root.set.stages.items) |stage| count += region_count(stage.query);
+        for (root.set.stages.items) |stage| if (stage.query_alive) {
+            count += region_count(stage.query);
+        };
         return count;
     }
     if (thindb.exec.queryAs(thindb.exec.region_exec.RegionExecOp, query)) |region| {
@@ -1164,6 +1166,90 @@ fn region_count(query: thindb.exec.Query) usize {
         return count;
     }
     return 0;
+}
+
+fn regional_op_count(query: thindb.exec.Query, tag: std.meta.Tag(thindb.exec.region_exec.RegionOp)) usize {
+    var count: usize = 0;
+    if (thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, query)) |root| {
+        for (root.set.stages.items) |stage| if (stage.query_alive) {
+            count += regional_op_count(stage.query, tag);
+        };
+    }
+    if (thindb.exec.queryAs(thindb.exec.region_exec.RegionExecOp, query)) |region| {
+        for (region.prog.ops) |op| if (std.meta.activeTag(op) == tag) {
+            count += 1;
+        };
+        for (region.sources) |source| count += regional_op_count(source, tag);
+    }
+    return count;
+}
+
+test "keyed region: shared SQL branches use one exchange around independent windows" {
+    const allocator = std.testing.allocator;
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, dop);
+        defer db.close();
+        try helpers.exec(allocator, db, "INSERT INTO inv VALUES (2001,100,'cust_0',12,NULL),(2002,100,NULL,3,11)");
+        const table = try db.openTable("inv", .{});
+        try table.flush();
+        const body =
+            \\base AS (
+            \\ SELECT id, custLC, month, amount,
+            \\   LAST_VALUE(amount) OVER (PARTITION BY custLC, month ORDER BY id
+            \\     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest FROM inv
+            \\), combined AS (
+            \\ SELECT custLC, id, amount, latest, 1 AS arm FROM base WHERE month <= 3
+            \\ UNION ALL
+            \\ SELECT custLC, id, amount * 2 AS amount, latest, 2 AS arm FROM base WHERE month >= 3 OR amount IS NULL
+            \\), result AS (
+            \\ SELECT *, LAG(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY id) AS prior FROM combined
+            \\)
+            \\SELECT * FROM result ORDER BY custLC, id, arm
+        ;
+        for (0..2) |_| {
+            var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+            defer query.deinit();
+            try std.testing.expectEqual(@as(usize, 1), region_count(query.cq.query));
+            try std.testing.expectEqual(@as(usize, 1), regional_op_count(query.cq.query, .union_all));
+            try std.testing.expectEqual(@as(usize, 2), regional_op_count(query.cq.query, .window));
+            while (try query.next()) |_| {}
+        }
+        try expect_keyed_matches(allocator, db, body, "prior");
+        try helpers.exec(allocator, db, "INSERT INTO inv VALUES (3001,100,'cust_0',3,701)");
+        try table.flush();
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
+test "keyed region: three SQL branches preserve positional widening duplicates and empty ranges" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    inline for (.{ "month <= 3", "month > 100" }) |first_filter| {
+        const body =
+            \\base AS (SELECT * FROM inv), combined AS (
+            \\ SELECT custLC, id, month AS value, 1 AS arm FROM base WHERE
+        ++ " " ++ first_filter ++
+            \\ UNION ALL
+            \\ SELECT custLC AS other_key, id AS other_id, amount AS other_value, 2 AS other_arm FROM base WHERE month >= 3
+            \\ UNION ALL
+            \\ SELECT custLC, id, amount, 3 FROM base WHERE month = 3
+            \\), result AS (
+            \\ SELECT *, LAG(value, 1, 0) OVER (PARTITION BY custLC ORDER BY id) AS prior FROM combined
+            \\)
+            \\SELECT * FROM result ORDER BY custLC, id, arm
+        ;
+        var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+        defer query.deinit();
+        try std.testing.expectEqual(@as(usize, 1), region_count(query.cq.query));
+        try std.testing.expectEqual(@as(usize, 2), regional_op_count(query.cq.query, .union_all));
+        while (try query.next()) |_| {}
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
 }
 
 test "keyed region: boolean payloads cross SQL union and window regions" {
@@ -1187,6 +1273,161 @@ test "keyed region: boolean payloads cross SQL union and window regions" {
         \\SELECT * FROM result ORDER BY id
     ;
     try expect_keyed_matches(allocator, db, body, "total");
+}
+
+test "keyed region: shared SQL branches preserve independent window frames and dimension joins" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE dimension (id INT PRIMARY KEY, month INT, label VARCHAR(32))");
+    try helpers.exec(allocator, db, "INSERT INTO dimension VALUES (1,1,'first'),(2,2,NULL),(3,3,'third')");
+    const dimension = try db.openTable("dimension", .{});
+    try dimension.flush();
+    const body =
+        \\base AS (SELECT * FROM inv), a AS (
+        \\ SELECT *, SUM(amount) OVER (PARTITION BY custLC ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS value
+        \\ FROM base WHERE month <= 3
+        \\), b AS (
+        \\ SELECT *, LEAD(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY id DESC) AS value
+        \\ FROM base WHERE month >= 3
+        \\), combined AS (
+        \\ SELECT a.custLC, a.id, a.value, d.label, 1 AS arm FROM a LEFT JOIN dimension d ON a.month = d.month
+        \\ UNION ALL
+        \\ SELECT b.custLC, b.id, b.value, d.label, 2 AS arm FROM b LEFT JOIN dimension d ON b.month = d.month
+        \\), result AS (
+        \\ SELECT *, LAG(value, 1, 0) OVER (PARTITION BY custLC ORDER BY id, arm) AS prior FROM combined
+        \\)
+        \\SELECT * FROM result ORDER BY custLC, id, arm
+    ;
+    for (0..2) |_| {
+        var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+        defer query.deinit();
+        try std.testing.expectEqual(@as(usize, 1), region_count(query.cq.query));
+        try std.testing.expectEqual(@as(usize, 1), regional_op_count(query.cq.query, .union_all));
+        try std.testing.expectEqual(@as(usize, 3), regional_op_count(query.cq.query, .window));
+        while (try query.next()) |_| {}
+        try expect_keyed_matches(allocator, db, body, "prior");
+        try helpers.exec(allocator, db, "DELETE FROM dimension WHERE month = 2");
+        try dimension.flush();
+    }
+}
+
+test "keyed region: shared SQL branches feed grouped reductions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    inline for (.{ "id <= 5", "id < 0" }) |filter| {
+        const body =
+            \\base AS (SELECT * FROM inv), combined AS (
+            \\ SELECT custLC, amount FROM base WHERE
+        ++ " " ++ filter ++
+            \\ UNION ALL SELECT custLC, amount * 2 AS amount FROM base WHERE
+        ++ " " ++ filter ++
+            \\), result AS (
+            \\ SELECT custLC, MAX(amount) AS largest, SUM(amount) AS total FROM combined GROUP BY custLC
+            \\)
+            \\SELECT * FROM result ORDER BY custLC
+        ;
+        var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+        defer query.deinit();
+        try std.testing.expectEqual(@as(usize, 1), regional_op_count(query.cq.query, .union_all));
+        while (try query.next()) |_| {}
+        try expect_keyed_matches(allocator, db, body, "total");
+    }
+}
+
+test "keyed region: shared SQL branches preserve multiplying and filtering joins" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE sides (id INT PRIMARY KEY, custLC VARCHAR(32), extra BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO sides VALUES (1,'cust_0',11),(2,'cust_0',12),(3,NULL,13),(4,'cust_1',NULL)");
+    const sides = try db.openTable("sides", .{});
+    try sides.flush();
+    inline for (.{
+        .{ .join_type = "LEFT", .source = "(SELECT * FROM sides WHERE id <= 3)", .fused = true },
+        .{ .join_type = "INNER", .source = "(SELECT * FROM sides WHERE id = 1)", .fused = true },
+        .{ .join_type = "LEFT", .source = "sides", .fused = false },
+    }) |case| {
+        const body =
+            \\base AS (SELECT * FROM inv), combined AS (
+            \\ SELECT b.custLC, b.id, s.extra AS value, 1 AS arm FROM base b
+        ++ " " ++ case.join_type ++ " JOIN " ++ case.source ++
+            \\ s ON b.custLC = s.custLC
+            \\ UNION ALL SELECT custLC, id, amount AS value, 2 AS arm FROM base WHERE month < 3
+            \\), result AS (
+            \\ SELECT *, LAG(value, 1, 0) OVER (PARTITION BY custLC ORDER BY id, arm, value) AS prior FROM combined
+            \\)
+            \\SELECT * FROM result ORDER BY custLC, id, arm, value
+        ;
+        var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+        defer query.deinit();
+        try std.testing.expectEqual(@as(usize, if (case.fused) 1 else 0), regional_op_count(query.cq.query, .union_all));
+        while (try query.next()) |_| {}
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
+test "keyed region: shared SQL branches reject unsafe fusion while retaining staged ingress" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    inline for (.{
+        .{ .base = "base AS MATERIALIZED (SELECT * FROM inv)", .left = "SELECT custLC, id, amount FROM base", .right = "SELECT custLC, id, amount FROM base" },
+        .{ .base = "base AS NOT MATERIALIZED (SELECT * FROM inv)", .left = "SELECT custLC, id, amount FROM base", .right = "SELECT custLC, id, amount FROM base" },
+        .{ .base = "base AS (SELECT * FROM inv)", .left = "SELECT custLC, id, amount FROM base", .right = "SELECT 'changed' AS custLC, id, amount FROM base" },
+        .{ .base = "base AS (SELECT * FROM inv)", .left = "SELECT custLC, id, amount FROM base", .right = "SELECT custLC, id, SUM(amount) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS amount FROM base" },
+        .{ .base = "base AS (SELECT * FROM inv), barrier AS MATERIALIZED (SELECT * FROM base)", .left = "SELECT custLC, id, amount FROM barrier", .right = "SELECT custLC, id, amount FROM base" },
+        .{ .base = "base AS (SELECT * FROM inv)", .left = "SELECT custLC, id, amount FROM base", .right = "SELECT b.custLC, b.id, other.amount FROM base b JOIN base other ON b.id = other.id" },
+    }) |case| {
+        const body = case.base ++ ", combined AS (" ++ case.left ++ " UNION ALL " ++ case.right ++
+            \\), result AS (
+            \\ SELECT *, LAG(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY id, amount) AS prior FROM combined
+            \\)
+            \\SELECT * FROM result ORDER BY custLC, id, amount, prior
+        ;
+        var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+        defer query.deinit();
+        try std.testing.expectEqual(@as(usize, 0), regional_op_count(query.cq.query, .union_all));
+        while (try query.next()) |_| {}
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
+test "keyed region: shared SQL branches retain externally consumed CTE stages" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    const ctes =
+        \\base AS (SELECT * FROM inv), combined AS (
+        \\ SELECT custLC, id, amount FROM base WHERE month <= 3
+        \\ UNION ALL SELECT custLC, id, amount * 2 AS amount FROM base WHERE month >= 3
+        \\), result AS (
+        \\ SELECT *, LAG(amount, 1, 0) OVER (PARTITION BY custLC ORDER BY id, amount) AS prior FROM combined
+        \\)
+    ;
+    inline for (.{ false, true, false }) |external| {
+        const body = ctes ++ if (external)
+            \\SELECT r.custLC, r.id, r.amount, r.prior, b.amount AS original
+            \\FROM result r JOIN base b ON r.id = b.id ORDER BY r.custLC, r.id, r.amount
+        else
+            "SELECT * FROM result ORDER BY custLC, id, amount";
+        var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+        defer query.deinit();
+        try std.testing.expectEqual(@as(usize, if (external) 0 else 1), regional_op_count(query.cq.query, .union_all));
+        while (try query.next()) |_| {}
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
 }
 
 test "keyed region: overlapping join payload names preserve the left columns" {

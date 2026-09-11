@@ -39,6 +39,7 @@ const types = @import("../types.zig");
 const udf_mod = @import("../udf.zig");
 const cte_stages = @import("cte_stages.zig");
 const aggregate_mod = @import("../exec/aggregate.zig");
+const set_union = @import("../exec/set_union.zig");
 
 const Column = types.Column;
 const Value = types.Value;
@@ -732,7 +733,8 @@ fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []cons
 /// program's — any DDL drift on the scan table declines to a full build.
 fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !exec.Query {
     const qa = input.allocator;
-    var pl = try collectPipeline(input.node_arena, anchor, ctx.keys);
+    var pl = try collectPipeline(input, anchor, ctx.keys, ctx.union_fusion);
+    if (pipeline_recipe_hash(pl.steps) != ctx.pipeline_recipe) return NoMatch;
 
     var prune_leaves: std.ArrayListUnmanaged(predicate_mod.Predicate) = .empty;
     defer prune_leaves.deinit(qa);
@@ -1287,6 +1289,8 @@ const Ctx = struct {
     opts: region.DriverOpts = undefined,
     declaration: ?DeclaredBoundary = null,
     keys: []const []const u8 = &.{},
+    pipeline_recipe: u64 = 0,
+    union_fusion: bool = false,
     /// Ordered mode: measured per-interval cost, filled by the first run
     /// and frozen — LPT weights for every later hit (arena-owned).
     iv_cost: []i64 = &.{},
@@ -1363,6 +1367,9 @@ const Builder = struct {
     /// columns on demand.
     null_sides: std.ArrayListUnmanaged(NullSide) = .empty,
     pending_nulls: std.ArrayListUnmanaged(Derived) = .empty,
+    /// A union can rename a preserved input slot. Record only value-identical
+    /// outputs so an enclosing fork can prove the same origin across arms.
+    column_origins: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Frame columns known constant (folded literal computes): groupings
     /// skip them as subkeys — a constant can't split groups.
     const_idxs: std.ArrayListUnmanaged(usize) = .empty,
@@ -1375,6 +1382,10 @@ const Builder = struct {
         }
         if (b.fb.resolve(name)) |e| return e.idx;
         return b.tryNullAppend(name);
+    }
+
+    fn column_origin(b: *const Builder, name: []const u8) []const u8 {
+        return b.column_origins.get(name) orelse name;
     }
 
     /// A ref that doesn't resolve may target one of the proven-empty join
@@ -2016,12 +2027,159 @@ const Step = union(enum) {
     window: *const ir.WindowOp,
     table_fn: *const ir.Op.TableFn,
     join: *const ir.Op.Join,
+    sql_union: SqlUnion,
     /// `base UNION ALL TVF(SELECT .. FROM base [WHERE f])` over the SAME
     /// base node: the TVF appends rows at each consolidation group's tail
     /// (fused), and its PARTITION BY / ORDER BY define the region's
     /// range/order contract. Must be the bottom-most structural step.
     union_tvf: UnionTvf,
 };
+
+const SqlUnion = struct { base: *const ir.Op, left: []const Step, right: []const Step };
+const RefCounts = std.AutoHashMapUnmanaged(*const ir.Op, u32);
+const NodeSet = std.AutoHashMapUnmanaged(*const ir.Op, void);
+
+fn graph_refs(a: Allocator, node: *const ir.Op, refs: *RefCounts, seen: *NodeSet, depth: usize) anyerror!void {
+    if (depth > 256) return NoMatch;
+    if (node.* == .materialize) {
+        const count = try refs.getOrPut(a, node);
+        if (!count.found_existing) count.value_ptr.* = 0;
+        count.value_ptr.* += 1;
+    }
+    const visited = try seen.getOrPut(a, node);
+    if (visited.found_existing) return;
+    switch (node.*) {
+        .set_union => |u| {
+            try graph_refs(a, u.left, refs, seen, depth + 1);
+            try graph_refs(a, u.right, refs, seen, depth + 1);
+        },
+        .join => |j| {
+            try graph_refs(a, j.left, refs, seen, depth + 1);
+            try graph_refs(a, j.right, refs, seen, depth + 1);
+        },
+        .table_fn => |t| for (t.inputs) |child| try graph_refs(a, child, refs, seen, depth + 1),
+        else => if (region_spine_upstream(node)) |child| try graph_refs(a, child, refs, seen, depth + 1),
+    }
+}
+
+fn union_spine(node: *const ir.Op, depth: usize) ?*const ir.Op {
+    if (depth > 32) return null;
+    if (node.* == .set_union) return shared_union_base(&node.set_union, depth + 1);
+    return region_spine_upstream(node);
+}
+
+fn shared_union_base(u: *const ir.SetUnion, depth: usize) ?*const ir.Op {
+    if (!u.all or depth > 32) return null;
+    var left = u.left;
+    for (0..128) |_| {
+        if (left.* == .materialize) {
+            var right = u.right;
+            for (0..128) |_| {
+                if (left == right) return left;
+                right = @constCast(union_spine(right, depth) orelse break);
+            }
+        }
+        left = @constCast(union_spine(left, depth) orelse break);
+    }
+    return null;
+}
+
+fn collect_branch(input: engine_v2.CompileInput, root: *const ir.Op, base: *const ir.Op, prefix: *const NodeSet, keys: []const []const u8, depth: usize) anyerror![]const Step {
+    const a = input.node_arena;
+    var steps: std.ArrayListUnmanaged(Step) = .empty;
+    var cur = root;
+    for (0..128) |_| {
+        if (cur == base) return steps.items;
+        switch (cur.*) {
+            .materialize => |m| {
+                if (m.forced) return NoMatch;
+                cur = m.upstream;
+            },
+            .select => |*p| {
+                try steps.append(a, .{ .select = p });
+                cur = p.upstream;
+            },
+            .exclude => |*p| {
+                try steps.append(a, .{ .exclude = p });
+                cur = p.upstream;
+            },
+            .compute => |c| {
+                try steps.append(a, .{ .compute = c.derived });
+                cur = c.upstream;
+            },
+            .filter => |f| {
+                try steps.append(a, .{ .filt = f.predicate });
+                cur = f.upstream;
+            },
+            .alias => |al| {
+                try steps.append(a, .{ .alias_name = al.alias });
+                cur = al.upstream;
+            },
+            .window => |*w| {
+                for (w.specs) |spec| if (!contains_keys(keys, spec.partition_by)) return NoMatch;
+                try steps.append(a, .{ .window = w });
+                cur = w.upstream;
+            },
+            .join => |*j| {
+                var refs: RefCounts = .empty;
+                var nodes: NodeSet = .empty;
+                try graph_refs(a, j.right, &refs, &nodes, 0);
+                var it = nodes.keyIterator();
+                while (it.next()) |node| if (prefix.contains(node.*)) return NoMatch;
+                try steps.append(a, .{ .join = j });
+                cur = j.left;
+            },
+            .set_union => |*u| {
+                const nested = try match_sql_union(input, cur, u, keys, depth + 1);
+                try steps.append(a, .{ .sql_union = nested });
+                cur = nested.base;
+            },
+            else => return NoMatch,
+        }
+    }
+    return NoMatch;
+}
+
+fn match_sql_union(input: engine_v2.CompileInput, root: *const ir.Op, u: *const ir.SetUnion, keys: []const []const u8, depth: usize) anyerror!SqlUnion {
+    if (depth > 16) return NoMatch;
+    const base = shared_union_base(u, 0) orelse return NoMatch;
+    const global = input.region_ref_counts orelse return NoMatch;
+    const a = input.node_arena;
+    var refs: RefCounts = .empty;
+    var nodes: NodeSet = .empty;
+    try graph_refs(a, root, &refs, &nodes, 0);
+    var it = refs.iterator();
+    while (it.next()) |ref| {
+        if (ref.key_ptr.*.materialize.forced) return NoMatch;
+        if (depth == 0) {
+            // Structural CSE can choose another representative. Decline if
+            // these raw nodes cannot prove exclusive ownership of the input.
+            const total_refs = global.get(ref.key_ptr.*) orelse return NoMatch;
+            if (total_refs > ref.value_ptr.*) return NoMatch;
+        }
+    }
+    var prefix: NodeSet = .empty;
+    var prefix_refs: RefCounts = .empty;
+    try graph_refs(a, base, &prefix_refs, &prefix, 0);
+    return .{
+        .base = base,
+        .left = try collect_branch(input, u.left, base, &prefix, keys, depth),
+        .right = try collect_branch(input, u.right, base, &prefix, keys, depth),
+    };
+}
+
+fn pipeline_recipe_hash(steps: []const Step) u64 {
+    var hash = std.hash.Wyhash.init(0x726563697065);
+    hu(&hash, steps.len);
+    for (steps) |step| {
+        hu(&hash, @intFromEnum(std.meta.activeTag(step)));
+        if (step == .sql_union) {
+            hu(&hash, pipeline_recipe_hash(step.sql_union.left));
+            hu(&hash, pipeline_recipe_hash(step.sql_union.right));
+        }
+    }
+    return hash.final();
+}
 
 const Pipeline = struct {
     /// Top-down (steps[0] nearest the anchor); dispatched in reverse.
@@ -2048,7 +2206,8 @@ fn staged_pipeline(steps: []const Step, structural_end: usize, entry_root: *cons
     };
 }
 
-fn collectPipeline(a: Allocator, anchor: *const ir.Op, keys: []const []const u8) !Pipeline {
+fn collectPipeline(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, union_fusion: bool) !Pipeline {
+    const a = input.node_arena;
     if (anchor.* != .materialize) return NoMatch;
     var steps: std.ArrayListUnmanaged(Step) = .empty;
     var cur: *const ir.Op = anchor.materialize.upstream;
@@ -2110,6 +2269,15 @@ fn collectPipeline(a: Allocator, anchor: *const ir.Op, keys: []const []const u8)
             },
             .set_union => |*u| {
                 const arm = unionTvfArm(u) orelse {
+                    if (union_fusion) {
+                        if (match_sql_union(input, cur, u, keys, 0)) |shared| {
+                            try steps.append(a, .{ .sql_union = shared });
+                            cur = shared.base;
+                            entry_root = cur;
+                            structural_end = steps.items.len;
+                            continue;
+                        } else |err| if (err == error.OutOfMemory) return err;
+                    }
                     if (!u.all or structural_end == 0) return NoMatch;
                     // Keep the entry's projections and filters in their SQL
                     // order, including positional aliases and union casts.
@@ -2315,6 +2483,14 @@ fn rename_entry_outputs(arena: Allocator, scan_schema: []const Column, derived: 
 }
 
 fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) anyerror!exec.Query {
+    var fused = false;
+    return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, true, &fused) catch |err| {
+        if (err == error.OutOfMemory or !fused) return err;
+        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, &fused);
+    };
+}
+
+fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary, union_fusion: bool, fused: *bool) anyerror!exec.Query {
     var tm: i64 = exec.prof.nowTicks();
     const registry = input.udf_registry orelse return NoMatch;
 
@@ -2351,7 +2527,13 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
 
     // Query-lifetime arena: the step list and the entry-derived slice are
     // borrowed by the operator (never by the cached ctx).
-    var pl = try collectPipeline(input.node_arena, anchor, declared_keys);
+    var pl = try collectPipeline(input, anchor, declared_keys, union_fusion);
+    for (pl.steps) |step| if (step == .sql_union) {
+        fused.* = true;
+        break;
+    };
+    ctx.pipeline_recipe = pipeline_recipe_hash(pl.steps);
+    ctx.union_fusion = union_fusion;
     traceMark("walk", &tm);
 
     // ---- entry: prune leaves + literal-pinned columns --------------------
@@ -2521,10 +2703,23 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
                         break :found;
                     }
                 },
+                .sql_union => break :found,
                 else => {},
             }
         }
     }
+    // Coarser downstream windows break ties by arrival order. A fork must
+    // concatenate whole declared-key partitions, never interleave finer ones.
+    for (pl.steps) |step| if (step == .sql_union) {
+        for (range_names) |name| {
+            if (!contains_keys(&.{name}, declared_keys) and b.pinnedName(name) == null) {
+                range_names = declared_keys;
+                order_specs = &.{};
+                break;
+            }
+        }
+        break;
+    };
     const range_keys = try a.alloc(usize, range_names.len);
     const key_names_owned = try a.alloc([]const u8, range_names.len);
     for (range_names, range_keys, key_names_owned) |n, *dst, *nm| {
@@ -2747,13 +2942,133 @@ fn dispatchStep(b: *Builder, registry: *const udf_mod.UdfRegistry, step: Step, a
         .exclude => |p| for (p.columns) |col| b.fb.removeVis(col),
         .compute => |d| try b.pushCompute(d),
         .alias_name => |nm| try b.applyAlias(nm),
-        .filt => return NoMatch, // mid-stream filters have no region op yet
+        .filt => |predicate| {
+            if (predicate == .always and predicate.always) return;
+            const cloned = try b.clonePred(predicate);
+            try b.flushPending();
+            try b.ops.append(b.a, .{ .filter = cloned });
+        },
         .group_by => |g| try pushGroupAggAuto(b, g),
         .window => |w| try dispatchWindow(b, w),
         .union_tvf => |u| try dispatchUnionTvf(b, registry, u),
         .table_fn => |t| try dispatchTvf(b, registry, t),
         .join => |j| try dispatchJoin(b, j, above),
+        .sql_union => |u| try dispatch_sql_union(b, registry, u),
     }
+}
+
+const BranchNamespace = struct {
+    frame: FrameB,
+    route_name: []const u8,
+    range_names: []const []const u8,
+    pinned: std.ArrayListUnmanaged(PinnedCol),
+    constants: std.ArrayListUnmanaged(usize),
+    null_sides: std.ArrayListUnmanaged(NullSide),
+};
+
+fn clone_list(comptime T: type, a: Allocator, source: std.ArrayListUnmanaged(T)) !std.ArrayListUnmanaged(T) {
+    const items = try a.dupe(T, source.items);
+    return .{ .items = items, .capacity = items.len };
+}
+
+fn capture_namespace(b: *Builder) !BranchNamespace {
+    return .{
+        .frame = .{
+            .a = b.a,
+            .next_id = b.fb.next_id,
+            .cols = try clone_list(Column, b.a, b.fb.cols),
+            .vis = try clone_list(VisEntry, b.a, b.fb.vis),
+        },
+        .route_name = b.route_name,
+        .range_names = b.range_key_names,
+        .pinned = try clone_list(PinnedCol, b.a, b.pinned),
+        .constants = try clone_list(usize, b.a, b.const_idxs),
+        .null_sides = try clone_list(NullSide, b.a, b.null_sides),
+    };
+}
+
+fn restore_namespace(b: *Builder, saved: BranchNamespace) !void {
+    const next_id = b.fb.next_id;
+    b.fb = saved.frame;
+    b.fb.cols = try clone_list(Column, b.a, saved.frame.cols);
+    b.fb.vis = try clone_list(VisEntry, b.a, saved.frame.vis);
+    b.fb.next_id = next_id;
+    b.route_name = saved.route_name;
+    b.range_key_names = saved.range_names;
+    b.pinned = try clone_list(PinnedCol, b.a, saved.pinned);
+    b.const_idxs = try clone_list(usize, b.a, saved.constants);
+    b.null_sides = try clone_list(NullSide, b.a, saved.null_sides);
+}
+
+fn dispatch_branch(b: *Builder, registry: *const udf_mod.UdfRegistry, steps: []const Step) anyerror!void {
+    var i = steps.len;
+    while (i > 0) {
+        i -= 1;
+        try dispatchStep(b, registry, steps[i], steps[0..i]);
+    }
+    try b.flushPending();
+}
+
+fn dispatch_sql_union(b: *Builder, registry: *const udf_mod.UdfRegistry, u: SqlUnion) anyerror!void {
+    try b.flushPending();
+    const base = try capture_namespace(b);
+    const saved_base = b.ops.items.len;
+    try b.ops.append(b.a, .save_frame);
+    try dispatch_branch(b, registry, u.left);
+    const left = try capture_namespace(b);
+    const saved_left = b.ops.items.len;
+    try b.ops.append(b.a, .save_frame);
+    try b.ops.append(b.a, .{ .restore_frame = saved_base });
+    try restore_namespace(b, base);
+    try dispatch_branch(b, registry, u.right);
+    if (left.frame.vis.items.len != b.fb.vis.items.len) return NoMatch;
+
+    const count = left.frame.vis.items.len;
+    const left_cols = try b.a.alloc(usize, count);
+    const right_cols = try b.a.alloc(usize, count);
+    const names = try b.a.alloc([]const u8, count);
+    var output = FrameB{ .a = b.a, .next_id = b.fb.next_id };
+    for (left.frame.vis.items, b.fb.vis.items, left_cols, right_cols, names) |l, r, *lc, *rc, *name| {
+        lc.* = l.idx;
+        rc.* = r.idx;
+        const plan = try set_union.plan_column(left.frame.cols.items[l.idx], b.fb.cols.items[r.idx]);
+        const idx = try output.addCol(l.name, plan.column.type, plan.column.nullable);
+        name.* = output.cols.items[idx].name;
+        const left_origin = b.column_origin(left.frame.cols.items[l.idx].name);
+        const right_origin = b.column_origin(b.fb.cols.items[r.idx].name);
+        if (plan.left_cast == null and plan.right_cast == null and std.mem.eql(u8, left_origin, right_origin)) {
+            try b.column_origins.put(b.a, name.*, left_origin);
+        }
+        try output.setVis(l.name, idx);
+    }
+    const range_names = try b.a.alloc([]const u8, base.range_names.len);
+    var route: ?[]const u8 = null;
+    for (base.range_names, range_names) |key, *new_key| {
+        const original = base.frame.resolve(key) orelse return NoMatch;
+        const physical = base.frame.cols.items[original.idx].name;
+        const origin = b.column_origin(physical);
+        var position: ?usize = null;
+        for (left_cols, 0..) |column, i| {
+            if (std.mem.eql(u8, b.column_origin(left.frame.cols.items[column].name), origin)) {
+                if (position == null) position = i;
+                if (std.ascii.eqlIgnoreCase(lastSegment(left.frame.vis.items[i].name), lastSegment(key))) {
+                    position = i;
+                    break;
+                }
+            }
+        }
+        const i = position orelse return NoMatch;
+        if (!std.mem.eql(u8, b.column_origin(b.fb.cols.items[right_cols[i]].name), origin)) return NoMatch;
+        new_key.* = output.vis.items[i].name;
+        if (std.mem.eql(u8, physical, base.route_name)) route = output.cols.items[i].name;
+    }
+    b.route_name = route orelse return NoMatch;
+    try b.ops.append(b.a, .{ .union_all = .{ .left = saved_left, .left_cols = left_cols, .right_cols = right_cols, .names = names } });
+    b.fb = output;
+    b.range_key_names = range_names;
+    b.pinned = .empty;
+    b.const_idxs = .empty;
+    b.null_sides = .empty;
 }
 
 /// Column names the remaining (not-yet-dispatched) steps can reference —
@@ -2793,7 +3108,7 @@ fn liveNamesAbove(a: Allocator, steps: []const Step) !?[]const []const u8 {
                 }
             },
             .join => |j| for (j.on) |pair| try out.append(a, pair.left),
-            .table_fn, .union_tvf => return null,
+            .table_fn, .union_tvf, .sql_union => return null,
         }
     }
     if (!any_select) return null; // without a projection, anything may emit
@@ -2858,6 +3173,7 @@ fn liveNamesBounded(a: Allocator, steps: []const Step) !?[]const []const u8 {
                 try tvfRefNames(a, u.tvf, &out);
                 if (u.input_filter) |f| try predColNames(a, f, &out);
             },
+            .sql_union => return null,
         }
     }
     return null; // no closing step below the anchor — keep everything
