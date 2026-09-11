@@ -1,5 +1,54 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### DOP 12 rerun of all thinDB arms (2026-09-11)
+
+Reran all four thinDB arms for both companies and all 15 variants on
+starrocks1, using the same 7b99d27 ReleaseFast binary, private snapshot on
+13311, archived query generator/dates, and hash buckets a/b/c. Only DOP
+changed from 4 to 12: block cache 2 GiB, region pool 4 GiB, shared/query
+budgets 16 GiB, service ceiling 20 GiB. Every arm received a fresh service,
+one warmup, three measured queries, and one untimed fingerprint query.
+Timed final row packets were drained without Node value decoding.
+StarRocks was not rerun; its preceding results are retained in the matrix.
+
+Sums of the fifteen query medians, seconds, shown as DOP 4 -> DOP 12:
+
+| Dataset | SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|
+| Sierra | 11.21 -> 12.34 | 16.62 -> 19.46 | 3.95 -> 5.14 | 1.58 -> 2.16 |
+| AirDNA | 54.81 -> 44.40 | 57.72 -> 49.00 | 42.95 -> 34.64 | 15.22 -> 12.24 |
+
+DOP 12 reduced AirDNA totals by 15-20%, but increased Sierra totals by
+10-37%. SQL+regions still lost to ordinary SQL in 23/30 cases. UDF+regions
+remained fastest in 29/30 cases; Sierra FX-average favored unkeyed UDF.
+All keyed arms engaged regions, all timed keyed traces used the requested
+DOP, and none used the new fused SQL union opcode. AirDNA expanded-cross
+UDF+regions improved from 985 to 674 ms; its shard phase roughly halved,
+while scan/scatter was nearly unchanged. Sierra's smaller scans paid more
+overhead at DOP 12. Trace comparisons are saved with the reports.
+
+All 480 new warmup/timing queries and 120 fingerprint queries succeeded.
+All 60 keyed/unkeyed fingerprint pairs matched at DOP 12. Cross-DOP raw
+fingerprints matched in 116/120 arms. Both SQL arms in the two AirDNA detail
+variants differed across DOP; the UDF arms matched. A separate untimed
+rerun of the identical saved SQL reproduced all four SQL fingerprints.
+Comparing every row isolated differences to exchangeRate/lastExchangeRate:
+94 detail-simple rows (maximum absolute difference 3e-16) and 288 detail-cross
+rows (7e-16). All other fields, including monetary amounts, matched exactly.
+This is not bitwise cross-DOP equivalence; no normalization was applied to
+the recorded fingerprints.
+
+The 120 benchmark services peaked at 17.23 GiB with zero memory-limit/OOM
+events. The benchmark and subsequent comparison services were stopped;
+13311 was released. Production retained PID 2579063 and zero restarts,
+and CDC remained RUNNING. No engine changes or deployment occurred.
+
+Full matrix, DOP comparison CSV, stage traces, validation details and health
+receipts: `.bench-data/five-arm-7b99d27-dop12/`, mirrored under
+`/home/ubuntu/wayroll-bench/five-arm-7b99d27-dop12` on starrocks1.
+The separate row-comparison harness and compressed packet captures are in
+`/home/ubuntu/wayroll-bench/dop-detail-check-7b99d27`.
+
 ### Full five-arm rollforward rerun (2026-09-11)
 
 Engine commit `7b99d27`, Linux ReleaseFast, ran on starrocks1 localhost
