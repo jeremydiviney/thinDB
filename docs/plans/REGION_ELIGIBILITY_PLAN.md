@@ -1,5 +1,71 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Sierra full five-arm sweep after fusion fix (2026-09-11)
+
+Reran all 15 Sierra variants and all five arms using engine d29f5f1.
+StarRocks timings are fresh. Clients ran locally on starrocks1: ThinDB
+used the private snapshot on 13311; StarRocks read live data on 9030.
+Hash buckets a/b/c, archived b5359d9e generator and per-case dates, DOP 12
+for ThinDB, cache/pool 2/4 GiB, shared/query budgets 16 GiB and service
+ceiling 20 GiB. Each ThinDB arm used a fresh service, one warmup, three
+measured queries and one untimed fingerprint query. Final row packets were
+discarded without Node value decoding. Startup/teardown/validation are
+outside timing; application query generation/setup remains inside.
+
+Median milliseconds:
+
+| Variant | StarRocks SQL | ThinDB SQL | SQL + regions | Zig UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| base simple | 485 | 360 | 214 | 218 | 112 |
+| base cross | 532 | 713 | 553 | 387 | 125 |
+| expanded simple | 1,721 | 1,007 | 240 | 441 | 112 |
+| expanded cross | 1,986 | 1,762 | 1,943 | 886 | 163 |
+| child simple | 478 | 368 | 220 | 201 | 113 |
+| child cross | 530 | 679 | 531 | 408 | 182 |
+| interval quarter | 451 | 458 | 266 | 216 | 159 |
+| interval annual | 446 | 377 | 230 | 208 | 121 |
+| fx latest | 591 | 368 | 220 | 151 | 140 |
+| fx average | 599 | 360 | 226 | 159 | 183 |
+| noest simple | 222 | 477 | 317 | 199 | 114 |
+| plans simple | 674 | 767 | 91 | 124 | 99 |
+| crossplans | 755 | 1,199 | 1,098 | 185 | 136 |
+| detail simple | 468 | 448 | 247 | 229 | 114 |
+| detail cross | 624 | 1,030 | 848 | 506 | 215 |
+
+Sums of the fifteen medians (seconds): SR 10.56; SQL 10.37; SQL + regions
+7.24; UDF 4.51; UDF + regions 2.09. SQL + regions is faster than ordinary
+SQL in 14/15 variants, versus 4/15 in the preceding DOP 12 sweep. Its total
+fell from 19.46 to 7.24 seconds; ordinary SQL also fell from 12.34 to 10.37
+seconds. These are successive full-suite runs on a shared host; the separate
+matched saved-SQL controls isolate the preparation defect more directly.
+
+Expanded cross remains the SQL-region exception: 1,943 versus 1,762 ms.
+UDF + regions beats SR in all 15 cases and is fastest in 13/15. The other
+winners are unkeyed UDF for FX average (159 versus 183 ms), and SQL +
+regions for plans simple (91 versus 99 ms for UDF + regions).
+
+All 300 accepted warmup/timing queries and 60 validation queries completed
+without query errors. All 30 keyed/unkeyed fingerprint pairs match, all
+60 ThinDB fingerprints match the preceding DOP 12 run, and result counts
+agree across all five arms. All keyed arms engaged regions at DOP 12;
+unkeyed arms did not. Saved SQL verifies the UDF/declaration switches for
+each arm. Expensive rejected fusion attempts: zero across the entire sweep.
+
+Startup headroom checks interrupted the run after seven variants; completed
+cases were retained and an incomplete annual-case attempt was archived and
+excluded before rerunning that case. The unused-memory startup requirement
+was reduced from 12 to 10 GiB, based on the preceding Sierra sweep peak of
+4.72 GiB. Service/query/cache/DOP limits stayed unchanged. The final 60
+accepted services peaked at 4.98 GiB with zero memory-limit/OOM events.
+Production PID 2579063 and zero restarts were unchanged; CDC stayed RUNNING.
+The candidate stopped and 13311 was released. No production deployment.
+
+Full table, comparison CSV, raw SQL/traces, fingerprint and memory audits,
+health checks and build provenance: `.bench-data/five-arm-d29f5f1-sierra-dop12/`
+(mirrored under `/home/ubuntu/wayroll-bench/five-arm-d29f5f1-sierra-dop12`).
+Portable bundle: `sierra-results.tgz`. `benchmark-report.md`, `timings.csv`,
+`before-after.csv` and `matrix.json` contain the accepted results.
+
 ### Reject unsupported SQL fusion before preparation (2026-09-11)
 
 The general fix checks branch join eligibility during collection, before
