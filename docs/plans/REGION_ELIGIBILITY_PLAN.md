@@ -1,5 +1,69 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### UNION experiment and prerequisite correctness fixes (2026-09-10)
+
+Current branch: `region-payload-and-cache-correctness`, engine commit
+`d4b66ca`. The general UNION-branch discovery experiment is preserved on
+`keyed-sql-union-coverage` at `62eedfe`; it is excluded from the current
+branch because the additional region boundaries regress the full-SQL FX
+workload. No changes from this round were deployed to production.
+
+The experiment exposed three general engine defects, now repaired:
+
+- Region column movement omitted Boolean and UUID payloads. Typed movement
+  now covers every stored payload type, preserving NULL validity and memory
+  accounting.
+- Right join payloads could overwrite same-named left columns. Table/CTE
+  qualifiers and explicit scan aliases now remain distinct. Selected right
+  keys preserve their values and NULLs, including an empty build side.
+- Deleting only persisted rows did not invalidate cached lookup results.
+  Table versions now include tombstone generation and cache UID, covering
+  segment-only deletes and table recreation.
+
+Programs that fold entirely to emission also decline regional execution:
+there is no shard-local work to amortize the exchange and consolidation.
+The existing mixed-width join-key output-type issue below remains separate;
+the new namespace regression uses matching key types and different payload
+types to isolate the binding defect.
+
+The fixes passed the full test suite (1,481 passed, five existing skips),
+`zig build bench`, and a Linux ReleaseFast distribution build. Snapshot
+validation passed all 24 checks comparing repeated raw-row fingerprints and
+row counts for SQL, SQL+regions and UDF+regions across Sierra/AirDNA monthly,
+FX latest and FX average. The experiment separately passed those checks and
+comparisons through all 39 Sierra CTEs after its correctness repairs.
+
+Median milliseconds, one warmup and five samples, three hash buckets a/b/c,
+on starrocks1 localhost against the private snapshot on port 13311. DOP 4,
+2 GiB block cache, 4 GiB retained-region budget, 20 GiB cgroup maximum; final
+packets discarded without Node value decoding. The baseline was refreshed
+immediately before the fixes run; the experiment ran earlier on the same
+shared host. Small differences are not established performance changes.
+
+| Dataset / variant | SQL+regions baseline | Fixes | UNION experiment | UDF+regions baseline | Fixes | UNION experiment |
+|---|---:|---:|---:|---:|---:|---:|
+| Sierra monthly | 213 | 211 | 185 | 95 | 83 | 83 |
+| Sierra FX latest | 233 | 220 | 403 | 112 | 118 | 170 |
+| Sierra FX average | 210 | 231 | 399 | 121 | 134 | 138 |
+| AirDNA monthly | 1,980 | 2,033 | 2,269 | 645 | 685 | 657 |
+| AirDNA FX latest | 2,017 | 1,982 | 3,786 | 1,169 | 1,214 | 1,288 |
+| AirDNA FX average | 1,952 | 2,041 | 3,500 | 1,268 | 1,186 | 1,195 |
+
+Next: preserve a shared input once and fuse compatible split/UNION/rejoin
+work within a region. Merely discovering additional independent regions
+adds materialization, repeated preparation, and exchanges. Start with a
+generic window/union/dimension-join regression requiring one exchange across
+the compatible fork, while preserving union casts, duplicates, NULLs,
+shared/forced CTE semantics and window ties. Then retry FX. Final aggregation,
+global sort and MySQL output remain later targets.
+
+Evidence: `.bench-data/keyed-union-coverage/final/report.md` and the matching
+directory on starrocks1 under `/home/ubuntu/wayroll-bench/`. The final candidate
+peaked at 11.06 GiB with no pressure/OOM event and was stopped. Production
+remained at PID 2579063, zero automatic restarts; CDC stayed RUNNING with
+37,413 completed checkpoints. This is a targeted comparison, not a new
+full five-arm or StarRocks sweep.
+
 ### Preserve routed keys across frame replacements (2026-09-10)
 
 Engine commit `bdec8da` fixes the physical route-key identity lost when a
