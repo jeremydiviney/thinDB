@@ -17,6 +17,7 @@ const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
 const errors = @import("errors.zig");
 const wire_format = @import("../wire_format.zig");
+const prof = @import("../../util/prof.zig");
 
 pub const MYSQL_TYPE_TINY: u8 = 0x01;
 pub const MYSQL_TYPE_SHORT: u8 = 0x02;
@@ -247,13 +248,16 @@ pub fn sendQueryResultStatus(
         // packet rather than dropping the connection — the column defs are
         // already on the wire, and MySQL clients accept an ERR packet in
         // place of the terminating EOF/OK.
+        const next_start = if (prof.enabled) prof.nowTicks() else 0;
         const maybe_batch = query.next() catch |err| {
             const mapped = errors.mapInternal(err, null);
             try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
             seq_id.* +%= 1;
             return;
         };
+        if (prof.enabled) prof.addPhase("mysql.text.next", @intCast(@max(0, prof.nowTicks() - next_start)));
         const batch = maybe_batch orelse break;
+        const write_start = if (prof.enabled) prof.nowTicks() else 0;
         var r: usize = 0;
         while (r < batch.row_count) : (r += 1) {
             row_payload.clearRetainingCapacity();
@@ -268,6 +272,7 @@ pub fn sendQueryResultStatus(
             try packet.writePacket(w, seq_id.*, row_payload.items);
             seq_id.* +%= 1;
         }
+        if (prof.enabled) prof.addPhase("mysql.text.encode_write", @intCast(@max(0, prof.nowTicks() - write_start)));
     }
 
     try sendResultTerminatorStatus(allocator, w, seq_id, client_caps, extra_status);
