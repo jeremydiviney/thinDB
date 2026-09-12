@@ -119,6 +119,9 @@ pub const Server = struct {
         const stream = try self.listener.accept(self.io);
         defer stream.close(self.io);
 
+        // A buffered result can end in a short TCP segment; Nagle otherwise
+        // holds it until the client's delayed ACK, even after the final flush.
+        _ = sock_opts.enable_tcp_no_delay(stream.socket.handle);
         _ = sock_opts.enableKeepalive(stream.socket.handle);
         if (self.idle_timeout_secs > 0) {
             _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);
@@ -146,6 +149,7 @@ pub const Server = struct {
                 std.debug.print("mysql: accept error: {s}\n", .{@errorName(err)});
                 continue;
             };
+            _ = sock_opts.enable_tcp_no_delay(stream.socket.handle);
             _ = sock_opts.enableKeepalive(stream.socket.handle);
             if (self.idle_timeout_secs > 0) {
                 _ = sock_opts.setReadTimeoutSeconds(stream.socket.handle, self.idle_timeout_secs);

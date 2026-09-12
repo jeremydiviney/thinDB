@@ -1713,6 +1713,10 @@ pub const Join = struct {
         while (true) {
             switch (self.phase) {
                 .building => {
+                    if (self.probe_fused and try self.empty_fused_probe()) {
+                        self.finishPhase();
+                        return null;
+                    }
                     // Empty-probe short-circuit: a non-FULL join whose
                     // probe (preserved) side is empty produces nothing, so
                     // skip building the other side entirely. Gated off when
@@ -1825,6 +1829,25 @@ pub const Join = struct {
     // Build phase: drain the build side, materialize into
     // build_columns, populate the hash table.
     // -----------------------------------------------------------------
+
+    fn empty_fused_probe(self: *Join) anyerror!bool {
+        if (self.join_type == .full) return false;
+        var query = if (self.build_is_left) self.right else self.left;
+        while (true) {
+            if (exec.queryAs(exec.Filter, query)) |filter| {
+                if (try filter.empty_stage_probe()) return true;
+                query = filter.upstream;
+            } else if (exec.queryAs(exec.Compute, query)) |compute| {
+                query = compute.upstream;
+            } else if (exec.queryAs(exec.Project, query)) |project| {
+                query = project.upstream;
+            } else if (exec.queryAs(exec.AliasRename, query)) |alias| {
+                query = alias.upstream;
+            } else if (exec.queryAs(Join, query)) |join| {
+                return join.empty_fused_probe();
+            } else return false;
+        }
+    }
 
     /// Derive per-key-column [min, max] over the finished build side and
     /// offer them to the probe subtree as prune hints. Each column's range

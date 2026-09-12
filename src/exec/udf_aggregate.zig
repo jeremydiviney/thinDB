@@ -225,7 +225,7 @@ pub const UdfAggregate = struct {
     }
 
     pub fn addPrune(self: *UdfAggregate, pred: exec.Predicate) !void {
-        try self.upstream.addPrune(pred);
+        return exec.aggregate_op.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
     }
 
     pub fn stats(self: *UdfAggregate) exec.PipelineStats {

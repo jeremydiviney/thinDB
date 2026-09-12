@@ -7,6 +7,59 @@ Snapshot of `zig build bench -Doptimize=ReleaseFast` results, captured for refer
 
 To regenerate: `zig build bench` (always built ReleaseFast regardless of `-Doptimize`).
 
+## Ordinary SQL against StarRocks (2026-09-11)
+
+The [Sierra diagnosis](bench/ordinary_sql_diagnosis.md) records explicit DOP 12/16
+comparisons, separate operator profiles, result validation and socket controls.
+The main findings are unnecessary empty/selective lookup work, repeated lookup
+construction and a confirmed delayed-ACK/Nagle response tail. It includes the
+full timing ranges and separates reproducible costs from unstable rankings.
+
+The [implementation results](bench/ordinary_sql_diagnosis.md#engine-implementation-2026-09-12-utc)
+verify qualified scan pruning, empty fused-probe short-circuiting and POSIX MySQL
+TCP_NODELAY. At DOP 12, median empty-plan latency drops from 805 to 68 ms,
+crossplans from 1,304 to 478 ms, and no-estimates from 489 to 410 ms. DOP 16
+confirms the large plan-query gains; cross-query timing variation and remaining
+lookup/window costs are documented. The final source passes 1,501 tests and the
+ReleaseFast benchmark suite, with all nine final SQL fingerprints preserved.
+
+The [fresh September 12 sweep](bench/ordinary_sql_sweep_20260912.md) reruns all nine
+cases against StarRocks at both DOPs using the application harness. ThinDB has the
+lower median in five cases at each DOP. No-estimates remains about 2× slower;
+base, child and detail cross remain 15–25% slower. All values are validated,
+including the known DATE/DATETIME normalization for detail-cross. The report
+retains full ranges and links to all 180 measured samples.
+
+The [no-estimates follow-up](bench/ordinary_sql_diagnosis.md#no-estimates-follow-up-and-column-pruning-fix-2026-09-12-utc)
+fixes the remaining wide lookup scans through query-block column pruning.
+Unchanged no-estimates SQL now measures 141/143 ms at DOP 12/16 versus
+StarRocks at 214/212 ms; base-simple improves to 157/151 ms. All nine cases
+retain their fingerprints at both DOPs. The final build passes 1,503 tests
+(five existing skips) and the ReleaseFast benchmark suite.
+
+The [full five-method Sierra/AirDNA sweep](bench/rollforward_five_arm_sweep_20260912.md)
+reruns all 30 variants at matched DOP 12, with fresh StarRocks timings and five
+measurements per cell. Ordinary SQL has a lower median in all 30 cases;
+UDF + regions is lowest in 27. All 120 ThinDB fingerprints match the archive,
+and all 60 keyed/unkeyed pairs match. The report records AirDNA's live-versus-
+snapshot differences, full ranges, source counts and every sample.
+
+## Full local ClickBench (2026-09-12)
+
+The [43-query DOP-12 run](bench/clickbench/CLICKBENCH_DOP12_20260912.md) completes
+the full 99,997,497-row dataset on the local Ryzen 9900X. Three executions per
+query use a fresh server per query, with hot time taken from the faster of
+runs two and three. With an 8 GiB cache and 16 GiB query/shared budgets, the
+sum of hot times is 19.296 seconds; peak working set is 24.571 GiB.
+
+The closest common AMD x86 leaderboard tier, c6a.4xlarge, reports ClickHouse
+18.150 s, DuckDB 26.252 s, StarRocks 44.467 s and Umbra 8.097 s. These are
+cross-hardware references, not DOP-matched rankings: the published machines
+have eight physical cores and 32 GiB RAM. The full report includes source
+links, every query, the leaderboard-style geometric ratios and configuration
+differences. Q28/Q29 use octet_length to preserve the canonical byte-length
+semantics. No engine source was changed for this run.
+
 ## SQL window regions (2026-09-10)
 
 `zig build bench-regions` compares ordinary and explicitly keyed SQL over

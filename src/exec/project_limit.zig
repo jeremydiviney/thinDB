@@ -150,7 +150,11 @@ pub const Project = struct {
     }
 
     pub fn addPrune(self: *Project, pred: Predicate) !void {
-        return self.upstream.addPrune(pred);
+        if (self.probe_fused) return;
+        const idx = types.findColumn(self.output_schema, pred.col) orelse return Error.ColumnNotFound;
+        var rewritten = pred;
+        rewritten.col = self.upstream.outputSchema()[self.column_map[idx]].name;
+        return self.upstream.addPrune(rewritten);
     }
 
     /// Pure view remap — data buffers are the upstream's.
@@ -387,9 +391,9 @@ pub const Project = struct {
     pub fn tryFuseFilter(self: *Project, expr: exec.predicate.PredicateExpr) !bool {
         if (self.probe_fused) return false;
         const up_schema = self.upstream.outputSchema();
-        for (self.output_schema, self.column_map) |out, src| {
+        for (self.output_schema, self.column_map, 0..) |out, src, idx| {
             if (types.columnNameEql(out.name, up_schema[src].name)) continue;
-            if (exec.predicate.touchesColumn(expr, out.name)) return false;
+            if (exec.predicate.touches_resolved_column(expr, self.output_schema, idx)) return false;
         }
         return self.upstream.tryFuseFilter(expr);
     }
@@ -511,9 +515,8 @@ pub const Limit = struct {
         return self.upstream.outputSchema();
     }
 
-    pub fn addPrune(self: *Limit, pred: Predicate) !void {
-        return self.upstream.addPrune(pred);
-    }
+    // Removing input rows changes which rows fall inside the limit.
+    pub fn addPrune(_: *Limit, _: Predicate) !void {}
 
     /// Limit clamps row count to `min(n, upstream.upper)`. Sort state
     /// preserved (Limit just truncates, doesn't reorder). Per-column ndv

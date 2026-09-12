@@ -6,6 +6,10 @@ denormalized table (`hits`), 43 standard queries, and a public
 leaderboard comparing DuckDB / ClickHouse / StarRocks / Snowflake /
 Umbra etc.
 
+Latest complete run: [September 12, 2026, DOP 12](CLICKBENCH_DOP12_20260912.md),
+covering all 43 queries on 99,997,497 rows with published comparison sources,
+all timings, result captures and process/memory receipts.
+
 ## Layout
 
 - `schema.zig` — the 105-column `hits` table definition (mirrors the

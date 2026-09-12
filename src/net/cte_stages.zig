@@ -446,6 +446,10 @@ fn blockSource(op: *const ir.Op) BlockSource {
 threadlocal var compile_block_depth: usize = 0;
 
 pub fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
+    return compile_block_with_root(input, op, map, op);
+}
+
+fn compile_block_with_root(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
     // Recursion guard: a compile that nests blocks this deep is either a
     // pathological plan or a walk cycle — fail the query instead of
     // silently smashing the stack (Windows kills without a trace). The
@@ -464,7 +468,7 @@ pub fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
         // pg_catalog virtual tables are in-memory metadata batches, not
         // columnar scans — they build generically like the other leaves.
         .table => if (blockScanIsPgCatalog(input, op))
-            buildGenericBlock(input, op, map, op)
+            buildGenericBlock(input, op, map, block_root)
         else blk: {
             const t_leaf = exec.prof.nowTicks();
             defer exec.prof.addPhase("compile.select_block", @intCast(exec.prof.nowTicks() - t_leaf));
@@ -475,7 +479,7 @@ pub fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
         // SingleRow / FileScan leaves. The heavy inputs were already produced
         // by upstream stage handlers or stream in from table-backed child
         // blocks; single-row and file leaves are not perf shapes.
-        .leaf, .mat, .join, .window, .set_union, .table_fn => buildGenericBlock(input, op, map, op),
+        .leaf, .mat, .join, .window, .set_union, .table_fn => buildGenericBlock(input, op, map, block_root),
         .unsupported => error.UnsupportedQueryShape,
     };
 }
@@ -485,31 +489,41 @@ pub fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
 /// compiles with the alias stripped (the V2 matchers decline aliased scans)
 /// and re-qualifies its output names through AliasRename so ON pairs and
 /// self-joins disambiguate — the same shape the legacy engine builds.
-fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, is_probe: bool) anyerror!exec.Query {
+fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, is_probe: bool, block_root: *const ir.Op) anyerror!exec.Query {
     if (op.* == .scan) {
         if (try tryPgCatalogLeaf(input, op.scan)) |q| return q;
+        const leaf_names = local.join_leaf_input_names(input.allocator, block_root, op);
+        defer if (leaf_names) |names| input.allocator.free(names);
+        var leaf_input = input;
+        if (leaf_names) |names| leaf_input.prune_names = names;
         if (op.scan.alias) |alias| {
             const stripped = try input.node_arena.create(ir.Op);
             stripped.* = op.*;
             stripped.scan.alias = null;
             const t_leaf2 = exec.prof.nowTicks();
-            var q = try engine_v2.compileSelectBlock(input, stripped);
+            var q = try engine_v2.compileSelectBlock(leaf_input, stripped);
             exec.prof.addPhase("compile.select_block", @intCast(exec.prof.nowTicks() - t_leaf2));
             errdefer q.deinit();
             return exec.AliasRename.create(input.allocator, q, alias);
         }
+        return compileBlock(leaf_input, op, map);
     }
+    if (op.* == .join) return compile_block_with_root(input, op, map, block_root);
     // A single-table child whose aliased scan is wrapped (e.g. a derived ON
     // key `lower(l.tag)` puts a Compute above the scan): the alias is no
     // longer the direct child, so strip it from the bottom scan, compile the
     // whole block bare, and re-qualify its output through one AliasRename.
     // A multi-table (join-bottomed) child returns null here — its leaf scans
     // qualify themselves through their own compileJoinChild calls.
-    if (singleAliasedScanAlias(op)) |alias| {
+    if (single_aliased_scan(op)) |scan| {
+        const leaf_names = local.join_leaf_input_names(input.allocator, block_root, scan);
+        defer if (leaf_names) |names| input.allocator.free(names);
+        var leaf_input = input;
+        if (leaf_names) |names| leaf_input.prune_names = names;
         const stripped = try cloneStrippedScanAlias(input.node_arena, op);
-        var q = try compileBlock(input, stripped, map);
+        var q = try compileBlock(leaf_input, stripped, map);
         errdefer q.deinit();
-        return exec.AliasRename.create(input.allocator, q, alias);
+        return exec.AliasRename.create(input.allocator, q, scan.scan.alias.?);
     }
     // A probe-side join child that is a streaming chain over one stage —
     // even with no per-row work, and seeing through single-ref inline
@@ -530,14 +544,12 @@ fn compileJoinChild(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stage
     return compileBlock(input, op, map);
 }
 
-/// If `op` is a single-table block whose bottom is an aliased scan, return
-/// that alias; null when it bottoms out in a join (multi-table) or an
-/// unaliased / non-scan leaf.
-fn singleAliasedScanAlias(op: *const ir.Op) ?[]const u8 {
+/// Only a filter/compute chain preserves this scan's column-name scope.
+fn single_aliased_scan(op: *const ir.Op) ?*const ir.Op {
     var cur = op;
     while (true) {
         switch (cur.*) {
-            .scan => |s| return s.alias,
+            .scan => |s| return if (s.alias != null) cur else null,
             .compute => |c| cur = c.upstream,
             .filter => |f| cur = f.upstream,
             else => return null,
@@ -1361,7 +1373,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             if (f.upstream.* == .join) {
                 const t_op = exec.prof.nowTicks();
                 defer exec.prof.addPhase("compile.op.filtered_join_incl", @intCast(exec.prof.nowTicks() - t_op));
-                return compileFilteredJoin(input, f.predicate, f.upstream, map);
+                return compileFilteredJoin(input, f.predicate, f.upstream, map, block_root);
             }
             var up = try buildGenericBlock(input, f.upstream, map, block_root);
             errdefer up.deinit();
@@ -1685,9 +1697,9 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // EITHER child may end up the probe — both take the parallel
             // probe route (a deferred leaf that becomes the build side just
             // drains in parallel; small dims decline via the stage row gate).
-            var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner);
+            var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner, block_root);
             errdefer left.deinit();
-            const right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner);
+            const right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner, block_root);
             markJoinBuildContiguous(input, j.join_type, left, right);
             const t_join = exec.prof.nowTicks();
             const jq = try left.join(right, joinSpecOf(j, input.force_ordered));
@@ -2300,14 +2312,15 @@ fn compileFilteredJoin(
     pred: PredicateExpr,
     join_op: *const ir.Op,
     map: *StageMap,
+    block_root: *const ir.Op,
 ) anyerror!exec.Query {
     const j = join_op.join;
     const allocator = input.allocator;
 
-    var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner);
+    var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner, block_root);
     var left_owned = true;
     errdefer if (left_owned) left.deinit();
-    var right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner);
+    var right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner, block_root);
     var right_owned = true;
     errdefer if (right_owned) right.deinit();
 

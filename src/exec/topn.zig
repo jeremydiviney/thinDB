@@ -197,9 +197,8 @@ pub const TopN = struct {
         return self.schema;
     }
 
-    pub fn addPrune(self: *TopN, pred: Predicate) !void {
-        return self.upstream.addPrune(pred);
-    }
+    // A predicate above TopN cannot change the set being ranked.
+    pub fn addPrune(_: *TopN, _: Predicate) !void {}
 
     /// Top-N output is globally sorted on its keys (in `sort_desc`
     /// directions) — it sorts the kept window before emitting.
