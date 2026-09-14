@@ -1482,6 +1482,34 @@ pub fn InlineSlotTable(comptime KeyW: type, comptime StateT: type) type {
     };
 }
 
+/// Allocation forecast, never a bound on how many groups may be inserted.
+/// Use the observed joint-key density rather than multiplying marginal NDVs.
+/// Weighted partial rows count as the source rows they represent. A changing
+/// distribution can exceed the forecast; callers must still grow normally.
+pub fn observed_group_reservation(expected: usize, input_rows: u64, groups: usize, observed_rows: u64, additional: usize) usize {
+    const need = groups + additional;
+    if (observed_rows == 0) return need;
+    // Leave 25% headroom for variation between the observed prefix and the
+    // rest of the input. Wide arithmetic keeps large row-count hints safe.
+    const numerator = @as(u128, input_rows) * groups *| 5;
+    const denominator = @as(u128, observed_rows) * 4;
+    const estimate = numerator / denominator + @intFromBool(numerator % denominator != 0);
+    const forecast: usize = @intCast(@min(@as(u128, expected), estimate));
+    return @max(need, forecast);
+}
+
+test "group reservation follows observed density without limiting insertion" {
+    const cases = .{
+        .{ .expected = 1_000_000, .input = 1_000_000, .groups = 0, .observed = 0, .additional = 256, .want = 256 },
+        .{ .expected = 1_000_000, .input = 1_000_000, .groups = 250, .observed = 1000, .additional = 256, .want = 312_500 },
+        .{ .expected = 1_000_000, .input = 1_000_000, .groups = 900, .observed = 1000, .additional = 256, .want = 1_000_000 },
+        .{ .expected = 1000, .input = 1_000_000, .groups = 250, .observed = 1000, .additional = 256, .want = 1000 },
+        .{ .expected = 16, .input = 16, .groups = 250, .observed = 1000, .additional = 256, .want = 506 },
+        .{ .expected = 10, .input = std.math.maxInt(u64), .groups = 250, .observed = std.math.maxInt(u64), .additional = 256, .want = 506 },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(@as(usize, c.want), observed_group_reservation(c.expected, c.input, c.groups, c.observed, c.additional));
+}
+
 /// Smallest power-of-two capacity that holds `expected` entries under the 0.75
 /// load factor, floored at 16. `expected * 4 / 3` is the minimum live-capacity;
 /// round it up to the next power of two.

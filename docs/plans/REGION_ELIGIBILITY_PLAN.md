@@ -1,5 +1,433 @@
 # Keyed Regions — eligibility round (hand-off)
 
+### Sierra full five-arm sweep after fusion fix (2026-09-11)
+
+Reran all 15 Sierra variants and all five arms using engine d29f5f1.
+StarRocks timings are fresh. Clients ran locally on starrocks1: ThinDB
+used the private snapshot on 13311; StarRocks read live data on 9030.
+Hash buckets a/b/c, archived b5359d9e generator and per-case dates, DOP 12
+for ThinDB, cache/pool 2/4 GiB, shared/query budgets 16 GiB and service
+ceiling 20 GiB. Each ThinDB arm used a fresh service, one warmup, three
+measured queries and one untimed fingerprint query. Final row packets were
+discarded without Node value decoding. Startup/teardown/validation are
+outside timing; application query generation/setup remains inside.
+
+Median milliseconds:
+
+| Variant | StarRocks SQL | ThinDB SQL | SQL + regions | Zig UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| base simple | 485 | 360 | 214 | 218 | 112 |
+| base cross | 532 | 713 | 553 | 387 | 125 |
+| expanded simple | 1,721 | 1,007 | 240 | 441 | 112 |
+| expanded cross | 1,986 | 1,762 | 1,943 | 886 | 163 |
+| child simple | 478 | 368 | 220 | 201 | 113 |
+| child cross | 530 | 679 | 531 | 408 | 182 |
+| interval quarter | 451 | 458 | 266 | 216 | 159 |
+| interval annual | 446 | 377 | 230 | 208 | 121 |
+| fx latest | 591 | 368 | 220 | 151 | 140 |
+| fx average | 599 | 360 | 226 | 159 | 183 |
+| noest simple | 222 | 477 | 317 | 199 | 114 |
+| plans simple | 674 | 767 | 91 | 124 | 99 |
+| crossplans | 755 | 1,199 | 1,098 | 185 | 136 |
+| detail simple | 468 | 448 | 247 | 229 | 114 |
+| detail cross | 624 | 1,030 | 848 | 506 | 215 |
+
+Sums of the fifteen medians (seconds): SR 10.56; SQL 10.37; SQL + regions
+7.24; UDF 4.51; UDF + regions 2.09. SQL + regions is faster than ordinary
+SQL in 14/15 variants, versus 4/15 in the preceding DOP 12 sweep. Its total
+fell from 19.46 to 7.24 seconds; ordinary SQL also fell from 12.34 to 10.37
+seconds. These are successive full-suite runs on a shared host; the separate
+matched saved-SQL controls isolate the preparation defect more directly.
+
+Expanded cross remains the SQL-region exception: 1,943 versus 1,762 ms.
+UDF + regions beats SR in all 15 cases and is fastest in 13/15. The other
+winners are unkeyed UDF for FX average (159 versus 183 ms), and SQL +
+regions for plans simple (91 versus 99 ms for UDF + regions).
+
+All 300 accepted warmup/timing queries and 60 validation queries completed
+without query errors. All 30 keyed/unkeyed fingerprint pairs match, all
+60 ThinDB fingerprints match the preceding DOP 12 run, and result counts
+agree across all five arms. All keyed arms engaged regions at DOP 12;
+unkeyed arms did not. Saved SQL verifies the UDF/declaration switches for
+each arm. Expensive rejected fusion attempts: zero across the entire sweep.
+
+Startup headroom checks interrupted the run after seven variants; completed
+cases were retained and an incomplete annual-case attempt was archived and
+excluded before rerunning that case. The unused-memory startup requirement
+was reduced from 12 to 10 GiB, based on the preceding Sierra sweep peak of
+4.72 GiB. Service/query/cache/DOP limits stayed unchanged. The final 60
+accepted services peaked at 4.98 GiB with zero memory-limit/OOM events.
+Production PID 2579063 and zero restarts were unchanged; CDC stayed RUNNING.
+The candidate stopped and 13311 was released. No production deployment.
+
+Full table, comparison CSV, raw SQL/traces, fingerprint and memory audits,
+health checks and build provenance: `.bench-data/five-arm-d29f5f1-sierra-dop12/`
+(mirrored under `/home/ubuntu/wayroll-bench/five-arm-d29f5f1-sierra-dop12`).
+Portable bundle: `sierra-results.tgz`. `benchmark-report.md`, `timings.csv`,
+`before-after.csv` and `matrix.json` contain the accepted results.
+
+### Reject unsupported SQL fusion before preparation (2026-09-11)
+
+The general fix checks branch join eligibility during collection, before
+preparing sources or draining lookup inputs. Collection and dispatch share
+one predicate for supported join kinds, range conditions and residual ON
+predicates. The rollforward gap-fill branch contains a range join; previously
+the fused attempt prepared earlier joins before reaching that rejection.
+Known-empty branch filters also retain ordinary staging and its pruning.
+Supported branches still fuse, and compatible regions around unsupported
+branches remain available. No query, table or UDF names select these rules.
+
+A bounded per-database rejection cache additionally avoids repeating
+data-dependent fusion failures when inputs are unchanged. Its fingerprint
+includes table/data/schema identity, declared keys, CTE sharing, session and
+compile context, and immutable scalar kernel identity. Volatile calls and
+unversionable inputs are excluded. Data/schema changes retry; actual join
+input compilation/execution errors preserve their error identity. The first
+data-dependent proof after a change still costs work. This cache alone did
+not resolve the first pilot; the early structural check removes the measured
+rollforward failure even on the first execution.
+
+Matched 7b99d27/candidate controls used DOP 12, the same private snapshot on
+starrocks1 port 13311, saved SQL and hash buckets a/b/c. Each arm had one
+warmup, three measured raw-packet-discard queries and one untimed fingerprint.
+Fresh services used cache/pool 2/4 GiB, shared/query budgets 16 GiB, service
+ceiling 20 GiB; build order alternated. Headroom checks paused between arms
+when necessary. These are six saved-SQL controls, not a fresh full five-arm
+application matrix; they exclude application generation/setup. Shared-host
+load can still affect elapsed time. Median milliseconds:
+
+| Case | Regressed SQL + regions | Fixed SQL + regions | Speedup |
+|---|---:|---:|---:|
+| Sierra base simple | 809 | 251 | 3.23x |
+| Sierra expanded simple | 1,036 | 283 | 3.67x |
+| Sierra expanded cross | 3,205 | 2,346 | 1.37x |
+| AirDNA base simple | 2,508 | 1,467 | 1.71x |
+| AirDNA expanded simple | 2,511 | 1,209 | 2.08x |
+| AirDNA expanded cross | 11,086 | 9,649 | 1.15x |
+
+Each regressed query attempted and rejected one fused union; every fixed
+query had zero expensive failed union attempts, including the warmup.
+Every arm retained one successful region. Rejection-cache hits were zero in
+all six fixed controls, confirming that the structural check accounts for
+this recovery. All six result fingerprints match each other and the earlier
+ordinary-SQL reference, including row/column counts. All 48 warmup/timing
+queries and 12 validation queries completed. Peak service memory was
+17.64 GiB with zero memory-limit/OOM events. Production PID 2579063
+and restart count remained unchanged; CDC stayed RUNNING. The diagnostic
+service stopped and port 13311 was released. No production deployment.
+
+Validation: `zig build test -j1 --summary all` passed 1,495 tests, with five
+known skips. Coverage includes range/residual join fallback, empty/nonempty
+branches, changed lookup data, ALTER/DROP/recreate, CTE sharing and cache
+fingerprint context/kernel/volatility changes. `zig build bench` passed during
+implementation; final `zig build bench-regions` passed exact-value checks.
+Generic shared-window branch cases retained 1.59-2.13x speedups over ordinary
+SQL. A high-cardinality grouped-reduction microbenchmark still ran at 0.81x;
+regional execution is not universally faster. The full application five-arm
+sweep remains the next comparison after this fix is integrated.
+
+Evidence: `.bench-data/sql-region-rejection-fix/`, mirrored under
+`/home/ubuntu/wayroll-bench/sql-region-rejection-fix`. Full receipts, traces,
+health/memory audits and summaries are in `control-results.tgz`; exact binary
+hashes are in `full-metadata.json`. Candidate Linux ReleaseFast SHA-256:
+`87b120dbe6be6b4f4e1967dca46b4a7031f0474ff959348689e807c78eb17796`.
+
+### Confirm SQL regional preparation regression (2026-09-11)
+
+Controlled comparison of parent 062b8c7 (same engine as d4b66ca) against
+7b99d27 confirms that the shared-branch fusion change introduced a broad
+SQL regional regression. Both binaries used DOP 12, the same private
+snapshot and saved SQL/parameters, hash buckets a/b/c, cache/pool 2/4 GiB,
+query/shared budgets 16 GiB and service ceiling 20 GiB. Each arm received
+a fresh service, one warmup, three measured queries and one fingerprint
+query. These controls exclude application SQL generation/setup and are
+separate from the full application benchmark. Build order alternated.
+
+Median milliseconds:
+
+| Case | Parent SQL | Current SQL | Parent SQL + regions | Current SQL + regions |
+|---|---:|---:|---:|---:|
+| Sierra base simple | 337 | 346 | 204 | 791 |
+| Sierra expanded simple | 925 | 961 | 221 | 786 |
+| Sierra expanded cross | 1,699 | 1,663 | 1,817 | 2,883 |
+| AirDNA base simple | 1,827 | 1,757 | 1,653 | 2,667 |
+| AirDNA expanded simple | 7,458 | 6,946 | 1,777 | 2,894 |
+| AirDNA expanded cross | 12,238 | 15,812 | 12,301 | 13,468 |
+
+The last case's ordinary-SQL control shifted materially on the shared host;
+do not attribute its entire difference to regional compilation. The other
+five cases hold ordinary SQL within about 7%, while regions regress 59-288%.
+
+For Sierra base-simple, the successful region still takes 114/115 ms on
+parent/current. The extra ~587 ms is outside that execution. Current
+traces show a failed sql_union attempt while preparing the staged input,
+followed by the same cached smaller region. dispatchJoin can compile and
+drain join inputs during speculative branch construction; a later decline
+discards that work before the fallback builds its ordinary input. This
+repeats even on warmed queries. All six current controls show one failed
+union attempt per timed query; parent controls show none.
+
+Priority: make failed shared-branch preparation cheap and avoid repeating
+it in cached/unsupported staged inputs, while preserving supported fusion
+and invalidation for changed data, schemas, kernels and CTE sharing. Keep
+the fix structural and general. Recheck the saved controls, generic cache
+invalidation/fallback tests, then the full application matrix. No engine
+fix was applied during this diagnosis.
+
+All four arm fingerprints match in all six cases. The 96 warmup/timing and
+24 untimed validation queries succeeded; 24 services peaked at 17.07 GiB
+with no memory-limit/OOM events. The diagnostic service stopped and 13311
+was released. Production PID 2579063 and restart count stayed unchanged;
+CDC remained RUNNING. No deployment occurred.
+
+Evidence: `.bench-data/sql-region-regression-7b99d27/`, mirrored under
+`/home/ubuntu/wayroll-bench/sql-region-regression-7b99d27`. The parent
+checkout is `.bench-data/sql-region-parent-control` (detached 062b8c7).
+
+### DOP 12 rerun of all thinDB arms (2026-09-11)
+
+Reran all four thinDB arms for both companies and all 15 variants on
+starrocks1, using the same 7b99d27 ReleaseFast binary, private snapshot on
+13311, archived query generator/dates, and hash buckets a/b/c. Only DOP
+changed from 4 to 12: block cache 2 GiB, region pool 4 GiB, shared/query
+budgets 16 GiB, service ceiling 20 GiB. Every arm received a fresh service,
+one warmup, three measured queries, and one untimed fingerprint query.
+Timed final row packets were drained without Node value decoding.
+StarRocks was not rerun; its preceding results are retained in the matrix.
+
+Sums of the fifteen query medians, seconds, shown as DOP 4 -> DOP 12:
+
+| Dataset | SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|
+| Sierra | 11.21 -> 12.34 | 16.62 -> 19.46 | 3.95 -> 5.14 | 1.58 -> 2.16 |
+| AirDNA | 54.81 -> 44.40 | 57.72 -> 49.00 | 42.95 -> 34.64 | 15.22 -> 12.24 |
+
+DOP 12 reduced AirDNA totals by 15-20%, but increased Sierra totals by
+10-37%. SQL+regions still lost to ordinary SQL in 23/30 cases. UDF+regions
+remained fastest in 29/30 cases; Sierra FX-average favored unkeyed UDF.
+All keyed arms engaged regions, all timed keyed traces used the requested
+DOP, and none used the new fused SQL union opcode. AirDNA expanded-cross
+UDF+regions improved from 985 to 674 ms; its shard phase roughly halved,
+while scan/scatter was nearly unchanged. Sierra's smaller scans paid more
+overhead at DOP 12. Trace comparisons are saved with the reports.
+
+All 480 new warmup/timing queries and 120 fingerprint queries succeeded.
+All 60 keyed/unkeyed fingerprint pairs matched at DOP 12. Cross-DOP raw
+fingerprints matched in 116/120 arms. Both SQL arms in the two AirDNA detail
+variants differed across DOP; the UDF arms matched. A separate untimed
+rerun of the identical saved SQL reproduced all four SQL fingerprints.
+Comparing every row isolated differences to exchangeRate/lastExchangeRate:
+94 detail-simple rows (maximum absolute difference 3e-16) and 288 detail-cross
+rows (7e-16). All other fields, including monetary amounts, matched exactly.
+This is not bitwise cross-DOP equivalence; no normalization was applied to
+the recorded fingerprints.
+
+The 120 benchmark services peaked at 17.23 GiB with zero memory-limit/OOM
+events. The benchmark and subsequent comparison services were stopped;
+13311 was released. Production retained PID 2579063 and zero restarts,
+and CDC remained RUNNING. No engine changes or deployment occurred.
+
+Full matrix, DOP comparison CSV, stage traces, validation details and health
+receipts: `.bench-data/five-arm-7b99d27-dop12/`, mirrored under
+`/home/ubuntu/wayroll-bench/five-arm-7b99d27-dop12` on starrocks1.
+The separate row-comparison harness and compressed packet captures are in
+`/home/ubuntu/wayroll-bench/dop-detail-check-7b99d27`.
+
+### Full five-arm rollforward rerun (2026-09-11)
+
+Engine commit `7b99d27`, Linux ReleaseFast, ran on starrocks1 localhost
+against the private snapshot on port 13311. StarRocks used live production
+data on 9030. Both companies ran all 15 variants with hash buckets a/b/c,
+the archived Wayroll b5359d9e generator, and the prior per-case dates.
+The production thinDB service on 13310 was not deployed or restarted.
+
+Final procedure: DOP 4, 2 GiB data cache, 4 GiB retained-region budget,
+16 GiB query/shared budgets, and a 20 GiB service ceiling. Each thinDB arm
+started a fresh isolated service, warmed once, ran three timed queries, then
+ran one untimed fingerprint query. Startup, shutdown and fingerprint work
+are excluded from timings. Final row packets are discarded without Node
+value decoding. These settings differ from the preceding DOP 16 production
+run; this is not a controlled historical before/after comparison.
+
+All 30 variants completed with no query errors in the accepted results;
+60/60 keyed/unkeyed fingerprint pairs matched. All 60 keyed case/arm
+combinations engaged an existing region, but **none used the new SQL
+`union_all` opcode**. SQL+regions was slower than ordinary SQL in 24/30
+cases. Traces show failed shared-fork attempts before falling back to a
+smaller existing region; avoid paying that preparation work repeatedly
+before pursuing more general branch coverage. UDF+regions had the lowest
+median in 29/30 cases (Sierra FX average favored unkeyed UDF slightly).
+
+Sums of the fifteen case medians, seconds:
+
+| Dataset | SR SQL | thinDB SQL | SQL + regions | UDF | UDF + regions |
+|---|---:|---:|---:|---:|---:|
+| Sierra | 10.53 | 11.21 | 16.62 | 3.95 | 1.58 |
+| AirDNA | 49.89 | 54.81 | 57.72 | 42.95 | 15.22 |
+
+Sierra source counts matched. AirDNA's live StarRocks data had slightly more
+rows/customers than the frozen copy; detail output differed by about 300
+rows. The fingerprint checks establish keyed/unkeyed equivalence within
+thinDB, not cross-engine value equivalence.
+
+An initial attempt with an 8 GiB query budget and retained service state
+across variants hit the budget and then the isolated cgroup OOM limit. It
+and the pilot were excluded, and the thinDB phase was rerun. A service-job
+cancellation interrupted the last case; its partial samples were excluded
+and all four arms of that case were rerun with unchanged settings. The
+restart helper now checks the actual service PID. All 120 accepted service
+instances have memory receipts: peak 16.55 GiB, no limit/OOM events.
+The final candidate was stopped and port 13311 released. Production remained
+at PID 2579063 with zero automatic restarts; CDC remained RUNNING.
+
+Full tables, CSV, source counts, validation and raw traces are in
+`.bench-data/five-arm-7b99d27/benchmark-report.md`, `timings.csv`,
+`matrix.json` and the sibling result directories. Matching evidence is on
+starrocks1 under `/home/ubuntu/wayroll-bench/five-arm-7b99d27`.
+
+### Fuse shared SQL branches within one region (2026-09-10)
+
+Branch: `region-shared-sql-branches`, based on `062b8c7`. This implements
+the shared-input approach below. The independent-region discovery
+experiment at `62eedfe` remains excluded. No production deployment or
+production benchmark was performed in this round.
+
+A common CTE input is retained once inside a keyed region. Compatible
+UNION ALL branches run over borrowed frame snapshots, then concatenate
+within each declared-key partition. Nested branches follow the same rule.
+Supported branch steps include filters, projections, expressions, aliases,
+SQL windows, and existing eligible joins. Ordinary UNION type planning is
+shared with regional execution. Filters preserve empty range positions;
+left-before-right concatenation preserves tied window ordering. Key
+provenance survives nested unions only for value-identical output slots.
+
+This is structural SQL support with no table, query-text or UDF-name
+recognizers. Forced materialization, external CTE consumers, changed keys,
+incompatible windows and unsupported branch operators retain ordinary
+staging. A declined fusion retries the original staged-ingress path at the
+same boundary. Cache reuse revalidates the sharing recipe and table
+versions. Existing restrictions still apply: branch GROUP BY/TVFs,
+unfiltered co-partitioned sides and duplicate-key broadcast joins are not
+newly enabled. Supported grouped reductions can follow the combined frame.
+
+Validation covers two/three branches, different window frames and order
+specs, ties, positional numeric widening, duplicates, NULL keys/payloads,
+empty branches/ranges, typed Boolean/UUID movement, dimension joins,
+multiplying LEFT joins, filtering INNER joins, cached source updates and
+changed external sharing. The benchmark's plan inspection checks live
+producers separately because a final scalar aggregate may already have
+destroyed its input operator during compilation.
+The final full test run passed 1,490 tests with five existing skips;
+formatting and whitespace checks passed.
+
+Local Windows in-process measurements, ReleaseFast, 1M input rows, DOP 12,
+one warmup per arm and five rotating measurements; medians in milliseconds.
+Every execution checks exact aggregate totals against ordinary SQL, and
+separate plan checks require the expected fused UNION op count. The
+materialized arm explicitly retains the common CTE with `AS MATERIALIZED`;
+this compares execution modes in the candidate, not different commits.
+There is no MySQL transfer or Node decoding in these measurements.
+
+`zig build bench-regions` uses the C allocator, matching the ReleaseFast
+server's process allocator on this platform:
+
+| SQL shape | Partitions | Ordinary SQL | Keyed materialized base | Keyed fused branches | Fused speedup vs materialized |
+|---|---:|---:|---:|---:|---:|
+| Shared window + overlapping filters | 100 | 103.85 | 93.93 | 50.54 | 1.86x |
+| Three branches + independent windows | 100 | 130.46 | 97.11 | 54.91 | 1.77x |
+| Filtered projections + grouped reduction | 100 | 20.89 | 21.09 | 18.08 | 1.17x |
+| Shared window + overlapping filters | 10,000 | 85.42 | 100.83 | 49.75 | 2.03x |
+| Three branches + independent windows | 10,000 | 126.66 | 108.21 | 53.08 | 2.04x |
+| Filtered projections + grouped reduction | 10,000 | 20.90 | 25.26 | 23.71 | 1.07x |
+
+The full `zig build bench` suite also passed. It explicitly uses
+`DebugAllocator` even in ReleaseFast and ran the same cases with these
+results; do not blend the two harnesses into one baseline:
+
+| SQL shape | Partitions | Ordinary SQL | Keyed materialized base | Keyed fused branches |
+|---|---:|---:|---:|---:|
+| Shared window + overlapping filters | 100 | 86.69 | 80.68 | 55.03 |
+| Three branches + independent windows | 100 | 125.58 | 108.75 | 60.67 |
+| Filtered projections + grouped reduction | 100 | 22.92 | 26.16 | 27.74 |
+| Shared window + overlapping filters | 10,000 | 81.16 | 100.62 | 79.57 |
+| Three branches + independent windows | 10,000 | 105.86 | 107.00 | 72.57 |
+| Filtered projections + grouped reduction | 10,000 | 25.87 | 32.65 | 40.02 |
+
+Window-heavy forks benefit in both harnesses. Small reductions can lose to
+ordinary SQL and can also regress against staged keyed execution; fusion
+still pays filtering, copying and exchange costs. No universal speedup or
+new production rollforward result is claimed.
+
+Evidence: `.bench-data/shared-branch-bench.log`,
+`.bench-data/shared-branch-full-bench.log`, and
+`.bench-data/shared-branch-final-tests.log`. Next: compare this branch with
+the correctness baseline on the private Linux FX snapshot, then use the
+remaining rejection traces to prioritize further general operator support.
+
+### UNION experiment and prerequisite correctness fixes (2026-09-10)
+
+Current branch: `region-payload-and-cache-correctness`, engine commit
+`d4b66ca`. The general UNION-branch discovery experiment is preserved on
+`keyed-sql-union-coverage` at `62eedfe`; it is excluded from the current
+branch because the additional region boundaries regress the full-SQL FX
+workload. No changes from this round were deployed to production.
+
+The experiment exposed three general engine defects, now repaired:
+
+- Region column movement omitted Boolean and UUID payloads. Typed movement
+  now covers every stored payload type, preserving NULL validity and memory
+  accounting.
+- Right join payloads could overwrite same-named left columns. Table/CTE
+  qualifiers and explicit scan aliases now remain distinct. Selected right
+  keys preserve their values and NULLs, including an empty build side.
+- Deleting only persisted rows did not invalidate cached lookup results.
+  Table versions now include tombstone generation and cache UID, covering
+  segment-only deletes and table recreation.
+
+Programs that fold entirely to emission also decline regional execution:
+there is no shard-local work to amortize the exchange and consolidation.
+The existing mixed-width join-key output-type issue below remains separate;
+the new namespace regression uses matching key types and different payload
+types to isolate the binding defect.
+
+The fixes passed the full test suite (1,481 passed, five existing skips),
+`zig build bench`, and a Linux ReleaseFast distribution build. Snapshot
+validation passed all 24 checks comparing repeated raw-row fingerprints and
+row counts for SQL, SQL+regions and UDF+regions across Sierra/AirDNA monthly,
+FX latest and FX average. The experiment separately passed those checks and
+comparisons through all 39 Sierra CTEs after its correctness repairs.
+
+Median milliseconds, one warmup and five samples, three hash buckets a/b/c,
+on starrocks1 localhost against the private snapshot on port 13311. DOP 4,
+2 GiB block cache, 4 GiB retained-region budget, 20 GiB cgroup maximum; final
+packets discarded without Node value decoding. The baseline was refreshed
+immediately before the fixes run; the experiment ran earlier on the same
+shared host. Small differences are not established performance changes.
+
+| Dataset / variant | SQL+regions baseline | Fixes | UNION experiment | UDF+regions baseline | Fixes | UNION experiment |
+|---|---:|---:|---:|---:|---:|---:|
+| Sierra monthly | 213 | 211 | 185 | 95 | 83 | 83 |
+| Sierra FX latest | 233 | 220 | 403 | 112 | 118 | 170 |
+| Sierra FX average | 210 | 231 | 399 | 121 | 134 | 138 |
+| AirDNA monthly | 1,980 | 2,033 | 2,269 | 645 | 685 | 657 |
+| AirDNA FX latest | 2,017 | 1,982 | 3,786 | 1,169 | 1,214 | 1,288 |
+| AirDNA FX average | 1,952 | 2,041 | 3,500 | 1,268 | 1,186 | 1,195 |
+
+Next: preserve a shared input once and fuse compatible split/UNION/rejoin
+work within a region. Merely discovering additional independent regions
+adds materialization, repeated preparation, and exchanges. Start with a
+generic window/union/dimension-join regression requiring one exchange across
+the compatible fork, while preserving union casts, duplicates, NULLs,
+shared/forced CTE semantics and window ties. Then retry FX. Final aggregation,
+global sort and MySQL output remain later targets.
+
+Evidence: `.bench-data/keyed-union-coverage/final/report.md` and the matching
+directory on starrocks1 under `/home/ubuntu/wayroll-bench/`. The final candidate
+peaked at 11.06 GiB with no pressure/OOM event and was stopped. Production
+remained at PID 2579063, zero automatic restarts; CDC stayed RUNNING with
+37,413 completed checkpoints. This is a targeted comparison, not a new
+full five-arm or StarRocks sweep.
+
 ### Preserve routed keys across frame replacements (2026-09-10)
 
 Engine commit `bdec8da` fixes the physical route-key identity lost when a

@@ -85,15 +85,10 @@ pub const AliasRename = struct {
     }
 
     pub fn addPrune(self: *AliasRename, pred: Predicate) !void {
-        // Translate the qualified name back to the upstream's bare
-        // column name before forwarding. The predicate stays the
-        // operator's IR object — we shallow-copy and adjust the col
-        // pointer to view into our upstream's name space.
-        const dot = std.mem.lastIndexOfScalar(u8, pred.col, '.') orelse {
-            return self.upstream.addPrune(pred);
-        };
+        if (self.probe_fused) return;
+        const idx = types.findColumn(self.output_schema, pred.col) orelse return error.ColumnNotFound;
         var rewritten = pred;
-        rewritten.col = pred.col[dot + 1 ..];
+        rewritten.col = self.upstream.outputSchema()[idx].name;
         return self.upstream.addPrune(rewritten);
     }
 

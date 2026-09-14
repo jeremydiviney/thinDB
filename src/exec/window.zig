@@ -486,9 +486,8 @@ pub const Window = struct {
         return .{ .schema = self.out_schema, .values = self.out_views, .row_count = n };
     }
 
-    pub fn addPrune(self: *Window, pred: Predicate) !void {
-        return self.upstream.addPrune(pred);
-    }
+    // Removing rows below a window changes its frames and row numbers.
+    pub fn addPrune(_: *Window, _: Predicate) !void {}
 
     pub fn stats(self: *Window) exec.PipelineStats {
         const up = self.upstream.stats();

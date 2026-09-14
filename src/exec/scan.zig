@@ -1289,12 +1289,7 @@ pub const Scan = struct {
     }
 
     pub fn addPrune(self: *Scan, pred: Predicate) !void {
-        const col_idx = blk: {
-            for (self.table.schema.columns, 0..) |c, i| {
-                if (@import("../types.zig").columnNameEql(c.name, pred.col)) break :blk i;
-            }
-            return Error.ColumnNotFound;
-        };
+        const col_idx = types.findColumn(self.table.schema.columns, pred.col) orelse return Error.ColumnNotFound;
         // Drop hints for types whose `Stats` slot is `{0, 0}` — no usable
         // min/max. statsOverlapPredicate would conservatively return true
         // anyway, but skipping the append avoids the per-row-group work.

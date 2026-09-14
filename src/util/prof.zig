@@ -8,8 +8,7 @@
 //!
 //! This Zig routes all clocks through the async `Io` abstraction; `std.time`
 //! exposes only constants. The operator next() wrapper has no `Io` handle, so
-//! we read the raw Windows performance counter directly (diagnostic builds are
-//! Windows-only here; elsewhere ticks are 0 and the dump is empty).
+//! we read a monotonic platform counter directly.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,6 +21,11 @@ threadlocal var slots: [48]Slot = undefined;
 threadlocal var count: usize = 0;
 
 pub fn nowTicks() i64 {
+    if (builtin.os.tag == .linux) {
+        var c: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &c) != 0) return 0;
+        return @as(i64, c.sec) * std.time.ns_per_s + c.nsec;
+    }
     if (builtin.os.tag != .windows) return 0;
     var c: win.LARGE_INTEGER = 0;
     _ = win.ntdll.RtlQueryPerformanceCounter(&c);
@@ -29,6 +33,7 @@ pub fn nowTicks() i64 {
 }
 
 fn freq() i64 {
+    if (builtin.os.tag == .linux) return std.time.ns_per_s;
     if (builtin.os.tag != .windows) return 1;
     var f: win.LARGE_INTEGER = 0;
     _ = win.ntdll.RtlQueryPerformanceFrequency(&f);

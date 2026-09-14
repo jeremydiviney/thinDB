@@ -1603,6 +1603,72 @@ fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
     return c.names.toOwnedSlice(allocator) catch null;
 }
 
+/// A join leaf needs references on its path through the current query block.
+/// Wildcards inside sibling CTEs must not disable pruning of this leaf. Alias,
+/// materialize and window boundaries start separate column-name scopes.
+pub fn join_leaf_input_names(allocator: Allocator, root: *const ir.Op, leaf: *const ir.Op) ?[][]const u8 {
+    var c = ProjScan{};
+    if (!walk_join_leaf_path(&c, allocator, root, leaf) or c.bail or !c.has_shaper) {
+        c.names.deinit(allocator);
+        return null;
+    }
+    return c.names.toOwnedSlice(allocator) catch null;
+}
+
+fn walk_join_leaf_path(c: *ProjScan, allocator: Allocator, op: *const ir.Op, leaf: *const ir.Op) bool {
+    if (op == leaf) return true;
+    switch (op.*) {
+        .select => |p| {
+            if (!walk_join_leaf_path(c, allocator, p.upstream, leaf)) return false;
+            c.has_shaper = true;
+            for (p.columns) |name| {
+                if (std.mem.eql(u8, name, "*") or aliasStarSource(name) != null) {
+                    c.bail = true;
+                } else c.add(allocator, name);
+            }
+        },
+        .filter => |f| {
+            if (!walk_join_leaf_path(c, allocator, f.upstream, leaf)) return false;
+            projWalkPredicate(c, allocator, f.predicate);
+        },
+        .compute => |cmp| {
+            if (!walk_join_leaf_path(c, allocator, cmp.upstream, leaf)) return false;
+            for (cmp.derived) |d| projWalkExpr(c, allocator, d.expr);
+        },
+        .order_by => |o| {
+            if (!walk_join_leaf_path(c, allocator, o.upstream, leaf)) return false;
+            for (o.specs) |sp| c.add(allocator, sp.col);
+        },
+        .group_by => |g| {
+            if (!walk_join_leaf_path(c, allocator, g.upstream, leaf)) return false;
+            c.has_shaper = true;
+            for (g.group_cols) |name| c.add(allocator, name);
+            for (g.aggs) |a| {
+                if (a.col) |name| c.add(allocator, name);
+                if (a.arg2_col) |name| c.add(allocator, name);
+                for (a.udf_arg_cols) |name| c.add(allocator, name);
+            }
+        },
+        .limit => |l| return walk_join_leaf_path(c, allocator, l.upstream, leaf),
+        .join => |j| {
+            const in_left = walk_join_leaf_path(c, allocator, j.left, leaf);
+            const in_right = walk_join_leaf_path(c, allocator, j.right, leaf);
+            if (!in_left and !in_right) return false;
+            for (j.on) |pair| {
+                c.add(allocator, pair.left);
+                c.add(allocator, pair.right);
+            }
+            for (j.ranges) |pair| {
+                c.add(allocator, pair.left);
+                c.add(allocator, pair.right);
+            }
+            if (j.extra_predicate) |p| projWalkPredicate(c, allocator, p);
+        },
+        else => return false,
+    }
+    return true;
+}
+
 /// Bits a group column contributes to a coded int key: a string keys on its
 /// 32-bit global code; an int-family column on its type width; anything else
 /// (float/double) can't pack (null). Mirrors aggregate.zig `intKeyBits` (+ the

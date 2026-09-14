@@ -3208,3 +3208,71 @@ test "SetUnion rechain: a second join above the union extends the fused pipeline
         try std.testing.expectEqualSlices(i64, ref.items, got.items);
     }
 }
+
+test "join: empty fused stage filter skips every lookup in a join chain" {
+    const allocator = std.testing.allocator;
+    const ex = exec;
+    const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
+    const storage = @import("../storage/storage.zig");
+    const source_schema = [_]types.Column{
+        .{ .name = "id", .type = .bigint, .nullable = true },
+        .{ .name = "other", .type = .bigint, .nullable = true },
+    };
+    const lookup_schema = [_]types.Column{
+        .{ .name = "key", .type = .bigint },
+        .{ .name = "value", .type = .bigint },
+    };
+    const ids = [_]i64{ 1, 2, 3 };
+    const cases = .{
+        .{ .other = &[_]i64{ 1, 2, 3 }, .nulls = @as(?[]const u8, null), .rows = 3, .expected = 0 },
+        .{ .other = &[_]i64{ 1, 2, 4 }, .nulls = @as(?[]const u8, null), .rows = 3, .expected = 1 },
+        .{ .other = &[_]i64{ 1, 2, 4 }, .nulls = @as(?[]const u8, &.{0b00000011}), .rows = 3, .expected = 0 },
+        .{ .other = &[_]i64{ 1, 2, 3 }, .nulls = @as(?[]const u8, null), .rows = 0, .expected = 0 },
+    };
+    inline for (cases) |case| {
+        const set = try ex.StageSet.create(allocator);
+        defer set.deinit();
+        const source_views = [_]storage.ColumnView{
+            .{ .data = .{ .bigint = &ids }, .nulls = null },
+            .{ .data = .{ .bigint = case.other }, .nulls = case.nulls },
+        };
+        const source = try SingleBatchSource.create(allocator, .{ .schema = &source_schema, .values = &source_views, .row_count = case.rows });
+        const stage = try set.addStage(source, null);
+        const lookup_views = [_]storage.ColumnView{
+            .{ .data = .{ .bigint = &ids }, .nulls = null },
+            .{ .data = .{ .bigint = &ids }, .nulls = null },
+        };
+        const lookup_batch = ex.Batch{ .schema = &lookup_schema, .values = &lookup_views, .row_count = 3 };
+        const lookup1 = try set.addStage(try SingleBatchSource.create(allocator, lookup_batch), null);
+        const lookup2 = try set.addStage(try SingleBatchSource.create(allocator, lookup_batch), null);
+        const parallel = try ex.ParallelScan.createOverStageDeferred(allocator, allocator, stage, null, 2);
+        const alias = try ex.AliasRename.create(allocator, parallel, "p");
+        const projected = try alias.projectNamed(&.{ "p.other", "p.id" }, &.{ "comparison", "probe_key" });
+        const filtered = try projected.filter(.{ .leaf_col_col = .{ .left = "probe_key", .op = .neq, .right = "comparison" } });
+        const rhs1 = try ex.AliasRename.create(allocator, try ex.MatScan.create(allocator, lookup1), "a");
+        const first = try filtered.join(rhs1, .{ .algorithm = .hash, .join_type = .left, .on = &.{.{ .left = "probe_key", .right = "a.key" }} });
+        const rhs2 = try ex.AliasRename.create(allocator, try ex.MatScan.create(allocator, lookup2), "b");
+        var query = try first.join(rhs2, .{ .algorithm = .hash, .join_type = .left, .on = &.{.{ .left = "probe_key", .right = "b.key" }} });
+        defer query.deinit();
+        try std.testing.expect(ex.queryAs(ex.Join, first).?.probe_fused);
+        try std.testing.expect(ex.queryAs(ex.Join, query).?.probe_fused);
+        try std.testing.expect(stage.result == null);
+        set.releaseCompilePins();
+        var rows: usize = 0;
+        while (try query.next()) |batch| {
+            for (0..batch.row_count) |i| {
+                try std.testing.expectEqual(@as(i64, 3), batch.values[1].data.bigint[i]);
+                try std.testing.expectEqual(@as(i64, 3), batch.values[2].data.bigint[i]);
+                try std.testing.expectEqual(@as(i64, 3), batch.values[3].data.bigint[i]);
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, case.expected), rows);
+        if (case.expected == 0) {
+            try std.testing.expect(lookup1.query_alive);
+            try std.testing.expect(lookup2.query_alive);
+            try std.testing.expect(lookup1.result == null);
+            try std.testing.expect(lookup2.result == null);
+        }
+    }
+}

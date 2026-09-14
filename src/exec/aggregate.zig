@@ -27,6 +27,15 @@ const makeQuery = exec.makeQuery;
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 
+pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices: []const usize, pred: Predicate) !void {
+    const idx = types.findColumn(schema, pred.col) orelse return Error.ColumnNotFound;
+    // Aggregate output can shadow an input column without keeping its values.
+    if (idx >= group_indices.len) return;
+    var rewritten = pred;
+    rewritten.col = upstream.outputSchema()[group_indices[idx]].name;
+    return upstream.addPrune(rewritten);
+}
+
 const simd = @import("../util/simd.zig");
 
 const native_endian = @import("builtin").cpu.arch.endian();
@@ -1298,7 +1307,8 @@ pub const Aggregate = struct {
     }
 
     pub fn addPrune(self: *Aggregate, pred: Predicate) !void {
-        return self.upstream.addPrune(pred);
+        if (self.top_k != null or self.emit_limit != null) return;
+        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
     }
 
     /// Global aggregate (no group_cols): always emits exactly 1 row.
@@ -2614,7 +2624,7 @@ pub const SortedAggregate = struct {
     }
 
     pub fn addPrune(self: *SortedAggregate, pred: Predicate) !void {
-        return self.upstream.addPrune(pred);
+        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
     }
 
     pub fn stats(self: *SortedAggregate) exec.PipelineStats {

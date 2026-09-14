@@ -23,6 +23,19 @@ const makeQuery = exec.makeQuery;
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
+const mat_stage = @import("mat_stage.zig");
+
+fn preflight_predicate(expr: PredicateExpr) bool {
+    return switch (expr) {
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .always => true,
+        .@"and", .@"or" => |children| blk: {
+            for (children) |child| if (!preflight_predicate(child)) break :blk false;
+            break :blk true;
+        },
+        .not => |child| preflight_predicate(child.*),
+        else => false,
+    };
+}
 
 /// Schema-only upstream for detached per-chunk Filter clones inside a probe
 /// pipeline (evalBatch is the only entry used; next() is never pulled).
@@ -60,6 +73,8 @@ const FilterForward = struct {
     stubs: []*SchemaStub = &.{},
     map_views: [][]ColumnView = &.{},
     bind_alloc: Allocator = undefined,
+    probe_source: ?mat_stage.StageSource = null,
+    probe_empty: ?bool = null,
 
     fn bindHook(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
         const cf: *FilterForward = @ptrCast(@alignCast(ctx));
@@ -112,6 +127,7 @@ const FilterForward = struct {
     }
 
     fn deinitAll(cf: *FilterForward, owner_alloc: Allocator) void {
+        if (cf.probe_source) |*source| source.deinit(owner_alloc);
         for (cf.per_chunk, cf.stubs) |*q, st| {
             q.deinit();
             cf.bind_alloc.destroy(st);
@@ -349,13 +365,22 @@ pub const Filter = struct {
     /// must decline: its mask evaluates against the probe-side schema and
     /// would be applied to already-joined rows.
     pub fn tryFuseProbe(self: *Filter, sink: exec.ProbeSink) !bool {
+        if (self.expr == .always and !self.expr.always) return false;
         if (self.fused) return self.upstream.tryFuseProbe(sink);
         // Unfused: the predicate must run BETWEEN the source's batches and
         // the join — forward a wrapper whose per-chunk clones filter each
         // batch before the join's sink sees it. A proven-false predicate
         // emits nothing either way; keep it on the cheap serial path.
         if (self.chain != null) return false;
-        if (self.expr == .always and !self.expr.always) return false;
+        var probe_source = if (preflight_predicate(self.expr)) try mat_stage.stageBehind(self.allocator, self.upstream, null) else null;
+        defer if (probe_source) |*source| source.deinit(self.allocator);
+        if (probe_source) |*source| {
+            for (source.casts) |cast| if (cast != null) {
+                source.deinit(self.allocator);
+                probe_source = null;
+                break;
+            };
+        }
         const chain = try self.allocator.create(FilterForward);
         errdefer self.allocator.destroy(chain);
         chain.* = .{
@@ -373,7 +398,41 @@ pub const Filter = struct {
             self.allocator.destroy(chain);
             return false;
         }
+        chain.probe_source = probe_source;
+        probe_source = null;
         self.chain = chain;
+        return true;
+    }
+
+    /// Probe fusion requires a ready hash table before workers start. A
+    /// filter over an existing stage can prove emptiness without starting
+    /// those workers or building an unused lookup. This reads immutable
+    /// stage views and never creates another materialization boundary.
+    pub fn empty_stage_probe(self: *Filter) !bool {
+        if (self.expr == .always and !self.expr.always) return true;
+        const chain = self.chain orelse return false;
+        if (chain.probe_empty) |empty| return empty;
+        const source = chain.probe_source orelse return false;
+        const started = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        defer if (exec.prof.enabled) exec.prof.addPhase("join.empty_probe_check", @intCast(exec.prof.nowTicks() - started));
+        try source.stage.ensureRun();
+        const result = source.stage.result.?;
+        var max_rows: usize = 0;
+        for (result.chunks.items) |chunk| max_rows = @max(max_rows, chunk.rows);
+        const mask = try self.allocator.alloc(bool, max_rows);
+        defer self.allocator.free(mask);
+        for (result.chunks.items) |chunk| {
+            for (source.map, self.views) |src, *view| {
+                view.* = if (chunk.views.len > 0) chunk.views[src] else chunk.cols[src].view();
+            }
+            const batch = Batch{ .schema = self.schema, .values = self.views, .row_count = chunk.rows };
+            try predicate.evaluateExprGuided(self.allocator, self.expr, self.schema, batch, mask[0..chunk.rows], null);
+            for (mask[0..chunk.rows]) |matched| if (matched) {
+                chain.probe_empty = false;
+                return false;
+            };
+        }
+        chain.probe_empty = true;
         return true;
     }
 

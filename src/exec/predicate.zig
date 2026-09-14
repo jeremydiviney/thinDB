@@ -181,6 +181,23 @@ pub fn touchesColumn(expr: PredicateExpr, name: []const u8) bool {
     };
 }
 
+pub fn touches_resolved_column(expr: PredicateExpr, schema: []const Column, idx: usize) bool {
+    return switch (expr) {
+        .leaf, .day_leaf => |leaf| types.findColumn(schema, leaf.col) == idx,
+        .leaf_col_col => |pair| types.findColumn(schema, pair.left) == idx or types.findColumn(schema, pair.right) == idx,
+        .is_null, .is_not_null => |col| types.findColumn(schema, col) == idx,
+        .like => |like| types.findColumn(schema, like.col) == idx,
+        .in_set => |set| types.findColumn(schema, set.col) == idx,
+        .@"and", .@"or" => |children| blk: {
+            for (children) |child| if (touches_resolved_column(child, schema, idx)) break :blk true;
+            break :blk false;
+        },
+        .not => |child| touches_resolved_column(child.*, schema, idx),
+        .always => false,
+        else => true,
+    };
+}
+
 /// Structural equality: column names case-insensitively, literals by
 /// value, children in order. Forms backed by a subquery never compare
 /// equal — each is its own evaluation.

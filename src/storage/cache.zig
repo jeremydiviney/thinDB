@@ -579,6 +579,9 @@ pub const SegmentHandles = struct {
     };
 
     map: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
+    /// Segment-only deletes need to invalidate cached query state even when
+    /// the memtable and manifest do not change, or no handle was cached.
+    tombstone_generation: std.atomic.Value(u64) = .init(0),
     lock: std.atomic.Mutex = .unlocked,
 
     fn lockSpin(self: *SegmentHandles) void {
@@ -651,6 +654,7 @@ pub const SegmentHandles = struct {
     pub fn invalidateTombstones(self: *SegmentHandles, allocator: Allocator, segment_id: u64) void {
         self.lockSpin();
         defer self.lock.unlock();
+        _ = self.tombstone_generation.fetchAdd(1, .monotonic);
         const e = self.map.get(segment_id) orelse return;
         if (e.tombs) |t| allocator.free(t);
         e.tombs = null;

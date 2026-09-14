@@ -3512,3 +3512,81 @@ test "sql: shared CTE stage build applies the join-key coercion cast" {
     try std.testing.expectEqualSlices(?i32, &[_]?i32{ 11, null, 30, null, null }, cur.items);
     try std.testing.expectEqualSlices(?i32, &[_]?i32{ 10, 20, null, null, null }, prev.items);
 }
+
+test "sql: ordinary diagnosis empty selective shared CTE and window fixtures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const cases = .{
+        .{
+            .sql =
+            \\WITH e AS (SELECT id FROM t WHERE 1=0),
+            \\w AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM t)
+            \\SELECT w.id FROM e INNER JOIN w ON e.id=w.id
+            ,
+            .expected = &[_]i64{},
+        },
+        .{
+            .sql =
+            \\WITH e AS (SELECT id FROM t WHERE tag='missing'),
+            \\w AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM t)
+            \\SELECT CAST(COUNT(*) AS BIGINT) FROM e INNER JOIN w ON e.id=w.id
+            ,
+            .expected = &[_]i64{0},
+        },
+        .{
+            .sql =
+            \\WITH e AS (SELECT id AS empty_id FROM t WHERE 1=0)
+            \\SELECT COALESCE(e.empty_id, CAST(-1 AS BIGINT)) FROM t LEFT JOIN e ON t.id=e.empty_id ORDER BY t.id
+            ,
+            .expected = &[_]i64{ -1, -1, -1, -1, -1 },
+        },
+        .{
+            .sql =
+            \\WITH chosen AS (SELECT id FROM t WHERE tag='c'),
+            \\w AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM t)
+            \\SELECT w.id FROM w INNER JOIN chosen ON w.id=chosen.id ORDER BY w.id
+            ,
+            .expected = &[_]i64{5},
+        },
+        .{
+            .sql =
+            \\WITH w AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM t)
+            \\SELECT id FROM (SELECT id FROM w WHERE rn=1 UNION ALL SELECT id FROM w WHERE rn=1) u ORDER BY id
+            ,
+            .expected = &[_]i64{ 1, 1, 3, 3, 5, 5 },
+        },
+        .{
+            .sql =
+            \\WITH w AS MATERIALIZED (SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM t)
+            \\SELECT id FROM (SELECT id FROM w WHERE rn=1 UNION ALL SELECT id FROM w WHERE rn=1) u ORDER BY id
+            ,
+            .expected = &[_]i64{ 1, 1, 3, 3, 5, 5 },
+        },
+        .{
+            .sql =
+            \\WITH w AS NOT MATERIALIZED (SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM t)
+            \\SELECT id FROM (SELECT id FROM w WHERE rn=1 UNION ALL SELECT id FROM w WHERE rn=1) u ORDER BY id
+            ,
+            .expected = &[_]i64{ 1, 1, 3, 3, 5, 5 },
+        },
+        .{
+            .sql =
+            \\WITH w AS (SELECT id,
+            \\ SUM(qty) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running,
+            \\ LAG(qty) OVER (PARTITION BY k ORDER BY id) AS previous FROM t)
+            \\SELECT CAST(running + COALESCE(previous, 0) AS BIGINT) FROM w ORDER BY id
+            ,
+            .expected = &[_]i64{ 10, 40, 30, 100, 50 },
+        },
+    };
+    inline for (cases) |case| {
+        const actual = try helpers.collectBigints(allocator, db, case.sql);
+        defer allocator.free(actual);
+        try std.testing.expectEqualSlices(i64, case.expected, actual);
+    }
+}

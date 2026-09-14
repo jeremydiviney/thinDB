@@ -7,6 +7,59 @@ Snapshot of `zig build bench -Doptimize=ReleaseFast` results, captured for refer
 
 To regenerate: `zig build bench` (always built ReleaseFast regardless of `-Doptimize`).
 
+## Ordinary SQL against StarRocks (2026-09-11)
+
+The [Sierra diagnosis](bench/ordinary_sql_diagnosis.md) records explicit DOP 12/16
+comparisons, separate operator profiles, result validation and socket controls.
+The main findings are unnecessary empty/selective lookup work, repeated lookup
+construction and a confirmed delayed-ACK/Nagle response tail. It includes the
+full timing ranges and separates reproducible costs from unstable rankings.
+
+The [implementation results](bench/ordinary_sql_diagnosis.md#engine-implementation-2026-09-12-utc)
+verify qualified scan pruning, empty fused-probe short-circuiting and POSIX MySQL
+TCP_NODELAY. At DOP 12, median empty-plan latency drops from 805 to 68 ms,
+crossplans from 1,304 to 478 ms, and no-estimates from 489 to 410 ms. DOP 16
+confirms the large plan-query gains; cross-query timing variation and remaining
+lookup/window costs are documented. The final source passes 1,501 tests and the
+ReleaseFast benchmark suite, with all nine final SQL fingerprints preserved.
+
+The [fresh September 12 sweep](bench/ordinary_sql_sweep_20260912.md) reruns all nine
+cases against StarRocks at both DOPs using the application harness. ThinDB has the
+lower median in five cases at each DOP. No-estimates remains about 2× slower;
+base, child and detail cross remain 15–25% slower. All values are validated,
+including the known DATE/DATETIME normalization for detail-cross. The report
+retains full ranges and links to all 180 measured samples.
+
+The [no-estimates follow-up](bench/ordinary_sql_diagnosis.md#no-estimates-follow-up-and-column-pruning-fix-2026-09-12-utc)
+fixes the remaining wide lookup scans through query-block column pruning.
+Unchanged no-estimates SQL now measures 141/143 ms at DOP 12/16 versus
+StarRocks at 214/212 ms; base-simple improves to 157/151 ms. All nine cases
+retain their fingerprints at both DOPs. The final build passes 1,503 tests
+(five existing skips) and the ReleaseFast benchmark suite.
+
+The [full five-method Sierra/AirDNA sweep](bench/rollforward_five_arm_sweep_20260912.md)
+reruns all 30 variants at matched DOP 12, with fresh StarRocks timings and five
+measurements per cell. Ordinary SQL has a lower median in all 30 cases;
+UDF + regions is lowest in 27. All 120 ThinDB fingerprints match the archive,
+and all 60 keyed/unkeyed pairs match. The report records AirDNA's live-versus-
+snapshot differences, full ranges, source counts and every sample.
+
+## Full local ClickBench (2026-09-12)
+
+The [43-query DOP-12 run](bench/clickbench/CLICKBENCH_DOP12_20260912.md) completes
+the full 99,997,497-row dataset on the local Ryzen 9900X. Three executions per
+query use a fresh server per query, with hot time taken from the faster of
+runs two and three. With an 8 GiB cache and 16 GiB query/shared budgets, the
+sum of hot times is 19.296 seconds; peak working set is 24.571 GiB.
+
+The closest common AMD x86 leaderboard tier, c6a.4xlarge, reports ClickHouse
+18.150 s, DuckDB 26.252 s, StarRocks 44.467 s and Umbra 8.097 s. These are
+cross-hardware references, not DOP-matched rankings: the published machines
+have eight physical cores and 32 GiB RAM. The full report includes source
+links, every query, the leaderboard-style geometric ratios and configuration
+differences. Q28/Q29 use octet_length to preserve the canonical byte-length
+semantics. No engine source was changed for this run.
+
 ## SQL window regions (2026-09-10)
 
 `zig build bench-regions` compares ordinary and explicitly keyed SQL over
@@ -320,3 +373,120 @@ zig build bench -Doptimize=ReleaseFast
 Output is to stdout; this file captures the current state. Re-run and update on perf-affecting changes (per CLAUDE.md guidance: track baseline numbers in PR descriptions).
 
 To run a subset: bench bodies live in `bench/main.zig`, `bench/join_bench.zig`, `bench/compact_bench.zig`, `bench/durability_bench.zig`, `bench/tcp_bench.zig`, `bench/window_bench.zig`, `bench/materialize_bench.zig`. Comment out the ones you don't need from `bench/main.zig`'s `pub fn main()`.
+
+## 2026-09-13: shared GROUP BY allocation
+
+The parallel grouping core bounds initial reservation to 8,192 groups per
+bucket, then forecasts larger reservations from observed joint-key density,
+including the source-row counts represented by weighted runs. It retains
+geometric state growth when estimates are too low. The SQL and operator order
+are unchanged. At 256 buckets this limits initial hash storage to 64 MiB;
+Q18 previously initialized 2 GiB from its input-row-count hint.
+
+Local ClickBench on the Ryzen 9 9900X, Windows, DOP 12: 99,997,497 rows,
+16 GiB source cache, 16 GiB query/shared budgets, region pool disabled,
+compaction disabled. Baseline is commit `05bdcff`. Each query/build cell used
+one warmup, five measured executions, and a separate value capture over
+loopback MySQL packet drain. Builds alternated order between queries.
+
+| Query | Baseline median ms | New median ms | Change | Baseline / new peak GiB |
+|---|---:|---:|---:|---:|
+| Q17 | 589.0 | 551.3 | -6.4% | 5.36 / 4.36 |
+| Q18 | 574.1 | 536.2 | -6.6% | 5.24 / 4.42 |
+| Q19 | 953.4 | 990.2 | +3.9% | 8.15 / 8.10 |
+| Q29 | 5230.9 | 5251.7 | +0.4% | 23.66 / 24.12 |
+| Q32 | 195.8 | 195.2 | -0.3% | 3.77 / 3.77 |
+
+The 42-query sum of medians is essentially flat: 13.885 s before and
+13.870 s after. The sum of minima from executions 2/3 is 13.400 s before
+and 13.572 s after. Q19's measured ranges overlap (940–961 vs 948–1012 ms);
+retain its slower median rather than claiming a universal speedup. Q29
+remains variable and its string/regex work is a separate target. Q42 was run
+but excluded from these historical aggregates because its zero/nonzero result
+inconsistency was unresolved during that sweep. The completion fix below does
+not retroactively validate those samples.
+
+A separate Q18 profile retains 24,070,560 groups and halves final hash storage
+from 2 GiB to 1 GiB. Preparation before workers falls from 80.8 to 8.8 ms;
+the worker/final phase rises from 481.0 to 503.0 ms, yielding 561.8 to 511.9 ms
+inside the grouping core. These are instrumented runs, separate from the
+timings above. The new allocation counter covers table/state-array setup,
+not string payload ownership or other operators' allocations.
+
+Verification: `zig build test test-v2` reports 1,531 passed and five existing
+skips; `zig build bench` completes with its exact-value checks. All 41
+deterministic comparable query fingerprints match. Q18 has unordered LIMIT,
+so its selected subset can vary; all 120 captured group counts match a
+separate filtered aggregation on the baseline. Fixtures cover correlated,
+unique and changing distributions, weighted rows, stale hints, workspace
+reuse, geometric growth, and allocation-failure cleanup.
+
+All samples, binaries, profiles, SQL, validation receipts and the complete
+comparison are retained locally under
+`.bench-data/group-allocation-20260912/RESULTS.md`; final raw samples are in
+`bounded-sweep/result.json` there. Production port 13310 was untouched.
+
+## 2026-09-13: parallel GROUP BY completion correctness
+
+The shared staged grouping scheduler could collect final candidates while a
+peer still held rows in an unpublished partial buffer. Independently sampled
+empty queues and active-job counters did not establish pipeline completion.
+Q42's large OFFSET exposed this as an intermittent zero-row result instead of
+the expected ten rows.
+
+The existing published-row counter now retains each row's unfinished-work
+credit through staging and partial buffers until successful aggregation.
+Final collection requires every scan producer to have closed and no unfinished
+rows to remain. Weighted partials count once for this counter while preserving
+their source-row aggregate weights. Failed folds retain their credits until
+abort; aborted workers skip collection. Partial publication also preserves
+ownership and releases its lock on allocation failure. This is a shared engine
+fix; the SQL, operator order, and allocation improvements above are unchanged.
+
+Before the fix, four of 144 Q42 executions returned zero rows. After the fix,
+all 1,600 executions returned ten valid rows across 80 fresh private services
+at max DOP 12, 4, and 1, alternating 8/16 GiB cache. Every service also matched
+the complete grouped result and a diagnostic page with explicit tie breakers
+against a serial reference: 102,676 qualifying source rows and 10,948 groups.
+A deterministic delayed-partial regression fails before the fix and passes
+after it. Fixtures also cover weighted rows, empty input, producer closure,
+large offsets, repeated SQL executions, and publication allocation failures.
+
+The full 43-query ClickBench sweep uses the same local hardware, dataset,
+DOP 12, 16 GiB cache/budgets, and one-warmup/five-measurement protocol above.
+All 41 deterministic archived fingerprints match. Q18's unordered LIMIT
+subset matches a separate serial aggregation; Q42 matches the serial reference
+with allowance for SQL ordering ties. Its median is **16.174 ms**, its minimum
+of executions 2/3 is **16.353 ms**, and every execution returns ten rows.
+
+The new **43-query** sum is **14.199 s in medians** and **13.998 s in hot
+minima**. Comparing the same 42 queries excluding historical Q42, the previous
+allocation build sums to 13.870 s and the fixed build to 14.183 s in medians
+(+2.3%). Q29 accounts for 0.219 s of the 0.313 s difference. These are separate
+sweeps, so the difference includes possible cache, scheduling, and host
+variation; this correctness change does not establish a speedup.
+
+A separate Q42 operator profile confirms seven actual workers under the DOP
+12 cap, 34,857 weighted staged rows, all 10,948 groups, and 10,010 candidates
+before OFFSET. Its final unfinished-row count is zero. Instrumented times
+are excluded from the benchmark scores.
+
+`zig build test test-v2 -j3` reports **1,535 passed and five existing skips**.
+Release and profiling builds succeed. The native suite passes its exact-value
+checks in a fresh scratch directory. Its first workspace run hit `AccessDenied`
+during sustained flush; the same binary's full isolated rerun passed, and both
+logs are retained without attributing an unconfirmed cause to the first error.
+Reproduction scripts, the before/after
+regression logs, every stress sample, full query comparisons, binary hashes,
+and profiles are retained in
+`.bench-data/q42-correctness-20260913/RESULTS.md` and its linked artifacts.
+All private SQL services use port 7881 and `.clickbench-db`.
+
+The subsequent full sweep uses one excluded warmup followed by exactly three
+timed warm executions per query. All 43 queries pass their result checks.
+Their arithmetic means sum to **14.046 s**; the sums of the first, second,
+and third warm measurements are 14.039, 14.292, and 13.807 s. Q42 averages
+13.109 ms and returns ten rows throughout. These means use all three samples
+and are a different metric from the hot minima and medians above. Full
+precision samples and validation receipts are retained under
+`.bench-data/clickbench-warm3-20260913/RESULTS.md`.

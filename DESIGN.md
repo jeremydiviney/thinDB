@@ -367,6 +367,47 @@ Join routing (`.algorithm = .auto`): opaque predicate → NLJ; pure single-range
 
 ### 6.3 Execution model
 
+Scan pruning resolves column references with the same rules as row evaluation.
+Alias, projection, and compute wrappers map hints back to unchanged source
+columns. Limits and windows stop hints; aggregates only forward group-key hints
+when their output is uncapped. A hint must not change the rows used to calculate
+a window, an aggregate value, or a limited result.
+
+The staged SQL compiler also derives join scans' required columns from
+their ancestors within the current query block. This keeps unused payloads out
+of lookup scans and hash builds even when a sibling CTE contains a wildcard.
+It retains join keys, filters, expressions, grouping and ordering inputs through
+filter/compute wrappers. It declines at wildcards or column-scope boundaries it
+cannot resolve. This pre-execution column projection leaves join order and SQL
+results intact.
+
+Before preparing a fused hash join, a pure filter over an existing materialized
+stage may check that stage for a surviving probe row. An empty probe skips the
+lookup builds through a chain of non-FULL joins. The check reuses stage buffers,
+retains parallel probing for nonempty inputs, and does not add a materialization
+boundary or choose a different join order or algorithm.
+
+Parallel grouped aggregation initially reserves at most one 8,192-row batch's
+worth of groups per bucket and allocates its state slab only when rows arrive.
+This keeps small tables' setup allocations out of the workers' allocation
+traffic while bounding speculative memory for large hints. When a table grows,
+it forecasts capacity from the observed number of distinct composite keys per
+source row, counting weighted run partials by their original row counts. The
+forecast has 25% headroom and is capped by the existing statistical reservation
+hint; actual insertions can always grow beyond either estimate. This changes
+memory reservation only, preserving operator order, grouping, and aggregate
+semantics. Reused workspaces retain their allocated capacity and reset the
+observed row counters. Developer profiles report actual groups, hash bytes,
+state capacity/bytes, growth count, and worker-summed allocation time.
+
+Parallel grouping collects its final candidates only after every scan producer
+has closed and all published staged rows have been aggregated. A row stays
+counted as unfinished while queued, being partitioned, held in a partial bucket
+buffer, or being aggregated. Weighted run partials count once in this work
+counter; their weights still determine aggregate values. Empty queue snapshots
+cannot establish completion during a hand-off. Failed folds retain their work
+count until the query aborts, and aborted workers skip candidate collection.
+
 The pipeline runs in pull mode (Volcano-style): `Sink.next()` pulls from upstream, which pulls from its upstream, etc. Each operator's `next()` returns a `Batch` — a small struct holding column slices for the rows currently in flight.
 
 Hot kernels (predicate evaluation, aggregation accumulators, arithmetic) use `@Vector(N, T)` for SIMD. Vector width is platform-dependent; code is written generically and the compiler chooses.
@@ -434,6 +475,50 @@ concurrent allocation from the input worker's arena.
 Every cached run rebuilds the source against fresh
 snapshots. Grouping exactly by the current range keys is supported as one
 aggregate group per range, including NULL keys and all-NULL values.
+
+`UNION ALL` branches that reference the same CTE input can instead remain
+inside one region. The compiler retains the shared frame, executes each
+branch's filters, projections, expressions, compatible windows and joins,
+then concatenates their outputs within each declared-key partition. Nested
+unions use the same rule. Frame snapshots borrow column buffers; each
+branch owns its result buffers until the union consumes them. Filters and
+joins retain empty range positions so branches can be aligned without
+another exchange. Positional names, casts and NULLability use the ordinary
+union's column planner, and left-before-right order preserves window ties.
+
+Fusion requires value-identical partition keys in corresponding output
+positions and an exclusively consumed shared input. Forced materialization,
+externally shared CTEs, key replacements, incompatible windows, branch
+aggregation/table functions and joins depending on the retained input keep
+ordinary staging. A failed fusion attempt retries the existing staged-ingress
+path at the same boundary. Cached programs recheck both the source versions
+and the branch-sharing recipe before reuse. These are structural SQL rules;
+no query text, table name or UDF name selects the optimization.
+
+Branch collection checks join kind, range conditions and residual predicates
+before preparing sources or lookup tables. A branch already filtered to false
+also retains ordinary staging so its joins can be pruned. These structurally
+unsupported forks do not execute speculative join inputs before fallback;
+compatible regions above or below the fork remain available.
+
+Failures that still require data-dependent proofs, such as duplicate lookup
+keys, can reuse a bounded per-database rejection hint. Its fingerprint includes
+the input/table versions, declared keys, CTE sharing, session/compile context
+and immutable scalar kernel identity. Changed inputs retry; volatile calls,
+unversionable sources and UDFs without an immutable execution contract do not
+retain rejection hints. The hint stores no rows and only skips fusion; the
+ordinary fallback always recompiles. Join-input compilation/execution errors
+retain their error identity instead of becoming cached eligibility failures.
+
+Regions whose program folds to only emission use the ordinary scan path,
+avoiding an exchange and consolidation without shard-local work. Column
+movement supports every stored payload type, including Boolean and UUID
+values and their validity bits. Broadcast and co-partitioned join payloads
+retain their right-side qualifier; they cannot overwrite a same-named left
+column. Explicitly selected right join keys retain their own values and NULLs.
+Cached lookup and emptiness proofs include the table's cache UID and
+tombstone generation, so recreating a table or deleting only persisted rows
+invalidates them even when memtable and manifest counters are unchanged.
 
 Consecutive entry projections preserve their evaluation order: only the
 lowest projection is absorbed into the scan entry; later projections and
@@ -914,8 +999,14 @@ while (try q.next()) |batch| { ... }
 ```
 
 The Connection abstracts a **transport**:
+
 - **In-process** (today): client and server in the same address space. The client encodes operator IR into bytes; the server-side dispatcher decodes and runs against the in-process `Database`. Exercises the wire path for tests with no socket overhead. (Walking skeleton currently passes `Batch` values directly across the boundary; batch wire-encoding lands with the TCP transport.)
 - **TCP** (later): same `Connection` API, bytes flow over a socket.
+
+Accepted MySQL sockets enable `TCP_NODELAY` on supported POSIX platforms to avoid
+holding a short result tail behind a delayed ACK. Socket-option helpers remain
+best effort. On Windows, Zig 0.16 exposes AFD handles without a public socket-option
+setter, so these helpers currently leave the OS defaults in place.
 
 ### 15.1 Operator IR
 

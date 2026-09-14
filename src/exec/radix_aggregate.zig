@@ -787,7 +787,8 @@ pub const RadixAggregate = struct {
         return self.output_schema;
     }
     pub fn addPrune(self: *RadixAggregate, pred: predicate.Predicate) !void {
-        return self.upstream.addPrune(pred);
+        if (self.top_k != null) return;
+        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
     }
     pub fn stats(self: *RadixAggregate) PipelineStats {
         return .{ .upper_rows = self.upstream.stats().upper_rows };
@@ -2090,7 +2091,8 @@ pub const RadixLeaseAggregate = struct {
         return self.output_schema;
     }
     pub fn addPrune(self: *RadixLeaseAggregate, pred: predicate.Predicate) !void {
-        return self.upstream.addPrune(pred);
+        if (self.top_k != null) return;
+        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
     }
     pub fn stats(self: *RadixLeaseAggregate) PipelineStats {
         return .{ .upper_rows = self.upstream.stats().upper_rows };

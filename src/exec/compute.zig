@@ -558,15 +558,20 @@ pub const Compute = struct {
     }
 
     pub fn addPrune(self: *Compute, pred: Predicate) !void {
-        // Pushdown is safe only for predicates referencing upstream
-        // columns (not derived ones). For v1 simplicity, just forward
-        // — the Filter operator above us validates predicate columns
-        // against our output schema, which includes both upstream and
-        // derived, so it'll only push down what's pushable through
-        // its own check. Anything Filter pushes here we forward to
-        // upstream blindly; upstream's addPrune does its own column
-        // check.
-        return self.upstream.addPrune(pred);
+        if (self.chain != null) return;
+        const idx = types.findColumn(self.output_schema, pred.col) orelse return Error.ColumnNotFound;
+        var src_idx = idx;
+        for (self.derived, self.derived_output_indices) |derived, out_idx| {
+            if (out_idx != idx) continue;
+            switch (derived.kind) {
+                .rename => |rename| src_idx = rename.src_idx,
+                else => return,
+            }
+            break;
+        }
+        var rewritten = pred;
+        rewritten.col = self.upstream.outputSchema()[src_idx].name;
+        return self.upstream.addPrune(rewritten);
     }
 
     /// Compute preserves row count (adds columns, doesn't drop rows).
@@ -724,8 +729,9 @@ pub const Compute = struct {
     /// column still exists below, but under a different name than the
     /// predicate uses.
     pub fn tryFuseFilter(self: *Compute, expr: exec.predicate.PredicateExpr) !bool {
-        for (self.derived) |d| {
-            if (exec.predicate.touchesColumn(expr, d.name)) return false;
+        if (self.chain != null) return false;
+        for (self.derived_output_indices) |idx| {
+            if (exec.predicate.touches_resolved_column(expr, self.output_schema, idx)) return false;
         }
         return self.upstream.tryFuseFilter(expr);
     }

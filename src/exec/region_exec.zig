@@ -30,6 +30,7 @@ const single_batch = @import("single_batch.zig");
 const udf_mod = @import("../udf.zig");
 const window_mod = @import("window.zig");
 const ir = @import("../ir/ir.zig");
+const set_union = @import("set_union.zig");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -46,7 +47,7 @@ const REF_ROW_MASK: u32 = (1 << REF_ROW_BITS) - 1;
 pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows: []const u32) !void {
     const base = store.rowCount();
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             const l = &@field(store.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, rows.len);
             for (rows) |r| l.appendAssumeCapacity(s[r]);
@@ -60,7 +61,6 @@ pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows:
             },
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (store.nulls != null) try appendScatterValidity(alloc, store, v, rows, base);
 }
@@ -119,7 +119,7 @@ fn runsDominate(rows: []const u32) bool {
 pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnView, refs: []const u32) !void {
     const base = dst.rowCount();
     switch (dst.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |*l, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |*l, tag| {
             try l.ensureUnusedCapacity(alloc, refs.len);
             for (refs) |r| {
                 l.appendAssumeCapacity(@field(srcs[r >> REF_ROW_BITS].data, @tagName(tag))[r & REF_ROW_MASK]);
@@ -131,7 +131,6 @@ pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnVie
             try d.ensureUnusedValueCapacity(alloc, refs.len, bytes);
             for (refs) |r| d.appendValueAssumeCapacity(stringViewOf(srcs[r >> REF_ROW_BITS]).rowBytes(r & REF_ROW_MASK));
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) try appendGatherValidity(alloc, dst, srcs, refs, base);
 }
@@ -172,14 +171,13 @@ pub fn appendStoreRange(alloc: Allocator, dst: *ColumnStore, src: *const ColumnS
 /// Range append from a view (same contract as `appendStoreRange`).
 pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start: usize, end: usize) !void {
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             try @field(dst.data, @tagName(tag)).appendSlice(alloc, s[start..end]);
         },
         .varchar, .string, .char, .json => |sv| switch (dst.data) {
             .varchar, .string, .char, .json => |*d| try d.appendRange(alloc, sv, start, end),
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) {
         const base = dst.rowCount() - (end - start);
@@ -193,14 +191,13 @@ pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start
 pub fn appendRowValue(alloc: Allocator, dst: *ColumnStore, v: ColumnView, i: usize) !void {
     if (!v.isValid(i)) return dst.appendNulls(alloc, 1);
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             try @field(dst.data, @tagName(tag)).append(alloc, s[i]);
         },
         .varchar, .string, .char, .json => |s| switch (dst.data) {
             .varchar, .string, .char, .json => |*d| try d.appendValue(alloc, s.rowBytes(i)),
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) try dst.appendValidBit(alloc, dst.rowCount() - 1, true);
 }
@@ -213,7 +210,7 @@ const NO_MATCH: u32 = std.math.maxInt(u32);
 fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: []const u32) !void {
     const base = dst.rowCount();
     switch (src.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |vals, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |vals, tag| {
             const l = &@field(dst.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, ords.len);
             for (ords) |o| l.appendAssumeCapacity(if (o == NO_MATCH) 0 else vals[o]);
@@ -229,7 +226,6 @@ fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: [
             },
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     for (ords, 0..) |o, k| {
         try dst.appendValidBit(alloc, base + k, o != NO_MATCH and src.isValid(o));
@@ -240,7 +236,7 @@ fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: [
 fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, count: usize) !void {
     if (!v.isValid(row)) return dst.appendNulls(alloc, count);
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             const l = &@field(dst.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, count);
             l.appendNTimesAssumeCapacity(s[row], count);
@@ -253,7 +249,6 @@ fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, 
             },
             else => unreachable,
         },
-        else => return error.UnsupportedQueryShape,
     }
     if (dst.nulls != null) {
         const base = dst.rowCount() - count;
@@ -303,8 +298,7 @@ fn stringViewOf(v: ColumnView) storage.StringView {
 fn routeKeyBytes(v: ColumnView, r: usize) []const u8 {
     return switch (v.data) {
         .varchar, .string, .char, .json => |s| s.rowBytes(r),
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
-        else => "",
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
     };
 }
 
@@ -1003,6 +997,12 @@ fn sortedBytesContains(items: []const []const u8, key: []const u8) bool {
 }
 
 pub const RegionOp = union(enum) {
+    filter: exec.predicate.PredicateExpr,
+    /// Snapshots borrow columns owned by earlier op states. Distinct branch
+    /// op states keep those buffers alive until both branches have finished.
+    save_frame,
+    restore_frame: usize,
+    union_all: struct { left: usize, left_cols: []const usize, right_cols: []const usize, names: []const []const u8 },
     window: struct { specs: []const ir.WindowSpec, calls: []const ir.WindowCall },
     /// Row-wise derived columns via the engine expression evaluator (one
     /// exec.Compute instance per worker, evalBatch over the whole shard).
@@ -1177,6 +1177,28 @@ pub const Program = struct {
             if (output_schema.len != 0) return error.UnsupportedQueryShape;
             const in = schema_at[oi];
             schema_at[oi + 1] = switch (op) {
+                .filter => |predicate| blk: {
+                    var validated = predicate;
+                    try exec.predicate.validateExpr(&validated, in);
+                    break :blk in;
+                },
+                .save_frame => in,
+                .restore_frame => |saved| blk: {
+                    if (saved >= oi or ops[saved] != .save_frame) return error.UnsupportedQueryShape;
+                    break :blk schema_at[saved];
+                },
+                .union_all => |u| blk: {
+                    if (u.left >= oi or ops[u.left] != .save_frame or u.left_cols.len != u.right_cols.len or
+                        u.names.len != u.left_cols.len) return error.UnsupportedQueryShape;
+                    const left = schema_at[u.left];
+                    const cols = try a.alloc(Column, u.names.len);
+                    for (u.left_cols, u.right_cols, u.names, cols) |lc, rc, name, *col| {
+                        const plan = try set_union.plan_column(left[try checkCol(left, lc)], in[try checkCol(in, rc)]);
+                        col.* = plan.column;
+                        col.name = try a.dupe(u8, name);
+                    }
+                    break :blk cols;
+                },
                 .window => |w| blk: {
                     var inst = try make_window_instance(base_alloc, in, w.specs, w.calls);
                     defer inst.q.deinit();
@@ -1509,6 +1531,22 @@ pub const RegionWorker = struct {
     side_data: []const ShardData = &.{},
 
     const OpState = union(enum) {
+        filter: struct {
+            predicate: exec.predicate.PredicateExpr,
+            cols: []ColumnStore,
+            mask: std.ArrayListUnmanaged(bool) = .empty,
+            keep: std.ArrayListUnmanaged(u32) = .empty,
+            ranges: std.ArrayListUnmanaged([2]u32) = .empty,
+        },
+        saved: Frame,
+        restore: void,
+        union_all: struct {
+            cols: []ColumnStore,
+            left_cast: []ColumnStore,
+            right_cast: []ColumnStore,
+            plans: []set_union.ColumnPlan,
+            ranges: std.ArrayListUnmanaged([2]u32) = .empty,
+        },
         window: WindowInstance,
         compute: ComputeInstance,
         ranks: struct { out: ColumnStore },
@@ -1561,6 +1599,33 @@ pub const RegionWorker = struct {
         }
         for (prog.ops, states, 0..) |op, *st, oi| {
             st.* = switch (op) {
+                .filter => |predicate| blk: {
+                    var validated = predicate;
+                    try exec.predicate.validateExpr(&validated, prog.schema_at[oi]);
+                    break :blk .{ .filter = .{ .predicate = validated, .cols = try initStores(alloc, prog.schema_at[oi]) } };
+                },
+                .save_frame => .{ .saved = .{
+                    .views = try alloc.alloc(ColumnView, prog.schema_at[oi].len),
+                    .width = prog.schema_at[oi].len,
+                    .rows = 0,
+                    .ranges = &.{},
+                } },
+                .restore_frame => .{ .restore = {} },
+                .union_all => |u| blk: {
+                    const schema = prog.schema_at[oi + 1];
+                    const cols = try initStores(alloc, schema);
+                    errdefer freeStores(alloc, cols);
+                    const left_cast = try initStores(alloc, schema);
+                    errdefer freeStores(alloc, left_cast);
+                    const right_cast = try initStores(alloc, schema);
+                    errdefer freeStores(alloc, right_cast);
+                    const plans = try alloc.alloc(set_union.ColumnPlan, schema.len);
+                    errdefer alloc.free(plans);
+                    for (plans, u.left_cols, u.right_cols) |*plan, lc, rc| {
+                        plan.* = try set_union.plan_column(prog.schema_at[u.left][lc], prog.schema_at[oi][rc]);
+                    }
+                    break :blk .{ .union_all = .{ .cols = cols, .left_cast = left_cast, .right_cast = right_cast, .plans = plans } };
+                },
                 .window => |w| .{ .window = try make_window_instance(alloc, prog.schema_at[oi], w.specs, w.calls) },
                 .compute => |c| .{
                     .compute = try makeComputeInstance(alloc, prog.schema_at[oi], c.derived, prog.registry),
@@ -1704,6 +1769,21 @@ pub const RegionWorker = struct {
 
     fn deinitStates(alloc: Allocator, states: []OpState) void {
         for (states) |*st| switch (st.*) {
+            .saved => |s| alloc.free(s.views),
+            .restore => {},
+            .filter => |*f| {
+                freeStores(alloc, f.cols);
+                f.mask.deinit(alloc);
+                f.keep.deinit(alloc);
+                f.ranges.deinit(alloc);
+            },
+            .union_all => |*u| {
+                freeStores(alloc, u.cols);
+                freeStores(alloc, u.left_cast);
+                freeStores(alloc, u.right_cast);
+                alloc.free(u.plans);
+                u.ranges.deinit(alloc);
+            },
             .compute => |*c| c.q.deinit(),
             .window => |*w| w.q.deinit(),
             .ranks => |*s| s.out.deinit(alloc),
@@ -1739,6 +1819,18 @@ pub const RegionWorker = struct {
     pub fn retainedBytes(self: *const RegionWorker) usize {
         var n: usize = self.scratch.queryCapacity();
         for (self.states) |*st| switch (st.*) {
+            .saved => |s| n += s.views.len * @sizeOf(ColumnView),
+            .restore => {},
+            .filter => |*f| {
+                for (f.cols) |*c| n += storeRetainedBytes(c);
+                n += f.mask.capacity * @sizeOf(bool) + f.keep.capacity * @sizeOf(u32) + f.ranges.capacity * @sizeOf([2]u32);
+            },
+            .union_all => |*u| {
+                for (u.cols) |*c| n += storeRetainedBytes(c);
+                for (u.left_cast) |*c| n += storeRetainedBytes(c);
+                for (u.right_cast) |*c| n += storeRetainedBytes(c);
+                n += u.plans.len * @sizeOf(set_union.ColumnPlan) + u.ranges.capacity * @sizeOf([2]u32);
+            },
             .window => |*w| {
                 for (w.ptr.output_columns) |*c| n += storeRetainedBytes(c);
                 for (w.ptr.string_outputs) |s| n += s.len * @sizeOf(?[]const u8);
@@ -1804,6 +1896,21 @@ pub const RegionWorker = struct {
                 self.op_ticks.?[oi] += exec.prof.nowTicks() - t_op;
             };
             switch (op) {
+                .save_frame => {
+                    const saved = &st.saved;
+                    @memcpy(saved.views, fr.views[0..fr.width]);
+                    saved.rows = fr.rows;
+                    saved.ranges = fr.ranges;
+                },
+                .restore_frame => |saved| {
+                    const src = &self.states[saved].saved;
+                    @memcpy(fr.views[0..src.width], src.views);
+                    fr.width = src.width;
+                    fr.rows = src.rows;
+                    fr.ranges = src.ranges;
+                },
+                .filter => try self.run_filter(&st.filter, &fr, oi),
+                .union_all => |u| try self.run_union(u, &st.union_all, &fr),
                 .window => {
                     const batch = try st.window.ptr.eval_batch(.{
                         .schema = self.prog.schema_at[oi],
@@ -1893,6 +2000,80 @@ pub const RegionWorker = struct {
                 },
             }
         }
+    }
+
+    fn run_filter(self: *RegionWorker, state: *@FieldType(OpState, "filter"), fr: *Frame, oi: usize) !void {
+        try state.mask.resize(self.alloc, fr.rows);
+        try exec.predicate.evaluatePredicate(self.scratch.allocator(), state.predicate, self.prog.schema_at[oi], .{
+            .schema = self.prog.schema_at[oi],
+            .values = fr.views[0..fr.width],
+            .row_count = fr.rows,
+        }, state.mask.items);
+        state.keep.clearRetainingCapacity();
+        try state.keep.ensureTotalCapacity(self.alloc, fr.rows);
+        state.ranges.clearRetainingCapacity();
+        try state.ranges.ensureTotalCapacity(self.alloc, fr.ranges.len);
+        for (fr.ranges) |range| {
+            const start: u32 = @intCast(state.keep.items.len);
+            for (range[0]..range[1]) |row| if (state.mask.items[row]) state.keep.appendAssumeCapacity(@intCast(row));
+            state.ranges.appendAssumeCapacity(.{ start, @intCast(state.keep.items.len) });
+        }
+        if (state.keep.items.len == fr.rows) return;
+        const use_runs = runsDominate(state.keep.items);
+        for (state.cols, fr.views[0..fr.width]) |*column, view| {
+            column.clear();
+            if (use_runs)
+                try scatterColumnRuns(self.alloc, column, view, state.keep.items)
+            else
+                try scatterColumn(self.alloc, column, view, state.keep.items);
+        }
+        for (state.cols, fr.views[0..fr.width]) |*column, *view| view.* = column.view();
+        fr.rows = state.keep.items.len;
+        fr.ranges = state.ranges.items;
+    }
+
+    fn run_union(self: *RegionWorker, op: @FieldType(RegionOp, "union_all"), state: *@FieldType(OpState, "union_all"), fr: *Frame) !void {
+        const left = &self.states[op.left].saved;
+        // The compiler accepts only branches that preserve the identity and
+        // number of input ranges, including empty ranges after a filter.
+        if (left.ranges.len != fr.ranges.len) return error.UnsupportedQueryShape;
+        state.ranges.clearRetainingCapacity();
+        try state.ranges.ensureTotalCapacity(self.alloc, fr.ranges.len);
+        var rows: u32 = 0;
+        for (left.ranges, fr.ranges) |l, r| {
+            const start = rows;
+            rows = std.math.add(u32, rows, l[1] - l[0]) catch return error.ArithmeticOverflow;
+            rows = std.math.add(u32, rows, r[1] - r[0]) catch return error.ArithmeticOverflow;
+            state.ranges.appendAssumeCapacity(.{ start, rows });
+        }
+        for (state.cols, state.plans, state.left_cast, state.right_cast, op.left_cols, op.right_cols) |*column, plan, *lc, *rc, li, ri| {
+            var lv = left.views[li];
+            var rv = fr.views[ri];
+            if (plan.left_cast) |kernel| {
+                lc.clear();
+                try kernel(self.alloc, &.{lv}, lc, left.rows);
+                lv = lc.view();
+            }
+            if (plan.right_cast) |kernel| {
+                rc.clear();
+                try kernel(self.alloc, &.{rv}, rc, fr.rows);
+                rv = rc.view();
+            }
+            column.clear();
+            const bytes = if (plan.column.type.isString() or plan.column.type == .json)
+                stringViewOf(lv).bytes.len + stringViewOf(rv).bytes.len
+            else
+                0;
+            try column.reserveTotal(self.alloc, rows, bytes);
+            for (left.ranges, fr.ranges) |l, r| {
+                try appendViewRange(self.alloc, column, lv, l[0], l[1]);
+                try appendViewRange(self.alloc, column, rv, r[0], r[1]);
+            }
+        }
+        fr.width = state.cols.len;
+        for (state.cols, fr.views[0..fr.width]) |*column, *view| view.* = column.view();
+        fr.rows = rows;
+        fr.ranges = state.ranges.items;
     }
 
     /// Lever 3: precomputed normalized sort keys per order column (the
@@ -3090,13 +3271,12 @@ pub const RegionPool = struct {
 /// Approximate retained capacity of one store (validity bitmap excluded).
 fn storeRetainedBytes(c: *const ColumnStore) usize {
     return switch (c.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .date, .datetime, .decimal64, .decimal128 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
         .varchar, .string, .char, .json => |s| blk: {
             var n: usize = s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity;
             if (s.wide_offsets) |w| n += w.capacity * @sizeOf(u64);
             break :blk n;
         },
-        else => 0,
     };
 }
 
@@ -4419,6 +4599,93 @@ fn appendI64As(alloc: Allocator, dst: *ColumnStore, v: i64) !void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "region program: shared frames retain payloads and empty range identity across pooled runs" {
+    const alloc = testing.allocator;
+    inline for (.{ types.Type.boolean, types.Type.uuid }) |column_type| {
+        const T = if (column_type == .boolean) u8 else u128;
+        const high: T = if (column_type == .boolean) 1 else std.math.maxInt(u128);
+        const entry = [_]Column{
+            .{ .name = "id", .type = .int },
+            .{ .name = "value", .type = column_type, .nullable = true },
+        };
+        var shard = ShardData{};
+        defer shard.deinit(alloc);
+        try shard.ensure(alloc, &entry);
+        try shard.cols[0].data.int.appendSlice(alloc, &.{ 0, 1, 2, 3 });
+        try @field(shard.cols[1].data, @tagName(column_type)).appendSlice(alloc, &.{ 0, 1, high, 0 });
+        for (0..4) |row| try shard.cols[1].appendValidBit(alloc, row, row != 1);
+        shard.rows = 4;
+        try shard.ranges.appendSlice(alloc, &.{ .{ 0, 2 }, .{ 2, 2 }, .{ 2, 4 } });
+        const ops = [_]RegionOp{
+            .save_frame,
+            .{ .filter = .{ .leaf = .{ .col = "id", .op = .lte, .val = .{ .int = 2 } } } },
+            .save_frame,
+            .{ .restore_frame = 0 },
+            .{ .filter = .{ .leaf = .{ .col = "id", .op = .gte, .val = .{ .int = 1 } } } },
+            .{ .union_all = .{ .left = 2, .left_cols = &.{ 0, 1 }, .right_cols = &.{ 0, 1 }, .names = &.{ "id", "value" } } },
+            .{ .emit = .{ .cols = &.{ 0, 1 } } },
+        };
+        var program = try Program.build(alloc, &entry, &ops, null);
+        defer program.deinit();
+        var worker = try RegionWorker.init(alloc, &program);
+        defer worker.deinit();
+        const out = try RegionWorker.initStores(alloc, program.output_schema);
+        defer RegionWorker.freeStores(alloc, out);
+        for (0..3) |_| {
+            for (out) |*column| column.clear();
+            try worker.runShard(&shard, out);
+            try testing.expectEqualSlices(i32, &.{ 0, 1, 1, 2, 2, 3 }, out[0].data.int.items);
+            const expected = [_]?T{ 0, null, null, high, high, 0 };
+            const view = out[1].view();
+            for (expected, 0..) |value, row| {
+                try testing.expectEqual(value != null, view.isValid(row));
+                if (value) |v| try testing.expectEqual(v, @field(view.data, @tagName(column_type))[row]);
+            }
+            try testing.expectEqualSlices([2]u32, &.{ .{ 0, 3 }, .{ 3, 3 }, .{ 3, 6 } }, worker.states[5].union_all.ranges.items);
+            try testing.expect(worker.retainedBytes() > 0);
+        }
+    }
+}
+
+test "region program: invalid frame references and union layouts fail before execution" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{.{ .name = "id", .type = .int }};
+    inline for (.{
+        &[_]RegionOp{ .{ .restore_frame = 0 }, .{ .emit = .{ .cols = &.{0} } } },
+        &[_]RegionOp{ .{ .filter = .{ .always = true } }, .{ .restore_frame = 0 }, .{ .emit = .{ .cols = &.{0} } } },
+        &[_]RegionOp{ .save_frame, .{ .union_all = .{ .left = 0, .left_cols = &.{0}, .right_cols = &.{}, .names = &.{"id"} } }, .{ .emit = .{ .cols = &.{0} } } },
+        &[_]RegionOp{ .save_frame, .{ .union_all = .{ .left = 0, .left_cols = &.{1}, .right_cols = &.{0}, .names = &.{"id"} } }, .{ .emit = .{ .cols = &.{0} } } },
+    }) |ops| try testing.expectError(error.UnsupportedQueryShape, Program.build(alloc, &entry, ops, null));
+}
+
+test "region column movement preserves boolean and UUID payloads and NULLs" {
+    const alloc = testing.allocator;
+    inline for (.{ types.Type.boolean, types.Type.uuid }) |column_type| {
+        const T = if (column_type == .boolean) u8 else u128;
+        const high: T = if (column_type == .boolean) 1 else std.math.maxInt(u128);
+        const values = [_]T{ 0, 1, high };
+        const source = ColumnView{ .data = @unionInit(storage.column.ValueView, @tagName(column_type), &values), .nulls = &.{5} };
+        var out = try ColumnStore.init(alloc, column_type, true);
+        defer out.deinit(alloc);
+        try scatterColumn(alloc, &out, source, &.{ 2, 1, 0 });
+        try gatherColumn(alloc, &out, &.{ source, source }, &.{ 1 << REF_ROW_BITS, 2 });
+        try appendViewRange(alloc, &out, source, 0, 3);
+        try appendRowValue(alloc, &out, source, 1);
+        try appendRowValue(alloc, &out, source, 2);
+        try gatherColumnOpt(alloc, &out, source, &.{ 1, NO_MATCH, 0 });
+        try appendRepeat(alloc, &out, source, 2, 2);
+        try appendRepeat(alloc, &out, source, 1, 1);
+        const expected = [_]?T{ high, null, 0, 0, high, 0, null, high, null, high, null, null, 0, high, high, null };
+        try testing.expectEqual(expected.len, out.rowCount());
+        const result = out.view();
+        for (expected, 0..) |value, i| {
+            try testing.expectEqual(value != null, result.isValid(i));
+            if (value) |v| try testing.expectEqual(v, @field(result.data, @tagName(column_type))[i]);
+        }
+        try testing.expect(storeRetainedBytes(&out) >= expected.len * @sizeOf(T));
+    }
+}
 
 test "region exchange + ordered consolidation: multiset, order, group ranges" {
     const alloc = testing.allocator;
