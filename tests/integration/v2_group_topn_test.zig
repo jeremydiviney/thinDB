@@ -6,6 +6,64 @@ const helpers = @import("sql_helpers.zig");
 const runSql = helpers.runSql;
 const exec = helpers.exec;
 
+test "group completion: filtered compound groups retain large OFFSET pages across parallel executions" {
+    const allocator = std.testing.allocator;
+    const group_count = 10_037;
+    const Row = struct { id: i64, g0: i32, g1: i32, kept: i32 };
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop });
+        defer db.close();
+        const t = try db.table("completion_rows", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g0", .type = .int },
+                .{ .name = "g1", .type = .int },
+                .{ .name = "kept", .type = .int },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+        const input = try allocator.alloc(Row, group_count * 3);
+        defer allocator.free(input);
+        for (input, 0..) |*row, i| {
+            const key = i / 3;
+            row.* = .{ .id = @intCast(i), .g0 = @intCast(key / 101), .g1 = @intCast(key % 101), .kept = @intFromBool(i % 3 != 2) };
+        }
+        try t.insert(input);
+        try t.flush();
+
+        for (0..16) |_| {
+            var q = try runSql(allocator, db, "SELECT g0, g1, COUNT(*) AS c FROM completion_rows WHERE kept = 1 GROUP BY g0, g1 ORDER BY c DESC LIMIT 10 OFFSET 10000");
+            defer q.deinit();
+            var seen = [_]bool{false} ** group_count;
+            var count: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |i| {
+                    const key: usize = @intCast(batch.values[0].data.int[i] * 101 + batch.values[1].data.int[i]);
+                    try std.testing.expect(key < group_count);
+                    try std.testing.expect(!seen[key]);
+                    seen[key] = true;
+                    try std.testing.expectEqual(@as(i64, 2), batch.values[2].data.bigint[i]);
+                    count += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 10), count);
+        }
+        inline for (.{
+            "SELECT g0, g1, COUNT(*) AS c FROM completion_rows WHERE kept = 7 GROUP BY g0, g1 ORDER BY c DESC LIMIT 10 OFFSET 10000",
+            "SELECT g0, g1, COUNT(*) AS c FROM completion_rows WHERE kept = 1 GROUP BY g0, g1 ORDER BY c DESC LIMIT 10 OFFSET 20000",
+        }) |sql| {
+            var empty = try runSql(allocator, db, sql);
+            defer empty.deinit();
+            var count: usize = 0;
+            while (try empty.next()) |batch| count += batch.row_count;
+            try std.testing.expectEqual(@as(usize, 0), count);
+        }
+    }
+}
+
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();

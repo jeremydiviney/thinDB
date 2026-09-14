@@ -43,6 +43,10 @@ const group_table = thindb.exec.group_table;
 const GroupTable = group_table.IntKeyMemsetTable(96);
 const TOP_K: usize = 10;
 
+test {
+    std.testing.refAllDecls(PipeBucket);
+}
+
 /// Selective-query right-sizing: one grid worker per this many surviving
 /// (post-zone-map) row groups, so a filter that touches a handful of row
 /// groups doesn't pay full-DOP worker setup (scans, staging, bucket scratch).
@@ -1374,20 +1378,13 @@ const StateSlab = struct {
     cap: usize = 0,
     n_slots: usize = 0,
     stride: usize = 0,
-    // Group-count reservation requested before the layout (hence stride) is
-    // known; applied on the first prepare().
     reserve_hint: usize = 0,
 
     fn strideFor(n_slots: usize) usize {
         return std.mem.alignForward(usize, STATE_HEAD_BYTES + n_slots * @sizeOf(i64), 16);
     }
 
-    fn reserve(self: *StateSlab, records: usize) void {
-        if (records > self.reserve_hint) self.reserve_hint = records;
-    }
-
-    // Bind the slab to the query's slot count before folding. First call (or a
-    // layout change) sets the stride and honours any pending reservation.
+    // A layout change invalidates the old records even when capacity suffices.
     fn prepare(self: *StateSlab, allocator: Allocator, n_slots: usize) !void {
         if (self.stride != 0 and self.n_slots == n_slots) return;
         if (self.bytes.len > 0) allocator.free(self.bytes);
@@ -1408,12 +1405,12 @@ const StateSlab = struct {
         self.cap = records;
     }
 
-    fn ensureUnusedCapacity(self: *StateSlab, allocator: Allocator, additional: usize) !void {
+    fn ensureUnusedCapacity(self: *StateSlab, allocator: Allocator, additional: usize, reservation: usize) !void {
         const need = self.len + additional;
         if (need <= self.cap) return;
-        var new_cap = if (self.cap == 0) @max(self.reserve_hint, 8) else self.cap * 2;
+        var new_cap = if (self.cap == 0) @as(usize, 8) else self.cap * 2;
         while (new_cap < need) new_cap *= 2;
-        try self.growTo(allocator, new_cap);
+        try self.growTo(allocator, @max(new_cap, reservation));
     }
 
     inline fn head(self: StateSlab, gid: usize) *StateHead {
@@ -1554,12 +1551,20 @@ const StageBucketBuilder = struct {
     }
 };
 
+const GroupAllocationProfile = struct {
+    ticks: i64 = 0,
+    table_growths: usize = 0,
+};
+
 const PipeBucket = struct {
     queue_lock: std.atomic.Mutex = .unlocked,
     agg_lock: std.atomic.Mutex = .unlocked,
     chunks: std.ArrayListUnmanaged(PipeChunk) = .empty,
     queued_rows: u64 = 0,
     table: GroupTable,
+    expected_groups: usize,
+    observed_input_rows: u64 = 0,
+    allocation_profile: GroupAllocationProfile = .{},
     states: StateSlab = .{},
     // Parallel to `states` (gid-indexed); populated only for string MIN/MAX
     // queries. Empty for the numeric common case.
@@ -1588,11 +1593,205 @@ const PipeBucket = struct {
     row_count: u64 = 0,
 
     fn init(allocator: Allocator, expected_groups: usize) !PipeBucket {
+        // One batch bounds speculative memory while keeping small tables'
+        // page faults out of the scan/route/group workers' allocation traffic.
+        const initial_groups = @min(expected_groups, PIPE_CHUNK_ROWS);
         return .{
-            .table = try GroupTable.init(allocator, expected_groups),
+            .table = try GroupTable.init(allocator, initial_groups),
+            .expected_groups = expected_groups,
+            .states = .{ .reserve_hint = initial_groups },
             .str_arena = std.heap.ArenaAllocator.init(allocator),
             .udf_arena = std.heap.ArenaAllocator.init(allocator),
         };
+    }
+
+    fn fold_rows(self: *PipeBucket, allocator: Allocator, scratch: *GroupScratch, rows: GroupRows, input_rows: u64) !void {
+        try groupChunkRowsDirect(&self.table, &self.states, &self.str_states, &self.concat_states, &self.udf_states, self.udf_arena.allocator(), &self.distinct_sets, scratch, allocator, self.str_arena.allocator(), rows, self.expected_groups, input_rows, self.observed_input_rows, if (PROFILING) &self.allocation_profile else null);
+        self.row_count += rows.len();
+        if (rows.layout.has_weight) {
+            var represented_rows: u64 = 0;
+            for (rows.weightAll()[0..rows.len()]) |weight| represented_rows += weight;
+            self.observed_input_rows += represented_rows;
+        } else {
+            self.observed_input_rows += rows.len();
+        }
+    }
+
+    test "group reservation empty bucket does not reserve the row-count hint" {
+        const allocator = std.testing.allocator;
+        var bucket = try PipeBucket.init(allocator, 1_000_000);
+        defer bucket.deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        try bucket.fold_rows(allocator, &scratch, .{}, 1_000_000);
+        try std.testing.expectEqual(group_table.capacityFor(PIPE_CHUNK_ROWS), bucket.table.slots.len);
+        try std.testing.expectEqual(@as(usize, 0), bucket.states.bytes.len);
+        try std.testing.expectEqual(@as(u64, 0), bucket.observed_input_rows);
+    }
+
+    fn allocation_failure_fixture(allocator: Allocator) !void {
+        var bucket = try PipeBucket.init(allocator, 16);
+        defer bucket.deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        var rows: GroupRows = .{};
+        defer rows.deinit(allocator);
+        try rows.ensureTotalCapacity(allocator, .{
+            .key_width = .u64,
+            .columns = &.{},
+            .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+        }, 256);
+        rows.len_rows = 256;
+        for (0..4) |batch| {
+            for (0..256) |i| rows.setKey(i, batch * 256 + i);
+            try bucket.fold_rows(allocator, &scratch, rows, 1024);
+        }
+        try std.testing.expectEqual(@as(usize, 1024), bucket.states.len);
+    }
+
+    test "group reservation releases allocations after a failed grow" {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocation_failure_fixture, .{});
+    }
+
+    test "group reservation keeps geometric state growth when the hint is too small" {
+        const allocator = std.testing.allocator;
+        var bucket = try PipeBucket.init(allocator, 8192);
+        defer bucket.deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        var rows: GroupRows = .{};
+        defer rows.deinit(allocator);
+        try rows.ensureTotalCapacity(allocator, .{
+            .key_width = .u64,
+            .columns = &.{},
+            .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+        }, 8192);
+        rows.len_rows = 8192;
+        for (0..8) |batch| {
+            for (0..8192) |i| rows.setKey(i, batch * 8192 + i);
+            try bucket.fold_rows(allocator, &scratch, rows, 65536);
+        }
+        try std.testing.expectEqual(@as(usize, 65536), bucket.states.len);
+        try std.testing.expectEqual(@as(usize, 65536), bucket.states.cap);
+        for (0..65536) |key| {
+            const probe = bucket.table.getOrPut(GroupTable.hashKey(key), key);
+            try std.testing.expect(probe.found);
+            try std.testing.expectEqual(@as(u64, 1), bucket.states.head(probe.gid).count);
+        }
+    }
+
+    fn queued_allocation_failure_fixture(allocator: Allocator) !void {
+        var buckets = [_]PipeBucket{try PipeBucket.init(allocator, 16)};
+        defer buckets[0].deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        var local: WorkerParts = .{};
+        defer local.deinit(allocator);
+        var shared = PipeShared{
+            .allocator = allocator,
+            .buckets = &buckets,
+            .bucket_count = 1,
+            .input_rows_per_bucket = 1024,
+            .scan_threads = 1,
+            .group_rows_layout = .{
+                .key_width = .u64,
+                .columns = &.{},
+                .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+            },
+        };
+        defer deinitRawQueues(&shared);
+        shared.raw_group_queues = try allocator.alloc(GroupQueue, 1);
+        shared.raw_group_queues[0] = .{};
+        const queue = &shared.raw_group_queues[0];
+        for (0..4) |batch| {
+            var rows: GroupRows = .{};
+            errdefer rows.deinit(allocator);
+            try rows.ensureTotalCapacity(allocator, shared.group_rows_layout, 256);
+            rows.len_rows = 256;
+            for (0..256) |i| rows.setKey(i, batch * 256 + i);
+            try queue.chunks.append(allocator, .{ .rows = rows, .owner_worker = 0, .bucket_idx = 0 });
+        }
+        queue.queued_rows = 1024;
+        queue.queued_rows_atomic.store(1024, .monotonic);
+        queue.queued_chunks_atomic.store(4, .monotonic);
+        shared.stage_outstanding_rows.store(1024, .monotonic);
+        shared.stage_outstanding_chunks.store(4, .monotonic);
+        shared.pending_group_rows.store(1024, .monotonic);
+        var ticks: i64 = 0;
+        var chunks: u64 = 0;
+        const drained = drainRawDedicatedGroupLane(allocator, &shared, &local, &scratch, 0, 512, 4, &ticks, &chunks, false);
+        try std.testing.expect(buckets[0].agg_lock.tryLock());
+        buckets[0].agg_lock.unlock();
+        try std.testing.expectEqual(@as(u64, 0), shared.stage_outstanding_rows.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 0), shared.stage_outstanding_chunks.load(.monotonic));
+        try std.testing.expect(try drained);
+        try std.testing.expectEqual(@as(usize, 1024), buckets[0].states.len);
+    }
+
+    test "group reservation cleans up queued chunks and unlocks on allocation failure" {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, queued_allocation_failure_fixture, .{});
+    }
+
+    test "group reservation preserves all counts through skew growth and workspace reuse" {
+        const allocator = std.testing.allocator;
+        const Distribution = enum { correlated, unique, late_unique };
+        inline for (.{ GroupKeyWidth.u32, .u64, .u96, .u128 }) |width| {
+            inline for (.{ false, true }) |weighted| {
+                var bucket = try PipeBucket.init(allocator, 1_000_000);
+                defer bucket.deinit(allocator);
+                var scratch: GroupScratch = .{};
+                defer scratch.deinit(allocator);
+                var rows: GroupRows = .{};
+                defer rows.deinit(allocator);
+                const batch_rows = 256;
+                const total_rows = 16_384;
+                const weight: u32 = if (weighted) 3 else 1;
+                try rows.ensureTotalCapacity(allocator, .{
+                    .key_width = width,
+                    .columns = &.{},
+                    .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+                    .has_weight = weighted,
+                }, batch_rows);
+                inline for (.{ Distribution.correlated, Distribution.unique, Distribution.late_unique }) |distribution| {
+                    resetPipeBucket(&bucket, allocator);
+                    // A stale, too-small hint must not truncate later groups.
+                    bucket.expected_groups = if (distribution == .late_unique) 16 else 1_000_000;
+                    var expected = [_]u64{0} ** total_rows;
+                    for (0..total_rows / batch_rows) |batch| {
+                        rows.len_rows = batch_rows;
+                        for (0..batch_rows) |r| {
+                            const i = batch * batch_rows + r;
+                            const key: usize = switch (distribution) {
+                                .correlated => i % 64,
+                                .unique => i,
+                                .late_unique => if (i < total_rows / 2) i % 64 else i,
+                            };
+                            const packed_key: u128 = if (width == .u96 or width == .u128) @as(u128, key) | (@as(u128, key) << 64) else key;
+                            rows.setKey(r, packed_key);
+                            if (weighted) rows.weightAll()[r] = weight;
+                            expected[key] += weight;
+                        }
+                        try bucket.fold_rows(allocator, &scratch, rows, total_rows * weight);
+                    }
+                    var groups: usize = 0;
+                    for (&expected, 0..) |count, key| {
+                        if (count == 0) continue;
+                        groups += 1;
+                        const packed_key: u128 = if (width == .u96 or width == .u128) @as(u128, key) | (@as(u128, key) << 64) else key;
+                        const probe = bucket.table.getOrPut(GroupTable.hashKey(packed_key), packed_key);
+                        try std.testing.expect(probe.found);
+                        try std.testing.expectEqual(count, bucket.states.head(probe.gid).count);
+                    }
+                    try std.testing.expectEqual(groups, bucket.table.len);
+                    try std.testing.expectEqual(groups, bucket.states.len);
+                    try std.testing.expectEqual(@as(u64, total_rows * weight), bucket.observed_input_rows);
+                    if (distribution == .correlated) {
+                        try std.testing.expect(bucket.table.slots.len <= group_table.capacityFor(PIPE_CHUNK_ROWS));
+                        try std.testing.expect(bucket.states.cap <= PIPE_CHUNK_ROWS);
+                    }
+                }
+            }
+        }
     }
 
     fn freeStrBytes(self: *PipeBucket) void {
@@ -1638,6 +1837,7 @@ const PipeShared = struct {
     allocator: Allocator,
     buckets: []PipeBucket,
     bucket_count: usize,
+    input_rows_per_bucket: u64 = 0,
     raw_queue_lock: std.atomic.Mutex = .unlocked,
     raw_chunks: std.ArrayListUnmanaged(RawChunk) = .empty,
     raw_recycle_lock: std.atomic.Mutex = .unlocked,
@@ -1656,7 +1856,9 @@ const PipeShared = struct {
     scan_threads: usize,
     scans_done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     outstanding_chunks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    outstanding_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Published staged rows not yet folded, including unpublished stage tails.
+    // A weighted row counts once here, regardless of its aggregate weight.
+    pending_group_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     scan_buffered_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     active_scan_jobs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     active_group_jobs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -1675,7 +1877,152 @@ const PipeShared = struct {
     direct_final_local: bool = false,
     local_parts: []WorkerParts = &.{},
     shared_scan_buffers: ?*SharedScanBuffers = null,
+
+    fn grouping_complete(self: *const PipeShared) bool {
+        // Closing every producer makes the remaining row count monotone.
+        // Its credits survive queue/builder hand-offs until group writes finish.
+        return self.scans_done.load(.acquire) == self.scan_threads and
+            self.pending_group_rows.load(.acquire) == 0;
+    }
 };
+
+test "group completion waits for a delayed partial before collecting top rows and OFFSET" {
+    const allocator = std.testing.allocator;
+    const group_count = 10_020;
+    const offset = 10_000;
+    var buckets = [_]PipeBucket{try PipeBucket.init(allocator, 16)};
+    defer buckets[0].deinit(allocator);
+    var local: WorkerParts = .{};
+    defer local.deinit(allocator);
+    var scratch: GroupScratch = .{};
+    defer scratch.deinit(allocator);
+    var shared = PipeShared{
+        .allocator = allocator,
+        .buckets = &buckets,
+        .bucket_count = 1,
+        .input_rows_per_bucket = group_count * (group_count + 1) / 2,
+        .scan_threads = 1,
+        .group_rows_layout = .{
+            .key_width = .u32,
+            .columns = &.{},
+            .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+            .has_weight = true,
+        },
+    };
+    defer deinitRawQueues(&shared);
+    shared.raw_scan_queues = try allocator.alloc(RawQueue, 1);
+    shared.raw_scan_queues[0] = .{};
+    shared.raw_group_queues = try allocator.alloc(GroupQueue, 1);
+    shared.raw_group_queues[0] = .{};
+    shared.stage_builders = try allocator.alloc(StageBucketBuilder, 1);
+    shared.stage_builders[0] = .{};
+    try std.testing.expect(!shared.grouping_complete());
+
+    var source: RawRows = .{};
+    defer source.deinit(allocator);
+    try source.resize(allocator, shared.group_rows_layout, group_count);
+    for (0..group_count) |i| {
+        source.setKey(i, i);
+        source.weightAll()[i] = @intCast(i + 1);
+    }
+    try publishRawRowsToQueue(&shared, &shared.raw_scan_queues[0], 0, &source, 16384, &shared.outstanding_chunks, &shared.pending_group_rows, null, null);
+    shared.scans_done.store(1, .release);
+    try std.testing.expect(!shared.grouping_complete());
+
+    // An idle worker can sample empty builders, then resume its completion
+    // check after a peer has staged the final input into an unpublished tail.
+    const earlier_has_partials = shared.stage_builder_rows.load(.acquire) > 0;
+    try std.testing.expect(!earlier_has_partials);
+    try std.testing.expect(claimRawQueueLaneExact(shared.raw_scan_queues, 0));
+    try std.testing.expect(try drainRawDedicatedStageSharedBuilders(allocator, &shared, &local, 0, 16384, 32768, 1, false));
+    try std.testing.expectEqual(@as(u64, group_count), shared.stage_builder_rows.load(.acquire));
+    try std.testing.expectEqual(@as(u64, group_count), shared.pending_group_rows.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), shared.stage_outstanding_chunks.load(.acquire));
+    try std.testing.expect(!shared.grouping_complete());
+
+    try std.testing.expect(try flushSharedStageBuilders(&shared, &local, 32768, false));
+    try std.testing.expect(!shared.grouping_complete());
+    var ticks: i64 = 0;
+    var chunks: u64 = 0;
+    try std.testing.expect(claimRawQueueLaneExact(shared.raw_group_queues, 0));
+    try std.testing.expect(try drainRawDedicatedGroupLane(allocator, &shared, &local, &scratch, 0, 32768, 1, &ticks, &chunks, false));
+    try std.testing.expect(shared.grouping_complete());
+    try std.testing.expectEqual(@as(usize, group_count), buckets[0].states.len);
+
+    var top = try TopSet.init(allocator, offset + 10);
+    defer top.deinit(allocator);
+    try collectOwnedTop(&shared, 0, 1, &top, &ticks, false);
+    std.mem.sort(TopRow, top.items[0..top.len], {}, topLess);
+    try std.testing.expectEqual(@as(usize, offset + 10), top.len);
+    for (top.items[offset..top.len], 0..) |row, i| {
+        try std.testing.expectEqual(@as(u128, group_count - 1 - offset - i), row.key);
+        try std.testing.expectEqual(@as(u64, group_count - offset - i), row.count);
+    }
+}
+
+test "group completion: an empty stream waits until every scan producer is closed" {
+    var shared = PipeShared{
+        .allocator = std.testing.allocator,
+        .buckets = &.{},
+        .bucket_count = 0,
+        .scan_threads = 2,
+    };
+    try std.testing.expect(!shared.grouping_complete());
+    shared.scans_done.store(1, .release);
+    try std.testing.expect(!shared.grouping_complete());
+    shared.scans_done.store(2, .release);
+    try std.testing.expect(shared.grouping_complete());
+}
+
+fn partial_flush_failure_fixture(allocator: Allocator) !void {
+    var buckets = [_]PipeBucket{try PipeBucket.init(allocator, 16)};
+    defer buckets[0].deinit(allocator);
+    var local: WorkerParts = .{};
+    defer local.deinit(allocator);
+    var shared = PipeShared{
+        .allocator = allocator,
+        .buckets = &buckets,
+        .bucket_count = 1,
+        .scan_threads = 1,
+        .group_rows_layout = .{
+            .key_width = .u32,
+            .columns = &.{},
+            .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+        },
+    };
+    defer deinitRawQueues(&shared);
+    shared.raw_group_queues = try allocator.alloc(GroupQueue, 1);
+    shared.raw_group_queues[0] = .{};
+    shared.stage_builders = try allocator.alloc(StageBucketBuilder, 1);
+    shared.stage_builders[0] = .{};
+    const builder = &shared.stage_builders[0];
+    try builder.rows.ensureTotalCapacity(allocator, shared.group_rows_layout, 32);
+    builder.rows.len_rows = 32;
+    for (0..32) |i| builder.rows.setKey(i, i);
+    shared.stage_builder_rows.store(32, .release);
+    shared.pending_group_rows.store(32, .release);
+    shared.scans_done.store(1, .release);
+
+    const flushed = flushSharedStageBuilders(&shared, &local, 64, false);
+    try std.testing.expect(builder.lock.tryLock());
+    builder.lock.unlock();
+    try std.testing.expect(!shared.grouping_complete());
+    try std.testing.expectEqual(@as(u64, 32), shared.pending_group_rows.load(.acquire));
+    if (flushed) |did_flush| {
+        try std.testing.expect(did_flush);
+        try std.testing.expectEqual(@as(u64, 0), shared.stage_builder_rows.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), shared.stage_outstanding_chunks.load(.acquire));
+    } else |err| {
+        try std.testing.expectEqual(@as(u64, 32), shared.stage_builder_rows.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 32), builder.rows.len());
+        try std.testing.expectEqual(@as(usize, 0), shared.stage_outstanding_chunks.load(.acquire));
+        return err;
+    }
+}
+
+test "group completion: failed partial publication restores ownership and unlocks the builder" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, partial_flush_failure_fixture, .{});
+}
 
 pub const RawGroupMode = enum {
     off,
@@ -2073,7 +2420,6 @@ fn initWorkspaceFreshParallel(
         for (buckets, 0..) |*bucket, i| {
             bucket.* = try PipeBucket.init(allocator, expected_groups_per_bucket);
             bucket_inited[i] = true;
-            bucket.states.reserve(expected_groups_per_bucket);
             try bucket.chunks.ensureTotalCapacity(allocator, 8);
         }
         if (profile) |p| {
@@ -2143,7 +2489,6 @@ fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
             return;
         };
         job.bucket_inited[b] = true;
-        job.buckets[b].states.reserve(job.expected_groups_per_bucket);
         job.buckets[b].chunks.ensureTotalCapacity(job.allocator, 8) catch |err| {
             job.err = err;
             return;
@@ -2217,6 +2562,8 @@ fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     bucket.chunks.clearRetainingCapacity();
     bucket.queued_rows = 0;
     bucket.row_count = 0;
+    bucket.observed_input_rows = 0;
+    bucket.allocation_profile = .{};
     bucket.queue_lock = .unlocked;
     bucket.agg_lock = .unlocked;
     bucket.table.clearRetainingCapacity();
@@ -2367,6 +2714,7 @@ fn acquireGroupRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64)
 
 fn recycleGroupRows(shared: *PipeShared, rows_group: GroupRows, reserve_rows: usize, lock_ticks: ?*i64) !void {
     var rows = rows_group;
+    errdefer rows.deinit(shared.allocator);
     rows.clearRetainingCapacity();
     if (rows.capacity() < reserve_rows) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
     const lock_t0 = if (lock_ticks != null) platform.nowTicks() else 0;
@@ -2388,13 +2736,13 @@ fn publishRawRows(shared: *PipeShared, owner_worker: usize, rows_ptr: *RawRows, 
     }
 
     _ = shared.outstanding_chunks.fetchAdd(1, .release);
-    _ = shared.outstanding_rows.fetchAdd(row_count, .release);
+    _ = shared.pending_group_rows.fetchAdd(row_count, .release);
     const lock_t0 = if (queue_lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_queue_lock);
     if (queue_lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
     errdefer {
         _ = shared.outstanding_chunks.fetchSub(1, .release);
-        _ = shared.outstanding_rows.fetchSub(row_count, .release);
+        _ = shared.pending_group_rows.fetchSub(row_count, .release);
         shared.raw_queue_lock.unlock();
     }
     try shared.raw_chunks.append(shared.allocator, .{ .rows = rows, .owner_worker = owner_worker });
@@ -3094,7 +3442,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         if (active.len() == raw_chunk_rows) {
             if (shared.raw_scan_queues.len > 0) {
                 const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
-                try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, active, raw_chunk_rows, &shared.outstanding_chunks, &shared.outstanding_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+                try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, active, raw_chunk_rows, &shared.outstanding_chunks, &shared.pending_group_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
             } else {
                 try publishRawRows(shared, parts.worker_index, active, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
             }
@@ -3707,7 +4055,7 @@ inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []
 fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize) !void {
     if (shared.raw_scan_queues.len > 0) {
         const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
-        try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &shared.outstanding_chunks, &shared.outstanding_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
+        try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &shared.outstanding_chunks, &shared.pending_group_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
     } else {
         try publishRawRows(shared, parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
     }
@@ -3998,15 +4346,29 @@ fn groupChunkRowsDirect(
     allocator: Allocator,
     str_arena: Allocator,
     rows: GroupRows,
+    expected_groups: usize,
+    input_rows: u64,
+    observed_rows: u64,
+    allocation_profile: ?*GroupAllocationProfile,
 ) !void {
     const n = rows.len();
     if (n == 0) return;
-    if (table.needsGrow(n)) try table.grow(allocator, n);
+    const allocation_t0 = if (allocation_profile != null) platform.nowTicks() else 0;
     try states.prepare(allocator, aggSlotCount(rows.layout));
-    try states.ensureUnusedCapacity(allocator, n);
+    var reservation: usize = 0;
+    if (table.needsGrow(n)) {
+        reservation = group_table.observed_group_reservation(expected_groups, input_rows, table.len, observed_rows, n);
+        table.grow_target = group_table.capacityFor(reservation);
+        try table.grow(allocator, n);
+        if (allocation_profile) |profile| profile.table_growths += 1;
+    }
+    // A low forecast must not turn geometric growth into repeated
+    // batch-sized copies with a larger final slab than ordinary doubling.
+    try states.ensureUnusedCapacity(allocator, n, reservation);
     if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_concat) try concat_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_udf) try udf_states.ensureUnusedCapacity(allocator, n);
+    if (allocation_profile) |profile| profile.ticks += platform.nowTicks() - allocation_t0;
     if (rows.layout.distinct_slot_count > distinct_sets.len) return error.UnsupportedOperatorForType;
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
@@ -4799,8 +5161,6 @@ fn publishSharedStageBuilderLocked(
         builder.rows.deinit(shared.allocator);
         builder.rows = rows;
     }
-    _ = shared.stage_builder_rows.fetchSub(@intCast(row_count), .release);
-
     try publishGroupChunkToQueue(
         shared,
         &shared.raw_group_queues[bucket_idx],
@@ -4809,6 +5169,7 @@ fn publishSharedStageBuilderLocked(
         &shared.stage_outstanding_rows,
         queue_lock_ticks,
     );
+    _ = shared.stage_builder_rows.fetchSub(@intCast(row_count), .release);
 }
 
 fn appendSharedStageBuilderRawSlice(
@@ -4864,12 +5225,12 @@ fn flushSharedStageBuilders(
         const builder = &shared.stage_builders[b];
         const lock_t0 = if (profile) platform.nowTicks() else 0;
         lockSpin(&builder.lock);
+        defer builder.lock.unlock();
         if (profile) local.raw_stage_builder_lock_ticks += platform.nowTicks() - lock_t0;
         if (builder.rows.len() > 0) {
             try publishSharedStageBuilderLocked(shared, builder, b, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
             flushed = true;
         }
-        builder.lock.unlock();
     }
     if (profile) local.raw_stage_publish_ticks += platform.nowTicks() - publish_t0;
     return flushed;
@@ -4907,7 +5268,6 @@ fn drainRawDedicatedStageSharedBuilders(
         var total_rows: usize = 0;
         var i: usize = 0;
         while (i < popped_total) : (i += 1) total_rows += raw_chunks[i].rows.len();
-        _ = shared.outstanding_rows.fetchSub(@intCast(total_rows), .release);
         _ = shared.outstanding_chunks.fetchSub(popped_total, .release);
         if (total_rows == 0) {
             i = 0;
@@ -5074,23 +5434,34 @@ fn drainRawDedicatedGroupLane(
 
     const bucket = &shared.buckets[group_lane % shared.bucket_count];
     var total_rows: u64 = 0;
+    for (group_chunks[0..popped_total]) |chunk| total_rows += chunk.rows.len();
+    defer {
+        _ = shared.stage_outstanding_rows.fetchSub(total_rows, .release);
+        _ = shared.stage_outstanding_chunks.fetchSub(popped_total, .release);
+    }
+    var transferred: usize = 0;
+    errdefer for (group_chunks[transferred..popped_total]) |*chunk| chunk.rows.deinit(allocator);
     var i: usize = 0;
     while (i < popped_total) : (i += 1) {
         const rows = group_chunks[i].rows;
-        total_rows += @intCast(rows.len());
         const lock_t0 = if (profile) platform.nowTicks() else 0;
         lockSpin(&bucket.agg_lock);
         if (profile) local.raw_agg_lock_ticks += platform.nowTicks() - lock_t0;
         const g0 = if (profile) platform.nowTicks() else 0;
-        try groupChunkRowsDirect(&bucket.table, &bucket.states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), rows);
-        bucket.row_count += rows.len();
+        bucket.fold_rows(allocator, scratch, rows, shared.input_rows_per_bucket) catch |err| {
+            bucket.agg_lock.unlock();
+            return err;
+        };
         if (profile) group_ticks.* += platform.nowTicks() - g0;
         bucket.agg_lock.unlock();
         chunks.* += 1;
+        // Recycling consumes this slab even if growing the recycle pool fails.
+        transferred = i + 1;
         try recycleGroupRows(shared, group_chunks[i].rows, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
     }
-    _ = shared.stage_outstanding_rows.fetchSub(total_rows, .release);
-    _ = shared.stage_outstanding_chunks.fetchSub(popped_total, .release);
+    // Failed folds retain their credit until the query aborts, so peers cannot
+    // read partial aggregate states in the interval before abort is signalled.
+    _ = shared.pending_group_rows.fetchSub(total_rows, .release);
     return true;
 }
 
@@ -5264,7 +5635,7 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
     if (job.raw_group_mode != .off and job.shared.raw_scan_queues.len > 0) {
         const publish_t0 = if (job.profile) platform.nowTicks() else 0;
         const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
-        try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.outstanding_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
+        try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.pending_group_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
         if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
 
@@ -5280,7 +5651,7 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
         const publish_t0 = if (job.profile) platform.nowTicks() else 0;
         if (job.shared.raw_scan_queues.len > 0) {
             const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
-            try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.outstanding_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
+            try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.pending_group_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
         }
         if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
@@ -5299,7 +5670,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
     while (true) {
         // A peer failed: stop scheduling and tear down (the failing worker's
         // error is already recorded; ours would just race it).
-        if (job.shared.aborted.load(.acquire)) break;
+        if (job.shared.aborted.load(.acquire)) return;
         job.local.sched_loops += 1;
         const decision_t0 = if (job.profile) platform.nowTicks() else 0;
         const scan_claims_available = !scan_exhausted and job.shared.next_scan_rg.load(.acquire) < job.shared.total_scan_rgs;
@@ -5407,12 +5778,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                 }
             }
 
-            if (job.shared.scans_done.load(.acquire) == job.shared.scan_threads and
-                job.shared.outstanding_chunks.load(.acquire) == 0 and
-                job.shared.stage_outstanding_chunks.load(.acquire) == 0 and
-                job.shared.active_stage_jobs.load(.acquire) == 0 and
-                job.shared.active_group_jobs.load(.acquire) == 0)
-            {
+            if (job.shared.grouping_complete()) {
                 break;
             }
 
@@ -5514,7 +5880,7 @@ fn localReservePerBucket(total_rows: u64, dop: usize, bucket_count: usize, chunk
     return @intCast(@min(chunk_u64, @max(@as(u64, 16), reserve)));
 }
 
-// Combined-key cardinality upper bound: saturating product of the KEY
+// Combined-key allocation hint: saturating product of the KEY
 // columns' NDVs, resolved BY NAME against the stats scan's output schema —
 // the projection orders filter columns ahead of keys, so positional indexing
 // would read the wrong columns' NDVs. A derived key has no schema entry →
@@ -5540,14 +5906,11 @@ fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.e
     const has_filter = generic_has_filter;
     const generic_wide_no_filter = generic_key_count != 0 and !has_filter and (generic_key_width == .u96 or generic_key_width == .u128);
     const no_filter_near_unique = !has_filter and estimated_total * 4 >= total_rows * 3;
-    // A filter can only REDUCE the distinct key combinations, so the no-filter
-    // NDV-product estimate stays a sound upper bound — but a correlated
-    // compound key defeats it (WindowClientWidth × Height ≈ 25M product for
-    // ~11K real combos), so under a filter the INITIAL presize is also capped
-    // outright: zeroing rows/4-group tables costs ~20ms of setup on a query
-    // whose whole runtime is ~40ms, while a rare filtered query that really
-    // produces millions of groups just grows (amortized ~2× insert cost on a
-    // query that runs seconds anyway). Sizing only — never correctness.
+    // These are allocation hints, not exact cardinalities: column sketches
+    // estimate marginal NDVs and compound keys may be correlated. Buckets
+    // start small and use observed joint-key density when growing. A filtered
+    // input also bounds the speculative reservation; real groups can grow
+    // beyond every hint without changing the aggregation algorithm.
     const filtered_init_cap: u64 = 2 * 1024 * 1024;
     const total_groups = if (generic_wide_no_filter)
         total_rows
@@ -5762,7 +6125,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         while (b < bucket_count) : (b += 1) {
             buckets[b] = try PipeBucket.init(allocator, init_groups_per_bucket);
             built_buckets += 1;
-            buckets[b].states.reserve(init_groups_per_bucket);
             try buckets[b].chunks.ensureTotalCapacity(allocator, 8);
         }
     }
@@ -5803,6 +6165,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .buckets = buckets,
         .bucket_count = bucket_count,
         .raw_scan_queues = raw_scan_queues,
+        .input_rows_per_bucket = total / bucket_count + @intFromBool(total % bucket_count != 0),
         .raw_group_queues = raw_group_queues,
         .stage_builders = stage_builders,
         .group_rows_layout = group_rows_layout,
@@ -6090,6 +6453,19 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (buckets) |*bucket| bucket.destroyUdfStates(cfg.group_rows_layout.aggregates);
     }
     if ((PROFILING and cfg.trace_timing)) {
+        var hash_bytes: usize = 0;
+        var state_capacity: usize = 0;
+        var state_bytes: usize = 0;
+        var allocation_ticks: i64 = 0;
+        var table_growths: usize = 0;
+        for (buckets) |bucket| {
+            hash_bytes += std.mem.sliceAsBytes(bucket.table.slots).len;
+            state_capacity += bucket.states.cap;
+            state_bytes += bucket.states.bytes.len;
+            allocation_ticks += bucket.allocation_profile.ticks;
+            table_growths += bucket.allocation_profile.table_growths;
+        }
+        std.debug.print("[group-allocation] groups={d} hash_bytes={d} state_capacity={d} state_bytes={d} table_growths={d} allocation_worker_sum={d:.3}ms\n", .{ group_count, hash_bytes, state_capacity, state_bytes, table_growths, platform.ticksToMs(allocation_ticks, freq) });
         std.debug.print(
             "[harness-core-timing] query={s} full={d:.1}ms setup_before_workers={d:.1}ms worker_and_final={d:.1}ms final_merge={d:.3}ms result_rows={d}\n",
             .{
@@ -6147,7 +6523,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             },
         );
         std.debug.print(
-            "[clientip-silo-grid-stages] query={s} scan_decode_cpu={d:.1}ms scan_reset_cpu={d:.3}ms route_partition_cpu={d:.1}ms raw_stage_cpu={d:.1}ms publish_queue_cpu={d:.1}ms aggregate_cpu={d:.1}ms idle_cpu={d:.1}ms local_topn_cpu={d:.1}ms final_merge_wall={d:.3}ms chunks={d} rows_per_chunk={d:.1} scan_ranges={d} scan_quanta={d} scan_batches={d} segments_opened={d} fused_scans={d}/{d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} final_scan_queue_rows={d} final_stage_queue_rows={d} final_scan_buffered_rows={d} active_scan_jobs={d} active_stage_jobs={d} active_group_jobs={d}\n",
+            "[clientip-silo-grid-stages] query={s} scan_decode_cpu={d:.1}ms scan_reset_cpu={d:.3}ms route_partition_cpu={d:.1}ms raw_stage_cpu={d:.1}ms publish_queue_cpu={d:.1}ms aggregate_cpu={d:.1}ms idle_cpu={d:.1}ms local_topn_cpu={d:.1}ms final_merge_wall={d:.3}ms chunks={d} rows_per_chunk={d:.1} scan_ranges={d} scan_quanta={d} scan_batches={d} segments_opened={d} fused_scans={d}/{d} scan_tile_rgs={d} scan_coalesce_tiles={d} route_block_rows={d} group_lease_buckets={d} group_lease_rows={d} final_pending_group_rows={d} final_stage_queue_rows={d} final_scan_buffered_rows={d} active_scan_jobs={d} active_stage_jobs={d} active_group_jobs={d}\n",
             .{
                 "generic",
                 platform.ticksToMs(scan_cpu_ticks, freq),
@@ -6172,7 +6548,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 route_block_rows,
                 cfg.group_lease_buckets,
                 cfg.group_lease_rows,
-                shared.outstanding_rows.load(.acquire),
+                shared.pending_group_rows.load(.acquire),
                 shared.stage_outstanding_rows.load(.acquire),
                 shared.scan_buffered_rows.load(.acquire),
                 shared.active_scan_jobs.load(.acquire),

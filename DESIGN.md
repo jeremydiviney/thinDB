@@ -387,6 +387,27 @@ lookup builds through a chain of non-FULL joins. The check reuses stage buffers,
 retains parallel probing for nonempty inputs, and does not add a materialization
 boundary or choose a different join order or algorithm.
 
+Parallel grouped aggregation initially reserves at most one 8,192-row batch's
+worth of groups per bucket and allocates its state slab only when rows arrive.
+This keeps small tables' setup allocations out of the workers' allocation
+traffic while bounding speculative memory for large hints. When a table grows,
+it forecasts capacity from the observed number of distinct composite keys per
+source row, counting weighted run partials by their original row counts. The
+forecast has 25% headroom and is capped by the existing statistical reservation
+hint; actual insertions can always grow beyond either estimate. This changes
+memory reservation only, preserving operator order, grouping, and aggregate
+semantics. Reused workspaces retain their allocated capacity and reset the
+observed row counters. Developer profiles report actual groups, hash bytes,
+state capacity/bytes, growth count, and worker-summed allocation time.
+
+Parallel grouping collects its final candidates only after every scan producer
+has closed and all published staged rows have been aggregated. A row stays
+counted as unfinished while queued, being partitioned, held in a partial bucket
+buffer, or being aggregated. Weighted run partials count once in this work
+counter; their weights still determine aggregate values. Empty queue snapshots
+cannot establish completion during a hand-off. Failed folds retain their work
+count until the query aborts, and aborted workers skip candidate collection.
+
 The pipeline runs in pull mode (Volcano-style): `Sink.next()` pulls from upstream, which pulls from its upstream, etc. Each operator's `next()` returns a `Batch` — a small struct holding column slices for the rows currently in flight.
 
 Hot kernels (predicate evaluation, aggregation accumulators, arithmetic) use `@Vector(N, T)` for SIMD. Vector width is platform-dependent; code is written generically and the compiler chooses.
