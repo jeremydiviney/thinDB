@@ -17,6 +17,91 @@ fn containsName(names: [][]u8, needle: []const u8) bool {
     return false;
 }
 
+test "Catalog: exclusive directory ownership precedes stale temporary cleanup" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const first = try thindb.Catalog.open(a, io, tmp.dir, .{});
+        defer first.close();
+        try tmp.dir.createDir(io, "_temp", .default_dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = "_temp/live", .data = "active" });
+        try std.testing.expectError(thindb.Error.DatabaseInUse, thindb.Catalog.open(a, io, tmp.dir, .{}));
+        const sentinel = try tmp.dir.readFileAlloc(io, "_temp/live", a, .unlimited);
+        defer a.free(sentinel);
+        try std.testing.expectEqualStrings("active", sentinel);
+    }
+    const reopened = try thindb.Catalog.open(a, io, tmp.dir, .{});
+    defer reopened.close();
+}
+
+test "Catalog: concurrent first table opens share one writer and WAL" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema: thindb.TableSchema = .{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    {
+        const db = try thindb.Database.open(a, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+        try t.insert(&.{.{ .id = @as(i64, 100) }});
+        try t.flush();
+    }
+    const db = try thindb.Database.open(a, io, tmp.dir, .{ .auto_flush_secs = 0 });
+    defer db.close();
+    const Worker = struct {
+        db: *thindb.Database,
+        start: *std.atomic.Value(bool),
+        id: i64,
+        table: ?*thindb.Table = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            const t = self.db.openTable("t", .{}) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.table = t;
+            t.insert(&.{.{ .id = self.id }}) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var workers: [8]Worker = undefined;
+    {
+        var threads: [8]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer {
+            start.store(true, .release);
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        for (&workers, 0..) |*worker, i| {
+            worker.* = .{ .db = db, .start = &start, .id = @intCast(i) };
+            threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
+            spawned += 1;
+        }
+    }
+    for (workers) |worker| {
+        try std.testing.expectEqual(@as(?anyerror, null), worker.failure);
+        try std.testing.expectEqual(workers[0].table, worker.table);
+    }
+    const t = workers[0].table.?;
+    try t.flush();
+    var q = try thindb.scan(a, t);
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |batch| rows += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 9), rows);
+}
+
 test "Catalog: createDatabase + listDatabases shows both" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

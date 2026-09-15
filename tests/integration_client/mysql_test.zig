@@ -538,6 +538,72 @@ fn openCatalog(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !*thin
     return c;
 }
 
+test "mysql wire: xa commit reports failure without partial effects and retries once" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try openCatalog(a, io, tmp.dir);
+    defer catalog.close();
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 2500 } };
+    const server = try thindb.serveMysql(a, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer thread.join();
+    var client = try TestClient.connect(a, io, addr);
+    defer client.close();
+    try client.doHandshake("main");
+    for ([_][]const u8{
+        "CREATE TABLE t (id BIGINT NOT NULL) ORDER BY (id)",
+        "INSERT INTO t VALUES (1)",
+        "XA START 'failed'",
+        "INSERT INTO t VALUES (2)",
+        "INSERT INTO t(missing) VALUES (3)",
+        "XA END 'failed'",
+        "XA PREPARE 'failed'",
+    }) |sql_text| {
+        try client.sendQuery(sql_text);
+        const packet = try mysql_packet.readPacket(a, &client.reader.interface);
+        defer a.free(packet.payload);
+        try std.testing.expectEqual(@as(u8, 0), packet.payload[0]);
+    }
+    try client.sendQuery("XA COMMIT 'failed'");
+    {
+        const packet = try mysql_packet.readPacket(a, &client.reader.interface);
+        defer a.free(packet.payload);
+        try std.testing.expectEqual(@as(u8, 0xff), packet.payload[0]);
+        try std.testing.expectEqual(@as(u16, 1401), std.mem.readInt(u16, packet.payload[1..3], .little));
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try client.sendQuery("SELECT id FROM t ORDER BY id");
+    const before = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), before.len);
+    try std.testing.expectEqualStrings("1", before[0][0].?);
+    try client.sendQuery("XA RECOVER");
+    try std.testing.expectEqual(@as(usize, 1), (try client.readResultSet(arena.allocator())).len);
+    for ([_][]const u8{
+        "XA ROLLBACK 'failed'",
+        "XA START 'success'",
+        "INSERT INTO t VALUES (3)",
+        "XA END 'success'",
+        "XA PREPARE 'success'",
+        "XA COMMIT 'success'",
+        "XA COMMIT 'success'",
+    }) |sql_text| {
+        try client.sendQuery(sql_text);
+        const packet = try mysql_packet.readPacket(a, &client.reader.interface);
+        defer a.free(packet.payload);
+        try std.testing.expectEqual(@as(u8, 0), packet.payload[0]);
+    }
+    try client.sendQuery("SELECT id FROM t ORDER BY id");
+    const after = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), after.len);
+    try std.testing.expectEqualStrings("3", after[1][0].?);
+}
+
 test "mysql wire: standalone client handshake + SELECT 1" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

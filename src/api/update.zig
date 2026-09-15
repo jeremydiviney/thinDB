@@ -256,10 +256,8 @@ fn processOneSegment(
     }
 
     if (deleted.items.len > 0) {
-        try storage.tombstone.merge(
+        try t.mergeTombstones(
             allocator,
-            t.io,
-            t.segments_dir,
             entry.segment_id,
             deleted.items,
             t.syncEnabled(),

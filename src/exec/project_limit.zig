@@ -249,7 +249,7 @@ pub const Project = struct {
     /// derived name collides with an output column (Compute's "replace
     /// that slot" semantics can't cross a projection) or an upstream one
     /// (a dropped column would shadow it in the worker pipeline).
-    pub fn tryFuseCompute(self: *Project, derived: []const @import("compute.zig").Derived) !bool {
+    pub fn tryFuseCompute(self: *Project, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) !bool {
         const trace = getenv("THINDB_TRACE_FUSE") != null;
         if (self.probe_fused) {
             if (trace) std.debug.print("[fuse]   project decline: probe_fused\n", .{});
@@ -299,7 +299,7 @@ pub const Project = struct {
         const new_stats: []exec.ColStat = if (self.cached_stats.len == 0) &.{} else try self.allocator.alloc(exec.ColStat, n);
         errdefer if (new_stats.len > 0) self.allocator.free(new_stats);
 
-        if (!try self.upstream.tryFuseCompute(fwd_derived)) {
+        if (!try self.upstream.tryFuseComputeWithRegistry(fwd_derived, registry)) {
             self.allocator.free(new_schema);
             self.allocator.free(new_map);
             self.allocator.free(new_views);

@@ -615,7 +615,7 @@ fn keyEqPrefix(a: []const RowKey, b: []const RowKey, prefix: usize) bool {
 /// callers that pushed rows without a scan phase.
 pub fn sortBucketKeys(ex: *Exchange, w: usize, shard: usize, sort_cols: []const OrderCol) !void {
     try prepare_bucket_sort(ex, w, shard, sort_cols.len);
-    try sort_prepared_bucket(ex.bucket(w, shard), sort_cols);
+    try sort_prepared_bucket(ex.alloc, ex.bucket(w, shard), sort_cols);
 }
 
 fn prepare_bucket_sort(ex: *Exchange, w: usize, shard: usize, n_sort: usize) !void {
@@ -632,7 +632,7 @@ fn prepare_bucket_sort(ex: *Exchange, w: usize, shard: usize, n_sort: usize) !vo
 
 // Prepared buffers let distinct shard workers sort buckets from the same
 // producer without concurrently allocating from that producer's arena.
-fn sort_prepared_bucket(b: *Bucket, sort_cols: []const OrderCol) !void {
+fn sort_prepared_bucket(allocator: Allocator, b: *Bucket, sort_cols: []const OrderCol) !void {
     const rows = b.rows;
     if (rows == 0) return;
     const n_sort = sort_cols.len;
@@ -654,7 +654,7 @@ fn sort_prepared_bucket(b: *Bucket, sort_cols: []const OrderCol) !void {
             };
         }
     };
-    std.mem.sortUnstable(u32, b.order.items, Ctx{ .keys = b.keys.items, .n_sort = n_sort }, Ctx.less);
+    try exec.memory.sort(u32, b.order.items, Ctx{ .keys = b.keys.items, .n_sort = n_sort }, allocator, Ctx.less);
 }
 
 /// One pre-sorted bucket run being merged.
@@ -1513,6 +1513,7 @@ fn makeComputeInstance(
 /// the worker's lifetime (clear per shard, never free — the slab-pool
 /// discipline). One worker runs many shards.
 pub const RegionWorker = struct {
+    output_allocator: ?Allocator = null,
     alloc: Allocator,
     prog: *const Program,
     states: []OpState,
@@ -1890,6 +1891,7 @@ pub const RegionWorker = struct {
 
         const tick_ops = self.op_ticks != null;
         for (self.prog.ops[start_op..], self.states[start_op..], start_op..) |op, *st, oi| {
+            try exec.memory.checkCancelled(self.alloc);
             self.cur_op = oi;
             const t_op = if (tick_ops) exec.prof.nowTicks() else 0;
             defer if (tick_ops) {
@@ -1995,7 +1997,7 @@ pub const RegionWorker = struct {
                 },
                 .emit => |e| {
                     for (e.cols, out) |c, *dst| {
-                        try appendViewRange(self.alloc, dst, fr.views[c], 0, fr.rows);
+                        try appendViewRange(self.output_allocator orelse self.alloc, dst, fr.views[c], 0, fr.rows);
                     }
                 },
             }
@@ -2178,7 +2180,7 @@ pub const RegionWorker = struct {
                 .norms = norms,
                 .base = lo,
             };
-            std.mem.sortUnstable(u32, ord, ctx, RankCtx.less);
+            try exec.memory.sort(u32, ord, ctx, self.alloc, RankCtx.less);
             for (ord, 1..) |li, rk| out_slice[lo + li] = @intCast(rk);
         }
         fr.views[fr.width] = store.view();
@@ -2214,7 +2216,7 @@ pub const RegionWorker = struct {
                 .norms = norms,
                 .base = lo,
             };
-            std.mem.sortUnstable(u32, permutation, ctx, RankCtx.less);
+            try exec.memory.sort(u32, permutation, ctx, self.alloc, RankCtx.less);
             for (permutation, 0..) |row, i| {
                 missing[lo + row] = i < lag.offset;
                 sources[lo + row] = lo + if (i < lag.offset) row else permutation[i - lag.offset];
@@ -2306,7 +2308,7 @@ pub const RegionWorker = struct {
                     .subkeys = g.subkeys,
                     .first = s.sub_first.items,
                 };
-                std.mem.sortUnstable(u32, sord, ctx, SubOrdCtx.less);
+                try exec.memory.sort(u32, sord, ctx, self.alloc, SubOrdCtx.less);
             }
 
             // Emission is column-major with the agg kind (and the value
@@ -3038,6 +3040,8 @@ pub const RegionResult = struct {
 /// `releaseRun` frees everything once retained capacity exceeds the cap.
 pub const RegionPool = struct {
     alloc: Allocator,
+    parent_allocator: Allocator,
+    tracker: ?*exec.memory.BudgetAllocator = null,
     /// Approximate retained-capacity ceiling (store capacities + arena
     /// footprints; validity bitmaps excluded — ~1/64 of data).
     max_retained_bytes: usize = 512 << 20,
@@ -3060,12 +3064,43 @@ pub const RegionPool = struct {
     };
 
     pub fn init(alloc: Allocator, max_retained_bytes: usize) RegionPool {
-        return .{ .alloc = alloc, .max_retained_bytes = max_retained_bytes };
+        return .{ .alloc = alloc, .parent_allocator = alloc, .max_retained_bytes = max_retained_bytes };
+    }
+
+    fn beginAccounting(self: *RegionPool, accountant: ?*exec.memory.MemoryAccountant) !void {
+        const a = accountant orelse return;
+        if (!a.physical_tracking or exec.memory.accountantOf(self.alloc) == a) return;
+        if (self.tracker == null) {
+            self.reset();
+            self.slots.deinit(self.alloc);
+            self.slots = .empty;
+            const tracker = try self.parent_allocator.create(exec.memory.BudgetAllocator);
+            tracker.* = exec.memory.BudgetAllocator.init(self.parent_allocator);
+            self.tracker = tracker;
+            self.alloc = tracker.allocator();
+        }
+        self.tracker.?.attach(a) catch |err| {
+            if (err != error.MemoryBudgetExceeded) return err;
+            self.reset();
+            self.slots.deinit(self.alloc);
+            self.slots = .empty;
+            try self.tracker.?.attach(a);
+        };
+    }
+
+    fn endAccounting(self: *RegionPool) void {
+        for (self.slots.items) |slot| slot.rw.output_allocator = null;
+        if (self.tracker) |tracker| tracker.detach();
     }
 
     pub fn deinit(self: *RegionPool) void {
         self.reset();
         self.slots.deinit(self.alloc);
+        if (self.tracker) |tracker| {
+            std.debug.assert(tracker.active == null);
+            std.debug.assert(tracker.live_bytes.load(.monotonic) == 0);
+            self.parent_allocator.destroy(tracker);
+        }
         self.* = undefined;
     }
 
@@ -3089,7 +3124,8 @@ pub const RegionPool = struct {
             slot.scratch.deinit();
             self.alloc.destroy(slot);
         }
-        self.slots.clearRetainingCapacity();
+        self.slots.deinit(self.alloc);
+        self.slots = .empty;
         self.prog = null;
     }
 
@@ -3160,6 +3196,8 @@ pub const RegionPool = struct {
                 .sides = slot_sides,
                 .scratch = std.heap.ArenaAllocator.init(self.alloc),
             };
+            errdefer slot.rw.deinit();
+            errdefer slot.scratch.deinit();
             try self.slots.append(self.alloc, slot);
         }
     }
@@ -3186,7 +3224,7 @@ pub const RegionPool = struct {
             sizes[i] = slotRetainedBytes(slot);
             slot_total += sizes[i];
         }
-        if (total - slot_total > self.max_retained_bytes) {
+        if (total -| slot_total > self.max_retained_bytes) {
             self.reset();
             return;
         }
@@ -3201,9 +3239,13 @@ pub const RegionPool = struct {
                 self.reset();
                 return;
             }
-            total -= @min(sizes[big], total);
+            total = self.retainedBytes();
             sizes[big] = 0;
             released += 1;
+        }
+        if (total > self.max_retained_bytes) {
+            self.reset();
+            return;
         }
         if (getenv("THINDB_REGION_TRACE") != null) {
             std.debug.print("[region] partial release: {d}/{d} slots freed, retained ~{d}MB\n", .{
@@ -3242,6 +3284,7 @@ pub const RegionPool = struct {
     }
 
     pub fn retainedBytes(self: *const RegionPool) usize {
+        if (self.tracker) |tracker| return tracker.live_bytes.load(.monotonic);
         var n: usize = 0;
         // Exchanges are arena-backed: count the arenas' real footprint
         // (store capacities + growth history + merge keys) — the honest
@@ -3329,9 +3372,11 @@ const ScanPhase = struct {
         const timed = self.ticks != null;
         var tk: [4]i64 = .{ 0, 0, 0, 0 };
         while (true) {
+            try exec.memory.checkCancelled(self.ex.alloc);
             const i = self.next.fetchAdd(1, .monotonic);
             if (i >= self.sources.len) break;
             while (true) {
+                try exec.memory.checkCancelled(self.ex.alloc);
                 const t_scan = if (timed) exec.prof.nowTicks() else 0;
                 const next = try self.sources[i].next();
                 if (timed) tk[0] += exec.prof.nowTicks() - t_scan;
@@ -3364,6 +3409,7 @@ const ScanPhase = struct {
                 sinst = try makeComputeInstance(side.ex.alloc, side.input.scan_schema, side.input.entry_derived, self.registry);
             }
             while (true) {
+                try exec.memory.checkCancelled(self.ex.alloc);
                 const i = side.next.fetchAdd(1, .monotonic);
                 if (i >= side.input.sources.len) break;
                 while (try side.input.sources[i].next()) |batch| {
@@ -3377,6 +3423,7 @@ const ScanPhase = struct {
         const t_sort = if (timed) exec.prof.nowTicks() else 0;
         if (!self.defer_sort) {
             for (0..self.ex.n_shards) |s| {
+                try exec.memory.checkCancelled(self.ex.alloc);
                 try sortBucketKeys(self.ex, w, s, self.sort_cols);
             }
         }
@@ -3641,6 +3688,7 @@ const ShardPhase = struct {
         };
 
         while (true) {
+            try exec.memory.checkCancelled(self.ex.alloc);
             const bi = self.next.fetchAdd(1, .monotonic);
             if (bi >= self.bins.len) break;
             const bin = self.bins[bi];
@@ -3650,7 +3698,7 @@ const ShardPhase = struct {
             for (bin.members) |s| {
                 if (self.deferred_sort) {
                     for (0..self.ex.n_workers) |sw| {
-                        try sort_prepared_bucket(self.ex.bucket(sw, s), self.opts.sort_cols);
+                        try sort_prepared_bucket(self.ex.alloc, self.ex.bucket(sw, s), self.opts.sort_cols);
                     }
                 }
                 try consolidateAppendTail(self.ex, s, self.opts.sort_cols, self.opts.group_prefix, &slot.sd, slot.scratch.allocator(), tail);
@@ -3679,6 +3727,7 @@ const ShardPhase = struct {
             rw.side_data = slot.sides;
             if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
             const out = &self.result.shards[bi];
+            rw.output_allocator = self.result.alloc;
             try rw.runShardFrom(&slot.sd, out.cols, start_op);
             out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
         }
@@ -3972,6 +4021,7 @@ const OrderedExecPhase = struct {
         }
 
         for (self.order) |ivi| {
+            try exec.memory.checkCancelled(self.alloc);
             if (self.assign[ivi] != w) continue;
             const i: usize = ivi;
             const iv = &self.intervals[i];
@@ -4037,6 +4087,7 @@ const OrderedExecPhase = struct {
                 if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
                 _ = self.direct.fetchAdd(1, .monotonic);
                 const out = &self.result.shards[i];
+                rw.output_allocator = self.result.alloc;
                 try rw.runShardFrom(&iv.sd, out.cols, 0);
                 out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
                 continue;
@@ -4068,13 +4119,14 @@ const OrderedExecPhase = struct {
                 var sorted = true;
                 var r: u32 = lo;
                 while (r + 1 < hi) : (r += 1) {
+                    if (r % 4096 == 0) try exec.memory.checkCancelled(self.alloc);
                     if (keyCmp(keys[(r + 1) * n_sort ..][0..n_sort], keys[r * n_sort ..][0..n_sort]) == .lt) {
                         sorted = false;
                         break;
                     }
                 }
                 if (!sorted) {
-                    std.mem.sortUnstable(u32, slice, KCtx{ .keys = keys, .n_sort = n_sort }, KCtx.less);
+                    try exec.memory.sort(u32, slice, KCtx{ .keys = keys, .n_sort = n_sort }, self.alloc, KCtx.less);
                 }
                 runs[ri] = .{ .w = @intCast(ri), .keys = keys, .ord = slice, .pos = 0 };
             }
@@ -4093,6 +4145,7 @@ const OrderedExecPhase = struct {
             var prev: ?[]const RowKey = null;
             var out_i: u32 = 0;
             while (heap_len > 0) {
+                if (out_i % 4096 == 0) try exec.memory.checkCancelled(self.alloc);
                 const rr = &runs[heap[0]];
                 const row = rr.ord[rr.pos];
                 const hk = rr.keys[row * n_sort ..][0..n_sort];
@@ -4125,6 +4178,7 @@ const OrderedExecPhase = struct {
             if (rw.op_ticks != null) rw.consolidate_ticks += exec.prof.nowTicks() - t_con;
 
             const out = &self.result.shards[i];
+            rw.output_allocator = self.result.alloc;
             try rw.runShardFrom(&slot.sd, out.cols, start_op);
             out.rows = if (out.cols.len > 0) out.cols[0].rowCount() else 0;
         }
@@ -4451,6 +4505,7 @@ pub const RegionExecOp = struct {
     }
 
     pub fn ensureExecuted(self: *RegionExecOp) !void {
+        try exec.memory.checkCancelled(self.allocator);
         if (self.result != null) return;
         const trace = getenv("THINDB_REGION_TRACE") != null;
         const t_all = if (trace) exec.prof.nowTicks() else 0;
@@ -4460,7 +4515,12 @@ pub const RegionExecOp = struct {
             std.debug.print("[region] ensureExecuted total={d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - t_all)});
         };
         if (self.pool) |p| {
-            try runRegionPooled(self.scan_schema, self.sources, self.entry_derived, self.sides, self.prog, self.opts, &result, p);
+            try p.beginAccounting(exec.memory.accountantOf(self.allocator));
+            defer p.endAccounting();
+            runRegionPooled(self.scan_schema, self.sources, self.entry_derived, self.sides, self.prog, self.opts, &result, p) catch |err| {
+                p.reset();
+                return err;
+            };
         } else {
             if (self.sides.len > 0) return error.UnsupportedQueryShape;
             try runRegion(self.allocator, self.scan_schema, self.sources, self.entry_derived, self.prog, self.opts, &result);
@@ -5800,6 +5860,10 @@ test "region pool: repeated runs reuse cleared state; cap evicts at release" {
     defer result.deinit();
 
     for (0..2) |_| {
+        var account = exec.memory.MemoryAccountant.init(128 << 20);
+        account.trackAllocations(alloc);
+        try pool.beginAccounting(&account);
+        defer if (pool.tracker.?.active != null) pool.endAccounting();
         result.clear();
         var srcs = [1]exec.Query{try single_batch.SingleBatchSource.create(alloc, .{
             .schema = &entry,
@@ -5818,6 +5882,9 @@ test "region pool: repeated runs reuse cleared state; cap evicts at release" {
         // State retained (cleared, not freed) for the next run.
         try testing.expect(pool.ex != null);
         try testing.expect(pool.prog == &prog);
+        try testing.expectEqual(pool.retainedBytes(), account.current_bytes);
+        pool.endAccounting();
+        try testing.expectEqual(@as(usize, 0), account.current_bytes);
     }
     try testing.expect(pool.retainedBytes() > 0);
 

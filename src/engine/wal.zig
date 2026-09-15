@@ -7,13 +7,14 @@
 //! that was lost when the previous process exited (with whatever was
 //! still in the memtable).
 //!
-//! File layout (binary, little-endian):
+//! File layout (v2, binary, little-endian; v1 remains readable):
 //!
-//!   Header (16 bytes):
+//!   Header (32 bytes):
 //!     magic "tDBW"        4
 //!     version u16         2
 //!     flags u16           2  (reserved, 0)
 //!     schema_fingerprint  8  (must match table's schema fingerprint on open)
+//!     generation         16  (new on each replacement; absent in v1)
 //!
 //!   Sequence of records, each:
 //!     type u8             1   (1=insert, 2=delete, 3=flush_marker)
@@ -53,9 +54,11 @@ const Memtable = memtable_mod.Memtable;
 const codec = @import("wal_codec.zig");
 
 pub const wal_magic: [4]u8 = .{ 't', 'D', 'B', 'W' };
-pub const wal_version: u16 = 1;
+pub const wal_version: u16 = 2;
 pub const wal_filename = "wal";
-pub const header_size: usize = 16;
+pub const header_size: usize = 32;
+const legacy_header_size: usize = 16;
+pub const Checkpoint = storage.manifest.WalCheckpoint;
 pub const record_header_size: usize = 1 + 4; // type + payload_len
 pub const record_trailer_size: usize = 8; // xxhash64
 
@@ -121,6 +124,8 @@ pub const WalWriter = struct {
     /// been covered by some fsync. After a truncate, the physical file is
     /// small again but `write_offset` keeps advancing.
     write_offset: u64,
+    physical_offset: u64 = header_size,
+    generation: [16]u8 = @splat(0),
     /// Highest `write_offset` that has been durably fsynced. After truncate,
     /// this is bumped to `write_offset` (data before truncate is implicitly
     /// durable — either in a segment or no longer needed).
@@ -163,13 +168,12 @@ pub const WalWriter = struct {
         var file = try dir.createFile(io, wal_filename, .{});
         errdefer file.close(io);
 
-        var hdr: [header_size]u8 = undefined;
-        @memcpy(hdr[0..4], &wal_magic);
-        format.writeU16(hdr[4..6], wal_version);
-        format.writeU16(hdr[6..8], 0);
-        format.writeU64(hdr[8..16], schema_fingerprint);
+        var generation: [16]u8 = undefined;
+        io.random(&generation);
+        const hdr = makeHeader(schema_fingerprint, generation);
         try file.writeStreamingAll(io, &hdr);
         try file.sync(io);
+        try storage.syncDirectory(io, dir);
 
         return .{
             .allocator = allocator,
@@ -178,12 +182,27 @@ pub const WalWriter = struct {
             .file = file,
             .write_offset = header_size,
             .synced_offset = header_size,
+            .generation = generation,
         };
     }
 
     pub fn deinit(self: *WalWriter) void {
         self.file.close(self.io);
         self.* = undefined;
+    }
+
+    pub fn checkpoint(self: *const WalWriter) Checkpoint {
+        return .{ .generation = self.generation, .offset = self.physical_offset };
+    }
+
+    fn makeHeader(schema_fingerprint: u64, generation: [16]u8) [header_size]u8 {
+        var hdr: [header_size]u8 = undefined;
+        @memcpy(hdr[0..4], &wal_magic);
+        format.writeU16(hdr[4..6], wal_version);
+        format.writeU16(hdr[6..8], 0);
+        format.writeU64(hdr[8..16], schema_fingerprint);
+        @memcpy(hdr[16..32], &generation);
+        return hdr;
     }
 
     /// Encode the newly-added rows (`memtable.columns[ci]` from `from..to`)
@@ -277,20 +296,22 @@ pub const WalWriter = struct {
             self.coord_mu.unlock(self.io);
         }
 
-        // Recreate before closing the old handle (createFile truncates the
-        // existing file in place) so a createFile failure leaves `self.file`
-        // valid for retry.
-        const new_file = try self.dir.createFile(self.io, wal_filename, .{});
+        const temporary = "wal.tmp";
+        var generation: [16]u8 = undefined;
+        self.io.random(&generation);
+        const new_file = try self.dir.createFile(self.io, temporary, .{});
+        var owns_new = true;
+        errdefer if (owns_new) new_file.close(self.io);
+        errdefer self.dir.deleteFile(self.io, temporary) catch {};
+        const hdr = makeHeader(schema_fingerprint, generation);
+        try new_file.writeStreamingAll(self.io, &hdr);
+        try new_file.sync(self.io);
+        try Io.Dir.rename(self.dir, temporary, self.dir, wal_filename, self.io);
         self.file.close(self.io);
         self.file = new_file;
-
-        var hdr: [header_size]u8 = undefined;
-        @memcpy(hdr[0..4], &wal_magic);
-        format.writeU16(hdr[4..6], wal_version);
-        format.writeU16(hdr[6..8], 0);
-        format.writeU64(hdr[8..16], schema_fingerprint);
-        try self.file.writeStreamingAll(self.io, &hdr);
-        try self.file.sync(self.io);
+        owns_new = false;
+        self.generation = generation;
+        self.physical_offset = header_size;
 
         // Anything that was waiting on offsets <= `write_offset` is now
         // implicitly durable (its data is either in a segment or was a delete
@@ -300,6 +321,9 @@ pub const WalWriter = struct {
         self.in_progress = false;
         self.coord_cv.broadcast(self.io);
         self.coord_mu.unlock(self.io);
+        // The new handle is installed even if directory sync fails. A later
+        // writer must never append through the retired, unlinked handle.
+        storage.syncDirectory(self.io, self.dir) catch return error.DurabilityUncertain;
     }
 
     /// Block until the WAL has been durably fsynced through `target_offset`.
@@ -405,6 +429,7 @@ pub const WalWriter = struct {
         format.writeU64(buf[5 + payload.len ..][0..8], checksum);
 
         try self.file.writeStreamingAll(self.io, buf);
+        self.physical_offset += total;
 
         self.coord_mu.lockUncancelable(self.io);
         self.write_offset += total;
@@ -424,22 +449,42 @@ pub fn replay(
     schema_fingerprint: u64,
     mt: *Memtable,
 ) !bool {
+    return (try replayFromCheckpoint(allocator, io, dir, schema_fingerprint, mt, .{})).did_replay;
+}
+
+pub const ReplayResult = struct { did_replay: bool = false, checkpoint: Checkpoint = .{} };
+
+pub fn replayFromCheckpoint(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    schema_fingerprint: u64,
+    mt: *Memtable,
+    checkpoint: Checkpoint,
+) !ReplayResult {
     const bytes = dir.readFileAlloc(io, wal_filename, allocator, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return false,
+        error.FileNotFound => return .{},
         else => return err,
     };
     defer allocator.free(bytes);
 
-    if (bytes.len < header_size) return Error.WalTooSmall;
+    if (bytes.len < legacy_header_size) return Error.WalTooSmall;
     if (!std.mem.eql(u8, bytes[0..4], &wal_magic)) return Error.WalBadMagic;
     const version = format.readU16(bytes[4..6]);
-    if (version != wal_version) return Error.WalUnsupportedVersion;
+    if (version != 1 and version != wal_version) return Error.WalUnsupportedVersion;
+    const actual_header_size: usize = if (version == 1) legacy_header_size else header_size;
+    if (bytes.len < actual_header_size) return Error.WalTooSmall;
+    const generation: [16]u8 = if (version == 1) @splat(0) else bytes[16..32].*;
     const fp = format.readU64(bytes[8..16]);
     if (fp != schema_fingerprint) return Error.WalSchemaFingerprintMismatch;
 
     // First pass: find the position immediately after the last flush_marker.
-    var cursor: usize = header_size;
-    var replay_start: usize = header_size;
+    var replay_start: usize = actual_header_size;
+    if (checkpoint.offset != 0 and std.mem.eql(u8, &generation, &checkpoint.generation)) {
+        if (checkpoint.offset < actual_header_size or checkpoint.offset > bytes.len) return Error.WalCorrupt;
+        replay_start = @intCast(checkpoint.offset);
+    }
+    var cursor: usize = replay_start;
     while (cursor < bytes.len) {
         const next = readRecord(bytes, cursor) catch |err| switch (err) {
             // Truncated tail (partial write before crash) — stop here.
@@ -468,7 +513,7 @@ pub fn replay(
         cursor = rec.cursor_after;
     }
 
-    return did_replay;
+    return .{ .did_replay = did_replay, .checkpoint = .{ .generation = generation, .offset = cursor } };
 }
 
 const ReadRecord = struct {
@@ -493,6 +538,44 @@ fn readRecord(bytes: []const u8, off: usize) !ReadRecord {
         .payload = bytes[off + record_header_size .. payload_end],
         .cursor_after = payload_end + record_trailer_size,
     };
+}
+
+test "wal v1 records remain readable without a generation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var source = try Memtable.init(a, schema);
+    defer source.deinit();
+    try source.appendValue(0, i64, 42);
+    source.row_count = 1;
+    {
+        var writer = try WalWriter.create(a, io, tmp.dir, 1234);
+        defer writer.deinit();
+        _ = try writer.appendInsert(&source, 0, 1);
+    }
+    const current = try tmp.dir.readFileAlloc(io, wal_filename, a, .unlimited);
+    defer a.free(current);
+    const legacy = try a.alloc(u8, current.len - (header_size - legacy_header_size));
+    defer a.free(legacy);
+    @memcpy(legacy[0..legacy_header_size], current[0..legacy_header_size]);
+    @memcpy(legacy[legacy_header_size..], current[header_size..]);
+    std.mem.writeInt(u16, legacy[4..6], 1, .little);
+    try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = legacy });
+    var recovered = try Memtable.init(a, schema);
+    defer recovered.deinit();
+    const result = try replayFromCheckpoint(a, io, tmp.dir, 1234, &recovered, .{});
+    try std.testing.expect(result.did_replay);
+    try std.testing.expectEqualSlices(i64, &.{42}, recovered.columns[0].data.bigint.items);
+    recovered.clear();
+    const again = try replayFromCheckpoint(a, io, tmp.dir, 1234, &recovered, result.checkpoint);
+    try std.testing.expect(!again.did_replay);
+    try std.testing.expectEqual(@as(u64, 0), recovered.row_count);
 }
 
 test "truncate failure clears the group-commit coordinator" {

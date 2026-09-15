@@ -17,6 +17,7 @@ const engine = @import("../engine/engine.zig");
 const exec = @import("../exec/exec.zig");
 const bloom_util = @import("../util/bloom.zig");
 const FairMutex = @import("../util/fair_mutex.zig").FairMutex;
+const StatementGate = @import("../util/statement_gate.zig").StatementGate;
 
 const api = @import("api.zig");
 const Config = api.Config;
@@ -25,6 +26,8 @@ const Error = api.Error;
 
 pub const Table = struct {
     allocator: Allocator,
+    statement_gate: ?*StatementGate = null,
+    recovery_required: std.atomic.Value(bool) = .init(false),
     io: Io,
     name: []u8,
     schema_owner: storage.schema_file.SchemaOwner,
@@ -213,10 +216,8 @@ pub const Table = struct {
         // we open the WAL writer for new appends. If wal_enabled is
         // false but a WAL file is present from a previous run, we still
         // replay it so no acked writes are silently dropped.
-        _ = engine.wal.replay(allocator, io, table_dir, fp, memtable) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+        const replayed = try engine.wal.replayFromCheckpoint(allocator, io, table_dir, fp, memtable, manifest.wal_checkpoint);
+        if (replayed.did_replay) manifest.wal_checkpoint = replayed.checkpoint;
 
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
@@ -244,6 +245,7 @@ pub const Table = struct {
 
         self.* = .{
             .allocator = allocator,
+            .statement_gate = cfg.statement_gate,
             .io = io,
             .name = name_copy,
             .schema_owner = schema_owner,
@@ -335,6 +337,8 @@ pub const Table = struct {
     /// causes the old row to be tombstoned. The new row becomes the visible
     /// value. (StarRocks "last writer wins" semantics.)
     pub fn insert(self: *Table, rows: anytype) !void {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         self.mutex.lockUncancelable(self.io);
         var wal_target: ?u64 = null;
         {
@@ -351,6 +355,8 @@ pub const Table = struct {
     /// when you want the call site to be explicit that overwrite is
     /// the intent.
     pub fn upsert(self: *Table, rows: anytype) !void {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         if (!self.schema.unique) return Error.UpsertRequiresUniqueKey;
         self.mutex.lockUncancelable(self.io);
         var wal_target: ?u64 = null;
@@ -373,6 +379,8 @@ pub const Table = struct {
         views: []const storage.ColumnView,
         row_count: usize,
     ) !void {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         self.mutex.lockUncancelable(self.io);
         var wal_target: ?u64 = null;
         {
@@ -403,6 +411,7 @@ pub const Table = struct {
         views: []const storage.ColumnView,
         row_count: usize,
     ) !?u64 {
+        try self.ensureUsable();
         var wal_target: ?u64 = null;
         try self.cloneMemtableIfPinnedLocked();
         const was_empty = self.memtable.isEmpty();
@@ -429,6 +438,7 @@ pub const Table = struct {
     /// concurrent batch of writers can amortize a single fsync syscall.
     /// Returns null when no WAL is configured.
     fn insertLocked(self: *Table, rows: anytype) !?u64 {
+        try self.ensureUsable();
         try self.cloneMemtableIfPinnedLocked();
         const was_empty = self.memtable.isEmpty();
         const before_count: usize = @intCast(self.memtable.row_count);
@@ -491,12 +501,15 @@ pub const Table = struct {
     /// atomically. Rows are written sorted by the table's order key. No-op
     /// if the memtable is empty.
     pub fn flush(self: *Table) !void {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.flushLocked();
     }
 
     pub fn flushLocked(self: *Table) !void {
+        try self.ensureUsable();
         if (self.memtable.isEmpty()) {
             self.first_write_ts = null;
             return;
@@ -514,7 +527,8 @@ pub const Table = struct {
         // manifest / WAL work below fails, errdefer frees the new one and we
         // leave the current memtable intact.
         const new_mt = try engine.Memtable.create(self.allocator, self.schema);
-        errdefer new_mt.release();
+        var owns_new_mt = true;
+        errdefer if (owns_new_mt) new_mt.release();
 
         const sync = self.syncEnabled();
 
@@ -560,27 +574,36 @@ pub const Table = struct {
             try storage.writeFileSynced(self.io, self.segments_dir, bloom_name, info.key_bloom, sync);
         }
 
-        try self.manifest.appendSegment(try self.entryFor(info));
-        try storage.writeManifest(self.io, self.table_dir, self.manifest, sync);
+        var entries: std.ArrayList(storage.ManifestEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        try entries.ensureTotalCapacity(self.allocator, self.manifest.segments.items.len + 1);
+        entries.appendSliceAssumeCapacity(self.manifest.segments.items);
+        var entry = try self.entryFor(info);
+        var owns_entry = true;
+        errdefer if (owns_entry) entry.deinit(self.allocator);
+        entries.appendAssumeCapacity(entry);
+        var candidate = self.manifest;
+        candidate.segments = entries;
+        if (self.wal) |*w| candidate.wal_checkpoint = w.checkpoint();
+        if (sync) try storage.syncDirectory(self.io, self.segments_dir);
+        try self.persistManifest(candidate, sync);
 
-        // WAL: the records preceding this flush are now redundant. Append a
-        // flush marker so a crash mid-truncate is still recoverable, then
-        // truncate. Order is intentional — marker first, truncate second.
-        // Truncate is self-syncing AND bumps `synced_offset` past every
-        // append before the truncate, so any pending `awaitDurable` from
-        // the same call chain becomes a no-op.
-        if (self.wal) |*w| {
-            _ = try w.appendFlushMarker(seg_id);
-            try w.truncate(self.schema_fingerprint);
-        }
+        self.manifest.segments.deinit(self.allocator);
+        self.manifest = candidate;
+        entries = .empty;
+        owns_entry = false;
 
         // Retire-replace: swap the active memtable for the fresh one. The
         // old memtable's columns are not mutated again; any scan that pinned
         // it via `acquire` continues to read it safely until its `release`
         // drops the refcount to zero and frees it.
         self.installMemtableLocked(new_mt);
-
+        owns_new_mt = false;
         self.first_write_ts = null;
+
+        // The manifest owns the WAL checkpoint now. A failed cleanup leaves
+        // both the live view and restart recovery at the same committed state.
+        try self.replaceWal();
     }
 
     /// Called from `insert`/`delete` after mutation. Flushes the memtable if
@@ -619,10 +642,12 @@ pub const Table = struct {
     /// silently forever while the memtable stays volatile — log it here,
     /// throttled, so the failure is visible in the server log.
     pub fn tryBackgroundFlush(self: *Table) !void {
+        try self.ensureUsable();
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock(self.io);
         self.drainPendingDeletesLocked();
         self.maybeAutoFlushLocked() catch |err| {
+            self.recordIoFailure(err);
             self.flush_fail_streak +|= 1;
             if (self.flush_fail_streak == 1 or self.flush_fail_streak % 60 == 0) {
                 std.debug.print(
@@ -641,6 +666,7 @@ pub const Table = struct {
     /// `min_segments` are live) the count-based tier trigger. No-op when
     /// no segment qualifies or both gates are disabled.
     pub fn tryBackgroundCompact(self: *Table, min_segments: u32, tomb_threshold: f32) !bool {
+        try self.ensureUsable();
         // Cheap optimization: skip the work if neither trigger can fire.
         self.mutex.lockUncancelable(self.io);
         const seg_count = self.manifest.segments.items.len;
@@ -691,6 +717,45 @@ pub const Table = struct {
 
     /// True iff this table is configured for durable writes (Config.sync_mode).
     /// Storage primitives that fsync take this as a parameter.
+    pub fn ensureUsable(self: *const Table) !void {
+        if (self.recovery_required.load(.acquire)) return error.RecoveryRequired;
+        if (self.statement_gate) |g| if (g.recovery_required.load(.acquire)) return error.RecoveryRequired;
+    }
+
+    pub fn acquireStatement(self: *Table) !?StatementGate.Lease {
+        try self.ensureUsable();
+        return if (self.statement_gate) |gate| try gate.acquire(false) else null;
+    }
+
+    pub fn persistManifest(self: *Table, manifest: storage.Manifest, sync: bool) !void {
+        try self.ensureUsable();
+        storage.writeManifest(self.io, self.table_dir, manifest, sync) catch |err| {
+            self.recordIoFailure(err);
+            return err;
+        };
+    }
+
+    pub fn mergeTombstones(self: *Table, scratch: Allocator, id: u64, offsets: []const u32, sync: bool) !void {
+        try self.ensureUsable();
+        storage.tombstone.merge(scratch, self.io, self.segments_dir, id, offsets, sync) catch |err| {
+            self.recordIoFailure(err);
+            return err;
+        };
+    }
+
+    fn replaceWal(self: *Table) !void {
+        if (self.wal) |*w| w.truncate(self.schema_fingerprint) catch |err| {
+            self.recordIoFailure(err);
+            return err;
+        };
+    }
+
+    fn recordIoFailure(self: *Table, err: anyerror) void {
+        if (err != error.DurabilityUncertain) return;
+        self.recovery_required.store(true, .release);
+        if (self.statement_gate) |gate| gate.recovery_required.store(true, .release);
+    }
+
     pub fn syncEnabled(self: Table) bool {
         return self.sync_mode != .none;
     }
@@ -714,11 +779,14 @@ pub const Table = struct {
     /// emits tombstones for matches in segments, and rebuilds the memtable
     /// without them. Returns the number of rows deleted.
     pub fn delete(self: *Table, pred: exec.Predicate) !usize {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         self.mutex.lockUncancelable(self.io);
         var wal_target: ?u64 = null;
         var deleted: usize = 0;
         {
             defer self.mutex.unlock(self.io);
+            try self.ensureUsable();
             // Log first; the delete primitive is idempotent on replay.
             if (self.wal) |*w| {
                 wal_target = try w.appendDelete(pred);
@@ -742,6 +810,8 @@ pub const Table = struct {
     /// memtable clone-and-swap. Crash recovery rebuilds segment
     /// state from the persisted tombstone files.
     pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr) !usize {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         // Widen literals in the predicate up front so both the WAL-
         // logged form and the executor see the same shape (BIGINT
         // column + INT literal etc.). The mutation is local to this
@@ -774,6 +844,8 @@ pub const Table = struct {
         preds: []const ?exec.PredicateExpr,
         counts: []usize,
     ) !?usize {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         const del = @import("delete.zig");
 
         // Widen literals up front (same as deleteByExpr) so key encoding,
@@ -808,6 +880,7 @@ pub const Table = struct {
     /// isn't loggable (caller should still proceed with the delete —
     /// segment tombstones are durable independently).
     pub fn logDeleteExprLocked(self: *Table, pred_opt: ?exec.PredicateExpr) !?u64 {
+        try self.ensureUsable();
         if (self.wal == null) return null;
         if (pred_opt) |pred| {
             return self.wal.?.appendDeleteExpr(pred) catch |err| switch (err) {
@@ -844,10 +917,14 @@ pub const Table = struct {
         pred: ?exec.PredicateExpr,
         assignments: []const @import("update.zig").Assignment,
     ) !usize {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         return try @import("update.zig").execUpdateStreaming(self, pred, assignments);
     }
 
     pub fn applyUpdate(self: *Table, pred: ?exec.PredicateExpr, sink: *@import("../engine/engine.zig").Memtable) !void {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         // Widen the predicate up front so the WAL-logged form matches
         // what execDeleteByExpr will run.
         var pred_local: ?exec.PredicateExpr = pred;
@@ -884,43 +961,45 @@ pub const Table = struct {
     /// DDL-style physical reset: segments, tombstones, memtable, WAL contents,
     /// row-group cache, and AUTO_INCREMENT state are cleared together.
     pub fn truncate(self: *Table) !void {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         self.compact_lock.lockUncancelable(self.io);
         defer self.compact_lock.unlock(self.io);
         self.ddl_lock.lockUncancelable(self.io);
         defer self.ddl_lock.unlock(self.io);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        try self.ensureUsable();
 
-        self.segments_dir.close(self.io);
-        try self.table_dir.deleteTree(self.io, "segments");
-        self.segments_dir = try self.table_dir.createDirPathOpen(self.io, "segments", .{});
-
-        var new_manifest = storage.Manifest.empty(self.allocator, self.schema_fingerprint, @intCast(self.schema.columns.len));
-        errdefer new_manifest.deinit();
-        if (autoIncrementColumnIndex(self.schema) != null) new_manifest.auto_inc_next = 1;
-        try storage.writeManifest(self.io, self.table_dir, new_manifest, self.syncEnabled());
-
-        if (self.wal) |*w| try w.truncate(self.schema_fingerprint);
-
-        const new_mt = try engine.Memtable.create(self.allocator, self.schema);
-        errdefer new_mt.release();
-        self.installMemtableLocked(new_mt);
-
-        self.manifest.deinit();
-        self.manifest = new_manifest;
-        self.next_segment_id.store(self.manifest.nextSegmentId(), .monotonic);
+        var candidate = storage.Manifest.empty(self.allocator, self.schema_fingerprint, @intCast(self.schema.columns.len));
+        var owns_candidate = true;
+        errdefer if (owns_candidate) candidate.deinit();
+        if (autoIncrementColumnIndex(self.schema) != null) candidate.auto_inc_next = 1;
+        if (self.wal) |*w| candidate.wal_checkpoint = w.checkpoint();
+        const replacement = try engine.Memtable.create(self.allocator, self.schema);
+        var owns_replacement = true;
+        errdefer if (owns_replacement) replacement.release();
+        try self.persistManifest(candidate, self.syncEnabled());
+        var previous = self.manifest;
+        defer previous.deinit();
+        self.manifest = candidate;
+        owns_candidate = false;
+        self.installMemtableLocked(replacement);
+        owns_replacement = false;
         self.first_write_ts = null;
-
-        // Segment IDs restart after a truncate, so the old generation's cached
-        // blocks must become unreachable: purge them and move to a fresh uid.
         self.cache.purgeTable(self.cache_uid);
         self.cache_uid = storage.cache.newTableUid();
         self.seg_handles.clear(self.allocator);
+        // Keep IDs monotonic while old files may remain queued for deletion.
+        try self.replaceWal();
+        for (previous.segments.items) |entry| try self.deleteSegmentFiles(entry.segment_id);
     }
 
     /// Merge all segments into a single new segment. Drops tombstoned rows.
     /// No-op if there's at most one segment.
     pub fn compact(self: *Table) !void {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
         self.compact_lock.lockUncancelable(self.io);
         defer self.compact_lock.unlock(self.io);
         try @import("compact.zig").execCompact(self);

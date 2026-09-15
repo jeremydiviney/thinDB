@@ -192,11 +192,7 @@ pub fn serveTcp(
     errdefer db.close();
 
     var listen_addr = address;
-    const listener = try std.Io.net.IpAddress.listen(&listen_addr, io, .{
-        .mode = .stream,
-        .protocol = .tcp,
-        .reuse_address = true,
-    });
+    const listener = try @import("../util/tcp_listener.zig").listen(&listen_addr, io);
 
     const limiter = try allocator.create(ConnectionLimiter);
     errdefer allocator.destroy(limiter);
@@ -235,11 +231,7 @@ pub fn serveTcpCatalog(
         try catalog.createDatabase(back_compat_database_name);
 
     var listen_addr = address;
-    const listener = try std.Io.net.IpAddress.listen(&listen_addr, io, .{
-        .mode = .stream,
-        .protocol = .tcp,
-        .reuse_address = true,
-    });
+    const listener = try @import("../util/tcp_listener.zig").listen(&listen_addr, io);
 
     const effective_limiter = if (limiter) |lim| lim else blk: {
         const lp = try allocator.create(ConnectionLimiter);
@@ -328,6 +320,22 @@ fn handleConnection(
     }
 
     const payload = frame.payload;
+
+    var statement_lease: ?@import("../api/catalog.zig").Catalog.StatementLease = null;
+    defer if (statement_lease) |lease| lease.release();
+    if (frame.msg_type != .req_query) {
+        if (local.catalogFor(db)) |catalog| {
+            const ddl = switch (frame.msg_type) {
+                .req_create_table, .req_drop_table, .req_rename_table, .req_alter_table => true,
+                else => false,
+            };
+            statement_lease = catalog.acquireStatement(ddl) catch |err| {
+                try sendError(allocator, &writer.interface, err);
+                try writer.interface.flush();
+                return;
+            };
+        }
+    }
 
     // Dispatch on request type. Read-path streams batches via
     // handleQuery; admin/write requests reply with a single resp_ok

@@ -445,9 +445,9 @@ pub const Filter = struct {
         return self.upstream.rechainProbeSink(sink);
     }
 
-    pub fn tryFuseCompute(self: *Filter, derived: []const @import("compute.zig").Derived) !bool {
+    pub fn tryFuseCompute(self: *Filter, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) !bool {
         if (!self.fused) return false;
-        const ok = try self.upstream.tryFuseCompute(derived);
+        const ok = try self.upstream.tryFuseComputeWithRegistry(derived, registry);
         // The fused derived columns grow the upstream's output schema, so our
         // pre-fusion `cached_stats` (tightened for the OLD, narrower schema) is
         // now stale + too short — a derived GROUP BY key would index past its

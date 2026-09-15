@@ -55,6 +55,42 @@ pub fn writeFileSynced(
     if (sync_after_write) try file.sync(io);
 }
 
+/// POSIX file sync does not persist the directory entry selecting that file.
+/// Windows does not support fsync on a directory handle.
+pub fn syncDirectory(io: Io, dir: Io.Dir) !void {
+    if (@import("builtin").os.tag == .windows) return;
+    const readable = try dir.openDir(io, ".", .{ .iterate = true });
+    defer readable.close(io);
+    const file: Io.File = .{ .handle = readable.handle, .flags = .{ .nonblocking = false } };
+    try file.sync(io);
+}
+
+pub fn writeFileAtomic(
+    io: Io,
+    dir: Io.Dir,
+    temporary_path: []const u8,
+    path: []const u8,
+    data: []const u8,
+    durable: bool,
+) !void {
+    try writeFileSynced(io, dir, temporary_path, data, durable);
+    errdefer dir.deleteFile(io, temporary_path) catch {};
+    // Windows can temporarily refuse replacement while another handle or a
+    // filesystem filter holds the destination. Retry only before publication;
+    // a persistent denial must preserve the old file and reach the caller.
+    var retry_delay_ms: i64 = 1;
+    while (true) {
+        Io.Dir.rename(dir, temporary_path, dir, path, io) catch |err| {
+            if (@import("builtin").os.tag != .windows or err != error.AccessDenied or retry_delay_ms > 32) return err;
+            try Io.sleep(io, .fromMilliseconds(retry_delay_ms), .awake);
+            retry_delay_ms *= 2;
+            continue;
+        };
+        break;
+    }
+    if (durable) syncDirectory(io, dir) catch return error.DurabilityUncertain;
+}
+
 // ---------------------------------------------------------------------------
 // Round-trip test — write some columns out, read them back, verify.
 // ---------------------------------------------------------------------------

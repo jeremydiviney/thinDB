@@ -105,8 +105,7 @@ pub fn write(
     for (offsets) |off| try appendU32(scratch, &buf, off);
     try buf.appendSlice(scratch, &tombstone_magic);
 
-    try @import("storage.zig").writeFileSynced(io, segments_dir, tmp_name, buf.items, sync);
-    try Io.Dir.rename(segments_dir, tmp_name, segments_dir, file_name, io);
+    try @import("storage.zig").writeFileAtomic(io, segments_dir, tmp_name, file_name, buf.items, sync);
 }
 
 /// Read existing tombstones (if any), merge in `new_offsets`, dedupe, sort,

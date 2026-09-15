@@ -1334,7 +1334,7 @@ const LowCardGroup = struct {
 
         if (self.order_specs.len > 0) {
             const ctx = SortCtx{ .op = self, .merged = merged };
-            std.sort.pdq(u32, order, ctx, SortCtx.lessThan);
+            try exec.memory.sort(u32, order, ctx, self.allocator, SortCtx.lessThan);
         }
 
         const start = @min(self.offset, n_groups);

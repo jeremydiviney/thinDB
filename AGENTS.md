@@ -6,7 +6,7 @@ This file tells Codex how to work in this repo. The architecture lives in [DESIG
 
 ## Project context
 
-**thinDB** is a single-node, columnar analytics database written in Zig. v1 is an embedded library only — no SQL, no server, no joins. The goal is raw speed via a small, predictable core. See `DESIGN.md` §1 for goals & non-goals.
+**thinDB** is a single-node columnar analytics database written in Zig. It includes an embedded API, SQL compiler, MySQL/PostgreSQL/native server, joins, CTEs, windows, UDFs, and parallel execution. The goal is raw speed with explicit memory, concurrency, and durability contracts. See `DESIGN.md` sections 1, 8, and 9.8.
 
 Two principles run through every decision in this codebase:
 1. **Thin.** If a feature doesn't earn its keep on one machine, it isn't here.
@@ -19,11 +19,14 @@ Two principles run through every decision in this codebase:
 ```
 src/
   api/        public Database, Table, Query builder, .pipe() composition
-  engine/     writer thread, memtable, flush, compaction, alter orchestration
+  engine/     memtable, WAL, column stores, flush/compaction primitives
   exec/       operators (scan, filter, project, aggregate, sort, limit, sink)
   storage/    segment reader/writer, manifest, encodings, compression, tombstones
   types/      type system, decimal kernel, datetime helpers
-  cache/      LRU row-group cache
+  sql/        SQL parser and lowering
+  ir/         query and statement representation
+  net/        compilation, sessions, MySQL/PostgreSQL/native protocols
+  cmd/        standalone server and CLI
   util/       allocator helpers, small primitives
 tests/
   integration/   end-to-end scenarios
@@ -45,7 +48,7 @@ When adding code, place it in the subsystem it logically belongs to. New encodin
 
 ```
 zig build                              # debug build
-zig build test                         # all `test` blocks across the tree
+zig build test                         # standard runners, including V2 integration
 zig build test -Dtest-filter="scan"    # subset by name
 zig build -Doptimize=ReleaseFast       # production build
 zig build bench                        # run benchmarks

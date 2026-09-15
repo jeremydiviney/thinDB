@@ -241,7 +241,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     if (request.derived.len > 0) {
         const scan = try Scan.allocWithProjectionLoc(allocator, table, null, base_cols.items, false, null);
         var sq = exec.makeQuery(allocator, scan);
-        probe_q = sq.compute(request.derived) catch |e| {
+        probe_q = sq.computeWithRegistry(request.derived, request.udf_registry) catch |e| {
             sq.deinit();
             return e;
         };
@@ -457,8 +457,10 @@ const GroupTopNPipeline = struct {
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
         const grouped = if (self.request.having_filter) |hexpr| applyHaving(self, hexpr, rows.items) else rows.items;
+        try exec.memory.checkCancelled(self.allocator);
         var final_rows = try prepareFinalRows(self, grouped);
         defer final_rows.deinit();
+        try exec.memory.checkCancelled(self.allocator);
         try emitResultStage(self, final_rows.items);
         ctx.times.emit_ticks = exec.prof.nowTicks() - emit_t0;
         traceProfile(ctx);
@@ -481,7 +483,7 @@ fn prepareExecution(allocator: Allocator, table: *api.Table, request: Request, p
 
 fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     const t0 = exec.prof.nowTicks();
-    const core_allocator = std.heap.page_allocator;
+    const core_allocator = try exec.memory.trackedBackend(std.heap.page_allocator, exec.memory.accountantOf(ctx.allocator));
     const params = GroupTopNEngine.paramsFromEnv(ctx.dop);
     ctx.bucket_count = params.bucket_count;
     ctx.chunk_rows = params.raw_chunk_rows;
@@ -594,6 +596,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
         .params = params,
         .scan_columns = scan_columns,
         .derived = ctx.plan.derived,
+        .udf_registry = ctx.request.udf_registry,
         .filter_expr = ctx.request.where_filter,
     });
 
@@ -645,7 +648,7 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
     }
 
     if (op.request.limit == 0) {
-        std.mem.sort(SiloCore.TopRow, rows, op, finalRowLess);
+        try exec.memory.sort(SiloCore.TopRow, rows, op, op.allocator, finalRowLess);
         return .{ .allocator = op.allocator, .items = rows };
     }
 
@@ -657,7 +660,7 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
     // and each replacement walks ~keep entries. Sorting everything is
     // O(n log n) and strictly cheaper there.
     if (keep * 2 >= rows.len) {
-        std.mem.sort(SiloCore.TopRow, rows, op, finalRowLess);
+        try exec.memory.sort(SiloCore.TopRow, rows, op, op.allocator, finalRowLess);
         const start = @min(op.request.offset, rows.len);
         const end = limitEnd(start, rows.len, op.request.limit);
         return .{ .allocator = op.allocator, .items = rows[start..end] };
@@ -666,7 +669,8 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
     errdefer op.allocator.free(candidates);
     var len: usize = 0;
     var worst_i: usize = 0;
-    for (rows) |row| {
+    for (rows, 0..) |row, row_index| {
+        if (row_index % 1024 == 0) try exec.memory.checkCancelled(op.allocator);
         if (len < keep) {
             candidates[len] = row;
             if (len == 0 or finalRowLess(op, candidates[worst_i], row)) worst_i = len;
@@ -681,7 +685,7 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
             if (finalRowLess(op, candidates[worst_i], candidates[i])) worst_i = i;
         }
     }
-    std.mem.sort(SiloCore.TopRow, candidates[0..len], op, finalRowLess);
+    try exec.memory.sort(SiloCore.TopRow, candidates[0..len], op, op.allocator, finalRowLess);
     const start = @min(op.request.offset, len);
     const end = limitEnd(start, len, op.request.limit);
     const emit_len = end - start;
@@ -905,13 +909,13 @@ fn emitPackedRange(allocator: Allocator, op: *GroupTopNPipeline, rows: []const S
 }
 
 fn emitPackedWorker(job: *EmitRange) void {
-    emitPackedRange(EmitRanges.worker_alloc, job.op, job.rows, job.cols) catch |e| {
+    emitPackedRange(job.allocator, job.op, job.rows, job.cols) catch |e| {
         job.err = e;
     };
 }
 
 fn emitHashedWorker(job: *EmitRange) void {
-    emitHashedRange(EmitRanges.worker_alloc, job.op, job.rows, job.idx, job.parts, job.part_starts, job.cols) catch |e| {
+    emitHashedRange(job.allocator, job.op, job.rows, job.idx, job.parts, job.part_starts, job.cols) catch |e| {
         job.err = e;
     };
 }
@@ -921,6 +925,7 @@ fn emitHashedWorker(job: *EmitRange) void {
 /// also carry the range's slice of the inverse permutation and the
 /// late-materialized partitions it reads.
 const EmitRange = struct {
+    allocator: Allocator,
     op: *GroupTopNPipeline,
     g0: usize,
     g1: usize,
@@ -933,21 +938,21 @@ const EmitRange = struct {
 };
 
 const EmitRanges = struct {
-    /// Worker allocations must be thread-safe; the query allocator isn't.
-    const worker_alloc = std.heap.c_allocator;
+    worker_alloc: Allocator,
 
     allocator: Allocator,
     jobs: []EmitRange,
     threads: []?std.Thread,
 
     fn init(op: *GroupTopNPipeline, workers: usize, total: usize) !EmitRanges {
+        const worker_alloc = try workerAllocator(op);
         const jobs = try op.allocator.alloc(EmitRange, workers);
         errdefer op.allocator.free(jobs);
         const threads = try op.allocator.alloc(?std.Thread, workers);
         errdefer op.allocator.free(threads);
         @memset(threads, null);
         var inited: usize = 0;
-        errdefer for (jobs[0..inited]) |*j| freeRangeCols(j.cols);
+        errdefer for (jobs[0..inited]) |*j| freeRangeCols(worker_alloc, j.cols);
         // Range bounds on 64-row multiples: the batches they become then
         // start on validity-byte boundaries, which a contiguous consumer
         // needs to fill them on parallel workers.
@@ -955,18 +960,23 @@ const EmitRanges = struct {
         for (jobs, 0..) |*job, w| {
             const g1 = if (w + 1 == workers) total else (total * (w + 1) / workers) & ~@as(usize, 63);
             job.* = .{
+                .allocator = worker_alloc,
                 .op = op,
                 .g0 = g0,
                 .g1 = g1,
-                .cols = try initRangeCols(op.output_schema),
+                .cols = try initRangeCols(worker_alloc, op.output_schema),
             };
             g0 = g1;
             inited += 1;
         }
-        return .{ .allocator = op.allocator, .jobs = jobs, .threads = threads };
+        return .{ .allocator = op.allocator, .worker_alloc = worker_alloc, .jobs = jobs, .threads = threads };
     }
 
-    fn initRangeCols(schema: []const Column) ![]ColumnStore {
+    fn workerAllocator(op: *GroupTopNPipeline) !Allocator {
+        return exec.memory.trackedBackend(std.heap.c_allocator, exec.memory.accountantOf(op.allocator));
+    }
+
+    fn initRangeCols(worker_alloc: Allocator, schema: []const Column) ![]ColumnStore {
         const cols = try worker_alloc.alloc(ColumnStore, schema.len);
         errdefer worker_alloc.free(cols);
         var n: usize = 0;
@@ -978,7 +988,7 @@ const EmitRanges = struct {
         return cols;
     }
 
-    fn freeRangeCols(cols: []ColumnStore) void {
+    fn freeRangeCols(worker_alloc: Allocator, cols: []ColumnStore) void {
         for (cols) |*c| c.deinit(worker_alloc);
         worker_alloc.free(cols);
     }
@@ -1000,7 +1010,7 @@ const EmitRanges = struct {
     }
 
     fn deinit(self: *EmitRanges) void {
-        for (self.jobs) |*j| freeRangeCols(j.cols);
+        for (self.jobs) |*j| freeRangeCols(self.worker_alloc, j.cols);
         self.allocator.free(self.jobs);
         self.allocator.free(self.threads);
     }
@@ -1016,6 +1026,7 @@ const MatPartition = struct {
     scan: *Scan,
     locs: []const i64,
     derived: []const compute.Derived,
+    udf_registry: ?*const udf_mod.UdfRegistry,
     views: []ColumnView = &.{},
     compute_q: ?Query = null,
     result: Batch = undefined,
@@ -1029,7 +1040,7 @@ const MatPartition = struct {
         errdefer inner.deinit();
         const late_q = try LateScan.create(allocator, inner, scan_ptr, op.table, names);
         const late = exec.queryAs(LateScan, late_q) orelse return error.UnsupportedQueryShape;
-        return .{ .allocator = allocator, .late_q = late_q, .late = late, .scan = scan_ptr, .locs = locs, .derived = derived };
+        return .{ .allocator = allocator, .late_q = late_q, .late = late, .scan = scan_ptr, .locs = locs, .derived = derived, .udf_registry = op.request.udf_registry };
     }
 
     fn materialize(self: *MatPartition) !void {
@@ -1043,7 +1054,11 @@ const MatPartition = struct {
         self.fetch_ticks = t1 - t0;
         if (self.derived.len == 0) return;
         const src = try SingleBatchSource.create(self.allocator, self.result);
-        self.compute_q = try compute.Compute.create(self.allocator, src, self.derived);
+        self.compute_q = compute.Compute.createWithRegistry(self.allocator, src, self.derived, self.udf_registry) catch |err| {
+            var owned_src = src;
+            owned_src.deinit();
+            return err;
+        };
         self.result = (try self.compute_q.?.next()) orelse return error.UnsupportedQueryShape;
         self.compute_ticks = exec.prof.nowTicks() - t1;
     }
@@ -1151,7 +1166,7 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
         const p0 = rows.len * w / workers;
         const p1 = if (w + 1 == workers) rows.len else rows.len * (w + 1) / workers;
         part_starts[w] = p0;
-        p.* = try MatPartition.create(EmitRanges.worker_alloc, op, names, derived, locs[p0..p1]);
+        p.* = try MatPartition.create(try EmitRanges.workerAllocator(op), op, names, derived, locs[p0..p1]);
         created += 1;
     }
     const mat_threads = try allocator.alloc(?std.Thread, workers);

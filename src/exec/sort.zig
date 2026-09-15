@@ -36,16 +36,17 @@ pub const SortSpec = struct {
 /// or deep slices fall back to comparison sort (correct because the shared
 /// prefix doesn't affect their relative order); the depth cap also bounds
 /// recursion for pathological long-common-prefix input.
-fn radixSortStringPerm(perm: []u32, tmp: []u32, view: storage.StringView, depth: usize) void {
+fn radixSortStringPerm(allocator: Allocator, perm: []u32, tmp: []u32, view: storage.StringView, depth: usize) error{QueryCancelled}!void {
     if (perm.len <= 32 or depth >= 128) {
-        sortStringPermAsc(perm, view);
+        try sortStringPermAsc(allocator, perm, view);
         return;
     }
     const offsets = view.offsets;
     const bytes = view.bytes;
 
     var counts = [_]u32{0} ** 257;
-    for (perm) |idx| {
+    for (perm, 0..) |idx, pi| {
+        if (pi % 4096 == 0) try exec.memory.checkCancelled(allocator);
         const start = offsets[idx];
         const end = offsets[idx + 1];
         const b: usize = if (depth >= end - start) 0 else @as(usize, bytes[start + depth]) + 1;
@@ -58,7 +59,7 @@ fn radixSortStringPerm(perm: []u32, tmp: []u32, view: storage.StringView, depth:
     const total: u32 = @intCast(perm.len);
     for (counts, 0..) |cnt, b| {
         if (cnt == total) {
-            if (b != 0) radixSortStringPerm(perm, tmp, view, depth + 1);
+            if (b != 0) try radixSortStringPerm(allocator, perm, tmp, view, depth + 1);
             return;
         }
         if (cnt != 0) break;
@@ -70,7 +71,8 @@ fn radixSortStringPerm(perm: []u32, tmp: []u32, view: storage.StringView, depth:
 
     var cursor: [257]u32 = undefined;
     for (0..257) |i| cursor[i] = bstart[i];
-    for (perm) |idx| {
+    for (perm, 0..) |idx, pi| {
+        if (pi % 4096 == 0) try exec.memory.checkCancelled(allocator);
         const start = offsets[idx];
         const end = offsets[idx + 1];
         const b: usize = if (depth >= end - start) 0 else @as(usize, bytes[start + depth]) + 1;
@@ -84,21 +86,21 @@ fn radixSortStringPerm(perm: []u32, tmp: []u32, view: storage.StringView, depth:
     while (b <= 256) : (b += 1) {
         const s = bstart[b];
         const e = bstart[b + 1];
-        if (e - s > 1) radixSortStringPerm(perm[s..e], tmp[s..e], view, depth + 1);
+        if (e - s > 1) try radixSortStringPerm(allocator, perm[s..e], tmp[s..e], view, depth + 1);
     }
 }
 
-fn sortStringPermAsc(perm: []u32, view: storage.StringView) void {
+fn sortStringPermAsc(allocator: Allocator, perm: []u32, view: storage.StringView) error{QueryCancelled}!void {
     const Cmp = struct {
         v: storage.StringView,
         pub fn lessThan(c: @This(), a: u32, b: u32) bool {
             return std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b)) == .lt;
         }
     };
-    std.sort.pdq(u32, perm, Cmp{ .v = view }, Cmp.lessThan);
+    try exec.memory.sort(u32, perm, Cmp{ .v = view }, allocator, Cmp.lessThan);
 }
 
-fn sortStringPermCompare(perm: []u32, view: anytype, desc: bool) void {
+fn sortStringPermCompare(allocator: Allocator, perm: []u32, view: anytype, desc: bool) error{QueryCancelled}!void {
     const Cmp = struct {
         v: @TypeOf(view),
         d: bool,
@@ -107,7 +109,7 @@ fn sortStringPermCompare(perm: []u32, view: anytype, desc: bool) void {
             return if (c.d) ord == .gt else ord == .lt;
         }
     };
-    std.sort.pdq(u32, perm, Cmp{ .v = view, .d = desc }, Cmp.lessThan);
+    try exec.memory.sort(u32, perm, Cmp{ .v = view, .d = desc }, allocator, Cmp.lessThan);
 }
 
 /// Emit the rows in `idxs` of `src` into `out`. For a string column that
@@ -137,17 +139,19 @@ fn emitColumn(allocator: Allocator, src: ColumnStore, idxs: []const u32, out: *C
 /// the column's concrete type. The typed slice / StringView is captured
 /// once, so each comparison avoids the tagged-union dispatch and view
 /// reconstruction the generic multi-key comparator pays per call.
-fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) void {
+fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) error{QueryCancelled}!void {
     // NULL rows order first ascending / last descending (dialect convention).
     // A NULL slot's payload bytes are encoding artifacts, so the typed
     // kernels below must only ever see the valid rows: partition the NULLs
     // out to their end of the permutation, sort the valid remainder.
+    try exec.memory.checkCancelled(allocator);
     var valid = perm;
     if (col.nulls != null) {
         if (desc) {
             var w: usize = perm.len;
             var i: usize = perm.len;
             while (i > 0) {
+                if (i % 4096 == 0) try exec.memory.checkCancelled(allocator);
                 i -= 1;
                 if (!engine.transform.rowIsValid(col, perm[i])) {
                     w -= 1;
@@ -158,6 +162,7 @@ fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool
         } else {
             var w: usize = 0;
             for (0..perm.len) |i| {
+                if (i % 4096 == 0) try exec.memory.checkCancelled(allocator);
                 if (!engine.transform.rowIsValid(col, perm[i])) {
                     std.mem.swap(u32, &perm[i], &perm[w]);
                     w += 1;
@@ -166,17 +171,17 @@ fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool
             valid = perm[w..];
         }
     }
-    sortSingleKeyValid(allocator, valid, col, desc);
+    try sortSingleKeyValid(allocator, valid, col, desc);
 }
 
-fn sortSingleKeyValid(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) void {
+fn sortSingleKeyValid(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) error{QueryCancelled}!void {
     switch (col.data) {
         inline .varchar, .string, .char, .json => |s| {
             // A column past 4 GiB carries u64 offsets (StringStore.wide_offsets);
             // the u32-offset radix can't index it, so fall back to the generic
             // comparison sort over the wide view (correct, just slower). Rare.
             if (s.isWide()) {
-                sortStringPermCompare(perm, s.wideView(), desc);
+                try sortStringPermCompare(allocator, perm, s.wideView(), desc);
                 return;
             }
             const view = s.view();
@@ -185,11 +190,11 @@ fn sortSingleKeyValid(allocator: Allocator, perm: []u32, col: ColumnStore, desc:
             // (no SIMD). Needs an n-sized index scratch; if that alloc fails,
             // fall back to a plain comparison sort.
             const tmp = allocator.alloc(u32, perm.len) catch {
-                sortStringPermCompare(perm, view, desc);
+                try sortStringPermCompare(allocator, perm, view, desc);
                 return;
             };
             defer allocator.free(tmp);
-            radixSortStringPerm(perm, tmp, view, 0);
+            try radixSortStringPerm(allocator, perm, tmp, view, 0);
             // Radix produces ascending order; DESC just reverses (ties are
             // unspecified in an unstable sort, so this is fine).
             if (desc) std.mem.reverse(u32, perm);
@@ -210,7 +215,7 @@ fn sortSingleKeyValid(allocator: Allocator, perm: []u32, col: ColumnStore, desc:
                     return if (c.d) ord == .gt else ord == .lt;
                 }
             };
-            std.sort.pdq(u32, perm, Cmp{ .it = items, .d = desc }, Cmp.lessThan);
+            try exec.memory.sort(u32, perm, Cmp{ .it = items, .d = desc }, allocator, Cmp.lessThan);
         },
     }
 }
@@ -247,7 +252,8 @@ pub const Sort = struct {
 
     const batch_size: usize = 1024;
 
-    pub fn create(allocator: Allocator, upstream: Query, sort_specs: []const SortSpec) !Query {
+    pub fn create(base_allocator: Allocator, upstream: Query, sort_specs: []const SortSpec) !Query {
+        const allocator = try exec.memory.executionAllocator(base_allocator, upstream.accountant());
         if (sort_specs.len == 0) return Error.SortNoKeys;
         const schema = upstream.outputSchema();
 
@@ -432,7 +438,7 @@ pub const Sort = struct {
         // rebuild that the generic multi-key path pays. The typed string
         // arm is also the natural seam for a future vectorized compare.
         if (self.sort_col_indices.len == 1) {
-            sortSingleKey(self.allocator, self.perm, self.accumulated[self.sort_col_indices[0]], self.sort_desc[0]);
+            try sortSingleKey(self.allocator, self.perm, self.accumulated[self.sort_col_indices[0]], self.sort_desc[0]);
             self.drained = true;
             return;
         }
@@ -452,11 +458,11 @@ pub const Sort = struct {
             }
         };
 
-        std.sort.pdq(u32, self.perm, Ctx{
+        try exec.memory.sort(u32, self.perm, Ctx{
             .accumulated = self.accumulated,
             .indices = self.sort_col_indices,
             .desc = self.sort_desc,
-        }, Ctx.lessThan);
+        }, self.allocator, Ctx.lessThan);
 
         self.drained = true;
     }
@@ -493,7 +499,7 @@ test "sort: radix string sort produces correct lexicographic order" {
         const tmp = try ta.alloc(u32, n);
         defer ta.free(tmp);
 
-        if (n > 0) radixSortStringPerm(perm, tmp, view, 0);
+        if (n > 0) try radixSortStringPerm(ta, perm, tmp, view, 0);
 
         // Keys must be non-decreasing.
         var i: usize = 1;

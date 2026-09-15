@@ -191,6 +191,8 @@ pub const Database = struct {
     }
 
     pub fn createSchema(self: *Database, name: []const u8) !*Schema {
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
         self.schemas_mutex.lockUncancelable(self.io);
         defer self.schemas_mutex.unlock(self.io);
 
@@ -212,6 +214,8 @@ pub const Database = struct {
     }
 
     pub fn dropSchema(self: *Database, name: []const u8) !void {
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(true) else null;
+        defer if (statement_lease) |lease| lease.release();
         self.schemas_mutex.lockUncancelable(self.io);
         const maybe = self.schemas.fetchRemove(name);
         self.schemas_mutex.unlock(self.io);
@@ -310,7 +314,7 @@ pub const Database = struct {
 
     /// Walk every schema in this database and run one flush sweep on each.
     pub fn backgroundFlushSweep(self: *Database) !void {
-        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, self.schemas);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, &self.schemas);
         defer snapshot.freeNames(self.allocator, names);
         for (names) |name| {
             const s = self.schema(name) orelse continue;
@@ -334,7 +338,7 @@ pub const Database = struct {
 
     /// Returns true if any schema merged a group this sweep.
     pub fn backgroundCompactSweep(self: *Database) !bool {
-        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, self.schemas);
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, &self.schemas);
         defer snapshot.freeNames(self.allocator, names);
         var worked = false;
         for (names) |name| {

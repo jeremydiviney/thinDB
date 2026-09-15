@@ -2,6 +2,63 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
+
+test "memory: SQL budgets cover wide sort and V2 group output allocations" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(a, io, tmp.dir, .{
+        .query_memory_budget = 16 * 1024,
+        .memory_budget = 16 * 1024,
+        .auto_flush_secs = 0,
+        .row_group_size = 64,
+        .max_dop = 2,
+    });
+    defer db.close();
+    const schema: thindb.TableSchema = .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "payload", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const table = try db.table("wide", schema, .{ .order_key = &.{"id"} });
+    const payloads = try a.alloc(u8, 256 * 4096);
+    defer a.free(payloads);
+    @memset(payloads, 'x');
+    const Row = struct { id: i64, payload: []const u8 };
+    const rows = try a.alloc(Row, 256);
+    defer a.free(rows);
+    for (rows, 0..) |*row, i| {
+        const bytes = payloads[i * 4096 ..][0..4096];
+        _ = try std.fmt.bufPrint(bytes[0..8], "{d:0>8}", .{256 - i});
+        row.* = .{ .id = @intCast(i), .payload = bytes };
+    }
+    try table.insert(rows);
+    try table.flush();
+    for ([_][]const u8{
+        "SELECT id, payload FROM wide ORDER BY payload",
+        "SELECT payload, COUNT(*) AS n FROM wide GROUP BY payload ORDER BY n DESC LIMIT 10",
+    }) |sql_text| {
+        var rejected = false;
+        if (@import("sql_helpers.zig").runSql(a, db, sql_text)) |value| {
+            var query = value;
+            defer query.deinit();
+            while (true) {
+                const batch = query.next() catch |err| {
+                    try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
+                    rejected = true;
+                    break;
+                };
+                if (batch == null) break;
+            }
+        } else |err| {
+            try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
+            rejected = true;
+        }
+        try std.testing.expect(rejected);
+        try std.testing.expectEqual(@as(usize, 0), db.config.memory_pool.?.inUse());
+    }
+}
 const helpers = @import("sql_helpers.zig");
 const runSql = helpers.runSql;
 const exec = helpers.exec;

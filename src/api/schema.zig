@@ -29,6 +29,7 @@ pub const Schema = struct {
     schema_dir: Io.Dir,
     config: Config,
     tables: std.StringHashMap(*Table),
+    dropping: std.StringHashMapUnmanaged(void) = .empty,
     /// Back-reference; not owning. Set by Database.createSchema.
     database: ?*@import("database.zig").Database = null,
 
@@ -85,6 +86,7 @@ pub const Schema = struct {
             t.close();
         }
         self.tables.deinit();
+        self.dropping.deinit(self.allocator);
         self.schema_dir.close(self.io);
         const allocator = self.allocator;
         allocator.free(self.name);
@@ -98,7 +100,9 @@ pub const Schema = struct {
     /// to it. Then calls `tryBackgroundFlush` (non-blocking on the per-
     /// table write mutex).
     pub fn backgroundFlushSweep(self: *Schema) !void {
-        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.tables_mutex, self.tables);
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.tables_mutex, &self.tables);
         defer snapshot.freeNames(self.allocator, names);
 
         for (names) |name| {
@@ -157,6 +161,8 @@ pub const Schema = struct {
     /// Returns true if any table merged a group this sweep (so the background
     /// loop can keep draining without sleeping).
     pub fn backgroundCompactSweep(self: *Schema) !bool {
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
         // Discover every table on disk, not just those a query has already
         // opened: the background compactor must monitor freshly-loaded tables
         // (e.g. a bulk import done by another process, or any table on a
@@ -203,17 +209,18 @@ pub const Schema = struct {
         table_schema: TableSchema,
         options: TableOptions,
     ) !*Table {
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
         try table_schema.validate();
 
-        {
-            self.tables_mutex.lockUncancelable(self.io);
-            defer self.tables_mutex.unlock(self.io);
-            if (self.tables.get(name)) |existing| {
-                if (schemaFingerprint(table_schema) != existing.schema_fingerprint) {
-                    return Error.SchemaMismatch;
-                }
-                return existing;
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
+        if (self.dropping.contains(name)) return Error.TableBusy;
+        if (self.tables.get(name)) |existing| {
+            if (schemaFingerprint(table_schema) != existing.schema_fingerprint) {
+                return Error.SchemaMismatch;
             }
+            return existing;
         }
 
         const t = try Table.open(
@@ -227,8 +234,6 @@ pub const Schema = struct {
         );
         errdefer t.close();
 
-        self.tables_mutex.lockUncancelable(self.io);
-        defer self.tables_mutex.unlock(self.io);
         try self.tables.put(t.name, t);
         return t;
     }
@@ -240,11 +245,12 @@ pub const Schema = struct {
         name: []const u8,
         options: OpenOptions,
     ) !*Table {
-        {
-            self.tables_mutex.lockUncancelable(self.io);
-            defer self.tables_mutex.unlock(self.io);
-            if (self.tables.get(name)) |existing| return existing;
-        }
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
+        self.tables_mutex.lockUncancelable(self.io);
+        defer self.tables_mutex.unlock(self.io);
+        if (self.dropping.contains(name)) return Error.TableBusy;
+        if (self.tables.get(name)) |existing| return existing;
 
         var probe = self.schema_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return Error.TableNotFound,
@@ -270,8 +276,6 @@ pub const Schema = struct {
         );
         errdefer t.close();
 
-        self.tables_mutex.lockUncancelable(self.io);
-        defer self.tables_mutex.unlock(self.io);
         try self.tables.put(t.name, t);
         return t;
     }
@@ -280,7 +284,24 @@ pub const Schema = struct {
     /// any in-flight scans to finish (via the table's exclusive ddl_lock),
     /// then closes and deletes the directory tree from disk.
     pub fn dropTable(self: *Schema, name: []const u8) !void {
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
+        const owned_name = try self.allocator.dupe(u8, name);
+        defer self.allocator.free(owned_name);
         self.tables_mutex.lockUncancelable(self.io);
+        if (self.dropping.contains(owned_name)) {
+            self.tables_mutex.unlock(self.io);
+            return Error.TableBusy;
+        }
+        self.dropping.put(self.allocator, owned_name, {}) catch |err| {
+            self.tables_mutex.unlock(self.io);
+            return err;
+        };
+        defer {
+            self.tables_mutex.lockUncancelable(self.io);
+            _ = self.dropping.remove(owned_name);
+            self.tables_mutex.unlock(self.io);
+        }
         const maybe_existing = self.tables.fetchRemove(name);
         self.tables_mutex.unlock(self.io);
 
@@ -299,12 +320,14 @@ pub const Schema = struct {
             probe.close(self.io);
         }
 
-        try self.schema_dir.deleteTree(self.io, name);
+        try self.schema_dir.deleteTree(self.io, owned_name);
     }
 
     /// Apply schema operations (`.add`, `.drop`, `.rename` columns) to a
     /// table. See `alter.execAlter` for orchestration details.
     pub fn alterTable(self: *Schema, name: []const u8, ops: []const AlterOp) !void {
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
         self.tables_mutex.lockUncancelable(self.io);
         const t = self.tables.get(name) orelse {
             self.tables_mutex.unlock(self.io);
@@ -318,8 +341,12 @@ pub const Schema = struct {
     /// Rename a table. Renames the on-disk directory, updates the in-memory
     /// map key, and updates the Table's internal name string.
     pub fn renameTable(self: *Schema, old_name: []const u8, new_name: []const u8) !void {
+        const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        defer if (statement_lease) |lease| lease.release();
         self.tables_mutex.lockUncancelable(self.io);
         defer self.tables_mutex.unlock(self.io);
+
+        if (self.dropping.contains(old_name) or self.dropping.contains(new_name)) return Error.TableBusy;
 
         if (self.tables.get(new_name) != null) return Error.TableAlreadyExists;
         if (self.schema_dir.openDir(self.io, new_name, .{})) |probe_| {

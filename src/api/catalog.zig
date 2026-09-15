@@ -19,6 +19,7 @@ const udf_mod = @import("../udf.zig");
 const zigfn = @import("zigfn.zig");
 const memory = @import("../memory.zig");
 const storage = @import("../storage/storage.zig");
+const StatementGate = @import("../util/statement_gate.zig").StatementGate;
 
 var zig_fn_seq: u64 = 1;
 
@@ -26,6 +27,7 @@ pub const Catalog = struct {
     allocator: Allocator,
     io: Io,
     root_dir: Io.Dir,
+    ownership_lock: ?Io.File = null,
     config: Config,
     udfs: udf_mod.UdfRegistry,
     /// SQL inline table functions (`CREATE FUNCTION ... RETURNS TABLE`),
@@ -61,6 +63,12 @@ pub const Catalog = struct {
     heap_owned: bool = true,
 
     databases_mutex: Io.Mutex = .init,
+    statement_gate: StatementGate,
+    pub const StatementLease = StatementGate.Lease;
+
+    pub fn acquireStatement(self: *Catalog, exclusive: bool) !StatementLease {
+        return self.statement_gate.acquire(exclusive);
+    }
 
     pub fn open(
         allocator: Allocator,
@@ -77,6 +85,16 @@ pub const Catalog = struct {
         root_dir: Io.Dir,
         config: Config,
     ) !*Catalog {
+        const ownership_lock = root_dir.createFile(io, ".thindb.lock", .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => return Error.DatabaseInUse,
+            else => return err,
+        };
+        errdefer ownership_lock.close(io);
+        try @import("../storage/write_journal.zig").recover(allocator, io, root_dir);
         // Best-effort sweep of any `_temp/` left behind by an ungraceful
         // exit. Per-session dirs only ever belong to a process that's
         // currently alive; if we're booting fresh, every previous tenant
@@ -122,6 +140,7 @@ pub const Catalog = struct {
             .allocator = allocator,
             .io = io,
             .root_dir = root_dir,
+            .ownership_lock = ownership_lock,
             .config = cfg,
             .owned_pool = owned_pool,
             .owned_block_cache = owned_block_cache,
@@ -130,7 +149,10 @@ pub const Catalog = struct {
             .views = udf_mod.ViewRegistry.init(allocator),
             .xa = @import("../net/xa.zig").XaManager.init(allocator),
             .databases = .init(allocator),
+            .statement_gate = StatementGate.init(allocator, io),
         };
+        self.config.statement_gate = &self.statement_gate;
+        cfg.statement_gate = &self.statement_gate;
         errdefer {
             var it = self.databases.iterator();
             while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
@@ -139,6 +161,7 @@ pub const Catalog = struct {
             self.views.deinit();
             self.xa.deinit();
             self.databases.deinit();
+            self.statement_gate.deinit();
         }
         try discoverDatabasesOnDisk(allocator, io, root_dir, cfg, &self.databases);
         var it = self.databases.iterator();
@@ -149,7 +172,7 @@ pub const Catalog = struct {
         }
         // Load any prepared XA branches left by a prior run (crash between
         // PREPARE and COMMIT) so `XA RECOVER` / `XA COMMIT` can complete them.
-        self.xa.setStorage(io, root_dir);
+        try self.xa.setStorage(io, root_dir);
         return self;
     }
 
@@ -530,6 +553,7 @@ pub const Catalog = struct {
         while (try dir_it.next(io)) |entry| {
             if (entry.kind != .directory) continue;
             if (std.mem.eql(u8, entry.name, temp_name)) continue;
+            if (std.mem.eql(u8, entry.name, "_xa")) continue;
             if (out_map.get(entry.name) != null) continue;
             // Database.create is idempotent on existing on-disk state: it
             // re-opens the dir, re-opens the `public` schema, and the
@@ -540,6 +564,7 @@ pub const Catalog = struct {
     }
 
     pub fn close(self: *Catalog) void {
+        self.statement_gate.beginClose();
         var it = self.databases.iterator();
         while (it.next()) |entry| entry.value_ptr.*.closeInPlace();
         self.udfs.deinit();
@@ -549,6 +574,8 @@ pub const Catalog = struct {
         self.views.deinit();
         self.xa.deinit();
         self.databases.deinit();
+        self.statement_gate.deinit();
+        if (self.ownership_lock) |lock| lock.close(self.io);
         const allocator = self.allocator;
         if (self.owned_block_cache) |bc| {
             bc.deinit();
@@ -565,6 +592,8 @@ pub const Catalog = struct {
     }
 
     pub fn createDatabase(self: *Catalog, name: []const u8) !*Database {
+        const lease = try self.acquireStatement(false);
+        defer lease.release();
         self.databases_mutex.lockUncancelable(self.io);
         defer self.databases_mutex.unlock(self.io);
 
@@ -587,6 +616,8 @@ pub const Catalog = struct {
     /// Get-or-create. Used by the back-compat `Database.open` shim to
     /// adopt an existing on-disk database directory without erroring.
     pub fn createOrOpenDatabase(self: *Catalog, name: []const u8) !*Database {
+        const lease = try self.acquireStatement(false);
+        defer lease.release();
         self.databases_mutex.lockUncancelable(self.io);
         defer self.databases_mutex.unlock(self.io);
 
@@ -598,6 +629,8 @@ pub const Catalog = struct {
     }
 
     pub fn dropDatabase(self: *Catalog, name: []const u8) !void {
+        const lease = try self.acquireStatement(true);
+        defer lease.release();
         self.databases_mutex.lockUncancelable(self.io);
         const maybe = self.databases.fetchRemove(name);
         self.databases_mutex.unlock(self.io);
@@ -634,7 +667,9 @@ pub const Catalog = struct {
     /// flush sweep. Errors from individual sweeps are swallowed — the
     /// background loop keeps running.
     pub fn backgroundFlushSweep(self: *Catalog) !void {
-        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, self.databases);
+        const lease = try self.acquireStatement(false);
+        defer lease.release();
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, &self.databases);
         defer snapshot.freeNames(self.allocator, names);
         for (names) |name| {
             const db = self.database(name) orelse continue;
@@ -659,7 +694,9 @@ pub const Catalog = struct {
 
     /// Returns true if any database merged a group this sweep.
     pub fn backgroundCompactSweep(self: *Catalog) !bool {
-        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, self.databases);
+        const lease = try self.acquireStatement(false);
+        defer lease.release();
+        const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, &self.databases);
         defer snapshot.freeNames(self.allocator, names);
         var worked = false;
         for (names) |name| {

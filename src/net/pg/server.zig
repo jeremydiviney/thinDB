@@ -199,11 +199,7 @@ pub fn servePg(
     limiter: ?*ConnectionLimiter,
 ) !*Server {
     var listen_addr = address;
-    const listener = try Io.net.IpAddress.listen(&listen_addr, io, .{
-        .mode = .stream,
-        .protocol = .tcp,
-        .reuse_address = true,
-    });
+    const listener = try @import("../../util/tcp_listener.zig").listen(&listen_addr, io);
     const effective_limiter = if (limiter) |lim| lim else blk: {
         const lp = try allocator.create(ConnectionLimiter);
         lp.* = ConnectionLimiter.init(catalog.config.max_connections);
@@ -604,6 +600,7 @@ fn extended_handleExecute(
     session: *SessionState,
     payload: []const u8,
 ) !void {
+    if (session.conn_state) |state| state.clearCancel();
     const exec_payload = try extended.parseExecuteFrame(payload);
     const portal = session.ext.portals.get(exec_payload.portal_name) orelse {
         return extended.Error.UnknownPortal;
@@ -635,19 +632,17 @@ fn runExtendedStatement(
 ) !void {
     if (op.* == .copy) return copy.Error.CopyMustBeSoleStatement;
 
+    const statement_lease = try catalog.acquireStatement(local.changesCatalog(op));
+    defer statement_lease.release();
+
     const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
 
     if (needsTempNamespace(op.*)) {
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);
+    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null });
     defer compiled.deinit();
-
-    if (session.conn_state) |state| {
-        state.clearCancel();
-        compiled.cancel_flag = &state.cancel_flag;
-    }
 
     if (isSideEffectOp(op.*)) {
         _ = try compiled.next();
@@ -895,6 +890,7 @@ fn handleQuery(
     session: *SessionState,
     payload: []const u8,
 ) !void {
+    if (session.conn_state) |state| state.clearCancel();
     if (payload.len == 0) {
         try errors.sendErrorResponse(allocator, w, "42000".*, "empty query");
         try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
@@ -1025,6 +1021,8 @@ fn runSingleStatement(
 ) !void {
     // COPY is wire-driven and can't ride the generic compile path —
     // hand it off before we open a CompileCtx.
+    const statement_lease = try catalog.acquireStatement(local.changesCatalog(op));
+    defer statement_lease.release();
     if (op.* == .copy) {
         return copy.handleCopy(allocator, w, r, catalog, session.asSession(), op.copy);
     }
@@ -1035,16 +1033,12 @@ fn runSingleStatement(
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileWithSession(allocator, main_db, session.asSession(), op);
+    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null });
     defer compiled.deinit();
 
     // Wire the connection's cancel flag into the compiled query so a
     // peer CancelRequest / pg_cancel_backend aborts at the next batch
     // boundary. Clear any stale cancel from a previous statement.
-    if (session.conn_state) |state| {
-        state.clearCancel();
-        compiled.cancel_flag = &state.cancel_flag;
-    }
 
     if (isSideEffectOp(op.*)) {
         _ = try compiled.next();

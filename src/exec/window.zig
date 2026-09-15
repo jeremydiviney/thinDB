@@ -1359,7 +1359,7 @@ pub const Window = struct {
                 const hi = self.bucket_offsets[b + 1];
                 if (lo == hi) continue;
                 const slice = self.placed[lo..hi];
-                std.sort.pdq(KeyIdx, slice, self.win.sortCtx(self.si), SpecSortCtx.pairLess);
+                exec.memory.sort(KeyIdx, slice, self.win.sortCtx(self.si), self.win.allocator, SpecSortCtx.pairLess) catch |e| return self.fail(e);
                 for (self.perm[lo..hi], slice) |*p, kp| p.* = kp.idx;
                 if (self.sort_only) continue;
                 var p_start = lo;
@@ -1441,7 +1441,7 @@ pub const Window = struct {
         defer self.allocator.free(sample);
         const stride = n / sample_len;
         for (sample, 0..) |*s, i| s.* = pairs[i * stride];
-        std.sort.pdq(KeyIdx, sample, self.sortCtx(si), SpecSortCtx.pairLess);
+        try exec.memory.sort(KeyIdx, sample, self.sortCtx(si), self.allocator, SpecSortCtx.pairLess);
         const splitters = try self.allocator.alloc(KeyIdx, bucket_count - 1);
         defer self.allocator.free(splitters);
         for (splitters, 1..) |*sp, b| sp.* = sample[b * sample_len / bucket_count];
@@ -1678,7 +1678,7 @@ pub const Window = struct {
         self.fillKeys(si, pairs, 0, n);
         const _st = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         if (exec.prof.enabled) exec.prof.addPhase("window.keys", @intCast(@max(0, _st - _kt)));
-        std.sort.pdq(KeyIdx, pairs, self.sortCtx(si), SpecSortCtx.pairLess);
+        try exec.memory.sort(KeyIdx, pairs, self.sortCtx(si), self.allocator, SpecSortCtx.pairLess);
         if (exec.prof.enabled) exec.prof.addPhase("window.sort", @intCast(@max(0, exec.prof.nowTicks() - _st)));
         for (perm, pairs) |*p, kp| p.* = kp.idx;
         return perm;
@@ -1740,7 +1740,7 @@ pub const Window = struct {
         var lo: usize = 0;
         while (lo < n) {
             const hi = partitionEnd(self.accumulated, si.partition_cols, perm, lo);
-            std.sort.pdq(KeyIdx, pairs[lo..hi], self.sortCtx(si), SpecSortCtx.pairLessOrderOnly);
+            try exec.memory.sort(KeyIdx, pairs[lo..hi], self.sortCtx(si), self.allocator, SpecSortCtx.pairLessOrderOnly);
             lo = hi;
         }
         if (exec.prof.enabled) exec.prof.addPhase("window.sort.grouped", @intCast(@max(0, exec.prof.nowTicks() - _st)));

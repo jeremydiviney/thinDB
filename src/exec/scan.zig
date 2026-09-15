@@ -296,6 +296,7 @@ pub const Scan = struct {
     /// False for parallel workers — the orchestrator holds one shared lock for
     /// all of them. Default true (serial scans take and release their own).
     holds_ddl: bool = true,
+    statement_lease: ?@import("../util/statement_gate.zig").StatementGate.Lease = null,
 
     /// Pinned handle from the table's segment cache; `cur_segment` aliases its
     /// parsed `ReadSegment`. Released (not closed) by `closeCurSegment`.
@@ -643,6 +644,9 @@ pub const Scan = struct {
         emit_loc: bool,
         injected_snap: ?Snapshot,
     ) !*Scan {
+        try table.ensureUsable();
+        const statement_lease = if (injected_snap == null) try table.acquireStatement() else null;
+        errdefer if (statement_lease) |lease| lease.release();
         const out_phys = try resolveOutPhys(allocator, table.schema.columns, needed);
         errdefer allocator.free(out_phys);
 
@@ -732,16 +736,21 @@ pub const Scan = struct {
         // mint our own from the table's configured budget (heap-allocated
         // so all operators in the pipeline share it via a pointer) and own
         // its lifetime.
-        var owned_accountant: ?*exec.memory.MemoryAccountant = injected;
+        var owned_accountant: ?*exec.memory.MemoryAccountant = injected orelse exec.memory.accountantOf(allocator);
         var owns_accountant = false;
-        if (injected == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
+        if (owned_accountant == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
             const acc = try allocator.create(exec.memory.MemoryAccountant);
             acc.* = exec.memory.MemoryAccountant.initWithPool(table.query_memory_budget, table.memory_pool);
+            acc.trackAllocations(table.allocator);
+            acc.retainGate(table.statement_gate) catch |err| {
+                allocator.destroy(acc);
+                return err;
+            };
             owned_accountant = acc;
             owns_accountant = true;
         }
         errdefer if (owns_accountant) {
-            if (owned_accountant) |a| allocator.destroy(a);
+            if (owned_accountant) |a| a.releaseOwner(allocator);
         };
 
         const cached_stats = try computeColumnStats(
@@ -768,6 +777,7 @@ pub const Scan = struct {
             .out_schema_owned = out_schema_owned,
             .emit_loc = emit_loc,
             .holds_ddl = holds_ddl,
+            .statement_lease = statement_lease,
             .prunes = .empty,
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
@@ -1012,6 +1022,11 @@ pub const Scan = struct {
     }
 
     pub fn deinit(self: *Scan) void {
+        const statement_lease = self.statement_lease;
+        defer if (statement_lease) |lease| lease.release();
+        const owned_accountant = if (self.owns_accountant) self.owned_accountant else null;
+        const owner_allocator = self.allocator;
+        defer if (owned_accountant) |a| a.releaseOwner(owner_allocator);
         self.releaseBatch();
         self.closeCurSegment();
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
@@ -1040,17 +1055,6 @@ pub const Scan = struct {
         self.key_in_sets.deinit(self.allocator);
         for (self.filter_rewritten.items) |slice| self.allocator.free(slice);
         self.filter_rewritten.deinit(self.allocator);
-        if (self.owns_accountant) {
-            if (self.owned_accountant) |a| {
-                // Backstop: reservations still outstanding at teardown (an
-                // undrained pipeline, an error unwind, a LIMIT cutting a
-                // blocking operator short) would otherwise stay in the
-                // cross-query pool FOREVER — the pool erodes run by run
-                // until unrelated queries spuriously fail MemoryBudget.
-                a.drainToPool();
-                self.allocator.destroy(a);
-            }
-        }
         if (self.seg_skip) |s| self.allocator.free(s);
         if (self.filtered) |arr| {
             for (arr) |*c| c.deinit(self.allocator);
@@ -1757,6 +1761,7 @@ pub const Scan = struct {
         if (self.sub_off < self.sub_count) return false;
         self.releaseBatch();
         while (self.phase == .segments) {
+            if (self.accountant()) |a| try a.checkCancelled();
             if (self.cur_segment == null and !try self.openCurSegment()) return false;
             const seg = self.cur_segment.?;
             if (self.atRangeEnd()) return false;
@@ -1817,6 +1822,7 @@ pub const Scan = struct {
     }
 
     pub fn next(self: *Scan) !?Batch {
+        if (self.accountant()) |a| try a.checkCancelled();
         if (self.fused_filter) |ff| {
             // Proven-empty predicate (e.g. an out-of-range equality folded to
             // `.always = false` by the Filter's stats simplification): no row
@@ -1841,6 +1847,7 @@ pub const Scan = struct {
         // always project >=1 probe column, so `emit_loc` never reaches here.)
         if (self.out_phys.len == 0 and !self.emit_loc) {
             while (self.phase == .segments) {
+                if (self.accountant()) |a| try a.checkCancelled();
                 if (self.cur_seg_idx >= self.segment_count) {
                     self.phase = .memtable;
                     break;
@@ -1864,6 +1871,7 @@ pub const Scan = struct {
 
         // Segments phase
         while (self.phase == .segments) {
+            if (self.accountant()) |a| try a.checkCancelled();
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
             const seg = self.cur_segment.?;
@@ -2064,6 +2072,7 @@ pub const Scan = struct {
         const expr = self.fused_filter.?;
 
         while (self.phase == .segments) {
+            if (self.accountant()) |a| try a.checkCancelled();
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
             const seg = self.cur_segment.?;

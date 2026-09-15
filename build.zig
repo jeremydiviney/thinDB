@@ -136,6 +136,7 @@ pub fn build(b: *std.Build) void {
     const run_v2_integration_tests = runTestStandalone(b, v2_integration_tests);
     const test_v2_step = b.step("test-v2", "Run V2-engine integration tests (default engine)");
     test_v2_step.dependOn(&run_v2_integration_tests.step);
+    test_step.dependOn(&run_v2_integration_tests.step);
 
     // ---- ReleaseFast thinDB module for performance tooling -----------------
     // Benchmarks (and the ClickBench loader) are only meaningful against
