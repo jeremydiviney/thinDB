@@ -563,8 +563,8 @@ fn zWorkerMain(w: *ZWorker) void {
 fn zWorkerRun(w: *ZWorker) !void {
     const z = w.z;
     const allocator = w.allocator;
-    const decoded = try allocator.alloc(storage.OwnedColumn, z.probe_phys.len);
-    defer allocator.free(decoded);
+    var scratch = try ProbeScratch.init(allocator, z.probe_phys.len);
+    defer scratch.deinit(allocator);
 
     // Per-worker segment + tombstone caches: the corner-sorted claim order
     // scatters across segments, and re-opening a segment (footer parse) plus a
@@ -593,7 +593,7 @@ fn zWorkerRun(w: *ZWorker) !void {
             w.stop.store(true, .release);
             break;
         }
-        try processSegmentRowGroup(z, allocator, w.ch, decoded, &cache, ref);
+        try processSegmentRowGroup(z, allocator, w.ch, &scratch, &cache, ref);
     }
 }
 
@@ -629,29 +629,49 @@ const SegCache = struct {
     }
 };
 
-fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *CandidateHeap, decoded: []storage.OwnedColumn, cache: *SegCache, ref: RgRef) !void {
+const ProbeScratch = struct {
+    blocks: []storage.ReadSegment.BorrowedBlock,
+    views: []ColumnView,
+    mask: std.ArrayListUnmanaged(bool) = .empty,
+
+    fn init(allocator: Allocator, columns: usize) !ProbeScratch {
+        const blocks = try allocator.alloc(storage.ReadSegment.BorrowedBlock, columns);
+        errdefer allocator.free(blocks);
+        const views = try allocator.alloc(ColumnView, columns);
+        errdefer allocator.free(views);
+        return .{ .blocks = blocks, .views = views };
+    }
+
+    fn deinit(self: *ProbeScratch, allocator: Allocator) void {
+        allocator.free(self.blocks);
+        allocator.free(self.views);
+        self.mask.deinit(allocator);
+    }
+};
+
+fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *CandidateHeap, scratch: *ProbeScratch, cache: *SegCache, ref: RgRef) !void {
     const seg = try cache.segment(z, allocator, ref.seg_idx);
 
     const rg_count = ref.row_count;
-    var decoded_n: usize = 0;
-    defer for (decoded[0..decoded_n]) |*c| c.deinit(allocator);
+    var borrowed: usize = 0;
+    defer for (scratch.blocks[0..borrowed]) |*block| block.release(allocator, z.table.cacheRef());
     for (z.probe_phys, 0..) |phys, j| {
-        decoded[j] = try seg.decodeColumnMaybeCached(
-            allocator,
-            z.table.schema,
-            ref.rg_idx,
-            phys,
-            z.table.cacheRef(),
-        );
-        decoded_n += 1;
+        scratch.blocks[j] = try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
+        borrowed += 1;
+        const block = &scratch.blocks[j];
+        const col = z.table.schema.columns[phys];
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = col.nullable };
+        if (storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, block.encoding)) |view| {
+            scratch.views[j] = view;
+        } else {
+            block.expanded = try storage.segment_reader.decodeColumnPayload(allocator, col.type, block.bytes, rg_count, flags, block.encoding);
+            scratch.views[j] = block.expanded.?.view();
+        }
     }
 
-    const vbuf = try allocator.alloc(ColumnView, z.probe_phys.len);
-    defer allocator.free(vbuf);
-    for (decoded[0..z.probe_phys.len], 0..) |c, i| vbuf[i] = c.view();
-
-    const mask = try allocator.alloc(bool, rg_count);
-    defer allocator.free(mask);
+    const vbuf = scratch.views;
+    try scratch.mask.resize(allocator, rg_count);
+    const mask = scratch.mask.items;
     try evalPredicate(z, allocator, vbuf, rg_count, mask);
     try applyTombstones(z, allocator, cache, ref, seg.*, rg_count, mask);
 

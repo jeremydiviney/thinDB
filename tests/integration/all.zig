@@ -87,3 +87,7 @@ test {
 test "integration entry exists" {
     try std.testing.expect(thindb.version.len > 0);
 }
+
+test {
+    _ = @import("encoded_pipeline_test.zig");
+}

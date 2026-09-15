@@ -400,6 +400,40 @@ semantics. Reused workspaces retain their allocated capacity and reset the
 observed row counters. Developer profiles report actual groups, hash bytes,
 state capacity/bytes, growth count, and worker-summed allocation time.
 
+Group accumulator storage grows in pages of 8,192 records. A small first page
+can grow up to that bound; subsequent growth adds pages without moving existing
+records. Key packing and record widths are unchanged. State pages reserve for
+the next batch rather than copying a large slab to match a speculative forecast;
+the hash table retains its bounded forecast. Published staging buffers transfer
+ownership to the group queue, and replacement buffers are acquired only when
+another append needs them. Numeric count-ranked top-N compares count and key
+before constructing a full candidate record.
+
+Count-only grouped programs use immediate updates while a bucket's live state
+is below 2 MiB. Larger live states prefetch existing accumulator records and hold
+up to sixteen pending count increments per worker's batch in stack storage. This
+physical-kernel choice uses actual live bytes and preserves the query plan. The
+batch reserves state capacity before probing, so these record addresses remain
+valid until every pending increment is applied. New groups initialize their
+counts immediately. A separate kernel keeps deferred-buffer branches and live
+registers out of the ordinary update loop. Other aggregate programs retain their
+existing update order; pending counts are drained before batch completion can
+release work credits.
+
+Consumers that explicitly support encoded input may consume pinned raw or RLE
+blocks during a scan callback. The callback completes before pins are released,
+so ordinary batch lifetimes do not change. Integer global reductions fold RLE
+values and lengths directly and borrow raw views. Count-only grouped pipelines
+can merge non-null integer key runs without expanding their logical rows first.
+Derived inputs, filters, unsupported encodings, and tombstoned segments retain
+the ordinary scan path. Results are computed on each execution; this does not
+cache aggregates or change the stored representation.
+
+Block-pruned top-N workers borrow raw probe columns, retaining pins through
+predicate evaluation and candidate selection. Only retained candidate keys are
+copied; output payloads are fetched after selection. Non-viewable encodings use
+owned decoding, and each worker reuses its view and predicate-mask buffers.
+
 Parallel grouping collects its final candidates only after every scan producer
 has closed and all published staged rows have been aggregated. A row stays
 counted as unfinished while queued, being partitioned, held in a partial bucket

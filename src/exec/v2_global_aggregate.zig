@@ -87,6 +87,7 @@ pub const Request = struct {
 const ScanSource = struct {
     scan: *Scan,
     drive: Query,
+    encoded: bool = false,
 
     fn next(self: *ScanSource) !?Batch {
         return self.drive.next();
@@ -124,7 +125,7 @@ fn openScanSource(
     // digesting the materialized bytes in the fold — same digest either way.
     for (hash_cols) |hc| _ = scan.setHashKeyColumn(hc);
     if (derived.len == 0) {
-        return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan) };
+        return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan), .encoded = where_filter == null and hash_cols.len == 0 };
     }
     const drive = try compute.Compute.create(allocator, exec.makeQuery(allocator, scan), derived);
     return .{ .scan = scan, .drive = drive };
@@ -471,6 +472,10 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
 }
 
 fn foldCountColGlobal(view: ColumnView, n: usize, ns: *u64) void {
+    if (view.nulls == null) {
+        ns.* += n;
+        return;
+    }
     var c: u64 = 0;
     for (0..n) |r| {
         if (view.isValid(r)) c += 1;
@@ -481,6 +486,20 @@ fn foldCountColGlobal(view: ColumnView, n: usize, ns: *u64) void {
 fn foldSumIntGlobal(view: ColumnView, n: usize, ns: *u64, acc: *i128) void {
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
+            if (view.nulls == null) {
+                const T = @typeInfo(@TypeOf(s)).pointer.child;
+                if (@sizeOf(T) <= 4 and n <= std.math.maxInt(u32)) {
+                    var sum: i64 = 0;
+                    for (s[0..n]) |v| sum += v;
+                    acc.* += sum;
+                } else {
+                    var sum: i128 = 0;
+                    for (s[0..n]) |v| sum += v;
+                    acc.* += sum;
+                }
+                ns.* += n;
+                return;
+            }
             var c: u64 = 0;
             var sum: i128 = 0;
             for (0..n) |r| {
@@ -793,8 +812,99 @@ fn workerRun(w: *Worker) !void {
     }
 }
 
+const EncodedFold = struct {
+    lane: *Lane,
+    plans: []const AggPlan,
+
+    pub fn consume(self: *EncodedFold, batch: @import("scan.zig").EncodedBatch) !bool {
+        for (self.plans) |p| {
+            if (p.is_udf or p.is_float or p.is_string or p.op == .count_distinct) return false;
+            const idx = batch.column_index(p.input_name orelse continue) orelse return error.ColumnNotFound;
+            const col = batch.schema[idx];
+            const block = batch.blocks[idx];
+            switch (block.encoding) {
+                .raw => if (storage.segment_reader.viewRawColumn(col.type, block.bytes, batch.row_count, .{ .has_nulls = col.nullable }, .raw) == null) return false,
+                .rle => if (col.nullable or !aggInputSupported(col.type)) return false,
+                else => return false,
+            }
+        }
+        self.lane.count += batch.row_count;
+        for (self.plans, 0..) |p, i| {
+            const idx = batch.column_index(p.input_name orelse continue).?;
+            const col = batch.schema[idx];
+            const block = batch.blocks[idx];
+            if (block.encoding == .rle) {
+                try fold_run_aggregate(self.lane, p, i, col.type, storage.segment_reader.rleViewOf(block.bytes, batch.row_count, .{}).block, batch.row_count);
+                continue;
+            }
+            const view = storage.segment_reader.viewRawColumn(col.type, block.bytes, batch.row_count, .{ .has_nulls = col.nullable }, .raw).?;
+            switch (p.op) {
+                .count_col => foldCountColGlobal(view, batch.row_count, &self.lane.ns[i]),
+                .sum, .avg => foldSumIntGlobal(view, batch.row_count, &self.lane.ns[i], &self.lane.isum[i]),
+                .min => foldExtremeIntGlobal(true, view, batch.row_count, &self.lane.ns[i], &self.lane.isum[i]),
+                .max => foldExtremeIntGlobal(false, view, batch.row_count, &self.lane.ns[i], &self.lane.isum[i]),
+                else => unreachable,
+            }
+        }
+        return true;
+    }
+};
+
+fn fold_run_aggregate(lane: *Lane, p: AggPlan, i: usize, typ: Type, runs: storage.segment_reader.RleBlock, row_count: u32) !void {
+    switch (runs.value_width) {
+        inline 1, 2, 4, 8 => |width| {
+            const T = std.meta.Int(.signed, width * 8);
+            const Acc = if (width <= 4) i64 else i128;
+            var count: u64 = 0;
+            var sum: Acc = 0;
+            var extreme: i64 = 0;
+            for (0..runs.n_runs) |r| {
+                const value: i64 = if (typ == .boolean) runs.values[r] else std.mem.readInt(T, runs.values[r * width ..][0..width], .little);
+                const length = runs.runLength(r);
+                if (length == 0 or length > row_count -| count) return error.CorruptColumnBlockHeader;
+                switch (p.op) {
+                    .sum, .avg => sum += @as(Acc, @intCast(value)) * @as(Acc, length),
+                    .min => if (count == 0 or value < extreme) {
+                        extreme = value;
+                    },
+                    .max => if (count == 0 or value > extreme) {
+                        extreme = value;
+                    },
+                    .count_col => {},
+                    else => unreachable,
+                }
+                count += length;
+            }
+            if (count != row_count) return error.CorruptColumnBlockHeader;
+            if (count == 0) return;
+            switch (p.op) {
+                .sum, .avg => lane.isum[i] += sum,
+                .min => if (lane.ns[i] == 0 or extreme < lane.isum[i]) {
+                    lane.isum[i] = extreme;
+                },
+                .max => if (lane.ns[i] == 0 or extreme > lane.isum[i]) {
+                    lane.isum[i] = extreme;
+                },
+                .count_col => {},
+                else => unreachable,
+            }
+            lane.ns[i] += count;
+        },
+        else => return error.CorruptColumnBlockHeader,
+    }
+}
+
+fn can_fold_encoded(plans: []const AggPlan) bool {
+    for (plans) |p| if (p.is_udf or p.is_float or p.is_string or p.op == .count_distinct) return false;
+    return true;
+}
+
 fn driveTile(w: *Worker, have_resolved: *bool) !void {
-    while (try w.source.next()) |batch| {
+    var consumer = EncodedFold{ .lane = &w.lane, .plans = w.plans };
+    const encoded = w.source.encoded and can_fold_encoded(w.plans);
+    while (true) {
+        if (encoded and try w.source.scan.consume_encoded(&consumer)) continue;
+        const batch = (try w.source.next()) orelse break;
         if (!have_resolved.*) {
             try resolveBatchIndices(w.plans, w.resolved, batch);
             have_resolved.* = true;
@@ -807,7 +917,11 @@ fn driveScan(lane: *Lane, plans: []const AggPlan, allocator: Allocator, source: 
     const resolved = try allocator.alloc(?usize, plans.len);
     defer allocator.free(resolved);
     var have_resolved = false;
-    while (try source.next()) |batch| {
+    var consumer = EncodedFold{ .lane = lane, .plans = plans };
+    const encoded = source.encoded and can_fold_encoded(plans);
+    while (true) {
+        if (encoded and try source.scan.consume_encoded(&consumer)) continue;
+        const batch = (try source.next()) orelse break;
         if (!have_resolved) {
             try resolveBatchIndices(plans, resolved, batch);
             have_resolved = true;
@@ -1523,4 +1637,67 @@ fn appendFloat(allocator: Allocator, col: *ColumnStore, out_type: Type, value: f
         .double => try col.data.double.append(allocator, value),
         else => return error.TypeMismatch,
     }
+}
+
+test "encoded machinery folds integer runs with wide totals and unsigned booleans" {
+    const cases = .{
+        .{ .typ = Type.tinyint, .T = i8, .a = -128, .b = 127 },
+        .{ .typ = Type.smallint, .T = i16, .a = -32768, .b = 32767 },
+        .{ .typ = Type.int, .T = i32, .a = std.math.minInt(i32), .b = std.math.maxInt(i32) },
+        .{ .typ = Type.bigint, .T = i64, .a = std.math.minInt(i64), .b = std.math.maxInt(i64) },
+        .{ .typ = Type.boolean, .T = u8, .a = 0, .b = 1 },
+    };
+    inline for (cases) |case| {
+        const plans = [_]AggPlan{
+            .{ .op = .sum, .input_name = "x", .is_float = false, .output_type = .largeint, .name = "s" },
+            .{ .op = .count_col, .input_name = "x", .is_float = false, .output_type = .bigint, .name = "n" },
+            .{ .op = .min, .input_name = "x", .is_float = false, .output_type = case.typ, .name = "lo" },
+            .{ .op = .max, .input_name = "x", .is_float = false, .output_type = case.typ, .name = "hi" },
+            .{ .op = .avg, .input_name = "x", .is_float = false, .output_type = .double, .name = "mean" },
+        };
+        var lane = try Lane.init(std.testing.allocator, &plans, 1);
+        defer lane.deinit(std.testing.allocator);
+        const width = @sizeOf(case.T);
+        var bytes: [8 + 2 * width + 8]u8 align(16) = @splat(0);
+        std.mem.writeInt(u32, bytes[0..4], 2, .little);
+        bytes[4] = width;
+        std.mem.writeInt(case.T, bytes[8..][0..width], case.a, .little);
+        std.mem.writeInt(case.T, bytes[8 + width ..][0..width], case.b, .little);
+        std.mem.writeInt(u32, bytes[8 + 2 * width ..][0..4], 3, .little);
+        std.mem.writeInt(u32, bytes[12 + 2 * width ..][0..4], 5, .little);
+        const blocks = [_]storage.ReadSegment.BorrowedBlock{.{ .bytes = &bytes, .encoding = .rle }};
+        const schema = [_]Column{.{ .name = "x", .type = case.typ }};
+        var consumer = EncodedFold{ .lane = &lane, .plans = &plans };
+        for (0..2) |_| try std.testing.expect(try consumer.consume(.{ .schema = &schema, .blocks = &blocks, .row_count = 8 }));
+        const sum = @as(i128, case.a) * 3 + @as(i128, case.b) * 5;
+        try std.testing.expectEqual(sum * 2, lane.isum[0]);
+        try std.testing.expectEqual(@as(u64, 16), lane.ns[1]);
+        try std.testing.expectEqual(@as(i128, case.a), lane.isum[2]);
+        try std.testing.expectEqual(@as(i128, case.b), lane.isum[3]);
+        try std.testing.expectEqual(sum * 2, lane.isum[4]);
+        try std.testing.expectEqual(@as(u64, 16), lane.count);
+    }
+}
+
+test "encoded machinery decline leaves aggregate state unchanged and nullable sums stay exact" {
+    const plans = [_]AggPlan{
+        .{ .op = .sum, .input_name = "x", .is_float = false, .output_type = .largeint, .name = "s" },
+        .{ .op = .sum, .input_name = "y", .is_float = false, .output_type = .largeint, .name = "t" },
+    };
+    var lane = try Lane.init(std.testing.allocator, &plans, 1);
+    defer lane.deinit(std.testing.allocator);
+    const raw = [_]i16{ -5, 0, 12 };
+    const blocks = [_]storage.ReadSegment.BorrowedBlock{
+        .{ .bytes = std.mem.sliceAsBytes(&raw), .encoding = .raw },
+        .{ .bytes = &.{}, .encoding = .for_ },
+    };
+    const schema = [_]Column{ .{ .name = "x", .type = .smallint }, .{ .name = "y", .type = .smallint } };
+    var consumer = EncodedFold{ .lane = &lane, .plans = &plans };
+    try std.testing.expect(!try consumer.consume(.{ .schema = &schema, .blocks = &blocks, .row_count = 3 }));
+    try std.testing.expectEqual(@as(u64, 0), lane.count);
+    try std.testing.expectEqual(@as(i128, 0), lane.isum[0]);
+    const valid = [_]u8{0b00000101};
+    foldSumIntGlobal(.{ .data = .{ .smallint = &raw }, .nulls = &valid }, raw.len, &lane.ns[0], &lane.isum[0]);
+    try std.testing.expectEqual(@as(i128, 7), lane.isum[0]);
+    try std.testing.expectEqual(@as(u64, 2), lane.ns[0]);
 }
