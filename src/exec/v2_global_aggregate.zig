@@ -114,6 +114,7 @@ fn openScanSource(
     derived: []const compute.Derived,
     hash_cols: []const []const u8,
     snap: ?Scan.Snapshot,
+    registry: ?*const udf_mod.UdfRegistry,
 ) !ScanSource {
     const scan = try Scan.allocWithProjectionLoc(allocator, table, null, needed, false, snap);
     errdefer scan.deinit();
@@ -127,7 +128,7 @@ fn openScanSource(
     if (derived.len == 0) {
         return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan), .encoded = where_filter == null and hash_cols.len == 0 };
     }
-    const drive = try compute.Compute.create(allocator, exec.makeQuery(allocator, scan), derived);
+    const drive = try compute.Compute.createWithRegistry(allocator, exec.makeQuery(allocator, scan), derived, registry);
     return .{ .scan = scan, .drive = drive };
 }
 
@@ -785,6 +786,7 @@ fn partMergeRun(job: *PartMergeJob) !void {
         for (job.workers) |*w| total += w.lane.dsets[i * job.parts + job.part].count();
         try out.ensureForBatch(job.allocator, total);
         for (job.workers) |*w| {
+            try exec.memory.checkCancelled(job.allocator);
             try out.mergeInto(job.allocator, &w.lane.dsets[i * job.parts + job.part]);
         }
         job.counts[i] = out.count();
@@ -801,6 +803,7 @@ fn workerRun(w: *Worker) !void {
         return;
     }
     while (true) {
+        try exec.memory.checkCancelled(w.allocator);
         const lo = w.next_rg.fetchAdd(TILE_RGS, .monotonic);
         if (lo >= w.total_rgs) break;
         const hi = @min(lo + TILE_RGS, w.total_rgs);
@@ -903,6 +906,7 @@ fn driveTile(w: *Worker, have_resolved: *bool) !void {
     var consumer = EncodedFold{ .lane = &w.lane, .plans = w.plans };
     const encoded = w.source.encoded and can_fold_encoded(w.plans);
     while (true) {
+        try exec.memory.checkCancelled(w.allocator);
         if (encoded and try w.source.scan.consume_encoded(&consumer)) continue;
         const batch = (try w.source.next()) orelse break;
         if (!have_resolved.*) {
@@ -920,6 +924,7 @@ fn driveScan(lane: *Lane, plans: []const AggPlan, allocator: Allocator, source: 
     var consumer = EncodedFold{ .lane = lane, .plans = plans };
     const encoded = source.encoded and can_fold_encoded(plans);
     while (true) {
+        try exec.memory.checkCancelled(allocator);
         if (encoded and try source.scan.consume_encoded(&consumer)) continue;
         const batch = (try source.next()) orelse break;
         if (!have_resolved) {
@@ -1122,7 +1127,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         defer if (probe) |*p| p.deinit();
         var probe_schema: ?[]const Column = null;
         if (request.derived.len > 0) {
-            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, null);
+            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, null, request.udf_registry);
             probe_schema = probe.?.schema();
         }
         for (request.aggs, plans) |agg, *p| {
@@ -1269,6 +1274,7 @@ const GlobalAggregate = struct {
     built: bool = false,
     row_count: usize = 0,
 
+    udf_registry: ?*const udf_mod.UdfRegistry,
     fn init(allocator: Allocator, table: *api.Table, request: Request, plans: []AggPlan, needed: []const []const u8, hash_cols: []const []const u8) !GlobalAggregate {
         const output_schema = try allocator.alloc(Column, plans.len);
         errdefer allocator.free(output_schema);
@@ -1293,6 +1299,7 @@ const GlobalAggregate = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         return .{
             .allocator = allocator,
+            .udf_registry = request.udf_registry,
             .table = table,
             .where_filter = request.where_filter,
             .derived = request.derived,
@@ -1362,7 +1369,7 @@ const GlobalAggregate = struct {
     }
 
     fn openScan(self: *GlobalAggregate, snap: ?Scan.Snapshot) !ScanSource {
-        return openScanSource(self.allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, snap);
+        return openScanSource(self.allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, snap, self.udf_registry);
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {

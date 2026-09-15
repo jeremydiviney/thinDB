@@ -67,10 +67,8 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
         }
 
         if (deleted.items.len > 0) {
-            try storage.tombstone.merge(
+            try t.mergeTombstones(
                 t.allocator,
-                t.io,
-                t.segments_dir,
                 entry.segment_id,
                 deleted.items,
                 t.syncEnabled(),
@@ -259,10 +257,8 @@ pub fn execDeleteKeyedBatch(
         }
 
         if (deleted.items.len > 0) {
-            try storage.tombstone.merge(
+            try t.mergeTombstones(
                 t.allocator,
-                t.io,
-                t.segments_dir,
                 entry.segment_id,
                 deleted.items,
                 t.syncEnabled(),
@@ -485,10 +481,8 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
         }
 
         if (deleted.items.len > 0) {
-            try storage.tombstone.merge(
+            try t.mergeTombstones(
                 t.allocator,
-                t.io,
-                t.segments_dir,
                 entry.segment_id,
                 deleted.items,
                 t.syncEnabled(),

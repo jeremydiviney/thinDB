@@ -248,7 +248,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
     const schema = q.outputSchema();
     if (schema.len != 1) return Error.BadRequest;
 
-    const aa = ctx.subqueryArena();
+    const aa = try ctx.subqueryArena();
     var out: std.ArrayList(Value) = .empty;
 
     // The materialized IN-set is resident for the rest of the query
@@ -293,7 +293,7 @@ fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
     if (try q.next() != null) return Error.BadRequest; // multi-row
 
     const view = first_batch.values[0];
-    return try extractScalarValue(ctx.subqueryArena(), view);
+    return try extractScalarValue(try ctx.subqueryArena(), view);
 }
 
 fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
@@ -528,7 +528,7 @@ fn buildRewrittenInner(
     info: CorrelationInfo,
     extra_first_col: ?[]const u8,
 ) !*ir.Op {
-    const aa = ctx.subqueryArena();
+    const aa = try ctx.subqueryArena();
 
     // Reuse the underlying Scan; build a fresh Filter/Select chain on
     // top so we don't mutate caller IR.
@@ -607,7 +607,7 @@ fn maybeResolveCorrelatedExists(
     var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
 
-    const aa = ctx.subqueryArena();
+    const aa = try ctx.subqueryArena();
     const outer_cols_owned = try aa.alloc([]const u8, info.outer_cols.items.len);
     for (info.outer_cols.items, outer_cols_owned) |c, *dst| dst.* = try aa.dupe(u8, c);
 
@@ -680,7 +680,7 @@ fn resolveCorrelatedExistsRange(
             upper = a;
         }
     }
-    const aa = ctx.subqueryArena();
+    const aa = try ctx.subqueryArena();
 
     // Build rewritten inner. Reuse buildRewrittenInner by routing the
     // range inner col through `extra_first_col` and the equi cols as
@@ -818,7 +818,7 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
     var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
 
-    const aa = ctx.subqueryArena();
+    const aa = try ctx.subqueryArena();
     const total_cols = 1 + info.outer_cols.items.len;
     const outer_cols_owned = try aa.alloc([]const u8, total_cols);
     outer_cols_owned[0] = try aa.dupe(u8, s.col);
@@ -915,7 +915,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
     //     └ GroupBy(group_cols = inner_cols, aggs = [original_agg])
     //
     // The result rows are (inner_correlation_keys..., agg_value).
-    const aa = ctx.subqueryArena();
+    const aa = try ctx.subqueryArena();
     const scan_clone = try aa.create(ir.Op);
     scan_clone.* = .{ .scan = scan_op.* };
 

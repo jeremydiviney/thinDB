@@ -53,7 +53,7 @@ const usage_text =
     \\  --bind ADDR             Interface to bind (default 0.0.0.0).
     \\  --max-connections N     Cap on concurrent client connections across all wires (default 256).
     \\  --xa-timeout-secs N     Roll back orphaned PREPARED XA branches (Flink exactly-once) older
-    \\                          than N seconds (default 86400 = 24h; 0 disables). Must exceed the
+    \\                          than N seconds (default 0 = disabled). Must exceed the
     \\                          Flink checkpoint interval + max tolerable downtime.
     \\  --idle-timeout-secs N   Close a connection after N seconds of read silence (default 0 = disabled).
     \\  --no-wal                Disable the write-ahead log (default: on). Without it, rows acked
@@ -172,9 +172,9 @@ pub fn main(init: std.process.Init) !u8 {
     var bind: []const u8 = default_bind;
     var max_connections: u32 = 256;
     // Orphaned prepared XA branches (Flink job died without committing) older
-    // than this are rolled back by the background sweep. 0 disables. Default 24h
+    // than this are rolled back by the background sweep. Disabled by default.
     // — must exceed Flink's checkpoint interval + max tolerable downtime.
-    var xa_timeout_secs: u32 = 24 * 3600;
+    var xa_timeout_secs: u32 = 0;
     // Background segment compaction. On by default; --no-compaction disables the
     // compactor thread. INTERIM ESCAPE HATCH while #136 (a compactor-vs-write
     // race → double-free/leak under sustained writes) is unfixed — lets a

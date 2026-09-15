@@ -912,21 +912,21 @@ fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *S
     return try switch (mode) {
         .deferred => exec.ParallelScan.createOverStageDeferred(
             input.allocator,
-            input.db.allocator,
+            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
             stage,
             input.accountant,
             input.effectiveDop(),
         ),
         .eager => exec.ParallelScan.createOverStage(
             input.allocator,
-            input.db.allocator,
+            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
             stage,
             input.accountant,
             input.effectiveDop(),
         ),
         .ordered => exec.ParallelScan.createOverStageOrdered(
             input.allocator,
-            input.db.allocator,
+            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
             stage,
             input.accountant,
             input.effectiveDop(),
@@ -1500,7 +1500,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 errdefer input.allocator.free(owned);
                 return AdaptiveGroupBy.create(
                     input.allocator,
-                    input.db.allocator,
+                    try exec.memory.trackedBackend(input.db.allocator, input.accountant),
                     up,
                     owned,
                     g.group_cols,
@@ -1518,7 +1518,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             }
             return group_route.routeGroupByDop(
                 input.allocator,
-                input.db.allocator,
+                try exec.memory.trackedBackend(input.db.allocator, input.accountant),
                 &up,
                 g.group_cols,
                 g.aggs,

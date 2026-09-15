@@ -629,25 +629,37 @@ pub const DistinctSet = struct {
                 const o = &other.store.u32;
                 if (o.has_sentinel) s.has_sentinel = true;
                 try s.ensureFor(allocator, o.count());
-                for (o.slots) |k| if (k != group_table.DistinctU32Set.SENTINEL) s.insert(k);
+                for (o.slots, 0..) |k, slot_index| {
+                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
+                    if (k != group_table.DistinctU32Set.SENTINEL) s.insert(k);
+                }
             },
             .u64 => |*s| {
                 const o = &other.store.u64;
                 if (o.has_sentinel) s.has_sentinel = true;
                 try s.ensureFor(allocator, o.count());
-                for (o.slots) |k| if (k != group_table.DistinctU64Set.SENTINEL) s.insert(k);
+                for (o.slots, 0..) |k, slot_index| {
+                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
+                    if (k != group_table.DistinctU64Set.SENTINEL) s.insert(k);
+                }
             },
             .u96 => |*s| {
                 const o = &other.store.u96;
                 if (o.has_sentinel) s.has_sentinel = true;
                 try s.ensureFor(allocator, o.count());
-                for (o.slots) |k| if (!k.eql(group_table.DistinctU96Set.SENTINEL)) s.insert(k);
+                for (o.slots, 0..) |k, slot_index| {
+                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
+                    if (!k.eql(group_table.DistinctU96Set.SENTINEL)) s.insert(k);
+                }
             },
             .u128 => |*s| {
                 const o = &other.store.u128;
                 if (o.has_sentinel) s.has_sentinel = true;
                 try s.ensureFor(allocator, o.count());
-                for (o.slots) |k| if (k != group_table.DistinctU128Set.SENTINEL) s.insert(k);
+                for (o.slots, 0..) |k, slot_index| {
+                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
+                    if (k != group_table.DistinctU128Set.SENTINEL) s.insert(k);
+                }
             },
         }
     }
@@ -1975,6 +1987,7 @@ const PipeBucket = struct {
 };
 
 const PipeShared = struct {
+    resources: ?*thindb.exec.memory.MemoryAccountant = null,
     allocator: Allocator,
     buckets: []PipeBucket,
     bucket_count: usize,
@@ -2093,7 +2106,7 @@ test "group completion waits for a delayed partial before collecting top rows an
     var top = try TopSet.init(allocator, offset + 10);
     defer top.deinit(allocator);
     try collectOwnedTop(&shared, 0, 1, &top, &ticks, false);
-    std.mem.sort(TopRow, top.items[0..top.len], {}, topLess);
+    try thindb.exec.memory.sort(TopRow, top.items[0..top.len], {}, allocator, topLess);
     try std.testing.expectEqual(@as(usize, offset + 10), top.len);
     for (top.items[offset..top.len], 0..) |row, i| {
         try std.testing.expectEqual(@as(u128, group_count - 1 - offset - i), row.key);
@@ -5894,6 +5907,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
         // A peer failed: stop scheduling and tear down (the failing worker's
         // error is already recorded; ours would just race it).
         if (job.shared.aborted.load(.acquire)) return;
+        if (job.shared.resources) |a| try a.checkCancelled();
         job.local.sched_loops += 1;
         const decision_t0 = if (job.profile) platform.nowTicks() else 0;
         const scan_claims_available = !scan_exhausted and job.shared.next_scan_rg.load(.acquire) < job.shared.total_scan_rgs;
@@ -6072,6 +6086,8 @@ pub const RunConfig = struct {
     group_rows_layout: GroupRowsLayout = .{},
     scan_columns: ?[]const []const u8 = null,
     derived: []const thindb.exec.Derived = &.{},
+    udf_registry: ?*const udf_mod.UdfRegistry = null,
+    resources: ?*thindb.exec.memory.MemoryAccountant = null,
     filter_expr: ?thindb.exec.PredicateExpr = null,
     shared_stage_builders: bool = false,
     no_profile: bool = false,
@@ -6210,7 +6226,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const claim_total_rgs = if (total_rgs == 0 and snap.memtable_snap.row_count > 0) 1 else total_rgs;
 
     const scan_columns = cfg.scan_columns orelse &[_][]const u8{};
-    var stats_scan = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, false, snap);
+    const resources = cfg.resources orelse thindb.exec.memory.accountantOf(allocator);
+    const scan_allocator = try thindb.exec.memory.trackedBackend(table.allocator, resources);
+    var stats_scan = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, false, snap);
     defer {
         const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
         stats_scan.deinit();
@@ -6384,6 +6402,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
 
     var shared = PipeShared{
+        .resources = resources,
         .allocator = allocator,
         .buckets = buckets,
         .bucket_count = bucket_count,
@@ -6427,14 +6446,14 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, stage_scratch_rows);
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
-        scans[i] = try Scan.allocWithProjectionLoc(table.allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
+        scans[i] = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
         // Weighted integer-key programs consume RLE run headers directly (the
         // run-native emitter); hashed-key layouts pack from digests, where the
         // sidecar has no consumer.
         scans[i].emit_runs = cfg.group_rows_layout.has_weight and !cfg.group_rows_layout.has_rowref;
         {
-            var sq = thindb.exec.makeQuery(table.allocator, scans[i]);
-            drives[i] = if (cfg.derived.len == 0) sq else sq.compute(cfg.derived) catch |e| {
+            var sq = thindb.exec.makeQuery(scan_allocator, scans[i]);
+            drives[i] = if (cfg.derived.len == 0) sq else sq.computeWithRegistry(cfg.derived, cfg.udf_registry) catch |e| {
                 sq.deinit();
                 return e;
             };
@@ -6617,9 +6636,12 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         grouped_rows += bucket.row_count;
     }
     for (worker_tops) |worker_top| {
-        for (worker_top.items[0..worker_top.len]) |candidate| top.consider(candidate);
+        for (worker_top.items[0..worker_top.len], 0..) |candidate, candidate_index| {
+            if (candidate_index % 1024 == 0) try thindb.exec.memory.checkCancelled(allocator);
+            top.consider(candidate);
+        }
     }
-    std.mem.sort(TopRow, top.items[0..top.len], {}, topLess);
+    try thindb.exec.memory.sort(TopRow, top.items[0..top.len], {}, allocator, topLess);
     const final_merge_ticks = platform.nowTicks() - final_t0;
     const total_ticks = platform.nowTicks() - total_t0;
     const function_ticks = platform.nowTicks() - function_t0;
@@ -6640,6 +6662,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                     const has_concat_out = cfg.group_rows_layout.has_concat;
                     var gid: usize = 0;
                     while (gid < bucket.states.len) : (gid += 1) {
+                        if (gid % 1024 == 0) try thindb.exec.memory.checkCancelled(allocator);
                         if (cap != 0 and out.items.len >= cap) break :emit_all;
                         var row = if (has_str_out) topRowFromStateStr(bucket.states.ref(gid), bucket.str_states.items[gid]) else topRowFromState(bucket.states.ref(gid));
                         if (has_concat_out) try finalizeConcatIntoRow(&row, cfg.group_rows_layout.aggregates, &bucket.concat_states.items[gid], bucket.str_arena.allocator());
@@ -6651,6 +6674,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 } else {
                     var gid: usize = 0;
                     while (gid < bucket.states.len) : (gid += 1) {
+                        if (gid % 1024 == 0) try thindb.exec.memory.checkCancelled(allocator);
                         if (cap != 0 and out.items.len >= cap) break :emit_all;
                         const row = topRowFromState(bucket.states.ref(gid));
                         if (filter) |f| if (!f.pass(f.ctx, row)) continue;

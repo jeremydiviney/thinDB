@@ -9,25 +9,30 @@
 //! a xid that isn't present is a no-op success, so Flink's commit retries are
 //! idempotent.
 //!
-//! Durability (stage 2): on PREPARE a branch is written to `<root>/_xa/<hex-
-//! xid>.xa` and fsync-flushed, so a crash between PREPARE and COMMIT survives —
-//! `loadAll` re-reads them on open and `XA RECOVER` reports them. COMMIT /
-//! ROLLBACK unlink the file. ACTIVE (un-prepared) branches are intentionally NOT
-//! persisted: a crash before PREPARE loses them, which is correct — Flink
-//! reproduces that data from the previous checkpoint.
+//! PREPARE atomically publishes and syncs the bounded branch record. Long XIDs
+//! use a SHA-256 filename; short XIDs retain the older hex naming. COMMIT is
+//! orchestrated by xa_exec.zig with an undo journal and exclusive visibility
+//! lease. Startup resolves that journal before loading prepared branches.
+//! ACTIVE branches are volatile, and reads do not see their staged writes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const storage = @import("../storage/storage.zig");
+
+const max_branch_bytes = 64 << 20;
+const max_xid_bytes = 1024;
 
 pub const Error = error{
     XaBranchExists,
     XaBranchUnknown,
     XaBranchBusy,
     XaProtocol,
+    XaBranchTooLarge,
+    XaInvalidXid,
 } || Allocator.Error;
 
-pub const State = enum { active, ended, prepared };
+pub const State = enum { active, ended, prepared, committing };
 
 /// One XA branch: buffered statements (encoded IR) + lifecycle state. Its arena
 /// owns the encoded bytes + the db name so they outlive the request that staged
@@ -37,11 +42,13 @@ pub const Branch = struct {
     /// Database the staged statements target (recorded at XA START, so a commit
     /// from another connection / after a restart resolves the right tables).
     db: []const u8,
+    schema: []const u8 = "public",
     state: State = .active,
     stmts: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Wall-clock microseconds when the branch was PREPARED (0 while ACTIVE).
     /// Absolute real time so age survives a restart; drives GC of orphans.
     prepared_at_us: i64 = 0,
+    encoded_bytes: usize = 0,
 
     fn deinit(self: *Branch) void {
         self.arena.deinit();
@@ -61,9 +68,9 @@ pub const XaManager = struct {
     /// A PREPARED branch older than this is orphaned (its Flink job died /
     /// was cancelled without committing) and gets rolled back by `gcSweep`.
     /// Must exceed Flink's checkpoint interval + max tolerable downtime, or a
-    /// slowly-recovering job's branch could be aborted from under it. Default
-    /// 24h; 0 disables GC.
-    gc_max_age_us: i64 = 24 * 3600 * 1_000_000,
+    /// slowly-recovering job's branch could be aborted from under it. Disabled
+    /// by default: elapsed time is not a coordinator rollback decision.
+    gc_max_age_us: i64 = 0,
 
     pub fn init(allocator: Allocator) XaManager {
         return .{ .allocator = allocator };
@@ -83,16 +90,19 @@ pub const XaManager = struct {
 
     /// Point the manager at a persistent `_xa/` dir (opened/created under the
     /// catalog root) and load any prepared branches left by a prior run.
-    pub fn setStorage(self: *XaManager, io: Io, root: Io.Dir) void {
+    pub fn setStorage(self: *XaManager, io: Io, root: Io.Dir) !void {
         // The fallback must also open with .iterate: a dir opened without it
         // cannot be listed on Linux (O_PATH fd), only Windows tolerates that.
-        const dir = root.openDir(io, "_xa", .{ .iterate = true }) catch
-            (root.createDirPathOpen(io, "_xa", .{
+        const dir = root.openDir(io, "_xa", .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => try root.createDirPathOpen(io, "_xa", .{
                 .open_options = .{ .iterate = true },
-            }) catch return);
+            }),
+            else => return err,
+        };
         self.io = io;
         self.dir = dir;
-        self.loadAll() catch {};
+        try storage.syncDirectory(io, root);
+        try self.loadAll();
     }
 
     fn lock(self: *XaManager) void {
@@ -101,6 +111,12 @@ pub const XaManager = struct {
 
     /// XA START — open a new ACTIVE branch targeting `db`. Errors on collision.
     pub fn begin(self: *XaManager, xid: []const u8, db: []const u8) Error!void {
+        return self.beginInSchema(xid, db, "public");
+    }
+
+    pub fn beginInSchema(self: *XaManager, xid: []const u8, db: []const u8, schema: []const u8) Error!void {
+        if (xid.len == 0 or xid.len > max_xid_bytes) return Error.XaInvalidXid;
+        if (db.len > max_branch_bytes - 24 - xid.len or schema.len > max_branch_bytes - 24 - xid.len - db.len) return Error.XaBranchTooLarge;
         self.lock();
         defer self.mutex.unlock();
         if (self.map.get(xid) != null) return Error.XaBranchExists;
@@ -109,7 +125,10 @@ pub const XaManager = struct {
         const branch = try self.allocator.create(Branch);
         errdefer self.allocator.destroy(branch);
         branch.* = .{ .arena = std.heap.ArenaAllocator.init(self.allocator), .db = "" };
+        errdefer branch.deinit();
         branch.db = try branch.arena.allocator().dupe(u8, db);
+        branch.schema = try branch.arena.allocator().dupe(u8, schema);
+        branch.encoded_bytes = 24 + xid.len + db.len + schema.len;
         try self.map.put(self.allocator, key, branch);
     }
 
@@ -119,8 +138,10 @@ pub const XaManager = struct {
         defer self.mutex.unlock();
         const branch = self.map.get(xid) orelse return Error.XaBranchUnknown;
         if (branch.state != .active) return Error.XaProtocol;
+        if (branch.encoded_bytes > max_branch_bytes - 4 or encoded.len > max_branch_bytes - branch.encoded_bytes - 4) return Error.XaBranchTooLarge;
         const a = branch.arena.allocator();
         try branch.stmts.append(a, try a.dupe(u8, encoded));
+        branch.encoded_bytes += 4 + encoded.len;
     }
 
     pub fn end(self: *XaManager, xid: []const u8) Error!void {
@@ -132,14 +153,14 @@ pub const XaManager = struct {
     }
 
     /// XA PREPARE — mark prepared and persist durably (crash-safe from here).
-    pub fn prepare(self: *XaManager, xid: []const u8) Error!void {
+    pub fn prepare(self: *XaManager, xid: []const u8) !void {
         self.lock();
         defer self.mutex.unlock();
         const branch = self.map.get(xid) orelse return Error.XaBranchUnknown;
         if (branch.state != .ended) return Error.XaProtocol;
-        branch.state = .prepared;
         branch.prepared_at_us = if (self.io) |io| std.Io.Timestamp.now(io, .real).toMicroseconds() else 0;
-        self.persist(xid, branch) catch {}; // best-effort; commit still works in-memory
+        try self.persist(xid, branch);
+        branch.state = .prepared;
     }
 
     /// Roll back every PREPARED branch older than `gc_max_age_us` — orphans from
@@ -173,33 +194,54 @@ pub const XaManager = struct {
             }
         }
         self.mutex.unlock();
-        for (stale.items) |xid| self.rollback(xid);
-        return stale.items.len;
+        var removed: usize = 0;
+        for (stale.items) |xid| {
+            self.rollback(xid) catch continue;
+            removed += 1;
+        }
+        return removed;
     }
 
-    /// Detach a branch for COMMIT and remove its durable record. Returns null
-    /// when the xid is absent — an already-committed xid re-committed by a Flink
-    /// retry (idempotent no-op). Caller applies `branch.stmts`, then `finishCommit`.
-    pub fn takeForCommit(self: *XaManager, xid: []const u8) ?*Branch {
+    pub fn beginCommit(self: *XaManager, xid: []const u8) Error!?*Branch {
         self.lock();
         defer self.mutex.unlock();
-        const entry = self.map.fetchRemove(xid) orelse return null;
-        self.allocator.free(entry.key);
-        self.unlink(xid);
-        return entry.value;
+        const branch = self.map.get(xid) orelse return null;
+        if (branch.state == .committing) return Error.XaBranchBusy;
+        if (branch.state != .prepared) return Error.XaProtocol;
+        branch.state = .committing;
+        return branch;
     }
 
-    pub fn finishCommit(self: *XaManager, branch: *Branch) void {
-        branch.deinit();
-        self.allocator.destroy(branch);
-    }
-
-    pub fn rollback(self: *XaManager, xid: []const u8) void {
+    pub fn cancelCommit(self: *XaManager, xid: []const u8) void {
         self.lock();
         defer self.mutex.unlock();
+        if (self.map.get(xid)) |branch| {
+            std.debug.assert(branch.state == .committing);
+            branch.state = .prepared;
+        }
+    }
+
+    pub fn finishCommit(self: *XaManager, xid: []const u8) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        const branch = self.map.get(xid) orelse return Error.XaBranchUnknown;
+        if (branch.state != .committing) return Error.XaProtocol;
+        try self.unlink(xid);
+        self.removeBranch(xid);
+    }
+
+    pub fn rollback(self: *XaManager, xid: []const u8) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        const branch = self.map.get(xid) orelse return;
+        if (branch.state == .committing) return Error.XaBranchBusy;
+        try self.unlink(xid);
+        self.removeBranch(xid);
+    }
+
+    fn removeBranch(self: *XaManager, xid: []const u8) void {
         if (self.map.fetchRemove(xid)) |entry| {
             self.allocator.free(entry.key);
-            self.unlink(xid);
             entry.value.deinit();
             self.allocator.destroy(entry.value);
         }
@@ -225,17 +267,7 @@ pub const XaManager = struct {
     // ---- durability ----
 
     fn fileName(buf: []u8, xid: []const u8) ?[]const u8 {
-        // hex(xid) + ".xa" — xids carry binary bytes, so keep the name safe.
-        if (xid.len * 2 + 3 > buf.len) return null;
-        const hex = "0123456789abcdef";
-        var i: usize = 0;
-        for (xid) |b| {
-            buf[i] = hex[b >> 4];
-            buf[i + 1] = hex[b & 0xf];
-            i += 2;
-        }
-        @memcpy(buf[i .. i + 3], ".xa");
-        return buf[0 .. i + 3];
+        return @import("../storage/write_journal.zig").branchFileName(buf, xid);
     }
 
     /// Serialize {xid, db, stmts} and write it to the branch's `.xa` file.
@@ -259,15 +291,23 @@ pub const XaManager = struct {
             try appendU32(self.allocator, &body, @intCast(s.len));
             try body.appendSlice(self.allocator, s);
         }
-        try dir.writeFile(io, .{ .sub_path = fname, .data = body.items });
+        try appendU32(self.allocator, &body, @intCast(branch.schema.len));
+        try body.appendSlice(self.allocator, branch.schema);
+        var tempbuf: [528]u8 = undefined;
+        const temporary = try std.fmt.bufPrint(&tempbuf, "{s}.tmp", .{fname});
+        try storage.writeFileAtomic(io, dir, temporary, fname, body.items, true);
     }
 
-    fn unlink(self: *XaManager, xid: []const u8) void {
+    fn unlink(self: *XaManager, xid: []const u8) !void {
         const io = self.io orelse return;
         const dir = self.dir orelse return;
         var namebuf: [520]u8 = undefined;
         const fname = fileName(&namebuf, xid) orelse return;
-        dir.deleteFile(io, fname) catch {};
+        dir.deleteFile(io, fname) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try storage.syncDirectory(io, dir);
     }
 
     /// Re-read all persisted prepared branches on open.
@@ -277,9 +317,15 @@ pub const XaManager = struct {
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".xa")) continue;
-            const bytes = dir.readFileAlloc(io, entry.name, self.allocator, .limited(64 << 20)) catch continue;
+            const bytes = try dir.readFileAlloc(io, entry.name, self.allocator, .limited(max_branch_bytes));
             defer self.allocator.free(bytes);
-            self.loadOne(bytes) catch continue;
+            var cursor: usize = 0;
+            const xid = try readSlice(bytes, &cursor);
+            if (xid.len == 0 or xid.len > max_xid_bytes) return error.Corrupt;
+            var namebuf: [520]u8 = undefined;
+            const expected = fileName(&namebuf, xid) orelse return error.Corrupt;
+            if (!std.mem.eql(u8, entry.name, expected)) return error.Corrupt;
+            try self.loadOne(bytes);
         }
     }
 
@@ -299,6 +345,7 @@ pub const XaManager = struct {
         const branch = try self.allocator.create(Branch);
         errdefer self.allocator.destroy(branch);
         branch.* = .{ .arena = std.heap.ArenaAllocator.init(self.allocator), .db = "", .state = .prepared, .prepared_at_us = prepared_at };
+        errdefer branch.deinit();
         const a = branch.arena.allocator();
         branch.db = try a.dupe(u8, db);
         var i: u32 = 0;
@@ -306,8 +353,12 @@ pub const XaManager = struct {
             const s = try readSlice(bytes, &c);
             try branch.stmts.append(a, try a.dupe(u8, s));
         }
+        if (c < bytes.len) branch.schema = try a.dupe(u8, try readSlice(bytes, &c));
+        if (c != bytes.len) return error.Corrupt;
+        branch.encoded_bytes = bytes.len;
         self.lock();
         defer self.mutex.unlock();
+        if (self.map.contains(key)) return Error.XaBranchExists;
         try self.map.put(self.allocator, key, branch);
     }
 };
@@ -417,12 +468,13 @@ test "xa branch lifecycle: begin/stage/end/prepare/commit + idempotent" {
     }
     try testing.expectEqual(@as(usize, 1), prepared.len);
 
-    const branch = mgr.takeForCommit("x1").?;
+    const branch = (try mgr.beginCommit("x1")).?;
     try testing.expectEqual(@as(usize, 2), branch.stmts.items.len);
     try testing.expectEqualStrings("main", branch.db);
-    mgr.finishCommit(branch);
+    try testing.expectError(Error.XaBranchBusy, mgr.rollback("x1"));
+    try mgr.finishCommit("x1");
 
-    try testing.expect(mgr.takeForCommit("x1") == null); // idempotent
+    try testing.expect(try mgr.beginCommit("x1") == null);
 }
 
 test "parseXid: hex gtrid/bqual + formatID" {
@@ -467,9 +519,9 @@ test "xa gc: aborts prepared branches older than max age, keeps young ones" {
 
     // now = 10_000: old is 9_900µs stale (> 1000 → aborted), young is 500µs.
     try testing.expectEqual(@as(usize, 1), mgr.gcSweepAt(10_000));
-    try testing.expect(mgr.takeForCommit("old") == null); // gone
-    const young = mgr.takeForCommit("young") orelse return error.YoungAborted;
-    mgr.finishCommit(young); // survived
+    try testing.expect(try mgr.beginCommit("old") == null);
+    try testing.expect(try mgr.beginCommit("young") != null);
+    try mgr.finishCommit("young");
 
     // Disabled GC is a no-op.
     mgr.gc_max_age_us = 0;
@@ -486,6 +538,79 @@ test "xa rollback discards" {
     defer mgr.deinit();
     try mgr.begin("r1", "main");
     try mgr.stage("r1", &.{9});
-    mgr.rollback("r1");
-    try testing.expect(mgr.takeForCommit("r1") == null);
+    try mgr.rollback("r1");
+    try testing.expect(try mgr.beginCommit("r1") == null);
+}
+
+test "xa prepare fails without publishing state when its file cannot be written" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var mgr = XaManager.init(a);
+    defer mgr.deinit();
+    try mgr.setStorage(io, tmp.dir);
+    try mgr.begin("blocked", "main");
+    try mgr.stage("blocked", "statement");
+    try mgr.end("blocked");
+    var namebuf: [520]u8 = undefined;
+    const name = XaManager.fileName(&namebuf, "blocked").?;
+    try mgr.dir.?.createDir(io, name, .default_dir);
+    var failed = false;
+    mgr.prepare("blocked") catch {
+        failed = true;
+    };
+    try std.testing.expect(failed);
+    try std.testing.expectEqual(State.ended, mgr.map.get("blocked").?.state);
+    try mgr.dir.?.deleteDir(io, name);
+    try mgr.prepare("blocked");
+    try std.testing.expectEqual(State.prepared, mgr.map.get("blocked").?.state);
+}
+
+test "xa prepared statements and long XIDs survive reopening" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const xid = "a" ** 300;
+    {
+        var mgr = XaManager.init(a);
+        defer mgr.deinit();
+        try mgr.setStorage(io, tmp.dir);
+        try mgr.begin(xid, "main");
+        try mgr.stage(xid, "one");
+        try mgr.stage(xid, "two");
+        try mgr.end(xid);
+        try mgr.prepare(xid);
+    }
+    var recovered = XaManager.init(a);
+    defer recovered.deinit();
+    try recovered.setStorage(io, tmp.dir);
+    const branch = recovered.map.get(xid).?;
+    try std.testing.expectEqual(State.prepared, branch.state);
+    try std.testing.expectEqualStrings("main", branch.db);
+    try std.testing.expectEqual(@as(usize, 2), branch.stmts.items.len);
+    try std.testing.expectEqualStrings("two", branch.stmts.items[1]);
+}
+
+test "xa recovery reports corrupt durable records" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "_xa", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "_xa/bad.xa", .data = "truncated" });
+    var mgr = XaManager.init(a);
+    defer mgr.deinit();
+    try std.testing.expectError(error.Corrupt, mgr.setStorage(io, tmp.dir));
+}
+
+test "xa staging enforces the recovery size limit before retaining bytes" {
+    var mgr = XaManager.init(std.testing.allocator);
+    defer mgr.deinit();
+    try mgr.begin("bounded", "main");
+    const branch = mgr.map.get("bounded").?;
+    branch.encoded_bytes = max_branch_bytes - 4;
+    try std.testing.expectError(Error.XaBranchTooLarge, mgr.stage("bounded", "x"));
+    try std.testing.expectEqual(@as(usize, 0), branch.stmts.items.len);
 }

@@ -1285,6 +1285,30 @@ fn affineUnary(e: Expr, up_schema: []const Column) ?struct { src_idx: usize, aff
 /// ndv ≤ NDV(src) (pigeonhole) and flow min/max when affine; two-column
 /// arithmetic bounds ndv ≤ NDV·NDV with min/max for add/sub. Anything else is
 /// `.none`.
+pub fn mayVary(e: Expr, registry: ?*const udf_mod.UdfRegistry) bool {
+    switch (e) {
+        .call => |call| {
+            inline for (scalar_fn.builtins) |f| {
+                if (comptime f.volatility == .@"volatile") {
+                    if (std.ascii.eqlIgnoreCase(f.name, call.fn_name)) return true;
+                }
+            }
+            if (registry) |r| for (r.scalarEntries()) |entry| {
+                if (entry.volatility == .@"volatile" and std.ascii.eqlIgnoreCase(entry.name, call.fn_name)) return true;
+            };
+            for (call.args) |arg| if (mayVary(arg, registry)) return true;
+            return false;
+        },
+        .case => |c| {
+            for (c.branches) |b| if (mayVary(b.then, registry)) return true;
+            if (c.else_branch) |e2| return mayVary(e2.*, registry);
+            return false;
+        },
+        .col_ref, .lit, .null_lit => return false,
+        .scalar_subquery, .exists_subquery, .var_ref => return true,
+    }
+}
+
 fn classifyExpr(e: Expr, up_schema: []const Column) StatClass {
     const c = switch (e) {
         .call => |x| x,
@@ -1485,7 +1509,7 @@ fn resolveDerived(
             };
         },
         .call => {
-            const stat_class = classifyExpr(d.expr, up_schema);
+            const stat_class: StatClass = if (mayVary(d.expr, udf_registry)) .none else classifyExpr(d.expr, up_schema);
             // Fast path: `col +/-/* const` collapses to one widening SIMD pass.
             if (try tryFuseScalar(aa, d.expr, up_schema)) |fs| {
                 return .{

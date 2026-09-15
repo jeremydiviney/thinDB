@@ -954,7 +954,7 @@ const PersistentTableTarget = struct {
     table_name: []const u8,
 };
 
-fn resolvePersistentTableTarget(catalog: *Catalog, session: Session, ref: ir.TableRef) !PersistentTableTarget {
+pub fn resolvePersistentTableTarget(catalog: *Catalog, session: Session, ref: ir.TableRef) !PersistentTableTarget {
     var db_name: []const u8 = ref.database orelse session.current_db;
     var schema_name: []const u8 = ref.schema orelse session.current_schema;
     if (ref.database == null and ref.schema != null) {
@@ -1038,6 +1038,8 @@ pub const CompileCtx = struct {
     /// This is the single seam where a future global memory pool would
     /// hand out (and reclaim) the per-query budget.
     accountant: ?*exec.memory.MemoryAccountant = null,
+    accountant_allocator: ?Allocator = null,
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
     /// Query-scoped global string dictionary (Phase 4.2 Option A). Lazily
     /// created the first time a scan needs to emit a dict string column as
     /// codes; the scan interns each segment's local dict into it (building a
@@ -1061,6 +1063,7 @@ pub const CompileCtx = struct {
     prune_names: ?[][]const u8 = null,
 
     pub fn deinit(self: *CompileCtx) void {
+        defer if (self.accountant) |a| a.releaseOwner(self.accountant_allocator.?);
         var it = self.materialized.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit();
         self.materialized.deinit(self.allocator);
@@ -1068,14 +1071,6 @@ pub const CompileCtx = struct {
         self.session_strings.deinit(self.allocator);
         if (self.subquery_arena) |*ar| ar.deinit();
         if (self.node_arena) |*ar| ar.deinit();
-        if (self.accountant) |a| {
-            // Release any reservation still outstanding (non-evicted materialize
-            // buffers freed just above, error-path remnants) back to the shared
-            // pool before the accountant is gone — otherwise the cross-query
-            // pool leaks and later queries fail MemoryBudgetExceeded.
-            a.drainToPool();
-            self.allocator.destroy(a);
-        }
         if (self.global_dict) |g| {
             g.deinit(self.allocator);
             self.allocator.destroy(g);
@@ -1118,18 +1113,34 @@ pub const CompileCtx = struct {
         if (self.accountant) |a| return a;
         const budget = thindb_api.autoQueryBudgetBytes(self.db.config.query_memory_budget);
         const pool = self.db.config.memory_pool;
-        if (budget == 0 and pool == null) return null;
-        const acc = try self.allocator.create(exec.memory.MemoryAccountant);
+        if (budget == 0 and pool == null and self.cancel_flag == null) return null;
+        const acc = try self.db.allocator.create(exec.memory.MemoryAccountant);
+        errdefer self.db.allocator.destroy(acc);
         acc.* = exec.memory.MemoryAccountant.initWithPool(budget, pool);
+        acc.cancel_flag = self.cancel_flag;
+        acc.trackAllocations(self.db.allocator);
+        try acc.retainGate(self.db.config.statement_gate);
+        self.accountant_allocator = self.db.allocator;
         self.accountant = acc;
         return acc;
     }
 
+    pub fn executionAllocator(self: *CompileCtx) !Allocator {
+        return exec.memory.executionAllocator(self.allocator, try self.queryAccountant());
+    }
+
+    fn executionError(self: *CompileCtx, err: anyerror) anyerror {
+        if (err == error.OutOfMemory) if (self.accountant) |a| {
+            if (a.exceeded.load(.acquire)) return error.MemoryBudgetExceeded;
+        };
+        return err;
+    }
+
     /// Get (or lazily create) the subquery arena. Resolution-time
     /// allocations from the pre-compile pass live here.
-    pub fn subqueryArena(self: *CompileCtx) Allocator {
+    pub fn subqueryArena(self: *CompileCtx) !Allocator {
         if (self.subquery_arena == null) {
-            self.subquery_arena = std.heap.ArenaAllocator.init(self.allocator);
+            self.subquery_arena = std.heap.ArenaAllocator.init(try self.executionAllocator());
         }
         return self.subquery_arena.?.allocator();
     }
@@ -1163,8 +1174,10 @@ pub const CompiledQuery = struct {
     /// query at the next batch boundary. Cost is one atomic load
     /// per batch; trivial compared to the work a batch represents.
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    statement_lease: ?Catalog.StatementLease = null,
 
     pub fn deinit(self: *CompiledQuery) void {
+        defer if (self.statement_lease) |lease| lease.release();
         self.query.deinit();
         // SessionVars (if any) is intentionally NOT freed here —
         // it must survive across statements in a multi-statement
@@ -1191,7 +1204,7 @@ pub const CompiledQuery = struct {
         if (self.cancel_flag) |f| {
             if (f.load(.acquire)) return Error.QueryCancelled;
         }
-        return self.query.next();
+        return self.query.next() catch |err| return self.ctx.executionError(err);
     }
 
     pub fn outputSchema(self: *CompiledQuery) []const @import("../types.zig").Column {
@@ -1227,6 +1240,50 @@ pub fn compileWithSession(
     session: Session,
     root: *const ir.Op,
 ) !CompiledQuery {
+    return compileWithOptions(allocator, db, session, root, .{});
+}
+
+pub fn changesCatalog(op: *const ir.Op) bool {
+    return switch (op.*) {
+        .ddl => |ddl| switch (ddl) {
+            .create_database, .create_schema, .create_table, .use_schema, .use_database_schema => false,
+            else => true,
+        },
+        .create_table_as => false,
+        .batch => |batch| blk: {
+            for (batch.statements) |statement| if (changesCatalog(statement)) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+pub const CompileOptions = struct {
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
+};
+
+pub fn compileWithOptions(allocator: Allocator, db: *Database, session: Session, root: *const ir.Op, options: CompileOptions) !CompiledQuery {
+    var lease: ?Catalog.StatementLease = null;
+    if (catalogFor(db)) |catalog| lease = try catalog.acquireStatement(changesCatalog(root));
+    errdefer if (lease) |l| l.release();
+    var compiled = try compileInStatementWithOptions(allocator, db, session, root, options);
+    // Statement handlers finish eagerly and return owned metadata or an empty
+    // result. Keeping those results alive must not block later DDL.
+    if (!engine_v2.isSelectQuery(root)) {
+        if (lease) |l| l.release();
+    } else {
+        compiled.statement_lease = lease;
+    }
+    return compiled;
+}
+
+/// Caller owns the catalog statement lease, including through query teardown.
+pub fn compileInStatement(allocator: Allocator, db: *Database, session: Session, root: *const ir.Op) !CompiledQuery {
+    return compileInStatementWithOptions(allocator, db, session, root, .{});
+}
+
+pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, session: Session, root: *const ir.Op, options: CompileOptions) !CompiledQuery {
+    if (options.cancel_flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     const session_cell = try allocator.create(Session);
     session_cell.* = session;
     errdefer allocator.destroy(session_cell);
@@ -1237,6 +1294,7 @@ pub fn compileWithSession(
         .udf_registry = if (catalogFor(db)) |catalog| &catalog.udfs else null,
         .session = session_cell,
         .now_micros = std.Io.Timestamp.now(db.io, .real).toMicroseconds(),
+        .cancel_flag = options.cancel_flag,
     };
     errdefer ctx.deinit();
     // Pre-compile pass: walk the IR and run each uncorrelated scalar
@@ -1244,11 +1302,12 @@ pub fn compileWithSession(
     // concrete `.leaf` / `.lit`. After this pass operators never see
     // subquery nodes — they're a parse-time-only construct.
     const t_resolve_subqueries = exec.prof.nowTicks();
-    try subquery_resolve.resolveSubqueriesInOp(&ctx, @constCast(root));
+    subquery_resolve.resolveSubqueriesInOp(&ctx, @constCast(root)) catch |err| return ctx.executionError(err);
     exec.prof.addPhase("compile.resolve_subqueries", @intCast(exec.prof.nowTicks() - t_resolve_subqueries));
     // Predicate pushdown: relocate single-side WHERE conjuncts below their join
     // so the source is narrowed before the join runs. Pure plan rewrite shared
     // by every handler. Runs on resolved predicates (concrete leaves).
+    if (ctx.cancel_flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     const t_push_join_filters = exec.prof.nowTicks();
     try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_join_filters", @intCast(exec.prof.nowTicks() - t_push_join_filters));
@@ -1276,7 +1335,7 @@ pub fn compileWithSession(
     // figure out which base columns the (single) scan must produce.
     ctx.prune_names = analyzeProjection(allocator, root);
     const v2_input = engine_v2.CompileInput{
-        .allocator = allocator,
+        .allocator = try ctx.executionAllocator(),
         .db = db,
         .session = session_cell.*,
         .prune_names = ctx.prune_names,
@@ -1291,14 +1350,14 @@ pub fn compileWithSession(
     if (engine_v2.isSelectQuery(root)) {
         if (cte_stages.needsStaging(root) or referencesPgCatalog(root, session_cell.*)) {
             const t_staged_total = exec.prof.nowTicks();
-            const q = try cte_stages.compileStaged(v2_input, root, &ctx.stage_count);
+            const q = cte_stages.compileStaged(v2_input, root, &ctx.stage_count) catch |err| return ctx.executionError(err);
             exec.prof.addPhase("compile.staged_total", @intCast(exec.prof.nowTicks() - t_staged_total));
             return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
         }
-        const q = try engine_v2.compileSelectBlock(v2_input, root);
+        const q = engine_v2.compileSelectBlock(v2_input, root) catch |err| return ctx.executionError(err);
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
-    const q = try compileOp(&ctx, root);
+    const q = compileOp(&ctx, root) catch |err| return ctx.executionError(err);
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
 }
 
@@ -1308,9 +1367,10 @@ pub fn compileWithSession(
 /// leaf blocks → cte_stages, single SELECT blocks → engine_v2, statements →
 /// the statement router.
 pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
+    if (ctx.cancel_flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     if (engine_v2.isSelectQuery(op)) {
         const v2_input = engine_v2.CompileInput{
-            .allocator = ctx.allocator,
+            .allocator = try ctx.executionAllocator(),
             .db = ctx.db,
             .session = ctx.session.*,
             .prune_names = ctx.prune_names,

@@ -510,6 +510,7 @@ pub const RunRequest = struct {
     // Derived columns the scan-layer Compute adds to each batch before keying
     // and aggregation (e.g. ClientIP - 1, length(URL)). Empty for plain shapes.
     derived: []const exec.Derived = &.{},
+    udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
     filter_expr: ?exec.PredicateExpr = null,
 };
 
@@ -618,7 +619,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: SiloCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.filter_expr, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -639,7 +640,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.filter_expr, &rows, &workspace);
+    try runHarness(allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -702,6 +703,8 @@ fn runHarness(
     params: Params,
     scan_columns: ?[]const []const u8,
     derived: []const exec.Derived,
+    udf_registry: ?*const @import("../udf.zig").UdfRegistry,
+    resources: ?*exec.memory.MemoryAccountant,
     filter_expr: ?exec.PredicateExpr,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
     workspace: *SiloCore.SiloGridWorkspace,
@@ -904,6 +907,8 @@ fn runHarness(
         .group_rows_layout = group_rows_layout,
         .scan_columns = scan_columns,
         .derived = derived,
+        .udf_registry = udf_registry,
+        .resources = resources,
         .filter_expr = filter_expr,
         .shared_stage_builders = params.shared_stage_builders,
         .no_profile = !params.worker_profile,

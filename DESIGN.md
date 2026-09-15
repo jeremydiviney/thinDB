@@ -2,52 +2,21 @@
 
 A single-node, columnar analytics database with a tight, fast core and deliberately small surface area. Inspired by StarRocks/Doris in storage shape, but stripped of every multi-node, optimizer, and ecosystem concern that doesn't earn its keep on one machine.
 
-This document is the working spec. v1 is effectively complete as of 2026-05-18 — joins (every algorithm), range/opaque predicates, skew auto-routing, upserts, WAL, type coercion, and a substantial scalar/aggregate function set have all landed. Section 14 tracks what's been deferred to v2 and v3.
-
-Decisions are presented as decisions, not options. Rationale is included where it isn't obvious; alternatives we considered and rejected are listed in `## Alternatives considered`.
-
-For the planned next-generation physical execution path for simple analytical
-query blocks, see `docs/simple_query_pipeline.md`.
-
----
+This document describes the current single-server engine. It includes an embedded API, SQL compilation, MySQL/PostgreSQL/native listeners, joins, CTEs, windows, UDFs, and parallel analytical execution. The execution pipeline is documented in [docs/simple_query_pipeline.md](docs/simple_query_pipeline.md).
 
 ## 1. Goals & Non-goals
 
-### Goals
-- **Single-node, embedded library** for analytical workloads on one machine.
-- **Raw speed** via columnar layout, vectorized execution, SIMD where it helps.
-- **Simple, predictable execution.** Queries run in the order you wrote them. No runtime optimizer.
-- **Strict schema.** `CREATE TABLE` with fixed types, `NOT NULL` by default. Typing is enforced at compile time wherever possible.
-- **Append-only storage** with tombstoning and background compaction.
-- **Thin everywhere.** Each subsystem should be the minimum that's correct and fast — nothing more.
-
-### Non-goals (v1)
-- Distribution, replication, sharding.
-- A SQL parser/dialect (v2).
-- A user-facing network server or wire protocol — though an in-process `Connection` exists (`thindb.local`) and TCP transport stubs are wired (v2 ships the parser; v3 ships MySQL wire-compat).
-- Client APIs for non-Zig languages (v2).
-- Subqueries, CTEs, window functions (v2). **Joins are in v1** (hash / sort-merge / nested-loop / range-sweep, with auto routing and skew detection).
-- Transactions or multi-statement atomicity (not currently planned).
-- Timezone-aware datetimes (v2 — `TIMESTAMPTZ`).
-- Cost-based query planning or statistics-driven optimization (rejected for the "thin" ethos).
-- Implicit string ↔ number coercion (matches DuckDB/StarRocks; users call `to_int` / `to_string`).
-
-### Shipped beyond the original v1 plan
-
-Items the early spec listed as v2 that landed in v1:
-
-- **Joins** — hash, sort-merge, nested-loop, range-sweep, with `.auto` routing via manifest stats and Misra-Gries skew detection that re-routes hash → SMJ in-place.
-- **Upserts** — `Table.upsert()`; inserts on unique tables transparently apply last-writer-wins resolution (StarRocks-style).
-- **Crash durability** — WAL with leader-follower group commit.
-- **Implicit type coercion** in scalar functions (DuckDB-style cost-ranked overload selection).
-
-Items genuinely deferred to v2/v3 are listed in `## 14`.
+- Run analytical workloads efficiently on one server, with an embeddable core and optional network frontends.
+- Keep columnar execution, memory ownership, error handling, and persistence transitions explicit.
+- Select general physical techniques from query shape and available metadata before execution. This work adds no query-specific recognizers, join-order optimizer, or group-key width policy.
+- Support strict schemas, immutable segments, tombstones, WAL recovery, and background compaction.
+- Keep distribution and replication outside the core. Ordinary SQL transaction verbs do not provide rollback or isolation; the supported staged-write XA protocol is described in section 8.2.
 
 ---
 
 ## 2. Architecture overview
 
-thinDB is a Zig library. A process embeds it via `@import("thindb")`, opens a `Database` pointed at a directory on disk, and operates on it through a typed API. There is no separate server, no daemon, no IPC.
+thinDB is a Zig library with an optional standalone server. A process embeds it via `@import("thindb")` and opens a `Catalog` or the `Database.open` convenience wrapper. SQL frontends parse into IR, compile physical operators, and execute against the same storage core.
 
 Three internal subsystems:
 
@@ -80,7 +49,7 @@ Three internal subsystems:
                        └────────────┘
 ```
 
-A **single writer thread** processes a command queue (`Insert`, `Delete`, `Flush`, `Compact`, `Alter`). Reads run concurrently on caller threads and see a manifest-snapshot view consistent at the moment the query started.
+Per-table mutexes serialize writes. Reads capture segment and memtable snapshots, then execute on caller and worker threads. Background flush and compaction use the same ownership and publication rules as foreground operations.
 
 ---
 
@@ -175,27 +144,13 @@ Result precisions exceeding 38 are clamped to 38, with overflow → error rather
 
 ### 4.2 Manifest
 
-A small file listing the active segments for a table. On every change (flush, compaction, delete-of-an-entire-segment), the writer:
+The manifest selects the active immutable segments. Flush and compaction build a candidate without changing the published in-memory list. They finish the referenced output files, atomically replace `manifest` via `manifest.tmp`, then install the new in-memory state. Failed publication retains the old input ownership. TRUNCATE follows the same rule: publish an empty manifest and WAL checkpoint before replacing the memtable and reclaiming old files; segment IDs remain monotonic while deferred deletion is possible. Late deletes found during compaction reconciliation are written to the output tombstone before that output is selected.
 
-1. Constructs the new manifest in memory.
-2. Writes `manifest.new`.
-3. `rename` over `manifest` (atomic on both POSIX and Windows when same-volume).
+Manifest v11 has a 56-byte header, including a 16-byte WAL generation and the covered physical byte offset. This checkpoint makes a published flush recoverable even if subsequent WAL replacement fails. WAL v2 has a 32-byte header with its generation. Readers also accept manifest v10 and WAL v1. Older binaries cannot read newly written formats; downgrade testing must use an untouched snapshot.
 
-Readers open `manifest` once at query start and read only segments it lists. Segments not in the manifest are invisible to that query, even if their files exist on disk.
+The exact binary layouts live in [src/storage/manifest.zig](src/storage/manifest.zig) and [src/engine/wal.zig](src/engine/wal.zig). Segment entries include row/byte counts, leading-key statistics, per-column statistics, and cardinality sketches.
 
-Manifest contents (binary, little-endian):
-
-```
-magic              u32   "tDBM"
-version            u16
-schema_fingerprint u64   identifies schema rev — must match schema.json
-segment_count      u32
-[ per segment ]
-  segment_id       u64
-  row_count        u64
-  min_key, max_key — variable-width, typed per order-key columns
-  tomb_present     u8    (0 or 1)
-```
+Durable mode syncs output files before publishing references, and syncs affected parent directories on POSIX before reclaiming the old WAL or inputs. Windows performs file sync and same-volume replacement; the directory-sync helper is unsupported there. `sync_mode = .none` remains the default and does not promise power-loss durability.
 
 ### 4.3 Segment file
 
@@ -632,14 +587,14 @@ Steps:
 
 ### 7.3 Concurrency
 
-Compaction holds the writer queue (no concurrent inserts/deletes/flushes during a compaction). Reads continue unaffected via manifest snapshots.
+Compaction builds output away from the table mutex. The commit phase reconciles concurrent deletes under the mutex, publishes output tombstones, and then publishes the candidate manifest. A separate compaction lock prevents overlapping compactions and excludes XA rollback from an in-flight merge.
 
 ---
 
 ## 8. Concurrency
 
 - **Per-table mutex** serializes memtable + WAL mutations. Multiple writer threads may call `insert`/`upsert`/`delete`/`flush` concurrently; they line up at the mutex one record at a time. Each `Table` has its own mutex, so writes to different tables run in parallel.
-- **Many reader threads.** Reads acquire a manifest snapshot at query start; no locks held during execution.
+- **Many reader threads.** Scans capture snapshots under the table mutex, then release it. Query lifetime leases prevent destructive catalog teardown and XA publication from invalidating borrowed table state.
 - **Manifest update is atomic** via `rename`. Readers always see either the pre- or post-state, never partial.
 - **Memtable snapshot isolation.** Scans pin a refcounted snapshot of the memtable at start; concurrent writers see a fresh memtable. Long readers and active writers never block each other.
 
@@ -692,6 +647,26 @@ Throughput scales sub-linearly with thread count (each fsync is now amortized ov
 Truncate (called at end of flush) coordinates with `awaitDurable`: it drains the current leader, then bumps `synced_offset` to the pre-truncate `write_offset` so any pending waiters from before the truncate become no-ops (their data is now in a segment, not the WAL).
 
 ---
+
+### 8.2 Ownership and XA staged writes
+
+A Catalog obtains an exclusive OS lock on `.thindb.lock` before recovery or temporary-file cleanup and holds it through close. Schema table initialization is serialized so one name has one Table/WAL owner. Dropping names remain reserved until teardown finishes.
+
+Normal statements and API scans/writes hold shared catalog leases. XA commit and destructive SQL DDL take an exclusive lease. Nested calls reuse their calling thread's lease; attempting to upgrade while that thread still owns a query returns `TableBusy`. Catalog close rejects new work and waits for live leases. Borrowed database/schema/table pointers are invalidated by drop or close; callers racing destructive DDL must hold a statement lease across lookup and use, as the wire handlers do. Asynchronous allocation cleanup retains a separate lifetime reference, keeping the catalog allocator and memory pool alive without holding up subsequent statements.
+
+XA stores encoded write statements, their database, and their originating schema. PREPARE succeeds only after its bounded recovery record is atomically persisted. COMMIT keeps the branch recoverable while it validates targets, takes the exclusive visibility lease, snapshots manifest/WAL/tombstone metadata into `_xa/commit`, applies statements, and flushes each affected table. A durable completion marker decides recovery. Without it, startup restores the old metadata; with it, startup retains the committed data and removes the prepared record. Journal retirement uses a directory rename before cleanup so interrupted cleanup cannot turn a completed commit into rollback.
+
+Statement errors trigger undo and leave the branch prepared for retry. If undo or the durable decision cannot be resolved, the catalog rejects further work with `RecoveryRequired`. Absent-branch COMMIT remains an idempotent success for the existing CDC integration. Prepared branches do not expire by default.
+
+This is a staged-write protocol, not general SQL transactional isolation: reads inside ACTIVE do not see an uncommitted write set, and expressions are evaluated at commit. DDL is not part of the staged write set.
+
+### 8.3 Query memory and cancellation
+
+One thread-safe query resource context follows SQL physical operators and worker backends. Allocation wrappers charge requested live capacities, including variable-length payloads, hash state, sort permutations, and worker buffers, against per-query and shared limits. Estimates remain useful for planning, but do not enforce these limits. Rejected growth returns `MemoryBudgetExceeded`; there is no spill fallback yet.
+
+Result buffers and metadata remain charged while owned. Retained region-pool capacity is charged when borrowed by a query and detached when returned to the separately capped pool. Asynchronous frees return reservations only when the corresponding storage is released. Allocator bookkeeping, allocator-internal rounding/freelists, parser/protocol buffers, database metadata/memtables, and the separate source cache are not an exact process-RSS ceiling.
+
+Wire handlers reset their cancellation token at statement acceptance, before parsing/compilation. Compilation and eager subqueries share the token with execution. Scans, worker scheduling, sort partitions/passes, regional operations, and merge loops check it cooperatively. `QueryCancelled` unwinds ordinary resource ownership. Polling does not preempt a native UDF callback or an operating-system I/O call; this is cooperative cancellation, not a hard latency guarantee.
 
 ## 9. API
 
@@ -839,7 +814,8 @@ SchemaMismatch, UnsupportedUniqueKeyType, UpsertRequiresUniqueKey,
 TableNotFound, TableAlreadyExists, ColumnNotFound,
 ColumnAlreadyExists, UnsupportedAlterOp,
 FunctionAlreadyExists, FunctionInvalidDefinition,
-WalOrphaned,
+WalOrphaned, XaBranchTooLarge, XaInvalidXid,
+DatabaseInUse, TableBusy, RecoveryRequired, DurabilityUncertain, DatabaseClosed,
 ```
 
 `WalOrphaned`: a `wal` file sits inside the table's `segments/` directory. Replay only reads the log beside the manifest, so that file holds acknowledged rows a normal open would silently drop; the table refuses to open until an operator moves the log into place (same schema fingerprint) or aside.
@@ -856,12 +832,14 @@ ComputeNoColumns, ComputeNameCollision, ComputeUnsupportedExpr,
 ComputeNoSuchOverload, ComputeTooManyArgs,
 JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
 JoinColumnNameCollision,
-MemoryBudgetExceeded, WindowUnsupported,
+MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
 
-No transactions, no rollback. Each top-level API call either fully succeeds or fully fails with no side effect (e.g., a failed `insert` leaves the memtable untouched; a failed `ALTER` leaves the shadow table to be cleaned up but the original is intact).
+`DatabaseInUse` means another catalog owns the root's OS lock. `TableBusy` rejects an unsafe same-thread upgrade from a live query lease to destructive DDL. `DatabaseClosed` rejects new operations during close. `DurabilityUncertain` means a file replacement succeeded but parent-directory sync failed. The affected table/catalog is fenced at the persistence boundary, before releasing the mutation lock; queued writers recheck that state after acquiring the table lock. `RecoveryRequired` means that publication or an XA persistence/rollback outcome requires restart recovery; operations are rejected until reopening resolves the journal. XA admission rejects records exceeding its 64 MiB serialized recovery limit (`XaBranchTooLarge`) or invalid XIDs (`XaInvalidXid`, at most 1024 bytes).
+
+Errors propagate to callers. Outside the XA commit protocol, an error is not a blanket guarantee that no effect occurred: durable publication can succeed before later cleanup fails. Retrying non-idempotent writes after an I/O error requires inspecting/recovering the state. Ordinary SQL BEGIN/COMMIT/ROLLBACK currently maintain protocol session status, not a multi-statement undo transaction.
 
 ---
 
@@ -1010,7 +988,7 @@ The biggest piece is a **compiled query-plan tree** as IR — most of v2 builds 
 
 | Feature | Notes |
 |---|---|
-| Transactions / multi-statement atomicity | Would require coordinating manifest updates across commands. |
+| General SQL transactions | Staged XA write commits exist (section 8.2); ordinary SQL transactional reads, rollback, and isolation remain unimplemented. |
 | Replication / multi-node | Explicitly out of scope. |
 | Cost-based optimizer / statistics-driven plans | The "thin" ethos rejects this. Pre-execution rewrites (constant folding, predicate normalization) are fine; plan-cost reordering is not. |
 | Implicit string ↔ number coercion | Footgun-prone (MySQL behavior); explicit `to_int` / `to_string` instead (Postgres/DuckDB/StarRocks consensus). |

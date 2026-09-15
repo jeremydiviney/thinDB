@@ -224,11 +224,7 @@ pub fn serveMysql(
     address: Io.net.IpAddress,
     limiter: ?*ConnectionLimiter,
 ) !*Server {
-    const listener = try Io.net.IpAddress.listen(&address, io, .{
-        .mode = .stream,
-        .protocol = .tcp,
-        .reuse_address = true,
-    });
+    const listener = try @import("../../util/tcp_listener.zig").listen(&address, io);
     const effective_limiter = if (limiter) |lim| lim else blk: {
         const lp = try allocator.create(ConnectionLimiter);
         lp.* = ConnectionLimiter.init(catalog.config.max_connections);
@@ -1080,6 +1076,7 @@ fn handleQuery(
     payload: []const u8,
     profiler: *MysqlProfiler,
 ) !void {
+    if (session.conn_state) |state| state.clearCancel();
     var seq_id: u8 = 1;
     const caps = session.client_caps;
 
@@ -3425,6 +3422,9 @@ fn runKeyedDeleteBatch(
     last_is_final: bool,
     profiler: *MysqlProfiler,
 ) !?bool {
+    if (session.xa_active != null) return null;
+    const lease = try catalog.acquireStatement(false);
+    defer lease.release();
     const main_db = catalog.database(session.current_db) orelse return null;
     const cat = local.catalogFor(main_db) orelse return null;
     const t = local.resolveTable(cat, session.asSession(), stmts[0].delete_op.table) catch return null;
@@ -3475,11 +3475,16 @@ fn xaErr(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, e: anyerror) !void
         try handshake.sendErrPacket(allocator, w, seq_id, 1440, "XAE08".*, "XAER_DUPID: XID already exists"),
         error.XaBranchUnknown => // XAER_NOTA
         try handshake.sendErrPacket(allocator, w, seq_id, 1397, "XAE04".*, "XAER_NOTA: unknown XID"),
-        error.XaProtocol => // XAER_RMFAIL: wrong state for this command
+        error.XaProtocol, error.XaBranchBusy => // XAER_RMFAIL: wrong state for this command
         try handshake.sendErrPacket(allocator, w, seq_id, 1399, "XAE07".*, "XAER_RMFAIL: command invalid in the current XA state"),
-        else => // XAER_INVAL
-        try handshake.sendErrPacket(allocator, w, seq_id, 1398, "XAE05".*, @errorName(e)),
+        error.XaInvalidXid, error.XaBranchTooLarge => try handshake.sendErrPacket(allocator, w, seq_id, 1398, "XAE05".*, @errorName(e)),
+        else => try handshake.sendErrPacket(allocator, w, seq_id, 1401, "XAE03".*, @errorName(e)),
     }
+}
+
+fn xaStageError(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, err: anyerror) !bool {
+    try xaErr(allocator, w, seq_id, err);
+    return false;
 }
 
 /// XA transaction control for the Flink exactly-once JDBC sink. `text` is the
@@ -3503,6 +3508,9 @@ fn handleXaCommand(
     var xid = std.mem.trim(u8, rest[vend..], " \t\r\n");
     const eq = std.ascii.eqlIgnoreCase;
 
+    const xa_lease = catalog.acquireStatement(eq(verb, "commit")) catch |err| return xaErr(allocator, w, seq_id, err);
+    defer xa_lease.release();
+
     if (eq(verb, "recover")) {
         // MySQL XA RECOVER result: formatID, gtrid_length, bqual_length, data
         // (= gtrid ++ bqual). Connector/J's recover() reconstructs each Xid from
@@ -3510,7 +3518,7 @@ fn handleXaCommand(
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
-        const xids = catalog.xa.preparedXids(aa) catch &[_][]const u8{};
+        const xids = catalog.xa.preparedXids(aa) catch |err| return xaErr(allocator, w, seq_id, err);
         var sid = seq_id;
         const cols = [_]types.Column{
             .{ .name = "formatID", .type = .int },
@@ -3534,9 +3542,13 @@ fn handleXaCommand(
         return;
     }
     if (eq(verb, "start") or eq(verb, "begin")) {
-        catalog.xa.begin(xid, session.current_db) catch |e| return xaErr(allocator, w, seq_id, e);
-        if (session.xa_active) |old| allocator.free(old);
-        session.xa_active = try allocator.dupe(u8, xid);
+        if (session.xa_active != null) return xaErr(allocator, w, seq_id, error.XaProtocol);
+        const owned_xid = allocator.dupe(u8, xid) catch |err| return xaErr(allocator, w, seq_id, err);
+        catalog.xa.beginInSchema(xid, session.current_db, session.current_schema) catch |err| {
+            allocator.free(owned_xid);
+            return xaErr(allocator, w, seq_id, err);
+        };
+        session.xa_active = owned_xid;
         return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
     }
     if (eq(verb, "end")) {
@@ -3552,7 +3564,7 @@ fn handleXaCommand(
         return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
     }
     if (eq(verb, "rollback")) {
-        catalog.xa.rollback(xid);
+        catalog.xa.rollback(xid) catch |e| return xaErr(allocator, w, seq_id, e);
         if (session.xa_active) |a| if (std.mem.eql(u8, a, xid)) {
             allocator.free(a);
             session.xa_active = null;
@@ -3560,23 +3572,10 @@ fn handleXaCommand(
         return handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
     }
     if (eq(verb, "commit")) {
-        if (xid.len >= 9 and eq(xid[xid.len - 9 ..], "one phase"))
+        const one_phase = xid.len >= 9 and eq(xid[xid.len - 9 ..], "one phase");
+        if (one_phase)
             xid = std.mem.trim(u8, xid[0 .. xid.len - 9], " \t\r\n,");
-        if (catalog.xa.takeForCommit(xid)) |branch| {
-            defer catalog.xa.finishCommit(branch);
-            const dbname = if (branch.db.len > 0) branch.db else session.current_db;
-            if (catalog.database(dbname)) |main_db| {
-                var carena = std.heap.ArenaAllocator.init(allocator);
-                defer carena.deinit();
-                const ca = carena.allocator();
-                for (branch.stmts.items) |enc| {
-                    const dop = ir.decode(ca, enc) catch continue;
-                    var compiled = local.compileWithSession(ca, main_db, session.asSession(), &dop) catch continue;
-                    defer compiled.deinit();
-                    while (compiled.next() catch null) |_| {}
-                }
-            }
-        }
+        @import("../xa_exec.zig").commit(allocator, catalog, xid, one_phase) catch |e| return xaErr(allocator, w, seq_id, e);
         if (session.xa_active) |a| if (std.mem.eql(u8, a, xid)) {
             allocator.free(a);
             session.xa_active = null;
@@ -3609,10 +3608,15 @@ fn runSingleStatement(
     // pins this thread to its core; on Linux it is accounting-only — this
     // thread spawns every exec worker for the statement, and spawned threads
     // inherit the spawner's affinity mask there (see core_scheduler.PIN_THREADS).
+    profiler.recordSqlKind(classifySqlKind(op.*));
+    const statement_lease = catalog.acquireStatement(local.changesCatalog(op)) catch |err| {
+        const mapped = errors.mapInternal(err, null);
+        try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
+        return false;
+    };
+    defer statement_lease.release();
     var qlease = core_scheduler.global().acquire();
     defer qlease.release();
-
-    profiler.recordSqlKind(classifySqlKind(op.*));
     const main_db = catalog.database(session.current_db) orelse {
         try handshake.sendErrPacket(allocator, w, seq_id.*, 1049, "42000".*, "Unknown database");
         return false;
@@ -3659,12 +3663,14 @@ fn runSingleStatement(
                 try handshake.sendOkPacketStatus(allocator, w, seq_id.*, 0, 0, extra_status);
                 seq_id.* +%= 1;
                 return true;
-            } else |_| {}
+            } else |err| {
+                return xaStageError(allocator, w, seq_id.*, err);
+            }
         }
     }
 
     const compile_start = profiler.start();
-    var compiled = local.compileWithSession(qalloc, main_db, session.asSession(), op) catch |err| {
+    var compiled = local.compileInStatementWithOptions(qalloc, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null }) catch |err| {
         profiler.recordSince(.query_compile, compile_start);
         const mapped = errors.mapInternal(err, null);
         var msg: []const u8 = mapped.message;
@@ -3688,15 +3694,6 @@ fn runSingleStatement(
         counting_allocator.dump("handler-alloc", mem_stats);
     };
     defer compiled.deinit();
-
-    // Clear any stale cancel flag from a previous statement on this
-    // connection, then wire the connection's cancel flag into the
-    // compiled query. CompiledQuery.next() polls the flag at each
-    // batch boundary; a peer KILL sets it via the shared registry.
-    if (session.conn_state) |state| {
-        state.clearCancel();
-        compiled.cancel_flag = &state.cancel_flag;
-    }
 
     if (isSideEffectOp(op.*)) {
         const exec_start = profiler.start();
@@ -3922,6 +3919,7 @@ fn handleStmtExecute(
     payload: []const u8,
     profiler: *MysqlProfiler,
 ) !void {
+    if (session.conn_state) |state| state.clearCancel();
     var seq_id: u8 = 1;
     const caps = session.client_caps;
 
@@ -3992,6 +3990,12 @@ fn handleStmtExecute(
         return;
     }
 
+    const statement_lease = catalog.acquireStatement(local.changesCatalog(op)) catch |err| {
+        const mapped = errors.mapInternal(err, null);
+        try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+        return;
+    };
+    defer statement_lease.release();
     const main_db = catalog.database(session.current_db) orelse {
         try handshake.sendErrPacket(allocator, w, seq_id, 1049, "42000".*, "Unknown database");
         return;
@@ -4019,12 +4023,15 @@ fn handleStmtExecute(
                 };
                 try handshake.sendOkPacket(allocator, w, seq_id, 0, 0);
                 return;
-            } else |_| {}
+            } else |err| {
+                _ = try xaStageError(allocator, w, seq_id, err);
+                return;
+            }
         }
     }
 
     const compile_start = profiler.start();
-    var compiled = local.compileWithSession(allocator, main_db, session.asSession(), op) catch |err| {
+    var compiled = local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null }) catch |err| {
         profiler.recordSince(.stmt_execute_compile, compile_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
@@ -4032,11 +4039,6 @@ fn handleStmtExecute(
     };
     profiler.recordSince(.stmt_execute_compile, compile_start);
     defer compiled.deinit();
-
-    if (session.conn_state) |state| {
-        state.clearCancel();
-        compiled.cancel_flag = &state.cancel_flag;
-    }
 
     if (isSideEffectOp(op.*)) {
         const exec_start = profiler.start();

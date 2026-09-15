@@ -2311,8 +2311,8 @@ test "skew: no-skew query with detection enabled runs normally" {
 }
 
 test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
-    // Budget = 100 bytes. We try to sort 100 rows (each ~16 bytes
-    // accounted, so ~1600 bytes total). Should fail with the typed
+    // Budget = 4096 bytes. We try to sort 1000 rows (each ~16 bytes
+    // accounted, so ~16000 bytes total). Should fail with the typed
     // error rather than an underlying allocator OOM.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2320,7 +2320,7 @@ test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
     defer tmp.cleanup();
 
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
-        .query_memory_budget = 100,
+        .query_memory_budget = 4096,
         .auto_flush_rows = std.math.maxInt(u64),
         .auto_flush_bytes = std.math.maxInt(usize),
         .auto_flush_secs = 0,
@@ -2336,14 +2336,17 @@ test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
     const t = try db.table("t", schema, .{ .order_key = &ok, .unique = true });
 
     const Row = struct { id: i64, v: i64 };
-    const rows = try allocator.alloc(Row, 100);
+    const rows = try allocator.alloc(Row, 1000);
     defer allocator.free(rows);
     for (rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .v = @intCast(100 - @as(i64, @intCast(i))) };
     try t.insert(rows);
     try t.flush();
 
     var base = try thindb.scan(allocator, t);
+    var base_owned = true;
+    defer if (base_owned) base.deinit();
     var q = try base.orderBy(&.{.{ .col = "v", .desc = false }});
+    base_owned = false;
     defer q.deinit();
 
     // Drain triggers the sort, which should overshoot the budget.

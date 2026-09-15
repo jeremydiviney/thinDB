@@ -819,6 +819,8 @@ pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
 
+    try t.ensureUsable();
+
     const sync = t.syncEnabled();
 
     // Late-tombstone reconciliation: deletes that landed on input segments
@@ -863,8 +865,8 @@ pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
 
     // Rebuild the keep-list from the CURRENT manifest. A flush may have
     // appended segments during the aside merge — those aren't in `seg_ids`,
-    // so they're preserved. Free each dropped input's owned stats; the kept
-    // entries carry theirs forward via the shallow struct copy.
+    // so they're preserved. Metadata stays owned by the old manifest until
+    // publication succeeds; an I/O failure must leave it available for retry.
     var keep: std.ArrayList(storage.ManifestEntry) = .empty;
     defer keep.deinit(t.allocator);
     try keep.ensureTotalCapacity(t.allocator, t.manifest.segments.items.len + 1);
@@ -879,10 +881,6 @@ pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
         };
         if (!is_input) {
             keep.appendAssumeCapacity(entry);
-        } else {
-            if (entry.column_stats.len > 0) t.allocator.free(entry.column_stats);
-            if (entry.column_sketches.len > 0) t.allocator.free(entry.column_sketches);
-            if (entry.key_bloom.len > 0) t.allocator.free(entry.key_bloom);
         }
     }
 
@@ -892,19 +890,33 @@ pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
         // older segments stay older.
         const insert_at = first_dropped_idx orelse keep.items.len;
         try keep.insert(t.allocator, @min(insert_at, keep.items.len), entry);
-        pending.new_entry = null; // ownership now lives in the manifest
     }
 
-    t.manifest.segments.clearRetainingCapacity();
-    try t.manifest.segments.appendSlice(t.allocator, keep.items);
-    try storage.writeManifest(t.io, t.table_dir, t.manifest, sync);
-
-    // Re-apply the late deletes to the merged output. (If the merge wrote
+    // Reconcile before publishing: failure must keep the original segments
+    // selected, where these deletes are already durable. (If the merge wrote
     // no output, every input row was already tombstoned in the snapshot, so
     // any late tombstone re-deleted an already-dropped row: nothing to do.)
     if (has_output and late_keys.count() > 0) {
         try tombstoneKeysInSegment(t, la, &late_keys, pending.new_seg_id, sync);
     }
+
+    var candidate = t.manifest;
+    candidate.segments = keep;
+    if (sync) try storage.syncDirectory(t.io, t.segments_dir);
+    try t.persistManifest(candidate, sync);
+
+    for (t.manifest.segments.items) |*entry| {
+        for (pending.seg_ids) |id| {
+            if (entry.segment_id == id) {
+                entry.deinit(t.allocator);
+                break;
+            }
+        }
+    }
+    t.manifest.segments.deinit(t.allocator);
+    t.manifest = candidate;
+    keep = .empty;
+    pending.new_entry = null;
 
     for (pending.seg_ids) |id| try t.deleteSegmentFiles(id);
 }
@@ -990,7 +1002,7 @@ fn tombstoneKeysInSegment(
     }
 
     if (hits.items.len > 0) {
-        try storage.tombstone.merge(t.allocator, t.io, t.segments_dir, seg_id, hits.items, sync);
+        try t.mergeTombstones(t.allocator, seg_id, hits.items, sync);
         t.seg_handles.invalidateTombstones(t.allocator, seg_id);
     }
 }
@@ -1048,6 +1060,28 @@ test "commitMerge re-applies deletes that land during the aside merge" {
     };
     const deleted = try t.deleteByExpr(pred);
     try std.testing.expectEqual(@as(usize, 1), deleted);
+
+    var blocked_buf: [40]u8 = undefined;
+    const blocked_tomb = try std.fmt.bufPrint(&blocked_buf, "{d:0>20}.tomb.tmp", .{pending.new_seg_id});
+    try t.segments_dir.createDir(io, blocked_tomb, .default_dir);
+    var tomb_failed = false;
+    commitMerge(t, &pending) catch {
+        tomb_failed = true;
+    };
+    try std.testing.expect(tomb_failed);
+    try std.testing.expectEqual(@as(usize, 2), t.manifest.segments.items.len);
+    try std.testing.expect(pending.new_entry != null);
+    try t.segments_dir.deleteDir(io, blocked_tomb);
+
+    try t.table_dir.createDir(io, storage.manifest.manifest_tmp_filename, .default_dir);
+    var manifest_failed = false;
+    commitMerge(t, &pending) catch {
+        manifest_failed = true;
+    };
+    try std.testing.expect(manifest_failed);
+    try std.testing.expectEqual(@as(usize, 2), t.manifest.segments.items.len);
+    try std.testing.expect(pending.new_entry != null);
+    try t.table_dir.deleteDir(io, storage.manifest.manifest_tmp_filename);
 
     try commitMerge(t, &pending);
 

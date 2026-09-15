@@ -599,6 +599,11 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchGroupTopN(root) orelse return null;
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
+    // The silo may reconstruct selected keys from source-row locations.
+    // Volatile expressions must retain the values used during grouping.
+    for (plan.derived) |d| {
+        if (@import("compute.zig").mayVary(d.expr, input.udf_registry)) return try buildOperatorGroupBy(input, table, plan);
+    }
 
     const needed = try projectedBaseColumns(input.allocator, table, input.prune_names);
     defer if (needed) |n| input.allocator.free(n);
@@ -811,7 +816,7 @@ pub fn computeDerivedFused(allocator: std.mem.Allocator, q: exec.Query, derived:
     const trace_fuse = getenv_c("THINDB_TRACE_FUSE") != null;
     if (trace_fuse) std.debug.print("[fuse] split fusable={d} serial={d}\n", .{ fusable.items.len, serial.items.len });
     if (fusable.items.len == 0) return computeSelfPushed(result, derived, udf_registry);
-    if (!try result.tryFuseCompute(fusable.items)) {
+    if (!try result.tryFuseComputeWithRegistry(fusable.items, udf_registry)) {
         if (trace_fuse) {
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
@@ -985,12 +990,12 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
     // fold) is the correct home, since states that can't merge can't parallelize.
     if (hasUdfAgg(plan.group_by.aggs)) {
         if (try v2_global_aggregate.tryBuild(input.allocator, table, .{
+            .udf_registry = input.udf_registry,
             .aggs = plan.group_by.aggs,
             .where_filter = if (plan.where_filter) |f| f.predicate else null,
             .having_filter = if (plan.having_filter) |f| f.predicate else null,
             .derived = plan.derived,
             .dop = input.effectiveDop(),
-            .udf_registry = input.udf_registry,
         })) |q| return q;
         return try buildGlobalOperatorAggregate(input, table, plan);
     }
@@ -1029,6 +1034,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
     // run on the engine-neutral hash Aggregate operator (serial fold over a parallel
     // scan), the same home GROUP_CONCAT and non-combinable UDAFs decline to above.
     if (try v2_global_aggregate.tryBuild(input.allocator, table, .{
+        .udf_registry = input.udf_registry,
         .aggs = plan.group_by.aggs,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = if (plan.having_filter) |f| f.predicate else null,

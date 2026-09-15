@@ -2,9 +2,9 @@
 //! write-tmp-then-rename so readers either see the old or new state, never a
 //! partial state.
 //!
-//! Format (v7, binary, little-endian):
+//! Format (v11, binary, little-endian; v10 remains readable):
 //!
-//!   [Header — 32 bytes]
+//!   [Header — 56 bytes]
 //!     magic "tDBM"            (4)
 //!     version u16             (2)
 //!     flags u16               (2 — reserved, written 0)
@@ -36,8 +36,9 @@
 //!   [Trailer]
 //!     magic "tDBM"            (4)
 //!
-//! No backward compatibility with older formats — version mismatches
-//! at read time are a hard error.
+//! The v10 header has no WAL checkpoint. v11 adds a 16-byte WAL generation
+//! followed by the covered physical offset (u64), so manifest publication
+//! makes recovery independent of whether subsequent WAL cleanup succeeds.
 
 const std = @import("std");
 const Io = std.Io;
@@ -48,12 +49,17 @@ const hll = @import("../util/hll.zig");
 const types = @import("../types.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-// v10: key Blooms moved out of the manifest into per-segment `<id>.bloom`
-// sidecars (#140) — entries are fixed-size again.
-pub const manifest_version: u16 = 10;
+// v11 retains v10's fixed entries and adds the WAL checkpoint to its header.
+pub const manifest_version: u16 = 11;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
-pub const header_size: usize = 32;
+pub const header_size: usize = 56;
+const legacy_header_size: usize = 32;
+
+pub const WalCheckpoint = struct {
+    generation: [16]u8 = @splat(0),
+    offset: u64 = 0,
+};
 /// Per-entry fixed prefix (excluding the per-column stats tail).
 pub const entry_prefix_size: usize = 64;
 pub const stats_slot_size: usize = 56; // i128 min + i128 max + i128 sum + u64 null_count
@@ -101,6 +107,13 @@ pub const ManifestEntry = struct {
     /// length (sized to the segment's row count). Empty on non-unique tables.
     /// Lifetime tied to the owning `Manifest`.
     key_bloom: []u8 = &.{},
+
+    pub fn deinit(self: *ManifestEntry, allocator: Allocator) void {
+        allocator.free(self.column_stats);
+        allocator.free(self.column_sketches);
+        allocator.free(self.key_bloom);
+        self.* = undefined;
+    }
 };
 
 pub const Manifest = struct {
@@ -115,6 +128,7 @@ pub const Manifest = struct {
     /// Zero when the table has no AUTO_INCREMENT column. Persists
     /// across reopens via the v5 manifest header.
     auto_inc_next: u64 = 0,
+    wal_checkpoint: WalCheckpoint = .{},
     segments: std.ArrayList(ManifestEntry),
 
     pub fn empty(allocator: Allocator, schema_fingerprint: u64, column_count: u32) Manifest {
@@ -160,6 +174,8 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
     try appendU32(m.allocator, &buf, @intCast(m.segments.items.len));
     try appendU32(m.allocator, &buf, m.column_count);
     try appendU64(m.allocator, &buf, m.auto_inc_next);
+    try buf.appendSlice(m.allocator, &m.wal_checkpoint.generation);
+    try appendU64(m.allocator, &buf, m.wal_checkpoint.offset);
 
     for (m.segments.items) |e| {
         try appendU64(m.allocator, &buf, e.segment_id);
@@ -215,11 +231,7 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
 
     try buf.appendSlice(m.allocator, &manifest_magic);
 
-    // write-tmp + (optional fsync) + atomic rename. Parent-directory fsync
-    // is skipped — NTFS rename is durable via the journal; ext4 has a small
-    // known hole closed by future WAL work.
-    try @import("storage.zig").writeFileSynced(io, dir, manifest_tmp_filename, buf.items, sync);
-    try Io.Dir.rename(dir, manifest_tmp_filename, dir, manifest_filename, io);
+    try @import("storage.zig").writeFileAtomic(io, dir, manifest_tmp_filename, manifest_filename, buf.items, sync);
 }
 
 pub fn readManifest(
@@ -234,11 +246,13 @@ pub fn readManifest(
     };
     defer allocator.free(bytes);
 
-    if (bytes.len < header_size + trailer_size) return Error.ManifestTooSmall;
+    if (bytes.len < legacy_header_size + trailer_size) return Error.ManifestTooSmall;
     if (!std.mem.eql(u8, bytes[0..4], &manifest_magic)) return Error.ManifestBadMagic;
 
     const version = format.readU16(bytes[4..6]);
-    if (version != manifest_version) return Error.ManifestUnsupportedVersion;
+    if (version != 10 and version != manifest_version) return Error.ManifestUnsupportedVersion;
+    const actual_header_size: usize = if (version == 10) legacy_header_size else header_size;
+    if (bytes.len < actual_header_size + trailer_size) return Error.ManifestTooSmall;
 
     const fp = format.readU64(bytes[8..16]);
     if (fp != schema_fingerprint) return Error.SchemaFingerprintMismatch;
@@ -246,11 +260,15 @@ pub fn readManifest(
     const count = format.readU32(bytes[16..20]);
     const column_count = format.readU32(bytes[20..24]);
     const auto_inc_next = format.readU64(bytes[24..32]);
+    const checkpoint: WalCheckpoint = if (version == 10) .{} else .{
+        .generation = bytes[32..48].*,
+        .offset = format.readU64(bytes[48..56]),
+    };
 
     // Entries are fixed-size again in v10 (blooms moved to sidecar files),
     // so the total is exact.
     const entry_size: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + sketch_slot_size);
-    const want_size: usize = header_size + @as(usize, count) * entry_size + trailer_size;
+    const want_size: usize = actual_header_size + @as(usize, count) * entry_size + trailer_size;
     if (bytes.len != want_size) return Error.ManifestCorrupt;
 
     if (!std.mem.eql(u8, bytes[bytes.len - 4 .. bytes.len], &manifest_magic)) {
@@ -268,7 +286,7 @@ pub fn readManifest(
     }
     try segments.ensureTotalCapacityPrecise(allocator, count);
 
-    var off: usize = header_size;
+    var off: usize = actual_header_size;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const segment_id = format.readU64(bytes[off .. off + 8]);
@@ -327,6 +345,7 @@ pub fn readManifest(
         .schema_fingerprint = schema_fingerprint,
         .column_count = column_count,
         .auto_inc_next = auto_inc_next,
+        .wal_checkpoint = checkpoint,
         .segments = segments,
     };
 }
@@ -487,6 +506,34 @@ test "manifest read of missing file returns empty" {
     try std.testing.expectEqual(@as(usize, 0), m.segments.items.len);
     try std.testing.expectEqual(@as(u64, 42), m.schema_fingerprint);
     try std.testing.expectEqual(@as(u64, 1), m.nextSegmentId());
+}
+
+test "manifest v10 remains readable without a WAL checkpoint" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var original = Manifest.empty(a, 1234, 0);
+    defer original.deinit();
+    original.auto_inc_next = 97;
+    original.wal_checkpoint = .{ .generation = @splat(42), .offset = 4096 };
+    try original.appendSegment(.{ .segment_id = 8, .row_count = 23 });
+    try writeManifest(io, tmp.dir, original, false);
+    const current = try tmp.dir.readFileAlloc(io, manifest_filename, a, .unlimited);
+    defer a.free(current);
+    const legacy = try a.alloc(u8, current.len - (header_size - legacy_header_size));
+    defer a.free(legacy);
+    @memcpy(legacy[0..legacy_header_size], current[0..legacy_header_size]);
+    @memcpy(legacy[legacy_header_size..], current[header_size..]);
+    std.mem.writeInt(u16, legacy[4..6], 10, .little);
+    try tmp.dir.writeFile(io, .{ .sub_path = manifest_filename, .data = legacy });
+    var read = try readManifest(a, io, tmp.dir, 1234);
+    defer read.deinit();
+    try std.testing.expectEqual(@as(u64, 97), read.auto_inc_next);
+    try std.testing.expectEqual(@as(u64, 8), read.segments.items[0].segment_id);
+    try std.testing.expectEqual(@as(u64, 23), read.segments.items[0].row_count);
+    try std.testing.expectEqual(@as(u64, 0), read.wal_checkpoint.offset);
+    try std.testing.expectEqual([_]u8{0} ** 16, read.wal_checkpoint.generation);
 }
 
 test "manifest fingerprint mismatch errors" {

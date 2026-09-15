@@ -635,6 +635,7 @@ const Leaf = union(enum) {
 };
 
 pub const ParallelScan = struct {
+    statement_lease: ?@import("../util/statement_gate.zig").StatementGate.Lease = null,
     allocator: Allocator,
     /// Table source (null for a materialized-buffer source). Used for the
     /// ddl-lock release and the explain name; the thread-safe allocator that
@@ -761,7 +762,7 @@ pub const ParallelScan = struct {
     /// freshly built workers in `buildDeferredWorkers`. `pending_schema_qs`
     /// holds one never-pulled probe Compute per layer — it owns the resolved
     /// post-fusion schema `outputSchema()` must answer in the meantime.
-    pending_computes: std.ArrayListUnmanaged([]const Derived) = .empty,
+    pending_computes: std.ArrayListUnmanaged(struct { derived: []const Derived, registry: ?*const @import("../udf.zig").UdfRegistry }) = .empty,
     pending_schema_qs: std.ArrayListUnmanaged(Query) = .empty,
     /// Stage use released early (round drain exhausted) — the buffer frees
     /// as soon as the last consumer finishes, like a MatScan drain, instead
@@ -783,6 +784,8 @@ pub const ParallelScan = struct {
         needed: ?[]const []const u8,
         max_dop: usize,
     ) !Query {
+        const statement_lease = if (table.statement_gate) |gate| try gate.acquire(false) else null;
+        errdefer if (statement_lease) |lease| lease.release();
         // Spawn up to `max_dop` workers; the CoreScheduler throttles at run time
         // (each worker leases+pins a core, blocking when the machine is full), so
         // there's no up-front global slot budget to negotiate here.
@@ -823,16 +826,21 @@ pub const ParallelScan = struct {
         // Mint or adopt the single accountant exposed to the downstream serial
         // tail. Workers get it as `injected` (they never touch it, so sharing is
         // race-free) so they don't each mint their own.
-        var acct: ?*exec.memory.MemoryAccountant = injected_acct;
+        var acct: ?*exec.memory.MemoryAccountant = injected_acct orelse exec.memory.accountantOf(allocator);
         var owns_acct = false;
-        if (injected_acct == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
+        if (acct == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
             const a = try allocator.create(exec.memory.MemoryAccountant);
             a.* = exec.memory.MemoryAccountant.initWithPool(table.query_memory_budget, table.memory_pool);
+            a.trackAllocations(table.allocator);
+            a.retainGate(table.statement_gate) catch |err| {
+                allocator.destroy(a);
+                return err;
+            };
             acct = a;
             owns_acct = true;
         }
         errdefer if (owns_acct) {
-            if (acct) |a| allocator.destroy(a);
+            if (acct) |a| a.releaseOwner(allocator);
         };
 
         // Byte-aware partition: weight each row group by the on-disk bytes of the
@@ -851,7 +859,7 @@ pub const ParallelScan = struct {
         defer if (bounds) |b| allocator.free(b);
         exec.prof.addPhase("pscan.create.byte_partition(footers)", @intCast(exec.prof.nowTicks() - t_part));
 
-        const wa = workerAlloc(table.allocator);
+        const wa = try exec.memory.trackedBackend(workerAlloc(table.allocator), acct);
         const t_workers = exec.prof.nowTicks();
         const workers = try allocator.alloc(Leaf, n_chunks);
         var built: usize = 0;
@@ -894,6 +902,7 @@ pub const ParallelScan = struct {
         self.* = .{
             .allocator = allocator,
             .table = table,
+            .statement_lease = statement_lease,
             .worker_alloc = wa,
             .stage = null,
             .workers = workers,
@@ -1123,7 +1132,8 @@ pub const ParallelScan = struct {
         // fuse, later layers stack onto the per-worker pipelines). The probe
         // Computes in pending_schema_qs stay alive — earlier compile steps
         // may hold their resolved schemas.
-        for (self.pending_computes.items, 0..) |derived, li| {
+        for (self.pending_computes.items, 0..) |pending, li| {
+            const derived = pending.derived;
             if (li == 0) {
                 const q = try self.allocator.alloc(Query, self.workers.len);
                 self.compute_q = q;
@@ -1131,12 +1141,12 @@ pub const ParallelScan = struct {
                     const sq = switch (w) {
                         inline else => |p| makeQuery(self.worker_alloc, p),
                     };
-                    q[i] = try sq.compute(derived);
+                    q[i] = try sq.computeWithRegistry(derived, pending.registry);
                     self.compute_built = i + 1;
                 }
                 self.compute_fused = true;
             } else {
-                for (self.compute_q) |*wq| wq.* = try wq.compute(derived);
+                for (self.compute_q) |*wq| wq.* = try wq.computeWithRegistry(derived, pending.registry);
             }
         }
         // A probe sink bound before the barrier already re-typed the
@@ -1150,6 +1160,11 @@ pub const ParallelScan = struct {
     }
 
     pub fn deinit(self: *ParallelScan) void {
+        const statement_lease = self.statement_lease;
+        defer if (statement_lease) |lease| lease.release();
+        const owned_accountant = if (self.owns_acct) self.acct else null;
+        const owner_allocator = self.allocator;
+        defer if (owned_accountant) |a| a.releaseOwner(owner_allocator);
         // Round-mode pool may still be parked on the barrier (query abandoned
         // before the stream drained, e.g. an error or early LIMIT). Join first.
         const t_pool = exec.prof.nowTicks();
@@ -1177,7 +1192,7 @@ pub const ParallelScan = struct {
         }
         for (self.pending_schema_qs.items) |*q| q.deinit();
         self.pending_schema_qs.deinit(self.allocator);
-        for (self.pending_computes.items) |d| self.allocator.free(d);
+        for (self.pending_computes.items) |p| self.allocator.free(p.derived);
         self.pending_computes.deinit(self.allocator);
 
         // Ownership split (compute-fused path): scans [0..compute_built) are
@@ -1215,9 +1230,6 @@ pub const ParallelScan = struct {
         if (self.stage) |s| {
             if (!self.stage_released) s.releaseUse();
         }
-        if (self.owns_acct) {
-            if (self.acct) |a| self.allocator.destroy(a);
-        }
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -1252,7 +1264,7 @@ pub const ParallelScan = struct {
     /// Declines (stays serial) for non-row-local derived (CASE / subquery / var).
     /// `compute_built` tracks construction so deinit's ownership split is correct
     /// even if a mid-build allocation fails.
-    pub fn tryFuseCompute(self: *ParallelScan, derived: []const Derived) !bool {
+    pub fn tryFuseCompute(self: *ParallelScan, derived: []const Derived, registry: ?*const @import("../udf.zig").UdfRegistry) !bool {
         if (self.stage_deferred and self.workers.len == 0) {
             // Deferred barrier not run yet: accept the offer by STASHING the
             // layer — buildDeferredWorkers wraps the workers at first pull,
@@ -1273,14 +1285,16 @@ pub const ParallelScan = struct {
             const stub = try self.allocator.create(DeferredSchemaStub);
             stub.* = .{ .alloc = self.allocator, .schema = cur_cols };
             const sq = makeQuery(self.allocator, stub);
-            var probe = sq.compute(owned) catch |e| {
+            var probe = sq.computeWithRegistry(owned, registry) catch |e| {
                 var s = sq;
                 s.deinit();
                 return e;
             };
             errdefer probe.deinit();
-            try self.pending_computes.append(self.allocator, owned);
-            try self.pending_schema_qs.append(self.allocator, probe);
+            try self.pending_computes.ensureUnusedCapacity(self.allocator, 1);
+            try self.pending_schema_qs.ensureUnusedCapacity(self.allocator, 1);
+            self.pending_computes.appendAssumeCapacity(.{ .derived = owned, .registry = registry });
+            self.pending_schema_qs.appendAssumeCapacity(probe);
             self.out_schema = probe.outputSchema();
             return true;
         }
@@ -1310,7 +1324,7 @@ pub const ParallelScan = struct {
                 if (!derivedFusable(d, cur_cols)) return false;
             }
             const q = self.compute_q;
-            for (q) |*wq| wq.* = try wq.compute(derived);
+            for (q) |*wq| wq.* = try wq.computeWithRegistry(derived, registry);
             self.out_schema = q[0].outputSchema();
             return true;
         }
@@ -1324,7 +1338,7 @@ pub const ParallelScan = struct {
             const sq = switch (w) {
                 inline else => |p| makeQuery(self.worker_alloc, p),
             };
-            q[i] = try sq.compute(derived);
+            q[i] = try sq.computeWithRegistry(derived, registry);
             self.compute_built = i + 1;
         }
         self.out_schema = q[0].outputSchema();

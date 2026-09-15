@@ -261,7 +261,7 @@ pub const VTable = struct {
     /// internally. ParallelScan accepts row-local derived (so the per-row
     /// scalar work — e.g. REGEXP_REPLACE — runs in its parallel workers); every
     /// other operator declines. A fused Filter forwards it to its upstream.
-    tryFuseCompute: *const fn (ptr: *anyopaque, derived: []const @import("compute.zig").Derived) anyerror!bool,
+    tryFuseCompute: *const fn (ptr: *anyopaque, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) anyerror!bool,
     /// Offer a PARTIAL aggregate to run inside this operator's parallel workers
     /// (two-phase GROUP BY): each worker aggregates its own slice on its own core
     /// — no cross-core feed — and emits partial groups; a serial combine aggregate
@@ -446,13 +446,20 @@ pub const Query = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     allocator: Allocator,
+    resources: ?*memory.MemoryAccountant = null,
     /// Cached at operator construction. False means no probe-fusion source is
     /// reachable through this pipeline, so speculative sink offers can skip a
     /// recursive walk that is otherwise quadratic in deep operator stacks.
     probe_fusion_reachable: bool,
 
     pub fn next(self: *Query) !?Batch {
-        return self.vtable.next(self.ptr);
+        if (self.resources) |a| try a.checkCancelled();
+        return self.vtable.next(self.ptr) catch |err| {
+            if (err == error.OutOfMemory) if (self.resources) |a| {
+                if (a.exceeded.load(.acquire)) return error.MemoryBudgetExceeded;
+            };
+            return err;
+        };
     }
 
     pub fn deinit(self: *Query) void {
@@ -492,7 +499,11 @@ pub const Query = struct {
     /// Offer a projection Compute to this operator to absorb. Returns true if it
     /// took ownership (caller becomes a pass-through). See `VTable.tryFuseCompute`.
     pub fn tryFuseCompute(self: *Query, derived: []const @import("compute.zig").Derived) !bool {
-        return self.vtable.tryFuseCompute(self.ptr, derived);
+        return self.tryFuseComputeWithRegistry(derived, null);
+    }
+
+    pub fn tryFuseComputeWithRegistry(self: *Query, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) !bool {
+        return self.vtable.tryFuseCompute(self.ptr, derived, registry);
     }
 
     /// Offer a partial aggregate to run inside this operator's parallel workers
@@ -516,8 +527,12 @@ pub const Query = struct {
     /// Per-query memory accountant. Set up by the bottom-most Scan
     /// when Table.query_memory_budget > 0. Combinators upstream
     /// inherit by calling this method on their input.
+    fn operatorAllocator(self: Query) !Allocator {
+        return memory.executionAllocator(self.allocator, self.accountant());
+    }
+
     pub fn accountant(self: Query) ?*memory.MemoryAccountant {
-        return self.vtable.accountant(self.ptr);
+        return self.resources orelse self.vtable.accountant(self.ptr);
     }
 
     pub fn explain(self: Query, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
@@ -572,34 +587,34 @@ pub const Query = struct {
     // ----- Combinators -----
 
     pub fn filter(self: Query, expr: predicate.PredicateExpr) !Query {
-        return @import("filter.zig").Filter.create(self.allocator, self, expr);
+        return @import("filter.zig").Filter.create(try self.operatorAllocator(), self, expr);
     }
 
     pub fn project(self: Query, columns: []const []const u8) !Query {
-        return @import("project_limit.zig").Project.create(self.allocator, self, columns);
+        return @import("project_limit.zig").Project.create(try self.operatorAllocator(), self, columns);
     }
 
     pub fn projectNamed(self: Query, columns: []const []const u8, output_names: []const []const u8) !Query {
-        return @import("project_limit.zig").Project.createNamed(self.allocator, self, columns, output_names);
+        return @import("project_limit.zig").Project.createNamed(try self.operatorAllocator(), self, columns, output_names);
     }
 
     pub fn limit(self: Query, n: usize) !Query {
-        return @import("project_limit.zig").Limit.create(self.allocator, self, n);
+        return @import("project_limit.zig").Limit.create(try self.operatorAllocator(), self, n);
     }
 
     pub fn limitOffset(self: Query, n: usize, offset: usize) !Query {
-        return @import("project_limit.zig").Limit.createOffset(self.allocator, self, n, offset);
+        return @import("project_limit.zig").Limit.createOffset(try self.operatorAllocator(), self, n, offset);
     }
 
     /// Aggregate over the entire upstream (no grouping).
     pub fn aggregate(self: Query, aggs: []const AggSpec) !Query {
-        return @import("aggregate.zig").Aggregate.create(self.allocator, self, &.{}, aggs, null, null);
+        return @import("aggregate.zig").Aggregate.create(try self.operatorAllocator(), self, &.{}, aggs, null, null);
     }
 
     /// Hash-grouped aggregation. `group_cols` lists the upstream columns to
     /// group by; one output row is emitted per distinct group.
     pub fn groupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec) !Query {
-        return @import("aggregate.zig").Aggregate.create(self.allocator, self, group_cols, aggs, null, null);
+        return @import("aggregate.zig").Aggregate.create(try self.operatorAllocator(), self, group_cols, aggs, null, null);
     }
 
     /// Hash GROUP BY with an optional top-k hint (set when this aggregate is
@@ -611,13 +626,13 @@ pub const Query = struct {
     pub fn groupByTopK(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("../ir/ir.zig").Op.TopK, emit_limit: ?u32) !Query {
         const agg = @import("aggregate.zig");
         const t = top_k orelse
-            return agg.Aggregate.create(self.allocator, self, group_cols, aggs, null, emit_limit);
+            return agg.Aggregate.create(try self.operatorAllocator(), self, group_cols, aggs, null, emit_limit);
         // The hint's keys are resolved (to agg indices) synchronously inside
         // create, so this temporary translation array need only outlive the call.
         const keys = try self.allocator.alloc(agg.TopKKey, t.keys.len);
         defer self.allocator.free(keys);
         for (t.keys, keys) |src, *dst| dst.* = .{ .col = src.col, .desc = src.desc };
-        return agg.Aggregate.create(self.allocator, self, group_cols, aggs, agg.TopKHint{ .k = t.k, .keys = keys }, emit_limit);
+        return agg.Aggregate.create(try self.operatorAllocator(), self, group_cols, aggs, agg.TopKHint{ .k = t.k, .keys = keys }, emit_limit);
     }
 
     /// Radix-partitioned hash aggregation over a compact fixed-state core.
@@ -626,14 +641,14 @@ pub const Query = struct {
     /// only the k most-preferred groups; the downstream OrderBy+Limit still
     /// finalizes exact order. The router gates eligibility before calling.
     pub fn radixGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("radix_aggregate.zig").TopK) !Query {
-        return @import("radix_aggregate.zig").RadixAggregate.create(self.allocator, self, group_cols, aggs, top_k);
+        return @import("radix_aggregate.zig").RadixAggregate.create(try self.operatorAllocator(), self, group_cols, aggs, top_k);
     }
 
     /// Parallel partition+lease grouped aggregation (high-card path). Same
     /// eligibility as radixGroupBy (int key ≤128 bits, fixed-state aggs) but
     /// partitions rows into buckets and aggregates them across `dop` threads.
     pub fn leaseGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("radix_aggregate.zig").TopK, dop: usize) !Query {
-        return @import("radix_aggregate.zig").RadixLeaseAggregate.create(self.allocator, self, group_cols, aggs, top_k, dop);
+        return @import("radix_aggregate.zig").RadixLeaseAggregate.create(try self.operatorAllocator(), self, group_cols, aggs, top_k, dop);
     }
 
     /// Streaming sort-based grouped aggregation. Requires the input to be
@@ -641,7 +656,7 @@ pub const Query = struct {
     /// group's state at a time (O(1) in cardinality). Caller (planner)
     /// must verify the sortedness precondition via `stats().sort_state`.
     pub fn streamGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec) !Query {
-        return @import("aggregate.zig").SortedAggregate.create(self.allocator, self, group_cols, aggs);
+        return @import("aggregate.zig").SortedAggregate.create(try self.operatorAllocator(), self, group_cols, aggs);
     }
 
     pub fn udfGroupBy(
@@ -650,20 +665,20 @@ pub const Query = struct {
         aggs: []const AggSpec,
         udf_registry: *const @import("../udf.zig").UdfRegistry,
     ) !Query {
-        return @import("udf_aggregate.zig").UdfAggregate.create(self.allocator, self, group_cols, aggs, udf_registry);
+        return @import("udf_aggregate.zig").UdfAggregate.create(try self.operatorAllocator(), self, group_cols, aggs, udf_registry);
     }
 
     /// Sort upstream rows by `sort_specs` (multi-column, ASC/DESC per key).
     /// Blocking — materializes all upstream rows before emitting any output.
     pub fn orderBy(self: Query, sort_specs: []const SortSpec) !Query {
-        return @import("sort.zig").Sort.create(self.allocator, self, sort_specs);
+        return @import("sort.zig").Sort.create(try self.operatorAllocator(), self, sort_specs) catch |err| return memory.allocationError(self.accountant(), err);
     }
 
     /// Bounded `ORDER BY ... LIMIT limit OFFSET offset` — keeps only the
     /// `limit + offset` rows it might emit instead of materializing the
     /// whole input. The planner fuses `Limit(OrderBy(X))` into this.
     pub fn topN(self: Query, sort_specs: []const SortSpec, n: usize, offset: usize) !Query {
-        return @import("topn.zig").TopN.create(self.allocator, self, sort_specs, n, offset);
+        return @import("topn.zig").TopN.create(try self.operatorAllocator(), self, sort_specs, n, offset);
     }
 
     /// Add derived columns via scalar function calls. Each `Derived`
@@ -671,7 +686,7 @@ pub const Query = struct {
     /// function on upstream columns (v1: no nesting). Output schema
     /// extends the upstream schema with these new columns appended.
     pub fn compute(self: Query, derived: []const @import("compute.zig").Derived) !Query {
-        return @import("compute.zig").Compute.create(self.allocator, self, derived);
+        return @import("compute.zig").Compute.create(try self.operatorAllocator(), self, derived);
     }
 
     pub fn computeWithRegistry(
@@ -679,7 +694,7 @@ pub const Query = struct {
         derived: []const @import("compute.zig").Derived,
         udf_registry: ?*const @import("../udf.zig").UdfRegistry,
     ) !Query {
-        return @import("compute.zig").Compute.createWithRegistry(self.allocator, self, derived, udf_registry);
+        return @import("compute.zig").Compute.createWithRegistry(try self.operatorAllocator(), self, derived, udf_registry);
     }
 
     /// Window function step. `specs` is the list of unique window
@@ -694,7 +709,7 @@ pub const Query = struct {
         calls: []const @import("../ir/ir.zig").WindowCall,
         dop: usize,
     ) !Query {
-        return @import("window.zig").Window.create(self.allocator, self, specs, calls, dop);
+        return @import("window.zig").Window.create(try self.operatorAllocator(), self, specs, calls, dop);
     }
 
     /// Inner equi-join with `other`. Output schema is this side's
@@ -703,7 +718,7 @@ pub const Query = struct {
     /// is hash join in v1 — build side is whichever has the smaller
     /// upper-bound row count.
     pub fn join(self: Query, other: Query, spec: @import("join.zig").Spec) !Query {
-        return @import("join.zig").Join.create(self.allocator, self, other, spec);
+        return @import("join.zig").Join.create(try self.operatorAllocator(), self, other, spec);
     }
 
     /// `f` is either a function taking `Query` and returning `!Query`, or a
@@ -727,6 +742,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
         .ptr = op,
         .vtable = &OpWrapper(Op).vt,
         .allocator = allocator,
+        .resources = memory.accountantOf(allocator) orelse (if (@hasDecl(Op, "accountant")) op.accountant() else null),
         .probe_fusion_reachable = probe_fusion_reachable,
     };
 }
@@ -804,10 +820,10 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.tryFuseFilter(expr);
         }
-        fn tryFuseComputeWrap(ptr: *anyopaque, derived: []const @import("compute.zig").Derived) anyerror!bool {
+        fn tryFuseComputeWrap(ptr: *anyopaque, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) anyerror!bool {
             if (!@hasDecl(Op, "tryFuseCompute")) return false;
             const o: *Op = @ptrCast(@alignCast(ptr));
-            return o.tryFuseCompute(derived);
+            return o.tryFuseCompute(derived, registry);
         }
         fn tryFuseAggregateWrap(ptr: *anyopaque, group_cols: []const []const u8, aggs: []const AggSpec) anyerror!bool {
             if (!@hasDecl(Op, "tryFuseAggregate")) return false;
@@ -907,6 +923,8 @@ pub const MinMaxStatsSpec = @import("agg_stats.zig").Spec;
 /// column stats instead of scanning. Returns null when the shortcut can't
 /// apply (caller compiles the normal scan+aggregate). See `agg_stats.zig`.
 pub fn minMaxStats(allocator: Allocator, table: *Table, specs: []const MinMaxStatsSpec) !?Query {
+    const lease = if (table.statement_gate) |gate| try gate.acquire(false) else null;
+    defer if (lease) |l| l.release();
     return @import("agg_stats.zig").MinMaxStats.create(allocator, table, specs);
 }
 
@@ -918,6 +936,8 @@ pub const MetaAggSpec = @import("agg_stats.zig").MetaSpec;
 /// on tombstones, unflushed rows, or inexact stats — the SHAPE gate (no
 /// WHERE/GROUP BY/HAVING/derived) is the caller's job. See `agg_stats.zig`.
 pub fn metaAggStats(allocator: Allocator, table: *Table, specs: []const MetaAggSpec) !?Query {
+    const lease = if (table.statement_gate) |gate| try gate.acquire(false) else null;
+    defer if (lease) |l| l.release();
     return @import("agg_stats.zig").MetaAggStats.create(allocator, table, specs);
 }
 

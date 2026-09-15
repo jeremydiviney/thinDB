@@ -27,6 +27,13 @@ pub const Error = error{
     /// acknowledged rows that replay would never see; the table refuses to
     /// open until an operator moves the log into place or aside.
     WalOrphaned,
+    XaBranchTooLarge,
+    XaInvalidXid,
+    DatabaseInUse,
+    TableBusy,
+    RecoveryRequired,
+    DurabilityUncertain,
+    DatabaseClosed,
 };
 
 pub const SyncMode = enum { none, per_flush };
@@ -76,6 +83,7 @@ pub const AlterOp = union(enum) {
 };
 
 pub const Config = struct {
+    statement_gate: ?*@import("../util/statement_gate.zig").StatementGate = null,
     /// Default rows per row-group in flushed segments.
     row_group_size: usize = 65_536,
 
