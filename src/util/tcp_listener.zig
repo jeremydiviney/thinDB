@@ -31,7 +31,8 @@ const Io = std.Io;
 pub fn listen(address: *const Io.net.IpAddress, io: Io) !Io.net.Server {
     if (builtin.os.tag == .windows) return listenWindows(address, io);
     const p = std.posix;
-    const cloexec = if (@hasDecl(p.SOCK, "CLOEXEC")) p.SOCK.CLOEXEC else 0;
+    // Darwin defines Zig compatibility flags that its socket syscall rejects.
+    const cloexec = if (Io.Threaded.socket_flags_unsupported) 0 else p.SOCK.CLOEXEC;
     const fd = p.system.socket(Io.Threaded.posixAddressFamily(address), p.SOCK.STREAM | cloexec, p.IPPROTO.TCP);
     if (fd < 0) return error.SystemResources;
     errdefer _ = p.system.close(fd);
