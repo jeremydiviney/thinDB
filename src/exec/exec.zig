@@ -10,6 +10,10 @@
 //! caring how the operators are split internally.
 
 const std = @import("std");
+
+test {
+    _ = @import("v2_global_aggregate.zig");
+}
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");

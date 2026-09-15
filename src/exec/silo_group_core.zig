@@ -1368,17 +1368,91 @@ const StateRef = struct {
     slots: []i64,
 };
 
-// Per-bucket group accumulator store. Replaces ArrayListUnmanaged(State): the
-// per-group slot count is a runtime value (`n_slots`), so the record stride is
-// computed once per query from the aggregate program rather than baked into a
-// fixed array. gid is a dense 0..len index (the GroupTable maps key→gid).
+const PendingCountUpdates = struct {
+    const CAPACITY = 16;
+    const MIN_STATE_BYTES = 2 * 1024 * 1024;
+    heads: [CAPACITY]*StateHead = undefined,
+    counts: [CAPACITY]u64 = undefined,
+    len: usize = 0,
+    next: usize = 0,
+
+    fn append(self: *PendingCountUpdates, head: *StateHead, count: u64) void {
+        @prefetch(&head.count, .{ .rw = .write, .locality = 1 });
+        if (self.len == CAPACITY) {
+            self.heads[self.next].count += self.counts[self.next];
+        } else {
+            self.len += 1;
+        }
+        self.heads[self.next] = head;
+        self.counts[self.next] = count;
+        self.next = (self.next + 1) % CAPACITY;
+    }
+
+    fn flush(self: *PendingCountUpdates) void {
+        for (self.heads[0..self.len], self.counts[0..self.len]) |head, count| head.count += count;
+        self.len = 0;
+        self.next = 0;
+    }
+};
+
+test "count update pipeline preserves repeated keys weights and partial batches" {
+    var heads = [_]StateHead{.{}} ** 127;
+    var expected = [_]u64{0} ** heads.len;
+    var pending: PendingCountUpdates = .{};
+    for (0..1003) |i| {
+        const index = if (i % 3 == 0) 7 else (i * 37) % heads.len;
+        const count: u64 = if (i % 11 == 0) @as(u64, std.math.maxInt(u32)) + 7 else i % 11 + 1;
+        pending.append(&heads[index], count);
+        expected[index] += count;
+        if (i % 257 == 0) pending.flush();
+    }
+    pending.flush();
+    pending.flush();
+    for (heads, expected) |head, count| try std.testing.expectEqual(count, head.count);
+}
+
+test "count update pipeline folds exact results below and above the live state threshold" {
+    const allocator = std.testing.allocator;
+    inline for (.{ @as(usize, 1024), @as(usize, 70_000) }) |group_count| {
+        var bucket = try PipeBucket.init(allocator, 16);
+        defer bucket.deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        var rows: GroupRows = .{};
+        defer rows.deinit(allocator);
+        const layout = GroupRowsLayout{ .key_width = .u64, .columns = &.{}, .aggregates = &.{.{ .op = .count_star, .state_index = 0 }}, .has_weight = true };
+        for (1..4) |weight| {
+            var offset: usize = 0;
+            while (offset < group_count) {
+                const count = @min(4096, group_count - offset);
+                try rows.resize(allocator, layout, count);
+                for (0..count) |i| {
+                    rows.setKey(i, (@as(u128, 1) << 40) + offset + i);
+                    rows.weightAll()[i] = @intCast(weight);
+                }
+                try bucket.fold_rows(allocator, &scratch, rows, group_count * 6);
+                offset += count;
+            }
+        }
+        try std.testing.expectEqual(group_count, bucket.states.len);
+        for (0..group_count) |i| {
+            try std.testing.expectEqual((@as(u128, 1) << 40) + i, bucket.states.head(i).key);
+            try std.testing.expectEqual(@as(u64, 6), bucket.states.head(i).count);
+        }
+    }
+}
+
+// Record stride follows the aggregate program; key and state widths do not
+// change. Fixed-size pages avoid relocating live groups during growth.
 const StateSlab = struct {
-    bytes: []align(16) u8 = &.{},
+    pages: std.ArrayListUnmanaged([]align(16) u8) = .empty,
     len: usize = 0,
     cap: usize = 0,
     n_slots: usize = 0,
     stride: usize = 0,
     reserve_hint: usize = 0,
+
+    const PAGE_ROWS = 8192;
 
     fn strideFor(n_slots: usize) usize {
         return std.mem.alignForward(usize, STATE_HEAD_BYTES + n_slots * @sizeOf(i64), 16);
@@ -1387,38 +1461,59 @@ const StateSlab = struct {
     // A layout change invalidates the old records even when capacity suffices.
     fn prepare(self: *StateSlab, allocator: Allocator, n_slots: usize) !void {
         if (self.stride != 0 and self.n_slots == n_slots) return;
-        if (self.bytes.len > 0) allocator.free(self.bytes);
-        self.bytes = &.{};
-        self.len = 0;
-        self.cap = 0;
+        const reserve_hint = self.reserve_hint;
+        self.deinit(allocator);
+        self.reserve_hint = reserve_hint;
         self.n_slots = n_slots;
         self.stride = strideFor(n_slots);
-        if (self.reserve_hint > 0) try self.growTo(allocator, self.reserve_hint);
+        if (self.reserve_hint > 0) try self.growTo(allocator, @min(self.reserve_hint, PAGE_ROWS));
     }
 
     fn growTo(self: *StateSlab, allocator: Allocator, records: usize) !void {
         if (records <= self.cap) return;
-        const next = try allocator.alignedAlloc(u8, .@"16", records * self.stride);
-        if (self.len > 0) @memcpy(next[0 .. self.len * self.stride], self.bytes[0 .. self.len * self.stride]);
-        if (self.bytes.len > 0) allocator.free(self.bytes);
-        self.bytes = next;
-        self.cap = records;
+        if (self.pages.items.len == 0) {
+            const first_rows = try std.math.ceilPowerOfTwo(usize, @max(8, @min(records, PAGE_ROWS)));
+            try self.pages.ensureUnusedCapacity(allocator, 1);
+            const page = try allocator.alignedAlloc(u8, .@"16", first_rows * self.stride);
+            errdefer allocator.free(page);
+            self.pages.appendAssumeCapacity(page);
+            self.cap = first_rows;
+        }
+        // Only the bounded first page can move; established full pages keep
+        // their records in place as the group count grows.
+        if (records > self.cap and self.cap < PAGE_ROWS) {
+            const page = try allocator.alignedAlloc(u8, .@"16", PAGE_ROWS * self.stride);
+            errdefer allocator.free(page);
+            @memcpy(page[0 .. self.len * self.stride], self.pages.items[0][0 .. self.len * self.stride]);
+            allocator.free(self.pages.items[0]);
+            self.pages.items[0] = page;
+            self.cap = PAGE_ROWS;
+        }
+        while (self.cap < records) {
+            try self.pages.ensureUnusedCapacity(allocator, 1);
+            const page = try allocator.alignedAlloc(u8, .@"16", PAGE_ROWS * self.stride);
+            errdefer allocator.free(page);
+            self.pages.appendAssumeCapacity(page);
+            self.cap += PAGE_ROWS;
+        }
     }
 
-    fn ensureUnusedCapacity(self: *StateSlab, allocator: Allocator, additional: usize, reservation: usize) !void {
+    fn ensureUnusedCapacity(self: *StateSlab, allocator: Allocator, additional: usize) !void {
         const need = self.len + additional;
         if (need <= self.cap) return;
-        var new_cap = if (self.cap == 0) @as(usize, 8) else self.cap * 2;
-        while (new_cap < need) new_cap *= 2;
-        try self.growTo(allocator, @max(new_cap, reservation));
+        try self.growTo(allocator, need);
+    }
+
+    inline fn record_ptr(self: StateSlab, gid: usize) [*]u8 {
+        return self.pages.items[gid / PAGE_ROWS].ptr + (gid % PAGE_ROWS) * self.stride;
     }
 
     inline fn head(self: StateSlab, gid: usize) *StateHead {
-        return @ptrCast(@alignCast(self.bytes.ptr + gid * self.stride));
+        return @ptrCast(@alignCast(self.record_ptr(gid)));
     }
 
     inline fn slotsOf(self: StateSlab, gid: usize) []i64 {
-        const p = self.bytes.ptr + gid * self.stride + STATE_HEAD_BYTES;
+        const p = self.record_ptr(gid) + STATE_HEAD_BYTES;
         return @as([*]i64, @ptrCast(@alignCast(p)))[0..self.n_slots];
     }
 
@@ -1430,7 +1525,7 @@ const StateSlab = struct {
     // gid. Caller has ensured capacity.
     inline fn pushAssumeCapacity(self: *StateSlab) u32 {
         const gid: u32 = @intCast(self.len);
-        const base = self.bytes.ptr + self.len * self.stride;
+        const base = self.record_ptr(self.len);
         @memset(base[0..self.stride], 0);
         self.len += 1;
         return gid;
@@ -1441,10 +1536,56 @@ const StateSlab = struct {
     }
 
     fn deinit(self: *StateSlab, allocator: Allocator) void {
-        if (self.bytes.len > 0) allocator.free(self.bytes);
+        for (self.pages.items) |page| allocator.free(page);
+        self.pages.deinit(allocator);
         self.* = .{};
     }
 };
+
+test "encoded machinery paged group state preserves records and clears reused slots" {
+    const allocator = std.testing.allocator;
+    var states: StateSlab = .{};
+    defer states.deinit(allocator);
+    try states.prepare(allocator, 2);
+    try states.ensureUnusedCapacity(allocator, StateSlab.PAGE_ROWS);
+    for (0..StateSlab.PAGE_ROWS) |i| {
+        const gid = states.pushAssumeCapacity();
+        states.head(gid).key = @as(u128, i) << 70;
+        states.head(gid).count = i + 1;
+        states.slotsOf(gid)[0] = -@as(i64, @intCast(i));
+    }
+    const first = states.head(0);
+    try states.ensureUnusedCapacity(allocator, StateSlab.PAGE_ROWS + 1);
+    try std.testing.expect(first == states.head(0));
+    for (0..StateSlab.PAGE_ROWS) |i| {
+        try std.testing.expectEqual(@as(u128, i) << 70, states.head(i).key);
+        try std.testing.expectEqual(@as(u64, i + 1), states.head(i).count);
+        try std.testing.expectEqual(-@as(i64, @intCast(i)), states.slotsOf(i)[0]);
+    }
+    const next = states.pushAssumeCapacity();
+    try std.testing.expectEqual(@as(u64, 0), states.head(next).count);
+    states.clearRetainingCapacity();
+    const reused = states.pushAssumeCapacity();
+    try std.testing.expectEqual(@as(u128, 0), states.head(reused).key);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 0 }, states.slotsOf(reused));
+    try states.prepare(allocator, 1);
+    try std.testing.expectEqual(@as(usize, 0), states.cap);
+    try states.ensureUnusedCapacity(allocator, 1);
+    try std.testing.expect(states.cap <= StateSlab.PAGE_ROWS);
+}
+
+fn test_state_growth_failure(allocator: Allocator) !void {
+    var states: StateSlab = .{};
+    defer states.deinit(allocator);
+    try states.prepare(allocator, 1);
+    try states.ensureUnusedCapacity(allocator, 3);
+    _ = states.pushAssumeCapacity();
+    try states.ensureUnusedCapacity(allocator, StateSlab.PAGE_ROWS * 2);
+}
+
+test "encoded machinery paged group state allocation failures release ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, test_state_growth_failure, .{});
+}
 
 // Per-group running MIN/MAX bytes for a string aggregate. Kept in a side array
 // parallel to a bucket's `states` (NOT in `State`, which would bloat the
@@ -1625,7 +1766,7 @@ const PipeBucket = struct {
         defer scratch.deinit(allocator);
         try bucket.fold_rows(allocator, &scratch, .{}, 1_000_000);
         try std.testing.expectEqual(group_table.capacityFor(PIPE_CHUNK_ROWS), bucket.table.slots.len);
-        try std.testing.expectEqual(@as(usize, 0), bucket.states.bytes.len);
+        try std.testing.expectEqual(@as(usize, 0), bucket.states.cap);
         try std.testing.expectEqual(@as(u64, 0), bucket.observed_input_rows);
     }
 
@@ -1940,7 +2081,7 @@ test "group completion waits for a delayed partial before collecting top rows an
     try std.testing.expectEqual(@as(usize, 0), shared.stage_outstanding_chunks.load(.acquire));
     try std.testing.expect(!shared.grouping_complete());
 
-    try std.testing.expect(try flushSharedStageBuilders(&shared, &local, 32768, false));
+    try std.testing.expect(try flushSharedStageBuilders(&shared, &local, false));
     try std.testing.expect(!shared.grouping_complete());
     var ticks: i64 = 0;
     var chunks: u64 = 0;
@@ -2003,7 +2144,7 @@ fn partial_flush_failure_fixture(allocator: Allocator) !void {
     shared.pending_group_rows.store(32, .release);
     shared.scans_done.store(1, .release);
 
-    const flushed = flushSharedStageBuilders(&shared, &local, 64, false);
+    const flushed = flushSharedStageBuilders(&shared, &local, false);
     try std.testing.expect(builder.lock.tryLock());
     builder.lock.unlock();
     try std.testing.expect(!shared.grouping_complete());
@@ -3078,6 +3219,15 @@ const TopSet = struct {
     fn deinit(self: *TopSet, allocator: Allocator) void {
         allocator.free(self.items);
         self.* = .{};
+    }
+
+    fn consider_state(self: *TopSet, state: StateRef) void {
+        if (self.items.len == 0) return;
+        if (self.len == self.items.len) {
+            const worst_row = self.items[0];
+            if (state.head.count < worst_row.count or (state.head.count == worst_row.count and state.head.key >= worst_row.key)) return;
+        }
+        self.consider(topRowFromState(state));
     }
 
     fn consider(self: *TopSet, cand: TopRow) void {
@@ -4362,9 +4512,7 @@ fn groupChunkRowsDirect(
         try table.grow(allocator, n);
         if (allocation_profile) |profile| profile.table_growths += 1;
     }
-    // A low forecast must not turn geometric growth into repeated
-    // batch-sized copies with a larger final slab than ordinary doubling.
-    try states.ensureUnusedCapacity(allocator, n, reservation);
+    try states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_concat) try concat_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_udf) try udf_states.ensureUnusedCapacity(allocator, n);
@@ -4560,6 +4708,39 @@ fn groupChunkRowsDirectKeysCountSumAvg(
     }
 }
 
+fn group_count_prefetched(comptime width: GroupKeyWidth, table: *GroupTable, states: *StateSlab, keys: anytype, key_hi: []const u32, n: usize, weights: []const u32, rowrefs: []const i64) void {
+    var pending: PendingCountUpdates = .{};
+    var r: usize = 0;
+    while (r < n) {
+        const pf = r + PREFETCH_DIST_BUCKET;
+        if (pf < n) {
+            const key = groupKeyAt(width, keys, key_hi, pf);
+            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(key))), .{ .rw = .write, .locality = 1 });
+        }
+        const key = groupKeyAt(width, keys, key_hi, r);
+        var end = r + 1;
+        while (end < n and groupKeyAt(width, keys, key_hi, end) == key) end += 1;
+        const count: u64 = if (weights.len == 0) end - r else blk: {
+            var sum: u64 = 0;
+            for (weights[r..end]) |weight| sum += weight;
+            break :blk sum;
+        };
+        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        if (probe.found) {
+            pending.append(states.head(probe.gid), count);
+        } else {
+            const gid = states.pushAssumeCapacity();
+            const head = states.head(gid);
+            head.key = key;
+            head.count = count;
+            if (rowrefs.len != 0) head.rowref = rowrefs[r];
+            table.commit(probe.slot, key, gid);
+        }
+        r = end;
+    }
+    pending.flush();
+}
+
 fn groupChunkRowsDirectKeys(
     comptime key_width: GroupKeyWidth,
     table: *GroupTable,
@@ -4624,6 +4805,15 @@ fn groupChunkRowsDirectKeys(
     }
     if (!kernelizable) {
         return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
+    }
+
+    // Keep the small-state and mixed-aggregate loops independent of the
+    // deferred count buffer's branches and live registers.
+    if (!needs_kernels and !has_mirror and !has_distinct and !has_str and !has_concat and !rows.layout.has_udf and
+        states.len * states.stride >= PendingCountUpdates.MIN_STATE_BYTES)
+    {
+        group_count_prefetched(key_width, table, states, keys, key_hi, n, if (rows.layout.has_weight) rows.weightAll()[0..n] else &.{}, rowrefs);
+        return;
     }
 
     // The gid array feeds the aggregate kernels and the COUNT(DISTINCT) pass 2
@@ -4825,7 +5015,7 @@ const NEW_GID_BIT: u32 = 1 << 31;
 const PREFETCH_DIST_STATES: usize = 24;
 
 inline fn prefetchStateSlots(states: *const StateSlab, gid: u32) void {
-    @prefetch(states.bytes.ptr + @as(usize, gid) * states.stride + STATE_HEAD_BYTES, .{ .rw = .write, .locality = 1 });
+    @prefetch(states.record_ptr(gid) + STATE_HEAD_BYTES, .{ .rw = .write, .locality = 1 });
 }
 
 // COUNT aggregates aimed at a numeric slot (state_index != 0) mirror the
@@ -5147,20 +5337,17 @@ fn publishSharedStageBuilderLocked(
     shared: *PipeShared,
     builder: *StageBucketBuilder,
     bucket_idx: usize,
-    raw_group_chunk_rows: usize,
     queue_lock_ticks: ?*i64,
-    recycle_lock_ticks: ?*i64,
 ) !void {
     if (bucket_idx >= shared.raw_group_queues.len) return;
     const row_count = builder.rows.len();
     if (row_count == 0) return;
 
     const rows = builder.rows;
-    builder.rows = try acquireGroupRows(shared, raw_group_chunk_rows, recycle_lock_ticks);
-    errdefer {
-        builder.rows.deinit(shared.allocator);
-        builder.rows = rows;
-    }
+    // A replacement is acquired by the next append. Final publication must
+    // not allocate an empty chunk that will only be torn down.
+    builder.rows = .{};
+    errdefer builder.rows = rows;
     try publishGroupChunkToQueue(
         shared,
         &shared.raw_group_queues[bucket_idx],
@@ -5195,7 +5382,7 @@ fn appendSharedStageBuilderRawSlice(
             builder.rows = try acquireGroupRows(shared, raw_group_chunk_rows, &local.raw_recycle_lock_ticks);
         }
         if (builder.rows.len() >= raw_group_chunk_rows) {
-            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
+            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, &local.raw_group_queue_lock_ticks);
             continue;
         }
 
@@ -5206,7 +5393,7 @@ fn appendSharedStageBuilderRawSlice(
         pos += take;
 
         if (builder.rows.len() >= raw_group_chunk_rows) {
-            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
+            try publishSharedStageBuilderLocked(shared, builder, bucket_idx, &local.raw_group_queue_lock_ticks);
         }
     }
 }
@@ -5214,7 +5401,6 @@ fn appendSharedStageBuilderRawSlice(
 fn flushSharedStageBuilders(
     shared: *PipeShared,
     local: *WorkerParts,
-    raw_group_chunk_rows: usize,
     profile: bool,
 ) !bool {
     if (shared.stage_builder_rows.load(.acquire) == 0) return false;
@@ -5228,7 +5414,7 @@ fn flushSharedStageBuilders(
         defer builder.lock.unlock();
         if (profile) local.raw_stage_builder_lock_ticks += platform.nowTicks() - lock_t0;
         if (builder.rows.len() > 0) {
-            try publishSharedStageBuilderLocked(shared, builder, b, raw_group_chunk_rows, &local.raw_group_queue_lock_ticks, &local.raw_recycle_lock_ticks);
+            try publishSharedStageBuilderLocked(shared, builder, b, &local.raw_group_queue_lock_ticks);
             flushed = true;
         }
     }
@@ -5486,7 +5672,7 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
             }
         } else {
             var gid: usize = 0;
-            while (gid < bkt.states.len) : (gid += 1) top_out.consider(topRowFromState(bkt.states.ref(gid)));
+            while (gid < bkt.states.len) : (gid += 1) top_out.consider_state(bkt.states.ref(gid));
         }
     }
     if (profile) top_ticks.* += platform.nowTicks() - top_t0;
@@ -5609,6 +5795,31 @@ fn openGridScanTile(job: SiloGridJob, tile: ScanTile) void {
     job.local.scan_tiles += 1;
 }
 
+const EncodedCountGroups = struct {
+    job: SiloGridJob,
+    route_ticks: i64 = 0,
+
+    pub fn consume(self: *EncodedCountGroups, batch: @import("scan.zig").EncodedBatch) !bool {
+        const layout = self.job.shared.group_rows_layout;
+        for (layout.key_columns) |part| {
+            const idx = batch.column_index(part.name) orelse return false;
+            if (batch.schema[idx].nullable or batch.blocks[idx].encoding != .rle) return false;
+            switch (part.typ) {
+                .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => {},
+                else => return false,
+            }
+        }
+        const runs = try self.job.scan.encoded_runs(batch);
+        var key_runs: [MAX_GENERIC_GROUP_KEYS]thindb.exec.RunsColumn = undefined;
+        for (layout.key_columns, 0..) |part, i| key_runs[i] = runs[batch.column_index(part.name).?].?;
+        const t0 = if (self.job.profile) platform.nowTicks() else 0;
+        if (self.job.local.raw_active_rows.capacity() == 0) self.job.local.raw_active_rows = try acquireRawRows(self.job.shared, self.job.raw_chunk_rows, &self.job.local.raw_recycle_lock_ticks);
+        try appendBatchRunsWeighted(self.job.local, self.job.shared, batch.row_count, layout, key_runs[0..layout.key_columns.len], &.{}, self.job.raw_chunk_rows, self.job.profile);
+        if (self.job.profile) self.route_ticks += platform.nowTicks() - t0;
+        return true;
+    }
+};
+
 fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *bool) !void {
     const claim_t0 = if (job.profile) platform.nowTicks() else 0;
     const tile = claimScanTile(job) orelse {
@@ -5623,8 +5834,20 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
     openGridScanTile(job, tile);
 
     job.local.scan_quanta += 1;
+    const layout = job.shared.group_rows_layout;
+    const encoded = job.drive.ptr == @as(*anyopaque, job.scan) and layout.has_weight and !layout.has_rowref and
+        !layout.hashed_key and !layout.has_str_payload and layout.columns.len == 0 and
+        layout.key_columns.len > 0 and layout.key_columns.len <= MAX_GENERIC_GROUP_KEYS and !job.shared.generic_filter_required;
     while (true) {
         const t0 = if (job.profile) platform.nowTicks() else 0;
+        if (encoded) {
+            var consumer = EncodedCountGroups{ .job = job };
+            if (try job.scan.consume_encoded(&consumer)) {
+                if (job.profile) job.local.scan_ticks += platform.nowTicks() - t0 - consumer.route_ticks;
+                job.local.scan_batches += 1;
+                continue;
+            }
+        }
         const maybe_batch = try job.drive.next();
         if (job.profile) job.local.scan_ticks += platform.nowTicks() - t0;
         const batch = maybe_batch orelse break;
@@ -5758,7 +5981,7 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                 job.shared.active_stage_jobs.load(.acquire) == 0;
             const has_stage_partials = job.shared.stage_builder_rows.load(.acquire) > 0;
             if (no_more_stage_input and has_stage_partials) {
-                const flushed = try flushSharedStageBuilders(job.shared, job.local, job.raw_group_chunk_rows, job.profile);
+                const flushed = try flushSharedStageBuilders(job.shared, job.local, job.profile);
                 if (flushed) {
                     idle_spins = 0;
                     continue;
@@ -6461,7 +6684,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (buckets) |bucket| {
             hash_bytes += std.mem.sliceAsBytes(bucket.table.slots).len;
             state_capacity += bucket.states.cap;
-            state_bytes += bucket.states.bytes.len;
+            state_bytes += bucket.states.cap * bucket.states.stride;
             allocation_ticks += bucket.allocation_profile.ticks;
             table_growths += bucket.allocation_profile.table_growths;
         }

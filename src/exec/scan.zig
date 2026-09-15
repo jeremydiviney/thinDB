@@ -28,6 +28,16 @@ const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
+pub const EncodedBatch = struct {
+    schema: []const Column,
+    blocks: []const storage.ReadSegment.BorrowedBlock,
+    row_count: u32,
+
+    pub fn column_index(self: EncodedBatch, name: []const u8) ?usize {
+        return types.findColumn(self.schema, name);
+    }
+};
+
 /// Slice a full-row-group `ColumnView` down to rows `[off, off+n)` for the scan
 /// sub-batch experiment. `off` is a multiple of 64 (the sub-batch stride), so a
 /// nullable column's bitmap slices on a byte boundary. Fixed-width slices the
@@ -1738,6 +1748,72 @@ pub const Scan = struct {
         for (self.decoded[0..self.views.len], 0..) |c, i| self.views[i] = subView(c.view(), self.sub_off, n);
         self.sub_off += n;
         return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(n) };
+    }
+
+    /// The consumer must decline before changing its state. Borrowed blocks
+    /// remain pinned only during consume; ordinary Batch lifetimes are unchanged.
+    pub fn consume_encoded(self: *Scan, consumer: anytype) !bool {
+        if (self.fused_filter != null or self.emit_loc or self.n_coded != 0 or self.n_hashed != 0 or self.out_phys.len == 0) return false;
+        if (self.sub_off < self.sub_count) return false;
+        self.releaseBatch();
+        while (self.phase == .segments) {
+            if (self.cur_segment == null and !try self.openCurSegment()) return false;
+            const seg = self.cur_segment.?;
+            if (self.atRangeEnd()) return false;
+            if (self.cur_rg_idx >= seg.info.row_groups.len) {
+                self.closeCurSegment();
+                self.cur_seg_idx += 1;
+                continue;
+            }
+            if (self.cur_segment_tomb != null) return false;
+            const rg = seg.info.row_groups[self.cur_rg_idx];
+            if (!self.rowGroupCanMatch(rg)) {
+                self.rgs_considered += 1;
+                self.cur_rg_idx += 1;
+                continue;
+            }
+            const blocks = try self.ensureBorrowBlocks();
+            var acquired: usize = 0;
+            defer for (blocks[0..acquired]) |*block| block.release(self.allocator, self.table.cacheRef());
+            for (self.out_phys, 0..) |phys, j| {
+                blocks[j] = try seg.borrowColumnBlock(self.allocator, self.cur_rg_idx, phys, self.table.cacheRef());
+                acquired += 1;
+            }
+            if (!try consumer.consume(EncodedBatch{ .schema = self.out_schema, .blocks = blocks[0..acquired], .row_count = rg.row_count })) return false;
+            self.rgs_considered += 1;
+            self.rgs_scanned += 1;
+            self.rows_scanned += rg.row_count;
+            self.cur_rg_idx += 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn encoded_runs(self: *Scan, batch: EncodedBatch) ![]const ?exec.RunsColumn {
+        const slots = try self.ensureRunsArrays();
+        for (batch.blocks, batch.schema, 0..) |block, col, j| {
+            if (block.encoding != .rle or col.nullable) continue;
+            const rb = storage.segment_reader.rleViewOf(block.bytes, batch.row_count, .{ .has_nulls = false }).block;
+            switch (rb.value_width) {
+                inline 1, 2, 4, 8 => |width| {
+                    const T = std.meta.Int(.signed, width * 8);
+                    try self.runs_v_bufs[j].resize(self.allocator, rb.n_runs);
+                    try self.runs_l_bufs[j].resize(self.allocator, rb.n_runs);
+                    var count: u64 = 0;
+                    for (0..rb.n_runs) |i| {
+                        self.runs_v_bufs[j].items[i] = if (col.type == .boolean) rb.values[i] else std.mem.readInt(T, rb.values[i * width ..][0..width], .little);
+                        const length = rb.runLength(i);
+                        if (length == 0) return error.CorruptColumnBlockHeader;
+                        self.runs_l_bufs[j].items[i] = length;
+                        count += length;
+                    }
+                    if (count != batch.row_count) return error.CorruptColumnBlockHeader;
+                    slots[j] = .{ .values_i64 = self.runs_v_bufs[j].items, .lengths = self.runs_l_bufs[j].items };
+                },
+                else => return error.CorruptColumnBlockHeader,
+            }
+        }
+        return slots;
     }
 
     pub fn next(self: *Scan) !?Batch {
