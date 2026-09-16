@@ -575,7 +575,8 @@ pub fn run(allocator: Allocator, request: RunRequest) !Result {
     const n = @min(@max(@as(usize, 1), request.params.dop), layout.order.len);
     if (n == 0) return .{ .allocator = allocator, .params = request.params, .times = times };
 
-    if (request.params.arena_workspace) {
+    // Variable-length staging must be able to release idle buffers mid-query.
+    if (request.params.arena_workspace and request.shape.string_aggregate_inputs.len == 0) {
         return runArenaWorkspace(allocator, request, layout.order[0..n], &times);
     }
     return runFreshWorkspace(allocator, request, layout.order[0..n], &times);
