@@ -364,6 +364,16 @@ ownership to the group queue, and replacement buffers are acquired only when
 another append needs them. Numeric count-ranked top-N compares count and key
 before constructing a full candidate record.
 
+Grouped programs carrying variable-length aggregate inputs give ready grouping
+work priority over staging and scanning. Staging yields after one chunk batch
+so consumers can release payloads before producers allocate more. Numeric-only
+programs retain their existing scheduling policy. The shared raw/group recycle
+pool for variable-length inputs retains at most 2 GiB of slab, reference and
+payload capacity, further capped at one eighth of the query and shared memory
+budgets. Surplus idle buffers are freed; live buffers and aggregate state remain
+subject to the ordinary allocation budget. These programs use reclaimable
+workspace allocation even when the diagnostic arena-workspace option is set.
+
 Count-only grouped programs use immediate updates while a bucket's live state
 is below 2 MiB. Larger live states prefetch existing accumulator records and hold
 up to sixteen pending count increments per worker's batch in stack storage. This

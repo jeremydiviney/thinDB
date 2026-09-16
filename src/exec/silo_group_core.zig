@@ -67,6 +67,7 @@ const AUTO_ROUTE_BLOCK_ROWS: usize = 0;
 const MAX_WORKSPACE_PROFILE_WORKERS: usize = 128;
 const MAX_RAW_BATCH_CHUNKS: usize = 64;
 const MAX_GENERIC_GROUP_KEYS: usize = 8;
+const MAX_STRING_RECYCLE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -296,6 +297,7 @@ const RawRows = struct {
             .capacity_rows = capacity_rows,
             .layout = layout,
         };
+        errdefer allocator.free(next.slab);
         if (self.len_rows != 0) {
             var i: usize = 0;
             while (i < self.len_rows) : (i += 1) next.setKey(i, self.keyAt(i));
@@ -1083,6 +1085,7 @@ const GroupRows = struct {
             .capacity_rows = capacity_rows,
             .layout = layout,
         };
+        errdefer allocator.free(next.slab);
         if (self.len_rows != 0) {
             var i: usize = 0;
             while (i < self.len_rows) : (i += 1) next.setKey(i, self.keyAt(i));
@@ -1997,6 +2000,8 @@ const PipeShared = struct {
     raw_recycle_lock: std.atomic.Mutex = .unlocked,
     raw_recycled_rows: std.ArrayListUnmanaged(RawRows) = .empty,
     group_recycled_rows: std.ArrayListUnmanaged(GroupRows) = .empty,
+    recycle_byte_limit: ?usize = null,
+    recycled_bytes: usize = 0,
     raw_merge_lock: std.atomic.Mutex = .unlocked,
     raw_scan_queues: []RawQueue = &.{},
     raw_group_queues: []GroupQueue = &.{},
@@ -2176,6 +2181,145 @@ fn partial_flush_failure_fixture(allocator: Allocator) !void {
 
 test "group completion: failed partial publication restores ownership and unlocks the builder" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, partial_flush_failure_fixture, .{});
+}
+
+const STRING_MEMORY_TEST_LAYOUT = GroupRowsLayout{
+    .key_width = .u32,
+    .columns = &.{},
+    .aggregates = &.{.{ .op = .min, .is_string = true, .str_input_index = 0, .str_state_index = 0, .state_index = 0 }},
+    .str_columns = &.{.{ .source_name = "value" }},
+    .has_str_payload = true,
+};
+
+fn string_recycle_failure_fixture(allocator: Allocator) !void {
+    var shared = PipeShared{
+        .allocator = allocator,
+        .buckets = &.{},
+        .bucket_count = 0,
+        .scan_threads = 1,
+        .group_rows_layout = STRING_MEMORY_TEST_LAYOUT,
+        .recycle_byte_limit = 4096,
+    };
+    defer deinitRawQueues(&shared);
+    for (0..12) |_| {
+        inline for (.{ RawRows, GroupRows }) |Rows| {
+            var rows: Rows = .{};
+            defer rows.deinit(allocator);
+            try rows.resize(allocator, STRING_MEMORY_TEST_LAYOUT, 4);
+            try rows.str.bytes.ensureTotalCapacity(allocator, 1024);
+            try rows.str.append(allocator, 1, 0, 0, "x");
+            const owned = rows;
+            rows = .{};
+            if (Rows == RawRows) {
+                try recycleRawRows(&shared, owned, 4, null);
+            } else {
+                try recycleGroupRows(&shared, owned, 4, null);
+            }
+            try std.testing.expect(shared.recycled_bytes <= 4096);
+        }
+    }
+    var counted: usize = 0;
+    for (shared.raw_recycled_rows.items) |rows| counted += rowBufferBytes(rows);
+    for (shared.group_recycled_rows.items) |rows| counted += rowBufferBytes(rows);
+    try std.testing.expectEqual(counted, shared.recycled_bytes);
+    try std.testing.expect(counted > 0);
+
+    inline for (.{ RawRows, GroupRows }) |Rows| {
+        var rows = if (Rows == RawRows) try acquireRawRows(&shared, 512, null) else try acquireGroupRows(&shared, 512, null);
+        defer rows.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), rows.len());
+        try std.testing.expectEqual(@as(usize, 0), rows.str.bytes.items.len);
+        try rows.str.bytes.ensureTotalCapacity(allocator, 8192);
+        const before = shared.recycled_bytes;
+        const owned = rows;
+        rows = .{};
+        if (Rows == RawRows) {
+            try recycleRawRows(&shared, owned, 512, null);
+        } else {
+            try recycleGroupRows(&shared, owned, 512, null);
+        }
+        try std.testing.expectEqual(before, shared.recycled_bytes);
+    }
+    try std.testing.expect(shared.raw_recycle_lock.tryLock());
+    shared.raw_recycle_lock.unlock();
+}
+
+test "string pipeline memory: shared recycle cap includes slack and releases rejected buffers on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, string_recycle_failure_fixture, .{});
+}
+
+test "string pipeline memory: recycle allowance leaves room in query and shared budgets" {
+    var pool = thindb.exec.memory.MemoryPool.init(64 * 1024 * 1024);
+    var resources = thindb.exec.memory.MemoryAccountant.initWithPool(32 * 1024 * 1024, &pool);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), stringRecycleLimit(&resources));
+    resources.budget = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), stringRecycleLimit(&resources));
+    try std.testing.expectEqual(MAX_STRING_RECYCLE_BYTES, stringRecycleLimit(null));
+}
+
+fn string_stage_failure_fixture(allocator: Allocator, cancelled: bool) !void {
+    var cancel = std.atomic.Value(bool).init(cancelled);
+    var resources = thindb.exec.memory.MemoryAccountant.init(1024 * 1024);
+    resources.cancel_flag = &cancel;
+    var shared = PipeShared{
+        .allocator = allocator,
+        .resources = &resources,
+        .buckets = &.{},
+        .bucket_count = 1,
+        .scan_threads = 1,
+        .group_rows_layout = STRING_MEMORY_TEST_LAYOUT,
+        .recycle_byte_limit = 0,
+    };
+    defer deinitRawQueues(&shared);
+    var local: WorkerParts = .{};
+    defer local.deinit(allocator);
+    shared.raw_scan_queues = try allocator.alloc(RawQueue, 1);
+    shared.raw_scan_queues[0] = .{};
+    shared.raw_group_queues = try allocator.alloc(GroupQueue, 1);
+    shared.raw_group_queues[0] = .{};
+    shared.stage_builders = try allocator.alloc(StageBucketBuilder, 1);
+    shared.stage_builders[0] = .{};
+    var source: RawRows = .{};
+    defer source.deinit(allocator);
+    for (0..3) |_| {
+        try source.resize(allocator, STRING_MEMORY_TEST_LAYOUT, 2);
+        for (0..2) |row| {
+            source.setKey(row, 7);
+            try source.str.append(allocator, 1, row, 0, "value");
+        }
+        try publishRawRowsToQueue(&shared, &shared.raw_scan_queues[0], 0, &source, 2, &shared.outstanding_chunks, &shared.pending_group_rows, null, null);
+    }
+    shared.scans_done.store(1, .release);
+    try std.testing.expect(claimRawQueueLaneExact(shared.raw_scan_queues, 0));
+    const staged = drainRawDedicatedStageSharedBuilders(allocator, &shared, &local, 0, 2, 4, 1, false);
+    try std.testing.expect(!shared.raw_scan_queues[0].lease.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), shared.active_stage_jobs.load(.acquire));
+    try std.testing.expect(!shared.grouping_complete());
+    if (cancelled) {
+        try std.testing.expectError(error.QueryCancelled, staged);
+        return;
+    }
+    try std.testing.expect(try staged);
+    try std.testing.expectEqual(@as(usize, 2), shared.raw_scan_queues[0].chunks.items.len);
+    try std.testing.expectEqual(@as(u64, 2), shared.stage_builder_rows.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 6), shared.pending_group_rows.load(.acquire));
+    while (shared.raw_scan_queues[0].chunks.items.len > 0) {
+        try std.testing.expect(claimRawQueueLaneExact(shared.raw_scan_queues, 0));
+        _ = try drainRawDedicatedStageSharedBuilders(allocator, &shared, &local, 0, 2, 4, 1, false);
+    }
+    _ = try flushSharedStageBuilders(&shared, &local, false);
+    try std.testing.expectEqual(@as(u64, 6), shared.stage_outstanding_rows.load(.acquire));
+    for (shared.raw_group_queues[0].chunks.items) |chunk| {
+        for (0..chunk.rows.len()) |row| try std.testing.expectEqualStrings("value", chunk.rows.str.get(1, row, 0));
+    }
+}
+
+test "string pipeline memory: bounded stage preserves partials and frees popped input on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, string_stage_failure_fixture, .{false});
+}
+
+test "string pipeline memory: cancelled stage releases its lease and popped input" {
+    try string_stage_failure_fixture(std.testing.allocator, true);
 }
 
 pub const RawGroupMode = enum {
@@ -2806,11 +2950,25 @@ fn scheduleHeavyTeardown(shared: *PipeShared) bool {
     shared.stage_builders = &.{};
     shared.raw_recycled_rows = .empty;
     shared.group_recycled_rows = .empty;
+    shared.recycled_bytes = 0;
     return true;
 }
 
 fn lockSpin(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn rowBufferBytes(rows: anytype) usize {
+    return rows.slab.len + rows.str.refs.len * @sizeOf(StrRef) + rows.str.bytes.capacity;
+}
+
+fn stringRecycleLimit(resources: ?*const thindb.exec.memory.MemoryAccountant) usize {
+    var limit = MAX_STRING_RECYCLE_BYTES;
+    if (resources) |a| {
+        limit = @min(limit, a.budget / 8);
+        if (a.pool) |pool| limit = @min(limit, pool.budget / 8);
+    }
+    return limit;
 }
 
 fn acquireRawRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !RawRows {
@@ -2821,7 +2979,9 @@ fn acquireRawRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !
         const idx = shared.raw_recycled_rows.items.len - 1;
         var rows = shared.raw_recycled_rows.items[idx];
         shared.raw_recycled_rows.items.len = idx;
+        if (shared.recycle_byte_limit != null) shared.recycled_bytes -= rowBufferBytes(rows);
         shared.raw_recycle_lock.unlock();
+        errdefer rows.deinit(shared.allocator);
         rows.clearRetainingCapacity();
         if (rows.capacity() < reserve_rows or !sameRowsLayout(rows.layout, shared.group_rows_layout)) {
             try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
@@ -2830,12 +2990,14 @@ fn acquireRawRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !
     }
     shared.raw_recycle_lock.unlock();
     var rows = RawRows{ .layout = shared.group_rows_layout };
+    errdefer rows.deinit(shared.allocator);
     if (reserve_rows > 0) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
     return rows;
 }
 
 fn recycleRawRows(shared: *PipeShared, rows_raw: RawRows, reserve_rows: usize, lock_ticks: ?*i64) !void {
     var rows = rows_raw;
+    errdefer rows.deinit(shared.allocator);
     rows.clearRetainingCapacity();
     if (rows.capacity() < reserve_rows or !sameRowsLayout(rows.layout, shared.group_rows_layout)) {
         try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
@@ -2843,8 +3005,16 @@ fn recycleRawRows(shared: *PipeShared, rows_raw: RawRows, reserve_rows: usize, l
     const lock_t0 = if (lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
     if (lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
+    if (shared.recycle_byte_limit) |limit| {
+        if (rowBufferBytes(rows) > limit - shared.recycled_bytes) {
+            shared.raw_recycle_lock.unlock();
+            rows.deinit(shared.allocator);
+            return;
+        }
+    }
     defer shared.raw_recycle_lock.unlock();
     try shared.raw_recycled_rows.append(shared.allocator, rows);
+    if (shared.recycle_byte_limit != null) shared.recycled_bytes += rowBufferBytes(rows);
 }
 
 fn acquireGroupRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64) !GroupRows {
@@ -2855,13 +3025,16 @@ fn acquireGroupRows(shared: *PipeShared, reserve_rows: usize, lock_ticks: ?*i64)
         const idx = shared.group_recycled_rows.items.len - 1;
         var rows = shared.group_recycled_rows.items[idx];
         shared.group_recycled_rows.items.len = idx;
+        if (shared.recycle_byte_limit != null) shared.recycled_bytes -= rowBufferBytes(rows);
         shared.raw_recycle_lock.unlock();
+        errdefer rows.deinit(shared.allocator);
         rows.clearRetainingCapacity();
         if (rows.capacity() < reserve_rows) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
         return rows;
     }
     shared.raw_recycle_lock.unlock();
     var rows = GroupRows{ .layout = shared.group_rows_layout };
+    errdefer rows.deinit(shared.allocator);
     if (reserve_rows > 0) try rows.ensureTotalCapacity(shared.allocator, shared.group_rows_layout, reserve_rows);
     return rows;
 }
@@ -2874,8 +3047,16 @@ fn recycleGroupRows(shared: *PipeShared, rows_group: GroupRows, reserve_rows: us
     const lock_t0 = if (lock_ticks != null) platform.nowTicks() else 0;
     lockSpin(&shared.raw_recycle_lock);
     if (lock_ticks) |ticks| ticks.* += platform.nowTicks() - lock_t0;
+    if (shared.recycle_byte_limit) |limit| {
+        if (rowBufferBytes(rows) > limit - shared.recycled_bytes) {
+            shared.raw_recycle_lock.unlock();
+            rows.deinit(shared.allocator);
+            return;
+        }
+    }
     defer shared.raw_recycle_lock.unlock();
     try shared.group_recycled_rows.append(shared.allocator, rows);
+    if (shared.recycle_byte_limit != null) shared.recycled_bytes += rowBufferBytes(rows);
 }
 
 fn publishRawRows(shared: *PipeShared, owner_worker: usize, rows_ptr: *RawRows, reserve_rows: usize, queue_lock_ticks: ?*i64, recycle_lock_ticks: ?*i64) !void {
@@ -5453,6 +5634,8 @@ fn drainRawDedicatedStageSharedBuilders(
     var popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
     if (profile) local.raw_stage_pop_ticks += platform.nowTicks() - pop_t0;
     if (popped_total == 0) return false;
+    var recycled: usize = 0;
+    errdefer for (raw_chunks[recycled..popped_total]) |*chunk| chunk.rows.deinit(allocator);
 
     _ = shared.active_stage_jobs.fetchAdd(1, .release);
     defer _ = shared.active_stage_jobs.fetchSub(1, .release);
@@ -5462,6 +5645,7 @@ fn drainRawDedicatedStageSharedBuilders(
     try local.ensureWideBucketScratch(allocator, bucket_count);
 
     while (popped_total > 0) {
+        if (shared.resources) |a| try a.checkCancelled();
         local.raw_stage_input_chunks += @intCast(popped_total);
 
         var total_rows: usize = 0;
@@ -5471,10 +5655,15 @@ fn drainRawDedicatedStageSharedBuilders(
         if (total_rows == 0) {
             i = 0;
             const recycle_t0 = if (profile) platform.nowTicks() else 0;
-            while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+            while (i < popped_total) : (i += 1) {
+                recycled = i + 1;
+                try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+            }
             if (profile) local.raw_stage_recycle_ticks += platform.nowTicks() - recycle_t0;
+            if (shared.group_rows_layout.has_str_payload) break;
             pop_t0 = if (profile) platform.nowTicks() else 0;
             popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
+            recycled = 0;
             if (profile) local.raw_stage_pop_ticks += platform.nowTicks() - pop_t0;
             continue;
         }
@@ -5601,11 +5790,18 @@ fn drainRawDedicatedStageSharedBuilders(
 
         i = 0;
         const recycle_t0 = if (profile) platform.nowTicks() else 0;
-        while (i < popped_total) : (i += 1) try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+        while (i < popped_total) : (i += 1) {
+            recycled = i + 1;
+            try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
+        }
         if (profile) local.raw_stage_recycle_ticks += platform.nowTicks() - recycle_t0;
 
+        // Return the lane so ready aggregation can consume its payload before
+        // a producer fills more buffers, even while this queue has input left.
+        if (shared.group_rows_layout.has_str_payload) break;
         pop_t0 = if (profile) platform.nowTicks() else 0;
         popped_total = popRawChunkBatchFromQueue(&shared.raw_scan_queues[scan_lane], &raw_chunks, raw_batch_chunks, &local.raw_scan_queue_lock_ticks);
+        recycled = 0;
         if (profile) local.raw_stage_pop_ticks += platform.nowTicks() - pop_t0;
     }
     return true;
@@ -5895,7 +6091,33 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
     marked_scan_done.* = true;
 }
 
+fn runReadyGroup(job: SiloGridJob, scratch: *GroupScratch, lane: usize) !bool {
+    if (!claimRawQueueLaneExact(job.shared.raw_group_queues, lane)) return false;
+    if (try drainRawDedicatedGroupLane(
+        job.shared.allocator,
+        job.shared,
+        job.local,
+        scratch,
+        lane,
+        job.raw_group_chunk_rows,
+        job.raw_batch_chunks,
+        job.group_ticks,
+        job.chunks,
+        job.profile,
+    )) {
+        job.local.sched_group_jobs += 1;
+        return true;
+    }
+    job.local.sched_group_misses += 1;
+    return false;
+}
+
 fn siloGridWorkerErr(job: SiloGridJob) !void {
+    if (job.shared.group_rows_layout.has_str_payload) return runSiloGridWorker(true, job);
+    return runSiloGridWorker(false, job);
+}
+
+fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
     var scratch: GroupScratch = .{};
     defer scratch.deinit(job.shared.allocator);
 
@@ -5930,7 +6152,18 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
             const max_group_rows = if (group_choice) |choice| choice.rows else 0;
             const downstream_max_rows = @max(max_stage_rows, max_group_rows);
 
-            if (scan_choice) |choice| {
+            // Queue counts differ by stage; comparing their largest row counts
+            // can starve consumers while variable-width payloads accumulate.
+            if (downstream_first) {
+                if (group_choice) |choice| {
+                    if (try runReadyGroup(job, &scratch, choice.lane)) {
+                        idle_spins = 0;
+                        continue;
+                    }
+                }
+            }
+
+            if (!downstream_first) if (scan_choice) |choice| {
                 if (scan_claims_available and (downstream_max_rows == 0 or choice.rows < downstream_max_rows) and claimRawScanLaneExact(job.shared.raw_scan_queues, choice.lane)) {
                     var release_scan = true;
                     errdefer if (release_scan) releaseRawScanLane(job.shared.raw_scan_queues, choice.lane);
@@ -5941,9 +6174,9 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                     idle_spins = 0;
                     continue;
                 }
-            }
+            };
 
-            if (max_stage_rows > max_group_rows) {
+            if (max_stage_rows > (if (downstream_first) @as(u64, 0) else max_group_rows)) {
                 if (stage_choice) |choice| {
                     if (claimRawQueueLaneExact(job.shared.raw_scan_queues, choice.lane)) {
                         const did_stage = try drainRawDedicatedStageSharedBuilders(
@@ -5966,26 +6199,11 @@ fn siloGridWorkerErr(job: SiloGridJob) !void {
                 }
             }
 
-            if (max_group_rows > 0) {
+            if (!downstream_first and max_group_rows > 0) {
                 if (group_choice) |choice| {
-                    if (claimRawQueueLaneExact(job.shared.raw_group_queues, choice.lane)) {
-                        if (try drainRawDedicatedGroupLane(
-                            job.shared.allocator,
-                            job.shared,
-                            job.local,
-                            &scratch,
-                            choice.lane,
-                            job.raw_group_chunk_rows,
-                            job.raw_batch_chunks,
-                            job.group_ticks,
-                            job.chunks,
-                            job.profile,
-                        )) {
-                            job.local.sched_group_jobs += 1;
-                            idle_spins = 0;
-                            continue;
-                        }
-                        job.local.sched_group_misses += 1;
+                    if (try runReadyGroup(job, &scratch, choice.lane)) {
+                        idle_spins = 0;
+                        continue;
                     }
                 }
             }
@@ -6411,6 +6629,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .raw_group_queues = raw_group_queues,
         .stage_builders = stage_builders,
         .group_rows_layout = group_rows_layout,
+        .recycle_byte_limit = if (group_rows_layout.has_str_payload) stringRecycleLimit(resources) else null,
         .generic_filter_required = cfg.filter_expr != null,
         .scan_threads = n_workers,
         .total_scan_rgs = claim_total_rgs,

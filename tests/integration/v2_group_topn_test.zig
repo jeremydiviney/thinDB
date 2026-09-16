@@ -1022,3 +1022,68 @@ test "V2 group emit: parallel ranges emit every group once, as batches" {
         try std.testing.expect(batches >= 3);
     }
 }
+
+test "string pipeline memory: parallel extrema preserve nulls, bytes, ties and partial batches" {
+    const a = std.testing.allocator;
+    const group_count = 16_391;
+    const Row = struct { id: i64, g: i32, payload: ?[]const u8 };
+    const Expected = struct { count: i64 = 0, lo: ?[]const u8 = null, hi: ?[]const u8 = null };
+    const rows = try a.alloc(Row, group_count * 4);
+    defer a.free(rows);
+    const bytes = try a.alloc(u8, rows.len * 256);
+    defer a.free(bytes);
+    const expected = try a.alloc(Expected, group_count);
+    defer a.free(expected);
+    @memset(expected, .{});
+    for (rows, 0..) |*row, i| {
+        const g = i % group_count;
+        const b = bytes[i * 256 ..][0 .. 64 + (i * 37) % 193];
+        @memset(b, 'x');
+        _ = try std.fmt.bufPrint(b[0..8], "{d:0>8}", .{(i * 31) % 997});
+        const value: ?[]const u8 = if (g == 0 or (g > 2 and i % 11 == 0)) null else if (g == 1) "" else if (g == 2) "same\x00\xff" else b;
+        row.* = .{ .id = @intCast(i), .g = @intCast(g), .payload = value };
+        const e = &expected[g];
+        e.count += 1;
+        if (value) |v| {
+            if (e.lo == null or std.mem.order(u8, v, e.lo.?) == .lt) e.lo = v;
+            if (e.hi == null or std.mem.order(u8, v, e.hi.?) == .gt) e.hi = v;
+        }
+    }
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("string_groups", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "g", .type = .int }, .{ .name = "payload", .type = .string, .nullable = true } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 256 });
+        try table.insert(rows);
+        try table.flush();
+        for (0..3) |_| {
+            var q = try runSql(a, db, "SELECT g, MIN(payload), MAX(payload), COUNT(*) FROM string_groups GROUP BY g HAVING COUNT(*) > 2 ORDER BY g LIMIT 20000");
+            defer q.deinit();
+            var seen: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const g: usize = @intCast(batch.values[0].data.int[r]);
+                    try std.testing.expectEqual(seen, g);
+                    const e = expected[g];
+                    try std.testing.expectEqual(e.count, batch.values[3].data.bigint[r]);
+                    for ([_]?[]const u8{ e.lo, e.hi }, 1..) |want, ci| {
+                        try std.testing.expectEqual(want != null, batch.values[ci].isValid(r));
+                        if (want) |v| try std.testing.expectEqualStrings(v, batch.values[ci].data.string.rowBytes(r));
+                    }
+                    seen += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, group_count), seen);
+        }
+        var empty = try runSql(a, db, "SELECT g, MIN(payload), MAX(payload), COUNT(*) FROM string_groups WHERE g < 0 GROUP BY g ORDER BY g");
+        defer empty.deinit();
+        var empty_rows: usize = 0;
+        while (try empty.next()) |batch| empty_rows += batch.row_count;
+        try std.testing.expectEqual(@as(usize, 0), empty_rows);
+    }
+}
