@@ -58,6 +58,7 @@ test {
     _ = @import("typed_temporal_literal_test.zig");
     _ = @import("literal_lhs_test.zig");
     _ = @import("agg_on_expr_test.zig");
+    _ = @import("orderby_where_limit_test.zig");
     _ = @import("temporal_group_agg_test.zig");
     _ = @import("keyed_region_test.zig");
     _ = @import("qualified_col_test.zig");

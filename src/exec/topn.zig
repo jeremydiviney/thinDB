@@ -246,36 +246,6 @@ pub const TopN = struct {
         }
     };
 
-    /// Compare raw values at row `a` of `va` against row `b` of `vb`,
-    /// where both views address the *same* logical column type. Mirrors
-    /// `engine.memtable.compareInColumn`'s per-type ordering (numeric for
-    /// scalars, byte-lexicographic for strings) but works across two
-    /// independent views/stores rather than two indices into one. NULLs are
-    /// compared by their placeholder value, exactly as the in-store
-    /// comparator does — keeping the bounded path byte-identical to the
-    /// full-sort path, which also ignores the null bitmap.
-    fn compareAcrossViews(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.math.Order {
-        return switch (va.data) {
-            .int => |s| std.math.order(s[a], vb.data.int[b]),
-            .bigint => |s| std.math.order(s[a], vb.data.bigint[b]),
-            .boolean => |s| std.math.order(s[a], vb.data.boolean[b]),
-            .varchar => |s| std.mem.order(u8, s.rowBytes(a), vb.data.varchar.rowBytes(b)),
-            .string => |s| std.mem.order(u8, s.rowBytes(a), vb.data.string.rowBytes(b)),
-            .char => |s| std.mem.order(u8, s.rowBytes(a), vb.data.char.rowBytes(b)),
-            .json => |s| std.mem.order(u8, s.rowBytes(a), vb.data.json.rowBytes(b)),
-            .tinyint => |s| std.math.order(s[a], vb.data.tinyint[b]),
-            .smallint => |s| std.math.order(s[a], vb.data.smallint[b]),
-            .largeint => |s| std.math.order(s[a], vb.data.largeint[b]),
-            .float => |s| types.floatOrder(s[a], vb.data.float[b]),
-            .double => |s| types.floatOrder(s[a], vb.data.double[b]),
-            .date => |s| std.math.order(s[a], vb.data.date[b]),
-            .datetime => |s| std.math.order(s[a], vb.data.datetime[b]),
-            .decimal64 => |s| std.math.order(s[a], vb.data.decimal64[b]),
-            .decimal128 => |s| std.math.order(s[a], vb.data.decimal128[b]),
-            .uuid => |s| std.math.order(s[a], vb.data.uuid[b]),
-        };
-    }
-
     /// True when batch row `row` (addressed through `batch_views`) is a
     /// candidate for the kept set — i.e. it is STRICTLY better than the current
     /// worst-kept row, which lives at `worst_idx` in `accumulated`. Only reached
@@ -285,9 +255,11 @@ pub const TopN = struct {
     /// heavily-tied key (e.g. `ORDER BY x LIMIT k` where many rows share x) into
     /// O(rows) buffer churn. Reject ties: the kept set already holds `keep` rows
     /// no worse, and tie order beyond the boundary is unspecified anyway.
+    /// NULL order must match `Comparator.lessThan` (NULLs first ascending),
+    /// or a NULL row from a later batch can never displace a kept value.
     fn isCandidate(self: *TopN, batch_views: []const ColumnView, row: usize, worst_idx: u32) bool {
         for (self.sort_col_indices, 0..) |ci, i| {
-            const ord = compareAcrossViews(
+            const ord = engine.transform.compareViewRowsNullsFirst(
                 self.accumulated[ci].view(),
                 worst_idx,
                 batch_views[ci],

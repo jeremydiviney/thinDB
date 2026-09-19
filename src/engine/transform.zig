@@ -96,6 +96,21 @@ pub fn compareViewRows(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.m
     };
 }
 
+/// `compareViewRows` under the query-side NULL order (NULL sorts before every
+/// value; two NULLs tie) — the cross-view twin of `compareInColumnNullsFirst`.
+/// A NULL slot's payload bytes are encoding artifacts, so a bounded top-N that
+/// compared them raw would accept or reject NULL rows depending on what the
+/// encoder left behind (issue #45's matrix caught exactly that).
+pub fn compareViewRowsNullsFirst(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.math.Order {
+    const av = va.isValid(a);
+    const bv = vb.isValid(b);
+    if (!av or !bv) {
+        if (av == bv) return .eq;
+        return if (av) .gt else .lt;
+    }
+    return compareViewRows(va, a, vb, b);
+}
+
 /// Borrowed row-range view over a column — the zero-copy slicing primitive
 /// for splitting one materialized column into chunk/batch windows. `off`
 /// must be a multiple of 8 so the validity bitmap slices on a byte
@@ -844,6 +859,12 @@ fn compactIntoConvert(
     }
 }
 
+/// Append the masked rows of `view` to `out`, converting between numeric
+/// widths where the store is wider. A source that differs from the store
+/// in type is accepted only when every masked row is NULL: it carries no
+/// type of its own and lands as placeholders of the store's type. A NULL
+/// masked row bound for a non-nullable store is a `ColumnTypeMismatch`
+/// rather than a silently dropped validity bit.
 pub fn appendMaskedColumn(
     allocator: Allocator,
     view: ColumnView,
@@ -851,6 +872,42 @@ pub fn appendMaskedColumn(
     out: *ColumnStore,
 ) !void {
     const dst_start = out.data.rowCount();
+    appendMaskedValues(allocator, view, mask, out) catch |err| switch (err) {
+        error.ColumnTypeMismatch => {
+            if (!maskedRowsAllNull(view, mask)) return err;
+            var survivors: usize = 0;
+            for (mask) |m| survivors += @intFromBool(m);
+            try out.data.appendNullPlaceholders(allocator, survivors);
+        },
+        else => return err,
+    };
+    if (out.nulls != null) {
+        var j: usize = 0;
+        for (mask, 0..) |m, src_row| {
+            if (!m) continue;
+            const valid = storage.column.isValidBit(view.nulls, src_row);
+            try out.appendValidBit(allocator, dst_start + j, valid);
+            j += 1;
+        }
+    } else if (view.nulls != null) {
+        for (mask, 0..) |m, src_row| {
+            if (m and !storage.column.isValidBit(view.nulls, src_row)) return error.ColumnTypeMismatch;
+        }
+    }
+}
+
+fn maskedRowsAllNull(view: ColumnView, mask: []const bool) bool {
+    const bm = view.nulls orelse return false;
+    for (mask, 0..) |m, row| if (m and storage.column.isValidBit(bm, row)) return false;
+    return true;
+}
+
+fn appendMaskedValues(
+    allocator: Allocator,
+    view: ColumnView,
+    mask: []const bool,
+    out: *ColumnStore,
+) !void {
     switch (view.data) {
         .int => |s| switch (out.data) {
             .int => |*list| try compactInto(i32, allocator, s, mask, list),
@@ -943,15 +1000,6 @@ pub fn appendMaskedColumn(
             else => return error.ColumnTypeMismatch,
         },
     }
-    if (out.nulls != null) {
-        var j: usize = 0;
-        for (mask, 0..) |m, src_row| {
-            if (!m) continue;
-            const valid = storage.column.isValidBit(view.nulls, src_row);
-            try out.appendValidBit(allocator, dst_start + j, valid);
-            j += 1;
-        }
-    }
 }
 
 /// Index-gather sibling of `appendMaskedColumn` for a sparse mask: `rows` are
@@ -1030,7 +1078,7 @@ fn appendMaskedStringy(allocator: Allocator, sv: anytype, mask: []const bool, ou
                 if (m) ss.appendValueAssumeCapacity(sv.rowBytes(row));
             }
         },
-        else => unreachable,
+        else => return error.ColumnTypeMismatch,
     }
 }
 

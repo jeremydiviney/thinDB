@@ -84,12 +84,18 @@ pub fn execUpdateStreaming(
 
         // -- Phase 1: memtable rows [0..mt_rows_at_start] --------
         if (mt_rows_at_start > 0) {
-            affected += try processMemtable(t, pred_local, assignments, mt_rows_at_start);
+            affected += processMemtable(t, pred_local, assignments, mt_rows_at_start) catch |err| switch (err) {
+                error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
+                else => return err,
+            };
         }
 
         // -- Phase 2: segments[0..segs_at_start] -----------------
         if (segs_at_start > 0) {
-            affected += try processSegments(t, pred_local, assignments, segs_at_start);
+            affected += processSegments(t, pred_local, assignments, segs_at_start) catch |err| switch (err) {
+                error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
+                else => return err,
+            };
         }
     }
     try t.awaitWalDurable(wal_target);

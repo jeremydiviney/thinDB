@@ -2258,10 +2258,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                 }
                 _ = ns.createTable(ct.table.name, schema_def, opts) catch |e| return thindb_api.remapError(Error, e);
             } else {
-                const db_name = ct.table.database orelse ctx.session.current_db;
-                const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
-                const sc_name = ct.table.schema orelse ctx.session.current_schema;
-                const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+                const sc = (try resolvePersistentTableTarget(catalog, ctx.session.*, ct.table)).schema;
 
                 sc.tables_mutex.lockUncancelable(sc.io);
                 const exists = sc.tables.get(ct.table.name) != null;
@@ -2286,10 +2283,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     }
                 }
             }
-            const db_name = dt.table.database orelse ctx.session.current_db;
-            const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
-            const sc_name = dt.table.schema orelse ctx.session.current_schema;
-            const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+            const sc = (try resolvePersistentTableTarget(catalog, ctx.session.*, dt.table)).schema;
             sc.dropTable(dt.table.name) catch |e| switch (e) {
                 ApiError.TableNotFound => if (!dt.if_exists) return Error.TableNotFound,
                 else => return thindb_api.remapError(Error, e),
@@ -2482,10 +2476,7 @@ fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
         }
         t = ns.createTable(op.table.name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
     } else {
-        const db_name = op.table.database orelse ctx.session.current_db;
-        const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
-        const sc_name = op.table.schema orelse ctx.session.current_schema;
-        const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
+        const sc = (try resolvePersistentTableTarget(catalog, ctx.session.*, op.table)).schema;
 
         sc.tables_mutex.lockUncancelable(sc.io);
         const exists = sc.tables.get(op.table.name) != null;

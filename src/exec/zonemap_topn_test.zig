@@ -779,6 +779,61 @@ test "zonemap memtable-only (no flushed segments)" {
     });
 }
 
+test "zonemap coerces a text literal against a DATETIME probe column (#45), parallel visit" {
+    // The WHERE arrives with the literal still as text (the SQL front end
+    // leaves coercion to the operator that evaluates it). The probe path
+    // must coerce it like `Filter.create` does — before the fix it read the
+    // text slice's bytes as the datetime bound and kept every row.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "k1", .type = .int },
+            .{ .name = "ts", .type = .datetime, .nullable = true },
+        },
+        .order_key = &.{"k1"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 4,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k1"}, .row_group_size = 4 });
+
+    // ts = 2026-01-01 00:00 + k1 minutes; k1 % 13 == 0 is NULL. 6 row groups.
+    const day0: i64 = 20454 * 86_400 * 1_000_000; // 2026-01-01 in µs since epoch
+    var rows: [24]struct { k1: i32, ts: ?i64 } = undefined;
+    for (0..24) |i| rows[i] = .{ .k1 = @intCast(i), .ts = if (i % 13 == 0) null else day0 + @as(i64, @intCast(i)) * 60 * 1_000_000 };
+    try t.insert(&rows);
+    try t.flush();
+
+    const probe = &[_][]const u8{ "k1", "ts" };
+    const specs = &[_]SortSpec{.{ .col = "k1", .desc = false }};
+    const out = &[_][]const u8{ "k1", "ts" };
+    const pred = leafExpr("ts", .gte, .{ .text = "2026-01-01 00:10:00" });
+
+    var ref_q = try exec.lateScan(allocator, t, null, probe, pred, specs, out, 3, 0);
+    defer ref_q.deinit();
+    var ref = try capture(allocator, &ref_q);
+    defer ref.deinit();
+
+    var z_q = (try exec.zonemapTopN(allocator, t, null, probe, pred, specs, out, 3, 0, 4)).?;
+    defer z_q.deinit();
+    var got = try capture(allocator, &z_q);
+    defer got.deinit();
+
+    // k1 = 10, 11, 12 (13 is NULL and would be next).
+    try std.testing.expectEqual(@as(usize, 3), got.rows.items.len);
+    try std.testing.expectEqual(@as(i128, 10), got.rows.items[0].cells[0].int);
+    try std.testing.expectEqual(@as(i128, 12), got.rows.items[2].cells[0].int);
+    try expectSameRows(ref, got);
+}
+
 // --- Fall-back cases: zonemapTopN must return null; lateScan still correct. ---
 
 // --- String leading key: prefix-stat pruning, ASC + DESC + prefix collision. ---

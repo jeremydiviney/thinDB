@@ -41,6 +41,15 @@ pub const ColumnView = struct {
     pub fn isValid(self: ColumnView, row: usize) bool {
         return isValidBit(self.nulls, row);
     }
+
+    /// True when each of the first `rows` rows is NULL. Such a column carries
+    /// no type of its own (a bare `NULL` literal reaches the engine with a
+    /// placeholder type), so a store of any type may take it as NULLs.
+    pub fn allNull(self: ColumnView, rows: usize) bool {
+        const bm = self.nulls orelse return false;
+        for (0..rows) |row| if (isValidBit(bm, row)) return false;
+        return true;
+    }
 };
 
 pub const ValueView = union(TypeTag) {
