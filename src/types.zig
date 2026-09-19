@@ -442,6 +442,36 @@ pub fn columnNameEql(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+pub const QualifiedName = struct {
+    qualifier: []const u8,
+    bare: []const u8,
+};
+
+/// Split a result name a join side qualified (`alias.col`, or
+/// `db.table.col`) into the qualifier and the bare column. Only an
+/// identifier-shaped name splits: a numeric literal's name (`1.5`), an
+/// expression name (`t.x + 1`) or a JSON path keeps its dots and returns
+/// null, so callers that present bare names never mangle those.
+pub fn splitQualifiedName(name: []const u8) ?QualifiedName {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    const qualifier = name[0..dot];
+    const bare = name[dot + 1 ..];
+    if (!isPlainIdentifier(bare)) return null;
+    var parts = std.mem.splitScalar(u8, qualifier, '.');
+    while (parts.next()) |part| {
+        if (!isPlainIdentifier(part)) return null;
+    }
+    return .{ .qualifier = qualifier, .bare = bare };
+}
+
+fn isPlainIdentifier(s: []const u8) bool {
+    if (s.len == 0 or (!std.ascii.isAlphabetic(s[0]) and s[0] != '_')) return false;
+    for (s) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '$') return false;
+    }
+    return true;
+}
+
 /// Resolve a column reference (possibly qualified `alias.col`) against a
 /// flat column slice. Used by every user-facing lookup site so the
 /// parser can leave qualifiers intact without each operator carrying
@@ -579,4 +609,16 @@ test "floatOrder sorts NaN last and is otherwise numeric" {
     // Works for f32 too.
     try std.testing.expectEqual(order.lt, floatOrder(@as(f32, 1.0), 2.0));
     try std.testing.expectEqual(order.gt, floatOrder(std.math.nan(f32), @as(f32, 9.0)));
+}
+
+test "splitQualifiedName splits only identifier-shaped qualified names" {
+    const split = splitQualifiedName("e.id").?;
+    try std.testing.expectEqualStrings("e", split.qualifier);
+    try std.testing.expectEqualStrings("id", split.bare);
+    const deep = splitQualifiedName("main.t.ID").?;
+    try std.testing.expectEqualStrings("main.t", deep.qualifier);
+    try std.testing.expectEqualStrings("ID", deep.bare);
+    inline for (.{ "id", "1.5", "t.x + 1", "payload->'a.b'", ".id", "e.", "e.1" }) |name| {
+        try std.testing.expect(splitQualifiedName(name) == null);
+    }
 }

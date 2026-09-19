@@ -82,12 +82,19 @@ pub fn appendColumnDef(
     table_name: []const u8,
     col: Column,
 ) !void {
+    // A qualified result name (`e.id`, kept so two join sides stay
+    // distinct inside the plan) is presented the way MySQL presents it:
+    // `table` carries the qualifier and `name` the bare column, so clients
+    // keying rows by name see `id` twice rather than `e.id` and `a.id`.
+    const split = types.splitQualifiedName(col.name);
+    const table: []const u8 = if (split) |s| s.qualifier else table_name;
+    const name: []const u8 = if (split) |s| s.bare else col.name;
     try packet.appendLenEncString(allocator, out, "def");
     try packet.appendLenEncString(allocator, out, schema_name);
-    try packet.appendLenEncString(allocator, out, table_name);
-    try packet.appendLenEncString(allocator, out, table_name);
-    try packet.appendLenEncString(allocator, out, col.name);
-    try packet.appendLenEncString(allocator, out, col.name);
+    try packet.appendLenEncString(allocator, out, table);
+    try packet.appendLenEncString(allocator, out, table);
+    try packet.appendLenEncString(allocator, out, name);
+    try packet.appendLenEncString(allocator, out, name);
     try packet.appendLenEncInt(allocator, out, 0x0c);
 
     const info = mysqlTypeOf(col.type);
@@ -391,4 +398,15 @@ pub fn sendSingleColumnRows(
         try sendTextRow(allocator, w, cells[0..], seq_id);
     }
     try sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+test "appendColumnDef presents a qualified result name as table + bare name" {
+    const allocator = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try appendColumnDef(allocator, &out, "db", "", .{ .name = "e.id", .type = .bigint });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01e\x01e\x02id\x02id") != null);
+    out.clearRetainingCapacity();
+    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "x.y + 1", .type = .bigint });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x07x.y + 1\x07x.y + 1") != null);
 }

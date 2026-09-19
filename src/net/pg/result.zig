@@ -64,7 +64,10 @@ pub fn sendRowDescription(
     try packet.appendI16(allocator, &payload, @intCast(schema.len));
     for (schema) |col| {
         const info = pgTypeOf(col.type);
-        try packet.appendCString(allocator, &payload, col.name);
+        // Result names are bare on the wire; a qualifier kept for plan-side
+        // uniqueness (`e.id`) is not part of the column name a client sees.
+        const name: []const u8 = if (types.splitQualifiedName(col.name)) |s| s.bare else col.name;
+        try packet.appendCString(allocator, &payload, name);
         try packet.appendU32(allocator, &payload, 0);
         try packet.appendI16(allocator, &payload, 0);
         try packet.appendU32(allocator, &payload, info.oid);

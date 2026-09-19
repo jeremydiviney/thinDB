@@ -3549,3 +3549,26 @@ test "sql: ordinary diagnosis empty selective shared CTE and window fixtures" {
         try std.testing.expectEqualSlices(i64, case.expected, actual);
     }
 }
+
+test "sql: CAST AS SIGNED / UNSIGNED are MySQL spellings of a 64-bit cast" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    inline for (.{ "SIGNED", "SIGNED INTEGER", "UNSIGNED", "UNSIGNED INT" }) |target| {
+        var q = try runSql(allocator, db, "SELECT CAST(qty AS " ++ target ++ ") AS b FROM t ORDER BY id LIMIT 1");
+        defer q.deinit();
+        const r = (try q.next()).?;
+        try std.testing.expect(std.meta.activeTag(q.outputSchema()[0].type) == .bigint);
+        try std.testing.expectEqual(@as(i64, 10), r.values[0].data.bigint[0]);
+    }
+    // The cohort report's shape: a cast wrapped around an aggregate.
+    var q = try runSql(allocator, db, "SELECT CAST(SUM(qty) AS SIGNED) AS s FROM t");
+    defer q.deinit();
+    const r = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), r.row_count);
+}
