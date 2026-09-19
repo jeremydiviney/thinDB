@@ -10,6 +10,10 @@ const config = @import("config.zig");
 
 const Io = std.Io;
 
+// Print a stack trace on access violations even in ReleaseFast: a silent
+// exit 139 is useless when a workload crashes the server.
+pub const std_options: std.Options = .{ .enable_segfault_handler = true };
+
 const default_bind: []const u8 = "0.0.0.0";
 
 /// Argument source for the parse loop: the config-file-derived tokens followed
