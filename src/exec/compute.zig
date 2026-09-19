@@ -425,8 +425,11 @@ pub const Compute = struct {
     /// Reusable views slice (upstream views + derived views), sized at
     /// create. Rewired per batch.
     views: []ColumnView,
-    /// Raw derived IR (arena copy) + registry, retained so tryFuseProbe can
-    /// build detached per-chunk clones for a probe pipeline.
+    /// Raw derived IR + registry, retained so tryFuseProbe can build
+    /// detached per-chunk clones for a probe pipeline and the join stage
+    /// peel can recognise in-place casts. Deep-copied into the arena:
+    /// callers build `derived` in scratch that dies once their own create
+    /// returns (a join's key-coercion casts), so nothing here may alias it.
     derived_ir: []const Derived,
     udf_registry: ?*const udf_mod.UdfRegistry,
     /// Set when this Compute forwarded a probe offer downward: evaluation
@@ -454,7 +457,10 @@ pub const Compute = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
-        const derived_ir = try aa.dupe(Derived, derived);
+        const derived_ir = try aa.alloc(Derived, derived.len);
+        for (derived, derived_ir) |d, *owned| {
+            owned.* = .{ .name = try aa.dupe(u8, d.name), .expr = try expr_mod.deepClone(aa, d.expr) };
+        }
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
         for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
@@ -2385,4 +2391,50 @@ test "stats aligns to the create-time input width when the upstream is re-typed"
     const retyped = q.stats();
     try std.testing.expectEqual(@as(usize, 3), retyped.column_stats.len);
     for (retyped.column_stats) |s| try std.testing.expectEqual(exec.ColCard.unknown, s.ndv);
+}
+
+test "retains its own copy of the derived IR after the caller's scratch dies" {
+    // Join.create builds its key-coercion casts (`to_*(col)` named after the
+    // column) in an arena that dies when create returns. The IR is read
+    // again long after that: chain clones re-resolve it and the join's
+    // shared-stage peel inspects the call shape. A shallow copy aliased the
+    // dead arena and segfaulted the ReleaseFast server under the wayroll
+    // report suites. Scribbling the caller's bytes after create must not
+    // change what the operator sees.
+    const Source = struct {
+        pub fn next(_: *@This()) anyerror!?Batch {
+            return null;
+        }
+        pub fn deinit(_: *@This()) void {}
+        pub fn outputSchema(_: *@This()) []const Column {
+            return &.{.{ .name = "a", .type = .int }};
+        }
+        pub fn addPrune(_: *@This(), _: Predicate) anyerror!void {}
+        pub fn stats(_: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = 0, .column_stats = &.{} };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), _: *std.ArrayList(u8), _: Allocator, _: usize) anyerror!void {}
+    };
+    var name_buf = "a".*;
+    var fn_buf = "to_bigint".*;
+    var arg_buf = "a".*;
+    var args = [_]Expr{.{ .col_ref = &arg_buf }};
+    var derived = [_]Derived{.{ .name = &name_buf, .expr = .{ .call = .{ .fn_name = &fn_buf, .args = &args } } }};
+    var src = Source{};
+    var q = try Compute.create(std.testing.allocator, exec.makeQuery(std.testing.allocator, &src), &derived);
+    defer q.deinit();
+
+    name_buf[0] = '?';
+    @memset(&fn_buf, '?');
+    arg_buf[0] = '?';
+    args[0] = .{ .lit = .{ .int = 0 } };
+    derived[0] = .{ .name = "gone", .expr = .{ .col_ref = "gone" } };
+
+    const c = exec.queryAs(Compute, q).?;
+    try std.testing.expectEqualStrings("a", c.derived_ir[0].name);
+    try std.testing.expectEqualStrings("to_bigint", c.derived_ir[0].expr.call.fn_name);
+    try std.testing.expectEqualStrings("a", c.derived_ir[0].expr.call.args[0].col_ref);
 }
