@@ -417,11 +417,19 @@ pub const Compute = struct {
     /// Combined output schema. Fresh derived names append; derived names
     /// matching an upstream column replace that upstream output slot.
     output_schema: []Column,
+    /// Width of the upstream schema the derived columns were resolved
+    /// against. The live upstream width can differ later: probe fusion
+    /// re-types the pipeline below, and a chained operator then reports the
+    /// joined output schema instead of the one this Compute was built on.
+    in_width: usize,
     /// Reusable views slice (upstream views + derived views), sized at
     /// create. Rewired per batch.
     views: []ColumnView,
-    /// Raw derived IR (arena copy) + registry, retained so tryFuseProbe can
-    /// build detached per-chunk clones for a probe pipeline.
+    /// Raw derived IR + registry, retained so tryFuseProbe can build
+    /// detached per-chunk clones for a probe pipeline and the join stage
+    /// peel can recognise in-place casts. Deep-copied into the arena:
+    /// callers build `derived` in scratch that dies once their own create
+    /// returns (a join's key-coercion casts), so nothing here may alias it.
     derived_ir: []const Derived,
     udf_registry: ?*const udf_mod.UdfRegistry,
     /// Set when this Compute forwarded a probe offer downward: evaluation
@@ -449,7 +457,10 @@ pub const Compute = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const aa = arena.allocator();
-        const derived_ir = try aa.dupe(Derived, derived);
+        const derived_ir = try aa.alloc(Derived, derived.len);
+        for (derived, derived_ir) |d, *owned| {
+            owned.* = .{ .name = try aa.dupe(u8, d.name), .expr = try expr_mod.deepClone(aa, d.expr) };
+        }
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
         for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
@@ -518,6 +529,7 @@ pub const Compute = struct {
             .derived_direct = derived_direct,
             .derived_output_indices = derived_output_indices,
             .output_schema = output_schema,
+            .in_width = up_schema.len,
             .views = views,
             .derived_ir = derived_ir,
             .udf_registry = udf_registry,
@@ -606,7 +618,15 @@ pub const Compute = struct {
             if (cf.inner != null) return self.upstream.stats();
         }
         var up = self.upstream.stats();
-        const up_n = self.upstream.outputSchema().len;
+        const in_width = self.in_width;
+        // The upstream's per-column stats index ITS live output schema. When
+        // that schema is no longer the one this Compute was resolved against
+        // (the pipeline below was re-typed by probe fusion after this
+        // operator was built), those stats describe other columns: treat
+        // them as unknown instead of copying them into the wrong slots — or
+        // past the end of `out_stats` when the live schema is wider.
+        const aligned: []const exec.ColStat =
+            if (self.upstream.outputSchema().len == in_width) up.column_stats else &.{};
         const out_stats = self.arena.allocator().alloc(exec.ColStat, self.output_schema.len) catch return up;
         // Align to the OUTPUT schema: copy the upstream stats we have, padding
         // any the upstream didn't report (a short/empty array) with unknown so
@@ -614,14 +634,12 @@ pub const Compute = struct {
         // instead would leave column_stats shorter than the schema, so a
         // derived GROUP BY key reads out-of-bounds → unknown → the router
         // mis-sizes the hash table (the Q28 regex-key sort regression).
-        for (out_stats[0..up_n], 0..) |*s, i| {
-            s.* = if (i < up.column_stats.len) up.column_stats[i] else .{ .ndv = .unknown };
+        for (out_stats[0..in_width], 0..) |*s, i| {
+            s.* = if (i < aligned.len) aligned[i] else .{ .ndv = .unknown };
         }
-        if (out_stats.len > up_n) {
-            for (out_stats[up_n..]) |*s| s.* = .{ .ndv = .unknown };
-        }
+        for (out_stats[in_width..]) |*s| s.* = .{ .ndv = .unknown };
         for (self.derived, self.derived_output_indices) |d, out_idx| {
-            out_stats[out_idx] = derivedColStat(d, out_stats[0..up_n]);
+            out_stats[out_idx] = derivedColStat(d, out_stats[0..in_width]);
         }
         exec.capColStats(out_stats, up.upper_rows);
         up.column_stats = out_stats;
@@ -2320,4 +2338,103 @@ fn fillNullColumn(allocator: Allocator, buf: *ColumnStore, n: usize) !void {
         try buf.data.appendNullPlaceholder(allocator);
         try buf.appendValidBit(allocator, buf.data.rowCount() - 1, false);
     }
+}
+
+test "stats aligns to the create-time input width when the upstream is re-typed" {
+    // Probe fusion re-types the pipeline below a Compute after it was built:
+    // a chained operator then reports the joined output schema, wider than
+    // the schema the derived columns were resolved against. The upstream's
+    // per-column stats index that wider schema, so they must be dropped, not
+    // copied into the wrong slots or past the end of the output buffer.
+    const ReTyped = struct {
+        schema: []const Column,
+        col_stats: []const exec.ColStat,
+
+        pub fn next(_: *@This()) anyerror!?Batch {
+            return null;
+        }
+        pub fn deinit(_: *@This()) void {}
+        pub fn outputSchema(self: *@This()) []const Column {
+            return self.schema;
+        }
+        pub fn addPrune(_: *@This(), _: Predicate) anyerror!void {}
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = 10, .column_stats = self.col_stats };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), _: *std.ArrayList(u8), _: Allocator, _: usize) anyerror!void {}
+    };
+    const narrow = [_]Column{ .{ .name = "a", .type = .int }, .{ .name = "b", .type = .int } };
+    const narrow_stats = [_]exec.ColStat{ .{ .ndv = .{ .exact = 3 } }, .{ .ndv = .{ .exact = 7 } } };
+    const wide = [_]Column{
+        .{ .name = "a", .type = .int }, .{ .name = "b", .type = .int }, .{ .name = "c", .type = .int },
+        .{ .name = "d", .type = .int }, .{ .name = "e", .type = .int },
+    };
+    const wide_stats = [_]exec.ColStat{
+        .{ .ndv = .{ .exact = 11 } }, .{ .ndv = .{ .exact = 12 } }, .{ .ndv = .{ .exact = 13 } },
+        .{ .ndv = .{ .exact = 14 } }, .{ .ndv = .{ .exact = 15 } },
+    };
+    var src = ReTyped{ .schema = &narrow, .col_stats = &narrow_stats };
+    const derived = [_]Derived{.{ .name = "k", .expr = .{ .col_ref = "a" } }};
+    var q = try Compute.create(std.testing.allocator, exec.makeQuery(std.testing.allocator, &src), &derived);
+    defer q.deinit();
+
+    const aligned = q.stats();
+    try std.testing.expectEqual(@as(usize, 3), aligned.column_stats.len);
+    try std.testing.expectEqual(exec.ColCard{ .exact = 7 }, aligned.column_stats[1].ndv);
+    try std.testing.expectEqual(exec.ColCard{ .exact = 3 }, aligned.column_stats[2].ndv);
+
+    src.schema = &wide;
+    src.col_stats = &wide_stats;
+    const retyped = q.stats();
+    try std.testing.expectEqual(@as(usize, 3), retyped.column_stats.len);
+    for (retyped.column_stats) |s| try std.testing.expectEqual(exec.ColCard.unknown, s.ndv);
+}
+
+test "retains its own copy of the derived IR after the caller's scratch dies" {
+    // Join.create builds its key-coercion casts (`to_*(col)` named after the
+    // column) in an arena that dies when create returns. The IR is read
+    // again long after that: chain clones re-resolve it and the join's
+    // shared-stage peel inspects the call shape. A shallow copy aliased the
+    // dead arena and segfaulted the ReleaseFast server under the wayroll
+    // report suites. Scribbling the caller's bytes after create must not
+    // change what the operator sees.
+    const Source = struct {
+        pub fn next(_: *@This()) anyerror!?Batch {
+            return null;
+        }
+        pub fn deinit(_: *@This()) void {}
+        pub fn outputSchema(_: *@This()) []const Column {
+            return &.{.{ .name = "a", .type = .int }};
+        }
+        pub fn addPrune(_: *@This(), _: Predicate) anyerror!void {}
+        pub fn stats(_: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = 0, .column_stats = &.{} };
+        }
+        pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+            return null;
+        }
+        pub fn explain(_: *@This(), _: *std.ArrayList(u8), _: Allocator, _: usize) anyerror!void {}
+    };
+    var name_buf = "a".*;
+    var fn_buf = "to_bigint".*;
+    var arg_buf = "a".*;
+    var args = [_]Expr{.{ .col_ref = &arg_buf }};
+    var derived = [_]Derived{.{ .name = &name_buf, .expr = .{ .call = .{ .fn_name = &fn_buf, .args = &args } } }};
+    var src = Source{};
+    var q = try Compute.create(std.testing.allocator, exec.makeQuery(std.testing.allocator, &src), &derived);
+    defer q.deinit();
+
+    name_buf[0] = '?';
+    @memset(&fn_buf, '?');
+    arg_buf[0] = '?';
+    args[0] = .{ .lit = .{ .int = 0 } };
+    derived[0] = .{ .name = "gone", .expr = .{ .col_ref = "gone" } };
+
+    const c = exec.queryAs(Compute, q).?;
+    try std.testing.expectEqualStrings("a", c.derived_ir[0].name);
+    try std.testing.expectEqualStrings("to_bigint", c.derived_ir[0].expr.call.fn_name);
+    try std.testing.expectEqualStrings("a", c.derived_ir[0].expr.call.args[0].col_ref);
 }
