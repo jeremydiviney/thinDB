@@ -90,6 +90,11 @@ pub const Table = struct {
 
     table_dir: Io.Dir,
     segments_dir: Io.Dir,
+    /// False while a DDL swap (ALTER rewrite, RENAME) has closed the two
+    /// directory handles and not yet reopened them. A swap that fails in
+    /// between leaves them closed for good; `close` must not close them again
+    /// (Windows reports INVALID_HANDLE, POSIX would hit a reused descriptor).
+    dirs_open: bool = true,
 
     manifest: storage.Manifest,
     /// Active memtable. Heap-allocated + refcounted so concurrent scans
@@ -320,8 +325,10 @@ pub const Table = struct {
         // memtable stays alive until the last reader releases it.
         self.memtable.release();
         self.manifest.deinit();
-        self.segments_dir.close(io);
-        self.table_dir.close(io);
+        if (self.dirs_open) {
+            self.segments_dir.close(io);
+            self.table_dir.close(io);
+        }
         self.schema_owner.deinit();
         allocator.free(self.order_key_indices);
         allocator.free(self.name);
@@ -752,6 +759,14 @@ pub const Table = struct {
 
     fn recordIoFailure(self: *Table, err: anyerror) void {
         if (err != error.DurabilityUncertain) return;
+        self.requireRecovery();
+    }
+
+    /// Fence every later operation with `RecoveryRequired` until the database
+    /// is reopened. Raised when the on-disk state can no longer be trusted:
+    /// an uncertain durability write, or a DDL swap that failed after the
+    /// table's directory handles were closed.
+    pub fn requireRecovery(self: *Table) void {
         self.recovery_required.store(true, .release);
         if (self.statement_gate) |gate| gate.recovery_required.store(true, .release);
     }

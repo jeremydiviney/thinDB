@@ -75,20 +75,28 @@ pub fn writeFileAtomic(
 ) !void {
     try writeFileSynced(io, dir, temporary_path, data, durable);
     errdefer dir.deleteFile(io, temporary_path) catch {};
-    // Windows can temporarily refuse replacement while another handle or a
-    // filesystem filter holds the destination. Retry only before publication;
-    // a persistent denial must preserve the old file and reach the caller.
+    // Retry only before publication; a persistent denial must preserve the
+    // old file and reach the caller.
+    try retryTransientWindowsRefusal(io, Io.Dir.rename, .{ dir, temporary_path, dir, path, io });
+    if (durable) syncDirectory(io, dir) catch return error.DurabilityUncertain;
+}
+
+/// Windows can temporarily refuse to rename or delete a directory entry while
+/// another handle or a filesystem filter still holds it. Runs `op(args...)`,
+/// retrying AccessDenied with exponential backoff (1..32 ms) on Windows only.
+/// Any other error, or a refusal that outlives the backoff, reaches the caller
+/// unchanged.
+pub fn retryTransientWindowsRefusal(io: Io, comptime op: anytype, args: anytype) !void {
     var retry_delay_ms: i64 = 1;
     while (true) {
-        Io.Dir.rename(dir, temporary_path, dir, path, io) catch |err| {
+        @call(.auto, op, args) catch |err| {
             if (@import("builtin").os.tag != .windows or err != error.AccessDenied or retry_delay_ms > 32) return err;
             try Io.sleep(io, .fromMilliseconds(retry_delay_ms), .awake);
             retry_delay_ms *= 2;
             continue;
         };
-        break;
+        return;
     }
-    if (durable) syncDirectory(io, dir) catch return error.DurabilityUncertain;
 }
 
 // ---------------------------------------------------------------------------

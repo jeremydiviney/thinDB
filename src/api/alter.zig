@@ -270,12 +270,18 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     }
     t.segments_dir.close(t.io);
     t.table_dir.close(t.io);
+    t.dirs_open = false;
     shadow_segs.close(t.io);
     shadow_dir.close(t.io);
     shadow_open = false;
+    // Past this point the Table owns no directory handles. A failed swap
+    // leaves the on-disk tree in whichever state the failing step reached,
+    // so fence the table until reopen instead of letting later operations
+    // reach through dead handles (`close` skips them via dirs_open).
+    errdefer t.requireRecovery();
 
-    try s.schema_dir.deleteTree(t.io, t.name);
-    try s.schema_dir.rename(shadow_name, s.schema_dir, t.name, t.io);
+    try storage.retryTransientWindowsRefusal(t.io, Io.Dir.deleteTree, .{ s.schema_dir, t.io, t.name });
+    try storage.retryTransientWindowsRefusal(t.io, Io.Dir.rename, .{ s.schema_dir, shadow_name, s.schema_dir, t.name, t.io });
 
     // 6. Re-open Table state under the new schema.
     try reInitTableState(s, t, new_fp, had_wal);
@@ -405,7 +411,11 @@ fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64, recreate_wal: bool) !v
     const io = t.io;
 
     t.table_dir = try s.schema_dir.openDir(io, t.name, .{});
-    t.segments_dir = try t.table_dir.openDir(io, "segments", .{});
+    t.segments_dir = t.table_dir.openDir(io, "segments", .{}) catch |err| {
+        t.table_dir.close(io);
+        return err;
+    };
+    t.dirs_open = true;
     if (recreate_wal) {
         t.wal = try engine.wal.WalWriter.create(allocator, io, t.table_dir, new_fp);
     }
