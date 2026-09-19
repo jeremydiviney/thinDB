@@ -260,6 +260,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
     const per_value = @sizeOf(Value) + 32;
 
     while (try q.next()) |batch| {
+        if (batch.row_count == 0) continue;
         const view = batch.values[0];
         var i: usize = 0;
         while (i < batch.row_count) : (i += 1) {
@@ -288,9 +289,16 @@ fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
     const schema = q.outputSchema();
     if (schema.len != 1) return Error.BadRequest;
 
-    const first_batch: Batch = (try q.next()) orelse return Error.BadRequest; // zero rows
+    // Operators may emit heading/trailing zero-row batches; only rows count.
+    var first_batch: Batch = undefined;
+    while (true) {
+        first_batch = (try q.next()) orelse return Error.BadRequest; // zero rows
+        if (first_batch.row_count > 0) break;
+    }
     if (first_batch.row_count != 1) return Error.BadRequest;
-    if (try q.next() != null) return Error.BadRequest; // multi-row
+    while (try q.next()) |rest| {
+        if (rest.row_count > 0) return Error.BadRequest; // multi-row
+    }
 
     const view = first_batch.values[0];
     return try extractScalarValue(try ctx.subqueryArena(), view);

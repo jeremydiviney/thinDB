@@ -192,3 +192,71 @@ test "INSERT SELECT: width mismatch rejected" {
         try std.testing.expectEqual(thindb.net.Error.BadRequest, err);
     }
 }
+
+test "INSERT SELECT: bare NULL literal lands in non-string nullable columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(
+        allocator,
+        db,
+        "CREATE TABLE sink (id BIGINT PRIMARY KEY, amt DECIMAL(10,2), ts DATETIME, d DATE, " ++
+            "f DOUBLE, k INT, s VARCHAR(8), n INT NOT NULL)",
+    );
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, n INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)");
+    const src = try db.openTable("src", .{});
+    try src.flush();
+
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO sink (id, n, amt, ts, d, f, k, s) " ++
+            "SELECT id, n, NULL AS a, NULL AS b, NULL AS c, NULL AS e, NULL AS g, NULL AS h FROM src",
+    );
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO sink (id, amt, ts, d, f, k, s, n) " ++
+            "SELECT id + 100, NULL AS a, NULL AS b, NULL AS c, NULL AS e, NULL AS g, NULL AS h, n FROM src WHERE id = 1",
+    );
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO sink (id, n, k, amt, ts, d, f, s) " ++
+            "SELECT id + 10, n, CASE WHEN id = 1 THEN NULL ELSE n END, NULL AS a, NULL AS b, NULL AS c, NULL AS e, NULL AS h FROM src",
+    );
+
+    const nulled = try collectBigints(
+        allocator,
+        db,
+        "SELECT id FROM sink WHERE amt IS NULL AND ts IS NULL AND d IS NULL AND f IS NULL " ++
+            "AND k IS NULL AND s IS NULL ORDER BY id ASC",
+    );
+    defer allocator.free(nulled);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 11, 101 }, nulled);
+
+    const ns = try collectBigints(allocator, db, "SELECT CAST(n AS BIGINT) FROM sink ORDER BY id ASC");
+    defer allocator.free(ns);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 20, 30, 10, 20, 30, 10 }, ns);
+
+    const ks = try collectBigints(allocator, db, "SELECT CAST(k AS BIGINT) FROM sink WHERE k IS NOT NULL ORDER BY id ASC");
+    defer allocator.free(ks);
+    try std.testing.expectEqualSlices(i64, &.{ 20, 30 }, ks);
+
+    // NULL into a NOT NULL target is still a type error, not a silent placeholder.
+    try helpers.expectRunError(
+        allocator,
+        db,
+        "INSERT INTO sink (id, n, amt, ts, d, f, k, s) " ++
+            "SELECT id + 200, NULL AS z, NULL AS a, NULL AS b, NULL AS c, NULL AS e, NULL AS g, NULL AS h FROM src",
+        error.TypeMismatch,
+    );
+    const count = try collectBigints(allocator, db, "SELECT COUNT(*) FROM sink");
+    defer allocator.free(count);
+    try std.testing.expectEqualSlices(i64, &.{7}, count);
+}

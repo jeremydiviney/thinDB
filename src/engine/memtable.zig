@@ -457,8 +457,11 @@ pub const Memtable = struct {
             // whichever string column the schema declares.
             const sch_tag = @as(types.TypeTag, sch_col.type);
             const batch_tag = @as(types.TypeTag, batch_schema[bi].type);
+            // An all-NULL batch column has no type of its own (a bare NULL
+            // literal arrives string-typed) and may land in any nullable column.
             const ok = sch_tag == batch_tag or
-                (isStringTag(sch_tag) and isStringTag(batch_tag));
+                (isStringTag(sch_tag) and isStringTag(batch_tag)) or
+                (sch_col.nullable and column_views[bi].allNull(row_count));
             if (!ok) return Error.TypeMismatch;
             // Wire-side nullable=true into a NOT-NULL schema column is a
             // hazard (some incoming rows may be NULL); reject so the
@@ -473,7 +476,13 @@ pub const Memtable = struct {
         // restore of every column's ArrayList lengths.
         for (0..self.schema.columns.len) |si| {
             const view = column_views[batch_idx_for_schema[si]];
-            try self.appendColumnFromView(si, view, row_count);
+            self.appendColumnFromView(si, view, row_count) catch |err| switch (err) {
+                Error.TypeMismatch => {
+                    if (!self.schema.columns[si].nullable or !view.allNull(row_count)) return err;
+                    for (0..row_count) |_| try self.appendNullToColumn(si);
+                },
+                else => return err,
+            };
         }
         self.row_count += @intCast(row_count);
     }

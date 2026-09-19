@@ -201,6 +201,14 @@ pub const ZonemapTopN = struct {
         errdefer allocator.free(probe_schema);
         for (probe_phys, 0..) |phys, i| probe_schema[i] = table.schema.columns[phys];
 
+        // The probe evaluation reads `pred` directly, so its literals must be
+        // coerced to the probe columns' types (text → temporal, integer
+        // widening, …) exactly as `Filter.create` does for the reference path.
+        // An un-coerced literal reads the wrong `Value` field — which is how
+        // `updatedAt >= '<text>' ORDER BY id LIMIT n` came back unfiltered.
+        var validated = pred;
+        try predicate.validateExpr(&validated, probe_schema);
+
         // Build the inner late-mat plan: pins the memtable + ddl_lock and gives
         // us the wide-column materializer. We never call `inner.next()`.
         const scan_ptr = try Scan.allocWithProjectionLoc(allocator, table, accountant_ptr, probe_names, true, null);
@@ -208,7 +216,7 @@ pub const ZonemapTopN = struct {
         var late_built = false;
         errdefer if (!late_built) inner.deinit();
 
-        inner = try inner.filter(pred);
+        inner = try inner.filter(validated);
         inner = try inner.topN(order_specs, n, offset);
         var late_q = try LateScan.create(allocator, inner, scan_ptr, table, output_names);
         late_built = true;
@@ -226,7 +234,7 @@ pub const ZonemapTopN = struct {
             .late = late,
             .inner_scan = scan_ptr,
             .segment_count = scan_ptr.segment_count,
-            .pred = pred,
+            .pred = validated,
             .probe_phys = probe_phys,
             .probe_schema = probe_schema,
             .key_phys = key_phys,
@@ -287,9 +295,11 @@ pub const ZonemapTopN = struct {
 
         const locs = try self.collectTopK();
         defer self.allocator.free(locs);
-        if (locs.len == 0) {
-            return Batch{ .schema = self.out_schema, .values = &.{}, .row_count = 0 };
-        }
+        // No survivors ⇒ end of stream. A batch must carry one view per
+        // output column; consumers (subquery drains, downstream operators)
+        // index `values` before looking at `row_count`, so a view-less
+        // zero-row batch is an out-of-bounds read — the #46 server crash.
+        if (locs.len == 0) return null;
 
         try self.late.materializeInto(locs, self.inner_scan.memtableSnap());
         const out = self.late.outputColumns();
@@ -806,7 +816,7 @@ const CandidateHeap = struct {
     /// storage order and it keeps the earliest arrival among ties.)
     fn candidateWorseThanRow(self: *const CandidateHeap, views: []const ColumnView, row: usize, loc: i64, other: u32) bool {
         for (self.key_cols, 0..) |kc, i| {
-            const ord = transform.compareViewRows(views[self.z.key_probe_idx[i]], row, kc.view(), other);
+            const ord = transform.compareViewRowsNullsFirst(views[self.z.key_probe_idx[i]], row, kc.view(), other);
             if (ord == .lt) return self.z.key_desc[i];
             if (ord == .gt) return !self.z.key_desc[i];
         }
@@ -818,7 +828,7 @@ const CandidateHeap = struct {
     /// Key ties break on storage location, matching `candidateWorseThanRow`.
     fn rowWorse(self: *const CandidateHeap, a: u32, b: u32) bool {
         for (self.key_cols, 0..) |kc, i| {
-            const ord = transform.compareInColumn(kc, a, b);
+            const ord = transform.compareInColumnNullsFirst(kc, a, b);
             if (ord == .lt) return self.z.key_desc[i];
             if (ord == .gt) return !self.z.key_desc[i];
         }
@@ -829,7 +839,7 @@ const CandidateHeap = struct {
     /// location tie-break for a deterministic emit order.
     fn permLess(self: *CandidateHeap, a: u32, b: u32) bool {
         for (self.key_cols, 0..) |kc, i| {
-            const ord = transform.compareInColumn(kc, a, b);
+            const ord = transform.compareInColumnNullsFirst(kc, a, b);
             if (ord == .lt) return !self.z.key_desc[i];
             if (ord == .gt) return self.z.key_desc[i];
         }
