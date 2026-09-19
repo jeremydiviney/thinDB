@@ -55,8 +55,11 @@ Requires JDK 17 + Maven, or use Docker:
 
 ```
 docker run --rm -v "$(pwd):/app" -v m2cache:/root/.m2 -w /app \
-  maven:3.9-eclipse-temurin-17 mvn -q -DskipTests package
+  maven:3.9-eclipse-temurin-17 mvn -q package
 ```
+
+Unit tests (`src/test`) cover every Debezium and Connect temporal encoding;
+drop `-DskipTests` only if you must.
 
 Produces `target/thindb-flink-cdc.jar` (Jackson shaded in; Flink, the CDC
 connector, and the MySQL driver are `provided`).
@@ -95,17 +98,27 @@ example. `flushRows`/`flushIntervalMs` bound the buffer; larger flushes widen
 the compaction window (20,000 works well for bulk replays, 2,000 for at-head
 trickle).
 
-**`tables`** — every table to sink, with ordered columns and their Debezium
-semantic types (`INT`, `TINYINT`, `BIGINT`, `DATE`, `DATETIME`, `DECIMAL`,
-anything else is passed through as text) and the primary-key column list.
-Composite keys are supported. Target tables must already exist in thinDB with
-matching primary keys.
+**`tables`** — every table to sink, with ordered columns, the sink coercion
+for each (`INT`, `TINYINT`, `BIGINT`, `DECIMAL`, `DATE`, `DATETIME`, `TIME`,
+`TIMESTAMP`; anything else is passed through as text) and the primary-key
+column list. Composite keys are supported. Target tables must already exist
+in thinDB with matching primary keys.
 
 ## Semantics and caveats
 
 - Deletes are applied by primary key from the Debezium `before` image.
 - `DECIMAL` uses `decimal.handling.mode=string` to avoid float drift.
-- `DATETIME` values are interpreted as UTC (`server-time-zone=UTC`).
+- Temporal values are rendered from the Kafka Connect schema name Debezium
+  attaches to each field, never from the config type word: MySQL
+  `DATETIME(0-3)` arrives as epoch millis (`io.debezium.time.Timestamp`),
+  `DATETIME(4-6)` as epoch micros (`MicroTimestamp`), `TIMESTAMP` as an
+  ISO-8601 string with offset (`ZonedTimestamp`), `DATE` as epoch days,
+  `TIME` as micros of day, and the `time.precision.mode=connect` variants as
+  Connect logical types. All of them become UTC text in thinDB's
+  `yyyy-MM-dd HH:mm:ss.ffffff` / `yyyy-MM-dd` / `HH:mm:ss.ffffff` form
+  (`server-time-zone=UTC`). A config that labels a non-temporal column
+  `DATE`/`DATETIME`/`TIME`/`TIMESTAMP` fails the job loudly instead of
+  storing a mistyped literal.
 - Snapshot-phase backfill reconciliation is skipped
   (`skipSnapshotBackfill(true)`): safe for PK-upsert sinks, where re-delivered
   rows dedup on key — and it prevents unbounded state growth when

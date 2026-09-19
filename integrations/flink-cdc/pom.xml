@@ -49,11 +49,22 @@
       <artifactId>jackson-databind</artifactId>
       <version>2.15.4</version>
     </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
     <finalName>thindb-flink-cdc</finalName>
     <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
@@ -67,6 +78,13 @@
                 <relocation>
                   <pattern>com.fasterxml.jackson</pattern>
                   <shadedPattern>dev.thindb.shaded.jackson</shadedPattern>
+                </relocation>
+                <!-- The cluster ships flink-sql-connector-mysql-cdc, which
+                     relocates Kafka Connect under this prefix; the deserializer
+                     is compiled against the plain API and rewritten to match. -->
+                <relocation>
+                  <pattern>org.apache.kafka.connect</pattern>
+                  <shadedPattern>org.apache.flink.cdc.connectors.shaded.org.apache.kafka.connect</shadedPattern>
                 </relocation>
               </relocations>
             </configuration>
