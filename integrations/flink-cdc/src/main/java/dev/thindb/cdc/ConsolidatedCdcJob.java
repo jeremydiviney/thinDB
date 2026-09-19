@@ -7,7 +7,6 @@ import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.cdc.connectors.mysql.source.MySqlSource;
 import org.apache.flink.cdc.connectors.mysql.table.StartupOptions;
-import org.apache.flink.cdc.debezium.JsonDebeziumDeserializationSchema;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
@@ -22,11 +21,6 @@ import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
-import java.time.Instant;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -95,7 +89,7 @@ public class ConsolidatedCdcJob {
         .connectTimeout(java.time.Duration.ofSeconds(60))
         .jdbcProperties(jdbcProps)
         .debeziumProperties(dbzProps)
-        .deserializer(new JsonDebeziumDeserializationSchema())
+        .deserializer(new NormalizedJsonDeserializer())
         .build();
 
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -171,9 +165,6 @@ public class ConsolidatedCdcJob {
     private transient long lastFlush;
     private transient ListState<byte[]> dummyState; // required by the interface; buffer is flushed, never stored
 
-    private static final DateTimeFormatter DT =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS");
-
     RoutingJdbcSink(String url, String user, String pass, int flushRows, long flushIntervalMs,
                     List<TableCfg> tables) {
       this.url = url;
@@ -212,7 +203,7 @@ public class ConsolidatedCdcJob {
         Object[] vals = new Object[t.pk.size()];
         for (int i = 0; i < t.pk.size(); i++) {
           String col = t.pk.get(i);
-          vals[i] = convert(before.get(col), t.types.get(t.cols.indexOf(col)));
+          vals[i] = convertColumn(t, t.cols.indexOf(col), before.get(col));
         }
         buffer.add(new Op(table, true, vals));
       } else { // c, r, u -> upsert from after image
@@ -220,7 +211,7 @@ public class ConsolidatedCdcJob {
         if (after == null || after.isNull()) return;
         Object[] vals = new Object[t.cols.size()];
         for (int i = 0; i < t.cols.size(); i++) {
-          vals[i] = convert(after.get(t.cols.get(i)), t.types.get(i));
+          vals[i] = convertColumn(t, i, after.get(t.cols.get(i)));
         }
         buffer.add(new Op(table, false, vals));
       }
@@ -230,18 +221,31 @@ public class ConsolidatedCdcJob {
       }
     }
 
-    /** Debezium JSON semantic types -> JDBC values thinDB accepts. */
+    private static Object convertColumn(TableCfg t, int i, JsonNode v) {
+      try {
+        return convert(v, t.types.get(i));
+      } catch (RuntimeException e) {
+        throw new IllegalStateException(t.name + "." + t.cols.get(i) + ": " + e.getMessage(), e);
+      }
+    }
+
+    /**
+     * Config type words -> JDBC values. Temporal columns arrive already
+     * rendered as text by {@link NormalizedJsonDeserializer}, whatever unit
+     * Debezium chose for them. A non-text value here means the config calls a
+     * non-temporal MySQL column temporal; that must fail here, not reach
+     * thinDB as a mistyped literal.
+     */
     static Object convert(JsonNode v, String type) {
       if (v == null || v.isNull()) return null;
       return switch (type) {
         case "INT", "TINYINT" -> v.asInt();
         case "BIGINT" -> v.asLong();
-        case "DATE" -> LocalDate.ofEpochDay(v.asLong()).toString(); // io.debezium.time.Date = epoch days
-        case "DATETIME" -> { // io.debezium.time.MicroTimestamp = epoch micros (UTC)
-          long us = v.asLong();
-          LocalDateTime ldt = LocalDateTime.ofInstant(
-              Instant.ofEpochSecond(us / 1_000_000, (us % 1_000_000) * 1000), ZoneOffset.UTC);
-          yield ldt.format(DT);
+        case "DATE", "DATETIME", "TIME", "TIMESTAMP" -> {
+          if (!v.isTextual()) {
+            throw new IllegalStateException(type + " column arrived as " + v.getNodeType() + " " + v);
+          }
+          yield v.asText();
         }
         case "DECIMAL" -> v.asText(); // decimal.handling.mode=string
         default -> v.isNumber() ? v.numberValue() : v.asText();
