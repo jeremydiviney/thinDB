@@ -9,6 +9,7 @@ const Io = std.Io;
 
 const types = @import("../types.zig");
 const TableSchema = types.TableSchema;
+const storage = @import("../storage/storage.zig");
 
 const api = @import("api.zig");
 const Config = api.Config;
@@ -380,11 +381,19 @@ pub const Schema = struct {
 
         t.segments_dir.close(t.io);
         t.table_dir.close(t.io);
+        t.dirs_open = false;
+        // Same contract as execAlter's swap: a failure here leaves the table
+        // without directory handles, so fence it until reopen.
+        errdefer t.requireRecovery();
 
-        try self.schema_dir.rename(old_name, self.schema_dir, new_name, self.io);
+        try storage.retryTransientWindowsRefusal(self.io, Io.Dir.rename, .{ self.schema_dir, old_name, self.schema_dir, new_name, self.io });
 
         t.table_dir = try self.schema_dir.openDir(self.io, new_name, .{});
-        t.segments_dir = try t.table_dir.openDir(t.io, "segments", .{});
+        t.segments_dir = t.table_dir.openDir(t.io, "segments", .{}) catch |err| {
+            t.table_dir.close(t.io);
+            return err;
+        };
+        t.dirs_open = true;
         if (had_wal) {
             t.wal = try @import("../engine/engine.zig").wal.WalWriter.create(
                 t.allocator,

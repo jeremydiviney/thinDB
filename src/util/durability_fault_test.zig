@@ -9,6 +9,9 @@ const DirectorySyncFault = struct {
     remaining: usize = 0,
     rename_failures: usize = 0,
     rename_calls: usize = 0,
+    /// When set, only renames whose source path starts with this prefix are
+    /// refused; everything else reaches the real backend.
+    rename_fail_prefix: ?[]const u8 = null,
 
     fn io(self: *@This()) Io {
         const base = self.threaded.io();
@@ -36,7 +39,8 @@ const DirectorySyncFault = struct {
         const threaded: *Io.Threaded = @ptrCast(@alignCast(userdata.?));
         const self: *@This() = @fieldParentPtr("threaded", threaded);
         self.rename_calls += 1;
-        if (self.rename_failures > 0) {
+        const targeted = if (self.rename_fail_prefix) |prefix| std.mem.startsWith(u8, old_path, prefix) else true;
+        if (targeted and self.rename_failures > 0) {
             self.rename_failures -= 1;
             return error.AccessDenied;
         }
@@ -100,4 +104,41 @@ test "durability: post-rename directory sync failure fences writes until reopen"
         rows += batch.row_count;
     }
     try std.testing.expectEqual(@as(usize, 1), rows);
+}
+
+test "durability: alter swap retries a transient rename refusal and fences the table on a persistent one" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Refuse only the swap's `__alter_<name>` -> `<name>` rename; the manifest
+    // and schema publications inside the rewrite keep the real backend.
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "__alter_" };
+    defer fault.threaded.deinit();
+    const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
+    defer db.close();
+    const table_def: @import("../types.zig").TableSchema = .{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const add_note: api.AlterOp = .{ .add = .{ .name = "note", .type = .bigint, .nullable = true } };
+
+    if (@import("builtin").os.tag == .windows) {
+        const retried = try db.table("t", table_def, .{ .order_key = &.{"id"} });
+        try retried.insert(&.{.{ .id = @as(i64, 7) }});
+        try retried.flush();
+        fault.rename_failures = 2;
+        try db.alterTable("t", &.{add_note});
+        try std.testing.expectEqual(@as(usize, 0), fault.rename_failures);
+        try std.testing.expect(retried.schema.columnIndex("note") != null);
+    }
+
+    const fenced = try db.table("u", table_def, .{ .order_key = &.{"id"} });
+    try fenced.insert(&.{.{ .id = @as(i64, 7) }});
+    try fenced.flush();
+    fault.rename_failures = std.math.maxInt(usize);
+    try std.testing.expectError(error.AccessDenied, db.alterTable("u", &.{add_note}));
+    try std.testing.expectError(error.RecoveryRequired, fenced.insert(&.{.{ .id = @as(i64, 8) }}));
+    try std.testing.expectError(error.RecoveryRequired, exec.scan(a, fenced));
+    // `db.close()` must skip the directory handles the failed swap closed.
 }
