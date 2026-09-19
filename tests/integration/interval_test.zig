@@ -123,3 +123,26 @@ test "INTERVAL: unknown unit rejected at parse time" {
     const err = thindb.sql.parse(arena.allocator(), "SELECT d + INTERVAL '1' FORTNIGHT FROM t");
     try std.testing.expectError(thindb.sql.ParseError.SqlExpectedKeyword, err);
 }
+
+test "ADDDATE / SUBDATE are MySQL spellings of DATE_ADD / DATE_SUB" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT ADDDATE(d, INTERVAL 10 DAY) AS r FROM t WHERE id = 1", "SELECT DATE_ADD(d, INTERVAL 10 DAY) AS r FROM t WHERE id = 1" },
+        .{ "SELECT ADDDATE(d, 10) AS r FROM t WHERE id = 1", "SELECT DATE_ADD(d, INTERVAL 10 DAY) AS r FROM t WHERE id = 1" },
+        .{ "SELECT SUBDATE(d, INTERVAL 1 MONTH) AS r FROM t WHERE id = 2", "SELECT DATE_SUB(d, INTERVAL 1 MONTH) AS r FROM t WHERE id = 2" },
+        .{ "SELECT ADDDATE(LAST_DAY(SUBDATE(d, INTERVAL 1 MONTH)), 1) AS r FROM t WHERE id = 1", "SELECT DATE_ADD(LAST_DAY(DATE_SUB(d, INTERVAL 1 MONTH)), 1) AS r FROM t WHERE id = 1" },
+    };
+    inline for (cases) |c| {
+        const alias = try collectDates(allocator, db, c[0]);
+        defer allocator.free(alias);
+        const canonical = try collectDates(allocator, db, c[1]);
+        defer allocator.free(canonical);
+        try std.testing.expectEqualSlices(i32, canonical, alias);
+    }
+}

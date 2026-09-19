@@ -1835,11 +1835,16 @@ fn appendExpandedProjectItem(
     output: ?[]const u8,
     replace_on_collision: bool,
 ) !void {
+    // `*` names its columns exactly as listing them would: a qualified
+    // upstream name (AliasRename over a join side) outputs its bare name,
+    // and the collision rule below restores the qualifier where two sides
+    // share one.
     if (std.mem.eql(u8, item, "*")) {
         for (schema) |c| {
+            const split = types.splitQualifiedName(c.name);
             try sources.append(allocator, c.name);
-            try outputs.append(allocator, c.name);
-            try stripped.append(allocator, false);
+            try outputs.append(allocator, if (split) |s| s.bare else c.name);
+            try stripped.append(allocator, split != null);
         }
         return;
     }

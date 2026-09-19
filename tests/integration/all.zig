@@ -23,6 +23,7 @@ test {
     _ = @import("compute_scalar_test.zig");
     _ = @import("decimal_test.zig");
     _ = @import("join_test.zig");
+    _ = @import("star_join_test.zig");
     _ = @import("aggregate_test.zig");
     _ = @import("plan_test.zig");
     _ = @import("sql_test.zig");

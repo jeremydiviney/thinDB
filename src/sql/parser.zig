@@ -198,8 +198,8 @@ fn unitFirstArgCall(name: []const u8) bool {
 const DateAddSubKind = enum { add, sub };
 
 fn dateAddSubName(name: []const u8) ?DateAddSubKind {
-    if (std.ascii.eqlIgnoreCase(name, "date_add")) return .add;
-    if (std.ascii.eqlIgnoreCase(name, "date_sub")) return .sub;
+    if (std.ascii.eqlIgnoreCase(name, "date_add") or std.ascii.eqlIgnoreCase(name, "adddate")) return .add;
+    if (std.ascii.eqlIgnoreCase(name, "date_sub") or std.ascii.eqlIgnoreCase(name, "subdate")) return .sub;
     return null;
 }
 
@@ -660,9 +660,11 @@ pub const Parser = struct {
         // missing FROM is a FROM-less SELECT (`SELECT 1+1`, `SELECT now()`):
         // evaluate the projection over one synthetic row.
         var root: *ir.Op = undefined;
+        var from_is_join = false;
         if (self.cur.tag == .kw_from) {
             try self.advance();
             root = try self.parseFromClause();
+            from_is_join = fromClauseIsJoin(root);
         } else {
             root = try self.allocOp(.{ .single_row = {} });
         }
@@ -1148,9 +1150,11 @@ pub const Parser = struct {
             // Hidden computed columns trail the row — the WHERE's predicate
             // anchors, the projection's own predicate anchors, then the
             // SELECT-list exprs/windows. `*` stops before all of them, so
-            // even a bare star projects when any exist.
+            // even a bare star projects when any exist. Over a join it
+            // projects too: the sides arrive alias-qualified and `*` names
+            // its columns as the explicit list would.
             const hidden_trailing = selectDerivedCount(proj) + where_derived_count + @as(u32, @intCast(projection_predicate_derived.len));
-            if (!isBareStarProjection(proj) or hidden_trailing > 0) {
+            if (!isBareStarProjection(proj) or hidden_trailing > 0 or from_is_join) {
                 root = try self.addSelectProject(root, proj, hidden_trailing);
             }
         }
@@ -1810,7 +1814,7 @@ pub const Parser = struct {
         const args = try self.parseCallArgList(&saw_distinct);
         if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
         try self.advance();
-        _ = try parse_ddl.parseColumnType(self);
+        _ = try self.parseCastType();
         try self.expect(.rparen);
         if (saw_distinct) {
             const distinct_func: ir.AggFunc = switch (func) {
@@ -2343,8 +2347,25 @@ pub const Parser = struct {
     /// in a `cast_as_<T>(inner)` scalar call. Used by both CAST(... AS T)
     /// and the `inner::T` postfix.
     fn parseCastTarget(self: *Parser, inner: ir.Expr) ParseError!ir.Expr {
-        const ty = try parse_ddl.parseColumnType(self);
+        const ty = try self.parseCastType();
         return try self.castExprToType(inner, ty);
+    }
+
+    /// A CAST target is a column type plus MySQL's cast-only spellings
+    /// `SIGNED [INTEGER]` / `UNSIGNED [INTEGER]`, both a 64-bit integer here.
+    fn parseCastType(self: *Parser) ParseError!types.Type {
+        if (self.cur.tag == .identifier and
+            (std.ascii.eqlIgnoreCase(self.cur.text, "signed") or std.ascii.eqlIgnoreCase(self.cur.text, "unsigned")))
+        {
+            try self.advance();
+            if (self.cur.tag == .identifier and
+                (std.ascii.eqlIgnoreCase(self.cur.text, "integer") or std.ascii.eqlIgnoreCase(self.cur.text, "int")))
+            {
+                try self.advance();
+            }
+            return .bigint;
+        }
+        return try parse_ddl.parseColumnType(self);
     }
 
     fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
@@ -4288,8 +4309,17 @@ pub const Parser = struct {
     }
 };
 
-/// Returns true when the projection's name+order already match the
-/// natural output of a GroupBy: `[group_cols..., agg_aliases...]`.
+/// A FROM clause that built a join, seen through the wrappers
+/// parseFromClause stacks on top of one.
+fn fromClauseIsJoin(root: *const ir.Op) bool {
+    var cur = root;
+    while (true) switch (cur.*) {
+        .join => return true,
+        .exclude => |e| cur = e.upstream,
+        else => return false,
+    };
+}
+
 fn isBareStarProjection(proj: []const ProjItem) bool {
     if (proj.len != 1) return false;
     return switch (proj[0].kind) {
@@ -4315,6 +4345,8 @@ fn projectionHasRenamedCols(proj: []const ProjItem) bool {
     return false;
 }
 
+/// Returns true when the projection's name+order already match the
+/// natural output of a GroupBy: `[group_cols..., agg_aliases...]`.
 fn projMatchesGroupByOrder(proj: []const ProjItem, group_cols: []const []const u8) bool {
     if (proj.len != group_cols.len + countAggs(proj)) return false;
     var i: usize = 0;
