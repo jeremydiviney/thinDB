@@ -52,6 +52,13 @@ pub const ColumnView = struct {
         return true;
     }
 
+    /// True when any of the first `rows` rows is NULL.
+    pub fn anyNull(self: ColumnView, rows: usize) bool {
+        const bm = self.nulls orelse return false;
+        for (0..rows) |row| if (!isValidBit(bm, row)) return true;
+        return false;
+    }
+
     /// Append row `row`'s value as self-delimiting bytes: equal values give
     /// equal bytes, so a concatenation over columns keys a row or a tuple.
     pub fn appendValueBytes(self: ColumnView, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), row: u32) !void {

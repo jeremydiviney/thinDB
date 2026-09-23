@@ -285,3 +285,94 @@ test "INSERT SELECT: repeated unaliased items insert positionally" {
     defer allocator.free(cs);
     try std.testing.expectEqualSlices(i64, &.{ 10, 20, 20, 40 }, cs);
 }
+
+test "INSERT SELECT: literals and narrower columns widen into the target types" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE sink2 (id BIGINT NOT NULL, amt DECIMAL(10,2), n INT NOT NULL, PRIMARY KEY (id))");
+    try exec(allocator, db, "INSERT INTO sink2 (id, amt, n) SELECT 4, 1.5, 40");
+    try exec(allocator, db, "INSERT INTO sink2 (id, n) SELECT 5, 50");
+
+    // A DECIMAL(12,4) payload must be rescaled, not stored as if it were
+    // already at scale 2.
+    try exec(allocator, db, "CREATE TABLE src2 (k INT NOT NULL, price DECIMAL(12,4) NOT NULL, small SMALLINT NOT NULL, m INT, PRIMARY KEY (k))");
+    try exec(allocator, db, "INSERT INTO src2 VALUES (1, 1.25, 11, 101), (2, 3.1, 22, NULL)");
+    try exec(allocator, db, "INSERT INTO sink2 SELECT k, price, small FROM src2");
+    // A nullable source lands in a NOT NULL column when its rows hold no NULL.
+    try exec(allocator, db, "INSERT INTO sink2 (id, n) SELECT k + 100, m FROM src2 WHERE k = 1");
+    const t = try db.openTable("sink2", .{});
+    try t.flush();
+
+    const ids = try collectBigints(allocator, db, "SELECT id FROM sink2 ORDER BY id");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 4, 5, 101 }, ids);
+    const cents = try collectBigints(allocator, db, "SELECT CAST(amt * 100 AS BIGINT) FROM sink2 WHERE amt IS NOT NULL ORDER BY id");
+    defer allocator.free(cents);
+    try std.testing.expectEqualSlices(i64, &.{ 125, 310, 150 }, cents);
+    const ns = try collectBigints(allocator, db, "SELECT CAST(n AS BIGINT) FROM sink2 ORDER BY id");
+    defer allocator.free(ns);
+    try std.testing.expectEqualSlices(i64, &.{ 11, 22, 40, 50, 101 }, ns);
+    const null_amt = try collectBigints(allocator, db, "SELECT id FROM sink2 WHERE amt IS NULL ORDER BY id");
+    defer allocator.free(null_amt);
+    try std.testing.expectEqualSlices(i64, &.{ 5, 101 }, null_amt);
+
+    // Narrowing and a NULL into a NOT NULL column are still rejected.
+    try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT 6, CAST(5000000000 AS BIGINT)", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT 7, 2.5", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT k + 200, m FROM src2", error.TypeMismatch);
+}
+
+test "INSERT SELECT: a date widens into a DATETIME column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, d DATE NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, '2024-03-15')");
+    try exec(allocator, db, "CREATE TABLE sink (id BIGINT PRIMARY KEY, ts DATETIME NOT NULL)");
+    try exec(allocator, db, "INSERT INTO sink SELECT id, d FROM src");
+
+    const hits = try collectBigints(allocator, db, "SELECT id FROM sink WHERE ts = '2024-03-15 00:00:00'");
+    defer allocator.free(hits);
+    try std.testing.expectEqualSlices(i64, &.{1}, hits);
+}
+
+test "INSERT SELECT: omitted columns take their DEFAULT, the clock, or NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1), (2)");
+    try exec(
+        allocator,
+        db,
+        "CREATE TABLE sink (id BIGINT PRIMARY KEY, qty INT NOT NULL DEFAULT 7, price DECIMAL(8,3) DEFAULT 1.25, " ++
+            "ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, note VARCHAR(8))",
+    );
+    try exec(allocator, db, "INSERT INTO sink (id) SELECT id FROM src");
+
+    const qtys = try collectBigints(allocator, db, "SELECT CAST(qty AS BIGINT) FROM sink ORDER BY id");
+    defer allocator.free(qtys);
+    try std.testing.expectEqualSlices(i64, &.{ 7, 7 }, qtys);
+    const mils = try collectBigints(allocator, db, "SELECT CAST(price * 1000 AS BIGINT) FROM sink ORDER BY id");
+    defer allocator.free(mils);
+    try std.testing.expectEqualSlices(i64, &.{ 1250, 1250 }, mils);
+    const filled = try collectBigints(allocator, db, "SELECT id FROM sink WHERE ts > '2020-01-01 00:00:00' AND note IS NULL ORDER BY id");
+    defer allocator.free(filled);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, filled);
+
+    try exec(allocator, db, "CREATE TABLE strict_sink (id BIGINT PRIMARY KEY, must INT NOT NULL)");
+    try helpers.expectRunError(allocator, db, "INSERT INTO strict_sink (id) SELECT id FROM src", error.ColumnNotFound);
+}
