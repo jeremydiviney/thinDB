@@ -3864,7 +3864,7 @@ pub const Parser = struct {
     fn tableColumns(self: *Parser, ref: ir.TableRef) ParseError!?[]const []const u8 {
         const ctx = self.sql_fns orelse return null;
         const tables = ctx.tables orelse return null;
-        return tables.lookup(tables.context, self.arena, ref);
+        return tables.lookup(tables.context, self.arena, ref.database, ref.schema, ref.name);
     }
 
     fn joinScalarAllowed(self: *Parser, name: []const u8) ParseError!bool {

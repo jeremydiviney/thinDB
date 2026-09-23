@@ -4,7 +4,6 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const TypeTag = types.TypeTag;
-const format = @import("format.zig");
 
 pub const StringView = struct {
     /// offsets[i] is the byte position of row i's first byte.
@@ -63,66 +62,29 @@ pub const ColumnView = struct {
     /// equal bytes, so a concatenation over columns keys a row or a tuple.
     pub fn appendValueBytes(self: ColumnView, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), row: u32) !void {
         switch (self.data) {
-            .int => |s| try format.appendI32(allocator, buf, s[row]),
-            .bigint => |s| try format.appendI64(allocator, buf, s[row]),
+            .int, .date => |s| try appendLittle(i32, allocator, buf, s[row]),
+            .bigint, .datetime, .decimal64 => |s| try appendLittle(i64, allocator, buf, s[row]),
             .boolean => |s| try buf.append(allocator, s[row]),
-            .varchar => |sv| {
+            .varchar, .string, .char, .json => |sv| {
                 const bytes = sv.rowBytes(row);
-                try format.appendU32(allocator, buf, @intCast(bytes.len));
+                try appendLittle(u32, allocator, buf, @intCast(bytes.len));
                 try buf.appendSlice(allocator, bytes);
             },
-            .string => |sv| {
-                const bytes = sv.rowBytes(row);
-                try format.appendU32(allocator, buf, @intCast(bytes.len));
-                try buf.appendSlice(allocator, bytes);
-            },
-            .float => |s| {
-                var b: [4]u8 = undefined;
-                format.writeF32(&b, s[row]);
-                try buf.appendSlice(allocator, &b);
-            },
-            .double => |s| {
-                var b: [8]u8 = undefined;
-                format.writeF64(&b, s[row]);
-                try buf.appendSlice(allocator, &b);
-            },
-            .date => |s| try format.appendI32(allocator, buf, s[row]),
-            .datetime => |s| try format.appendI64(allocator, buf, s[row]),
+            .float => |s| try appendLittle(u32, allocator, buf, @bitCast(s[row])),
+            .double => |s| try appendLittle(u64, allocator, buf, @bitCast(s[row])),
             .tinyint => |s| try buf.append(allocator, @bitCast(s[row])),
-            .smallint => |s| {
-                var b: [2]u8 = undefined;
-                std.mem.writeInt(i16, &b, s[row], .little);
-                try buf.appendSlice(allocator, &b);
-            },
-            .largeint => |s| {
-                var b: [16]u8 = undefined;
-                std.mem.writeInt(i128, &b, s[row], .little);
-                try buf.appendSlice(allocator, &b);
-            },
-            .char => |sv| {
-                const bytes = sv.rowBytes(row);
-                try format.appendU32(allocator, buf, @intCast(bytes.len));
-                try buf.appendSlice(allocator, bytes);
-            },
-            .decimal64 => |s| try format.appendI64(allocator, buf, s[row]),
-            .decimal128 => |s| {
-                var b: [16]u8 = undefined;
-                std.mem.writeInt(i128, &b, s[row], .little);
-                try buf.appendSlice(allocator, &b);
-            },
-            .uuid => |s| {
-                var b: [16]u8 = undefined;
-                std.mem.writeInt(u128, &b, s[row], .little);
-                try buf.appendSlice(allocator, &b);
-            },
-            .json => |sv| {
-                const bytes = sv.rowBytes(row);
-                try format.appendU32(allocator, buf, @intCast(bytes.len));
-                try buf.appendSlice(allocator, bytes);
-            },
+            .smallint => |s| try appendLittle(i16, allocator, buf, s[row]),
+            .largeint, .decimal128 => |s| try appendLittle(i128, allocator, buf, s[row]),
+            .uuid => |s| try appendLittle(u128, allocator, buf, s[row]),
         }
     }
 };
+
+fn appendLittle(comptime T: type, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    try buf.appendSlice(allocator, &bytes);
+}
 
 pub const ValueView = union(TypeTag) {
     int: []const i32,
