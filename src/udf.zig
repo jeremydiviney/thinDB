@@ -10,7 +10,6 @@ const storage_column = @import("storage/column.zig");
 const ColumnView = storage_column.ColumnView;
 const store = @import("engine/store.zig");
 const ColumnStore = store.ColumnStore;
-const TableRef = @import("ir/ir.zig").TableRef;
 
 pub const Error = error{
     FunctionAlreadyExists,
@@ -565,9 +564,17 @@ pub const SqlFnCtx = struct {
 
 /// Parse-time lookup of a base table's column names, resolved the way the
 /// statement's compile will resolve the reference. Null = no such table.
+/// The reference arrives as its parts because this file ships inside the
+/// Zig-function SDK, which must not import the IR.
 pub const TableColumns = struct {
     context: *const anyopaque,
-    lookup: *const fn (context: *const anyopaque, arena: Allocator, ref: TableRef) Allocator.Error!?[]const []const u8,
+    lookup: *const fn (
+        context: *const anyopaque,
+        arena: Allocator,
+        database: ?[]const u8,
+        schema: ?[]const u8,
+        name: []const u8,
+    ) Allocator.Error!?[]const []const u8,
 };
 
 pub const UdfRegistry = struct {

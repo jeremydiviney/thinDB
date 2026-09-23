@@ -932,12 +932,19 @@ pub const SessionTables = struct {
         return .{ .context = self, .lookup = lookup };
     }
 
-    fn lookup(context: *const anyopaque, arena: Allocator, ref: ir.TableRef) Allocator.Error!?[]const []const u8 {
+    fn lookup(
+        context: *const anyopaque,
+        arena: Allocator,
+        database: ?[]const u8,
+        schema: ?[]const u8,
+        name: []const u8,
+    ) Allocator.Error!?[]const []const u8 {
         const self: *const SessionTables = @ptrCast(@alignCast(context));
+        const ref: ir.TableRef = .{ .database = database, .schema = schema, .name = name };
         if (pgcat.match(ref) != null) return null;
         const table = resolveTable(self.catalog, self.session, ref) catch return null;
         const names = try arena.alloc([]const u8, table.schema.columns.len);
-        for (table.schema.columns, names) |col, *name| name.* = try arena.dupe(u8, col.name);
+        for (table.schema.columns, names) |col, *column_name| column_name.* = try arena.dupe(u8, col.name);
         return names;
     }
 };

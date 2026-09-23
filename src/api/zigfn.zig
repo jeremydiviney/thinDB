@@ -47,6 +47,8 @@ const EmbeddedFile = struct { path: []const u8, data: []const u8 };
 
 /// The SDK's complete transitive import closure — all std-only (the
 /// import-hygiene refactor keeps the storage subsystem and its C libs out).
+/// An import from one of these files to anything else breaks every
+/// `LANGUAGE zig` compile at runtime; the test at the bottom guards it.
 const EMBEDDED_SDK = [_]EmbeddedFile{
     .{ .path = "udf_sdk.zig", .data = @embedFile("../udf_sdk.zig") },
     .{ .path = "udf.zig", .data = @embedFile("../udf.zig") },
@@ -692,4 +694,31 @@ fn descCols(arena: Allocator, descs: []const ColDesc) ![]types.Column {
         };
     }
     return cols;
+}
+
+test "embedded SDK imports only std, builtin and other embedded files" {
+    const allocator = std.testing.allocator;
+    var missing: std.ArrayList(u8) = .empty;
+    defer missing.deinit(allocator);
+    for (EMBEDDED_SDK) |file| {
+        const source = try allocator.dupeZ(u8, file.data);
+        defer allocator.free(source);
+        var tokenizer = std.zig.Tokenizer.init(source);
+        var token = tokenizer.next();
+        while (token.tag != .eof) : (token = tokenizer.next()) {
+            if (token.tag != .builtin or !std.mem.eql(u8, source[token.loc.start..token.loc.end], "@import")) continue;
+            if (tokenizer.next().tag != .l_paren) continue;
+            const literal = tokenizer.next();
+            if (literal.tag != .string_literal) continue;
+            const target = source[literal.loc.start + 1 .. literal.loc.end - 1];
+            if (std.mem.eql(u8, target, "std") or std.mem.eql(u8, target, "builtin")) continue;
+            const resolved = try std.fs.path.resolvePosix(allocator, &.{ std.fs.path.dirnamePosix(file.path) orelse "", target });
+            defer allocator.free(resolved);
+            const embedded = for (EMBEDDED_SDK) |other| {
+                if (std.mem.eql(u8, other.path, resolved)) break true;
+            } else false;
+            if (!embedded) try missing.print(allocator, "{s} imports {s}\n", .{ file.path, target });
+        }
+    }
+    try std.testing.expectEqualStrings("", missing.items);
 }
