@@ -225,6 +225,11 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // output-column name; a post-parse pass rewrites it to the matching
     // SELECT aggregate's alias.
     if (p.cur.tag == .lparen) {
+        // `DATE_ADD(d, INTERVAL n DAY)` and its spellings aren't a plain
+        // argument list, and never name an aggregate or window.
+        if (p.scalarCallHasOwnSyntax(col_dup)) {
+            return try parseScalarCallOps(p, try p.parseScalarCallAfterName(col_dup));
+        }
         var saw_distinct = false;
         const args = try p.parseCallArgList(&saw_distinct);
         // Window call in a predicate position — only where the projection's
@@ -267,32 +272,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref) {
             return try makeDayComparison(p, args[0].col_ref);
         } else {
-            var lhs = ir.Expr{ .call = .{
-                .fn_name = try p.arena.dupe(u8, col_dup),
-                .args = args,
-            } };
-            lhs = try p.continueBinaryFrom(lhs);
-            if (isComparisonToken(p.cur.tag)) {
-                const op = try parseComparisonToken(p);
-                const rhs = try p.parseAddSub();
-                return try makeExprComparisonPredicate(p, lhs, op, rhs);
-            }
-            switch (p.cur.tag) {
-                // `ABS(x) BETWEEN ...`, `fn(x) IN (...)`, `fn(x) IS NULL`:
-                // anchor the call to a hidden computed column and reuse the
-                // operator tail.
-                .kw_is, .kw_not, .kw_between, .kw_like, .kw_in => {
-                    const anchored = try p.materializePredicateExpr(lhs);
-                    return try parseColOps(p, anchored);
-                },
-                // Bare call = truthiness (`WHERE fn(x)`).
-                else => return try makeExprComparisonPredicate(
-                    p,
-                    lhs,
-                    .eq,
-                    .{ .lit = .{ .boolean = true } },
-                ),
-            }
+            return try parseScalarCallOps(p, try p.makeScalarCallExpr(col_dup, args));
         }
     }
 
@@ -304,6 +284,26 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         col_dup = try p.materializePredicateExpr(lhs);
     }
     return try parseColOps(p, col_dup);
+}
+
+/// The operator tail after a scalar call on a predicate's left side.
+fn parseScalarCallOps(p: anytype, call: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const lhs = try p.continueBinaryFrom(call);
+    if (isComparisonToken(p.cur.tag)) {
+        const op = try parseComparisonToken(p);
+        const rhs = try p.parseAddSub();
+        return try makeExprComparisonPredicate(p, lhs, op, rhs);
+    }
+    switch (p.cur.tag) {
+        // `ABS(x) BETWEEN ...`, `fn(x) IN (...)`, `fn(x) IS NULL`: anchor the
+        // call to a hidden computed column and reuse the operator tail.
+        .kw_is, .kw_not, .kw_between, .kw_like, .kw_in => {
+            const anchored = try p.materializePredicateExpr(lhs);
+            return try parseColOps(p, anchored);
+        },
+        // Bare call = truthiness (`WHERE fn(x)`).
+        else => return try makeExprComparisonPredicate(p, lhs, .eq, .{ .lit = .{ .boolean = true } }),
+    }
 }
 
 fn isArithToken(tag: anytype) bool {

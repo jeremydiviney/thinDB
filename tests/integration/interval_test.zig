@@ -146,3 +146,115 @@ test "ADDDATE / SUBDATE are MySQL spellings of DATE_ADD / DATE_SUB" {
         try std.testing.expectEqualSlices(i32, canonical, alias);
     }
 }
+
+test "date-add spellings and unit-first calls parse as a predicate's left side" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT d FROM t WHERE ADDDATE(d, 1) >= '2024-02-01' ORDER BY d", "SELECT d FROM t WHERE d >= '2024-01-31' ORDER BY d" },
+        .{ "SELECT d FROM t WHERE DATE_ADD(d, INTERVAL 1 DAY) >= '2024-02-01' ORDER BY d", "SELECT d FROM t WHERE d >= '2024-01-31' ORDER BY d" },
+        .{ "SELECT d FROM t WHERE SUBDATE(d, 1) BETWEEN '2024-01-30' AND '2024-02-28' ORDER BY d", "SELECT d FROM t WHERE d >= '2024-01-31' ORDER BY d" },
+        .{
+            "SELECT d FROM t WHERE (ADDDATE(LAST_DAY(SUBDATE(d, INTERVAL 1 MONTH)), 1) >= '2024-02-01' AND ADDDATE(LAST_DAY(SUBDATE(d, INTERVAL 1 MONTH)), 1) < '2024-03-01') ORDER BY d",
+            "SELECT d FROM t WHERE d >= '2024-02-01' ORDER BY d",
+        },
+        .{ "SELECT d FROM t WHERE TIMESTAMPDIFF(DAY, d, DATE '2024-03-01') < 10 ORDER BY d", "SELECT d FROM t WHERE d >= '2024-02-01' ORDER BY d" },
+    };
+    inline for (cases) |c| {
+        const got = try collectDates(allocator, db, c[0]);
+        defer allocator.free(got);
+        const want = try collectDates(allocator, db, c[1]);
+        defer allocator.free(want);
+        try std.testing.expect(want.len > 0);
+        try std.testing.expectEqualSlices(i32, want, got);
+    }
+}
+
+test "INTERVAL: QUARTER is three months and WEEK is seven days" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT d + INTERVAL 1 QUARTER AS r FROM t ORDER BY id", "SELECT d + INTERVAL 3 MONTH AS r FROM t ORDER BY id" },
+        .{ "SELECT d - INTERVAL '2' QUARTERS AS r FROM t ORDER BY id", "SELECT d - INTERVAL 6 MONTH AS r FROM t ORDER BY id" },
+        .{ "SELECT DATE_SUB(d, INTERVAL 2 WEEK) AS r FROM t ORDER BY id", "SELECT DATE_SUB(d, INTERVAL 14 DAY) AS r FROM t ORDER BY id" },
+        .{ "SELECT ADDDATE(d, INTERVAL 1 QUARTER) AS r FROM t ORDER BY id", "SELECT DATE_ADD(d, INTERVAL 3 MONTH) AS r FROM t ORDER BY id" },
+        .{
+            "SELECT MAKEDATE(YEAR(d), 1) + INTERVAL QUARTER(d) QUARTER - INTERVAL 1 QUARTER AS r FROM t ORDER BY id",
+            "SELECT CAST(date_trunc('quarter', d) AS DATE) AS r FROM t ORDER BY id",
+        },
+    };
+    inline for (cases) |c| {
+        const got = try collectDates(allocator, db, c[0]);
+        defer allocator.free(got);
+        const want = try collectDates(allocator, db, c[1]);
+        defer allocator.free(want);
+        try std.testing.expectEqual(@as(usize, 3), want.len);
+        try std.testing.expectEqualSlices(i32, want, got);
+    }
+}
+
+fn collectInts(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i32 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(i32) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (batch.values[0].data.int[0..batch.row_count]) |v| try out.append(allocator, v);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "date unit functions know WEEK and QUARTER and reject unknown units" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // Expected values are DuckDB's, as days since 1970-01-01.
+    const date_cases = .{
+        .{ "SELECT CAST(date_trunc('week', d) AS DATE) AS r FROM t ORDER BY id", [_]i32{ 19737, 19751, 19779 } },
+        .{ "SELECT CAST(date_trunc('QUARTER', d) AS DATE) AS r FROM t ORDER BY id", [_]i32{ 19723, 19723, 19723 } },
+        .{ "SELECT TIMESTAMPADD(WEEK, 2, d) AS r FROM t ORDER BY id", [_]i32{ 19751, 19767, 19796 } },
+        .{ "SELECT TIMESTAMPADD(QUARTER, 1, d) AS r FROM t ORDER BY id", [_]i32{ 19828, 19843, 19872 } },
+    };
+    inline for (date_cases) |c| {
+        const got = try collectDates(allocator, db, c[0]);
+        defer allocator.free(got);
+        const want: [3]i32 = c[1];
+        try std.testing.expectEqualSlices(i32, &want, got);
+    }
+    const int_cases = .{
+        .{ "SELECT TIMESTAMPDIFF(WEEK, d, DATE '2024-06-30') AS r FROM t ORDER BY id", [_]i32{ 23, 21, 17 } },
+        .{ "SELECT TIMESTAMPDIFF(QUARTER, d, DATE '2024-07-15') AS r FROM t ORDER BY id", [_]i32{ 2, 1, 1 } },
+    };
+    inline for (int_cases) |c| {
+        const got = try collectInts(allocator, db, c[0]);
+        defer allocator.free(got);
+        const want: [3]i32 = c[1];
+        try std.testing.expectEqualSlices(i32, &want, got);
+    }
+
+    // The unit is read when the kernel runs, so the error surfaces on the
+    // first batch.
+    const unknown_units = .{
+        "SELECT date_trunc('fortnight', d) AS r FROM t",
+        "SELECT TIMESTAMPDIFF(FORTNIGHT, d, DATE '2024-06-30') AS r FROM t",
+    };
+    inline for (unknown_units) |sql| {
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        try std.testing.expectError(error.ComputeUnsupportedExpr, q.next());
+    }
+}

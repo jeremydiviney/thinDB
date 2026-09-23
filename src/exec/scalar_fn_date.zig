@@ -213,14 +213,14 @@ pub fn dateToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out:
 }
 
 /// DATE_TRUNC(unit, datetime) → datetime truncated down to the unit
-/// boundary. `unit` is a constant string ('second'/'minute'/'hour'/
-/// 'day'/'month'/'year'); an unrecognized unit passes the value through.
+/// boundary. `unit` is a constant string naming a `DateUnit`; weeks start
+/// on Monday.
 pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
     // The unit is the same for every row, so identify it ONCE — the per-row
     // hot loop is then a branch-free arithmetic truncation, not six repeated
     // case-insensitive string compares.
-    const unit = parseTruncUnit(stringViewOf(args[0]).rowBytes(0));
+    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
     const s = args[1].data.datetime[0..row_count];
 
     const base = out.data.datetime.items.len;
@@ -235,24 +235,35 @@ pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *Col
         .minute => truncToQuantum(60 * us, s, dst),
         .hour => truncToQuantum(3600 * us, s, dst),
         .day => truncToQuantum(86_400 * us, s, dst),
-        // Month/year boundaries aren't fixed-width — scalar calendar math.
-        .month, .year => for (dst, s) |*d, v| {
-            d.* = truncCalendar(v, unit == .year);
+        // Week/month/quarter/year boundaries aren't fixed micro-quanta from
+        // the epoch — scalar calendar math.
+        .week, .month, .quarter, .year => for (dst, s) |*d, v| {
+            d.* = truncCalendar(v, unit);
         },
-        .other => @memcpy(dst, s),
     }
 }
 
-const TruncUnit = enum { second, minute, hour, day, month, year, other };
+/// A unit named by the constant string argument of `date_trunc`,
+/// `date_diff`/`timestampdiff` and `timestampadd`.
+const DateUnit = enum { second, minute, hour, day, week, month, quarter, year };
 
-fn parseTruncUnit(unit: []const u8) TruncUnit {
+/// An unknown unit fails the call: a value passed through unchanged would be a
+/// plausible-looking wrong answer.
+fn parseDateUnit(unit: []const u8) error{ComputeUnsupportedExpr}!DateUnit {
     const table = .{
-        .{ "second", TruncUnit.second }, .{ "minute", TruncUnit.minute },
-        .{ "hour", TruncUnit.hour },     .{ "day", TruncUnit.day },
-        .{ "month", TruncUnit.month },   .{ "year", TruncUnit.year },
+        .{ DateUnit.second, .{ "second", "seconds", "ss" } },
+        .{ DateUnit.minute, .{ "minute", "minutes", "mi" } },
+        .{ DateUnit.hour, .{ "hour", "hours", "hh" } },
+        .{ DateUnit.day, .{ "day", "days", "dd" } },
+        .{ DateUnit.week, .{ "week", "weeks", "wk" } },
+        .{ DateUnit.month, .{ "month", "months", "mm" } },
+        .{ DateUnit.quarter, .{ "quarter", "quarters", "qq" } },
+        .{ DateUnit.year, .{ "year", "years", "yy" } },
     };
-    inline for (table) |e| if (std.ascii.eqlIgnoreCase(unit, e[0])) return e[1];
-    return .other;
+    inline for (table) |e| {
+        inline for (e[1]) |spelling| if (std.ascii.eqlIgnoreCase(unit, spelling)) return e[0];
+    }
+    return error.ComputeUnsupportedExpr;
 }
 
 /// Vectorized floor-to-multiple: `dst[i] = s[i] - (s[i] mod q)`, the largest
@@ -271,14 +282,20 @@ fn truncToQuantum(comptime q: i64, s: []const i64, dst: []i64) void {
     while (i < s.len) : (i += 1) dst[i] = s[i] - @mod(s[i], q);
 }
 
-/// Truncate to the start of the month (or year) — calendar-relative, so it
-/// can't be expressed as a fixed micro-quantum. Unparseable values pass through.
-fn truncCalendar(v: i64, to_year: bool) i64 {
-    const us: i64 = 1_000_000;
-    const ymd = daysToYmd(daysFromDatetime(v)) orelse return v;
-    const month: u32 = if (to_year) 1 else @intCast(ymd.month);
-    const td = common.ymdToDays(@intCast(ymd.year), month, 1);
-    return @as(i64, td) * 86_400 * us;
+/// Truncate to the start of a calendar unit (week, month, quarter or year),
+/// which can't be expressed as a fixed micro-quantum. Unparseable values pass
+/// through.
+fn truncCalendar(v: i64, unit: DateUnit) i64 {
+    const days = daysFromDatetime(v);
+    // 1970-01-01 was a Thursday: +3 puts Monday at 0.
+    if (unit == .week) return @as(i64, days - @mod(days + 3, 7)) * std.time.us_per_day;
+    const ymd = daysToYmd(days) orelse return v;
+    const month: u32 = switch (unit) {
+        .year => 1,
+        .quarter => (@as(u32, ymd.month) - 1) / 3 * 3 + 1,
+        else => ymd.month,
+    };
+    return @as(i64, common.ymdToDays(@intCast(ymd.year), month, 1)) * std.time.us_per_day;
 }
 
 // ---------------------------------------------------------------------------
@@ -422,18 +439,6 @@ pub fn monthnameFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
     }
 }
 
-const DiffUnit = enum { second, minute, hour, day, month, year, other };
-
-fn parseDiffUnit(unit: []const u8) DiffUnit {
-    if (std.ascii.eqlIgnoreCase(unit, "second") or std.ascii.eqlIgnoreCase(unit, "seconds") or std.ascii.eqlIgnoreCase(unit, "ss")) return .second;
-    if (std.ascii.eqlIgnoreCase(unit, "minute") or std.ascii.eqlIgnoreCase(unit, "minutes") or std.ascii.eqlIgnoreCase(unit, "mi")) return .minute;
-    if (std.ascii.eqlIgnoreCase(unit, "hour") or std.ascii.eqlIgnoreCase(unit, "hours") or std.ascii.eqlIgnoreCase(unit, "hh")) return .hour;
-    if (std.ascii.eqlIgnoreCase(unit, "day") or std.ascii.eqlIgnoreCase(unit, "days") or std.ascii.eqlIgnoreCase(unit, "dd")) return .day;
-    if (std.ascii.eqlIgnoreCase(unit, "month") or std.ascii.eqlIgnoreCase(unit, "months") or std.ascii.eqlIgnoreCase(unit, "mm")) return .month;
-    if (std.ascii.eqlIgnoreCase(unit, "year") or std.ascii.eqlIgnoreCase(unit, "years") or std.ascii.eqlIgnoreCase(unit, "yy")) return .year;
-    return .other;
-}
-
 fn monthDiff(start_days: i32, end_days: i32) i32 {
     const s = daysToYmd(start_days) orelse return 0;
     const e = daysToYmd(end_days) orelse return 0;
@@ -443,34 +448,36 @@ fn monthDiff(start_days: i32, end_days: i32) i32 {
     return months;
 }
 
-fn diffDate(unit: DiffUnit, start_days: i32, end_days: i32) i32 {
+fn diffDate(unit: DateUnit, start_days: i32, end_days: i32) i32 {
     return switch (unit) {
         .day => end_days - start_days,
+        .week => @divTrunc(end_days - start_days, 7),
         .month => monthDiff(start_days, end_days),
+        .quarter => @divTrunc(monthDiff(start_days, end_days), 3),
         .year => @divTrunc(monthDiff(start_days, end_days), 12),
         .second => (end_days - start_days) * 86_400,
         .minute => (end_days - start_days) * 1_440,
         .hour => (end_days - start_days) * 24,
-        .other => 0,
     };
 }
 
-fn diffDatetime(unit: DiffUnit, start_us: i64, end_us: i64) i32 {
+fn diffDatetime(unit: DateUnit, start_us: i64, end_us: i64) i32 {
     const delta = end_us - start_us;
     const v: i64 = switch (unit) {
         .second => @divTrunc(delta, 1_000_000),
         .minute => @divTrunc(delta, 60 * 1_000_000),
         .hour => @divTrunc(delta, 3_600 * 1_000_000),
         .day => @as(i64, daysFromDatetime(end_us) - daysFromDatetime(start_us)),
+        .week => @divTrunc(@as(i64, daysFromDatetime(end_us) - daysFromDatetime(start_us)), 7),
         .month => monthDiff(daysFromDatetime(start_us), daysFromDatetime(end_us)),
+        .quarter => @divTrunc(monthDiff(daysFromDatetime(start_us), daysFromDatetime(end_us)), 3),
         .year => @divTrunc(monthDiff(daysFromDatetime(start_us), daysFromDatetime(end_us)), 12),
-        .other => 0,
     };
     return std.math.lossyCast(i32, v);
 }
 
 pub fn dateDiffDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const unit = parseDiffUnit(stringViewOf(args[0]).rowBytes(0));
+    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
     const start = args[1].data.date;
     const end = args[2].data.date;
     var i: usize = 0;
@@ -478,43 +485,48 @@ pub fn dateDiffDateKernel(allocator: Allocator, args: []const ColumnView, out: *
 }
 
 pub fn dateDiffDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const unit = parseDiffUnit(stringViewOf(args[0]).rowBytes(0));
+    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
     const start = args[1].data.datetime;
     const end = args[2].data.datetime;
     var i: usize = 0;
     while (i < row_count) : (i += 1) try out.data.int.append(allocator, diffDatetime(unit, start[i], end[i]));
 }
 
-fn addUnitToDate(unit: DiffUnit, days: i32, n: i32) i32 {
+fn addUnitToDate(unit: DateUnit, days: i32, n: i32) i32 {
     return switch (unit) {
         .day => days + n,
+        .week => days + n * 7,
         .month => addMonths(days, n),
+        .quarter => addMonths(days, n * 3),
         .year => addMonths(days, n * 12),
         .hour => daysFromDatetime(@as(i64, days) * std.time.us_per_day + @as(i64, n) * std.time.us_per_hour),
         .minute => daysFromDatetime(@as(i64, days) * std.time.us_per_day + @as(i64, n) * std.time.us_per_min),
         .second => daysFromDatetime(@as(i64, days) * std.time.us_per_day + @as(i64, n) * std.time.us_per_s),
-        .other => days,
     };
 }
 
-fn addUnitToDatetime(unit: DiffUnit, micros: i64, n: i32) i64 {
+fn addUnitToDatetime(unit: DateUnit, micros: i64, n: i32) i64 {
     return switch (unit) {
         .second => micros + @as(i64, n) * std.time.us_per_s,
         .minute => micros + @as(i64, n) * std.time.us_per_min,
         .hour => micros + @as(i64, n) * std.time.us_per_hour,
         .day => micros + @as(i64, n) * std.time.us_per_day,
-        .month, .year => blk: {
+        .week => micros + @as(i64, n) * 7 * std.time.us_per_day,
+        .month, .quarter, .year => blk: {
             const days = daysFromDatetime(micros);
             const time_of_day = @mod(micros, std.time.us_per_day);
-            const months = if (unit == .year) n * 12 else n;
+            const months = switch (unit) {
+                .year => n * 12,
+                .quarter => n * 3,
+                else => n,
+            };
             break :blk @as(i64, addMonths(days, months)) * std.time.us_per_day + time_of_day;
         },
-        .other => micros,
     };
 }
 
 pub fn timestampAddDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const unit = parseDiffUnit(stringViewOf(args[0]).rowBytes(0));
+    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
     const ns = args[1].data.int;
     const dates = args[2].data.date;
     var i: usize = 0;
@@ -522,7 +534,7 @@ pub fn timestampAddDateKernel(allocator: Allocator, args: []const ColumnView, ou
 }
 
 pub fn timestampAddDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const unit = parseDiffUnit(stringViewOf(args[0]).rowBytes(0));
+    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
     const ns = args[1].data.int;
     const dts = args[2].data.datetime;
     var i: usize = 0;
@@ -657,12 +669,17 @@ test "date_trunc: month/year land on the first of the unit" {
     // month → 2013-07-01 00:00:00; year → 2013-01-01 00:00:00.
     const d_2013_07_01 = common.ymdToDays(2013, 7, 1);
     const d_2013_01_01 = common.ymdToDays(2013, 1, 1);
-    try std.testing.expectEqual(@as(i64, d_2013_07_01) * day, truncCalendar(v, false));
-    try std.testing.expectEqual(@as(i64, d_2013_01_01) * day, truncCalendar(v, true));
+    try std.testing.expectEqual(@as(i64, d_2013_07_01) * day, truncCalendar(v, .month));
+    try std.testing.expectEqual(@as(i64, d_2013_07_01) * day, truncCalendar(v, .quarter));
+    try std.testing.expectEqual(@as(i64, d_2013_01_01) * day, truncCalendar(v, .year));
+    // 2013-07-14 was a Sunday; its week starts Monday 2013-07-08.
+    try std.testing.expectEqual(@as(i64, common.ymdToDays(2013, 7, 8)) * day, truncCalendar(v, .week));
 }
 
-test "date_trunc: unit parse is case-insensitive, unknown → other" {
-    try std.testing.expectEqual(TruncUnit.minute, parseTruncUnit("MiNuTe"));
-    try std.testing.expectEqual(TruncUnit.year, parseTruncUnit("YEAR"));
-    try std.testing.expectEqual(TruncUnit.other, parseTruncUnit("fortnight"));
+test "date unit parse is case-insensitive and rejects unknown units" {
+    try std.testing.expectEqual(DateUnit.minute, try parseDateUnit("MiNuTe"));
+    try std.testing.expectEqual(DateUnit.year, try parseDateUnit("YEAR"));
+    try std.testing.expectEqual(DateUnit.quarter, try parseDateUnit("Quarters"));
+    try std.testing.expectEqual(DateUnit.week, try parseDateUnit("wk"));
+    try std.testing.expectError(error.ComputeUnsupportedExpr, parseDateUnit("fortnight"));
 }
