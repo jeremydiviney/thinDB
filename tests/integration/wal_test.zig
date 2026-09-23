@@ -451,7 +451,7 @@ test "wal: SQL DELETE with AND/OR predicate replays correctly" {
     try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, ids);
 }
 
-test "wal: SQL UPDATE replays via DELETE + INSERT entries" {
+test "wal: SQL UPDATE replays via its replace record" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -471,8 +471,8 @@ test "wal: SQL UPDATE replays via DELETE + INSERT entries" {
             "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30)",
         );
         try sql_helpers.exec(allocator, db, "UPDATE t SET qty = 999 WHERE id = 2");
-        // No flush — replay should rebuild via WAL: insert all 3, delete
-        // matching the UPDATE's predicate, re-insert with new qty.
+        // No flush — replay should rebuild via WAL: insert all 3, then the
+        // UPDATE's replace record retracts id 2 and appends it with new qty.
     }
 
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
@@ -659,4 +659,199 @@ test "wal: clean close flushes WAL-backed tables, leaving a segment and an empty
     defer ids.deinit(allocator);
     while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids.items);
+}
+
+// =============================================================================
+// UPDATE crash atomicity (#48): one `replace` record per batch.
+// =============================================================================
+
+const IdQty = struct { id: i64, qty: i32 };
+
+fn collectIdQty(allocator: std.mem.Allocator, t: *thindb.Table) ![]IdQty {
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var rows: std.ArrayList(IdQty) = .empty;
+    errdefer rows.deinit(allocator);
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count], b.values[1].data.int[0..b.row_count]) |id, qty| {
+            try rows.append(allocator, .{ .id = id, .qty = qty });
+        }
+    }
+    std.mem.sort(IdQty, rows.items, {}, struct {
+        fn lessThan(_: void, x: IdQty, y: IdQty) bool {
+            return x.id < y.id or (x.id == y.id and x.qty < y.qty);
+        }
+    }.lessThan);
+    return rows.toOwnedSlice(allocator);
+}
+
+/// Every id in 1..=`count` exactly once, holding `id * 10` or, for an id in
+/// `touched`, possibly `id * 10 + 1`.
+fn expectOldOrNewOnce(rows: []const IdQty, count: usize, touched: []const i64) !void {
+    try std.testing.expectEqual(count, rows.len);
+    for (rows, 1..) |r, want_id| {
+        try std.testing.expectEqual(@as(i64, @intCast(want_id)), r.id);
+        const old: i32 = @intCast(r.id * 10);
+        const may_change = std.mem.indexOfScalar(i64, touched, r.id) != null;
+        try std.testing.expect(r.qty == old or (may_change and r.qty == old + 1));
+    }
+}
+
+test "wal: an UPDATE cut off at any logged point keeps every row once, old or new" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const config: thindb.Config = .{
+        .wal_enabled = true,
+        .auto_flush_secs = 0,
+        .row_group_size = 2,
+        .sync_mode = .per_flush,
+    };
+    const touched = [_]i64{ 2, 3, 5 };
+    inline for (.{ false, true }) |unique| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const schema: thindb.TableSchema = .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "qty", .type = .int } },
+            .order_key = &.{"id"},
+            .unique = unique,
+        };
+
+        // Ids 1-4 in one segment (row groups {1,2} {3,4}), 5-6 in the
+        // memtable: the UPDATE logs one batch for the memtable and one per
+        // matching row group.
+        var manifest_before: []u8 = undefined;
+        var update_start: usize = undefined;
+        var wal_after: []u8 = undefined;
+        var tomb_after: []u8 = undefined;
+        var tomb_name_buf: [40]u8 = undefined;
+        var tomb_name: []const u8 = undefined;
+        {
+            const db = try thindb.Database.open(a, io, tmp.dir, config);
+            defer db.close();
+            const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+            try t.insert(&.{
+                .{ .id = @as(i64, 1), .qty = @as(i32, 10) },
+                .{ .id = @as(i64, 2), .qty = @as(i32, 20) },
+                .{ .id = @as(i64, 3), .qty = @as(i32, 30) },
+                .{ .id = @as(i64, 4), .qty = @as(i32, 40) },
+            });
+            try t.flush();
+            tomb_name = try thindb.storage.tombstone.fileNameFor(&tomb_name_buf, t.manifest.segments.items[0].segment_id);
+            try t.insert(&.{
+                .{ .id = @as(i64, 5), .qty = @as(i32, 50) },
+                .{ .id = @as(i64, 6), .qty = @as(i32, 60) },
+            });
+            manifest_before = try t.table_dir.readFileAlloc(io, "manifest", aa, .unlimited);
+            update_start = (try t.table_dir.readFileAlloc(io, "wal", aa, .unlimited)).len;
+            try sql_helpers.exec(a, db, "UPDATE t SET qty = qty + 1 WHERE id IN (2, 3, 5)");
+            wal_after = try t.table_dir.readFileAlloc(io, "wal", aa, .unlimited);
+            tomb_after = try t.segments_dir.readFileAlloc(io, tomb_name, aa, .unlimited);
+        }
+
+        var ends: std.ArrayList(usize) = .empty;
+        var cursor: usize = thindb.engine.wal.header_size;
+        var replace_records: usize = 0;
+        var last_replace_end: usize = 0;
+        while (cursor < wal_after.len) {
+            const tag = wal_after[cursor];
+            const payload_len = std.mem.readInt(u32, wal_after[cursor + 1 ..][0..4], .little);
+            cursor += thindb.engine.wal.record_header_size + payload_len + thindb.engine.wal.record_trailer_size;
+            if (cursor >= update_start) try ends.append(aa, cursor);
+            if (tag == @intFromEnum(thindb.engine.wal.RecordType.replace)) {
+                replace_records += 1;
+                last_replace_end = cursor;
+            }
+        }
+        try std.testing.expectEqual(wal_after.len, cursor);
+        try std.testing.expectEqual(@as(usize, 3), replace_records);
+
+        // A crash keeps the acknowledged inserts and some prefix of the
+        // UPDATE's records, possibly with a torn last one. The segment's
+        // tombstone file is written only after every batch that feeds it
+        // is in the log.
+        var cuts: std.ArrayList(usize) = .empty;
+        for (ends.items, 0..) |end, i| {
+            try cuts.append(aa, end);
+            if (i + 1 < ends.items.len) try cuts.append(aa, end + 1);
+        }
+        const tomb_path = try std.fmt.allocPrint(aa, "main/public/t/segments/{s}", .{tomb_name});
+        for (cuts.items) |cut| {
+            for ([_]bool{ false, true }) |tomb_written| {
+                if (tomb_written and cut < last_replace_end) continue;
+                errdefer std.debug.print("unique={} cut={d}/{d} tomb_written={}\n", .{ unique, cut, wal_after.len, tomb_written });
+                try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/manifest", .data = manifest_before });
+                try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/wal", .data = wal_after[0..cut] });
+                if (tomb_written) {
+                    try tmp.dir.writeFile(io, .{ .sub_path = tomb_path, .data = tomb_after });
+                } else {
+                    tmp.dir.deleteFile(io, tomb_path) catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    };
+                }
+
+                const db = try thindb.Database.open(a, io, tmp.dir, config);
+                defer db.close();
+                const rows = try collectIdQty(a, try db.openTable("t", .{}));
+                defer a.free(rows);
+                try expectOldOrNewOnce(rows, 6, &touched);
+                if (tomb_written or cut == wal_after.len) {
+                    try std.testing.expectEqual(@as(i32, 21), rows[1].qty);
+                    try std.testing.expectEqual(@as(i32, 31), rows[2].qty);
+                }
+                if (cut == wal_after.len) try std.testing.expectEqual(@as(i32, 51), rows[4].qty);
+            }
+        }
+    }
+}
+
+test "wal: an UPDATE whose tombstone write fails after an auto-flush leaves no duplicates" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema: thindb.TableSchema = .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "qty", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var ids: [16]i64 = undefined;
+    for (&ids, 1..) |*id, i| id.* = @intCast(i);
+    {
+        // Four row groups of four; every two rewritten row groups fill the
+        // memtable past the auto-flush threshold mid-UPDATE.
+        const db = try thindb.Database.open(a, io, tmp.dir, .{
+            .wal_enabled = true,
+            .auto_flush_secs = 0,
+            .auto_flush_rows = 6,
+            .row_group_size = 4,
+        });
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+        var rows: [16]struct { id: i64, qty: i32 } = undefined;
+        for (&rows, ids) |*r, id| r.* = .{ .id = id, .qty = @intCast(id * 10) };
+        try t.insert(&rows);
+        try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+        var name_buf: [40]u8 = undefined;
+        const tomb_name = try thindb.storage.tombstone.fileNameFor(&name_buf, t.manifest.segments.items[0].segment_id);
+        const blocker = try std.fmt.allocPrint(a, "{s}.tmp", .{tomb_name});
+        defer a.free(blocker);
+        try t.segments_dir.createDir(io, blocker, .default_dir);
+        var failed = false;
+        sql_helpers.exec(a, db, "UPDATE t SET qty = qty + 1") catch {
+            failed = true;
+        };
+        try std.testing.expect(failed);
+        try t.segments_dir.deleteDir(io, blocker);
+    }
+
+    const db = try thindb.Database.open(a, io, tmp.dir, .{ .wal_enabled = true, .auto_flush_secs = 0 });
+    defer db.close();
+    const rows = try collectIdQty(a, try db.openTable("t", .{}));
+    defer a.free(rows);
+    try expectOldOrNewOnce(rows, 16, &ids);
 }

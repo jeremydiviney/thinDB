@@ -20,9 +20,11 @@
 //!      tombstones for that segment.
 //!   5. Unlock.
 //!
-//! "Delete and insert happen together in batches": each segment's
-//! tombstone-merge + its new-row inserts happen contiguously under
-//! one mutex hold. Per-batch atomicity.
+//! Per-batch atomicity: the memtable phase and each matching row group
+//! is one batch, logged as one `replace` WAL record holding both its
+//! deletes and its replacement rows (`Table.replaceRowsLocked`). A crash
+//! keeps or drops whole batches; it never keeps a delete without its
+//! rows or the rows without their delete (#48).
 //!
 //! Assignment evaluation reuses the standard Compute operator wired
 //! via SingleBatchSource so we don't duplicate that machinery here.
@@ -73,18 +75,21 @@ pub fn execUpdateStreaming(
     var affected: usize = 0;
     {
         defer t.mutex.unlock(t.io);
+        try t.ensureUsable();
 
         // Snapshot bounds. These freeze for the duration of the UPDATE.
         const segs_at_start = t.manifest.segments.items.len;
         const mt_rows_at_start: usize = @intCast(t.memtable.row_count);
 
-        // Log the predicate (and the new-row inserts, later) into WAL
-        // so a crash mid-UPDATE leaves a recoverable state.
-        wal_target = try t.logDeleteExprLocked(pred_local);
+        // Batches applied before a failure keep their replacement rows in
+        // the memtable, so their logged offsets must still reach the
+        // segments. If even that fails, only a reopen (which replays the
+        // log) restores a consistent table.
+        errdefer t.mergeLoggedTombstonesLocked() catch t.requireRecovery();
 
         // -- Phase 1: memtable rows [0..mt_rows_at_start] --------
         if (mt_rows_at_start > 0) {
-            affected += processMemtable(t, pred_local, assignments, mt_rows_at_start) catch |err| switch (err) {
+            affected += processMemtable(t, pred_local, assignments, mt_rows_at_start, &wal_target) catch |err| switch (err) {
                 error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
                 else => return err,
             };
@@ -92,7 +97,7 @@ pub fn execUpdateStreaming(
 
         // -- Phase 2: segments[0..segs_at_start] -----------------
         if (segs_at_start > 0) {
-            affected += processSegments(t, pred_local, assignments, segs_at_start) catch |err| switch (err) {
+            affected += processSegments(t, pred_local, assignments, segs_at_start, &wal_target) catch |err| switch (err) {
                 error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
                 else => return err,
             };
@@ -111,6 +116,7 @@ fn processMemtable(
     pred_opt: ?exec.PredicateExpr,
     assignments: []const Assignment,
     mt_rows_at_start: usize,
+    wal_target: *?u64,
 ) !usize {
     const allocator = t.allocator;
 
@@ -142,22 +148,17 @@ fn processMemtable(
     };
     if (matched_count == 0) return 0;
 
-    // Compute new values for matched rows via the standard pipeline:
-    // SingleBatchSource → Compute(synthetic derived) → drain.
-    var new_rows = try computeNewRows(t, batch, mask, matched_count, assignments);
+    var matched = try materializeMatched(t, batch, mask, matched_count);
+    defer freeMaterializedRows(allocator, &matched);
+    var new_rows = try computeNewRows(t, matched, assignments);
     defer freeMaterializedRows(allocator, &new_rows);
 
-    // Filter the memtable: keep rows where !mask. Append new rows
-    // (post-assignment) to the now-filtered memtable.
     const keep = try allocator.alloc(bool, mt_rows_at_start);
     defer allocator.free(keep);
     for (mask, keep) |m, *k| k.* = !m;
 
-    if (try t.memtable.cloneWithRetainedRows(allocator, keep)) |new_mt| {
-        t.installMemtableLocked(new_mt);
-    }
-
-    try insertMaterializedRows(t, &new_rows);
+    const replaced: Table.Replaced = .{ .memtable = .{ .keep = keep, .rows = matched.stores, .row_count = matched.row_count } };
+    if (try t.replaceRowsLocked(replaced, new_rows.stores, new_rows.row_count)) |target| wal_target.* = target;
     return matched_count;
 }
 
@@ -170,6 +171,7 @@ fn processSegments(
     pred_opt: ?exec.PredicateExpr,
     assignments: []const Assignment,
     segs_at_start: usize,
+    wal_target: *?u64,
 ) !usize {
     // Full-key Bloom gate (#143): a keyed UPDATE (every order-key column
     // pinned by AND-equality) skips segments whose Bloom rejects the key(s)
@@ -189,7 +191,7 @@ fn processSegments(
         if (key_hashes) |hs| {
             if (!upsert_mod.bloomAdmitsAny(entry.key_bloom, hs)) continue;
         }
-        total += try processOneSegment(t, pred_opt, assignments, entry);
+        total += try processOneSegment(t, pred_opt, assignments, entry, wal_target);
     }
     return total;
 }
@@ -199,6 +201,7 @@ fn processOneSegment(
     pred_opt: ?exec.PredicateExpr,
     assignments: []const Assignment,
     entry: storage.manifest.ManifestEntry,
+    wal_target: *?u64,
 ) !usize {
     const allocator = t.allocator;
     var name_buf: [32]u8 = undefined;
@@ -206,8 +209,9 @@ fn processOneSegment(
     var seg = try storage.readSegment(allocator, t.io, t.segments_dir, file_name, t.schema);
     defer seg.deinit();
 
-    var deleted: std.ArrayList(u32) = .empty;
-    defer deleted.deinit(allocator);
+    var offsets: std.ArrayList(u32) = .empty;
+    defer offsets.deinit(allocator);
+    var deleted: usize = 0;
 
     var row_offset: u32 = 0;
     for (seg.info.row_groups, 0..) |rg, rg_idx| {
@@ -248,98 +252,86 @@ fn processOneSegment(
         };
 
         if (matched_in_rg > 0) {
-            // Record original row offsets (within the segment) for tombstoning.
+            offsets.clearRetainingCapacity();
             for (mask, 0..) |m, k| if (m) {
-                try deleted.append(allocator, row_offset + @as(u32, @intCast(k)));
+                try offsets.append(allocator, row_offset + @as(u32, @intCast(k)));
             };
 
-            // Compute new values and append to memtable.
-            var new_rows = try computeNewRows(t, batch, mask, matched_in_rg, assignments);
+            var matched = try materializeMatched(t, batch, mask, matched_in_rg);
+            defer freeMaterializedRows(allocator, &matched);
+            var new_rows = try computeNewRows(t, matched, assignments);
             defer freeMaterializedRows(allocator, &new_rows);
-            try insertMaterializedRows(t, &new_rows);
+
+            const replaced: Table.Replaced = .{ .segment = .{ .id = entry.segment_id, .offsets = offsets.items } };
+            if (try t.replaceRowsLocked(replaced, new_rows.stores, new_rows.row_count)) |target| wal_target.* = target;
+            deleted += matched_in_rg;
         }
         row_offset += n;
     }
 
-    if (deleted.items.len > 0) {
-        try t.mergeTombstones(
-            allocator,
-            entry.segment_id,
-            deleted.items,
-            t.syncEnabled(),
-        );
-        t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
-    }
-    return deleted.items.len;
+    // One tombstone-file rewrite per segment, not per row group.
+    try t.mergeLoggedTombstonesLocked();
+    return deleted;
 }
 
 // =============================================================================
 // Helpers — compute new-row batch via Compute, materialize, insert.
 // =============================================================================
 
-/// Materialized new-row buffer with one ColumnStore per table schema
-/// column. Lives for the duration of one row-group's processing.
-const NewRows = struct {
+/// Rows with one ColumnStore per table schema column. Lives for the
+/// duration of one batch's processing.
+const MaterializedRows = struct {
     stores: []ColumnStore,
     row_count: usize,
 };
 
-fn freeMaterializedRows(allocator: std.mem.Allocator, rows: *NewRows) void {
+fn freeMaterializedRows(allocator: std.mem.Allocator, rows: *MaterializedRows) void {
     for (rows.stores) |*c| c.deinit(allocator);
     allocator.free(rows.stores);
 }
 
-/// Given a batch + match mask + assignments, produce a NewRows with
-/// `matched_count` rows where each column carries either the
-/// post-assignment value (for assigned cols) or the original value
-/// from `batch` (for the others).
-///
-/// Strategy: build a filtered batch holding only matched rows
-/// (via `appendMaskedColumn` into per-column ColumnStores), then
-/// run a SingleBatchSource(filtered_batch) → Compute(synthetic
-/// derived) pipeline to produce the post-assignment columns.
-fn computeNewRows(
-    t: *Table,
-    batch: exec.Batch,
-    mask: []const bool,
-    matched_count: usize,
-    assignments: []const Assignment,
-) !NewRows {
+/// Copy out the `matched_count` rows of `batch` that `mask` selects.
+fn materializeMatched(t: *Table, batch: exec.Batch, mask: []const bool, matched_count: usize) !MaterializedRows {
     const allocator = t.allocator;
-    const schema = t.schema;
-
-    // Step 1: materialize filtered (matched-only) batch into ColumnStores.
-    var filtered = try allocator.alloc(ColumnStore, schema.columns.len);
+    const stores = try allocator.alloc(ColumnStore, t.schema.columns.len);
     var inited: usize = 0;
     errdefer {
-        for (filtered[0..inited]) |*c| c.deinit(allocator);
-        allocator.free(filtered);
+        for (stores[0..inited]) |*c| c.deinit(allocator);
+        allocator.free(stores);
     }
-    for (schema.columns, 0..) |sc, ci| {
-        filtered[ci] = try ColumnStore.init(allocator, sc.type, sc.nullable);
+    for (t.schema.columns, stores) |sc, *store| {
+        store.* = try ColumnStore.init(allocator, sc.type, sc.nullable);
         inited += 1;
     }
-    for (schema.columns, 0..) |sc, ci| {
-        _ = sc;
-        try engine.transform.appendMaskedColumn(
-            allocator,
-            batch.values[ci],
-            mask,
-            &filtered[ci],
-        );
+    for (batch.values, stores) |view, *store| {
+        try engine.transform.appendMaskedColumn(allocator, view, mask, store);
     }
+    return .{ .stores = stores, .row_count = matched_count };
+}
 
-    // Step 2: build a Batch view over the filtered columns.
+/// Given the matched rows + assignments, produce rows where each column
+/// carries either the post-assignment value (for assigned cols) or the
+/// original value (for the others), via a SingleBatchSource(matched) →
+/// Compute(synthetic derived) pipeline.
+fn computeNewRows(
+    t: *Table,
+    matched: MaterializedRows,
+    assignments: []const Assignment,
+) !MaterializedRows {
+    const allocator = t.allocator;
+    const schema = t.schema;
+    const matched_count = matched.row_count;
+
     const filtered_views = try allocator.alloc(ColumnView, schema.columns.len);
     defer allocator.free(filtered_views);
-    for (filtered, filtered_views) |*c, *v| v.* = c.view();
+    for (matched.stores, filtered_views) |*c, *v| v.* = c.view();
     const filtered_batch: exec.Batch = .{
         .schema = schema.columns,
         .values = filtered_views,
         .row_count = matched_count,
     };
 
-    // Step 3: wrap in SingleBatchSource and chain through Compute.
+    // Wrap in SingleBatchSource and chain through Compute.
     // Compute's `Derived` list uses synthetic names so its outputs
     // don't collide with the upstream cols of the same name.
     const synth_names = try allocator.alloc([]u8, assignments.len);
@@ -358,7 +350,7 @@ fn computeNewRows(
     var compute_q = try src_q.compute(derived);
     defer compute_q.deinit();
 
-    // Step 4: drain Compute (just one batch out, since input is one batch).
+    // Drain Compute (just one batch out, since input is one batch).
     var got: ?exec.Batch = null;
     while (try compute_q.next()) |b| {
         if (b.row_count == 0) continue;
@@ -367,8 +359,8 @@ fn computeNewRows(
     }
     const out = got orelse return error.UpdateNoRowsFromCompute;
 
-    // Step 5: build the final NewRows — for each table schema column,
-    // pick either the synthetic (assigned) or the filtered original.
+    // For each table schema column, pick either the synthetic (assigned)
+    // or the matched original.
     const out_stores = try allocator.alloc(ColumnStore, schema.columns.len);
     var out_inited: usize = 0;
     errdefer {
@@ -377,7 +369,7 @@ fn computeNewRows(
     }
 
     for (schema.columns, 0..) |sc, ci| {
-        var src_view: ColumnView = filtered[ci].view();
+        var src_view: ColumnView = matched.stores[ci].view();
         // Was this column assigned? If so, replace src_view with the
         // synthetic column from Compute's output.
         for (assignments, synth_names) |asn, syn| {
@@ -409,24 +401,5 @@ fn computeNewRows(
         );
     }
 
-    // Filtered columns served their purpose; release.
-    for (filtered) |*c| c.deinit(allocator);
-    allocator.free(filtered);
-
-    return NewRows{ .stores = out_stores, .row_count = matched_count };
-}
-
-/// Push the materialized new rows into the table's memtable via
-/// `insertBatchInner` (which also WAL-logs and may trigger
-/// auto-flush). The translation step converts the synthetic Compute
-/// names back to the schema names (they're identical here because we
-/// already moved synthetic outputs into the right slots).
-fn insertMaterializedRows(t: *Table, rows: *NewRows) !void {
-    if (rows.row_count == 0) return;
-    const allocator = t.allocator;
-    const schema = t.schema;
-    const views = try allocator.alloc(ColumnView, schema.columns.len);
-    defer allocator.free(views);
-    for (rows.stores, views) |*c, *v| v.* = c.view();
-    _ = try t.insertBatchInner(schema.columns, views, rows.row_count);
+    return .{ .stores = out_stores, .row_count = matched_count };
 }

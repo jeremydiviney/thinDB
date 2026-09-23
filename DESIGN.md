@@ -279,7 +279,7 @@ Execution:
 
 A delete that runs concurrently with reads is invisible to them — readers see the manifest snapshot taken at their query start, including the tomb file state at that moment. New deletes append to the tomb file; readers using an older snapshot just see fewer tombstoned rows than the live state.
 
-There is **no UPDATE**. To replace a row: delete + insert.
+UPDATE is delete + insert in batches: the memtable's matching rows form one batch, and each matching row group of a segment forms another. Each batch goes into the WAL as one `replace` record before it is applied. The record carries the batch's deletes (the retracted memtable rows, or segment offsets) together with the replacement rows. Replay retracts memtable rows by content, appends the replacements and merges the offsets into the `.tomb` files. A crash can therefore leave an UPDATE applied up to some batch. It never keeps a delete without its replacement, and never keeps both versions of a row. Segment offsets reach the `.tomb` file once per segment. They also reach it before any flush retires the WAL, since an auto-flush can fire mid-UPDATE.
 
 ---
 
@@ -655,6 +655,8 @@ Bench numbers (8 OS threads, `sync_mode=.per_flush`, tight insert loop, Windows 
 Throughput scales sub-linearly with thread count (each fsync is now amortized over multiple writers), single-writer pays ~3% latency overhead vs. the no-pause baseline.
 
 Truncate (called at end of flush) coordinates with `awaitDurable`: it drains the current leader, then bumps `synced_offset` to the pre-truncate `write_offset` so any pending waiters from before the truncate become no-ops (their data is now in a segment, not the WAL).
+
+Tombstones never get ahead of the log. A tombstone can hide a row whose replacement, from an UPDATE or a unique-key upsert, so far lives only in the WAL. So `Table.mergeTombstones` syncs the WAL before it writes a `.tomb` file whenever sync is on.
 
 ---
 
