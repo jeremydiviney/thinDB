@@ -1630,12 +1630,18 @@ pub const Parser = struct {
         return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
     }
 
+    /// Whether `name(` opens a call whose arguments aren't a plain comma list,
+    /// so it must be parsed by `parseScalarCallAfterName`.
     pub fn scalarCallHasOwnSyntax(_: *const Parser, name: []const u8) bool {
-        return dateAddSubName(name) != null;
+        return dateAddSubName(name) != null or
+            std.ascii.eqlIgnoreCase(name, "cast") or
+            std.ascii.eqlIgnoreCase(name, "extract");
     }
 
     pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
         if (dateAddSubName(name)) |_| return try self.parseDateAddSubCallAfterName(name);
+        if (std.ascii.eqlIgnoreCase(name, "cast")) return try self.parseCastCallAfterName();
+        if (std.ascii.eqlIgnoreCase(name, "extract")) return try self.parseExtractCall();
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
         const args = try self.parseCallArgList(null);
         return try self.makeScalarCallExpr(name, args);
@@ -2345,6 +2351,17 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = fn_name, .args = args } };
     }
 
+    /// `(expr AS type)` after the `CAST` keyword.
+    fn parseCastCallAfterName(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        const inner = try self.parseCallArg();
+        if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        const result = try self.parseCastTarget(inner);
+        try self.expect(.rparen);
+        return result;
+    }
+
     /// Parse the target type (cursor on the type name) and wrap `inner`
     /// in a `cast_as_<T>(inner)` scalar call. Used by both CAST(... AS T)
     /// and the `inner::T` postfix.
@@ -2376,15 +2393,7 @@ pub const Parser = struct {
         if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "cast")) {
             const saved = self.cur;
             try self.advance();
-            if (self.cur.tag == .lparen) {
-                try self.advance();
-                const inner = try self.parseCallArg();
-                if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
-                try self.advance();
-                const result = try self.parseCastTarget(inner);
-                try self.expect(.rparen);
-                return result;
-            }
+            if (self.cur.tag == .lparen) return try self.parseCastCallAfterName();
             return ir.Expr{ .col_ref = try self.arena.dupe(u8, saved.text) };
         }
         // EXISTS (SELECT ...) in expression position — projects a

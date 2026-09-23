@@ -345,6 +345,43 @@ test "INSERT SELECT: a date widens into a DATETIME column" {
     try std.testing.expectEqualSlices(i64, &.{1}, hits);
 }
 
+test "INSERT SELECT: text parses into DATE and DATETIME columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, s VARCHAR(32), t STRING NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, '2024-03-15', '2024-03-15 10:20:30'), (2, NULL, '2024-03-16')");
+    try exec(allocator, db, "CREATE TABLE sink (id BIGINT PRIMARY KEY, d DATE, ts DATETIME NOT NULL)");
+    try exec(allocator, db, "INSERT INTO sink SELECT id, s, t FROM src");
+    try exec(allocator, db, "INSERT INTO sink (id, d, ts) SELECT 3, '2024-03-17', '2024-03-17 01:02:03'");
+
+    const cases = .{
+        .{ .sql = "SELECT id FROM sink WHERE d = DATE '2024-03-15'", .ids = &[_]i64{1} },
+        .{ .sql = "SELECT id FROM sink WHERE d IS NULL", .ids = &[_]i64{2} },
+        .{ .sql = "SELECT id FROM sink WHERE d = DATE '2024-03-17'", .ids = &[_]i64{3} },
+        .{ .sql = "SELECT id FROM sink WHERE ts = DATETIME '2024-03-15 10:20:30'", .ids = &[_]i64{1} },
+        .{ .sql = "SELECT id FROM sink WHERE ts = DATETIME '2024-03-16 00:00:00'", .ids = &[_]i64{2} },
+        .{ .sql = "SELECT id FROM sink WHERE ts = DATETIME '2024-03-17 01:02:03'", .ids = &[_]i64{3} },
+    };
+    inline for (cases) |c| {
+        const ids = try collectBigints(allocator, db, c.sql);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, c.ids, ids);
+    }
+
+    // Text that isn't a date is rejected as INSERT ... VALUES rejects it,
+    // not stored as NULL, even in a nullable column.
+    try helpers.expectRunError(allocator, db, "INSERT INTO sink (id, d, ts) SELECT 4, 'soon', '2024-01-01'", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO sink (id, d, ts) SELECT 5, '2024-01-01', 'later'", error.TypeMismatch);
+    const count = try collectBigints(allocator, db, "SELECT COUNT(*) FROM sink");
+    defer allocator.free(count);
+    try std.testing.expectEqualSlices(i64, &.{3}, count);
+}
+
 test "INSERT SELECT: omitted columns take their DEFAULT, the clock, or NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

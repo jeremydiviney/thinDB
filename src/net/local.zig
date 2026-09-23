@@ -2564,6 +2564,10 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const views = try aa.alloc(storage.ColumnView, tbl_columns.len);
     var total_rows: usize = 0;
     while (try source.next()) |b| {
+        for (table_to_source, picks) |maybe_src, pick| {
+            const src = maybe_src orelse continue;
+            if (pick != src and wideningDroppedValue(b.values[src], b.values[pick], b.row_count)) return Error.TypeMismatch;
+        }
         for (tbl_columns, picks, batch_schema, views) |col, pick, *bs, *view| {
             view.* = b.values[pick];
             // A NOT NULL column admits a nullable source whose rows hold no
@@ -2581,14 +2585,17 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
 /// The cast that widens an INSERT source column into its target type, or
 /// null when the column lands as is. A decimal target always takes one when
 /// the types differ: the memtable matches decimal columns on tag alone, so a
-/// payload at another scale would be stored misread. Other targets widen
-/// along the implicit-cast ladder short of its lossy steps; the ladder
-/// reaches FLOAT only through DOUBLE, so a FLOAT target never casts.
-/// Anything else passes through for the memtable to admit or reject.
+/// payload at another scale would be stored misread. Text parses into a DATE
+/// or DATETIME target. Other targets widen along the implicit-cast ladder
+/// short of its lossy steps; the ladder reaches FLOAT only through DOUBLE, so
+/// a FLOAT target never casts. Anything else passes through for the memtable
+/// to admit or reject.
 fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?exec.Expr {
     if (std.meta.eql(src.type, target)) return null;
     const widens = if (target.isDecimal())
         src.type.isInteger() or src.type.isFloat() or src.type.isDecimal() or src.type == .boolean
+    else if ((target == .date or target == .datetime) and src.type.isString())
+        true
     else if (target == .float)
         false
     else if (exec_cast.castCost(@as(types.TypeTag, src.type), @as(types.TypeTag, target))) |cost|
@@ -2600,6 +2607,17 @@ fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?ex
     const args = try aa.alloc(exec.Expr, 1);
     args[0] = .{ .col_ref = src.name };
     return .{ .call = .{ .fn_name = fn_name, .args = args } };
+}
+
+/// Whether a widened INSERT column is NULL where its source had a value, as
+/// for text that isn't a date. INSERT ... VALUES rejects such a value, so
+/// INSERT ... SELECT does too rather than storing NULL.
+fn wideningDroppedValue(src: storage.ColumnView, widened: storage.ColumnView, rows: usize) bool {
+    if (!widened.anyNull(rows)) return false;
+    for (0..rows) |i| {
+        if (src.isValid(i) and !widened.isValid(i)) return true;
+    }
+    return false;
 }
 
 /// The value for a table column an INSERT ... SELECT column list omits: the

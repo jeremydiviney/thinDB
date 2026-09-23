@@ -1909,7 +1909,8 @@ fn buildCallPlan(
     }
 
     var r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
-    if (r == null and try coerceTemporalStringLiterals(runtime_allocator, c.fn_name, arg_plans, arg_types)) {
+    const coerce_literals = if (r) |resolved| parsesTextToTemporal(resolved.func) else true;
+    if (coerce_literals and try coerceTemporalStringLiterals(runtime_allocator, c.fn_name, arg_plans, arg_types)) {
         r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     }
     const rr = r orelse return Error.ComputeNoSuchOverload;
@@ -1963,6 +1964,10 @@ fn buildCallPlan(
 /// date/datetime, parse it, and rewrite the slot in place. Returns true when it
 /// coerced at least one argument (caller re-resolves). The literal is validated
 /// during the feasibility scan, so the commit pass never mutates partially.
+///
+/// Also called when the call resolved to an explicit text parse
+/// (`CAST(text AS DATE)`): over a literal that parse is a constant, so doing
+/// it here keeps the call a non-null constant rather than a per-row parse.
 fn coerceTemporalStringLiterals(
     runtime_allocator: Allocator,
     fn_name: []const u8,
@@ -2005,6 +2010,12 @@ fn coerceTemporalStringLiterals(
     return false;
 }
 
+/// Whether `f` reads text as a date or datetime, as `CAST(text AS DATE)` does.
+fn parsesTextToTemporal(f: scalar_fn.ScalarFn) bool {
+    return f.arg_types.len == 1 and f.arg_types[0].isString() and
+        (f.return_type == .date or f.return_type == .datetime);
+}
+
 /// `.varchar`/`.char` share `.string`'s representation; fold them for matching.
 fn foldStringTag(t: types.TypeTag) types.TypeTag {
     return switch (t) {
@@ -2014,8 +2025,9 @@ fn foldStringTag(t: types.TypeTag) types.TypeTag {
 }
 
 /// If `ap` is a string literal that parses as `target` (`.date`/`.datetime`),
-/// return the coerced Value; otherwise null. A datetime target accepts a plain
-/// date string (midnight). Pure — used both to test feasibility and to commit.
+/// return the coerced Value; otherwise null. It parses exactly as the per-row
+/// text kernels do, so folding a literal never changes a result. Pure — used
+/// both to test feasibility and to commit.
 fn litTemporalValue(ap: ArgPlan, target: types.TypeTag) ?types.Value {
     const slot = switch (ap) {
         .lit => |s| s,
@@ -2026,9 +2038,8 @@ fn litTemporalValue(ap: ArgPlan, target: types.TypeTag) ?types.Value {
         else => return null,
     };
     return switch (target) {
-        .date => .{ .date = scalar_common.parseDateString(text) catch return null },
-        .datetime => .{ .datetime = scalar_common.parseDateTimeString(text) catch
-            (@as(i64, scalar_common.parseDateString(text) catch return null) * std.time.us_per_day) },
+        .date => .{ .date = scalar_common.textToDate(text) orelse return null },
+        .datetime => .{ .datetime = scalar_common.textToDatetime(text) orelse return null },
         else => null,
     };
 }
