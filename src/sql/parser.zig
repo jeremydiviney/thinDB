@@ -1301,7 +1301,25 @@ pub const Parser = struct {
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
+        try self.dedupeProjectionNames(items.items);
         return try items.toOwnedSlice(self.arena);
+    }
+
+    /// Operators bind by name, so a projection's outputs must be distinct.
+    /// A repeated name (`SELECT 1, 1`, `SELECT id, NULL, NULL`, `a AS x, b AS
+    /// x`) keeps its first use; each later use becomes `name_N` with the
+    /// smallest N no item claims — DuckDB's naming.
+    fn dedupeProjectionNames(self: *Parser, items: []ProjItem) ParseError!void {
+        for (items, 0..) |*item, i| {
+            if (item.kind == .star or !projectionNameClaimed(items[0..i], item.name)) continue;
+            var n: usize = 1;
+            while (true) : (n += 1) {
+                const candidate = try std.fmt.allocPrint(self.arena, "{s}_{d}", .{ item.name, n });
+                if (projectionNameClaimed(items, candidate)) continue;
+                item.name = candidate;
+                break;
+            }
+        }
     }
 
     fn parseProjItem(self: *Parser) ParseError!ProjItem {
@@ -4335,6 +4353,13 @@ fn selectDerivedCount(proj: []const ProjItem) u32 {
         else => {},
     };
     return n;
+}
+
+fn projectionNameClaimed(items: []const ProjItem, name: []const u8) bool {
+    for (items) |item| {
+        if (item.kind != .star and types.columnNameEql(item.name, name)) return true;
+    }
+    return false;
 }
 
 fn projectionHasRenamedCols(proj: []const ProjItem) bool {
