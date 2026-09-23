@@ -682,6 +682,8 @@ Result buffers and metadata remain charged while owned. Retained region-pool cap
 
 Wire handlers reset their cancellation token at statement acceptance, before parsing/compilation. Compilation and eager subqueries share the token with execution. Scans, worker scheduling, sort partitions/passes, regional operations, and merge loops check it cooperatively. `QueryCancelled` unwinds ordinary resource ownership. Polling does not preempt a native UDF callback or an operating-system I/O call; this is cooperative cancellation, not a hard latency guarantee.
 
+The server trips the same token when a MySQL-wire client disconnects mid-statement. Its connection reaper probes each connection's socket every 5 s, and cancels a statement whose only product is its result set (not a write, DDL or EXPLAIN) once the peer has closed. Writes run to completion, as in MySQL. The PostgreSQL wire does not arm this yet.
+
 ## 9. API
 
 The public Zig API. v1 has no other client surface.

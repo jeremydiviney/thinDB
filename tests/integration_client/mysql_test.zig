@@ -1730,6 +1730,168 @@ test "mysql wire: KILL <self_id> sets the cancel flag (no registry → no-op suc
     if (sctx.err) |e| return e;
 }
 
+/// A scalar UDF that sleeps on every batch, so a statement calling it is
+/// still running when the test acts on it.
+const SlowProbe = struct {
+    io: std.Io,
+    rows: std.atomic.Value(usize) = .init(0),
+
+    fn kernel(ctx: *const thindb.udf.ScalarContext, args: []const thindb.storage.ColumnView, out: *thindb.engine.ColumnStore, count: usize) !void {
+        const self: *SlowProbe = @ptrCast(@alignCast(ctx.user_data.?));
+        _ = self.rows.fetchAdd(count, .monotonic);
+        try out.data.bigint.appendSlice(ctx.allocator, args[0].data.bigint[0..count]);
+        try std.Io.sleep(self.io, .fromMilliseconds(20), .awake);
+    }
+
+    fn awaitFirstBatch(self: *SlowProbe) !void {
+        for (0..1000) |_| {
+            if (self.rows.load(.monotonic) > 0) return;
+            try std.Io.sleep(self.io, .fromMilliseconds(5), .awake);
+        }
+        return error.ProbeNeverCalled;
+    }
+};
+
+const slow_probe_rows: usize = 4096;
+const schema_ids = thindb.TableSchema{
+    .columns = &.{.{ .name = "id", .type = .bigint }},
+    .order_key = &.{"id"},
+    .unique = false,
+};
+const ok_ids = [_][]const u8{"id"};
+const opts_ids = thindb.TableOptions{
+    .order_key = &ok_ids,
+    .row_group_size = 128,
+};
+
+/// Registers `slow_probe` and seeds `main.public.t` with enough row groups
+/// that a statement over it spans many probe batches; `dst` starts empty.
+fn seedSlowProbe(catalog: *thindb.Catalog, probe: *SlowProbe) !void {
+    try catalog.registerScalarUdf(.{
+        .name = "slow_probe",
+        .arg_types = &.{.bigint},
+        .return_type = .bigint,
+        .volatility = .immutable,
+        .kernel = SlowProbe.kernel,
+        .user_data = probe,
+    });
+    const sc = catalog.database("main").?.schema("public").?;
+    const t = try sc.table("t", schema_ids, opts_ids);
+    var rows: [slow_probe_rows]struct { id: i64 } = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .id = @intCast(i) };
+    try t.insert(&rows);
+    try t.flush();
+    _ = try sc.table("dst", schema_ids, opts_ids);
+}
+
+test "mysql wire: a read-only query is cancelled once its client disconnects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: SlowProbe = .{ .io = io };
+    try seedSlowProbe(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 62;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    var server_joined = false;
+    defer if (!server_joined) t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    var client_open = true;
+    defer if (client_open) client.close();
+    try client.doHandshake("main");
+
+    try client.sendQuery("SELECT max(slow_probe(id)) AS m FROM t");
+    try probe.awaitFirstBatch();
+    try std.testing.expectEqual(@as(usize, 0), registry.cancelAbandonedQueries());
+
+    client.close();
+    client_open = false;
+    var cancelled: usize = 0;
+    for (0..400) |_| {
+        cancelled = registry.cancelAbandonedQueries();
+        if (cancelled != 0) break;
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cancelled);
+
+    t.join();
+    server_joined = true;
+    try std.testing.expect(probe.rows.load(.monotonic) < slow_probe_rows);
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: a write keeps running after its client disconnects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: SlowProbe = .{ .io = io };
+    try seedSlowProbe(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 63;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 2 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    {
+        var writer_client = try TestClient.connect(allocator, io, addr);
+        defer writer_client.close();
+        try writer_client.doHandshake("main");
+        try writer_client.sendQuery("INSERT INTO dst SELECT slow_probe(id) FROM t");
+        try probe.awaitFirstBatch();
+    }
+
+    var cancelled: usize = 0;
+    for (0..2000) |_| {
+        if (probe.rows.load(.monotonic) >= slow_probe_rows) break;
+        cancelled += registry.cancelAbandonedQueries();
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), cancelled);
+
+    // The server serves one connection at a time, so this handshake waits
+    // for the INSERT to finish.
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main");
+    try client.sendQuery("SELECT count(*) FROM dst");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqualStrings("4096", rows[0][0].?);
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
 test "mysql wire: limiter at zero capacity emits ER_CON_COUNT_ERROR on accept" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

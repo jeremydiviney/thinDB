@@ -2,7 +2,8 @@
 //! cancellation: MySQL `KILL <id>` and PG `CancelRequest` /
 //! `pg_cancel_backend(pid)` both need to reach into another
 //! connection's state, set its cancel flag, and let the executor
-//! abort at the next batch boundary.
+//! abort at the next batch boundary. The reaper sets the same flag
+//! when a client disconnects mid-query (`cancelAbandonedQueries`).
 //!
 //! One Registry is shared across all wire frontends (mysql, pg,
 //! native). Each accepted connection registers a ConnectionState on
@@ -32,6 +33,11 @@ pub const ConnectionState = struct {
     /// it to true causes the in-flight query to abort with
     /// error.QueryCancelled. Reset to false when a new query starts.
     cancel_flag: std.atomic.Value(bool) = .{ .raw = false },
+    /// Set while the connection runs a statement whose only product is
+    /// its result set (`local.producesOnlyResult`). If the client closes
+    /// the connection meanwhile, nobody is left to receive the result, so
+    /// `Registry.cancelAbandonedQueries` cancels the statement.
+    cancel_on_disconnect: std.atomic.Value(bool) = .{ .raw = false },
     /// Socket handle for the net_read_timeout reaper (#164). Set once,
     /// before `Registry.register` publishes this state (the register
     /// lock is the publication barrier). Null for transports that
@@ -82,6 +88,10 @@ pub const ConnectionState = struct {
 
     pub fn isCancelled(self: *const ConnectionState) bool {
         return self.cancel_flag.load(.acquire);
+    }
+
+    pub fn setCancelOnDisconnect(self: *ConnectionState, on: bool) void {
+        self.cancel_on_disconnect.store(on, .release);
     }
 
     pub fn beginRead(self: *ConnectionState, now_ms: u64, mid_packet: bool) void {
@@ -199,7 +209,7 @@ pub const Registry = struct {
     /// AFD handles that ws2_32 calls reject, so the shutdown must go
     /// through the same Io vtable that opened them.
     pub fn reapStalledReads(self: *Registry, io: std.Io, now_ms: u64, timeout_ms: u64) usize {
-        const afd_probe = @import("afd_probe.zig");
+        const socket_probe = @import("socket_probe.zig");
         self.mutex.lock();
         defer self.mutex.unlock();
         var reaped: usize = 0;
@@ -231,7 +241,7 @@ pub const Registry = struct {
                 },
                 else => { // header read: idle unless bytes are queued
                     if (waited < wedge_probe_grace_ms) continue;
-                    const avail = afd_probe.bytesAvailable(handle) orelse continue;
+                    const avail = socket_probe.bytesAvailable(handle) orelse continue;
                     if (avail == 0) continue; // genuinely idle
                     std.debug.print(
                         "thindb: wedged read: connection {d} has {d} bytes queued but its read has pended {d}ms — shutting down its socket\n",
@@ -244,6 +254,31 @@ pub const Registry = struct {
             reaped += 1;
         }
         return reaped;
+    }
+
+    /// Cancel every result-only statement whose client has closed its
+    /// connection. The connection thread would notice the close only when
+    /// it next touched the socket, after the statement finished, so a
+    /// long or runaway query otherwise keeps its cores and memory with
+    /// nobody waiting for it. Statements that write are left to finish,
+    /// as MySQL finishes them. Runs under the registry lock for the same
+    /// reason as `reapStalledReads`: a registered socket is still open.
+    pub fn cancelAbandonedQueries(self: *Registry) usize {
+        const socket_probe = @import("socket_probe.zig");
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var cancelled: usize = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry| {
+            const state = entry.*;
+            if (!state.cancel_on_disconnect.load(.acquire) or state.isCancelled()) continue;
+            const handle = state.reap_socket orelse continue;
+            if (socket_probe.peerClosed(handle) != true) continue;
+            std.debug.print("thindb: connection {d} closed by its client mid-query — cancelling the query\n", .{state.backend_id});
+            state.requestCancel();
+            cancelled += 1;
+        }
+        return cancelled;
     }
 };
 
@@ -301,6 +336,46 @@ test "transfer-wait marks encode class; reap skips unarmed sockets" {
     s.endTransfer();
     try std.testing.expectEqual(@as(u64, 0), s.transfer_wait.load(.monotonic));
     reg.unregister(7);
+}
+
+test "cancelAbandonedQueries cancels only an armed statement whose client is gone" {
+    const socket_probe = @import("socket_probe.zig");
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    defer listener.deinit(io);
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    var client_open = true;
+    defer if (client_open) client.close(io);
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    var s = ConnectionState.init(9, 0);
+    s.reap_socket = accepted.socket.handle;
+    try reg.register(&s);
+    defer reg.unregister(9);
+
+    s.setCancelOnDisconnect(true);
+    try std.testing.expectEqual(@as(usize, 0), reg.cancelAbandonedQueries());
+    try std.testing.expect(!s.isCancelled());
+
+    client.close(io);
+    client_open = false;
+    for (0..100) |_| {
+        if (socket_probe.peerClosed(accepted.socket.handle) == true) break;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+
+    s.setCancelOnDisconnect(false);
+    try std.testing.expectEqual(@as(usize, 0), reg.cancelAbandonedQueries());
+    try std.testing.expect(!s.isCancelled());
+
+    s.setCancelOnDisconnect(true);
+    try std.testing.expectEqual(@as(usize, 1), reg.cancelAbandonedQueries());
+    try std.testing.expect(s.isCancelled());
+    try std.testing.expectEqual(@as(usize, 0), reg.cancelAbandonedQueries());
 }
 
 test "nextBackendId is monotonically increasing" {

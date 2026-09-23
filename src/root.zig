@@ -134,6 +134,7 @@ test {
     _ = @import("util/buffer_pool.zig");
     _ = @import("util/fair_mutex.zig");
     _ = @import("net/conn_registry.zig");
+    _ = @import("net/socket_probe.zig");
     _ = @import("net/xa_exec.zig");
     _ = @import("net/const_fold.zig");
     _ = @import("exec/affine_agg.zig");

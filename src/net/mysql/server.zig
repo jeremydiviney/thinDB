@@ -3516,6 +3516,8 @@ fn runSingleStatement(
     // thread spawns every exec worker for the statement, and spawned threads
     // inherit the spawner's affinity mask there (see core_scheduler.PIN_THREADS).
     profiler.recordSqlKind(classifySqlKind(op.*));
+    if (session.conn_state) |state| state.setCancelOnDisconnect(local.producesOnlyResult(op));
+    defer if (session.conn_state) |state| state.setCancelOnDisconnect(false);
     const statement_lease = catalog.acquireStatement(local.changesCatalog(op)) catch |err| {
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, mapped.message);
@@ -3886,6 +3888,8 @@ fn handleStmtExecute(
         try handshake.sendErrPacket(allocator, w, seq_id, 1064, "42000".*, "Multi-statement not supported in prepared mode");
         return;
     }
+    if (session.conn_state) |state| state.setCancelOnDisconnect(local.producesOnlyResult(op));
+    defer if (session.conn_state) |state| state.setCancelOnDisconnect(false);
 
     const statement_lease = catalog.acquireStatement(local.changesCatalog(op)) catch |err| {
         const mapped = errors.mapInternal(err, null);
