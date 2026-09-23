@@ -463,7 +463,12 @@ pub const Compute = struct {
         }
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
-        for (derived, resolved) |d, *r| r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
+        var resolved_count: usize = 0;
+        errdefer for (resolved[0..resolved_count]) |r| freeResolvedDerived(allocator, r);
+        for (derived, resolved) |d, *r| {
+            r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
+            resolved_count += 1;
+        }
 
         // Validate no duplicate derived names. Matching an upstream column
         // name is allowed and means "replace that output slot".
@@ -545,16 +550,7 @@ pub const Compute = struct {
         self.allocator.free(self.derived_cols);
         self.allocator.free(self.derived_direct);
         self.allocator.free(self.derived_output_indices);
-        for (self.derived) |r| {
-            switch (r.kind) {
-                .call => |plan| freeCallPlan(self.allocator, plan),
-                .lit_only => |slot| slot.buf.deinit(self.allocator),
-                .case => |plan| freeCasePlan(self.allocator, plan),
-                .rename => {},
-                .null_only => {},
-                .fused_scalar => {},
-            }
-        }
+        for (self.derived) |r| freeResolvedDerived(self.allocator, r);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.views);
         self.arena.deinit();
@@ -1494,11 +1490,12 @@ fn resolveDerived(
     up_schema: []const Column,
     udf_registry: ?*const udf_mod.UdfRegistry,
 ) !ResolvedDerived {
+    const name = try aa.dupe(u8, d.name);
     switch (d.expr) {
-        .col_ref => |name| {
-            const idx = columnIndex(up_schema, name) orelse return Error.ColumnNotFound;
+        .col_ref => |src_name| {
+            const idx = columnIndex(up_schema, src_name) orelse return Error.ColumnNotFound;
             return .{
-                .name = try aa.dupe(u8, d.name),
+                .name = name,
                 .output_type = up_schema[idx].type,
                 .stat_class = .none, // rename is handled directly by stats() (pass-through)
                 .kind = .{ .rename = .{ .src_idx = idx } },
@@ -1512,7 +1509,7 @@ fn resolveDerived(
                 .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
             };
             return .{
-                .name = try aa.dupe(u8, d.name),
+                .name = name,
                 .output_type = literalType(v),
                 .stat_class = .{ .literal = intFamilyValueI128(v) },
                 .kind = .{ .lit_only = slot },
@@ -1520,7 +1517,7 @@ fn resolveDerived(
         },
         .null_lit => |ty| {
             return .{
-                .name = try aa.dupe(u8, d.name),
+                .name = name,
                 .output_type = ty,
                 .stat_class = .none,
                 .kind = .{ .null_only = ty },
@@ -1531,7 +1528,7 @@ fn resolveDerived(
             // Fast path: `col +/-/* const` collapses to one widening SIMD pass.
             if (try tryFuseScalar(aa, d.expr, up_schema)) |fs| {
                 return .{
-                    .name = try aa.dupe(u8, d.name),
+                    .name = name,
                     .output_type = fs.out_type,
                     .stat_class = stat_class,
                     .kind = .{ .fused_scalar = fs },
@@ -1539,7 +1536,7 @@ fn resolveDerived(
             }
             const plan = try buildCallPlan(runtime_allocator, aa, d.expr, up_schema, udf_registry);
             return .{
-                .name = try aa.dupe(u8, d.name),
+                .name = name,
                 .output_type = plan.output_type,
                 .stat_class = stat_class,
                 .kind = .{ .call = plan },
@@ -1548,7 +1545,7 @@ fn resolveDerived(
         .case => {
             const plan = try buildCasePlan(runtime_allocator, aa, d.expr.case, up_schema, udf_registry);
             return .{
-                .name = try aa.dupe(u8, d.name),
+                .name = name,
                 .output_type = plan.output_type,
                 .stat_class = .none,
                 .kind = .{ .case = plan },
@@ -1597,9 +1594,8 @@ fn normalizeBranchSrc(runtime_allocator: Allocator, src: BranchSrc, out_type: Ty
         .lit => try coerceLitBranch(runtime_allocator, src, out_type),
         .null_lit => |slot| {
             if (std.meta.activeTag(slot.ty) == std.meta.activeTag(out_type)) return;
+            replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, out_type, true));
             slot.ty = out_type;
-            slot.buf.deinit(runtime_allocator);
-            slot.buf = try ColumnStore.init(runtime_allocator, out_type, true);
         },
         else => {},
     }
@@ -1615,10 +1611,14 @@ fn coerceLitBranch(runtime_allocator: Allocator, src: BranchSrc, out_type: Type)
     if (std.meta.activeTag(slot.ty) == std.meta.activeTag(out_type)) return;
     var v = slot.value;
     predicate_mod.coerceValueRounded(&v, out_type) catch return;
+    replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, out_type, false));
     slot.value = v;
     slot.ty = out_type;
-    slot.buf.deinit(runtime_allocator);
-    slot.buf = try ColumnStore.init(runtime_allocator, out_type, false);
+}
+
+fn replaceBuf(allocator: Allocator, buf: *ColumnStore, replacement: ColumnStore) void {
+    buf.deinit(allocator);
+    buf.* = replacement;
 }
 
 fn commonCaseType(current: ?Type, next: Type) ?Type {
@@ -1733,6 +1733,7 @@ fn buildCasePlan(
     const out_buf = try runtime_allocator.create(ColumnStore);
     errdefer runtime_allocator.destroy(out_buf);
     out_buf.* = try ColumnStore.init(runtime_allocator, out_type, may_null);
+    errdefer out_buf.deinit(runtime_allocator);
 
     const plan = try aa.create(CasePlan);
     plan.* = .{
@@ -1864,6 +1865,8 @@ fn buildCallPlan(
 
     const arg_plans = try aa.alloc(ArgPlan, c.args.len);
     const arg_types = try aa.alloc(Type, c.args.len);
+    var built: usize = 0;
+    errdefer for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
     for (c.args, 0..) |arg, i| {
         switch (arg) {
             .col_ref => |name| {
@@ -1906,6 +1909,7 @@ fn buildCallPlan(
                 return Error.ComputeUnsupportedExpr;
             },
         }
+        built += 1;
     }
 
     var r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
@@ -1917,8 +1921,11 @@ fn buildCallPlan(
 
     // Cast scratch buffers (one per coerced arg).
     var cast_buffers: ?[]?ColumnStore = null;
+    errdefer if (cast_buffers) |buffers| freeCastBuffers(runtime_allocator, buffers);
     if (rr.arg_casts) |casts| {
         const buffers = try runtime_allocator.alloc(?ColumnStore, casts.len);
+        @memset(buffers, null);
+        cast_buffers = buffers;
         for (casts, rr.func.arg_types, arg_plans, buffers) |k, declared, ap, *slot| {
             if (k == null) {
                 slot.* = null;
@@ -1934,13 +1941,14 @@ fn buildCallPlan(
             };
             slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable);
         }
-        cast_buffers = buffers;
     }
 
     // Own a nullable output ColumnStore so the next level up's null
     // propagation can see the correct validity bits.
     const output_buf = try runtime_allocator.create(ColumnStore);
+    errdefer runtime_allocator.destroy(output_buf);
     output_buf.* = try ColumnStore.init(runtime_allocator, rr.func.return_type, true);
+    errdefer output_buf.deinit(runtime_allocator);
 
     const plan = try aa.create(CallPlan);
     plan.* = .{
@@ -1999,10 +2007,9 @@ fn coerceTemporalStringLiterals(
             if (declared != .date and declared != .datetime) continue;
             const new_val = litTemporalValue(arg_plans[i], declared) orelse continue;
             const slot = arg_plans[i].lit;
+            replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, literalType(new_val), false));
             slot.value = new_val;
             slot.ty = literalType(new_val);
-            slot.buf.deinit(runtime_allocator);
-            slot.buf = try ColumnStore.init(runtime_allocator, literalType(new_val), false);
             at.* = literalType(new_val);
         }
         return true;
@@ -2049,20 +2056,35 @@ fn litTemporalValue(ap: ArgPlan, target: types.TypeTag) ?types.Value {
 /// Called from Compute.deinit. The CallPlan struct itself lives in
 /// the arena and is freed there.
 fn freeCallPlan(runtime_allocator: Allocator, plan: *CallPlan) void {
-    for (plan.args) |arg| switch (arg) {
+    for (plan.args) |arg| freeArgPlan(runtime_allocator, arg);
+    if (plan.cast_buffers) |buffers| freeCastBuffers(runtime_allocator, buffers);
+    if (plan.output_owned) {
+        plan.output.deinit(runtime_allocator);
+        runtime_allocator.destroy(plan.output);
+    }
+}
+
+fn freeArgPlan(runtime_allocator: Allocator, arg: ArgPlan) void {
+    switch (arg) {
         .col => {},
         .lit => |slot| slot.buf.deinit(runtime_allocator),
         .null_lit => |slot| slot.buf.deinit(runtime_allocator),
         .call => |sub| freeCallPlan(runtime_allocator, sub),
         .case => |sub| freeCasePlan(runtime_allocator, sub),
-    };
-    if (plan.cast_buffers) |buffers| {
-        for (buffers) |*slot| if (slot.*) |*cs| cs.deinit(runtime_allocator);
-        runtime_allocator.free(buffers);
     }
-    if (plan.output_owned) {
-        plan.output.deinit(runtime_allocator);
-        runtime_allocator.destroy(plan.output);
+}
+
+fn freeCastBuffers(runtime_allocator: Allocator, buffers: []?ColumnStore) void {
+    for (buffers) |*slot| if (slot.*) |*cs| cs.deinit(runtime_allocator);
+    runtime_allocator.free(buffers);
+}
+
+fn freeResolvedDerived(runtime_allocator: Allocator, r: ResolvedDerived) void {
+    switch (r.kind) {
+        .call => |plan| freeCallPlan(runtime_allocator, plan),
+        .lit_only => |slot| slot.buf.deinit(runtime_allocator),
+        .case => |plan| freeCasePlan(runtime_allocator, plan),
+        .rename, .null_only, .fused_scalar => {},
     }
 }
 
@@ -2448,4 +2470,93 @@ test "retains its own copy of the derived IR after the caller's scratch dies" {
     try std.testing.expectEqualStrings("a", c.derived_ir[0].name);
     try std.testing.expectEqualStrings("to_bigint", c.derived_ir[0].expr.call.fn_name);
     try std.testing.expectEqualStrings("a", c.derived_ir[0].expr.call.args[0].col_ref);
+}
+
+/// Upstream for the construction-failure tests: `a INT NULL, s VARCHAR NULL`, no rows.
+const EmptyTestSource = struct {
+    pub fn next(_: *@This()) anyerror!?Batch {
+        return null;
+    }
+    pub fn deinit(_: *@This()) void {}
+    pub fn outputSchema(_: *@This()) []const Column {
+        return &.{
+            .{ .name = "a", .type = .int, .nullable = true },
+            .{ .name = "s", .type = .string, .nullable = true },
+        };
+    }
+    pub fn addPrune(_: *@This(), _: Predicate) anyerror!void {}
+    pub fn stats(_: *@This()) exec.PipelineStats {
+        return .{ .upper_rows = 0, .column_stats = &.{} };
+    }
+    pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *@This(), _: *std.ArrayList(u8), _: Allocator, _: usize) anyerror!void {}
+};
+
+test "a create that fails frees every buffer it built" {
+    // A statement's accountant, and the statement-gate lease Database.close
+    // waits on, live until every tracked byte is returned: one leaked
+    // literal buffer hung close for good (#63).
+    const x = [_]Expr{.{ .lit = .{ .text = "x" } }};
+    const sqrt_x: Expr = .{ .call = .{ .fn_name = "sqrt", .args = &x } };
+    const lit_then_bad = [_]Expr{ .{ .lit = .{ .text = "a" } }, sqrt_x };
+    const cases = .{
+        .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = sqrt_x }} },
+        .{ Error.ComputeNoSuchOverload, &[_]Derived{
+            .{ .name = "u", .expr = .{ .call = .{ .fn_name = "upper", .args = &x } } },
+            .{ .name = "v", .expr = sqrt_x },
+        } },
+        .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = .{ .call = .{ .fn_name = "concat", .args = &lit_then_bad } } }} },
+        .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = .{ .case = .{
+            .branches = &.{.{ .cond = .{ .is_not_null = "a" }, .then = .{ .lit = .{ .text = "y" } } }},
+            .else_branch = &sqrt_x,
+        } } }} },
+        .{ Error.ComputeNameCollision, &[_]Derived{
+            .{ .name = "k", .expr = .{ .lit = .{ .text = "p" } } },
+            .{ .name = "k", .expr = .{ .lit = .{ .text = "q" } } },
+        } },
+    };
+    inline for (cases) |c| {
+        var src = EmptyTestSource{};
+        try std.testing.expectError(c[0], Compute.create(std.testing.allocator, exec.makeQuery(std.testing.allocator, &src), c[1]));
+    }
+}
+
+fn createAndRelease(allocator: Allocator) !void {
+    const date_text = [_]Expr{.{ .lit = .{ .text = "2024-05-01" } }};
+    const a = [_]Expr{.{ .col_ref = "a" }};
+    const s_x = [_]Expr{ .{ .col_ref = "s" }, .{ .lit = .{ .text = "x" } } };
+    const lit_s = [_]Expr{ .{ .lit = .{ .text = "a" } }, .{ .col_ref = "s" } };
+    const concat_lit_s = [_]Expr{.{ .call = .{ .fn_name = "concat", .args = &lit_s } }};
+    const zero: Expr = .{ .lit = .{ .int = 0 } };
+    const string_null: Expr = .{ .null_lit = .string };
+    const derived = [_]Derived{
+        .{ .name = "month_end", .expr = .{ .call = .{ .fn_name = "last_day", .args = &date_text } } },
+        .{ .name = "root", .expr = .{ .call = .{ .fn_name = "sqrt", .args = &a } } },
+        .{ .name = "suffixed", .expr = .{ .call = .{ .fn_name = "concat", .args = &s_x } } },
+        .{ .name = "shout", .expr = .{ .call = .{ .fn_name = "upper", .args = &concat_lit_s } } },
+        .{ .name = "label", .expr = .{ .lit = .{ .text = "k" } } },
+        .{ .name = "widened", .expr = .{ .case = .{
+            .branches = &.{
+                .{ .cond = .{ .is_not_null = "s" }, .then = .{ .lit = .{ .double = 1.5 } } },
+                .{ .cond = .{ .is_not_null = "a" }, .then = .{ .col_ref = "a" } },
+            },
+            .else_branch = &zero,
+        } } },
+        .{ .name = "or_null", .expr = .{ .case = .{
+            .branches = &.{.{ .cond = .{ .is_not_null = "a" }, .then = .{ .col_ref = "a" } }},
+            .else_branch = &string_null,
+        } } },
+    };
+    var src = EmptyTestSource{};
+    var q = try Compute.create(allocator, exec.makeQuery(allocator, &src), &derived);
+    q.deinit();
+}
+
+test "create frees what it built when any allocation fails" {
+    // Covers literal slots re-typed after they were built (a text literal
+    // read as a date, CASE literals and NULLs unified to the result type):
+    // a failed replacement must leave the old buffer freeable exactly once.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, createAndRelease, .{});
 }
