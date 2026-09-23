@@ -5,7 +5,9 @@
 //! Used by wal.zig:
 //!   - WalWriter.appendInsert  -> encodeColumnRange + writePacked helpers
 //!   - WalWriter.appendDelete  -> encodeValue
-//!   - replay() apply step     -> applyInsertRecord, applyDeleteRecord
+//!   - WalWriter.appendReplace -> encodeRows
+//!   - replay apply step       -> applyInsertRecord, applyDeleteRecord,
+//!                                applyDeleteExprRecord, applyReplaceRecord
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -29,13 +31,82 @@ const wal = @import("wal.zig");
 const Error = wal.Error;
 
 pub fn applyInsertRecord(allocator: Allocator, payload: []const u8, mt: *Memtable) !void {
-    if (payload.len < 4) return Error.WalCorrupt;
-    const row_count = format.readU32(payload[0..4]);
-    var cursor: usize = 4;
-    for (mt.columns, mt.schema.columns) |*col, schema_col| {
-        cursor = try decodeColumnRange(allocator, payload, cursor, row_count, col, schema_col);
+    _ = try decodeRows(allocator, payload, 0, mt);
+}
+
+/// Apply a `replace` record: drop one memtable row equal to each retracted
+/// row, collect the segment offsets into `tombstones`, then append the
+/// replacement rows. Retracting by content rather than by position or by
+/// the UPDATE's predicate keeps replay exact when the recovered memtable
+/// holds rows the live one had already dropped (a unique table's superseded
+/// keys, which only the post-replay upsert pass removes).
+pub fn applyReplaceRecord(
+    allocator: Allocator,
+    payload: []const u8,
+    mt: *Memtable,
+    tombstones: *wal.SegmentTombstones,
+) !void {
+    var retracted = try Memtable.init(allocator, mt.schema);
+    defer retracted.deinit();
+    var cursor = try decodeRows(allocator, payload, 0, &retracted);
+
+    if (cursor + 12 > payload.len) return Error.WalCorrupt;
+    const segment_id = format.readU64(payload[cursor..][0..8]);
+    const offset_count: usize = format.readU32(payload[cursor + 8 ..][0..4]);
+    cursor += 12;
+    if (cursor + offset_count * 4 > payload.len) return Error.WalCorrupt;
+    const offsets = try allocator.alloc(u32, offset_count);
+    defer allocator.free(offsets);
+    for (offsets, 0..) |*offset, i| offset.* = format.readU32(payload[cursor + i * 4 ..][0..4]);
+    cursor += offset_count * 4;
+
+    try retractRows(allocator, mt, &retracted);
+    try wal.addSegmentTombstones(allocator, tombstones, segment_id, offsets);
+    _ = try decodeRows(allocator, payload, cursor, mt);
+}
+
+fn retractRows(allocator: Allocator, mt: *Memtable, retracted: *const Memtable) !void {
+    const retracted_count: usize = @intCast(retracted.row_count);
+    const row_count: usize = @intCast(mt.row_count);
+    if (retracted_count == 0 or row_count == 0) return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var remaining: std.StringHashMapUnmanaged(u32) = .empty;
+    for (0..retracted_count) |row| {
+        var key: std.ArrayList(u8) = .empty;
+        try appendRowKey(aa, &key, retracted.columns, row);
+        const entry = try remaining.getOrPut(aa, key.items);
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
     }
-    mt.row_count += row_count;
+
+    const keep = try allocator.alloc(bool, row_count);
+    defer allocator.free(keep);
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(allocator);
+    for (keep, 0..) |*k, row| {
+        key.clearRetainingCapacity();
+        try appendRowKey(allocator, &key, mt.columns, row);
+        k.* = true;
+        const left = remaining.getPtr(key.items) orelse continue;
+        if (left.* == 0) continue;
+        left.* -= 1;
+        k.* = false;
+    }
+    _ = try mt.retainRows(keep);
+}
+
+fn appendRowKey(allocator: Allocator, out: *std.ArrayList(u8), columns: []const ColumnStore, row: usize) !void {
+    for (columns) |*col| {
+        const view = col.view();
+        if (!view.isValid(row)) {
+            try out.append(allocator, 0);
+            continue;
+        }
+        try out.append(allocator, 1);
+        try view.appendValueBytes(allocator, out, @intCast(row));
+    }
 }
 
 pub fn applyDeleteRecord(allocator: Allocator, payload: []const u8, mt: *Memtable) !void {
@@ -125,6 +196,38 @@ fn cmpStr(a: []const u8, b: []const u8, op: u8) bool {
 // ---------------------------------------------------------------------------
 // Per-column encode / decode for insert records
 // ---------------------------------------------------------------------------
+
+/// Insert-payload layout: row_count u32, then each column's rows
+/// `from..to` in schema order.
+pub fn encodeRows(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    schema: []const types.Column,
+    columns: []const ColumnStore,
+    from: usize,
+    to: usize,
+) !void {
+    try format.appendU32(allocator, out, @intCast(to - from));
+    // A side with no rows may come without columns (a segment batch
+    // retracts no memtable rows).
+    if (to == from) return;
+    for (columns, schema) |col, schema_col| {
+        try encodeColumnRange(allocator, out, col, schema_col, from, to);
+    }
+}
+
+/// Append the insert-payload row block at `cursor_in` to `mt`. Returns the
+/// cursor past it.
+fn decodeRows(allocator: Allocator, payload: []const u8, cursor_in: usize, mt: *Memtable) !usize {
+    if (cursor_in + 4 > payload.len) return Error.WalCorrupt;
+    const row_count = format.readU32(payload[cursor_in..][0..4]);
+    var cursor = cursor_in + 4;
+    for (mt.columns, mt.schema.columns) |*col, schema_col| {
+        cursor = try decodeColumnRange(allocator, payload, cursor, row_count, col, schema_col);
+    }
+    mt.row_count += row_count;
+    return cursor;
+}
 
 pub fn encodeColumnRange(
     allocator: Allocator,
