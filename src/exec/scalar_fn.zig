@@ -346,6 +346,30 @@ fn intCastTarget(name: []const u8) ?Type {
 
 /// Resolve a name-encoded `to_decimal:<p>:<s>` cast. Source may be any numeric
 /// or string type.
+/// The conversion function `CAST(x AS ty)` lowers to (the implicit-cast
+/// ranking then coerces the source width, e.g. smallint→bigint before
+/// to_int), or null when no kernel converts into `ty`. A DECIMAL target
+/// carries its (p,s) in the name — the resolver sees types, not literal
+/// values — so every name is allocated in `arena`.
+pub fn castFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
+    if (ty.decimalSpec()) |spec| return try std.fmt.allocPrint(arena, "to_decimal:{d}:{d}", .{ spec.p, spec.s });
+    const name: []const u8 = switch (ty) {
+        .int => "to_int",
+        .bigint => "to_bigint",
+        .smallint => "to_smallint",
+        .tinyint => "to_tinyint",
+        .largeint => "to_largeint",
+        .float, .double => "to_double",
+        .boolean => "to_boolean",
+        .date => "to_date",
+        .datetime => "to_datetime",
+        .varchar, .char, .string => "to_string",
+        .json => "to_json",
+        .decimal64, .decimal128, .uuid => return null,
+    };
+    return try arena.dupe(u8, name);
+}
+
 fn resolveToDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     if (arg_types.len != 1) return null;
     var it = std.mem.splitScalar(u8, name, ':');

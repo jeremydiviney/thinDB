@@ -40,6 +40,7 @@ const TableSchema = types.TableSchema;
 const Value = types.Value;
 
 const exec = @import("../exec/exec.zig");
+const exec_cast = @import("../exec/cast.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const cte_stages = @import("cte_stages.zig");
 const Query = exec.Query;
@@ -2503,44 +2504,118 @@ fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
 }
 
 /// INSERT INTO target [(cols)] SELECT ... — drain the source query
-/// and bulk-insert each batch into the target table. The source's
-/// output columns are renamed (per the column list, or positional
-/// against the target schema) so the memtable's name-based column
-/// matching finds them.
+/// and bulk-insert each batch into the target table. Each table column
+/// takes its source column widened to the column's type or, when the
+/// column list omits it, the fill INSERT ... VALUES uses.
 fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, op.table);
-    const tbl_schema = t.schema;
+    const tbl_columns = t.schema.columns;
+
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
 
     var source = try compileSubplan(ctx, op.source);
     defer source.deinit();
 
     const src_schema = source.outputSchema();
+    const table_to_source = try aa.alloc(?usize, tbl_columns.len);
+    @memset(table_to_source, null);
     if (op.columns) |cols| {
         if (cols.len != src_schema.len) return Error.BadRequest;
-        for (cols) |cname| {
-            _ = tbl_schema.columnIndex(cname) orelse return Error.ColumnNotFound;
+        for (cols, 0..) |cname, i| {
+            const j = t.schema.columnIndex(cname) orelse return Error.ColumnNotFound;
+            table_to_source[j] = i;
         }
     } else {
-        if (src_schema.len != tbl_schema.columns.len) return Error.BadRequest;
+        if (src_schema.len != tbl_columns.len) return Error.BadRequest;
+        for (table_to_source, 0..) |*s, j| s.* = j;
     }
 
-    // Synthesize a batch_schema where each source column carries the
-    // target column name expected by `Memtable.insertColumnarBatch`.
-    const renamed = try ctx.allocator.alloc(types.Column, src_schema.len);
-    defer ctx.allocator.free(renamed);
-    for (src_schema, renamed, 0..) |s, *r, i| {
-        const target_name = if (op.columns) |cols| cols[i] else tbl_schema.columns[i].name;
-        r.* = .{ .name = target_name, .type = s.type, .nullable = s.nullable };
+    // picks[j] = the output column of `source` that lands in table column
+    // j: a source column as is, or a derivation appended after them.
+    const picks = try aa.alloc(usize, tbl_columns.len);
+    var derived: std.ArrayList(exec.Derived) = .empty;
+    for (tbl_columns, table_to_source, picks, 0..) |col, maybe_src, *pick, j| {
+        const expr = if (maybe_src) |i|
+            try insertWideningExpr(aa, src_schema[i], col.type) orelse {
+                pick.* = i;
+                continue;
+            }
+        else
+            try insertFillExpr(ctx, aa, col);
+        pick.* = src_schema.len + derived.items.len;
+        try derived.append(aa, .{ .name = try std.fmt.allocPrint(aa, "__insert_{d}", .{j}), .expr = expr });
     }
+    if (derived.items.len > 0) source = try source.computeWithRegistry(derived.items, ctx.udf_registry);
 
+    const out_schema = source.outputSchema();
+    const batch_schema = try aa.alloc(types.Column, tbl_columns.len);
+    const views = try aa.alloc(storage.ColumnView, tbl_columns.len);
     var total_rows: usize = 0;
     while (try source.next()) |b| {
-        try t.insertBatch(renamed, b.values, b.row_count);
+        for (tbl_columns, picks, batch_schema, views) |col, pick, *bs, *view| {
+            view.* = b.values[pick];
+            // A NOT NULL column admits a nullable source whose rows hold no
+            // NULL, as MySQL does; a NULL row still fails in the memtable.
+            const nullable = out_schema[pick].nullable and (col.nullable or view.anyNull(b.row_count));
+            bs.* = .{ .name = col.name, .type = out_schema[pick].type, .nullable = nullable };
+        }
+        try t.insertBatch(batch_schema, views, b.row_count);
         total_rows += b.row_count;
     }
     ctx.affected_rows = @intCast(total_rows);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
+}
+
+/// The cast that widens an INSERT source column into its target type, or
+/// null when the column lands as is. A decimal target always takes one when
+/// the types differ: the memtable matches decimal columns on tag alone, so a
+/// payload at another scale would be stored misread. Other targets widen
+/// along the implicit-cast ladder short of its lossy steps; the ladder
+/// reaches FLOAT only through DOUBLE, so a FLOAT target never casts.
+/// Anything else passes through for the memtable to admit or reject.
+fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?exec.Expr {
+    if (std.meta.eql(src.type, target)) return null;
+    const widens = if (target.isDecimal())
+        src.type.isInteger() or src.type.isFloat() or src.type.isDecimal() or src.type == .boolean
+    else if (target == .float)
+        false
+    else if (exec_cast.castCost(@as(types.TypeTag, src.type), @as(types.TypeTag, target))) |cost|
+        cost > 0 and cost < exec_cast.LOSSY_CAST_COST
+    else
+        false;
+    if (!widens) return null;
+    const fn_name = try exec.scalar_fn.castFnName(aa, target) orelse return null;
+    const args = try aa.alloc(exec.Expr, 1);
+    args[0] = .{ .col_ref = src.name };
+    return .{ .call = .{ .fn_name = fn_name, .args = args } };
+}
+
+/// The value for a table column an INSERT ... SELECT column list omits: the
+/// DEFAULT, the wall clock for DEFAULT CURRENT_TIMESTAMP, else NULL.
+fn insertFillExpr(ctx: *CompileCtx, aa: Allocator, col: types.Column) !exec.Expr {
+    // INSERT ... VALUES reserves AUTO_INCREMENT ids under the table mutex
+    // before building its one batch; a streamed source has no such step.
+    if (col.auto_increment) return Error.UnsupportedOp;
+    if (col.default_value) |dv| {
+        const raw: i128 = switch (dv) {
+            .decimal64 => |r| r,
+            .decimal128 => |r| r,
+            else => return .{ .lit = dv },
+        };
+        // Compute has no decimal literal: rebuild the exact value from text.
+        var text: std.ArrayList(u8) = .empty;
+        try wire_format.formatDecimal(aa, &text, raw, col.type);
+        const args = try aa.alloc(exec.Expr, 1);
+        args[0] = .{ .lit = .{ .text = text.items } };
+        const fn_name = try exec.scalar_fn.castFnName(aa, col.type) orelse return Error.TypeMismatch;
+        return .{ .call = .{ .fn_name = fn_name, .args = args } };
+    }
+    if (col.default_now) return .{ .lit = nowDatetime(ctx) };
+    if (col.nullable) return .{ .null_lit = col.type };
+    return Error.ColumnNotFound;
 }
 
 /// MySQL / StarRocks DDL quotes defaults freely (`DEFAULT "0"`,
