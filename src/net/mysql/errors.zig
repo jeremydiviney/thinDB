@@ -21,6 +21,7 @@ pub fn mapInternal(err: anyerror, fallback_msg: ?[]const u8) Mapped {
         .schema_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Schema exists" },
         .table_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Table exists" },
         .column_not_found => .{ .code = 1054, .sqlstate = "42S22".*, .message = "Unknown column" },
+        .ambiguous_column => .{ .code = 1052, .sqlstate = "23000".*, .message = "Column in on clause is ambiguous" },
         .query_cancelled => .{ .code = 1317, .sqlstate = "70100".*, .message = "Query execution was interrupted" },
         .unknown => .{ .code = 1064, .sqlstate = "42000".*, .message = fallback_msg orelse @errorName(err) },
     };

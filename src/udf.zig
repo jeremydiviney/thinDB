@@ -10,6 +10,7 @@ const storage_column = @import("storage/column.zig");
 const ColumnView = storage_column.ColumnView;
 const store = @import("engine/store.zig");
 const ColumnStore = store.ColumnStore;
+const TableRef = @import("ir/ir.zig").TableRef;
 
 pub const Error = error{
     FunctionAlreadyExists,
@@ -557,6 +558,16 @@ pub const SqlFnCtx = struct {
     registry: *SqlFnRegistry,
     db: []const u8,
     views: ?*ViewRegistry = null,
+    /// Absent = an unqualified `JOIN ... ON` column can't be attributed to
+    /// a base-table input.
+    tables: ?TableColumns = null,
+};
+
+/// Parse-time lookup of a base table's column names, resolved the way the
+/// statement's compile will resolve the reference. Null = no such table.
+pub const TableColumns = struct {
+    context: *const anyopaque,
+    lookup: *const fn (context: *const anyopaque, arena: Allocator, ref: TableRef) Allocator.Error!?[]const []const u8,
 };
 
 pub const UdfRegistry = struct {

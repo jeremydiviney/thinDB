@@ -11,6 +11,7 @@ pub const Category = enum {
     schema_not_found,
     schema_already_exists,
     column_not_found,
+    ambiguous_column,
     query_cancelled,
     unknown,
 };
@@ -23,6 +24,7 @@ pub fn classify(err_name: []const u8) Category {
     if (std.mem.eql(u8, err_name, "SchemaNotFound")) return .schema_not_found;
     if (std.mem.eql(u8, err_name, "SchemaAlreadyExists")) return .schema_already_exists;
     if (std.mem.eql(u8, err_name, "ColumnNotFound")) return .column_not_found;
+    if (std.mem.eql(u8, err_name, "SqlOnColumnAmbiguous")) return .ambiguous_column;
     if (std.mem.eql(u8, err_name, "QueryCancelled")) return .query_cancelled;
     return .unknown;
 }
@@ -31,5 +33,6 @@ test "classify recognizes known errors" {
     try std.testing.expectEqual(Category.table_not_found, classify("TableNotFound"));
     try std.testing.expectEqual(Category.database_already_exists, classify("DatabaseAlreadyExists"));
     try std.testing.expectEqual(Category.query_cancelled, classify("QueryCancelled"));
+    try std.testing.expectEqual(Category.ambiguous_column, classify("SqlOnColumnAmbiguous"));
     try std.testing.expectEqual(Category.unknown, classify("NotARealError"));
 }

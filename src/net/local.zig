@@ -922,6 +922,26 @@ pub fn catalogFor(db: *Database) ?*Catalog {
 /// Unqualified refs (no database / schema) consult the session's temp
 /// namespace first, so a temp table named `foo` shadows any persistent
 /// table named `foo` for the creating session only.
+/// The session's tables as the parser sees them, so it can attribute an
+/// unqualified `JOIN ... ON` column to the input that has it.
+pub const SessionTables = struct {
+    catalog: *Catalog,
+    session: Session,
+
+    pub fn columns(self: *const SessionTables) @import("../udf.zig").TableColumns {
+        return .{ .context = self, .lookup = lookup };
+    }
+
+    fn lookup(context: *const anyopaque, arena: Allocator, ref: ir.TableRef) Allocator.Error!?[]const []const u8 {
+        const self: *const SessionTables = @ptrCast(@alignCast(context));
+        if (pgcat.match(ref) != null) return null;
+        const table = resolveTable(self.catalog, self.session, ref) catch return null;
+        const names = try arena.alloc([]const u8, table.schema.columns.len);
+        for (table.schema.columns, names) |col, *name| name.* = try arena.dupe(u8, col.name);
+        return names;
+    }
+};
+
 pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*ApiTable {
     if (ref.database == null and ref.schema == null) {
         if (session.temp_namespace) |ns| {
@@ -2384,12 +2404,13 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             {
                 var va = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer va.deinit();
+                const tables: SessionTables = .{ .catalog = catalog, .session = ctx.session.* };
                 _ = @import("../sql/sql.zig").parseWithContext(
                     va.allocator(),
                     cv.body,
                     ctx.session.dialect,
                     &catalog.udfs,
-                    .{ .registry = &catalog.sql_fns, .db = db_name, .views = &catalog.views },
+                    .{ .registry = &catalog.sql_fns, .db = db_name, .views = &catalog.views, .tables = tables.columns() },
                 ) catch return Error.FunctionInvalidDefinition;
             }
             if (cv.materialized) {
@@ -2437,12 +2458,13 @@ fn buildMaterializedView(
 ) anyerror!usize {
     var pa = std.heap.ArenaAllocator.init(ctx.allocator);
     defer pa.deinit();
+    const tables: SessionTables = .{ .catalog = catalog, .session = ctx.session.* };
     const parsed = @import("../sql/sql.zig").parseWithContext(
         pa.allocator(),
         body,
         ctx.session.dialect,
         &catalog.udfs,
-        .{ .registry = &catalog.sql_fns, .db = ctx.session.current_db, .views = &catalog.views },
+        .{ .registry = &catalog.sql_fns, .db = ctx.session.current_db, .views = &catalog.views, .tables = tables.columns() },
     ) catch return Error.FunctionInvalidDefinition;
 
     var source = try compileSubplan(ctx, parsed);

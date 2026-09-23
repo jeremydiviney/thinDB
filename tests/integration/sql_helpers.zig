@@ -84,20 +84,22 @@ pub fn runSqlDialect(allocator: std.mem.Allocator, db: anytype, sql: []const u8,
     };
 }
 
-/// Like `runSql` but parses with the database's SQL-function and view
-/// registries in scope, so a bare `FROM viewname` expands. Single-statement
-/// only. Used by view/function tests; plain `runSql` (no context) suffices
+/// Like `runSql` but parses with the database's SQL-function, view and
+/// table registries in scope, as a server connection does: a bare
+/// `FROM viewname` expands and an unqualified `JOIN ... ON` column finds
+/// its side. Single-statement only. Plain `runSql` (no context) suffices
 /// for everything else.
 pub fn runSqlCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const cat = db.catalog.?;
+    const tables: thindb.net.SessionTables = .{ .catalog = cat, .session = .{ .current_db = db.name } };
     const root = try thindb.sql.parseWithContext(
         arena.allocator(),
         sql,
         .neutral,
         &cat.udfs,
-        .{ .registry = &cat.sql_fns, .db = db.name, .views = &cat.views },
+        .{ .registry = &cat.sql_fns, .db = db.name, .views = &cat.views, .tables = tables.columns() },
     );
     const cq = try thindb.net.compile(allocator, db, root);
     return .{
@@ -126,6 +128,18 @@ pub fn exec(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
 /// owned by `allocator`. Caller must `allocator.free` the returned slice.
 pub fn collectBigints(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i64 {
     var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(i64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (batch.values[0].data.bigint[0..batch.row_count]) |v| try out.append(allocator, v);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// `collectBigints` over `runSqlCtx`.
+pub fn collectBigintsCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i64 {
+    var q = try runSqlCtx(allocator, db, sql);
     defer q.deinit();
     var out: std.ArrayList(i64) = .empty;
     errdefer out.deinit(allocator);
