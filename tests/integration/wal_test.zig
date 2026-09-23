@@ -855,3 +855,134 @@ test "wal: an UPDATE whose tombstone write fails after an auto-flush leaves no d
     defer a.free(rows);
     try expectOldOrNewOnce(rows, 16, &ids);
 }
+
+// =============================================================================
+// Replay reproduces what a statement removed, not how it chose the rows (#61).
+// =============================================================================
+
+/// `d` is a date: 0 is 1970-01-01, 4 is 1970-01-05.
+const RecoveryRow = struct { id: i64, x: ?i32, s: []const u8, d: i32 };
+
+const RecoveryCase = struct {
+    unique: bool,
+    segment_rows: []const RecoveryRow,
+    /// Inserted one statement at a time, so a unique table supersedes keys
+    /// between them.
+    memtable_rows: []const RecoveryRow,
+    sql: []const u8,
+    live: []const i64,
+};
+
+/// Run `c` on a fresh table, then reopen from the manifest and log as they
+/// stood after `c.sql`, as if the process had died right there. Tombstone
+/// files stay as written; a table that never flushed has no manifest yet.
+/// Returns the ids the reopened table holds.
+fn recoveredIds(a: std.mem.Allocator, io: std.Io, c: RecoveryCase) ![]i64 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const schema: thindb.TableSchema = .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "x", .type = .int, .nullable = true },
+            .{ .name = "s", .type = .string },
+            .{ .name = "d", .type = .date },
+        },
+        .order_key = &.{"id"},
+        .unique = c.unique,
+    };
+    const config: thindb.Config = .{ .wal_enabled = true, .auto_flush_secs = 0 };
+
+    var manifest: ?[]u8 = undefined;
+    var wal: []u8 = undefined;
+    {
+        const db = try thindb.Database.open(a, io, tmp.dir, config);
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = c.unique });
+        if (c.segment_rows.len > 0) {
+            try t.insert(c.segment_rows);
+            try t.flush();
+        }
+        for (c.memtable_rows) |row| try t.insert(&.{row});
+        try sql_helpers.exec(a, db, c.sql);
+        const live = try sql_helpers.collectBigints(a, db, "SELECT id FROM t ORDER BY id");
+        defer a.free(live);
+        try std.testing.expectEqualSlices(i64, c.live, live);
+        manifest = t.table_dir.readFileAlloc(io, "manifest", aa, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        wal = try t.table_dir.readFileAlloc(io, "wal", aa, .unlimited);
+    }
+    if (manifest) |bytes| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/manifest", .data = bytes });
+    } else {
+        try tmp.dir.deleteFile(io, "main/public/t/manifest");
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/wal", .data = wal });
+
+    const db = try thindb.Database.open(a, io, tmp.dir, config);
+    defer db.close();
+    return sql_helpers.collectBigints(a, db, "SELECT id FROM t ORDER BY id");
+}
+
+test "wal: a crash right after a DELETE or UPDATE recovers exactly the live rows" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const segment = [_]RecoveryRow{.{ .id = 0, .x = 5, .s = "a", .d = 4 }};
+    const mixed = [_]RecoveryRow{
+        .{ .id = 1, .x = null, .s = "q", .d = 0 },
+        .{ .id = 2, .x = 5, .s = "z", .d = 4 },
+        .{ .id = 3, .x = 7, .s = "b", .d = 0 },
+    };
+    const superseded = [_]RecoveryRow{
+        .{ .id = 1, .x = 10, .s = "a", .d = 0 },
+        .{ .id = 1, .x = 20, .s = "b", .d = 0 },
+        .{ .id = 2, .x = 30, .s = "c", .d = 0 },
+    };
+    const cases = [_]RecoveryCase{
+        .{
+            .unique = false,
+            .segment_rows = &segment,
+            .memtable_rows = &mixed,
+            .sql = "DELETE FROM t WHERE s < 'm'",
+            .live = &.{ 1, 2 },
+        },
+        .{
+            .unique = false,
+            .segment_rows = &segment,
+            .memtable_rows = &mixed,
+            .sql = "DELETE FROM t WHERE NOT (x = 5)",
+            .live = &.{ 0, 1, 2 },
+        },
+        .{
+            .unique = false,
+            .segment_rows = &segment,
+            .memtable_rows = &mixed,
+            .sql = "DELETE FROM t WHERE DAY(d) = 5",
+            .live = &.{ 1, 3 },
+        },
+        .{
+            .unique = true,
+            .segment_rows = &.{},
+            .memtable_rows = &superseded,
+            .sql = "DELETE FROM t WHERE x = 20",
+            .live = &.{2},
+        },
+        .{
+            .unique = true,
+            .segment_rows = &.{},
+            .memtable_rows = &superseded,
+            .sql = "UPDATE t SET id = 5 WHERE id = 1",
+            .live = &.{ 2, 5 },
+        },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("case: {s} (unique={})\n", .{ c.sql, c.unique });
+        const ids = try recoveredIds(a, io, c);
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i64, c.live, ids);
+    }
+}

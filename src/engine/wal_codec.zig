@@ -3,11 +3,11 @@
 //! is pure functions over byte buffers — no I/O.
 //!
 //! Used by wal.zig:
-//!   - WalWriter.appendInsert  -> encodeColumnRange + writePacked helpers
-//!   - WalWriter.appendDelete  -> encodeValue
+//!   - WalWriter.appendInsert  -> encodeRows
 //!   - WalWriter.appendReplace -> encodeRows
-//!   - replay apply step       -> applyInsertRecord, applyDeleteRecord,
-//!                                applyDeleteExprRecord, applyReplaceRecord
+//!   - replay apply step       -> applyInsertRecord, applyReplaceRecord, and
+//!                                applyDeleteRecord / applyDeleteExprRecord
+//!                                for logs that older binaries left behind
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -34,12 +34,10 @@ pub fn applyInsertRecord(allocator: Allocator, payload: []const u8, mt: *Memtabl
     _ = try decodeRows(allocator, payload, 0, mt);
 }
 
-/// Apply a `replace` record: drop one memtable row equal to each retracted
-/// row, collect the segment offsets into `tombstones`, then append the
-/// replacement rows. Retracting by content rather than by position or by
-/// the UPDATE's predicate keeps replay exact when the recovered memtable
-/// holds rows the live one had already dropped (a unique table's superseded
-/// keys, which only the post-replay upsert pass removes).
+/// Apply a `replace` record: retract the memtable rows it names, collect the
+/// segment offsets into `tombstones`, then append the replacement rows. The
+/// record names the rows a statement removed rather than the predicate that
+/// chose them, so replay never evaluates a predicate (#61).
 pub fn applyReplaceRecord(
     allocator: Allocator,
     payload: []const u8,
@@ -65,6 +63,12 @@ pub fn applyReplaceRecord(
     _ = try decodeRows(allocator, payload, cursor, mt);
 }
 
+/// Drop the recovered memtable rows `retracted` names. A plain table loses one
+/// equal row per retracted row. A unique table loses every row with a
+/// retracted key: the live memtable held one row per key, but the recovered
+/// one still holds the versions later inserts superseded until the
+/// post-replay upsert pass. Keeping those would bring back a row that was
+/// deleted or moved to another key.
 fn retractRows(allocator: Allocator, mt: *Memtable, retracted: *const Memtable) !void {
     const retracted_count: usize = @intCast(retracted.row_count);
     const row_count: usize = @intCast(mt.row_count);
@@ -73,10 +77,11 @@ fn retractRows(allocator: Allocator, mt: *Memtable, retracted: *const Memtable) 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
+    const key_columns = try rowKeyColumns(aa, mt.schema);
     var remaining: std.StringHashMapUnmanaged(u32) = .empty;
     for (0..retracted_count) |row| {
         var key: std.ArrayList(u8) = .empty;
-        try appendRowKey(aa, &key, retracted.columns, row);
+        try appendRowKey(aa, &key, retracted.columns, key_columns, row);
         const entry = try remaining.getOrPut(aa, key.items);
         entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
     }
@@ -87,19 +92,40 @@ fn retractRows(allocator: Allocator, mt: *Memtable, retracted: *const Memtable) 
     defer key.deinit(allocator);
     for (keep, 0..) |*k, row| {
         key.clearRetainingCapacity();
-        try appendRowKey(allocator, &key, mt.columns, row);
+        try appendRowKey(allocator, &key, mt.columns, key_columns, row);
         k.* = true;
         const left = remaining.getPtr(key.items) orelse continue;
         if (left.* == 0) continue;
-        left.* -= 1;
+        if (!mt.schema.unique) left.* -= 1;
         k.* = false;
     }
     _ = try mt.retainRows(keep);
 }
 
-fn appendRowKey(allocator: Allocator, out: *std.ArrayList(u8), columns: []const ColumnStore, row: usize) !void {
-    for (columns) |*col| {
-        const view = col.view();
+/// The columns that identify a retracted row: the order key on a unique
+/// table, every column otherwise.
+fn rowKeyColumns(allocator: Allocator, schema: types.TableSchema) ![]const usize {
+    if (!schema.unique) {
+        const all = try allocator.alloc(usize, schema.columns.len);
+        for (all, 0..) |*index, i| index.* = i;
+        return all;
+    }
+    const key = try allocator.alloc(usize, schema.order_key.len);
+    for (key, schema.order_key) |*index, name| {
+        index.* = schema.columnIndex(name) orelse return Error.WalCorrupt;
+    }
+    return key;
+}
+
+fn appendRowKey(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    columns: []const ColumnStore,
+    key_columns: []const usize,
+    row: usize,
+) !void {
+    for (key_columns) |column| {
+        const view = columns[column].view();
         if (!view.isValid(row)) {
             try out.append(allocator, 0);
             continue;
@@ -109,6 +135,8 @@ fn appendRowKey(allocator: Allocator, out: *std.ArrayList(u8), columns: []const 
     }
 }
 
+/// Apply a `delete` record, which only older binaries wrote: drop the
+/// memtable rows its single-column predicate matches.
 pub fn applyDeleteRecord(allocator: Allocator, payload: []const u8, mt: *Memtable) !void {
     _ = allocator;
     if (payload.len < 4) return Error.WalCorrupt;
@@ -489,63 +517,6 @@ fn writePackedStrings(
     }
 }
 
-pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) !void {
-    var b: [16]u8 = undefined;
-    switch (v) {
-        .int => |x| {
-            format.writeI32(b[0..4], x);
-            try out.appendSlice(allocator, b[0..4]);
-        },
-        .bigint => |x| {
-            format.writeI64(b[0..8], x);
-            try out.appendSlice(allocator, b[0..8]);
-        },
-        .boolean => |x| try out.append(allocator, @intFromBool(x)),
-        .float => |x| {
-            format.writeF32(b[0..4], x);
-            try out.appendSlice(allocator, b[0..4]);
-        },
-        .double => |x| {
-            format.writeF64(b[0..8], x);
-            try out.appendSlice(allocator, b[0..8]);
-        },
-        .date => |x| {
-            format.writeI32(b[0..4], x);
-            try out.appendSlice(allocator, b[0..4]);
-        },
-        .datetime => |x| {
-            format.writeI64(b[0..8], x);
-            try out.appendSlice(allocator, b[0..8]);
-        },
-        .tinyint => |x| try out.append(allocator, @bitCast(x)),
-        .smallint => |x| {
-            std.mem.writeInt(i16, b[0..2], x, .little);
-            try out.appendSlice(allocator, b[0..2]);
-        },
-        .largeint => |x| {
-            std.mem.writeInt(i128, b[0..16], x, .little);
-            try out.appendSlice(allocator, &b);
-        },
-        .decimal64 => |x| {
-            format.writeI64(b[0..8], x);
-            try out.appendSlice(allocator, b[0..8]);
-        },
-        .decimal128 => |x| {
-            std.mem.writeInt(i128, b[0..16], x, .little);
-            try out.appendSlice(allocator, &b);
-        },
-        .uuid => |x| {
-            std.mem.writeInt(u128, b[0..16], x, .little);
-            try out.appendSlice(allocator, &b);
-        },
-        .text => |s| {
-            format.writeU32(b[0..4], @intCast(s.len));
-            try out.appendSlice(allocator, b[0..4]);
-            try out.appendSlice(allocator, s);
-        },
-    }
-}
-
 fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
     const c = cursor.*;
     return switch (tag) {
@@ -637,11 +608,9 @@ fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
 }
 
 // ---------------------------------------------------------------------------
-// Rich-predicate (PredicateExpr) encode / decode for delete_expr WAL records.
-//
-// Mirrors the IR's `encodePredicate` tag numbering so the byte layout is
-// stable across the codebase; the engine layer can't import IR (would
-// cycle), so we duplicate the small encoder/decoder here.
+// Rich-predicate (PredicateExpr) decode for delete_expr WAL records, which
+// only older binaries wrote. The tag numbering mirrors the IR's
+// `encodePredicate`.
 //
 // Tag (u8):
 //   0  = leaf            [op u8][col_len u32][col bytes][value_tag u8][value bytes]
@@ -654,11 +623,6 @@ fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
 //   7  = leaf_col_col    [op u8][left_len u32][left bytes][right_len u32][right bytes]
 //   8  = always          [b u8]   (0 = false, non-zero = true)
 //   9  = in_set          [col_len u32][col bytes][negate u8][value_tag u8][n_values u32][values...]
-//
-// Unresolved or runtime-only variants (scalar_subquery / exists_subquery /
-// in_subquery / correlated_* / leaf_var / var_ref) error out with
-// WalPredicateUnsupported — caller can choose to skip WAL logging and
-// proceed with the mutation.
 // ---------------------------------------------------------------------------
 
 const PredTagWal = enum(u8) {
@@ -674,108 +638,10 @@ const PredTagWal = enum(u8) {
     in_set = 9,
 };
 
-pub fn encodePredicateExpr(allocator: Allocator, out: *std.ArrayList(u8), expr: anytype) !void {
-    var b4: [4]u8 = undefined;
-    switch (expr) {
-        .leaf => |lf| {
-            try out.append(allocator, @intFromEnum(PredTagWal.leaf));
-            try out.append(allocator, @intFromEnum(lf.op));
-            format.writeU32(&b4, @intCast(lf.col.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, lf.col);
-            try out.append(allocator, @intFromEnum(@as(ValueTag, lf.val)));
-            try encodeValue(allocator, out, lf.val);
-        },
-        .day_leaf => return Error.WalPredicateUnsupported,
-        .leaf_col_col => |lc| {
-            try out.append(allocator, @intFromEnum(PredTagWal.leaf_col_col));
-            try out.append(allocator, @intFromEnum(lc.op));
-            format.writeU32(&b4, @intCast(lc.left.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, lc.left);
-            format.writeU32(&b4, @intCast(lc.right.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, lc.right);
-        },
-        .is_null => |col| {
-            try out.append(allocator, @intFromEnum(PredTagWal.is_null));
-            format.writeU32(&b4, @intCast(col.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, col);
-        },
-        .is_not_null => |col| {
-            try out.append(allocator, @intFromEnum(PredTagWal.is_not_null));
-            format.writeU32(&b4, @intCast(col.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, col);
-        },
-        .like => |lp| {
-            try out.append(allocator, @intFromEnum(PredTagWal.like));
-            format.writeU32(&b4, @intCast(lp.col.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, lp.col);
-            format.writeU32(&b4, @intCast(lp.pattern.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, lp.pattern);
-        },
-        .@"and" => |kids| {
-            try out.append(allocator, @intFromEnum(PredTagWal.p_and));
-            format.writeU32(&b4, @intCast(kids.len));
-            try out.appendSlice(allocator, &b4);
-            for (kids) |k| try encodePredicateExpr(allocator, out, k);
-        },
-        .@"or" => |kids| {
-            try out.append(allocator, @intFromEnum(PredTagWal.p_or));
-            format.writeU32(&b4, @intCast(kids.len));
-            try out.appendSlice(allocator, &b4);
-            for (kids) |k| try encodePredicateExpr(allocator, out, k);
-        },
-        .not => |child| {
-            try out.append(allocator, @intFromEnum(PredTagWal.p_not));
-            try encodePredicateExpr(allocator, out, child.*);
-        },
-        .always => |b| {
-            try out.append(allocator, @intFromEnum(PredTagWal.always));
-            try out.append(allocator, if (b) @as(u8, 1) else 0);
-        },
-        // UNKNOWN matches no rows, and no negation happens after parse — a
-        // replayed DELETE evaluates it identically to always-false.
-        .unknown => {
-            try out.append(allocator, @intFromEnum(PredTagWal.always));
-            try out.append(allocator, 0);
-        },
-        .in_set => |s| {
-            try out.append(allocator, @intFromEnum(PredTagWal.in_set));
-            format.writeU32(&b4, @intCast(s.col.len));
-            try out.appendSlice(allocator, &b4);
-            try out.appendSlice(allocator, s.col);
-            try out.append(allocator, if (s.negate) @as(u8, 1) else 0);
-            // All set values share the same type tag — use [0]'s.
-            // The set is guaranteed non-empty at this point (parser
-            // requires at least one value).
-            if (s.values.len == 0) return Error.WalPredicateUnsupported;
-            const tag: ValueTag = std.meta.activeTag(s.values[0]);
-            try out.append(allocator, @intFromEnum(tag));
-            format.writeU32(&b4, @intCast(s.values.len));
-            try out.appendSlice(allocator, &b4);
-            for (s.values) |v| try encodeValue(allocator, out, v);
-        },
-        // Resolving / runtime forms can't be WAL-logged. Skip.
-        .scalar_subquery,
-        .exists_subquery,
-        .in_subquery,
-        .correlated_set,
-        .correlated_scalar,
-        .correlated_range,
-        .leaf_var,
-        => return Error.WalPredicateUnsupported,
-    }
-}
-
-/// Apply a `delete_expr` WAL record to the recovered memtable. Decodes
-/// the predicate then runs `evaluatePredicateOnMemtable` to drop the
-/// matching rows. Segments are durable independently via per-segment
-/// tombstone files — replay only fixes up the memtable side.
+/// Apply a `delete_expr` record, which only older binaries wrote: decode the
+/// predicate and drop the memtable rows it matches. This evaluator is not
+/// the live one; it lacks string range compares and treats NOT over NULL as
+/// two-valued, which is why DELETE now logs the rows it removes (#61).
 pub fn applyDeleteExprRecord(allocator: Allocator, payload: []const u8, mt: *Memtable) !void {
     _ = allocator;
     var cursor: usize = 0;
