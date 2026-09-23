@@ -18,7 +18,8 @@
 //!
 //!   Sequence of records, each:
 //!     type u8             1   (1=insert, 2=delete, 3=flush_marker,
-//!                                  4=delete_expr, 5=replace)
+//!                                  4=delete_expr, 5=replace; 2 and 4 are
+//!                                  only read, from logs older binaries wrote)
 //!     payload_len u32     4
 //!     payload bytes       N
 //!     checksum u64        8   (XxHash64 of [type ++ payload_len ++ payload])
@@ -29,7 +30,7 @@
 //!       optional null-bitmap bytes (only when nullable)
 //!       value bytes (fixed-width packed, or string offset table + bytes)
 //!
-//! Delete payload:
+//! Delete payload (older binaries only):
 //!     col_name_len u32 + col_name bytes
 //!     op u8                (one of PredicateOp values)
 //!     value_type u8        (one of ValueTag values)
@@ -38,7 +39,7 @@
 //! Flush-marker payload:
 //!     max_segment_id u64   (records BEFORE this marker are redundant)
 //!
-//! Replace payload (one UPDATE batch):
+//! Replace payload (one UPDATE or DELETE batch):
 //!     retracted rows       (insert-payload layout)
 //!     segment_id u64
 //!     offset_count u32 + offset u32 each   (tombstoned in that segment)
@@ -50,7 +51,6 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
-const ValueTag = types.ValueTag;
 
 const storage = @import("../storage/storage.zig");
 const format = storage.format;
@@ -92,20 +92,18 @@ pub const coalesce_max_ns: u64 = 200_000;
 
 pub const RecordType = enum(u8) {
     insert = 1,
+    /// A DELETE's single-column predicate. Only older binaries wrote it;
+    /// replay still reads it from a log one of them left behind.
     delete = 2,
     flush_marker = 3,
-    /// Rich-predicate delete — `DELETE FROM t WHERE <bool_expr>`. The
-    /// payload encodes a `PredicateExpr` tree (AND/OR/NOT/leaf/etc).
-    /// On replay, the memtable is filtered by evaluating the predicate
-    /// over its rows. Segment-side tombstones are durable independently
-    /// (per-segment atomic tmp+rename writes) — replay only fixes up
-    /// the memtable.
+    /// A DELETE's `PredicateExpr`, replayed by evaluating it over the
+    /// memtable. Only older binaries wrote it, like `delete`.
     delete_expr = 4,
-    /// One UPDATE batch: the memtable rows it retracts, the offsets it
-    /// tombstones in one segment, and the rows that replace them. One record,
-    /// so replay applies an UPDATE's deletes and their replacements together
-    /// or not at all. Replay hands the offsets back to the table, which
-    /// merges them into the segment's tombstone file.
+    /// One UPDATE or DELETE batch: the memtable rows it retracts, the offsets
+    /// it tombstones in one segment, and the rows that replace them (none for
+    /// a DELETE). One record, so replay applies an UPDATE's deletes and their
+    /// replacements together or not at all. Replay hands the offsets back to
+    /// the table, which merges them into the segment's tombstone file.
     replace = 5,
 };
 
@@ -132,10 +130,6 @@ pub const Error = error{
     WalCorrupt,
     WalUnknownRecord,
     WalTooSmall,
-    /// PredicateExpr contained a variant the WAL codec doesn't
-    /// support (subqueries, var_refs, correlated forms). Caller can
-    /// choose to skip WAL logging and proceed with the delete.
-    WalPredicateUnsupported,
 };
 
 /// Owns the open file handle for the current WAL and accumulates writes.
@@ -248,9 +242,10 @@ pub const WalWriter = struct {
         return self.writeRecord(.insert, payload.items);
     }
 
-    /// Encode one UPDATE batch as a `replace` record (no fsync): the rows it
-    /// retracts from the memtable, the offsets it tombstones in segment
-    /// `segment_id`, and the replacement rows. Either side may be empty.
+    /// Encode one UPDATE or DELETE batch as a `replace` record (no fsync):
+    /// the rows it retracts from the memtable, the offsets it tombstones in
+    /// segment `segment_id`, and the replacement rows. Either side may be
+    /// empty.
     pub fn appendReplace(
         self: *WalWriter,
         schema: []const types.Column,
@@ -269,45 +264,6 @@ pub const WalWriter = struct {
         for (offsets) |offset| try format.appendU32(self.allocator, &payload, offset);
         try codec.encodeRows(self.allocator, &payload, schema, inserted, 0, inserted_rows);
         return self.writeRecord(.replace, payload.items);
-    }
-
-    /// Encode a delete predicate as a record (no fsync). Idempotent on replay.
-    pub fn appendDelete(self: *WalWriter, pred: anytype) !u64 {
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-
-        // col_name
-        var b4: [4]u8 = undefined;
-        format.writeU32(&b4, @intCast(pred.col.len));
-        try payload.appendSlice(self.allocator, &b4);
-        try payload.appendSlice(self.allocator, pred.col);
-
-        // op
-        try payload.append(self.allocator, @intFromEnum(pred.op));
-
-        // value type tag + bytes
-        try payload.append(self.allocator, @intFromEnum(@as(ValueTag, pred.val)));
-        try codec.encodeValue(self.allocator, &payload, pred.val);
-
-        return self.writeRecord(.delete, payload.items);
-    }
-
-    /// Encode a rich `PredicateExpr` tree (the SQL `DELETE FROM t WHERE
-    /// ...` form). Supported variants: leaf / leaf_col_col / is_null /
-    /// is_not_null / like / and / or / not / always / in_set. Predicates
-    /// containing unresolved subqueries (scalar/exists/in) or var_refs
-    /// surface as `error.WalPredicateUnsupported` — caller may proceed
-    /// without WAL logging (the delete still executes; durability for
-    /// memtable-only state is lost across crash, but segment tombstones
-    /// remain durable via their tmp+rename writes).
-    ///
-    /// `pred` is `anytype` to avoid an engine→exec import cycle —
-    /// callers pass an `exec.PredicateExpr`.
-    pub fn appendDeleteExpr(self: *WalWriter, pred: anytype) !u64 {
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-        try codec.encodePredicateExpr(self.allocator, &payload, pred);
-        return self.writeRecord(.delete_expr, payload.items);
     }
 
     pub fn appendFlushMarker(self: *WalWriter, max_segment_id: u64) !u64 {

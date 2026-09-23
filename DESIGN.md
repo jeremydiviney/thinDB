@@ -275,11 +275,13 @@ Execution:
    a. Scan its row groups, evaluating the predicate.
    b. For each matching row, record its in-segment offset.
    c. Append all matched offsets to `<seg_id>.tomb` (creating the file if it didn't exist).
-3. The memtable is also scanned. Matching rows are removed in place (the memtable hasn't been flushed yet, so true removal is fine — for unique tables, also remove the hash index entry).
+3. The memtable is also scanned. Matching rows go into the WAL as a `replace` record that retracts them and inserts nothing, then are removed (the memtable hasn't been flushed yet, so true removal is fine).
+
+The WAL records the rows a DELETE removed, never its predicate. Replay therefore has no predicate evaluator that could drift from the live one: it removes exactly what the live DELETE removed. Older binaries logged the predicate (`delete` / `delete_expr` records). Replay still reads those from a log such a binary left behind, but nothing writes them.
 
 A delete that runs concurrently with reads is invisible to them — readers see the manifest snapshot taken at their query start, including the tomb file state at that moment. New deletes append to the tomb file; readers using an older snapshot just see fewer tombstoned rows than the live state.
 
-UPDATE is delete + insert in batches: the memtable's matching rows form one batch, and each matching row group of a segment forms another. Each batch goes into the WAL as one `replace` record before it is applied. The record carries the batch's deletes (the retracted memtable rows, or segment offsets) together with the replacement rows. Replay retracts memtable rows by content, appends the replacements and merges the offsets into the `.tomb` files. A crash can therefore leave an UPDATE applied up to some batch. It never keeps a delete without its replacement, and never keeps both versions of a row. Segment offsets reach the `.tomb` file once per segment. They also reach it before any flush retires the WAL, since an auto-flush can fire mid-UPDATE.
+UPDATE is delete + insert in batches: the memtable's matching rows form one batch, and each matching row group of a segment forms another. Each batch goes into the WAL as one `replace` record before it is applied. The record carries the batch's deletes (the retracted memtable rows, or segment offsets) together with the replacement rows. Replay retracts memtable rows, appends the replacements and merges the offsets into the `.tomb` files. On a plain table a retracted row removes one equal row. On a unique table it removes every row with its key, since until the post-replay upsert pass the recovered memtable still holds the versions that later inserts superseded. A crash can therefore leave an UPDATE applied up to some batch. It never keeps a delete without its replacement, and never keeps both versions of a row. Segment offsets reach the `.tomb` file once per segment. They also reach it before any flush retires the WAL, since an auto-flush can fire mid-UPDATE.
 
 ---
 
