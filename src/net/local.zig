@@ -57,6 +57,7 @@ const subquery_resolve = @import("subquery_resolve.zig");
 const predicate_pushdown = @import("predicate_pushdown.zig");
 const const_fold = @import("const_fold.zig");
 const prune_columns = @import("prune_columns.zig");
+const unbound_refs = @import("unbound_refs.zig");
 const partition_keys = @import("partition_keys.zig");
 const pgcat = @import("pg_catalog.zig");
 
@@ -1317,16 +1318,24 @@ pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, sessio
     const t_push_compute_unions = exec.prof.nowTicks();
     try predicate_pushdown.pushComputeThroughUnions(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_compute_unions", @intCast(exec.prof.nowTicks() - t_push_compute_unions));
-    // Dead-branch elimination: prune UNION arms that provably yield zero rows
-    // (constant-false filters — the parser already folds literal comparisons
-    // to `.always`) and unlink WHERE-TRUE plumbing. Runs before projection
-    // analysis and staging so ref counts see the pruned tree.
-    const_fold.foldDeadBranches(@constCast(root));
-    // Dead-column elimination: delete select items / window calls /
-    // aggregates whose outputs nothing above consumes, so wide CTE stacks
-    // stop carrying long-dead columns through every stage buffer. Runs
-    // before projection analysis so the flat set shrinks with the tree.
-    prune_columns.pruneDeadColumns(ctx.nodeArena(), @constCast(root));
+    // The two removal rewrites below delete SQL before any operator binds it,
+    // so a reference that can never resolve would vanish with its unused item
+    // and the statement would run. Keep the tree whole then: the binder
+    // rejects it exactly as it rejects the same reference in a used item.
+    const unbound = try unbound_refs.find(ctx.nodeArena(), catalogFor(db), session_cell.*, ctx.udf_registry, root);
+    if (unbound == null) {
+        // Dead-branch elimination: prune UNION arms that provably yield zero
+        // rows (constant-false filters — the parser already folds literal
+        // comparisons to `.always`) and unlink WHERE-TRUE plumbing. Runs
+        // before projection analysis and staging so ref counts see the
+        // pruned tree.
+        const_fold.foldDeadBranches(@constCast(root));
+        // Dead-column elimination: delete select items / window calls /
+        // aggregates whose outputs nothing above consumes, so wide CTE stacks
+        // stop carrying long-dead columns through every stage buffer. Runs
+        // before projection analysis so the flat set shrinks with the tree.
+        prune_columns.pruneDeadColumns(ctx.nodeArena(), @constCast(root));
+    }
     // Partition-key subtree report (THINDB_TRACE_PARTKEYS, no plan changes):
     // prints each maximal subtree a single hash-partition exchange could
     // parallelize end-to-end.

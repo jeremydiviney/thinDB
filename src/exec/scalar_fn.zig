@@ -335,6 +335,18 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
     return null;
 }
 
+/// Whether ANY overload named `name` exists — builtin, decimal-only, or a
+/// registered UDF. Name-only, so it holds before argument types are known.
+pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "to_decimal")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
+    for (builtins) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return true;
+    if (registry) |reg| {
+        for (reg.scalarEntries()) |entry| if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
+    }
+    return false;
+}
+
 fn intCastTarget(name: []const u8) ?Type {
     if (std.ascii.eqlIgnoreCase(name, "to_int")) return .int;
     if (std.ascii.eqlIgnoreCase(name, "to_bigint")) return .bigint;
