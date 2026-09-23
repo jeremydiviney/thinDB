@@ -1260,6 +1260,44 @@ pub fn changesCatalog(op: *const ir.Op) bool {
     };
 }
 
+/// True when a statement's only product is its result set, so it is
+/// safe to abandon once nobody can receive that result. Statements that
+/// change data or the catalog, and EXPLAIN (whose ANALYZE form runs its
+/// inner statement), are not.
+pub fn producesOnlyResult(op: *const ir.Op) bool {
+    return switch (op.*) {
+        .scan,
+        .limit,
+        .select,
+        .exclude,
+        .filter,
+        .order_by,
+        .group_by,
+        .compute,
+        .join,
+        .materialize,
+        .show,
+        .window,
+        .set_union,
+        .single_row,
+        .file_scan,
+        .alias,
+        .table_fn,
+        => true,
+        .ddl,
+        .insert,
+        .batch,
+        .copy,
+        .create_table_as,
+        .insert_select,
+        .set_var,
+        .delete_op,
+        .update_op,
+        .explain,
+        => false,
+    };
+}
+
 pub const CompileOptions = struct {
     cancel_flag: ?*const std.atomic.Value(bool) = null,
 };

@@ -464,17 +464,14 @@ pub fn main(init: std.process.Init) !u8 {
     else
         null;
 
-    // net_read_timeout enforcement — see ReaperCtx.
+    // Connection reaper — see ReaperCtx.
     const net_read_timeout_secs = envU64(init.environ_map, "THINDB_NET_READ_TIMEOUT_SECS", 30);
     var reaper_ctx: ReaperCtx = .{
         .registry = &shared_registry,
         .io = io,
         .timeout_ms = net_read_timeout_secs * 1000,
     };
-    const reaper_thread: ?std.Thread = if (net_read_timeout_secs > 0)
-        try std.Thread.spawn(.{}, ReaperCtx.run, .{&reaper_ctx})
-    else
-        null;
+    const reaper_thread = try std.Thread.spawn(.{}, ReaperCtx.run, .{&reaper_ctx});
 
     waitForStop(io);
 
@@ -484,7 +481,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (listeners[0..n_listeners]) |*l| l.destroy();
     flusher_thread.join();
     if (compactor_thread) |t| t.join();
-    if (reaper_thread) |t| t.join();
+    reaper_thread.join();
 
     try out_w.writeAll("thindb-server shutting down\n");
     try out_w.flush();
@@ -560,12 +557,16 @@ const CompactorCtx = struct {
     }
 };
 
-/// net_read_timeout reaper (#164): sweep the connection registry and shut
-/// down any socket stuck mid-packet longer than `timeout_ms`. Mirrors
-/// MySQL's net_read_timeout (default 30 s); override with
-/// `THINDB_NET_READ_TIMEOUT_SECS` (0 disables). A wedged mid-packet read
-/// otherwise hangs until the client gives up — the 2026-07-11 incident
-/// held a Flink sink connection at zero packets for 559 s.
+/// Connection reaper: every sweep of the connection registry
+///   - shuts down any socket stuck mid-packet longer than `timeout_ms`
+///     (#164). Mirrors MySQL's net_read_timeout (default 30 s); override
+///     with `THINDB_NET_READ_TIMEOUT_SECS` (0 disables). A wedged
+///     mid-packet read otherwise hangs until the client gives up — the
+///     2026-07-11 incident held a Flink sink connection at zero packets
+///     for 559 s.
+///   - cancels read-only queries whose client has disconnected, which
+///     would otherwise run to completion for nobody (2026-09-04: a
+///     runaway query outlived its killed client and needed a restart).
 const ReaperCtx = struct {
     registry: *thindb.ConnectionRegistry,
     io: Io,
@@ -577,7 +578,8 @@ const ReaperCtx = struct {
             Io.sleep(self.io, poll, .awake) catch return;
             const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
             const now_ms: u64 = @intCast(@divTrunc(@max(now_ns, 0), std.time.ns_per_ms));
-            _ = self.registry.reapStalledReads(self.io, now_ms, self.timeout_ms);
+            if (self.timeout_ms > 0) _ = self.registry.reapStalledReads(self.io, now_ms, self.timeout_ms);
+            _ = self.registry.cancelAbandonedQueries();
         }
     }
 };
