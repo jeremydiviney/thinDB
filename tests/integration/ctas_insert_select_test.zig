@@ -261,6 +261,31 @@ test "INSERT SELECT: bare NULL literal lands in non-string nullable columns" {
     try std.testing.expectEqualSlices(i64, &.{7}, count);
 }
 
+test "INSERT SELECT: repeated unaliased items insert positionally" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE sink (id BIGINT PRIMARY KEY, n INT NOT NULL, a INT, b INT, c INT)");
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, n INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, 10), (2, 20)");
+    const src = try db.openTable("src", .{});
+    try src.flush();
+
+    try exec(allocator, db, "INSERT INTO sink SELECT id, n, NULL, NULL, n FROM src");
+    try exec(allocator, db, "INSERT INTO sink SELECT id + 10, n, n, NULL, n FROM src");
+
+    const nulls = try collectBigints(allocator, db, "SELECT id FROM sink WHERE a IS NULL AND b IS NULL ORDER BY id ASC");
+    defer allocator.free(nulls);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, nulls);
+    const cs = try collectBigints(allocator, db, "SELECT CAST(c AS BIGINT) + CAST(COALESCE(a, 0) AS BIGINT) FROM sink ORDER BY id ASC");
+    defer allocator.free(cs);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 20, 20, 40 }, cs);
+}
+
 test "INSERT SELECT: literals and narrower columns widen into the target types" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

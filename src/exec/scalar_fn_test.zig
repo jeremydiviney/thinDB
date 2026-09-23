@@ -209,3 +209,11 @@ test "scalar_fn: expanded math date and hash additions resolve" {
     try std.testing.expect((try resolve(aa, "md5sum", &.{ .string, .string })) != null);
     try std.testing.expect((try resolve(aa, "xx_hash3_128", &.{.string})) != null);
 }
+
+test "scalar_fn: nameResolvable covers builtins and decimal-only names" {
+    try std.testing.expect(scalar_fn.nameResolvable(null, "upper"));
+    try std.testing.expect(scalar_fn.nameResolvable(null, "COALESCE"));
+    try std.testing.expect(scalar_fn.nameResolvable(null, "to_float"));
+    try std.testing.expect(scalar_fn.nameResolvable(null, "to_decimal:10:2"));
+    try std.testing.expect(!scalar_fn.nameResolvable(null, "definitely_not_a_function"));
+}

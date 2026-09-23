@@ -25,6 +25,7 @@ const Schema = thindb_api.Schema;
 const Table = thindb_api.Table;
 
 const local = @import("../local.zig");
+const unbound_refs = @import("../unbound_refs.zig");
 const ir = @import("../../ir/ir.zig");
 const PredicateExpr = @import("../../exec/predicate.zig").PredicateExpr;
 const exec_predicate = @import("../../exec/predicate.zig");
@@ -1304,123 +1305,29 @@ fn stripIdentifierQuotes(s_in: []const u8) []const u8 {
     return s;
 }
 
-/// Best-effort identification of the missing column behind a
-/// ColumnNotFound compile error, so ER_BAD_FIELD can NAME it the way MySQL
-/// does. Walks a linear SELECT chain down to its scan, collecting referenced
-/// column names and Compute-provided names; the first reference missing from
-/// the table's schema (and not Compute-provided) is the culprit. Conservative
-/// by construction: joins, unions, subqueries, qualified/star/synthetic names
-/// and overflowing shapes return null and the generic message stands.
-fn findUnknownColumn(catalog: *Catalog, session: *SessionState, root: *const ir.Op) ?[]const u8 {
-    var needed_buf: [64][]const u8 = undefined;
-    var needed_n: usize = 0;
-    var provided_buf: [32][]const u8 = undefined;
-    var provided_n: usize = 0;
-
-    var op = root;
-    const scan_table = walk: while (true) {
-        switch (op.*) {
-            .scan => |s| break :walk s,
-            .select, .exclude => |pr| {
-                for (pr.columns) |c| {
-                    if (!plausibleColumnName(c)) continue;
-                    if (needed_n == needed_buf.len) return null;
-                    needed_buf[needed_n] = c;
-                    needed_n += 1;
-                }
-                op = pr.upstream;
-            },
-            .filter => |f| {
-                if (!collectPredicateColumns(f.predicate, &needed_buf, &needed_n)) return null;
-                op = f.upstream;
-            },
-            .group_by => |g| {
-                for (g.group_cols) |c| {
-                    if (!plausibleColumnName(c)) continue;
-                    if (needed_n == needed_buf.len) return null;
-                    needed_buf[needed_n] = c;
-                    needed_n += 1;
-                }
-                for (g.aggs) |a| {
-                    for ([_]?[]const u8{ a.col, a.arg2_col }) |maybe| {
-                        const c = maybe orelse continue;
-                        if (std.mem.eql(u8, c, "*") or !plausibleColumnName(c)) continue;
-                        if (needed_n == needed_buf.len) return null;
-                        needed_buf[needed_n] = c;
-                        needed_n += 1;
-                    }
-                }
-                op = g.upstream;
-            },
-            .order_by => |o| {
-                for (o.specs) |sp| {
-                    if (!plausibleColumnName(sp.col)) continue;
-                    if (needed_n == needed_buf.len) return null;
-                    needed_buf[needed_n] = sp.col;
-                    needed_n += 1;
-                }
-                op = o.upstream;
-            },
-            .compute => |cm| {
-                for (cm.derived) |d| {
-                    if (provided_n == provided_buf.len) return null;
-                    provided_buf[provided_n] = d.name;
-                    provided_n += 1;
-                }
-                op = cm.upstream;
-            },
-            .limit => |l| op = l.upstream,
-            .alias => |a| op = a.upstream,
-            else => return null,
-        }
-    };
-
-    const db = catalog.database(scan_table.table.database orelse session.current_db) orelse return null;
-    const sc = db.schema(scan_table.table.schema orelse session.current_schema) orelse return null;
-    const t = schemaTable(sc, scan_table.table.name) orelse return null;
-
-    outer: for (needed_buf[0..needed_n]) |name| {
-        if (types.findColumn(t.schema.columns, name) != null) continue;
-        for (provided_buf[0..provided_n]) |pn| {
-            if (types.columnNameEql(pn, name)) continue :outer;
-        }
-        return name;
+/// ERR packet for a failed compile. A reference no operator could ever bind
+/// is named the way MySQL names it (ER_BAD_FIELD_ERROR, ER_SP_DOES_NOT_EXIST);
+/// otherwise the mapped internal error stands.
+fn sendCompileError(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, err: anyerror, catalog: *Catalog, session: *SessionState, op: *const ir.Op) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const unbound = unbound_refs.find(aa, catalog, session.asSession(), &catalog.udfs, op) catch null;
+    if (unbound) |u| {
+        const named = switch (u) {
+            .column => |c| std.fmt.allocPrint(aa, "Unknown column '{s}' in 'field list'", .{c}),
+            .function => |f| std.fmt.allocPrint(aa, "FUNCTION {s} does not exist", .{f}),
+        };
+        if (named) |msg| {
+            const code: u16, const sqlstate: [5]u8 = switch (u) {
+                .column => .{ 1054, "42S22".* },
+                .function => .{ 1305, "42000".* },
+            };
+            return handshake.sendErrPacket(allocator, w, seq_id, code, sqlstate, msg);
+        } else |_| {}
     }
-    return null;
-}
-
-fn plausibleColumnName(name: []const u8) bool {
-    if (name.len == 0 or std.mem.eql(u8, name, "*")) return false;
-    // Qualified (alias.col), star-expanded (t.*), and synthetic (__agg_arg_n)
-    // names carry resolution rules this walker doesn't model.
-    if (std.mem.indexOfScalar(u8, name, '.') != null) return false;
-    if (std.mem.startsWith(u8, name, "__")) return false;
-    return true;
-}
-
-fn collectPredicateColumns(expr: PredicateExpr, buf: *[64][]const u8, n: *usize) bool {
-    switch (expr) {
-        .leaf => |p| {
-            if (plausibleColumnName(p.col)) {
-                if (n.* == buf.len) return false;
-                buf[n.*] = p.col;
-                n.* += 1;
-            }
-        },
-        .in_set => |s| {
-            if (plausibleColumnName(s.col)) {
-                if (n.* == buf.len) return false;
-                buf[n.*] = s.col;
-                n.* += 1;
-            }
-        },
-        .@"and", .@"or" => |kids| for (kids) |k| {
-            if (!collectPredicateColumns(k, buf, n)) return false;
-        },
-        .not => |child| return collectPredicateColumns(child.*, buf, n),
-        else => {},
-    }
-    return true;
+    const mapped = errors.mapInternal(err, null);
+    return handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
 }
 
 const SyntheticValue = union(enum) { text: []const u8, null_value };
@@ -3672,17 +3579,7 @@ fn runSingleStatement(
     const compile_start = profiler.start();
     var compiled = local.compileInStatementWithOptions(qalloc, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null }) catch |err| {
         profiler.recordSince(.query_compile, compile_start);
-        const mapped = errors.mapInternal(err, null);
-        var msg: []const u8 = mapped.message;
-        var msg_owned: ?[]u8 = null;
-        defer if (msg_owned) |m| allocator.free(m);
-        if (err == error.ColumnNotFound) {
-            if (findUnknownColumn(catalog, session, op)) |col| {
-                msg_owned = std.fmt.allocPrint(allocator, "Unknown column '{s}' in 'field list'", .{col}) catch null;
-                if (msg_owned) |m| msg = m;
-            }
-        }
-        try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, msg);
+        try sendCompileError(allocator, w, seq_id.*, err, catalog, session, op);
         return false;
     };
     profiler.recordSince(.query_compile, compile_start);
@@ -4033,8 +3930,7 @@ fn handleStmtExecute(
     const compile_start = profiler.start();
     var compiled = local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null }) catch |err| {
         profiler.recordSince(.stmt_execute_compile, compile_start);
-        const mapped = errors.mapInternal(err, null);
-        try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+        try sendCompileError(allocator, w, seq_id, err, catalog, session, op);
         return;
     };
     profiler.recordSince(.stmt_execute_compile, compile_start);
