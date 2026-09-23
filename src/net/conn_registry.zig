@@ -4,6 +4,8 @@
 //! connection's state, set its cancel flag, and let the executor
 //! abort at the next batch boundary. The reaper sets the same flag
 //! when a client disconnects mid-query (`cancelAbandonedQueries`).
+//! `processList` snapshots what every connection is doing, for
+//! SHOW PROCESSLIST, so a runaway query's id can be found to KILL it.
 //!
 //! One Registry is shared across all wire frontends (mysql, pg,
 //! native). Each accepted connection registers a ConnectionState on
@@ -18,6 +20,84 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+/// Awake-clock milliseconds: the time base of transfer marks and
+/// activity timestamps.
+pub fn nowMs(io: std.Io) u64 {
+    const ns = std.Io.Clock.awake.now(io).nanoseconds;
+    return @intCast(@divTrunc(@max(ns, 0), std.time.ns_per_ms));
+}
+
+/// The longest prefix of `text` that fits `max_len` bytes without
+/// splitting a UTF-8 character.
+pub fn utf8Prefix(text: []const u8, max_len: usize) []const u8 {
+    if (text.len <= max_len) return text;
+    var n = max_len;
+    while (n > 0 and text[n] & 0xC0 == 0x80) n -= 1;
+    return text[0..n];
+}
+
+/// Text copied into a fixed buffer, so another thread can snapshot it
+/// without sharing the writer's allocations. Text that doesn't fit is
+/// cut at a UTF-8 character boundary.
+pub fn BoundedText(comptime capacity: usize) type {
+    return struct {
+        bytes: [capacity]u8 = undefined,
+        len: usize = 0,
+
+        pub fn set(self: *@This(), text: []const u8) void {
+            const kept = utf8Prefix(text, capacity);
+            @memcpy(self.bytes[0..kept.len], kept);
+            self.len = kept.len;
+        }
+
+        pub fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+}
+
+/// What a connection is doing, in MySQL's PROCESSLIST terms. Commands
+/// that finish in microseconds (ping, statement close, ...) aren't
+/// tracked; the connection reads as sleeping through them.
+pub const Command = enum {
+    connect,
+    sleep,
+    query,
+    prepare,
+    execute,
+
+    pub fn label(self: Command) []const u8 {
+        return switch (self) {
+            .connect => "Connect",
+            .sleep => "Sleep",
+            .query => "Query",
+            .prepare => "Prepare",
+            .execute => "Execute",
+        };
+    }
+};
+
+pub const Activity = struct {
+    /// Longest statement text kept for SHOW FULL PROCESSLIST.
+    pub const max_info_len = 1024;
+
+    /// Empty until the client authenticates.
+    user: BoundedText(64) = .{},
+    /// The client's address, `ip:port`.
+    host: BoundedText(64) = .{},
+    db: BoundedText(128) = .{},
+    command: Command = .connect,
+    /// Awake-clock milliseconds when `command` began.
+    since_ms: u64 = 0,
+    /// The running statement's text; empty unless a statement runs.
+    info: BoundedText(max_info_len) = .{},
+};
+
+pub const Process = struct {
+    backend_id: u32,
+    activity: Activity,
+};
 
 pub const ConnectionState = struct {
     /// Process-unique connection id. Stable for the connection's
@@ -62,6 +142,10 @@ pub const ConnectionState = struct {
     /// liveness. These marks make every socket transfer observable and
     /// every stall bounded, whatever the underlying cause.
     transfer_wait: std.atomic.Value(u64) = .{ .raw = 0 },
+    /// Written by the connection thread, snapshotted by any thread that
+    /// lists processes.
+    activity: Activity = .{},
+    activity_lock: SpinLock = .{},
 
     pub fn init(backend_id: u32, secret_key: u32) ConnectionState {
         return .{ .backend_id = backend_id, .secret_key = secret_key };
@@ -104,6 +188,38 @@ pub const ConnectionState = struct {
 
     pub fn endTransfer(self: *ConnectionState) void {
         self.transfer_wait.store(0, .release);
+    }
+
+    pub fn setPeer(self: *ConnectionState, host: []const u8, now_ms: u64) void {
+        self.activity_lock.lock();
+        defer self.activity_lock.unlock();
+        self.activity.host.set(host);
+        self.activity.since_ms = now_ms;
+    }
+
+    pub fn setUser(self: *ConnectionState, user: []const u8) void {
+        self.activity_lock.lock();
+        defer self.activity_lock.unlock();
+        self.activity.user.set(user);
+    }
+
+    pub fn beginCommand(self: *ConnectionState, command: Command, info: []const u8, db: []const u8, now_ms: u64) void {
+        self.activity_lock.lock();
+        defer self.activity_lock.unlock();
+        self.activity.command = command;
+        self.activity.info.set(info);
+        self.activity.db.set(db);
+        self.activity.since_ms = now_ms;
+    }
+
+    pub fn endCommand(self: *ConnectionState, db: []const u8, now_ms: u64) void {
+        self.beginCommand(.sleep, "", db, now_ms);
+    }
+
+    pub fn snapshotActivity(self: *ConnectionState) Activity {
+        self.activity_lock.lock();
+        defer self.activity_lock.unlock();
+        return self.activity;
     }
 };
 
@@ -178,6 +294,28 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.entries.count();
+    }
+
+    /// What every registered connection is doing, ordered by id. The
+    /// caller owns the slice.
+    pub fn processList(self: *Registry, allocator: Allocator) ![]Process {
+        const list = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const list = try allocator.alloc(Process, self.entries.count());
+            var it = self.entries.valueIterator();
+            for (list) |*process| {
+                const state = it.next().?.*;
+                process.* = .{ .backend_id = state.backend_id, .activity = state.snapshotActivity() };
+            }
+            break :blk list;
+        };
+        std.mem.sortUnstable(Process, list, {}, processIdLessThan);
+        return list;
+    }
+
+    fn processIdLessThan(_: void, a: Process, b: Process) bool {
+        return a.backend_id < b.backend_id;
     }
 
     /// Grace before probing a header-wait for the wedged-read signature.
@@ -376,6 +514,59 @@ test "cancelAbandonedQueries cancels only an armed statement whose client is gon
     try std.testing.expectEqual(@as(usize, 1), reg.cancelAbandonedQueries());
     try std.testing.expect(s.isCancelled());
     try std.testing.expectEqual(@as(usize, 0), reg.cancelAbandonedQueries());
+}
+
+test "processList snapshots each connection's activity in id order" {
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    var s5 = ConnectionState.init(5, 0);
+    var s2 = ConnectionState.init(2, 0);
+    s5.setPeer("10.0.0.5:4000", 1_000);
+    s2.setPeer("10.0.0.2:4000", 1_000);
+    try reg.register(&s5);
+    try reg.register(&s2);
+    defer reg.unregister(5);
+    defer reg.unregister(2);
+
+    s2.setUser("alice");
+    s2.beginCommand(.query, "SELECT 1", "main__public", 2_000);
+    s5.setUser("bob");
+    s5.endCommand("main__sales", 3_000);
+
+    const list = try reg.processList(std.testing.allocator);
+    defer std.testing.allocator.free(list);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+
+    try std.testing.expectEqual(@as(u32, 2), list[0].backend_id);
+    const running = list[0].activity;
+    try std.testing.expectEqualStrings("alice", running.user.slice());
+    try std.testing.expectEqualStrings("10.0.0.2:4000", running.host.slice());
+    try std.testing.expectEqualStrings("main__public", running.db.slice());
+    try std.testing.expectEqual(Command.query, running.command);
+    try std.testing.expectEqual(@as(u64, 2_000), running.since_ms);
+    try std.testing.expectEqualStrings("SELECT 1", running.info.slice());
+
+    try std.testing.expectEqual(@as(u32, 5), list[1].backend_id);
+    const idle = list[1].activity;
+    try std.testing.expectEqualStrings("bob", idle.user.slice());
+    try std.testing.expectEqualStrings("main__sales", idle.db.slice());
+    try std.testing.expectEqual(Command.sleep, idle.command);
+    try std.testing.expectEqual(@as(u64, 3_000), idle.since_ms);
+    try std.testing.expectEqualStrings("", idle.info.slice());
+}
+
+test "BoundedText cuts long text at a character boundary" {
+    var text: BoundedText(4) = .{};
+    text.set("abc");
+    try std.testing.expectEqualStrings("abc", text.slice());
+    text.set("abcdef");
+    try std.testing.expectEqualStrings("abcd", text.slice());
+    text.set("abéé");
+    try std.testing.expectEqualStrings("abé", text.slice());
+    text.set("a€b");
+    try std.testing.expectEqualStrings("a€", text.slice());
+    text.set("ab€");
+    try std.testing.expectEqualStrings("ab", text.slice());
 }
 
 test "nextBackendId is monotonically increasing" {

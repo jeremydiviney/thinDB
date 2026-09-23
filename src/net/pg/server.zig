@@ -37,6 +37,7 @@ const extended = @import("extended.zig");
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
 const conn_registry = @import("../conn_registry.zig");
 const ConnectionState = conn_registry.ConnectionState;
+const ProcessCommand = conn_registry.Command;
 const ConnectionRegistry = conn_registry.Registry;
 const sock_opts = @import("../sock_opts.zig");
 
@@ -364,6 +365,8 @@ fn handleConnection(
     defer session.deinit();
 
     var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
+    var host_buf: [64]u8 = undefined;
+    conn_state.setPeer(std.fmt.bufPrint(&host_buf, "{f}", .{stream.socket.address}) catch "", conn_registry.nowMs(io));
     if (registry) |reg| {
         try reg.register(&conn_state);
     }
@@ -372,6 +375,10 @@ fn handleConnection(
     session.registry = registry;
 
     if (!try completeStartup(allocator, w, r, catalog, &session, connection_id, auth_creds, registry)) return;
+    {
+        var db_buf: [256]u8 = undefined;
+        conn_state.endCommand(processDb(&session, &db_buf), conn_registry.nowMs(io));
+    }
 
     while (true) {
         const frame = packet.readFrame(allocator, r) catch |err| switch (err) {
@@ -397,6 +404,11 @@ fn handleConnection(
             continue;
         }
 
+        var db_buf: [256]u8 = undefined;
+        if (processCommand(&session, frame.type_byte, frame.payload)) |tracked| {
+            conn_state.beginCommand(tracked.command, tracked.text, processDb(&session, &db_buf), conn_registry.nowMs(io));
+        }
+        defer conn_state.endCommand(processDb(&session, &db_buf), conn_registry.nowMs(io));
         switch (frame.type_byte) {
             'X' => return,
             'Q' => try handleQuery(allocator, w, r, catalog, &session, frame.payload),
@@ -683,6 +695,38 @@ fn extended_handleClose(
     try extended.sendCloseComplete(w);
 }
 
+const TrackedCommand = struct {
+    command: ProcessCommand,
+    text: []const u8,
+};
+
+/// The PROCESSLIST command a frame runs as and its statement text, or null
+/// for the frames that finish too quickly to be worth tracking.
+fn processCommand(session: *const SessionState, type_byte: u8, payload: []const u8) ?TrackedCommand {
+    return switch (type_byte) {
+        'Q' => .{ .command = .query, .text = std.mem.sliceTo(payload, 0) },
+        'P' => .{
+            .command = .prepare,
+            .text = if (std.mem.indexOfScalar(u8, payload, 0)) |name_end| std.mem.sliceTo(payload[name_end + 1 ..], 0) else "",
+        },
+        'E' => .{
+            .command = .execute,
+            .text = blk: {
+                const exec = extended.parseExecuteFrame(payload) catch break :blk "";
+                const portal = session.ext.portals.get(exec.portal_name) orelse break :blk "";
+                break :blk portal.bound_sql;
+            },
+        },
+        else => null,
+    };
+}
+
+/// The session's current schema as the MySQL wire's `USE` names it, so
+/// both wires' rows read alike in SHOW PROCESSLIST.
+fn processDb(session: *const SessionState, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}__{s}", .{ session.current_db, session.current_schema }) catch session.current_db;
+}
+
 /// Handles SSLRequest negotiation if needed, then the real StartupMessage
 /// and the post-auth parameter / key / ready frames. Returns true on
 /// success, false if the client aborted (cancellation request, etc.).
@@ -739,6 +783,7 @@ fn completeStartup(
     if (auth_creds) |creds| {
         if (!try runScramSha256(allocator, w, r, creds)) return false;
     }
+    if (session.conn_state) |state| state.setUser(params.user);
 
     try startup.sendAuthenticationOk(allocator, w);
     try startup.sendStandardParameterStatus(
