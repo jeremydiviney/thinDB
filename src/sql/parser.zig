@@ -70,6 +70,8 @@ pub const ParseError = error{
     SqlTrailingTokens,
     SqlExpectedJoinOn,
     SqlOnRefsUnknownTable,
+    /// An unqualified `JOIN ... ON` column that both join inputs expose.
+    SqlOnColumnAmbiguous,
     SqlOnNonEquiUnsupported,
     SqlCteRedefined,
     SqlSubqueryNeedsAlias,
@@ -403,6 +405,24 @@ const FromTarget = struct {
 };
 
 const JoinExprSide = enum { none, left, right, mixed };
+
+/// What an ON clause can reference: the left subtree (every FROM name joined
+/// so far) and the right target. A qualified column sides by its qualifier,
+/// an unqualified one by which input's output has it.
+const JoinScope = struct {
+    left_names: []const []const u8,
+    right_name: []const u8,
+    left: *const ir.Op,
+    right: *const ir.Op,
+    /// Enumerated at the first unqualified reference.
+    columns: ?JoinInputColumns = null,
+};
+
+/// Each join input's output column names; null where they can't be enumerated.
+const JoinInputColumns = struct {
+    left: ?[]const []const u8,
+    right: ?[]const []const u8,
+};
 
 const JoinOnPlan = struct {
     on: []const ir.JoinKeyPair,
@@ -2689,7 +2709,8 @@ pub const Parser = struct {
 
             if (self.cur.tag != .kw_on) return ParseError.SqlExpectedJoinOn;
             try self.advance();
-            const on_plan = try self.parseOnJoin(left_names.items, right.name, jtype);
+            var scope: JoinScope = .{ .left_names = left_names.items, .right_name = right.name, .left = root, .right = right.op };
+            const on_plan = try self.parseOnJoin(&scope, jtype);
 
             var left_op = root;
             var right_op = right.op;
@@ -3315,8 +3336,7 @@ pub const Parser = struct {
 
     fn parseOnJoin(
         self: *Parser,
-        left_table_names: []const []const u8,
-        right_table_name: []const u8,
+        scope: *JoinScope,
         jtype: ir.JoinType,
     ) ParseError!JoinOnPlan {
         var pairs: std.ArrayList(ir.JoinKeyPair) = .empty;
@@ -3342,8 +3362,7 @@ pub const Parser = struct {
                 try self.addJoinNullCondition(
                     lhs,
                     negated,
-                    left_table_names,
-                    right_table_name,
+                    scope,
                     &left_filters,
                     &right_filters,
                 );
@@ -3358,8 +3377,7 @@ pub const Parser = struct {
                     lhs,
                     lower,
                     upper,
-                    left_table_names,
-                    right_table_name,
+                    scope,
                     &pairs,
                     &ranges,
                     &left_derived,
@@ -3378,8 +3396,7 @@ pub const Parser = struct {
                     lhs,
                     op,
                     rhs,
-                    left_table_names,
-                    right_table_name,
+                    scope,
                     &pairs,
                     &ranges,
                     &left_derived,
@@ -3486,12 +3503,11 @@ pub const Parser = struct {
         self: *Parser,
         expr: ir.Expr,
         negated: bool,
-        left_table_names: []const []const u8,
-        right_table_name: []const u8,
+        scope: *JoinScope,
         left_filters: *std.ArrayList(PredicateExpr),
         right_filters: *std.ArrayList(PredicateExpr),
     ) ParseError!void {
-        const side = try self.joinExprSide(expr, left_table_names, right_table_name);
+        const side = try self.joinExprSide(expr, scope);
         if (side != .left and side != .right) return ParseError.SqlOnNonEquiUnsupported;
         if (expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
         const col = try self.joinColName(expr);
@@ -3523,8 +3539,7 @@ pub const Parser = struct {
         lhs: ir.Expr,
         lower: ir.Expr,
         upper: ir.Expr,
-        left_table_names: []const []const u8,
-        right_table_name: []const u8,
+        scope: *JoinScope,
         pairs: *std.ArrayList(ir.JoinKeyPair),
         ranges: *std.ArrayList(ir.JoinRangePredicate),
         left_derived: *std.ArrayList(ir.Derived),
@@ -3538,8 +3553,7 @@ pub const Parser = struct {
             lhs,
             .gte,
             lower,
-            left_table_names,
-            right_table_name,
+            scope,
             pairs,
             ranges,
             left_derived,
@@ -3553,8 +3567,7 @@ pub const Parser = struct {
             lhs,
             .lte,
             upper,
-            left_table_names,
-            right_table_name,
+            scope,
             pairs,
             ranges,
             left_derived,
@@ -3571,8 +3584,7 @@ pub const Parser = struct {
         lhs: ir.Expr,
         op: PredicateOp,
         rhs: ir.Expr,
-        left_table_names: []const []const u8,
-        right_table_name: []const u8,
+        scope: *JoinScope,
         pairs: *std.ArrayList(ir.JoinKeyPair),
         ranges: *std.ArrayList(ir.JoinRangePredicate),
         left_derived: *std.ArrayList(ir.Derived),
@@ -3582,8 +3594,8 @@ pub const Parser = struct {
         hidden_left: *std.ArrayList([]const u8),
         synth_counter: *usize,
     ) ParseError!void {
-        const lhs_side = try self.joinExprSide(lhs, left_table_names, right_table_name);
-        const rhs_side = try self.joinExprSide(rhs, left_table_names, right_table_name);
+        const lhs_side = try self.joinExprSide(lhs, scope);
+        const rhs_side = try self.joinExprSide(rhs, scope);
         if (lhs_side == .mixed or rhs_side == .mixed) return ParseError.SqlOnRefsUnknownTable;
         if (try self.addJoinSideFilter(lhs, lhs_side, op, rhs, rhs_side, left_filters, right_filters)) return;
         if (try self.addJoinSideFilter(rhs, rhs_side, reverseRangeOp(op), lhs, lhs_side, left_filters, right_filters)) return;
@@ -3719,11 +3731,10 @@ pub const Parser = struct {
     fn joinExprSide(
         self: *Parser,
         expr: ir.Expr,
-        left_table_names: []const []const u8,
-        right_table_name: []const u8,
+        scope: *JoinScope,
     ) ParseError!JoinExprSide {
         return switch (expr) {
-            .col_ref => |name| (try self.splitJoinCol(name, left_table_names, right_table_name)).side,
+            .col_ref => |name| (try self.splitJoinCol(name, scope)).side,
             // A session `@var` is a per-statement constant (resolved once at
             // compile time), so it sides like a literal — never a join key.
             .lit, .null_lit, .var_ref => .none,
@@ -3731,7 +3742,7 @@ pub const Parser = struct {
                 if (!try self.joinScalarAllowed(c.fn_name)) return ParseError.SqlOnNonEquiUnsupported;
                 var side: JoinExprSide = .none;
                 for (c.args) |arg| {
-                    side = combineJoinSides(side, try self.joinExprSide(arg, left_table_names, right_table_name));
+                    side = combineJoinSides(side, try self.joinExprSide(arg, scope));
                     if (side == .mixed) break :blk .mixed;
                 }
                 break :blk side;
@@ -3743,17 +3754,117 @@ pub const Parser = struct {
     fn splitJoinCol(
         self: *Parser,
         name: []const u8,
-        left_table_names: []const []const u8,
-        right_table_name: []const u8,
+        scope: *JoinScope,
     ) ParseError!QualifiedJoinCol {
-        _ = self;
-        const dot = std.mem.indexOfScalar(u8, name, '.') orelse return ParseError.SqlOnRefsUnknownTable;
+        const dot = std.mem.indexOfScalar(u8, name, '.') orelse
+            return .{ .side = try self.unqualifiedJoinColSide(name, scope), .name = name };
         const qualifier = name[0..dot];
         const col = name[dot + 1 ..];
-        if (nameIn(qualifier, left_table_names)) return .{ .side = .left, .name = col };
-        if (types.columnNameEql(qualifier, right_table_name)) return .{ .side = .right, .name = col };
-        if (left_table_names.len == 0 and right_table_name.len == 0) return .{ .side = .none, .name = col };
+        if (nameIn(qualifier, scope.left_names)) return .{ .side = .left, .name = col };
+        if (types.columnNameEql(qualifier, scope.right_name)) return .{ .side = .right, .name = col };
+        if (scope.left_names.len == 0 and scope.right_name.len == 0) return .{ .side = .none, .name = col };
         return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    /// An unqualified ON column belongs to the one input whose output has it,
+    /// as MySQL resolves it. An input whose columns can't be enumerated could
+    /// hold any name, so nothing resolves beside it.
+    fn unqualifiedJoinColSide(self: *Parser, name: []const u8, scope: *JoinScope) ParseError!JoinExprSide {
+        const columns = scope.columns orelse blk: {
+            const enumerated: JoinInputColumns = .{
+                .left = try self.sourceColumns(scope.left),
+                .right = try self.sourceColumns(scope.right),
+            };
+            scope.columns = enumerated;
+            break :blk enumerated;
+        };
+        const left = columns.left orelse return ParseError.SqlOnRefsUnknownTable;
+        const right = columns.right orelse return ParseError.SqlOnRefsUnknownTable;
+        const in_left = exposesColumn(left, name);
+        const in_right = exposesColumn(right, name);
+        if (in_left and in_right) return ParseError.SqlOnColumnAmbiguous;
+        if (in_left) return .left;
+        if (in_right) return .right;
+        return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    /// Output column names of a FROM source, or null when they can't be
+    /// enumerated at parse time: a table the parse context can't resolve, a
+    /// file scan, an unregistered table function.
+    fn sourceColumns(self: *Parser, op: *const ir.Op) ParseError!?[]const []const u8 {
+        return switch (op.*) {
+            .scan => |s| try self.tableColumns(s.table),
+            .single_row => &.{},
+            .limit => |l| try self.sourceColumns(l.upstream),
+            .filter => |f| try self.sourceColumns(f.upstream),
+            .order_by => |o| try self.sourceColumns(o.upstream),
+            .materialize => |m| try self.sourceColumns(m.upstream),
+            .alias => |a| try self.sourceColumns(a.upstream),
+            .set_union => |u| try self.sourceColumns(u.left),
+            .select => |p| try self.projectedColumns(p),
+            .exclude => |p| blk: {
+                const upstream = try self.sourceColumns(p.upstream) orelse break :blk null;
+                var kept: std.ArrayList([]const u8) = .empty;
+                for (upstream) |c| if (!nameIn(c, p.columns)) try kept.append(self.arena, c);
+                break :blk kept.items;
+            },
+            .compute => |c| blk: {
+                const upstream = try self.sourceColumns(c.upstream) orelse break :blk null;
+                var names = try std.ArrayList([]const u8).initCapacity(self.arena, upstream.len + c.derived.len);
+                names.appendSliceAssumeCapacity(upstream);
+                for (c.derived) |d| names.appendAssumeCapacity(d.name);
+                break :blk names.items;
+            },
+            .window => |w| blk: {
+                const upstream = try self.sourceColumns(w.upstream) orelse break :blk null;
+                var names = try std.ArrayList([]const u8).initCapacity(self.arena, upstream.len + w.calls.len);
+                names.appendSliceAssumeCapacity(upstream);
+                for (w.calls) |call| names.appendAssumeCapacity(call.output_name);
+                break :blk names.items;
+            },
+            .group_by => |g| blk: {
+                var names = try std.ArrayList([]const u8).initCapacity(self.arena, g.group_cols.len + g.aggs.len);
+                names.appendSliceAssumeCapacity(g.group_cols);
+                for (g.aggs) |a| names.appendAssumeCapacity(a.as);
+                break :blk names.items;
+            },
+            .join => |j| blk: {
+                const left = try self.sourceColumns(j.left) orelse break :blk null;
+                const right = try self.sourceColumns(j.right) orelse break :blk null;
+                break :blk try std.mem.concat(self.arena, []const u8, &.{ left, right });
+            },
+            .table_fn => |t| blk: {
+                const registry = self.udf_registry orelse break :blk null;
+                const entry = registry.tableByName(t.name) orelse break :blk null;
+                const names = try self.arena.alloc([]const u8, entry.output_schema.len);
+                for (entry.output_schema, names) |col, *name| name.* = col.name;
+                break :blk names;
+            },
+            else => null,
+        };
+    }
+
+    fn projectedColumns(self: *Parser, p: ir.Op.Project) ParseError!?[]const []const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        for (p.columns, 0..) |c, i| {
+            if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) {
+                // `alias.*` keeps only that alias's columns, so the whole
+                // upstream is a superset: at worst an unqualified ON name
+                // reads as ambiguous, never as the wrong side.
+                const upstream = try self.sourceColumns(p.upstream) orelse return null;
+                try names.appendSlice(self.arena, upstream);
+                continue;
+            }
+            const output = if (p.outputs) |outs| (if (i < outs.len) outs[i] else null) else null;
+            try names.append(self.arena, output orelse c);
+        }
+        return names.items;
+    }
+
+    fn tableColumns(self: *Parser, ref: ir.TableRef) ParseError!?[]const []const u8 {
+        const ctx = self.sql_fns orelse return null;
+        const tables = ctx.tables orelse return null;
+        return tables.lookup(tables.context, self.arena, ref);
     }
 
     fn joinScalarAllowed(self: *Parser, name: []const u8) ParseError!bool {
@@ -4826,6 +4937,16 @@ fn aggAliasForProjection(arena: Allocator, proj: []const ProjItem, name: []const
 
 fn nameIn(needle: []const u8, names: []const []const u8) bool {
     for (names) |n| if (types.columnNameEql(n, needle)) return true;
+    return false;
+}
+
+/// Whether an input with output `columns` binds the unqualified `name`: a
+/// bare name matches on the last dotted segment, as `types.findColumn` does.
+fn exposesColumn(columns: []const []const u8, name: []const u8) bool {
+    for (columns) |c| {
+        const last = if (std.mem.lastIndexOfScalar(u8, c, '.')) |dot| c[dot + 1 ..] else c;
+        if (types.columnNameEql(last, name)) return true;
+    }
     return false;
 }
 

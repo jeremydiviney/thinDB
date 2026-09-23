@@ -2899,3 +2899,50 @@ test "mysql wire: two connections, A's temp invisible to B" {
     if (sctx_a.err) |e| return e;
     if (sctx_b.err) |e| return e;
 }
+
+test "mysql wire: an unqualified ON column resolves against the session's tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 65 } };
+    const server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer thread.join();
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main");
+    for ([_][]const u8{
+        "CREATE TABLE t (id BIGINT NOT NULL, qty INT NOT NULL) ORDER BY (id)",
+        "CREATE TABLE o (oid BIGINT NOT NULL, tid BIGINT NOT NULL) ORDER BY (oid)",
+        "INSERT INTO t VALUES (1, 10), (2, 20)",
+        "INSERT INTO o VALUES (10, 1), (11, 2), (12, 2)",
+    }) |sql_text| {
+        try client.sendQuery(sql_text);
+        const packet = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(packet.payload);
+        try std.testing.expectEqual(@as(u8, 0), packet.payload[0]);
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendQuery("SELECT oid FROM t JOIN o ON id = tid WHERE qty = 20 ORDER BY oid");
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("11", rows[0][0].?);
+    try std.testing.expectEqualStrings("12", rows[1][0].?);
+
+    try client.sendQuery("SELECT a.id FROM t a JOIN t b ON id = b.qty");
+    {
+        const packet = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(packet.payload);
+        try std.testing.expectEqual(@as(u8, 0xff), packet.payload[0]);
+        try std.testing.expectEqual(@as(u16, 1052), std.mem.readInt(u16, packet.payload[1..3], .little));
+    }
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}

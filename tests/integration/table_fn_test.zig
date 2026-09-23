@@ -126,6 +126,31 @@ test "table UDF: partitioned running total with ORDER BY" {
     try std.testing.expectEqualSlices(i64, &.{ 10, 30, 60, 40, 90 }, got_running.items);
 }
 
+test "table UDF: unqualified ON columns resolve against the declared output" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try register(db, .either);
+
+    // Running totals are 10, 30, 60 for g=1 and 40, 90 for g=2, and ids
+    // 1, 3 and 4 carry the amts 10, 30 and 40.
+    const tvf = "TABLE(running_total((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)";
+    const cases = .{
+        .{ "SELECT s.id FROM " ++ tvf ++ " JOIN t s ON running = s.amt ORDER BY s.id", &[_]i64{ 1, 3, 4 } },
+        .{ "SELECT s.id FROM " ++ tvf ++ " r JOIN t s ON running = s.amt ORDER BY s.id", &[_]i64{ 1, 3, 4 } },
+        .{ "SELECT s.id FROM " ++ tvf ++ " r JOIN t s ON r.running = s.amt ORDER BY s.id", &[_]i64{ 1, 3, 4 } },
+        .{ "SELECT s.id FROM (SELECT amt AS x FROM t) d JOIN " ++ tvf ++ " s ON x = running ORDER BY s.id", &[_]i64{ 1, 2, 4 } },
+    };
+    inline for (cases) |case| {
+        const ids = try helpers.collectBigintsCtx(allocator, db, case[0]);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, case[1], ids);
+    }
+}
+
 test "table UDF: global mode is one partition over everything" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

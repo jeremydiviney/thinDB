@@ -622,7 +622,8 @@ fn extended_handleExecute(
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const op = try sql.parseWithContext(aa, portal.bound_sql, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views });
+    const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
+    const op = try sql.parseWithContext(aa, portal.bound_sql, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
 
     if (op.* == .batch) {
         for (op.batch.statements) |stmt| {
@@ -1031,7 +1032,8 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const op = try sql.parseWithContext(arena.allocator(), sql_text, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views });
+    const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
+    const op = try sql.parseWithContext(arena.allocator(), sql_text, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
 
     if (op.* == .batch) {
         // PG simple-Query protocol natively supports `;`-separated

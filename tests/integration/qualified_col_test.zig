@@ -327,6 +327,63 @@ test "qualified join projection preserves wildcards predicates aggregates and al
     }
 }
 
+fn setupOrders(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
+    const db = try setup(allocator, io, dir);
+    errdefer db.close();
+    try exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT NOT NULL, amount INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO o (oid, tid, amount) VALUES (10, 1, 5), (11, 1, 7), (12, 3, 9), (13, 4, 1)");
+    const o = try db.openTable("o", .{});
+    try o.flush();
+    return db;
+}
+
+test "unqualified ON columns resolve to the join input that exposes them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupOrders(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Each unqualified ON must return what its qualified spelling returns.
+    const cases = .{
+        .{ "SELECT oid FROM t JOIN o ON id = tid ORDER BY oid", "SELECT oid FROM t JOIN o ON t.id = o.tid ORDER BY oid", &[_]i64{ 10, 11, 12 } },
+        .{ "SELECT oid FROM t a JOIN o b ON id = b.tid ORDER BY oid", "SELECT oid FROM t a JOIN o b ON a.id = b.tid ORDER BY oid", &[_]i64{ 10, 11, 12 } },
+        .{ "SELECT oid FROM o JOIN t ON id = tid ORDER BY oid", "SELECT oid FROM o JOIN t ON t.id = o.tid ORDER BY oid", &[_]i64{ 10, 11, 12 } },
+        .{ "SELECT s.oid FROM (SELECT id AS k FROM t) d JOIN o s ON k = s.tid ORDER BY s.oid", "SELECT s.oid FROM (SELECT id AS k FROM t) d JOIN o s ON d.k = s.tid ORDER BY s.oid", &[_]i64{ 10, 11, 12 } },
+        .{ "SELECT oid FROM o JOIN (SELECT id AS k FROM t) s ON tid = k ORDER BY oid", "SELECT oid FROM o JOIN (SELECT id AS k FROM t) s ON o.tid = s.k ORDER BY oid", &[_]i64{ 10, 11, 12 } },
+        .{ "SELECT oid FROM t JOIN o ON id = tid AND amount > 5 ORDER BY oid", "SELECT oid FROM t JOIN o ON t.id = o.tid AND o.amount > 5 ORDER BY oid", &[_]i64{ 11, 12 } },
+        .{ "SELECT oid FROM t JOIN o ON tid = id + 0 ORDER BY oid", "SELECT oid FROM t JOIN o ON o.tid = t.id + 0 ORDER BY oid", &[_]i64{ 10, 11, 12 } },
+        .{ "WITH c AS (SELECT id, qty FROM t WHERE qty >= 20) SELECT oid FROM c JOIN o ON id = tid ORDER BY oid", "WITH c AS (SELECT id, qty FROM t WHERE qty >= 20) SELECT oid FROM c JOIN o ON c.id = o.tid ORDER BY oid", &[_]i64{12} },
+        .{ "SELECT oid FROM t JOIN o ON id = tid JOIN (SELECT id AS k2 FROM t) x ON k2 = tid ORDER BY oid", "SELECT oid FROM t JOIN o ON t.id = o.tid JOIN (SELECT id AS k2 FROM t) x ON x.k2 = o.tid ORDER BY oid", &[_]i64{ 10, 11, 12 } },
+        .{ "SELECT id FROM t LEFT JOIN o ON id = tid AND amount > 6 ORDER BY id", "SELECT id FROM t LEFT JOIN o ON t.id = o.tid AND o.amount > 6 ORDER BY id", &[_]i64{ 1, 2, 3 } },
+    };
+    inline for (cases) |case| {
+        const unqualified = try helpers.collectBigintsCtx(allocator, db, case[0]);
+        defer allocator.free(unqualified);
+        const qualified = try helpers.collectBigintsCtx(allocator, db, case[1]);
+        defer allocator.free(qualified);
+        try std.testing.expectEqualSlices(i64, case[2], qualified);
+        try std.testing.expectEqualSlices(i64, qualified, unqualified);
+    }
+}
+
+test "unqualified ON column exposed by both inputs is ambiguous" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupOrders(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT a.id FROM t a JOIN t b ON id = b.qty", error.SqlOnColumnAmbiguous },
+        .{ "SELECT oid FROM o JOIN (SELECT oid AS id, tid FROM o) d ON tid = d.id", error.SqlOnColumnAmbiguous },
+        .{ "SELECT oid FROM t JOIN o ON nosuch = tid", error.SqlOnRefsUnknownTable },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectError(case[1], helpers.runSqlCtx(allocator, db, case[0]));
+    }
+}
+
 test "qualified col: aliased col in ORDER BY" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -41,6 +41,7 @@ pub fn mapInternal(err: anyerror) Mapped {
         .schema_already_exists => .{ .sqlstate = "42P06".*, .message = "schema already exists" },
         .table_already_exists => .{ .sqlstate = "42P07".*, .message = "relation already exists" },
         .column_not_found => .{ .sqlstate = "42703".*, .message = "column does not exist" },
+        .ambiguous_column => .{ .sqlstate = "42702".*, .message = "column reference is ambiguous" },
         .query_cancelled => .{ .sqlstate = "57014".*, .message = "canceling statement due to user request" },
         .unknown => .{ .sqlstate = "42000".*, .message = name },
     };

@@ -338,6 +338,15 @@ filter/compute wrappers. It declines at wildcards or column-scope boundaries it
 cannot resolve. This pre-execution column projection leaves join order and SQL
 results intact.
 
+The parser decides which join input each `JOIN ... ON` column belongs to. A
+qualified column goes to the input its qualifier names. An unqualified one goes
+to the single input whose output has that name, as MySQL resolves it. Base-table
+columns come from the session's catalog through the parse context, derived
+tables and CTEs from their projection, and table functions from their declared
+output. A name that both inputs have is an error (`SqlOnColumnAmbiguous`, MySQL
+1052). If an input's columns can't be listed (a file scan, or a parse without
+the catalog), unqualified names on that join don't resolve.
+
 Before preparing a fused hash join, a pure filter over an existing materialized
 stage may check that stage for a surviving probe row. An empty probe skips the
 lookup builds through a chain of non-FULL joins. The check reuses stage buffers,
