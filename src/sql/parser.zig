@@ -195,6 +195,22 @@ fn unitFirstArgCall(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "timestampadd");
 }
 
+/// An interval unit is a whole number of days or months.
+const IntervalUnit = struct { fn_name: []const u8, factor: i32 };
+
+fn intervalUnit(word: []const u8) ?IntervalUnit {
+    const units = [_]struct { []const u8, IntervalUnit }{
+        .{ "day", .{ .fn_name = "date_add", .factor = 1 } },
+        .{ "week", .{ .fn_name = "date_add", .factor = 7 } },
+        .{ "month", .{ .fn_name = "date_add_months", .factor = 1 } },
+        .{ "quarter", .{ .fn_name = "date_add_months", .factor = 3 } },
+        .{ "year", .{ .fn_name = "date_add_years", .factor = 1 } },
+    };
+    const singular = if (word.len > 1 and (word[word.len - 1] == 's' or word[word.len - 1] == 'S')) word[0 .. word.len - 1] else word;
+    for (units) |u| if (std.ascii.eqlIgnoreCase(singular, u[0])) return u[1];
+    return null;
+}
+
 const DateAddSubKind = enum { add, sub };
 
 fn dateAddSubName(name: []const u8) ?DateAddSubKind {
@@ -1595,7 +1611,11 @@ pub const Parser = struct {
         return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
     }
 
-    fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
+    pub fn scalarCallHasOwnSyntax(_: *const Parser, name: []const u8) bool {
+        return dateAddSubName(name) != null;
+    }
+
+    pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
         if (dateAddSubName(name)) |_| return try self.parseDateAddSubCallAfterName(name);
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
         const args = try self.parseCallArgList(null);
@@ -1630,7 +1650,7 @@ pub const Parser = struct {
         return normalized;
     }
 
-    fn makeScalarCallExpr(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
+    pub fn makeScalarCallExpr(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
         if (std.ascii.eqlIgnoreCase(name, "months_add")) {
             if (args.len != 2) return ParseError.SqlInvalidProjection;
             return ir.Expr{ .call = .{
@@ -1713,9 +1733,9 @@ pub const Parser = struct {
     }
 
     /// Cursor sits on the INTERVAL keyword. Consume the
-    /// `INTERVAL '<integer>' (DAY|MONTH|YEAR)` form and rewrite to a
-    /// calendar-aware scalar call on `lhs`. `negate` flips the sign
-    /// for the `lhs - INTERVAL ...` form.
+    /// `INTERVAL '<integer>' <unit>` form and rewrite to a calendar-aware
+    /// scalar call on `lhs`. `negate` flips the sign for the
+    /// `lhs - INTERVAL ...` form.
     fn applyInterval(self: *Parser, lhs: ir.Expr, negate: bool) ParseError!ir.Expr {
         try self.expect(.kw_interval);
         // Accept both `'90'` (string) and bare integer for the
@@ -1723,24 +1743,23 @@ pub const Parser = struct {
         var amount = try self.parseAddSub();
         amount = try self.normalizeIntervalAmount(amount, negate);
 
-        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-        const unit_word = self.cur.text;
-        const fn_name = try self.intervalFunctionName(unit_word);
-        try self.advance();
-
-        // Build a 2-arg call: fn(date_expr, n).
-        const args = try self.arena.alloc(ir.Expr, 2);
-        args[0] = lhs;
-        args[1] = amount;
-        const name_dup = try self.arena.dupe(u8, fn_name);
-        return ir.Expr{ .call = .{ .fn_name = name_dup, .args = args } };
+        return try self.intervalCall(lhs, amount);
     }
 
-    fn intervalFunctionName(_: *Parser, unit_word: []const u8) ParseError![]const u8 {
-        if (std.ascii.eqlIgnoreCase(unit_word, "day") or std.ascii.eqlIgnoreCase(unit_word, "days")) return "date_add";
-        if (std.ascii.eqlIgnoreCase(unit_word, "month") or std.ascii.eqlIgnoreCase(unit_word, "months")) return "date_add_months";
-        if (std.ascii.eqlIgnoreCase(unit_word, "year") or std.ascii.eqlIgnoreCase(unit_word, "years")) return "date_add_years";
-        return ParseError.SqlExpectedKeyword;
+    /// Cursor sits on an interval's unit word: consume it and build the
+    /// calendar kernel call that moves `base` by `amount` of that unit.
+    fn intervalCall(self: *Parser, base: ir.Expr, amount: ir.Expr) ParseError!ir.Expr {
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const unit = intervalUnit(self.cur.text) orelse return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        const scaled = if (unit.factor == 1)
+            amount
+        else
+            try self.makeBinary("mul", amount, .{ .lit = .{ .int = unit.factor } });
+        const args = try self.arena.alloc(ir.Expr, 2);
+        args[0] = base;
+        args[1] = scaled;
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, unit.fn_name), .args = args } };
     }
 
     fn normalizeIntervalAmount(self: *Parser, amount: ir.Expr, negate: bool) ParseError!ir.Expr {
@@ -1785,14 +1804,9 @@ pub const Parser = struct {
             try self.advance();
             var amount = try self.parseAddSub();
             amount = try self.normalizeIntervalAmount(amount, kind == .sub);
-            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            const fn_name = try self.intervalFunctionName(self.cur.text);
-            try self.advance();
+            const call = try self.intervalCall(base, amount);
             try self.expect(.rparen);
-            const args = try self.arena.alloc(ir.Expr, 2);
-            args[0] = base;
-            args[1] = amount;
-            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+            return call;
         }
 
         const amount = try self.parseCallArg();
