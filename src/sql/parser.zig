@@ -46,6 +46,7 @@ const types = @import("../types.zig");
 const Value = types.Value;
 const exec_expr = @import("../exec/expr.zig");
 const exec_predicate = @import("../exec/predicate.zig");
+const scalar_fn = @import("../exec/scalar_fn.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
@@ -2320,28 +2321,6 @@ pub const Parser = struct {
         return atom;
     }
 
-    /// Map a CAST target type onto the existing conversion scalar-fn that
-    /// implements it (the registry's implicit-cast ranking then coerces
-    /// the source width, e.g. smallint→bigint before to_int). Returns null
-    /// for targets without a conversion kernel yet — those CASTs error.
-    fn castFnName(ty: types.Type) ?[]const u8 {
-        return switch (ty) {
-            .int => "to_int",
-            .bigint => "to_bigint",
-            .smallint => "to_smallint",
-            .tinyint => "to_tinyint",
-            .largeint => "to_largeint",
-            .float, .double => "to_double",
-            .boolean => "to_boolean",
-            .date => "to_date",
-            .datetime => "to_datetime",
-            .varchar, .char, .string => "to_string",
-            .json => "to_json",
-            // No conversion kernel yet: decimal, uuid.
-            .decimal64, .decimal128, .uuid => null,
-        };
-    }
-
     fn castExprToType(self: *Parser, inner: ir.Expr, ty: types.Type) ParseError!ir.Expr {
         if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
         if (inner == .case) {
@@ -2360,19 +2339,10 @@ pub const Parser = struct {
             }
             return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
         }
-        // DECIMAL target: the (p,s) ride in the function name so the scalar
-        // resolver (which sees types, not the would-be literal values) can
-        // build the right scale-aware cast kernel. See scalar_fn.resolveToDecimal.
-        if (ty.decimalSpec()) |sp| {
-            const fn_name = try std.fmt.allocPrint(self.arena, "to_decimal:{d}:{d}", .{ sp.p, sp.s });
-            const dargs = try self.arena.alloc(ir.Expr, 1);
-            dargs[0] = inner;
-            return ir.Expr{ .call = .{ .fn_name = fn_name, .args = dargs } };
-        }
-        const fn_name = castFnName(ty) orelse return ParseError.SqlInvalidProjection;
+        const fn_name = try scalar_fn.castFnName(self.arena, ty) orelse return ParseError.SqlInvalidProjection;
         const args = try self.arena.alloc(ir.Expr, 1);
         args[0] = inner;
-        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+        return ir.Expr{ .call = .{ .fn_name = fn_name, .args = args } };
     }
 
     /// Parse the target type (cursor on the type name) and wrap `inner`

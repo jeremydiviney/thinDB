@@ -39,6 +39,9 @@ pub const CastKernel = *const fn (
     row_count: usize,
 ) anyerror!void;
 
+/// The cost of an implicit cast that can lose information.
+pub const LOSSY_CAST_COST: u32 = 100;
+
 /// Returns the implicit-cast cost from `from` to `to`, or null if no
 /// implicit cast exists. Cost 0 = same type (callers usually short-
 /// circuit before calling). Lower cost wins in overload ranking.
@@ -78,13 +81,13 @@ pub fn castCost(from: TypeTag, to: TypeTag) ?u32 {
         },
         .bigint => switch (to) {
             .largeint => 1,
-            .float => 100,
+            .float => LOSSY_CAST_COST,
             .double => 10,
             else => null,
         },
         .largeint => switch (to) {
-            .float => 100,
-            .double => 100,
+            .float => LOSSY_CAST_COST,
+            .double => LOSSY_CAST_COST,
             else => null,
         },
         .float => switch (to) {
@@ -288,7 +291,7 @@ test "castCost: int → float costs more than int widening" {
 
 test "castCost: largeint → float is high-cost lossy" {
     const c = castCost(.largeint, .double).?;
-    try std.testing.expect(c >= 100);
+    try std.testing.expect(c >= LOSSY_CAST_COST);
 }
 
 test "castCost: no implicit string ↔ number" {

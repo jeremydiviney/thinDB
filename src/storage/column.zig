@@ -50,6 +50,13 @@ pub const ColumnView = struct {
         for (0..rows) |row| if (isValidBit(bm, row)) return false;
         return true;
     }
+
+    /// True when any of the first `rows` rows is NULL.
+    pub fn anyNull(self: ColumnView, rows: usize) bool {
+        const bm = self.nulls orelse return false;
+        for (0..rows) |row| if (!isValidBit(bm, row)) return true;
+        return false;
+    }
 };
 
 pub const ValueView = union(TypeTag) {
