@@ -1,6 +1,7 @@
 //! Delete-by-predicate orchestration. Per segment: prune by stats where
 //! possible, otherwise decode the predicate column and emit tombstones for
-//! matching rows. Memtable rows are filtered in-place via retainRows.
+//! matching rows. Memtable rows are removed through
+//! `Table.deleteMemtableRowsLocked`, which logs them first.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -16,8 +17,9 @@ const comparison = @import("comparison.zig");
 const upsert = @import("upsert.zig");
 const bloom = @import("../util/bloom.zig");
 
-/// Implements `Table.delete`. Returns the number of rows deleted.
-pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
+/// Implements `Table.delete`. Returns the number of rows deleted;
+/// `wal_target` receives the WAL offset to await.
+pub fn execDelete(t: *Table, pred: exec.Predicate, wal_target: *?u64) !usize {
     const col_idx = t.schema.columnIndex(pred.col) orelse return exec.Error.ColumnNotFound;
     const col_type = t.schema.columns[col_idx].type;
     if (ValueTag.fromType(col_type) != std.meta.activeTag(pred.val)) {
@@ -89,11 +91,7 @@ pub fn execDelete(t: *Table, pred: exec.Predicate) !usize {
         defer t.allocator.free(keep);
         const view = t.memtable.columns[col_idx].view();
         for (0..n) |i| keep[i] = !comparison.evalRow(view, @intCast(i), pred);
-
-        if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-            t.installMemtableLocked(new_mt);
-            total += n - new_mt.row_count;
-        }
+        total += try t.deleteMemtableRowsLocked(keep, wal_target);
     }
 
     return total;
@@ -171,11 +169,13 @@ pub fn keyedBatchEligible(t: *Table, preds: []const ?predicate.PredicateExpr) !b
 /// when the batch isn't eligible; total matched rows otherwise.
 ///
 /// Caller holds the table mutex. Literals must already be widened
-/// (`validateExpr`), same as `execDeleteByExpr`.
+/// (`validateExpr`), same as `execDeleteByExpr`. `wal_target` receives
+/// the WAL offset to await.
 pub fn execDeleteKeyedBatch(
     t: *Table,
     preds: []const ?predicate.PredicateExpr,
     counts: []usize,
+    wal_target: *?u64,
 ) !?usize {
     std.debug.assert(preds.len == counts.len);
     if (!t.schema.unique or t.order_key_indices.len == 0) return null;
@@ -291,11 +291,7 @@ pub fn execDeleteKeyedBatch(
             }
         }
 
-        if (matched_any) {
-            if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-                t.installMemtableLocked(new_mt);
-            }
-        }
+        if (matched_any) _ = try t.deleteMemtableRowsLocked(keep, wal_target);
     }
 
     return total;
@@ -360,8 +356,9 @@ fn collectDeletePruneInfo(
 /// before moving to the next segment. Memtable rows are filtered
 /// via clone-and-swap, same as the simple `execDelete` path.
 ///
-/// `pred_or_null == null` means delete every row.
-pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
+/// `pred_or_null == null` means delete every row. `wal_target` receives
+/// the WAL offset to await.
+pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr, wal_target: *?u64) !usize {
     var total: usize = 0;
 
     // Make a local mutable copy of the predicate so validateExpr can
@@ -515,11 +512,7 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr) !usize {
             try predicate.evaluatePredicate(t.allocator, pred_or_null.?, t.schema.columns, fake_batch, mask);
             for (mask, keep) |m, *k| k.* = !m;
         }
-
-        if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-            t.installMemtableLocked(new_mt);
-            total += n - new_mt.row_count;
-        }
+        total += try t.deleteMemtableRowsLocked(keep, wal_target);
     }
 
     return total;
@@ -551,16 +544,17 @@ test "delete: affected count excludes already-tombstoned rows" {
     });
     try t.flush();
 
+    var wal_target: ?u64 = null;
     const pred = exec.Predicate{ .col = "v", .op = .lte, .val = .{ .int = 2 } };
-    try std.testing.expectEqual(@as(usize, 2), try execDelete(t, pred));
+    try std.testing.expectEqual(@as(usize, 2), try execDelete(t, pred, &wal_target));
     // The matching rows are dead now; re-running the same predicate must
     // report 0, not re-count the tombstoned copies.
-    try std.testing.expectEqual(@as(usize, 0), try execDelete(t, pred));
+    try std.testing.expectEqual(@as(usize, 0), try execDelete(t, pred, &wal_target));
 
     var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "v", .op = .gte, .val = .{ .int = 1 } } };
     try predicate.validateExpr(&expr, t.schema.columns);
-    try std.testing.expectEqual(@as(usize, 1), try execDeleteByExpr(t, expr));
-    try std.testing.expectEqual(@as(usize, 0), try execDeleteByExpr(t, expr));
+    try std.testing.expectEqual(@as(usize, 1), try execDeleteByExpr(t, expr, &wal_target));
+    try std.testing.expectEqual(@as(usize, 0), try execDeleteByExpr(t, expr, &wal_target));
 }
 
 test "keyed batch delete: one sweep, per-statement counts, literal widening" {

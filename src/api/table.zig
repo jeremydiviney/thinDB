@@ -466,16 +466,18 @@ pub const Table = struct {
         try self.maybeAutoFlushLocked();
     }
 
-    /// Rows one UPDATE batch removes: memtable rows (`keep[i]` false for
-    /// each, `rows` holding their values) or offsets in one segment.
+    /// Rows one UPDATE or DELETE batch removes: memtable rows (`keep[i]`
+    /// false for each, `rows` holding their values) or offsets in one
+    /// segment.
     pub const Replaced = union(enum) {
         memtable: struct { keep: []const bool, rows: []const engine.ColumnStore, row_count: usize },
         segment: struct { id: u64, offsets: []const u32 },
     };
 
-    /// Apply one UPDATE batch: remove `replaced` and insert `rows` in its
-    /// place. Both halves go into one `replace` WAL record before either is
-    /// applied, so recovery can't keep the delete and lose the rows (#48).
+    /// Apply one UPDATE or DELETE batch: remove `replaced` and insert `rows`
+    /// (none for a DELETE) in its place. Both halves go into one `replace`
+    /// WAL record before either is applied, so recovery can't keep the delete
+    /// and lose the rows (#48).
     /// Segment offsets wait in `wal_tombstones` for
     /// `mergeLoggedTombstonesLocked`. Returns the WAL offset to await.
     pub fn replaceRowsLocked(
@@ -501,9 +503,27 @@ pub const Table = struct {
             defer self.allocator.free(views);
             for (rows, views) |*store, *view| view.* = store.view();
             try self.appendBatchLocked(self.schema.columns, views, row_count);
+            try self.settleInsertLocked();
         }
-        try self.settleInsertLocked();
         return wal_target;
+    }
+
+    /// Drop the memtable rows `keep` marks false and return how many. They go
+    /// into the WAL first as a `replace` record with nothing in their place,
+    /// so replay removes exactly these rows instead of re-running the DELETE's
+    /// predicate (#61). `wal_target` receives the WAL offset to await.
+    pub fn deleteMemtableRowsLocked(self: *Table, keep: []const bool, wal_target: *?u64) !usize {
+        const removed_count = std.mem.countScalar(bool, keep, false);
+        if (removed_count == 0) return 0;
+        const removed_mask = try self.allocator.alloc(bool, keep.len);
+        defer self.allocator.free(removed_mask);
+        for (keep, removed_mask) |k, *r| r.* = !k;
+        const removed = try self.memtable.cloneWithRetainedRows(self.allocator, removed_mask);
+        defer if (removed) |mt| mt.release();
+        const rows = if (removed) |mt| mt.columns else self.memtable.columns;
+        const replaced: Replaced = .{ .memtable = .{ .keep = keep, .rows = rows, .row_count = removed_count } };
+        if (try self.replaceRowsLocked(replaced, &.{}, 0)) |target| wal_target.* = target;
+        return removed_count;
     }
 
     /// Merge `wal_tombstones` into the segments' tombstone files. Offsets for
@@ -891,11 +911,7 @@ pub const Table = struct {
         {
             defer self.mutex.unlock(self.io);
             try self.ensureUsable();
-            // Log first; the delete primitive is idempotent on replay.
-            if (self.wal) |*w| {
-                wal_target = try w.appendDelete(pred);
-            }
-            deleted = try @import("delete.zig").execDelete(self, pred);
+            deleted = try @import("delete.zig").execDelete(self, pred, &wal_target);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
@@ -905,22 +921,14 @@ pub const Table = struct {
     /// rich PredicateExpr. Subqueries and `@vars` must already be
     /// resolved by the pre-compile pass. `pred == null` deletes every
     /// row. Returns the deleted row count. Streams per segment so
-    /// memory stays bounded by segment size.
-    ///
-    /// Note: WAL semantics for the rich predicate aren't implemented
-    /// yet (the existing appendDelete signature only carries the
-    /// simple `exec.Predicate`). For v1, durability comes from the
-    /// per-segment tombstone-file atomicity (tmp + rename) and the
-    /// memtable clone-and-swap. Crash recovery rebuilds segment
-    /// state from the persisted tombstone files.
+    /// memory stays bounded by segment size. Segment rows are durable
+    /// through their tombstone files, memtable rows through the WAL
+    /// (`deleteMemtableRowsLocked`).
     pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr) !usize {
         const statement_lease = try self.acquireStatement();
         defer if (statement_lease) |lease| lease.release();
-        // Widen literals in the predicate up front so both the WAL-
-        // logged form and the executor see the same shape (BIGINT
-        // column + INT literal etc.). The mutation is local to this
-        // function but propagates because both calls take the
-        // widened value.
+        // Widen literals in the predicate up front (BIGINT column + INT
+        // literal etc.). The mutation is local to this function.
         var pred_local: ?exec.PredicateExpr = pred;
         if (pred_local) |*p| try exec.predicate.validateExpr(p, self.schema.columns);
 
@@ -929,8 +937,8 @@ pub const Table = struct {
         var deleted: usize = 0;
         {
             defer self.mutex.unlock(self.io);
-            wal_target = try self.logDeleteExprLocked(pred_local);
-            deleted = try @import("delete.zig").execDeleteByExpr(self, pred_local);
+            try self.ensureUsable();
+            deleted = try @import("delete.zig").execDeleteByExpr(self, pred_local, &wal_target);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
@@ -952,8 +960,8 @@ pub const Table = struct {
         defer if (statement_lease) |lease| lease.release();
         const del = @import("delete.zig");
 
-        // Widen literals up front (same as deleteByExpr) so key encoding,
-        // zonemap checks, and the WAL all see the widened shape.
+        // Widen literals up front (same as deleteByExpr) so key encoding and
+        // zonemap checks see the widened shape.
         const local_preds = try self.allocator.alloc(?exec.PredicateExpr, preds.len);
         defer self.allocator.free(local_preds);
         for (preds, local_preds) |p, *lp| {
@@ -966,39 +974,12 @@ pub const Table = struct {
         var deleted: ?usize = null;
         {
             defer self.mutex.unlock(self.io);
+            try self.ensureUsable();
             if (!try del.keyedBatchEligible(self, local_preds)) return null;
-            // Log first, execute second — same ordering as deleteByExpr;
-            // replaying a delete that already ran is a no-op.
-            for (local_preds) |p| {
-                if (try self.logDeleteExprLocked(p)) |target| wal_target = target;
-            }
-            deleted = try del.execDeleteKeyedBatch(self, local_preds, counts);
+            deleted = try del.execDeleteKeyedBatch(self, local_preds, counts, &wal_target);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
-    }
-
-    /// WAL-log a rich `DELETE FROM t WHERE ...` predicate. Mutex must
-    /// be held. Returns the WAL write_offset to await for durability,
-    /// or null when there's no WAL writer or the predicate shape
-    /// isn't loggable (caller should still proceed with the delete —
-    /// segment tombstones are durable independently).
-    pub fn logDeleteExprLocked(self: *Table, pred_opt: ?exec.PredicateExpr) !?u64 {
-        try self.ensureUsable();
-        if (self.wal == null) return null;
-        if (pred_opt) |pred| {
-            return self.wal.?.appendDeleteExpr(pred) catch |err| switch (err) {
-                // Predicate variant the WAL can't encode (subquery /
-                // var_ref / correlated). Skip logging — delete still
-                // succeeds; documented gap.
-                error.WalPredicateUnsupported => null,
-                else => err,
-            };
-        }
-        // DELETE without WHERE — log as `.always = true` so replay
-        // wipes the memtable too.
-        const wal_pred: exec.PredicateExpr = .{ .always = true };
-        return try self.wal.?.appendDeleteExpr(wal_pred);
     }
 
     /// SQL `UPDATE t SET ... [WHERE expr]`: per-batch delete+insert pairs
