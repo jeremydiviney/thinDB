@@ -684,6 +684,8 @@ Wire handlers reset their cancellation token at statement acceptance, before par
 
 The server trips the same token when a MySQL-wire client disconnects mid-statement. Its connection reaper probes each connection's socket every 5 s, and cancels a statement whose only product is its result set (not a write, DDL or EXPLAIN) once the peer has closed. Writes run to completion, as in MySQL. The PostgreSQL wire does not arm this yet.
 
+Each connection records what it is doing: its user and client address, current schema, command, and when that command began, plus up to 1 KiB of the running statement's text. `SHOW [FULL] PROCESSLIST` lists that record for every connection, so a runaway statement's id can be found and passed to `KILL`.
+
 ## 9. API
 
 The public Zig API. v1 has no other client surface.

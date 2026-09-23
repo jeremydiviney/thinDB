@@ -34,6 +34,10 @@ pub const Outcome = union(enum) {
     /// query at the next batch boundary and leave the connection
     /// open.
     kill: u32,
+    /// `SHOW [FULL] PROCESSLIST` — the wire layer lists every registered
+    /// connection. `full` keeps the whole statement text instead of its
+    /// first 100 bytes.
+    processlist: struct { full: bool },
     /// `RESET CONNECTION` — the wire layer drops the session's temp
     /// namespace (if any), clears the txn flag, reverts the current
     /// schema to defaults, then replies OK.
@@ -53,7 +57,6 @@ pub const EmptyResultKind = enum {
     columns,
     indexes,
     grants,
-    processlist,
     generic_status,
 };
 
@@ -224,9 +227,10 @@ pub fn match(
         return Outcome{ .empty_result = .indexes };
     if (std.mem.startsWith(u8, lc, "show grants"))
         return Outcome{ .empty_result = .grants };
-    if (std.mem.startsWith(u8, lc, "show processlist") or
-        std.mem.startsWith(u8, lc, "show full processlist"))
-        return Outcome{ .empty_result = .processlist };
+    if (std.mem.startsWith(u8, lc, "show processlist"))
+        return Outcome{ .processlist = .{ .full = false } };
+    if (std.mem.startsWith(u8, lc, "show full processlist"))
+        return Outcome{ .processlist = .{ .full = true } };
     if (std.mem.startsWith(u8, lc, "show procedure status") or
         std.mem.startsWith(u8, lc, "show triggers") or
         std.mem.startsWith(u8, lc, "show events") or

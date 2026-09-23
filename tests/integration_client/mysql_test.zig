@@ -1892,6 +1892,106 @@ test "mysql wire: a write keeps running after its client disconnects" {
     if (sctx.err) |e| return e;
 }
 
+test "mysql wire: SHOW PROCESSLIST finds a running query and KILL interrupts it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: SlowProbe = .{ .io = io };
+    try seedSlowProbe(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 64;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    // One acceptOne per connection, each on its own thread, so both
+    // connections are served at once. Connecting the runner first gives
+    // it id 1.
+    var runner_ctx: ServerCtx = .{ .server = server, .n = 1 };
+    const runner_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&runner_ctx});
+    defer runner_thread.join();
+    var runner = try TestClient.connect(allocator, io, addr);
+    defer runner.close();
+    try runner.doHandshake("main");
+
+    const slow_sql = "SELECT max(slow_probe(id)) AS largest_id_the_probe_saw FROM t WHERE id >= 0 AND id < 1000000000 AND id <> -1";
+    try std.testing.expect(slow_sql.len > 100);
+    try runner.sendQuery(slow_sql);
+    try probe.awaitFirstBatch();
+
+    var admin_ctx: ServerCtx = .{ .server = server, .n = 1 };
+    const admin_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&admin_ctx});
+    defer admin_thread.join();
+    var admin = try TestClient.connect(allocator, io, addr);
+    defer admin.close();
+    try admin.doHandshake("main");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try admin.sendQuery("SHOW FULL PROCESSLIST");
+    const full = try admin.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), full.len);
+    try std.testing.expectEqual(@as(usize, 8), full[0].len);
+    try std.testing.expectEqualStrings("1", full[0][0].?);
+    try std.testing.expectEqualStrings("test", full[0][1].?);
+    try std.testing.expect(std.mem.startsWith(u8, full[0][2].?, "127.0.0.1:"));
+    try std.testing.expectEqualStrings("main__public", full[0][3].?);
+    try std.testing.expectEqualStrings("Query", full[0][4].?);
+    _ = try std.fmt.parseInt(u64, full[0][5].?, 10);
+    try std.testing.expectEqualStrings("executing", full[0][6].?);
+    try std.testing.expectEqualStrings(slow_sql, full[0][7].?);
+    try std.testing.expectEqualStrings("2", full[1][0].?);
+    try std.testing.expectEqualStrings("SHOW FULL PROCESSLIST", full[1][7].?);
+
+    try admin.sendQuery("SHOW PROCESSLIST");
+    const short = try admin.readResultSet(arena.allocator());
+    try std.testing.expectEqualStrings(slow_sql[0..100], short[0][7].?);
+
+    try admin.sendQuery("KILL 1");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &admin.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    // The runner's result ends in ER_QUERY_INTERRUPTED, possibly after
+    // its column definitions.
+    const interrupted_code = for (0..16) |_| {
+        const pkt = try mysql_packet.readPacket(allocator, &runner.reader.interface);
+        defer allocator.free(pkt.payload);
+        if (pkt.payload[0] == 0xFF) break std.mem.readInt(u16, pkt.payload[1..3], .little);
+    } else return error.NoErrorPacket;
+    try std.testing.expectEqual(@as(u16, 1317), interrupted_code);
+    try std.testing.expect(probe.rows.load(.monotonic) < slow_probe_rows);
+
+    // The runner goes back to sleep once its reply is flushed.
+    const idle = for (0..200) |_| {
+        _ = arena.reset(.retain_capacity);
+        try admin.sendQuery("SHOW PROCESSLIST");
+        const rows = try admin.readResultSet(arena.allocator());
+        if (std.mem.eql(u8, rows[0][4].?, "Sleep")) break rows[0];
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    } else return error.RunnerNeverSlept;
+    try std.testing.expectEqualStrings("", idle[6].?);
+    try std.testing.expect(idle[7] == null);
+
+    try runner.sendQuit();
+    try admin.sendQuit();
+    if (runner_ctx.err) |e| return e;
+    if (admin_ctx.err) |e| return e;
+}
+
 test "mysql wire: limiter at zero capacity emits ER_CON_COUNT_ERROR on accept" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

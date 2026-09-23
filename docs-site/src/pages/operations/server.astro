@@ -85,6 +85,11 @@ no-wal = false`} />
     <tr><td><code>--no-compaction</code></td><td>Disables the background compactor. Use only as an operational escape hatch; segment count will grow.</td></tr>
   </tbody></table></div>
 
+  <h2 id="running-queries">Running queries</h2>
+  <p><code>SHOW PROCESSLIST</code> on the MySQL wire lists every connection on both wires. Each row shows the id, user, client address, schema, command, seconds in its current state, and the running statement. <code>SHOW PROCESSLIST</code> shows the statement's first 100 bytes; <code>SHOW FULL PROCESSLIST</code> shows up to 1 KiB of it.</p>
+  <p><code>KILL &lt;id&gt;</code> or <code>KILL QUERY &lt;id&gt;</code> interrupts that connection's statement at its next cancellation check. The statement fails with error 1317 (<code>Query execution was interrupted</code>). Unlike MySQL, the connection stays open for both forms. From PostgreSQL, <code>pg_cancel_backend(pid)</code> does the same.</p>
+  <p>When a MySQL client disconnects while its read-only statement runs, the server cancels that statement within about 5 seconds. Writes run to completion.</p>
+
   <h2 id="diagnostics">Diagnostics</h2>
   <ul><li><code>--profile-ops</code> prints inclusive per-operator timings after each query.</li><li><code>--trace-group-by</code> prints hash/sort/radix routing inputs and decisions.</li><li><code>--force-group-by auto|hash|sort|radix</code> overrides routing for diagnosis and benchmarks.</li><li><code>THINDB_MYSQL_PROFILE=1</code> logs per-connection MySQL protocol phase timings.</li><li><code>--scan-batch N</code> overrides the scan sub-batch size for diagnostics.</li><li><code>--version</code> and <code>--help</code> report the binary build and current flags.</li></ul>
   <Callout type="note" title="Diagnostic overrides"><p>Forced group-by and scan-batch settings are process-wide diagnostic controls. Do not use benchmark overrides as unexplained production defaults.</p></Callout>

@@ -21,6 +21,7 @@ pub fn mapInternal(err: anyerror, fallback_msg: ?[]const u8) Mapped {
         .schema_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Schema exists" },
         .table_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Table exists" },
         .column_not_found => .{ .code = 1054, .sqlstate = "42S22".*, .message = "Unknown column" },
+        .query_cancelled => .{ .code = 1317, .sqlstate = "70100".*, .message = "Query execution was interrupted" },
         .unknown => .{ .code = 1064, .sqlstate = "42000".*, .message = fallback_msg orelse @errorName(err) },
     };
 }
@@ -29,6 +30,12 @@ test "mapInternal recognizes catalog errors" {
     const m = mapInternal(error.TableNotFound, "x");
     try std.testing.expectEqual(@as(u16, 1146), m.code);
     try std.testing.expectEqualStrings("42S02", &m.sqlstate);
+}
+
+test "mapInternal reports a cancelled query as interrupted" {
+    const m = mapInternal(error.QueryCancelled, null);
+    try std.testing.expectEqual(@as(u16, 1317), m.code);
+    try std.testing.expectEqualStrings("70100", &m.sqlstate);
 }
 
 test "mapInternal falls back to 1064" {

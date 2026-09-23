@@ -53,6 +53,7 @@ const scan_mod = @import("../../exec/scan.zig");
 // can print this query's hit/miss/evict delta under `--profile-ops`.
 threadlocal var prev_cache_stats: rg_cache.GlobalStats = .{ .hits = 0, .misses = 0, .evictions = 0, .miss_bytes = 0, .cache_bytes = 0 };
 const ConnectionState = conn_registry.ConnectionState;
+const ProcessCommand = conn_registry.Command;
 const ConnectionRegistry = conn_registry.Registry;
 const ConnectionLimiter = @import("../conn_limit.zig").ConnectionLimiter;
 const sock_opts = @import("../sock_opts.zig");
@@ -620,10 +621,7 @@ fn profilePhaseName(phase: ProfilePhase) []const u8 {
 
 /// Millisecond reading of the awake clock — the same timebase the
 /// net_read_timeout reaper compares against (cmd/server.zig).
-fn nowMs(io: Io) u64 {
-    const ns = Io.Clock.awake.now(io).nanoseconds;
-    return @intCast(@divTrunc(@max(ns, 0), std.time.ns_per_ms));
-}
+const nowMs = conn_registry.nowMs;
 
 // ---------------------------------------------------------------------------
 // Guarded socket writes (#164): every send on a connection's stream writer is
@@ -732,6 +730,8 @@ fn handleConnection(
     // socket shut down, which completes the wedged operation and lets
     // this thread exit through the normal error path.
     conn_state.reap_socket = stream.socket.handle;
+    var host_buf: [64]u8 = undefined;
+    conn_state.setPeer(std.fmt.bufPrint(&host_buf, "{f}", .{stream.socket.address}) catch "", nowMs(io));
     interposeWriteGuard(w, &conn_state, io);
     defer tl_write_guard = null;
     if (registry) |reg| {
@@ -785,6 +785,7 @@ fn handleConnection(
             return;
         }
     }
+    conn_state.setUser(client.username);
 
     if (client.initial_database) |db_name| {
         if (db_name.len > 0) {
@@ -808,6 +809,10 @@ fn handleConnection(
         try handshake.sendHandshakeOk(allocator, w);
     }
     try w.flush();
+    {
+        var db_buf: [256]u8 = undefined;
+        conn_state.endCommand(processDb(&session, &db_buf), nowMs(io));
+    }
 
     while (true) {
         const read_start = profiler.start();
@@ -839,6 +844,10 @@ fn handleConnection(
         const cmd = pkt.payload[0];
         const body = pkt.payload[1..];
         const command_start = profiler.start();
+        var db_buf: [256]u8 = undefined;
+        if (processCommand(cmd)) |command| {
+            conn_state.beginCommand(command, commandText(&session, cmd, body), processDb(&session, &db_buf), nowMs(io));
+        }
         switch (cmd) {
             0x01 => {
                 profiler.recordSince(.command_total, command_start);
@@ -913,9 +922,35 @@ fn handleConnection(
         const flush_start = profiler.start();
         try w.flush();
         profiler.recordSince(.response_flush, flush_start);
+        conn_state.endCommand(processDb(&session, &db_buf), nowMs(io));
         profiler.recordSince(.command_total, command_start);
         profiler.finishCommand();
     }
+}
+
+/// The PROCESSLIST command a MySQL command byte runs as, or null for the
+/// commands that finish too quickly to be worth tracking.
+fn processCommand(cmd: u8) ?ProcessCommand {
+    return switch (cmd) {
+        0x03 => .query,
+        0x16 => .prepare,
+        0x17 => .execute,
+        else => null,
+    };
+}
+
+/// The statement a tracked command runs: the SQL itself for COM_QUERY and
+/// COM_STMT_PREPARE, the prepared statement's SQL for COM_STMT_EXECUTE.
+fn commandText(session: *const SessionState, cmd: u8, body: []const u8) []const u8 {
+    if (cmd != 0x17) return body;
+    if (body.len < 4) return "";
+    const stmt = session.prepared_statements.get(std.mem.readInt(u32, body[0..4], .little)) orelse return "";
+    return stmt.sql;
+}
+
+/// The session's current schema as `USE` and `SHOW TABLES` name it.
+fn processDb(session: *const SessionState, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}__{s}", .{ session.current_db, session.current_schema }) catch session.current_db;
 }
 
 /// Apply the flattening rule for COM_INIT_DB / USE: `db__schema` splits
@@ -986,6 +1021,7 @@ fn handleChangeUser(
         try handshake.sendErrPacket(allocator, w, 1, 1064, "42000".*, "malformed COM_CHANGE_USER");
         return;
     }
+    const user_name = payload[0..i];
     i += 1; // skip NUL after user
 
     if (i >= payload.len) {
@@ -1016,6 +1052,7 @@ fn handleChangeUser(
             return;
         }
     }
+    if (session.conn_state) |state| state.setUser(user_name);
 
     // Reset session state. COM_CHANGE_USER is more aggressive than
     // COM_RESET_CONNECTION: it explicitly re-authenticates and
@@ -1133,6 +1170,7 @@ fn handleQuery(
             .variable_row => |vr| try result.sendVariableRow(allocator, w, vr.name, vr.value, &seq_id, caps),
             .empty_variables => try result.sendEmptyVariables(allocator, w, &seq_id, caps),
             .empty_result => |kind| try sendMetadataResult(allocator, w, catalog, session, payload, kind, &seq_id, caps),
+            .processlist => |list| try sendProcessList(allocator, w, catalog.io, session, list.full, &seq_id, caps),
             .kill => |target_id| {
                 // No registry → KILL is a no-op success. With a
                 // registry, look up the target and set its cancel
@@ -3122,24 +3160,73 @@ fn sendEmptyMetadataResult(
             const cols = [_]types.Column{.{ .name = "Grants for thindb@localhost", .type = .string }};
             return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
         },
-        .processlist => {
-            const cols = [_]types.Column{
-                .{ .name = "Id", .type = .bigint },
-                .{ .name = "User", .type = .string },
-                .{ .name = "Host", .type = .string },
-                .{ .name = "db", .type = .string, .nullable = true },
-                .{ .name = "Command", .type = .string },
-                .{ .name = "Time", .type = .int },
-                .{ .name = "State", .type = .string, .nullable = true },
-                .{ .name = "Info", .type = .string, .nullable = true },
-            };
-            return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
-        },
         .generic_status => {
             const cols = [_]types.Column{.{ .name = "Name", .type = .string }};
             return sendEmptyColumns(allocator, w, cols[0..], seq_id, client_caps);
         },
     }
+}
+
+/// `SHOW [FULL] PROCESSLIST`: one row per connection, as MySQL lays it
+/// out. Without a shared registry only this connection is known.
+fn sendProcessList(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    io: Io,
+    session: *SessionState,
+    full: bool,
+    seq_id: *u8,
+    client_caps: u32,
+) !void {
+    const cols = [_]types.Column{
+        .{ .name = "Id", .type = .bigint },
+        .{ .name = "User", .type = .string },
+        .{ .name = "Host", .type = .string },
+        .{ .name = "db", .type = .string, .nullable = true },
+        .{ .name = "Command", .type = .string },
+        .{ .name = "Time", .type = .int },
+        .{ .name = "State", .type = .string, .nullable = true },
+        .{ .name = "Info", .type = .string, .nullable = true },
+    };
+    const processes = if (session.registry) |reg| try reg.processList(allocator) else try ownProcess(allocator, session);
+    defer allocator.free(processes);
+
+    try result.sendResultHeader(allocator, w, cols[0..], "", "", seq_id);
+    try result.sendColumnDefBoundary(allocator, w, seq_id, client_caps);
+    const now_ms = nowMs(io);
+    for (processes) |process| {
+        const activity = &process.activity;
+        const running = switch (activity.command) {
+            .query, .prepare, .execute => true,
+            .connect, .sleep => false,
+        };
+        var id_buf: [16]u8 = undefined;
+        var time_buf: [24]u8 = undefined;
+        const info = activity.info.slice();
+        const cells = [_]?[]const u8{
+            try std.fmt.bufPrint(&id_buf, "{d}", .{process.backend_id}),
+            if (activity.user.len > 0) activity.user.slice() else "unauthenticated user",
+            activity.host.slice(),
+            if (activity.db.len > 0) activity.db.slice() else null,
+            activity.command.label(),
+            try std.fmt.bufPrint(&time_buf, "{d}", .{(now_ms -| activity.since_ms) / std.time.ms_per_s}),
+            switch (activity.command) {
+                .connect => "login",
+                .sleep => "",
+                .query, .prepare, .execute => "executing",
+            },
+            if (!running) null else if (full) info else conn_registry.utf8Prefix(info, 100),
+        };
+        try result.sendTextRow(allocator, w, cells[0..], seq_id);
+    }
+    try result.sendResultTerminator(allocator, w, seq_id, client_caps);
+}
+
+fn ownProcess(allocator: Allocator, session: *SessionState) ![]conn_registry.Process {
+    const state = session.conn_state orelse return allocator.alloc(conn_registry.Process, 0);
+    const list = try allocator.alloc(conn_registry.Process, 1);
+    list[0] = .{ .backend_id = state.backend_id, .activity = state.snapshotActivity() };
+    return list;
 }
 
 fn sendEmptyColumns(
