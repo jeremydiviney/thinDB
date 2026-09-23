@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
+const helpers = @import("sql_helpers.zig");
 
 // ---------------------------------------------------------------------------
 // Implicit type coercion (DuckDB-style promotion graph in src/exec/cast.zig)
@@ -140,6 +141,31 @@ test "coercion: no implicit string ↔ number — concat(string, int) still erro
     });
     try std.testing.expectError(thindb.exec.Error.ComputeNoSuchOverload, result);
     base.deinit();
+}
+
+test "a statement whose Compute fails to build lets the database close" {
+    // The literal buffers Compute built before its overload failed were
+    // charged to the statement's tracked allocator and leaked. The statement's
+    // accountant, and the gate lease Database.close waits on, outlived the
+    // statement, and close hung (#63).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    try helpers.exec(allocator, db, "CREATE TABLE raw (id BIGINT PRIMARY KEY, s VARCHAR(32))");
+    try helpers.exec(allocator, db, "INSERT INTO raw (id, s) VALUES (1, 'a')");
+    inline for (.{
+        "SELECT sqrt('x') AS v FROM raw",
+        "SELECT upper(s) AS u, concat('a', sqrt('x')) AS v FROM raw",
+        "SELECT CASE WHEN id > 0 THEN 'y' ELSE sqrt('x') END AS v FROM raw",
+    }) |sql| {
+        try helpers.expectRunError(allocator, db, sql, thindb.exec.Error.ComputeNoSuchOverload);
+    }
+    // Checked before close, which would wait on a leaked lease forever.
+    try std.testing.expectEqual(@as(usize, 0), db.config.statement_gate.?.allocator_owners);
+    db.close();
 }
 
 // ---------------------------------------------------------------------------
