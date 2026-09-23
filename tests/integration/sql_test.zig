@@ -3572,3 +3572,44 @@ test "sql: CAST AS SIGNED / UNSIGNED are MySQL spellings of a 64-bit cast" {
     const r = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 1), r.row_count);
 }
+
+test "sql: a repeated projection name becomes name_N, as DuckDB names it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const cases = .{
+        .{ .sql = "SELECT 1, 1, NULL, NULL", .names = &[_][]const u8{ "1", "1_1", "NULL", "NULL_1" } },
+        .{ .sql = "SELECT * FROM (SELECT id, id FROM t WHERE id = 1) d", .names = &[_][]const u8{ "id", "id_1" } },
+        .{ .sql = "SELECT id, NULL, NULL FROM t WHERE id = 1", .names = &[_][]const u8{ "id", "NULL", "NULL_1" } },
+        .{ .sql = "SELECT id, id, id AS id_1 FROM t WHERE id = 1", .names = &[_][]const u8{ "id", "id_2", "id_1" } },
+    };
+    inline for (cases) |case| {
+        var q = try runSql(allocator, db, case.sql);
+        defer q.deinit();
+        const schema = q.outputSchema();
+        try std.testing.expectEqual(case.names.len, schema.len);
+        // A derived table's alias qualifies its names; the rename is on the bare one.
+        for (schema, case.names) |col, name| {
+            const bare = if (std.mem.lastIndexOfScalar(u8, col.name, '.')) |dot| col.name[dot + 1 ..] else col.name;
+            try std.testing.expectEqualStrings(name, bare);
+        }
+        const r = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 1), r.row_count);
+    }
+
+    // The renamed item keeps its own value: `id + 10 AS id` must not
+    // replace the plain `id` it follows.
+    var q = try runSql(allocator, db, "SELECT id, id + 10 AS id FROM t WHERE id = 1");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqualStrings("id", schema[0].name);
+    try std.testing.expectEqualStrings("id_1", schema[1].name);
+    const r = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), r.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 11), r.values[1].data.bigint[0]);
+}
