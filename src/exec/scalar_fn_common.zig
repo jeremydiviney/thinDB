@@ -164,6 +164,20 @@ pub fn parseDateTimeString(s: []const u8) !i64 {
     return @as(i64, days) * 86_400_000_000 + day_micros;
 }
 
+/// Text as a DATE, the way CAST and a date-typed argument read it: the
+/// leading `YYYY-MM-DD`, so a datetime string gives its day. Null when the
+/// text isn't a date.
+pub fn textToDate(s: []const u8) ?i32 {
+    return parseDateString(s) catch null;
+}
+
+/// Text as a DATETIME, the way CAST and a datetime-typed argument read it.
+/// Text that starts with a date but has no time of day this parser accepts
+/// is midnight of that date. Null when the text isn't a date.
+pub fn textToDatetime(s: []const u8) ?i64 {
+    return parseDateTimeString(s) catch @as(i64, textToDate(s) orelse return null) * std.time.us_per_day;
+}
+
 test "parseDateTimeString: fractions, date-only, Z, rejects" {
     try std.testing.expectEqual(@as(i64, 1783663005455833), try parseDateTimeString("2026-07-10 05:56:45.455833"));
     try std.testing.expectEqual(@as(i64, 1783663005455000), try parseDateTimeString("2026-07-10 05:56:45.455"));

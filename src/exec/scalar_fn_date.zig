@@ -212,6 +212,30 @@ pub fn dateToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out:
     while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, @as(i64, s[i]) * std.time.us_per_day);
 }
 
+/// CAST(text AS DATE). Text that isn't a date is NULL, as in MySQL.
+pub fn stringToDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const base = out.data.rowCount();
+    const text = stringViewOf(args[0]);
+    for (0..row_count) |i| {
+        const days = if (args[0].isValid(i)) common.textToDate(text.rowBytes(i)) else null;
+        try out.data.date.append(allocator, days orelse 0);
+        try out.appendValidBit(allocator, base + i, days != null);
+    }
+}
+
+/// CAST(text AS DATETIME). Text that isn't a date is NULL, as in MySQL.
+pub fn stringToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const base = out.data.rowCount();
+    const text = stringViewOf(args[0]);
+    for (0..row_count) |i| {
+        const micros = if (args[0].isValid(i)) common.textToDatetime(text.rowBytes(i)) else null;
+        try out.data.datetime.append(allocator, micros orelse 0);
+        try out.appendValidBit(allocator, base + i, micros != null);
+    }
+}
+
 /// DATE_TRUNC(unit, datetime) → datetime truncated down to the unit
 /// boundary. `unit` is a constant string naming a `DateUnit`; weeks start
 /// on Monday.

@@ -139,3 +139,51 @@ test "TIMESTAMP alias for DATETIME" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{1}, ids);
 }
+
+test "CAST text AS DATE / DATETIME: a column parses per row, a literal stays a constant" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE raw (id BIGINT PRIMARY KEY, s VARCHAR(32))");
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO raw (id, s) VALUES (1, '2024-03-01'), (2, '2024-03-01 18:30:00'), (3, 'soon'), (4, NULL), (5, '2024-12-31')",
+    );
+    const t = try db.openTable("raw", .{});
+    try t.flush();
+
+    const cases = .{
+        .{ .sql = "SELECT id FROM raw WHERE CAST(s AS DATE) = DATE '2024-03-01' ORDER BY id", .ids = &[_]i64{ 1, 2 } },
+        .{ .sql = "SELECT id FROM raw WHERE CAST(s AS DATE) IS NULL ORDER BY id", .ids = &[_]i64{ 3, 4 } },
+        .{ .sql = "SELECT id FROM raw WHERE CAST(s AS DATETIME) = DATETIME '2024-03-01 18:30:00'", .ids = &[_]i64{2} },
+        .{ .sql = "SELECT id FROM raw WHERE CAST(s AS DATETIME) = DATETIME '2024-03-01 00:00:00'", .ids = &[_]i64{1} },
+        .{ .sql = "SELECT id FROM raw WHERE DATEDIFF(CAST(s AS DATE), CAST('2024-03-01' AS DATE)) > 0", .ids = &[_]i64{5} },
+        .{ .sql = "SELECT id FROM raw WHERE EXTRACT(MONTH FROM CAST(s AS DATE)) = 12", .ids = &[_]i64{5} },
+    };
+    inline for (cases) |c| {
+        const ids = try collectBigints(allocator, db, c.sql);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, c.ids, ids);
+    }
+
+    // A literal parses once while planning: the column is a non-null
+    // constant, not a per-row parse that could yield NULL.
+    var constant = try runSql(allocator, db, "SELECT CAST('2024-03-01' AS DATE) AS d, CAST('2024-03-01 18:30:00' AS DATETIME) AS ts FROM raw WHERE id = 1");
+    defer constant.deinit();
+    try std.testing.expectEqual(false, constant.outputSchema()[0].nullable);
+    try std.testing.expectEqual(false, constant.outputSchema()[1].nullable);
+    const row = (try constant.next()).?;
+    try std.testing.expectEqual(@as(i32, 19783), row.values[0].data.date[0]);
+    try std.testing.expectEqual(@as(i64, 19783 * std.time.us_per_day + (18 * 3600 + 30 * 60) * std.time.us_per_s), row.values[1].data.datetime[0]);
+
+    var invalid = try runSql(allocator, db, "SELECT CAST('soon' AS DATE) AS d FROM raw WHERE id = 1");
+    defer invalid.deinit();
+    const invalid_row = (try invalid.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), invalid_row.row_count);
+    try std.testing.expect(!invalid_row.values[0].isValid(0));
+}

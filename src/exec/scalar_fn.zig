@@ -709,6 +709,10 @@ pub const builtins = [_]ScalarFn{
     // date <-> datetime
     .{ .name = "to_date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },
+    // Text parsing: text that isn't a date is NULL. Compute parses a literal
+    // argument once at plan time instead (coerceTemporalStringLiterals).
+    .{ .name = "to_date", .arg_types = &.{.string}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.stringToDateKernel },
+    .{ .name = "to_datetime", .arg_types = &.{.string}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.stringToDatetimeKernel },
     // Stringify numerics.
     .{ .name = "to_string", .arg_types = &.{.int}, .return_type = .string, .kernel = math.intToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.bigintToStringKernel },
