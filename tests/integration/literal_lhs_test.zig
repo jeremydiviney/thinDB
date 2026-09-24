@@ -1,6 +1,9 @@
-//! Literal-on-LHS predicate comparisons. v1 handles:
+//! Literal-on-LHS predicates. Handled:
 //!   - lit op lit  → evaluated at parse time, predicate becomes
 //!                   constant TRUE/FALSE (`.always`).
+//!   - lit IS [NOT] NULL, NULL IS [NOT] NULL → `.always`; NULL op X →
+//!                   UNKNOWN.
+//!   - lit [NOT] BETWEEN / IN / LIKE → the literal as a computed column.
 //!   - lit op col  → flipped to `col reverse_op lit` (normal leaf).
 //! Subquery on either side of a literal-LHS is rejected; users
 //! rewrite as `col op (SELECT ...)`.
@@ -92,4 +95,39 @@ test "literal-on-LHS: composes with AND" {
     );
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, ids);
+}
+
+test "literal-on-LHS: IS [NOT] NULL, NULL comparisons, BETWEEN / IN / LIKE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ .where = "NULL IS NULL", .ids = &[_]i64{ 1, 2, 3 } },
+        .{ .where = "NULL IS NOT NULL", .ids = &[_]i64{} },
+        .{ .where = "5 IS NULL", .ids = &[_]i64{} },
+        .{ .where = "'x' IS NOT NULL", .ids = &[_]i64{ 1, 2, 3 } },
+        .{ .where = "NULL = 1", .ids = &[_]i64{} },
+        .{ .where = "NOT (NULL = qty)", .ids = &[_]i64{} },
+        .{ .where = "NOT (NULL IS NULL)", .ids = &[_]i64{} },
+        // Optional-parameter guard as generated SQL binds it when the parameter is absent.
+        .{ .where = "(NULL IS NULL OR ABS(qty) = NULL)", .ids = &[_]i64{ 1, 2, 3 } },
+        .{ .where = "(NULL IS NOT NULL OR qty = 20)", .ids = &[_]i64{2} },
+        .{ .where = "20 BETWEEN qty AND 30", .ids = &[_]i64{ 1, 2 } },
+        .{ .where = "20 NOT BETWEEN qty AND 30", .ids = &[_]i64{3} },
+        .{ .where = "20 IN (10, 20)", .ids = &[_]i64{ 1, 2, 3 } },
+        .{ .where = "5 NOT IN (10, 20)", .ids = &[_]i64{ 1, 2, 3 } },
+        .{ .where = "'abc' LIKE 'a%'", .ids = &[_]i64{ 1, 2, 3 } },
+    };
+    inline for (cases) |c| {
+        const ids = try collectBigints(allocator, db, "SELECT id FROM t WHERE " ++ c.where ++ " ORDER BY id ASC");
+        defer allocator.free(ids);
+        std.testing.expectEqualSlices(i64, c.ids, ids) catch |err| {
+            std.debug.print("WHERE {s}\n", .{c.where});
+            return err;
+        };
+    }
 }
