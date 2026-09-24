@@ -1,8 +1,8 @@
 //! Literal-on-LHS predicates. Handled:
 //!   - lit op lit  → evaluated at parse time, predicate becomes
 //!                   constant TRUE/FALSE (`.always`).
-//!   - lit IS [NOT] NULL, NULL IS [NOT] NULL → `.always`; NULL op X →
-//!                   UNKNOWN.
+//!   - lit IS [NOT] NULL, NULL IS [NOT] NULL → `.always`; NULL op X and
+//!                   lit op NULL → UNKNOWN.
 //!   - lit [NOT] BETWEEN / IN / LIKE → the literal as a computed column.
 //!   - lit op col  → flipped to `col reverse_op lit` (normal leaf).
 //! Subquery on either side of a literal-LHS is rejected; users
@@ -111,6 +111,9 @@ test "literal-on-LHS: IS [NOT] NULL, NULL comparisons, BETWEEN / IN / LIKE" {
         .{ .where = "5 IS NULL", .ids = &[_]i64{} },
         .{ .where = "'x' IS NOT NULL", .ids = &[_]i64{ 1, 2, 3 } },
         .{ .where = "NULL = 1", .ids = &[_]i64{} },
+        .{ .where = "1 = NULL", .ids = &[_]i64{} },
+        .{ .where = "NOT ('a' <> NULL)", .ids = &[_]i64{} },
+        .{ .where = "(NULL IS NULL OR 1 = NULL)", .ids = &[_]i64{ 1, 2, 3 } },
         .{ .where = "NOT (NULL = qty)", .ids = &[_]i64{} },
         .{ .where = "NOT (NULL IS NULL)", .ids = &[_]i64{} },
         // Optional-parameter guard as generated SQL binds it when the parameter is absent.

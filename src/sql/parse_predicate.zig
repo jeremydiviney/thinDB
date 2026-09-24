@@ -10,7 +10,7 @@
 //!   not_expr   := 'NOT' not_expr | atom
 //!   atom       := '(' or_expr ')'
 //!                | 'NULL' ('IS' ['NOT'] 'NULL' | cmp_op expr)
-//!                | lit ('IS' ['NOT'] 'NULL' | cmp_op (qualified_col | lit | @var))
+//!                | lit ('IS' ['NOT'] 'NULL' | cmp_op (qualified_col | lit | @var | 'NULL'))
 //!                | lit ['NOT'] ('BETWEEN' | 'LIKE' | 'IN') ...
 //!                | qualified_col 'IS' ['NOT'] 'NULL'
 //!                | qualified_col ['NOT'] 'BETWEEN' lit 'AND' lit
@@ -171,6 +171,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // Literal-on-LHS: `lit op X`. Sub-cases handled:
     //   - lit op col   → flipped to `col reverse_op lit` as a normal leaf
     //   - lit op lit   → evaluated at parse time, emitted as `.always`
+    //   - lit op NULL  → UNKNOWN
     //   - lit IS [NOT] NULL → a literal is never NULL, so `.always`
     //   - lit [NOT] BETWEEN / LIKE / IN → the literal anchors to a hidden
     //     computed column and takes the column operator tail
@@ -195,6 +196,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             else => return PE.SqlExpectedToken,
         };
         try p.advance();
+        if (p.cur.tag == .kw_null) {
+            try p.advance();
+            return .unknown;
+        }
         if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
             const col_dup = try parseQualifiedColRef(p);
             return .{ .leaf = .{ .col = col_dup, .op = reverseOp(op_lhs), .val = lhs_val } };
