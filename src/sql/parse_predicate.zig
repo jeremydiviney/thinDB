@@ -9,6 +9,9 @@
 //!   and_expr   := not_expr ('AND' not_expr)*
 //!   not_expr   := 'NOT' not_expr | atom
 //!   atom       := '(' or_expr ')'
+//!                | 'NULL' ('IS' ['NOT'] 'NULL' | cmp_op expr)
+//!                | lit ('IS' ['NOT'] 'NULL' | cmp_op (qualified_col | lit | @var))
+//!                | lit ['NOT'] ('BETWEEN' | 'LIKE' | 'IN') ...
 //!                | qualified_col 'IS' ['NOT'] 'NULL'
 //!                | qualified_col ['NOT'] 'BETWEEN' lit 'AND' lit
 //!                | qualified_col ['NOT'] 'LIKE' string_lit
@@ -154,13 +157,34 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         try p.expect(.rparen);
         return .{ .exists_subquery = @ptrCast(source) };
     }
-    // Literal-on-LHS comparison: `lit op X`. Two sub-cases handled:
+    // NULL on the LHS — generated SQL guards optional parameters with
+    // `(:param IS NULL OR ...)`. IS [NOT] NULL folds to a constant, and any
+    // comparison with NULL is UNKNOWN, as `col = NULL` is in parseColOps.
+    if (p.cur.tag == .kw_null) {
+        try p.advance();
+        if (p.cur.tag == .kw_is) return .{ .always = !(try parseIsNullTail(p)) };
+        if (!isComparisonToken(p.cur.tag)) return PE.SqlExpectedToken;
+        _ = try parseComparisonToken(p);
+        _ = try p.parseAddSub();
+        return .unknown;
+    }
+    // Literal-on-LHS: `lit op X`. Sub-cases handled:
     //   - lit op col   → flipped to `col reverse_op lit` as a normal leaf
     //   - lit op lit   → evaluated at parse time, emitted as `.always`
+    //   - lit IS [NOT] NULL → a literal is never NULL, so `.always`
+    //   - lit [NOT] BETWEEN / LIKE / IN → the literal anchors to a hidden
+    //     computed column and takes the column operator tail
     // Subquery on either side of a literal-LHS comparison is rejected
     // — workaround is to write the column on the LHS.
     if (isLiteralLhsTokenStart(p.cur.tag)) {
         const lhs_val = try p.parseValue();
+        switch (p.cur.tag) {
+            .kw_is => return .{ .always = try parseIsNullTail(p) },
+            .kw_not, .kw_between, .kw_like, .kw_in => {
+                return try parseColOps(p, try p.materializePredicateExpr(.{ .lit = lhs_val }));
+            },
+            else => {},
+        }
         const op_lhs: PredicateOp = switch (p.cur.tag) {
             .eq => .eq,
             .neq => .neq,
@@ -323,22 +347,25 @@ fn isPredicateEnd(tag: anytype) bool {
     };
 }
 
+/// Consumes `IS [NOT] NULL` and returns whether NOT was present.
+fn parseIsNullTail(p: anytype) @TypeOf(p.*).Err!bool {
+    const PE = @TypeOf(p.*).Err;
+    try p.expect(.kw_is);
+    const negated = p.cur.tag == .kw_not;
+    if (negated) try p.advance();
+    if (p.cur.tag != .kw_null) return PE.SqlExpectedNull;
+    try p.advance();
+    return negated;
+}
+
 /// The operator tail shared by every LHS that resolves to a column name —
 /// plain columns, hidden computed columns, hidden window/aggregate outputs:
 /// IS [NOT] NULL, [NOT] BETWEEN, [NOT] LIKE, [NOT] IN, comparisons.
 fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
 
-    // IS NULL / IS NOT NULL.
     if (p.cur.tag == .kw_is) {
-        try p.advance();
-        var negated = false;
-        if (p.cur.tag == .kw_not) {
-            negated = true;
-            try p.advance();
-        }
-        if (p.cur.tag != .kw_null) return PE.SqlExpectedNull;
-        try p.advance();
+        const negated = try parseIsNullTail(p);
         return if (negated) .{ .is_not_null = col_dup } else .{ .is_null = col_dup };
     }
 
