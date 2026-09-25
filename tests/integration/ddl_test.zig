@@ -248,6 +248,74 @@ test "alterTable: add column fills existing rows with default" {
     try std.testing.expectEqual(@as(usize, 2), saw);
 }
 
+const IdQty = struct { id: i64, qty: i32 };
+
+fn expectLiveRows(allocator: std.mem.Allocator, t: *thindb.Table, expected: []const IdQty) !void {
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var rows: std.ArrayList(IdQty) = .empty;
+    defer rows.deinit(allocator);
+    const id_idx = t.schema.columnIndex("id").?;
+    const qty_idx = t.schema.columnIndex("qty").?;
+    while (try q.next()) |batch| {
+        for (batch.values[id_idx].data.bigint, batch.values[qty_idx].data.int) |id, qty| {
+            try rows.append(allocator, .{ .id = id, .qty = qty });
+        }
+    }
+    std.sort.pdq(IdQty, rows.items, {}, struct {
+        fn lessThan(_: void, a: IdQty, b: IdQty) bool {
+            return a.id < b.id;
+        }
+    }.lessThan);
+    try std.testing.expectEqualSlices(IdQty, expected, rows.items);
+}
+
+test "alterTable: deletes, replaced rows and key filters survive the rewrite" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const expected = [_]IdQty{
+        .{ .id = 1, .qty = 10 },
+        .{ .id = 3, .qty = 300 },
+        .{ .id = 4, .qty = 40 },
+        .{ .id = 6, .qty = 60 },
+    };
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("orders", schema_v1, opts_v1);
+        // Two row groups (row_group_size 4), so the deletes land in both.
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+            .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
+            .{ .id = @as(i64, 3), .qty = @as(i32, 30), .active = true, .tag = "c" },
+            .{ .id = @as(i64, 4), .qty = @as(i32, 40), .active = true, .tag = "d" },
+            .{ .id = @as(i64, 5), .qty = @as(i32, 50), .active = true, .tag = "e" },
+            .{ .id = @as(i64, 6), .qty = @as(i32, 60), .active = true, .tag = "f" },
+        });
+        try t.flush();
+        _ = try t.delete(.{ .col = "id", .op = .eq, .val = .{ .bigint = 2 } });
+        _ = try t.delete(.{ .col = "id", .op = .eq, .val = .{ .bigint = 5 } });
+        // An upsert tombstones the flushed copy of its key.
+        try t.insert(&.{.{ .id = @as(i64, 3), .qty = @as(i32, 300), .active = true, .tag = "c" }});
+        try t.flush();
+        try expectLiveRows(allocator, t, &expected);
+
+        try db.alterTable("orders", &.{
+            .{ .add = .{ .name = "priority", .type = .int, .default = .{ .int = 7 } } },
+        });
+        try expectLiveRows(allocator, t, &expected);
+        for (t.manifest.segments.items) |entry| try std.testing.expect(entry.key_bloom.len > 0);
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try expectLiveRows(allocator, try db.openTable("orders", .{}), &expected);
+}
+
 test "alterTable: rejects dropping a column in the order key" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

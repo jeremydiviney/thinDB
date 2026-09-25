@@ -1100,11 +1100,11 @@ pub const Table = struct {
     }
 
     /// Attach persisted key-Bloom sidecars (#140) to the in-memory manifest
-    /// entries. Called once at open; flush/compaction attach the blooms of
-    /// segments they create directly. Best-effort: a missing or torn sidecar
+    /// entries. Called at open and after ALTER reloads the manifest;
+    /// flush/compaction attach the blooms of segments they create directly. Best-effort: a missing or torn sidecar
     /// (crash between segment write and sidecar write) just means no probe
     /// pruning for that segment.
-    fn loadKeyBloomSidecars(self: *Table) void {
+    pub fn loadKeyBloomSidecars(self: *Table) void {
         if (!self.schema.unique) return;
         for (self.manifest.segments.items) |*entry| {
             var buf: [32]u8 = undefined;
