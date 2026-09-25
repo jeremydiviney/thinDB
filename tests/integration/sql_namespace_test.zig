@@ -224,6 +224,33 @@ test "sql namespace: USE schema shifts subsequent unqualified queries" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 100, 200 }, ids);
 }
 
+test "sql namespace: USE db opens the database's default schema (#83)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var create_q = try runSql(allocator, db, "CREATE DATABASE warehouse");
+    defer create_q.deinit();
+    const tw = try db.owned_catalog.?.database("warehouse").?.table("t", schema_t, opts_t);
+    try tw.insert(&.{.{ .id = @as(i64, 9), .qty = @as(i32, 1) }});
+    try tw.flush();
+
+    var use_q = try runSql(allocator, db, "USE warehouse");
+    defer use_q.deinit();
+    const post_session = use_q.cq.sessionValue();
+    try std.testing.expectEqualStrings("warehouse", post_session.current_db);
+    try std.testing.expectEqualStrings("public", post_session.current_schema);
+
+    var q = try runSqlSession(allocator, db, post_session, "SELECT id FROM t");
+    defer q.deinit();
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{9}, ids);
+}
+
 test "sql namespace: USE db.schema shifts both" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -448,7 +475,7 @@ test "sql namespace: USE nonexistent db errors" {
     try std.testing.expectError(thindb.net.Error.DatabaseNotFound, thindb.net.compile(allocator, db, root));
 }
 
-test "sql namespace: USE nonexistent schema errors" {
+test "sql namespace: USE of a name that is neither schema nor database is an unknown database" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -459,5 +486,19 @@ test "sql namespace: USE nonexistent schema errors" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = try thindb.sql.parse(arena.allocator(), "USE ghost");
+    try std.testing.expectError(thindb.net.Error.DatabaseNotFound, thindb.net.compile(allocator, db, root));
+}
+
+test "sql namespace: USE nonexistent schema of a known db errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = try thindb.sql.parse(arena.allocator(), "USE main__ghost");
     try std.testing.expectError(thindb.net.Error.SchemaNotFound, thindb.net.compile(allocator, db, root));
 }
