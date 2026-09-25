@@ -25,12 +25,12 @@
 //!     bounded to `dop` batches.
 //! Both emit in worker/slice order, so results are reproducible for a given
 //! `dop` (DOP=1 is the canonical serial result). Per-query parallelism is capped
-//! by `max_dop`; the process-global CoreScheduler (util/core_scheduler.zig) then
-//! throttles globally — each worker leases (and pins to) a physical core for its
-//! run and blocks when the machine is saturated, so concurrent queries share
-//! cores instead of oversubscribing, and the lease bucket doubles as admission
-//! control. Pinning recovers the ~40% scaling the OS scheduler loses by parking
-//! two of our threads on one core's SMT siblings while another core idles.
+//! by `max_dop`; each worker then leases (and pins to) a free physical core from
+//! the process-global CoreScheduler (util/core_scheduler.zig), running unpinned
+//! when the machine is saturated rather than waiting — its statement already
+//! holds the admission lease the connection thread took. Pinning recovers the
+//! ~40% scaling the OS scheduler loses by parking two of our threads on one
+//! core's SMT siblings while another core idles.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -786,9 +786,9 @@ pub const ParallelScan = struct {
     ) !Query {
         const statement_lease = if (table.statement_gate) |gate| try gate.acquire(false) else null;
         errdefer if (statement_lease) |lease| lease.release();
-        // Spawn up to `max_dop` workers; the CoreScheduler throttles at run time
-        // (each worker leases+pins a core, blocking when the machine is full), so
-        // there's no up-front global slot budget to negotiate here.
+        // Spawn up to `max_dop` workers; each pins to a free core at run time
+        // (see `stealLoop`), so there's no up-front global slot budget to
+        // negotiate here.
         const dop = @max(@as(usize, 1), max_dop);
 
         const t_lock = exec.prof.nowTicks();
@@ -2295,11 +2295,13 @@ fn roundWorker(self: *ParallelScan) void {
 /// passes the chunk count. `drainables` is `[]Query` (compute-fused) or `[]*Scan`
 /// (bare); monomorphized per call site.
 fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
-    // Lease a core only AFTER claiming the first chunk: a worker that loses the
-    // race for every chunk (all drained by faster peers) never blocks on the
-    // scheduler and never stalls the join. A worker already holding a core (the
-    // inline calling thread carrying a serial-stage lease) reuses it — the
-    // scheduler's no-hold-and-wait guard returns a non-owning lease.
+    // Pin to a free core when there is one, never wait for one: this worker's
+    // statement already holds a core on its calling thread, which joins this
+    // worker, so a worker waiting on a saturated machine is hold-and-wait at
+    // the statement level. With every slot held by statements joining such
+    // workers, nothing ever frees. The calling thread's statement lease is the
+    // admission control. Pin only after claiming a chunk, so a worker that
+    // loses every claim to faster peers never takes a slot.
     const sched = core_scheduler.global();
     var lease: core_scheduler.Lease = undefined;
     var leased = false;
@@ -2308,7 +2310,7 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
         const i = self.next_chunk.fetchAdd(1, .monotonic);
         if (i >= drainables.len) break;
         if (!leased) {
-            lease = sched.acquire();
+            lease = sched.tryAcquire();
             leased = true;
         }
         // With a composed probe+aggregate fusion, the probing happens inside
