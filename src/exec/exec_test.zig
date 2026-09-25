@@ -10,6 +10,7 @@ const leafExpr = exec.leafExpr;
 
 const types = @import("../types.zig");
 const api = @import("../api/api.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 
 test "pipeline stats propagate through scan, filter, limit, project, sort" {
     const allocator = std.testing.allocator;
@@ -1251,6 +1252,116 @@ test "parallel scan matches serial across DOP levels (with fused filter)" {
             try std.testing.expectEqualSlices(i64, a, b);
         }
     }
+}
+
+const SlotHolder = struct {
+    sched: *core_scheduler.CoreScheduler,
+    release: *std.atomic.Value(bool),
+    reported: *std.atomic.Value(usize),
+    io: std.Io,
+
+    fn run(self: SlotHolder) void {
+        var lease = self.sched.tryAcquire();
+        defer lease.release();
+        _ = self.reported.fetchAdd(1, .release);
+        if (!lease.owns) return;
+        while (!self.release.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch {};
+    }
+};
+
+const Watchdog = struct {
+    release: *std.atomic.Value(bool),
+    io: std.Io,
+    done: std.atomic.Value(bool) = .init(false),
+    fired: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Watchdog) void {
+        var waited_ms: u32 = 0;
+        while (!self.done.load(.acquire)) : (waited_ms += 1) {
+            if (waited_ms == 5000) {
+                self.fired.store(true, .release);
+                self.release.store(true, .release);
+                return;
+            }
+            std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch {};
+        }
+    }
+};
+
+test "a parallel scan finishes while every other core slot is leased" {
+    // The other slots belong to threads waiting on something else, as other
+    // statements' connection threads do while they join their own workers. A
+    // worker that blocks for a slot while its statement's calling thread holds
+    // one never finishes, and neither does this scan's join.
+    const sched = core_scheduler.global();
+    if (sched.disabled or sched.capacity() == 0) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 1024,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 1024 });
+
+    // Chunks heavy enough that the spawned workers claim some before the
+    // calling thread has drained them all.
+    var next_id: i64 = 0;
+    for (0..16) |_| {
+        for (0..8) |_| {
+            var rows: [1024]struct { id: i64, v: i32 } = undefined;
+            for (&rows) |*r| {
+                r.id = next_id;
+                r.v = @intCast(@mod(next_id, 7));
+                next_id += 1;
+            }
+            try t.insert(&rows);
+        }
+        try t.flush();
+    }
+
+    var own = sched.acquire();
+    defer own.release();
+    var release = std.atomic.Value(bool).init(false);
+    var reported = std.atomic.Value(usize).init(0);
+    const holders = try allocator.alloc(std.Thread, sched.capacity());
+    defer allocator.free(holders);
+    var spawned: usize = 0;
+    defer {
+        release.store(true, .release);
+        for (holders[0..spawned]) |h| h.join();
+    }
+    for (holders) |*h| {
+        h.* = try std.Thread.spawn(.{}, SlotHolder.run, .{SlotHolder{ .sched = sched, .release = &release, .reported = &reported, .io = io }});
+        spawned += 1;
+    }
+    while (reported.load(.acquire) < spawned) std.Thread.yield() catch {};
+
+    var watchdog: Watchdog = .{ .release = &release, .io = io };
+    const watch = try std.Thread.spawn(.{}, Watchdog.run, .{&watchdog});
+    var rows: usize = 0;
+    {
+        // A fused filter routes the scan through its work-stealing drain.
+        var base = try exec.ParallelScan.create(allocator, t, null, null, 4);
+        var q = try base.filter(leafExpr("v", .gte, .{ .int = 1 }));
+        defer q.deinit();
+        while (try q.next()) |b| rows += b.row_count;
+    }
+    watchdog.done.store(true, .release);
+    watch.join();
+
+    try std.testing.expect(!watchdog.fired.load(.acquire));
+    const total_rows = 16 * 8 * 1024;
+    try std.testing.expectEqual(@as(usize, total_rows - (total_rows + 6) / 7), rows);
 }
 
 test "parallel scan matches serial — byte-skewed string row groups" {

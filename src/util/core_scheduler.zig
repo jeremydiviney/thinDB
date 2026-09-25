@@ -12,12 +12,14 @@
 //! concurrent queries from both pinning to the same cores. (The one legitimate
 //! process singleton; holds no per-Database logical state.)
 //!
-//! Deadlock-freedom rests on one invariant: **a thread that already holds a
-//! core never blocks for another** — if it needs one and none is free it runs
-//! unpinned. That makes hold-and-wait impossible to express, so the blocking
-//! wait can never form a cycle. Only fresh, core-less work ever waits; anything
-//! already holding a core only ever releases. No starvation deadlock: a freed
-//! slot is always eventually seen by a waiter's re-poll.
+//! Deadlock-freedom rests on one invariant: **work that already holds a core
+//! never blocks for another** — if it needs one and none is free it runs
+//! unpinned. "Work" is the statement, not the thread: a statement's worker
+//! threads are joined by its calling thread, which holds the admission lease,
+//! so they take `tryAcquire`, never `acquire`. Blocking `acquire` is for
+//! admitting a fresh statement only. That makes hold-and-wait impossible to
+//! express, so the blocking wait can never form a cycle. No starvation
+//! deadlock: a freed slot is always eventually seen by a waiter's re-poll.
 //!
 //! Sync primitives: this Zig fork stripped std.Thread.{Mutex,Condition,sleep};
 //! Io.Mutex needs an Io + an Io task, which raw worker threads aren't. So we use
