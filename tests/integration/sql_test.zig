@@ -3573,6 +3573,37 @@ test "sql: CAST AS SIGNED / UNSIGNED are MySQL spellings of a 64-bit cast" {
     try std.testing.expectEqual(@as(usize, 1), r.row_count);
 }
 
+test "sql: a CAST around aggregate arithmetic casts the whole expression" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // SUM(qty) over t is 150.
+    const cases = .{
+        .{ .sql = "SELECT CAST(SUM(qty) / 100.0 AS decimal(18,2)) AS a FROM t", .raw = 150 },
+        .{ .sql = "SELECT CAST(SUM(qty) AS DECIMAL(18,2)) AS a FROM t", .raw = 15000 },
+        .{ .sql = "SELECT CAST(SUM(qty) + 5 AS DECIMAL(18,2)) AS a FROM t", .raw = 15500 },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        const spec = q.outputSchema()[0].type.decimalSpec() orelse return error.TestExpectedDecimal;
+        try std.testing.expectEqual(@as(u8, 2), spec.s);
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(@as(i64, c.raw), b.values[0].data.decimal64[0]);
+    }
+
+    const grouped = try helpers.collectBigints(allocator, db,
+        \\SELECT CAST(COUNT(*) * 10 + SUM(qty) AS BIGINT) AS a FROM t GROUP BY k ORDER BY k
+    );
+    defer allocator.free(grouped);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 50, 90, 60 }, grouped);
+}
+
 test "sql: a repeated projection name becomes name_N, as DuckDB names it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
