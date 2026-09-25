@@ -43,6 +43,7 @@ pub fn mapInternal(err: anyerror) Mapped {
         .column_not_found => .{ .sqlstate = "42703".*, .message = "column does not exist" },
         .ambiguous_column => .{ .sqlstate = "42702".*, .message = "column reference is ambiguous" },
         .query_cancelled => .{ .sqlstate = "57014".*, .message = "canceling statement due to user request" },
+        .numeric_out_of_range => .{ .sqlstate = "22003".*, .message = "numeric value out of range" },
         .unknown => .{ .sqlstate = "42000".*, .message = name },
     };
 }

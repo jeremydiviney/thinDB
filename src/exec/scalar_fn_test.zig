@@ -217,3 +217,22 @@ test "scalar_fn: nameResolvable covers builtins and decimal-only names" {
     try std.testing.expect(scalar_fn.nameResolvable(null, "to_decimal:10:2"));
     try std.testing.expect(!scalar_fn.nameResolvable(null, "definitely_not_a_function"));
 }
+
+test "scalar_fn: integer arithmetic raises on an overflowing row, never under a NULL" {
+    const allocator = std.testing.allocator;
+    const math = @import("scalar_fn_math.zig");
+    const ColumnView = @import("../storage/storage.zig").ColumnView;
+    var out = try @import("../engine/store.zig").ColumnStore.init(allocator, .int, true);
+    defer out.deinit(allocator);
+
+    const lhs = [_]i32{ 1, std.math.maxInt(i32), 3 };
+    const rhs = [_]i32{ 1, 1, 1 };
+    const row_1_null = [_]u8{0b101};
+    const masked = [_]ColumnView{ .{ .data = .{ .int = &lhs }, .nulls = &row_1_null }, .{ .data = .{ .int = &rhs } } };
+    try math.addIntKernel(allocator, &masked, &out, lhs.len);
+    try std.testing.expectEqualSlices(i32, &.{ 2, 0, 4 }, out.data.int.items);
+
+    out.clear();
+    const real = [_]ColumnView{ .{ .data = .{ .int = &lhs } }, .{ .data = .{ .int = &rhs } } };
+    try std.testing.expectError(error.ArithmeticOverflow, math.addIntKernel(allocator, &real, &out, lhs.len));
+}

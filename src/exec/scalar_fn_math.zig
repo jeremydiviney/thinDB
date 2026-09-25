@@ -23,9 +23,10 @@ pub fn absIntKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     const s = args[0].data.int;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        // INT_MIN's abs overflows; saturate to INT_MAX to avoid trap.
-        const v = s[i];
-        const r: i32 = if (v == std.math.minInt(i32)) std.math.maxInt(i32) else if (v < 0) -v else v;
+        const r = std.math.cast(i32, @abs(s[i])) orelse blk: {
+            try overflowOnRow(args, i);
+            break :blk 0;
+        };
         try out.data.int.append(allocator, r);
     }
 }
@@ -34,8 +35,10 @@ pub fn absBigintKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     const s = args[0].data.bigint;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const v = s[i];
-        const r: i64 = if (v == std.math.minInt(i64)) std.math.maxInt(i64) else if (v < 0) -v else v;
+        const r = std.math.cast(i64, @abs(s[i])) orelse blk: {
+            try overflowOnRow(args, i);
+            break :blk 0;
+        };
         try out.data.bigint.append(allocator, r);
     }
 }
@@ -75,27 +78,31 @@ pub fn signKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
 }
 
 // ---------------------------------------------------------------------------
-// Binary arithmetic (+, -, *, /) — kernel implementations.
-// All wrapping for integer types matches the column's declared width
-// (i32/i64). Division by zero on integer kernels returns 0 (same
-// convention as MOD above); on double-typed kernels Zig propagates
-// IEEE NaN/inf naturally.
+// Binary arithmetic (+, -, *, /, DIV, MOD) — kernel implementations.
+// Integer results keep the operands' declared width and raise
+// `ArithmeticOverflow` instead of wrapping (DESIGN.md §3.4). Division by zero
+// on integer kernels returns 0 (same convention as MOD); on double-typed
+// kernels Zig propagates IEEE NaN/inf naturally.
 // ---------------------------------------------------------------------------
 
-// Reserve `n` elements of an unmanaged int/bigint/double list and return the
+fn intField(comptime T: type) []const u8 {
+    return switch (T) {
+        i32 => "int",
+        i64 => "bigint",
+        i128 => "largeint",
+        else => @compileError("no integer column type for " ++ @typeName(T)),
+    };
+}
+
+// Reserve `n` elements of an unmanaged output list and return the
 // freshly-exposed tail slice for a vectorized write. The output list is
 // cleared before each kernel call, so this appends `n` new values.
-fn reserveInt(allocator: Allocator, out: *ColumnStore, n: usize) ![]i32 {
-    try out.data.int.ensureUnusedCapacity(allocator, n);
-    const base = out.data.int.items.len;
-    out.data.int.items.len = base + n;
-    return out.data.int.items[base..];
-}
-fn reserveBigint(allocator: Allocator, out: *ColumnStore, n: usize) ![]i64 {
-    try out.data.bigint.ensureUnusedCapacity(allocator, n);
-    const base = out.data.bigint.items.len;
-    out.data.bigint.items.len = base + n;
-    return out.data.bigint.items[base..];
+fn reserveInts(comptime T: type, allocator: Allocator, out: *ColumnStore, n: usize) ![]T {
+    const list = &@field(out.data, intField(T));
+    try list.ensureUnusedCapacity(allocator, n);
+    const base = list.items.len;
+    list.items.len = base + n;
+    return list.items[base..];
 }
 fn reserveDouble(allocator: Allocator, out: *ColumnStore, n: usize) ![]f64 {
     try out.data.double.ensureUnusedCapacity(allocator, n);
@@ -104,45 +111,71 @@ fn reserveDouble(allocator: Allocator, out: *ColumnStore, n: usize) ![]f64 {
     return out.data.double.items[base..];
 }
 
+/// A NULL row's operands are garbage, so an overflow there is not an error:
+/// the caller stores 0 and the validity bitmap discards it.
+fn overflowOnRow(args: []const ColumnView, row: usize) error{ArithmeticOverflow}!void {
+    for (args) |arg| if (!arg.isValid(row)) return;
+    return error.ArithmeticOverflow;
+}
+
+fn checkedIntArith(comptime T: type, comptime op: simd.BinOp, allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = @field(args[0].data, intField(T))[0..row_count];
+    const b = @field(args[1].data, intField(T))[0..row_count];
+    const dst = try reserveInts(T, allocator, out, row_count);
+    if (!simd.binInto(T, op, a, b, dst)) return;
+    for (a, b, dst, 0..) |x, y, *d, row| {
+        if (simd.intOpWithOverflow(op, x, y)[1] == 0) continue;
+        try overflowOnRow(args, row);
+        d.* = 0;
+    }
+}
+
 pub fn addIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(i32, .add, args[0].data.int[0..row_count], args[1].data.int[0..row_count], try reserveInt(allocator, out, row_count));
+    try checkedIntArith(i32, .add, allocator, args, out, row_count);
 }
 
 pub fn addBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(i64, .add, args[0].data.bigint[0..row_count], args[1].data.bigint[0..row_count], try reserveBigint(allocator, out, row_count));
+    try checkedIntArith(i64, .add, allocator, args, out, row_count);
+}
+
+pub fn addLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try checkedIntArith(i128, .add, allocator, args, out, row_count);
 }
 
 pub fn addDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(f64, .add, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
+    _ = simd.binInto(f64, .add, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
 }
 
-// i128 (LARGEINT) arithmetic. Wrapping like the narrower int kernels — the
-// affine-aggregate reduction (`local.zig`) is the only producer and proves
-// the affine transform stays in range, so the i128 result equals the direct
-// `SUM(a·col+b)` accumulator exactly. Scalar loops (no SIMD) since i128 lanes
-// aren't a vector win.
-pub fn addLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.largeint;
-    const b = args[1].data.largeint;
-    try out.data.largeint.ensureUnusedCapacity(allocator, row_count);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) out.data.largeint.appendAssumeCapacity(a[i] +% b[i]);
+pub fn subIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try checkedIntArith(i32, .sub, allocator, args, out, row_count);
+}
+
+pub fn subBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try checkedIntArith(i64, .sub, allocator, args, out, row_count);
 }
 
 pub fn subLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.largeint;
-    const b = args[1].data.largeint;
-    try out.data.largeint.ensureUnusedCapacity(allocator, row_count);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) out.data.largeint.appendAssumeCapacity(a[i] -% b[i]);
+    try checkedIntArith(i128, .sub, allocator, args, out, row_count);
+}
+
+pub fn subDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    _ = simd.binInto(f64, .sub, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
+}
+
+pub fn mulIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try checkedIntArith(i32, .mul, allocator, args, out, row_count);
+}
+
+pub fn mulBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try checkedIntArith(i64, .mul, allocator, args, out, row_count);
 }
 
 pub fn mulLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.largeint;
-    const b = args[1].data.largeint;
-    try out.data.largeint.ensureUnusedCapacity(allocator, row_count);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) out.data.largeint.appendAssumeCapacity(a[i] *% b[i]);
+    try checkedIntArith(i128, .mul, allocator, args, out, row_count);
+}
+
+pub fn mulDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    _ = simd.binInto(f64, .mul, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
 }
 
 /// Checked i128 → i64 narrow used by the affine-aggregate reduction to
@@ -162,48 +195,25 @@ pub fn narrowBigintKernel(allocator: Allocator, args: []const ColumnView, out: *
     }
 }
 
-pub fn subIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(i32, .sub, args[0].data.int[0..row_count], args[1].data.int[0..row_count], try reserveInt(allocator, out, row_count));
-}
-
-pub fn subBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(i64, .sub, args[0].data.bigint[0..row_count], args[1].data.bigint[0..row_count], try reserveBigint(allocator, out, row_count));
-}
-
-pub fn subDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(f64, .sub, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
-}
-
-pub fn mulIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(i32, .mul, args[0].data.int[0..row_count], args[1].data.int[0..row_count], try reserveInt(allocator, out, row_count));
-}
-
-pub fn mulBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(i64, .mul, args[0].data.bigint[0..row_count], args[1].data.bigint[0..row_count], try reserveBigint(allocator, out, row_count));
-}
-
-pub fn mulDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    simd.binInto(f64, .mul, args[0].data.double[0..row_count], args[1].data.double[0..row_count], try reserveDouble(allocator, out, row_count));
+fn truncatingIntDiv(comptime T: type, allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = @field(args[0].data, intField(T));
+    const b = @field(args[1].data, intField(T));
+    const dst = try reserveInts(T, allocator, out, row_count);
+    for (dst, 0..) |*d, row| {
+        // minInt DIV -1 is the one quotient that overflows; x86 `idiv` traps on it.
+        d.* = if (b[row] == 0) 0 else std.math.divTrunc(T, a[row], b[row]) catch blk: {
+            try overflowOnRow(args, row);
+            break :blk 0;
+        };
+    }
 }
 
 pub fn divIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.int;
-    const b = args[1].data.int;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const r: i32 = if (b[i] == 0) 0 else @divTrunc(a[i], b[i]);
-        try out.data.int.append(allocator, r);
-    }
+    try truncatingIntDiv(i32, allocator, args, out, row_count);
 }
 
 pub fn divBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.bigint;
-    const b = args[1].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const r: i64 = if (b[i] == 0) 0 else @divTrunc(a[i], b[i]);
-        try out.data.bigint.append(allocator, r);
-    }
+    try truncatingIntDiv(i64, allocator, args, out, row_count);
 }
 
 pub fn divDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -213,6 +223,9 @@ pub fn divDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] / b[i]);
 }
 
+// A remainder by -1 is always 0, and computing minInt's traps x86 `idiv`, so
+// the integer MOD/PMOD kernels answer it without dividing.
+
 pub fn modIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0].data.int;
     const b = args[1].data.int;
@@ -220,7 +233,7 @@ pub fn modIntKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     while (i < row_count) : (i += 1) {
         // MySQL convention: MOD by 0 returns 0 (we don't surface NULL on
         // the propagates path without going kernel_managed).
-        const r: i32 = if (b[i] == 0) 0 else @rem(a[i], b[i]);
+        const r: i32 = if (b[i] == 0 or b[i] == -1) 0 else @rem(a[i], b[i]);
         try out.data.int.append(allocator, r);
     }
 }
@@ -230,7 +243,7 @@ pub fn modBigintKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     const b = args[1].data.bigint;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const r: i64 = if (b[i] == 0) 0 else @rem(a[i], b[i]);
+        const r: i64 = if (b[i] == 0 or b[i] == -1) 0 else @rem(a[i], b[i]);
         try out.data.bigint.append(allocator, r);
     }
 }
@@ -423,7 +436,7 @@ pub fn pmodIntKernel(allocator: Allocator, args: []const ColumnView, out: *Colum
     const b = args[1].data.int;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const r: i32 = if (b[i] == 0) 0 else @mod(a[i], b[i]);
+        const r: i32 = if (b[i] == 0 or b[i] == -1) 0 else @mod(a[i], b[i]);
         try out.data.int.append(allocator, r);
     }
 }
@@ -433,7 +446,7 @@ pub fn pmodBigintKernel(allocator: Allocator, args: []const ColumnView, out: *Co
     const b = args[1].data.bigint;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const r: i64 = if (b[i] == 0) 0 else @mod(a[i], b[i]);
+        const r: i64 = if (b[i] == 0 or b[i] == -1) 0 else @mod(a[i], b[i]);
         try out.data.bigint.append(allocator, r);
     }
 }
