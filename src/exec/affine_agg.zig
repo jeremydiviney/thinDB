@@ -14,14 +14,16 @@
 //!
 //! ## Overflow fidelity (SUM)
 //! The direct path computes `Σ(a·col+b)` by accumulating each per-row
-//! `a·col+b` (which may itself WRAP its argument arithmetic type) in i128,
-//! narrowing once at the i64 output. The reduction is bit-identical only when:
+//! `a·col+b` in i128, narrowing once at the i64 output; a row whose `a·col+b`
+//! overflows its argument arithmetic type raises `ArithmeticOverflow`. The
+//! reduction matches it exactly only when:
 //!   1. The base SUM is pinned to LARGEINT (i128) via `out_type_override`, so it
 //!      never narrows mid-flight, and
-//!   2. `a·col+b` provably cannot wrap its arg arithmetic type for ANY value in
-//!      the base column's declared range (`affineNoWrap`), so `Σ(a·col+b) =
-//!      a·Σcol + b·n` holds exactly in i128. The derivation runs in i128 and
-//!      narrows with `__narrow_bigint`, whose range check matches SUM finalize.
+//!   2. `a·col+b` provably cannot overflow its arg arithmetic type for ANY value
+//!      in the base column's declared range (`affineCannotOverflow`), so the
+//!      direct path never raises and `Σ(a·col+b) = a·Σcol + b·n` holds exactly
+//!      in i128. The derivation runs in i128 and narrows with
+//!      `__narrow_bigint`, whose range check matches SUM finalize.
 //! Any aggregate failing the guard is left direct.
 
 const std = @import("std");
@@ -39,15 +41,15 @@ const Expr = ir.Expr;
 
 /// One base column's affine decomposition: `value = a·col + b` over the named
 /// base column. For a plain `col` reference a=1, b=0 and `arg_type` is null (no
-/// wrapping arg).
+/// arithmetic).
 pub const AffineArg = struct {
     base_col: []const u8,
     a: i128,
     b: i128,
     /// Declared type of the base column (for the overflow bound on SUM).
     base_type: types.Type,
-    /// Arithmetic type the direct `a·col+b` would evaluate (and wrap) in; null
-    /// when the arg is a plain column (no intermediate arithmetic).
+    /// Arithmetic type the direct `a·col+b` would evaluate (and overflow) in;
+    /// null when the arg is a plain column (no intermediate arithmetic).
     arg_type: ?types.Type,
 };
 
@@ -182,9 +184,9 @@ pub fn affineDecompose(aa: Allocator, up_schema: []const types.Column, e: Expr) 
 }
 
 /// True when `a·col+b` provably stays inside `arg_type` for every `col` in
-/// `base_type`'s declared range — so the direct path's wrapping arithmetic never
+/// `base_type`'s declared range — so the direct path's overflow check never
 /// fires and `Σ(a·col+b) == a·Σcol + b·n` exactly in i128.
-pub fn affineNoWrap(arg: AffineArg) bool {
+pub fn affineCannotOverflow(arg: AffineArg) bool {
     const at = arg.arg_type orelse return true; // plain col: no arithmetic
     const lo_base = typeMinI128(arg.base_type) orelse return false;
     const hi_base = typeMaxI128(arg.base_type) orelse return false;
@@ -371,9 +373,9 @@ pub fn reduce(
         if (family == .sum) {
             // Integer SUM only; float/decimal SUM scale handling stays direct.
             if (!aff.base_type.isInteger() and aff.base_type != .boolean) continue;
-            if (!affineNoWrap(aff)) continue;
+            if (!affineCannotOverflow(aff)) continue;
         } else {
-            if (!affineNoWrap(aff)) continue;
+            if (!affineCannotOverflow(aff)) continue;
         }
 
         const base_idx = types.findColumn(up_schema, aff.base_col) orelse continue;
@@ -541,7 +543,7 @@ test "affineDecompose recognizes col, col+k, k-col, c*col" {
 test "reduce collapses SUM(x), SUM(x+1), SUM(x+2) to one base set" {
     // smallint base: x+k widens to int and provably can't overflow, so the
     // overflow guard admits the reduction (an int base would decline x+k — it
-    // can wrap — which is the correct, fidelity-preserving behavior).
+    // can overflow — which is the correct, fidelity-preserving behavior).
     const cols = [_]types.Column{.{ .name = "x", .type = .smallint, .nullable = false }};
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();

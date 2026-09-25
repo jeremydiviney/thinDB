@@ -116,47 +116,62 @@ pub fn compareInto(comptime T: type, comptime op: CmpOp, data: []const T, want: 
 
 pub const BinOp = enum { add, sub, mul };
 
+/// `a <op> b` with the overflow bit, for an integer scalar or vector.
+pub inline fn intOpWithOverflow(comptime op: BinOp, a: anytype, b: @TypeOf(a)) @TypeOf(@addWithOverflow(a, b)) {
+    return switch (op) {
+        .add => @addWithOverflow(a, b),
+        .sub => @subWithOverflow(a, b),
+        .mul => @mulWithOverflow(a, b),
+    };
+}
+
+inline fn floatOp(comptime op: BinOp, a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    return switch (op) {
+        .add => a + b,
+        .sub => a - b,
+        .mul => a * b,
+    };
+}
+
 /// Elementwise `dst[i] = a[i] <op> b[i]` over equal-length slices, vectorized.
-/// Integer ops wrap (matching the scalar `+%`/`-%`/`*%` kernels); float ops are
-/// plain IEEE. `dst` must already be sized to `a.len`.
-pub fn binInto(comptime T: type, comptime op: BinOp, a: []const T, b: []const T, dst: []T) void {
+/// An integer lane that overflows `T` keeps its wrapped value, and the call
+/// returns true so the caller can decide per row whether that is an error.
+/// Float ops are plain IEEE and never report overflow. `dst` must already be
+/// sized to `a.len`.
+pub fn binInto(comptime T: type, comptime op: BinOp, a: []const T, b: []const T, dst: []T) bool {
     std.debug.assert(a.len == b.len and a.len == dst.len);
     const is_int = @typeInfo(T) == .int;
     const N = comptime lanes(T);
+    var overflowed = false;
     var i: usize = 0;
     if (N > 1) {
+        var lane_overflow: @Vector(N, u1) = @splat(0);
         while (i + N <= dst.len) : (i += N) {
             const va: @Vector(N, T) = a[i..][0..N].*;
             const vb: @Vector(N, T) = b[i..][0..N].*;
-            const vr: @Vector(N, T) = if (is_int) switch (op) {
-                .add => va +% vb,
-                .sub => va -% vb,
-                .mul => va *% vb,
-            } else switch (op) {
-                .add => va + vb,
-                .sub => va - vb,
-                .mul => va * vb,
-            };
-            dst[i..][0..N].* = vr;
+            if (is_int) {
+                const r = intOpWithOverflow(op, va, vb);
+                dst[i..][0..N].* = r[0];
+                lane_overflow |= r[1];
+            } else dst[i..][0..N].* = floatOp(op, va, vb);
         }
+        overflowed = @reduce(.Or, lane_overflow) != 0;
     }
     while (i < dst.len) : (i += 1) {
-        dst[i] = if (is_int) switch (op) {
-            .add => a[i] +% b[i],
-            .sub => a[i] -% b[i],
-            .mul => a[i] *% b[i],
-        } else switch (op) {
-            .add => a[i] + b[i],
-            .sub => a[i] - b[i],
-            .mul => a[i] * b[i],
-        };
+        if (is_int) {
+            const r = intOpWithOverflow(op, a[i], b[i]);
+            dst[i] = r[0];
+            overflowed = overflowed or r[1] != 0;
+        } else dst[i] = floatOp(op, a[i], b[i]);
     }
+    return overflowed;
 }
 
 /// Fused `dst[i] = widen(src[i]) <op> scalar` (or `scalar <op> widen(src[i])`
 /// when `col_left` is false), in one vectorized pass. `Tsrc` widens to `Tout`
-/// (same kind: int→int or float→float); integer ops wrap. Lets `col + const`
-/// skip both the smallint→int cast column and the replicated-literal column.
+/// (same kind: int→int or float→float). Returns whether an integer lane
+/// overflowed `Tout`, as `binInto` does. Lets `col + const` skip both the
+/// smallint→int cast column and the replicated-literal column.
 pub fn scalarOp(
     comptime Tsrc: type,
     comptime Tout: type,
@@ -165,43 +180,39 @@ pub fn scalarOp(
     src: []const Tsrc,
     scalar: Tout,
     dst: []Tout,
-) void {
+) bool {
     std.debug.assert(src.len == dst.len);
     const is_int = @typeInfo(Tout) == .int;
     const N = comptime lanes(Tout);
+    var overflowed = false;
     var i: usize = 0;
     if (N > 1) {
         const sv: @Vector(N, Tout) = @splat(scalar);
+        var lane_overflow: @Vector(N, u1) = @splat(0);
         while (i + N <= dst.len) : (i += N) {
             const chunk: @Vector(N, Tsrc) = src[i..][0..N].*;
             const w = @as(@Vector(N, Tout), chunk);
             const a = if (col_left) w else sv;
             const b = if (col_left) sv else w;
-            dst[i..][0..N].* = if (is_int) switch (op) {
-                .add => a +% b,
-                .sub => a -% b,
-                .mul => a *% b,
-            } else switch (op) {
-                .add => a + b,
-                .sub => a - b,
-                .mul => a * b,
-            };
+            if (is_int) {
+                const r = intOpWithOverflow(op, a, b);
+                dst[i..][0..N].* = r[0];
+                lane_overflow |= r[1];
+            } else dst[i..][0..N].* = floatOp(op, a, b);
         }
+        overflowed = @reduce(.Or, lane_overflow) != 0;
     }
     while (i < dst.len) : (i += 1) {
         const w: Tout = src[i];
         const a = if (col_left) w else scalar;
         const b = if (col_left) scalar else w;
-        dst[i] = if (is_int) switch (op) {
-            .add => a +% b,
-            .sub => a -% b,
-            .mul => a *% b,
-        } else switch (op) {
-            .add => a + b,
-            .sub => a - b,
-            .mul => a * b,
-        };
+        if (is_int) {
+            const r = intOpWithOverflow(op, a, b);
+            dst[i] = r[0];
+            overflowed = overflowed or r[1] != 0;
+        } else dst[i] = floatOp(op, a, b);
     }
+    return overflowed;
 }
 
 test "simd: scalarOp matches widen-then-scalar reference" {
@@ -218,7 +229,7 @@ test "simd: scalarOp matches widen-then-scalar reference" {
                     defer std.testing.allocator.free(dst);
                     for (src, 0..) |*s, idx| s.* = if (@typeInfo(Tsrc) == .float) @floatFromInt(idx % 11) else @intCast(idx % 11);
                     const scalar: Tout = if (@typeInfo(Tout) == .float) 3.0 else 3;
-                    scalarOp(Tsrc, Tout, op, col_left, src, scalar, dst);
+                    try std.testing.expect(!scalarOp(Tsrc, Tout, op, col_left, src, scalar, dst));
                     for (src, dst) |s, d| {
                         const w: Tout = if (@typeInfo(Tout) == .float and @typeInfo(Tsrc) == .float) @floatCast(s) else s;
                         const a = if (col_left) w else scalar;
@@ -286,7 +297,7 @@ test "simd: binInto matches scalar add/sub/mul" {
                     av.* = if (@typeInfo(T) == .float) @floatFromInt(idx % 17) else @intCast(idx % 17);
                     bv.* = if (@typeInfo(T) == .float) @floatFromInt((idx % 5) + 1) else @intCast((idx % 5) + 1);
                 }
-                binInto(T, op, a, b, dst);
+                try std.testing.expect(!binInto(T, op, a, b, dst));
                 for (a, b, dst) |av, bv, dv| {
                     const want: T = if (@typeInfo(T) == .float) switch (op) {
                         .add => av + bv,
@@ -299,6 +310,27 @@ test "simd: binInto matches scalar add/sub/mul" {
                     };
                     try std.testing.expectEqual(want, dv);
                 }
+            }
+        }
+    }
+}
+
+test "simd: binInto and scalarOp report one overflowing lane anywhere in the slice" {
+    const len = 37;
+    inline for (.{ i32, i64 }) |T| {
+        inline for (.{ BinOp.add, BinOp.sub, BinOp.mul }) |op| {
+            const big: T = switch (op) {
+                .add, .mul => std.math.maxInt(T),
+                .sub => std.math.minInt(T),
+            };
+            for ([_]usize{ 0, 5, len - 1 }) |at| {
+                var a = [_]T{1} ** len;
+                const b = [_]T{2} ** len;
+                var dst: [len]T = undefined;
+                a[at] = big;
+                try std.testing.expect(binInto(T, op, &a, &b, &dst));
+                try std.testing.expectEqual(intOpWithOverflow(op, big, @as(T, 2))[0], dst[at]);
+                try std.testing.expect(scalarOp(T, T, op, true, &a, 2, &dst));
             }
         }
     }

@@ -1048,60 +1048,63 @@ pub const Compute = struct {
     /// Evaluate a fused `col <op> const` directly into `out_col` in one
     /// widening SIMD pass — no cast column, no replicated-literal column.
     /// Only built for non-nullable int/float source columns (see tryFuseScalar),
-    /// so there is no validity bitmap to propagate.
+    /// so there is no validity bitmap to propagate and every overflowed lane
+    /// is a real row.
     fn evalFusedScalar(self: *Compute, fs: FusedScalar, in_values: []const ColumnView, out_col: *ColumnStore, n: usize) !void {
         const src = in_values[fs.src_idx];
-        switch (fs.out_type) {
-            .int => {
+        const overflowed = switch (fs.out_type) {
+            .int => blk: {
                 try out_col.data.int.ensureUnusedCapacity(self.allocator, n);
                 out_col.data.int.items.len = n;
                 const dst = out_col.data.int.items[0..n];
                 const s: i32 = @intCast(fs.scalar_i);
-                switch (fs.src_type) {
+                break :blk switch (fs.src_type) {
                     .tinyint => runScalar(i8, i32, fs.op, fs.col_left, src.data.tinyint[0..n], s, dst),
                     .smallint => runScalar(i16, i32, fs.op, fs.col_left, src.data.smallint[0..n], s, dst),
                     .int => runScalar(i32, i32, fs.op, fs.col_left, src.data.int[0..n], s, dst),
                     .boolean => runScalar(u8, i32, fs.op, fs.col_left, src.data.boolean[0..n], s, dst),
                     else => unreachable,
-                }
+                };
             },
-            .bigint => {
+            .bigint => blk: {
                 try out_col.data.bigint.ensureUnusedCapacity(self.allocator, n);
                 out_col.data.bigint.items.len = n;
                 const dst = out_col.data.bigint.items[0..n];
                 const s: i64 = fs.scalar_i;
-                switch (fs.src_type) {
+                break :blk switch (fs.src_type) {
                     .tinyint => runScalar(i8, i64, fs.op, fs.col_left, src.data.tinyint[0..n], s, dst),
                     .smallint => runScalar(i16, i64, fs.op, fs.col_left, src.data.smallint[0..n], s, dst),
                     .int => runScalar(i32, i64, fs.op, fs.col_left, src.data.int[0..n], s, dst),
                     .bigint => runScalar(i64, i64, fs.op, fs.col_left, src.data.bigint[0..n], s, dst),
                     .boolean => runScalar(u8, i64, fs.op, fs.col_left, src.data.boolean[0..n], s, dst),
                     else => unreachable,
-                }
+                };
             },
-            .double => {
+            .double => blk: {
                 try out_col.data.double.ensureUnusedCapacity(self.allocator, n);
                 out_col.data.double.items.len = n;
                 const dst = out_col.data.double.items[0..n];
                 const s: f64 = fs.scalar_f;
-                switch (fs.src_type) {
+                break :blk switch (fs.src_type) {
                     .float => runScalar(f32, f64, fs.op, fs.col_left, src.data.float[0..n], s, dst),
                     .double => runScalar(f64, f64, fs.op, fs.col_left, src.data.double[0..n], s, dst),
                     else => unreachable,
-                }
+                };
             },
             else => unreachable,
-        }
+        };
+        if (overflowed) return Error.ArithmeticOverflow;
     }
 };
 
 /// Bridge the runtime op/direction to the comptime-specialized SIMD kernel.
-fn runScalar(comptime Tsrc: type, comptime Tout: type, op: simd.BinOp, col_left: bool, src: []const Tsrc, scalar: Tout, dst: []Tout) void {
-    switch (op) {
+/// Returns whether an integer lane overflowed.
+fn runScalar(comptime Tsrc: type, comptime Tout: type, op: simd.BinOp, col_left: bool, src: []const Tsrc, scalar: Tout, dst: []Tout) bool {
+    return switch (op) {
         inline else => |o| switch (col_left) {
             inline else => |cl| simd.scalarOp(Tsrc, Tout, o, cl, src, scalar, dst),
         },
-    }
+    };
 }
 
 fn fusableSrc(t: Type) bool {
@@ -1467,10 +1470,9 @@ fn typeRangeI128(t: Type) ?struct { lo: i128, hi: i128 } {
     };
 }
 
-/// A derived [min,max] is only PROVABLE if the runtime arithmetic can't wrap:
-/// the integer kernels evaluate at the output type's width with wrapping
-/// (`+%`/`*%`), so a computed bound that escapes that width would be a lie.
-/// Returns the range only when both endpoints fit `out_type`; null otherwise.
+/// A derived [min,max] is only kept when both endpoints fit `out_type`: the
+/// integer kernels raise `ArithmeticOverflow` for any value outside it, so a
+/// computed bound that escapes that width is not a tight one. Null otherwise.
 fn provableRange(out_type: Type, min: ?i128, max: ?i128) struct { min: ?i128, max: ?i128 } {
     const lo = min orelse return .{ .min = null, .max = null };
     const hi = max orelse return .{ .min = null, .max = null };
@@ -2132,8 +2134,7 @@ fn derivedColStat(d: ResolvedDerived, up_stats: []const exec.ColStat) exec.ColSt
             if (u.src_idx >= up_stats.len) break :blk .{ .ndv = .unknown };
             const src = up_stats[u.src_idx];
             // f(col): ndv ≤ NDV(col) (pigeonhole). Affine ⇒ flow the range,
-            // then clamp to the output width (wrapping kernels make an
-            // escaping bound unprovable).
+            // kept only when it fits the output width (see provableRange).
             if (u.affine) |aff| {
                 const r = affineRange(aff, src.min, src.max);
                 const p = provableRange(d.output_type, r.min, r.max);
@@ -2153,8 +2154,8 @@ fn derivedColStat(d: ResolvedDerived, up_stats: []const exec.ColStat) exec.ColSt
                     .exact => |n2| .{ .exact = n1 *| n2 },
                 },
             };
-            // min/max for + and - via interval arithmetic, clamped to the
-            // output width (same wrapping-kernel caveat as the affine case).
+            // min/max for + and - via interval arithmetic, kept only when it
+            // fits the output width (see provableRange).
             var min: ?i128 = null;
             var max: ?i128 = null;
             if (bn.op) |op| {

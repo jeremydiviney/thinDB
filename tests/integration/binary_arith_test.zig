@@ -8,6 +8,7 @@
 //!   - composition with the existing scalar-function call syntax
 //!   - the natural "delta" pattern from the LAG bench
 //!   - integer division-by-zero returns 0 (MOD/DIV convention)
+//!   - integer overflow raises ArithmeticOverflow instead of wrapping
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -255,3 +256,42 @@ test "binary arith: division by zero — slash follows IEEE, DIV returns 0" {
 // in the projection-list grammar today) — so for now, real "delta"
 // queries either skip the LAG or skip the arithmetic. Tracked as a
 // follow-up to either of those grammar extensions.
+
+test "binary arith: integer overflow raises instead of wrapping" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    var q1 = try runSql(allocator, db, "CREATE TABLE o (id BIGINT PRIMARY KEY, i INT NOT NULL, n INT, b BIGINT NOT NULL, m INT NOT NULL)");
+    defer q1.deinit();
+    _ = try q1.next();
+    var q2 = try runSql(allocator, db, "INSERT INTO o VALUES (1, 2000000000, 2000000000, 9000000000000000000, -2147483648)");
+    defer q2.deinit();
+    _ = try q2.next();
+
+    const overflowing = [_][]const u8{
+        "SELECT i * 2 FROM o",
+        "SELECT i + i FROM o",
+        "SELECT n + n FROM o",
+        "SELECT b * 2 FROM o",
+        "SELECT b + b FROM o",
+        "SELECT -m FROM o",
+        "SELECT abs(m) FROM o",
+        "SELECT m DIV -1 FROM o",
+    };
+    for (overflowing) |sql| {
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        try std.testing.expectError(error.ArithmeticOverflow, q.next());
+    }
+
+    var q = try runSql(allocator, db, "SELECT i - 1 AS a, m % -1 AS r, i DIV 7 AS d FROM o");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i32, 1999999999), b.values[0].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 0), b.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 285714285), b.values[2].data.int[0]);
+}
