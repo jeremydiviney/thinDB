@@ -20,7 +20,6 @@ const Catalog = thindb_api.Catalog;
 const Session = thindb_api.Session;
 const SessionVars = thindb_api.SessionVars;
 const TempNamespace = thindb_api.TempNamespace;
-const ApiError = thindb_api.Error;
 const Schema = thindb_api.Schema;
 const Table = thindb_api.Table;
 
@@ -952,29 +951,9 @@ fn processDb(session: *const SessionState, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}__{s}", .{ session.current_db, session.current_schema }) catch session.current_db;
 }
 
-/// Apply the flattening rule for COM_INIT_DB / USE: `db__schema` splits
-/// into both parts; otherwise treat the name as either a schema within
-/// the current db or a top-level database.
 fn applyInitDb(catalog: *Catalog, session: *SessionState, name: []const u8) !void {
-    if (std.mem.indexOf(u8, name, "__")) |sep| {
-        const db_name = name[0..sep];
-        const sc_name = name[sep + 2 ..];
-        const db = catalog.database(db_name) orelse return ApiError.DatabaseNotFound;
-        _ = db.schema(sc_name) orelse return ApiError.SchemaNotFound;
-        try session.replace(db_name, sc_name);
-        return;
-    }
-
-    const cur_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
-    if (cur_db.schema(name) != null) {
-        try session.replace(session.current_db, name);
-        return;
-    }
-    if (catalog.database(name) != null) {
-        try session.replace(name, "public");
-        return;
-    }
-    return ApiError.DatabaseNotFound;
+    const target = try local.resolveUseTarget(catalog, session.current_db, name);
+    try session.replace(target.db, target.schema);
 }
 
 fn handleInitDb(
