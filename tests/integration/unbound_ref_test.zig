@@ -84,3 +84,45 @@ test "unused valid CTE items still run" {
         \\SELECT count(*) FROM (SELECT id FROM ext UNION ALL SELECT id FROM ext WHERE 1 = 0) u
     ));
 }
+
+// The MySQL wire names the culprit from this report. It can't walk the tree
+// instead: a failed compile has freed the nodes its rewrites spliced in.
+test "a failed compile hands its caller the unbound reference" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ .sql = "WITH b AS (SELECT id, nonexistent_col AS x FROM ext) SELECT count(*) FROM b", .err = error.ColumnNotFound, .column = true, .name = "nonexistent_col" },
+        .{ .sql = "WITH b AS (SELECT id, invalid_function(name) AS x FROM ext) SELECT count(*) FROM b", .err = error.ComputeNoSuchOverload, .column = false, .name = "invalid_function" },
+    };
+    inline for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const root = try thindb.sql.parse(arena.allocator(), c.sql);
+        var unbound: ?thindb.net.Unbound = null;
+        defer if (unbound) |u| allocator.free(u.name());
+        try std.testing.expectError(c.err, thindb.net.compileWithOptions(allocator, db, .{}, root, .{ .unbound = &unbound }));
+        const u = unbound orelse return error.TestExpectedUnbound;
+        try std.testing.expectEqual(c.column, u == .column);
+        try std.testing.expectEqualStrings(c.name, u.name());
+    }
+}
+
+test "a compile with nothing unbound reports none" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = try thindb.sql.parse(arena.allocator(), "SELECT id FROM ext WHERE amount > 2");
+    var unbound: ?thindb.net.Unbound = null;
+    var cq = try thindb.net.compileWithOptions(allocator, db, .{}, root, .{ .unbound = &unbound });
+    defer cq.deinit();
+    try std.testing.expectEqual(@as(?thindb.net.Unbound, null), unbound);
+}

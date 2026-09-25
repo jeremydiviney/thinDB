@@ -32,6 +32,21 @@ const UdfRegistry = @import("../udf.zig").UdfRegistry;
 pub const Unbound = union(enum) {
     column: []const u8,
     function: []const u8,
+
+    /// A copy whose name lives in `allocator`, so it outlives the tree it
+    /// was found in.
+    pub fn dupe(self: Unbound, allocator: Allocator) Allocator.Error!Unbound {
+        return switch (self) {
+            .column => |c| .{ .column = try allocator.dupe(u8, c) },
+            .function => |f| .{ .function = try allocator.dupe(u8, f) },
+        };
+    }
+
+    pub fn name(self: Unbound) []const u8 {
+        return switch (self) {
+            inline else => |n| n,
+        };
+    }
 };
 
 pub fn find(

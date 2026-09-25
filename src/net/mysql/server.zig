@@ -25,7 +25,6 @@ const Schema = thindb_api.Schema;
 const Table = thindb_api.Table;
 
 const local = @import("../local.zig");
-const unbound_refs = @import("../unbound_refs.zig");
 const ir = @import("../../ir/ir.zig");
 const PredicateExpr = @import("../../exec/predicate.zig").PredicateExpr;
 const exec_predicate = @import("../../exec/predicate.zig");
@@ -1343,14 +1342,14 @@ fn stripIdentifierQuotes(s_in: []const u8) []const u8 {
     return s;
 }
 
-/// ERR packet for a failed compile. A reference no operator could ever bind
-/// is named the way MySQL names it (ER_BAD_FIELD_ERROR, ER_SP_DOES_NOT_EXIST);
-/// otherwise the mapped internal error stands.
-fn sendCompileError(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, err: anyerror, catalog: *Catalog, session: *SessionState, op: *const ir.Op) !void {
+/// ERR packet for a failed compile. A reference no operator could ever bind,
+/// as the compile reported it, is named the way MySQL names it
+/// (ER_BAD_FIELD_ERROR, ER_SP_DOES_NOT_EXIST); otherwise the mapped internal
+/// error stands.
+fn sendCompileError(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, err: anyerror, unbound: ?local.Unbound) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
-    const unbound = unbound_refs.find(aa, catalog, session.asSession(), &catalog.udfs, op) catch null;
     if (unbound) |u| {
         const named = switch (u) {
             .column => |c| std.fmt.allocPrint(aa, "Unknown column '{s}' in 'field list'", .{c}),
@@ -3667,9 +3666,14 @@ fn runSingleStatement(
     }
 
     const compile_start = profiler.start();
-    var compiled = local.compileInStatementWithOptions(qalloc, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null }) catch |err| {
+    var unbound: ?local.Unbound = null;
+    defer if (unbound) |u| qalloc.free(u.name());
+    var compiled = local.compileInStatementWithOptions(qalloc, main_db, session.asSession(), op, .{
+        .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
+        .unbound = &unbound,
+    }) catch |err| {
         profiler.recordSince(.query_compile, compile_start);
-        try sendCompileError(allocator, w, seq_id.*, err, catalog, session, op);
+        try sendCompileError(allocator, w, seq_id.*, err, unbound);
         return false;
     };
     profiler.recordSince(.query_compile, compile_start);
@@ -4022,9 +4026,14 @@ fn handleStmtExecute(
     }
 
     const compile_start = profiler.start();
-    var compiled = local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null }) catch |err| {
+    var unbound: ?local.Unbound = null;
+    defer if (unbound) |u| allocator.free(u.name());
+    var compiled = local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{
+        .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
+        .unbound = &unbound,
+    }) catch |err| {
         profiler.recordSince(.stmt_execute_compile, compile_start);
-        try sendCompileError(allocator, w, seq_id, err, catalog, session, op);
+        try sendCompileError(allocator, w, seq_id, err, unbound);
         return;
     };
     profiler.recordSince(.stmt_execute_compile, compile_start);

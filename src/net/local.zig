@@ -1325,8 +1325,16 @@ pub fn producesOnlyResult(op: *const ir.Op) bool {
     };
 }
 
+pub const Unbound = unbound_refs.Unbound;
+
 pub const CompileOptions = struct {
     cancel_flag: ?*const std.atomic.Value(bool) = null,
+    /// Receives the reference no operator could ever bind, if there is one,
+    /// named in the compile's allocator; the caller frees it whether or not
+    /// the compile succeeds. A caller can't find it by walking the tree after
+    /// a failed compile: the rewrites splice arena nodes into the tree, and
+    /// the failure frees that arena.
+    unbound: ?*?Unbound = null,
 };
 
 pub fn compileWithOptions(allocator: Allocator, db: *Database, session: Session, root: *const ir.Op, options: CompileOptions) !CompiledQuery {
@@ -1389,6 +1397,9 @@ pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, sessio
     // and the statement would run. Keep the tree whole then: the binder
     // rejects it exactly as it rejects the same reference in a used item.
     const unbound = try unbound_refs.find(ctx.nodeArena(), catalogFor(db), session_cell.*, ctx.udf_registry, root);
+    if (unbound) |u| if (options.unbound) |out| {
+        out.* = try u.dupe(allocator);
+    };
     if (unbound == null) {
         // Dead-branch elimination: prune UNION arms that provably yield zero
         // rows (constant-false filters — the parser already folds literal
