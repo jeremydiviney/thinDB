@@ -326,27 +326,98 @@ const RgHint = struct {
 /// correct.
 fn collectDeletePruneInfo(
     columns: []const Column,
+    derived: []const exec.Derived,
     expr: predicate.PredicateExpr,
     aa: std.mem.Allocator,
     hints: *std.ArrayList(RgHint),
     ref_cols: []bool,
 ) !void {
     switch (expr) {
-        .@"and" => |kids| for (kids) |k| try collectDeletePruneInfo(columns, k, aa, hints, ref_cols),
+        .@"and" => |kids| for (kids) |k| try collectDeletePruneInfo(columns, derived, k, aa, hints, ref_cols),
         .leaf => |p| {
-            const ci = types.findColumn(columns, p.col) orelse return error.UnknownShape;
-            ref_cols[ci] = true;
-            try hints.append(aa, .{ .col_idx = ci, .op = p.op, .val = p.val });
+            if (types.findColumn(columns, p.col)) |ci| {
+                ref_cols[ci] = true;
+                try hints.append(aa, .{ .col_idx = ci, .op = p.op, .val = p.val });
+            } else try markDerivedInputs(columns, derived, p.col, aa, ref_cols);
         },
         .in_set => |s| {
-            const ci = types.findColumn(columns, s.col) orelse return error.UnknownShape;
-            ref_cols[ci] = true;
             // IN sets don't produce a single-op hint; referenced-column
             // tracking alone is the win here.
+            if (types.findColumn(columns, s.col)) |ci| {
+                ref_cols[ci] = true;
+            } else try markDerivedInputs(columns, derived, s.col, aa, ref_cols);
         },
         else => return error.UnknownShape,
     }
 }
+
+/// A computed operand gives no zonemap hint, but the columns it reads must
+/// still be decoded for the Compute that evaluates it.
+fn markDerivedInputs(
+    columns: []const Column,
+    derived: []const exec.Derived,
+    name: []const u8,
+    aa: std.mem.Allocator,
+    ref_cols: []bool,
+) !void {
+    for (derived) |d| {
+        if (!std.mem.eql(u8, d.name, name)) continue;
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        try exec.compute_op.collectColumnRefs(aa, &refs, d.expr);
+        for (refs.items) |r| ref_cols[types.findColumn(columns, r) orelse return error.UnknownShape] = true;
+        return;
+    }
+    return error.UnknownShape;
+}
+
+/// A DML WHERE clause: the predicate plus the computed operands it compares
+/// by name (`n % 3 = 0` compares a derived `n % 3` with 0). One Compute,
+/// resolved against the table schema, evaluates those columns per batch
+/// ahead of the predicate, as the Compute below a SELECT's filter does.
+pub const DmlFilter = struct {
+    predicate: predicate.PredicateExpr,
+    compute: ?struct { q: exec.Query, op: *exec.Compute } = null,
+
+    /// Checks `pred` against `columns` plus the derived columns and widens
+    /// its literals in place, as every later `evaluate` sees it.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        columns: []const Column,
+        pred: predicate.PredicateExpr,
+        derived: []const exec.Derived,
+    ) !DmlFilter {
+        var self: DmlFilter = .{ .predicate = pred };
+        if (derived.len > 0) {
+            // A zero-row source only carries the schema through resolution;
+            // batches reach the Compute through `evalBatch`.
+            var src = try @import("../exec/single_batch.zig").SingleBatchSource.create(allocator, .{
+                .schema = columns,
+                .values = &.{},
+                .row_count = 0,
+            });
+            const q = exec.Compute.create(allocator, src, derived) catch |err| {
+                src.deinit();
+                return err;
+            };
+            self.compute = .{ .q = q, .op = exec.queryAs(exec.Compute, q).? };
+        }
+        errdefer self.deinit();
+        const schema = if (self.compute) |c| c.op.outputSchema() else columns;
+        try predicate.validateExpr(&self.predicate, schema);
+        return self;
+    }
+
+    pub fn deinit(self: *DmlFilter) void {
+        if (self.compute) |*c| c.q.deinit();
+    }
+
+    /// `batch` carries the table schema; only the columns the predicate
+    /// and its derived operands read need real data.
+    pub fn evaluate(self: *const DmlFilter, allocator: std.mem.Allocator, batch: exec.Batch, mask: []bool) !void {
+        const in = if (self.compute) |c| try c.op.evalBatch(batch) else batch;
+        try predicate.evaluatePredicate(allocator, self.predicate, in.schema, in, mask);
+    }
+};
 
 /// `DELETE FROM t [WHERE expr]` — generalized delete accepting the
 /// rich `PredicateExpr` (AND/OR/IN/etc). Same per-segment streaming
@@ -356,19 +427,19 @@ fn collectDeletePruneInfo(
 /// before moving to the next segment. Memtable rows are filtered
 /// via clone-and-swap, same as the simple `execDelete` path.
 ///
-/// `pred_or_null == null` means delete every row. `wal_target` receives
-/// the WAL offset to await.
-pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr, wal_target: *?u64) !usize {
+/// `pred_in == null` means delete every row; `derived` are the computed
+/// operands it compares. `wal_target` receives the WAL offset to await.
+pub fn execDeleteByExpr(
+    t: *Table,
+    pred_in: ?predicate.PredicateExpr,
+    derived: []const exec.Derived,
+    wal_target: *?u64,
+) !usize {
     var total: usize = 0;
 
-    // Make a local mutable copy of the predicate so validateExpr can
-    // widen literals in place (Zig function parameters are immutable,
-    // so we can't mutate `pred_in` directly even via a const-cast).
-    var pred_local: ?predicate.PredicateExpr = pred_in;
-    if (pred_local) |*p| {
-        try predicate.validateExpr(p, t.schema.columns);
-    }
-    const pred_or_null = pred_local;
+    var filter: ?DmlFilter = if (pred_in) |p| try DmlFilter.init(t.allocator, t.schema.columns, p, derived) else null;
+    defer if (filter) |*f| f.deinit();
+    const pred_or_null: ?predicate.PredicateExpr = if (filter) |f| f.predicate else null;
 
     // Full-key Bloom gate (#143): a keyed DELETE — every order-key column
     // pinned by AND-equality, the exact shape a CDC binlog delete takes —
@@ -391,7 +462,7 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr, wal_target
     const ref_cols: []bool = try ga.alloc(bool, t.schema.columns.len);
     @memset(ref_cols, false);
     if (pred_or_null) |p| {
-        collectDeletePruneInfo(t.schema.columns, p, ga, &rg_hints, ref_cols) catch {
+        collectDeletePruneInfo(t.schema.columns, derived, p, ga, &rg_hints, ref_cols) catch {
             @memset(ref_cols, true);
             rg_hints.clearRetainingCapacity();
         };
@@ -468,7 +539,7 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr, wal_target
             };
             const mask = try t.allocator.alloc(bool, n);
             defer t.allocator.free(mask);
-            try predicate.evaluatePredicate(t.allocator, pred_or_null.?, t.schema.columns, fake_batch, mask);
+            try filter.?.evaluate(t.allocator, fake_batch, mask);
 
             var i: u32 = 0;
             while (i < n) : (i += 1) {
@@ -509,7 +580,7 @@ pub fn execDeleteByExpr(t: *Table, pred_in: ?predicate.PredicateExpr, wal_target
             };
             const mask = try t.allocator.alloc(bool, n);
             defer t.allocator.free(mask);
-            try predicate.evaluatePredicate(t.allocator, pred_or_null.?, t.schema.columns, fake_batch, mask);
+            try filter.?.evaluate(t.allocator, fake_batch, mask);
             for (mask, keep) |m, *k| k.* = !m;
         }
         total += try t.deleteMemtableRowsLocked(keep, wal_target);
@@ -553,8 +624,8 @@ test "delete: affected count excludes already-tombstoned rows" {
 
     var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "v", .op = .gte, .val = .{ .int = 1 } } };
     try predicate.validateExpr(&expr, t.schema.columns);
-    try std.testing.expectEqual(@as(usize, 1), try execDeleteByExpr(t, expr, &wal_target));
-    try std.testing.expectEqual(@as(usize, 0), try execDeleteByExpr(t, expr, &wal_target));
+    try std.testing.expectEqual(@as(usize, 1), try execDeleteByExpr(t, expr, &.{}, &wal_target));
+    try std.testing.expectEqual(@as(usize, 0), try execDeleteByExpr(t, expr, &.{}, &wal_target));
 }
 
 test "keyed batch delete: one sweep, per-statement counts, literal widening" {

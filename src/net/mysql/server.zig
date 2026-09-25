@@ -3370,12 +3370,18 @@ fn tableRefEql(a: ir.TableRef, b: ir.TableRef) bool {
 }
 
 /// Length of the leading run of DELETE statements against one table.
+/// A statement with computed operands is never a full-key equality, so it
+/// ends the run.
 fn deleteRunLen(stmts: []const *ir.Op) usize {
-    if (stmts.len == 0 or stmts[0].* != .delete_op) return 0;
+    if (stmts.len == 0 or !plainColumnDelete(stmts[0])) return 0;
     const first = stmts[0].delete_op.table;
     var n: usize = 1;
-    while (n < stmts.len and stmts[n].* == .delete_op and tableRefEql(stmts[n].delete_op.table, first)) n += 1;
+    while (n < stmts.len and plainColumnDelete(stmts[n]) and tableRefEql(stmts[n].delete_op.table, first)) n += 1;
     return n;
+}
+
+fn plainColumnDelete(op: *const ir.Op) bool {
+    return op.* == .delete_op and op.delete_op.derived.len == 0;
 }
 
 /// Execute a run of same-table DELETE statements as one batched keyed

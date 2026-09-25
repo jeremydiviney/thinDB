@@ -1081,7 +1081,7 @@ test "commitMerge re-applies deletes that land during the aside merge" {
     const pred = exec.predicate.PredicateExpr{
         .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 2 } },
     };
-    const deleted = try t.deleteByExpr(pred);
+    const deleted = try t.deleteByExpr(pred, &.{});
     try std.testing.expectEqual(@as(usize, 1), deleted);
 
     var blocked_buf: [40]u8 = undefined;

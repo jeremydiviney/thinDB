@@ -1871,9 +1871,7 @@ fn buildCallPlan(
     for (c.args, 0..) |arg, i| {
         switch (arg) {
             .col_ref => |name| {
-                const idx = columnIndex(up_schema, name) orelse {
-                    return Error.ComputeUnsupportedExpr;
-                };
+                const idx = columnIndex(up_schema, name) orelse return Error.ColumnNotFound;
                 arg_plans[i] = .{ .col = idx };
                 arg_types[i] = up_schema[idx].type;
             },

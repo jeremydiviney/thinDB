@@ -41,6 +41,7 @@ const ColumnStore = engine.ColumnStore;
 
 const api = @import("api.zig");
 const Table = api.Table;
+const DmlFilter = @import("delete.zig").DmlFilter;
 
 const ir = @import("../ir/ir.zig");
 
@@ -52,18 +53,21 @@ pub const Assignment = struct {
     value: ir.Expr,
 };
 
-/// Streaming UPDATE entry point. Caller pre-resolved the predicate +
-/// assignments through the pre-compile pass (subqueries / @vars
-/// already folded to literals). Returns the affected row count.
+/// Streaming UPDATE entry point. Caller pre-resolved the predicate,
+/// its computed operands (`derived`) and the assignments through the
+/// pre-compile pass (subqueries / @vars already folded to literals).
+/// Returns the affected row count.
 pub fn execUpdateStreaming(
     t: *Table,
     pred_in: ?exec.PredicateExpr,
+    derived: []const exec.Derived,
     assignments: []const Assignment,
 ) !usize {
-    // Validate + widen predicate literals up front so both the WAL-
-    // logged form and the per-row-group eval see the same shape.
-    var pred_local: ?exec.PredicateExpr = pred_in;
-    if (pred_local) |*p| try exec.predicate.validateExpr(p, t.schema.columns);
+    // Validate + widen predicate literals up front so every per-row-group
+    // eval sees the same shape.
+    var filter: ?DmlFilter = if (pred_in) |p| try DmlFilter.init(t.allocator, t.schema.columns, p, derived) else null;
+    defer if (filter) |*f| f.deinit();
+    const filter_ref: ?*const DmlFilter = if (filter) |*f| f else null;
 
     // Verify every assigned column exists.
     for (assignments) |asn| {
@@ -89,7 +93,7 @@ pub fn execUpdateStreaming(
 
         // -- Phase 1: memtable rows [0..mt_rows_at_start] --------
         if (mt_rows_at_start > 0) {
-            affected += processMemtable(t, pred_local, assignments, mt_rows_at_start, &wal_target) catch |err| switch (err) {
+            affected += processMemtable(t, filter_ref, assignments, mt_rows_at_start, &wal_target) catch |err| switch (err) {
                 error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
                 else => return err,
             };
@@ -97,7 +101,7 @@ pub fn execUpdateStreaming(
 
         // -- Phase 2: segments[0..segs_at_start] -----------------
         if (segs_at_start > 0) {
-            affected += processSegments(t, pred_local, assignments, segs_at_start, &wal_target) catch |err| switch (err) {
+            affected += processSegments(t, filter_ref, assignments, segs_at_start, &wal_target) catch |err| switch (err) {
                 error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
                 else => return err,
             };
@@ -113,7 +117,7 @@ pub fn execUpdateStreaming(
 
 fn processMemtable(
     t: *Table,
-    pred_opt: ?exec.PredicateExpr,
+    filter: ?*const DmlFilter,
     assignments: []const Assignment,
     mt_rows_at_start: usize,
     wal_target: *?u64,
@@ -136,8 +140,8 @@ fn processMemtable(
     // Evaluate predicate → mask. Allow null = match everything.
     const mask = try allocator.alloc(bool, mt_rows_at_start);
     defer allocator.free(mask);
-    if (pred_opt) |p| {
-        try exec.predicate.evaluatePredicate(allocator, p, t.schema.columns, batch, mask);
+    if (filter) |f| {
+        try f.evaluate(allocator, batch, mask);
     } else {
         @memset(mask, true);
     }
@@ -168,7 +172,7 @@ fn processMemtable(
 
 fn processSegments(
     t: *Table,
-    pred_opt: ?exec.PredicateExpr,
+    filter: ?*const DmlFilter,
     assignments: []const Assignment,
     segs_at_start: usize,
     wal_target: *?u64,
@@ -179,8 +183,8 @@ fn processSegments(
     var gate_arena = std.heap.ArenaAllocator.init(t.allocator);
     defer gate_arena.deinit();
     const upsert_mod = @import("upsert.zig");
-    const key_hashes: ?[]u64 = if (pred_opt) |p|
-        upsert_mod.keyHashesFromPredicateExpr(t, gate_arena.allocator(), p) catch null
+    const key_hashes: ?[]u64 = if (filter) |f|
+        upsert_mod.keyHashesFromPredicateExpr(t, gate_arena.allocator(), f.predicate) catch null
     else
         null;
 
@@ -191,14 +195,14 @@ fn processSegments(
         if (key_hashes) |hs| {
             if (!upsert_mod.bloomAdmitsAny(entry.key_bloom, hs)) continue;
         }
-        total += try processOneSegment(t, pred_opt, assignments, entry, wal_target);
+        total += try processOneSegment(t, filter, assignments, entry, wal_target);
     }
     return total;
 }
 
 fn processOneSegment(
     t: *Table,
-    pred_opt: ?exec.PredicateExpr,
+    filter: ?*const DmlFilter,
     assignments: []const Assignment,
     entry: storage.manifest.ManifestEntry,
     wal_target: *?u64,
@@ -240,8 +244,8 @@ fn processOneSegment(
 
         const mask = try allocator.alloc(bool, n);
         defer allocator.free(mask);
-        if (pred_opt) |p| {
-            try exec.predicate.evaluatePredicate(allocator, p, t.schema.columns, batch, mask);
+        if (filter) |f| {
+            try f.evaluate(allocator, batch, mask);
         } else {
             @memset(mask, true);
         }
