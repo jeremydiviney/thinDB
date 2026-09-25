@@ -1435,7 +1435,6 @@ pub const Parser = struct {
             try self.advance();
             if (self.cur.tag == .lparen) {
                 try self.advance();
-                if (try self.tryParseCastWrappedAggregate()) |agg| return agg;
                 const inner = try self.parseCallArg();
                 if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
                 try self.advance();
@@ -1861,30 +1860,6 @@ pub const Parser = struct {
         args[1] = amount;
         const fn_name: []const u8 = if (kind == .sub) "date_sub" else "date_add";
         return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
-    }
-
-    fn tryParseCastWrappedAggregate(self: *Parser) ParseError!?ProjItem {
-        if (self.cur.tag != .identifier) return null;
-        const first = self.cur.text;
-        const func = self.aggregateFuncForName(first) orelse return null;
-        try self.advance();
-        if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
-        var saw_distinct = false;
-        const args = try self.parseCallArgList(&saw_distinct);
-        if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
-        try self.advance();
-        _ = try self.parseCastType();
-        try self.expect(.rparen);
-        if (saw_distinct) {
-            const distinct_func: ir.AggFunc = switch (func) {
-                .count => .count_distinct,
-                .sum => .sum_distinct,
-                .avg => .avg_distinct,
-                else => return ParseError.SqlInvalidProjection,
-            };
-            return try self.aggCallFromArgs(first, distinct_func, args);
-        }
-        return try self.aggCallFromArgs(first, func, args);
     }
 
     /// Parse `(arg, arg, ...)`. Cursor is on `(` going in, on the token

@@ -321,10 +321,52 @@ test "INSERT SELECT: literals and narrower columns widen into the target types" 
     defer allocator.free(null_amt);
     try std.testing.expectEqualSlices(i64, &.{ 5, 101 }, null_amt);
 
-    // Narrowing and a NULL into a NOT NULL column are still rejected.
+    // An integer the column can't hold, a fraction, and a NULL into a NOT
+    // NULL column are still rejected.
     try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT 6, CAST(5000000000 AS BIGINT)", error.TypeMismatch);
     try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT 7, 2.5", error.TypeMismatch);
     try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT k + 200, m FROM src2", error.TypeMismatch);
+}
+
+test "INSERT SELECT: a wider integer narrows into its column when every value fits" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE wide (k BIGINT NOT NULL, big BIGINT, PRIMARY KEY (k))");
+    try exec(allocator, db, "INSERT INTO wide VALUES (1, 7), (2, NULL), (3, -128)");
+    try exec(allocator, db, "CREATE TABLE slim (id BIGINT NOT NULL, i INT, s SMALLINT, t TINYINT, n INT NOT NULL DEFAULT 0, PRIMARY KEY (id))");
+    try exec(allocator, db, "INSERT INTO slim (id, i, s, t) SELECT k, big, big, big FROM wide");
+    // Aggregates come out BIGINT, as they do into an output table's INT and
+    // TINYINT columns.
+    try exec(allocator, db, "INSERT INTO slim (id, i, t, n) SELECT 10, SUM(big), COUNT(*), COUNT(big) FROM wide");
+    const t = try db.openTable("slim", .{});
+    try t.flush();
+
+    const cases = .{
+        .{ .col = "i", .expected = &[_]i64{ 7, -128, -121 } },
+        .{ .col = "s", .expected = &[_]i64{ 7, -128 } },
+        .{ .col = "t", .expected = &[_]i64{ 7, -128, 3 } },
+        .{ .col = "n", .expected = &[_]i64{ 0, 0, 0, 2 } },
+    };
+    inline for (cases) |c| {
+        const got = try collectBigints(allocator, db, "SELECT CAST(" ++ c.col ++ " AS BIGINT) FROM slim WHERE " ++ c.col ++ " IS NOT NULL ORDER BY id");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c.expected, got);
+    }
+    const null_ids = try collectBigints(allocator, db, "SELECT id FROM slim WHERE i IS NULL AND s IS NULL AND t IS NULL ORDER BY id");
+    defer allocator.free(null_ids);
+    try std.testing.expectEqualSlices(i64, &.{2}, null_ids);
+
+    // A value the column can't hold fails the statement rather than clamping.
+    try helpers.expectRunError(allocator, db, "INSERT INTO slim (id, i) SELECT k + 20, big * 1000000000 FROM wide", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO slim (id, s) SELECT k + 20, big - 32768 FROM wide WHERE k = 3", error.TypeMismatch);
+    const after = try collectBigints(allocator, db, "SELECT COUNT(*) FROM slim WHERE id > 20");
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(i64, &.{0}, after);
 }
 
 test "INSERT SELECT: a date widens into a DATETIME column" {

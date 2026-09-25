@@ -1110,6 +1110,69 @@ test "commitMerge re-applies deletes that land during the aside merge" {
     try std.testing.expectEqual(@as(i64, 2), ids.items[tombs[0]]);
 }
 
+const CommitThread = struct {
+    t: *Table,
+    pending: *PendingMerge,
+    started: std.atomic.Value(bool) = .init(false),
+    result: ?anyerror = null,
+
+    fn run(self: *CommitThread) void {
+        self.started.store(true, .release);
+        commitMerge(self.t, self.pending) catch |err| {
+            self.result = err;
+        };
+    }
+};
+
+test "a statement opens another scan on a table whose merge commit waits for its scans" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const exec = @import("../exec/exec.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    try t.insert(&.{.{ .id = @as(i64, 1), .v = @as(i32, 10) }});
+    try t.flush();
+    try t.insert(&.{.{ .id = @as(i64, 2), .v = @as(i32, 20) }});
+    try t.flush();
+    const input_ids = [_]u64{
+        t.manifest.segments.items[0].segment_id,
+        t.manifest.segments.items[1].segment_id,
+    };
+    var pending = try mergeAside(t, &input_ids);
+    defer pending.deinit(allocator);
+
+    var first = try exec.scan(allocator, t);
+    var commit: CommitThread = .{ .t = t, .pending = &pending };
+    const thread = try std.Thread.spawn(.{}, CommitThread.run, .{&commit});
+    while (!commit.started.load(.acquire)) std.Thread.yield() catch {};
+    try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+
+    // A CTE plan opening its next scan of `t`: with a writer-preferring
+    // ddl_lock this waited behind the queued commit, which waits for `first`.
+    var second = try exec.scan(allocator, t);
+    second.deinit();
+    try std.testing.expectEqual(@as(usize, 2), t.manifest.segments.items.len);
+    first.deinit();
+
+    thread.join();
+    try std.testing.expectEqual(@as(?anyerror, null), commit.result);
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+}
+
 test "segmentTier buckets row counts logarithmically" {
     // tier-1 floor is 2^19 (524,288); each tier is 4x the previous.
     try std.testing.expectEqual(@as(u8, 0), segmentTier(0));
