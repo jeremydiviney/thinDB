@@ -13,6 +13,8 @@ const Error = api.Error;
 
 const DatabaseMod = @import("database.zig");
 const Database = DatabaseMod.Database;
+const SchemaMod = @import("schema.zig");
+const Schema = SchemaMod.Schema;
 
 const snapshot = @import("../util/snapshot.zig");
 const udf_mod = @import("../udf.zig");
@@ -665,16 +667,29 @@ pub const Catalog = struct {
 
     /// Walk every database (and every schema beneath each) and run one
     /// flush sweep. Errors from individual sweeps are swallowed — the
-    /// background loop keeps running.
+    /// background loop keeps running. Holds no statement lease across the
+    /// walk: each table step takes its own (see `Schema.flushSweep`).
     pub fn backgroundFlushSweep(self: *Catalog) !void {
-        const lease = try self.acquireStatement(false);
-        defer lease.release();
+        const lifetime = try self.statement_gate.retainAllocator();
+        defer lifetime.release();
         const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, &self.databases);
         defer snapshot.freeNames(self.allocator, names);
-        for (names) |name| {
-            const db = self.database(name) orelse continue;
-            db.backgroundFlushSweep() catch {};
+        for (names) |db_name| {
+            const schema_names = (try self.sweepSchemaNames(db_name)) orelse continue;
+            defer snapshot.freeNames(self.allocator, schema_names);
+            for (schema_names) |schema_name| {
+                Schema.flushSweep(.{ .catalog = .{ .catalog = self, .database = db_name, .schema = schema_name } }) catch {};
+            }
         }
+    }
+
+    /// The database's schema names, snapshotted under a statement lease so a
+    /// concurrent DROP DATABASE cannot free it mid-read. Null if it is gone.
+    fn sweepSchemaNames(self: *Catalog, db_name: []const u8) !?[][]u8 {
+        const lease = try self.acquireStatement(false);
+        defer lease.release();
+        const db = self.database(db_name) orelse return null;
+        return try snapshot.snapshotMapKeys(self.allocator, self.io, &db.schemas_mutex, &db.schemas);
     }
 
     pub fn runBackgroundFlusher(
@@ -692,16 +707,22 @@ pub const Catalog = struct {
         }
     }
 
-    /// Returns true if any database merged a group this sweep.
+    /// Returns true if any database merged a group this sweep. Holds no
+    /// statement lease across the walk: each table's pick takes its own and
+    /// the merge runs without one (see `Schema.compactSweep`).
     pub fn backgroundCompactSweep(self: *Catalog) !bool {
-        const lease = try self.acquireStatement(false);
-        defer lease.release();
+        const lifetime = try self.statement_gate.retainAllocator();
+        defer lifetime.release();
         const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.databases_mutex, &self.databases);
         defer snapshot.freeNames(self.allocator, names);
         var worked = false;
-        for (names) |name| {
-            const db = self.database(name) orelse continue;
-            if (db.backgroundCompactSweep() catch false) worked = true;
+        for (names) |db_name| {
+            const schema_names = (try self.sweepSchemaNames(db_name)) orelse continue;
+            defer snapshot.freeNames(self.allocator, schema_names);
+            for (schema_names) |schema_name| {
+                const route: SchemaMod.SweepRoute = .{ .catalog = .{ .catalog = self, .database = db_name, .schema = schema_name } };
+                if (Schema.compactSweep(route) catch false) worked = true;
+            }
         }
         return worked;
     }

@@ -3,12 +3,13 @@
 //! Two entry points:
 //!   - `execCompact(t)` merges every live segment (the "full" variant —
 //!     what `Table.compact()` exposes to users).
-//!   - `execTieredCompact(t)` picks a subset via the tiered LSM strategy
-//!     and merges only those (drives the background compactor).
+//!   - `pickTieredGroup(t)` picks a subset via the tiered LSM strategy,
+//!     which the background compactor merges with `mergeInBackground`.
 //!
-//! Both call into `mergeSegments` which is the shared work.
+//! Both merge through `mergeAside` + `commitMerge`.
 
 const std = @import("std");
+const Io = std.Io;
 const storage = @import("../storage/storage.zig");
 const engine = @import("../engine/engine.zig");
 const types = @import("../types.zig");
@@ -77,41 +78,27 @@ pub fn execCompact(t: *Table) !void {
     try mergeSegments(t, all_ids);
 }
 
-/// Background compactor entry point. Picks one compaction group and
-/// merges it. First check is tombstone pressure: any segment with
-/// `tombs / row_count >= tomb_threshold` is compacted (with adjacent
-/// same-tier neighbors if there are any). If no tombstone-pressured
-/// segment, fall back to the count-based tier picker. No-op if no
-/// group qualifies. Caller holds `compact_lock`.
+/// Background compactor pick: the one group the next merge should take, or
+/// null if none qualifies. First check is tombstone pressure: any segment
+/// with `tombs / row_count >= tomb_threshold` is picked (with adjacent
+/// same-tier neighbors if there are any). If no tombstone-pressured segment,
+/// fall back to the count-based tier picker. Caller holds `compact_lock` and
+/// owns the returned ids.
 ///
-/// Pass `tomb_threshold > 1.0` to disable the tombstone trigger. Returns true
-/// if a merge was performed (so the background loop can keep draining without
-/// sleeping), false if no group qualified.
-pub fn execTieredCompact(t: *Table, tomb_threshold: f32) !bool {
+/// Pass `tomb_threshold > 1.0` to disable the tombstone trigger.
+pub fn pickTieredGroup(t: *Table, tomb_threshold: f32) !?[]u64 {
     const metas = try snapshotSegMeta(t);
     defer t.allocator.free(metas);
 
     // 1. Tombstone pressure first.
     if (tomb_threshold <= 1.0) {
-        const tomb_pick = try pickTombstonePressuredGroup(t, metas, tomb_threshold);
-        if (tomb_pick) |ids| {
-            defer t.allocator.free(ids);
-            try mergeSegments(t, ids);
-            return true;
-        }
+        if (try pickTombstonePressuredGroup(t, metas, tomb_threshold)) |ids| return ids;
     }
     // 2. Tier-0 sweep: collapse a run of small staging segments into one
     // ~2M (tier-1) segment in a single merge, ahead of the 4-wide picker.
-    if (try pickTier0Group(t.allocator, metas)) |ids| {
-        defer t.allocator.free(ids);
-        try mergeSegments(t, ids);
-        return true;
-    }
+    if (try pickTier0Group(t.allocator, metas)) |ids| return ids;
     // 3. Tier-based count trigger (tier 1+).
-    const seg_ids = try pickCompactionGroup(t.allocator, metas) orelse return false;
-    defer t.allocator.free(seg_ids);
-    try mergeSegments(t, seg_ids);
-    return true;
+    return pickCompactionGroup(t.allocator, metas);
 }
 
 /// Find the first segment whose tombstone fraction exceeds `threshold`
@@ -708,6 +695,20 @@ pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     try commitMerge(t, &pending);
 }
 
+/// How long a background merge waits for the table's readers to drain before
+/// it gives up its commit. The wait holds `compact_lock`, so it also bounds
+/// how long DROP, ALTER, TRUNCATE and XA COMMIT on the table queue behind it.
+pub const background_commit_wait: Io.Duration = .fromSeconds(60);
+
+/// `mergeSegments` for the background compactor: the commit gives up after
+/// `commit_wait` (see `commitMergeBefore`). Returns whether the merge landed.
+pub fn mergeInBackground(t: *Table, seg_ids: []const u64, commit_wait: Io.Duration) !bool {
+    if (seg_ids.len == 0) return false;
+    var pending = try mergeAside(t, seg_ids);
+    defer pending.deinit(t.allocator);
+    return commitMergeBefore(t, &pending, .fromNow(t.io, .{ .raw = commit_wait, .clock = .awake }));
+}
+
 /// Everything `commitMerge` needs from the aside phase. `deinit` is safe to
 /// call whether or not the commit ran (entry ownership moves to the manifest
 /// on splice and is nulled here).
@@ -816,6 +817,27 @@ pub fn mergeAside(t: *Table, seg_ids_in: []const u64) !PendingMerge {
 pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
     t.ddl_lock.lockUncancelable(t.io);
     defer t.ddl_lock.unlock(t.io);
+    _ = try commitMergeLocked(t, pending);
+}
+
+/// `commitMerge` that abandons the merge if the table's readers still hold
+/// `ddl_lock` at `deadline`: `ddl_lock` prefers readers, so on a table that is
+/// never idle the commit would otherwise wait forever. Abandoning is always
+/// safe: the output was never published, so deleting it leaves the inputs
+/// live for a later sweep. Returns false when abandoned.
+pub fn commitMergeBefore(t: *Table, pending: *PendingMerge, deadline: Io.Clock.Timestamp) !bool {
+    if (!t.ddl_lock.lockBefore(t.io, deadline)) {
+        std.log.warn("compaction abandoned: readers held table '{s}' past the commit deadline", .{t.name});
+        try t.deleteSegmentFiles(pending.new_seg_id);
+        return false;
+    }
+    defer t.ddl_lock.unlock(t.io);
+    return commitMergeLocked(t, pending);
+}
+
+/// The commit, with `ddl_lock` held exclusive. Returns false when late
+/// deletes on a keyless table forced it to abandon the merge.
+fn commitMergeLocked(t: *Table, pending: *PendingMerge) !bool {
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
 
@@ -858,7 +880,7 @@ pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
             // output instead; the compactor re-picks with fresh tombstones.
             std.log.warn("compaction abandoned: {d} delete(s) landed mid-merge on keyless table", .{late.items.len});
             try t.deleteSegmentFiles(pending.new_seg_id);
-            return;
+            return false;
         }
         try collectKeysForOffsets(t, la, &late_keys, id, late.items);
     }
@@ -919,6 +941,7 @@ pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
     pending.new_entry = null;
 
     for (pending.seg_ids) |id| try t.deleteSegmentFiles(id);
+    return true;
 }
 
 /// Decode the order keys of `offsets` (sorted, segment-absolute) in segment
@@ -1171,6 +1194,78 @@ test "a statement opens another scan on a table whose merge commit waits for its
     thread.join();
     try std.testing.expectEqual(@as(?anyerror, null), commit.result);
     try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+}
+
+fn countSegmentDataFiles(dir: std.Io.Dir, io: std.Io) !usize {
+    var iter_dir = try dir.openDir(io, ".", .{ .iterate = true });
+    defer iter_dir.close(io);
+    var it = iter_dir.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".dat")) n += 1;
+    }
+    return n;
+}
+
+test "a background merge abandons its commit when readers outlast the deadline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    try t.insert(&.{ .{ .id = @as(i64, 1), .v = @as(i32, 10) }, .{ .id = @as(i64, 2), .v = @as(i32, 20) } });
+    try t.flush();
+    try t.insert(&.{ .{ .id = @as(i64, 3), .v = @as(i32, 30) }, .{ .id = @as(i64, 4), .v = @as(i32, 40) } });
+    try t.flush();
+    const input_ids = [_]u64{
+        t.manifest.segments.items[0].segment_id,
+        t.manifest.segments.items[1].segment_id,
+    };
+
+    // A reader that never lets go: the merge writes its output, waits out the
+    // deadline, then deletes the output and leaves the inputs published.
+    t.ddl_lock.lockSharedUncancelable(io);
+    const landed = mergeInBackground(t, &input_ids, .fromMilliseconds(50)) catch |err| {
+        t.ddl_lock.unlockShared(io);
+        return err;
+    };
+    t.ddl_lock.unlockShared(io);
+    try std.testing.expect(!landed);
+    try std.testing.expectEqual(@as(usize, 2), t.manifest.segments.items.len);
+    try std.testing.expectEqual(input_ids[0], t.manifest.segments.items[0].segment_id);
+    try std.testing.expectEqual(input_ids[1], t.manifest.segments.items[1].segment_id);
+    try std.testing.expectEqual(@as(usize, 2), try countSegmentDataFiles(t.segments_dir, io));
+
+    // With the reader gone the same group merges and keeps every row.
+    try std.testing.expect(try mergeInBackground(t, &input_ids, .fromSeconds(10)));
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+    try std.testing.expectEqual(@as(usize, 1), try countSegmentDataFiles(t.segments_dir, io));
+
+    var name_buf: [32]u8 = undefined;
+    const file_name = try Table.segmentFileName(&name_buf, t.manifest.segments.items[0].segment_id);
+    var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
+    defer seg.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    for (seg.info.row_groups, 0..) |_, rg_idx| {
+        var c = try seg.decodeColumn(allocator, schema, rg_idx, 0);
+        defer c.deinit(allocator);
+        try ids.appendSlice(allocator, c.data.bigint);
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4 }, ids.items);
 }
 
 test "segmentTier buckets row counts logarithmically" {
