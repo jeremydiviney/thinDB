@@ -7,8 +7,8 @@
 //!   - parenthesized sub-expressions
 //!   - composition with the existing scalar-function call syntax
 //!   - the natural "delta" pattern from the LAG bench
-//!   - integer division-by-zero returns 0 (MOD/DIV convention)
-//!   - integer overflow raises ArithmeticOverflow instead of wrapping
+//!   - integer DIV / MOD by zero returns NULL
+//!   - integer result types and wrapping match StarRocks (DESIGN.md §3.4)
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -221,7 +221,7 @@ test "binary arith: scalar call as binary operand" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 91, 82, 73 }, got);
 }
 
-test "binary arith: division by zero — slash follows IEEE, DIV returns 0" {
+test "binary arith: division by zero — slash follows IEEE, DIV and MOD return NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -230,16 +230,16 @@ test "binary arith: division by zero — slash follows IEEE, DIV returns 0" {
     defer db.close();
     try seedSimple(allocator, db);
 
-    // `/` widens to double, so /0 is IEEE infinity (MySQL's NULL-on-zero is
-    // a dialect follow-up — kernels don't write validity today). DIV keeps
-    // the integer-kernel convention of 0.
-    var q = try runSql(allocator, db, "SELECT qty / 0 AS d, qty DIV 0 AS i FROM t ORDER BY id ASC");
+    // `/` widens to double, so /0 is IEEE infinity (StarRocks' NULL-on-zero
+    // for `/` is a dialect follow-up).
+    var q = try runSql(allocator, db, "SELECT qty / 0 AS d, qty DIV 0 AS i, qty % 0 AS r FROM t ORDER BY id ASC");
     defer q.deinit();
     var n: usize = 0;
     while (try q.next()) |b| {
         for (0..b.row_count) |r| {
             try std.testing.expect(std.math.isInf(b.values[0].data.double[r]));
-            try std.testing.expectEqual(@as(i64, 0), b.values[1].data.bigint[r]);
+            try std.testing.expect(!b.values[1].isValid(r));
+            try std.testing.expect(!b.values[2].isValid(r));
             n += 1;
         }
     }
@@ -257,41 +257,69 @@ test "binary arith: division by zero — slash follows IEEE, DIV returns 0" {
 // queries either skip the LAG or skip the arithmetic. Tracked as a
 // follow-up to either of those grammar extensions.
 
-test "binary arith: integer overflow raises instead of wrapping" {
+fn firstIntValue(q: *RunResult) !?i128 {
+    const b = (try q.next()) orelse return error.NoRows;
+    if (!b.values[0].isValid(0)) return null;
+    return switch (b.values[0].data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |vals| vals[0],
+        else => error.UnexpectedType,
+    };
+}
+
+// Expected values are what StarRocks 4.0.10 returns for the same query.
+test "binary arith: integer result types and wrapping match StarRocks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
-    defer db.close();
+    const TypeTag = thindb.types.TypeTag;
+    const bigint_min: i128 = std.math.minInt(i64);
+    const bigint_max: i128 = std.math.maxInt(i64);
 
-    var q1 = try runSql(allocator, db, "CREATE TABLE o (id BIGINT PRIMARY KEY, i INT NOT NULL, n INT, b BIGINT NOT NULL, m INT NOT NULL)");
-    defer q1.deinit();
-    _ = try q1.next();
-    var q2 = try runSql(allocator, db, "INSERT INTO o VALUES (1, 2000000000, 2000000000, 9000000000000000000, -2147483648)");
-    defer q2.deinit();
-    _ = try q2.next();
-
-    const overflowing = [_][]const u8{
-        "SELECT i * 2 FROM o",
-        "SELECT i + i FROM o",
-        "SELECT n + n FROM o",
-        "SELECT b * 2 FROM o",
-        "SELECT b + b FROM o",
-        "SELECT -m FROM o",
-        "SELECT abs(m) FROM o",
-        "SELECT m DIV -1 FROM o",
+    const cases = .{
+        .{ "SELECT 2147483647 + 1", TypeTag.bigint, @as(?i128, 2147483648) },
+        .{ "SELECT x * 1000000 FROM o", TypeTag.bigint, @as(?i128, 5000000000) },
+        .{ "SELECT i + i FROM o", TypeTag.bigint, @as(?i128, 4000000000) },
+        .{ "SELECT n + n FROM o", TypeTag.bigint, @as(?i128, 4000000000) },
+        .{ "SELECT i * 2 FROM o", TypeTag.bigint, @as(?i128, 4000000000) },
+        .{ "SELECT i - 1 FROM o", TypeTag.bigint, @as(?i128, 1999999999) },
+        .{ "SELECT s + s FROM o", TypeTag.int, @as(?i128, 65534) },
+        .{ "SELECT s + 1 FROM o", TypeTag.int, @as(?i128, 32768) },
+        .{ "SELECT -s FROM o", TypeTag.int, @as(?i128, -32767) },
+        .{ "SELECT -m FROM o", TypeTag.bigint, @as(?i128, 2147483648) },
+        .{ "SELECT abs(m) FROM o", TypeTag.bigint, @as(?i128, 2147483648) },
+        .{ "SELECT abs(s) FROM o", TypeTag.int, @as(?i128, 32767) },
+        .{ "SELECT 9223372036854775807 + 1", TypeTag.bigint, @as(?i128, bigint_min) },
+        .{ "SELECT b + b FROM o", TypeTag.bigint, @as(?i128, -446744073709551616) },
+        .{ "SELECT b * 2 FROM o", TypeTag.bigint, @as(?i128, -446744073709551616) },
+        .{ "SELECT bm - 2 FROM o", TypeTag.bigint, @as(?i128, bigint_max) },
+        .{ "SELECT -(bm - 1) FROM o", TypeTag.bigint, @as(?i128, bigint_min) },
+        // StarRocks returns LARGEINT 9223372036854775808 here (DESIGN.md §3.4).
+        .{ "SELECT abs(bm - 1) FROM o", TypeTag.bigint, @as(?i128, bigint_min) },
+        .{ "SELECT m DIV -1 FROM o", TypeTag.int, @as(?i128, -2147483648) },
+        .{ "SELECT (bm - 1) DIV -1 FROM o", TypeTag.bigint, @as(?i128, bigint_min) },
+        .{ "SELECT i DIV 7 FROM o", TypeTag.int, @as(?i128, 285714285) },
+        .{ "SELECT m % -1 FROM o", TypeTag.int, @as(?i128, 0) },
+        .{ "SELECT b % -1 FROM o", TypeTag.bigint, @as(?i128, 0) },
+        .{ "SELECT i DIV 0 FROM o", TypeTag.int, @as(?i128, null) },
+        .{ "SELECT i % 0 FROM o", TypeTag.int, @as(?i128, null) },
+        .{ "SELECT i DIV z FROM o", TypeTag.int, @as(?i128, null) },
+        .{ "SELECT b % z FROM o", TypeTag.bigint, @as(?i128, null) },
     };
-    for (overflowing) |sql| {
-        var q = try runSql(allocator, db, sql);
-        defer q.deinit();
-        try std.testing.expectError(error.ArithmeticOverflow, q.next());
-    }
 
-    var q = try runSql(allocator, db, "SELECT i - 1 AS a, m % -1 AS r, i DIV 7 AS d FROM o");
-    defer q.deinit();
-    const b = (try q.next()).?;
-    try std.testing.expectEqual(@as(i32, 1999999999), b.values[0].data.int[0]);
-    try std.testing.expectEqual(@as(i32, 0), b.values[1].data.int[0]);
-    try std.testing.expectEqual(@as(i32, 285714285), b.values[2].data.int[0]);
+    for ([_]bool{ false, true }) |flushed| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        try helpers.exec(allocator, db, "CREATE TABLE o (id BIGINT PRIMARY KEY, i INT NOT NULL, n INT, b BIGINT NOT NULL, m INT NOT NULL, bm BIGINT NOT NULL, s SMALLINT NOT NULL, x INT NOT NULL, z INT NOT NULL)");
+        try helpers.exec(allocator, db, "INSERT INTO o VALUES (1, 2000000000, 2000000000, 9000000000000000000, -2147483648, -9223372036854775807, 32767, 5000, 0)");
+        if (flushed) try (try db.openTable("o", .{})).flush();
+
+        inline for (cases) |c| {
+            var q = try runSql(allocator, db, c[0]);
+            defer q.deinit();
+            errdefer std.debug.print("case: {s} (flushed={})\n", .{ c[0], flushed });
+            try std.testing.expectEqual(c[1], std.meta.activeTag(q.outputSchema()[0].type));
+            try std.testing.expectEqual(c[2], try firstIntValue(&q));
+        }
+    }
 }

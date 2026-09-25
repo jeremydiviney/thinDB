@@ -1004,10 +1004,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
     // set computed once, then derive every original output. Q29's 90
     // SUM(ResolutionWidth+k) become SUM+COUNT + a post-agg Compute. Only when
     // there's no HAVING (it would bind to the original aliases the base set
-    // replaces; global+HAVING is declined regardless). Tried BEFORE the
-    // metadata lane: a reduced integer SUM narrows through `__narrow_bigint`'s
-    // i64 range check (the documented overflow dialect), which the metadata
-    // lane's canonical-type emit would silently skip.
+    // replaces; global+HAVING is declined regardless).
     if (plan.having_filter == null and plan.post_derived.len == 0) {
         if (try affine_agg.reduce(input.node_arena, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
             return try buildGlobalAggregateReduced(input, table, plan, red);

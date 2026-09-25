@@ -153,7 +153,7 @@ test "qualified pruning respects limits windows and aggregate outputs" {
         defer query.deinit();
         const batch = (try query.next()).?;
         try std.testing.expectEqual(@as(usize, 1), batch.row_count);
-        try std.testing.expectEqual(@as(i128, 312), batch.values[0].data.largeint[0]);
+        try std.testing.expectEqual(@as(i64, 312), batch.values[0].data.bigint[0]);
         try std.testing.expect((try query.next()) == null);
     }
 }

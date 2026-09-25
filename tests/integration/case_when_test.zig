@@ -231,9 +231,9 @@ test "case: CASE expression continued by arithmetic over a window call" {
     defer q.deinit();
     const batch = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 3), batch.row_count);
-    try std.testing.expectEqual(@as(i32, 0), batch.values[1].data.int[0]);
-    try std.testing.expectEqual(@as(i32, 1), batch.values[1].data.int[1]);
-    try std.testing.expectEqual(@as(i32, 0), batch.values[1].data.int[2]);
+    try std.testing.expectEqual(@as(i64, 0), batch.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 1), batch.values[1].data.bigint[1]);
+    try std.testing.expectEqual(@as(i64, 0), batch.values[1].data.bigint[2]);
 }
 
 test "case: bare NULL branch adopts the typed branches' type" {

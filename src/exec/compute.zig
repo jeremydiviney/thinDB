@@ -1048,63 +1048,60 @@ pub const Compute = struct {
     /// Evaluate a fused `col <op> const` directly into `out_col` in one
     /// widening SIMD pass — no cast column, no replicated-literal column.
     /// Only built for non-nullable int/float source columns (see tryFuseScalar),
-    /// so there is no validity bitmap to propagate and every overflowed lane
-    /// is a real row.
+    /// so there is no validity bitmap to propagate. Integer lanes wrap at the
+    /// output width, exactly as the generic integer kernels do.
     fn evalFusedScalar(self: *Compute, fs: FusedScalar, in_values: []const ColumnView, out_col: *ColumnStore, n: usize) !void {
         const src = in_values[fs.src_idx];
-        const overflowed = switch (fs.out_type) {
-            .int => blk: {
+        switch (fs.out_type) {
+            .int => {
                 try out_col.data.int.ensureUnusedCapacity(self.allocator, n);
                 out_col.data.int.items.len = n;
                 const dst = out_col.data.int.items[0..n];
                 const s: i32 = @intCast(fs.scalar_i);
-                break :blk switch (fs.src_type) {
+                switch (fs.src_type) {
                     .tinyint => runScalar(i8, i32, fs.op, fs.col_left, src.data.tinyint[0..n], s, dst),
                     .smallint => runScalar(i16, i32, fs.op, fs.col_left, src.data.smallint[0..n], s, dst),
-                    .int => runScalar(i32, i32, fs.op, fs.col_left, src.data.int[0..n], s, dst),
                     .boolean => runScalar(u8, i32, fs.op, fs.col_left, src.data.boolean[0..n], s, dst),
                     else => unreachable,
-                };
+                }
             },
-            .bigint => blk: {
+            .bigint => {
                 try out_col.data.bigint.ensureUnusedCapacity(self.allocator, n);
                 out_col.data.bigint.items.len = n;
                 const dst = out_col.data.bigint.items[0..n];
                 const s: i64 = fs.scalar_i;
-                break :blk switch (fs.src_type) {
+                switch (fs.src_type) {
                     .tinyint => runScalar(i8, i64, fs.op, fs.col_left, src.data.tinyint[0..n], s, dst),
                     .smallint => runScalar(i16, i64, fs.op, fs.col_left, src.data.smallint[0..n], s, dst),
                     .int => runScalar(i32, i64, fs.op, fs.col_left, src.data.int[0..n], s, dst),
                     .bigint => runScalar(i64, i64, fs.op, fs.col_left, src.data.bigint[0..n], s, dst),
                     .boolean => runScalar(u8, i64, fs.op, fs.col_left, src.data.boolean[0..n], s, dst),
                     else => unreachable,
-                };
+                }
             },
-            .double => blk: {
+            .double => {
                 try out_col.data.double.ensureUnusedCapacity(self.allocator, n);
                 out_col.data.double.items.len = n;
                 const dst = out_col.data.double.items[0..n];
                 const s: f64 = fs.scalar_f;
-                break :blk switch (fs.src_type) {
+                switch (fs.src_type) {
                     .float => runScalar(f32, f64, fs.op, fs.col_left, src.data.float[0..n], s, dst),
                     .double => runScalar(f64, f64, fs.op, fs.col_left, src.data.double[0..n], s, dst),
                     else => unreachable,
-                };
+                }
             },
             else => unreachable,
-        };
-        if (overflowed) return Error.ArithmeticOverflow;
+        }
     }
 };
 
 /// Bridge the runtime op/direction to the comptime-specialized SIMD kernel.
-/// Returns whether an integer lane overflowed.
-fn runScalar(comptime Tsrc: type, comptime Tout: type, op: simd.BinOp, col_left: bool, src: []const Tsrc, scalar: Tout, dst: []Tout) bool {
-    return switch (op) {
+fn runScalar(comptime Tsrc: type, comptime Tout: type, op: simd.BinOp, col_left: bool, src: []const Tsrc, scalar: Tout, dst: []Tout) void {
+    switch (op) {
         inline else => |o| switch (col_left) {
             inline else => |cl| simd.scalarOp(Tsrc, Tout, o, cl, src, scalar, dst),
         },
-    };
+    }
 }
 
 fn fusableSrc(t: Type) bool {
@@ -1195,8 +1192,10 @@ fn tryFuseScalar(aa: Allocator, expr: Expr, up_schema: []const Column) !?FusedSc
     // Canonical output type from the real overload resolution, so the derived
     // column's type matches what the rest of the plan expects.
     var arg_types: [2]Type = undefined;
-    arg_types[0] = if (col_left) src_type else literalType(lit_v);
-    arg_types[1] = if (col_left) literalType(lit_v) else src_type;
+    const lit_idx: usize = if (col_left) 1 else 0;
+    arg_types[1 - lit_idx] = src_type;
+    arg_types[lit_idx] = literalType(lit_v);
+    arg_types[lit_idx] = literalType(scalar_fn.arithOperandLiteral(c.fn_name, &arg_types, lit_v));
     const r = (try scalar_fn.resolve(aa, c.fn_name, &arg_types)) orelse return null;
     const out_type = r.func.return_type;
 
@@ -1471,8 +1470,8 @@ fn typeRangeI128(t: Type) ?struct { lo: i128, hi: i128 } {
 }
 
 /// A derived [min,max] is only kept when both endpoints fit `out_type`: the
-/// integer kernels raise `ArithmeticOverflow` for any value outside it, so a
-/// computed bound that escapes that width is not a tight one. Null otherwise.
+/// integer kernels wrap any value outside it, so a computed bound that
+/// escapes that width bounds nothing. Null otherwise.
 fn provableRange(out_type: Type, min: ?i128, max: ?i128) struct { min: ?i128, max: ?i128 } {
     const lo = min orelse return .{ .min = null, .max = null };
     const hi = max orelse return .{ .min = null, .max = null };
@@ -1913,6 +1912,18 @@ fn buildCallPlan(
         }
         built += 1;
     }
+    // Retyping a literal never changes whether the call is integer arithmetic,
+    // so later literals still see the right decision.
+    for (arg_plans, arg_types) |ap, *at| {
+        if (ap != .lit) continue;
+        const slot = ap.lit;
+        const typed = scalar_fn.arithOperandLiteral(c.fn_name, arg_types, slot.value);
+        if (std.meta.activeTag(typed) == std.meta.activeTag(slot.value)) continue;
+        replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, literalType(typed), false));
+        slot.value = typed;
+        slot.ty = literalType(typed);
+        at.* = slot.ty;
+    }
 
     var r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     const coerce_literals = if (r) |resolved| parsesTextToTemporal(resolved.func) else true;
@@ -1952,9 +1963,11 @@ fn buildCallPlan(
     output_buf.* = try ColumnStore.init(runtime_allocator, rr.func.return_type, true);
     errdefer output_buf.deinit(runtime_allocator);
 
+    var func = rr.func;
+    if (nonzeroLiteralDivisor(func, arg_plans)) func.null_strategy = .propagates;
     const plan = try aa.create(CallPlan);
     plan.* = .{
-        .func = rr.func,
+        .func = func,
         .args = arg_plans,
         .arg_runtime_types = arg_types,
         .arg_casts = rr.arg_casts,
@@ -1964,6 +1977,21 @@ fn buildCallPlan(
         .output_type = rr.func.return_type,
     };
     return plan;
+}
+
+/// Integer DIV/MOD owns its validity bitmap only to emit NULL for a zero
+/// divisor. A nonzero literal divisor never does, so the result is exactly as
+/// nullable as its operands (`x % 10` over a NOT NULL column stays NOT NULL);
+/// the kernel's bits then match what `.propagates` rewrites.
+fn nonzeroLiteralDivisor(func: scalar_fn.ScalarFn, args: []const ArgPlan) bool {
+    if (func.null_strategy != .kernel_managed or args.len != 2) return false;
+    const op = scalar_fn.intArithOp(func.name) orelse return false;
+    if (op != .intdiv and op != .mod) return false;
+    const divisor = switch (args[1]) {
+        .lit => |slot| intFamilyValueI128(slot.value) orelse return false,
+        else => return false,
+    };
+    return divisor != 0;
 }
 
 /// MySQL/StarRocks coerce string LITERALS to temporal types in temporal

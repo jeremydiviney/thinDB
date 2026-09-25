@@ -2329,7 +2329,7 @@ pub const RegionWorker = struct {
                         const cell = &cells.items[gi];
                         if (cell.seen) {
                             switch (dst.data) {
-                                .bigint => |*values| try values.append(alloc, std.math.cast(i64, cell.i) orelse return error.ArithmeticOverflow),
+                                .bigint => |*values| try values.append(alloc, @truncate(cell.i)),
                                 .largeint => |*values| try values.append(alloc, cell.i),
                                 else => unreachable,
                             }
@@ -3630,7 +3630,7 @@ fn aggregateSideBin(sex: *Exchange, ag: SideAgg, bin: Bin, ssd: *ShardData, sa: 
                 continue;
             }
             switch (dst.data) {
-                .bigint => |*l| try l.append(sex.alloc, std.math.cast(i64, a.i) orelse return error.UnsupportedQueryShape),
+                .bigint => |*l| try l.append(sex.alloc, @truncate(a.i)),
                 .largeint, .decimal128 => |*l| try l.append(sex.alloc, a.i),
                 .double => |*l| try l.append(sex.alloc, a.f),
                 else => return error.UnsupportedQueryShape,
@@ -5181,6 +5181,31 @@ test "region program: wide sum reports i128 overflow" {
     var out = [_]ColumnStore{try ColumnStore.init(alloc, .largeint, true)};
     defer out[0].deinit(alloc);
     try testing.expectError(error.ArithmeticOverflow, worker.runShard(&shard, &out));
+}
+
+test "region program: BIGINT sum wraps like StarRocks" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "v", .type = .bigint },
+    };
+    var shard = ShardData{};
+    defer shard.deinit(alloc);
+    try shard.ensure(alloc, &entry);
+    try shard.cols[0].data.bigint.appendSlice(alloc, &.{ std.math.maxInt(i64), 1 });
+    shard.rows = 2;
+    try shard.ranges.append(alloc, .{ 0, 2 });
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &.{}, .out = &.{.{ .name = "total", .kind = .{ .sum_int = 0 } }} } },
+        .{ .emit = .{ .cols = &.{0} } },
+    };
+    var program = try Program.build(alloc, &entry, &ops, null);
+    defer program.deinit();
+    var worker = try RegionWorker.init(alloc, &program);
+    defer worker.deinit();
+    var out = [_]ColumnStore{try ColumnStore.init(alloc, .bigint, true)};
+    defer out[0].deinit(alloc);
+    try worker.runShard(&shard, &out);
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), out[0].view().data.bigint[0]);
 }
 
 test "region program: ranks merge_on spans adjacent same-key ranges" {

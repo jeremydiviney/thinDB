@@ -556,15 +556,14 @@ test "createOverStage + fused partial aggregate drains without corruption" {
     // Each stripe worker emits partial groups; summed across every partial row
     // the count column (and the SUM(v=1) column) must each equal n — every row
     // counted exactly once across the parallel stripes, none dropped/doubled.
-    // COUNT(*) stays bigint; SUM(bigint) widens to a largeint (i128) accumulator.
     var total_count: i64 = 0;
-    var total_sum: i128 = 0;
+    var total_sum: i64 = 0;
     while (try up.next()) |b| {
         for (b.values[1].data.bigint) |c| total_count += c;
-        for (b.values[2].data.largeint) |s| total_sum += s;
+        for (b.values[2].data.bigint) |s| total_sum += s;
     }
     try std.testing.expectEqual(@as(i64, @intCast(n)), total_count);
-    try std.testing.expectEqual(@as(i128, @intCast(n)), total_sum);
+    try std.testing.expectEqual(@as(i64, @intCast(n)), total_sum);
 }
 
 /// A parallel-scan worker leaf — either a range-restricted segment `Scan`

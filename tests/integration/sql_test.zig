@@ -590,13 +590,13 @@ test "sql: FROM-less SELECT evaluates expressions over one row" {
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    // SELECT 1 + 1 — one row, no FROM.
+    // SELECT 1 + 1 — one row, no FROM; TINYINT + TINYINT is SMALLINT.
     {
         var q = try runSql(allocator, db, "SELECT 1 + 1 AS s");
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(usize, 1), b.row_count);
-        try std.testing.expectEqual(@as(i32, 2), b.values[0].data.int[0]);
+        try std.testing.expectEqual(@as(i16, 2), b.values[0].data.smallint[0]);
         try std.testing.expect((try q.next()) == null);
     }
     // SELECT now() — real wall-clock, no FROM.
@@ -976,7 +976,7 @@ test "sql: mixed star and expression projection preserves source columns first" 
     try std.testing.expectEqualStrings("next_qty", schema[4].name);
 
     const b = (try q.next()).?;
-    try std.testing.expectEqual(@as(i32, 11), b.values[4].data.int[0]);
+    try std.testing.expectEqual(@as(i64, 11), b.values[4].data.bigint[0]);
 }
 
 test "sql: computed projection can replace a star-expanded source column" {
@@ -998,7 +998,7 @@ test "sql: computed projection can replace a star-expanded source column" {
     try std.testing.expectEqualStrings("tag", schema[3].name);
 
     const b = (try q.next()).?;
-    try std.testing.expectEqual(@as(i32, 11), b.values[2].data.int[0]);
+    try std.testing.expectEqual(@as(i64, 11), b.values[2].data.bigint[0]);
     try std.testing.expectEqualStrings("a", b.values[3].data.string.rowBytes(0));
 }
 
@@ -1297,7 +1297,7 @@ test "sql: GROUP BY with count(*) and sum(qty)" {
     try std.testing.expect(seen_a and seen_b and seen_c);
 }
 
-test "sql: grouped SUM/AVG over BIGINT accumulate in i128 (wide two-slot state)" {
+test "sql: grouped SUM over BIGINT wraps, AVG stays exact (wide two-slot state)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1337,17 +1337,19 @@ test "sql: grouped SUM/AVG over BIGINT accumulate in i128 (wide two-slot state)"
     while (try q.next()) |b| {
         for (0..b.row_count) |i| {
             const tag = b.values[0].data.string.rowBytes(i);
-            const s = b.values[1].data.largeint[i];
+            const s = b.values[1].data.bigint[i];
             const a = b.values[2].data.double[i];
             const c = b.values[3].data.bigint[i];
+            // SUM wraps to BIGINT like StarRocks (3·4e18 − 2^64); AVG divides
+            // the exact sum.
             if (std.mem.eql(u8, tag, "a")) {
                 seen_a = true;
-                try std.testing.expectEqual(@as(i128, 3) * big, s);
+                try std.testing.expectEqual(@as(i64, -6446744073709551616), s);
                 try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(big)), a, 1e-12);
                 try std.testing.expectEqual(@as(i64, 3), c);
             } else if (std.mem.eql(u8, tag, "b")) {
                 seen_b = true;
-                try std.testing.expectEqual(@as(i128, -3) * big, s);
+                try std.testing.expectEqual(@as(i64, 6446744073709551616), s);
                 try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(-big)), a, 1e-12);
                 try std.testing.expectEqual(@as(i64, 3), c);
             } else return error.UnexpectedTag;
@@ -1703,7 +1705,7 @@ test "sql: GROUP BY alias of a computed expression" {
     defer kps.deinit(allocator);
     defer counts.deinit(allocator);
     while (try q.next()) |b| {
-        for (b.values[0].data.int[0..b.row_count]) |v| try kps.append(allocator, v);
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try kps.append(allocator, v);
         for (b.values[1].data.bigint[0..b.row_count]) |v| try counts.append(allocator, v);
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 101, 201, 301 }, kps.items);
@@ -1911,14 +1913,12 @@ test "sql: CASE result branches coerce numeric widths" {
     }
 
     {
-        // SUM over a bigint CASE widens to LARGEINT (i128) on this engine
-        // (overflow-safe SUM), unlike the bare bigint the branch type implies.
         var q = try runSql(allocator, db,
             \\SELECT SUM(CASE WHEN tag = 'a' THEN id ELSE 0 END) AS total FROM t
         );
         defer q.deinit();
         const b = (try q.next()).?;
-        try std.testing.expectEqual(@as(i128, 4), b.values[0].data.largeint[0]);
+        try std.testing.expectEqual(@as(i64, 4), b.values[0].data.bigint[0]);
     }
 }
 
@@ -3308,7 +3308,8 @@ test "sql: slash is true division; DIV is integer division" {
     defer q.deinit();
     const b = (try q.next()).?;
     try std.testing.expectApproxEqAbs(@as(f64, 3.5), b.values[0].data.double[0], 1e-12);
-    try std.testing.expectEqual(@as(i32, 3), b.values[1].data.int[0]);
+    // TINYINT DIV TINYINT keeps the common type.
+    try std.testing.expectEqual(@as(i8, 3), b.values[1].data.tinyint[0]);
 }
 
 test "sql: aggregate expressions in global (ungrouped) selects" {

@@ -96,21 +96,49 @@ Columns are **NOT NULL by default**. To allow nulls, mark explicitly:
 
 `NOT NULL` columns carry no null metadata. Nullable columns carry a **1-bit-per-row null bitmap**, co-located with the column data in each row group. Standard Arrow/Parquet layout.
 
-### 3.4 Decimal arithmetic
+### 3.4 Arithmetic
 
-Following DuckDB semantics: precise, predictable, errors on overflow at row-level.
+Integer arithmetic matches StarRocks (4.0.10): result types widen one level
+and BIGINT wraps silently. Decimal arithmetic follows DuckDB: precise, and an
+error on overflow at row level.
 
-**Aggregates promote the accumulator type**:
+**Integer operators** (both operands integers; BOOLEAN counts as the narrowest):
+
+| Operation | Result type | Overflow |
+|---|---|---|
+| `a + b`, `a - b`, `a * b` | common type widened one level: TINYINT→SMALLINT, SMALLINT→INT, INT→BIGINT, BIGINT→BIGINT | BIGINT wraps (two's complement): `BIGINT_MAX + 1 = BIGINT_MIN`, `BIGINT_MAX * 2 = -2` |
+| `-a` | `a`'s type widened one level (parsed as `0 - a`) | `-BIGINT_MIN = BIGINT_MIN` |
+| `a DIV b`, `a % b` | common type | `INT_MIN DIV -1 = INT_MIN`, `BIGINT_MIN DIV -1 = BIGINT_MIN`, `x % -1 = 0`; a zero divisor gives NULL |
+| `ABS(a)` | SMALLINT→INT, INT→BIGINT, BIGINT→BIGINT | `ABS(BIGINT_MIN) = BIGINT_MIN` |
+| `a / b` | `DOUBLE` (or `DECIMAL`) | IEEE; `/ 0` is ±inf |
+
+An integer literal in integer arithmetic takes the narrowest type that holds
+it, so `SELECT 2147483647 + 1` is INT + TINYINT → BIGINT `2147483648`, and
+`smallint_col + 1` is INT. The result type is decided once, in
+`scalar_fn.intArithResultType`; kernels convert both operands to it and use
+wrapping ops. LARGEINT operands stay LARGEINT. A widened result passed to a
+function's narrower integer parameter narrows back, as in StarRocks (see
+implicit type coercion).
+
+Known difference: StarRocks returns LARGEINT for `ABS(BIGINT)`, so
+`ABS(BIGINT_MIN)` is `9223372036854775808` there. thinDB keeps BIGINT, which
+wraps to `BIGINT_MIN`.
+
+**Aggregates**:
 
 | Input column type | `SUM` result |
 |---|---|
-| Any integer type | `LARGEINT` (i128). Errors at i128 overflow. |
+| Any integer type up to `BIGINT` | `BIGINT`. Wraps on overflow, like the operators. |
+| `LARGEINT` | `LARGEINT` |
 | `FLOAT`, `DOUBLE` | `DOUBLE` |
 | `DECIMAL(p, s)` | `DECIMAL(38, s)`. Errors at the i128 ceiling. |
 
-`MIN`/`MAX` return the input type. `AVG` returns `DOUBLE`. `COUNT` returns `BIGINT`.
-
-**Row-level arithmetic** stays in the column's declared type. Overflow is an error (`thindb.Error.ArithmeticOverflow`). To get wider math, the user explicitly casts upstream.
+Every SUM path (generic, V2 handlers, radix, region, SMA metadata, affine
+reduction) accumulates exactly in i128 and truncates to BIGINT at emit. That
+equals the wrapped sum, because truncation commutes with addition mod 2^64.
+ORDER BY and HAVING on a SUM see the emitted, wrapped value. `AVG` divides the
+exact sum and returns `DOUBLE`. `MIN`/`MAX` return the input type. `COUNT`
+returns `BIGINT`.
 
 **Decimal precision/scale propagation**:
 
@@ -570,8 +598,9 @@ spilled temporary tables disable this program cache instead of relying on
 reusable allocation addresses as table identities.
 
 Regional windows append results in the original row positions, so independent
-window orders can coexist. Integer sums retain ordinary SQL promotion: `SUM(BIGINT)` and
-`SUM(LARGEINT)` use checked i128 accumulation and return `LARGEINT`.
+window orders can coexist. Integer sums follow §3.4: `SUM` over an integer
+up to BIGINT accumulates in i128 and returns BIGINT, wrapped; `SUM(LARGEINT)`
+uses checked i128 accumulation and returns `LARGEINT`.
 Consolidation keys retain all 64 integer bits plus a distinct NULL marker;
 adjacent BIGINT values must never collapse into one partition.
 
@@ -864,6 +893,8 @@ MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
 
+`ArithmeticOverflow` comes from decimal arithmetic and casts that leave the declared precision, and from `SUM(LARGEINT)` past the i128 range. Integer arithmetic and integer `SUM` up to BIGINT wrap instead of raising it (§3.4).
+
 `DatabaseInUse` means another catalog owns the root's OS lock. `TableBusy` rejects an unsafe same-thread upgrade from a live query lease to destructive DDL. `DatabaseClosed` rejects new operations during close. `DurabilityUncertain` means a file replacement succeeded but parent-directory sync failed. The affected table/catalog is fenced at the persistence boundary, before releasing the mutation lock; queued writers recheck that state after acquiring the table lock. `RecoveryRequired` means that publication or an XA persistence/rollback outcome requires restart recovery; operations are rejected until reopening resolves the journal. XA admission rejects records exceeding its 64 MiB serialized recovery limit (`XaBranchTooLarge`) or invalid XIDs (`XaInvalidXid`, at most 1024 bytes).
 
 Errors propagate to callers. Outside the XA commit protocol, an error is not a blanket guarantee that no effect occurred: durable publication can succeed before later cleanup fails. Retrying non-idempotent writes after an I/O error requires inspecting/recovering the state. Ordinary SQL BEGIN/COMMIT/ROLLBACK currently maintain protocol session status, not a multi-statement undo transaction.
@@ -971,7 +1002,7 @@ Target Zig version: 0.16.
 | **Range / opaque predicates** | Single inequality `a OP b`, multi-range (BETWEEN), `extra_predicate` post-join filter, opaque callback via NLJ. Skew detection + auto-route on top. |
 | **Upserts** | StarRocks-style last-writer-wins on tables with `unique = true`. Insert auto-resolves; `Table.upsert()` is the self-documenting alias. |
 | **Crash durability** | WAL with leader-follower group commit (§8.1). `wal_enabled = true` + `sync_mode = .per_flush`. |
-| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. A string literal where a function takes a date or datetime is parsed once at plan time, including `CAST('…' AS DATE)`. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a date. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. |
+| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). A string literal where a function takes a date or datetime is parsed once at plan time, including `CAST('…' AS DATE)`. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a date. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. |
 | **Statistical / set-oriented aggregates** | `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT`. |
 | **In-process Connection** | `thindb.local(...)` returns a Connection that mediates queries — same surface a future remote-mode Connection will expose. |
 

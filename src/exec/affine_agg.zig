@@ -12,19 +12,20 @@
 //! parallel reducer matches and layer the derivations as an ordinary Compute +
 //! Project; the V1 path (net/local.zig) assembles the same pieces into a Query.
 //!
-//! ## Overflow fidelity (SUM)
-//! The direct path computes `Σ(a·col+b)` by accumulating each per-row
-//! `a·col+b` in i128, narrowing once at the i64 output; a row whose `a·col+b`
-//! overflows its argument arithmetic type raises `ArithmeticOverflow`. The
-//! reduction matches it exactly only when:
-//!   1. The base SUM is pinned to LARGEINT (i128) via `out_type_override`, so it
-//!      never narrows mid-flight, and
-//!   2. `a·col+b` provably cannot overflow its arg arithmetic type for ANY value
-//!      in the base column's declared range (`affineCannotOverflow`), so the
-//!      direct path never raises and `Σ(a·col+b) = a·Σcol + b·n` holds exactly
-//!      in i128. The derivation runs in i128 and narrows with
-//!      `__narrow_bigint`, whose range check matches SUM finalize.
-//! Any aggregate failing the guard is left direct.
+//! ## Overflow fidelity
+//! Integer arithmetic and integer SUM both wrap (DESIGN.md §3.4): a per-row
+//! `a·col+b` either fits its result type or is at least BIGINT wide and wraps
+//! mod 2^64, and SUM returns its exact total mod 2^64 as a BIGINT. Wrapping is
+//! a ring homomorphism, so `Σ(a·col+b) ≡ a·Σcol + b·n (mod 2^64)` for every
+//! input, and the derivation `SUM(col)·a + COUNT(col)·b`, evaluated in
+//! wrapping BIGINT arithmetic, equals the direct SUM bit for bit. A LARGEINT
+//! base or argument stays direct: its i128 SUM has no wrapping definition to
+//! lean on.
+//!
+//! MIN/MAX do not commute with a wrap, so they reduce only when `a·col+b`
+//! provably stays inside its result type for every value of the base column
+//! (`affineCannotOverflow`); the derivation then re-applies the original call
+//! to the base extreme.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -40,17 +41,25 @@ const Derived = ir.Derived;
 const Expr = ir.Expr;
 
 /// One base column's affine decomposition: `value = a·col + b` over the named
-/// base column. For a plain `col` reference a=1, b=0 and `arg_type` is null (no
-/// arithmetic).
+/// base column. For a plain `col` reference a=1, b=0 and `arg_type` and
+/// `call` are null (no arithmetic).
 pub const AffineArg = struct {
     base_col: []const u8,
     a: i128,
     b: i128,
-    /// Declared type of the base column (for the overflow bound on SUM).
+    /// Declared type of the base column (for the MIN/MAX overflow bound).
     base_type: types.Type,
-    /// Arithmetic type the direct `a·col+b` would evaluate (and overflow) in;
-    /// null when the arg is a plain column (no intermediate arithmetic).
+    /// Result type of the direct `a·col+b` call.
     arg_type: ?types.Type,
+    /// The direct call, re-applied to a base extreme to derive MIN/MAX.
+    call: ?AffineCall,
+};
+
+/// `fn_name(col, lit)` (or `fn_name(lit, col)` when `!col_left`).
+pub const AffineCall = struct {
+    fn_name: []const u8,
+    lit: types.Value,
+    col_left: bool,
 };
 
 pub fn typeMinI128(t: types.Type) ?i128 {
@@ -81,7 +90,7 @@ pub fn typeMaxI128(t: types.Type) ?i128 {
     };
 }
 
-/// Type of an integer-family literal — matches the parser's lowering so the
+/// Type of an integer-family literal, as Compute types it, so the
 /// arithmetic-type resolution sees the same overload the direct path picked.
 fn litValueType(v: types.Value) types.Type {
     return switch (v) {
@@ -118,7 +127,7 @@ pub fn affineDecompose(aa: Allocator, up_schema: []const types.Column, e: Expr) 
     switch (e) {
         .col_ref => |name| {
             const idx = types.findColumn(up_schema, name) orelse return null;
-            return AffineArg{ .base_col = name, .a = 1, .b = 0, .base_type = up_schema[idx].type, .arg_type = null };
+            return AffineArg{ .base_col = name, .a = 1, .b = 0, .base_type = up_schema[idx].type, .arg_type = null, .call = null };
         },
         .call => |c| {
             if (c.args.len != 2) return null;
@@ -174,18 +183,26 @@ pub fn affineDecompose(aa: Allocator, up_schema: []const types.Column, e: Expr) 
             }
 
             var arg_types: [2]types.Type = undefined;
-            arg_types[0] = if (col_left) base_type else litValueType(lit_v);
-            arg_types[1] = if (col_left) litValueType(lit_v) else base_type;
+            const lit_idx: usize = if (col_left) 1 else 0;
+            arg_types[1 - lit_idx] = base_type;
+            arg_types[lit_idx] = litValueType(lit_v);
+            arg_types[lit_idx] = litValueType(scalar_fn.arithOperandLiteral(c.fn_name, &arg_types, lit_v));
             const resolved = (try scalar_fn.resolve(aa, c.fn_name, &arg_types)) orelse return null;
-            return AffineArg{ .base_col = col_name, .a = a, .b = b, .base_type = base_type, .arg_type = resolved.func.return_type };
+            return AffineArg{
+                .base_col = col_name,
+                .a = a,
+                .b = b,
+                .base_type = base_type,
+                .arg_type = resolved.func.return_type,
+                .call = .{ .fn_name = c.fn_name, .lit = lit_v, .col_left = col_left },
+            };
         },
         else => return null,
     }
 }
 
 /// True when `a·col+b` provably stays inside `arg_type` for every `col` in
-/// `base_type`'s declared range — so the direct path's overflow check never
-/// fires and `Σ(a·col+b) == a·Σcol + b·n` exactly in i128.
+/// `base_type`'s declared range — so no row wraps and the map is monotonic.
 pub fn affineCannotOverflow(arg: AffineArg) bool {
     const at = arg.arg_type orelse return true; // plain col: no arithmetic
     const lo_base = typeMinI128(arg.base_type) orelse return false;
@@ -239,59 +256,33 @@ pub const BaseAgg = struct {
 };
 
 /// The IR Expr deriving one original output from its base aggregate(s). SUM:
-/// `__narrow_bigint(base_sum·a + base_cnt·b)` in i128 (stays largeint when the
-/// output is largeint). MIN/MAX: `a·base+b` in the arg arithmetic type.
+/// `base_sum·a + base_cnt·b` in wrapping BIGINT arithmetic (a and b reduced
+/// mod 2^64, which the congruence allows). MIN/MAX: the direct call applied to
+/// the base extreme, so the result type is the direct one.
 pub fn buildDerivedExpr(arena: Allocator, r: ReducedAgg, base: BaseAgg) !Expr {
     switch (r.family) {
         .sum => {
-            const sum_ref = try arena.create(Expr);
-            sum_ref.* = .{ .col_ref = base.sum_name };
-            const cnt_ref = try arena.create(Expr);
-            cnt_ref.* = .{ .col_ref = base.count_name };
-
             const a_term = try arena.alloc(Expr, 2);
-            a_term[0] = sum_ref.*;
-            a_term[1] = .{ .lit = .{ .largeint = r.arg.a } };
+            a_term[0] = .{ .col_ref = base.sum_name };
+            a_term[1] = .{ .lit = .{ .bigint = @truncate(r.arg.a) } };
             const b_term = try arena.alloc(Expr, 2);
-            b_term[0] = cnt_ref.*;
-            b_term[1] = .{ .lit = .{ .largeint = r.arg.b } };
+            b_term[0] = .{ .col_ref = base.count_name };
+            b_term[1] = .{ .lit = .{ .bigint = @truncate(r.arg.b) } };
 
             const sum_args = try arena.alloc(Expr, 2);
             sum_args[0] = .{ .call = .{ .fn_name = "mul", .args = a_term } };
             sum_args[1] = .{ .call = .{ .fn_name = "mul", .args = b_term } };
-            const inner: Expr = .{ .call = .{ .fn_name = "add", .args = sum_args } };
-
-            if (r.out_type == .largeint) return inner;
-            const narrow_args = try arena.alloc(Expr, 1);
-            narrow_args[0] = inner;
-            return .{ .call = .{ .fn_name = "__narrow_bigint", .args = narrow_args } };
+            return .{ .call = .{ .fn_name = "add", .args = sum_args } };
         },
         .min, .max => {
-            const base_name = if (r.family == .min) base.min_name else base.max_name;
-            const col_ref = try arena.create(Expr);
-            col_ref.* = .{ .col_ref = base_name };
-            var scaled: Expr = col_ref.*;
-            if (r.arg.a != 1) {
-                const a_args = try arena.alloc(Expr, 2);
-                a_args[0] = col_ref.*;
-                a_args[1] = .{ .lit = litForI128(r.arg.a) };
-                scaled = .{ .call = .{ .fn_name = "mul", .args = a_args } };
-            }
-            if (r.arg.b == 0) return scaled;
-            const b_args = try arena.alloc(Expr, 2);
-            b_args[0] = scaled;
-            b_args[1] = .{ .lit = litForI128(r.arg.b) };
-            return .{ .call = .{ .fn_name = "add", .args = b_args } };
+            const extreme: Expr = .{ .col_ref = if (r.family == .min) base.min_name else base.max_name };
+            const call = r.arg.call orelse return extreme;
+            const args = try arena.alloc(Expr, 2);
+            args[0] = if (call.col_left) extreme else .{ .lit = call.lit };
+            args[1] = if (call.col_left) .{ .lit = call.lit } else extreme;
+            return .{ .call = .{ .fn_name = call.fn_name, .args = args } };
         },
     }
-}
-
-/// Smallest integer-family Value holding `v` — matches the parser's literal
-/// typing so coercion in the derived Compute picks the direct path's width.
-pub fn litForI128(v: i128) types.Value {
-    if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) return .{ .int = @intCast(v) };
-    if (v >= std.math.minInt(i64) and v <= std.math.maxInt(i64)) return .{ .bigint = @intCast(v) };
-    return .{ .largeint = v };
 }
 
 /// `desired` if unused among `taken`, else a `desired__<idx>` suffix that is.
@@ -309,14 +300,14 @@ pub fn uniqueOutputName(arena: Allocator, taken: []const []const u8, desired: []
     return std.fmt.allocPrint(arena, "{s}__{d}", .{ desired, idx });
 }
 
-/// The canonical output type the direct `<func>(arg)` would produce. SUM(int) →
-/// bigint (or largeint when the base is largeint); MIN/MAX → the arg arithmetic
-/// type (or the base type for a plain column).
-pub fn aggOutTypeForReduction(family: AggFamily, base_type: types.Type, aff: AffineArg) !types.Type {
-    switch (family) {
-        .sum => return if (base_type == .largeint) .largeint else .bigint,
-        .min, .max => return aff.arg_type orelse base_type,
-    }
+/// The canonical output type the direct `<func>(arg)` would produce: SUM of a
+/// (non-LARGEINT) integer → bigint; MIN/MAX → the arg arithmetic type (or the
+/// base type for a plain column).
+pub fn aggOutTypeForReduction(family: AggFamily, base_type: types.Type, aff: AffineArg) types.Type {
+    return switch (family) {
+        .sum => .bigint,
+        .min, .max => aff.arg_type orelse base_type,
+    };
 }
 
 /// The pieces of an affine reduction, handler-agnostic. The caller computes
@@ -373,7 +364,8 @@ pub fn reduce(
         if (family == .sum) {
             // Integer SUM only; float/decimal SUM scale handling stays direct.
             if (!aff.base_type.isInteger() and aff.base_type != .boolean) continue;
-            if (!affineCannotOverflow(aff)) continue;
+            if (aff.base_type == .largeint) continue;
+            if (aff.arg_type) |t| if (t == .largeint) continue;
         } else {
             if (!affineCannotOverflow(aff)) continue;
         }
@@ -386,7 +378,7 @@ pub fn reduce(
 
         reduced[i] = .{
             .out_name = a.as,
-            .out_type = try aggOutTypeForReduction(family, up_schema[base_idx].type, aff),
+            .out_type = aggOutTypeForReduction(family, up_schema[base_idx].type, aff),
             .family = fam,
             .arg = aff,
         };
@@ -438,7 +430,7 @@ pub fn reduce(
     for (bases.items) |b| {
         switch (b.family) {
             .sum => {
-                try aggs.append(arena, .{ .func = .sum, .col = b.base_col, .as = b.sum_name, .out_type_override = .largeint });
+                try aggs.append(arena, .{ .func = .sum, .col = b.base_col, .as = b.sum_name });
                 try aggs.append(arena, .{ .func = .count, .col = b.base_col, .as = b.count_name });
             },
             .min => try aggs.append(arena, .{ .func = .min, .col = b.base_col, .as = b.min_name }),
@@ -540,43 +532,89 @@ test "affineDecompose recognizes col, col+k, k-col, c*col" {
     try std.testing.expect((try affineDecompose(a, &cols, mk(a, "add", .{ .col_ref = "x" }, .{ .col_ref = "x" }))) == null);
 }
 
-test "reduce collapses SUM(x), SUM(x+1), SUM(x+2) to one base set" {
-    // smallint base: x+k widens to int and provably can't overflow, so the
-    // overflow guard admits the reduction (an int base would decline x+k — it
-    // can overflow — which is the correct, fidelity-preserving behavior).
-    const cols = [_]types.Column{.{ .name = "x", .type = .smallint, .nullable = false }};
-    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_inst.deinit();
-    const a = arena_inst.allocator();
-
-    // Pre-agg Computes for the +1 / +2 arguments, as the planner produces them.
-    const d1args = try a.alloc(Expr, 2);
-    d1args[0] = .{ .col_ref = "x" };
-    d1args[1] = .{ .lit = .{ .int = 1 } };
-    const d2args = try a.alloc(Expr, 2);
-    d2args[0] = .{ .col_ref = "x" };
-    d2args[1] = .{ .lit = .{ .int = 2 } };
-    const derived = [_]Derived{
-        .{ .name = "__a1", .expr = .{ .call = .{ .fn_name = "add", .args = d1args } } },
-        .{ .name = "__a2", .expr = .{ .call = .{ .fn_name = "add", .args = d2args } } },
+test "reduce collapses SUM(x), SUM(x+1), SUM(x+2) to one base set for every wrapping width" {
+    // SUM wraps mod 2^64 exactly as `x+k` does at BIGINT, so the reduction
+    // holds even where x+k can overflow; only a LARGEINT base stays direct.
+    const cases = .{
+        .{ .base = types.Type.smallint, .reduces = true },
+        .{ .base = types.Type.int, .reduces = true },
+        .{ .base = types.Type.bigint, .reduces = true },
+        .{ .base = types.Type.largeint, .reduces = false },
     };
-    const aggs = [_]AggSpec{
-        .{ .func = .sum, .col = "x", .as = "s0" },
-        .{ .func = .sum, .col = "__a1", .as = "s1" },
-        .{ .func = .sum, .col = "__a2", .as = "s2" },
+    inline for (cases) |c| {
+        const cols = [_]types.Column{.{ .name = "x", .type = c.base, .nullable = false }};
+        var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_inst.deinit();
+        const a = arena_inst.allocator();
+
+        // Pre-agg Computes for the +1 / +2 arguments, as the planner produces them.
+        const d1args = try a.alloc(Expr, 2);
+        d1args[0] = .{ .col_ref = "x" };
+        d1args[1] = .{ .lit = .{ .int = 1 } };
+        const d2args = try a.alloc(Expr, 2);
+        d2args[0] = .{ .col_ref = "x" };
+        d2args[1] = .{ .lit = .{ .int = 2 } };
+        const derived = [_]Derived{
+            .{ .name = "__a1", .expr = .{ .call = .{ .fn_name = "add", .args = d1args } } },
+            .{ .name = "__a2", .expr = .{ .call = .{ .fn_name = "add", .args = d2args } } },
+        };
+        const aggs = [_]AggSpec{
+            .{ .func = .sum, .col = "x", .as = "s0" },
+            .{ .func = .sum, .col = "__a1", .as = "s1" },
+            .{ .func = .sum, .col = "__a2", .as = "s2" },
+        };
+
+        const maybe_red = try reduce(a, &cols, &.{}, &aggs, &derived, &.{});
+        if (!c.reduces) {
+            try std.testing.expect(maybe_red == null);
+        } else {
+            const red = maybe_red.?;
+            // Base set is exactly {SUM(x), COUNT(x)} — 2 aggs replacing 3 —
+            // and the base SUM keeps the canonical BIGINT type.
+            try std.testing.expectEqual(@as(usize, 2), red.base_aggs.len);
+            try std.testing.expectEqual(AggFunc.sum, red.base_aggs[0].func);
+            try std.testing.expect(red.base_aggs[0].out_type_override == null);
+            try std.testing.expectEqual(AggFunc.count, red.base_aggs[1].func);
+            // One derivation per original output, projected in order.
+            try std.testing.expectEqual(@as(usize, 3), red.post_derived.len);
+            try std.testing.expectEqual(@as(usize, 3), red.output_names.len);
+        }
+
+        // A single SUM(x) must NOT reduce — base {SUM,COUNT} wouldn't shrink it.
+        const one = [_]AggSpec{.{ .func = .sum, .col = "x", .as = "s" }};
+        try std.testing.expect((try reduce(a, &cols, &.{}, &one, &.{}, &.{})) == null);
+    }
+}
+
+test "reduce keeps MIN/MAX(x+k) direct when x+k can wrap" {
+    // INT + TINYINT is BIGINT: never wraps, so MIN collapses. BIGINT + TINYINT
+    // stays BIGINT and can wrap, which MIN does not commute with.
+    const cases = .{
+        .{ .base = types.Type.int, .reduces = true },
+        .{ .base = types.Type.bigint, .reduces = false },
     };
+    inline for (cases) |c| {
+        const cols = [_]types.Column{.{ .name = "x", .type = c.base, .nullable = false }};
+        var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_inst.deinit();
+        const a = arena_inst.allocator();
 
-    const red = (try reduce(a, &cols, &.{}, &aggs, &derived, &.{})).?;
-    // Base set is exactly {SUM(x), COUNT(x)} — 2 aggs replacing 3.
-    try std.testing.expectEqual(@as(usize, 2), red.base_aggs.len);
-    try std.testing.expectEqual(AggFunc.sum, red.base_aggs[0].func);
-    try std.testing.expectEqual(types.Type.largeint, red.base_aggs[0].out_type_override.?);
-    try std.testing.expectEqual(AggFunc.count, red.base_aggs[1].func);
-    // One derivation per original output, projected in order.
-    try std.testing.expectEqual(@as(usize, 3), red.post_derived.len);
-    try std.testing.expectEqual(@as(usize, 3), red.output_names.len);
+        const d1args = try a.alloc(Expr, 2);
+        d1args[0] = .{ .col_ref = "x" };
+        d1args[1] = .{ .lit = .{ .int = 1 } };
+        const derived = [_]Derived{.{ .name = "__a1", .expr = .{ .call = .{ .fn_name = "add", .args = d1args } } }};
+        const aggs = [_]AggSpec{
+            .{ .func = .min, .col = "x", .as = "m0" },
+            .{ .func = .min, .col = "__a1", .as = "m1" },
+        };
 
-    // A single SUM(x) must NOT reduce — base {SUM,COUNT} wouldn't shrink it.
-    const one = [_]AggSpec{.{ .func = .sum, .col = "x", .as = "s" }};
-    try std.testing.expect((try reduce(a, &cols, &.{}, &one, &.{}, &.{})) == null);
+        const maybe_red = try reduce(a, &cols, &.{}, &aggs, &derived, &.{});
+        try std.testing.expectEqual(c.reduces, maybe_red != null);
+        if (maybe_red) |red| {
+            // The derivation re-applies the direct call to the base MIN.
+            const d = red.post_derived[1].expr.call;
+            try std.testing.expectEqualStrings("add", d.fn_name);
+            try std.testing.expectEqualStrings(red.base_aggs[0].as, d.args[0].col_ref);
+        }
+    }
 }

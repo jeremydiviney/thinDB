@@ -742,7 +742,7 @@ fn compareAggregateValue(agg_plan: AggregatePlan, a: SiloCore.TopRow, b: SiloCor
         .sum, .min, .max => if (float_input)
             compareF64(rowStateFloat(a, agg_plan.state_index), rowStateFloat(b, agg_plan.state_index))
         else
-            compareI128(rowStateValue(a, agg_plan.state_index, agg_plan.wide), rowStateValue(b, agg_plan.state_index, agg_plan.wide)),
+            compareI128(integerAggValue(a, agg_plan), integerAggValue(b, agg_plan)),
         .avg => if (float_input)
             compareF64(avgFloatValue(a, agg_plan), avgFloatValue(b, agg_plan))
         else
@@ -806,6 +806,13 @@ fn avgValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) f64 {
     // DECIMAL: the accumulated value is a mantissa-sum, so divide by 10^scale too.
     const scale_div = std.math.pow(f64, 10.0, @floatFromInt(agg_plan.input_scale));
     return @as(f64, @floatFromInt(rowStateValue(row, agg_plan.state_index, agg_plan.wide))) / @as(f64, @floatFromInt(denom)) / scale_div;
+}
+
+// An integer SUM/MIN/MAX as emitted: a wide (i128) SUM wraps to its BIGINT
+// output (DESIGN.md §3.4), so ORDER BY and HAVING see the emitted value.
+fn integerAggValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) i128 {
+    const v = rowStateValue(row, agg_plan.state_index, agg_plan.wide);
+    return if (agg_plan.output_type == .bigint) @as(i64, @truncate(v)) else v;
 }
 
 fn rowStateValue(row: SiloCore.TopRow, state_index: u16, wide: bool) i128 {
@@ -1365,7 +1372,7 @@ fn appendAggregateValue(allocator: Allocator, col: *ColumnStore, agg_plan: Aggre
         .sum, .min, .max => if (float_input)
             try appendFloatAggregate(allocator, col, agg_plan.output_type, rowStateFloat(row, agg_plan.state_index))
         else
-            try appendIntegerAggregate(allocator, col, agg_plan.output_type, rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
+            try appendIntegerAggregate(allocator, col, agg_plan.output_type, integerAggValue(row, agg_plan)),
         .avg => try col.data.double.append(
             allocator,
             if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan),
@@ -1498,9 +1505,10 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 // too so the silo never emits a nonsense µs sum.
                 if ((input_type == .date or input_type == .datetime) and agg.func != .min and agg.func != .max)
                     return traceDecline(request, "temporal sum/avg");
-                // SUM/AVG over a 64-bit integer accumulates into i128 (the
-                // result widens to LARGEINT): the aggregate takes TWO state
-                // slots (lo, hi) and runs in the generic per-row program.
+                // SUM/AVG over a 64-bit integer accumulates exactly into i128
+                // (a BIGINT SUM wraps at emit, AVG divides the exact sum): the
+                // aggregate takes TWO state slots (lo, hi) and runs in the
+                // generic per-row program.
                 // MIN/MAX over a 64-bit int holds a single value — never wide.
                 const wide = (agg.func == .sum or agg.func == .avg) and physicalTypeFor(input_type) == .i64;
                 const slot_width: u16 = (if (wide) @as(u16, 2) else 1) + @as(u16, @intFromBool(input_nullable));
@@ -1782,7 +1790,7 @@ fn havingOutputNum(plan: *const ShapePlan, name: []const u8, row: SiloCore.TopRo
                 .sum, .min, .max => if (float_input)
                     Num{ .f = rowStateFloat(row, agg_plan.state_index) }
                 else
-                    Num{ .i = rowStateValue(row, agg_plan.state_index, agg_plan.wide) },
+                    Num{ .i = integerAggValue(row, agg_plan) },
                 .avg => .{ .f = if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan) },
                 .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .f = welfordValue(row, agg_plan) },
                 else => null,
