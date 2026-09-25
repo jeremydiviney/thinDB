@@ -104,6 +104,33 @@ fn reserveDouble(allocator: Allocator, out: *ColumnStore, n: usize) ![]f64 {
     return out.data.double.items[base..];
 }
 
+/// MySQL and StarRocks answer a math function's domain error or overflow
+/// (SQRT(-1), LN(0), ASIN(2), EXP(1000), MOD(x, 0)) with NULL, never NaN or
+/// ±inf, so a wrapped kernel owns its validity bitmap: register it with
+/// `null_strategy = .kernel_managed`. A NULL slot holds 0, not the NaN.
+fn finiteOrNull(comptime f: anytype) Kernel {
+    const Operands = std.meta.ArgsTuple(@TypeOf(f));
+    const arity = @typeInfo(Operands).@"struct".fields.len;
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const dst = try reserveDouble(allocator, out, row_count);
+            const base = out.data.rowCount() - row_count;
+            for (dst, 0..) |*d, row| {
+                var operands: Operands = undefined;
+                var valid = true;
+                inline for (0..arity) |a| {
+                    operands[a] = args[a].data.double[row];
+                    valid = valid and args[a].isValid(row);
+                }
+                const r = @call(.auto, f, operands);
+                valid = valid and std.math.isFinite(r);
+                d.* = if (valid) r else 0;
+                try out.appendValidBit(allocator, base + row, valid);
+            }
+        }
+    }.kernel;
+}
+
 pub fn wrappingArithKernel(comptime T: type, comptime op: simd.BinOp) Kernel {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -160,42 +187,41 @@ pub fn divDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] / b[i]);
 }
 
-pub fn powKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.pow(f64, a[i], b[i]));
-}
+pub const powKernel = finiteOrNull(struct {
+    fn f(a: f64, b: f64) f64 {
+        return std.math.pow(f64, a, b);
+    }
+}.f);
 
-pub fn sqrtKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @sqrt(s[i]));
-}
+pub const sqrtKernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return @sqrt(x);
+    }
+}.f);
 
-pub fn expKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @exp(s[i]));
-}
+pub const expKernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return @exp(x);
+    }
+}.f);
 
-pub fn lnKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log(s[i]));
-}
+pub const lnKernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return @log(x);
+    }
+}.f);
 
-pub fn log10Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log10(s[i]));
-}
+pub const log10Kernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return @log10(x);
+    }
+}.f);
 
-pub fn log2Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log2(s[i]));
-}
+pub const log2Kernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return @log2(x);
+    }
+}.f);
 
 pub fn greatestIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0].data.int;
@@ -262,17 +288,17 @@ pub fn tanKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSto
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, @tan(s[i]));
 }
 
-pub fn asinKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.asin(s[i]));
-}
+pub const asinKernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return std.math.asin(x);
+    }
+}.f);
 
-pub fn acosKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.acos(s[i]));
-}
+pub const acosKernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return std.math.acos(x);
+    }
+}.f);
 
 pub fn atanKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.double;
@@ -280,11 +306,11 @@ pub fn atanKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.atan(s[i]));
 }
 
-pub fn cotKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, 1.0 / @tan(s[i]));
-}
+pub const cotKernel = finiteOrNull(struct {
+    fn f(x: f64) f64 {
+        return 1.0 / @tan(x);
+    }
+}.f);
 
 pub fn cbrtKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.double;
@@ -306,12 +332,11 @@ pub fn randomKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, random.float(f64));
 }
 
-pub fn logBaseKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const base = args[0].data.double;
-    const x = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @log(x[i]) / @log(base[i]));
-}
+pub const logBaseKernel = finiteOrNull(struct {
+    fn f(base: f64, x: f64) f64 {
+        return @log(x) / @log(base);
+    }
+}.f);
 
 pub fn roundScaleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const x = args[0].data.double;
@@ -323,25 +348,20 @@ pub fn roundScaleKernel(allocator: Allocator, args: []const ColumnView, out: *Co
     }
 }
 
-pub fn fmodKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @mod(a[i], b[i]));
-}
+pub const fmodKernel = finiteOrNull(struct {
+    fn f(a: f64, b: f64) f64 {
+        return @mod(a, b);
+    }
+}.f);
 
 /// `%` / MOD with a floating operand: the remainder keeps the dividend's
-/// sign (MySQL, DuckDB), unlike `fmod()` above which floors. MOD by 0 is 0
-/// here; only the integer kernels return NULL for it.
-pub fn modDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const r: f64 = if (b[i] == 0) 0 else @rem(a[i], b[i]);
-        try out.data.double.append(allocator, r);
+/// sign (MySQL, DuckDB), unlike `fmod()` above which floors. MOD by 0 is
+/// NULL, as for the integer kernels.
+pub const modDoubleKernel = finiteOrNull(struct {
+    fn f(a: f64, b: f64) f64 {
+        return @rem(a, b);
     }
-}
+}.f);
 
 pub fn pmodIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0].data.int;

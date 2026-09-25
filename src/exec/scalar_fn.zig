@@ -667,10 +667,10 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "random", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
     // Integer MOD resolves in `resolveIntArith`. A floating operand on either
     // side: MySQL MOD keeps the dividend's sign (fmod), same as `%`.
-    .{ .name = "mod", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.modDoubleKernel },
+    .{ .name = "mod", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.modDoubleKernel },
     .{ .name = "pmod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.pmodIntKernel },
     .{ .name = "pmod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.pmodBigintKernel },
-    .{ .name = "fmod", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.fmodKernel },
+    .{ .name = "fmod", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.fmodKernel },
     // Binary arithmetic — backs the SQL infix operators (+ - * /) in the
     // parser. Integer operands resolve in `resolveIntArith`; these overloads
     // take any floating operand, with integers promoted to double.
@@ -682,13 +682,13 @@ pub const builtins = [_]ScalarFn{
     // division is the `DIV` operator, which lowers to `intdiv` and resolves
     // in `resolveIntArith`.
     .{ .name = "div", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.divDoubleKernel },
-    .{ .name = "pow", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.powKernel },
-    .{ .name = "sqrt", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sqrtKernel },
-    .{ .name = "exp", .arg_types = &.{.double}, .return_type = .double, .kernel = math.expKernel },
-    .{ .name = "ln", .arg_types = &.{.double}, .return_type = .double, .kernel = math.lnKernel },
-    .{ .name = "log", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.logBaseKernel },
-    .{ .name = "log10", .arg_types = &.{.double}, .return_type = .double, .kernel = math.log10Kernel },
-    .{ .name = "log2", .arg_types = &.{.double}, .return_type = .double, .kernel = math.log2Kernel },
+    .{ .name = "pow", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.powKernel },
+    .{ .name = "sqrt", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.sqrtKernel },
+    .{ .name = "exp", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.expKernel },
+    .{ .name = "ln", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.lnKernel },
+    .{ .name = "log", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.logBaseKernel },
+    .{ .name = "log10", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.log10Kernel },
+    .{ .name = "log2", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.log2Kernel },
     .{ .name = "greatest", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.greatestIntKernel },
     .{ .name = "greatest", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.greatestBigintKernel },
     .{ .name = "greatest", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.greatestDoubleKernel },
@@ -701,10 +701,10 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "sin", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sinKernel },
     .{ .name = "cos", .arg_types = &.{.double}, .return_type = .double, .kernel = math.cosKernel },
     .{ .name = "tan", .arg_types = &.{.double}, .return_type = .double, .kernel = math.tanKernel },
-    .{ .name = "asin", .arg_types = &.{.double}, .return_type = .double, .kernel = math.asinKernel },
-    .{ .name = "acos", .arg_types = &.{.double}, .return_type = .double, .kernel = math.acosKernel },
+    .{ .name = "asin", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.asinKernel },
+    .{ .name = "acos", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.acosKernel },
     .{ .name = "atan", .arg_types = &.{.double}, .return_type = .double, .kernel = math.atanKernel },
-    .{ .name = "cot", .arg_types = &.{.double}, .return_type = .double, .kernel = math.cotKernel },
+    .{ .name = "cot", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.cotKernel },
     .{ .name = "cbrt", .arg_types = &.{.double}, .return_type = .double, .kernel = math.cbrtKernel },
     .{ .name = "square", .arg_types = &.{.double}, .return_type = .double, .kernel = math.squareKernel },
     .{ .name = "bit_count", .arg_types = &.{.int}, .return_type = .int, .kernel = math.bitCountIntKernel },
@@ -874,7 +874,7 @@ pub const builtins = [_]ScalarFn{
     // --- MySQL aliases over existing kernels (zero new code) ---
     .{ .name = "lcase", .arg_types = &.{.string}, .return_type = .string, .kernel = string.lowerKernel },
     .{ .name = "ucase", .arg_types = &.{.string}, .return_type = .string, .kernel = string.upperKernel },
-    .{ .name = "power", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.powKernel },
+    .{ .name = "power", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.powKernel },
     .{ .name = "ceiling", .arg_types = &.{.double}, .return_type = .double, .kernel = math.ceilKernel },
     .{ .name = "chr", .arg_types = &.{.int}, .return_type = .string, .kernel = string.chrKernel },
     .{ .name = "char", .arg_types = &.{.int}, .return_type = .string, .kernel = string.chrKernel },
