@@ -29,7 +29,6 @@ const storage = @import("../storage/storage.zig");
 const aggregate = @import("aggregate.zig");
 const ir = @import("../ir/ir.zig");
 const hll = @import("../util/hll.zig");
-const buffer_pool = @import("../util/buffer_pool.zig");
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -206,7 +205,7 @@ pub const PartitionedAggregate = struct {
         // Partition arenas churn hundreds of MB per stage; the retaining pool
         // hands back warm, already-faulted blocks and takes them back without
         // an OS release (the arena's node frees are class-sized pool returns).
-        const arena_backing = buffer_pool.workerAllocator(std.heap.c_allocator);
+        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), std.heap.c_allocator);
         for (parts) |*p| {
             p.* = .{ .arena = std.heap.ArenaAllocator.init(arena_backing), .in_cols = &.{} };
             const aa = p.arena.allocator();

@@ -3058,6 +3058,111 @@ test "sql: a materialized CTE is charged against the memory budget" {
     try std.testing.expectError(error.MemoryBudgetExceeded, q.next());
 }
 
+fn seedRollforward(db: anytype, rows: usize) !void {
+    const base = try db.table("base", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "cust", .type = .string },
+            .{ .name = "plan", .type = .string },
+            .{ .name = "start_m", .type = .bigint },
+            .{ .name = "end_m", .type = .bigint },
+            .{ .name = "amount", .type = .double },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"}, .unique = false });
+    const Row = struct { id: i64, cust: []const u8, plan: []const u8, start_m: i64, end_m: i64, amount: f64 };
+    const allocator = std.testing.allocator;
+    const names = try allocator.alloc([16]u8, rows);
+    defer allocator.free(names);
+    const batch = try allocator.alloc(Row, rows);
+    defer allocator.free(batch);
+    const plans = [_][]const u8{ "basic", "pro", "team", "enterprise" };
+    for (batch, names, 0..) |*row, *name, i| {
+        const cust = std.fmt.bufPrint(name, "cust_{d}", .{i % (rows / 4)}) catch unreachable;
+        const start: i64 = @intCast(i % 18);
+        row.* = .{
+            .id = @intCast(i),
+            .cust = cust,
+            .plan = plans[i % plans.len],
+            .start_m = start,
+            .end_m = start + 3 + @as(i64, @intCast(i % 21)),
+            .amount = @floatFromInt(i % 997),
+        };
+    }
+    try base.insert(batch);
+    try base.flush();
+    const months = try db.table("months", .{
+        .columns = &.{.{ .name = "m", .type = .bigint }},
+        .order_key = &.{"m"},
+        .unique = false,
+    }, .{ .order_key = &.{"m"}, .unique = false });
+    var m: i64 = 0;
+    while (m < 48) : (m += 1) try months.insert(&.{.{ .m = m }});
+    try months.flush();
+}
+
+const rollforward_sql =
+    \\WITH expanded AS (
+    \\  SELECT b.id, b.cust, b.plan, m.m AS month, b.amount
+    \\  FROM base b CROSS JOIN months m
+    \\  WHERE m.m >= b.start_m AND m.m < b.end_m
+    \\),
+    \\monthly AS (
+    \\  SELECT cust, plan, month, SUM(amount) AS mrr, COUNT(DISTINCT id) AS subs, MAX(plan) AS top_plan
+    \\  FROM expanded GROUP BY cust, plan, month
+    \\),
+    \\windowed AS (
+    \\  SELECT cust, plan, month, mrr, top_plan,
+    \\    LAG(mrr) OVER (PARTITION BY cust, plan ORDER BY month) AS prev_mrr,
+    \\    SUM(mrr) OVER (PARTITION BY cust ORDER BY month) AS running
+    \\  FROM monthly
+    \\),
+    \\by_cust AS (
+    \\  SELECT cust, month, SUM(mrr - COALESCE(prev_mrr, 0)) AS delta, MAX(running) AS peak, MAX(top_plan) AS top_plan
+    \\  FROM windowed GROUP BY cust, month
+    \\)
+    \\SELECT month, COUNT(*) AS custs, SUM(delta) AS delta, MAX(peak) AS peak, MAX(top_plan) AS top_plan
+    \\FROM by_cust GROUP BY month ORDER BY month
+;
+
+test "sql: a budget bounds a cross + aggregate + window pipeline's worker arenas" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Parallel stage, window and partitioned-aggregate arenas hold most of
+    // this pipeline's memory. When they went uncharged the whole query fit
+    // in 64 MiB of accounted memory while holding several times that.
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 64 << 20,
+        .memory_budget = 64 << 20,
+        .auto_flush_secs = 0,
+        .max_dop = 4,
+    });
+    defer db.close();
+    try seedRollforward(db, 20_000);
+
+    var rejected = false;
+    if (runSql(allocator, db, rollforward_sql)) |value| {
+        var q = value;
+        defer q.deinit();
+        while (true) {
+            const batch = q.next() catch |err| {
+                try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
+                rejected = true;
+                break;
+            };
+            if (batch == null) break;
+        }
+    } else |err| {
+        try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
+        rejected = true;
+    }
+    try std.testing.expect(rejected);
+    try std.testing.expectEqual(@as(usize, 0), db.config.memory_pool.?.inUse());
+}
+
 test "sql: blocking paths release all actual capacity at teardown" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

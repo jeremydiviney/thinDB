@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const parallel = @import("../util/parallel.zig");
+const memory = @import("../memory.zig");
 
 pub const col_name = "__rowloc";
 
@@ -182,7 +183,7 @@ pub fn sortedOrderOn(allocator: std.mem.Allocator, locs: []const i64, order: []u
     parallel.forRanges(nt_runs, n, &scatter_pass, ScatterPass.run);
 
     // Worker scratch can't come from the caller's allocator (not thread-safe).
-    const scratch_alloc = if (nt_runs == 1) allocator else std.heap.c_allocator;
+    const scratch_alloc = if (nt_runs == 1) allocator else try memory.trackedBackend(std.heap.c_allocator, memory.accountantOf(allocator));
     var scratch: [parallel.MAX_THREADS]RunScratch = undefined;
     for (scratch[0..nt_runs]) |*sc| sc.* = .{};
     defer for (scratch[0..nt_runs]) |*sc| sc.deinit(scratch_alloc);

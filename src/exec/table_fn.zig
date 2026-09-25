@@ -488,7 +488,10 @@ pub const TableFnExec = struct {
         // race-free (the #108 window fused-drain protocol); the upstream
         // pull itself stays on this thread — batches are only valid until
         // the next pull, so produce and copy can't overlap.
-        const drain_backing = if (builtin.is_test) self.allocator else std.heap.c_allocator;
+        const drain_backing = try exec.memory.trackedBackend(
+            if (builtin.is_test) self.allocator else std.heap.c_allocator,
+            exec.memory.accountantOf(self.allocator),
+        );
         const drain_arenas = try self.allocator.alloc(std.heap.ArenaAllocator, n_cols);
         var arenas_inited: usize = 0;
         defer {
@@ -1033,7 +1036,10 @@ pub const TableFnExec = struct {
         } else {
             const t_kg = if (trace) prof.nowTicks() else 0;
             k0_arenas = try a.alloc(std.heap.ArenaAllocator, n_kernel0);
-            const k0_backing = if (builtin.is_test) a else std.heap.c_allocator;
+            const k0_backing = try exec.memory.trackedBackend(
+                if (builtin.is_test) a else std.heap.c_allocator,
+                exec.memory.accountantOf(a),
+            );
             for (k0_arenas) |*ar| {
                 ar.* = std.heap.ArenaAllocator.init(k0_backing);
                 k0_inited += 1;

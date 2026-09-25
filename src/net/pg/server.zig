@@ -654,7 +654,10 @@ fn runExtendedStatement(
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null });
+    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{
+        .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
+        .connection_id = if (session.conn_state) |state| state.backend_id else null,
+    });
     defer compiled.deinit();
 
     if (isSideEffectOp(op.*)) {
@@ -1080,7 +1083,10 @@ fn runSingleStatement(
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{ .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null });
+    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{
+        .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
+        .connection_id = if (session.conn_state) |state| state.backend_id else null,
+    });
     defer compiled.deinit();
 
     // Wire the connection's cancel flag into the compiled query so a

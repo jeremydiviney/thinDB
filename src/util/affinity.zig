@@ -200,6 +200,38 @@ pub fn totalMemoryBytes() ?u64 {
     return limit;
 }
 
+/// Process memory resident in RAM now, excluding file-backed pages where the
+/// OS separates them: Linux resident minus shared (the anonymous set the OOM
+/// killer weighs), the working set on Windows. Null where no cheap probe
+/// exists (macOS).
+pub fn processResidentBytes() ?u64 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var buf: [256]u8 = undefined;
+            const text = readSmallFile("/proc/self/statm", &buf) orelse return null;
+            var fields = std.mem.tokenizeAny(u8, text, " \n");
+            _ = fields.next() orelse return null;
+            const resident = std.fmt.parseInt(u64, fields.next() orelse return null, 10) catch return null;
+            const shared = std.fmt.parseInt(u64, fields.next() orelse return null, 10) catch return null;
+            return (resident -| shared) * std.heap.pageSize();
+        },
+        .windows => {
+            const windows = std.os.windows;
+            var counters: windows.PROCESS.VM_COUNTERS = undefined;
+            const status = windows.ntdll.NtQueryInformationProcess(
+                windows.GetCurrentProcess(),
+                .VmCounters,
+                &counters,
+                @sizeOf(windows.PROCESS.VM_COUNTERS),
+                null,
+            );
+            if (status != .SUCCESS) return null;
+            return counters.WorkingSetSize;
+        },
+        else => return null,
+    }
+}
+
 /// The process's own cgroup and every ancestor, v2 first then the v1 memory
 /// controller: a systemd service's cap is written at
 /// /sys/fs/cgroup/system.slice/<unit>/memory.max, a slice cap one level up,
@@ -369,6 +401,16 @@ test "cgroupLimitValue treats the v1 unlimited sentinel as no cap" {
 test "totalMemoryBytes reports usable memory" {
     const total = totalMemoryBytes() orelse return error.SkipZigTest;
     try std.testing.expect(total >= 64 * 1024 * 1024);
+}
+
+test "processResidentBytes sees memory this process touches" {
+    const before = processResidentBytes() orelse return error.SkipZigTest;
+    try std.testing.expect(before > 0);
+    const touched = try std.heap.page_allocator.alloc(u8, 64 << 20);
+    defer std.heap.page_allocator.free(touched);
+    @memset(touched, 1);
+    const after = processResidentBytes() orelse return error.SkipZigTest;
+    try std.testing.expect(after >= before + (32 << 20));
 }
 
 test "physicalCoreCount is sane" {

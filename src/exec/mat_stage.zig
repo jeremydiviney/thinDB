@@ -25,7 +25,6 @@
 //! lives inside table-sourced stages (which run the regular V2 handlers).
 
 const std = @import("std");
-const buffer_pool = @import("../util/buffer_pool.zig");
 const Allocator = std.mem.Allocator;
 
 const exec = @import("exec.zig");
@@ -622,7 +621,7 @@ pub const ContigSink = struct {
         const arena_backed = try allocator.alloc(bool, schema.len);
         errdefer allocator.free(arena_backed);
         @memset(arena_backed, true);
-        const arena_backing = buffer_pool.workerAllocator(std.heap.c_allocator);
+        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), std.heap.c_allocator);
         for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
         errdefer for (arenas) |*a| a.deinit();
         for (schema, stores, arenas) |sc, *st, *ar| {
@@ -840,6 +839,10 @@ pub const Stage = struct {
             const a0 = if (prof_on) exec.prof.nowTicks() else 0;
             try res.appendBatch(batch);
             if (prof_on) append_ticks += exec.prof.nowTicks() - a0;
+        }
+        if (self.accountant) |acct| {
+            var site_buf: [96]u8 = undefined;
+            acct.watch(std.fmt.bufPrint(&site_buf, "stage {s}", .{self.name}) catch "stage");
         }
         // Release the pipeline's operator buffers right away — the stage's
         // working memory drops to just the chunked result.

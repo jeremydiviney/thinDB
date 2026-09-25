@@ -1085,6 +1085,7 @@ pub const CompileCtx = struct {
     accountant: ?*exec.memory.MemoryAccountant = null,
     accountant_allocator: ?Allocator = null,
     cancel_flag: ?*const std.atomic.Value(bool) = null,
+    connection_id: ?u32 = null,
     /// Query-scoped global string dictionary (Phase 4.2 Option A). Lazily
     /// created the first time a scan needs to emit a dict string column as
     /// codes; the scan interns each segment's local dict into it (building a
@@ -1163,6 +1164,7 @@ pub const CompileCtx = struct {
         errdefer self.db.allocator.destroy(acc);
         acc.* = exec.memory.MemoryAccountant.initWithPool(budget, pool);
         acc.cancel_flag = self.cancel_flag;
+        acc.connection_id = self.connection_id;
         acc.trackAllocations(self.db.allocator);
         try acc.retainGate(self.db.config.statement_gate);
         self.accountant_allocator = self.db.allocator;
@@ -1223,6 +1225,7 @@ pub const CompiledQuery = struct {
 
     pub fn deinit(self: *CompiledQuery) void {
         defer if (self.statement_lease) |lease| lease.release();
+        if (self.ctx.accountant) |a| a.finishStatement();
         self.query.deinit();
         // SessionVars (if any) is intentionally NOT freed here —
         // it must survive across statements in a multi-statement
@@ -1345,6 +1348,8 @@ pub const Unbound = unbound_refs.Unbound;
 
 pub const CompileOptions = struct {
     cancel_flag: ?*const std.atomic.Value(bool) = null,
+    /// The wire connection's PROCESSLIST id, named in memory watchdog lines.
+    connection_id: ?u32 = null,
     /// Receives the reference no operator could ever bind, if there is one,
     /// named in the compile's allocator; the caller frees it whether or not
     /// the compile succeeds. A caller can't find it by walking the tree after
@@ -1386,6 +1391,7 @@ pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, sessio
         .session = session_cell,
         .now_micros = std.Io.Timestamp.now(db.io, .real).toMicroseconds(),
         .cancel_flag = options.cancel_flag,
+        .connection_id = options.connection_id,
     };
     errdefer ctx.deinit();
     // Pre-compile pass: walk the IR and run each uncorrelated scalar

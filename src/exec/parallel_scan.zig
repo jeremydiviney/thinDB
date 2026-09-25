@@ -35,7 +35,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const buffer_pool = @import("../util/buffer_pool.zig");
 const types = @import("../types.zig");
 const Column = types.Column;
 
@@ -188,9 +187,10 @@ const WorkerBuf = struct {
 /// The thread-safe allocator the per-worker scans/aggregates/survivor buffers
 /// draw from: the process-global retaining buffer pool (recycles the large
 /// decode buffers instead of `munmap`-ing them every scan), or the raw
-/// backing allocator in tests and under `THINDB_NO_BUFPOOL=1`.
-fn workerAlloc(base: Allocator) Allocator {
-    return buffer_pool.workerAllocator(base);
+/// backing allocator in tests and under `THINDB_NO_BUFPOOL=1` — charged to
+/// the scan's query either way.
+fn workerAlloc(acct: ?*exec.memory.MemoryAccountant, base: Allocator) !Allocator {
+    return exec.memory.workerAllocator(acct orelse exec.memory.accountantOf(base), base);
 }
 
 test "createOverStage: parallel buffer scan preserves the row multiset" {
@@ -858,7 +858,7 @@ pub const ParallelScan = struct {
         defer if (bounds) |b| allocator.free(b);
         exec.prof.addPhase("pscan.create.byte_partition(footers)", @intCast(exec.prof.nowTicks() - t_part));
 
-        const wa = try exec.memory.trackedBackend(workerAlloc(table.allocator), acct);
+        const wa = try workerAlloc(acct, table.allocator);
         const t_workers = exec.prof.nowTicks();
         const workers = try allocator.alloc(Leaf, n_chunks);
         var built: usize = 0;
@@ -961,7 +961,7 @@ pub const ParallelScan = struct {
         max_dop: usize,
         ordered: bool,
     ) !Query {
-        const worker_alloc = workerAlloc(worker_alloc_in);
+        const worker_alloc = try workerAlloc(injected_acct, worker_alloc_in);
         const dop = @max(@as(usize, 1), max_dop);
 
         // The barrier: drain the producer once. After this the result is frozen
@@ -1043,7 +1043,7 @@ pub const ParallelScan = struct {
         injected_acct: ?*exec.memory.MemoryAccountant,
         max_dop: usize,
     ) !Query {
-        const worker_alloc = workerAlloc(worker_alloc_in);
+        const worker_alloc = try workerAlloc(injected_acct, worker_alloc_in);
         const self = try allocator.create(ParallelScan);
         errdefer allocator.destroy(self);
 
