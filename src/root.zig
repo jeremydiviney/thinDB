@@ -133,6 +133,7 @@ test {
     _ = @import("util/huge_page.zig");
     _ = @import("util/buffer_pool.zig");
     _ = @import("util/fair_mutex.zig");
+    _ = @import("util/reader_preferring_rwlock.zig");
     _ = @import("net/conn_registry.zig");
     _ = @import("net/socket_probe.zig");
     _ = @import("net/xa_exec.zig");

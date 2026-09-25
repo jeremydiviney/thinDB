@@ -17,6 +17,7 @@ const engine = @import("../engine/engine.zig");
 const exec = @import("../exec/exec.zig");
 const bloom_util = @import("../util/bloom.zig");
 const FairMutex = @import("../util/fair_mutex.zig").FairMutex;
+const ReaderPreferringRwLock = @import("../util/reader_preferring_rwlock.zig").ReaderPreferringRwLock;
 const StatementGate = @import("../util/statement_gate.zig").StatementGate;
 
 const api = @import("api.zig");
@@ -150,8 +151,10 @@ pub const Table = struct {
     ///
     /// Semantic: DDL waits for in-flight scans to finish, then runs while
     /// no new scans can start. Standard SQL-DB behavior (cf. PostgreSQL
-    /// AccessExclusiveLock, MySQL MDL).
-    ddl_lock: Io.RwLock = .init,
+    /// AccessExclusiveLock, MySQL MDL). Reader-preferring: one statement's
+    /// Scans take it shared one after another, so a queued writer must not
+    /// hold back the next one (see util/reader_preferring_rwlock.zig).
+    ddl_lock: ReaderPreferringRwLock = .init,
 
     /// Serializes compaction against itself (background sweep vs. explicit
     /// COMPACT). Held for a whole compaction; does NOT block scans/inserts.
