@@ -2254,18 +2254,20 @@ fn writePropagatedNulls(
     arg_views: []const ColumnView,
     n: usize,
 ) !void {
-    // Output row i valid iff ALL arg rows i are valid.
+    // Output row i valid iff ALL arg rows i are valid: start the rows all
+    // valid, then AND each nullable argument's bitmap in.
     const base = out.data.rowCount() - n;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        var valid = true;
-        for (arg_views) |v| {
-            if (!v.isValid(i)) {
-                valid = false;
-                break;
-            }
+    try out.appendValidityRange(allocator, base, null, n);
+    const bits = out.nulls.?.items;
+    for (arg_views) |v| {
+        const src = v.nulls orelse continue;
+        if (base & 7 == 0) {
+            // Bits past the n rows are 0 in `bits`, so the AND keeps them 0.
+            const bytes = (n + 7) / 8;
+            for (bits[base >> 3 ..][0..bytes], src[0..bytes]) |*d, s| d.* &= s;
+        } else {
+            for (0..n) |i| if (!storage.column.isValidBit(src, i)) clearBit(bits, base + i);
         }
-        try out.appendValidBit(allocator, base + i, valid);
     }
 }
 
@@ -2277,14 +2279,19 @@ fn writeZeroDivisorNulls(
     arg_views: []const ColumnView,
     n: usize,
 ) !void {
+    try writePropagatedNulls(allocator, out, arg_views, n);
     const base = out.data.rowCount() - n;
-    const divisor = arg_views[arg_views.len - 1];
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        var valid = !zeroDivisorAt(divisor, i);
-        for (arg_views) |v| valid = valid and v.isValid(i);
-        try out.appendValidBit(allocator, base + i, valid);
+    const bits = out.nulls.?.items;
+    switch (arg_views[arg_views.len - 1].data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => |divisor| {
+            for (divisor[0..n], base..) |d, row| if (d == 0) clearBit(bits, row);
+        },
+        else => {},
     }
+}
+
+fn clearBit(bits: []u8, row: usize) void {
+    bits[row >> 3] &= ~(@as(u8, 1) << @intCast(row & 7));
 }
 
 /// Only numeric columns divide; a divisor of any other type is never zero.

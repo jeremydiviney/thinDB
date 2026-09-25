@@ -346,6 +346,81 @@ pub const ColumnStore = struct {
         }
     }
 
+    /// Bulk-append the validity bits of the `n` rows `mask` selects from a
+    /// packed source bitmap (all-valid when `src_nulls` is null), starting at
+    /// row `dst_start`. Equivalent to one `appendValidBit` per selected row,
+    /// which dominated compacting a nullable column through a filter. Same
+    /// invariant as `appendValidityRange`: bits at or above the row count are
+    /// 0, so only the valid bits need setting.
+    pub fn appendMaskedValidity(
+        self: *ColumnStore,
+        allocator: Allocator,
+        dst_start: usize,
+        src_nulls: ?[]const u8,
+        mask: []const bool,
+        n: usize,
+    ) !void {
+        const nb = self.nullsPtr() orelse return;
+        if (n == 0) return;
+        const src = src_nulls orelse return self.appendValidityRange(allocator, dst_start, null, n);
+        const need = (dst_start + n + 7) / 8;
+        if (nb.items.len < need) try nb.appendNTimes(allocator, 0, need - nb.items.len);
+        const dst = nb.items;
+        var j = dst_start;
+        var row: usize = 0;
+        // The selected rows of an all-valid 64-row source word are one run of
+        // valid bits, so only words that hold a NULL go row by row.
+        while (row + 64 <= mask.len) : (row += 64) {
+            const word = std.mem.readInt(u64, src[row / 8 ..][0..8], .little);
+            if (word == std.math.maxInt(u64)) {
+                const selected: @Vector(64, u8) = std.mem.sliceAsBytes(mask[row..][0..64])[0..64].*;
+                const count: usize = @reduce(.Add, @as(@Vector(64, u16), selected));
+                setBitRangeTrue(dst, j, count);
+                j += count;
+            } else {
+                j = gatherMaskedBits(dst, j, src, mask[row..][0..64], row);
+            }
+        }
+        _ = gatherMaskedBits(dst, j, src, mask[row..], row);
+    }
+
+    /// Append the validity bits of the rows `mask` selects (source rows
+    /// `first_row..`) at bit `j`; returns the next bit. Branch-free: an
+    /// unselected row ORs a 0 bit, and past the last survivor `j` stops
+    /// advancing, so the clamp keeps its byte index in range.
+    fn gatherMaskedBits(dst: []u8, j_start: usize, src: []const u8, mask: []const bool, first_row: usize) usize {
+        const last = dst.len - 1;
+        var j = j_start;
+        for (mask, first_row..) |m, row| {
+            const bit = @intFromBool(m) & ((src[row >> 3] >> @intCast(row & 7)) & 1);
+            dst[@min(j >> 3, last)] |= bit << @intCast(j & 7);
+            j += @intFromBool(m);
+        }
+        return j;
+    }
+
+    /// Bulk-append the validity bits of source rows `rows` (all-valid when
+    /// `src_nulls` is null), starting at row `dst_start`: the index-gather
+    /// sibling of `appendMaskedValidity`, under the same invariant.
+    pub fn appendGatheredValidity(
+        self: *ColumnStore,
+        allocator: Allocator,
+        dst_start: usize,
+        src_nulls: ?[]const u8,
+        rows: []const u32,
+    ) !void {
+        const nb = self.nullsPtr() orelse return;
+        if (rows.len == 0) return;
+        const src = src_nulls orelse return self.appendValidityRange(allocator, dst_start, null, rows.len);
+        const need = (dst_start + rows.len + 7) / 8;
+        if (nb.items.len < need) try nb.appendNTimes(allocator, 0, need - nb.items.len);
+        const dst = nb.items;
+        for (rows, dst_start..) |row, j| {
+            const bit = (src[row >> 3] >> @intCast(row & 7)) & 1;
+            dst[j >> 3] |= bit << @intCast(j & 7);
+        }
+    }
+
     /// Bulk-append `n` NULL rows: placeholder data slots + n invalid (0)
     /// validity bits. The bitmap only needs to grow to cover the new rows —
     /// fresh bytes arrive zeroed and the append-only invariant keeps bits
@@ -409,6 +484,57 @@ test "appendValidityRange matches per-bit appends across alignments" {
                 const expected = i >= dst_start;
                 const got = bulk2.nulls.?.items[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) != 0;
                 try std.testing.expectEqual(expected, got);
+            }
+        }
+    }
+}
+
+test "appendMaskedValidity and appendGatheredValidity match per-bit appends" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed1e55);
+    const rand = prng.random();
+    inline for (.{ 0, 1, 3, 7, 8, 13 }) |dst_start| {
+        inline for (.{ 1, 5, 8, 9, 64, 200 }) |len| {
+            var src_bits: [32]u8 = undefined;
+            rand.bytes(&src_bits);
+            // All-valid 64-row words take the run path; the rest go row by row.
+            @memset(src_bits[0..8], 0xFF);
+            @memset(src_bits[16..24], 0xFF);
+            var mask: [len]bool = undefined;
+            for (&mask) |*m| m.* = rand.boolean();
+            // End on a selected row half the time, so the last survivor lands
+            // on the final bitmap byte.
+            mask[len - 1] = rand.boolean();
+            var rows_buf: [len]u32 = undefined;
+            var n: usize = 0;
+            for (mask, 0..) |m, row| if (m) {
+                rows_buf[n] = @intCast(row);
+                n += 1;
+            };
+            const rows = rows_buf[0..n];
+
+            inline for (.{ true, false }) |has_src| {
+                const src: ?[]const u8 = if (has_src) &src_bits else null;
+                var perbit = try ColumnStore.init(allocator, .{ .bigint = {} }, true);
+                defer perbit.deinit(allocator);
+                var masked = try ColumnStore.init(allocator, .{ .bigint = {} }, true);
+                defer masked.deinit(allocator);
+                var gathered = try ColumnStore.init(allocator, .{ .bigint = {} }, true);
+                defer gathered.deinit(allocator);
+                for (0..dst_start) |i| {
+                    const v = rand.boolean();
+                    try perbit.appendValidBit(allocator, i, v);
+                    try masked.appendValidBit(allocator, i, v);
+                    try gathered.appendValidBit(allocator, i, v);
+                }
+
+                for (rows, 0..) |row, j| {
+                    try perbit.appendValidBit(allocator, dst_start + j, storage_column.isValidBit(src, row));
+                }
+                try masked.appendMaskedValidity(allocator, dst_start, src, &mask, n);
+                try gathered.appendGatheredValidity(allocator, dst_start, src, rows);
+                try std.testing.expectEqualSlices(u8, perbit.nulls.?.items, masked.nulls.?.items);
+                try std.testing.expectEqualSlices(u8, perbit.nulls.?.items, gathered.nulls.?.items);
             }
         }
     }
