@@ -2592,8 +2592,9 @@ fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
 
 /// INSERT INTO target [(cols)] SELECT ... — drain the source query
 /// and bulk-insert each batch into the target table. Each table column
-/// takes its source column widened to the column's type or, when the
-/// column list omits it, the fill INSERT ... VALUES uses.
+/// takes its source column widened to the column's type, a wider integer
+/// narrowed to it when every value fits or, when the column list omits
+/// it, the fill INSERT ... VALUES uses.
 fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, op.table);
@@ -2640,18 +2641,28 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const out_schema = source.outputSchema();
     const batch_schema = try aa.alloc(types.Column, tbl_columns.len);
     const views = try aa.alloc(storage.ColumnView, tbl_columns.len);
+    const narrowed = try aa.alloc(bool, tbl_columns.len);
+    for (tbl_columns, picks, narrowed) |col, pick, *n| n.* = narrowsInteger(out_schema[pick].type, col.type);
     var total_rows: usize = 0;
     while (try source.next()) |b| {
         for (table_to_source, picks) |maybe_src, pick| {
             const src = maybe_src orelse continue;
             if (pick != src and wideningDroppedValue(b.values[src], b.values[pick], b.row_count)) return Error.TypeMismatch;
         }
-        for (tbl_columns, picks, batch_schema, views) |col, pick, *bs, *view| {
-            view.* = b.values[pick];
+        var filled: usize = 0;
+        defer for (views[0..filled], narrowed[0..filled]) |view, n| {
+            if (n) freeNarrowedColumn(ctx.allocator, view);
+        };
+        for (tbl_columns, picks, narrowed, batch_schema, views) |col, pick, n, *bs, *view| {
+            view.* = if (n)
+                try narrowIntegerColumn(ctx.allocator, b.values[pick], col.type, b.row_count) orelse return Error.TypeMismatch
+            else
+                b.values[pick];
+            filled += 1;
             // A NOT NULL column admits a nullable source whose rows hold no
             // NULL, as MySQL does; a NULL row still fails in the memtable.
             const nullable = out_schema[pick].nullable and (col.nullable or view.anyNull(b.row_count));
-            bs.* = .{ .name = col.name, .type = out_schema[pick].type, .nullable = nullable };
+            bs.* = .{ .name = col.name, .type = if (n) col.type else out_schema[pick].type, .nullable = nullable };
         }
         try t.insertBatch(batch_schema, views, b.row_count);
         total_rows += b.row_count;
@@ -2666,8 +2677,8 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
 /// payload at another scale would be stored misread. Text parses into a DATE
 /// or DATETIME target. Other targets widen along the implicit-cast ladder
 /// short of its lossy steps; the ladder reaches FLOAT only through DOUBLE, so
-/// a FLOAT target never casts. Anything else passes through for the memtable
-/// to admit or reject.
+/// a FLOAT target never casts. Anything else passes through: a wider integer
+/// narrows batch by batch, and the memtable admits or rejects the rest.
 fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?exec.Expr {
     if (std.meta.eql(src.type, target)) return null;
     const widens = if (target.isDecimal())
@@ -2696,6 +2707,50 @@ fn wideningDroppedValue(src: storage.ColumnView, widened: storage.ColumnView, ro
         if (src.isValid(i) and !widened.isValid(i)) return true;
     }
     return false;
+}
+
+/// Whether an INSERT source column is an integer wider than its integer
+/// table column. MySQL assigns such a value when it fits the column.
+fn narrowsInteger(src: types.Type, target: types.Type) bool {
+    if (!src.isInteger() or !target.isInteger()) return false;
+    const cost = exec_cast.castCost(@as(types.TypeTag, target), @as(types.TypeTag, src)) orelse return false;
+    return cost > 0;
+}
+
+/// `src` at the table column's narrower integer width, in `allocator`, or
+/// null when a value falls outside the column's range: INSERT ... VALUES
+/// rejects such a value, and MySQL's strict mode fails the statement rather
+/// than clamping it as a CAST does. A NULL row narrows to 0 whatever its
+/// payload.
+fn narrowIntegerColumn(allocator: Allocator, src: storage.ColumnView, target: types.Type, rows: usize) Allocator.Error!?storage.ColumnView {
+    switch (target) {
+        inline .tinyint, .smallint, .int, .bigint => |_, tag| {
+            const T = std.meta.Child(@FieldType(storage.column.ValueView, @tagName(tag)));
+            const dst = try allocator.alloc(T, rows);
+            switch (src.data) {
+                inline .smallint, .int, .bigint, .largeint => |values| for (values[0..rows], dst, 0..) |v, *d, i| {
+                    if (std.math.cast(T, v)) |fits| {
+                        d.* = fits;
+                    } else if (src.isValid(i)) {
+                        allocator.free(dst);
+                        return null;
+                    } else {
+                        d.* = 0;
+                    }
+                },
+                else => unreachable,
+            }
+            return .{ .data = @unionInit(storage.column.ValueView, @tagName(tag), dst), .nulls = src.nulls };
+        },
+        else => unreachable,
+    }
+}
+
+fn freeNarrowedColumn(allocator: Allocator, view: storage.ColumnView) void {
+    switch (view.data) {
+        inline .tinyint, .smallint, .int, .bigint => |values| allocator.free(values),
+        else => unreachable,
+    }
 }
 
 /// The value for a table column an INSERT ... SELECT column list omits: the
