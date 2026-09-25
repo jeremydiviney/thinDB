@@ -94,12 +94,12 @@ pub fn appendPredicateValueBytes(
         },
         .float => |v| {
             var b: [4]u8 = undefined;
-            storage.format.writeF32(&b, v);
+            storage.format.writeF32(&b, types.canonicalFloat(v));
             try buf.appendSlice(aa, &b);
         },
         .double => |v| {
             var b: [8]u8 = undefined;
-            storage.format.writeF64(&b, v);
+            storage.format.writeF64(&b, types.canonicalFloat(v));
             try buf.appendSlice(aa, &b);
         },
         .date => |v| try storage.format.appendI32(aa, buf, v),

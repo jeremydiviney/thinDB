@@ -74,6 +74,10 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | | `DATETIME` | i64 microseconds since 1970-01-01 UTC. No timezone awareness — applications convert at boundaries. |
 | Boolean | `BOOLEAN` | u8 (0/1) |
 
+Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
+after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
+follow this, so `-0.0` and `0.0` form one group. MIN and MAX skip NaN.
+
 Explicitly **out of scope for v1**: `JSON`, `ARRAY`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 ### 3.2 Schema and order key

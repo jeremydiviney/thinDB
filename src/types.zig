@@ -194,6 +194,19 @@ pub fn floatOrder(a: anytype, b: @TypeOf(a)) std.math.Order {
     return std.math.order(a, b);
 }
 
+/// The one representative of a float's equality class: -0.0 and +0.0 are one
+/// value and so is every NaN, as in `floatOrder` (#82). A site that hashes,
+/// dedupes or matches float keys by their bits canonicalizes first, or equal
+/// keys land in different groups, join buckets or Bloom slots.
+pub fn canonicalFloat(v: anytype) @TypeOf(v) {
+    if (std.math.isNan(v)) return std.math.nan(@TypeOf(v));
+    return if (v == 0) 0 else v;
+}
+
+pub fn canonicalFloatBits(v: anytype) std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(v))) {
+    return @bitCast(canonicalFloat(v));
+}
+
 /// Logical wrapper around a stored `u128` UUID. Mirrors `Date`/`DateTime`
 /// — gives `@as(Uuid, ...)` ergonomics for insert without colliding with
 /// LARGEINT columns. `.value` accesses the raw u128. UUIDs are
@@ -314,8 +327,8 @@ pub const Value = union(ValueTag) {
             .int => |a| std.math.order(a, other.int),
             .bigint => |a| std.math.order(a, other.bigint),
             .boolean => |a| std.math.order(@as(u8, @intFromBool(a)), @as(u8, @intFromBool(other.boolean))),
-            .float => |a| std.math.order(a, other.float),
-            .double => |a| std.math.order(a, other.double),
+            .float => |a| floatOrder(a, other.float),
+            .double => |a| floatOrder(a, other.double),
             .date => |a| std.math.order(a, other.date),
             .datetime => |a| std.math.order(a, other.datetime),
             .tinyint => |a| std.math.order(a, other.tinyint),

@@ -673,13 +673,13 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
                 while (r < n) : (r += 1) {
                     if (!view.isValid(r)) continue;
                     lane.ns[i] += 1;
-                    const key = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[r])))));
+                    const key = @as(u128, types.canonicalFloatBits(@as(f64, @floatCast(s[r]))));
                     if (have_prev and key == prev_key) continue;
                     prev_key = key;
                     have_prev = true;
                     const pf = r + PREFETCH_DIST_DISTINCT;
                     if (pf < n and view.isValid(pf)) {
-                        const k_pf = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[pf])))));
+                        const k_pf = @as(u128, types.canonicalFloatBits(@as(f64, @floatCast(s[pf]))));
                         dsets[distinctPartition(tier, k_pf, parts)].prefetchKey(k_pf);
                     }
                     _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);

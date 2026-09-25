@@ -3000,7 +3000,7 @@ const FrameCursor = struct {
 fn range_order(view: ColumnView, t: Type, candidate: usize, current: usize, delta: i128) !std.math.Order {
     return switch (view.data) {
         inline .tinyint, .smallint, .int, .bigint, .largeint => |values| std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + delta),
-        inline .float, .double => |values| std.math.order(@as(f64, values[candidate]), @as(f64, values[current]) + @as(f64, @floatFromInt(delta))),
+        inline .float, .double => |values| types.floatOrder(@as(f64, values[candidate]), @as(f64, values[current]) + @as(f64, @floatFromInt(delta))),
         inline .decimal64, .decimal128 => |values| blk: {
             var scale: i256 = 1;
             for (0..t.decimalSpec().?.s) |_| scale *= 10;

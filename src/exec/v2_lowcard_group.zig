@@ -1461,7 +1461,7 @@ fn compareBySpec(ctx: SortCtx, spec: SortSpec, a_gid: u32, b_gid: u32) std.math.
             .sum, .min, .max => {
                 const as_ = merged.slots.items[@as(usize, a_gid) * n_aggs + i];
                 const bs = merged.slots.items[@as(usize, b_gid) * n_aggs + i];
-                if (agg.is_float) return std.math.order(slotF64(as_), slotF64(bs));
+                if (agg.is_float) return types.floatOrder(slotF64(as_), slotF64(bs));
                 // A BIGINT SUM orders by its wrapped value, as emitted.
                 if (agg.output_type == .bigint) return std.math.order(@as(i64, @truncate(as_)), @as(i64, @truncate(bs)));
                 return std.math.order(as_, bs);
@@ -1473,7 +1473,7 @@ fn compareBySpec(ctx: SortCtx, spec: SortSpec, a_gid: u32, b_gid: u32) std.math.
                 const bs = merged.slots.items[@as(usize, b_gid) * n_aggs + i];
                 const af: f64 = if (an == 0) 0 else if (agg.is_float) slotF64(as_) / @as(f64, @floatFromInt(an)) else @as(f64, @floatFromInt(as_)) / @as(f64, @floatFromInt(an));
                 const bf: f64 = if (bn == 0) 0 else if (agg.is_float) slotF64(bs) / @as(f64, @floatFromInt(bn)) else @as(f64, @floatFromInt(bs)) / @as(f64, @floatFromInt(bn));
-                return std.math.order(af, bf);
+                return types.floatOrder(af, bf);
             },
         }
     }
