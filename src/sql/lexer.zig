@@ -221,6 +221,9 @@ pub const Lexer = struct {
                 return Token{ .tag = .comma, .text = self.src[start..self.pos] };
             },
             '.' => {
+                // `.5` is a number unless the dot qualifies a name (`t.x`).
+                const c1 = self.peekChar(1);
+                if (c1 != null and std.ascii.isDigit(c1.?) and !self.followsName(start)) return try self.lexNumber();
                 self.pos += 1;
                 return Token{ .tag = .dot, .text = self.src[start..self.pos] };
             },
@@ -471,6 +474,9 @@ pub const Lexer = struct {
         return buf[0..out];
     }
 
+    /// `1`, `1.5`, `.5`, and with an exponent `1e3`, `2.5E-3`, `.5e+2`. A
+    /// fraction or an exponent makes a DOUBLE, as in MySQL, StarRocks and
+    /// DuckDB; a value beyond the double range is an error, not ±inf.
     fn lexNumber(self: *Lexer) LexError!Token {
         const start = self.pos;
         var seen_dot = false;
@@ -483,14 +489,39 @@ pub const Lexer = struct {
             }
             if (!std.ascii.isDigit(c)) break;
         }
+        const is_float = self.lexExponent() or seen_dot;
         const text = self.src[start..self.pos];
-        if (seen_dot) {
+        if (is_float) {
             const v = std.fmt.parseFloat(f64, text) catch return LexError.LexInvalidNumber;
+            if (!std.math.isFinite(v)) return LexError.LexInvalidNumber;
             return Token{ .tag = .floating, .text = text, .value = .{ .floating = v } };
         } else {
             const v = std.fmt.parseInt(i64, text, 10) catch return LexError.LexInvalidNumber;
             return Token{ .tag = .integer, .text = text, .value = .{ .integer = v } };
         }
+    }
+
+    /// Consume an exponent (`e` or `E`, an optional sign, digits) when one
+    /// follows the mantissa. Without a digit the `e` is not part of the
+    /// number, so `SELECT 1e` still reads as `1 AS e`.
+    fn lexExponent(self: *Lexer) bool {
+        const c = self.peekChar(0) orelse return false;
+        if (c != 'e' and c != 'E') return false;
+        var end = self.pos + 1;
+        if (end < self.src.len and (self.src[end] == '+' or self.src[end] == '-')) end += 1;
+        if (end >= self.src.len or !std.ascii.isDigit(self.src[end])) return false;
+        while (end < self.src.len and std.ascii.isDigit(self.src[end])) end += 1;
+        self.pos = end;
+        return true;
+    }
+
+    /// Whether the byte before `pos` ends a name or a parenthesized
+    /// expression, where a following dot qualifies rather than starts a
+    /// number.
+    fn followsName(self: *Lexer, pos: usize) bool {
+        if (pos == 0) return false;
+        const prev = self.src[pos - 1];
+        return std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '`' or prev == '"' or prev == ')' or prev == ']';
     }
 
     fn lexIdent(self: *Lexer) LexError!Token {
@@ -919,6 +950,51 @@ test "lexer: integer + float + string literals" {
     const escaped = try lx.next();
     try std.testing.expectEqual(@as(TokenTag, .string), escaped.tag);
     try std.testing.expectEqualStrings("it's", escaped.value.string);
+}
+
+test "lexer: scientific notation and a leading dot make float literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "1e3", 1000.0 },
+        .{ "1E3", 1000.0 },
+        .{ "2.5E-3", 0.0025 },
+        .{ "6.02e+23", 6.02e23 },
+        .{ "1.e2", 100.0 },
+        .{ ".5", 0.5 },
+        .{ ".5e2", 50.0 },
+        .{ "0e0", 0.0 },
+        .{ "1e-400", 0.0 },
+    };
+    inline for (cases) |c| {
+        var lx = Lexer.init(arena.allocator(), c[0]);
+        const tok = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .floating), tok.tag);
+        try std.testing.expectEqualStrings(c[0], tok.text);
+        try std.testing.expectEqual(@as(f64, c[1]), tok.value.floating);
+        try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+    }
+
+    // An `e` without exponent digits is not part of the number, and a dot
+    // after a name still qualifies it.
+    const splits = .{
+        .{ "1e", &[_]TokenTag{ .integer, .identifier } },
+        .{ "1e+", &[_]TokenTag{ .integer, .identifier, .plus } },
+        .{ "2.5e", &[_]TokenTag{ .floating, .identifier } },
+        .{ "t.x", &[_]TokenTag{ .identifier, .dot, .identifier } },
+        .{ "t.5", &[_]TokenTag{ .identifier, .dot, .integer } },
+        .{ "f(1).5", &[_]TokenTag{ .identifier, .lparen, .integer, .rparen, .dot, .integer } },
+        .{ "1e3-1", &[_]TokenTag{ .floating, .minus, .integer } },
+        .{ "-.5", &[_]TokenTag{ .minus, .floating } },
+    };
+    inline for (splits) |c| {
+        var lx = Lexer.init(arena.allocator(), c[0]);
+        for (c[1]) |want| try std.testing.expectEqual(want, (try lx.next()).tag);
+        try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+    }
+
+    var overflow = Lexer.init(arena.allocator(), "1e400");
+    try std.testing.expectError(LexError.LexInvalidNumber, overflow.next());
 }
 
 test "lexer: skips line and block comments" {
