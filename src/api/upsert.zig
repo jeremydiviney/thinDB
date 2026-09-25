@@ -406,7 +406,7 @@ test "memtable swaps invalidate the incremental upsert index (gen counter, not p
         });
         const gen_before = t.memtable_gen;
         const pred: exec.PredicateExpr = .{ .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 3 } } };
-        _ = try t.deleteByExpr(pred);
+        _ = try t.deleteByExpr(pred, &.{});
         try std.testing.expect(t.memtable_gen > gen_before); // swap bumped the generation
         // Re-add the deleted key; the rebuilt index must dedup it correctly.
         try t.insert(&.{.{ .id = @as(i64, 3), .v = round }});

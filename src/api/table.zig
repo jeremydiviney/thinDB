@@ -923,17 +923,14 @@ pub const Table = struct {
     /// SQL `DELETE FROM t [WHERE expr]` — generalized delete with the
     /// rich PredicateExpr. Subqueries and `@vars` must already be
     /// resolved by the pre-compile pass. `pred == null` deletes every
-    /// row. Returns the deleted row count. Streams per segment so
+    /// row; `derived` are the computed operands it compares by name.
+    /// Returns the deleted row count. Streams per segment so
     /// memory stays bounded by segment size. Segment rows are durable
     /// through their tombstone files, memtable rows through the WAL
     /// (`deleteMemtableRowsLocked`).
-    pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr) !usize {
+    pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr, derived: []const exec.Derived) !usize {
         const statement_lease = try self.acquireStatement();
         defer if (statement_lease) |lease| lease.release();
-        // Widen literals in the predicate up front (BIGINT column + INT
-        // literal etc.). The mutation is local to this function.
-        var pred_local: ?exec.PredicateExpr = pred;
-        if (pred_local) |*p| try exec.predicate.validateExpr(p, self.schema.columns);
 
         self.mutex.lockUncancelable(self.io);
         var wal_target: ?u64 = null;
@@ -941,7 +938,7 @@ pub const Table = struct {
         {
             defer self.mutex.unlock(self.io);
             try self.ensureUsable();
-            deleted = try @import("delete.zig").execDeleteByExpr(self, pred_local, &wal_target);
+            deleted = try @import("delete.zig").execDeleteByExpr(self, pred, derived, &wal_target);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
@@ -991,11 +988,12 @@ pub const Table = struct {
     pub fn updateStreaming(
         self: *Table,
         pred: ?exec.PredicateExpr,
+        derived: []const exec.Derived,
         assignments: []const @import("update.zig").Assignment,
     ) !usize {
         const statement_lease = try self.acquireStatement();
         defer if (statement_lease) |lease| lease.release();
-        return try @import("update.zig").execUpdateStreaming(self, pred, assignments);
+        return try @import("update.zig").execUpdateStreaming(self, pred, derived, assignments);
     }
 
     /// Remove every row while preserving schema and table identity. This is a

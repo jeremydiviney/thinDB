@@ -2169,7 +2169,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
 fn compileDelete(ctx: *CompileCtx, d: ir.DeleteOp) !Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, d.table);
-    const deleted = try t.deleteByExpr(d.predicate);
+    const deleted = try t.deleteByExpr(d.predicate, d.derived);
     ctx.affected_rows = @intCast(deleted);
     return try EmptyOp.createWithCount(ctx.allocator, deleted);
 }
@@ -2193,7 +2193,7 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
         dst.* = .{ .col = src.col, .value = src.value };
     }
 
-    const affected = try t.updateStreaming(u.predicate, assigns_buf);
+    const affected = try t.updateStreaming(u.predicate, u.derived, assigns_buf);
     ctx.affected_rows = @intCast(affected);
     return try EmptyOp.createWithCount(ctx.allocator, affected);
 }

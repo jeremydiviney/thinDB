@@ -135,12 +135,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
         },
         .compute => |c| {
             try out.appendSlice(allocator, "Compute [");
-            for (c.derived, 0..) |d, i| {
-                if (i > 0) try out.appendSlice(allocator, ", ");
-                try out.appendSlice(allocator, d.name);
-                try out.appendSlice(allocator, " := ");
-                try explainExpr(allocator, out, d.expr);
-            }
+            try explainDerived(allocator, out, c.derived);
             try out.appendSlice(allocator, "]\n");
             try explainOp(allocator, out, c.upstream.*, depth + 1);
         },
@@ -278,6 +273,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
                 try out.appendSlice(allocator, " WHERE ");
                 try explainPredicate(allocator, out, p);
             }
+            try explainDmlDerived(allocator, out, d.derived);
             try out.append(allocator, '\n');
         },
         .update_op => |u| {
@@ -294,9 +290,26 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
                 try out.appendSlice(allocator, " WHERE ");
                 try explainPredicate(allocator, out, p);
             }
+            try explainDmlDerived(allocator, out, u.derived);
             try out.append(allocator, '\n');
         },
     }
+}
+
+fn explainDerived(allocator: Allocator, out: *std.ArrayList(u8), derived: []const ir.Derived) !void {
+    for (derived, 0..) |d, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, d.name);
+        try out.appendSlice(allocator, " := ");
+        try explainExpr(allocator, out, d.expr);
+    }
+}
+
+fn explainDmlDerived(allocator: Allocator, out: *std.ArrayList(u8), derived: []const ir.Derived) !void {
+    if (derived.len == 0) return;
+    try out.appendSlice(allocator, " [");
+    try explainDerived(allocator, out, derived);
+    try out.append(allocator, ']');
 }
 
 fn explainFrameBound(allocator: Allocator, out: *std.ArrayList(u8), b: FrameBound) !void {

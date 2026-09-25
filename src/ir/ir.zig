@@ -568,6 +568,9 @@ pub const SetVar = struct {
 pub const DeleteOp = struct {
     table: TableRef,
     predicate: ?@import("../exec/predicate.zig").PredicateExpr,
+    /// Computed operands the predicate compares by name (`n % 3 = 0`
+    /// compares a derived `n % 3` with 0), evaluated ahead of it per batch.
+    derived: []const Derived = &.{},
 };
 
 /// One `col = expr` assignment in an UPDATE statement.
@@ -585,6 +588,8 @@ pub const UpdateOp = struct {
     table: TableRef,
     assignments: []const Assignment,
     predicate: ?@import("../exec/predicate.zig").PredicateExpr,
+    /// Same as `DeleteOp.derived`.
+    derived: []const Derived = &.{},
 };
 
 /// EXPLAIN <statement> — wraps an inner statement. Compiling it builds the
