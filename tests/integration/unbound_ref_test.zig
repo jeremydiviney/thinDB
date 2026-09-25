@@ -37,7 +37,7 @@ test "unused CTE item with an unknown column fails the statement" {
     , error.ColumnNotFound);
     try helpers.expectRunError(allocator, db,
         \\WITH b AS (SELECT id, upper(nonexistent_col) AS x FROM ext) SELECT count(*) FROM b
-    , error.ComputeUnsupportedExpr);
+    , error.ColumnNotFound);
 }
 
 test "unused CTE item calling an unknown function fails the statement" {

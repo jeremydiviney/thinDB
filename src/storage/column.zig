@@ -70,8 +70,8 @@ pub const ColumnView = struct {
                 try appendLittle(u32, allocator, buf, @intCast(bytes.len));
                 try buf.appendSlice(allocator, bytes);
             },
-            .float => |s| try appendLittle(u32, allocator, buf, @bitCast(s[row])),
-            .double => |s| try appendLittle(u64, allocator, buf, @bitCast(s[row])),
+            .float => |s| try appendLittle(u32, allocator, buf, types.canonicalFloatBits(s[row])),
+            .double => |s| try appendLittle(u64, allocator, buf, types.canonicalFloatBits(s[row])),
             .tinyint => |s| try buf.append(allocator, @bitCast(s[row])),
             .smallint => |s| try appendLittle(i16, allocator, buf, s[row]),
             .largeint, .decimal128 => |s| try appendLittle(i128, allocator, buf, s[row]),

@@ -141,7 +141,7 @@ test "mixed COUNT/MIN/MAX metadata lane matches the scan path, bails on tombston
 }
 
 const SumAvgRow = struct {
-    sum_k: i128,
+    sum_k: i64,
     avg_v: f64,
     count_v: i64,
     sum_f: f64,
@@ -153,7 +153,7 @@ fn sumAvgRow(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !SumAvg
     const batch = (try q.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), batch.row_count);
     const out: SumAvgRow = .{
-        .sum_k = batch.values[0].data.largeint[0],
+        .sum_k = batch.values[0].data.bigint[0],
         .avg_v = batch.values[1].data.double[0],
         .count_v = batch.values[2].data.bigint[0],
         .sum_f = batch.values[3].data.double[0],
@@ -202,7 +202,7 @@ test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segment
         try std.testing.expectEqual(scanned, meta);
         // Σ 2·id = 359400; v non-null on 400 rows summing 120000 → AVG 300;
         // Σ (id + 0.5) = 180000.
-        try std.testing.expectEqual(@as(i128, 359400), meta.sum_k);
+        try std.testing.expectEqual(@as(i64, 359400), meta.sum_k);
         try std.testing.expectEqual(@as(f64, 300.0), meta.avg_v);
         try std.testing.expectEqual(@as(i64, 400), meta.count_v);
         try std.testing.expectEqual(@as(f64, 180000.0), meta.sum_f);
@@ -217,7 +217,7 @@ test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segment
         try std.testing.expectEqual(scanned, meta);
         // Removed ids 0..8: Σ2·id drops 72; v drops ids {1,2,4,5,7,8} = 27
         // over 6 rows; f drops 36 + 9·0.5.
-        try std.testing.expectEqual(@as(i128, 359400 - 72), meta.sum_k);
+        try std.testing.expectEqual(@as(i64, 359400 - 72), meta.sum_k);
         try std.testing.expectEqual(@as(i64, 394), meta.count_v);
         try std.testing.expectEqual(@as(f64, (120000.0 - 27.0) / 394.0), meta.avg_v);
         try std.testing.expectEqual(@as(f64, 180000.0 - 40.5), meta.sum_f);
@@ -229,7 +229,7 @@ test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segment
         const meta = try sumAvgRow(allocator, db, meta_sql);
         const scanned = try sumAvgRow(allocator, db, scan_sql);
         try std.testing.expectEqual(scanned, meta);
-        try std.testing.expectEqual(@as(i128, 359400 - 72 + 10), meta.sum_k);
+        try std.testing.expectEqual(@as(i64, 359400 - 72 + 10), meta.sum_k);
         try std.testing.expectEqual(@as(i64, 395), meta.count_v);
     }
 }

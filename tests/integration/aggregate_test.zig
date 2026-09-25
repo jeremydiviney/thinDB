@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
+const helpers = @import("sql_helpers.zig");
 
 const schema_nums = thindb.TableSchema{
     .columns = &.{
@@ -594,15 +595,15 @@ test "aggregate: combined distinct alongside other aggregates (Q09 shape)" {
             rows_seen += 1;
             const r = b.values[0].data.int[i];
             const c = b.values[1].data.bigint[i];
-            const s = b.values[2].data.largeint[i]; // SUM(bigint) → LARGEINT (i128)
+            const s = b.values[2].data.bigint[i];
             const nd = b.values[3].data.bigint[i];
             if (r == 1) {
                 try std.testing.expectEqual(@as(i64, 3), c);
-                try std.testing.expectEqual(@as(i128, 23), s); // 7+7+9
+                try std.testing.expectEqual(@as(i64, 23), s); // 7+7+9
                 try std.testing.expectEqual(@as(i64, 2), nd); // {7, 9}
             } else if (r == 2) {
                 try std.testing.expectEqual(@as(i64, 1), c);
-                try std.testing.expectEqual(@as(i128, 5), s);
+                try std.testing.expectEqual(@as(i64, 5), s);
                 try std.testing.expectEqual(@as(i64, 1), nd);
             } else return error.UnexpectedGroup;
         }
@@ -731,10 +732,10 @@ test "aggregate: high-NDV key behind a selective filter stays under the adaptive
             groups_seen += 1;
             const k = b.values[0].data.int[row];
             const c = b.values[1].data.bigint[row];
-            const s = b.values[2].data.largeint[row]; // SUM(bigint) → LARGEINT (i128)
+            const s = b.values[2].data.bigint[row];
             try std.testing.expectEqual(@as(i32, 3), @mod(k, 10)); // only sel==3 keys
             try std.testing.expectEqual(@as(i64, 1), c);
-            try std.testing.expectEqual(@as(i128, k), s); // v == id == k
+            try std.testing.expectEqual(@as(i64, k), s); // v == id == k
         }
     }
     try std.testing.expectEqual(expected_groups, groups_seen);
@@ -783,10 +784,10 @@ test "aggregate: genuinely high-card group-by overflows the initial size and jum
             groups_seen += 1;
             const k = b.values[0].data.int[row];
             const c = b.values[1].data.bigint[row];
-            const s = b.values[2].data.largeint[row]; // SUM(bigint) → LARGEINT (i128)
+            const s = b.values[2].data.bigint[row];
             count_sum += @intCast(c);
             try std.testing.expectEqual(@as(i64, 2), c); // each key inserted twice
-            try std.testing.expectEqual(@as(i128, @as(i64, k) * 2), s); // v == k, summed twice
+            try std.testing.expectEqual(@as(i64, k) * 2, s); // v == k, summed twice
         }
     }
     try std.testing.expectEqual(n_keys, groups_seen);
@@ -895,4 +896,209 @@ test "aggregate: new aggregates honor all-NULL inputs" {
     try std.testing.expect(!b.values[3].isValid(0));
     try std.testing.expect(!b.values[4].isValid(0));
     try std.testing.expect(!b.values[5].isValid(0));
+}
+
+// SUM over integers is BIGINT and wraps like StarRocks (DESIGN.md §3.4). Group
+// g=1 sums 3·9e18 and g=2 sums 2·5e18, both past BIGINT; g=4 / hk ≥ 100 are
+// zero-valued filler rows that make `hk` high-cardinality.
+const wrap_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "g", .type = .int },
+        .{ .name = "hk", .type = .int },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    },
+    .order_key = &.{"id"},
+    .unique = true,
+};
+const wrap_ok = [_][]const u8{"id"};
+const WrapRow = struct { id: i64, g: i32, hk: i32, v: ?i64 };
+const WRAP_FILLER_ROWS = 70_000;
+const WRAP_NON_NULL_ROWS = 7 + WRAP_FILLER_ROWS;
+const WRAP_G1: i64 = 8553255926290448384;
+const WRAP_G2: i64 = -8446744073709551616;
+const WRAP_G3: i64 = 3;
+const WRAP_TOTAL: i64 = 106511852580896771;
+
+const KeySum = struct { k: i64, s: ?i64 };
+
+fn collectKeySums(allocator: std.mem.Allocator, q: anytype) ![]KeySum {
+    var out: std.ArrayList(KeySum) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            const k: i64 = switch (b.values[0].data) {
+                .int => |d| d[r],
+                .bigint => |d| d[r],
+                else => return error.UnexpectedType,
+            };
+            try out.append(allocator, .{ .k = k, .s = if (b.values[1].isValid(r)) b.values[1].data.bigint[r] else null });
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn expectKeySums(expected: []const KeySum, actual: []const KeySum) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, a| try std.testing.expectEqual(e, a);
+}
+
+fn expectKeySet(expected: []const i64, actual: []const KeySum) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected) |k| {
+        var found = false;
+        for (actual) |a| found = found or a.k == k;
+        try std.testing.expect(found);
+    }
+}
+
+fn expectAllHkGroups(pairs: []const KeySum) !void {
+    try std.testing.expectEqual(@as(usize, 3 + WRAP_FILLER_ROWS), pairs.len);
+    for (pairs) |p| {
+        const want: ?i64 = switch (p.k) {
+            1 => WRAP_G1,
+            2 => WRAP_G2,
+            3 => WRAP_G3,
+            else => 0,
+        };
+        try std.testing.expectEqual(want, p.s);
+    }
+}
+
+fn expectSqlKeySums(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: []const KeySum) !void {
+    var q = try helpers.runSql(allocator, db, sql);
+    defer q.deinit();
+    const got = try collectKeySums(allocator, &q);
+    defer allocator.free(got);
+    errdefer std.debug.print("query: {s}\n", .{sql});
+    try expectKeySums(expected, got);
+}
+
+test "aggregate: SUM(BIGINT) wraps identically on every aggregate path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const sum_v = [_]thindb.exec.AggSpec{.{ .func = .sum, .col = "v", .as = "s" }};
+
+    for ([_]bool{ false, true }) |flushed| {
+        errdefer std.debug.print("flushed={}\n", .{flushed});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{
+            .auto_flush_rows = std.math.maxInt(u64),
+            .auto_flush_bytes = std.math.maxInt(usize),
+            .auto_flush_secs = 0,
+        });
+        defer db.close();
+        const t = try db.table("w", wrap_schema, .{ .order_key = &wrap_ok, .unique = true, .row_group_size = 4096 });
+
+        const head = [_]WrapRow{
+            .{ .id = 1, .g = 1, .hk = 1, .v = 9_000_000_000_000_000_000 },
+            .{ .id = 2, .g = 1, .hk = 1, .v = 9_000_000_000_000_000_000 },
+            .{ .id = 3, .g = 1, .hk = 1, .v = 9_000_000_000_000_000_000 },
+            .{ .id = 4, .g = 2, .hk = 2, .v = 5_000_000_000_000_000_000 },
+            .{ .id = 5, .g = 2, .hk = 2, .v = 5_000_000_000_000_000_000 },
+            .{ .id = 6, .g = 3, .hk = 3, .v = 1 },
+            .{ .id = 7, .g = 3, .hk = 3, .v = 2 },
+            .{ .id = 8, .g = 3, .hk = 3, .v = null },
+        };
+        const rows = try allocator.alloc(WrapRow, head.len + WRAP_FILLER_ROWS);
+        defer allocator.free(rows);
+        @memcpy(rows[0..head.len], &head);
+        for (rows[head.len..], 0..) |*r, i| r.* = .{ .id = @intCast(100 + i), .g = 4, .hk = @intCast(100 + i), .v = 0 };
+        try t.insert(rows);
+        if (flushed) try t.flush();
+
+        // Global, plain and affine (SUM(v±k) reduces to SUM(v) ± k·COUNT(v)).
+        {
+            var q = try helpers.runSql(allocator, db, "SELECT SUM(v), SUM(v + 1), SUM(v - 1) FROM w");
+            defer q.deinit();
+            const b = (try q.next()).?;
+            try std.testing.expectEqual(WRAP_TOTAL, b.values[0].data.bigint[0]);
+            try std.testing.expectEqual(WRAP_TOTAL + WRAP_NON_NULL_ROWS, b.values[1].data.bigint[0]);
+            try std.testing.expectEqual(WRAP_TOTAL - WRAP_NON_NULL_ROWS, b.values[2].data.bigint[0]);
+        }
+
+        // Grouped, small cardinality: plain, ranked by the wrapped value, and
+        // filtered on it.
+        try expectSqlKeySums(allocator, db, "SELECT g, SUM(v) AS s FROM w GROUP BY g ORDER BY g", &.{
+            .{ .k = 1, .s = WRAP_G1 }, .{ .k = 2, .s = WRAP_G2 }, .{ .k = 3, .s = WRAP_G3 }, .{ .k = 4, .s = 0 },
+        });
+        try expectSqlKeySums(allocator, db, "SELECT g, SUM(v) AS s FROM w GROUP BY g ORDER BY s DESC LIMIT 2", &.{
+            .{ .k = 1, .s = WRAP_G1 }, .{ .k = 3, .s = WRAP_G3 },
+        });
+        try expectSqlKeySums(allocator, db, "SELECT g, SUM(v) AS s FROM w GROUP BY g HAVING SUM(v) < 0", &.{
+            .{ .k = 2, .s = WRAP_G2 },
+        });
+
+        // Grouped affine: three SUMs collapse to one {SUM(v), COUNT(v)} base set.
+        {
+            var q = try helpers.runSql(allocator, db, "SELECT g, SUM(v), SUM(v + 1), SUM(v + 2) FROM w GROUP BY g ORDER BY g");
+            defer q.deinit();
+            const want = [_][3]i64{
+                .{ WRAP_G1, WRAP_G1 + 3, WRAP_G1 + 6 },
+                .{ WRAP_G2, WRAP_G2 + 2, WRAP_G2 + 4 },
+                .{ WRAP_G3, WRAP_G3 + 2, WRAP_G3 + 4 },
+                .{ 0, WRAP_FILLER_ROWS, 2 * WRAP_FILLER_ROWS },
+            };
+            var row: usize = 0;
+            while (try q.next()) |b| {
+                for (0..b.row_count) |r| {
+                    for (want[row], 1..) |w, c| try std.testing.expectEqual(w, b.values[c].data.bigint[r]);
+                    row += 1;
+                }
+            }
+            try std.testing.expectEqual(want.len, row);
+        }
+
+        // Grouped, high cardinality.
+        try expectSqlKeySums(allocator, db, "SELECT hk, SUM(v) AS s FROM w GROUP BY hk ORDER BY s DESC LIMIT 2", &.{
+            .{ .k = 1, .s = WRAP_G1 }, .{ .k = 3, .s = WRAP_G3 },
+        });
+        try expectSqlKeySums(allocator, db, "SELECT hk, SUM(v) AS s FROM w GROUP BY hk HAVING SUM(v) < 0", &.{
+            .{ .k = 2, .s = WRAP_G2 },
+        });
+        try expectSqlKeySums(allocator, db, "SELECT hk, SUM(v) AS s FROM w GROUP BY hk ORDER BY hk LIMIT 3", &.{
+            .{ .k = 1, .s = WRAP_G1 }, .{ .k = 2, .s = WRAP_G2 }, .{ .k = 3, .s = WRAP_G3 },
+        });
+
+        // Each operator directly, so no router choice hides a path.
+        {
+            var base = try thindb.scan(allocator, t);
+            var q = try base.aggregate(&sum_v);
+            defer q.deinit();
+            try std.testing.expectEqual(WRAP_TOTAL, (try q.next()).?.values[0].data.bigint[0]);
+        }
+        {
+            var base = try thindb.scan(allocator, t);
+            var q = try base.groupBy(&.{"hk"}, &sum_v);
+            defer q.deinit();
+            const got = try collectKeySums(allocator, &q);
+            defer allocator.free(got);
+            try expectAllHkGroups(got);
+        }
+        {
+            var base = try thindb.scan(allocator, t);
+            var q = try base.groupByTopK(&.{"hk"}, &sum_v, .{ .k = 2, .keys = &.{.{ .col = "s", .desc = true }} }, null);
+            defer q.deinit();
+            const got = try collectKeySums(allocator, &q);
+            defer allocator.free(got);
+            try expectKeySet(&.{ 1, 3 }, got);
+        }
+        {
+            var base = try thindb.scan(allocator, t);
+            var q = try base.radixGroupBy(&.{"hk"}, &sum_v, null);
+            defer q.deinit();
+            const got = try collectKeySums(allocator, &q);
+            defer allocator.free(got);
+            try expectAllHkGroups(got);
+        }
+        {
+            var base = try thindb.scan(allocator, t);
+            var q = try base.radixGroupBy(&.{"hk"}, &sum_v, .{ .k = 2, .col = "s", .desc = true });
+            defer q.deinit();
+            const got = try collectKeySums(allocator, &q);
+            defer allocator.free(got);
+            try expectKeySet(&.{ 1, 3 }, got);
+        }
+    }
 }

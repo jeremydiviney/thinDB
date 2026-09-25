@@ -153,12 +153,10 @@ pub const AggSpec = struct {
     /// Per-function payload. Defaults to `.none` so existing call
     /// sites compile unchanged.
     params: AggParams = .none,
-    /// Forces the output column type, overriding `aggOutputType`. Set by
-    /// the affine-aggregate reduction (`local.zig`) to keep an integer SUM
-    /// base in i128 (`.largeint`) so the post-aggregate derivation
-    /// `a·SUM + b·COUNT` runs in i128 with no intermediate i64 narrowing —
-    /// matching the direct path's accumulate-in-i128-then-narrow-once
-    /// overflow behavior bit-for-bit. `null` ⇒ the canonical type.
+    /// Forces the output column type, overriding `aggOutputType`, for
+    /// internal producers whose type the input can't tell: a parallel combine
+    /// re-summing partial results keeps the partial's type, and MAX_BY's key
+    /// column type. `null` ⇒ the canonical type.
     out_type_override: ?Type = null,
 };
 
@@ -193,6 +191,9 @@ const OrderVal = union(enum) {
 const ResolvedKey = struct {
     agg_idx: usize,
     desc: bool,
+    /// The aggregate emits BIGINT, so an i128 SUM total ranks by its wrapped
+    /// i64 value, as emitted.
+    wraps_to_bigint: bool,
 };
 
 /// `TopKHint` after binding every key. Owns `keys` (allocator-backed; freed in
@@ -345,8 +346,8 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .int => |v| std.math.order(v[row], val.int),
         .bigint => |v| std.math.order(v[row], val.bigint),
         .boolean => |v| std.math.order(v[row], @intFromBool(val.boolean)),
-        .float => |v| std.math.order(v[row], val.float),
-        .double => |v| std.math.order(v[row], val.double),
+        .float => |v| types.floatOrder(v[row], val.float),
+        .double => |v| types.floatOrder(v[row], val.double),
         .date => |v| std.math.order(v[row], val.date),
         .datetime => |v| std.math.order(v[row], val.datetime),
         .tinyint => |v| std.math.order(v[row], val.tinyint),
@@ -2749,11 +2750,12 @@ fn resolveTopK(
             allocator.free(rkeys);
             return null;
         };
-        if (!topkOrderable(aggs[idx].func, output_schema[group_cols_len + idx].type)) {
+        const out_t = output_schema[group_cols_len + idx].type;
+        if (!topkOrderable(aggs[idx].func, out_t)) {
             allocator.free(rkeys);
             return null;
         }
-        rk.* = .{ .agg_idx = idx, .desc = hk.desc };
+        rk.* = .{ .agg_idx = idx, .desc = hk.desc, .wraps_to_bigint = out_t == .bigint };
     }
     return ResolvedTopK{ .k = h.k, .keys = rkeys };
 }
@@ -2782,10 +2784,10 @@ fn topkOrderable(func: AggFunc, out_t: Type) bool {
 /// value `appendAccToColumn` would emit — including the 0/0.0 defaults for
 /// empty MIN/MAX/AVG — so the heap orders groups identically to the downstream
 /// OrderBy. Only reached for variants `topkOrderable` accepts.
-fn aggOrderValue(s: AccState) OrderVal {
+fn aggOrderValue(s: AccState, wraps_to_bigint: bool) OrderVal {
     return switch (s) {
         .count => |c| .{ .int = @intCast(c) },
-        .sum_int => |v| .{ .int = v.v },
+        .sum_int => |v| .{ .int = if (wraps_to_bigint) @as(i64, @truncate(v.v)) else v.v },
         .sum_float => |v| .{ .float = v.v },
         .min_int, .max_int => |m| .{ .int = m orelse 0 },
         .min_large, .max_large => |m| .{ .int = if (m.present) m.v else 0 },
@@ -2802,7 +2804,7 @@ fn aggOrderValue(s: AccState) OrderVal {
 fn ovOrder(a: OrderVal, b: OrderVal) std.math.Order {
     return switch (a) {
         .int => |x| std.math.order(x, b.int),
-        .float => |x| std.math.order(x, b.float),
+        .float => |x| types.floatOrder(x, b.float),
     };
 }
 
@@ -2817,7 +2819,7 @@ fn topkEntry(gid: u32, state: []AccState, keys: []const ResolvedKey, cd: []const
         e.vals[i] = if (cd[kk.agg_idx]) |c|
             .{ .int = @intCast(c.counts.items[gid]) }
         else
-            aggOrderValue(state[kk.agg_idx]);
+            aggOrderValue(state[kk.agg_idx], kk.wraps_to_bigint);
     }
     return e;
 }
@@ -3130,6 +3132,8 @@ fn aggColStat(a: AggSpec, out_type: Type, src: ?exec.ColStat, upper_rows: u64) e
             // lo ≤ hi ⇒ n·lo ≤ n·hi for n ≥ 0.
             const min = std.math.mul(i128, n, lo) catch return .{};
             const max = std.math.mul(i128, n, hi) catch return .{};
+            // A BIGINT SUM that could leave i64 wraps, so the range would bound nothing.
+            if (out_type == .bigint and (min < std.math.minInt(i64) or max > std.math.maxInt(i64))) return .{};
             return .{ .min = min, .max = max };
         },
         .avg => {
@@ -3152,11 +3156,10 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
             // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s).
             if (t.decimalSpec()) |spec| break :blk .{ .decimal128 = .{ .p = 38, .s = spec.s } };
             if (t.isFloat()) break :blk .double;
-            // A 64-bit integer SUM widens its accumulator and result to i128 so a
-            // large-magnitude sum (e.g. SUM(UserID)) can't overflow; 8/16/32-bit
-            // inputs stay in i64 (a sum can't overflow i64 short of billions of
-            // rows). See DESIGN.md §3.4 (accumulator promotion).
-            if (t == .largeint or t == .bigint) break :blk .largeint;
+            // DESIGN.md §3.4: an integer SUM is BIGINT and wraps on overflow,
+            // as in StarRocks — every path accumulates exactly and truncates
+            // the total to i64. LARGEINT (internal-only) keeps its width.
+            if (t == .largeint) break :blk .largeint;
             break :blk .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
@@ -3877,12 +3880,12 @@ fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row:
         },
         .float => |s| {
             var b: [4]u8 = undefined;
-            storage.format.writeF32(&b, s[row]);
+            storage.format.writeF32(&b, types.canonicalFloat(s[row]));
             try out.appendSlice(aa, &b);
         },
         .double => |s| {
             var b: [8]u8 = undefined;
-            storage.format.writeF64(&b, s[row]);
+            storage.format.writeF64(&b, types.canonicalFloat(s[row]));
             try out.appendSlice(aa, &b);
         },
         .string, .varchar, .char, .json => |sv| {
@@ -3938,12 +3941,8 @@ pub fn appendAccToColumn(
                 // overflow is impossible here because total is already i128;
                 // any further widening would only occur in row-level arithmetic.
                 .decimal128 => try col.data.decimal128.append(allocator, total.v),
-                else => {
-                    if (total.v > std.math.maxInt(i64) or total.v < std.math.minInt(i64)) {
-                        return Error.ArithmeticOverflow;
-                    }
-                    try col.data.bigint.append(allocator, @intCast(total.v));
-                },
+                // DESIGN.md §3.4: an integer SUM wraps to BIGINT.
+                else => try col.data.bigint.append(allocator, @truncate(total.v)),
             },
             .sum_float => |total| if (!total.seen) {
                 try col.data.appendNullPlaceholder(allocator);
@@ -4588,12 +4587,12 @@ fn buildCompoundGroupKey(
             },
             .float => |s| {
                 var b: [4]u8 = undefined;
-                storage.format.writeF32(&b, s[row]);
+                storage.format.writeF32(&b, types.canonicalFloat(s[row]));
                 try out.appendSlice(allocator, &b);
             },
             .double => |s| {
                 var b: [8]u8 = undefined;
-                storage.format.writeF64(&b, s[row]);
+                storage.format.writeF64(&b, types.canonicalFloat(s[row]));
                 try out.appendSlice(allocator, &b);
             },
             .date => |s| try storage.format.appendI32(allocator, out, s[row]),

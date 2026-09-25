@@ -318,25 +318,15 @@ pub const MetaAggStats = struct {
                             try out_cols[i].data.double.append(allocator, fsum);
                             try out_cols[i].appendValidBit(allocator, 0, true);
                         }
-                    } else if (col.type == .bigint) {
-                        // SUM(bigint) widens to largeint (aggOutputType).
-                        out_schema[i] = .{ .name = sp.out_name, .type = .largeint, .nullable = true };
-                        out_cols[i] = try ColumnStore.init(allocator, .largeint, true);
-                        inited += 1;
-                        if (non_null == 0) {
-                            try cell_io.appendNullTo(allocator, &out_cols[i]);
-                        } else {
-                            try out_cols[i].data.largeint.append(allocator, isum);
-                            try out_cols[i].appendValidBit(allocator, 0, true);
-                        }
                     } else {
+                        // DESIGN.md §3.4: an integer SUM wraps to BIGINT (aggOutputType).
                         out_schema[i] = .{ .name = sp.out_name, .type = .bigint, .nullable = true };
                         out_cols[i] = try ColumnStore.init(allocator, .bigint, true);
                         inited += 1;
                         if (non_null == 0) {
                             try cell_io.appendNullTo(allocator, &out_cols[i]);
                         } else {
-                            try out_cols[i].data.bigint.append(allocator, @intCast(isum));
+                            try out_cols[i].data.bigint.append(allocator, @truncate(isum));
                             try out_cols[i].appendValidBit(allocator, 0, true);
                         }
                     }

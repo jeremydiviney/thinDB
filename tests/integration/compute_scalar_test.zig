@@ -536,3 +536,58 @@ test "scalar: expanded missing-function kernels through Compute" {
     try std.testing.expectEqualStrings("10", b.values[base_cols + 24].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("255", b.values[base_cols + 25].data.string.rowBytes(0));
 }
+
+// ---------------------------------------------------------------------------
+// Math domain errors and overflow
+// ---------------------------------------------------------------------------
+
+test "a math function answers a domain error or overflow with NULL" {
+    // MySQL and StarRocks return NULL for SQRT(-1), LN(0), ASIN(2), EXP(1000),
+    // MOD(x, 0); thinDB returned NaN and ±inf, which then misbehaved as keys.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE m (id BIGINT PRIMARY KEY, x DOUBLE)");
+    try helpers.exec(allocator, db, "INSERT INTO m (id, x) VALUES (1, -1.0), (2, 0.0), (3, 4.0), (4, 1000.0), (5, NULL)");
+
+    const pi = std.math.pi;
+    const cases = .{
+        .{ "SQRT(x)", [_]?f64{ null, 0, 2, @sqrt(1000.0), null } },
+        .{ "SQRT(id - 3)", [_]?f64{ null, null, 0, 1, @sqrt(2.0) } },
+        .{ "LN(x)", [_]?f64{ null, null, @log(4.0), @log(1000.0), null } },
+        .{ "LOG10(x)", [_]?f64{ null, null, @log10(4.0), 3, null } },
+        .{ "LOG2(x)", [_]?f64{ null, null, 2, @log2(1000.0), null } },
+        .{ "LOG(2, x)", [_]?f64{ null, null, 2, @log(1000.0) / @log(2.0), null } },
+        .{ "LOG(1, x)", [_]?f64{ null, null, null, null, null } },
+        .{ "EXP(x)", [_]?f64{ @exp(-1.0), 1, @exp(4.0), null, null } },
+        .{ "POW(x, 0.5)", [_]?f64{ null, 0, 2, std.math.pow(f64, 1000, 0.5), null } },
+        .{ "POWER(x, -1)", [_]?f64{ -1, null, 0.25, 0.001, null } },
+        .{ "ASIN(x)", [_]?f64{ -pi / 2.0, 0, null, null, null } },
+        .{ "ACOS(x)", [_]?f64{ pi, pi / 2.0, null, null, null } },
+        .{ "COT(x)", [_]?f64{ 1.0 / @tan(-1.0), null, 1.0 / @tan(4.0), 1.0 / @tan(1000.0), null } },
+        .{ "MOD(x, 3)", [_]?f64{ -1, 0, 1, 1, null } },
+        .{ "x % 0", [_]?f64{ null, null, null, null, null } },
+        .{ "FMOD(x, 0)", [_]?f64{ null, null, null, null, null } },
+    };
+    inline for (cases) |c| {
+        var q = try helpers.runSql(allocator, db, "SELECT " ++ c[0] ++ " FROM m ORDER BY id");
+        defer q.deinit();
+        var row: usize = 0;
+        while (try q.next()) |b| {
+            for (0..b.row_count) |r| {
+                const got: ?f64 = if (b.values[0].isValid(r)) b.values[0].data.double[r] else null;
+                // Comptime folds the expected transcendentals, which can differ
+                // from the runtime result in the last bit.
+                const same = if (c[1][row]) |want| got != null and std.math.approxEqRel(f64, want, got.?, 1e-12) else got == null;
+                if (!same) {
+                    std.debug.print("{s} row {d}: want {?d} got {?d}\n", .{ c[0], row, c[1][row], got });
+                    return error.TestUnexpectedResult;
+                }
+                row += 1;
+            }
+        }
+        try std.testing.expectEqual(c[1].len, row);
+    }
+}

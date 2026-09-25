@@ -175,6 +175,59 @@ pub fn kernelFor(from: TypeTag, to: TypeTag) ?CastKernel {
     };
 }
 
+/// The cost of passing an integer argument to a narrower integer parameter,
+/// or null when `from → to` is not an integer narrowing. Only the scalar
+/// function resolver uses it, and only after no overload matched through
+/// `castCost`, so it never changes a call that resolved by widening. It exists
+/// because integer `+ - *` widen their result (DESIGN.md §3.4): StarRocks casts
+/// such a BIGINT argument down to an INT parameter, e.g. `date_add(d, n + 1)`.
+pub fn argNarrowingCost(from: TypeTag, to: TypeTag) ?u32 {
+    const from_rank = intRank(from) orelse return null;
+    const to_rank = intRank(to) orelse return null;
+    return if (to_rank < from_rank) from_rank - to_rank else null;
+}
+
+fn intRank(t: TypeTag) ?u32 {
+    return switch (t) {
+        .tinyint => 0,
+        .smallint => 1,
+        .int => 2,
+        .bigint => 3,
+        .largeint => 4,
+        else => null,
+    };
+}
+
+/// The kernel for an `argNarrowingCost` cast. Out-of-range values saturate,
+/// as an explicit `CAST(bigint AS INT)` does.
+pub fn argNarrowingKernelFor(from: TypeTag, to: TypeTag) ?CastKernel {
+    return switch (from) {
+        .smallint => switch (to) {
+            .tinyint => makeIntNarrow(i16, i8, .tinyint),
+            else => null,
+        },
+        .int => switch (to) {
+            .tinyint => makeIntNarrow(i32, i8, .tinyint),
+            .smallint => makeIntNarrow(i32, i16, .smallint),
+            else => null,
+        },
+        .bigint => switch (to) {
+            .tinyint => makeIntNarrow(i64, i8, .tinyint),
+            .smallint => makeIntNarrow(i64, i16, .smallint),
+            .int => makeIntNarrow(i64, i32, .int),
+            else => null,
+        },
+        .largeint => switch (to) {
+            .tinyint => makeIntNarrow(i128, i8, .tinyint),
+            .smallint => makeIntNarrow(i128, i16, .smallint),
+            .int => makeIntNarrow(i128, i32, .int),
+            .bigint => makeIntNarrow(i128, i64, .bigint),
+            else => null,
+        },
+        else => null,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Comptime-generated kernel factories. Each returns a function pointer with
 // the standard kernel signature so the Compute operator can call uniformly.
@@ -201,6 +254,20 @@ fn makeIntWiden(comptime FromT: type, comptime ToT: type, comptime to_tag: TypeT
             const dst = &@field(out.data, @tagName(to_tag));
             var i: usize = 0;
             while (i < row_count) : (i += 1) try dst.append(allocator, @as(ToT, src[i]));
+            try copyValidityIfNullable(allocator, args[0], out, row_count);
+        }
+    }.kernel;
+}
+
+fn makeIntNarrow(comptime FromT: type, comptime ToT: type, comptime to_tag: TypeTag) CastKernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const src = @field(args[0].data, @tagName(srcTag(FromT)));
+            const dst = &@field(out.data, @tagName(to_tag));
+            const lo: FromT = std.math.minInt(ToT);
+            const hi: FromT = std.math.maxInt(ToT);
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) try dst.append(allocator, @as(ToT, @intCast(std.math.clamp(src[i], lo, hi))));
             try copyValidityIfNullable(allocator, args[0], out, row_count);
         }
     }.kernel;

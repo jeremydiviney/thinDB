@@ -314,11 +314,12 @@ pub const Database = struct {
 
     /// Walk every schema in this database and run one flush sweep on each.
     pub fn backgroundFlushSweep(self: *Database) !void {
+        const lifetime = try SchemaMod.retainSweepLifetime(self.config.statement_gate);
+        defer if (lifetime) |l| l.release();
         const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, &self.schemas);
         defer snapshot.freeNames(self.allocator, names);
         for (names) |name| {
-            const s = self.schema(name) orelse continue;
-            try s.backgroundFlushSweep();
+            try Schema.flushSweep(.{ .database = .{ .database = self, .schema = name } });
         }
     }
 
@@ -338,12 +339,13 @@ pub const Database = struct {
 
     /// Returns true if any schema merged a group this sweep.
     pub fn backgroundCompactSweep(self: *Database) !bool {
+        const lifetime = try SchemaMod.retainSweepLifetime(self.config.statement_gate);
+        defer if (lifetime) |l| l.release();
         const names = try snapshot.snapshotMapKeys(self.allocator, self.io, &self.schemas_mutex, &self.schemas);
         defer snapshot.freeNames(self.allocator, names);
         var worked = false;
         for (names) |name| {
-            const s = self.schema(name) orelse continue;
-            if (s.backgroundCompactSweep() catch false) worked = true;
+            if (Schema.compactSweep(.{ .database = .{ .database = self, .schema = name } }) catch false) worked = true;
         }
         return worked;
     }

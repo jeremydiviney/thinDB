@@ -1009,12 +1009,28 @@ fn sameNamespace(a: PersistentTableTarget, b: PersistentTableTarget) bool {
 const NameParts = struct { db: []const u8, schema: []const u8 };
 
 /// Split `db__schema` into `(db, schema)` for MySQL-style flattened
-/// names. Returns null if `__` is absent. Mirrors the rule in
-/// `mysql/server.zig::applyInitDb` so wire-side and SQL-side resolve
-/// the same way.
+/// names. Returns null if `__` is absent.
 fn splitDoubleUnderscore(name: []const u8) ?NameParts {
     const sep = std.mem.indexOf(u8, name, "__") orelse return null;
     return .{ .db = name[0..sep], .schema = name[sep + 2 ..] };
+}
+
+/// Where `USE name` and COM_INIT_DB land, so the SQL and wire paths agree.
+/// `db__schema` names both parts. A bare name is a schema of the current
+/// database, else a database's default schema: clients run
+/// `CREATE DATABASE x; USE x` and expect to be in `x`.
+pub fn resolveUseTarget(catalog: *Catalog, current_db: []const u8, name: []const u8) Error!NameParts {
+    if (splitDoubleUnderscore(name)) |parts| {
+        const db = catalog.database(parts.db) orelse return Error.DatabaseNotFound;
+        _ = db.schema(parts.schema) orelse return Error.SchemaNotFound;
+        return parts;
+    }
+    if (catalog.database(current_db)) |db| {
+        if (db.schema(name) != null) return .{ .db = current_db, .schema = name };
+    }
+    const db = catalog.database(name) orelse return Error.DatabaseNotFound;
+    _ = db.schema(thindb_api.default_schema_name) orelse return Error.SchemaNotFound;
+    return .{ .db = name, .schema = thindb_api.default_schema_name };
 }
 
 // ---------------------------------------------------------------------------
@@ -2159,7 +2175,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
 fn compileDelete(ctx: *CompileCtx, d: ir.DeleteOp) !Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, d.table);
-    const deleted = try t.deleteByExpr(d.predicate);
+    const deleted = try t.deleteByExpr(d.predicate, d.derived);
     ctx.affected_rows = @intCast(deleted);
     return try EmptyOp.createWithCount(ctx.allocator, deleted);
 }
@@ -2183,7 +2199,7 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
         dst.* = .{ .col = src.col, .value = src.value };
     }
 
-    const affected = try t.updateStreaming(u.predicate, assigns_buf);
+    const affected = try t.updateStreaming(u.predicate, u.derived, assigns_buf);
     ctx.affected_rows = @intCast(affected);
     return try EmptyOp.createWithCount(ctx.allocator, affected);
 }
@@ -2274,26 +2290,13 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             };
         },
         .use_schema => |name| {
-            // Accept MySQL-style `USE db__schema` by splitting on `__`.
-            // Without this the SQL `USE` path diverges from COM_INIT_DB
-            // and tools like MySQL Workbench (which always emit the
-            // flattened form) fail with "Schema not found".
-            if (splitDoubleUnderscore(name)) |parts| {
-                const db = catalog.database(parts.db) orelse return Error.DatabaseNotFound;
-                _ = db.schema(parts.schema) orelse return Error.SchemaNotFound;
-                const db_owned = try ctx.allocator.dupe(u8, parts.db);
-                try ctx.session_strings.append(ctx.allocator, db_owned);
-                const sc_owned = try ctx.allocator.dupe(u8, parts.schema);
-                try ctx.session_strings.append(ctx.allocator, sc_owned);
-                ctx.session.current_db = db_owned;
-                ctx.session.current_schema = sc_owned;
-            } else {
-                const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
-                _ = db.schema(name) orelse return Error.SchemaNotFound;
-                const owned = try ctx.allocator.dupe(u8, name);
-                try ctx.session_strings.append(ctx.allocator, owned);
-                ctx.session.current_schema = owned;
-            }
+            const target = try resolveUseTarget(catalog, ctx.session.current_db, name);
+            const db_owned = try ctx.allocator.dupe(u8, target.db);
+            try ctx.session_strings.append(ctx.allocator, db_owned);
+            const sc_owned = try ctx.allocator.dupe(u8, target.schema);
+            try ctx.session_strings.append(ctx.allocator, sc_owned);
+            ctx.session.current_db = db_owned;
+            ctx.session.current_schema = sc_owned;
         },
         .use_database_schema => |p| {
             const db = catalog.database(p.database) orelse return Error.DatabaseNotFound;

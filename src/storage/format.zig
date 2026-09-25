@@ -227,9 +227,18 @@ pub fn encodeFloatOrder(f: f64) i128 {
     // NaN sorts last (max key) to match `types.floatOrder`: +inf maps to
     // 0xFFF0… while maxInt(u64) is strictly above it, so NaN > every value.
     if (std.math.isNan(f)) return @as(i128, std.math.maxInt(u64));
-    const bits: u64 = @bitCast(f);
+    // -0.0 and +0.0 are one value (#82): both take +0.0's key.
+    const bits: u64 = @bitCast(if (f == 0) @as(f64, 0) else f);
     const key: u64 = if (bits >> 63 != 0) ~bits else bits | (@as(u64, 1) << 63);
     return @as(i128, key);
+}
+
+/// Float stats written before #82 keep -0.0 at its own key, one below +0.0's.
+/// A reader comparing stored float stats maps that key onto +0.0's, so a row
+/// group holding only -0.0 still matches `= 0`.
+pub fn canonicalFloatOrder(k: i128) i128 {
+    const neg_zero_key: i128 = ~@as(u64, @bitCast(@as(f64, -0.0)));
+    return if (k == neg_zero_key) encodeFloatOrder(0) else k;
 }
 
 pub const Error = error{
@@ -477,11 +486,14 @@ test "encodeFloatOrder is monotonic across the f64 range" {
     var prev = encodeFloatOrder(ordered[0]);
     for (ordered[1..]) |f| {
         const cur = encodeFloatOrder(f);
-        // -0.0 and +0.0 are adjacent (encode to consecutive keys); every other
-        // step is a strict increase. `<=` covers the ±0 tie soundly for bounds.
-        try std.testing.expect(prev <= cur);
+        // -0.0 and +0.0 share a key; every other step is a strict increase.
+        try std.testing.expect(if (f == 0 and prev == encodeFloatOrder(0)) cur == prev else prev < cur);
         prev = cur;
     }
+    // A pre-#82 stats key for -0.0 reads back as +0.0's.
+    const legacy_neg_zero: i128 = ~@as(u64, @bitCast(@as(f64, -0.0)));
+    try std.testing.expectEqual(encodeFloatOrder(0), canonicalFloatOrder(legacy_neg_zero));
+    try std.testing.expectEqual(encodeFloatOrder(-1.0), canonicalFloatOrder(encodeFloatOrder(-1.0)));
     // Distinct finite values are strictly ordered.
     try std.testing.expect(encodeFloatOrder(1.0) < encodeFloatOrder(2.0));
     try std.testing.expect(encodeFloatOrder(-2.0) < encodeFloatOrder(-1.0));

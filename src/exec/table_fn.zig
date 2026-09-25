@@ -2001,9 +2001,14 @@ pub const TableFnExec = struct {
                     h1.update(std.mem.asBytes(&bytes.len));
                     h2.update(std.mem.asBytes(&bytes.len));
                 },
-                inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .uuid, .float, .double, .boolean => |s| {
+                inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .uuid, .boolean => |s| {
                     h1.update(std.mem.asBytes(&s[row]));
                     h2.update(std.mem.asBytes(&s[row]));
+                },
+                inline .float, .double => |s| {
+                    const canonical = types.canonicalFloat(s[row]);
+                    h1.update(std.mem.asBytes(&canonical));
+                    h2.update(std.mem.asBytes(&canonical));
                 },
             }
         }

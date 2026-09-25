@@ -193,7 +193,8 @@ const AggPlan = struct {
 };
 
 // A per-lane partial accumulator. Aggregate i uses `isum[i]` (integer
-// sum/min/max — i128, so a 100M-row SUM over bigint can't overflow) OR
+// sum/min/max — i128, so a SUM over bigint is exact until the wrap to BIGINT
+// at emit) OR
 // `fsum[i]` (float sum/min/max), chosen by the aggregate's input type. `ns[i]`
 // is the non-null input count (AVG denominator, COUNT(col)); `count` is the
 // group's row count (COUNT(*)). Nothing here is column-specific. Per-group
@@ -672,13 +673,13 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
                 while (r < n) : (r += 1) {
                     if (!view.isValid(r)) continue;
                     lane.ns[i] += 1;
-                    const key = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[r])))));
+                    const key = @as(u128, types.canonicalFloatBits(@as(f64, @floatCast(s[r]))));
                     if (have_prev and key == prev_key) continue;
                     prev_key = key;
                     have_prev = true;
                     const pf = r + PREFETCH_DIST_DISTINCT;
                     if (pf < n and view.isValid(pf)) {
-                        const k_pf = @as(u128, @as(u64, @bitCast(@as(f64, @floatCast(s[pf])))));
+                        const k_pf = @as(u128, types.canonicalFloatBits(@as(f64, @floatCast(s[pf]))));
                         dsets[distinctPartition(tier, k_pf, parts)].prefetchKey(k_pf);
                     }
                     _ = try dsets[distinctPartition(tier, key, parts)].insertIsNew(lane.allocator, key);
@@ -1146,10 +1147,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                         const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
                         p.is_float = isFloatType(ctyp);
                         if (ctyp.decimalSpec()) |sp| p.input_scale = sp.s;
-                        // The affine-aggregate reduction pins a base SUM to
-                        // largeint so the post-agg `a·SUM + b·COUNT` derivation
-                        // runs in i128 without an intermediate narrow.
-                        p.output_type = agg.out_type_override orelse out_type;
+                        p.output_type = out_type;
                     }
                 },
                 .count_distinct => {
@@ -1628,7 +1626,8 @@ fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i12
         .smallint => try col.data.smallint.append(allocator, @intCast(value)),
         .int => try col.data.int.append(allocator, @intCast(value)),
         .date => try col.data.date.append(allocator, @intCast(value)),
-        .bigint => try col.data.bigint.append(allocator, @intCast(value)),
+        // DESIGN.md §3.4: an integer SUM wraps to BIGINT (MIN/MAX always fit).
+        .bigint => try col.data.bigint.append(allocator, @truncate(value)),
         .datetime => try col.data.datetime.append(allocator, @intCast(value)),
         .decimal64 => try col.data.decimal64.append(allocator, @intCast(value)),
         .decimal128 => try col.data.decimal128.append(allocator, value),
@@ -1656,7 +1655,7 @@ test "encoded machinery folds integer runs with wide totals and unsigned boolean
     };
     inline for (cases) |case| {
         const plans = [_]AggPlan{
-            .{ .op = .sum, .input_name = "x", .is_float = false, .output_type = .largeint, .name = "s" },
+            .{ .op = .sum, .input_name = "x", .is_float = false, .output_type = .bigint, .name = "s" },
             .{ .op = .count_col, .input_name = "x", .is_float = false, .output_type = .bigint, .name = "n" },
             .{ .op = .min, .input_name = "x", .is_float = false, .output_type = case.typ, .name = "lo" },
             .{ .op = .max, .input_name = "x", .is_float = false, .output_type = case.typ, .name = "hi" },
@@ -1688,8 +1687,8 @@ test "encoded machinery folds integer runs with wide totals and unsigned boolean
 
 test "encoded machinery decline leaves aggregate state unchanged and nullable sums stay exact" {
     const plans = [_]AggPlan{
-        .{ .op = .sum, .input_name = "x", .is_float = false, .output_type = .largeint, .name = "s" },
-        .{ .op = .sum, .input_name = "y", .is_float = false, .output_type = .largeint, .name = "t" },
+        .{ .op = .sum, .input_name = "x", .is_float = false, .output_type = .bigint, .name = "s" },
+        .{ .op = .sum, .input_name = "y", .is_float = false, .output_type = .bigint, .name = "t" },
     };
     var lane = try Lane.init(std.testing.allocator, &plans, 1);
     defer lane.deinit(std.testing.allocator);

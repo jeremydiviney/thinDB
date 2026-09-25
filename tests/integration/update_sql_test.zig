@@ -317,3 +317,33 @@ test "UPDATE: an expression that yields NULL for a NOT NULL column is rejected, 
     defer allocator.free(ns);
     try std.testing.expectEqualSlices(i64, &.{ 10, 20, 30, 40, 50, 60 }, ns);
 }
+
+test "UPDATE: WHERE with a computed operand — segment and memtable rows (#94)" {
+    // Row 5 stays in the memtable; 1-4 are in a flushed segment.
+    const cases = .{
+        .{ .sql = "UPDATE t SET qty = 0 WHERE id % 2 = 0", .qtys = &[_]i64{ 10, 0, 30, 0, 50 }, .affected = 2 },
+        .{ .sql = "UPDATE t SET qty = 0 WHERE id * 2 = 4", .qtys = &[_]i64{ 10, 0, 30, 40, 50 }, .affected = 1 },
+        .{ .sql = "UPDATE t SET qty = qty + 1 WHERE MOD(qty, 20) = 10", .qtys = &[_]i64{ 11, 20, 31, 40, 51 }, .affected = 3 },
+        .{ .sql = "UPDATE t SET qty = 0 WHERE UPPER(label) = 'E'", .qtys = &[_]i64{ 10, 20, 30, 40, 0 }, .affected = 1 },
+        .{ .sql = "UPDATE t SET qty = 0 WHERE id = 3 AND qty % 2 = 0", .qtys = &[_]i64{ 10, 20, 0, 40, 50 }, .affected = 1 },
+        .{ .sql = "UPDATE t SET qty = 0 WHERE id = 3 AND qty % 2 = 1", .qtys = &[_]i64{ 10, 20, 30, 40, 50 }, .affected = 0 },
+    };
+    inline for (cases) |c| {
+        const allocator = std.testing.allocator;
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try setup(allocator, io, tmp.dir);
+        defer db.close();
+        try exec(allocator, db, "INSERT INTO t (id, qty, label) VALUES (5, 50, 'e')");
+
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        while (try q.next()) |_| {}
+        try std.testing.expectEqual(@as(u64, c.affected), q.affectedRows());
+
+        const qtys = try collectBigints(allocator, db, "SELECT CAST(qty AS BIGINT) FROM t ORDER BY id ASC");
+        defer allocator.free(qtys);
+        try std.testing.expectEqualSlices(i64, c.qtys, qtys);
+    }
+}

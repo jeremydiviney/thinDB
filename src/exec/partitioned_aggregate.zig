@@ -269,10 +269,10 @@ pub const PartitionedAggregate = struct {
                 h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) @as(u64, @bitCast(@as(i64, v))) else NULL_SENTINEL));
             },
             .float => |s| for (hashes, s[0..hashes.len], 0..) |*h, v, row| {
-                h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) @as(u64, @as(u32, @bitCast(v))) else NULL_SENTINEL));
+                h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) @as(u64, types.canonicalFloatBits(v)) else NULL_SENTINEL));
             },
             .double => |s| for (hashes, s[0..hashes.len], 0..) |*h, v, row| {
-                h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) @as(u64, @bitCast(v)) else NULL_SENTINEL));
+                h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) types.canonicalFloatBits(v) else NULL_SENTINEL));
             },
             .largeint, .decimal128 => |s| for (hashes, s[0..hashes.len], 0..) |*h, v, row| {
                 const u: u128 = @bitCast(v);

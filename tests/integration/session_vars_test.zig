@@ -116,7 +116,7 @@ test "session var: var in SELECT expression position" {
     defer q.deinit();
     const batch = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 1), batch.row_count);
-    try std.testing.expectEqual(@as(i32, 110), batch.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i64, 110), batch.values[1].data.bigint[0]);
 }
 
 test "session var: undefined var resolves to NULL" {

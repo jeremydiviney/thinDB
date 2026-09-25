@@ -146,8 +146,8 @@ pub const Table = struct {
 
     /// Reader/DDL coordination. Scans hold this SHARED for their entire
     /// lifetime (acquire on create, release on deinit). DDL operations
-    /// (drop / alter / rename) hold it EXCLUSIVE. Background flushers and
-    /// compactors briefly hold it shared while they have a `*Table` pointer.
+    /// (drop / alter / rename) and compaction commits hold it EXCLUSIVE. The
+    /// background flusher holds it shared while it flushes.
     ///
     /// Semantic: DDL waits for in-flight scans to finish, then runs while
     /// no new scans can start. Standard SQL-DB behavior (cf. PostgreSQL
@@ -775,12 +775,12 @@ pub const Table = struct {
         self.flush_fail_streak = 0;
     }
 
-    /// Background-compactor entry point. Caller (the background compact
-    /// sweep) already holds `compact_lock`. Runs one compaction step,
-    /// considering both the tombstone-pressure trigger and (when at least
-    /// `min_segments` are live) the count-based tier trigger. No-op when
-    /// no segment qualifies or both gates are disabled.
-    pub fn tryBackgroundCompact(self: *Table, min_segments: u32, tomb_threshold: f32) !bool {
+    /// Background-compactor pick. Caller (the background compact sweep)
+    /// already holds `compact_lock`. Returns the segment ids of the next
+    /// merge, considering both the tombstone-pressure trigger and (when at
+    /// least `min_segments` are live) the count-based tier trigger; null when
+    /// no segment qualifies or both gates are disabled. Caller owns the ids.
+    pub fn pickBackgroundCompaction(self: *Table, min_segments: u32, tomb_threshold: f32) !?[]u64 {
         try self.ensureUsable();
         // Cheap optimization: skip the work if neither trigger can fire.
         self.mutex.lockUncancelable(self.io);
@@ -788,8 +788,8 @@ pub const Table = struct {
         self.mutex.unlock(self.io);
         const enough_for_tier = (min_segments != 0 and seg_count >= min_segments);
         const tomb_enabled = (tomb_threshold <= 1.0);
-        if (!enough_for_tier and !tomb_enabled) return false;
-        return try @import("compact.zig").execTieredCompact(self, tomb_threshold);
+        if (!enough_for_tier and !tomb_enabled) return null;
+        return @import("compact.zig").pickTieredGroup(self, tomb_threshold);
     }
 
     pub fn segmentCount(self: Table) usize {
@@ -923,17 +923,14 @@ pub const Table = struct {
     /// SQL `DELETE FROM t [WHERE expr]` — generalized delete with the
     /// rich PredicateExpr. Subqueries and `@vars` must already be
     /// resolved by the pre-compile pass. `pred == null` deletes every
-    /// row. Returns the deleted row count. Streams per segment so
+    /// row; `derived` are the computed operands it compares by name.
+    /// Returns the deleted row count. Streams per segment so
     /// memory stays bounded by segment size. Segment rows are durable
     /// through their tombstone files, memtable rows through the WAL
     /// (`deleteMemtableRowsLocked`).
-    pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr) !usize {
+    pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr, derived: []const exec.Derived) !usize {
         const statement_lease = try self.acquireStatement();
         defer if (statement_lease) |lease| lease.release();
-        // Widen literals in the predicate up front (BIGINT column + INT
-        // literal etc.). The mutation is local to this function.
-        var pred_local: ?exec.PredicateExpr = pred;
-        if (pred_local) |*p| try exec.predicate.validateExpr(p, self.schema.columns);
 
         self.mutex.lockUncancelable(self.io);
         var wal_target: ?u64 = null;
@@ -941,7 +938,7 @@ pub const Table = struct {
         {
             defer self.mutex.unlock(self.io);
             try self.ensureUsable();
-            deleted = try @import("delete.zig").execDeleteByExpr(self, pred_local, &wal_target);
+            deleted = try @import("delete.zig").execDeleteByExpr(self, pred, derived, &wal_target);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
@@ -991,11 +988,12 @@ pub const Table = struct {
     pub fn updateStreaming(
         self: *Table,
         pred: ?exec.PredicateExpr,
+        derived: []const exec.Derived,
         assignments: []const @import("update.zig").Assignment,
     ) !usize {
         const statement_lease = try self.acquireStatement();
         defer if (statement_lease) |lease| lease.release();
-        return try @import("update.zig").execUpdateStreaming(self, pred, assignments);
+        return try @import("update.zig").execUpdateStreaming(self, pred, derived, assignments);
     }
 
     /// Remove every row while preserving schema and table identity. This is a
@@ -1100,11 +1098,11 @@ pub const Table = struct {
     }
 
     /// Attach persisted key-Bloom sidecars (#140) to the in-memory manifest
-    /// entries. Called once at open; flush/compaction attach the blooms of
-    /// segments they create directly. Best-effort: a missing or torn sidecar
+    /// entries. Called at open and after ALTER reloads the manifest;
+    /// flush/compaction attach the blooms of segments they create directly. Best-effort: a missing or torn sidecar
     /// (crash between segment write and sidecar write) just means no probe
     /// pruning for that segment.
-    fn loadKeyBloomSidecars(self: *Table) void {
+    pub fn loadKeyBloomSidecars(self: *Table) void {
         if (!self.schema.unique) return;
         for (self.manifest.segments.items) |*entry| {
             var buf: [32]u8 = undefined;

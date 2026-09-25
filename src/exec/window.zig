@@ -2021,7 +2021,7 @@ pub const Window = struct {
                     }
                     if (saw_any) {
                         switch (out.data) {
-                            .bigint => try writeBigint(out, perm[i], @intCast(sum)),
+                            .bigint => try writeBigint(out, perm[i], @truncate(sum)),
                             .largeint => try writeLargeint(out, perm[i], sum),
                             else => return Error.WindowUnsupported,
                         }
@@ -2195,10 +2195,10 @@ pub const Window = struct {
                 if (!saw_value) {
                     setNull(out, out_idx);
                 } else {
-                    // SUM widens to bigint by default in this v1; for
-                    // largeint inputs we widen to largeint.
+                    // An exact i128 sum truncated to BIGINT is the wrapped
+                    // BIGINT sum (DESIGN.md §3.4).
                     switch (out.data) {
-                        .bigint => try writeBigint(out, out_idx, @intCast(sum)),
+                        .bigint => try writeBigint(out, out_idx, @truncate(sum)),
                         .largeint => try writeLargeint(out, out_idx, sum),
                         else => return Error.WindowUnsupported,
                     }
@@ -2999,7 +2999,7 @@ const FrameCursor = struct {
 fn range_order(view: ColumnView, t: Type, candidate: usize, current: usize, delta: i128) !std.math.Order {
     return switch (view.data) {
         inline .tinyint, .smallint, .int, .bigint, .largeint => |values| std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + delta),
-        inline .float, .double => |values| std.math.order(@as(f64, values[candidate]), @as(f64, values[current]) + @as(f64, @floatFromInt(delta))),
+        inline .float, .double => |values| types.floatOrder(@as(f64, values[candidate]), @as(f64, values[current]) + @as(f64, @floatFromInt(delta))),
         inline .decimal64, .decimal128 => |values| blk: {
             var scale: i256 = 1;
             for (0..t.decimalSpec().?.s) |_| scale *= 10;

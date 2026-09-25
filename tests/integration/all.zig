@@ -32,6 +32,7 @@ test {
     _ = @import("sql_ddl_test.zig");
     _ = @import("multi_statement_test.zig");
     _ = @import("catalog_test.zig");
+    _ = @import("sweep_gate_test.zig");
     _ = @import("temp_tables_test.zig");
     _ = @import("window_test.zig");
     _ = @import("window_matrix_test.zig");
@@ -93,4 +94,5 @@ test "integration entry exists" {
 
 test {
     _ = @import("encoded_pipeline_test.zig");
+    _ = @import("float_key_equality_test.zig");
 }

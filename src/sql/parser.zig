@@ -710,21 +710,12 @@ pub const Parser = struct {
         var where_derived_count: u32 = 0;
         if (self.cur.tag == .kw_where) {
             try self.advance();
-            const derived_mark = self.predicate_derived.items.len;
-            const old_enabled = self.predicate_derived_enabled;
-            const old_scope = self.predicate_derived_scope;
-            self.predicate_derived_enabled = true;
-            self.predicate_derived_scope = derived_mark;
-            defer self.predicate_derived_enabled = old_enabled;
-            defer self.predicate_derived_scope = old_scope;
-            const pred = try self.parseBoolExpr();
-            if (self.predicate_derived.items.len > derived_mark) {
-                const derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[derived_mark..]);
-                self.predicate_derived.shrinkRetainingCapacity(derived_mark);
-                root = try self.allocOp(.{ .compute = .{ .derived = derived, .upstream = root } });
-                where_derived_count = @intCast(derived.len);
+            const where = try self.parseWhereBody();
+            if (where.derived.len > 0) {
+                root = try self.allocOp(.{ .compute = .{ .derived = where.derived, .upstream = root } });
+                where_derived_count = @intCast(where.derived.len);
             }
-            root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
+            root = try self.allocOp(.{ .filter = .{ .predicate = where.predicate, .upstream = root } });
         }
 
         // Optional GROUP BY. Each item is a general expression so we
@@ -3863,11 +3854,14 @@ pub const Parser = struct {
         try self.expect(.kw_from);
         const tref = try self.parseTableRef();
         var pred: ?PredicateExpr = null;
+        var derived: []const ir.Derived = &.{};
         if (self.cur.tag == .kw_where) {
             try self.advance();
-            pred = try self.parseBoolExpr();
+            const where = try self.parseWhereBody();
+            pred = where.predicate;
+            derived = where.derived;
         }
-        return try self.allocOp(.{ .delete_op = .{ .table = tref, .predicate = pred } });
+        return try self.allocOp(.{ .delete_op = .{ .table = tref, .predicate = pred, .derived = derived } });
     }
 
     /// Parse `UPDATE <table> SET col = expr [, ...] [WHERE <bool_expr>]`.
@@ -3896,15 +3890,42 @@ pub const Parser = struct {
         const assigns_owned = try assigns.toOwnedSlice(self.arena);
 
         var pred: ?PredicateExpr = null;
+        var derived: []const ir.Derived = &.{};
         if (self.cur.tag == .kw_where) {
             try self.advance();
-            pred = try self.parseBoolExpr();
+            const where = try self.parseWhereBody();
+            pred = where.predicate;
+            derived = where.derived;
         }
         return try self.allocOp(.{ .update_op = .{
             .table = tref,
             .assignments = assigns_owned,
             .predicate = pred,
+            .derived = derived,
         } });
+    }
+
+    const WhereBody = struct {
+        predicate: PredicateExpr,
+        /// Computed comparison operands, in the order the predicate names them.
+        derived: []const ir.Derived,
+    };
+
+    /// Parse a WHERE condition in its own anchoring scope: a computed
+    /// comparison operand (`n % 3 = 0`) becomes a derived column the
+    /// predicate compares by name, for the caller to evaluate ahead of it.
+    fn parseWhereBody(self: *Parser) ParseError!WhereBody {
+        const derived_mark = self.predicate_derived.items.len;
+        const old_enabled = self.predicate_derived_enabled;
+        const old_scope = self.predicate_derived_scope;
+        self.predicate_derived_enabled = true;
+        self.predicate_derived_scope = derived_mark;
+        defer self.predicate_derived_enabled = old_enabled;
+        defer self.predicate_derived_scope = old_scope;
+        const pred = try self.parseBoolExpr();
+        const derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[derived_mark..]);
+        self.predicate_derived.shrinkRetainingCapacity(derived_mark);
+        return .{ .predicate = pred, .derived = derived };
     }
 
     /// Parse `SET @name = expr`. The RHS is a general Expr so users

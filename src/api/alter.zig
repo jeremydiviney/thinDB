@@ -246,6 +246,7 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     for (t.manifest.segments.items) |entry| {
         const info = try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync);
         defer info.deinit(t.allocator);
+        try carrySidecars(t, shadow_segs, entry.segment_id, sync);
         try new_manifest.appendSegment(
             try storage.manifest.entryFromSegmentInfo(t.allocator, info, new_lk_idx, new_schema.columns),
         );
@@ -355,6 +356,27 @@ fn rewriteSegment(
     );
 }
 
+/// A segment's deletes (`.tomb`) and key filter (`.bloom`) live in
+/// sidecars beside it, not in its rows. The rewrite keeps segment ids, row
+/// order and key values, so both carry over byte for byte. Without the
+/// tombstones every deleted or replaced row comes back.
+fn carrySidecars(t: *Table, shadow_segs: Io.Dir, seg_id: u64, sync: bool) !void {
+    var tomb_buf: [32]u8 = undefined;
+    var bloom_buf: [32]u8 = undefined;
+    const names = [_][]const u8{
+        try storage.tombstone.fileNameFor(&tomb_buf, seg_id),
+        try Table.segmentBloomFileName(&bloom_buf, seg_id),
+    };
+    for (names) |name| {
+        const bytes = t.segments_dir.readFileAlloc(t.io, name, t.allocator, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer t.allocator.free(bytes);
+        try storage.writeFileSynced(t.io, shadow_segs, name, bytes, sync);
+    }
+}
+
 /// Append `n` copies of `val` to `out`. For a nullable column, also marks
 /// all `n` rows as valid (the default IS a real value, not NULL).
 fn fillDefault(
@@ -429,6 +451,7 @@ fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64, recreate_wal: bool) !v
     const new_manifest = try storage.readManifest(allocator, io, t.table_dir, new_fp);
     t.manifest.deinit();
     t.manifest = new_manifest;
+    t.loadKeyBloomSidecars();
 
     // The rewritten table restarts segment IDs and reshapes columns, so the
     // old generation's cached blocks must become unreachable: purge and move

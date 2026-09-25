@@ -92,6 +92,33 @@ test "scalar_fn: exact match short-circuits before cost calc" {
     try std.testing.expectEqual(@as(TypeTag, .bigint), @as(TypeTag, r.func.return_type));
 }
 
+test "scalar_fn: a wider integer argument narrows only when nothing widens" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const ColumnView = @import("../storage/storage.zig").ColumnView;
+    const ColumnStore = @import("../engine/store.zig").ColumnStore;
+
+    // `date_add(d, n + 1)` passes a BIGINT to an INT parameter, as StarRocks allows.
+    const r = (try resolve(aa, "date_add", &.{ .date, .bigint })) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .int), @as(TypeTag, r.func.arg_types[1]));
+    const narrow = (r.arg_casts orelse return error.ExpectedCastPlan)[1] orelse return error.ExpectedCastPlan;
+
+    const src = [_]i64{ 7, std.math.maxInt(i64), std.math.minInt(i64) };
+    const args = [_]ColumnView{.{ .data = .{ .bigint = &src } }};
+    var out = try ColumnStore.init(allocator, .int, false);
+    defer out.deinit(allocator);
+    try narrow(allocator, &args, &out, src.len);
+    try std.testing.expectEqualSlices(i32, &.{ 7, std.math.maxInt(i32), std.math.minInt(i32) }, out.view().data.int);
+
+    // A widening overload still wins: bigint → double, not bigint → int.
+    const s = (try resolve(aa, "sqrt", &.{.bigint})) orelse return error.NotFound;
+    try std.testing.expectEqual(@as(TypeTag, .double), @as(TypeTag, s.func.arg_types[0]));
+    // Narrowing is integer-only.
+    try std.testing.expect((try resolve(aa, "date_add", &.{ .date, .double })) == null);
+}
+
 // ---------------------------------------------------------------------------
 // Expanded scalar function registry (lpad/rpad/repeat/space/ascii/position/
 // instr/substring_index/strcmp + truncate/degrees/radians/atan2 + date funcs
@@ -218,21 +245,83 @@ test "scalar_fn: nameResolvable covers builtins and decimal-only names" {
     try std.testing.expect(!scalar_fn.nameResolvable(null, "definitely_not_a_function"));
 }
 
-test "scalar_fn: integer arithmetic raises on an overflowing row, never under a NULL" {
+test "scalar_fn: integer arithmetic result types match StarRocks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Unary minus parses as sub(0, x) and the 0 literal types as TINYINT, so
+    // the ("sub", .tinyint, x) rows are -x.
+    const cases = .{
+        .{ .name = "add", .a = .tinyint, .b = .tinyint, .expected = TypeTag.smallint },
+        .{ .name = "add", .a = .smallint, .b = .smallint, .expected = TypeTag.int },
+        .{ .name = "mul", .a = .int, .b = .int, .expected = TypeTag.bigint },
+        .{ .name = "add", .a = .int, .b = .bigint, .expected = TypeTag.bigint },
+        .{ .name = "sub", .a = .bigint, .b = .bigint, .expected = TypeTag.bigint },
+        .{ .name = "mul", .a = .boolean, .b = .smallint, .expected = TypeTag.int },
+        .{ .name = "sub", .a = .tinyint, .b = .int, .expected = TypeTag.bigint },
+        .{ .name = "sub", .a = .tinyint, .b = .smallint, .expected = TypeTag.int },
+        .{ .name = "sub", .a = .tinyint, .b = .bigint, .expected = TypeTag.bigint },
+        .{ .name = "intdiv", .a = .int, .b = .int, .expected = TypeTag.int },
+        .{ .name = "intdiv", .a = .smallint, .b = .bigint, .expected = TypeTag.bigint },
+        .{ .name = "mod", .a = .smallint, .b = .int, .expected = TypeTag.int },
+        .{ .name = "mod", .a = .tinyint, .b = .tinyint, .expected = TypeTag.tinyint },
+    };
+    inline for (cases) |c| {
+        const r = (try resolve(aa, c.name, &.{ c.a, c.b })) orelse return error.NotFound;
+        try std.testing.expectEqual(c.expected, @as(TypeTag, r.func.return_type));
+    }
+
+    const abs_cases = .{
+        .{ .arg = .tinyint, .expected = TypeTag.smallint },
+        .{ .arg = .smallint, .expected = TypeTag.int },
+        .{ .arg = .int, .expected = TypeTag.bigint },
+        .{ .arg = .bigint, .expected = TypeTag.bigint },
+    };
+    inline for (abs_cases) |c| {
+        const r = (try resolve(aa, "abs", &.{c.arg})) orelse return error.NotFound;
+        try std.testing.expectEqual(c.expected, @as(TypeTag, r.func.return_type));
+    }
+}
+
+test "scalar_fn: integer kernels wrap, and DIV/MOD by zero is NULL" {
     const allocator = std.testing.allocator;
     const math = @import("scalar_fn_math.zig");
     const ColumnView = @import("../storage/storage.zig").ColumnView;
-    var out = try @import("../engine/store.zig").ColumnStore.init(allocator, .int, true);
-    defer out.deinit(allocator);
+    const ColumnStore = @import("../engine/store.zig").ColumnStore;
+    const min = std.math.minInt(i64);
+    const max = std.math.maxInt(i64);
 
-    const lhs = [_]i32{ 1, std.math.maxInt(i32), 3 };
-    const rhs = [_]i32{ 1, 1, 1 };
-    const row_1_null = [_]u8{0b101};
-    const masked = [_]ColumnView{ .{ .data = .{ .int = &lhs }, .nulls = &row_1_null }, .{ .data = .{ .int = &rhs } } };
-    try math.addIntKernel(allocator, &masked, &out, lhs.len);
-    try std.testing.expectEqualSlices(i32, &.{ 2, 0, 4 }, out.data.int.items);
+    const lhs = [_]i64{ max, min, max, min, 7, -7, 7 };
+    const rhs = [_]i64{ 1, 1, 2, -1, -1, 2, 0 };
+    const args = [_]ColumnView{ .{ .data = .{ .bigint = &lhs } }, .{ .data = .{ .bigint = &rhs } } };
 
-    out.clear();
-    const real = [_]ColumnView{ .{ .data = .{ .int = &lhs } }, .{ .data = .{ .int = &rhs } } };
-    try std.testing.expectError(error.ArithmeticOverflow, math.addIntKernel(allocator, &real, &out, lhs.len));
+    const cases = .{
+        // + - * propagate operand nulls outside the kernel, so their output
+        // carries no validity of its own; DIV/MOD write validity per row.
+        .{ .nullable = false, .kernel = math.wrappingArithKernel(i64, .add), .expected = [_]?i64{ min, min + 1, min + 1, max, 6, -5, 7 } },
+        .{ .nullable = false, .kernel = math.wrappingArithKernel(i64, .sub), .expected = [_]?i64{ max - 1, max, max - 2, min + 1, 8, -9, 7 } },
+        .{ .nullable = false, .kernel = math.wrappingArithKernel(i64, .mul), .expected = [_]?i64{ max, min, -2, min, -7, -14, 0 } },
+        .{ .nullable = true, .kernel = math.intDivModKernel(i64, .div), .expected = [_]?i64{ max, min, @divTrunc(max, 2), min, -7, -3, null } },
+        .{ .nullable = true, .kernel = math.intDivModKernel(i64, .mod), .expected = [_]?i64{ 0, 0, 1, 0, 0, -1, null } },
+    };
+    inline for (cases) |c| {
+        var out = try ColumnStore.init(allocator, .bigint, c.nullable);
+        defer out.deinit(allocator);
+        try c.kernel(allocator, &args, &out, lhs.len);
+        const view = out.view();
+        for (c.expected, 0..) |want, row| {
+            try std.testing.expectEqual(want != null, view.isValid(row));
+            if (want) |v| try std.testing.expectEqual(v, view.data.bigint[row]);
+        }
+    }
+
+    const int_lhs = [_]i32{ std.math.minInt(i32), 5 };
+    const int_rhs = [_]i32{ -1, 0 };
+    const int_args = [_]ColumnView{ .{ .data = .{ .int = &int_lhs } }, .{ .data = .{ .int = &int_rhs } } };
+    var int_out = try ColumnStore.init(allocator, .int, true);
+    defer int_out.deinit(allocator);
+    try math.intDivModKernel(i32, .div)(allocator, &int_args, &int_out, int_lhs.len);
+    try std.testing.expectEqual(std.math.minInt(i32), int_out.view().data.int[0]);
+    try std.testing.expect(!int_out.view().isValid(1));
 }

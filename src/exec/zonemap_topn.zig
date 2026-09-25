@@ -452,7 +452,10 @@ pub const ZonemapTopN = struct {
                         s.sum
                     else
                         s.min;
-                    try corners.append(self.allocator, corner);
+                    try corners.append(self.allocator, switch (self.table.schema.columns[self.key_phys[k]].type) {
+                        .float, .double => storage.format.canonicalFloatOrder(corner),
+                        else => corner,
+                    });
                 }
                 try list.append(self.allocator, .{
                     .seg_idx = seg_idx,
