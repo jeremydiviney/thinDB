@@ -22,6 +22,9 @@ pub const NullStrategy = enum {
     propagates,
     absorbs,
     kernel_managed,
+    /// `propagates`, and a zero in the last argument (the divisor) also
+    /// yields NULL: division by zero, as MySQL and StarRocks answer it.
+    zero_divisor,
 };
 
 pub const Volatility = enum {

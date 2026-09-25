@@ -11,6 +11,7 @@
 //!     the order given. Downstream operators see both.
 //!   - Null handling: per `NullStrategy` of the resolved function.
 //!     `.propagates` → if ANY arg is null at row i, output is null.
+//!     `.zero_divisor` → `.propagates`, and also null where the divisor is 0.
 //!     `.absorbs` → kernel handles nulls itself.
 //!
 //! Future (post-v1): nested calls (`upper(lower(x))`), literal args,
@@ -934,6 +935,7 @@ pub const Compute = struct {
             switch (plan.func.null_strategy) {
                 .propagates => try writePropagatedNulls(self.allocator, plan.output, arg_views, n),
                 .absorbs => try writeAbsorbedNulls(self.allocator, plan.output, arg_views, n),
+                .zero_divisor => try writeZeroDivisorNulls(self.allocator, plan.output, arg_views, n),
                 .kernel_managed => {}, // kernel already wrote the bitmap
             }
         }
@@ -1962,7 +1964,7 @@ fn buildCallPlan(
     errdefer output_buf.deinit(runtime_allocator);
 
     var func = rr.func;
-    if (nonzeroLiteralDivisor(func, arg_plans)) func.null_strategy = .propagates;
+    if (try literalDivisorNonzero(aa, runtime_allocator, rr, arg_plans)) func.null_strategy = .propagates;
     const plan = try aa.create(CallPlan);
     plan.* = .{
         .func = func,
@@ -1977,19 +1979,27 @@ fn buildCallPlan(
     return plan;
 }
 
-/// Integer DIV/MOD owns its validity bitmap only to emit NULL for a zero
-/// divisor. A nonzero literal divisor never does, so the result is exactly as
-/// nullable as its operands (`x % 10` over a NOT NULL column stays NOT NULL);
-/// the kernel's bits then match what `.propagates` rewrites.
-fn nonzeroLiteralDivisor(func: scalar_fn.ScalarFn, args: []const ArgPlan) bool {
-    if (func.null_strategy != .kernel_managed or args.len != 2) return false;
-    const op = scalar_fn.intArithOp(func.name) orelse return false;
-    if (op != .intdiv and op != .mod) return false;
-    const divisor = switch (args[1]) {
-        .lit => |slot| intFamilyValueI128(slot.value) orelse return false,
+/// A `.zero_divisor` call whose divisor is a literal that is still nonzero as
+/// the kernel sees it (after its implicit cast) never divides by zero, so the
+/// result is exactly as nullable as its operands: `x / 100` or `x % 10` over a
+/// NOT NULL column stays NOT NULL.
+fn literalDivisorNonzero(aa: Allocator, runtime_allocator: Allocator, rr: scalar_fn.ResolvedOverload, args: []const ArgPlan) !bool {
+    if (rr.func.null_strategy != .zero_divisor or args.len == 0) return false;
+    const last = args.len - 1;
+    const slot = switch (args[last]) {
+        .lit => |s| s,
         else => return false,
     };
-    return divisor != 0;
+    slot.buf.clear();
+    try fillLiteralColumn(runtime_allocator, &slot.buf, slot.value, 1);
+    var divisor = slot.buf.view();
+    if (rr.arg_casts) |casts| if (casts[last]) |k| {
+        var converted = try ColumnStore.init(aa, rr.func.arg_types[last], false);
+        const one = [_]ColumnView{divisor};
+        k(aa, &one, &converted, 1) catch return false;
+        divisor = converted.view();
+    };
+    return !zeroDivisorAt(divisor, 0);
 }
 
 /// MySQL/StarRocks coerce string LITERALS to temporal types in temporal
@@ -2221,7 +2231,7 @@ fn derivedNullable(r: ResolvedDerived, up_schema: []const Column) bool {
 /// nullable. Mirrors the eval-time null bookkeeping decision.
 fn callPlanNullable(plan: *CallPlan, up_schema: []const Column) bool {
     switch (plan.func.null_strategy) {
-        .absorbs, .kernel_managed => return true,
+        .absorbs, .kernel_managed, .zero_divisor => return true,
         .propagates => {},
     }
     for (plan.args) |arg| switch (arg) {
@@ -2257,6 +2267,32 @@ fn writePropagatedNulls(
         }
         try out.appendValidBit(allocator, base + i, valid);
     }
+}
+
+/// `.zero_divisor`: row i is valid iff every argument is valid and the divisor
+/// (the last argument) is nonzero.
+fn writeZeroDivisorNulls(
+    allocator: Allocator,
+    out: *ColumnStore,
+    arg_views: []const ColumnView,
+    n: usize,
+) !void {
+    const base = out.data.rowCount() - n;
+    const divisor = arg_views[arg_views.len - 1];
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var valid = !zeroDivisorAt(divisor, i);
+        for (arg_views) |v| valid = valid and v.isValid(i);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// Only numeric columns divide; a divisor of any other type is never zero.
+fn zeroDivisorAt(divisor: ColumnView, row: usize) bool {
+    return switch (divisor.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => |s| s[row] == 0,
+        else => false,
+    };
 }
 
 fn writeAbsorbedNulls(

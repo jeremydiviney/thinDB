@@ -284,7 +284,7 @@ test "scalar_fn: integer arithmetic result types match StarRocks" {
     }
 }
 
-test "scalar_fn: integer kernels wrap, and DIV/MOD by zero is NULL" {
+test "scalar_fn: integer kernels wrap, and DIV/MOD by zero or -1 never trap" {
     const allocator = std.testing.allocator;
     const math = @import("scalar_fn_math.zig");
     const ColumnView = @import("../storage/storage.zig").ColumnView;
@@ -297,31 +297,27 @@ test "scalar_fn: integer kernels wrap, and DIV/MOD by zero is NULL" {
     const args = [_]ColumnView{ .{ .data = .{ .bigint = &lhs } }, .{ .data = .{ .bigint = &rhs } } };
 
     const cases = .{
-        // + - * propagate operand nulls outside the kernel, so their output
-        // carries no validity of its own; DIV/MOD write validity per row.
-        .{ .nullable = false, .kernel = math.wrappingArithKernel(i64, .add), .expected = [_]?i64{ min, min + 1, min + 1, max, 6, -5, 7 } },
-        .{ .nullable = false, .kernel = math.wrappingArithKernel(i64, .sub), .expected = [_]?i64{ max - 1, max, max - 2, min + 1, 8, -9, 7 } },
-        .{ .nullable = false, .kernel = math.wrappingArithKernel(i64, .mul), .expected = [_]?i64{ max, min, -2, min, -7, -14, 0 } },
-        .{ .nullable = true, .kernel = math.intDivModKernel(i64, .div), .expected = [_]?i64{ max, min, @divTrunc(max, 2), min, -7, -3, null } },
-        .{ .nullable = true, .kernel = math.intDivModKernel(i64, .mod), .expected = [_]?i64{ 0, 0, 1, 0, 0, -1, null } },
+        // Compute writes every operator's validity; a zero divisor's slot
+        // holds 0 and `.zero_divisor` marks it NULL.
+        .{ .kernel = math.wrappingArithKernel(i64, .add), .expected = [_]i64{ min, min + 1, min + 1, max, 6, -5, 7 } },
+        .{ .kernel = math.wrappingArithKernel(i64, .sub), .expected = [_]i64{ max - 1, max, max - 2, min + 1, 8, -9, 7 } },
+        .{ .kernel = math.wrappingArithKernel(i64, .mul), .expected = [_]i64{ max, min, -2, min, -7, -14, 0 } },
+        .{ .kernel = math.intDivModKernel(i64, .div), .expected = [_]i64{ max, min, @divTrunc(max, 2), min, -7, -3, 0 } },
+        .{ .kernel = math.intDivModKernel(i64, .mod), .expected = [_]i64{ 0, 0, 1, 0, 0, -1, 0 } },
     };
     inline for (cases) |c| {
-        var out = try ColumnStore.init(allocator, .bigint, c.nullable);
+        var out = try ColumnStore.init(allocator, .bigint, false);
         defer out.deinit(allocator);
         try c.kernel(allocator, &args, &out, lhs.len);
-        const view = out.view();
-        for (c.expected, 0..) |want, row| {
-            try std.testing.expectEqual(want != null, view.isValid(row));
-            if (want) |v| try std.testing.expectEqual(v, view.data.bigint[row]);
-        }
+        const want = c.expected;
+        try std.testing.expectEqualSlices(i64, &want, out.view().data.bigint);
     }
 
     const int_lhs = [_]i32{ std.math.minInt(i32), 5 };
     const int_rhs = [_]i32{ -1, 0 };
     const int_args = [_]ColumnView{ .{ .data = .{ .int = &int_lhs } }, .{ .data = .{ .int = &int_rhs } } };
-    var int_out = try ColumnStore.init(allocator, .int, true);
+    var int_out = try ColumnStore.init(allocator, .int, false);
     defer int_out.deinit(allocator);
     try math.intDivModKernel(i32, .div)(allocator, &int_args, &int_out, int_lhs.len);
-    try std.testing.expectEqual(std.math.minInt(i32), int_out.view().data.int[0]);
-    try std.testing.expect(!int_out.view().isValid(1));
+    try std.testing.expectEqualSlices(i32, &.{ std.math.minInt(i32), 0 }, int_out.view().data.int);
 }

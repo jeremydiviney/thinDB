@@ -17,6 +17,9 @@
 //!     bookkeeping — kernels can assume non-null inputs. `coalesce` /
 //!     `ifnull` are flagged with `null_strategy = .absorbs`; `nullif`
 //!     uses `.kernel_managed` (kernel writes the bitmap itself).
+//!     Division (`/`, `DIV`, `%`, `PMOD`) uses `.zero_divisor`: Compute
+//!     also nulls each row whose divisor is 0, so those kernels need only
+//!     not trap on it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -281,7 +284,11 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
         if (arithOp(name)) |op| {
             if (!allNumericLike(arg_types)) return null;
             const rt = dec.arithResultType(op, arg_types[0], arg_types[1]);
-            return try buildDecFn(aa, name, arg_types, rt, arithKernelFor(op), .propagates);
+            const nulls: NullStrategy = switch (op) {
+                .add, .sub, .mul => .propagates,
+                .div, .mod => .zero_divisor,
+            };
+            return try buildDecFn(aa, name, arg_types, rt, arithKernelFor(op), nulls);
         }
     }
 
@@ -452,7 +459,7 @@ fn resolveIntArith(aa: Allocator, name: []const u8, arg_types: []const Type) !?R
             .return_type = width,
             .null_strategy = switch (op) {
                 .add, .sub, .mul => .propagates,
-                .intdiv, .mod => .kernel_managed,
+                .intdiv, .mod => .zero_divisor,
             },
             .kernel = intArithKernel(op, width),
         },
@@ -668,8 +675,8 @@ pub const builtins = [_]ScalarFn{
     // Integer MOD resolves in `resolveIntArith`. A floating operand on either
     // side: MySQL MOD keeps the dividend's sign (fmod), same as `%`.
     .{ .name = "mod", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.modDoubleKernel },
-    .{ .name = "pmod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.pmodIntKernel },
-    .{ .name = "pmod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.pmodBigintKernel },
+    .{ .name = "pmod", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .zero_divisor, .kernel = math.pmodIntKernel },
+    .{ .name = "pmod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .zero_divisor, .kernel = math.pmodBigintKernel },
     .{ .name = "fmod", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.fmodKernel },
     // Binary arithmetic — backs the SQL infix operators (+ - * /) in the
     // parser. Integer operands resolve in `resolveIntArith`; these overloads
@@ -680,8 +687,8 @@ pub const builtins = [_]ScalarFn{
     // `/` is true division per MySQL/StarRocks: integer operands widen to
     // double via the implicit-cast lattice (7 / 2 = 3.5). Explicit integer
     // division is the `DIV` operator, which lowers to `intdiv` and resolves
-    // in `resolveIntArith`.
-    .{ .name = "div", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.divDoubleKernel },
+    // in `resolveIntArith`. A zero divisor gives NULL, as for DIV and %.
+    .{ .name = "div", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .zero_divisor, .kernel = math.divDoubleKernel },
     .{ .name = "pow", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.powKernel },
     .{ .name = "sqrt", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.sqrtKernel },
     .{ .name = "exp", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.expKernel },
