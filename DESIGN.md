@@ -68,11 +68,15 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | | `DOUBLE` | f64 |
 | Decimal | `DECIMAL(p, s)` | i64 (`p ≤ 18`) or i128 (`p ≤ 38`). `p` is total digits, `s` is digits after the decimal point. |
 | String | `CHAR(N)` | Fixed-width bytes |
-| | `VARCHAR(N)` | Variable-width bytes, bounded |
+| | `VARCHAR(N)` | Variable-width bytes. `N` is recorded but not enforced: a longer value is stored whole, as in DuckDB |
 | | `STRING` | Variable-width bytes, unbounded (effective limit: 64 MB / value) |
 | Temporal | `DATE` | i32 days since 1970-01-01 UTC |
 | | `DATETIME` | i64 microseconds since 1970-01-01 UTC. No timezone awareness — applications convert at boundaries. |
 | Boolean | `BOOLEAN` | u8 (0/1) |
+
+Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
+after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
+follow this, so `-0.0` and `0.0` form one group. MIN and MAX skip NaN.
 
 Explicitly **out of scope for v1**: `JSON`, `ARRAY`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 

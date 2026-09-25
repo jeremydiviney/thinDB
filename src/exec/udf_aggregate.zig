@@ -423,12 +423,12 @@ fn serializeGroupKey(
             .string => |sv| try appendKeyString(allocator, out, sv.rowBytes(row)),
             .float => |s| {
                 var b: [4]u8 = undefined;
-                storage.format.writeF32(&b, s[row]);
+                storage.format.writeF32(&b, types.canonicalFloat(s[row]));
                 try out.appendSlice(allocator, &b);
             },
             .double => |s| {
                 var b: [8]u8 = undefined;
-                storage.format.writeF64(&b, s[row]);
+                storage.format.writeF64(&b, types.canonicalFloat(s[row]));
                 try out.appendSlice(allocator, &b);
             },
             .date => |s| try storage.format.appendI32(allocator, out, s[row]),

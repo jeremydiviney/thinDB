@@ -625,7 +625,7 @@ pub fn decCompare(va: ColumnView, ta: Type, vb: ColumnView, tb: Type, row: usize
 /// Overflow fallback for `decCompare`: compare as f64 (only reached for
 /// pathologically large aligned mantissas, which decimals can't hold anyway).
 fn compareWide(va: ColumnView, ta: Type, vb: ColumnView, tb: Type, row: usize) std.math.Order {
-    return std.math.order(f64At(va, ta, row), f64At(vb, tb, row));
+    return types.floatOrder(f64At(va, ta, row), f64At(vb, tb, row));
 }
 
 // ---------------------------------------------------------------------------

@@ -2050,13 +2050,17 @@ pub fn statsOverlapPredicateBlankAware(s: storage.format.Stats, op: PredicateOp,
             break :blk storage.format.encodeFloatOrder(x);
         },
     };
+    const min, const max = switch (v) {
+        .float, .double => .{ storage.format.canonicalFloatOrder(s.min), storage.format.canonicalFloatOrder(s.max) },
+        else => .{ s.min, s.max },
+    };
     return switch (op) {
-        .eq => wanted >= s.min and wanted <= s.max,
-        .neq => !(s.min == s.max and s.min == wanted),
-        .lt => s.min < wanted,
-        .lte => s.min <= wanted,
-        .gt => s.max > wanted,
-        .gte => s.max >= wanted,
+        .eq => wanted >= min and wanted <= max,
+        .neq => !(min == max and min == wanted),
+        .lt => min < wanted,
+        .lte => min <= wanted,
+        .gt => max > wanted,
+        .gte => max >= wanted,
     };
 }
 

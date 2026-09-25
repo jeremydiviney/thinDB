@@ -346,8 +346,8 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .int => |v| std.math.order(v[row], val.int),
         .bigint => |v| std.math.order(v[row], val.bigint),
         .boolean => |v| std.math.order(v[row], @intFromBool(val.boolean)),
-        .float => |v| std.math.order(v[row], val.float),
-        .double => |v| std.math.order(v[row], val.double),
+        .float => |v| types.floatOrder(v[row], val.float),
+        .double => |v| types.floatOrder(v[row], val.double),
         .date => |v| std.math.order(v[row], val.date),
         .datetime => |v| std.math.order(v[row], val.datetime),
         .tinyint => |v| std.math.order(v[row], val.tinyint),
@@ -2804,7 +2804,7 @@ fn aggOrderValue(s: AccState, wraps_to_bigint: bool) OrderVal {
 fn ovOrder(a: OrderVal, b: OrderVal) std.math.Order {
     return switch (a) {
         .int => |x| std.math.order(x, b.int),
-        .float => |x| std.math.order(x, b.float),
+        .float => |x| types.floatOrder(x, b.float),
     };
 }
 
@@ -3880,12 +3880,12 @@ fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row:
         },
         .float => |s| {
             var b: [4]u8 = undefined;
-            storage.format.writeF32(&b, s[row]);
+            storage.format.writeF32(&b, types.canonicalFloat(s[row]));
             try out.appendSlice(aa, &b);
         },
         .double => |s| {
             var b: [8]u8 = undefined;
-            storage.format.writeF64(&b, s[row]);
+            storage.format.writeF64(&b, types.canonicalFloat(s[row]));
             try out.appendSlice(aa, &b);
         },
         .string, .varchar, .char, .json => |sv| {
@@ -4587,12 +4587,12 @@ fn buildCompoundGroupKey(
             },
             .float => |s| {
                 var b: [4]u8 = undefined;
-                storage.format.writeF32(&b, s[row]);
+                storage.format.writeF32(&b, types.canonicalFloat(s[row]));
                 try out.appendSlice(allocator, &b);
             },
             .double => |s| {
                 var b: [8]u8 = undefined;
-                storage.format.writeF64(&b, s[row]);
+                storage.format.writeF64(&b, types.canonicalFloat(s[row]));
                 try out.appendSlice(allocator, &b);
             },
             .date => |s| try storage.format.appendI32(allocator, out, s[row]),

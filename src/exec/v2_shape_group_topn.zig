@@ -1729,7 +1729,7 @@ fn numOrder(a: Num, b: Num) std.math.Order {
             .i => |v| @floatFromInt(v),
             .f => |v| v,
         };
-        return std.math.order(af, bf);
+        return types.floatOrder(af, bf);
     }
     return std.math.order(a.i, b.i);
 }

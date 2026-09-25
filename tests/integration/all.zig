@@ -94,4 +94,5 @@ test "integration entry exists" {
 
 test {
     _ = @import("encoded_pipeline_test.zig");
+    _ = @import("float_key_equality_test.zig");
 }
