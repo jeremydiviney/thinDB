@@ -738,7 +738,7 @@ try db.renameTable("orders", "orders_v2");
 try db.dropTable("orders_v2");
 ```
 
-`ALTER TABLE` is implemented as orchestrated copy-and-swap: create shadow, stream rows through projection, atomic directory rename. Writes are paused during the copy; reads see the old version until swap, the new version after.
+`ALTER TABLE` is implemented as orchestrated copy-and-swap: create shadow, stream rows through projection, atomic directory rename. Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over.
 
 ### 9.3 Inserts
 
