@@ -23,6 +23,7 @@ pub fn mapInternal(err: anyerror, fallback_msg: ?[]const u8) Mapped {
         .column_not_found => .{ .code = 1054, .sqlstate = "42S22".*, .message = "Unknown column" },
         .ambiguous_column => .{ .code = 1052, .sqlstate = "23000".*, .message = "Column in on clause is ambiguous" },
         .query_cancelled => .{ .code = 1317, .sqlstate = "70100".*, .message = "Query execution was interrupted" },
+        .numeric_out_of_range => .{ .code = 1690, .sqlstate = "22003".*, .message = "Numeric value out of range" },
         .unknown => .{ .code = 1064, .sqlstate = "42000".*, .message = fallback_msg orelse @errorName(err) },
     };
 }
@@ -37,6 +38,12 @@ test "mapInternal reports a cancelled query as interrupted" {
     const m = mapInternal(error.QueryCancelled, null);
     try std.testing.expectEqual(@as(u16, 1317), m.code);
     try std.testing.expectEqualStrings("70100", &m.sqlstate);
+}
+
+test "mapInternal reports arithmetic overflow as out of range" {
+    const m = mapInternal(error.ArithmeticOverflow, null);
+    try std.testing.expectEqual(@as(u16, 1690), m.code);
+    try std.testing.expectEqualStrings("22003", &m.sqlstate);
 }
 
 test "mapInternal falls back to 1064" {
