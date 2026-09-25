@@ -610,6 +610,8 @@ Steps:
 
 Compaction builds output away from the table mutex. The commit phase reconciles concurrent deletes under the mutex, publishes output tombstones, and then publishes the candidate manifest. A separate compaction lock prevents overlapping compactions and excludes XA rollback from an in-flight merge.
 
+The background compactor holds a statement lease only while it resolves a table and picks its group. The merge and its commit run under the compaction lock alone, so DDL and XA COMMIT on other tables never queue behind a merge. Every path that frees or rewrites a table takes that lock first: DROP, RENAME, ALTER, TRUNCATE, XA COMMIT, and schema teardown (DROP SCHEMA, DROP DATABASE, shutdown). A background commit waits at most 60 seconds for the table's readers to drain. After that it deletes its unpublished output and leaves the inputs for a later sweep.
+
 ---
 
 ## 8. Concurrency

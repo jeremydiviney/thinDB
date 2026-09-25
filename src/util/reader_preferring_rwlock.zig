@@ -12,7 +12,9 @@
 //!
 //! The cost is that a writer can wait for as long as readers keep overlapping.
 //! DDL takes the catalog statement gate exclusively before this lock, so no new
-//! statement starts and the readers drain. A compaction commit waits for a gap.
+//! statement starts and the readers drain. A compaction commit waits for a gap,
+//! but only until a deadline (`lockBefore`): on a table whose readers never
+//! drain it gives up rather than wait forever.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,6 +24,11 @@ pub const ReaderPreferringRwLock = struct {
     changed: Io.Condition = .init,
     readers: usize = 0,
     writing: bool = false,
+    /// `lockBefore` callers parked on `released`. The condition has no timed
+    /// wait, so they sleep on this futex word instead.
+    timed_writers: usize = 0,
+    /// Bumped each time the lock becomes free while a timed writer waits.
+    released: std.atomic.Value(u32) = .init(0),
 
     pub const init: ReaderPreferringRwLock = .{};
 
@@ -36,7 +43,10 @@ pub const ReaderPreferringRwLock = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.readers -= 1;
-        if (self.readers == 0) self.changed.broadcast(io);
+        if (self.readers == 0) {
+            self.changed.broadcast(io);
+            self.wakeTimedWriters(io);
+        }
     }
 
     pub fn lockUncancelable(self: *ReaderPreferringRwLock, io: Io) void {
@@ -46,11 +56,39 @@ pub const ReaderPreferringRwLock = struct {
         self.writing = true;
     }
 
+    /// `lockUncancelable` that gives up once `deadline` passes. Returns
+    /// false, without the lock, when it timed out.
+    pub fn lockBefore(self: *ReaderPreferringRwLock, io: Io, deadline: Io.Clock.Timestamp) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.timed_writers += 1;
+        defer self.timed_writers -= 1;
+        while (self.writing or self.readers > 0) {
+            if (Io.Clock.Timestamp.now(io, deadline.clock).compare(.gte, deadline)) return false;
+            // Read under the mutex: a release after this bumps the word, so the
+            // futex wait below returns at once instead of missing it.
+            const seen = self.released.load(.acquire);
+            self.mutex.unlock(io);
+            const waited = io.futexWaitTimeout(u32, &self.released.raw, seen, .{ .deadline = deadline });
+            self.mutex.lockUncancelable(io);
+            waited catch return false;
+        }
+        self.writing = true;
+        return true;
+    }
+
     pub fn unlock(self: *ReaderPreferringRwLock, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.writing = false;
         self.changed.broadcast(io);
+        self.wakeTimedWriters(io);
+    }
+
+    fn wakeTimedWriters(self: *ReaderPreferringRwLock, io: Io) void {
+        if (self.timed_writers == 0) return;
+        _ = self.released.fetchAdd(1, .release);
+        io.futexWake(u32, &self.released.raw, std.math.maxInt(u32));
     }
 };
 
@@ -90,6 +128,49 @@ test "a shared holder takes the lock again while a writer waits" {
     try std.testing.expect(!writer.acquired.load(.acquire));
     lock.unlockShared(io);
 
+    thread.join();
+    try std.testing.expect(writer.acquired.load(.acquire));
+}
+
+fn deadlineIn(io: Io, ms: i64) Io.Clock.Timestamp {
+    return .fromNow(io, .{ .raw = .fromMilliseconds(ms), .clock = .awake });
+}
+
+test "a timed writer gives up while readers keep the lock" {
+    const io = std.testing.io;
+    var lock: ReaderPreferringRwLock = .init;
+    lock.lockSharedUncancelable(io);
+    try std.testing.expect(!lock.lockBefore(io, deadlineIn(io, 30)));
+    lock.lockSharedUncancelable(io);
+    lock.unlockShared(io);
+    lock.unlockShared(io);
+    try std.testing.expect(lock.lockBefore(io, deadlineIn(io, 30)));
+    lock.unlock(io);
+}
+
+test "a timed writer takes the lock when the last reader leaves" {
+    const io = std.testing.io;
+    var lock: ReaderPreferringRwLock = .init;
+    lock.lockSharedUncancelable(io);
+    const Writer = struct {
+        lock: *ReaderPreferringRwLock,
+        io: Io,
+        waiting: std.atomic.Value(bool) = .init(false),
+        acquired: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.waiting.store(true, .release);
+            if (self.lock.lockBefore(self.io, deadlineIn(self.io, 10_000))) {
+                self.acquired.store(true, .release);
+                self.lock.unlock(self.io);
+            }
+        }
+    };
+    var writer: Writer = .{ .lock = &lock, .io = io };
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    while (!writer.waiting.load(.acquire)) std.Thread.yield() catch {};
+    try Io.sleep(io, .fromMilliseconds(20), .awake);
+    try std.testing.expect(!writer.acquired.load(.acquire));
+    lock.unlockShared(io);
     thread.join();
     try std.testing.expect(writer.acquired.load(.acquire));
 }
