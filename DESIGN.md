@@ -124,6 +124,12 @@ Known difference: StarRocks returns LARGEINT for `ABS(BIGINT)`, so
 `ABS(BIGINT_MIN)` is `9223372036854775808` there. thinDB keeps BIGINT, which
 wraps to `BIGINT_MIN`.
 
+**Math functions** return NULL where the result would be NaN or ±inf: a
+domain error (`SQRT(-1)`, `LN(0)`, `ASIN(2)`, `LOG(1, x)`), overflow
+(`EXP(1000)`, `POW(10, 400)`), or a zero divisor in a float `%`, `MOD` or
+`FMOD`. This is StarRocks' rule; MySQL agrees on domain errors and raises an
+error on overflow. The `/` operator still follows IEEE (table above).
+
 **Aggregates**:
 
 | Input column type | `SUM` result |
