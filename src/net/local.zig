@@ -1440,7 +1440,7 @@ pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, sessio
             exec.prof.addPhase("compile.staged_total", @intCast(exec.prof.nowTicks() - t_staged_total));
             return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
         }
-        const q = engine_v2.compileSelectBlock(v2_input, root) catch |err| return ctx.executionError(err);
+        const q = cte_stages.compileSingleBlock(v2_input, root) catch |err| return ctx.executionError(err);
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
     const q = compileOp(&ctx, root) catch |err| return ctx.executionError(err);
@@ -1467,7 +1467,7 @@ pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
         if (cte_stages.needsStaging(op) or referencesPgCatalog(op, ctx.session.*)) {
             return try cte_stages.compileStaged(v2_input, op, &ctx.stage_count);
         }
-        return try engine_v2.compileSelectBlock(v2_input, op);
+        return try cte_stages.compileSingleBlock(v2_input, op);
     }
     return try compileOp(ctx, op);
 }

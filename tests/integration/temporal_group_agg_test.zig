@@ -107,7 +107,7 @@ test "grouped SUM over datetime stays a dialect error" {
     defer db.close();
 
     try std.testing.expectError(
-        error.UnsupportedQueryShape,
+        error.AggregateUnsupportedType,
         runSql(allocator, db, "SELECT pid, SUM(ts) AS s FROM ev GROUP BY pid"),
     );
 }

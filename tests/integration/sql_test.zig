@@ -2046,6 +2046,38 @@ test "sql: COUNT(DISTINCT col) grouped" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2, 1 }, dks.items);
 }
 
+test "sql: grouped COUNT(DISTINCT string) with other aggregates, HAVING, ORDER BY and LIMIT" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // GROUP BY k: 100→{a,b} qty 30, 200→{a,b} qty 70, 300→{c} qty 50.
+    var mixed = try runSql(allocator, db,
+        \\SELECT k, count(DISTINCT tag) * 10 + sum(qty) AS a FROM t GROUP BY k ORDER BY k
+    );
+    defer mixed.deinit();
+    var sums: std.ArrayList(i64) = .empty;
+    defer sums.deinit(allocator);
+    while (try mixed.next()) |b| {
+        for (b.values[1].data.bigint[0..b.row_count]) |v| try sums.append(allocator, v);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 50, 90, 60 }, sums.items);
+
+    var top = try runSql(allocator, db,
+        \\SELECT k, count(DISTINCT tag) AS dt FROM t GROUP BY k HAVING count(DISTINCT tag) > 1 ORDER BY k DESC LIMIT 1
+    );
+    defer top.deinit();
+    const b = (try top.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectEqual(@as(i32, 200), b.values[0].data.int[0]);
+    try std.testing.expectEqual(@as(i64, 2), b.values[1].data.bigint[0]);
+    try std.testing.expect((try top.next()) == null);
+}
+
 test "sql: DISTINCT in a scalar call is rejected" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -443,6 +443,41 @@ fn blockSource(op: *const ir.Op) BlockSource {
     }
 }
 
+fn blockAggregates(op: *const ir.Op) bool {
+    var cur = op;
+    while (true) {
+        cur = switch (cur.*) {
+            .group_by => return true,
+            .select => |p| p.upstream,
+            .exclude => |p| p.upstream,
+            .filter => |f| f.upstream,
+            .order_by => |o| o.upstream,
+            .compute => |c| c.upstream,
+            .alias => |a| a.upstream,
+            .limit => |l| l.upstream,
+            else => return false,
+        };
+    }
+}
+
+/// A table-backed block through the V2 handlers. An aggregating block whose
+/// aggregates none of them hosts (a grouped COUNT(DISTINCT) over a string or
+/// a double) aggregates generically over its table-backed input instead, as
+/// the same query over a derived table always has.
+fn compileTableBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
+    return engine_v2.compileSelectBlock(input, op) catch |err| switch (err) {
+        error.UnsupportedQueryShape => if (blockAggregates(op)) buildGenericBlock(input, op, map, block_root) else err,
+        else => err,
+    };
+}
+
+/// A single table-backed SELECT block with no stages beneath it.
+pub fn compileSingleBlock(input: engine_v2.CompileInput, op: *const ir.Op) anyerror!exec.Query {
+    var map: StageMap = .empty;
+    defer map.deinit(input.allocator);
+    return compileTableBlock(input, op, &map, op);
+}
+
 threadlocal var compile_block_depth: usize = 0;
 
 pub fn compileBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap) anyerror!exec.Query {
@@ -472,7 +507,7 @@ fn compile_block_with_root(input: engine_v2.CompileInput, op: *const ir.Op, map:
         else blk: {
             const t_leaf = exec.prof.nowTicks();
             defer exec.prof.addPhase("compile.select_block", @intCast(exec.prof.nowTicks() - t_leaf));
-            break :blk engine_v2.compileSelectBlock(input, op);
+            break :blk compileTableBlock(input, op, map, block_root);
         },
         // Stage-, join-, window-, union- or non-table-leaf-backed block:
         // generic operators over MatScan / Join / Window / SetUnion /
@@ -1475,9 +1510,14 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         .group_by => |g| {
             for (g.aggs) |a| if (a.func == .udf) return error.UnsupportedQueryShape;
+            // A table-backed input compiles as its own block through the V2
+            // handlers, as a window's input does.
             var up = (try tryStageParallelChain(input, g.upstream, map)) orelse
                 (try tryStageParallelScan(input, g.upstream, map, .eager)) orelse
-                try buildGenericBlock(input, g.upstream, map, block_root);
+                if (blockSource(g.upstream) == .table)
+                    try compileBlock(input, g.upstream, map)
+                else
+                    try buildGenericBlock(input, g.upstream, map, block_root);
             errdefer up.deinit();
             const t_op = exec.prof.nowTicks();
             defer exec.prof.addPhase("compile.op.group_by", @intCast(exec.prof.nowTicks() - t_op));
