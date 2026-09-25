@@ -82,3 +82,25 @@ export default {
 The insert phase uses prepared multi-row inserts. Keep `insertBatchSize * columns.length` under roughly `65,000` parameters.
 
 Supported generators: `sequence`, `int`, `float`, `string`, `text`, `enum`, `bool`, `datetime`, and `uuid`.
+
+## Concurrent DDL stress
+
+`stress_ddl.ts` is a correctness and crash harness rather than a benchmark (#90). Each client owns a database and loops through a fixed sequence:
+- CREATE, a doubling `INSERT ... SELECT`, CTAS, DELETE, UPDATE, ALTER, RENAME, TRUNCATE and DROP;
+- dropping and recreating its whole database every third cycle;
+- now and then abandoning a connection in the middle of a join.
+
+The server's background flusher and compactor run underneath all of it.
+
+Every step checks its exact row counts. It reports:
+- a refused or reset connection as a server crash;
+- a statement slower than five minutes as a stall.
+
+It exits non-zero on any of these.
+
+```powershell
+.\zig-out\bin\thindb-server.exe --data-dir .bench-data\stress --bind 127.0.0.1 --mysql-port 3307 --pg-port 0 --native-port 0 --max-dop 4
+bun run bench/mysql/stress_ddl.ts --port 3307 --clients 6 --seconds 600 --doublings 20
+```
+
+A ReleaseSafe server build turns memory corruption into a panic at the fault instead of a later heap-corruption crash.
