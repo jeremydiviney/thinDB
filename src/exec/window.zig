@@ -23,7 +23,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const buffer_pool = @import("../util/buffer_pool.zig");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
@@ -86,9 +85,9 @@ pub const Window = struct {
     /// different columns concurrently, and per-column arenas make those
     /// allocations race-free without a shared-allocator lock; (b) evict()
     /// frees the whole input in one arena sweep per column. Backed by the
-    /// (thread-safe) c_allocator normally; by the operator's own allocator
-    /// under tests so std.testing.allocator still audits the memory (the
-    /// drain is serial there).
+    /// (thread-safe) retaining pool charged to the query normally; by the
+    /// operator's own allocator under tests so std.testing.allocator still
+    /// audits the memory (the drain is serial there).
     acc_arenas: []std.heap.ArenaAllocator,
     output_columns: []ColumnStore, // window outputs (fixed-width types)
     /// Parallel scratch for string-typed outputs. `string_outputs[ci]`
@@ -367,7 +366,7 @@ pub const Window = struct {
         // deinit — the arena sweep in evict()/deinit() reclaims everything.
         const acc_arenas = try allocator.alloc(std.heap.ArenaAllocator, input_schema.len);
         errdefer allocator.free(acc_arenas);
-        const arena_backing = buffer_pool.workerAllocator(allocator);
+        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), allocator);
         for (acc_arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
         errdefer for (acc_arenas) |*a| a.deinit();
         const accumulated = try allocator.alloc(ColumnStore, input_schema.len);
@@ -587,7 +586,7 @@ pub const Window = struct {
         @memset(arena_backed, true);
         const arenas = try alloc.alloc(std.heap.ArenaAllocator, ncols);
         errdefer alloc.free(arenas);
-        const arena_backing = buffer_pool.workerAllocator(alloc);
+        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(alloc), alloc);
         for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
         errdefer for (arenas) |*a| a.deinit();
 
@@ -688,7 +687,7 @@ pub const Window = struct {
         // Fallible work first, so the move below can't half-complete:
         // 1. String outputs → fresh arena-backed contiguous stores (their
         //    scratch slices borrow into `accumulated`, still alive here).
-        const arena_backing = buffer_pool.workerAllocator(alloc);
+        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(alloc), alloc);
         var str_built: usize = 0;
         errdefer for (arenas[nin .. nin + str_built]) |*a| a.deinit();
         {

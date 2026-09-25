@@ -276,6 +276,21 @@ pub fn dumpGlobalStats() void {
     global().dumpStats();
 }
 
+/// Bytes a request on `alloc` really holds: the whole class-sized block when
+/// `alloc` is a pool and the request is pooled (a recycled block is resident
+/// in full), else `len`.
+pub fn footprint(alloc: Allocator, len: usize, alignment: std.mem.Alignment) usize {
+    if (alloc.vtable != &Pool.vtable) return len;
+    const idx = Pool.classOf(len, alignment) orelse return len;
+    return Pool.classSize(idx);
+}
+
+/// Idle bytes the process-global pool holds between queries; 0 before first use.
+pub fn globalRetainedBytes() usize {
+    if (!g_ready.load(.acquire)) return 0;
+    return g_pool.?.retained_bytes.load(.monotonic);
+}
+
 /// The allocator worker-side operators draw their large short-lived buffers
 /// from (per-worker decode buffers, partition arenas): the shared pool in
 /// production; `base` under `THINDB_NO_BUFPOOL=1` (an A/B without a
@@ -372,6 +387,16 @@ test "concurrent alloc/free across workers stays consistent and leak-free" {
     for (threads) |t| t.join();
     // drain (deferred) returns all retained blocks to testing.allocator — a leak
     // or double-free trips std.testing.allocator.
+}
+
+test "footprint is the class block for pooled requests and the length otherwise" {
+    var pool = Pool.init(std.testing.allocator, default_cap_bytes);
+    const a = pool.allocator();
+    const byte: std.mem.Alignment = .@"1";
+    try std.testing.expectEqual(@as(usize, 128 * 1024), footprint(a, 100 * 1024, byte));
+    try std.testing.expectEqual(@as(usize, 1024), footprint(a, 1024, byte));
+    try std.testing.expectEqual(@as(usize, (1 << 27) + 7), footprint(a, (1 << 27) + 7, byte));
+    try std.testing.expectEqual(@as(usize, 100 * 1024), footprint(std.testing.allocator, 100 * 1024, byte));
 }
 
 test "defaultCapFor scales with the memory size and clamps both ends" {

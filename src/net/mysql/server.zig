@@ -3670,6 +3670,7 @@ fn runSingleStatement(
     defer if (unbound) |u| qalloc.free(u.name());
     var compiled = local.compileInStatementWithOptions(qalloc, main_db, session.asSession(), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
+        .connection_id = if (session.conn_state) |state| state.backend_id else null,
         .unbound = &unbound,
     }) catch |err| {
         profiler.recordSince(.query_compile, compile_start);
@@ -4030,6 +4031,7 @@ fn handleStmtExecute(
     defer if (unbound) |u| allocator.free(u.name());
     var compiled = local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
+        .connection_id = if (session.conn_state) |state| state.backend_id else null,
         .unbound = &unbound,
     }) catch |err| {
         profiler.recordSince(.stmt_execute_compile, compile_start);
