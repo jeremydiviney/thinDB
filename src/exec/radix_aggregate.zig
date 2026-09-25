@@ -350,7 +350,7 @@ fn scatterWelford(state: []u64, stride: usize, base: usize, gids: []const u32, v
 }
 
 /// Canonical finalized value of one aggregate for group `g`. The output-type
-/// coercion (i128 SUM → bigint with overflow check, MIN narrowing, etc.) lives
+/// coercion (i128 SUM wrapped to bigint, MIN narrowing, etc.) lives
 /// in the emit phase, which mirrors `aggregate.appendAccToColumn`; this returns
 /// the raw accumulator result for correctness testing and as that phase's input.
 pub const Finalized = union(enum) {
@@ -407,10 +407,8 @@ fn appendFinalized(allocator: Allocator, f: Finalized, col: *ColumnStore, out_ty
         .sum_int => |maybe| if (maybe) |total| switch (out_type) {
             .largeint => try col.data.largeint.append(allocator, total),
             .decimal128 => try col.data.decimal128.append(allocator, total),
-            else => {
-                if (total > std.math.maxInt(i64) or total < std.math.minInt(i64)) return Error.ArithmeticOverflow;
-                try col.data.bigint.append(allocator, @intCast(total));
-            },
+            // DESIGN.md §3.4: an integer SUM wraps to BIGINT.
+            else => try col.data.bigint.append(allocator, @truncate(total)),
         } else {
             try col.data.appendNullPlaceholder(allocator);
             is_null = true;
@@ -464,12 +462,12 @@ const OrderVal = union(enum) {
     }
 };
 
-fn orderValOf(layout: CompactLayout, state: []const u64, g: usize, ai: usize) OrderVal {
+fn orderValOf(layout: CompactLayout, state: []const u64, g: usize, ai: usize, out_type: Type) OrderVal {
     // NULL results order as 0 — matches the generic operator's `aggOrderValue`
-    // heap defaults.
+    // heap defaults. A BIGINT SUM ranks by its wrapped value, as emitted.
     return switch (finalize(layout, state, g, ai)) {
         .int => |c| .{ .i = @intCast(c) },
-        .sum_int => |v| .{ .i = v orelse 0 },
+        .sum_int => |v| .{ .i = if (out_type == .bigint) @as(i64, @truncate(v orelse 0)) else v orelse 0 },
         .signed => |v| .{ .i = v orelse 0 },
         .float => |v| .{ .f = v orelse 0.0 },
     };
@@ -739,7 +737,7 @@ pub const RadixAggregate = struct {
         const ov = try aa.alloc(OrderVal, k);
         var len: usize = 0;
         for (0..gkeys.len) |g| {
-            const v = orderValOf(self.compact, gstate, g, tk.agg_idx);
+            const v = orderValOf(self.compact, gstate, g, tk.agg_idx, self.output_schema[self.group_col_indices.len + tk.agg_idx].type);
             if (len < k) {
                 sel[len] = g;
                 ov[len] = v;
@@ -1705,7 +1703,7 @@ pub const RadixLeaseAggregate = struct {
         result.ov = try aa.alloc(OrderVal, k);
         var len: usize = 0;
         for (0..ng) |g| {
-            const val = orderValOf(self.compact, result.state.items, g, tk.agg_idx);
+            const val = orderValOf(self.compact, result.state.items, g, tk.agg_idx, self.output_schema[self.group_col_indices.len + tk.agg_idx].type);
             if (len < k) {
                 result.sel[len] = g;
                 result.ov[len] = val;

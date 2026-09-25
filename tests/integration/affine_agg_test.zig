@@ -8,7 +8,7 @@
 //! the base column's declared type to prove overflow-identity), so the plan
 //! text from `ir.explain` does NOT reflect it. These tests assert RESULT
 //! correctness: the reduced path must produce byte-identical values to the
-//! direct path — including the same ArithmeticOverflow error.
+//! direct path — including the same BIGINT wrap.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -259,7 +259,7 @@ test "affine-agg: non-affine arg (w*w) is NOT reduced (stays direct, correct)" {
     try std.testing.expectEqual(@as(i64, 210), b.values[1].data.bigint[0]);
 }
 
-test "affine-agg: SUM overflow raises ArithmeticOverflow identically" {
+test "affine-agg: SUM overflow wraps identically to the direct SUM" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -268,7 +268,7 @@ test "affine-agg: SUM overflow raises ArithmeticOverflow identically" {
     defer db.close();
     try exec(allocator, db, "CREATE TABLE big (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)");
     // Three rows near i64 max so Σc overflows i64 — the reduced SUM(c) must
-    // narrow with the same i64 range check the direct SUM finalize uses.
+    // wrap exactly as the direct SUM does (3·9e18 − 2^64).
     try exec(
         allocator,
         db,
@@ -277,10 +277,14 @@ test "affine-agg: SUM overflow raises ArithmeticOverflow identically" {
     const t = try db.openTable("big", .{});
     try t.flush();
 
-    // Three plain SUM(c): base {SUM,COUNT}=2 < 3 ⇒ reduction fires. Σc overflows.
-    var q = try runSql(allocator, db, "SELECT SUM(c), SUM(c), SUM(c) FROM big");
+    // Three plain SUM(c): base {SUM,COUNT}=2 < 3 ⇒ reduction fires. Σc wraps.
+    var q = try runSql(allocator, db, "SELECT SUM(c), SUM(c + 1), SUM(c), SUM(2 * c) FROM big");
     defer q.deinit();
-    try std.testing.expectError(error.ArithmeticOverflow, q.next());
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 8553255926290448384), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 8553255926290448387), b.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 8553255926290448384), b.values[2].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, -1340232221128654848), b.values[3].data.bigint[0]);
 }
 
 test "affine-agg: single affine agg does not over-trigger (correct value)" {

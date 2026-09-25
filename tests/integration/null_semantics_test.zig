@@ -469,8 +469,8 @@ test "null group keys: NULL-keyed group aggregates its values normally" {
     const b = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 3), b.row_count);
     try std.testing.expect(!b.values[0].isValid(0));
-    // SUM(BIGINT) widens to LARGEINT (DESIGN.md §3.4).
-    try std.testing.expectEqual(@as(i128, 30), b.values[1].data.largeint[0]);
+    // SUM(BIGINT) is BIGINT (DESIGN.md §3.4).
+    try std.testing.expectEqual(@as(i64, 30), b.values[1].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 1), b.values[2].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 4), b.values[3].data.bigint[0]);
 }
@@ -606,7 +606,7 @@ test "null agg inputs: all-NULL group emits NULL for SUM/AVG/MIN/MAX, 0 for coun
     // MIN 10, MAX 30, COUNT(v) 2, COUNT(*) 3, MIN(s) = '' (valid, not NULL).
     try std.testing.expectEqualStrings("a", b.values[0].data.varchar.rowBytes(0));
     try std.testing.expect(b.values[1].isValid(0));
-    try std.testing.expectEqual(@as(i128, 40), b.values[1].data.largeint[0]);
+    try std.testing.expectEqual(@as(i64, 40), b.values[1].data.bigint[0]);
     try std.testing.expectApproxEqAbs(@as(f64, 20.0), b.values[2].data.double[0], 1e-9);
     try std.testing.expectEqual(@as(i64, 10), b.values[3].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 30), b.values[4].data.bigint[0]);

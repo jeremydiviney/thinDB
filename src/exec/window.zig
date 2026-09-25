@@ -2022,7 +2022,7 @@ pub const Window = struct {
                     }
                     if (saw_any) {
                         switch (out.data) {
-                            .bigint => try writeBigint(out, perm[i], @intCast(sum)),
+                            .bigint => try writeBigint(out, perm[i], @truncate(sum)),
                             .largeint => try writeLargeint(out, perm[i], sum),
                             else => return Error.WindowUnsupported,
                         }
@@ -2196,10 +2196,10 @@ pub const Window = struct {
                 if (!saw_value) {
                     setNull(out, out_idx);
                 } else {
-                    // SUM widens to bigint by default in this v1; for
-                    // largeint inputs we widen to largeint.
+                    // An exact i128 sum truncated to BIGINT is the wrapped
+                    // BIGINT sum (DESIGN.md §3.4).
                     switch (out.data) {
-                        .bigint => try writeBigint(out, out_idx, @intCast(sum)),
+                        .bigint => try writeBigint(out, out_idx, @truncate(sum)),
                         .largeint => try writeLargeint(out, out_idx, sum),
                         else => return Error.WindowUnsupported,
                     }

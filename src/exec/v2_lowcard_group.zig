@@ -435,7 +435,8 @@ fn openScanSource(
 
 // One worker's private aggregation state: a packed-key group table plus
 // parallel per-group accumulator arrays (stride = n_aggs). Slots are i128 —
-// overflow-proof for any integer SUM; floats bit-cast an f64 into the slot.
+// an integer SUM stays exact until its wrap to BIGINT at emit; floats bit-cast
+// an f64 into the slot.
 const WState = struct {
     table: GroupTable,
     counts: std.ArrayListUnmanaged(u64) = .empty,
@@ -1461,6 +1462,8 @@ fn compareBySpec(ctx: SortCtx, spec: SortSpec, a_gid: u32, b_gid: u32) std.math.
                 const as_ = merged.slots.items[@as(usize, a_gid) * n_aggs + i];
                 const bs = merged.slots.items[@as(usize, b_gid) * n_aggs + i];
                 if (agg.is_float) return std.math.order(slotF64(as_), slotF64(bs));
+                // A BIGINT SUM orders by its wrapped value, as emitted.
+                if (agg.output_type == .bigint) return std.math.order(@as(i64, @truncate(as_)), @as(i64, @truncate(bs)));
                 return std.math.order(as_, bs);
             },
             .avg => {
@@ -1492,7 +1495,8 @@ fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i12
         .smallint => try col.data.smallint.append(allocator, @intCast(value)),
         .int => try col.data.int.append(allocator, @intCast(value)),
         .date => try col.data.date.append(allocator, @intCast(value)),
-        .bigint => try col.data.bigint.append(allocator, @intCast(value)),
+        // DESIGN.md §3.4: an integer SUM wraps to BIGINT (keys and MIN/MAX always fit).
+        .bigint => try col.data.bigint.append(allocator, @truncate(value)),
         .datetime => try col.data.datetime.append(allocator, @intCast(value)),
         .decimal64 => try col.data.decimal64.append(allocator, @intCast(value)),
         .decimal128 => try col.data.decimal128.append(allocator, value),

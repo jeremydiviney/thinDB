@@ -5225,8 +5225,8 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
                 const idx = try b.resolveIdx(spec.col orelse return NoMatch);
                 const t = b.fb.cols.items[idx].type;
                 break :blk switch (t) {
-                    .tinyint, .smallint, .int, .date, .datetime => .{ .sum_int = idx },
-                    .bigint, .largeint => .{ .sum_large = idx },
+                    .tinyint, .smallint, .int, .bigint, .date, .datetime => .{ .sum_int = idx },
+                    .largeint => .{ .sum_large = idx },
                     .float, .double => .{ .sum_float = idx },
                     else => return NoMatch,
                 };

@@ -437,7 +437,8 @@ test "keyed region: broadcast joins honor pinned string keys" {
     , "extra");
 }
 
-test "keyed region: broadcast joins retain nullable LARGEINT aggregate payloads" {
+// SUM(amount) for month 1 wraps past BIGINT max; both paths must wrap alike.
+test "keyed region: broadcast joins retain nullable wrapped BIGINT SUM payloads" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

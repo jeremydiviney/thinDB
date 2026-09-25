@@ -122,6 +122,7 @@ pub fn resolveWithRegistry(
     // builtins table can't express a dynamic output scale). Checked first so a
     // decimal operand never falls into an int/double overload that ignores scale.
     if (try resolveDecimal(aa, name, arg_types)) |ov| return ov;
+    if (try resolveIntArith(aa, name, arg_types)) |ov| return ov;
 
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
@@ -145,36 +146,40 @@ pub fn resolveWithRegistry(
     }
 
     // Slow path: rank by cumulative cast cost. Iterate name-matching
-    // overloads, compute cost, keep the cheapest.
+    // overloads, compute cost, keep the cheapest. Integer arguments narrow
+    // to a narrower integer parameter only when nothing matched by widening.
     var best: ?ScalarFn = null;
-    var best_cost: u64 = std.math.maxInt(u64);
-    for (builtins) |f| {
-        if (!std.ascii.eqlIgnoreCase(f.name, name)) continue;
-        const total_cost = scalarCastCost(f, arg_types) orelse continue;
-        if (total_cost < best_cost) {
-            best_cost = total_cost;
-            best = f;
-        }
-    }
-    if (registry) |reg| {
-        for (reg.scalarEntries()) |entry| {
-            if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
-            if (entry.arg_types.len != arg_types.len) continue;
-            var total_cost: u64 = 0;
-            var castable = true;
-            for (entry.arg_types, arg_types) |declared, given| {
-                const c = cast.castCost(@as(TypeTag, given), @as(TypeTag, declared)) orelse {
-                    castable = false;
-                    break;
-                };
-                total_cost += c;
-            }
-            if (!castable) continue;
+    for ([_]bool{ false, true }) |allow_narrowing| {
+        var best_cost: u64 = std.math.maxInt(u64);
+        for (builtins) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, name)) continue;
+            const total_cost = scalarCastCost(f, arg_types, allow_narrowing) orelse continue;
             if (total_cost < best_cost) {
                 best_cost = total_cost;
-                best = scalarFromUdf(entry);
+                best = f;
             }
         }
+        if (registry) |reg| {
+            for (reg.scalarEntries()) |entry| {
+                if (!std.ascii.eqlIgnoreCase(entry.name, name)) continue;
+                if (entry.arg_types.len != arg_types.len) continue;
+                var total_cost: u64 = 0;
+                var castable = true;
+                for (entry.arg_types, arg_types) |declared, given| {
+                    const c = argCastCost(given, declared, allow_narrowing) orelse {
+                        castable = false;
+                        break;
+                    };
+                    total_cost += c;
+                }
+                if (!castable) continue;
+                if (total_cost < best_cost) {
+                    best_cost = total_cost;
+                    best = scalarFromUdf(entry);
+                }
+            }
+        }
+        if (best != null) break;
     }
 
     const chosen_proto = best orelse return null;
@@ -185,7 +190,7 @@ pub fn resolveWithRegistry(
         const declared = chosen.arg_types[i];
         const ft: TypeTag = @as(TypeTag, given);
         const tt: TypeTag = @as(TypeTag, declared);
-        slot.* = if (ft == tt) null else cast.kernelFor(ft, tt);
+        slot.* = if (ft == tt) null else cast.kernelFor(ft, tt) orelse cast.argNarrowingKernelFor(ft, tt);
     }
     return ResolvedOverload{ .func = chosen, .arg_casts = arg_casts };
 }
@@ -335,11 +340,132 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Integer arithmetic resolution
+//
+// The one rule for the width of `+ - * DIV %` over integer operands
+// (DESIGN.md §3.4), matching StarRocks 4.0: both operands widen to their common
+// type; `+ - *` then widen one more level (TINYINT→SMALLINT→INT→BIGINT; BIGINT
+// and LARGEINT stay) and wrap on overflow, while DIV and % keep the common
+// type and return NULL for a zero divisor. BOOLEAN counts as TINYINT. Integer
+// literal operands are typed by `arithOperandLiteral`.
+// ---------------------------------------------------------------------------
+
+pub const IntArithOp = enum { add, sub, mul, intdiv, mod };
+
+pub fn intArithOp(name: []const u8) ?IntArithOp {
+    inline for (@typeInfo(IntArithOp).@"enum".fields) |f| {
+        if (std.ascii.eqlIgnoreCase(name, f.name)) return @field(IntArithOp, f.name);
+    }
+    return null;
+}
+
+fn intWidthRank(t: Type) ?usize {
+    return switch (t) {
+        .boolean, .tinyint => 0,
+        .smallint => 1,
+        .int => 2,
+        .bigint => 3,
+        .largeint => 4,
+        else => null,
+    };
+}
+
+const INT_BY_WIDTH_RANK = [_]Type{ .tinyint, .smallint, .int, .bigint, .largeint };
+
+/// Result type of integer `a <op> b`; null unless both operands are integers
+/// (or BOOLEAN). Both operands are cast to this type before the kernel runs.
+pub fn intArithResultType(op: IntArithOp, a: Type, b: Type) ?Type {
+    const common_rank = @max(intWidthRank(a) orelse return null, intWidthRank(b) orelse return null);
+    return INT_BY_WIDTH_RANK[
+        switch (op) {
+            .add, .sub, .mul => if (common_rank < 3) common_rank + 1 else common_rank,
+            .intdiv, .mod => common_rank,
+        }
+    ];
+}
+
+/// A literal operand of `name(arg_types)` (typed as the parser typed it) as
+/// the arithmetic sees it. In integer arithmetic an integer literal takes the
+/// narrowest of TINYINT/SMALLINT/INT/BIGINT holding it, as StarRocks types
+/// literals, so `smallint_col + 1` is SMALLINT + TINYINT → INT rather than
+/// INT + INT → BIGINT. Every other call keeps the parser's literal.
+pub fn arithOperandLiteral(name: []const u8, arg_types: []const Type, lit: types.Value) types.Value {
+    const op = intArithOp(name) orelse return lit;
+    if (arg_types.len != 2 or intArithResultType(op, arg_types[0], arg_types[1]) == null) return lit;
+    const x: i128 = switch (lit) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        .largeint => |x| x,
+        else => return lit,
+    };
+    if (std.math.cast(i8, x)) |n| return .{ .tinyint = n };
+    if (std.math.cast(i16, x)) |n| return .{ .smallint = n };
+    if (std.math.cast(i32, x)) |n| return .{ .int = n };
+    if (std.math.cast(i64, x)) |n| return .{ .bigint = n };
+    return .{ .largeint = x };
+}
+
+/// `width` is always one of INT_BY_WIDTH_RANK.
+fn intArithKernel(op: IntArithOp, width: Type) Kernel {
+    return switch (width) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |_, tag| blk: {
+            const T = switch (tag) {
+                .tinyint => i8,
+                .smallint => i16,
+                .int => i32,
+                .bigint => i64,
+                .largeint => i128,
+                else => unreachable,
+            };
+            break :blk switch (op) {
+                .add => math.wrappingArithKernel(T, .add),
+                .sub => math.wrappingArithKernel(T, .sub),
+                .mul => math.wrappingArithKernel(T, .mul),
+                .intdiv => math.intDivModKernel(T, .div),
+                .mod => math.intDivModKernel(T, .mod),
+            };
+        },
+        else => unreachable,
+    };
+}
+
+fn resolveIntArith(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (arg_types.len != 2) return null;
+    const op = intArithOp(name) orelse return null;
+    const width = intArithResultType(op, arg_types[0], arg_types[1]) orelse return null;
+    const declared = try aa.alloc(Type, 2);
+    @memset(declared, width);
+    const casts = try aa.alloc(?CastKernel, 2);
+    var any_cast = false;
+    for (arg_types, casts) |given, *slot| {
+        const from: TypeTag = given;
+        slot.* = if (from == @as(TypeTag, width)) null else cast.kernelFor(from, width) orelse return null;
+        any_cast = any_cast or slot.* != null;
+    }
+    return ResolvedOverload{
+        .func = .{
+            .name = name,
+            .arg_types = declared,
+            .return_type = width,
+            .null_strategy = switch (op) {
+                .add, .sub, .mul => .propagates,
+                .intdiv, .mod => .kernel_managed,
+            },
+            .kernel = intArithKernel(op, width),
+        },
+        .arg_casts = if (any_cast) casts else null,
+    };
+}
+
 /// Whether ANY overload named `name` exists — builtin, decimal-only, or a
 /// registered UDF. Name-only, so it holds before argument types are known.
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "to_decimal")) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
+    if (intArithOp(name) != null) return true;
     for (builtins) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return true;
     if (registry) |reg| {
         for (reg.scalarEntries()) |entry| if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
@@ -413,15 +539,20 @@ fn canonScalarTag(t: TypeTag) TypeTag {
     };
 }
 
-fn scalarCastCost(f: ScalarFn, arg_types: []const Type) ?u64 {
+fn scalarCastCost(f: ScalarFn, arg_types: []const Type, allow_narrowing: bool) ?u64 {
     if (!scalarArityMatches(f, arg_types.len)) return null;
     var total_cost: u64 = 0;
     for (arg_types, 0..) |given, i| {
-        const declared = scalarDeclaredTypeAt(f, i);
-        const c = cast.castCost(@as(TypeTag, given), @as(TypeTag, declared)) orelse return null;
-        total_cost += c;
+        total_cost += argCastCost(given, scalarDeclaredTypeAt(f, i), allow_narrowing) orelse return null;
     }
     return total_cost;
+}
+
+fn argCastCost(given: Type, declared: Type, allow_narrowing: bool) ?u32 {
+    const from: TypeTag = given;
+    const to: TypeTag = declared;
+    if (cast.castCost(from, to)) |c| return c;
+    return if (allow_narrowing) cast.argNarrowingCost(from, to) else null;
 }
 
 fn expandScalarFn(aa: Allocator, f: ScalarFn, actual: usize) !ScalarFn {
@@ -521,8 +652,10 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "coalesce", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .null_strategy = .absorbs, .kernel = cond.coalesceDatetimeKernel },
     .{ .name = "coalesce", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 2, .null_strategy = .absorbs, .kernel = cond.coalesceDatetimeKernel },
     // --- math ---
-    .{ .name = "abs", .arg_types = &.{.int}, .return_type = .int, .kernel = math.absIntKernel },
-    .{ .name = "abs", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.absBigintKernel },
+    .{ .name = "abs", .arg_types = &.{.tinyint}, .return_type = .smallint, .kernel = math.absIntegerKernel(i8, i16) },
+    .{ .name = "abs", .arg_types = &.{.smallint}, .return_type = .int, .kernel = math.absIntegerKernel(i16, i32) },
+    .{ .name = "abs", .arg_types = &.{.int}, .return_type = .bigint, .kernel = math.absIntegerKernel(i32, i64) },
+    .{ .name = "abs", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.absIntegerKernel(i64, i64) },
     .{ .name = "abs", .arg_types = &.{.double}, .return_type = .double, .kernel = math.absDoubleKernel },
     .{ .name = "ceil", .arg_types = &.{.double}, .return_type = .double, .kernel = math.ceilKernel },
     .{ .name = "floor", .arg_types = &.{.double}, .return_type = .double, .kernel = math.floorKernel },
@@ -532,39 +665,23 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "pi", .arg_types = &.{}, .return_type = .double, .kernel = math.piKernel },
     .{ .name = "rand", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
     .{ .name = "random", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
-    .{ .name = "mod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.modIntKernel },
-    .{ .name = "mod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.modBigintKernel },
-    // A floating operand on either side: MySQL MOD keeps the dividend's sign
-    // (fmod), same as `%`.
+    // Integer MOD resolves in `resolveIntArith`. A floating operand on either
+    // side: MySQL MOD keeps the dividend's sign (fmod), same as `%`.
     .{ .name = "mod", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.modDoubleKernel },
     .{ .name = "pmod", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.pmodIntKernel },
     .{ .name = "pmod", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.pmodBigintKernel },
     .{ .name = "fmod", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.fmodKernel },
     // Binary arithmetic — backs the SQL infix operators (+ - * /) in the
-    // parser. Overloaded on (int,int), (bigint,bigint), (double,double);
-    // mixed-type combinations route through the existing scalar-fn
-    // coercion machinery (int→bigint→double promotion).
-    .{ .name = "add", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.addIntKernel },
-    .{ .name = "add", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.addBigintKernel },
-    .{ .name = "add", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.addLargeintKernel },
+    // parser. Integer operands resolve in `resolveIntArith`; these overloads
+    // take any floating operand, with integers promoted to double.
     .{ .name = "add", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.addDoubleKernel },
-    .{ .name = "sub", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.subIntKernel },
-    .{ .name = "sub", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.subBigintKernel },
-    .{ .name = "sub", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.subLargeintKernel },
     .{ .name = "sub", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.subDoubleKernel },
-    .{ .name = "mul", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.mulIntKernel },
-    .{ .name = "mul", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.mulBigintKernel },
-    .{ .name = "mul", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.mulLargeintKernel },
     .{ .name = "mul", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.mulDoubleKernel },
-    // Internal checked i128 → i64 narrow for the affine-aggregate reduction.
-    // Errors on out-of-i64-range exactly like the SUM finalize. Not user-facing.
-    .{ .name = "__narrow_bigint", .arg_types = &.{.largeint}, .return_type = .bigint, .kernel = math.narrowBigintKernel },
     // `/` is true division per MySQL/StarRocks: integer operands widen to
     // double via the implicit-cast lattice (7 / 2 = 3.5). Explicit integer
-    // division is the `DIV` operator, which lowers to `intdiv`.
+    // division is the `DIV` operator, which lowers to `intdiv` and resolves
+    // in `resolveIntArith`.
     .{ .name = "div", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.divDoubleKernel },
-    .{ .name = "intdiv", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.divIntKernel },
-    .{ .name = "intdiv", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.divBigintKernel },
     .{ .name = "pow", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.powKernel },
     .{ .name = "sqrt", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sqrtKernel },
     .{ .name = "exp", .arg_types = &.{.double}, .return_type = .double, .kernel = math.expKernel },

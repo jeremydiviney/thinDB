@@ -253,7 +253,7 @@ test "compute: math — abs, ceil, floor, round, sign, mod, pow, sqrt" {
     });
     defer q.deinit();
 
-    var abs_i: std.ArrayList(i32) = .empty;
+    var abs_i: std.ArrayList(i64) = .empty;
     defer abs_i.deinit(allocator);
     var ceil_d: std.ArrayList(f64) = .empty;
     defer ceil_d.deinit(allocator);
@@ -261,11 +261,11 @@ test "compute: math — abs, ceil, floor, round, sign, mod, pow, sqrt" {
     defer floor_d.deinit(allocator);
 
     while (try q.next()) |b| {
-        try abs_i.appendSlice(allocator, b.values[3].data.int[0..b.row_count]);
+        try abs_i.appendSlice(allocator, b.values[3].data.bigint[0..b.row_count]);
         try ceil_d.appendSlice(allocator, b.values[4].data.double[0..b.row_count]);
         try floor_d.appendSlice(allocator, b.values[5].data.double[0..b.row_count]);
     }
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 7, 10, 0 }, abs_i.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 10, 0 }, abs_i.items);
     try std.testing.expectEqualSlices(f64, &[_]f64{ 3.0, -3.0, 9.0 }, ceil_d.items);
     try std.testing.expectEqualSlices(f64, &[_]f64{ 2.0, -4.0, 9.0 }, floor_d.items);
 }

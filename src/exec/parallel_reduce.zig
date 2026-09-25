@@ -461,9 +461,9 @@ test "parallel reduce matches serial global aggregate" {
     const b = (try q.next()).?;
     try testing.expectEqual(@as(usize, 1), b.row_count);
     try testing.expectEqual(@as(i64, n), b.values[0].data.bigint[0]);
-    var expect_sum: i128 = 0;
+    var expect_sum: i64 = 0;
     for (vals) |v| expect_sum += v;
-    try testing.expectEqual(expect_sum, b.values[1].data.largeint[0]);
+    try testing.expectEqual(expect_sum, b.values[1].data.bigint[0]);
     try testing.expectEqual(@as(i64, 0), b.values[2].data.bigint[0]);
     try testing.expectEqual(@as(i64, n - 1), b.values[3].data.bigint[0]);
     // max_by(v, id): value at the highest id.

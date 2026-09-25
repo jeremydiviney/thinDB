@@ -85,10 +85,10 @@ test "CTAS: computed projection can replace a star-expanded source column" {
     defer q.deinit();
     const b = (try q.next()).?;
     try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);
-    try std.testing.expectEqual(@as(i32, 11), b.values[1].data.int[0]);
+    try std.testing.expectEqual(@as(i64, 11), b.values[1].data.bigint[0]);
     try std.testing.expectEqualStrings("a", b.values[2].data.string.rowBytes(0));
     try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[1]);
-    try std.testing.expectEqual(@as(i32, 21), b.values[1].data.int[1]);
+    try std.testing.expectEqual(@as(i64, 21), b.values[1].data.bigint[1]);
     try std.testing.expectEqualStrings("b", b.values[2].data.string.rowBytes(1));
 }
 
