@@ -188,6 +188,7 @@ pub fn parseWindowSpecOrRef(p: anytype) !SpecKind {
 /// partitioning, no ordering, frame chosen by whether ORDER BY is
 /// present).
 pub fn parseWindowSpec(p: anytype) !ir.WindowSpec {
+    const PE = @TypeOf(p.*).Err;
     try p.expect(.lparen);
 
     var partition_by: []const []const u8 = &.{};
@@ -202,8 +203,14 @@ pub fn parseWindowSpec(p: anytype) !ir.WindowSpec {
         try p.advance();
         try p.expect(.kw_by);
         // Window ORDER BY references columns, not projection outputs, so
-        // no projection context is needed for scalar-expr binding.
-        order_by = try p.parseOrderBy(&.{});
+        // no projection context is needed for scalar-expr binding. An
+        // expression key computes below the Window with the PARTITION BY
+        // expressions; a predicate key comparing computed operands would
+        // need its own Compute beneath that one.
+        const order = try p.parseOrderBy(&.{});
+        if (order.anchors.len > 0) return PE.SqlInvalidProjection;
+        try p.window_partition_expr_refs.appendSlice(p.arena, order.keys);
+        order_by = order.specs;
     }
 
     var frame: ir.Frame = if (order_by.len == 0)
