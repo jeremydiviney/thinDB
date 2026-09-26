@@ -31,6 +31,8 @@ pub const Error = error{
     XaInvalidXid,
     DatabaseInUse,
     TableBusy,
+    /// Table names starting `__alter_` belong to ALTER's on-disk swap.
+    ReservedTableName,
     RecoveryRequired,
     DurabilityUncertain,
     DatabaseClosed,

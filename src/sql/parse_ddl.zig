@@ -1012,7 +1012,7 @@ pub fn parseColumnType(p: anytype) !types.Type {
     if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return integerType(p, .int, .bigint);
     if (asciiEqlAny(name, &.{"mediumint"})) return integerType(p, .int, .int);
     if (asciiEqlAny(name, &.{ "smallint", "int2" })) return integerType(p, .smallint, .int);
-    if (asciiEqlAny(name, &.{"tinyint"})) return integerType(p, .smallint, .smallint);
+    if (asciiEqlAny(name, &.{"tinyint"})) return integerType(p, .tinyint, .smallint);
     if (asciiEqlAny(name, &.{ "float", "real", "float4" })) return numericModifiers(p, .float);
     if (asciiEqlAny(name, &.{"float8"})) return .double;
     if (asciiEqlAny(name, &.{"double"})) {

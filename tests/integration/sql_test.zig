@@ -846,6 +846,8 @@ test "sql: MySQL column type spellings and modifiers" {
         \\  u INT(10) UNSIGNED ZEROFILL,
         \\  su SMALLINT UNSIGNED,
         \\  m MEDIUMINT,
+        \\  ti TINYINT(4),
+        \\  tu TINYINT UNSIGNED,
         \\  c CHAR(3),
         \\  c1 CHAR,
         \\  cv CHARACTER VARYING(10),
@@ -860,20 +862,23 @@ test "sql: MySQL column type spellings and modifiers" {
         \\  t TEXT CHARSET utf8 COMMENT 'note'
         \\)
     );
-    try helpers.exec(allocator, db, "INSERT INTO my (id, u, su, m, c, s) VALUES (1, 4000000000, 60000, -5, 'abc', 'x')");
+    try helpers.exec(allocator, db, "INSERT INTO my (id, u, su, m, ti, tu, c, s) VALUES (1, 4000000000, 60000, -5, -128, 255, 'abc', 'x')");
+    try helpers.expectRunError(allocator, db, "INSERT INTO my (id, ti, s) VALUES (2, 128, 'x')", error.TypeMismatch);
 
     var q = try runSql(allocator, db, "SELECT * FROM my");
     defer q.deinit();
     const TypeTag = thindb.types.TypeTag;
-    const expected = [_]TypeTag{ .bigint, .bigint, .int, .int, .char, .char, .varchar, .string, .string, .string, .decimal64, .decimal64, .float, .double, .varchar, .string };
+    const expected = [_]TypeTag{ .bigint, .bigint, .int, .int, .tinyint, .smallint, .char, .char, .varchar, .string, .string, .string, .decimal64, .decimal64, .float, .double, .varchar, .string };
     const schema = q.outputSchema();
     try std.testing.expectEqual(expected.len, schema.len);
     for (expected, schema) |tag, col| try std.testing.expectEqual(tag, std.meta.activeTag(col.type));
-    try std.testing.expectEqual(@as(u32, 1), schema[5].type.char);
-    try std.testing.expectEqual(@as(u8, 10), schema[10].type.decimal64.p);
-    try std.testing.expectEqual(@as(u8, 0), schema[10].type.decimal64.s);
+    try std.testing.expectEqual(@as(u32, 1), schema[7].type.char);
+    try std.testing.expectEqual(@as(u8, 10), schema[12].type.decimal64.p);
+    try std.testing.expectEqual(@as(u8, 0), schema[12].type.decimal64.s);
     const b = (try q.next()).?;
     try std.testing.expectEqual(@as(i64, 4000000000), b.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i8, -128), b.values[4].data.tinyint[0]);
+    try std.testing.expectEqual(@as(i16, 255), b.values[5].data.smallint[0]);
 }
 
 test "sql: MySQL cast and function spellings" {

@@ -1,7 +1,8 @@
 //! ALTER TABLE orchestration. Per DESIGN.md §9.2: derive the new schema
 //! from the ops, create a shadow directory next to the table, stream
-//! every row group of every segment through the projection, atomically
-//! rename the shadow into place, then re-init the Table's in-memory state.
+//! every row group of every segment through the projection, set the
+//! original aside, rename the shadow into place, delete the original, then
+//! re-init the Table's in-memory state.
 //!
 //! Writers are paused for the entire duration (we hold `table.mutex`).
 //! Active scans hold their own refcounted memtable snapshot, so they
@@ -31,6 +32,99 @@ const api = @import("api.zig");
 const NsSchema = api.Schema;
 const Table = api.Table;
 const AlterOp = api.AlterOp;
+
+/// Directory names under this prefix belong to an ALTER swap: no table is
+/// created, renamed, listed or opened under one.
+pub const reserved_table_prefix = "__alter_";
+/// The rewritten table, and the original set aside while the rewrite takes
+/// its name. Neither prefix starts the other, so one table's shadow never
+/// names another table's aside.
+const shadow_prefix = reserved_table_prefix ++ "new_";
+const aside_prefix = reserved_table_prefix ++ "old_";
+
+pub fn isReservedTableName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, reserved_table_prefix);
+}
+
+/// Delete the shadow and the aside an ALTER of `table_name` may have left.
+pub fn deleteAlterLeftovers(io: Io, schema_dir: Io.Dir, table_name: []const u8) !void {
+    var name_buf: [256]u8 = undefined;
+    inline for (.{ shadow_prefix, aside_prefix }) |prefix| {
+        const name = try std.fmt.bufPrint(&name_buf, prefix ++ "{s}", .{table_name});
+        try storage.retryTransientWindowsRefusal(io, Io.Dir.deleteTree, .{ schema_dir, io, name });
+    }
+}
+
+/// Resolve the ALTER swaps a crash or a persistent refusal interrupted in
+/// `schema_dir`. A swap commits when its shadow takes the table's name, so
+/// an interrupted one rolls back: an aside returns to its table's name, and
+/// a shadow is deleted once its table stands. Runs as the schema opens,
+/// before any of its tables does.
+pub fn recoverInterruptedAlters(allocator: Allocator, io: Io, schema_dir: Io.Dir) !void {
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    // Collected first: the fixes below rename and delete entries of the
+    // directory being walked.
+    var it = schema_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory or !isReservedTableName(entry.name)) continue;
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try names.append(allocator, name);
+    }
+    for (names.items) |name| {
+        if (!std.mem.startsWith(u8, name, aside_prefix)) continue;
+        const table_name = name[aside_prefix.len..];
+        if (try dirExists(io, schema_dir, table_name)) continue;
+        try storage.retryTransientWindowsRefusal(io, Io.Dir.rename, .{ schema_dir, name, schema_dir, table_name, io });
+    }
+    for (names.items) |name| {
+        if (std.mem.startsWith(u8, name, aside_prefix)) {
+            if (try dirExists(io, schema_dir, name)) try deleteLeftover(io, schema_dir, name);
+            continue;
+        }
+        // A bare `__alter_<name>` predates the aside step. That swap deleted
+        // the original before renaming the shadow in, so a crash between the
+        // two left a complete shadow as the table's only copy.
+        const table_name = name[if (std.mem.startsWith(u8, name, shadow_prefix)) shadow_prefix.len else reserved_table_prefix.len..];
+        if (!try dirExists(io, schema_dir, table_name) and try hasManifest(io, schema_dir, name)) {
+            try storage.retryTransientWindowsRefusal(io, Io.Dir.rename, .{ schema_dir, name, schema_dir, table_name, io });
+        } else {
+            try deleteLeftover(io, schema_dir, name);
+        }
+    }
+}
+
+// A leftover the restored table no longer needs; one that stays only costs
+// disk until the next open, so a refusal must not keep the schema closed.
+fn deleteLeftover(io: Io, schema_dir: Io.Dir, name: []const u8) !void {
+    storage.retryTransientWindowsRefusal(io, Io.Dir.deleteTree, .{ schema_dir, io, name }) catch |err| switch (err) {
+        error.AccessDenied => {},
+        else => return err,
+    };
+}
+
+fn dirExists(io: Io, parent: Io.Dir, name: []const u8) !bool {
+    const dir = parent.openDir(io, name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    dir.close(io);
+    return true;
+}
+
+fn hasManifest(io: Io, parent: Io.Dir, name: []const u8) !bool {
+    const dir = try parent.openDir(io, name, .{});
+    defer dir.close(io);
+    dir.access(io, storage.manifest.manifest_filename, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
 
 /// Source of data for one column of the new schema.
 const ColumnSource = union(enum) {
@@ -219,10 +313,12 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     // 1. Flush the active memtable so all live data is in segments.
     try t.flushLocked();
 
-    // 2. Create (or recreate, after a prior failed alter) the shadow directory.
+    // 2. Create the shadow directory, clearing what a failed alter left.
+    try deleteAlterLeftovers(t.io, s.schema_dir, t.name);
     var shadow_name_buf: [256]u8 = undefined;
-    const shadow_name = try std.fmt.bufPrint(&shadow_name_buf, "__alter_{s}", .{t.name});
-    s.schema_dir.deleteTree(t.io, shadow_name) catch {};
+    const shadow_name = try std.fmt.bufPrint(&shadow_name_buf, shadow_prefix ++ "{s}", .{t.name});
+    var aside_name_buf: [256]u8 = undefined;
+    const aside_name = try std.fmt.bufPrint(&aside_name_buf, aside_prefix ++ "{s}", .{t.name});
 
     var shadow_dir = try s.schema_dir.createDirPathOpen(t.io, shadow_name, .{});
     var shadow_segs = try shadow_dir.createDirPathOpen(t.io, "segments", .{});
@@ -252,18 +348,20 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
         );
     }
 
-    // 4. Write new schema and manifest into the shadow.
-    try storage.schema_file.writeSchema(t.io, shadow_dir, new_schema, t.allocator);
+    // 4. Write new schema and manifest into the shadow, manifest last:
+    //    recovery reads a manifest as a complete shadow.
+    try storage.schema_file.writeSchema(t.io, shadow_dir, new_schema, t.allocator, sync);
+    if (sync) try storage.syncDirectory(t.io, shadow_segs);
     try storage.writeManifest(t.io, shadow_dir, new_manifest, sync);
 
-    // 5. Swap on disk: close current + shadow handles, delete original tree,
-    //    rename shadow into place. The WAL file lives in the original tree,
-    //    so the writer is closed before deleteTree unlinks it and recreated
-    //    in reInitTableState. A writer that outlives the swap keeps a stale
-    //    dir handle whose fd number gets reused, and its next truncate lands
-    //    in whatever directory owns that number by then (2026-08-29: the
-    //    segments dir — a log replay never looked at). Step 1 flushed, so the
-    //    log carries nothing live. Mirrors NsSchema.renameTable.
+    // 5. Swap on disk: close current + shadow handles, set the original tree
+    //    aside, rename the shadow into place, delete the original. The WAL
+    //    file lives in the original tree, so the writer is closed before the
+    //    swap and recreated in reInitTableState. A writer that outlives the
+    //    swap keeps a stale dir handle whose fd number gets reused, and its
+    //    next truncate lands in whatever directory owns that number by then
+    //    (2026-08-29: the segments dir — a log replay never looked at). Step 1
+    //    flushed, so the log carries nothing live. Mirrors NsSchema.renameTable.
     const had_wal = t.wal != null;
     if (had_wal) {
         t.wal.?.deinit();
@@ -275,17 +373,32 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     shadow_segs.close(t.io);
     shadow_dir.close(t.io);
     shadow_open = false;
-    // Past this point the Table owns no directory handles. A failed swap
-    // leaves the on-disk tree in whichever state the failing step reached,
-    // so fence the table until reopen instead of letting later operations
-    // reach through dead handles (`close` skips them via dirs_open).
+    // Cached segment handles hold their files open, and Windows refuses to
+    // rename a directory while a file inside it is open. Their parsed footers
+    // embed the old schema anyway.
+    t.seg_handles.clear(t.allocator);
+    // Nothing on disk has moved yet, so a refusal to set the original aside
+    // reopens it unchanged.
+    storage.retryTransientWindowsRefusal(t.io, Io.Dir.rename, .{ s.schema_dir, t.name, s.schema_dir, aside_name, t.io }) catch |err| {
+        reInitTableState(s, t, t.schema_fingerprint, had_wal) catch t.requireRecovery();
+        return err;
+    };
+    // Past this point a failure leaves the tree mid-swap, which only
+    // `recoverInterruptedAlters` resolves, so fence the table until reopen
+    // instead of letting later operations reach through dead handles
+    // (`close` skips them via dirs_open).
     errdefer t.requireRecovery();
-
-    try storage.retryTransientWindowsRefusal(t.io, Io.Dir.deleteTree, .{ s.schema_dir, t.io, t.name });
+    if (sync) storage.syncDirectory(t.io, s.schema_dir) catch return api.Error.DurabilityUncertain;
+    // The swap commits here; until this rename lands, the next open puts the
+    // original back.
     try storage.retryTransientWindowsRefusal(t.io, Io.Dir.rename, .{ s.schema_dir, shadow_name, s.schema_dir, t.name, t.io });
+    if (sync) storage.syncDirectory(t.io, s.schema_dir) catch return api.Error.DurabilityUncertain;
 
     // 6. Re-open Table state under the new schema.
     try reInitTableState(s, t, new_fp, had_wal);
+    // Committed: an original the delete leaves behind is only garbage, which
+    // the next open of the schema or alter of the table removes.
+    storage.retryTransientWindowsRefusal(t.io, Io.Dir.deleteTree, .{ s.schema_dir, t.io, aside_name }) catch {};
 }
 
 /// Build a new segment in `shadow_segs` carrying `entry`'s rows but reshaped
@@ -455,11 +568,9 @@ fn reInitTableState(s: *NsSchema, t: *Table, new_fp: u64, recreate_wal: bool) !v
 
     // The rewritten table restarts segment IDs and reshapes columns, so the
     // old generation's cached blocks must become unreachable: purge and move
-    // to a fresh uid. The parsed footers embed schema-derived structures —
-    // drop them too.
+    // to a fresh uid. execAlter already dropped the parsed footers.
     t.cache.purgeTable(t.cache_uid);
     t.cache_uid = storage.cache.newTableUid();
-    t.seg_handles.clear(allocator);
 
     const new_indices = try allocator.alloc(usize, t.schema.order_key.len);
     for (t.schema.order_key, 0..) |k, i| {

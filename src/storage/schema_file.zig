@@ -110,7 +110,7 @@ pub const SchemaOwner = struct {
     }
 };
 
-pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator) !void {
+pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator, durable: bool) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(scratch);
 
@@ -150,7 +150,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator)
     try buf.append(scratch, @intFromEnum(schema.compression));
     try buf.appendSlice(scratch, &schema_magic);
 
-    try dir.writeFile(io, .{ .sub_path = schema_filename, .data = buf.items });
+    try @import("storage.zig").writeFileSynced(io, dir, schema_filename, buf.items, durable);
 }
 
 pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
@@ -505,7 +505,7 @@ test "round-trip schema (simple)" {
         .unique = true,
     };
 
-    try writeSchema(io, tmp.dir, schema, allocator);
+    try writeSchema(io, tmp.dir, schema, allocator, false);
 
     var owner = try readSchema(allocator, io, tmp.dir);
     defer owner.deinit();
@@ -527,7 +527,7 @@ test "round-trip schema preserves compression option" {
             .unique = false,
             .compression = comp,
         };
-        try writeSchema(io, tmp.dir, schema, allocator);
+        try writeSchema(io, tmp.dir, schema, allocator, false);
         var owner = try readSchema(allocator, io, tmp.dir);
         defer owner.deinit();
         try std.testing.expectEqual(comp, owner.view().compression);
@@ -551,7 +551,7 @@ test "round-trip schema (composite order key)" {
         .unique = false,
     };
 
-    try writeSchema(io, tmp.dir, schema, allocator);
+    try writeSchema(io, tmp.dir, schema, allocator, false);
 
     var owner = try readSchema(allocator, io, tmp.dir);
     defer owner.deinit();
