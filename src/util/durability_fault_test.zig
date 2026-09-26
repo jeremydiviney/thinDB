@@ -12,12 +12,16 @@ const DirectorySyncFault = struct {
     /// When set, only renames whose source path starts with this prefix are
     /// refused; everything else reaches the real backend.
     rename_fail_prefix: ?[]const u8 = null,
+    /// When set, deleting an entry whose name starts with this prefix is
+    /// refused, as Windows refuses one another handle still holds.
+    delete_fail_prefix: ?[]const u8 = null,
 
     fn io(self: *@This()) Io {
         const base = self.threaded.io();
         self.vtable = base.vtable.*;
         self.vtable.fileSync = sync;
         self.vtable.dirRename = rename;
+        self.vtable.dirDeleteFile = deleteFile;
         return .{ .userdata = base.userdata, .vtable = &self.vtable };
     }
 
@@ -46,6 +50,18 @@ const DirectorySyncFault = struct {
         }
         const base = threaded.io();
         return base.vtable.dirRename(base.userdata, old_dir, old_path, new_dir, new_path);
+    }
+
+    fn deleteFile(userdata: ?*anyopaque, dir: Io.Dir, path: []const u8) Io.Dir.DeleteFileError!void {
+        const threaded: *Io.Threaded = @ptrCast(@alignCast(userdata.?));
+        const self: *@This() = @fieldParentPtr("threaded", threaded);
+        const base = threaded.io();
+        if (self.delete_fail_prefix) |prefix| {
+            // A missing entry still reports FileNotFound.
+            const present = if (dir.access(base, path, .{})) true else |_| false;
+            if (present and std.mem.startsWith(u8, path, prefix)) return error.AccessDenied;
+        }
+        return base.vtable.dirDeleteFile(base.userdata, dir, path);
     }
 };
 
@@ -106,39 +122,115 @@ test "durability: post-rename directory sync failure fences writes until reopen"
     try std.testing.expectEqual(@as(usize, 1), rows);
 }
 
+const alter_test_table: @import("../types.zig").TableSchema = .{
+    .columns = &.{.{ .name = "id", .type = .bigint }},
+    .order_key = &.{"id"},
+    .unique = false,
+};
+const add_note: api.AlterOp = .{ .add = .{ .name = "note", .type = .bigint, .nullable = true } };
+
+fn expectIds(a: std.mem.Allocator, table: *api.Table, expected: []const i64) !void {
+    var query = try exec.scan(a, table);
+    defer query.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(a);
+    while (try query.next()) |batch| try ids.appendSlice(a, batch.values[0].data.bigint[0..batch.row_count]);
+    std.mem.sort(i64, ids.items, {}, std.sort.asc(i64));
+    try std.testing.expectEqualSlices(i64, expected, ids.items);
+}
+
 test "durability: alter swap retries a transient rename refusal and fences the table on a persistent one" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Refuse only the swap's `__alter_<name>` -> `<name>` rename; the manifest
-    // and schema publications inside the rewrite keep the real backend.
-    var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "__alter_" };
+    {
+        // Refuse only the swap's `__alter_new_<name>` -> `<name>` rename; the
+        // manifest and schema publications inside the rewrite keep the real
+        // backend.
+        var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "__alter_" };
+        defer fault.threaded.deinit();
+        const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
+        defer db.close();
+
+        if (@import("builtin").os.tag == .windows) {
+            const retried = try db.table("t", alter_test_table, .{ .order_key = &.{"id"} });
+            try retried.insert(&.{.{ .id = @as(i64, 7) }});
+            try retried.flush();
+            fault.rename_failures = 2;
+            try db.alterTable("t", &.{add_note});
+            try std.testing.expectEqual(@as(usize, 0), fault.rename_failures);
+            try std.testing.expect(retried.schema.columnIndex("note") != null);
+        }
+
+        const fenced = try db.table("u", alter_test_table, .{ .order_key = &.{"id"} });
+        try fenced.insert(&.{.{ .id = @as(i64, 7) }});
+        try fenced.flush();
+        fault.rename_failures = std.math.maxInt(usize);
+        try std.testing.expectError(error.AccessDenied, db.alterTable("u", &.{add_note}));
+        try std.testing.expectError(error.RecoveryRequired, fenced.insert(&.{.{ .id = @as(i64, 8) }}));
+        try std.testing.expectError(error.RecoveryRequired, exec.scan(a, fenced));
+        // `db.close()` must skip the directory handles the failed swap closed.
+    }
+    // The swap never committed, so the reopen rolls it back.
+    const db = try api.Database.open(a, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const restored = try db.openTable("u", .{});
+    try std.testing.expect(restored.schema.columnIndex("note") == null);
+    try expectIds(a, restored, &.{7});
+    try db.alterTable("u", &.{add_note});
+    try std.testing.expect(restored.schema.columnIndex("note") != null);
+    try expectIds(a, restored, &.{7});
+}
+
+test "durability: a refusal to set the original aside leaves the table usable" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Only the swap's first rename moves a directory named for the table.
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "swapped" };
     defer fault.threaded.deinit();
     const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
     defer db.close();
-    const table_def: @import("../types.zig").TableSchema = .{
-        .columns = &.{.{ .name = "id", .type = .bigint }},
-        .order_key = &.{"id"},
-        .unique = false,
-    };
-    const add_note: api.AlterOp = .{ .add = .{ .name = "note", .type = .bigint, .nullable = true } };
-
-    if (@import("builtin").os.tag == .windows) {
-        const retried = try db.table("t", table_def, .{ .order_key = &.{"id"} });
-        try retried.insert(&.{.{ .id = @as(i64, 7) }});
-        try retried.flush();
-        fault.rename_failures = 2;
-        try db.alterTable("t", &.{add_note});
-        try std.testing.expectEqual(@as(usize, 0), fault.rename_failures);
-        try std.testing.expect(retried.schema.columnIndex("note") != null);
-    }
-
-    const fenced = try db.table("u", table_def, .{ .order_key = &.{"id"} });
-    try fenced.insert(&.{.{ .id = @as(i64, 7) }});
-    try fenced.flush();
+    const table = try db.table("swapped", alter_test_table, .{ .order_key = &.{"id"} });
+    try table.insert(&.{.{ .id = @as(i64, 7) }});
+    try table.flush();
     fault.rename_failures = std.math.maxInt(usize);
-    try std.testing.expectError(error.AccessDenied, db.alterTable("u", &.{add_note}));
-    try std.testing.expectError(error.RecoveryRequired, fenced.insert(&.{.{ .id = @as(i64, 8) }}));
-    try std.testing.expectError(error.RecoveryRequired, exec.scan(a, fenced));
-    // `db.close()` must skip the directory handles the failed swap closed.
+    try std.testing.expectError(error.AccessDenied, db.alterTable("swapped", &.{add_note}));
+    try std.testing.expect(table.schema.columnIndex("note") == null);
+    try table.insert(&.{.{ .id = @as(i64, 8) }});
+    try table.flush();
+    try expectIds(a, table, &.{ 7, 8 });
+    fault.rename_failures = 0;
+    try db.alterTable("swapped", &.{add_note});
+    try std.testing.expect(table.schema.columnIndex("note") != null);
+    try expectIds(a, table, &.{ 7, 8 });
+}
+
+test "durability: an original the committed swap failed to delete stays gone after DROP and RENAME" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .delete_fail_prefix = "__alter_old_" };
+        defer fault.threaded.deinit();
+        const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
+        defer db.close();
+        inline for (.{ "dropped", "renamed" }) |name| {
+            const table = try db.table(name, alter_test_table, .{ .order_key = &.{"id"} });
+            try table.insert(&.{.{ .id = @as(i64, 7) }});
+            try table.flush();
+            try db.alterTable(name, &.{add_note});
+            try std.testing.expect(table.schema.columnIndex("note") != null);
+        }
+        fault.delete_fail_prefix = null;
+        try db.dropTable("dropped");
+        try db.renameTable("renamed", "moved");
+    }
+    const db = try api.Database.open(a, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try std.testing.expectError(error.TableNotFound, db.openTable("dropped", .{}));
+    try std.testing.expectError(error.TableNotFound, db.openTable("renamed", .{}));
+    const moved = try db.openTable("moved", .{});
+    try std.testing.expect(moved.schema.columnIndex("note") != null);
+    try expectIds(a, moved, &.{7});
 }
