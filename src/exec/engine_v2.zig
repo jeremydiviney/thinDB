@@ -1130,6 +1130,11 @@ const ScanSelectPlan = struct {
     // later SELECT of an excluded name fails with ColumnNotFound.
     excludes: [MAX_SCAN_EXCLUDES][]const []const u8 = undefined,
     exclude_count: usize = 0,
+    // Computes stacked ABOVE the SELECT list, outermost first: they read its
+    // output and apply last. Splitting a Compute into UNION arms leaves them
+    // there.
+    post_computes: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined,
+    post_compute_count: usize = 0,
 };
 
 const MAX_SCAN_COMPUTES = 4;
@@ -1137,6 +1142,15 @@ const MAX_SCAN_EXCLUDES = 4;
 
 fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     var op = root;
+    var post_computes: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined;
+    var post_compute_count: usize = 0;
+    var top = root;
+    while (top.* == .compute) : (top = top.compute.upstream) {
+        if (post_compute_count == MAX_SCAN_COMPUTES) return null;
+        post_computes[post_compute_count] = top.compute.derived;
+        post_compute_count += 1;
+    }
+    if (post_compute_count > 0 and top.* == .select) op = top else post_compute_count = 0;
     // Top decorators — Project (SELECT list), LIMIT, ORDER BY — can nest in any
     // order above the scan body; peel each at most once.
     var project_columns: ?[]const []const u8 = null;
@@ -1229,6 +1243,8 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         .project_replace = project_replace,
         .excludes = excludes,
         .exclude_count = exclude_count,
+        .post_computes = post_computes,
+        .post_compute_count = post_compute_count,
     };
 }
 
@@ -1379,7 +1395,7 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const table = try resolveTable(input.db, input.session, plan.scan.table);
 
     if (plan.limit) |l| {
-        if (plan.project_outputs == null and plan.exclude_count == 0) {
+        if (plan.project_outputs == null and plan.exclude_count == 0 and plan.post_compute_count == 0) {
             if (try tryScanSelectLateMat(input, table, plan, l)) |q| return q;
         }
     }
@@ -1499,6 +1515,12 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
         } else {
             q = try q.project(cols);
         }
+    }
+    var post_i = plan.post_compute_count;
+    while (post_i > 0) {
+        post_i -= 1;
+        const derived = plan.post_computes[post_i];
+        if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
     }
     return q;
 }

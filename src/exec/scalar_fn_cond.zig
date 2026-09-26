@@ -247,35 +247,31 @@ pub fn ifDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *Co
 // (registered with `null_strategy = .kernel_managed`).
 // ---------------------------------------------------------------------------
 
-pub fn nullifIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0];
-    const b = args[1];
-    const base = out.data.rowCount();
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const a_valid = a.isValid(i);
-        const av = a.data.int[i];
-        const bv = b.data.int[i];
-        const should_null = a_valid and b.isValid(i) and av == bv;
-        try out.data.int.append(allocator, if (should_null) 0 else av);
-        try out.appendValidBit(allocator, base + i, a_valid and !should_null);
-    }
+fn NullifFixed(comptime field: []const u8) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const a = args[0];
+            const b = args[1];
+            const base = out.data.rowCount();
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                const a_valid = a.isValid(i);
+                const av = @field(a.data, field)[i];
+                const bv = @field(b.data, field)[i];
+                const should_null = a_valid and b.isValid(i) and av == bv;
+                try @field(out.data, field).append(allocator, if (should_null) 0 else av);
+                try out.appendValidBit(allocator, base + i, a_valid and !should_null);
+            }
+        }
+    };
 }
 
-pub fn nullifBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0];
-    const b = args[1];
-    const base = out.data.rowCount();
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const a_valid = a.isValid(i);
-        const av = a.data.bigint[i];
-        const bv = b.data.bigint[i];
-        const should_null = a_valid and b.isValid(i) and av == bv;
-        try out.data.bigint.append(allocator, if (should_null) 0 else av);
-        try out.appendValidBit(allocator, base + i, a_valid and !should_null);
-    }
-}
+pub const nullifIntKernel = NullifFixed("int").kernel;
+pub const nullifBigintKernel = NullifFixed("bigint").kernel;
+pub const nullifDoubleKernel = NullifFixed("double").kernel;
+pub const nullifBooleanKernel = NullifFixed("boolean").kernel;
+pub const nullifDateKernel = NullifFixed("date").kernel;
+pub const nullifDatetimeKernel = NullifFixed("datetime").kernel;
 
 pub fn nullifStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0];
