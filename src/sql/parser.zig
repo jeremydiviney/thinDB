@@ -710,7 +710,7 @@ pub const Parser = struct {
         var where_derived_count: u32 = 0;
         if (self.cur.tag == .kw_where) {
             try self.advance();
-            const where = try self.parseWhereBody();
+            const where = try self.parseConditionBody();
             if (where.derived.len > 0) {
                 root = try self.allocOp(.{ .compute = .{ .derived = where.derived, .upstream = root } });
                 where_derived_count = @intCast(where.derived.len);
@@ -736,13 +736,17 @@ pub const Parser = struct {
         // against the post-GroupBy output schema.
         // An aggregate the SELECT list did not declare (`HAVING SUM(v) > 50`
         // under `SELECT k`) hoists into a hidden aggregate output through the
-        // projection's channel; the final Project drops it.
+        // projection's channel; the final Project drops it. A computed
+        // operand (`SUM(v) + 1 > 3`) is a derived column evaluated per group.
         var pending_having: ?PredicateExpr = null;
+        var having_derived: []const ir.Derived = &.{};
         if (self.cur.tag == .kw_having) {
             try self.advance();
             self.aggregate_expr_refs_enabled = true;
             defer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
-            pending_having = try self.parseBoolExpr();
+            const having = try self.parseConditionBody();
+            pending_having = having.predicate;
+            having_derived = having.derived;
         }
 
         // Optional WINDOW clause — named windows declared here resolve
@@ -1069,7 +1073,9 @@ pub const Parser = struct {
             // above the GroupBy so HAVING / ORDER BY / the final Project all
             // see them. Each derived expression now reads the retained group
             // columns (one row per group instead of one row per input row).
-            if (collapsed_exprs.items.len > 0) {
+            // HAVING's computed operands follow, so they can read those keys.
+            if (collapsed_exprs.items.len > 0 or having_derived.len > 0) {
+                try collapsed_exprs.appendSlice(self.arena, having_derived);
                 const above = try collapsed_exprs.toOwnedSlice(self.arena);
                 root = try self.allocOp(.{ .compute = .{ .derived = above, .upstream = root } });
             }
@@ -1117,7 +1123,7 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            if (distinct or hidden_group_count or has_window or aggregate_expr_refs.len > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            if (distinct or hidden_group_count or has_window or aggregate_expr_refs.len > 0 or having_derived.len > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
         } else {
@@ -3857,7 +3863,7 @@ pub const Parser = struct {
         var derived: []const ir.Derived = &.{};
         if (self.cur.tag == .kw_where) {
             try self.advance();
-            const where = try self.parseWhereBody();
+            const where = try self.parseConditionBody();
             pred = where.predicate;
             derived = where.derived;
         }
@@ -3893,7 +3899,7 @@ pub const Parser = struct {
         var derived: []const ir.Derived = &.{};
         if (self.cur.tag == .kw_where) {
             try self.advance();
-            const where = try self.parseWhereBody();
+            const where = try self.parseConditionBody();
             pred = where.predicate;
             derived = where.derived;
         }
@@ -3905,16 +3911,17 @@ pub const Parser = struct {
         } });
     }
 
-    const WhereBody = struct {
+    const ConditionBody = struct {
         predicate: PredicateExpr,
         /// Computed comparison operands, in the order the predicate names them.
         derived: []const ir.Derived,
     };
 
-    /// Parse a WHERE condition in its own anchoring scope: a computed
-    /// comparison operand (`n % 3 = 0`) becomes a derived column the
-    /// predicate compares by name, for the caller to evaluate ahead of it.
-    fn parseWhereBody(self: *Parser) ParseError!WhereBody {
+    /// Parse a WHERE or HAVING condition in its own anchoring scope: a
+    /// computed comparison operand (`n % 3 = 0`, `SUM(v) + 1 > 3`) becomes a
+    /// derived column the predicate compares by name, for the caller to
+    /// evaluate ahead of it.
+    fn parseConditionBody(self: *Parser) ParseError!ConditionBody {
         const derived_mark = self.predicate_derived.items.len;
         const old_enabled = self.predicate_derived_enabled;
         const old_scope = self.predicate_derived_scope;

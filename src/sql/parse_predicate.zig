@@ -168,55 +168,42 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         _ = try p.parseAddSub();
         return .unknown;
     }
-    // Literal-on-LHS: `lit op X`. Sub-cases handled:
+    // Literal- or sign-led LHS. Each side of the comparison is a whole
+    // scalar expression (`1 + x > 2`, `-x < 0`, `2 > 1 + x`); a side that
+    // parses to a lone literal keeps its constant-aware form:
     //   - lit op col   → flipped to `col reverse_op lit` as a normal leaf
-    //   - lit op lit   → evaluated at parse time, emitted as `.always`
+    //   - lit op lit   → evaluated at parse time when both literals share a
+    //     type, emitted as `.always`
     //   - lit op NULL  → UNKNOWN
     //   - lit IS [NOT] NULL → a literal is never NULL, so `.always`
     //   - lit [NOT] BETWEEN / LIKE / IN → the literal anchors to a hidden
     //     computed column and takes the column operator tail
-    // Subquery on either side of a literal-LHS comparison is rejected
-    // — workaround is to write the column on the LHS.
-    if (isLiteralLhsTokenStart(p.cur.tag)) {
-        const lhs_val = try p.parseValue();
+    // `lit op @var` (e.g. `1 = @includeEstimates`) is a constant guard: the
+    // var resolves to a literal pre-compile, so both sides materialize as
+    // constant columns and the comparison keeps or drops every row.
+    if (isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus) {
+        const lhs = try p.parseAddSub();
+        const lhs_val = switch (lhs) {
+            .lit => |v| v,
+            else => return try parseExprOps(p, lhs),
+        };
         switch (p.cur.tag) {
             .kw_is => return .{ .always = try parseIsNullTail(p) },
             .kw_not, .kw_between, .kw_like, .kw_in => {
-                return try parseColOps(p, try p.materializePredicateExpr(.{ .lit = lhs_val }));
+                return try parseColOps(p, try p.materializePredicateExpr(lhs));
             },
             else => {},
         }
-        const op_lhs: PredicateOp = switch (p.cur.tag) {
-            .eq => .eq,
-            .neq => .neq,
-            .lt => .lt,
-            .lte => .lte,
-            .gt => .gt,
-            .gte => .gte,
-            else => return PE.SqlExpectedToken,
+        // A lone literal is truthiness, as a bare column is (`WHERE 1`).
+        if (isPredicateEnd(p.cur.tag)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
+        const op_lhs = try parseComparisonToken(p);
+        const rhs = try p.parseAddSub();
+        return switch (rhs) {
+            .col_ref => |col| .{ .leaf = .{ .col = col, .op = reverseOp(op_lhs), .val = lhs_val } },
+            .lit => |rhs_val| try literalComparison(p, lhs_val, op_lhs, rhs_val),
+            .null_lit => .unknown,
+            else => try makeExprComparisonPredicate(p, lhs, op_lhs, rhs),
         };
-        try p.advance();
-        if (p.cur.tag == .kw_null) {
-            try p.advance();
-            return .unknown;
-        }
-        if (p.cur.tag == .identifier and !isTypedLiteralKeyword(p.cur.text)) {
-            const col_dup = try parseQualifiedColRef(p);
-            return .{ .leaf = .{ .col = col_dup, .op = reverseOp(op_lhs), .val = lhs_val } };
-        }
-        if (isLiteralTokenStart(p.cur.tag, p.cur.text)) {
-            const rhs_val = try p.parseValue();
-            const result = compareLiterals(lhs_val, op_lhs, rhs_val) catch return PE.SqlExpectedValue;
-            return .{ .always = result };
-        }
-        // `lit op @var` (e.g. `1 = @includeEstimates`): a constant guard. Both
-        // sides materialize as constant columns — the var resolves to a literal
-        // in the pre-compile pass — so the comparison keeps or drops every row.
-        if (p.cur.tag == .at_identifier) {
-            const rhs_expr = try p.parseAddSub();
-            return try makeExprComparisonPredicate(p, .{ .lit = lhs_val }, op_lhs, rhs_expr);
-        }
-        return PE.SqlExpectedValue;
     }
     // `@var op X` — a session var on the LHS (constant guard, e.g.
     // `@comparisonMonths > 1`). Symmetric to the literal-LHS form above: the
@@ -257,7 +244,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         // `DATE_ADD(d, INTERVAL n DAY)` and its spellings aren't a plain
         // argument list, and never name an aggregate or window.
         if (p.scalarCallHasOwnSyntax(col_dup)) {
-            return try parseScalarCallOps(p, try p.parseScalarCallAfterName(col_dup));
+            return try parseExprOps(p, try p.parseScalarCallAfterName(col_dup));
         }
         var saw_distinct = false;
         const args = try p.parseCallArgList(&saw_distinct);
@@ -301,7 +288,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref) {
             return try makeDayComparison(p, args[0].col_ref);
         } else {
-            return try parseScalarCallOps(p, try p.makeScalarCallExpr(col_dup, args));
+            return try parseExprOps(p, try p.makeScalarCallExpr(col_dup, args));
         }
     }
 
@@ -315,9 +302,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     return try parseColOps(p, col_dup);
 }
 
-/// The operator tail after a scalar call on a predicate's left side.
-fn parseScalarCallOps(p: anytype, call: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
-    const lhs = try p.continueBinaryFrom(call);
+/// The operator tail after a scalar expression (a call, or arithmetic led by
+/// a literal) on a predicate's left side.
+fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const lhs = try p.continueBinaryFrom(expr);
     if (isComparisonToken(p.cur.tag)) {
         const op = try parseComparisonToken(p);
         const rhs = try p.parseAddSub();
@@ -330,8 +318,9 @@ fn parseScalarCallOps(p: anytype, call: ir.Expr) @TypeOf(p.*).Err!PredicateExpr 
             const anchored = try p.materializePredicateExpr(lhs);
             return try parseColOps(p, anchored);
         },
-        // Bare call = truthiness (`WHERE fn(x)`).
-        else => return try makeExprComparisonPredicate(p, lhs, .eq, .{ .lit = .{ .boolean = true } }),
+        // A bare expression is MySQL truthiness (`WHERE fn(x)`, `WHERE 1 + x`):
+        // non-zero and non-NULL, as for a bare column.
+        else => return try makeExprComparisonPredicate(p, lhs, .neq, .{ .lit = .{ .int = 0 } }),
     }
 }
 
@@ -494,7 +483,6 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     // captures the inner Op; a pre-compile pass runs it once and
     // rewrites this predicate node into a `.leaf` literal.
     if (p.cur.tag == .lparen) {
-        const saved = p.cur;
         try p.advance();
         if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
             const source = try p.parseStatement();
@@ -505,13 +493,11 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
                 .source = @ptrCast(source),
             } };
         }
-        // Not a subquery — restore the `(` token so parseValue sees a
-        // parenthesized literal. parseValue doesn't accept that today
-        // (literals are bare); surface the same error parseValue would.
-        const rhs_expr = try p.parseAddSub();
+        // A parenthesized group that leads a longer expression
+        // (`(a + b) * 2`) continues past its `)`.
+        const group = try p.parseAddSub();
         try p.expect(.rparen);
-        _ = saved;
-        return try makeComparisonExprPredicate(p, col_dup, op, rhs_expr);
+        return try makeComparisonExprPredicate(p, col_dup, op, try p.continueBinaryFrom(group));
     }
 
     // Session var on the RHS: `col op @name`. Build a leaf_var
@@ -531,8 +517,9 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         return .unknown;
     }
 
-    const val = try p.parseValue();
-    return .{ .leaf = .{ .col = col_dup, .op = op, .val = val } };
+    // A literal, or an expression a literal leads (`x > 1 + y`); a lone
+    // literal stays a plain leaf.
+    return try makeComparisonExprPredicate(p, col_dup, op, try p.parseAddSub());
 }
 
 fn makeScalarExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
@@ -634,8 +621,12 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
             else => {},
         }
     }
-    if (!saw_arithmetic and !case_start) return false;
     const op_tok = try look.next();
+    // A group that leads longer arithmetic (`(a + b) * 2 > x`) is a scalar
+    // operand whatever it holds: no predicate grammar continues a boolean
+    // group with arithmetic.
+    if (isArithToken(op_tok.tag)) return true;
+    if (!saw_arithmetic and !case_start) return false;
     return isComparisonToken(op_tok.tag) or switch (op_tok.tag) {
         // `(expr) BETWEEN/IN/IS/LIKE/NOT ...` — the group anchors to a
         // hidden computed column and takes the normal operator tail.
@@ -646,8 +637,9 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
 
 fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     try p.expect(.lparen);
-    const lhs = try p.parseAddSub();
+    const group = try p.parseAddSub();
     try p.expect(.rparen);
+    const lhs = try p.continueBinaryFrom(group);
     if (isComparisonToken(p.cur.tag)) {
         const op = try parseComparisonToken(p);
         const rhs = try p.parseAddSub();
@@ -755,14 +747,6 @@ fn isTypedLiteralKeyword(s: []const u8) bool {
         std.ascii.eqlIgnoreCase(s, "timestamp");
 }
 
-fn isLiteralTokenStart(tag: anytype, text: []const u8) bool {
-    return switch (tag) {
-        .integer, .floating, .string, .kw_true, .kw_false => true,
-        .identifier => isTypedLiteralKeyword(text),
-        else => false,
-    };
-}
-
 fn isLiteralLhsTokenStart(tag: anytype) bool {
     return switch (tag) {
         .integer, .floating, .string, .kw_true, .kw_false => true,
@@ -784,6 +768,13 @@ fn reverseOp(op: PredicateOp) PredicateOp {
 /// Compile-time comparison of two literal Values. Both sides must
 /// share the same active tag (no widening). Returns error.Invalid on
 /// any mismatch — the caller surfaces it as a parse error.
+/// `lit op lit`: a constant when both literals share a type; otherwise the
+/// engine's comparison coercion decides (`1 = 1.0`, `2.5 > 1`).
+fn literalComparison(p: anytype, lhs: Value, op: PredicateOp, rhs: Value) @TypeOf(p.*).Err!PredicateExpr {
+    if (compareLiterals(lhs, op, rhs)) |result| return .{ .always = result } else |_| {}
+    return try makeExprComparisonPredicate(p, .{ .lit = lhs }, op, .{ .lit = rhs });
+}
+
 fn compareLiterals(a: Value, op: PredicateOp, b: Value) !bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return error.Invalid;
     const order = a.compare(b);
