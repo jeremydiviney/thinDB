@@ -401,6 +401,47 @@ test "qualified col: aliased col in ORDER BY" {
     try std.testing.expectEqualSlices(i64, &.{ 3, 2, 1 }, ids);
 }
 
+test "an unaliased join input is qualified by its own name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupOrders(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    // `u` shares both of `t`'s column names.
+    try exec(allocator, db, "CREATE TABLE u (id BIGINT PRIMARY KEY, qty BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO u (id, qty) VALUES (1, 100), (2, 200), (3, 300)");
+
+    const cases = .{
+        .{ "SELECT u.qty FROM t JOIN u ON t.id = u.id ORDER BY u.id", &[_]i64{ 100, 200, 300 } },
+        .{ "SELECT U.qty FROM t JOIN U ON t.id = U.id ORDER BY U.id", &[_]i64{ 100, 200, 300 } },
+        .{ "SELECT SUM(u.qty) FROM t JOIN u ON t.id = u.id", &[_]i64{600} },
+        .{ "SELECT u.qty FROM t JOIN u ON t.id = u.id WHERE u.qty > 150 ORDER BY u.qty", &[_]i64{ 200, 300 } },
+        .{ "SELECT u.qty FROM t LEFT JOIN u ON t.id = u.id ORDER BY t.id", &[_]i64{ 100, 200, 300 } },
+        .{ "SELECT u.qty FROM t CROSS JOIN u WHERE t.id = 1 ORDER BY u.qty", &[_]i64{ 100, 200, 300 } },
+        .{ "SELECT u.id + u.qty FROM t JOIN u ON t.qty * 10 = u.qty ORDER BY u.id", &[_]i64{ 101, 202, 303 } },
+        .{ "WITH c1 AS (SELECT id, qty FROM t), c2 AS (SELECT id, qty FROM u) SELECT c2.qty FROM c1 JOIN c2 ON c1.id = c2.id ORDER BY c2.qty", &[_]i64{ 100, 200, 300 } },
+        .{ "WITH c2 AS (SELECT id, qty FROM u) SELECT c2.qty FROM t JOIN c2 ON t.id = c2.id ORDER BY c2.qty", &[_]i64{ 100, 200, 300 } },
+        .{ "SELECT u.qty, o.oid FROM t JOIN o ON t.id = o.tid JOIN u ON u.id = t.id ORDER BY o.oid", &[_]i64{ 100, 100, 300 } },
+        // `t.*` names `t`'s columns only.
+        .{ "SELECT t.* FROM t JOIN o ON t.id = o.tid ORDER BY o.oid", &[_]i64{ 1, 1, 3 } },
+        .{ "SELECT u.*, t.qty FROM t JOIN u ON t.id = u.id ORDER BY u.id", &[_]i64{ 1, 2, 3 } },
+        .{ "WITH c AS (SELECT id FROM t) SELECT c.*, o.oid FROM c JOIN o ON c.id = o.tid ORDER BY o.oid", &[_]i64{ 1, 1, 3 } },
+        // A lone unaliased source's `name.*` is `*`.
+        .{ "WITH c AS (SELECT id, qty FROM t) SELECT c.* FROM c ORDER BY c.id", &[_]i64{ 1, 2, 3 } },
+        .{ "WITH c AS (SELECT id, qty FROM t) SELECT c.*, c.id AS k FROM c WHERE c.qty > 15 ORDER BY c.id", &[_]i64{ 2, 3 } },
+        .{ "WITH c AS (SELECT id, SUM(qty) AS s FROM t GROUP BY id) SELECT c.* FROM c ORDER BY c.id", &[_]i64{ 1, 2, 3 } },
+        .{ "WITH c AS (SELECT id FROM t), d AS (SELECT * FROM c) SELECT d.* FROM d ORDER BY d.id", &[_]i64{ 1, 2, 3 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    // A bare column both inputs expose names neither.
+    try std.testing.expectError(error.ColumnNotFound, helpers.runSql(allocator, db, "SELECT qty FROM t JOIN u ON t.id = u.id"));
+}
+
 test "qualified refs in a single-table block name its one table" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
