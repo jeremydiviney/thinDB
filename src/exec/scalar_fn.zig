@@ -46,6 +46,7 @@ const udf_mod = @import("../udf.zig");
 const string = @import("scalar_fn_string.zig");
 const math = @import("scalar_fn_math.zig");
 const date = @import("scalar_fn_date.zig");
+const datefmt = @import("scalar_fn_datefmt.zig");
 const cond = @import("scalar_fn_cond.zig");
 const dec = @import("scalar_fn_decimal.zig");
 const json = @import("scalar_fn_json.zig");
@@ -780,6 +781,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "pi", .arg_types = &.{}, .return_type = .double, .kernel = math.piKernel },
     .{ .name = "rand", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
     .{ .name = "random", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
+    .{ .name = "uuid", .arg_types = &.{.bigint}, .return_type = .string, .volatility = .@"volatile", .kernel = string.uuidKernel },
     // Integer MOD resolves in `resolveIntArith`. A floating operand on either
     // side: MySQL MOD keeps the dividend's sign (fmod), same as `%`.
     .{ .name = "mod", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.modDoubleKernel },
@@ -907,6 +909,21 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "last_day", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.lastDayFromDatetimeKernel },
     .{ .name = "date_format", .arg_types = &.{ .datetime, .string }, .return_type = .string, .kernel = date.dateFormatDatetimeKernel },
     .{ .name = "date_format", .arg_types = &.{ .date, .string }, .return_type = .string, .kernel = date.dateFormatDateKernel },
+    .{ .name = "str_to_date", .arg_types = &.{ .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = datefmt.strToDateKernel },
+    .{ .name = "week", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.weekKernel(.date) },
+    .{ .name = "week", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.weekKernel(.datetime) },
+    .{ .name = "week", .arg_types = &.{ .date, .int }, .return_type = .int, .kernel = datefmt.weekKernel(.date) },
+    .{ .name = "week", .arg_types = &.{ .datetime, .int }, .return_type = .int, .kernel = datefmt.weekKernel(.datetime) },
+    .{ .name = "yearweek", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.yearWeekKernel(.date) },
+    .{ .name = "yearweek", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.yearWeekKernel(.datetime) },
+    .{ .name = "yearweek", .arg_types = &.{ .date, .int }, .return_type = .int, .kernel = datefmt.yearWeekKernel(.date) },
+    .{ .name = "yearweek", .arg_types = &.{ .datetime, .int }, .return_type = .int, .kernel = datefmt.yearWeekKernel(.datetime) },
+    .{ .name = "weekofyear", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.weekOfYearKernel(.date) },
+    .{ .name = "weekofyear", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.weekOfYearKernel(.datetime) },
+    .{ .name = "weekday", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.weekdayKernel(.date) },
+    .{ .name = "weekday", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.weekdayKernel(.datetime) },
+    .{ .name = "microsecond", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.microsecondKernel(.date) },
+    .{ .name = "microsecond", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.microsecondKernel(.datetime) },
     // --- conversion ---
     // Numeric widening (int → bigint → double): always succeeds.
     .{ .name = "to_int", .arg_types = &.{.int}, .return_type = .int, .kernel = math.intIdentityKernel },

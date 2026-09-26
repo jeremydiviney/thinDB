@@ -167,6 +167,29 @@ pub fn trimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     }
 }
 
+var uuid_stream_counter = std.atomic.Value(u64).init(0);
+
+/// UUID(seed): random (version 4) UUIDs, as StarRocks and DuckDB return.
+/// The compile pass supplies a fresh `seed` per statement; the counter gives
+/// every batch its own stream under it.
+pub fn uuidKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    var key: [std.Random.DefaultCsprng.secret_seed_length]u8 = @splat(0);
+    std.mem.writeInt(i64, key[0..8], args[0].data.bigint[0], .little);
+    std.mem.writeInt(u64, key[8..16], uuid_stream_counter.fetchAdd(1, .monotonic), .little);
+    var csprng = std.Random.DefaultCsprng.init(key);
+    const ss = stringStoreOf(out);
+    for (0..row_count) |_| {
+        var bytes: [16]u8 = undefined;
+        csprng.fill(&bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = std.fmt.bytesToHex(bytes, .lower);
+        const text = hex[0..8] ++ "-" ++ hex[8..12] ++ "-" ++ hex[12..16] ++ "-" ++ hex[16..20] ++ "-" ++ hex[20..32];
+        try ss.appendValue(allocator, text);
+    }
+}
+
 pub fn reverseKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     const ss = stringStoreOf(out);

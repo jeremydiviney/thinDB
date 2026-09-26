@@ -203,6 +203,16 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                     e.* = .{ .lit = .{ .date = @intCast(@divFloor(ctx.now_micros, std.time.us_per_day)) } };
                     return;
                 }
+                if (std.ascii.eqlIgnoreCase(c.fn_name, "uuid")) {
+                    // Kernels carry no Io, so UUID() takes its entropy as a
+                    // fresh per-statement seed from the database's.
+                    var seed: [8]u8 = undefined;
+                    ctx.db.io.random(&seed);
+                    const args = try (try ctx.subqueryArena()).alloc(ir.Expr, 1);
+                    args[0] = .{ .lit = .{ .bigint = std.mem.readInt(i64, &seed, .little) } };
+                    e.* = .{ .call = .{ .fn_name = c.fn_name, .args = args } };
+                    return;
+                }
             }
             for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg), lowered);
         },

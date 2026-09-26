@@ -47,6 +47,7 @@ const Value = types.Value;
 const exec_expr = @import("../exec/expr.zig");
 const exec_predicate = @import("../exec/predicate.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
+const datefmt = @import("../exec/scalar_fn_datefmt.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
@@ -1878,6 +1879,15 @@ pub const Parser = struct {
                 .args = normalized,
             } };
         }
+        if (std.ascii.eqlIgnoreCase(name, "str_to_date") and args.len == 2 and args[1] == .lit and args[1].lit == .text and
+            !datefmt.formatHasTimePart(args[1].lit.text))
+        {
+            // MySQL types STR_TO_DATE by its format: a constant format that
+            // names no time of day yields a DATE.
+            const inner = try self.arena.alloc(ir.Expr, 1);
+            inner[0] = .{ .call = .{ .fn_name = try self.arena.dupe(u8, "str_to_date"), .args = try self.arena.dupe(ir.Expr, args) } };
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "to_date"), .args = inner } };
+        }
         return ir.Expr{ .call = .{
             .fn_name = try self.arena.dupe(u8, name),
             .args = try self.normalizeScalarCallArgs(name, args),
@@ -2388,20 +2398,12 @@ pub const Parser = struct {
         try self.expect(.lparen);
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const field = self.cur.text;
-        const fn_name: []const u8 = if (std.ascii.eqlIgnoreCase(field, "year"))
-            "year"
-        else if (std.ascii.eqlIgnoreCase(field, "month"))
-            "month"
-        else if (std.ascii.eqlIgnoreCase(field, "day"))
-            "day"
-        else if (std.ascii.eqlIgnoreCase(field, "hour"))
-            "hour"
-        else if (std.ascii.eqlIgnoreCase(field, "minute"))
-            "minute"
-        else if (std.ascii.eqlIgnoreCase(field, "second"))
-            "second"
-        else
-            return ParseError.SqlExpectedKeyword;
+        // MySQL's units, plus DAYOFYEAR, which every engine that accepts it
+        // numbers the same way. WEEK is WEEK(d), mode 0, as in MySQL.
+        const fields = [_][]const u8{ "year", "quarter", "month", "week", "day", "dayofyear", "hour", "minute", "second", "microsecond" };
+        const fn_name: []const u8 = for (fields) |f| {
+            if (std.ascii.eqlIgnoreCase(field, f)) break f;
+        } else return ParseError.SqlExpectedKeyword;
         try self.advance();
         if (self.cur.tag != .kw_from) return ParseError.SqlExpectedFrom;
         try self.advance();
