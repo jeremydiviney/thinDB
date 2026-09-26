@@ -179,3 +179,36 @@ test "correlated EXISTS: multi-key correlation" {
     const batch = (try q.next()).?;
     try std.testing.expectEqual(@as(i64, 2), batch.values[0].data.bigint[0]);
 }
+
+test "correlated subqueries: SELECT 1 / SELECT * and refs qualified by the inner table's name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM lineitem WHERE l_orderid = o_id) ORDER BY o_id", &[_]i64{ 1, 2, 4 } },
+        .{ "SELECT x.o_id FROM orders x WHERE EXISTS (SELECT 1 FROM lineitem AS p WHERE p.l_orderid = x.o_id) ORDER BY x.o_id", &[_]i64{ 1, 2, 4 } },
+        .{ "SELECT o_id FROM orders WHERE EXISTS (SELECT * FROM lineitem WHERE lineitem.l_orderid = orders.o_id) ORDER BY o_id", &[_]i64{ 1, 2, 4 } },
+        .{ "SELECT x.o_id FROM orders x WHERE EXISTS (SELECT lineitem.l_id FROM lineitem WHERE lineitem.l_orderid = x.o_id) ORDER BY x.o_id", &[_]i64{ 1, 2, 4 } },
+        .{ "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM LineItem WHERE LineItem.l_orderid = orders.o_id) ORDER BY o_id", &[_]i64{ 1, 2, 4 } },
+        .{ "SELECT orders.o_id FROM orders WHERE NOT EXISTS (SELECT 1 FROM lineitem WHERE lineitem.l_orderid = orders.o_id)", &[_]i64{3} },
+        .{ "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM lineitem WHERE lineitem.l_orderid = orders.o_id AND lineitem.l_qty >= 50) ORDER BY o_id", &[_]i64{ 2, 4 } },
+        .{ "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM lineitem WHERE lineitem.l_qty > orders.o_total) ORDER BY o_id", &[_]i64{1} },
+        .{ "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM lineitem WHERE l_qty > 100) ORDER BY o_id", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT o_id FROM orders WHERE EXISTS (SELECT 1 FROM lineitem WHERE l_qty > 1000) ORDER BY o_id", &[_]i64{} },
+        .{ "SELECT o_id FROM orders WHERE o_id IN (SELECT l_orderid FROM lineitem WHERE l_id = o_id) ORDER BY o_id", &[_]i64{ 1, 4 } },
+        .{ "SELECT x.o_id FROM orders x WHERE x.o_id IN (SELECT p.l_orderid FROM lineitem p WHERE p.l_id = x.o_id) ORDER BY x.o_id", &[_]i64{ 1, 4 } },
+        .{ "SELECT o_id FROM orders WHERE o_id IN (SELECT l_orderid FROM lineitem WHERE lineitem.l_id = orders.o_id) ORDER BY o_id", &[_]i64{ 1, 4 } },
+        .{ "SELECT o_id FROM orders WHERE o_id IN (SELECT lineitem.l_orderid FROM lineitem WHERE lineitem.l_id = orders.o_id) ORDER BY o_id", &[_]i64{ 1, 4 } },
+        .{ "SELECT o_id FROM orders WHERE o_id NOT IN (SELECT l_orderid FROM lineitem WHERE l_id = o_id) ORDER BY o_id", &[_]i64{ 2, 3 } },
+        .{ "SELECT CASE WHEN EXISTS (SELECT 1 FROM lineitem WHERE lineitem.l_orderid = orders.o_id) THEN o_id ELSE 0 END AS f FROM orders ORDER BY o_id", &[_]i64{ 1, 2, 0, 4 } },
+        .{ "SELECT o_id FROM orders WHERE o_id = (SELECT MIN(lineitem.l_id) FROM lineitem WHERE lineitem.l_orderid = orders.o_id) ORDER BY o_id", &[_]i64{ 1, 4 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}
