@@ -87,7 +87,7 @@ fn verify(allocator: std.mem.Allocator, db: anytype, segments: []const Segment) 
                 if (id >= seg.base and id < seg.base + seg.rows) i = id - seg.base;
             }
             try std.testing.expectEqual(runsFor(i), batch.values[1].data.bigint[j]);
-            try std.testing.expectEqual(flagFor(i), @as(i64, batch.values[2].data.smallint[j]));
+            try std.testing.expectEqual(flagFor(i), @as(i64, batch.values[2].data.tinyint[j]));
             try std.testing.expectEqual(altFor(i), @as(i64, batch.values[3].data.int[j]));
             if (runsNullValid(i)) {
                 try std.testing.expect(batch.values[4].isValid(j));
