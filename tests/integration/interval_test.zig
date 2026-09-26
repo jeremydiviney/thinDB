@@ -306,3 +306,88 @@ test "calendar functions work before 1970" {
     defer allocator.free(day_match);
     try std.testing.expectEqualSlices(i64, &.{2}, day_match);
 }
+
+test "DATE_FORMAT, STR_TO_DATE and the week functions match MySQL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE w (id BIGINT PRIMARY KEY, ts DATETIME NOT NULL)");
+    try exec(allocator, db, "INSERT INTO w (id, ts) VALUES (1, '2024-03-05 14:07:09.25'), (2, '1965-12-31 00:30:00'), (3, '2021-01-03 12:00:59.000001')");
+
+    // Every value below is MySQL 8.4's.
+    const formatted = try helpers.collectStrings(allocator, db, "SELECT DATE_FORMAT(ts, '%M %e, %Y %r %D %j %a %W %b %c %f %h %I %l %k %p %T %U %u %V %v %w %X %x %y %%') FROM w ORDER BY id");
+    defer helpers.freeStrings(allocator, formatted);
+    const want_formatted = [_][]const u8{
+        "March 5, 2024 02:07:09 PM 5th 065 Tue Tuesday Mar 3 250000 02 02 2 14 PM 14:07:09 09 10 09 10 2 2024 2024 24 %",
+        "December 31, 1965 12:30:00 AM 31st 365 Fri Friday Dec 12 000000 12 12 12 0 AM 00:30:00 52 52 52 52 5 1965 1965 65 %",
+        "January 3, 2021 12:00:59 PM 3rd 003 Sun Sunday Jan 1 000001 12 12 12 12 PM 12:00:59 01 00 01 53 0 2021 2020 21 %",
+    };
+    try std.testing.expectEqual(want_formatted.len, formatted.len);
+    for (want_formatted, formatted) |want, got| try std.testing.expectEqualStrings(want, got.?);
+
+    const int_cases = .{
+        .{ "WEEK(ts)", [_]i64{ 9, 52, 1 } },
+        .{ "WEEK(ts, 3)", [_]i64{ 10, 52, 53 } },
+        .{ "YEARWEEK(ts)", [_]i64{ 202409, 196552, 202101 } },
+        .{ "YEARWEEK(ts, 1)", [_]i64{ 202410, 196552, 202053 } },
+        .{ "WEEKOFYEAR(ts)", [_]i64{ 10, 52, 53 } },
+        .{ "WEEKDAY(ts)", [_]i64{ 1, 4, 6 } },
+        .{ "MICROSECOND(ts)", [_]i64{ 250000, 0, 1 } },
+        .{ "EXTRACT(QUARTER FROM ts)", [_]i64{ 1, 4, 1 } },
+        .{ "EXTRACT(WEEK FROM ts)", [_]i64{ 9, 52, 1 } },
+        .{ "EXTRACT(DAYOFYEAR FROM ts)", [_]i64{ 65, 365, 3 } },
+        .{ "EXTRACT(MICROSECOND FROM ts)", [_]i64{ 250000, 0, 1 } },
+    };
+    inline for (int_cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS BIGINT) FROM w ORDER BY id");
+        defer allocator.free(got);
+        const want: [3]i64 = c[1];
+        std.testing.expectEqualSlices(i64, &want, got) catch |err| {
+            std.debug.print("expr: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    // A format that names no time of day yields a DATE; one that does, a
+    // DATETIME. Text that does not match, or names no real date, is NULL.
+    const parse_cases = .{
+        .{ "STR_TO_DATE('March 5, 2024', '%M %e, %Y')", "2024-03-05" },
+        .{ "STR_TO_DATE('Tue 5th Mar 2024', '%a %D %b %Y')", "2024-03-05" },
+        .{ "STR_TO_DATE(' 2024- 3-5', '%Y-%m-%d')", "2024-03-05" },
+        .{ "STR_TO_DATE('2024-03-05trailing', '%Y-%m-%d')", "2024-03-05" },
+        .{ "STR_TO_DATE('200442 Monday', '%X%V %W')", "2004-10-18" },
+        .{ "STR_TO_DATE('2024 065', '%Y %j')", "2024-03-05" },
+        .{ "STR_TO_DATE('Sept 5 2024', '%M %e %Y')", "2024-09-05" },
+        .{ "STR_TO_DATE('05/03/24 2:07:09 PM', '%d/%m/%y %r')", "2024-03-05 14:07:09" },
+        .{ "STR_TO_DATE('12:30 AM 2024-01-02', '%h:%i %p %Y-%m-%d')", "2024-01-02 00:30:00" },
+        .{ "STR_TO_DATE('2024-3-5 7', '%Y-%m-%d %H')", "2024-03-05 07:00:00" },
+        .{ "DATE_FORMAT(STR_TO_DATE('2024-03-05 14:07:09.25', '%Y-%m-%d %H:%i:%s.%f'), '%Y-%m-%d %T.%f')", "2024-03-05 14:07:09.250000" },
+        .{ "STR_TO_DATE('2024-02-30', '%Y-%m-%d')", null },
+        .{ "STR_TO_DATE('abc', '%Y')", null },
+        .{ "STR_TO_DATE('Ma 5 2024', '%M %e %Y')", null },
+        .{ "STR_TO_DATE('13:00 PM 2024-01-02', '%h:%i %p %Y-%m-%d')", null },
+    };
+    inline for (parse_cases) |c| {
+        const got = try helpers.collectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM w WHERE id = 1");
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        const want: ?[]const u8 = c[1];
+        (if (want) |w| std.testing.expectEqualStrings(w, got[0] orelse "NULL") else std.testing.expectEqual(@as(?[]u8, null), got[0])) catch |err| {
+            std.debug.print("expr: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    const uuids = try helpers.collectStrings(allocator, db, "SELECT UUID() FROM w ORDER BY id");
+    defer helpers.freeStrings(allocator, uuids);
+    try std.testing.expectEqual(@as(usize, 3), uuids.len);
+    for (uuids, 0..) |u, i| {
+        const text = u.?;
+        try std.testing.expectEqual(@as(usize, 36), text.len);
+        try std.testing.expectEqual(@as(u8, '4'), text[14]);
+        for (uuids[0..i]) |earlier| try std.testing.expect(!std.mem.eql(u8, earlier.?, text));
+    }
+}
