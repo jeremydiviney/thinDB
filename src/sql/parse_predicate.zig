@@ -220,7 +220,9 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         }
         return try makeExprComparisonPredicate(p, lhs_expr, .neq, .{ .lit = .{ .int = 0 } });
     }
-    if (p.keywordCallAhead()) return try parseExprOps(p, try p.parseCallAtom());
+    // A CASE expression or a keyword-named call (`IF(...)`) can only be a
+    // scalar operand here.
+    if (p.cur.tag == .kw_case or p.keywordCallAhead()) return try parseExprOps(p, try p.parseCallAtom());
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     var col_dup = try parseQualifiedColRef(p);
 
@@ -488,6 +490,12 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
             const source = try p.parseStatement();
             try p.expect(.rparen);
+            // `col > (SELECT ...) - 1`: the subquery is one operand of a
+            // longer expression, compared like any other.
+            if (isArithToken(p.cur.tag)) {
+                const rhs = try p.continueBinaryFrom(.{ .scalar_subquery = @ptrCast(source) });
+                return try makeComparisonExprPredicate(p, col_dup, op, rhs);
+            }
             return .{ .scalar_subquery = .{
                 .col = col_dup,
                 .op = op,

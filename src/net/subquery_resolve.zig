@@ -42,6 +42,7 @@ const storage = @import("../storage/storage.zig");
 const ir = @import("../ir/ir.zig");
 
 const local = @import("local.zig");
+const wire_format = @import("wire_format.zig");
 const CompileCtx = local.CompileCtx;
 const Error = local.Error;
 
@@ -128,7 +129,7 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
         .scalar_subquery => |sq| {
             if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
             pred.* = switch (try runScalarSubquery(ctx, sq.source)) {
-                .value => |val| .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } },
+                .value => |tv| .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = try comparableValue(try ctx.subqueryArena(), tv) } },
                 .null_of => .unknown,
             };
         },
@@ -219,7 +220,7 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                 return;
             };
             e.* = switch (try runScalarSubquery(ctx, opaque_ptr)) {
-                .value => |val| .{ .lit = val },
+                .value => |tv| try valueExpr(try ctx.subqueryArena(), tv),
                 .null_of => |ty| .{ .null_lit = ty },
             };
         },
@@ -284,8 +285,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
         while (i < batch.row_count) : (i += 1) {
             if (!view.isValid(i)) continue;
             if (acct) |a| try a.reserve(.subquery, per_value);
-            const v = try extractScalarValueAt(aa, view, i);
-            try out.append(aa, v);
+            try out.append(aa, try extractKeyValueAt(aa, view, schema[0].type, i));
         }
     }
     return try out.toOwnedSlice(aa);
@@ -294,9 +294,39 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
 /// A scalar subquery's result: its one value, or SQL NULL of its column
 /// type when that value is NULL or the subquery returns no rows.
 const ScalarResult = union(enum) {
-    value: Value,
+    value: TypedValue,
     null_of: types.Type,
 };
+
+/// A decimal `Value` carries only its mantissa, so a subquery value keeps
+/// its column type until it reaches a consumer that can place it.
+const TypedValue = struct {
+    val: Value,
+    ty: types.Type,
+};
+
+/// The value as a predicate literal. A decimal travels as its exact digits:
+/// validation parses numeric text onto the compared column's own scale.
+fn comparableValue(arena: Allocator, tv: TypedValue) !Value {
+    const mantissa: i128 = switch (tv.val) {
+        .decimal64 => |m| m,
+        .decimal128 => |m| m,
+        else => return tv.val,
+    };
+    var text: std.ArrayList(u8) = .empty;
+    try wire_format.formatDecimal(arena, &text, mantissa, tv.ty);
+    return .{ .text = try text.toOwnedSlice(arena) };
+}
+
+/// The value as an expression: a decimal re-enters through a cast of its
+/// exact digits to its own type, since a bare decimal literal has no scale.
+fn valueExpr(arena: Allocator, tv: TypedValue) !ir.Expr {
+    if (!tv.ty.isDecimal()) return .{ .lit = tv.val };
+    const args = try arena.alloc(ir.Expr, 1);
+    args[0] = .{ .lit = try comparableValue(arena, tv) };
+    const fn_name = (try exec.scalar_fn.castFnName(arena, tv.ty)) orelse return Error.TypeMismatch;
+    return .{ .call = .{ .fn_name = fn_name, .args = args } };
+}
 
 /// Compile + drain an inner Op of one column and at most one row.
 /// More rows or columns → error.
@@ -324,7 +354,7 @@ fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !ScalarR
 
     const view = first_batch.values[0];
     if (!view.isValid(0)) return .{ .null_of = schema[0].type };
-    return .{ .value = try extractScalarValue(try ctx.subqueryArena(), view) };
+    return .{ .value = .{ .val = try extractScalarValue(try ctx.subqueryArena(), view), .ty = schema[0].type } };
 }
 
 fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
@@ -347,6 +377,12 @@ fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
         .char => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
         .json => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
     };
+}
+
+/// A correlation key or IN value as a predicate literal: validation brings
+/// it to the outer column's type (see `comparableValue`).
+fn extractKeyValueAt(allocator: Allocator, view: storage.ColumnView, ty: types.Type, idx: usize) !Value {
+    return comparableValue(allocator, .{ .val = try extractScalarValueAt(allocator, view, idx), .ty = ty });
 }
 
 fn extractScalarValueAt(allocator: Allocator, view: storage.ColumnView, idx: usize) !Value {
@@ -665,7 +701,7 @@ fn maybeResolveCorrelatedExists(
                     has_null = true;
                     break;
                 }
-                tuple[j] = try extractScalarValueAt(aa, view, i);
+                tuple[j] = try extractKeyValueAt(aa, view, q.outputSchema()[j].type, i);
             }
             // Drop NULL-containing tuples — dialect mirrors NOT IN.
             if (has_null) continue;
@@ -756,7 +792,7 @@ fn resolveCorrelatedExistsRange(
                     any_null = true;
                     break;
                 }
-                key[j] = try extractScalarValueAt(aa, view, i);
+                key[j] = try extractKeyValueAt(aa, view, q.outputSchema()[1 + j].type, i);
             }
             if (any_null) continue;
             const v = try extractScalarValueAt(aa, range_view, i);
@@ -879,7 +915,7 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
                     has_null = true;
                     break;
                 }
-                tuple[j] = try extractScalarValueAt(aa, view, i);
+                tuple[j] = try extractKeyValueAt(aa, view, q.outputSchema()[j].type, i);
             }
             if (has_null) continue;
             try rows.append(aa, tuple);
@@ -1266,7 +1302,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
                     any_null = true;
                     break;
                 }
-                key[j] = try extractScalarValueAt(aa, view, i);
+                key[j] = try extractKeyValueAt(aa, view, schema[j].type, i);
             }
             if (any_null) continue;
             const agg_view = batch.values[agg_col_idx];
@@ -1282,6 +1318,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
         .op = sq.op,
         .outer_keys = outer_keys_owned,
         .rows = rows_owned,
+        .value_type = schema[agg_col_idx].type,
     } };
     return true;
 }

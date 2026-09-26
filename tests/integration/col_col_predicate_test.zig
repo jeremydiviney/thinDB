@@ -93,7 +93,7 @@ test "col op col: composes with AND on a col-vs-literal predicate" {
     try std.testing.expectEqualSlices(i64, &.{5}, ids);
 }
 
-test "col op col: rejected when type tags differ" {
+test "col op col: rejected when the kinds never compare" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -103,14 +103,14 @@ test "col op col: rejected when type tags differ" {
     try exec(
         allocator,
         db,
-        "CREATE TABLE m (id BIGINT PRIMARY KEY, name VARCHAR(8) NOT NULL, qty INT NOT NULL)",
+        "CREATE TABLE m (id BIGINT PRIMARY KEY, day DATE NOT NULL, qty INT NOT NULL)",
     );
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = try thindb.sql.parse(
         arena.allocator(),
-        "SELECT id FROM m WHERE qty = name",
+        "SELECT id FROM m WHERE qty = day",
     );
     const cq = thindb.net.compile(allocator, db, root);
     if (cq) |ok| {

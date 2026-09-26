@@ -1252,8 +1252,8 @@ fn tryFuseScalar(aa: Allocator, expr: Expr, up_schema: []const Column) !?FusedSc
     var arg_types: [2]Type = undefined;
     const lit_idx: usize = if (col_left) 1 else 0;
     arg_types[1 - lit_idx] = src_type;
-    arg_types[lit_idx] = literalType(lit_v);
-    arg_types[lit_idx] = literalType(scalar_fn.arithOperandLiteral(c.fn_name, &arg_types, lit_v));
+    arg_types[lit_idx] = try literalType(lit_v);
+    arg_types[lit_idx] = try literalType(scalar_fn.arithOperandLiteral(c.fn_name, &arg_types, lit_v));
     const r = (try scalar_fn.resolve(aa, c.fn_name, &arg_types)) orelse return null;
     const out_type = r.func.return_type;
 
@@ -1564,12 +1564,12 @@ fn resolveDerived(
             const slot = try aa.create(LitSlot);
             slot.* = .{
                 .value = v,
-                .ty = literalType(v),
-                .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
+                .ty = try literalType(v),
+                .buf = try ColumnStore.init(runtime_allocator, try literalType(v), false),
             };
             return .{
                 .name = name,
-                .output_type = literalType(v),
+                .output_type = try literalType(v),
                 .stat_class = .{ .literal = intFamilyValueI128(v) },
                 .kind = .{ .lit_only = slot },
             };
@@ -1825,8 +1825,8 @@ fn buildBranchSrc(
             const slot = try aa.create(LitSlot);
             slot.* = .{
                 .value = v,
-                .ty = literalType(v),
-                .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
+                .ty = try literalType(v),
+                .buf = try ColumnStore.init(runtime_allocator, try literalType(v), false),
             };
             break :blk BranchSrc{ .lit = slot };
         },
@@ -1937,11 +1937,11 @@ fn buildCallPlan(
                 const slot = try aa.create(LitSlot);
                 slot.* = .{
                     .value = v,
-                    .ty = literalType(v),
-                    .buf = try ColumnStore.init(runtime_allocator, literalType(v), false),
+                    .ty = try literalType(v),
+                    .buf = try ColumnStore.init(runtime_allocator, try literalType(v), false),
                 };
                 arg_plans[i] = .{ .lit = slot };
-                arg_types[i] = literalType(v);
+                arg_types[i] = try literalType(v);
             },
             .null_lit => |ty| {
                 const slot = try aa.create(NullSlot);
@@ -1975,9 +1975,9 @@ fn buildCallPlan(
         const slot = ap.lit;
         const typed = scalar_fn.arithOperandLiteral(c.fn_name, arg_types, slot.value);
         if (std.meta.activeTag(typed) == std.meta.activeTag(slot.value)) continue;
-        replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, literalType(typed), false));
+        replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, try literalType(typed), false));
         slot.value = typed;
-        slot.ty = literalType(typed);
+        slot.ty = try literalType(typed);
         at.* = slot.ty;
     }
 
@@ -2139,10 +2139,10 @@ fn coerceTemporalStringLiterals(
             if (declared != .date and declared != .datetime) continue;
             const new_val = litTemporalValue(arg_plans[i], declared) orelse continue;
             const slot = arg_plans[i].lit;
-            replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, literalType(new_val), false));
+            replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, try literalType(new_val), false));
             slot.value = new_val;
-            slot.ty = literalType(new_val);
-            at.* = literalType(new_val);
+            slot.ty = try literalType(new_val);
+            at.* = try literalType(new_val);
         }
         return true;
     }
@@ -2224,7 +2224,7 @@ fn freeResolvedDerived(runtime_allocator: Allocator, r: ResolvedDerived) void {
 /// the active union tag — int literals stay int (not promoted to bigint);
 /// promotion happens via the existing implicit-cast machinery if the
 /// resolved overload requires it.
-fn literalType(v: types.Value) Type {
+fn literalType(v: types.Value) Error!Type {
     return switch (v) {
         .int => .int,
         .bigint => .bigint,
@@ -2239,8 +2239,8 @@ fn literalType(v: types.Value) Type {
         .datetime => .datetime,
         // Decimal Values carry just the raw int payload (no precision/
         // scale). Compute can't materialize a typed decimal column
-        // without those — caller must explicitly cast / project.
-        .decimal64, .decimal128 => @panic("Compute: decimal literal args not supported"),
+        // without those — the producer must cast to the decimal type.
+        .decimal64, .decimal128 => Error.TypeMismatch,
         .uuid => .uuid,
     };
 }
