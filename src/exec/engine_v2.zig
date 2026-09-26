@@ -1583,7 +1583,7 @@ fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: Gl
     return q;
 }
 
-fn resolveTable(db: *api.Database, session: api.Session, ref: ir.TableRef) !*api.Table {
+pub fn resolveTable(db: *api.Database, session: api.Session, ref: ir.TableRef) !*api.Table {
     if (ref.database == null and ref.schema == null) {
         if (session.temp_namespace) |ns| {
             if (ns.findTable(ref.name)) |t| return t;

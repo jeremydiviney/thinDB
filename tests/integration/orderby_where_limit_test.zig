@@ -363,3 +363,32 @@ test "WHERE × ORDER BY × LIMIT matrix with parallel workers (max_dop 4)" {
     defer db.close();
     try checkMatrix(allocator, db, .mixed);
 }
+
+test "#123: ORDER BY a SELECT alias that renames a plain column sorts on that column" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE s (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO s (id, k, v) VALUES (1, 30, 5), (2, 10, 7), (3, 20, 5)");
+
+    const cases = .{
+        .{ "SELECT k AS kv, id FROM s ORDER BY kv", &[_]i64{ 10, 20, 30 } },
+        .{ "SELECT s.k AS kv FROM s ORDER BY kv DESC", &[_]i64{ 30, 20, 10 } },
+        .{ "SELECT k AS kv FROM s ORDER BY kv LIMIT 2", &[_]i64{ 10, 20 } },
+        .{ "SELECT k AS kv FROM s WHERE v = 5 ORDER BY kv LIMIT 1", &[_]i64{20} },
+        // The alias wins over a same-named input column; a qualified name is the input column.
+        .{ "SELECT k AS id FROM s ORDER BY id", &[_]i64{ 10, 20, 30 } },
+        .{ "SELECT k AS id FROM s ORDER BY s.id", &[_]i64{ 30, 10, 20 } },
+        .{ "SELECT v AS g, COUNT(*) AS n FROM s GROUP BY v ORDER BY g DESC", &[_]i64{ 7, 5 } },
+        .{ "SELECT v AS g, SUM(k) AS total FROM s GROUP BY v ORDER BY g", &[_]i64{ 5, 7 } },
+        .{ "SELECT DISTINCT v AS g FROM s ORDER BY g", &[_]i64{ 5, 7 } },
+        .{ "WITH c AS (SELECT k AS kv FROM s ORDER BY kv LIMIT 2) SELECT kv FROM c ORDER BY kv", &[_]i64{ 10, 20 } },
+    };
+    inline for (cases) |case| {
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}
