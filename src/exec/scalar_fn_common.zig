@@ -45,14 +45,12 @@ pub inline fn stringStoreOf(out: *ColumnStore) *store.StringStore {
     };
 }
 
-/// Extract (year, month1to12, day1to31) from a day-since-epoch i32.
-/// Returns null for pre-1970 dates.
-/// Days-since-epoch → (year, month, day). Hinnant's civil_from_days — the
-/// exact O(1) inverse of `ymdToDays`. The std `EpochDay` path scans year by
-/// year from 1970 (~56 iterations for a 2020s date), which dominates every
-/// date-part kernel (YEAR/MONTH/DAY/quarter/last_day/…) on hot columns.
-pub fn daysToYmd(days: i32) ?struct { year: u16, month: u4, day: u5 } {
-    if (days < 0) return null;
+/// Days-since-epoch → (year, month, day), for every day before the epoch
+/// too. Hinnant's civil_from_days — the exact O(1) inverse of `ymdToDays`.
+/// The std `EpochDay` path scans year by year from 1970 (~56 iterations for
+/// a 2020s date), which dominates every date-part kernel
+/// (YEAR/MONTH/DAY/quarter/last_day/…) on hot columns.
+pub fn daysToYmd(days: i32) struct { year: i32, month: u4, day: u5 } {
     const z = days + 719468;
     const era = @divFloor(z, 146097);
     const doe = z - era * 146097;
@@ -69,17 +67,13 @@ pub fn daysToYmd(days: i32) ?struct { year: u16, month: u4, day: u5 } {
     };
 }
 
-/// Extract (hour, minute, second) from a datetime i64 (micros).
-/// Returns null for pre-1970 datetimes.
-pub fn microsToHms(micros: i64) ?struct { hour: u5, minute: u6, second: u6 } {
-    if (micros < 0) return null;
-    const secs: u64 = @intCast(@divTrunc(micros, 1_000_000));
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
-    const day_seconds = epoch_seconds.getDaySeconds();
+/// (hour, minute, second) of a datetime's time of day, before the epoch too.
+pub fn microsToHms(micros: i64) struct { hour: u5, minute: u6, second: u6 } {
+    const secs: u32 = @intCast(@divFloor(@mod(micros, std.time.us_per_day), std.time.us_per_s));
     return .{
-        .hour = day_seconds.getHoursIntoDay(),
-        .minute = day_seconds.getMinutesIntoHour(),
-        .second = day_seconds.getSecondsIntoMinute(),
+        .hour = @intCast(secs / 3600),
+        .minute = @intCast(secs / 60 % 60),
+        .second = @intCast(secs % 60),
     };
 }
 
@@ -378,15 +372,30 @@ test "daysToYmd round-trips ymdToDays and matches std decomposition" {
     var days: i32 = 0;
     const last = ymdToDays(9999, 12, 31);
     while (days <= last) : (days += 1) {
-        const ymd = daysToYmd(days) orelse unreachable;
+        const ymd = daysToYmd(days);
         try std.testing.expectEqual(days, ymdToDays(ymd.year, ymd.month, ymd.day));
 
         const u_days: u47 = @intCast(days);
         const yd = (std.time.epoch.EpochDay{ .day = u_days }).calculateYearDay();
         const md = yd.calculateMonthDay();
-        try std.testing.expectEqual(yd.year, ymd.year);
+        try std.testing.expectEqual(@as(i32, yd.year), ymd.year);
         try std.testing.expectEqual(md.month.numeric(), ymd.month);
         try std.testing.expectEqual(md.day_index + 1, ymd.day);
     }
-    try std.testing.expectEqual(@as(?@TypeOf(daysToYmd(0).?), null), daysToYmd(-1));
+}
+
+test "daysToYmd and microsToHms before the epoch" {
+    var days = ymdToDays(1, 1, 1);
+    while (days < 0) : (days += 1) {
+        const ymd = daysToYmd(days);
+        try std.testing.expectEqual(days, ymdToDays(ymd.year, ymd.month, ymd.day));
+    }
+    const d = daysToYmd(ymdToDays(1965, 3, 5));
+    try std.testing.expectEqual(@as(i32, 1965), d.year);
+    try std.testing.expectEqual(@as(u4, 3), d.month);
+    try std.testing.expectEqual(@as(u5, 5), d.day);
+    const t = microsToHms((@as(i64, ymdToDays(1965, 3, 5)) * 86_400 + 10 * 3600 + 7 * 60 + 9) * std.time.us_per_s + 250);
+    try std.testing.expectEqual(@as(u5, 10), t.hour);
+    try std.testing.expectEqual(@as(u6, 7), t.minute);
+    try std.testing.expectEqual(@as(u6, 9), t.second);
 }
