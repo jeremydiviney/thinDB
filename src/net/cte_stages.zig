@@ -465,10 +465,106 @@ fn blockAggregates(op: *const ir.Op) bool {
 /// a double) aggregates generically over its table-backed input instead, as
 /// the same query over a derived table always has.
 fn compileTableBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *StageMap, block_root: *const ir.Op) anyerror!exec.Query {
-    return engine_v2.compileSelectBlock(input, op) catch |err| switch (err) {
-        error.UnsupportedQueryShape => if (blockAggregates(op)) buildGenericBlock(input, op, map, block_root) else err,
+    const is_root = op == block_root;
+    const block = if (is_root) try unqualifyTableBlock(input, op) else op;
+    return engine_v2.compileSelectBlock(input, block) catch |err| switch (err) {
+        error.UnsupportedQueryShape => if (blockAggregates(block)) buildGenericBlock(input, block, map, if (is_root) block else block_root) else err,
         else => err,
     };
+}
+
+/// A single-table block's qualifier names nothing but its one table, so the
+/// block compiles bare: under `FROM t a` (or plain `FROM t`), `a.qty`
+/// (`t.qty`) IS `qty`. Every operator of the chain reads the bare name, so
+/// no handler has to know about qualifiers. Output names are untouched — a
+/// projected `a.qty` already resolves to the source name `qty`. A chain with
+/// an inline derived-table alias keeps its names (that alias qualifies the
+/// block above it, not the scan).
+fn unqualifyTableBlock(input: engine_v2.CompileInput, op: *const ir.Op) !*const ir.Op {
+    var cur = op;
+    const scan = while (true) {
+        cur = switch (cur.*) {
+            .scan => |s| break s,
+            .select => |p| p.upstream,
+            .exclude => |p| p.upstream,
+            .filter => |f| f.upstream,
+            .order_by => |o| o.upstream,
+            .group_by => |g| g.upstream,
+            .compute => |c| c.upstream,
+            .limit => |l| l.upstream,
+            else => return op,
+        };
+    };
+    const table = engine_v2.resolveTable(input.db, input.session, scan.table) catch return op;
+    const qualifier = scan.alias orelse scan.table.name;
+    const arena = input.node_arena;
+    const columns = table.schema.columns;
+    const renames = try arena.alloc(exec.predicate.ColRename, columns.len + 1);
+    for (columns, renames[0..columns.len]) |col, *r| {
+        r.* = .{ .from = try std.fmt.allocPrint(arena, "{s}.{s}", .{ qualifier, col.name }), .to = col.name };
+    }
+    renames[columns.len] = .{ .from = try std.fmt.allocPrint(arena, "{s}.*", .{qualifier}), .to = "*" };
+    return cloneRenamedChain(arena, op, renames);
+}
+
+/// Clone a single-table chain (validated by unqualifyTableBlock) with every
+/// column reference resolved through `renames` and the scan's alias dropped.
+/// Never mutates the shared IR node.
+fn cloneRenamedChain(arena: Allocator, op: *const ir.Op, renames: []const exec.predicate.ColRename) !*ir.Op {
+    const out = try arena.create(ir.Op);
+    out.* = op.*;
+    switch (op.*) {
+        .scan => out.scan.alias = null,
+        .select => |p| {
+            out.select.columns = try renameNames(arena, p.columns, renames);
+            out.select.upstream = try cloneRenamedChain(arena, p.upstream, renames);
+        },
+        .exclude => |p| {
+            out.exclude.columns = try renameNames(arena, p.columns, renames);
+            out.exclude.upstream = try cloneRenamedChain(arena, p.upstream, renames);
+        },
+        .filter => |f| {
+            out.filter.predicate = try exec.predicate.deepClonePredicateRenamed(arena, f.predicate, renames);
+            out.filter.upstream = try cloneRenamedChain(arena, f.upstream, renames);
+        },
+        .order_by => |o| {
+            out.order_by.specs = try renameSortSpecs(arena, o.specs, renames);
+            out.order_by.upstream = try cloneRenamedChain(arena, o.upstream, renames);
+        },
+        .group_by => |g| {
+            out.group_by.group_cols = try renameNames(arena, g.group_cols, renames);
+            const aggs = try arena.dupe(ir.AggSpec, g.aggs);
+            for (aggs) |*a| {
+                if (a.col) |c| a.col = exec.predicate.renameOf(renames, c);
+                if (a.arg2_col) |c| a.arg2_col = exec.predicate.renameOf(renames, c);
+                a.udf_arg_cols = try renameNames(arena, a.udf_arg_cols, renames);
+            }
+            out.group_by.aggs = aggs;
+            if (g.top_k) |tk| out.group_by.top_k = .{ .k = tk.k, .keys = try renameSortSpecs(arena, tk.keys, renames) };
+            out.group_by.upstream = try cloneRenamedChain(arena, g.upstream, renames);
+        },
+        .compute => |c| {
+            const derived = try arena.alloc(ir.Derived, c.derived.len);
+            for (c.derived, derived) |d, *nd| nd.* = .{ .name = d.name, .expr = try exec.expr_mod.deepCloneRenamed(arena, d.expr, renames) };
+            out.compute.derived = derived;
+            out.compute.upstream = try cloneRenamedChain(arena, c.upstream, renames);
+        },
+        .limit => |l| out.limit.upstream = try cloneRenamedChain(arena, l.upstream, renames),
+        else => unreachable,
+    }
+    return out;
+}
+
+fn renameNames(arena: Allocator, names: []const []const u8, renames: []const exec.predicate.ColRename) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, names.len);
+    for (names, out) |n, *o| o.* = exec.predicate.renameOf(renames, n);
+    return out;
+}
+
+fn renameSortSpecs(arena: Allocator, specs: []const ir.SortSpec, renames: []const exec.predicate.ColRename) ![]const ir.SortSpec {
+    const out = try arena.dupe(ir.SortSpec, specs);
+    for (out) |*s| s.col = exec.predicate.renameOf(renames, s.col);
+    return out;
 }
 
 /// A single table-backed SELECT block with no stages beneath it.

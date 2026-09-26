@@ -400,3 +400,36 @@ test "qualified col: aliased col in ORDER BY" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{ 3, 2, 1 }, ids);
 }
+
+
+test "qualified refs in a single-table block name its one table" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    // `m` stays in the memtable: its aggregates run the non-segment lanes.
+    try exec(allocator, db, "CREATE TABLE m (id BIGINT PRIMARY KEY, x DOUBLE, s VARCHAR(20))");
+    try exec(allocator, db, "INSERT INTO m (id, x, s) VALUES (1, 1.5, 'a'), (2, 2.5, 'b'), (3, 3.5, 'a')");
+
+    // Each qualified spelling must return what its bare spelling returns.
+    const cases = .{
+        .{ "SELECT a.id, SUM(a.qty) FROM t a GROUP BY a.id ORDER BY a.id", "SELECT id, SUM(qty) FROM t GROUP BY id ORDER BY id", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT t.id, COUNT(*) FROM t GROUP BY t.id HAVING SUM(t.qty) > 15 ORDER BY t.id", "SELECT id, COUNT(*) FROM t GROUP BY id HAVING SUM(qty) > 15 ORDER BY id", &[_]i64{ 2, 3 } },
+        .{ "SELECT SUM(a.id) FROM t a WHERE a.qty > 15", "SELECT SUM(id) FROM t WHERE qty > 15", &[_]i64{5} },
+        .{ "SELECT SUM(m.id) FROM m", "SELECT SUM(id) FROM m", &[_]i64{6} },
+        .{ "SELECT COUNT(*) FROM m a GROUP BY a.s ORDER BY COUNT(*)", "SELECT COUNT(*) FROM m GROUP BY s ORDER BY COUNT(*)", &[_]i64{ 1, 2 } },
+        .{ "SELECT COUNT(DISTINCT a.s) FROM m a WHERE a.x > 1", "SELECT COUNT(DISTINCT s) FROM m WHERE x > 1", &[_]i64{2} },
+        .{ "SELECT DISTINCT a.id FROM m a WHERE a.s = 'a' ORDER BY a.id", "SELECT DISTINCT id FROM m WHERE s = 'a' ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT COUNT(*) FROM (SELECT DISTINCT a.s FROM m a) d", "SELECT COUNT(*) FROM (SELECT DISTINCT s FROM m) d", &[_]i64{2} },
+        .{ "SELECT m.id FROM m ORDER BY m.x DESC LIMIT 1", "SELECT id FROM m ORDER BY x DESC LIMIT 1", &[_]i64{3} },
+    };
+    inline for (cases) |case| {
+        const qualified = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(qualified);
+        const bare = try collectBigints(allocator, db, case[1]);
+        defer allocator.free(bare);
+        try std.testing.expectEqualSlices(i64, case[2], bare);
+        try std.testing.expectEqualSlices(i64, bare, qualified);
+    }
+}
