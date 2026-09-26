@@ -2982,6 +2982,9 @@ test "join: a comma joins like CROSS JOIN, keyed by the WHERE's equalities" {
         // row crosses a (4 c rows, 3 with a match in b; 3 a rows).
         .{ "SELECT COUNT(*) FROM a, b RIGHT JOIN c ON b.bid = c.bid", &[_]i64{12} },
         .{ "SELECT COUNT(*) FROM a, b RIGHT JOIN c ON b.bid = c.bid WHERE b.bid IS NULL", &[_]i64{3} },
+        // An ON expression's hidden left column doesn't hide the join below it.
+        .{ "SELECT b.bid FROM a JOIN b ON a.id + 0 = b.aid WHERE a.v = 20 ORDER BY b.bid", &[_]i64{3} },
+        .{ "SELECT c.cid FROM a JOIN b ON a.id + 0 = b.aid, c WHERE b.bid = c.bid ORDER BY c.cid", &[_]i64{ 1, 2, 3 } },
         // A derived table on either side.
         .{ "SELECT a.id FROM a, (SELECT aid, SUM(amount) AS s FROM b GROUP BY aid) t WHERE a.id = t.aid AND t.s > 10 ORDER BY a.id", &[_]i64{ 1, 3 } },
         // Text meets a number as the comparison reads it.
@@ -2997,6 +3000,7 @@ test "join: a comma joins like CROSS JOIN, keyed by the WHERE's equalities" {
         "SELECT b.bid FROM a, b WHERE a.id = b.aid",
         "SELECT c.cid FROM a, b, c WHERE a.id = b.aid AND b.bid = c.bid",
         "SELECT c.cid FROM a, b JOIN c ON b.bid = c.bid WHERE a.id = b.aid",
+        "SELECT c.cid FROM a JOIN b ON a.id + 0 = b.aid, c WHERE b.bid = c.bid",
     };
     inline for (keyed) |sql| try std.testing.expect(!try planMentions(allocator, db, sql, "NestedLoopJoin"));
     try std.testing.expect(try planMentions(allocator, db, "SELECT COUNT(*) FROM a, b", "NestedLoopJoin"));
