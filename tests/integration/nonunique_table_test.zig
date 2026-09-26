@@ -66,7 +66,7 @@ test "non-unique table stays non-unique across a reopen" {
     try std.testing.expectEqual(@as(i64, 3), try firstInt(allocator, db, "SELECT COUNT(*) FROM evt"));
 }
 
-test "CREATE TABLE requires a key clause; PRIMARY KEY and ORDER BY are exclusive" {
+test "CREATE TABLE without a key clause keeps every row; PRIMARY KEY and ORDER BY are exclusive" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -74,6 +74,15 @@ test "CREATE TABLE requires a key clause; PRIMARY KEY and ORDER BY are exclusive
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    try std.testing.expectError(error.SqlInvalidProjection, exec(allocator, db, "CREATE TABLE nokey (a INT, b INT)"));
+    // Plain MySQL DDL: the table orders by its first column and, with no
+    // PRIMARY KEY, keeps duplicates and NULL keys.
+    try exec(allocator, db, "CREATE TABLE nokey (a INT, b INT)");
+    try exec(allocator, db, "INSERT INTO nokey (a, b) VALUES (2, 1), (1, 1), (1, 1), (NULL, 3)");
+    try std.testing.expectEqual(@as(i64, 4), try firstInt(allocator, db, "SELECT COUNT(*) FROM nokey"));
+    try (try db.openTable("nokey", .{})).flush();
+    try exec(allocator, db, "INSERT INTO nokey (a, b) VALUES (1, 1)");
+    try std.testing.expectEqual(@as(i64, 5), try firstInt(allocator, db, "SELECT COUNT(*) FROM nokey"));
+    try std.testing.expectEqual(@as(i64, 3), try firstInt(allocator, db, "SELECT COUNT(*) FROM nokey WHERE a = 1"));
+
     try std.testing.expectError(error.SqlInvalidProjection, exec(allocator, db, "CREATE TABLE both (a INT, b INT, PRIMARY KEY (a)) ORDER BY (b)"));
 }

@@ -88,20 +88,14 @@ test "sql ddl: CREATE TABLE that already exists errors" {
     try expectRunError(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY)", thindb.net.Error.TableAlreadyExists);
 }
 
-test "sql ddl: CREATE TABLE without any PRIMARY KEY errors" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
-    defer db.close();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
+test "sql ddl: CREATE TABLE without a key clause orders by its first column" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectError(
-        thindb.sql.ParseError.SqlInvalidProjection,
-        thindb.sql.parse(arena.allocator(), "CREATE TABLE t (id BIGINT, name TEXT)"),
-    );
+    const op = try thindb.sql.parse(arena.allocator(), "CREATE TABLE t (id BIGINT, name TEXT)");
+    const ct = op.ddl.create_table;
+    try std.testing.expectEqual(@as(usize, 1), ct.order_key.len);
+    try std.testing.expectEqualStrings("id", ct.order_key[0]);
+    try std.testing.expect(!ct.unique);
 }
 
 test "sql ddl: DROP TABLE removes the table from the catalog" {
