@@ -104,6 +104,9 @@ pub const NestedLoopJoin = struct {
     // Output staging.
     output_columns: []ColumnStore,
     views: []ColumnView,
+    /// Rows staged in output_columns, counted apart from them: a COUNT(*)
+    /// above prunes the join to zero output columns.
+    output_rows: usize = 0,
     pending_clear: bool = false,
 
     phase: Phase = .materializing,
@@ -386,6 +389,7 @@ pub const NestedLoopJoin = struct {
     fn loopStep(self: *NestedLoopJoin) !?Batch {
         if (self.pending_clear) {
             for (self.output_columns) |*c| c.clear();
+            self.output_rows = 0;
             self.pending_clear = false;
         }
 
@@ -405,7 +409,7 @@ pub const NestedLoopJoin = struct {
                 self.left_cursor += 1;
                 self.right_cursor = 0;
                 self.cur_left_any_match = false;
-                if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                if (self.output_rows >= output_batch_rows) {
                     return try self.flushOutput();
                 }
                 continue;
@@ -420,7 +424,7 @@ pub const NestedLoopJoin = struct {
                 try self.emitRow();
                 self.cur_left_any_match = true;
                 if (self.matched_right) |*mb| mb.set(self.right_cursor);
-                if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+                if (self.output_rows >= output_batch_rows) {
                     self.right_cursor += 1;
                     return try self.flushOutput();
                 }
@@ -433,7 +437,7 @@ pub const NestedLoopJoin = struct {
             self.left_cursor += 1;
             self.right_cursor = 0;
             self.cur_left_any_match = false;
-            if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+            if (self.output_rows >= output_batch_rows) {
                 return try self.flushOutput();
             }
         }
@@ -447,12 +451,13 @@ pub const NestedLoopJoin = struct {
         const mb = if (self.matched_right) |*m| m else return null;
         if (self.pending_clear) {
             for (self.output_columns) |*c| c.clear();
+            self.output_rows = 0;
             self.pending_clear = false;
         }
         while (self.drain_cursor < self.right_rows) : (self.drain_cursor += 1) {
             if (mb.isSet(self.drain_cursor)) continue;
             try self.emitRightOnlyRow(self.drain_cursor);
-            if (self.output_columns[0].data.rowCount() >= output_batch_rows) {
+            if (self.output_rows >= output_batch_rows) {
                 self.drain_cursor += 1;
                 return try self.flushOutput();
             }
@@ -468,6 +473,7 @@ pub const NestedLoopJoin = struct {
             left_row,
             self.right_kept_mask,
         );
+        self.output_rows += 1;
     }
 
     fn emitRightOnlyRow(self: *NestedLoopJoin, right_row: u32) !void {
@@ -479,6 +485,7 @@ pub const NestedLoopJoin = struct {
             self.right_kept_mask,
             self.left_col_count,
         );
+        self.output_rows += 1;
     }
 
     fn outerHasNullKey(self: NestedLoopJoin) bool {
@@ -533,10 +540,11 @@ pub const NestedLoopJoin = struct {
             self.right_cursor,
             self.right_kept_mask,
         );
+        self.output_rows += 1;
     }
 
     fn flushOutput(self: *NestedLoopJoin) !?Batch {
-        const rows = self.output_columns[0].data.rowCount();
+        const rows = self.output_rows;
         if (rows == 0) return null;
         for (self.output_columns, 0..) |c, i| self.views[i] = c.view();
         self.pending_clear = true;
