@@ -111,6 +111,9 @@ pub const TokenTag = enum {
     kw_in,
     kw_interval,
     kw_union,
+    kw_intersect,
+    /// EXCEPT, or MINUS, StarRocks' and Oracle's spelling of it.
+    kw_except,
     kw_all,
     /// MySQL-style `SET` for user-defined variables: `SET @name = expr`.
     /// Same `SET` keyword used for session config in PG; thinDB v1
@@ -736,6 +739,9 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "in", .tag = .kw_in },
         .{ .name = "interval", .tag = .kw_interval },
         .{ .name = "union", .tag = .kw_union },
+        .{ .name = "intersect", .tag = .kw_intersect },
+        .{ .name = "except", .tag = .kw_except },
+        .{ .name = "minus", .tag = .kw_except },
         .{ .name = "all", .tag = .kw_all },
         .{ .name = "set", .tag = .kw_set },
         .{ .name = "delete", .tag = .kw_delete },

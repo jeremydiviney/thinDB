@@ -540,16 +540,26 @@ pub const BatchOp = struct {
     statements: []const *Op,
 };
 
-/// UNION ALL — concatenate the row streams from `left` and `right`.
-/// Schemas must be compatible (same column count + per-position type
-/// tags must match); output schema borrows the left side's names.
-/// UNION (distinct) lands on top of this as a dedup pass when needed.
+/// A set operation over `left` and `right`. UNION ALL concatenates the
+/// row streams. Schemas must be compatible (same column count + per-position
+/// type tags must match); output schema borrows the left side's names.
+/// UNION (distinct), INTERSECT and EXCEPT land on top of that as a grouping
+/// pass.
 pub const SetUnion = struct {
     left: *Op,
     right: *Op,
-    /// `true` = UNION ALL (no dedup); `false` = UNION [DISTINCT], one copy
-    /// of each distinct row.
+    /// `true` = UNION ALL (no dedup); `false` = one copy of each distinct
+    /// row. INTERSECT and EXCEPT are always distinct.
     all: bool,
+    kind: SetKind = .@"union",
+};
+
+pub const SetKind = enum(u8) {
+    @"union",
+    /// Rows in both arms.
+    intersect,
+    /// Rows of the left arm that are not in the right one.
+    except,
 };
 
 /// `SET @name = expr` — assign a session-scoped variable. Compile
@@ -1040,6 +1050,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .window => |w| try encodeWindow(allocator, out, w),
         .set_union => |u| {
             try out.append(allocator, if (u.all) @as(u8, 1) else 0);
+            try out.append(allocator, @intFromEnum(u.kind));
             try encodeOp(allocator, out, u.left.*);
             try encodeOp(allocator, out, u.right.*);
         },
@@ -2204,9 +2215,11 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         .copy => Op{ .copy = try decodeCopy(allocator, bytes, cursor) },
         .window => try decodeWindow(allocator, bytes, cursor),
         .set_union => blk: {
-            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
             const all = bytes[cursor.*] != 0;
-            cursor.* += 1;
+            if (bytes[cursor.* + 1] > @intFromEnum(SetKind.except)) return Error.IrCorrupt;
+            const kind: SetKind = @enumFromInt(bytes[cursor.* + 1]);
+            cursor.* += 2;
             const left = try allocator.create(Op);
             errdefer allocator.destroy(left);
             left.* = try decodeOp(allocator, bytes, cursor);
@@ -2214,7 +2227,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             const right = try allocator.create(Op);
             errdefer allocator.destroy(right);
             right.* = try decodeOp(allocator, bytes, cursor);
-            break :blk Op{ .set_union = .{ .left = left, .right = right, .all = all } };
+            break :blk Op{ .set_union = .{ .left = left, .right = right, .all = all, .kind = kind } };
         },
         .create_table_as => blk: {
             const ref = try decodeTableRef(bytes, cursor);

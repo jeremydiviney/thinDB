@@ -1,5 +1,6 @@
 //! UNION ALL concatenates two SELECT pipelines with matching schemas;
-//! UNION [DISTINCT] keeps one copy of each distinct row.
+//! UNION [DISTINCT] keeps one copy of each distinct row; INTERSECT and
+//! EXCEPT keep the distinct rows both arms hold, or only the left one does.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -211,4 +212,70 @@ test "UNION ALL: a computed column over a union CTE" {
     const got = try collectBigints(allocator, db, "WITH u AS (SELECT id FROM a UNION ALL SELECT id FROM b) SELECT id % 3 AS m FROM u ORDER BY id");
     defer allocator.free(got);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 2, 0, 1 }, got);
+}
+
+test "INTERSECT / EXCEPT: distinct rows both arms hold, or only the left" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE c (id BIGINT PRIMARY KEY, v BIGINT)");
+    try exec(allocator, db, "INSERT INTO c (id, v) VALUES (1, NULL), (2, NULL), (3, 5)");
+    try exec(allocator, db, "CREATE TABLE d (id BIGINT PRIMARY KEY, k BIGINT)");
+    try exec(allocator, db, "INSERT INTO d (id, k) VALUES (1, 1), (2, 1), (3, 2), (4, NULL), (5, NULL), (6, 5)");
+
+    const cases = .{
+        .{ "SELECT id FROM a INTERSECT SELECT id FROM b ORDER BY id", &[_]i64{2} },
+        .{ "SELECT id FROM a INTERSECT DISTINCT SELECT id FROM b ORDER BY id", &[_]i64{2} },
+        .{ "SELECT id FROM a EXCEPT SELECT id FROM b ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM a EXCEPT DISTINCT SELECT id FROM b ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM a MINUS SELECT id FROM b ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM b EXCEPT SELECT id FROM a", &[_]i64{4} },
+        // INTERSECT binds tighter: a − (a ∩ b), not (a − a) ∩ b.
+        .{ "SELECT id FROM a EXCEPT SELECT id FROM a INTERSECT SELECT id FROM b ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM a INTERSECT SELECT id FROM b UNION SELECT 9 ORDER BY 1", &[_]i64{ 2, 9 } },
+        // UNION and EXCEPT associate left: (a − b) ∪ b, (a ∪all b) − a.
+        .{ "SELECT id FROM a EXCEPT SELECT id FROM b UNION SELECT id FROM b ORDER BY id", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT id FROM a UNION ALL SELECT id FROM b EXCEPT SELECT id FROM a", &[_]i64{4} },
+        // One copy of each distinct row; NULLs compare equal, as in SELECT DISTINCT.
+        .{ "SELECT COUNT(*) FROM (SELECT k FROM d INTERSECT SELECT k FROM d) x", &[_]i64{4} },
+        .{ "SELECT COUNT(*) FROM (SELECT v FROM c INTERSECT SELECT v FROM c WHERE v IS NULL) x", &[_]i64{1} },
+        .{ "SELECT v FROM c EXCEPT SELECT v FROM c WHERE v IS NULL", &[_]i64{5} },
+        .{ "SELECT COUNT(*) FROM (SELECT k FROM d EXCEPT SELECT id FROM a) x", &[_]i64{2} },
+        // Every column decides which rows match.
+        .{ "SELECT id FROM (SELECT id % 2 AS m, id FROM a INTERSECT SELECT 0, id FROM b) x ORDER BY id", &[_]i64{2} },
+        .{ "SELECT id FROM a INTERSECT SELECT CAST(id AS INT) FROM b", &[_]i64{2} },
+        .{ "SELECT id FROM a EXCEPT SELECT id FROM b ORDER BY id DESC LIMIT 1", &[_]i64{3} },
+        .{ "(SELECT id FROM a) INTERSECT (SELECT id FROM b)", &[_]i64{2} },
+        .{ "SELECT id FROM a EXCEPT (SELECT id FROM b ORDER BY id LIMIT 1) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM a WHERE id IN (SELECT id FROM a EXCEPT SELECT id FROM b) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "WITH x AS (SELECT id FROM a INTERSECT SELECT id FROM b) SELECT id * 10 FROM x", &[_]i64{20} },
+        .{ "SELECT id FROM a WHERE id > 10 INTERSECT SELECT id FROM b", &[_]i64{} },
+        .{ "SELECT id FROM a EXCEPT SELECT id FROM b WHERE id > 10 ORDER BY id", &[_]i64{ 1, 2, 3 } },
+        // Same arms, different operators: shared-subplan detection keeps them apart.
+        .{ "WITH u AS (SELECT id FROM a UNION SELECT id FROM b), i AS (SELECT id FROM a INTERSECT SELECT id FROM b) SELECT COUNT(*) FROM u UNION ALL SELECT COUNT(*) FROM i", &[_]i64{ 4, 1 } },
+    };
+    inline for (cases) |c| {
+        const got = try collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var q = try helpers.runSql(allocator, db, "SELECT id, id * 2 AS twice FROM a EXCEPT SELECT id, id * 2 FROM b");
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 2), q.outputSchema().len);
+    try std.testing.expectEqualStrings("twice", q.outputSchema()[1].name);
+}
+
+test "INTERSECT / EXCEPT: the ALL forms are rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    inline for (.{ "SELECT id FROM a INTERSECT ALL SELECT id FROM b", "SELECT id FROM a EXCEPT ALL SELECT id FROM b" }) |sql| {
+        try std.testing.expectError(error.SqlSetOpAllUnsupported, thindb.sql.parse(arena.allocator(), sql));
+    }
 }

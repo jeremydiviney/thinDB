@@ -1876,10 +1876,14 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 const t_op = exec.prof.nowTicks();
                 defer exec.prof.addPhase("compile.op.union", @intCast(exec.prof.nowTicks() - t_op));
                 try unifyUnionArmTypes(input, u, &left, &right);
+                if (u.kind != .@"union") try markSetOpSides(input, &left, &right);
                 break :blk try exec.SetUnion.create(input.allocator, left, right, true);
             };
-            if (u.all) return unioned;
-            return distinctRows(input, unioned);
+            return switch (u.kind) {
+                .@"union" => if (u.all) unioned else distinctRows(input, unioned),
+                .intersect => setOpRows(input, unioned, try intersectKeep(input.node_arena)),
+                .except => setOpRows(input, unioned, sideLeaf(SETOP_MAX_SIDE, 0)),
+            };
         },
         else => return error.UnsupportedQueryShape,
     }
@@ -1912,6 +1916,66 @@ fn distinctRows(input: engine_v2.CompileInput, unioned: exec.Query) !exec.Query 
     };
     errdefer grouped.deinit();
     return grouped.project(cols);
+}
+
+const SETOP_SIDE = "__setop_side";
+const SETOP_MIN_SIDE = "__setop_min_side";
+const SETOP_MAX_SIDE = "__setop_max_side";
+
+/// Tag each INTERSECT / EXCEPT arm's rows with the arm they came from, 0 for
+/// the left and 1 for the right, so one grouping over the unioned rows sees
+/// which arms hold each distinct row.
+fn markSetOpSides(input: engine_v2.CompileInput, left: *exec.Query, right: *exec.Query) !void {
+    inline for (.{ left, right }, 0..) |arm, side| {
+        const derived = try input.node_arena.dupe(ir.Derived, &.{.{ .name = SETOP_SIDE, .expr = .{ .lit = .{ .int = side } } }});
+        arm.* = try engine_v2.computeDerivedFused(input.allocator, arm.*, derived, input.udf_registry);
+    }
+}
+
+/// INTERSECT / EXCEPT over the side-tagged unioned rows: group on every real
+/// column — NULLs and the key rules match SELECT DISTINCT's — keep the groups
+/// `keep` accepts from the smallest and largest side tag, then project the
+/// real columns.
+fn setOpRows(input: engine_v2.CompileInput, unioned: exec.Query, keep: exec.PredicateExpr) !exec.Query {
+    var up = unioned;
+    var grouped, const cols = blk: {
+        errdefer up.deinit();
+        const schema = up.outputSchema();
+        const names = try input.node_arena.alloc([]const u8, schema.len - 1);
+        for (schema[0..names.len], names) |col, *name| name.* = try input.node_arena.dupe(u8, col.name);
+        const aggs = try input.node_arena.dupe(ir.AggSpec, &.{
+            .{ .func = .min, .col = SETOP_SIDE, .as = SETOP_MIN_SIDE },
+            .{ .func = .max, .col = SETOP_SIDE, .as = SETOP_MAX_SIDE },
+        });
+        const q = try group_route.routeGroupByDop(
+            input.allocator,
+            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+            &up,
+            names,
+            aggs,
+            null,
+            null,
+            input.db.config.query_memory_budget,
+            input.effectiveDop(),
+        );
+        break :blk .{ q, names };
+    };
+    var kept = blk: {
+        errdefer grouped.deinit();
+        break :blk try grouped.filter(keep);
+    };
+    errdefer kept.deinit();
+    return kept.project(cols);
+}
+
+/// A row both arms hold: its smallest side tag is the left arm's and its
+/// largest the right's.
+fn intersectKeep(arena: Allocator) !exec.PredicateExpr {
+    return .{ .@"and" = try arena.dupe(exec.PredicateExpr, &.{ sideLeaf(SETOP_MIN_SIDE, 0), sideLeaf(SETOP_MAX_SIDE, 1) }) };
+}
+
+fn sideLeaf(col: []const u8, side: i32) exec.PredicateExpr {
+    return .{ .leaf = .{ .col = col, .op = .eq, .val = .{ .int = side } } };
 }
 
 /// Rewrite each arm so every column reaches the union's result type

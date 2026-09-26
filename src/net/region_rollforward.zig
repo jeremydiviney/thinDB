@@ -1221,6 +1221,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
         },
         .set_union => |u| {
             hu(h, @intFromBool(u.all));
+            hu(h, @intFromEnum(u.kind));
             try hashOp(h, u.left);
             try hashOp(h, u.right);
         },
