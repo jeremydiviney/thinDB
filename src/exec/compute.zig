@@ -1616,8 +1616,8 @@ fn resolveDerived(
     }
 }
 
-/// CASE result branches use the scalar implicit-cast lattice to find a common
-/// output type. Branches that cannot widen to a shared type are rejected.
+/// CASE result branches take one output type by the result-type rule
+/// (`cast.commonType`). Branches that never share a type are rejected.
 const CaseUnifyState = struct {
     /// True while every integer-typed contribution so far was a literal —
     /// only then may a later decimal branch take over the unified type.
@@ -1627,11 +1627,12 @@ const CaseUnifyState = struct {
     only_null_so_far: bool = true,
 };
 
-/// commonCaseType plus two plan-time-only widenings the cast lattice can't
-/// express: an integer LITERAL branch (`ELSE 0`) unifies with a decimal
-/// branch, and a bare NULL branch (`ELSE NULL`) is typeless and adopts
-/// whatever the typed branches unify to. normalizeBranchSrc rewrites the
-/// affected slots once the final type is known.
+/// `cast.commonType` plus two plan-time-only rules: an integer LITERAL
+/// branch (`ELSE 0`) takes a decimal branch's type rather than widening its
+/// precision (the literal carries BIGINT's 19 digits, not its own), and a
+/// bare NULL branch (`ELSE NULL`) is typeless and adopts whatever the typed
+/// branches unify to. normalizeBranchSrc rewrites the affected slots once
+/// the final type is known.
 fn unifyCaseType(current: ?Type, next: Type, next_src: BranchSrc, st: *CaseUnifyState) ?Type {
     if (next_src == .null_lit) return current orelse next;
     defer st.only_null_so_far = false;
@@ -1639,11 +1640,10 @@ fn unifyCaseType(current: ?Type, next: Type, next_src: BranchSrc, st: *CaseUnify
         st.int_contribs_all_lits = false;
     }
     if (st.only_null_so_far and current != null) return next;
-    if (commonCaseType(current, next)) |t| return t;
     const cur = current orelse return next;
-    if (cur.decimalSpec() != null and next.isInteger() and next_src == .lit) return cur;
-    if (next.decimalSpec() != null and cur.isInteger() and st.int_contribs_all_lits) return next;
-    return null;
+    if (cur.isDecimal() and next.isInteger() and next_src == .lit) return cur;
+    if (next.isDecimal() and cur.isInteger() and st.int_contribs_all_lits) return next;
+    return cast.commonType(cur, next);
 }
 
 /// Post-unification slot repair: bare-NULL branches take the unified type,
@@ -1667,7 +1667,8 @@ fn normalizeBranchSrc(runtime_allocator: Allocator, src: BranchSrc, out_type: Ty
 fn coerceLitBranch(runtime_allocator: Allocator, src: BranchSrc, out_type: Type) !void {
     if (src != .lit) return;
     const slot = src.lit;
-    if (std.meta.activeTag(slot.ty) == std.meta.activeTag(out_type)) return;
+    // A decimal Value carries no scale to rescale from; retypeBranch casts it.
+    if (cast.sameRepresentation(slot.ty, out_type) or slot.ty.isDecimal()) return;
     var v = slot.value;
     predicate_mod.coerceValueRounded(&v, out_type) catch return;
     replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, out_type, false));
@@ -1680,17 +1681,33 @@ fn replaceBuf(allocator: Allocator, buf: *ColumnStore, replacement: ColumnStore)
     buf.* = replacement;
 }
 
-fn commonCaseType(current: ?Type, next: Type) ?Type {
-    const cur = current orelse return next;
-    const cur_tag: types.TypeTag = std.meta.activeTag(cur);
-    const next_tag: types.TypeTag = std.meta.activeTag(next);
-    if (cur_tag == next_tag) return cur;
-    // `.string`/`.varchar`/`.char` share one StringView representation, so a
-    // CASE mixing a string literal with a VARCHAR column reconciles to string.
-    if (foldStringTag(cur_tag) == .string and foldStringTag(next_tag) == .string) return Type{ .string = {} };
-    if (cast.castCost(cur_tag, next_tag) != null) return next;
-    if (cast.castCost(next_tag, cur_tag) != null) return cur;
-    return null;
+/// Whether a branch of type `src` reaches the CASE's type through a
+/// tag-level widening kernel (attachCaseCast). Other conversions change
+/// the value's representation (a decimal at another scale, a number as
+/// text) and need retypeBranch's typed cast.
+fn widensByKernel(src: Type, out_type: Type) bool {
+    if (cast.sameRepresentation(src, out_type)) return true;
+    if (src.isDecimal() or out_type.isDecimal()) return false;
+    return cast.kernelFor(@as(types.TypeTag, src), @as(types.TypeTag, out_type)) != null;
+}
+
+/// Rebuild a branch that can't widen by kernel as the typed cast
+/// `CAST(branch AS out_type)` lowers to, so its values are converted rather
+/// than reinterpreted.
+fn retypeBranch(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    src: *BranchSrc,
+    e: Expr,
+    up_schema: []const Column,
+    out_type: Type,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+) PlanError!void {
+    if (src.* == .null_lit or widensByKernel(branchSrcType(src.*, up_schema), out_type)) return;
+    const name = try scalar_fn.castFnName(aa, out_type) orelse return Error.ComputeUnsupportedExpr;
+    const rebuilt = try buildBranchSrc(runtime_allocator, aa, .{ .call = .{ .fn_name = name, .args = try aa.dupe(Expr, &.{e}) } }, up_schema, udf_registry);
+    freeBranchSrc(runtime_allocator, src.*);
+    src.* = rebuilt;
 }
 
 fn attachCaseCast(
@@ -1702,14 +1719,11 @@ fn attachCaseCast(
     cast_buf: *?*ColumnStore,
 ) !void {
     const src_type = branchSrcType(src, up_schema);
-    const src_tag: types.TypeTag = std.meta.activeTag(src_type);
-    const out_tag: types.TypeTag = std.meta.activeTag(out_type);
-    if (src_tag == out_tag) return;
-    // Same StringView representation across the string family — pass through.
-    if (foldStringTag(src_tag) == .string and foldStringTag(out_tag) == .string) return;
-    const k = cast.kernelFor(src_tag, out_tag) orelse {
-        return Error.ComputeUnsupportedExpr;
-    };
+    if (cast.sameRepresentation(src_type, out_type)) return;
+    // A NULL branch keeps its placeholder buffer; no value to convert.
+    if (src == .null_lit) return;
+    if (!widensByKernel(src_type, out_type)) return Error.ComputeUnsupportedExpr;
+    const k = cast.kernelFor(@as(types.TypeTag, src_type), @as(types.TypeTag, out_type)).?;
     const buf = try runtime_allocator.create(ColumnStore);
     errdefer runtime_allocator.destroy(buf);
     buf.* = try ColumnStore.init(runtime_allocator, out_type, branchSrcNullable(src, up_schema));
@@ -1718,9 +1732,8 @@ fn attachCaseCast(
 }
 
 /// Resolve a parsed CASE expression to a CasePlan. All branches' THEN
-/// (and ELSE) results unify to one output type via the implicit-cast
-/// lattice (`commonCaseType`); branches that can't widen to a shared type
-/// are rejected. Nested CASE in a branch's THEN is also rejected.
+/// (and ELSE) results unify to one output type by the result-type rule
+/// (`unifyCaseType`); branches that never share a type are rejected.
 fn buildCasePlan(
     runtime_allocator: Allocator,
     aa: Allocator,
@@ -1782,6 +1795,10 @@ fn buildCasePlan(
     const out_type = inferred_type orelse return Error.ComputeUnsupportedExpr;
     for (branches[0..built]) |*br| try normalizeBranchSrc(runtime_allocator, br.then_src, out_type);
     if (else_src) |es| try normalizeBranchSrc(runtime_allocator, es, out_type);
+    for (branches[0..built], cs.branches) |*br, src| {
+        try retypeBranch(runtime_allocator, aa, &br.then_src, src.then, up_schema, out_type, udf_registry);
+    }
+    if (else_src) |*es| try retypeBranch(runtime_allocator, aa, es, cs.else_branch.?.*, up_schema, out_type, udf_registry);
     for (branches[0..built]) |*br| {
         try attachCaseCast(runtime_allocator, br.then_src, up_schema, out_type, &br.cast_kernel, &br.cast_buf);
     }
@@ -1987,6 +2004,13 @@ fn buildCallPlan(
         r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     }
     if (r == null) r = try resolveWithTypedNulls(runtime_allocator, aa, udf_registry, c.fn_name, arg_plans, arg_types);
+    if (r == null) {
+        if (try retypedCall(aa, c, arg_plans, arg_types)) |rewritten| {
+            for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
+            built = 0;
+            return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
+        }
+    }
     const rr = r orelse return Error.ComputeNoSuchOverload;
 
     // Cast scratch buffers (one per coerced arg).
@@ -2034,6 +2058,48 @@ fn buildCallPlan(
         .output_type = rr.func.return_type,
     };
     return plan;
+}
+
+/// A call no overload accepts as written, with its arguments converted so
+/// one does: the arguments a function returns (GREATEST, COALESCE, IF's
+/// branches) take their common type by the result-type rule, and otherwise
+/// a string parameter takes a number, decimal or date as its text
+/// (`CONCAT('Q', quarter)`). Literals are converted in place; everything
+/// else goes through the typed cast `CAST(x AS t)` lowers to. Null when
+/// no conversion applies, so the rewritten call can't recurse again.
+fn retypedCall(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
+    const args = try aa.alloc(Expr, c.args.len);
+    for (args, c.args, arg_plans) |*a, orig, ap| a.* = if (ap == .lit) .{ .lit = ap.lit.value } else orig;
+    if (scalar_fn.resultValueArgsStart(c.fn_name)) |start| if (start < args.len) {
+        var typed: std.ArrayList(Type) = .empty;
+        for (arg_plans[start..], arg_types[start..]) |ap, t| if (ap != .null_lit) try typed.append(aa, t);
+        const target = cast.commonTypeOf(typed.items) orelse return null;
+        var changed = false;
+        for (args[start..], arg_plans[start..], arg_types[start..]) |*a, ap, t| {
+            if (ap == .null_lit) {
+                a.* = .{ .null_lit = target };
+                continue;
+            }
+            if (cast.sameRepresentation(t, target)) continue;
+            a.* = try convertedArg(aa, a.*, target) orelse return null;
+            changed = true;
+        }
+        return if (changed) Expr{ .call = .{ .fn_name = c.fn_name, .args = args } } else null;
+    };
+    const wrap = try scalar_fn.stringifiedArgs(aa, c.fn_name, arg_types) orelse return null;
+    for (args, wrap) |*a, w| {
+        if (w) a.* = try convertedArg(aa, a.*, .string) orelse return null;
+    }
+    return Expr{ .call = .{ .fn_name = c.fn_name, .args = args } };
+}
+
+fn convertedArg(aa: Allocator, e: Expr, target: Type) !?Expr {
+    if (e == .lit and !target.isString()) {
+        var v = e.lit;
+        if (predicate_mod.coerceValueRounded(&v, target)) |_| return Expr{ .lit = v } else |_| {}
+    }
+    const name = try scalar_fn.castFnName(aa, target) orelse return null;
+    return Expr{ .call = .{ .fn_name = name, .args = try aa.dupe(Expr, &.{e}) } };
 }
 
 /// A `.zero_divisor` call whose divisor is a literal that is still nonzero as
@@ -2695,6 +2761,8 @@ fn createAndRelease(allocator: Allocator) !void {
     const concat_lit_s = [_]Expr{.{ .call = .{ .fn_name = "concat", .args = &lit_s } }};
     const zero: Expr = .{ .lit = .{ .int = 0 } };
     const string_null: Expr = .{ .null_lit = .string };
+    const s_a = [_]Expr{ .{ .col_ref = "s" }, .{ .col_ref = "a" } };
+    const s_col: Expr = .{ .col_ref = "s" };
     const derived = [_]Derived{
         .{ .name = "month_end", .expr = .{ .call = .{ .fn_name = "last_day", .args = &date_text } } },
         .{ .name = "root", .expr = .{ .call = .{ .fn_name = "sqrt", .args = &a } } },
@@ -2711,6 +2779,12 @@ fn createAndRelease(allocator: Allocator) !void {
         .{ .name = "or_null", .expr = .{ .case = .{
             .branches = &.{.{ .cond = .{ .is_not_null = "a" }, .then = .{ .col_ref = "a" } }},
             .else_branch = &string_null,
+        } } },
+        .{ .name = "tagged", .expr = .{ .call = .{ .fn_name = "concat", .args = &s_a } } },
+        .{ .name = "top", .expr = .{ .call = .{ .fn_name = "greatest", .args = &s_a } } },
+        .{ .name = "as_text", .expr = .{ .case = .{
+            .branches = &.{.{ .cond = .{ .is_not_null = "a" }, .then = .{ .col_ref = "a" } }},
+            .else_branch = &s_col,
         } } },
     };
     var src = EmptyTestSource{};

@@ -663,6 +663,20 @@ pub fn dateFormatDateKernel(allocator: Allocator, args: []const ColumnView, out:
     }
 }
 
+pub fn dateToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ds = args[0].data.date;
+    const ss = stringStoreOf(out);
+    var buf: [32]u8 = undefined;
+    for (ds[0..row_count]) |d| try ss.appendValue(allocator, try common.formatDate(&buf, d));
+}
+
+pub fn datetimeToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const dts = args[0].data.datetime;
+    const ss = stringStoreOf(out);
+    var buf: [48]u8 = undefined;
+    for (dts[0..row_count]) |dt| try ss.appendValue(allocator, try common.formatDateTime(&buf, dt));
+}
+
 test "date_trunc: vectorized quantum truncation matches @divFloor reference" {
     const us: i64 = 1_000_000;
     // Lengths spanning the vector-tail boundary; sign-mixed inputs (pre-epoch

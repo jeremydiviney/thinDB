@@ -111,7 +111,7 @@ test "coercion: mod(int_col, bigint_col) picks bigint overload + casts int" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 2 }, rems.items);
 }
 
-test "coercion: no implicit string ↔ number — concat(string, int) still errors" {
+test "coercion: a string parameter takes a number as its text — concat(int, int)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -130,17 +130,17 @@ test "coercion: no implicit string ↔ number — concat(string, int) still erro
     const aa = arena.allocator();
 
     var base = try thindb.scan(allocator, t);
-    // Two-arg concat exists only as (string, string). small is int.
-    // Per DuckDB/StarRocks convention, string ↔ number requires an
-    // explicit cast — verify we don't silently auto-stringify.
-    const result = base.compute(&.{
+    // Two-arg concat exists only as (string, string); as in StarRocks and
+    // MySQL, an int argument passes as its text.
+    var q = try base.compute(&.{
         .{ .name = "joined", .expr = try thindb.exec.scalar_fn.concat(aa, &.{
             thindb.exec.expr_mod.col("small"),
             thindb.exec.expr_mod.col("small"),
         }) },
     });
-    try std.testing.expectError(thindb.exec.Error.ComputeNoSuchOverload, result);
-    base.deinit();
+    defer q.deinit();
+    const b = (try q.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("44", b.values[3].data.string.rowBytes(0));
 }
 
 test "a statement whose Compute fails to build lets the database close" {

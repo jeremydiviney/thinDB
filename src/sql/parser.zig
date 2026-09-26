@@ -2458,22 +2458,6 @@ pub const Parser = struct {
 
     fn castExprToType(self: *Parser, inner: ir.Expr, ty: types.Type) ParseError!ir.Expr {
         if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
-        if (inner == .case) {
-            const branches = try self.arena.alloc(ir.Expr.Branch, inner.case.branches.len);
-            for (inner.case.branches, branches) |src, *dst| {
-                dst.* = .{
-                    .cond = src.cond,
-                    .then = try self.castExprToType(src.then, ty),
-                };
-            }
-            var else_branch: ?*const ir.Expr = null;
-            if (inner.case.else_branch) |eb| {
-                const owned = try self.arena.create(ir.Expr);
-                owned.* = try self.castExprToType(eb.*, ty);
-                else_branch = owned;
-            }
-            return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
-        }
         const fn_name = try scalar_fn.castFnName(self.arena, ty) orelse return ParseError.SqlInvalidProjection;
         const args = try self.arena.alloc(ir.Expr, 1);
         args[0] = inner;

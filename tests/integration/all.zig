@@ -55,6 +55,7 @@ test {
     _ = @import("in_subquery_test.zig");
     _ = @import("col_col_predicate_test.zig");
     _ = @import("comparison_test.zig");
+    _ = @import("result_type_test.zig");
     _ = @import("predicate_precedence_test.zig");
     _ = @import("filter_compaction_test.zig");
     _ = @import("correlated_subquery_test.zig");

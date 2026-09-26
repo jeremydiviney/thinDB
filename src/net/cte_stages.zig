@@ -33,6 +33,8 @@ const local = @import("local.zig");
 const pgcat = @import("pg_catalog.zig");
 const types = @import("../types.zig");
 const join_mod = @import("../exec/join.zig");
+const cast = @import("../exec/cast.zig");
+const scalar_fn = @import("../exec/scalar_fn.zig");
 const udf = @import("../udf.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
@@ -1860,8 +1862,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 errdefer left.deinit();
                 var right = try compileUnionArm(input, u.right, map);
                 errdefer right.deinit();
-                // Pre-push lossless widening casts into the arms so the exec
-                // union is cast-free: rebatched()'s serial per-batch kernels
+                // Pre-push the conversions to the result type into the arms so
+                // the exec union is cast-free: rebatched()'s serial per-batch kernels
                 // disappear, and a join's probe sink can forward into BOTH arms
                 // (a cast arm otherwise pins the union's serial lane — on the
                 // production rollforward workload that lane carried the heavy 3.2M-row arm).
@@ -1879,51 +1881,6 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         else => return error.UnsupportedQueryShape,
     }
-}
-
-/// Integer-family widening rank; null for anything outside the family.
-fn intRank(t: types.Type) ?u8 {
-    return switch (t) {
-        .tinyint => 0,
-        .smallint => 1,
-        .int => 2,
-        .bigint => 3,
-        .largeint => 4,
-        else => null,
-    };
-}
-
-/// The scalar conversion fn implementing a lossless widening to `t`.
-fn wideningFnName(t: types.Type) ?[]const u8 {
-    return switch (t) {
-        .smallint => "to_smallint",
-        .int => "to_int",
-        .bigint => "to_bigint",
-        .largeint => "to_largeint",
-        .double => "to_double",
-        .datetime => "to_datetime",
-        else => null,
-    };
-}
-
-/// The common type both union arms should widen to — ONLY when the pair is
-/// a lossless, unambiguous widening (int-family → the wider member;
-/// float/double → double; date/datetime → datetime, a date being its own
-/// midnight). Everything else returns null and stays on the exec union's
-/// own cast kernels, exactly as before.
-fn unionWideningType(l: types.Type, r: types.Type) ?types.Type {
-    if (std.meta.activeTag(l) == std.meta.activeTag(r)) return null; // no cast needed
-    if (intRank(l)) |lr| {
-        if (intRank(r)) |rr| return if (lr > rr) l else r;
-        return null;
-    }
-    const lf = l == .float or l == .double;
-    const rf = r == .float or r == .double;
-    if (lf and rf) return .double;
-    const ld = l == .date or l == .datetime;
-    const rd = r == .date or r == .datetime;
-    if (ld and rd) return .datetime;
-    return null;
 }
 
 /// UNION's DISTINCT over the unioned rows: group on every output column —
@@ -1955,11 +1912,11 @@ fn distinctRows(input: engine_v2.CompileInput, unioned: exec.Query) !exec.Query 
     return grouped.project(cols);
 }
 
-/// Rewrite each arm so cast-needing columns are widened INSIDE the arm
-/// (fused into its scan workers where the chain allows) instead of by the
-/// union's serial per-batch kernels. Only the safe widening subset — see
-/// `unionWideningType`. Arm ownership transfers into the wrapping Compute
-/// on success; on ANY failure the arms are left exactly as passed in.
+/// Rewrite each arm so every column reaches the union's result type
+/// (`cast.commonType`) INSIDE the arm, fused into its scan workers where the
+/// chain allows, through the typed cast `CAST(col AS t)` lowers to. Arm
+/// ownership transfers into the wrapping Compute on success; on ANY failure
+/// the arms are left exactly as passed in.
 fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec.Query, right: *exec.Query) !void {
     const ls = left.outputSchema();
     const rs = right.outputSchema();
@@ -1968,7 +1925,7 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
     var r_derived: std.ArrayListUnmanaged(ir.Derived) = .empty;
     const trace_jf = getenv("THINDB_TRACE_JOINFUSE") != null;
     for (ls, rs) |lc, rc| {
-        if (std.meta.activeTag(lc.type) != std.meta.activeTag(rc.type)) {
+        if (!cast.sameRepresentation(lc.type, rc.type)) {
             // A bare NULL has no type of its own; it takes the other arm's.
             const l_null = outputIsNullLiteral(u.left, lc.name);
             if (l_null != outputIsNullLiteral(u.right, rc.name)) {
@@ -1980,17 +1937,16 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
                 continue;
             }
         }
-        const common = unionWideningType(lc.type, rc.type) orelse {
-            if (trace_jf and std.meta.activeTag(lc.type) != std.meta.activeTag(rc.type)) {
-                std.debug.print("[jf]   union widen skip: {s} {s} vs {s}\n", .{ lc.name, @tagName(lc.type), @tagName(rc.type) });
-            }
+        if (cast.sameRepresentation(lc.type, rc.type)) continue;
+        const common = cast.commonType(lc.type, rc.type) orelse {
+            if (trace_jf) std.debug.print("[jf]   union widen skip: {s} {s} vs {s}\n", .{ lc.name, @tagName(lc.type), @tagName(rc.type) });
             continue;
         };
-        const fn_name = wideningFnName(common) orelse continue;
-        if (std.meta.activeTag(lc.type) != std.meta.activeTag(common)) {
+        const fn_name = try scalar_fn.castFnName(input.node_arena, common) orelse continue;
+        if (!cast.sameRepresentation(lc.type, common)) {
             try l_derived.append(input.node_arena, try castDerived(input.node_arena, lc.name, fn_name));
         }
-        if (std.meta.activeTag(rc.type) != std.meta.activeTag(common)) {
+        if (!cast.sameRepresentation(rc.type, common)) {
             try r_derived.append(input.node_arena, try castDerived(input.node_arena, rc.name, fn_name));
         }
     }

@@ -241,6 +241,24 @@ pub fn greatestDoubleKernel(allocator: Allocator, args: []const ColumnView, out:
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, @max(a[i], b[i]));
 }
 
+/// GREATEST/LEAST over a column representation both arguments and the
+/// output share (`field` names it in the column data union).
+fn Extremum(comptime field: []const u8, comptime take_max: bool) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const a = @field(args[0].data, field);
+            const b = @field(args[1].data, field);
+            const dst = &@field(out.data, field);
+            for (a[0..row_count], b[0..row_count]) |x, y| try dst.append(allocator, if (take_max) @max(x, y) else @min(x, y));
+        }
+    };
+}
+
+pub const greatestDateKernel = Extremum("date", true).kernel;
+pub const greatestDatetimeKernel = Extremum("datetime", true).kernel;
+pub const leastDateKernel = Extremum("date", false).kernel;
+pub const leastDatetimeKernel = Extremum("datetime", false).kernel;
+
 pub fn leastIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0].data.int;
     const b = args[1].data.int;

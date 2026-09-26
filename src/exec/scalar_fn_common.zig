@@ -191,6 +191,55 @@ test "parseDateTimeString: fractions, date-only, Z, rejects" {
     try std.testing.expectError(error.Invalid, parseDateTimeString("1783663005455833"));
 }
 
+pub const Ymd = struct { y: i32, m: u32, d: u32 };
+
+pub fn civilFromDays(days_since_epoch: i64) Ymd {
+    const z = days_since_epoch + 719468;
+    const era_div: i64 = if (z >= 0) @divFloor(z, 146097) else @divFloor(z - 146096, 146097);
+    const era = era_div;
+    const doe: u64 = @intCast(z - era * 146097);
+    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y_iso: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp = (5 * doy + 2) / 153;
+    const d = doy - (153 * mp + 2) / 5 + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = y_iso + @as(i64, @intFromBool(m <= 2));
+    return .{ .y = @intCast(y), .m = @intCast(m), .d = @intCast(d) };
+}
+
+/// The canonical text of a DATE (`YYYY-MM-DD`), as the wire and `CAST(d AS CHAR)` print it.
+pub fn formatDate(buf: []u8, days_since_epoch: i32) ![]const u8 {
+    const ymd = civilFromDays(@intCast(days_since_epoch));
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(ymd.y)), ymd.m, ymd.d });
+}
+
+/// The canonical text of a DATETIME: fractional seconds only when nonzero.
+pub fn formatDateTime(buf: []u8, micros_since_epoch: i64) ![]const u8 {
+    const sec = @divFloor(micros_since_epoch, 1_000_000);
+    var us = @rem(micros_since_epoch, 1_000_000);
+    var s = sec;
+    if (us < 0) {
+        us += 1_000_000;
+        s -= 1;
+    }
+    const day = @divFloor(s, 86_400);
+    var tod = @rem(s, 86_400);
+    if (tod < 0) tod += 86_400;
+    const ymd = civilFromDays(@intCast(day));
+    // Zig 0.16's `{d:0>N}` prints a leading `+` for signed values; cast
+    // to unsigned before formatting (values are guaranteed non-negative
+    // after the normalization above).
+    const hours: u32 = @intCast(@divFloor(tod, 3600));
+    const minutes: u32 = @intCast(@divFloor(@rem(tod, 3600), 60));
+    const seconds: u32 = @intCast(@rem(tod, 60));
+    const us_u: u32 = @intCast(us);
+    const year_u: u32 = @intCast(ymd.y);
+    if (us == 0)
+        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year_u, ymd.m, ymd.d, hours, minutes, seconds });
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year_u, ymd.m, ymd.d, hours, minutes, seconds, us_u });
+}
+
 /// Days in month for a given (year, 1-indexed month). Handles Feb leap-year.
 pub fn lastDayOfMonth(year: i32, month: u32) u32 {
     return switch (month) {
