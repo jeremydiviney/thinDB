@@ -595,6 +595,18 @@ pub const Compute = struct {
         self.deinitLayer();
     }
 
+    /// Frees the Compute layers `top` stacks on `base`, leaving `base` to
+    /// its owner: the undo of a `Query.compute` over `base` whose result is
+    /// dropped before anything takes it.
+    pub fn deinitLayersOver(top: Query, base: Query) void {
+        var cur = top;
+        while (cur.ptr != base.ptr) {
+            const layer = exec.queryAs(Compute, cur).?;
+            cur = layer.upstream;
+            layer.deinitLayer();
+        }
+    }
+
     /// Frees this operator but not its upstream.
     fn deinitLayer(self: *Compute) void {
         for (self.derived_cols) |*c| c.deinit(self.allocator);
