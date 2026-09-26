@@ -800,3 +800,44 @@ test "CASE, IF and COALESCE raise only where a row takes the failing branch" {
     }
     try std.testing.expectEqualSlices(?f64, &.{ 0, 8, 0, 64, 0, 216, 0, 512, 0 }, got.items);
 }
+
+test "TRIM removes spaces, a character set, or whole copies of a string" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, s VARCHAR(20) NOT NULL, both VARCHAR(20) NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO t (id, s, both) VALUES (1, 'xxhixx', ' a'), (2, '  hi  ', 'b '), (3, 'hiabab', 'c'), (4, 'abhiba', 'd'), (5, 'éhié', 'e'), (6, '\t hi', 'f')");
+
+    const cases = .{
+        // MySQL's keyword form removes whole copies of remstr, spaces by default.
+        .{ "TRIM(LEADING 'x' FROM s)", .{ "hixx", "  hi  ", "hiabab", "abhiba", "éhié", "\t hi" } },
+        .{ "TRIM(TRAILING 'ab' FROM s)", .{ "xxhixx", "  hi  ", "hi", "abhiba", "éhié", "\t hi" } },
+        .{ "TRIM(BOTH 'ab' FROM s)", .{ "xxhixx", "  hi  ", "hi", "hiba", "éhié", "\t hi" } },
+        .{ "TRIM('x' FROM s)", .{ "hi", "  hi  ", "hiabab", "abhiba", "éhié", "\t hi" } },
+        .{ "TRIM('é' FROM s)", .{ "xxhixx", "  hi  ", "hiabab", "abhiba", "hi", "\t hi" } },
+        .{ "TRIM(BOTH FROM s)", .{ "xxhixx", "hi", "hiabab", "abhiba", "éhié", "\t hi" } },
+        .{ "TRIM(LEADING FROM s)", .{ "xxhixx", "hi  ", "hiabab", "abhiba", "éhié", "\t hi" } },
+        .{ "TRIM(TRAILING FROM s)", .{ "xxhixx", "  hi", "hiabab", "abhiba", "éhié", "\t hi" } },
+        // The call forms remove spaces only, or any character of a set, as
+        // StarRocks and DuckDB do.
+        .{ "TRIM(s)", .{ "xxhixx", "hi", "hiabab", "abhiba", "éhié", "\t hi" } },
+        .{ "TRIM(s, 'ab')", .{ "xxhixx", "  hi  ", "hi", "hi", "éhié", "\t hi" } },
+        .{ "LTRIM(s, 'x')", .{ "hixx", "  hi  ", "hiabab", "abhiba", "éhié", "\t hi" } },
+        .{ "RTRIM(s, 'ba')", .{ "xxhixx", "  hi  ", "hi", "abhi", "éhié", "\t hi" } },
+        .{ "TRIM(s, 'é')", .{ "xxhixx", "  hi  ", "hiabab", "abhiba", "hi", "\t hi" } },
+        // A lone side word is a column of that name.
+        .{ "TRIM(both)", .{ "a", "b", "c", "d", "e", "f" } },
+    };
+    inline for (cases) |c| {
+        const want: [6]?[]const u8 = c[1];
+        expectTextColumn(allocator, db, "SELECT " ++ c[0] ++ " FROM t ORDER BY id", &want) catch |err| {
+            std.debug.print("expr: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+    const matched = try helpers.collectBigints(allocator, db, "SELECT id FROM t WHERE TRIM(LEADING 'x' FROM s) = 'hixx' OR TRIM(TRAILING 'ab' FROM s) = 'hi' ORDER BY id");
+    defer allocator.free(matched);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, matched);
+}

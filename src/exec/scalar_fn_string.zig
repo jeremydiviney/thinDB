@@ -129,42 +129,95 @@ pub fn charLengthKernel(allocator: Allocator, args: []const ColumnView, out: *Co
     }
 }
 
-pub fn ltrimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+const TrimSide = enum { leading, trailing, both };
+
+/// What one trim step removes: a single character that appears in the given
+/// set (the one-argument forms remove only ' ', as in MySQL, StarRocks and
+/// DuckDB; the two-argument call form removes any listed character, as in
+/// StarRocks and DuckDB), or a whole copy of a string (MySQL's
+/// `TRIM(... remstr FROM s)`).
+const TrimRemoval = enum { char_set, substring };
+
+fn trimRows(
+    allocator: Allocator,
+    args: []const ColumnView,
+    out: *ColumnStore,
+    row_count: usize,
+    comptime side: TrimSide,
+    comptime removal: TrimRemoval,
+) !void {
     const sv = stringViewOf(args[0]);
+    const remove_view = if (args.len > 1) stringViewOf(args[1]) else null;
     const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const src = sv.rowBytes(i);
-        var start: usize = 0;
-        while (start < src.len and std.ascii.isWhitespace(src[start])) : (start += 1) {}
-        try ss.appendValue(allocator, src[start..]);
+    for (0..row_count) |i| {
+        const remove = if (remove_view) |rv| rv.rowBytes(i) else " ";
+        try ss.appendValue(allocator, trimText(sv.rowBytes(i), remove, side, removal));
     }
+}
+
+fn trimText(src: []const u8, remove: []const u8, comptime side: TrimSide, comptime removal: TrimRemoval) []const u8 {
+    var start: usize = 0;
+    var end: usize = src.len;
+    if (side != .trailing) {
+        while (start < end) {
+            const n = leadingTrimLen(src[start..end], remove, removal);
+            if (n == 0) break;
+            start += n;
+        }
+    }
+    if (side != .leading) {
+        while (end > start) {
+            const n = trailingTrimLen(src[start..end], remove, removal);
+            if (n == 0) break;
+            end -= n;
+        }
+    }
+    return src[start..end];
+}
+
+fn leadingTrimLen(s: []const u8, remove: []const u8, comptime removal: TrimRemoval) usize {
+    switch (removal) {
+        .substring => return if (remove.len > 0 and std.mem.startsWith(u8, s, remove)) remove.len else 0,
+        .char_set => {
+            const n = @min(std.unicode.utf8ByteSequenceLength(s[0]) catch 1, s.len);
+            return if (std.mem.indexOf(u8, remove, s[0..n]) != null) n else 0;
+        },
+    }
+}
+
+fn trailingTrimLen(s: []const u8, remove: []const u8, comptime removal: TrimRemoval) usize {
+    switch (removal) {
+        .substring => return if (remove.len > 0 and std.mem.endsWith(u8, s, remove)) remove.len else 0,
+        .char_set => {
+            var char_start = s.len - 1;
+            while (char_start > 0 and s[char_start] & 0xC0 == 0x80) char_start -= 1;
+            return if (std.mem.indexOf(u8, remove, s[char_start..]) != null) s.len - char_start else 0;
+        },
+    }
+}
+
+pub fn ltrimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try trimRows(allocator, args, out, row_count, .leading, .char_set);
 }
 
 pub fn rtrimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const src = sv.rowBytes(i);
-        var end: usize = src.len;
-        while (end > 0 and std.ascii.isWhitespace(src[end - 1])) : (end -= 1) {}
-        try ss.appendValue(allocator, src[0..end]);
-    }
+    try trimRows(allocator, args, out, row_count, .trailing, .char_set);
 }
 
 pub fn trimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const src = sv.rowBytes(i);
-        var start: usize = 0;
-        while (start < src.len and std.ascii.isWhitespace(src[start])) : (start += 1) {}
-        var end: usize = src.len;
-        while (end > start and std.ascii.isWhitespace(src[end - 1])) : (end -= 1) {}
-        try ss.appendValue(allocator, src[start..end]);
-    }
+    try trimRows(allocator, args, out, row_count, .both, .char_set);
+}
+
+pub fn ltrimSubstringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try trimRows(allocator, args, out, row_count, .leading, .substring);
+}
+
+pub fn rtrimSubstringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try trimRows(allocator, args, out, row_count, .trailing, .substring);
+}
+
+pub fn trimSubstringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try trimRows(allocator, args, out, row_count, .both, .substring);
 }
 
 pub fn reverseKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
