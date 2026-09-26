@@ -768,6 +768,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .op = p.op,
             .val = try cloneValue(aa, p.val),
         } },
+        .text_as_number, .text_as_number_set => try exec.predicate.deepClonePredicate(aa, expr),
         .leaf_col_col => |lc| PredicateExpr{ .leaf_col_col = .{
             .left = try aa.dupe(u8, lc.left),
             .op = lc.op,
@@ -1566,7 +1567,8 @@ fn projWalkPredicate(c: *ProjScan, allocator: Allocator, p: exec.predicate.Predi
         },
         .is_null, .is_not_null => |col| c.add(allocator, col),
         .like => |lp| c.add(allocator, lp.col),
-        .in_set => |s| c.add(allocator, s.col),
+        .in_set, .text_as_number_set => |s| c.add(allocator, s.col),
+        .text_as_number => |lf| c.add(allocator, lf.col),
         .@"and", .@"or" => |children| for (children) |ch| projWalkPredicate(c, allocator, ch),
         .not => |child| projWalkPredicate(c, allocator, child.*),
         .always, .unknown => {},

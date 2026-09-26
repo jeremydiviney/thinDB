@@ -363,7 +363,8 @@ fn collectPredCols(arena: Allocator, pred: PredicateExpr, out: *std.ArrayListUnm
         .day_leaf => |l| out.append(arena, l.col) catch return false,
         .is_null, .is_not_null => |name| out.append(arena, name) catch return false,
         .like => |lk| out.append(arena, lk.col) catch return false,
-        .in_set => |s| out.append(arena, s.col) catch return false,
+        .in_set, .text_as_number_set => |s| out.append(arena, s.col) catch return false,
+        .text_as_number => |l| out.append(arena, l.col) catch return false,
         .leaf_var => |v| out.append(arena, v.col) catch return false,
         .always, .unknown => {},
         .@"and", .@"or" => |kids| for (kids) |k| {

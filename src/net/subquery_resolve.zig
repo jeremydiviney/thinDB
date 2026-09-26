@@ -117,7 +117,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .text_as_number, .text_as_number_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
         .leaf_var => |v| {
             // `col <op> @x` where @x is SQL NULL is UNKNOWN under 3VL (matches a
             // null literal on the RHS); otherwise compare against the value.
@@ -1049,6 +1049,9 @@ const LoweredScalars = struct {
     values: std.ArrayList(ir.Derived) = .empty,
     /// The subqueries' expressions over those values.
     post_values: std.ArrayList(ir.Derived) = .empty,
+    /// Comparison right sides over the subqueries' results (`x > (SELECT
+    /// ...) - 1`), evaluated per outer row.
+    compared_values: std.ArrayList(ir.Derived) = .empty,
     /// Join-side and value columns, dropped once the operator has read them.
     hidden: std.ArrayList([]const u8) = .empty,
 };
@@ -1153,6 +1156,18 @@ fn missedJoinValue(ctx: *CompileCtx, func: ir.AggFunc, agg_col: []const u8) !ir.
     };
 }
 
+/// The expression of `SELECT <expr>` with no FROM, the form a comparison's
+/// right side takes when it holds no column; null for any other subquery.
+fn singleRowExpr(source: *const anyopaque) ?*ir.Expr {
+    const op: *const ir.Op = @ptrCast(@alignCast(source));
+    if (op.* != .select) return null;
+    const upstream = op.select.upstream;
+    if (upstream.* != .compute) return null;
+    const c = upstream.compute;
+    if (c.upstream.* != .single_row or c.derived.len != 1) return null;
+    return @constCast(&c.derived[0].expr);
+}
+
 /// `input` LEFT JOINed with each lowered subquery, value columns on top.
 fn joinLoweredScalars(ctx: *CompileCtx, input: *ir.Op, lowered: LoweredScalars) !*ir.Op {
     var left = input;
@@ -1170,9 +1185,11 @@ fn joinLoweredScalars(ctx: *CompileCtx, input: *ir.Op, lowered: LoweredScalars) 
             .right = j.right,
         } });
     }
-    const values = try newOp(ctx, .{ .compute = .{ .derived = lowered.values.items, .upstream = left } });
-    if (lowered.post_values.items.len == 0) return values;
-    return newOp(ctx, .{ .compute = .{ .derived = lowered.post_values.items, .upstream = values } });
+    var top = try newOp(ctx, .{ .compute = .{ .derived = lowered.values.items, .upstream = left } });
+    for ([_][]const ir.Derived{ lowered.post_values.items, lowered.compared_values.items }) |derived| {
+        if (derived.len > 0) top = try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = top } });
+    }
+    return top;
 }
 
 /// Rewrite each correlated `col op (scalar subquery)` in `pred` into a
@@ -1181,6 +1198,20 @@ fn lowerPredicateScalars(ctx: *CompileCtx, pred: *PredicateExpr, lowered: *Lower
     switch (pred.*) {
         .scalar_subquery => |sq| if (try lowerCorrelatedScalar(ctx, sq.source, lowered)) |value| {
             pred.* = .{ .leaf_col_col = .{ .left = sq.col, .op = sq.op, .right = value } };
+        } else if (singleRowExpr(sq.source)) |expr| {
+            // `col op <expression>` with no column is evaluated once, over a
+            // single row, so it can prune as a literal. A correlated subquery
+            // inside it reads the outer row: lowered, the expression becomes a
+            // value column the comparison reads per row.
+            const joins_before = lowered.joins.items.len;
+            try resolveSubqueriesInExpr(ctx, expr, lowered);
+            if (lowered.joins.items.len == joins_before) return;
+            const na = ctx.nodeArena();
+            const name = try std.fmt.allocPrint(na, "__csq_cmp{d}", .{ctx.lowered_scalars});
+            ctx.lowered_scalars += 1;
+            try lowered.compared_values.append(na, .{ .name = name, .expr = expr.* });
+            try lowered.hidden.append(na, name);
+            pred.* = .{ .leaf_col_col = .{ .left = sq.col, .op = sq.op, .right = name } };
         },
         .@"and", .@"or" => |children| for (children) |*c| try lowerPredicateScalars(ctx, @constCast(c), lowered),
         .not => |child| try lowerPredicateScalars(ctx, @constCast(child), lowered),

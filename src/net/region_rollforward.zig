@@ -1318,7 +1318,7 @@ fn hashExpr(h: *std.hash.Wyhash, e: Expr) error{RegionUnhashable}!void {
 fn hashPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void {
     hu(h, @intFromEnum(std.meta.activeTag(p)));
     switch (p) {
-        .leaf, .day_leaf => |l| {
+        .leaf, .day_leaf, .text_as_number => |l| {
             hstr(h, l.col);
             hu(h, @intFromEnum(l.op));
             hashValue(h, l.val);
@@ -1340,7 +1340,7 @@ fn hashPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void 
         .not => |k| try hashPred(h, k.*),
         .always => |b| hu(h, @intFromBool(b)),
         .unknown => {},
-        .in_set => |s| {
+        .in_set, .text_as_number_set => |s| {
             hstr(h, s.col);
             hu(h, @intFromBool(s.negate));
             hu(h, s.values.len);
@@ -1713,6 +1713,7 @@ const Builder = struct {
         return switch (p) {
             .leaf => |l| .{ .leaf = try b.cloneLeaf(l) },
             .day_leaf => |l| .{ .day_leaf = try b.cloneLeaf(l) },
+            .text_as_number => |l| .{ .text_as_number = try b.cloneLeaf(l) },
             .leaf_col_col => |cc| blk: {
                 const li = try b.resolveIdx(cc.left);
                 const ri = try b.resolveIdx(cc.right);
@@ -2096,6 +2097,7 @@ fn clonePredPlain(a: Allocator, p: PredicateExpr) anyerror!PredicateExpr {
     return switch (p) {
         .leaf => |l| .{ .leaf = try cloneLeafPlain(a, l) },
         .day_leaf => |l| .{ .day_leaf = try cloneLeafPlain(a, l) },
+        .text_as_number => |l| .{ .text_as_number = try cloneLeafPlain(a, l) },
         .leaf_col_col => |cc| .{ .leaf_col_col = .{
             .left = try a.dupe(u8, lastSegment(cc.left)),
             .op = cc.op,
@@ -3438,7 +3440,7 @@ fn exprColNames(a: Allocator, e: Expr, out: *std.ArrayListUnmanaged([]const u8))
 
 fn predColNames(a: Allocator, p: PredicateExpr, out: *std.ArrayListUnmanaged([]const u8)) anyerror!void {
     switch (p) {
-        .leaf, .day_leaf => |l| try out.append(a, l.col),
+        .leaf, .day_leaf, .text_as_number => |l| try out.append(a, l.col),
         .leaf_col_col => |l| {
             try out.append(a, l.left);
             try out.append(a, l.right);
@@ -3447,7 +3449,7 @@ fn predColNames(a: Allocator, p: PredicateExpr, out: *std.ArrayListUnmanaged([]c
         .like => |l| try out.append(a, l.col),
         .@"and", .@"or" => |kids| for (kids) |k| try predColNames(a, k, out),
         .not => |k| try predColNames(a, k.*, out),
-        .in_set => |s| try out.append(a, s.col),
+        .in_set, .text_as_number_set => |s| try out.append(a, s.col),
         else => {},
     }
 }

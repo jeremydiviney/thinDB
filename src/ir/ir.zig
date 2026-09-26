@@ -1745,7 +1745,8 @@ const PredTag = enum(u8) {
 
 pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: PredicateExpr) EncodeError!void {
     switch (expr) {
-        .leaf => |p| {
+        // Validation's text-against-number form re-validates from the leaf.
+        .leaf, .text_as_number => |p| {
             try out.append(allocator, @intFromEnum(PredTag.leaf));
             try out.append(allocator, @intFromEnum(p.op));
             try appendU32(allocator, out, @intCast(p.col.len));
@@ -1789,7 +1790,7 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
         // `.always` / `.in_set` / `.correlated_set` are post-resolution
         // forms that also shouldn't appear in wire IR (callers re-emit
         // via SQL).
-        .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => return EncodeError.OutOfMemory,
+        .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .text_as_number_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => return EncodeError.OutOfMemory,
         .@"and" => |children| {
             try out.append(allocator, @intFromEnum(PredTag.p_and));
             try appendU32(allocator, out, @intCast(children.len));
@@ -2988,7 +2989,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
 
 pub fn freeDecodedPredicate(expr: PredicateExpr, allocator: Allocator) void {
     switch (expr) {
-        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => {},
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .text_as_number, .text_as_number_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => {},
         .@"and", .@"or" => |children| {
             for (children) |c| freeDecodedPredicate(c, allocator);
             allocator.free(children);

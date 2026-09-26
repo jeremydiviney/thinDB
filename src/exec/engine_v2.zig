@@ -425,15 +425,14 @@ fn appendNameUnique(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([
 
 fn collectPredicateNames(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([]const u8), p: exec.PredicateExpr) !void {
     switch (p) {
-        .leaf => |l| try appendNameUnique(allocator, set, l.col),
-        .day_leaf => |l| try appendNameUnique(allocator, set, l.col),
+        .leaf, .day_leaf, .text_as_number => |l| try appendNameUnique(allocator, set, l.col),
         .leaf_col_col => |c| {
             try appendNameUnique(allocator, set, c.left);
             try appendNameUnique(allocator, set, c.right);
         },
         .is_null, .is_not_null => |nm| try appendNameUnique(allocator, set, nm),
         .like => |lk| try appendNameUnique(allocator, set, lk.col),
-        .in_set => |s| try appendNameUnique(allocator, set, s.col),
+        .in_set, .text_as_number_set => |s| try appendNameUnique(allocator, set, s.col),
         .@"and", .@"or" => |kids| for (kids) |k| try collectPredicateNames(allocator, set, k),
         .not => |k| try collectPredicateNames(allocator, set, k.*),
         else => {},
@@ -1260,15 +1259,14 @@ fn collectPredicateColumns(
     p: exec.PredicateExpr,
 ) !void {
     switch (p) {
-        .leaf => |lf| try addColumnUnique(allocator, set, lf.col),
-        .day_leaf => |lf| try addColumnUnique(allocator, set, lf.col),
+        .leaf, .day_leaf, .text_as_number => |lf| try addColumnUnique(allocator, set, lf.col),
         .leaf_col_col => |lc| {
             try addColumnUnique(allocator, set, lc.left);
             try addColumnUnique(allocator, set, lc.right);
         },
         .is_null, .is_not_null => |col| try addColumnUnique(allocator, set, col),
         .like => |lp| try addColumnUnique(allocator, set, lp.col),
-        .in_set => |s| try addColumnUnique(allocator, set, s.col),
+        .in_set, .text_as_number_set => |s| try addColumnUnique(allocator, set, s.col),
         .@"and", .@"or" => |children| for (children) |ch| try collectPredicateColumns(allocator, set, ch),
         .not => |child| try collectPredicateColumns(allocator, set, child.*),
         .always => {},
