@@ -1773,7 +1773,9 @@ pub const Parser = struct {
         return dateAddSubName(name) != null or
             std.ascii.eqlIgnoreCase(name, "cast") or
             std.ascii.eqlIgnoreCase(name, "convert") or
-            std.ascii.eqlIgnoreCase(name, "extract");
+            std.ascii.eqlIgnoreCase(name, "extract") or
+            std.ascii.eqlIgnoreCase(name, "position") or
+            std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring");
     }
 
     pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
@@ -1781,9 +1783,47 @@ pub const Parser = struct {
         if (std.ascii.eqlIgnoreCase(name, "cast")) return try self.parseCastCallAfterName();
         if (std.ascii.eqlIgnoreCase(name, "convert")) return try self.parseConvertCallAfterName();
         if (std.ascii.eqlIgnoreCase(name, "extract")) return try self.parseExtractCall();
+        if (std.ascii.eqlIgnoreCase(name, "position")) return try self.parsePositionCall();
+        if (std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring")) return try self.parseSubstringCall(name);
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
         const args = try self.parseCallArgList(null);
         return try self.makeScalarCallExpr(name, args);
+    }
+
+    /// `POSITION(needle IN haystack)`, or the plain two-argument call. The
+    /// needle is a value, so its IN is the call's separator, not a predicate.
+    fn parsePositionCall(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        const needle = try self.parseCallArg();
+        if (self.cur.tag == .kw_in) try self.advance() else try self.expect(.comma);
+        const args = try self.arena.alloc(ir.Expr, 2);
+        args[0] = needle;
+        args[1] = try self.parseCallArg();
+        try self.expect(.rparen);
+        return try self.makeScalarCallExpr("position", args);
+    }
+
+    /// `SUBSTRING(s FROM pos [FOR len])`, the standard spelling, or the
+    /// comma list `SUBSTRING(s, pos [, len])`.
+    fn parseSubstringCall(self: *Parser, name: []const u8) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        var args: std.ArrayList(ir.Expr) = .empty;
+        try args.append(self.arena, try self.parseCallArg());
+        if (self.cur.tag == .kw_from) {
+            try self.advance();
+            try args.append(self.arena, try self.parseCallArg());
+            if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "for")) {
+                try self.advance();
+                try args.append(self.arena, try self.parseCallArg());
+            }
+        } else {
+            while (self.cur.tag == .comma) {
+                try self.advance();
+                try args.append(self.arena, try self.parseCallArg());
+            }
+        }
+        try self.expect(.rparen);
+        return try self.makeScalarCallExpr(name, try args.toOwnedSlice(self.arena));
     }
 
     fn parseIfCallAfterName(self: *Parser) ParseError!ir.Expr {
