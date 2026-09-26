@@ -44,6 +44,7 @@ pub fn mapInternal(err: anyerror) Mapped {
         .ambiguous_column => .{ .sqlstate = "42702".*, .message = "column reference is ambiguous" },
         .query_cancelled => .{ .sqlstate = "57014".*, .message = "canceling statement due to user request" },
         .numeric_out_of_range => .{ .sqlstate = "22003".*, .message = "numeric value out of range" },
+        .subquery_multiple_rows => .{ .sqlstate = "21000".*, .message = "more than one row returned by a subquery used as an expression" },
         .unknown => .{ .sqlstate = "42000".*, .message = name },
     };
 }

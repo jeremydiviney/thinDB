@@ -126,6 +126,7 @@ pub fn resolveWithRegistry(
     // decimal operand never falls into an int/double overload that ignores scale.
     if (try resolveDecimal(aa, name, arg_types)) |ov| return ov;
     if (try resolveIntArith(aa, name, arg_types)) |ov| return ov;
+    if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
 
     // Fast path: exact TypeTag match. No allocation, no cost calc.
@@ -472,6 +473,7 @@ fn resolveIntArith(aa: Allocator, name: []const u8, arg_types: []const Type) !?R
 /// registered UDF. Name-only, so it holds before argument types are known.
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "to_decimal")) return true;
+    if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
@@ -480,6 +482,17 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
         for (reg.scalarEntries()) |entry| if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
     }
     return false;
+}
+
+/// Internal: a correlated scalar subquery's value for one outer row,
+/// `__single_row(matched_rows, value)`, where `matched_rows` counts the inner
+/// rows the outer row's correlation key matched.
+pub const SINGLE_ROW_FN = "__single_row";
+
+fn resolveSingleRow(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (!std.mem.eql(u8, name, SINGLE_ROW_FN)) return null;
+    if (arg_types.len != 2 or arg_types[0] != .bigint) return null;
+    return try buildDecFn(aa, name, arg_types, arg_types[1], cond.singleRowKernel, .kernel_managed);
 }
 
 fn intCastTarget(name: []const u8) ?Type {

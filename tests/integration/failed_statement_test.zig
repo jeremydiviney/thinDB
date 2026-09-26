@@ -38,7 +38,7 @@ test "failed statements leave the statement gate idle" {
     try helpers.exec(allocator, db, "CREATE TABLE fc (id BIGINT PRIMARY KEY, n INT)");
     try helpers.exec(allocator, db, "INSERT INTO fa VALUES (1, 1, 'a', '2024-01-01'), (2, 2, 'b', '2024-01-02')");
     try helpers.exec(allocator, db, "INSERT INTO fb VALUES (1, 1, '2024-01-01'), (2, 0, '2024-01-02')");
-    try helpers.exec(allocator, db, "INSERT INTO fc VALUES (1, 1)");
+    try helpers.exec(allocator, db, "INSERT INTO fc VALUES (1, 1), (2, 1)");
 
     const statements = [_][]const u8{
         // Join keys that never compare.
@@ -61,6 +61,8 @@ test "failed statements leave the statement gate idle" {
         "SELECT id FROM fa WHERE EXISTS (SELECT 1 FROM fb WHERE fb.dt = fa.n)",
         "SELECT id FROM fa UNION ALL SELECT id, n FROM fb",
         "SELECT fa.id, sqrt(fb.dt) AS v FROM fa JOIN fb ON fa.id = fb.id",
+        // A correlated lookup whose key matches two rows.
+        "SELECT fb.id, (SELECT fc.id FROM fc WHERE fc.n = fb.n) AS x FROM fb",
         // Fails while running, past the join.
         "SELECT fa.id, CAST(fa.n AS DECIMAL(38,0)) * 90000000000000000000000000000000000000 AS v FROM fa JOIN fb ON fa.id = fb.id",
     };

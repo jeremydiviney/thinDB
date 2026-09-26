@@ -14,6 +14,7 @@ pub const Category = enum {
     ambiguous_column,
     query_cancelled,
     numeric_out_of_range,
+    subquery_multiple_rows,
     unknown,
 };
 
@@ -28,6 +29,7 @@ pub fn classify(err_name: []const u8) Category {
     if (std.mem.eql(u8, err_name, "SqlOnColumnAmbiguous")) return .ambiguous_column;
     if (std.mem.eql(u8, err_name, "QueryCancelled")) return .query_cancelled;
     if (std.mem.eql(u8, err_name, "ArithmeticOverflow")) return .numeric_out_of_range;
+    if (std.mem.eql(u8, err_name, "SubqueryMultipleRows")) return .subquery_multiple_rows;
     return .unknown;
 }
 
@@ -36,6 +38,7 @@ test "classify recognizes known errors" {
     try std.testing.expectEqual(Category.database_already_exists, classify("DatabaseAlreadyExists"));
     try std.testing.expectEqual(Category.query_cancelled, classify("QueryCancelled"));
     try std.testing.expectEqual(Category.numeric_out_of_range, classify("ArithmeticOverflow"));
+    try std.testing.expectEqual(Category.subquery_multiple_rows, classify("SubqueryMultipleRows"));
     try std.testing.expectEqual(Category.ambiguous_column, classify("SqlOnColumnAmbiguous"));
     try std.testing.expectEqual(Category.unknown, classify("NotARealError"));
 }

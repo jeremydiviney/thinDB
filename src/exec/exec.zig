@@ -92,6 +92,8 @@ pub const Error = error{
     AggregateUnsupportedType,
     AggregateInvalidParam,
     ArithmeticOverflow,
+    /// A scalar subquery returned more than one row for a row that reads it.
+    SubqueryMultipleRows,
     /// Compute operator: no derived columns provided.
     ComputeNoColumns,
     /// Table-valued UDF contract violations: call-site PARTITION BY vs

@@ -6,11 +6,30 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const Type = @import("../types.zig").Type;
+const transform = @import("../engine/transform.zig");
+
 const common = @import("scalar_fn_common.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
+
+// ---------------------------------------------------------------------------
+// __single_row(matched_rows, value): a correlated scalar subquery's value.
+// ---------------------------------------------------------------------------
+
+/// `value` for an outer row whose correlation key matched at most one inner
+/// row. More than one leaves the subquery without a value, which fails the
+/// statement, as it does in MySQL and PostgreSQL.
+pub fn singleRowKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    for (args[0].data.bigint[0..row_count], 0..) |matched, row| {
+        if (matched > 1 and args[0].isValid(row)) return error.SubqueryMultipleRows;
+    }
+    try transform.appendColumnRange(allocator, args[1], 0, row_count, out);
+}
 
 // ---------------------------------------------------------------------------
 // COALESCE ? first non-null wins. Compute writes the bitmap (absorbs);
