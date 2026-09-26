@@ -4533,11 +4533,13 @@ fn nameInList(name: []const u8, cols: []const []const u8) bool {
 
 fn groupColumnNameEql(a: []const u8, b: []const u8) bool {
     if (types.columnNameEql(a, b)) return true;
-    if (std.mem.lastIndexOfScalar(u8, a, '.')) |dot| {
-        if (std.mem.indexOfScalar(u8, b, '.') == null and types.columnNameEql(a[dot + 1 ..], b)) return true;
+    const split_a = types.splitQualifiedName(a);
+    const split_b = types.splitQualifiedName(b);
+    if (split_a) |s| {
+        if (split_b == null and types.columnNameEql(s.bare, b)) return true;
     }
-    if (std.mem.lastIndexOfScalar(u8, b, '.')) |dot| {
-        if (std.mem.indexOfScalar(u8, a, '.') == null and types.columnNameEql(a, b[dot + 1 ..])) return true;
+    if (split_b) |s| {
+        if (split_a == null and types.columnNameEql(a, s.bare)) return true;
     }
     return false;
 }
@@ -4937,11 +4939,10 @@ fn nameIn(needle: []const u8, names: []const []const u8) bool {
 }
 
 /// Whether an input with output `columns` binds the unqualified `name`: a
-/// bare name matches on the last dotted segment, as `types.findColumn` does.
+/// bare name matches on the bare column, as `types.findColumn` does.
 fn exposesColumn(columns: []const []const u8, name: []const u8) bool {
     for (columns) |c| {
-        const last = if (std.mem.lastIndexOfScalar(u8, c, '.')) |dot| c[dot + 1 ..] else c;
-        if (types.columnNameEql(last, name)) return true;
+        if (types.columnNameEql(types.unqualifiedName(c), name)) return true;
     }
     return false;
 }

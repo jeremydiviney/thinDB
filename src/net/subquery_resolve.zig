@@ -463,12 +463,10 @@ fn analyzeCorrelation(ctx: *CompileCtx, inner: *ir.Op) !?CorrelationInfo {
 /// inner col whenever the bare column name happens to exist in the
 /// inner table (very common: `region`, `id`, `created_at`, etc.).
 fn refIsInnerLocal(ref: []const u8, inner_schema: TableSchema, scan_alias: ?[]const u8) bool {
-    if (std.mem.lastIndexOfScalar(u8, ref, '.')) |dot| {
-        const qualifier = ref[0..dot];
-        const tail = ref[dot + 1 ..];
+    if (types.splitQualifiedName(ref)) |split| {
         const alias = scan_alias orelse return false; // qualified ref against unaliased scan: not local
-        if (!std.mem.eql(u8, qualifier, alias)) return false;
-        return inner_schema.columnIndex(tail) != null;
+        if (!std.mem.eql(u8, split.qualifier, alias)) return false;
+        return inner_schema.columnIndex(split.bare) != null;
     }
     return inner_schema.columnIndex(ref) != null;
 }

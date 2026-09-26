@@ -39,10 +39,7 @@ fn trace() bool {
     return std.c.getenv("THINDB_TRACE_PRUNE") != null;
 }
 
-fn lastSegment(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
-    return name;
-}
+const lastSegment = types.unqualifiedName;
 
 fn lower(arena: Allocator, s: []const u8) ?[]const u8 {
     const buf = arena.alloc(u8, s.len) catch return null;

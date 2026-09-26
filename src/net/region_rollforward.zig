@@ -1412,17 +1412,16 @@ const FrameB = struct {
         for (fb.vis.items) |e| {
             if (std.ascii.eqlIgnoreCase(e.name, name)) return e;
         }
-        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
-            const tail = name[dot + 1 ..];
+        if (types.splitQualifiedName(name)) |split| {
             for (fb.vis.items) |e| {
-                if (std.ascii.eqlIgnoreCase(e.name, tail)) return e;
+                if (std.ascii.eqlIgnoreCase(e.name, split.bare)) return e;
             }
             return null;
         }
         var match: ?VisEntry = null;
         for (fb.vis.items) |e| {
-            const d = std.mem.lastIndexOfScalar(u8, e.name, '.') orelse continue;
-            if (std.ascii.eqlIgnoreCase(e.name[d + 1 ..], name)) {
+            const split = types.splitQualifiedName(e.name) orelse continue;
+            if (std.ascii.eqlIgnoreCase(split.bare, name)) {
                 if (match != null) return null; // ambiguous
                 match = e;
             }
@@ -1433,8 +1432,8 @@ const FrameB = struct {
 
 fn visRefMatches(vis_name: []const u8, ref: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(vis_name, ref)) return true;
-    if (std.mem.lastIndexOfScalar(u8, ref, '.')) |dot| {
-        return std.ascii.eqlIgnoreCase(vis_name, ref[dot + 1 ..]);
+    if (types.splitQualifiedName(ref)) |split| {
+        return std.ascii.eqlIgnoreCase(vis_name, split.bare);
     }
     return false;
 }
@@ -1555,9 +1554,9 @@ const Builder = struct {
     const_idxs: std.ArrayListUnmanaged(usize) = .empty,
 
     fn resolveIdx(b: *Builder, name: []const u8) !usize {
-        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+        if (types.splitQualifiedName(name)) |split| {
             for (b.null_sides.items) |side| {
-                if (std.ascii.eqlIgnoreCase(side.alias, name[0..dot])) return b.tryNullAppend(name);
+                if (std.ascii.eqlIgnoreCase(side.alias, split.qualifier)) return b.tryNullAppend(name);
             }
         }
         if (b.fb.resolve(name)) |e| return e.idx;
@@ -1960,9 +1959,9 @@ fn right_key_referenced(alias: ?[]const u8, column: []const u8, live: ?[]const [
     const al = alias orelse return false;
     const names = live orelse return true;
     for (names) |name| {
-        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse continue;
-        if (std.ascii.eqlIgnoreCase(name[0..dot], al) and
-            std.ascii.eqlIgnoreCase(name[dot + 1 ..], lastSegment(column))) return true;
+        const split = types.splitQualifiedName(name) orelse continue;
+        if (std.ascii.eqlIgnoreCase(split.qualifier, al) and
+            std.ascii.eqlIgnoreCase(split.bare, lastSegment(column))) return true;
     }
     return false;
 }
@@ -4559,9 +4558,9 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             var qualified_ref = false;
             if (live) |names| {
                 for (names) |n| {
-                    const dot = std.mem.lastIndexOfScalar(u8, n, '.') orelse continue;
-                    if (std.ascii.eqlIgnoreCase(n[0..dot], al) and
-                        std.ascii.eqlIgnoreCase(n[dot + 1 ..], tail))
+                    const split = types.splitQualifiedName(n) orelse continue;
+                    if (std.ascii.eqlIgnoreCase(split.qualifier, al) and
+                        std.ascii.eqlIgnoreCase(split.bare, tail))
                     {
                         qualified_ref = true;
                         break;
@@ -4931,10 +4930,7 @@ fn traceMark(name: []const u8, last: *i64) void {
     last.* = now;
 }
 
-fn lastSegment(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |d| return name[d + 1 ..];
-    return name;
-}
+const lastSegment = types.unqualifiedName;
 
 fn valueI64(v: Value) ?i64 {
     return switch (v) {

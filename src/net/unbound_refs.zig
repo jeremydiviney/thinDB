@@ -20,6 +20,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const ir = @import("../ir/ir.zig");
+const types = @import("../types.zig");
 const api = @import("../api/api.zig");
 const local = @import("local.zig");
 const pgcat = @import("pg_catalog.zig");
@@ -60,13 +61,10 @@ pub fn find(
     return finder.walk(root);
 }
 
-/// Lower-cased last dotted segments of the names an operator can expose.
+/// Lower-cased bare names of the columns an operator can expose.
 const NameSet = std.StringHashMapUnmanaged(void);
 
-fn lastSegment(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
-    return name;
-}
+const lastSegment = types.unqualifiedName;
 
 fn isStar(name: []const u8) bool {
     return std.mem.eql(u8, name, "*") or std.mem.endsWith(u8, name, ".*");

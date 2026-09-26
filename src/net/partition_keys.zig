@@ -84,18 +84,16 @@ fn emit(where: []const u8, op: *const ir.Op, info: Info) void {
 /// `projectId` (SQL refs mix qualified and bare forms freely across CTEs).
 fn nameMatches(a: []const u8, b: []const u8) bool {
     if (types.columnNameEql(a, b)) return true;
-    if (std.mem.lastIndexOfScalar(u8, a, '.')) |dot| {
-        if (types.columnNameEql(a[dot + 1 ..], b)) return true;
+    if (types.splitQualifiedName(a)) |split| {
+        if (types.columnNameEql(split.bare, b)) return true;
     }
-    if (std.mem.lastIndexOfScalar(u8, b, '.')) |dot| {
-        if (types.columnNameEql(a, b[dot + 1 ..])) return true;
+    if (types.splitQualifiedName(b)) |split| {
+        if (types.columnNameEql(a, split.bare)) return true;
     }
     return false;
 }
 
-fn bareName(n: []const u8) []const u8 {
-    return if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| n[dot + 1 ..] else n;
-}
+const bareName = types.unqualifiedName;
 
 /// Intersect `keys` (null = TOP) with name set `with`, in the arena. Keys
 /// are held in BARE form throughout (SQL refs mix `cia.projectId` and

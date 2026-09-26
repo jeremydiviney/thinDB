@@ -407,6 +407,9 @@ test "appendColumnDef presents a qualified result name as table + bare name" {
     try appendColumnDef(allocator, &out, "db", "", .{ .name = "e.id", .type = .bigint });
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01e\x01e\x02id\x02id") != null);
     out.clearRetainingCapacity();
-    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "x.y + 1", .type = .bigint });
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x07x.y + 1\x07x.y + 1") != null);
+    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "s.mul(x, 1.5)", .type = .double });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01s\x01s\x0bmul(x, 1.5)\x0bmul(x, 1.5)") != null);
+    out.clearRetainingCapacity();
+    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "0.5", .type = .double });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x030.5\x030.5") != null);
 }

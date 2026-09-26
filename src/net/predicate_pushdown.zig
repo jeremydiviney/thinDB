@@ -330,11 +330,8 @@ fn combine(arena: Allocator, conjuncts: []const PredicateExpr) !PredicateExpr {
     return .{ .@"and" = try arena.dupe(PredicateExpr, conjuncts) };
 }
 
-/// Last dotted segment of `name` — the form `types.findColumn` matches on.
-fn suffix(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
-    return name;
-}
+/// Bare column of a name — the form `types.findColumn` matches on.
+const suffix = types.unqualifiedName;
 
 fn isStar(name: []const u8) bool {
     return std.mem.eql(u8, name, "*") or std.mem.endsWith(u8, name, ".*");
