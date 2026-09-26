@@ -1062,6 +1062,45 @@ test "sql: ORDER BY an expression sorts on its value" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 4, 1, 3, 2 }, b.values[0].data.bigint[0..b.row_count]);
 }
 
+test "sql: NULLS FIRST and NULLS LAST place NULL sort keys" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE o (id BIGINT NOT NULL, k BIGINT NOT NULL, qty BIGINT, big BIGINT NOT NULL, PRIMARY KEY (id))");
+    try helpers.exec(allocator, db, "INSERT INTO o VALUES (1, 1, 5, 30), (2, 2, NULL, 10), (3, 1, 2, 20), (4, 2, 7, 40), (5, 3, NULL, 50)");
+
+    const cases = .{
+        .{ "SELECT id FROM o ORDER BY qty NULLS LAST, id", &[_]i64{ 3, 1, 4, 2, 5 } },
+        .{ "SELECT id FROM o ORDER BY qty ASC NULLS FIRST, id", &[_]i64{ 2, 5, 3, 1, 4 } },
+        .{ "SELECT id FROM o ORDER BY qty DESC NULLS FIRST, id", &[_]i64{ 2, 5, 4, 1, 3 } },
+        .{ "SELECT id FROM o ORDER BY qty DESC NULLS LAST, id", &[_]i64{ 4, 1, 3, 2, 5 } },
+        .{ "SELECT id FROM o ORDER BY qty nulls last, id LIMIT 2", &[_]i64{ 3, 1 } },
+        .{ "SELECT id FROM o ORDER BY qty DESC NULLS FIRST, id LIMIT 3", &[_]i64{ 2, 5, 4 } },
+        .{ "SELECT id FROM o ORDER BY qty * 2 NULLS LAST, id", &[_]i64{ 3, 1, 4, 2, 5 } },
+        .{ "SELECT id, qty AS q FROM o ORDER BY q NULLS LAST, id", &[_]i64{ 3, 1, 4, 2, 5 } },
+        .{ "SELECT id, qty + 1 AS q1 FROM o ORDER BY q1 DESC NULLS FIRST, id", &[_]i64{ 2, 5, 4, 1, 3 } },
+        .{ "SELECT id, qty FROM o ORDER BY 2 DESC NULLS FIRST, id", &[_]i64{ 2, 5, 4, 1, 3 } },
+        .{ "SELECT k FROM o GROUP BY k ORDER BY MAX(qty) NULLS LAST", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT id, ROW_NUMBER() OVER (ORDER BY qty NULLS LAST, id) AS rn FROM o ORDER BY rn", &[_]i64{ 3, 1, 4, 2, 5 } },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var q = try runSql(allocator, db, "SELECT * FROM o ORDER BY qty NULLS LAST");
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 4), q.outputSchema().len);
+    try helpers.expectRunError(allocator, db, "SELECT id FROM o ORDER BY qty NULLS", error.SqlExpectedKeyword);
+}
+
 test "sql: pg_type maps a well-known OID to its type name" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
