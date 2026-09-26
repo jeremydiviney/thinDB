@@ -131,6 +131,7 @@ pub const RangeSweepJoin = struct {
 
         const left_schema = left.outputSchema();
         const right_schema = right.outputSchema();
+        const left_emit = try join_mod.leftEmitCount(left_schema, spec);
 
         const rp = spec.ranges[0];
         const lidx = columnIndex(left_schema, rp.left) orelse return Error.ColumnNotFound;
@@ -143,10 +144,10 @@ pub const RangeSweepJoin = struct {
 
         // Output schema: all left + all right (pure range has no
         // USING-style key drop).
-        const output_schema = try allocator.alloc(Column, left_schema.len + right_schema.len);
+        const output_schema = try allocator.alloc(Column, left_emit + right_schema.len);
         errdefer allocator.free(output_schema);
-        for (left_schema, 0..) |c, i| output_schema[i] = c;
-        var out_idx: usize = left_schema.len;
+        for (left_schema[0..left_emit], 0..) |c, i| output_schema[i] = c;
+        var out_idx: usize = left_emit;
         for (right_schema) |c| {
             for (output_schema[0..out_idx]) |prior| {
                 if (types.columnNameEql(prior.name, c.name)) return Error.JoinColumnNameCollision;
@@ -190,7 +191,7 @@ pub const RangeSweepJoin = struct {
         const b_rows = try allocator.alloc(u32, output_batch_rows);
         errdefer allocator.free(b_rows);
 
-        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_schema.len, null, output_schema.len);
+        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_emit, null, output_schema.len);
         errdefer if (cached_stats.len > 0) allocator.free(cached_stats);
 
         const self = try allocator.create(RangeSweepJoin);
@@ -202,7 +203,7 @@ pub const RangeSweepJoin = struct {
             .right = right,
             .range = .{ .left_col = lidx, .right_col = ridx, .op = rp.op },
             .output_schema = output_schema,
-            .left_col_count = left_schema.len,
+            .left_col_count = left_emit,
             .cached_stats = cached_stats,
             .left_materialized = left_mat,
             .right_materialized = right_mat,
@@ -413,7 +414,7 @@ pub const RangeSweepJoin = struct {
     fn gatherPairs(self: *RangeSweepJoin) !void {
         const a = self.a_rows[0..self.pair_len];
         const b = self.b_rows[0..self.pair_len];
-        for (self.left_materialized, 0..) |*store, i| {
+        for (self.left_materialized[0..self.left_col_count], 0..) |*store, i| {
             try transform.appendByIndices(self.allocator, store.view(), a, &self.output_columns[i]);
         }
         for (self.right_materialized, 0..) |*store, i| {

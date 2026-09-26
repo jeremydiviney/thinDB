@@ -161,6 +161,7 @@ pub const SortMergeJoin = struct {
 
         const left_schema = left.outputSchema();
         const right_schema = right.outputSchema();
+        const left_emit = try join_mod.leftEmitCount(left_schema, spec);
 
         const left_keys = try aa.alloc(usize, spec.on.len);
         const right_keys = try aa.alloc(usize, spec.on.len);
@@ -211,13 +212,13 @@ pub const SortMergeJoin = struct {
             .left, .full => true,
         };
 
-        const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
+        const output_schema = try allocator.alloc(Column, left_emit + right_kept_count);
         errdefer allocator.free(output_schema);
-        for (left_schema, 0..) |c, i| {
+        for (left_schema[0..left_emit], 0..) |c, i| {
             output_schema[i] = c;
             if (left_nullable_in_output) output_schema[i].nullable = true;
         }
-        var out_idx: usize = left_schema.len;
+        var out_idx: usize = left_emit;
         for (right_schema, 0..) |c, i| {
             if (!right_kept_mask[i]) continue;
             for (output_schema[0..out_idx]) |prior| {
@@ -273,7 +274,7 @@ pub const SortMergeJoin = struct {
         const skip_right = right_stats.sort_state.global and
             join_mod.joinKeysCovered(right_stats.sort_state, spec.on, .right);
 
-        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_schema.len, right_kept_mask_owned, output_schema.len);
+        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_emit, right_kept_mask_owned, output_schema.len);
         errdefer if (cached_stats.len > 0) allocator.free(cached_stats);
 
         const self = try allocator.create(SortMergeJoin);
@@ -286,7 +287,7 @@ pub const SortMergeJoin = struct {
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
             .output_schema = output_schema,
-            .left_col_count = left_schema.len,
+            .left_col_count = left_emit,
             .right_kept_mask = right_kept_mask_owned,
             .cached_stats = cached_stats,
             .left_materialized = left_mat,
@@ -401,24 +402,6 @@ pub const SortMergeJoin = struct {
         const l = self.left.stats();
         const r = self.right.stats();
         const product = std.math.mul(u64, l.upper_rows, r.upper_rows) catch std.math.maxInt(u64);
-        // SMJ output IS sorted on the join keys — a real downstream
-        // advantage we should publish (e.g., a downstream merge or
-        // groupBy on join keys can skip its own sort).
-        const key_names = self.allocator.alloc([]const u8, self.left_key_indices.len) catch {
-            return .{ .upper_rows = product, .column_stats = self.cached_stats };
-        };
-        defer self.allocator.free(key_names);
-        // Use the LEFT-side column names — those are the ones that
-        // remain in the output schema (right-side keys are dropped
-        // per USING-clause semantics).
-        const left_schema = blk: {
-            // Construct a temporary slice of just our left columns
-            // (output_schema[0..left_col_count]).
-            break :blk self.output_schema[0..self.left_col_count];
-        };
-        for (self.left_key_indices, 0..) |idx, i| key_names[i] = left_schema[idx].name;
-        // The sort_state lifetime is "until next call": the stats() caller
-        // reads it immediately and never retains the slice.
         return .{ .upper_rows = product, .column_stats = self.cached_stats };
     }
 
@@ -645,7 +628,7 @@ pub const SortMergeJoin = struct {
         try cell_io.emitLeftOnlyRow(
             self.allocator,
             self.output_columns,
-            self.left_materialized,
+            self.left_materialized[0..self.left_col_count],
             left_row,
             self.right_kept_mask,
         );
@@ -666,7 +649,7 @@ pub const SortMergeJoin = struct {
         try cell_io.emitMatchedRow(
             self.allocator,
             self.output_columns,
-            self.left_materialized,
+            self.left_materialized[0..self.left_col_count],
             left_row,
             self.right_materialized,
             right_row,
