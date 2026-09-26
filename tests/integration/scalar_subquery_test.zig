@@ -134,7 +134,7 @@ test "scalar subquery: multi-row error" {
         c.deinit();
         return error.TestUnexpectedSuccess;
     } else |err| {
-        try std.testing.expectEqual(thindb.net.Error.BadRequest, err);
+        try std.testing.expectEqual(error.SubqueryMultipleRows, err);
     }
 }
 

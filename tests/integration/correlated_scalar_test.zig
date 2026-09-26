@@ -181,6 +181,45 @@ test "correlated scalar: compared in WHERE and read in the SELECT list, by one L
     try std.testing.expectEqualSlices(i64, &.{ 2, 0, 1, 0, 0 }, batch.values[3].data.bigint[0..batch.row_count]);
 }
 
+test "correlated scalar: a lookup reads the one row its key matches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, big BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, big) VALUES (1, 1), (2, 0), (3, 5), (4, 0), (5, 2)");
+    try exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT NOT NULL, amount INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO o (oid, tid, amount) VALUES (1, 1, 7), (2, 1, 5), (3, 3, 9), (4, 9, 4)");
+
+    // o.tid matches t.id: {1, 1, 3, none}. Per t.id, o's rows: 1 → oids {1, 2}
+    // (amounts {7, 5}), 3 → oid 3, every other id → none.
+    const cases = .{
+        .{ "SELECT COALESCE((SELECT big FROM t WHERE t.id = o.tid), -1) AS b FROM o ORDER BY oid", &[_]i64{ 1, 1, 5, -1 } },
+        .{ "SELECT COALESCE((SELECT big * 10 FROM t WHERE t.id = o.tid), -1) AS b FROM o ORDER BY oid", &[_]i64{ 10, 10, 50, -1 } },
+        .{ "SELECT oid FROM o WHERE amount < (SELECT big * 2 FROM t WHERE t.id = o.tid) ORDER BY oid", &[_]i64{3} },
+        // ORDER BY ... LIMIT picks each key's rows in that order.
+        .{ "SELECT COALESCE((SELECT oid FROM o WHERE o.tid = t.id ORDER BY oid DESC LIMIT 1), 0) AS x FROM t ORDER BY id", &[_]i64{ 2, 0, 3, 0, 0 } },
+        .{ "SELECT COALESCE((SELECT oid FROM o WHERE o.tid = t.id ORDER BY oid LIMIT 1), 0) AS x FROM t ORDER BY id", &[_]i64{ 1, 0, 3, 0, 0 } },
+        .{ "SELECT COALESCE((SELECT oid FROM o WHERE o.tid = t.id ORDER BY amount LIMIT 1), 0) AS x FROM t ORDER BY id", &[_]i64{ 2, 0, 3, 0, 0 } },
+        .{ "SELECT COALESCE((SELECT oid FROM o WHERE o.tid = t.id ORDER BY oid LIMIT 1 OFFSET 1), 0) AS x FROM t ORDER BY id", &[_]i64{ 2, 0, 0, 0, 0 } },
+        .{ "SELECT COALESCE((SELECT oid FROM o WHERE o.tid = t.id AND amount > 6 LIMIT 1), 0) AS x FROM t ORDER BY id", &[_]i64{ 1, 0, 3, 0, 0 } },
+        // A key that matches two rows fails only an outer row that reads it.
+        .{ "SELECT COALESCE((SELECT oid FROM o WHERE o.tid = t.id), 0) AS x FROM t WHERE id >= 2 ORDER BY id", &[_]i64{ 0, 3, 0, 0 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    var q = try runSql(allocator, db, "SELECT (SELECT oid FROM o WHERE o.tid = t.id) AS x FROM t");
+    defer q.deinit();
+    while (q.next()) |batch| {
+        if (batch == null) return error.TestUnexpectedSuccess;
+    } else |err| try std.testing.expectEqual(error.SubqueryMultipleRows, err);
+}
+
 test "correlated scalar: inside arithmetic on the right of a comparison" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
