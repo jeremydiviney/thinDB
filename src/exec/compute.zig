@@ -30,6 +30,7 @@ const ColumnView = storage.ColumnView;
 
 const store = @import("../engine/store.zig");
 const ColumnStore = store.ColumnStore;
+const transform = @import("../engine/transform.zig");
 
 const expr_mod = @import("expr.zig");
 const Expr = expr_mod.Expr;
@@ -133,6 +134,19 @@ const NullSlot = struct {
 
 const PlanError = Allocator.Error || Error;
 
+/// Which rows read a call's arguments after the first. A conditional
+/// function reads each only on the rows that reach it, so an argument that
+/// fails over the whole batch runs again over just those rows:
+/// `COALESCE(a, CAST(b AS DECIMAL(5,2)))` never converts `b` where `a`
+/// is set, as in MySQL, StarRocks and DuckDB.
+const ArgReach = enum {
+    all,
+    /// COALESCE, IFNULL: the rows every earlier argument left NULL.
+    until_non_null,
+    /// IF(cond, a, b): `a` where `cond` is true, `b` everywhere else.
+    by_condition,
+};
+
 /// Resolved call node: ScalarFn + per-arg evaluation plan + optional
 /// coercion machinery + output buffer. Roots of derived columns
 /// alias `Compute.derived_cols[i]` as their output (avoids one copy);
@@ -152,6 +166,7 @@ const CallPlan = struct {
     output: *ColumnStore,
     output_owned: bool,
     output_type: Type,
+    arg_reach: ArgReach = .all,
 };
 
 /// Fused `col <op> const` (or `const <op> col`) for +/-/* — evaluated in one
@@ -939,49 +954,35 @@ pub const Compute = struct {
         // internal nodes we clear before refilling here.
         if (plan.output_owned) plan.output.clear();
 
-        // 1. Evaluate each arg (post-order). Build per-arg ColumnViews.
+        // 1. Evaluate and coerce each arg (post-order). An argument that
+        // fails over the whole batch, of a call that reads it on only some
+        // rows (`ArgReach`), runs again over just those rows.
         var arg_views_buf: [16]ColumnView = undefined;
         if (plan.args.len > arg_views_buf.len) return Error.ComputeTooManyArgs;
         const arg_views = arg_views_buf[0..plan.args.len];
-        for (plan.args, arg_views) |arg, *view| {
-            switch (arg) {
-                .col => |idx| view.* = in_values[idx],
-                .lit => |slot| {
-                    slot.buf.clear();
-                    try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
-                    view.* = slot.buf.view();
-                },
-                .null_lit => |slot| {
-                    slot.buf.clear();
-                    try fillNullColumn(self.allocator, &slot.buf, n);
-                    view.* = slot.buf.view();
-                },
-                .call => |sub| {
-                    try self.evalCall(sub, in_values, n);
-                    view.* = sub.output.view();
-                },
-                .case => |sub| {
-                    try self.evalCase(sub, in_values, n);
-                    view.* = sub.output.view();
-                },
-            }
+        var reached: std.ArrayList(ColumnStore) = .empty;
+        defer {
+            for (reached.items) |*s| s.deinit(self.allocator);
+            reached.deinit(self.allocator);
+        }
+        for (arg_views, 0..) |*view, i| {
+            view.* = self.callArg(plan, i, in_values, n) catch |err| retry: {
+                if (err == error.OutOfMemory) return err;
+                const rows = try argRows(self.allocator, plan.arg_reach, arg_views[0..i], n) orelse return err;
+                defer self.allocator.free(rows);
+                try reached.ensureUnusedCapacity(self.allocator, 1);
+                var subset = try RowSubset.init(self.allocator, in_values[0..self.in_width], rows);
+                defer subset.deinit(self.allocator);
+                const part = try self.callArg(plan, i, subset.values, subset.count);
+                var spread = try ColumnStore.initLike(self.allocator, part, true);
+                errdefer spread.deinit(self.allocator);
+                try scatterRows(self.allocator, &spread, part, rows);
+                reached.appendAssumeCapacity(spread);
+                break :retry spread.view();
+            };
         }
 
-        // 2. Apply implicit casts.
-        if (plan.arg_casts) |casts| {
-            const buffers = plan.cast_buffers.?;
-            var one_cast_view: [1]ColumnView = undefined;
-            for (casts, buffers, 0..) |kfn, *buf_slot, arg_i| {
-                const k = kfn orelse continue;
-                const buf = &buf_slot.*.?;
-                buf.clear();
-                one_cast_view[0] = arg_views[arg_i];
-                try k(self.allocator, &one_cast_view, buf, n);
-                arg_views[arg_i] = buf.view();
-            }
-        }
-
-        // 3. Run the kernel. Decimal (typed) kernels take precedence and get
+        // 2. Run the kernel. Decimal (typed) kernels take precedence and get
         // the arg/out Types so they can align scales.
         if (plan.func.typed_kernel) |tk| {
             try tk(self.allocator, plan.arg_runtime_types, plan.output_type, arg_views, plan.output, n);
@@ -994,7 +995,7 @@ pub const Compute = struct {
             return Error.ComputeNoSuchOverload;
         }
 
-        // 4. Null bookkeeping. Internal calls always have a nullable
+        // 3. Null bookkeeping. Internal calls always have a nullable
         // output (we allocated it that way) so the parent's null-check
         // sees correct validity; root calls only write when their
         // declared schema column is nullable.
@@ -1009,32 +1010,24 @@ pub const Compute = struct {
     }
 
     /// Evaluate a CASE expression over a single batch. Strategy:
-    ///   1. Materialize every branch's THEN (and the ELSE) into a
+    ///   1. Evaluate each branch's condition into a row mask. First
+    ///      true mask wins per row; record the winner in `winners`.
+    ///   2. Materialize every branch's THEN (and the ELSE) into a
     ///      per-batch ColumnView. Cheap for col_ref / lit; runs the
     ///      sub-CallPlan for call-typed branches.
-    ///   2. Evaluate each branch's condition into a row mask. First
-    ///      true mask wins per row; record the winner in `winners`.
     ///   3. Walk rows in order, copying the winner's cell into the
     ///      output ColumnStore (or appending NULL when no branch
     ///      matches and there's no ELSE).
+    /// A THEN or ELSE clause that fails over the whole batch runs again over
+    /// only the rows it wins, so a branch no row takes never raises, as in
+    /// MySQL, StarRocks and DuckDB.
     fn evalCase(self: *Compute, plan: *CasePlan, in_values: []const ColumnView, n: usize) anyerror!void {
         plan.output.clear();
         if (plan.branches.len > MAX_CASE_BRANCHES) return Error.ComputeTooManyArgs;
 
-        var srcs_buf: [MAX_CASE_BRANCHES + 1]CaseSrc = undefined;
-        for (plan.branches, 0..) |br, bi| {
-            srcs_buf[bi] = try self.caseSrc(br.then_src, br.cast_kernel, br.cast_buf, in_values, n);
-        }
-        var src_count = plan.branches.len;
-        if (plan.else_src) |es| {
-            srcs_buf[src_count] = try self.caseSrc(es, plan.else_cast_kernel, plan.else_cast_buf, in_values, n);
-            src_count += 1;
-        }
-        const srcs = srcs_buf[0..src_count];
-
-        // winners[i] indexes `srcs`: the first branch whose condition holds,
-        // else the ELSE slot; with no ELSE, `srcs.len` marks an unmatched
-        // (NULL) row.
+        // winners[i] indexes the THEN/ELSE sources: the first branch whose
+        // condition holds, else the ELSE slot; with no ELSE,
+        // `branches.len` marks an unmatched (NULL) row.
         const winners = try self.allocator.alloc(u8, n);
         defer self.allocator.free(winners);
         @memset(winners, @as(u8, @intCast(plan.branches.len)));
@@ -1062,10 +1055,102 @@ pub const Compute = struct {
             }
         }
 
+        var reached: std.ArrayList(ColumnStore) = .empty;
+        defer {
+            for (reached.items) |*s| s.deinit(self.allocator);
+            reached.deinit(self.allocator);
+        }
+        var srcs_buf: [MAX_CASE_BRANCHES + 1]CaseSrc = undefined;
+        for (plan.branches, 0..) |br, bi| {
+            srcs_buf[bi] = try self.reachedCaseSrc(plan, br.then_src, br.cast_kernel, br.cast_buf, in_values, winners, bi, &reached);
+        }
+        var src_count = plan.branches.len;
+        if (plan.else_src) |es| {
+            srcs_buf[src_count] = try self.reachedCaseSrc(plan, es, plan.else_cast_kernel, plan.else_cast_buf, in_values, winners, src_count, &reached);
+            src_count += 1;
+        }
+        const srcs = srcs_buf[0..src_count];
+
         switch (plan.output.data) {
             .varchar, .string, .char, .json => |*ss| try assembleCaseStrings(self.allocator, ss, plan.output, srcs, winners),
             inline else => |*list, tag| try assembleCaseFixed(self.allocator, list, tag, plan.output, srcs, winners),
         }
+    }
+
+    /// A THEN or ELSE clause's batch value. One that fails over the whole
+    /// batch runs again over only the rows it wins (`slot` in `winners`);
+    /// a row that takes it still fails. `reached` keeps the stores such a
+    /// clause's values live in until the CASE assembles.
+    fn reachedCaseSrc(
+        self: *Compute,
+        plan: *const CasePlan,
+        s: BranchSrc,
+        cast_kernel: ?CastKernel,
+        cast_buf: ?*ColumnStore,
+        in_values: []const ColumnView,
+        winners: []const u8,
+        slot: usize,
+        reached: *std.ArrayList(ColumnStore),
+    ) anyerror!CaseSrc {
+        const n = winners.len;
+        if (self.caseSrc(s, cast_kernel, cast_buf, in_values, n)) |src| {
+            return src;
+        } else |err| if (err == error.OutOfMemory) return err;
+
+        const rows = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(rows);
+        for (rows, winners) |*r, w| r.* = w == slot;
+        try reached.ensureUnusedCapacity(self.allocator, 1);
+        if (std.mem.indexOfScalar(bool, rows, true) == null) {
+            // No row takes the clause; a NULL stands in for it.
+            var none = try ColumnStore.init(self.allocator, plan.output_type, true);
+            errdefer none.deinit(self.allocator);
+            try none.appendNulls(self.allocator, 1);
+            reached.appendAssumeCapacity(none);
+            return .{ .view = none.view(), .scalar = true };
+        }
+        var subset = try RowSubset.init(self.allocator, in_values[0..self.in_width], rows);
+        defer subset.deinit(self.allocator);
+        const part = try self.caseSrc(s, cast_kernel, cast_buf, subset.values, subset.count);
+        if (part.scalar) return part;
+        var spread = try ColumnStore.initLike(self.allocator, part.view, true);
+        errdefer spread.deinit(self.allocator);
+        try scatterRows(self.allocator, &spread, part.view, rows);
+        reached.appendAssumeCapacity(spread);
+        return .{ .view = spread.view(), .scalar = false };
+    }
+
+    /// Argument `i` of `plan` over the batch, converted to its parameter
+    /// type when resolve coerced it.
+    fn callArg(self: *Compute, plan: *CallPlan, i: usize, in_values: []const ColumnView, n: usize) anyerror!ColumnView {
+        const raw: ColumnView = switch (plan.args[i]) {
+            .col => |idx| in_values[idx],
+            .lit => |slot| blk: {
+                slot.buf.clear();
+                try fillLiteralColumn(self.allocator, &slot.buf, slot.value, n);
+                break :blk slot.buf.view();
+            },
+            .null_lit => |slot| blk: {
+                slot.buf.clear();
+                try fillNullColumn(self.allocator, &slot.buf, n);
+                break :blk slot.buf.view();
+            },
+            .call => |sub| blk: {
+                try self.evalCall(sub, in_values, n);
+                break :blk sub.output.view();
+            },
+            .case => |sub| blk: {
+                try self.evalCase(sub, in_values, n);
+                break :blk sub.output.view();
+            },
+        };
+        const casts = plan.arg_casts orelse return raw;
+        const k = casts[i] orelse return raw;
+        const buf = &plan.cast_buffers.?[i].?;
+        buf.clear();
+        var one_arg = [_]ColumnView{raw};
+        try k(self.allocator, &one_arg, buf, n);
+        return buf.view();
     }
 
     /// The batch value of one THEN/ELSE clause. Literals and bare NULLs
@@ -2067,6 +2152,7 @@ fn buildCallPlan(
         .output = output_buf,
         .output_owned = true,
         .output_type = rr.func.return_type,
+        .arg_reach = argReach(func),
     };
     return plan;
 }
@@ -2514,6 +2600,92 @@ fn appendCopiedColumn(
 /// Fixed-width CASE output: size the column once, then one pass reads each
 /// row from its winning source (a scalar source replicates through a zero
 /// stride; an unmatched row reads a zero placeholder and is NULL).
+/// The rows a conditional call reads its next argument on, given the
+/// arguments before it; null when every row reads it.
+fn argRows(allocator: Allocator, reach: ArgReach, prior: []const ColumnView, n: usize) !?[]bool {
+    if (prior.len == 0) return null;
+    switch (reach) {
+        .all => return null,
+        .until_non_null => {
+            const rows = try allocator.alloc(bool, n);
+            for (rows, 0..) |*r, row| {
+                r.* = for (prior) |v| {
+                    if (v.isValid(row)) break false;
+                } else true;
+            }
+            return rows;
+        },
+        .by_condition => {
+            const cond = switch (prior[0].data) {
+                .boolean => |b| b,
+                else => return null,
+            };
+            const want_true = prior.len == 1;
+            const rows = try allocator.alloc(bool, n);
+            for (rows, 0..) |*r, row| r.* = (prior[0].isValid(row) and cond[row] != 0) == want_true;
+            return rows;
+        },
+    }
+}
+
+fn argReach(func: ScalarFn) ArgReach {
+    if (func.udf_kernel != null) return .all;
+    if (std.ascii.eqlIgnoreCase(func.name, "coalesce") or std.ascii.eqlIgnoreCase(func.name, "ifnull")) return .until_non_null;
+    if (std.ascii.eqlIgnoreCase(func.name, "if")) return .by_condition;
+    return .all;
+}
+
+/// The batch's input rows where `rows` is set, compacted: what a
+/// conditional sub-expression reads when it runs again over only the rows
+/// that reach it.
+const RowSubset = struct {
+    stores: []ColumnStore,
+    values: []ColumnView,
+    count: usize,
+
+    fn init(allocator: Allocator, in_values: []const ColumnView, rows: []const bool) !RowSubset {
+        const stores = try allocator.alloc(ColumnStore, in_values.len);
+        errdefer allocator.free(stores);
+        const values = try allocator.alloc(ColumnView, in_values.len);
+        errdefer allocator.free(values);
+        var built: usize = 0;
+        errdefer for (stores[0..built]) |*s| s.deinit(allocator);
+        for (stores, values, in_values) |*s, *v, in| {
+            s.* = try ColumnStore.initLike(allocator, in, in.nulls != null);
+            built += 1;
+            try transform.appendMaskedColumn(allocator, in, rows, s);
+            v.* = s.view();
+        }
+        var count: usize = 0;
+        for (rows) |r| count += @intFromBool(r);
+        return .{ .stores = stores, .values = values, .count = count };
+    }
+
+    fn deinit(self: *RowSubset, allocator: Allocator) void {
+        for (self.stores) |*s| s.deinit(allocator);
+        allocator.free(self.stores);
+        allocator.free(self.values);
+    }
+};
+
+/// Spread `part`, one row per set entry of `rows`, back over the whole
+/// batch; every other row is NULL.
+fn scatterRows(allocator: Allocator, out: *ColumnStore, part: ColumnView, rows: []const bool) !void {
+    var taken: usize = 0;
+    var i: usize = 0;
+    while (i < rows.len) {
+        const start = i;
+        const reached = rows[i];
+        while (i < rows.len and rows[i] == reached) i += 1;
+        if (reached) {
+            try store.appendViewRange(allocator, out, part, taken, taken + (i - start));
+            taken += i - start;
+        } else {
+            try out.appendNulls(allocator, i - start);
+        }
+    }
+}
+
 fn assembleCaseFixed(
     allocator: Allocator,
     list: anytype,
