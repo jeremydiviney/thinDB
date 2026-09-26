@@ -27,7 +27,7 @@ const mat_stage = @import("mat_stage.zig");
 
 fn preflight_predicate(expr: PredicateExpr) bool {
     return switch (expr) {
-        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .always => true,
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .text_as_number, .text_as_number_set, .always => true,
         .@"and", .@"or" => |children| blk: {
             for (children) |child| if (!preflight_predicate(child)) break :blk false;
             break :blk true;
@@ -989,6 +989,8 @@ fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.
         .in_set => |s| .{ .cost = 1, .sel = colSelectivity(s.col, schema, stats, @floatFromInt(@max(s.values.len, 1))) },
         .like => .{ .cost = 2, .sel = 0.10 },
         .not => .{ .cost = 2, .sel = 0.5 },
+        .text_as_number => .{ .cost = 2, .sel = 0.5 },
+        .text_as_number_set => |s| .{ .cost = 2, .sel = colSelectivity(s.col, schema, stats, @floatFromInt(@max(s.values.len, 1))) },
         // Roll a nested group's children up so its real cost/selectivity orders
         // it against its siblings: cost is the costliest child; an AND multiplies
         // pass-fractions, an OR combines them as 1 - ∏(1 - childᵢ).

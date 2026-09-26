@@ -117,7 +117,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
     switch (pred.*) {
-        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .text_as_number, .text_as_number_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
         .leaf_var => |v| {
             // `col <op> @x` where @x is SQL NULL is UNKNOWN under 3VL (matches a
             // null literal on the RHS); otherwise compare against the value.

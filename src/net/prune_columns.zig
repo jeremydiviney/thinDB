@@ -670,7 +670,8 @@ fn collectPredicate(arena: Allocator, p: PredicateExpr, out: *NameSet) bool {
         },
         .is_null, .is_not_null => |col| _ = out.add(arena, col),
         .like => |lp| _ = out.add(arena, lp.col),
-        .in_set => |s| _ = out.add(arena, s.col),
+        .in_set, .text_as_number_set => |s| _ = out.add(arena, s.col),
+        .text_as_number => |lf| _ = out.add(arena, lf.col),
         .@"and", .@"or" => |children| for (children) |ch| {
             if (!collectPredicate(arena, ch, out)) return false;
         },

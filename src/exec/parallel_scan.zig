@@ -2493,12 +2493,12 @@ fn caseFusable(c: Expr.Case, scan_cols: []const Column) bool {
 /// query-wide state and are never fusable.
 fn predFusable(p: predicate.PredicateExpr, scan_cols: []const Column) bool {
     return switch (p) {
-        .leaf, .day_leaf => |l| types.findColumn(scan_cols, l.col) != null,
+        .leaf, .day_leaf, .text_as_number => |l| types.findColumn(scan_cols, l.col) != null,
         .leaf_col_col => |c| types.findColumn(scan_cols, c.left) != null and
             types.findColumn(scan_cols, c.right) != null,
         .is_null, .is_not_null => |name| types.findColumn(scan_cols, name) != null,
         .like => |l| types.findColumn(scan_cols, l.col) != null,
-        .in_set => |s| types.findColumn(scan_cols, s.col) != null,
+        .in_set, .text_as_number_set => |s| types.findColumn(scan_cols, s.col) != null,
         .@"and", .@"or" => |arms| blk: {
             for (arms) |a| {
                 if (!predFusable(a, scan_cols)) break :blk false;
