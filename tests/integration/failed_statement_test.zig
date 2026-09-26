@@ -57,6 +57,8 @@ test "failed statements leave the statement gate idle" {
         "SELECT n, COUNT(*) AS c FROM fa GROUP BY nope",
         "SELECT ROW_NUMBER() OVER (ORDER BY nope) AS r FROM fa",
         "SELECT id FROM fa WHERE n = dt",
+        "SELECT id FROM fa WHERE n IN (SELECT dt FROM fb)",
+        "SELECT id FROM fa WHERE EXISTS (SELECT 1 FROM fb WHERE fb.dt = fa.n)",
         "SELECT id FROM fa UNION ALL SELECT id, n FROM fb",
         "SELECT fa.id, sqrt(fb.dt) AS v FROM fa JOIN fb ON fa.id = fb.id",
         // A correlated lookup whose key matches two rows.
