@@ -401,7 +401,6 @@ test "qualified col: aliased col in ORDER BY" {
     try std.testing.expectEqualSlices(i64, &.{ 3, 2, 1 }, ids);
 }
 
-
 test "qualified refs in a single-table block name its one table" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
