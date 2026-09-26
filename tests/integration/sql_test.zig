@@ -2881,13 +2881,9 @@ test "sql: CTE referenced twice in a self-join (inline DAG)" {
     // The CTE expression compiles into a single *ir.Op; both join
     // sides reference it. Compile produces two independent runtime
     // operators (inline semantics) — proven correct here by row count.
-    // CTE exposes ONLY the join-key column; v1 SQL can't yet
-    // disambiguate same-named non-key columns across join sides,
-    // so the test uses the simplest shape that exercises the
-    // DAG-shared-subtree path without hitting that limit.
     var q = try runSql(allocator, db,
         \\WITH big AS (SELECT k FROM t WHERE k >= 200)
-        \\SELECT k FROM big JOIN big AS other ON big.k = other.k
+        \\SELECT big.k FROM big JOIN big AS other ON big.k = other.k
     );
     defer q.deinit();
     var rows: usize = 0;
@@ -3238,7 +3234,7 @@ test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
 
     var q = try runSql(allocator, db,
         \\WITH big AS NOT MATERIALIZED (SELECT k FROM t WHERE k >= 200)
-        \\SELECT k FROM big JOIN big AS other ON big.k = other.k
+        \\SELECT big.k FROM big JOIN big AS other ON big.k = other.k
     );
     defer q.deinit();
 
@@ -3268,7 +3264,7 @@ test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)"
     // buffer with two Readers sharing it.
     var q = try runSql(allocator, db,
         \\WITH big AS (SELECT k FROM t WHERE k >= 200)
-        \\SELECT k FROM big JOIN big AS other ON big.k = other.k
+        \\SELECT big.k FROM big JOIN big AS other ON big.k = other.k
     );
     defer q.deinit();
 
