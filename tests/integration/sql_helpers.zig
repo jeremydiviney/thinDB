@@ -137,6 +137,31 @@ pub fn collectBigints(allocator: std.mem.Allocator, db: anytype, sql: []const u8
     return out.toOwnedSlice(allocator);
 }
 
+/// Collect every value of a single-column text result, NULL as null. Free
+/// with `freeStrings`.
+pub fn collectStrings(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]?[]u8 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(?[]u8) = .empty;
+    errdefer {
+        for (out.items) |v| if (v) |x| allocator.free(x);
+        out.deinit(allocator);
+    }
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            const v: ?[]u8 = if (batch.values[0].isValid(i)) try allocator.dupe(u8, batch.values[0].data.string.rowBytes(i)) else null;
+            errdefer if (v) |x| allocator.free(x);
+            try out.append(allocator, v);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn freeStrings(allocator: std.mem.Allocator, values: []?[]u8) void {
+    for (values) |v| if (v) |x| allocator.free(x);
+    allocator.free(values);
+}
+
 /// `collectBigints` over `runSqlCtx`.
 pub fn collectBigintsCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i64 {
     var q = try runSqlCtx(allocator, db, sql);

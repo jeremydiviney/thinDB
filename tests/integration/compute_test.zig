@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const thindb = @import("thindb");
+const helpers = @import("sql_helpers.zig");
 
 const schema_basic = thindb.TableSchema{
     .columns = &.{
@@ -935,3 +936,61 @@ test "compute: coalesce returns first non-null + bookkeeps the output bitmap" {
 
 // Coercion + the expanded scalar-function set (lpad/position/dayofweek/
 // date_format/etc) live in compute_scalar_test.zig.
+
+test "compute: position-taking string functions count UTF-8 characters" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE s (id BIGINT PRIMARY KEY, a VARCHAR(20))");
+    try helpers.exec(allocator, db, "INSERT INTO s (id, a) VALUES (1, 'héllo'), (2, 'hello'), (3, 'Жук')");
+
+    const text_cases = .{
+        .{ "SUBSTRING(a, 2, 2)", [_][]const u8{ "él", "el", "ук" } },
+        .{ "SUBSTRING(a, 2)", [_][]const u8{ "éllo", "ello", "ук" } },
+        .{ "SUBSTR(a FROM 2 FOR 3)", [_][]const u8{ "éll", "ell", "ук" } },
+        .{ "SUBSTRING(a FROM -2)", [_][]const u8{ "lo", "lo", "ук" } },
+        .{ "MID(a, 3, 1)", [_][]const u8{ "l", "l", "к" } },
+        // Position 0 and positions outside the string are empty, as in MySQL and StarRocks.
+        .{ "SUBSTRING(a, 0, 2)", [_][]const u8{ "", "", "" } },
+        .{ "SUBSTRING(a, -10, 2)", [_][]const u8{ "", "", "" } },
+        .{ "SUBSTRING(a, 6)", [_][]const u8{ "", "", "" } },
+        .{ "LEFT(a, 2)", [_][]const u8{ "hé", "he", "Жу" } },
+        .{ "RIGHT(a, 4)", [_][]const u8{ "éllo", "ello", "Жук" } },
+        .{ "LPAD(a, 7, 'é*')", [_][]const u8{ "é*héllo", "é*hello", "é*é*Жук" } },
+        .{ "RPAD(a, 3, 'x')", [_][]const u8{ "hél", "hel", "Жук" } },
+        .{ "REVERSE(a)", [_][]const u8{ "olléh", "olleh", "куЖ" } },
+        .{ "TRANSLATE(a, 'éЖ', 'EZ')", [_][]const u8{ "hEllo", "hello", "Zук" } },
+    };
+    inline for (text_cases) |c| {
+        const got = try helpers.collectStrings(allocator, db, "SELECT " ++ c[0] ++ " FROM s ORDER BY id");
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, g| std.testing.expectEqualStrings(want, g.?) catch |err| {
+            std.debug.print("expr: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    const int_cases = .{
+        .{ "POSITION('l' IN a)", [_]i64{ 3, 3, 0 } },
+        .{ "LOCATE('l', a)", [_]i64{ 3, 3, 0 } },
+        .{ "LOCATE('l', a, 4)", [_]i64{ 4, 4, 0 } },
+        .{ "LOCATE('', a, 6)", [_]i64{ 6, 6, 0 } },
+        .{ "LOCATE('l', a, 0)", [_]i64{ 0, 0, 0 } },
+        .{ "INSTR(a, 'у')", [_]i64{ 0, 0, 2 } },
+        .{ "STRPOS(a, 'lo')", [_]i64{ 4, 4, 0 } },
+        .{ "CHAR_LENGTH(a)", [_]i64{ 5, 5, 3 } },
+    };
+    inline for (int_cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS BIGINT) FROM s ORDER BY id");
+        defer allocator.free(got);
+        const want: [3]i64 = c[1];
+        std.testing.expectEqualSlices(i64, &want, got) catch |err| {
+            std.debug.print("expr: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
