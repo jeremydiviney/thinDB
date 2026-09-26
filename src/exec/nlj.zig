@@ -133,6 +133,7 @@ pub const NestedLoopJoin = struct {
 
         const left_schema = left.outputSchema();
         const right_schema = right.outputSchema();
+        const left_emit = try join_mod.leftEmitCount(left_schema, spec);
 
         // Resolve equi keys (may be empty).
         const left_keys = try aa.alloc(usize, spec.on.len);
@@ -183,13 +184,13 @@ pub const NestedLoopJoin = struct {
             .left, .full => true,
         };
 
-        const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
+        const output_schema = try allocator.alloc(Column, left_emit + right_kept_count);
         errdefer allocator.free(output_schema);
-        for (left_schema, 0..) |c, i| {
+        for (left_schema[0..left_emit], 0..) |c, i| {
             output_schema[i] = c;
             if (left_nullable_in_output) output_schema[i].nullable = true;
         }
-        var out_idx: usize = left_schema.len;
+        var out_idx: usize = left_emit;
         for (right_schema, 0..) |c, i| {
             if (!right_kept_mask[i]) continue;
             for (output_schema[0..out_idx]) |prior| {
@@ -241,7 +242,7 @@ pub const NestedLoopJoin = struct {
         const rvb = try allocator.alloc(ColumnView, right_schema.len);
         errdefer allocator.free(rvb);
 
-        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_schema.len, right_kept_mask_owned, output_schema.len);
+        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_emit, right_kept_mask_owned, output_schema.len);
         errdefer if (cached_stats.len > 0) allocator.free(cached_stats);
 
         const self = try allocator.create(NestedLoopJoin);
@@ -258,7 +259,7 @@ pub const NestedLoopJoin = struct {
             .left_view_buf = lvb,
             .right_view_buf = rvb,
             .output_schema = output_schema,
-            .left_col_count = left_schema.len,
+            .left_col_count = left_emit,
             .right_kept_mask = right_kept_mask_owned,
             .cached_stats = cached_stats,
             .left_materialized = left_mat,
@@ -469,7 +470,7 @@ pub const NestedLoopJoin = struct {
         try cell_io.emitLeftOnlyRow(
             self.allocator,
             self.output_columns,
-            self.left_materialized,
+            self.left_materialized[0..self.left_col_count],
             left_row,
             self.right_kept_mask,
         );
@@ -534,7 +535,7 @@ pub const NestedLoopJoin = struct {
         try cell_io.emitMatchedRow(
             self.allocator,
             self.output_columns,
-            self.left_materialized,
+            self.left_materialized[0..self.left_col_count],
             self.left_cursor,
             self.right_materialized,
             self.right_cursor,

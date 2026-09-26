@@ -1918,9 +1918,9 @@ const Scalar = union(enum) {
 /// `m × 10^-s`.
 const ScaledInt = scalar_fn_common.ScaledInt;
 
-const ComparisonKind = enum { number, temporal, text, uuid };
+pub const ComparisonKind = enum { number, temporal, text, uuid };
 
-fn comparisonKind(ty: types.Type) ComparisonKind {
+pub fn comparisonKind(ty: types.Type) ComparisonKind {
     return switch (ty) {
         .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => .number,
         .date, .datetime => .temporal,

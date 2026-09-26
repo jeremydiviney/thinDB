@@ -178,7 +178,7 @@ pub fn textToDatetime(s: []const u8) ?i64 {
     return parseDateTimeString(s) catch @as(i64, textToDate(s) orelse return null) * std.time.us_per_day;
 }
 
-const TEXT_SPACE = " \t\r\n";
+pub const TEXT_SPACE = " \t\r\n";
 
 /// A decimal value: mantissa `m` at scale `s`, i.e. m / 10^s.
 pub const ScaledInt = struct { m: i128, s: u8 };

@@ -503,8 +503,8 @@ pub const StageSource = struct {
 
 /// Peel `q_in` down to the stage it reads through AliasRename, a column
 /// Project and Computes that only rename (a `col_ref` derived — the
-/// parser's hidden `__join_on_*` key columns) or cast a slot in place
-/// (`to_*(slot)` — join-key type coercion). Null for anything else, a
+/// parser's hidden `__join_on_*` key columns) or convert one column
+/// (`to_*(col)` or `text_key:*(col)` — join-key type coercion). Null for anything else, a
 /// probe-fused wrapper, or a MatScan with a slice-skip hint (it doesn't
 /// read every chunk).
 /// `reason`, when given, names the operator that stopped the peel on a null
@@ -567,7 +567,7 @@ fn declined(reason: ?*[]const u8, why: []const u8) ?*Stage {
 }
 
 /// Rewrite `map`/`casts` (in `c`'s output space) into `c`'s upstream space.
-/// False when a slot reads anything but a rename or an in-place `to_*` cast.
+/// False when a slot reads anything but a rename or a one-column conversion.
 fn peelComputeSlots(c: *const exec.Compute, map: []usize, casts: []?[]const u8) bool {
     for (map, casts) |*m, *cast| {
         const k = derivedIndexAt(c, m.*) orelse continue;
@@ -579,13 +579,12 @@ fn peelComputeSlots(c: *const exec.Compute, map: []usize, casts: []?[]const u8) 
                     .call => |cl| cl,
                     else => return false,
                 };
-                if (call.args.len != 1 or !std.ascii.startsWithIgnoreCase(call.fn_name, "to_")) return false;
+                if (call.args.len != 1 or !exec.scalar_fn.isKeyConversionFn(call.fn_name)) return false;
                 const arg = switch (call.args[0]) {
                     .col_ref => |name| name,
                     else => return false,
                 };
-                if (!types.columnNameEql(arg, c.derived_ir[k].name)) return false;
-                if (m.* >= c.upstream.outputSchema().len) return false;
+                m.* = types.findColumn(c.upstream.outputSchema(), arg) orelse return false;
                 cast.* = call.fn_name;
             },
             else => return false,
