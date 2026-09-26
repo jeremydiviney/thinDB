@@ -200,7 +200,7 @@ test "CASE WHEN: AND/OR conditions in WHEN" {
     try std.testing.expectEqualStrings("small-west", batch.values[0].data.string.rowBytes(2));
 }
 
-test "CASE WHEN: rejects branches with mismatched types" {
+test "CASE WHEN: a number branch beside a text branch reads as text" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -209,20 +209,13 @@ test "CASE WHEN: rejects branches with mismatched types" {
     defer db.close();
 
     try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const root = try thindb.sql.parse(
-        arena.allocator(),
-        "SELECT CASE WHEN qty < 10 THEN 1 ELSE 'big' END AS mix FROM t",
-    );
-    const cq = thindb.net.compile(allocator, db, root);
-    if (cq) |ok| {
-        var c = ok;
-        c.deinit();
-        return error.TestUnexpectedSuccess;
-    } else |err| {
-        try std.testing.expectEqual(thindb.exec.Error.ComputeUnsupportedExpr, err);
-    }
+    try exec(allocator, db, "INSERT INTO t VALUES (1, 5), (2, 50)");
+    var q = try runSql(allocator, db, "SELECT CASE WHEN qty < 10 THEN 1 ELSE 'big' END AS mix FROM t ORDER BY id");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), batch.row_count);
+    try std.testing.expectEqualStrings("1", batch.values[0].data.string.rowBytes(0));
+    try std.testing.expectEqualStrings("big", batch.values[0].data.string.rowBytes(1));
 }
 
 test "case: parenthesized CASE as a WHEN comparison operand" {

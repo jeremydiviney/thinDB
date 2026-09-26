@@ -22,7 +22,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
+const Type = types.Type;
 const TypeTag = types.TypeTag;
+
+const decimal = @import("scalar_fn_decimal.zig");
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -228,6 +231,61 @@ pub fn argNarrowingKernelFor(from: TypeTag, to: TypeTag) ?CastKernel {
     };
 }
 
+/// THE result-type rule: the type one result takes when it may hold a value
+/// of either type — CASE/IF branches, COALESCE/GREATEST/LEAST arguments,
+/// UNION arms. StarRocks semantics: decimals meet at the precision and scale
+/// covering both, a decimal and a float meet as DOUBLE, integers widen, DATE
+/// meets DATETIME as DATETIME, and anything meets text as text. Null when
+/// the two never share a result (a number and a date).
+pub fn commonType(a: Type, b: Type) ?Type {
+    if (sameRepresentation(a, b)) return if (a.isString()) commonText(a, b) else a;
+    if (a.isDecimal() or b.isDecimal()) {
+        if (a.isFloat() or b.isFloat()) return .double;
+        if (decimal.commonSpec(&.{ a, b })) |spec| return decimal.decTypeFor(spec.p, spec.s);
+    }
+    const at: TypeTag = a;
+    const bt: TypeTag = b;
+    if (!a.isDecimal() and !b.isDecimal()) {
+        if (castCost(at, bt) != null) return b;
+        if (castCost(bt, at) != null) return a;
+    }
+    if (a.isString() or b.isString()) return .string;
+    return null;
+}
+
+/// Two declared-length text types meet at the longer VARCHAR, as in MySQL;
+/// unbounded text or JSON on either side meets as plain text.
+fn commonText(a: Type, b: Type) Type {
+    if (std.meta.eql(a, b)) return a;
+    const a_len = declaredTextLength(a) orelse return .string;
+    const b_len = declaredTextLength(b) orelse return .string;
+    return .{ .varchar = @max(a_len, b_len) };
+}
+
+fn declaredTextLength(t: Type) ?u32 {
+    return switch (t) {
+        .varchar, .char => |n| n,
+        else => null,
+    };
+}
+
+/// `commonType` folded over every type; null when any pair never meets.
+pub fn commonTypeOf(ts: []const Type) ?Type {
+    if (ts.len == 0) return null;
+    var acc = ts[0];
+    for (ts[1..]) |t| acc = commonType(acc, t) orelse return null;
+    return acc;
+}
+
+/// Whether a value of type `a` is stored exactly as the same value of type
+/// `b`: the text family shares one representation, and a decimal's
+/// mantissa means a different number at another scale.
+pub fn sameRepresentation(a: Type, b: Type) bool {
+    if (a.isString() and b.isString()) return true;
+    if (a.isDecimal() or b.isDecimal()) return std.meta.eql(a, b);
+    return @as(TypeTag, a) == @as(TypeTag, b);
+}
+
 // ---------------------------------------------------------------------------
 // Comptime-generated kernel factories. Each returns a function pointer with
 // the standard kernel signature so the Compute operator can call uniformly.
@@ -386,6 +444,29 @@ test "castCost: bool widens through integer family" {
 test "castCost: date → datetime is cheap" {
     try std.testing.expectEqual(@as(?u32, 1), castCost(.date, .datetime));
     try std.testing.expect(castCost(.datetime, .date) == null);
+}
+
+test "commonType: one result type for values of either type" {
+    const dec_10_2: Type = .{ .decimal64 = .{ .p = 10, .s = 2 } };
+    const dec_12_4: Type = .{ .decimal64 = .{ .p = 12, .s = 4 } };
+    const cases = .{
+        .{ dec_10_2, dec_12_4, @as(?Type, dec_12_4) },
+        .{ dec_10_2, @as(Type, .int), @as(?Type, .{ .decimal64 = .{ .p = 12, .s = 2 } }) },
+        .{ dec_10_2, @as(Type, .double), @as(?Type, .double) },
+        .{ @as(Type, .int), @as(Type, .bigint), @as(?Type, .bigint) },
+        .{ @as(Type, .smallint), @as(Type, .double), @as(?Type, .double) },
+        .{ @as(Type, .date), @as(Type, .datetime), @as(?Type, .datetime) },
+        .{ @as(Type, .int), @as(Type, .{ .varchar = 5 }), @as(?Type, .string) },
+        .{ @as(Type, .{ .varchar = 10 }), @as(Type, .{ .varchar = 20 }), @as(?Type, .{ .varchar = 20 }) },
+        .{ @as(Type, .{ .char = 3 }), @as(Type, .{ .varchar = 2 }), @as(?Type, .{ .varchar = 3 }) },
+        .{ @as(Type, .{ .varchar = 10 }), @as(Type, .string), @as(?Type, .string) },
+        .{ @as(Type, .int), @as(Type, .date), @as(?Type, null) },
+        .{ dec_10_2, @as(Type, .datetime), @as(?Type, null) },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectEqual(c[2], commonType(c[0], c[1]));
+        try std.testing.expectEqual(c[2], commonType(c[1], c[0]));
+    }
 }
 
 test "kernelFor: same-type returns null" {

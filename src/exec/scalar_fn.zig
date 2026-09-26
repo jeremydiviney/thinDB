@@ -546,6 +546,56 @@ fn canonScalarTag(t: TypeTag) TypeTag {
     };
 }
 
+/// The first argument of a function whose result is one of its arguments
+/// (GREATEST, LEAST, COALESCE, IFNULL, NULLIF; IF after its condition):
+/// those arguments take one type by `cast.commonType` when no overload
+/// matches them as given. Null for any other function.
+pub fn resultValueArgsStart(name: []const u8) ?usize {
+    inline for (.{ "greatest", "least", "coalesce", "ifnull", "nullif" }) |n| {
+        if (std.ascii.eqlIgnoreCase(name, n)) return 0;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "if")) return 1;
+    return null;
+}
+
+/// Which arguments to pass through `to_string` so `name` resolves: a
+/// string parameter takes a number, a decimal or a date as its text, as in
+/// StarRocks (`CONCAT('Q', quarter)`). The cheapest overload wins; null when
+/// no overload resolves that way or no argument needs it.
+pub fn stringifiedArgs(aa: Allocator, name: []const u8, arg_types: []const Type) !?[]const bool {
+    var best: ?ScalarFn = null;
+    var best_cost: u64 = std.math.maxInt(u64);
+    for (builtins) |f| {
+        if (!std.ascii.eqlIgnoreCase(f.name, name)) continue;
+        if (!scalarArityMatches(f, arg_types.len)) continue;
+        var total: u64 = 0;
+        for (arg_types, 0..) |given, i| {
+            total += try stringifyArgCost(aa, given, scalarDeclaredTypeAt(f, i)) orelse break;
+        } else if (total < best_cost) {
+            best_cost = total;
+            best = f;
+        }
+    }
+    const f = best orelse return null;
+    const wrap = try aa.alloc(bool, arg_types.len);
+    var any = false;
+    for (arg_types, wrap, 0..) |given, *w, i| {
+        w.* = scalarDeclaredTypeAt(f, i).isString() and !given.isString();
+        any = any or w.*;
+    }
+    return if (any) wrap else null;
+}
+
+const STRINGIFY_COST: u64 = 1000;
+
+fn stringifyArgCost(aa: Allocator, given: Type, declared: Type) !?u64 {
+    if (declared.isString()) {
+        if (given.isString()) return 0;
+        return if (try resolve(aa, "to_string", &.{given}) != null) STRINGIFY_COST else null;
+    }
+    return argCastCost(given, declared, true) orelse return null;
+}
+
 fn scalarCastCost(f: ScalarFn, arg_types: []const Type, allow_narrowing: bool) ?u64 {
     if (!scalarArityMatches(f, arg_types.len)) return null;
     var total_cost: u64 = 0;
@@ -625,6 +675,7 @@ pub const builtins = [_]ScalarFn{
     // --- multi-arg string ---
     .{ .name = "concat", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.concat2Kernel },
     .{ .name = "concat", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.concat3Kernel },
+    .{ .name = "concat", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 4, .kernel = string.concatNKernel },
     .{ .name = "concat_ws", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = string.concatWsKernel },
     .{ .name = "substring", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .kernel = string.substringKernel },
     .{ .name = "left", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.leftKernel },
@@ -700,10 +751,14 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "greatest", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.greatestBigintKernel },
     .{ .name = "greatest", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.greatestDoubleKernel },
     .{ .name = "greatest", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.greatestStringKernel },
+    .{ .name = "greatest", .arg_types = &.{ .date, .date }, .return_type = .date, .kernel = math.greatestDateKernel },
+    .{ .name = "greatest", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .kernel = math.greatestDatetimeKernel },
     .{ .name = "least", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.leastIntKernel },
     .{ .name = "least", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.leastBigintKernel },
     .{ .name = "least", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.leastDoubleKernel },
     .{ .name = "least", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.leastStringKernel },
+    .{ .name = "least", .arg_types = &.{ .date, .date }, .return_type = .date, .kernel = math.leastDateKernel },
+    .{ .name = "least", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .kernel = math.leastDatetimeKernel },
     // --- math (expanded) ---
     .{ .name = "sin", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sinKernel },
     .{ .name = "cos", .arg_types = &.{.double}, .return_type = .double, .kernel = math.cosKernel },
@@ -846,6 +901,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.bigintToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.double}, .return_type = .string, .kernel = math.doubleToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.boolean}, .return_type = .string, .kernel = math.boolToStringKernel },
+    .{ .name = "to_string", .arg_types = &.{.date}, .return_type = .string, .kernel = date.dateToStringKernel },
+    .{ .name = "to_string", .arg_types = &.{.datetime}, .return_type = .string, .kernel = date.datetimeToStringKernel },
     // --- hash ---
     .{ .name = "md5", .arg_types = &.{.string}, .return_type = .string, .kernel = string.md5Kernel },
     .{ .name = "md5sum", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 1, .kernel = string.md5sumKernel },

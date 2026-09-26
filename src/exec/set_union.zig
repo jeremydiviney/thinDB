@@ -348,33 +348,20 @@ fn typeTag(t: Type) TypeTag {
     return std.meta.activeTag(t);
 }
 
-/// `.string`, `.varchar(n)`, and `.char(n)` share one physical StringView
-/// representation, so unioning across them needs no cast — only a common tag.
-fn stringFamily(t: TypeTag) bool {
-    return t == .string or t == .varchar or t == .char;
-}
-
-/// True when `a` and `b` occupy the same physical column representation, so a
-/// value of one can flow into an output column typed as the other uncast.
 fn sameRepr(a: Type, b: Type) bool {
-    const at = typeTag(a);
-    const bt = typeTag(b);
-    return at == bt or (stringFamily(at) and stringFamily(bt));
+    return cast.sameRepresentation(a, b);
 }
 
 fn commonUnionType(left: Type, right: Type) ?Type {
-    const lt = typeTag(left);
-    const rt = typeTag(right);
-    if (lt == rt) return left;
-    // A `VARCHAR(n)` base column unioned with a `.string` expression result
-    // (CONCAT/LOWER/…) reconciles to plain string — same representation.
-    if (stringFamily(lt) and stringFamily(rt)) return Type{ .string = {} };
-    if (cast.castCost(lt, rt) != null) return right;
-    if (cast.castCost(rt, lt) != null) return left;
-    return null;
+    return cast.commonType(left, right);
 }
 
+/// The tag-level widening kernel from `from` to `to`. A conversion that
+/// changes the value's representation (a decimal rescale, a number as text)
+/// has none: the planner converts that arm with a typed cast first
+/// (`cte_stages.unifyUnionArmTypes`), so a union built without it fails
+/// with TypeMismatch rather than reinterpreting mantissas.
 fn castFor(from: Type, to: Type) ?CastKernel {
-    if (sameRepr(from, to)) return null;
+    if (sameRepr(from, to) or from.isDecimal() or to.isDecimal()) return null;
     return cast.kernelFor(typeTag(from), typeTag(to));
 }

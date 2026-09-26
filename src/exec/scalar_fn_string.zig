@@ -212,6 +212,17 @@ pub fn concat3Kernel(allocator: Allocator, args: []const ColumnView, out: *Colum
     }
 }
 
+pub fn concatNKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    for (0..row_count) |i| {
+        scratch.clearRetainingCapacity();
+        for (args) |arg| try scratch.appendSlice(allocator, stringViewOf(arg).rowBytes(i));
+        try ss.appendValue(allocator, scratch.items);
+    }
+}
+
 /// MySQL-style substring: 1-indexed start; negative start counts from
 /// end; length < 0 → empty string. Out-of-range returns empty string
 /// rather than erroring (matches MySQL).

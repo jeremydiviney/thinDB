@@ -2544,9 +2544,9 @@ test "sql: aggregate-inside-scalar goes through overload resolution" {
     defer db.close();
     _ = try seedT(db);
 
-    // The aggregate hoists to a hidden output; upper() then has no
-    // bigint overload, so this fails at resolution, not at parse.
-    const res = runSql(allocator, db, "SELECT upper(count(*)) FROM t");
+    // The aggregate hoists to a hidden output; sqrt() then has no text
+    // overload, so this fails at resolution, not at parse.
+    const res = runSql(allocator, db, "SELECT sqrt(max(tag)) FROM t");
     try std.testing.expectError(error.ComputeNoSuchOverload, res);
 }
 
