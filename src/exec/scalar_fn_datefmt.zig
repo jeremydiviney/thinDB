@@ -9,7 +9,6 @@ const common = @import("scalar_fn_common.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
-const stringStoreOf = common.stringStoreOf;
 
 const Kernel = *const fn (allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void;
 
