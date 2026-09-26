@@ -93,7 +93,7 @@ fn flipOp(op: PredicateOp) PredicateOp {
 /// has no negated form, so it keeps the `.not` wrapper behind an IS NOT NULL
 /// guard. EXISTS stays wrapped — subquery_resolve pattern-matches
 /// `.not(.exists_subquery)` to thread the negation into the correlated set.
-fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr {
+pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr {
     switch (e) {
         .leaf => |l| return .{ .leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
         .day_leaf => |l| return .{ .day_leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },

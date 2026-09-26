@@ -451,6 +451,9 @@ pub const Parser = struct {
     arena: Allocator,
     lex: *Lexer,
     cur: Token,
+    /// Source end of the last consumed token: bounds a SELECT item's text,
+    /// which names a predicate item the way MySQL does.
+    prev_end: usize = 0,
     /// CTE registry: name → resolved *ir.Op + materialization hint.
     /// Populated by `parseCteList`; consulted in `parseFromTarget`.
     /// Flat scope: nested SELECTs can reference outer CTEs but
@@ -496,6 +499,7 @@ pub const Parser = struct {
     window_partition_expr_counter: usize = 0,
 
     pub fn advance(self: *Parser) ParseError!void {
+        self.prev_end = self.lex.pos;
         self.cur = try self.lex.next();
         // SQL table-function expansion: inside a function body, parameter
         // identifiers resolve to the call's literal argument tokens. One
@@ -1368,6 +1372,14 @@ pub const Parser = struct {
             return ProjItem{ .name = "*", .kind = .{ .star = null } };
         }
 
+        if (try self.predicateValueAhead()) {
+            const start = self.prev_end;
+            const expr = try self.parsePredicateValue();
+            const text = std.mem.trim(u8, self.lex.src[start..self.prev_end], " \t\r\n");
+            const alias = try self.maybeAlias(try self.arena.dupe(u8, text));
+            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+        }
+
         // Parenthesized expression at projection start: `(expr) [AS name]`.
         // Routes through the expression parser (which handles binary
         // operators) without going through the identifier path.
@@ -1684,6 +1696,57 @@ pub const Parser = struct {
         return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_expr } };
     }
 
+    /// Whether the value starting at `cur` is a predicate: it opens with NOT
+    /// or EXISTS, or a comparison, IS, IN, BETWEEN, LIKE, AND or OR sits
+    /// outside every parenthesis and CASE before the value ends.
+    fn predicateValueAhead(self: *Parser) ParseError!bool {
+        if (self.cur.tag == .kw_not or self.cur.tag == .kw_exists) return true;
+        var look = self.lex.*;
+        var tok = self.cur;
+        var depth: usize = 0;
+        while (true) : (tok = try look.next()) {
+            switch (tok.tag) {
+                .lparen, .kw_case => depth += 1,
+                .rparen, .kw_end => {
+                    if (depth == 0) return false;
+                    depth -= 1;
+                },
+                .eof, .semicolon => return false,
+                .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_into => {
+                    if (depth == 0) return false;
+                },
+                .eq, .neq, .lt, .lte, .gt, .gte, .kw_is, .kw_in, .kw_between, .kw_like, .kw_and, .kw_or, .kw_not => {
+                    if (depth == 0) return true;
+                },
+                .pipe_pipe => if (depth == 0 and self.lex.dialect == .mysql) return true,
+                else => {},
+            }
+        }
+    }
+
+    /// A predicate read as a value: TRUE, FALSE, or NULL where it is unknown.
+    fn parsePredicateValue(self: *Parser) ParseError!ir.Expr {
+        const pred = try self.parseBoolExpr();
+        const never_unknown = switch (pred) {
+            .exists_subquery, .always, .is_null, .is_not_null => true,
+            .not => |child| child.* == .exists_subquery,
+            else => false,
+        };
+        const true_lit: ir.Expr = .{ .lit = .{ .boolean = true } };
+        const false_lit: ir.Expr = .{ .lit = .{ .boolean = false } };
+        if (never_unknown) {
+            const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+            branches[0] = .{ .cond = pred, .then = true_lit };
+            const else_branch = try self.arena.create(ir.Expr);
+            else_branch.* = false_lit;
+            return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
+        }
+        const branches = try self.arena.alloc(ir.Expr.Branch, 2);
+        branches[0] = .{ .cond = pred, .then = true_lit };
+        branches[1] = .{ .cond = try parse_predicate.negatePredicate(self, pred), .then = false_lit };
+        return ir.Expr{ .case = .{ .branches = branches, .else_branch = null } };
+    }
+
     fn normalizeScalarCallArgs(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError![]const ir.Expr {
         if (!unitFirstArgCall(name) or args.len == 0) return args;
         const unit = switch (args[0]) {
@@ -1887,7 +1950,7 @@ pub const Parser = struct {
             try args.append(self.arena, ir.Expr{ .col_ref = "*" });
         } else if (self.cur.tag != .rparen) {
             while (true) {
-                const a = try self.parseCallArg();
+                const a = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
                 try args.append(self.arena, a);
                 if (self.cur.tag != .comma) break;
                 try self.advance();
@@ -2511,7 +2574,7 @@ pub const Parser = struct {
                     try self.expect(.rparen);
                     return ir.Expr{ .scalar_subquery = @ptrCast(source) };
                 }
-                const inner = try self.parseAddSub();
+                const inner = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseAddSub();
                 try self.expect(.rparen);
                 return inner;
             },
