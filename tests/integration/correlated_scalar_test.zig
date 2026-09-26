@@ -180,3 +180,40 @@ test "correlated scalar: compared in WHERE and read in the SELECT list, by one L
     try std.testing.expectEqual(@as(usize, 4), batch.values.len);
     try std.testing.expectEqualSlices(i64, &.{ 2, 0, 1, 0, 0 }, batch.values[3].data.bigint[0..batch.row_count]);
 }
+
+test "correlated scalar: inside arithmetic on the right of a comparison" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, big BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, qty, big) VALUES (1, 1, 1), (2, 0, 0), (3, 5, 5), (4, 0, 0), (5, 2, 2)");
+    try exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT NOT NULL, amount INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO o (oid, tid, amount) VALUES (1, 1, 5), (2, 1, 7), (3, 3, 9)");
+
+    // Per t.id: COUNT over o = {2, 0, 1, 0, 0}; MAX(amount) = {7, NULL, 9, NULL, NULL};
+    // AVG(amount) = {6, NULL, 9, NULL, NULL}; MAX(amount) over all of o = 9.
+    const cases = .{
+        .{ "SELECT id FROM t WHERE big > (SELECT COUNT(*) FROM o WHERE tid = id) - 1 ORDER BY id", &[_]i64{ 2, 3, 4, 5 } },
+        .{ "SELECT id FROM t WHERE big < 1 + (SELECT MAX(amount) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE qty < (SELECT AVG(amount) FROM o WHERE tid = id) - 1 ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE big <= (SELECT COUNT(*) FROM o WHERE tid = id) + (SELECT MAX(amount) FROM o) - 9 ORDER BY id", &[_]i64{ 1, 2, 4 } },
+        .{ "SELECT id FROM t WHERE id >= 2 AND big > (SELECT COUNT(*) FROM o WHERE tid = id) - 1 ORDER BY id", &[_]i64{ 2, 3, 4, 5 } },
+        .{ "SELECT id FROM t WHERE big < (SELECT MAX(amount) FROM o) - 5 ORDER BY id", &[_]i64{ 1, 2, 4, 5 } },
+        .{ "SELECT CASE WHEN big > (SELECT COUNT(*) FROM o WHERE tid = id) - 1 THEN id ELSE 0 END AS c FROM t ORDER BY id", &[_]i64{ 0, 2, 3, 4, 5 } },
+        .{ "SELECT id FROM t WHERE big BETWEEN (SELECT COUNT(*) FROM o WHERE tid = id) - 1 AND 1 + (SELECT MAX(amount) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE big NOT BETWEEN (SELECT COUNT(*) FROM o WHERE tid = id) + 1 AND 4 ORDER BY id", &[_]i64{ 1, 2, 3, 4 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    // The lowered value column never reaches the output.
+    var q = try runSql(allocator, db, "SELECT * FROM t WHERE big > (SELECT COUNT(*) FROM o WHERE tid = id) - 1 ORDER BY id");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 3), batch.values.len);
+}
