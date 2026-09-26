@@ -1,6 +1,5 @@
-//! UNION ALL — concatenate two SELECT pipelines with matching schemas.
-//! v1 only supports UNION ALL (no dedup). Plain UNION errors at parse
-//! time until a hash-dedup pass lands.
+//! UNION ALL concatenates two SELECT pipelines with matching schemas;
+//! UNION [DISTINCT] keeps one copy of each distinct row.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -97,10 +96,119 @@ test "UNION ALL: schema width mismatch rejected" {
     }
 }
 
-test "UNION (distinct) rejected — only UNION ALL ships in v1" {
+test "UNION: keeps one copy of each distinct row" {
     const allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const err = thindb.sql.parse(arena.allocator(), "SELECT id FROM a UNION SELECT id FROM b");
-    try std.testing.expectError(thindb.sql.ParseError.SqlInvalidProjection, err);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE c (id BIGINT PRIMARY KEY, v BIGINT)");
+    try exec(allocator, db, "INSERT INTO c (id, v) VALUES (1, NULL), (2, NULL), (3, 5)");
+
+    const cases = .{
+        .{ "SELECT id FROM a UNION SELECT id FROM b ORDER BY id", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT id FROM a UNION DISTINCT SELECT id FROM b ORDER BY 1", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT id % 2 FROM a UNION SELECT id % 2 FROM b ORDER BY 1", &[_]i64{ 0, 1 } },
+        .{ "SELECT id, id * 0 AS z FROM a UNION SELECT id, 0 FROM b ORDER BY id", &[_]i64{ 1, 2, 3, 4 } },
+        // Left-associative: (a ∪all a) ∪ b, then (a ∪ b) ∪all b.
+        .{ "SELECT id FROM a UNION ALL SELECT id FROM a UNION SELECT id FROM b ORDER BY id", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT id FROM a UNION SELECT id FROM b UNION ALL SELECT id FROM b ORDER BY id", &[_]i64{ 1, 2, 2, 3, 4, 4 } },
+        // A column no consumer reads still decides which rows are duplicates.
+        .{ "SELECT k FROM (SELECT id % 2 AS k, id FROM a UNION SELECT id % 2, id FROM b) x ORDER BY k", &[_]i64{ 0, 0, 1, 1 } },
+        .{ "SELECT id FROM a WHERE id IN (SELECT id FROM b UNION SELECT 3) ORDER BY id", &[_]i64{ 2, 3 } },
+        // NULLs compare equal, as in SELECT DISTINCT.
+        .{ "SELECT COUNT(*) FROM (SELECT v FROM c UNION SELECT v FROM c) x", &[_]i64{2} },
+    };
+    inline for (cases) |c| {
+        const got = try collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "UNION: a trailing ORDER BY / LIMIT applies to the whole union" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id DESC", &[_]i64{ 4, 3, 2, 2, 1 } },
+        .{ "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id LIMIT 3", &[_]i64{ 1, 2, 2 } },
+        .{ "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY 1 DESC LIMIT 2 OFFSET 1", &[_]i64{ 3, 2 } },
+        .{ "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id % 3, id", &[_]i64{ 3, 1, 4, 2, 2 } },
+        .{ "SELECT id AS k FROM a UNION SELECT id FROM b ORDER BY k DESC", &[_]i64{ 4, 3, 2, 1 } },
+        .{ "(SELECT id FROM a ORDER BY id DESC LIMIT 1) UNION ALL (SELECT id FROM b ORDER BY id LIMIT 1)", &[_]i64{ 3, 2 } },
+        .{ "(SELECT id FROM a) UNION (SELECT id FROM b) ORDER BY id LIMIT 3", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT id FROM a UNION ALL (SELECT id FROM b ORDER BY id DESC LIMIT 1) ORDER BY id", &[_]i64{ 1, 2, 3, 4 } },
+    };
+    inline for (cases) |c| {
+        const got = try collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    const limited = try collectBigints(allocator, db, "SELECT id FROM a UNION ALL SELECT id FROM b LIMIT 2");
+    defer allocator.free(limited);
+    try std.testing.expectEqual(@as(usize, 2), limited.len);
+
+    // The expression key's hidden column never reaches the output.
+    var q = try helpers.runSql(allocator, db, "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY -id");
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 1), q.outputSchema().len);
+}
+
+test "UNION: a bare NULL arm column takes the other arm's type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE f (id BIGINT PRIMARY KEY, amt DOUBLE, d DATE)");
+    try exec(allocator, db, "INSERT INTO f (id, amt, d) VALUES (7, 1.5, '2024-01-01')");
+
+    const cases = .{
+        .{ "SELECT COUNT(x) FROM (SELECT id, NULL AS x FROM a UNION ALL SELECT id, amt FROM f) t", &[_]i64{1} },
+        .{ "SELECT COUNT(x) FROM (SELECT id, amt AS x FROM f UNION ALL SELECT id, NULL FROM a) t", &[_]i64{1} },
+        .{ "SELECT COUNT(*) FROM (SELECT id, NULL AS x FROM a UNION SELECT id, d FROM f) t", &[_]i64{4} },
+        .{ "SELECT k FROM (SELECT NULL AS k UNION ALL SELECT id FROM b) t WHERE k IS NOT NULL ORDER BY k", &[_]i64{ 2, 4 } },
+        .{ "SELECT k FROM (SELECT id AS k FROM b UNION SELECT NULL FROM a) t WHERE k > 2", &[_]i64{4} },
+        .{ "SELECT k FROM (SELECT v.k FROM (SELECT NULL AS k) v UNION ALL SELECT id FROM b) t WHERE k > 2", &[_]i64{4} },
+    };
+    inline for (cases) |c| {
+        const got = try collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var q = try helpers.runSql(allocator, db, "SELECT NULL AS x FROM a UNION ALL SELECT amt FROM f");
+    defer q.deinit();
+    try std.testing.expectEqual(thindb.types.TypeTag.double, std.meta.activeTag(q.outputSchema()[0].type));
+}
+
+test "UNION ALL: a computed column over a union CTE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // The Compute splits into the arms above each one's SELECT list.
+    const got = try collectBigints(allocator, db, "WITH u AS (SELECT id FROM a UNION ALL SELECT id FROM b) SELECT id % 3 AS m FROM u ORDER BY id");
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 2, 0, 1 }, got);
 }

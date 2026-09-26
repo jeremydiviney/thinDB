@@ -498,6 +498,12 @@ pub const Parser = struct {
     window_partition_expr_refs: std.ArrayList(ir.Derived) = .empty,
     window_partition_expr_counter: usize = 0,
     order_expr_counter: usize = 0,
+    /// Set by a UNION chain just before it parses a bare arm: that SELECT
+    /// stops before ORDER BY / LIMIT, which belong to the whole union.
+    union_arm: bool = false,
+    /// The SELECT list of the query expression parsed last: a parenthesized
+    /// operand's output names, which a trailing ORDER BY binds to.
+    select_output: []const ProjItem = &.{},
 
     pub fn advance(self: *Parser) ParseError!void {
         self.prev_end = self.lex.pos;
@@ -626,10 +632,13 @@ pub const Parser = struct {
     }
 
     pub fn parseStatement(self: *Parser) ParseError!*ir.Op {
+        const union_arm = self.union_arm;
+        self.union_arm = false;
         // DDL / SHOW / INSERT are leading-keyword forms that don't combine
         // with WITH. They have no projection / FROM / WHERE / etc.;
         // dispatch before the SELECT-only path.
         switch (self.cur.tag) {
+            .lparen => return try self.parseParenthesizedQuery(),
             .kw_create, .kw_drop, .kw_use, .kw_alter, .kw_rename, .kw_truncate => return try parse_ddl.parseDdl(self),
             .kw_show => return try parse_ddl.parseShow(self),
             .kw_explain => {
@@ -780,6 +789,9 @@ pub const Parser = struct {
             try self.advance();
             pending_qualify = try self.parseBoolExpr();
         }
+        // In a UNION chain, ORDER BY / LIMIT order and cut the union's rows:
+        // `parseSetOpTail` reads them once the chain ends.
+        const set_op_follows = union_arm or self.cur.tag == .kw_union;
 
         // Parse-time peek for ORDER BY and LIMIT clauses — we need to
         // know the pipeline shape before deciding where to insert
@@ -791,7 +803,7 @@ pub const Parser = struct {
         var pending_order_specs: ?[]const @import("../exec/sort.zig").SortSpec = null;
         var order_anchors: []const ir.Derived = &.{};
         var order_keys: []const ir.Derived = &.{};
-        if (self.cur.tag == .kw_order) {
+        if (!set_op_follows and self.cur.tag == .kw_order) {
             try self.advance();
             try self.expect(.kw_by);
             self.aggregate_expr_refs_enabled = true;
@@ -805,41 +817,9 @@ pub const Parser = struct {
         const aggregate_expr_refs = try self.arena.dupe(AggExprRef, self.aggregate_expr_refs.items[agg_ref_mark..]);
         self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
 
-        // Optional LIMIT, in either of MySQL's two forms:
-        //   LIMIT count
-        //   LIMIT offset, count        (offset first)
-        //   LIMIT count OFFSET offset  (OFFSET keyword)
         var pending_limit: ?u64 = null;
         var pending_offset: u64 = 0;
-        if (self.cur.tag == .kw_limit) {
-            try self.advance();
-            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-            const n = self.cur.value.integer;
-            try self.advance();
-            if (n < 0) return ParseError.SqlExpectedValue;
-            if (self.cur.tag == .comma) {
-                // LIMIT offset, count — first number is the offset.
-                try self.advance();
-                if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-                const count = self.cur.value.integer;
-                try self.advance();
-                if (count < 0) return ParseError.SqlExpectedValue;
-                pending_offset = @intCast(n);
-                pending_limit = @intCast(count);
-            } else {
-                pending_limit = @intCast(n);
-                if (self.cur.tag == .kw_offset) {
-                    try self.advance();
-                    if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
-                    const off = self.cur.value.integer;
-                    try self.advance();
-                    if (off < 0) return ParseError.SqlExpectedValue;
-                    pending_offset = @intCast(off);
-                }
-            }
-        } else {
-            try self.parseFetchOffset(&pending_limit, &pending_offset);
-        }
+        if (!set_op_follows) try self.parseLimitClause(&pending_limit, &pending_offset);
 
         // Decide between a Project, a Group-by, or a Group-by + Project
         // based on the projection list shape.
@@ -1212,32 +1192,120 @@ pub const Parser = struct {
                 root = try self.addSelectProject(root, proj, hidden_trailing);
             }
         }
-        // Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit,
-        // e.g. ANSI `OFFSET n ROWS`) still needs the operator, with an
-        // effectively-unbounded count.
-        if (pending_limit != null or pending_offset > 0) {
-            const n = pending_limit orelse std.math.maxInt(u64);
-            root = try self.allocOp(.{ .limit = .{ .n = n, .offset = pending_offset, .upstream = root } });
-        }
+        root = try self.addLimit(root, pending_limit, pending_offset);
+        if (union_arm) return root;
+        const query = try self.parseSetOpTail(root, proj, false);
+        self.select_output = proj;
+        return query;
+    }
 
-        // UNION / UNION ALL chains. SQL semantics: left-associative;
-        // every right-hand side is itself a full SELECT pipeline.
-        // v1 only ships UNION ALL — UNION (distinct) errors with
-        // SqlInvalidProjection until a dedup pass lands.
-        while (self.cur.tag == .kw_union) {
+    /// Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit, e.g.
+    /// ANSI `OFFSET n ROWS`) still needs the operator, with an
+    /// effectively-unbounded count.
+    fn addLimit(self: *Parser, upstream: *ir.Op, limit: ?u64, offset: u64) ParseError!*ir.Op {
+        if (limit == null and offset == 0) return upstream;
+        const n = limit orelse std.math.maxInt(u64);
+        return try self.allocOp(.{ .limit = .{ .n = n, .offset = offset, .upstream = upstream } });
+    }
+
+    /// Optional LIMIT, in either of MySQL's two forms, or the ANSI
+    /// OFFSET / FETCH form:
+    ///   LIMIT count
+    ///   LIMIT offset, count        (offset first)
+    ///   LIMIT count OFFSET offset  (OFFSET keyword)
+    fn parseLimitClause(self: *Parser, limit_out: *?u64, offset_out: *u64) ParseError!void {
+        if (self.cur.tag != .kw_limit) return try self.parseFetchOffset(limit_out, offset_out);
+        try self.advance();
+        if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+        const n = self.cur.value.integer;
+        try self.advance();
+        if (n < 0) return ParseError.SqlExpectedValue;
+        if (self.cur.tag == .comma) {
+            // LIMIT offset, count — first number is the offset.
             try self.advance();
-            const all = self.cur.tag == .kw_all;
-            if (all) try self.advance();
-            if (!all) return ParseError.SqlInvalidProjection;
-            const rhs = try self.parseStatement();
-            root = try self.allocOp(.{ .set_union = .{
-                .left = root,
-                .right = rhs,
-                .all = true,
-            } });
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            const count = self.cur.value.integer;
+            try self.advance();
+            if (count < 0) return ParseError.SqlExpectedValue;
+            offset_out.* = @intCast(n);
+            limit_out.* = @intCast(count);
+            return;
         }
+        limit_out.* = @intCast(n);
+        if (self.cur.tag == .kw_offset) {
+            try self.advance();
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            const off = self.cur.value.integer;
+            try self.advance();
+            if (off < 0) return ParseError.SqlExpectedValue;
+            offset_out.* = @intCast(off);
+        }
+    }
 
-        return root;
+    /// `( query ) ...`: a parenthesized query expression keeps its own
+    /// ORDER BY / LIMIT, and may lead a UNION chain.
+    fn parseParenthesizedQuery(self: *Parser) ParseError!*ir.Op {
+        try self.advance();
+        const inner = try self.parseStatement();
+        try self.expect(.rparen);
+        const output = self.select_output;
+        const query = try self.parseSetOpTail(inner, output, true);
+        self.select_output = output;
+        return query;
+    }
+
+    /// The rest of a query expression after its first operand: UNION arms,
+    /// left-associative as the standard reads `A UNION ALL B UNION C`, then
+    /// an ORDER BY / LIMIT over the whole result. ORDER BY binds the union's
+    /// output names, the first operand's. A lone SELECT has already read its
+    /// own ORDER BY / LIMIT; a parenthesized one reads them here.
+    fn parseSetOpTail(self: *Parser, first: *ir.Op, output: []const ProjItem, parenthesized: bool) ParseError!*ir.Op {
+        var root = first;
+        var arms: usize = 0;
+        while (self.cur.tag == .kw_union) : (arms += 1) {
+            try self.advance();
+            var all = false;
+            if (self.cur.tag == .kw_all) {
+                all = true;
+                try self.advance();
+            } else if (self.cur.tag == .kw_distinct) {
+                try self.advance();
+            }
+            const arm = if (self.cur.tag == .lparen) try self.parseParenthesizedArm() else blk: {
+                self.union_arm = true;
+                break :blk try self.parseStatement();
+            };
+            root = try self.allocOp(.{ .set_union = .{ .left = root, .right = arm, .all = all } });
+        }
+        if (arms == 0 and !parenthesized) return root;
+
+        if (self.cur.tag == .kw_order) {
+            try self.advance();
+            try self.expect(.kw_by);
+            const names = try self.arena.alloc(ProjItem, output.len);
+            for (output, names) |p, *n| n.* = if (p.kind == .star) p else .{ .name = p.name, .kind = .{ .col = p.name } };
+            const old_aggregate_expr_refs_enabled = self.aggregate_expr_refs_enabled;
+            self.aggregate_expr_refs_enabled = false;
+            defer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
+            const order = try self.parseOrderBy(names);
+            root = try self.addOrderKeyComputes(root, order.anchors, order.keys);
+            if (order.specs.len > 0) root = try self.allocOp(.{ .order_by = .{ .specs = order.specs, .upstream = root } });
+            const hidden = try self.arena.alloc([]const u8, order.anchors.len + order.keys.len);
+            for (order.anchors, hidden[0..order.anchors.len]) |d, *h| h.* = d.name;
+            for (order.keys, hidden[order.anchors.len..]) |d, *h| h.* = d.name;
+            if (hidden.len > 0) root = try self.allocOp(.{ .exclude = .{ .columns = hidden, .upstream = root } });
+        }
+        var limit: ?u64 = null;
+        var offset: u64 = 0;
+        try self.parseLimitClause(&limit, &offset);
+        return try self.addLimit(root, limit, offset);
+    }
+
+    fn parseParenthesizedArm(self: *Parser) ParseError!*ir.Op {
+        try self.advance();
+        const arm = try self.parseStatement();
+        try self.expect(.rparen);
+        return arm;
     }
 
     pub fn parseTableRef(self: *Parser) ParseError!ir.TableRef {

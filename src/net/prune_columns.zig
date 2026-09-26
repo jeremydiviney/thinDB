@@ -478,7 +478,12 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
 
         .set_union => |u| {
             var child: ?*const NameSet = needed;
-            if (needed != null) {
+            // DISTINCT compares whole rows: a column no consumer reads still
+            // decides which rows are duplicates.
+            if (needed != null and !u.all) {
+                child = null;
+                ctx.null_reason = "union-distinct";
+            } else if (needed != null) {
                 const ln = armSelectNames(ctx.arena, u.left);
                 const rn = armSelectNames(ctx.arena, u.right);
                 const lmat = armMat(u.left);

@@ -1852,26 +1852,30 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return jq;
         },
         .set_union => |u| {
-            // SetUnion.create validates schema compatibility and does NOT
-            // consume its inputs on error — both sides need errdefers (the
-            // width-mismatch path is exercised by tests).
-            var left = try compileUnionArm(input, u.left, map);
-            errdefer left.deinit();
-            var right = try compileUnionArm(input, u.right, map);
-            errdefer right.deinit();
-            // Pre-push lossless widening casts into the arms so the exec
-            // union is cast-free: rebatched()'s serial per-batch kernels
-            // disappear, and a join's probe sink can forward into BOTH arms
-            // (a cast arm otherwise pins the union's serial lane — on the
-            // production rollforward workload that lane carried the heavy 3.2M-row arm).
-            // The cast Compute fuses into the arm's stripe workers, or rides
-            // the ChainForward terminal push when a probe later chains
-            // through it; worst case it evaluates where rebatched would
-            // have, so this can't regress.
-            const t_op = exec.prof.nowTicks();
-            defer exec.prof.addPhase("compile.op.union", @intCast(exec.prof.nowTicks() - t_op));
-            try unifyUnionArmTypes(input, &left, &right);
-            return exec.SetUnion.create(input.allocator, left, right, u.all);
+            const unioned = blk: {
+                // SetUnion.create validates schema compatibility and does NOT
+                // consume its inputs on error — both sides need errdefers (the
+                // width-mismatch path is exercised by tests).
+                var left = try compileUnionArm(input, u.left, map);
+                errdefer left.deinit();
+                var right = try compileUnionArm(input, u.right, map);
+                errdefer right.deinit();
+                // Pre-push lossless widening casts into the arms so the exec
+                // union is cast-free: rebatched()'s serial per-batch kernels
+                // disappear, and a join's probe sink can forward into BOTH arms
+                // (a cast arm otherwise pins the union's serial lane — on the
+                // production rollforward workload that lane carried the heavy 3.2M-row arm).
+                // The cast Compute fuses into the arm's stripe workers, or rides
+                // the ChainForward terminal push when a probe later chains
+                // through it; worst case it evaluates where rebatched would
+                // have, so this can't regress.
+                const t_op = exec.prof.nowTicks();
+                defer exec.prof.addPhase("compile.op.union", @intCast(exec.prof.nowTicks() - t_op));
+                try unifyUnionArmTypes(input, u, &left, &right);
+                break :blk try exec.SetUnion.create(input.allocator, left, right, true);
+            };
+            if (u.all) return unioned;
+            return distinctRows(input, unioned);
         },
         else => return error.UnsupportedQueryShape,
     }
@@ -1922,12 +1926,41 @@ fn unionWideningType(l: types.Type, r: types.Type) ?types.Type {
     return null;
 }
 
+/// UNION's DISTINCT over the unioned rows: group on every output column —
+/// NULLs and the DISTINCT key rules match SELECT DISTINCT's — with the
+/// placeholder COUNT(*) the grouped cores need, then project it away. The
+/// column names exist only here, once the arms' schemas are known.
+fn distinctRows(input: engine_v2.CompileInput, unioned: exec.Query) !exec.Query {
+    var up = unioned;
+    var grouped, const cols = blk: {
+        errdefer up.deinit();
+        const schema = up.outputSchema();
+        const names = try input.node_arena.alloc([]const u8, schema.len);
+        for (schema, names) |col, *name| name.* = try input.node_arena.dupe(u8, col.name);
+        const aggs = try input.node_arena.dupe(ir.AggSpec, &.{.{ .func = .count, .col = null, .as = "__union_distinct_count" }});
+        const q = try group_route.routeGroupByDop(
+            input.allocator,
+            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+            &up,
+            names,
+            aggs,
+            null,
+            null,
+            input.db.config.query_memory_budget,
+            input.effectiveDop(),
+        );
+        break :blk .{ q, names };
+    };
+    errdefer grouped.deinit();
+    return grouped.project(cols);
+}
+
 /// Rewrite each arm so cast-needing columns are widened INSIDE the arm
 /// (fused into its scan workers where the chain allows) instead of by the
 /// union's serial per-batch kernels. Only the safe widening subset — see
 /// `unionWideningType`. Arm ownership transfers into the wrapping Compute
 /// on success; on ANY failure the arms are left exactly as passed in.
-fn unifyUnionArmTypes(input: engine_v2.CompileInput, left: *exec.Query, right: *exec.Query) !void {
+fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec.Query, right: *exec.Query) !void {
     const ls = left.outputSchema();
     const rs = right.outputSchema();
     if (ls.len != rs.len) return; // SetUnion.create reports the real error
@@ -1935,6 +1968,18 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, left: *exec.Query, right: *
     var r_derived: std.ArrayListUnmanaged(ir.Derived) = .empty;
     const trace_jf = getenv("THINDB_TRACE_JOINFUSE") != null;
     for (ls, rs) |lc, rc| {
+        if (std.meta.activeTag(lc.type) != std.meta.activeTag(rc.type)) {
+            // A bare NULL has no type of its own; it takes the other arm's.
+            const l_null = outputIsNullLiteral(u.left, lc.name);
+            if (l_null != outputIsNullLiteral(u.right, rc.name)) {
+                if (l_null) {
+                    try l_derived.append(input.node_arena, try nullDerived(input.node_arena, lc.name, rc.type));
+                } else {
+                    try r_derived.append(input.node_arena, try nullDerived(input.node_arena, rc.name, lc.type));
+                }
+                continue;
+            }
+        }
         const common = unionWideningType(lc.type, rc.type) orelse {
             if (trace_jf and std.meta.activeTag(lc.type) != std.meta.activeTag(rc.type)) {
                 std.debug.print("[jf]   union widen skip: {s} {s} vs {s}\n", .{ lc.name, @tagName(lc.type), @tagName(rc.type) });
@@ -1955,6 +2000,52 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, left: *exec.Query, right: *
     if (r_derived.items.len > 0) {
         right.* = try engine_v2.computeDerivedFused(input.allocator, right.*, r_derived.items, input.udf_registry);
     }
+}
+
+/// Whether `name` in `op`'s output is a NULL literal on every row, followed
+/// through the row-preserving and renaming nodes an arm's SELECT builds.
+fn outputIsNullLiteral(op: *const ir.Op, name: []const u8) bool {
+    var cur = op;
+    var col = name;
+    while (true) switch (cur.*) {
+        .compute => |c| {
+            var i = c.derived.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.ascii.eqlIgnoreCase(c.derived[i].name, col)) return c.derived[i].expr == .null_lit;
+            }
+            cur = c.upstream;
+        },
+        .select => |p| {
+            col = projectedSource(p, col) orelse return false;
+            cur = p.upstream;
+        },
+        .alias => |a| {
+            if (types.splitQualifiedName(col)) |split| {
+                if (std.ascii.eqlIgnoreCase(split.qualifier, a.alias)) col = split.bare;
+            }
+            cur = a.upstream;
+        },
+        .exclude => |p| cur = p.upstream,
+        .filter => |f| cur = f.upstream,
+        .order_by => |o| cur = o.upstream,
+        .limit => |l| cur = l.upstream,
+        .materialize => |m| cur = m.upstream,
+        else => return false,
+    };
+}
+
+fn projectedSource(p: ir.Op.Project, name: []const u8) ?[]const u8 {
+    for (p.columns, 0..) |src, i| {
+        const out = if (p.outputs) |outs| outs[i] orelse types.unqualifiedName(src) else types.unqualifiedName(src);
+        if (std.ascii.eqlIgnoreCase(out, types.unqualifiedName(name))) return src;
+    }
+    return null;
+}
+
+/// `name = NULL` typed as `ty`, replacing the arm's output slot in place.
+fn nullDerived(arena: std.mem.Allocator, col_name: []const u8, ty: types.Type) !ir.Derived {
+    return .{ .name = try arena.dupe(u8, col_name), .expr = .{ .null_lit = ty } };
 }
 
 /// `name = to_T(name)` — replaces the arm's own output slot in place (a
