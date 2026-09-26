@@ -3998,7 +3998,10 @@ pub const Parser = struct {
                     const call_expr = ir.Expr{ .call = .{ .fn_name = fname, .args = args } };
                     const idx = findGroupMatch(proj, call_expr) orelse return ParseError.SqlInvalidProjection;
                     break :blk proj[idx].name;
-                } else try self.dupQualifiedColRef(first);
+                } else if (self.cur.tag == .dot)
+                    try self.dupQualifiedColRef(first)
+                else
+                    try self.arena.dupe(u8, renamedColumnSource(proj, first) orelse first);
             }
             var desc = false;
             if (self.cur.tag == .kw_asc) {
@@ -4467,6 +4470,21 @@ fn projectionNameClaimed(items: []const ProjItem, name: []const u8) bool {
         if (item.kind != .star and types.columnNameEql(item.name, name)) return true;
     }
     return false;
+}
+
+/// An unqualified ORDER BY name resolves against the SELECT-list aliases
+/// first. The sort runs below the final projection, so an alias that renames
+/// a plain column sorts on that column; every other item is already
+/// materialized under its alias.
+fn renamedColumnSource(proj: []const ProjItem, name: []const u8) ?[]const u8 {
+    for (proj) |p| {
+        if (p.kind == .star or !types.columnNameEql(p.name, name)) continue;
+        return switch (p.kind) {
+            .col => |c| c,
+            else => null,
+        };
+    }
+    return null;
 }
 
 fn projectionHasRenamedCols(proj: []const ProjItem) bool {
