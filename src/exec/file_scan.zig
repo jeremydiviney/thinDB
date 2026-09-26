@@ -712,9 +712,7 @@ fn wantsColumn(needed: ?[]const []const u8, name: []const u8) bool {
     const names = needed orelse return true;
     for (names) |candidate| {
         if (types.columnNameEql(candidate, name)) return true;
-        if (std.mem.lastIndexOfScalar(u8, candidate, '.')) |dot| {
-            if (types.columnNameEql(candidate[dot + 1 ..], name)) return true;
-        }
+        if (types.columnNameEql(types.unqualifiedName(candidate), name)) return true;
     }
     return false;
 }

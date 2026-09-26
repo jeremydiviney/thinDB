@@ -623,6 +623,37 @@ test "sql: FROM-less SELECT evaluates expressions over one row" {
     }
 }
 
+test "sql: column names that contain a dot stay whole (issue #113)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const cases = .{
+        .{ .sql = "SELECT 0.5, 1.5", .names = &[_][]const u8{ "0.5", "1.5" }, .rows = 1 },
+        .{ .sql = "SELECT -0.0025, 'a.b', 7", .names = &[_][]const u8{ "-0.0025", "'a.b'", "7" }, .rows = 1 },
+        .{ .sql = "SELECT 0.5 + 1, 1.5 + 1", .names = &[_][]const u8{ "add(0.5, 1)", "add(1.5, 1)" }, .rows = 1 },
+        .{ .sql = "SELECT 0.5, 1.5 UNION ALL SELECT 2.5, 3.5", .names = &[_][]const u8{ "0.5", "1.5" }, .rows = 2 },
+        .{ .sql = "WITH c AS (SELECT 0.5, 1.5) SELECT * FROM c", .names = &[_][]const u8{ "0.5", "1.5" }, .rows = 1 },
+        .{ .sql = "WITH c AS (SELECT id, k * 1.5 FROM t) SELECT c.id, c.`mul(k, 1.5)` FROM c", .names = &[_][]const u8{ "id", "mul(k, 1.5)" }, .rows = 5 },
+        .{ .sql = "WITH c AS (SELECT id FROM t) SELECT c.id, 0.5, 1.5 FROM c JOIN t ON c.id = t.id", .names = &[_][]const u8{ "id", "0.5", "1.5" }, .rows = 5 },
+        .{ .sql = "SELECT a.qty, 0.5 FROM t a", .names = &[_][]const u8{ "qty", "0.5" }, .rows = 5 },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        const schema = q.outputSchema();
+        try std.testing.expectEqual(c.names.len, schema.len);
+        for (schema, c.names) |col, name| try std.testing.expectEqualStrings(name, col.name);
+        var rows: usize = 0;
+        while (try q.next()) |b| rows += b.row_count;
+        try std.testing.expectEqual(@as(usize, c.rows), rows);
+    }
+}
+
 test "sql: CAST(expr AS type) and PG expr::type" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

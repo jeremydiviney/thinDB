@@ -1975,7 +1975,7 @@ fn appendExpandedProjectItem(
     // outputs its UNQUALIFIED name (`SELECT sub.id` and `SELECT id` over an
     // aliased source both yield a column named `id`), regardless of how the
     // upstream schema spells it (AliasRename qualifies every column).
-    const bare = if (std.mem.lastIndexOfScalar(u8, item, '.')) |dot| item[dot + 1 ..] else item;
+    const bare = types.unqualifiedName(item);
     const output_name = output orelse bare;
     const is_stripped = output == null and bare.ptr != item.ptr;
     // Replace-on-collision: a derived/aliased item whose final name already

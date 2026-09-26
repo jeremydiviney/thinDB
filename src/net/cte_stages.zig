@@ -2293,11 +2293,11 @@ fn pruneStageColumns(input: engine_v2.CompileInput, q: exec.Query) exec.Query {
 
 fn columnRefMatchesName(column_name: []const u8, ref_name: []const u8) bool {
     if (types.columnNameEql(column_name, ref_name)) return true;
-    if (std.mem.lastIndexOfScalar(u8, ref_name, '.')) |dot| {
-        if (types.columnNameEql(column_name, ref_name[dot + 1 ..])) return true;
+    if (types.splitQualifiedName(ref_name)) |split| {
+        if (types.columnNameEql(column_name, split.bare)) return true;
     }
-    if (std.mem.lastIndexOfScalar(u8, column_name, '.')) |dot| {
-        if (types.columnNameEql(column_name[dot + 1 ..], ref_name)) return true;
+    if (types.splitQualifiedName(column_name)) |split| {
+        if (types.columnNameEql(split.bare, ref_name)) return true;
     }
     return false;
 }

@@ -460,21 +460,36 @@ pub const QualifiedName = struct {
     bare: []const u8,
 };
 
-/// Split a result name a join side qualified (`alias.col`, or
-/// `db.table.col`) into the qualifier and the bare column. Only an
-/// identifier-shaped name splits: a numeric literal's name (`1.5`), an
-/// expression name (`t.x + 1`) or a JSON path keeps its dots and returns
-/// null, so callers that present bare names never mangle those.
+/// Split a qualified name (`alias.col`, or `db.table.col`) into the
+/// qualifier and the bare column. The one rule for where a qualifier ends:
+/// every lookup, pruning pass and result-name presenter that tolerates
+/// qualifiers splits through here.
+///
+/// Qualifiers are identifiers but column names need not be: a literal or
+/// expression column is named `0.5` or `mul(x, 1.5)`, and an alias
+/// qualifies it as `s.0.5` or `s.mul(x, 1.5)`. So the qualifier is the run
+/// of leading identifier segments, and the bare column is everything after
+/// it, dots included. A name with no leading identifier segment (`0.5`,
+/// `add(x, 1.5)`, a JSON path) splits only when its last segment is an
+/// identifier, which keeps quoted qualifiers like `` `my tbl`.x `` working.
 pub fn splitQualifiedName(name: []const u8) ?QualifiedName {
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
-    const qualifier = name[0..dot];
-    const bare = name[dot + 1 ..];
-    if (!isPlainIdentifier(bare)) return null;
-    var parts = std.mem.splitScalar(u8, qualifier, '.');
-    while (parts.next()) |part| {
-        if (!isPlainIdentifier(part)) return null;
+    var bare_start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, name, bare_start, '.')) |dot| {
+        if (!isPlainIdentifier(name[bare_start..dot])) break;
+        bare_start = dot + 1;
     }
-    return .{ .qualifier = qualifier, .bare = bare };
+    if (bare_start > 0 and bare_start < name.len) {
+        return .{ .qualifier = name[0 .. bare_start - 1], .bare = name[bare_start..] };
+    }
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    if (dot == 0 or !isPlainIdentifier(name[dot + 1 ..])) return null;
+    return .{ .qualifier = name[0..dot], .bare = name[dot + 1 ..] };
+}
+
+/// The bare column of a possibly qualified name (`t.x` → `x`, `s.0.5` →
+/// `0.5`, `0.5` → `0.5`).
+pub fn unqualifiedName(name: []const u8) []const u8 {
+    return if (splitQualifiedName(name)) |split| split.bare else name;
 }
 
 fn isPlainIdentifier(s: []const u8) bool {
@@ -492,27 +507,26 @@ fn isPlainIdentifier(s: []const u8) bool {
 ///
 /// Match order:
 ///   1. Exact match on the full string.
-///   2. If `name` contains a `.`, retry exact match against the suffix
-///      after the last dot. Lets bare-table users keep writing `t.col`
-///      against an unaliased scan whose schema only has `col`.
-///   3. Else (no dot in `name`) search for any column whose name ends
-///      in `.name` — accepted only when exactly one column matches.
-///      Lets bare `col` resolve against an aliased schema (`a.col`).
+///   2. If `name` is qualified (`splitQualifiedName`), retry exact match
+///      against its bare column. Lets bare-table users keep writing
+///      `t.col` against an unaliased scan whose schema only has `col`.
+///   3. Else search for any qualified column whose bare column is
+///      `name` — accepted only when exactly one column matches. Lets
+///      bare `col` resolve against an aliased schema (`a.col`).
 pub fn findColumn(columns: []const Column, name: []const u8) ?usize {
     for (columns, 0..) |c, i| {
         if (columnNameEql(c.name, name)) return i;
     }
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
-        const tail = name[dot + 1 ..];
+    if (splitQualifiedName(name)) |split| {
         for (columns, 0..) |c, i| {
-            if (columnNameEql(c.name, tail)) return i;
+            if (columnNameEql(c.name, split.bare)) return i;
         }
         return null;
     }
     var match: ?usize = null;
     for (columns, 0..) |c, i| {
-        const d = std.mem.lastIndexOfScalar(u8, c.name, '.') orelse continue;
-        if (columnNameEql(c.name[d + 1 ..], name)) {
+        const split = splitQualifiedName(c.name) orelse continue;
+        if (columnNameEql(split.bare, name)) {
             if (match != null) return null; // ambiguous
             match = i;
         }
@@ -624,14 +638,43 @@ test "floatOrder sorts NaN last and is otherwise numeric" {
     try std.testing.expectEqual(order.gt, floatOrder(std.math.nan(f32), @as(f32, 9.0)));
 }
 
-test "splitQualifiedName splits only identifier-shaped qualified names" {
-    const split = splitQualifiedName("e.id").?;
-    try std.testing.expectEqualStrings("e", split.qualifier);
-    try std.testing.expectEqualStrings("id", split.bare);
-    const deep = splitQualifiedName("main.t.ID").?;
-    try std.testing.expectEqualStrings("main.t", deep.qualifier);
-    try std.testing.expectEqualStrings("ID", deep.bare);
-    inline for (.{ "id", "1.5", "t.x + 1", "payload->'a.b'", ".id", "e.", "e.1" }) |name| {
-        try std.testing.expect(splitQualifiedName(name) == null);
+test "splitQualifiedName ends the qualifier at the leading identifier segments" {
+    const cases = .{
+        .{ "e.id", "e", "id" },
+        .{ "main.t.ID", "main.t", "ID" },
+        .{ "s.0.5", "s", "0.5" },
+        .{ "s.mul(x, 1.5)", "s", "mul(x, 1.5)" },
+        .{ "main.t.add(x, 1.5)", "main.t", "add(x, 1.5)" },
+        .{ "e.1", "e", "1" },
+        .{ "t.my col", "t", "my col" },
+        .{ "my tbl.x", "my tbl", "x" },
+    };
+    inline for (cases) |c| {
+        const split = splitQualifiedName(c[0]).?;
+        try std.testing.expectEqualStrings(c[1], split.qualifier);
+        try std.testing.expectEqualStrings(c[2], split.bare);
     }
+    inline for (.{ "id", "1.5", "-0.0025", "add(x, 1.5)", "UPPER(t.s)", "'a.b'", "payload->'a.b'", ".id", "e." }) |name| {
+        try std.testing.expect(splitQualifiedName(name) == null);
+        try std.testing.expectEqualStrings(name, unqualifiedName(name));
+    }
+}
+
+test "findColumn resolves names that contain dots" {
+    const derived = [_]Column{
+        .{ .name = "0.5", .type = .{ .double = {} } },
+        .{ .name = "1.5", .type = .{ .double = {} } },
+        .{ .name = "5", .type = .{ .double = {} } },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), findColumn(&derived, "1.5"));
+    try std.testing.expectEqual(@as(?usize, 0), findColumn(&derived, "s.0.5"));
+    const aliased = [_]Column{
+        .{ .name = "s.0.5", .type = .{ .double = {} } },
+        .{ .name = "s.mul(x, 1.5)", .type = .{ .double = {} } },
+        .{ .name = "s.x", .type = .{ .double = {} } },
+    };
+    try std.testing.expectEqual(@as(?usize, 0), findColumn(&aliased, "0.5"));
+    try std.testing.expectEqual(@as(?usize, 1), findColumn(&aliased, "mul(x, 1.5)"));
+    try std.testing.expectEqual(@as(?usize, 2), findColumn(&aliased, "x"));
+    try std.testing.expectEqual(@as(?usize, null), findColumn(&aliased, "5"));
 }
