@@ -2776,3 +2776,39 @@ test "join: CROSS JOIN parses without ON and produces the cartesian product" {
     defer allocator.free(filtered);
     try std.testing.expectEqualSlices(i64, &.{ 11, 12, 21, 22, 31, 32 }, filtered);
 }
+
+test "join: COUNT(*) over a nested-loop join that outputs no columns counts every row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE base (k BIGINT PRIMARY KEY)");
+    try helpers.exec(allocator, db, "INSERT INTO base VALUES (10), (20), (30)");
+    try helpers.exec(allocator, db, "CREATE TABLE spine (id BIGINT PRIMARY KEY)");
+    // 300 x 100 rows crosses several output batches.
+    var values: std.ArrayList(u8) = .empty;
+    defer values.deinit(allocator);
+    try values.appendSlice(allocator, "INSERT INTO spine VALUES (1)");
+    for (2..301) |i| try values.print(allocator, ", ({d})", .{i});
+    try helpers.exec(allocator, db, values.items);
+    try helpers.exec(allocator, db, "CREATE TABLE wide (w BIGINT PRIMARY KEY)");
+    values.clearRetainingCapacity();
+    try values.appendSlice(allocator, "INSERT INTO wide VALUES (1)");
+    for (2..101) |i| try values.print(allocator, ", ({d})", .{i});
+    try helpers.exec(allocator, db, values.items);
+
+    const cases = .{
+        .{ "SELECT COUNT(*) FROM base CROSS JOIN spine", 900 },
+        .{ "SELECT COUNT(*) FROM spine CROSS JOIN wide", 30000 },
+        .{ "SELECT COUNT(*) FROM base CROSS JOIN spine WHERE id <= 2", 6 },
+        .{ "SELECT COUNT(*) FROM base JOIN spine ON base.k > spine.id", 57 },
+    };
+    inline for (cases) |case| {
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &.{case[1]}, got);
+    }
+}
