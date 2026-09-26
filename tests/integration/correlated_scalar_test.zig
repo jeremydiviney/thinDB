@@ -158,6 +158,14 @@ test "correlated scalar: compared in WHERE and read in the SELECT list, by one L
         // Correlation refs qualified by the table names rather than aliases.
         .{ "SELECT t.id FROM t WHERE t.big = (SELECT COUNT(*) FROM o WHERE o.tid = t.id) ORDER BY t.id", &[_]i64{ 2, 4 } },
         .{ "SELECT (SELECT COUNT(*) FROM o WHERE o.tid = t.id) AS n FROM t ORDER BY t.id", &[_]i64{ 2, 0, 1, 0, 0 } },
+        // Expressions over the aggregates see each one's zero-row value on a
+        // key with no inner rows: NULL for SUM and MAX, 0 for COUNT.
+        .{ "SELECT (SELECT COALESCE(SUM(amount), 0) FROM o WHERE o.tid = t.id) AS s FROM t ORDER BY id", &[_]i64{ 12, 0, 9, 0, 0 } },
+        .{ "SELECT (SELECT COUNT(*) + 1 FROM o WHERE o.tid = t.id) AS n FROM t ORDER BY id", &[_]i64{ 3, 1, 2, 1, 1 } },
+        .{ "SELECT (SELECT COALESCE(SUM(amount * 2), 0) FROM o WHERE o.tid = t.id) AS s FROM t ORDER BY id", &[_]i64{ 24, 0, 18, 0, 0 } },
+        .{ "SELECT id FROM t WHERE big > (SELECT COALESCE(MAX(amount), 0) FROM o WHERE o.tid = t.id) ORDER BY id", &[_]i64{5} },
+        .{ "SELECT id FROM t WHERE big < (SELECT SUM(amount) / COUNT(*) FROM o WHERE o.tid = t.id) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE (SELECT MAX(amount) - MIN(amount) FROM o WHERE o.tid = t.id) > 1 ORDER BY id", &[_]i64{1} },
     };
     inline for (cases) |case| {
         const got = try collectBigints(allocator, db, case[0]);

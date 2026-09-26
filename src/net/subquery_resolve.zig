@@ -907,24 +907,57 @@ fn innerSelectedColumn(inner: *const ir.Op) ?[]const u8 {
 /// `Scan`, with its WHERE conjuncts sorted into correlations and kept
 /// predicates. Caller owns `info`.
 const ScalarAggregate = struct {
-    agg: ir.AggSpec,
+    aggs: []const ir.AggSpec,
+    /// Aggregate arguments computed per inner row (`SUM(qty * price)`).
+    pre: []const ir.Derived,
+    /// Expressions over the aggregates (`COALESCE(SUM(x), 0)`).
+    post: []const ir.Derived,
+    /// The one column the subquery projects: an aggregate or a `post` name.
+    selected: []const u8,
     info: CorrelationInfo,
 };
 
 fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAggregate {
     var cur: *const ir.Op = @ptrCast(@alignCast(source));
+    var selected: ?[]const u8 = null;
+    var post: []const ir.Derived = &.{};
     while (true) {
         switch (cur.*) {
-            .select, .exclude => |p| cur = p.upstream,
+            .select => |s| {
+                if (selected) |name| {
+                    selected = selectSourceColumn(s, name) orelse return null;
+                } else {
+                    if (s.columns.len != 1 or std.mem.endsWith(u8, s.columns[0], "*")) return null;
+                    selected = s.columns[0];
+                }
+                cur = s.upstream;
+            },
+            .exclude => |e| cur = e.upstream,
+            .compute => |c| {
+                if (post.len > 0) return null;
+                post = c.derived;
+                cur = c.upstream;
+            },
             .group_by => break,
             else => return null,
         }
     }
     const gb = cur.group_by;
-    if (gb.aggs.len != 1 or gb.group_cols.len != 0) return null;
+    if (gb.aggs.len == 0 or gb.group_cols.len != 0) return null;
+    if (selected == null) {
+        if (gb.aggs.len != 1 or post.len > 0) return null;
+        selected = gb.aggs[0].as;
+    }
+    if (!namesAny(gb.aggs, post, selected.?)) return null;
 
+    var pre: []const ir.Derived = &.{};
+    var below = gb.upstream;
+    if (below.* == .compute) {
+        pre = below.compute.derived;
+        below = below.compute.upstream;
+    }
     var filter_pred: ?PredicateExpr = null;
-    const scan_op: *const ir.Op.Scan = switch (gb.upstream.*) {
+    const scan_op: *const ir.Op.Scan = switch (below.*) {
         .filter => |*f| blk: {
             filter_pred = f.predicate;
             break :blk switch (f.upstream.*) {
@@ -942,7 +975,22 @@ fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAg
     errdefer info.deinit(ctx.allocator);
     info.scan = scan_op;
     if (filter_pred) |p| try collectConjuncts(ctx, p, t.schema, rangeName(scan_op), &info);
-    return .{ .agg = gb.aggs[0], .info = info };
+    return .{ .aggs = gb.aggs, .pre = pre, .post = post, .selected = selected.?, .info = info };
+}
+
+/// The upstream column a Select output `name` reads.
+fn selectSourceColumn(s: ir.Op.Project, name: []const u8) ?[]const u8 {
+    for (s.columns, 0..) |col, i| {
+        const output = if (s.outputs) |outs| outs[i] orelse col else col;
+        if (types.columnNameEql(output, name)) return col;
+    }
+    return null;
+}
+
+fn namesAny(aggs: []const ir.AggSpec, post: []const ir.Derived, name: []const u8) bool {
+    for (aggs) |a| if (types.columnNameEql(a.as, name)) return true;
+    for (post) |d| if (types.columnNameEql(d.name, name)) return true;
+    return false;
 }
 
 /// The correlated scalar subqueries lowered out of one Compute or Filter.
@@ -952,7 +1000,10 @@ fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAg
 /// joins, each subquery reads as one value column.
 const LoweredScalars = struct {
     joins: std.ArrayList(LoweredJoin) = .empty,
+    /// Each aggregate as the outer row reads it, zero-row value on a miss.
     values: std.ArrayList(ir.Derived) = .empty,
+    /// The subqueries' expressions over those values.
+    post_values: std.ArrayList(ir.Derived) = .empty,
     /// Join-side and value columns, dropped once the operator has read them.
     hidden: std.ArrayList([]const u8) = .empty,
 };
@@ -989,9 +1040,11 @@ fn lowerCorrelatedScalar(ctx: *CompileCtx, source: *const anyopaque, lowered: *L
     if (info.kept_predicates.items.len > 0) {
         inner = try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, info.kept_predicates.items), .upstream = inner } });
     }
-    const aggs = try na.alloc(ir.AggSpec, 1);
-    aggs[0] = shape.agg;
-    aggs[0].as = "__csq_agg";
+    if (shape.pre.len > 0) {
+        inner = try newOp(ctx, .{ .compute = .{ .derived = shape.pre, .upstream = inner } });
+    }
+    const aggs = try na.dupe(ir.AggSpec, shape.aggs);
+    for (aggs, 0..) |*a, j| a.as = try std.fmt.allocPrint(na, "__csq_a{d}", .{j});
     inner = try newOp(ctx, .{ .group_by = .{
         .group_cols = try na.dupe([]const u8, info.inner_cols.items),
         .aggs = aggs,
@@ -1001,8 +1054,8 @@ fn lowerCorrelatedScalar(ctx: *CompileCtx, source: *const anyopaque, lowered: *L
     // Output names no outer column shares, so a bare outer ref never
     // suffix-matches a join-side column.
     const n_keys = info.inner_cols.items.len;
-    const columns = try na.alloc([]const u8, n_keys + 1);
-    const outputs = try na.alloc(?[]const u8, n_keys + 1);
+    const columns = try na.alloc([]const u8, n_keys + aggs.len);
+    const outputs = try na.alloc(?[]const u8, n_keys + aggs.len);
     const on = try na.alloc(ir.JoinKeyPair, n_keys);
     for (info.inner_cols.items, info.outer_cols.items, 0..) |inner_col, outer_col, i| {
         columns[i] = inner_col;
@@ -1010,20 +1063,35 @@ fn lowerCorrelatedScalar(ctx: *CompileCtx, source: *const anyopaque, lowered: *L
         on[i] = .{ .left = outer_col, .right = try std.fmt.allocPrint(na, "{s}.__csq_k{d}", .{ alias, i }) };
         try lowered.hidden.append(na, on[i].right);
     }
-    columns[n_keys] = aggs[0].as;
-    outputs[n_keys] = "__csq_v";
+    for (aggs, n_keys..) |a, i| {
+        columns[i] = a.as;
+        outputs[i] = null;
+    }
     inner = try newOp(ctx, .{ .select = .{ .columns = columns, .outputs = outputs, .upstream = inner } });
     inner = try newOp(ctx, .{ .materialize = .{ .upstream = inner, .structural_cse = true } });
     const right = try newOp(ctx, .{ .alias = .{ .alias = alias, .upstream = inner } });
     try resolveSubqueriesInOp(ctx, right);
-
-    const agg_col = try std.fmt.allocPrint(na, "{s}.__csq_v", .{alias});
-    const value = try std.fmt.allocPrint(na, "{s}_value", .{alias});
-    try lowered.hidden.append(na, agg_col);
-    try lowered.hidden.append(na, value);
     try lowered.joins.append(na, .{ .on = on, .right = right });
-    try lowered.values.append(na, .{ .name = value, .expr = try missedJoinValue(ctx, shape.agg.func, agg_col) });
-    return value;
+
+    // The subquery's own names for its aggregates and expressions, each
+    // relabelled to the outer column that carries it.
+    const renames = try na.alloc(exec.predicate.ColRename, aggs.len + shape.post.len);
+    for (shape.aggs, aggs, 0..) |original, a, j| {
+        const joined = try std.fmt.allocPrint(na, "{s}.{s}", .{ alias, a.as });
+        const value = try std.fmt.allocPrint(na, "{s}_a{d}", .{ alias, j });
+        renames[j] = .{ .from = original.as, .to = value };
+        try lowered.hidden.append(na, joined);
+        try lowered.hidden.append(na, value);
+        try lowered.values.append(na, .{ .name = value, .expr = try missedJoinValue(ctx, a.func, joined) });
+    }
+    for (shape.post, aggs.len..) |d, k| {
+        const value = try std.fmt.allocPrint(na, "{s}_p{d}", .{ alias, k - aggs.len });
+        const expr = try exec.expr_mod.deepCloneRenamed(na, d.expr, renames[0..k]);
+        renames[k] = .{ .from = d.name, .to = value };
+        try lowered.hidden.append(na, value);
+        try lowered.post_values.append(na, .{ .name = value, .expr = expr });
+    }
+    return exec.predicate.renameOf(renames, shape.selected);
 }
 
 /// An outer row that misses the join reads the aggregate over zero rows:
@@ -1057,7 +1125,9 @@ fn joinLoweredScalars(ctx: *CompileCtx, input: *ir.Op, lowered: LoweredScalars) 
             .right = j.right,
         } });
     }
-    return newOp(ctx, .{ .compute = .{ .derived = lowered.values.items, .upstream = left } });
+    const values = try newOp(ctx, .{ .compute = .{ .derived = lowered.values.items, .upstream = left } });
+    if (lowered.post_values.items.len == 0) return values;
+    return newOp(ctx, .{ .compute = .{ .derived = lowered.post_values.items, .upstream = values } });
 }
 
 /// Rewrite each correlated `col op (scalar subquery)` in `pred` into a
@@ -1124,6 +1194,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
     const info = &shape.info;
     const scan_op = info.scan.?;
     if (info.outer_cols.items.len == 0) return false;
+    if (shape.aggs.len != 1 or shape.pre.len > 0 or shape.post.len > 0) return false;
     // Range correlation in scalar subquery context isn't supported
     // yet — the materialized agg can't be keyed by an open-ended
     // range, so we'd need per-row eval. Bail.
@@ -1155,7 +1226,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
     const group_cols = try aa.alloc([]const u8, info.inner_cols.items.len);
     for (info.inner_cols.items, group_cols) |c, *dst| dst.* = c;
     const aggs = try aa.alloc(ir.AggSpec, 1);
-    aggs[0] = shape.agg;
+    aggs[0] = shape.aggs[0];
     const gb_new = try aa.create(ir.Op);
     gb_new.* = .{ .group_by = .{
         .group_cols = group_cols,
