@@ -427,13 +427,22 @@ const CorrelationInfo = struct {
 /// the shape doesn't match (caller falls back to the uncorrelated
 /// path). Returns an empty CorrelationInfo when the shape matches
 /// but there are no correlations.
-fn analyzeCorrelation(ctx: *CompileCtx, inner: *ir.Op) !?CorrelationInfo {
+///
+/// What an EXISTS inner selects never changes its result, so its computed
+/// select items (`SELECT 1`) are skipped rather than blocking the match.
+const InnerSelectList = enum { used, ignored };
+
+fn analyzeCorrelation(ctx: *CompileCtx, inner: *ir.Op, select_list: InnerSelectList) !?CorrelationInfo {
     // Walk through Project / Exclude layers to find the underlying
     // Filter (or Scan, if there's no WHERE).
     var cur: *const ir.Op = inner;
     while (true) {
         switch (cur.*) {
             .select, .exclude => |p| cur = p.upstream,
+            .compute => |c| switch (select_list) {
+                .ignored => cur = c.upstream,
+                .used => return null,
+            },
             .filter, .scan => break,
             else => return null,
         }
@@ -462,7 +471,7 @@ fn analyzeCorrelation(ctx: *CompileCtx, inner: *ir.Op) !?CorrelationInfo {
     info.scan = scan_op;
 
     if (filter_pred) |pred| {
-        try collectConjuncts(ctx, pred, inner_schema, scan_op.alias, &info);
+        try collectConjuncts(ctx, pred, inner_schema, rangeName(scan_op), &info);
     }
 
     return info;
@@ -470,31 +479,35 @@ fn analyzeCorrelation(ctx: *CompileCtx, inner: *ir.Op) !?CorrelationInfo {
 
 /// Strict "does this col-ref belong to the inner scan?" check. Unlike
 /// the generic `types.findColumn` smart matcher, this rejects refs
-/// whose qualifier doesn't match the scan's alias — otherwise the
+/// whose qualifier doesn't name the inner scan — otherwise the
 /// correlation analyzer would mistake `outer_alias.colname` for an
 /// inner col whenever the bare column name happens to exist in the
 /// inner table (very common: `region`, `id`, `created_at`, etc.).
-fn refIsInnerLocal(ref: []const u8, inner_schema: TableSchema, scan_alias: ?[]const u8) bool {
+fn refIsInnerLocal(ref: []const u8, inner_schema: TableSchema, inner_name: []const u8) bool {
     if (types.splitQualifiedName(ref)) |split| {
-        const alias = scan_alias orelse return false; // qualified ref against unaliased scan: not local
-        if (!std.mem.eql(u8, split.qualifier, alias)) return false;
+        if (!types.columnNameEql(split.qualifier, inner_name)) return false;
         return inner_schema.columnIndex(split.bare) != null;
     }
     return inner_schema.columnIndex(ref) != null;
+}
+
+/// The name that qualifies a scan's columns: its alias, else its table.
+fn rangeName(scan: *const ir.Op.Scan) []const u8 {
+    return scan.alias orelse scan.table.name;
 }
 
 fn collectConjuncts(
     ctx: *CompileCtx,
     pred: PredicateExpr,
     inner_schema: TableSchema,
-    scan_alias: ?[]const u8,
+    inner_name: []const u8,
     info: *CorrelationInfo,
 ) !void {
     switch (pred) {
-        .@"and" => |children| for (children) |c| try collectConjuncts(ctx, c, inner_schema, scan_alias, info),
+        .@"and" => |children| for (children) |c| try collectConjuncts(ctx, c, inner_schema, inner_name, info),
         .leaf_col_col => |lc| {
-            const left_local = refIsInnerLocal(lc.left, inner_schema, scan_alias);
-            const right_local = refIsInnerLocal(lc.right, inner_schema, scan_alias);
+            const left_local = refIsInnerLocal(lc.left, inner_schema, inner_name);
+            const right_local = refIsInnerLocal(lc.right, inner_schema, inner_name);
             if (left_local and right_local) {
                 // Pure inner predicate — keep in rewritten inner.
                 try info.kept_predicates.append(ctx.allocator, pred);
@@ -602,7 +615,7 @@ fn maybeResolveCorrelatedExists(
     negate: bool,
 ) !bool {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
-    var info = (try analyzeCorrelation(ctx, inner)) orelse return false;
+    var info = (try analyzeCorrelation(ctx, inner, .ignored)) orelse return false;
     defer info.deinit(ctx.allocator);
 
     // Range-correlation path: single open-ended op, or a pair of
@@ -823,17 +836,18 @@ fn valueLessThan(_: void, a: Value, b: Value) bool {
 /// when correlated; otherwise the caller does the uncorrelated path.
 fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) !bool {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(s.source)));
-    var info = (try analyzeCorrelation(ctx, inner)) orelse return false;
+    var info = (try analyzeCorrelation(ctx, inner, .used)) orelse return false;
     defer info.deinit(ctx.allocator);
     if (info.outer_cols.items.len == 0) return false;
     // Range correlation in IN-subquery context isn't supported yet —
     // the IN set depends on the outer range value, which can't be
     // hash-keyed. Bail; caller surfaces as unsupported.
     if (info.range_corrs.items.len > 0) return false;
+    const in_col = innerSelectedColumn(inner) orelse return false;
 
     // Rewritten inner projects the IN column FIRST (so the outer's
     // `s.col` matches against it), then the correlation keys.
-    const rewritten = try buildRewrittenInner(ctx, inner, info, s.col);
+    const rewritten = try buildRewrittenInner(ctx, inner, info, in_col);
 
     var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
@@ -870,6 +884,19 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
         .negate = s.negate,
     } };
     return true;
+}
+
+/// The one column an IN subquery's inner selects, named as the inner scan
+/// knows it.
+fn innerSelectedColumn(inner: *const ir.Op) ?[]const u8 {
+    const project = switch (inner.*) {
+        .select => |p| p,
+        else => return null,
+    };
+    if (project.columns.len != 1) return null;
+    const col = project.columns[0];
+    if (std.mem.endsWith(u8, col, "*")) return null;
+    return col;
 }
 
 // =============================================================================
@@ -914,7 +941,7 @@ fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAg
     var info = CorrelationInfo.init();
     errdefer info.deinit(ctx.allocator);
     info.scan = scan_op;
-    if (filter_pred) |p| try collectConjuncts(ctx, p, t.schema, scan_op.alias, &info);
+    if (filter_pred) |p| try collectConjuncts(ctx, p, t.schema, rangeName(scan_op), &info);
     return .{ .agg = gb.aggs[0], .info = info };
 }
 

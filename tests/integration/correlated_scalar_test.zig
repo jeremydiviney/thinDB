@@ -155,6 +155,9 @@ test "correlated scalar: compared in WHERE and read in the SELECT list, by one L
         .{ "SELECT id FROM t WHERE (SELECT COUNT(*) FROM o WHERE tid = id) = 0 ORDER BY id", &[_]i64{ 2, 4, 5 } },
         .{ "SELECT id FROM t WHERE (SELECT COUNT(*) FROM o WHERE tid = id) > 0 ORDER BY id", &[_]i64{ 1, 3 } },
         .{ "SELECT id FROM t WHERE (SELECT MAX(amount) FROM o) > big * 2 ORDER BY id", &[_]i64{ 1, 2, 4, 5 } },
+        // Correlation refs qualified by the table names rather than aliases.
+        .{ "SELECT t.id FROM t WHERE t.big = (SELECT COUNT(*) FROM o WHERE o.tid = t.id) ORDER BY t.id", &[_]i64{ 2, 4 } },
+        .{ "SELECT (SELECT COUNT(*) FROM o WHERE o.tid = t.id) AS n FROM t ORDER BY t.id", &[_]i64{ 2, 0, 1, 0, 0 } },
     };
     inline for (cases) |case| {
         const got = try collectBigints(allocator, db, case[0]);

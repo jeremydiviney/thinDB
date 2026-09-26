@@ -3319,8 +3319,15 @@ pub const Parser = struct {
         var right_filters: std.ArrayList(PredicateExpr) = .empty;
         var hidden_left: std.ArrayList([]const u8) = .empty;
         var synth_counter: usize = 0;
+        // Paren groups of AND-ed conditions flatten into the one conjunct
+        // list: `(a AND (b AND c))` joins exactly like `a AND b AND c`.
+        var open_groups: usize = 0;
 
         while (true) {
+            while (self.cur.tag == .lparen and try self.onConditionGroupAhead()) {
+                try self.advance();
+                open_groups += 1;
+            }
             const lhs = try self.parseCallArg();
             if (self.cur.tag == .kw_is) {
                 try self.advance();
@@ -3380,6 +3387,10 @@ pub const Parser = struct {
                 );
             }
 
+            while (open_groups > 0 and self.cur.tag == .rparen) {
+                try self.advance();
+                open_groups -= 1;
+            }
             if (self.cur.tag != .kw_and) break;
             try self.advance();
         }
@@ -3388,6 +3399,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_or or (self.cur.tag == .pipe_pipe and self.lex.dialect == .mysql)) {
             return ParseError.SqlOnNonEquiUnsupported;
         }
+        if (open_groups > 0) return ParseError.SqlExpectedToken;
         // A column range join (`l.a < r.b`) only has well-defined semantics for
         // an inner join; outer joins would need true ON-extra-predicate support.
         if (jtype != .inner and ranges.items.len > 0) return ParseError.SqlOnNonEquiUnsupported;
@@ -3491,6 +3503,33 @@ pub const Parser = struct {
             try left_filters.append(self.arena, pred);
         } else {
             try right_filters.append(self.arena, pred);
+        }
+    }
+
+    /// With `cur` on `(` in an ON condition: whether the group holds
+    /// conditions (`(a = b AND c IS NULL)`) rather than opening a scalar
+    /// operand (`(a + 1) = b`). Only a condition group carries a comparison,
+    /// AND, IS or BETWEEN at its own depth.
+    fn onConditionGroupAhead(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        var depth: usize = 1;
+        var first_tok = true;
+        while (true) {
+            const tok = try look.next();
+            if (first_tok) {
+                first_tok = false;
+                if (tok.tag == .kw_select or tok.tag == .kw_with) return false;
+            }
+            switch (tok.tag) {
+                .eof => return false,
+                .lparen => depth += 1,
+                .rparen => {
+                    depth -= 1;
+                    if (depth == 0) return false;
+                },
+                .eq, .neq, .lt, .lte, .gt, .gte, .kw_and, .kw_or, .kw_is, .kw_between => if (depth == 1) return true,
+                else => {},
+            }
         }
     }
 
