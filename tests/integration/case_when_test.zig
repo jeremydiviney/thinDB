@@ -423,6 +423,8 @@ test "predicates read as values: TRUE, FALSE, or NULL where unknown" {
         .{ "SELECT qty > 0 OR big = 0 AS f FROM t ORDER BY id", &[_]i64{ 1, 1, 1, 1, 1 } },
         .{ "SELECT NOT (qty > 0) AS f FROM t ORDER BY id", &[_]i64{ 0, 1, 0, -1, 0 } },
         .{ "SELECT s LIKE 'a%' AS f FROM t ORDER BY id", &[_]i64{ 1, 0, -1, 1, 0 } },
+        .{ "SELECT s REGEXP '^a' AS f FROM t ORDER BY id", &[_]i64{ 1, 0, -1, 1, 0 } },
+        .{ "SELECT s NOT RLIKE 'an' AS f FROM t ORDER BY id", &[_]i64{ 1, 0, -1, 1, 1 } },
         .{ "SELECT COALESCE(qty > 1, FALSE) AS f FROM t ORDER BY id", &[_]i64{ 0, 0, 1, 0, 1 } },
         .{ "SELECT id IN (SELECT tid FROM o) AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 1, 0, 0 } },
         .{ "SELECT EXISTS (SELECT 1 FROM o WHERE o.tid = t.id) AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 1, 0, 0 } },
