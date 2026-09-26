@@ -217,3 +217,29 @@ test "correlated scalar: inside arithmetic on the right of a comparison" {
     const batch = (try q.next()).?;
     try std.testing.expectEqual(@as(usize, 3), batch.values.len);
 }
+
+test "correlated scalar: the whole argument of an aggregate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, big BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, big) VALUES (1, 1), (2, 0), (3, 5), (4, 0), (5, 2)");
+    try exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT NOT NULL, amount INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO o (oid, tid, amount) VALUES (1, 1, 5), (2, 1, 7), (3, 3, 9)");
+
+    // Per t.id: COUNT over o = {2, 0, 1, 0, 0}; MAX(oid) = {2, NULL, 3, NULL, NULL}.
+    const cases = .{
+        .{ "SELECT SUM((SELECT MAX(big) FROM t)) AS s FROM t", &[_]i64{25} },
+        .{ "SELECT SUM((SELECT COUNT(*) FROM o WHERE o.tid = t.id)) AS s FROM t", &[_]i64{3} },
+        .{ "SELECT MAX((SELECT COUNT(*) FROM o WHERE o.tid = t.id)) AS s FROM t", &[_]i64{2} },
+        .{ "SELECT COUNT((SELECT MAX(oid) FROM o WHERE o.tid = t.id)) AS c FROM t", &[_]i64{2} },
+        .{ "SELECT MAX_BY(id, (SELECT COUNT(*) FROM o WHERE o.tid = t.id)) AS m FROM t", &[_]i64{1} },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}
