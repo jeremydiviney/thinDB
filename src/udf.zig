@@ -882,7 +882,8 @@ fn isReservedScalarName(name: []const u8) bool {
         "to_string",      "md5",               "sha1",         "sha256",          "crc32",           "hex",
         "unhex",          "to_base64",         "from_base64",  "lpad",            "rpad",            "repeat",
         "space",          "ascii",             "position",     "instr",           "substring_index", "strcmp",
-        "lcase",          "ucase",             "power",        "ceiling",         "chr",
+        "lcase",          "ucase",             "power",        "ceiling",         "chr",             "substr",
+        "mid",            "date",              "char",         "months_add",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     return false;

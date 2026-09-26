@@ -307,7 +307,7 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.roundKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "floor"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.floorKernel, .propagates);
-        if (std.ascii.eqlIgnoreCase(name, "ceil") or std.ascii.eqlIgnoreCase(name, "ceiling"))
+        if (std.ascii.eqlIgnoreCase(name, "ceil"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.ceilKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "truncate"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.truncateKernel, .propagates);
@@ -882,14 +882,30 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "find_in_set", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.findInSetKernel },
     .{ .name = "initcap", .arg_types = &.{.string}, .return_type = .string, .kernel = string.initcapKernel },
     .{ .name = "translate", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.translateKernel },
-    // --- MySQL aliases over existing kernels (zero new code) ---
-    .{ .name = "lcase", .arg_types = &.{.string}, .return_type = .string, .kernel = string.lowerKernel },
-    .{ .name = "ucase", .arg_types = &.{.string}, .return_type = .string, .kernel = string.upperKernel },
-    .{ .name = "power", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.powKernel },
-    .{ .name = "ceiling", .arg_types = &.{.double}, .return_type = .double, .kernel = math.ceilKernel },
     .{ .name = "chr", .arg_types = &.{.int}, .return_type = .string, .kernel = string.chrKernel },
-    .{ .name = "char", .arg_types = &.{.int}, .return_type = .string, .kernel = string.chrKernel },
 };
+
+/// Other dialects' spellings of builtins. The parser rewrites a call to
+/// its canonical name, so an alias carries every overload of its target
+/// and every later name check sees one name.
+const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
+    .{ .alias = "substr", .name = "substring" },
+    .{ .alias = "mid", .name = "substring" },
+    .{ .alias = "date", .name = "to_date" },
+    .{ .alias = "lcase", .name = "lower" },
+    .{ .alias = "ucase", .name = "upper" },
+    .{ .alias = "power", .name = "pow" },
+    .{ .alias = "ceiling", .name = "ceil" },
+    .{ .alias = "char", .name = "chr" },
+    .{ .alias = "months_add", .name = "date_add_months" },
+};
+
+pub fn canonicalName(name: []const u8) []const u8 {
+    for (FUNCTION_ALIASES) |a| {
+        if (std.ascii.eqlIgnoreCase(name, a.alias)) return a.name;
+    }
+    return name;
+}
 
 // ---------------------------------------------------------------------------
 // User-facing builder helpers
@@ -1284,16 +1300,16 @@ pub fn timestampAdd(arena: Allocator, unit: Expr, n: Expr, value: Expr) !Expr {
 
 // --- MySQL aliases / one-off additions ---
 pub fn lcase(arena: Allocator, arg: Expr) !Expr {
-    return expr_mod.call(arena, "lcase", &.{arg});
+    return expr_mod.call(arena, "lower", &.{arg});
 }
 pub fn ucase(arena: Allocator, arg: Expr) !Expr {
-    return expr_mod.call(arena, "ucase", &.{arg});
+    return expr_mod.call(arena, "upper", &.{arg});
 }
 pub fn power(arena: Allocator, a: Expr, b: Expr) !Expr {
-    return expr_mod.call(arena, "power", &.{ a, b });
+    return expr_mod.call(arena, "pow", &.{ a, b });
 }
 pub fn ceiling(arena: Allocator, arg: Expr) !Expr {
-    return expr_mod.call(arena, "ceiling", &.{arg});
+    return expr_mod.call(arena, "ceil", &.{arg});
 }
 pub fn chr(arena: Allocator, arg: Expr) !Expr {
     return expr_mod.call(arena, "chr", &.{arg});

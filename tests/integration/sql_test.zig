@@ -832,6 +832,92 @@ test "sql: PG type aliases + bigserial in CREATE TABLE" {
     try std.testing.expectEqual(@as(i32, 7), b.values[1].data.int[0]);
 }
 
+test "sql: MySQL column type spellings and modifiers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db,
+        \\CREATE TABLE my (
+        \\  id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+        \\  u INT(10) UNSIGNED ZEROFILL,
+        \\  su SMALLINT UNSIGNED,
+        \\  m MEDIUMINT,
+        \\  c CHAR(3),
+        \\  c1 CHAR,
+        \\  cv CHARACTER VARYING(10),
+        \\  v VARCHAR,
+        \\  lt LONGTEXT,
+        \\  e ENUM('x', 'y') NOT NULL DEFAULT 'x',
+        \\  d DECIMAL,
+        \\  d10 DECIMAL(10),
+        \\  f FLOAT(7),
+        \\  dbl DOUBLE(10, 2) UNSIGNED,
+        \\  s VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+        \\  t TEXT CHARSET utf8 COMMENT 'note'
+        \\)
+    );
+    try helpers.exec(allocator, db, "INSERT INTO my (id, u, su, m, c, s) VALUES (1, 4000000000, 60000, -5, 'abc', 'x')");
+
+    var q = try runSql(allocator, db, "SELECT * FROM my");
+    defer q.deinit();
+    const TypeTag = thindb.types.TypeTag;
+    const expected = [_]TypeTag{ .bigint, .bigint, .int, .int, .char, .char, .varchar, .string, .string, .string, .decimal64, .decimal64, .float, .double, .varchar, .string };
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(expected.len, schema.len);
+    for (expected, schema) |tag, col| try std.testing.expectEqual(tag, std.meta.activeTag(col.type));
+    try std.testing.expectEqual(@as(u32, 1), schema[5].type.char);
+    try std.testing.expectEqual(@as(u8, 10), schema[10].type.decimal64.p);
+    try std.testing.expectEqual(@as(u8, 0), schema[10].type.decimal64.s);
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 4000000000), b.values[1].data.bigint[0]);
+}
+
+test "sql: MySQL cast and function spellings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE fx (id BIGINT PRIMARY KEY, s VARCHAR(10), ts DATETIME)");
+    try helpers.exec(allocator, db, "INSERT INTO fx VALUES (1, 'hello', '2024-03-05 10:11:12'), (12, 'world', '2024-03-06 00:00:00')");
+
+    const counts = .{
+        .{ "SELECT COUNT(*) FROM fx WHERE CAST(id AS CHAR) LIKE '1%'", 2 },
+        .{ "SELECT COUNT(*) FROM fx WHERE CAST(id AS CHAR(5)) = '12'", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE CONVERT(id, CHAR) = '12'", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE CONVERT(s USING utf8mb4) = 'hello'", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE CONVERT('12', SIGNED) = id", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE DATE(ts) = '2024-03-05'", 1 },
+        .{ "SELECT COUNT(DISTINCT DATE(ts)) FROM fx", 2 },
+        .{ "SELECT COUNT(*) FROM fx WHERE SUBSTR(s, 1, 2) = 'he'", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE MID(s, 2, 2) = 'or'", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE UCASE(s) = 'HELLO' OR s = LCASE('WORLD')", 2 },
+        .{ "SELECT COUNT(*) FROM fx WHERE POWER(id, 2) = 144 AND CEILING(id / 5) = 3", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE TRUNCATE(id * 1.9, 0) = 1", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE LEFT(s, 1) = 'h' AND IF(id > 0, 1, 0) = 1", 1 },
+        .{ "SELECT COUNT(*) FROM fx WHERE RIGHT(s, 2) = 'ld' OR REPLACE(s, 'l', 'L') = 'heLLo'", 2 },
+    };
+    inline for (counts) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, &.{c[1]}, got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var q = try runSql(allocator, db, "SELECT TRUNCATE(2.567, 1), CHAR(65), EXTRACT(YEAR FROM DATE(ts)) FROM fx WHERE id = 1");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(f64, 2.5), b.values[0].data.double[0]);
+    try std.testing.expectEqualStrings("A", b.values[1].data.string.rowBytes(0));
+}
+
 test "sql: string_agg and group_concat concatenate grouped strings" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

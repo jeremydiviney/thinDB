@@ -889,6 +889,16 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                     _ = try parsePropertyText(p);
                     continue;
                 }
+                // MySQL CHARACTER SET / CHARSET / COLLATE: accepted, not
+                // stored; text is always UTF-8 compared bytewise.
+                if (asciiEqlAny(p.cur.text, &.{ "character", "charset", "collate" })) {
+                    const is_character = std.ascii.eqlIgnoreCase(p.cur.text, "character");
+                    try p.advance();
+                    if (is_character) try p.expect(.kw_set);
+                    if (p.cur.tag != .identifier and p.cur.tag != .string) return PE.SqlExpectedIdent;
+                    try p.advance();
+                    continue;
+                }
                 if (!std.ascii.eqlIgnoreCase(p.cur.text, "generated")) break;
                 try p.advance();
                 if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "always")) {
@@ -934,17 +944,58 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
     };
 }
 
-/// MySQL integer display width (`int(11)`): a formatting hint with no
-/// storage meaning — consumed and ignored.
-fn skipDisplayWidth(p: anytype, ty: types.Type) !types.Type {
+/// MySQL integer display width (`int(11)`) and the SIGNED / UNSIGNED /
+/// ZEROFILL modifiers after it. The width is a formatting hint with no
+/// storage meaning; UNSIGNED picks `unsigned_ty`.
+fn integerType(p: anytype, signed_ty: types.Type, unsigned_ty: types.Type) !types.Type {
+    _ = try optionalLength(p);
+    const unsigned = p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "unsigned");
+    try skipIntegerModifiers(p);
+    return if (unsigned) unsigned_ty else signed_ty;
+}
+
+fn skipIntegerModifiers(p: anytype) !void {
+    while (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "signed", "unsigned", "zerofill" })) {
+        try p.advance();
+    }
+}
+
+/// MySQL's FLOAT(p) / DOUBLE(m, d) precision hints and UNSIGNED: accepted,
+/// storage stays IEEE.
+fn numericModifiers(p: anytype, ty: types.Type) !types.Type {
     const PE = @TypeOf(p.*).Err;
     if (p.cur.tag == .lparen) {
         try p.advance();
         if (p.cur.tag != .integer) return PE.SqlExpectedValue;
         try p.advance();
+        if (p.cur.tag == .comma) {
+            try p.advance();
+            if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+            try p.advance();
+        }
         try p.expect(.rparen);
     }
+    try skipIntegerModifiers(p);
     return ty;
+}
+
+/// `(n)` after a type name, n >= 1.
+fn optionalLength(p: anytype) !?u32 {
+    const PE = @TypeOf(p.*).Err;
+    if (p.cur.tag != .lparen) return null;
+    try p.advance();
+    if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+    const n_raw = p.cur.value.integer;
+    try p.advance();
+    try p.expect(.rparen);
+    if (n_raw < 1 or n_raw > std.math.maxInt(u32)) return PE.SqlExpectedValue;
+    return @intCast(n_raw);
+}
+
+/// VARCHAR(n); without a length (PostgreSQL) it is unbounded text.
+fn varcharType(p: anytype) !types.Type {
+    const n = try optionalLength(p) orelse return .string;
+    return types.Type{ .varchar = n };
 }
 
 pub fn parseColumnType(p: anytype) !types.Type {
@@ -955,28 +1006,39 @@ pub fn parseColumnType(p: anytype) !types.Type {
 
     // PG type-name aliases (int4/int8/...) sit alongside the standard
     // names so DDL and casts emitted by PG clients/ORMs parse unchanged.
-    if (asciiEqlAny(name, &.{ "bigint", "int8" })) return skipDisplayWidth(p, .bigint);
-    if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return skipDisplayWidth(p, .int);
-    if (asciiEqlAny(name, &.{ "smallint", "int2" })) return skipDisplayWidth(p, .smallint);
-    if (asciiEqlAny(name, &.{"tinyint"})) return skipDisplayWidth(p, .smallint);
-    if (asciiEqlAny(name, &.{ "float", "real", "float4" })) return .float;
+    // An UNSIGNED integer widens to the next type that holds its range,
+    // except BIGINT UNSIGNED, which keeps 64 bits.
+    if (asciiEqlAny(name, &.{ "bigint", "int8" })) return integerType(p, .bigint, .bigint);
+    if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return integerType(p, .int, .bigint);
+    if (asciiEqlAny(name, &.{"mediumint"})) return integerType(p, .int, .int);
+    if (asciiEqlAny(name, &.{ "smallint", "int2" })) return integerType(p, .smallint, .int);
+    if (asciiEqlAny(name, &.{"tinyint"})) return integerType(p, .smallint, .smallint);
+    if (asciiEqlAny(name, &.{ "float", "real", "float4" })) return numericModifiers(p, .float);
     if (asciiEqlAny(name, &.{"float8"})) return .double;
     if (asciiEqlAny(name, &.{"double"})) {
         if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "precision")) {
             try p.advance();
         }
-        return .double;
+        return numericModifiers(p, .double);
     }
-    if (asciiEqlAny(name, &.{ "decimal", "numeric" })) {
-        try p.expect(.lparen);
-        if (p.cur.tag != .integer) return PE.SqlExpectedValue;
-        const p_raw = p.cur.value.integer;
-        try p.advance();
-        try p.expect(.comma);
-        if (p.cur.tag != .integer) return PE.SqlExpectedValue;
-        const s_raw = p.cur.value.integer;
-        try p.advance();
-        try p.expect(.rparen);
+    if (asciiEqlAny(name, &.{ "decimal", "numeric", "dec" })) {
+        // MySQL's defaults: DECIMAL = DECIMAL(10, 0), DECIMAL(p) = DECIMAL(p, 0).
+        var p_raw: i64 = 10;
+        var s_raw: i64 = 0;
+        if (p.cur.tag == .lparen) {
+            try p.advance();
+            if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+            p_raw = p.cur.value.integer;
+            try p.advance();
+            if (p.cur.tag == .comma) {
+                try p.advance();
+                if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+                s_raw = p.cur.value.integer;
+                try p.advance();
+            }
+            try p.expect(.rparen);
+        }
+        try skipIntegerModifiers(p);
         if (p_raw < 1 or p_raw > 38 or s_raw < 0 or s_raw > p_raw) return PE.SqlExpectedValue;
         const p_u: u8 = @intCast(p_raw);
         const s_u: u8 = @intCast(s_raw);
@@ -985,16 +1047,27 @@ pub fn parseColumnType(p: anytype) !types.Type {
         else
             types.Type{ .decimal128 = .{ .p = p_u, .s = s_u } };
     }
-    if (asciiEqlAny(name, &.{"varchar"})) {
-        try p.expect(.lparen);
-        if (p.cur.tag != .integer) return PE.SqlExpectedValue;
-        const n_raw = p.cur.value.integer;
-        try p.advance();
-        try p.expect(.rparen);
-        if (n_raw < 1) return PE.SqlExpectedValue;
-        return types.Type{ .varchar = @intCast(n_raw) };
+    if (asciiEqlAny(name, &.{ "char", "character", "nchar" })) {
+        if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "varying")) {
+            try p.advance();
+            return varcharType(p);
+        }
+        return types.Type{ .char = try optionalLength(p) orelse 1 };
     }
-    if (asciiEqlAny(name, &.{ "text", "string" })) return .string;
+    if (asciiEqlAny(name, &.{ "varchar", "nvarchar" })) return varcharType(p);
+    if (asciiEqlAny(name, &.{ "text", "string", "tinytext", "mediumtext", "longtext" })) return .string;
+    // ENUM('a', 'b', ...) stores its labels as text; the list isn't enforced.
+    if (asciiEqlAny(name, &.{"enum"})) {
+        try p.expect(.lparen);
+        while (true) {
+            if (p.cur.tag != .string) return PE.SqlExpectedValue;
+            try p.advance();
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+        try p.expect(.rparen);
+        return .string;
+    }
     if (asciiEqlAny(name, &.{ "boolean", "bool" })) return .boolean;
     if (asciiEqlAny(name, &.{"date"})) return .date;
     // timestamptz is accepted as a synonym; thinDB datetimes are UTC-naive.
