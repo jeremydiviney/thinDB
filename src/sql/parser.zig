@@ -86,6 +86,9 @@ pub const ParseError = error{
     /// SQL table-function call-site errors: argument count mismatch or
     /// nested expansion beyond the recursion bound.
     SqlFunctionArgMismatch,
+    /// INTERSECT ALL / EXCEPT ALL: only the distinct forms are supported,
+    /// as in StarRocks.
+    SqlSetOpAllUnsupported,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -790,9 +793,9 @@ pub const Parser = struct {
             try self.advance();
             pending_qualify = try self.parseBoolExpr();
         }
-        // In a UNION chain, ORDER BY / LIMIT order and cut the union's rows:
-        // `parseSetOpTail` reads them once the chain ends.
-        const set_op_follows = union_arm or self.cur.tag == .kw_union;
+        // In a set-operation chain, ORDER BY / LIMIT order and cut the chain's
+        // rows: `parseSetOpTail` reads them once the chain ends.
+        const set_op_follows = union_arm or isSetOpKeyword(self.cur.tag);
 
         // Parse-time peek for ORDER BY and LIMIT clauses — we need to
         // know the pipeline shape before deciding where to insert
@@ -1255,30 +1258,26 @@ pub const Parser = struct {
         return query;
     }
 
-    /// The rest of a query expression after its first operand: UNION arms,
-    /// left-associative as the standard reads `A UNION ALL B UNION C`, then
-    /// an ORDER BY / LIMIT over the whole result. ORDER BY binds the union's
+    /// The rest of a query expression after its first operand: set-operation
+    /// arms, then an ORDER BY / LIMIT over the whole result. INTERSECT binds
+    /// tighter than UNION and EXCEPT, which are left-associative as the
+    /// standard reads `A UNION ALL B EXCEPT C`. ORDER BY binds the chain's
     /// output names, the first operand's. A lone SELECT has already read its
     /// own ORDER BY / LIMIT; a parenthesized one reads them here.
     fn parseSetOpTail(self: *Parser, first: *ir.Op, output: []const ProjItem, parenthesized: bool) ParseError!*ir.Op {
-        var root = first;
-        var arms: usize = 0;
-        while (self.cur.tag == .kw_union) : (arms += 1) {
-            try self.advance();
-            var all = false;
-            if (self.cur.tag == .kw_all) {
-                all = true;
-                try self.advance();
-            } else if (self.cur.tag == .kw_distinct) {
-                try self.advance();
-            }
-            const arm = if (self.cur.tag == .lparen) try self.parseParenthesizedArm() else blk: {
-                self.union_arm = true;
-                break :blk try self.parseStatement();
+        var root = try self.parseIntersectArms(first);
+        while (true) {
+            const kind: ir.SetKind = switch (self.cur.tag) {
+                .kw_union => .@"union",
+                .kw_except => .except,
+                else => break,
             };
-            root = try self.allocOp(.{ .set_union = .{ .left = root, .right = arm, .all = all } });
+            try self.advance();
+            const all = try self.parseSetQuantifier(kind);
+            const arm = try self.parseIntersectArms(try self.parseSetArm());
+            root = try self.allocOp(.{ .set_union = .{ .left = root, .right = arm, .all = all, .kind = kind } });
         }
-        if (arms == 0 and !parenthesized) return root;
+        if (root == first and !parenthesized) return root;
 
         if (self.cur.tag == .kw_order) {
             try self.advance();
@@ -1300,6 +1299,40 @@ pub const Parser = struct {
         var offset: u64 = 0;
         try self.parseLimitClause(&limit, &offset);
         return try self.addLimit(root, limit, offset);
+    }
+
+    /// `first` and the INTERSECT arms that follow it, left-associative.
+    fn parseIntersectArms(self: *Parser, first: *ir.Op) ParseError!*ir.Op {
+        var root = first;
+        while (self.cur.tag == .kw_intersect) {
+            try self.advance();
+            _ = try self.parseSetQuantifier(.intersect);
+            const arm = try self.parseSetArm();
+            root = try self.allocOp(.{ .set_union = .{ .left = root, .right = arm, .all = false, .kind = .intersect } });
+        }
+        return root;
+    }
+
+    /// The optional ALL / DISTINCT after a set operator; true for ALL.
+    fn parseSetQuantifier(self: *Parser, kind: ir.SetKind) ParseError!bool {
+        switch (self.cur.tag) {
+            .kw_all => {
+                if (kind != .@"union") return ParseError.SqlSetOpAllUnsupported;
+                try self.advance();
+                return true;
+            },
+            .kw_distinct => {
+                try self.advance();
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn parseSetArm(self: *Parser) ParseError!*ir.Op {
+        if (self.cur.tag == .lparen) return try self.parseParenthesizedArm();
+        self.union_arm = true;
+        return try self.parseStatement();
     }
 
     fn parseParenthesizedArm(self: *Parser) ParseError!*ir.Op {
@@ -1332,6 +1365,10 @@ pub const Parser = struct {
             3 => ir.TableRef{ .database = parts_buf[0], .schema = parts_buf[1], .name = parts_buf[2] },
             else => unreachable,
         };
+    }
+
+    fn isSetOpKeyword(tag: TokenTag) bool {
+        return tag == .kw_union or tag == .kw_intersect or tag == .kw_except;
     }
 
     fn wordLikeToken(text: []const u8) bool {
@@ -1820,7 +1857,7 @@ pub const Parser = struct {
                     depth -= 1;
                 },
                 .eof, .semicolon => return false,
-                .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_into => {
+                .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into => {
                     if (depth == 0) return false;
                 },
                 .eq, .neq, .lt, .lte, .gt, .gte, .kw_is, .kw_in, .kw_between, .kw_like, .kw_and, .kw_or, .kw_not => {
@@ -4282,7 +4319,7 @@ pub const Parser = struct {
             else => return false,
         }
         return switch (tok.tag) {
-            .comma, .kw_asc, .kw_desc, .kw_limit, .kw_offset, .rparen, .eof, .semicolon, .kw_union, .kw_rows, .kw_range, .kw_groups => true,
+            .comma, .kw_asc, .kw_desc, .kw_limit, .kw_offset, .rparen, .eof, .semicolon, .kw_union, .kw_intersect, .kw_except, .kw_rows, .kw_range, .kw_groups => true,
             else => false,
         };
     }

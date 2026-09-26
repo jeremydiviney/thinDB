@@ -697,3 +697,106 @@ test "division by zero is NULL for every numeric type and operator" {
         try std.testing.expectEqual(c[1], q.outputSchema()[0].nullable);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conditionals raise only for the rows that reach a failing branch
+// ---------------------------------------------------------------------------
+
+fn expectQueryError(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: anyerror) !void {
+    var q = helpers.runSql(allocator, db, sql) catch |err| return std.testing.expectEqual(expected, err);
+    defer q.deinit();
+    while (q.next()) |batch| {
+        if (batch == null) return error.TestUnexpectedSuccess;
+    } else |err| return std.testing.expectEqual(expected, err);
+}
+
+fn expectTextColumn(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: []const ?[]const u8) !void {
+    var q = try helpers.runSql(allocator, db, sql);
+    defer q.deinit();
+    var row: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            const got: ?[]const u8 = if (b.values[0].isValid(r)) b.values[0].data.string.rowBytes(r) else null;
+            if (want[row]) |w| try std.testing.expectEqualStrings(w, got orelse "NULL") else try std.testing.expectEqual(@as(?[]const u8, null), got);
+            row += 1;
+        }
+    }
+    try std.testing.expectEqual(want.len, row);
+}
+
+test "CASE, IF and COALESCE raise only where a row takes the failing branch" {
+    // MySQL, StarRocks and DuckDB evaluate a branch only for the rows that
+    // take it; thinDB evaluated every branch over the whole batch, so a
+    // decimal overflow on a row the CASE sent elsewhere failed the query.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    // Odd ids hold a d whose cube overflows DECIMAL(38,0); even ids a small d.
+    // Row 9 is the one big-d row without an n for COALESCE to take.
+    try helpers.exec(allocator, db, "CREATE TABLE g (id BIGINT PRIMARY KEY, d DECIMAL(18,0) NOT NULL, n DECIMAL(10,2), small BOOLEAN NOT NULL)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO g (id, d, n, small) VALUES
+        \\(1, 999999999999999999, 2.00, FALSE), (2, 2, NULL, TRUE),
+        \\(3, 999999999999999999, 2.00, FALSE), (4, 4, NULL, TRUE),
+        \\(5, 999999999999999999, 2.00, FALSE), (6, 6, NULL, TRUE),
+        \\(7, 999999999999999999, 2.00, FALSE), (8, 8, NULL, TRUE),
+        \\(9, 999999999999999999, NULL, FALSE)
+    );
+
+    const cubes = [_]?f64{ 0, 8, 0, 64, 0, 216, 0, 512 };
+    const cases = .{
+        .{ "CASE WHEN d < 100 THEN d * d * d ELSE 0 END", cubes },
+        .{ "IF(d < 100, d * d * d, 0)", cubes },
+        .{ "COALESCE(n, d * d * d)", [_]?f64{ 2, 8, 2, 64, 2, 216, 2, 512 } },
+        .{ "IFNULL(n, d * d * d)", [_]?f64{ 2, 8, 2, 64, 2, 216, 2, 512 } },
+        .{ "CASE WHEN d < 100 THEN CAST(d AS DECIMAL(5,2)) END", [_]?f64{ null, 2, null, 4, null, 6, null, 8 } },
+        // A branch no row takes.
+        .{ "CASE WHEN d < 0 THEN d * d * d ELSE 1 END", [_]?f64{ 1, 1, 1, 1, 1, 1, 1, 1 } },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("g", .{})).flush();
+        inline for (cases) |c| {
+            const want = c[1];
+            try expectNumericColumn(allocator, db, "SELECT " ++ c[0] ++ " FROM g WHERE id <= 8 ORDER BY id", &want);
+        }
+        // The ELSE's COALESCE fails on row 9, which the WHEN takes.
+        try expectNumericColumn(
+            allocator,
+            db,
+            "SELECT CASE WHEN d > 100 THEN 0 ELSE COALESCE(n, d * d * d) END FROM g ORDER BY id",
+            &.{ 0, 8, 0, 64, 0, 216, 0, 512, 0 },
+        );
+        try expectTextColumn(
+            allocator,
+            db,
+            "SELECT CASE WHEN d < 100 THEN CAST(d * d * d AS CHAR) ELSE 'big' END FROM g WHERE id <= 4 ORDER BY id",
+            &.{ "big", "8", "big", "64" },
+        );
+
+        // A row that takes the failing branch still fails.
+        try expectQueryError(allocator, db, "SELECT CASE WHEN d > 0 THEN d * d * d ELSE 0 END FROM g", error.ArithmeticOverflow);
+        try expectQueryError(allocator, db, "SELECT COALESCE(n, d * d * d) FROM g", error.ArithmeticOverflow);
+    }
+
+    // The `if` function, which SQL's IF lowers past, reads its branches the
+    // same way.
+    var base = try thindb.scan(allocator, try db.openTable("g", .{}));
+    var q = try base.compute(&.{.{ .name = "v", .expr = .{ .call = .{ .fn_name = "if", .args = &.{
+        .{ .col_ref = "small" },
+        .{ .call = .{ .fn_name = "mul", .args = &.{
+            .{ .call = .{ .fn_name = "mul", .args = &.{ .{ .col_ref = "d" }, .{ .col_ref = "d" } } } },
+            .{ .col_ref = "d" },
+        } } },
+        .{ .lit = .{ .int = 0 } },
+    } } } }});
+    defer q.deinit();
+    const v_type = q.outputSchema()[4].type;
+    var got: std.ArrayList(?f64) = .empty;
+    defer got.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| try got.append(allocator, try numericCell(v_type, b.values[4], r));
+    }
+    try std.testing.expectEqualSlices(?f64, &.{ 0, 8, 0, 64, 0, 216, 0, 512, 0 }, got.items);
+}

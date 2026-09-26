@@ -168,22 +168,7 @@ pub fn appendStoreRange(alloc: Allocator, dst: *ColumnStore, src: *const ColumnS
     return appendViewRange(alloc, dst, src.view(), start, end);
 }
 
-/// Range append from a view (same contract as `appendStoreRange`).
-pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start: usize, end: usize) !void {
-    switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
-            try @field(dst.data, @tagName(tag)).appendSlice(alloc, s[start..end]);
-        },
-        .varchar, .string, .char, .json => |sv| switch (dst.data) {
-            .varchar, .string, .char, .json => |*d| try d.appendRange(alloc, sv, start, end),
-            else => unreachable,
-        },
-    }
-    if (dst.nulls != null) {
-        const base = dst.rowCount() - (end - start);
-        try dst.appendValidityRangeFrom(alloc, base, v.nulls, start, end - start);
-    }
-}
+pub const appendViewRange = store_mod.appendViewRange;
 
 /// Append row `i` of `v` onto `dst` (typed single-row append; group-agg and
 /// probe emission). `dst`'s data variant must match `v`'s — the program
