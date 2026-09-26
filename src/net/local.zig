@@ -831,6 +831,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .op = s.op,
                 .outer_keys = outer_keys,
                 .rows = rows,
+                .value_type = s.value_type,
             } };
         },
         .correlated_range => |s| blk: {

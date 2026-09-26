@@ -1059,21 +1059,19 @@ test "error: filter predicate type mismatch on each new type" {
     defer db.close();
     const t = try db.table("t", schema, opts);
 
-    // Filter SMALLINT column with an out-of-range INT literal — can't
-    // narrow losslessly, so it's a type mismatch. (An in-range int
-    // literal like 1 now narrows to smallint; see the coercion test.)
+    // A number never meets a date.
     var base = try thindb.scan(allocator, t);
-    var q = base.filter(thindb.leafExpr("small", .eq, .{ .int = 100000 }));
+    const q = base.filter(thindb.leafExpr("small", .eq, .{ .date = 1 }));
     try std.testing.expectError(error.PredicateTypeMismatch, q);
     base.deinit();
 
-    // LARGEINT column with a TEXT literal — type mismatch. (BIGINT
-    // literal would widen losslessly to LARGEINT, so use a literal
-    // that genuinely can't be widened.)
+    // An out-of-range literal and a numeric text literal both compare.
     base = try thindb.scan(allocator, t);
-    q = base.filter(thindb.leafExpr("big", .eq, .{ .text = "1" }));
-    try std.testing.expectError(error.PredicateTypeMismatch, q);
-    base.deinit();
+    var wide = try base.filter(thindb.leafExpr("small", .eq, .{ .int = 100000 }));
+    wide.deinit();
+    base = try thindb.scan(allocator, t);
+    var text = try base.filter(thindb.leafExpr("big", .eq, .{ .text = "1" }));
+    text.deinit();
 
     // DECIMAL column with an integer literal now coerces: the literal scales to
     // the column's mantissa so the comparison runs (see the decimal kernels).

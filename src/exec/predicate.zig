@@ -20,6 +20,7 @@ const exec = @import("exec.zig");
 const simd = @import("../util/simd.zig");
 const Error = exec.Error;
 const scalar_fn_common = @import("scalar_fn_common.zig");
+const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
 
 pub const PredicateOp = enum { eq, neq, lt, lte, gt, gte };
 
@@ -255,6 +256,9 @@ pub const CorrelatedScalar = struct {
     /// Materialized rows. `key` tuples are unique (the inner's
     /// GROUP BY on the correlation columns guarantees that).
     rows: []const CorrelatedScalarRow,
+    /// Type of each row's `value`: a decimal `Value` carries no scale, and
+    /// the outer column may be a different type altogether.
+    value_type: types.Type,
 };
 
 pub const CorrelatedRangeGroup = struct {
@@ -416,6 +420,7 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .op = s.op,
                 .outer_keys = outer_keys,
                 .rows = rows,
+                .value_type = s.value_type,
             } };
         },
         .correlated_range => |s| blk: {
@@ -484,12 +489,14 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .leaf => |*p| {
             const col_idx = types.findColumn(schema, p.col) orelse return Error.ColumnNotFound;
             const col_type = schema[col_idx].type;
-            const col_tag = ValueTag.fromType(col_type);
-            const val_tag = std.meta.activeTag(p.val);
-            if (col_tag != val_tag) {
-                coerceValue(&p.val, col_type) catch {
-                    if (!foldFractionalComparison(expr, col_type)) return Error.PredicateTypeMismatch;
-                };
+            if (ValueTag.fromType(col_type) != std.meta.activeTag(p.val)) {
+                switch (placeLiteral(p.val, col_type)) {
+                    .exact => |v| p.val = v,
+                    .between => |b| foldBetween(expr, b.lo, b.hi),
+                    .beyond => |side| foldBeyond(expr, side),
+                    .null_text => expr.* = .unknown,
+                    .incomparable => return Error.PredicateTypeMismatch,
+                }
             }
         },
         .day_leaf => |*p| {
@@ -503,30 +510,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .leaf_col_col => |lc| {
             const li = types.findColumn(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = types.findColumn(schema, lc.right) orelse return Error.ColumnNotFound;
-            const lt = schema[li].type;
-            const rt = schema[ri].type;
-            // String columns only support eq / neq (same as col-vs-literal).
-            if (lt.isString() != rt.isString()) {
-                return Error.PredicateTypeMismatch;
-            }
-            if (lt.isString() and lc.op != .eq and lc.op != .neq) return Error.UnsupportedOperatorForType;
-            // Numeric sides widen per row in evaluateColColMask; anything
-            // else (temporal vs numeric, decimal mixes — scale unavailable
-            // at eval level) must share the same tag.
-            if (std.meta.activeTag(lt) != std.meta.activeTag(rt)) {
-                const lt_tag = std.meta.activeTag(lt);
-                const rt_tag = std.meta.activeTag(rt);
-                const numeric_mix = switch (lt_tag) {
-                    .int, .bigint, .smallint, .tinyint, .largeint, .float, .double => switch (rt_tag) {
-                        .int, .bigint, .smallint, .tinyint, .largeint, .float, .double => true,
-                        else => false,
-                    },
-                    else => false,
-                };
-                if (!numeric_mix) {
-                    return Error.PredicateTypeMismatch;
-                }
-            }
+            if (!typesComparable(schema[li].type, schema[ri].type)) return Error.PredicateTypeMismatch;
         },
         .is_null, .is_not_null => |col_name| {
             _ = types.findColumn(schema, col_name) orelse return Error.ColumnNotFound;
@@ -574,46 +558,72 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                 const vals = @constCast(s.values);
                 var keep: usize = 0;
                 for (s.values) |v| {
-                    var c = v;
-                    if (std.meta.activeTag(c) != col_tag) {
-                        coerceValue(&c, col_type) catch continue;
-                    }
-                    vals[keep] = c;
+                    vals[keep] = if (std.meta.activeTag(v) == col_tag) v else switch (placeLiteral(v, col_type)) {
+                        .exact => |c| c,
+                        .between, .beyond, .null_text, .incomparable => continue,
+                    };
                     keep += 1;
                 }
                 s.values = vals[0..keep];
             }
         },
-        // `.correlated_set` — every outer_col must exist; per-row
-        // tuples must match each col's value tag. Same safety net.
-        .correlated_set => |s| {
-            for (s.outer_cols) |c_name| {
-                _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
-            }
-            for (s.rows) |row| {
-                if (row.len != s.outer_cols.len) return Error.PredicateTypeMismatch;
-                for (row, s.outer_cols) |v, c_name| {
-                    const col_idx = findCol(schema, c_name).?;
-                    const expected = ValueTag.fromType(schema[col_idx].type);
-                    if (std.meta.activeTag(v) != expected) return Error.PredicateTypeMismatch;
+        // `.correlated_set` — every outer_col must exist; each tuple
+        // value comes to its column's type, and a tuple holding a value
+        // no row of its column can equal never matches, so it drops.
+        .correlated_set => |*s| {
+            var col_types_buf: [16]types.Type = undefined;
+            const col_types = try outerColumnTypes(schema, s.outer_cols, &col_types_buf);
+            for (s.rows) |row| if (row.len != s.outer_cols.len) return Error.PredicateTypeMismatch;
+            if (keyTuplesNeedCoercion(s.rows, col_types)) {
+                const rows = @constCast(s.rows);
+                var keep: usize = 0;
+                for (s.rows) |row| {
+                    if (!coerceKeyTuple(@constCast(row), col_types)) continue;
+                    rows[keep] = row;
+                    keep += 1;
                 }
+                s.rows = rows[0..keep];
             }
         },
-        // `.correlated_scalar` — outer_compared + outer_keys all
-        // exist; per-row keys + value type tags match.
-        .correlated_scalar => |s| {
-            _ = findCol(schema, s.outer_compared) orelse return Error.ColumnNotFound;
-            for (s.outer_keys) |c_name| {
-                _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
+        // `.correlated_scalar` — outer_compared + outer_keys all exist;
+        // keys come to the outer key columns' types like a set tuple.
+        .correlated_scalar => |*s| {
+            const cmp_idx = findCol(schema, s.outer_compared) orelse return Error.ColumnNotFound;
+            if (!typesComparable(schema[cmp_idx].type, s.value_type)) return Error.PredicateTypeMismatch;
+            var col_types_buf: [16]types.Type = undefined;
+            const col_types = try outerColumnTypes(schema, s.outer_keys, &col_types_buf);
+            var needs = false;
+            for (s.rows) |row| needs = needs or keyTuplesNeedCoercion(&.{row.key}, col_types);
+            if (needs) {
+                const rows = @constCast(s.rows);
+                var keep: usize = 0;
+                for (s.rows) |row| {
+                    if (!coerceKeyTuple(@constCast(row.key), col_types)) continue;
+                    rows[keep] = row;
+                    keep += 1;
+                }
+                s.rows = rows[0..keep];
             }
         },
         // `.correlated_range` — outer_range_col + each outer_keys
-        // entry must exist on the outer schema. Group values are
-        // pre-sorted at materialization; trust their tags.
-        .correlated_range => |s| {
+        // entry must exist on the outer schema; group keys come to the
+        // key columns' types. Group values are pre-sorted at
+        // materialization; trust their tags.
+        .correlated_range => |*s| {
             _ = findCol(schema, s.outer_range_col) orelse return Error.ColumnNotFound;
-            for (s.outer_keys) |c_name| {
-                _ = findCol(schema, c_name) orelse return Error.ColumnNotFound;
+            var col_types_buf: [16]types.Type = undefined;
+            const col_types = try outerColumnTypes(schema, s.outer_keys, &col_types_buf);
+            var needs = false;
+            for (s.groups) |g| needs = needs or keyTuplesNeedCoercion(&.{g.key}, col_types);
+            if (needs) {
+                const groups = @constCast(s.groups);
+                var keep: usize = 0;
+                for (s.groups) |g| {
+                    if (!coerceKeyTuple(@constCast(g.key), col_types)) continue;
+                    groups[keep] = g;
+                    keep += 1;
+                }
+                s.groups = groups[0..keep];
             }
         },
         // `.leaf_var` must have been resolved by the pre-compile
@@ -627,67 +637,193 @@ fn findCol(schema: []const Column, name: []const u8) ?usize {
     return types.findColumn(schema, name);
 }
 
-/// Lossless widening for an integer / float literal to match a wider
-/// column type. Errors when the source literal can't be losslessly
-/// represented in the target type (caller treats that as a type
-/// mismatch).
-/// Coerce a predicate literal to the column's value tag when it's safe:
-///   - lossless integer widening (tinyint → … → largeint)
-///   - integer narrowing when the literal's *value* fits the target range
-///     (safe: the literal is a compile-time-known constant, so an
-///     out-of-range value errors rather than silently truncating)
-///   - boolean ↔ 0/1 integer
-///   - float → double
-///   - 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' text → date / datetime
-/// Returns NoWidening when no safe coercion exists.
+fn outerColumnTypes(schema: []const Column, names: []const []const u8, buf: *[16]types.Type) Error![]const types.Type {
+    if (names.len > buf.len) return Error.PredicateTypeMismatch;
+    for (names, buf[0..names.len]) |name, *ty| ty.* = schema[findCol(schema, name) orelse return Error.ColumnNotFound].type;
+    return buf[0..names.len];
+}
+
+fn keyTuplesNeedCoercion(tuples: []const []const Value, col_types: []const types.Type) bool {
+    for (tuples) |tuple| for (tuple, col_types) |v, ty| {
+        if (std.meta.activeTag(v) != ValueTag.fromType(ty)) return true;
+    };
+    return false;
+}
+
+/// Brings a materialized key tuple to its outer columns' types in place.
+/// False when some value can't equal any value of its column, so the tuple
+/// never matches.
+fn coerceKeyTuple(tuple: []Value, col_types: []const types.Type) bool {
+    for (tuple, col_types) |*v, ty| {
+        if (std.meta.activeTag(v.*) == ValueTag.fromType(ty)) continue;
+        switch (placeLiteral(v.*, ty)) {
+            .exact => |c| v.* = c,
+            .between, .beyond, .null_text, .incomparable => return false,
+        }
+    }
+    return true;
+}
+
+/// Where a comparison literal lands against a column type, under the
+/// comparison rule (`typesComparable`).
+const LiteralPlacement = union(enum) {
+    /// The column type holds the literal exactly.
+    exact: Value,
+    /// The literal falls strictly between two neighbouring column values.
+    between: struct { lo: Value, hi: Value },
+    /// The literal lies past every value the column type can hold.
+    beyond: Side,
+    /// Text that doesn't parse as the column's number or date: the
+    /// comparison is NULL (StarRocks: `'12abc' = 12` is NULL).
+    null_text,
+    incomparable,
+};
+
+const Side = enum { above, below };
+
+fn sideOf(negative: bool) Side {
+    return if (negative) .below else .above;
+}
+
+fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
+    var exact = val;
+    if (coerceValue(&exact, col_type)) |_| return .{ .exact = exact } else |_| {}
+    const lit: Scalar = switch (val) {
+        .text => |t| textScalar(t, col_type) orelse return .null_text,
+        // No scale to place it by: only a decimal column (coerceValue) takes it.
+        .decimal64, .decimal128 => return .incomparable,
+        else => valueScalar(val, 0),
+    };
+    if (!scalarComparableTo(lit, col_type)) return .incomparable;
+    return switch (col_type) {
+        .tinyint, .smallint, .int, .bigint, .largeint => placeOnGrid(lit, 0, col_type),
+        .decimal64, .decimal128 => |spec| placeOnGrid(lit, spec.s, col_type),
+        .float => .{ .exact = .{ .float = @floatCast(scalarF64(lit) orelse return .incomparable) } },
+        .double => .{ .exact = .{ .double = scalarF64(lit) orelse return .incomparable } },
+        .date => placeOnDays(lit),
+        .datetime => .{ .exact = .{ .datetime = lit.micros } },
+        .varchar, .string, .char, .json => .{ .exact = .{ .text = lit.text } },
+        .boolean, .uuid => .incomparable,
+    };
+}
+
+/// Text compared against a column: it meets a number or a temporal by
+/// parsing; null when it doesn't parse.
+fn textScalar(text: []const u8, col_type: types.Type) ?Scalar {
+    return switch (comparisonKind(col_type)) {
+        .number => textNumber(text),
+        .temporal => textMicros(text),
+        .text, .uuid => .{ .text = text },
+    };
+}
+
+fn scalarComparableTo(lit: Scalar, col_type: types.Type) bool {
+    return switch (comparisonKind(col_type)) {
+        .number => lit == .integer or lit == .float or lit == .decimal,
+        .temporal => lit == .micros,
+        .text => lit == .text,
+        .uuid => false,
+    };
+}
+
+/// A number against an integer (`scale` 0) or decimal column: exact when it
+/// lands on the column's grid of 10^-scale steps, else the two grid points
+/// around it.
+fn placeOnGrid(lit: Scalar, scale: u8, col_type: types.Type) LiteralPlacement {
+    const steps: struct { lo: i128, hi: i128 } = switch (lit) {
+        .integer => |v| blk: {
+            const m = mulPow10(v, scale) orelse return .{ .beyond = sideOf(v < 0) };
+            break :blk .{ .lo = m, .hi = m };
+        },
+        .decimal => |d| blk: {
+            if (d.s <= scale) {
+                const m = mulPow10(d.m, scale - d.s) orelse return .{ .beyond = sideOf(d.m < 0) };
+                break :blk .{ .lo = m, .hi = m };
+            }
+            const step = decimal_pow10(d.s - scale);
+            const lo = @divFloor(d.m, step);
+            break :blk .{ .lo = lo, .hi = if (lo * step == d.m) lo else lo + 1 };
+        },
+        .float => |v| blk: {
+            if (!std.math.isFinite(v)) return .incomparable;
+            const scaled = v * std.math.pow(f64, 10.0, @floatFromInt(scale));
+            if (@abs(scaled) >= 1.0e38) return .{ .beyond = sideOf(scaled < 0) };
+            if (scaledIsIntegral(scaled)) {
+                const m: i128 = @intFromFloat(@round(scaled));
+                break :blk .{ .lo = m, .hi = m };
+            }
+            break :blk .{ .lo = @intFromFloat(@floor(scaled)), .hi = @intFromFloat(@ceil(scaled)) };
+        },
+        .micros, .text, .uuid => return .incomparable,
+    };
+    // Past the type's range on one side only when `lo` is its maximum or
+    // `hi` its minimum: then the literal is still beyond every column value.
+    const lo = gridValue(steps.lo, col_type) orelse return .{ .beyond = sideOf(steps.hi <= 0) };
+    const hi = gridValue(steps.hi, col_type) orelse return .{ .beyond = .above };
+    if (steps.lo == steps.hi) return .{ .exact = lo };
+    return .{ .between = .{ .lo = lo, .hi = hi } };
+}
+
+fn gridValue(m: i128, col_type: types.Type) ?Value {
+    return switch (col_type) {
+        .tinyint => .{ .tinyint = std.math.cast(i8, m) orelse return null },
+        .smallint => .{ .smallint = std.math.cast(i16, m) orelse return null },
+        .int => .{ .int = std.math.cast(i32, m) orelse return null },
+        .bigint => .{ .bigint = std.math.cast(i64, m) orelse return null },
+        .largeint => .{ .largeint = m },
+        .decimal64 => .{ .decimal64 = std.math.cast(i64, m) orelse return null },
+        .decimal128 => .{ .decimal128 = m },
+        else => null,
+    };
+}
+
+/// A datetime against a DATE column: the date is midnight, so a time of day
+/// puts the literal between that day and the next.
+fn placeOnDays(lit: Scalar) LiteralPlacement {
+    const lo_day = @divFloor(lit.micros, std.time.us_per_day);
+    const lo = std.math.cast(i32, lo_day) orelse return .incomparable;
+    if (lo_day * std.time.us_per_day == lit.micros) return .{ .exact = .{ .date = lo } };
+    const hi = std.math.cast(i32, lo_day + 1) orelse return .incomparable;
+    return .{ .between = .{ .lo = .{ .date = lo }, .hi = .{ .date = hi } } };
+}
+
+fn mulPow10(m: i128, n: u8) ?i128 {
+    if (n > 38) return null;
+    return std.math.mul(i128, m, decimal_pow10(n)) catch null;
+}
+
+/// `col op x` where x lies strictly between the neighbouring column values
+/// `lo` and `hi`: `=` never matches, `<>` matches every non-NULL row, and a
+/// range keeps its meaning against the bound on its side — MySQL semantics:
+/// `x < 2.5` ⇔ `x < 3`, `x <= 2.5` ⇔ `x <= 2`, `d < '2024-03-05 10:00'` ⇔
+/// `d < '2024-03-06'`.
+fn foldBetween(expr: *PredicateExpr, lo: Value, hi: Value) void {
+    const p = expr.leaf;
+    expr.* = switch (p.op) {
+        .eq => .{ .always = false },
+        .neq => .{ .is_not_null = p.col },
+        .lt, .gte => .{ .leaf = .{ .col = p.col, .op = p.op, .val = hi } },
+        .lte, .gt => .{ .leaf = .{ .col = p.col, .op = p.op, .val = lo } },
+    };
+}
+
+/// `col op x` where x lies past every value of the column's type: `=`
+/// never matches, and every other operator matches either every non-NULL
+/// row or none (`smallint_col < 100000` holds for every smallint).
+fn foldBeyond(expr: *PredicateExpr, side: Side) void {
+    const p = expr.leaf;
+    const matches_all = switch (p.op) {
+        .eq => false,
+        .neq => true,
+        .lt, .lte => side == .above,
+        .gt, .gte => side == .below,
+    };
+    expr.* = if (matches_all) .{ .is_not_null = p.col } else .{ .always = false };
+}
+
 /// Pub: the keyed-access bloom gate (api/comparison.appendPredicateValueBytes)
 /// must coerce literals identically to predicate evaluation, or a single
 /// text-vs-DATE key column silently disables bloom pruning for the statement.
-/// A numeric literal with more fractional digits than the column can hold —
-/// any fraction against an integer-family column, or digits past a DECIMAL's
-/// scale — can never be equal; instead of erroring, comparisons fold to the
-/// nearest representable form — MySQL semantics at the column's scale:
-/// `x = 2.5` matches nothing, `x <> 2.5` matches every non-NULL row,
-/// `x < 2.5` ⇔ `x < 3`, `x <= 2.5` ⇔ `x <= 2`, `x > 2.5` ⇔ `x > 2`,
-/// `x >= 2.5` ⇔ `x >= 3` (and `dc < 10.499` ⇔ `dc < 10.50` at scale 2).
-/// Returns false when the shape doesn't apply (caller errors).
-fn foldFractionalComparison(expr: *PredicateExpr, col_type: types.Type) bool {
-    const p = expr.leaf;
-    const scale: u8 = if (col_type.isInteger()) 0 else if (col_type.decimalSpec()) |spec| spec.s else return false;
-    const f: f64 = switch (p.val) {
-        .double => |v| v,
-        .float => |v| v,
-        else => return false,
-    };
-    if (!std.math.isFinite(f)) return false;
-    const scaled = f * std.math.pow(f64, 10.0, @floatFromInt(scale));
-    if (scaledIsIntegral(scaled)) return false;
-    switch (p.op) {
-        .eq => {
-            expr.* = .{ .always = false };
-            return true;
-        },
-        .neq => {
-            expr.* = .{ .is_not_null = p.col };
-            return true;
-        },
-        .lt, .gte, .lte, .gt => {
-            const bound = if (p.op == .lt or p.op == .gte) @ceil(scaled) else @floor(scaled);
-            if (@abs(bound) >= 9.2e18) return false;
-            var v = types.Value{ .bigint = @intFromFloat(bound) };
-            if (col_type.isInteger()) {
-                coerceValue(&v, col_type) catch return false;
-            } else if (col_type == .decimal128) {
-                v = .{ .decimal128 = @intFromFloat(bound) };
-            } else {
-                v = .{ .decimal64 = @intFromFloat(bound) };
-            }
-            expr.* = .{ .leaf = .{ .col = p.col, .op = p.op, .val = v } };
-            return true;
-        },
-    }
-}
-
 /// THE literal-coercion entry: adopt `target`'s type when the value is
 /// losslessly representable there (int-family widening/narrow-with-fit,
 /// int/float → decimal at the target's scale, text → temporal by parsing,
@@ -716,7 +852,12 @@ pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
     if (val.* == .text) {
         switch (target) {
             .date => {
-                const d = parseDateString(val.text) catch return error.NoWidening;
+                // A datetime string equals a DATE only at midnight; any other
+                // time of day lies between two dates (placeLiteral folds it).
+                const d = if (parseDateTimeString(val.text)) |us| blk: {
+                    if (@mod(us, std.time.us_per_day) != 0) return error.NoWidening;
+                    break :blk std.math.cast(i32, @divFloor(us, std.time.us_per_day)) orelse return error.NoWidening;
+                } else |_| parseDateString(val.text) catch return error.NoWidening;
                 val.* = .{ .date = d };
                 return;
             },
@@ -729,10 +870,17 @@ pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
         }
     }
 
+    if (val.* == .date and target == .datetime) {
+        const days = val.date;
+        val.* = .{ .datetime = @as(i64, days) * std.time.us_per_day };
+        return;
+    }
+
     // Integer-family literal → integer-family / boolean column. Widening
     // is always safe; narrowing is gated on the value fitting the target.
     if (val.* == .float and target == .double) {
-        val.* = .{ .double = val.float };
+        const f = val.float;
+        val.* = .{ .double = f };
         return;
     }
     const iv: i128 = switch (val.*) {
@@ -744,7 +892,7 @@ pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
         .boolean => |v| @intFromBool(v),
         // A whole-valued float literal adopts an integer target exactly
         // (`x = 2.0` on an INT column). Fractional values stay NoWidening —
-        // comparison folding (foldFractionalComparison) handles those.
+        // comparison folding (placeLiteral) handles those.
         .float => |v| blk: {
             const f: f64 = v;
             if (!std.math.isFinite(f) or @trunc(f) != f or @abs(f) >= 1.7e38) return error.NoWidening;
@@ -1009,7 +1157,7 @@ pub fn evaluatePredicate(
         .leaf_col_col => |lc| {
             const li = findCol(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = findCol(schema, lc.right) orelse return Error.ColumnNotFound;
-            try evaluateColColMask(batch.values[li], batch.values[ri], lc.op, batch.row_count, out);
+            evaluateColColMask(batch.values[li], schema[li].type, batch.values[ri], schema[ri].type, lc.op, batch.row_count, out);
         },
         .is_null => |col_name| {
             const col_idx = findCol(schema, col_name) orelse return Error.ColumnNotFound;
@@ -1099,7 +1247,7 @@ pub fn evaluateExprGuided(
         .leaf_col_col => |lc| {
             const li = findCol(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = findCol(schema, lc.right) orelse return Error.ColumnNotFound;
-            try evaluateColColMask(batch.values[li], batch.values[ri], lc.op, batch.row_count, out);
+            evaluateColColMask(batch.values[li], schema[li].type, batch.values[ri], schema[ri].type, lc.op, batch.row_count, out);
         },
         .is_null => |col_name| {
             const col_idx = findCol(schema, col_name) orelse return Error.ColumnNotFound;
@@ -1183,6 +1331,7 @@ pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column,
     }
     const cmp_idx = findCol(schema, s.outer_compared) orelse return Error.ColumnNotFound;
     const cmp_view = batch.values[cmp_idx];
+    const cmp_type = schema[cmp_idx].type;
 
     var i: usize = 0;
     while (i < batch.row_count) : (i += 1) {
@@ -1219,7 +1368,7 @@ pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column,
             }
         }
         if (found_value) |v| {
-            out[i] = try compareCellToValue(cmp_view, i, s.op, v);
+            out[i] = orderMatches(scalarOrder(cellScalar(cmp_view, cmp_type, i), valueScalar(v, decimalScale(s.value_type))), s.op);
         } else {
             out[i] = false;
         }
@@ -1590,7 +1739,21 @@ pub fn evaluateInSetMask(view: ColumnView, values: []const Value, negate: bool, 
         .string => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         .char => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         .json => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
-        else => return Error.UnsupportedOperatorForType,
+        // Validation brought every set value to the column's type.
+        else => for (0..n) |i| {
+            if (!view.isValid(i)) {
+                mask[i] = false;
+                continue;
+            }
+            var found = false;
+            for (values) |v| {
+                if (cellMatchesValue(view, i, v)) {
+                    found = true;
+                    break;
+                }
+            }
+            mask[i] = if (negate) !found else found;
+        },
     }
 }
 
@@ -1612,62 +1775,223 @@ fn evalInSetStringy(sv: anytype, values: []const Value, negate: bool, view: Colu
     }
 }
 
-/// Per-row col-vs-col comparison. Both views must share the same
-/// primitive type tag (validateExpr enforces). NULL on either side
-/// → mask[i] = false (two-valued logic).
-fn plainNumericTag(tag: anytype) bool {
-    return switch (tag) {
-        .int, .bigint, .smallint, .tinyint, .largeint, .float, .double => true,
-        else => false,
+/// One side of a comparison in the form the comparison rule works on:
+/// integers exact, decimals as (mantissa, scale), DATE and DATETIME as µs
+/// since the epoch, text as its bytes.
+const Scalar = union(enum) {
+    integer: i128,
+    float: f64,
+    decimal: ScaledInt,
+    micros: i64,
+    text: []const u8,
+    uuid: u128,
+};
+
+/// `m × 10^-s`.
+const ScaledInt = struct { m: i128, s: u8 };
+
+const ComparisonKind = enum { number, temporal, text, uuid };
+
+fn comparisonKind(ty: types.Type) ComparisonKind {
+    return switch (ty) {
+        .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => .number,
+        .date, .datetime => .temporal,
+        .varchar, .string, .char, .json => .text,
+        .uuid => .uuid,
     };
 }
 
-fn intFamilyTag(tag: anytype) bool {
-    return switch (tag) {
-        .int, .bigint, .smallint, .tinyint, .largeint => true,
-        else => false,
-    };
+/// THE comparison rule, as StarRocks and MySQL apply it: numbers compare by
+/// value across integer, decimal and float types; a DATE meets a DATETIME at
+/// midnight; text meets a number or a temporal by parsing (text that doesn't
+/// parse compares as NULL); text against text is bytewise.
+pub fn typesComparable(a: types.Type, b: types.Type) bool {
+    const ka = comparisonKind(a);
+    const kb = comparisonKind(b);
+    if (ka == kb) return true;
+    if (ka == .uuid or kb == .uuid) return false;
+    return ka == .text or kb == .text;
 }
 
-fn numAsI128(view: ColumnView, i: usize) i128 {
+fn cellScalar(view: ColumnView, ty: types.Type, i: usize) Scalar {
+    const scale = decimalScale(ty);
     return switch (view.data) {
-        .int => |l| l[i],
-        .bigint => |l| l[i],
-        .smallint => |l| l[i],
-        .tinyint => |l| l[i],
-        .largeint => |l| l[i],
-        else => unreachable,
+        .tinyint => |s| .{ .integer = s[i] },
+        .smallint => |s| .{ .integer = s[i] },
+        .int => |s| .{ .integer = s[i] },
+        .bigint => |s| .{ .integer = s[i] },
+        .largeint => |s| .{ .integer = s[i] },
+        .boolean => |s| .{ .integer = s[i] },
+        .float => |s| .{ .float = s[i] },
+        .double => |s| .{ .float = s[i] },
+        .decimal64 => |s| .{ .decimal = .{ .m = s[i], .s = scale } },
+        .decimal128 => |s| .{ .decimal = .{ .m = s[i], .s = scale } },
+        .date => |s| .{ .micros = @as(i64, s[i]) * std.time.us_per_day },
+        .datetime => |s| .{ .micros = s[i] },
+        .uuid => |s| .{ .uuid = s[i] },
+        .varchar, .string, .char, .json => |sv| .{ .text = sv.rowBytes(i) },
     };
 }
 
-fn numAsF64(view: ColumnView, i: usize) f64 {
-    return switch (view.data) {
-        .int => |l| @floatFromInt(l[i]),
-        .bigint => |l| @floatFromInt(l[i]),
-        .smallint => |l| @floatFromInt(l[i]),
-        .tinyint => |l| @floatFromInt(l[i]),
-        .largeint => |l| @floatFromInt(l[i]),
-        .float => |l| @floatCast(l[i]),
-        .double => |l| l[i],
-        else => unreachable,
+/// A value in comparison form; `decimal_scale` places a decimal mantissa.
+fn valueScalar(v: Value, decimal_scale: u8) Scalar {
+    return switch (v) {
+        .tinyint => |x| .{ .integer = x },
+        .smallint => |x| .{ .integer = x },
+        .int => |x| .{ .integer = x },
+        .bigint => |x| .{ .integer = x },
+        .largeint => |x| .{ .integer = x },
+        .boolean => |x| .{ .integer = @intFromBool(x) },
+        .float => |x| .{ .float = x },
+        .double => |x| .{ .float = x },
+        .decimal64 => |m| .{ .decimal = .{ .m = m, .s = decimal_scale } },
+        .decimal128 => |m| .{ .decimal = .{ .m = m, .s = decimal_scale } },
+        .date => |x| .{ .micros = @as(i64, x) * std.time.us_per_day },
+        .datetime => |x| .{ .micros = x },
+        .uuid => |x| .{ .uuid = x },
+        .text => |t| .{ .text = t },
     };
 }
 
-pub fn evaluateColColMask(left: ColumnView, right: ColumnView, op: PredicateOp, n: usize, mask: []bool) !void {
-    // Mixed plain-numeric tags (a computed double against a passed-through
-    // int, etc.) widen per row: exact i128 when both sides are integers,
-    // f64 when a float side is involved. Decimal mixes stay rejected by the
-    // validator — the scale isn't available at this level.
-    const lt = std.meta.activeTag(left.data);
-    const rt = std.meta.activeTag(right.data);
-    if (lt != rt and plainNumericTag(lt) and plainNumericTag(rt)) {
-        if (intFamilyTag(lt) and intFamilyTag(rt)) {
-            for (0..n) |i| mask[i] = cmp(i128, numAsI128(left, i), numAsI128(right, i), op);
-        } else {
-            for (0..n) |i| mask[i] = cmp(f64, numAsF64(left, i), numAsF64(right, i), op);
-        }
-        return;
+fn decimalScale(ty: types.Type) u8 {
+    return if (ty.decimalSpec()) |spec| spec.s else 0;
+}
+
+/// Order of `a` against `b` under the comparison rule; null when the pair
+/// compares as NULL (text that doesn't parse as the other side's kind, a NaN)
+/// or isn't comparable.
+fn scalarOrder(a: Scalar, b: Scalar) ?std.math.Order {
+    if (a == .text and b != .text) return textOrder(a.text, b);
+    if (b == .text and a != .text) return if (textOrder(b.text, a)) |o| o.invert() else null;
+    return switch (a) {
+        .text => |at| std.mem.order(u8, at, b.text),
+        .micros => |am| if (b == .micros) std.math.order(am, b.micros) else null,
+        .uuid => |au| if (b == .uuid) std.math.order(au, b.uuid) else null,
+        .integer, .float, .decimal => numberOrder(a, b),
+    };
+}
+
+fn textOrder(text: []const u8, other: Scalar) ?std.math.Order {
+    return switch (other) {
+        .micros => |m| std.math.order((textMicros(text) orelse return null).micros, m),
+        .integer, .float, .decimal => numberOrder(textNumber(text) orelse return null, other),
+        .text, .uuid => null,
+    };
+}
+
+fn numberOrder(a: Scalar, b: Scalar) ?std.math.Order {
+    if (a == .float or b == .float) {
+        const af = scalarF64(a) orelse return null;
+        const bf = scalarF64(b) orelse return null;
+        if (std.math.isNan(af) or std.math.isNan(bf)) return null;
+        return std.math.order(af, bf);
     }
+    const ad = scalarDecimal(a) orelse return null;
+    const bd = scalarDecimal(b) orelse return null;
+    if (ad.s == bd.s) return std.math.order(ad.m, bd.m);
+    if (ad.s < bd.s) return rescaledOrder(ad.m, bd.s - ad.s, bd.m);
+    return rescaledOrder(bd.m, ad.s - bd.s, ad.m).invert();
+}
+
+/// Order of `m × 10^shift` against `other`. A product past i128 lies beyond
+/// every value `other` can hold, so the sign of `m` alone decides.
+fn rescaledOrder(m: i128, shift: u8, other: i128) std.math.Order {
+    const scaled = mulPow10(m, shift) orelse return if (m > 0) .gt else .lt;
+    return std.math.order(scaled, other);
+}
+
+fn scalarF64(v: Scalar) ?f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .decimal => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10.0, @floatFromInt(d.s)),
+        .micros, .text, .uuid => null,
+    };
+}
+
+fn scalarDecimal(v: Scalar) ?ScaledInt {
+    return switch (v) {
+        .integer => |i| .{ .m = i, .s = 0 },
+        .decimal => |d| d,
+        .float, .micros, .text, .uuid => null,
+    };
+}
+
+/// Text read as a number, the way StarRocks casts it for a comparison:
+/// surrounding spaces ignored, plain decimal digits kept exact, an exponent
+/// form read as a double; anything else is not a number.
+fn textNumber(raw: []const u8) ?Scalar {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    var i: usize = 0;
+    const negative = i < text.len and text[i] == '-';
+    if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
+    var m: i128 = 0;
+    var digits: usize = 0;
+    var scale: u8 = 0;
+    var seen_point = false;
+    var exact = true;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '.' and !seen_point) {
+            seen_point = true;
+        } else if (c >= '0' and c <= '9') {
+            digits += 1;
+            if (digits > 38) {
+                exact = false;
+                continue;
+            }
+            m = m * 10 + (c - '0');
+            if (seen_point) scale += 1;
+        } else break;
+    }
+    if (digits == 0) return null;
+    if (i == text.len and exact) return .{ .decimal = .{ .m = if (negative) -m else m, .s = scale } };
+    for (text[i..]) |c| switch (c) {
+        '0'...'9', '.', 'e', 'E', '+', '-' => {},
+        else => return null,
+    };
+    const f = std.fmt.parseFloat(f64, text) catch return null;
+    return if (std.math.isFinite(f)) .{ .float = f } else null;
+}
+
+fn textMicros(raw: []const u8) ?Scalar {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    return .{ .micros = scalar_fn_common.textToDatetime(text) orelse return null };
+}
+
+fn orderMatches(order: ?std.math.Order, op: PredicateOp) bool {
+    const o = order orelse return false;
+    return switch (op) {
+        .eq => o == .eq,
+        .neq => o != .eq,
+        .lt => o == .lt,
+        .lte => o != .gt,
+        .gt => o == .gt,
+        .gte => o != .lt,
+    };
+}
+
+/// Both sides store values the comparison can use as they are.
+fn sameRepresentation(a: types.Type, b: types.Type) bool {
+    if (a.isString() and b.isString()) return true;
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    if (a.decimalSpec()) |da| if (b.decimalSpec()) |db| return da.s == db.s;
+    return true;
+}
+
+/// Per-row col-vs-col comparison under the comparison rule. NULL on either
+/// side → mask[i] = false (two-valued logic).
+pub fn evaluateColColMask(left: ColumnView, left_type: types.Type, right: ColumnView, right_type: types.Type, op: PredicateOp, n: usize, mask: []bool) void {
+    if (sameRepresentation(left_type, right_type)) {
+        sameRepresentationMask(left, right, op, n, mask);
+    } else {
+        for (0..n) |i| mask[i] = orderMatches(scalarOrder(cellScalar(left, left_type, i), cellScalar(right, right_type, i)), op);
+    }
+    clearNullRows(left.nulls, mask[0..n]);
+    clearNullRows(right.nulls, mask[0..n]);
+}
+
+fn sameRepresentationMask(left: ColumnView, right: ColumnView, op: PredicateOp, n: usize, mask: []bool) void {
     switch (left.data) {
         .int => |l| {
             const r = right.data.int;
@@ -1721,43 +2045,10 @@ pub fn evaluateColColMask(left: ColumnView, right: ColumnView, op: PredicateOp, 
             const r = right.data.uuid;
             for (0..n) |i| mask[i] = cmp(u128, l[i], r[i], op);
         },
-        .varchar => |l| switch (right.data) {
-            .varchar => |r| stringCmpCol(l, r, op, n, mask),
-            .string => |r| stringCmpCol(l, r, op, n, mask),
-            .char => |r| stringCmpCol(l, r, op, n, mask),
-            .json => |r| stringCmpCol(l, r, op, n, mask),
-            else => unreachable,
+        .varchar, .string, .char, .json => |l| {
+            const r = scalar_fn_common.stringViewOf(right);
+            for (0..n) |i| mask[i] = cmpStr(l.rowBytes(i), r.rowBytes(i), op);
         },
-        .string => |l| switch (right.data) {
-            .varchar => |r| stringCmpCol(l, r, op, n, mask),
-            .string => |r| stringCmpCol(l, r, op, n, mask),
-            .char => |r| stringCmpCol(l, r, op, n, mask),
-            .json => |r| stringCmpCol(l, r, op, n, mask),
-            else => unreachable,
-        },
-        .char => |l| switch (right.data) {
-            .varchar => |r| stringCmpCol(l, r, op, n, mask),
-            .string => |r| stringCmpCol(l, r, op, n, mask),
-            .char => |r| stringCmpCol(l, r, op, n, mask),
-            .json => |r| stringCmpCol(l, r, op, n, mask),
-            else => unreachable,
-        },
-        .json => |l| switch (right.data) {
-            .varchar => |r| stringCmpCol(l, r, op, n, mask),
-            .string => |r| stringCmpCol(l, r, op, n, mask),
-            .char => |r| stringCmpCol(l, r, op, n, mask),
-            .json => |r| stringCmpCol(l, r, op, n, mask),
-            else => unreachable,
-        },
-    }
-    clearNullRows(left.nulls, mask[0..n]);
-    clearNullRows(right.nulls, mask[0..n]);
-}
-
-fn stringCmpCol(l: anytype, r: anytype, op: PredicateOp, n: usize, mask: []bool) void {
-    for (0..n) |i| {
-        const eq = std.mem.eql(u8, l.rowBytes(i), r.rowBytes(i));
-        mask[i] = if (op == .eq) eq else !eq;
     }
 }
 
@@ -2149,4 +2440,42 @@ test "clearNullRows clears exactly the NULL rows across word boundaries" {
     var untouched = [_]bool{ true, false, true };
     clearNullRows(null, &untouched);
     try std.testing.expectEqualSlices(bool, &[_]bool{ true, false, true }, &untouched);
+}
+
+test "textNumber parses what StarRocks compares as a number" {
+    const t = std.testing;
+    const cases = .{
+        .{ "12", ScaledInt{ .m = 12, .s = 0 } },
+        .{ " -1.50 ", ScaledInt{ .m = -150, .s = 2 } },
+        .{ "+.5", ScaledInt{ .m = 5, .s = 1 } },
+        .{ "7.", ScaledInt{ .m = 7, .s = 0 } },
+    };
+    inline for (cases) |c| try t.expectEqual(Scalar{ .decimal = c[1] }, textNumber(c[0]).?);
+    try t.expectEqual(Scalar{ .float = 1500.0 }, textNumber("1.5e3").?);
+    inline for (.{ "", "abc", "12abc", "-", ".", "1e999" }) |bad| try t.expect(textNumber(bad) == null);
+}
+
+test "placeLiteral lands each literal on the column's values" {
+    const t = std.testing;
+    const dec_10_2: types.Type = .{ .decimal64 = .{ .p = 10, .s = 2 } };
+    try t.expectEqual(Value{ .smallint = 2 }, placeLiteral(.{ .bigint = 2 }, .smallint).exact);
+    try t.expectEqual(Value{ .decimal64 = 150 }, placeLiteral(.{ .text = "1.5" }, dec_10_2).exact);
+    try t.expectEqual(Value{ .int = 3 }, placeLiteral(.{ .double = 3.0 }, .int).exact);
+    try t.expectEqual(Value{ .datetime = 19787 * std.time.us_per_day }, placeLiteral(.{ .date = 19787 }, .datetime).exact);
+
+    const between = placeLiteral(.{ .double = 2.5 }, .int).between;
+    try t.expectEqual(Value{ .int = 2 }, between.lo);
+    try t.expectEqual(Value{ .int = 3 }, between.hi);
+    const on_days = placeLiteral(.{ .text = "2024-03-05 10:00:00" }, .date).between;
+    try t.expectEqual(Value{ .date = 19787 }, on_days.lo);
+    try t.expectEqual(Value{ .date = 19788 }, on_days.hi);
+
+    try t.expectEqual(Side.above, placeLiteral(.{ .int = 100000 }, .smallint).beyond);
+    try t.expectEqual(Side.below, placeLiteral(.{ .int = -100000 }, .smallint).beyond);
+    try t.expectEqual(Side.above, placeLiteral(.{ .double = 32767.5 }, .smallint).beyond);
+    try t.expectEqual(Side.below, placeLiteral(.{ .double = -32768.5 }, .smallint).beyond);
+
+    try t.expect(placeLiteral(.{ .text = "12abc" }, .int) == .null_text);
+    try t.expect(placeLiteral(.{ .date = 1 }, .int) == .incomparable);
+    try t.expect(placeLiteral(.{ .bigint = 1 }, .date) == .incomparable);
 }

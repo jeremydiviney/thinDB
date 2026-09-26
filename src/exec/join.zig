@@ -38,6 +38,8 @@ const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 const cast = @import("cast.zig");
+const scalar_fn = @import("scalar_fn.zig");
+const decimal = @import("scalar_fn_decimal.zig");
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
@@ -292,12 +294,28 @@ fn appendJoinKeyCasts(
     right_type: Type,
 ) !void {
     if (!joinKeyCoercionEligible(left_name) and !joinKeyCoercionEligible(right_name)) return;
-    const lt = typeTag(left_type);
-    const rt = typeTag(right_type);
-    if (lt == rt or (isStringTag(lt) and isStringTag(rt))) return;
-    const target = commonJoinKeyTag(lt, rt) orelse return;
-    if (lt != target) try appendCastDerived(aa, left_casts, left_name, target);
-    if (rt != target) try appendCastDerived(aa, right_casts, right_name, target);
+    const target = commonJoinKeyType(left_type, right_type) orelse return;
+    if (!std.meta.eql(left_type, target)) try appendCastDerived(aa, left_casts, left_name, target);
+    if (!std.meta.eql(right_type, target)) try appendCastDerived(aa, right_casts, right_name, target);
+}
+
+/// The type both sides of a join key convert to; null when their stored
+/// values already compare. Decimals meet at the common decimal type, since
+/// mantissas at different scales never match.
+fn commonJoinKeyType(left: Type, right: Type) ?Type {
+    if (left.isDecimal() or right.isDecimal()) {
+        if (std.meta.eql(left, right)) return null;
+        if (left.isFloat() or right.isFloat()) return .double;
+        const spec = decimal.commonSpec(&.{ left, right }) orelse return null;
+        return decimal.decTypeFor(spec.p, spec.s);
+    }
+    const lt = typeTag(left);
+    const rt = typeTag(right);
+    if (lt == rt or (isStringTag(lt) and isStringTag(rt))) return null;
+    const target = commonJoinKeyTag(lt, rt) orelse return null;
+    if (target == lt) return left;
+    if (target == rt) return right;
+    return .string;
 }
 
 fn joinKeyCoercionEligible(name: []const u8) bool {
@@ -309,18 +327,18 @@ fn appendCastDerived(
     aa: Allocator,
     casts: *std.ArrayList(exec.Derived),
     name: []const u8,
-    target: TypeTag,
+    target: Type,
 ) !void {
     for (casts.items) |existing| {
         if (types.columnNameEql(existing.name, name)) return;
     }
-    const fn_name = castFunctionName(target) orelse return;
+    const fn_name = (try scalar_fn.castFnName(aa, target)) orelse return;
     const args = try aa.alloc(exec.Expr, 1);
     args[0] = .{ .col_ref = try aa.dupe(u8, name) };
     try casts.append(aa, .{
         .name = try aa.dupe(u8, name),
         .expr = .{ .call = .{
-            .fn_name = try aa.dupe(u8, fn_name),
+            .fn_name = fn_name,
             .args = args,
         } },
     });
