@@ -722,6 +722,12 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "ltrim", .arg_types = &.{.string}, .return_type = .string, .kernel = string.ltrimKernel },
     .{ .name = "rtrim", .arg_types = &.{.string}, .return_type = .string, .kernel = string.rtrimKernel },
     .{ .name = "trim", .arg_types = &.{.string}, .return_type = .string, .kernel = string.trimKernel },
+    .{ .name = "ltrim", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.ltrimKernel },
+    .{ .name = "rtrim", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.rtrimKernel },
+    .{ .name = "trim", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.trimKernel },
+    .{ .name = "ltrim_substring", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.ltrimSubstringKernel },
+    .{ .name = "rtrim_substring", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.rtrimSubstringKernel },
+    .{ .name = "trim_substring", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.trimSubstringKernel },
     .{ .name = "reverse", .arg_types = &.{.string}, .return_type = .string, .kernel = string.reverseKernel },
     // --- string → int ---
     // length / char_length count UTF-8 characters (DuckDB/standard semantics);
