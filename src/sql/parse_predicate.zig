@@ -661,7 +661,7 @@ fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr
     return try parseColOps(p, anchored);
 }
 
-fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+pub fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const lhs_col = switch (lhs) {
         .col_ref => |c| c,
         else => try p.materializePredicateExpr(lhs),

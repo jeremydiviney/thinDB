@@ -46,6 +46,38 @@ test "CASE WHEN: literal branches, ELSE present" {
     try std.testing.expectEqualStrings("large", batch.values[0].data.string.rowBytes(2));
 }
 
+test "simple CASE compares its operand to each WHEN value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT, s STRING)");
+    try exec(allocator, db, "INSERT INTO t (id, qty, s) VALUES (1, 1, 'a'), (2, 0, 'b'), (3, 5, NULL), (4, NULL, 'a')");
+
+    // A NULL operand matches no WHEN and takes the ELSE.
+    const cases = .{
+        .{ "SELECT CASE qty WHEN 0 THEN id WHEN 1 THEN id * 10 ELSE 0 - id END AS v FROM t ORDER BY id", &[_]i64{ 10, 2, -3, -4 } },
+        .{ "SELECT CASE id % 2 WHEN 0 THEN 100 + id ELSE id END AS v FROM t ORDER BY id", &[_]i64{ 1, 102, 3, 104 } },
+        .{ "SELECT CASE s WHEN 'a' THEN id ELSE 0 - id END AS v FROM t ORDER BY id", &[_]i64{ 1, -2, -3, 4 } },
+        .{ "SELECT COALESCE(CASE qty WHEN 5 THEN id END, 0) AS v FROM t ORDER BY id", &[_]i64{ 0, 0, 3, 0 } },
+        .{ "SELECT SUM(CASE s WHEN 'a' THEN id ELSE 0 END) AS n FROM t", &[_]i64{5} },
+    };
+    inline for (cases) |case| {
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    var q = try runSql(allocator, db, "SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END AS w FROM t ORDER BY id");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    const col = batch.values[0];
+    for ([_][]const u8{ "one", "two", "many", "many" }, 0..) |want, i| {
+        try std.testing.expectEqualStrings(want, col.data.string.rowBytes(i));
+    }
+}
+
 test "CASE WHEN: ELSE-less form emits NULL for unmatched rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
