@@ -245,7 +245,11 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try explainOp(allocator, out, w.upstream.*, depth + 1);
         },
         .set_union => |u| {
-            try out.appendSlice(allocator, if (u.all) "UnionAll\n" else "Union\n");
+            try out.appendSlice(allocator, switch (u.kind) {
+                .@"union" => if (u.all) "UnionAll\n" else "Union\n",
+                .intersect => "Intersect\n",
+                .except => "Except\n",
+            });
             try explainOp(allocator, out, u.left.*, depth + 1);
             try explainOp(allocator, out, u.right.*, depth + 1);
         },
