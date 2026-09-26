@@ -2812,3 +2812,39 @@ test "join: COUNT(*) over a nested-loop join that outputs no columns counts ever
         try std.testing.expectEqualSlices(i64, &.{case[1]}, got);
     }
 }
+
+test "join: parenthesized ON conditions join like the bare conjuncts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)");
+    try helpers.exec(allocator, db, "CREATE TABLE b (bid BIGINT PRIMARY KEY, aid BIGINT NOT NULL, amount BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO b VALUES (1, 1, 5), (2, 1, 50), (3, 2, 7), (4, 3, 70)");
+
+    const cases = .{
+        .{ "SELECT b.bid FROM a JOIN b ON (a.id = b.aid) ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a INNER JOIN b ON (a.id = b.aid AND b.amount > 6) ORDER BY b.bid", &[_]i64{ 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a JOIN b ON (a.id = b.aid) AND (b.amount > 6) ORDER BY b.bid", &[_]i64{ 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a JOIN b ON ((a.id = b.aid) AND b.amount > 6) ORDER BY b.bid", &[_]i64{ 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a JOIN b ON (a.id = b.aid AND (b.amount > 6 AND b.amount < 60)) ORDER BY b.bid", &[_]i64{ 2, 3 } },
+        .{ "SELECT b.bid FROM a JOIN b ON (a.id = b.aid AND b.amount BETWEEN 6 AND 60) ORDER BY b.bid", &[_]i64{ 2, 3 } },
+        .{ "SELECT b.bid FROM a JOIN b ON (b.amount IS NOT NULL AND a.id = b.aid) ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a JOIN b ON (a.id + 1) = (b.aid + 1) ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a JOIN b ON ((a.id + 1) = b.aid + 1) ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT COALESCE(b.bid, 0) AS c FROM a LEFT JOIN b ON (a.id = b.aid AND b.amount > 60) ORDER BY a.id", &[_]i64{ 0, 0, 4 } },
+        .{ "SELECT b.bid FROM a JOIN b ON (a.id = b.aid) JOIN a AS a2 ON (a2.id = b.aid) ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+    };
+    inline for (cases) |case| {
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    try std.testing.expectError(error.SqlOnNonEquiUnsupported, helpers.runSql(allocator, db, "SELECT b.bid FROM a JOIN b ON (a.id = b.aid OR b.amount > 6)"));
+    try std.testing.expectError(error.SqlExpectedToken, helpers.runSql(allocator, db, "SELECT b.bid FROM a JOIN b ON (a.id = b.aid"));
+}
