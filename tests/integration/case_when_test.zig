@@ -15,6 +15,7 @@ const thindb = @import("thindb");
 const helpers = @import("sql_helpers.zig");
 const runSql = helpers.runSql;
 const exec = helpers.exec;
+const collectBigints = helpers.collectBigints;
 
 test "CASE WHEN: literal branches, ELSE present" {
     const allocator = std.testing.allocator;
@@ -355,5 +356,87 @@ test "CASE WHEN: nullable column branches beside literal branches" {
         try std.testing.expect(col.isValid(2));
         try std.testing.expectEqual(@as(i32, 0), col.data.int[2]);
         try std.testing.expect(!col.isValid(3));
+    }
+}
+
+/// Each row's first column as 1 or 0, or -1 where it is NULL.
+fn collectTruth(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i64 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(i64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        const col = batch.values[0];
+        for (0..batch.row_count) |i| {
+            try out.append(allocator, if (col.isValid(i)) col.data.boolean[i] else -1);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "predicates read as values: TRUE, FALSE, or NULL where unknown" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT, big BIGINT NOT NULL, s STRING)");
+    try exec(allocator, db, "INSERT INTO t (id, qty, big, s) VALUES (1, 1, 1, 'apple'), (2, 0, 0, 'banana'), (3, 5, 5, NULL), (4, NULL, 0, 'avocado'), (5, 2, 2, 'cherry')");
+    try exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT NOT NULL, amount INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO o (oid, tid, amount) VALUES (1, 1, 5), (2, 1, 7), (3, 3, 9)");
+
+    const truth_cases = .{
+        .{ "SELECT qty > 1 AS f FROM t ORDER BY id", &[_]i64{ 0, 0, 1, -1, 1 } },
+        .{ "SELECT qty > 1 FROM t ORDER BY id", &[_]i64{ 0, 0, 1, -1, 1 } },
+        .{ "SELECT (qty > 1) AS f FROM t ORDER BY id", &[_]i64{ 0, 0, 1, -1, 1 } },
+        .{ "SELECT id = big AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 0, 0, 0 } },
+        .{ "SELECT id IN (1, 3) AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 1, 0, 0 } },
+        .{ "SELECT id NOT IN (1, 3) AS f FROM t ORDER BY id", &[_]i64{ 0, 1, 0, 1, 1 } },
+        .{ "SELECT qty BETWEEN 1 AND 2 AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 0, -1, 1 } },
+        .{ "SELECT qty IS NULL AS f FROM t ORDER BY id", &[_]i64{ 0, 0, 0, 1, 0 } },
+        .{ "SELECT qty > 0 AND big < 5 AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 0, -1, 1 } },
+        .{ "SELECT qty > 0 OR big = 0 AS f FROM t ORDER BY id", &[_]i64{ 1, 1, 1, 1, 1 } },
+        .{ "SELECT NOT (qty > 0) AS f FROM t ORDER BY id", &[_]i64{ 0, 1, 0, -1, 0 } },
+        .{ "SELECT s LIKE 'a%' AS f FROM t ORDER BY id", &[_]i64{ 1, 0, -1, 1, 0 } },
+        .{ "SELECT COALESCE(qty > 1, FALSE) AS f FROM t ORDER BY id", &[_]i64{ 0, 0, 1, 0, 1 } },
+        .{ "SELECT id IN (SELECT tid FROM o) AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 1, 0, 0 } },
+        .{ "SELECT EXISTS (SELECT 1 FROM o WHERE o.tid = t.id) AS f FROM t ORDER BY id", &[_]i64{ 1, 0, 1, 0, 0 } },
+        .{ "SELECT NOT EXISTS (SELECT 1 FROM o WHERE o.tid = t.id) AS f FROM t ORDER BY id", &[_]i64{ 0, 1, 0, 1, 1 } },
+        .{ "SELECT COUNT(*) > 4 AS f FROM t", &[_]i64{1} },
+        .{ "SELECT SUM(amount) > 10 AS f FROM o GROUP BY tid ORDER BY tid", &[_]i64{ 1, 0 } },
+    };
+    inline for (truth_cases) |case| {
+        const got = try collectTruth(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    const bigint_cases = .{
+        .{ "SELECT SUM(qty > 0) AS n FROM t", &[_]i64{3} },
+        .{ "SELECT SUM(qty > 0 AND big > 1) AS n FROM t", &[_]i64{2} },
+        // Call arguments and BETWEEN bounds in WHERE keep parsing as values.
+        .{ "SELECT id FROM t WHERE COALESCE(qty, 0) > 1 ORDER BY id", &[_]i64{ 3, 5 } },
+        .{ "SELECT id FROM t WHERE big BETWEEN ABS(0 - 1) AND 5 ORDER BY id", &[_]i64{ 1, 3, 5 } },
+    };
+    inline for (bigint_cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    // An unaliased predicate is named by its text, as MySQL names it.
+    {
+        var q = try runSql(allocator, db, "SELECT qty > 1, id IN (1, 3) FROM t");
+        defer q.deinit();
+        const schema = q.outputSchema();
+        try std.testing.expectEqualStrings("qty > 1", schema[0].name);
+        try std.testing.expectEqualStrings("id IN (1, 3)", schema[1].name);
+    }
+    // On the MySQL wire `||` is OR.
+    {
+        var q = try helpers.runSqlMysql(allocator, db, "SELECT qty > 1 || big = 0 AS f FROM t ORDER BY id");
+        defer q.deinit();
+        const batch = (try q.next()).?;
+        try std.testing.expectEqualSlices(u8, &.{ 0, 1, 1, 1, 1 }, batch.values[0].data.boolean[0..batch.row_count]);
     }
 }
