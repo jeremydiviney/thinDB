@@ -572,7 +572,8 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
         return PE.SqlInvalidProjection;
     }
     const has_pk = inline_pk != null or table_pk != null;
-    // Exactly one key clause: PRIMARY KEY (unique) or ORDER BY (non-unique).
+    // At most one key clause: PRIMARY KEY (unique) or ORDER BY (non-unique).
+    // With neither, the table orders by its first column, as CTAS does.
     if (has_pk and sort_key != null) return PE.SqlInvalidProjection;
     const unique = has_pk;
     const order_key: []const []const u8 = if (table_pk) |tpk|
@@ -585,8 +586,11 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
         sk
     else if (dist_key) |dk|
         dk
-    else
-        return PE.SqlInvalidProjection;
+    else if (cols.items.len > 0) blk: {
+        const one = try p.arena.alloc([]const u8, 1);
+        one[0] = cols.items[0].name;
+        break :blk one;
+    } else return PE.SqlInvalidProjection;
 
     const owned_cols = try p.arena.alloc(ir.ColumnDef, cols.items.len);
     for (cols.items, 0..) |c, i| owned_cols[i] = c;
