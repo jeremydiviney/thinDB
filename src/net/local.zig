@@ -800,6 +800,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .col = try aa.dupe(u8, s.col),
                 .values = vals,
                 .negate = s.negate,
+                .value_type = s.value_type,
             } };
         },
         .correlated_set => |s| blk: {
@@ -815,6 +816,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .outer_cols = outer_cols,
                 .rows = rows,
                 .negate = s.negate,
+                .inner_types = try aa.dupe(types.Type, s.inner_types),
             } };
         },
         .correlated_scalar => |s| blk: {
@@ -833,6 +835,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .outer_keys = outer_keys,
                 .rows = rows,
                 .value_type = s.value_type,
+                .key_types = try aa.dupe(types.Type, s.key_types),
             } };
         },
         .correlated_range => |s| blk: {
@@ -856,6 +859,8 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .op_upper = s.op_upper,
                 .groups = groups,
                 .negate = s.negate,
+                .key_types = try aa.dupe(types.Type, s.key_types),
+                .range_type = s.range_type,
             } };
         },
         .@"and" => |children| PredicateExpr{ .@"and" = try cloneChildren(aa, children) },
