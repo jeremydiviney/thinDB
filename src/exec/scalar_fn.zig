@@ -742,6 +742,10 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "nullif", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = cond.nullifIntKernel },
     .{ .name = "nullif", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = cond.nullifBigintKernel },
     .{ .name = "nullif", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = cond.nullifStringKernel },
+    .{ .name = "nullif", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = cond.nullifDoubleKernel },
+    .{ .name = "nullif", .arg_types = &.{ .boolean, .boolean }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = cond.nullifBooleanKernel },
+    .{ .name = "nullif", .arg_types = &.{ .date, .date }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = cond.nullifDateKernel },
+    .{ .name = "nullif", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = cond.nullifDatetimeKernel },
     // --- date/time component extractors ---
     // NB: now() / current_date() are deferred — Zig 0.16's std.Io.Clock
     // needs an Io instance; kernel signature doesn't carry one yet.

@@ -1986,6 +1986,7 @@ fn buildCallPlan(
     if (coerce_literals and try coerceTemporalStringLiterals(runtime_allocator, c.fn_name, arg_plans, arg_types)) {
         r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     }
+    if (r == null) r = try resolveWithTypedNulls(runtime_allocator, aa, udf_registry, c.fn_name, arg_plans, arg_types);
     const rr = r orelse return Error.ComputeNoSuchOverload;
 
     // Cast scratch buffers (one per coerced arg).
@@ -2070,6 +2071,43 @@ fn literalDivisorNonzero(aa: Allocator, runtime_allocator: Allocator, rr: scalar
 /// Also called when the call resolved to an explicit text parse
 /// (`CAST(text AS DATE)`): over a literal that parse is a constant, so doing
 /// it here keeps the call a non-null constant rather than a per-row parse.
+/// A NULL literal carries only a placeholder type, so a call no overload
+/// accepts as written retries with its NULL arguments retyped to each
+/// sibling argument's type in turn (`COALESCE(NULL, x)`, `x + NULL`).
+fn resolveWithTypedNulls(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+    fn_name: []const u8,
+    arg_plans: []ArgPlan,
+    arg_types: []Type,
+) !?scalar_fn.ResolvedOverload {
+    var any_null = false;
+    for (arg_plans) |ap| any_null = any_null or ap == .null_lit;
+    if (!any_null) return null;
+    const tried = try aa.alloc(Type, arg_types.len);
+    var tried_len: usize = 0;
+    candidates: for (arg_plans, arg_types) |ap, candidate| {
+        if (ap == .null_lit) continue;
+        for (tried[0..tried_len]) |t| if (std.meta.eql(t, candidate)) continue :candidates;
+        tried[tried_len] = candidate;
+        tried_len += 1;
+        const retyped = try aa.dupe(Type, arg_types);
+        for (arg_plans, retyped) |p, *t| {
+            if (p == .null_lit) t.* = candidate;
+        }
+        const r = try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, retyped) orelse continue;
+        for (arg_plans, arg_types) |p, *t| {
+            if (p != .null_lit) continue;
+            replaceBuf(runtime_allocator, &p.null_lit.buf, try ColumnStore.init(runtime_allocator, candidate, true));
+            p.null_lit.ty = candidate;
+            t.* = candidate;
+        }
+        return r;
+    }
+    return null;
+}
+
 fn coerceTemporalStringLiterals(
     runtime_allocator: Allocator,
     fn_name: []const u8,
