@@ -38,6 +38,7 @@ const Batch = exec.Batch;
 const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 const cast = @import("cast.zig");
+const Compute = @import("compute.zig").Compute;
 const scalar_fn = @import("scalar_fn.zig");
 const decimal = @import("scalar_fn_decimal.zig");
 
@@ -232,6 +233,13 @@ pub const OpaquePredicate = struct {
 const NormalizedJoinInputs = struct {
     left: Query,
     right: Query,
+
+    /// Frees the key conversions laid over `left` and `right`, which stay
+    /// their caller's.
+    fn unwind(self: NormalizedJoinInputs, left: Query, right: Query) void {
+        Compute.deinitLayersOver(self.left, left);
+        Compute.deinitLayersOver(self.right, right);
+    }
 };
 
 fn normalizeJoinKeyTypes(
@@ -278,6 +286,7 @@ fn normalizeJoinKeyTypes(
     if (left_casts.items.len > 0) {
         left_out = try left_out.compute(try left_casts.toOwnedSlice(aa));
     }
+    errdefer Compute.deinitLayersOver(left_out, left);
     if (right_casts.items.len > 0) {
         right_out = try right_out.compute(try right_casts.toOwnedSlice(aa));
     }
@@ -1180,6 +1189,8 @@ pub const Join = struct {
         defer coerce_arena.deinit();
         const coerce_aa = coerce_arena.allocator();
         const normalized = try normalizeJoinKeyTypes(coerce_aa, left, right, spec);
+        // On failure the caller still owns `left` and `right`.
+        errdefer normalized.unwind(left, right);
         const left_in = normalized.left;
         const right_in = normalized.right;
 
