@@ -234,3 +234,26 @@ test "durability: an original the committed swap failed to delete stays gone aft
     try std.testing.expect(moved.schema.columnIndex("note") != null);
     try expectIds(a, moved, &.{7});
 }
+
+test "durability: a refused RENAME TABLE leaves the table usable under its name" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "moving" };
+    defer fault.threaded.deinit();
+    const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
+    defer db.close();
+    const table = try db.table("moving", alter_test_table, .{ .order_key = &.{"id"} });
+    try table.insert(&.{.{ .id = @as(i64, 7) }});
+    try table.flush();
+    try expectIds(a, table, &.{7});
+    fault.rename_failures = std.math.maxInt(usize);
+    try std.testing.expectError(error.AccessDenied, db.renameTable("moving", "moved"));
+    try std.testing.expectEqualStrings("moving", table.name);
+    try table.insert(&.{.{ .id = @as(i64, 8) }});
+    try table.flush();
+    try expectIds(a, table, &.{ 7, 8 });
+    fault.rename_failures = 0;
+    try db.renameTable("moving", "moved");
+    try expectIds(a, try db.openTable("moved", .{}), &.{ 7, 8 });
+}

@@ -495,26 +495,15 @@ pub const Schema = struct {
         // Cached segment handles hold their files open too; scans reopen them
         // from the renamed directory.
         t.seg_handles.clear(t.allocator);
+        // A refused rename moved nothing, so the table reopens where it stands.
+        storage.retryTransientWindowsRefusal(self.io, Io.Dir.rename, .{ self.schema_dir, old_name, self.schema_dir, new_name, self.io }) catch |err| {
+            self.reopenTableDirs(t, old_name, had_wal) catch t.requireRecovery();
+            return err;
+        };
         // Same contract as execAlter's swap: a failure here leaves the table
         // without directory handles, so fence it until reopen.
         errdefer t.requireRecovery();
-
-        try storage.retryTransientWindowsRefusal(self.io, Io.Dir.rename, .{ self.schema_dir, old_name, self.schema_dir, new_name, self.io });
-
-        t.table_dir = try self.schema_dir.openDir(self.io, new_name, .{});
-        t.segments_dir = t.table_dir.openDir(t.io, "segments", .{}) catch |err| {
-            t.table_dir.close(t.io);
-            return err;
-        };
-        t.dirs_open = true;
-        if (had_wal) {
-            t.wal = try @import("../engine/engine.zig").wal.WalWriter.create(
-                t.allocator,
-                t.io,
-                t.table_dir,
-                t.schema_fingerprint,
-            );
-        }
+        try self.reopenTableDirs(t, new_name, had_wal);
 
         const new_owned = try self.allocator.dupe(u8, new_name);
         const old_owned = t.name;
@@ -524,6 +513,23 @@ pub const Schema = struct {
         try self.tables.put(t.name, t);
 
         self.allocator.free(old_owned);
+    }
+
+    fn reopenTableDirs(self: *Schema, t: *Table, name: []const u8, recreate_wal: bool) !void {
+        t.table_dir = try self.schema_dir.openDir(self.io, name, .{});
+        t.segments_dir = t.table_dir.openDir(t.io, "segments", .{}) catch |err| {
+            t.table_dir.close(t.io);
+            return err;
+        };
+        t.dirs_open = true;
+        if (recreate_wal) {
+            t.wal = try @import("../engine/engine.zig").wal.WalWriter.create(
+                t.allocator,
+                t.io,
+                t.table_dir,
+                t.schema_fingerprint,
+            );
+        }
     }
 
     /// List the names of every table in this schema. Caller frees the
