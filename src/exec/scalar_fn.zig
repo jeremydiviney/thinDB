@@ -875,6 +875,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "second", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.secondKernel },
     // --- date arithmetic + epoch conversion ---
     .{ .name = "datediff", .arg_types = &.{ .date, .date }, .return_type = .int, .kernel = date.datediffKernel },
+    .{ .name = "datediff", .arg_types = &.{ .datetime, .datetime }, .return_type = .int, .kernel = date.datediffDatetimeKernel },
     .{ .name = "date_add", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddKernel },
     .{ .name = "date_sub", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateSubKernel },
     // Calendar-aware month/year addition; clamps day on short destination
