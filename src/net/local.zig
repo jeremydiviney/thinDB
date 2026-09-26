@@ -1055,6 +1055,9 @@ pub const CompileCtx = struct {
     /// Number of shared V2 stages the staged compiler produced (the V2
     /// analogue of `materialized.count()`). Tests assert the sum of both.
     stage_count: u32 = 0,
+    /// Correlated scalar subqueries lowered to LEFT JOINs so far; numbers
+    /// each one's join alias so no two collide in one statement.
+    lowered_scalars: u32 = 0,
     /// Strings duplicated into `allocator` to back Session updates from
     /// `USE` statements. Freed at `deinit`.
     session_strings: std.ArrayListUnmanaged([]u8) = .empty,

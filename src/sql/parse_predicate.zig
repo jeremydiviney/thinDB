@@ -601,12 +601,15 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
     // scalar comparison: parseAddSub dispatches CASE, and no predicate
     // grammar accepts a CASE-led paren group, so this only widens parses.
     var case_start = false;
+    // `(SELECT ...) = 0` likewise: a subquery-led group is a scalar operand.
+    var subquery_start = false;
     var first_tok = true;
     while (true) {
         const tok = try look.next();
         if (first_tok) {
             first_tok = false;
             case_start = tok.tag == .kw_case;
+            subquery_start = tok.tag == .kw_select or tok.tag == .kw_with;
         }
         switch (tok.tag) {
             .eof => return false,
@@ -626,7 +629,7 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
     // operand whatever it holds: no predicate grammar continues a boolean
     // group with arithmetic.
     if (isArithToken(op_tok.tag)) return true;
-    if (!saw_arithmetic and !case_start) return false;
+    if (!saw_arithmetic and !case_start and !subquery_start) return false;
     return isComparisonToken(op_tok.tag) or switch (op_tok.tag) {
         // `(expr) BETWEEN/IN/IS/LIKE/NOT ...` — the group anchors to a
         // hidden computed column and takes the normal operator tail.
@@ -636,10 +639,16 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
 }
 
 fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
-    try p.expect(.lparen);
-    const group = try p.parseAddSub();
-    try p.expect(.rparen);
-    const lhs = try p.continueBinaryFrom(group);
+    var look = p.lex.*;
+    const first = try look.next();
+    const lhs = if (first.tag == .kw_select or first.tag == .kw_with)
+        try p.parseAddSub()
+    else blk: {
+        try p.expect(.lparen);
+        const group = try p.parseAddSub();
+        try p.expect(.rparen);
+        break :blk try p.continueBinaryFrom(group);
+    };
     if (isComparisonToken(p.cur.tag)) {
         const op = try parseComparisonToken(p);
         const rhs = try p.parseAddSub();

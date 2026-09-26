@@ -65,27 +65,32 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .alias => |a| try resolveSubqueriesInOp(ctx, @constCast(a.upstream)),
         .table_fn => |t| for (t.inputs) |inp| try resolveSubqueriesInOp(ctx, inp),
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
-        .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value),
+        .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value, null),
         .delete_op => |*d| {
             if (d.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
-            for (d.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr));
+            for (d.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
         },
         .update_op => |*u| {
             if (u.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
-            for (u.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr));
-            for (u.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value));
+            for (u.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
+            for (u.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
         },
         .limit => |l| try resolveSubqueriesInOp(ctx, @constCast(l.upstream)),
         .select, .exclude => |p| try resolveSubqueriesInOp(ctx, @constCast(p.upstream)),
-        .filter => |*f| {
-            try resolveSubqueriesInPredicate(ctx, &f.predicate);
-            try resolveSubqueriesInOp(ctx, @constCast(f.upstream));
-        },
+        .filter => try resolveFilterSubqueries(ctx, op),
         .order_by => |o| try resolveSubqueriesInOp(ctx, @constCast(o.upstream)),
         .group_by => |g| try resolveSubqueriesInOp(ctx, @constCast(g.upstream)),
         .compute => |c| {
-            for (c.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr));
+            var lowered: LoweredScalars = .{};
+            for (c.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), &lowered);
             try resolveSubqueriesInOp(ctx, @constCast(c.upstream));
+            if (lowered.joins.items.len > 0) {
+                const compute = try newOp(ctx, .{ .compute = .{
+                    .derived = c.derived,
+                    .upstream = try joinLoweredScalars(ctx, @constCast(c.upstream), lowered),
+                } });
+                op.* = .{ .exclude = .{ .columns = lowered.hidden.items, .upstream = compute } };
+            }
         },
         .join => |*j| {
             if (j.extra_predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
@@ -97,7 +102,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .window => |w| {
             // Window-call args carry `@var` offsets/defaults (`LAG(x, @n, 0)`);
             // resolve them to literals before the operator reads them.
-            for (w.calls) |c| for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg));
+            for (w.calls) |c| for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg), null);
             try resolveSubqueriesInOp(ctx, @constCast(w.upstream));
         },
         .set_union => |u| {
@@ -160,7 +165,9 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
     }
 }
 
-fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
+/// `lowered` collects the correlated scalar subqueries of a Compute's
+/// expressions for the LEFT JOIN lowering; null elsewhere.
+fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScalars) anyerror!void {
     switch (e.*) {
         .col_ref, .lit, .null_lit => {},
         .var_ref => |name| {
@@ -194,16 +201,21 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr) anyerror!void {
                     return;
                 }
             }
-            for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg));
+            for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg), lowered);
         },
         .case => |cs| {
             for (cs.branches) |*br| {
+                if (lowered) |l| try lowerPredicateScalars(ctx, @constCast(&br.cond), l);
                 try resolveSubqueriesInPredicate(ctx, @constCast(&br.cond));
-                try resolveSubqueriesInExpr(ctx, @constCast(&br.then));
+                try resolveSubqueriesInExpr(ctx, @constCast(&br.then), lowered);
             }
-            if (cs.else_branch) |eb| try resolveSubqueriesInExpr(ctx, @constCast(eb));
+            if (cs.else_branch) |eb| try resolveSubqueriesInExpr(ctx, @constCast(eb), lowered);
         },
         .scalar_subquery => |opaque_ptr| {
+            if (lowered) |l| if (try lowerCorrelatedScalar(ctx, opaque_ptr, l)) |value| {
+                e.* = .{ .col_ref = value };
+                return;
+            };
             const val = try runScalarSubquery(ctx, opaque_ptr);
             e.* = .{ .lit = val };
         },
@@ -888,6 +900,215 @@ fn innerSelectedColumn(inner: *const ir.Op) ?[]const u8 {
 }
 
 // =============================================================================
+// Correlated scalar subqueries in a Compute or Filter — LEFT JOIN lowering.
+// =============================================================================
+
+/// A scalar subquery that is one global aggregate over `Filter(Scan)` or
+/// `Scan`, with its WHERE conjuncts sorted into correlations and kept
+/// predicates. Caller owns `info`.
+const ScalarAggregate = struct {
+    agg: ir.AggSpec,
+    info: CorrelationInfo,
+};
+
+fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAggregate {
+    var cur: *const ir.Op = @ptrCast(@alignCast(source));
+    while (true) {
+        switch (cur.*) {
+            .select, .exclude => |p| cur = p.upstream,
+            .group_by => break,
+            else => return null,
+        }
+    }
+    const gb = cur.group_by;
+    if (gb.aggs.len != 1 or gb.group_cols.len != 0) return null;
+
+    var filter_pred: ?PredicateExpr = null;
+    const scan_op: *const ir.Op.Scan = switch (gb.upstream.*) {
+        .filter => |*f| blk: {
+            filter_pred = f.predicate;
+            break :blk switch (f.upstream.*) {
+                .scan => |*s| s,
+                else => return null,
+            };
+        },
+        .scan => |*s| s,
+        else => return null,
+    };
+    const catalog = local.catalogFor(ctx.db) orelse return null;
+    const t = local.resolveTable(catalog, ctx.session.*, scan_op.table) catch return null;
+
+    var info = CorrelationInfo.init();
+    errdefer info.deinit(ctx.allocator);
+    info.scan = scan_op;
+    if (filter_pred) |p| try collectConjuncts(ctx, p, t.schema, rangeName(scan_op), &info);
+    return .{ .agg = gb.aggs[0], .info = info };
+}
+
+/// The correlated scalar subqueries lowered out of one Compute or Filter.
+/// Each becomes a LEFT JOIN against its inner aggregate grouped by the
+/// correlation keys: one row per key, so the join never repeats an outer
+/// row, and an outer row with no inner rows misses the join. Above the
+/// joins, each subquery reads as one value column.
+const LoweredScalars = struct {
+    joins: std.ArrayList(LoweredJoin) = .empty,
+    values: std.ArrayList(ir.Derived) = .empty,
+    /// Join-side and value columns, dropped once the operator has read them.
+    hidden: std.ArrayList([]const u8) = .empty,
+};
+
+const LoweredJoin = struct {
+    on: []const ir.JoinKeyPair,
+    right: *ir.Op,
+};
+
+fn newOp(ctx: *CompileCtx, value: ir.Op) !*ir.Op {
+    const op = try ctx.nodeArena().create(ir.Op);
+    op.* = value;
+    return op;
+}
+
+fn conjunction(ctx: *CompileCtx, preds: []const PredicateExpr) !PredicateExpr {
+    if (preds.len == 1) return preds[0];
+    return .{ .@"and" = try ctx.nodeArena().dupe(PredicateExpr, preds) };
+}
+
+/// Lower a correlated global-aggregate subquery into `lowered`, returning the
+/// column its value reads as; null leaves any other shape to the other paths.
+fn lowerCorrelatedScalar(ctx: *CompileCtx, source: *const anyopaque, lowered: *LoweredScalars) !?[]const u8 {
+    var shape = (try analyzeScalarAggregate(ctx, source)) orelse return null;
+    defer shape.info.deinit(ctx.allocator);
+    const info = &shape.info;
+    if (info.outer_cols.items.len == 0 or info.range_corrs.items.len > 0) return null;
+
+    const na = ctx.nodeArena();
+    const alias = try std.fmt.allocPrint(na, "__csq{d}", .{ctx.lowered_scalars});
+    ctx.lowered_scalars += 1;
+
+    var inner = try newOp(ctx, .{ .scan = info.scan.?.* });
+    if (info.kept_predicates.items.len > 0) {
+        inner = try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, info.kept_predicates.items), .upstream = inner } });
+    }
+    const aggs = try na.alloc(ir.AggSpec, 1);
+    aggs[0] = shape.agg;
+    aggs[0].as = "__csq_agg";
+    inner = try newOp(ctx, .{ .group_by = .{
+        .group_cols = try na.dupe([]const u8, info.inner_cols.items),
+        .aggs = aggs,
+        .upstream = inner,
+    } });
+
+    // Output names no outer column shares, so a bare outer ref never
+    // suffix-matches a join-side column.
+    const n_keys = info.inner_cols.items.len;
+    const columns = try na.alloc([]const u8, n_keys + 1);
+    const outputs = try na.alloc(?[]const u8, n_keys + 1);
+    const on = try na.alloc(ir.JoinKeyPair, n_keys);
+    for (info.inner_cols.items, info.outer_cols.items, 0..) |inner_col, outer_col, i| {
+        columns[i] = inner_col;
+        outputs[i] = try std.fmt.allocPrint(na, "__csq_k{d}", .{i});
+        on[i] = .{ .left = outer_col, .right = try std.fmt.allocPrint(na, "{s}.__csq_k{d}", .{ alias, i }) };
+        try lowered.hidden.append(na, on[i].right);
+    }
+    columns[n_keys] = aggs[0].as;
+    outputs[n_keys] = "__csq_v";
+    inner = try newOp(ctx, .{ .select = .{ .columns = columns, .outputs = outputs, .upstream = inner } });
+    inner = try newOp(ctx, .{ .materialize = .{ .upstream = inner, .structural_cse = true } });
+    const right = try newOp(ctx, .{ .alias = .{ .alias = alias, .upstream = inner } });
+    try resolveSubqueriesInOp(ctx, right);
+
+    const agg_col = try std.fmt.allocPrint(na, "{s}.__csq_v", .{alias});
+    const value = try std.fmt.allocPrint(na, "{s}_value", .{alias});
+    try lowered.hidden.append(na, agg_col);
+    try lowered.hidden.append(na, value);
+    try lowered.joins.append(na, .{ .on = on, .right = right });
+    try lowered.values.append(na, .{ .name = value, .expr = try missedJoinValue(ctx, shape.agg.func, agg_col) });
+    return value;
+}
+
+/// An outer row that misses the join reads the aggregate over zero rows:
+/// 0 for the counts, NULL for everything else.
+fn missedJoinValue(ctx: *CompileCtx, func: ir.AggFunc, agg_col: []const u8) !ir.Expr {
+    return switch (func) {
+        .count, .count_if, .count_distinct => blk: {
+            const args = try ctx.nodeArena().alloc(ir.Expr, 2);
+            args[0] = .{ .col_ref = agg_col };
+            args[1] = .{ .lit = .{ .bigint = 0 } };
+            break :blk .{ .call = .{ .fn_name = "coalesce", .args = args } };
+        },
+        else => .{ .col_ref = agg_col },
+    };
+}
+
+/// `input` LEFT JOINed with each lowered subquery, value columns on top.
+fn joinLoweredScalars(ctx: *CompileCtx, input: *ir.Op, lowered: LoweredScalars) !*ir.Op {
+    var left = input;
+    for (lowered.joins.items) |j| {
+        left = try newOp(ctx, .{ .join = .{
+            .algorithm = .auto,
+            .join_type = .left,
+            .on = j.on,
+            .ranges = &.{},
+            .extra_predicate = null,
+            .skew_ratio_threshold = 0.3,
+            .skew_absolute_threshold = 20_000,
+            .skew_sample_interval = 10,
+            .left = left,
+            .right = j.right,
+        } });
+    }
+    return newOp(ctx, .{ .compute = .{ .derived = lowered.values.items, .upstream = left } });
+}
+
+/// Rewrite each correlated `col op (scalar subquery)` in `pred` into a
+/// comparison against the lowered subquery's value column.
+fn lowerPredicateScalars(ctx: *CompileCtx, pred: *PredicateExpr, lowered: *LoweredScalars) anyerror!void {
+    switch (pred.*) {
+        .scalar_subquery => |sq| if (try lowerCorrelatedScalar(ctx, sq.source, lowered)) |value| {
+            pred.* = .{ .leaf_col_col = .{ .left = sq.col, .op = sq.op, .right = value } };
+        },
+        .@"and", .@"or" => |children| for (children) |*c| try lowerPredicateScalars(ctx, @constCast(c), lowered),
+        .not => |child| try lowerPredicateScalars(ctx, @constCast(child), lowered),
+        else => {},
+    }
+}
+
+/// A Filter whose conjuncts read correlated scalar subqueries evaluates them
+/// above the lowered joins; its other conjuncts stay below, where they still
+/// narrow the scan.
+fn resolveFilterSubqueries(ctx: *CompileCtx, op: *ir.Op) !void {
+    const f = op.filter;
+    const conjuncts = switch (f.predicate) {
+        .@"and" => |children| try ctx.nodeArena().dupe(PredicateExpr, children),
+        else => try ctx.nodeArena().dupe(PredicateExpr, &.{f.predicate}),
+    };
+    var lowered: LoweredScalars = .{};
+    var above: std.ArrayList(PredicateExpr) = .empty;
+    var below: std.ArrayList(PredicateExpr) = .empty;
+    for (conjuncts) |*c| {
+        const joins_before = lowered.joins.items.len;
+        try lowerPredicateScalars(ctx, c, &lowered);
+        try resolveSubqueriesInPredicate(ctx, c);
+        const side = if (lowered.joins.items.len > joins_before) &above else &below;
+        try side.append(ctx.nodeArena(), c.*);
+    }
+    try resolveSubqueriesInOp(ctx, @constCast(f.upstream));
+    if (lowered.joins.items.len == 0) {
+        op.filter.predicate = try conjunction(ctx, below.items);
+        return;
+    }
+    var input: *ir.Op = @constCast(f.upstream);
+    if (below.items.len > 0) {
+        input = try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, below.items), .upstream = input } });
+    }
+    const upper = try newOp(ctx, .{ .filter = .{
+        .predicate = try conjunction(ctx, above.items),
+        .upstream = try joinLoweredScalars(ctx, input, lowered),
+    } });
+    op.* = .{ .exclude = .{ .columns = lowered.hidden.items, .upstream = upper } };
+}
+
+// =============================================================================
 // Correlated scalar subquery.
 // =============================================================================
 
@@ -898,46 +1119,10 @@ fn innerSelectedColumn(inner: *const ir.Op) ?[]const u8 {
 /// predicates, and materialize key_tuple → agg_value. Returns true
 /// when correlated and pred.* was rewritten.
 fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anytype) !bool {
-    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(sq.source)));
-
-    // Walk through Select/Project layers to find a GroupBy.
-    var cur: *const ir.Op = inner;
-    while (true) {
-        switch (cur.*) {
-            .select, .exclude => |p| cur = p.upstream,
-            .group_by, .filter, .scan => break,
-            else => return false,
-        }
-    }
-    if (cur.* != .group_by) return false;
-
-    const gb = cur.group_by;
-    if (gb.aggs.len != 1) return false;
-    if (gb.group_cols.len != 0) return false; // already-grouped → unsupported v1
-
-    // Find the Filter + Scan beneath the GroupBy.
-    var filter_pred: ?PredicateExpr = null;
-    var scan_op: *const ir.Op.Scan = undefined;
-    switch (gb.upstream.*) {
-        .filter => |*f| {
-            filter_pred = f.predicate;
-            switch (f.upstream.*) {
-                .scan => |*s| scan_op = s,
-                else => return false,
-            }
-        },
-        .scan => |*s| scan_op = s,
-        else => return false,
-    }
-
-    const catalog = local.catalogFor(ctx.db) orelse return false;
-    const t = local.resolveTable(catalog, ctx.session.*, scan_op.table) catch return false;
-    const inner_schema = t.schema;
-
-    var info = CorrelationInfo.init();
-    defer info.deinit(ctx.allocator);
-    info.scan = scan_op;
-    if (filter_pred) |p| try collectConjuncts(ctx, p, inner_schema, rangeName(scan_op), &info);
+    var shape = (try analyzeScalarAggregate(ctx, sq.source)) orelse return false;
+    defer shape.info.deinit(ctx.allocator);
+    const info = &shape.info;
+    const scan_op = info.scan.?;
     if (info.outer_cols.items.len == 0) return false;
     // Range correlation in scalar subquery context isn't supported
     // yet — the materialized agg can't be keyed by an open-ended
@@ -970,7 +1155,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
     const group_cols = try aa.alloc([]const u8, info.inner_cols.items.len);
     for (info.inner_cols.items, group_cols) |c, *dst| dst.* = c;
     const aggs = try aa.alloc(ir.AggSpec, 1);
-    aggs[0] = gb.aggs[0];
+    aggs[0] = shape.agg;
     const gb_new = try aa.create(ir.Op);
     gb_new.* = .{ .group_by = .{
         .group_cols = group_cols,

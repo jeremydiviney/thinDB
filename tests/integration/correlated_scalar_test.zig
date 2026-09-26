@@ -121,3 +121,54 @@ test "correlated scalar: equality comparison" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{2}, ids);
 }
+
+test "correlated scalar: compared in WHERE and read in the SELECT list, by one LEFT JOIN" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL, big BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (id, qty, big) VALUES (1, 1, 1), (2, 0, 0), (3, 5, 5), (4, 0, 0), (5, 2, 2)");
+    try exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT NOT NULL, amount INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO o (oid, tid, amount) VALUES (1, 1, 5), (2, 1, 7), (3, 3, 9)");
+
+    // Per t.id: COUNT over o = {2, 0, 1, 0, 0}; MAX(amount) = {7, NULL, 9, NULL, NULL}.
+    const cases = .{
+        // An INT or BIGINT outer column against a BIGINT COUNT, where a key
+        // with no inner rows counts 0.
+        .{ "SELECT id FROM t WHERE qty > (SELECT COUNT(*) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 3, 5 } },
+        .{ "SELECT id FROM t WHERE big > (SELECT COUNT(*) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 3, 5 } },
+        .{ "SELECT id FROM t WHERE big = (SELECT COUNT(*) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 2, 4 } },
+        // A key with no inner rows reads MAX as NULL, which matches nothing.
+        .{ "SELECT id FROM t WHERE qty < (SELECT MAX(amount) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE big < (SELECT MAX(amount) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE id <= 3 AND big >= (SELECT COUNT(*) FROM o WHERE tid = id) ORDER BY id", &[_]i64{ 2, 3 } },
+        .{ "SELECT id FROM t WHERE big = (SELECT COUNT(*) FROM o WHERE tid = id AND amount > 6) ORDER BY id", &[_]i64{ 1, 2, 4 } },
+        .{ "SELECT (SELECT COUNT(*) FROM o WHERE tid = id) AS n FROM t ORDER BY id", &[_]i64{ 2, 0, 1, 0, 0 } },
+        .{ "SELECT id * 100 + (SELECT COUNT(*) FROM o WHERE tid = id) AS v FROM t ORDER BY id", &[_]i64{ 102, 200, 301, 400, 500 } },
+        .{ "SELECT x.id * 100 + (SELECT COUNT(*) FROM o p WHERE p.tid = x.id) AS v FROM t x ORDER BY x.id", &[_]i64{ 102, 200, 301, 400, 500 } },
+        .{ "SELECT COALESCE((SELECT MAX(big) FROM t t2 WHERE t2.id = o.tid), 0) AS m FROM o ORDER BY oid", &[_]i64{ 1, 1, 5 } },
+        .{ "SELECT id + (SELECT COUNT(*) FROM o WHERE tid = id) + (SELECT COUNT(*) FROM o WHERE tid = id AND amount > 6) AS n FROM t ORDER BY id", &[_]i64{ 4, 2, 5, 4, 5 } },
+        .{ "SELECT CASE WHEN big > (SELECT COUNT(*) FROM o WHERE tid = id) THEN id ELSE 0 END AS c FROM t ORDER BY id", &[_]i64{ 0, 0, 3, 0, 5 } },
+        .{ "SELECT (SELECT COUNT(*) FROM o WHERE tid = id) AS n FROM t GROUP BY id ORDER BY n", &[_]i64{ 0, 0, 0, 1, 2 } },
+        .{ "SELECT id FROM t WHERE (SELECT COUNT(*) FROM o WHERE tid = id) = 0 ORDER BY id", &[_]i64{ 2, 4, 5 } },
+        .{ "SELECT id FROM t WHERE (SELECT COUNT(*) FROM o WHERE tid = id) > 0 ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE (SELECT MAX(amount) FROM o) > big * 2 ORDER BY id", &[_]i64{ 1, 2, 4, 5 } },
+        // Correlation refs qualified by the table names rather than aliases.
+        .{ "SELECT t.id FROM t WHERE t.big = (SELECT COUNT(*) FROM o WHERE o.tid = t.id) ORDER BY t.id", &[_]i64{ 2, 4 } },
+        .{ "SELECT (SELECT COUNT(*) FROM o WHERE o.tid = t.id) AS n FROM t ORDER BY t.id", &[_]i64{ 2, 0, 1, 0, 0 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    // The join's key and value columns never reach the output.
+    var q = try runSql(allocator, db, "SELECT *, (SELECT COUNT(*) FROM o WHERE tid = id) AS n FROM t ORDER BY id");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 4), batch.values.len);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 0, 1, 0, 0 }, batch.values[3].data.bigint[0..batch.row_count]);
+}
