@@ -392,3 +392,100 @@ test "alterTable: rejects duplicate column name on add" {
         .{ .add = .{ .name = "qty", .type = .int, .default = .{ .int = 0 } } },
     }));
 }
+
+// ---------------------------------------------------------------------------
+// ALTER swap recovery
+// ---------------------------------------------------------------------------
+
+const add_note: thindb.AlterOp = .{ .add = .{ .name = "note", .type = .bigint, .nullable = true } };
+
+/// Leave `orders` under the original schema and `altered` holding the same
+/// rows after `add_note`: the two trees an ALTER of `orders` swaps.
+fn seedAlterTrees(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
+    var db = try thindb.Database.open(allocator, io, dir, .{});
+    defer db.close();
+    inline for (.{ "orders", "altered" }) |name| {
+        const t = try db.table(name, schema_v1, opts_v1);
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
+            .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
+        });
+        try t.flush();
+    }
+    try db.alterTable("altered", &.{add_note});
+}
+
+fn expectNoSwapDirectories(io: std.Io, dir: std.Io.Dir) !void {
+    var public = try dir.openDir(io, "main/public", .{ .iterate = true });
+    defer public.close(io);
+    var it = public.iterate();
+    while (try it.next(io)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.name, "__alter_"));
+}
+
+test "alterTable: a schema reopening mid-swap restores the table whole" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Move = struct { []const u8, []const u8 };
+    // Each case leaves the directories an ALTER of `orders` stopped at one
+    // step would, then reopens. `note` says which schema must come back.
+    const cases = .{
+        // Crashed writing the shadow, before its manifest.
+        .{ .moves = &[_]Move{.{ "altered", "__alter_new_orders" }}, .drop_manifest = "__alter_new_orders", .drop_tree = "", .note = false },
+        // Shadow complete, original not yet set aside.
+        .{ .moves = &[_]Move{.{ "altered", "__alter_new_orders" }}, .drop_manifest = "", .drop_tree = "", .note = false },
+        // Original set aside, shadow not yet renamed in: rolls back.
+        .{ .moves = &[_]Move{ .{ "orders", "__alter_old_orders" }, .{ "altered", "__alter_new_orders" } }, .drop_manifest = "", .drop_tree = "", .note = false },
+        // Committed, original not yet deleted.
+        .{ .moves = &[_]Move{ .{ "orders", "__alter_old_orders" }, .{ "altered", "orders" } }, .drop_manifest = "", .drop_tree = "", .note = true },
+        // The swap before the aside step, stopped between its delete and rename.
+        .{ .moves = &[_]Move{.{ "altered", "__alter_orders" }}, .drop_manifest = "", .drop_tree = "orders", .note = true },
+        // That swap's incomplete shadow beside the table.
+        .{ .moves = &[_]Move{.{ "altered", "__alter_orders" }}, .drop_manifest = "__alter_orders", .drop_tree = "", .note = false },
+    };
+    inline for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try seedAlterTrees(allocator, io, tmp.dir);
+        var public = try tmp.dir.openDir(io, "main/public", .{});
+        if (c.drop_tree.len > 0) try public.deleteTree(io, c.drop_tree);
+        for (c.moves) |m| try std.Io.Dir.rename(public, m[0], public, m[1], io);
+        if (c.drop_manifest.len > 0) {
+            var shadow = try public.openDir(io, c.drop_manifest, .{});
+            defer shadow.close(io);
+            try shadow.deleteFile(io, "manifest");
+        }
+        public.close(io);
+
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.openTable("orders", .{});
+        try std.testing.expectEqual(c.note, t.schema.columnIndex("note") != null);
+        try expectLiveRows(allocator, t, &.{ .{ .id = 1, .qty = 10 }, .{ .id = 2, .qty = 20 } });
+        const names = try db.schema("public").?.listTables(allocator);
+        defer {
+            for (names) |name| allocator.free(name);
+            allocator.free(names);
+        }
+        try std.testing.expectEqual(@as(usize, 1), names.len);
+        try std.testing.expectEqualStrings("orders", names[0]);
+        try expectNoSwapDirectories(io, tmp.dir);
+    }
+}
+
+test "alterTable: swap directory names are reserved" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try db.table("orders", schema_v1, opts_v1);
+
+    try std.testing.expectError(thindb.Error.ReservedTableName, db.table("__alter_new_orders", schema_v1, opts_v1));
+    try std.testing.expectError(thindb.Error.ReservedTableName, db.renameTable("orders", "__alter_old_orders"));
+    try std.testing.expectError(thindb.Error.TableNotFound, db.openTable("__alter_new_orders", .{}));
+    try std.testing.expectError(thindb.Error.TableNotFound, db.dropTable("__alter_new_orders"));
+    try std.testing.expectError(thindb.Error.TableNotFound, db.renameTable("__alter_new_orders", "shadow"));
+}

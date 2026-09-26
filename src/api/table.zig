@@ -179,7 +179,7 @@ pub const Table = struct {
         var table_dir = try parent_dir.createDirPathOpen(io, name, .{});
         errdefer table_dir.close(io);
 
-        var schema_owner = try acquireSchema(allocator, io, table_dir, maybe_schema);
+        var schema_owner = try acquireSchema(allocator, io, table_dir, maybe_schema, cfg.sync_mode != .none);
         errdefer schema_owner.deinit();
         const schema = schema_owner.view();
 
@@ -1188,6 +1188,7 @@ fn acquireSchema(
     io: Io,
     table_dir: Io.Dir,
     maybe_schema: ?TableSchema,
+    durable: bool,
 ) !storage.schema_file.SchemaOwner {
     if (storage.schema_file.readSchema(allocator, io, table_dir)) |loaded| {
         if (maybe_schema) |s| {
@@ -1204,7 +1205,7 @@ fn acquireSchema(
             try s.validate();
             var owner = try storage.schema_file.SchemaOwner.clone(allocator, s);
             errdefer owner.deinit();
-            try storage.schema_file.writeSchema(io, table_dir, s, allocator);
+            try storage.schema_file.writeSchema(io, table_dir, s, allocator, durable);
             return owner;
         },
         else => return err,

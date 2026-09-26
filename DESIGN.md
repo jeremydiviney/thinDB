@@ -200,7 +200,8 @@ Result precisions exceeding 38 are clamped to 38, with overflow → error rather
     segments/
       <seg_id>.dat                 ← immutable segment file
       <seg_id>.tomb                ← tombstones for that segment (sparse, append-only)
-    __alter_<ts>_<table_name>/     ← shadow directory used by ALTER TABLE (transient)
+  __alter_new_<table_name>/        ← ALTER TABLE's rewritten table before the swap (transient)
+  __alter_old_<table_name>/        ← the original, set aside during the swap (transient)
 ```
 
 `<seg_id>` is a monotonically increasing u64. `.tomb` files are absent until the first delete that hits that segment.
@@ -808,7 +809,15 @@ try db.renameTable("orders", "orders_v2");
 try db.dropTable("orders_v2");
 ```
 
-`ALTER TABLE` is implemented as orchestrated copy-and-swap: create shadow, stream rows through projection, atomic directory rename. Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over.
+`ALTER TABLE` is implemented as orchestrated copy-and-swap:
+1. Build the rewritten table in a shadow directory, `__alter_new_<name>`, writing its manifest last.
+2. Set the original aside as `__alter_old_<name>`.
+3. Rename the shadow into place. This rename commits the swap.
+4. Delete the original.
+
+Each rename is followed by a directory sync. When a schema opens, it resolves any swap that a crash or a persistent refusal interrupted. Before the commit, it puts the original back. After the commit, it deletes what is left over. DROP TABLE and RENAME TABLE delete an original that a committed swap failed to delete, so the next open can't restore it under the old name. Names starting `__alter_` are reserved: no table can be created or renamed under one, and none is listed or opened.
+
+Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over.
 
 ### 9.3 Inserts
 
@@ -912,7 +921,7 @@ TableNotFound, TableAlreadyExists, ColumnNotFound,
 ColumnAlreadyExists, UnsupportedAlterOp,
 FunctionAlreadyExists, FunctionInvalidDefinition,
 WalOrphaned, XaBranchTooLarge, XaInvalidXid,
-DatabaseInUse, TableBusy, RecoveryRequired, DurabilityUncertain, DatabaseClosed,
+DatabaseInUse, TableBusy, ReservedTableName, RecoveryRequired, DurabilityUncertain, DatabaseClosed,
 ```
 
 `WalOrphaned`: a `wal` file sits inside the table's `segments/` directory. Replay only reads the log beside the manifest, so that file holds acknowledged rows a normal open would silently drop; the table refuses to open until an operator moves the log into place (same schema fingerprint) or aside.
@@ -937,6 +946,8 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 `ArithmeticOverflow` comes from decimal arithmetic and casts that leave the declared precision, and from `SUM(LARGEINT)` past the i128 range. Integer arithmetic and integer `SUM` up to BIGINT wrap instead of raising it (§3.4).
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
+
+`ReservedTableName` rejects creating or renaming a table under the `__alter_` prefix, which ALTER TABLE's swap directories use (§9.2).
 
 `DatabaseInUse` means another catalog owns the root's OS lock. `TableBusy` rejects an unsafe same-thread upgrade from a live query lease to destructive DDL. `DatabaseClosed` rejects new operations during close. `DurabilityUncertain` means a file replacement succeeded but parent-directory sync failed. The affected table/catalog is fenced at the persistence boundary, before releasing the mutation lock; queued writers recheck that state after acquiring the table lock. `RecoveryRequired` means that publication or an XA persistence/rollback outcome requires restart recovery; operations are rejected until reopening resolves the journal. XA admission rejects records exceeding its 64 MiB serialized recovery limit (`XaBranchTooLarge`) or invalid XIDs (`XaInvalidXid`, at most 1024 bytes).
 

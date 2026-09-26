@@ -26,6 +26,7 @@ const schemaFingerprint = api.schemaFingerprint;
 const snapshot = @import("../util/snapshot.zig");
 const StatementGate = @import("../util/statement_gate.zig").StatementGate;
 const compact = @import("compact.zig");
+const alter = @import("alter.zig");
 
 /// How a background sweep finds a schema again. Between tables a sweep holds
 /// no statement lease, so a DROP SCHEMA or DROP DATABASE may free the schema
@@ -107,6 +108,7 @@ pub const Schema = struct {
             var d = schema_dir;
             d.close(io);
         }
+        try alter.recoverInterruptedAlters(allocator, io, schema_dir);
 
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
@@ -307,6 +309,7 @@ pub const Schema = struct {
         const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
         defer if (statement_lease) |lease| lease.release();
         try table_schema.validate();
+        if (alter.isReservedTableName(name)) return Error.ReservedTableName;
 
         self.tables_mutex.lockUncancelable(self.io);
         defer self.tables_mutex.unlock(self.io);
@@ -340,6 +343,7 @@ pub const Schema = struct {
         name: []const u8,
         options: OpenOptions,
     ) !*Table {
+        if (alter.isReservedTableName(name)) return Error.TableNotFound;
         const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
         defer if (statement_lease) |lease| lease.release();
         self.tables_mutex.lockUncancelable(self.io);
@@ -379,6 +383,7 @@ pub const Schema = struct {
     /// any in-flight scans to finish (via the table's exclusive ddl_lock),
     /// then closes and deletes the directory tree from disk.
     pub fn dropTable(self: *Schema, name: []const u8) !void {
+        if (alter.isReservedTableName(name)) return Error.TableNotFound;
         const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
         defer if (statement_lease) |lease| lease.release();
         const owned_name = try self.allocator.dupe(u8, name);
@@ -415,6 +420,9 @@ pub const Schema = struct {
             probe.close(self.io);
         }
 
+        // An original an ALTER set aside but failed to delete goes first:
+        // the next open would otherwise put it back under the dropped name.
+        try alter.deleteAlterLeftovers(self.io, self.schema_dir, owned_name);
         try self.schema_dir.deleteTree(self.io, owned_name);
     }
 
@@ -430,12 +438,14 @@ pub const Schema = struct {
         };
         self.tables_mutex.unlock(self.io);
 
-        try @import("alter.zig").execAlter(self, t, ops);
+        try alter.execAlter(self, t, ops);
     }
 
     /// Rename a table. Renames the on-disk directory, updates the in-memory
     /// map key, and updates the Table's internal name string.
     pub fn renameTable(self: *Schema, old_name: []const u8, new_name: []const u8) !void {
+        if (alter.isReservedTableName(old_name)) return Error.TableNotFound;
+        if (alter.isReservedTableName(new_name)) return Error.ReservedTableName;
         const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
         defer if (statement_lease) |lease| lease.release();
         self.tables_mutex.lockUncancelable(self.io);
@@ -461,6 +471,12 @@ pub const Schema = struct {
         defer t.ddl_lock.unlock(t.io);
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
+        // A fenced table may own no directory handles, or have no directory
+        // under its name.
+        try t.ensureUsable();
+        // As in dropTable: an original left set aside would come back under
+        // the old name at the next open.
+        try alter.deleteAlterLeftovers(self.io, self.schema_dir, old_name);
 
         // The WAL file lives inside table_dir and Windows refuses to
         // rename a directory containing open handles. Flush residue so
@@ -476,26 +492,18 @@ pub const Schema = struct {
         t.segments_dir.close(t.io);
         t.table_dir.close(t.io);
         t.dirs_open = false;
+        // Cached segment handles hold their files open too; scans reopen them
+        // from the renamed directory.
+        t.seg_handles.clear(t.allocator);
+        // A refused rename moved nothing, so the table reopens where it stands.
+        storage.retryTransientWindowsRefusal(self.io, Io.Dir.rename, .{ self.schema_dir, old_name, self.schema_dir, new_name, self.io }) catch |err| {
+            self.reopenTableDirs(t, old_name, had_wal) catch t.requireRecovery();
+            return err;
+        };
         // Same contract as execAlter's swap: a failure here leaves the table
         // without directory handles, so fence it until reopen.
         errdefer t.requireRecovery();
-
-        try storage.retryTransientWindowsRefusal(self.io, Io.Dir.rename, .{ self.schema_dir, old_name, self.schema_dir, new_name, self.io });
-
-        t.table_dir = try self.schema_dir.openDir(self.io, new_name, .{});
-        t.segments_dir = t.table_dir.openDir(t.io, "segments", .{}) catch |err| {
-            t.table_dir.close(t.io);
-            return err;
-        };
-        t.dirs_open = true;
-        if (had_wal) {
-            t.wal = try @import("../engine/engine.zig").wal.WalWriter.create(
-                t.allocator,
-                t.io,
-                t.table_dir,
-                t.schema_fingerprint,
-            );
-        }
+        try self.reopenTableDirs(t, new_name, had_wal);
 
         const new_owned = try self.allocator.dupe(u8, new_name);
         const old_owned = t.name;
@@ -505,6 +513,23 @@ pub const Schema = struct {
         try self.tables.put(t.name, t);
 
         self.allocator.free(old_owned);
+    }
+
+    fn reopenTableDirs(self: *Schema, t: *Table, name: []const u8, recreate_wal: bool) !void {
+        t.table_dir = try self.schema_dir.openDir(self.io, name, .{});
+        t.segments_dir = t.table_dir.openDir(t.io, "segments", .{}) catch |err| {
+            t.table_dir.close(t.io);
+            return err;
+        };
+        t.dirs_open = true;
+        if (recreate_wal) {
+            t.wal = try @import("../engine/engine.zig").wal.WalWriter.create(
+                t.allocator,
+                t.io,
+                t.table_dir,
+                t.schema_fingerprint,
+            );
+        }
     }
 
     /// List the names of every table in this schema. Caller frees the
@@ -528,7 +553,7 @@ pub const Schema = struct {
 
         var dir_it = self.schema_dir.iterate();
         while (try dir_it.next(self.io)) |entry| {
-            if (entry.kind != .directory) continue;
+            if (entry.kind != .directory or alter.isReservedTableName(entry.name)) continue;
             if (ownedNameListContains(out_list.items, entry.name)) continue;
             if (!self.diskTableExists(entry.name)) continue;
             try out_list.append(allocator, try allocator.dupe(u8, entry.name));
