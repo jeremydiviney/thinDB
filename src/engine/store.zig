@@ -198,6 +198,15 @@ pub const ColumnStore = struct {
         return initCapacity(allocator, t, nullable, 0, 0);
     }
 
+    /// An empty store of `v`'s physical type, for rows copied out of a
+    /// view whose declared type isn't at hand.
+    pub fn initLike(allocator: Allocator, v: ColumnView, nullable: bool) Allocator.Error!ColumnStore {
+        return .{
+            .data = try DataStore.initTag(allocator, std.meta.activeTag(v.data)),
+            .nulls = if (nullable) .empty else null,
+        };
+    }
+
     pub fn initCapacity(
         allocator: Allocator,
         t: Type,
@@ -441,6 +450,24 @@ pub const ColumnStore = struct {
     }
 };
 
+/// Append rows [start,end) of `v` onto `dst`, validity included, as slice
+/// copies rather than per-value appends.
+pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start: usize, end: usize) !void {
+    switch (v.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+            try @field(dst.data, @tagName(tag)).appendSlice(alloc, s[start..end]);
+        },
+        .varchar, .string, .char, .json => |sv| switch (dst.data) {
+            .varchar, .string, .char, .json => |*d| try d.appendRange(alloc, sv, start, end),
+            else => unreachable,
+        },
+    }
+    if (dst.nulls != null) {
+        const base = dst.rowCount() - (end - start);
+        try dst.appendValidityRangeFrom(alloc, base, v.nulls, start, end - start);
+    }
+}
+
 pub fn setBitRangeTrue(bytes: []u8, start: usize, n: usize) void {
     var i = start;
     const end = start + n;
@@ -561,6 +588,16 @@ pub const DataStore = union(TypeTag) {
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return initCapacity(allocator, t, 0, 0);
+    }
+
+    pub fn initTag(allocator: Allocator, tag: TypeTag) Allocator.Error!DataStore {
+        return switch (tag) {
+            inline else => |t| @unionInit(
+                DataStore,
+                @tagName(t),
+                if (@FieldType(DataStore, @tagName(t)) == StringStore) try StringStore.init(allocator) else .empty,
+            ),
+        };
     }
 
     pub fn initCapacity(
