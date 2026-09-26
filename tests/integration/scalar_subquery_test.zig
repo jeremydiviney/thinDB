@@ -162,3 +162,28 @@ test "scalar subquery: multi-column error" {
         try std.testing.expectEqual(thindb.net.Error.BadRequest, err);
     }
 }
+
+test "scalar subquery: a statement constant beside an aggregate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT NOT NULL, amount INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO o (oid, tid, amount) VALUES (1, 1, 5), (2, 1, 7), (3, 3, 9)");
+
+    const cases = .{
+        .{ "SELECT COUNT(*) + (SELECT COUNT(*) FROM o) AS n FROM t", &[_]i64{8} },
+        .{ "SELECT (SELECT COUNT(*) FROM o) * COUNT(*) AS n FROM t", &[_]i64{15} },
+        .{ "SELECT COUNT(*) AS n, (SELECT MAX(amount) FROM o) AS m FROM t", &[_]i64{5} },
+        .{ "SELECT SUM(qty) - (SELECT MAX(amount) FROM o) AS d FROM t GROUP BY id ORDER BY d", &[_]i64{ 1, 11, 21, 31, 41 } },
+        .{ "SELECT COUNT(*) + COALESCE(@never_set, 7) AS n FROM t", &[_]i64{12} },
+        .{ "SELECT CASE WHEN EXISTS (SELECT 1 FROM o WHERE amount > 8) THEN COUNT(*) ELSE 0 END AS n FROM t", &[_]i64{5} },
+        .{ "SELECT CASE WHEN id IN (SELECT tid FROM o) THEN SUM(qty) ELSE 0 END AS s FROM t GROUP BY id ORDER BY s", &[_]i64{ 0, 0, 0, 10, 30 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}

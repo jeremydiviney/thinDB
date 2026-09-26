@@ -4668,6 +4668,10 @@ fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8, extra_col
     return switch (e) {
         .lit => true,
         .null_lit => true,
+        // Statement constants: a session variable, and a subquery the
+        // pre-compile pass runs once. A correlated subquery still resolves
+        // against the grouped output, so it may name only grouped columns.
+        .var_ref, .scalar_subquery, .exists_subquery => true,
         .col_ref => |name| groupedOutputNameAvailable(name, group_cols, extra_cols),
         .call => |c| blk: {
             if (isNondeterministicFn(c.fn_name)) break :blk false;
@@ -4686,7 +4690,6 @@ fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8, extra_col
             }
             break :blk true;
         },
-        else => false,
     };
 }
 
@@ -4708,7 +4711,9 @@ fn predicateAvailableAfterGroup(p: PredicateExpr, group_cols: []const []const u8
             break :blk true;
         },
         .not => |child| predicateAvailableAfterGroup(child.*, group_cols, extra_cols),
-        .always, .unknown => true,
+        .always, .unknown, .exists_subquery => true,
+        .scalar_subquery => |sq| groupedOutputNameAvailable(sq.col, group_cols, extra_cols),
+        .in_subquery => |sq| groupedOutputNameAvailable(sq.col, group_cols, extra_cols),
         else => false,
     };
 }
