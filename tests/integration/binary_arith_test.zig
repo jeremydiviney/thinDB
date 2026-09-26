@@ -9,6 +9,7 @@
 //!   - the natural "delta" pattern from the LAG bench
 //!   - `/`, DIV and MOD by zero return NULL
 //!   - integer result types and wrapping match StarRocks (DESIGN.md §3.4)
+//!   - scientific-notation and leading-dot literals are DOUBLE
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -320,4 +321,40 @@ test "binary arith: integer result types and wrapping match StarRocks" {
             try std.testing.expectEqual(c[2], try firstIntValue(&q));
         }
     }
+}
+
+test "binary arith: scientific-notation and leading-dot literals are DOUBLE" {
+    // MySQL, StarRocks and DuckDB read `1e3` and `.5` as DOUBLE literals;
+    // thinDB read `1e3` as `1 AS e3`.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+    try helpers.exec(allocator, db, "INSERT INTO t VALUES (4, 10, 2.5E-3), (5, 50, .5e1)");
+
+    const cases = .{
+        .{ "SELECT 1e3 FROM t WHERE id = 1", 1000.0 },
+        .{ "SELECT -2.5E-3 FROM t WHERE id = 1", -0.0025 },
+        .{ "SELECT 1e0 - 1e0 FROM t WHERE id = 1", 0.0 },
+        .{ "SELECT 6.02e+23 FROM t WHERE id = 1", 6.02e23 },
+        .{ "SELECT .5 + price FROM t WHERE id = 1", 2.0 },
+        .{ "SELECT price * 1e2 FROM t WHERE id = 1", 150.0 },
+        .{ "SELECT price FROM t WHERE price < 1e-2", 0.0025 },
+        .{ "SELECT price FROM t WHERE qty = 2e1", 2.5 },
+        .{ "SELECT price FROM t WHERE id = 5", 5.0 },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        try std.testing.expectEqual(thindb.types.TypeTag.double, std.meta.activeTag(q.outputSchema()[0].type));
+        const got = try collectDouble(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectApproxEqRel(@as(f64, c[1]), got[0], 1e-12);
+    }
+
+    try helpers.expectRunError(allocator, db, "SELECT 1e400 FROM t", error.LexInvalidNumber);
 }

@@ -124,6 +124,10 @@ wrapping ops. LARGEINT operands stay LARGEINT. A widened result passed to a
 function's narrower integer parameter narrows back, as in StarRocks (see
 implicit type coercion).
 
+A numeric literal with a fraction or an exponent is DOUBLE: `1.5`, `.5`,
+`1e3`, `2.5E-3`, `6.02e+23`. This matches MySQL, StarRocks and DuckDB. A
+literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
+
 Known difference: StarRocks returns LARGEINT for `ABS(BIGINT)`, so
 `ABS(BIGINT_MIN)` is `9223372036854775808` there. thinDB keeps BIGINT, which
 wraps to `BIGINT_MIN`.
