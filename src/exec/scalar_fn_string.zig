@@ -121,12 +121,56 @@ pub fn charLengthKernel(allocator: Allocator, args: []const ColumnView, out: *Co
     const sv = stringViewOf(args[0]);
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        var n: usize = 0;
-        for (sv.rowBytes(i)) |b| {
-            if (b & 0xC0 != 0x80) n += 1;
-        }
-        try out.data.int.append(allocator, @intCast(n));
+        try out.data.int.append(allocator, @intCast(charCount(sv.rowBytes(i))));
     }
+}
+
+// Every function that takes or returns a position counts UTF-8 characters,
+// as MySQL, StarRocks and DuckDB do, so it never splits a multi-byte one.
+
+fn isCharStart(b: u8) bool {
+    return b & 0xC0 != 0x80;
+}
+
+/// Characters in UTF-8 `s`: every byte but a 0b10xxxxxx continuation byte
+/// starts one, so a malformed byte still counts once.
+fn charCount(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |b| n += @intFromBool(isCharStart(b));
+    return n;
+}
+
+/// Byte offset where character `k` of `s` starts, or `s.len` when `s`
+/// has `k` characters or fewer.
+fn charOffset(s: []const u8, k: usize) usize {
+    if (k == 0) return 0;
+    var seen: usize = 0;
+    for (s, 0..) |b, j| {
+        if (!isCharStart(b)) continue;
+        if (seen == k) return j;
+        seen += 1;
+    }
+    return s.len;
+}
+
+/// Characters [start, end) of `s`.
+fn charSlice(s: []const u8, start: usize, end: usize) []const u8 {
+    const rest = s[charOffset(s, start)..];
+    return rest[0..charOffset(rest, end - start)];
+}
+
+/// The character at byte `j` of `s`, through its continuation bytes.
+fn charAt(s: []const u8, j: usize) []const u8 {
+    var end = j + 1;
+    while (end < s.len and !isCharStart(s[end])) end += 1;
+    return s[j..end];
+}
+
+/// 1-based character position of the first `needle` in `hay` at or after
+/// byte `from`, or 0. An empty needle is found where the search starts.
+fn findChars(hay: []const u8, needle: []const u8, from: usize) i32 {
+    const idx = std.mem.indexOfPos(u8, hay, from, needle) orelse return 0;
+    return @intCast(charCount(hay[0..idx]) + 1);
 }
 
 pub fn ltrimKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -175,7 +219,15 @@ pub fn reverseKernel(allocator: Allocator, args: []const ColumnView, out: *Colum
         const src = sv.rowBytes(i);
         const dst = try allocator.alloc(u8, src.len);
         defer allocator.free(dst);
-        for (src, 0..) |b, j| dst[src.len - 1 - j] = b;
+        var end = src.len;
+        var written: usize = 0;
+        while (end > 0) {
+            var start = end - 1;
+            while (start > 0 and !isCharStart(src[start])) start -= 1;
+            @memcpy(dst[written..][0 .. end - start], src[start..end]);
+            written += end - start;
+            end = start;
+        }
         try ss.appendValue(allocator, dst);
     }
 }
@@ -226,37 +278,27 @@ pub fn concatNKernel(allocator: Allocator, args: []const ColumnView, out: *Colum
 /// MySQL-style substring: 1-indexed start; negative start counts from
 /// end; length < 0 → empty string. Out-of-range returns empty string
 /// rather than erroring (matches MySQL).
+/// SUBSTRING(s, pos[, len]), with or without the length.
 pub fn substringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     const starts = args[1].data.int;
-    const lens = args[2].data.int;
+    const lens: ?[]const i32 = if (args.len > 2) args[2].data.int else null;
     const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const src = sv.rowBytes(i);
-        const start_raw = starts[i];
-        const len_raw = lens[i];
-        if (len_raw <= 0 or src.len == 0) {
-            try ss.appendValue(allocator, "");
-            continue;
-        }
-        const src_len_i: i64 = @intCast(src.len);
-        var start_0: i64 = if (start_raw > 0)
-            @as(i64, start_raw) - 1
-        else if (start_raw < 0)
-            src_len_i + @as(i64, start_raw)
-        else
-            0;
-        if (start_0 < 0) start_0 = 0;
-        if (start_0 >= src_len_i) {
-            try ss.appendValue(allocator, "");
-            continue;
-        }
-        const end_0 = @min(start_0 + @as(i64, len_raw), src_len_i);
-        const start_u: usize = @intCast(start_0);
-        const end_u: usize = @intCast(end_0);
-        try ss.appendValue(allocator, src[start_u..end_u]);
+    for (0..row_count) |i| {
+        try ss.appendValue(allocator, substringChars(sv.rowBytes(i), starts[i], if (lens) |l| l[i] else null));
     }
+}
+
+/// MySQL's and StarRocks' SUBSTRING: `pos` counts from 1, or back from the
+/// end when negative; position 0, a position outside `s` or a length
+/// below 1 gives ''.
+fn substringChars(s: []const u8, pos: i32, len: ?i32) []const u8 {
+    const n: i64 = @intCast(charCount(s));
+    if (pos == 0 or pos > n or -@as(i64, pos) > n) return "";
+    const start: i64 = if (pos > 0) pos - 1 else n + pos;
+    const count: i64 = len orelse n;
+    if (count <= 0) return "";
+    return charSlice(s, @intCast(start), @intCast(@min(start + count, n)));
 }
 
 /// MySQL REPLACE(haystack, needle, replacement). Empty needle leaves
@@ -555,7 +597,7 @@ pub fn leftKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     while (i < row_count) : (i += 1) {
         const src = sv.rowBytes(i);
         const n: usize = if (ns[i] <= 0) 0 else @intCast(ns[i]);
-        try ss.appendValue(allocator, src[0..@min(src.len, n)]);
+        try ss.appendValue(allocator, src[0..charOffset(src, n)]);
     }
 }
 
@@ -567,8 +609,8 @@ pub fn rightKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
     while (i < row_count) : (i += 1) {
         const src = sv.rowBytes(i);
         const n: usize = if (ns[i] <= 0) 0 else @intCast(ns[i]);
-        const take = @min(src.len, n);
-        try ss.appendValue(allocator, src[src.len - take ..]);
+        const count = charCount(src);
+        try ss.appendValue(allocator, src[charOffset(src, count - @min(count, n))..]);
     }
 }
 
@@ -783,15 +825,30 @@ pub fn translateKernel(allocator: Allocator, args: []const ColumnView, out: *Col
         const from = from_sv.rowBytes(i);
         const to = to_sv.rowBytes(i);
         scratch.clearRetainingCapacity();
-        for (src) |b| {
-            if (std.mem.indexOfScalar(u8, from, b)) |idx| {
-                if (idx < to.len) try scratch.append(allocator, to[idx]);
+        var j: usize = 0;
+        while (j < src.len) {
+            const ch = charAt(src, j);
+            j += ch.len;
+            if (charIndex(from, ch)) |k| {
+                try scratch.appendSlice(allocator, charSlice(to, k, k + 1));
             } else {
-                try scratch.append(allocator, b);
+                try scratch.appendSlice(allocator, ch);
             }
         }
         try ss.appendValue(allocator, scratch.items);
     }
+}
+
+/// Character index of the first `ch` in `s`.
+fn charIndex(s: []const u8, ch: []const u8) ?usize {
+    var k: usize = 0;
+    var j: usize = 0;
+    while (j < s.len) : (k += 1) {
+        const c = charAt(s, j);
+        if (std.mem.eql(u8, c, ch)) return k;
+        j += c.len;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -801,59 +858,39 @@ pub fn translateKernel(allocator: Allocator, args: []const ColumnView, out: *Col
 // ---------------------------------------------------------------------------
 
 pub fn lpadKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
-    const lens = args[1].data.int;
-    const pad_sv = stringViewOf(args[2]);
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const src = sv.rowBytes(i);
-        const target_len_i32 = lens[i];
-        const pad = pad_sv.rowBytes(i);
-        if (target_len_i32 <= 0 or pad.len == 0) {
-            try ss.appendValue(allocator, src[0..@min(src.len, @as(usize, @intCast(@max(target_len_i32, 0))))]);
-            continue;
-        }
-        const target_len: usize = @intCast(target_len_i32);
-        if (src.len >= target_len) {
-            try ss.appendValue(allocator, src[0..target_len]);
-            continue;
-        }
-        var buf = try allocator.alloc(u8, target_len);
-        defer allocator.free(buf);
-        const pad_needed = target_len - src.len;
-        var written: usize = 0;
-        while (written < pad_needed) : (written += 1) buf[written] = pad[written % pad.len];
-        @memcpy(buf[pad_needed..], src);
-        try ss.appendValue(allocator, buf);
-    }
+    try padKernel(allocator, args, out, row_count, .left);
 }
 
 pub fn rpadKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try padKernel(allocator, args, out, row_count, .right);
+}
+
+/// LPAD / RPAD(s, len, pad): `s` cut or padded to `len` characters, the
+/// pad repeating as needed. An empty pad leaves a short `s` as it is.
+fn padKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, side: enum { left, right }) !void {
     const sv = stringViewOf(args[0]);
     const lens = args[1].data.int;
     const pad_sv = stringViewOf(args[2]);
     const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
         const src = sv.rowBytes(i);
-        const target_len_i32 = lens[i];
         const pad = pad_sv.rowBytes(i);
-        if (target_len_i32 <= 0 or pad.len == 0) {
-            try ss.appendValue(allocator, src[0..@min(src.len, @as(usize, @intCast(@max(target_len_i32, 0))))]);
+        const target: usize = @intCast(@max(lens[i], 0));
+        const src_chars = charCount(src);
+        if (src_chars >= target or pad.len == 0) {
+            try ss.appendValue(allocator, charSlice(src, 0, @min(src_chars, target)));
             continue;
         }
-        const target_len: usize = @intCast(target_len_i32);
-        if (src.len >= target_len) {
-            try ss.appendValue(allocator, src[0..target_len]);
-            continue;
-        }
-        var buf = try allocator.alloc(u8, target_len);
-        defer allocator.free(buf);
-        @memcpy(buf[0..src.len], src);
-        var j: usize = src.len;
-        while (j < target_len) : (j += 1) buf[j] = pad[(j - src.len) % pad.len];
-        try ss.appendValue(allocator, buf);
+        const needed = target - src_chars;
+        const pad_chars = charCount(pad);
+        buf.clearRetainingCapacity();
+        if (side == .right) try buf.appendSlice(allocator, src);
+        for (0..needed / pad_chars) |_| try buf.appendSlice(allocator, pad);
+        try buf.appendSlice(allocator, charSlice(pad, 0, needed % pad_chars));
+        if (side == .left) try buf.appendSlice(allocator, src);
+        try ss.appendValue(allocator, buf.items);
     }
 }
 
@@ -908,30 +945,37 @@ pub fn asciiKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
     }
 }
 
-/// 1-based offset of `needle` in `haystack`, or 0 if absent. Matches MySQL /
-/// StarRocks / DuckDB. An empty needle returns 1 (consistent with most engines).
+/// POSITION(needle IN haystack) / LOCATE(needle, haystack): the 1-based
+/// character position of `needle`, or 0 if absent. An empty needle is at 1.
 pub fn positionKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const needle_sv = stringViewOf(args[0]);
     const hay_sv = stringViewOf(args[1]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const needle = needle_sv.rowBytes(i);
-        const hay = hay_sv.rowBytes(i);
-        const v: i32 = if (needle.len == 0) 1 else if (std.mem.indexOf(u8, hay, needle)) |idx| @intCast(idx + 1) else 0;
-        try out.data.int.append(allocator, v);
+    for (0..row_count) |i| {
+        try out.data.int.append(allocator, findChars(hay_sv.rowBytes(i), needle_sv.rowBytes(i), 0));
     }
 }
 
-/// MySQL's INSTR(haystack, needle). Same semantics as position; args swapped.
+/// INSTR(haystack, needle) / STRPOS(haystack, needle): POSITION with the
+/// arguments swapped.
 pub fn instrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const hay_sv = stringViewOf(args[0]);
     const needle_sv = stringViewOf(args[1]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
+    for (0..row_count) |i| {
+        try out.data.int.append(allocator, findChars(hay_sv.rowBytes(i), needle_sv.rowBytes(i), 0));
+    }
+}
+
+/// LOCATE(needle, haystack, pos): the search starts at character `pos`; a
+/// `pos` below 1 or past the end finds nothing, as in MySQL and StarRocks.
+pub fn locateFromKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const needle_sv = stringViewOf(args[0]);
+    const hay_sv = stringViewOf(args[1]);
+    const starts = args[2].data.int;
+    for (0..row_count) |i| {
         const hay = hay_sv.rowBytes(i);
-        const needle = needle_sv.rowBytes(i);
-        const v: i32 = if (needle.len == 0) 1 else if (std.mem.indexOf(u8, hay, needle)) |idx| @intCast(idx + 1) else 0;
-        try out.data.int.append(allocator, v);
+        const pos = starts[i];
+        const found: i32 = if (pos < 1 or pos > charCount(hay) + 1) 0 else findChars(hay, needle_sv.rowBytes(i), charOffset(hay, @intCast(pos - 1)));
+        try out.data.int.append(allocator, found);
     }
 }
 
