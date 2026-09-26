@@ -497,6 +497,7 @@ pub const Parser = struct {
     window_expr_counter: usize = 0,
     window_partition_expr_refs: std.ArrayList(ir.Derived) = .empty,
     window_partition_expr_counter: usize = 0,
+    order_expr_counter: usize = 0,
 
     pub fn advance(self: *Parser) ParseError!void {
         self.prev_end = self.lex.pos;
@@ -788,13 +789,19 @@ pub const Parser = struct {
         // For aggregated queries it comes AFTER GroupBy because the
         // grouped schema is the only one available.
         var pending_order_specs: ?[]const @import("../exec/sort.zig").SortSpec = null;
+        var order_anchors: []const ir.Derived = &.{};
+        var order_keys: []const ir.Derived = &.{};
         if (self.cur.tag == .kw_order) {
             try self.advance();
             try self.expect(.kw_by);
             self.aggregate_expr_refs_enabled = true;
             defer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
-            pending_order_specs = try self.parseOrderBy(proj);
+            const order = try self.parseOrderBy(proj);
+            if (order.specs.len > 0) pending_order_specs = order.specs;
+            order_anchors = order.anchors;
+            order_keys = order.keys;
         }
+        const order_hidden: u32 = @intCast(order_anchors.len + order_keys.len);
         const aggregate_expr_refs = try self.arena.dupe(AggExprRef, self.aggregate_expr_refs.items[agg_ref_mark..]);
         self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
 
@@ -1125,6 +1132,7 @@ pub const Parser = struct {
             }
 
             // Apply ORDER BY on the grouped schema.
+            root = try self.addOrderKeyComputes(root, order_anchors, order_keys);
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
             }
@@ -1133,7 +1141,7 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            if (distinct or hidden_group_count or has_window or aggregate_expr_refs.len > 0 or having_derived.len > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            if (distinct or hidden_group_count or has_window or aggregate_expr_refs.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
         } else {
@@ -1188,16 +1196,18 @@ pub const Parser = struct {
                 if (!has_window) return ParseError.SqlInvalidProjection;
                 root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
             }
+            root = try self.addOrderKeyComputes(root, order_anchors, order_keys);
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
             }
             // Hidden computed columns trail the row — the WHERE's predicate
-            // anchors, the projection's own predicate anchors, then the
-            // SELECT-list exprs/windows. `*` stops before all of them, so
-            // even a bare star projects when any exist. Over a join it
-            // projects too: the sides arrive alias-qualified and `*` names
-            // its columns as the explicit list would.
-            const hidden_trailing = selectDerivedCount(proj) + where_derived_count + @as(u32, @intCast(projection_predicate_derived.len));
+            // anchors, the projection's own predicate anchors, the
+            // SELECT-list exprs/windows, then the ORDER BY's keys. `*` stops
+            // before all of them, so even a bare star projects when any
+            // exist. Over a join it projects too: the sides arrive
+            // alias-qualified and `*` names its columns as the explicit list
+            // would.
+            const hidden_trailing = selectDerivedCount(proj) + where_derived_count + @as(u32, @intCast(projection_predicate_derived.len)) + order_hidden;
             if (!isBareStarProjection(proj) or hidden_trailing > 0 or from_is_join) {
                 root = try self.addSelectProject(root, proj, hidden_trailing);
             }
@@ -1281,6 +1291,15 @@ pub const Parser = struct {
         const out = try std.ascii.allocLowerString(self.arena, self.cur.text);
         try self.advance();
         return out;
+    }
+
+    /// ORDER BY's hidden columns land directly below the sort, the predicate
+    /// operands first: the keys' CASE conditions compare them by name.
+    fn addOrderKeyComputes(self: *Parser, upstream: *ir.Op, anchors: []const ir.Derived, keys: []const ir.Derived) ParseError!*ir.Op {
+        var root = upstream;
+        if (anchors.len > 0) root = try self.allocOp(.{ .compute = .{ .derived = anchors, .upstream = root } });
+        if (keys.len > 0) root = try self.allocOp(.{ .compute = .{ .derived = keys, .upstream = root } });
+        return root;
     }
 
     fn addSelectProject(
@@ -4099,59 +4118,35 @@ pub const Parser = struct {
         return try self.allocOp(.{ .set_var = .{ .name = name, .value = value_expr } });
     }
 
-    pub fn parseOrderBy(self: *Parser, proj: []const ProjItem) ParseError![]const @import("../exec/sort.zig").SortSpec {
+    pub const OrderByClause = struct {
+        specs: []const @import("../exec/sort.zig").SortSpec,
+        /// Computed comparison operands the expression keys' predicates
+        /// name, evaluated ahead of `keys`.
+        anchors: []const ir.Derived,
+        /// Expression keys (`big * 2`, `COALESCE(qty, 0)`), each sorted on
+        /// as a hidden column computed ahead of the sort.
+        keys: []const ir.Derived,
+    };
+
+    pub fn parseOrderBy(self: *Parser, proj: []const ProjItem) ParseError!OrderByClause {
         const SortSpec = @import("../exec/sort.zig").SortSpec;
         var items: std.ArrayList(SortSpec) = .empty;
         defer items.deinit(self.arena);
+        var keys: std.ArrayList(ir.Derived) = .empty;
+        defer keys.deinit(self.arena);
+        const anchor_mark = self.predicate_derived.items.len;
+        const old_enabled = self.predicate_derived_enabled;
+        const old_scope = self.predicate_derived_scope;
+        self.predicate_derived_enabled = true;
+        self.predicate_derived_scope = anchor_mark;
+        defer self.predicate_derived_enabled = old_enabled;
+        defer self.predicate_derived_scope = old_scope;
+        errdefer self.predicate_derived.shrinkRetainingCapacity(anchor_mark);
         while (true) {
-            var col: []const u8 = undefined;
-            if (self.cur.tag == .integer) {
-                // `ORDER BY <n>` — 1-based ordinal into the SELECT list
-                // (PG/MySQL). A plain column sorts on its underlying name
-                // (the sort runs before the final projection); a computed /
-                // aggregate / window item sorts on its output alias.
-                const k = self.cur.value.integer;
-                try self.advance();
-                if (k < 1 or k > @as(i64, @intCast(proj.len))) return ParseError.SqlInvalidProjection;
-                const p = proj[@intCast(k - 1)];
-                col = switch (p.kind) {
-                    .col => |c| try self.arena.dupe(u8, c),
-                    .star => return ParseError.SqlInvalidProjection,
-                    else => try self.arena.dupe(u8, p.name),
-                };
-            } else {
-                if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-                const first = self.cur.text;
-                try self.advance();
-                col = if (self.cur.tag == .lparen) blk: {
-                    var distinct = false;
-                    const args = try self.parseCallArgList(&distinct);
-                    // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
-                    // to the aggregate's canonical output column name (the
-                    // sort runs after the aggregate). Aliased aggregates are
-                    // referenced by alias via the plain-ident path.
-                    if (self.aggregateFuncForName(first)) |func| {
-                        if (self.aggregate_expr_refs_enabled) {
-                            if (!distinct) {
-                                if (self.aggSortName(first, args)) |canonical| {
-                                    if (try self.aggAliasFor(proj, canonical)) |alias| break :blk alias;
-                                } else |_| {}
-                            }
-                            break :blk try self.materializeAggregateExpr(first, func, args, distinct);
-                        }
-                        break :blk try self.aggSortName(first, args);
-                    }
-                    // `ORDER BY scalar_fn(args)` (e.g. ORDER BY DATE_TRUNC(...))
-                    // binds to the matching SELECT expression's output column.
-                    const fname = try self.arena.dupe(u8, first);
-                    const call_expr = ir.Expr{ .call = .{ .fn_name = fname, .args = args } };
-                    const idx = findGroupMatch(proj, call_expr) orelse return ParseError.SqlInvalidProjection;
-                    break :blk proj[idx].name;
-                } else if (self.cur.tag == .dot)
-                    try self.dupQualifiedColRef(first)
-                else
-                    try self.arena.dupe(u8, renamedColumnSource(proj, first) orelse first);
-            }
+            const col = if (try self.orderKeyBindsDirectly())
+                try self.parseDirectOrderKey(proj, &keys)
+            else
+                try self.parseExprOrderKey(proj, &keys);
             var desc = false;
             if (self.cur.tag == .kw_asc) {
                 try self.advance();
@@ -4159,11 +4154,135 @@ pub const Parser = struct {
                 desc = true;
                 try self.advance();
             }
-            try items.append(self.arena, .{ .col = col, .desc = desc });
+            if (col) |c| try items.append(self.arena, .{ .col = c, .desc = desc });
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
-        return try items.toOwnedSlice(self.arena);
+        const renames = try self.orderAliasRenames(proj);
+        const anchors = try self.arena.dupe(ir.Derived, self.predicate_derived.items[anchor_mark..]);
+        self.predicate_derived.shrinkRetainingCapacity(anchor_mark);
+        for (anchors) |*d| d.expr = try exec_expr.deepCloneRenamed(self.arena, d.expr, renames);
+        for (keys.items) |*d| d.expr = try exec_expr.deepCloneRenamed(self.arena, d.expr, renames);
+        return .{
+            .specs = try items.toOwnedSlice(self.arena),
+            .anchors = anchors,
+            .keys = try keys.toOwnedSlice(self.arena),
+        };
+    }
+
+    /// Whether the ORDER BY key at the cursor is an ordinal, a column, or a
+    /// single call: the forms that bind to a SELECT item by position, name,
+    /// or canonical aggregate name rather than being evaluated as an
+    /// expression.
+    fn orderKeyBindsDirectly(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        var tok = self.cur;
+        switch (tok.tag) {
+            .integer => tok = try look.next(),
+            .identifier => {
+                tok = try look.next();
+                if (tok.tag == .lparen) {
+                    var depth: usize = 1;
+                    while (depth > 0) {
+                        tok = try look.next();
+                        switch (tok.tag) {
+                            .lparen => depth += 1,
+                            .rparen => depth -= 1,
+                            .eof => return false,
+                            else => {},
+                        }
+                    }
+                    tok = try look.next();
+                } else while (tok.tag == .dot) {
+                    tok = try look.next();
+                    tok = try look.next();
+                }
+            },
+            else => return false,
+        }
+        return switch (tok.tag) {
+            .comma, .kw_asc, .kw_desc, .kw_limit, .kw_offset, .rparen, .eof, .semicolon, .kw_union, .kw_rows, .kw_range, .kw_groups => true,
+            else => false,
+        };
+    }
+
+    fn parseDirectOrderKey(self: *Parser, proj: []const ProjItem, keys: *std.ArrayList(ir.Derived)) ParseError![]const u8 {
+        if (self.cur.tag == .integer) {
+            // `ORDER BY <n>` — 1-based ordinal into the SELECT list
+            // (PG/MySQL). A plain column sorts on its underlying name
+            // (the sort runs before the final projection); a computed /
+            // aggregate / window item sorts on its output alias.
+            const k = self.cur.value.integer;
+            try self.advance();
+            if (k < 1 or k > @as(i64, @intCast(proj.len))) return ParseError.SqlInvalidProjection;
+            const p = proj[@intCast(k - 1)];
+            return switch (p.kind) {
+                .col => |c| try self.arena.dupe(u8, c),
+                .star => ParseError.SqlInvalidProjection,
+                else => try self.arena.dupe(u8, p.name),
+            };
+        }
+        const first = self.cur.text;
+        try self.advance();
+        if (self.cur.tag == .dot) return try self.dupQualifiedColRef(first);
+        if (self.cur.tag != .lparen) return try self.arena.dupe(u8, renamedColumnSource(proj, first) orelse first);
+        var distinct = false;
+        const args = try self.parseCallArgList(&distinct);
+        // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
+        // to the aggregate's canonical output column name (the
+        // sort runs after the aggregate). Aliased aggregates are
+        // referenced by alias via the plain-ident path.
+        if (self.aggregateFuncForName(first)) |func| {
+            if (self.aggregate_expr_refs_enabled) {
+                if (!distinct) {
+                    if (self.aggSortName(first, args)) |canonical| {
+                        if (try self.aggAliasFor(proj, canonical)) |alias| return alias;
+                    } else |_| {}
+                }
+                return try self.materializeAggregateExpr(first, func, args, distinct);
+            }
+            return try self.aggSortName(first, args);
+        }
+        if (distinct) return ParseError.SqlInvalidProjection;
+        return try self.orderExprKey(proj, try self.makeScalarCallExpr(first, args), keys);
+    }
+
+    /// An ORDER BY key that is an expression: a constant sorts nothing and
+    /// drops out (MySQL's `ORDER BY NULL`), a lone column binds by name, and
+    /// anything else reads through `orderExprKey`.
+    fn parseExprOrderKey(self: *Parser, proj: []const ProjItem, keys: *std.ArrayList(ir.Derived)) ParseError!?[]const u8 {
+        const window_mark = self.window_expr_refs.items.len;
+        const e = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
+        // The SELECT list's windows are already collected; one named only
+        // here has no Window operator to land in.
+        if (self.window_expr_refs.items.len != window_mark) return ParseError.SqlInvalidProjection;
+        return switch (e) {
+            .lit, .null_lit, .var_ref => null,
+            .col_ref => |c| try self.arena.dupe(u8, renamedColumnSource(proj, c) orelse c),
+            else => try self.orderExprKey(proj, e, keys),
+        };
+    }
+
+    /// The column an expression sort key reads: the SELECT item it repeats,
+    /// else a hidden column computed ahead of the sort.
+    fn orderExprKey(self: *Parser, proj: []const ProjItem, e: ir.Expr, keys: *std.ArrayList(ir.Derived)) ParseError![]const u8 {
+        if (findGroupMatch(proj, e)) |idx| return proj[idx].name;
+        const name = std.fmt.allocPrint(self.arena, "__order_expr_{d}", .{self.order_expr_counter}) catch return ParseError.OutOfMemory;
+        self.order_expr_counter += 1;
+        try keys.append(self.arena, .{ .name = name, .expr = e });
+        return name;
+    }
+
+    /// A SELECT alias of a plain column re-binds to its source inside an
+    /// ORDER BY expression: the sort runs below the final projection, where
+    /// only the source name exists.
+    fn orderAliasRenames(self: *Parser, proj: []const ProjItem) ParseError![]const exec_predicate.ColRename {
+        var renames: std.ArrayList(exec_predicate.ColRename) = .empty;
+        for (proj) |p| switch (p.kind) {
+            .col => |c| if (!types.columnNameEql(c, p.name)) try renames.append(self.arena, .{ .from = p.name, .to = c }),
+            else => {},
+        };
+        return try renames.toOwnedSlice(self.arena);
     }
 
     /// Canonical output-column name for an aggregate referenced in ORDER
