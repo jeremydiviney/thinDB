@@ -436,6 +436,32 @@ fn keyConversionExpr(aa: Allocator, name: []const u8, conversion: KeyConversion)
     } };
 }
 
+/// Whether a join takes `left = right` as an equality key: after the
+/// conversions `normalizeJoinKeyTypes` lays over them, the keys share a type.
+pub fn equalityKeyTypesJoin(left: Type, right: Type) bool {
+    const plan = joinKeyConversions(left, right, .equality);
+    return keyTagsMatch(typeTag(convertedKeyType(left, plan.left)), typeTag(convertedKeyType(right, plan.right)));
+}
+
+/// The type `keyConversionExpr`'s function returns for a key of type `t`.
+fn convertedKeyType(t: Type, conversion: ?KeyConversion) Type {
+    return switch (conversion orelse return t) {
+        .cast => |target| switch (target) {
+            .float => .double,
+            .uuid => t,
+            else => target,
+        },
+        .text_key => |target| switch (target) {
+            .float, .double, .varchar, .char, .string, .json, .uuid => t,
+            else => target,
+        },
+    };
+}
+
+fn keyTagsMatch(left: TypeTag, right: TypeTag) bool {
+    return left == right or (isStringTag(left) and isStringTag(right));
+}
+
 fn commonJoinKeyTag(left: TypeTag, right: TypeTag) ?TypeTag {
     if (cast.castCost(left, right) != null and castFunctionName(right) != null) return right;
     if (cast.castCost(right, left) != null and castFunctionName(left) != null) return left;
@@ -1354,9 +1380,7 @@ pub const Join = struct {
             right_key_names[i] = try aa.dupe(u8, right_schema[right_keys[i]].name);
             // Types must match by tag (varchar/string/char are
             // compatible string-family; otherwise must match exactly).
-            const lt: TypeTag = left_schema[left_keys[i]].type;
-            const rt: TypeTag = right_schema[right_keys[i]].type;
-            if (lt != rt and !(isStringTag(lt) and isStringTag(rt))) {
+            if (!keyTagsMatch(left_schema[left_keys[i]].type, right_schema[right_keys[i]].type)) {
                 return Error.JoinKeyTypeMismatch;
             }
         }

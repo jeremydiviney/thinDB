@@ -2928,3 +2928,81 @@ test "join: parenthesized ON conditions join like the bare conjuncts" {
     try std.testing.expectError(error.SqlOnNonEquiUnsupported, helpers.runSql(allocator, db, "SELECT b.bid FROM a JOIN b ON (a.id = b.aid OR b.amount > 6)"));
     try std.testing.expectError(error.SqlExpectedToken, helpers.runSql(allocator, db, "SELECT b.bid FROM a JOIN b ON (a.id = b.aid"));
 }
+
+fn planMentions(allocator: std.mem.Allocator, db: anytype, sql: []const u8, needle: []const u8) !bool {
+    const helpers = @import("sql_helpers.zig");
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    var q = try helpers.runSql(allocator, db, explain_sql);
+    defer q.deinit();
+    var found = false;
+    while (try q.next()) |b| {
+        const lines = b.values[0].data.string;
+        for (0..b.row_count) |i| {
+            if (std.mem.indexOf(u8, lines.rowBytes(i), needle) != null) found = true;
+        }
+    }
+    return found;
+}
+
+test "join: a comma joins like CROSS JOIN, keyed by the WHERE's equalities" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, code VARCHAR(8))");
+    try helpers.exec(allocator, db, "INSERT INTO a VALUES (1, 10, '2'), (2, 20, '3'), (3, 30, 'x')");
+    try helpers.exec(allocator, db, "CREATE TABLE b (bid BIGINT PRIMARY KEY, aid BIGINT, amount BIGINT NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO b VALUES (1, 1, 5), (2, 1, 50), (3, 2, 7), (4, 3, 70), (5, NULL, 9)");
+    try helpers.exec(allocator, db, "CREATE TABLE c (cid BIGINT PRIMARY KEY, bid BIGINT NOT NULL, id BIGINT NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO c VALUES (1, 1, 100), (2, 3, 200), (3, 3, 300), (4, 9, 400)");
+
+    const cases = .{
+        .{ "SELECT COUNT(*) FROM a, b", &[_]i64{15} },
+        .{ "SELECT b.bid FROM a, b WHERE a.id = b.aid ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a, b WHERE b.aid = a.id ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+        // Unqualified columns side by the input that has them.
+        .{ "SELECT bid FROM a, b WHERE id = aid AND v > 10 ORDER BY bid", &[_]i64{ 3, 4 } },
+        // The right key stays readable.
+        .{ "SELECT b.aid FROM a, b WHERE a.id = b.aid ORDER BY b.bid", &[_]i64{ 1, 1, 2, 3 } },
+        // An equality beside a cross-input condition that isn't one.
+        .{ "SELECT b.bid FROM a, b WHERE a.id = b.aid AND a.v < b.amount ORDER BY b.bid", &[_]i64{ 2, 4 } },
+        .{ "SELECT b.bid FROM a, b WHERE a.id = b.aid OR b.amount = 9 ORDER BY b.bid, a.id", &[_]i64{ 1, 2, 3, 4, 5, 5, 5 } },
+        // Three inputs: each equality keys the join that first sees both columns.
+        .{ "SELECT c.cid FROM a, b, c WHERE a.id = b.aid AND b.bid = c.bid ORDER BY c.cid", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT c.cid FROM a, b, c WHERE b.bid = c.bid AND a.id = b.aid AND a.v = 20 ORDER BY c.cid", &[_]i64{ 2, 3 } },
+        .{ "SELECT c.cid FROM a, b, c WHERE a.id = b.aid AND c.bid = a.id ORDER BY c.cid, b.bid", &[_]i64{ 1, 1, 2, 3 } },
+        // A comma between join chains, and CROSS JOIN, key the same way.
+        .{ "SELECT c.cid FROM a, b JOIN c ON b.bid = c.bid WHERE a.id = b.aid ORDER BY c.cid", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT c.cid FROM a CROSS JOIN b CROSS JOIN c WHERE a.id = b.aid AND b.bid = c.bid ORDER BY c.cid", &[_]i64{ 1, 2, 3 } },
+        // A comma binds looser than JOIN: c right-joins b alone, then every
+        // row crosses a (4 c rows, 3 with a match in b; 3 a rows).
+        .{ "SELECT COUNT(*) FROM a, b RIGHT JOIN c ON b.bid = c.bid", &[_]i64{12} },
+        .{ "SELECT COUNT(*) FROM a, b RIGHT JOIN c ON b.bid = c.bid WHERE b.bid IS NULL", &[_]i64{3} },
+        // A derived table on either side.
+        .{ "SELECT a.id FROM a, (SELECT aid, SUM(amount) AS s FROM b GROUP BY aid) t WHERE a.id = t.aid AND t.s > 10 ORDER BY a.id", &[_]i64{ 1, 3 } },
+        // Text meets a number as the comparison reads it.
+        .{ "SELECT b.bid FROM a, b WHERE a.code = b.aid ORDER BY b.bid", &[_]i64{ 3, 4 } },
+    };
+    inline for (cases) |case| {
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    const keyed = .{
+        "SELECT b.bid FROM a, b WHERE a.id = b.aid",
+        "SELECT c.cid FROM a, b, c WHERE a.id = b.aid AND b.bid = c.bid",
+        "SELECT c.cid FROM a, b JOIN c ON b.bid = c.bid WHERE a.id = b.aid",
+    };
+    inline for (keyed) |sql| try std.testing.expect(!try planMentions(allocator, db, sql, "NestedLoopJoin"));
+    try std.testing.expect(try planMentions(allocator, db, "SELECT COUNT(*) FROM a, b", "NestedLoopJoin"));
+
+    // Each chain's ON sees only its own names.
+    try helpers.expectRunError(allocator, db, "SELECT c.cid FROM a, b JOIN c ON a.id = c.bid", error.SqlOnRefsUnknownTable);
+    // `id` is in both a and c: ambiguous, not read from the first input.
+    try helpers.expectRunError(allocator, db, "SELECT b.bid FROM a, b, c WHERE id = 1", error.ColumnNotFound);
+}
