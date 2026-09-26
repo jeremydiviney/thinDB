@@ -437,6 +437,9 @@ pub const Compute = struct {
     /// happens in per-chunk clones inside the scan workers, and this
     /// operator passes the final joined batches through untouched.
     chain: ?*ChainForward = null,
+    /// The upstream is the Compute for the earlier entries of the list this
+    /// one was created from, so `evalBatch` runs it first.
+    layered_on_upstream: bool = false,
 
     pub fn create(
         allocator: Allocator,
@@ -446,14 +449,35 @@ pub const Compute = struct {
         return createWithRegistry(allocator, upstream, derived, null);
     }
 
+    /// An entry of `derived` may read a column an earlier entry defines
+    /// (`WHERE (CASE WHEN a + 1 > 2 THEN ...) = 1` anchors `a + 1` and the
+    /// CASE that compares it in one list). Each entry resolves against its
+    /// input only, so the list evaluates as a stack of Computes, one per
+    /// layer of those reads.
     pub fn createWithRegistry(
         allocator: Allocator,
         upstream: Query,
         derived: []const Derived,
         udf_registry: ?*const udf_mod.UdfRegistry,
     ) !Query {
+        return createLayer(allocator, upstream, derived, udf_registry, false);
+    }
+
+    fn createLayer(
+        allocator: Allocator,
+        upstream: Query,
+        derived: []const Derived,
+        udf_registry: ?*const udf_mod.UdfRegistry,
+        layered_on_upstream: bool,
+    ) !Query {
         if (derived.len == 0) return Error.ComputeNoColumns;
         const up_schema = upstream.outputSchema();
+        if (try siblingReadIndex(allocator, derived, up_schema)) |split| {
+            const lower = try createLayer(allocator, upstream, derived[0..split], udf_registry, layered_on_upstream);
+            // On failure the caller still owns `upstream`.
+            errdefer exec.queryAs(Compute, lower).?.deinitLayer();
+            return try createLayer(allocator, lower, derived[split..], udf_registry, true);
+        }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -539,14 +563,41 @@ pub const Compute = struct {
             .views = views,
             .derived_ir = derived_ir,
             .udf_registry = udf_registry,
+            .layered_on_upstream = layered_on_upstream,
         };
         return makeQuery(allocator, self);
+    }
+
+    /// Where `derived` splits into layers: the first entry that reads a
+    /// column its input lacks but an earlier entry defines. None past an
+    /// entry that replaces an input column, whose later readers must see
+    /// the input's value.
+    fn siblingReadIndex(allocator: Allocator, derived: []const Derived, up_schema: []const Column) !?usize {
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer refs.deinit(allocator);
+        for (derived, 0..) |d, i| {
+            refs.clearRetainingCapacity();
+            try collectColumnRefs(allocator, &refs, d.expr);
+            for (refs.items) |r| {
+                if (columnIndex(up_schema, r) != null) continue;
+                for (derived[0..i]) |prior| {
+                    if (types.columnNameEql(prior.name, r)) return i;
+                }
+            }
+            if (columnIndex(up_schema, d.name) != null) return null;
+        }
+        return null;
     }
 
     pub fn deinit(self: *Compute) void {
         if (self.chain) |cf| cf.deinitAll(self.allocator);
         var up = self.upstream;
         up.deinit();
+        self.deinitLayer();
+    }
+
+    /// Frees this operator but not its upstream.
+    fn deinitLayer(self: *Compute) void {
         for (self.derived_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.derived_cols);
         self.allocator.free(self.derived_direct);
@@ -782,13 +833,18 @@ pub const Compute = struct {
     pub fn next(self: *Compute) !?Batch {
         const in = (try self.upstream.next()) orelse return null;
         if (self.chain != null) return in;
-        return try self.evalBatch(in);
+        return try self.evalLayer(in);
     }
 
     /// Push-model entry for probe-pipeline chunk wrappers: evaluate the
     /// derived columns against a caller-supplied batch. The returned views
     /// live until the next call on this instance.
     pub fn evalBatch(self: *Compute, in: Batch) !Batch {
+        if (!self.layered_on_upstream) return try self.evalLayer(in);
+        return try self.evalLayer(try exec.queryAs(Compute, self.upstream).?.evalBatch(in));
+    }
+
+    fn evalLayer(self: *Compute, in: Batch) !Batch {
         const n = in.row_count;
 
         for (self.derived, self.derived_cols, self.derived_direct) |r, *out_col, *direct| {
