@@ -4550,7 +4550,15 @@ pub const Parser = struct {
                 desc = true;
                 try self.advance();
             }
-            if (col) |c| try items.append(self.arena, .{ .col = c, .desc = desc });
+            const nulls_first = try self.parseNullsPlacement();
+            if (col) |c| {
+                // NULLs sort first ascending and last descending; the other
+                // placement sorts on whether the key is NULL ahead of it.
+                if (nulls_first) |first| if (first == desc) {
+                    try items.append(self.arena, .{ .col = try self.orderNullKey(c, &keys), .desc = first });
+                };
+                try items.append(self.arena, .{ .col = c, .desc = desc });
+            }
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
@@ -4657,6 +4665,33 @@ pub const Parser = struct {
             .col_ref => |c| try self.arena.dupe(u8, renamedColumnSource(proj, c) orelse c),
             else => try self.orderExprKey(proj, e, keys),
         };
+    }
+
+    /// `NULLS FIRST` (true) / `NULLS LAST` (false) after a sort key.
+    fn parseNullsPlacement(self: *Parser) ParseError!?bool {
+        if (self.cur.tag != .kw_nulls) return null;
+        try self.advance();
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedKeyword;
+        const first = if (std.ascii.eqlIgnoreCase(self.cur.text, "first"))
+            true
+        else if (std.ascii.eqlIgnoreCase(self.cur.text, "last"))
+            false
+        else
+            return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        return first;
+    }
+
+    /// A hidden sort key, 1 where `column` is NULL and 0 elsewhere.
+    fn orderNullKey(self: *Parser, column: []const u8, keys: *std.ArrayList(ir.Derived)) ParseError![]const u8 {
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        branches[0] = .{ .cond = .{ .is_null = column }, .then = .{ .lit = .{ .int = 1 } } };
+        const else_branch = try self.arena.create(ir.Expr);
+        else_branch.* = .{ .lit = .{ .int = 0 } };
+        const name = std.fmt.allocPrint(self.arena, "__order_expr_{d}", .{self.order_expr_counter}) catch return ParseError.OutOfMemory;
+        self.order_expr_counter += 1;
+        try keys.append(self.arena, .{ .name = name, .expr = .{ .case = .{ .branches = branches, .else_branch = else_branch } } });
+        return name;
     }
 
     /// The column an expression sort key reads: the SELECT item it repeats,
