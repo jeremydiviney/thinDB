@@ -2098,6 +2098,86 @@ test "join: range_sweep output matches NLJ for same data" {
     try std.testing.expectEqual(nlj_count, sweep_count);
 }
 
+test "join: a left key tail is matched on and never emitted, by every algorithm" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const users = try db.table("users", users_schema, users_opts);
+    try users.insert(&.{
+        .{ .uid = @as(i64, 1), .name = "alice" },
+        .{ .uid = @as(i64, 2), .name = "bob" },
+        .{ .uid = @as(i64, 3), .name = "carol" },
+    });
+    try users.flush();
+    const orders = try db.table("orders", orders_schema, orders_opts);
+    try orders.insert(&.{
+        .{ .oid = @as(i64, 100), .uid = @as(i64, 1), .qty = @as(i32, 10) },
+        .{ .oid = @as(i64, 101), .uid = @as(i64, 2), .qty = @as(i32, 20) },
+        .{ .oid = @as(i64, 102), .uid = @as(i64, 1), .qty = @as(i32, 30) },
+        .{ .oid = @as(i64, 103), .uid = @as(i64, 99), .qty = @as(i32, 40) },
+    });
+    try orders.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const expr = thindb.exec.expr_mod;
+    const key = try expr.call(arena.allocator(), "mul", &.{ expr.col("uid"), expr.lit(.{ .bigint = 100 }) });
+
+    // The tail key reads uid * 100, so only uid 1 meets an oid (100).
+    const algorithms = [_]@FieldType(thindb.exec.JoinSpec, "algorithm"){ .hash, .sort_merge, .nested_loop };
+    for (algorithms) |algorithm| {
+        const base = try thindb.scan(allocator, users);
+        const left = try base.compute(&.{.{ .name = "k", .expr = key }});
+        const right = try (try thindb.scan(allocator, orders)).project(&.{ "oid", "qty" });
+        var q = try left.join(right, .{
+            .on = &.{.{ .left = "k", .right = "oid" }},
+            .algorithm = algorithm,
+            .left_key_tail = 1,
+        });
+        defer q.deinit();
+
+        const schema = q.outputSchema();
+        try std.testing.expectEqual(@as(usize, 3), schema.len);
+        try std.testing.expectEqualStrings("uid", schema[0].name);
+        try std.testing.expectEqualStrings("name", schema[1].name);
+        try std.testing.expectEqualStrings("qty", schema[2].name);
+        var rows: usize = 0;
+        while (try q.next()) |b| {
+            for (0..b.row_count) |i| {
+                try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[i]);
+                try std.testing.expectEqual(@as(i32, 10), b.values[2].data.int[i]);
+            }
+            rows += b.row_count;
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows);
+    }
+
+    // A pure range runs as range_sweep and keeps every right column.
+    const base = try thindb.scan(allocator, users);
+    const left = try base.compute(&.{.{ .name = "k", .expr = key }});
+    const right = try (try thindb.scan(allocator, orders)).project(&.{ "oid", "qty" });
+    var q = try left.join(right, .{
+        .on = &.{},
+        .ranges = &.{.{ .left = "k", .op = .gt, .right = "oid" }},
+        .left_key_tail = 1,
+    });
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 4), q.outputSchema().len);
+    var uid_sum: i64 = 0;
+    var rows: usize = 0;
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |uid| uid_sum += uid;
+        rows += b.row_count;
+    }
+    try std.testing.expectEqual(@as(usize, 8), rows);
+    try std.testing.expectEqual(@as(i64, 20), uid_sum);
+}
+
 test "opaque: cross-side predicate via NLJ callback" {
     // 100 left rows, 100 right rows. Opaque predicate: keep pairs
     // where (a.x + a.y) > b.threshold. Can't be expressed as equi

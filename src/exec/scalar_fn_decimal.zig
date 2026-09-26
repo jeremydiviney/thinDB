@@ -405,6 +405,69 @@ fn textMantissa(text: []const u8, s: u8) error{ArithmeticOverflow}!?i128 {
     };
 }
 
+/// Text as a mantissa at scale `s` with nothing rounded away: null when the
+/// text isn't a number or its value needs more fraction digits than `s`.
+/// An exponent form holds when the double it reads is that mantissa's value.
+fn exactTextMantissa(text: []const u8, s: u8) ?i128 {
+    return switch (common.textNumber(text) orelse return null) {
+        .exact => |d| if (d.s <= s) mulPow10(d.m, s - d.s) else blk: {
+            const p = pow10(d.s - s);
+            break :blk if (@rem(d.m, p) == 0) @divExact(d.m, p) else null;
+        },
+        .float => |f| blk: {
+            const scaled = @round(f * pow10f(s));
+            if (!(@abs(scaled) < 1e38)) break :blk null;
+            const m: i128 = @intFromFloat(scaled);
+            break :blk if (@as(f64, @floatFromInt(m)) / pow10f(s) == f) m else null;
+        },
+    };
+}
+
+/// A text value as a `ty` value when the comparison rule calls them equal,
+/// exactly; null when no `ty` value equals the text. Integer targets are
+/// narrowed by the caller.
+fn textKeyValue(ty: Type, text: []const u8) ?i128 {
+    return switch (ty) {
+        .tinyint, .smallint, .int, .bigint, .largeint => exactTextMantissa(text, 0),
+        .boolean => blk: {
+            const v = exactTextMantissa(text, 0) orelse break :blk null;
+            break :blk if (v == 0 or v == 1) v else null;
+        },
+        .decimal64, .decimal128 => |spec| blk: {
+            const m = exactTextMantissa(text, spec.s) orelse break :blk null;
+            break :blk if (@abs(m) < pow10(spec.p)) m else null;
+        },
+        .date => blk: {
+            const micros = common.textToDatetime(std.mem.trim(u8, text, common.TEXT_SPACE)) orelse break :blk null;
+            break :blk if (@mod(micros, std.time.us_per_day) == 0) @divExact(micros, std.time.us_per_day) else null;
+        },
+        .datetime => common.textToDatetime(std.mem.trim(u8, text, common.TEXT_SPACE)) orelse null,
+        else => null,
+    };
+}
+
+/// A text join key read as the other key's type (`join.zig`): each row is
+/// the `out_type` value the text equals under the comparison rule, NULL when
+/// there is none, so a hash on the result matches what `=` matches.
+pub fn textKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = arg_types;
+    const text = common.stringViewOf(args[0]);
+    const base = out.data.rowCount();
+    switch (out.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .date, .datetime, .decimal64, .decimal128 => |*list| {
+            const T = @typeInfo(@TypeOf(list.items)).pointer.child;
+            try list.ensureUnusedCapacity(allocator, n);
+            for (0..n) |row| {
+                const wide = if (args[0].isValid(row)) textKeyValue(out_type, text.rowBytes(row)) else null;
+                const v: ?T = if (wide) |w| std.math.cast(T, w) else null;
+                list.appendAssumeCapacity(v orelse 0);
+                try out.appendValidBit(allocator, base + row, v != null);
+            }
+        },
+        else => return error.ComputeNoSuchOverload,
+    }
+}
+
 pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     _ = out_type;
     const s = scaleOf(arg_types[0]);

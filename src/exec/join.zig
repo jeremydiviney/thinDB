@@ -213,7 +213,18 @@ pub const Spec = struct {
     /// holds. Set by the staged compiler under force_ordered chains;
     /// meaningful for `.left` equi-joins only.
     preserve_left_order: bool = false,
+    /// Trailing left columns that exist only to carry join keys: the join
+    /// matches on them and never emits them. `Join.create` appends one per
+    /// left key it converts, so a key conversion never changes a column the
+    /// caller sees.
+    left_key_tail: usize = 0,
 };
+
+/// How many left columns a join emits: all but its `left_key_tail`.
+pub fn leftEmitCount(left_schema: []const Column, spec: Spec) Error!usize {
+    if (spec.left_key_tail > left_schema.len) return Error.ColumnNotFound;
+    return left_schema.len - spec.left_key_tail;
+}
 
 /// User-supplied cross-side predicate callback. Receives the
 /// materialized columns + row indices for left and right.
@@ -233,6 +244,9 @@ pub const OpaquePredicate = struct {
 const NormalizedJoinInputs = struct {
     left: Query,
     right: Query,
+    /// The caller's spec, reading each converted left key from its hidden
+    /// column.
+    spec: Spec,
 
     /// Frees the key conversions laid over `left` and `right`, which stay
     /// their caller's.
@@ -250,16 +264,18 @@ fn normalizeJoinKeyTypes(
 ) !NormalizedJoinInputs {
     const left_schema = left.outputSchema();
     const right_schema = right.outputSchema();
-    var left_casts: std.ArrayList(exec.Derived) = .empty;
+    var left_keys: std.ArrayList(exec.Derived) = .empty;
     var right_casts: std.ArrayList(exec.Derived) = .empty;
 
-    for (spec.on) |pair| {
+    const on = try aa.dupe(KeyPair, spec.on);
+    for (on) |*pair| {
         const left_idx = columnIndex(left_schema, pair.left) orelse return Error.ColumnNotFound;
         const right_idx = columnIndex(right_schema, pair.right) orelse return Error.ColumnNotFound;
-        try appendJoinKeyCasts(
+        pair.left = try convertKeyPair(
             aa,
-            &left_casts,
+            &left_keys,
             &right_casts,
+            .equality,
             pair.left,
             left_schema[left_idx].type,
             pair.right,
@@ -267,13 +283,15 @@ fn normalizeJoinKeyTypes(
         );
     }
 
-    for (spec.ranges) |rp| {
+    const ranges = try aa.dupe(RangePredicate, spec.ranges);
+    for (ranges) |*rp| {
         const left_idx = columnIndex(left_schema, rp.left) orelse return Error.ColumnNotFound;
         const right_idx = columnIndex(right_schema, rp.right) orelse return Error.ColumnNotFound;
-        try appendJoinKeyCasts(
+        rp.left = try convertKeyPair(
             aa,
-            &left_casts,
+            &left_keys,
             &right_casts,
+            .order,
             rp.left,
             left_schema[left_idx].type,
             rp.right,
@@ -281,31 +299,103 @@ fn normalizeJoinKeyTypes(
         );
     }
 
+    var normalized_spec = spec;
+    normalized_spec.on = on;
+    normalized_spec.ranges = ranges;
+    normalized_spec.left_key_tail = spec.left_key_tail + left_keys.items.len;
     var left_out = left;
     var right_out = right;
-    if (left_casts.items.len > 0) {
-        left_out = try left_out.compute(try left_casts.toOwnedSlice(aa));
+    if (left_keys.items.len > 0) {
+        left_out = try left_out.compute(try left_keys.toOwnedSlice(aa));
     }
     errdefer Compute.deinitLayersOver(left_out, left);
     if (right_casts.items.len > 0) {
         right_out = try right_out.compute(try right_casts.toOwnedSlice(aa));
     }
-    return .{ .left = left_out, .right = right_out };
+    return .{ .left = left_out, .right = right_out, .spec = normalized_spec };
 }
 
-fn appendJoinKeyCasts(
+/// How a join compares a key pair: for equality (hashed or sorted) or for
+/// order (a range predicate).
+const KeyUse = enum { equality, order };
+
+/// A conversion one join key takes before the join.
+const KeyConversion = union(enum) {
+    /// CAST to the type.
+    cast: Type,
+    /// Text read exactly as the type (`scalar_fn.textKeyFnName`).
+    text_key: Type,
+};
+
+const KeyConversions = struct {
+    left: ?KeyConversion = null,
+    right: ?KeyConversion = null,
+};
+
+/// Adds the conversions a key pair needs to compare by the comparison rule
+/// and returns the name the join reads the left key from. A converted left
+/// key is read from a hidden column appended to the left side
+/// (`Spec.left_key_tail`), so the left column keeps its type and value in
+/// the output. A right key converts in place: the join emits no right
+/// equality key.
+fn convertKeyPair(
     aa: Allocator,
-    left_casts: *std.ArrayList(exec.Derived),
+    left_keys: *std.ArrayList(exec.Derived),
     right_casts: *std.ArrayList(exec.Derived),
+    use: KeyUse,
     left_name: []const u8,
     left_type: Type,
     right_name: []const u8,
     right_type: Type,
-) !void {
-    if (!joinKeyCoercionEligible(left_name) and !joinKeyCoercionEligible(right_name)) return;
-    const target = commonJoinKeyType(left_type, right_type) orelse return;
-    if (!std.meta.eql(left_type, target)) try appendCastDerived(aa, left_casts, left_name, target);
-    if (!std.meta.eql(right_type, target)) try appendCastDerived(aa, right_casts, right_name, target);
+) ![]const u8 {
+    if (!joinKeyCoercionEligible(left_name) and !joinKeyCoercionEligible(right_name)) return left_name;
+    const plan = joinKeyConversions(left_type, right_type, use);
+    if (plan.right) |c| {
+        const already = for (right_casts.items) |existing| {
+            if (types.columnNameEql(existing.name, right_name)) break true;
+        } else false;
+        if (!already) {
+            if (try keyConversionExpr(aa, right_name, c)) |expr|
+                try right_casts.append(aa, .{ .name = try aa.dupe(u8, right_name), .expr = expr });
+        }
+    }
+    const c = plan.left orelse return left_name;
+    const expr = (try keyConversionExpr(aa, left_name, c)) orelse return left_name;
+    const hidden = try std.fmt.allocPrint(aa, "__join_key_left_{d}", .{left_keys.items.len});
+    try left_keys.append(aa, .{ .name = hidden, .expr = expr });
+    return hidden;
+}
+
+/// The conversions that leave both keys one type whose stored values compare
+/// as the comparison rule compares the originals (`predicate.typesComparable`).
+/// Text meeting a number or a temporal is read as the other key's type: for
+/// equality exactly, so `'12.0'` meets 12, `'12.5'` meets no integer and
+/// text that isn't a number meets nothing; for order both keys meet as DOUBLE,
+/// or as DATETIME against a temporal.
+fn joinKeyConversions(left: Type, right: Type, use: KeyUse) KeyConversions {
+    const left_kind = predicate.comparisonKind(left);
+    const right_kind = predicate.comparisonKind(right);
+    if (left_kind == .text and (right_kind == .number or right_kind == .temporal))
+        return textMeetsValue(right, right_kind, use);
+    if (right_kind == .text and (left_kind == .number or left_kind == .temporal)) {
+        const flipped = textMeetsValue(left, left_kind, use);
+        return .{ .left = flipped.right, .right = flipped.left };
+    }
+    const target = commonJoinKeyType(left, right) orelse return .{};
+    return .{
+        .left = if (std.meta.eql(left, target)) null else .{ .cast = target },
+        .right = if (std.meta.eql(right, target)) null else .{ .cast = target },
+    };
+}
+
+/// Conversions for a text key (`.left`) meeting a key of type `value`.
+fn textMeetsValue(value: Type, value_kind: predicate.ComparisonKind, use: KeyUse) KeyConversions {
+    const shared: Type = if (value_kind == .temporal) .datetime else .double;
+    if (use == .equality and value != .float and value != .double) return .{ .left = .{ .text_key = value } };
+    return .{
+        .left = .{ .cast = shared },
+        .right = if (std.meta.eql(value, shared)) null else .{ .cast = shared },
+    };
 }
 
 /// The type both sides of a join key convert to; null when their stored
@@ -332,41 +422,24 @@ fn joinKeyCoercionEligible(name: []const u8) bool {
         std.mem.startsWith(u8, name, "__join_on_");
 }
 
-fn appendCastDerived(
-    aa: Allocator,
-    casts: *std.ArrayList(exec.Derived),
-    name: []const u8,
-    target: Type,
-) !void {
-    for (casts.items) |existing| {
-        if (types.columnNameEql(existing.name, name)) return;
-    }
-    const fn_name = (try scalar_fn.castFnName(aa, target)) orelse return;
+/// The call converting column `name`; null when no function does.
+fn keyConversionExpr(aa: Allocator, name: []const u8, conversion: KeyConversion) !?exec.Expr {
+    const fn_name = (switch (conversion) {
+        .cast => |target| try scalar_fn.castFnName(aa, target),
+        .text_key => |target| try scalar_fn.textKeyFnName(aa, target),
+    }) orelse return null;
     const args = try aa.alloc(exec.Expr, 1);
     args[0] = .{ .col_ref = try aa.dupe(u8, name) };
-    try casts.append(aa, .{
-        .name = try aa.dupe(u8, name),
-        .expr = .{ .call = .{
-            .fn_name = fn_name,
-            .args = args,
-        } },
-    });
+    return .{ .call = .{
+        .fn_name = fn_name,
+        .args = args,
+    } };
 }
 
 fn commonJoinKeyTag(left: TypeTag, right: TypeTag) ?TypeTag {
-    if (isStringTag(left) and canStringifyJoinKey(right)) return .string;
-    if (isStringTag(right) and canStringifyJoinKey(left)) return .string;
     if (cast.castCost(left, right) != null and castFunctionName(right) != null) return right;
     if (cast.castCost(right, left) != null and castFunctionName(left) != null) return left;
     return null;
-}
-
-fn canStringifyJoinKey(tag: TypeTag) bool {
-    return switch (tag) {
-        .int, .bigint, .double, .boolean => true,
-        .string, .varchar, .char, .json => true,
-        else => false,
-    };
 }
 
 fn castFunctionName(tag: TypeTag) ?[]const u8 {
@@ -1183,16 +1256,17 @@ pub const Join = struct {
         allocator: Allocator,
         left: Query,
         right: Query,
-        spec: Spec,
+        caller_spec: Spec,
     ) !Query {
         var coerce_arena = std.heap.ArenaAllocator.init(allocator);
         defer coerce_arena.deinit();
         const coerce_aa = coerce_arena.allocator();
-        const normalized = try normalizeJoinKeyTypes(coerce_aa, left, right, spec);
+        const normalized = try normalizeJoinKeyTypes(coerce_aa, left, right, caller_spec);
         // On failure the caller still owns `left` and `right`.
         errdefer normalized.unwind(left, right);
         const left_in = normalized.left;
         const right_in = normalized.right;
+        const spec = normalized.spec;
 
         // Resolve algorithm. Opaque predicate forces NLJ (the only
         // algorithm that evaluates per-pair callbacks). Otherwise
@@ -1228,6 +1302,7 @@ pub const Join = struct {
                 .algorithm = .range_sweep,
                 .extra_predicate = spec.extra_predicate,
                 .ranges = spec.ranges,
+                .left_key_tail = spec.left_key_tail,
             };
             return @import("range_sweep.zig").RangeSweepJoin.create(allocator, left_in, right_in, rs_spec);
         }
@@ -1240,6 +1315,7 @@ pub const Join = struct {
                 .extra_predicate = spec.extra_predicate,
                 .ranges = spec.ranges,
                 .opaque_predicate = spec.opaque_predicate,
+                .left_key_tail = spec.left_key_tail,
             };
             return @import("nlj.zig").NestedLoopJoin.create(allocator, left_in, right_in, nl_spec);
         }
@@ -1253,6 +1329,7 @@ pub const Join = struct {
                 .algorithm = .sort_merge,
                 .extra_predicate = spec.extra_predicate,
                 .ranges = spec.ranges,
+                .left_key_tail = spec.left_key_tail,
             };
             return @import("smj.zig").SortMergeJoin.create(allocator, left_in, right_in, sm_spec);
         }
@@ -1263,6 +1340,7 @@ pub const Join = struct {
 
         const left_schema = left_in.outputSchema();
         const right_schema = right_in.outputSchema();
+        const left_emit = try leftEmitCount(left_schema, spec);
 
         // Resolve key column indices on each side.
         const left_keys = try aa.alloc(usize, spec.on.len);
@@ -1310,7 +1388,7 @@ pub const Join = struct {
         for (right_keys) |idx| right_kept_mask[idx] = false;
         for (right_schema, 0..) |rc, ri| {
             if (!right_kept_mask[ri]) continue;
-            for (left_schema) |lc| {
+            for (left_schema[0..left_emit]) |lc| {
                 if (types.columnNameEql(lc.name, rc.name)) {
                     right_kept_mask[ri] = false;
                     break;
@@ -1342,13 +1420,13 @@ pub const Join = struct {
         // Duplicate right-side names were already removed from
         // right_kept_mask above; this final collision check protects
         // against duplicates within the kept right-side schema.
-        const output_schema = try allocator.alloc(Column, left_schema.len + right_kept_count);
+        const output_schema = try allocator.alloc(Column, left_emit + right_kept_count);
         errdefer allocator.free(output_schema);
-        for (left_schema, 0..) |c, i| {
+        for (left_schema[0..left_emit], 0..) |c, i| {
             output_schema[i] = c;
             if (left_nullable_in_output) output_schema[i].nullable = true;
         }
-        var out_idx: usize = left_schema.len;
+        var out_idx: usize = left_emit;
         for (right_schema, 0..) |c, i| {
             if (!right_kept_mask[i]) continue;
             // Check against left columns + already-placed right columns.
@@ -1394,7 +1472,7 @@ pub const Join = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
-        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_schema.len, right_kept_mask, output_schema.len);
+        const cached_stats = try exec.concatJoinStats(allocator, left, right, left_emit, right_kept_mask, output_schema.len);
         errdefer if (cached_stats.len > 0) allocator.free(cached_stats);
 
         const self = try allocator.create(Join);
@@ -1417,7 +1495,7 @@ pub const Join = struct {
             .skew_sample_interval = if (spec.skew_sample_interval == 0) 1 else spec.skew_sample_interval,
             .build_is_left = build_is_left,
             .output_schema = output_schema,
-            .left_col_count = left_schema.len,
+            .left_col_count = left_emit,
             .right_kept_mask = right_kept_mask_owned,
             .cached_stats = cached_stats,
             .build_columns = build_columns,
@@ -2157,6 +2235,7 @@ pub const Join = struct {
                 break :blk pairs;
             },
             .algorithm = .sort_merge,
+            .left_key_tail = self.left.outputSchema().len - self.left_col_count,
         };
         defer self.allocator.free(@constCast(smj_spec.on));
 

@@ -126,6 +126,7 @@ pub fn resolveWithRegistry(
     // decimal operand never falls into an int/double overload that ignores scale.
     if (try resolveDecimal(aa, name, arg_types)) |ov| return ov;
     if (try resolveIntArith(aa, name, arg_types)) |ov| return ov;
+    if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
 
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
@@ -471,6 +472,7 @@ fn resolveIntArith(aa: Allocator, name: []const u8, arg_types: []const Type) !?R
 /// registered UDF. Name-only, so it holds before argument types are known.
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "to_decimal")) return true;
+    if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
     for (builtins) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return true;
@@ -513,6 +515,48 @@ pub fn castFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
         .decimal64, .decimal128, .uuid => return null,
     };
     return try arena.dupe(u8, name);
+}
+
+const TEXT_KEY_PREFIX = "text_key:";
+
+/// The function that reads a text join key as `ty`, the other key's type:
+/// each row becomes the `ty` value it equals under the comparison rule, or
+/// NULL (`dec.textKeyKernel`). The target rides in the name, as CAST's
+/// DECIMAL target does; null when no such reading exists.
+pub fn textKeyFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
+    if (ty.decimalSpec()) |spec| return try std.fmt.allocPrint(arena, TEXT_KEY_PREFIX ++ "decimal:{d}:{d}", .{ spec.p, spec.s });
+    return switch (ty) {
+        .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .date, .datetime => try std.fmt.allocPrint(arena, TEXT_KEY_PREFIX ++ "{s}", .{@tagName(ty)}),
+        else => null,
+    };
+}
+
+/// True for a function a join lays over one key column to convert it:
+/// `castFnName`'s and `textKeyFnName`'s.
+pub fn isKeyConversionFn(name: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(name, "to_") or std.mem.startsWith(u8, name, TEXT_KEY_PREFIX);
+}
+
+fn resolveTextKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (!std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return null;
+    if (arg_types.len != 1 or !arg_types[0].isString()) return null;
+    const target = textKeyTarget(name[TEXT_KEY_PREFIX.len..]) orelse return null;
+    return try buildDecFn(aa, name, arg_types, target, dec.textKeyKernel, .kernel_managed);
+}
+
+fn textKeyTarget(spec: []const u8) ?Type {
+    var it = std.mem.splitScalar(u8, spec, ':');
+    const head = it.next() orelse return null;
+    if (std.mem.eql(u8, head, "decimal")) {
+        const p = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+        const s = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+        return dec.decTypeFor(p, s);
+    }
+    const tag = std.meta.stringToEnum(TypeTag, head) orelse return null;
+    return switch (tag) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .date, .datetime => |t| t,
+        else => null,
+    };
 }
 
 fn resolveToDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
