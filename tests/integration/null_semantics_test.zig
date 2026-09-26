@@ -719,3 +719,45 @@ test "group_concat: skips NULLs, all-NULL group emits NULL, custom separator, ro
     try std.testing.expect(!b.values[1].isValid(1));
     try std.testing.expectEqual(@as(i64, 2), b.values[2].data.bigint[1]);
 }
+
+test "null literal arguments take a sibling argument's type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE nd (id BIGINT PRIMARY KEY, amt DOUBLE, d DATE)");
+    try exec(allocator, db, "INSERT INTO nd (id, amt, d) VALUES (1, 1.5, '2024-01-01'), (2, NULL, NULL), (3, 0, '2024-02-01')");
+
+    const cases = .{
+        .{ "SELECT COUNT(COALESCE(NULL, amt)) FROM nd", 2 },
+        .{ "SELECT COUNT(COALESCE(amt, NULL)) FROM nd", 2 },
+        .{ "SELECT COUNT(COALESCE(NULL, NULL, id)) FROM nd", 3 },
+        .{ "SELECT COUNT(IFNULL(NULL, amt)) FROM nd", 2 },
+        .{ "SELECT COUNT(COALESCE(NULL, d)) FROM nd", 2 },
+        .{ "SELECT COUNT(amt + NULL) FROM nd", 0 },
+        .{ "SELECT COUNT(NULL - id) FROM nd", 0 },
+        .{ "SELECT COUNT(GREATEST(amt, NULL)) FROM nd", 0 },
+        .{ "SELECT COUNT(*) FROM nd WHERE COALESCE(amt, NULL) > 1", 1 },
+        .{ "SELECT COUNT(NULLIF(amt, 0)) FROM nd", 1 },
+        .{ "SELECT COUNT(NULLIF(amt, 1.5)) FROM nd", 1 },
+        .{ "SELECT COUNT(1 / NULLIF(amt, 0)) FROM nd", 1 },
+        .{ "SELECT COUNT(NULLIF(d, '2024-01-01')) FROM nd", 1 },
+        .{ "SELECT COUNT(NULLIF(amt > 1, true)) FROM nd", 1 },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, &.{c[1]}, got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var q = try runSql(allocator, db, "SELECT COALESCE(NULL, amt) AS x, NULL + 1 AS y FROM nd");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(thindb.types.TypeTag.double, std.meta.activeTag(schema[0].type));
+    try std.testing.expectEqual(thindb.types.TypeTag.bigint, std.meta.activeTag(schema[1].type));
+}
