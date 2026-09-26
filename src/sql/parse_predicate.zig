@@ -191,7 +191,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         };
         switch (p.cur.tag) {
             .kw_is => return .{ .always = try parseIsNullTail(p) },
-            .kw_not, .kw_between, .kw_like, .kw_in => {
+            .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
                 return try parseColOps(p, try p.materializePredicateExpr(lhs));
             },
             else => {},
@@ -319,7 +319,7 @@ fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     switch (p.cur.tag) {
         // `ABS(x) BETWEEN ...`, `fn(x) IN (...)`, `fn(x) IS NULL`: anchor the
         // call to a hidden computed column and reuse the operator tail.
-        .kw_is, .kw_not, .kw_between, .kw_like, .kw_in => {
+        .kw_is, .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
             const anchored = try p.materializePredicateExpr(lhs);
             return try parseColOps(p, anchored);
         },
@@ -393,6 +393,19 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         const pattern = try p.arena.dupe(u8, p.cur.value.string);
         try p.advance();
         var pe: PredicateExpr = .{ .like = .{ .col = col_dup, .pattern = pattern } };
+        if (negate_predicate) pe = try negatePredicate(p, pe);
+        return pe;
+    }
+
+    // s REGEXP pattern / s RLIKE pattern (MySQL): regexp_like, a search
+    // anywhere in s, as REGEXP_LIKE and MySQL both read it.
+    if (p.cur.tag == .kw_regexp) {
+        try p.advance();
+        const args = try p.arena.alloc(ir.Expr, 2);
+        args[0] = .{ .col_ref = col_dup };
+        args[1] = try p.parseAddSub();
+        const call: ir.Expr = .{ .call = .{ .fn_name = try p.arena.dupe(u8, "regexp_like"), .args = args } };
+        var pe = try makeExprComparisonPredicate(p, call, .neq, .{ .lit = .{ .int = 0 } });
         if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
     }
@@ -644,7 +657,7 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
     return isComparisonToken(op_tok.tag) or switch (op_tok.tag) {
         // `(expr) BETWEEN/IN/IS/LIKE/NOT ...` — the group anchors to a
         // hidden computed column and takes the normal operator tail.
-        .kw_between, .kw_in, .kw_is, .kw_like, .kw_not => true,
+        .kw_between, .kw_in, .kw_is, .kw_like, .kw_regexp, .kw_not => true,
         else => false,
     };
 }

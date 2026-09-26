@@ -1860,7 +1860,7 @@ pub const Parser = struct {
                 .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into => {
                     if (depth == 0) return false;
                 },
-                .eq, .neq, .lt, .lte, .gt, .gte, .kw_is, .kw_in, .kw_between, .kw_like, .kw_and, .kw_or, .kw_not => {
+                .eq, .neq, .lt, .lte, .gt, .gte, .kw_is, .kw_in, .kw_between, .kw_like, .kw_regexp, .kw_and, .kw_or, .kw_not => {
                     if (depth == 0) return true;
                 },
                 .pipe_pipe => if (depth == 0 and self.lex.dialect == .mysql) return true,

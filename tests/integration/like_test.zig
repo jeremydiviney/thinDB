@@ -97,3 +97,28 @@ test "LIKE: matcher unit tests" {
     try std.testing.expect(thindb.exec.predicate.likeMatch("ababc", "a%c"));
     try std.testing.expect(!thindb.exec.predicate.likeMatch("ababc", "a%d"));
 }
+
+test "REGEXP and RLIKE match anywhere in the string" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT id FROM t WHERE name REGEXP '^al' ORDER BY id", &[_]i64{ 1, 2, 5 } },
+        .{ "SELECT id FROM t WHERE name RLIKE 'ta$' ORDER BY id", &[_]i64{3} },
+        .{ "SELECT id FROM t WHERE name regexp 'mm' ORDER BY id", &[_]i64{4} },
+        .{ "SELECT id FROM t WHERE name NOT REGEXP 'a$' ORDER BY id", &[_]i64{ 2, 5 } },
+        .{ "SELECT id FROM t WHERE NOT name RLIKE '^al' ORDER BY id", &[_]i64{ 3, 4 } },
+        .{ "SELECT id FROM t WHERE UPPER(name) REGEXP '^AL.+T$' ORDER BY id", &[_]i64{2} },
+        .{ "SELECT id FROM t WHERE name REGEXP CONCAT('^', 'g') OR id = 5 ORDER BY id", &[_]i64{ 4, 5 } },
+        .{ "SELECT id FROM t WHERE id > 1 AND name REGEXP 'b' ORDER BY id", &[_]i64{ 2, 3 } },
+    };
+    inline for (cases) |case| {
+        const ids = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, case[1], ids);
+    }
+}
