@@ -6,8 +6,7 @@
 //!   - WHERE col cmp (SELECT ...)
 //!   - SELECT (SELECT ...) AS alias FROM ...
 //!   - Inside arithmetic / function calls / CASE branches
-//!   - Postgres semantics: multi-row → error, multi-col → error,
-//!     zero-row → error (Tier 2 may revisit zero-row → NULL).
+//!   - multi-row → error, multi-col → error, zero rows → NULL.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -186,4 +185,36 @@ test "scalar subquery: a statement constant beside an aggregate" {
         defer allocator.free(got);
         try std.testing.expectEqualSlices(i64, case[1], got);
     }
+}
+
+test "scalar subquery: a NULL result or no rows reads as NULL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE n (id BIGINT PRIMARY KEY, v INT)");
+    try exec(allocator, db, "INSERT INTO n (id, v) VALUES (1, NULL), (2, 3)");
+
+    const cases = .{
+        // A comparison with NULL keeps no row, whichever way it is negated.
+        .{ "SELECT id FROM t WHERE qty > (SELECT v FROM n WHERE id = 1)", &[_]i64{} },
+        .{ "SELECT id FROM t WHERE NOT (qty > (SELECT v FROM n WHERE id = 1))", &[_]i64{} },
+        .{ "SELECT id FROM t WHERE qty > (SELECT v FROM n WHERE id = 99)", &[_]i64{} },
+        .{ "SELECT id FROM t WHERE qty > (SELECT MAX(id) FROM n WHERE id = 99)", &[_]i64{} },
+        .{ "SELECT id FROM t WHERE qty > (SELECT v FROM n WHERE id = 2) ORDER BY id", &[_]i64{ 1, 2, 3, 4, 5 } },
+        .{ "SELECT COALESCE((SELECT MAX(id) FROM n WHERE id = 99), -1) AS x FROM t", &[_]i64{ -1, -1, -1, -1, -1 } },
+        .{ "SELECT COALESCE((SELECT id FROM n WHERE id = 99), -1) AS x FROM t", &[_]i64{ -1, -1, -1, -1, -1 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    var q = try runSql(allocator, db, "SELECT id + (SELECT MAX(id) FROM n WHERE id = 99) AS s FROM t");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 5), batch.row_count);
+    for (0..batch.row_count) |i| try std.testing.expect(!batch.values[0].isValid(i));
 }
