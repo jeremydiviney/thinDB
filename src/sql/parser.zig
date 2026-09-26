@@ -1773,7 +1773,8 @@ pub const Parser = struct {
         return dateAddSubName(name) != null or
             std.ascii.eqlIgnoreCase(name, "cast") or
             std.ascii.eqlIgnoreCase(name, "convert") or
-            std.ascii.eqlIgnoreCase(name, "extract");
+            std.ascii.eqlIgnoreCase(name, "extract") or
+            std.ascii.eqlIgnoreCase(name, "trim");
     }
 
     pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
@@ -1781,9 +1782,55 @@ pub const Parser = struct {
         if (std.ascii.eqlIgnoreCase(name, "cast")) return try self.parseCastCallAfterName();
         if (std.ascii.eqlIgnoreCase(name, "convert")) return try self.parseConvertCallAfterName();
         if (std.ascii.eqlIgnoreCase(name, "extract")) return try self.parseExtractCall();
+        if (std.ascii.eqlIgnoreCase(name, "trim")) return try self.parseTrimCall();
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
         const args = try self.parseCallArgList(null);
         return try self.makeScalarCallExpr(name, args);
+    }
+
+    /// TRIM([BOTH | LEADING | TRAILING] [remstr] FROM s) removes whole copies
+    /// of remstr (spaces when it is left out), as MySQL does. TRIM(s) and
+    /// TRIM(s, chars) stay ordinary calls.
+    fn parseTrimCall(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        const side = try self.trimSideAhead();
+        if (side != null) try self.advance();
+        const first: ?ir.Expr = if (self.cur.tag == .kw_from) null else try self.parseCallArg();
+        if (side == null and self.cur.tag != .kw_from) {
+            var args: std.ArrayList(ir.Expr) = .empty;
+            try args.append(self.arena, first.?);
+            while (self.cur.tag == .comma) {
+                try self.advance();
+                try args.append(self.arena, try self.parseCallArg());
+            }
+            try self.expect(.rparen);
+            return try self.makeScalarCallExpr("trim", try args.toOwnedSlice(self.arena));
+        }
+        try self.expect(.kw_from);
+        const source = try self.parseCallArg();
+        try self.expect(.rparen);
+        const args = try self.arena.alloc(ir.Expr, if (first == null) 1 else 2);
+        args[0] = source;
+        if (first) |remove| args[1] = remove;
+        const fn_name: []const u8 = switch (side orelse .both) {
+            .leading => if (first == null) "ltrim" else "ltrim_substring",
+            .trailing => if (first == null) "rtrim" else "rtrim_substring",
+            .both => if (first == null) "trim" else "trim_substring",
+        };
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = args } };
+    }
+
+    /// The side word opening a TRIM argument list. A lone `both` (or
+    /// `leading`, `trailing`) before `)` or `,` is a column of that name.
+    fn trimSideAhead(self: *Parser) ParseError!?enum { leading, trailing, both } {
+        if (self.cur.tag != .identifier) return null;
+        var look = self.lex.*;
+        const next = try look.next();
+        if (next.tag == .rparen or next.tag == .comma) return null;
+        if (std.ascii.eqlIgnoreCase(self.cur.text, "leading")) return .leading;
+        if (std.ascii.eqlIgnoreCase(self.cur.text, "trailing")) return .trailing;
+        if (std.ascii.eqlIgnoreCase(self.cur.text, "both")) return .both;
+        return null;
     }
 
     fn parseIfCallAfterName(self: *Parser) ParseError!ir.Expr {
