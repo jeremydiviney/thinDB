@@ -2129,8 +2129,7 @@ pub const Parser = struct {
                     if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
                     value_col = try self.arena.dupe(u8, c);
                 },
-                .call, .case, .lit => value_expr = args[0],
-                else => return ParseError.SqlInvalidProjection,
+                else => value_expr = args[0],
             }
             var key_col: ?[]const u8 = null;
             var key_expr: ?ir.Expr = null;
@@ -2139,8 +2138,7 @@ pub const Parser = struct {
                     if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
                     key_col = try self.arena.dupe(u8, c);
                 },
-                .call, .case, .lit => key_expr = args[1],
-                else => return ParseError.SqlInvalidProjection,
+                else => key_expr = args[1],
             }
             const default_name = try self.arena.dupe(u8, "max_by(expr)");
             return .{ .default_name = default_name, .agg = .{
@@ -2197,13 +2195,11 @@ pub const Parser = struct {
                     arg_col = try self.arena.dupe(u8, c);
                 }
             },
-            // Expression arg — e.g. SUM(a * b) or COUNT(upper(name)).
-            // Hoisted into a synthetic Compute column before the
-            // GroupBy step; see parseStatement's pre-aggregate pass.
-            .call, .case, .lit => arg_expr = value_args[0],
-            // Subqueries / EXISTS as aggregate args are out of scope
-            // for v1; users can pre-aggregate via a CTE.
-            else => return ParseError.SqlInvalidProjection,
+            // Any other argument — SUM(a * b), COUNT(upper(name)),
+            // SUM((SELECT ...)) — is hoisted into a synthetic Compute
+            // column before the GroupBy step; see parseStatement's
+            // pre-aggregate pass.
+            else => arg_expr = value_args[0],
         }
         const default_name = blk: {
             var buf: std.ArrayList(u8) = .empty;
