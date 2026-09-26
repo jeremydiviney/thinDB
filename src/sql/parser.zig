@@ -2325,6 +2325,9 @@ pub const Parser = struct {
     /// rewrite to searched form (`CASE WHEN col = v THEN ...`).
     fn parseCaseExpr(self: *Parser) ParseError!ir.Expr {
         try self.expect(.kw_case);
+        // Simple CASE (`CASE x WHEN v THEN ...`): each branch tests `x = v`,
+        // so a NULL operand takes no WHEN.
+        const operand: ?ir.Expr = if (self.cur.tag == .kw_when) null else try self.parseCallArg();
         if (self.cur.tag != .kw_when) return ParseError.SqlExpectedKeyword;
 
         var branches: std.ArrayList(ir.Expr.Branch) = .empty;
@@ -2332,7 +2335,10 @@ pub const Parser = struct {
 
         while (self.cur.tag == .kw_when) {
             try self.advance();
-            const cond = try self.parseBoolExpr();
+            const cond = if (operand) |x|
+                try parse_predicate.makeExprComparisonPredicate(self, x, .eq, try self.parseCallArg())
+            else
+                try self.parseBoolExpr();
             if (self.cur.tag != .kw_then) return ParseError.SqlExpectedKeyword;
             try self.advance();
             const then_expr = try self.parseCallArg();
