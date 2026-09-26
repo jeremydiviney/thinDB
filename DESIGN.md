@@ -411,6 +411,18 @@ output. A name that both inputs have is an error (`SqlOnColumnAmbiguous`, MySQL
 1052). If an input's columns can't be listed (a file scan, or a parse without
 the catalog), unqualified names on that join don't resolve.
 
+`JOIN ... USING (c, ...)` is an equi join on each named column. The parser
+merges each `c` into one bare output column holding the left value, the right
+value under RIGHT JOIN, or their COALESCE under FULL JOIN. `left.c` and
+`right.c` stay addressable, so `LEFT JOIN r USING (id) WHERE r.id IS NULL`
+works. `NATURAL JOIN` is USING over every column name both sides show, which
+requires both inputs' columns to be listable. A bare `*` over such a FROM
+clause becomes the explicit list MySQL shows: the merged columns in the first
+input's order, then that input's other columns, then the second's. The right
+input counts as first under RIGHT JOIN. An exclude drops each column a name
+spells or resolves to, so hidden join keys staged below an aliased input leave
+`*` too.
+
 Before preparing a fused hash join, a pure filter over an existing materialized
 stage may check that stage for a surviving probe row. An empty probe skips the
 lookup builds through a chain of non-FULL joins. The check reuses stage buffers,
