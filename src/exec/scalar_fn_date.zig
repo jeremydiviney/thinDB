@@ -8,6 +8,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const common = @import("scalar_fn_common.zig");
+const datefmt = @import("scalar_fn_datefmt.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
@@ -398,8 +399,8 @@ pub fn lastDayFromDatetimeKernel(allocator: Allocator, args: []const ColumnView,
 // Additional date/time names and unit-based diff/add helpers.
 // ---------------------------------------------------------------------------
 
-const day_names = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
-const month_names = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+const day_names = datefmt.day_names;
+const month_names = datefmt.month_names;
 
 pub fn daynameFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.date;
@@ -536,30 +537,10 @@ pub fn timestampAddDatetimeKernel(allocator: Allocator, args: []const ColumnView
 }
 
 // ---------------------------------------------------------------------------
-// date_format — MySQL-style strftime subset. Recognised specifiers:
-//   %Y  4-digit year   %y  2-digit year (last two digits)
-//   %m  month 01-12    %d  day 01-31
-//   %H  hour 00-23     %i  minute 00-59  %s  second 00-59
-//   %%  literal '%'
-// Other %X sequences pass through with the '%' stripped (matches MySQL's
-// "unknown specifier" behavior); bare text is copied verbatim.
-//
-// Per-row format strings are allowed but rare — most callers pass a literal
-// format. We don't precompile (would require constant folding); each row
-// re-parses, which is fine at ~few hundred ns per row.
+// date_format: MySQL's specifiers (scalar_fn_datefmt.zig). Per-row format
+// strings are allowed; each row re-reads its format, which costs a few
+// hundred ns.
 // ---------------------------------------------------------------------------
-
-fn appendDigits2(buf: *std.ArrayList(u8), aa: Allocator, v: u64) !void {
-    try buf.append(aa, @intCast('0' + (v / 10) % 10));
-    try buf.append(aa, @intCast('0' + (v % 10)));
-}
-
-fn appendDigits4(buf: *std.ArrayList(u8), aa: Allocator, v: u64) !void {
-    try buf.append(aa, @intCast('0' + (v / 1000) % 10));
-    try buf.append(aa, @intCast('0' + (v / 100) % 10));
-    try buf.append(aa, @intCast('0' + (v / 10) % 10));
-    try buf.append(aa, @intCast('0' + (v % 10)));
-}
 
 fn dateFormatRow(
     allocator: Allocator,
@@ -568,41 +549,9 @@ fn dateFormatRow(
     days: i32,
     micros_into_day: i64,
 ) !void {
-    const ymd = daysToYmd(days);
-    const hms = microsToHms(micros_into_day);
-    // DATE's range is years 0000-9999; arithmetic can step outside it.
-    const year: u64 = @intCast(std.math.clamp(ymd.year, 0, 9999));
-
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < fmt.len) {
-        if (fmt[i] != '%') {
-            try buf.append(allocator, fmt[i]);
-            i += 1;
-            continue;
-        }
-        if (i + 1 >= fmt.len) {
-            try buf.append(allocator, '%');
-            i += 1;
-            continue;
-        }
-        const spec = fmt[i + 1];
-        i += 2;
-        switch (spec) {
-            'Y' => try appendDigits4(&buf, allocator, year),
-            'y' => try appendDigits2(&buf, allocator, year % 100),
-            'm' => try appendDigits2(&buf, allocator, ymd.month),
-            'd' => try appendDigits2(&buf, allocator, ymd.day),
-            'H' => try appendDigits2(&buf, allocator, hms.hour),
-            'i' => try appendDigits2(&buf, allocator, hms.minute),
-            's' => try appendDigits2(&buf, allocator, hms.second),
-            '%' => try buf.append(allocator, '%'),
-            else => try buf.append(allocator, spec), // unknown: pass through stripped
-        }
-    }
-
+    try datefmt.format(allocator, &buf, fmt, days, micros_into_day);
     try stringStoreOf(out).appendValue(allocator, buf.items);
 }
 
