@@ -71,7 +71,9 @@ pub fn signKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
 // `scalar_fn.intArithResultType` picks an integer operation's width
 // (DESIGN.md §3.4) and the resolver casts both operands to it, so each integer
 // kernel reads two same-width columns. Integer results wrap in two's
-// complement, as StarRocks does. `/` and floating operands follow IEEE.
+// complement, as StarRocks does. Division registers `.zero_divisor`, so
+// Compute nulls a zero-divisor row and the kernel writes 0 there. Floating
+// operands otherwise follow IEEE.
 // ---------------------------------------------------------------------------
 
 const Kernel = *const fn (allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void;
@@ -155,36 +157,31 @@ pub fn mulDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *Col
 
 pub const DivMod = enum { div, mod };
 
-/// Integer DIV (truncating) or MOD (dividend's sign). A zero divisor yields
-/// NULL, so the kernel owns the validity bitmap (`null_strategy =
-/// .kernel_managed`). A -1 divisor is answered without dividing because
-/// minInt ÷ -1 traps x86 `idiv`: DIV negates with wrap (minInt DIV -1 =
-/// minInt, as in StarRocks) and MOD is 0.
+/// Integer DIV (truncating) or MOD (dividend's sign). A -1 divisor is answered
+/// without dividing because minInt ÷ -1 traps x86 `idiv`: DIV negates with
+/// wrap (minInt DIV -1 = minInt, as in StarRocks) and MOD is 0.
 pub fn intDivModKernel(comptime T: type, comptime op: DivMod) Kernel {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
             const a = @field(args[0].data, intField(T))[0..row_count];
             const b = @field(args[1].data, intField(T))[0..row_count];
             const dst = try reserveInts(T, allocator, out, row_count);
-            const base = out.data.rowCount() - row_count;
-            for (a, b, dst, 0..) |x, y, *d, row| {
+            for (a, b, dst) |x, y, *d| {
                 d.* = switch (y) {
                     0 => 0,
                     -1 => if (op == .div) 0 -% x else 0,
                     else => if (op == .div) @divTrunc(x, y) else @rem(x, y),
                 };
-                const valid = y != 0 and args[0].isValid(row) and args[1].isValid(row);
-                try out.appendValidBit(allocator, base + row, valid);
             }
         }
     }.kernel;
 }
 
 pub fn divDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, a[i] / b[i]);
+    const a = args[0].data.double[0..row_count];
+    const b = args[1].data.double[0..row_count];
+    const dst = try reserveDouble(allocator, out, row_count);
+    for (a, b, dst) |x, y, *d| d.* = if (y == 0) 0 else x / y;
 }
 
 pub const powKernel = finiteOrNull(struct {

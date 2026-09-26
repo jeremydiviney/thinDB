@@ -591,3 +591,109 @@ test "a math function answers a domain error or overflow with NULL" {
         try std.testing.expectEqual(c[1].len, row);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Division by zero
+// ---------------------------------------------------------------------------
+
+fn numericCell(t: thindb.types.Type, v: thindb.storage.ColumnView, row: usize) !?f64 {
+    if (!v.isValid(row)) return null;
+    return switch (v.data) {
+        .double => |s| s[row],
+        .bigint => |s| @floatFromInt(s[row]),
+        .int => |s| @floatFromInt(s[row]),
+        .decimal64 => |s| @as(f64, @floatFromInt(s[row])) / std.math.pow(f64, 10, @floatFromInt(t.decimalSpec().?.s)),
+        .decimal128 => |s| @as(f64, @floatFromInt(s[row])) / std.math.pow(f64, 10, @floatFromInt(t.decimalSpec().?.s)),
+        else => error.TestUnexpectedResult,
+    };
+}
+
+fn expectNumericColumn(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: []const ?f64) !void {
+    var q = try helpers.runSql(allocator, db, sql);
+    defer q.deinit();
+    const t = q.outputSchema()[0].type;
+    var row: usize = 0;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            const got = try numericCell(t, b.values[0], r);
+            const same = if (want[row]) |w| got != null and std.math.approxEqRel(f64, w, got.?, 1e-12) else got == null;
+            if (!same) {
+                std.debug.print("{s} row {d}: want {?d} got {?d}\n", .{ sql, row, want[row], got });
+                return error.TestUnexpectedResult;
+            }
+            row += 1;
+        }
+    }
+    try std.testing.expectEqual(want.len, row);
+}
+
+test "division by zero is NULL for every numeric type and operator" {
+    // MySQL and StarRocks answer `/`, DIV, %, MOD and PMOD by zero with NULL.
+    // thinDB returned ±inf or NaN for `/`, and 0 for a decimal divisor, which
+    // then leaked into SUM/AVG and passed range filters.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE dz (id BIGINT PRIMARY KEY, x DOUBLE, y DOUBLE, n BIGINT, k INT, d DECIMAL(10,2), e DECIMAL(10,2))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO dz (id, x, y, n, k, d, e) VALUES
+        \\(1, 6.0, 2.0, 6, 2, 6.00, 2.00),
+        \\(2, 6.0, 0.0, 6, 0, 6.00, 0.00),
+        \\(3, 0.0, 0.0, 0, 0, 0.00, 0.00),
+        \\(4, -6.0, -0.0, -6, 0, -6.00, 0.00),
+        \\(5, NULL, 2.0, NULL, 2, NULL, 2.00),
+        \\(6, 6.0, NULL, 6, NULL, 6.00, NULL)
+    );
+
+    const all_null = [_]?f64{ null, null, null, null, null, null };
+    const cases = .{
+        .{ "x / y", [_]?f64{ 3, null, null, null, null, null } },
+        .{ "n / k", [_]?f64{ 3, null, null, null, null, null } },
+        .{ "d / e", [_]?f64{ 3, null, null, null, null, null } },
+        .{ "d / y", [_]?f64{ 3, null, null, null, null, null } },
+        .{ "x / e", [_]?f64{ 3, null, null, null, null, null } },
+        .{ "n DIV k", [_]?f64{ 3, null, null, null, null, null } },
+        .{ "n % k", [_]?f64{ 0, null, null, null, null, null } },
+        .{ "MOD(n, k)", [_]?f64{ 0, null, null, null, null, null } },
+        .{ "PMOD(n, k)", [_]?f64{ 0, null, null, null, null, null } },
+        .{ "d % e", [_]?f64{ 0, null, null, null, null, null } },
+        .{ "x % y", [_]?f64{ 0, null, null, null, null, null } },
+        .{ "(x + 1) / (y - 2)", [_]?f64{ null, -3.5, -0.5, 2.5, null, null } },
+        .{ "x / 0", all_null },
+        .{ "x / 0.0", all_null },
+        .{ "n / 0", all_null },
+        .{ "d / 0.00", all_null },
+        .{ "0.0 / 0", all_null },
+        .{ "id / (id - id)", all_null },
+        .{ "id / 2", [_]?f64{ 0.5, 1, 1.5, 2, 2.5, 3 } },
+    };
+    inline for (cases) |c| {
+        const want = c[1];
+        try expectNumericColumn(allocator, db, "SELECT " ++ c[0] ++ " FROM dz ORDER BY id", &want);
+    }
+
+    // Aggregates skip the NULLs, and no inf or NaN reaches a filter.
+    try expectNumericColumn(allocator, db, "SELECT SUM(x / y) FROM dz", &.{3});
+    try expectNumericColumn(allocator, db, "SELECT COUNT(n / k) FROM dz", &.{1});
+    try expectNumericColumn(allocator, db, "SELECT AVG(d / e) FROM dz", &.{3});
+    try expectNumericColumn(allocator, db, "SELECT id FROM dz WHERE x / y > 0 OR x / y < 0 ORDER BY id", &.{1});
+    try expectNumericColumn(allocator, db, "SELECT id FROM dz WHERE n / k IS NULL ORDER BY id", &.{ 2, 3, 4, 5, 6 });
+
+    // Only a divisor that can be zero makes the result nullable.
+    const nullability = .{
+        .{ "id / 2", false },
+        .{ "id % 10", false },
+        .{ "id DIV 3", false },
+        .{ "id / 2.5", false },
+        .{ "id / 0", true },
+        .{ "id / k", true },
+        .{ "id / id", true },
+    };
+    inline for (nullability) |c| {
+        var q = try helpers.runSql(allocator, db, "SELECT " ++ c[0] ++ " FROM dz");
+        defer q.deinit();
+        try std.testing.expectEqual(c[1], q.outputSchema()[0].nullable);
+    }
+}

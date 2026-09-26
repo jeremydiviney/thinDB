@@ -114,7 +114,7 @@ error on overflow at row level.
 | `-a` | `a`'s type widened one level (parsed as `0 - a`) | `-BIGINT_MIN = BIGINT_MIN` |
 | `a DIV b`, `a % b` | common type | `INT_MIN DIV -1 = INT_MIN`, `BIGINT_MIN DIV -1 = BIGINT_MIN`, `x % -1 = 0`; a zero divisor gives NULL |
 | `ABS(a)` | SMALLINT→INT, INT→BIGINT, BIGINT→BIGINT | `ABS(BIGINT_MIN) = BIGINT_MIN` |
-| `a / b` | `DOUBLE` (or `DECIMAL`) | IEEE; `/ 0` is ±inf |
+| `a / b` | `DOUBLE` (or `DECIMAL`) | a zero divisor gives NULL |
 
 An integer literal in integer arithmetic takes the narrowest type that holds
 it, so `SELECT 2147483647 + 1` is INT + TINYINT → BIGINT `2147483648`, and
@@ -132,7 +132,16 @@ wraps to `BIGINT_MIN`.
 domain error (`SQRT(-1)`, `LN(0)`, `ASIN(2)`, `LOG(1, x)`), overflow
 (`EXP(1000)`, `POW(10, 400)`), or a zero divisor in a float `%`, `MOD` or
 `FMOD`. This is StarRocks' rule; MySQL agrees on domain errors and raises an
-error on overflow. The `/` operator still follows IEEE (table above).
+error on overflow.
+
+**Division by zero** is NULL for every numeric type: `/`, `DIV`, `%`, `MOD`
+and `PMOD`, over integers, DOUBLE and DECIMAL alike. MySQL and StarRocks
+answer it the same way. Such a function registers the `.zero_divisor` null
+strategy, and Compute nulls each row whose divisor is 0 wherever the
+expression appears: a projection, a filter, an aggregate's input. The result
+is nullable unless the divisor is a nonzero literal, so `x / 100` over a NOT
+NULL column stays NOT NULL. A nonzero divisor otherwise follows IEEE: an
+infinite operand or an overflow still gives ±inf.
 
 **Aggregates**:
 

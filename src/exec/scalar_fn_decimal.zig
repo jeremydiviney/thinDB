@@ -238,7 +238,9 @@ fn arithDecimal(
     while (row < n) : (row += 1) {
         const a = mantissaAt(args[0], row);
         const b = mantissaAt(args[1], row);
-        const valid = rowValid(args, row);
+        // A zero divisor's row is NULL (`.zero_divisor`), so it must not
+        // raise an overflow while aligning its operands.
+        const valid = rowValid(args, row) and !((op == .div or op == .mod) and b == 0);
         const mr: i128 = switch (op) {
             .add, .sub, .mod => blk: {
                 const ns = @max(s0, s1);
@@ -294,8 +296,8 @@ fn arithDouble(
             .add => a + b,
             .sub => a - b,
             .mul => a * b,
-            .div => a / b,
-            .mod => @rem(a, b),
+            .div => if (b == 0) 0 else a / b,
+            .mod => if (b == 0) 0 else @rem(a, b),
         };
         try out.data.double.append(allocator, r);
     }

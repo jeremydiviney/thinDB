@@ -659,11 +659,7 @@ pub fn appendFsstRows(allocator: Allocator, fv: storage.segment_reader.FsstView,
 /// range when the block carries no bitmap, else one bit per survivor.
 pub fn appendRowsValidity(allocator: Allocator, nulls: ?[]const u8, rows: []const u32, out: *ColumnStore) !void {
     if (out.nulls == null) return;
-    const dst_start = out.data.rowCount() - rows.len;
-    if (nulls == null) return out.appendValidityRange(allocator, dst_start, null, rows.len);
-    for (rows, 0..) |row, j| {
-        try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(nulls, row));
-    }
+    try out.appendGatheredValidity(allocator, out.data.rowCount() - rows.len, nulls, rows);
 }
 
 /// Append rows from `view` to `out`, picking by the given indices into `view`.
@@ -882,13 +878,7 @@ pub fn appendMaskedColumn(
         else => return err,
     };
     if (out.nulls != null) {
-        var j: usize = 0;
-        for (mask, 0..) |m, src_row| {
-            if (!m) continue;
-            const valid = storage.column.isValidBit(view.nulls, src_row);
-            try out.appendValidBit(allocator, dst_start + j, valid);
-            j += 1;
-        }
+        try out.appendMaskedValidity(allocator, dst_start, view.nulls, mask, out.data.rowCount() - dst_start);
     } else if (view.nulls != null) {
         for (mask, 0..) |m, src_row| {
             if (m and !storage.column.isValidBit(view.nulls, src_row)) return error.ColumnTypeMismatch;
@@ -1017,15 +1007,7 @@ pub fn appendGatheredColumn(allocator: Allocator, view: ColumnView, rows: []cons
             else => return false,
         },
     }
-    if (out.nulls != null) {
-        if (view.nulls == null) {
-            try out.appendValidityRange(allocator, dst_start, null, rows.len);
-        } else {
-            for (rows, 0..) |row, j| {
-                try out.appendValidBit(allocator, dst_start + j, storage.column.isValidBit(view.nulls, row));
-            }
-        }
-    }
+    try out.appendGatheredValidity(allocator, dst_start, view.nulls, rows);
     return true;
 }
 

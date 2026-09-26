@@ -7,7 +7,7 @@
 //!   - parenthesized sub-expressions
 //!   - composition with the existing scalar-function call syntax
 //!   - the natural "delta" pattern from the LAG bench
-//!   - integer DIV / MOD by zero returns NULL
+//!   - `/`, DIV and MOD by zero return NULL
 //!   - integer result types and wrapping match StarRocks (DESIGN.md §3.4)
 
 const std = @import("std");
@@ -221,7 +221,7 @@ test "binary arith: scalar call as binary operand" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 91, 82, 73 }, got);
 }
 
-test "binary arith: division by zero — slash follows IEEE, DIV and MOD return NULL" {
+test "binary arith: division by zero — slash, DIV and MOD return NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -230,14 +230,12 @@ test "binary arith: division by zero — slash follows IEEE, DIV and MOD return 
     defer db.close();
     try seedSimple(allocator, db);
 
-    // `/` widens to double, so /0 is IEEE infinity (StarRocks' NULL-on-zero
-    // for `/` is a dialect follow-up).
     var q = try runSql(allocator, db, "SELECT qty / 0 AS d, qty DIV 0 AS i, qty % 0 AS r FROM t ORDER BY id ASC");
     defer q.deinit();
     var n: usize = 0;
     while (try q.next()) |b| {
         for (0..b.row_count) |r| {
-            try std.testing.expect(std.math.isInf(b.values[0].data.double[r]));
+            try std.testing.expect(!b.values[0].isValid(r));
             try std.testing.expect(!b.values[1].isValid(r));
             try std.testing.expect(!b.values[2].isValid(r));
             n += 1;

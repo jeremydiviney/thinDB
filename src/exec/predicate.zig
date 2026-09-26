@@ -1001,13 +1001,6 @@ pub fn evaluatePredicate(
         .leaf => |p| {
             const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
             try evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
-            // Two-valued logic: NULL never matches a comparison.
-            const view = batch.values[col_idx];
-            if (view.nulls != null) {
-                for (0..batch.row_count) |i| {
-                    if (!view.isValid(i)) out[i] = false;
-                }
-            }
         },
         .day_leaf => |p| {
             const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
@@ -1098,12 +1091,6 @@ pub fn evaluateExprGuided(
         .leaf => |p| {
             const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
             try evaluateMaskWithPred(batch.values[col_idx], p, batch.row_count, out);
-            const view = batch.values[col_idx];
-            if (view.nulls != null) {
-                for (0..batch.row_count) |i| if (!view.isValid(i)) {
-                    out[i] = false;
-                };
-            }
         },
         .day_leaf => |p| {
             const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
@@ -1763,17 +1750,8 @@ pub fn evaluateColColMask(left: ColumnView, right: ColumnView, op: PredicateOp, 
             else => unreachable,
         },
     }
-    // NULL on either side → false.
-    if (left.nulls != null) {
-        for (0..n) |i| if (!left.isValid(i)) {
-            mask[i] = false;
-        };
-    }
-    if (right.nulls != null) {
-        for (0..n) |i| if (!right.isValid(i)) {
-            mask[i] = false;
-        };
-    }
+    clearNullRows(left.nulls, mask[0..n]);
+    clearNullRows(right.nulls, mask[0..n]);
 }
 
 fn stringCmpCol(l: anytype, r: anytype, op: PredicateOp, n: usize, mask: []bool) void {
@@ -1837,11 +1815,25 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
         .decimal128 => |s| cmpInto(i128, s[0..n], p.val.decimal128, mask[0..n], op),
         .uuid => |s| cmpInto(u128, s[0..n], p.val.uuid, mask[0..n], op),
     }
-    // Two-valued logic: a NULL value never matches a comparison.
-    if (view.nulls != null) {
-        for (0..n) |i| {
-            if (!view.isValid(i)) mask[i] = false;
+    clearNullRows(view.nulls, mask[0..n]);
+}
+
+/// Two-valued logic: a NULL value never matches a comparison, so clear the
+/// mask of every row whose validity bit is 0. A comparison runs as one SIMD
+/// pass, so a per-row bit test would cost more than the compare itself: a
+/// 64-row word of the bitmap that is all valid is skipped whole.
+fn clearNullRows(nulls: ?[]const u8, mask: []bool) void {
+    const bitmap = nulls orelse return;
+    var i: usize = 0;
+    while (i + 64 <= mask.len) : (i += 64) {
+        const word = std.mem.readInt(u64, bitmap[i / 8 ..][0..8], .little);
+        if (word == std.math.maxInt(u64)) continue;
+        for (mask[i..][0..64], 0..) |*m, bit| {
+            if ((word >> @intCast(bit)) & 1 == 0) m.* = false;
         }
+    }
+    while (i < mask.len) : (i += 1) {
+        if (!storage.column.isValidBit(bitmap, i)) mask[i] = false;
     }
 }
 
@@ -2137,4 +2129,24 @@ test "leafExcludesBlank classifies the provable shapes" {
     try t.expect(!leafExcludesBlank(.neq, .{ .text = "x" }));
     try t.expect(!leafExcludesBlank(.lt, .{ .text = "z" }));
     try t.expect(!leafExcludesBlank(.gt, .{ .bigint = 5 }));
+}
+
+test "clearNullRows clears exactly the NULL rows across word boundaries" {
+    var prng = std.Random.DefaultPrng.init(0xc1ea7);
+    const rand = prng.random();
+    inline for (.{ 1, 7, 63, 64, 65, 130, 200 }) |n| {
+        var bitmap: [(n + 7) / 8]u8 = undefined;
+        rand.bytes(&bitmap);
+        // An all-valid word takes the skip path.
+        if (n >= 64) @memset(bitmap[0..8], 0xFF);
+        var mask: [n]bool = undefined;
+        for (&mask) |*m| m.* = rand.boolean();
+        var want: [n]bool = undefined;
+        for (&want, mask, 0..) |*w, m, i| w.* = m and storage.column.isValidBit(&bitmap, i);
+        clearNullRows(&bitmap, &mask);
+        try std.testing.expectEqualSlices(bool, &want, &mask);
+    }
+    var untouched = [_]bool{ true, false, true };
+    clearNullRows(null, &untouched);
+    try std.testing.expectEqualSlices(bool, &[_]bool{ true, false, true }, &untouched);
 }
