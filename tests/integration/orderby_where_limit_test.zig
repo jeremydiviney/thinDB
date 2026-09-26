@@ -309,15 +309,14 @@ test "#46: IN / NOT IN / EXISTS / scalar subqueries whose ORDER BY LIMIT inner i
         .{ .sql = "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE updatedAt >= '2026-01-01 05:00:00' ORDER BY id LIMIT 3) ORDER BY id", .want = &[_]i64{ 300, 301, 302 } },
         // A filtered-to-nothing inner over a populated table.
         .{ .sql = "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE updatedAt >= '2027-01-01 00:00:00' ORDER BY id LIMIT 3) ORDER BY id", .want = &[_]i64{} },
+        // A scalar subquery with zero rows is NULL, which equals nothing.
+        .{ .sql = "SELECT id FROM t WHERE id = (SELECT id FROM e ORDER BY id LIMIT 1)", .want = &[_]i64{} },
     };
     inline for (cases) |c| {
         const got = try collectIds(allocator, db, c.sql);
         defer allocator.free(got);
         try std.testing.expectEqualSlices(i64, c.want, got);
     }
-
-    // A scalar subquery with zero rows is an error, not a crash.
-    try helpers.expectRunError(allocator, db, "SELECT id FROM t WHERE id = (SELECT id FROM e ORDER BY id LIMIT 1)", error.BadRequest);
 }
 
 test "#46: db__schema-qualified inner table, and CREATE/DROP TABLE accept the qualifier" {

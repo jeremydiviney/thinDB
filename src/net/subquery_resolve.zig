@@ -127,8 +127,10 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
         },
         .scalar_subquery => |sq| {
             if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
-            const val = try runScalarSubquery(ctx, sq.source);
-            pred.* = .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } };
+            pred.* = switch (try runScalarSubquery(ctx, sq.source)) {
+                .value => |val| .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = val } },
+                .null_of => .unknown,
+            };
         },
         .exists_subquery => |src| {
             // Detect correlation. If the inner has any leaf_col_col
@@ -216,8 +218,10 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                 e.* = .{ .col_ref = value };
                 return;
             };
-            const val = try runScalarSubquery(ctx, opaque_ptr);
-            e.* = .{ .lit = val };
+            e.* = switch (try runScalarSubquery(ctx, opaque_ptr)) {
+                .value => |val| .{ .lit = val },
+                .null_of => |ty| .{ .null_lit = ty },
+            };
         },
         .exists_subquery => |opaque_ptr| {
             const has_rows = try runExistsSubquery(ctx, opaque_ptr);
@@ -287,12 +291,16 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
     return try out.toOwnedSlice(aa);
 }
 
-/// Compile + drain an inner Op, expecting exactly one row × one
-/// column. Returns the extracted scalar. Multi-row → error,
-/// multi-col → error, zero rows in Tier 1 also errors (NULL handling
-/// in PredicateExpr.leaf isn't well-defined yet — the caller can
-/// re-emit IS NULL if they want zero-or-one semantics).
-fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
+/// A scalar subquery's result: its one value, or SQL NULL of its column
+/// type when that value is NULL or the subquery returns no rows.
+const ScalarResult = union(enum) {
+    value: Value,
+    null_of: types.Type,
+};
+
+/// Compile + drain an inner Op of one column and at most one row.
+/// More rows or columns → error.
+fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !ScalarResult {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     // Resolve any further-nested subqueries first.
     try resolveSubqueriesInOp(ctx, inner);
@@ -306,7 +314,7 @@ fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
     // Operators may emit heading/trailing zero-row batches; only rows count.
     var first_batch: Batch = undefined;
     while (true) {
-        first_batch = (try q.next()) orelse return Error.BadRequest; // zero rows
+        first_batch = (try q.next()) orelse return .{ .null_of = schema[0].type };
         if (first_batch.row_count > 0) break;
     }
     if (first_batch.row_count != 1) return Error.BadRequest;
@@ -315,7 +323,8 @@ fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !Value {
     }
 
     const view = first_batch.values[0];
-    return try extractScalarValue(try ctx.subqueryArena(), view);
+    if (!view.isValid(0)) return .{ .null_of = schema[0].type };
+    return .{ .value = try extractScalarValue(try ctx.subqueryArena(), view) };
 }
 
 fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
