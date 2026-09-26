@@ -922,6 +922,55 @@ test "sql: ORDER BY ordinal sorts by the Nth SELECT item" {
     try std.testing.expect(dbs >= 1);
 }
 
+test "sql: ORDER BY an expression sorts on its value" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE o (id BIGINT NOT NULL, k BIGINT NOT NULL, qty BIGINT, big BIGINT NOT NULL, PRIMARY KEY (id))");
+    try helpers.exec(allocator, db, "INSERT INTO o VALUES (1, 1, 5, 30), (2, 2, NULL, 10), (3, 1, 2, 20), (4, 2, 7, 40), (5, 3, NULL, 50)");
+
+    const cases = .{
+        .{ "SELECT id FROM o ORDER BY big * -1", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT id FROM o ORDER BY -big", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT id FROM o ORDER BY -big LIMIT 2", &[_]i64{ 5, 4 } },
+        .{ "SELECT o.id FROM o ORDER BY o.big * -1", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT id FROM o ORDER BY k * 10 + id DESC", &[_]i64{ 5, 4, 2, 3, 1 } },
+        .{ "SELECT id FROM o ORDER BY COALESCE(qty, 0) DESC, id", &[_]i64{ 4, 1, 3, 2, 5 } },
+        .{ "SELECT id FROM o ORDER BY ABS(big - 25), id", &[_]i64{ 1, 3, 2, 4, 5 } },
+        .{ "SELECT id FROM o ORDER BY CASE WHEN qty IS NULL THEN 1 ELSE 0 END, id", &[_]i64{ 1, 3, 4, 2, 5 } },
+        .{ "SELECT id FROM o ORDER BY CASE WHEN qty + 1 > 4 THEN 0 ELSE 1 END, id", &[_]i64{ 1, 4, 2, 3, 5 } },
+        .{ "SELECT id FROM o ORDER BY qty IS NULL, qty DESC, id", &[_]i64{ 4, 1, 3, 2, 5 } },
+        .{ "SELECT id FROM o ORDER BY NULL, id DESC", &[_]i64{ 5, 4, 3, 2, 1 } },
+        .{ "SELECT id AS i, big AS b FROM o ORDER BY b % 30, i", &[_]i64{ 1, 2, 4, 3, 5 } },
+        .{ "SELECT id, big * 2 AS d FROM o ORDER BY big * 2 DESC", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT id, k * 10 AS kk FROM o ORDER BY kk + id DESC", &[_]i64{ 5, 4, 2, 3, 1 } },
+        .{ "SELECT id, ROW_NUMBER() OVER (ORDER BY -big) AS rn FROM o ORDER BY rn", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT k FROM o GROUP BY k ORDER BY -k", &[_]i64{ 3, 2, 1 } },
+        .{ "SELECT k, MIN(big) AS mn FROM o GROUP BY k ORDER BY mn * -1", &[_]i64{ 3, 1, 2 } },
+        .{ "SELECT k FROM o GROUP BY k ORDER BY 0 - MIN(big)", &[_]i64{ 3, 1, 2 } },
+        .{ "SELECT k FROM o GROUP BY k ORDER BY SUM(big) / COUNT(*) DESC, k", &[_]i64{ 3, 1, 2 } },
+        .{ "SELECT DISTINCT k FROM o ORDER BY -k", &[_]i64{ 3, 2, 1 } },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    // The hidden sort key never reaches a star's output.
+    var q = try runSql(allocator, db, "SELECT * FROM o ORDER BY -big");
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 4), q.outputSchema().len);
+    const b = (try q.next()).?;
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 4, 1, 3, 2 }, b.values[0].data.bigint[0..b.row_count]);
+}
+
 test "sql: pg_type maps a well-known OID to its type name" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
