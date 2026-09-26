@@ -423,22 +423,6 @@ fn appendNameUnique(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([
     try set.append(allocator, name);
 }
 
-fn collectPredicateNames(allocator: std.mem.Allocator, set: *std.ArrayListUnmanaged([]const u8), p: exec.PredicateExpr) !void {
-    switch (p) {
-        .leaf, .day_leaf, .text_as_number => |l| try appendNameUnique(allocator, set, l.col),
-        .leaf_col_col => |c| {
-            try appendNameUnique(allocator, set, c.left);
-            try appendNameUnique(allocator, set, c.right);
-        },
-        .is_null, .is_not_null => |nm| try appendNameUnique(allocator, set, nm),
-        .like => |lk| try appendNameUnique(allocator, set, lk.col),
-        .in_set, .text_as_number_set => |s| try appendNameUnique(allocator, set, s.col),
-        .@"and", .@"or" => |kids| for (kids) |k| try collectPredicateNames(allocator, set, k),
-        .not => |k| try collectPredicateNames(allocator, set, k.*),
-        else => {},
-    }
-}
-
 fn nameInList(list: []const []const u8, name: []const u8) bool {
     for (list) |n| if (types.columnNameEql(n, name)) return true;
     return false;
@@ -463,7 +447,7 @@ fn groupColsAreOrderKeyPrefix(table: *api.Table, group_cols: []const []const u8)
 fn havingConjunctPushable(input: CompileInput, table: *api.Table, group_cols: []const []const u8, conjunct: exec.PredicateExpr) !bool {
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer names.deinit(input.allocator);
-    try collectPredicateNames(input.allocator, &names, conjunct);
+    try exec.predicate.collectColumnNames(input.allocator, &names, conjunct);
     if (names.items.len == 0) return false;
     for (names.items) |nm| {
         if (!nameInList(group_cols, nm)) return false;
@@ -590,7 +574,7 @@ fn collectProtectedAggNames(allocator: std.mem.Allocator, plan: GroupTopNPlan) !
     var set: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer set.deinit(allocator);
     if (plan.order_by) |o| for (o.specs) |s| try appendNameUnique(allocator, &set, s.col);
-    if (plan.having_filter) |f| try collectPredicateNames(allocator, &set, f.predicate);
+    if (plan.having_filter) |f| try exec.predicate.collectColumnNames(allocator, &set, f.predicate);
     return set.toOwnedSlice(allocator);
 }
 
@@ -1247,33 +1231,6 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     };
 }
 
-/// Walk a resolved WHERE predicate and collect every base-column name it
-/// references (case-insensitive dedup). Returns error.UnsupportedOp for any
-/// subquery / correlated / var shape — those never appear under a single
-/// base-table late-mat candidate and signal the caller to skip late-mat. Mirror
-/// of net/local.collectPredicateNames; kept here so engine_v2 stays free of a
-/// net/ dependency.
-fn collectPredicateColumns(
-    allocator: std.mem.Allocator,
-    set: *std.ArrayListUnmanaged([]const u8),
-    p: exec.PredicateExpr,
-) !void {
-    switch (p) {
-        .leaf, .day_leaf, .text_as_number => |lf| try addColumnUnique(allocator, set, lf.col),
-        .leaf_col_col => |lc| {
-            try addColumnUnique(allocator, set, lc.left);
-            try addColumnUnique(allocator, set, lc.right);
-        },
-        .is_null, .is_not_null => |col| try addColumnUnique(allocator, set, col),
-        .like => |lp| try addColumnUnique(allocator, set, lp.col),
-        .in_set, .text_as_number_set => |s| try addColumnUnique(allocator, set, s.col),
-        .@"and", .@"or" => |children| for (children) |ch| try collectPredicateColumns(allocator, set, ch),
-        .not => |child| try collectPredicateColumns(allocator, set, child.*),
-        .always => {},
-        else => return error.UnsupportedOp,
-    }
-}
-
 fn addColumnUnique(
     allocator: std.mem.Allocator,
     set: *std.ArrayListUnmanaged([]const u8),
@@ -1331,7 +1288,10 @@ fn tryScanSelectLateMat(
     var probe: std.ArrayListUnmanaged([]const u8) = .empty;
     defer probe.deinit(allocator);
     if (plan.where_filter) |f| {
-        collectPredicateColumns(allocator, &probe, f.predicate) catch return null;
+        // The late-mat probes take per-row kernel predicates only; a subquery
+        // lookup set or UNKNOWN takes the full scan.
+        if (!exec.predicate.kernelsOnly(f.predicate)) return null;
+        try exec.predicate.collectColumnNames(allocator, &probe, f.predicate);
     }
     if (plan.order_by) |o| {
         for (o.specs) |sp| try addColumnUnique(allocator, &probe, sp.col);
@@ -1418,7 +1378,7 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const filter_after_compute = if (plan.where_filter) |f| blk: {
         var pcols: std.ArrayListUnmanaged([]const u8) = .empty;
         defer pcols.deinit(allocator);
-        collectPredicateColumns(allocator, &pcols, f.predicate) catch break :blk false;
+        try exec.predicate.collectColumnNames(allocator, &pcols, f.predicate);
         for (pcols.items) |pc| {
             if (types.findColumn(table.schema.columns, pc) == null) break :blk true;
         }

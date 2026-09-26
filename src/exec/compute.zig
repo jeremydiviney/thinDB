@@ -87,21 +87,7 @@ pub fn collectColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]co
 
 /// Companion to `collectColumnRefs` for the predicate trees inside CASE
 /// conditions (and any other predicate whose columns must be projected).
-pub fn collectPredicateColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), p: PredicateExpr) !void {
-    switch (p) {
-        .leaf, .day_leaf, .text_as_number => |l| try appendUniqueName(allocator, out, l.col),
-        .leaf_col_col => |c| {
-            try appendUniqueName(allocator, out, c.left);
-            try appendUniqueName(allocator, out, c.right);
-        },
-        .is_null, .is_not_null => |nm| try appendUniqueName(allocator, out, nm),
-        .like => |lk| try appendUniqueName(allocator, out, lk.col),
-        .in_set, .text_as_number_set => |s| try appendUniqueName(allocator, out, s.col),
-        .@"and", .@"or" => |kids| for (kids) |k| try collectPredicateColumnRefs(allocator, out, k),
-        .not => |k| try collectPredicateColumnRefs(allocator, out, k.*),
-        else => {},
-    }
-}
+pub const collectPredicateColumnRefs = predicate_mod.collectColumnNames;
 
 /// One argument to a function call inside the resolved expression
 /// tree. Args can be: an upstream column reference, a literal (which

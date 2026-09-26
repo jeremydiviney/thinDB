@@ -692,7 +692,10 @@ fn collectPredicate(arena: Allocator, p: PredicateExpr, out: *NameSet) bool {
         // The variable / inner-query side is a VALUE; the compared column
         // is right here. (Scalar/exists markers name no column — bail.)
         .leaf_var => |v| _ = out.add(arena, v.col),
-        .in_subquery => |s| _ = out.add(arena, s.col),
+        .in_subquery => |s| {
+            _ = out.add(arena, s.col);
+            for (s.rest_cols) |nm| _ = out.add(arena, nm);
+        },
         .scalar_subquery, .exists_subquery => return false,
     }
     return true;

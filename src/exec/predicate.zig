@@ -157,6 +157,9 @@ pub const InSubquery = struct {
     col: []const u8,
     source: *const anyopaque,
     negate: bool,
+    /// A row value's remaining columns (`(a, b) IN (SELECT x, y ...)`),
+    /// matched against the inner's second and later columns.
+    rest_cols: []const []const u8 = &.{},
 };
 
 pub const InSet = struct {
@@ -193,6 +196,60 @@ pub fn touchesColumn(expr: PredicateExpr, name: []const u8) bool {
         .not => |n| touchesColumn(n.*, name),
         .always => false,
         else => true,
+    };
+}
+
+/// Every column the predicate reads, appended to `out` once each. A
+/// subquery marker reads its compared columns; its inner query is its own.
+pub fn collectColumnNames(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), expr: PredicateExpr) std.mem.Allocator.Error!void {
+    switch (expr) {
+        .leaf, .day_leaf, .text_as_number => |l| try appendColumnName(allocator, out, l.col),
+        .leaf_col_col => |c| {
+            try appendColumnName(allocator, out, c.left);
+            try appendColumnName(allocator, out, c.right);
+        },
+        .is_null, .is_not_null => |c| try appendColumnName(allocator, out, c),
+        .like => |l| try appendColumnName(allocator, out, l.col),
+        .in_set, .text_as_number_set => |s| try appendColumnName(allocator, out, s.col),
+        .leaf_var => |v| try appendColumnName(allocator, out, v.col),
+        .scalar_subquery => |s| try appendColumnName(allocator, out, s.col),
+        .in_subquery => |s| {
+            try appendColumnName(allocator, out, s.col);
+            for (s.rest_cols) |c| try appendColumnName(allocator, out, c);
+        },
+        .correlated_set => |s| for (s.outer_cols) |c| try appendColumnName(allocator, out, c),
+        .correlated_scalar => |s| {
+            try appendColumnName(allocator, out, s.outer_compared);
+            for (s.outer_keys) |c| try appendColumnName(allocator, out, c);
+        },
+        .correlated_range => |r| {
+            for (r.outer_keys) |c| try appendColumnName(allocator, out, c);
+            try appendColumnName(allocator, out, r.outer_range_col);
+            if (r.outer_range_col_upper) |upper| try appendColumnName(allocator, out, upper);
+        },
+        .@"and", .@"or" => |kids| for (kids) |k| try collectColumnNames(allocator, out, k),
+        .not => |k| try collectColumnNames(allocator, out, k.*),
+        .exists_subquery, .always, .unknown => {},
+    }
+}
+
+fn appendColumnName(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), name: []const u8) std.mem.Allocator.Error!void {
+    if (name.len == 0) return;
+    for (out.items) |existing| if (types.columnNameEql(existing, name)) return;
+    try out.append(allocator, name);
+}
+
+/// Whether the predicate is made only of per-row kernels: no subquery
+/// lookup set and no UNKNOWN.
+pub fn kernelsOnly(expr: PredicateExpr) bool {
+    return switch (expr) {
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .text_as_number, .text_as_number_set, .always => true,
+        .@"and", .@"or" => |children| blk: {
+            for (children) |child| if (!kernelsOnly(child)) break :blk false;
+            break :blk true;
+        },
+        .not => |child| kernelsOnly(child.*),
+        else => false,
     };
 }
 
@@ -395,11 +452,16 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
         } },
         .exists_subquery => |src| .{ .exists_subquery = src },
         .always => |b| .{ .always = b },
-        .in_subquery => |s| .{ .in_subquery = .{
-            .col = try out_arena.dupe(u8, renameOf(renames, s.col)),
-            .source = s.source,
-            .negate = s.negate,
-        } },
+        .in_subquery => |s| blk: {
+            const rest_cols = try out_arena.alloc([]const u8, s.rest_cols.len);
+            for (s.rest_cols, rest_cols) |src, *dst| dst.* = try out_arena.dupe(u8, renameOf(renames, src));
+            break :blk .{ .in_subquery = .{
+                .col = try out_arena.dupe(u8, renameOf(renames, s.col)),
+                .source = s.source,
+                .negate = s.negate,
+                .rest_cols = rest_cols,
+            } };
+        },
         .in_set => |s| .{ .in_set = try cloneInSet(out_arena, s, renames) },
         .text_as_number_set => |s| .{ .text_as_number_set = try cloneInSet(out_arena, s, renames) },
         .correlated_set => |s| blk: {
