@@ -402,6 +402,9 @@ const CteEntry = struct {
 const FromTarget = struct {
     name: []const u8,
     op: *ir.Op,
+    /// A table, CTE or view reference written without an alias. `in_place`:
+    /// the reference owns its scan node, so an alias can be set on it.
+    unaliased: enum { no, in_place, wrap } = .no,
 };
 
 const JoinExprSide = enum { none, left, right, mixed };
@@ -684,7 +687,7 @@ pub const Parser = struct {
         errdefer self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
         errdefer self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
         errdefer self.predicate_derived.shrinkRetainingCapacity(projection_pred_mark);
-        const proj = try self.parseProjection();
+        const parsed_proj = try self.parseProjection();
         self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
         self.predicate_derived_enabled = old_predicate_derived_enabled;
         self.predicate_derived_scope = old_predicate_derived_scope;
@@ -698,10 +701,13 @@ pub const Parser = struct {
         // evaluate the projection over one synthetic row.
         var root: *ir.Op = undefined;
         var from_is_join = false;
+        var proj = parsed_proj;
         if (self.cur.tag == .kw_from) {
             try self.advance();
-            root = try self.parseFromClause();
+            const from = try self.parseFromClause();
+            root = from.op;
             from_is_join = fromClauseIsJoin(root);
+            if (from.sole_unaliased_name) |name| proj = try self.soleSourceStars(parsed_proj, name);
         } else {
             root = try self.allocOp(.{ .single_row = {} });
         }
@@ -2641,7 +2647,13 @@ pub const Parser = struct {
     // a follow-up that adds Op.Join.ranges + extra_predicate handling
     // will lift those restrictions.
     // -----------------------------------------------------------------------
-    fn parseFromClause(self: *Parser) ParseError!*ir.Op {
+    const FromClause = struct {
+        op: *ir.Op,
+        /// The name of a lone FROM source written without an alias.
+        sole_unaliased_name: ?[]const u8 = null,
+    };
+
+    fn parseFromClause(self: *Parser) ParseError!FromClause {
         const first = try self.parseFromTarget();
         var root = first.op;
 
@@ -2654,6 +2666,7 @@ pub const Parser = struct {
         defer left_names.deinit(self.arena);
 
         while (isJoinStart(self.cur.tag)) {
+            if (root == first.op) root = try self.nameJoinInput(first);
             // CROSS JOIN takes no ON clause; empty key/range sets route the
             // executor to its nested-loop (cartesian) path.
             if (self.cur.tag == .kw_cross) {
@@ -2661,6 +2674,7 @@ pub const Parser = struct {
                 if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
                 try self.advance();
                 const right = try self.parseFromTarget();
+                const right_op = try self.nameJoinInput(right);
                 root = try self.allocOp(.{ .join = .{
                     .algorithm = .auto,
                     .join_type = .inner,
@@ -2671,21 +2685,21 @@ pub const Parser = struct {
                     .skew_absolute_threshold = 20_000,
                     .skew_sample_interval = 10,
                     .left = root,
-                    .right = right.op,
+                    .right = right_op,
                 } });
                 try left_names.append(self.arena, right.name);
                 continue;
             }
             const jtype = try self.parseJoinKind();
             const right = try self.parseFromTarget();
+            var right_op = try self.nameJoinInput(right);
 
             if (self.cur.tag != .kw_on) return ParseError.SqlExpectedJoinOn;
             try self.advance();
-            var scope: JoinScope = .{ .left_names = left_names.items, .right_name = right.name, .left = root, .right = right.op };
+            var scope: JoinScope = .{ .left_names = left_names.items, .right_name = right.name, .left = root, .right = right_op };
             const on_plan = try self.parseOnJoin(&scope, jtype);
 
             var left_op = root;
-            var right_op = right.op;
             if (on_plan.left_derived.len > 0) {
                 left_op = try self.allocOp(.{ .compute = .{ .derived = on_plan.left_derived, .upstream = left_op } });
             }
@@ -2719,7 +2733,25 @@ pub const Parser = struct {
             }
             try left_names.append(self.arena, right.name);
         }
-        return root;
+        if (root != first.op or first.unaliased == .no) return .{ .op = root };
+        return .{ .op = root, .sole_unaliased_name = first.name };
+    }
+
+    /// A lone unaliased FROM source is named by itself, so its `name.*` is
+    /// every source column: `*`.
+    fn soleSourceStars(self: *Parser, proj: []const ProjItem, name: []const u8) ParseError![]const ProjItem {
+        var out: ?[]ProjItem = null;
+        for (proj, 0..) |p, i| {
+            const qualifier = switch (p.kind) {
+                .star => |q| q orelse continue,
+                else => continue,
+            };
+            if (!types.columnNameEql(qualifier, name)) continue;
+            const items = out orelse try self.arena.dupe(ProjItem, proj);
+            items[i] = .{ .name = "*", .kind = .{ .star = null } };
+            out = items;
+        }
+        return out orelse proj;
     }
 
     /// One source in a FROM clause: bare identifier (table or CTE
@@ -2838,8 +2870,23 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
+        } else {
+            return .{ .name = resolved_name, .op = op, .unaliased = if (alias_in_place) .in_place else .wrap };
         }
         return .{ .name = resolved_name, .op = op };
+    }
+
+    /// A join input is qualified by its range-variable name. An unaliased
+    /// table, CTE or view reference's name is its own, so it takes the same
+    /// shape an explicit alias gives it: otherwise its bare columns share the
+    /// join's output with the other input's, and `u.qty` could resolve to the
+    /// other input's `qty`.
+    fn nameJoinInput(self: *Parser, target: FromTarget) ParseError!*ir.Op {
+        return switch (target.unaliased) {
+            .no => target.op,
+            .in_place => try self.applyAliasToFromOp(target.op, target.name, true),
+            .wrap => try self.applyAliasToFromOp(target.op, target.name, false),
+        };
     }
 
     /// `TABLE( fname( (subquery) ) [PARTITION BY col, ...]
