@@ -144,8 +144,8 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
         },
         .in_subquery => |s| {
             if (try maybeResolveCorrelatedIn(ctx, pred, s)) return;
-            const values = try runInSubquery(ctx, s.source);
-            pred.* = .{ .in_set = .{ .col = s.col, .values = values, .negate = s.negate } };
+            const drained = try runInSubquery(ctx, s.source);
+            pred.* = .{ .in_set = .{ .col = s.col, .values = drained.values, .negate = s.negate, .value_type = drained.ty } };
         },
         .@"and" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
         .@"or" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
@@ -257,7 +257,14 @@ fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
 /// `ctx.subqueryArena()` (text values dup'd into the same arena).
 /// NULL handling per thinDB dialect: NULLs are dropped from the set —
 /// see [[thindb-not-in-nonstandard]] memory for the rationale.
-fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Value {
+/// An IN subquery's drained values, with the type of the column they came
+/// from.
+const DrainedSet = struct {
+    values: []const Value,
+    ty: types.Type,
+};
+
+fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
     try resolveSubqueriesInOp(ctx, inner);
 
@@ -288,7 +295,14 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) ![]const Val
             try out.append(aa, try extractKeyValueAt(aa, view, schema[0].type, i));
         }
     }
-    return try out.toOwnedSlice(aa);
+    return .{ .values = try out.toOwnedSlice(aa), .ty = schema[0].type };
+}
+
+/// The types of `columns`, in the subquery arena.
+fn columnTypes(aa: Allocator, columns: []const types.Column) ![]const types.Type {
+    const out = try aa.alloc(types.Type, columns.len);
+    for (columns, out) |c, *t| t.* = c.type;
+    return out;
 }
 
 /// A scalar subquery's result: its one value, or SQL NULL of its column
@@ -714,6 +728,7 @@ fn maybeResolveCorrelatedExists(
         .outer_cols = outer_cols_owned,
         .rows = rows_owned,
         .negate = negate,
+        .inner_types = try columnTypes(aa, q.outputSchema()[0..info.outer_cols.items.len]),
     } };
     return true;
 }
@@ -856,6 +871,8 @@ fn resolveCorrelatedExistsRange(
         .op_upper = op_upper,
         .groups = groups_owned,
         .negate = negate,
+        .key_types = try columnTypes(aa, q.outputSchema()[1 .. 1 + n_keys]),
+        .range_type = q.outputSchema()[0].type,
     } };
     return true;
 }
@@ -927,6 +944,7 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
         .outer_cols = outer_cols_owned,
         .rows = rows_owned,
         .negate = s.negate,
+        .inner_types = try columnTypes(aa, q.outputSchema()[0..total_cols]),
     } };
     return true;
 }
@@ -1350,6 +1368,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
         .outer_keys = outer_keys_owned,
         .rows = rows_owned,
         .value_type = schema[agg_col_idx].type,
+        .key_types = try columnTypes(aa, schema[0..info.inner_cols.items.len]),
     } };
     return true;
 }

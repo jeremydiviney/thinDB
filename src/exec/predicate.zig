@@ -163,6 +163,9 @@ pub const InSet = struct {
     col: []const u8,
     values: []const Value,
     negate: bool,
+    /// Type of the subquery column the values were drained from; null for
+    /// a literal list.
+    value_type: ?types.Type = null,
 };
 
 pub const ColColPred = struct {
@@ -273,6 +276,8 @@ pub const CorrelatedScalar = struct {
     /// Type of each row's `value`: a decimal `Value` carries no scale, and
     /// the outer column may be a different type altogether.
     value_type: types.Type,
+    /// Types of the inner correlation key columns, parallel to `outer_keys`.
+    key_types: []const types.Type,
 };
 
 pub const CorrelatedRangeGroup = struct {
@@ -310,6 +315,10 @@ pub const CorrelatedRange = struct {
     /// `true` = NOT EXISTS — outer row passes iff no inner value
     /// satisfies the range op.
     negate: bool,
+    /// Types of the inner correlation key columns, parallel to `outer_keys`.
+    key_types: []const types.Type,
+    /// Type of the inner range column.
+    range_type: types.Type,
 };
 
 pub const CorrelatedSet = struct {
@@ -325,6 +334,8 @@ pub const CorrelatedSet = struct {
     /// `true` = NOT IN / NOT EXISTS; outer row passes iff its
     /// tuple does NOT appear in `rows`.
     negate: bool,
+    /// Types of the inner columns, parallel to `outer_cols`.
+    inner_types: []const types.Type,
 };
 
 /// Build a leaf predicate expression. Shorthand for `.{ .leaf = ... }`.
@@ -404,6 +415,7 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .outer_cols = outer_cols,
                 .rows = rows,
                 .negate = s.negate,
+                .inner_types = try out_arena.dupe(types.Type, s.inner_types),
             } };
         },
         .correlated_scalar => |s| blk: {
@@ -421,6 +433,7 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .outer_keys = outer_keys,
                 .rows = rows,
                 .value_type = s.value_type,
+                .key_types = try out_arena.dupe(types.Type, s.key_types),
             } };
         },
         .correlated_range => |s| blk: {
@@ -443,6 +456,8 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .op_upper = s.op_upper,
                 .groups = groups,
                 .negate = s.negate,
+                .key_types = try out_arena.dupe(types.Type, s.key_types),
+                .range_type = s.range_type,
             } };
         },
         .@"and" => |kids| blk: {
@@ -484,6 +499,7 @@ fn cloneInSet(out_arena: std.mem.Allocator, s: InSet, renames: []const ColRename
         .col = try out_arena.dupe(u8, renameOf(renames, s.col)),
         .values = vals,
         .negate = s.negate,
+        .value_type = s.value_type,
     };
 }
 
@@ -568,6 +584,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .in_set => |*s| {
             const col_idx = types.findColumn(schema, s.col) orelse return Error.ColumnNotFound;
             const col_type = schema[col_idx].type;
+            if (s.value_type) |vt| if (!typesComparable(col_type, vt)) return Error.PredicateTypeMismatch;
             const col_tag = ValueTag.fromType(col_type);
             var needs_rewrite = false;
             for (s.values) |v| {
@@ -608,6 +625,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             var col_types_buf: [16]types.Type = undefined;
             const col_types = try outerColumnTypes(schema, s.outer_cols, &col_types_buf);
             for (s.rows) |row| if (row.len != s.outer_cols.len) return Error.PredicateTypeMismatch;
+            try expectComparable(schema, s.outer_cols, s.inner_types);
             if (keyTuplesNeedCoercion(s.rows, col_types)) {
                 const rows = @constCast(s.rows);
                 var keep: usize = 0;
@@ -624,6 +642,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .correlated_scalar => |*s| {
             const cmp_idx = findCol(schema, s.outer_compared) orelse return Error.ColumnNotFound;
             if (!typesComparable(schema[cmp_idx].type, s.value_type)) return Error.PredicateTypeMismatch;
+            try expectComparable(schema, s.outer_keys, s.key_types);
             var col_types_buf: [16]types.Type = undefined;
             const col_types = try outerColumnTypes(schema, s.outer_keys, &col_types_buf);
             var needs = false;
@@ -644,7 +663,9 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // key columns' types. Group values are pre-sorted at
         // materialization; trust their tags.
         .correlated_range => |*s| {
-            _ = findCol(schema, s.outer_range_col) orelse return Error.ColumnNotFound;
+            try expectComparable(schema, &.{s.outer_range_col}, &.{s.range_type});
+            if (s.outer_range_col_upper) |upper| try expectComparable(schema, &.{upper}, &.{s.range_type});
+            try expectComparable(schema, s.outer_keys, s.key_types);
             var col_types_buf: [16]types.Type = undefined;
             const col_types = try outerColumnTypes(schema, s.outer_keys, &col_types_buf);
             var needs = false;
@@ -669,6 +690,17 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
 
 fn findCol(schema: []const Column, name: []const u8) ?usize {
     return types.findColumn(schema, name);
+}
+
+/// Each outer column against the type of the inner column it's compared
+/// with, by the comparison rule: the pair compares or the statement fails,
+/// however many rows the subquery drained.
+fn expectComparable(schema: []const Column, outer: []const []const u8, inner_types: []const types.Type) Error!void {
+    if (outer.len != inner_types.len) return Error.PredicateTypeMismatch;
+    for (outer, inner_types) |name, ty| {
+        const idx = findCol(schema, name) orelse return Error.ColumnNotFound;
+        if (!typesComparable(schema[idx].type, ty)) return Error.PredicateTypeMismatch;
+    }
 }
 
 fn outerColumnTypes(schema: []const Column, names: []const []const u8, buf: *[16]types.Type) Error![]const types.Type {

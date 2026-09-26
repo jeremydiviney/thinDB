@@ -264,6 +264,23 @@ test "comparison: kinds that never compare are rejected" {
 
     try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE i = d", error.PredicateTypeMismatch);
     try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE ts > 5", error.PredicateTypeMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE i IN (DATE '2024-03-05', DATE '2024-03-06')", error.PredicateTypeMismatch);
+
+    // A subquery's column meets the rule by its type, whatever rows it returns.
+    try helpers.exec(allocator, db, "CREATE TABLE ck (id BIGINT PRIMARY KEY, d DATE, i INT)");
+    try helpers.exec(allocator, db, "INSERT INTO ck VALUES (1, '2024-03-05', 2), (2, '2024-03-06', 3)");
+    const statements = [_][]const u8{
+        "SELECT id FROM cm WHERE i IN (SELECT d FROM ck)",
+        "SELECT id FROM cm WHERE i NOT IN (SELECT d FROM ck)",
+        "SELECT id FROM cm WHERE i IN (SELECT d FROM ck WHERE id < 0)",
+        "SELECT id FROM cm WHERE i IN (SELECT ck.d FROM ck WHERE ck.id = cm.id)",
+        "SELECT id FROM cm WHERE EXISTS (SELECT 1 FROM ck WHERE ck.d = cm.i)",
+        "SELECT id FROM cm WHERE NOT EXISTS (SELECT 1 FROM ck WHERE ck.d = cm.i)",
+        "SELECT id FROM cm WHERE EXISTS (SELECT 1 FROM ck WHERE ck.d > cm.i)",
+    };
+    for (statements) |sql| try helpers.expectRunError(allocator, db, sql, error.PredicateTypeMismatch);
+    // A correlated scalar subquery runs as a join on its correlation keys.
+    try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE i = (SELECT MAX(ck.i) FROM ck WHERE ck.d = cm.i)", error.JoinKeyTypeMismatch);
 }
 
 fn setupTextNumbers(allocator: std.mem.Allocator, db: *thindb.Database) !void {
