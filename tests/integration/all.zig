@@ -21,6 +21,7 @@ test {
     _ = @import("key_bloom_prune_test.zig");
     _ = @import("compute_test.zig");
     _ = @import("compute_scalar_test.zig");
+    _ = @import("failed_statement_test.zig");
     _ = @import("decimal_test.zig");
     _ = @import("join_test.zig");
     _ = @import("star_join_test.zig");

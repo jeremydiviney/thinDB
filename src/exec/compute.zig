@@ -88,15 +88,14 @@ pub fn collectColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]co
 /// conditions (and any other predicate whose columns must be projected).
 pub fn collectPredicateColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), p: PredicateExpr) !void {
     switch (p) {
-        .leaf => |l| try appendUniqueName(allocator, out, l.col),
-        .day_leaf => |l| try appendUniqueName(allocator, out, l.col),
+        .leaf, .day_leaf, .text_as_number => |l| try appendUniqueName(allocator, out, l.col),
         .leaf_col_col => |c| {
             try appendUniqueName(allocator, out, c.left);
             try appendUniqueName(allocator, out, c.right);
         },
         .is_null, .is_not_null => |nm| try appendUniqueName(allocator, out, nm),
         .like => |lk| try appendUniqueName(allocator, out, lk.col),
-        .in_set => |s| try appendUniqueName(allocator, out, s.col),
+        .in_set, .text_as_number_set => |s| try appendUniqueName(allocator, out, s.col),
         .@"and", .@"or" => |kids| for (kids) |k| try collectPredicateColumnRefs(allocator, out, k),
         .not => |k| try collectPredicateColumnRefs(allocator, out, k.*),
         else => {},
@@ -594,6 +593,18 @@ pub const Compute = struct {
         var up = self.upstream;
         up.deinit();
         self.deinitLayer();
+    }
+
+    /// Frees the Compute layers `top` stacks on `base`, leaving `base` to
+    /// its owner: the undo of a `Query.compute` over `base` whose result is
+    /// dropped before anything takes it.
+    pub fn deinitLayersOver(top: Query, base: Query) void {
+        var cur = top;
+        while (cur.ptr != base.ptr) {
+            const layer = exec.queryAs(Compute, cur).?;
+            cur = layer.upstream;
+            layer.deinitLayer();
+        }
     }
 
     /// Frees this operator but not its upstream.

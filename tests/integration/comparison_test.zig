@@ -265,3 +265,87 @@ test "comparison: kinds that never compare are rejected" {
     try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE i = d", error.PredicateTypeMismatch);
     try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE ts > 5", error.PredicateTypeMismatch);
 }
+
+fn setupTextNumbers(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    try helpers.exec(allocator, db, "CREATE TABLE tn (id BIGINT PRIMARY KEY, code VARCHAR(10), n INT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO tn VALUES
+        \\  (1, '12', 12), (2, '12.0', 7), (3, ' 7 ', NULL), (4, '007', NULL), (5, 'x', NULL),
+        \\  (6, '', NULL), (7, NULL, NULL), (8, '1e1', NULL), (9, '-3.5', NULL), (10, '12abc', NULL)
+    );
+    try helpers.exec(allocator, db, "CREATE TABLE tnk (id BIGINT PRIMARY KEY, k BIGINT, n INT)");
+    try helpers.exec(allocator, db, "INSERT INTO tnk VALUES (100, 1, 12), (200, 2, 12), (300, 3, 7), (400, 4, 8), (500, 5, 0), (600, 8, 10), (700, 9, -3)");
+}
+
+test "comparison: a text column against a number reads each row as a number" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setupTextNumbers(allocator, db);
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{ "tn", "tnk" }, &.{
+        .{ .sql = "SELECT id FROM tn WHERE code = 12 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM tn WHERE code = 7 ORDER BY id", .expected = &.{ 3, 4 } },
+        .{ .sql = "SELECT id FROM tn WHERE code > 5 ORDER BY id", .expected = &.{ 1, 2, 3, 4, 8 } },
+        .{ .sql = "SELECT id FROM tn WHERE code < 0 ORDER BY id", .expected = &.{9} },
+        .{ .sql = "SELECT id FROM tn WHERE code >= 1.5 ORDER BY id", .expected = &.{ 1, 2, 3, 4, 8 } },
+        .{ .sql = "SELECT id FROM tn WHERE code = 10.0 ORDER BY id", .expected = &.{8} },
+        .{ .sql = "SELECT id FROM tn WHERE code <> 12 ORDER BY id", .expected = &.{ 3, 4, 8, 9 } },
+        .{ .sql = "SELECT id FROM tn WHERE NOT (code = 12) ORDER BY id", .expected = &.{ 3, 4, 8, 9 } },
+        .{ .sql = "SELECT id FROM tn WHERE code BETWEEN 5 AND 11 ORDER BY id", .expected = &.{ 3, 4, 8 } },
+        .{ .sql = "SELECT id FROM tn WHERE code IN (7, 12) ORDER BY id", .expected = &.{ 1, 2, 3, 4 } },
+        .{ .sql = "SELECT id FROM tn WHERE code NOT IN (7, 12) ORDER BY id", .expected = &.{ 8, 9 } },
+        .{ .sql = "SELECT id FROM tn WHERE code IN ('x', 12) ORDER BY id", .expected = &.{ 1, 2, 5 } },
+        .{ .sql = "SELECT id FROM tn WHERE code = 12 OR code LIKE 'x%' ORDER BY id", .expected = &.{ 1, 2, 5 } },
+        .{ .sql = "SELECT id FROM tn WHERE code = 12 AND id > 1 ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM tn WHERE CASE WHEN code = 12 THEN 1 ELSE 0 END = 1 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT COUNT(*) FROM tn WHERE code > 5", .expected = &.{5} },
+        .{ .sql = "SELECT id FROM tn WHERE code = (SELECT MAX(n) FROM tn) ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM tn WHERE code IN (SELECT n FROM tn WHERE n IS NOT NULL) ORDER BY id", .expected = &.{ 1, 2, 3, 4 } },
+        .{ .sql = "SELECT id FROM tn WHERE code NOT IN (SELECT n FROM tn WHERE n IS NOT NULL) ORDER BY id", .expected = &.{ 8, 9 } },
+        .{ .sql = "SELECT id FROM tn WHERE code IN (SELECT n FROM tnk WHERE tnk.k = tn.id) ORDER BY id", .expected = &.{ 1, 2, 3, 8 } },
+        .{ .sql = "SELECT id FROM tn WHERE EXISTS (SELECT 1 FROM tnk WHERE tnk.k = tn.id AND tnk.n = tn.code) ORDER BY id", .expected = &.{ 1, 2, 3, 8 } },
+        .{ .sql = "SELECT id FROM tn WHERE code = (SELECT MAX(n) FROM tnk WHERE tnk.k = tn.id) ORDER BY id", .expected = &.{ 1, 2, 3, 8 } },
+        .{ .sql = "SELECT id FROM tn WHERE EXISTS (SELECT 1 FROM tnk WHERE tnk.n = tn.code) ORDER BY id", .expected = &.{ 1, 2, 3, 4, 8 } },
+    });
+}
+
+test "comparison: DELETE by a text column against a number" {
+    const allocator = std.testing.allocator;
+    for (0..2) |flush_first| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+        defer db.close();
+        try setupTextNumbers(allocator, db);
+        if (flush_first == 1) try (try db.openTable("tn", .{})).flush();
+
+        try helpers.exec(allocator, db, "DELETE FROM tn WHERE code = 7 OR code < 0");
+        try expectCases(allocator, db, &.{
+            .{ .sql = "SELECT id FROM tn ORDER BY id", .expected = &.{ 1, 2, 5, 6, 7, 8, 10 } },
+        });
+    }
+}
+
+test "comparison: a text order key against a number reads each key as a number" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE tk (code VARCHAR(10) PRIMARY KEY, v BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO tk VALUES ('007', 1), ('7', 2), ('12', 3), ('x', 4)");
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{"tk"}, &.{
+        .{ .sql = "SELECT v FROM tk WHERE code = 7 ORDER BY v", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT v FROM tk WHERE code IN (7, 12) ORDER BY v", .expected = &.{ 1, 2, 3 } },
+        .{ .sql = "SELECT v FROM tk WHERE code IN (SELECT v + 11 FROM tk WHERE v = 1) ORDER BY v", .expected = &.{3} },
+        .{ .sql = "SELECT v FROM tk WHERE code = '7' ORDER BY v", .expected = &.{2} },
+    });
+    try helpers.exec(allocator, db, "DELETE FROM tk WHERE code = 7");
+    try expectCases(allocator, db, &.{
+        .{ .sql = "SELECT v FROM tk ORDER BY v", .expected = &.{ 3, 4 } },
+    });
+}

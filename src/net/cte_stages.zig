@@ -1835,9 +1835,11 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // EITHER child may end up the probe — both take the parallel
             // probe route (a deferred leaf that becomes the build side just
             // drains in parallel; small dims decline via the stage row gate).
+            // Join.create does NOT consume its inputs on error.
             var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner, block_root);
             errdefer left.deinit();
-            const right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner, block_root);
+            var right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner, block_root);
+            errdefer right.deinit();
             markJoinBuildContiguous(input, j.join_type, left, right);
             const t_join = exec.prof.nowTicks();
             const jq = try left.join(right, joinSpecOf(j, input.force_ordered));
@@ -2536,10 +2538,10 @@ fn compileFilteredJoin(
     if (right_push.items.len > 0)
         right = try right.filter(try combineConjuncts(input.node_arena, right_push.items));
 
-    left_owned = false;
-    right_owned = false;
     markJoinBuildContiguous(input, j.join_type, left, right);
     var joined = try left.join(right, joinSpecOf(j, input.force_ordered));
+    left_owned = false;
+    right_owned = false;
     if (input.win_registry) |reg| {
         if (exec.queryAs(join_mod.Join, joined)) |jop| {
             reg.put(input.allocator, @ptrCast(join_op), @ptrCast(jop)) catch {};
@@ -2586,11 +2588,11 @@ fn walkConjunctCols(
     side: *?ConjunctSide,
 ) bool {
     switch (e) {
-        .leaf => |lf| return noteCol(lf.col, ls, rs, side),
+        .leaf, .text_as_number => |lf| return noteCol(lf.col, ls, rs, side),
         .leaf_col_col => |lc| return noteCol(lc.left, ls, rs, side) and noteCol(lc.right, ls, rs, side),
         .is_null, .is_not_null => |col| return noteCol(col, ls, rs, side),
         .like => |lp| return noteCol(lp.col, ls, rs, side),
-        .in_set => |s| return noteCol(s.col, ls, rs, side),
+        .in_set, .text_as_number_set => |s| return noteCol(s.col, ls, rs, side),
         .@"and", .@"or" => |children| {
             for (children) |ch| if (!walkConjunctCols(ch, ls, rs, side)) return false;
             return true;

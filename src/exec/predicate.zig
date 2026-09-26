@@ -83,6 +83,17 @@ pub const PredicateExpr = union(enum) {
     /// linear scan. v1 set sizes are small (typical < 1k) — hash-set
     /// optimization is a follow-up.
     in_set: InSet,
+    /// A text column compared with a number (`code = 12`, `code > 1.5`):
+    /// validation's rewrite of such a `.leaf`, since no literal of the
+    /// column's type stands for a number (`'12.0'` equals 12, `'12'` too).
+    /// Each row's text is read as a number the way a CAST reads it, and text
+    /// that isn't a number compares as NULL. Only the generic evaluator
+    /// handles it; pruning and fused kernels decline.
+    text_as_number: Predicate,
+    /// An `.in_set` over a text column whose set holds numbers, rewritten by
+    /// validation for the same reason: each number meets the row's text read
+    /// as a number, each text value meets it bytewise.
+    text_as_number_set: InSet,
     /// Resolved form of a correlated subquery (EXISTS / NOT EXISTS /
     /// IN / NOT IN). The pre-compile pass dropped the correlation
     /// predicates from the inner, drained the rewritten inner, and
@@ -165,11 +176,11 @@ pub const ColColPred = struct {
 /// use this to prove a pushdown is safe, so "don't know" must mean "yes".
 pub fn touchesColumn(expr: PredicateExpr, name: []const u8) bool {
     return switch (expr) {
-        .leaf, .day_leaf => |l| types.columnNameEql(l.col, name),
+        .leaf, .day_leaf, .text_as_number => |l| types.columnNameEql(l.col, name),
         .leaf_col_col => |c| types.columnNameEql(c.left, name) or types.columnNameEql(c.right, name),
         .is_null, .is_not_null => |c| types.columnNameEql(c, name),
         .like => |l| types.columnNameEql(l.col, name),
-        .in_set => |s| types.columnNameEql(s.col, name),
+        .in_set, .text_as_number_set => |s| types.columnNameEql(s.col, name),
         .@"and", .@"or" => |arms| blk: {
             for (arms) |a| {
                 if (touchesColumn(a, name)) break :blk true;
@@ -184,11 +195,11 @@ pub fn touchesColumn(expr: PredicateExpr, name: []const u8) bool {
 
 pub fn touches_resolved_column(expr: PredicateExpr, schema: []const Column, idx: usize) bool {
     return switch (expr) {
-        .leaf, .day_leaf => |leaf| types.findColumn(schema, leaf.col) == idx,
+        .leaf, .day_leaf, .text_as_number => |leaf| types.findColumn(schema, leaf.col) == idx,
         .leaf_col_col => |pair| types.findColumn(schema, pair.left) == idx or types.findColumn(schema, pair.right) == idx,
         .is_null, .is_not_null => |col| types.findColumn(schema, col) == idx,
         .like => |like| types.findColumn(schema, like.col) == idx,
-        .in_set => |set| types.findColumn(schema, set.col) == idx,
+        .in_set, .text_as_number_set => |set| types.findColumn(schema, set.col) == idx,
         .@"and", .@"or" => |children| blk: {
             for (children) |child| if (touches_resolved_column(child, schema, idx)) break :blk true;
             break :blk false;
@@ -207,6 +218,7 @@ pub fn eql(a: PredicateExpr, b: PredicateExpr) bool {
     return switch (a) {
         .leaf => |l| leafEql(l, b.leaf),
         .day_leaf => |l| leafEql(l, b.day_leaf),
+        .text_as_number => |l| leafEql(l, b.text_as_number),
         .leaf_col_col => |c| c.op == b.leaf_col_col.op and
             types.columnNameEql(c.left, b.leaf_col_col.left) and
             types.columnNameEql(c.right, b.leaf_col_col.right),
@@ -217,12 +229,8 @@ pub fn eql(a: PredicateExpr, b: PredicateExpr) bool {
         .@"or" => |arms| armsEql(arms, b.@"or"),
         .not => |n| eql(n.*, b.not.*),
         .always => |v| v == b.always,
-        .in_set => |s| blk: {
-            const o = b.in_set;
-            if (s.negate != o.negate or s.values.len != o.values.len or !types.columnNameEql(s.col, o.col)) break :blk false;
-            for (s.values, o.values) |x, y| if (!x.eql(y)) break :blk false;
-            break :blk true;
-        },
+        .in_set => |s| setEql(s, b.in_set),
+        .text_as_number_set => |s| setEql(s, b.text_as_number_set),
         .leaf_var => |v| v.op == b.leaf_var.op and
             types.columnNameEql(v.col, b.leaf_var.col) and
             std.mem.eql(u8, v.var_name, b.leaf_var.var_name),
@@ -233,6 +241,12 @@ pub fn eql(a: PredicateExpr, b: PredicateExpr) bool {
 
 fn leafEql(a: Predicate, b: Predicate) bool {
     return a.op == b.op and types.columnNameEql(a.col, b.col) and a.val.eql(b.val);
+}
+
+fn setEql(a: InSet, b: InSet) bool {
+    if (a.negate != b.negate or a.values.len != b.values.len or !types.columnNameEql(a.col, b.col)) return false;
+    for (a.values, b.values) |x, y| if (!x.eql(y)) return false;
+    return true;
 }
 
 fn armsEql(a: []const PredicateExpr, b: []const PredicateExpr) bool {
@@ -349,16 +363,9 @@ pub fn deepClonePredicate(out_arena: std.mem.Allocator, p: PredicateExpr) std.me
 /// deepClonePredicate with column-reference substitution (see `ColRename`).
 pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr, renames: []const ColRename) std.mem.Allocator.Error!PredicateExpr {
     return switch (p) {
-        .leaf => |lf| .{ .leaf = .{
-            .col = try out_arena.dupe(u8, renameOf(renames, lf.col)),
-            .op = lf.op,
-            .val = try cloneValue(out_arena, lf.val),
-        } },
-        .day_leaf => |lf| .{ .day_leaf = .{
-            .col = try out_arena.dupe(u8, renameOf(renames, lf.col)),
-            .op = lf.op,
-            .val = try cloneValue(out_arena, lf.val),
-        } },
+        .leaf => |lf| .{ .leaf = try cloneLeaf(out_arena, lf, renames) },
+        .day_leaf => |lf| .{ .day_leaf = try cloneLeaf(out_arena, lf, renames) },
+        .text_as_number => |lf| .{ .text_as_number = try cloneLeaf(out_arena, lf, renames) },
         .leaf_col_col => |lc| .{ .leaf_col_col = .{
             .left = try out_arena.dupe(u8, renameOf(renames, lc.left)),
             .op = lc.op,
@@ -382,15 +389,8 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
             .source = s.source,
             .negate = s.negate,
         } },
-        .in_set => |s| blk: {
-            const vals = try out_arena.alloc(Value, s.values.len);
-            for (s.values, vals) |v, *out| out.* = try cloneValue(out_arena, v);
-            break :blk .{ .in_set = .{
-                .col = try out_arena.dupe(u8, renameOf(renames, s.col)),
-                .values = vals,
-                .negate = s.negate,
-            } };
-        },
+        .in_set => |s| .{ .in_set = try cloneInSet(out_arena, s, renames) },
+        .text_as_number_set => |s| .{ .text_as_number_set = try cloneInSet(out_arena, s, renames) },
         .correlated_set => |s| blk: {
             const outer_cols = try out_arena.alloc([]const u8, s.outer_cols.len);
             for (s.outer_cols, outer_cols) |src, *dst| dst.* = try out_arena.dupe(u8, renameOf(renames, src));
@@ -469,6 +469,24 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
     };
 }
 
+fn cloneLeaf(out_arena: std.mem.Allocator, lf: Predicate, renames: []const ColRename) std.mem.Allocator.Error!Predicate {
+    return .{
+        .col = try out_arena.dupe(u8, renameOf(renames, lf.col)),
+        .op = lf.op,
+        .val = try cloneValue(out_arena, lf.val),
+    };
+}
+
+fn cloneInSet(out_arena: std.mem.Allocator, s: InSet, renames: []const ColRename) std.mem.Allocator.Error!InSet {
+    const vals = try out_arena.alloc(Value, s.values.len);
+    for (s.values, vals) |v, *out| out.* = try cloneValue(out_arena, v);
+    return .{
+        .col = try out_arena.dupe(u8, renameOf(renames, s.col)),
+        .values = vals,
+        .negate = s.negate,
+    };
+}
+
 fn cloneValue(out_arena: std.mem.Allocator, v: Value) std.mem.Allocator.Error!Value {
     return switch (v) {
         .text => |s| .{ .text = try out_arena.dupe(u8, s) },
@@ -495,6 +513,10 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                     .between => |b| foldBetween(expr, b.lo, b.hi),
                     .beyond => |side| foldBeyond(expr, side),
                     .null_text => expr.* = .unknown,
+                    .parse_rows => {
+                        const leaf = p.*;
+                        expr.* = .{ .text_as_number = leaf };
+                    },
                     .incomparable => return Error.PredicateTypeMismatch,
                 }
             }
@@ -515,6 +537,8 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .is_null, .is_not_null => |col_name| {
             _ = types.findColumn(schema, col_name) orelse return Error.ColumnNotFound;
         },
+        .text_as_number => |p| try expectTextColumn(schema, p.col),
+        .text_as_number_set => |s| try expectTextColumn(schema, s.col),
         .like => |lp| {
             const idx = types.findColumn(schema, lp.col) orelse return Error.ColumnNotFound;
             if (!schema[idx].type.isString()) return Error.UnsupportedOperatorForType;
@@ -538,8 +562,9 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // equal it (`x IN (2.5, 5)` on an INT column: 2.5 matches nothing)
         // and is dropped from the set — correct for the negated form too
         // (`x <> 2.5` is always true for an INT x under this dialect's
-        // NULL-skipping NOT IN). Values are arena-owned parse output;
-        // in-place rewrite mirrors the `.leaf` arm.
+        // NULL-skipping NOT IN). A number against a text column stays a
+        // number and the node becomes `.text_as_number_set`. Values are
+        // arena-owned parse output; in-place rewrite mirrors the `.leaf` arm.
         .in_set => |*s| {
             const col_idx = types.findColumn(schema, s.col) orelse return Error.ColumnNotFound;
             const col_type = schema[col_idx].type;
@@ -557,14 +582,23 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
             if (needs_rewrite) {
                 const vals = @constCast(s.values);
                 var keep: usize = 0;
+                var parse_rows = false;
                 for (s.values) |v| {
                     vals[keep] = if (std.meta.activeTag(v) == col_tag) v else switch (placeLiteral(v, col_type)) {
                         .exact => |c| c,
+                        .parse_rows => blk: {
+                            parse_rows = true;
+                            break :blk v;
+                        },
                         .between, .beyond, .null_text, .incomparable => continue,
                     };
                     keep += 1;
                 }
                 s.values = vals[0..keep];
+                if (parse_rows) {
+                    const set = s.*;
+                    expr.* = .{ .text_as_number_set = set };
+                }
             }
         },
         // `.correlated_set` — every outer_col must exist; each tuple
@@ -652,12 +686,14 @@ fn keyTuplesNeedCoercion(tuples: []const []const Value, col_types: []const types
 
 /// Brings a materialized key tuple to its outer columns' types in place.
 /// False when some value can't equal any value of its column, so the tuple
-/// never matches.
+/// never matches. A number against a text column stays a number:
+/// `cellMatchesValue` reads the row's text as one.
 fn coerceKeyTuple(tuple: []Value, col_types: []const types.Type) bool {
     for (tuple, col_types) |*v, ty| {
         if (std.meta.activeTag(v.*) == ValueTag.fromType(ty)) continue;
         switch (placeLiteral(v.*, ty)) {
             .exact => |c| v.* = c,
+            .parse_rows => {},
             .between, .beyond, .null_text, .incomparable => return false,
         }
     }
@@ -676,6 +712,9 @@ const LiteralPlacement = union(enum) {
     /// Text that doesn't parse as the column's number or date: the
     /// comparison is NULL (StarRocks: `'12abc' = 12` is NULL).
     null_text,
+    /// A number against a text column: each row's text is read as a number,
+    /// so no one value of the column's type stands for the literal.
+    parse_rows,
     incomparable,
 };
 
@@ -694,7 +733,10 @@ fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
         .decimal64, .decimal128 => return .incomparable,
         else => valueScalar(val, 0),
     };
-    if (!scalarComparableTo(lit, col_type)) return .incomparable;
+    if (!scalarComparableTo(lit, col_type)) {
+        const number = lit == .integer or lit == .float;
+        return if (number and comparisonKind(col_type) == .text) .parse_rows else .incomparable;
+    }
     return switch (col_type) {
         .tinyint, .smallint, .int, .bigint, .largeint => placeOnGrid(lit, 0, col_type),
         .decimal64, .decimal128 => |spec| placeOnGrid(lit, spec.s, col_type),
@@ -1213,6 +1255,14 @@ pub fn evaluatePredicate(
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
             try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
         },
+        .text_as_number => |p| {
+            const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
+            evaluateTextAsNumberMask(batch.values[col_idx], schema[col_idx].type, p, batch.row_count, out);
+        },
+        .text_as_number_set => |s| {
+            const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
+            evaluateTextAsNumberSetMask(batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
+        },
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
         .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out),
@@ -1310,6 +1360,14 @@ pub fn evaluateExprGuided(
         .in_set => |s| {
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
             try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
+        },
+        .text_as_number => |p| {
+            const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
+            evaluateTextAsNumberMask(batch.values[col_idx], schema[col_idx].type, p, batch.row_count, out);
+        },
+        .text_as_number_set => |s| {
+            const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
+            evaluateTextAsNumberSetMask(batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
         },
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
@@ -1672,8 +1730,9 @@ pub fn evaluateCorrelatedSetMask(s: CorrelatedSet, schema: []const Column, batch
     }
 }
 
-/// Equality check between a single cell of a ColumnView and a Value
-/// of the same type. Returns false on type mismatch (defensive).
+/// Equality check between a single cell of a ColumnView and a Value of the
+/// same type, or a number against a text cell (see `coerceKeyTuple`).
+/// Returns false on any other type mismatch (defensive).
 fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
     return switch (view.data) {
         .int => |s| ref == .int and s[idx] == ref.int,
@@ -1689,10 +1748,10 @@ fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
         .decimal64 => |s| ref == .decimal64 and s[idx] == ref.decimal64,
         .decimal128 => |s| ref == .decimal128 and s[idx] == ref.decimal128,
         .uuid => |s| ref == .uuid and s[idx] == ref.uuid,
-        .varchar => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
-        .string => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
-        .char => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
-        .json => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
+        .varchar, .string, .char, .json => |sv| switch (ref) {
+            .text => |t| std.mem.eql(u8, sv.rowBytes(idx), t),
+            else => textOrder(sv.rowBytes(idx), valueScalar(ref, 0)) == .eq,
+        },
     };
 }
 
@@ -1754,6 +1813,43 @@ pub fn evaluateInSetMask(view: ColumnView, values: []const Value, negate: bool, 
             }
             mask[i] = if (negate) !found else found;
         },
+    }
+}
+
+fn expectTextColumn(schema: []const Column, name: []const u8) Error!void {
+    const idx = types.findColumn(schema, name) orelse return Error.ColumnNotFound;
+    if (comparisonKind(schema[idx].type) != .text) return Error.PredicateTypeMismatch;
+}
+
+/// `.text_as_number`: each row's text read as a number against the literal.
+fn evaluateTextAsNumberMask(view: ColumnView, col_type: types.Type, p: Predicate, n: usize, mask: []bool) void {
+    const rhs = valueScalar(p.val, 0);
+    for (0..n) |i| mask[i] = view.isValid(i) and orderMatches(scalarOrder(cellScalar(view, col_type, i), rhs), p.op);
+}
+
+/// `.text_as_number_set`, element by element: `a IN (b, c)` is
+/// `a = b OR a = c`. IN holds when some value equals the row, NOT IN when
+/// every value is known to differ; text that isn't a number leaves each
+/// comparison with a number NULL, so it fails both.
+fn evaluateTextAsNumberSetMask(view: ColumnView, col_type: types.Type, s: InSet, n: usize, mask: []bool) void {
+    for (0..n) |i| {
+        if (!view.isValid(i)) {
+            mask[i] = false;
+            continue;
+        }
+        const cell = cellScalar(view, col_type, i);
+        const number: ?Scalar = if (cell == .text) textNumber(cell.text) else cell;
+        var found = false;
+        var unknown = false;
+        for (s.values) |v| {
+            const order = if (v == .text) scalarOrder(cell, valueScalar(v, 0)) else if (number) |x| scalarOrder(x, valueScalar(v, 0)) else null;
+            if (order == .eq) {
+                found = true;
+                break;
+            }
+            unknown = unknown or order == null;
+        }
+        mask[i] = if (s.negate) !found and !unknown else found;
     }
 }
 

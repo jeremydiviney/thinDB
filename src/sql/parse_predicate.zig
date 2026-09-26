@@ -97,6 +97,7 @@ pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateE
     switch (e) {
         .leaf => |l| return .{ .leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
         .day_leaf => |l| return .{ .day_leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
+        .text_as_number => |l| return .{ .text_as_number = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
         .leaf_col_col => |c| return .{ .leaf_col_col = .{ .left = c.left, .op = flipOp(c.op), .right = c.right } },
         .is_null => |c| return .{ .is_not_null = c },
         .is_not_null => |c| return .{ .is_null = c },
@@ -115,6 +116,7 @@ pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateE
             return .{ .@"and" = out };
         },
         .in_set => |s| return .{ .in_set = .{ .col = s.col, .values = s.values, .negate = !s.negate } },
+        .text_as_number_set => |s| return .{ .text_as_number_set = .{ .col = s.col, .values = s.values, .negate = !s.negate } },
         .in_subquery => |s| return .{ .in_subquery = .{ .col = s.col, .source = s.source, .negate = !s.negate } },
         .scalar_subquery => |sq| return .{ .scalar_subquery = .{ .col = sq.col, .op = flipOp(sq.op), .source = sq.source } },
         .like => |l| {
@@ -590,7 +592,7 @@ fn exprHasColumnRef(expr: ir.Expr) bool {
 
 fn predicateHasColumnRef(pred: PredicateExpr) bool {
     return switch (pred) {
-        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .leaf_var => true,
+        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .text_as_number, .text_as_number_set, .leaf_var => true,
         .@"and", .@"or" => |children| blk: {
             for (children) |child| {
                 if (predicateHasColumnRef(child)) break :blk true;

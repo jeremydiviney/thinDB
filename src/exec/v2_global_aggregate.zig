@@ -1009,14 +1009,14 @@ fn collectExprCols(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const
 
 fn collectPredCols(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const u8), table: *api.Table, p: PredicateExpr) !void {
     switch (p) {
-        .leaf => |l| _ = try addNeeded(allocator, needed, table, l.col),
+        .leaf, .day_leaf, .text_as_number => |l| _ = try addNeeded(allocator, needed, table, l.col),
         .leaf_col_col => |c| {
             _ = try addNeeded(allocator, needed, table, c.left);
             _ = try addNeeded(allocator, needed, table, c.right);
         },
         .is_null, .is_not_null => |nm| _ = try addNeeded(allocator, needed, table, nm),
         .like => |lk| _ = try addNeeded(allocator, needed, table, lk.col),
-        .in_set => |s| _ = try addNeeded(allocator, needed, table, s.col),
+        .in_set, .text_as_number_set => |s| _ = try addNeeded(allocator, needed, table, s.col),
         .@"and", .@"or" => |kids| for (kids) |k| try collectPredCols(allocator, needed, table, k),
         .not => |k| try collectPredCols(allocator, needed, table, k.*),
         else => {},

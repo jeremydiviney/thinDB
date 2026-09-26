@@ -560,7 +560,7 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
 
 fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateExpr) anyerror!void {
     switch (p) {
-        .leaf => |l| {
+        .leaf, .text_as_number => |l| {
             try out.appendSlice(allocator, l.col);
             try out.append(allocator, ' ');
             try out.appendSlice(allocator, opSymbol(l.op));
@@ -610,7 +610,7 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
             try out.appendSlice(allocator, s.col);
             try out.appendSlice(allocator, if (s.negate) " NOT IN (SELECT …)" else " IN (SELECT …)");
         },
-        .in_set => |s| {
+        .in_set, .text_as_number_set => |s| {
             try out.appendSlice(allocator, s.col);
             try out.appendSlice(allocator, if (s.negate) " NOT IN [" else " IN [");
             for (s.values, 0..) |v, i| {

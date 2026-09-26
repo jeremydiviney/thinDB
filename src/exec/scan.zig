@@ -84,14 +84,14 @@ fn collectPredicateColumns(
 ) !void {
     const t = @import("../types.zig");
     switch (expr) {
-        .leaf => |p| try addPredicateColumn(allocator, out, t.findColumn(schema, p.col)),
+        .leaf, .day_leaf, .text_as_number => |p| try addPredicateColumn(allocator, out, t.findColumn(schema, p.col)),
         .leaf_col_col => |lc| {
             try addPredicateColumn(allocator, out, t.findColumn(schema, lc.left));
             try addPredicateColumn(allocator, out, t.findColumn(schema, lc.right));
         },
         .is_null, .is_not_null => |col_name| try addPredicateColumn(allocator, out, t.findColumn(schema, col_name)),
         .like => |lp| try addPredicateColumn(allocator, out, t.findColumn(schema, lp.col)),
-        .in_set => |s| try addPredicateColumn(allocator, out, t.findColumn(schema, s.col)),
+        .in_set, .text_as_number_set => |s| try addPredicateColumn(allocator, out, t.findColumn(schema, s.col)),
         // Correlated leaves evaluate against the materialized batch, so every
         // outer-side column they read must be sourced for the eval schema even
         // when the projection doesn't carry it.

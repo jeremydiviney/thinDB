@@ -78,6 +78,18 @@ Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
 after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
 follow this, so `-0.0` and `0.0` form one group. MIN and MAX skip NaN.
 
+Values of different types compare by value, as in StarRocks and MySQL
+(`predicate.typesComparable`):
+- Numbers compare across integer, decimal and float types.
+- A DATE meets a DATETIME at midnight.
+- Text meets a number or a date by reading the text as one, the way a CAST reads it. Text that doesn't read as one compares as NULL.
+
+So `code = 12` matches `'12'`, `'12.0'` and `' 12 '` but not `'12abc'`. A
+text column compared with a number is evaluated row by row, with no zone-map
+or Bloom pruning. An IN list compares each element on its own, so
+`code IN ('x', 12)` means `code = 'x' OR code = 12`. StarRocks instead reads
+the whole list as numbers.
+
 Explicitly **out of scope for v1**: `JSON`, `ARRAY`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 ### 3.2 Schema and order key
@@ -1078,7 +1090,7 @@ The biggest piece is a **compiled query-plan tree** as IR — most of v2 builds 
 | General SQL transactions | Staged XA write commits exist (section 8.2); ordinary SQL transactional reads, rollback, and isolation remain unimplemented. |
 | Replication / multi-node | Explicitly out of scope. |
 | Cost-based optimizer / statistics-driven plans | The "thin" ethos rejects this. Pre-execution rewrites (constant folding, predicate normalization) are fine; plan-cost reordering is not. |
-| Implicit string ↔ number coercion | Footgun-prone (MySQL behavior); explicit `to_int` / `to_string` instead (Postgres/DuckDB/StarRocks consensus). |
+| Implicit string ↔ number coercion in arithmetic and function arguments | Footgun-prone (MySQL behavior); explicit `CAST` / `to_int` / `to_string` instead (Postgres/DuckDB/StarRocks consensus). Comparisons are the exception: text meets a number by value (§3.1). |
 
 ---
 
