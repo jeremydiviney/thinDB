@@ -340,12 +340,18 @@ fn collectDeletePruneInfo(
                 try hints.append(aa, .{ .col_idx = ci, .op = p.op, .val = p.val });
             } else try markDerivedInputs(columns, derived, p.col, aa, ref_cols);
         },
-        .in_set => |s| {
+        .in_set, .text_as_number_set => |s| {
             // IN sets don't produce a single-op hint; referenced-column
             // tracking alone is the win here.
             if (types.findColumn(columns, s.col)) |ci| {
                 ref_cols[ci] = true;
             } else try markDerivedInputs(columns, derived, s.col, aa, ref_cols);
+        },
+        // Text read as a number has no zonemap order to prune by.
+        .text_as_number => |p| {
+            if (types.findColumn(columns, p.col)) |ci| {
+                ref_cols[ci] = true;
+            } else try markDerivedInputs(columns, derived, p.col, aa, ref_cols);
         },
         else => return error.UnknownShape,
     }

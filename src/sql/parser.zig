@@ -4903,12 +4903,13 @@ fn predicateAvailableAfterGroup(p: PredicateExpr, group_cols: []const []const u8
     return switch (p) {
         .leaf => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
         .day_leaf => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
+        .text_as_number => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
         .leaf_col_col => |lc| groupedOutputNameAvailable(lc.left, group_cols, extra_cols) and
             groupedOutputNameAvailable(lc.right, group_cols, extra_cols),
         .is_null => |c| groupedOutputNameAvailable(c, group_cols, extra_cols),
         .is_not_null => |c| groupedOutputNameAvailable(c, group_cols, extra_cols),
         .like => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
-        .in_set => |s| groupedOutputNameAvailable(s.col, group_cols, extra_cols),
+        .in_set, .text_as_number_set => |s| groupedOutputNameAvailable(s.col, group_cols, extra_cols),
         .leaf_var => |v| groupedOutputNameAvailable(v.col, group_cols, extra_cols),
         .@"and", .@"or" => |children| blk: {
             for (children) |child| {
@@ -4951,11 +4952,12 @@ fn predicateReferencesAnyColumn(p: PredicateExpr, cols: []const []const u8) bool
     return switch (p) {
         .leaf => |l| nameInList(l.col, cols),
         .day_leaf => |l| nameInList(l.col, cols),
+        .text_as_number => |l| nameInList(l.col, cols),
         .leaf_col_col => |lc| nameInList(lc.left, cols) or nameInList(lc.right, cols),
         .is_null => |c| nameInList(c, cols),
         .is_not_null => |c| nameInList(c, cols),
         .like => |l| nameInList(l.col, cols),
-        .in_set => |s| nameInList(s.col, cols),
+        .in_set, .text_as_number_set => |s| nameInList(s.col, cols),
         .leaf_var => |v| nameInList(v.col, cols),
         .@"and", .@"or" => |children| blk: {
             for (children) |child| {

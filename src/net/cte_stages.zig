@@ -2586,11 +2586,11 @@ fn walkConjunctCols(
     side: *?ConjunctSide,
 ) bool {
     switch (e) {
-        .leaf => |lf| return noteCol(lf.col, ls, rs, side),
+        .leaf, .text_as_number => |lf| return noteCol(lf.col, ls, rs, side),
         .leaf_col_col => |lc| return noteCol(lc.left, ls, rs, side) and noteCol(lc.right, ls, rs, side),
         .is_null, .is_not_null => |col| return noteCol(col, ls, rs, side),
         .like => |lp| return noteCol(lp.col, ls, rs, side),
-        .in_set => |s| return noteCol(s.col, ls, rs, side),
+        .in_set, .text_as_number_set => |s| return noteCol(s.col, ls, rs, side),
         .@"and", .@"or" => |children| {
             for (children) |ch| if (!walkConjunctCols(ch, ls, rs, side)) return false;
             return true;
