@@ -25,8 +25,7 @@ pub fn yearFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *
     const s = args[0].data.date;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const y: i32 = if (daysToYmd(s[i])) |ymd| @intCast(ymd.year) else 0;
-        try out.data.int.append(allocator, y);
+        try out.data.int.append(allocator, daysToYmd(s[i]).year);
     }
 }
 
@@ -34,8 +33,7 @@ pub fn yearFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, ou
     const s = args[0].data.datetime;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const y: i32 = if (daysToYmd(daysFromDatetime(s[i]))) |ymd| @intCast(ymd.year) else 0;
-        try out.data.int.append(allocator, y);
+        try out.data.int.append(allocator, daysToYmd(daysFromDatetime(s[i])).year);
     }
 }
 
@@ -43,8 +41,7 @@ pub fn monthFromDateKernel(allocator: Allocator, args: []const ColumnView, out: 
     const s = args[0].data.date;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const m: i32 = if (daysToYmd(s[i])) |ymd| @intCast(ymd.month) else 0;
-        try out.data.int.append(allocator, m);
+        try out.data.int.append(allocator, daysToYmd(s[i]).month);
     }
 }
 
@@ -52,8 +49,7 @@ pub fn monthFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, o
     const s = args[0].data.datetime;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const m: i32 = if (daysToYmd(daysFromDatetime(s[i]))) |ymd| @intCast(ymd.month) else 0;
-        try out.data.int.append(allocator, m);
+        try out.data.int.append(allocator, daysToYmd(daysFromDatetime(s[i])).month);
     }
 }
 
@@ -61,8 +57,7 @@ pub fn dayFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *C
     const s = args[0].data.date;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const d: i32 = if (daysToYmd(s[i])) |ymd| @intCast(ymd.day) else 0;
-        try out.data.int.append(allocator, d);
+        try out.data.int.append(allocator, daysToYmd(s[i]).day);
     }
 }
 
@@ -70,8 +65,7 @@ pub fn dayFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out
     const s = args[0].data.datetime;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const d: i32 = if (daysToYmd(daysFromDatetime(s[i]))) |ymd| @intCast(ymd.day) else 0;
-        try out.data.int.append(allocator, d);
+        try out.data.int.append(allocator, daysToYmd(daysFromDatetime(s[i])).day);
     }
 }
 
@@ -79,8 +73,7 @@ pub fn hourKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     const s = args[0].data.datetime;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const h: i32 = if (microsToHms(s[i])) |hms| @intCast(hms.hour) else 0;
-        try out.data.int.append(allocator, h);
+        try out.data.int.append(allocator, microsToHms(s[i]).hour);
     }
 }
 
@@ -88,8 +81,7 @@ pub fn minuteKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     const s = args[0].data.datetime;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const m: i32 = if (microsToHms(s[i])) |hms| @intCast(hms.minute) else 0;
-        try out.data.int.append(allocator, m);
+        try out.data.int.append(allocator, microsToHms(s[i]).minute);
     }
 }
 
@@ -97,8 +89,7 @@ pub fn secondKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     const s = args[0].data.datetime;
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const sec: i32 = if (microsToHms(s[i])) |hms| @intCast(hms.second) else 0;
-        try out.data.int.append(allocator, sec);
+        try out.data.int.append(allocator, microsToHms(s[i]).second);
     }
 }
 
@@ -111,6 +102,13 @@ pub fn datediffKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
     const b = args[1].data.date;
     var i: usize = 0;
     while (i < row_count) : (i += 1) try out.data.int.append(allocator, a[i] - b[i]);
+}
+
+/// DATEDIFF over datetimes compares their dates only, as in MySQL.
+pub fn datediffDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.datetime;
+    const b = args[1].data.datetime;
+    for (a[0..row_count], b[0..row_count]) |x, y| try out.data.int.append(allocator, daysFromDatetime(x) - daysFromDatetime(y));
 }
 
 pub fn dateAddKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -164,9 +162,9 @@ pub fn makedateKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
 }
 
 fn addMonths(days: i32, n_months: i32) i32 {
-    const ymd = daysToYmd(days) orelse return days;
+    const ymd = daysToYmd(days);
     // Compute (year, month_0_indexed) zero-based math, then re-bias.
-    const total_m0: i32 = @as(i32, @intCast(ymd.year)) * 12 + (@as(i32, ymd.month) - 1) + n_months;
+    const total_m0: i32 = ymd.year * 12 + (@as(i32, ymd.month) - 1) + n_months;
     const new_year: i32 = @divFloor(total_m0, 12);
     const new_month: u32 = @intCast(@mod(total_m0, 12) + 1);
     const last = common.lastDayOfMonth(new_year, new_month);
@@ -307,19 +305,18 @@ fn truncToQuantum(comptime q: i64, s: []const i64, dst: []i64) void {
 }
 
 /// Truncate to the start of a calendar unit (week, month, quarter or year),
-/// which can't be expressed as a fixed micro-quantum. Unparseable values pass
-/// through.
+/// which can't be expressed as a fixed micro-quantum.
 fn truncCalendar(v: i64, unit: DateUnit) i64 {
     const days = daysFromDatetime(v);
     // 1970-01-01 was a Thursday: +3 puts Monday at 0.
     if (unit == .week) return @as(i64, days - @mod(days + 3, 7)) * std.time.us_per_day;
-    const ymd = daysToYmd(days) orelse return v;
+    const ymd = daysToYmd(days);
     const month: u32 = switch (unit) {
         .year => 1,
         .quarter => (@as(u32, ymd.month) - 1) / 3 * 3 + 1,
         else => ymd.month,
     };
-    return @as(i64, common.ymdToDays(@intCast(ymd.year), month, 1)) * std.time.us_per_day;
+    return @as(i64, common.ymdToDays(ymd.year, month, 1)) * std.time.us_per_day;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,8 +345,7 @@ pub fn dayofweekFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
 }
 
 fn dayofyearFromDays(days: i32) i32 {
-    const ymd = daysToYmd(days) orelse return 0;
-    return days - common.ymdToDays(@intCast(ymd.year), 1, 1) + 1;
+    return days - common.ymdToDays(daysToYmd(days).year, 1, 1) + 1;
 }
 
 pub fn dayofyearFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -365,8 +361,7 @@ pub fn dayofyearFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
 }
 
 fn quarterFromDays(days: i32) i32 {
-    const ymd = daysToYmd(days) orelse return 0;
-    return @divTrunc(@as(i32, ymd.month) - 1, 3) + 1;
+    return @divTrunc(@as(i32, daysToYmd(days).month) - 1, 3) + 1;
 }
 
 pub fn quarterFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -381,27 +376,10 @@ pub fn quarterFromDatetimeKernel(allocator: Allocator, args: []const ColumnView,
     while (i < row_count) : (i += 1) try out.data.int.append(allocator, quarterFromDays(daysFromDatetime(s[i])));
 }
 
-/// LAST_DAY: return the date corresponding to the last day of the given
-/// month. Days-since-epoch backed; pre-epoch returns 0.
+/// LAST_DAY: the last day of the date's month.
 fn lastDayFromDays(days: i32) i32 {
-    const ymd = daysToYmd(days) orelse return 0;
-    const last = daysInMonth(ymd.year, ymd.month);
-    return days - @as(i32, ymd.day - 1) + @as(i32, last - 1);
-}
-
-fn daysInMonth(yr: u16, mo: u4) u5 {
-    return switch (mo) {
-        1, 3, 5, 7, 8, 10, 12 => 31,
-        4, 6, 9, 11 => 30,
-        2 => if (isLeapYear(yr)) 29 else 28,
-        else => 0,
-    };
-}
-
-fn isLeapYear(yr: u16) bool {
-    if (yr % 400 == 0) return true;
-    if (yr % 100 == 0) return false;
-    return yr % 4 == 0;
+    const ymd = daysToYmd(days);
+    return days - @as(i32, ymd.day) + @as(i32, @intCast(common.lastDayOfMonth(ymd.year, ymd.month)));
 }
 
 pub fn lastDayFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -442,11 +420,7 @@ pub fn monthnameFromDateKernel(allocator: Allocator, args: []const ColumnView, o
     const ss = stringStoreOf(out);
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const ymd = daysToYmd(s[i]) orelse {
-            try ss.appendValue(allocator, "");
-            continue;
-        };
-        try ss.appendValue(allocator, month_names[@as(usize, ymd.month) - 1]);
+        try ss.appendValue(allocator, month_names[@as(usize, daysToYmd(s[i]).month) - 1]);
     }
 }
 
@@ -455,18 +429,14 @@ pub fn monthnameFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
     const ss = stringStoreOf(out);
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const ymd = daysToYmd(daysFromDatetime(s[i])) orelse {
-            try ss.appendValue(allocator, "");
-            continue;
-        };
-        try ss.appendValue(allocator, month_names[@as(usize, ymd.month) - 1]);
+        try ss.appendValue(allocator, month_names[@as(usize, daysToYmd(daysFromDatetime(s[i])).month) - 1]);
     }
 }
 
 fn monthDiff(start_days: i32, end_days: i32) i32 {
-    const s = daysToYmd(start_days) orelse return 0;
-    const e = daysToYmd(end_days) orelse return 0;
-    var months = (@as(i32, e.year) - @as(i32, s.year)) * 12 + (@as(i32, e.month) - @as(i32, s.month));
+    const s = daysToYmd(start_days);
+    const e = daysToYmd(end_days);
+    var months = (e.year - s.year) * 12 + (@as(i32, e.month) - @as(i32, s.month));
     if (months > 0 and e.day < s.day) months -= 1;
     if (months < 0 and e.day > s.day) months += 1;
     return months;
@@ -598,16 +568,10 @@ fn dateFormatRow(
     days: i32,
     micros_into_day: i64,
 ) !void {
-    const ymd_opt = daysToYmd(days);
-    var hh: u32 = 0;
-    var mm: u32 = 0;
-    var ss_v: u32 = 0;
-    if (micros_into_day >= 0) {
-        const total_secs = @divTrunc(micros_into_day, 1_000_000);
-        hh = @intCast(@divTrunc(total_secs, 3600));
-        mm = @intCast(@mod(@divTrunc(total_secs, 60), 60));
-        ss_v = @intCast(@mod(total_secs, 60));
-    }
+    const ymd = daysToYmd(days);
+    const hms = microsToHms(micros_into_day);
+    // DATE's range is years 0000-9999; arithmetic can step outside it.
+    const year: u64 = @intCast(std.math.clamp(ymd.year, 0, 9999));
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -627,13 +591,13 @@ fn dateFormatRow(
         const spec = fmt[i + 1];
         i += 2;
         switch (spec) {
-            'Y' => if (ymd_opt) |ymd| try appendDigits4(&buf, allocator, ymd.year) else try buf.appendSlice(allocator, "0000"),
-            'y' => if (ymd_opt) |ymd| try appendDigits2(&buf, allocator, @as(u64, ymd.year) % 100) else try buf.appendSlice(allocator, "00"),
-            'm' => if (ymd_opt) |ymd| try appendDigits2(&buf, allocator, ymd.month) else try buf.appendSlice(allocator, "00"),
-            'd' => if (ymd_opt) |ymd| try appendDigits2(&buf, allocator, ymd.day) else try buf.appendSlice(allocator, "00"),
-            'H' => try appendDigits2(&buf, allocator, hh),
-            'i' => try appendDigits2(&buf, allocator, mm),
-            's' => try appendDigits2(&buf, allocator, ss_v),
+            'Y' => try appendDigits4(&buf, allocator, year),
+            'y' => try appendDigits2(&buf, allocator, year % 100),
+            'm' => try appendDigits2(&buf, allocator, ymd.month),
+            'd' => try appendDigits2(&buf, allocator, ymd.day),
+            'H' => try appendDigits2(&buf, allocator, hms.hour),
+            'i' => try appendDigits2(&buf, allocator, hms.minute),
+            's' => try appendDigits2(&buf, allocator, hms.second),
             '%' => try buf.append(allocator, '%'),
             else => try buf.append(allocator, spec), // unknown: pass through stripped
         }

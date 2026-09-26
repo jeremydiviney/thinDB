@@ -741,6 +741,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "concat", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 4, .kernel = string.concatNKernel },
     .{ .name = "concat_ws", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = string.concatWsKernel },
     .{ .name = "substring", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .kernel = string.substringKernel },
+    .{ .name = "substring", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.substringKernel },
     .{ .name = "left", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.leftKernel },
     .{ .name = "right", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.rightKernel },
     .{ .name = "replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.replaceKernel },
@@ -881,6 +882,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "second", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.secondKernel },
     // --- date arithmetic + epoch conversion ---
     .{ .name = "datediff", .arg_types = &.{ .date, .date }, .return_type = .int, .kernel = date.datediffKernel },
+    .{ .name = "datediff", .arg_types = &.{ .datetime, .datetime }, .return_type = .int, .kernel = date.datediffDatetimeKernel },
     .{ .name = "date_add", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddKernel },
     .{ .name = "date_sub", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateSubKernel },
     // Calendar-aware month/year addition; clamps day on short destination
@@ -991,7 +993,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "bit_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.bitLengthKernel },
     .{ .name = "position", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.positionKernel },
     .{ .name = "locate", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.positionKernel },
-    .{ .name = "strpos", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.positionKernel },
+    .{ .name = "locate", .arg_types = &.{ .string, .string, .int }, .return_type = .int, .kernel = string.locateFromKernel },
+    .{ .name = "strpos", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.instrKernel },
     .{ .name = "instr", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.instrKernel },
     .{ .name = "starts_with", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.startsWithKernel },
     .{ .name = "ends_with", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.endsWithKernel },

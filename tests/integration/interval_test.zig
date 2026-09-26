@@ -258,3 +258,51 @@ test "date unit functions know WEEK and QUARTER and reject unknown units" {
         try std.testing.expectError(error.ComputeUnsupportedExpr, q.next());
     }
 }
+
+test "calendar functions work before 1970" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE h (id BIGINT PRIMARY KEY, d DATE NOT NULL, ts DATETIME NOT NULL)");
+    try exec(allocator, db, "INSERT INTO h (id, d, ts) VALUES (1, '1965-03-05', '1965-03-05 10:07:09.25'), (2, '1964-02-10', '1900-02-10 23:59:58'), (3, '0001-01-01', '1969-12-31 23:00:01')");
+
+    const cases = .{
+        .{ "YEAR(d)", [_]i64{ 1965, 1964, 1 } },
+        .{ "MONTH(d)", [_]i64{ 3, 2, 1 } },
+        .{ "DAY(d)", [_]i64{ 5, 10, 1 } },
+        .{ "QUARTER(d)", [_]i64{ 1, 1, 1 } },
+        .{ "DAYOFYEAR(d)", [_]i64{ 64, 41, 1 } },
+        .{ "DAYOFWEEK(d)", [_]i64{ 6, 2, 2 } },
+        .{ "YEAR(ts)", [_]i64{ 1965, 1900, 1969 } },
+        .{ "HOUR(ts)", [_]i64{ 10, 23, 23 } },
+        .{ "MINUTE(ts)", [_]i64{ 7, 59, 0 } },
+        .{ "SECOND(ts)", [_]i64{ 9, 58, 1 } },
+        .{ "DATEDIFF(LAST_DAY(d), DATE '1964-01-01')", [_]i64{ 455, 59, -716940 } },
+        .{ "DATEDIFF(LAST_DAY(ts), DATE '1900-01-01')", [_]i64{ 23830, 58, 25566 } },
+        .{ "DATEDIFF(d + INTERVAL 1 MONTH, d)", [_]i64{ 31, 29, 31 } },
+        .{ "TIMESTAMPDIFF(MONTH, d, DATE '1965-03-05')", [_]i64{ 0, 12, 23570 } },
+        .{ "DATEDIFF(DATE_TRUNC('month', ts), DATE '1900-01-01')", [_]i64{ 23800, 31, 25536 } },
+        .{ "DATEDIFF(DATE_TRUNC('quarter', ts), DATE '1900-01-01')", [_]i64{ 23741, 0, 25475 } },
+        .{ "CASE WHEN DATE_FORMAT(ts, '%Y/%m/%d %H:%i:%s') IN ('1965/03/05 10:07:09', '1900/02/10 23:59:58', '1969/12/31 23:00:01') THEN 1 ELSE 0 END", [_]i64{ 1, 1, 1 } },
+        .{ "CASE WHEN MONTHNAME(d) IN ('March', 'February', 'January') THEN 1 ELSE 0 END", [_]i64{ 1, 1, 1 } },
+    };
+    inline for (cases) |c| {
+        const got = helpers.collectBigints(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS BIGINT) FROM h ORDER BY id") catch |err| {
+            std.debug.print("expr: {s}\n", .{c[0]});
+            return err;
+        };
+        defer allocator.free(got);
+        const want: [3]i64 = c[1];
+        std.testing.expectEqualSlices(i64, &want, got) catch |err| {
+            std.debug.print("expr: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    const day_match = try helpers.collectBigints(allocator, db, "SELECT id FROM h WHERE DAY(d) = 10");
+    defer allocator.free(day_match);
+    try std.testing.expectEqualSlices(i64, &.{2}, day_match);
+}

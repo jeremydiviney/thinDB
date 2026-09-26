@@ -1498,15 +1498,8 @@ fn evaluateDayMask(view: ColumnView, p: Predicate, n: usize, out: []bool) !void 
             continue;
         }
         const day: i32 = switch (view.data) {
-            .date => |s| blk: {
-                const ymd = scalar_fn_common.daysToYmd(s[i]) orelse return Error.PredicateTypeMismatch;
-                break :blk ymd.day;
-            },
-            .datetime => |s| blk: {
-                const days = scalar_fn_common.daysFromDatetime(s[i]);
-                const ymd = scalar_fn_common.daysToYmd(days) orelse return Error.PredicateTypeMismatch;
-                break :blk ymd.day;
-            },
+            .date => |s| scalar_fn_common.daysToYmd(s[i]).day,
+            .datetime => |s| scalar_fn_common.daysToYmd(scalar_fn_common.daysFromDatetime(s[i])).day,
             else => return Error.PredicateTypeMismatch,
         };
         out[i] = cmp(i32, day, want, p.op);
