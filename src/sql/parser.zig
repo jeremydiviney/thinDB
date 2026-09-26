@@ -2737,7 +2737,8 @@ pub const Parser = struct {
     // -----------------------------------------------------------------------
     // FROM clause + JOIN chaining.
     //
-    //   from_clause := ident (join_kind 'JOIN' ident 'ON' equi_conds)*
+    //   from_clause := join_chain (',' join_chain)*
+    //   join_chain  := ident (join_kind 'JOIN' ident 'ON' equi_conds | 'CROSS' 'JOIN' ident)*
     //   join_kind   := 'INNER'? | 'LEFT' 'OUTER'? | 'RIGHT' 'OUTER'? | 'FULL' 'OUTER'?
     //   equi_conds  := qualified_col '=' qualified_col ('AND' qualified_col '=' qualified_col)*
     //
@@ -2757,7 +2758,42 @@ pub const Parser = struct {
 
     fn parseFromClause(self: *Parser) ParseError!FromClause {
         const first = try self.parseFromTarget();
-        var root = first.op;
+        if (!isJoinStart(self.cur.tag) and self.cur.tag != .comma) {
+            if (first.unaliased == .no) return .{ .op = first.op };
+            return .{ .op = first.op, .sole_unaliased_name = first.name };
+        }
+        var root = try self.parseJoinChain(first);
+        // A comma cross-joins whole join chains: it binds looser than JOIN,
+        // so `a, b RIGHT JOIN c ON ...` right-joins c to b alone, and each
+        // chain's ON clauses see only that chain's names. WHERE equalities
+        // between the chains become join keys at compile.
+        while (self.cur.tag == .comma) {
+            try self.advance();
+            const chain = try self.parseJoinChain(try self.parseFromTarget());
+            root = try self.crossJoin(root, chain);
+        }
+        return .{ .op = root };
+    }
+
+    fn crossJoin(self: *Parser, left: *ir.Op, right: *ir.Op) ParseError!*ir.Op {
+        // Empty key/range sets route the executor to its nested-loop
+        // (cartesian) path.
+        return self.allocOp(.{ .join = .{
+            .algorithm = .auto,
+            .join_type = .inner,
+            .on = &.{},
+            .ranges = &.{},
+            .extra_predicate = null,
+            .skew_ratio_threshold = 0.3,
+            .skew_absolute_threshold = 20_000,
+            .skew_sample_interval = 10,
+            .left = left,
+            .right = right,
+        } });
+    }
+
+    fn parseJoinChain(self: *Parser, first: FromTarget) ParseError!*ir.Op {
+        var root = try self.nameJoinInput(first);
 
         // Running set of names that constitute the current left
         // subtree. Each new JOIN's ON clause must reference one of
@@ -2768,27 +2804,13 @@ pub const Parser = struct {
         defer left_names.deinit(self.arena);
 
         while (isJoinStart(self.cur.tag)) {
-            if (root == first.op) root = try self.nameJoinInput(first);
-            // CROSS JOIN takes no ON clause; empty key/range sets route the
-            // executor to its nested-loop (cartesian) path.
+            // CROSS JOIN takes no ON clause.
             if (self.cur.tag == .kw_cross) {
                 try self.advance();
                 if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
                 try self.advance();
                 const right = try self.parseFromTarget();
-                const right_op = try self.nameJoinInput(right);
-                root = try self.allocOp(.{ .join = .{
-                    .algorithm = .auto,
-                    .join_type = .inner,
-                    .on = &.{},
-                    .ranges = &.{},
-                    .extra_predicate = null,
-                    .skew_ratio_threshold = 0.3,
-                    .skew_absolute_threshold = 20_000,
-                    .skew_sample_interval = 10,
-                    .left = root,
-                    .right = right_op,
-                } });
+                root = try self.crossJoin(root, try self.nameJoinInput(right));
                 try left_names.append(self.arena, right.name);
                 continue;
             }
@@ -2835,8 +2857,7 @@ pub const Parser = struct {
             }
             try left_names.append(self.arena, right.name);
         }
-        if (root != first.op or first.unaliased == .no) return .{ .op = root };
-        return .{ .op = root, .sole_unaliased_name = first.name };
+        return root;
     }
 
     /// A lone unaliased FROM source is named by itself, so its `name.*` is

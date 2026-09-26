@@ -1503,7 +1503,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return exec.AliasRename.create(input.allocator, up, a.alias);
         },
         .filter => |f| {
-            if (f.upstream.* == .join) {
+            if (filterableJoin(f.upstream) != null) {
                 const t_op = exec.prof.nowTicks();
                 defer exec.prof.addPhase("compile.op.filtered_join_incl", @intCast(exec.prof.nowTicks() - t_op));
                 return compileFilteredJoin(input, f.predicate, f.upstream, map, block_root);
@@ -2478,79 +2478,281 @@ fn joinSpecOf(j: anytype, force_ordered: bool) ir.JoinSpec {
 }
 
 // ---------------------------------------------------------------------------
-// WHERE-above-JOIN: basic predicate pushdown into the join inputs.
+// WHERE-above-JOIN: placing the WHERE's conjuncts into the join tree.
 // ---------------------------------------------------------------------------
 
-const ConjunctSide = enum { left, right, mixed };
-
-/// Compile `filter(pred) -> join(left, right)` splitting the top-level AND
-/// conjuncts by which join input their columns resolve to. Single-side
-/// conjuncts become filters ON that input — the Filter registers row-group
-/// prune hints and offers itself for scan fusion, so only surviving rows are
-/// materialized (build side) or streamed (probe side). Pushing below the
-/// join is only sound where filtered rows can't resurface as null-extended
-/// output: INNER pushes both sides, LEFT only left-side conjuncts, RIGHT
-/// only right-side, FULL nothing. Cross-side / unresolvable / subquery
-/// conjuncts stay in a residual filter above the join (WHERE semantics).
+/// Compile `filter(pred)` over a join tree, placing each top-level AND
+/// conjunct at the lowest point that sees every column it reads:
+///   - on the one input its columns resolve to, where the Filter registers
+///     row-group prune hints and offers itself for scan fusion, so only
+///     surviving rows are materialized (build side) or streamed (probe);
+///   - as a key of the INNER join whose two sides it equates, so
+///     `FROM a, b WHERE a.x = b.y` joins like `a JOIN b ON a.x = b.y`
+///     instead of filtering a cartesian product;
+///   - otherwise in a filter above the lowest join that sees its columns.
+/// A filter moves into a join's input only where the rows it drops can't
+/// resurface as null-extended output: INNER both inputs, LEFT the left,
+/// RIGHT the right, FULL neither. A conjunct no input resolves — subquery,
+/// correlated or variable markers, an ambiguous or unknown column — stays
+/// in a filter above the whole tree (WHERE semantics).
 fn compileFilteredJoin(
     input: engine_v2.CompileInput,
     pred: PredicateExpr,
-    join_op: *const ir.Op,
+    top: *const ir.Op,
     map: *StageMap,
     block_root: *const ir.Op,
 ) anyerror!exec.Query {
-    const j = join_op.join;
     const allocator = input.allocator;
-
-    var left = try compileJoinChild(input, j.left, map, j.join_type == .left or j.join_type == .inner, block_root);
-    var left_owned = true;
-    errdefer if (left_owned) left.deinit();
-    var right = try compileJoinChild(input, j.right, map, j.join_type == .right or j.join_type == .inner, block_root);
-    var right_owned = true;
-    errdefer if (right_owned) right.deinit();
+    var tree: JoinTree = .{ .input = input, .map = map, .block_root = block_root };
+    defer tree.deinit();
+    try tree.compileInputs(top, true, true);
 
     var conjuncts: std.ArrayListUnmanaged(PredicateExpr) = .empty;
     defer conjuncts.deinit(allocator);
     try flattenConjuncts(allocator, pred, &conjuncts);
 
-    var left_push: std.ArrayListUnmanaged(PredicateExpr) = .empty;
-    defer left_push.deinit(allocator);
-    var right_push: std.ArrayListUnmanaged(PredicateExpr) = .empty;
-    defer right_push.deinit(allocator);
-    var residual: std.ArrayListUnmanaged(PredicateExpr) = .empty;
-    defer residual.deinit(allocator);
-
-    const can_left = j.join_type == .inner or j.join_type == .left;
-    const can_right = j.join_type == .inner or j.join_type == .right;
-    const left_schema = left.outputSchema();
-    const right_schema = right.outputSchema();
-
+    var placed: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    defer placed.deinit(allocator);
+    var above: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    defer above.deinit(allocator);
     for (conjuncts.items) |c| {
-        switch (conjunctSide(c, left_schema, right_schema)) {
-            .left => try (if (can_left) &left_push else &residual).append(allocator, c),
-            .right => try (if (can_right) &right_push else &residual).append(allocator, c),
-            .mixed => try residual.append(allocator, c),
-        }
+        try (if (tree.span(c) != null) &placed else &above).append(allocator, c);
     }
 
-    if (left_push.items.len > 0)
-        left = try left.filter(try combineConjuncts(input.node_arena, left_push.items));
-    if (right_push.items.len > 0)
-        right = try right.filter(try combineConjuncts(input.node_arena, right_push.items));
-
-    markJoinBuildContiguous(input, j.join_type, left, right);
-    var joined = try left.join(right, joinSpecOf(j, input.force_ordered));
-    left_owned = false;
-    right_owned = false;
-    if (input.win_registry) |reg| {
-        if (exec.queryAs(join_mod.Join, joined)) |jop| {
-            reg.put(input.allocator, @ptrCast(join_op), @ptrCast(jop)) catch {};
-        }
-    }
-    if (residual.items.len == 0) return joined;
+    var joined = try tree.buildInput(top, true, 0, placed.items);
+    if (above.items.len == 0) return joined;
     errdefer joined.deinit();
-    return joined.filter(try combineConjuncts(input.node_arena, residual.items));
+    return joined.filter(try combineConjuncts(input.node_arena, above.items));
 }
+
+/// `op` as a join a WHERE above it reaches into: a join, or one under the
+/// Exclude that drops its hidden ON-expression columns.
+fn filterableJoin(op: *const ir.Op) ?*const ir.Op {
+    return switch (op.*) {
+        .join => op,
+        .exclude => |e| if (e.upstream.* == .join) e.upstream else null,
+        else => null,
+    };
+}
+
+/// Whether a filter above the join may move into its left input — also the
+/// input a join may probe.
+fn pushesLeft(j: ir.Op.Join) bool {
+    return j.join_type == .inner or j.join_type == .left;
+}
+
+fn pushesRight(j: ir.Op.Join) bool {
+    return j.join_type == .inner or j.join_type == .right;
+}
+
+/// The lowest and highest leaf of a `JoinTree` a conjunct reads.
+const LeafSpan = struct { lo: usize, hi: usize };
+
+const LeafColumn = struct { leaf: usize, column: types.Column };
+
+const WhereKey = struct { pair: ir.JoinKeyPair, copy: ir.Derived };
+
+/// A join tree under a WHERE (`compileFilteredJoin`). Every join a filter
+/// may move into is opened up to its inputs, and those inputs (the leaves)
+/// compile left to right before any conjunct is placed, so each conjunct
+/// resolves against every leaf's columns.
+const JoinTree = struct {
+    input: engine_v2.CompileInput,
+    map: *StageMap,
+    block_root: *const ir.Op,
+    /// Null once built into its join.
+    leaves: std.ArrayListUnmanaged(?exec.Query) = .empty,
+    schemas: std.ArrayListUnmanaged([]const types.Column) = .empty,
+
+    fn deinit(self: *JoinTree) void {
+        for (self.leaves.items) |*leaf| if (leaf.*) |*q| q.deinit();
+        self.leaves.deinit(self.input.allocator);
+        self.schemas.deinit(self.input.allocator);
+    }
+
+    fn compileInputs(self: *JoinTree, op: *const ir.Op, pushable: bool, is_probe: bool) anyerror!void {
+        if (pushable) if (filterableJoin(op)) |join_op| {
+            const j = join_op.join;
+            try self.compileInputs(j.left, pushesLeft(j), pushesLeft(j));
+            try self.compileInputs(j.right, pushesRight(j), pushesRight(j));
+            return;
+        };
+        const allocator = self.input.allocator;
+        try self.leaves.ensureUnusedCapacity(allocator, 1);
+        try self.schemas.ensureUnusedCapacity(allocator, 1);
+        const q = try compileJoinChild(self.input, op, self.map, is_probe, self.block_root);
+        self.leaves.appendAssumeCapacity(q);
+        self.schemas.appendAssumeCapacity(q.outputSchema());
+    }
+
+    /// How many leaves `compileInputs` compiled under `op`.
+    fn leafCount(op: *const ir.Op, pushable: bool) usize {
+        if (pushable) if (filterableJoin(op)) |join_op| {
+            const j = join_op.join;
+            return leafCount(j.left, pushesLeft(j)) + leafCount(j.right, pushesRight(j));
+        };
+        return 1;
+    }
+
+    /// Null when the conjunct reads no column, a column no single leaf
+    /// resolves, or a subquery, correlated or variable marker.
+    fn span(self: *const JoinTree, c: PredicateExpr) ?LeafSpan {
+        var s: ?LeafSpan = null;
+        if (!self.noteConjunct(c, &s)) return null;
+        return s;
+    }
+
+    fn noteConjunct(self: *const JoinTree, e: PredicateExpr, s: *?LeafSpan) bool {
+        switch (e) {
+            .leaf, .text_as_number => |lf| return self.noteColumn(lf.col, s),
+            .leaf_col_col => |lc| return self.noteColumn(lc.left, s) and self.noteColumn(lc.right, s),
+            .is_null, .is_not_null => |col| return self.noteColumn(col, s),
+            .like => |lp| return self.noteColumn(lp.col, s),
+            .in_set, .text_as_number_set => |set| return self.noteColumn(set.col, s),
+            .@"and", .@"or" => |children| {
+                for (children) |ch| if (!self.noteConjunct(ch, s)) return false;
+                return true;
+            },
+            .not => |child| return self.noteConjunct(child.*, s),
+            .always => return true,
+            else => return false,
+        }
+    }
+
+    fn noteColumn(self: *const JoinTree, name: []const u8, s: *?LeafSpan) bool {
+        const leaf = self.leafOf(name) orelse return false;
+        s.* = if (s.*) |prev| .{ .lo = @min(prev.lo, leaf), .hi = @max(prev.hi, leaf) } else .{ .lo = leaf, .hi = leaf };
+        return true;
+    }
+
+    /// The one leaf whose output has `name`. `findColumn`'s qualified-name
+    /// tail matching can hit several (`h.RegionID` tail-matches a bare
+    /// `RegionID` elsewhere): an exact-name match on exactly one of them
+    /// disambiguates, anything else is ambiguous.
+    fn leafOf(self: *const JoinTree, name: []const u8) ?usize {
+        var hits: usize = 0;
+        var hit: usize = 0;
+        var exact_hits: usize = 0;
+        var exact_hit: usize = 0;
+        for (self.schemas.items, 0..) |schema, i| {
+            if (types.findColumn(schema, name) == null) continue;
+            hits += 1;
+            hit = i;
+            if (exactCol(schema, name)) {
+                exact_hits += 1;
+                exact_hit = i;
+            }
+        }
+        if (hits == 1) return hit;
+        if (exact_hits == 1) return exact_hit;
+        return null;
+    }
+
+    fn column(self: *const JoinTree, name: []const u8) ?LeafColumn {
+        const leaf = self.leafOf(name) orelse return null;
+        const schema = self.schemas.items[leaf];
+        const idx = types.findColumn(schema, name) orelse return null;
+        return .{ .leaf = leaf, .column = schema[idx] };
+    }
+
+    /// Builds the input `op`, whose leaves start at `first_leaf`, placing
+    /// `conjuncts` (each reading only those leaves) at their lowest point.
+    fn buildInput(self: *JoinTree, op: *const ir.Op, pushable: bool, first_leaf: usize, conjuncts: []const PredicateExpr) anyerror!exec.Query {
+        if (pushable) if (filterableJoin(op)) |join_op| {
+            var joined = try self.buildJoin(join_op, first_leaf, conjuncts);
+            if (op.* != .exclude) return joined;
+            errdefer joined.deinit();
+            const remaining = try local.complementColumns(self.input.allocator, joined.outputSchema(), op.exclude.columns);
+            defer self.input.allocator.free(remaining);
+            return joined.project(remaining);
+        };
+        var leaf = self.leaves.items[first_leaf].?;
+        self.leaves.items[first_leaf] = null;
+        if (conjuncts.len == 0) return leaf;
+        errdefer leaf.deinit();
+        return leaf.filter(try combineConjuncts(self.input.node_arena, conjuncts));
+    }
+
+    fn buildJoin(self: *JoinTree, join_op: *const ir.Op, first_leaf: usize, conjuncts: []const PredicateExpr) anyerror!exec.Query {
+        const j = join_op.join;
+        const input = self.input;
+        const allocator = input.allocator;
+        const first_right = first_leaf + leafCount(j.left, pushesLeft(j));
+
+        var to_left: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer to_left.deinit(allocator);
+        var to_right: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer to_right.deinit(allocator);
+        var keys: std.ArrayListUnmanaged(ir.JoinKeyPair) = .empty;
+        var key_copies: std.ArrayListUnmanaged(ir.Derived) = .empty;
+        var residual: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer residual.deinit(allocator);
+        for (conjuncts) |c| {
+            const s = self.span(c).?;
+            if (s.hi < first_right and pushesLeft(j)) {
+                try to_left.append(allocator, c);
+            } else if (s.lo >= first_right and pushesRight(j)) {
+                try to_right.append(allocator, c);
+            } else if (j.join_type == .inner and s.lo < first_right and s.hi >= first_right) {
+                if (try self.whereKey(c, first_right, key_copies.items.len)) |key| {
+                    try keys.append(input.node_arena, key.pair);
+                    try key_copies.append(input.node_arena, key.copy);
+                } else try residual.append(allocator, c);
+            } else {
+                try residual.append(allocator, c);
+            }
+        }
+
+        var left = try self.buildInput(j.left, pushesLeft(j), first_leaf, to_left.items);
+        var left_owned = true;
+        errdefer if (left_owned) left.deinit();
+        var right = try self.buildInput(j.right, pushesRight(j), first_right, to_right.items);
+        var right_owned = true;
+        errdefer if (right_owned) right.deinit();
+        if (key_copies.items.len > 0) {
+            right = try engine_v2.computeDerivedFused(allocator, right, key_copies.items, input.udf_registry);
+        }
+
+        var spec = joinSpecOf(j, input.force_ordered);
+        if (keys.items.len > 0) spec.on = try std.mem.concat(input.node_arena, ir.JoinKeyPair, &.{ j.on, keys.items });
+        markJoinBuildContiguous(input, j.join_type, left, right);
+        var joined = try left.join(right, spec);
+        left_owned = false;
+        right_owned = false;
+        if (input.win_registry) |reg| {
+            if (exec.queryAs(join_mod.Join, joined)) |jop| {
+                reg.put(allocator, @ptrCast(join_op), @ptrCast(jop)) catch {};
+            }
+        }
+        if (residual.items.len == 0) return joined;
+        errdefer joined.deinit();
+        return joined.filter(try combineConjuncts(input.node_arena, residual.items));
+    }
+
+    /// `c` as a key of the join whose right leaves start at `first_right`:
+    /// an equality of a left and a right column whose types compare and make
+    /// a join key. The key reads the right column through a hidden copy, as
+    /// an ON clause's does, since the join drops its right keys.
+    fn whereKey(self: *const JoinTree, c: PredicateExpr, first_right: usize, copy_index: usize) !?WhereKey {
+        if (c != .leaf_col_col or c.leaf_col_col.op != .eq) return null;
+        const a = self.column(c.leaf_col_col.left) orelse return null;
+        const b = self.column(c.leaf_col_col.right) orelse return null;
+        const left, const right = if (a.leaf < first_right and b.leaf >= first_right)
+            .{ a.column, b.column }
+        else if (b.leaf < first_right and a.leaf >= first_right)
+            .{ b.column, a.column }
+        else
+            return null;
+        if (!exec.predicate.typesComparable(left.type, right.type)) return null;
+        if (!join_mod.equalityKeyTypesJoin(left.type, right.type)) return null;
+        const arena = self.input.node_arena;
+        const copy = try std.fmt.allocPrint(arena, "__join_on_where_{d}", .{copy_index});
+        return .{
+            .pair = .{ .left = try arena.dupe(u8, left.name), .right = copy },
+            .copy = .{ .name = copy, .expr = .{ .col_ref = try arena.dupe(u8, right.name) } },
+        };
+    }
+};
 
 fn flattenConjuncts(
     allocator: std.mem.Allocator,
@@ -2570,61 +2772,6 @@ fn combineConjuncts(arena: Allocator, items: []const PredicateExpr) !PredicateEx
     const children = try arena.alloc(PredicateExpr, items.len);
     @memcpy(children, items);
     return .{ .@"and" = children };
-}
-
-fn conjunctSide(c: PredicateExpr, left_schema: []const types.Column, right_schema: []const types.Column) ConjunctSide {
-    var side: ?ConjunctSide = null;
-    if (!walkConjunctCols(c, left_schema, right_schema, &side)) return .mixed;
-    return side orelse .mixed;
-}
-
-/// Accumulate the side every column of `e` resolves to. Returns false to
-/// keep the conjunct above the join: subquery / correlated / variable
-/// markers, a column resolving to both or neither side, or sides mixing.
-fn walkConjunctCols(
-    e: PredicateExpr,
-    ls: []const types.Column,
-    rs: []const types.Column,
-    side: *?ConjunctSide,
-) bool {
-    switch (e) {
-        .leaf, .text_as_number => |lf| return noteCol(lf.col, ls, rs, side),
-        .leaf_col_col => |lc| return noteCol(lc.left, ls, rs, side) and noteCol(lc.right, ls, rs, side),
-        .is_null, .is_not_null => |col| return noteCol(col, ls, rs, side),
-        .like => |lp| return noteCol(lp.col, ls, rs, side),
-        .in_set, .text_as_number_set => |s| return noteCol(s.col, ls, rs, side),
-        .@"and", .@"or" => |children| {
-            for (children) |ch| if (!walkConjunctCols(ch, ls, rs, side)) return false;
-            return true;
-        },
-        .not => |child| return walkConjunctCols(child.*, ls, rs, side),
-        .always => return true,
-        else => return false,
-    }
-}
-
-fn noteCol(name: []const u8, ls: []const types.Column, rs: []const types.Column, side: *?ConjunctSide) bool {
-    const in_left = types.findColumn(ls, name) != null;
-    const in_right = types.findColumn(rs, name) != null;
-    var s: ConjunctSide = undefined;
-    if (in_left and in_right) {
-        // findColumn's qualified-name tail matching can hit BOTH sides
-        // (`h.RegionID` tail-matches a bare `RegionID` on the other
-        // side). An exact-name match on exactly one side disambiguates;
-        // anything else is genuinely ambiguous — keep above the join.
-        const exact_left = exactCol(ls, name);
-        const exact_right = exactCol(rs, name);
-        if (exact_left == exact_right) return false;
-        s = if (exact_left) .left else .right;
-    } else if (in_left) {
-        s = .left;
-    } else if (in_right) {
-        s = .right;
-    } else return false;
-    if (side.*) |prev| {
-        if (prev != s) return false;
-    } else side.* = s;
-    return true;
 }
 
 fn exactCol(schema: []const types.Column, name: []const u8) bool {
