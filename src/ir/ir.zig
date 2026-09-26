@@ -547,8 +547,8 @@ pub const BatchOp = struct {
 pub const SetUnion = struct {
     left: *Op,
     right: *Op,
-    /// `true` = UNION ALL (no dedup); `false` is reserved for the
-    /// future distinct variant. v1 only emits `all = true`.
+    /// `true` = UNION ALL (no dedup); `false` = UNION [DISTINCT], one copy
+    /// of each distinct row.
     all: bool,
 };
 
