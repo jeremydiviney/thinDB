@@ -298,7 +298,7 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
         if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float"))
             return try buildDecFn(aa, name, arg_types, .double, dec.toDoubleKernel, .propagates);
         if (intCastTarget(name)) |it|
-            return try buildDecFn(aa, name, arg_types, it, dec.toIntKernel, .propagates);
+            return try buildDecFn(aa, name, arg_types, it, dec.toIntKernel, .kernel_managed);
         if (std.ascii.eqlIgnoreCase(name, "to_string"))
             return try buildDecFn(aa, name, arg_types, .string, dec.toStringKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "abs"))
@@ -524,7 +524,7 @@ fn resolveToDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?
     const s = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
     const src = arg_types[0];
     if (!(numericLike(src) or src.isString())) return null;
-    return try buildDecFn(aa, name, arg_types, dec.decTypeFor(p, s), dec.toDecimalKernel, .propagates);
+    return try buildDecFn(aa, name, arg_types, dec.decTypeFor(p, s), dec.toDecimalKernel, .kernel_managed);
 }
 
 fn scalarArityMatches(f: ScalarFn, actual: usize) bool {
@@ -866,29 +866,29 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_bigint", .arg_types = &.{.int}, .return_type = .bigint, .kernel = math.intToBigintKernel },
     .{ .name = "to_double", .arg_types = &.{.int}, .return_type = .double, .kernel = math.intToDoubleKernel },
     .{ .name = "to_double", .arg_types = &.{.bigint}, .return_type = .double, .kernel = math.bigintToDoubleKernel },
-    // Numeric narrowing (truncates, may lose precision; overflow saturates).
-    .{ .name = "to_int", .arg_types = &.{.bigint}, .return_type = .int, .kernel = math.bigintToIntKernel },
-    .{ .name = "to_int", .arg_types = &.{.double}, .return_type = .int, .kernel = math.doubleToIntKernel },
-    .{ .name = "to_bigint", .arg_types = &.{.double}, .return_type = .bigint, .kernel = math.doubleToBigintKernel },
-    // String parsing — on parse failure returns 0 (NULL-on-failure
-    // would need .kernel_managed; deferred).
-    .{ .name = "to_int", .arg_types = &.{.string}, .return_type = .int, .kernel = math.stringToIntKernel },
-    .{ .name = "to_bigint", .arg_types = &.{.string}, .return_type = .bigint, .kernel = math.stringToBigintKernel },
-    .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .kernel = math.stringToDoubleKernel },
-    // Narrowing-int / largeint / boolean conversions (back the extra CAST
-    // targets). Narrower int sources widen to bigint first via the
-    // resolver's implicit-cast ranking, so one bigint overload suffices.
-    .{ .name = "to_smallint", .arg_types = &.{.bigint}, .return_type = .smallint, .kernel = math.bigintToSmallintKernel },
-    .{ .name = "to_smallint", .arg_types = &.{.double}, .return_type = .smallint, .kernel = math.doubleToSmallintKernel },
-    .{ .name = "to_smallint", .arg_types = &.{.string}, .return_type = .smallint, .kernel = math.stringToSmallintKernel },
-    .{ .name = "to_tinyint", .arg_types = &.{.bigint}, .return_type = .tinyint, .kernel = math.bigintToTinyintKernel },
-    .{ .name = "to_tinyint", .arg_types = &.{.double}, .return_type = .tinyint, .kernel = math.doubleToTinyintKernel },
-    .{ .name = "to_tinyint", .arg_types = &.{.string}, .return_type = .tinyint, .kernel = math.stringToTinyintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.bigint}, .return_type = .largeint, .kernel = math.bigintToLargeintKernel },
-    .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .kernel = math.doubleToLargeintKernel },
-    .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .kernel = math.stringToLargeintKernel },
     .{ .name = "to_boolean", .arg_types = &.{.bigint}, .return_type = .boolean, .kernel = math.bigintToBoolKernel },
     .{ .name = "to_boolean", .arg_types = &.{.double}, .return_type = .boolean, .kernel = math.doubleToBoolKernel },
+    // Conversions that can fail, StarRocks semantics: numbers truncate
+    // toward zero, and a value outside the target's range or text that
+    // isn't a number of the target's kind is NULL. Narrower integer
+    // sources widen to bigint first through the implicit-cast ranking, so a
+    // bigint overload covers them.
+    .{ .name = "to_tinyint", .arg_types = &.{.bigint}, .return_type = .tinyint, .null_strategy = .kernel_managed, .kernel = math.bigintToTinyintKernel },
+    .{ .name = "to_tinyint", .arg_types = &.{.double}, .return_type = .tinyint, .null_strategy = .kernel_managed, .kernel = math.doubleToTinyintKernel },
+    .{ .name = "to_tinyint", .arg_types = &.{.string}, .return_type = .tinyint, .null_strategy = .kernel_managed, .kernel = math.stringToTinyintKernel },
+    .{ .name = "to_smallint", .arg_types = &.{.bigint}, .return_type = .smallint, .null_strategy = .kernel_managed, .kernel = math.bigintToSmallintKernel },
+    .{ .name = "to_smallint", .arg_types = &.{.double}, .return_type = .smallint, .null_strategy = .kernel_managed, .kernel = math.doubleToSmallintKernel },
+    .{ .name = "to_smallint", .arg_types = &.{.string}, .return_type = .smallint, .null_strategy = .kernel_managed, .kernel = math.stringToSmallintKernel },
+    .{ .name = "to_int", .arg_types = &.{.bigint}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = math.bigintToIntKernel },
+    .{ .name = "to_int", .arg_types = &.{.double}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = math.doubleToIntKernel },
+    .{ .name = "to_int", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = math.stringToIntKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.doubleToBigintKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.stringToBigintKernel },
+    .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.doubleToLargeintKernel },
+    .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.stringToLargeintKernel },
+    .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.stringToDoubleKernel },
+    .{ .name = "to_boolean", .arg_types = &.{.string}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = math.stringToBoolKernel },
     // date <-> datetime
     .{ .name = "to_date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },

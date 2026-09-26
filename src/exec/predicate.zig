@@ -1788,7 +1788,7 @@ const Scalar = union(enum) {
 };
 
 /// `m × 10^-s`.
-const ScaledInt = struct { m: i128, s: u8 };
+const ScaledInt = scalar_fn_common.ScaledInt;
 
 const ComparisonKind = enum { number, temporal, text, uuid };
 
@@ -1917,41 +1917,12 @@ fn scalarDecimal(v: Scalar) ?ScaledInt {
     };
 }
 
-/// Text read as a number, the way StarRocks casts it for a comparison:
-/// surrounding spaces ignored, plain decimal digits kept exact, an exponent
-/// form read as a double; anything else is not a number.
+/// Text read as a number, the way a CAST reads it.
 fn textNumber(raw: []const u8) ?Scalar {
-    const text = std.mem.trim(u8, raw, " \t\r\n");
-    var i: usize = 0;
-    const negative = i < text.len and text[i] == '-';
-    if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
-    var m: i128 = 0;
-    var digits: usize = 0;
-    var scale: u8 = 0;
-    var seen_point = false;
-    var exact = true;
-    while (i < text.len) : (i += 1) {
-        const c = text[i];
-        if (c == '.' and !seen_point) {
-            seen_point = true;
-        } else if (c >= '0' and c <= '9') {
-            digits += 1;
-            if (digits > 38) {
-                exact = false;
-                continue;
-            }
-            m = m * 10 + (c - '0');
-            if (seen_point) scale += 1;
-        } else break;
-    }
-    if (digits == 0) return null;
-    if (i == text.len and exact) return .{ .decimal = .{ .m = if (negative) -m else m, .s = scale } };
-    for (text[i..]) |c| switch (c) {
-        '0'...'9', '.', 'e', 'E', '+', '-' => {},
-        else => return null,
+    return switch (scalar_fn_common.textNumber(raw) orelse return null) {
+        .exact => |d| .{ .decimal = d },
+        .float => |f| .{ .float = f },
     };
-    const f = std.fmt.parseFloat(f64, text) catch return null;
-    return if (std.math.isFinite(f)) .{ .float = f } else null;
 }
 
 fn textMicros(raw: []const u8) ?Scalar {
