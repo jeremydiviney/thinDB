@@ -188,6 +188,7 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_if => "if",
         .kw_left => "left",
         .kw_right => "right",
+        .kw_truncate => "truncate",
         else => null,
     };
 }
@@ -1444,36 +1445,14 @@ pub const Parser = struct {
             else => {},
         }
 
-        // EXTRACT(field FROM expr) — special function form. Detected
-        // here before the identifier-then-`(` branch below misparses
-        // the field name as a regular call arg.
-        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "extract")) {
+        // A call with its own argument syntax (CAST(x AS t), EXTRACT(f FROM x),
+        // CONVERT(x, t), DATE_ADD(x, INTERVAL n u)), before the
+        // identifier-then-`(` branch below parses its arguments as a list.
+        if (self.cur.tag == .identifier and self.scalarCallHasOwnSyntax(self.cur.text)) {
             const saved = self.cur;
             try self.advance();
             if (self.cur.tag == .lparen) {
-                const expr = try self.parseExtractCall();
-                const default_name = try self.exprDefaultName(expr);
-                const alias = try self.maybeAlias(default_name);
-                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
-            }
-            // Bare `extract` as a column name — treat as col_ref.
-            const dup_col = try self.arena.dupe(u8, saved.text);
-            const alias = try self.maybeAlias(dup_col);
-            return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
-        }
-
-        // CAST(expr AS type) at projection top level. Detected before the
-        // identifier-then-`(` call branch (which would choke on `AS`).
-        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "cast")) {
-            const saved = self.cur;
-            try self.advance();
-            if (self.cur.tag == .lparen) {
-                try self.advance();
-                const inner = try self.parseCallArg();
-                if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
-                try self.advance();
-                var expr = try self.parseCastTarget(inner);
-                try self.expect(.rparen);
+                var expr = try self.parseScalarCallAfterName(saved.text);
                 while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
                     try self.advance();
                     expr = try self.parseCastTarget(expr);
@@ -1513,13 +1492,6 @@ pub const Parser = struct {
 
         // Function call?
         if (self.cur.tag == .lparen) {
-            if (dateAddSubName(first)) |_| {
-                const scalar_atom = try self.parseDateAddSubCallAfterName(first);
-                const expr = try self.continueBinaryFrom(scalar_atom);
-                const default_name = try self.exprDefaultName(expr);
-                const alias = try self.maybeAlias(default_name);
-                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
-            }
             // Parse the call shape (name + paren-wrapped args) once. Then
             // decide between aggregate / scalar / window based on what
             // follows.
@@ -1685,15 +1657,24 @@ pub const Parser = struct {
 
     /// Whether `name(` opens a call whose arguments aren't a plain comma list,
     /// so it must be parsed by `parseScalarCallAfterName`.
+    /// The current token names a function that is also a keyword (IF,
+    /// LEFT, RIGHT, REPLACE, TRUNCATE); in expression position it can only
+    /// open a call.
+    pub fn keywordCallAhead(self: *const Parser) bool {
+        return keywordScalarName(self.cur.tag) != null;
+    }
+
     pub fn scalarCallHasOwnSyntax(_: *const Parser, name: []const u8) bool {
         return dateAddSubName(name) != null or
             std.ascii.eqlIgnoreCase(name, "cast") or
+            std.ascii.eqlIgnoreCase(name, "convert") or
             std.ascii.eqlIgnoreCase(name, "extract");
     }
 
     pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
         if (dateAddSubName(name)) |_| return try self.parseDateAddSubCallAfterName(name);
         if (std.ascii.eqlIgnoreCase(name, "cast")) return try self.parseCastCallAfterName();
+        if (std.ascii.eqlIgnoreCase(name, "convert")) return try self.parseConvertCallAfterName();
         if (std.ascii.eqlIgnoreCase(name, "extract")) return try self.parseExtractCall();
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
         const args = try self.parseCallArgList(null);
@@ -1779,14 +1760,8 @@ pub const Parser = struct {
         return normalized;
     }
 
-    pub fn makeScalarCallExpr(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
-        if (std.ascii.eqlIgnoreCase(name, "months_add")) {
-            if (args.len != 2) return ParseError.SqlInvalidProjection;
-            return ir.Expr{ .call = .{
-                .fn_name = try self.arena.dupe(u8, "date_add_months"),
-                .args = args,
-            } };
-        }
+    pub fn makeScalarCallExpr(self: *Parser, typed_name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
+        const name = scalar_fn.canonicalName(typed_name);
         if (std.ascii.eqlIgnoreCase(name, "months_diff")) {
             if (args.len != 2) return ParseError.SqlInvalidProjection;
             const normalized = try self.arena.alloc(ir.Expr, 3);
@@ -2383,7 +2358,7 @@ pub const Parser = struct {
     /// `parseCallArg`: column ref (possibly qualified), literal, or
     /// nested scalar call. Aggregates and window functions are
     /// rejected — they belong at the top level of the SELECT list.
-    fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
+    pub fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
         var atom = try self.parseCallAtomBase();
         // `expr::type` postfix cast (PG). Binds tighter than binary ops;
         // rejected on MySQL (where `::` is not a cast operator).
@@ -2437,6 +2412,24 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = fn_name, .args = args } };
     }
 
+    /// MySQL `(expr, type)` or `(expr USING charset)` after `CONVERT`. Text
+    /// is always UTF-8, so a charset conversion returns its argument.
+    fn parseConvertCallAfterName(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        const inner = try self.parseCallArg();
+        const result = if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "using")) blk: {
+            try self.advance();
+            if (self.cur.tag != .identifier and self.cur.tag != .string) return ParseError.SqlExpectedIdent;
+            try self.advance();
+            break :blk inner;
+        } else blk: {
+            try self.expect(.comma);
+            break :blk try self.parseCastTarget(inner);
+        };
+        try self.expect(.rparen);
+        return result;
+    }
+
     /// `(expr AS type)` after the `CAST` keyword.
     fn parseCastCallAfterName(self: *Parser) ParseError!ir.Expr {
         try self.expect(.lparen);
@@ -2475,13 +2468,6 @@ pub const Parser = struct {
 
     fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag == .kw_case) return try self.parseCaseExpr();
-        // CAST(expr AS type) — SQL-standard explicit cast (both dialects).
-        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "cast")) {
-            const saved = self.cur;
-            try self.advance();
-            if (self.cur.tag == .lparen) return try self.parseCastCallAfterName();
-            return ir.Expr{ .col_ref = try self.arena.dupe(u8, saved.text) };
-        }
         // EXISTS (SELECT ...) in expression position — projects a
         // boolean. Resolved by the pre-compile pass into `.lit`.
         if (self.cur.tag == .kw_exists) {
@@ -2492,38 +2478,18 @@ pub const Parser = struct {
             try self.expect(.rparen);
             return ir.Expr{ .exists_subquery = @ptrCast(source) };
         }
-        // EXTRACT(field FROM expr) — SQL-standard. Lowers to a regular
-        // scalar call (year/month/day/hour/minute/second). `field` is
-        // an identifier (not a reserved keyword) so check the *next*
-        // token for `(`.
-        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "extract")) {
-            // Peek: the next two tokens must look like `( ident`. If
-            // they don't, fall through to the identifier branch (treats
-            // `extract` as a column name).
-            const saved = self.cur;
+        if (keywordScalarName(self.cur.tag)) |name| {
             try self.advance();
-            if (self.cur.tag == .lparen) {
-                return try self.parseExtractCall();
-            }
-            // Roll-back path: we already consumed `extract` and looked
-            // at the next token. Re-emit it as a col_ref since the
-            // grammar can't peek-then-backtrack arbitrarily.
-            const col = try self.arena.dupe(u8, saved.text);
-            return ir.Expr{ .col_ref = col };
+            if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
+            return try self.parseScalarCallAfterName(name);
         }
         switch (self.cur.tag) {
-            .kw_replace, .kw_if, .kw_left, .kw_right => {
-                const name = keywordScalarName(self.cur.tag).?;
-                try self.advance();
-                if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
-                return try self.parseScalarCallAfterName(name);
-            },
             .identifier => {
                 const name = self.cur.text;
                 try self.advance();
                 if (try self.typedTemporalLiteralAfterName(name)) |lit| return lit;
                 if (self.cur.tag == .lparen) {
-                    if (dateAddSubName(name)) |_| return try self.parseDateAddSubCallAfterName(name);
+                    if (self.scalarCallHasOwnSyntax(name)) return try self.parseScalarCallAfterName(name);
                     var saw_distinct = false;
                     const nested_args = try self.parseCallArgList(&saw_distinct);
                     const ignore_nulls = try parse_window.parseIgnoreNulls(self);

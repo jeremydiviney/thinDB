@@ -220,6 +220,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         }
         return try makeExprComparisonPredicate(p, lhs_expr, .neq, .{ .lit = .{ .int = 0 } });
     }
+    if (p.keywordCallAhead()) return try parseExprOps(p, try p.parseCallAtom());
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     var col_dup = try parseQualifiedColRef(p);
 
