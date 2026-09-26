@@ -3845,15 +3845,8 @@ pub fn complementColumns(
 ) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(allocator);
-    for (upstream_cols) |c| {
-        var dropped = false;
-        for (excluded) |ex| {
-            if (types.columnNameEql(c.name, ex)) {
-                dropped = true;
-                break;
-            }
-        }
-        if (!dropped) try out.append(allocator, c.name);
+    for (upstream_cols, 0..) |c, i| {
+        if (!types.columnExcluded(upstream_cols, i, excluded)) try out.append(allocator, c.name);
     }
     return try out.toOwnedSlice(allocator);
 }

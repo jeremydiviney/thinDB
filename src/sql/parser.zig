@@ -73,6 +73,8 @@ pub const ParseError = error{
     /// An unqualified `JOIN ... ON` column that both join inputs expose.
     SqlOnColumnAmbiguous,
     SqlOnNonEquiUnsupported,
+    /// A `JOIN ... USING` list naming one column twice.
+    SqlUsingColumnRepeated,
     SqlCteRedefined,
     SqlSubqueryNeedsAlias,
     /// COPY with a file-path source/target. thinDB only speaks
@@ -413,6 +415,27 @@ const FromTarget = struct {
     unaliased: enum { no, in_place, wrap } = .no,
 };
 
+/// One join-chain input, by the range-variable name its columns qualify with.
+const ChainInput = struct {
+    name: []const u8,
+    op: *const ir.Op,
+};
+
+/// What a bare `*` names over a join chain. The join output serves until a
+/// USING or NATURAL join merges columns; from then on `*` is an explicit list.
+const ChainStar = union(enum) {
+    plain,
+    merged: []const []const u8,
+    /// Columns merged, but some input's columns can't be listed.
+    unlisted,
+};
+
+const JoinChain = struct {
+    op: *ir.Op,
+    inputs: []const ChainInput,
+    star: ChainStar,
+};
+
 const JoinExprSide = enum { none, left, right, mixed };
 
 /// What an ON clause can reference: the left subtree (every FROM name joined
@@ -728,6 +751,7 @@ pub const Parser = struct {
             root = from.op;
             from_is_join = fromClauseIsJoin(root);
             if (from.sole_unaliased_name) |name| proj = try self.soleSourceStars(parsed_proj, name);
+            if (from.merged_star) |columns| proj = try self.mergedJoinStars(parsed_proj, columns);
         } else {
             root = try self.allocOp(.{ .single_row = {} });
         }
@@ -2880,15 +2904,19 @@ pub const Parser = struct {
         op: *ir.Op,
         /// The name of a lone FROM source written without an alias.
         sole_unaliased_name: ?[]const u8 = null,
+        /// What a bare `*` names when a USING or NATURAL join merged columns.
+        merged_star: ?[]const []const u8 = null,
     };
 
     fn parseFromClause(self: *Parser) ParseError!FromClause {
         const first = try self.parseFromTarget();
-        if (!isJoinStart(self.cur.tag) and self.cur.tag != .comma) {
+        if (!self.joinStartAhead() and self.cur.tag != .comma) {
             if (first.unaliased == .no) return .{ .op = first.op };
             return .{ .op = first.op, .sole_unaliased_name = first.name };
         }
-        var root = try self.parseJoinChain(first);
+        var chains: std.ArrayList(JoinChain) = .empty;
+        try chains.append(self.arena, try self.parseJoinChain(first));
+        var root = chains.items[0].op;
         // A comma cross-joins whole join chains: it binds looser than JOIN,
         // so `a, b RIGHT JOIN c ON ...` right-joins c to b alone, and each
         // chain's ON clauses see only that chain's names. WHERE equalities
@@ -2896,9 +2924,29 @@ pub const Parser = struct {
         while (self.cur.tag == .comma) {
             try self.advance();
             const chain = try self.parseJoinChain(try self.parseFromTarget());
-            root = try self.crossJoin(root, chain);
+            root = try self.crossJoin(root, chain.op);
+            try chains.append(self.arena, chain);
         }
-        return .{ .op = root };
+        return .{ .op = root, .merged_star = try self.fromMergedStar(chains.items) };
+    }
+
+    /// `*` over the whole FROM clause when some chain merged columns: each
+    /// chain's columns in order. Null when nothing merged, or when a chain's
+    /// columns can't be listed (a bare `*` then shows the join output as-is).
+    fn fromMergedStar(self: *Parser, chains: []const JoinChain) ParseError!?[]const []const u8 {
+        for (chains) |chain| {
+            if (chain.star != .plain) break;
+        } else return null;
+        var columns: std.ArrayList([]const u8) = .empty;
+        for (chains) |chain| {
+            const chain_columns = switch (chain.star) {
+                .plain => try self.inputsStar(chain.inputs),
+                .merged => |merged| merged,
+                .unlisted => null,
+            };
+            try columns.appendSlice(self.arena, chain_columns orelse return null);
+        }
+        return columns.items;
     }
 
     fn crossJoin(self: *Parser, left: *ir.Op, right: *ir.Op) ParseError!*ir.Op {
@@ -2918,7 +2966,7 @@ pub const Parser = struct {
         } });
     }
 
-    fn parseJoinChain(self: *Parser, first: FromTarget) ParseError!*ir.Op {
+    fn parseJoinChain(self: *Parser, first: FromTarget) ParseError!JoinChain {
         var root = try self.nameJoinInput(first);
 
         // Running set of names that constitute the current left
@@ -2929,20 +2977,52 @@ pub const Parser = struct {
         try left_names.append(self.arena, first.name);
         defer left_names.deinit(self.arena);
 
-        while (isJoinStart(self.cur.tag)) {
+        var inputs: std.ArrayList(ChainInput) = .empty;
+        try inputs.append(self.arena, .{ .name = first.name, .op = root });
+        var star: ChainStar = .plain;
+        var merged_names: std.ArrayList([]const u8) = .empty;
+
+        while (self.joinStartAhead()) {
             // CROSS JOIN takes no ON clause.
             if (self.cur.tag == .kw_cross) {
                 try self.advance();
                 if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
                 try self.advance();
                 const right = try self.parseFromTarget();
-                root = try self.crossJoin(root, try self.nameJoinInput(right));
+                const right_op = try self.nameJoinInput(right);
+                root = try self.crossJoin(root, right_op);
                 try left_names.append(self.arena, right.name);
+                try inputs.append(self.arena, .{ .name = right.name, .op = right_op });
+                star = try self.appendInputStar(star, right.name, right_op);
                 continue;
             }
+            const natural = self.joinWordAhead("natural");
+            if (natural) try self.advance();
             const jtype = try self.parseJoinKind();
             const right = try self.parseFromTarget();
-            var right_op = try self.nameJoinInput(right);
+            const right_input = try self.nameJoinInput(right);
+            var right_op = right_input;
+
+            if (natural or self.joinWordAhead("using")) {
+                const left_star = switch (star) {
+                    .plain => try self.inputsStar(inputs.items),
+                    .merged => |merged| merged,
+                    .unlisted => null,
+                };
+                const right_star = try self.qualifiedColumns(right.name, right_input);
+                const using = if (natural)
+                    try naturalJoinColumns(self.arena, left_star, right_star)
+                else
+                    try self.parseUsingColumns();
+                root = try self.usingJoin(root, right_input, right.name, jtype, using, &merged_names);
+                star = if (left_star != null and right_star != null)
+                    .{ .merged = try usingJoinStar(self.arena, left_star.?, right_star.?, using, jtype) }
+                else
+                    .unlisted;
+                try left_names.append(self.arena, right.name);
+                try inputs.append(self.arena, .{ .name = right.name, .op = right_input });
+                continue;
+            }
 
             if (self.cur.tag != .kw_on) return ParseError.SqlExpectedJoinOn;
             try self.advance();
@@ -2982,8 +3062,10 @@ pub const Parser = struct {
                 root = try self.allocOp(.{ .exclude = .{ .columns = on_plan.hidden_left, .upstream = root } });
             }
             try left_names.append(self.arena, right.name);
+            try inputs.append(self.arena, .{ .name = right.name, .op = right_input });
+            star = try self.appendInputStar(star, right.name, right_input);
         }
-        return root;
+        return .{ .op = root, .inputs = inputs.items, .star = star };
     }
 
     /// A lone unaliased FROM source is named by itself, so its `name.*` is
@@ -3112,7 +3194,7 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
-        } else if (self.cur.tag == .identifier) {
+        } else if (self.implicitFromAliasAhead()) {
             // Implicit alias: bare identifier after the FROM target.
             // SQL clause keywords (JOIN/WHERE/ON/...) aren't .identifier
             // tokens so they don't trigger this.
@@ -3209,7 +3291,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_as) {
             try self.advance();
             resolved_name = try self.dupedIdent();
-        } else if (self.cur.tag == .identifier) {
+        } else if (self.implicitFromAliasAhead()) {
             resolved_name = try self.dupedIdent();
         }
         const op = try self.allocOp(.{ .table_fn = .{
@@ -3375,7 +3457,7 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
-        } else if (self.cur.tag == .identifier) {
+        } else if (self.implicitFromAliasAhead()) {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
@@ -3564,11 +3646,160 @@ pub const Parser = struct {
         }
     }
 
-    fn isJoinStart(tag: TokenTag) bool {
-        return switch (tag) {
+    fn joinStartAhead(self: *const Parser) bool {
+        return switch (self.cur.tag) {
             .kw_join, .kw_cross, .kw_inner, .kw_left, .kw_right, .kw_full => true,
-            else => false,
+            else => self.joinWordAhead("natural"),
         };
+    }
+
+    /// USING and NATURAL lex as identifiers; MySQL reserves both, so in a
+    /// FROM clause they are join syntax, never an implicit alias.
+    fn joinWordAhead(self: *const Parser, word: []const u8) bool {
+        return self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, word);
+    }
+
+    fn implicitFromAliasAhead(self: *const Parser) bool {
+        return self.cur.tag == .identifier and !self.joinWordAhead("using") and !self.joinWordAhead("natural");
+    }
+
+    /// `USING (c, ...)`: the column names, each once. Only names can appear,
+    /// so reserved words read as names (`USING (date)`).
+    fn parseUsingColumns(self: *Parser) ParseError![]const []const u8 {
+        try self.advance();
+        try self.expect(.lparen);
+        var names: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            if (self.cur.tag != .identifier and !wordLikeToken(self.cur.text)) return ParseError.SqlExpectedIdent;
+            const name = try self.arena.dupe(u8, self.cur.text);
+            if (nameIn(name, names.items)) return ParseError.SqlUsingColumnRepeated;
+            try names.append(self.arena, name);
+            try self.advance();
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        try self.expect(.rparen);
+        return names.items;
+    }
+
+    /// `left JOIN right USING (c, ...)`: an equi join on each column, with
+    /// `c` merged into one bare column holding the left value, the right one
+    /// under RIGHT JOIN, or their COALESCE under FULL JOIN. `left.c` and
+    /// `right.c` stay addressable, as under ON. An empty list (NATURAL JOIN
+    /// over no shared column) pairs every row with every row.
+    fn usingJoin(
+        self: *Parser,
+        left: *ir.Op,
+        right: *ir.Op,
+        right_name: []const u8,
+        jtype: ir.JoinType,
+        using: []const []const u8,
+        merged_names: *std.ArrayList([]const u8),
+    ) ParseError!*ir.Op {
+        const key_count = @max(using.len, 1);
+        const left_keys = try self.arena.alloc(ir.Derived, key_count);
+        const right_keys = try self.arena.alloc(ir.Derived, key_count);
+        const pairs = try self.arena.alloc(ir.JoinKeyPair, key_count);
+        const hidden = try self.arena.alloc([]const u8, key_count);
+        const merged = try self.arena.alloc(ir.Derived, using.len);
+        var remerged: std.ArrayList([]const u8) = .empty;
+        for (left_keys, right_keys, pairs, hidden, 0..) |*left_key, *right_key, *pair, *hidden_name, i| {
+            // The `__join_on_*` names give these keys the join's key-type
+            // coercion and the rename-only peel ON keys get.
+            const left_name = try std.fmt.allocPrint(self.arena, "__join_on_left_{d}", .{i});
+            const right_name_i = try std.fmt.allocPrint(self.arena, "__join_on_right_{d}", .{i});
+            pair.* = .{ .left = left_name, .right = right_name_i };
+            hidden_name.* = left_name;
+            if (using.len == 0) {
+                const one: ir.Expr = .{ .lit = .{ .int = 1 } };
+                left_key.* = .{ .name = left_name, .expr = one };
+                right_key.* = .{ .name = right_name_i, .expr = one };
+                break;
+            }
+            const column = using[i];
+            const left_value: ir.Expr = .{ .col_ref = left_name };
+            const right_value: ir.Expr = .{ .col_ref = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ right_name, column }) };
+            left_key.* = .{ .name = left_name, .expr = .{ .col_ref = column } };
+            right_key.* = .{ .name = right_name_i, .expr = right_value };
+            merged[i] = .{ .name = column, .expr = switch (jtype) {
+                .inner, .left => left_value,
+                .right => right_value,
+                .full => blk: {
+                    const args = try self.arena.alloc(ir.Expr, 2);
+                    args[0] = left_value;
+                    args[1] = right_value;
+                    break :blk .{ .call = .{ .fn_name = try self.arena.dupe(u8, "coalesce"), .args = args } };
+                },
+            } };
+            // A column an earlier USING merged is re-merged: the new value
+            // replaces it.
+            if (nameIn(column, merged_names.items)) {
+                try remerged.append(self.arena, column);
+            } else {
+                try merged_names.append(self.arena, column);
+            }
+        }
+        var root = try self.allocOp(.{ .join = .{
+            .algorithm = .auto,
+            .join_type = jtype,
+            .on = pairs,
+            .ranges = &.{},
+            .extra_predicate = null,
+            .skew_ratio_threshold = 0.3,
+            .skew_absolute_threshold = 20_000,
+            .skew_sample_interval = 10,
+            .left = try self.allocOp(.{ .compute = .{ .derived = left_keys, .upstream = left } }),
+            .right = try self.allocOp(.{ .compute = .{ .derived = right_keys, .upstream = right } }),
+        } });
+        if (remerged.items.len > 0) root = try self.allocOp(.{ .exclude = .{ .columns = remerged.items, .upstream = root } });
+        if (merged.len > 0) root = try self.allocOp(.{ .compute = .{ .derived = merged, .upstream = root } });
+        return try self.allocOp(.{ .exclude = .{ .columns = hidden, .upstream = root } });
+    }
+
+    /// `name.col` for each output column of a join input; null when they
+    /// can't be listed.
+    fn qualifiedColumns(self: *Parser, name: []const u8, op: *const ir.Op) ParseError!?[]const []const u8 {
+        const columns = try self.sourceColumns(op) orelse return null;
+        const out = try self.arena.alloc([]const u8, columns.len);
+        for (columns, out) |column, *qualified| {
+            qualified.* = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ name, types.unqualifiedName(column) });
+        }
+        return out;
+    }
+
+    fn inputsStar(self: *Parser, inputs: []const ChainInput) ParseError!?[]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (inputs) |input| {
+            try out.appendSlice(self.arena, try self.qualifiedColumns(input.name, input.op) orelse return null);
+        }
+        return out.items;
+    }
+
+    fn appendInputStar(self: *Parser, star: ChainStar, name: []const u8, op: *const ir.Op) ParseError!ChainStar {
+        const merged = switch (star) {
+            .plain, .unlisted => return star,
+            .merged => |merged| merged,
+        };
+        const columns = try self.qualifiedColumns(name, op) orelse return .unlisted;
+        return .{ .merged = try std.mem.concat(self.arena, []const u8, &.{ merged, columns }) };
+    }
+
+    /// Each bare `*` over a FROM clause whose joins merged columns becomes
+    /// the explicit list MySQL shows, so a merged column appears once.
+    fn mergedJoinStars(self: *Parser, proj: []const ProjItem, columns: []const []const u8) ParseError![]const ProjItem {
+        var out: std.ArrayList(ProjItem) = .empty;
+        for (proj) |item| {
+            const is_bare_star = switch (item.kind) {
+                .star => |qualifier| qualifier == null,
+                else => false,
+            };
+            if (!is_bare_star) {
+                try out.append(self.arena, item);
+                continue;
+            }
+            for (columns) |column| try out.append(self.arena, .{ .name = column, .kind = .{ .col = column } });
+        }
+        return out.items;
     }
 
     fn parseJoinKind(self: *Parser) ParseError!ir.JoinType {
@@ -4321,7 +4552,15 @@ pub const Parser = struct {
                 desc = true;
                 try self.advance();
             }
-            if (col) |c| try items.append(self.arena, .{ .col = c, .desc = desc });
+            const nulls_first = try self.parseNullsPlacement();
+            if (col) |c| {
+                // NULLs sort first ascending and last descending; the other
+                // placement sorts on whether the key is NULL ahead of it.
+                if (nulls_first) |first| if (first == desc) {
+                    try items.append(self.arena, .{ .col = try self.orderNullKey(c, &keys), .desc = first });
+                };
+                try items.append(self.arena, .{ .col = c, .desc = desc });
+            }
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
@@ -4428,6 +4667,33 @@ pub const Parser = struct {
             .col_ref => |c| try self.arena.dupe(u8, renamedColumnSource(proj, c) orelse c),
             else => try self.orderExprKey(proj, e, keys),
         };
+    }
+
+    /// `NULLS FIRST` (true) / `NULLS LAST` (false) after a sort key.
+    fn parseNullsPlacement(self: *Parser) ParseError!?bool {
+        if (self.cur.tag != .kw_nulls) return null;
+        try self.advance();
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedKeyword;
+        const first = if (std.ascii.eqlIgnoreCase(self.cur.text, "first"))
+            true
+        else if (std.ascii.eqlIgnoreCase(self.cur.text, "last"))
+            false
+        else
+            return ParseError.SqlExpectedKeyword;
+        try self.advance();
+        return first;
+    }
+
+    /// A hidden sort key, 1 where `column` is NULL and 0 elsewhere.
+    fn orderNullKey(self: *Parser, column: []const u8, keys: *std.ArrayList(ir.Derived)) ParseError![]const u8 {
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        branches[0] = .{ .cond = .{ .is_null = column }, .then = .{ .lit = .{ .int = 1 } } };
+        const else_branch = try self.arena.create(ir.Expr);
+        else_branch.* = .{ .lit = .{ .int = 0 } };
+        const name = std.fmt.allocPrint(self.arena, "__order_expr_{d}", .{self.order_expr_counter}) catch return ParseError.OutOfMemory;
+        self.order_expr_counter += 1;
+        try keys.append(self.arena, .{ .name = name, .expr = .{ .case = .{ .branches = branches, .else_branch = else_branch } } });
+        return name;
     }
 
     /// The column an expression sort key reads: the SELECT item it repeats,
@@ -4879,6 +5145,7 @@ fn fromClauseIsJoin(root: *const ir.Op) bool {
     while (true) switch (cur.*) {
         .join => return true,
         .exclude => |e| cur = e.upstream,
+        .compute => |c| cur = c.upstream,
         else => return false,
     };
 }
@@ -5406,6 +5673,60 @@ fn aggAliasForProjection(arena: Allocator, proj: []const ProjItem, name: []const
 fn nameIn(needle: []const u8, names: []const []const u8) bool {
     for (names) |n| if (types.columnNameEql(n, needle)) return true;
     return false;
+}
+
+/// NATURAL JOIN's USING list: every name both sides' `*` show, in the left
+/// side's order. Unlistable columns leave nothing to match by name.
+fn naturalJoinColumns(
+    arena: Allocator,
+    left: ?[]const []const u8,
+    right: ?[]const []const u8,
+) ParseError![]const []const u8 {
+    const left_columns = left orelse return ParseError.SqlOnRefsUnknownTable;
+    const right_columns = right orelse return ParseError.SqlOnRefsUnknownTable;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (left_columns) |column| {
+        const bare = types.unqualifiedName(column);
+        if (exposesColumn(right_columns, bare) and !nameIn(bare, out.items)) try out.append(arena, bare);
+    }
+    return out.items;
+}
+
+/// `*` after a USING join, as MySQL orders it: the merged columns in the
+/// first input's order, then that input's other columns, then the second's.
+/// The right input is the first under RIGHT JOIN.
+fn usingJoinStar(
+    arena: Allocator,
+    left: []const []const u8,
+    right: []const []const u8,
+    using: []const []const u8,
+    jtype: ir.JoinType,
+) ParseError![]const []const u8 {
+    const first = if (jtype == .right) right else left;
+    const second = if (jtype == .right) left else right;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (first) |column| {
+        const merged = usingColumnOf(column, using) orelse continue;
+        if (!nameIn(merged, out.items)) try out.append(arena, merged);
+    }
+    for (using) |merged| {
+        if (!nameIn(merged, out.items)) try out.append(arena, merged);
+    }
+    for (first) |column| {
+        if (usingColumnOf(column, using) == null) try out.append(arena, column);
+    }
+    for (second) |column| {
+        if (usingColumnOf(column, using) == null) try out.append(arena, column);
+    }
+    return out.items;
+}
+
+fn usingColumnOf(column: []const u8, using: []const []const u8) ?[]const u8 {
+    const bare = types.unqualifiedName(column);
+    for (using) |merged| {
+        if (types.columnNameEql(bare, merged)) return merged;
+    }
+    return null;
 }
 
 /// Whether an input with output `columns` binds the unqualified `name`: a

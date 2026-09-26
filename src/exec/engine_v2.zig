@@ -1408,11 +1408,9 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
         ei -= 1;
         var remaining: std.ArrayListUnmanaged([]const u8) = .empty;
         defer remaining.deinit(allocator);
-        keep: for (q.outputSchema()) |col| {
-            for (plan.excludes[ei]) |ex| {
-                if (types.columnNameEql(col.name, ex)) continue :keep;
-            }
-            try remaining.append(allocator, col.name);
+        const schema = q.outputSchema();
+        for (schema, 0..) |col, i| {
+            if (!types.columnExcluded(schema, i, plan.excludes[ei])) try remaining.append(allocator, col.name);
         }
         q = try q.project(remaining.items);
     }

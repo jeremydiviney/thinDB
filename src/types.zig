@@ -534,6 +534,18 @@ pub fn findColumn(columns: []const Column, name: []const u8) ?usize {
     return match;
 }
 
+/// Whether an exclude of `excluded` drops `columns[index]`: a column any
+/// name spells exactly, or the one a name resolves to as a reference does.
+/// A hidden column staged below an aliased input surfaces alias-qualified
+/// (`l.__join_on_left_0`), and its bare name must still drop it.
+pub fn columnExcluded(columns: []const Column, index: usize, excluded: []const []const u8) bool {
+    for (excluded) |name| {
+        if (columnNameEql(columns[index].name, name)) return true;
+        if (findColumn(columns, name) == index) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
