@@ -333,86 +333,76 @@ pub fn toDoubleKernel(allocator: Allocator, arg_types: []const Type, out_type: T
     while (row < n) : (row += 1) try out.data.double.append(allocator, f64At(args[0], arg_types[0], row));
 }
 
+/// DECIMAL to an integer type: truncates toward zero, as StarRocks does; a
+/// value outside the target's range is NULL. `.kernel_managed`.
 pub fn toIntKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
-    const s = scaleOf(arg_types[0]);
-    const factor = pow10(s);
+    const factor = pow10(scaleOf(arg_types[0]));
+    const base = out.data.rowCount();
     var row: usize = 0;
     while (row < n) : (row += 1) {
-        const v = roundDiv(mantissaAt(args[0], row), factor);
-        try appendIntFamily(allocator, out, out_type, v);
+        const whole: ?i128 = if (args[0].isValid(row)) @divTrunc(mantissaAt(args[0], row), factor) else null;
+        const stored = try appendIntFamily(allocator, out, out_type, whole);
+        try out.appendValidBit(allocator, base + row, stored);
     }
 }
 
-fn appendIntFamily(allocator: Allocator, out: *ColumnStore, out_type: Type, v: i128) !void {
-    switch (out_type) {
-        .tinyint => try out.data.tinyint.append(allocator, satCast(i8, v)),
-        .smallint => try out.data.smallint.append(allocator, satCast(i16, v)),
-        .int => try out.data.int.append(allocator, satCast(i32, v)),
-        .bigint => try out.data.bigint.append(allocator, satCast(i64, v)),
-        .largeint => try out.data.largeint.append(allocator, v),
+/// Append `v` to an integer output, or 0 when it is null or outside the
+/// output's range; whether `v` was stored.
+fn appendIntFamily(allocator: Allocator, out: *ColumnStore, out_type: Type, v: ?i128) !bool {
+    return switch (out_type) {
+        .tinyint => appendInRange(i8, allocator, &out.data.tinyint, v),
+        .smallint => appendInRange(i16, allocator, &out.data.smallint, v),
+        .int => appendInRange(i32, allocator, &out.data.int, v),
+        .bigint => appendInRange(i64, allocator, &out.data.bigint, v),
+        .largeint => appendInRange(i128, allocator, &out.data.largeint, v),
         else => unreachable,
-    }
+    };
 }
 
-/// Saturating narrow to an integer type (matches the double→int cast policy).
-fn satCast(comptime T: type, v: i128) T {
-    if (v > std.math.maxInt(T)) return std.math.maxInt(T);
-    if (v < std.math.minInt(T)) return std.math.minInt(T);
-    return @intCast(v);
+fn appendInRange(comptime T: type, allocator: Allocator, list: anytype, v: ?i128) !bool {
+    const fit: ?T = if (v) |x| std.math.cast(T, x) else null;
+    try list.append(allocator, fit orelse 0);
+    return fit != null;
 }
 
 /// `CAST(x AS DECIMAL(p,s))`. Source may be decimal (rescale), integer
-/// (×10^s), float (round), or string (parse). args = (value, p_lit, s_lit);
-/// the p/s literals are read off the constant columns the parser appends.
+/// (×10^s), float (round) or text (parse). Text that isn't a number and a
+/// float that isn't finite are NULL, as in StarRocks; a value past the
+/// target's precision raises, as in DuckDB. `.kernel_managed`.
 pub fn toDecimalKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     const target = out_type.decimalSpec().?;
     const src = arg_types[0];
+    const base = out.data.rowCount();
     var row: usize = 0;
     while (row < n) : (row += 1) {
-        const valid = args[0].isValid(row);
-        const m: i128 = switch (src) {
-            .decimal64, .decimal128 => try orErr(rescale(mantissaAt(args[0], row), scaleOf(src), target.s), valid),
-            .tinyint, .smallint, .int, .bigint, .largeint, .boolean => try orErr(mulPow10(mantissaAt(args[0], row), target.s), valid),
-            .float, .double => blk: {
-                const scaled = f64At(args[0], src, row) * pow10f(target.s);
-                break :blk @as(i128, @intFromFloat(@round(scaled)));
-            },
-            .varchar, .string, .char, .json => parseDecimal(common.stringViewOf(args[0]).rowBytes(row), target.s) catch if (valid) return error.ArithmeticOverflow else 0,
+        const m: ?i128 = if (!args[0].isValid(row)) null else switch (src) {
+            .decimal64, .decimal128 => try orErr(rescale(mantissaAt(args[0], row), scaleOf(src), target.s), true),
+            .tinyint, .smallint, .int, .bigint, .largeint, .boolean => try orErr(mulPow10(mantissaAt(args[0], row), target.s), true),
+            .float, .double => try floatMantissa(f64At(args[0], src, row), target.s),
+            .varchar, .string, .char, .json => try textMantissa(common.stringViewOf(args[0]).rowBytes(row), target.s),
             else => return error.ComputeNoSuchOverload,
         };
-        try appendDec(allocator, out, out_type, m, valid);
+        try appendDec(allocator, out, out_type, m orelse 0, m != null);
+        try out.appendValidBit(allocator, base + row, m != null);
     }
 }
 
-/// Parse a decimal string literal into a mantissa at `target_s`. Accepts an
-/// optional sign, integer part, and fractional part; extra fractional digits
-/// round (ties away from zero).
-fn parseDecimal(text: []const u8, target_s: u8) !i128 {
-    var i: usize = 0;
-    var neg = false;
-    if (i < text.len and (text[i] == '+' or text[i] == '-')) {
-        neg = text[i] == '-';
-        i += 1;
-    }
-    var int_part: i128 = 0;
-    while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
-        int_part = try std.math.add(i128, try std.math.mul(i128, int_part, 10), text[i] - '0');
-    }
-    var frac: i128 = 0;
-    var frac_digits: u8 = 0;
-    if (i < text.len and text[i] == '.') {
-        i += 1;
-        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
-            if (frac_digits < 38) {
-                frac = frac * 10 + (text[i] - '0');
-                frac_digits += 1;
-            }
-        }
-    }
-    if (i != text.len) return error.InvalidDecimal;
-    var m = try std.math.add(i128, try std.math.mul(i128, int_part, pow10(target_s)), rescale(frac, frac_digits, target_s) orelse return error.InvalidDecimal);
-    if (neg) m = -m;
-    return m;
+/// A double as a mantissa at scale `s`, rounded half away from zero; null
+/// when it isn't finite.
+fn floatMantissa(x: f64, s: u8) error{ArithmeticOverflow}!?i128 {
+    if (!std.math.isFinite(x)) return null;
+    const scaled = @round(x * pow10f(s));
+    if (@abs(scaled) >= 1e38) return error.ArithmeticOverflow;
+    return @as(i128, @intFromFloat(scaled));
+}
+
+/// Text as a mantissa at scale `s`: any number `textNumber` reads, rounded
+/// half away from zero; null when the text isn't a number.
+fn textMantissa(text: []const u8, s: u8) error{ArithmeticOverflow}!?i128 {
+    return switch (common.textNumber(text) orelse return null) {
+        .exact => |d| rescale(d.m, d.s, s) orelse error.ArithmeticOverflow,
+        .float => |f| floatMantissa(f, s),
+    };
 }
 
 pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
@@ -665,11 +655,14 @@ test "arithResultType follows DESIGN §3.4" {
     try std.testing.expect(arithResultType(.mul, a, .double) == .double);
 }
 
-test "parseDecimal and formatDecimal round-trip" {
-    try std.testing.expectEqual(@as(i128, 1234560), try parseDecimal("1.23456", 6)); // scale 6
-    try std.testing.expectEqual(@as(i128, -50000), try parseDecimal("-0.5", 5));
-    try std.testing.expectEqual(@as(i128, 1000000), try parseDecimal("1", 6));
-    try std.testing.expectEqual(@as(i128, 125), try parseDecimal("1.25", 2)); // exact at scale 2
+test "textMantissa and formatDecimal round-trip" {
+    try std.testing.expectEqual(@as(?i128, 1234560), try textMantissa("1.23456", 6));
+    try std.testing.expectEqual(@as(?i128, -50000), try textMantissa("-0.5", 5));
+    try std.testing.expectEqual(@as(?i128, 1000000), try textMantissa(" 1 ", 6));
+    try std.testing.expectEqual(@as(?i128, -101), try textMantissa("-1.005", 2));
+    try std.testing.expectEqual(@as(?i128, 150), try textMantissa("1.5e0", 2));
+    try std.testing.expectEqual(@as(?i128, null), try textMantissa("abc", 2));
+    try std.testing.expectEqual(@as(?i128, null), try floatMantissa(std.math.inf(f64), 2));
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("1.230000", formatDecimal(&buf, 1230000, 6));
     try std.testing.expectEqualStrings("-0.50", formatDecimal(&buf, -50, 2));

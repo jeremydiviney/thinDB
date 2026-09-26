@@ -178,6 +178,122 @@ pub fn textToDatetime(s: []const u8) ?i64 {
     return parseDateTimeString(s) catch @as(i64, textToDate(s) orelse return null) * std.time.us_per_day;
 }
 
+const TEXT_SPACE = " \t\r\n";
+
+/// A decimal value: mantissa `m` at scale `s`, i.e. m / 10^s.
+pub const ScaledInt = struct { m: i128, s: u8 };
+
+/// A number read from text: exact when it is plain decimal digits a DECIMAL
+/// holds, a double otherwise.
+pub const TextNumber = union(enum) {
+    exact: ScaledInt,
+    float: f64,
+};
+
+/// Text read as a number, the way StarRocks casts it: surrounding spaces
+/// ignored, plain decimal digits kept exact, an exponent form read as a
+/// double; anything else is not a number.
+pub fn textNumber(raw: []const u8) ?TextNumber {
+    const text = std.mem.trim(u8, raw, TEXT_SPACE);
+    var i: usize = 0;
+    const negative = i < text.len and text[i] == '-';
+    if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
+    var m: i128 = 0;
+    var digits: usize = 0;
+    var scale: u8 = 0;
+    var seen_point = false;
+    var exact = true;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '.' and !seen_point) {
+            seen_point = true;
+        } else if (c >= '0' and c <= '9') {
+            digits += 1;
+            if (digits > 38) {
+                exact = false;
+                continue;
+            }
+            m = m * 10 + (c - '0');
+            if (seen_point) scale += 1;
+        } else break;
+    }
+    if (digits == 0) return null;
+    if (i == text.len and exact) return .{ .exact = .{ .m = if (negative) -m else m, .s = scale } };
+    for (text[i..]) |c| switch (c) {
+        '0'...'9', '.', 'e', 'E', '+', '-' => {},
+        else => return null,
+    };
+    const f = std.fmt.parseFloat(f64, text) catch return null;
+    return if (std.math.isFinite(f)) .{ .float = f } else null;
+}
+
+/// Text as a DOUBLE: any number `textNumber` reads, correctly rounded.
+pub fn textDouble(raw: []const u8) ?f64 {
+    return switch (textNumber(raw) orelse return null) {
+        .float => |f| f,
+        .exact => std.fmt.parseFloat(f64, std.mem.trim(u8, raw, TEXT_SPACE)) catch null,
+    };
+}
+
+/// Text as an integer, the way StarRocks casts it to one: surrounding
+/// spaces ignored, an optional sign, then digits only. A fraction, an
+/// exponent or a value past i128 is not an integer.
+pub fn textInteger(raw: []const u8) ?i128 {
+    const text = std.mem.trim(u8, raw, TEXT_SPACE);
+    const negative = text.len > 0 and text[0] == '-';
+    const digits = if (text.len > 0 and (text[0] == '-' or text[0] == '+')) text[1..] else text;
+    if (digits.len == 0) return null;
+    var v: i128 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+        const d: i128 = c - '0';
+        v = std.math.mul(i128, v, 10) catch return null;
+        v = (if (negative) std.math.sub(i128, v, d) else std.math.add(i128, v, d)) catch return null;
+    }
+    return v;
+}
+
+/// Text as a BOOLEAN, the way StarRocks casts it: `true` or `false` in any
+/// case, or a number, which is true when nonzero.
+pub fn textBoolean(raw: []const u8) ?bool {
+    const text = std.mem.trim(u8, raw, TEXT_SPACE);
+    if (std.ascii.eqlIgnoreCase(text, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(text, "false")) return false;
+    return switch (textNumber(text) orelse return null) {
+        .exact => |d| d.m != 0,
+        .float => |f| f != 0,
+    };
+}
+
+test "text as a number: what StarRocks casts, and nothing else" {
+    const t = std.testing;
+    const exact = .{
+        .{ "12", ScaledInt{ .m = 12, .s = 0 } },
+        .{ " -1.50 ", ScaledInt{ .m = -150, .s = 2 } },
+        .{ "+.5", ScaledInt{ .m = 5, .s = 1 } },
+        .{ "5.", ScaledInt{ .m = 5, .s = 0 } },
+    };
+    inline for (exact) |c| try t.expectEqual(TextNumber{ .exact = c[1] }, textNumber(c[0]).?);
+    try t.expectEqual(TextNumber{ .float = 1500.0 }, textNumber("1.5e3").?);
+    inline for (.{ "", "abc", "12abc", "-", ".", "1e999", "inf", "NaN", "0x10", "1_0", "1 2" }) |bad| try t.expect(textNumber(bad) == null);
+
+    try t.expectEqual(@as(?f64, 0.1), textDouble(" 0.1"));
+    try t.expectEqual(@as(?f64, 100.0), textDouble("1e2"));
+    try t.expect(textDouble("1.5x") == null);
+
+    try t.expectEqual(@as(?i128, 5), textInteger("+5"));
+    try t.expectEqual(@as(?i128, -7), textInteger(" -007 "));
+    try t.expectEqual(@as(?i128, std.math.minInt(i128)), textInteger("-170141183460469231731687303715884105728"));
+    inline for (.{ "", "-", "12.0", "1.7", "12abc", "1e3", "1 2", "170141183460469231731687303715884105728" }) |bad| try t.expect(textInteger(bad) == null);
+
+    try t.expectEqual(@as(?bool, true), textBoolean(" TRUE "));
+    try t.expectEqual(@as(?bool, false), textBoolean("False"));
+    try t.expectEqual(@as(?bool, true), textBoolean("2"));
+    try t.expectEqual(@as(?bool, false), textBoolean("0.0"));
+    try t.expect(textBoolean("x") == null);
+    try t.expect(textBoolean("") == null);
+}
+
 test "parseDateTimeString: fractions, date-only, Z, rejects" {
     try std.testing.expectEqual(@as(i64, 1783663005455833), try parseDateTimeString("2026-07-10 05:56:45.455833"));
     try std.testing.expectEqual(@as(i64, 1783663005455000), try parseDateTimeString("2026-07-10 05:56:45.455"));

@@ -478,13 +478,13 @@ test "compute: conversion — numeric widening, narrowing, parsing, stringifying
     defer i_to_bi.deinit(allocator);
     var i_to_d: std.ArrayList(f64) = .empty;
     defer i_to_d.deinit(allocator);
-    var bi_to_i: std.ArrayList(i32) = .empty;
+    var bi_to_i: std.ArrayList(?i32) = .empty;
     defer bi_to_i.deinit(allocator);
     var d_to_i: std.ArrayList(i32) = .empty;
     defer d_to_i.deinit(allocator);
-    var s_to_i: std.ArrayList(i32) = .empty;
+    var s_to_i: std.ArrayList(?i32) = .empty;
     defer s_to_i.deinit(allocator);
-    var s_to_d: std.ArrayList(f64) = .empty;
+    var s_to_d: std.ArrayList(?f64) = .empty;
     defer s_to_d.deinit(allocator);
     var i_to_s_concat: std.ArrayList(u8) = .empty;
     defer i_to_s_concat.deinit(allocator);
@@ -494,13 +494,13 @@ test "compute: conversion — numeric widening, narrowing, parsing, stringifying
     while (try q.next()) |b| {
         try i_to_bi.appendSlice(allocator, b.values[6].data.bigint[0..b.row_count]);
         try i_to_d.appendSlice(allocator, b.values[7].data.double[0..b.row_count]);
-        try bi_to_i.appendSlice(allocator, b.values[9].data.int[0..b.row_count]);
         try d_to_i.appendSlice(allocator, b.values[10].data.int[0..b.row_count]);
-        try s_to_i.appendSlice(allocator, b.values[12].data.int[0..b.row_count]);
-        try s_to_d.appendSlice(allocator, b.values[14].data.double[0..b.row_count]);
         const is = b.values[15].data.string;
         const bs = b.values[17].data.string;
         for (0..b.row_count) |k| {
+            try bi_to_i.append(allocator, if (b.values[9].isValid(k)) b.values[9].data.int[k] else null);
+            try s_to_i.append(allocator, if (b.values[12].isValid(k)) b.values[12].data.int[k] else null);
+            try s_to_d.append(allocator, if (b.values[14].isValid(k)) b.values[14].data.double[k] else null);
             try i_to_s_concat.appendSlice(allocator, is.rowBytes(k));
             try i_to_s_concat.append(allocator, '|');
             try b_to_s_concat.appendSlice(allocator, bs.rowBytes(k));
@@ -509,13 +509,13 @@ test "compute: conversion — numeric widening, narrowing, parsing, stringifying
     }
     try std.testing.expectEqualSlices(i64, &[_]i64{ 42, -7 }, i_to_bi.items);
     try std.testing.expectEqualSlices(f64, &[_]f64{ 42.0, -7.0 }, i_to_d.items);
-    // bigint 1_000_000_000_000 saturates to i32 max; 99 fits.
-    try std.testing.expectEqualSlices(i32, &[_]i32{ std.math.maxInt(i32), 99 }, bi_to_i.items);
+    // bigint 1_000_000_000_000 is outside INT: NULL; 99 fits.
+    try std.testing.expectEqualSlices(?i32, &[_]?i32{ null, 99 }, bi_to_i.items);
     // double 3.14 → 3; -2.5 → -2 (truncates toward zero)
     try std.testing.expectEqualSlices(i32, &[_]i32{ 3, -2 }, d_to_i.items);
-    // string "123" → 123; "not_a_number" → 0
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 123, 0 }, s_to_i.items);
-    try std.testing.expectEqualSlices(f64, &[_]f64{ 123.0, 0.0 }, s_to_d.items);
+    // string "123" → 123; "not_a_number" → NULL
+    try std.testing.expectEqualSlices(?i32, &[_]?i32{ 123, null }, s_to_i.items);
+    try std.testing.expectEqualSlices(?f64, &[_]?f64{ 123.0, null }, s_to_d.items);
     try std.testing.expectEqualStrings("42|-7|", i_to_s_concat.items);
     try std.testing.expectEqualStrings("true|false|", b_to_s_concat.items);
 }

@@ -321,3 +321,16 @@ test "scalar_fn: integer kernels wrap, and DIV/MOD by zero or -1 never trap" {
     try math.intDivModKernel(i32, .div)(allocator, &int_args, &int_out, int_lhs.len);
     try std.testing.expectEqualSlices(i32, &.{ std.math.minInt(i32), 0 }, int_out.view().data.int);
 }
+
+test "scalar_fn: a double truncates into an integer type, NULL past its range" {
+    const truncatedInt = @import("scalar_fn_math.zig").truncatedInt;
+    try std.testing.expectEqual(@as(?i32, 2147483647), truncatedInt(i32, 2147483647.9));
+    try std.testing.expectEqual(@as(?i32, -2147483648), truncatedInt(i32, -2147483648.5));
+    try std.testing.expectEqual(@as(?i32, -2), truncatedInt(i32, -2.5));
+    try std.testing.expectEqual(@as(?i32, null), truncatedInt(i32, 2147483648.0));
+    try std.testing.expectEqual(@as(?i32, null), truncatedInt(i32, -2147483649.0));
+    try std.testing.expectEqual(@as(?i64, null), truncatedInt(i64, 9223372036854775808.0));
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), truncatedInt(i64, -9223372036854775808.0));
+    try std.testing.expectEqual(@as(?i8, null), truncatedInt(i8, std.math.nan(f64)));
+    try std.testing.expectEqual(@as(?i128, null), truncatedInt(i128, std.math.inf(f64)));
+}
