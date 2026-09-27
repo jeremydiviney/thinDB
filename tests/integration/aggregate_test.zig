@@ -1213,3 +1213,46 @@ test "aggregate: COUNT(DISTINCT a, b) counts distinct tuples with no NULL elemen
 
     try helpers.expectRunError(allocator, db, "SELECT SUM(DISTINCT a, x) FROM cd", error.SqlInvalidProjection);
 }
+
+test "aggregate: DISTINCT stays in the default column name and apart from the plain aggregate" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE dn (id BIGINT PRIMARY KEY, g VARCHAR(4), s VARCHAR(4), n BIGINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO dn VALUES (1, 'p', 'a', 5), (2, 'p', 'a', 5), (3, 'p', 'a', 5), (4, 'p', 'a', 5),
+        \\  (5, 'q', 'a', 1), (6, 'q', 'b', 2), (7, 'q', 'c', 4)
+    );
+
+    {
+        var q = try helpers.runSql(allocator, db,
+            \\SELECT COUNT(s), COUNT(DISTINCT s), count(distinct n), SUM(DISTINCT n), AVG(DISTINCT n),
+            \\  GROUP_CONCAT(DISTINCT s), GROUP_CONCAT(s), COUNT(DISTINCT s, n) FROM dn
+        );
+        defer q.deinit();
+        const expected = [_][]const u8{ "COUNT(s)", "COUNT(DISTINCT s)", "count(distinct n)", "SUM(DISTINCT n)", "AVG(DISTINCT n)", "GROUP_CONCAT(DISTINCT s)", "GROUP_CONCAT(s)", "COUNT(DISTINCT expr)" };
+        const schema = q.outputSchema();
+        try std.testing.expectEqual(expected.len, schema.len);
+        for (expected, schema) |name, col| try std.testing.expectEqualStrings(name, col.name);
+    }
+
+    // p has 4 values of s, 1 distinct; q has 3, all distinct.
+    const cases = .{
+        .{ "SELECT COUNT(DISTINCT s) FROM dn GROUP BY g ORDER BY COUNT(s)", &[_]i64{ 3, 1 } },
+        .{ "SELECT COUNT(s) FROM dn GROUP BY g ORDER BY COUNT(DISTINCT s)", &[_]i64{ 4, 3 } },
+        .{ "SELECT COUNT(DISTINCT s) FROM dn GROUP BY g HAVING COUNT(s) > 3", &[_]i64{1} },
+        .{ "SELECT COUNT(s) FROM dn GROUP BY g HAVING COUNT(DISTINCT s) > 1", &[_]i64{3} },
+        .{ "SELECT COUNT(s), SUM(DISTINCT n) FROM dn GROUP BY g ORDER BY SUM(n)", &[_]i64{ 3, 4 } },
+        .{ "SELECT COUNT(DISTINCT s) FROM dn WHERE g = 'p' UNION ALL SELECT COUNT(DISTINCT s) FROM dn WHERE g = 'q' ORDER BY COUNT(DISTINCT s) DESC", &[_]i64{ 3, 1 } },
+    };
+    inline for (cases) |case| {
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, case[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}

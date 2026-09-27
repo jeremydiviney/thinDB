@@ -289,7 +289,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
                 col_dup = try p.materializeAggregateExpr(col_dup, func, args, saw_distinct);
             } else {
                 if (saw_distinct) return PE.SqlInvalidProjection;
-                col_dup = try p.aggSortName(col_dup, args);
+                col_dup = try p.aggSortName(col_dup, args, false);
             }
         } else if (saw_distinct) {
             return PE.SqlInvalidProjection;

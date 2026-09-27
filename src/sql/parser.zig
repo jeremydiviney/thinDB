@@ -141,9 +141,16 @@ fn aggForName(name: []const u8) ?ir.AggFunc {
 /// Canonical lowercase function name for an aggregate, used to rebuild
 /// the `func(arg)` reference name a HAVING clause would produce. Returns
 /// null for functions not addressable as a bare `func(col)` HAVING ref.
+/// The `DISTINCT ` of an aggregate's default name, spelled in its function
+/// name's case.
+fn distinctPrefix(func_name: []const u8, distinct: bool) []const u8 {
+    if (!distinct) return "";
+    return if (func_name.len > 0 and std.ascii.isLower(func_name[0])) "distinct " else "DISTINCT ";
+}
+
 fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
     return switch (f) {
-        .count, .count_distinct => "count",
+        .count => "count",
         .sum => "sum",
         .min => "min",
         .max => "max",
@@ -158,13 +165,11 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .bit_and => "bit_and",
         .bit_or => "bit_or",
         .bit_xor => "bit_xor",
-        .sum_distinct => "sum",
-        .avg_distinct => "avg",
         .stddev_pop => "stddev_pop",
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .percentile, .group_concat, .udf, .max_by_key => null,
+        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .group_concat, .udf, .max_by_key => null,
     };
 }
 
@@ -2412,6 +2417,7 @@ pub const Parser = struct {
             defer buf.deinit(self.arena);
             try buf.appendSlice(self.arena, func_name);
             try buf.append(self.arena, '(');
+            try buf.appendSlice(self.arena, distinctPrefix(func_name, distinct));
             if (arg_expr != null) {
                 try buf.appendSlice(self.arena, "expr");
             } else {
@@ -2445,7 +2451,7 @@ pub const Parser = struct {
             .col_ref => |c| c,
             else => "expr",
         };
-        return .{ .default_name = try std.fmt.allocPrint(self.arena, "{s}({s})", .{ func_name, arg_name }), .agg = .{
+        return .{ .default_name = try std.fmt.allocPrint(self.arena, "{s}({s}{s})", .{ func_name, distinctPrefix(func_name, distinct), arg_name }), .agg = .{
             .func = .group_concat,
             .col = null,
             .arg_expr = try scalar_fn.toString(self.arena, args[0]),
@@ -4708,13 +4714,13 @@ pub const Parser = struct {
         if (self.aggregateFuncForName(first)) |func| {
             if (self.aggregate_expr_refs_enabled) {
                 if (!distinct) {
-                    if (self.aggSortName(first, args)) |canonical| {
+                    if (self.aggSortName(first, args, false)) |canonical| {
                         if (try self.aggAliasFor(proj, canonical)) |alias| return alias;
                     } else |_| {}
                 }
                 return try self.materializeAggregateExpr(first, func, args, distinct);
             }
-            return try self.aggSortName(first, args);
+            return try self.aggSortName(first, args, distinct);
         }
         if (distinct) return ParseError.SqlInvalidProjection;
         return try self.orderExprKey(proj, try self.makeScalarCallExpr(first, args), keys);
@@ -4789,12 +4795,13 @@ pub const Parser = struct {
     /// BY, matching `aggCallFromArgs`'s default-name format
     /// (`func(arg)` / `func(*)`). Only single col-ref / `*` args are
     /// bindable — anything else can't be matched to a projected column.
-    pub fn aggSortName(self: *Parser, func_name: []const u8, args: []const ir.Expr) ParseError![]const u8 {
+    pub fn aggSortName(self: *Parser, func_name: []const u8, args: []const ir.Expr, distinct: bool) ParseError![]const u8 {
         if (args.len != 1 and self.aggregateFuncForName(func_name) != .udf) return ParseError.SqlInvalidProjection;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.arena);
         try buf.appendSlice(self.arena, func_name);
         try buf.append(self.arena, '(');
+        try buf.appendSlice(self.arena, distinctPrefix(func_name, distinct));
         for (args, 0..) |arg, i| {
             if (i > 0) try buf.append(self.arena, ',');
             const argname: []const u8 = switch (arg) {
@@ -4828,8 +4835,8 @@ pub const Parser = struct {
     fn aggAliasFor(self: *Parser, proj: []const ProjItem, name: []const u8) ParseError!?[]const u8 {
         for (proj) |p| switch (p.kind) {
             .agg => |a| {
-                // count_distinct / expression-arg aggregates aren't
-                // expressible as a HAVING reference today; skip them.
+                // DISTINCT and expression arguments reach HAVING as
+                // hidden aggregates, never by canonical name.
                 if (a.arg_expr != null) continue;
                 const fname = if (a.func == .udf)
                     (a.udf_name orelse continue)
