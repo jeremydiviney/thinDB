@@ -187,6 +187,10 @@ distinct values and have the same types as `SUM(x)` and `AVG(x)`.
 
 Result precisions exceeding 38 are clamped to 38, with overflow → error rather than truncation. Mixed decimal/integer arithmetic promotes the integer to decimal first.
 
+**DOUBLE to DECIMAL** goes through the double's shortest round-trip digits (the digits it prints as), rounded half away from zero to the target scale. `1.005e0` is 1.005 although its binary value is just below it, so it lands on 1.01 at scale 2, as in MySQL. One rule (`scalar_fn_common.floatDigits`) covers every conversion: `CAST`, an INSERT of a float literal into a DECIMAL column, and a float literal compared with a decimal or integer column. Text written into a DECIMAL column rounds the same way, and a value past the column's precision is `ValueOutOfRange`.
+
+**A float function takes a decimal's value.** A function with only DOUBLE parameters, such as `POWER`, `SQRT`, `LN`, `EXP`, the trigonometric functions and `SIGN`, converts a DECIMAL argument to DOUBLE, as MySQL and StarRocks do. Functions with decimal overloads (`ROUND`, `FLOOR`, `CEIL`, `ABS`, `TRUNCATE`, `MOD`, `GREATEST`, `LEAST`) keep DECIMAL.
+
 ---
 
 ## 4. On-disk format
