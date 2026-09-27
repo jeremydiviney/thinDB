@@ -707,7 +707,7 @@ pub fn hexEncodeKernel(allocator: Allocator, args: []const ColumnView, out: *Col
         const src = sv.rowBytes(i);
         const dst = try allocator.alloc(u8, src.len * 2);
         defer allocator.free(dst);
-        const charset = "0123456789abcdef";
+        const charset = "0123456789ABCDEF";
         for (src, 0..) |b, j| {
             dst[j * 2] = charset[b >> 4];
             dst[j * 2 + 1] = charset[b & 0x0F];

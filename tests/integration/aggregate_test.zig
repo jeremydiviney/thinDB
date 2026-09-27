@@ -1277,7 +1277,7 @@ test "aggregate: DISTINCT stays in the default column name and apart from the pl
             \\  GROUP_CONCAT(DISTINCT s), GROUP_CONCAT(s), COUNT(DISTINCT s, n) FROM dn
         );
         defer q.deinit();
-        const expected = [_][]const u8{ "COUNT(s)", "COUNT(DISTINCT s)", "count(distinct n)", "SUM(DISTINCT n)", "AVG(DISTINCT n)", "GROUP_CONCAT(DISTINCT s)", "GROUP_CONCAT(s)", "COUNT(DISTINCT expr)" };
+        const expected = [_][]const u8{ "COUNT(s)", "COUNT(DISTINCT s)", "count(distinct n)", "SUM(DISTINCT n)", "AVG(DISTINCT n)", "GROUP_CONCAT(DISTINCT s)", "GROUP_CONCAT(s)", "COUNT(DISTINCT s, n)" };
         const schema = q.outputSchema();
         try std.testing.expectEqual(expected.len, schema.len);
         for (expected, schema) |name, col| try std.testing.expectEqualStrings(name, col.name);

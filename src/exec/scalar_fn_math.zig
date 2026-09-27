@@ -448,6 +448,21 @@ pub fn binBigintKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     }
 }
 
+pub fn hexBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    for (args[0].data.bigint[0..row_count]) |v| try common.appendBigintHex(allocator, ss, v);
+}
+
+pub fn hexLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    for (args[0].data.largeint[0..row_count]) |v| try common.appendBigintHex(allocator, ss, common.unsignedOrSaturatedBigint(v));
+}
+
+pub fn hexDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    for (args[0].data.double[0..row_count]) |x| try common.appendBigintHex(allocator, ss, common.doubleToBigint(x));
+}
+
 fn digitValue(c: u8) ?u8 {
     return switch (c) {
         '0'...'9' => c - '0',

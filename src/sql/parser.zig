@@ -52,6 +52,7 @@ const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
 const parse_window = @import("parse_window.zig");
+const item_name = @import("item_name.zig");
 pub const ParsedWindowCall = parse_window.ParsedWindowCall;
 const parse_ddl = @import("parse_ddl.zig");
 const parse_predicate = @import("parse_predicate.zig");
@@ -481,9 +482,18 @@ const WindowExprRef = struct {
 };
 
 const ProjItem = struct {
-    /// Output name for this projected column (post-alias).
+    /// Output name for this projected column (post-alias). The plan binds
+    /// the item by it: ORDER BY and GROUP BY references, ordinals, the
+    /// computed column that carries the value.
     name: []const u8,
-    kind: union(enum) {
+    /// The name clients see when it differs from `name`: an unaliased
+    /// computed item is named by the dialect's rule for its text (MySQL's
+    /// `COUNT(*)`, `a+1`; PostgreSQL's `count`, `?column?`), which the plan
+    /// can't bind by, as two items may share it or it may be any text.
+    display: ?[]const u8 = null,
+    kind: Kind,
+
+    const Kind = union(enum) {
         /// Plain column reference. `column` is the column name.
         col: []const u8,
         /// Star expansion. Null means `*`; otherwise `qualifier.*`.
@@ -505,8 +515,24 @@ const ProjItem = struct {
         /// equivalent specs across all window calls in the SELECT and
         /// assigns each call a spec_idx.
         window: ParsedWindowCall,
-    },
+    };
 };
+
+/// The name a client sees for `p`, before the projection's collision rules:
+/// its display name, else its alias, else a column's bare name.
+fn shownName(p: ProjItem) []const u8 {
+    if (p.display) |d| return d;
+    return switch (p.kind) {
+        .col => |c| if (types.columnNameEql(c, p.name)) types.unqualifiedName(p.name) else p.name,
+        else => p.name,
+    };
+}
+
+/// The column a query's output carries `p` in: its display name when it has
+/// one (the final projection renamed it), else its plan name.
+fn outputColumnName(p: ProjItem) []const u8 {
+    return p.display orelse p.name;
+}
 
 /// Per-CTE materialization hint from the SQL surface. Every CTE boundary
 /// materializes (stage-per-block execution); the hint only picks sharing:
@@ -865,6 +891,7 @@ pub const Parser = struct {
         // evaluate the projection over one synthetic row.
         var root: *ir.Op = undefined;
         var from_is_join = false;
+        var from_is_aliased = false;
         var from_inputs: []const ChainInput = &.{};
         var proj = parsed_proj;
         const has_from = self.cur.tag == .kw_from;
@@ -874,6 +901,7 @@ pub const Parser = struct {
             root = from.op;
             from_inputs = from.inputs;
             from_is_join = fromClauseIsJoin(root);
+            from_is_aliased = from.sole_unaliased_name == null;
             if (from.sole_unaliased_name) |name| proj = try self.soleSourceStars(parsed_proj, name);
             if (from.merged_star) |columns| proj = try self.mergedJoinStars(parsed_proj, columns);
         } else {
@@ -1384,11 +1412,12 @@ pub const Parser = struct {
             // anchors, the projection's own predicate anchors, the
             // SELECT-list exprs/windows, then the ORDER BY's keys. `*` stops
             // before all of them, so even a bare star projects when any
-            // exist. Over a join it projects too: the sides arrive
-            // alias-qualified and `*` names its columns as the explicit list
-            // would.
+            // exist. Over a join or an aliased source it projects too: the
+            // columns arrive alias-qualified and `*` names them as the
+            // explicit list would, where a client can't tell `d.a+1` (column
+            // `a+1` of `d`) from a result named by its text, `t.a + 1`.
             const hidden_trailing = selectDerivedCount(proj) + where_derived_count + @as(u32, @intCast(projection_predicate_derived.len)) + order_hidden;
-            if (!isBareStarProjection(proj) or hidden_trailing > 0 or from_is_join) {
+            if (!isBareStarProjection(proj) or hidden_trailing > 0 or from_is_join or from_is_aliased) {
                 root = try self.addSelectProject(root, proj, hidden_trailing);
             }
         }
@@ -1488,7 +1517,7 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.kw_by);
             const names = try self.arena.alloc(ProjItem, output.len);
-            for (output, names) |p, *n| n.* = if (p.kind == .star) p else .{ .name = p.name, .kind = .{ .col = p.name } };
+            for (output, names) |p, *n| n.* = if (p.kind == .star) p else .{ .name = outputColumnName(p), .kind = .{ .col = outputColumnName(p) } };
             const old_aggregate_expr_refs_enabled = self.aggregate_expr_refs_enabled;
             self.aggregate_expr_refs_enabled = false;
             defer self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
@@ -1651,16 +1680,22 @@ pub const Parser = struct {
         };
     }
 
+    /// A computed item's name is whole, never a qualified column: `e.a IS
+    /// NULL` over a join must not lose its `e.` and collide with `f.a IS NULL`.
     fn projectOutputName(p: ProjItem) ?[]const u8 {
         return switch (p.kind) {
             .col => |c| if (types.columnNameEql(c, p.name)) null else p.name,
-            else => null,
+            .star => null,
+            .agg, .expr, .window => p.display orelse if (types.splitQualifiedName(p.name) != null) p.name else null,
         };
     }
 
+    /// An aliased item replaces a same-named column `*` brought in (`SELECT
+    /// *, f(x) AS x`); a default-named one sits beside it, as `SELECT a, 'a'`
+    /// keeps both.
     fn projectMayReplaceOutput(p: ProjItem) bool {
         return switch (p.kind) {
-            .expr, .window => true,
+            .expr, .window => p.display == null,
             .col => projectOutputName(p) != null,
             else => false,
         };
@@ -1713,7 +1748,30 @@ pub const Parser = struct {
             try self.advance();
         }
         try self.dedupeProjectionNames(items.items);
+        try self.dedupeDisplayNames(items.items);
         return try items.toOwnedSlice(self.arena);
+    }
+
+    /// Display names are defaults, so they yield: one that repeats a name
+    /// the query spells out (an alias, a column), or an earlier display name,
+    /// becomes `name_N` with the smallest N no shown name claims.
+    fn dedupeDisplayNames(self: *Parser, items: []ProjItem) ParseError!void {
+        for (items, 0..) |*item, i| {
+            const display = item.display orelse continue;
+            if (!displayNameClaimed(items, i, display)) continue;
+            var n: usize = 1;
+            while (true) : (n += 1) {
+                const candidate = try std.fmt.allocPrint(self.arena, "{s}_{d}", .{ display, n });
+                if (shownNameClaimed(items, candidate)) continue;
+                item.display = candidate;
+                break;
+            }
+        }
+        for (items) |*item| {
+            if (item.display) |d| if (std.mem.eql(u8, d, item.name)) {
+                item.display = null;
+            };
+        }
     }
 
     /// Operators bind by name, so a projection's outputs must be distinct.
@@ -1741,11 +1799,9 @@ pub const Parser = struct {
         }
 
         if (try self.predicateValueAhead()) {
-            const start = self.prev_end;
             const expr = try self.parsePredicateValue();
-            const text = std.mem.trim(u8, self.lex.src[start..self.prev_end], " \t\r\n");
-            const alias = try self.maybeAlias(try self.arena.dupe(u8, text));
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            const text = std.mem.trim(u8, self.lex.src[item_start..self.prev_end], " \t\r\n");
+            return try self.namedProjItem(item_start, try self.arena.dupe(u8, text), .{ .expr = expr });
         }
 
         // Parenthesized expression at projection start: `(expr) [AS name]`.
@@ -1753,9 +1809,7 @@ pub const Parser = struct {
         // operators) without going through the identifier path.
         if (self.cur.tag == .lparen) {
             const expr = try self.parseCallArg();
-            const default_name = try self.exprDefaultName(expr);
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            return try self.namedExprItem(item_start, expr);
         }
 
         // CASE expression at projection start. Same routing — parseCallArg
@@ -1764,9 +1818,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_case) {
             var expr = try self.parseCaseExpr();
             expr = try self.continueBinaryFrom(expr);
-            const default_name = try self.exprDefaultName(expr);
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            return try self.namedExprItem(item_start, expr);
         }
 
         // EXISTS (SELECT ...) at projection start. Routed via the
@@ -1774,9 +1826,7 @@ pub const Parser = struct {
         // into an aliased .expr ProjItem.
         if (self.cur.tag == .kw_exists) {
             const expr = try self.parseCallAtom();
-            const default_name = try self.exprDefaultName(expr);
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            return try self.namedExprItem(item_start, expr);
         }
 
         // Literal at projection start: `SELECT 1`, `SELECT 'x'`,
@@ -1786,9 +1836,7 @@ pub const Parser = struct {
         switch (self.cur.tag) {
             .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
                 const expr = try self.parseScalar();
-                const default_name = try self.exprDefaultName(expr);
-                const alias = try self.maybeAlias(default_name);
-                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                return try self.namedExprItem(item_start, expr);
             },
             else => {},
         }
@@ -1806,9 +1854,7 @@ pub const Parser = struct {
                     expr = try self.parseCastTarget(expr);
                 }
                 expr = try self.continueBinaryFrom(expr);
-                const default_name = try self.exprDefaultName(expr);
-                const alias = try self.maybeAlias(default_name);
-                return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                return try self.namedExprItem(item_start, expr);
             }
             const dup_col = try self.arena.dupe(u8, saved.text);
             const alias = try self.maybeAlias(dup_col);
@@ -1822,20 +1868,14 @@ pub const Parser = struct {
             if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
             const scalar_atom = try self.parseScalarCallAfterName(first);
             const expr = try self.continueBinaryFrom(scalar_atom);
-            const default_name = try self.exprDefaultName(expr);
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            return try self.namedExprItem(item_start, expr);
         }
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const first = self.cur.text;
         try self.advance();
 
         if (try self.typedTemporalLiteralAfterName(first)) |lit| {
-            var expr = lit;
-            expr = try self.continueBinaryFrom(expr);
-            const default_name = try self.exprDefaultName(expr);
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            return try self.namedExprItem(item_start, try self.continueBinaryFrom(lit));
         }
 
         // Function call?
@@ -1877,8 +1917,7 @@ pub const Parser = struct {
                     const hidden_name = try self.materializeWindowExpr(call);
                     const expr = try self.windowNullCheckExpr(hidden_name, negated);
                     const default_name: []const u8 = if (negated) "is_not_null" else "is_null";
-                    const alias = try self.maybeAlias(default_name);
-                    return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                    return try self.namedProjItem(item_start, default_name, .{ .expr = expr });
                 }
                 // A leading window call continued by an operator
                 // (`SUM(x) OVER (...) / 12`) hoists like the IS NULL
@@ -1886,13 +1925,10 @@ pub const Parser = struct {
                 if (try self.binaryOpAhead()) {
                     const hidden_name = try self.materializeWindowExpr(call);
                     const expr = try self.continueBinaryFrom(ir.Expr{ .col_ref = hidden_name });
-                    const default_name = try self.exprDefaultName(expr);
-                    const alias = try self.maybeAlias(default_name);
-                    return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                    return try self.namedExprItem(item_start, expr);
                 }
                 const default_name = try parse_window.defaultName(self.arena, first, args);
-                const alias = try self.maybeAlias(default_name);
-                return ProjItem{ .name = alias, .kind = .{ .window = call } };
+                return try self.namedProjItem(item_start, default_name, .{ .window = call });
             }
 
             // IGNORE NULLS without OVER is a parse error per SQL standard.
@@ -1918,11 +1954,10 @@ pub const Parser = struct {
                 if (try self.binaryOpAhead()) {
                     const agg_name = try self.materializeAggregateExpr(first, func, args, saw_distinct);
                     const expr = try self.continueBinaryFrom(ir.Expr{ .col_ref = agg_name });
-                    const default_name = try self.exprDefaultName(expr);
-                    const alias = try self.maybeAlias(default_name);
-                    return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+                    return try self.namedExprItem(item_start, expr);
                 }
-                return try self.aggCallFromArgs(first, func, args, saw_distinct);
+                const parsed = try self.parsedAggFromArgs(first, func, args, saw_distinct);
+                return try self.namedProjItem(item_start, parsed.default_name, .{ .agg = parsed.agg });
             }
 
             // DISTINCT is only valid inside an aggregate; a scalar/window
@@ -1934,26 +1969,14 @@ pub const Parser = struct {
             // leftmost operand — lift into a .expr ProjItem. Otherwise
             // stay as a bare scalar call.
             const scalar_atom = try self.makeScalarCallExpr(first, args);
-            const expr = try self.continueBinaryFrom(scalar_atom);
-            // A JSON aggregate lowers to calls over a hidden column; it takes
-            // its name from the text as written, as MySQL names it.
-            const lowered_aggregate = jsonAggregateFor(first) != null and expr == .call and expr.call.args.ptr == scalar_atom.call.args.ptr;
-            const default_name = if (lowered_aggregate)
-                try self.arena.dupe(u8, std.mem.trim(u8, self.lex.src[item_start..self.prev_end], " \t\r\n"))
-            else
-                try self.exprDefaultName(expr);
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            return try self.namedExprItem(item_start, try self.continueBinaryFrom(scalar_atom));
         }
 
         // Bare CURRENT_TIMESTAMP / CURRENT_DATE (no parens) — nullary
         // temporal functions, not column refs.
         if (self.cur.tag != .dot) {
             if (try self.bareTemporalCall(first)) |call| {
-                const e = try self.continueBinaryFrom(call);
-                const default_name = try self.exprDefaultName(e);
-                const alias = try self.maybeAlias(default_name);
-                return ProjItem{ .name = alias, .kind = .{ .expr = e } };
+                return try self.namedExprItem(item_start, try self.continueBinaryFrom(call));
             }
         }
 
@@ -1976,13 +1999,44 @@ pub const Parser = struct {
                 expr = try self.parseCastTarget(expr);
             }
             expr = try self.continueBinaryFrom(expr);
-            const default_name = try self.exprDefaultName(expr);
-            const alias = try self.maybeAlias(default_name);
-            return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
+            return try self.namedExprItem(item_start, expr);
         }
 
         const alias = try self.maybeAlias(dup_col);
         return ProjItem{ .name = alias, .kind = .{ .col = dup_col } };
+    }
+
+    fn namedExprItem(self: *Parser, item_start: usize, expr: ir.Expr) ParseError!ProjItem {
+        return try self.namedProjItem(item_start, try self.exprDefaultName(expr), .{ .expr = expr });
+    }
+
+    /// A computed SELECT item the plan names `default_name` unless an alias
+    /// follows. Without one, clients see the dialect's name for the item's
+    /// text, which ran from `item_start` to here.
+    fn namedProjItem(self: *Parser, item_start: usize, default_name: []const u8, kind: ProjItem.Kind) ParseError!ProjItem {
+        const item_end = self.prev_end;
+        const name = try self.maybeAlias(default_name);
+        if (self.prev_end != item_end) return .{ .name = name, .kind = kind };
+        const display = try self.itemDisplayName(item_start, item_end);
+        return .{ .name = name, .kind = kind, .display = if (std.mem.eql(u8, display, name)) null else display };
+    }
+
+    fn itemDisplayName(self: *Parser, item_start: usize, item_end: usize) ParseError![]const u8 {
+        var look = self.lex.*;
+        look.pos = item_start;
+        try look.skipWhitespaceAndComments();
+        const text = self.lex.src[look.pos..item_end];
+        return switch (self.lex.dialect) {
+            .mysql, .neutral => try item_name.mysqlName(self.arena, self.lex.*, text),
+            .postgres => try item_name.postgresName(self.arena, self.lex.*, text, self.subqueryOutputName()),
+        };
+    }
+
+    /// The name of the last-parsed query's first output, which PostgreSQL
+    /// gives a scalar subquery item.
+    fn subqueryOutputName(self: *const Parser) ?[]const u8 {
+        if (self.select_output.len == 0 or self.select_output[0].kind == .star) return null;
+        return shownName(self.select_output[0]);
     }
 
     /// Whether `name(` opens a call whose arguments aren't a plain comma list,
@@ -2763,18 +2817,6 @@ pub const Parser = struct {
             .arg2_expr = if (args.len == 3) args[2] else null,
             .params = .{ .concat = .{ .separator = separator, .distinct = distinct } },
         } };
-    }
-
-    fn aggCallFromArgs(
-        self: *Parser,
-        func_name: []const u8,
-        func: ir.AggFunc,
-        args: []const ir.Expr,
-        distinct: bool,
-    ) ParseError!ProjItem {
-        const parsed = try self.parsedAggFromArgs(func_name, func, args, distinct);
-        const alias = try self.maybeAlias(parsed.default_name);
-        return ProjItem{ .name = alias, .kind = .{ .agg = parsed.agg } };
     }
 
     pub fn aggregateExprRefsEnabled(self: *const Parser) bool {
@@ -5766,7 +5808,7 @@ pub const Parser = struct {
         const first = self.cur.text;
         try self.advance();
         if (self.cur.tag == .dot) return try self.dupQualifiedColRef(first);
-        if (self.cur.tag != .lparen) return try self.arena.dupe(u8, renamedColumnSource(proj, first) orelse first);
+        if (self.cur.tag != .lparen) return try self.arena.dupe(u8, orderNameSource(proj, first));
         var distinct = false;
         const args = try self.parseCallArgList(first, &distinct);
         // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
@@ -5799,7 +5841,7 @@ pub const Parser = struct {
         if (self.window_expr_refs.items.len != window_mark) return ParseError.SqlInvalidProjection;
         return switch (e) {
             .lit, .null_lit, .var_ref => null,
-            .col_ref => |c| try self.arena.dupe(u8, renamedColumnSource(proj, c) orelse c),
+            .col_ref => |c| try self.arena.dupe(u8, orderNameSource(proj, c)),
             else => try self.orderExprKey(proj, e, keys),
         };
     }
@@ -5854,7 +5896,7 @@ pub const Parser = struct {
     }
 
     /// Canonical output-column name for an aggregate referenced in ORDER
-    /// BY, matching `aggCallFromArgs`'s default-name format
+    /// BY, matching `parsedAggFromArgs`'s default-name format
     /// (`func(arg)` / `func(*)`). Only single col-ref / `*` args are
     /// bindable — anything else can't be matched to a projected column.
     pub fn aggSortName(self: *Parser, func_name: []const u8, args: []const ir.Expr, distinct: bool) ParseError![]const u8 {
@@ -5934,7 +5976,7 @@ pub const Parser = struct {
         const columns = try self.arena.alloc([]const u8, names.len);
         const outputs = try self.arena.alloc(?[]const u8, names.len);
         for (output, names, columns, outputs) |p, name, *column, *out| {
-            column.* = p.name;
+            column.* = outputColumnName(p);
             out.* = name;
         }
         // The rename reads the query as a derived table does, through its own
@@ -6317,6 +6359,9 @@ pub const Parser = struct {
                     .col => |c| if (groupColumnNameEql(c, name)) return i,
                     else => {},
                 };
+                for (proj, 0..) |p, i| {
+                    if (displayNameBinds(p, name)) return i;
+                }
                 return null;
             },
             else => {
@@ -6617,11 +6662,49 @@ fn renamedColumnSource(proj: []const ProjItem, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The column an unqualified ORDER BY name sorts on: an item's plan name
+/// when it names the item, else the name itself.
+fn orderNameSource(proj: []const ProjItem, name: []const u8) []const u8 {
+    if (renamedColumnSource(proj, name)) |source| return source;
+    for (proj) |p| {
+        if (displayNameBinds(p, name)) return p.name;
+    }
+    return name;
+}
+
+/// Whether ORDER BY or GROUP BY `name` refers to `p` by its display name,
+/// as a quoted `COUNT(*)` or `a+1` does. Only a name that isn't an
+/// identifier binds: MySQL also lets `SELECT 'a' ... ORDER BY a` sort by the
+/// constant rather than the column `a`, which is a trap.
+fn displayNameBinds(p: ProjItem, name: []const u8) bool {
+    const display = p.display orelse return false;
+    return types.columnNameEql(display, name) and !types.isPlainIdentifier(display);
+}
+
 fn projectionHasRenamedCols(proj: []const ProjItem) bool {
     for (proj) |p| switch (p.kind) {
         .col => |c| if (!types.columnNameEql(c, p.name)) return true,
-        else => {},
+        .star => {},
+        .agg, .expr, .window => if (p.display != null) return true,
     };
+    return false;
+}
+
+/// Whether an item other than `index` claims `name` as it will be shown: an
+/// explicit name anywhere, or an earlier item's display name.
+fn displayNameClaimed(items: []const ProjItem, index: usize, name: []const u8) bool {
+    for (items, 0..) |item, j| {
+        if (j == index or item.kind == .star) continue;
+        if (item.display != null and j > index) continue;
+        if (types.columnNameEql(shownName(item), name)) return true;
+    }
+    return false;
+}
+
+fn shownNameClaimed(items: []const ProjItem, name: []const u8) bool {
+    for (items) |item| {
+        if (item.kind != .star and types.columnNameEql(shownName(item), name)) return true;
+    }
     return false;
 }
 

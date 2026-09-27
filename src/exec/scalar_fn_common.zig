@@ -262,6 +262,41 @@ pub fn roundHalfEven(x: f64) f64 {
     return if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x);
 }
 
+/// A double as MySQL converts it to BIGINT: rounded half to even, then
+/// pinned to the nearer end of the range when past it.
+pub fn doubleToBigint(x: f64) i64 {
+    const r = roundHalfEven(x);
+    if (std.math.isNan(r)) return 0;
+    if (r >= 0x1p63) return std.math.maxInt(i64);
+    if (r < -0x1p63) return std.math.minInt(i64);
+    return @intFromFloat(r);
+}
+
+/// An integer past the BIGINT range pinned to its nearer end, as MySQL
+/// converts a DECIMAL to BIGINT.
+pub fn saturateBigint(v: i128) i64 {
+    return std.math.cast(i64, v) orelse if (v < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+}
+
+/// An integer where MySQL's HEX reads one: a value from 2^63 to 2^64 - 1
+/// keeps its low 64 bits, as MySQL types an integer literal that large
+/// BIGINT UNSIGNED; any other value past BIGINT saturates.
+pub fn unsignedOrSaturatedBigint(v: i128) i64 {
+    if (v > std.math.maxInt(i64)) {
+        if (std.math.cast(u64, v)) |u| return @bitCast(u);
+    }
+    return saturateBigint(v);
+}
+
+/// MySQL's HEX of a number: the BIGINT it converts to, printed as its
+/// 64-bit two's-complement pattern in uppercase digits.
+pub fn appendBigintHex(allocator: std.mem.Allocator, ss: *store.StringStore, v: i64) !void {
+    var buf: [16]u8 = undefined;
+    const bits: u64 = @bitCast(v);
+    // 16 hex digits always hold a u64.
+    try ss.appendValue(allocator, std.fmt.bufPrint(&buf, "{X}", .{bits}) catch unreachable);
+}
+
 /// Text as an integer, the way StarRocks casts it to one: surrounding
 /// spaces ignored, an optional sign, then digits only. A fraction, an
 /// exponent or a value past i128 is not an integer.

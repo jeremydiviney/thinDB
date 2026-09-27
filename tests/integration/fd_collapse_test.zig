@@ -60,7 +60,7 @@ test "fd-collapse: Q35-shape drops derived keys, recomputes above the aggregate"
     );
     try std.testing.expectEqualStrings(
         \\Limit n=10
-        \\  Select [ip, sub(ip, 1), sub(ip, 2), c]
+        \\  Select [ip, sub(ip, 1) AS ip - 1, sub(ip, 2) AS ip - 2, c]
         \\    OrderBy [c DESC]
         \\      Compute [sub(ip, 1) := sub(ip, 1), sub(ip, 2) := sub(ip, 2)]
         \\        GroupBy keys=[ip] aggs=[count(*) AS c]
@@ -197,7 +197,7 @@ test "fd-collapse: non-collapsible derived key (function of a NON-key) stays bel
     );
     try std.testing.expectEqualStrings(
         \\Limit n=10
-        \\  Select [ip, sub(region, 1), c]
+        \\  Select [ip, sub(region, 1) AS region - 1, c]
         \\    OrderBy [c DESC]
         \\      GroupBy keys=[ip, sub(region, 1)] aggs=[count(*) AS c]
         \\        Compute [sub(region, 1) := sub(region, 1)]

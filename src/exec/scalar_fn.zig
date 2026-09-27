@@ -316,6 +316,8 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
             return try buildDecFn(aa, name, arg_types, it, dec.toIntKernel, .kernel_managed);
         if (std.ascii.eqlIgnoreCase(name, "to_string"))
             return try buildDecFn(aa, name, arg_types, .string, dec.toStringKernel, .propagates);
+        if (std.ascii.eqlIgnoreCase(name, "hex"))
+            return try buildDecFn(aa, name, arg_types, .string, dec.hexKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "abs"))
             return try buildDecFn(aa, name, arg_types, arg_types[0], dec.absKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "round"))
@@ -1212,6 +1214,9 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "xx_hash3_128", .arg_types = &.{.string}, .return_type = .string, .kernel = string.xxHash3_128Kernel },
     // --- encoding ---
     .{ .name = "hex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.hexEncodeKernel },
+    .{ .name = "hex", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.hexBigintKernel },
+    .{ .name = "hex", .arg_types = &.{.largeint}, .return_type = .string, .kernel = math.hexLargeintKernel },
+    .{ .name = "hex", .arg_types = &.{.double}, .return_type = .string, .kernel = math.hexDoubleKernel },
     .{ .name = "unhex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.hexDecodeKernel },
     .{ .name = "to_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = string.base64EncodeKernel },
     .{ .name = "from_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = string.base64DecodeKernel },

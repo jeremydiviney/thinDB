@@ -120,6 +120,33 @@ test "mysql literals: an integer past BIGINT is DECIMAL, then DOUBLE" {
     try expectText(allocator, db, "SELECT CAST(COUNT(*) AS CHAR) FROM big WHERE CAST(id AS DOUBLE) < 12345678901234567890", "2");
 }
 
+test "mysql HEX: a number prints as the BIGINT MySQL converts it to (issue #297)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    try expectCells(allocator, db, "SELECT HEX(255), HEX(-1), HEX(0), HEX(TRUE), HEX(1 = 1)", &.{ "FF", "FFFFFFFFFFFFFFFF", "0", "1", "1" });
+    // A DECIMAL rounds half away from zero, a double half to even.
+    try expectCells(allocator, db, "SELECT HEX(1.5), HEX(2.5), HEX(-1.5), HEX(-0.5), HEX(0.4), HEX(CAST(-2.5 AS DECIMAL(5,1)))", &.{ "2", "3", "FFFFFFFFFFFFFFFE", "FFFFFFFFFFFFFFFF", "0", "FFFFFFFFFFFFFFFD" });
+    try expectCells(allocator, db, "SELECT HEX(2.5e0), HEX(0.5e0), HEX(-2.5e0), HEX(1e3), HEX(1e30)", &.{ "2", "0", "FFFFFFFFFFFFFFFE", "3E8", "7FFFFFFFFFFFFFFF" });
+    // MySQL reads an integer literal up to 2^64 - 1 as BIGINT UNSIGNED;
+    // past that, or below BIGINT, HEX saturates.
+    try expectCells(
+        allocator,
+        db,
+        "SELECT HEX(18446744073709551615), HEX(9223372036854775808), HEX(-9223372036854775808), HEX(18446744073709551616), HEX(-9223372036854775809), HEX(99999999999999999999)",
+        &.{ "FFFFFFFFFFFFFFFF", "8000000000000000", "8000000000000000", "7FFFFFFFFFFFFFFF", "8000000000000000", "7FFFFFFFFFFFFFFF" },
+    );
+    try expectCells(allocator, db, "SELECT HEX('abc'), HEX(X'0aff'), HEX(DATE '2024-01-02'), UNHEX(HEX('abc'))", &.{ "616263", "0AFF", "323032342D30312D3032", "abc" });
+    try expectCells(allocator, db, "SELECT HEX(id), HEX(high_priority), HEX(high_priority * -1), HEX(CAST(id AS DOUBLE) / 2), HEX(s) FROM t ORDER BY id", &.{
+        "1", "A",  "FFFFFFFFFFFFFFF6", "0", "6B697769",
+        "2", "14", "FFFFFFFFFFFFFFEC", "1", "70656172",
+        "3", "1E", "FFFFFFFFFFFFFFE2", "2", "4142",
+    });
+}
+
 test "mysql literals: hex, bit, national, introducers and adjacent strings" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

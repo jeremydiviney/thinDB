@@ -34,4 +34,5 @@ pub const MaterializeHint = parser.MaterializeHint;
 test {
     _ = lexer;
     _ = parser;
+    _ = @import("item_name.zig");
 }

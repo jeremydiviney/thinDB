@@ -683,11 +683,11 @@ test "sql: column names that contain a dot stay whole (issue #113)" {
 
     const cases = .{
         .{ .sql = "SELECT 0.5, 1.5", .names = &[_][]const u8{ "0.5", "1.5" }, .rows = 1 },
-        .{ .sql = "SELECT -0.0025, 'a.b', 7", .names = &[_][]const u8{ "-0.0025", "'a.b'", "7" }, .rows = 1 },
-        .{ .sql = "SELECT 0.5 + 1, 1.5 + 1", .names = &[_][]const u8{ "add(0.5, 1)", "add(1.5, 1)" }, .rows = 1 },
+        .{ .sql = "SELECT -0.0025, 'a.b', 7", .names = &[_][]const u8{ "-0.0025", "a.b", "7" }, .rows = 1 },
+        .{ .sql = "SELECT 0.5 + 1, 1.5 + 1", .names = &[_][]const u8{ "0.5 + 1", "1.5 + 1" }, .rows = 1 },
         .{ .sql = "SELECT 0.5, 1.5 UNION ALL SELECT 2.5, 3.5", .names = &[_][]const u8{ "0.5", "1.5" }, .rows = 2 },
         .{ .sql = "WITH c AS (SELECT 0.5, 1.5) SELECT * FROM c", .names = &[_][]const u8{ "0.5", "1.5" }, .rows = 1 },
-        .{ .sql = "WITH c AS (SELECT id, k * 1.5 FROM t) SELECT c.id, c.`mul(k, 1.5)` FROM c", .names = &[_][]const u8{ "id", "mul(k, 1.5)" }, .rows = 5 },
+        .{ .sql = "WITH c AS (SELECT id, k * 1.5 FROM t) SELECT c.id, c.`k * 1.5` FROM c", .names = &[_][]const u8{ "id", "k * 1.5" }, .rows = 5 },
         .{ .sql = "WITH c AS (SELECT id FROM t) SELECT c.id, 0.5, 1.5 FROM c JOIN t ON c.id = t.id", .names = &[_][]const u8{ "id", "0.5", "1.5" }, .rows = 5 },
         .{ .sql = "SELECT a.qty, 0.5 FROM t a", .names = &[_][]const u8{ "qty", "0.5" }, .rows = 5 },
     };
@@ -701,6 +701,54 @@ test "sql: column names that contain a dot stay whole (issue #113)" {
         while (try q.next()) |b| rows += b.row_count;
         try std.testing.expectEqual(@as(usize, c.rows), rows);
     }
+}
+
+test "sql: an unaliased computed column takes its dialect's name for the SQL text (issue #255)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE dn (id BIGINT PRIMARY KEY, g VARCHAR(4), s VARCHAR(4), n BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO dn VALUES (1, 'p', 'a', 5), (2, 'p', 'a', 5), (5, 'q', 'a', 1), (6, 'q', 'b', 2)");
+
+    const cases = .{
+        .{ .dialect = .mysql, .sql = "SELECT n+1, -n, CONCAT(s,'x'), 1.50, 'abc', NULL, CAST(n AS CHAR), n IS NULL FROM dn", .names = &[_][]const u8{ "n+1", "-n", "CONCAT(s,'x')", "1.50", "abc", "NULL", "CAST(n AS CHAR)", "n IS NULL" } },
+        .{ .dialect = .mysql, .sql = "SELECT COUNT(*), count( * ), COUNT(*) + 1, SUM(n) / COUNT(*), SUM(n + 1), COUNT(DISTINCT s, n) FROM dn", .names = &[_][]const u8{ "COUNT(*)", "count( * )", "COUNT(*) + 1", "SUM(n) / COUNT(*)", "SUM(n + 1)", "COUNT(DISTINCT s, n)" } },
+        .{ .dialect = .mysql, .sql = "SELECT CASE WHEN n > 1 THEN 'a' END, ROW_NUMBER() OVER (ORDER BY id), (SELECT MAX(n) FROM dn) FROM dn", .names = &[_][]const u8{ "CASE WHEN n > 1 THEN 'a' END", "ROW_NUMBER() OVER (ORDER BY id)", "(SELECT MAX(n) FROM dn)" } },
+        .{ .dialect = .mysql, .sql = "SELECT n+1 AS m, n AS `n+1` FROM dn", .names = &[_][]const u8{ "m", "n+1" } },
+        .{ .dialect = .mysql, .sql = "SELECT *, n+1 FROM dn", .names = &[_][]const u8{ "id", "g", "s", "n", "n+1" } },
+        .{ .dialect = .mysql, .sql = "SELECT n+1, x.* FROM dn x", .names = &[_][]const u8{ "n+1", "id", "g", "s", "n" } },
+        .{ .dialect = .mysql, .sql = "SELECT * FROM (SELECT x.n + 1, 'x' FROM dn x) d", .names = &[_][]const u8{ "x.n + 1", "x" } },
+        .{ .dialect = .mysql, .sql = "SELECT d.`x.n + 1` FROM (SELECT x.n + 1 FROM dn x) d", .names = &[_][]const u8{"x.n + 1"} },
+        .{ .dialect = .mysql, .sql = "WITH c AS (SELECT n * 2 FROM dn) SELECT `n * 2` FROM c", .names = &[_][]const u8{"n * 2"} },
+        .{ .dialect = .mysql, .sql = "WITH c(k) AS (SELECT n * 2 FROM dn) SELECT * FROM c", .names = &[_][]const u8{"k"} },
+        // Only one column may carry a name, so a repeat takes a suffix.
+        .{ .dialect = .mysql, .sql = "SELECT n, 'n' FROM dn", .names = &[_][]const u8{ "n", "n_1" } },
+        .{ .dialect = .mysql, .sql = "SELECT e.n IS NULL, f.n IS NULL FROM dn e JOIN dn f ON e.id = f.id", .names = &[_][]const u8{ "e.n IS NULL", "f.n IS NULL" } },
+        .{ .dialect = .neutral, .sql = "SELECT g, COUNT(*), n % 2 FROM dn GROUP BY g, n % 2", .names = &[_][]const u8{ "g", "COUNT(*)", "n % 2" } },
+        .{ .dialect = .postgres, .sql = "SELECT n + 1, concat(s, 'x'), 1.5, CAST(n AS TEXT), -n, CASE WHEN n > 1 THEN 1 END FROM dn", .names = &[_][]const u8{ "?column?", "concat", "?column?_1", "n", "?column?_2", "case" } },
+        .{ .dialect = .postgres, .sql = "SELECT count(*), sum(n) + 1, (SELECT max(n) FROM dn) FROM dn", .names = &[_][]const u8{ "count", "?column?", "max" } },
+    };
+    inline for (cases) |c| {
+        var q = helpers.runSqlDialect(allocator, db, c.sql, c.dialect) catch |err| {
+            std.debug.print("case failed ({s}): {s}\n", .{ @errorName(err), c.sql });
+            return err;
+        };
+        defer q.deinit();
+        const schema = q.outputSchema();
+        try std.testing.expectEqual(c.names.len, schema.len);
+        for (schema, c.names) |col, name| try std.testing.expectEqualStrings(name, col.name);
+        while (try q.next()) |_| {}
+    }
+
+    // ORDER BY and GROUP BY reach an item by that name.
+    const ordered = try helpers.collectBigints(allocator, db, "SELECT n+1 FROM dn UNION ALL SELECT 5 ORDER BY `n+1`");
+    defer allocator.free(ordered);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 5, 6, 6 }, ordered);
+    const grouped = try helpers.collectBigints(allocator, db, "SELECT n+1, COUNT(*) FROM dn GROUP BY `n+1` ORDER BY `n+1` DESC");
+    defer allocator.free(grouped);
+    try std.testing.expectEqualSlices(i64, &.{ 6, 3, 2 }, grouped);
 }
 
 test "sql: CAST(expr AS type) and PG expr::type" {

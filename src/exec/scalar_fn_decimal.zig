@@ -513,6 +513,23 @@ pub fn textKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Ty
     }
 }
 
+/// HEX(decimal): the value rounded half away from zero to a BIGINT, which
+/// saturates, as MySQL converts a DECIMAL to an integer. An integer literal
+/// past BIGINT is a DECIMAL of scale 0 here but BIGINT UNSIGNED in MySQL
+/// up to 2^64 - 1, so a scale-0 value in that range keeps its bits.
+pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    const scale = scaleOf(arg_types[0]);
+    const factor = pow10(scale);
+    const ss = common.stringStoreOf(out);
+    var row: usize = 0;
+    while (row < n) : (row += 1) {
+        const whole = roundDiv(mantissaAt(args[0], row), factor);
+        const v = if (scale == 0) common.unsignedOrSaturatedBigint(whole) else common.saturateBigint(whole);
+        try common.appendBigintHex(allocator, ss, v);
+    }
+}
+
 pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     _ = out_type;
     const s = scaleOf(arg_types[0]);
