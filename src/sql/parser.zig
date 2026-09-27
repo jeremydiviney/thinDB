@@ -2319,10 +2319,10 @@ pub const Parser = struct {
         const cond = try self.parseBoolExpr();
         self.case_scope.reaches_every_row = false;
         try self.expect(.comma);
-        const then_expr = try self.parseCallArg();
+        const then_expr = try self.parseValueExpr();
         try self.expect(.comma);
         const else_expr = try self.arena.create(ir.Expr);
-        else_expr.* = try self.parseCallArg();
+        else_expr.* = try self.parseValueExpr();
         try self.expect(.rparen);
 
         const branches = try self.arena.alloc(ir.Expr.Branch, 1);
@@ -2332,7 +2332,8 @@ pub const Parser = struct {
 
     /// Whether the value starting at `cur` is a predicate: it opens with NOT
     /// or EXISTS, or a comparison, IS, IN, BETWEEN, LIKE, AND or OR sits
-    /// outside every parenthesis and CASE before the value ends.
+    /// outside every parenthesis and CASE before the value ends. A CASE
+    /// value ends at its WHEN, THEN, ELSE or END.
     fn predicateValueAhead(self: *Parser) ParseError!bool {
         if (self.cur.tag == .kw_not or self.cur.tag == .kw_exists) return true;
         var look = self.lex.*;
@@ -2346,7 +2347,7 @@ pub const Parser = struct {
                     depth -= 1;
                 },
                 .eof, .semicolon => return false,
-                .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into, .kw_on => {
+                .comma, .kw_when, .kw_then, .kw_else, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into, .kw_on => {
                     if (depth == 0) return false;
                 },
                 .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq, .kw_is, .kw_in, .kw_between, .kw_like, .kw_regexp, .kw_and, .amp_amp, .kw_or, .kw_not => {
@@ -3213,7 +3214,7 @@ pub const Parser = struct {
         errdefer self.abandonCase(outer);
         // Simple CASE (`CASE x WHEN v THEN ...`): each branch tests `x = v`,
         // so a NULL operand takes no WHEN.
-        const operand: ?ir.Expr = if (self.cur.tag == .kw_when) null else try self.parseCallArg();
+        const operand: ?ir.Expr = if (self.cur.tag == .kw_when) null else try self.parseValueExpr();
         if (self.cur.tag != .kw_when) return ParseError.SqlExpectedKeyword;
 
         var branches: std.ArrayList(ir.Expr.Branch) = .empty;
@@ -3222,14 +3223,14 @@ pub const Parser = struct {
         while (self.cur.tag == .kw_when) {
             try self.advance();
             const cond = if (operand) |x|
-                try parse_predicate.makeExprComparisonPredicate(self, x, .eq, try self.parseCallArg())
+                try parse_predicate.makeExprComparisonPredicate(self, x, .eq, try self.parseValueExpr())
             else
                 try self.parseBoolExpr();
             // Past the first WHEN, a row reaches only what no earlier WHEN took.
             self.case_scope.reaches_every_row = false;
             if (self.cur.tag != .kw_then) return ParseError.SqlExpectedKeyword;
             try self.advance();
-            const then_expr = try self.parseCallArg();
+            const then_expr = try self.parseValueExpr();
             try branches.append(self.arena, .{ .cond = cond, .then = then_expr });
         }
 
@@ -3237,7 +3238,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_else) {
             try self.advance();
             const eb = try self.arena.create(ir.Expr);
-            eb.* = try self.parseCallArg();
+            eb.* = try self.parseValueExpr();
             else_branch = eb;
         }
 
