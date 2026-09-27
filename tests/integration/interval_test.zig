@@ -247,17 +247,6 @@ test "INTERVAL: QUARTER is three months and WEEK is seven days" {
     }
 }
 
-fn collectInts(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i32 {
-    var q = try runSql(allocator, db, sql);
-    defer q.deinit();
-    var out: std.ArrayList(i32) = .empty;
-    errdefer out.deinit(allocator);
-    while (try q.next()) |batch| {
-        for (batch.values[0].data.int[0..batch.row_count]) |v| try out.append(allocator, v);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
 test "date unit functions know WEEK and QUARTER and reject unknown units" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -280,14 +269,14 @@ test "date unit functions know WEEK and QUARTER and reject unknown units" {
         try std.testing.expectEqualSlices(i32, &want, got);
     }
     const int_cases = .{
-        .{ "SELECT TIMESTAMPDIFF(WEEK, d, DATE '2024-06-30') AS r FROM t ORDER BY id", [_]i32{ 23, 21, 17 } },
-        .{ "SELECT TIMESTAMPDIFF(QUARTER, d, DATE '2024-07-15') AS r FROM t ORDER BY id", [_]i32{ 2, 1, 1 } },
+        .{ "SELECT TIMESTAMPDIFF(WEEK, d, DATE '2024-06-30') AS r FROM t ORDER BY id", [_]i64{ 23, 21, 17 } },
+        .{ "SELECT TIMESTAMPDIFF(QUARTER, d, DATE '2024-07-15') AS r FROM t ORDER BY id", [_]i64{ 2, 1, 1 } },
     };
     inline for (int_cases) |c| {
-        const got = try collectInts(allocator, db, c[0]);
+        const got = try helpers.collectBigints(allocator, db, c[0]);
         defer allocator.free(got);
-        const want: [3]i32 = c[1];
-        try std.testing.expectEqualSlices(i32, &want, got);
+        const want: [3]i64 = c[1];
+        try std.testing.expectEqualSlices(i64, &want, got);
     }
 
     // The unit is read when the kernel runs, so the error surfaces on the

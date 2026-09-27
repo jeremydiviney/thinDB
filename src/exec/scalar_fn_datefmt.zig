@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const common = @import("scalar_fn_common.zig");
+const time = @import("scalar_fn_time.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
@@ -246,6 +247,19 @@ pub fn formatHasTimePart(fmt: []const u8) bool {
     return false;
 }
 
+/// Whether a format names a year, month, week or weekday. A format with a
+/// time of day and none of these makes STR_TO_DATE a TIME, with any day of
+/// the month (`%d`, `%e`, `%D`) counted in hours, as MySQL does.
+pub fn formatHasDatePart(fmt: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < fmt.len) : (i += 1) {
+        if (fmt[i] != '%') continue;
+        i += 1;
+        if (std.mem.indexOfScalar(u8, "yYmcMbjuUvVxXwWa", fmt[i]) != null) return true;
+    }
+    return false;
+}
+
 const ParseState = struct {
     year: i32 = 0,
     month: i32 = 0,
@@ -407,14 +421,7 @@ fn mondayBased(sunday_first_index: usize) i32 {
 /// which MySQL answers with NULL too. Text left over after the format ends
 /// is ignored, as MySQL ignores it with a warning.
 pub fn parse(text: []const u8, fmt: []const u8) ?i64 {
-    var state: ParseState = .{};
-    var pos: usize = 0;
-    if (!scan(&state, text, &pos, fmt)) return null;
-
-    if (state.twelve_hour) {
-        if (state.hour < 1 or state.hour > 12) return null;
-        state.hour = @mod(state.hour, 12) + state.pm_offset;
-    }
+    var state = scanClock(text, fmt) orelse return null;
     var days: ?i32 = null;
     if (state.yearday > 0) days = common.ymdToDays(state.year, 1, 1) + state.yearday - 1;
     if (state.week_number >= 0 and state.weekday != 0) {
@@ -437,12 +444,82 @@ pub fn parse(text: []const u8, fmt: []const u8) ?i64 {
         state.day = ymd.day;
     }
 
-    if (state.year < 0 or state.year > 9999 or state.month < 1 or state.month > 12 or state.day < 1 or
-        state.hour > 23 or state.minute > 59 or state.second > 59) return null;
+    if (state.year < 0 or state.year > 9999 or state.month < 1 or state.month > 12 or state.day < 1) return null;
     if (state.day > common.lastDayOfMonth(state.year, @intCast(state.month))) return null;
     const date = common.ymdToDays(state.year, @intCast(state.month), @intCast(state.day));
     const seconds = (@as(i64, state.hour) * 60 + state.minute) * 60 + state.second;
     return @as(i64, date) * std.time.us_per_day + seconds * std.time.us_per_s + state.micro;
+}
+
+/// `text` walked under `fmt` with its time of day checked: hours 0-23
+/// (1-12 before a 12-hour clock's AM/PM applies), minutes and seconds 0-59.
+fn scanClock(text: []const u8, fmt: []const u8) ?ParseState {
+    var state: ParseState = .{};
+    var pos: usize = 0;
+    if (!scan(&state, text, &pos, fmt)) return null;
+    if (state.twelve_hour) {
+        if (state.hour < 1 or state.hour > 12) return null;
+        state.hour = @mod(state.hour, 12) + state.pm_offset;
+    }
+    if (state.hour > 23 or state.minute > 59 or state.second > 59) return null;
+    return state;
+}
+
+/// The TIME, in microseconds, that `text` spells under a format with no
+/// date part (`formatHasDatePart`): its day of the month counts 24 hours
+/// each. MySQL leaves such a sum past 838:59:59 unclamped, and so does this.
+pub fn parseClock(text: []const u8, fmt: []const u8) ?i64 {
+    const state = scanClock(text, fmt) orelse return null;
+    const hours = @as(i64, state.day) * 24 + state.hour;
+    const seconds = (hours * 60 + state.minute) * 60 + state.second;
+    return seconds * std.time.us_per_s + state.micro;
+}
+
+/// STR_TO_DATE(text, format) under a constant format with no date part: a
+/// TIME's text, with six fraction digits when the format reads them (`%f`).
+pub fn strToTimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    const text = stringViewOf(args[0]);
+    const fmt = stringViewOf(args[1]);
+    const ss = common.stringStoreOf(out);
+    var buf: [48]u8 = undefined;
+    for (0..row_count) |i| {
+        const micros = if (args[0].isValid(i) and args[1].isValid(i)) parseClock(text.rowBytes(i), fmt.rowBytes(i)) else null;
+        const fsp: u8 = if (std.mem.indexOf(u8, fmt.rowBytes(i), "%f") != null) 6 else 0;
+        try ss.appendValue(allocator, if (micros) |m| try time.formatTime(&buf, m, fsp) else "");
+        try out.appendValidBit(allocator, base + i, micros != null);
+    }
+}
+
+/// GET_FORMAT(kind, standard): the format string MySQL names for a DATE,
+/// TIME or DATETIME (TIMESTAMP) in the USA, JIS, ISO, EUR or INTERNAL
+/// standard; null for any other pair.
+pub fn getFormat(kind: []const u8, standard: []const u8) ?[]const u8 {
+    const kinds = [_][]const u8{ "date", "time", "datetime" };
+    const table = [_]struct { []const u8, [3][]const u8 }{
+        .{ "usa", .{ "%m.%d.%Y", "%h:%i:%s %p", "%Y-%m-%d %H.%i.%s" } },
+        .{ "jis", .{ "%Y-%m-%d", "%H:%i:%s", "%Y-%m-%d %H:%i:%s" } },
+        .{ "iso", .{ "%Y-%m-%d", "%H:%i:%s", "%Y-%m-%d %H:%i:%s" } },
+        .{ "eur", .{ "%d.%m.%Y", "%H.%i.%s", "%Y-%m-%d %H.%i.%s" } },
+        .{ "internal", .{ "%Y%m%d", "%H%i%s", "%Y%m%d%H%i%s" } },
+    };
+    const k = for (kinds, 0..) |name, idx| {
+        if (std.ascii.eqlIgnoreCase(kind, name)) break idx;
+    } else if (std.ascii.eqlIgnoreCase(kind, "timestamp")) 2 else return null;
+    for (table) |row| if (std.ascii.eqlIgnoreCase(standard, row[0])) return row[1][k];
+    return null;
+}
+
+pub fn getFormatKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    const kind = stringViewOf(args[0]);
+    const standard = stringViewOf(args[1]);
+    const ss = common.stringStoreOf(out);
+    for (0..row_count) |i| {
+        const f = if (args[0].isValid(i) and args[1].isValid(i)) getFormat(kind.rowBytes(i), standard.rowBytes(i)) else null;
+        try ss.appendValue(allocator, f orelse "");
+        try out.appendValidBit(allocator, base + i, f != null);
+    }
 }
 
 /// STR_TO_DATE(text, format) as a DATETIME; the parser narrows it to a DATE
