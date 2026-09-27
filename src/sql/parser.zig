@@ -105,8 +105,6 @@ pub const ParseError = error{
     /// A column list over a query that projects `*`: the names it renames
     /// are only known once the query binds.
     SqlColumnListOverStar,
-    /// A multi-table UPDATE assigning columns of more than one table.
-    SqlUpdateTargetsUnsupported,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -5301,38 +5299,44 @@ pub const Parser = struct {
     }
 
     /// UPDATE forms a filtered scan can't express, as a SELECT of each
-    /// candidate target's columns followed by the assignment values. SET
-    /// targets qualified by one table make it the target; unqualified ones
-    /// leave every named table a candidate, for compile to settle by which
-    /// holds the assigned columns.
+    /// candidate target's columns followed by the assignment values. When
+    /// every SET target is qualified, the tables they name are the targets;
+    /// otherwise every named table is a candidate, and compile settles each
+    /// unqualified assignment on the one that holds its column.
     fn parseUpdateSource(self: *Parser) ParseError!*ir.Op {
         const refs = try self.scanDmlTableRefs(.kw_set);
         try self.expect(.kw_set);
         var assigns: std.ArrayList(ir.Assignment) = .empty;
         var values: std.ArrayList([]const u8) = .empty;
-        var qualifier: ?[]const u8 = null;
+        var all_qualified = true;
         while (true) {
             var col = try self.dupedIdent();
+            var target: ?[]const u8 = null;
             if (self.cur.tag == .dot) {
                 try self.advance();
-                if (qualifier) |q| {
-                    if (!std.ascii.eqlIgnoreCase(q, col)) return ParseError.SqlUpdateTargetsUnsupported;
-                }
-                qualifier = col;
+                target = col;
                 col = try self.dupedIdent();
+            } else {
+                all_qualified = false;
             }
             try self.expect(.eq);
             try values.append(self.arena, try self.skipDmlValue());
             const value_name = try std.fmt.allocPrint(self.arena, "__set_{d}", .{assigns.items.len});
-            try assigns.append(self.arena, .{ .col = col, .value = .{ .col_ref = value_name } });
+            try assigns.append(self.arena, .{ .col = col, .value = .{ .col_ref = value_name }, .target = target });
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
         const tail = try self.skipDmlTail();
 
         var targets: std.ArrayList(ir.DmlTarget) = .empty;
-        if (qualifier) |q| {
-            try targets.append(self.arena, try dmlTarget(refs.tables, q));
+        if (all_qualified) {
+            next: for (assigns.items) |a| {
+                const target = try dmlTarget(refs.tables, a.target.?);
+                for (targets.items) |listed| {
+                    if (std.ascii.eqlIgnoreCase(listed.qualifier, target.qualifier)) continue :next;
+                }
+                try targets.append(self.arena, target);
+            }
         } else {
             for (refs.tables) |t| try targets.append(self.arena, .{ .table = t.table, .qualifier = t.alias orelse t.table.name });
         }

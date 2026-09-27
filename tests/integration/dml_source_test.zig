@@ -124,6 +124,27 @@ test "multi-table UPDATE writes the joined values" {
     }
 }
 
+test "multi-table UPDATE assigns each table it names" {
+    const allocator = std.testing.allocator;
+    inline for (.{ false, true }) |flush| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try openTables(allocator, std.testing.io, tmp.dir, flush);
+        defer db.close();
+
+        try std.testing.expectEqual(@as(u64, 4), try affectedRows(allocator, db, "UPDATE t JOIN u ON t.id = u.k SET t.v = u.w, u.w = u.w + 1"));
+        try expectInts(allocator, db, "SELECT v FROM t ORDER BY id", &.{ 10, 200, 30, 400, 50, 60 });
+        try expectInts(allocator, db, "SELECT w FROM u ORDER BY k", &.{ 201, 401, 900 });
+
+        // Unqualified targets each settle on the table that holds them.
+        try std.testing.expectEqual(@as(u64, 2), try affectedRows(allocator, db, "UPDATE t, u SET v = 0, w = 0 WHERE t.id = u.k AND u.k = 2"));
+        try expectInts(allocator, db, "SELECT v FROM t ORDER BY id", &.{ 10, 0, 30, 400, 50, 60 });
+        try expectInts(allocator, db, "SELECT w FROM u ORDER BY k", &.{ 0, 401, 900 });
+        try expectInts(allocator, db, "SELECT COUNT(*) FROM t", &.{6});
+        try expectInts(allocator, db, "SELECT COUNT(*) FROM u", &.{3});
+    }
+}
+
 test "multi-table DELETE removes each target's joined rows" {
     const allocator = std.testing.allocator;
     inline for (.{ false, true }) |flush| {
@@ -154,7 +175,7 @@ test "UPDATE and DELETE over a SELECT reject what a key can't resolve" {
     try expectRunError(allocator, db, "UPDATE t SET id = id + 10 ORDER BY id LIMIT 1", error.UnsupportedOp);
     try expectRunError(allocator, db, "UPDATE evt SET val = 0 ORDER BY ts LIMIT 1", error.UnsupportedOp);
     try expectRunError(allocator, db, "DELETE FROM evt ORDER BY ts LIMIT 1", error.UnsupportedOp);
-    try expectRunError(allocator, db, "UPDATE t JOIN u ON t.id = u.k SET t.v = 1, u.w = 2", error.SqlUpdateTargetsUnsupported);
+    try expectRunError(allocator, db, "UPDATE t a JOIN t b ON a.id = b.id SET v = 1", error.BadRequest);
     try expectRunError(allocator, db, "UPDATE t JOIN u ON t.id = u.k SET nope = 1", error.ColumnNotFound);
     try expectInts(allocator, db, "SELECT v FROM t ORDER BY id", &.{ 10, 20, 30, 40, 50, 60 });
     try expectInts(allocator, db, "SELECT COUNT(*) FROM evt", &.{2});
