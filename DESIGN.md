@@ -156,9 +156,15 @@ DECIMAL column stays DECIMAL. MySQL, StarRocks and DuckDB type literals the
 same way. The tree carries the literal as its digits cast to its own type
 (`expr.decimalLiteral`), and Compute folds that into one typed constant.
 Beside a DOUBLE operand the literal converts to DOUBLE, as any decimal does.
-A comparison reads it as the double nearest its digits. That double lands
-exactly on a decimal or integer column (see DOUBLE to DECIMAL below), so
-`x > 1.5` stays a leaf and keeps zonemap pruning. The exponent form
+A comparison reads it as the double nearest its digits when that double
+prints as those digits, as it does for any literal of up to 15 significant
+digits. That double lands exactly on a decimal or integer column (see DOUBLE
+to DECIMAL below), so `x > 1.5` stays a leaf and keeps zonemap pruning. A
+longer literal no double holds (`123456789012345678.5`) compares as the
+exact decimal it is, without pruning. An INSERT's literal row writes such a
+literal as its digits, which a DECIMAL column reads exactly; rows with an
+expression cell are read as expressions, where every fraction is its
+DECIMAL. The exponent form
 (`1e3`, `2.5E-3`, `6.02e+23`) is DOUBLE, and so is a literal of more than
 38 digits. A literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
 An integer literal past BIGINT is DECIMAL(n,0) of its digits, and DOUBLE past
@@ -1027,7 +1033,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `DatabaseInUse` means another catalog owns the root's OS lock. `TableBusy` rejects an unsafe same-thread upgrade from a live query lease to destructive DDL. `DatabaseClosed` rejects new operations during close. `DurabilityUncertain` means a file replacement succeeded but parent-directory sync failed. The affected table/catalog is fenced at the persistence boundary, before releasing the mutation lock; queued writers recheck that state after acquiring the table lock. `RecoveryRequired` means that publication or an XA persistence/rollback outcome requires restart recovery; operations are rejected until reopening resolves the journal. XA admission rejects records exceeding its 64 MiB serialized recovery limit (`XaBranchTooLarge`) or invalid XIDs (`XaInvalidXid`, at most 1024 bytes).
 
-Errors propagate to callers. Outside the XA commit protocol, an error is not a blanket guarantee that no effect occurred: durable publication can succeed before later cleanup fails. Retrying non-idempotent writes after an I/O error requires inspecting/recovering the state. Ordinary SQL BEGIN/COMMIT/ROLLBACK currently maintain protocol session status, not a multi-statement undo transaction. For the same reason the MySQL dialect accepts SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT, LOCK/UNLOCK TABLES and FLUSH as statements without effect; ANALYZE/OPTIMIZE/CHECK/REPAIR TABLE answer MySQL's status rows without doing work, since there are no optimizer statistics to gather and compaction runs on its own. SQL-level PREPARE/EXECUTE is rejected (`SqlPrepareExecuteUnsupported`); prepared statements go through the binary protocol. MySQL's SELECT hints (STRAIGHT_JOIN, SQL_NO_CACHE, HIGH_PRIORITY, index hints, `/*+ … */`) are ignored, since the plan follows the written order anyway; SQL_CALC_FOUND_ROWS is ignored too, but FOUND_ROWS() is rejected (`SqlFoundRowsUnsupported`) rather than answering a count the session never kept.
+Errors propagate to callers. Outside the XA commit protocol, an error is not a blanket guarantee that no effect occurred: durable publication can succeed before later cleanup fails. Retrying non-idempotent writes after an I/O error requires inspecting/recovering the state. A statement's own failure is narrower: an INSERT whose source query fails part way, or one of whose rows the table refuses, leaves no rows behind, since its rows are gathered and the table validates the batch whole before taking any of it. The guarantee holds up to 64 MiB of gathered rows; a larger INSERT ... SELECT writes what it gathered and streams the rest, keeping what it wrote if a later batch fails. A CTAS whose query fails drops the table it created. Ordinary SQL BEGIN/COMMIT/ROLLBACK currently maintain protocol session status, not a multi-statement undo transaction. For the same reason the MySQL dialect accepts SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT, LOCK/UNLOCK TABLES and FLUSH as statements without effect; ANALYZE/OPTIMIZE/CHECK/REPAIR TABLE answer MySQL's status rows without doing work, since there are no optimizer statistics to gather and compaction runs on its own. SQL-level PREPARE/EXECUTE is rejected (`SqlPrepareExecuteUnsupported`); prepared statements go through the binary protocol. MySQL's SELECT hints (STRAIGHT_JOIN, SQL_NO_CACHE, HIGH_PRIORITY, index hints, `/*+ … */`) are ignored, since the plan follows the written order anyway; SQL_CALC_FOUND_ROWS is ignored too, but FOUND_ROWS() is rejected (`SqlFoundRowsUnsupported`) rather than answering a count the session never kept.
 
 ---
 

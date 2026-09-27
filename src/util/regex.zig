@@ -7,7 +7,8 @@
 //!   with ranges, shorthands `\d \w \s \D \W \S`, escapes (`\.` `\n`
 //!   `\t` `\\` etc), quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy
 //!   `*? +? ??`), alternation `|`, capturing `( )` and non-capturing
-//!   `(?: )` groups, anchors `^ $`, word boundaries `\b \B`.
+//!   `(?: )` groups, anchors `^ $` (the text's start and end, or any
+//!   line's with `Options.multiline`), word boundaries `\b \B`.
 //!
 //! NOT supported (require backtracking — same omissions as RE2):
 //!   in-pattern backreferences, lookahead/lookbehind. Backreferences in
@@ -29,6 +30,9 @@ pub const Options = struct {
     case_insensitive: bool = false,
     /// `.` matches '\n' too.
     dot_all: bool = false,
+    /// `^` and `$` also match just after and just before a '\n', not
+    /// only at the text's start and end.
+    multiline: bool = false,
 };
 
 /// 256-bit set of matchable bytes.
@@ -583,9 +587,11 @@ pub const Regex = struct {
     prog: []Inst,
     n_slots: u32, // 2 * (n_groups + 1)
     allocator: Allocator,
+    /// `Options.multiline`: `.bol`/`.eol` hold at line breaks too.
+    multiline: bool,
     /// True when the program is `^`-anchored at the start (prog[1] is a
     /// `.bol` — no top-level alternation). Lets `find` seed the start
-    /// thread only at line boundaries instead of at every position, which
+    /// thread only where `.bol` holds instead of at every position, which
     /// is the dominant per-row cost for anchored patterns over many rows.
     anchored_start: bool,
     /// True when the program contains a `\b`/`\B` assertion. These make a
@@ -668,6 +674,7 @@ pub const Regex = struct {
             .prog = prog,
             .n_slots = 2 * parser.next_group,
             .allocator = allocator,
+            .multiline = options.multiline,
             .anchored_start = anchored_start,
             .has_wordbound = has_wordbound,
             .loopy = loopy,
@@ -739,7 +746,7 @@ pub const Regex = struct {
         if (scratch.dfa == null or scratch.dfa_prog != @intFromPtr(self.prog.ptr)) {
             if (scratch.dfa) |*d| d.deinit();
             scratch.dfa = null;
-            scratch.dfa = try Dfa.init(scratch.backing, self.prog);
+            scratch.dfa = try Dfa.init(scratch.backing, self.prog, self.multiline);
             scratch.dfa_prog = @intFromPtr(self.prog.ptr);
         }
         return scratch.dfa.?.matches(input, start);
@@ -756,6 +763,7 @@ pub const Regex = struct {
         const VM = struct {
             prog: []const Inst,
             input: []const u8,
+            multiline: bool,
             caps_alloc: Allocator,
             list_alloc: Allocator,
             visited: []u32,
@@ -777,8 +785,8 @@ pub const Regex = struct {
                         caps2[slot] = pos;
                         try vm.addThread(list, pc + 1, pos, caps2);
                     },
-                    .bol => if (pos == 0 or vm.input[pos - 1] == '\n') try vm.addThread(list, pc + 1, pos, caps),
-                    .eol => if (pos == vm.input.len or vm.input[pos] == '\n') try vm.addThread(list, pc + 1, pos, caps),
+                    .bol => if (pos == 0 or (vm.multiline and vm.input[pos - 1] == '\n')) try vm.addThread(list, pc + 1, pos, caps),
+                    .eol => if (pos == vm.input.len or (vm.multiline and vm.input[pos] == '\n')) try vm.addThread(list, pc + 1, pos, caps),
                     .word_boundary, .not_word_boundary => {
                         const before = pos > 0 and isWordByte(vm.input[pos - 1]);
                         const after = pos < vm.input.len and isWordByte(vm.input[pos]);
@@ -794,6 +802,7 @@ pub const Regex = struct {
         var vm = VM{
             .prog = self.prog,
             .input = input,
+            .multiline = self.multiline,
             .caps_alloc = scratch.arena.allocator(),
             .list_alloc = scratch.backing,
             .visited = scratch.visited,
@@ -832,10 +841,10 @@ pub const Regex = struct {
             for (carried.items) |t| try vm.addThread(clist, t.pc, sp, t.caps);
             // Seed an unanchored start thread at the lowest priority until a
             // match begins, so an earlier-starting match wins (leftmost). For
-            // a `^`-anchored program the seed can only survive at a line
-            // boundary, so skip it everywhere else — this removes the
+            // a `^`-anchored program the seed can only survive where `.bol`
+            // holds, so skip it everywhere else — this removes the
             // per-position seed work that otherwise dominates anchored scans.
-            if (matched == null and (!self.anchored_start or sp == 0 or input[sp - 1] == '\n')) {
+            if (matched == null and (!self.anchored_start or sp == 0 or (self.multiline and input[sp - 1] == '\n'))) {
                 try vm.addThread(clist, 0, sp, seed);
             }
             carried.clearRetainingCapacity();
@@ -1098,7 +1107,8 @@ fn afterMatch(input: []const u8, m_start: usize, m_end: usize) usize {
 //
 // Subset construction over the compiled program, built lazily: a DFA state is
 // the (sorted, deduped) set of instruction pointers alive after consuming the
-// previous byte, plus a "previous byte was '\n'" flag that resolves `.bol`.
+// previous byte, plus a flag that resolves `.bol`: at the text's start, or,
+// multiline, just after a '\n'.
 // Transitions are built on first use per (state, byte-class); `.eol` resolves
 // against the byte being consumed (or EOF) and `.save` is plain epsilon. The
 // DFA recognizes exactly the language the Pike VM does — it answers "does a
@@ -1157,11 +1167,13 @@ pub const Dfa = struct {
     stack: std.ArrayListUnmanaged(u32) = .empty,
     next_pcs: std.ArrayListUnmanaged(u32) = .empty,
     failed: bool = false,
+    multiline: bool,
 
-    fn init(backing: Allocator, prog: []const Inst) Error!Dfa {
+    fn init(backing: Allocator, prog: []const Inst, multiline: bool) Error!Dfa {
         var d = Dfa{
             .allocator = backing,
             .prog = prog,
+            .multiline = multiline,
             .visited = try backing.alloc(u32, prog.len),
         };
         @memset(d.visited, 0);
@@ -1228,7 +1240,7 @@ pub const Dfa = struct {
     /// (caller must use the VM).
     pub fn matches(self: *Dfa, input: []const u8, start: usize) Error!?bool {
         if (self.failed) return null;
-        const prev_nl = start == 0 or input[start - 1] == '\n';
+        const prev_nl = start == 0 or (self.multiline and input[start - 1] == '\n');
         var sid = (try self.stateFor(&.{}, prev_nl)) orelse return null;
         var sp = start;
         while (sp < input.len) {
@@ -1289,7 +1301,7 @@ pub const Dfa = struct {
                 },
                 .save => try self.stack.append(self.allocator, pc + 1),
                 .bol => if (st.prev_nl) try self.stack.append(self.allocator, pc + 1),
-                .eol => if (b == null or b.? == '\n') try self.stack.append(self.allocator, pc + 1),
+                .eol => if (b == null or (self.multiline and b.? == '\n')) try self.stack.append(self.allocator, pc + 1),
                 // Never compiled into a DFA-eligible program (dfaMatches
                 // declines has_wordbound patterns before building one).
                 .word_boundary, .not_word_boundary => unreachable,
@@ -1305,7 +1317,7 @@ pub const Dfa = struct {
     fn computeTransition(self: *Dfa, sid: DfaId, b: u8) Error!?DfaId {
         if (try self.closureWalk(sid, b)) return DFA_ACCEPT;
         std.mem.sort(u32, self.next_pcs.items, {}, std.sort.asc(u32));
-        return self.stateFor(self.next_pcs.items, b == '\n');
+        return self.stateFor(self.next_pcs.items, self.multiline and b == '\n');
     }
 
     fn stateFor(self: *Dfa, pcs: []const u32, prev_nl: bool) Error!?DfaId {
@@ -1594,6 +1606,27 @@ test "regex: options fold ASCII case and let dot cross newlines" {
         .{ "[^b]", Options{ .case_insensitive = true }, "B", false },
         .{ "a.b", Options{}, "a\nb", false },
         .{ "a.b", Options{ .dot_all = true }, "a\nb", true },
+    };
+    inline for (cases) |c| try expectMatchWith(c[0], c[1], c[2], c[3]);
+}
+
+test "regex: ^ and $ hold at the text's ends, and at line ends when multiline" {
+    const ml = Options{ .multiline = true };
+    const cases = .{
+        .{ "^b", Options{}, "a\nb", false },
+        .{ "^b", ml, "a\nb", true },
+        .{ "a$", Options{}, "a\nb", false },
+        .{ "a$", ml, "a\nb", true },
+        .{ "^a$", Options{}, "a\n", false },
+        .{ "^a$", ml, "a\n", true },
+        .{ "^a", Options{}, "a\nb", true },
+        .{ "b$", Options{}, "a\nb", true },
+        .{ "x|^b", Options{}, "a\nb", false },
+        .{ "x|^b", ml, "a\nb", true },
+        .{ "c$|x", Options{}, "c\nd", false },
+        .{ "c$|x", ml, "c\nd", true },
+        .{ "^[a-z]+$", Options{}, "ab\ncd", false },
+        .{ "^[a-z]+$", ml, "ab\ncd", true },
     };
     inline for (cases) |c| try expectMatchWith(c[0], c[1], c[2], c[3]);
 }

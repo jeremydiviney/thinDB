@@ -399,6 +399,9 @@ const SessionState = struct {
             .vars = self.vars,
             .last_insert_id = self.last_insert_id,
             .row_count = self.row_count,
+            .connection_id = self.backend_id,
+            .user = handshake.reported_user,
+            .server_version = handshake.server_version,
         };
     }
 
@@ -1295,6 +1298,8 @@ fn sendSyntheticWorkbenchSelect(
     defer cols.deinit(allocator);
     var cells = std.ArrayList(?[]const u8).empty;
     defer cells.deinit(allocator);
+    var id_buf: [10]u8 = undefined;
+    const connection_id = std.fmt.bufPrint(&id_buf, "{d}", .{session.backend_id}) catch unreachable;
 
     var start: usize = 0;
     while (start < select_list.len) {
@@ -1308,7 +1313,7 @@ fn sendSyntheticWorkbenchSelect(
             // the WHOLE statement to the engine, which answers FROM-less
             // SELECTs with proper values and types. Answering "" here (the
             // old fallback) silently lost values.
-            const value = syntheticSelectValue(expr, session.current_schema) orelse return false;
+            const value = syntheticSelectValue(expr, session.current_schema, connection_id) orelse return false;
             const col_name = stripIdentifierQuotes(stripAlias(orig_raw).alias orelse orig_raw);
             try cols.append(allocator, .{ .name = col_name, .type = .string, .nullable = value == .null_value });
             try cells.append(allocator, switch (value) {
@@ -1403,7 +1408,7 @@ const SyntheticValue = union(enum) { text: []const u8, null_value };
 /// evaluates FROM-less SELECTs with real values and types). This layer only
 /// exists for the multi-column `@@var` init probes drivers send, which the
 /// engine has no system-variable support for.
-fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8) ?SyntheticValue {
+fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8, connection_id: []const u8) ?SyntheticValue {
     const expr = std.mem.trim(u8, expr_in, " \t\r\n");
     if (std.mem.eql(u8, expr, "null")) return .null_value;
 
@@ -1417,9 +1422,9 @@ fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8) ?Synthe
         std.mem.eql(u8, expr, "current_user()") or
         std.mem.eql(u8, expr, "session_user()") or
         std.mem.eql(u8, expr, "system_user()"))
-        return .{ .text = "thindb@localhost" };
-    if (std.mem.eql(u8, expr, "connection_id()")) return .{ .text = "1" };
-    if (std.mem.eql(u8, expr, "connection_id")) return .{ .text = "1" };
+        return .{ .text = handshake.reported_user };
+    if (std.mem.eql(u8, expr, "connection_id()")) return .{ .text = connection_id };
+    if (std.mem.eql(u8, expr, "connection_id")) return .{ .text = connection_id };
 
     return null;
 }

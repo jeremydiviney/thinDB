@@ -2728,9 +2728,12 @@ test "sql: aggregate-inside-scalar goes through overload resolution" {
     _ = try seedT(db);
 
     // The aggregate hoists to a hidden output; sqrt() then has no text
-    // overload, so this fails at resolution, not at parse.
-    const res = runSql(allocator, db, "SELECT sqrt(max(tag)) FROM t");
-    try std.testing.expectError(error.ComputeNoSuchOverload, res);
+    // overload, so resolution reads the text 'c' as a number (0), as MySQL
+    // does.
+    var q = try runSql(allocator, db, "SELECT sqrt(max(tag)) FROM t");
+    defer q.deinit();
+    const b = (try q.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f64, 0), b.values[0].data.double[0]);
 }
 
 test "sql: scalar functions over grouped keys are allowed alongside aggregates" {

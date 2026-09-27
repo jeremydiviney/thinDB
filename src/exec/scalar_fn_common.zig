@@ -262,39 +262,30 @@ pub fn roundHalfEven(x: f64) f64 {
     return if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x);
 }
 
-/// A double as MySQL converts it to BIGINT: rounded half to even, then
-/// pinned to the nearer end of the range when past it.
-pub fn doubleToBigint(x: f64) i64 {
+/// A double where MySQL reads it as a BIGINT (`HEX(2.5e0)`): rounded half
+/// to even, and clamped to the BIGINT range.
+pub fn doubleAsBigint(x: f64) i64 {
+    if (std.math.isNan(x)) return 0;
     const r = roundHalfEven(x);
-    if (std.math.isNan(r)) return 0;
     if (r >= 0x1p63) return std.math.maxInt(i64);
     if (r < -0x1p63) return std.math.minInt(i64);
     return @intFromFloat(r);
 }
 
-/// An integer past the BIGINT range pinned to its nearer end, as MySQL
-/// converts a DECIMAL to BIGINT.
-pub fn saturateBigint(v: i128) i64 {
-    return std.math.cast(i64, v) orelse if (v < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+/// HEX of a number, as MySQL prints it: the uppercase digits of the
+/// BIGINT's 64 bits, so a negative value shows its two's complement.
+pub fn integerHex(buf: *[16]u8, v: i64) []const u8 {
+    return std.fmt.bufPrint(buf, "{X}", .{@as(u64, @bitCast(v))}) catch unreachable;
 }
 
-/// An integer where MySQL's HEX reads one: a value from 2^63 to 2^64 - 1
-/// keeps its low 64 bits, as MySQL types an integer literal that large
-/// BIGINT UNSIGNED; any other value past BIGINT saturates.
-pub fn unsignedOrSaturatedBigint(v: i128) i64 {
+/// A wide integer where MySQL's HEX reads a BIGINT: a value from 2^63 to
+/// 2^64 - 1 keeps its low 64 bits, as MySQL types an integer literal that
+/// large BIGINT UNSIGNED; any other value past BIGINT is clamped to it.
+pub fn wideIntegerAsBigint(v: i128) i64 {
     if (v > std.math.maxInt(i64)) {
         if (std.math.cast(u64, v)) |u| return @bitCast(u);
     }
-    return saturateBigint(v);
-}
-
-/// MySQL's HEX of a number: the BIGINT it converts to, printed as its
-/// 64-bit two's-complement pattern in uppercase digits.
-pub fn appendBigintHex(allocator: std.mem.Allocator, ss: *store.StringStore, v: i64) !void {
-    var buf: [16]u8 = undefined;
-    const bits: u64 = @bitCast(v);
-    // 16 hex digits always hold a u64.
-    try ss.appendValue(allocator, std.fmt.bufPrint(&buf, "{X}", .{bits}) catch unreachable);
+    return std.math.cast(i64, v) orelse if (v < 0) std.math.minInt(i64) else std.math.maxInt(i64);
 }
 
 /// Text as an integer, the way StarRocks casts it to one: surrounding
@@ -325,6 +316,79 @@ pub fn textBoolean(raw: []const u8) ?bool {
         .exact => |d| d.m != 0,
         .float => |f| f != 0,
     };
+}
+
+/// Text where MySQL expects a DOUBLE and no CAST was written: the longest
+/// number the text starts with after any whitespace, its exponent kept only
+/// when digits follow the `e`; 0 when it starts with none (`'3abc'` is 3,
+/// `'abc'` is 0). Past the double range it is the largest finite double of
+/// its sign.
+pub fn leadingDouble(raw: []const u8) f64 {
+    var i: usize = 0;
+    while (i < raw.len and std.ascii.isWhitespace(raw[i])) i += 1;
+    const start = i;
+    if (i < raw.len and (raw[i] == '-' or raw[i] == '+')) i += 1;
+    var digits: usize = 0;
+    while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) digits += 1;
+    if (i < raw.len and raw[i] == '.') {
+        i += 1;
+        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) digits += 1;
+    }
+    if (digits == 0) return 0;
+    if (i < raw.len and (raw[i] == 'e' or raw[i] == 'E')) {
+        var j = i + 1;
+        if (j < raw.len and (raw[j] == '-' or raw[j] == '+')) j += 1;
+        const exponent_start = j;
+        while (j < raw.len and std.ascii.isDigit(raw[j])) j += 1;
+        if (j > exponent_start) i = j;
+    }
+    const x = std.fmt.parseFloat(f64, raw[start..i]) catch return 0;
+    if (std.math.isInf(x)) return std.math.copysign(std.math.floatMax(f64), x);
+    return x;
+}
+
+/// Text where MySQL expects an integer and no CAST was written: after any
+/// spaces and tabs, an optional sign and the digits that follow, so a
+/// fraction or an exponent is cut off (`'2.7'` is 2, `'1e3'` is 1) and text
+/// with no leading digits is 0. As in MySQL, a magnitude past 64 bits
+/// saturates and a positive one past BIGINT reads as its unsigned bits.
+pub fn leadingInteger(raw: []const u8) i64 {
+    var i: usize = 0;
+    while (i < raw.len and (raw[i] == ' ' or raw[i] == '\t')) i += 1;
+    const negative = i < raw.len and raw[i] == '-';
+    if (i < raw.len and (raw[i] == '-' or raw[i] == '+')) i += 1;
+    var magnitude: u64 = 0;
+    while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {
+        magnitude = std.math.mul(u64, magnitude, 10) catch std.math.maxInt(u64);
+        magnitude = std.math.add(u64, magnitude, raw[i] - '0') catch std.math.maxInt(u64);
+    }
+    if (!negative) return @bitCast(magnitude);
+    if (magnitude >= @as(u64, 1) << 63) return std.math.minInt(i64);
+    return -@as(i64, @intCast(magnitude));
+}
+
+test "leading numbers: what MySQL reads where a number is expected" {
+    const t = std.testing;
+    const doubles = .{
+        .{ "3abc", 3.0 },    .{ "abc", 0.0 }, .{ "", 0.0 },     .{ " 12 ", 12.0 },
+        .{ "\n2", 2.0 },     .{ "+3", 3.0 },  .{ "0x10", 0.0 }, .{ ".5", 0.5 },
+        .{ "5.", 5.0 },      .{ "1e", 1.0 },  .{ "1e+", 1.0 },  .{ "-.5e1x", -5.0 },
+        .{ "1.5e2", 150.0 }, .{ "inf", 0.0 }, .{ "-", 0.0 },    .{ ".", 0.0 },
+        .{ "1_0", 1.0 },
+    };
+    inline for (doubles) |c| try t.expectEqual(@as(f64, c[1]), leadingDouble(c[0]));
+    try t.expectEqual(std.math.floatMax(f64), leadingDouble("1e400"));
+    try t.expectEqual(-std.math.floatMax(f64), leadingDouble("-1e400"));
+
+    const integers = .{
+        .{ "3", 3 },                                        .{ "2.7", 2 },                                    .{ " 3", 3 },
+        .{ "\t2", 2 },                                      .{ "\n2", 0 },                                    .{ "3abc", 3 },
+        .{ "abc", 0 },                                      .{ "1e1", 1 },                                    .{ "-1", -1 },
+        .{ "+4", 4 },                                       .{ "", 0 },                                       .{ "-9223372036854775808", std.math.minInt(i64) },
+        .{ "9223372036854775807", std.math.maxInt(i64) },   .{ "9223372036854775808", std.math.minInt(i64) }, .{ "99999999999999999999", -1 },
+        .{ "-99999999999999999999", std.math.minInt(i64) },
+    };
+    inline for (integers) |c| try t.expectEqual(@as(i64, c[1]), leadingInteger(c[0]));
 }
 
 test "text as a number: what StarRocks casts, and nothing else" {

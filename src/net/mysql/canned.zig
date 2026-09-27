@@ -169,7 +169,7 @@ pub fn match(
         return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "database()"), .val = current_schema } };
     }
     if (std.mem.eql(u8, lc, "select user()") or std.mem.eql(u8, lc, "select current_user()"))
-        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "user()"), .val = "thindb@localhost" } };
+        return Outcome{ .single_value = .{ .col = selectExprLabel(sql, "user()"), .val = handshake.reported_user } };
 
     if (isShowVariables(lc)) {
         if (std.mem.indexOf(u8, lc, "sql_mode") != null)

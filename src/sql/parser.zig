@@ -243,6 +243,8 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_truncate => "truncate",
         .kw_insert => "insert",
         .kw_interval => "interval",
+        .kw_database => "database",
+        .kw_schema => "schema",
         else => null,
     };
 }
@@ -726,6 +728,17 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Whether `tag` opens a query: SELECT, WITH, and MySQL's VALUES and
+    /// TABLE statements. In an ON DUPLICATE KEY UPDATE, `VALUES(col)` is
+    /// the inserted-value function instead.
+    pub fn startsQuery(self: *const Parser, tag: TokenTag) bool {
+        return switch (tag) {
+            .kw_select, .kw_with, .kw_table => true,
+            .kw_values => !self.insert_values_refs,
+            else => false,
+        };
+    }
+
     pub fn expect(self: *Parser, tag: TokenTag) ParseError!void {
         if (self.cur.tag != tag) return ParseError.SqlExpectedToken;
         try self.advance();
@@ -848,7 +861,12 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_with) {
             try self.parseCteList();
         }
-        if (self.cur.tag != .kw_select) return ParseError.SqlExpectedSelect;
+        switch (self.cur.tag) {
+            .kw_values => return try self.parseValuesStatement(union_arm),
+            .kw_table => return try self.parseTableStatement(union_arm),
+            .kw_select => {},
+            else => return ParseError.SqlExpectedSelect,
+        }
         try self.advance();
 
         // Optional DISTINCT — desugars to grouping on every projected item
@@ -1429,6 +1447,61 @@ pub const Parser = struct {
         return query;
     }
 
+    /// `VALUES [ROW](expr, ...), ...`: a table of constant rows, standing
+    /// wherever a SELECT can. Columns are named as MySQL names them,
+    /// column_0 onward; PostgreSQL's column1 onward in its dialect.
+    fn parseValuesStatement(self: *Parser, union_arm: bool) ParseError!*ir.Op {
+        try self.advance();
+        var rows: std.ArrayList([]const ir.Expr) = .empty;
+        var width: ?usize = null;
+        while (true) {
+            if (self.cur.tag == .kw_row) try self.advance();
+            try self.expect(.lparen);
+            var cells: std.ArrayList(ir.Expr) = .empty;
+            while (true) {
+                try cells.append(self.arena, try self.parseValueExpr());
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+            try self.expect(.rparen);
+            if (cells.items.len != (width orelse cells.items.len)) return ParseError.SqlRowValueWidthMismatch;
+            width = cells.items.len;
+            try rows.append(self.arena, cells.items);
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        const output = try self.arena.alloc(ProjItem, width.?);
+        const names = try self.arena.alloc([]const u8, width.?);
+        for (output, names, 0..) |*item, *name, i| {
+            name.* = if (self.lex.dialect == .postgres)
+                try std.fmt.allocPrint(self.arena, "column{d}", .{i + 1})
+            else
+                try std.fmt.allocPrint(self.arena, "column_{d}", .{i});
+            item.* = .{ .name = name.*, .kind = .{ .col = name.* } };
+        }
+        return try self.finishQueryOperand(try parse_ddl.valuesQuery(self, rows.items, names), output, &.{}, union_arm);
+    }
+
+    /// `TABLE t`: MySQL's short form of `SELECT * FROM t`.
+    fn parseTableStatement(self: *Parser, union_arm: bool) ParseError!*ir.Op {
+        try self.advance();
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const target = try self.parseFromTarget();
+        const output = try self.arena.dupe(ProjItem, &.{.{ .name = "*", .kind = .{ .star = null } }});
+        const inputs = try self.arena.dupe(ChainInput, &.{.{ .name = target.name, .op = target.op }});
+        return try self.finishQueryOperand(target.op, output, inputs, union_arm);
+    }
+
+    /// A query operand with no clauses of its own: a UNION arm as is, else
+    /// the chain it leads with the ORDER BY / LIMIT over it.
+    fn finishQueryOperand(self: *Parser, operand: *ir.Op, output: []const ProjItem, inputs: []const ChainInput, union_arm: bool) ParseError!*ir.Op {
+        if (union_arm) return operand;
+        const query = try self.parseSetOpTail(operand, output, inputs, true);
+        self.select_output = output;
+        self.select_inputs = inputs;
+        return query;
+    }
+
     /// MySQL's `DUAL`: the one-row source of a FROM-less SELECT. A
     /// backquoted `dual` still names a table.
     fn atDual(self: *const Parser) bool {
@@ -1829,12 +1902,12 @@ pub const Parser = struct {
             return try self.namedExprItem(item_start, expr);
         }
 
-        // Literal at projection start: `SELECT 1`, `SELECT 'x'`,
-        // `SELECT 1 + 2`. Route through the expression parser so binary
-        // operators and aliasing work. (`GROUP BY 1` then references it
-        // as ordinal 1.)
+        // Literal or user variable at projection start: `SELECT 1`,
+        // `SELECT 'x'`, `SELECT 1 + 2`, `SELECT @w`. Route through the
+        // expression parser so binary operators and aliasing work.
+        // (`GROUP BY 1` then references it as ordinal 1.)
         switch (self.cur.tag) {
-            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
+            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier => {
                 const expr = try self.parseScalar();
                 return try self.namedExprItem(item_start, expr);
             },
@@ -3162,7 +3235,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_exists) {
             try self.advance();
             try self.expect(.lparen);
-            if (self.cur.tag != .kw_select and self.cur.tag != .kw_with) return ParseError.SqlExpectedSelect;
+            if (!self.startsQuery(self.cur.tag)) return ParseError.SqlExpectedSelect;
             const source = try self.parseStatement();
             try self.expect(.rparen);
             return ir.Expr{ .exists_subquery = @ptrCast(source) };
@@ -3265,7 +3338,7 @@ pub const Parser = struct {
                 // as a scalar_subquery node; everything else recurses
                 // through the binary expression parser.
                 try self.advance();
-                if (self.cur.tag == .kw_select or self.cur.tag == .kw_with) {
+                if (self.startsQuery(self.cur.tag)) {
                     const source = try self.parseStatement();
                     try self.expect(.rparen);
                     return ir.Expr{ .scalar_subquery = @ptrCast(source) };
@@ -3408,21 +3481,26 @@ pub const Parser = struct {
         };
     }
 
+    /// A select-list item's `[AS] alias`, or `fallback` when none follows.
+    /// The AS is optional, as in MySQL/StarRocks; keywords such as FROM
+    /// are not identifiers, so an item's end is never read as its alias.
+    /// On MySQL a string names the column too (`1 'a'`, `1 AS "a"`, where
+    /// `"a"` is a string). MySQL allows that only here, never for a table.
     fn maybeAlias(self: *Parser, fallback: []const u8) ParseError![]const u8 {
-        if (self.cur.tag == .kw_as) {
+        const explicit = self.cur.tag == .kw_as;
+        if (explicit) try self.advance();
+        if (self.cur.tag == .string and self.lex.dialect == .mysql) {
+            const name = self.cur.value.string;
+            if (name.len == 0) return ParseError.SqlExpectedIdent;
             try self.advance();
-            const name = try self.expectIdent();
             return try self.arena.dupe(u8, name);
         }
-        // Implicit alias: `expr alias_ident` (no AS keyword) — common
-        // in MySQL/StarRocks. Only if next token is a bare identifier.
         if (self.cur.tag == .identifier) {
-            // But we have to be careful — keywords like FROM are NOT
-            // identifiers, so the lookahead naturally stops at them.
             const name = self.cur.text;
             try self.advance();
             return try self.arena.dupe(u8, name);
         }
+        if (explicit) return ParseError.SqlExpectedIdent;
         return fallback;
     }
 
@@ -3530,21 +3608,13 @@ pub const Parser = struct {
         var merged_names: std.ArrayList([]const u8) = .empty;
 
         while (self.joinStartAhead()) {
-            // CROSS JOIN takes no ON clause.
-            if (self.cur.tag == .kw_cross) {
-                try self.advance();
-                if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
-                try self.advance();
-                const right = try self.parseFromTarget();
-                const right_op = try self.nameJoinInput(right);
-                root = try self.crossJoin(root, right_op);
-                try left_names.append(self.arena, right.name);
-                try inputs.append(self.arena, .{ .name = right.name, .op = right_op });
-                star = try self.appendInputStar(star, right.name, right_op);
-                continue;
-            }
             const natural = self.joinWordAhead("natural");
             if (natural) try self.advance();
+            const cross = !natural and self.cur.tag == .kw_cross;
+            if (cross) {
+                try self.advance();
+                if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
+            }
             // MySQL's STRAIGHT_JOIN is an inner join that pins the join
             // order, which thinDB already takes as written.
             const straight = !natural and self.joinWordAhead("straight_join");
@@ -3554,7 +3624,14 @@ pub const Parser = struct {
             const right_input = try self.nameJoinInput(right);
             var right_op = right_input;
 
-            if (straight and self.cur.tag != .kw_on) {
+            // MySQL reads [INNER] JOIN, CROSS JOIN and STRAIGHT_JOIN alike:
+            // an inner join whose ON / USING is optional, and a cross join
+            // without one. Elsewhere CROSS JOIN takes no condition and
+            // [INNER] JOIN requires one.
+            const condition_optional = cross or straight or (jtype == .inner and self.lex.dialect == .mysql);
+            const condition_allowed = !cross or self.lex.dialect == .mysql;
+            const condition_follows = self.cur.tag == .kw_on or self.joinWordAhead("using");
+            if (!natural and condition_optional and !(condition_allowed and condition_follows)) {
                 root = try self.crossJoin(root, right_input);
                 try left_names.append(self.arena, right.name);
                 try inputs.append(self.arena, .{ .name = right.name, .op = right_input });
@@ -4877,7 +4954,7 @@ pub const Parser = struct {
             const tok = try look.next();
             if (first_tok) {
                 first_tok = false;
-                if (tok.tag == .kw_select or tok.tag == .kw_with) return false;
+                if (self.startsQuery(tok.tag)) return false;
             }
             switch (tok.tag) {
                 .eof => return false,
@@ -5023,12 +5100,9 @@ pub const Parser = struct {
         if (side != .left and side != .right) return false;
         if (side_expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
         const col = try self.joinColName(side_expr);
-        const pred = if (exec_expr.decimalLiteral(literal_expr) != null) PredicateExpr{ .leaf = .{
-            .col = col,
-            .op = op,
-            .val = exec_expr.literalValue(literal_expr) orelse return ParseError.SqlExpectedValue,
-        } } else switch (literal_expr) {
-            .lit => |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } },
+        // A decimal constant no Value holds exactly is a `.call`, filtered
+        // by its exact value like any other constant expression.
+        const pred = if (exec_expr.exactLiteralValue(literal_expr)) |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } } else switch (literal_expr) {
             .null_lit => PredicateExpr.unknown,
             // `col <op> @var`: the pre-compile pass rewrites leaf_var to a
             // literal leaf once the session value is known.
@@ -6741,15 +6815,16 @@ fn countAggs(proj: []const ProjItem) usize {
 }
 
 /// Scalar functions whose result depends on more than their arguments
-/// (wall clock, RNG, ...). A group key built from one of these is NOT a
-/// pure function of the other keys, so it must never be collapsed. The
-/// registry doesn't expose these yet, but list them so the rewrite stays
+/// (wall clock, RNG, the session, ...). A group key built from one of these
+/// is NOT a pure function of the other keys, so it must never be collapsed.
+/// The registry doesn't expose these yet, but list them so the rewrite stays
 /// correct the moment they land.
 pub fn isNondeterministicFn(name: []const u8) bool {
     if (bareTemporalFn(name) != null) return true;
     const names = [_][]const u8{
-        "now",   "random",         "rand",      "uuid", "uuid_short", "sysdate", "unix_timestamp",
-        "sleep", "last_insert_id", "row_count",
+        "now",         "random",         "rand",      "uuid",          "uuid_short", "sysdate",      "unix_timestamp",
+        "sleep",       "last_insert_id", "row_count", "connection_id", "user",       "current_user", "session_user",
+        "system_user", "database",       "schema",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
     return false;

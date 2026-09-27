@@ -1,6 +1,7 @@
 //! UNION ALL concatenates two SELECT pipelines with matching schemas;
 //! UNION [DISTINCT] keeps one copy of each distinct row; INTERSECT and
 //! EXCEPT keep the distinct rows both arms hold, or only the left one does.
+//! VALUES and TABLE t stand in for a SELECT anywhere one can.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -278,4 +279,68 @@ test "INTERSECT / EXCEPT: the ALL forms are rejected" {
     inline for (.{ "SELECT id FROM a INTERSECT ALL SELECT id FROM b", "SELECT id FROM a EXCEPT ALL SELECT id FROM b" }) |sql| {
         try std.testing.expectError(error.SqlSetOpAllUnsupported, thindb.sql.parse(arena.allocator(), sql));
     }
+}
+
+test "VALUES and TABLE: row constructors and a whole table stand wherever a query can" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE c (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO c TABLE b");
+    try exec(allocator, db, "INSERT INTO c VALUES (5)");
+    try exec(allocator, db, "CREATE TABLE d AS VALUES ROW(1), ROW(2)");
+
+    const cases = .{
+        .{ "VALUES ROW(3), ROW(1), ROW(2) ORDER BY column_0 LIMIT 2", &[_]i64{ 1, 2 } },
+        .{ "SELECT column_1 FROM (VALUES ROW(1, 10), ROW(2, 20)) v ORDER BY column_0 DESC", &[_]i64{ 20, 10 } },
+        .{ "SELECT n * 100 + m FROM (VALUES ROW(1, 2), ROW(3, 4)) AS v(n, m) ORDER BY 1", &[_]i64{ 102, 304 } },
+        .{ "SELECT a FROM (VALUES (5), (6)) AS v(a) ORDER BY a", &[_]i64{ 5, 6 } },
+        .{ "SELECT CAST(SUM(column_0) * 10 AS BIGINT) FROM (VALUES ROW(1), ROW(2.5), ROW(NULL)) v", &[_]i64{35} },
+        .{ "SELECT id FROM a UNION ALL VALUES ROW(9) ORDER BY 1", &[_]i64{ 1, 2, 3, 9 } },
+        .{ "VALUES ROW(7) UNION ALL SELECT id FROM b ORDER BY 1", &[_]i64{ 2, 4, 7 } },
+        .{ "(VALUES ROW(8)) UNION (TABLE b) ORDER BY 1 DESC", &[_]i64{ 8, 4, 2 } },
+        // A star arm keeps its table's columns though no name above reads them.
+        .{ "SELECT 8 UNION ALL SELECT * FROM b ORDER BY 1", &[_]i64{ 2, 4, 8 } },
+        .{ "SELECT * FROM b UNION ALL SELECT 8 ORDER BY id", &[_]i64{ 2, 4, 8 } },
+        .{ "TABLE b", &[_]i64{ 2, 4 } },
+        .{ "TABLE a ORDER BY id DESC LIMIT 2", &[_]i64{ 3, 2 } },
+        .{ "TABLE a EXCEPT TABLE b ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "TABLE c ORDER BY id", &[_]i64{ 2, 4, 5 } },
+        .{ "SELECT column_0 FROM d ORDER BY 1", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM a WHERE id IN (TABLE b)", &[_]i64{2} },
+        .{ "SELECT id FROM a WHERE id IN (VALUES ROW(1), ROW(3)) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM a WHERE id > (VALUES ROW(2))", &[_]i64{3} },
+        .{ "SELECT COUNT(*) FROM a WHERE EXISTS (VALUES ROW(1))", &[_]i64{3} },
+        .{ "WITH w AS (VALUES ROW(1), ROW(2)) SELECT SUM(column_0) FROM w", &[_]i64{3} },
+        .{ "WITH w AS (SELECT 5 AS x) TABLE w", &[_]i64{5} },
+    };
+    inline for (cases) |c| {
+        const got = collectBigints(allocator, db, c[0]) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    const texts = try helpers.collectStrings(allocator, db, "SELECT column_1 FROM (VALUES ROW(1, 'x'), ROW(NULL, 'yy')) v ORDER BY column_1");
+    defer helpers.freeStrings(allocator, texts);
+    try std.testing.expectEqual(@as(usize, 2), texts.len);
+    try std.testing.expectEqualStrings("x", texts[0].?);
+    try std.testing.expectEqualStrings("yy", texts[1].?);
+
+    var mysql_names = try helpers.runSqlMysql(allocator, db, "VALUES ROW(1, 2)");
+    defer mysql_names.deinit();
+    try std.testing.expectEqualStrings("column_1", mysql_names.outputSchema()[1].name);
+    var pg_names = try helpers.runSqlDialect(allocator, db, "VALUES (1, 2)", .postgres);
+    defer pg_names.deinit();
+    try std.testing.expectEqualStrings("column2", pg_names.outputSchema()[1].name);
+
+    try helpers.expectRunError(allocator, db, "VALUES ROW(1), ROW(1, 2)", error.SqlRowValueWidthMismatch);
 }

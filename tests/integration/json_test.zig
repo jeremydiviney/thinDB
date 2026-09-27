@@ -110,3 +110,38 @@ test "JSON: length, contains, keys after flush" {
         try std.testing.expectEqualStrings("age", k0);
     }
 }
+
+test "JSON: MIN and MAX over a JSON column agree with ORDER BY, on every aggregate path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT, j JSON)");
+    try exec(allocator, db,
+        \\INSERT INTO t VALUES (1, '{"a": 1}'), (2, '[1, 2]'), (1, '3'), (2, '"x"'), (3, 'true'), (3, NULL)
+    );
+
+    const t = try db.openTable("t", .{});
+    inline for (.{ false, true }) |flushed| {
+        if (flushed) try t.flush();
+        // JSON orders by its stored JSONB bytes, not MySQL's JSON rules
+        // (#314); what matters here is that every path agrees with ORDER BY.
+        const cases = .{
+            .{ "SELECT CAST(MAX(j) AS CHAR) FROM t", "SELECT CAST(j AS CHAR) FROM t WHERE j IS NOT NULL ORDER BY j DESC LIMIT 1" },
+            .{ "SELECT CAST(MIN(j) AS CHAR) FROM t", "SELECT CAST(j AS CHAR) FROM t WHERE j IS NOT NULL ORDER BY j LIMIT 1" },
+            .{ "SELECT CAST(MAX(x) AS CHAR) FROM (SELECT j x FROM t) t2", "SELECT CAST(j AS CHAR) FROM t WHERE j IS NOT NULL ORDER BY j DESC LIMIT 1" },
+            .{ "SELECT CAST(MAX(j) AS CHAR) FROM t GROUP BY id ORDER BY id", "SELECT CAST(MAX(j) AS CHAR) FROM (SELECT id, j FROM t ORDER BY id, j DESC) s GROUP BY id ORDER BY id" },
+            .{ "SELECT CAST(m AS CHAR) FROM (SELECT id, MIN(j) OVER (PARTITION BY id) m FROM t) w ORDER BY id, m", "SELECT CAST(m AS CHAR) FROM (SELECT id, MIN(j) m FROM t GROUP BY id) g JOIN t USING (id) ORDER BY id, m" },
+        };
+        inline for (cases) |c| {
+            const got = try helpers.collectStrings(allocator, db, c[0]);
+            defer helpers.freeStrings(allocator, got);
+            const want = try helpers.collectStrings(allocator, db, c[1]);
+            defer helpers.freeStrings(allocator, want);
+            try std.testing.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try std.testing.expectEqualDeep(w, g);
+        }
+    }
+}

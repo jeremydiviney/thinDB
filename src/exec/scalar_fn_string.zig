@@ -97,16 +97,18 @@ const RegexCall = struct {
 };
 
 /// MySQL's match_type letters: c case-sensitive, i case-insensitive (the
-/// later of the two wins), n `.` matches line ends too, m and u multi-line
-/// and Unix line ends. `^` and `$` match at line ends here whatever the
-/// match type, so m and u change nothing.
+/// later of the two wins), n `.` matches line ends too, m `^` and `$` match
+/// at line ends too, u Unix line ends (the only line end here, so u changes
+/// nothing). With no letters a pattern is case-sensitive, as in StarRocks
+/// and DuckDB, where MySQL follows the collation.
 fn regexMatchOptions(match_type: []const u8) !regex.Options {
     var options: regex.Options = .{};
     for (match_type) |c| switch (c) {
         'c' => options.case_insensitive = false,
         'i' => options.case_insensitive = true,
         'n' => options.dot_all = true,
-        'm', 'u' => {},
+        'm' => options.multiline = true,
+        'u' => {},
         else => return error.RegexInvalidMatchType,
     };
     return options;
@@ -699,6 +701,26 @@ pub fn xxHash3_128Kernel(allocator: Allocator, args: []const ColumnView, out: *C
 // Encoding kernels — hex / base64 round-trips on string columns.
 // ---------------------------------------------------------------------------
 
+/// HEX(number): the hex of the value as a BIGINT (`common.integerHex`), a
+/// double rounded to one first (`common.doubleAsBigint`).
+pub fn hexBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    var buf: [16]u8 = undefined;
+    for (args[0].data.bigint[0..row_count]) |v| try ss.appendValue(allocator, common.integerHex(&buf, v));
+}
+
+pub fn hexLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    var buf: [16]u8 = undefined;
+    for (args[0].data.largeint[0..row_count]) |v| try ss.appendValue(allocator, common.integerHex(&buf, common.wideIntegerAsBigint(v)));
+}
+
+pub fn hexDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    var buf: [16]u8 = undefined;
+    for (args[0].data.double[0..row_count]) |x| try ss.appendValue(allocator, common.integerHex(&buf, common.doubleAsBigint(x)));
+}
+
 pub fn hexEncodeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     const ss = stringStoreOf(out);
@@ -818,6 +840,21 @@ pub fn concatWsKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
         }
         try ss.appendValue(allocator, scratch.items);
         try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
+/// The character set MySQL names for a value of the argument's type: text
+/// and JSON are utf8mb4, every other type binary. A NULL still has a type,
+/// so the result is never NULL.
+pub fn charsetKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = out_type;
+    _ = args;
+    const charset: []const u8 = if (arg_types[0].isString()) "utf8mb4" else "binary";
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    for (0..row_count) |row| {
+        try ss.appendValue(allocator, charset);
+        try out.appendValidBit(allocator, base + row, true);
     }
 }
 

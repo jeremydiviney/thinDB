@@ -513,23 +513,6 @@ pub fn textKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Ty
     }
 }
 
-/// HEX(decimal): the value rounded half away from zero to a BIGINT, which
-/// saturates, as MySQL converts a DECIMAL to an integer. An integer literal
-/// past BIGINT is a DECIMAL of scale 0 here but BIGINT UNSIGNED in MySQL
-/// up to 2^64 - 1, so a scale-0 value in that range keeps its bits.
-pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
-    _ = out_type;
-    const scale = scaleOf(arg_types[0]);
-    const factor = pow10(scale);
-    const ss = common.stringStoreOf(out);
-    var row: usize = 0;
-    while (row < n) : (row += 1) {
-        const whole = roundDiv(mantissaAt(args[0], row), factor);
-        const v = if (scale == 0) common.unsignedOrSaturatedBigint(whole) else common.saturateBigint(whole);
-        try common.appendBigintHex(allocator, ss, v);
-    }
-}
-
 pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     _ = out_type;
     const s = scaleOf(arg_types[0]);
@@ -538,6 +521,28 @@ pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: T
     while (row < n) : (row += 1) {
         const text = formatDecimal(&buf, mantissaAt(args[0], row), s);
         try common.stringStoreOf(out).appendValue(allocator, text);
+    }
+}
+
+/// HEX(decimal): the value rounded half away from zero to a BIGINT, as
+/// MySQL reads a DECIMAL as an integer (clamped to the BIGINT range), then
+/// printed as `common.integerHex` prints one.
+///
+/// An integer literal past BIGINT is a DECIMAL of scale 0 here, but MySQL
+/// reads one up to 2^64 - 1 as BIGINT UNSIGNED, so a scale-0 value in that
+/// range keeps its bits (`HEX(18446744073709551615)` is FFFFFFFFFFFFFFFF).
+pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    const scale = scaleOf(arg_types[0]);
+    const unit = pow10(scale);
+    var buf: [16]u8 = undefined;
+    for (0..n) |row| {
+        const whole = roundDiv(mantissaAt(args[0], row), unit);
+        const v: i64 = if (scale == 0)
+            common.wideIntegerAsBigint(whole)
+        else
+            std.math.cast(i64, whole) orelse if (whole < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+        try common.stringStoreOf(out).appendValue(allocator, common.integerHex(&buf, v));
     }
 }
 

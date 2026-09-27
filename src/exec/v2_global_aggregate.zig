@@ -1598,6 +1598,7 @@ const GlobalAggregate = struct {
                             .varchar => try col.data.varchar.appendValue(a, lane.sstr[i]),
                             .string => try col.data.string.appendValue(a, lane.sstr[i]),
                             .char => try col.data.char.appendValue(a, lane.sstr[i]),
+                            .json => try col.data.json.appendValue(a, lane.sstr[i]),
                             else => return error.TypeMismatch,
                         }
                     } else if (p.is_float) {
