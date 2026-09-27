@@ -244,6 +244,8 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_truncate => "truncate",
         .kw_insert => "insert",
         .kw_interval => "interval",
+        .kw_database => "database",
+        .kw_schema => "schema",
         else => null,
     };
 }
@@ -859,7 +861,7 @@ pub const Parser = struct {
         self.predicate_derived_scope = old_predicate_derived_scope;
         const window_expr_refs = try self.arena.dupe(WindowExprRef, self.window_expr_refs.items[window_ref_mark..]);
         self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
-        const projection_predicate_derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[projection_pred_mark..]);
+        var projection_predicate_derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[projection_pred_mark..]);
         self.predicate_derived.shrinkRetainingCapacity(projection_pred_mark);
 
         // FROM clause — supports a single table or chained JOINs. A
@@ -898,13 +900,17 @@ pub const Parser = struct {
         // Optional GROUP BY. Each item is a general expression so we
         // accept ordinals (`GROUP BY 1`), aliases (`GROUP BY m`), plain
         // columns, and computed keys (`GROUP BY ClientIP - 1`,
-        // `GROUP BY date_trunc(...)`). Resolution against the projection
-        // happens once we know the SELECT shape.
+        // `GROUP BY date_trunc(...)`), or ROLLUP / CUBE / GROUPING SETS.
+        // Resolution against the projection happens once we know the
+        // SELECT shape.
         var group_exprs: []const ir.Expr = &.{};
+        var grouping_sets: ?[]const u64 = null;
         if (self.cur.tag == .kw_group) {
             try self.advance();
             try self.expect(.kw_by);
-            group_exprs = try self.parseGroupByExprs();
+            const clause = try self.parseGroupByClause();
+            group_exprs = clause.exprs;
+            grouping_sets = clause.sets;
         }
 
         // Optional HAVING — post-aggregate filter. Predicate may
@@ -1003,7 +1009,7 @@ pub const Parser = struct {
             };
             break :blk false;
         };
-        const has_group = group_exprs.len > 0;
+        const has_group = group_exprs.len > 0 or grouping_sets != null;
         var hidden_agg_cols: []const []const u8 = &.{};
         if (aggregate_expr_refs.len > 0) {
             const cols = try self.arena.alloc([]const u8, aggregate_expr_refs.len);
@@ -1039,6 +1045,14 @@ pub const Parser = struct {
         // output columns (e.g. `k + 1` under `GROUP BY k`) that isn't itself a
         // grouping key — computed once per group ABOVE the aggregate.
         var post_group_expr: []bool = &.{};
+        // GROUPING() calls, the keys each names, and the columns carrying them.
+        var grouping_calls: std.ArrayList([]const usize) = .empty;
+        var grouping_names: []const []const u8 = &.{};
+        var after_group_extra = hidden_agg_cols;
+        // The projection's computed predicate operands (`CASE WHEN g + 1 = 2`):
+        // those over input columns are evaluated before the GroupBy, and
+        // those over grouped output per group above it.
+        var post_group_pred_derived: []const ir.Derived = &.{};
         if (distinct) {
             // SELECT DISTINCT a, b, expr ≡ SELECT a, b, expr GROUP BY 1, 2, 3:
             // every projected item becomes a grouping key (markGroupKey
@@ -1057,6 +1071,32 @@ pub const Parser = struct {
             const res = try self.resolveGroupBy(proj, group_exprs);
             group_cols = res.cols;
             grouping_key = res.gk;
+            const keys: GroupKeys = .{ .exprs = group_exprs, .cols = group_cols };
+            proj = try self.rewriteGroupingInProj(proj, keys, &grouping_calls);
+            having_derived = try self.rewriteGroupingInDerived(having_derived, keys, &grouping_calls);
+            order_anchors = try self.rewriteGroupingInDerived(order_anchors, keys, &grouping_calls);
+            order_keys = try self.rewriteGroupingInDerived(order_keys, keys, &grouping_calls);
+            const pred_derived = try self.rewriteGroupingInDerived(projection_predicate_derived, keys, &grouping_calls);
+            if (grouping_calls.items.len > 0) {
+                grouping_names = try groupingColumnNames(self.arena, grouping_calls.items.len);
+                after_group_extra = try std.mem.concat(self.arena, []const u8, &.{ hidden_agg_cols, grouping_names });
+                if (grouping_sets == null) grouping_sets = try self.arena.dupe(u64, &.{lowBits(group_cols.len)});
+            }
+            if (pred_derived.len > 0) {
+                var pre: std.ArrayList(ir.Derived) = .empty;
+                var post: std.ArrayList(ir.Derived) = .empty;
+                var post_names: std.ArrayList([]const u8) = .empty;
+                for (projection_predicate_derived, pred_derived) |original, d| {
+                    if (!exprHasGroupingCall(original.expr) and !exprReferencesAnyColumn(original.expr, hidden_agg_cols)) try pre.append(self.arena, original);
+                    if (exprAvailableAfterGroup(d.expr, group_cols, after_group_extra)) {
+                        try post.append(self.arena, d);
+                        try post_names.append(self.arena, d.name);
+                    }
+                }
+                projection_predicate_derived = pre.items;
+                post_group_pred_derived = post.items;
+                after_group_extra = try std.mem.concat(self.arena, []const u8, &.{ after_group_extra, post_names.items });
+            }
             post_group_expr = try self.arena.alloc(bool, proj.len);
             @memset(post_group_expr, false);
             // Every projection must be an aggregate, a grouping key, or a
@@ -1067,7 +1107,7 @@ pub const Parser = struct {
                 .col => |c| if (!grouping_key[i] and !nameInList(c, group_cols)) return ParseError.SqlMixedAggAndPlainProjection,
                 .expr => |e| {
                     if (!grouping_key[i]) {
-                        if (!exprAvailableAfterGroup(e, group_cols, hidden_agg_cols)) return ParseError.SqlMixedAggAndPlainProjection;
+                        if (!exprAvailableAfterGroup(e, group_cols, after_group_extra)) return ParseError.SqlMixedAggAndPlainProjection;
                         post_group_expr[i] = true;
                     }
                 },
@@ -1104,7 +1144,8 @@ pub const Parser = struct {
             for (proj, 0..) |p, i| {
                 if (grouping_key[i] and p.kind == .col) has_anchor = true;
             }
-            if (has_anchor) {
+            // A grouping set nulls keys a collapsed one would be recomputed from.
+            if (has_anchor and grouping_sets == null) {
                 for (proj, 0..) |p, i| {
                     if (!grouping_key[i]) continue;
                     switch (p.kind) {
@@ -1217,18 +1258,24 @@ pub const Parser = struct {
             }
 
             const aggs_slice = try aggs_buf.toOwnedSlice(self.arena);
-            root = try self.allocOp(.{ .group_by = .{
-                .group_cols = retained_group_cols,
-                .aggs = aggs_slice,
-                .upstream = root,
-            } });
+            root = if (grouping_sets) |sets|
+                try self.groupingSetsUnion(root, retained_group_cols, aggs_slice, sets, grouping_calls.items, grouping_names)
+            else
+                try self.allocOp(.{ .group_by = .{
+                    .group_cols = retained_group_cols,
+                    .aggs = aggs_slice,
+                    .upstream = root,
+                } });
 
             // Recompute the collapsed keys once per output group, directly
             // above the GroupBy so HAVING / ORDER BY / the final Project all
             // see them. Each derived expression now reads the retained group
             // columns (one row per group instead of one row per input row).
+            // The projection's computed predicate operands over grouped output
+            // come first, as the recomputed expressions may read them;
             // HAVING's computed operands follow, so they can read those keys.
-            if (collapsed_exprs.items.len > 0 or having_derived.len > 0) {
+            if (post_group_pred_derived.len > 0 or collapsed_exprs.items.len > 0 or having_derived.len > 0) {
+                try collapsed_exprs.insertSlice(self.arena, 0, post_group_pred_derived);
                 try collapsed_exprs.appendSlice(self.arena, having_derived);
                 const above = try collapsed_exprs.toOwnedSlice(self.arena);
                 root = try self.allocOp(.{ .compute = .{ .derived = above, .upstream = root } });
@@ -1278,7 +1325,7 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            if (distinct or hidden_group_count or has_window or aggregate_expr_refs.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            if (distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
         } else {
@@ -1736,12 +1783,12 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
-        // Literal at projection start: `SELECT 1`, `SELECT 'x'`,
-        // `SELECT 1 + 2`. Route through the expression parser so binary
-        // operators and aliasing work. (`GROUP BY 1` then references it
-        // as ordinal 1.)
+        // Literal or user variable at projection start: `SELECT 1`,
+        // `SELECT 'x'`, `SELECT 1 + 2`, `SELECT @w`. Route through the
+        // expression parser so binary operators and aliasing work.
+        // (`GROUP BY 1` then references it as ordinal 1.)
         switch (self.cur.tag) {
-            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
+            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier => {
                 const expr = try self.parseScalar();
                 const default_name = try self.exprDefaultName(expr);
                 const alias = try self.maybeAlias(default_name);
@@ -3360,21 +3407,26 @@ pub const Parser = struct {
         };
     }
 
+    /// A select-list item's `[AS] alias`, or `fallback` when none follows.
+    /// The AS is optional, as in MySQL/StarRocks; keywords such as FROM
+    /// are not identifiers, so an item's end is never read as its alias.
+    /// On MySQL a string names the column too (`1 'a'`, `1 AS "a"`, where
+    /// `"a"` is a string). MySQL allows that only here, never for a table.
     fn maybeAlias(self: *Parser, fallback: []const u8) ParseError![]const u8 {
-        if (self.cur.tag == .kw_as) {
+        const explicit = self.cur.tag == .kw_as;
+        if (explicit) try self.advance();
+        if (self.cur.tag == .string and self.lex.dialect == .mysql) {
+            const name = self.cur.value.string;
+            if (name.len == 0) return ParseError.SqlExpectedIdent;
             try self.advance();
-            const name = try self.expectIdent();
             return try self.arena.dupe(u8, name);
         }
-        // Implicit alias: `expr alias_ident` (no AS keyword) — common
-        // in MySQL/StarRocks. Only if next token is a bare identifier.
         if (self.cur.tag == .identifier) {
-            // But we have to be careful — keywords like FROM are NOT
-            // identifiers, so the lookahead naturally stops at them.
             const name = self.cur.text;
             try self.advance();
             return try self.arena.dupe(u8, name);
         }
+        if (explicit) return ParseError.SqlExpectedIdent;
         return fallback;
     }
 
@@ -3482,21 +3534,13 @@ pub const Parser = struct {
         var merged_names: std.ArrayList([]const u8) = .empty;
 
         while (self.joinStartAhead()) {
-            // CROSS JOIN takes no ON clause.
-            if (self.cur.tag == .kw_cross) {
-                try self.advance();
-                if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
-                try self.advance();
-                const right = try self.parseFromTarget();
-                const right_op = try self.nameJoinInput(right);
-                root = try self.crossJoin(root, right_op);
-                try left_names.append(self.arena, right.name);
-                try inputs.append(self.arena, .{ .name = right.name, .op = right_op });
-                star = try self.appendInputStar(star, right.name, right_op);
-                continue;
-            }
             const natural = self.joinWordAhead("natural");
             if (natural) try self.advance();
+            const cross = !natural and self.cur.tag == .kw_cross;
+            if (cross) {
+                try self.advance();
+                if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
+            }
             // MySQL's STRAIGHT_JOIN is an inner join that pins the join
             // order, which thinDB already takes as written.
             const straight = !natural and self.joinWordAhead("straight_join");
@@ -3506,7 +3550,14 @@ pub const Parser = struct {
             const right_input = try self.nameJoinInput(right);
             var right_op = right_input;
 
-            if (straight and self.cur.tag != .kw_on) {
+            // MySQL reads [INNER] JOIN, CROSS JOIN and STRAIGHT_JOIN alike:
+            // an inner join whose ON / USING is optional, and a cross join
+            // without one. Elsewhere CROSS JOIN takes no condition and
+            // [INNER] JOIN requires one.
+            const condition_optional = cross or straight or (jtype == .inner and self.lex.dialect == .mysql);
+            const condition_allowed = !cross or self.lex.dialect == .mysql;
+            const condition_follows = self.cur.tag == .kw_on or self.joinWordAhead("using");
+            if (!natural and condition_optional and !(condition_allowed and condition_follows)) {
                 root = try self.crossJoin(root, right_input);
                 try left_names.append(self.arena, right.name);
                 try inputs.append(self.arena, .{ .name = right.name, .op = right_input });
@@ -4975,12 +5026,9 @@ pub const Parser = struct {
         if (side != .left and side != .right) return false;
         if (side_expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
         const col = try self.joinColName(side_expr);
-        const pred = if (exec_expr.decimalLiteral(literal_expr) != null) PredicateExpr{ .leaf = .{
-            .col = col,
-            .op = op,
-            .val = exec_expr.literalValue(literal_expr) orelse return ParseError.SqlExpectedValue,
-        } } else switch (literal_expr) {
-            .lit => |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } },
+        // A decimal constant no Value holds exactly is a `.call`, filtered
+        // by its exact value like any other constant expression.
+        const pred = if (exec_expr.exactLiteralValue(literal_expr)) |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } } else switch (literal_expr) {
             .null_lit => PredicateExpr.unknown,
             // `col <op> @var`: the pre-compile pass rewrites leaf_var to a
             // literal leaf once the session value is known.
@@ -5976,6 +6024,255 @@ pub const Parser = struct {
         return try items.toOwnedSlice(self.arena);
     }
 
+    const GroupByClause = struct {
+        exprs: []const ir.Expr,
+        /// Null for a plain GROUP BY; else the grouping sets, each a mask of
+        /// `exprs`, whose groupings the query returns one after another.
+        sets: ?[]const u64,
+    };
+
+    /// Each grouping set's branch scans the input again; past this many
+    /// sets a query is refused rather than run.
+    const MAX_GROUPING_SETS = 4096;
+
+    /// GROUP BY's items. Beside plain expressions, an item may be
+    /// `ROLLUP(...)`, `CUBE(...)` or `GROUPING SETS (...)`, and a plain list
+    /// may end `WITH ROLLUP` (MySQL). The grouping sets are the cross
+    /// product of the items' own sets, as the SQL standard composes them. A
+    /// key named twice is one key.
+    fn parseGroupByClause(self: *Parser) ParseError!GroupByClause {
+        var exprs: std.ArrayList(ir.Expr) = .empty;
+        var sets: []const u64 = &.{0};
+        var any_sets = false;
+        while (true) {
+            var item: std.ArrayList(u64) = .empty;
+            if (try self.atGroupingSets()) {
+                any_sets = true;
+                try self.expect(.lparen);
+                while (true) {
+                    try item.append(self.arena, try self.parseGroupingSet(&exprs));
+                    if (self.cur.tag != .comma) break;
+                    try self.advance();
+                }
+                try self.expect(.rparen);
+            } else {
+                const e = try self.parseScalar();
+                if (groupingConstructorArgs(e, "rollup")) |args| {
+                    any_sets = true;
+                    var mask: u64 = 0;
+                    for (args) |a| {
+                        try item.append(self.arena, mask);
+                        mask |= try self.groupKeyBit(&exprs, a);
+                    }
+                    try item.append(self.arena, mask);
+                    std.mem.reverse(u64, item.items);
+                } else if (groupingConstructorArgs(e, "cube")) |args| {
+                    any_sets = true;
+                    if (args.len > 12) return ParseError.SqlInvalidProjection;
+                    const bits = try self.arena.alloc(u64, args.len);
+                    for (args, bits) |a, *b| b.* = try self.groupKeyBit(&exprs, a);
+                    for (0..@as(usize, 1) << @intCast(args.len)) |dropped| {
+                        var mask: u64 = 0;
+                        for (bits, 0..) |b, i| {
+                            if ((dropped >> @intCast(i)) & 1 == 0) mask |= b;
+                        }
+                        try item.append(self.arena, mask);
+                    }
+                } else {
+                    try item.append(self.arena, try self.groupKeyBit(&exprs, e));
+                }
+            }
+            if (sets.len * item.items.len > MAX_GROUPING_SETS) return ParseError.SqlInvalidProjection;
+            const crossed = try self.arena.alloc(u64, sets.len * item.items.len);
+            var n: usize = 0;
+            for (sets) |s| for (item.items) |m| {
+                crossed[n] = s | m;
+                n += 1;
+            };
+            sets = crossed;
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        if (self.cur.tag == .kw_with) {
+            try self.advance();
+            if (self.cur.tag != .identifier or !std.ascii.eqlIgnoreCase(self.cur.text, "rollup")) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            if (any_sets) return ParseError.SqlInvalidProjection;
+            const rollup = try self.arena.alloc(u64, exprs.items.len + 1);
+            for (rollup, 0..) |*m, i| m.* = lowBits(exprs.items.len - i);
+            return .{ .exprs = try exprs.toOwnedSlice(self.arena), .sets = rollup };
+        }
+        return .{ .exprs = try exprs.toOwnedSlice(self.arena), .sets = if (any_sets) sets else null };
+    }
+
+    /// Whether `GROUPING SETS` starts here, consuming it if so; `GROUPING`
+    /// alone starts the GROUPING() function.
+    fn atGroupingSets(self: *Parser) ParseError!bool {
+        if (self.cur.tag != .identifier or !std.ascii.eqlIgnoreCase(self.cur.text, "grouping")) return false;
+        const saved_cur = self.cur;
+        const saved_pos = self.lex.pos;
+        const saved_prev_end = self.prev_end;
+        try self.advance();
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "sets")) {
+            try self.advance();
+            return true;
+        }
+        self.cur = saved_cur;
+        self.lex.pos = saved_pos;
+        self.prev_end = saved_prev_end;
+        return false;
+    }
+
+    /// One set of `GROUPING SETS (...)`: `(a, b)`, `()` or a lone `a`.
+    fn parseGroupingSet(self: *Parser, exprs: *std.ArrayList(ir.Expr)) ParseError!u64 {
+        if (self.cur.tag != .lparen) return self.groupKeyBit(exprs, try self.parseScalar());
+        try self.advance();
+        var mask: u64 = 0;
+        while (self.cur.tag != .rparen) {
+            mask |= try self.groupKeyBit(exprs, try self.parseScalar());
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        try self.expect(.rparen);
+        return mask;
+    }
+
+    /// The bit of grouping key `e` among `exprs`, adding it when new.
+    fn groupKeyBit(self: *Parser, exprs: *std.ArrayList(ir.Expr), e: ir.Expr) ParseError!u64 {
+        for (exprs.items, 0..) |known, i| {
+            if (exprEqual(known, e)) return @as(u64, 1) << @intCast(i);
+        }
+        if (exprs.items.len == 64) return ParseError.SqlInvalidProjection;
+        try exprs.append(self.arena, e);
+        return @as(u64, 1) << @intCast(exprs.items.len - 1);
+    }
+
+    const GroupKeys = struct { exprs: []const ir.Expr, cols: []const []const u8 };
+
+    /// `GROUPING(k, ...)` in a grouped query: which of its arguments, all
+    /// grouping keys, a row's grouping set rolled up, as bits with the first
+    /// argument the most significant. Each distinct call becomes a column,
+    /// `__grouping_<i>`, that every grouping set's branch fills with its
+    /// constant (`groupingSetsUnion`); `calls` gathers the keys each names.
+    fn rewriteGroupingCalls(self: *Parser, e: ir.Expr, keys: GroupKeys, calls: *std.ArrayList([]const usize)) ParseError!ir.Expr {
+        if (!exprHasGroupingCall(e)) return e;
+        switch (e) {
+            .call => |c| {
+                if (isGroupingFn(c.fn_name)) {
+                    if (c.args.len == 0 or c.args.len > 63) return ParseError.SqlInvalidProjection;
+                    const named = try self.arena.alloc(usize, c.args.len);
+                    for (c.args, named) |arg, *k| k.* = groupKeyIndex(keys, arg) orelse return ParseError.SqlInvalidProjection;
+                    const index = for (calls.items, 0..) |known, i| {
+                        if (std.mem.eql(usize, known, named)) break i;
+                    } else blk: {
+                        try calls.append(self.arena, named);
+                        break :blk calls.items.len - 1;
+                    };
+                    return .{ .col_ref = try groupingColumnName(self.arena, index) };
+                }
+                const args = try self.arena.alloc(ir.Expr, c.args.len);
+                for (c.args, args) |arg, *dst| dst.* = try self.rewriteGroupingCalls(arg, keys, calls);
+                return .{ .call = .{ .fn_name = c.fn_name, .args = args } };
+            },
+            .case => |c| {
+                const branches = try self.arena.alloc(ir.Expr.Branch, c.branches.len);
+                for (c.branches, branches) |b, *dst| dst.* = .{ .cond = b.cond, .then = try self.rewriteGroupingCalls(b.then, keys, calls) };
+                var else_branch: ?*const ir.Expr = null;
+                if (c.else_branch) |eb| {
+                    const rewritten = try self.arena.create(ir.Expr);
+                    rewritten.* = try self.rewriteGroupingCalls(eb.*, keys, calls);
+                    else_branch = rewritten;
+                }
+                return .{ .case = .{ .branches = branches, .else_branch = else_branch } };
+            },
+            else => return e,
+        }
+    }
+
+    fn rewriteGroupingInProj(self: *Parser, proj: []const ProjItem, keys: GroupKeys, calls: *std.ArrayList([]const usize)) ParseError![]const ProjItem {
+        var out: ?[]ProjItem = null;
+        for (proj, 0..) |p, i| switch (p.kind) {
+            .expr => |e| if (exprHasGroupingCall(e)) {
+                const items = out orelse try self.arena.dupe(ProjItem, proj);
+                out = items;
+                items[i].kind = .{ .expr = try self.rewriteGroupingCalls(e, keys, calls) };
+            },
+            else => {},
+        };
+        return out orelse proj;
+    }
+
+    fn rewriteGroupingInDerived(self: *Parser, derived: []const ir.Derived, keys: GroupKeys, calls: *std.ArrayList([]const usize)) ParseError![]const ir.Derived {
+        var out: ?[]ir.Derived = null;
+        for (derived, 0..) |d, i| {
+            if (!exprHasGroupingCall(d.expr)) continue;
+            const items = out orelse try self.arena.dupe(ir.Derived, derived);
+            out = items;
+            items[i].expr = try self.rewriteGroupingCalls(d.expr, keys, calls);
+        }
+        return out orelse derived;
+    }
+
+    /// A grouped query's GroupBy over grouping sets: a UNION ALL of one
+    /// GroupBy per set, each over its own copy of the input. Every branch
+    /// groups on every key, those its set leaves out replaced beforehand by
+    /// a NULL of the key's type, so the branches share the grouped schema
+    /// and a rolled-up key reads NULL, as ROLLUP's super-aggregate rows do.
+    /// A branch then adds the GROUPING() values of its set as constants.
+    fn groupingSetsUnion(
+        self: *Parser,
+        input: *ir.Op,
+        keys: []const []const u8,
+        aggs: []const ir.AggSpec,
+        sets: []const u64,
+        calls: []const []const usize,
+        grouping_names: []const []const u8,
+    ) ParseError!*ir.Op {
+        const agg_names = try self.arena.alloc([]const u8, aggs.len);
+        for (aggs, agg_names) |a, *name| name.* = a.as;
+        var root: ?*ir.Op = null;
+        for (sets, 0..) |set, b| {
+            var branch = if (b == 0) input else try input.cloneTree(self.arena);
+            const group_cols = try self.arena.alloc([]const u8, keys.len);
+            const outputs = try self.arena.alloc(?[]const u8, keys.len + aggs.len + calls.len);
+            @memset(outputs, null);
+            var nulls: std.ArrayList(ir.Derived) = .empty;
+            for (keys, group_cols, outputs[0..keys.len], 0..) |key, *col, *output, j| {
+                if ((set >> @intCast(j)) & 1 == 1) {
+                    col.* = key;
+                    continue;
+                }
+                col.* = try std.fmt.allocPrint(self.arena, "__rollup_null_{d}", .{j});
+                output.* = key;
+                try nulls.append(self.arena, .{ .name = col.*, .expr = try self.nullOfColumn(key) });
+            }
+            if (nulls.items.len > 0) branch = try self.allocOp(.{ .compute = .{ .derived = nulls.items, .upstream = branch } });
+            branch = try self.allocOp(.{ .group_by = .{ .group_cols = group_cols, .aggs = aggs, .upstream = branch } });
+            if (calls.len > 0) {
+                const values = try self.arena.alloc(ir.Derived, calls.len);
+                for (calls, values, grouping_names) |named, *value, name| {
+                    var bits: i64 = 0;
+                    for (named) |j| bits = bits * 2 + @as(i64, @intCast((~set >> @intCast(j)) & 1));
+                    value.* = .{ .name = name, .expr = .{ .lit = .{ .bigint = bits } } };
+                }
+                branch = try self.allocOp(.{ .compute = .{ .derived = values, .upstream = branch } });
+            }
+            if (nulls.items.len > 0) {
+                const columns = try std.mem.concat(self.arena, []const u8, &.{ group_cols, agg_names, grouping_names });
+                branch = try self.allocOp(.{ .select = .{ .columns = columns, .outputs = outputs, .upstream = branch } });
+            }
+            root = if (root) |left| try self.allocOp(.{ .set_union = .{ .left = left, .right = branch, .all = true } }) else branch;
+        }
+        return root.?;
+    }
+
+    /// A NULL typed as column `name`: a CASE no row takes.
+    fn nullOfColumn(self: *Parser, name: []const u8) ParseError!ir.Expr {
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        branches[0] = .{ .cond = .{ .always = false }, .then = .{ .col_ref = name } };
+        return .{ .case = .{ .branches = branches, .else_branch = null } };
+    }
+
     const GroupByResolution = struct { cols: []const []const u8, gk: []bool };
 
     /// Resolve GROUP BY items against the projection. Each item binds to
@@ -6394,15 +6691,16 @@ fn countAggs(proj: []const ProjItem) usize {
 }
 
 /// Scalar functions whose result depends on more than their arguments
-/// (wall clock, RNG, ...). A group key built from one of these is NOT a
-/// pure function of the other keys, so it must never be collapsed. The
-/// registry doesn't expose these yet, but list them so the rewrite stays
+/// (wall clock, RNG, the session, ...). A group key built from one of these
+/// is NOT a pure function of the other keys, so it must never be collapsed.
+/// The registry doesn't expose these yet, but list them so the rewrite stays
 /// correct the moment they land.
 pub fn isNondeterministicFn(name: []const u8) bool {
     if (bareTemporalFn(name) != null) return true;
     const names = [_][]const u8{
-        "now",   "random",         "rand",      "uuid", "uuid_short", "sysdate", "unix_timestamp",
-        "sleep", "last_insert_id", "row_count",
+        "now",         "random",         "rand",      "uuid",          "uuid_short", "sysdate",      "unix_timestamp",
+        "sleep",       "last_insert_id", "row_count", "connection_id", "user",       "current_user", "session_user",
+        "system_user", "database",       "schema",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
     return false;
@@ -6583,6 +6881,60 @@ fn isPlainGroupKey(proj: []const ProjItem, grouping_key: []const bool, name: []c
 /// date_trunc(...)` ↔ `SELECT date_trunc(...) AS M`). CASE / subquery /
 /// var_ref nodes are conservatively treated as unequal — grouping by
 /// those goes through alias references instead.
+/// The arguments of `e` when it is a call of `name` (ROLLUP or CUBE in
+/// GROUP BY).
+fn groupingConstructorArgs(e: ir.Expr, name: []const u8) ?[]const ir.Expr {
+    return switch (e) {
+        .call => |c| if (std.ascii.eqlIgnoreCase(c.fn_name, name)) c.args else null,
+        else => null,
+    };
+}
+
+fn isGroupingFn(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "grouping") or std.ascii.eqlIgnoreCase(name, "grouping_id");
+}
+
+fn exprHasGroupingCall(e: ir.Expr) bool {
+    return switch (e) {
+        .call => |c| isGroupingFn(c.fn_name) or for (c.args) |arg| {
+            if (exprHasGroupingCall(arg)) break true;
+        } else false,
+        .case => |c| for (c.branches) |b| {
+            if (exprHasGroupingCall(b.then)) break true;
+        } else if (c.else_branch) |eb| exprHasGroupingCall(eb.*) else false,
+        else => false,
+    };
+}
+
+/// The grouping key a GROUPING() argument names: the GROUP BY item it
+/// repeats, or the column a key groups on.
+fn groupKeyIndex(keys: anytype, arg: ir.Expr) ?usize {
+    for (keys.exprs, 0..) |key, j| {
+        if (exprEqual(key, arg)) return j;
+    }
+    if (arg == .col_ref) {
+        for (keys.cols, 0..) |col, j| {
+            if (types.columnNameEql(col, arg.col_ref)) return j;
+        }
+    }
+    return null;
+}
+
+fn groupingColumnName(arena: std.mem.Allocator, index: usize) ParseError![]const u8 {
+    return try std.fmt.allocPrint(arena, "__grouping_{d}", .{index});
+}
+
+fn groupingColumnNames(arena: std.mem.Allocator, count: usize) ParseError![]const []const u8 {
+    const names = try arena.alloc([]const u8, count);
+    for (names, 0..) |*name, i| name.* = try groupingColumnName(arena, i);
+    return names;
+}
+
+/// A mask of the first `n` grouping keys.
+fn lowBits(n: usize) u64 {
+    return if (n >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
+}
+
 fn exprEqual(a: ir.Expr, b: ir.Expr) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {

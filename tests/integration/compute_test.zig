@@ -639,7 +639,7 @@ test "compute: encoding — hex/unhex + base64 round-trips" {
             try b64_concat.append(allocator, '|');
         }
     }
-    try std.testing.expectEqualStrings("4869||7468696e444221|", hex_concat.items);
+    try std.testing.expectEqualStrings("4869||7468696E444221|", hex_concat.items);
     try std.testing.expectEqualStrings("SGk=||dGhpbkRCIQ==|", b64_concat.items);
 
     // Two-layer Compute exercises unhex / from_base64 (Compute v1

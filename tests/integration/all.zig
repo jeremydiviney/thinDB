@@ -27,6 +27,7 @@ test {
     _ = @import("star_join_test.zig");
     _ = @import("unbound_ref_test.zig");
     _ = @import("aggregate_test.zig");
+    _ = @import("grouping_sets_test.zig");
     _ = @import("plan_test.zig");
     _ = @import("sql_test.zig");
     _ = @import("sql_namespace_test.zig");

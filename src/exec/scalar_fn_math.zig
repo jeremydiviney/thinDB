@@ -10,6 +10,7 @@ const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const simd = @import("../util/simd.zig");
 const memory = @import("../memory.zig");
+const jb = @import("json_binary.zig");
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 
@@ -657,6 +658,46 @@ pub const stringToBoolKernel = convertOrNull("boolean", struct {
         return @intFromBool(common.textBoolean(stringViewOf(v).rowBytes(row)) orelse return null);
     }
 }.f);
+
+// ---------------------------------------------------------------------------
+// Text where a number is expected and no CAST was written: MySQL reads the
+// number the text starts with, so these always have an answer
+// (`common.leadingDouble`, `common.leadingInteger`).
+// ---------------------------------------------------------------------------
+
+fn textAsNumber(comptime dst_field: []const u8, comptime read: anytype) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const dst = &@field(out.data, dst_field);
+            try dst.ensureUnusedCapacity(allocator, row_count);
+            var scratch: std.ArrayList(u8) = .empty;
+            defer scratch.deinit(allocator);
+            for (0..row_count) |row| {
+                dst.appendAssumeCapacity(if (args[0].isValid(row)) read(try numericText(allocator, args[0], row, &scratch)) else 0);
+            }
+        }
+    }.kernel;
+}
+
+/// The text a value reads as a number from: a JSON value's unquoted text,
+/// with true and false as 1 and 0, as MySQL reads JSON as a number; other
+/// text as it is.
+fn numericText(allocator: Allocator, v: ColumnView, row: usize, scratch: *std.ArrayList(u8)) ![]const u8 {
+    const bytes = stringViewOf(v).rowBytes(row);
+    if (v.data != .json) return bytes;
+    const norm = jb.normalize(allocator, bytes) catch return bytes;
+    defer if (norm.owned) allocator.free(norm.bytes);
+    scratch.clearRetainingCapacity();
+    switch (jb.tagOf(norm.bytes)) {
+        .true => try scratch.append(allocator, '1'),
+        .false => try scratch.append(allocator, '0'),
+        else => try jb.appendUnquoted(allocator, scratch, norm.bytes),
+    }
+    return scratch.items;
+}
+
+pub const textAsDoubleKernel = textAsNumber("double", common.leadingDouble);
+pub const textAsBigintKernel = textAsNumber("bigint", common.leadingInteger);
 
 pub fn intToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.int;

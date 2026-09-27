@@ -9,6 +9,7 @@ const std = @import("std");
 
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
+const parse_predicate = @import("parse_predicate.zig");
 const Value = types.Value;
 
 pub const ColDefResult = struct { def: ir.ColumnDef, is_pk: bool };
@@ -1039,38 +1040,30 @@ fn parseInsertLike(p: anytype, mode_in: ir.InsertMode) !*ir.Op {
         } });
     }
 
-    var rows: InsertRows = .{};
-    if (p.cur.tag == .kw_set) {
+    const set_form = p.cur.tag == .kw_set;
+    if (set_form) {
         if (cols_opt != null) return PE.SqlExpectedKeyword;
-        try p.advance();
-        var names: std.ArrayList([]const u8) = .empty;
-        while (true) {
-            try names.append(p.arena, try p.dupedIdent());
-            if (p.cur.tag != .eq) return PE.SqlExpectedToken;
-            try p.advance();
-            try rows.cell(p);
-            if (p.cur.tag != .comma) break;
-            try p.advance();
-        }
-        try rows.endRow(p);
-        return try rows.finish(p, mode, ref, names.items, try parseOnDuplicate(p, mode, null, null));
-    }
-
-    if (p.cur.tag != .kw_values and !isIdentText(p, "value")) return PE.SqlExpectedKeyword;
+    } else if (p.cur.tag != .kw_values and !isIdentText(p, "value")) return PE.SqlExpectedKeyword;
     try p.advance();
-    while (true) {
-        if (p.cur.tag == .kw_row) try p.advance();
-        try p.expect(.lparen);
-        while (true) {
-            try rows.cell(p);
-            if (p.cur.tag != .comma) break;
-            try p.advance();
-        }
-        try p.expect(.rparen);
-        try rows.endRow(p);
-        if (p.cur.tag != .comma) break;
-        try p.advance();
+
+    // The first cell that isn't a lone literal turns every row into
+    // expressions, so the rows are read again from here as such. The
+    // literal pass stops before that cell, so rereading repeats no side
+    // effect of parsing an expression.
+    const lex = p.lex.*;
+    const cur = p.cur;
+    const prev_end = p.prev_end;
+    var rows: InsertRows = .{};
+    var names: std.ArrayList([]const u8) = .empty;
+    if (!try rows.read(p, set_form, &names)) {
+        p.lex.* = lex;
+        p.cur = cur;
+        p.prev_end = prev_end;
+        rows = .{ .as_exprs = true };
+        names = .empty;
+        _ = try rows.read(p, set_form, &names);
     }
+    if (set_form) return try rows.finish(p, mode, ref, names.items, try parseOnDuplicate(p, mode, null, null));
 
     var row_alias: ?[]const u8 = null;
     var row_alias_columns: ?[]const []const u8 = null;
@@ -1087,8 +1080,7 @@ fn parseInsertLike(p: anytype, mode_in: ir.InsertMode) !*ir.Op {
 }
 
 /// An INSERT's rows as parsed. Literal rows stay Values, the path bulk
-/// loaders take. The first cell that isn't a lone literal turns every row
-/// into expressions.
+/// loaders take; expression rows become the query INSERT ... SELECT reads.
 const InsertRows = struct {
     literal: std.ArrayList([]const ?Value) = .empty,
     hex_cells: std.ArrayList(ir.InsertCell) = .empty,
@@ -1098,22 +1090,56 @@ const InsertRows = struct {
     cells: std.ArrayList(ir.Expr) = .empty,
     width: ?usize = null,
 
-    fn cell(self: *InsertRows, p: anytype) !void {
-        const literal = try literalCellAhead(p);
-        if (!literal and !self.as_exprs) {
-            self.as_exprs = true;
-            for (self.literal.items) |row| try self.exprs.append(p.arena, try literalExprs(p, row));
-            for (self.row_vals.items) |v| try self.cells.append(p.arena, literalExpr(v));
+    /// Reads the SET assignments, their column names into `names`, or the
+    /// VALUES rows. False when literal rows meet a cell that isn't a lone
+    /// literal, with the cursor left on it.
+    fn read(self: *InsertRows, p: anytype, set_form: bool, names: *std.ArrayList([]const u8)) !bool {
+        const PE = @TypeOf(p.*).Err;
+        if (set_form) {
+            while (true) {
+                try names.append(p.arena, try p.dupedIdent());
+                if (p.cur.tag != .eq) return PE.SqlExpectedToken;
+                try p.advance();
+                if (!try self.cell(p)) return false;
+                if (p.cur.tag != .comma) break;
+                try p.advance();
+            }
+            try self.endRow(p);
+            return true;
         }
+        while (true) {
+            if (p.cur.tag == .kw_row) try p.advance();
+            try p.expect(.lparen);
+            while (true) {
+                if (!try self.cell(p)) return false;
+                if (p.cur.tag != .comma) break;
+                try p.advance();
+            }
+            try p.expect(.rparen);
+            try self.endRow(p);
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+        return true;
+    }
+
+    fn cell(self: *InsertRows, p: anytype) !bool {
+        const literal = try literalCellAhead(p);
         if (!self.as_exprs) {
+            if (!literal) return false;
             if (p.cur.isHexLiteral()) try self.hex_cells.append(p.arena, .{
                 .row = @intCast(self.literal.items.len),
                 .column = @intCast(self.row_vals.items.len),
             });
             try self.row_vals.append(p.arena, try parseInsertValue(p));
-        } else {
-            try self.cells.append(p.arena, if (literal) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
+            return true;
         }
+        // A fraction is the DECIMAL constant it spells, as anywhere else in
+        // an expression, so the rows meet at a decimal that holds each one's
+        // digits rather than at a DOUBLE.
+        const fraction = (try parse_predicate.unsignedTokenAhead(p)).tag == .floating;
+        try self.cells.append(p.arena, if (literal and !fraction) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
+        return true;
     }
 
     fn endRow(self: *InsertRows, p: anytype) !void {
@@ -1224,12 +1250,6 @@ fn literalCellAhead(p: anytype) !bool {
 
 fn literalExpr(v: ?Value) ir.Expr {
     return if (v) |lit| .{ .lit = lit } else .{ .null_lit = .string };
-}
-
-fn literalExprs(p: anytype, row: []const ?Value) ![]const ir.Expr {
-    const out = try p.arena.alloc(ir.Expr, row.len);
-    for (row, out) |v, *e| e.* = literalExpr(v);
-    return out;
 }
 
 /// The rows of a VALUES list as the query INSERT ... SELECT reads: each row
@@ -1678,10 +1698,20 @@ pub fn parseColumnType(p: anytype) !types.Type {
     return PE.SqlExpectedKeyword;
 }
 
+/// A literal cell's value. A fraction whose digits no DOUBLE holds is its
+/// digits as text, which a column reads as it reads the same number
+/// quoted: a DECIMAL exactly, a DOUBLE as the nearest double.
 fn parseInsertValue(p: anytype) !?Value {
     if (p.cur.tag == .kw_null) {
         try p.advance();
         return null;
+    }
+    if (try parse_predicate.inexactFractionAhead(p)) {
+        const negative = p.cur.tag == .minus;
+        if (p.cur.tag != .floating) try p.advance();
+        const digits = if (negative) try std.fmt.allocPrint(p.arena, "-{s}", .{p.cur.text}) else try p.arena.dupe(u8, p.cur.text);
+        try p.advance();
+        return .{ .text = digits };
     }
     return try p.parseValue();
 }

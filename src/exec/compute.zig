@@ -1786,9 +1786,10 @@ fn replaceBuf(allocator: Allocator, buf: *ColumnStore, replacement: ColumnStore)
 
 /// Whether a branch of type `src` reaches the CASE's type through a
 /// tag-level widening kernel (attachCaseCast). Other conversions change
-/// the value's representation (a decimal at another scale, a number as
-/// text) and need retypeBranch's typed cast.
+/// the value's representation (a decimal at another scale, a number or a
+/// JSON value as text) and need retypeBranch's typed cast.
 fn widensByKernel(src: Type, out_type: Type) bool {
+    if (src == .json and out_type != .json) return false;
     if (cast.sameRepresentation(src, out_type)) return true;
     if (src.isDecimal() or out_type.isDecimal()) return false;
     return cast.kernelFor(@as(types.TypeTag, src), @as(types.TypeTag, out_type)) != null;
@@ -2198,11 +2199,12 @@ fn hexNumbersRead(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: E
 
 /// A call no overload accepts as written, with its arguments converted so
 /// one does: the arguments a function returns (GREATEST, COALESCE, IF's
-/// branches) take their common type by the result-type rule, and otherwise
-/// each argument converts to its parameter (`scalar_fn.convertedArgs`).
-/// Literals are converted in place; everything else goes through the typed
-/// cast `CAST(x AS t)` lowers to. Null when no conversion applies, so the
-/// rewritten call can't recurse again.
+/// branches) take their common type by the result-type rule, JSON ones as
+/// their text, and otherwise each argument converts to its parameter
+/// (`scalar_fn.convertedArgs`). Literals are converted in place; everything
+/// else goes through the typed cast `CAST(x AS t)` lowers to, or, for text
+/// read as a number, the reading MySQL gives it with no CAST. Null when no
+/// conversion applies, so the rewritten call can't recurse again.
 fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
     const args = try aa.alloc(Expr, c.args.len);
     // A literal slot may hold a retyped value; a decimal one keeps its digits'
@@ -2211,27 +2213,35 @@ fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr
     if (scalar_fn.resultValueArgsStart(c.fn_name)) |start| if (start < args.len) {
         var typed: std.ArrayList(Type) = .empty;
         for (arg_plans[start..], arg_types[start..]) |ap, t| if (ap != .null_lit) try typed.append(aa, t);
-        const target = cast.commonTypeOf(typed.items) orelse return null;
+        const common = cast.commonTypeOf(typed.items) orelse return null;
+        const target: Type = if (common == .json) .string else common;
         var changed = false;
         for (args[start..], arg_plans[start..], arg_types[start..]) |*a, ap, t| {
             if (ap == .null_lit) {
                 a.* = .{ .null_lit = target };
                 continue;
             }
-            if (cast.sameRepresentation(t, target)) continue;
-            a.* = try convertedArg(aa, a.*, target) orelse return null;
+            if (t != .json and cast.sameRepresentation(t, target)) continue;
+            a.* = try convertedArg(aa, a.*, t, target) orelse return null;
             changed = true;
         }
         return if (changed) Expr{ .call = .{ .fn_name = c.fn_name, .args = args } } else null;
     };
     const targets = try scalar_fn.convertedArgs(aa, udf_registry, c.fn_name, arg_types) orelse return null;
-    for (args, targets) |*a, target| {
-        if (target) |t| a.* = try convertedArg(aa, a.*, t) orelse return null;
+    for (args, arg_types, targets) |*a, given, target| {
+        if (target) |t| a.* = try convertedArg(aa, a.*, given, t) orelse return null;
     }
     return Expr{ .call = .{ .fn_name = c.fn_name, .args = args } };
 }
 
-fn convertedArg(aa: Allocator, e: Expr, target: Type) !?Expr {
+fn convertedArg(aa: Allocator, e: Expr, given: Type, target: Type) !?Expr {
+    if (given.isString()) if (scalar_fn.textAsNumberFn(target)) |reader| {
+        if (e == .lit and e.lit == .text) return Expr{ .lit = switch (target) {
+            .bigint => .{ .bigint = scalar_common.leadingInteger(e.lit.text) },
+            else => .{ .double = scalar_common.leadingDouble(e.lit.text) },
+        } };
+        return Expr{ .call = .{ .fn_name = reader, .args = try aa.dupe(Expr, &.{e}) } };
+    };
     const lit_value: ?types.Value = if (e == .lit) e.lit else if (target.isFloat()) expr_mod.literalValue(e) else null;
     if (lit_value) |lv| if (!target.isString()) {
         var v = lv;
@@ -3004,18 +3014,19 @@ test "a create that fails frees every buffer it built" {
     // waits on, live until every tracked byte is returned: one leaked
     // literal buffer hung close for good (#63).
     const x = [_]Expr{.{ .lit = .{ .text = "x" } }};
-    const sqrt_x: Expr = .{ .call = .{ .fn_name = "sqrt", .args = &x } };
-    const lit_then_bad = [_]Expr{ .{ .lit = .{ .text = "a" } }, sqrt_x };
+    const xy = [_]Expr{ .{ .lit = .{ .text = "x" } }, .{ .lit = .{ .text = "y" } } };
+    const sqrt_xy: Expr = .{ .call = .{ .fn_name = "sqrt", .args = &xy } };
+    const lit_then_bad = [_]Expr{ .{ .lit = .{ .text = "a" } }, sqrt_xy };
     const cases = .{
-        .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = sqrt_x }} },
+        .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = sqrt_xy }} },
         .{ Error.ComputeNoSuchOverload, &[_]Derived{
             .{ .name = "u", .expr = .{ .call = .{ .fn_name = "upper", .args = &x } } },
-            .{ .name = "v", .expr = sqrt_x },
+            .{ .name = "v", .expr = sqrt_xy },
         } },
         .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = .{ .call = .{ .fn_name = "concat", .args = &lit_then_bad } } }} },
         .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = .{ .case = .{
             .branches = &.{.{ .cond = .{ .is_not_null = "a" }, .then = .{ .lit = .{ .text = "y" } } }},
-            .else_branch = &sqrt_x,
+            .else_branch = &sqrt_xy,
         } } }} },
         .{ Error.ComputeNameCollision, &[_]Derived{
             .{ .name = "k", .expr = .{ .lit = .{ .text = "p" } } },

@@ -189,6 +189,28 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
     }
 }
 
+/// MySQL's information functions, answered from the session like
+/// LAST_INSERT_ID(); null for any other name, or where the session has no
+/// value for it. The text is copied: the session's strings change with USE
+/// while a compiled query can still hold the literal.
+fn sessionInfoExpr(ctx: *CompileCtx, name: []const u8) !?ir.Expr {
+    const session = ctx.session.*;
+    if (std.ascii.eqlIgnoreCase(name, "connection_id")) {
+        const id = session.connection_id orelse return null;
+        return .{ .lit = .{ .bigint = id } };
+    }
+    const text: []const u8 = text: {
+        if (std.ascii.eqlIgnoreCase(name, "version")) break :text session.server_version orelse return null;
+        const user_fns = [_][]const u8{ "user", "current_user", "session_user", "system_user" };
+        for (user_fns) |f| if (std.ascii.eqlIgnoreCase(name, f)) break :text session.user orelse return null;
+        if (session.dialect != .mysql) return null;
+        if (!std.ascii.eqlIgnoreCase(name, "database") and !std.ascii.eqlIgnoreCase(name, "schema")) return null;
+        if (session.current_schema.len == 0) return .{ .null_lit = .string };
+        break :text session.current_schema;
+    };
+    return .{ .lit = .{ .text = try (try ctx.subqueryArena()).dupe(u8, text) } };
+}
+
 /// The fraction digits a CURTIME / CURRENT_TIME / UTC_TIME call shows (its
 /// literal precision argument, 0 without one); null for any other call.
 fn clockTimeFsp(c: exec.expr_mod.Expr.Call) ?u8 {
@@ -253,6 +275,10 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                 }
                 if (std.ascii.eqlIgnoreCase(c.fn_name, "row_count")) {
                     e.* = .{ .lit = .{ .bigint = ctx.session.row_count } };
+                    return;
+                }
+                if (try sessionInfoExpr(ctx, c.fn_name)) |info| {
+                    e.* = info;
                     return;
                 }
                 if (std.ascii.eqlIgnoreCase(c.fn_name, "uuid")) {

@@ -529,6 +529,20 @@ pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: T
     }
 }
 
+/// HEX(decimal): the value rounded half away from zero to a BIGINT, as
+/// MySQL reads a DECIMAL as an integer (clamped to the BIGINT range), then
+/// printed as `common.integerHex` prints one.
+pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    const unit = pow10(scaleOf(arg_types[0]));
+    var buf: [16]u8 = undefined;
+    for (0..n) |row| {
+        const whole = roundDiv(mantissaAt(args[0], row), unit);
+        const v: i64 = std.math.cast(i64, whole) orelse if (whole < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+        try common.stringStoreOf(out).appendValue(allocator, common.integerHex(&buf, v));
+    }
+}
+
 /// MySQL's `FORMAT(x, d)`: `x` rounded to `d` places (clamped to 0..30),
 /// its integer part grouped by thousands with `,`. A DECIMAL or an integer
 /// rounds half away from zero; a float rounds its binary value half to even,

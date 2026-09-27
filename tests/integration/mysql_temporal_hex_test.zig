@@ -172,6 +172,7 @@ test "a date or datetime in a numeric context is its YYYYMMDD[HHMMSS] number" {
     try expectRows(allocator, db, "SELECT d + 0 FROM dn ORDER BY id", &.{ "20260926", "20260228", null });
     try expectRows(allocator, db, "SELECT ts + 0 FROM dn ORDER BY id", &.{ "20260926100503", "20260228235959", null });
     try expectRows(allocator, db, "SELECT CAST(d AS SIGNED) FROM dn ORDER BY id", &.{ "20260926", "20260228", null });
+    try expectRows(allocator, db, "SELECT ROUND(SQRT(d), 2) FROM dn ORDER BY id", &.{ "4501.21", "4501.14", null });
     // `d`'s zone maps hold day numbers, which must not prune `d + 0`.
     try expectRows(allocator, db, "SELECT id FROM dn WHERE d + 0 = 20260926", &.{"1"});
     try expectRows(allocator, db, "SELECT id FROM dn WHERE d + 0 > 20260300 ORDER BY id", &.{"1"});
