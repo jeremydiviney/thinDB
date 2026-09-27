@@ -389,6 +389,45 @@ test "INSERT and UPDATE: a value converts to its column's type as MySQL assigns 
     try std.testing.expectEqualSlices(i64, &.{0}, unchanged);
 }
 
+test "INSERT VALUES: a row takes constant expressions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE vx (id BIGINT NOT NULL, x DOUBLE, n BIGINT, s VARCHAR(16), d DATE, PRIMARY KEY (id))");
+    try exec(allocator, db, "INSERT INTO vx VALUES (4, CAST('2.5' AS DOUBLE), 1, 'a', DATE '2024-01-02')");
+    try exec(allocator, db, "INSERT INTO vx VALUES (5, 1 + 1, 2 * 3, CONCAT('b', 'c'), NULL), (6, -1.5, 3, UPPER('d'), DATE_ADD(DATE '2024-01-31', INTERVAL 1 DAY))");
+    try exec(allocator, db, "INSERT INTO vx (id, n, s) VALUES (7, NULL, 'x'), (8, ABS(-8), NULL), (9, 1.5 + 1, 'y')");
+    try exec(allocator, db, "INSERT INTO vx (id, n) VALUES (10, 3 > 2), (11, COALESCE(NULL, 11)), (12, CASE WHEN 1 = 2 THEN 0 ELSE 12 END)");
+    try exec(allocator, db, "REPLACE INTO vx (id, n) VALUES (4, 40 + 0)");
+    const t = try db.openTable("vx", .{});
+    try t.flush();
+
+    const cases = .{
+        .{ "SELECT id FROM vx ORDER BY id", &[_]i64{ 4, 5, 6, 7, 8, 9, 10, 11, 12 } },
+        .{ "SELECT n FROM vx WHERE n IS NOT NULL ORDER BY id", &[_]i64{ 40, 6, 3, 8, 3, 1, 11, 12 } },
+        .{ "SELECT CAST(x * 10 AS BIGINT) FROM vx WHERE x IS NOT NULL ORDER BY id", &[_]i64{ 20, -15 } },
+        .{ "SELECT id FROM vx WHERE s IN ('bc', 'D', 'x', 'y') ORDER BY id", &[_]i64{ 5, 6, 7, 9 } },
+        .{ "SELECT id FROM vx WHERE d = DATE '2024-02-01'", &[_]i64{6} },
+    };
+    inline for (cases) |c| {
+        const got = try collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+    try helpers.expectRunError(allocator, db, "INSERT INTO vx (id, n) VALUES (20, 1 + 1), (21)", error.SqlRowValueWidthMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO vx (id, n) VALUES (20, 1), (21)", error.SqlRowValueWidthMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO vx (id, n) VALUES (20, 1 + 1, 3)", error.BadRequest);
+    try helpers.expectRunError(allocator, db, "INSERT INTO vx (id, n) VALUES (22, 'x' || 1)", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO vx (id, n) VALUES (23, nope + 1)", error.ColumnNotFound);
+}
+
 test "INSERT SELECT: a wider integer narrows into its column when every value fits" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

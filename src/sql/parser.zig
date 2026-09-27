@@ -1933,6 +1933,11 @@ pub const Parser = struct {
         }
     }
 
+    /// One value: a predicate read as a value, or an arithmetic expression.
+    pub fn parseValueExpr(self: *Parser) ParseError!ir.Expr {
+        return if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
+    }
+
     /// A predicate read as a value: TRUE, FALSE, or NULL where it is unknown.
     fn parsePredicateValue(self: *Parser) ParseError!ir.Expr {
         const pred = try self.parseBoolExpr();
@@ -2163,7 +2168,7 @@ pub const Parser = struct {
             try args.append(self.arena, ir.Expr{ .col_ref = "*" });
         } else if (self.cur.tag != .rparen) {
             while (true) {
-                const a = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
+                const a = try self.parseValueExpr();
                 try args.append(self.arena, a);
                 if (self.cur.tag != .comma) break;
                 try self.advance();
@@ -2824,7 +2829,7 @@ pub const Parser = struct {
                     try self.expect(.rparen);
                     return ir.Expr{ .scalar_subquery = @ptrCast(source) };
                 }
-                const inner = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseAddSub();
+                const inner = try self.parseValueExpr();
                 try self.expect(.rparen);
                 return inner;
             },
@@ -4725,7 +4730,7 @@ pub const Parser = struct {
     /// anything else reads through `orderExprKey`.
     fn parseExprOrderKey(self: *Parser, proj: []const ProjItem, keys: *std.ArrayList(ir.Derived)) ParseError!?[]const u8 {
         const window_mark = self.window_expr_refs.items.len;
-        const e = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
+        const e = try self.parseValueExpr();
         // The SELECT list's windows are already collected; one named only
         // here has no Window operator to land in.
         if (self.window_expr_refs.items.len != window_mark) return ParseError.SqlInvalidProjection;

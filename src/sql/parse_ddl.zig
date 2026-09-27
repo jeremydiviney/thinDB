@@ -678,27 +678,44 @@ fn parseInsertLike(p: anytype, mode: ir.InsertMode) !*ir.Op {
     if (p.cur.tag != .kw_values) return PE.SqlExpectedKeyword;
     try p.advance();
 
+    // Literal rows stay Values, the path bulk loaders take. The first cell
+    // that isn't a lone literal turns every row into expressions.
     var rows: std.ArrayList([]const ?Value) = .empty;
-    defer rows.deinit(p.arena);
+    var expr_rows: std.ArrayList([]const ir.Expr) = .empty;
+    var as_exprs = false;
+    var cells: std.ArrayList(ir.Expr) = .empty;
+    var width: ?usize = null;
     while (true) {
         try p.expect(.lparen);
         var row_vals: std.ArrayList(?Value) = .empty;
-        defer row_vals.deinit(p.arena);
+        cells.clearRetainingCapacity();
         while (true) {
-            const v = try parseInsertValue(p);
-            try row_vals.append(p.arena, v);
+            const literal = try literalCellAhead(p);
+            if (!literal and !as_exprs) {
+                as_exprs = true;
+                for (rows.items) |row| try expr_rows.append(p.arena, try literalExprs(p, row));
+                for (row_vals.items) |v| try cells.append(p.arena, literalExpr(v));
+            }
+            if (!as_exprs) {
+                try row_vals.append(p.arena, try parseInsertValue(p));
+            } else {
+                try cells.append(p.arena, if (literal) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
+            }
             if (p.cur.tag != .comma) break;
             try p.advance();
         }
         try p.expect(.rparen);
-        const row_owned = try p.arena.alloc(?Value, row_vals.items.len);
-        for (row_vals.items, 0..) |v, i| row_owned[i] = v;
-        try rows.append(p.arena, row_owned);
+        const row_width = if (as_exprs) cells.items.len else row_vals.items.len;
+        if (row_width != (width orelse row_width)) return PE.SqlRowValueWidthMismatch;
+        width = row_width;
+        if (as_exprs) {
+            try expr_rows.append(p.arena, try p.arena.dupe(ir.Expr, cells.items));
+        } else {
+            try rows.append(p.arena, row_vals.items);
+        }
         if (p.cur.tag != .comma) break;
         try p.advance();
     }
-    const rows_owned = try p.arena.alloc([]const ?Value, rows.items.len);
-    for (rows.items, 0..) |r, i| rows_owned[i] = r;
 
     // MySQL upsert clause: `ON DUPLICATE KEY UPDATE col = VALUES(col), ...`.
     // thinDB's INSERT already upserts on a unique table (last-writer-wins) and
@@ -729,12 +746,75 @@ fn parseInsertLike(p: anytype, mode: ir.InsertMode) !*ir.Op {
         }
     }
 
+    if (as_exprs) return try p.allocOp(.{ .insert_select = .{
+        .mode = mode,
+        .table = ref,
+        .columns = cols_opt,
+        .source = try valuesQuery(p, expr_rows.items),
+    } });
     return try p.allocOp(.{ .insert = .{
         .mode = mode,
         .table = ref,
         .columns = cols_opt,
-        .rows = rows_owned,
+        .rows = rows.items,
     } });
+}
+
+/// Whether the VALUES cell at the cursor is a lone literal: NULL, TRUE,
+/// FALSE, a string, a number with an optional sign, or a DATE, DATETIME or
+/// TIMESTAMP string.
+fn literalCellAhead(p: anytype) !bool {
+    var look = p.lex.*;
+    var tok = p.cur;
+    switch (tok.tag) {
+        .kw_null, .kw_true, .kw_false, .string, .integer, .floating => {},
+        .plus, .minus => {
+            tok = try look.next();
+            if (tok.tag != .integer and tok.tag != .floating) return false;
+        },
+        .identifier => {
+            if (!asciiEqlAny(tok.text, &.{ "date", "datetime", "timestamp" })) return false;
+            tok = try look.next();
+            if (tok.tag != .string) return false;
+        },
+        else => return false,
+    }
+    const after = try look.next();
+    return after.tag == .comma or after.tag == .rparen;
+}
+
+fn literalExpr(v: ?Value) ir.Expr {
+    return if (v) |lit| .{ .lit = lit } else .{ .null_lit = .string };
+}
+
+fn literalExprs(p: anytype, row: []const ?Value) ![]const ir.Expr {
+    const out = try p.arena.alloc(ir.Expr, row.len);
+    for (row, out) |v, *e| e.* = literalExpr(v);
+    return out;
+}
+
+/// The rows of a VALUES list as the query INSERT ... SELECT reads: each row
+/// a FROM-less SELECT, all of them a UNION ALL, balanced so a long list
+/// nests only log2(rows) deep.
+fn valuesQuery(p: anytype, rows: []const []const ir.Expr) !*ir.Op {
+    if (rows.len > 1) {
+        const half = rows.len / 2;
+        return try p.allocOp(.{ .set_union = .{
+            .left = try valuesQuery(p, rows[0..half]),
+            .right = try valuesQuery(p, rows[half..]),
+            .all = true,
+        } });
+    }
+    const row = rows[0];
+    const derived = try p.arena.alloc(ir.Derived, row.len);
+    const names = try p.arena.alloc([]const u8, row.len);
+    for (row, derived, names, 0..) |e, *d, *name, i| {
+        name.* = try std.fmt.allocPrint(p.arena, "__value_{d}", .{i});
+        d.* = .{ .name = name.*, .expr = e };
+    }
+    const single = try p.allocOp(.{ .single_row = {} });
+    const compute = try p.allocOp(.{ .compute = .{ .derived = derived, .upstream = single } });
+    return try p.allocOp(.{ .select = .{ .columns = names, .upstream = compute } });
 }
 
 /// COPY [db.][schema.]table [(col, ...)] FROM STDIN [WITH (...)]
