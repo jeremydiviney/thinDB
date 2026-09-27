@@ -1,6 +1,8 @@
 //! Unique-key upsert resolution. Implements StarRocks-style "last writer
 //! wins" semantics on tables created with `unique = true`. Called from
-//! `Table.insert` after `insertRows` lands the new rows.
+//! `Table.insert` after `insertRows` lands the new rows. INSERT IGNORE and
+//! INSERT ... ON DUPLICATE KEY UPDATE resolve a present key their own way
+//! (`insertOnDuplicateLocked`) before the rows reach it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,6 +16,8 @@ const types = @import("../types.zig");
 const Table = api.Table;
 const comparison = @import("comparison.zig");
 const bloom = @import("../util/bloom.zig");
+const delete_mod = @import("delete.zig");
+const update_mod = @import("update.zig");
 
 /// Hash each row's compound primary key and append to `out`. Segment writers
 /// (flush + compaction) call this to build the per-segment key Bloom; it uses
@@ -372,6 +376,347 @@ fn compoundKeyFromOwnedColumns(
         try comparison.appendColumnValueBytes(aa, &buf, c.view(), row);
     }
     return buf.toOwnedSlice(aa);
+}
+
+/// What an INSERT does with a row whose key the table already holds, where
+/// plain INSERT replaces it (last writer wins).
+pub const OnDuplicate = union(enum) {
+    /// INSERT IGNORE: keep the stored row and drop the new one. A key repeated
+    /// within the statement keeps its first row.
+    ignore,
+    /// ON DUPLICATE KEY UPDATE: rewrite the stored row through the
+    /// assignments, which name its columns as they are and the new row's under
+    /// `incoming_prefix`. A key repeated within the statement applies them in
+    /// turn, each row against the result of the one before.
+    update: []const update_mod.Assignment,
+};
+
+/// Column-name prefix under which ON DUPLICATE KEY UPDATE assignments see the
+/// row being inserted.
+pub const incoming_prefix = "__incoming__.";
+
+pub const DuplicateCounts = struct {
+    inserted: usize = 0,
+    updated: usize = 0,
+};
+
+/// INSERT under a duplicate-key rule on a unique table. Caller holds the
+/// table mutex; `wal_target` receives the WAL offset to await.
+pub fn insertOnDuplicateLocked(
+    t: *Table,
+    batch_schema: []const types.Column,
+    views: []const storage.ColumnView,
+    row_count: usize,
+    action: OnDuplicate,
+    wal_target: *?u64,
+) !DuplicateCounts {
+    std.debug.assert(t.schema.unique and t.order_key_indices.len > 0);
+    try t.ensureUsable();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Staged in the table's own types, the rows' keys encode exactly as the
+    // stored rows' keys do.
+    var incoming = try engine.Memtable.init(t.allocator, t.schema);
+    defer incoming.deinit();
+    try incoming.insertColumnarBatch(batch_schema, views, row_count);
+
+    var slot_of: std.StringHashMapUnmanaged(u32) = .empty;
+    var slot_first_row: std.ArrayList(u32) = .empty;
+    const row_slot = try aa.alloc(u32, row_count);
+    for (row_slot, 0..) |*slot, i| {
+        const key = try compoundKeyFromColumnStores(aa, incoming.columns, t.order_key_indices, @intCast(i));
+        const gop = try slot_of.getOrPut(aa, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(slot_first_row.items.len);
+            try slot_first_row.append(aa, @intCast(i));
+        }
+        slot.* = gop.value_ptr.*;
+    }
+
+    var current = try engine.Memtable.init(t.allocator, t.schema);
+    defer current.deinit();
+    const slot_current = try aa.alloc(?u32, slot_first_row.items.len);
+    @memset(slot_current, null);
+    try collectStoredRows(t, aa, &slot_of, &incoming, slot_first_row.items, &current, slot_current);
+
+    return switch (action) {
+        .ignore => try insertAbsentRows(t, aa, &incoming, row_slot, slot_current, wal_target),
+        .update => |assignments| try mergeRows(t, aa, &incoming, row_slot, &current, slot_current, assignments, wal_target),
+    };
+}
+
+/// Copy into `current` the stored row of every key in `slot_of` the table
+/// holds, recording where it landed in `slot_current`. Upsert resolution
+/// leaves one live row per key, in the memtable or in a segment.
+fn collectStoredRows(
+    t: *Table,
+    aa: Allocator,
+    slot_of: *const std.StringHashMapUnmanaged(u32),
+    incoming: *const engine.Memtable,
+    slot_first_row: []const u32,
+    current: *engine.Memtable,
+    slot_current: []?u32,
+) !void {
+    const oki = t.order_key_indices;
+    var keybuf: std.ArrayList(u8) = .empty;
+    var found: usize = 0;
+
+    var hits: std.ArrayList(u32) = .empty;
+    var hit_slots: std.ArrayList(u32) = .empty;
+    const mt_rows: usize = @intCast(t.memtable.row_count);
+    for (0..mt_rows) |i| {
+        keybuf.clearRetainingCapacity();
+        for (oki) |ci| try comparison.appendColumnValueBytes(aa, &keybuf, t.memtable.columns[ci].view(), @intCast(i));
+        const slot = slot_of.get(keybuf.items) orelse continue;
+        if (slot_current[slot] != null) continue;
+        slot_current[slot] = 0;
+        try hits.append(aa, @intCast(i));
+        try hit_slots.append(aa, slot);
+    }
+    try appendHits(t.allocator, t.memtable.columns, hits.items, hit_slots.items, current, slot_current);
+    found += hits.items.len;
+    if (found == slot_current.len or t.manifest.segments.items.len == 0) return;
+
+    var hashes: std.ArrayList(u64) = .empty;
+    var first_vals: std.ArrayList(types.Value) = .empty;
+    var prune_ok = true;
+    var it = slot_of.iterator();
+    while (it.next()) |e| {
+        if (slot_current[e.value_ptr.*] != null) continue;
+        try hashes.append(aa, bloom.keyHash(e.key_ptr.*));
+        const first_row = slot_first_row[e.value_ptr.*];
+        if (try viewValueAt(aa, incoming.columns[oki[0]].view(), first_row)) |v| {
+            try first_vals.append(aa, v);
+        } else {
+            prune_ok = false;
+        }
+    }
+
+    for (t.manifest.segments.items) |entry| {
+        if (found == slot_current.len) break;
+        if (!bloomAdmitsAny(entry.key_bloom, hashes.items)) continue;
+        const handle = try t.acquireSegment(entry.segment_id);
+        defer t.releaseSegment(handle);
+        const seg = &handle.seg;
+        const tombs = try t.segmentTombstones(t.allocator, handle);
+        defer if (tombs) |x| t.allocator.free(x);
+        var dead = delete_mod.TombCursor{ .tombs = tombs orelse &.{} };
+
+        var row_offset: u32 = 0;
+        for (seg.info.row_groups, 0..) |rg, rg_idx| {
+            defer row_offset += rg.row_count;
+            if (prune_ok) {
+                const admit = for (first_vals.items) |v| {
+                    if (exec.predicate.statsOverlapPredicate(rg.stats[oki[0]], .eq, v)) break true;
+                } else false;
+                if (!admit) continue;
+            }
+
+            const decoded_keys = try aa.alloc(storage.OwnedColumn, oki.len);
+            var decoded_count: usize = 0;
+            defer for (decoded_keys[0..decoded_count]) |*c| c.deinit(t.allocator);
+            for (oki, decoded_keys) |col_idx, *c| {
+                c.* = try seg.decodeColumn(t.allocator, t.schema, rg_idx, col_idx);
+                decoded_count += 1;
+            }
+
+            hits.clearRetainingCapacity();
+            hit_slots.clearRetainingCapacity();
+            for (0..rg.row_count) |r| {
+                const row: u32 = @intCast(r);
+                if (dead.isDead(row_offset + row)) continue;
+                const key = try compoundKeyFromOwnedColumns(aa, decoded_keys, row);
+                const slot = slot_of.get(key) orelse continue;
+                if (slot_current[slot] != null) continue;
+                slot_current[slot] = 0;
+                try hits.append(aa, row);
+                try hit_slots.append(aa, slot);
+            }
+            if (hits.items.len == 0) continue;
+
+            const decoded_all = try aa.alloc(storage.OwnedColumn, t.schema.columns.len);
+            var all_count: usize = 0;
+            defer for (decoded_all[0..all_count]) |*c| c.deinit(t.allocator);
+            const stores = try aa.alloc(storage.ColumnView, t.schema.columns.len);
+            for (decoded_all, stores, 0..) |*c, *view, ci| {
+                c.* = try seg.decodeColumn(t.allocator, t.schema, rg_idx, ci);
+                all_count += 1;
+                view.* = c.view();
+            }
+            try appendHitViews(t.allocator, stores, hits.items, hit_slots.items, current, slot_current);
+            found += hits.items.len;
+        }
+    }
+}
+
+fn appendHits(
+    allocator: Allocator,
+    columns: []const engine.ColumnStore,
+    rows: []const u32,
+    slots: []const u32,
+    current: *engine.Memtable,
+    slot_current: []?u32,
+) !void {
+    if (rows.len == 0) return;
+    for (columns, current.columns) |src, *dst| try engine.transform.appendByIndices(allocator, src.view(), rows, dst);
+    assignSlots(current, slots, slot_current);
+}
+
+fn appendHitViews(
+    allocator: Allocator,
+    views: []const storage.ColumnView,
+    rows: []const u32,
+    slots: []const u32,
+    current: *engine.Memtable,
+    slot_current: []?u32,
+) !void {
+    for (views, current.columns) |view, *dst| try engine.transform.appendByIndices(allocator, view, rows, dst);
+    assignSlots(current, slots, slot_current);
+}
+
+/// Point `slots` at the rows just appended to `current`, in order.
+fn assignSlots(current: *engine.Memtable, slots: []const u32, slot_current: []?u32) void {
+    const base: u32 = @intCast(current.row_count);
+    for (slots, 0..) |slot, k| slot_current[slot] = base + @as(u32, @intCast(k));
+    current.row_count += slots.len;
+}
+
+/// INSERT IGNORE: insert each key's first row when the table doesn't hold
+/// the key.
+fn insertAbsentRows(
+    t: *Table,
+    aa: Allocator,
+    incoming: *const engine.Memtable,
+    row_slot: []const u32,
+    slot_current: []const ?u32,
+    wal_target: *?u64,
+) !DuplicateCounts {
+    const keep = try aa.alloc(bool, row_slot.len);
+    const seen = try aa.alloc(bool, slot_current.len);
+    @memset(seen, false);
+    var kept: usize = 0;
+    for (row_slot, keep) |slot, *k| {
+        k.* = slot_current[slot] == null and !seen[slot];
+        seen[slot] = true;
+        if (k.*) kept += 1;
+    }
+    if (kept == 0) return .{};
+    const retained = try incoming.cloneWithRetainedRows(t.allocator, keep);
+    defer if (retained) |m| {
+        m.retire();
+        m.release();
+    };
+    const rows = retained orelse incoming;
+    const views = try aa.alloc(storage.ColumnView, rows.columns.len);
+    for (rows.columns, views) |*c, *v| v.* = c.view();
+    wal_target.* = try t.insertBatchInner(t.schema.columns, views, kept);
+    return .{ .inserted = kept };
+}
+
+/// ON DUPLICATE KEY UPDATE, in rounds: round r takes each key's r-th row of
+/// the statement, so a repeated key meets the row its previous occurrence
+/// left, as MySQL's row-at-a-time loop would have it. A row whose key has a
+/// current row rewrites it through the assignments; any other row becomes
+/// its key's current row as is. Every key the statement touched is then
+/// written once, replacing its stored row.
+fn mergeRows(
+    t: *Table,
+    aa: Allocator,
+    incoming: *const engine.Memtable,
+    row_slot: []const u32,
+    current: *engine.Memtable,
+    slot_current: []?u32,
+    assignments: []const update_mod.Assignment,
+    wal_target: *?u64,
+) !DuplicateCounts {
+    var counts: DuplicateCounts = .{};
+    const occurrence = try aa.alloc(u32, row_slot.len);
+    const seen_count = try aa.alloc(u32, slot_current.len);
+    @memset(seen_count, 0);
+    var rounds: u32 = 0;
+    for (row_slot, occurrence) |slot, *occ| {
+        occ.* = seen_count[slot];
+        seen_count[slot] += 1;
+        rounds = @max(rounds, seen_count[slot]);
+    }
+    const touched = try aa.alloc(bool, slot_current.len);
+    @memset(touched, false);
+
+    var fresh: std.ArrayList(u32) = .empty;
+    var fresh_slots: std.ArrayList(u32) = .empty;
+    var pair_incoming: std.ArrayList(u32) = .empty;
+    var pair_current: std.ArrayList(u32) = .empty;
+    var pair_slots: std.ArrayList(u32) = .empty;
+    for (0..rounds) |round| {
+        fresh.clearRetainingCapacity();
+        fresh_slots.clearRetainingCapacity();
+        pair_incoming.clearRetainingCapacity();
+        pair_current.clearRetainingCapacity();
+        pair_slots.clearRetainingCapacity();
+        for (row_slot, occurrence, 0..) |slot, occ, i| {
+            if (occ != round) continue;
+            touched[slot] = true;
+            if (slot_current[slot]) |cur| {
+                try pair_incoming.append(aa, @intCast(i));
+                try pair_current.append(aa, cur);
+                try pair_slots.append(aa, slot);
+            } else {
+                try fresh.append(aa, @intCast(i));
+                try fresh_slots.append(aa, slot);
+            }
+        }
+        if (fresh.items.len > 0) {
+            try appendHits(t.allocator, incoming.columns, fresh.items, fresh_slots.items, current, slot_current);
+            counts.inserted += fresh.items.len;
+        }
+        if (pair_incoming.items.len > 0) {
+            try appendMergedRows(t, aa, incoming, current, pair_incoming.items, pair_current.items, assignments);
+            assignSlots(current, pair_slots.items, slot_current);
+            counts.updated += pair_incoming.items.len;
+        }
+    }
+
+    var final_rows: std.ArrayList(u32) = .empty;
+    for (touched, slot_current) |was_touched, cur| {
+        if (was_touched) try final_rows.append(aa, cur.?);
+    }
+    var out = try engine.Memtable.init(t.allocator, t.schema);
+    defer out.deinit();
+    for (current.columns, out.columns) |src, *dst| try engine.transform.appendByIndices(t.allocator, src.view(), final_rows.items, dst);
+    const views = try aa.alloc(storage.ColumnView, out.columns.len);
+    for (out.columns, views) |*c, *v| v.* = c.view();
+    wal_target.* = try t.insertBatchInner(t.schema.columns, views, final_rows.items.len);
+    return counts;
+}
+
+/// Append to `current` the assignments' result for each pair: row
+/// `current_rows[k]` of `current` as the stored row, row
+/// `incoming_rows[k]` of `incoming` as the new one.
+fn appendMergedRows(
+    t: *Table,
+    aa: Allocator,
+    incoming: *const engine.Memtable,
+    current: *engine.Memtable,
+    incoming_rows: []const u32,
+    current_rows: []const u32,
+    assignments: []const update_mod.Assignment,
+) !void {
+    var stored = try engine.Memtable.init(t.allocator, t.schema);
+    defer stored.deinit();
+    var new_rows = try engine.Memtable.init(t.allocator, t.schema);
+    defer new_rows.deinit();
+    for (current.columns, incoming.columns, stored.columns, new_rows.columns) |cur_src, inc_src, *cur_dst, *inc_dst| {
+        try engine.transform.appendByIndices(t.allocator, cur_src.view(), current_rows, cur_dst);
+        try engine.transform.appendByIndices(t.allocator, inc_src.view(), incoming_rows, inc_dst);
+    }
+    const incoming_views = try aa.alloc(storage.ColumnView, new_rows.columns.len);
+    for (new_rows.columns, incoming_views) |*c, *v| v.* = c.view();
+
+    var merged = try update_mod.computeNewRows(t, .{ .stores = stored.columns, .row_count = current_rows.len }, incoming_views, assignments);
+    defer update_mod.freeMaterializedRows(t.allocator, &merged);
+    for (merged.stores, current.columns) |*src, *dst| try engine.transform.appendAllColumn(t.allocator, src.view(), dst);
 }
 
 test "memtable swaps invalidate the incremental upsert index (gen counter, not pointer)" {
