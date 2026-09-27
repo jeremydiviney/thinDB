@@ -1648,8 +1648,8 @@ pub const Parser = struct {
         // operators and aliasing work. (`GROUP BY 1` then references it
         // as ordinal 1.)
         switch (self.cur.tag) {
-            .plus, .minus, .integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
-                const expr = try self.parseAddSub();
+            .plus, .minus, .tilde, .integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
+                const expr = try self.parseScalar();
                 const default_name = try self.exprDefaultName(expr);
                 const alias = try self.maybeAlias(default_name);
                 return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
@@ -1747,7 +1747,7 @@ pub const Parser = struct {
                 // A leading window call continued by an operator
                 // (`SUM(x) OVER (...) / 12`) hoists like the IS NULL
                 // form: hidden window column + expression over it.
-                if (isBinaryOpToken(self.cur.tag)) {
+                if (try self.binaryOpAhead()) {
                     const hidden_name = try self.materializeWindowExpr(call);
                     const expr = try self.continueBinaryFrom(ir.Expr{ .col_ref = hidden_name });
                     const default_name = try self.exprDefaultName(expr);
@@ -1779,7 +1779,7 @@ pub const Parser = struct {
                 // An aggregate continued by an operator (`SUM(a) / COUNT(*)`)
                 // hoists to a hidden aggregate output exactly like the nested
                 // form, then keeps parsing the expression.
-                if (isBinaryOpToken(self.cur.tag)) {
+                if (try self.binaryOpAhead()) {
                     const agg_name = try self.materializeAggregateExpr(first, func, args, saw_distinct);
                     const expr = try self.continueBinaryFrom(ir.Expr{ .col_ref = agg_name });
                     const default_name = try self.exprDefaultName(expr);
@@ -1827,7 +1827,7 @@ pub const Parser = struct {
 
         // A `col::type` postfix cast (PG) and/or a trailing binary
         // operator (`qty + 1`) lift the column ref into an expression.
-        if ((self.cur.tag == .coloncolon and self.lex.dialect != .mysql) or isBinaryOpToken(self.cur.tag)) {
+        if ((self.cur.tag == .coloncolon and self.lex.dialect != .mysql) or try self.binaryOpAhead()) {
             var expr = ir.Expr{ .col_ref = dup_col };
             while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
                 try self.advance();
@@ -1997,10 +1997,11 @@ pub const Parser = struct {
                 .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into => {
                     if (depth == 0) return false;
                 },
-                .eq, .neq, .lt, .lte, .gt, .gte, .kw_is, .kw_in, .kw_between, .kw_like, .kw_regexp, .kw_and, .kw_or, .kw_not => {
+                .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq, .kw_is, .kw_in, .kw_between, .kw_like, .kw_regexp, .kw_and, .amp_amp, .kw_or, .kw_not => {
                     if (depth == 0) return true;
                 },
                 .pipe_pipe => if (depth == 0 and self.lex.dialect == .mysql) return true,
+                .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(tok.text, "xor") and tok.text.ptr != self.cur.text.ptr) return true,
                 else => {},
             }
         }
@@ -2011,9 +2012,12 @@ pub const Parser = struct {
         return if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
     }
 
-    /// A predicate read as a value: TRUE, FALSE, or NULL where it is unknown.
     fn parsePredicateValue(self: *Parser) ParseError!ir.Expr {
-        const pred = try self.parseBoolExpr();
+        return try self.predicateAsValue(try self.parseBoolExpr());
+    }
+
+    /// A predicate read as a value: TRUE, FALSE, or NULL where it is unknown.
+    pub fn predicateAsValue(self: *Parser, pred: PredicateExpr) ParseError!ir.Expr {
         const never_unknown = switch (pred) {
             .exists_subquery, .always, .is_null, .is_not_null => true,
             .not => |child| child.* == .exists_subquery,
@@ -2113,12 +2117,24 @@ pub const Parser = struct {
         } };
     }
 
-    /// True when `tag` is one of the binary arithmetic operators we
-    /// recognize in expression position (+ - * / %).
-    fn isBinaryOpToken(tag: TokenTag) bool {
-        return switch (tag) {
-            .plus, .minus, .star, .slash, .percent, .kw_div, .pipe_pipe, .arrow, .arrow2 => true,
-            else => false,
+    /// Whether a binary operator of the expression sub-language sits at the
+    /// cursor, so an operand already parsed continues into an expression.
+    fn binaryOpAhead(self: *Parser) ParseError!bool {
+        return switch (self.cur.tag) {
+            .plus, .minus, .star, .slash, .percent, .kw_div, .pipe_pipe, .arrow, .arrow2, .amp, .pipe, .caret, .shl, .shr => true,
+            else => try self.modOperatorAhead(),
+        };
+    }
+
+    /// `MOD` between two operands is MySQL's spelling of `%`. It lexes as
+    /// an identifier, so it is the operator only when a value follows it.
+    pub fn modOperatorAhead(self: *Parser) ParseError!bool {
+        if (self.cur.tag != .identifier or !std.ascii.eqlIgnoreCase(self.cur.text, "mod")) return false;
+        var look = self.lex.*;
+        const next = try look.next();
+        return switch (next.tag) {
+            .identifier, .integer, .floating, .string, .lparen, .minus, .plus, .tilde, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case => true,
+            else => keywordScalarName(next.tag) != null,
         };
     }
 
@@ -2136,38 +2152,9 @@ pub const Parser = struct {
     pub fn continueBinaryFrom(self: *Parser, atom: ir.Expr) ParseError!ir.Expr {
         // JSON `->`/`->>` bind tighter than arithmetic — consume any that
         // trail the already-parsed atom before climbing precedence levels.
-        var lhs = try self.consumeJsonArrows(atom);
-        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent or self.cur.tag == .kw_div) {
-            const fn_name: []const u8 = switch (self.cur.tag) {
-                .star => "mul",
-                .slash => "div",
-                .percent => "mod",
-                .kw_div => "intdiv",
-                else => unreachable,
-            };
-            try self.advance();
-            const rhs = try self.parseCallAtom();
-            lhs = try self.makeBinary(fn_name, lhs, rhs);
-        }
-        // Then extend into an AddSub-level expression.
-        while (self.cur.tag == .plus or self.cur.tag == .minus or self.concatOpHere()) {
-            if (self.concatOpHere()) {
-                try self.advance();
-                const rhs = try self.parseMulDiv();
-                lhs = try self.makeBinary("concat", lhs, rhs);
-                continue;
-            }
-            const is_minus = self.cur.tag == .minus;
-            try self.advance();
-            if (self.cur.tag == .kw_interval) {
-                lhs = try self.applyInterval(lhs, is_minus);
-            } else {
-                const fn_name: []const u8 = if (is_minus) "sub" else "add";
-                const rhs = try self.parseMulDiv();
-                lhs = try self.makeBinary(fn_name, lhs, rhs);
-            }
-        }
-        return lhs;
+        const xored = try self.continueBitXor(try self.consumeJsonArrows(atom));
+        const sum = try self.continueAddSub(try self.continueMulDiv(xored));
+        return try self.continueBitOr(try self.continueBitAnd(try self.continueShift(sum)));
     }
 
     /// Cursor sits on the INTERVAL keyword. Consume the
@@ -2178,7 +2165,7 @@ pub const Parser = struct {
         try self.expect(.kw_interval);
         // Accept both `'90'` (string) and bare integer for the
         // quantity — MySQL / DuckDB use string, PG uses bare integer.
-        var amount = try self.parseAddSub();
+        var amount = try self.parseScalar();
         amount = try self.normalizeIntervalAmount(amount, negate);
 
         return try self.intervalCall(lhs, amount);
@@ -2257,7 +2244,7 @@ pub const Parser = struct {
 
         if (self.cur.tag == .kw_interval) {
             try self.advance();
-            var amount = try self.parseAddSub();
+            var amount = try self.parseScalar();
             amount = try self.normalizeIntervalAmount(amount, kind == .sub);
             const call = try self.intervalCall(base, amount);
             try self.expect(.rparen);
@@ -2646,20 +2633,66 @@ pub const Parser = struct {
 
     /// One argument to a scalar function call. Entry point for the
     /// expression sub-language used inside call args / projections.
-    /// Precedence layers:
-    ///   parseCallArg → parseAddSub  (lowest: + -)
-    ///                → parseMulDiv  (next:   * / %)
-    ///                → parseCallAtom (leaf: ident / call / literal)
-    /// Aggregates and window functions are rejected inside this
-    /// sub-language (atom layer enforces it).
+    /// Precedence layers, loosest first, as MySQL orders them; every level
+    /// is left-associative:
+    ///   parseScalar (|) → parseBitAnd (&) → parseShift (<< >>)
+    ///   → parseAddSub (+ - ||) → parseMulDiv (* / % DIV MOD)
+    ///   → parseBitXor (^) → parseCallAtom (leaf: ident / call / literal)
+    /// Each level's `continue*` extends an operand already parsed, which
+    /// is how `continueBinaryFrom` climbs from an atom. Aggregates and
+    /// window functions are rejected inside this sub-language (atom layer
+    /// enforces it).
     pub fn parseCallArg(self: *Parser) ParseError!ir.Expr {
-        return try self.parseAddSub();
+        return try self.parseScalar();
     }
 
-    /// `+` / `-` binary operators, lowest precedence in the expr
-    /// sub-language. Left-associative.
-    pub fn parseAddSub(self: *Parser) ParseError!ir.Expr {
-        var lhs = try self.parseMulDiv();
+    /// One scalar expression: the loosest level, bitwise OR.
+    pub fn parseScalar(self: *Parser) ParseError!ir.Expr {
+        return try self.continueBitOr(try self.parseBitAnd());
+    }
+
+    fn continueBitOr(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
+        var lhs = first;
+        while (self.cur.tag == .pipe) {
+            try self.advance();
+            lhs = try self.makeBinary("bitor", lhs, try self.parseBitAnd());
+        }
+        return lhs;
+    }
+
+    fn parseBitAnd(self: *Parser) ParseError!ir.Expr {
+        return try self.continueBitAnd(try self.parseShift());
+    }
+
+    fn continueBitAnd(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
+        var lhs = first;
+        while (self.cur.tag == .amp) {
+            try self.advance();
+            lhs = try self.makeBinary("bitand", lhs, try self.parseShift());
+        }
+        return lhs;
+    }
+
+    fn parseShift(self: *Parser) ParseError!ir.Expr {
+        return try self.continueShift(try self.parseAddSub());
+    }
+
+    fn continueShift(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
+        var lhs = first;
+        while (self.cur.tag == .shl or self.cur.tag == .shr) {
+            const fn_name: []const u8 = if (self.cur.tag == .shl) "bit_shift_left" else "bit_shift_right";
+            try self.advance();
+            lhs = try self.makeBinary(fn_name, lhs, try self.parseAddSub());
+        }
+        return lhs;
+    }
+
+    fn parseAddSub(self: *Parser) ParseError!ir.Expr {
+        return try self.continueAddSub(try self.parseMulDiv());
+    }
+
+    fn continueAddSub(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
+        var lhs = first;
         while (self.cur.tag == .plus or self.cur.tag == .minus or self.concatOpHere()) {
             if (self.concatOpHere()) {
                 try self.advance();
@@ -2680,21 +2713,38 @@ pub const Parser = struct {
         return lhs;
     }
 
-    /// `*` / `/` / `%` binary operators, higher precedence than + / -.
-    /// Left-associative.
     fn parseMulDiv(self: *Parser) ParseError!ir.Expr {
-        var lhs = try self.parseCallAtom();
-        while (self.cur.tag == .star or self.cur.tag == .slash or self.cur.tag == .percent or self.cur.tag == .kw_div) {
+        return try self.continueMulDiv(try self.parseBitXor());
+    }
+
+    fn continueMulDiv(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
+        var lhs = first;
+        while (true) {
             const fn_name: []const u8 = switch (self.cur.tag) {
                 .star => "mul",
                 .slash => "div",
                 .percent => "mod",
                 .kw_div => "intdiv",
-                else => unreachable,
+                else => if (try self.modOperatorAhead()) "mod" else break,
             };
             try self.advance();
-            const rhs = try self.parseCallAtom();
-            lhs = try self.makeBinary(fn_name, lhs, rhs);
+            lhs = try self.makeBinary(fn_name, lhs, try self.parseBitXor());
+        }
+        return lhs;
+    }
+
+    fn parseBitXor(self: *Parser) ParseError!ir.Expr {
+        return try self.continueBitXor(try self.parseCallAtom());
+    }
+
+    /// `^` is bitwise XOR on MySQL (and StarRocks) and exponentiation on
+    /// PG (and DuckDB); either way it binds tighter than `*`.
+    fn continueBitXor(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
+        var lhs = first;
+        while (self.cur.tag == .caret) {
+            const fn_name: []const u8 = if (self.lex.dialect == .mysql) "bitxor" else "pow";
+            try self.advance();
+            lhs = try self.makeBinary(fn_name, lhs, try self.parseCallAtom());
         }
         return lhs;
     }
@@ -2812,7 +2862,7 @@ pub const Parser = struct {
     /// is always UTF-8, so a charset conversion returns its argument.
     fn parseConvertCallAfterName(self: *Parser) ParseError!ir.Expr {
         try self.expect(.lparen);
-        const inner = try self.parseCallArg();
+        const inner = try self.parseValueExpr();
         const result = if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "using")) blk: {
             try self.advance();
             if (self.cur.tag != .identifier and self.cur.tag != .string) return ParseError.SqlExpectedIdent;
@@ -2829,7 +2879,7 @@ pub const Parser = struct {
     /// `(expr AS type)` after the `CAST` keyword.
     fn parseCastCallAfterName(self: *Parser) ParseError!ir.Expr {
         try self.expect(.lparen);
-        const inner = try self.parseCallArg();
+        const inner = try self.parseValueExpr();
         if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
         try self.advance();
         const result = try self.parseCastTarget(inner);
@@ -2933,6 +2983,12 @@ pub const Parser = struct {
                 try self.advance();
                 const rhs = try self.parseCallAtom();
                 return try self.negateExpr(rhs);
+            },
+            .tilde => {
+                try self.advance();
+                const args = try self.arena.alloc(ir.Expr, 1);
+                args[0] = try self.parseCallAtom();
+                return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "bitnot"), .args = args } };
             },
             .floating => {
                 const tok = self.cur;
@@ -4302,12 +4358,12 @@ pub const Parser = struct {
                 try self.advance();
                 open_groups -= 1;
             }
-            if (self.cur.tag != .kw_and) break;
+            if (self.cur.tag != .kw_and and self.cur.tag != .amp_amp) break;
             try self.advance();
         }
         // OR / general boolean ON predicates aren't join keys; reject rather
         // than silently mis-join.
-        if (self.cur.tag == .kw_or or (self.cur.tag == .pipe_pipe and self.lex.dialect == .mysql)) {
+        if (self.cur.tag == .kw_or or (self.cur.tag == .pipe_pipe and self.lex.dialect == .mysql) or parse_predicate.xorKeywordHere(self)) {
             return ParseError.SqlOnNonEquiUnsupported;
         }
         if (open_groups > 0) return ParseError.SqlExpectedToken;
@@ -4473,7 +4529,7 @@ pub const Parser = struct {
                     depth -= 1;
                     if (depth == 0) return false;
                 },
-                .eq, .neq, .lt, .lte, .gt, .gte, .kw_and, .kw_or, .kw_is, .kw_between => if (depth == 1) return true,
+                .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq, .kw_and, .amp_amp, .kw_or, .kw_is, .kw_between => if (depth == 1) return true,
                 else => {},
             }
         }
@@ -4486,7 +4542,9 @@ pub const Parser = struct {
             .lte => .lte,
             .gt => .gt,
             .gte => .gte,
-            .neq => ParseError.SqlOnNonEquiUnsupported,
+            // `<=>` matches NULL keys, which a hash join key never does: it
+            // takes the general residual form.
+            .neq, .null_safe_eq => ParseError.SqlOnNonEquiUnsupported,
             else => ParseError.SqlExpectedToken,
         };
     }
@@ -4880,7 +4938,7 @@ pub const Parser = struct {
             try self.advance();
             if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
             try self.advance();
-            const val = try self.parseAddSub();
+            const val = try self.parseScalar();
             try assigns.append(self.arena, .{ .col = col_name, .value = val });
             if (self.cur.tag != .comma) break;
             try self.advance();
@@ -4938,7 +4996,7 @@ pub const Parser = struct {
         try self.advance();
         if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
         try self.advance();
-        const value_expr = try self.parseAddSub();
+        const value_expr = try self.parseScalar();
         return try self.allocOp(.{ .set_var = .{ .name = name, .value = value_expr } });
     }
 
@@ -5265,7 +5323,7 @@ pub const Parser = struct {
         var items: std.ArrayList(ir.Expr) = .empty;
         defer items.deinit(self.arena);
         while (true) {
-            const e = try self.parseAddSub();
+            const e = try self.parseScalar();
             try items.append(self.arena, e);
             if (self.cur.tag != .comma) break;
             try self.advance();

@@ -235,7 +235,7 @@ fn parsePartitionByList(p: anytype) ![]const []const u8 {
     defer items.deinit(p.arena);
 
     while (true) {
-        const expr = try p.parseAddSub();
+        const expr = try p.parseScalar();
         const name = switch (expr) {
             .col_ref => |c| c,
             else => try p.materializeWindowPartitionExpr(expr),

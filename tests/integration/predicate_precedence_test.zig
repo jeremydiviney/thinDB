@@ -91,3 +91,33 @@ test "precedence: NOT binds tighter than AND (no parens)" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, ids);
 }
+
+test "precedence: XOR binds between AND and OR, and && is AND" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "a < 5 XOR b = 20", &[_]i64{ 1, 2, 3 } },
+        .{ "b = 20 XOR c = 30", &[_]i64{3} },
+        // b=20 XOR (c=30 AND a<5); grouping XOR first would keep no row.
+        .{ "b = 20 XOR c = 30 AND a < 5", &[_]i64{ 2, 3 } },
+        // (a<5) OR (b=20 XOR c=30).
+        .{ "a < 5 OR b = 20 XOR c = 30", &[_]i64{ 1, 3 } },
+        .{ "NOT (b = 20 XOR c = 30)", &[_]i64{ 1, 2, 4 } },
+        .{ "b = 20 && c = 30", &[_]i64{2} },
+        .{ "a < 5 || b = 20 && c = 99", &[_]i64{ 1, 3 } },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        var q = try helpers.runSqlMysql(allocator, db, "SELECT id FROM t WHERE " ++ c[0] ++ " ORDER BY id");
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint[0..batch.row_count]);
+        try std.testing.expectEqualSlices(i64, c[1], ids.items);
+    }
+}

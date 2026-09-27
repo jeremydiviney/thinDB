@@ -5,8 +5,9 @@
 //!
 //! Grammar:
 //!   bool_expr  := or_expr
-//!   or_expr    := and_expr ('OR' and_expr)*
-//!   and_expr   := not_expr ('AND' not_expr)*
+//!   or_expr    := xor_expr ('OR' xor_expr)*
+//!   xor_expr   := and_expr ('XOR' and_expr)*
+//!   and_expr   := not_expr (('AND' | '&&') not_expr)*
 //!   not_expr   := 'NOT' not_expr | atom
 //!   atom       := '(' or_expr ')'
 //!                | row cmp_op row
@@ -36,16 +37,16 @@ pub fn parseBoolExpr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     return try parseOr(p);
 }
 
-// The parseOr/parseAnd/parseNot/parseAtom quartet is mutually recursive;
-// Zig can't infer error sets through a cycle, so all four return the
-// Parser's concrete `Err` set explicitly.
+// The parseOr/parseXor/parseAnd/parseNot/parseAtom chain is mutually
+// recursive; Zig can't infer error sets through a cycle, so each returns
+// the Parser's concrete `Err` set explicitly.
 pub fn parseOr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
-    var lhs = try parseAnd(p);
+    var lhs = try parseXor(p);
     // On the MySQL wire `||` is a synonym for OR (PG/neutral reserve it for
     // string concatenation, handled in the expression parser).
     while (p.cur.tag == .kw_or or (p.cur.tag == .pipe_pipe and p.lex.dialect == .mysql)) {
         try p.advance();
-        const rhs = try parseAnd(p);
+        const rhs = try parseXor(p);
         const children = try p.arena.alloc(PredicateExpr, 2);
         children[0] = lhs;
         children[1] = rhs;
@@ -54,9 +55,35 @@ pub fn parseOr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     return lhs;
 }
 
+/// `a XOR b` holds when exactly one side does and is UNKNOWN when either
+/// side is, which `(a OR b) AND NOT (a AND b)` keeps under 3VL.
+pub fn parseXor(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
+    var lhs = try parseAnd(p);
+    while (xorKeywordHere(p)) {
+        try p.advance();
+        const rhs = try parseAnd(p);
+        const either = try p.arena.alloc(PredicateExpr, 2);
+        either[0] = lhs;
+        either[1] = rhs;
+        const both = try p.arena.alloc(PredicateExpr, 2);
+        both[0] = lhs;
+        both[1] = rhs;
+        const kids = try p.arena.alloc(PredicateExpr, 2);
+        kids[0] = .{ .@"or" = either };
+        kids[1] = try negatePredicate(p, .{ .@"and" = both });
+        lhs = .{ .@"and" = kids };
+    }
+    return lhs;
+}
+
+/// XOR lexes as an identifier.
+pub fn xorKeywordHere(p: anytype) bool {
+    return p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "xor");
+}
+
 pub fn parseAnd(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     var lhs = try parseNot(p);
-    while (p.cur.tag == .kw_and) {
+    while (p.cur.tag == .kw_and or p.cur.tag == .amp_amp) {
         try p.advance();
         const rhs = try parseNot(p);
         const children = try p.arena.alloc(PredicateExpr, 2);
@@ -150,6 +177,8 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         try p.advance();
         const inner = try parseOr(p);
         try p.expect(.rparen);
+        // `(a > 1) IS TRUE`: the condition read as a value, then tested.
+        if (p.cur.tag == .kw_is) return try parseIsOps(p, try p.predicateAsValue(inner));
         return inner;
     }
     // EXISTS (SELECT ...) — produces a constant-bool predicate after
@@ -165,13 +194,17 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     }
     // NULL on the LHS — generated SQL guards optional parameters with
     // `(:param IS NULL OR ...)`. IS [NOT] NULL folds to a constant, and any
-    // comparison with NULL is UNKNOWN, as `col = NULL` is in parseColOps.
+    // comparison with NULL is UNKNOWN, as `col = NULL` is in parseColOps. A
+    // bare NULL (`NULL XOR x`) is UNKNOWN too.
     if (p.cur.tag == .kw_null) {
         try p.advance();
-        if (p.cur.tag == .kw_is) return .{ .always = !(try parseIsNullTail(p)) };
+        const null_lhs: ir.Expr = .{ .null_lit = .string };
+        if (p.cur.tag == .kw_is) return try parseIsOps(p, null_lhs);
+        if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, null_lhs)).?;
+        if (isPredicateEnd(p)) return .unknown;
         if (!isComparisonToken(p.cur.tag)) return PE.SqlExpectedToken;
         _ = try parseComparisonToken(p);
-        _ = try p.parseAddSub();
+        _ = try p.parseScalar();
         return .unknown;
     }
     // Literal- or sign-led LHS. Each side of the comparison is a whole
@@ -187,23 +220,24 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // `lit op @var` (e.g. `1 = @includeEstimates`) is a constant guard: the
     // var resolves to a literal pre-compile, so both sides materialize as
     // constant columns and the comparison keeps or drops every row.
-    if (isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus) {
-        const lhs = try p.parseAddSub();
+    if (isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus or p.cur.tag == .tilde) {
+        const lhs = try p.parseScalar();
         const lhs_val = switch (leafOperand(lhs)) {
             .lit => |v| v,
             else => return try parseExprOps(p, lhs),
         };
         switch (p.cur.tag) {
-            .kw_is => return .{ .always = try parseIsNullTail(p) },
+            .kw_is => return try parseIsOps(p, lhs),
             .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
                 return try parseColOps(p, try p.materializePredicateExpr(lhs));
             },
             else => {},
         }
         // A lone literal is truthiness, as a bare column is (`WHERE 1`).
-        if (isPredicateEnd(p.cur.tag)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
+        if (isPredicateEnd(p)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
+        if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, lhs)).?;
         const op_lhs = try parseComparisonToken(p);
-        const rhs = try p.parseAddSub();
+        const rhs = try p.parseScalar();
         return switch (leafOperand(rhs)) {
             .col_ref => |col| .{ .leaf = .{ .col = col, .op = reverseOp(op_lhs), .val = lhs_val } },
             .lit => |rhs_val| try literalComparison(p, lhs_val, op_lhs, rhs_val),
@@ -219,11 +253,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         const var_name = try p.arena.dupe(u8, p.cur.text);
         try p.advance();
         const lhs_expr = ir.Expr{ .var_ref = var_name };
-        if (isComparisonToken(p.cur.tag)) {
-            const op = try parseComparisonToken(p);
-            const rhs = try p.parseAddSub();
-            return try makeExprComparisonPredicate(p, lhs_expr, op, rhs);
-        }
+        if (try parseComparisonTail(p, lhs_expr)) |pred| return pred;
         return try makeExprComparisonPredicate(p, lhs_expr, .neq, .{ .lit = .{ .int = 0 } });
     }
     // A CASE expression or a keyword-named call (`IF(...)`) can only be a
@@ -240,12 +270,8 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // generic expression-comparison path.
     if (p.cur.tag == .arrow or p.cur.tag == .arrow2) {
         const lhs = try p.consumeJsonArrows(.{ .col_ref = col_dup });
-        if (!isComparisonToken(p.cur.tag)) {
-            return try makeExprComparisonPredicate(p, lhs, .eq, .{ .lit = .{ .boolean = true } });
-        }
-        const op = try parseComparisonToken(p);
-        const rhs = try p.parseAddSub();
-        return try makeExprComparisonPredicate(p, lhs, op, rhs);
+        if (try parseComparisonTail(p, lhs)) |pred| return pred;
+        return try makeExprComparisonPredicate(p, lhs, .eq, .{ .lit = .{ .boolean = true } });
     }
 
     // Aggregate reference inside a predicate — only meaningful in HAVING
@@ -277,11 +303,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
                 .spec_kind = spec_kind,
             });
             const lhs = try p.continueBinaryFrom(.{ .col_ref = hidden });
-            if (isComparisonToken(p.cur.tag)) {
-                const op = try parseComparisonToken(p);
-                const rhs = try p.parseAddSub();
-                return try makeExprComparisonPredicate(p, lhs, op, rhs);
-            }
+            if (try parseComparisonTail(p, lhs)) |pred| return pred;
             const anchored = switch (lhs) {
                 .col_ref => |c| c,
                 else => try p.materializePredicateExpr(lhs),
@@ -297,7 +319,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             }
         } else if (saw_distinct) {
             return PE.SqlInvalidProjection;
-        } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref) {
+        } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref and isComparisonToken(p.cur.tag) and p.cur.tag != .null_safe_eq) {
             return try makeDayComparison(p, args[0].col_ref);
         } else {
             return try parseExprOps(p, try p.makeScalarCallExpr(col_dup, args));
@@ -307,7 +329,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // Arithmetic continuation from a bare column (`i + 1 > 3`,
     // `qty * 2 IN (...)`): the expression materializes to a hidden
     // computed column and the normal operator tail anchors to it.
-    if (isArithToken(p.cur.tag)) {
+    if (try isArithAhead(p)) {
         const lhs = try p.continueBinaryFrom(.{ .col_ref = col_dup });
         col_dup = try p.materializePredicateExpr(lhs);
     }
@@ -318,11 +340,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
 /// a literal) on a predicate's left side.
 fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const lhs = try p.continueBinaryFrom(expr);
-    if (isComparisonToken(p.cur.tag)) {
-        const op = try parseComparisonToken(p);
-        const rhs = try p.parseAddSub();
-        return try makeExprComparisonPredicate(p, lhs, op, rhs);
-    }
+    if (try parseComparisonTail(p, lhs)) |pred| return pred;
     switch (p.cur.tag) {
         // `ABS(x) BETWEEN ...`, `fn(x) IN (...)`, `fn(x) IS NULL`: anchor the
         // call to a hidden computed column and reuse the operator tail.
@@ -338,30 +356,157 @@ fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
 
 fn isArithToken(tag: anytype) bool {
     return switch (tag) {
-        .plus, .minus, .star, .slash, .percent, .kw_div => true,
+        .plus, .minus, .star, .slash, .percent, .kw_div, .amp, .pipe, .caret, .shl, .shr => true,
         else => false,
     };
+}
+
+/// Whether a binary operator continues the operand before the cursor:
+/// an operator token, or MySQL's `MOD` word.
+fn isArithAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    return isArithToken(p.cur.tag) or try p.modOperatorAhead();
 }
 
 /// Tokens that close a predicate: the call/CASE punctuation around an IF
 /// or WHEN condition, boolean connectives, and the clause keywords that
 /// can follow a WHERE / HAVING.
-fn isPredicateEnd(tag: anytype) bool {
-    return switch (tag) {
-        .rparen, .comma, .kw_and, .kw_or, .kw_then, .eof, .semicolon, .kw_group, .kw_order, .kw_limit, .kw_having => true,
-        else => false,
+fn isPredicateEnd(p: anytype) bool {
+    return switch (p.cur.tag) {
+        .rparen, .comma, .kw_and, .amp_amp, .kw_or, .kw_then, .eof, .semicolon, .kw_group, .kw_order, .kw_limit, .kw_having => true,
+        .pipe_pipe => p.lex.dialect == .mysql,
+        else => xorKeywordHere(p),
     };
 }
 
-/// Consumes `IS [NOT] NULL` and returns whether NOT was present.
-fn parseIsNullTail(p: anytype) @TypeOf(p.*).Err!bool {
+/// What an `IS [NOT] ...` tests: NULL (UNKNOWN is its synonym), TRUE,
+/// FALSE, or `DISTINCT FROM` another value.
+const IsTest = enum { null, true, false, distinct_from };
+
+const IsTail = struct { what: IsTest, negated: bool };
+
+/// Consumes `IS [NOT]` and the tested word; after `DISTINCT FROM` the
+/// cursor sits on the other value.
+fn parseIsTail(p: anytype) @TypeOf(p.*).Err!IsTail {
     const PE = @TypeOf(p.*).Err;
     try p.expect(.kw_is);
     const negated = p.cur.tag == .kw_not;
     if (negated) try p.advance();
-    if (p.cur.tag != .kw_null) return PE.SqlExpectedNull;
+    const what: IsTest = switch (p.cur.tag) {
+        .kw_null => .null,
+        .kw_true => .true,
+        .kw_false => .false,
+        .kw_distinct => .distinct_from,
+        .identifier => if (std.ascii.eqlIgnoreCase(p.cur.text, "unknown")) .null else return PE.SqlExpectedNull,
+        else => return PE.SqlExpectedNull,
+    };
     try p.advance();
-    return negated;
+    if (what == .distinct_from) try p.expect(.kw_from);
+    return .{ .what = what, .negated = negated };
+}
+
+/// `x IS [NOT] NULL | UNKNOWN | TRUE | FALSE | DISTINCT FROM y`. None of
+/// them is ever UNKNOWN: IS TRUE holds for a non-NULL non-zero value, so
+/// its negation keeps the NULL rows.
+fn parseIsOps(p: anytype, lhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const tail = try parseIsTail(p);
+    if (tail.what == .distinct_from) {
+        const same = try nullSafeEqual(p, lhs, try p.parseScalar());
+        return if (tail.negated) same else try negatePredicate(p, same);
+    }
+    const operand = leafOperand(lhs);
+    const tested: PredicateExpr = switch (operand) {
+        .null_lit => .{ .always = tail.what == .null },
+        .lit => |v| switch (tail.what) {
+            .null => .{ .always = false },
+            .true => if (literalTruth(v)) |t| .{ .always = t } else try literalComparison(p, v, .neq, .{ .int = 0 }),
+            .false => if (literalTruth(v)) |t| .{ .always = !t } else try literalComparison(p, v, .eq, .{ .int = 0 }),
+            .distinct_from => unreachable,
+        },
+        else => blk: {
+            const col = try anchorColumn(p, operand);
+            break :blk switch (tail.what) {
+                .null => .{ .is_null = col },
+                .true => try notNullAnd(p, col, .{ .leaf = .{ .col = col, .op = .neq, .val = .{ .int = 0 } } }),
+                .false => try notNullAnd(p, col, .{ .leaf = .{ .col = col, .op = .eq, .val = .{ .int = 0 } } }),
+                .distinct_from => unreachable,
+            };
+        },
+    };
+    return if (tail.negated) try negatePredicate(p, tested) else tested;
+}
+
+fn literalTruth(v: Value) ?bool {
+    return switch (v) {
+        .boolean => |b| b,
+        .int => |x| x != 0,
+        .bigint => |x| x != 0,
+        .double => |x| x != 0,
+        else => null,
+    };
+}
+
+/// `pred` guarded by `col IS NOT NULL`, so that negating it keeps the
+/// NULL rows: the leaf kernels exclude NULL whatever the operator.
+fn notNullAnd(p: anytype, col: []const u8, pred: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr {
+    const kids = try p.arena.alloc(PredicateExpr, 2);
+    kids[0] = .{ .is_not_null = col };
+    kids[1] = pred;
+    return .{ .@"and" = kids };
+}
+
+/// The column a predicate tests for an operand: itself, or a hidden
+/// computed column holding the expression.
+fn anchorColumn(p: anytype, e: ir.Expr) @TypeOf(p.*).Err![]const u8 {
+    return switch (e) {
+        .col_ref => |c| c,
+        else => try p.materializePredicateExpr(e),
+    };
+}
+
+/// `a <=> b` (IS NOT DISTINCT FROM): equal, or both NULL. It is never
+/// UNKNOWN, so its negation keeps the rows where only one side is NULL.
+fn nullSafeEqual(p: anytype, lhs_expr: ir.Expr, rhs_expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const lhs = leafOperand(lhs_expr);
+    const rhs = leafOperand(rhs_expr);
+    if (lhs == .null_lit or rhs == .null_lit) {
+        const other = if (lhs == .null_lit) rhs else lhs;
+        return switch (other) {
+            .null_lit => .{ .always = true },
+            .lit => .{ .always = false },
+            else => .{ .is_null = try anchorColumn(p, other) },
+        };
+    }
+    if (lhs == .lit and rhs == .lit) return try literalComparison(p, lhs.lit, .eq, rhs.lit);
+    if (lhs == .lit or rhs == .lit) {
+        const col = try anchorColumn(p, if (lhs == .lit) rhs else lhs);
+        const val = if (lhs == .lit) lhs.lit else rhs.lit;
+        return try notNullAnd(p, col, .{ .leaf = .{ .col = col, .op = .eq, .val = val } });
+    }
+    const a = try anchorColumn(p, lhs);
+    const b = try anchorColumn(p, rhs);
+    const both_null = try p.arena.alloc(PredicateExpr, 2);
+    both_null[0] = .{ .is_null = a };
+    both_null[1] = .{ .is_null = b };
+    const equal = try p.arena.alloc(PredicateExpr, 3);
+    equal[0] = .{ .is_not_null = a };
+    equal[1] = .{ .is_not_null = b };
+    equal[2] = .{ .leaf_col_col = .{ .left = a, .op = .eq, .right = b } };
+    const kids = try p.arena.alloc(PredicateExpr, 2);
+    kids[0] = .{ .@"and" = both_null };
+    kids[1] = .{ .@"and" = equal };
+    return .{ .@"or" = kids };
+}
+
+/// A comparison operator and its right operand after `lhs`, or null when
+/// no comparison operator sits at the cursor.
+fn parseComparisonTail(p: anytype, lhs: ir.Expr) @TypeOf(p.*).Err!?PredicateExpr {
+    if (p.cur.tag == .null_safe_eq) {
+        try p.advance();
+        return try nullSafeEqual(p, lhs, try p.parseScalar());
+    }
+    if (!isComparisonToken(p.cur.tag)) return null;
+    const op = try parseComparisonToken(p);
+    return try makeExprComparisonPredicate(p, lhs, op, try p.parseScalar());
 }
 
 /// The operator tail shared by every LHS that resolves to a column name —
@@ -370,10 +515,7 @@ fn parseIsNullTail(p: anytype) @TypeOf(p.*).Err!bool {
 fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
 
-    if (p.cur.tag == .kw_is) {
-        const negated = try parseIsNullTail(p);
-        return if (negated) .{ .is_not_null = col_dup } else .{ .is_null = col_dup };
-    }
+    if (p.cur.tag == .kw_is) return try parseIsOps(p, .{ .col_ref = col_dup });
 
     // Optional NOT — gates BETWEEN / LIKE / IN below.
     var negate_predicate = false;
@@ -386,10 +528,10 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     // NOT BETWEEN        →  (col <  lo) OR  (col >  hi)
     if (p.cur.tag == .kw_between) {
         try p.advance();
-        const lo = try p.parseAddSub();
+        const lo = try p.parseScalar();
         if (p.cur.tag != .kw_and) return PE.SqlExpectedKeyword;
         try p.advance();
-        const hi = try p.parseAddSub();
+        const hi = try p.parseScalar();
         return try makeBetweenExpr(p, col_dup, lo, hi, negate_predicate);
     }
 
@@ -397,8 +539,16 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .kw_like) {
         try p.advance();
         if (p.cur.tag != .string) return PE.SqlExpectedValue;
-        const pattern = try p.arena.dupe(u8, p.cur.value.string);
+        var pattern: []const u8 = try p.arena.dupe(u8, p.cur.value.string);
         try p.advance();
+        if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "escape")) {
+            try p.advance();
+            if (p.cur.tag != .string) return PE.SqlExpectedValue;
+            const escape = p.cur.value.string;
+            if (escape.len > 1) return PE.SqlExpectedValue;
+            pattern = try likePatternWithEscape(p.arena, pattern, escape);
+            try p.advance();
+        }
         var pe: PredicateExpr = .{ .like = .{ .col = col_dup, .pattern = pattern } };
         if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
@@ -410,7 +560,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         try p.advance();
         const args = try p.arena.alloc(ir.Expr, 2);
         args[0] = .{ .col_ref = col_dup };
-        args[1] = try p.parseAddSub();
+        args[1] = try p.parseScalar();
         const call: ir.Expr = .{ .call = .{ .fn_name = try p.arena.dupe(u8, "regexp_like"), .args = args } };
         var pe = try makeExprComparisonPredicate(p, call, .neq, .{ .lit = .{ .int = 0 } });
         if (negate_predicate) pe = try negatePredicate(p, pe);
@@ -479,9 +629,10 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
 
     // A bare column where the predicate ends (`IF(isActive, 1, 0)`,
     // `WHERE flag AND ...`) is MySQL truthiness: non-zero and non-NULL.
-    if (isPredicateEnd(p.cur.tag)) {
+    if (isPredicateEnd(p)) {
         return .{ .leaf = .{ .col = col_dup, .op = .neq, .val = .{ .int = 0 } } };
     }
+    if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, .{ .col_ref = col_dup })).?;
 
     // Comparison.
     const op: PredicateOp = switch (p.cur.tag) {
@@ -526,7 +677,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         }
         // A parenthesized group that leads a longer expression
         // (`(a + b) * 2`) continues past its `)`.
-        const group = try p.parseAddSub();
+        const group = try p.parseScalar();
         try p.expect(.rparen);
         return try makeComparisonExprPredicate(p, col_dup, op, try p.continueBinaryFrom(group));
     }
@@ -550,7 +701,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
 
     // A literal, or an expression a literal leads (`x > 1 + y`); a lone
     // literal stays a plain leaf.
-    return try makeComparisonExprPredicate(p, col_dup, op, try p.parseAddSub());
+    return try makeComparisonExprPredicate(p, col_dup, op, try p.parseScalar());
 }
 
 fn makeScalarExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
@@ -629,7 +780,7 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
     var depth: usize = 1;
     var saw_arithmetic = false;
     // `(CASE ... END) > x` carries no depth-1 arithmetic but is still a
-    // scalar comparison: parseAddSub dispatches CASE, and no predicate
+    // scalar comparison: parseScalar dispatches CASE, and no predicate
     // grammar accepts a CASE-led paren group, so this only widens parses.
     var case_start = false;
     // `(SELECT ...) = 0` likewise: a subquery-led group is a scalar operand.
@@ -649,7 +800,7 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
                 depth -= 1;
                 if (depth == 0) break;
             },
-            .plus, .minus, .star, .slash, .percent, .kw_div => {
+            .plus, .minus, .star, .slash, .percent, .kw_div, .amp, .pipe, .caret, .shl, .shr, .tilde => {
                 if (depth == 1) saw_arithmetic = true;
             },
             else => {},
@@ -708,6 +859,14 @@ fn parseRowValuePredicate(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
     const lhs = try parseRowValue(p);
     for (lhs) |*element| element.* = try anchorRowElement(p, element.*);
+    if (p.cur.tag == .null_safe_eq) {
+        try p.advance();
+        const rhs = try parseRowValue(p);
+        if (rhs.len != lhs.len) return PE.SqlRowValueWidthMismatch;
+        const kids = try p.arena.alloc(PredicateExpr, lhs.len);
+        for (lhs, rhs, kids) |l, r, *kid| kid.* = try nullSafeEqual(p, l, r);
+        return .{ .@"and" = kids };
+    }
     if (isComparisonToken(p.cur.tag)) {
         const op = try parseComparisonToken(p);
         const rhs = try parseRowValue(p);
@@ -757,7 +916,7 @@ fn parseRowValue(p: anytype) @TypeOf(p.*).Err![]ir.Expr {
     if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) return PE.SqlExpectedValue;
     var elements: std.ArrayList(ir.Expr) = .empty;
     while (true) {
-        try elements.append(p.arena, try p.parseAddSub());
+        try elements.append(p.arena, try p.parseScalar());
         if (p.cur.tag != .comma) break;
         try p.advance();
     }
@@ -820,18 +979,14 @@ fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr
     var look = p.lex.*;
     const first = try look.next();
     const lhs = if (first.tag == .kw_select or first.tag == .kw_with)
-        try p.parseAddSub()
+        try p.parseScalar()
     else blk: {
         try p.expect(.lparen);
-        const group = try p.parseAddSub();
+        const group = try p.parseScalar();
         try p.expect(.rparen);
         break :blk try p.continueBinaryFrom(group);
     };
-    if (isComparisonToken(p.cur.tag)) {
-        const op = try parseComparisonToken(p);
-        const rhs = try p.parseAddSub();
-        return try makeExprComparisonPredicate(p, lhs, op, rhs);
-    }
+    if (try parseComparisonTail(p, lhs)) |pred| return pred;
     const anchored = switch (lhs) {
         .col_ref => |c| c,
         else => try p.materializePredicateExpr(lhs),
@@ -857,9 +1012,33 @@ pub fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rh
 
 fn isComparisonToken(tag: anytype) bool {
     return switch (tag) {
-        .eq, .neq, .lt, .lte, .gt, .gte => true,
+        .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq => true,
         else => false,
     };
+}
+
+/// A LIKE pattern with its own ESCAPE character, rewritten to the one the
+/// matcher reads, backslash (MySQL's default): the escape before any
+/// character becomes a backslash, and a literal backslash doubles. An empty
+/// ESCAPE turns escaping off.
+fn likePatternWithEscape(arena: std.mem.Allocator, pattern: []const u8, escape: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (escape.len == 1 and escape[0] == '\\') return pattern;
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, pattern.len * 2);
+    var i: usize = 0;
+    while (i < pattern.len) : (i += 1) {
+        const c = pattern[i];
+        if (c == '\\') {
+            out.appendSliceAssumeCapacity("\\\\");
+        } else if (escape.len == 1 and c == escape[0] and i + 1 < pattern.len) {
+            i += 1;
+            out.appendAssumeCapacity('\\');
+            out.appendAssumeCapacity(pattern[i]);
+        } else {
+            out.appendAssumeCapacity(c);
+        }
+    }
+    return out.items;
 }
 
 fn parseComparisonToken(p: anytype) @TypeOf(p.*).Err!PredicateOp {
@@ -889,7 +1068,7 @@ fn makeDayComparison(p: anytype, col: []const u8) @TypeOf(p.*).Err!PredicateExpr
         else => return PE.SqlExpectedToken,
     };
     try p.advance();
-    const rhs = try p.parseAddSub();
+    const rhs = try p.parseScalar();
     return switch (leafOperand(rhs)) {
         .lit => |val| .{ .day_leaf = .{ .col = try p.arena.dupe(u8, col), .op = op, .val = val } },
         else => blk: {

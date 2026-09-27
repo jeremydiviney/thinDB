@@ -762,6 +762,85 @@ test "null literal arguments take a sibling argument's type" {
     try std.testing.expectEqual(thindb.types.TypeTag.bigint, std.meta.activeTag(schema[1].type));
 }
 
+test "null-safe equality, IS [NOT] TRUE / FALSE / UNKNOWN and XOR under NULLs" {
+    // Probed against MySQL 8.4. <=>, IS DISTINCT FROM and the IS tests are
+    // never UNKNOWN, so NOT keeps the rows a NULL decided; XOR is UNKNOWN
+    // when either side is.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ns (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, f BOOLEAN)");
+    try exec(allocator, db, "INSERT INTO ns VALUES (1, 1, 1, true), (2, 1, 2, false), (3, NULL, 1, NULL), (4, NULL, NULL, true), (5, 0, NULL, false)");
+
+    const cases = .{
+        .{ "a <=> b", &[_]i64{ 1, 4 } },
+        .{ "NOT (a <=> b)", &[_]i64{ 2, 3, 5 } },
+        .{ "a IS NOT DISTINCT FROM b", &[_]i64{ 1, 4 } },
+        .{ "a IS DISTINCT FROM b", &[_]i64{ 2, 3, 5 } },
+        .{ "a <=> 1", &[_]i64{ 1, 2 } },
+        .{ "NOT (a <=> 1)", &[_]i64{ 3, 4, 5 } },
+        .{ "a <=> NULL", &[_]i64{ 3, 4 } },
+        .{ "NULL <=> b", &[_]i64{ 4, 5 } },
+        .{ "a + 0 <=> b * 1", &[_]i64{ 1, 4 } },
+        .{ "(a, b) <=> (NULL, 1)", &[_]i64{3} },
+        .{ "a IS TRUE", &[_]i64{ 1, 2 } },
+        .{ "a IS NOT TRUE", &[_]i64{ 3, 4, 5 } },
+        .{ "NOT (a IS TRUE)", &[_]i64{ 3, 4, 5 } },
+        .{ "a IS FALSE", &[_]i64{5} },
+        .{ "a IS NOT FALSE", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "a IS UNKNOWN", &[_]i64{ 3, 4 } },
+        .{ "f IS FALSE", &[_]i64{ 2, 5 } },
+        .{ "(a > 0) IS NOT TRUE", &[_]i64{ 3, 4, 5 } },
+        .{ "(b > a) IS UNKNOWN", &[_]i64{ 3, 4, 5 } },
+        .{ "NULL IS UNKNOWN AND id < 3", &[_]i64{ 1, 2 } },
+        .{ "1 IS TRUE AND 0 IS NOT TRUE AND id = 1", &[_]i64{1} },
+        .{ "a XOR b > 1", &[_]i64{1} },
+        .{ "NOT (a XOR b > 1)", &[_]i64{2} },
+        .{ "NULL XOR a", &[_]i64{} },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectBigints(allocator, db, "SELECT id FROM ns WHERE " ++ c[0] ++ " ORDER BY id");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+
+    const value_cases = .{
+        .{ "CAST(a <=> b AS BIGINT)", &[_]i64{ 1, 0, 0, 1, 0 } },
+        .{ "CAST(a IS NOT TRUE AS BIGINT)", &[_]i64{ 0, 0, 1, 1, 1 } },
+        .{ "CAST((b > a) IS UNKNOWN AS BIGINT)", &[_]i64{ 0, 0, 1, 1, 1 } },
+    };
+    inline for (value_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectBigints(allocator, db, "SELECT " ++ c[0] ++ " FROM ns ORDER BY id");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+}
+
+test "null-safe equality joins NULL keys, inner and outer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ns (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)");
+    try exec(allocator, db, "INSERT INTO ns VALUES (1, 1, 1), (2, 1, 2), (3, NULL, 1), (4, NULL, NULL), (5, 0, NULL)");
+
+    const cases = .{
+        .{ "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON x.a <=> y.b ORDER BY 1", &[_]i64{ 11, 13, 21, 23, 34, 35, 44, 45 } },
+        .{ "SELECT x.id * 10 + COALESCE(y.id, 0) FROM ns x LEFT JOIN ns y ON x.a <=> y.b AND y.id > 2 ORDER BY 1", &[_]i64{ 13, 23, 34, 35, 44, 45, 50 } },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+}
+
 test "null literal arguments with no typed sibling take an overload's parameter type" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

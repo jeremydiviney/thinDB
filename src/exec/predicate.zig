@@ -18,6 +18,7 @@ const ColumnView = storage.ColumnView;
 
 const exec = @import("exec.zig");
 const simd = @import("../util/simd.zig");
+const like_pattern = @import("../util/like.zig");
 const Error = exec.Error;
 const scalar_fn_common = @import("scalar_fn_common.zig");
 const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
@@ -1131,9 +1132,9 @@ pub fn pushExprDown(upstream: *exec.Query, expr: PredicateExpr) !void {
     }
 }
 
-/// SQL LIKE matcher. `pattern` uses `%` (zero-or-more) and `_` (one). No
-/// escape syntax in v1 (`\%` / `\_` not supported). Convenience wrapper that
-/// compiles + matches in one shot; loops over many rows should `compileLike`
+/// SQL LIKE matcher: `%` (zero-or-more), `_` (one) and backslash escapes, as
+/// `util/like.zig` defines them. Convenience wrapper that compiles + matches
+/// in one shot; loops over many rows should `compileLike`
 /// once and reuse the plan (see `evaluateLikeMask`).
 pub fn likeMatch(text: []const u8, pattern: []const u8) bool {
     return compileLike(pattern).match(text);
@@ -1146,8 +1147,8 @@ const max_like_segments = 16;
 /// so it matches via ordered substring search (`std.mem.indexOfPos`, an
 /// optimized scan) — anchored at an end only when the pattern doesn't start /
 /// end with `%`. This subsumes the common shapes (`lit`, `lit%`, `%lit`,
-/// `%lit%`, `%a%b%`). Patterns with `_`, or more than `max_like_segments`
-/// literal pieces, fall back to the recursive backtracking matcher.
+/// `%lit%`, `%a%b%`). Patterns with `_` or an escape, or more than
+/// `max_like_segments` literal pieces, fall back to the backtracking matcher.
 pub const LikePlan = struct {
     general: bool,
     pattern: []const u8,
@@ -1158,7 +1159,7 @@ pub const LikePlan = struct {
     segs: [max_like_segments][]const u8 = undefined,
 
     pub fn match(self: *const LikePlan, text: []const u8) bool {
-        if (self.general) return likeMatchBacktrack(text, self.pattern);
+        if (self.general) return like_pattern.match(text, self.pattern);
         if (self.empty) return text.len == 0;
         if (self.nseg == 0) return true; // pattern is all `%` → matches anything
         var pos: usize = 0;
@@ -1188,9 +1189,7 @@ pub const LikePlan = struct {
 /// Classify a LIKE pattern into a `LikePlan`. No allocation — segments are
 /// slices into `pattern`, which outlives the plan.
 pub fn compileLike(pattern: []const u8) LikePlan {
-    if (std.mem.indexOfScalar(u8, pattern, '_') != null) {
-        return .{ .general = true, .pattern = pattern };
-    }
+    if (like_pattern.needsGeneralMatch(pattern)) return .{ .general = true, .pattern = pattern };
     if (pattern.len == 0) return .{ .general = false, .pattern = pattern, .empty = true };
     var plan: LikePlan = .{
         .general = false,
@@ -1225,32 +1224,6 @@ fn findSubstring(haystack: []const u8, start: usize, needle: []const u8) ?usize 
         i = p + 1;
     }
     return null;
-}
-
-/// Recursive-backtracking LIKE matcher — fallback for patterns containing `_`.
-/// `%` = zero-or-more, `_` = exactly one; no escape syntax in v1.
-fn likeMatchBacktrack(text: []const u8, pattern: []const u8) bool {
-    var ti: usize = 0;
-    var pi: usize = 0;
-    var star_ti: ?usize = null;
-    var star_pi: usize = 0;
-    while (ti < text.len) {
-        if (pi < pattern.len and pattern[pi] == '%') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (pi < pattern.len and (pattern[pi] == '_' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (star_ti) |sti| {
-            // Backtrack to last %, consume one more char from text.
-            pi = star_pi + 1;
-            ti = sti + 1;
-            star_ti = sti + 1;
-        } else return false;
-    }
-    while (pi < pattern.len and pattern[pi] == '%') pi += 1;
-    return pi == pattern.len;
 }
 
 /// Evaluate a full boolean predicate over a Batch (typed columns +
