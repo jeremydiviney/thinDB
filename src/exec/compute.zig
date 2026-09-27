@@ -2236,7 +2236,10 @@ fn literalDivisorNonzero(aa: Allocator, runtime_allocator: Allocator, rr: scalar
 /// it here keeps the call a non-null constant rather than a per-row parse.
 /// A NULL literal carries only a placeholder type, so a call no overload
 /// accepts as written retries with its NULL arguments retyped to each
-/// sibling argument's type in turn (`COALESCE(NULL, x)`, `x + NULL`).
+/// sibling argument's type in turn (`COALESCE(NULL, x)`, `x + NULL`), then
+/// to the declared parameter types of each overload of the right arity
+/// (`ABS(NULL)`, `DATE_FORMAT(NULL, '%Y')`): a strict function's answer for
+/// NULL input is NULL whichever overload runs.
 fn resolveWithTypedNulls(
     runtime_allocator: Allocator,
     aa: Allocator,
@@ -2260,15 +2263,29 @@ fn resolveWithTypedNulls(
             if (p == .null_lit) t.* = candidate;
         }
         const r = try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, retyped) orelse continue;
-        for (arg_plans, arg_types) |p, *t| {
-            if (p != .null_lit) continue;
-            replaceBuf(runtime_allocator, &p.null_lit.buf, try ColumnStore.init(runtime_allocator, candidate, true));
-            p.null_lit.ty = candidate;
-            t.* = candidate;
+        try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
+        return r;
+    }
+    for (scalar_fn.overloadsOf(fn_name)) |f| {
+        if (!scalar_fn.scalarArityMatches(f, arg_types.len)) continue;
+        const retyped = try aa.dupe(Type, arg_types);
+        for (arg_plans, retyped, 0..) |p, *t, i| {
+            if (p == .null_lit) t.* = scalar_fn.scalarDeclaredTypeAt(f, i);
         }
+        const r = try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, retyped) orelse continue;
+        try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
         return r;
     }
     return null;
+}
+
+fn commitNullTypes(runtime_allocator: Allocator, arg_plans: []ArgPlan, arg_types: []Type, retyped: []const Type) !void {
+    for (arg_plans, arg_types, retyped) |p, *t, new_type| {
+        if (p != .null_lit) continue;
+        replaceBuf(runtime_allocator, &p.null_lit.buf, try ColumnStore.init(runtime_allocator, new_type, true));
+        p.null_lit.ty = new_type;
+        t.* = new_type;
+    }
 }
 
 fn coerceTemporalStringLiterals(
