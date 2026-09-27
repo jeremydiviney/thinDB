@@ -733,8 +733,7 @@ fn hexLiteralAsKernel(allocator: Allocator, arg_types: []const Type, out_type: T
         for (0..row_count) |row| try out.data.largeint.append(allocator, expr_mod.hexNumber(bytes.rowBytes(row)));
         return;
     }
-    const text = common.stringStoreOf(out);
-    for (0..row_count) |row| try text.appendValue(allocator, bytes.rowBytes(row));
+    return string.stringIdentityKernel(allocator, args[1..2], out, row_count);
 }
 
 /// Whether argument `i` of an `arity`-argument `name` call reads a number,
