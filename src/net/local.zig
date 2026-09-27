@@ -1671,6 +1671,10 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
                 c.add(allocator, rp.right);
             }
             if (j.extra_predicate) |p| projWalkPredicate(c, allocator, p);
+            if (j.residual) |res| {
+                for (res.derived) |d| projWalkExpr(c, allocator, d.expr);
+                projWalkPredicate(c, allocator, res.predicate);
+            }
             projWalkOp(c, allocator, j.left);
             projWalkOp(c, allocator, j.right);
         },
@@ -1849,6 +1853,10 @@ fn walk_join_leaf_path(c: *ProjScan, allocator: Allocator, op: *const ir.Op, lea
                 c.add(allocator, pair.right);
             }
             if (j.extra_predicate) |p| projWalkPredicate(c, allocator, p);
+            if (j.residual) |res| {
+                for (res.derived) |d| projWalkExpr(c, allocator, d.expr);
+                projWalkPredicate(c, allocator, res.predicate);
+            }
         },
         else => return false,
     }

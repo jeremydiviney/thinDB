@@ -4,7 +4,7 @@
 //! to drive a hash/SMJ, or when at least one side is tiny.
 //!
 //! Same external contract as Hash / SMJ:
-//!   - INNER joins only in v1 (outer + range deferred)
+//!   - INNER, LEFT, RIGHT and FULL joins
 //!   - Output schema = left + (right minus right join-key columns)
 //!   - Multi-column equi keys via Spec.on
 //!   - Range predicates (Spec.ranges) AND-combined with equi keys
@@ -13,6 +13,9 @@
 //! .auto picks this algorithm — there's no equi prefix to feed a
 //! hash table or merge step, but we can still evaluate ranges over
 //! the Cartesian product.
+//!
+//! An ON residual (Spec.residual) always runs here, evaluated over
+//! batches of candidate pairs (`ResidualState`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,6 +38,8 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
+const PredicateExpr = predicate.PredicateExpr;
+const Compute = @import("compute.zig").Compute;
 
 const transform = @import("../engine/transform.zig");
 const join_mod = @import("join.zig");
@@ -43,6 +48,126 @@ const Spec = join_mod.Spec;
 const cell_io = @import("cell_io.zig");
 
 const output_batch_rows: usize = 1024;
+
+/// Candidate pairs per residual evaluation.
+const residual_chunk_pairs: usize = 2048;
+
+/// Schema-only upstream for the residual's Compute, which only ever
+/// evaluates caller-supplied pair batches.
+const PairSchema = struct {
+    schema: []const Column,
+    pub fn next(_: *PairSchema) !?Batch {
+        return null;
+    }
+    pub fn deinit(_: *PairSchema) void {}
+    pub fn outputSchema(self: *PairSchema) []const Column {
+        return self.schema;
+    }
+    pub fn addPrune(_: *PairSchema, _: Predicate) !void {}
+    pub fn stats(_: *PairSchema) exec.PipelineStats {
+        return .{ .upper_rows = std.math.maxInt(u64) };
+    }
+    pub fn accountant(_: *PairSchema) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *PairSchema, _: *std.ArrayList(u8), _: std.mem.Allocator, _: usize) !void {}
+};
+
+/// Evaluates an ON residual over batches of candidate pairs. A batch lays
+/// its pairs out like the output (left columns, kept right columns), so the
+/// residual reads the names it would read above the join. Pairs run
+/// left-row-major; with the left side preserved, each left row's candidates
+/// end in a pair with no right row: the row's null-extension, emitted only
+/// when none of its candidates passed.
+const ResidualState = struct {
+    /// Computes the residual's expression operands; null when it reads only
+    /// columns.
+    compute: ?Query,
+    stub: ?*PairSchema,
+    predicate: PredicateExpr,
+    eval_schema: []const Column,
+    /// Right rows by equi key; null without keys, where every right row is
+    /// a candidate.
+    index: ?std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = null,
+    key_scratch: std.ArrayList(u8) = .empty,
+    left_views: []ColumnView,
+    right_views: []ColumnView,
+    pair_left: []u32,
+    pair_right: []u32,
+    pairs: usize = 0,
+    pair_columns: []ColumnStore,
+    pair_views: []ColumnView,
+    mask: []bool,
+    emit: []bool,
+    /// Next candidate of the current left row.
+    cand: u32 = 0,
+    /// Whether a candidate of the current left row has passed.
+    any_pass: bool = false,
+
+    fn create(
+        allocator: Allocator,
+        aa: Allocator,
+        residual: join_mod.Residual,
+        output_schema: []const Column,
+        left_width: usize,
+        right_width: usize,
+    ) !*ResidualState {
+        const self = try aa.create(ResidualState);
+        const pair_columns = try aa.alloc(ColumnStore, output_schema.len);
+        var inited: usize = 0;
+        errdefer for (pair_columns[0..inited]) |*c| c.deinit(allocator);
+        for (output_schema, pair_columns) |col, *c| {
+            c.* = try ColumnStore.init(allocator, col.type, col.nullable);
+            inited += 1;
+        }
+        var stub: ?*PairSchema = null;
+        errdefer if (stub) |s| allocator.destroy(s);
+        var compute: ?Query = null;
+        var eval_schema = output_schema;
+        if (residual.derived.len > 0) {
+            stub = try allocator.create(PairSchema);
+            stub.?.* = .{ .schema = output_schema };
+            compute = try Compute.createWithRegistry(allocator, makeQuery(allocator, stub.?), residual.derived, residual.udf_registry);
+            eval_schema = compute.?.outputSchema();
+        }
+        errdefer if (compute) |*q| q.deinit();
+        var validated = residual.predicate;
+        try predicate.validateExpr(&validated, eval_schema);
+        self.* = .{
+            .compute = compute,
+            .stub = stub,
+            .predicate = validated,
+            .eval_schema = eval_schema,
+            .left_views = try aa.alloc(ColumnView, left_width),
+            .right_views = try aa.alloc(ColumnView, right_width),
+            .pair_left = try aa.alloc(u32, residual_chunk_pairs + 1),
+            .pair_right = try aa.alloc(u32, residual_chunk_pairs + 1),
+            .pair_columns = pair_columns,
+            .pair_views = try aa.alloc(ColumnView, output_schema.len),
+            .mask = try aa.alloc(bool, residual_chunk_pairs + 1),
+            .emit = try aa.alloc(bool, residual_chunk_pairs + 1),
+        };
+        return self;
+    }
+
+    fn deinit(self: *ResidualState, allocator: Allocator) void {
+        if (self.compute) |*q| q.deinit();
+        if (self.stub) |s| allocator.destroy(s);
+        for (self.pair_columns) |*c| c.deinit(allocator);
+        self.key_scratch.deinit(allocator);
+    }
+};
+
+/// A left row's candidate right rows: a bucket of the equi index, or every
+/// right row.
+const Candidates = struct {
+    rows: ?[]const u32,
+    count: u32,
+
+    fn at(self: Candidates, i: u32) u32 {
+        return if (self.rows) |r| r[i] else i;
+    }
+};
 
 pub const NestedLoopJoin = struct {
     allocator: Allocator,
@@ -62,6 +187,8 @@ pub const NestedLoopJoin = struct {
     /// Optional opaque per-pair predicate. Evaluated after equi +
     /// range checks; pairs returning false get dropped.
     opaque_predicate: ?join_mod.OpaquePredicate,
+
+    residual: ?*ResidualState = null,
 
     // Scratch ColumnView buffers reused per-call to feed the
     // opaque predicate callback (so we don't allocate per pair).
@@ -245,6 +372,12 @@ pub const NestedLoopJoin = struct {
         const cached_stats = try exec.concatJoinStats(allocator, left, right, left_emit, right_kept_mask_owned, output_schema.len);
         errdefer if (cached_stats.len > 0) allocator.free(cached_stats);
 
+        const residual = if (spec.residual) |res|
+            try ResidualState.create(allocator, aa, res, output_schema, left_schema.len, right_schema.len)
+        else
+            null;
+        errdefer if (residual) |rs| rs.deinit(allocator);
+
         const self = try allocator.create(NestedLoopJoin);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -256,6 +389,7 @@ pub const NestedLoopJoin = struct {
             .right_key_indices = right_keys,
             .ranges = resolved_ranges,
             .opaque_predicate = spec.opaque_predicate,
+            .residual = residual,
             .left_view_buf = lvb,
             .right_view_buf = rvb,
             .output_schema = output_schema,
@@ -276,6 +410,7 @@ pub const NestedLoopJoin = struct {
     }
 
     pub fn deinit(self: *NestedLoopJoin) void {
+        if (self.residual) |rs| rs.deinit(self.allocator);
         var l = self.left;
         l.deinit();
         var r = self.right;
@@ -318,7 +453,7 @@ pub const NestedLoopJoin = struct {
     }
 
     pub fn explain(self: *NestedLoopJoin, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
-        try exec.explainLine(out, allocator, depth, "NestedLoopJoin");
+        try exec.explainLine(out, allocator, depth, if (self.residual != null) "NestedLoopJoin (ON residual)" else "NestedLoopJoin");
         try self.left.explain(out, allocator, depth + 1);
         try self.right.explain(out, allocator, depth + 1);
     }
@@ -335,6 +470,7 @@ pub const NestedLoopJoin = struct {
             switch (self.phase) {
                 .materializing => {
                     try self.materialize();
+                    if (self.residual) |rs| try self.prepareResidual(rs);
                     // RIGHT/FULL OUTER: allocate matched-right bitmap
                     // so the draining phase can find unmatched rows.
                     if (self.join_type == .right or self.join_type == .full) {
@@ -346,7 +482,8 @@ pub const NestedLoopJoin = struct {
                     self.phase = .looping;
                 },
                 .looping => {
-                    if (try self.loopStep()) |batch| return batch;
+                    const step = if (self.residual) |rs| try self.residualStep(rs) else try self.loopStep();
+                    if (step) |batch| return batch;
                     if (self.matched_right != null) {
                         self.phase = .draining_right;
                         continue;
@@ -444,6 +581,113 @@ pub const NestedLoopJoin = struct {
         }
 
         return null;
+    }
+
+    fn prepareResidual(self: *NestedLoopJoin, rs: *ResidualState) !void {
+        for (self.left_materialized, rs.left_views) |*c, *v| v.* = c.view();
+        for (self.right_materialized, rs.right_views) |*c, *v| v.* = c.view();
+        if (self.right_key_indices.len == 0) return;
+        const aa = self.arena.allocator();
+        var index: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty;
+        const right_batch = Batch{ .schema = self.right.outputSchema(), .values = rs.right_views, .row_count = self.right_rows };
+        var r: u32 = 0;
+        while (r < self.right_rows) : (r += 1) {
+            if (join_mod.anyKeyNull(right_batch, self.right_key_indices, r)) continue;
+            rs.key_scratch.clearRetainingCapacity();
+            try join_mod.buildCompoundKey(self.allocator, &rs.key_scratch, right_batch, self.right_key_indices, r);
+            const entry = try index.getOrPut(aa, rs.key_scratch.items);
+            if (!entry.found_existing) {
+                entry.key_ptr.* = try aa.dupe(u8, rs.key_scratch.items);
+                entry.value_ptr.* = .empty;
+            }
+            try entry.value_ptr.append(aa, r);
+        }
+        rs.index = index;
+    }
+
+    fn residualCandidates(self: *NestedLoopJoin, rs: *ResidualState) !Candidates {
+        const index = rs.index orelse return .{ .rows = null, .count = self.right_rows };
+        const none: Candidates = .{ .rows = &.{}, .count = 0 };
+        const left_batch = Batch{ .schema = self.left.outputSchema(), .values = rs.left_views, .row_count = self.left_rows };
+        if (join_mod.anyKeyNull(left_batch, self.left_key_indices, self.left_cursor)) return none;
+        rs.key_scratch.clearRetainingCapacity();
+        try join_mod.buildCompoundKey(self.allocator, &rs.key_scratch, left_batch, self.left_key_indices, self.left_cursor);
+        const bucket = index.get(rs.key_scratch.items) orelse return none;
+        return .{ .rows = bucket.items, .count = @intCast(bucket.items.len) };
+    }
+
+    fn residualStep(self: *NestedLoopJoin, rs: *ResidualState) !?Batch {
+        if (self.pending_clear) {
+            for (self.output_columns) |*c| c.clear();
+            self.output_rows = 0;
+            self.pending_clear = false;
+        }
+        const preserve_left = self.join_type == .left or self.join_type == .full;
+        while (self.left_cursor < self.left_rows) {
+            rs.pairs = 0;
+            while (self.left_cursor < self.left_rows and rs.pairs < residual_chunk_pairs) {
+                const cands = try self.residualCandidates(rs);
+                while (rs.cand < cands.count and rs.pairs < residual_chunk_pairs) : (rs.cand += 1) {
+                    rs.pair_left[rs.pairs] = self.left_cursor;
+                    rs.pair_right[rs.pairs] = cands.at(rs.cand);
+                    rs.pairs += 1;
+                }
+                if (rs.cand < cands.count) break;
+                if (preserve_left) {
+                    rs.pair_left[rs.pairs] = self.left_cursor;
+                    rs.pair_right[rs.pairs] = join_mod.FAST_EMPTY;
+                    rs.pairs += 1;
+                }
+                self.left_cursor += 1;
+                rs.cand = 0;
+            }
+            try self.evaluateResidualPairs(rs);
+            if (self.output_rows > 0) return try self.flushOutput();
+        }
+        return null;
+    }
+
+    fn evaluateResidualPairs(self: *NestedLoopJoin, rs: *ResidualState) !void {
+        const n = rs.pairs;
+        if (n == 0) return;
+        const left_rows = rs.pair_left[0..n];
+        const right_rows = rs.pair_right[0..n];
+        for (rs.pair_columns) |*c| c.clear();
+        for (rs.pair_columns[0..self.left_col_count], rs.left_views[0..self.left_col_count]) |*col, view| {
+            try transform.appendByIndices(self.allocator, view, left_rows, col);
+        }
+        var out_idx = self.left_col_count;
+        for (rs.right_views, self.right_kept_mask) |view, kept| {
+            if (!kept) continue;
+            try join_mod.Join.gatherBuildColumn(self.allocator, view, right_rows, &rs.pair_columns[out_idx]);
+            out_idx += 1;
+        }
+        for (rs.pair_columns, rs.pair_views) |*c, *v| v.* = c.view();
+        const pairs = Batch{ .schema = self.output_schema, .values = rs.pair_views, .row_count = n };
+        const evaluated = if (rs.compute) |q| try exec.queryAs(Compute, q).?.evalBatch(pairs) else pairs;
+        const mask = rs.mask[0..n];
+        try predicate.evaluateExprGuided(self.allocator, rs.predicate, rs.eval_schema, evaluated, mask, null);
+
+        const emit = rs.emit[0..n];
+        var emitted: usize = 0;
+        for (right_rows, mask, emit) |r, pass, *out| {
+            if (r == join_mod.FAST_EMPTY) {
+                out.* = !rs.any_pass;
+                rs.any_pass = false;
+            } else {
+                out.* = pass;
+                if (pass) {
+                    rs.any_pass = true;
+                    if (self.matched_right) |*mb| mb.set(r);
+                }
+            }
+            if (out.*) emitted += 1;
+        }
+        if (emitted == 0) return;
+        for (self.output_columns, rs.pair_views) |*out, view| {
+            try transform.appendMaskedColumn(self.allocator, view, emit, out);
+        }
+        self.output_rows += emitted;
     }
 
     /// RIGHT/FULL OUTER drain: walk matched_right and emit
