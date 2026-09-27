@@ -2067,8 +2067,12 @@ pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Proj
 pub const ProjectionNames = struct {
     sources: [][]const u8,
     outputs: [][]const u8,
+    /// Output names allocated to tell repeated columns apart.
+    renamed: [][]u8,
 
     pub fn deinit(self: ProjectionNames, allocator: Allocator) void {
+        for (self.renamed) |r| allocator.free(r);
+        allocator.free(self.renamed);
         allocator.free(self.sources);
         allocator.free(self.outputs);
     }
@@ -2121,10 +2125,16 @@ pub fn resolve_select_project(allocator: Allocator, schema: []const types.Column
         }
     }
 
+    // A star repeating another item's column (`SELECT *, c`, `SELECT c, t.*`).
+    const renamed = try types.dedupeColumnNames(allocator, outputs.items);
+    errdefer {
+        for (renamed) |r| allocator.free(r);
+        allocator.free(renamed);
+    }
     const source_slice = try sources.toOwnedSlice(allocator);
     errdefer allocator.free(source_slice);
     const output_slice = try outputs.toOwnedSlice(allocator);
-    return .{ .sources = source_slice, .outputs = output_slice };
+    return .{ .sources = source_slice, .outputs = output_slice, .renamed = renamed };
 }
 
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {

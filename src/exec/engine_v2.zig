@@ -1463,7 +1463,15 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
                     try names.append(allocator, c);
                 }
             }
-            q = try q.project(names.items);
+            // A star repeating another item's column (`SELECT *, c`).
+            const outputs = try allocator.dupe([]const u8, names.items);
+            defer allocator.free(outputs);
+            const renamed = try types.dedupeColumnNames(allocator, outputs);
+            defer {
+                for (renamed) |r| allocator.free(r);
+                allocator.free(renamed);
+            }
+            q = if (renamed.len == 0) try q.project(names.items) else try q.projectNamed(names.items, outputs);
         } else if (plan.project_outputs) |outs| {
             const names = try allocator.alloc([]const u8, cols.len);
             defer allocator.free(names);
