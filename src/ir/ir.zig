@@ -64,7 +64,8 @@ pub const Expr = exec_expr.Expr;
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v5: create_table carries a table-compression byte.
 /// v7: join carries an optional ON residual.
-pub const version: u16 = 7;
+/// v8: drop_table carries a table list; alter_table carries actions.
+pub const version: u16 = 8;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -126,7 +127,7 @@ pub const DdlOp = union(enum) {
     create_table: CreateTable,
     drop_table: DropTable,
     rename_table: RenameTable,
-    alter_table_add_column: AlterTableAddColumn,
+    alter_table: AlterTable,
     truncate_table: TableRef,
     create_sql_function: CreateSqlFunction,
     drop_sql_function: DropSqlFunction,
@@ -229,8 +230,9 @@ pub const CreateTable = struct {
     compression: ?types.TableCompression = null,
 };
 
+/// `DROP TABLE [IF EXISTS] a, b, ...`.
 pub const DropTable = struct {
-    table: TableRef,
+    tables: []const TableRef,
     if_exists: bool,
 };
 
@@ -251,9 +253,22 @@ pub const RenameTable = struct {
     to: TableRef,
 };
 
-pub const AlterTableAddColumn = struct {
+/// `ALTER TABLE t action, ...`: the actions apply in order.
+pub const AlterTable = struct {
     table: TableRef,
-    column: ColumnDef,
+    actions: []const AlterAction,
+};
+
+pub const AlterAction = union(enum) {
+    add_column: ColumnDef,
+    drop_column: []const u8,
+    rename_column: RenameColumn,
+    /// `CHANGE old def` / `MODIFY def` (then `from` is `column.name`).
+    change_column: ChangeColumn,
+    rename_table: TableRef,
+
+    pub const RenameColumn = struct { from: []const u8, to: []const u8 };
+    pub const ChangeColumn = struct { from: []const u8, column: ColumnDef };
 };
 
 /// Side-effect: bulk insert literal rows. Lives outside DdlOp because
@@ -972,6 +987,8 @@ fn freeDecodedDdl(d: DdlOp, allocator: Allocator) void {
             allocator.free(cf.param_names);
             allocator.free(cf.param_types);
         },
+        .drop_table => |dt| allocator.free(dt.tables),
+        .alter_table => |at| allocator.free(at.actions),
         else => {},
     }
 }
@@ -1196,6 +1213,28 @@ fn encodeCopy(allocator: Allocator, out: *std.ArrayList(u8), c: CopyOp) EncodeEr
     }
 }
 
+fn encodeAlterAction(allocator: Allocator, out: *std.ArrayList(u8), action: AlterAction) EncodeError!void {
+    try out.append(allocator, @intFromEnum(@as(std.meta.Tag(AlterAction), action)));
+    switch (action) {
+        .add_column => |c| try encodeColumnDef(allocator, out, c),
+        .drop_column => |name| try encodeString(allocator, out, name),
+        .rename_column => |r| {
+            try encodeString(allocator, out, r.from);
+            try encodeString(allocator, out, r.to);
+        },
+        .change_column => |ch| {
+            try encodeString(allocator, out, ch.from);
+            try encodeColumnDef(allocator, out, ch.column);
+        },
+        .rename_table => |ref| try encodeTableRef(allocator, out, ref),
+    }
+}
+
+fn encodeString(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) EncodeError!void {
+    try appendU32(allocator, out, @intCast(s.len));
+    try out.appendSlice(allocator, s);
+}
+
 fn encodeTableRef(allocator: Allocator, out: *std.ArrayList(u8), ref: TableRef) EncodeError!void {
     try encodeOptString(allocator, out, ref.database);
     try encodeOptString(allocator, out, ref.schema);
@@ -1223,7 +1262,7 @@ const DdlTag = enum(u8) {
     create_table = 6,
     drop_table = 7,
     rename_table = 8,
-    alter_table_add_column = 9,
+    alter_table = 9,
     truncate_table = 10,
     create_sql_function = 11,
     drop_sql_function = 12,
@@ -1410,7 +1449,8 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
         },
         .drop_table => |dt| {
             try out.append(allocator, @intFromEnum(DdlTag.drop_table));
-            try encodeTableRef(allocator, out, dt.table);
+            try appendU32(allocator, out, @intCast(dt.tables.len));
+            for (dt.tables) |ref| try encodeTableRef(allocator, out, ref);
             try out.append(allocator, @intFromBool(dt.if_exists));
         },
         .rename_table => |rt| {
@@ -1418,10 +1458,11 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try encodeTableRef(allocator, out, rt.from);
             try encodeTableRef(allocator, out, rt.to);
         },
-        .alter_table_add_column => |at| {
-            try out.append(allocator, @intFromEnum(DdlTag.alter_table_add_column));
+        .alter_table => |at| {
+            try out.append(allocator, @intFromEnum(DdlTag.alter_table));
             try encodeTableRef(allocator, out, at.table);
-            try encodeColumnDef(allocator, out, at.column);
+            try appendU32(allocator, out, @intCast(at.actions.len));
+            for (at.actions) |action| try encodeAlterAction(allocator, out, action);
         },
         .truncate_table => |ref| {
             try out.append(allocator, @intFromEnum(DdlTag.truncate_table));
@@ -2541,6 +2582,30 @@ fn decodeCopy(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErr
     return .{ .direction = direction, .table = ref, .columns = cols_opt };
 }
 
+/// A u32 element count, bounded by the bytes left so a corrupt count can't
+/// size a huge allocation.
+fn decodeCount(bytes: []const u8, cursor: *usize) DecodeError!usize {
+    if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+    const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+    cursor.* += 4;
+    if (n > bytes.len - cursor.*) return Error.IrCorrupt;
+    return n;
+}
+
+fn decodeAlterAction(bytes: []const u8, cursor: *usize) DecodeError!AlterAction {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const t = bytes[cursor.*];
+    cursor.* += 1;
+    if (t >= @typeInfo(AlterAction).@"union".fields.len) return Error.IrCorrupt;
+    return switch (@as(std.meta.Tag(AlterAction), @enumFromInt(t))) {
+        .add_column => .{ .add_column = try decodeColumnDef(bytes, cursor) },
+        .drop_column => .{ .drop_column = try readString(bytes, cursor) },
+        .rename_column => .{ .rename_column = .{ .from = try readString(bytes, cursor), .to = try readString(bytes, cursor) } },
+        .change_column => .{ .change_column = .{ .from = try readString(bytes, cursor), .column = try decodeColumnDef(bytes, cursor) } },
+        .rename_table => .{ .rename_table = try decodeTableRef(bytes, cursor) },
+    };
+}
+
 fn decodeTableRef(bytes: []const u8, cursor: *usize) DecodeError!TableRef {
     const database = try decodeOptString(bytes, cursor);
     const schema = try decodeOptString(bytes, cursor);
@@ -2656,21 +2721,25 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             } };
         },
         .drop_table => blk: {
-            const ref = try decodeTableRef(bytes, cursor);
+            const tables = try allocator.alloc(TableRef, try decodeCount(bytes, cursor));
+            errdefer allocator.free(tables);
+            for (tables) |*ref| ref.* = try decodeTableRef(bytes, cursor);
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const ie = bytes[cursor.*] != 0;
             cursor.* += 1;
-            break :blk DdlOp{ .drop_table = .{ .table = ref, .if_exists = ie } };
+            break :blk DdlOp{ .drop_table = .{ .tables = tables, .if_exists = ie } };
         },
         .rename_table => blk: {
             const from = try decodeTableRef(bytes, cursor);
             const to = try decodeTableRef(bytes, cursor);
             break :blk DdlOp{ .rename_table = .{ .from = from, .to = to } };
         },
-        .alter_table_add_column => blk: {
+        .alter_table => blk: {
             const ref = try decodeTableRef(bytes, cursor);
-            const column = try decodeColumnDef(bytes, cursor);
-            break :blk DdlOp{ .alter_table_add_column = .{ .table = ref, .column = column } };
+            const actions = try allocator.alloc(AlterAction, try decodeCount(bytes, cursor));
+            errdefer allocator.free(actions);
+            for (actions) |*action| action.* = try decodeAlterAction(bytes, cursor);
+            break :blk DdlOp{ .alter_table = .{ .table = ref, .actions = actions } };
         },
         .truncate_table => DdlOp{ .truncate_table = try decodeTableRef(bytes, cursor) },
         .create_sql_function => blk: {
@@ -3252,22 +3321,29 @@ test "ir: database and schema ddl round-trip with their existence flags" {
     }
 }
 
-test "ir: ddl rename alter-add and truncate round-trip" {
+test "ir: ddl rename alter drop and truncate round-trip" {
     const allocator = std.testing.allocator;
+    const score: ColumnDef = .{
+        .name = "score",
+        .column_type = .int,
+        .nullable = false,
+        .default_value = .{ .int = 0 },
+    };
+    const actions = [_]AlterAction{
+        .{ .add_column = score },
+        .{ .drop_column = "old" },
+        .{ .rename_column = .{ .from = "a", .to = "b" } },
+        .{ .change_column = .{ .from = "c", .column = score } },
+        .{ .rename_table = .{ .schema = "s", .name = "t2" } },
+    };
+    const dropped = [_]TableRef{ .{ .name = "a" }, .{ .database = "d", .name = "b" } };
     const cases = [_]Op{
         .{ .ddl = .{ .rename_table = .{
             .from = .{ .name = "a" },
             .to = .{ .name = "b" },
         } } },
-        .{ .ddl = .{ .alter_table_add_column = .{
-            .table = .{ .name = "t" },
-            .column = .{
-                .name = "score",
-                .column_type = .int,
-                .nullable = false,
-                .default_value = .{ .int = 0 },
-            },
-        } } },
+        .{ .ddl = .{ .alter_table = .{ .table = .{ .name = "t" }, .actions = &actions } } },
+        .{ .ddl = .{ .drop_table = .{ .tables = &dropped, .if_exists = true } } },
         .{ .ddl = .{ .truncate_table = .{ .name = "t" } } },
     };
 
@@ -3281,6 +3357,21 @@ test "ir: ddl rename alter-add and truncate round-trip" {
 
         try std.testing.expect(decoded == .ddl);
         try std.testing.expectEqual(@as(std.meta.Tag(DdlOp), root.ddl), @as(std.meta.Tag(DdlOp), decoded.ddl));
+        switch (decoded.ddl) {
+            .alter_table => |at| {
+                try std.testing.expectEqual(actions.len, at.actions.len);
+                for (actions, at.actions) |want, got| try std.testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+                try std.testing.expectEqualStrings("b", at.actions[2].rename_column.to);
+                try std.testing.expectEqualStrings("c", at.actions[3].change_column.from);
+                try std.testing.expectEqualStrings("t2", at.actions[4].rename_table.name);
+            },
+            .drop_table => |dt| {
+                try std.testing.expectEqual(dropped.len, dt.tables.len);
+                try std.testing.expectEqualStrings("d", dt.tables[1].database.?);
+                try std.testing.expect(dt.if_exists);
+            },
+            else => {},
+        }
     }
 }
 
