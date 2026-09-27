@@ -47,6 +47,7 @@ const string = @import("scalar_fn_string.zig");
 const math = @import("scalar_fn_math.zig");
 const date = @import("scalar_fn_date.zig");
 const datefmt = @import("scalar_fn_datefmt.zig");
+const time = @import("scalar_fn_time.zig");
 const cond = @import("scalar_fn_cond.zig");
 const dec = @import("scalar_fn_decimal.zig");
 const json = @import("scalar_fn_json.zig");
@@ -135,6 +136,7 @@ pub fn resolveWithRegistry(
     if (try resolveIntArith(aa, name, arg_types)) |ov| return ov;
     if (try resolveFractionalIntDiv(aa, name, arg_types)) |ov| return ov;
     if (try resolveFormat(aa, name, arg_types)) |ov| return ov;
+    if (try resolveTimeFromNumbers(aa, name, arg_types)) |ov| return ov;
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
@@ -519,6 +521,20 @@ fn resolveFormat(aa: Allocator, name: []const u8, arg_types: []const Type) !?Res
     return try buildDecFn(aa, name, arg_types, .string, dec.formatKernel, .propagates);
 }
 
+/// SEC_TO_TIME(n) and MAKETIME(h, m, s) read any number, or text as a
+/// number, keeping a decimal's or a double's fraction, so they take each
+/// argument's own type rather than a cast.
+fn resolveTimeFromNumbers(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    const kernel: TypedKernel = if (arg_types.len == 1 and std.ascii.eqlIgnoreCase(name, "sec_to_time"))
+        time.secToTimeKernel
+    else if (arg_types.len == 3 and std.ascii.eqlIgnoreCase(name, "maketime"))
+        time.makeTimeKernel
+    else
+        return null;
+    for (arg_types) |t| if (!numericLike(t) and !t.isString()) return null;
+    return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
+}
+
 /// Internal: JSON_ARRAYAGG / JSON_OBJECTAGG lower to a GROUP_CONCAT of these
 /// per-row packings, which the matching wrapper builds the document from
 /// (`scalar_fn_json.zig`).
@@ -564,6 +580,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
     if (std.ascii.eqlIgnoreCase(name, "format")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "sec_to_time") or std.ascii.eqlIgnoreCase(name, "maketime")) return true;
     for (builtins) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return true;
     if (registry) |reg| {
         for (reg.scalarEntries()) |entry| if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
@@ -1039,10 +1056,37 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "day", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.dayFromDatetimeKernel },
     .{ .name = "dayofmonth", .arg_types = &.{.date}, .return_type = .int, .kernel = date.dayFromDateKernel },
     .{ .name = "dayofmonth", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.dayFromDatetimeKernel },
-    .{ .name = "makedate", .arg_types = &.{ .int, .int }, .return_type = .date, .kernel = date.makedateKernel },
+    .{ .name = "makedate", .arg_types = &.{ .int, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.makedateKernel },
+    // Text reads as MySQL reads a TIME argument: a TIME, or a DATETIME
+    // when it spells one (scalar_fn_time.zig).
     .{ .name = "hour", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.hourKernel },
+    .{ .name = "hour", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = time.clockPartKernel(.hour) },
     .{ .name = "minute", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.minuteKernel },
+    .{ .name = "minute", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = time.clockPartKernel(.minute) },
     .{ .name = "second", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.secondKernel },
+    .{ .name = "second", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = time.clockPartKernel(.second) },
+    .{ .name = "time", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timeKernel },
+    .{ .name = "time", .arg_types = &.{.datetime}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timeKernel },
+    .{ .name = "time", .arg_types = &.{.date}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timeKernel },
+    .{ .name = "time_to_sec", .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = time.timeToSecKernel },
+    .{ .name = "time_to_sec", .arg_types = &.{.datetime}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = time.timeToSecKernel },
+    .{ .name = "time_to_sec", .arg_types = &.{.date}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = time.timeToSecKernel },
+    .{ .name = "timediff", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timediffKernel },
+    .{ .name = "timediff", .arg_types = &.{ .datetime, .datetime }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timediffKernel },
+    .{ .name = "timediff", .arg_types = &.{ .date, .date }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timediffKernel },
+    .{ .name = "timediff", .arg_types = &.{ .datetime, .date }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timediffKernel },
+    .{ .name = "timediff", .arg_types = &.{ .date, .datetime }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.timediffKernel },
+    .{ .name = "addtime", .arg_types = &.{ .datetime, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = time.addTimeKernel(1) },
+    .{ .name = "addtime", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.addTimeKernel(1) },
+    .{ .name = "subtime", .arg_types = &.{ .datetime, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = time.addTimeKernel(-1) },
+    .{ .name = "subtime", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = time.addTimeKernel(-1) },
+    .{ .name = "to_days", .arg_types = &.{.date}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = date.toDaysKernel(.date) },
+    .{ .name = "to_days", .arg_types = &.{.datetime}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = date.toDaysKernel(.datetime) },
+    .{ .name = "to_seconds", .arg_types = &.{.datetime}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = date.toSecondsKernel },
+    .{ .name = "from_days", .arg_types = &.{.bigint}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.fromDaysKernel },
+    .{ .name = "period_add", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = date.periodAddKernel },
+    .{ .name = "period_diff", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = date.periodDiffKernel },
+    .{ .name = "convert_tz", .arg_types = &.{ .datetime, .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.convertTzKernel },
     // --- date arithmetic + epoch conversion ---
     .{ .name = "datediff", .arg_types = &.{ .date, .date }, .return_type = .int, .kernel = date.datediffKernel },
     .{ .name = "datediff", .arg_types = &.{ .datetime, .datetime }, .return_type = .int, .kernel = date.datediffDatetimeKernel },
@@ -1062,10 +1106,11 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = date.fromUnixtimeKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
-    .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .int, .kernel = date.dateDiffDateKernel },
-    .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .int, .kernel = date.dateDiffDatetimeKernel },
-    .{ .name = "timestampdiff", .arg_types = &.{ .string, .date, .date }, .return_type = .int, .kernel = date.dateDiffDateKernel },
-    .{ .name = "timestampdiff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .int, .kernel = date.dateDiffDatetimeKernel },
+    .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .bigint, .kernel = date.dateDiffDateKernel },
+    .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.dateDiffDatetimeKernel },
+    // DATEs widen to DATETIMEs at midnight, which leaves every unit's
+    // count unchanged.
+    .{ .name = "timestampdiff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.timestampDiffKernel },
     .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .date }, .return_type = .date, .kernel = date.timestampAddDateKernel },
     .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .datetime }, .return_type = .datetime, .kernel = date.timestampAddDatetimeKernel },
     // --- date (expanded MySQL-style helpers) ---
@@ -1084,6 +1129,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_format", .arg_types = &.{ .datetime, .string }, .return_type = .string, .kernel = date.dateFormatDatetimeKernel },
     .{ .name = "date_format", .arg_types = &.{ .date, .string }, .return_type = .string, .kernel = date.dateFormatDateKernel },
     .{ .name = "str_to_date", .arg_types = &.{ .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = datefmt.strToDateKernel },
+    .{ .name = "str_to_time", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = datefmt.strToTimeKernel },
+    .{ .name = "get_format", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = datefmt.getFormatKernel },
     .{ .name = "week", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.weekKernel(.date) },
     .{ .name = "week", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.weekKernel(.datetime) },
     .{ .name = "week", .arg_types = &.{ .date, .int }, .return_type = .int, .kernel = datefmt.weekKernel(.date) },
@@ -1098,6 +1145,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "weekday", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.weekdayKernel(.datetime) },
     .{ .name = "microsecond", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.microsecondKernel(.date) },
     .{ .name = "microsecond", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.microsecondKernel(.datetime) },
+    .{ .name = "microsecond", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = time.clockPartKernel(.microsecond) },
     // --- conversion ---
     // Numeric widening (int → bigint → double): always succeeds.
     .{ .name = "to_int", .arg_types = &.{.int}, .return_type = .int, .kernel = math.intIdentityKernel },
@@ -1210,7 +1258,31 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "interval", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = math.intervalKernel("bigint") },
     .{ .name = "interval", .arg_types = &.{.double}, .return_type = .bigint, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = math.intervalKernel("double") },
     .{ .name = "sleep", .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .volatility = .@"volatile", .kernel = math.sleepKernel },
-};
+} ++ extractBuiltins();
+
+/// `extract_<unit>` over text, a DATETIME or a DATE for each of MySQL's
+/// compound EXTRACT units, which the parser lowers EXTRACT(unit FROM x) to.
+fn extractBuiltins() [3 * (std.meta.fields(time.ClockUnit).len + 1)]ScalarFn {
+    const operand_types = [_]Type{ .string, .datetime, .date };
+    var fns: [3 * (std.meta.fields(time.ClockUnit).len + 1)]ScalarFn = undefined;
+    for (operand_types, 0..) |t, i| fns[i] = .{
+        .name = "extract_year_month",
+        .arg_types = &[_]Type{t},
+        .return_type = .bigint,
+        .null_strategy = .kernel_managed,
+        .kernel = time.extractYearMonthKernel,
+    };
+    for (std.enums.values(time.ClockUnit), 1..) |unit, u| {
+        for (operand_types, 0..) |t, i| fns[u * 3 + i] = .{
+            .name = "extract_" ++ @tagName(unit),
+            .arg_types = &[_]Type{t},
+            .return_type = .bigint,
+            .null_strategy = .kernel_managed,
+            .kernel = time.extractClockKernel(unit),
+        };
+    }
+    return fns;
+}
 
 /// Other dialects' spellings of builtins. The parser rewrites a call to
 /// its canonical name, so an alias carries every overload of its target

@@ -3708,6 +3708,7 @@ fn runSingleStatement(
         try session.replace(new_session.current_db, new_session.current_schema);
         session.captureVars(new_session);
         session.recordOutcome(op.*, &compiled);
+        applyTransactionVerb(session, op.*);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
         const write_start = profiler.start();
@@ -3717,7 +3718,7 @@ fn runSingleStatement(
             seq_id.*,
             affected_rows,
             compiled.lastInsertId() orelse 0,
-            extra_status,
+            (extra_status & ~handshake.SERVER_STATUS_IN_TRANS) | session.transactionStatus(),
         );
         profiler.recordSince(.query_write, write_start);
         seq_id.* +%= 1;
@@ -3777,8 +3778,20 @@ fn runSingleStatement(
 fn isSideEffectOp(op: ir.Op) bool {
     return switch (op) {
         .ddl, .insert, .insert_select, .set_var, .delete_op, .update_op => true,
+        .admin => |a| a != .table_maintenance,
         else => false,
     };
+}
+
+/// BEGIN / COMMIT that reach the parser (inside a batch, or in a form
+/// `matchTxnVerb` does not spell out) set the IN_TRANS status the same way.
+fn applyTransactionVerb(session: *SessionState, op: ir.Op) void {
+    if (op != .admin) return;
+    switch (op.admin) {
+        .begin_transaction => session.in_transaction = true,
+        .end_transaction => session.in_transaction = false,
+        .ignored, .table_maintenance => {},
+    }
 }
 
 /// True when an op (or one of its sub-statements in a batch) is a
@@ -4064,6 +4077,7 @@ fn handleStmtExecute(
         try session.replace(new_session.current_db, new_session.current_schema);
         session.captureVars(new_session);
         session.recordOutcome(op.*, &compiled);
+        applyTransactionVerb(session, op.*);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
         const write_start = profiler.start();

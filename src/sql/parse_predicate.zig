@@ -1125,7 +1125,7 @@ fn isTypedLiteralKeyword(s: []const u8) bool {
 
 fn isLiteralLhsTokenStart(tag: anytype) bool {
     return switch (tag) {
-        .integer, .floating, .string, .kw_true, .kw_false => true,
+        .integer, .big_integer, .floating, .string, .kw_true, .kw_false => true,
         else => false,
     };
 }

@@ -338,7 +338,7 @@ pub fn intDivKernel(allocator: Allocator, arg_types: []const Type, out_type: Typ
 
 /// An operand as an exact scaled integer; null for a double past DECIMAL's
 /// range.
-fn exactAt(v: ColumnView, t: Type, row: usize) ?common.ScaledInt {
+pub fn exactAt(v: ColumnView, t: Type, row: usize) ?common.ScaledInt {
     if (t.isFloat()) return common.floatDigits(f64At(v, t, row));
     return .{ .m = mantissaAt(v, row), .s = scaleOf(t) };
 }

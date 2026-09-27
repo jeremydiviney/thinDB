@@ -208,7 +208,7 @@ pub fn parseWindowSpec(p: anytype) !ir.WindowSpec {
         // expression key computes below the Window with the PARTITION BY
         // expressions; a predicate key comparing computed operands would
         // need its own Compute beneath that one.
-        const order = try p.parseOrderBy(&.{});
+        const order = try p.parseOrderBy(&.{}, &.{});
         if (order.anchors.len > 0) return PE.SqlInvalidProjection;
         try p.window_partition_expr_refs.appendSlice(p.arena, order.keys);
         order_by = order.specs;

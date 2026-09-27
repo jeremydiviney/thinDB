@@ -32,6 +32,7 @@ test {
     _ = @import("sql_namespace_test.zig");
     _ = @import("sql_ddl_test.zig");
     _ = @import("multi_statement_test.zig");
+    _ = @import("mysql_surface_test.zig");
     _ = @import("catalog_test.zig");
     _ = @import("sweep_gate_test.zig");
     _ = @import("temp_tables_test.zig");
@@ -48,6 +49,7 @@ test {
     _ = @import("extract_test.zig");
     _ = @import("having_test.zig");
     _ = @import("interval_test.zig");
+    _ = @import("mysql_time_fn_test.zig");
     _ = @import("union_test.zig");
     _ = @import("ctas_insert_select_test.zig");
     _ = @import("file_scan_test.zig");
