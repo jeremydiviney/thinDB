@@ -38,6 +38,7 @@ const predicate_mod = @import("predicate.zig");
 const PredicateExpr = predicate_mod.PredicateExpr;
 const scalar_fn = @import("scalar_fn.zig");
 const scalar_common = @import("scalar_fn_common.zig");
+const scalar_decimal = @import("scalar_fn_decimal.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const simd = @import("../util/simd.zig");
 const udf_mod = @import("../udf.zig");
@@ -1303,31 +1304,18 @@ fn tryFuseScalar(aa: Allocator, expr: Expr, up_schema: []const Column) !?FusedSc
         return null;
     if (c.args.len != 2) return null;
 
-    var col_idx: usize = undefined;
-    var lit_v: types.Value = undefined;
-    var col_left: bool = undefined;
-    switch (c.args[0]) {
-        .col_ref => |name| switch (c.args[1]) {
-            .lit => |v| {
-                col_idx = columnIndex(up_schema, name) orelse return null;
-                lit_v = v;
-                col_left = true;
-            },
-            else => return null,
-        },
-        .lit => |v| switch (c.args[1]) {
-            .col_ref => |name| {
-                col_idx = columnIndex(up_schema, name) orelse return null;
-                lit_v = v;
-                col_left = false;
-            },
-            else => return null,
-        },
-        else => return null,
-    }
+    const col_left = c.args[0] == .col_ref;
+    const col_arg = c.args[if (col_left) 0 else 1];
+    const lit_arg = c.args[if (col_left) 1 else 0];
+    if (col_arg != .col_ref) return null;
+    const col_idx = columnIndex(up_schema, col_arg.col_ref) orelse return null;
+    const lit_v = expr_mod.literalValue(lit_arg) orelse return null;
 
     const src_type = up_schema[col_idx].type;
     if (up_schema[col_idx].nullable or !fusableSrc(src_type)) return null;
+    // A decimal constant is its double only beside a float column, where the
+    // call converts it to DOUBLE anyway.
+    if (lit_arg != .lit and !src_type.isFloat()) return null;
 
     // Canonical output type from the real overload resolution, so the derived
     // column's type matches what the rest of the plan expects.
@@ -1665,6 +1653,12 @@ fn resolveDerived(
             };
         },
         .call => {
+            if (try decimalLitSlot(runtime_allocator, aa, d.expr)) |slot| return .{
+                .name = name,
+                .output_type = slot.ty,
+                .stat_class = .{ .literal = null },
+                .kind = .{ .lit_only = slot },
+            };
             const stat_class: StatClass = if (mayVary(d.expr, udf_registry)) .none else classifyExpr(d.expr, up_schema);
             // Fast path: `col +/-/* const` collapses to one widening SIMD pass.
             if (try tryFuseScalar(aa, d.expr, up_schema)) |fs| {
@@ -1938,6 +1932,7 @@ fn buildBranchSrc(
             break :blk BranchSrc{ .null_lit = slot };
         },
         .call => blk: {
+            if (try decimalLitSlot(runtime_allocator, aa, e)) |slot| break :blk BranchSrc{ .lit = slot };
             const sub = try buildCallPlan(runtime_allocator, aa, e, up_schema, udf_registry);
             break :blk BranchSrc{ .call = sub };
         },
@@ -2051,7 +2046,10 @@ fn buildCallPlan(
                 arg_plans[i] = .{ .null_lit = slot };
                 arg_types[i] = ty;
             },
-            .call => {
+            .call => if (try decimalLitSlot(runtime_allocator, aa, arg)) |slot| {
+                arg_plans[i] = .{ .lit = slot };
+                arg_types[i] = slot.ty;
+            } else {
                 const sub = try buildCallPlan(runtime_allocator, aa, arg, up_schema, udf_registry);
                 arg_plans[i] = .{ .call = sub };
                 arg_types[i] = sub.output_type;
@@ -2119,15 +2117,20 @@ fn buildCallPlan(
         }
     }
 
+    var func = rr.func;
+    if (try literalDivisorNonzero(aa, runtime_allocator, rr, arg_plans)) func.null_strategy = .propagates;
+    if (arg_plans.len == 2 and arg_plans[1] == .lit) {
+        if (intFamilyValueI128(arg_plans[1].lit.value)) |places| {
+            if (scalar_fn.roundedDecimalType(c.fn_name, arg_types, places)) |t| func.return_type = t;
+        }
+    }
+
     // Own a nullable output ColumnStore so the next level up's null
     // propagation can see the correct validity bits.
     const output_buf = try runtime_allocator.create(ColumnStore);
     errdefer runtime_allocator.destroy(output_buf);
-    output_buf.* = try ColumnStore.init(runtime_allocator, rr.func.return_type, true);
+    output_buf.* = try ColumnStore.init(runtime_allocator, func.return_type, true);
     errdefer output_buf.deinit(runtime_allocator);
-
-    var func = rr.func;
-    if (try literalDivisorNonzero(aa, runtime_allocator, rr, arg_plans)) func.null_strategy = .propagates;
     const plan = try aa.create(CallPlan);
     plan.* = .{
         .func = func,
@@ -2137,7 +2140,7 @@ fn buildCallPlan(
         .cast_buffers = cast_buffers,
         .output = output_buf,
         .output_owned = true,
-        .output_type = rr.func.return_type,
+        .output_type = func.return_type,
         .arg_reach = argReach(func),
     };
     return plan;
@@ -2152,7 +2155,9 @@ fn buildCallPlan(
 /// rewritten call can't recurse again.
 fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
     const args = try aa.alloc(Expr, c.args.len);
-    for (args, c.args, arg_plans) |*a, orig, ap| a.* = if (ap == .lit) .{ .lit = ap.lit.value } else orig;
+    // A literal slot may hold a retyped value; a decimal one keeps its digits'
+    // expression, since its Value has no scale.
+    for (args, c.args, arg_plans) |*a, orig, ap| a.* = if (ap == .lit and !ap.lit.ty.isDecimal()) .{ .lit = ap.lit.value } else orig;
     if (scalar_fn.resultValueArgsStart(c.fn_name)) |start| if (start < args.len) {
         var typed: std.ArrayList(Type) = .empty;
         for (arg_plans[start..], arg_types[start..]) |ap, t| if (ap != .null_lit) try typed.append(aa, t);
@@ -2177,10 +2182,11 @@ fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr
 }
 
 fn convertedArg(aa: Allocator, e: Expr, target: Type) !?Expr {
-    if (e == .lit and !target.isString()) {
-        var v = e.lit;
+    const lit_value: ?types.Value = if (e == .lit) e.lit else if (target.isFloat()) expr_mod.literalValue(e) else null;
+    if (lit_value) |lv| if (!target.isString()) {
+        var v = lv;
         if (predicate_mod.coerceValueRounded(&v, target)) |_| return Expr{ .lit = v } else |_| {}
-    }
+    };
     const name = try scalar_fn.castFnName(aa, target) orelse return null;
     return Expr{ .call = .{ .fn_name = name, .args = try aa.dupe(Expr, &.{e}) } };
 }
@@ -2373,6 +2379,25 @@ fn freeResolvedDerived(runtime_allocator: Allocator, r: ResolvedDerived) void {
 /// the active union tag — int literals stay int (not promoted to bigint);
 /// promotion happens via the existing implicit-cast machinery if the
 /// resolved overload requires it.
+/// A decimal constant (`expr.decimalLiteral`) folded into one typed literal,
+/// its digits read as the cast reads them. Null leaves any other cast, and
+/// digits the cast would reject, to run per row.
+fn decimalLitSlot(runtime_allocator: Allocator, aa: Allocator, e: Expr) PlanError!?*LitSlot {
+    const d = expr_mod.decimalLiteral(e) orelse return null;
+    const ty = scalar_decimal.decTypeFor(d.p, d.s);
+    const m = scalar_decimal.textConstantMantissa(d.digits, ty.decimalSpec().?) orelse return null;
+    const slot = try aa.create(LitSlot);
+    slot.* = .{
+        .value = switch (ty) {
+            .decimal64 => .{ .decimal64 = @intCast(m) },
+            else => .{ .decimal128 = m },
+        },
+        .ty = ty,
+        .buf = try ColumnStore.init(runtime_allocator, ty, false),
+    };
+    return slot;
+}
+
 fn literalType(v: types.Value) Error!Type {
     return switch (v) {
         .int => .int,

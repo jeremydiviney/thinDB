@@ -165,6 +165,40 @@ test "decimal: ROUND and COALESCE" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 400, 300, 100 }, cb);
 }
 
+test "decimal: ROUND and TRUNCATE to a literal place narrow the scale" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE m (id INT PRIMARY KEY, a DECIMAL(10,2), n INT)");
+    try helpers.exec(allocator, db, "INSERT INTO m VALUES (1, 1.50, 1), (2, 2.25, -1)");
+    try (try db.openTable("m", .{})).flush();
+
+    // MySQL and DuckDB: a literal place below the scale is the result's
+    // scale, and a negative one rounds left of the point.
+    const cases = .{
+        .{ "SELECT ROUND(1.005, 2) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 4, .s = 2 } }, &[_]i64{ 101, 101 } },
+        .{ "SELECT TRUNCATE(2.555, 2) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 4, .s = 2 } }, &[_]i64{ 255, 255 } },
+        .{ "SELECT ROUND(15.5, -1) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 3, .s = 0 } }, &[_]i64{ 20, 20 } },
+        .{ "SELECT TRUNCATE(19.99, -1) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 4, .s = 0 } }, &[_]i64{ 10, 10 } },
+        .{ "SELECT ROUND(1.5, 3) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 2, .s = 1 } }, &[_]i64{ 15, 15 } },
+        .{ "SELECT ROUND(a * 1.1, 2) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 12, .s = 2 } }, &[_]i64{ 165, 248 } },
+        .{ "SELECT ROUND(a, 1) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 10, .s = 1 } }, &[_]i64{ 15, 23 } },
+        // A per-row place keeps the source scale.
+        .{ "SELECT ROUND(a, n) FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 10, .s = 2 } }, &[_]i64{ 150, 0 } },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        try std.testing.expectEqual(c[1], q.outputSchema()[0].type);
+        const got = try collectDecimal64(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[2], got);
+    }
+}
+
 test "decimal: comparison against int and float literals" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -281,6 +315,80 @@ test "decimal: a float function takes a decimal's value" {
         defer allocator.free(got);
         try std.testing.expectEqual(c[1].len, got.len);
         for (c[1], got) |want, v| try std.testing.expectApproxEqAbs(want, v, 1e-9);
+    }
+}
+
+test "decimal: a fractional literal is an exact DECIMAL of its digits" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE m (id INT PRIMARY KEY, a DECIMAL(10,2), f DOUBLE, i INT)");
+    try helpers.exec(allocator, db, "INSERT INTO m VALUES (1, 1.50, 1.5, 3), (2, 2.25, 2.25, 4)");
+    try (try db.openTable("m", .{})).flush();
+
+    // MySQL, StarRocks and DuckDB type `1.10` as DECIMAL(3,2), so literal
+    // arithmetic is exact: 0.1 + 0.2 is 0.3, and money math stays DECIMAL.
+    const decimals = .{
+        .{ "SELECT 0.1 + 0.2 FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 3, .s = 1 } }, &[_]i64{ 3, 3 } },
+        .{ "SELECT a * 1.1 FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 12, .s = 3 } }, &[_]i64{ 1650, 2475 } },
+        .{ "SELECT i * 1.5 FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 12, .s = 1 } }, &[_]i64{ 45, 60 } },
+        .{ "SELECT 1.10 FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 3, .s = 2 } }, &[_]i64{ 110, 110 } },
+        .{ "SELECT -.5 FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 1, .s = 1 } }, &[_]i64{ -5, -5 } },
+        .{ "SELECT CASE WHEN id = 1 THEN 1.5 ELSE 0 END FROM m ORDER BY id", thindb.Type{ .decimal64 = .{ .p = 2, .s = 1 } }, &[_]i64{ 15, 0 } },
+    };
+    inline for (decimals) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        try std.testing.expectEqual(c[1], q.outputSchema()[0].type);
+        const got = try collectDecimal64(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[2], got);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT SUM(0.1) FROM m");
+        defer q.deinit();
+        const got = try collectDecimal128(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i128, &[_]i128{2}, got);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT 1.10 FROM m");
+        defer q.deinit();
+        try std.testing.expectEqualStrings("1.10", q.outputSchema()[0].name);
+    }
+
+    // Beside a DOUBLE, and in the exponent form, the literal is DOUBLE.
+    const doubles = .{
+        .{ "SELECT f * 1.1 FROM m ORDER BY id", &[_]f64{ 1.5 * 1.1, 2.25 * 1.1 } },
+        .{ "SELECT 1.5e0 + i FROM m ORDER BY id", &[_]f64{ 4.5, 5.5 } },
+        .{ "SELECT POWER(1.09, i) FROM m ORDER BY id", &[_]f64{ 1.295029, 1.41158161 } },
+    };
+    inline for (doubles) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        try std.testing.expectEqual(thindb.Type.double, q.outputSchema()[0].type);
+        const got = try collectDouble(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, v| try std.testing.expectApproxEqAbs(want, v, 1e-12);
+    }
+
+    const matches = .{
+        .{ "SELECT id FROM m WHERE 0.1 + 0.2 = 0.3 ORDER BY id", &[_]i32{ 1, 2 } },
+        .{ "SELECT id FROM m WHERE a * 1.1 = 1.65 ORDER BY id", &[_]i32{1} },
+        .{ "SELECT id FROM m WHERE f > 1.5 ORDER BY id", &[_]i32{2} },
+        .{ "SELECT id FROM m WHERE 2.0 < a ORDER BY id", &[_]i32{2} },
+        .{ "SELECT id FROM m WHERE i * 0.5 BETWEEN 1.5 AND 1.9 ORDER BY id", &[_]i32{1} },
+    };
+    inline for (matches) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        const ids = try collectInt(allocator, &q, 0);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i32, c[1], ids);
     }
 }
 

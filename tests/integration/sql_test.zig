@@ -919,7 +919,7 @@ test "sql: MySQL cast and function spellings" {
     var q = try runSql(allocator, db, "SELECT TRUNCATE(2.567, 1), CHAR(65), EXTRACT(YEAR FROM DATE(ts)) FROM fx WHERE id = 1");
     defer q.deinit();
     const b = (try q.next()).?;
-    try std.testing.expectEqual(@as(f64, 2.5), b.values[0].data.double[0]);
+    try std.testing.expectEqual(@as(i64, 25), b.values[0].data.decimal64[0]);
     try std.testing.expectEqualStrings("A", b.values[1].data.string.rowBytes(0));
 }
 

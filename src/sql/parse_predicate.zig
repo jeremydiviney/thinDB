@@ -23,6 +23,7 @@
 const std = @import("std");
 
 const exec_predicate = @import("../exec/predicate.zig");
+const exec_expr = @import("../exec/expr.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
@@ -188,7 +189,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // constant columns and the comparison keeps or drops every row.
     if (isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus) {
         const lhs = try p.parseAddSub();
-        const lhs_val = switch (lhs) {
+        const lhs_val = switch (leafOperand(lhs)) {
             .lit => |v| v,
             else => return try parseExprOps(p, lhs),
         };
@@ -203,7 +204,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         if (isPredicateEnd(p.cur.tag)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
         const op_lhs = try parseComparisonToken(p);
         const rhs = try p.parseAddSub();
-        return switch (rhs) {
+        return switch (leafOperand(rhs)) {
             .col_ref => |col| .{ .leaf = .{ .col = col, .op = reverseOp(op_lhs), .val = lhs_val } },
             .lit => |rhs_val| try literalComparison(p, lhs_val, op_lhs, rhs_val),
             .null_lit => .unknown,
@@ -569,7 +570,7 @@ fn makeScalarExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: i
 }
 
 fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
-    return switch (expr) {
+    return switch (leafOperand(expr)) {
         .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_dup } },
         .lit => |val| .{ .leaf = .{ .col = col, .op = op, .val = val } },
         .null_lit => .unknown,
@@ -800,7 +801,9 @@ fn rowComparison(p: anytype, lhs: []const ir.Expr, op: PredicateOp, rhs: []const
     }
 }
 
-fn elementComparison(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+fn elementComparison(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_operand: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const lhs = leafOperand(lhs_operand);
+    const rhs = leafOperand(rhs_operand);
     if (lhs == .null_lit or rhs == .null_lit) return .unknown;
     if (lhs == .lit) switch (rhs) {
         .lit => |rhs_val| return try literalComparison(p, lhs.lit, op, rhs_val),
@@ -838,7 +841,7 @@ pub fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rh
         .col_ref => |c| c,
         else => try p.materializePredicateExpr(lhs),
     };
-    return switch (rhs) {
+    return switch (leafOperand(rhs)) {
         .col_ref => |rhs_col| .{ .leaf_col_col = .{ .left = lhs_col, .op = op, .right = rhs_col } },
         .lit => |val| .{ .leaf = .{ .col = lhs_col, .op = op, .val = val } },
         .null_lit => .unknown,
@@ -884,7 +887,7 @@ fn makeDayComparison(p: anytype, col: []const u8) @TypeOf(p.*).Err!PredicateExpr
     };
     try p.advance();
     const rhs = try p.parseAddSub();
-    return switch (rhs) {
+    return switch (leafOperand(rhs)) {
         .lit => |val| .{ .day_leaf = .{ .col = try p.arena.dupe(u8, col), .op = op, .val = val } },
         else => blk: {
             const args = try p.arena.alloc(ir.Expr, 1);
@@ -936,6 +939,15 @@ fn reverseOp(op: PredicateOp) PredicateOp {
 /// any mismatch — the caller surfaces it as a parse error.
 /// `lit op lit`: a constant when both literals share a type; otherwise the
 /// engine's comparison coercion decides (`1 = 1.0`, `2.5 > 1`).
+/// A comparison operand as the leaf builders take it: a decimal constant
+/// compares as its DOUBLE (`exec_expr.literalValue`), so `x > 1.5` stays a
+/// leaf and keeps zonemap pruning. The double lands on a decimal or integer
+/// column by its shortest digits, which are the literal's own.
+fn leafOperand(e: ir.Expr) ir.Expr {
+    if (exec_expr.decimalLiteral(e) == null) return e;
+    return .{ .lit = exec_expr.literalValue(e) orelse return e };
+}
+
 fn literalComparison(p: anytype, lhs: Value, op: PredicateOp, rhs: Value) @TypeOf(p.*).Err!PredicateExpr {
     if (compareLiterals(lhs, op, rhs)) |result| return .{ .always = result } else |_| {}
     return try makeExprComparisonPredicate(p, .{ .lit = lhs }, op, .{ .lit = rhs });
