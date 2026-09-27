@@ -3010,3 +3010,54 @@ test "join: a comma joins like CROSS JOIN, keyed by the WHERE's equalities" {
     // `id` is in both a and c: ambiguous, not read from the first input.
     try helpers.expectRunError(allocator, db, "SELECT b.bid FROM a, b, c WHERE id = 1", error.ColumnNotFound);
 }
+
+// An ON condition on an outer join's preserved side decides which rows
+// match: a row failing it null-extends rather than dropping out.
+test "join: an ON condition on the preserved side null-extends the rows it rejects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT)");
+    try helpers.exec(allocator, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, NULL)");
+    try helpers.exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT, amount INT)");
+    try helpers.exec(allocator, db, "INSERT INTO o VALUES (10, 1, 5), (11, 1, 7), (12, 3, 9), (13, 4, 1), (14, NULL, 8)");
+
+    const pair = "SELECT COALESCE(t.id, 0) * 100 + COALESCE(o.oid, 0) AS k FROM ";
+    const cases = .{
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND t.qty > 15 ORDER BY k", &[_]i64{ 100, 200, 312, 400 } },
+        .{ pair ++ "t RIGHT JOIN o ON t.id = o.tid AND o.amount > 6 ORDER BY k", &[_]i64{ 10, 13, 14, 111, 312 } },
+        .{ pair ++ "t FULL JOIN o ON t.id = o.tid AND t.qty > 15 AND o.amount > 6 ORDER BY k", &[_]i64{ 10, 11, 13, 14, 100, 200, 312, 400 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND t.qty IS NOT NULL ORDER BY k", &[_]i64{ 110, 111, 200, 312, 400 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND t.qty IS NULL ORDER BY k", &[_]i64{ 100, 200, 300, 413 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND t.qty > 15 AND t.qty < 25 ORDER BY k", &[_]i64{ 100, 200, 300, 400 } },
+        // The null-supplying side's condition still filters that side.
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND t.qty < 25 AND o.amount > 6 ORDER BY k", &[_]i64{ 111, 200, 300, 400 } },
+        // An expression key, and a condition against a constant expression.
+        .{ pair ++ "t LEFT JOIN o ON t.id + 0 = o.tid AND t.qty > 15 ORDER BY k", &[_]i64{ 100, 200, 312, 400 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND t.qty > abs(-15) ORDER BY k", &[_]i64{ 100, 200, 312, 400 } },
+        // No key at all: a filtered cross product.
+        .{ pair ++ "t LEFT JOIN o ON t.qty = 20 ORDER BY k", &[_]i64{ 100, 210, 211, 212, 213, 214, 300, 400 } },
+        .{ pair ++ "t RIGHT JOIN o ON o.amount > 6 ORDER BY k", &[_]i64{ 10, 13, 111, 112, 114, 211, 212, 214, 311, 312, 314, 411, 412, 414 } },
+        // WHERE still filters the joined rows.
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid WHERE t.qty > 15 ORDER BY k", &[_]i64{ 200, 312 } },
+        .{ "SELECT COUNT(*) FROM t LEFT JOIN o ON t.id = o.tid AND t.qty > 15", &[_]i64{4} },
+        // A condition on an earlier input of the chain.
+        .{ "SELECT COUNT(*) FROM t LEFT JOIN o ON t.id = o.tid LEFT JOIN o AS o2 ON o2.oid = o.oid AND t.qty > 15", &[_]i64{5} },
+        .{ "SELECT COUNT(o2.oid) FROM t LEFT JOIN o ON t.id = o.tid LEFT JOIN o AS o2 ON o2.oid = o.oid AND t.qty > 15", &[_]i64{1} },
+    };
+    for (0..2) |phase| {
+        if (phase == 1) for ([_][]const u8{ "t", "o" }) |name| {
+            const tbl = try db.openTable(name, .{});
+            try tbl.flush();
+        };
+        inline for (cases) |case| {
+            const got = try helpers.collectBigints(allocator, db, case[0]);
+            defer allocator.free(got);
+            try std.testing.expectEqualSlices(i64, case[1], got);
+        }
+    }
+}

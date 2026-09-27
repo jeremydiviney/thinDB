@@ -4020,6 +4020,10 @@ pub const Parser = struct {
             try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
         }
         self.dropRedundantOuterJoinNotNullFilters(jtype, &left_filters, &right_filters, pairs.items, ranges.items);
+        const preserved_left = jtype == .left or jtype == .full;
+        const preserved_right = jtype == .right or jtype == .full;
+        if (preserved_left) try self.foldPreservedSideConditions(.left, &left_filters, &pairs.items[0], &left_derived, &right_derived, &hidden_left, &synth_counter);
+        if (preserved_right) try self.foldPreservedSideConditions(.right, &right_filters, &pairs.items[0], &left_derived, &right_derived, &hidden_left, &synth_counter);
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = try ranges.toOwnedSlice(self.arena),
@@ -4029,6 +4033,37 @@ pub const Parser = struct {
             .right_filter = try self.joinFilterFromParts(&right_filters),
             .hidden_left = try hidden_left.toOwnedSlice(self.arena),
         };
+    }
+
+    /// An ON condition on a preserved side of an outer join decides which of
+    /// that side's rows match, not which survive: a row failing it still
+    /// comes out, null-extended. So rather than filter the input, the
+    /// conditions fold into the side's first key as `CASE WHEN <conditions>
+    /// THEN key END`, and a failing row's NULL key matches nothing.
+    fn foldPreservedSideConditions(
+        self: *Parser,
+        side: JoinExprSide,
+        filters: *std.ArrayList(PredicateExpr),
+        pair: *ir.JoinKeyPair,
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        const cond = try self.joinFilterFromParts(filters) orelse return;
+        filters.clearRetainingCapacity();
+        const key = if (side == .left) &pair.left else &pair.right;
+        const derived = if (side == .left) left_derived else right_derived;
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        for (derived.items) |*d| {
+            if (!std.mem.eql(u8, d.name, key.*)) continue;
+            branches[0] = .{ .cond = cond, .then = d.expr };
+            d.expr = .{ .case = .{ .branches = branches, .else_branch = null } };
+            return;
+        }
+        branches[0] = .{ .cond = cond, .then = .{ .col_ref = key.* } };
+        const folded: ir.Expr = .{ .case = .{ .branches = branches, .else_branch = null } };
+        key.* = try self.materializeJoinOperand(folded, side, left_derived, right_derived, hidden_left, synth_counter);
     }
 
     fn dropRedundantOuterJoinNotNullFilters(
