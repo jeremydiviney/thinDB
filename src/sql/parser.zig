@@ -1181,7 +1181,7 @@ pub const Parser = struct {
             grouping_key = dgk;
             group_alias_renames = try self.aliasRenames(proj, group_cols);
         } else if (has_agg or has_group) {
-            const res = try self.resolveGroupBy(proj, group_exprs);
+            const res = try self.resolveGroupBy(proj, group_exprs, from_op);
             group_cols = res.cols;
             grouping_key = res.gk;
             const keys: GroupKeys = .{ .exprs = group_exprs, .cols = group_cols };
@@ -6611,18 +6611,33 @@ pub const Parser = struct {
     /// a projected column (by ordinal, by name/alias, or by structural
     /// expression match), yielding the grouping-key column names and a
     /// per-projection flag. A bare column not present in the SELECT list
-    /// is grouped directly.
-    fn resolveGroupBy(self: *Parser, proj: []const ProjItem, group_exprs: []const ir.Expr) ParseError!GroupByResolution {
+    /// is grouped directly. A bare name FROM exposes means that column even
+    /// when a SELECT alias spells it too (`SELECT n % 2 AS n ... GROUP BY
+    /// n` groups on `n`), as in MySQL, StarRocks, PostgreSQL and DuckDB.
+    fn resolveGroupBy(self: *Parser, proj: []const ProjItem, group_exprs: []const ir.Expr, from: ?*const ir.Op) ParseError!GroupByResolution {
         const gk = try self.arena.alloc(bool, proj.len);
         @memset(gk, false);
         var cols: std.ArrayList([]const u8) = .empty;
         defer cols.deinit(self.arena);
+        var from_columns: ?[]const []const u8 = null;
         for (group_exprs) |ge| {
             if (ordinalOf(ge)) |k| {
                 if (k < 1 or k > proj.len) return ParseError.SqlInvalidProjection;
                 try self.markGroupKey(proj, gk, k - 1, &cols);
                 continue;
             }
+            if (ge == .col_ref) if (from) |source| {
+                const name = ge.col_ref;
+                from_columns = from_columns orelse try self.sourceColumns(source);
+                if (from_columns) |columns| if (nameIn(name, columns) or exposesColumn(columns, name)) {
+                    if (findColumnItem(proj, name)) |idx| {
+                        try self.markGroupKey(proj, gk, idx, &cols);
+                    } else {
+                        try cols.append(self.arena, try self.arena.dupe(u8, name));
+                    }
+                    continue;
+                };
+            };
             if (findGroupMatch(proj, ge)) |idx| {
                 try self.markGroupKey(proj, gk, idx, &cols);
                 continue;
@@ -6676,6 +6691,15 @@ pub const Parser = struct {
         };
         if (n < 1) return null;
         return @intCast(n);
+    }
+
+    /// The SELECT item that reads column `name` as it is.
+    fn findColumnItem(proj: []const ProjItem, name: []const u8) ?usize {
+        for (proj, 0..) |p, i| switch (p.kind) {
+            .col => |c| if (groupColumnNameEql(c, name)) return i,
+            else => {},
+        };
+        return null;
     }
 
     fn findGroupMatch(proj: []const ProjItem, ge: ir.Expr) ?usize {
