@@ -3381,7 +3381,7 @@ fn deleteRunLen(stmts: []const *ir.Op) usize {
 }
 
 fn plainColumnDelete(op: *const ir.Op) bool {
-    return op.* == .delete_op and op.delete_op.derived.len == 0;
+    return op.* == .delete_op and op.delete_op.derived.len == 0 and op.delete_op.source == null;
 }
 
 /// Execute a run of same-table DELETE statements as one batched keyed

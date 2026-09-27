@@ -284,6 +284,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             }
             try explainDmlDerived(allocator, out, d.derived);
             try out.append(allocator, '\n');
+            if (d.source) |s| try explainOp(allocator, out, s.*, depth + 1);
         },
         .update_op => |u| {
             try out.appendSlice(allocator, "Update ");
@@ -301,6 +302,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             }
             try explainDmlDerived(allocator, out, u.derived);
             try out.append(allocator, '\n');
+            if (u.source) |s| try explainOp(allocator, out, s.*, depth + 1);
         },
         .admin => |a| {
             try out.appendSlice(allocator, "Admin ");

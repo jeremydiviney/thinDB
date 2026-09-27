@@ -328,7 +328,7 @@ pub fn bloomAdmitsAny(key_bloom: []const u8, hashes: []const u64) bool {
 /// Read row `row` of a column view as a `types.Value` for zonemap checks.
 /// String bytes are duped into `aa` so the value outlives a memtable swap.
 /// Returns null for a NULL cell — the caller must then skip pruning.
-fn viewValueAt(aa: Allocator, view: storage.ColumnView, row: u32) !?types.Value {
+pub fn viewValueAt(aa: Allocator, view: storage.ColumnView, row: u32) !?types.Value {
     if (!view.isValid(row)) return null;
     return switch (view.data) {
         .int => |s| .{ .int = s[row] },
