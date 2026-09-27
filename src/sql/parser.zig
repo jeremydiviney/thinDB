@@ -105,6 +105,12 @@ pub const ParseError = error{
     /// A column list over a query that projects `*`: the names it renames
     /// are only known once the query binds.
     SqlColumnListOverStar,
+    /// FOUND_ROWS(): thinDB keeps no per-session count of the rows the last
+    /// SELECT would have returned without its LIMIT.
+    SqlFoundRowsUnsupported,
+    /// SQL-level PREPARE / EXECUTE / DEALLOCATE PREPARE. Prepared
+    /// statements go through the binary protocol (COM_STMT_PREPARE).
+    SqlPrepareExecuteUnsupported,
     /// A multi-table UPDATE assigning columns of more than one table.
     SqlUpdateTargetsUnsupported,
 } || LexError;
@@ -238,6 +244,17 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_truncate => "truncate",
         else => null,
     };
+}
+
+/// MySQL's SELECT modifiers that steer execution or the query cache only.
+/// SQL_CALC_FOUND_ROWS only feeds FOUND_ROWS(), which is rejected.
+fn isSelectHintWord(word: []const u8) bool {
+    const words = [_][]const u8{
+        "high_priority",     "straight_join", "sql_small_result", "sql_big_result",
+        "sql_buffer_result", "sql_no_cache",  "sql_cache",        "sql_calc_found_rows",
+    };
+    for (words) |w| if (std.ascii.eqlIgnoreCase(word, w)) return true;
+    return false;
 }
 
 fn unitFirstArgCall(name: []const u8) bool {
@@ -795,6 +812,7 @@ pub const Parser = struct {
                 if (std.ascii.eqlIgnoreCase(self.cur.text, "refresh")) {
                     return try parse_ddl.parseRefresh(self);
                 }
+                if (try parse_ddl.parseAdmin(self)) |op| return op;
             },
             else => {},
         }
@@ -811,11 +829,7 @@ pub const Parser = struct {
         // (resolved after the projection list is parsed). DISTINCT combined
         // with aggregates / GROUP BY / HAVING / window functions / `*` is
         // rejected: those need a second dedup layer above the aggregate.
-        var distinct = false;
-        if (self.cur.tag == .kw_distinct) {
-            distinct = true;
-            try self.advance();
-        }
+        const distinct = try self.parseSelectModifiers();
 
         // Projection list. Scalar projection expressions may contain
         // aggregate calls; collect those as hidden aggregate outputs so the
@@ -1607,6 +1621,43 @@ pub const Parser = struct {
         };
     }
 
+    /// The words between SELECT and its first item: ALL, DISTINCT and
+    /// DISTINCTROW, and MySQL's optimizer and cache hints, in any order.
+    /// The hints change how MySQL runs the query, never its rows, so they
+    /// are read and dropped. Returns whether the query is DISTINCT.
+    fn parseSelectModifiers(self: *Parser) ParseError!bool {
+        var distinct = false;
+        while (true) {
+            switch (self.cur.tag) {
+                .kw_distinct => distinct = true,
+                .kw_all => {},
+                .identifier => {
+                    if (self.cur.quoted) break;
+                    const word = self.cur.text;
+                    if (std.ascii.eqlIgnoreCase(word, "distinctrow")) {
+                        distinct = true;
+                    } else if (!isSelectHintWord(word) or !try self.selectItemFollows()) break;
+                },
+                else => break,
+            }
+            try self.advance();
+        }
+        return distinct;
+    }
+
+    /// Whether the token after the current one can begin a SELECT item, so
+    /// a hint word at the cursor is a modifier rather than a column that
+    /// happens to share its name (`SELECT sql_cache FROM t`).
+    fn selectItemFollows(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        const tok = try look.next();
+        if (keywordScalarName(tok.tag) != null) return true;
+        return switch (tok.tag) {
+            .identifier, .integer, .big_integer, .floating, .string, .star, .lparen, .minus, .plus, .tilde, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case, .kw_not, .kw_exists, .kw_distinct, .kw_all => true,
+            else => false,
+        };
+    }
+
     fn parseProjection(self: *Parser) ParseError![]const ProjItem {
         var items: std.ArrayList(ProjItem) = .empty;
         defer items.deinit(self.arena);
@@ -1687,7 +1738,7 @@ pub const Parser = struct {
         // operators and aliasing work. (`GROUP BY 1` then references it
         // as ordinal 1.)
         switch (self.cur.tag) {
-            .plus, .minus, .tilde, .integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
+            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
                 const expr = try self.parseScalar();
                 const default_name = try self.exprDefaultName(expr);
                 const alias = try self.maybeAlias(default_name);
@@ -2106,6 +2157,7 @@ pub const Parser = struct {
 
     pub fn makeScalarCallExpr(self: *Parser, typed_name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
         const name = scalar_fn.canonicalName(typed_name);
+        if (std.ascii.eqlIgnoreCase(name, "found_rows")) return ParseError.SqlFoundRowsUnsupported;
         if (args.len == 1 and fspTemporalFn(name)) {
             // Timestamps carry microseconds whatever precision is asked
             // for, as DATETIME(fsp) columns do. A TIME is text, so it keeps
@@ -2183,7 +2235,7 @@ pub const Parser = struct {
         var look = self.lex.*;
         const next = try look.next();
         return switch (next.tag) {
-            .identifier, .integer, .floating, .string, .lparen, .minus, .plus, .tilde, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case => true,
+            .identifier, .integer, .big_integer, .floating, .string, .lparen, .minus, .plus, .tilde, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case => true,
             else => keywordScalarName(next.tag) != null,
         };
     }
@@ -2268,7 +2320,10 @@ pub const Parser = struct {
         switch (expr) {
             .lit => |v| switch (v) {
                 .int => |x| return ir.Expr{ .lit = .{ .int = -x } },
-                .bigint => |x| return ir.Expr{ .lit = .{ .bigint = -x } },
+                .bigint => |x| {
+                    if (x == std.math.minInt(i64)) return try bigIntegerLiteral(self.arena, "9223372036854775808");
+                    return ir.Expr{ .lit = .{ .bigint = -x } };
+                },
                 .smallint => |x| return ir.Expr{ .lit = .{ .smallint = -x } },
                 .tinyint => |x| return ir.Expr{ .lit = .{ .tinyint = -x } },
                 .float => |x| return ir.Expr{ .lit = .{ .float = -x } },
@@ -2280,6 +2335,11 @@ pub const Parser = struct {
                     d.digits[1..]
                 else
                     try std.fmt.allocPrint(self.arena, "-{s}", .{d.digits});
+                // `-9223372036854775808` is BIGINT's minimum, as in MySQL,
+                // though its magnitude alone lexes past BIGINT.
+                if (d.s == 0) {
+                    if (std.fmt.parseInt(i64, digits, 10)) |v| return ir.Expr{ .lit = .{ .bigint = v } } else |_| {}
+                }
                 return try exec_expr.decimalLiteralExpr(self.arena, digits, d.p, d.s);
             },
         }
@@ -3060,6 +3120,11 @@ pub const Parser = struct {
                 try self.advance();
                 return try fractionalLiteral(self.arena, tok.text, tok.value.floating);
             },
+            .big_integer => {
+                const digits = self.cur.value.big_integer;
+                try self.advance();
+                return try bigIntegerLiteral(self.arena, digits);
+            },
             .integer, .string, .kw_true, .kw_false => {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
@@ -3355,10 +3420,22 @@ pub const Parser = struct {
             }
             const natural = self.joinWordAhead("natural");
             if (natural) try self.advance();
-            const jtype = try self.parseJoinKind();
+            // MySQL's STRAIGHT_JOIN is an inner join that pins the join
+            // order, which thinDB already takes as written.
+            const straight = !natural and self.joinWordAhead("straight_join");
+            const jtype: ir.JoinType = if (straight) .inner else try self.parseJoinKind();
+            if (straight) try self.advance();
             const right = try self.parseFromTarget();
             const right_input = try self.nameJoinInput(right);
             var right_op = right_input;
+
+            if (straight and self.cur.tag != .kw_on) {
+                root = try self.crossJoin(root, right_input);
+                try left_names.append(self.arena, right.name);
+                try inputs.append(self.arena, .{ .name = right.name, .op = right_input });
+                star = try self.appendInputStar(star, right.name, right_input);
+                continue;
+            }
 
             if (natural or self.joinWordAhead("using")) {
                 const left_star = switch (star) {
@@ -3563,23 +3640,76 @@ pub const Parser = struct {
         }
 
         // Optional AS alias.
+        var aliased = true;
         if (self.cur.tag == .kw_as) {
             try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
-        } else if (self.implicitFromAliasAhead()) {
+        } else if (try self.implicitFromAliasAhead()) {
             // Implicit alias: bare identifier after the FROM target.
             // SQL clause keywords (JOIN/WHERE/ON/...) aren't .identifier
             // tokens so they don't trigger this.
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             op = try self.applyAliasToFromOp(op, resolved_name, alias_in_place);
             try self.advance();
-        } else {
-            return .{ .name = resolved_name, .op = op, .unaliased = if (alias_in_place) .in_place else .wrap };
-        }
+        } else aliased = false;
+        try self.skipIndexHints();
+        if (!aliased) return .{ .name = resolved_name, .op = op, .unaliased = if (alias_in_place) .in_place else .wrap };
         return .{ .name = resolved_name, .op = op };
+    }
+
+    /// MySQL index hints after a table name: `{USE | FORCE | IGNORE} {INDEX |
+    /// KEY} [FOR {JOIN | ORDER BY | GROUP BY}] (name, ...)`, several separated
+    /// by spaces or commas. thinDB has no secondary index to choose, so a hint
+    /// changes nothing and only parses.
+    fn skipIndexHints(self: *Parser) ParseError!void {
+        while (true) {
+            if (self.cur.tag == .comma) {
+                var look = self.lex.*;
+                if (!try indexHintAt(try look.next(), &look)) return;
+                try self.advance();
+            } else if (!try self.indexHintAhead()) return;
+            try self.advance();
+            try self.advance();
+            if (self.joinWordAhead("for")) {
+                try self.advance();
+                switch (self.cur.tag) {
+                    .kw_join => try self.advance(),
+                    .kw_order, .kw_group => {
+                        try self.advance();
+                        try self.expect(.kw_by);
+                    },
+                    else => return ParseError.SqlExpectedKeyword,
+                }
+            }
+            try self.expect(.lparen);
+            while (self.cur.tag != .rparen) {
+                if (self.cur.tag != .identifier and !wordLikeToken(self.cur.text)) return ParseError.SqlExpectedIdent;
+                try self.advance();
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+            try self.expect(.rparen);
+        }
+    }
+
+    fn indexHintAhead(self: *const Parser) ParseError!bool {
+        var look = self.lex.*;
+        return try indexHintAt(self.cur, &look);
+    }
+
+    /// Whether `tok`, followed by what `look` lexes next, opens an index hint.
+    fn indexHintAt(tok: Token, look: *Lexer) ParseError!bool {
+        const verb = switch (tok.tag) {
+            .kw_use, .kw_ignore => true,
+            .identifier => !tok.quoted and std.ascii.eqlIgnoreCase(tok.text, "force"),
+            else => false,
+        };
+        if (!verb) return false;
+        const noun = try look.next();
+        return noun.tag == .kw_key or (noun.tag == .identifier and !noun.quoted and std.ascii.eqlIgnoreCase(noun.text, "index"));
     }
 
     /// A join input is qualified by its range-variable name. An unaliased
@@ -3666,7 +3796,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_as) {
             try self.advance();
             resolved_name = try self.dupedIdent();
-        } else if (self.implicitFromAliasAhead()) {
+        } else if (try self.implicitFromAliasAhead()) {
             resolved_name = try self.dupedIdent();
         }
         const op = try self.allocOp(.{ .table_fn = .{
@@ -3832,7 +3962,7 @@ pub const Parser = struct {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
-        } else if (self.implicitFromAliasAhead()) {
+        } else if (try self.implicitFromAliasAhead()) {
             resolved_name = try self.arena.dupe(u8, self.cur.text);
             aliased_op = try self.applyAliasToFromOp(aliased_op, resolved_name, true);
             try self.advance();
@@ -4026,7 +4156,7 @@ pub const Parser = struct {
     fn joinStartAhead(self: *const Parser) bool {
         return switch (self.cur.tag) {
             .kw_join, .kw_cross, .kw_inner, .kw_left, .kw_right, .kw_full => true,
-            else => self.joinWordAhead("natural"),
+            else => self.joinWordAhead("natural") or self.joinWordAhead("straight_join"),
         };
     }
 
@@ -4036,8 +4166,9 @@ pub const Parser = struct {
         return self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, word);
     }
 
-    fn implicitFromAliasAhead(self: *const Parser) bool {
-        return self.cur.tag == .identifier and !self.joinWordAhead("using") and !self.joinWordAhead("natural");
+    fn implicitFromAliasAhead(self: *const Parser) ParseError!bool {
+        return self.cur.tag == .identifier and !self.joinWordAhead("using") and !self.joinWordAhead("natural") and
+            !self.joinWordAhead("straight_join") and !try self.indexHintAhead();
     }
 
     /// `USING (c, ...)`: the column names, each once. Only names can appear,
@@ -5138,7 +5269,7 @@ pub const Parser = struct {
                 if (self.cur.tag == .kw_as) {
                     try self.advance();
                     alias = try self.dupedIdentLower();
-                } else if (self.implicitFromAliasAhead()) {
+                } else if (try self.implicitFromAliasAhead()) {
                     alias = try self.dupedIdentLower();
                 }
                 try tables.append(self.arena, .{ .table = table, .alias = alias });
@@ -5868,6 +5999,10 @@ pub const Parser = struct {
                         const v = if (negate) -signed_tok.value.floating else signed_tok.value.floating;
                         return .{ .double = v };
                     },
+                    .big_integer => {
+                        try self.advance();
+                        return try bigIntegerValue(signed_tok.value.big_integer, negate);
+                    },
                     else => return ParseError.SqlExpectedValue,
                 }
             },
@@ -5884,6 +6019,10 @@ pub const Parser = struct {
             .floating => {
                 try self.advance();
                 return .{ .double = tok.value.floating };
+            },
+            .big_integer => {
+                try self.advance();
+                return try bigIntegerValue(tok.value.big_integer, false);
             },
             .string => {
                 try self.advance();
@@ -6351,6 +6490,29 @@ fn exprEqual(a: ir.Expr, b: ir.Expr) bool {
         },
         else => false,
     };
+}
+
+/// An integer literal past BIGINT in an expression: DECIMAL(n,0) as in
+/// MySQL, and DOUBLE past DECIMAL's 38 digits (MySQL's own cap is 65).
+fn bigIntegerLiteral(arena: std.mem.Allocator, digits: []const u8) ParseError!ir.Expr {
+    if (digits.len > 38) return .{ .lit = .{ .double = try bigIntegerDouble(digits, false) } };
+    return try exec_expr.decimalLiteralExpr(arena, digits, @intCast(digits.len), 0);
+}
+
+/// An integer literal past BIGINT as a lone value (an IN-list item, a
+/// DEFAULT): LARGEINT while it fits, which coerces exactly to the column it
+/// meets, else DOUBLE. A negated one that fits BIGINT is a BIGINT.
+fn bigIntegerValue(digits: []const u8, negate: bool) ParseError!Value {
+    const magnitude = std.fmt.parseInt(i128, digits, 10) catch return .{ .double = try bigIntegerDouble(digits, negate) };
+    const v = if (negate) -magnitude else magnitude;
+    if (std.math.cast(i64, v)) |small| return .{ .bigint = small };
+    return .{ .largeint = v };
+}
+
+fn bigIntegerDouble(digits: []const u8, negate: bool) ParseError!f64 {
+    const v = std.fmt.parseFloat(f64, digits) catch return ParseError.LexInvalidNumber;
+    if (!std.math.isFinite(v)) return ParseError.LexInvalidNumber;
+    return if (negate) -v else v;
 }
 
 /// A fractional literal without an exponent is the exact DECIMAL of its
