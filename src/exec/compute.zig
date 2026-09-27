@@ -2193,6 +2193,7 @@ fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr
 }
 
 fn convertedArg(aa: Allocator, e: Expr, given: Type, target: Type) !?Expr {
+    if (scalar_fn.integerArgFn(given, target)) |reader| return Expr{ .call = .{ .fn_name = reader, .args = try aa.dupe(Expr, &.{e}) } };
     if (given.isString()) if (scalar_fn.textAsNumberFn(target)) |reader| {
         if (e == .lit and e.lit == .text) return Expr{ .lit = switch (target) {
             .bigint => .{ .bigint = scalar_common.leadingInteger(e.lit.text) },

@@ -1965,7 +1965,13 @@ pub const Parser = struct {
             std.ascii.eqlIgnoreCase(name, "extract") or
             std.ascii.eqlIgnoreCase(name, "trim") or
             std.ascii.eqlIgnoreCase(name, "position") or
-            std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring");
+            std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring") or
+            namesArgType(name);
+    }
+
+    /// CHARSET and COLLATION name their argument's type.
+    fn namesArgType(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "charset") or std.ascii.eqlIgnoreCase(name, "collation");
     }
 
     pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
@@ -1977,7 +1983,22 @@ pub const Parser = struct {
         if (std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring")) return try self.parseSubstringCall(name);
         if (std.ascii.eqlIgnoreCase(name, "trim")) return try self.parseTrimCall();
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
+        if (namesArgType(name)) return try self.parseArgTypeCall(name);
         const args = try self.parseCallArgList(name, null);
+        return try self.makeScalarCallExpr(name, args);
+    }
+
+    /// `CHARSET(x)` or `COLLATION(x)`. A bare NULL has no character set in
+    /// MySQL (`binary`), where a text NULL such as `CAST(NULL AS CHAR)` has
+    /// utf8mb4, and both parse to a text NULL; so a bare NULL argument is
+    /// retyped as a number's NULL, whose character set is binary.
+    fn parseArgTypeCall(self: *Parser, name: []const u8) ParseError!ir.Expr {
+        var look = self.lex.*;
+        var tok = try look.next();
+        while (tok.tag == .lparen) tok = try look.next();
+        const bare_null = tok.tag == .kw_null;
+        const args = try self.parseCallArgList(name, null);
+        if (bare_null and args.len == 1 and args[0] == .null_lit) return try self.makeScalarCallExpr(name, &.{.{ .null_lit = .bigint }});
         return try self.makeScalarCallExpr(name, args);
     }
 

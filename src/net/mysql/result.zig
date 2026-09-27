@@ -136,10 +136,10 @@ fn formatCell(scratch: *std.ArrayList(u8), allocator: Allocator, schema_col: Col
         .tinyint => |s| try scratch.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{s[row]})),
         .largeint => |s| try scratch.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{s[row]})),
         .boolean => |s| try scratch.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{s[row]})),
-        // A double's plain digits run past 300 characters, so they print
-        // straight into the growable scratch.
-        .float => |s| try scratch.print(allocator, "{d}", .{s[row]}),
-        .double => |s| try scratch.print(allocator, "{d}", .{s[row]}),
+        inline .float, .double => |s| {
+            var buf: [wire_format.FLOAT_TEXT_MAX]u8 = undefined;
+            try scratch.appendSlice(allocator, wire_format.floatText(&buf, s[row], .plain));
+        },
         .date => |s| {
             var buf: [16]u8 = undefined;
             try scratch.appendSlice(allocator, try wire_format.formatDate(&buf, s[row]));
