@@ -5507,13 +5507,26 @@ pub const Parser = struct {
     /// literal, and `compileSetVar` requires the result to be a `.lit`.
     pub fn parseSetVar(self: *Parser) ParseError!*ir.Op {
         try self.expect(.kw_set);
-        if (self.cur.tag != .at_identifier) return ParseError.SqlExpectedIdent;
+        if (self.cur.tag != .at_identifier) {
+            if (self.lex.dialect != .mysql) return ParseError.SqlExpectedIdent;
+            return try self.parseIgnoredSet();
+        }
         const name = try self.arena.dupe(u8, self.cur.text);
         try self.advance();
         if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
         try self.advance();
         const value_expr = try self.parseScalar();
         return try self.allocOp(.{ .set_var = .{ .name = name, .value = value_expr } });
+    }
+
+    /// A MySQL SET of anything but a user variable (`SET NAMES utf8mb4`,
+    /// `SET autocommit = 1`, `SET @@session.sql_mode = ''`, `SET TRANSACTION
+    /// ISOLATION LEVEL ...`) sets server or session state thinDB has no
+    /// counterpart for, so it is acknowledged and ignored, as the wire layer
+    /// answers it when it arrives alone.
+    fn parseIgnoredSet(self: *Parser) ParseError!*ir.Op {
+        while (self.cur.tag != .semicolon and self.cur.tag != .eof) try self.advance();
+        return try self.allocOp(.{ .admin = .ignored });
     }
 
     pub const OrderByClause = struct {
