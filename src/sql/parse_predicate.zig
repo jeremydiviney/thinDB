@@ -10,6 +10,8 @@
 //!   and_expr   := not_expr (('AND' | '&&') not_expr)*
 //!   not_expr   := 'NOT' not_expr | atom
 //!   atom       := '(' or_expr ')'
+//!                | scalar value_op ...   (scalar led by a literal, a sign,
+//!                                         or a group a value operator follows)
 //!                | row cmp_op row
 //!                | row ['NOT'] 'IN' '(' (row (',' row)* | select) ')'
 //!                | 'NULL' ('IS' ['NOT'] 'NULL' | cmp_op expr)
@@ -171,14 +173,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
     if (p.cur.tag == .lparen) {
         if (try rowValueAhead(p)) return try parseRowValuePredicate(p);
-        if (try parenthesizedScalarComparisonAhead(p)) {
-            return try parseParenthesizedScalarComparison(p);
-        }
+        if (try parenthesizedOperandAhead(p)) return try parseScalarLhs(p);
         try p.advance();
         const inner = try parseOr(p);
         try p.expect(.rparen);
-        // `(a > 1) IS TRUE`: the condition read as a value, then tested.
-        if (p.cur.tag == .kw_is) return try parseIsOps(p, try p.predicateAsValue(inner));
         return inner;
     }
     // EXISTS (SELECT ...) — produces a constant-bool predicate after
@@ -207,43 +205,8 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         _ = try p.parseScalar();
         return .unknown;
     }
-    // Literal- or sign-led LHS. Each side of the comparison is a whole
-    // scalar expression (`1 + x > 2`, `-x < 0`, `2 > 1 + x`); a side that
-    // parses to a lone literal keeps its constant-aware form:
-    //   - lit op col   → flipped to `col reverse_op lit` as a normal leaf
-    //   - lit op lit   → evaluated at parse time when both literals share a
-    //     type, emitted as `.always`
-    //   - lit op NULL  → UNKNOWN
-    //   - lit IS [NOT] NULL → a literal is never NULL, so `.always`
-    //   - lit [NOT] BETWEEN / LIKE / IN → the literal anchors to a hidden
-    //     computed column and takes the column operator tail
-    // `lit op @var` (e.g. `1 = @includeEstimates`) is a constant guard: the
-    // var resolves to a literal pre-compile, so both sides materialize as
-    // constant columns and the comparison keeps or drops every row.
     if (isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus or p.cur.tag == .tilde) {
-        const lhs = try p.parseScalar();
-        const lhs_val = switch (leafOperand(lhs)) {
-            .lit => |v| v,
-            else => return try parseExprOps(p, lhs),
-        };
-        switch (p.cur.tag) {
-            .kw_is => return try parseIsOps(p, lhs),
-            .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
-                return try parseColOps(p, try p.materializePredicateExpr(lhs));
-            },
-            else => if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs)),
-        }
-        // A lone literal is truthiness, as a bare column is (`WHERE 1`).
-        if (isPredicateEnd(p)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
-        if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, lhs)).?;
-        const op_lhs = try parseComparisonToken(p);
-        const rhs = try p.parseScalar();
-        return switch (leafOperand(rhs)) {
-            .col_ref => |col| .{ .leaf = .{ .col = col, .op = reverseOp(op_lhs), .val = lhs_val } },
-            .lit => |rhs_val| try literalComparison(p, lhs_val, op_lhs, rhs_val),
-            .null_lit => .unknown,
-            else => try makeExprComparisonPredicate(p, lhs, op_lhs, rhs),
-        };
+        return try parseScalarLhs(p);
     }
     // `@var op X` — a session var on the LHS (constant guard, e.g.
     // `@comparisonMonths > 1`). Symmetric to the literal-LHS form above: the
@@ -336,17 +299,58 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     return try parseColOps(p, col_dup);
 }
 
-/// The operator tail after a scalar expression (a call, or arithmetic led by
-/// a literal) on a predicate's left side.
+/// A predicate whose left side is a whole scalar expression led by a
+/// literal, a sign, or a parenthesized operand (`1 + x > 2`, `-x < 0`,
+/// `(id) = 1`, `(a + b) * 2 > x`, `(SELECT ...) = 0`). The right side is a
+/// whole scalar expression too. A side that parses to a lone literal keeps
+/// its constant-aware form:
+///   - lit op col   → flipped to `col reverse_op lit` as a normal leaf
+///   - lit op lit   → evaluated at parse time when both literals share a
+///     type, emitted as `.always`
+///   - lit op NULL  → UNKNOWN
+///   - lit IS [NOT] NULL → a literal is never NULL, so `.always`
+///   - lit [NOT] BETWEEN / LIKE / IN → the literal anchors to a hidden
+///     computed column and takes the column operator tail
+/// `lit op @var` (e.g. `1 = @includeEstimates`) is a constant guard: the
+/// var resolves to a literal pre-compile, so both sides materialize as
+/// constant columns and the comparison keeps or drops every row.
+fn parseScalarLhs(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
+    const lhs = try p.parseScalar();
+    const lhs_val = switch (leafOperand(lhs)) {
+        .lit => |v| v,
+        else => return try parseExprOps(p, lhs),
+    };
+    switch (p.cur.tag) {
+        .kw_is => return try parseIsOps(p, lhs),
+        .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
+            return try parseColOps(p, try p.materializePredicateExpr(lhs));
+        },
+        else => if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs)),
+    }
+    // A lone literal is truthiness, as a bare column is (`WHERE 1`).
+    if (isPredicateEnd(p)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
+    if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, lhs)).?;
+    const op_lhs = try parseComparisonToken(p);
+    const rhs = try p.parseScalar();
+    return switch (leafOperand(rhs)) {
+        .col_ref => |col| .{ .leaf = .{ .col = col, .op = reverseOp(op_lhs), .val = lhs_val } },
+        .lit => |rhs_val| try literalComparison(p, lhs_val, op_lhs, rhs_val),
+        .null_lit => .unknown,
+        else => try makeExprComparisonPredicate(p, lhs, op_lhs, rhs),
+    };
+}
+
+/// The operator tail after a scalar expression (a call, a parenthesized
+/// operand, or arithmetic led by a literal) on a predicate's left side.
 fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const lhs = try p.continueBinaryFrom(expr);
     if (try parseComparisonTail(p, lhs)) |pred| return pred;
     switch (p.cur.tag) {
         // `ABS(x) BETWEEN ...`, `fn(x) IN (...)`, `fn(x) IS NULL`: anchor the
-        // call to a hidden computed column and reuse the operator tail.
+        // call to a hidden computed column and reuse the operator tail. A
+        // parenthesized bare column (`(s) IN (...)`) stays that column.
         .kw_is, .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
-            const anchored = try p.materializePredicateExpr(lhs);
-            return try parseColOps(p, anchored);
+            return try parseColOps(p, try anchorColumn(p, lhs));
         },
         // A bare expression is MySQL truthiness (`WHERE fn(x)`, `WHERE 1 + x`):
         // non-zero and non-NULL, as for a bare column.
@@ -611,6 +615,9 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         }
         var values: std.ArrayList(Value) = .empty;
         defer values.deinit(p.arena);
+        // Entries no Value holds exactly compare as the decimals they are.
+        var inexact: std.ArrayList(PredicateExpr) = .empty;
+        defer inexact.deinit(p.arena);
         var saw_value = false;
         while (true) {
             // NULL literals are dropped from the set in both IN and NOT IN
@@ -618,6 +625,9 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
             // gives NULLs it drains; see thindb-not-in-nonstandard).
             if (p.cur.tag == .kw_null) {
                 try p.advance();
+                saw_value = true;
+            } else if (try inexactFractionAhead(p)) {
+                try inexact.append(p.arena, try makeComparisonExprPredicate(p, col_dup, .eq, try p.parseScalar()));
                 saw_value = true;
             } else {
                 const v = try p.parseValue();
@@ -632,16 +642,17 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         // Every entry was NULL: nothing can match IN (); the negated form
         // is vacuously true under the drop-NULLs dialect (negatePredicate
         // flips the .always).
-        if (values.items.len == 0) {
+        if (values.items.len + inexact.items.len == 0) {
             var pe: PredicateExpr = .{ .always = false };
             if (negate_predicate) pe = try negatePredicate(p, pe);
             return pe;
         }
 
-        const kids = try p.arena.alloc(PredicateExpr, values.items.len);
-        for (values.items, kids) |v, *kid| {
+        const kids = try p.arena.alloc(PredicateExpr, values.items.len + inexact.items.len);
+        for (values.items, kids[0..values.items.len]) |v, *kid| {
             kid.* = .{ .leaf = .{ .col = col_dup, .op = .eq, .val = v } };
         }
+        @memcpy(kids[values.items.len..], inexact.items);
         var pe: PredicateExpr = if (kids.len == 1) kids[0] else .{ .@"or" = kids };
         if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
@@ -799,48 +810,30 @@ fn predicateHasColumnRef(pred: PredicateExpr) bool {
     };
 }
 
-fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
+/// Whether the parenthesized group at the cursor is the operand of a value
+/// operator: a comparison, IS, [NOT] IN / BETWEEN / LIKE / REGEXP, SOUNDS LIKE,
+/// arithmetic, a JSON arrow or a cast follows its `)`. No predicate grammar
+/// continues a boolean group with any of them, so the group is a value
+/// whatever it holds: `(id) = 1`, `(UPPER(s)) LIKE 'A%'`, `(a + b) * 2 > x`,
+/// and `(a > 1) IS TRUE` or `(a = 1) = 1`, where the condition is read as
+/// a value (parseScalar's parenthesized value takes a predicate).
+fn parenthesizedOperandAhead(p: anytype) @TypeOf(p.*).Err!bool {
     var look = p.lex.*;
     var depth: usize = 1;
-    var saw_arithmetic = false;
-    // `(CASE ... END) > x` carries no depth-1 arithmetic but is still a
-    // scalar comparison: parseScalar dispatches CASE, and no predicate
-    // grammar accepts a CASE-led paren group, so this only widens parses.
-    var case_start = false;
-    // `(SELECT ...) = 0` likewise: a subquery-led group is a scalar operand.
-    var subquery_start = false;
-    var first_tok = true;
-    while (true) {
-        const tok = try look.next();
-        if (first_tok) {
-            first_tok = false;
-            case_start = tok.tag == .kw_case;
-            subquery_start = p.startsQuery(tok.tag);
-        }
-        switch (tok.tag) {
+    while (depth > 0) {
+        switch ((try look.next()).tag) {
             .eof => return false,
             .lparen => depth += 1,
-            .rparen => {
-                depth -= 1;
-                if (depth == 0) break;
-            },
-            .plus, .minus, .star, .slash, .percent, .kw_div, .amp, .pipe, .caret, .shl, .shr, .tilde => {
-                if (depth == 1) saw_arithmetic = true;
-            },
+            .rparen => depth -= 1,
             else => {},
         }
     }
     const op_tok = try look.next();
-    // A group that leads longer arithmetic (`(a + b) * 2 > x`) is a scalar
-    // operand whatever it holds: no predicate grammar continues a boolean
-    // group with arithmetic.
-    if (isArithToken(op_tok.tag)) return true;
-    if (!saw_arithmetic and !case_start and !subquery_start) return false;
-    return isComparisonToken(op_tok.tag) or switch (op_tok.tag) {
-        // `(expr) BETWEEN/IN/IS/LIKE/NOT ...` — the group anchors to a
-        // hidden computed column and takes the normal operator tail.
-        .kw_between, .kw_in, .kw_is, .kw_like, .kw_regexp, .kw_not => true,
-        .identifier => std.ascii.eqlIgnoreCase(op_tok.text, "sounds") and (try look.next()).tag == .kw_like,
+    return isComparisonToken(op_tok.tag) or isArithToken(op_tok.tag) or switch (op_tok.tag) {
+        .kw_between, .kw_in, .kw_is, .kw_like, .kw_regexp, .kw_not, .arrow, .arrow2 => true,
+        .pipe_pipe, .coloncolon => look.dialect != .mysql,
+        .identifier => std.ascii.eqlIgnoreCase(op_tok.text, "mod") or
+            (std.ascii.eqlIgnoreCase(op_tok.text, "sounds") and (try look.next()).tag == .kw_like),
         else => false,
     };
 }
@@ -1035,6 +1028,20 @@ pub fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rh
     };
 }
 
+/// The token at the cursor, or the one after it when the cursor is a sign.
+pub fn unsignedTokenAhead(p: anytype) @TypeOf(p.*).Err!@TypeOf(p.cur) {
+    if (p.cur.tag != .minus and p.cur.tag != .plus) return p.cur;
+    var look = p.lex.*;
+    return try look.next();
+}
+
+/// Whether the value at the cursor is a signed or unsigned fractional
+/// literal whose digits no DOUBLE holds (`exec_expr.fractionFitsDouble`).
+pub fn inexactFractionAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    const tok = try unsignedTokenAhead(p);
+    return tok.tag == .floating and !exec_expr.fractionFitsDouble(tok.text, tok.value.floating);
+}
+
 fn isComparisonToken(tag: anytype) bool {
     return switch (tag) {
         .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq => true,
@@ -1147,12 +1154,12 @@ fn reverseOp(op: PredicateOp) PredicateOp {
 /// `lit op lit`: a constant when both literals share a type; otherwise the
 /// engine's comparison coercion decides (`1 = 1.0`, `2.5 > 1`).
 /// A comparison operand as the leaf builders take it: a decimal constant
-/// compares as its DOUBLE (`exec_expr.literalValue`), so `x > 1.5` stays a
-/// leaf and keeps zonemap pruning. The double lands on a decimal or integer
-/// column by its shortest digits, which are the literal's own.
+/// compares as the Value that holds it exactly (`exec_expr.exactLiteralValue`),
+/// so `x > 1.5` stays a leaf and keeps zonemap pruning. A fraction no double
+/// holds stays an expression and compares exactly as a decimal.
 fn leafOperand(e: ir.Expr) ir.Expr {
     if (exec_expr.decimalLiteral(e) == null) return e;
-    return .{ .lit = exec_expr.literalValue(e) orelse return e };
+    return .{ .lit = exec_expr.exactLiteralValue(e) orelse return e };
 }
 
 fn literalComparison(p: anytype, lhs: Value, op: PredicateOp, rhs: Value) @TypeOf(p.*).Err!PredicateExpr {

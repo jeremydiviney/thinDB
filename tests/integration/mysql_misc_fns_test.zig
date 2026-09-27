@@ -1,8 +1,10 @@
 //! MySQL miscellaneous scalar functions (issue #245): ELT, INSERT, QUOTE,
 //! SOUNDEX / SOUNDS LIKE, the INET family, INTERVAL(N, ...), SLEEP, the
 //! REGEXP_* match-type and position arguments, the JSON constructors and
-//! aggregates, LAST_INSERT_ID() and ROW_COUNT(). Expected values are MySQL
-//! 8.4 output for the same statements.
+//! aggregates, LAST_INSERT_ID() and ROW_COUNT(); then text read where a
+//! number is expected, HEX of numbers, regex line anchors, JSON read as text
+//! by string functions, and the information functions (#276-#282). Expected
+//! values are MySQL 8.4 output for the same statements.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -147,6 +149,133 @@ const scalar_cases = [_]Case{
     .{ .sql = "REGEXP_SUBSTR('abc', 'b', 1, NULL)", .want = null },
 };
 
+/// Text passed where a number is expected reads its leading number, as
+/// MySQL does with no CAST: whitespace, sign, digits, fraction, exponent;
+/// nothing numeric reads as 0. An integer parameter stops at the '.'.
+const text_number_cases = [_]Case{
+    .{ .sql = "REPEAT('a', '3')", .want = "aaa" },
+    .{ .sql = "REPEAT('a', '2.7')", .want = "aa" },
+    .{ .sql = "REPEAT('a', '3abc')", .want = "aaa" },
+    .{ .sql = "REPEAT('a', 'abc')", .want = "" },
+    .{ .sql = "REPEAT('a', '1e1')", .want = "a" },
+    .{ .sql = "REPEAT('a', '\\t2')", .want = "aa" },
+    .{ .sql = "REPEAT('a', '\\n2')", .want = "" },
+    .{ .sql = "LEFT('abcdef', '2')", .want = "ab" },
+    .{ .sql = "SUBSTRING('abcdef', '2', '3')", .want = "bcd" },
+    .{ .sql = "ELT('2', 'x', 'y')", .want = "y" },
+    .{ .sql = "'3abc' + 0", .want = "3" },
+    .{ .sql = "'1.5' + 1", .want = "2.5" },
+    .{ .sql = "'1e2' + 0", .want = "100" },
+    .{ .sql = "'abc' + 0", .want = "0" },
+    .{ .sql = "'' + 0", .want = "0" },
+    .{ .sql = "' 12 ' + 0", .want = "12" },
+    .{ .sql = "'-.5e1x' + 0", .want = "-5" },
+    .{ .sql = "'1e+' + 0", .want = "1" },
+    .{ .sql = "'0x10' + 0", .want = "0" },
+    .{ .sql = "'\\n2' + 0", .want = "2" },
+    .{ .sql = "'2' * '3'", .want = "6" },
+    .{ .sql = "'10' / '4'", .want = "2.5" },
+    .{ .sql = "'7' DIV '2'", .want = "3" },
+    .{ .sql = "'7' % '3'", .want = "1" },
+    .{ .sql = "-'3'", .want = "-3" },
+    .{ .sql = "ABS('-3')", .want = "3" },
+    .{ .sql = "ROUND('2.567', 1)", .want = "2.6" },
+    .{ .sql = "SQRT('16')", .want = "4" },
+    .{ .sql = "POW('2', '3')", .want = "8" },
+    .{ .sql = "JSON_EXTRACT('{\"a\": \"7x\"}', '$.a') + 1", .want = "8" },
+    .{ .sql = "JSON_EXTRACT('{\"a\": true}', '$.a') + 1", .want = "2" },
+    .{ .sql = "JSON_EXTRACT('{\"a\": 2.5}', '$.a') * 2", .want = "5" },
+    .{ .sql = "REPEAT('a', JSON_EXTRACT('{\"a\": 3}', '$.a'))", .want = "aaa" },
+    .{ .sql = "CAST(JSON_EXTRACT('{\"a\": 5}', '$.a') AS SIGNED)", .want = "5" },
+};
+
+/// HEX of a number is the hex of its integer value, two's complement for a
+/// negative one; a decimal rounds half away from zero, a double to even.
+const hex_cases = [_]Case{
+    .{ .sql = "HEX(255)", .want = "FF" },
+    .{ .sql = "HEX(0)", .want = "0" },
+    .{ .sql = "HEX(-1)", .want = "FFFFFFFFFFFFFFFF" },
+    .{ .sql = "HEX(-255)", .want = "FFFFFFFFFFFFFF01" },
+    .{ .sql = "HEX(CAST(3000000000 AS SIGNED))", .want = "B2D05E00" },
+    .{ .sql = "HEX(TRUE)", .want = "1" },
+    .{ .sql = "HEX(1.5)", .want = "2" },
+    .{ .sql = "HEX(2.5)", .want = "3" },
+    .{ .sql = "HEX(-1.5)", .want = "FFFFFFFFFFFFFFFE" },
+    .{ .sql = "HEX(-0.4)", .want = "0" },
+    .{ .sql = "HEX(123.456)", .want = "7B" },
+    .{ .sql = "HEX(2.5e0)", .want = "2" },
+    .{ .sql = "HEX(3.5e0)", .want = "4" },
+    .{ .sql = "HEX(1e19)", .want = "7FFFFFFFFFFFFFFF" },
+    .{ .sql = "HEX(NULL)", .want = null },
+    .{ .sql = "HEX('z')", .want = "7A" },
+    .{ .sql = "HEX('abc')", .want = "616263" },
+    .{ .sql = "HEX('')", .want = "" },
+    .{ .sql = "HEX(CAST('2024-01-02' AS DATE))", .want = "323032342D30312D3032" },
+    .{ .sql = "LOWER(HEX(255))", .want = "ff" },
+};
+
+/// `^` and `$` hold only at the ends of the text unless the `m` match type
+/// asks for line anchors too.
+const regex_anchor_cases = [_]Case{
+    .{ .sql = "'a\\nb' REGEXP '^b'", .want = "0" },
+    .{ .sql = "'a\\nb' REGEXP 'a$'", .want = "0" },
+    .{ .sql = "'a\\nb' REGEXP '^a'", .want = "1" },
+    .{ .sql = "'a\\nb' REGEXP 'b$'", .want = "1" },
+    .{ .sql = "REGEXP_LIKE('a\\nb', '^b', 'm')", .want = "1" },
+    .{ .sql = "REGEXP_LIKE('a\\nb', 'a$', 'm')", .want = "1" },
+    .{ .sql = "REGEXP_LIKE('a\\nb', '^b', 'mc')", .want = "1" },
+    .{ .sql = "REGEXP_LIKE('a\\nb\\nc', '^b$')", .want = "0" },
+    .{ .sql = "REGEXP_LIKE('a\\nb\\nc', '^b$', 'm')", .want = "1" },
+    .{ .sql = "REGEXP_REPLACE('a\\nb', '^', '>')", .want = ">a\nb" },
+    .{ .sql = "REGEXP_REPLACE('a\\nb', '^', '>', 1, 0, 'm')", .want = ">a\n>b" },
+    .{ .sql = "REGEXP_REPLACE('a\\nb', '$', '<', 1, 0, 'm')", .want = "a<\nb<" },
+    .{ .sql = "REGEXP_REPLACE('ab\\ncd', '^.', 'X', 1, 0, 'm')", .want = "Xb\nXd" },
+    .{ .sql = "REGEXP_INSTR('a\\nb', '^b')", .want = "0" },
+    .{ .sql = "REGEXP_INSTR('a\\nb', '^b', 1, 1, 0, 'm')", .want = "3" },
+    .{ .sql = "REGEXP_SUBSTR('x1\\ny2', '^y.')", .want = null },
+    .{ .sql = "REGEXP_SUBSTR('x1\\ny2', '^y.', 1, 1, 'm')", .want = "y2" },
+};
+
+/// A string function reads a JSON argument as its text, as does a CASE,
+/// IF or COALESCE that mixes JSON with text.
+const json_text_cases = [_]Case{
+    .{ .sql = "LOWER(CAST('{\"a\": \"Xy\", \"b\": 5}' AS JSON))", .want = "{\"a\": \"xy\", \"b\": 5}" },
+    .{ .sql = "UPPER(CAST('{\"a\": \"Xy\", \"b\": 5}' AS JSON))", .want = "{\"A\": \"XY\", \"B\": 5}" },
+    .{ .sql = "LENGTH(CAST('{\"a\": \"Xy\", \"b\": 5}' AS JSON))", .want = "19" },
+    .{ .sql = "CHAR_LENGTH(JSON_OBJECT('k', 'héllo'))", .want = "14" },
+    .{ .sql = "CONCAT(CAST('[1, 2]' AS JSON), '!')", .want = "[1, 2]!" },
+    .{ .sql = "CONCAT(JSON_OBJECT('a', 1), JSON_ARRAY(2))", .want = "{\"a\": 1}[2]" },
+    .{ .sql = "REPLACE(CAST('{\"a\": \"Xy\", \"b\": 5}' AS JSON), '\"', '')", .want = "{a: Xy, b: 5}" },
+    .{ .sql = "HEX(CAST('\"q\"' AS JSON))", .want = "227122" },
+    .{ .sql = "MD5(CAST('[1, 2]' AS JSON)) = MD5('[1, 2]')", .want = "1" },
+    .{ .sql = "CAST('{\"a\": \"Xy\"}' AS JSON) LIKE '%Xy%'", .want = "1" },
+    .{ .sql = "SUBSTRING(CAST('[1, 2]' AS JSON), 2, 1)", .want = "1" },
+    .{ .sql = "TRIM(CAST('\"q\"' AS JSON))", .want = "\"q\"" },
+    .{ .sql = "LOCATE('b', JSON_OBJECT('b', 1))", .want = "3" },
+    .{ .sql = "REVERSE(JSON_ARRAY(1, 2))", .want = "]2 ,1[" },
+    .{ .sql = "COALESCE(CAST(NULL AS JSON), 'none')", .want = "none" },
+    .{ .sql = "IFNULL(CAST('\"q\"' AS JSON), 'x')", .want = "\"q\"" },
+    .{ .sql = "CASE WHEN 1 = 1 THEN CAST('[1, 2]' AS JSON) ELSE 'x' END", .want = "[1, 2]" },
+    .{ .sql = "CASE WHEN 1 = 0 THEN CAST('[1, 2]' AS JSON) ELSE 'x' END", .want = "x" },
+    .{ .sql = "IF(1 = 1, JSON_OBJECT('a', 1), 'x')", .want = "{\"a\": 1}" },
+};
+
+/// CHARSET names the character set of its argument's type.
+const charset_cases = [_]Case{
+    .{ .sql = "CHARSET('a')", .want = "utf8mb4" },
+    .{ .sql = "CHARSET(CONCAT('a', 1))", .want = "utf8mb4" },
+    .{ .sql = "CHARSET(CAST(NULL AS CHAR))", .want = "utf8mb4" },
+    .{ .sql = "CHARSET(JSON_ARRAY(1))", .want = "utf8mb4" },
+    .{ .sql = "CHARSET(1)", .want = "binary" },
+    .{ .sql = "CHARSET(1.5)", .want = "binary" },
+    .{ .sql = "CHARSET(1e0)", .want = "binary" },
+    .{ .sql = "CHARSET(TRUE)", .want = "binary" },
+    .{ .sql = "CHARSET(DATE '2020-01-01')", .want = "binary" },
+    .{ .sql = "CHARSET(NOW())", .want = "binary" },
+    .{ .sql = "CONCAT(CHARSET('a'), '!')", .want = "utf8mb4!" },
+    .{ .sql = "CHARSET('a') = 'utf8mb4'", .want = "1" },
+};
+
 /// Each is wrapped in `CAST(... AS CHAR)`, which MySQL renders the same as
 /// its JSON result.
 const json_cases = [_]Case{
@@ -182,13 +311,14 @@ const error_cases = [_][]const u8{
     "SELECT REGEXP_REPLACE('abc', 'b', 'X', 0)",
     "SELECT REGEXP_SUBSTR('abc', 'b', 5)",
     "SELECT JSON_OBJECT(NULL, 1)",
+    "SELECT FOUND_ROWS()",
 };
 
 fn renderCell(allocator: std.mem.Allocator, col: thindb.storage.ColumnView, row: usize) !?[]u8 {
     if (!col.isValid(row)) return null;
     return switch (col.data) {
         .boolean => |s| try allocator.dupe(u8, if (s[row] != 0) "1" else "0"),
-        inline .tinyint, .smallint, .int, .bigint, .largeint => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
         .varchar, .string, .char => |sv| try allocator.dupe(u8, sv.rowBytes(row)),
         else => error.UnexpectedResultType,
     };
@@ -256,6 +386,51 @@ test "MySQL misc functions: scalar values match MySQL 8.4" {
         try sql_buf.print(allocator, "SELECT CAST({s} AS CHAR)", .{c.sql});
         try expectCells(allocator, db, sql_buf.items, 0, &.{c.want});
     }
+}
+
+test "MySQL misc functions: implicit conversions, HEX, regex anchors and CHARSET match MySQL 8.4" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    var sql_buf: std.ArrayList(u8) = .empty;
+    defer sql_buf.deinit(allocator);
+    inline for (.{ text_number_cases, hex_cases, regex_anchor_cases, json_text_cases, charset_cases }) |cases| {
+        for (cases) |c| {
+            sql_buf.clearRetainingCapacity();
+            try sql_buf.print(allocator, "SELECT {s}", .{c.sql});
+            try expectCells(allocator, db, sql_buf.items, 0, &.{c.want});
+        }
+    }
+}
+
+test "MySQL misc functions: text and JSON columns convert per row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE cv (id BIGINT PRIMARY KEY, j JSON, s VARCHAR(20), n VARCHAR(10))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO cv (id, j, s, n) VALUES
+        \\ (1, '{"a": "Xy", "b": 5}', 'abc', '3abc'), (2, '[1, 2]', 'de', '2.7'), (3, NULL, NULL, NULL), (4, '"q"', 'f', 'zz')
+    );
+
+    try expectCells(allocator, db, "SELECT REPEAT('a', n) FROM cv ORDER BY id", 0, &.{ "aaa", "aa", null, "" });
+    try expectCells(allocator, db, "SELECT n + 0 FROM cv ORDER BY id", 0, &.{ "3", "2.7", null, "0" });
+    try expectCells(allocator, db, "SELECT LEFT(s, n) FROM cv ORDER BY id", 0, &.{ "abc", "de", null, "" });
+    try expectCells(allocator, db, "SELECT LEFT(s, id + 1) FROM cv ORDER BY id", 0, &.{ "ab", "de", null, "f" });
+    try expectCells(allocator, db, "SELECT HEX(id * 100) FROM cv ORDER BY id", 0, &.{ "64", "C8", "12C", "190" });
+    try expectCells(allocator, db, "SELECT LOWER(j) FROM cv ORDER BY id", 0, &.{ "{\"a\": \"xy\", \"b\": 5}", "[1, 2]", null, "\"q\"" });
+    try expectCells(allocator, db, "SELECT LENGTH(j) FROM cv ORDER BY id", 0, &.{ "19", "6", null, "3" });
+    try expectCells(allocator, db, "SELECT COALESCE(j, 'none') FROM cv ORDER BY id", 0, &.{ "{\"a\": \"Xy\", \"b\": 5}", "[1, 2]", "none", "\"q\"" });
+    try expectCells(allocator, db, "SELECT CASE WHEN id = 1 THEN j ELSE s END FROM cv ORDER BY id", 0, &.{ "{\"a\": \"Xy\", \"b\": 5}", "de", null, "f" });
+    try expectCells(allocator, db, "SELECT CAST(JSON_EXTRACT(j, '$.b') AS SIGNED) FROM cv ORDER BY id", 0, &.{ "5", null, null, null });
+    try expectCells(allocator, db, "SELECT JSON_EXTRACT(j, '$.b') + 1 FROM cv ORDER BY id", 0, &.{ "6", null, null, null });
+    try expectCells(allocator, db, "SELECT id FROM cv WHERE LOWER(j) LIKE '%xy%'", 0, &.{"1"});
+    try expectCells(allocator, db, "SELECT CHARSET(j) FROM cv WHERE id = 3", 0, &.{"utf8mb4"});
 }
 
 test "MySQL misc functions: invalid arguments raise errors as in MySQL" {
@@ -364,4 +539,41 @@ test "MySQL misc functions: LAST_INSERT_ID and ROW_COUNT read the session" {
         try std.testing.expectEqual(@as(?u64, 101), q.cq.lastInsertId());
     }
     try expectSessionCells(allocator, db, .{ .last_insert_id = 2 }, "SELECT s FROM ai WHERE id = LAST_INSERT_ID()", &.{"b"});
+}
+
+test "MySQL misc functions: information functions read the session" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    const session: thindb.Session = .{
+        .dialect = .mysql,
+        .current_schema = "sales",
+        .connection_id = 42,
+        .user = "app@localhost",
+        .server_version = "8.0.32-thinDB",
+    };
+    const cases = [_]Case{
+        .{ .sql = "SELECT CONNECTION_ID() AS id, 7 AS n", .want = "42" },
+        .{ .sql = "SELECT CONNECTION_ID() + 1", .want = "43" },
+        .{ .sql = "SELECT USER() u", .want = "app@localhost" },
+        .{ .sql = "SELECT CURRENT_USER() AS u, 1", .want = "app@localhost" },
+        .{ .sql = "SELECT SESSION_USER()", .want = "app@localhost" },
+        .{ .sql = "SELECT SYSTEM_USER()", .want = "app@localhost" },
+        .{ .sql = "SELECT CONCAT(VERSION(), '!') v", .want = "8.0.32-thinDB!" },
+        .{ .sql = "SELECT DATABASE() AS db, 2", .want = "sales" },
+        .{ .sql = "SELECT UPPER(SCHEMA())", .want = "SALES" },
+        .{ .sql = "SELECT 'hit' WHERE CONNECTION_ID() = 42 AND DATABASE() = 'sales'", .want = "hit" },
+        .{ .sql = "SELECT CHARSET(DATABASE())", .want = "utf8mb4" },
+    };
+    for (cases) |c| try expectSessionCells(allocator, db, session, c.sql, &.{c.want});
+
+    var no_schema = session;
+    no_schema.current_schema = "";
+    try expectSessionCells(allocator, db, no_schema, "SELECT DATABASE()", &.{null});
+
+    try expectFailure(allocator, db, "SELECT CONNECTION_ID()");
+    try expectFailure(allocator, db, "SELECT USER()");
 }

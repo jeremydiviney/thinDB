@@ -138,6 +138,7 @@ pub fn resolveWithRegistry(
     if (try resolveFormat(aa, name, arg_types)) |ov| return ov;
     if (try resolveTimeFromNumbers(aa, name, arg_types)) |ov| return ov;
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
+    if (try resolveCharset(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveOrderKey(aa, name, arg_types)) |ov| return ov;
@@ -148,7 +149,7 @@ pub fn resolveWithRegistry(
         if (!scalarArityMatches(f, arg_types.len)) continue;
         var all_match = true;
         for (arg_types, 0..) |given, i| {
-            if (canonScalarTag(@as(TypeTag, scalarDeclaredTypeAt(f, i))) != canonScalarTag(@as(TypeTag, given))) {
+            if (!bindsAsIs(given, scalarDeclaredTypeAt(f, i))) {
                 all_match = false;
                 break;
             }
@@ -326,6 +327,8 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.ceilKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "truncate"))
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.truncateKernel, .propagates);
+        if (std.ascii.eqlIgnoreCase(name, "hex"))
+            return try buildDecFn(aa, name, arg_types, .string, dec.hexKernel, .propagates);
         return null;
     }
 
@@ -574,6 +577,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.ascii.eqlIgnoreCase(name, "json_array") or std.ascii.eqlIgnoreCase(name, "json_object")) return true;
     if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) or std.mem.eql(u8, name, JSON_AGG_MEMBER_FN)) return true;
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
+    if (std.ascii.eqlIgnoreCase(name, "charset")) return true;
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
@@ -586,6 +590,12 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
         for (reg.scalarEntries()) |entry| if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
     }
     return false;
+}
+
+/// CHARSET(x) depends on x's type alone, so it takes any argument, NULL too.
+fn resolveCharset(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (!std.ascii.eqlIgnoreCase(name, "charset") or arg_types.len != 1) return null;
+    return try buildDecFn(aa, name, arg_types, .string, string.charsetKernel, .kernel_managed);
 }
 
 /// Internal: a correlated scalar subquery's value for one outer row,
@@ -726,14 +736,16 @@ pub fn scalarDeclaredTypeAt(f: ScalarFn, i: usize) Type {
     return repeated[(i - f.variadic_fixed) % repeated.len];
 }
 
-/// `.varchar`/`.char` share the physical StringView representation of `.string`
-/// (see `stringViewOf`), so for scalar-overload matching they are the same type.
-/// Folding them lets a `VARCHAR(n)` column resolve string builtins with no cast.
-fn canonScalarTag(t: TypeTag) TypeTag {
-    return switch (t) {
-        .varchar, .char, .json => .string,
-        else => t,
-    };
+/// Whether an argument of type `given` takes a parameter declared `declared`
+/// with no conversion. The text types share one representation (see
+/// `stringViewOf`), so a `VARCHAR(n)` column takes a string parameter as it
+/// is. A JSON parameter takes text too, as a document written out, but a
+/// JSON value takes a text parameter only as its text (`argConversion`):
+/// its stored bytes are JSONB, not the text MySQL's string functions read.
+fn bindsAsIs(given: Type, declared: Type) bool {
+    if (declared == .json) return given.isString();
+    if (declared.isString()) return given.isString() and given != .json;
+    return @as(TypeTag, given) == @as(TypeTag, declared);
 }
 
 /// The first argument of a function whose result is one of its arguments
@@ -751,10 +763,15 @@ pub fn resultValueArgsStart(name: []const u8) ?usize {
 /// The type each argument converts to so `name` resolves, where the
 /// implicit casts can't take it: a string parameter takes a number, a
 /// decimal or a date as its text, as in StarRocks (`CONCAT('Q', quarter)`),
-/// and a float parameter takes a decimal's value, as in MySQL and StarRocks
-/// (`POWER(1.09, n)`, `SQRT(price)`). Builtins and registered UDFs alike;
-/// the cheapest overload wins. Null when no overload resolves that way or
-/// no argument needs converting.
+/// and a JSON value as its text, as in MySQL (`LOWER(doc)`); a float
+/// parameter takes a decimal's value, as in MySQL and StarRocks
+/// (`POWER(1.09, n)`, `SQRT(price)`); and a numeric parameter takes text or
+/// JSON as the number it starts with, as in MySQL (`REPEAT('a', '3')`,
+/// `'3abc' + 0`). Builtins and registered UDFs alike; the cheapest overload
+/// wins. A function no overload of which takes these arguments that way
+/// (`'7' DIV '2'`, whose integer and decimal forms resolve by type) reads
+/// its text arguments as doubles when that resolves it. Null when nothing
+/// resolves or no argument needs converting.
 pub fn convertedArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: []const u8, arg_types: []const Type) !?[]const ?Type {
     var best: ?ScalarFn = null;
     var best_cost: u64 = std.math.maxInt(u64);
@@ -762,7 +779,7 @@ pub fn convertedArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name:
     if (registry) |reg| {
         for (reg.scalarEntries()) |entry| try considerConverted(aa, scalarFromUdf(entry), name, arg_types, &best, &best_cost);
     }
-    const f = best orelse return null;
+    const f = best orelse return try textAsDoubleArgs(aa, registry, name, arg_types);
     const targets = try aa.alloc(?Type, arg_types.len);
     var any = false;
     for (arg_types, targets, 0..) |given, *t, i| {
@@ -785,17 +802,54 @@ fn considerConverted(aa: Allocator, f: ScalarFn, name: []const u8, arg_types: []
     }
 }
 
+fn textAsDoubleArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: []const u8, arg_types: []const Type) !?[]const ?Type {
+    const retyped = try aa.dupe(Type, arg_types);
+    const targets = try aa.alloc(?Type, arg_types.len);
+    var any = false;
+    for (retyped, targets) |*t, *target| {
+        target.* = if (t.isString()) .double else null;
+        if (target.*) |d| t.* = d;
+        any = any or target.* != null;
+    }
+    if (!any) return null;
+    return if (try resolveWithRegistry(aa, registry, name, retyped) != null) targets else null;
+}
+
 const CONVERT_COST: u64 = 1000;
 
 const ArgConversion = struct { cost: u64, target: ?Type = null };
 
+/// Text converts to a number only where no overload takes it as text, and
+/// to a double before an integer: MySQL types a text operand as DOUBLE, so
+/// `ABS('-2.5')` is 2.5.
 fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
     if (declared.isString()) {
-        if (given.isString()) return .{ .cost = 0 };
+        if (bindsAsIs(given, declared)) return .{ .cost = 0 };
         return if (try resolve(aa, "to_string", &.{given}) != null) .{ .cost = CONVERT_COST, .target = .string } else null;
+    }
+    if (given.isString()) {
+        if (declared.isFloat()) return .{ .cost = CONVERT_COST + 1, .target = .double };
+        if (declared.isInteger()) return .{ .cost = CONVERT_COST + 2 + (argCastCost(.bigint, declared, true) orelse return null), .target = .bigint };
+        return null;
     }
     if (declared.isFloat() and given.isDecimal()) return .{ .cost = CONVERT_COST, .target = .double };
     return .{ .cost = argCastCost(given, declared, true) orelse return null };
+}
+
+/// Internal: text or JSON read as the number it starts with, where a
+/// numeric parameter meets it and no CAST was written
+/// (`common.leadingDouble`, `common.leadingInteger`).
+pub const TEXT_AS_DOUBLE_FN = "__text_as_double";
+pub const TEXT_AS_BIGINT_FN = "__text_as_bigint";
+
+/// The function that reads text as a number of type `target`, the type
+/// `convertedArgs` converts text to; null for any other type.
+pub fn textAsNumberFn(target: Type) ?[]const u8 {
+    return switch (target) {
+        .double => TEXT_AS_DOUBLE_FN,
+        .bigint => TEXT_AS_BIGINT_FN,
+        else => null,
+    };
 }
 
 fn scalarCastCost(f: ScalarFn, arg_types: []const Type, allow_narrowing: bool) ?u64 {
@@ -808,6 +862,7 @@ fn scalarCastCost(f: ScalarFn, arg_types: []const Type, allow_narrowing: bool) ?
 }
 
 fn argCastCost(given: Type, declared: Type, allow_narrowing: bool) ?u32 {
+    if (bindsAsIs(given, declared)) return 0;
     const from: TypeTag = given;
     const to: TypeTag = declared;
     if (cast.castCost(from, to)) |c| return c;
@@ -907,15 +962,15 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
     .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint, .bigint, .string }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
     // --- json ---
-    .{ .name = "json_extract", .arg_types = &.{ .string, .string }, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonExtractKernel },
-    .{ .name = "json_value", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonValueKernel },
-    .{ .name = "json_unquote", .arg_types = &.{.string}, .return_type = .string, .kernel = json.jsonUnquoteKernel },
-    .{ .name = "json_valid", .arg_types = &.{.string}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonValidKernel },
-    .{ .name = "json_type", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonTypeKernel },
-    .{ .name = "json_length", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = json.jsonLengthKernel },
-    .{ .name = "json_contains", .arg_types = &.{ .string, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonContainsKernel },
-    .{ .name = "json_keys", .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonKeysKernel },
-    .{ .name = "to_json", .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.toJsonKernel },
+    .{ .name = "json_extract", .arg_types = &.{ .json, .string }, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonExtractKernel },
+    .{ .name = "json_value", .arg_types = &.{ .json, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonValueKernel },
+    .{ .name = "json_unquote", .arg_types = &.{.json}, .return_type = .string, .kernel = json.jsonUnquoteKernel },
+    .{ .name = "json_valid", .arg_types = &.{.json}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonValidKernel },
+    .{ .name = "json_type", .arg_types = &.{.json}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonTypeKernel },
+    .{ .name = "json_length", .arg_types = &.{.json}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = json.jsonLengthKernel },
+    .{ .name = "json_contains", .arg_types = &.{ .json, .json }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonContainsKernel },
+    .{ .name = "json_keys", .arg_types = &.{.json}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonKeysKernel },
+    .{ .name = "to_json", .arg_types = &.{.json}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.toJsonKernel },
     .{ .name = JSON_AGG_ARRAY_FN, .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonAggArrayKernel },
     .{ .name = JSON_AGG_OBJECT_FN, .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonAggObjectKernel },
     // --- coalesce overloads ---
@@ -1186,6 +1241,9 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.stringToLargeintKernel },
     .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.stringToDoubleKernel },
     .{ .name = "to_boolean", .arg_types = &.{.string}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = math.stringToBoolKernel },
+    // Text or JSON read as a number where no CAST was written (`argConversion`).
+    .{ .name = TEXT_AS_DOUBLE_FN, .arg_types = &.{.json}, .return_type = .double, .kernel = math.textAsDoubleKernel },
+    .{ .name = TEXT_AS_BIGINT_FN, .arg_types = &.{.json}, .return_type = .bigint, .kernel = math.textAsBigintKernel },
     // date <-> datetime
     .{ .name = "to_date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },
@@ -1212,6 +1270,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "xx_hash3_128", .arg_types = &.{.string}, .return_type = .string, .kernel = string.xxHash3_128Kernel },
     // --- encoding ---
     .{ .name = "hex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.hexEncodeKernel },
+    .{ .name = "hex", .arg_types = &.{.bigint}, .return_type = .string, .kernel = string.hexBigintKernel },
+    .{ .name = "hex", .arg_types = &.{.double}, .return_type = .string, .kernel = string.hexDoubleKernel },
     .{ .name = "unhex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.hexDecodeKernel },
     .{ .name = "to_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = string.base64EncodeKernel },
     .{ .name = "from_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = string.base64DecodeKernel },

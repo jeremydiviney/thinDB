@@ -2979,9 +2979,13 @@ fn writeUpdatedRows(
     t: *ApiTable,
     plan: InsertColumnPlan,
     out_schema: []const types.Column,
-    values: []const storage.ColumnView,
-    row_count: usize,
+    all_values: []const storage.ColumnView,
+    all_rows: usize,
 ) !usize {
+    const rows = try rowsNamingTarget(aa, t, plan, out_schema, all_values, all_rows);
+    const values = rows.values;
+    const row_count = rows.count;
+    if (row_count == 0) return 0;
     const batch_schema = try aa.alloc(types.Column, t.schema.columns.len);
     const views = try aa.alloc(storage.ColumnView, t.schema.columns.len);
     try plan.fill(ctx, t, out_schema, values, row_count, batch_schema, views);
@@ -2996,6 +3000,35 @@ fn writeUpdatedRows(
     }
     try t.insertBatch(batch_schema, views, row_count);
     return keys.count();
+}
+
+/// The rows of an UPDATE's staged SELECT that name a row of `t`. An outer
+/// join's NULL-extended rows have a NULL key and name none; MySQL skips
+/// them, as DELETE does.
+fn rowsNamingTarget(
+    aa: Allocator,
+    t: *ApiTable,
+    plan: InsertColumnPlan,
+    out_schema: []const types.Column,
+    values: []const storage.ColumnView,
+    row_count: usize,
+) !struct { values: []const storage.ColumnView, count: usize } {
+    const keep = try aa.alloc(bool, row_count);
+    var kept: usize = 0;
+    for (keep, 0..) |*k, r| {
+        k.* = for (t.order_key_indices) |ci| {
+            if (!values[plan.table_to_source[ci].?].isValid(r)) break false;
+        } else true;
+        kept += @intFromBool(k.*);
+    }
+    if (kept == row_count) return .{ .values = values, .count = row_count };
+    const gathered = try aa.alloc(storage.ColumnView, values.len);
+    for (values, out_schema, gathered) |v, col, *g| {
+        var column = try engine.ColumnStore.init(aa, col.type, col.nullable);
+        try engine.transform.appendMaskedColumn(aa, v, keep, &column);
+        g.* = column.view();
+    }
+    return .{ .values = gathered, .count = kept };
 }
 
 /// DELETE in a form a filtered scan can't express (ORDER BY / LIMIT, an
@@ -3050,7 +3083,8 @@ fn compileDeleteFromSource(ctx: *CompileCtx, d: ir.DeleteOp) anyerror!Query {
 /// the types differ: the memtable matches decimal columns on tag alone, so a
 /// payload at another scale would be stored misread. Text parses into a DATE
 /// or DATETIME target. An integer, float or boolean target converts batch by
-/// batch by the assignment rule instead (`exec_cast.assignColumn`). Other
+/// batch by the assignment rule instead (`exec_cast.assignColumn`), as does
+/// a number, DATE or DATETIME into a text target. Other
 /// targets widen along the implicit-cast ladder short of its lossy steps;
 /// the memtable admits or rejects the rest.
 fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?exec.Expr {
@@ -3670,9 +3704,12 @@ pub const InsertColumnBuilder = struct {
             .decimal128 => |spec| self.writeFixedInt(col_idx, i128, try coerceToDecimal128(v, spec)),
             .uuid => self.writeFixedInt(col_idx, u128, try coerceToUuid(v)),
             .varchar, .string, .char, .json => {
-                const s = try coerceToText(v);
                 const sb = &self.string_bytes[col_idx];
-                try sb.appendSlice(self.allocator, s);
+                if (col.type == .json) {
+                    try sb.appendSlice(self.allocator, try coerceToJsonText(v));
+                } else {
+                    try exec_cast.appendAssignedText(self.allocator, sb, v);
+                }
                 try self.string_offsets[col_idx].append(self.allocator, @intCast(sb.items.len));
             },
         }
@@ -3730,7 +3767,7 @@ pub const InsertColumnBuilder = struct {
     }
 };
 
-fn coerceToText(v: Value) ![]const u8 {
+fn coerceToJsonText(v: Value) ![]const u8 {
     return switch (v) {
         .text => |s| s,
         else => Error.TypeMismatch,

@@ -145,6 +145,29 @@ test "multi-table UPDATE assigns each table it names" {
     }
 }
 
+test "UPDATE over an outer join leaves the NULL-extended side alone" {
+    const allocator = std.testing.allocator;
+    inline for (.{ false, true }) |flush| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try openTables(allocator, std.testing.io, tmp.dir, flush);
+        defer db.close();
+
+        try std.testing.expectEqual(@as(u64, 2), try affectedRows(allocator, db, "UPDATE t LEFT JOIN u ON t.id = u.k SET u.w = u.w + 1"));
+        try expectInts(allocator, db, "SELECT w FROM u ORDER BY k", &.{ 201, 401, 900 });
+
+        try std.testing.expectEqual(@as(u64, 8), try affectedRows(allocator, db, "UPDATE t LEFT JOIN u ON t.id = u.k SET t.v = COALESCE(u.w, -1), u.w = 0"));
+        try expectInts(allocator, db, "SELECT v FROM t ORDER BY id", &.{ -1, 201, -1, 401, -1, -1 });
+        try expectInts(allocator, db, "SELECT w FROM u ORDER BY k", &.{ 0, 0, 900 });
+
+        try std.testing.expectEqual(@as(u64, 2), try affectedRows(allocator, db, "UPDATE t RIGHT JOIN u ON t.id = u.k SET t.v = 7"));
+        try expectInts(allocator, db, "SELECT v FROM t ORDER BY id", &.{ -1, 7, -1, 7, -1, -1 });
+        try std.testing.expectEqual(@as(u64, 0), try affectedRows(allocator, db, "UPDATE t LEFT JOIN u ON t.id = u.k + 100 SET u.w = 5"));
+        try expectInts(allocator, db, "SELECT COUNT(*) FROM t", &.{6});
+        try expectInts(allocator, db, "SELECT COUNT(*) FROM u", &.{3});
+    }
+}
+
 test "multi-table DELETE removes each target's joined rows" {
     const allocator = std.testing.allocator;
     inline for (.{ false, true }) |flush| {
