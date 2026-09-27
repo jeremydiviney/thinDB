@@ -37,6 +37,7 @@ const Value = types.Value;
 const exec = @import("../exec/exec.zig");
 const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
+const time_fn = @import("../exec/scalar_fn_time.zig");
 
 const storage = @import("../storage/storage.zig");
 
@@ -63,7 +64,8 @@ fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !?@import("../types.zig"
 
 pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
     switch (op.*) {
-        .scan, .file_scan, .ddl, .show, .insert, .copy, .single_row => {},
+        .scan, .file_scan, .ddl, .show, .copy, .single_row, .admin => {},
+        .insert => |i| try resolveDuplicateAssignments(ctx, i.on_duplicate),
         .alias => |a| try resolveSubqueriesInOp(ctx, @constCast(a.upstream)),
         .table_fn => |t| for (t.inputs) |inp| try resolveSubqueriesInOp(ctx, inp),
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
@@ -118,8 +120,19 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
             try resolveSubqueriesInOp(ctx, @constCast(u.right));
         },
         .create_table_as => |c| try resolveSubqueriesInOp(ctx, @constCast(c.source)),
-        .insert_select => |i| try resolveSubqueriesInOp(ctx, @constCast(i.source)),
+        .insert_select => |i| {
+            try resolveSubqueriesInOp(ctx, @constCast(i.source));
+            try resolveDuplicateAssignments(ctx, i.on_duplicate);
+        },
     }
+}
+
+/// ON DUPLICATE KEY UPDATE values are evaluated per duplicate row with only
+/// the stored and incoming rows in scope, so a subquery or `@var` in one
+/// binds to its literal first, as an UPDATE's assignments do.
+fn resolveDuplicateAssignments(ctx: *CompileCtx, on_duplicate: ?ir.OnDuplicate) anyerror!void {
+    const od = on_duplicate orelse return;
+    for (od.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
 }
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
@@ -198,6 +211,22 @@ fn sessionInfoExpr(ctx: *CompileCtx, name: []const u8) !?ir.Expr {
     return .{ .lit = .{ .text = try (try ctx.subqueryArena()).dupe(u8, text) } };
 }
 
+/// The fraction digits a CURTIME / CURRENT_TIME / UTC_TIME call shows (its
+/// literal precision argument, 0 without one); null for any other call.
+fn clockTimeFsp(c: exec.expr_mod.Expr.Call) ?u8 {
+    const names = [_][]const u8{ "current_time", "curtime", "utc_time" };
+    for (names) |n| {
+        if (!std.ascii.eqlIgnoreCase(c.fn_name, n)) continue;
+        if (c.args.len == 0) return 0;
+        if (c.args.len != 1 or c.args[0] != .lit) return null;
+        return switch (c.args[0].lit) {
+            inline .tinyint, .smallint, .int, .bigint => |fsp| if (fsp >= 0 and fsp <= 6) @intCast(fsp) else null,
+            else => null,
+        };
+    }
+    return null;
+}
+
 /// `lowered` collects the correlated scalar subqueries of a Compute's
 /// expressions for the LEFT JOIN lowering; null elsewhere.
 fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScalars) anyerror!void {
@@ -214,13 +243,20 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
             // literal from the wall clock captured at compile time, rather
             // than a per-row scalar kernel (PG/MySQL evaluate now() once
             // per statement).
+            if (clockTimeFsp(c)) |fsp| {
+                // thinDB has no TIME type: a TIME is its text. The clock is
+                // UTC, so the session's time of day is UTC's.
+                var buf: [32]u8 = undefined;
+                const text = try time_fn.clockTime(&buf, ctx.now_micros, fsp);
+                e.* = .{ .lit = .{ .text = try (try ctx.subqueryArena()).dupe(u8, text) } };
+                return;
+            }
             if (c.args.len == 0) {
                 if (std.ascii.eqlIgnoreCase(c.fn_name, "now") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "current_timestamp") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "localtimestamp") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "utc_timestamp") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "current_time") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "curtime") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "sysdate") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "localtime"))
                 {
                     e.* = .{ .lit = .{ .datetime = ctx.now_micros } };

@@ -146,6 +146,7 @@ pub fn isSelectQuery(op: *const ir.Op) bool {
         .delete_op,
         .update_op,
         .explain,
+        .admin,
         => false,
     };
 }
@@ -1447,8 +1448,9 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
                         // below is dropped.
                         for (plan.compute_layers[0..plan.compute_layer_count]) |layer| {
                             for (layer) |d| {
-                                if (types.columnNameEql(d.name, col.name) and
-                                    !planReplacesName(plan, d.name)) continue :expand;
+                                if (!types.columnNameEql(d.name, col.name)) continue;
+                                const replaces_source = types.findColumn(table.schema.columns, d.name) != null and planReplacesName(plan, d.name);
+                                if (!replaces_source) continue :expand;
                             }
                         }
                         try names.append(allocator, col.name);
@@ -1462,7 +1464,15 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
                     try names.append(allocator, c);
                 }
             }
-            q = try q.project(names.items);
+            // A star repeating another item's column (`SELECT *, c`).
+            const outputs = try allocator.dupe([]const u8, names.items);
+            defer allocator.free(outputs);
+            const renamed = try types.dedupeColumnNames(allocator, outputs);
+            defer {
+                for (renamed) |r| allocator.free(r);
+                allocator.free(renamed);
+            }
+            q = if (renamed.len == 0) try q.project(names.items) else try q.projectNamed(names.items, outputs);
         } else if (plan.project_outputs) |outs| {
             const names = try allocator.alloc([]const u8, cols.len);
             defer allocator.free(names);
@@ -1512,10 +1522,11 @@ fn projectedBaseColumns(
     const raw = prune_names orelse return null;
     var keep: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer keep.deinit(allocator);
+    // `t.col` and `col` read one column: scan it once, by the table's name.
     for (raw) |name| {
-        if (types.findColumn(table.schema.columns, name) != null) {
-            try keep.append(allocator, name);
-        }
+        const index = types.findColumn(table.schema.columns, name) orelse continue;
+        const column_name = table.schema.columns[index].name;
+        if (!nameInList(keep.items, column_name)) try keep.append(allocator, column_name);
     }
     return try keep.toOwnedSlice(allocator);
 }

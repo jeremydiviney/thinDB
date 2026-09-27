@@ -972,25 +972,24 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
             if (ns.findTable(ref.name)) |t| return t;
         }
     }
-    var db_name: []const u8 = ref.database orelse session.current_db;
-    var schema_name: []const u8 = ref.schema orelse session.current_schema;
-    // MySQL-style `db__schema.table` arrives here as ref.schema = "db__schema",
-    // ref.database = null. Flatten it back to (db, schema) so the resolver
-    // doesn't go hunting for a literal schema named "db__schema".
-    if (ref.database == null and ref.schema != null) {
-        if (splitDoubleUnderscore(ref.schema.?)) |parts| {
-            db_name = parts.db;
-            schema_name = parts.schema;
-        }
-    }
-    const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
-    const sc = db.schema(schema_name) orelse return Error.SchemaNotFound;
+    const ns = tableNamespace(session, ref);
+    const db = catalog.database(ns.db) orelse return Error.DatabaseNotFound;
+    const sc = db.schema(ns.schema) orelse return Error.SchemaNotFound;
     {
         sc.tables_mutex.lockUncancelable(sc.io);
         defer sc.tables_mutex.unlock(sc.io);
         if (sc.tables.get(ref.name)) |t| return t;
     }
     return sc.openTable(ref.name, .{});
+}
+
+/// The (database, schema) a persistent table reference names.
+fn tableNamespace(session: Session, ref: ir.TableRef) NameParts {
+    // MySQL-style `db__schema.table` arrives here as ref.schema = "db__schema",
+    // ref.database = null. Flatten it back to (db, schema) so the resolver
+    // doesn't go hunting for a literal schema named "db__schema".
+    if (ref.database == null) if (ref.schema) |s| if (splitDoubleUnderscore(s)) |parts| return parts;
+    return .{ .db = ref.database orelse session.current_db, .schema = ref.schema orelse session.current_schema };
 }
 
 const PersistentTableTarget = struct {
@@ -1357,6 +1356,7 @@ pub fn producesOnlyResult(op: *const ir.Op) bool {
         .file_scan,
         .alias,
         .table_fn,
+        .admin,
         => true,
         .ddl,
         .insert,
@@ -2075,8 +2075,12 @@ pub fn compileSelectProject(allocator: Allocator, upstream: Query, p: ir.Op.Proj
 pub const ProjectionNames = struct {
     sources: [][]const u8,
     outputs: [][]const u8,
+    /// Output names allocated to tell repeated columns apart.
+    renamed: [][]u8,
 
     pub fn deinit(self: ProjectionNames, allocator: Allocator) void {
+        for (self.renamed) |r| allocator.free(r);
+        allocator.free(self.renamed);
         allocator.free(self.sources);
         allocator.free(self.outputs);
     }
@@ -2129,10 +2133,16 @@ pub fn resolve_select_project(allocator: Allocator, schema: []const types.Column
         }
     }
 
+    // A star repeating another item's column (`SELECT *, c`, `SELECT c, t.*`).
+    const renamed = try types.dedupeColumnNames(allocator, outputs.items);
+    errdefer {
+        for (renamed) |r| allocator.free(r);
+        allocator.free(renamed);
+    }
     const source_slice = try sources.toOwnedSlice(allocator);
     errdefer allocator.free(source_slice);
     const output_slice = try outputs.toOwnedSlice(allocator);
-    return .{ .sources = source_slice, .outputs = output_slice };
+    return .{ .sources = source_slice, .outputs = output_slice, .renamed = renamed };
 }
 
 pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
@@ -2171,6 +2181,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .create_table_as => |c| try compileCreateTableAs(ctx, c),
         .insert_select => |i| try compileInsertSelect(ctx, i),
         .set_var => |sv| try compileSetVar(ctx, sv),
+        .admin => |a| try compileAdmin(ctx, a),
         .delete_op => |d| if (d.source != null) try compileDeleteFromSource(ctx, d) else try compileDelete(ctx, d),
         .update_op => |u| if (u.source != null) try compileUpdateFromSource(ctx, u) else try compileUpdate(ctx, u),
         .explain => |e| blk: {
@@ -2193,7 +2204,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
                 const json = try planTextToJson(ctx.allocator, plan);
                 defer ctx.allocator.free(json);
                 var rows = [_][]u8{@constCast(json)};
-                break :blk try NamesOp.create(ctx.allocator, col_name, rows[0..]);
+                break :blk try TextRowsOp.create(ctx.allocator, col_name, rows[0..]);
             }
             var lines: std.ArrayList([]u8) = .empty;
             defer lines.deinit(ctx.allocator);
@@ -2201,7 +2212,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             while (it.next()) |line| {
                 if (line.len > 0) try lines.append(ctx.allocator, @constCast(line));
             }
-            break :blk try NamesOp.create(ctx.allocator, col_name, lines.items);
+            break :blk try TextRowsOp.create(ctx.allocator, col_name, lines.items);
         },
     };
 }
@@ -2263,6 +2274,44 @@ fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
     try ctx.session.vars.?.set(sv.name, value);
 
     return try EmptyOp.createWithCount(ctx.allocator, 0);
+}
+
+fn compileAdmin(ctx: *CompileCtx, a: ir.AdminOp) !Query {
+    return switch (a) {
+        .ignored, .begin_transaction, .end_transaction => try EmptyOp.createWithCount(ctx.allocator, 0),
+        .table_maintenance => |m| try compileTableMaintenance(ctx, m),
+    };
+}
+
+/// MySQL's four-column status report, a verdict per named table. thinDB
+/// keeps no optimizer statistics and compacts on its own, so an existing
+/// table is simply OK; REPAIR gets InnoDB's note that it does not apply.
+/// A table is labelled `db__schema.table`, the database name the MySQL wire
+/// lists it under.
+fn compileTableMaintenance(ctx: *CompileCtx, m: ir.TableMaintenance) !Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const op_name = @tagName(m.kind);
+    var cells: std.ArrayList([]const u8) = .empty;
+    for (m.tables) |ref| {
+        const ns = tableNamespace(ctx.session.*, ref);
+        const label = try std.fmt.allocPrint(aa, "{s}__{s}.{s}", .{ ns.db, ns.schema, ref.name });
+        const exists = if (resolveTable(catalog, ctx.session.*, ref)) |_| true else |err| switch (err) {
+            error.TableNotFound, error.SchemaNotFound, error.DatabaseNotFound => false,
+            else => return err,
+        };
+        if (!exists) {
+            const msg = try std.fmt.allocPrint(aa, "Table '{s}' doesn't exist", .{label});
+            try cells.appendSlice(aa, &.{ label, op_name, "Error", msg, label, op_name, "status", "Operation failed" });
+        } else if (m.kind == .repair) {
+            try cells.appendSlice(aa, &.{ label, op_name, "note", "The storage engine for the table doesn't support repair" });
+        } else {
+            try cells.appendSlice(aa, &.{ label, op_name, "status", "OK" });
+        }
+    }
+    return try TextRowsOp.createRows(ctx.allocator, &.{ "Table", "Op", "Msg_type", "Msg_text" }, cells.items);
 }
 
 fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
@@ -2813,16 +2862,18 @@ fn isOrderKeyColumn(t: *const ApiTable, ci: usize) bool {
     return false;
 }
 
-/// Which of an UPDATE's candidate targets it writes: the only one, or the
-/// only one holding every assigned column.
-fn updateTargetIndex(tables: []const *ApiTable, assignments: []const ir.Assignment) !usize {
-    if (tables.len == 1) return 0;
+/// Which of an UPDATE's candidate targets an assignment writes: the one its
+/// qualifier names, or else the one table holding its column.
+fn assignmentTarget(targets: []const ir.DmlTarget, tables: []const *ApiTable, a: ir.Assignment) !usize {
+    if (a.target) |q| {
+        for (targets, 0..) |target, k| {
+            if (types.columnNameEql(target.qualifier, q)) return k;
+        }
+        return Error.TableNotFound;
+    }
     var found: ?usize = null;
     for (tables, 0..) |t, k| {
-        const holds_all = for (assignments) |a| {
-            if (t.schema.columnIndex(a.col) == null) break false;
-        } else true;
-        if (!holds_all) continue;
+        if (t.schema.columnIndex(a.col) == null) continue;
         if (found != null) return Error.BadRequest;
         found = k;
     }
@@ -2831,8 +2882,8 @@ fn updateTargetIndex(tables: []const *ApiTable, assignments: []const ir.Assignme
 
 /// UPDATE in a form a filtered scan can't express (ORDER BY / LIMIT, a
 /// join, an alias). The SELECT yields each candidate target's columns,
-/// then one column per assignment value; the chosen target's rows, with
-/// the assigned columns replaced, are written back over their keys.
+/// then one column per assignment value; each table an assignment writes
+/// takes its rows, with the assigned columns replaced, back over their keys.
 fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -2840,43 +2891,78 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const aa = arena.allocator();
 
     const tables = try aa.alloc(*ApiTable, u.targets.len);
-    for (u.targets, tables) |target, *t| t.* = try resolveTable(catalog, ctx.session.*, target.table);
-    const k = try updateTargetIndex(tables, u.assignments);
-    const t = tables[k];
-    // Only a key identifies the row a SELECT returned.
-    if (!t.schema.unique) return Error.UnsupportedOp;
-
-    var offset: usize = 0;
+    const offsets = try aa.alloc(usize, u.targets.len);
     var star_width: usize = 0;
-    for (tables, 0..) |x, i| {
-        if (i < k) offset += x.schema.columns.len;
-        star_width += x.schema.columns.len;
+    for (u.targets, tables, offsets) |target, *t, *offset| {
+        t.* = try resolveTable(catalog, ctx.session.*, target.table);
+        offset.* = star_width;
+        star_width += t.*.schema.columns.len;
     }
-    const table_to_source = try aa.alloc(?usize, t.schema.columns.len);
-    for (table_to_source, 0..) |*s, j| s.* = offset + j;
+
+    // Each written table's columns: its own source column, or an assignment's.
+    const table_to_source = try aa.alloc(?[]?usize, tables.len);
+    @memset(table_to_source, null);
     for (u.assignments, 0..) |a, i| {
+        const k = try assignmentTarget(u.targets, tables, a);
+        const t = tables[k];
+        // Only a key identifies the row a SELECT returned.
+        if (!t.schema.unique) return Error.UnsupportedOp;
         const ci = t.schema.columnIndex(a.col) orelse return Error.ColumnNotFound;
         // The key finds the row; moving it is not an update.
         if (isOrderKeyColumn(t, ci)) return Error.UnsupportedOp;
-        table_to_source[ci] = star_width + i;
+        const map = table_to_source[k] orelse blk: {
+            const own = try aa.alloc(?usize, t.schema.columns.len);
+            for (own, 0..) |*s, j| s.* = offsets[k] + j;
+            table_to_source[k] = own;
+            break :blk own;
+        };
+        map[ci] = star_width + i;
     }
 
     var source = try compileSubplan(ctx, u.source.?);
     defer source.deinit();
     if (source.outputSchema().len != star_width + u.assignments.len) return Error.BadRequest;
-    const plan = try InsertColumnPlan.init(ctx, aa, t, &source, table_to_source, 0);
+    const plans = try aa.alloc(?InsertColumnPlan, tables.len);
+    for (tables, table_to_source, plans, 0..) |t, maybe_map, *plan, k| {
+        const map = maybe_map orelse {
+            plan.* = null;
+            continue;
+        };
+        plan.* = try InsertColumnPlan.init(ctx, aa, t, &source, map, k);
+    }
     const out_schema = try aa.dupe(types.Column, source.outputSchema());
     var staged = try stageDmlSource(ctx, aa, &source);
     defer staged.deinit();
     const row_count: usize = @intCast(staged.row_count);
     if (row_count == 0) return try EmptyOp.createWithCount(ctx.allocator, 0);
+    const values = try stagedViews(aa, &staged);
 
+    var affected: usize = 0;
+    for (tables, plans) |t, maybe_plan| {
+        const plan = maybe_plan orelse continue;
+        affected += try writeUpdatedRows(ctx, aa, t, plan, out_schema, values, row_count);
+    }
+    ctx.affected_rows = @intCast(affected);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
+}
+
+/// Write `t`'s rows of an UPDATE's staged SELECT back over their keys,
+/// returning how many rows that updated: a row a join matched more than
+/// once is updated once.
+fn writeUpdatedRows(
+    ctx: *CompileCtx,
+    aa: Allocator,
+    t: *ApiTable,
+    plan: InsertColumnPlan,
+    out_schema: []const types.Column,
+    values: []const storage.ColumnView,
+    row_count: usize,
+) !usize {
     const batch_schema = try aa.alloc(types.Column, t.schema.columns.len);
     const views = try aa.alloc(storage.ColumnView, t.schema.columns.len);
-    try plan.fill(ctx, t, out_schema, try stagedViews(aa, &staged), row_count, batch_schema, views);
+    try plan.fill(ctx, t, out_schema, values, row_count, batch_schema, views);
     defer plan.release(ctx, views);
 
-    // A row a join matched more than once is updated once.
     var keys: std.StringHashMapUnmanaged(void) = .empty;
     var key_buf: std.ArrayList(u8) = .empty;
     for (0..row_count) |r| {
@@ -2885,9 +2971,7 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
         try keys.put(aa, try aa.dupe(u8, key_buf.items), {});
     }
     try t.insertBatch(batch_schema, views, row_count);
-    const affected: usize = keys.count();
-    ctx.affected_rows = @intCast(affected);
-    return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
+    return keys.count();
 }
 
 /// DELETE in a form a filtered scan can't express (ORDER BY / LIMIT, an
@@ -3753,14 +3837,14 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
         .databases => blk: {
             const names = try catalog.listDatabases(ctx.allocator);
             defer freeOwnedNames(ctx.allocator, names);
-            break :blk try NamesOp.create(ctx.allocator, "name", names);
+            break :blk try TextRowsOp.create(ctx.allocator, "name", names);
         },
         .schemas => |db_arg| blk: {
             const db_name = db_arg orelse ctx.session.current_db;
             const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
             const names = try db.listSchemas(ctx.allocator);
             defer freeOwnedNames(ctx.allocator, names);
-            break :blk try NamesOp.create(ctx.allocator, "name", names);
+            break :blk try TextRowsOp.create(ctx.allocator, "name", names);
         },
         .tables => |ref| blk: {
             const db_name = ref.database orelse ctx.session.current_db;
@@ -3769,7 +3853,7 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
             const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
             const names = try unionSchemaAndTempTables(ctx.allocator, sc, ctx.session.temp_namespace, ref);
             defer freeOwnedNames(ctx.allocator, names);
-            break :blk try NamesOp.create(ctx.allocator, "name", names);
+            break :blk try TextRowsOp.create(ctx.allocator, "name", names);
         },
         .functions => blk: {
             var names: std.ArrayList([]u8) = .empty;
@@ -3788,13 +3872,13 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
                     return std.mem.lessThan(u8, a, b);
                 }
             }.lt);
-            break :blk try NamesOp.create(ctx.allocator, "name", names.items);
+            break :blk try TextRowsOp.create(ctx.allocator, "name", names.items);
         },
         .create_function => |fname| blk: {
             // SQL inline function: the canonical persisted CREATE text.
             if (catalog.sql_fns.get(ctx.session.current_db, fname)) |def| {
                 var one = [_][]u8{@constCast(def.create_text)};
-                break :blk try NamesOp.create(ctx.allocator, "Create Function", &one);
+                break :blk try TextRowsOp.create(ctx.allocator, "Create Function", &one);
             }
             // LANGUAGE zig function: reconstruct the CREATE around the
             // persisted source; embedded registrations have no source.
@@ -3808,7 +3892,7 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
                         );
                         defer ctx.allocator.free(text);
                         var one = [_][]u8{text};
-                        break :blk try NamesOp.create(ctx.allocator, "Create Function", &one);
+                        break :blk try TextRowsOp.create(ctx.allocator, "Create Function", &one);
                     }
                 }
                 const note = try std.fmt.allocPrint(
@@ -3818,9 +3902,28 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
                 );
                 defer ctx.allocator.free(note);
                 var one = [_][]u8{note};
-                break :blk try NamesOp.create(ctx.allocator, "Create Function", &one);
+                break :blk try TextRowsOp.create(ctx.allocator, "Create Function", &one);
             }
             return Error.FunctionNotFound;
+        },
+        .create_database => |cd| blk: {
+            _ = resolveUseTarget(catalog, ctx.session.current_db, cd.name) catch |err| switch (err) {
+                error.SchemaNotFound => return Error.DatabaseNotFound,
+                else => return err,
+            };
+            var quoted: std.ArrayList(u8) = .empty;
+            defer quoted.deinit(ctx.allocator);
+            for (cd.name) |c| {
+                if (c == '`') try quoted.append(ctx.allocator, '`');
+                try quoted.append(ctx.allocator, c);
+            }
+            const text = try std.fmt.allocPrint(
+                ctx.allocator,
+                "CREATE DATABASE {s}`{s}` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci */",
+                .{ if (cd.if_not_exists) "/*!32312 IF NOT EXISTS*/ " else "", quoted.items },
+            );
+            defer ctx.allocator.free(text);
+            break :blk try TextRowsOp.createRows(ctx.allocator, &.{ "Database", "Create Database" }, &.{ cd.name, text });
         },
     };
 }
@@ -3875,7 +3978,7 @@ fn unionSchemaAndTempTables(
 //
 // DDL ops return `EmptyOp` — single output column carrying a status name
 // only when needed (today: nothing — `.next()` returns null on first
-// call). SHOW ops return `NamesOp`, which materializes a list of names
+// call). SHOW ops return `TextRowsOp`, which materializes a list of names
 // into one string column and emits a single Batch.
 // ---------------------------------------------------------------------------
 
@@ -4042,86 +4145,104 @@ fn planTextToJson(allocator: Allocator, plan: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-const NamesOp = struct {
+/// A fixed result of text columns built at compile: SHOW output, EXPLAIN
+/// lines, table-maintenance status rows.
+const TextRowsOp = struct {
     allocator: Allocator,
-    schema: [1]types.Column,
-    offsets: []u32,
-    bytes: []u8,
-    views: [1]storage.ColumnView,
+    schema: []types.Column,
+    views: []storage.ColumnView,
     row_count: usize,
     emitted: bool,
 
-    fn create(allocator: Allocator, col_name: []const u8, names: [][]u8) !Query {
-        const owned_name = try allocator.dupe(u8, col_name);
-        errdefer allocator.free(owned_name);
+    fn create(allocator: Allocator, col_name: []const u8, names: []const []const u8) !Query {
+        return createRows(allocator, &.{col_name}, names);
+    }
 
-        const offsets = try allocator.alloc(u32, names.len + 1);
-        errdefer allocator.free(offsets);
-
-        var total: u32 = 0;
-        offsets[0] = 0;
-        for (names, 0..) |n, i| {
-            total += @intCast(n.len);
-            offsets[i + 1] = total;
+    /// `cells` holds the rows one after another, `col_names.len` cells each.
+    fn createRows(allocator: Allocator, col_names: []const []const u8, cells: []const []const u8) !Query {
+        const width = col_names.len;
+        const row_count = cells.len / width;
+        const schema = try allocator.alloc(types.Column, width);
+        errdefer allocator.free(schema);
+        const views = try allocator.alloc(storage.ColumnView, width);
+        errdefer allocator.free(views);
+        var built: usize = 0;
+        errdefer for (schema[0..built], views[0..built]) |col, view| freeTextColumn(allocator, col, view);
+        for (col_names, 0..) |col_name, c| {
+            const owned_name = try allocator.dupe(u8, col_name);
+            errdefer allocator.free(owned_name);
+            const offsets = try allocator.alloc(u32, row_count + 1);
+            errdefer allocator.free(offsets);
+            var total: usize = 0;
+            offsets[0] = 0;
+            for (0..row_count) |r| {
+                total += cells[r * width + c].len;
+                offsets[r + 1] = @intCast(total);
+            }
+            const bytes = try allocator.alloc(u8, total);
+            var pos: usize = 0;
+            for (0..row_count) |r| {
+                const cell = cells[r * width + c];
+                @memcpy(bytes[pos..][0..cell.len], cell);
+                pos += cell.len;
+            }
+            schema[c] = .{ .name = owned_name, .type = .string };
+            views[c] = .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes } } };
+            built = c + 1;
         }
 
-        const bytes = try allocator.alloc(u8, total);
-        errdefer allocator.free(bytes);
-        var pos: usize = 0;
-        for (names) |n| {
-            @memcpy(bytes[pos .. pos + n.len], n);
-            pos += n.len;
-        }
-
-        const self = try allocator.create(NamesOp);
+        const self = try allocator.create(TextRowsOp);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .schema = .{.{ .name = owned_name, .type = .string }},
-            .offsets = offsets,
-            .bytes = bytes,
-            .views = undefined,
-            .row_count = names.len,
+            .schema = schema,
+            .views = views,
+            .row_count = row_count,
             .emitted = false,
         };
-        self.views[0] = .{ .data = .{ .string = .{ .offsets = self.offsets, .bytes = self.bytes } } };
         return exec.makeQuery(allocator, self);
     }
 
-    pub fn next(self: *NamesOp) !?exec.Batch {
+    fn freeTextColumn(allocator: Allocator, col: types.Column, view: storage.ColumnView) void {
+        allocator.free(col.name);
+        allocator.free(view.data.string.offsets);
+        allocator.free(view.data.string.bytes);
+    }
+
+    pub fn next(self: *TextRowsOp) !?exec.Batch {
         if (self.emitted) return null;
         self.emitted = true;
         return exec.Batch{
-            .schema = self.schema[0..],
-            .values = self.views[0..],
+            .schema = self.schema,
+            .values = self.views,
             .row_count = self.row_count,
         };
     }
 
-    pub fn deinit(self: *NamesOp) void {
+    pub fn deinit(self: *TextRowsOp) void {
         const allocator = self.allocator;
-        allocator.free(self.schema[0].name);
-        allocator.free(self.offsets);
-        allocator.free(self.bytes);
+        for (self.schema, self.views) |col, view| freeTextColumn(allocator, col, view);
+        allocator.free(self.schema);
+        allocator.free(self.views);
         allocator.destroy(self);
     }
 
-    pub fn outputSchema(self: *NamesOp) []const types.Column {
-        return self.schema[0..];
+    pub fn outputSchema(self: *TextRowsOp) []const types.Column {
+        return self.schema;
     }
 
-    pub fn addPrune(_: *NamesOp, _: exec.Predicate) !void {}
+    pub fn addPrune(_: *TextRowsOp, _: exec.Predicate) !void {}
 
-    pub fn stats(self: *NamesOp) exec.PipelineStats {
+    pub fn stats(self: *TextRowsOp) exec.PipelineStats {
         return .{ .upper_rows = self.row_count };
     }
 
-    pub fn accountant(_: *NamesOp) ?*exec.memory.MemoryAccountant {
+    pub fn accountant(_: *TextRowsOp) ?*exec.memory.MemoryAccountant {
         return null;
     }
 
-    pub fn explain(_: *NamesOp, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        try exec.explainLine(out, allocator, depth, "Names");
+    pub fn explain(_: *TextRowsOp, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "TextRows");
     }
 };
 

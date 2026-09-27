@@ -13,6 +13,9 @@ const types = @import("../types.zig");
 pub const TokenTag = enum {
     // Literals.
     integer,
+    /// An integer literal past the BIGINT range. Its decimal digits ride in
+    /// `Token.value.big_integer`; the parser types it as MySQL does.
+    big_integer,
     floating,
     string,
     identifier,
@@ -127,6 +130,9 @@ pub const TokenTag = enum {
     /// carries the name without the `@` prefix. Resolved to a literal
     /// by the pre-compile pass using the active Session.vars.
     at_identifier,
+    /// MySQL system variable: `@@name`, `@@session.name`. The `text` field
+    /// carries the name without the `@@` prefix, scope included.
+    system_variable,
 
     // Operators / punctuation.
     eq, // =
@@ -184,6 +190,8 @@ pub const Token = struct {
     value: union(enum) {
         none,
         integer: i64,
+        /// Decimal digits of a `.big_integer`, without leading zeros.
+        big_integer: []const u8,
         floating: f64,
         /// String literal contents with `''` un-escaped to `'`. Owned
         /// by the lexer's arena when un-escaping happens; otherwise a
@@ -203,6 +211,9 @@ pub const LexError = error{
     LexUnterminatedIdentifier,
     LexInvalidNumber,
     LexUnexpectedChar,
+    /// A charset introducer whose literal thinDB would have to transcode:
+    /// a UTF-16/32 charset, or non-ASCII bytes under a non-UTF-8 charset.
+    LexCharsetUnsupported,
 } || Allocator.Error;
 
 pub const Lexer = struct {
@@ -374,14 +385,32 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return Token{ .tag = .gt, .text = self.src[start..self.pos] };
             },
-            '\'' => return try self.lexString(),
+            '\'' => return try self.lexString(start),
             '"' => return try self.lexDoubleQuoted(),
             '`' => return try self.lexBacktickIdent(),
-            '0'...'9' => return try self.lexNumber(),
+            '0'...'9' => {
+                if (ch == '0' and self.dialect != .postgres) {
+                    if (try self.scanHexNumber()) |bytes| return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = bytes } };
+                    if (try self.scanBitNumber()) |digits| return try self.bitIntegerToken(start, digits);
+                }
+                return try self.lexNumber();
+            },
             'a'...'z', 'A'...'Z', '_' => {
+                const quote_follows = self.peekChar(1) == '\'';
                 // PG escape-string prefix `E'...'` / `e'...'`.
-                if ((ch == 'E' or ch == 'e') and self.peekChar(1) == '\'' and self.dialect != .mysql)
+                if ((ch == 'E' or ch == 'e') and quote_follows and self.dialect != .mysql)
                     return try self.lexEscapeString();
+                if ((ch == 'N' or ch == 'n') and quote_follows) {
+                    self.pos += 1;
+                    return try self.lexString(start);
+                }
+                if (quote_follows and self.dialect != .postgres) {
+                    if (ch == 'X' or ch == 'x') {
+                        const bytes = try self.scanHexQuoted();
+                        return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = bytes } };
+                    }
+                    if (ch == 'B' or ch == 'b') return try self.bitIntegerToken(start, try self.scanBitQuoted());
+                }
                 return try self.lexIdent();
             },
             else => return LexError.LexUnexpectedChar,
@@ -426,12 +455,33 @@ pub const Lexer = struct {
         }
     }
 
-    fn lexString(self: *Lexer) LexError!Token {
+    /// Cursor is on the opening `'`; `start` is where the token began, before
+    /// an `N` national-string prefix or a charset introducer.
+    fn lexString(self: *Lexer, start: usize) LexError!Token {
         // MySQL processes C-style backslash escapes in ordinary string
         // literals; PG/neutral treat backslash literally (standard SQL,
         // standard_conforming_strings on). `''` always escapes a quote.
-        const start = self.pos;
-        const content = try self.scanStringContent(self.dialect == .mysql);
+        const content = try self.scanQuotedContent('\'', self.dialect == .mysql);
+        return try self.joinAdjacentStrings(start, content);
+    }
+
+    /// MySQL reads quoted strings separated only by whitespace or comments
+    /// as one literal: `'a' 'b'` is `'ab'`. PostgreSQL joins them only
+    /// across a newline, so the other dialects keep them apart.
+    fn joinAdjacentStrings(self: *Lexer, start: usize, first: []const u8) LexError!Token {
+        var content = first;
+        while (self.dialect == .mysql) {
+            const before_gap = self.pos;
+            try self.skipWhitespaceAndComments();
+            const c = self.peekChar(0);
+            const piece = if (c == '\'' or c == '"')
+                try self.scanQuotedContent(c.?, true)
+            else {
+                self.pos = before_gap;
+                break;
+            };
+            content = try std.mem.concat(self.arena, u8, &.{ content, piece });
+        }
         return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = content } };
     }
 
@@ -440,14 +490,15 @@ pub const Lexer = struct {
     fn lexEscapeString(self: *Lexer) LexError!Token {
         const start = self.pos;
         self.pos += 1; // skip the E prefix
-        const content = try self.scanStringContent(true);
+        const content = try self.scanQuotedContent('\'', true);
         return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = content } };
     }
 
-    /// Cursor is on the opening `'`. Consume through the closing `'` and
-    /// return the (un-escaped) content. `''` is always a literal quote;
-    /// when `process_backslash` is set, `\x` C-style escapes are honored.
-    fn scanStringContent(self: *Lexer, process_backslash: bool) LexError![]const u8 {
+    /// Cursor is on the opening `quote`. Consume through the closing one and
+    /// return the (un-escaped) content. A doubled quote is always a literal
+    /// quote; when `process_backslash` is set, `\x` C-style escapes are
+    /// honored.
+    fn scanQuotedContent(self: *Lexer, quote: u8, process_backslash: bool) LexError![]const u8 {
         self.pos += 1; // opening quote
         const body_start = self.pos;
         var needs_build = false;
@@ -458,8 +509,8 @@ pub const Lexer = struct {
                 self.pos += if (self.pos + 1 < self.src.len) 2 else 1;
                 continue;
             }
-            if (c == '\'') {
-                if (self.peekChar(1) == '\'') {
+            if (c == quote) {
+                if (self.peekChar(1) == quote) {
                     needs_build = true;
                     self.pos += 2;
                     continue;
@@ -467,21 +518,21 @@ pub const Lexer = struct {
                 const raw = self.src[body_start..self.pos];
                 self.pos += 1; // closing quote
                 if (!needs_build) return raw;
-                return try self.buildUnescaped(raw, process_backslash);
+                return try self.buildUnescaped(raw, quote, process_backslash);
             }
             self.pos += 1;
         }
         return LexError.LexUnterminatedString;
     }
 
-    fn buildUnescaped(self: *Lexer, raw: []const u8, process_backslash: bool) LexError![]const u8 {
+    fn buildUnescaped(self: *Lexer, raw: []const u8, quote: u8, process_backslash: bool) LexError![]const u8 {
         const buf = try self.arena.alloc(u8, raw.len);
         var out: usize = 0;
         var i: usize = 0;
         while (i < raw.len) : (i += 1) {
             const c = raw[i];
-            if (c == '\'' and i + 1 < raw.len and raw[i + 1] == '\'') {
-                buf[out] = '\'';
+            if (c == quote and i + 1 < raw.len and raw[i + 1] == quote) {
+                buf[out] = quote;
                 out += 1;
                 i += 1;
                 continue;
@@ -542,9 +593,107 @@ pub const Lexer = struct {
             if (!std.math.isFinite(v)) return LexError.LexInvalidNumber;
             return Token{ .tag = .floating, .text = text, .value = .{ .floating = v } };
         } else {
-            const v = std.fmt.parseInt(i64, text, 10) catch return LexError.LexInvalidNumber;
+            const v = std.fmt.parseInt(i64, text, 10) catch |err| switch (err) {
+                error.Overflow => return Token{ .tag = .big_integer, .text = text, .value = .{ .big_integer = std.mem.trimStart(u8, text, "0") } },
+                error.InvalidCharacter => return LexError.LexInvalidNumber,
+            };
             return Token{ .tag = .integer, .text = text, .value = .{ .integer = v } };
         }
+    }
+
+    /// MySQL `0x41`: the bytes its hex digits spell, an odd count padded
+    /// with a leading zero. Null when no hex digit follows the `0x`, which
+    /// leaves `0xyz` reading as `0 AS xyz` like `1e` reads as `1 AS e`.
+    /// Cursor is on the `0`.
+    fn scanHexNumber(self: *Lexer) LexError!?[]const u8 {
+        if (self.peekChar(1) != 'x') return null;
+        const digits = self.digitRun(self.pos + 2, std.ascii.isHex);
+        if (digits.len == 0) return null;
+        try self.rejectIdentTail(self.pos + 2 + digits.len);
+        self.pos += 2 + digits.len;
+        return try self.hexBytes(digits);
+    }
+
+    /// `X'41'`: an even number of hex digits. Cursor is on the `X`.
+    fn scanHexQuoted(self: *Lexer) LexError![]const u8 {
+        const digits = try self.quotedDigits(std.ascii.isHex);
+        if (digits.len % 2 != 0) return LexError.LexInvalidNumber;
+        return try self.hexBytes(digits);
+    }
+
+    /// MySQL `0b101`: the binary digits, or null when none follows the `0b`.
+    /// Cursor is on the `0`.
+    fn scanBitNumber(self: *Lexer) LexError!?[]const u8 {
+        if (self.peekChar(1) != 'b') return null;
+        const digits = self.digitRun(self.pos + 2, isBitDigit);
+        if (digits.len == 0) return null;
+        try self.rejectIdentTail(self.pos + 2 + digits.len);
+        self.pos += 2 + digits.len;
+        return digits;
+    }
+
+    /// `b'101'`. Cursor is on the `b`.
+    fn scanBitQuoted(self: *Lexer) LexError![]const u8 {
+        return try self.quotedDigits(isBitDigit);
+    }
+
+    fn digitRun(self: *Lexer, from: usize, comptime is_digit: fn (u8) bool) []const u8 {
+        var end = from;
+        while (end < self.src.len and is_digit(self.src[end])) end += 1;
+        return self.src[from..end];
+    }
+
+    /// A digit run running straight into a name (`0x41g`, `0b102`) is no
+    /// literal; MySQL reads it as an identifier, which thinDB's names never
+    /// start with a digit to allow.
+    fn rejectIdentTail(self: *Lexer, end: usize) LexError!void {
+        if (end < self.src.len and (std.ascii.isAlphanumeric(self.src[end]) or self.src[end] == '_'))
+            return LexError.LexInvalidNumber;
+    }
+
+    /// Cursor is on the prefix letter before the opening `'`; every byte up
+    /// to the closing `'` must satisfy `is_digit`.
+    fn quotedDigits(self: *Lexer, comptime is_digit: fn (u8) bool) LexError![]const u8 {
+        const body_start = self.pos + 2;
+        const close = std.mem.indexOfScalarPos(u8, self.src, body_start, '\'') orelse return LexError.LexUnterminatedString;
+        const digits = self.src[body_start..close];
+        for (digits) |d| if (!is_digit(d)) return LexError.LexInvalidNumber;
+        self.pos = close + 1;
+        return digits;
+    }
+
+    fn hexBytes(self: *Lexer, digits: []const u8) LexError![]const u8 {
+        const bytes = try self.arena.alloc(u8, (digits.len + 1) / 2);
+        const pad = digits.len % 2;
+        for (bytes, 0..) |*b, i| {
+            const hi: u8 = if (i == 0 and pad == 1) 0 else hexValue(digits[2 * i - pad]);
+            b.* = hi << 4 | hexValue(digits[2 * i + 1 - pad]);
+        }
+        return bytes;
+    }
+
+    /// A bit-value literal reads as its unsigned integer: thinDB stores BIT
+    /// columns as BOOLEAN / BIGINT, the types these literals are written
+    /// for. Past BIGINT it is a `.big_integer`; past 64 bits, an error.
+    fn bitIntegerToken(self: *Lexer, start: usize, digits: []const u8) LexError!Token {
+        const text = self.src[start..self.pos];
+        const significant = std.mem.trimStart(u8, digits, "0");
+        if (significant.len > 64) return LexError.LexInvalidNumber;
+        const v: u64 = if (significant.len == 0) 0 else std.fmt.parseInt(u64, significant, 2) catch return LexError.LexInvalidNumber;
+        if (std.math.cast(i64, v)) |small| return Token{ .tag = .integer, .text = text, .value = .{ .integer = small } };
+        return Token{ .tag = .big_integer, .text = text, .value = .{ .big_integer = try std.fmt.allocPrint(self.arena, "{d}", .{v}) } };
+    }
+
+    /// The bytes of a bit-value literal read as a string (after a charset
+    /// introducer): the value left-padded to whole bytes.
+    fn bitBytes(self: *Lexer, digits: []const u8) LexError![]const u8 {
+        const bytes = try self.arena.alloc(u8, (digits.len + 7) / 8);
+        @memset(bytes, 0);
+        for (digits, 0..) |d, i| {
+            const bit = digits.len - 1 - i;
+            if (d == '1') bytes[bytes.len - 1 - bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
+        }
+        return bytes;
     }
 
     /// Consume an exponent (`e` or `E`, an optional sign, digits) when one
@@ -578,12 +727,42 @@ pub const Lexer = struct {
         }
         const text = self.src[start..self.pos];
         if (keywordFor(text)) |kw| return Token{ .tag = kw, .text = text };
+        if (text[0] == '_' and self.dialect != .postgres) {
+            if (charsetOf(text[1..])) |charset| {
+                if (try self.lexIntroducedLiteral(start, charset)) |tok| return tok;
+            }
+        }
         // Identifiers keep the case the client typed: MySQL/PG echo names
         // as-typed in result columns while COMPARING case-insensitively.
         // Every downstream match must therefore be case-insensitive
         // (columnNameEql / eqlIgnoreCase / lowercase-at-map-boundary) —
         // lowering here made grouped output labels silently lowercase.
         return Token{ .tag = .identifier, .text = text };
+    }
+
+    /// MySQL charset introducer `_utf8mb4'abc'`, `_binary X'41'`: the
+    /// literal that follows, read as a string. Null when no string, hex or
+    /// bit literal follows, so `_latin1` stays an ordinary name. Cursor is
+    /// just past the introducer.
+    fn lexIntroducedLiteral(self: *Lexer, start: usize, charset: Charset) LexError!?Token {
+        const after_name = self.pos;
+        try self.skipWhitespaceAndComments();
+        const c = self.peekChar(0) orelse 0;
+        const quote_follows = self.peekChar(1) == '\'';
+        const content: []const u8 = blk: {
+            if (c == '\'') break :blk (try self.lexString(start)).value.string;
+            if (c == '"' and self.dialect == .mysql) break :blk (try self.lexDoubleQuoted()).value.string;
+            if ((c == 'X' or c == 'x') and quote_follows) break :blk try self.scanHexQuoted();
+            if ((c == 'B' or c == 'b') and quote_follows) break :blk try self.bitBytes(try self.scanBitQuoted());
+            if (c == '0') {
+                if (try self.scanHexNumber()) |bytes| break :blk bytes;
+                if (try self.scanBitNumber()) |digits| break :blk try self.bitBytes(digits);
+            }
+            self.pos = after_name;
+            return null;
+        };
+        try charset.admit(content);
+        return Token{ .tag = .string, .text = self.src[start..self.pos], .value = .{ .string = content } };
     }
 
     /// PG dollar-quoted string: `$tag$ ... $tag$` (tag may be empty:
@@ -629,50 +808,30 @@ pub const Lexer = struct {
 
     fn lexAtVar(self: *Lexer) LexError!Token {
         self.pos += 1; // consume '@'
+        const system = self.pos < self.src.len and self.src[self.pos] == '@';
+        if (system) self.pos += 1;
         const name_start = self.pos;
         while (self.pos < self.src.len) : (self.pos += 1) {
             const c = self.src[self.pos];
-            if (!(std.ascii.isAlphanumeric(c) or c == '_')) break;
+            if (!(std.ascii.isAlphanumeric(c) or c == '_' or (system and c == '.'))) break;
         }
         const name = self.src[name_start..self.pos];
         if (name.len == 0) return LexError.LexUnexpectedChar;
-        return Token{ .tag = .at_identifier, .text = name };
+        return Token{ .tag = if (system) .system_variable else .at_identifier, .text = name };
     }
 
-    /// `"..."`. On MySQL this is a string literal (same as `'...'`); on
-    /// PG/neutral it is a delimited, case-preserving identifier. `""`
-    /// escapes an embedded double-quote in both modes.
+    /// `"..."`. On MySQL this is a string literal, backslash escapes and all,
+    /// the same as `'...'`; on PG/neutral it is a delimited, case-preserving
+    /// identifier. `""` escapes an embedded double-quote in both modes.
     fn lexDoubleQuoted(self: *Lexer) LexError!Token {
-        const as_string = self.dialect == .mysql;
         const start = self.pos;
-        self.pos += 1; // opening "
-        var contains_escape = false;
-        while (self.pos < self.src.len) : (self.pos += 1) {
-            if (self.src[self.pos] != '"') continue;
-            if (self.peekChar(1) == '"') {
-                contains_escape = true;
-                self.pos += 1; // skip first "; loop's += 1 skips the second
-                continue;
-            }
-            self.pos += 1; // closing "
-            const raw = self.src[start + 1 .. self.pos - 1];
-            const text = self.src[start..self.pos];
-            const content = if (!contains_escape) raw else blk: {
-                const buf = try self.arena.alloc(u8, raw.len);
-                var out: usize = 0;
-                var i: usize = 0;
-                while (i < raw.len) : (i += 1) {
-                    buf[out] = raw[i];
-                    out += 1;
-                    if (raw[i] == '"' and i + 1 < raw.len and raw[i + 1] == '"') i += 1;
-                }
-                break :blk buf[0..out];
-            };
-            if (as_string) return Token{ .tag = .string, .text = text, .value = .{ .string = content } };
-            if (content.len == 0) return LexError.LexUnexpectedChar;
-            return Token{ .tag = .identifier, .text = content, .quoted = true };
-        }
-        return if (as_string) LexError.LexUnterminatedString else LexError.LexUnterminatedIdentifier;
+        if (self.dialect == .mysql) return try self.joinAdjacentStrings(start, try self.scanQuotedContent('"', true));
+        const content = self.scanQuotedContent('"', false) catch |err| return switch (err) {
+            LexError.LexUnterminatedString => LexError.LexUnterminatedIdentifier,
+            else => err,
+        };
+        if (content.len == 0) return LexError.LexUnexpectedChar;
+        return Token{ .tag = .identifier, .text = content, .quoted = true };
     }
 
     fn lexBacktickIdent(self: *Lexer) LexError!Token {
@@ -692,6 +851,53 @@ pub const Lexer = struct {
         return LexError.LexUnterminatedIdentifier;
     }
 };
+
+fn hexValue(c: u8) u8 {
+    // Callers pass only bytes `std.ascii.isHex` accepted.
+    return std.fmt.charToDigit(c, 16) catch unreachable;
+}
+
+fn isBitDigit(c: u8) bool {
+    return c == '0' or c == '1';
+}
+
+/// How a charset introducer's literal maps onto thinDB's UTF-8 text, which
+/// stores the literal's bytes without transcoding.
+const Charset = enum {
+    /// UTF-8 is thinDB's own encoding; binary is raw bytes.
+    verbatim,
+    /// Agrees with UTF-8 on ASCII, so ASCII content reads the same.
+    ascii_compatible,
+    /// UCS-2 / UTF-16 / UTF-32: no byte reads the same as in UTF-8.
+    wide,
+
+    fn admit(self: Charset, bytes: []const u8) LexError!void {
+        switch (self) {
+            .verbatim => {},
+            .ascii_compatible => for (bytes) |b| {
+                if (b >= 0x80) return LexError.LexCharsetUnsupported;
+            },
+            .wide => return LexError.LexCharsetUnsupported,
+        }
+    }
+};
+
+/// MySQL 8.4's character sets, by introducer name.
+fn charsetOf(name: []const u8) ?Charset {
+    const verbatim = [_][]const u8{ "binary", "utf8", "utf8mb3", "utf8mb4" };
+    const wide = [_][]const u8{ "ucs2", "utf16", "utf16le", "utf32" };
+    const ascii_compatible = [_][]const u8{
+        "armscii8", "ascii",   "big5",   "cp1250", "cp1251",  "cp1256",   "cp1257",  "cp850",
+        "cp852",    "cp866",   "cp932",  "dec8",   "eucjpms", "euckr",    "gb18030", "gb2312",
+        "gbk",      "geostd8", "greek",  "hebrew", "hp8",     "keybcs2",  "koi8r",   "koi8u",
+        "latin1",   "latin2",  "latin5", "latin7", "macce",   "macroman", "sjis",    "swe7",
+        "tis620",   "ujis",
+    };
+    for (verbatim) |n| if (std.ascii.eqlIgnoreCase(name, n)) return .verbatim;
+    for (wide) |n| if (std.ascii.eqlIgnoreCase(name, n)) return .wide;
+    for (ascii_compatible) |n| if (std.ascii.eqlIgnoreCase(name, n)) return .ascii_compatible;
+    return null;
+}
 
 fn keywordFor(s: []const u8) ?TokenTag {
     // Tiny set; linear scan is fine. ASCII-case-insensitive compare.
@@ -796,6 +1002,30 @@ fn keywordFor(s: []const u8) ?TokenTag {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;
     }
     return null;
+}
+
+/// Whether `src` holds more than one statement: a `;` outside strings,
+/// quoted names and comments with another token after it. Text that fails
+/// to lex counts as one statement, left for the parser to reject.
+pub fn isMultiStatement(arena: Allocator, src: []const u8, dialect: types.Dialect) Allocator.Error!bool {
+    var lex = Lexer.init(arena, src);
+    lex.dialect = dialect;
+    var statement_seen = false;
+    var separated = false;
+    while (true) {
+        const tok = lex.next() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+        switch (tok.tag) {
+            .eof => return false,
+            .semicolon => separated = statement_seen,
+            else => {
+                if (separated) return true;
+                statement_seen = true;
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +1145,43 @@ test "lexer: MySQL processes backslash escapes, PG/neutral treat backslash liter
         var lx = Lexer.init(aa, "'it''s'");
         const s = try lx.next();
         try std.testing.expectEqualStrings("it's", s.value.string);
+    }
+}
+
+test "lexer: MySQL double-quoted strings escape like single-quoted ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cases = .{
+        .{ "\"a\\nb\"", "a\nb" },
+        .{ "\"say \\\"hi\\\"\"", "say \"hi\"" },
+        .{ "\"a\"\"b\"", "a\"b" },
+        .{ "\"it's\"", "it's" },
+        .{ "\"a''b\"", "a''b" },
+        .{ "\"\\1\"", "\\1" },
+    };
+    inline for (cases) |c| {
+        var lx = Lexer.init(aa, c[0]);
+        lx.dialect = .mysql;
+        const s = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .string), s.tag);
+        try std.testing.expectEqualStrings(c[1], s.value.string);
+        try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+    }
+    {
+        var lx = Lexer.init(aa, "\"a\\nb\"");
+        const s = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .identifier), s.tag);
+        try std.testing.expectEqualStrings("a\\nb", s.text);
+    }
+    {
+        var lx = Lexer.init(aa, "\"open");
+        try std.testing.expectError(LexError.LexUnterminatedIdentifier, lx.next());
+    }
+    {
+        var lx = Lexer.init(aa, "\"open");
+        lx.dialect = .mysql;
+        try std.testing.expectError(LexError.LexUnterminatedString, lx.next());
     }
 }
 
@@ -1149,4 +1416,185 @@ test "lexer: unterminated string errors cleanly" {
     defer arena.deinit();
     var lx = Lexer.init(arena.allocator(), "'open string");
     try std.testing.expectError(LexError.LexUnterminatedString, lx.next());
+}
+
+test "lexer: integers past BIGINT are big_integer tokens carrying their digits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "9223372036854775807 9223372036854775808 0018446744073709551616");
+    const max = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .integer), max.tag);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), max.value.integer);
+    const past = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .big_integer), past.tag);
+    try std.testing.expectEqualStrings("9223372036854775808", past.value.big_integer);
+    const padded = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .big_integer), padded.tag);
+    try std.testing.expectEqualStrings("18446744073709551616", padded.value.big_integer);
+    try std.testing.expectEqualStrings("0018446744073709551616", padded.text);
+}
+
+test "lexer: hex literals are byte strings on MySQL and neutral" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "X'41'", "A" },
+        .{ "x'4a4B'", "JK" },
+        .{ "X''", "" },
+        .{ "0x41", "A" },
+        .{ "0x123", "\x01\x23" },
+        .{ "0x0041", "\x00A" },
+    };
+    inline for (.{ types.Dialect.mysql, types.Dialect.neutral }) |dialect| {
+        inline for (cases) |c| {
+            var lx = Lexer.init(arena.allocator(), c[0]);
+            lx.dialect = dialect;
+            const tok = try lx.next();
+            try std.testing.expectEqual(@as(TokenTag, .string), tok.tag);
+            try std.testing.expectEqualStrings(c[1], tok.value.string);
+            try std.testing.expectEqualStrings(c[0], tok.text);
+            try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+        }
+    }
+    inline for (.{ "X'4'", "X'4G'", "0x41g", "X'41" }) |bad| {
+        var lx = Lexer.init(arena.allocator(), bad);
+        lx.dialect = .mysql;
+        try std.testing.expect(std.meta.isError(lx.next()));
+    }
+    // No hex digit after `0x`: the `0` stays a number, like `1e`.
+    var bare = Lexer.init(arena.allocator(), "0xyz");
+    bare.dialect = .mysql;
+    try std.testing.expectEqual(@as(TokenTag, .integer), (try bare.next()).tag);
+    try std.testing.expectEqual(@as(TokenTag, .identifier), (try bare.next()).tag);
+    // PostgreSQL keeps its own reading of `X'..'` and `0x..`.
+    var pg = Lexer.init(arena.allocator(), "X'41'");
+    pg.dialect = .postgres;
+    try std.testing.expectEqual(@as(TokenTag, .identifier), (try pg.next()).tag);
+}
+
+test "lexer: isMultiStatement counts statements, not semicolons" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "SELECT 1", false },
+        .{ "SELECT 1;", false },
+        .{ ";; SELECT 1 ;; -- done\n", false },
+        .{ "SELECT ';' AS s; /* ; */", false },
+        .{ "SELECT \"a;b\", `c;d`", false },
+        .{ "SELECT 'unterminated; SELECT 2", false },
+        .{ "SELECT 1;SELECT 2", true },
+        .{ "SET NAMES utf8mb4; INSERT INTO t VALUES (1)", true },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectEqual(c[1], try isMultiStatement(arena.allocator(), c[0], .mysql));
+    }
+}
+
+test "lexer: @@ names a system variable, scope included" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "@@session.sql_mode @@autocommit @v");
+    const scoped = try lx.next();
+    try std.testing.expectEqual(TokenTag.system_variable, scoped.tag);
+    try std.testing.expectEqualStrings("session.sql_mode", scoped.text);
+    const bare = try lx.next();
+    try std.testing.expectEqual(TokenTag.system_variable, bare.tag);
+    try std.testing.expectEqualStrings("autocommit", bare.text);
+    const user = try lx.next();
+    try std.testing.expectEqual(TokenTag.at_identifier, user.tag);
+    try std.testing.expectEqualStrings("v", user.text);
+}
+
+test "lexer: bit-value literals are integers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "b'101'", 5 },
+        .{ "B'0'", 0 },
+        .{ "b''", 0 },
+        .{ "0b101", 5 },
+        .{ "0b0111111111111111111111111111111111111111111111111111111111111111", std.math.maxInt(i64) },
+    };
+    inline for (cases) |c| {
+        var lx = Lexer.init(arena.allocator(), c[0]);
+        lx.dialect = .mysql;
+        const tok = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .integer), tok.tag);
+        try std.testing.expectEqual(@as(i64, c[1]), tok.value.integer);
+    }
+    var wide = Lexer.init(arena.allocator(), "b'1111111111111111111111111111111111111111111111111111111111111111'");
+    wide.dialect = .mysql;
+    const big = try wide.next();
+    try std.testing.expectEqual(@as(TokenTag, .big_integer), big.tag);
+    try std.testing.expectEqualStrings("18446744073709551615", big.value.big_integer);
+    inline for (.{ "b'102'", "0b102", "b'11111111111111111111111111111111111111111111111111111111111111111'" }) |bad| {
+        var lx = Lexer.init(arena.allocator(), bad);
+        lx.dialect = .mysql;
+        try std.testing.expectError(LexError.LexInvalidNumber, lx.next());
+    }
+}
+
+test "lexer: national strings and adjacent string concatenation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "N'abc'", "abc" },
+        .{ "'a' 'b'", "ab" },
+        .{ "'a'\n/* gap */ 'b' \"c\"", "abc" },
+        .{ "N'a' 'b'", "ab" },
+    };
+    inline for (cases) |c| {
+        var lx = Lexer.init(arena.allocator(), c[0]);
+        lx.dialect = .mysql;
+        const tok = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .string), tok.tag);
+        try std.testing.expectEqualStrings(c[1], tok.value.string);
+        try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+    }
+    // A string followed by a name keeps its own extent.
+    var alias = Lexer.init(arena.allocator(), "'a' x");
+    alias.dialect = .mysql;
+    try std.testing.expectEqualStrings("'a'", (try alias.next()).text);
+    inline for (.{ types.Dialect.postgres, types.Dialect.neutral }) |dialect| {
+        var lx = Lexer.init(arena.allocator(), "'a' 'b'");
+        lx.dialect = dialect;
+        try std.testing.expectEqualStrings("a", (try lx.next()).value.string);
+        try std.testing.expectEqualStrings("b", (try lx.next()).value.string);
+    }
+}
+
+test "lexer: charset introducers read the literal that follows as a string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "_utf8mb4'abc'", "abc" },
+        .{ "_UTF8MB4 'abc' 'd'", "abcd" },
+        .{ "_latin1'x'", "x" },
+        .{ "_binary X'41'", "A" },
+        .{ "_binary 0x4142", "AB" },
+        .{ "_utf8mb4 b'1000001'", "A" },
+        .{ "_binary b'0000000001000001'", "\x00A" },
+        .{ "_utf8mb4 \"q\"", "q" },
+    };
+    inline for (cases) |c| {
+        var lx = Lexer.init(arena.allocator(), c[0]);
+        lx.dialect = .mysql;
+        const tok = try lx.next();
+        try std.testing.expectEqual(@as(TokenTag, .string), tok.tag);
+        try std.testing.expectEqualStrings(c[1], tok.value.string);
+        try std.testing.expectEqualStrings(c[0], tok.text);
+        try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+    }
+    // Without a literal after it, or with an unknown charset, it is a name.
+    inline for (.{ "_latin1 + 1", "_foo'x'" }) |src| {
+        var lx = Lexer.init(arena.allocator(), src);
+        lx.dialect = .mysql;
+        try std.testing.expectEqual(@as(TokenTag, .identifier), (try lx.next()).tag);
+    }
+    // thinDB stores literal bytes as UTF-8 text without transcoding.
+    inline for (.{ "_latin1 X'E9'", "_utf16'ab'" }) |src| {
+        var lx = Lexer.init(arena.allocator(), src);
+        lx.dialect = .mysql;
+        try std.testing.expectError(LexError.LexCharsetUnsupported, lx.next());
+    }
 }
