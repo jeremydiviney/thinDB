@@ -222,6 +222,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // constant columns and the comparison keeps or drops every row.
     if (isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus or p.cur.tag == .tilde) {
         const lhs = try p.parseScalar();
+        if (exec_expr.hexLiteralBytes(lhs) != null and isComparisonToken(p.cur.tag) and p.cur.tag != .null_safe_eq) {
+            const op = try parseComparisonToken(p);
+            return try elementComparison(p, lhs, op, try p.parseScalar());
+        }
         const lhs_val = switch (leafOperand(lhs)) {
             .lit => |v| v,
             else => return try parseExprOps(p, lhs),
@@ -466,8 +470,9 @@ fn anchorColumn(p: anytype, e: ir.Expr) @TypeOf(p.*).Err![]const u8 {
 /// `a <=> b` (IS NOT DISTINCT FROM): equal, or both NULL. It is never
 /// UNKNOWN, so its negation keeps the rows where only one side is NULL.
 fn nullSafeEqual(p: anytype, lhs_expr: ir.Expr, rhs_expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
-    const lhs = leafOperand(lhs_expr);
-    const rhs = leafOperand(rhs_expr);
+    const operands = try hexResolved(p, lhs_expr, rhs_expr);
+    const lhs = leafOperand(operands[0]);
+    const rhs = leafOperand(operands[1]);
     if (lhs == .null_lit or rhs == .null_lit) {
         const other = if (lhs == .null_lit) rhs else lhs;
         return switch (other) {
@@ -587,6 +592,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         }
         var values: std.ArrayList(Value) = .empty;
         defer values.deinit(p.arena);
+        var hex_kids: std.ArrayList(PredicateExpr) = .empty;
         var saw_value = false;
         while (true) {
             // NULL literals are dropped from the set in both IN and NOT IN
@@ -594,6 +600,9 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
             // gives NULLs it drains; see thindb-not-in-nonstandard).
             if (p.cur.tag == .kw_null) {
                 try p.advance();
+                saw_value = true;
+            } else if (p.cur.isHexLiteral()) {
+                try hex_kids.append(p.arena, try makeComparisonExprPredicate(p, col_dup, .eq, try p.parseScalar()));
                 saw_value = true;
             } else {
                 const v = try p.parseValue();
@@ -608,16 +617,17 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         // Every entry was NULL: nothing can match IN (); the negated form
         // is vacuously true under the drop-NULLs dialect (negatePredicate
         // flips the .always).
-        if (values.items.len == 0) {
+        if (values.items.len == 0 and hex_kids.items.len == 0) {
             var pe: PredicateExpr = .{ .always = false };
             if (negate_predicate) pe = try negatePredicate(p, pe);
             return pe;
         }
 
-        const kids = try p.arena.alloc(PredicateExpr, values.items.len);
-        for (values.items, kids) |v, *kid| {
+        const kids = try p.arena.alloc(PredicateExpr, values.items.len + hex_kids.items.len);
+        for (values.items, kids[0..values.items.len]) |v, *kid| {
             kid.* = .{ .leaf = .{ .col = col_dup, .op = .eq, .val = v } };
         }
+        @memcpy(kids[values.items.len..], hex_kids.items);
         var pe: PredicateExpr = if (kids.len == 1) kids[0] else .{ .@"or" = kids };
         if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
@@ -723,7 +733,8 @@ fn makeScalarExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: i
     } };
 }
 
-fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const expr = if (exec_expr.hexLiteralBytes(rhs)) |bytes| try hexComparand(p, bytes, .{ .col_ref = col }) else rhs;
     return switch (leafOperand(expr)) {
         .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_dup } },
         .lit => |val| .{ .leaf = .{ .col = col, .op = op, .val = val } },
@@ -964,8 +975,9 @@ fn rowComparison(p: anytype, lhs: []const ir.Expr, op: PredicateOp, rhs: []const
 }
 
 fn elementComparison(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_operand: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
-    const lhs = leafOperand(lhs_operand);
-    const rhs = leafOperand(rhs_operand);
+    const operands = try hexResolved(p, lhs_operand, rhs_operand);
+    const lhs = leafOperand(operands[0]);
+    const rhs = leafOperand(operands[1]);
     if (lhs == .null_lit or rhs == .null_lit) return .unknown;
     if (lhs == .lit) switch (rhs) {
         .lit => |rhs_val| return try literalComparison(p, lhs.lit, op, rhs_val),
@@ -994,7 +1006,8 @@ fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr
     return try parseColOps(p, anchored);
 }
 
-pub fn makeExprComparisonPredicate(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+pub fn makeExprComparisonPredicate(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_operand: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const lhs, const rhs = try hexResolved(p, lhs_operand, rhs_operand);
     const lhs_col = switch (lhs) {
         .col_ref => |c| c,
         else => try p.materializePredicateExpr(lhs),
@@ -1128,6 +1141,40 @@ fn reverseOp(op: PredicateOp) PredicateOp {
 fn leafOperand(e: ir.Expr) ir.Expr {
     if (exec_expr.decimalLiteral(e) == null) return e;
     return .{ .lit = exec_expr.literalValue(e) orelse return e };
+}
+
+/// A hex literal compared with `other`, as MySQL compares one: as its
+/// integer against a number, as its bytes against anything else. A column's
+/// or expression's type is known only once the plan is built, so against one
+/// the literal becomes `__hex_literal_as(other, bytes)`, a computed operand
+/// that reads it then.
+fn hexComparand(p: anytype, bytes: []const u8, other: ir.Expr) @TypeOf(p.*).Err!ir.Expr {
+    const text: ir.Expr = .{ .lit = .{ .text = bytes } };
+    if (exec_expr.hexLiteralBytes(other) != null) return text;
+    switch (leafOperand(other)) {
+        .lit => |v| return if (isNumberValue(v)) .{ .lit = exec_expr.hexLiteralNumber(bytes) } else text,
+        .null_lit => return text,
+        else => {},
+    }
+    if (!p.predicateDerivedEnabled()) return text;
+    const operand = if (other == .col_ref) p.predicateOperandExpr(other.col_ref) else other;
+    return try exec_expr.hexLiteralAsExpr(p.arena, operand, bytes);
+}
+
+/// A comparison's operands with each hex literal read as the other side
+/// makes it read (`hexComparand`).
+fn hexResolved(p: anytype, lhs: ir.Expr, rhs: ir.Expr) @TypeOf(p.*).Err![2]ir.Expr {
+    return .{
+        if (exec_expr.hexLiteralBytes(lhs)) |bytes| try hexComparand(p, bytes, rhs) else lhs,
+        if (exec_expr.hexLiteralBytes(rhs)) |bytes| try hexComparand(p, bytes, lhs) else rhs,
+    };
+}
+
+fn isNumberValue(v: Value) bool {
+    return switch (v) {
+        .int, .bigint, .tinyint, .smallint, .largeint, .float, .double, .decimal64, .decimal128, .boolean => true,
+        .text, .date, .datetime, .uuid => false,
+    };
 }
 
 fn literalComparison(p: anytype, lhs: Value, op: PredicateOp, rhs: Value) @TypeOf(p.*).Err!PredicateExpr {

@@ -698,3 +698,18 @@ test "EXTRACT's clock units follow MySQL's day, hour and sign rules" {
     };
     inline for (cases) |c| try t.expectEqual(@as(i64, c[2]), clockUnitValue(c[0], clockFields(parseTime(c[1]).?)));
 }
+
+test "a number reads as a TIME by its HHMMSS digits, or a datetime's time of day" {
+    const S = common.ScaledInt;
+    const clock = (10 * 3600 + 5 * 60 + 3) * US_PER_S;
+    const cases = .{
+        .{ S{ .m = 100503, .s = 0 }, @as(?i64, clock) },
+        .{ S{ .m = -1005035, .s = 1 }, @as(?i64, -(clock + 500_000)) },
+        .{ S{ .m = 106000, .s = 0 }, @as(?i64, null) },
+        .{ S{ .m = 8390000, .s = 0 }, @as(?i64, null) },
+        .{ S{ .m = 20260926100503, .s = 0 }, @as(?i64, clock) },
+        .{ S{ .m = 20260230100503, .s = 0 }, @as(?i64, null) },
+        .{ S{ .m = 599999999, .s = 7 }, @as(?i64, 60 * US_PER_S) },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c[1], numberTime(c[0]));
+}

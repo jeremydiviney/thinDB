@@ -361,6 +361,35 @@ test "parseDateTimeString: fractions, date-only, Z, rejects" {
     try std.testing.expectError(error.Invalid, parseDateTimeString("1783663005455833"));
 }
 
+test "a date's day must exist in its month, as MySQL judges it" {
+    const cases = .{
+        .{ "2026-02-28", true },
+        .{ "2026-02-29", false },
+        .{ "2026-02-30", false },
+        .{ "2026-04-31", false },
+        .{ "2026-12-31", true },
+        .{ "2024-02-29", true },
+        .{ "2000-02-29", true },
+        .{ "1900-02-29", false },
+        .{ "0000-02-29", false },
+        .{ "2026-13-01", false },
+        .{ "2026-00-10", false },
+        .{ "2026-01-00", false },
+    };
+    inline for (cases) |c| {
+        const valid = if (parseDateString(c[0])) |_| true else |_| false;
+        try std.testing.expectEqual(c[1], valid);
+    }
+    try std.testing.expectError(error.Invalid, parseDateTimeString("2026-02-30 10:00:00"));
+}
+
+test "a date or datetime as MySQL's YYYYMMDD[HHMMSS] number" {
+    try std.testing.expectEqual(@as(i64, 20260927), dateNumber(try parseDateString("2026-09-27")));
+    try std.testing.expectEqual(@as(i64, 19691231), dateNumber(-1));
+    try std.testing.expectEqual(ScaledInt{ .m = 20260927123456500000, .s = 6 }, datetimeNumber(try parseDateTimeString("2026-09-27 12:34:56.5")));
+    try std.testing.expectEqual(ScaledInt{ .m = 19691231235959250000, .s = 6 }, datetimeNumber(try parseDateTimeString("1969-12-31 23:59:59.25")));
+}
+
 pub const Ymd = struct { y: i32, m: u32, d: u32 };
 
 pub fn civilFromDays(days_since_epoch: i64) Ymd {

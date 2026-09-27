@@ -3150,6 +3150,11 @@ pub const Parser = struct {
                 return try bigIntegerLiteral(self.arena, digits);
             },
             .integer, .string, .kw_true, .kw_false => {
+                if (self.cur.isHexLiteral()) {
+                    const bytes = self.cur.value.string;
+                    try self.advance();
+                    return try exec_expr.hexLiteralExpr(self.arena, bytes);
+                }
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
             },
@@ -3260,6 +3265,16 @@ pub const Parser = struct {
             .null_lit => return try self.arena.dupe(u8, "NULL"),
             .call => |c| {
                 if (exec_expr.decimalLiteral(e)) |d| return try self.arena.dupe(u8, d.digits);
+                if (exec_expr.hexLiteralBytes(e)) |bytes| {
+                    const name = try self.arena.alloc(u8, 2 + 2 * bytes.len);
+                    name[0] = '0';
+                    name[1] = 'x';
+                    for (bytes, 0..) |b, i| {
+                        name[2 + 2 * i] = std.fmt.hex_charset[b >> 4];
+                        name[3 + 2 * i] = std.fmt.hex_charset[b & 0xf];
+                    }
+                    return name;
+                }
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.arena);
                 try buf.appendSlice(self.arena, c.fn_name);
@@ -6148,6 +6163,17 @@ pub const Parser = struct {
 
     pub fn predicateDerivedEnabled(self: *const Parser) bool {
         return self.predicate_derived_enabled;
+    }
+
+    /// The expression a predicate operand named `name` stands for: a
+    /// computed operand's own expression (`materializePredicateExpr`), since
+    /// operands computed side by side can't read one another, or else the
+    /// column itself.
+    pub fn predicateOperandExpr(self: *const Parser, name: []const u8) ir.Expr {
+        for (self.predicate_derived.items[self.predicate_derived_scope..]) |d| {
+            if (std.mem.eql(u8, d.name, name)) return d.expr;
+        }
+        return .{ .col_ref = name };
     }
 
     // -----------------------------------------------------------------------

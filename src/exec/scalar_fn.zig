@@ -136,6 +136,7 @@ pub fn resolveWithRegistry(
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveOrderKey(aa, name, arg_types)) |ov| return ov;
+    if (try resolveHexLiteralAs(aa, name, arg_types)) |ov| return ov;
 
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
@@ -564,6 +565,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
+    if (std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
     if (std.ascii.eqlIgnoreCase(name, "format")) return true;
@@ -673,6 +675,47 @@ fn resolveOrderKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?R
     else
         return null;
     return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
+}
+
+/// `expr.HEX_LITERAL_AS_FN`: the literal's integer when the first argument
+/// is a number, else its bytes.
+fn resolveHexLiteralAs(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (!std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN)) return null;
+    if (arg_types.len != 2 or !arg_types[1].isString()) return null;
+    const out: Type = if (numericLike(arg_types[0])) .largeint else .string;
+    return try buildDecFn(aa, name, arg_types, out, hexLiteralAsKernel, .propagates);
+}
+
+fn hexLiteralAsKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    const bytes = common.stringViewOf(args[1]);
+    if (out_type == .largeint) {
+        for (0..row_count) |row| try out.data.largeint.append(allocator, expr_mod.hexNumber(bytes.rowBytes(row)));
+        return;
+    }
+    const text = common.stringStoreOf(out);
+    for (0..row_count) |row| try text.appendValue(allocator, bytes.rowBytes(row));
+}
+
+/// Whether argument `i` of an `arity`-argument `name` call reads a number,
+/// so a hex literal there is its integer (`0x41 + 0`, `ABS(0x41)`,
+/// `CAST(0x41 AS SIGNED)`) rather than its bytes (`CONCAT(0x41, 1)`,
+/// `LENGTH(0x41)`), as in MySQL. A numeric cast reads a number; an argument
+/// the call returns (COALESCE, IF's branches) keeps its bytes, as does one
+/// any overload takes as text.
+pub fn readsNumberAt(registry: ?*const udf_mod.UdfRegistry, name: []const u8, arity: usize, i: usize) bool {
+    if (intCastTarget(name) != null or std.mem.startsWith(u8, name, "to_decimal")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float")) return true;
+    if (resultValueArgsStart(name)) |start| if (i >= start) return false;
+    for (builtins) |f| {
+        if (!std.ascii.eqlIgnoreCase(f.name, name) or !scalarArityMatches(f, arity)) continue;
+        if (scalarDeclaredTypeAt(f, i).isString()) return false;
+    }
+    if (registry) |reg| for (reg.scalarEntries()) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.name, name) or entry.arg_types.len != arity) continue;
+        if (entry.arg_types[i].isString()) return false;
+    };
+    return true;
 }
 
 fn textKeyTarget(spec: []const u8) ?Type {
@@ -1153,6 +1196,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_string", .arg_types = &.{.string}, .return_type = .string, .kernel = string.stringIdentityKernel },
     .{ .name = "to_string", .arg_types = &.{.{ .varchar = 0 }}, .return_type = .string, .kernel = string.stringIdentityKernel },
     .{ .name = "to_string", .arg_types = &.{.{ .char = 0 }}, .return_type = .string, .kernel = string.stringIdentityKernel },
+    .{ .name = expr_mod.HEX_LITERAL_FN, .arg_types = &.{.string}, .return_type = .string, .kernel = string.stringIdentityKernel },
     .{ .name = "to_bigint", .arg_types = &.{.int}, .return_type = .bigint, .kernel = math.intToBigintKernel },
     .{ .name = "to_double", .arg_types = &.{.int}, .return_type = .double, .kernel = math.intToDoubleKernel },
     .{ .name = "to_double", .arg_types = &.{.bigint}, .return_type = .double, .kernel = math.bigintToDoubleKernel },

@@ -334,3 +334,21 @@ test "scalar_fn: a double truncates into an integer type, NULL past its range" {
     try std.testing.expectEqual(@as(?i8, null), truncatedInt(i8, std.math.nan(f64)));
     try std.testing.expectEqual(@as(?i128, null), truncatedInt(i128, std.math.inf(f64)));
 }
+
+test "scalar_fn: a hex literal reads as a number where the call reads one" {
+    const cases = .{
+        .{ "add", 2, 0, true },
+        .{ "abs", 1, 0, true },
+        .{ "to_bigint", 1, 0, true },
+        .{ "to_double", 1, 0, true },
+        .{ "to_decimal:5:1", 1, 0, true },
+        .{ "concat", 2, 1, false },
+        .{ "length", 1, 0, false },
+        .{ "hex", 1, 0, false },
+        .{ "to_string", 1, 0, false },
+        .{ "coalesce", 2, 0, false },
+        .{ "if", 3, 1, false },
+        .{ "greatest", 2, 1, false },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c[3], scalar_fn.readsNumberAt(null, c[0], c[1], c[2]));
+}

@@ -201,6 +201,14 @@ pub const Token = struct {
     /// A backquoted or double-quoted identifier: never a keyword, even when
     /// spelled like one of the contextual clause words (`INDEX`, `UNIQUE`).
     quoted: bool = false,
+
+    /// A MySQL hex literal (`0x41`, `X'41'`): a `.string` of the bytes its
+    /// digits spell, which a numeric context reads as an integer instead.
+    pub fn isHexLiteral(self: Token) bool {
+        if (self.tag != .string or self.text.len < 2) return false;
+        return (self.text[0] == '0' and self.text[1] == 'x') or
+            ((self.text[0] == 'x' or self.text[0] == 'X') and self.text[1] == '\'');
+    }
 };
 
 pub const LexError = error{
@@ -1424,8 +1432,14 @@ test "lexer: hex literals are byte strings on MySQL and neutral" {
             try std.testing.expectEqual(@as(TokenTag, .string), tok.tag);
             try std.testing.expectEqualStrings(c[1], tok.value.string);
             try std.testing.expectEqualStrings(c[0], tok.text);
+            try std.testing.expect(tok.isHexLiteral());
             try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
         }
+    }
+    inline for (.{ "'A'", "N'41'", "'0x41'" }) |text| {
+        var lx = Lexer.init(arena.allocator(), text);
+        lx.dialect = .mysql;
+        try std.testing.expect(!(try lx.next()).isHexLiteral());
     }
     inline for (.{ "X'4'", "X'4G'", "0x41g", "X'41" }) |bad| {
         var lx = Lexer.init(arena.allocator(), bad);

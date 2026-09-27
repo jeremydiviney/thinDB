@@ -1556,6 +1556,23 @@ test "NDV chains through deterministic functions (pigeonhole, never grows)" {
     try std.testing.expectEqual(exec.ColCard.unknown, derivedColStat(o, &up_stats).ndv);
 }
 
+test "arithmetic over a date carries no min/max, since it reads the date's YYYYMMDD number" {
+    const up_schema = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "n", .type = .int },
+    };
+    const date_plus_one = [_]Expr{ .{ .col_ref = "d" }, .{ .lit = .{ .int = 1 } } };
+    const unary = classifyExpr(.{ .call = .{ .fn_name = "add", .args = &date_plus_one } }, &up_schema);
+    try std.testing.expect(unary == .unary);
+    try std.testing.expect(unary.unary.affine == null);
+    const date_plus_int = [_]Expr{ .{ .col_ref = "d" }, .{ .col_ref = "n" } };
+    const binary = classifyExpr(.{ .call = .{ .fn_name = "add", .args = &date_plus_int } }, &up_schema);
+    try std.testing.expect(binary == .binary);
+    try std.testing.expect(binary.binary.op == null);
+    const int_plus_one = [_]Expr{ .{ .col_ref = "n" }, .{ .lit = .{ .int = 1 } } };
+    try std.testing.expect(classifyExpr(.{ .call = .{ .fn_name = "add", .args = &int_plus_one } }, &up_schema).unary.affine != null);
+}
+
 /// Checked i128 add — null on overflow so a derived bound is never wrong.
 fn addChecked(a: i128, b: i128) ?i128 {
     return std.math.add(i128, a, b) catch null;
@@ -2025,6 +2042,7 @@ fn buildCallPlan(
         .call => |x| x,
         else => return Error.ComputeUnsupportedExpr,
     };
+    if (try hexNumbersRead(aa, udf_registry, c)) |rewritten| return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
 
     const arg_plans = try aa.alloc(ArgPlan, c.args.len);
     const arg_types = try aa.alloc(Type, c.args.len);
@@ -2162,6 +2180,20 @@ fn buildCallPlan(
         .arg_reach = argReach(func),
     };
     return plan;
+}
+
+/// The call with each hex literal it reads as a number replaced by that
+/// integer (`scalar_fn.readsNumberAt`), or null when it reads none so.
+fn hexNumbersRead(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr.Call) Allocator.Error!?Expr {
+    var args: ?[]Expr = null;
+    for (c.args, 0..) |arg, i| {
+        const bytes = expr_mod.hexLiteralBytes(arg) orelse continue;
+        if (!scalar_fn.readsNumberAt(udf_registry, c.fn_name, c.args.len, i)) continue;
+        const out = args orelse try aa.dupe(Expr, c.args);
+        out[i] = .{ .lit = expr_mod.hexLiteralNumber(bytes) };
+        args = out;
+    }
+    return if (args) |a| Expr{ .call = .{ .fn_name = c.fn_name, .args = a } } else null;
 }
 
 /// A call no overload accepts as written, with its arguments converted so
