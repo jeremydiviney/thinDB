@@ -2983,7 +2983,8 @@ fn compileDeleteFromSource(ctx: *CompileCtx, d: ir.DeleteOp) anyerror!Query {
 /// the types differ: the memtable matches decimal columns on tag alone, so a
 /// payload at another scale would be stored misread. Text parses into a DATE
 /// or DATETIME target. An integer, float or boolean target converts batch by
-/// batch by the assignment rule instead (`exec_cast.assignColumn`). Other
+/// batch by the assignment rule instead (`exec_cast.assignColumn`), as does
+/// a number, DATE or DATETIME into a text target. Other
 /// targets widen along the implicit-cast ladder short of its lossy steps;
 /// the memtable admits or rejects the rest.
 fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?exec.Expr {
@@ -3602,9 +3603,12 @@ pub const InsertColumnBuilder = struct {
             .decimal128 => |spec| self.writeFixedInt(col_idx, i128, try coerceToDecimal128(v, spec)),
             .uuid => self.writeFixedInt(col_idx, u128, try coerceToUuid(v)),
             .varchar, .string, .char, .json => {
-                const s = try coerceToText(v);
                 const sb = &self.string_bytes[col_idx];
-                try sb.appendSlice(self.allocator, s);
+                if (col.type == .json) {
+                    try sb.appendSlice(self.allocator, try coerceToJsonText(v));
+                } else {
+                    try exec_cast.appendAssignedText(self.allocator, sb, v);
+                }
                 try self.string_offsets[col_idx].append(self.allocator, @intCast(sb.items.len));
             },
         }
@@ -3662,7 +3666,7 @@ pub const InsertColumnBuilder = struct {
     }
 };
 
-fn coerceToText(v: Value) ![]const u8 {
+fn coerceToJsonText(v: Value) ![]const u8 {
     return switch (v) {
         .text => |s| s,
         else => Error.TypeMismatch,
