@@ -57,7 +57,8 @@ const ColumnStore = engine.ColumnStore;
 const transform = @import("../engine/transform.zig");
 const Derived = @import("compute.zig").Derived;
 const core_scheduler = @import("../util/core_scheduler.zig");
-const Expr = @import("expr.zig").Expr;
+const expr_mod = @import("expr.zig");
+const Expr = expr_mod.Expr;
 const ChunkRangeScan = @import("mat_stage.zig").ChunkRangeScan;
 const Stage = @import("mat_stage.zig").Stage;
 const MaterializedResult = @import("mat_stage.zig").MaterializedResult;
@@ -2478,8 +2479,11 @@ fn exprHasCase(e: Expr) bool {
 /// Row-locality check for a CASE expression: every branch condition,
 /// every THEN, and the ELSE must reference only upstream scan columns.
 fn caseFusable(c: Expr.Case, scan_cols: []const Column) bool {
+    for (c.operands) |o| {
+        if (!exprFusable(o.expr, scan_cols)) return false;
+    }
     for (c.branches) |b| {
-        if (!predFusable(b.cond, scan_cols)) return false;
+        if (!predFusable(b.cond, scan_cols, c.operands)) return false;
         if (!exprFusable(b.then, scan_cols)) return false;
     }
     if (c.else_branch) |e| {
@@ -2491,24 +2495,29 @@ fn caseFusable(c: Expr.Case, scan_cols: []const Column) bool {
 /// Row-locality check for a predicate used inside a CASE branch condition.
 /// Opaque/unresolved variants (subqueries, correlated forms, var refs) touch
 /// query-wide state and are never fusable.
-fn predFusable(p: predicate.PredicateExpr, scan_cols: []const Column) bool {
+/// A CASE's own operands (`locals`) are row-local once their expressions are.
+fn predFusable(p: predicate.PredicateExpr, scan_cols: []const Column, locals: []const Expr.Operand) bool {
     return switch (p) {
-        .leaf, .day_leaf, .text_as_number => |l| types.findColumn(scan_cols, l.col) != null,
-        .leaf_col_col => |c| types.findColumn(scan_cols, c.left) != null and
-            types.findColumn(scan_cols, c.right) != null,
-        .is_null, .is_not_null => |name| types.findColumn(scan_cols, name) != null,
-        .like => |l| types.findColumn(scan_cols, l.col) != null,
-        .in_set, .text_as_number_set => |s| types.findColumn(scan_cols, s.col) != null,
+        .leaf, .day_leaf, .text_as_number => |l| readable(scan_cols, locals, l.col),
+        .leaf_col_col => |c| readable(scan_cols, locals, c.left) and
+            readable(scan_cols, locals, c.right),
+        .is_null, .is_not_null => |name| readable(scan_cols, locals, name),
+        .like => |l| readable(scan_cols, locals, l.col),
+        .in_set, .text_as_number_set => |s| readable(scan_cols, locals, s.col),
         .@"and", .@"or" => |arms| blk: {
             for (arms) |a| {
-                if (!predFusable(a, scan_cols)) break :blk false;
+                if (!predFusable(a, scan_cols, locals)) break :blk false;
             }
             break :blk true;
         },
-        .not => |n| predFusable(n.*, scan_cols),
+        .not => |n| predFusable(n.*, scan_cols, locals),
         .always, .unknown => true,
         else => false,
     };
+}
+
+fn readable(scan_cols: []const Column, locals: []const Expr.Operand, name: []const u8) bool {
+    return types.findColumn(scan_cols, name) != null or expr_mod.operandListed(locals, name);
 }
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;

@@ -46,6 +46,7 @@ const types = @import("../types.zig");
 const Value = types.Value;
 const exec_expr = @import("../exec/expr.zig");
 const exec_predicate = @import("../exec/predicate.zig");
+const exec_compute = @import("../exec/compute.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const datefmt = @import("../exec/scalar_fn_datefmt.zig");
 const date_text = @import("../exec/scalar_fn_common.zig");
@@ -644,6 +645,21 @@ const QualifiedJoinCol = struct {
     name: []const u8,
 };
 
+/// Where a condition's computed operand lands while a CASE is parsed. One
+/// that every row of the anchoring scope reads — in the first WHEN of a CASE
+/// every row reaches — anchors ahead of the CASE like any other, shared
+/// with the rest of the scope. Any other is the CASE's own
+/// (`Expr.Case.operands`), computed over only the rows still open at the
+/// WHEN that reads it.
+const CaseScope = struct {
+    open: bool = false,
+    /// Where the innermost open CASE's operands start in `case_operands`.
+    operand_mark: usize = 0,
+    /// Whether the expression being parsed is evaluated on every row its
+    /// anchoring scope sees.
+    reaches_every_row: bool = true,
+};
+
 pub const Parser = struct {
     /// Exported so `parse_window.zig` (which takes the parser via `anytype`
     /// to avoid a circular import) can name our error set via
@@ -692,6 +708,10 @@ pub const Parser = struct {
     /// (a SELECT list or a WHERE); anchors dedupe only within it, since
     /// every scope lands in its own Compute.
     predicate_derived_scope: usize = 0,
+    /// Computed condition operands the CASEs being parsed own
+    /// (`Expr.Case.operands`), the innermost CASE's last.
+    case_operands: std.ArrayList(ir.Expr.Operand) = .empty,
+    case_scope: CaseScope = .{},
     aggregate_expr_refs: std.ArrayList(AggExprRef) = .empty,
     aggregate_expr_counter: usize = 0,
     aggregate_expr_refs_enabled: bool = false,
@@ -868,6 +888,10 @@ pub const Parser = struct {
     pub fn parseStatement(self: *Parser) ParseError!*ir.Op {
         const union_arm = self.union_arm;
         self.union_arm = false;
+        // A subquery inside a CASE anchors its own operands.
+        const outer_case = self.case_scope;
+        self.case_scope = .{ .operand_mark = self.case_operands.items.len };
+        defer self.case_scope = outer_case;
         // DDL / SHOW / INSERT are leading-keyword forms that don't combine
         // with WITH. They have no projection / FROM / WHERE / etc.;
         // dispatch before the SELECT-only path.
@@ -2290,7 +2314,10 @@ pub const Parser = struct {
 
     fn parseIfCallAfterName(self: *Parser) ParseError!ir.Expr {
         try self.expect(.lparen);
+        const outer = self.openCase();
+        errdefer self.abandonCase(outer);
         const cond = try self.parseBoolExpr();
+        self.case_scope.reaches_every_row = false;
         try self.expect(.comma);
         const then_expr = try self.parseCallArg();
         try self.expect(.comma);
@@ -2300,7 +2327,7 @@ pub const Parser = struct {
 
         const branches = try self.arena.alloc(ir.Expr.Branch, 1);
         branches[0] = .{ .cond = cond, .then = then_expr };
-        return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_expr } };
+        return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_expr, .operands = try self.closeCase(outer) } };
     }
 
     /// Whether the value starting at `cur` is a predicate: it opens with NOT
@@ -2342,43 +2369,50 @@ pub const Parser = struct {
     }
 
     fn parsePredicateValue(self: *Parser) ParseError!ir.Expr {
-        return try self.predicateAsValue(try self.parseBoolExpr());
+        const outer = self.openCase();
+        errdefer self.abandonCase(outer);
+        const pred = try self.parseBoolExpr();
+        return try self.predicateAsValue(pred, outer);
     }
 
     /// A predicate read as a value: TRUE, FALSE, or NULL where it is unknown.
-    pub fn predicateAsValue(self: *Parser, pred: PredicateExpr) ParseError!ir.Expr {
+    /// It closes the CASE operand scope `pred` was parsed in (`openCase`).
+    fn predicateAsValue(self: *Parser, pred: PredicateExpr, outer: CaseScope) ParseError!ir.Expr {
         const never_unknown = switch (pred) {
             .exists_subquery, .always, .is_null, .is_not_null => true,
             .not => |child| child.* == .exists_subquery,
             else => false,
         };
-        if (never_unknown) return try self.knownPredicateValue(pred);
+        if (never_unknown) return try self.knownPredicateValue(pred, outer);
         const true_lit: ir.Expr = .{ .lit = .{ .boolean = true } };
         const false_lit: ir.Expr = .{ .lit = .{ .boolean = false } };
         const branches = try self.arena.alloc(ir.Expr.Branch, 2);
         branches[0] = .{ .cond = pred, .then = true_lit };
         branches[1] = .{ .cond = try parse_predicate.negatePredicate(self, pred), .then = false_lit };
-        return ir.Expr{ .case = .{ .branches = branches, .else_branch = null } };
+        return ir.Expr{ .case = .{ .branches = branches, .else_branch = null, .operands = try self.closeCase(outer) } };
     }
 
-    /// A predicate that is never unknown, read as TRUE or FALSE.
-    fn knownPredicateValue(self: *Parser, pred: PredicateExpr) ParseError!ir.Expr {
+    /// A predicate that is never unknown, read as TRUE or FALSE. It closes
+    /// the CASE operand scope `pred` was parsed in (`openCase`).
+    fn knownPredicateValue(self: *Parser, pred: PredicateExpr, outer: CaseScope) ParseError!ir.Expr {
         const branches = try self.arena.alloc(ir.Expr.Branch, 1);
         branches[0] = .{ .cond = pred, .then = .{ .lit = .{ .boolean = true } } };
         const else_branch = try self.arena.create(ir.Expr);
         else_branch.* = .{ .lit = .{ .boolean = false } };
-        return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
+        return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = try self.closeCase(outer) } };
     }
 
     /// MySQL's `ISNULL(x)`: `x IS NULL` as a value.
     fn isNullValue(self: *Parser, arg: ir.Expr) ParseError!ir.Expr {
+        const outer = self.openCase();
+        errdefer self.abandonCase(outer);
         const pred: PredicateExpr = switch (arg) {
             .null_lit => .{ .always = true },
             .lit => .{ .always = false },
             .col_ref => |c| .{ .is_null = c },
             else => .{ .is_null = try self.materializePredicateExpr(arg) },
         };
-        return try self.knownPredicateValue(pred);
+        return try self.knownPredicateValue(pred, outer);
     }
 
     fn normalizeScalarCallArgs(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError![]const ir.Expr {
@@ -2659,7 +2693,10 @@ pub const Parser = struct {
             try self.advance();
             try args.append(self.arena, ir.Expr{ .col_ref = "*" });
         } else if (self.cur.tag != .rparen) {
+            const reaches_every_row = self.case_scope.reaches_every_row;
+            defer self.case_scope.reaches_every_row = reaches_every_row;
             while (true) {
+                if (!exec_compute.callReadsArgOnEveryRow(name, args.items.len)) self.case_scope.reaches_every_row = false;
                 const a = try self.parseValueExpr();
                 try args.append(self.arena, a);
                 if (self.cur.tag != .comma) break;
@@ -3172,6 +3209,8 @@ pub const Parser = struct {
     /// rewrite to searched form (`CASE WHEN col = v THEN ...`).
     fn parseCaseExpr(self: *Parser) ParseError!ir.Expr {
         try self.expect(.kw_case);
+        const outer = self.openCase();
+        errdefer self.abandonCase(outer);
         // Simple CASE (`CASE x WHEN v THEN ...`): each branch tests `x = v`,
         // so a NULL operand takes no WHEN.
         const operand: ?ir.Expr = if (self.cur.tag == .kw_when) null else try self.parseCallArg();
@@ -3186,6 +3225,8 @@ pub const Parser = struct {
                 try parse_predicate.makeExprComparisonPredicate(self, x, .eq, try self.parseCallArg())
             else
                 try self.parseBoolExpr();
+            // Past the first WHEN, a row reaches only what no earlier WHEN took.
+            self.case_scope.reaches_every_row = false;
             if (self.cur.tag != .kw_then) return ParseError.SqlExpectedKeyword;
             try self.advance();
             const then_expr = try self.parseCallArg();
@@ -3204,7 +3245,7 @@ pub const Parser = struct {
         try self.advance();
 
         const branches_owned = try branches.toOwnedSlice(self.arena);
-        return ir.Expr{ .case = .{ .branches = branches_owned, .else_branch = else_branch } };
+        return ir.Expr{ .case = .{ .branches = branches_owned, .else_branch = else_branch, .operands = try self.closeCase(outer) } };
     }
 
     /// Leaf of the expr sub-language. Same shape as the original
@@ -4881,8 +4922,12 @@ pub const Parser = struct {
             .lit, .null_lit, .var_ref, .scalar_subquery, .exists_subquery => {},
             .call => |c| for (c.args) |arg| try self.checkResidualExpr(arg, scope, derived),
             .case => |cs| {
+                for (cs.operands) |o| try self.checkResidualExpr(o.expr, scope, derived);
+                var names: std.ArrayListUnmanaged([]const u8) = .empty;
                 for (cs.branches) |br| {
-                    try self.checkResidualPredicate(br.cond, scope, derived);
+                    names.clearRetainingCapacity();
+                    try exec_expr.collectCaseConditionRefs(self.arena, &names, cs, br.cond);
+                    for (names.items) |name| try self.checkResidualColumn(name, scope, derived);
                     try self.checkResidualExpr(br.then, scope, derived);
                 }
                 if (cs.else_branch) |eb| try self.checkResidualExpr(eb.*, scope, derived);
@@ -6467,7 +6512,9 @@ pub const Parser = struct {
                     rewritten.* = try self.rewriteGroupingCalls(eb.*, keys, calls);
                     else_branch = rewritten;
                 }
-                return .{ .case = .{ .branches = branches, .else_branch = else_branch } };
+                const operands = try self.arena.alloc(ir.Expr.Operand, c.operands.len);
+                for (c.operands, operands) |o, *dst| dst.* = .{ .name = o.name, .expr = try self.rewriteGroupingCalls(o.expr, keys, calls) };
+                return .{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = operands } };
             },
             else => return e,
         }
@@ -6779,6 +6826,7 @@ pub const Parser = struct {
 
     pub fn materializePredicateExpr(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
         if (!self.predicate_derived_enabled) return ParseError.SqlInvalidProjection;
+        if (self.case_scope.open and !self.case_scope.reaches_every_row) return try self.caseOperand(expr);
         // The same expression anchored again in this scope (generated SQL
         // repeats one CASE per derived flag) reads the column it already has.
         if (self.exprShareable(expr)) {
@@ -6790,6 +6838,48 @@ pub const Parser = struct {
         self.predicate_derived_counter += 1;
         try self.predicate_derived.append(self.arena, .{ .name = name, .expr = expr });
         return name;
+    }
+
+    /// A computed operand of the innermost open CASE's condition. One the
+    /// scope already anchors reads that anchor, which every row computes.
+    fn caseOperand(self: *Parser, expr: ir.Expr) ParseError![]const u8 {
+        const own = self.case_operands.items[self.case_scope.operand_mark..];
+        if (self.exprShareable(expr)) {
+            for (self.predicate_derived.items[self.predicate_derived_scope..]) |d| {
+                if (exec_expr.eql(d.expr, expr)) return d.name;
+            }
+            for (own) |o| if (exec_expr.eql(o.expr, expr)) return o.name;
+        }
+        const name = try exec_expr.caseOperandName(self.arena, own.len);
+        try self.case_operands.append(self.arena, .{ .name = name, .expr = expr });
+        return name;
+    }
+
+    /// Opens a CASE's operand scope, the CASE reached by the rows the
+    /// expression around it reaches; the caller restores the returned scope
+    /// once the CASE is built.
+    fn openCase(self: *Parser) CaseScope {
+        const outer = self.case_scope;
+        self.case_scope = .{
+            .open = true,
+            .operand_mark = self.case_operands.items.len,
+            .reaches_every_row = outer.reaches_every_row,
+        };
+        return outer;
+    }
+
+    /// Closes the innermost CASE's operand scope, handing back its operands.
+    fn closeCase(self: *Parser, outer: CaseScope) ParseError![]const ir.Expr.Operand {
+        const operands = try self.arena.dupe(ir.Expr.Operand, self.case_operands.items[self.case_scope.operand_mark..]);
+        self.case_operands.shrinkRetainingCapacity(self.case_scope.operand_mark);
+        self.case_scope = outer;
+        return operands;
+    }
+
+    /// Drops an unfinished CASE's operands after a parse error.
+    fn abandonCase(self: *Parser, outer: CaseScope) void {
+        self.case_operands.shrinkRetainingCapacity(self.case_scope.operand_mark);
+        self.case_scope = outer;
     }
 
     /// Whether two textual copies of `e` may evaluate once: not when a
@@ -6804,6 +6894,7 @@ pub const Parser = struct {
                 break :blk true;
             },
             .case => |cs| blk: {
+                for (cs.operands) |o| if (!self.exprShareable(o.expr)) break :blk false;
                 for (cs.branches) |br| if (!self.exprShareable(br.then)) break :blk false;
                 if (cs.else_branch) |eb| if (!self.exprShareable(eb.*)) break :blk false;
                 break :blk true;
@@ -6834,6 +6925,9 @@ pub const Parser = struct {
     /// operands computed side by side can't read one another, or else the
     /// column itself.
     pub fn predicateOperandExpr(self: *const Parser, name: []const u8) ir.Expr {
+        if (self.case_scope.open) for (self.case_operands.items[self.case_scope.operand_mark..]) |o| {
+            if (std.mem.eql(u8, o.name, name)) return o.expr;
+        };
         for (self.predicate_derived.items[self.predicate_derived_scope..]) |d| {
             if (std.mem.eql(u8, d.name, name)) return d.expr;
         }
@@ -7089,8 +7183,11 @@ fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8, extra_col
             break :blk true;
         },
         .case => |c| blk: {
+            for (c.operands) |o| {
+                if (!exprAvailableAfterGroup(o.expr, group_cols, extra_cols)) break :blk false;
+            }
             for (c.branches) |branch| {
-                if (!predicateAvailableAfterGroup(branch.cond, group_cols, extra_cols)) break :blk false;
+                if (!predicateAvailableAfterGroup(branch.cond, group_cols, extra_cols, c.operands)) break :blk false;
                 if (!exprAvailableAfterGroup(branch.then, group_cols, extra_cols)) break :blk false;
             }
             if (c.else_branch) |else_branch| {
@@ -7101,30 +7198,40 @@ fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8, extra_col
     };
 }
 
-fn predicateAvailableAfterGroup(p: PredicateExpr, group_cols: []const []const u8, extra_cols: []const []const u8) bool {
+/// A CASE condition's column is available above the GroupBy when it is one
+/// of the CASE's own operands (checked on their own) or a grouped output.
+fn availableAfterGroupOrLocal(name: []const u8, group_cols: []const []const u8, extra_cols: []const []const u8, locals: []const ir.Expr.Operand) bool {
+    return exec_expr.operandListed(locals, name) or groupedOutputNameAvailable(name, group_cols, extra_cols);
+}
+
+fn namedNonLocal(name: []const u8, cols: []const []const u8, locals: []const ir.Expr.Operand) bool {
+    return !exec_expr.operandListed(locals, name) and nameInList(name, cols);
+}
+
+fn predicateAvailableAfterGroup(p: PredicateExpr, group_cols: []const []const u8, extra_cols: []const []const u8, locals: []const ir.Expr.Operand) bool {
     return switch (p) {
-        .leaf => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
-        .day_leaf => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
-        .text_as_number => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
-        .leaf_col_col => |lc| groupedOutputNameAvailable(lc.left, group_cols, extra_cols) and
-            groupedOutputNameAvailable(lc.right, group_cols, extra_cols),
-        .is_null => |c| groupedOutputNameAvailable(c, group_cols, extra_cols),
-        .is_not_null => |c| groupedOutputNameAvailable(c, group_cols, extra_cols),
-        .like => |l| groupedOutputNameAvailable(l.col, group_cols, extra_cols),
-        .in_set, .text_as_number_set => |s| groupedOutputNameAvailable(s.col, group_cols, extra_cols),
-        .leaf_var => |v| groupedOutputNameAvailable(v.col, group_cols, extra_cols),
+        .leaf => |l| availableAfterGroupOrLocal(l.col, group_cols, extra_cols, locals),
+        .day_leaf => |l| availableAfterGroupOrLocal(l.col, group_cols, extra_cols, locals),
+        .text_as_number => |l| availableAfterGroupOrLocal(l.col, group_cols, extra_cols, locals),
+        .leaf_col_col => |lc| availableAfterGroupOrLocal(lc.left, group_cols, extra_cols, locals) and
+            availableAfterGroupOrLocal(lc.right, group_cols, extra_cols, locals),
+        .is_null => |c| availableAfterGroupOrLocal(c, group_cols, extra_cols, locals),
+        .is_not_null => |c| availableAfterGroupOrLocal(c, group_cols, extra_cols, locals),
+        .like => |l| availableAfterGroupOrLocal(l.col, group_cols, extra_cols, locals),
+        .in_set, .text_as_number_set => |s| availableAfterGroupOrLocal(s.col, group_cols, extra_cols, locals),
+        .leaf_var => |v| availableAfterGroupOrLocal(v.col, group_cols, extra_cols, locals),
         .@"and", .@"or" => |children| blk: {
             for (children) |child| {
-                if (!predicateAvailableAfterGroup(child, group_cols, extra_cols)) break :blk false;
+                if (!predicateAvailableAfterGroup(child, group_cols, extra_cols, locals)) break :blk false;
             }
             break :blk true;
         },
-        .not => |child| predicateAvailableAfterGroup(child.*, group_cols, extra_cols),
+        .not => |child| predicateAvailableAfterGroup(child.*, group_cols, extra_cols, locals),
         .always, .unknown, .exists_subquery => true,
-        .scalar_subquery => |sq| groupedOutputNameAvailable(sq.col, group_cols, extra_cols),
+        .scalar_subquery => |sq| availableAfterGroupOrLocal(sq.col, group_cols, extra_cols, locals),
         .in_subquery => |sq| blk: {
-            for (sq.rest_cols) |c| if (!groupedOutputNameAvailable(c, group_cols, extra_cols)) break :blk false;
-            break :blk groupedOutputNameAvailable(sq.col, group_cols, extra_cols);
+            for (sq.rest_cols) |c| if (!availableAfterGroupOrLocal(c, group_cols, extra_cols, locals)) break :blk false;
+            break :blk availableAfterGroupOrLocal(sq.col, group_cols, extra_cols, locals);
         },
         else => false,
     };
@@ -7140,8 +7247,11 @@ fn exprReferencesAnyColumn(e: ir.Expr, cols: []const []const u8) bool {
             break :blk false;
         },
         .case => |c| blk: {
+            for (c.operands) |o| {
+                if (exprReferencesAnyColumn(o.expr, cols)) break :blk true;
+            }
             for (c.branches) |branch| {
-                if (predicateReferencesAnyColumn(branch.cond, cols)) break :blk true;
+                if (predicateReferencesAnyColumn(branch.cond, cols, c.operands)) break :blk true;
                 if (exprReferencesAnyColumn(branch.then, cols)) break :blk true;
             }
             if (c.else_branch) |else_branch| {
@@ -7153,24 +7263,24 @@ fn exprReferencesAnyColumn(e: ir.Expr, cols: []const []const u8) bool {
     };
 }
 
-fn predicateReferencesAnyColumn(p: PredicateExpr, cols: []const []const u8) bool {
+fn predicateReferencesAnyColumn(p: PredicateExpr, cols: []const []const u8, locals: []const ir.Expr.Operand) bool {
     return switch (p) {
-        .leaf => |l| nameInList(l.col, cols),
-        .day_leaf => |l| nameInList(l.col, cols),
-        .text_as_number => |l| nameInList(l.col, cols),
-        .leaf_col_col => |lc| nameInList(lc.left, cols) or nameInList(lc.right, cols),
-        .is_null => |c| nameInList(c, cols),
-        .is_not_null => |c| nameInList(c, cols),
-        .like => |l| nameInList(l.col, cols),
-        .in_set, .text_as_number_set => |s| nameInList(s.col, cols),
-        .leaf_var => |v| nameInList(v.col, cols),
+        .leaf => |l| namedNonLocal(l.col, cols, locals),
+        .day_leaf => |l| namedNonLocal(l.col, cols, locals),
+        .text_as_number => |l| namedNonLocal(l.col, cols, locals),
+        .leaf_col_col => |lc| namedNonLocal(lc.left, cols, locals) or namedNonLocal(lc.right, cols, locals),
+        .is_null => |c| namedNonLocal(c, cols, locals),
+        .is_not_null => |c| namedNonLocal(c, cols, locals),
+        .like => |l| namedNonLocal(l.col, cols, locals),
+        .in_set, .text_as_number_set => |s| namedNonLocal(s.col, cols, locals),
+        .leaf_var => |v| namedNonLocal(v.col, cols, locals),
         .@"and", .@"or" => |children| blk: {
             for (children) |child| {
-                if (predicateReferencesAnyColumn(child, cols)) break :blk true;
+                if (predicateReferencesAnyColumn(child, cols, locals)) break :blk true;
             }
             break :blk false;
         },
-        .not => |child| predicateReferencesAnyColumn(child.*, cols),
+        .not => |child| predicateReferencesAnyColumn(child.*, cols, locals),
         else => false,
     };
 }
@@ -7228,7 +7338,9 @@ fn exprHasGroupingCall(e: ir.Expr) bool {
         .call => |c| isGroupingFn(c.fn_name) or for (c.args) |arg| {
             if (exprHasGroupingCall(arg)) break true;
         } else false,
-        .case => |c| for (c.branches) |b| {
+        .case => |c| for (c.operands) |o| {
+            if (exprHasGroupingCall(o.expr)) break true;
+        } else for (c.branches) |b| {
             if (exprHasGroupingCall(b.then)) break true;
         } else if (c.else_branch) |eb| exprHasGroupingCall(eb.*) else false,
         else => false,

@@ -76,8 +76,13 @@ pub fn collectColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]co
         .col_ref => |nm| try appendUniqueName(allocator, out, nm),
         .call => |c| for (c.args) |arg| try collectColumnRefs(allocator, out, arg),
         .case => |cs| {
+            for (cs.operands) |o| try collectColumnRefs(allocator, out, o.expr);
+            var cond_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer cond_refs.deinit(allocator);
             for (cs.branches) |b| {
-                try collectPredicateColumnRefs(allocator, out, b.cond);
+                cond_refs.clearRetainingCapacity();
+                try expr_mod.collectCaseConditionRefs(allocator, &cond_refs, cs, b.cond);
+                for (cond_refs.items) |nm| try appendUniqueName(allocator, out, nm);
                 try collectColumnRefs(allocator, out, b.then);
             }
             if (cs.else_branch) |eb| try collectColumnRefs(allocator, out, eb.*);
@@ -245,10 +250,21 @@ const CasePlan = struct {
     /// Upstream schema captured at resolve so the per-batch predicate
     /// evaluator can resolve column refs in branch conditions.
     upstream_schema: []const Column,
+    /// The operands the conditions read (`Expr.Case.operands`), each
+    /// computed at its first reader. The conditions resolve against
+    /// `cond_schema`: the upstream schema, then these.
+    operands: []const CaseOperand,
+    cond_schema: []const Column,
     /// True when any branch may produce a NULL (else-less form, or
     /// any then_src is a nullable column). Used by Compute to decide
     /// whether the output column needs a validity bitmap.
     may_produce_null: bool,
+};
+
+const CaseOperand = struct {
+    src: BranchSrc,
+    /// The first branch whose condition reads the operand.
+    first_branch: usize,
 };
 
 const MAX_CASE_BRANCHES: usize = 16;
@@ -1007,7 +1023,8 @@ pub const Compute = struct {
     ///      matches and there's no ELSE).
     /// A THEN or ELSE clause that fails over the whole batch runs again over
     /// only the rows it wins, so a branch no row takes never raises, as in
-    /// MySQL, StarRocks and DuckDB.
+    /// MySQL, StarRocks and DuckDB. A condition's operand likewise runs again
+    /// over only the rows still open at the first WHEN that reads it.
     fn evalCase(self: *Compute, plan: *CasePlan, in_values: []const ColumnView, n: usize) anyerror!void {
         plan.output.clear();
         if (plan.branches.len > MAX_CASE_BRANCHES) return Error.ComputeTooManyArgs;
@@ -1024,29 +1041,39 @@ pub const Compute = struct {
         defer self.allocator.free(open);
         @memset(open, true);
 
-        const fake_batch: Batch = .{
-            .schema = plan.upstream_schema,
-            .values = in_values,
-            .row_count = n,
-        };
-        for (plan.branches, 0..) |br, bi| {
-            // Rows an earlier branch won are inactive: the guided evaluator
-            // may skip them, and their mask bits are ignored here.
-            @memset(cond_buf, false);
-            try predicate_mod.evaluateExprGuided(self.allocator, br.cond, plan.upstream_schema, fake_batch, cond_buf, open);
-            for (cond_buf, open, winners) |c, *o, *w| {
-                if (o.* and c) {
-                    w.* = @intCast(bi);
-                    o.* = false;
-                }
-            }
-        }
-
         var reached: std.ArrayList(ColumnStore) = .empty;
         defer {
             for (reached.items) |*s| s.deinit(self.allocator);
             reached.deinit(self.allocator);
         }
+        const up_width = plan.upstream_schema.len;
+        const cond_values = try self.allocator.alloc(ColumnView, if (plan.operands.len == 0) 0 else up_width + plan.operands.len);
+        defer self.allocator.free(cond_values);
+        if (plan.operands.len > 0) @memcpy(cond_values[0..up_width], in_values[0..up_width]);
+        const fake_batch: Batch = .{
+            .schema = plan.cond_schema,
+            .values = if (plan.operands.len == 0) in_values else cond_values,
+            .row_count = n,
+        };
+        var open_count = n;
+        for (plan.branches, 0..) |br, bi| {
+            if (open_count == 0) break;
+            for (plan.operands, up_width..) |op, slot| {
+                if (op.first_branch == bi) cond_values[slot] = try self.caseOperandRows(op.src, in_values, open, open_count, &reached);
+            }
+            // Rows an earlier branch won are inactive: the guided evaluator
+            // may skip them, and their mask bits are ignored here.
+            @memset(cond_buf, false);
+            try predicate_mod.evaluateExprGuided(self.allocator, br.cond, plan.cond_schema, fake_batch, cond_buf, open);
+            for (cond_buf, open, winners) |c, *o, *w| {
+                if (o.* and c) {
+                    w.* = @intCast(bi);
+                    o.* = false;
+                    open_count -= 1;
+                }
+            }
+        }
+
         var srcs_buf: [MAX_CASE_BRANCHES + 1]CaseSrc = undefined;
         for (plan.branches, 0..) |br, bi| {
             srcs_buf[bi] = try self.reachedCaseSrc(plan, br.then_src, br.cast_kernel, br.cast_buf, in_values, winners, bi, &reached);
@@ -1107,10 +1134,35 @@ pub const Compute = struct {
         return .{ .view = spread.view(), .scalar = false };
     }
 
-    /// Argument `i` of `plan` over the batch, converted to its parameter
-    /// type when resolve coerced it.
-    fn callArg(self: *Compute, plan: *CallPlan, i: usize, in_values: []const ColumnView, n: usize) anyerror!ColumnView {
-        const raw: ColumnView = switch (plan.args[i]) {
+    /// A CASE condition's operand over the batch. One that fails over every
+    /// row runs again over only the rows still `open`, since a row an
+    /// earlier WHEN took never reads it; a row still open that fails still
+    /// fails. `reached` keeps the store such an operand's rows live in.
+    fn caseOperandRows(
+        self: *Compute,
+        src: BranchSrc,
+        in_values: []const ColumnView,
+        open: []const bool,
+        open_count: usize,
+        reached: *std.ArrayList(ColumnStore),
+    ) anyerror!ColumnView {
+        return self.srcRows(src, in_values, open.len) catch |err| {
+            if (err == error.OutOfMemory or open_count == open.len) return err;
+            try reached.ensureUnusedCapacity(self.allocator, 1);
+            var subset = try RowSubset.init(self.allocator, in_values[0..self.in_width], open);
+            defer subset.deinit(self.allocator);
+            const part = try self.srcRows(src, subset.values, subset.count);
+            var spread = try ColumnStore.initLike(self.allocator, part, true);
+            errdefer spread.deinit(self.allocator);
+            try scatterRows(self.allocator, &spread, part, open);
+            reached.appendAssumeCapacity(spread);
+            return spread.view();
+        };
+    }
+
+    /// A call argument's or CASE operand's value on each of `n` rows.
+    fn srcRows(self: *Compute, src: anytype, in_values: []const ColumnView, n: usize) anyerror!ColumnView {
+        return switch (src) {
             .col => |idx| in_values[idx],
             .lit => |slot| blk: {
                 slot.buf.clear();
@@ -1131,6 +1183,12 @@ pub const Compute = struct {
                 break :blk sub.output.view();
             },
         };
+    }
+
+    /// Argument `i` of `plan` over the batch, converted to its parameter
+    /// type when resolve coerced it.
+    fn callArg(self: *Compute, plan: *CallPlan, i: usize, in_values: []const ColumnView, n: usize) anyerror!ColumnView {
+        const raw = try self.srcRows(plan.args[i], in_values, n);
         const casts = plan.arg_casts orelse return raw;
         const k = casts[i] orelse return raw;
         const buf = &plan.cast_buffers.?[i].?;
@@ -1445,6 +1503,7 @@ pub fn mayVary(e: Expr, registry: ?*const udf_mod.UdfRegistry) bool {
             return false;
         },
         .case => |c| {
+            for (c.operands) |o| if (mayVary(o.expr, registry)) return true;
             for (c.branches) |b| if (mayVary(b.then, registry)) return true;
             if (c.else_branch) |e2| return mayVary(e2.*, registry);
             return false;
@@ -1847,6 +1906,25 @@ fn buildCasePlan(
 ) PlanError!*CasePlan {
     if (cs.branches.len == 0) return Error.ComputeUnsupportedExpr;
 
+    var operands: std.ArrayList(CaseOperand) = .empty;
+    errdefer for (operands.items) |o| freeBranchSrc(runtime_allocator, o.src);
+    var cond_schema: std.ArrayList(Column) = .empty;
+    if (cs.operands.len > 0) try cond_schema.appendSlice(aa, up_schema);
+    var cond_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (cs.operands) |o| {
+        // An operand no condition reads (a branch dropped since) is never computed.
+        const first_branch = for (cs.branches, 0..) |br, bi| {
+            cond_names.clearRetainingCapacity();
+            try predicate_mod.collectColumnNames(aa, &cond_names, br.cond);
+            if (columnNameListed(cond_names.items, o.name)) break bi;
+        } else continue;
+        try operands.ensureUnusedCapacity(aa, 1);
+        const src = try buildBranchSrc(runtime_allocator, aa, o.expr, up_schema, udf_registry);
+        operands.appendAssumeCapacity(.{ .src = src, .first_branch = first_branch });
+        try cond_schema.append(aa, .{ .name = o.name, .type = branchSrcType(src, up_schema), .nullable = true });
+    }
+    const conds_schema: []const Column = if (cs.operands.len > 0) cond_schema.items else up_schema;
+
     const branches = try aa.alloc(CaseBranch, cs.branches.len);
     var built: usize = 0;
     errdefer {
@@ -1872,7 +1950,7 @@ fn buildCasePlan(
         // this for WHERE predicates via validateExpr; a CASE condition is
         // evaluated directly in evalCase and needs the same pass, or
         // evaluateMaskWithPred reads the wrong Value union field and panics.
-        try predicate_mod.validateExpr(&dst.cond, up_schema);
+        try predicate_mod.validateExpr(&dst.cond, conds_schema);
     }
 
     var else_src: ?BranchSrc = null;
@@ -1925,9 +2003,16 @@ fn buildCasePlan(
         .output_owned = true,
         .output_type = out_type,
         .upstream_schema = up_schema,
+        .operands = operands.items,
+        .cond_schema = conds_schema,
         .may_produce_null = may_null,
     };
     return plan;
+}
+
+fn columnNameListed(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (types.columnNameEql(n, name)) return true;
+    return false;
 }
 
 fn buildBranchSrc(
@@ -2011,6 +2096,7 @@ fn freeCaseBranch(allocator: Allocator, branch: CaseBranch) void {
 }
 
 fn freeCasePlan(allocator: Allocator, plan: *CasePlan) void {
+    for (plan.operands) |o| freeBranchSrc(allocator, o.src);
     for (plan.branches) |br| freeCaseBranch(allocator, br);
     if (plan.else_src) |es| freeBranchSrc(allocator, es);
     if (plan.else_cast_buf) |buf| {
@@ -2733,9 +2819,19 @@ fn argRows(allocator: Allocator, reach: ArgReach, prior: []const ColumnView, n: 
 
 fn argReach(func: ScalarFn) ArgReach {
     if (func.udf_kernel != null) return .all;
-    if (std.ascii.eqlIgnoreCase(func.name, "coalesce") or std.ascii.eqlIgnoreCase(func.name, "ifnull")) return .until_non_null;
-    if (std.ascii.eqlIgnoreCase(func.name, "if")) return .by_condition;
+    return argReachOf(func.name);
+}
+
+fn argReachOf(fn_name: []const u8) ArgReach {
+    const name = scalar_fn.canonicalName(fn_name);
+    if (std.ascii.eqlIgnoreCase(name, "coalesce") or std.ascii.eqlIgnoreCase(name, "ifnull")) return .until_non_null;
+    if (std.ascii.eqlIgnoreCase(name, "if")) return .by_condition;
     return .all;
+}
+
+/// Whether a call to `fn_name` reads its argument `i` on every row it sees.
+pub fn callReadsArgOnEveryRow(fn_name: []const u8, i: usize) bool {
+    return i == 0 or argReachOf(fn_name) == .all;
 }
 
 /// The batch's input rows where `rows` is set, compacted: what a

@@ -65,7 +65,8 @@ pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v5: create_table carries a table-compression byte.
 /// v7: join carries an optional ON residual.
 /// v8: drop_table carries a table list; alter_table carries actions.
-pub const version: u16 = 8;
+/// v9: a CASE carries the operands its conditions compute.
+pub const version: u16 = 9;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -1942,6 +1943,12 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
             }
             try out.append(allocator, if (cs.else_branch != null) @as(u8, 1) else 0);
             if (cs.else_branch) |eb| try encodeExpr(allocator, out, eb.*);
+            try appendU32(allocator, out, @intCast(cs.operands.len));
+            for (cs.operands) |o| {
+                try appendU32(allocator, out, @intCast(o.name.len));
+                try out.appendSlice(allocator, o.name);
+                try encodeExpr(allocator, out, o.expr);
+            }
         },
     }
 }
@@ -3076,7 +3083,13 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
                 eb.* = try decodeExpr(allocator, bytes, cursor);
                 else_ptr = eb;
             }
-            break :blk Expr{ .case = .{ .branches = branches, .else_branch = else_ptr } };
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const operand_count = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const operands = try allocator.alloc(Expr.Operand, operand_count);
+            errdefer allocator.free(operands);
+            for (operands) |*o| o.* = .{ .name = try readString(bytes, cursor), .expr = try decodeExpr(allocator, bytes, cursor) };
+            break :blk Expr{ .case = .{ .branches = branches, .else_branch = else_ptr, .operands = operands } };
         },
     };
 }
@@ -3098,6 +3111,8 @@ pub fn freeDecodedExpr(e: Expr, allocator: Allocator) void {
                 freeDecodedExpr(eb.*, allocator);
                 allocator.destroy(@constCast(eb));
             }
+            for (cs.operands) |o| freeDecodedExpr(o.expr, allocator);
+            allocator.free(cs.operands);
         },
     }
 }
@@ -3665,6 +3680,31 @@ test "ir: compute round-trips with a call expr over a col_ref" {
     try std.testing.expectEqual(@as(usize, 1), decoded.compute.derived[0].expr.call.args.len);
     try std.testing.expect(decoded.compute.derived[0].expr.call.args[0] == .col_ref);
     try std.testing.expectEqualStrings("name", decoded.compute.derived[0].expr.call.args[0].col_ref);
+}
+
+test "ir: a CASE's condition operands round-trip" {
+    const allocator = std.testing.allocator;
+
+    var scan_storage: Op = .{ .scan = .{ .table = .{ .name = "g" } } };
+    const square = [_]Expr{ .{ .col_ref = "d" }, .{ .col_ref = "d" } };
+    const operands = [_]Expr.Operand{.{ .name = "__case_operand_0", .expr = .{ .call = .{ .fn_name = "mul", .args = &square } } }};
+    const branches = [_]Expr.Branch{
+        .{ .cond = .{ .leaf = .{ .col = "d", .op = .gt, .val = .{ .bigint = 100 } } }, .then = .{ .lit = .{ .int = 1 } } },
+        .{ .cond = .{ .leaf = .{ .col = "__case_operand_0", .op = .gt, .val = .{ .bigint = 0 } } }, .then = .{ .lit = .{ .int = 2 } } },
+    };
+    const case_expr: Expr = .{ .case = .{ .branches = &branches, .else_branch = null, .operands = &operands } };
+    const derived = [_]Derived{.{ .name = "v", .expr = case_expr }};
+    const root: Op = .{ .compute = .{ .derived = &derived, .upstream = &scan_storage } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expect(decoded == .compute);
+    try std.testing.expect(exec_expr.eql(case_expr, decoded.compute.derived[0].expr));
 }
 
 test "ir: join round-trips with on + range + extra_predicate + skew" {
