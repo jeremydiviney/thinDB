@@ -31,6 +31,12 @@ pub const Predicate = struct {
     col: []const u8,
     op: PredicateOp,
     val: Value,
+    /// `val` comes from the statement itself: a constant written in its
+    /// text, or a user variable or scalar subquery it reads. Text no DATE or
+    /// DATETIME reads then fails the statement, as MySQL raises error 1525.
+    /// A bound parameter's value or an API caller's never matches instead,
+    /// as MySQL returns no rows for a prepared statement's parameter.
+    from_statement: bool = false,
 };
 
 /// Boolean expression over Predicates.
@@ -554,6 +560,7 @@ fn cloneLeaf(out_arena: std.mem.Allocator, lf: Predicate, renames: []const ColRe
         .col = try out_arena.dupe(u8, renameOf(renames, lf.col)),
         .op = lf.op,
         .val = try cloneValue(out_arena, lf.val),
+        .from_statement = lf.from_statement,
     };
 }
 
@@ -598,9 +605,11 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                         const leaf = p.*;
                         expr.* = .{ .text_as_number = leaf };
                     },
-                    .not_temporal => {
+                    .not_temporal => if (p.from_statement) {
                         recordInvalidTemporal(col_type, p.val.text);
                         return Error.InvalidTemporalLiteral;
+                    } else {
+                        expr.* = .unknown;
                     },
                     .incomparable => return Error.PredicateTypeMismatch,
                 }
@@ -650,8 +659,8 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // NULL-skipping NOT IN). Text that doesn't read as the DATE or
         // DATETIME it meets drops the same way: set values are rows an IN
         // subquery returned, which MySQL skips with a warning; only a
-        // `.leaf` constant raises `InvalidTemporalLiteral`. A number against a
-        // text column stays a number and the node becomes
+        // `.leaf` the statement spells raises `InvalidTemporalLiteral`. A
+        // number against a text column stays a number and the node becomes
         // `.text_as_number_set`. Values are arena-owned parse output;
         // in-place rewrite mirrors the `.leaf` arm.
         .in_set => |*s| {
@@ -846,7 +855,7 @@ const LiteralPlacement = union(enum) {
     /// NULL (StarRocks: `'12abc' = 12` is NULL).
     null_text,
     /// Text that doesn't read as a date or datetime against a DATE or
-    /// DATETIME column. A constant spelled that way fails the statement, as
+    /// DATETIME column. A `from_statement` constant fails the statement, as
     /// MySQL raises `Incorrect DATE value`; anything else never matches.
     not_temporal,
     /// A number against a text column: each row's text is read as a number,
@@ -2658,9 +2667,14 @@ test "validateExpr raises on a constant no date reads, and drops it from a set" 
     const schema = [_]Column{.{ .name = "d", .type = .date, .nullable = true }};
     const ops = [_]PredicateOp{ .eq, .neq, .lt, .lte, .gt, .gte };
     for (ops) |op| {
-        var expr: PredicateExpr = .{ .leaf = .{ .col = "d", .op = op, .val = .{ .text = "abc" } } };
+        var expr: PredicateExpr = .{ .leaf = .{ .col = "d", .op = op, .val = .{ .text = "abc" }, .from_statement = true } };
         try t.expectError(Error.InvalidTemporalLiteral, validateExpr(&expr, &schema));
         try t.expectEqualStrings("Incorrect DATE value: 'abc'", takeInvalidTemporalMessage().?);
+        try t.expect(takeInvalidTemporalMessage() == null);
+
+        var bound: PredicateExpr = .{ .leaf = .{ .col = "d", .op = op, .val = .{ .text = "abc" } } };
+        try validateExpr(&bound, &schema);
+        try t.expect(bound == .unknown);
         try t.expect(takeInvalidTemporalMessage() == null);
     }
 
@@ -2668,7 +2682,7 @@ test "validateExpr raises on a constant no date reads, and drops it from a set" 
     @memset(&long_value, 'x');
     long_value[127] = 0xC3;
     long_value[128] = 0xA9;
-    var long: PredicateExpr = .{ .leaf = .{ .col = "d", .op = .eq, .val = .{ .text = &long_value } } };
+    var long: PredicateExpr = .{ .leaf = .{ .col = "d", .op = .eq, .val = .{ .text = &long_value }, .from_statement = true } };
     try t.expectError(Error.InvalidTemporalLiteral, validateExpr(&long, &schema));
     try t.expectEqualStrings("Incorrect DATE value: '" ++ "x" ** 127 ++ "'", takeInvalidTemporalMessage().?);
 

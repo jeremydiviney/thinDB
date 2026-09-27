@@ -767,11 +767,13 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .col = try aa.dupe(u8, p.col),
             .op = p.op,
             .val = try cloneValue(aa, p.val),
+            .from_statement = p.from_statement,
         } },
         .day_leaf => |p| PredicateExpr{ .day_leaf = .{
             .col = try aa.dupe(u8, p.col),
             .op = p.op,
             .val = try cloneValue(aa, p.val),
+            .from_statement = p.from_statement,
         } },
         .text_as_number, .text_as_number_set => try exec.predicate.deepClonePredicate(aa, expr),
         .leaf_col_col => |lc| PredicateExpr{ .leaf_col_col = .{

@@ -59,7 +59,7 @@ test "mapInternal reports a value past its column's range as 1264" {
 
 test "mapInternal names the constant a DATE comparison rejected" {
     const schema = [_]types.Column{.{ .name = "d", .type = .date, .nullable = true }};
-    var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "d", .op = .lt, .val = .{ .text = "2026-09-31" } } };
+    var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "d", .op = .lt, .val = .{ .text = "2026-09-31" }, .from_statement = true } };
     try std.testing.expectError(error.InvalidTemporalLiteral, predicate.validateExpr(&expr, &schema));
     const m = mapInternal(error.InvalidTemporalLiteral, null);
     try std.testing.expectEqual(@as(u16, 1525), m.code);

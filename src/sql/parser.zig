@@ -384,6 +384,21 @@ pub fn parseWithContext(
     udf_registry: ?*const udf_mod.UdfRegistry,
     sql_fns: ?udf_mod.SqlFnCtx,
 ) ParseError!*ir.Op {
+    return parseBoundWithContext(arena, sql, &.{}, dialect, udf_registry, sql_fns);
+}
+
+/// `parseWithContext` for a statement a wire layer built by substituting
+/// bound parameters' literals for its placeholders, `bound_params` marking
+/// where they sit. Only a constant the statement spells is
+/// `Predicate.from_statement`.
+pub fn parseBoundWithContext(
+    arena: Allocator,
+    sql: []const u8,
+    bound_params: []const lexer_mod.BoundSpan,
+    dialect: types.Dialect,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+    sql_fns: ?udf_mod.SqlFnCtx,
+) ParseError!*ir.Op {
     var lex = Lexer.init(arena, sql);
     lex.dialect = dialect;
     var parser = Parser{
@@ -393,6 +408,12 @@ pub fn parseWithContext(
         .udf_registry = udf_registry,
         .sql_fns = sql_fns,
     };
+    for (bound_params) |span| {
+        var param_lex = Lexer.init(arena, sql[span.start..span.end]);
+        param_lex.dialect = dialect;
+        const tok = try param_lex.next();
+        if (tok.tag == .string) try parser.bound_texts.append(arena, tok.value.string);
+    }
 
     // Skip leading empty statements (e.g. ";;SELECT ...").
     while (parser.cur.tag == .semicolon) try parser.advance();
@@ -687,6 +708,9 @@ pub const Parser = struct {
     /// Set inside `ON DUPLICATE KEY UPDATE`, where `VALUES(col)` names the
     /// value the row would have inserted into `col`.
     insert_values_refs: bool = false,
+    /// The text of every string a bound parameter supplied. Filled before
+    /// parsing starts; sub-parsers share it read-only.
+    bound_texts: std.ArrayList([]const u8) = .empty,
 
     pub fn advance(self: *Parser) ParseError!void {
         self.prev_end = self.lex.pos;
@@ -706,6 +730,18 @@ pub const Parser = struct {
                 }
             }
         }
+    }
+
+    /// `val` is a constant the statement spells, not a bound parameter's
+    /// value: `Predicate.from_statement`. Text equal to a bound parameter's
+    /// counts as bound wherever it appears, so a value built from one (a
+    /// folded `CONCAT(?, '')`) never fails the statement either.
+    pub fn spelledValue(self: *const Parser, val: Value) bool {
+        if (val != .text) return true;
+        for (self.bound_texts.items) |bound| {
+            if (std.mem.eql(u8, bound, val.text)) return false;
+        }
+        return true;
     }
 
     /// The full SQL source being parsed.
@@ -4099,6 +4135,7 @@ pub const Parser = struct {
             .udf_registry = self.udf_registry,
             .sql_fns = self.sql_fns,
             .fn_expand_depth = self.fn_expand_depth + 1,
+            .bound_texts = self.bound_texts,
         };
         try sub.advance();
         const op = try sub.parseStatement();
@@ -4152,6 +4189,7 @@ pub const Parser = struct {
             .sql_fns = self.sql_fns,
             .param_bindings = &bindings,
             .fn_expand_depth = self.fn_expand_depth + 1,
+            .bound_texts = self.bound_texts,
         };
         try sub.advance(); // load the first body token (with param interception)
         const op = try sub.parseStatement();
@@ -5160,7 +5198,7 @@ pub const Parser = struct {
         const col = try self.joinColName(side_expr);
         // A decimal constant no Value holds exactly is a `.call`, filtered
         // by its exact value like any other constant expression.
-        const pred = if (exec_expr.exactLiteralValue(literal_expr)) |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } } else switch (literal_expr) {
+        const pred = if (exec_expr.exactLiteralValue(literal_expr)) |v| parse_predicate.literalLeaf(self, col, op, v) else switch (literal_expr) {
             .null_lit => PredicateExpr.unknown,
             // `col <op> @var`: the pre-compile pass rewrites leaf_var to a
             // literal leaf once the session value is known.
@@ -5636,6 +5674,7 @@ pub const Parser = struct {
             .cur = try lex.next(),
             .udf_registry = self.udf_registry,
             .sql_fns = self.sql_fns,
+            .bound_texts = self.bound_texts,
         };
         const op = try sub.parseStatement();
         try sub.applyAutoMaterialize();

@@ -396,6 +396,40 @@ test "comparison: a string constant no DATE or DATETIME reads fails the statemen
     });
 }
 
+fn countApiRows(allocator: std.mem.Allocator, t: *thindb.Table, expr: thindb.PredicateExpr) !usize {
+    var base = try thindb.scan(allocator, t);
+    var q = try base.filter(expr);
+    defer q.deinit();
+    var rows: usize = 0;
+    while (try q.next()) |b| rows += b.row_count;
+    return rows;
+}
+
+test "comparison: an API value no DATE or DATETIME reads matches nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setupMixed(allocator, db);
+    const t = try db.openTable("cm", .{});
+
+    // A value the caller passes is a parameter, not a constant the statement
+    // spells: like a prepared statement's, it never fails the query.
+    const ops = [_]thindb.exec.PredicateOp{ .eq, .neq, .lt, .gte };
+    for (0..2) |_| {
+        for ([_][]const u8{ "d", "ts" }) |col| {
+            for ([_][]const u8{ "", "abc", "2024-02-30" }) |text| {
+                for (ops) |op| {
+                    try std.testing.expectEqual(@as(usize, 0), try countApiRows(allocator, t, thindb.leafExpr(col, op, .{ .text = text })));
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), try countApiRows(allocator, t, thindb.leafExpr("d", .gte, .{ .text = "2024-3-1" })));
+        try t.flush();
+    }
+}
+
 test "comparison: text meets a DATE or DATETIME the way MySQL reads it" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

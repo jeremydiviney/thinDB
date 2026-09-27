@@ -85,7 +85,7 @@ test "mapInternal recognizes table-not-found" {
 
 test "mapInternal names the constant a DATETIME comparison rejected" {
     const schema = [_]types.Column{.{ .name = "ts", .type = .datetime, .nullable = true }};
-    var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "ts", .op = .eq, .val = .{ .text = "abc" } } };
+    var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "ts", .op = .eq, .val = .{ .text = "abc" }, .from_statement = true } };
     try std.testing.expectError(error.InvalidTemporalLiteral, predicate.validateExpr(&expr, &schema));
     const m = mapInternal(error.InvalidTemporalLiteral);
     try std.testing.expectEqualStrings("22007", &m.sqlstate);
