@@ -662,6 +662,18 @@ pub const DeleteOp = struct {
     /// Computed operands the predicate compares by name (`n % 3 = 0`
     /// compares a derived `n % 3` with 0), evaluated ahead of it per batch.
     derived: []const Derived = &.{},
+    /// The MySQL forms a filtered scan can't express — ORDER BY / LIMIT, an
+    /// alias, a join, several targets — select the rows to delete instead:
+    /// every target's columns, in `targets` order.
+    source: ?*Op = null,
+    targets: []const DmlTarget = &.{},
+};
+
+/// A table an UPDATE or DELETE over a SELECT writes, and the name its
+/// columns carry in that SELECT.
+pub const DmlTarget = struct {
+    table: TableRef,
+    qualifier: []const u8,
 };
 
 /// One `col = expr` assignment in an UPDATE statement.
@@ -681,6 +693,10 @@ pub const UpdateOp = struct {
     predicate: ?@import("../exec/predicate.zig").PredicateExpr,
     /// Same as `DeleteOp.derived`.
     derived: []const Derived = &.{},
+    /// As `DeleteOp.source`, followed by one column per assignment value;
+    /// the target is whichever of `targets` holds the assigned columns.
+    source: ?*Op = null,
+    targets: []const DmlTarget = &.{},
 };
 
 /// EXPLAIN <statement> — wraps an inner statement. Compiling it builds the
