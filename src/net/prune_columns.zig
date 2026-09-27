@@ -715,6 +715,9 @@ fn collectExpr(arena: Allocator, e: ir.Expr, out: *NameSet) bool {
             if (!collectExpr(arena, a, out)) return false;
         },
         .case => |cs| {
+            for (cs.operands) |o| {
+                if (!collectExpr(arena, o.expr, out)) return false;
+            }
             for (cs.branches) |br| {
                 if (!collectPredicate(arena, br.cond, out)) return false;
                 if (!collectExpr(arena, br.then, out)) return false;

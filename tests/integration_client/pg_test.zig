@@ -2559,3 +2559,66 @@ test "pg wire: a batch runs every statement though one leads with SET or BEGIN" 
     try client.sendTerminate();
     if (sctx.err) |e| return e;
 }
+
+test "pg wire ext: a Bind value no DATE or TIMESTAMP reads matches nothing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 104;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "CREATE TABLE dt (id BIGINT PRIMARY KEY, d DATE, ts TIMESTAMP)",
+        "INSERT INTO dt VALUES (1, '2026-09-26', '2026-09-26 10:00:00'), (2, '2026-09-27', '2026-09-27 00:00:00')",
+    }) |sql_text| {
+        try client.sendQuery(sql_text);
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+
+    // Spelled in the statement, the constant fails it.
+    try client.sendQuery("SELECT id FROM dt WHERE ts = 'abc'");
+    const rejected = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("22007", rejected.error_code.?);
+
+    // Bound, it matches nothing.
+    for ([_][]const u8{
+        "SELECT id FROM dt WHERE d = $1",
+        "SELECT id FROM dt WHERE ts >= $1",
+    }) |sql_text| {
+        for ([_][]const u8{ "", "abc", "Invalid Date" }) |value| {
+            try client.sendParse("", sql_text, &.{});
+            try client.sendBind("", "", &.{.{ .value = value, .format = 0 }}, &.{});
+            try client.sendExecute("", 0);
+            try client.sendSync();
+            const r = try client.readExtendedReplies(arena.allocator());
+            if (r.error_code) |code| {
+                std.debug.print("bound '{s}' failed with {s}: {s}\n", .{ value, code, sql_text });
+                return error.TestUnexpectedResult;
+            }
+            try std.testing.expectEqual(@as(usize, 0), r.rows.len);
+        }
+    }
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}

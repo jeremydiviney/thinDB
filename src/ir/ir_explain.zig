@@ -599,6 +599,12 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
                 try out.appendSlice(allocator, " ELSE ");
                 try explainExpr(allocator, out, eb.*);
             }
+            for (cs.operands) |o| {
+                try out.appendSlice(allocator, " WITH ");
+                try out.appendSlice(allocator, o.name);
+                try out.appendSlice(allocator, " = ");
+                try explainExpr(allocator, out, o.expr);
+            }
             try out.appendSlice(allocator, " END");
         },
         .scalar_subquery => try out.appendSlice(allocator, "(SELECT …)"),

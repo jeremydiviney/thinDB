@@ -21,6 +21,7 @@ const Type = types.Type;
 const DecimalSpec = types.DecimalSpec;
 
 const common = @import("scalar_fn_common.zig");
+const time = @import("scalar_fn_time.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 
@@ -488,10 +489,10 @@ fn textKeyValue(ty: Type, text: []const u8) ?i128 {
             break :blk if (@abs(m) < pow10(spec.p)) m else null;
         },
         .date => blk: {
-            const micros = common.textToDatetime(std.mem.trim(u8, text, common.TEXT_SPACE)) orelse break :blk null;
+            const micros = (time.parseDatetime(text) orelse break :blk null).value;
             break :blk if (@mod(micros, std.time.us_per_day) == 0) @divExact(micros, std.time.us_per_day) else null;
         },
-        .datetime => common.textToDatetime(std.mem.trim(u8, text, common.TEXT_SPACE)) orelse null,
+        .datetime => if (time.parseDatetime(text)) |m| m.value else null,
         else => null,
     };
 }

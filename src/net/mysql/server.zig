@@ -4019,7 +4019,7 @@ fn handleStmtExecute(
 
     const parse_start = profiler.start();
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
-    const op = sql.parseWithContext(arena_alloc, substituted, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
+    const op = sql.parseBoundWithContext(arena_alloc, substituted.sql, substituted.params, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
         profiler.recordSince(.stmt_execute_parse, parse_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);

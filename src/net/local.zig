@@ -767,11 +767,13 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .col = try aa.dupe(u8, p.col),
             .op = p.op,
             .val = try cloneValue(aa, p.val),
+            .from_statement = p.from_statement,
         } },
         .day_leaf => |p| PredicateExpr{ .day_leaf = .{
             .col = try aa.dupe(u8, p.col),
             .op = p.op,
             .val = try cloneValue(aa, p.val),
+            .from_statement = p.from_statement,
         } },
         .text_as_number, .text_as_number_set => try exec.predicate.deepClonePredicate(aa, expr),
         .leaf_col_col => |lc| PredicateExpr{ .leaf_col_col = .{
@@ -1618,6 +1620,7 @@ fn projWalkExpr(c: *ProjScan, allocator: Allocator, e: ir.Expr) void {
         .lit, .null_lit => {},
         .call => |call| for (call.args) |a| projWalkExpr(c, allocator, a),
         .case => |cs| {
+            for (cs.operands) |o| projWalkExpr(c, allocator, o.expr);
             for (cs.branches) |br| {
                 projWalkPredicate(c, allocator, br.cond);
                 projWalkExpr(c, allocator, br.then);
@@ -3676,8 +3679,9 @@ fn collectExprNames(aa: Allocator, out: *std.ArrayListUnmanaged([]const u8), e: 
         .col_ref => |name| try out.append(aa, name),
         .call => |c| for (c.args) |arg| try collectExprNames(aa, out, arg),
         .case => |c| {
+            for (c.operands) |o| try collectExprNames(aa, out, o.expr);
             for (c.branches) |b| {
-                try exec.predicate.collectColumnNames(aa, out, b.cond);
+                try exec.expr_mod.collectCaseConditionRefs(aa, out, c, b.cond);
                 try collectExprNames(aa, out, b.then);
             }
             if (c.else_branch) |eb| try collectExprNames(aa, out, eb.*);

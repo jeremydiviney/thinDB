@@ -6,6 +6,8 @@ const Allocator = std.mem.Allocator;
 
 const packet = @import("packet.zig");
 const error_map = @import("../error_map.zig");
+const predicate = @import("../../exec/predicate.zig");
+const types = @import("../../types.zig");
 
 pub const Mapped = struct {
     sqlstate: [5]u8,
@@ -46,6 +48,7 @@ pub fn mapInternal(err: anyerror) Mapped {
         .numeric_out_of_range => .{ .sqlstate = "22003".*, .message = "numeric value out of range" },
         .value_out_of_range => .{ .sqlstate = "22003".*, .message = "value out of range for column type" },
         .subquery_multiple_rows => .{ .sqlstate = "21000".*, .message = "more than one row returned by a subquery used as an expression" },
+        .invalid_temporal_literal => .{ .sqlstate = "22007".*, .message = predicate.takeInvalidTemporalMessage() orelse "invalid input syntax for type date or timestamp" },
         .unknown => .{ .sqlstate = "42000".*, .message = name },
     };
 }
@@ -78,6 +81,15 @@ pub fn sendErrorResponse(
 test "mapInternal recognizes table-not-found" {
     const m = mapInternal(error.TableNotFound);
     try std.testing.expectEqualStrings("42P01", &m.sqlstate);
+}
+
+test "mapInternal names the constant a DATETIME comparison rejected" {
+    const schema = [_]types.Column{.{ .name = "ts", .type = .datetime, .nullable = true }};
+    var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "ts", .op = .eq, .val = .{ .text = "abc" }, .from_statement = true } };
+    try std.testing.expectError(error.InvalidTemporalLiteral, predicate.validateExpr(&expr, &schema));
+    const m = mapInternal(error.InvalidTemporalLiteral);
+    try std.testing.expectEqualStrings("22007", &m.sqlstate);
+    try std.testing.expectEqualStrings("Incorrect DATETIME value: 'abc'", m.message);
 }
 
 test "mapInternal falls back to 42000 with error name" {

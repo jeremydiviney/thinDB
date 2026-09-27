@@ -224,6 +224,10 @@ pub const LexError = error{
     LexCharsetUnsupported,
 } || Allocator.Error;
 
+/// Where a wire layer substituted a bound parameter's literal for a
+/// placeholder: byte offsets into the statement it built.
+pub const BoundSpan = struct { start: usize, end: usize };
+
 pub const Lexer = struct {
     arena: Allocator,
     src: []const u8,

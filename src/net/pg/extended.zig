@@ -100,6 +100,8 @@ pub const Portal = struct {
     name: []u8,
     stmt: *PreparedStmt,
     bound_sql: []u8,
+    /// Where `bound_sql` holds the Bind values (`Lexer.bound_params`).
+    bound_params: []lexer_mod.BoundSpan,
     /// Format code per result column (0 = text, 1 = binary). If the
     /// client sent 0 codes, this is empty and we default to text. If
     /// it sent 1 code, this is length-1 and applies to every column.
@@ -111,6 +113,7 @@ pub const Portal = struct {
     pub fn deinit(self: *Portal, gpa: Allocator) void {
         gpa.free(self.name);
         gpa.free(self.bound_sql);
+        gpa.free(self.bound_params);
         gpa.free(self.result_formats);
     }
 };
@@ -199,12 +202,12 @@ pub fn sendParameterDescription(
 
 /// Walk `sql` substituting each `$N` outside string/identifier/comment
 /// context with `params[N-1]` (or `NULL` when the entry is null).
-/// Returns an allocator-owned slice the caller frees.
+/// The caller frees the result with `deinit`.
 pub fn substituteDollarSql(
     allocator: Allocator,
     sql: []const u8,
     params: []const ?[]const u8,
-) ![]u8 {
+) !sql_text.BoundSql {
     return sql_text.substituteDollarPlaceholders(allocator, sql, params) catch |err| switch (err) {
         sql_text.DollarError.MalformedBindParam => Error.MalformedBindParam,
         sql_text.DollarError.BindParamCountMismatch => Error.BindParamCountMismatch,
@@ -575,7 +578,7 @@ pub fn dryCompileSchema(
         const dummies = try pa.alloc(?[]const u8, num_params);
         for (dummies) |*slot| slot.* = "0";
         const substituted = substituteDollarSql(pa, sql, dummies) catch return null;
-        const op = sql_mod.parseDialect(pa, substituted, .postgres) catch return null;
+        const op = sql_mod.parseDialect(pa, substituted.sql, .postgres) catch return null;
         if (isSideEffect(op.*)) return null;
     }
 
@@ -604,7 +607,7 @@ fn tryDryCompile(
     for (dummies) |*slot| slot.* = dummy;
 
     const substituted = substituteDollarSql(aa, sql, dummies) catch return null;
-    const op = sql_mod.parseDialect(aa, substituted, .postgres) catch return null;
+    const op = sql_mod.parseDialect(aa, substituted.sql, .postgres) catch return null;
     if (isSideEffect(op.*)) return null;
 
     const db = catalog.database(session.current_db) orelse return null;
@@ -732,10 +735,10 @@ test "substituteDollarSql replaces $N in order, preserves strings" {
         "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = '$1' AND d = $3",
         params[0..],
     );
-    defer allocator.free(out);
+    defer out.deinit(allocator);
     try std.testing.expectEqualStrings(
         "SELECT * FROM t WHERE a = 42 AND b = 'hello''world' AND c = '$1' AND d = NULL",
-        out,
+        out.sql,
     );
 }
 
@@ -747,10 +750,10 @@ test "substituteDollarSql honours -- and /* */ comments" {
         "SELECT $1 -- $1 in comment\n /* also $1 */ FROM t",
         params[0..],
     );
-    defer allocator.free(out);
+    defer out.deinit(allocator);
     try std.testing.expectEqualStrings(
         "SELECT 42 -- $1 in comment\n /* also $1 */ FROM t",
-        out,
+        out.sql,
     );
 }
 
