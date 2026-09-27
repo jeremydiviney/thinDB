@@ -499,8 +499,10 @@ reads an earlier item (`SELECT a + 1 AS b, b * 2`), which MySQL rejects. Beside
 `*` the item takes the slot of the column it names (`SELECT *, f(n) AS n`), where
 MySQL shows both. A bare ORDER BY name and QUALIFY read the alias. HAVING reads
 a grouped column of that name, else the alias. An ORDER BY expression reads the
-column. GROUP BY still tries the aliases first (#328). `SELECT n, t.n FROM t`
-names the repeat `n_1`, as `SELECT n, n` does.
+column. A bare GROUP BY name reads the FROM column too, in every dialect, as
+MySQL, StarRocks, PostgreSQL and DuckDB bind it: `SELECT n % 2 AS n ... GROUP BY
+n` makes one group per `n`. It reaches an alias only when FROM has no such
+column. `SELECT n, t.n FROM t` names the repeat `n_1`, as `SELECT n, n` does.
 
 Before preparing a fused hash join, a pure filter over an existing materialized
 stage may check that stage for a surviving probe row. An empty probe skips the

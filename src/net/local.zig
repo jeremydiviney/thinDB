@@ -2096,14 +2096,44 @@ fn projectHasReplaceTarget(p: ir.Op.Project, name: []const u8) bool {
     return false;
 }
 
-/// A trailing derived column the `*` would normally skip stays in the star
-/// expansion when a later projection item replaces it by name — otherwise the
-/// replacement would have no slot to overwrite.
+/// The SELECT's own pipeline between the Project and its FROM source derives
+/// `name`: an ORDER BY key, a WHERE operand or a window result no projection
+/// item names.
+fn selectPipelineDerives(upstream: *const ir.Op, name: []const u8) bool {
+    var op = upstream;
+    while (true) {
+        switch (op.*) {
+            .compute => |c| {
+                for (c.derived) |d| if (types.columnNameEql(d.name, name)) return true;
+                op = c.upstream;
+            },
+            .window => |w| {
+                for (w.calls) |call| if (types.columnNameEql(call.output_name, name)) return true;
+                op = w.upstream;
+            },
+            .filter => |f| op = f.upstream,
+            .order_by => |o| op = o.upstream,
+            // The staged compiler's seam around this SELECT's own window. A
+            // FROM source computing a window ends in its own projection.
+            .materialize => |m| {
+                if (m.upstream.* != .window) return false;
+                op = m.upstream;
+            },
+            else => return false,
+        }
+    }
+}
+
+/// `star_skip_trailing` counts the columns the SELECT appends after its FROM
+/// source, but a derived item named like a source column replaces that column
+/// in place instead of appending (`SELECT *, qty + 1 AS qty` without catalog
+/// context), so the count can overshoot. Only trailing columns the SELECT
+/// itself derives are skipped; the first source column stops the skip.
 fn effectiveStarSkip(schema: []const types.Column, p: ir.Op.Project) u32 {
     var skip: u32 = 0;
     while (skip < p.star_skip_trailing and skip < schema.len) : (skip += 1) {
-        const idx = schema.len - 1 - skip;
-        if (!projectHasReplaceTarget(p, schema[idx].name)) break;
+        const name = schema[schema.len - 1 - skip].name;
+        if (!projectHasReplaceTarget(p, name) and !selectPipelineDerives(p.upstream, name)) break;
     }
     return skip;
 }
