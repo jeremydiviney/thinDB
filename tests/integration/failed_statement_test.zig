@@ -51,7 +51,7 @@ test "failed statements leave the statement gate idle" {
         "WITH x AS (SELECT fa.id FROM fa JOIN fb ON fa.n = fb.dt) SELECT id FROM x",
         "SELECT id FROM fc WHERE id IN (SELECT fa.id FROM fa JOIN fb ON fa.n = fb.dt)",
         // Columns and functions that don't resolve, or don't take their arguments.
-        "SELECT sqrt('x') AS v FROM fa",
+        "SELECT sqrt('x', 'y') AS v FROM fa",
         "SELECT fa.id FROM fa JOIN fb ON fa.id = fb.id WHERE fa.nope = 1",
         "SELECT id FROM fa ORDER BY nope",
         "SELECT n, COUNT(*) AS c FROM fa GROUP BY nope",

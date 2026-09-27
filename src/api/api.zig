@@ -387,6 +387,12 @@ pub const Session = struct {
     /// ROW_COUNT(): what the previous statement changed — its affected rows
     /// for DML, -1 after a result set, 0 otherwise.
     row_count: i64 = -1,
+    /// What CONNECTION_ID(), USER() and VERSION() answer on this connection.
+    /// A caller with no such notion (embedded use, the PG wire) leaves them
+    /// null, and the calls stay unknown functions there.
+    connection_id: ?u32 = null,
+    user: ?[]const u8 = null,
+    server_version: ?[]const u8 = null,
 };
 
 /// Per-connection variable storage. Names and string values are
