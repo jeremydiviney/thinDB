@@ -138,9 +138,7 @@ fn scanDatetime(s: []const u8, datetime_only: bool) DatetimeScan {
     if (year_len == 2 and !zero_date) year += if (year < 70) 2000 else 1900;
     const month = fields[1];
     const day = fields[2];
-    if (year > 9999 or month < 1 or month > 12 or day < 1 or fields[3] > 23 or fields[4] > 59 or fields[5] > 59) return .invalid;
-    // MySQL's year 0 is not a leap year.
-    if (day > common.lastDayOfMonth(year, month) or (year == 0 and month == 2 and day == 29)) return .invalid;
+    if (year > 9999 or !common.validDate(year, month, day) or fields[3] > 23 or fields[4] > 59 or fields[5] > 59) return .invalid;
     const seconds = (@as(i64, fields[3]) * 60 + fields[4]) * 60 + fields[5];
     const micros = @as(i64, common.ymdToDays(year, month, day)) * US_PER_DAY + seconds * US_PER_S + frac.micros;
     return .{ .valid = .{ .value = micros + @intFromBool(frac.round_up), .fsp = frac.digits } };
@@ -342,6 +340,74 @@ pub fn timeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
         } else null;
         try appendText(allocator, out, base, i, if (value) |x| try formatTime(&buf, x.value, x.fsp) else null);
     }
+}
+
+/// The deepest fraction CAST(x AS TIME(n)) takes.
+pub const MAX_FSP: u8 = 6;
+
+/// CAST(x AS TIME(fsp)): text, a DATE or a DATETIME as `temporalAt` reads it
+/// (a DATETIME gives its time of day), a number as `numberTime` reads it,
+/// rounded half away from zero to `fsp` digits and shown with exactly that
+/// many. A time of day can round up to 24:00:00, as in MySQL.
+pub fn castTimeKernel(comptime fsp: u8) common.TypedKernelFn {
+    return struct {
+        fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+            _ = out_type;
+            const base = out.data.rowCount();
+            const t = arg_types[0];
+            const numeric = !(t.isString() or t.isTemporal());
+            var buf: [48]u8 = undefined;
+            for (0..row_count) |i| {
+                const micros: ?i64 = if (!args[0].isValid(i))
+                    null
+                else if (numeric)
+                    (if (dec.exactAt(args[0], t, i)) |n| numberTime(n) else null)
+                else if (temporalAt(args[0], i)) |v| switch (v) {
+                    .time => |x| x.value,
+                    .datetime => |x| @mod(x.value, US_PER_DAY),
+                } else null;
+                try appendText(allocator, out, base, i, if (micros) |m| try formatTime(&buf, roundTime(m, fsp), fsp) else null);
+            }
+        }
+    }.kernel;
+}
+
+/// `micros` rounded half away from zero to `fsp` fraction digits, within
+/// ±838:59:59.
+fn roundTime(micros: i64, fsp: u8) i64 {
+    const unit: u64 = pow10(MAX_FSP - fsp);
+    const rounded = (@abs(micros) + unit / 2) / unit * unit;
+    const magnitude: i64 = @intCast(@min(rounded, @as(u64, MAX_TIME_MICROS)));
+    return if (micros < 0) -magnitude else magnitude;
+}
+
+/// A number as MySQL reads it for a TIME: `[-]HHMMSS[.f]` with minutes and
+/// seconds within 59, or from 10^10 up a `[YY]YYMMDDHHMMSS` datetime's time
+/// of day. Past 838:59:59 otherwise it is no TIME, unlike text, which clamps.
+/// The fraction rounds to the microsecond after the fields are checked, so
+/// 59.9999999 is 00:01:00.
+fn numberTime(n: common.ScaledInt) ?i64 {
+    const scale = dec.pow10(n.s);
+    const magnitude: i128 = @intCast(@abs(n.m));
+    const whole = @divTrunc(magnitude, scale);
+    const fraction: i64 = @intCast(dec.rescale(@mod(magnitude, scale), n.s, MAX_FSP) orelse return null);
+    const time_of_day: i64 = if (whole <= 8_385_959) blk: {
+        const w: i64 = @intCast(whole);
+        const minute = @mod(@divTrunc(w, 100), 100);
+        const second = @mod(w, 100);
+        if (minute > 59 or second > 59) return null;
+        break :blk ((@divTrunc(w, 10_000) * 60 + minute) * 60 + second) * US_PER_S;
+    } else blk: {
+        if (n.m < 0 or whole < 10_000_000_000) return null;
+        var buf: [40]u8 = undefined;
+        const digits = std.fmt.bufPrint(&buf, "{d}", .{whole}) catch return null;
+        break :blk switch (scanDatetime(digits, false)) {
+            .valid => |m| @mod(m.value, US_PER_DAY),
+            .not_datetime, .invalid => return null,
+        };
+    };
+    const micros = time_of_day + fraction;
+    return if (n.m < 0) -micros else micros;
 }
 
 /// TIMEDIFF(a, b): a - b as a TIME, for two TIMEs or two DATETIMEs; one of

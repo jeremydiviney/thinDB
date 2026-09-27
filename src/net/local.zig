@@ -3693,16 +3693,10 @@ fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {
     return out;
 }
 
-/// `YYYY-MM-DD` → days since the Unix epoch. Uses civil-from-days math
-/// (Howard Hinnant's algorithm) for correctness across leap years.
+/// `YYYY-MM-DD` → days since the Unix epoch. A day the month doesn't have
+/// is rejected, as MySQL's strict mode rejects it on INSERT.
 pub fn parseDateLiteral(s: []const u8) !i32 {
-    if (s.len < 10) return Error.TypeMismatch;
-    if (s[4] != '-' or s[7] != '-') return Error.TypeMismatch;
-    const year = try parseIntField(i32, s[0..4]);
-    const month = try parseIntField(u32, s[5..7]);
-    const day = try parseIntField(u32, s[8..10]);
-    if (month < 1 or month > 12 or day < 1 or day > 31) return Error.TypeMismatch;
-    return civilToDays(year, month, day);
+    return exec_common.parseDateString(s) catch Error.TypeMismatch;
 }
 
 pub fn parseDateTimeLiteral(s: []const u8) !i64 {
@@ -3727,15 +3721,6 @@ pub fn parseUuidLiteral(s: []const u8) !u128 {
     }
     if (idx != 32) return Error.TypeMismatch;
     return out;
-}
-
-fn parseIntField(comptime T: type, s: []const u8) !T {
-    return std.fmt.parseInt(T, s, 10) catch return Error.TypeMismatch;
-}
-
-fn civilToDays(year: i32, month: u32, day: u32) !i32 {
-    if (month == 0 or day == 0) return Error.TypeMismatch;
-    return wire_format.daysFromCivil(year, month, day);
 }
 
 fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {

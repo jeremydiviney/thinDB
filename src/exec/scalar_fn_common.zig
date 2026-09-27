@@ -100,16 +100,39 @@ pub fn ymdToDays(year: i32, month: u32, day: u32) i32 {
     return @as(i32, era * 146097) + @as(i32, @intCast(doe)) - 719468;
 }
 
+/// A DATE as MySQL reads it where a number is wanted: `YYYYMMDD`.
+pub fn dateNumber(days: i32) i64 {
+    const ymd = daysToYmd(days);
+    return (@as(i64, ymd.year) * 100 + ymd.month) * 100 + ymd.day;
+}
+
+/// A DATETIME as MySQL reads it where a number is wanted,
+/// `YYYYMMDDHHMMSS.ffffff`: the mantissa at scale 6.
+pub fn datetimeNumber(micros: i64) ScaledInt {
+    const hms = microsToHms(micros);
+    const clock = (@as(i64, hms.hour) * 100 + hms.minute) * 100 + hms.second;
+    const whole = @as(i128, dateNumber(daysFromDatetime(micros))) * 1_000_000 + clock;
+    return .{ .m = whole * std.time.us_per_s + @mod(micros, std.time.us_per_s), .s = 6 };
+}
+
+/// Whether (year, month, day) names a real day, as MySQL judges it: the day
+/// is within its month, and MySQL's year 0 has no February 29.
+pub fn validDate(year: i32, month: u32, day: u32) bool {
+    if (month < 1 or month > 12 or day < 1 or day > lastDayOfMonth(year, month)) return false;
+    return !(year == 0 and month == 2 and day == 29);
+}
+
 /// Parse a `YYYY-MM-DD` date string to days-since-epoch. Accepts a trailing
 /// time component (so a datetime string parses as its date part). Errors on a
-/// malformed prefix — callers use that to fall back / reject.
+/// malformed prefix or a day that doesn't exist (`2026-02-30`) — callers use
+/// that to fall back / reject.
 pub fn parseDateString(s: []const u8) !i32 {
     if (s.len < 10) return error.Invalid;
     if (s[4] != '-' or s[7] != '-') return error.Invalid;
     const year = try std.fmt.parseInt(i32, s[0..4], 10);
     const month = try std.fmt.parseInt(u32, s[5..7], 10);
     const day = try std.fmt.parseInt(u32, s[8..10], 10);
-    if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
+    if (!validDate(year, month, day)) return error.Invalid;
     return ymdToDays(year, month, day);
 }
 
@@ -122,13 +145,7 @@ pub fn parseDateString(s: []const u8) !i32 {
 /// a truncating parse would make `=` comparisons silently miss µs-precision
 /// rows (the original #148 bug).
 pub fn parseDateTimeString(s: []const u8) !i64 {
-    if (s.len < 10) return error.Invalid;
-    if (s[4] != '-' or s[7] != '-') return error.Invalid;
-    const year = try std.fmt.parseInt(i32, s[0..4], 10);
-    const month = try std.fmt.parseInt(u32, s[5..7], 10);
-    const day = try std.fmt.parseInt(u32, s[8..10], 10);
-    if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
-    const days = ymdToDays(year, month, day);
+    const days = try parseDateString(s);
 
     var idx: usize = 10;
     var day_micros: i64 = 0;

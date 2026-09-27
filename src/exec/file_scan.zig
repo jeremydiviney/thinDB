@@ -19,6 +19,7 @@ const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 
 const exec = @import("exec.zig");
+const date_text = @import("scalar_fn_common.zig");
 const Batch = exec.Batch;
 const Query = exec.Query;
 
@@ -781,12 +782,8 @@ fn hasFloatMarker(text: []const u8) bool {
 }
 
 fn parseDate(s: []const u8) !i32 {
-    if (s.len != 10 or s[4] != '-' or s[7] != '-') return error.FileScanCoercionFailed;
-    const y = try std.fmt.parseInt(i32, s[0..4], 10);
-    const m = try std.fmt.parseInt(u32, s[5..7], 10);
-    const d = try std.fmt.parseInt(u32, s[8..10], 10);
-    if (m < 1 or m > 12 or d < 1 or d > 31) return error.FileScanCoercionFailed;
-    return daysFromCivil(y, m, d);
+    if (s.len != 10) return error.FileScanCoercionFailed;
+    return date_text.parseDateString(s) catch error.FileScanCoercionFailed;
 }
 
 fn parseDateTime(s: []const u8) !i64 {
@@ -820,17 +817,6 @@ fn parseDateTime(s: []const u8) !i64 {
     const day_us: i64 = 86_400 * 1_000_000;
     const secs: i64 = @intCast(hh * 3600 + mm * 60 + ss);
     return @as(i64, days) * day_us + secs * 1_000_000 + @as(i64, @intCast(micros));
-}
-
-fn daysFromCivil(year: i32, month: u32, day: u32) i32 {
-    var y = year;
-    if (month <= 2) y -= 1;
-    const era = @divFloor(y, 400);
-    const yoe: u32 = @intCast(y - era * 400);
-    const mp: u32 = if (month > 2) month - 3 else month + 9;
-    const doy: u32 = (153 * mp + 2) / 5 + day - 1;
-    const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return @intCast(era * 146097 + @as(i32, @intCast(doe)) - 719468);
 }
 
 fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {

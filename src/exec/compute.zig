@@ -1404,6 +1404,7 @@ fn affineUnary(e: Expr, up_schema: []const Column) ?struct { src_idx: usize, aff
     }
     const k = intFamilyValueI128(lit_v) orelse return null;
     const idx = columnIndex(up_schema, col_name) orelse return null;
+    if (!arithReadsStoredValue(up_schema[idx].type)) return null;
 
     var scale: i128 = undefined;
     var offset: i128 = undefined;
@@ -1453,6 +1454,13 @@ pub fn mayVary(e: Expr, registry: ?*const udf_mod.UdfRegistry) bool {
     }
 }
 
+/// Whether arithmetic over a column of type `t` reads the stored value its
+/// min/max describe. A date or datetime reads as its YYYYMMDD[HHMMSS]
+/// number, not its stored day or microsecond count.
+fn arithReadsStoredValue(t: Type) bool {
+    return !t.isTemporal();
+}
+
 fn classifyExpr(e: Expr, up_schema: []const Column) StatClass {
     const c = switch (e) {
         .call => |x| x,
@@ -1463,7 +1471,9 @@ fn classifyExpr(e: Expr, up_schema: []const Column) StatClass {
     if (c.args.len == 2 and c.args[0] == .col_ref and c.args[1] == .col_ref) {
         const idx1 = columnIndex(up_schema, c.args[0].col_ref) orelse return .none;
         const idx2 = columnIndex(up_schema, c.args[1].col_ref) orelse return .none;
-        const op: ?simd.BinOp = if (std.mem.eql(u8, c.fn_name, "add"))
+        const op: ?simd.BinOp = if (!arithReadsStoredValue(up_schema[idx1].type) or !arithReadsStoredValue(up_schema[idx2].type))
+            null
+        else if (std.mem.eql(u8, c.fn_name, "add"))
             .add
         else if (std.mem.eql(u8, c.fn_name, "sub"))
             .sub
