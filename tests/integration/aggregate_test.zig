@@ -914,7 +914,7 @@ test "aggregate: count_if bool bit value and distinct numeric additions" {
     try std.testing.expectEqual(@as(i64, 1), b.values[3].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 7), b.values[4].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 5), b.values[5].data.bigint[0]);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), b.values[6].data.double[0], 1e-9);
+    try std.testing.expectEqual(@as(i64, 3), b.values[6].data.bigint[0]);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), b.values[7].data.double[0], 1e-9);
     try std.testing.expectEqualStrings("a", b.values[8].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("a", b.values[9].data.string.rowBytes(0));
@@ -1170,6 +1170,51 @@ test "aggregate: SUM(BIGINT) wraps identically on every aggregate path" {
             try expectKeySet(&.{ 1, 3 }, got);
         }
     }
+}
+
+test "aggregate: SUM and AVG over DISTINCT keep integers and decimals exact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE sd (id BIGINT PRIMARY KEY, g VARCHAR(4), n BIGINT, d DECIMAL(10,2), f DOUBLE, i INT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO sd VALUES (1, 'p', 9007199254740993, 0.10, 1.5, 1), (2, 'p', 1, 0.20, 1.5, 1),
+        \\  (3, 'p', 1, 0.20, 2.5, 2), (4, 'p', 1, 0.30, 2.5, 2), (5, 'q', 9007199254740995, -0.05, NULL, NULL),
+        \\  (6, 'q', NULL, NULL, NULL, NULL)
+    );
+
+    const cases = .{
+        .{ "SELECT SUM(DISTINCT n) FROM sd", &[_]i64{18014398509481989} },
+        .{ "SELECT SUM(DISTINCT n) FROM sd GROUP BY g ORDER BY g", &[_]i64{ 9007199254740994, 9007199254740995 } },
+        .{ "SELECT CAST(SUM(DISTINCT d) * 100 AS BIGINT) FROM sd", &[_]i64{55} },
+        .{ "SELECT CAST(AVG(DISTINCT d) * 100 AS BIGINT) FROM sd WHERE g = 'p'", &[_]i64{20} },
+        .{ "SELECT CAST(SUM(DISTINCT f) AS BIGINT) FROM sd", &[_]i64{4} },
+        .{ "SELECT SUM(DISTINCT i) FROM sd", &[_]i64{3} },
+        .{ "SELECT COUNT(*) FROM sd GROUP BY g HAVING SUM(DISTINCT d) > 0.5", &[_]i64{4} },
+        .{ "SELECT COALESCE(SUM(DISTINCT n), -1) FROM sd WHERE id > 100", &[_]i64{-1} },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("sd", .{})).flush();
+        inline for (cases) |case| {
+            const got = try helpers.collectBigints(allocator, db, case[0]);
+            defer allocator.free(got);
+            std.testing.expectEqualSlices(i64, case[1], got) catch |err| {
+                std.debug.print("query: {s}\n", .{case[0]});
+                return err;
+            };
+        }
+    }
+
+    // SUM(DISTINCT x) has SUM(x)'s type.
+    var q = try helpers.runSql(allocator, db, "SELECT SUM(DISTINCT n), SUM(DISTINCT d), SUM(DISTINCT f), AVG(DISTINCT d) FROM sd");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(thindb.types.TypeTag.bigint, std.meta.activeTag(schema[0].type));
+    try std.testing.expectEqual(@as(?thindb.types.DecimalSpec, .{ .p = 38, .s = 2 }), schema[1].type.decimalSpec());
+    try std.testing.expectEqual(thindb.types.TypeTag.double, std.meta.activeTag(schema[2].type));
+    try std.testing.expectEqual(thindb.types.TypeTag.double, std.meta.activeTag(schema[3].type));
 }
 
 test "aggregate: COUNT(DISTINCT a, b) counts distinct tuples with no NULL element" {

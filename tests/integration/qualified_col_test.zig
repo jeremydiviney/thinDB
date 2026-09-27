@@ -473,3 +473,32 @@ test "qualified refs in a single-table block name its one table" {
         try std.testing.expectEqualSlices(i64, bare, qualified);
     }
 }
+
+test "a schema- or database-qualified column resolves by its table name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupOrders(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT main.t.id FROM t ORDER BY main.t.id", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT public.t.id FROM public.t WHERE public.t.qty > 15 ORDER BY 1", &[_]i64{ 2, 3 } },
+        .{ "SELECT SUM(main.t.qty) FROM t", &[_]i64{60} },
+        .{ "SELECT main.t.id FROM t GROUP BY main.t.id HAVING SUM(main.t.qty) > 15 ORDER BY main.t.id", &[_]i64{ 2, 3 } },
+        .{ "SELECT main.o.oid FROM t JOIN o ON main.t.id = main.o.tid ORDER BY main.o.oid", &[_]i64{ 10, 11, 12 } },
+        .{ "SELECT main.t.id + main.t.qty FROM t ORDER BY 1", &[_]i64{ 11, 22, 33 } },
+        .{ "SELECT main.t.* FROM t ORDER BY id", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT main.t.* FROM t JOIN o ON t.id = o.tid ORDER BY o.oid", &[_]i64{ 1, 1, 3 } },
+    };
+    inline for (cases) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, case[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+    try helpers.expectRunError(allocator, db, "SELECT main.t.nope FROM t", error.ColumnNotFound);
+    try helpers.expectRunError(allocator, db, "SELECT a.main.t.id FROM t", error.SqlExpectedIdent);
+}

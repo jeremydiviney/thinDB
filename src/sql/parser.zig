@@ -1748,26 +1748,12 @@ pub const Parser = struct {
         // Qualified column? `table.col` — preserved as the dotted
         // string `qualifier.col` so a downstream lookup against a
         // scan renamed by `FROM t AS alias` finds the right column.
-        const dup_col = blk: {
-            if (self.cur.tag == .dot) {
-                try self.advance();
-                if (self.cur.tag == .star) {
-                    try self.advance();
-                    const qual = try self.arena.dupe(u8, first);
-                    const name = try std.fmt.allocPrint(self.arena, "{s}.*", .{qual});
-                    return ProjItem{ .name = name, .kind = .{ .star = qual } };
-                }
-                if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-                const second = self.cur.text;
-                try self.advance();
-                const buf = try self.arena.alloc(u8, first.len + 1 + second.len);
-                @memcpy(buf[0..first.len], first);
-                buf[first.len] = '.';
-                @memcpy(buf[first.len + 1 ..], second);
-                break :blk @as([]const u8, buf);
-            }
-            break :blk try self.arena.dupe(u8, first);
-        };
+        const ref = try self.qualifiedRef(first);
+        const dup_col = try self.dupRef(ref.table, ref.column orelse {
+            const qual = try self.arena.dupe(u8, ref.table.?);
+            const name = try std.fmt.allocPrint(self.arena, "{s}.*", .{qual});
+            return ProjItem{ .name = name, .kind = .{ .star = qual } };
+        });
 
         // A `col::type` postfix cast (PG) and/or a trailing binary
         // operator (`qty + 1`) lift the column ref into an expression.
@@ -2879,17 +2865,45 @@ pub const Parser = struct {
     /// reference survives long enough for a renamed scan (`FROM t AS
     /// alias`) to resolve it. Caller has already consumed the first
     /// identifier and passes its text as `first`.
-    fn dupQualifiedColRef(self: *Parser, first: []const u8) ParseError![]const u8 {
-        if (self.cur.tag != .dot) return try self.arena.dupe(u8, first);
-        try self.advance();
-        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-        const second = self.cur.text;
-        try self.advance();
-        const buf = try self.arena.alloc(u8, first.len + 1 + second.len);
-        @memcpy(buf[0..first.len], first);
-        buf[first.len] = '.';
-        @memcpy(buf[first.len + 1 ..], second);
-        return buf;
+    /// The column a reference names, cursor after its first name, as
+    /// `col` or `table.col` (`qualifiedRef`).
+    pub fn dupQualifiedColRef(self: *Parser, first: []const u8) ParseError![]const u8 {
+        const ref = try self.qualifiedRef(first);
+        return try self.dupRef(ref.table, ref.column orelse return ParseError.SqlExpectedIdent);
+    }
+
+    const QualifiedRef = struct {
+        table: ?[]const u8,
+        /// Null for `table.*`.
+        column: ?[]const u8,
+    };
+
+    /// A reference, cursor after its first name: `col`, `table.col`,
+    /// `table.*`, `schema.table.col` or `schema.table.*`. The schema (or
+    /// database) qualifier drops: a column resolves by its table name.
+    fn qualifiedRef(self: *Parser, first: []const u8) ParseError!QualifiedRef {
+        var table: ?[]const u8 = null;
+        var name = first;
+        var segments: usize = 1;
+        while (self.cur.tag == .dot) {
+            if (segments == 3) return ParseError.SqlExpectedIdent;
+            try self.advance();
+            if (self.cur.tag == .star) {
+                try self.advance();
+                return .{ .table = name, .column = null };
+            }
+            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+            table = name;
+            name = self.cur.text;
+            try self.advance();
+            segments += 1;
+        }
+        return .{ .table = table, .column = name };
+    }
+
+    fn dupRef(self: *Parser, table: ?[]const u8, column: []const u8) ParseError![]const u8 {
+        const t = table orelse return try self.arena.dupe(u8, column);
+        return try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ t, column });
     }
 
     /// Default name when a scalar expression has no AS alias — use the
