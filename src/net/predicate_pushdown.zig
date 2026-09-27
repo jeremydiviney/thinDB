@@ -60,7 +60,9 @@ pub fn pushJoinFilters(arena: Allocator, catalog: ?*api.Catalog, session: api.Se
 fn walk(ctx: Ctx, op: *ir.Op) anyerror!void {
     // Bottom-up: optimize children first, then try to push at this node.
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var => {},
+        .delete_op => |d| if (d.source) |s| try walk(ctx, s),
+        .update_op => |u| if (u.source) |s| try walk(ctx, s),
         .limit => |l| try walk(ctx, @constCast(l.upstream)),
         .select, .exclude => |p| try walk(ctx, @constCast(p.upstream)),
         .order_by => |o| try walk(ctx, @constCast(o.upstream)),
@@ -419,7 +421,9 @@ fn countMatRefs(arena: Allocator, op: *const ir.Op, map: *std.AutoHashMapUnmanag
         return countMatRefs(arena, op.materialize.upstream, map);
     }
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var => {},
+        .delete_op => |d| if (d.source) |s| try countMatRefs(arena, s, map),
+        .update_op => |u| if (u.source) |s| try countMatRefs(arena, s, map),
         .limit => |l| try countMatRefs(arena, l.upstream, map),
         .select, .exclude => |p| try countMatRefs(arena, p.upstream, map),
         .order_by => |o| try countMatRefs(arena, o.upstream, map),
@@ -452,7 +456,9 @@ fn walkComputeUnions(
     visited: *std.AutoHashMapUnmanaged(*const ir.Op, void),
 ) anyerror!void {
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var => {},
+        .delete_op => |d| if (d.source) |s| try walkComputeUnions(ctx, s, mat_refs, visited),
+        .update_op => |u| if (u.source) |s| try walkComputeUnions(ctx, s, mat_refs, visited),
         .limit => |l| try walkComputeUnions(ctx, @constCast(l.upstream), mat_refs, visited),
         .select, .exclude => |p| try walkComputeUnions(ctx, @constCast(p.upstream), mat_refs, visited),
         .order_by => |o| try walkComputeUnions(ctx, @constCast(o.upstream), mat_refs, visited),
