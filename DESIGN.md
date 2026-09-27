@@ -945,7 +945,7 @@ UnsupportedOperatorForType,
 SortNoKeys,
 AggregateNoSpecs, AggregateColumnRequired,
 AggregateUnsupportedType, AggregateInvalidParam,
-ArithmeticOverflow, SubqueryMultipleRows,
+ArithmeticOverflow, ValueOutOfRange, SubqueryMultipleRows,
 ComputeNoColumns, ComputeNameCollision, ComputeUnsupportedExpr,
 ComputeNoSuchOverload, ComputeTooManyArgs,
 JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
@@ -956,6 +956,8 @@ MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
 
 `ArithmeticOverflow` comes from decimal arithmetic and casts that leave the declared precision, and from `SUM(LARGEINT)` past the i128 range. Integer arithmetic and integer `SUM` up to BIGINT wrap instead of raising it (§3.4).
+
+`ValueOutOfRange` means INSERT or UPDATE wrote a value its column's type can't hold, such as 300 into a TINYINT or 127.5 into a TINYINT after rounding. MySQL's strict mode fails the statement the same way; a CAST clamps instead.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 

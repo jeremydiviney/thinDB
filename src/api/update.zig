@@ -36,6 +36,7 @@ const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 
 const exec = @import("../exec/exec.zig");
+const cast = @import("../exec/cast.zig");
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 
@@ -374,6 +375,7 @@ fn computeNewRows(
 
     for (schema.columns, 0..) |sc, ci| {
         var src_view: ColumnView = matched.stores[ci].view();
+        var src_type = sc.type;
         // Was this column assigned? If so, replace src_view with the
         // synthetic column from Compute's output.
         for (assignments, synth_names) |asn, syn| {
@@ -384,12 +386,19 @@ fn computeNewRows(
                 for (out.schema, 0..) |out_col, oi| {
                     if (std.mem.eql(u8, out_col.name, syn)) {
                         src_view = out.values[oi];
+                        src_type = out_col.type;
                         break;
                     }
                 }
                 break;
             }
         }
+        const assigned: ?ColumnView = if (cast.assignsByRule(src_type, sc.type))
+            try cast.assignColumn(allocator, src_view, src_type, sc.type, matched_count)
+        else
+            null;
+        defer if (assigned) |view| cast.freeAssignedColumn(allocator, view);
+        if (assigned) |view| src_view = view;
 
         // Allocate the destination store and copy src_view's rows in.
         out_stores[ci] = try ColumnStore.init(allocator, sc.type, sc.nullable);

@@ -92,6 +92,9 @@ pub const Error = error{
     AggregateUnsupportedType,
     AggregateInvalidParam,
     ArithmeticOverflow,
+    /// A value written into a column (INSERT, UPDATE) lies outside the
+    /// column type's range, as 300 for a TINYINT.
+    ValueOutOfRange,
     /// A scalar subquery returned more than one row for a row that reads it.
     SubqueryMultipleRows,
     /// Compute operator: no derived columns provided.

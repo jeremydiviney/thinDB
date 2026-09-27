@@ -17,6 +17,9 @@
 //! Each allowed cast has a cost (DuckDB-style). The resolver picks the
 //! lowest-cost overload by summing per-arg costs; exact matches bypass
 //! the lookup entirely (zero overhead on the hot path).
+//!
+//! The assignment rule, further down, is how INSERT and UPDATE convert a
+//! value to its column's type.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -26,6 +29,7 @@ const Type = types.Type;
 const TypeTag = types.TypeTag;
 
 const decimal = @import("scalar_fn_decimal.zig");
+const common = @import("scalar_fn_common.zig");
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -287,6 +291,142 @@ pub fn sameRepresentation(a: Type, b: Type) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Assignment: a value converted to the type of the column it is written into,
+// by INSERT ... VALUES, INSERT ... SELECT and UPDATE ... SET alike. MySQL's
+// strict mode sets the rule: a number or numeric text lands in any integer,
+// float or boolean column, and a fraction rounds half away from zero into an
+// integer column, as MySQL and DuckDB do (StarRocks truncates). Text that
+// isn't a number is a TypeMismatch, and a value the column can't hold is
+// ValueOutOfRange where a CAST would clamp it.
+// ---------------------------------------------------------------------------
+
+pub const AssignError = error{ TypeMismatch, ValueOutOfRange };
+
+/// Whether a column of type `from` written into a column of type `to`
+/// converts by the assignment rule.
+pub fn assignsByRule(from: Type, to: Type) bool {
+    if (@as(TypeTag, from) == @as(TypeTag, to)) return false;
+    const into_number = to.isInteger() or to.isFloat() or to == .boolean;
+    const from_number = from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean or
+        (from.isString() and from != .json);
+    return into_number and from_number;
+}
+
+/// A literal written into a column whose values are `T`: an integer type, a
+/// float type or `bool`.
+pub fn assignValue(comptime T: type, v: types.Value) AssignError!T {
+    return switch (v) {
+        .text => |s| assignText(T, s),
+        .date, .datetime, .decimal64, .decimal128, .uuid => error.TypeMismatch,
+        inline else => |x| assignNumber(T, x),
+    };
+}
+
+/// An integer, a float or a bool written into a `T` column.
+pub fn assignNumber(comptime T: type, v: anytype) AssignError!T {
+    if (@TypeOf(v) == bool) return assignNumber(T, @as(u1, @intFromBool(v)));
+    if (T == bool) return v != 0;
+    switch (@typeInfo(T)) {
+        .int => switch (@typeInfo(@TypeOf(v))) {
+            .int => return std.math.cast(T, v) orelse error.ValueOutOfRange,
+            .float => {
+                // The bounds are powers of two, which the float holds exactly.
+                const F = @TypeOf(v);
+                const limit: F = -@as(F, @floatFromInt(std.math.minInt(T)));
+                const rounded = @round(v);
+                if (!(rounded >= -limit and rounded < limit)) return error.ValueOutOfRange;
+                return @intFromFloat(rounded);
+            },
+            else => @compileError("assignNumber takes an integer, a float or a bool"),
+        },
+        .float => switch (@typeInfo(@TypeOf(v))) {
+            .int => return @floatFromInt(v),
+            .float => {
+                const out: T = @floatCast(v);
+                if (std.math.isInf(out) and !std.math.isInf(v)) return error.ValueOutOfRange;
+                return out;
+            },
+            else => @compileError("assignNumber takes an integer, a float or a bool"),
+        },
+        else => @compileError("assignNumber writes an integer, a float or a bool"),
+    }
+}
+
+/// A decimal, mantissa `m` at scale `scale`, written into a `T` column.
+pub fn assignScaled(comptime T: type, m: i128, scale: u8) AssignError!T {
+    if (T == bool) return m != 0;
+    if (@typeInfo(T) == .float) return assignNumber(T, @as(f64, @floatFromInt(m)) / std.math.pow(f64, 10.0, @floatFromInt(scale)));
+    const unit = decimal.pow10(scale);
+    const truncated = @divTrunc(m, unit);
+    const rounds_away = @abs(@rem(m, unit)) * 2 >= @abs(unit);
+    return assignNumber(T, if (!rounds_away) truncated else if (m < 0) truncated - 1 else truncated + 1);
+}
+
+/// Text written into a `T` column: a number read from the text, which an
+/// integer column takes exactly, digit for digit.
+pub fn assignText(comptime T: type, text: []const u8) AssignError!T {
+    if (T == bool) return common.textBoolean(text) orelse error.TypeMismatch;
+    if (@typeInfo(T) == .float) return assignNumber(T, common.textDouble(text) orelse return error.TypeMismatch);
+    return switch (common.textNumber(text) orelse return error.TypeMismatch) {
+        .exact => |d| assignScaled(T, d.m, d.s),
+        .float => |f| assignNumber(T, f),
+    };
+}
+
+/// `src`, a column of type `from`, written into a column of type `to`, a
+/// pair `assignsByRule` accepts. The rows land in a new column in
+/// `allocator`, which `freeAssignedColumn` frees; a NULL row lands as 0,
+/// and `src.nulls` carries over.
+pub fn assignColumn(allocator: Allocator, src: ColumnView, from: Type, to: Type, rows: usize) (AssignError || Allocator.Error)!ColumnView {
+    switch (to) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .boolean => |_, tag| {
+            const Slot = std.meta.Child(@FieldType(storage.column.ValueView, @tagName(tag)));
+            const dst = try allocator.alloc(Slot, rows);
+            errdefer allocator.free(dst);
+            try assignRows(if (tag == .boolean) bool else Slot, src, from, dst);
+            return .{ .data = @unionInit(storage.column.ValueView, @tagName(tag), dst), .nulls = src.nulls };
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+fn assignRows(comptime T: type, src: ColumnView, from: Type, dst: anytype) AssignError!void {
+    switch (src.data) {
+        .varchar, .string, .char, .json => |s| for (dst, 0..) |*d, i| {
+            d.* = if (src.isValid(i)) slotOf(try assignText(T, s.rowBytes(i))) else 0;
+        },
+        .boolean => |values| for (dst, values[0..dst.len], 0..) |*d, v, i| {
+            d.* = if (src.isValid(i)) slotOf(try assignNumber(T, v != 0)) else 0;
+        },
+        inline .decimal64, .decimal128 => |values| {
+            const scale = switch (from) {
+                .decimal64, .decimal128 => |spec| spec.s,
+                else => return error.TypeMismatch,
+            };
+            for (dst, values[0..dst.len], 0..) |*d, v, i| {
+                d.* = if (src.isValid(i)) slotOf(try assignScaled(T, v, scale)) else 0;
+            }
+        },
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => |values| for (dst, values[0..dst.len], 0..) |*d, v, i| {
+            d.* = if (src.isValid(i)) slotOf(try assignNumber(T, v)) else 0;
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+/// A converted value as its column stores it: a BOOLEAN as a byte.
+fn slotOf(v: anytype) if (@TypeOf(v) == bool) u8 else @TypeOf(v) {
+    return if (@TypeOf(v) == bool) @intFromBool(v) else v;
+}
+
+pub fn freeAssignedColumn(allocator: Allocator, view: ColumnView) void {
+    switch (view.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .boolean => |values| allocator.free(values),
+        else => unreachable,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Comptime-generated kernel factories. Each returns a function pointer with
 // the standard kernel signature so the Compute operator can call uniformly.
 // ---------------------------------------------------------------------------
@@ -488,4 +628,79 @@ test "kernelFor: every allowed cast has a kernel" {
             try std.testing.expectEqual(has_cost, has_kernel);
         }
     };
+}
+
+test "assignment: numbers and numeric text land in integer, float and boolean columns" {
+    const t = std.testing;
+    const ints = .{
+        .{ assignNumber(i32, @as(f64, 1.6)), 2 },
+        .{ assignNumber(i32, @as(f64, 1.5)), 2 },
+        .{ assignNumber(i32, @as(f64, -1.5)), -2 },
+        .{ assignNumber(i32, @as(f64, 2147483647.4)), 2147483647 },
+        .{ assignNumber(i8, @as(f32, 127.4)), 127 },
+        .{ assignNumber(i8, @as(i64, -128)), -128 },
+        .{ assignNumber(i32, true), 1 },
+        .{ assignText(i32, " 12 "), 12 },
+        .{ assignText(i32, "+7"), 7 },
+        .{ assignText(i32, "0012"), 12 },
+        .{ assignText(i32, "1.6"), 2 },
+        .{ assignText(i32, ".5"), 1 },
+        .{ assignText(i32, "-.5"), -1 },
+        .{ assignText(i32, "-2.49"), -2 },
+        .{ assignText(i32, "1e2"), 100 },
+        .{ assignScaled(i32, 250, 2), 3 },
+        .{ assignScaled(i32, -250, 2), -3 },
+        .{ assignScaled(i32, 249, 2), 2 },
+    };
+    inline for (ints) |c| try t.expectEqual(@as(i32, c[1]), @as(i32, try c[0]));
+    try t.expectEqual(@as(i64, 9007199254740993), try assignText(i64, "9007199254740993"));
+    try t.expectEqual(@as(i128, std.math.minInt(i128)), try assignText(i128, "-170141183460469231731687303715884105728"));
+
+    try t.expectEqual(@as(f64, 1.5), try assignText(f64, "1.5"));
+    try t.expectEqual(@as(f64, 25), try assignText(f64, " 2.5e1 "));
+    try t.expectEqual(@as(f64, 1), try assignNumber(f64, true));
+    try t.expectEqual(@as(f32, 2.5), try assignScaled(f32, 25, 1));
+    try t.expectEqual(true, try assignText(bool, "true"));
+    try t.expectEqual(true, try assignNumber(bool, @as(i32, 5)));
+    try t.expectEqual(false, try assignNumber(bool, @as(f64, 0)));
+
+    inline for (.{ "12abc", "", "-0x10", "abc", "1 2" }) |bad| {
+        try t.expectError(error.TypeMismatch, assignText(i32, bad));
+        try t.expectError(error.TypeMismatch, assignText(f64, bad));
+    }
+    try t.expectError(error.ValueOutOfRange, assignNumber(i8, @as(i32, 300)));
+    try t.expectError(error.ValueOutOfRange, assignText(i8, "300"));
+    try t.expectError(error.ValueOutOfRange, assignNumber(i8, @as(f64, 127.5)));
+    try t.expectError(error.ValueOutOfRange, assignNumber(i32, @as(f64, 2147483647.5)));
+    try t.expectError(error.ValueOutOfRange, assignNumber(i64, @as(f64, 9223372036854775808.0)));
+    try t.expectError(error.ValueOutOfRange, assignNumber(i64, std.math.nan(f64)));
+    try t.expectError(error.ValueOutOfRange, assignNumber(f32, @as(f64, 1e39)));
+    try t.expectError(error.ValueOutOfRange, assignScaled(i8, 12850, 2));
+    try t.expectError(error.TypeMismatch, assignValue(i32, .{ .date = 1 }));
+}
+
+test "assignment: a column converts row by row and keeps its NULLs" {
+    const t = std.testing;
+    const text: storage.column.StringView = .{ .offsets = &.{ 0, 2, 2, 5 }, .bytes = "122.5" };
+    const nulls = [_]u8{0b101};
+    const col = try assignColumn(t.allocator, .{ .data = .{ .varchar = text }, .nulls = &nulls }, .{ .varchar = 8 }, .smallint, 3);
+    defer freeAssignedColumn(t.allocator, col);
+    try t.expectEqualSlices(i16, &.{ 12, 0, 3 }, col.data.smallint);
+
+    const doubles = [_]f64{ 0.5, -0.5, 3 };
+    const bools = try assignColumn(t.allocator, .{ .data = .{ .double = &doubles } }, .double, .boolean, 3);
+    defer freeAssignedColumn(t.allocator, bools);
+    try t.expectEqualSlices(u8, &.{ 1, 1, 1 }, bools.data.boolean);
+
+    const decimals = [_]i64{ 150, -150, 149 };
+    const ints = try assignColumn(t.allocator, .{ .data = .{ .decimal64 = &decimals } }, .{ .decimal64 = .{ .p = 6, .s = 2 } }, .bigint, 3);
+    defer freeAssignedColumn(t.allocator, ints);
+    try t.expectEqualSlices(i64, &.{ 2, -2, 1 }, ints.data.bigint);
+
+    const wide = [_]i64{ 1, 40000 };
+    try t.expectError(error.ValueOutOfRange, assignColumn(t.allocator, .{ .data = .{ .bigint = &wide } }, .bigint, .smallint, 2));
+    try t.expect(assignsByRule(.{ .varchar = 8 }, .int));
+    try t.expect(!assignsByRule(.int, .int));
+    try t.expect(!assignsByRule(.json, .int));
+    try t.expect(!assignsByRule(.int, .{ .decimal64 = .{ .p = 6, .s = 2 } }));
 }
