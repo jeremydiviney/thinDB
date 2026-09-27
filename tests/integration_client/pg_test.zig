@@ -2492,3 +2492,70 @@ test "pg wire: two connections, A's temp invisible to B" {
     if (sctx_a.err) |e| return e;
     if (sctx_b.err) |e| return e;
 }
+
+test "pg wire: a batch runs every statement though one leads with SET or BEGIN" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 103;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try client.sendQuery("CREATE TABLE mix (id BIGINT PRIMARY KEY, v BIGINT)");
+    try std.testing.expect((try client.readQueryReply(arena.allocator())).error_code == null);
+
+    try client.sendQuery("SET client_encoding = 'UTF8'; INSERT INTO mix VALUES (1, 10)");
+    var reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqualStrings("INSERT 0 1", reply.command_tag);
+
+    // BEGIN still flips the transaction status mid-batch.
+    try client.sendQuery("BEGIN; INSERT INTO mix VALUES (2, 20); SELECT COUNT(*) FROM mix");
+    reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqual(@as(u8, 'T'), reply.tx_status);
+    try std.testing.expectEqualStrings("2", reply.rows[0][0].?);
+    try client.sendQuery("COMMIT");
+    reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(u8, 'I'), reply.tx_status);
+
+    // A later statement is parsed after the search_path change took effect.
+    try client.sendQuery("CREATE SCHEMA side; SET search_path = side; CREATE TABLE only_side (id BIGINT PRIMARY KEY); SELECT current_schema()");
+    reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqualStrings("side", reply.rows[0][0].?);
+    try client.sendQuery("SET search_path = public; SELECT COUNT(*) FROM side.only_side");
+    reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code == null);
+    try std.testing.expectEqualStrings("0", reply.rows[0][0].?);
+
+    // The first error ends the batch.
+    try client.sendQuery("SET client_encoding = 'UTF8'; SELECT * FROM missing_table; INSERT INTO mix VALUES (3, 30)");
+    reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(reply.error_code != null);
+    try client.sendQuery("SELECT COUNT(*) FROM mix");
+    reply = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("2", reply.rows[0][0].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
