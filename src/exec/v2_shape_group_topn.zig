@@ -254,13 +254,55 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     };
     plan.derived = request.derived;
     plan.scan_base_columns = try base_cols.toOwnedSlice(allocator);
-    errdefer allocator.free(plan.scan_base_columns);
+
+    // A hashed layout keys each group by a digest, and the key values exist
+    // only once emit late-materializes them: the in-pass comparator and HAVING
+    // evaluator would read every key part as zero. Such a query ranks and
+    // filters the finished groups instead.
+    const finish_after_emit = plan.hashed and readsKeyPart(plan, request);
+    var core_request = request;
+    if (finish_after_emit) {
+        core_request.order_specs = &.{};
+        core_request.having_filter = null;
+        core_request.limit = 0;
+        core_request.offset = 0;
+    }
 
     traceAccepted(request, plan);
+    var q = try pipelineQuery(allocator, table, core_request, plan);
+    if (!finish_after_emit) return q;
+    errdefer q.deinit();
+    if (request.having_filter) |having| q = try q.filter(having);
+    if (request.order_specs.len > 0) {
+        q = if (request.limit != 0)
+            try q.topN(request.order_specs, request.limit, request.offset)
+        else
+            try q.orderBy(request.order_specs);
+    } else if (request.limit != 0) {
+        q = try q.limitOffset(request.limit, request.offset);
+    }
+    return q;
+}
+
+/// Owns `plan.scan_base_columns` from the call on.
+fn pipelineQuery(allocator: Allocator, table: *api.Table, request: Request, plan: ShapePlan) !Query {
+    errdefer allocator.free(plan.scan_base_columns);
     const op = try allocator.create(GroupTopNPipeline);
     errdefer allocator.destroy(op);
     op.* = try GroupTopNPipeline.init(allocator, table, request, plan);
     return exec.makeQuery(allocator, op);
+}
+
+fn readsKeyPart(plan: ShapePlan, request: Request) bool {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        for (request.order_specs) |spec| {
+            if (types.columnNameEql(spec.col, part.name)) return true;
+        }
+        if (request.having_filter) |having| {
+            if (exec.predicate.touchesColumn(having, part.name)) return true;
+        }
+    }
+    return false;
 }
 
 fn findDerived(derived: []const compute.Derived, name: []const u8) ?compute.Derived {

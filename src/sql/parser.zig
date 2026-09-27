@@ -1181,7 +1181,7 @@ pub const Parser = struct {
             grouping_key = dgk;
             group_alias_renames = try self.aliasRenames(proj, group_cols);
         } else if (has_agg or has_group) {
-            const res = try self.resolveGroupBy(proj, group_exprs);
+            const res = try self.resolveGroupBy(proj, group_exprs, from_op);
             group_cols = res.cols;
             grouping_key = res.gk;
             const keys: GroupKeys = .{ .exprs = group_exprs, .cols = group_cols };
@@ -2319,10 +2319,10 @@ pub const Parser = struct {
         const cond = try self.parseBoolExpr();
         self.case_scope.reaches_every_row = false;
         try self.expect(.comma);
-        const then_expr = try self.parseCallArg();
+        const then_expr = try self.parseValueExpr();
         try self.expect(.comma);
         const else_expr = try self.arena.create(ir.Expr);
-        else_expr.* = try self.parseCallArg();
+        else_expr.* = try self.parseValueExpr();
         try self.expect(.rparen);
 
         const branches = try self.arena.alloc(ir.Expr.Branch, 1);
@@ -2332,7 +2332,8 @@ pub const Parser = struct {
 
     /// Whether the value starting at `cur` is a predicate: it opens with NOT
     /// or EXISTS, or a comparison, IS, IN, BETWEEN, LIKE, AND or OR sits
-    /// outside every parenthesis and CASE before the value ends.
+    /// outside every parenthesis and CASE before the value ends. A CASE
+    /// value ends at its WHEN, THEN, ELSE or END.
     fn predicateValueAhead(self: *Parser) ParseError!bool {
         if (self.cur.tag == .kw_not or self.cur.tag == .kw_exists) return true;
         var look = self.lex.*;
@@ -2346,7 +2347,7 @@ pub const Parser = struct {
                     depth -= 1;
                 },
                 .eof, .semicolon => return false,
-                .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into, .kw_on => {
+                .comma, .kw_when, .kw_then, .kw_else, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into, .kw_on => {
                     if (depth == 0) return false;
                 },
                 .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq, .kw_is, .kw_in, .kw_between, .kw_like, .kw_regexp, .kw_and, .amp_amp, .kw_or, .kw_not => {
@@ -3220,7 +3221,7 @@ pub const Parser = struct {
         errdefer self.abandonCase(outer);
         // Simple CASE (`CASE x WHEN v THEN ...`): each branch tests `x = v`,
         // so a NULL operand takes no WHEN.
-        const operand: ?ir.Expr = if (self.cur.tag == .kw_when) null else try self.parseCallArg();
+        const operand: ?ir.Expr = if (self.cur.tag == .kw_when) null else try self.parseValueExpr();
         if (self.cur.tag != .kw_when) return ParseError.SqlExpectedKeyword;
 
         var branches: std.ArrayList(ir.Expr.Branch) = .empty;
@@ -3229,14 +3230,14 @@ pub const Parser = struct {
         while (self.cur.tag == .kw_when) {
             try self.advance();
             const cond = if (operand) |x|
-                try parse_predicate.makeExprComparisonPredicate(self, x, .eq, try self.parseCallArg())
+                try parse_predicate.makeExprComparisonPredicate(self, x, .eq, try self.parseValueExpr())
             else
                 try self.parseBoolExpr();
             // Past the first WHEN, a row reaches only what no earlier WHEN took.
             self.case_scope.reaches_every_row = false;
             if (self.cur.tag != .kw_then) return ParseError.SqlExpectedKeyword;
             try self.advance();
-            const then_expr = try self.parseCallArg();
+            const then_expr = try self.parseValueExpr();
             try branches.append(self.arena, .{ .cond = cond, .then = then_expr });
         }
 
@@ -3244,7 +3245,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_else) {
             try self.advance();
             const eb = try self.arena.create(ir.Expr);
-            eb.* = try self.parseCallArg();
+            eb.* = try self.parseValueExpr();
             else_branch = eb;
         }
 
@@ -6617,18 +6618,33 @@ pub const Parser = struct {
     /// a projected column (by ordinal, by name/alias, or by structural
     /// expression match), yielding the grouping-key column names and a
     /// per-projection flag. A bare column not present in the SELECT list
-    /// is grouped directly.
-    fn resolveGroupBy(self: *Parser, proj: []const ProjItem, group_exprs: []const ir.Expr) ParseError!GroupByResolution {
+    /// is grouped directly. A bare name FROM exposes means that column even
+    /// when a SELECT alias spells it too (`SELECT n % 2 AS n ... GROUP BY
+    /// n` groups on `n`), as in MySQL, StarRocks, PostgreSQL and DuckDB.
+    fn resolveGroupBy(self: *Parser, proj: []const ProjItem, group_exprs: []const ir.Expr, from: ?*const ir.Op) ParseError!GroupByResolution {
         const gk = try self.arena.alloc(bool, proj.len);
         @memset(gk, false);
         var cols: std.ArrayList([]const u8) = .empty;
         defer cols.deinit(self.arena);
+        var from_columns: ?[]const []const u8 = null;
         for (group_exprs) |ge| {
             if (ordinalOf(ge)) |k| {
                 if (k < 1 or k > proj.len) return ParseError.SqlInvalidProjection;
                 try self.markGroupKey(proj, gk, k - 1, &cols);
                 continue;
             }
+            if (ge == .col_ref) if (from) |source| {
+                const name = ge.col_ref;
+                from_columns = from_columns orelse try self.sourceColumns(source);
+                if (from_columns) |columns| if (nameIn(name, columns) or exposesColumn(columns, name)) {
+                    if (findColumnItem(proj, name)) |idx| {
+                        try self.markGroupKey(proj, gk, idx, &cols);
+                    } else {
+                        try cols.append(self.arena, try self.arena.dupe(u8, name));
+                    }
+                    continue;
+                };
+            };
             if (findGroupMatch(proj, ge)) |idx| {
                 try self.markGroupKey(proj, gk, idx, &cols);
                 continue;
@@ -6682,6 +6698,15 @@ pub const Parser = struct {
         };
         if (n < 1) return null;
         return @intCast(n);
+    }
+
+    /// The SELECT item that reads column `name` as it is.
+    fn findColumnItem(proj: []const ProjItem, name: []const u8) ?usize {
+        for (proj, 0..) |p, i| switch (p.kind) {
+            .col => |c| if (groupColumnNameEql(c, name)) return i,
+            else => {},
+        };
+        return null;
     }
 
     fn findGroupMatch(proj: []const ProjItem, ge: ir.Expr) ?usize {

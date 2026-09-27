@@ -467,3 +467,55 @@ test "predicates read as values: TRUE, FALSE, or NULL where unknown" {
         try std.testing.expectEqualSlices(u8, &.{ 0, 1, 1, 1, 1 }, batch.values[0].data.boolean[0..batch.row_count]);
     }
 }
+
+test "a predicate reads as a value in a CASE or IF branch (issue #332)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, b BIGINT NOT NULL, c BIGINT)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, 9000, 1), (2, 2, NULL), (3, 9000, 5), (4, 4, 2)");
+
+    const truth_cases = .{
+        .{ "SELECT CASE WHEN b > 100 THEN NULL ELSE b > 10 END AS v FROM t ORDER BY id", &[_]i64{ -1, 0, -1, 0 } },
+        .{ "SELECT CASE WHEN b > 100 THEN b > 10 END AS v FROM t ORDER BY id", &[_]i64{ 1, -1, 1, -1 } },
+        .{ "SELECT IF(b > 100, NULL, b > 3) AS v FROM t ORDER BY id", &[_]i64{ -1, 0, -1, 1 } },
+        .{ "SELECT IF(b > 100, b = 9000, NOT b > 3) AS v FROM t ORDER BY id", &[_]i64{ 1, 1, 1, 0 } },
+        .{ "SELECT CASE WHEN b > 100 THEN c > 2 WHEN b > 3 THEN c IS NULL ELSE c BETWEEN 1 AND 3 END AS v FROM t ORDER BY id", &[_]i64{ 0, -1, 1, 0 } },
+        .{ "SELECT CASE b WHEN 9000 THEN c > 2 ELSE c IN (1, 2) END AS v FROM t ORDER BY id", &[_]i64{ 0, -1, 1, 1 } },
+        .{ "SELECT CASE WHEN b > 100 THEN CASE WHEN c > 2 THEN c < 9 ELSE c = 1 END ELSE b > 3 AND c > 1 END AS v FROM t ORDER BY id", &[_]i64{ 1, 0, 1, 1 } },
+        .{ "SELECT CASE WHEN b > 100 THEN (c > 1) ELSE (b > 3) END AS v FROM t ORDER BY id", &[_]i64{ 0, 0, 1, 1 } },
+    };
+    inline for (truth_cases) |case| {
+        errdefer std.debug.print("query: {s}\n", .{case[0]});
+        const got = try collectTruth(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    const bigint_cases = .{
+        .{ "SELECT CASE WHEN b > 100 THEN 5 ELSE b > 3 END AS v FROM t ORDER BY id", &[_]i64{ 5, 0, 5, 1 } },
+        .{ "SELECT SUM(CASE WHEN b > 100 THEN c > 1 ELSE 0 END) AS v FROM t", &[_]i64{1} },
+        .{ "SELECT id FROM t WHERE IF(b > 100, c > 1, b > 3) ORDER BY id", &[_]i64{ 3, 4 } },
+        .{ "SELECT id FROM t WHERE CASE WHEN b > 100 THEN c > 1 ELSE b > 3 END ORDER BY id", &[_]i64{ 3, 4 } },
+    };
+    inline for (bigint_cases) |case| {
+        errdefer std.debug.print("query: {s}\n", .{case[0]});
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+
+    // A simple CASE's operand and WHEN values read predicates too.
+    inline for (.{
+        "SELECT CASE b > 100 WHEN TRUE THEN 'big' ELSE 'small' END AS v FROM t ORDER BY id",
+        "SELECT CASE 1 WHEN b > 100 THEN 'big' ELSE 'small' END AS v FROM t ORDER BY id",
+    }) |sql| {
+        errdefer std.debug.print("query: {s}\n", .{sql});
+        const got = try helpers.collectStrings(allocator, db, sql);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 4), got.len);
+        for (got, [_][]const u8{ "big", "small", "big", "small" }) |cell, want| try std.testing.expectEqualStrings(want, cell.?);
+    }
+}
