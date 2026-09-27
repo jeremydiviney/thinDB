@@ -64,7 +64,8 @@ fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !?@import("../types.zig"
 
 pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
     switch (op.*) {
-        .scan, .file_scan, .ddl, .show, .insert, .copy, .single_row, .admin => {},
+        .scan, .file_scan, .ddl, .show, .copy, .single_row, .admin => {},
+        .insert => |i| try resolveDuplicateAssignments(ctx, i.on_duplicate),
         .alias => |a| try resolveSubqueriesInOp(ctx, @constCast(a.upstream)),
         .table_fn => |t| for (t.inputs) |inp| try resolveSubqueriesInOp(ctx, inp),
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
@@ -119,8 +120,19 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
             try resolveSubqueriesInOp(ctx, @constCast(u.right));
         },
         .create_table_as => |c| try resolveSubqueriesInOp(ctx, @constCast(c.source)),
-        .insert_select => |i| try resolveSubqueriesInOp(ctx, @constCast(i.source)),
+        .insert_select => |i| {
+            try resolveSubqueriesInOp(ctx, @constCast(i.source));
+            try resolveDuplicateAssignments(ctx, i.on_duplicate);
+        },
     }
+}
+
+/// ON DUPLICATE KEY UPDATE values are evaluated per duplicate row with only
+/// the stored and incoming rows in scope, so a subquery or `@var` in one
+/// binds to its literal first, as an UPDATE's assignments do.
+fn resolveDuplicateAssignments(ctx: *CompileCtx, on_duplicate: ?ir.OnDuplicate) anyerror!void {
+    const od = on_duplicate orelse return;
+    for (od.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
 }
 
 fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {

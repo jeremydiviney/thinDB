@@ -136,6 +136,25 @@ test "ON DUPLICATE KEY UPDATE after INSERT ... SELECT names the source" {
     try expectInts(allocator, db, "SELECT a FROM dim WHERE id = 2", &.{15});
 }
 
+test "ON DUPLICATE KEY UPDATE binds subqueries and user variables" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openDim(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE other (w INT NOT NULL, PRIMARY KEY (w))");
+    try exec(allocator, db, "INSERT INTO other (w) VALUES (7), (70)");
+
+    try exec(allocator, db, "INSERT INTO dim (id, a) VALUES (1, 5) ON DUPLICATE KEY UPDATE a = (SELECT MAX(w) FROM other)");
+    try exec(allocator, db, "SET @x = 3; INSERT INTO dim (id, a) VALUES (2, 5) ON DUPLICATE KEY UPDATE a = a + @x");
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 70, 23 });
+
+    try exec(allocator, db, "SET @y = 100; INSERT INTO dim (id, a) SELECT w, w FROM other ON DUPLICATE KEY UPDATE a = @y");
+    try exec(allocator, db, "SET @y = 100; INSERT INTO dim (id, a) SELECT w, w FROM other ON DUPLICATE KEY UPDATE a = @y");
+    try expectInts(allocator, db, "SELECT id FROM dim ORDER BY id", &.{ 1, 2, 7, 70 });
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 70, 23, 100, 100 });
+}
+
 test "ON DUPLICATE KEY UPDATE rejects a moved key and unknown names" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
