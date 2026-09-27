@@ -516,6 +516,10 @@ const ProjItem = struct {
     /// `COUNT(*)`, `a+1`; PostgreSQL's `count`, `?column?`), which the plan
     /// can't bind by, as two items may share it or it may be any text.
     display: ?[]const u8 = null,
+    /// `display` is the name the item was bound by, moved off `name` by
+    /// `privatizeShadowingItems`: bare ORDER BY and GROUP BY names reach it,
+    /// and it replaces a column `*` brought in, as `name` did.
+    display_is_alias: bool = false,
     kind: Kind,
 
     const Kind = union(enum) {
@@ -949,12 +953,14 @@ pub const Parser = struct {
         var from_is_join = false;
         var from_is_aliased = false;
         var from_inputs: []const ChainInput = &.{};
+        var from_op: ?*const ir.Op = null;
         var proj = parsed_proj;
         const has_from = self.cur.tag == .kw_from;
         if (has_from) try self.advance();
         if (has_from and !self.atDual()) {
             const from = try self.parseFromClause();
             root = from.op;
+            from_op = from.op;
             from_inputs = from.inputs;
             from_is_join = fromClauseIsJoin(root);
             from_is_aliased = from.sole_unaliased_name == null;
@@ -1032,6 +1038,7 @@ pub const Parser = struct {
             try self.advance();
             pending_qualify = try self.parseBoolExpr();
         }
+        if (from_op) |source| proj = try self.privatizeShadowingItems(proj, source, group_exprs);
         // In a set-operation chain, ORDER BY / LIMIT order and cut the chain's
         // rows: `parseSetOpTail` reads them once the chain ends.
         const set_op_follows = union_arm or isSetOpKeyword(self.cur.tag);
@@ -1133,6 +1140,7 @@ pub const Parser = struct {
         // those over input columns are evaluated before the GroupBy, and
         // those over grouped output per group above it.
         var post_group_pred_derived: []const ir.Derived = &.{};
+        var group_alias_renames: []const exec_predicate.ColRename = &.{};
         if (distinct) {
             // SELECT DISTINCT a, b, expr ≡ SELECT a, b, expr GROUP BY 1, 2, 3:
             // every projected item becomes a grouping key (markGroupKey
@@ -1147,6 +1155,7 @@ pub const Parser = struct {
             for (proj, 0..) |_, i| try self.markGroupKey(proj, dgk, i, &dcols);
             group_cols = try dcols.toOwnedSlice(self.arena);
             grouping_key = dgk;
+            group_alias_renames = try self.aliasRenames(proj, group_cols);
         } else if (has_agg or has_group) {
             const res = try self.resolveGroupBy(proj, group_exprs);
             group_cols = res.cols;
@@ -1161,6 +1170,12 @@ pub const Parser = struct {
                 grouping_names = try groupingColumnNames(self.arena, grouping_calls.items.len);
                 after_group_extra = try std.mem.concat(self.arena, []const u8, &.{ hidden_agg_cols, grouping_names });
                 if (grouping_sets == null) grouping_sets = try self.arena.dupe(u64, &.{lowBits(group_cols.len)});
+            }
+            group_alias_renames = try self.aliasRenames(proj, group_cols);
+            if (group_alias_renames.len > 0) {
+                const aliases = try self.arena.alloc([]const u8, group_alias_renames.len);
+                for (group_alias_renames, aliases) |r, *alias| alias.* = r.from;
+                after_group_extra = try std.mem.concat(self.arena, []const u8, &.{ after_group_extra, aliases });
             }
             if (pred_derived.len > 0) {
                 var pre: std.ArrayList(ir.Derived) = .empty;
@@ -1346,6 +1361,7 @@ pub const Parser = struct {
                     .aggs = aggs_slice,
                     .upstream = root,
                 } });
+            const group_op = root;
 
             // Recompute the collapsed keys once per output group, directly
             // above the GroupBy so HAVING / ORDER BY / the final Project all
@@ -1408,6 +1424,7 @@ pub const Parser = struct {
             if (distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
+            if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, group_op, group_alias_renames);
         } else {
             // HAVING without GROUP BY / aggregates is rejected — would
             // be silently equivalent to WHERE, which masks user intent.
@@ -1458,7 +1475,8 @@ pub const Parser = struct {
                 // by most dialects (acts as a HAVING), but reject for
                 // now — encourage users to use WHERE instead.
                 if (!has_window) return ParseError.SqlInvalidProjection;
-                root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
+                const bound = try exec_predicate.deepClonePredicateRenamed(self.arena, pred, try self.aliasRenames(proj, &.{}));
+                root = try self.allocOp(.{ .filter = .{ .predicate = bound, .upstream = root } });
             }
             root = try self.addOrderKeyComputes(root, order_anchors, order_keys);
             if (pending_order_specs) |specs| {
@@ -1806,7 +1824,7 @@ pub const Parser = struct {
     /// keeps both.
     fn projectMayReplaceOutput(p: ProjItem) bool {
         return switch (p.kind) {
-            .expr, .window => p.display == null,
+            .expr, .window => p.display == null or p.display_is_alias,
             .col => projectOutputName(p) != null,
             else => false,
         };
@@ -3812,6 +3830,101 @@ pub const Parser = struct {
             star = try self.appendInputStar(star, right.name, right_input);
         }
         return .{ .op = root, .inputs = inputs.items, .star = star };
+    }
+
+    /// A computed item named like a column it would replace hides that
+    /// column from everything read after it: `SELECT 'x' AS n, n` would read
+    /// `x` twice, and window specs and aggregate arguments would read the
+    /// item too. MySQL binds such a bare name to the column. The item is
+    /// computed under a private name instead, and its name becomes the
+    /// display name the final projection shows. A per-row item gives way to
+    /// any FROM column; an aggregate only to one GROUP BY may keep, the only
+    /// FROM columns left beside it. A name no such column has keeps naming
+    /// the item, so a later item may still read it.
+    fn privatizeShadowingItems(self: *Parser, proj: []const ProjItem, from: *const ir.Op, group_exprs: []const ir.Expr) ParseError![]const ProjItem {
+        var columns: ?[]const []const u8 = null;
+        var out: ?[]ProjItem = null;
+        for (proj, 0..) |p, i| {
+            switch (p.kind) {
+                .expr, .window, .agg => {},
+                .col, .star => continue,
+            }
+            const source = columns orelse try self.sourceColumns(from) orelse return proj;
+            columns = source;
+            if (!nameIn(p.name, source) and !exposesColumn(source, p.name)) continue;
+            if (p.kind == .agg and !groupMayKeepColumn(proj, group_exprs, p.name)) continue;
+            const items = out orelse try self.arena.dupe(ProjItem, proj);
+            out = items;
+            items[i].name = try std.fmt.allocPrint(self.arena, "__alias_{d}", .{i});
+            if (p.display == null) {
+                items[i].display = p.name;
+                items[i].display_is_alias = true;
+            }
+        }
+        return out orelse proj;
+    }
+
+    /// Where a bare name an alias carries means the item, it reads the
+    /// item's private column: above the GroupBy, where only the columns in
+    /// `group_cols` remain of FROM, and in QUALIFY, which filters the
+    /// finished row as HAVING filters the grouped one.
+    fn aliasRenames(self: *Parser, proj: []const ProjItem, group_cols: []const []const u8) ParseError![]const exec_predicate.ColRename {
+        var renames: std.ArrayList(exec_predicate.ColRename) = .empty;
+        for (proj) |p| {
+            if (!p.display_is_alias) continue;
+            const alias = p.display.?;
+            if (nameInList(alias, group_cols)) continue;
+            try renames.append(self.arena, .{ .from = alias, .to = p.name });
+        }
+        return try renames.toOwnedSlice(self.arena);
+    }
+
+    /// The ops `top` stacks on `group_op`, each reading its columns through
+    /// `renames`. The columns an op defines keep their names, and the
+    /// final projection already reads each item by its private name.
+    fn renameAboveGroup(self: *Parser, top: *ir.Op, group_op: *const ir.Op, renames: []const exec_predicate.ColRename) ParseError!*ir.Op {
+        if (top == group_op) return top;
+        const out = try self.arena.create(ir.Op);
+        out.* = top.*;
+        switch (out.*) {
+            .select => |*p| p.upstream = try self.renameAboveGroup(p.upstream, group_op, renames),
+            .compute => |*c| {
+                const derived = try self.arena.alloc(ir.Derived, c.derived.len);
+                for (c.derived, derived) |d, *renamed| {
+                    renamed.* = .{ .name = d.name, .expr = try exec_expr.deepCloneRenamed(self.arena, d.expr, renames) };
+                }
+                c.derived = derived;
+                c.upstream = try self.renameAboveGroup(c.upstream, group_op, renames);
+            },
+            .filter => |*f| {
+                f.predicate = try exec_predicate.deepClonePredicateRenamed(self.arena, f.predicate, renames);
+                f.upstream = try self.renameAboveGroup(f.upstream, group_op, renames);
+            },
+            .order_by => |*o| {
+                o.specs = try renamedSortSpecs(self.arena, o.specs, renames);
+                o.upstream = try self.renameAboveGroup(o.upstream, group_op, renames);
+            },
+            .window => |*w| {
+                const specs = try self.arena.dupe(ir.WindowSpec, w.specs);
+                for (specs) |*s| {
+                    const partition = try self.arena.alloc([]const u8, s.partition_by.len);
+                    for (s.partition_by, partition) |col, *renamed| renamed.* = exec_predicate.renameOf(renames, col);
+                    s.partition_by = partition;
+                    s.order_by = try renamedSortSpecs(self.arena, s.order_by, renames);
+                }
+                const calls = try self.arena.dupe(ir.WindowCall, w.calls);
+                for (calls) |*call| {
+                    const args = try self.arena.alloc(ir.Expr, call.args.len);
+                    for (call.args, args) |arg, *renamed| renamed.* = try exec_expr.deepCloneRenamed(self.arena, arg, renames);
+                    call.args = args;
+                }
+                w.specs = specs;
+                w.calls = calls;
+                w.upstream = try self.renameAboveGroup(w.upstream, group_op, renames);
+            },
+            else => return top,
+        }
+        return out;
     }
 
     /// A lone unaliased FROM source is named by itself, so its `name.*` is
@@ -6531,6 +6644,9 @@ pub const Parser = struct {
                     else => {},
                 };
                 for (proj, 0..) |p, i| {
+                    // Such an alias repeats a FROM column, which GROUP BY can
+                    // group on where it can't group on the item.
+                    if (p.display_is_alias and (p.kind == .agg or p.kind == .window)) continue;
                     if (displayNameBinds(p, name)) return i;
                 }
                 return null;
@@ -6837,10 +6953,11 @@ fn orderNameSource(proj: []const ProjItem, name: []const u8) []const u8 {
 /// Whether ORDER BY or GROUP BY `name` refers to `p` by its display name,
 /// as a quoted `COUNT(*)` or `a+1` does. Only a name that isn't an
 /// identifier binds: MySQL also lets `SELECT 'a' ... ORDER BY a` sort by the
-/// constant rather than the column `a`, which is a trap.
+/// constant rather than the column `a`, which is a trap. An alias always
+/// binds.
 fn displayNameBinds(p: ProjItem, name: []const u8) bool {
     const display = p.display orelse return false;
-    return types.columnNameEql(display, name) and !types.isPlainIdentifier(display);
+    return types.columnNameEql(display, name) and (p.display_is_alias or !types.isPlainIdentifier(display));
 }
 
 fn projectionHasRenamedCols(proj: []const ProjItem) bool {
@@ -7498,6 +7615,26 @@ fn exposesColumn(columns: []const []const u8, name: []const u8) bool {
         if (types.columnNameEql(types.unqualifiedName(c), name)) return true;
     }
     return false;
+}
+
+/// Whether FROM column `name` may reach past the GroupBy: GROUP BY names it,
+/// or a plain SELECT column reads it, which only a grouped column can be.
+fn groupMayKeepColumn(proj: []const ProjItem, group_exprs: []const ir.Expr, name: []const u8) bool {
+    for (group_exprs) |ge| switch (ge) {
+        .col_ref => |c| if (types.columnNameEql(types.unqualifiedName(c), name)) return true,
+        else => {},
+    };
+    for (proj) |p| switch (p.kind) {
+        .col => |c| if (types.columnNameEql(types.unqualifiedName(c), name)) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn renamedSortSpecs(arena: Allocator, specs: []const ir.SortSpec, renames: []const exec_predicate.ColRename) ParseError![]const ir.SortSpec {
+    const out = try arena.dupe(ir.SortSpec, specs);
+    for (out) |*s| s.col = exec_predicate.renameOf(renames, s.col);
+    return out;
 }
 
 fn combineJoinSides(a: JoinExprSide, b: JoinExprSide) JoinExprSide {

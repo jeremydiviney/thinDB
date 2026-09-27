@@ -178,6 +178,29 @@ pub fn collectBigintsCtx(allocator: std.mem.Allocator, db: anytype, sql: []const
     return out.toOwnedSlice(allocator);
 }
 
+/// Every cell of a result whose columns are all INT or BIGINT, row by row,
+/// NULL as null.
+pub fn collectIntCells(allocator: std.mem.Allocator, q: *RunResult) ![]?i64 {
+    var out: std.ArrayList(?i64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            for (batch.values) |column| {
+                if (!column.isValid(row)) {
+                    try out.append(allocator, null);
+                    continue;
+                }
+                try out.append(allocator, switch (column.data) {
+                    .int => |values| values[row],
+                    .bigint => |values| values[row],
+                    else => return error.TestUnexpectedResult,
+                });
+            }
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Asserts that compiling `sql` against `db` returns `expected`. Useful
 /// for tests that exercise parse-time and compile-time error paths.
 pub fn expectRunError(

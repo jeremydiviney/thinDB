@@ -490,6 +490,18 @@ identifier, such as `` `n+1` ``. A result's columns stay uniquely named, so a
 shown name that repeats an earlier one gets a `_N` suffix. MySQL and PostgreSQL
 would allow the duplicate.
 
+A bare name in the SELECT list, a window spec or an aggregate argument reads the
+FROM column of that name, as MySQL binds it, even after an item aliased to the
+same name: `SELECT 'x' AS n, n` shows `x` and the column. The parser computes
+such an item under a private name and shows it under its alias. An aggregate
+gives way only to a column the GROUP BY keeps. A name no FROM column has still
+reads an earlier item (`SELECT a + 1 AS b, b * 2`), which MySQL rejects. Beside
+`*` the item takes the slot of the column it names (`SELECT *, f(n) AS n`), where
+MySQL shows both. A bare ORDER BY name and QUALIFY read the alias. HAVING reads
+a grouped column of that name, else the alias. An ORDER BY expression reads the
+column. GROUP BY still tries the aliases first (#328). `SELECT n, t.n FROM t`
+names the repeat `n_1`, as `SELECT n, n` does.
+
 Before preparing a fused hash join, a pure filter over an existing materialized
 stage may check that stage for a surviving probe row. An empty probe skips the
 lookup builds through a chain of non-FULL joins. The check reuses stage buffers,
