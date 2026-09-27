@@ -140,6 +140,7 @@ pub fn resolveWithRegistry(
     if (try resolveCastTime(aa, name, arg_types)) |ov| return ov;
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveCharset(aa, name, arg_types)) |ov| return ov;
+    if (try resolveBenchmark(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveOrderKey(aa, name, arg_types)) |ov| return ov;
@@ -331,6 +332,8 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
             return try buildDecFn(aa, name, arg_types, dec.decTypeFor(sp.p, 0), dec.truncateKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "hex"))
             return try buildDecFn(aa, name, arg_types, .string, dec.hexKernel, .propagates);
+        if (std.ascii.eqlIgnoreCase(name, INTEGER_ARG_FN))
+            return try buildDecFn(aa, name, arg_types, .bigint, dec.integerArgKernel, .propagates);
         return null;
     }
 
@@ -605,7 +608,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.ascii.eqlIgnoreCase(name, "json_array") or std.ascii.eqlIgnoreCase(name, "json_object")) return true;
     if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) or std.mem.eql(u8, name, JSON_AGG_MEMBER_FN)) return true;
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
-    if (std.ascii.eqlIgnoreCase(name, "charset")) return true;
+    inline for (.{ "charset", "collation", "benchmark" }) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
@@ -621,10 +624,24 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     return false;
 }
 
-/// CHARSET(x) depends on x's type alone, so it takes any argument, NULL too.
+/// CHARSET(x) and COLLATION(x) depend on x's type alone, so they take any
+/// argument, NULL too.
 fn resolveCharset(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
-    if (!std.ascii.eqlIgnoreCase(name, "charset") or arg_types.len != 1) return null;
-    return try buildDecFn(aa, name, arg_types, .string, string.charsetKernel, .kernel_managed);
+    if (arg_types.len != 1) return null;
+    const kernel: TypedKernel = if (std.ascii.eqlIgnoreCase(name, "charset"))
+        string.charsetKernel
+    else if (std.ascii.eqlIgnoreCase(name, "collation"))
+        string.collationKernel
+    else
+        return null;
+    return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
+}
+
+/// BENCHMARK(count, expr) reads `count` as MySQL reads an integer argument
+/// and never looks at `expr`, so it takes any two arguments.
+fn resolveBenchmark(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (!std.ascii.eqlIgnoreCase(name, "benchmark") or arg_types.len != 2) return null;
+    return try buildDecFn(aa, name, arg_types, .bigint, math.benchmarkKernel, .kernel_managed);
 }
 
 /// Internal: a correlated scalar subquery's value for one outer row,
@@ -910,11 +927,18 @@ fn textAsDoubleArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: 
 
 const CONVERT_COST: u64 = 1000;
 
+/// More than all the other conversions of a call's arguments add up to.
+const FRACTION_DROP_COST: u64 = 1_000_000;
+
 const ArgConversion = struct { cost: u64, target: ?Type = null };
 
 /// Text converts to a number only where no overload takes it as text, and
 /// to a double before an integer: MySQL types a text operand as DOUBLE, so
-/// `ABS('-2.5')` is 2.5.
+/// `ABS('-2.5')` is 2.5. A double or decimal meets an integer parameter as
+/// the integer MySQL reads it as (`INTEGER_ARG_FN`), but only where no
+/// overload takes every argument without dropping a fraction: that costs
+/// more than any other conversion of the whole call, so `INTERVAL(2.5, 1,
+/// 2.5, 3)` still compares doubles.
 fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
     if (declared.isString()) {
         if (bindsAsIs(given, declared)) return .{ .cost = 0 };
@@ -926,7 +950,22 @@ fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
         return null;
     }
     if (declared.isFloat() and given.isDecimal()) return .{ .cost = CONVERT_COST, .target = .double };
+    if (declared.isInteger() and (given.isFloat() or given.isDecimal()))
+        return .{ .cost = FRACTION_DROP_COST + (argCastCost(.bigint, declared, true) orelse return null), .target = .bigint };
     return .{ .cost = argCastCost(given, declared, true) orelse return null };
+}
+
+/// Internal: a double or decimal read as an integer argument, as MySQL reads
+/// one where a function takes an integer (`REPEAT('a', 2.5)`, `ELT(1.5e0,
+/// ...)`): a double rounds half to even (`common.doubleAsBigint`), a decimal
+/// half away from zero (`dec.integerArgAt`), clamped to the BIGINT range.
+pub const INTEGER_ARG_FN = "__integer_arg";
+
+/// The function that reads a `given` number as the integer `target`
+/// `convertedArgs` converts it to; null unless a double or decimal meets an
+/// integer.
+pub fn integerArgFn(given: Type, target: Type) ?[]const u8 {
+    return if (target.isInteger() and (given.isFloat() or given.isDecimal())) INTEGER_ARG_FN else null;
 }
 
 /// Internal: text or JSON read as the number it starts with, where a
@@ -1058,6 +1097,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "json_extract", .arg_types = &.{ .json, .string }, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonExtractKernel },
     .{ .name = "json_value", .arg_types = &.{ .json, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonValueKernel },
     .{ .name = "json_unquote", .arg_types = &.{.json}, .return_type = .string, .kernel = json.jsonUnquoteKernel },
+    .{ .name = "json_quote", .arg_types = &.{.string}, .return_type = .string, .kernel = json.jsonQuoteKernel },
     .{ .name = "json_valid", .arg_types = &.{.json}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonValidKernel },
     .{ .name = "json_type", .arg_types = &.{.json}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonTypeKernel },
     .{ .name = "json_length", .arg_types = &.{.json}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = json.jsonLengthKernel },
@@ -1343,6 +1383,9 @@ pub const builtins = [_]ScalarFn{
     // Text or JSON read as a number where no CAST was written (`argConversion`).
     .{ .name = TEXT_AS_DOUBLE_FN, .arg_types = &.{.json}, .return_type = .double, .kernel = math.textAsDoubleKernel },
     .{ .name = TEXT_AS_BIGINT_FN, .arg_types = &.{.json}, .return_type = .bigint, .kernel = math.textAsBigintKernel },
+    // A double read where an integer parameter meets it (`argConversion`);
+    // `resolveDecimal` takes a DECIMAL.
+    .{ .name = INTEGER_ARG_FN, .arg_types = &.{.double}, .return_type = .bigint, .kernel = math.doubleIntegerArgKernel },
     // date <-> datetime
     .{ .name = "to_date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },
@@ -1354,6 +1397,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_string", .arg_types = &.{.int}, .return_type = .string, .kernel = math.intToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.bigintToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.double}, .return_type = .string, .kernel = math.doubleToStringKernel },
+    .{ .name = "to_string", .arg_types = &.{.float}, .return_type = .string, .kernel = math.floatToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.boolean}, .return_type = .string, .kernel = math.boolToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.date}, .return_type = .string, .kernel = date.dateToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.datetime}, .return_type = .string, .kernel = date.datetimeToStringKernel },
@@ -1398,7 +1442,6 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "translate", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.translateKernel },
     .{ .name = "chr", .arg_types = &.{.int}, .return_type = .string, .kernel = string.chrKernel },
     .{ .name = "elt", .arg_types = &.{ .bigint, .string }, .return_type = .string, .variadic_min_args = 2, .variadic_fixed = 1, .null_strategy = .kernel_managed, .kernel = string.eltKernel },
-    .{ .name = "elt", .arg_types = &.{ .double, .string }, .return_type = .string, .variadic_min_args = 2, .variadic_fixed = 1, .null_strategy = .kernel_managed, .kernel = string.eltKernel },
     .{ .name = "insert", .arg_types = &.{ .string, .int, .int, .string }, .return_type = .string, .kernel = string.insertKernel },
     .{ .name = "quote", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.quoteKernel },
     .{ .name = "soundex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.soundexKernel },

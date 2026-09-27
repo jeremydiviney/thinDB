@@ -169,9 +169,8 @@ fn formatFloat(allocator: Allocator, out: *std.ArrayList(u8), v: f64) !void {
         try out.appendSlice(allocator, if (v > 0) "Infinity" else "-Infinity");
         return;
     }
-    var buf: [64]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, "{d}", .{v});
-    try out.appendSlice(allocator, text);
+    // Plain digits run past 300 characters for a large or tiny double.
+    try out.print(allocator, "{d}", .{v});
 }
 
 /// Drain `query` (a `*CompiledQuery`) as a SELECT-shaped result set.

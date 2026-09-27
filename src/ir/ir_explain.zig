@@ -25,6 +25,7 @@ const types = @import("../types.zig");
 const Value = types.Value;
 
 const exec_predicate = @import("../exec/predicate.zig");
+const exec_text = @import("../exec/scalar_fn_common.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
@@ -746,8 +747,10 @@ fn writeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) anyerror!
         .smallint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
         .tinyint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
         .largeint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
-        .float => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
-        .double => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
+        inline .float, .double => |x| {
+            var float_buf: [exec_text.FLOAT_TEXT_MAX]u8 = undefined;
+            try out.appendSlice(allocator, exec_text.floatText(&float_buf, x, .plain));
+        },
         .boolean => |x| try out.appendSlice(allocator, if (x) "true" else "false"),
         .text => |s| {
             try out.append(allocator, '\'');

@@ -177,6 +177,20 @@ pub fn jsonUnquoteKernel(allocator: Allocator, args: []const ColumnView, out: *C
     }
 }
 
+/// JSON_QUOTE(s) → text: `s` as a JSON string literal (`jb.appendEscaped`).
+/// Input NULL propagates.
+pub fn jsonQuoteKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const sv = stringViewOf(args[0]);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    for (0..row_count) |i| {
+        scratch.clearRetainingCapacity();
+        if (args[0].isValid(i)) try jb.appendEscaped(allocator, &scratch, sv.rowBytes(i));
+        try ss.appendValue(allocator, scratch.items);
+    }
+}
+
 /// JSON_VALID(doc) → boolean. NULL input → SQL NULL.
 pub fn jsonValidKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();

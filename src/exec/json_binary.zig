@@ -32,6 +32,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const common = @import("scalar_fn_common.zig");
+
 pub const Tag = enum(u8) {
     null = 0,
     false = 1,
@@ -699,7 +701,9 @@ pub fn keysArray(aa: Allocator, obj: []const u8) Allocator.Error!?[]u8 {
 // JSONB → text serializer
 // ---------------------------------------------------------------------------
 
-fn appendEscaped(aa: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+/// `s` as a JSON string literal: quoted, with `"`, `\` and control
+/// characters escaped as MySQL writes them.
+pub fn appendEscaped(aa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
     try out.append(aa, '"');
     for (s) |c| {
         switch (c) {
@@ -769,43 +773,9 @@ pub fn toText(aa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.E
     }
 }
 
-/// A double as MySQL prints one in JSON: its shortest round-trip digits,
-/// positional when the decimal exponent is in -14..15 (or the digits reach
-/// past the point), otherwise `d.ddde[-]x`; a positional integer gains `.0`.
 fn appendDoubleText(aa: Allocator, out: *std.ArrayList(u8), x: f64) Allocator.Error!void {
-    if (x == 0) return out.appendSlice(aa, if (std.math.signbit(x)) "-0.0" else "0.0");
-    const float_fmt = std.fmt.float;
-    const d = float_fmt.binaryToDecimal(u64, @bitCast(x), std.math.floatMantissaBits(f64), std.math.floatExponentBits(f64), false, &float_fmt.Backend64_TablesFull);
-    var digit_buf: [24]u8 = undefined;
-    const all_digits = std.fmt.bufPrint(&digit_buf, "{d}", .{d.mantissa}) catch unreachable;
-    const point: i32 = @as(i32, @intCast(all_digits.len)) + d.exponent;
-    const digits = std.mem.trimEnd(u8, all_digits, "0");
-    const len: i32 = @intCast(digits.len);
-    if (d.sign) try out.append(aa, '-');
-    if (point >= -14 and (point <= 15 or len > point)) {
-        if (point <= 0) {
-            try out.appendSlice(aa, "0.");
-            try out.appendNTimes(aa, '0', @intCast(-point));
-            try out.appendSlice(aa, digits);
-        } else if (point >= len) {
-            try out.appendSlice(aa, digits);
-            try out.appendNTimes(aa, '0', @intCast(point - len));
-            try out.appendSlice(aa, ".0");
-        } else {
-            const whole: usize = @intCast(point);
-            try out.appendSlice(aa, digits[0..whole]);
-            try out.append(aa, '.');
-            try out.appendSlice(aa, digits[whole..]);
-        }
-        return;
-    }
-    try out.append(aa, digits[0]);
-    if (digits.len > 1) {
-        try out.append(aa, '.');
-        try out.appendSlice(aa, digits[1..]);
-    }
-    var exp_buf: [8]u8 = undefined;
-    try out.appendSlice(aa, std.fmt.bufPrint(&exp_buf, "e{d}", .{point - 1}) catch unreachable);
+    var buf: [common.FLOAT_TEXT_MAX]u8 = undefined;
+    try out.appendSlice(aa, common.floatText(&buf, x, .json));
 }
 
 /// Append the unquoted scalar form (JSON_UNQUOTE) of a JSONB value: a string

@@ -40,6 +40,7 @@ const errors = @import("errors.zig");
 const auth = @import("auth.zig");
 const prepared = @import("prepared.zig");
 const sql_text_mod = @import("../sql_text.zig");
+const wire_format = @import("../wire_format.zig");
 const conn_registry = @import("../conn_registry.zig");
 const oprof = @import("../../util/prof.zig");
 const buffer_pool = @import("../../util/buffer_pool.zig");
@@ -2268,8 +2269,10 @@ fn allocColumnDefaultText(allocator: Allocator, col: types.Column) !?[]const u8 
         .largeint => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
         .decimal64 => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
         .decimal128 => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
-        .float => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
-        .double => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        inline .float, .double => |x| blk: {
+            var buf: [wire_format.FLOAT_TEXT_MAX]u8 = undefined;
+            break :blk try allocator.dupe(u8, wire_format.floatText(&buf, x, .plain));
+        },
         .date => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
         .datetime => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
         .uuid => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),

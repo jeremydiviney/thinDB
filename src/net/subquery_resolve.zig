@@ -227,6 +227,23 @@ fn clockTimeFsp(c: exec.expr_mod.Expr.Call) ?u8 {
     return null;
 }
 
+/// CHARSET or COLLATION of a system function's result (`CHARSET(VERSION())`),
+/// which MySQL gives as utf8mb3 text. It's answered before the function
+/// becomes a literal, whose text is utf8mb4 like any other; null for any
+/// other call.
+fn systemTextTypeName(c: exec.expr_mod.Expr.Call) ?[]const u8 {
+    if (c.args.len != 1 or c.args[0] != .call) return null;
+    const name: []const u8 = if (std.ascii.eqlIgnoreCase(c.fn_name, "charset"))
+        "utf8mb3"
+    else if (std.ascii.eqlIgnoreCase(c.fn_name, "collation"))
+        "utf8mb3_general_ci"
+    else
+        return null;
+    const system_fns = [_][]const u8{ "version", "database", "schema", "user", "current_user", "session_user", "system_user", "uuid", "charset", "collation" };
+    for (system_fns) |f| if (std.ascii.eqlIgnoreCase(c.args[0].call.fn_name, f)) return name;
+    return null;
+}
+
 /// `lowered` collects the correlated scalar subqueries of a Compute's
 /// expressions for the LEFT JOIN lowering; null elsewhere.
 fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScalars) anyerror!void {
@@ -291,6 +308,10 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                     e.* = .{ .call = .{ .fn_name = c.fn_name, .args = args } };
                     return;
                 }
+            }
+            if (systemTextTypeName(c)) |text| {
+                e.* = .{ .lit = .{ .text = text } };
+                return;
             }
             for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg), lowered);
         },

@@ -4,7 +4,7 @@
 //!   - Signed integer widening: tinyint → smallint → int → bigint → largeint
 //!   - Int families → float / double (cross-family)
 //!   - float → double
-//!   - boolean → tinyint → … (boolean treated as 0/1 numeric)
+//!   - boolean → tinyint → … → double (boolean treated as 0/1 numeric)
 //!   - date → datetime
 //!
 //! Things explicitly NOT implicitly cast (require `to_*` helpers):
@@ -107,6 +107,8 @@ pub fn castCost(from: TypeTag, to: TypeTag) ?u32 {
             .int => 3,
             .bigint => 4,
             .largeint => 5,
+            .float => 12,
+            .double => 13,
             else => null,
         },
         .date => switch (to) {
@@ -172,6 +174,8 @@ pub fn kernelFor(from: TypeTag, to: TypeTag) ?CastKernel {
             .int => makeBoolToInt(i32, .int),
             .bigint => makeBoolToInt(i64, .bigint),
             .largeint => makeBoolToInt(i128, .largeint),
+            .float => makeBoolToFloat(f32, .float),
+            .double => makeBoolToFloat(f64, .double),
             else => null,
         },
         .date => switch (to) {
@@ -392,7 +396,11 @@ fn appendText(allocator: Allocator, text: *std.ArrayList(u8), v: types.Value, sc
     switch (v) {
         .text => |s| try text.appendSlice(allocator, s),
         .boolean => |b| try text.append(allocator, if (b) '1' else '0'),
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => |x| try text.print(allocator, "{d}", .{x}),
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |x| try text.print(allocator, "{d}", .{x}),
+        inline .float, .double => |x| {
+            var float_buf: [common.FLOAT_TEXT_MAX]u8 = undefined;
+            try text.appendSlice(allocator, common.floatText(&float_buf, x, .plain));
+        },
         inline .decimal64, .decimal128 => |m| try text.appendSlice(allocator, decimal.formatDecimal(&buf, m, scale)),
         .date => |d| try text.appendSlice(allocator, common.formatDate(&buf, d) catch return error.ValueOutOfRange),
         .datetime => |d| try text.appendSlice(allocator, common.formatDateTime(&buf, d) catch return error.ValueOutOfRange),
@@ -559,6 +567,18 @@ fn makeBoolToInt(comptime ToT: type, comptime to_tag: TypeTag) CastKernel {
     }.kernel;
 }
 
+fn makeBoolToFloat(comptime ToT: type, comptime to_tag: TypeTag) CastKernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const src = args[0].data.boolean;
+            const dst = &@field(out.data, @tagName(to_tag));
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) try dst.append(allocator, @as(ToT, @floatFromInt(src[i])));
+            try copyValidityIfNullable(allocator, args[0], out, row_count);
+        }
+    }.kernel;
+}
+
 fn makeDateToDatetime() CastKernel {
     return struct {
         // Date is days-since-epoch (i32); datetime is microseconds-since-
@@ -629,9 +649,11 @@ test "castCost: no float → int (lossy needs explicit cast)" {
     try std.testing.expect(castCost(.double, .bigint) == null);
 }
 
-test "castCost: bool widens through integer family" {
+test "castCost: bool widens through integer family, then to floats" {
     try std.testing.expect(castCost(.boolean, .tinyint).? > 0);
     try std.testing.expect(castCost(.boolean, .bigint).? > castCost(.boolean, .tinyint).?);
+    try std.testing.expect(castCost(.boolean, .double).? > castCost(.boolean, .largeint).?);
+    try std.testing.expectEqual(@as(?Type, .double), commonType(.boolean, .double));
 }
 
 test "castCost: date → datetime is cheap" {
