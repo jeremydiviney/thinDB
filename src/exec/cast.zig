@@ -299,9 +299,10 @@ pub fn sameRepresentation(a: Type, b: Type) bool {
 // by INSERT ... VALUES, INSERT ... SELECT and UPDATE ... SET alike. MySQL's
 // strict mode sets the rule: a number or numeric text lands in any integer,
 // float or boolean column, and a fraction rounds half away from zero into an
-// integer column, as MySQL and DuckDB do (StarRocks truncates). Text that
-// isn't a number is a TypeMismatch, and a value the column can't hold is
-// ValueOutOfRange where a CAST would clamp it.
+// integer column, as MySQL and DuckDB do (StarRocks truncates). A number, a
+// DATE or a DATETIME lands in a text column as the text `CAST(x AS CHAR)`
+// gives it. Text that isn't a number is a TypeMismatch, and a value the
+// column can't hold is ValueOutOfRange where a CAST would clamp it.
 // ---------------------------------------------------------------------------
 
 pub const AssignError = error{ TypeMismatch, ValueOutOfRange };
@@ -310,10 +311,10 @@ pub const AssignError = error{ TypeMismatch, ValueOutOfRange };
 /// converts by the assignment rule.
 pub fn assignsByRule(from: Type, to: Type) bool {
     if (@as(TypeTag, from) == @as(TypeTag, to)) return false;
+    const from_number = from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean;
+    if (to.isString()) return to != .json and (from_number or from == .date or from == .datetime);
     const into_number = to.isInteger() or to.isFloat() or to == .boolean;
-    const from_number = from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean or
-        (from.isString() and from != .json);
-    return into_number and from_number;
+    return into_number and (from_number or (from.isString() and from != .json));
 }
 
 /// A literal written into a column whose values are `T`: an integer type, a
@@ -377,10 +378,36 @@ pub fn assignText(comptime T: type, text: []const u8) AssignError!T {
     };
 }
 
+/// A literal written into a text column, appended to `text`: text as is,
+/// anything else as `appendText` spells it. A decimal literal carries no
+/// scale to spell it by.
+pub fn appendAssignedText(allocator: Allocator, text: *std.ArrayList(u8), v: types.Value) (AssignError || Allocator.Error)!void {
+    switch (v) {
+        .decimal64, .decimal128 => return error.TypeMismatch,
+        else => try appendText(allocator, text, v, 0),
+    }
+}
+
+/// `v` appended to `text` as `CAST(v AS CHAR)` spells it, a decimal at
+/// scale `scale`, but a boolean as 1 or 0: MySQL has no boolean, and stores
+/// TRUE in a text column as 1.
+fn appendText(allocator: Allocator, text: *std.ArrayList(u8), v: types.Value, scale: u8) (AssignError || Allocator.Error)!void {
+    var buf: [64]u8 = undefined;
+    switch (v) {
+        .text => |s| try text.appendSlice(allocator, s),
+        .boolean => |b| try text.append(allocator, if (b) '1' else '0'),
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => |x| try text.print(allocator, "{d}", .{x}),
+        inline .decimal64, .decimal128 => |m| try text.appendSlice(allocator, decimal.formatDecimal(&buf, m, scale)),
+        .date => |d| try text.appendSlice(allocator, common.formatDate(&buf, d) catch return error.ValueOutOfRange),
+        .datetime => |d| try text.appendSlice(allocator, common.formatDateTime(&buf, d) catch return error.ValueOutOfRange),
+        .uuid => return error.TypeMismatch,
+    }
+}
+
 /// `src`, a column of type `from`, written into a column of type `to`, a
 /// pair `assignsByRule` accepts. The rows land in a new column in
-/// `allocator`, which `freeAssignedColumn` frees; a NULL row lands as 0,
-/// and `src.nulls` carries over.
+/// `allocator`, which `freeAssignedColumn` frees; a NULL row lands as 0
+/// (as '' in a text column), and `src.nulls` carries over.
 pub fn assignColumn(allocator: Allocator, src: ColumnView, from: Type, to: Type, rows: usize) (AssignError || Allocator.Error)!ColumnView {
     switch (to) {
         inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .boolean => |_, tag| {
@@ -390,8 +417,30 @@ pub fn assignColumn(allocator: Allocator, src: ColumnView, from: Type, to: Type,
             try assignRows(if (tag == .boolean) bool else Slot, src, from, dst);
             return .{ .data = @unionInit(storage.column.ValueView, @tagName(tag), dst), .nulls = src.nulls };
         },
+        inline .varchar, .string, .char => |_, tag| {
+            const text = try assignTextRows(allocator, src, from, rows);
+            return .{ .data = @unionInit(storage.column.ValueView, @tagName(tag), text), .nulls = src.nulls };
+        },
         else => return error.TypeMismatch,
     }
+}
+
+fn assignTextRows(allocator: Allocator, src: ColumnView, from: Type, rows: usize) (AssignError || Allocator.Error)!storage.column.StringView {
+    const scale = if (from.decimalSpec()) |spec| spec.s else 0;
+    const offsets = try allocator.alloc(u32, rows + 1);
+    errdefer allocator.free(offsets);
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    offsets[0] = 0;
+    for (0..rows) |i| {
+        if (src.isValid(i)) try appendText(allocator, &bytes, switch (src.data) {
+            inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128, .date, .datetime => |values, tag| @unionInit(types.Value, @tagName(tag), values[i]),
+            .boolean => |values| .{ .boolean = values[i] != 0 },
+            else => return error.TypeMismatch,
+        }, scale);
+        offsets[i + 1] = std.math.cast(u32, bytes.items.len) orelse return error.ValueOutOfRange;
+    }
+    return .{ .offsets = offsets, .bytes = try bytes.toOwnedSlice(allocator) };
 }
 
 fn assignRows(comptime T: type, src: ColumnView, from: Type, dst: anytype) AssignError!void {
@@ -426,6 +475,10 @@ fn slotOf(v: anytype) if (@TypeOf(v) == bool) u8 else @TypeOf(v) {
 pub fn freeAssignedColumn(allocator: Allocator, view: ColumnView) void {
     switch (view.data) {
         inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .boolean => |values| allocator.free(values),
+        .varchar, .string, .char => |text| {
+            allocator.free(text.offsets);
+            allocator.free(text.bytes);
+        },
         else => unreachable,
     }
 }
