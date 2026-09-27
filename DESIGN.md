@@ -82,7 +82,8 @@ Values of different types compare by value, as in StarRocks and MySQL
 (`predicate.typesComparable`):
 - Numbers compare across integer, decimal and float types.
 - A DATE meets a DATETIME at midnight.
-- Text meets a number or a date by reading the text as one, the way a CAST reads it. Text that doesn't read as one compares as NULL.
+- Text meets a number by reading the text as one, the way a CAST reads it. Text that doesn't read as a number compares as NULL.
+- Text meets a DATE or DATETIME by reading it the way MySQL's `str_to_datetime` does. That reader takes any punctuation between fields (`'2026-9-1'`, `'2026/09/01'`), digits alone (`'20260901'`, `'260901'`) and a partial time (`'2026-09-01 10:00'`), and it ignores text after the last field. It rejects impossible values: `'2026-09-31'`, month 13, hour 24 and minute or second 60, fewer than three date fields, a zero date or zero date part, and a year past 9999. A text row that doesn't read as a date compares as NULL. A string constant that doesn't read as one fails the statement with `InvalidTemporalLiteral` (§9.8).
 
 So `code = 12` matches `'12'`, `'12.0'` and `' 12 '` but not `'12abc'`. A
 text column compared with a number is evaluated row by row, with no zone-map
@@ -1007,7 +1008,7 @@ DatabaseInUse, TableBusy, ReservedTableName, RecoveryRequired, DurabilityUncerta
 **Execution-level (`src/exec/exec.zig`):**
 ```
 ColumnNotFound, TypeMismatch, PredicateTypeMismatch,
-UnsupportedOperatorForType,
+InvalidTemporalLiteral, UnsupportedOperatorForType,
 SortNoKeys,
 AggregateNoSpecs, AggregateColumnRequired,
 AggregateUnsupportedType, AggregateInvalidParam,
@@ -1024,6 +1025,8 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 `ArithmeticOverflow` comes from decimal arithmetic and casts that leave the declared precision, and from `SUM(LARGEINT)` past the i128 range. Integer arithmetic and integer `SUM` up to BIGINT wrap instead of raising it (§3.4).
 
 `ValueOutOfRange` means INSERT or UPDATE wrote a value its column's type can't hold, such as 300 into a TINYINT or 127.5 into a TINYINT after rounding. MySQL's strict mode fails the statement the same way; a CAST clamps instead.
+
+`InvalidTemporalLiteral` means a DATE or DATETIME was compared with a string constant that doesn't read as a date or datetime (§3.1), as in `d = ''`, `d = 'abc'` or `d < '2026-09-31'`. The statement fails when it is planned, before it returns or changes any rows. The constant can be written in the statement, come from a prepared-statement parameter or a user variable, or be the value of a scalar subquery or a constant expression. The rule is the same for every comparison form: `=`, `<>`, `<`, `<=>`, BETWEEN, IN, CASE, HAVING and a JOIN's ON. A NULL, a text column, a CAST, and rows an IN subquery returns never raise it. The MySQL wire reports it as error 1525 (`HY000`) with MySQL's message, `Incorrect DATE value: 'abc'`. The PostgreSQL wire reports it as `22007` with the same message. MySQL raises 1525 for the same constants in the text protocol, with three exceptions that only warn and skip the value: BETWEEN, an IN list of two or more values, and a server-side prepared parameter. thinDB fails those too. MySQL's UPDATE and DELETE raise 1292 (`Incorrect date value`) where thinDB raises 1525.
 
 Scalar functions reject bad arguments with their own errors, which reach a client under their names: `JsonInvalid` (malformed JSON text or JSONB bytes), `JsonNullMemberName` (a NULL key in `JSON_OBJECT` / `JSON_OBJECTAGG`), `IncorrectArgumentsToSleep` (a NULL or negative `SLEEP`), `RegexInvalidPattern`, `RegexInvalidMatchType` (a `match_type` letter outside `c i m n u`), `RegexInvalidReturnOption` (a `REGEXP_INSTR` return option other than 0 or 1) and `RegexIndexOutOfBounds` (a `REGEXP_*` position below 1 or past the end of the subject). MySQL raises the same conditions as errors.
 

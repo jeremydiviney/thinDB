@@ -85,6 +85,10 @@ pub const Error = error{
     ColumnNotFound,
     TypeMismatch,
     PredicateTypeMismatch,
+    /// A DATE or DATETIME is compared with a string constant that doesn't
+    /// read as a date or datetime (`d = 'abc'`, `d < '2026-09-31'`).
+    /// `predicate.invalidTemporalMessage` names the constant.
+    InvalidTemporalLiteral,
     UnsupportedOperatorForType,
     SortNoKeys,
     AggregateNoSpecs,

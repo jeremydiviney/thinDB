@@ -16,6 +16,7 @@ pub const Category = enum {
     numeric_out_of_range,
     value_out_of_range,
     subquery_multiple_rows,
+    invalid_temporal_literal,
     unknown,
 };
 
@@ -32,6 +33,7 @@ pub fn classify(err_name: []const u8) Category {
     if (std.mem.eql(u8, err_name, "ArithmeticOverflow")) return .numeric_out_of_range;
     if (std.mem.eql(u8, err_name, "ValueOutOfRange")) return .value_out_of_range;
     if (std.mem.eql(u8, err_name, "SubqueryMultipleRows")) return .subquery_multiple_rows;
+    if (std.mem.eql(u8, err_name, "InvalidTemporalLiteral")) return .invalid_temporal_literal;
     return .unknown;
 }
 
@@ -42,6 +44,7 @@ test "classify recognizes known errors" {
     try std.testing.expectEqual(Category.numeric_out_of_range, classify("ArithmeticOverflow"));
     try std.testing.expectEqual(Category.value_out_of_range, classify("ValueOutOfRange"));
     try std.testing.expectEqual(Category.subquery_multiple_rows, classify("SubqueryMultipleRows"));
+    try std.testing.expectEqual(Category.invalid_temporal_literal, classify("InvalidTemporalLiteral"));
     try std.testing.expectEqual(Category.ambiguous_column, classify("SqlOnColumnAmbiguous"));
     try std.testing.expectEqual(Category.unknown, classify("NotARealError"));
 }

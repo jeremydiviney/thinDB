@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const error_map = @import("../error_map.zig");
+const predicate = @import("../../exec/predicate.zig");
+const types = @import("../../types.zig");
 
 pub const Mapped = struct {
     code: u16,
@@ -26,6 +28,7 @@ pub fn mapInternal(err: anyerror, fallback_msg: ?[]const u8) Mapped {
         .numeric_out_of_range => .{ .code = 1690, .sqlstate = "22003".*, .message = "Numeric value out of range" },
         .value_out_of_range => .{ .code = 1264, .sqlstate = "22003".*, .message = "Out of range value for column" },
         .subquery_multiple_rows => .{ .code = 1242, .sqlstate = "21000".*, .message = "Subquery returns more than 1 row" },
+        .invalid_temporal_literal => .{ .code = 1525, .sqlstate = "HY000".*, .message = predicate.takeInvalidTemporalMessage() orelse "Incorrect DATE or DATETIME value" },
         .unknown => .{ .code = 1064, .sqlstate = "42000".*, .message = fallback_msg orelse @errorName(err) },
     };
 }
@@ -52,6 +55,17 @@ test "mapInternal reports a value past its column's range as 1264" {
     const m = mapInternal(error.ValueOutOfRange, null);
     try std.testing.expectEqual(@as(u16, 1264), m.code);
     try std.testing.expectEqualStrings("22003", &m.sqlstate);
+}
+
+test "mapInternal names the constant a DATE comparison rejected" {
+    const schema = [_]types.Column{.{ .name = "d", .type = .date, .nullable = true }};
+    var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "d", .op = .lt, .val = .{ .text = "2026-09-31" } } };
+    try std.testing.expectError(error.InvalidTemporalLiteral, predicate.validateExpr(&expr, &schema));
+    const m = mapInternal(error.InvalidTemporalLiteral, null);
+    try std.testing.expectEqual(@as(u16, 1525), m.code);
+    try std.testing.expectEqualStrings("HY000", &m.sqlstate);
+    try std.testing.expectEqualStrings("Incorrect DATE value: '2026-09-31'", m.message);
+    try std.testing.expectEqualStrings("Incorrect DATE or DATETIME value", mapInternal(error.InvalidTemporalLiteral, null).message);
 }
 
 test "mapInternal falls back to 1064" {

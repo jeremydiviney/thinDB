@@ -330,6 +330,121 @@ test "comparison: kinds that never compare are rejected" {
     try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE i = (SELECT MAX(ck.i) FROM ck WHERE ck.d = cm.i)", error.JoinKeyTypeMismatch);
 }
 
+fn expectInvalidTemporal(allocator: std.mem.Allocator, db: *thindb.Database, statements: []const []const u8) !void {
+    for (statements) |sql| {
+        std.testing.expectError(error.InvalidTemporalLiteral, helpers.execCtx(allocator, db, sql)) catch |err| {
+            std.debug.print("expected InvalidTemporalLiteral: {s}\n", .{sql});
+            return err;
+        };
+    }
+}
+
+test "comparison: a string constant no DATE or DATETIME reads fails the statement" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setupMixed(allocator, db);
+
+    // MySQL raises 1525 for each of these; BETWEEN and IN lists of several
+    // values only warn there, and fail here too.
+    const statements = [_][]const u8{
+        "SELECT id FROM cm WHERE d = ''",
+        "SELECT id FROM cm WHERE d = '   '",
+        "SELECT id FROM cm WHERE d = 'abc'",
+        "SELECT id FROM cm WHERE ts = 'abc'",
+        "SELECT id FROM cm WHERE d <> 'abc'",
+        "SELECT id FROM cm WHERE d != '2024-02-30'",
+        "SELECT id FROM cm WHERE d < '2024-09-31'",
+        "SELECT id FROM cm WHERE d <= '2024-13-01'",
+        "SELECT id FROM cm WHERE d > '2024-03'",
+        "SELECT id FROM cm WHERE d >= '0000-00-00'",
+        "SELECT id FROM cm WHERE d = '2024'",
+        "SELECT id FROM cm WHERE ts > '2024-03-05 25:00:00'",
+        "SELECT id FROM cm WHERE ts < '2024-03-05 10:60:00'",
+        "SELECT id FROM cm WHERE d <=> 'abc'",
+        "SELECT id FROM cm WHERE 'abc' = d",
+        "SELECT id FROM cm WHERE NOT (d = 'abc')",
+        "SELECT id FROM cm WHERE d = 'abc' OR id = 1",
+        "SELECT id FROM cm WHERE d = 'abc' AND id < 0",
+        "SELECT id FROM cm WHERE d BETWEEN '2024-03-01' AND '2024-03-32'",
+        "SELECT id FROM cm WHERE d NOT BETWEEN 'abc' AND '2024-03-31'",
+        "SELECT id FROM cm WHERE d IN ('abc')",
+        "SELECT id FROM cm WHERE d IN ('2024-03-05', 'abc')",
+        "SELECT id FROM cm WHERE d NOT IN ('2024-03-05', 'abc')",
+        "SELECT id FROM cm WHERE (d, id) = ('abc', 1)",
+        "SELECT id, CASE WHEN d = 'abc' THEN 1 ELSE 0 END AS c FROM cm",
+        "SELECT id, CASE d WHEN 'abc' THEN 1 ELSE 0 END AS c FROM cm",
+        "SELECT d FROM cm GROUP BY d HAVING d = 'abc'",
+        "SELECT MAX(d) AS m FROM cm HAVING MAX(d) < '2024-02-30'",
+        "SELECT cm.id FROM cm JOIN cm AS o ON o.id = cm.id AND cm.d = 'abc'",
+        "SELECT cm.id FROM cm LEFT JOIN cm AS o ON o.id = cm.id AND o.ts = 'abc'",
+        "SELECT id FROM cm WHERE DATE(ts) = 'abc'",
+        "SELECT id FROM cm WHERE d = CONCAT('ab', 'c')",
+        "SELECT id FROM cm WHERE d = (SELECT 'abc')",
+        "SELECT id FROM cm WHERE d = (SELECT ds FROM cm WHERE id = 3)",
+        "SELECT COUNT(*) FROM cm WHERE d = 'abc'",
+        "DELETE FROM cm WHERE d = 'abc'",
+        "UPDATE cm SET i = 0 WHERE ts < '2024-02-30'",
+    };
+    try expectInvalidTemporal(allocator, db, &statements);
+    try (try db.openTable("cm", .{})).flush();
+    try expectInvalidTemporal(allocator, db, &statements);
+    try expectCases(allocator, db, &.{
+        .{ .sql = "SELECT id FROM cm WHERE i <> 0 ORDER BY id", .expected = &.{ 1, 2, 3 } },
+    });
+}
+
+test "comparison: text meets a DATE or DATETIME the way MySQL reads it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setupMixed(allocator, db);
+    try helpers.exec(allocator, db, "CREATE TABLE tx (id BIGINT PRIMARY KEY, s VARCHAR(30))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO tx VALUES (1, '2024-3-5'), (2, '20240306'), (3, 'junk'), (4, ''),
+        \\  (5, '2024-03-05 25:00:00'), (6, '2024-03-05 10:00'), (7, NULL)
+    );
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{ "cm", "tx" }, &.{
+        .{ .sql = "SELECT id FROM cm WHERE d = '20240305' ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE d = '240305' ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE d = '2024-3-5' ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE d = '2024/03/05' ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE d = ' 2024-03-05 ' ORDER BY id", .expected = &.{1} },
+        // MySQL reads the date and drops the rest with a warning.
+        .{ .sql = "SELECT id FROM cm WHERE d = '2024-03-05x' ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE ts = '2024-03-05 10:00' ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE ts = '2024-03-05 10' ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE ts = '2024-03-05T10:00:00' ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE ts > '2024-03-05 9:5:3' ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE d < '2024-03-05 10:00' ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE d BETWEEN '2024-3-1' AND '2024-03-31' ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM cm WHERE d IN ('2024-3-5', '20240306') ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM cm WHERE d NOT IN ('2024-3-5') ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE CASE WHEN d = '2024-3-6' THEN 1 ELSE 0 END = 1 ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE d = NULL ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM cm WHERE d <=> NULL ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM cm WHERE d IN ('2024-03-05', NULL) ORDER BY id", .expected = &.{1} },
+        // Only a constant raises: rows of a text column, a subquery's rows and
+        // a number never do.
+        .{ .sql = "SELECT id FROM cm WHERE s = 'abc' ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM cm WHERE i = 'abc' ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM cm WHERE ds = d ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE ds > '2024-03-06' ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE d IN (SELECT ds FROM cm) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE d NOT IN (SELECT ds FROM cm) ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE d = CAST('abc' AS DATE) ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm, tx WHERE tx.s = cm.d ORDER BY p", .expected = &.{ 11, 22 } },
+        .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm, tx WHERE tx.s = cm.ts ORDER BY p", .expected = &.{ 11, 26 } },
+        .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm JOIN tx ON tx.s = cm.d ORDER BY p", .expected = &.{ 11, 22 } },
+        .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm JOIN tx ON tx.s = cm.ts ORDER BY p", .expected = &.{ 11, 26 } },
+    });
+}
+
 fn setupTextNumbers(allocator: std.mem.Allocator, db: *thindb.Database) !void {
     try helpers.exec(allocator, db, "CREATE TABLE tn (id BIGINT PRIMARY KEY, code VARCHAR(10), n INT)");
     try helpers.exec(allocator, db,
