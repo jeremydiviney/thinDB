@@ -136,6 +136,53 @@ test "comparison: subquery results compare by value" {
     });
 }
 
+test "comparison: row values compare element by element" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE rv (id BIGINT PRIMARY KEY, a INT, b INT, s VARCHAR(8))");
+    try helpers.exec(allocator, db, "CREATE TABLE rw (n BIGINT PRIMARY KEY, a BIGINT, s VARCHAR(8))");
+    try helpers.exec(allocator, db, "INSERT INTO rv VALUES (1, 1, 1, 'x'), (2, 1, 2, 'y'), (3, 2, 1, 'x'), (4, 2, NULL, 'z'), (5, NULL, 1, 'x')");
+    try helpers.exec(allocator, db, "INSERT INTO rw VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 2, 'z'), (4, NULL, 'x'), (5, 5, NULL)");
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{ "rv", "rw" }, &.{
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) = (1, 2) ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM rv WHERE (1, 2) = (a, b) ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) <> (1, 1) ORDER BY id", .expected = &.{ 2, 3, 4 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) < (2, 1) ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) <= (2, 1) ORDER BY id", .expected = &.{ 1, 2, 3 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) > (1, 1) ORDER BY id", .expected = &.{ 2, 3, 4 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) >= (2, 0) ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM rv WHERE (a, 1) < (2, b) ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b, s) > (1, 1, 'x') ORDER BY id", .expected = &.{ 2, 3, 4 } },
+        .{ .sql = "SELECT id FROM rv WHERE NOT ((a, b) = (2, 1)) ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM rv WHERE (b, a) = (1, NULL) ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM rv WHERE (a + 1, s) = (2, 'x') ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM rv WHERE (1, 2) = (1, 2) AND id < 3 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) IN ((1, 2), (2, 1)) ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) NOT IN ((1, 2), (2, 1)) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM rv WHERE (s, a) IN (('x', 1), ('z', 2)) ORDER BY id", .expected = &.{ 1, 4 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, b) IN ((1, 1)) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM rv WHERE CASE WHEN (a, s) = (2, 'x') THEN 1 ELSE 0 END = 1 ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM rv WHERE (a, s) IN (SELECT a, s FROM rw) ORDER BY id", .expected = &.{ 1, 4 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, s) IN (SELECT a, s FROM rw WHERE n > 1) ORDER BY id", .expected = &.{4} },
+        .{ .sql = "SELECT id FROM rv WHERE (a, s) NOT IN (SELECT a, s FROM rw) ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM rv WHERE NOT ((a, s) IN (SELECT a, s FROM rw)) ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a * 1, UPPER(s)) IN (SELECT a, UPPER(s) FROM rw) ORDER BY id", .expected = &.{ 1, 4 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, s) IN (SELECT a, s FROM rw WHERE rw.n = rv.id) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM rv WHERE a * 1 IN (SELECT a FROM rw WHERE rw.n = rv.id) ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM rv WHERE (a, s) NOT IN (SELECT a, s FROM rw WHERE rw.n = rv.id) ORDER BY id", .expected = &.{ 2, 3, 4 } },
+        .{ .sql = "SELECT n FROM rw WHERE (a, s) IN (SELECT a, s FROM rv) ORDER BY n", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT n FROM rw WHERE (a, s) NOT IN (SELECT a, s FROM rv) ORDER BY n", .expected = &.{2} },
+    });
+
+    try helpers.expectRunError(allocator, db, "SELECT id FROM rv WHERE (a, b) = (1, 2, 3)", error.SqlRowValueWidthMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT id FROM rv WHERE (a, b) IN ((1, 2), (3))", error.SqlRowValueWidthMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT id FROM rv WHERE (a, s) IN (SELECT a FROM rw)", error.BadRequest);
+}
+
 test "comparison: a decimal scalar subquery projects at its scale" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

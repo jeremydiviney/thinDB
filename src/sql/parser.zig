@@ -92,6 +92,8 @@ pub const ParseError = error{
     /// INTERSECT ALL / EXCEPT ALL: only the distinct forms are supported,
     /// as in StarRocks.
     SqlSetOpAllUnsupported,
+    /// Row values of different widths compared or matched by IN.
+    SqlRowValueWidthMismatch,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -2379,6 +2381,13 @@ pub const Parser = struct {
                 } };
                 value_args = args[0..1];
             }
+        }
+        // COUNT(DISTINCT a, b) counts the distinct tuples with no NULL element.
+        if (func == .count_distinct and value_args.len > 1) {
+            for (value_args) |arg| if (arg == .col_ref and std.mem.eql(u8, arg.col_ref, "*")) return ParseError.SqlInvalidProjection;
+            const key = try self.arena.alloc(ir.Expr, 1);
+            key[0] = .{ .call = .{ .fn_name = scalar_fn.ROW_KEY_FN, .args = value_args } };
+            value_args = key;
         }
         if (value_args.len != 1) return ParseError.SqlInvalidProjection;
         var arg_col: ?[]const u8 = null;
@@ -5388,7 +5397,10 @@ fn predicateAvailableAfterGroup(p: PredicateExpr, group_cols: []const []const u8
         .not => |child| predicateAvailableAfterGroup(child.*, group_cols, extra_cols),
         .always, .unknown, .exists_subquery => true,
         .scalar_subquery => |sq| groupedOutputNameAvailable(sq.col, group_cols, extra_cols),
-        .in_subquery => |sq| groupedOutputNameAvailable(sq.col, group_cols, extra_cols),
+        .in_subquery => |sq| blk: {
+            for (sq.rest_cols) |c| if (!groupedOutputNameAvailable(c, group_cols, extra_cols)) break :blk false;
+            break :blk groupedOutputNameAvailable(sq.col, group_cols, extra_cols);
+        },
         else => false,
     };
 }

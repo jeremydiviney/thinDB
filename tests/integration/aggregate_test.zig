@@ -1171,3 +1171,45 @@ test "aggregate: SUM(BIGINT) wraps identically on every aggregate path" {
         }
     }
 }
+
+test "aggregate: COUNT(DISTINCT a, b) counts distinct tuples with no NULL element" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE cd (id BIGINT PRIMARY KEY, g VARCHAR(4), a INT, b VARCHAR(8), x DOUBLE)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO cd VALUES (1, 'p', 1, 'x', 0.0), (2, 'p', 1, 'x', -0.0), (3, 'p', 1, 'y', 1.5),
+        \\  (4, 'p', NULL, 'x', 1.5), (5, 'q', 2, NULL, 2.5), (6, 'q', 2, 'x', 2.5), (7, 'q', 3, 'x', NULL),
+        \\  (8, 'q', 2, 'x', 2.5), (9, 'q', 4, 'z', 4.0)
+    );
+    try helpers.exec(allocator, db, "CREATE TABLE pairs (id BIGINT PRIMARY KEY, s1 VARCHAR(4), s2 VARCHAR(4))");
+    try helpers.exec(allocator, db, "INSERT INTO pairs VALUES (1, 'ab', 'c'), (2, 'a', 'bc'), (3, 'a', 'bc')");
+
+    // Expected counts are MySQL 8.4's.
+    const cases = .{
+        .{ "SELECT COUNT(DISTINCT a, b) FROM cd", &[_]i64{5} },
+        .{ "SELECT count(distinct a,b) FROM cd GROUP BY g ORDER BY g", &[_]i64{ 2, 3 } },
+        .{ "SELECT COUNT(DISTINCT a, x) FROM cd", &[_]i64{4} },
+        .{ "SELECT COUNT(DISTINCT a, b, x) FROM cd", &[_]i64{4} },
+        .{ "SELECT COUNT(DISTINCT a, b) * 100 + COUNT(DISTINCT a) FROM cd", &[_]i64{504} },
+        .{ "SELECT COUNT(*) FROM cd GROUP BY g HAVING COUNT(DISTINCT a, b) > 2", &[_]i64{5} },
+        .{ "SELECT COUNT(DISTINCT a + 1, UPPER(b)) FROM cd", &[_]i64{5} },
+        .{ "SELECT COUNT(DISTINCT a, b) FROM cd WHERE id <= 3", &[_]i64{2} },
+        .{ "SELECT COUNT(DISTINCT s1, s2) FROM pairs", &[_]i64{2} },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) {
+            try (try db.openTable("cd", .{})).flush();
+            try (try db.openTable("pairs", .{})).flush();
+        }
+        inline for (cases) |case| {
+            const counts = try helpers.collectBigintsCtx(allocator, db, case[0]);
+            defer allocator.free(counts);
+            try std.testing.expectEqualSlices(i64, case[1], counts);
+        }
+    }
+
+    try helpers.expectRunError(allocator, db, "SELECT SUM(DISTINCT a, x) FROM cd", error.SqlInvalidProjection);
+}

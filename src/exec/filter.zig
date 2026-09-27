@@ -25,18 +25,6 @@ const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
 const mat_stage = @import("mat_stage.zig");
 
-fn preflight_predicate(expr: PredicateExpr) bool {
-    return switch (expr) {
-        .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .text_as_number, .text_as_number_set, .always => true,
-        .@"and", .@"or" => |children| blk: {
-            for (children) |child| if (!preflight_predicate(child)) break :blk false;
-            break :blk true;
-        },
-        .not => |child| preflight_predicate(child.*),
-        else => false,
-    };
-}
-
 /// Schema-only upstream for detached per-chunk Filter clones inside a probe
 /// pipeline (evalBatch is the only entry used; next() is never pulled).
 const SchemaStub = struct {
@@ -372,7 +360,7 @@ pub const Filter = struct {
         // batch before the join's sink sees it. A proven-false predicate
         // emits nothing either way; keep it on the cheap serial path.
         if (self.chain != null) return false;
-        var probe_source = if (preflight_predicate(self.expr)) try mat_stage.stageBehind(self.allocator, self.upstream, null) else null;
+        var probe_source = if (predicate.kernelsOnly(self.expr)) try mat_stage.stageBehind(self.allocator, self.upstream, null) else null;
         defer if (probe_source) |*source| source.deinit(self.allocator);
         if (probe_source) |*source| {
             for (source.casts) |cast| if (cast != null) {

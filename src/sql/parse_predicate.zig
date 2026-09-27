@@ -9,6 +9,8 @@
 //!   and_expr   := not_expr ('AND' not_expr)*
 //!   not_expr   := 'NOT' not_expr | atom
 //!   atom       := '(' or_expr ')'
+//!                | row cmp_op row
+//!                | row ['NOT'] 'IN' '(' (row (',' row)* | select) ')'
 //!                | 'NULL' ('IS' ['NOT'] 'NULL' | cmp_op expr)
 //!                | lit ('IS' ['NOT'] 'NULL' | cmp_op (qualified_col | lit | @var | 'NULL'))
 //!                | lit ['NOT'] ('BETWEEN' | 'LIKE' | 'IN') ...
@@ -117,7 +119,7 @@ pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateE
         },
         .in_set => |s| return .{ .in_set = .{ .col = s.col, .values = s.values, .negate = !s.negate } },
         .text_as_number_set => |s| return .{ .text_as_number_set = .{ .col = s.col, .values = s.values, .negate = !s.negate } },
-        .in_subquery => |s| return .{ .in_subquery = .{ .col = s.col, .source = s.source, .negate = !s.negate } },
+        .in_subquery => |s| return .{ .in_subquery = .{ .col = s.col, .source = s.source, .negate = !s.negate, .rest_cols = s.rest_cols } },
         .scalar_subquery => |sq| return .{ .scalar_subquery = .{ .col = sq.col, .op = flipOp(sq.op), .source = sq.source } },
         .like => |l| {
             const child = try p.arena.create(PredicateExpr);
@@ -140,6 +142,7 @@ pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateE
 pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
     if (p.cur.tag == .lparen) {
+        if (try rowValueAhead(p)) return try parseRowValuePredicate(p);
         if (try parenthesizedScalarComparisonAhead(p)) {
             return try parseParenthesizedScalarComparison(p);
         }
@@ -660,6 +663,151 @@ fn parenthesizedScalarComparisonAhead(p: anytype) @TypeOf(p.*).Err!bool {
         .kw_between, .kw_in, .kw_is, .kw_like, .kw_regexp, .kw_not => true,
         else => false,
     };
+}
+
+/// A parenthesized list with a top-level comma, followed by a comparison or
+/// [NOT] IN: `(a, b) = (1, 2)`, `(a, b) IN ((1, 2), (3, 4))`.
+fn rowValueAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    var look = p.lex.*;
+    var depth: usize = 1;
+    var saw_comma = false;
+    const first = try look.next();
+    if (first.tag == .kw_select or first.tag == .kw_with) return false;
+    var tok = first;
+    while (true) : (tok = try look.next()) {
+        switch (tok.tag) {
+            .eof => return false,
+            .lparen => depth += 1,
+            .rparen => {
+                depth -= 1;
+                if (depth == 0) break;
+            },
+            .comma => if (depth == 1) {
+                saw_comma = true;
+            },
+            else => {},
+        }
+    }
+    if (!saw_comma) return false;
+    const op_tok = try look.next();
+    return isComparisonToken(op_tok.tag) or op_tok.tag == .kw_in or op_tok.tag == .kw_not;
+}
+
+/// Row values compare element by element, as MySQL defines them:
+///   (a, b) = (x, y)   → a = x AND b = y
+///   (a, b) <> (x, y)  → a <> x OR b <> y
+///   (a, b) < (x, y)   → a < x OR (a = x AND b < y)
+///   (a, b) IN (r1, r2) → (a, b) = r1 OR (a, b) = r2
+/// `(a, b) IN (SELECT x, y ...)` keeps its subquery for the resolver, with
+/// every element anchored to a column.
+fn parseRowValuePredicate(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
+    const PE = @TypeOf(p.*).Err;
+    const lhs = try parseRowValue(p);
+    for (lhs) |*element| element.* = try anchorRowElement(p, element.*);
+    if (isComparisonToken(p.cur.tag)) {
+        const op = try parseComparisonToken(p);
+        const rhs = try parseRowValue(p);
+        if (rhs.len != lhs.len) return PE.SqlRowValueWidthMismatch;
+        return try rowComparison(p, lhs, op, rhs);
+    }
+    var negate = false;
+    if (p.cur.tag == .kw_not) {
+        try p.advance();
+        negate = true;
+    }
+    if (p.cur.tag != .kw_in) return PE.SqlExpectedKeyword;
+    try p.advance();
+    try p.expect(.lparen);
+    if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+        const source = try p.parseStatement();
+        try p.expect(.rparen);
+        const cols = try p.arena.alloc([]const u8, lhs.len);
+        for (lhs, cols) |element, *col| col.* = switch (element) {
+            .col_ref => |name| name,
+            else => try p.materializePredicateExpr(element),
+        };
+        return .{ .in_subquery = .{
+            .col = cols[0],
+            .source = @ptrCast(source),
+            .negate = negate,
+            .rest_cols = cols[1..],
+        } };
+    }
+    var rows: std.ArrayList(PredicateExpr) = .empty;
+    while (true) {
+        const row = try parseRowValue(p);
+        if (row.len != lhs.len) return PE.SqlRowValueWidthMismatch;
+        try rows.append(p.arena, try rowComparison(p, lhs, .eq, row));
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    try p.expect(.rparen);
+    var pe: PredicateExpr = if (rows.items.len == 1) rows.items[0] else .{ .@"or" = try rows.toOwnedSlice(p.arena) };
+    if (negate) pe = try negatePredicate(p, pe);
+    return pe;
+}
+
+fn parseRowValue(p: anytype) @TypeOf(p.*).Err![]ir.Expr {
+    const PE = @TypeOf(p.*).Err;
+    try p.expect(.lparen);
+    if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) return PE.SqlExpectedValue;
+    var elements: std.ArrayList(ir.Expr) = .empty;
+    while (true) {
+        try elements.append(p.arena, try p.parseAddSub());
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    try p.expect(.rparen);
+    return try elements.toOwnedSlice(p.arena);
+}
+
+/// A left-hand element takes part in several comparisons, so an expression
+/// is computed once, as a hidden column.
+fn anchorRowElement(p: anytype, element: ir.Expr) @TypeOf(p.*).Err!ir.Expr {
+    return switch (element) {
+        .col_ref, .lit, .null_lit => element,
+        else => .{ .col_ref = try p.materializePredicateExpr(element) },
+    };
+}
+
+fn rowComparison(p: anytype, lhs: []const ir.Expr, op: PredicateOp, rhs: []const ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const last = lhs.len - 1;
+    switch (op) {
+        .eq, .neq => {
+            const kids = try p.arena.alloc(PredicateExpr, lhs.len);
+            for (lhs, rhs, kids) |l, r, *kid| kid.* = try elementComparison(p, l, op, r);
+            return if (op == .eq) .{ .@"and" = kids } else .{ .@"or" = kids };
+        },
+        .lt, .lte, .gt, .gte => {
+            const strict: PredicateOp = switch (op) {
+                .lt, .lte => .lt,
+                else => .gt,
+            };
+            var acc = try elementComparison(p, lhs[last], op, rhs[last]);
+            var i = last;
+            while (i > 0) {
+                i -= 1;
+                const tie = try p.arena.alloc(PredicateExpr, 2);
+                tie[0] = try elementComparison(p, lhs[i], .eq, rhs[i]);
+                tie[1] = acc;
+                const either = try p.arena.alloc(PredicateExpr, 2);
+                either[0] = try elementComparison(p, lhs[i], strict, rhs[i]);
+                either[1] = .{ .@"and" = tie };
+                acc = .{ .@"or" = either };
+            }
+            return acc;
+        },
+    }
+}
+
+fn elementComparison(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    if (lhs == .null_lit or rhs == .null_lit) return .unknown;
+    if (lhs == .lit) switch (rhs) {
+        .lit => |rhs_val| return try literalComparison(p, lhs.lit, op, rhs_val),
+        .col_ref => |col| return .{ .leaf = .{ .col = col, .op = reverseOp(op), .val = lhs.lit } },
+        else => {},
+    };
+    return try makeExprComparisonPredicate(p, lhs, op, rhs);
 }
 
 fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
