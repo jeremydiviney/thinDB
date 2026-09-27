@@ -2341,6 +2341,13 @@ pub const Parser = struct {
                 value_args = args[0..1];
             }
         }
+        // COUNT(DISTINCT a, b) counts the distinct tuples with no NULL element.
+        if (func == .count_distinct and value_args.len > 1) {
+            for (value_args) |arg| if (arg == .col_ref and std.mem.eql(u8, arg.col_ref, "*")) return ParseError.SqlInvalidProjection;
+            const key = try self.arena.alloc(ir.Expr, 1);
+            key[0] = .{ .call = .{ .fn_name = scalar_fn.ROW_KEY_FN, .args = value_args } };
+            value_args = key;
+        }
         if (value_args.len != 1) return ParseError.SqlInvalidProjection;
         var arg_col: ?[]const u8 = null;
         var arg_expr: ?ir.Expr = null;
