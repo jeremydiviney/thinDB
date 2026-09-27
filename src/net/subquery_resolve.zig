@@ -64,7 +64,7 @@ fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !?@import("../types.zig"
 
 pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
     switch (op.*) {
-        .scan, .file_scan, .ddl, .show, .copy, .single_row => {},
+        .scan, .file_scan, .ddl, .show, .copy, .single_row, .admin => {},
         .insert => |i| try resolveDuplicateAssignments(ctx, i.on_duplicate),
         .alias => |a| try resolveSubqueriesInOp(ctx, @constCast(a.upstream)),
         .table_fn => |t| for (t.inputs) |inp| try resolveSubqueriesInOp(ctx, inp),

@@ -60,7 +60,7 @@ pub fn pushJoinFilters(arena: Allocator, catalog: ?*api.Catalog, session: api.Se
 fn walk(ctx: Ctx, op: *ir.Op) anyerror!void {
     // Bottom-up: optimize children first, then try to push at this node.
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var => {},
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .admin => {},
         .delete_op => |d| if (d.source) |s| try walk(ctx, s),
         .update_op => |u| if (u.source) |s| try walk(ctx, s),
         .limit => |l| try walk(ctx, @constCast(l.upstream)),
@@ -421,7 +421,7 @@ fn countMatRefs(arena: Allocator, op: *const ir.Op, map: *std.AutoHashMapUnmanag
         return countMatRefs(arena, op.materialize.upstream, map);
     }
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var => {},
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .admin => {},
         .delete_op => |d| if (d.source) |s| try countMatRefs(arena, s, map),
         .update_op => |u| if (u.source) |s| try countMatRefs(arena, s, map),
         .limit => |l| try countMatRefs(arena, l.upstream, map),
@@ -456,7 +456,7 @@ fn walkComputeUnions(
     visited: *std.AutoHashMapUnmanaged(*const ir.Op, void),
 ) anyerror!void {
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var => {},
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .admin => {},
         .delete_op => |d| if (d.source) |s| try walkComputeUnions(ctx, s, mat_refs, visited),
         .update_op => |u| if (u.source) |s| try walkComputeUnions(ctx, s, mat_refs, visited),
         .limit => |l| try walkComputeUnions(ctx, @constCast(l.upstream), mat_refs, visited),
