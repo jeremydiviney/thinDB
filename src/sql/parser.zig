@@ -606,6 +606,9 @@ pub const Parser = struct {
     /// The SELECT list of the query expression parsed last: a parenthesized
     /// operand's output names, which a trailing ORDER BY binds to.
     select_output: []const ProjItem = &.{},
+    /// Set inside `ON DUPLICATE KEY UPDATE`, where `VALUES(col)` names the
+    /// value the row would have inserted into `col`.
+    insert_values_refs: bool = false,
 
     pub fn advance(self: *Parser) ParseError!void {
         self.prev_end = self.lex.pos;
@@ -1849,7 +1852,7 @@ pub const Parser = struct {
     /// LEFT, RIGHT, REPLACE, TRUNCATE); in expression position it can only
     /// open a call.
     pub fn keywordCallAhead(self: *const Parser) bool {
-        return keywordScalarName(self.cur.tag) != null;
+        return keywordScalarName(self.cur.tag) != null or (self.cur.tag == .kw_values and self.insert_values_refs);
     }
 
     /// A bare CURRENT_TIMESTAMP / CURRENT_DATE (no parentheses) as the
@@ -1994,7 +1997,7 @@ pub const Parser = struct {
                     depth -= 1;
                 },
                 .eof, .semicolon => return false,
-                .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into => {
+                .comma, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into, .kw_on => {
                     if (depth == 0) return false;
                 },
                 .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq, .kw_is, .kw_in, .kw_between, .kw_like, .kw_regexp, .kw_and, .amp_amp, .kw_or, .kw_not => {
@@ -2923,6 +2926,13 @@ pub const Parser = struct {
             const source = try self.parseStatement();
             try self.expect(.rparen);
             return ir.Expr{ .exists_subquery = @ptrCast(source) };
+        }
+        if (self.cur.tag == .kw_values and self.insert_values_refs) {
+            try self.advance();
+            try self.expect(.lparen);
+            const name = try std.mem.concat(self.arena, u8, &.{ ir.insert_values_prefix, try self.dupedIdent() });
+            try self.expect(.rparen);
+            return ir.Expr{ .col_ref = name };
         }
         if (keywordScalarName(self.cur.tag)) |name| {
             try self.advance();
