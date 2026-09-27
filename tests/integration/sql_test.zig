@@ -3962,6 +3962,9 @@ test "sql: a repeated projection name becomes name_N, as DuckDB names it" {
         .{ .sql = "SELECT * FROM (SELECT id, id FROM t WHERE id = 1) d", .names = &[_][]const u8{ "id", "id_1" } },
         .{ .sql = "SELECT id, NULL, NULL FROM t WHERE id = 1", .names = &[_][]const u8{ "id", "NULL", "NULL_1" } },
         .{ .sql = "SELECT id, id, id AS id_1 FROM t WHERE id = 1", .names = &[_][]const u8{ "id", "id_2", "id_1" } },
+        .{ .sql = "SELECT t.id, t.qty AS id FROM t WHERE id = 1", .names = &[_][]const u8{ "id", "id_1" } },
+        // Two qualified columns keep their shared name, as MySQL names them.
+        .{ .sql = "SELECT a.id, b.id FROM t a JOIN t b ON a.id = b.id WHERE a.id = 1", .names = &[_][]const u8{ "id", "id" } },
     };
     inline for (cases) |case| {
         var q = try runSql(allocator, db, case.sql);
@@ -3987,4 +3990,48 @@ test "sql: a repeated projection name becomes name_N, as DuckDB names it" {
     const r = (try q.next()).?;
     try std.testing.expectEqual(@as(i64, 1), r.values[0].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 11), r.values[1].data.bigint[0]);
+
+    // Nor may an alias replace the qualified column whose bare name it takes.
+    var joined = try runSql(allocator, db, "SELECT a.id, b.id * 10 AS id FROM t a JOIN t b ON a.id = b.id WHERE a.id = 2");
+    defer joined.deinit();
+    try std.testing.expectEqual(@as(usize, 2), joined.outputSchema().len);
+    const jr = (try joined.next()).?;
+    try std.testing.expectEqual(@as(i64, 2), jr.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 20), jr.values[1].data.bigint[0]);
+}
+
+test "sql: a CTE or derived table column list renames the query's columns by position" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE x (id BIGINT PRIMARY KEY, qty BIGINT NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO x VALUES (1, 10), (2, 20), (3, 30)");
+    try (try db.openTable("x", .{})).flush();
+
+    // MySQL, StarRocks and DuckDB answer every case the same.
+    const cases = .{
+        .{ "WITH t(a, b) AS (SELECT 1, 2) SELECT a * 10 + b FROM t", &[_]i64{12} },
+        .{ "WITH t(k, v) AS (SELECT id, qty FROM x) SELECT k FROM t WHERE v > 15 ORDER BY k", &[_]i64{ 2, 3 } },
+        .{ "WITH t(v, k) AS (SELECT qty, id AS q FROM x) SELECT k FROM t WHERE v < 25 ORDER BY k", &[_]i64{ 1, 2 } },
+        .{ "WITH t(n) AS (SELECT id FROM x UNION ALL SELECT qty FROM x) SELECT SUM(n) FROM t", &[_]i64{66} },
+        .{ "WITH t(a, b) AS (SELECT id, id + 1 FROM x) SELECT b FROM t WHERE a = 2", &[_]i64{3} },
+        .{ "SELECT a FROM (SELECT id, qty FROM x) AS d(a, b) WHERE b > 15 ORDER BY a", &[_]i64{ 2, 3 } },
+        .{ "SELECT d.b FROM (SELECT id, qty FROM x) d (a, b) WHERE d.a = 1", &[_]i64{10} },
+        .{ "WITH t(a, b) AS (SELECT x.id, y.qty AS id FROM x JOIN x AS y ON x.id = y.id) SELECT a * 100 + b FROM t ORDER BY a", &[_]i64{ 110, 220, 330 } },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+
+    try helpers.expectRunError(allocator, db, "WITH t(a) AS (SELECT id, qty FROM x) SELECT a FROM t", error.SqlColumnListCountMismatch);
+    try helpers.expectRunError(allocator, db, "WITH t(a, A) AS (SELECT id, qty FROM x) SELECT a FROM t", error.SqlColumnListRepeated);
+    try helpers.expectRunError(allocator, db, "WITH t(a, b) AS (SELECT * FROM x) SELECT a FROM t", error.SqlColumnListOverStar);
+    try helpers.expectRunError(allocator, db, "SELECT a FROM (SELECT id FROM x) AS d(a, b)", error.SqlColumnListCountMismatch);
+    // The listed names replace the query's own.
+    try helpers.expectRunError(allocator, db, "WITH t(a) AS (SELECT id FROM x) SELECT id FROM t", error.ColumnNotFound);
 }
