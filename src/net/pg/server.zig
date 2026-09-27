@@ -539,8 +539,8 @@ fn extended_handleBind(
     }
 
     const literals = try extended.renderBindParams(aa, bind, stmt.param_oids);
-    const bound_sql = try extended.substituteDollarSql(allocator, stmt.sql, literals);
-    errdefer allocator.free(bound_sql);
+    const bound = try extended.substituteDollarSql(allocator, stmt.sql, literals);
+    errdefer bound.deinit(allocator);
 
     const result_formats = try allocator.alloc(u16, bind.result_formats.len);
     errdefer allocator.free(result_formats);
@@ -557,7 +557,8 @@ fn extended_handleBind(
     portal.* = .{
         .name = portal_name,
         .stmt = stmt,
-        .bound_sql = bound_sql,
+        .bound_sql = bound.sql,
+        .bound_params = bound.params,
         .result_formats = result_formats,
     };
 
@@ -623,7 +624,7 @@ fn extended_handleExecute(
     const aa = arena.allocator();
 
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
-    const op = try sql.parseWithContext(aa, portal.bound_sql, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
+    const op = try sql.parseBoundWithContext(aa, portal.bound_sql, portal.bound_params, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
 
     if (op.* == .batch) {
         for (op.batch.statements) |stmt| {

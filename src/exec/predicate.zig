@@ -21,6 +21,7 @@ const simd = @import("../util/simd.zig");
 const like_pattern = @import("../util/like.zig");
 const Error = exec.Error;
 const scalar_fn_common = @import("scalar_fn_common.zig");
+const scalar_fn_time = @import("scalar_fn_time.zig");
 const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
 const decimal_rescale = @import("scalar_fn_decimal.zig").rescale;
 
@@ -30,6 +31,12 @@ pub const Predicate = struct {
     col: []const u8,
     op: PredicateOp,
     val: Value,
+    /// `val` comes from the statement itself: a constant written in its
+    /// text, or a user variable or scalar subquery it reads. Text no DATE or
+    /// DATETIME reads then fails the statement, as MySQL raises error 1525.
+    /// A bound parameter's value or an API caller's never matches instead,
+    /// as MySQL returns no rows for a prepared statement's parameter.
+    from_statement: bool = false,
 };
 
 /// Boolean expression over Predicates.
@@ -553,6 +560,7 @@ fn cloneLeaf(out_arena: std.mem.Allocator, lf: Predicate, renames: []const ColRe
         .col = try out_arena.dupe(u8, renameOf(renames, lf.col)),
         .op = lf.op,
         .val = try cloneValue(out_arena, lf.val),
+        .from_statement = lf.from_statement,
     };
 }
 
@@ -596,6 +604,12 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                     .parse_rows => {
                         const leaf = p.*;
                         expr.* = .{ .text_as_number = leaf };
+                    },
+                    .not_temporal => if (p.from_statement) {
+                        recordInvalidTemporal(col_type, p.val.text);
+                        return Error.InvalidTemporalLiteral;
+                    } else {
+                        expr.* = .unknown;
                     },
                     .incomparable => return Error.PredicateTypeMismatch,
                 }
@@ -642,9 +656,13 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         // equal it (`x IN (2.5, 5)` on an INT column: 2.5 matches nothing)
         // and is dropped from the set — correct for the negated form too
         // (`x <> 2.5` is always true for an INT x under this dialect's
-        // NULL-skipping NOT IN). A number against a text column stays a
-        // number and the node becomes `.text_as_number_set`. Values are
-        // arena-owned parse output; in-place rewrite mirrors the `.leaf` arm.
+        // NULL-skipping NOT IN). Text that doesn't read as the DATE or
+        // DATETIME it meets drops the same way: set values are rows an IN
+        // subquery returned, which MySQL skips with a warning; only a
+        // `.leaf` the statement spells raises `InvalidTemporalLiteral`. A
+        // number against a text column stays a number and the node becomes
+        // `.text_as_number_set`. Values are arena-owned parse output;
+        // in-place rewrite mirrors the `.leaf` arm.
         .in_set => |*s| {
             const col_idx = types.findColumn(schema, s.col) orelse return Error.ColumnNotFound;
             const col_type = schema[col_idx].type;
@@ -671,7 +689,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                             parse_rows = true;
                             break :blk v;
                         },
-                        .between, .beyond, .null_text, .incomparable => continue,
+                        .between, .beyond, .null_text, .not_temporal, .incomparable => continue,
                     };
                     keep += 1;
                 }
@@ -752,6 +770,34 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
     }
 }
 
+/// MySQL's ER_WRONG_VALUE prints at most 128 characters of the value.
+const INVALID_TEMPORAL_VALUE_MAX = 128;
+
+/// `InvalidTemporalLiteral` carries no payload, and operators raise it while
+/// they build, far below the wire layer that reports it; the message naming
+/// the constant waits here on the raising thread.
+threadlocal var invalid_temporal_message_buf: ["Incorrect DATETIME value: ''".len + INVALID_TEMPORAL_VALUE_MAX]u8 = undefined;
+threadlocal var invalid_temporal_message_len: usize = 0;
+
+fn recordInvalidTemporal(col_type: types.Type, text: []const u8) void {
+    var value = text[0..@min(text.len, INVALID_TEMPORAL_VALUE_MAX)];
+    while (value.len < text.len and value.len > 0 and text[value.len] & 0xC0 == 0x80) value.len -= 1;
+    const type_name = if (col_type == .date) "DATE" else "DATETIME";
+    const message = std.fmt.bufPrint(&invalid_temporal_message_buf, "Incorrect {s} value: '{s}'", .{ type_name, value }) catch unreachable;
+    invalid_temporal_message_len = message.len;
+}
+
+/// The message for this thread's last `InvalidTemporalLiteral` (MySQL's
+/// wording: `Incorrect DATE value: 'abc'`), taken once so a later error
+/// can't report a stale constant. Null when it was raised on another thread
+/// or already taken. The slice lives until this thread raises again.
+pub fn takeInvalidTemporalMessage() ?[]const u8 {
+    const len = invalid_temporal_message_len;
+    if (len == 0) return null;
+    invalid_temporal_message_len = 0;
+    return invalid_temporal_message_buf[0..len];
+}
+
 fn findCol(schema: []const Column, name: []const u8) ?usize {
     return types.findColumn(schema, name);
 }
@@ -790,7 +836,7 @@ fn coerceKeyTuple(tuple: []Value, col_types: []const types.Type) bool {
         switch (placeLiteral(v.*, ty)) {
             .exact => |c| v.* = c,
             .parse_rows => {},
-            .between, .beyond, .null_text, .incomparable => return false,
+            .between, .beyond, .null_text, .not_temporal, .incomparable => return false,
         }
     }
     return true;
@@ -805,9 +851,13 @@ const LiteralPlacement = union(enum) {
     between: struct { lo: Value, hi: Value },
     /// The literal lies past every value the column type can hold.
     beyond: Side,
-    /// Text that doesn't parse as the column's number or date: the
-    /// comparison is NULL (StarRocks: `'12abc' = 12` is NULL).
+    /// Text that doesn't parse as the column's number: the comparison is
+    /// NULL (StarRocks: `'12abc' = 12` is NULL).
     null_text,
+    /// Text that doesn't read as a date or datetime against a DATE or
+    /// DATETIME column. A `from_statement` constant fails the statement, as
+    /// MySQL raises `Incorrect DATE value`; anything else never matches.
+    not_temporal,
     /// A number against a text column: each row's text is read as a number,
     /// so no one value of the column's type stands for the literal.
     parse_rows,
@@ -821,17 +871,23 @@ fn sideOf(negative: bool) Side {
 }
 
 fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
-    var exact = val;
-    if (coerceValue(&exact, col_type)) |_| return .{ .exact = exact } else |_| {}
+    const kind = comparisonKind(col_type);
+    // Text meets a temporal column only as `textMicros` reads it:
+    // `coerceValue` takes a date prefix, so it would read
+    // '2026-09-26 25:00:00' as a valid date.
+    if (val != .text or kind != .temporal) {
+        var exact = val;
+        if (coerceValue(&exact, col_type)) |_| return .{ .exact = exact } else |_| {}
+    }
     const lit: Scalar = switch (val) {
-        .text => |t| textScalar(t, col_type) orelse return .null_text,
+        .text => |t| textScalar(t, col_type) orelse return if (kind == .temporal) .not_temporal else .null_text,
         // No scale to place it by: only a decimal column (coerceValue) takes it.
         .decimal64, .decimal128 => return .incomparable,
         else => valueScalar(val, 0),
     };
     if (!scalarComparableTo(lit, col_type)) {
         const number = lit == .integer or lit == .float;
-        return if (number and comparisonKind(col_type) == .text) .parse_rows else .incomparable;
+        return if (number and kind == .text) .parse_rows else .incomparable;
     }
     return switch (col_type) {
         .tinyint, .smallint, .int, .bigint, .largeint => placeOnGrid(lit, 0, col_type),
@@ -2051,9 +2107,11 @@ fn textNumber(raw: []const u8) ?Scalar {
     };
 }
 
-fn textMicros(raw: []const u8) ?Scalar {
-    const text = std.mem.trim(u8, raw, " \t\r\n");
-    return .{ .micros = scalar_fn_common.textToDatetime(text) orelse return null };
+/// Text as a comparison with a DATE or DATETIME reads it: MySQL's
+/// str_to_datetime (`scalar_fn_time.parseDatetime`), so '2026-9-1' and
+/// '20260901' are dates and '2026-09-31' or '2026-09-26 25:00:00' are none.
+fn textMicros(text: []const u8) ?Scalar {
+    return .{ .micros = (scalar_fn_time.parseDatetime(text) orelse return null).value };
 }
 
 fn orderMatches(order: ?std.math.Order, op: PredicateOp) bool {
@@ -2575,4 +2633,61 @@ test "placeLiteral lands each literal on the column's values" {
     try t.expect(placeLiteral(.{ .text = "12abc" }, .int) == .null_text);
     try t.expect(placeLiteral(.{ .date = 1 }, .int) == .incomparable);
     try t.expect(placeLiteral(.{ .bigint = 1 }, .date) == .incomparable);
+}
+
+test "placeLiteral reads text against a DATE or DATETIME as MySQL does" {
+    const t = std.testing;
+    const day: i32 = 20722; // 2026-09-26
+    const readable = .{
+        .{ "2026-09-26", day },
+        .{ "20260926", day },
+        .{ "260926", day },
+        .{ "2026-9-26", day },
+        .{ "2026/09/26", day },
+        .{ " 2026-09-26", day },
+        .{ "2026-09-26x", day },
+        .{ "2026-09-26 00:00:00", day },
+    };
+    inline for (readable) |c| try t.expectEqual(Value{ .date = c[1] }, placeLiteral(.{ .text = c[0] }, .date).exact);
+    const at_ten = @as(i64, day) * std.time.us_per_day + 10 * std.time.us_per_hour;
+    inline for (.{ "2026-09-26 10:00:00", "2026-09-26T10:00", "2026-09-26 10" }) |text| {
+        try t.expectEqual(Value{ .datetime = at_ten }, placeLiteral(.{ .text = text }, .datetime).exact);
+    }
+    try t.expectEqual(Value{ .date = day }, placeLiteral(.{ .text = "2026-09-26 10:00" }, .date).between.lo);
+
+    const unreadable = .{ "", "   ", "abc", "0", "2026", "202609", "2026-09", "2026-02-30", "2026-09-31", "2026-13-01", "0000-00-00", "2026-09-00", "10000-01-01", "2026-09-26 25:00:00", "2026-09-26 10:60:00", "2026-09-26 10:00:60" };
+    inline for (unreadable) |text| {
+        try t.expect(placeLiteral(.{ .text = text }, .date) == .not_temporal);
+        try t.expect(placeLiteral(.{ .text = text }, .datetime) == .not_temporal);
+    }
+}
+
+test "validateExpr raises on a constant no date reads, and drops it from a set" {
+    const t = std.testing;
+    const schema = [_]Column{.{ .name = "d", .type = .date, .nullable = true }};
+    const ops = [_]PredicateOp{ .eq, .neq, .lt, .lte, .gt, .gte };
+    for (ops) |op| {
+        var expr: PredicateExpr = .{ .leaf = .{ .col = "d", .op = op, .val = .{ .text = "abc" }, .from_statement = true } };
+        try t.expectError(Error.InvalidTemporalLiteral, validateExpr(&expr, &schema));
+        try t.expectEqualStrings("Incorrect DATE value: 'abc'", takeInvalidTemporalMessage().?);
+        try t.expect(takeInvalidTemporalMessage() == null);
+
+        var bound: PredicateExpr = .{ .leaf = .{ .col = "d", .op = op, .val = .{ .text = "abc" } } };
+        try validateExpr(&bound, &schema);
+        try t.expect(bound == .unknown);
+        try t.expect(takeInvalidTemporalMessage() == null);
+    }
+
+    var long_value: [200]u8 = undefined;
+    @memset(&long_value, 'x');
+    long_value[127] = 0xC3;
+    long_value[128] = 0xA9;
+    var long: PredicateExpr = .{ .leaf = .{ .col = "d", .op = .eq, .val = .{ .text = &long_value }, .from_statement = true } };
+    try t.expectError(Error.InvalidTemporalLiteral, validateExpr(&long, &schema));
+    try t.expectEqualStrings("Incorrect DATE value: '" ++ "x" ** 127 ++ "'", takeInvalidTemporalMessage().?);
+
+    var values = [_]Value{ .{ .text = "abc" }, .{ .text = "2026-09-26" } };
+    var set: PredicateExpr = .{ .in_set = .{ .col = "d", .values = &values, .negate = false, .value_type = .string } };
+    try validateExpr(&set, &schema);
+    try t.expectEqualSlices(Value, &.{.{ .date = 20722 }}, set.in_set.values);
 }

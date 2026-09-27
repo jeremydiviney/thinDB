@@ -142,14 +142,14 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
             // `col <op> @x` where @x is SQL NULL is UNKNOWN under 3VL (matches a
             // null literal on the RHS); otherwise compare against the value.
             pred.* = if (try lookupSessionVar(ctx, v.var_name)) |resolved|
-                .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved } }
+                .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved, .from_statement = true } }
             else
                 .unknown;
         },
         .scalar_subquery => |sq| {
             if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
             pred.* = switch (try runScalarSubquery(ctx, sq.source)) {
-                .value => |tv| .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = try comparableValue(try ctx.subqueryArena(), tv) } },
+                .value => |tv| .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = try comparableValue(try ctx.subqueryArena(), tv), .from_statement = true } },
                 .null_of => .unknown,
             };
         },

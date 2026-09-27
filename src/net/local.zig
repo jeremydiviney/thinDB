@@ -767,11 +767,13 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .col = try aa.dupe(u8, p.col),
             .op = p.op,
             .val = try cloneValue(aa, p.val),
+            .from_statement = p.from_statement,
         } },
         .day_leaf => |p| PredicateExpr{ .day_leaf = .{
             .col = try aa.dupe(u8, p.col),
             .op = p.op,
             .val = try cloneValue(aa, p.val),
+            .from_statement = p.from_statement,
         } },
         .text_as_number, .text_as_number_set => try exec.predicate.deepClonePredicate(aa, expr),
         .leaf_col_col => |lc| PredicateExpr{ .leaf_col_col = .{
@@ -2084,10 +2086,13 @@ fn projectTargetName(p: ir.Op.Project, index: usize) []const u8 {
     return p.columns[index];
 }
 
+/// A replace-flagged item outputs `name`, or reads it as the private column
+/// the parser computes the item under when its alias would hide a FROM
+/// column (`SELECT *, SUM(x) OVER () AS x`).
 fn projectHasReplaceTarget(p: ir.Op.Project, name: []const u8) bool {
-    for (p.columns, 0..) |_, i| {
+    for (p.columns, 0..) |column, i| {
         if (!projectReplaceFlag(p, i)) continue;
-        if (types.columnNameEql(projectTargetName(p, i), name)) return true;
+        if (types.columnNameEql(projectTargetName(p, i), name) or types.columnNameEql(column, name)) return true;
     }
     return false;
 }

@@ -120,12 +120,12 @@ pub fn createPreparedStmt(
 
 /// Walk the original SQL substituting `?` positions with rendered
 /// literal text. `params` is a list of optional rendered-literal strings
-/// (null = SQL NULL). Returns an allocator-owned slice the caller frees.
+/// (null = SQL NULL). The caller frees the result with `deinit`.
 pub fn substituteSql(
     allocator: Allocator,
     sql: []const u8,
     params: []const ?[]const u8,
-) ![]u8 {
+) !sql_text.BoundSql {
     return sql_text.substituteQuestionPlaceholders(allocator, sql, params);
 }
 
@@ -136,7 +136,9 @@ pub fn renderDummySubstitution(allocator: Allocator, sql: []const u8, n: u16) ![
     const buf = try allocator.alloc(?[]const u8, n);
     defer allocator.free(buf);
     for (buf) |*slot| slot.* = "0";
-    return try substituteSql(allocator, sql, buf);
+    const bound = try substituteSql(allocator, sql, buf);
+    allocator.free(bound.params);
+    return bound.sql;
 }
 
 // ---------------------------------------------------------------------------
@@ -602,9 +604,9 @@ test "substituteSql replaces in order, preserves strings + comments" {
         "SELECT * FROM t WHERE a = ? AND b = ? AND c = '?' AND d = ?",
         params[0..],
     );
-    defer allocator.free(out);
+    defer out.deinit(allocator);
     try std.testing.expectEqualStrings(
         "SELECT * FROM t WHERE a = 42 AND b = 'hello''world' AND c = '?' AND d = NULL",
-        out,
+        out.sql,
     );
 }

@@ -1948,15 +1948,21 @@ const Builder = struct {
         const names = try @import("local.zig").resolve_select_project(b.a, schema, p.*);
         defer names.deinit(b.a);
         var new_vis: std.ArrayListUnmanaged(VisEntry) = .empty;
+        // A pin follows its column's value, not its name: `x + 1 AS x`
+        // reaches here as a private column renamed to the pinned `x`.
+        var pinned: std.ArrayListUnmanaged(PinnedCol) = .empty;
         for (names.sources, names.outputs) |col, output| {
             const e = b.fb.resolve(col) orelse return NoMatch;
             for (new_vis.items) |prior| {
                 if (types.columnNameEql(prior.name, output)) return NoMatch;
             }
-            try new_vis.append(b.a, .{ .name = try b.a.dupe(u8, output), .idx = e.idx });
+            const name = try b.a.dupe(u8, output);
+            try new_vis.append(b.a, .{ .name = name, .idx = e.idx });
+            if (b.pinnedName(col)) |value| try pinned.append(b.a, .{ .name = name, .val = value });
         }
         try b.flushPending();
         b.fb.vis = new_vis;
+        b.pinned = pinned;
     }
 
     fn applyAlias(b: *Builder, alias: []const u8) !void {

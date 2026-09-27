@@ -502,6 +502,21 @@ test "keyed region: qualified projection aliases follow computed output replacem
         \\)
         \\SELECT * FROM j ORDER BY custLC, month
     , "extra");
+    // The entry filter's pin on projectId must not follow the name to the
+    // column renamed onto it.
+    try expect_keyed_matches(allocator, db,
+        \\r AS (
+        \\ SELECT projectId, custLC, month, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM inv WHERE projectId = 100
+        \\), changed AS (
+        \\ SELECT custLC, month, rn, rn + 99 AS k FROM r
+        \\), renamed AS (
+        \\ SELECT custLC, month, rn, k AS projectId FROM changed
+        \\), j AS (
+        \\ SELECT p.custLC, p.month, p.rn, d.extra FROM renamed p LEFT JOIN projection_lookup d ON p.projectId = d.id
+        \\)
+        \\SELECT * FROM j ORDER BY custLC, month
+    , "extra");
 }
 
 test "keyed region: entry computes replace input names without losing their source values" {
