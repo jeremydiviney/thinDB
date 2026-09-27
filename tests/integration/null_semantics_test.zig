@@ -761,3 +761,35 @@ test "null literal arguments take a sibling argument's type" {
     try std.testing.expectEqual(thindb.types.TypeTag.double, std.meta.activeTag(schema[0].type));
     try std.testing.expectEqual(thindb.types.TypeTag.bigint, std.meta.activeTag(schema[1].type));
 }
+
+test "null literal arguments with no typed sibling take an overload's parameter type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE nf (id BIGINT PRIMARY KEY, d DATE)");
+    try exec(allocator, db, "INSERT INTO nf (id, d) VALUES (1, '2024-01-01'), (2, NULL)");
+
+    const cases = .{
+        .{ "SELECT COUNT(ABS(NULL)) FROM nf", 0 },
+        .{ "SELECT COUNT(ROUND(NULL)) FROM nf", 0 },
+        .{ "SELECT COUNT(ROUND(NULL, 2)) FROM nf", 0 },
+        .{ "SELECT COUNT(DAY(NULL)) FROM nf", 0 },
+        .{ "SELECT COUNT(YEAR(NULL)) FROM nf", 0 },
+        .{ "SELECT COUNT(DATE_FORMAT(NULL, '%Y')) FROM nf", 0 },
+        .{ "SELECT COUNT(DATE_FORMAT(d, NULL)) FROM nf", 0 },
+        .{ "SELECT COUNT(*) FROM nf WHERE YEAR(NULL) = 2024", 0 },
+        .{ "SELECT COUNT(*) FROM nf WHERE ABS(NULL) IS NULL", 2 },
+        .{ "SELECT COUNT(COALESCE(ABS(NULL), id)) FROM nf", 2 },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, &.{c[1]}, got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
