@@ -389,6 +389,55 @@ test "INSERT and UPDATE: a value converts to its column's type as MySQL assigns 
     try std.testing.expectEqualSlices(i64, &.{0}, unchanged);
 }
 
+test "INSERT and UPDATE: a number, DATE or DATETIME lands in a text column as CAST(x AS CHAR) spells it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE vv (id BIGINT PRIMARY KEY, s VARCHAR(30), c CHAR(10), txt STRING)");
+    try exec(allocator, db, "INSERT INTO vv (id, s) VALUES (1, 1.5)");
+    try exec(allocator, db, "INSERT INTO vv (id, s) VALUES (2, 7)");
+    try exec(allocator, db, "INSERT INTO vv (id, s) VALUES (3, 1 + 1)");
+    try exec(allocator, db, "INSERT INTO vv (id, s) SELECT 4, 1.5");
+    try exec(allocator, db, "INSERT INTO vv (id, s) VALUES (5, CAST(1.5 AS DECIMAL(4,2)))");
+    try exec(allocator, db, "INSERT INTO vv (id, s, c, txt) VALUES (6, TRUE, -12, DATE '2024-02-29')");
+    try exec(allocator, db, "INSERT INTO vv (id, s, c, txt) SELECT 7, CAST('2024-01-02 03:04:05' AS DATETIME), 1 = 0, CAST(NULL AS BIGINT)");
+    try exec(allocator, db, "CREATE TABLE nums (k BIGINT PRIMARY KEY, n INT, x DOUBLE, m DECIMAL(6,2), d DATE)");
+    try exec(allocator, db, "INSERT INTO nums VALUES (1, -3, 0.25, 12.30, '2020-01-01'), (2, NULL, NULL, NULL, NULL)");
+    try exec(allocator, db, "INSERT INTO vv (id, s, c, txt) SELECT k + 10, n, m, x FROM nums");
+    try exec(allocator, db, "UPDATE vv SET s = id * 10 WHERE id = 1");
+    try exec(allocator, db, "UPDATE vv SET txt = 2.5 WHERE id = 2");
+    try exec(allocator, db, "UPDATE vv JOIN nums ON vv.id = nums.k + 10 SET vv.c = nums.d");
+    try exec(allocator, db, "INSERT INTO vv (id, s) VALUES (3, 'x') ON DUPLICATE KEY UPDATE s = id + 0.5");
+
+    for (0..2) |pass| {
+        if (pass == 1) {
+            const t = try db.openTable("vv", .{});
+            try t.flush();
+        }
+        const cases = .{
+            .{ "SELECT CAST(s AS CHAR) FROM vv ORDER BY id", &[_]?[]const u8{ "10", "7", "3.5", "1.5", "1.50", "1", "2024-01-02 03:04:05", "-3", null } },
+            .{ "SELECT CAST(c AS CHAR) FROM vv ORDER BY id", &[_]?[]const u8{ null, null, null, null, null, "-12", "0", "2020-01-01", null } },
+            .{ "SELECT CAST(txt AS CHAR) FROM vv ORDER BY id", &[_]?[]const u8{ null, "2.5", null, null, null, "2024-02-29", null, "0.25", null } },
+        };
+        inline for (cases) |c| {
+            const got = try helpers.collectStrings(allocator, db, c[0]);
+            defer helpers.freeStrings(allocator, got);
+            try std.testing.expectEqual(c[1].len, got.len);
+            for (c[1], got) |want, have| {
+                if (want) |w| {
+                    try std.testing.expectEqualStrings(w, have orelse return error.TestExpectedEqual);
+                } else {
+                    try std.testing.expectEqual(@as(?[]u8, null), have);
+                }
+            }
+        }
+    }
+}
+
 test "INSERT VALUES: a row takes constant expressions" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
