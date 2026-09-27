@@ -932,6 +932,34 @@ pub const Op = union(OpTag) {
         right: *Op,
     };
 
+    /// A copy of the operator tree under `self` whose nodes compile apart
+    /// from the original's, in `arena`. Expressions and names stay shared,
+    /// as does a `materialize` node: its readers share one buffer.
+    pub fn cloneTree(self: *Op, arena: Allocator) Allocator.Error!*Op {
+        if (self.* == .materialize) return self;
+        const copy = try arena.create(Op);
+        copy.* = self.*;
+        switch (copy.*) {
+            inline else => |*payload| {
+                const Payload = @TypeOf(payload.*);
+                if (@typeInfo(Payload) != .@"struct") return copy;
+                inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                    const child = &@field(payload.*, field.name);
+                    if (field.type == *Op) {
+                        child.* = try child.*.cloneTree(arena);
+                    } else if (field.type == ?*Op) {
+                        if (child.*) |op| child.* = try op.cloneTree(arena);
+                    } else if (field.type == []const *Op) {
+                        const ops = try arena.alloc(*Op, child.len);
+                        for (child.*, ops) |op, *dst| dst.* = try op.cloneTree(arena);
+                        child.* = ops;
+                    }
+                }
+            },
+        }
+        return copy;
+    }
+
     /// Free any allocations made by `decode`. No-op for client-built trees
     /// whose strings come from caller storage.
     pub fn deinitDecoded(self: *Op, allocator: Allocator) void {
