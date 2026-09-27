@@ -86,10 +86,13 @@ fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: Column
         // A zero byte escapes to 0x00 0xFF and 0x00 0x00 ends the text, so a
         // prefix sorts before every longer text, and the next key starts clean.
         .varchar, .string, .char, .json => |sv| {
-            for (sv.rowBytes(row)) |b| {
-                try key.append(allocator, b);
-                if (b == 0) try key.append(allocator, 0xFF);
+            var rest = sv.rowBytes(row);
+            while (std.mem.indexOfScalar(u8, rest, 0)) |zero| {
+                try key.appendSlice(allocator, rest[0 .. zero + 1]);
+                try key.append(allocator, 0xFF);
+                rest = rest[zero + 1 ..];
             }
+            try key.appendSlice(allocator, rest);
             try key.appendSlice(allocator, &.{ 0, 0 });
         },
         inline .float, .double => |s| {
@@ -735,10 +738,9 @@ pub fn concatWsKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
     }
 }
 
-/// `__row_key(a, b, ...)`: one byte string per row, equal for two rows
-/// exactly when every argument is, and NULL when any argument is. A column's
-/// type is fixed, so fixed-width values keep their bytes and only text needs a
-/// length prefix to stay unambiguous.
+/// `__row_key(a, b, ...)`: the ascending order key of the arguments, which
+/// is equal for two rows exactly when every argument is, and NULL when any
+/// argument is.
 pub fn rowKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
     _ = arg_types;
     _ = out_type;
@@ -750,28 +752,10 @@ pub fn rowKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Typ
         key.clearRetainingCapacity();
         const complete = for (args) |arg| {
             if (!arg.isValid(row)) break false;
-            try appendRowKeyPart(allocator, &key, arg, row);
+            try appendOrderKeyPart(allocator, &key, arg, row);
         } else true;
         try ss.appendValue(allocator, if (complete) key.items else "");
         try out.appendValidBit(allocator, base + row, complete);
-    }
-}
-
-fn appendRowKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: ColumnView, row: usize) Allocator.Error!void {
-    switch (arg.data) {
-        .varchar, .string, .char, .json => |sv| {
-            const bytes = sv.rowBytes(row);
-            const len: u64 = bytes.len;
-            try key.appendSlice(allocator, std.mem.asBytes(&len));
-            try key.appendSlice(allocator, bytes);
-        },
-        // -0.0 equals 0.0 but has other bytes.
-        inline .float, .double => |s| {
-            const v = if (s[row] == 0) 0 else s[row];
-            try key.appendSlice(allocator, std.mem.asBytes(&v));
-        },
-        .boolean => |s| try key.append(allocator, @intFromBool(s[row] != 0)),
-        inline else => |s| try key.appendSlice(allocator, std.mem.asBytes(&s[row])),
     }
 }
 
