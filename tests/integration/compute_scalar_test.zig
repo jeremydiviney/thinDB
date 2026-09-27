@@ -157,9 +157,9 @@ test "a statement whose Compute fails to build lets the database close" {
     try helpers.exec(allocator, db, "CREATE TABLE raw (id BIGINT PRIMARY KEY, s VARCHAR(32))");
     try helpers.exec(allocator, db, "INSERT INTO raw (id, s) VALUES (1, 'a')");
     inline for (.{
-        "SELECT sqrt('x') AS v FROM raw",
-        "SELECT upper(s) AS u, concat('a', sqrt('x')) AS v FROM raw",
-        "SELECT CASE WHEN id > 0 THEN 'y' ELSE sqrt('x') END AS v FROM raw",
+        "SELECT sqrt('x', 'y') AS v FROM raw",
+        "SELECT upper(s) AS u, concat('a', sqrt('x', 'y')) AS v FROM raw",
+        "SELECT CASE WHEN id > 0 THEN 'y' ELSE sqrt('x', 'y') END AS v FROM raw",
     }) |sql| {
         try helpers.expectRunError(allocator, db, sql, thindb.exec.Error.ComputeNoSuchOverload);
     }

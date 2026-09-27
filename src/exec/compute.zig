@@ -2972,18 +2972,19 @@ test "a create that fails frees every buffer it built" {
     // waits on, live until every tracked byte is returned: one leaked
     // literal buffer hung close for good (#63).
     const x = [_]Expr{.{ .lit = .{ .text = "x" } }};
-    const sqrt_x: Expr = .{ .call = .{ .fn_name = "sqrt", .args = &x } };
-    const lit_then_bad = [_]Expr{ .{ .lit = .{ .text = "a" } }, sqrt_x };
+    const xy = [_]Expr{ .{ .lit = .{ .text = "x" } }, .{ .lit = .{ .text = "y" } } };
+    const sqrt_xy: Expr = .{ .call = .{ .fn_name = "sqrt", .args = &xy } };
+    const lit_then_bad = [_]Expr{ .{ .lit = .{ .text = "a" } }, sqrt_xy };
     const cases = .{
-        .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = sqrt_x }} },
+        .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = sqrt_xy }} },
         .{ Error.ComputeNoSuchOverload, &[_]Derived{
             .{ .name = "u", .expr = .{ .call = .{ .fn_name = "upper", .args = &x } } },
-            .{ .name = "v", .expr = sqrt_x },
+            .{ .name = "v", .expr = sqrt_xy },
         } },
         .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = .{ .call = .{ .fn_name = "concat", .args = &lit_then_bad } } }} },
         .{ Error.ComputeNoSuchOverload, &[_]Derived{.{ .name = "v", .expr = .{ .case = .{
             .branches = &.{.{ .cond = .{ .is_not_null = "a" }, .then = .{ .lit = .{ .text = "y" } } }},
-            .else_branch = &sqrt_x,
+            .else_branch = &sqrt_xy,
         } } }} },
         .{ Error.ComputeNameCollision, &[_]Derived{
             .{ .name = "k", .expr = .{ .lit = .{ .text = "p" } } },
