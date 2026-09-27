@@ -2669,6 +2669,7 @@ fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
     };
 
     var t: *ApiTable = undefined;
+    var persistent_schema: ?*DbSchema = null;
     if (op.is_temp) {
         const ns = ctx.session.temp_namespace orelse return Error.UnsupportedOp;
         if (ns.contains(op.table.name)) {
@@ -2687,7 +2688,16 @@ fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
             return Error.TableAlreadyExists;
         }
         t = sc.table(op.table.name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
+        persistent_schema = sc;
     }
+    // A CTAS whose query fails leaves no table behind, as MySQL's atomic
+    // DDL rolls it back: a retry would otherwise meet a half-filled table.
+    // The query's error is the one to report, so a failed drop is ignored.
+    errdefer if (persistent_schema) |sc| {
+        sc.dropTable(op.table.name) catch {};
+    } else if (ctx.session.temp_namespace) |ns| {
+        ns.dropTable(op.table.name) catch {};
+    };
 
     var total_rows: usize = 0;
     while (try source.next()) |b| {
@@ -2736,21 +2746,111 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const out_schema = source.outputSchema();
     const batch_schema = try aa.alloc(types.Column, tbl_columns.len);
     const views = try aa.alloc(storage.ColumnView, tbl_columns.len);
+    var staged: StagedInsertRows = .{};
+    defer staged.deinit(ctx.allocator);
+    var streaming = false;
     var total_rows: usize = 0;
     while (try source.next()) |b| {
         try plan.fill(ctx, t, out_schema, b.values, b.row_count, batch_schema, views);
         defer plan.release(ctx, views);
-        switch (rule) {
-            .replace => {
-                try t.insertBatch(batch_schema, views, b.row_count);
-                total_rows += b.row_count;
-            },
-            .resolve => |action| total_rows += duplicateAffectedRows(try t.insertBatchOnDuplicate(batch_schema, views, b.row_count, action)),
+        if (streaming) {
+            total_rows += try writeInsertRows(t, rule, batch_schema, views, b.row_count);
+            continue;
+        }
+        try staged.append(ctx.allocator, aa, t, plan, out_schema, batch_schema, views, b.row_count);
+        if (staged.bytes > INSERT_SELECT_STAGE_BYTES) {
+            total_rows += try staged.write(aa, t, rule);
+            staged.deinit(ctx.allocator);
+            staged = .{};
+            streaming = true;
         }
     }
+    if (staged.row_count > 0) total_rows += try staged.write(aa, t, rule);
     ctx.affected_rows = @intCast(total_rows);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
 }
+
+/// How many bytes of rows an INSERT ... SELECT gathers before writing any.
+/// Within the bound the rows land in one batch, which the table validates
+/// whole before taking any of it, so a source that fails part way or a row
+/// the table refuses leaves nothing behind, as MySQL rolls the statement
+/// back. A larger copy writes what it gathered, then streams batch by batch.
+const INSERT_SELECT_STAGE_BYTES: usize = 64 << 20;
+
+fn writeInsertRows(t: *ApiTable, rule: DuplicateRule, batch_schema: []const types.Column, views: []const storage.ColumnView, row_count: usize) !usize {
+    switch (rule) {
+        .replace => {
+            try t.insertBatch(batch_schema, views, row_count);
+            return row_count;
+        },
+        .resolve => |action| return duplicateAffectedRows(try t.insertBatchOnDuplicate(batch_schema, views, row_count, action)),
+    }
+}
+
+/// An INSERT ... SELECT's filled batches, copied into one column store per
+/// table column until they are written together.
+const StagedInsertRows = struct {
+    columns: []engine.ColumnStore = &.{},
+    column_types: []types.Type = &.{},
+    row_count: usize = 0,
+    bytes: usize = 0,
+
+    fn append(
+        self: *StagedInsertRows,
+        allocator: Allocator,
+        aa: Allocator,
+        t: *ApiTable,
+        plan: InsertColumnPlan,
+        out_schema: []const types.Column,
+        batch_schema: []const types.Column,
+        views: []const storage.ColumnView,
+        row_count: usize,
+    ) !void {
+        if (self.columns.len == 0) {
+            const columns = try allocator.alloc(engine.ColumnStore, views.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (columns[0..initialized]) |*c| c.deinit(allocator);
+                allocator.free(columns);
+            }
+            self.column_types = try aa.alloc(types.Type, views.len);
+            for (columns, self.column_types, batch_schema, plan.picks, t.schema.columns) |*c, *ty, bs, pick, col| {
+                ty.* = bs.type;
+                c.* = try engine.ColumnStore.init(allocator, bs.type, out_schema[pick].nullable or col.nullable);
+                initialized += 1;
+            }
+            self.columns = columns;
+        }
+        self.bytes = 0;
+        for (self.columns, views) |*c, v| {
+            try engine.transform.appendColumnRange(allocator, v, 0, row_count, c);
+            self.bytes += storeCapacityBytes(c);
+        }
+        self.row_count += row_count;
+    }
+
+    fn write(self: *StagedInsertRows, aa: Allocator, t: *ApiTable, rule: DuplicateRule) !usize {
+        const batch_schema = try aa.alloc(types.Column, self.columns.len);
+        const views = try aa.alloc(storage.ColumnView, self.columns.len);
+        for (self.columns, self.column_types, t.schema.columns, batch_schema, views) |c, ty, col, *bs, *view| {
+            view.* = c.view();
+            bs.* = .{ .name = col.name, .type = ty, .nullable = c.nulls != null and (col.nullable or view.anyNull(self.row_count)) };
+        }
+        return try writeInsertRows(t, rule, batch_schema, views, self.row_count);
+    }
+
+    fn deinit(self: *StagedInsertRows, allocator: Allocator) void {
+        for (self.columns) |*c| c.deinit(allocator);
+        allocator.free(self.columns);
+    }
+
+    fn storeCapacityBytes(c: *const engine.ColumnStore) usize {
+        return switch (c.data) {
+            .varchar, .string, .char, .json => |s| s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity,
+            inline else => |list| list.capacity * @sizeOf(std.meta.Child(@TypeOf(list.items))),
+        };
+    }
+};
 
 /// How an INSERT fills each column of its table from a source query: the
 /// source column it takes (after any widening appended to the query) and

@@ -555,3 +555,54 @@ test "INSERT SELECT: omitted columns take their DEFAULT, the clock, or NULL" {
     try exec(allocator, db, "CREATE TABLE strict_sink (id BIGINT PRIMARY KEY, must INT NOT NULL)");
     try helpers.expectRunError(allocator, db, "INSERT INTO strict_sink (id) SELECT id FROM src", error.ColumnNotFound);
 }
+
+fn expectStatementFails(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = try thindb.sql.parseDialect(arena.allocator(), sql, .mysql);
+    if (thindb.net.compile(allocator, db, root)) |ok| {
+        var cq = ok;
+        cq.deinit();
+        std.debug.print("statement: {s}\n", .{sql});
+        return error.TestUnexpectedSuccess;
+    } else |_| {}
+}
+
+test "INSERT SELECT and CTAS: a statement that fails part way leaves nothing behind" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE vw (id BIGINT PRIMARY KEY, s VARCHAR(30), d DOUBLE NOT NULL)");
+    try exec(allocator, db, "INSERT INTO vw VALUES (1, 'a', 1)");
+    try exec(allocator, db, "CREATE TABLE log (k BIGINT NOT NULL, v BIGINT NOT NULL) ORDER BY (k)");
+
+    // The failing arm's error comes after the first arm's rows are ready.
+    try expectStatementFails(allocator, db, "INSERT INTO vw SELECT 20, 'j', 1 UNION ALL SELECT 21, 'k', CAST(d * 1000000 AS DECIMAL(5,0)) FROM vw WHERE id = 1");
+    try expectStatementFails(allocator, db, "INSERT INTO vw VALUES (30, 'x', 1), (31, 'y', CAST(1e10 AS DECIMAL(5,0)))");
+    try expectStatementFails(allocator, db, "INSERT INTO log SELECT 1, 5 UNION ALL SELECT 2, NULL");
+    try expectStatementFails(allocator, db, "INSERT INTO vw (id, s, d) SELECT 40, 'z', 2 UNION ALL SELECT 41, 'w', NULL");
+    const survivors = try collectBigints(allocator, db, "SELECT COUNT(*) FROM vw WHERE id >= 20");
+    defer allocator.free(survivors);
+    try std.testing.expectEqualSlices(i64, &.{0}, survivors);
+    const logged = try collectBigints(allocator, db, "SELECT COUNT(*) FROM log");
+    defer allocator.free(logged);
+    try std.testing.expectEqualSlices(i64, &.{0}, logged);
+
+    // A failed CTAS drops the table it created, so the retry succeeds.
+    try expectStatementFails(allocator, db, "CREATE TABLE bad AS SELECT id, CAST(d * 1000000 AS DECIMAL(5,0)) AS x FROM vw");
+    try exec(allocator, db, "CREATE TABLE bad AS SELECT id FROM vw");
+    const copied = try collectBigints(allocator, db, "SELECT COUNT(*) FROM bad");
+    defer allocator.free(copied);
+    try std.testing.expectEqualSlices(i64, &.{1}, copied);
+
+    // Statements that succeed still land every row, ON DUPLICATE KEY UPDATE included.
+    try exec(allocator, db, "INSERT INTO log SELECT id, id * 2 FROM vw UNION ALL SELECT 7, 8");
+    try exec(allocator, db, "INSERT INTO vw SELECT id, 'b', d + 1 FROM vw ON DUPLICATE KEY UPDATE d = vw.d + 10");
+    const after = try collectBigints(allocator, db, "SELECT CAST(SUM(v) AS BIGINT) FROM log UNION ALL SELECT CAST(d AS BIGINT) FROM vw");
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 11 }, after);
+}
