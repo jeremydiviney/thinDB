@@ -308,6 +308,37 @@ pub const ShowOp = union(enum) {
     functions,
     /// `SHOW CREATE FUNCTION name`: the persisted definition text.
     create_function: []const u8,
+    /// `SHOW CREATE DATABASE name`: MySQL's two-column answer.
+    create_database: ShowCreateDatabase,
+};
+
+pub const ShowCreateDatabase = struct {
+    name: []const u8,
+    /// `SHOW CREATE DATABASE IF NOT EXISTS` echoes the clause.
+    if_not_exists: bool,
+};
+
+/// A MySQL administrative statement. thinDB has no table locks, savepoints,
+/// query cache or optimizer statistics, so each runs without effect; table
+/// maintenance answers with MySQL's status rows.
+pub const AdminOp = union(enum) {
+    /// LOCK / UNLOCK TABLES, FLUSH, SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK
+    /// TO SAVEPOINT and DO.
+    ignored,
+    /// BEGIN / START TRANSACTION. No rollback or isolation follows (DESIGN.md
+    /// §1); the session reports an open transaction until it ends.
+    begin_transaction,
+    /// COMMIT / ROLLBACK.
+    end_transaction,
+    /// ANALYZE / OPTIMIZE / CHECK / REPAIR TABLE t, ...
+    table_maintenance: TableMaintenance,
+};
+
+pub const TableMaintenance = struct {
+    kind: Kind,
+    tables: []const TableRef,
+
+    pub const Kind = enum { analyze, optimize, check, repair };
 };
 
 /// PostgreSQL `COPY ... FROM STDIN` / `COPY ... TO STDOUT` bulk
@@ -561,6 +592,10 @@ pub const OpTag = enum(u8) {
     /// ORDER BY o)`. One input subtree; the registered function's declared
     /// output schema is the node's output.
     table_fn = 26,
+    /// MySQL administrative statement (`LOCK TABLES`, `FLUSH`, `SAVEPOINT`,
+    /// `ANALYZE TABLE`, ...). Session-local and never persisted, so it has no
+    /// wire encoding.
+    admin = 27,
 };
 
 pub const BatchOp = struct {
@@ -695,6 +730,7 @@ pub const Op = union(OpTag) {
     file_scan: FileScan,
     alias: Alias,
     table_fn: TableFn,
+    admin: AdminOp,
 
     /// `FROM TABLE(name(<subquery>) [PARTITION BY cols] [ORDER BY specs])`.
     /// The registered function's declared input schema is matched against
@@ -974,8 +1010,8 @@ pub const Op = union(OpTag) {
                 i.source.deinitDecoded(allocator);
                 allocator.destroy(i.source);
             },
-            // Never reached: SET / DELETE / UPDATE aren't wire-decoded.
-            .set_var, .delete_op, .update_op => {},
+            // Never reached: SET / DELETE / UPDATE / admin statements aren't wire-decoded.
+            .set_var, .delete_op, .update_op, .admin => {},
         }
     }
 };
@@ -1119,6 +1155,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         // EXPLAIN is a SQL-text-only statement; never sent over the binary
         // IR protocol.
         .explain => return EncodeError.OutOfMemory,
+        .admin => return EncodeError.OutOfMemory,
         // Void op — the tag byte above is the whole encoding.
         .single_row => {},
     }
@@ -1559,6 +1596,7 @@ const ShowTag = enum(u8) {
     tables = 2,
     functions = 3,
     create_function = 4,
+    create_database = 5,
 };
 
 fn encodeShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) EncodeError!void {
@@ -1577,6 +1615,12 @@ fn encodeShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) EncodeEr
             try out.append(allocator, @intFromEnum(ShowTag.create_function));
             try appendU32(allocator, out, @intCast(name.len));
             try out.appendSlice(allocator, name);
+        },
+        .create_database => |cd| {
+            try out.append(allocator, @intFromEnum(ShowTag.create_database));
+            try appendU32(allocator, out, @intCast(cd.name.len));
+            try out.appendSlice(allocator, cd.name);
+            try out.append(allocator, @intFromBool(cd.if_not_exists));
         },
     }
 }
@@ -2377,7 +2421,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         // SET / DELETE / UPDATE / EXPLAIN / single_row are never
         // wire-encoded (the tag guard above already rejects them). If the
         // decoder somehow sees their tag, the stream is corrupt.
-        .set_var, .delete_op, .update_op, .explain, .single_row => return Error.IrCorrupt,
+        .set_var, .delete_op, .update_op, .explain, .single_row, .admin => return Error.IrCorrupt,
     };
 }
 
@@ -2880,7 +2924,7 @@ fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(ShowTag.create_function)) return Error.IrCorrupt;
+    if (t > @intFromEnum(ShowTag.create_database)) return Error.IrCorrupt;
     const tag: ShowTag = @enumFromInt(t);
     return switch (tag) {
         .databases => ShowOp.databases,
@@ -2888,6 +2932,14 @@ fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
         .tables => ShowOp{ .tables = try decodeTableRef(bytes, cursor) },
         .functions => ShowOp.functions,
         .create_function => ShowOp{ .create_function = try readString(bytes, cursor) },
+        .create_database => blk: {
+            const name = try readString(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const flag = bytes[cursor.*];
+            cursor.* += 1;
+            if (flag > 1) return Error.IrCorrupt;
+            break :blk ShowOp{ .create_database = .{ .name = name, .if_not_exists = flag == 1 } };
+        },
     };
 }
 

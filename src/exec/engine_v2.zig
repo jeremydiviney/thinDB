@@ -146,6 +146,7 @@ pub fn isSelectQuery(op: *const ir.Op) bool {
         .delete_op,
         .update_op,
         .explain,
+        .admin,
         => false,
     };
 }

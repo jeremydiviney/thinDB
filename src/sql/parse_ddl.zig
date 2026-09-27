@@ -89,6 +89,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             return PE.SqlExpectedKeyword;
         },
         .kw_drop => {
+            if (p.lex.dialect != .postgres and isBareWord(p, "prepare")) return PE.SqlPrepareExecuteUnsupported;
             if (p.cur.tag == .kw_database or p.cur.tag == .kw_schema) {
                 const is_database = p.cur.tag == .kw_database;
                 try p.advance();
@@ -1606,6 +1607,148 @@ fn parseInsertValue(p: anytype) !?Value {
     return try p.parseValue();
 }
 
+/// A MySQL administrative statement at the cursor, or null when the word
+/// there opens none. PostgreSQL spells these its own way and its wire
+/// answers them, so its dialect is left alone.
+///
+/// Transaction verbs parse here too, for the forms and batches the MySQL
+/// wire's text match does not catch (`START TRANSACTION READ ONLY`,
+/// `BEGIN; ...; COMMIT`). SQL-level PREPARE / EXECUTE is rejected: it
+/// would need a per-session registry of statement texts, and clients
+/// prepare through the binary protocol instead.
+pub fn parseAdmin(p: anytype) !?*ir.Op {
+    const PE = @TypeOf(p.*).Err;
+    if (p.lex.dialect == .postgres or p.cur.tag != .identifier or p.cur.quoted) return null;
+    const word = p.cur.text;
+    if (asciiEqlAny(word, &.{ "prepare", "execute", "deallocate" })) return PE.SqlPrepareExecuteUnsupported;
+    if (std.ascii.eqlIgnoreCase(word, "begin")) {
+        try p.advance();
+        if (isBareWord(p, "work")) try p.advance();
+        return try p.allocOp(.{ .admin = .begin_transaction });
+    }
+    if (std.ascii.eqlIgnoreCase(word, "start")) {
+        try p.advance();
+        if (!isBareWord(p, "transaction")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        try skipTransactionCharacteristics(p);
+        return try p.allocOp(.{ .admin = .begin_transaction });
+    }
+    if (asciiEqlAny(word, &.{ "commit", "rollback" })) {
+        const rollback = std.ascii.eqlIgnoreCase(word, "rollback");
+        try p.advance();
+        if (isBareWord(p, "work")) try p.advance();
+        if (rollback and p.cur.tag == .kw_to) {
+            try p.advance();
+            if (isBareWord(p, "savepoint")) try p.advance();
+            _ = try p.dupedIdent();
+            return try p.allocOp(.{ .admin = .ignored });
+        }
+        const chain = try skipCompletionOptions(p);
+        return try p.allocOp(.{ .admin = if (chain) .begin_transaction else .end_transaction });
+    }
+    if (std.ascii.eqlIgnoreCase(word, "savepoint")) {
+        try p.advance();
+        _ = try p.dupedIdent();
+        return try p.allocOp(.{ .admin = .ignored });
+    }
+    if (std.ascii.eqlIgnoreCase(word, "release")) {
+        try p.advance();
+        if (!isBareWord(p, "savepoint")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        _ = try p.dupedIdent();
+        return try p.allocOp(.{ .admin = .ignored });
+    }
+    if (asciiEqlAny(word, &.{ "lock", "unlock" })) {
+        try p.advance();
+        if (p.cur.tag != .kw_table and p.cur.tag != .kw_tables and !isBareWord(p, "instance")) return PE.SqlExpectedKeyword;
+        try skipToStatementEnd(p);
+        return try p.allocOp(.{ .admin = .ignored });
+    }
+    if (std.ascii.eqlIgnoreCase(word, "flush")) {
+        try p.advance();
+        if (p.cur.tag == .eof or p.cur.tag == .semicolon) return PE.SqlExpectedKeyword;
+        try skipToStatementEnd(p);
+        return try p.allocOp(.{ .admin = .ignored });
+    }
+    if (std.ascii.eqlIgnoreCase(word, "do")) {
+        // DO evaluates for side effects only, and thinDB's functions have
+        // none, so the expressions are checked for syntax and dropped.
+        try p.advance();
+        while (true) {
+            _ = try p.parseValueExpr();
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+        return try p.allocOp(.{ .admin = .ignored });
+    }
+    const kind: ir.TableMaintenance.Kind = if (std.ascii.eqlIgnoreCase(word, "analyze"))
+        .analyze
+    else if (std.ascii.eqlIgnoreCase(word, "optimize"))
+        .optimize
+    else if (std.ascii.eqlIgnoreCase(word, "check"))
+        .check
+    else if (std.ascii.eqlIgnoreCase(word, "repair"))
+        .repair
+    else
+        return null;
+    try p.advance();
+    if (kind != .check and (isBareWord(p, "no_write_to_binlog") or isBareWord(p, "local"))) try p.advance();
+    if (p.cur.tag != .kw_table and p.cur.tag != .kw_tables) return PE.SqlExpectedKeyword;
+    try p.advance();
+    var tables: std.ArrayList(ir.TableRef) = .empty;
+    while (true) {
+        try tables.append(p.arena, try p.parseTableRef());
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    // Trailing options (CHECK ... QUICK, REPAIR ... USE_FRM, ANALYZE ...
+    // UPDATE HISTOGRAM ON c) tune work thinDB does not do.
+    try skipToStatementEnd(p);
+    return try p.allocOp(.{ .admin = .{ .table_maintenance = .{ .kind = kind, .tables = tables.items } } });
+}
+
+/// `START TRANSACTION` characteristics: `WITH CONSISTENT SNAPSHOT`,
+/// `READ ONLY`, `READ WRITE`, comma-separated.
+fn skipTransactionCharacteristics(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    while (true) {
+        if (p.cur.tag == .kw_with) {
+            try p.advance();
+            if (!isBareWord(p, "consistent")) return PE.SqlExpectedKeyword;
+            try p.advance();
+            if (!isBareWord(p, "snapshot")) return PE.SqlExpectedKeyword;
+            try p.advance();
+        } else if (isBareWord(p, "read")) {
+            try p.advance();
+            if (!isBareWord(p, "only") and !isBareWord(p, "write")) return PE.SqlExpectedKeyword;
+            try p.advance();
+        } else return;
+        if (p.cur.tag != .comma) return;
+        try p.advance();
+    }
+}
+
+/// `COMMIT` / `ROLLBACK` options `[AND [NO] CHAIN] [[NO] RELEASE]`. Returns
+/// whether AND CHAIN opens the next transaction at once.
+fn skipCompletionOptions(p: anytype) !bool {
+    const PE = @TypeOf(p.*).Err;
+    var chain = false;
+    if (p.cur.tag == .kw_and) {
+        try p.advance();
+        const no = isBareWord(p, "no");
+        if (no) try p.advance();
+        if (!isBareWord(p, "chain")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        chain = !no;
+    }
+    if (isBareWord(p, "no")) {
+        try p.advance();
+        if (!isBareWord(p, "release")) return PE.SqlExpectedKeyword;
+        try p.advance();
+    } else if (isBareWord(p, "release")) try p.advance();
+    return chain;
+}
+
 pub fn parseShow(p: anytype) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     try p.advance(); // consume SHOW
@@ -1641,6 +1784,12 @@ pub fn parseShow(p: anytype) !*ir.Op {
         },
         .kw_create => {
             try p.advance();
+            if (p.cur.tag == .kw_database or p.cur.tag == .kw_schema) {
+                try p.advance();
+                const if_not_exists = try parseIfNotExists(p);
+                const name = try p.dupedIdentLower();
+                return try p.allocOp(.{ .show = .{ .create_database = .{ .name = name, .if_not_exists = if_not_exists } } });
+            }
             if (!isIdentText(p, "function")) return PE.SqlExpectedKeyword;
             try p.advance();
             const name = try p.dupedIdentLower();

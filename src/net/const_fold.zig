@@ -91,7 +91,7 @@ pub fn foldDeadBranches(op: *ir.Op) void {
     // Bottom-up: children first, so a union arm that is itself a pruned
     // union is judged in final form.
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op, .admin => {},
         .limit => |l| foldDeadBranches(l.upstream),
         .select, .exclude => |p| foldDeadBranches(p.upstream),
         .order_by => |o| foldDeadBranches(o.upstream),
