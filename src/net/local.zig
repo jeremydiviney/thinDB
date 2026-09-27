@@ -2947,9 +2947,13 @@ fn writeUpdatedRows(
     t: *ApiTable,
     plan: InsertColumnPlan,
     out_schema: []const types.Column,
-    values: []const storage.ColumnView,
-    row_count: usize,
+    all_values: []const storage.ColumnView,
+    all_rows: usize,
 ) !usize {
+    const rows = try rowsNamingTarget(aa, t, plan, out_schema, all_values, all_rows);
+    const values = rows.values;
+    const row_count = rows.count;
+    if (row_count == 0) return 0;
     const batch_schema = try aa.alloc(types.Column, t.schema.columns.len);
     const views = try aa.alloc(storage.ColumnView, t.schema.columns.len);
     try plan.fill(ctx, t, out_schema, values, row_count, batch_schema, views);
@@ -2964,6 +2968,35 @@ fn writeUpdatedRows(
     }
     try t.insertBatch(batch_schema, views, row_count);
     return keys.count();
+}
+
+/// The rows of an UPDATE's staged SELECT that name a row of `t`. An outer
+/// join's NULL-extended rows have a NULL key and name none; MySQL skips
+/// them, as DELETE does.
+fn rowsNamingTarget(
+    aa: Allocator,
+    t: *ApiTable,
+    plan: InsertColumnPlan,
+    out_schema: []const types.Column,
+    values: []const storage.ColumnView,
+    row_count: usize,
+) !struct { values: []const storage.ColumnView, count: usize } {
+    const keep = try aa.alloc(bool, row_count);
+    var kept: usize = 0;
+    for (keep, 0..) |*k, r| {
+        k.* = for (t.order_key_indices) |ci| {
+            if (!values[plan.table_to_source[ci].?].isValid(r)) break false;
+        } else true;
+        kept += @intFromBool(k.*);
+    }
+    if (kept == row_count) return .{ .values = values, .count = row_count };
+    const gathered = try aa.alloc(storage.ColumnView, values.len);
+    for (values, out_schema, gathered) |v, col, *g| {
+        var column = try engine.ColumnStore.init(aa, col.type, col.nullable);
+        try engine.transform.appendMaskedColumn(aa, v, keep, &column);
+        g.* = column.view();
+    }
+    return .{ .values = gathered, .count = kept };
 }
 
 /// DELETE in a form a filtered scan can't express (ORDER BY / LIMIT, an
