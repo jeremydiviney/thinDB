@@ -10,6 +10,7 @@ const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
+const Type = @import("../types.zig").Type;
 
 const store = @import("../engine/store.zig");
 const regex = @import("../util/regex.zig");
@@ -662,6 +663,46 @@ pub fn concatWsKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
         }
         try ss.appendValue(allocator, scratch.items);
         try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
+/// `__row_key(a, b, ...)`: one byte string per row, equal for two rows
+/// exactly when every argument is, and NULL when any argument is. A column's
+/// type is fixed, so fixed-width values keep their bytes and only text needs a
+/// length prefix to stay unambiguous.
+pub fn rowKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(allocator);
+    for (0..row_count) |row| {
+        key.clearRetainingCapacity();
+        const complete = for (args) |arg| {
+            if (!arg.isValid(row)) break false;
+            try appendRowKeyPart(allocator, &key, arg, row);
+        } else true;
+        try ss.appendValue(allocator, if (complete) key.items else "");
+        try out.appendValidBit(allocator, base + row, complete);
+    }
+}
+
+fn appendRowKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: ColumnView, row: usize) Allocator.Error!void {
+    switch (arg.data) {
+        .varchar, .string, .char, .json => |sv| {
+            const bytes = sv.rowBytes(row);
+            const len: u64 = bytes.len;
+            try key.appendSlice(allocator, std.mem.asBytes(&len));
+            try key.appendSlice(allocator, bytes);
+        },
+        // -0.0 equals 0.0 but has other bytes.
+        inline .float, .double => |s| {
+            const v = if (s[row] == 0) 0 else s[row];
+            try key.appendSlice(allocator, std.mem.asBytes(&v));
+        },
+        .boolean => |s| try key.append(allocator, @intFromBool(s[row] != 0)),
+        inline else => |s| try key.appendSlice(allocator, std.mem.asBytes(&s[row])),
     }
 }
 
