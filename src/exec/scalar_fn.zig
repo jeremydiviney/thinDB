@@ -128,6 +128,7 @@ pub fn resolveWithRegistry(
     if (try resolveDecimal(aa, name, arg_types)) |ov| return ov;
     if (try resolveIntArith(aa, name, arg_types)) |ov| return ov;
     if (try resolveFractionalIntDiv(aa, name, arg_types)) |ov| return ov;
+    if (try resolveFormat(aa, name, arg_types)) |ov| return ov;
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
@@ -504,6 +505,14 @@ fn resolveFractionalIntDiv(aa: Allocator, name: []const u8, arg_types: []const T
     return try buildDecFn(aa, name, arg_types, .bigint, dec.intDivKernel, .zero_divisor);
 }
 
+/// MySQL's `FORMAT(x, d)` over any number and an integer `d`
+/// (`dec.formatKernel`). The locale form isn't supported.
+fn resolveFormat(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (arg_types.len != 2 or !std.ascii.eqlIgnoreCase(name, "format")) return null;
+    if (!numericLike(arg_types[0]) or !arg_types[1].isInteger()) return null;
+    return try buildDecFn(aa, name, arg_types, .string, dec.formatKernel, .propagates);
+}
+
 /// Whether ANY overload named `name` exists — builtin, decimal-only, or a
 /// registered UDF. Name-only, so it holds before argument types are known.
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
@@ -514,6 +523,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
+    if (std.ascii.eqlIgnoreCase(name, "format")) return true;
     for (builtins) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return true;
     if (registry) |reg| {
         for (reg.scalarEntries()) |entry| if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
