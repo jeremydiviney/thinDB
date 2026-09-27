@@ -1187,6 +1187,14 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                 hu(h, 1);
                 try hashPred(h, p);
             } else hu(h, 0);
+            if (j.residual) |res| {
+                hu(h, res.derived.len + 1);
+                for (res.derived) |d| {
+                    hstr(h, d.name);
+                    try hashExpr(h, d.expr);
+                }
+                try hashPred(h, res.predicate);
+            } else hu(h, 0);
             try hashOp(h, j.left);
             try hashOp(h, j.right);
         },
@@ -3610,7 +3618,7 @@ fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
 }
 
 fn supports_region_join(j: *const ir.Op.Join) bool {
-    return (j.join_type == .left or j.join_type == .inner) and j.extra_predicate == null and j.ranges.len == 0;
+    return (j.join_type == .left or j.join_type == .inner) and j.extra_predicate == null and j.ranges.len == 0 and j.residual == null;
 }
 
 fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror!void {

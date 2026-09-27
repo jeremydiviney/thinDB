@@ -2849,18 +2849,18 @@ test "sql: JOIN ON equality can use date arithmetic expressions" {
     try std.testing.expectEqualSlices(i64, &.{2}, b.values[0].data.bigint[0..b.row_count]);
 }
 
-test "sql: unsupported JOIN ON predicates fail clearly" {
+test "sql: a general JOIN ON over a name outside the join fails clearly" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     try std.testing.expectError(
-        thindb.sql.ParseError.SqlOnNonEquiUnsupported,
-        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a JOIN t AS b ON a.id = b.id OR a.k = b.k", .neutral),
+        thindb.sql.ParseError.SqlOnRefsUnknownTable,
+        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a JOIN t AS b ON a.id = b.id OR a.k = c.k", .neutral),
     );
 
     try std.testing.expectError(
-        thindb.sql.ParseError.SqlOnNonEquiUnsupported,
-        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a LEFT JOIN t AS b ON a.k < b.k", .neutral),
+        thindb.sql.ParseError.SqlOnRefsUnknownTable,
+        thindb.sql.parseDialect(arena.allocator(), "SELECT * FROM t AS a LEFT JOIN t AS b ON a.k < c.k", .neutral),
     );
 }
 

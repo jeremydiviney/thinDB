@@ -469,6 +469,11 @@ const JoinOnPlan = struct {
     left_filter: ?PredicateExpr,
     right_filter: ?PredicateExpr,
     hidden_left: []const []const u8,
+    /// The ON conditions beyond the keys (`Parser.parseResidualOn`), over
+    /// the joined schema.
+    residual: ?PredicateExpr = null,
+    /// The expression operands `residual` reads.
+    residual_derived: []const ir.Derived = &.{},
 };
 
 const QualifiedJoinCol = struct {
@@ -3135,23 +3140,39 @@ pub const Parser = struct {
                 right_op = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = right_op } });
             }
 
+            // An outer join decides per candidate pair whether the residual
+            // passes; an inner join's residual is a filter above it.
+            const filters_above = jtype == .inner;
             root = try self.allocOp(.{ .join = .{
                 .algorithm = .auto,
                 .join_type = jtype,
                 .on = on_plan.on,
                 .ranges = on_plan.ranges,
                 .extra_predicate = null,
+                .residual = if (filters_above) null else if (on_plan.residual) |pred| .{ .derived = on_plan.residual_derived, .predicate = pred } else null,
                 .skew_ratio_threshold = 0.3,
                 .skew_absolute_threshold = 20_000,
                 .skew_sample_interval = 10,
                 .left = left_op,
                 .right = right_op,
             } });
+            var hidden = on_plan.hidden_left;
+            if (filters_above) if (on_plan.residual) |pred| {
+                if (on_plan.residual_derived.len > 0) {
+                    root = try self.allocOp(.{ .compute = .{ .derived = on_plan.residual_derived, .upstream = root } });
+                    const names = try self.arena.alloc([]const u8, hidden.len + on_plan.residual_derived.len);
+                    @memcpy(names[0..hidden.len], hidden);
+                    for (on_plan.residual_derived, names[hidden.len..]) |d, *name| name.* = d.name;
+                    hidden = names;
+                }
+                root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
+            };
             // A synthetic left-side ON expression (e.g. `ON upper(l.k) = r.k`)
-            // stages a hidden `__join_on_left_*` column the join key reads; drop
-            // it from the join output so it can't leak into `SELECT *`.
-            if (on_plan.hidden_left.len > 0) {
-                root = try self.allocOp(.{ .exclude = .{ .columns = on_plan.hidden_left, .upstream = root } });
+            // stages a hidden `__join_on_left_*` column the join key reads, as
+            // a residual stages its operands; drop them from the join output so
+            // they can't leak into `SELECT *`.
+            if (hidden.len > 0) {
+                root = try self.allocOp(.{ .exclude = .{ .columns = hidden, .upstream = root } });
             }
             try left_names.append(self.arena, right.name);
             try inputs.append(self.arena, .{ .name = right.name, .op = right_input });
@@ -3925,7 +3946,140 @@ pub const Parser = struct {
         return jtype;
     }
 
-    fn parseOnJoin(
+    /// An ON clause of keys, ranges and one-sided conditions lowers to join
+    /// keys and input filters (`parseKeyedOn`). Any other reparses as one
+    /// general condition (`parseResidualOn`), whose error is the one to
+    /// report: it accepts every ON the keyed form does.
+    fn parseOnJoin(self: *Parser, scope: *JoinScope, jtype: ir.JoinType) ParseError!JoinOnPlan {
+        const lex_start = self.lex.*;
+        const cur_start = self.cur;
+        const prev_end_start = self.prev_end;
+        const derived_start = self.predicate_derived.items.len;
+        return self.parseKeyedOn(scope, jtype) catch |err| switch (err) {
+            ParseError.SqlOnNonEquiUnsupported, ParseError.SqlOnRefsUnknownTable, ParseError.SqlExpectedToken => {
+                self.lex.* = lex_start;
+                self.cur = cur_start;
+                self.prev_end = prev_end_start;
+                self.predicate_derived.shrinkRetainingCapacity(derived_start);
+                return self.parseResidualOn(scope);
+            },
+            else => err,
+        };
+    }
+
+    /// A general ON condition: its top-level `left = right` column
+    /// equalities key the join and the rest is its residual, which an inner
+    /// join filters above itself and an outer join checks per candidate pair.
+    /// Every column must side with one input.
+    fn parseResidualOn(self: *Parser, scope: *JoinScope) ParseError!JoinOnPlan {
+        const cond = try self.parseConditionBody();
+        for (cond.derived) |d| try self.checkResidualExpr(d.expr, scope, cond.derived);
+        try self.checkResidualPredicate(cond.predicate, scope, cond.derived);
+
+        var conjuncts: std.ArrayList(PredicateExpr) = .empty;
+        try appendConjuncts(self.arena, &conjuncts, cond.predicate);
+        var pairs: std.ArrayList(ir.JoinKeyPair) = .empty;
+        var left_derived: std.ArrayList(ir.Derived) = .empty;
+        var right_derived: std.ArrayList(ir.Derived) = .empty;
+        var hidden_left: std.ArrayList([]const u8) = .empty;
+        var rest: std.ArrayList(PredicateExpr) = .empty;
+        var synth_counter: usize = 0;
+        for (conjuncts.items) |c| {
+            const key = try self.residualKeyColumns(c, scope, cond.derived) orelse {
+                try rest.append(self.arena, c);
+                continue;
+            };
+            const right_name = try self.materializeJoinOperand(.{ .col_ref = key.right }, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
+            try pairs.append(self.arena, .{ .left = try self.arena.dupe(u8, key.left), .right = right_name });
+        }
+        if (pairs.items.len == 0) {
+            const one = ir.Expr{ .lit = .{ .int = 1 } };
+            const left_name = try self.materializeJoinOperand(one, .left, &left_derived, &right_derived, &hidden_left, &synth_counter);
+            const right_name = try self.materializeJoinOperand(one, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
+            try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
+        }
+        return .{
+            .on = try pairs.toOwnedSlice(self.arena),
+            .ranges = &.{},
+            .left_derived = try left_derived.toOwnedSlice(self.arena),
+            .right_derived = try right_derived.toOwnedSlice(self.arena),
+            .left_filter = null,
+            .right_filter = null,
+            .hidden_left = try hidden_left.toOwnedSlice(self.arena),
+            .residual = try self.joinFilterFromParts(&rest),
+            .residual_derived = cond.derived,
+        };
+    }
+
+    const ResidualKey = struct { left: []const u8, right: []const u8 };
+
+    /// The left and right columns a conjunct equates, when it is a column
+    /// equality across the two inputs.
+    fn residualKeyColumns(self: *Parser, c: PredicateExpr, scope: *JoinScope, derived: []const ir.Derived) ParseError!?ResidualKey {
+        if (c != .leaf_col_col or c.leaf_col_col.op != .eq) return null;
+        const a = c.leaf_col_col.left;
+        const b = c.leaf_col_col.right;
+        if (derivedNamed(derived, a) or derivedNamed(derived, b)) return null;
+        const a_side = try self.residualColumnSide(a, scope) orelse return null;
+        const b_side = try self.residualColumnSide(b, scope) orelse return null;
+        if (a_side == .left and b_side == .right) return .{ .left = a, .right = b };
+        if (a_side == .right and b_side == .left) return .{ .left = b, .right = a };
+        return null;
+    }
+
+    fn derivedNamed(derived: []const ir.Derived, name: []const u8) bool {
+        for (derived) |d| if (types.columnNameEql(d.name, name)) return true;
+        return false;
+    }
+
+    fn appendConjuncts(arena: Allocator, out: *std.ArrayList(PredicateExpr), p: PredicateExpr) Allocator.Error!void {
+        switch (p) {
+            .@"and" => |kids| for (kids) |k| try appendConjuncts(arena, out, k),
+            else => try out.append(arena, p),
+        }
+    }
+
+    /// The input a residual column reads, or null for an unqualified name
+    /// beside an input whose columns can't be listed: it resolves against
+    /// the joined output when the plan compiles, as a WHERE's does.
+    fn residualColumnSide(self: *Parser, name: []const u8, scope: *JoinScope) ParseError!?JoinExprSide {
+        if (std.mem.indexOfScalar(u8, name, '.') == null) {
+            const columns = try self.joinInputColumns(scope);
+            if (columns.left == null or columns.right == null) return null;
+        }
+        return (try self.splitJoinCol(name, scope)).side;
+    }
+
+    /// Rejects a residual column neither join input exposes; a derived
+    /// operand's name reads the operand.
+    fn checkResidualColumn(self: *Parser, name: []const u8, scope: *JoinScope, derived: []const ir.Derived) ParseError!void {
+        if (derivedNamed(derived, name)) return;
+        const side = try self.residualColumnSide(name, scope) orelse return;
+        if (side != .left and side != .right) return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    fn checkResidualExpr(self: *Parser, e: ir.Expr, scope: *JoinScope, derived: []const ir.Derived) ParseError!void {
+        switch (e) {
+            .col_ref => |name| try self.checkResidualColumn(name, scope, derived),
+            .lit, .null_lit, .var_ref, .scalar_subquery, .exists_subquery => {},
+            .call => |c| for (c.args) |arg| try self.checkResidualExpr(arg, scope, derived),
+            .case => |cs| {
+                for (cs.branches) |br| {
+                    try self.checkResidualPredicate(br.cond, scope, derived);
+                    try self.checkResidualExpr(br.then, scope, derived);
+                }
+                if (cs.else_branch) |eb| try self.checkResidualExpr(eb.*, scope, derived);
+            },
+        }
+    }
+
+    fn checkResidualPredicate(self: *Parser, p: PredicateExpr, scope: *JoinScope, derived: []const ir.Derived) ParseError!void {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        try exec_predicate.collectColumnNames(self.arena, &names, p);
+        for (names.items) |name| try self.checkResidualColumn(name, scope, derived);
+    }
+
+    fn parseKeyedOn(
         self: *Parser,
         scope: *JoinScope,
         jtype: ir.JoinType,
@@ -4019,8 +4173,8 @@ pub const Parser = struct {
             return ParseError.SqlOnNonEquiUnsupported;
         }
         if (open_groups > 0) return ParseError.SqlExpectedToken;
-        // A column range join (`l.a < r.b`) only has well-defined semantics for
-        // an inner join; outer joins would need true ON-extra-predicate support.
+        // An outer join's column range checks per candidate pair: the ON
+        // reparses as a residual (`parseResidualOn`).
         if (jtype != .inner and ranges.items.len > 0) return ParseError.SqlOnNonEquiUnsupported;
         if (pairs.items.len == 0 and ranges.items.len == 0) {
             // Every conjunct sided with one input (`ON r.currencyTo = 'USD'
@@ -4435,14 +4589,7 @@ pub const Parser = struct {
     /// as MySQL resolves it. An input whose columns can't be enumerated could
     /// hold any name, so nothing resolves beside it.
     fn unqualifiedJoinColSide(self: *Parser, name: []const u8, scope: *JoinScope) ParseError!JoinExprSide {
-        const columns = scope.columns orelse blk: {
-            const enumerated: JoinInputColumns = .{
-                .left = try self.sourceColumns(scope.left),
-                .right = try self.sourceColumns(scope.right),
-            };
-            scope.columns = enumerated;
-            break :blk enumerated;
-        };
+        const columns = try self.joinInputColumns(scope);
         const left = columns.left orelse return ParseError.SqlOnRefsUnknownTable;
         const right = columns.right orelse return ParseError.SqlOnRefsUnknownTable;
         const in_left = exposesColumn(left, name);
@@ -4451,6 +4598,16 @@ pub const Parser = struct {
         if (in_left) return .left;
         if (in_right) return .right;
         return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    fn joinInputColumns(self: *Parser, scope: *JoinScope) ParseError!JoinInputColumns {
+        if (scope.columns) |columns| return columns;
+        const enumerated: JoinInputColumns = .{
+            .left = try self.sourceColumns(scope.left),
+            .right = try self.sourceColumns(scope.right),
+        };
+        scope.columns = enumerated;
+        return enumerated;
     }
 
     /// Output column names of a FROM source, or null when they can't be
