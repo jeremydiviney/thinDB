@@ -788,11 +788,16 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
         .exists_subquery => |src| PredicateExpr{ .exists_subquery = src },
         .always => |b| PredicateExpr{ .always = b },
         .unknown => .unknown,
-        .in_subquery => |s| PredicateExpr{ .in_subquery = .{
-            .col = try aa.dupe(u8, s.col),
-            .source = s.source,
-            .negate = s.negate,
-        } },
+        .in_subquery => |s| blk: {
+            const rest_cols = try aa.alloc([]const u8, s.rest_cols.len);
+            for (s.rest_cols, rest_cols) |src, *dst| dst.* = try aa.dupe(u8, src);
+            break :blk PredicateExpr{ .in_subquery = .{
+                .col = try aa.dupe(u8, s.col),
+                .source = s.source,
+                .negate = s.negate,
+                .rest_cols = rest_cols,
+            } };
+        },
         .in_set => |s| blk: {
             const vals = try aa.alloc(types.Value, s.values.len);
             for (s.values, vals) |v, *out| out.* = try cloneValue(aa, v);

@@ -611,7 +611,13 @@ fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateE
         .always => |b| try out.appendSlice(allocator, if (b) "TRUE" else "FALSE"),
         .unknown => try out.appendSlice(allocator, "UNKNOWN"),
         .in_subquery => |s| {
+            if (s.rest_cols.len > 0) try out.append(allocator, '(');
             try out.appendSlice(allocator, s.col);
+            for (s.rest_cols) |c| {
+                try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, c);
+            }
+            if (s.rest_cols.len > 0) try out.append(allocator, ')');
             try out.appendSlice(allocator, if (s.negate) " NOT IN (SELECT …)" else " IN (SELECT …)");
         },
         .in_set, .text_as_number_set => |s| {

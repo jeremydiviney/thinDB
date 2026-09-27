@@ -10,7 +10,8 @@
 //!     (PG semantics: multi-row error, multi-col error; zero rows
 //!     surfaces as a future NULL extension)
 //!   - `exists_subquery` → run inner once, check row_count → `.always`
-//!   - `in_subquery` → drain inner's single column → `.in_set`
+//!   - `in_subquery` → drain inner's single column → `.in_set`; a row
+//!     value's columns → `.correlated_set` of whole tuples
 //!
 //! Tier 2 — correlated EXISTS / IN / scalar / range:
 //!   For predicates whose inner WHERE includes `inner_col op outer_col`
@@ -144,6 +145,7 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
         },
         .in_subquery => |s| {
             if (try maybeResolveCorrelatedIn(ctx, pred, s)) return;
+            if (s.rest_cols.len > 0) return try resolveRowIn(ctx, pred, s);
             const drained = try runInSubquery(ctx, s.source);
             pred.* = .{ .in_set = .{ .col = s.col, .values = drained.values, .negate = s.negate, .value_type = drained.ty } };
         },
@@ -306,6 +308,62 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet 
         }
     }
     return .{ .values = try out.toOwnedSlice(aa), .ty = schema[0].type };
+}
+
+/// `(a, b) IN (SELECT x, y ...)`, uncorrelated: the inner's rows become one
+/// tuple set.
+fn resolveRowIn(ctx: *CompileCtx, pred: *PredicateExpr, s: exec.predicate.InSubquery) !void {
+    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(s.source)));
+    try resolveSubqueriesInOp(ctx, inner);
+
+    var q = try local.compileSubplan(ctx, inner);
+    defer q.deinit();
+    const width = 1 + s.rest_cols.len;
+    if (q.outputSchema().len != width) return Error.BadRequest;
+
+    const aa = try ctx.subqueryArena();
+    const outer_cols = try aa.alloc([]const u8, width);
+    outer_cols[0] = try aa.dupe(u8, s.col);
+    for (s.rest_cols, outer_cols[1..]) |c, *dst| dst.* = try aa.dupe(u8, c);
+    pred.* = try inTupleSet(aa, .{
+        .outer_cols = outer_cols,
+        .rows = try drainTuples(ctx, &q, width),
+        .negate = s.negate,
+        .inner_types = try columnTypes(aa, q.outputSchema()),
+    }, width);
+}
+
+/// The inner's rows as `width`-value tuples; a tuple holding a NULL can
+/// never match, so it drops (the thinDB IN-set dialect).
+fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize) ![]const []const Value {
+    const aa = try ctx.subqueryArena();
+    const acct = try ctx.queryAccountant();
+    const per_tuple = width * (@sizeOf(Value) + 32);
+    var rows: std.ArrayList([]const Value) = .empty;
+    while (try q.next()) |batch| {
+        var i: usize = 0;
+        next_row: while (i < batch.row_count) : (i += 1) {
+            for (batch.values[0..width]) |view| if (!view.isValid(i)) continue :next_row;
+            if (acct) |a| try a.reserve(.subquery, per_tuple);
+            const tuple = try aa.alloc(Value, width);
+            for (tuple, batch.values[0..width], q.outputSchema()[0..width]) |*v, view, column| {
+                v.* = try extractKeyValueAt(aa, view, column.type, i);
+            }
+            try rows.append(aa, tuple);
+        }
+    }
+    return try rows.toOwnedSlice(aa);
+}
+
+/// An IN predicate over a tuple set whose first `in_width` outer columns
+/// are the IN side. A NULL there never matches either way, as for a
+/// single-column IN set, so NOT IN keeps those rows out.
+fn inTupleSet(aa: Allocator, set: exec.predicate.CorrelatedSet, in_width: usize) !PredicateExpr {
+    if (!set.negate) return .{ .correlated_set = set };
+    const kids = try aa.alloc(PredicateExpr, in_width + 1);
+    for (set.outer_cols[0..in_width], kids[0..in_width]) |c, *kid| kid.* = .{ .is_not_null = c };
+    kids[in_width] = .{ .correlated_set = set };
+    return .{ .@"and" = kids };
 }
 
 /// The types of `columns`, in the subquery arena.
@@ -620,14 +678,13 @@ fn collectConjuncts(
 }
 
 /// Build a rewritten inner Op suitable for materialization. Drops
-/// correlation predicates; if `extra_first_col` is non-null, projects
-/// that column first (used by IN). Otherwise projects only the
-/// correlation-key columns (used by EXISTS).
+/// correlation predicates and projects `selected` (IN's columns; EXISTS
+/// selects none) ahead of the correlation-key columns.
 fn buildRewrittenInner(
     ctx: *CompileCtx,
     _: *ir.Op,
     info: CorrelationInfo,
-    extra_first_col: ?[]const u8,
+    selected: []const []const u8,
 ) !*ir.Op {
     const aa = try ctx.subqueryArena();
 
@@ -651,18 +708,9 @@ fn buildRewrittenInner(
         upstream = filter;
     }
 
-    // Build projection: optional extra col first, then inner_cols.
-    const n_cols = info.inner_cols.items.len + @as(usize, if (extra_first_col != null) 1 else 0);
-    const cols = try aa.alloc([]const u8, n_cols);
-    var ci: usize = 0;
-    if (extra_first_col) |c| {
-        cols[ci] = c;
-        ci += 1;
-    }
-    for (info.inner_cols.items) |c| {
-        cols[ci] = c;
-        ci += 1;
-    }
+    const cols = try aa.alloc([]const u8, selected.len + info.inner_cols.items.len);
+    @memcpy(cols[0..selected.len], selected);
+    @memcpy(cols[selected.len..], info.inner_cols.items);
     const project = try aa.create(ir.Op);
     project.* = .{ .select = .{ .columns = cols, .upstream = upstream } };
     return project;
@@ -702,7 +750,7 @@ fn maybeResolveCorrelatedExists(
     // Build rewritten inner: drop correlation predicates; project the
     // inner-side correlation keys (so the materialized rows are
     // exactly the lookup-tuple values).
-    const rewritten = try buildRewrittenInner(ctx, inner, info, null);
+    const rewritten = try buildRewrittenInner(ctx, inner, info, &.{});
 
     // Drain.
     var q = try local.compileSubplan(ctx, rewritten);
@@ -788,7 +836,7 @@ fn resolveCorrelatedExistsRange(
     // range inner col through `extra_first_col` and the equi cols as
     // info.inner_cols — that way Select projects (range_col,
     // equi_inner_cols...). We'll un-permute on drain.
-    const rewritten = try buildRewrittenInner(ctx, undefined, info, range.inner_col);
+    const rewritten = try buildRewrittenInner(ctx, undefined, info, &.{range.inner_col});
 
     var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
@@ -914,61 +962,43 @@ fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) 
     // the IN set depends on the outer range value, which can't be
     // hash-keyed. Bail; caller surfaces as unsupported.
     if (info.range_corrs.items.len > 0) return false;
-    const in_col = innerSelectedColumn(inner) orelse return false;
+    const in_cols = innerSelectedColumns(inner) orelse return false;
+    const in_width = 1 + s.rest_cols.len;
+    if (in_cols.len != in_width) return Error.BadRequest;
 
-    // Rewritten inner projects the IN column FIRST (so the outer's
-    // `s.col` matches against it), then the correlation keys.
-    const rewritten = try buildRewrittenInner(ctx, inner, info, in_col);
+    // Rewritten inner projects the IN columns FIRST (so the outer's
+    // `s.col` and `s.rest_cols` match against them), then the
+    // correlation keys.
+    const rewritten = try buildRewrittenInner(ctx, inner, info, in_cols);
 
     var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
 
     const aa = try ctx.subqueryArena();
-    const total_cols = 1 + info.outer_cols.items.len;
+    const total_cols = in_width + info.outer_cols.items.len;
     const outer_cols_owned = try aa.alloc([]const u8, total_cols);
     outer_cols_owned[0] = try aa.dupe(u8, s.col);
-    for (info.outer_cols.items, 1..) |c, j| outer_cols_owned[j] = try aa.dupe(u8, c);
+    for (s.rest_cols, outer_cols_owned[1..in_width]) |c, *dst| dst.* = try aa.dupe(u8, c);
+    for (info.outer_cols.items, outer_cols_owned[in_width..]) |c, *dst| dst.* = try aa.dupe(u8, c);
 
-    var rows: std.ArrayList([]const Value) = .empty;
-    while (try q.next()) |batch| {
-        var i: usize = 0;
-        while (i < batch.row_count) : (i += 1) {
-            const tuple = try aa.alloc(Value, total_cols);
-            var has_null = false;
-            for (0..total_cols) |j| {
-                const view = batch.values[j];
-                if (!view.isValid(i)) {
-                    has_null = true;
-                    break;
-                }
-                tuple[j] = try extractKeyValueAt(aa, view, q.outputSchema()[j].type, i);
-            }
-            if (has_null) continue;
-            try rows.append(aa, tuple);
-        }
-    }
-    const rows_owned = try rows.toOwnedSlice(aa);
-
-    pred.* = .{ .correlated_set = .{
+    pred.* = try inTupleSet(aa, .{
         .outer_cols = outer_cols_owned,
-        .rows = rows_owned,
+        .rows = try drainTuples(ctx, &q, total_cols),
         .negate = s.negate,
         .inner_types = try columnTypes(aa, q.outputSchema()[0..total_cols]),
-    } };
+    }, in_width);
     return true;
 }
 
-/// The one column an IN subquery's inner selects, named as the inner scan
-/// knows it.
-fn innerSelectedColumn(inner: *const ir.Op) ?[]const u8 {
+/// The columns an IN subquery's inner selects, named as the inner scan
+/// knows them.
+fn innerSelectedColumns(inner: *const ir.Op) ?[]const []const u8 {
     const project = switch (inner.*) {
         .select => |p| p,
         else => return null,
     };
-    if (project.columns.len != 1) return null;
-    const col = project.columns[0];
-    if (std.mem.endsWith(u8, col, "*")) return null;
-    return col;
+    for (project.columns) |col| if (std.mem.endsWith(u8, col, "*")) return null;
+    return project.columns;
 }
 
 // =============================================================================
