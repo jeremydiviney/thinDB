@@ -61,6 +61,11 @@ pub const Expr = union(enum) {
     pub const Call = struct {
         fn_name: []const u8,
         args: []const Expr,
+        /// Its text constants come from the statement, as a
+        /// `Predicate.from_statement` value does: one it compares with a
+        /// DATE or DATETIME that no date reads fails the statement (NULLIF).
+        /// A bound parameter's text, or an API caller's, never equals one.
+        from_statement: bool = false,
     };
 
     pub const Branch = struct {
@@ -158,7 +163,7 @@ pub fn deepCloneRenamed(out_arena: Allocator, e: Expr, renames: []const predicat
             const name_dup = try out_arena.dupe(u8, c.fn_name);
             const args_dup = try out_arena.alloc(Expr, c.args.len);
             for (c.args, 0..) |child, i| args_dup[i] = try deepCloneRenamed(out_arena, child, renames);
-            break :blk .{ .call = .{ .fn_name = name_dup, .args = args_dup } };
+            break :blk .{ .call = .{ .fn_name = name_dup, .args = args_dup, .from_statement = c.from_statement } };
         },
         .case => |cs| blk: {
             const branches_dup = try out_arena.alloc(Expr.Branch, cs.branches.len);
