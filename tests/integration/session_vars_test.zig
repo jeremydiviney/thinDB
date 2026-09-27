@@ -65,6 +65,23 @@ test "session var: re-SET between statements changes the predicate" {
     try std.testing.expectEqualSlices(i64, &.{4}, ids);
 }
 
+test "session var: fractional constant" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const ids = try collectBigints(
+        allocator,
+        db,
+        "SET @cutoff = 25.5; SET @floor = -.5; SELECT id FROM t WHERE qty > @cutoff AND qty > @floor ORDER BY id ASC",
+    );
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, ids);
+}
+
 test "session var: text type" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

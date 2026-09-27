@@ -405,6 +405,11 @@ fn textMantissa(text: []const u8, s: u8) error{ArithmeticOverflow}!?i128 {
     };
 }
 
+/// A decimal as DOUBLE, as the cast and the float kernels read it.
+pub fn mantissaToDouble(m: i128, s: u8) f64 {
+    return @as(f64, @floatFromInt(m)) / pow10f(s);
+}
+
 /// A text constant as `CAST(text AS DECIMAL(p,s))` reads it, for folding
 /// the cast at plan time: null where the cast gives NULL or raises.
 pub fn textConstantMantissa(text: []const u8, spec: DecimalSpec) ?i128 {

@@ -2070,7 +2070,15 @@ fn buildCallPlan(
     for (arg_plans, arg_types) |ap, *at| {
         if (ap != .lit) continue;
         const slot = ap.lit;
-        const typed = scalar_fn.arithOperandLiteral(c.fn_name, arg_types, slot.value);
+        const typed: types.Value = if (slot.ty.decimalSpec()) |spec| blk: {
+            if (!scalar_fn.arithTakesDouble(c.fn_name, arg_types)) continue;
+            const m: i128 = switch (slot.value) {
+                .decimal64 => |x| x,
+                .decimal128 => |x| x,
+                else => continue,
+            };
+            break :blk .{ .double = scalar_decimal.mantissaToDouble(m, spec.s) };
+        } else scalar_fn.arithOperandLiteral(c.fn_name, arg_types, slot.value);
         if (std.meta.activeTag(typed) == std.meta.activeTag(slot.value)) continue;
         replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, try literalType(typed), false));
         slot.value = typed;

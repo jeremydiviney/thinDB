@@ -2236,10 +2236,11 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
 /// statements. Errors if the Expr didn't constant-fold to a single
 /// literal.
 fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
+    // A session variable holds a Value, which carries no decimal scale, so a
+    // decimal constant is held as the double nearest its digits.
     const value: ?Value = switch (sv.value) {
-        .lit => |v| v,
         .null_lit => null,
-        else => return Error.UnsupportedOp,
+        else => exec.expr_mod.literalValue(sv.value) orelse return Error.UnsupportedOp,
     };
 
     // Lazily create the session's var map. Owned by the CompileCtx's

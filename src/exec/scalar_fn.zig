@@ -421,6 +421,17 @@ pub fn arithOperandLiteral(name: []const u8, arg_types: []const Type, lit: types
     return .{ .largeint = x };
 }
 
+/// Whether `name(arg_types)` is arithmetic over a float operand, which is
+/// DOUBLE (`dec.arithResultType`): a decimal literal operand then converts
+/// once, at plan time, instead of per row.
+pub fn arithTakesDouble(name: []const u8, arg_types: []const Type) bool {
+    if (arg_types.len != 2 or !(arg_types[0].isFloat() or arg_types[1].isFloat())) return false;
+    inline for (@typeInfo(dec.Op).@"enum".fields) |f| {
+        if (std.ascii.eqlIgnoreCase(name, f.name)) return true;
+    }
+    return false;
+}
+
 /// ROUND/TRUNCATE(decimal, n) with a literal `n` below the source scale
 /// return DECIMAL(p, max(n, 0)), as MySQL and DuckDB do: `ROUND(1.005, 2)`
 /// is 1.01, not 1.010. A per-row `n` keeps the source type.
