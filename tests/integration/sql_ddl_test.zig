@@ -155,8 +155,8 @@ test "sql ddl: parser recognizes rename, alter add column, and truncate" {
     {
         const root = try thindb.sql.parse(arena.allocator(), "ALTER TABLE t ADD COLUMN note TEXT");
         try std.testing.expect(root.* == .ddl);
-        try std.testing.expect(root.ddl == .alter_table_add_column);
-        try std.testing.expectEqualStrings("note", root.ddl.alter_table_add_column.column.name);
+        try std.testing.expect(root.ddl == .alter_table);
+        try std.testing.expectEqualStrings("note", root.ddl.alter_table.actions[0].add_column.name);
     }
     {
         const root = try thindb.sql.parse(arena.allocator(), "TRUNCATE TABLE t");
@@ -249,6 +249,61 @@ test "sql ddl: ALTER TABLE ADD COLUMN backfills nullable NULL and default values
         try std.testing.expectEqual(@as(usize, 1), batch.row_count);
         try std.testing.expectEqual(@as(i32, 0), batch.values[0].data.int[0]);
     }
+}
+
+test "sql ddl: ALTER TABLE drops, renames and changes columns and renames the table, as MySQL spells them" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty BIGINT NOT NULL, note VARCHAR(10), extra INT)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, 10, 'a', 5), (2, 20, 'b', 6)");
+    try (try db.openTable("t", .{})).flush();
+
+    try exec(allocator, db, "ALTER TABLE t DROP COLUMN extra, RENAME COLUMN qty TO amount, CHANGE note label VARCHAR(10), ADD flag INT");
+    {
+        const got = try collectBigints(allocator, db, "SELECT amount FROM t WHERE label = 'b' AND flag IS NULL");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &[_]i64{20}, got);
+    }
+    try expectRunError(allocator, db, "SELECT extra FROM t", thindb.net.Error.ColumnNotFound);
+    try expectRunError(allocator, db, "SELECT qty FROM t", thindb.net.Error.ColumnNotFound);
+
+    // A definition that keeps the column's type, nullability and default
+    // is a rename or nothing; anything else would convert every value.
+    try exec(allocator, db, "ALTER TABLE t MODIFY COLUMN amount BIGINT NOT NULL");
+    try exec(allocator, db, "ALTER TABLE t DROP flag");
+    try expectRunError(allocator, db, "ALTER TABLE t MODIFY amount INT NOT NULL", thindb.net.Error.UnsupportedOp);
+    try expectRunError(allocator, db, "ALTER TABLE t CHANGE amount total BIGINT", thindb.net.Error.UnsupportedOp);
+    try expectRunError(allocator, db, "ALTER TABLE t CHANGE ghost total BIGINT NOT NULL", thindb.net.Error.ColumnNotFound);
+    try expectRunError(allocator, db, "ALTER TABLE t ADD COLUMN z INT AFTER id", error.SqlColumnPositionUnsupported);
+
+    try exec(allocator, db, "ALTER TABLE t RENAME TO t2");
+    try expectRunError(allocator, db, "SELECT id FROM t", thindb.net.Error.TableNotFound);
+    try exec(allocator, db, "ALTER TABLE t2 CHANGE COLUMN amount total BIGINT NOT NULL, RENAME AS t3");
+    const got = try collectBigints(allocator, db, "SELECT id * 100 + total FROM t3 ORDER BY id");
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 110, 220 }, got);
+}
+
+test "sql ddl: DROP TABLE drops a list, and a missing table drops none of it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE a (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "CREATE TABLE b (id BIGINT PRIMARY KEY)");
+    try expectRunError(allocator, db, "DROP TABLE a, ghost", thindb.net.Error.TableNotFound);
+    try exec(allocator, db, "INSERT INTO a VALUES (1)");
+    try exec(allocator, db, "DROP TABLE IF EXISTS a, ghost, b RESTRICT");
+    try expectRunError(allocator, db, "SELECT id FROM a", thindb.net.Error.TableNotFound);
+    try expectRunError(allocator, db, "SELECT id FROM b", thindb.net.Error.TableNotFound);
 }
 
 test "sql ddl: TRUNCATE TABLE clears persisted rows and preserves schema" {

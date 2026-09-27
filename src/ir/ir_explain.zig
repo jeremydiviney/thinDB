@@ -414,7 +414,10 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
         },
         .drop_table => |dt| {
             try out.appendSlice(allocator, "DropTable ");
-            try writeTableRef(allocator, out, dt.table);
+            for (dt.tables, 0..) |ref, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try writeTableRef(allocator, out, ref);
+            }
             if (dt.if_exists) try out.appendSlice(allocator, " if_exists");
             try out.append(allocator, '\n');
         },
@@ -425,14 +428,36 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
             try writeTableRef(allocator, out, rt.to);
             try out.append(allocator, '\n');
         },
-        .alter_table_add_column => |at| {
-            try out.appendSlice(allocator, "AlterTableAddColumn ");
+        .alter_table => |at| {
+            try out.appendSlice(allocator, "AlterTable ");
             try writeTableRef(allocator, out, at.table);
-            try out.append(allocator, ' ');
-            try out.appendSlice(allocator, at.column.name);
-            try out.append(allocator, ' ');
-            try out.appendSlice(allocator, @tagName(at.column.column_type));
-            if (at.column.nullable) try out.appendSlice(allocator, " NULL");
+            for (at.actions, 0..) |action, i| {
+                try out.appendSlice(allocator, if (i == 0) " " else ", ");
+                try out.appendSlice(allocator, @tagName(action));
+                try out.append(allocator, ' ');
+                switch (action) {
+                    .add_column => |c| {
+                        try out.appendSlice(allocator, c.name);
+                        try out.append(allocator, ' ');
+                        try out.appendSlice(allocator, @tagName(c.column_type));
+                        if (c.nullable) try out.appendSlice(allocator, " NULL");
+                    },
+                    .drop_column => |name| try out.appendSlice(allocator, name),
+                    .rename_column => |r| {
+                        try out.appendSlice(allocator, r.from);
+                        try out.appendSlice(allocator, " to ");
+                        try out.appendSlice(allocator, r.to);
+                    },
+                    .change_column => |ch| {
+                        try out.appendSlice(allocator, ch.from);
+                        try out.appendSlice(allocator, " to ");
+                        try out.appendSlice(allocator, ch.column.name);
+                        try out.append(allocator, ' ');
+                        try out.appendSlice(allocator, @tagName(ch.column.column_type));
+                    },
+                    .rename_table => |ref| try writeTableRef(allocator, out, ref),
+                }
+            }
             try out.append(allocator, '\n');
         },
         .truncate_table => |ref| {

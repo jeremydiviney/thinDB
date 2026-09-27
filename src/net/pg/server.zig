@@ -1147,7 +1147,7 @@ fn commandTagFor(op: ir.Op) []const u8 {
             .create_table => "CREATE TABLE",
             .drop_table => "DROP TABLE",
             .rename_table => "RENAME TABLE",
-            .alter_table_add_column => "ALTER TABLE",
+            .alter_table => "ALTER TABLE",
             .truncate_table => "TRUNCATE TABLE",
             .use_schema, .use_database_schema => "SET",
             .create_sql_function => "CREATE FUNCTION",

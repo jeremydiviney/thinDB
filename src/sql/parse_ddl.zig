@@ -168,14 +168,15 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             if (p.cur.tag != .kw_table) return PE.SqlExpectedKeyword;
             try p.advance();
             const table = try p.parseTableRef();
-            if (p.cur.tag != .kw_add) return PE.SqlExpectedKeyword;
-            try p.advance();
-            if (p.cur.tag == .kw_column) try p.advance();
-            const col = try parseColumnDef(p);
-            if (col.is_pk or col.def.auto_increment) return PE.SqlInvalidProjection;
-            return try p.allocOp(.{ .ddl = .{ .alter_table_add_column = .{
+            var actions: std.ArrayList(ir.AlterAction) = .empty;
+            while (true) {
+                try actions.append(p.arena, try parseAlterAction(p));
+                if (p.cur.tag != .comma) break;
+                try p.advance();
+            }
+            return try p.allocOp(.{ .ddl = .{ .alter_table = .{
                 .table = table,
-                .column = col.def,
+                .actions = try actions.toOwnedSlice(p.arena),
             } } });
         },
         .kw_truncate => {
@@ -185,6 +186,54 @@ pub fn parseDdl(p: anytype) !*ir.Op {
         },
         else => unreachable,
     }
+}
+
+/// One `ALTER TABLE` action, in MySQL's spellings:
+///   ADD [COLUMN] def | DROP [COLUMN] name | RENAME COLUMN a TO b
+///   | CHANGE [COLUMN] old def | MODIFY [COLUMN] def | RENAME [TO | AS] t2
+fn parseAlterAction(p: anytype) !ir.AlterAction {
+    const PE = @TypeOf(p.*).Err;
+    switch (p.cur.tag) {
+        .kw_add => {
+            try p.advance();
+            if (p.cur.tag == .kw_column) try p.advance();
+            const col = try parseColumnDef(p);
+            if (col.is_pk or col.def.auto_increment) return PE.SqlInvalidProjection;
+            try rejectColumnPosition(p);
+            return .{ .add_column = col.def };
+        },
+        .kw_drop => {
+            try p.advance();
+            if (p.cur.tag == .kw_column) try p.advance();
+            return .{ .drop_column = try p.dupedIdent() };
+        },
+        .kw_rename => {
+            try p.advance();
+            if (p.cur.tag == .kw_column) {
+                try p.advance();
+                const from = try p.dupedIdent();
+                try p.expect(.kw_to);
+                return .{ .rename_column = .{ .from = from, .to = try p.dupedIdent() } };
+            }
+            if (p.cur.tag == .kw_to or p.cur.tag == .kw_as) try p.advance();
+            return .{ .rename_table = try p.parseTableRef() };
+        },
+        else => {},
+    }
+    const change = isIdentText(p, "change");
+    if (!change and !isIdentText(p, "modify")) return PE.SqlExpectedKeyword;
+    try p.advance();
+    if (p.cur.tag == .kw_column) try p.advance();
+    const from: ?[]const u8 = if (change) try p.dupedIdent() else null;
+    const col = try parseColumnDef(p);
+    if (col.is_pk) return PE.SqlInvalidProjection;
+    try rejectColumnPosition(p);
+    return .{ .change_column = .{ .from = from orelse col.def.name, .column = col.def } };
+}
+
+fn rejectColumnPosition(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    if (isIdentText(p, "first") or isIdentText(p, "after")) return PE.SqlColumnPositionUnsupported;
 }
 
 fn isIdentText(p: anytype, comptime text: []const u8) bool {
@@ -630,9 +679,16 @@ pub fn parseDropTableBody(p: anytype) !*ir.Op {
         try p.advance();
         if_exists = true;
     }
-    const ref = try p.parseTableRef();
+    var tables: std.ArrayList(ir.TableRef) = .empty;
+    while (true) {
+        try tables.append(p.arena, try p.parseTableRef());
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    // MySQL accepts and ignores RESTRICT / CASCADE.
+    if (isIdentText(p, "restrict") or isIdentText(p, "cascade")) try p.advance();
     return try p.allocOp(.{ .ddl = .{ .drop_table = .{
-        .table = ref,
+        .tables = try tables.toOwnedSlice(p.arena),
         .if_exists = if_exists,
     } } });
 }
