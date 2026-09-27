@@ -254,6 +254,7 @@ const Lane = struct {
         // destroys them in `deinit`.
         errdefer for (udf_states) |st| if (st.len > 0) allocator.free(st);
         const dsets = try allocator.alloc(DistinctSet, n * parts);
+        errdefer allocator.free(dsets);
         @memset(isum, 0);
         @memset(fsum, 0);
         @memset(ns, 0);
@@ -1427,14 +1428,18 @@ const GlobalAggregate = struct {
 
         var next_rg = std.atomic.Value(usize).init(0);
         for (workers, 0..) |*w, i| {
-            const source = try self.openScan(snap);
+            var source = try self.openScan(snap);
+            errdefer source.deinit();
+            var lane = try Lane.init(self.allocator, self.plans, n_workers);
+            errdefer lane.deinit(self.allocator);
+            const resolved = try self.allocator.alloc(?usize, self.plans.len);
             w.* = .{
                 .index = i,
                 .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
                 .source = source,
-                .lane = try Lane.init(self.allocator, self.plans, n_workers),
+                .lane = lane,
                 .plans = self.plans,
-                .resolved = try self.allocator.alloc(?usize, self.plans.len),
+                .resolved = resolved,
                 .allocator = self.allocator,
                 .seg_start = seg_start,
                 .segment_count = snap.segment_count,

@@ -3753,6 +3753,7 @@ pub const InsertColumnBuilder = struct {
         const string_offsets = try allocator.alloc(std.ArrayListUnmanaged(u32), n_cols);
         errdefer allocator.free(string_offsets);
         for (string_offsets) |*b| b.* = .empty;
+        errdefer for (string_offsets) |*b| b.deinit(allocator);
 
         const string_bytes = try allocator.alloc(std.ArrayListUnmanaged(u8), n_cols);
         errdefer allocator.free(string_bytes);
@@ -3761,6 +3762,7 @@ pub const InsertColumnBuilder = struct {
         const nulls = try allocator.alloc(std.ArrayListUnmanaged(u8), n_cols);
         errdefer allocator.free(nulls);
         for (nulls) |*b| b.* = .empty;
+        errdefer for (nulls) |*b| b.deinit(allocator);
 
         const view_slice = try allocator.alloc(storage.ColumnView, n_cols);
         errdefer allocator.free(view_slice);

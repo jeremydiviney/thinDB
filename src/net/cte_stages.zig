@@ -1476,12 +1476,10 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 }
             }
             if (tvf_ordered or any_borrow) eff_input.force_ordered = true;
-            var ups: std.ArrayList(exec.Query) = .empty;
+            var ups: std.ArrayList(exec.Query) = try .initCapacity(input.allocator, t.inputs.len);
             defer ups.deinit(input.allocator);
             errdefer for (ups.items) |*u| u.deinit();
-            for (t.inputs) |inp| {
-                try ups.append(input.allocator, try compileBlock(eff_input, inp, map));
-            }
+            for (t.inputs) |inp| ups.appendAssumeCapacity(try compileBlock(eff_input, inp, map));
             // A ride that crossed LEFT joins holds only if the compiled
             // operators kept the probe-order pin; sort on any doubt.
             if (tvf_ordered and tvf_n_crossed > 0 and
@@ -1493,7 +1491,9 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             {
                 tvf_ordered = false;
             }
-            const q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
+            var q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
+            ups.clearRetainingCapacity();
+            errdefer q.deinit();
             if (exec.queryAs(exec.table_fn.TableFnExec, q)) |tf| {
                 tf.input_ordered = tvf_ordered;
                 if (n_tin == 1) {
@@ -1516,10 +1516,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     std.debug.print("[tvf] compile {s}: advertises output order\n", .{t.name});
                 }
             }
-            if (t.alias) |a| {
-                errdefer @constCast(&q).deinit();
-                return exec.AliasRename.create(input.allocator, q, a);
-            }
+            if (t.alias) |a| return exec.AliasRename.create(input.allocator, q, a);
             return q;
         },
         .alias => |a| {

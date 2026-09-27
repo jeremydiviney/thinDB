@@ -512,6 +512,12 @@ pub const TableFnExec = struct {
         var dworkers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
         var n_dworkers: usize = 0;
         var max_tiles: usize = 1;
+        defer {
+            dp.stop.store(true, .release);
+            for (dworkers[0..n_dworkers]) |maybe| if (maybe) |t| t.join();
+            if (dp.preps.len > 0) self.allocator.free(dp.preps);
+            if (dp.bounds.len > 0) self.allocator.free(dp.bounds);
+        }
         if (self.dop > 1 and owned.len >= 2 and (!builtin.is_test or force_parallel_in_tests)) {
             const want = @min(@min(self.dop - 1, owned.len - 1), max_drain_workers);
             while (n_dworkers < want) {
@@ -522,12 +528,6 @@ pub const TableFnExec = struct {
             max_tiles = (n_dworkers + 1) * 2;
             dp.preps = try self.allocator.alloc(transform.PreparedAppend, n_cols);
             dp.bounds = try self.allocator.alloc(usize, max_tiles + 1);
-        }
-        defer {
-            dp.stop.store(true, .release);
-            for (dworkers[0..n_dworkers]) |maybe| if (maybe) |t| t.join();
-            if (dp.preps.len > 0) self.allocator.free(dp.preps);
-            if (dp.bounds.len > 0) self.allocator.free(dp.bounds);
         }
         var accumulated: usize = 0;
         while (try self.upstream.next()) |batch| {

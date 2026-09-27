@@ -226,12 +226,14 @@ fn processOneSegment(
         // Decode all schema columns for this row group. (Future: only
         // decode columns referenced by predicate + assignments.)
         const owned_cols = try allocator.alloc(storage.OwnedColumn, t.schema.columns.len);
+        var decoded: usize = 0;
         defer {
-            for (owned_cols) |*oc| oc.deinit(allocator);
+            for (owned_cols[0..decoded]) |*oc| oc.deinit(allocator);
             allocator.free(owned_cols);
         }
-        for (t.schema.columns, 0..) |_, ci| {
-            owned_cols[ci] = try seg.decodeColumn(allocator, t.schema, rg_idx, ci);
+        for (owned_cols, 0..) |*oc, ci| {
+            oc.* = try seg.decodeColumn(allocator, t.schema, rg_idx, ci);
+            decoded += 1;
         }
 
         const views = try allocator.alloc(ColumnView, t.schema.columns.len);
@@ -357,19 +359,24 @@ pub fn computeNewRows(
     // Compute's `Derived` list uses synthetic names so its outputs
     // don't collide with the upstream cols of the same name.
     const synth_names = try allocator.alloc([]u8, assignments.len);
+    var synth_made: usize = 0;
     defer {
-        for (synth_names) |s| allocator.free(s);
+        for (synth_names[0..synth_made]) |s| allocator.free(s);
         allocator.free(synth_names);
     }
     const derived = try allocator.alloc(exec.Derived, assignments.len);
     defer allocator.free(derived);
     for (assignments, 0..) |asn, i| {
         synth_names[i] = try std.fmt.allocPrint(allocator, "__upd_{d}__{s}", .{ i, asn.col });
+        synth_made += 1;
         derived[i] = .{ .name = synth_names[i], .expr = asn.value };
     }
 
     var src_q = try @import("../exec/single_batch.zig").SingleBatchSource.create(allocator, filtered_batch);
-    var compute_q = try src_q.compute(derived);
+    var compute_q = src_q.compute(derived) catch |err| {
+        src_q.deinit();
+        return err;
+    };
     defer compute_q.deinit();
 
     // Drain Compute (just one batch out, since input is one batch).

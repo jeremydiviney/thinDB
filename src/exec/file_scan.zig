@@ -117,8 +117,9 @@ pub const FileScan = struct {
         const field_count = parsed.records[0].fields.len;
 
         var infos = try self.allocator.alloc(ColumnInfo, field_count);
+        var named: usize = 0;
         defer {
-            for (infos) |info| self.allocator.free(info.name);
+            for (infos[0..named]) |info| self.allocator.free(info.name);
             self.allocator.free(infos);
         }
 
@@ -131,6 +132,7 @@ pub const FileScan = struct {
                 .kind = if (opts.all_varchar) .string else .null,
                 .nullable = false,
             };
+            named += 1;
         }
 
         for (parsed.records[first_data..]) |record| {
@@ -185,8 +187,9 @@ pub const FileScan = struct {
             while (it.next()) |entry| {
                 const key = entry.key_ptr.*;
                 const idx = jsonColumnIndex(infos.items, key) orelse blk: {
+                    try infos.ensureUnusedCapacity(self.allocator, 1);
                     const name = try uniqueJsonName(self.allocator, key, infos.items);
-                    try infos.append(self.allocator, .{
+                    infos.appendAssumeCapacity(.{
                         .name = name,
                         .key = key,
                         .kind = .null,
@@ -214,7 +217,7 @@ pub const FileScan = struct {
 
         const selected = try selectedJsonColumns(self.allocator, infos.items, needed);
         defer self.allocator.free(selected);
-        try self.initJsonOutput(infos.items, selected, rows.items.len);
+        try self.initOutput(infos.items, selected, rows.items.len);
         errdefer self.clearOutput();
 
         for (rows.items) |row| {
@@ -227,51 +230,37 @@ pub const FileScan = struct {
         self.finishViews();
     }
 
-    fn initOutput(self: *FileScan, infos: []const ColumnInfo, selected: []const usize, rows_cap: usize) !void {
-        self.schema = try self.allocator.alloc(Column, selected.len);
-        errdefer self.allocator.free(self.schema);
-        self.stores = try self.allocator.alloc(ColumnStore, selected.len);
-        errdefer self.allocator.free(self.stores);
-        self.views = try self.allocator.alloc(ColumnView, selected.len);
-        errdefer self.allocator.free(self.views);
-        self.stats_buf = try self.allocator.alloc(exec.ColStat, selected.len);
-        errdefer self.allocator.free(self.stats_buf);
+    /// `infos` is a slice of ColumnInfo or JsonColumnInfo. The output lands
+    /// on `self` only once whole: `deinit` frees whatever `self` holds.
+    fn initOutput(self: *FileScan, infos: anytype, selected: []const usize, rows_cap: usize) !void {
+        const schema = try self.allocator.alloc(Column, selected.len);
+        errdefer self.allocator.free(schema);
+        const stores = try self.allocator.alloc(ColumnStore, selected.len);
+        errdefer self.allocator.free(stores);
+        const views = try self.allocator.alloc(ColumnView, selected.len);
+        errdefer self.allocator.free(views);
+        const stats_buf = try self.allocator.alloc(exec.ColStat, selected.len);
+        errdefer self.allocator.free(stats_buf);
+        var built: usize = 0;
+        errdefer for (schema[0..built], stores[0..built]) |col, *store| {
+            self.allocator.free(col.name);
+            store.deinit(self.allocator);
+        };
 
-        for (selected, 0..) |src_idx, out_idx| {
+        for (selected, schema, stores, stats_buf) |src_idx, *col, *store, *stat| {
             const info = infos[src_idx];
             const ty = typeFromKind(info.kind);
-            self.schema[out_idx] = .{
-                .name = try self.allocator.dupe(u8, info.name),
-                .type = ty,
-                .nullable = info.nullable,
-            };
-            self.stores[out_idx] = try ColumnStore.initCapacity(self.allocator, ty, info.nullable, rows_cap, 0);
-            self.stats_buf[out_idx] = .{};
+            const name = try self.allocator.dupe(u8, info.name);
+            errdefer self.allocator.free(name);
+            store.* = try ColumnStore.initCapacity(self.allocator, ty, info.nullable, rows_cap, 0);
+            col.* = .{ .name = name, .type = ty, .nullable = info.nullable };
+            stat.* = .{};
+            built += 1;
         }
-        self.row_count = rows_cap;
-    }
-
-    fn initJsonOutput(self: *FileScan, infos: []const JsonColumnInfo, selected: []const usize, rows_cap: usize) !void {
-        self.schema = try self.allocator.alloc(Column, selected.len);
-        errdefer self.allocator.free(self.schema);
-        self.stores = try self.allocator.alloc(ColumnStore, selected.len);
-        errdefer self.allocator.free(self.stores);
-        self.views = try self.allocator.alloc(ColumnView, selected.len);
-        errdefer self.allocator.free(self.views);
-        self.stats_buf = try self.allocator.alloc(exec.ColStat, selected.len);
-        errdefer self.allocator.free(self.stats_buf);
-
-        for (selected, 0..) |src_idx, out_idx| {
-            const info = infos[src_idx];
-            const ty = typeFromKind(info.kind);
-            self.schema[out_idx] = .{
-                .name = try self.allocator.dupe(u8, info.name),
-                .type = ty,
-                .nullable = info.nullable,
-            };
-            self.stores[out_idx] = try ColumnStore.initCapacity(self.allocator, ty, info.nullable, rows_cap, 0);
-            self.stats_buf[out_idx] = .{};
-        }
+        self.schema = schema;
+        self.stores = stores;
+        self.views = views;
+        self.stats_buf = stats_buf;
         self.row_count = rows_cap;
     }
 
@@ -402,7 +391,10 @@ fn parseCsvRecords(allocator: Allocator, bytes: []const u8, opts: CsvOptionsNorm
         records.deinit(allocator);
     }
     var fields: std.ArrayList([]u8) = .empty;
-    defer fields.deinit(allocator);
+    defer {
+        for (fields.items) |f| allocator.free(f);
+        fields.deinit(allocator);
+    }
     var field: std.ArrayList(u8) = .empty;
     defer field.deinit(allocator);
 
@@ -469,9 +461,8 @@ fn parseCsvRecords(allocator: Allocator, bytes: []const u8, opts: CsvOptionsNorm
 }
 
 fn finishCsvField(allocator: Allocator, fields: *std.ArrayList([]u8), field: *std.ArrayList(u8)) !void {
-    const owned = try field.toOwnedSlice(allocator);
-    try fields.append(allocator, owned);
-    field.* = .empty;
+    try fields.ensureUnusedCapacity(allocator, 1);
+    fields.appendAssumeCapacity(try field.toOwnedSlice(allocator));
 }
 
 fn finishCsvRecord(
@@ -501,9 +492,8 @@ fn finishCsvRecord(
     } else {
         expected_fields.* = count;
     }
-    const owned_fields = try fields.toOwnedSlice(allocator);
-    try records.append(allocator, .{ .fields = owned_fields });
-    fields.* = .empty;
+    try records.ensureUnusedCapacity(allocator, 1);
+    records.appendAssumeCapacity(.{ .fields = try fields.toOwnedSlice(allocator) });
 }
 
 fn detectHeader(records: []const CsvRecord) bool {
