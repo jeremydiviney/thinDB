@@ -1096,6 +1096,14 @@ fn handleQuery(
     var seq_id: u8 = 1;
     const caps = session.client_caps;
 
+    // Every shortcut below matches the whole payload, so on a batch it would
+    // answer the first statement and drop the rest; the engine's batch path
+    // runs each statement and flags all but the last with more results.
+    if (try isMultiStatementPayload(allocator, payload)) {
+        try runEngineQuery(allocator, w, catalog, session, payload, &seq_id, profiler);
+        return;
+    }
+
     if (try trySetThindbEnvVar(allocator, payload)) {
         try handshake.sendOkPacketStatus(allocator, w, seq_id, 0, 0, session.transactionStatus());
         return;
@@ -1179,7 +1187,27 @@ fn handleQuery(
 
     if (try sendSyntheticWorkbenchSelect(allocator, w, catalog, session, payload, &seq_id, caps)) return;
 
+    // XA transaction control (Flink exactly-once): `XA START|END|PREPARE|COMMIT|
+    // ROLLBACK|RECOVER ...`. Not thinDB SQL — intercept before the parser.
+    {
+        const t = std.mem.trim(u8, payload, " \t\r\n;");
+        if (t.len > 2 and std.ascii.eqlIgnoreCase(t[0..2], "XA") and (t[2] == ' ' or t[2] == '\t')) {
+            try handleXaCommand(allocator, w, catalog, session, t, seq_id);
+            return;
+        }
+    }
+
     try runEngineQuery(allocator, w, catalog, session, payload, &seq_id, profiler);
+}
+
+fn isMultiStatementPayload(allocator: Allocator, payload: []const u8) Allocator.Error!bool {
+    // Only a `;` ahead of the trailing ones can separate statements; most
+    // payloads have none and skip the lex.
+    const body = std.mem.trimEnd(u8, payload, " \t\r\n;");
+    if (std.mem.indexOfScalar(u8, body, ';') == null) return false;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    return sql.isMultiStatement(arena.allocator(), payload, .mysql);
 }
 
 fn sendSyntheticWorkbenchSelect(
@@ -3292,16 +3320,6 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    // XA transaction control (Flink exactly-once): `XA START|END|PREPARE|COMMIT|
-    // ROLLBACK|RECOVER ...`. Not thinDB SQL — intercept before the parser.
-    {
-        const t = std.mem.trim(u8, payload, " \t\r\n;");
-        if (t.len > 2 and std.ascii.eqlIgnoreCase(t[0..2], "XA") and (t[2] == ' ' or t[2] == '\t')) {
-            try handleXaCommand(allocator, w, catalog, session, t, seq_id.*);
-            return;
-        }
-    }
-
     const parse_start = profiler.start();
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
     const op = sql.parseWithContext(arena.allocator(), payload, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
@@ -4182,6 +4200,74 @@ fn handleStmtSendLongData(session: *SessionState, payload: []const u8) !void {
     }
     var buf = &stmt.long_data[param_index].?;
     try buf.appendSlice(stmt.allocator, data);
+}
+
+fn testPacketBodies(allocator: Allocator, bytes: []const u8) ![]const []const u8 {
+    var bodies: std.ArrayList([]const u8) = .empty;
+    errdefer bodies.deinit(allocator);
+    var pos: usize = 0;
+    while (pos + 4 <= bytes.len) {
+        const len = std.mem.readInt(u24, bytes[pos..][0..3], .little);
+        try bodies.append(allocator, bytes[pos + 4 ..][0..len]);
+        pos += 4 + len;
+    }
+    return bodies.toOwnedSlice(allocator);
+}
+
+/// Each OK packet's status flags; every reply these tests read has small
+/// affected-row and insert-id counts, so both are one-byte lenenc ints.
+fn testOkStatuses(allocator: Allocator, bytes: []const u8) ![]u16 {
+    const bodies = try testPacketBodies(allocator, bytes);
+    defer allocator.free(bodies);
+    const statuses = try allocator.alloc(u16, bodies.len);
+    errdefer allocator.free(statuses);
+    for (bodies, statuses) |body, *status| {
+        try std.testing.expect(body.len >= 5 and body[0] == 0x00);
+        status.* = std.mem.readInt(u16, body[3..5], .little);
+    }
+    return statuses;
+}
+
+test "a batch runs every statement, SETs and transaction verbs included" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41 | handshake.CLIENT_MULTI_STATEMENTS;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE mix (id INT, v INT)", &profiler);
+    const cases = .{
+        .{ "SET NAMES utf8mb4; INSERT INTO mix VALUES (1, 10)", 2 },
+        .{ "SET @@session.sql_mode = ''; SET autocommit = 1; INSERT INTO mix VALUES (2, 20); SET TRANSACTION ISOLATION LEVEL READ COMMITTED", 4 },
+        .{ "START TRANSACTION; INSERT INTO mix VALUES (3, 30); COMMIT;", 3 },
+        .{ "SET NAMES utf8mb4;", 1 },
+    };
+    inline for (cases) |case| {
+        out.clearRetainingCapacity();
+        try handleQuery(allocator, &out.writer, c, &session, case[0], &profiler);
+        const statuses = try testOkStatuses(allocator, out.written());
+        defer allocator.free(statuses);
+        try std.testing.expectEqual(@as(usize, case[1]), statuses.len);
+        for (statuses, 1..) |status, n| {
+            try std.testing.expectEqual(n < statuses.len, status & handshake.SERVER_MORE_RESULTS_EXISTS != 0);
+        }
+    }
+
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "SELECT COUNT(*) FROM mix", &profiler);
+    const bodies = try testPacketBodies(allocator, out.written());
+    defer allocator.free(bodies);
+    var saw_count = false;
+    for (bodies) |body| saw_count = saw_count or std.mem.eql(u8, body, "\x013");
+    try std.testing.expect(saw_count);
 }
 
 test "applyInitDb resolves flat db__schema name" {
