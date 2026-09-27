@@ -136,9 +136,18 @@ wrapping ops. LARGEINT operands stay LARGEINT. A widened result passed to a
 function's narrower integer parameter narrows back, as in StarRocks (see
 implicit type coercion).
 
-A numeric literal with a fraction or an exponent is DOUBLE: `1.5`, `.5`,
-`1e3`, `2.5E-3`, `6.02e+23`. This matches MySQL, StarRocks and DuckDB. A
-literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
+A numeric literal with a fraction and no exponent is an exact DECIMAL of its
+own digits: `1.10` is DECIMAL(3,2), `.5` is DECIMAL(1,1) and `0.000` is
+DECIMAL(4,3). So `0.1 + 0.2` is exactly `0.3`, and `price * 1.1` over a
+DECIMAL column stays DECIMAL. MySQL, StarRocks and DuckDB type literals the
+same way. The tree carries the literal as its digits cast to its own type
+(`expr.decimalLiteral`), and Compute folds that into one typed constant.
+Beside a DOUBLE operand the literal converts to DOUBLE, as any decimal does.
+A comparison reads it as the double nearest its digits. That double lands
+exactly on a decimal or integer column (see DOUBLE to DECIMAL below), so
+`x > 1.5` stays a leaf and keeps zonemap pruning. The exponent form
+(`1e3`, `2.5E-3`, `6.02e+23`) is DOUBLE, and so is a literal of more than
+38 digits. A literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
 
 Known difference: StarRocks returns LARGEINT for `ABS(BIGINT)`, so
 `ABS(BIGINT_MIN)` is `9223372036854775808` there. thinDB keeps BIGINT, which
@@ -190,6 +199,8 @@ Result precisions exceeding 38 are clamped to 38, with overflow → error rather
 **DOUBLE to DECIMAL** goes through the double's shortest round-trip digits (the digits it prints as), rounded half away from zero to the target scale. `1.005e0` is 1.005 although its binary value is just below it, so it lands on 1.01 at scale 2, as in MySQL. One rule (`scalar_fn_common.floatDigits`) covers every conversion: `CAST`, an INSERT of a float literal into a DECIMAL column, and a float literal compared with a decimal or integer column. Text written into a DECIMAL column rounds the same way, and a value past the column's precision is `ValueOutOfRange`.
 
 **A float function takes a decimal's value.** A function with only DOUBLE parameters, such as `POWER`, `SQRT`, `LN`, `EXP`, the trigonometric functions and `SIGN`, converts a DECIMAL argument to DOUBLE, as MySQL and StarRocks do. Functions with decimal overloads (`ROUND`, `FLOOR`, `CEIL`, `ABS`, `TRUNCATE`, `MOD`, `GREATEST`, `LEAST`) keep DECIMAL.
+
+**`ROUND(x, n)` and `TRUNCATE(x, n)`** over DECIMAL(p,s) with a literal `n` below `s` return DECIMAL(p, max(n, 0)), as in MySQL and DuckDB. So `ROUND(1.005, 2)` is `1.01`, and a negative `n` rounds left of the point: `ROUND(15.5, -1)` is `20`. A place computed per row keeps DECIMAL(p,s), with the dropped digits zeroed.
 
 ---
 

@@ -4214,7 +4214,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
                 try agg_keys.append(a, .{ .name = lastSegment(c), .src = lastSegment(c) });
             }
             for (se.above_derived) |d| {
-                const src: ?[]const u8 = switch (d.expr) {
+                const src: ?[]const u8 = if (expr_mod.decimalLiteral(d.expr) != null) d.name else switch (d.expr) {
                     .lit, .null_lit => d.name,
                     .col_ref => |r| blk: {
                         const t = lastSegment(r);
@@ -4318,13 +4318,13 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
         // Constant derived above the aggregate (the `-2 AS divisionId`
         // class) evaluate with the scan; key aliases resolve at compile
         // and are never materialized.
-        for (se.above_derived) |d| switch (d.expr) {
-            .lit, .null_lit => try side_derived.append(a, .{
+        for (se.above_derived) |d| {
+            if (d.expr != .lit and d.expr != .null_lit and expr_mod.decimalLiteral(d.expr) == null) continue;
+            try side_derived.append(a, .{
                 .name = try a.dupe(u8, d.name),
                 .expr = try cloneExprPlain(a, d.expr),
-            }),
-            else => {},
-        };
+            });
+        }
 
         // Scan projection: the visible set minus derived names, plus every
         // stored column the derived exprs read. An aggregating side scans

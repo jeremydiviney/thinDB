@@ -320,6 +320,7 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
     }
 
     // ROUND/TRUNCATE(decimal, n) — keeps the source scale, rounds the value.
+    // A literal `n` narrows the scale (`roundedDecimalType`).
     if (arg_types.len == 2 and arg_types[0].isDecimal() and arg_types[1].isInteger()) {
         if (std.ascii.eqlIgnoreCase(name, "round"))
             return try buildDecFn(aa, name, arg_types, arg_types[0], dec.roundNKernel, .propagates);
@@ -418,6 +419,28 @@ pub fn arithOperandLiteral(name: []const u8, arg_types: []const Type, lit: types
     if (std.math.cast(i32, x)) |n| return .{ .int = n };
     if (std.math.cast(i64, x)) |n| return .{ .bigint = n };
     return .{ .largeint = x };
+}
+
+/// Whether `name(arg_types)` is arithmetic over a float operand, which is
+/// DOUBLE (`dec.arithResultType`): a decimal literal operand then converts
+/// once, at plan time, instead of per row.
+pub fn arithTakesDouble(name: []const u8, arg_types: []const Type) bool {
+    if (arg_types.len != 2 or !(arg_types[0].isFloat() or arg_types[1].isFloat())) return false;
+    inline for (@typeInfo(dec.Op).@"enum".fields) |f| {
+        if (std.ascii.eqlIgnoreCase(name, f.name)) return true;
+    }
+    return false;
+}
+
+/// ROUND/TRUNCATE(decimal, n) with a literal `n` below the source scale
+/// return DECIMAL(p, max(n, 0)), as MySQL and DuckDB do: `ROUND(1.005, 2)`
+/// is 1.01, not 1.010. A per-row `n` keeps the source type.
+pub fn roundedDecimalType(name: []const u8, arg_types: []const Type, places: i128) ?Type {
+    if (arg_types.len != 2 or !arg_types[1].isInteger()) return null;
+    if (!std.ascii.eqlIgnoreCase(name, "round") and !std.ascii.eqlIgnoreCase(name, "truncate")) return null;
+    const sp = arg_types[0].decimalSpec() orelse return null;
+    if (places >= sp.s) return null;
+    return dec.decTypeFor(sp.p, @intCast(@max(places, 0)));
 }
 
 /// `width` is always one of INT_BY_WIDTH_RANK.

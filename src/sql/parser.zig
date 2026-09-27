@@ -2112,7 +2112,13 @@ pub const Parser = struct {
                 .double => |x| return ir.Expr{ .lit = .{ .double = -x } },
                 else => {},
             },
-            else => {},
+            else => if (exec_expr.decimalLiteral(expr)) |d| {
+                const digits = if (d.digits[0] == '-')
+                    d.digits[1..]
+                else
+                    try std.fmt.allocPrint(self.arena, "-{s}", .{d.digits});
+                return try exec_expr.decimalLiteralExpr(self.arena, digits, d.p, d.s);
+            },
         }
         return try self.makeBinary("sub", ir.Expr{ .lit = .{ .int = 0 } }, expr);
     }
@@ -2370,14 +2376,11 @@ pub const Parser = struct {
                 value_args = args[0..1];
             } else {
                 if (args.len != 2) return ParseError.SqlInvalidProjection;
-                params = .{ .percentile = switch (args[1]) {
-                    .lit => |v| switch (v) {
-                        .double => |x| x,
-                        .float => |x| x,
-                        .int => |x| @floatFromInt(x),
-                        .bigint => |x| @floatFromInt(x),
-                        else => return ParseError.SqlInvalidProjection,
-                    },
+                params = .{ .percentile = switch (exec_expr.literalValue(args[1]) orelse return ParseError.SqlInvalidProjection) {
+                    .double => |x| x,
+                    .float => |x| x,
+                    .int => |x| @floatFromInt(x),
+                    .bigint => |x| @floatFromInt(x),
                     else => return ParseError.SqlInvalidProjection,
                 } };
                 value_args = args[0..1];
@@ -2806,7 +2809,12 @@ pub const Parser = struct {
                 const rhs = try self.parseCallAtom();
                 return try self.negateExpr(rhs);
             },
-            .integer, .floating, .string, .kw_true, .kw_false => {
+            .floating => {
+                const tok = self.cur;
+                try self.advance();
+                return try fractionalLiteral(self.arena, tok.text, tok.value.floating);
+            },
+            .integer, .string, .kw_true, .kw_false => {
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
             },
@@ -2916,6 +2924,7 @@ pub const Parser = struct {
             .lit => |v| return try self.renderLit(v),
             .null_lit => return try self.arena.dupe(u8, "NULL"),
             .call => |c| {
+                if (exec_expr.decimalLiteral(e)) |d| return try self.arena.dupe(u8, d.digits);
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.arena);
                 try buf.appendSlice(self.arena, c.fn_name);
@@ -4470,7 +4479,11 @@ pub const Parser = struct {
         if (side != .left and side != .right) return false;
         if (side_expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
         const col = try self.joinColName(side_expr);
-        const pred = switch (literal_expr) {
+        const pred = if (exec_expr.decimalLiteral(literal_expr) != null) PredicateExpr{ .leaf = .{
+            .col = col,
+            .op = op,
+            .val = exec_expr.literalValue(literal_expr) orelse return ParseError.SqlExpectedValue,
+        } } else switch (literal_expr) {
             .lit => |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } },
             .null_lit => PredicateExpr.unknown,
             // `col <op> @var`: the pre-compile pass rewrites leaf_var to a
@@ -5718,6 +5731,16 @@ fn exprEqual(a: ir.Expr, b: ir.Expr) bool {
         },
         else => false,
     };
+}
+
+/// A fractional literal without an exponent is the exact DECIMAL of its
+/// digits, as in MySQL, StarRocks and DuckDB: `1.10` is DECIMAL(3,2) and
+/// `.5` DECIMAL(1,1). The exponent form, and a literal past 38 digits, is
+/// DOUBLE.
+fn fractionalLiteral(arena: std.mem.Allocator, text: []const u8, value: f64) ParseError!ir.Expr {
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse return .{ .lit = .{ .double = value } };
+    if (std.mem.indexOfAny(u8, text, "eE") != null or text.len - 1 > 38) return .{ .lit = .{ .double = value } };
+    return try exec_expr.decimalLiteralExpr(arena, text, @intCast(text.len - 1), @intCast(text.len - dot - 1));
 }
 
 fn valueEqual(a: @import("../types.zig").Value, b: @import("../types.zig").Value) bool {

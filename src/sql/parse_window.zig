@@ -15,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const ir = @import("../ir/ir.zig");
+const exec_expr = @import("../exec/expr.zig");
 const SortSpec = @import("../exec/sort.zig").SortSpec;
 
 /// Inline-spec representation of a window call collected from the SELECT
@@ -348,7 +349,9 @@ pub fn defaultName(arena: Allocator, func_name: []const u8, args: []const ir.Exp
             .col_ref => |c| try buf.appendSlice(arena, c),
             .lit => try buf.appendSlice(arena, "?"),
             .null_lit => try buf.appendSlice(arena, "NULL"),
-            .call => |c| {
+            .call => |c| if (exec_expr.decimalLiteral(a) != null) {
+                try buf.appendSlice(arena, "?");
+            } else {
                 try buf.appendSlice(arena, c.fn_name);
                 try buf.appendSlice(arena, "(...)");
             },

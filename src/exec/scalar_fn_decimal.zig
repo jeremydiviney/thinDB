@@ -405,6 +405,19 @@ fn textMantissa(text: []const u8, s: u8) error{ArithmeticOverflow}!?i128 {
     };
 }
 
+/// A decimal as DOUBLE, as the cast and the float kernels read it.
+pub fn mantissaToDouble(m: i128, s: u8) f64 {
+    return @as(f64, @floatFromInt(m)) / pow10f(s);
+}
+
+/// A text constant as `CAST(text AS DECIMAL(p,s))` reads it, for folding
+/// the cast at plan time: null where the cast gives NULL or raises.
+pub fn textConstantMantissa(text: []const u8, spec: DecimalSpec) ?i128 {
+    const m = (textMantissa(text, spec.s) catch return null) orelse return null;
+    const limit = pow10(spec.p);
+    return if (m > -limit and m < limit) m else null;
+}
+
 /// Text as a mantissa at scale `s` with nothing rounded away: null when the
 /// text isn't a number or its value needs more fraction digits than `s`.
 /// An exponent form reads as the double's shortest digits.
@@ -504,9 +517,10 @@ pub fn truncateKernel(allocator: Allocator, arg_types: []const Type, out_type: T
     try rescaleToOut(allocator, arg_types, out_type, args, out, n, .trunc);
 }
 
-/// ROUND(decimal, n) / TRUNCATE(decimal, n): keep the source scale, but zero
-/// (round/truncate) the digits below the n-th place. `n` is read per-row off
-/// the second (literal) column, so the result type stays decimal(p, s).
+/// ROUND(decimal, n) / TRUNCATE(decimal, n): round (or truncate) away the
+/// digits below the n-th place; a negative `n` reaches left of the point.
+/// `n` is read per row, so the result keeps the source scale unless a
+/// literal `n` narrowed out_type to scale max(n, 0).
 pub fn roundNKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     try rescaleNInPlace(allocator, arg_types, out_type, args, out, n, .round);
 }
@@ -517,15 +531,18 @@ pub fn truncateNKernel(allocator: Allocator, arg_types: []const Type, out_type: 
 
 fn rescaleNInPlace(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize, mode: RoundMode) !void {
     const s = scaleOf(arg_types[0]);
+    const ts = scaleOf(out_type);
     var row: usize = 0;
     while (row < n) : (row += 1) {
         const places = nAt(args[1], row);
-        var v = mantissaAt(args[0], row);
-        if (places < s) {
-            const drop: u8 = @intCast(@min(@as(i128, s), s - @as(i128, @max(places, 0))));
-            const reduced = reduceScale(v, drop, mode);
-            v = reduced * pow10(drop);
-        }
+        const m = mantissaAt(args[0], row);
+        // out_type's scale is at least max(places, 0) whenever places < s.
+        const v: i128 = if (places >= s)
+            m
+        else if (s - places > MAX_PRECISION)
+            0
+        else
+            reduceScale(m, @intCast(s - places), mode) * pow10(@intCast(ts - places));
         try appendDec(allocator, out, out_type, v, args[0].isValid(row));
     }
 }

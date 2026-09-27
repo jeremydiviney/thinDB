@@ -175,6 +175,55 @@ pub fn eql(a: Expr, b: Expr) bool {
     };
 }
 
+/// A decimal constant as the tree carries it: its digits cast to its own
+/// type, `to_decimal:<p>:<s>('<digits>')`. A decimal Value holds only a
+/// mantissa, so the digits keep the scale. The parser types a fractional
+/// literal this way (`1.10` is DECIMAL(3,2)), subquery resolution re-enters
+/// a decimal result this way, and Compute folds it into one typed constant.
+pub const DecimalLiteral = struct {
+    digits: []const u8,
+    p: u8,
+    s: u8,
+};
+
+pub fn decimalLiteral(e: Expr) ?DecimalLiteral {
+    const c = switch (e) {
+        .call => |c| c,
+        else => return null,
+    };
+    if (c.args.len != 1) return null;
+    const digits = switch (c.args[0]) {
+        .lit => |v| switch (v) {
+            .text => |t| t,
+            else => return null,
+        },
+        else => return null,
+    };
+    var it = std.mem.splitScalar(u8, c.fn_name, ':');
+    if (!std.mem.eql(u8, it.next() orelse return null, "to_decimal")) return null;
+    const p = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    const s = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+    if (it.next() != null) return null;
+    return .{ .digits = digits, .p = p, .s = s };
+}
+
+pub fn decimalLiteralExpr(arena: Allocator, digits: []const u8, p: u8, s: u8) Allocator.Error!Expr {
+    const args = try arena.alloc(Expr, 1);
+    args[0] = .{ .lit = .{ .text = try arena.dupe(u8, digits) } };
+    return .{ .call = .{ .fn_name = try std.fmt.allocPrint(arena, "to_decimal:{d}:{d}", .{ p, s }), .args = args } };
+}
+
+/// The value of a literal operand for a consumer that takes one where a
+/// DOUBLE serves: a comparison leaf, which places a double on a decimal or
+/// integer column by its shortest digits (the literal's own), or a numeric
+/// parameter such as a percentile. A decimal constant gives the double
+/// nearest its digits.
+pub fn literalValue(e: Expr) ?Value {
+    if (e == .lit) return e.lit;
+    const d = decimalLiteral(e) orelse return null;
+    return .{ .double = std.fmt.parseFloat(f64, d.digits) catch return null };
+}
+
 fn cloneValue(out_arena: Allocator, v: Value) Allocator.Error!Value {
     return switch (v) {
         .text => |s| .{ .text = try out_arena.dupe(u8, s) },

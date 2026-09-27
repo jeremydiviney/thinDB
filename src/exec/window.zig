@@ -31,6 +31,7 @@ const Type = types.Type;
 const Value = types.Value;
 
 const ir = @import("../ir/ir.zig");
+const expr_mod = @import("expr.zig");
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -2351,7 +2352,12 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
                     .null_lit => {
                         plan.default_kind = .none;
                     },
-                    .call, .case, .scalar_subquery, .exists_subquery, .var_ref => return Error.WindowUnsupported,
+                    .call => {
+                        const v = expr_mod.literalValue(c.args[2]) orelse return Error.WindowUnsupported;
+                        plan.default_kind = .literal;
+                        plan.default_literal = try coerceDefaultLit(v, schema[plan.value_col].type);
+                    },
+                    .case, .scalar_subquery, .exists_subquery, .var_ref => return Error.WindowUnsupported,
                 }
             }
         },
