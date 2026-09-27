@@ -323,6 +323,52 @@ test "binary arith: integer result types and wrapping match StarRocks" {
     }
 }
 
+test "binary arith: DIV over DOUBLE and DECIMAL truncates the exact quotient into BIGINT" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const TypeTag = thindb.types.TypeTag;
+
+    // MySQL 8.4 answers every case the same.
+    const cases = .{
+        .{ "SELECT 5.5 DIV 2", @as(?i128, 2) },
+        .{ "SELECT -5.5 DIV 2", @as(?i128, -2) },
+        .{ "SELECT 5.5 DIV 0.5", @as(?i128, 11) },
+        .{ "SELECT 7.5 DIV 2.5", @as(?i128, 3) },
+        .{ "SELECT 7 DIV 2.0", @as(?i128, 3) },
+        .{ "SELECT 5.5e0 DIV 2", @as(?i128, 2) },
+        .{ "SELECT -7.9e0 DIV 1", @as(?i128, -7) },
+        .{ "SELECT 0.3e0 DIV 0.1e0", @as(?i128, 3) },
+        .{ "SELECT 9223372036854775807.9 DIV 1", @as(?i128, std.math.maxInt(i64)) },
+        .{ "SELECT 1 DIV 0.0", @as(?i128, null) },
+        .{ "SELECT d DIV 0.1 FROM f", @as(?i128, 3) },
+        .{ "SELECT a DIV d FROM f", @as(?i128, 25) },
+        .{ "SELECT a DIV z FROM f", @as(?i128, null) },
+        .{ "SELECT d DIV z FROM f", @as(?i128, null) },
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE f (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, a DECIMAL(10,2) NOT NULL, z DOUBLE NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO f VALUES (1, 0.3, 7.50, 0)");
+    try (try db.openTable("f", .{})).flush();
+
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        try std.testing.expectEqual(TypeTag.bigint, std.meta.activeTag(q.outputSchema()[0].type));
+        try std.testing.expectEqual(c[1], try firstIntValue(&q));
+    }
+
+    inline for (.{ "SELECT 99999999999999999999.0 DIV 1", "SELECT 1e30 DIV 1" }) |sql| {
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        try std.testing.expectError(error.ArithmeticOverflow, q.next());
+    }
+}
+
 test "binary arith: scientific-notation and leading-dot literals are DOUBLE" {
     // MySQL, StarRocks and DuckDB read `1e3` and `.5` as DOUBLE literals;
     // thinDB read `1e3` as `1 AS e3`.

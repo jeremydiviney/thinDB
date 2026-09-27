@@ -391,3 +391,35 @@ test "DATE_FORMAT, STR_TO_DATE and the week functions match MySQL" {
         for (uuids[0..i]) |earlier| try std.testing.expect(!std.mem.eql(u8, earlier.?, text));
     }
 }
+
+test "INTERVAL: a fractional amount rounds to whole units before the unit's factor" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    // MySQL 8.4: half away from zero, and a text amount reads its leading
+    // integer.
+    const cases = .{
+        .{ "d + INTERVAL 1.5 DAY", "d + INTERVAL 2 DAY" },
+        .{ "d + INTERVAL 1.4 DAY", "d + INTERVAL 1 DAY" },
+        .{ "d + INTERVAL -1.5 DAY", "d + INTERVAL -2 DAY" },
+        .{ "d - INTERVAL 2.5 DAY", "d - INTERVAL 3 DAY" },
+        .{ "d + INTERVAL 1.5 WEEK", "d + INTERVAL 2 WEEK" },
+        .{ "d + INTERVAL 1.5 QUARTER", "d + INTERVAL 2 QUARTER" },
+        .{ "DATE_ADD(d, INTERVAL 1.49 MONTH)", "DATE_ADD(d, INTERVAL 1 MONTH)" },
+        .{ "DATE_ADD(d, INTERVAL 1.5e0 DAY)", "DATE_ADD(d, INTERVAL 2 DAY)" },
+        .{ "DATE_SUB(d, INTERVAL 2.5 DAY)", "DATE_SUB(d, INTERVAL 3 DAY)" },
+        .{ "d + INTERVAL '1.5' DAY", "d + INTERVAL 1 DAY" },
+    };
+    inline for (cases) |c| {
+        const got = try collectDates(allocator, db, "SELECT " ++ c[0] ++ " FROM t ORDER BY id");
+        defer allocator.free(got);
+        const want = try collectDates(allocator, db, "SELECT " ++ c[1] ++ " FROM t ORDER BY id");
+        defer allocator.free(want);
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        try std.testing.expectEqualSlices(i32, want, got);
+    }
+}
