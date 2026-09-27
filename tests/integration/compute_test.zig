@@ -994,3 +994,50 @@ test "compute: position-taking string functions count UTF-8 characters" {
         };
     }
 }
+
+test "compute: FORMAT rounds and groups thousands as MySQL does" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE f (id BIGINT PRIMARY KEY, a DECIMAL(10,3) NOT NULL, d DOUBLE NOT NULL, i BIGINT NOT NULL, n INT NOT NULL, z DOUBLE)");
+    try helpers.exec(allocator, db, "INSERT INTO f VALUES (1, -1234567.891, 0.1, 1000000, 2, NULL)");
+    try (try db.openTable("f", .{})).flush();
+
+    // MySQL 8.4 answers every case the same.
+    const cases = .{
+        .{ "FORMAT(1234.567, 2)", "1,234.57" },
+        .{ "FORMAT(-1234.5, 0)", "-1,235" },
+        .{ "FORMAT(0.5, 0)", "1" },
+        .{ "FORMAT(999.995, 2)", "1,000.00" },
+        .{ "FORMAT(1.005, 2)", "1.01" },
+        .{ "FORMAT(12345, 2)", "12,345.00" },
+        .{ "FORMAT(1234.5678e0, 2)", "1,234.57" },
+        .{ "FORMAT(1.005e0, 2)", "1.00" },
+        .{ "FORMAT(2.5e0, 0)", "2" },
+        .{ "FORMAT(1e20, 2)", "100,000,000,000,000,000,000.00" },
+        .{ "FORMAT(1234.5, -1)", "1,235" },
+        .{ "FORMAT(0.123, 40)", "0.123000000000000000000000000000" },
+        .{ "FORMAT(-0.4, 0)", "0" },
+        .{ "FORMAT(-0.001, 2)", "0.00" },
+        .{ "FORMAT(a, n)", "-1,234,567.89" },
+        .{ "FORMAT(i, 0)", "1,000,000" },
+        .{ "FORMAT(d, 3)", "0.100" },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectStrings(allocator, db, "SELECT " ++ c[0] ++ " FROM f");
+        defer helpers.freeStrings(allocator, got);
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqualStrings(c[1], got[0].?);
+    }
+
+    const bare = try helpers.collectStrings(allocator, db, "SELECT FORMAT(1234.567, 2)");
+    defer helpers.freeStrings(allocator, bare);
+    try std.testing.expectEqualStrings("1,234.57", bare[0].?);
+
+    const none = try helpers.collectStrings(allocator, db, "SELECT FORMAT(z, 2) FROM f");
+    defer helpers.freeStrings(allocator, none);
+    try std.testing.expect(none[0] == null);
+}
