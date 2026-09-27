@@ -120,6 +120,29 @@ test "mysql literals: an integer past BIGINT is DECIMAL, then DOUBLE" {
     try expectText(allocator, db, "SELECT CAST(COUNT(*) AS CHAR) FROM big WHERE CAST(id AS DOUBLE) < 12345678901234567890", "2");
 }
 
+test "mysql literals: HEX of an integer past BIGINT reads it as MySQL types it (issue #297)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    // MySQL reads an integer literal up to 2^64 - 1 as BIGINT UNSIGNED;
+    // past that, or below BIGINT, HEX clamps to the BIGINT range.
+    try expectCells(
+        allocator,
+        db,
+        "SELECT HEX(18446744073709551615), HEX(9223372036854775808), HEX(-9223372036854775808), HEX(18446744073709551616), HEX(-9223372036854775809), HEX(99999999999999999999)",
+        &.{ "FFFFFFFFFFFFFFFF", "8000000000000000", "8000000000000000", "7FFFFFFFFFFFFFFF", "8000000000000000", "7FFFFFFFFFFFFFFF" },
+    );
+    try expectCells(allocator, db, "SELECT HEX(CAST(18446744073709551615.5 AS DECIMAL(22,1))), HEX(X'0aff')", &.{ "7FFFFFFFFFFFFFFF", "0AFF" });
+    try expectCells(allocator, db, "SELECT HEX(id), HEX(high_priority), HEX(high_priority * -1), HEX(CAST(id AS DOUBLE) / 2), HEX(s) FROM t ORDER BY id", &.{
+        "1", "A",  "FFFFFFFFFFFFFFF6", "0", "6B697769",
+        "2", "14", "FFFFFFFFFFFFFFEC", "1", "70656172",
+        "3", "1E", "FFFFFFFFFFFFFFE2", "2", "4142",
+    });
+}
+
 test "mysql literals: hex, bit, national, introducers and adjacent strings" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

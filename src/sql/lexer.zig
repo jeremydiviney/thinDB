@@ -431,7 +431,7 @@ pub const Lexer = struct {
         return self.src[idx];
     }
 
-    fn skipWhitespaceAndComments(self: *Lexer) LexError!void {
+    pub fn skipWhitespaceAndComments(self: *Lexer) LexError!void {
         while (self.pos < self.src.len) {
             const ch = self.src[self.pos];
             if (std.ascii.isWhitespace(ch)) {

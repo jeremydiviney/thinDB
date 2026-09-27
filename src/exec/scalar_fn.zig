@@ -1414,6 +1414,7 @@ pub const builtins = [_]ScalarFn{
     // --- encoding ---
     .{ .name = "hex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.hexEncodeKernel },
     .{ .name = "hex", .arg_types = &.{.bigint}, .return_type = .string, .kernel = string.hexBigintKernel },
+    .{ .name = "hex", .arg_types = &.{.largeint}, .return_type = .string, .kernel = string.hexLargeintKernel },
     .{ .name = "hex", .arg_types = &.{.double}, .return_type = .string, .kernel = string.hexDoubleKernel },
     .{ .name = "unhex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.hexDecodeKernel },
     .{ .name = "to_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = string.base64EncodeKernel },

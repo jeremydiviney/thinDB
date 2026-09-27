@@ -2040,14 +2040,18 @@ fn appendExpandedProjectItem(
         return;
     }
 
-    _ = types.findColumn(schema, item) orelse return Error.ColumnNotFound;
+    const index = types.findColumn(schema, item) orelse return Error.ColumnNotFound;
     // Standard SQL result naming: a bare or qualified column reference
     // outputs its UNQUALIFIED name (`SELECT sub.id` and `SELECT id` over an
     // aliased source both yield a column named `id`), regardless of how the
-    // upstream schema spells it (AliasRename qualifies every column).
-    const bare = types.unqualifiedName(item);
+    // upstream schema spells it (AliasRename qualifies every column). When
+    // the reference only looks qualified, the column names it: `t.a + 1`
+    // reads column `t.a + 1` of `d` and keeps that name.
+    const item_bare = types.unqualifiedName(item);
+    const column_bare = types.unqualifiedName(schema[index].name);
+    const bare = if (types.columnNameEql(item_bare, column_bare) or types.columnNameEql(schema[index].name, item)) item_bare else column_bare;
     const output_name = output orelse bare;
-    const is_stripped = output == null and bare.ptr != item.ptr;
+    const is_stripped = output == null and !types.columnNameEql(bare, item);
     // Replace-on-collision: a derived/aliased item whose final name already
     // exists in the partial output overwrites that slot (`SELECT *, f(x) AS x`).
     if (replace_on_collision) {

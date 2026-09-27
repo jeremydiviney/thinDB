@@ -475,6 +475,20 @@ input counts as first under RIGHT JOIN. An exclude drops each column a name
 spells or resolves to, so hidden join keys staged below an aliased input leave
 `*` too.
 
+An unaliased computed SELECT item is shown under its dialect's name. MySQL and
+the neutral dialect use the item's SQL text as written, cut to 255 bytes. A lone
+literal or column, even in parentheses, is named by itself: a string by its
+value, a number by its spelling, NULL as `NULL`, a column by its bare name.
+PostgreSQL applies its `FigureColname` rules: `count`, `concat`, `case`, a
+cast's operand name, and `?column?` for everything else. The name is computed
+from the item's text, never from the lowered expression. The plan keeps its own
+internal name for the item, and the final projection renames the item. Derived
+tables, CTEs, views and `CREATE TABLE ... AS SELECT` expose the shown name. ORDER
+BY and GROUP BY can reach an item by a quoted shown name that isn't a plain
+identifier, such as `` `n+1` ``. A result's columns stay uniquely named, so a
+shown name that repeats an earlier one gets a `_N` suffix. MySQL and PostgreSQL
+would allow the duplicate.
+
 Before preparing a fused hash join, a pure filter over an existing materialized
 stage may check that stage for a surviving probe row. An empty probe skips the
 lookup builds through a chain of non-FULL joins. The check reuses stage buffers,

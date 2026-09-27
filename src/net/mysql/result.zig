@@ -86,7 +86,7 @@ pub fn appendColumnDef(
     // distinct inside the plan) is presented the way MySQL presents it:
     // `table` carries the qualifier and `name` the bare column, so clients
     // keying rows by name see `id` twice rather than `e.id` and `a.id`.
-    const split = types.splitQualifiedName(col.name);
+    const split = types.splitResultName(col.name);
     const table: []const u8 = if (split) |s| s.qualifier else table_name;
     const name: []const u8 = if (split) |s| s.bare else col.name;
     try packet.appendLenEncString(allocator, out, "def");
@@ -409,8 +409,8 @@ test "appendColumnDef presents a qualified result name as table + bare name" {
     try appendColumnDef(allocator, &out, "db", "", .{ .name = "e.id", .type = .bigint });
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01e\x01e\x02id\x02id") != null);
     out.clearRetainingCapacity();
-    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "s.mul(x, 1.5)", .type = .double });
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01s\x01s\x0bmul(x, 1.5)\x0bmul(x, 1.5)") != null);
+    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "t.price * t.qty", .type = .double });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x0ft.price * t.qty\x0ft.price * t.qty") != null);
     out.clearRetainingCapacity();
     try appendColumnDef(allocator, &out, "db", "t", .{ .name = "0.5", .type = .double });
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x030.5\x030.5") != null);

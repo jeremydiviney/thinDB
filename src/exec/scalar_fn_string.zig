@@ -709,6 +709,12 @@ pub fn hexBigintKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     for (args[0].data.bigint[0..row_count]) |v| try ss.appendValue(allocator, common.integerHex(&buf, v));
 }
 
+pub fn hexLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    var buf: [16]u8 = undefined;
+    for (args[0].data.largeint[0..row_count]) |v| try ss.appendValue(allocator, common.integerHex(&buf, common.wideIntegerAsBigint(v)));
+}
+
 pub fn hexDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const ss = stringStoreOf(out);
     var buf: [16]u8 = undefined;

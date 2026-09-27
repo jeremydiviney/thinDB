@@ -531,11 +531,17 @@ pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: T
 
 /// HEX(decimal): the value read as an integer (`integerArgAt`), printed
 /// as `common.integerHex` prints one.
+///
+/// An integer literal past BIGINT is a DECIMAL of scale 0 here, but MySQL
+/// reads one up to 2^64 - 1 as BIGINT UNSIGNED, so a scale-0 value in that
+/// range keeps its bits (`HEX(18446744073709551615)` is FFFFFFFFFFFFFFFF).
 pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     _ = out_type;
+    const t = arg_types[0];
     var buf: [16]u8 = undefined;
     for (0..n) |row| {
-        try common.stringStoreOf(out).appendValue(allocator, common.integerHex(&buf, integerArgAt(args[0], arg_types[0], row)));
+        const v = if (scaleOf(t) == 0) common.wideIntegerAsBigint(mantissaAt(args[0], row)) else integerArgAt(args[0], t, row);
+        try common.stringStoreOf(out).appendValue(allocator, common.integerHex(&buf, v));
     }
 }
 

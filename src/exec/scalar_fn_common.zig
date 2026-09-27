@@ -358,6 +358,16 @@ pub fn integerHex(buf: *[16]u8, v: i64) []const u8 {
     return std.fmt.bufPrint(buf, "{X}", .{@as(u64, @bitCast(v))}) catch unreachable;
 }
 
+/// A wide integer where MySQL's HEX reads a BIGINT: a value from 2^63 to
+/// 2^64 - 1 keeps its low 64 bits, as MySQL types an integer literal that
+/// large BIGINT UNSIGNED; any other value past BIGINT is clamped to it.
+pub fn wideIntegerAsBigint(v: i128) i64 {
+    if (v > std.math.maxInt(i64)) {
+        if (std.math.cast(u64, v)) |u| return @bitCast(u);
+    }
+    return std.math.cast(i64, v) orelse if (v < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+}
+
 /// Text as an integer, the way StarRocks casts it to one: surrounding
 /// spaces ignored, an optional sign, then digits only. A fraction, an
 /// exponent or a value past i128 is not an integer.

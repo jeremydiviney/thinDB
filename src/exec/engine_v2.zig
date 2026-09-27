@@ -849,8 +849,12 @@ const GlobalAggregatePlan = struct {
     /// (`SELECT SUM(a) / COUNT(*)` hoists to hidden aggs + this layer).
     post_derived: []const ir.Derived = &.{},
     /// SELECT-list columns when a post layer exists (drops hidden
-    /// `__agg_expr_*` outputs); null = emit the aggregate output as-is.
+    /// `__agg_expr_*` outputs) or the list renames a column; null = emit
+    /// the aggregate output as-is.
     output_names: ?[]const []const u8 = null,
+    /// The SELECT list's client names for `output_names`, as captured from
+    /// its Project.
+    output_renames: ?[]const ?[]const u8 = null,
 };
 
 fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
@@ -881,9 +885,14 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
     const group_by = op.group_by;
     if (group_by.group_cols.len != 0) return null;
     var output_names: ?[]const []const u8 = null;
+    var output_renames: ?[]const ?[]const u8 = null;
     if (top_project) |p| {
         if (post_derived.len == 0) {
             if (!projectMatchesGroupOutput(p, group_by)) return null;
+            if (p.outputs != null) {
+                output_names = p.columns;
+                output_renames = p.outputs;
+            }
         } else {
             // Every projected column must be an aggregate output or a
             // post-computed name; the project then drops the hidden aggs.
@@ -903,8 +912,8 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
                 };
                 if (!found) return null;
             }
-            if (p.outputs != null) return null;
             output_names = p.columns;
+            output_renames = p.outputs;
         }
     }
 
@@ -939,18 +948,16 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
         .derived = derived,
         .post_derived = post_derived,
         .output_names = output_names,
+        .output_renames = output_renames,
     };
 }
 
 fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchGlobalAggregate(root) orelse return null;
     var base = (try buildGlobalAggregateBase(input, plan)) orelse return null;
-    if (plan.post_derived.len > 0) {
-        errdefer base.deinit();
-        base = try base.computeWithRegistry(plan.post_derived, input.udf_registry);
-        if (plan.output_names) |names| base = try base.project(names);
-    }
-    return base;
+    errdefer base.deinit();
+    if (plan.post_derived.len > 0) base = try base.computeWithRegistry(plan.post_derived, input.udf_registry);
+    return try applyOutputProjection(input.allocator, base, plan.output_names, plan.output_renames);
 }
 
 fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?exec.Query {
@@ -1146,14 +1153,6 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         switch (op.*) {
             .select => |p| {
                 if (project_columns != null) return null;
-                // Plain column aliases ride along (projectNamed); star items
-                // can't mix with aliases on this path — their expansion lives
-                // in the net-layer projection compiler.
-                if (p.outputs != null) {
-                    for (p.columns) |c| {
-                        if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) return null;
-                    }
-                }
                 project_columns = p.columns;
                 project_outputs = p.outputs;
                 project_replace = p.replace_on_collision;
@@ -1437,6 +1436,8 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
             // single-source block, so expansion uses the bare names.
             var names: std.ArrayListUnmanaged([]const u8) = .empty;
             defer names.deinit(allocator);
+            var outputs: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer outputs.deinit(allocator);
             for (cols, 0..) |c, ci| {
                 if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) {
                     expand: for (q.outputSchema()) |col| {
@@ -1454,25 +1455,35 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
                             }
                         }
                         try names.append(allocator, col.name);
+                        try outputs.append(allocator, col.name);
                     }
                 } else {
-                    // matchScanSelect declines star lists with output
-                    // aliases, so non-star items here carry no rename. A
-                    // replacement item whose name the star already emitted
-                    // in place is redundant — drop it.
-                    if (planItemReplaces(plan, ci) and nameAppended(names.items, c)) continue;
+                    // A replacement item takes over the slot the star gave
+                    // its name, as `SELECT *, qty AS id` puts qty in id's
+                    // place; when a Compute already merged it there, the
+                    // slot reads it as is.
+                    const target = if (plan.project_outputs) |outs| (outs[ci] orelse c) else c;
+                    if (planItemReplaces(plan, ci)) {
+                        if (appendedIndex(outputs.items, target)) |slot| {
+                            names.items[slot] = c;
+                            outputs.items[slot] = target;
+                            continue;
+                        }
+                    }
                     try names.append(allocator, c);
+                    try outputs.append(allocator, target);
                 }
             }
             // A star repeating another item's column (`SELECT *, c`).
-            const outputs = try allocator.dupe([]const u8, names.items);
-            defer allocator.free(outputs);
-            const renamed = try types.dedupeColumnNames(allocator, outputs);
+            const renamed = try types.dedupeColumnNames(allocator, outputs.items);
             defer {
                 for (renamed) |r| allocator.free(r);
                 allocator.free(renamed);
             }
-            q = if (renamed.len == 0) try q.project(names.items) else try q.projectNamed(names.items, outputs);
+            const renames_any = renamed.len > 0 or for (names.items, outputs.items) |name, out| {
+                if (!std.mem.eql(u8, name, out)) break true;
+            } else false;
+            q = if (renames_any) try q.projectNamed(names.items, outputs.items) else try q.project(names.items);
         } else if (plan.project_outputs) |outs| {
             const names = try allocator.alloc([]const u8, cols.len);
             defer allocator.free(names);
@@ -1509,9 +1520,9 @@ fn planReplacesName(plan: ScanSelectPlan, name: []const u8) bool {
     return false;
 }
 
-fn nameAppended(names: []const []const u8, name: []const u8) bool {
-    for (names) |n| if (types.columnNameEql(n, name)) return true;
-    return false;
+fn appendedIndex(names: []const []const u8, name: []const u8) ?usize {
+    for (names, 0..) |n, i| if (types.columnNameEql(n, name)) return i;
+    return null;
 }
 
 fn projectedBaseColumns(
