@@ -189,6 +189,26 @@ fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
     return .text;
 }
 
+/// The wall-clock functions that take MySQL's optional fractional-seconds
+/// precision: `NOW(3)`, `CURRENT_TIMESTAMP(6)`.
+fn fspTemporalFn(name: []const u8) bool {
+    inline for (.{ "now", "current_timestamp", "localtimestamp", "localtime", "utc_timestamp", "sysdate", "current_time", "curtime", "utc_time" }) |n| {
+        if (std.ascii.eqlIgnoreCase(name, n)) return true;
+    }
+    return false;
+}
+
+fn literalInteger(e: ir.Expr) ?i64 {
+    if (e != .lit) return null;
+    return switch (e.lit) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        else => null,
+    };
+}
+
 /// SQL-standard bare (no-paren) temporal functions. They lex as plain
 /// identifiers; the parser rewrites them to the nullary call form so the
 /// now()/current_date compile-time substitution resolves them to real
@@ -223,7 +243,8 @@ fn unitFirstArgCall(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "timestampadd");
 }
 
-/// An interval unit is a whole number of days or months.
+/// An interval unit is a whole number of days, months, seconds or
+/// microseconds.
 const IntervalUnit = struct { fn_name: []const u8, factor: i32 };
 
 /// Decimal digits (`-2.5`, `.5`) rounded half away from zero.
@@ -260,6 +281,10 @@ fn intervalUnit(word: []const u8) ?IntervalUnit {
         .{ "month", .{ .fn_name = "date_add_months", .factor = 1 } },
         .{ "quarter", .{ .fn_name = "date_add_months", .factor = 3 } },
         .{ "year", .{ .fn_name = "date_add_years", .factor = 1 } },
+        .{ "hour", .{ .fn_name = "date_add_seconds", .factor = 3600 } },
+        .{ "minute", .{ .fn_name = "date_add_seconds", .factor = 60 } },
+        .{ "second", .{ .fn_name = "date_add_seconds", .factor = 1 } },
+        .{ "microsecond", .{ .fn_name = "date_add_micros", .factor = 1 } },
     };
     const singular = if (word.len > 1 and (word[word.len - 1] == 's' or word[word.len - 1] == 'S')) word[0 .. word.len - 1] else word;
     for (units) |u| if (std.ascii.eqlIgnoreCase(singular, u[0])) return u[1];
@@ -1782,9 +1807,8 @@ pub const Parser = struct {
         // Bare CURRENT_TIMESTAMP / CURRENT_DATE (no parens) — nullary
         // temporal functions, not column refs.
         if (self.cur.tag != .dot) {
-            if (bareTemporalFn(first)) |fn_name| {
-                var e = ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = &.{} } };
-                e = try self.continueBinaryFrom(e);
+            if (try self.bareTemporalCall(first)) |call| {
+                const e = try self.continueBinaryFrom(call);
                 const default_name = try self.exprDefaultName(e);
                 const alias = try self.maybeAlias(default_name);
                 return ProjItem{ .name = alias, .kind = .{ .expr = e } };
@@ -1826,6 +1850,13 @@ pub const Parser = struct {
     /// open a call.
     pub fn keywordCallAhead(self: *const Parser) bool {
         return keywordScalarName(self.cur.tag) != null;
+    }
+
+    /// A bare CURRENT_TIMESTAMP / CURRENT_DATE (no parentheses) as the
+    /// nullary call it is; null for any other name.
+    pub fn bareTemporalCall(self: *Parser, name: []const u8) ParseError!?ir.Expr {
+        const fn_name = bareTemporalFn(name) orelse return null;
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = &.{} } };
     }
 
     pub fn scalarCallHasOwnSyntax(_: *const Parser, name: []const u8) bool {
@@ -1992,19 +2023,33 @@ pub const Parser = struct {
             .not => |child| child.* == .exists_subquery,
             else => false,
         };
+        if (never_unknown) return try self.knownPredicateValue(pred);
         const true_lit: ir.Expr = .{ .lit = .{ .boolean = true } };
         const false_lit: ir.Expr = .{ .lit = .{ .boolean = false } };
-        if (never_unknown) {
-            const branches = try self.arena.alloc(ir.Expr.Branch, 1);
-            branches[0] = .{ .cond = pred, .then = true_lit };
-            const else_branch = try self.arena.create(ir.Expr);
-            else_branch.* = false_lit;
-            return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
-        }
         const branches = try self.arena.alloc(ir.Expr.Branch, 2);
         branches[0] = .{ .cond = pred, .then = true_lit };
         branches[1] = .{ .cond = try parse_predicate.negatePredicate(self, pred), .then = false_lit };
         return ir.Expr{ .case = .{ .branches = branches, .else_branch = null } };
+    }
+
+    /// A predicate that is never unknown, read as TRUE or FALSE.
+    fn knownPredicateValue(self: *Parser, pred: PredicateExpr) ParseError!ir.Expr {
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        branches[0] = .{ .cond = pred, .then = .{ .lit = .{ .boolean = true } } };
+        const else_branch = try self.arena.create(ir.Expr);
+        else_branch.* = .{ .lit = .{ .boolean = false } };
+        return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch } };
+    }
+
+    /// MySQL's `ISNULL(x)`: `x IS NULL` as a value.
+    fn isNullValue(self: *Parser, arg: ir.Expr) ParseError!ir.Expr {
+        const pred: PredicateExpr = switch (arg) {
+            .null_lit => .{ .always = true },
+            .lit => .{ .always = false },
+            .col_ref => |c| .{ .is_null = c },
+            else => .{ .is_null = try self.materializePredicateExpr(arg) },
+        };
+        return try self.knownPredicateValue(pred);
     }
 
     fn normalizeScalarCallArgs(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError![]const ir.Expr {
@@ -2022,6 +2067,30 @@ pub const Parser = struct {
 
     pub fn makeScalarCallExpr(self: *Parser, typed_name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
         const name = scalar_fn.canonicalName(typed_name);
+        if (args.len == 1 and fspTemporalFn(name)) {
+            // Timestamps carry microseconds whatever precision is asked
+            // for, as DATETIME(fsp) columns do.
+            const fsp = literalInteger(args[0]) orelse return ParseError.SqlExpectedValue;
+            if (fsp < 0 or fsp > 6) return ParseError.SqlExpectedValue;
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, name), .args = &.{} } };
+        }
+        if (std.ascii.eqlIgnoreCase(name, "isnull") and args.len == 1) return try self.isNullValue(args[0]);
+        if (std.ascii.eqlIgnoreCase(name, "timestampadd") and args.len == 3) {
+            // `TIMESTAMPADD(unit, n, x)` is `x + INTERVAL n unit`, so a
+            // DATE moved by hours becomes a DATETIME, as in MySQL.
+            const unit_word: ?[]const u8 = switch (args[0]) {
+                .col_ref => |c| c,
+                .lit => |v| if (v == .text) v.text else null,
+                else => null,
+            };
+            if (unit_word) |word| if (intervalUnit(word)) |unit| return try self.unitAddCall(unit, args[2], args[1]);
+        }
+        if (std.ascii.eqlIgnoreCase(name, "log") and args.len == 1) {
+            // One-argument LOG is the natural log in MySQL and base 10 in
+            // PostgreSQL and DuckDB.
+            const log_fn = if (self.lex.dialect == .mysql) "ln" else "log10";
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, log_fn), .args = try self.arena.dupe(ir.Expr, args) } };
+        }
         if (std.ascii.eqlIgnoreCase(name, "months_diff")) {
             if (args.len != 2) return ParseError.SqlInvalidProjection;
             const normalized = try self.arena.alloc(ir.Expr, 3);
@@ -2108,6 +2177,10 @@ pub const Parser = struct {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const unit = intervalUnit(self.cur.text) orelse return ParseError.SqlExpectedKeyword;
         try self.advance();
+        return try self.unitAddCall(unit, base, amount);
+    }
+
+    fn unitAddCall(self: *Parser, unit: IntervalUnit, base: ir.Expr, amount: ir.Expr) ParseError!ir.Expr {
         const scaled = if (unit.factor == 1)
             amount
         else
@@ -2893,8 +2966,7 @@ pub const Parser = struct {
                 }
                 // Bare CURRENT_TIMESTAMP / CURRENT_DATE → nullary call.
                 if (self.cur.tag != .dot) {
-                    if (bareTemporalFn(name)) |fn_name|
-                        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = &.{} } };
+                    if (try self.bareTemporalCall(name)) |call| return call;
                 }
                 const col_dup = try self.dupQualifiedColRef(name);
                 return ir.Expr{ .col_ref = col_dup };

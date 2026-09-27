@@ -220,65 +220,32 @@ pub const log2Kernel = finiteOrNull(struct {
     }
 }.f);
 
-pub fn greatestIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.int;
-    const b = args[1].data.int;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @max(a[i], b[i]));
-}
-
-pub fn greatestBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.bigint;
-    const b = args[1].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @max(a[i], b[i]));
-}
-
-pub fn greatestDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @max(a[i], b[i]));
-}
-
-/// GREATEST/LEAST over a column representation both arguments and the
-/// output share (`field` names it in the column data union).
+/// GREATEST/LEAST over any number of arguments in a column representation
+/// they and the output share (`field` names it in the column data union),
+/// folded one argument column at a time.
 fn Extremum(comptime field: []const u8, comptime take_max: bool) type {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-            const a = @field(args[0].data, field);
-            const b = @field(args[1].data, field);
             const dst = &@field(out.data, field);
-            for (a[0..row_count], b[0..row_count]) |x, y| try dst.append(allocator, if (take_max) @max(x, y) else @min(x, y));
+            try dst.appendSlice(allocator, @field(args[0].data, field)[0..row_count]);
+            const best = dst.items[dst.items.len - row_count ..];
+            for (args[1..]) |arg| {
+                for (best, @field(arg.data, field)[0..row_count]) |*b, x| b.* = if (take_max) @max(b.*, x) else @min(b.*, x);
+            }
         }
     };
 }
 
+pub const greatestIntKernel = Extremum("int", true).kernel;
+pub const greatestBigintKernel = Extremum("bigint", true).kernel;
+pub const greatestDoubleKernel = Extremum("double", true).kernel;
 pub const greatestDateKernel = Extremum("date", true).kernel;
 pub const greatestDatetimeKernel = Extremum("datetime", true).kernel;
+pub const leastIntKernel = Extremum("int", false).kernel;
+pub const leastBigintKernel = Extremum("bigint", false).kernel;
+pub const leastDoubleKernel = Extremum("double", false).kernel;
 pub const leastDateKernel = Extremum("date", false).kernel;
 pub const leastDatetimeKernel = Extremum("datetime", false).kernel;
-
-pub fn leastIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.int;
-    const b = args[1].data.int;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @min(a[i], b[i]));
-}
-
-pub fn leastBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.bigint;
-    const b = args[1].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @min(a[i], b[i]));
-}
-
-pub fn leastDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.double;
-    const b = args[1].data.double;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.double.append(allocator, @min(a[i], b[i]));
-}
 
 // ---------------------------------------------------------------------------
 // Expanded math parity: trig, log(base,x), nullary constants/random, round

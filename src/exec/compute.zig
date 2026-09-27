@@ -2278,11 +2278,11 @@ fn coerceTemporalStringLiterals(
     arg_types: []Type,
 ) !bool {
     for (scalar_fn.overloadsOf(fn_name)) |f| {
-        if (f.variadic_min_args != null or f.arg_types.len != arg_types.len) continue;
+        if (!scalar_fn.scalarArityMatches(f, arg_types.len)) continue;
         var feasible = true;
         var any_coerce = false;
         for (arg_types, 0..) |given, i| {
-            const declared = f.arg_types[i];
+            const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
             if (foldStringTag(@as(types.TypeTag, declared)) == foldStringTag(@as(types.TypeTag, given))) continue;
             if (cast.castCost(@as(types.TypeTag, given), @as(types.TypeTag, declared)) != null) continue;
             // The only otherwise-unreachable mismatch we repair: a string
@@ -2298,7 +2298,7 @@ fn coerceTemporalStringLiterals(
         if (!feasible or !any_coerce) continue;
 
         for (arg_types, 0..) |*at, i| {
-            const declared = f.arg_types[i];
+            const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
             if (declared != .date and declared != .datetime) continue;
             const new_val = litTemporalValue(arg_plans[i], declared) orelse continue;
             const slot = arg_plans[i].lit;
