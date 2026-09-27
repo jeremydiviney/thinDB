@@ -21,6 +21,7 @@ pub const TokenTag = lexer.TokenTag;
 pub const Lexer = lexer.Lexer;
 pub const LexError = lexer.LexError;
 pub const isMultiStatement = lexer.isMultiStatement;
+pub const splitStatements = lexer.splitStatements;
 
 pub const parse = parser.parse;
 pub const parseDialect = parser.parseDialect;

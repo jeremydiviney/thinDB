@@ -185,7 +185,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .kw_exists) {
         try p.advance();
         try p.expect(.lparen);
-        if (p.cur.tag != .kw_select and p.cur.tag != .kw_with) return PE.SqlExpectedSelect;
+        if (!p.startsQuery(p.cur.tag)) return PE.SqlExpectedSelect;
         const source = try p.parseStatement();
         try p.expect(.rparen);
         return .{ .exists_subquery = @ptrCast(source) };
@@ -604,7 +604,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .kw_in) {
         try p.advance();
         try p.expect(.lparen);
-        if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+        if (p.startsQuery(p.cur.tag)) {
             const source = try p.parseStatement();
             try p.expect(.rparen);
             return .{ .in_subquery = .{
@@ -695,7 +695,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     // rewrites this predicate node into a `.leaf` literal.
     if (p.cur.tag == .lparen) {
         try p.advance();
-        if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+        if (p.startsQuery(p.cur.tag)) {
             const source = try p.parseStatement();
             try p.expect(.rparen);
             // `col > (SELECT ...) - 1`: the subquery is one operand of a
@@ -845,7 +845,7 @@ fn rowValueAhead(p: anytype) @TypeOf(p.*).Err!bool {
     var depth: usize = 1;
     var saw_comma = false;
     const first = try look.next();
-    if (first.tag == .kw_select or first.tag == .kw_with) return false;
+    if (p.startsQuery(first.tag)) return false;
     var tok = first;
     while (true) : (tok = try look.next()) {
         switch (tok.tag) {
@@ -899,7 +899,7 @@ fn parseRowValuePredicate(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag != .kw_in) return PE.SqlExpectedKeyword;
     try p.advance();
     try p.expect(.lparen);
-    if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+    if (p.startsQuery(p.cur.tag)) {
         const source = try p.parseStatement();
         try p.expect(.rparen);
         const cols = try p.arena.alloc([]const u8, lhs.len);
@@ -931,7 +931,7 @@ fn parseRowValuePredicate(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
 fn parseRowValue(p: anytype) @TypeOf(p.*).Err![]ir.Expr {
     const PE = @TypeOf(p.*).Err;
     try p.expect(.lparen);
-    if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) return PE.SqlExpectedValue;
+    if (p.startsQuery(p.cur.tag)) return PE.SqlExpectedValue;
     var elements: std.ArrayList(ir.Expr) = .empty;
     while (true) {
         try elements.append(p.arena, try p.parseScalar());
@@ -996,7 +996,7 @@ fn elementComparison(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_oper
 fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     var look = p.lex.*;
     const first = try look.next();
-    const lhs = if (first.tag == .kw_select or first.tag == .kw_with)
+    const lhs = if (p.startsQuery(first.tag))
         try p.parseScalar()
     else blk: {
         try p.expect(.lparen);

@@ -1008,22 +1008,32 @@ fn keywordFor(s: []const u8) ?TokenTag {
 /// quoted names and comments with another token after it. Text that fails
 /// to lex counts as one statement, left for the parser to reject.
 pub fn isMultiStatement(arena: Allocator, src: []const u8, dialect: types.Dialect) Allocator.Error!bool {
+    return (try splitStatements(arena, src, dialect)).len > 1;
+}
+
+/// The statements of `src`, split at each `;` outside strings, quoted
+/// names and comments, empty ones dropped. Text that fails to lex is one
+/// statement, left for the parser to reject.
+pub fn splitStatements(arena: Allocator, src: []const u8, dialect: types.Dialect) Allocator.Error![]const []const u8 {
     var lex = Lexer.init(arena, src);
     lex.dialect = dialect;
-    var statement_seen = false;
-    var separated = false;
+    var statements: std.ArrayList([]const u8) = .empty;
+    var start: usize = 0;
+    var has_token = false;
     while (true) {
         const tok = lex.next() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return false,
+            else => return try arena.dupe([]const u8, &.{src}),
         };
         switch (tok.tag) {
-            .eof => return false,
-            .semicolon => separated = statement_seen,
-            else => {
-                if (separated) return true;
-                statement_seen = true;
+            .eof, .semicolon => {
+                const end = if (tok.tag == .eof) src.len else lex.pos - 1;
+                if (has_token) try statements.append(arena, std.mem.trim(u8, src[start..end], &std.ascii.whitespace));
+                if (tok.tag == .eof) return statements.items;
+                start = lex.pos;
+                has_token = false;
             },
+            else => has_token = true,
         }
     }
 }
@@ -1487,6 +1497,22 @@ test "lexer: isMultiStatement counts statements, not semicolons" {
     };
     inline for (cases) |c| {
         try std.testing.expectEqual(c[1], try isMultiStatement(arena.allocator(), c[0], .mysql));
+    }
+}
+
+test "lexer: splitStatements cuts at semicolons outside quotes and comments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "SELECT 1", &[_][]const u8{"SELECT 1"} },
+        .{ " SET a = 1 ;; SELECT ';' ; ", &[_][]const u8{ "SET a = 1", "SELECT ';'" } },
+        .{ "SELECT $$a;b$$; /* ; */ SELECT 2 -- ;", &[_][]const u8{ "SELECT $$a;b$$", "/* ; */ SELECT 2 -- ;" } },
+        .{ "SELECT 'open; SELECT 2", &[_][]const u8{"SELECT 'open; SELECT 2"} },
+    };
+    inline for (cases) |c| {
+        const got = try splitStatements(arena.allocator(), c[0], .postgres);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, have| try std.testing.expectEqualStrings(want, have);
     }
 }
 
