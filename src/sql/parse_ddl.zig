@@ -74,6 +74,9 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                 return try parseCreateViewBody(p, or_replace, false);
             }
             if (or_replace) return PE.SqlExpectedKeyword;
+            if (isBareWord(p, "index") or isBareWord(p, "unique") or isBareWord(p, "fulltext") or isBareWord(p, "spatial")) {
+                return try parseCreateIndex(p);
+            }
             var is_temp = false;
             if (p.cur.tag == .kw_temp or p.cur.tag == .kw_temporary) {
                 is_temp = true;
@@ -93,6 +96,15 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                 const ns: ir.DropNamespace = .{ .name = try p.dupedIdentLower(), .if_exists = if_exists };
                 const d: ir.DdlOp = if (is_database) .{ .drop_database = ns } else .{ .drop_schema = ns };
                 return try p.allocOp(.{ .ddl = d });
+            }
+            // `DROP INDEX name ON t`: indexes are never kept (parseCreateIndex).
+            if (isBareWord(p, "index")) {
+                try p.advance();
+                _ = try p.dupedIdent();
+                try p.expect(.kw_on);
+                const table = try p.parseTableRef();
+                try skipToStatementEnd(p);
+                return try tableCheckOp(p, table);
             }
             if (isIdentText(p, "function")) {
                 try p.advance();
@@ -170,7 +182,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             const table = try p.parseTableRef();
             var actions: std.ArrayList(ir.AlterAction) = .empty;
             while (true) {
-                try actions.append(p.arena, try parseAlterAction(p));
+                if (try parseAlterAction(p)) |action| try actions.append(p.arena, action);
                 if (p.cur.tag != .comma) break;
                 try p.advance();
             }
@@ -191,11 +203,19 @@ pub fn parseDdl(p: anytype) !*ir.Op {
 /// One `ALTER TABLE` action, in MySQL's spellings:
 ///   ADD [COLUMN] def | DROP [COLUMN] name | RENAME COLUMN a TO b
 ///   | CHANGE [COLUMN] old def | MODIFY [COLUMN] def | RENAME [TO | AS] t2
-fn parseAlterAction(p: anytype) !ir.AlterAction {
+/// Null for an action that changes nothing thinDB keeps: an index or
+/// constraint added, dropped or renamed (see parseTableConstraint), a table
+/// option, `ENABLE` / `DISABLE KEYS`, `FORCE`.
+fn parseAlterAction(p: anytype) !?ir.AlterAction {
     const PE = @TypeOf(p.*).Err;
+    if (try skipTableOption(p)) return null;
     switch (p.cur.tag) {
         .kw_add => {
             try p.advance();
+            if (try parseTableConstraint(p)) |c| return switch (c) {
+                .primary_key => PE.SqlInvalidProjection,
+                .ignored => null,
+            };
             if (p.cur.tag == .kw_column) try p.advance();
             const col = try parseColumnDef(p);
             if (col.is_pk or col.def.auto_increment) return PE.SqlInvalidProjection;
@@ -204,11 +224,30 @@ fn parseAlterAction(p: anytype) !ir.AlterAction {
         },
         .kw_drop => {
             try p.advance();
+            if (isBareWord(p, "foreign")) {
+                try p.advance();
+                try p.expect(.kw_key);
+                _ = try p.dupedIdent();
+                return null;
+            }
+            if (p.cur.tag == .kw_key or isBareWord(p, "index") or isBareWord(p, "check") or isBareWord(p, "constraint")) {
+                try p.advance();
+                _ = try p.dupedIdent();
+                return null;
+            }
+            if (p.cur.tag == .kw_primary) return PE.SqlInvalidProjection;
             if (p.cur.tag == .kw_column) try p.advance();
             return .{ .drop_column = try p.dupedIdent() };
         },
         .kw_rename => {
             try p.advance();
+            if (p.cur.tag == .kw_key or isBareWord(p, "index")) {
+                try p.advance();
+                _ = try p.dupedIdent();
+                try p.expect(.kw_to);
+                _ = try p.dupedIdent();
+                return null;
+            }
             if (p.cur.tag == .kw_column) {
                 try p.advance();
                 const from = try p.dupedIdent();
@@ -218,7 +257,27 @@ fn parseAlterAction(p: anytype) !ir.AlterAction {
             if (p.cur.tag == .kw_to or p.cur.tag == .kw_as) try p.advance();
             return .{ .rename_table = try p.parseTableRef() };
         },
+        // `ALTER INDEX name VISIBLE | INVISIBLE`.
+        .kw_alter => {
+            try p.advance();
+            if (!isBareWord(p, "index")) return PE.SqlExpectedKeyword;
+            try p.advance();
+            _ = try p.dupedIdent();
+            if (!isBareWord(p, "visible") and !isBareWord(p, "invisible")) return PE.SqlExpectedKeyword;
+            try p.advance();
+            return null;
+        },
         else => {},
+    }
+    if (isBareWord(p, "enable") or isBareWord(p, "disable")) {
+        try p.advance();
+        if (!isBareWord(p, "keys")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        return null;
+    }
+    if (isBareWord(p, "force")) {
+        try p.advance();
+        return null;
     }
     const change = isIdentText(p, "change");
     if (!change and !isIdentText(p, "modify")) return PE.SqlExpectedKeyword;
@@ -238,6 +297,230 @@ fn rejectColumnPosition(p: anytype) !void {
 
 fn isIdentText(p: anytype, comptime text: []const u8) bool {
     return p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, text);
+}
+
+/// The unquoted word `text`. MySQL reserves the clause words (`INDEX`,
+/// `UNIQUE`, `CHECK`, ...), so only a quoted one can name a column.
+fn isBareWord(p: anytype, comptime text: []const u8) bool {
+    return isIdentText(p, text) and !p.cur.quoted;
+}
+
+fn isIndexHead(p: anytype) bool {
+    return p.cur.tag == .kw_key or isBareWord(p, "index") or isBareWord(p, "fulltext") or isBareWord(p, "spatial");
+}
+
+fn isConstraintHead(p: anytype) bool {
+    return isBareWord(p, "unique") or isBareWord(p, "foreign") or isBareWord(p, "check");
+}
+
+const TableConstraint = union(enum) {
+    /// `[CONSTRAINT name] PRIMARY KEY (cols)`.
+    primary_key: []const []const u8,
+    /// An index or an unenforced constraint: accepted, not kept.
+    ignored,
+};
+
+/// A table-level index or constraint in a CREATE TABLE column list or after
+/// ALTER TABLE ADD; null when the item at the cursor is a column.
+///
+/// Secondary indexes are advisory to a columnar scan, so `KEY` / `INDEX` /
+/// `FULLTEXT` / `SPATIAL` are accepted and dropped. `UNIQUE`, `FOREIGN KEY`
+/// and `CHECK` are accepted as informational and not enforced, as analytics
+/// warehouses (Snowflake, Redshift, BigQuery) do: they hold in the OLTP
+/// database the data is loaded from. Only PRIMARY KEY is kept.
+fn parseTableConstraint(p: anytype) !?TableConstraint {
+    const PE = @TypeOf(p.*).Err;
+    if (isBareWord(p, "constraint")) {
+        try p.advance();
+        if (p.cur.tag == .identifier and !isConstraintHead(p)) try p.advance();
+        if (p.cur.tag == .kw_primary) return .{ .primary_key = try parsePrimaryKeyClause(p) };
+        if (!isConstraintHead(p)) return PE.SqlExpectedKeyword;
+    } else if (p.cur.tag == .kw_primary) {
+        return .{ .primary_key = try parsePrimaryKeyClause(p) };
+    } else if (!isConstraintHead(p) and !isIndexHead(p)) return null;
+    try p.advance();
+    try skipToItemEnd(p);
+    return .ignored;
+}
+
+/// `PRIMARY KEY [USING type] (cols) [index options]`.
+fn parsePrimaryKeyClause(p: anytype) ![]const []const u8 {
+    try p.advance();
+    try p.expect(.kw_key);
+    if (isBareWord(p, "using")) {
+        try p.advance();
+        try p.advance();
+    }
+    try p.expect(.lparen);
+    const cols = try p.parseIdentList();
+    try p.expect(.rparen);
+    try skipToItemEnd(p);
+    return cols;
+}
+
+/// Consumes the rest of the current comma-separated item, up to the next
+/// `,` or `)` outside parentheses (not consumed) or the statement's end.
+fn skipToItemEnd(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    var depth: usize = 0;
+    while (true) {
+        switch (p.cur.tag) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) return,
+            .eof, .semicolon => return if (depth == 0) {} else PE.SqlExpectedToken,
+            else => {},
+        }
+        try p.advance();
+    }
+}
+
+fn skipToStatementEnd(p: anytype) !void {
+    while (p.cur.tag != .eof and p.cur.tag != .semicolon) try p.advance();
+}
+
+/// A parenthesized group, parentheses included.
+fn skipParenGroup(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    try p.expect(.lparen);
+    var depth: usize = 1;
+    while (depth > 0) {
+        switch (p.cur.tag) {
+            .lparen => depth += 1,
+            .rparen => depth -= 1,
+            .eof, .semicolon => return PE.SqlExpectedToken,
+            else => {},
+        }
+        try p.advance();
+    }
+}
+
+/// A column-level `[CONSTRAINT name] CHECK (expr) [[NOT] ENFORCED]` or
+/// `REFERENCES t [(cols)] [MATCH m] [ON DELETE | ON UPDATE action]...`:
+/// informational, like the table-level forms (parseTableConstraint).
+fn skipColumnConstraint(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    if (isBareWord(p, "constraint")) {
+        try p.advance();
+        if (p.cur.tag == .identifier and !isBareWord(p, "check")) try p.advance();
+        if (!isBareWord(p, "check")) return PE.SqlExpectedKeyword;
+    }
+    if (isBareWord(p, "check")) {
+        try p.advance();
+        try skipParenGroup(p);
+        if (isBareWord(p, "enforced")) {
+            try p.advance();
+        } else if (p.cur.tag == .kw_not) {
+            var look = p.lex.*;
+            const next = try look.next();
+            if (next.tag == .identifier and std.ascii.eqlIgnoreCase(next.text, "enforced")) {
+                try p.advance();
+                try p.advance();
+            }
+        }
+        return;
+    }
+    try p.advance(); // REFERENCES
+    _ = try p.parseTableRef();
+    if (p.cur.tag == .lparen) try skipParenGroup(p);
+    if (isBareWord(p, "match")) {
+        try p.advance();
+        try p.advance();
+    }
+    while (p.cur.tag == .kw_on) {
+        try p.advance();
+        if (p.cur.tag != .kw_delete and p.cur.tag != .kw_update) return PE.SqlExpectedKeyword;
+        try p.advance();
+        if (isBareWord(p, "restrict") or isBareWord(p, "cascade")) {
+            try p.advance();
+        } else if (p.cur.tag == .kw_set) {
+            try p.advance();
+            if (p.cur.tag != .kw_null and p.cur.tag != .kw_default) return PE.SqlExpectedKeyword;
+            try p.advance();
+        } else if (isBareWord(p, "no")) {
+            try p.advance();
+            if (!isBareWord(p, "action")) return PE.SqlExpectedKeyword;
+            try p.advance();
+        } else return PE.SqlExpectedKeyword;
+    }
+}
+
+/// A MySQL table option as an ALTER TABLE action: storage engine, character
+/// set, comment, row format, and the online-DDL `ALGORITHM` / `LOCK`
+/// clauses. None has a single-node columnar meaning; each is accepted and
+/// dropped. `AUTO_INCREMENT = n` is dropped too: new ids continue past the
+/// table's largest, so they stay unique.
+fn skipTableOption(p: anytype) !bool {
+    const PE = @TypeOf(p.*).Err;
+    if (isBareWord(p, "convert")) {
+        // CONVERT TO CHARACTER SET name [COLLATE name]
+        try p.advance();
+        try p.expect(.kw_to);
+        if (!isBareWord(p, "character")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        try p.expect(.kw_set);
+        try p.advance();
+        if (isBareWord(p, "collate")) {
+            try p.advance();
+            try p.advance();
+        }
+        return true;
+    }
+    const had_default = p.cur.tag == .kw_default;
+    if (had_default) try p.advance();
+    if (isBareWord(p, "character")) {
+        try p.advance();
+        try p.expect(.kw_set);
+    } else if (isBareWord(p, "charset") or isBareWord(p, "collate")) {
+        try p.advance();
+    } else if (had_default) {
+        return PE.SqlExpectedKeyword;
+    } else if (p.cur.tag == .kw_auto_increment or isTableOptionWord(p)) {
+        try p.advance();
+    } else return false;
+    if (p.cur.tag == .eq) try p.advance();
+    switch (p.cur.tag) {
+        .identifier, .string, .integer, .kw_default => try p.advance(),
+        else => return PE.SqlExpectedValue,
+    }
+    return true;
+}
+
+fn isTableOptionWord(p: anytype) bool {
+    if (p.cur.tag != .identifier or p.cur.quoted) return false;
+    return asciiEqlAny(p.cur.text, &.{
+        "comment",            "engine",         "row_format",       "algorithm",
+        "lock",               "key_block_size", "stats_persistent", "stats_auto_recalc",
+        "stats_sample_pages", "checksum",       "pack_keys",        "avg_row_length",
+        "min_rows",           "max_rows",       "delay_key_write",  "insert_method",
+    });
+}
+
+/// `CREATE [UNIQUE | FULLTEXT | SPATIAL] INDEX name ON t (key parts) ...`.
+/// A secondary index is advisory and a UNIQUE one an unenforced constraint
+/// (parseTableConstraint), so the statement only checks that t exists.
+fn parseCreateIndex(p: anytype) !*ir.Op {
+    const PE = @TypeOf(p.*).Err;
+    if (!isBareWord(p, "index")) try p.advance();
+    if (!isBareWord(p, "index")) return PE.SqlExpectedKeyword;
+    try p.advance();
+    while (p.cur.tag != .kw_on) {
+        if (p.cur.tag == .eof or p.cur.tag == .semicolon) return PE.SqlExpectedKeyword;
+        try p.advance();
+    }
+    try p.advance();
+    const table = try p.parseTableRef();
+    try skipToStatementEnd(p);
+    return try tableCheckOp(p, table);
+}
+
+/// An ALTER TABLE with no actions: fails when the table doesn't exist and
+/// otherwise changes nothing.
+fn tableCheckOp(p: anytype, table: ir.TableRef) !*ir.Op {
+    return try p.allocOp(.{ .ddl = .{ .alter_table = .{ .table = table, .actions = &.{} } } });
 }
 
 /// CREATE [OR REPLACE] FUNCTION name([pname ptype, ...]) RETURNS TABLE AS ( body )
@@ -457,6 +740,26 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     }
     const ref = try p.parseTableRef();
 
+    // `CREATE TABLE t2 LIKE t1`, or MySQL's `(LIKE t1)`.
+    const like_in_parens = p.cur.tag == .lparen and blk: {
+        var look = p.lex.*;
+        break :blk (try look.next()).tag == .kw_like;
+    };
+    if (p.cur.tag == .kw_like or like_in_parens) {
+        if (like_in_parens) try p.advance();
+        try p.advance();
+        const source = try p.parseTableRef();
+        if (like_in_parens) try p.expect(.rparen);
+        return try p.allocOp(.{ .ddl = .{ .create_table = .{
+            .table = ref,
+            .if_not_exists = if_not_exists,
+            .is_temp = is_temp,
+            .columns = &.{},
+            .order_key = &.{},
+            .like = source,
+        } } });
+    }
+
     // CTAS path: `CREATE TABLE name AS SELECT ...`. No column list.
     if (p.cur.tag == .kw_as) {
         try p.advance();
@@ -478,13 +781,12 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     var table_pk: ?[]const []const u8 = null;
 
     while (true) {
-        if (p.cur.tag == .kw_primary) {
-            try p.advance();
-            if (p.cur.tag != .kw_key) return PE.SqlExpectedKeyword;
-            try p.advance();
-            try p.expect(.lparen);
-            table_pk = try p.parseIdentList();
-            try p.expect(.rparen);
+        if (try parseTableConstraint(p)) |c| switch (c) {
+            .primary_key => |key_cols| {
+                if (table_pk != null) return PE.SqlInvalidProjection;
+                table_pk = key_cols;
+            },
+            .ignored => {},
         } else {
             const col = try parseColumnDef(p);
             try cols.append(p.arena, col.def);
@@ -570,8 +872,9 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
                 sort_key = key_cols;
             }
         } else if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "comment")) {
-            // Table COMMENT: accepted, not stored.
+            // Table COMMENT [=] 'text': accepted, not stored.
             try p.advance();
+            if (p.cur.tag == .eq) try p.advance();
             _ = try parsePropertyText(p);
         } else break;
     }
@@ -1022,6 +1325,12 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                 try p.advance();
                 auto_increment = true;
             },
+            // MySQL: in a column definition, KEY alone means PRIMARY KEY.
+            .kw_key => {
+                try p.advance();
+                is_pk = true;
+                nullable = false;
+            },
             // GENERATED [ALWAYS | BY DEFAULT] AS IDENTITY [( ... )] — the
             // SQL-standard auto-increment spelling. Mapped onto
             // AUTO_INCREMENT + NOT NULL; any sequence-option parenthesis
@@ -1040,6 +1349,23 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                     try p.advance();
                     if (is_character) try p.expect(.kw_set);
                     if (p.cur.tag != .identifier and p.cur.tag != .string) return PE.SqlExpectedIdent;
+                    try p.advance();
+                    continue;
+                }
+                // Column-level UNIQUE, CHECK and REFERENCES: informational,
+                // like the table-level forms (parseTableConstraint).
+                if (isBareWord(p, "unique")) {
+                    try p.advance();
+                    if (p.cur.tag == .kw_key) try p.advance();
+                    continue;
+                }
+                if (isBareWord(p, "check") or isBareWord(p, "constraint") or isBareWord(p, "references")) {
+                    try skipColumnConstraint(p);
+                    continue;
+                }
+                // NDB storage hints.
+                if (isBareWord(p, "column_format") or isBareWord(p, "storage")) {
+                    try p.advance();
                     try p.advance();
                     continue;
                 }
@@ -1142,8 +1468,40 @@ fn varcharType(p: anytype) !types.Type {
     return types.Type{ .varchar = n };
 }
 
+/// ENUM / SET's label list, `('a', 'b', ...)`.
+fn skipLabelList(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    try p.expect(.lparen);
+    while (true) {
+        if (p.cur.tag != .string) return PE.SqlExpectedValue;
+        try p.advance();
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    try p.expect(.rparen);
+}
+
+/// A fractional-seconds precision, `(0)` to `(6)`. Storage is always
+/// microseconds, so it is range-checked and otherwise ignored.
+fn skipFsp(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    if (p.cur.tag != .lparen) return;
+    try p.advance();
+    if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+    const fsp = p.cur.value.integer;
+    try p.advance();
+    try p.expect(.rparen);
+    if (fsp < 0 or fsp > 6) return PE.SqlExpectedValue;
+}
+
 pub fn parseColumnType(p: anytype) !types.Type {
     const PE = @TypeOf(p.*).Err;
+    // SET('a', 'b', ...) stores its labels as comma-joined text, like ENUM.
+    if (p.cur.tag == .kw_set) {
+        try p.advance();
+        try skipLabelList(p);
+        return .string;
+    }
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     const name = p.cur.text;
     try p.advance();
@@ -1154,9 +1512,9 @@ pub fn parseColumnType(p: anytype) !types.Type {
     // except BIGINT UNSIGNED, which keeps 64 bits.
     if (asciiEqlAny(name, &.{ "bigint", "int8" })) return integerType(p, .bigint, .bigint);
     if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return integerType(p, .int, .bigint);
-    if (asciiEqlAny(name, &.{"mediumint"})) return integerType(p, .int, .int);
+    if (asciiEqlAny(name, &.{ "mediumint", "middleint", "int3" })) return integerType(p, .int, .int);
     if (asciiEqlAny(name, &.{ "smallint", "int2" })) return integerType(p, .smallint, .int);
-    if (asciiEqlAny(name, &.{"tinyint"})) return integerType(p, .tinyint, .smallint);
+    if (asciiEqlAny(name, &.{ "tinyint", "int1" })) return integerType(p, .tinyint, .smallint);
     if (asciiEqlAny(name, &.{ "float", "real", "float4" })) return numericModifiers(p, .float);
     if (asciiEqlAny(name, &.{"float8"})) return .double;
     if (asciiEqlAny(name, &.{"double"})) {
@@ -1165,7 +1523,7 @@ pub fn parseColumnType(p: anytype) !types.Type {
         }
         return numericModifiers(p, .double);
     }
-    if (asciiEqlAny(name, &.{ "decimal", "numeric", "dec" })) {
+    if (asciiEqlAny(name, &.{ "decimal", "numeric", "dec", "fixed" })) {
         // MySQL's defaults: DECIMAL = DECIMAL(10, 0), DECIMAL(p) = DECIMAL(p, 0).
         var p_raw: i64 = 10;
         var s_raw: i64 = 0;
@@ -1202,31 +1560,37 @@ pub fn parseColumnType(p: anytype) !types.Type {
     if (asciiEqlAny(name, &.{ "text", "string", "tinytext", "mediumtext", "longtext" })) return .string;
     // ENUM('a', 'b', ...) stores its labels as text; the list isn't enforced.
     if (asciiEqlAny(name, &.{"enum"})) {
-        try p.expect(.lparen);
-        while (true) {
-            if (p.cur.tag != .string) return PE.SqlExpectedValue;
-            try p.advance();
-            if (p.cur.tag != .comma) break;
-            try p.advance();
-        }
-        try p.expect(.rparen);
+        try skipLabelList(p);
+        return .string;
+    }
+    // Byte strings store as text, which holds any bytes. BINARY(n)'s zero
+    // padding isn't applied.
+    if (asciiEqlAny(name, &.{ "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "bytea" })) {
+        _ = try optionalLength(p);
+        return .string;
+    }
+    // BIT(1) is MySQL's flag type; a wider BIT(n) holds an n-bit unsigned
+    // integer (BIT(64) values past BIGINT's range wrap negative).
+    if (asciiEqlAny(name, &.{"bit"})) {
+        const n = try optionalLength(p) orelse 1;
+        if (n > 64) return PE.SqlExpectedValue;
+        return if (n == 1) .boolean else .bigint;
+    }
+    if (asciiEqlAny(name, &.{"year"})) {
+        _ = try optionalLength(p);
+        return .smallint;
+    }
+    // MySQL's TIME is a signed duration up to 838:59:59; it stores as its
+    // text, `HH:MM:SS[.ffffff]`.
+    if (asciiEqlAny(name, &.{"time"})) {
+        try skipFsp(p);
         return .string;
     }
     if (asciiEqlAny(name, &.{ "boolean", "bool" })) return .boolean;
     if (asciiEqlAny(name, &.{"date"})) return .date;
     // timestamptz is accepted as a synonym; thinDB datetimes are UTC-naive.
     if (asciiEqlAny(name, &.{ "datetime", "timestamp", "timestamptz" })) {
-        // MySQL/PG fractional-seconds precision, e.g. DATETIME(6). Storage is
-        // always microseconds, so the value is range-checked (0-6, both
-        // dialects' maximum) and otherwise ignored — never rounded to.
-        if (p.cur.tag == .lparen) {
-            try p.advance();
-            if (p.cur.tag != .integer) return PE.SqlExpectedValue;
-            const fsp = p.cur.value.integer;
-            try p.advance();
-            try p.expect(.rparen);
-            if (fsp < 0 or fsp > 6) return PE.SqlExpectedValue;
-        }
+        try skipFsp(p);
         return .datetime;
     }
     if (asciiEqlAny(name, &.{"uuid"})) return .uuid;

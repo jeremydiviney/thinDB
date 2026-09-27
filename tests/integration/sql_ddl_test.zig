@@ -943,3 +943,126 @@ test "sql ddl: global block cache — two tables share it; TRUNCATE never serves
     defer allocator.free(vb2);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 14 }, vb2);
 }
+
+test "sql ddl: MySQL type aliases map onto thinDB types" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db,
+        \\CREATE TABLE ty (id INT PRIMARY KEY, f FIXED(5,2), b BINARY(4), vb VARBINARY(10), bl BLOB,
+        \\  lb LONGBLOB, b1 BIT(1), b8 BIT(8), y YEAR, t TIME(6), s SET('x', 'y'), i1 INT1, i3 MIDDLEINT)
+    );
+    const Tag = thindb.types.TypeTag;
+    const expected = [_]Tag{ .int, .decimal64, .string, .string, .string, .string, .boolean, .bigint, .smallint, .string, .string, .tinyint, .int };
+    const t = try db.openTable("ty", .{});
+    try std.testing.expectEqual(expected.len, t.schema.columns.len);
+    for (expected, t.schema.columns) |want, col| {
+        errdefer std.debug.print("column {s}\n", .{col.name});
+        try std.testing.expectEqual(want, @as(Tag, col.type));
+    }
+    try std.testing.expectEqual(thindb.types.DecimalSpec{ .p = 5, .s = 2 }, t.schema.columns[1].type.decimal64);
+
+    try exec(allocator, db, "INSERT INTO ty (id, b8, y, t, s) VALUES (1, 200, 2024, '12:34:56', 'x,y')");
+    const got = try collectBigints(allocator, db, "SELECT CAST(b8 + y AS BIGINT) FROM ty WHERE t = '12:34:56' AND s = 'x,y'");
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(i64, &.{2224}, got);
+}
+
+test "sql ddl: index and constraint clauses are accepted, only PRIMARY KEY is kept" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE parent (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db,
+        \\CREATE TABLE ic (
+        \\  id BIGINT, c BIGINT UNIQUE, d BIGINT REFERENCES parent (id) ON DELETE CASCADE ON UPDATE SET NULL,
+        \\  e BIGINT CHECK (e > 0) NOT NULL,
+        \\  CONSTRAINT pk PRIMARY KEY (id), KEY k_c (c), INDEX i_d (d) USING BTREE, UNIQUE KEY uk (c, d),
+        \\  FULLTEXT KEY ft (c), CONSTRAINT fk FOREIGN KEY (d) REFERENCES parent (id),
+        \\  CONSTRAINT ck CHECK (e < 100) NOT ENFORCED
+        \\) COMMENT = 'constraints'
+    );
+    const t = try db.openTable("ic", .{});
+    try std.testing.expect(t.schema.unique);
+    try std.testing.expectEqual(@as(usize, 1), t.schema.order_key.len);
+    try std.testing.expectEqualStrings("id", t.schema.order_key[0]);
+    try std.testing.expect(!t.schema.columns[3].nullable);
+
+    // UNIQUE and CHECK are informational: rows that break them still load.
+    try exec(allocator, db, "INSERT INTO ic (id, c, d, e) VALUES (1, 5, 1, 500), (2, 5, 1, 7)");
+    const count = try collectBigints(allocator, db, "SELECT COUNT(*) FROM ic");
+    defer allocator.free(count);
+    try std.testing.expectEqualSlices(i64, &.{2}, count);
+
+    // A quoted clause word still names a column.
+    try exec(allocator, db, "CREATE TABLE qc (id BIGINT PRIMARY KEY, \"index\" BIGINT, \"unique\" BIGINT)");
+    try exec(allocator, db, "INSERT INTO qc VALUES (1, 2, 3)");
+    const sum = try collectBigints(allocator, db, "SELECT \"index\" + \"unique\" FROM qc");
+    defer allocator.free(sum);
+    try std.testing.expectEqualSlices(i64, &.{5}, sum);
+
+    // In a MySQL column definition, KEY alone is PRIMARY KEY.
+    try exec(allocator, db, "CREATE TABLE kc (id BIGINT KEY, v BIGINT)");
+    const kc = try db.openTable("kc", .{});
+    try std.testing.expect(kc.schema.unique);
+    try std.testing.expectEqualStrings("id", kc.schema.order_key[0]);
+
+    // Generated columns compute values, so they can't be dropped silently.
+    try expectRunError(allocator, db, "CREATE TABLE g (id BIGINT PRIMARY KEY, c BIGINT, d BIGINT GENERATED ALWAYS AS (c + 1) STORED)", error.SqlExpectedKeyword);
+}
+
+test "sql ddl: CREATE TABLE LIKE copies the definition; index DDL and table options change nothing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY, amt DECIMAL(10,2) NOT NULL DEFAULT 0, note VARCHAR(20)) PROPERTIES ('compression' = 'zstd')");
+    try exec(allocator, db, "CREATE TABLE dst LIKE src");
+    try exec(allocator, db, "CREATE TABLE dst2 (LIKE src)");
+    inline for (.{ "dst", "dst2" }) |name| {
+        const t = try db.openTable(name, .{});
+        try std.testing.expectEqual(@as(usize, 3), t.schema.columns.len);
+        try std.testing.expect(!t.schema.columns[1].nullable);
+        try std.testing.expect(t.schema.columns[1].default_value != null);
+        try std.testing.expect(t.schema.unique);
+        try std.testing.expectEqualStrings("id", t.schema.order_key[0]);
+        try std.testing.expectEqual(thindb.types.TableCompression.zstd, t.schema.compression);
+    }
+    try exec(allocator, db, "INSERT INTO dst (id) VALUES (1)");
+    try exec(allocator, db, "INSERT INTO dst (id, note) VALUES (1, 'x')");
+    const count = try collectBigints(allocator, db, "SELECT COUNT(*) FROM dst");
+    defer allocator.free(count);
+    try std.testing.expectEqualSlices(i64, &.{1}, count);
+    try expectRunError(allocator, db, "CREATE TABLE dst LIKE src", thindb.net.Error.TableAlreadyExists);
+    try exec(allocator, db, "CREATE TABLE IF NOT EXISTS dst LIKE src");
+    try expectRunError(allocator, db, "CREATE TABLE d3 LIKE ghost", thindb.net.Error.TableNotFound);
+
+    try exec(allocator, db, "CREATE INDEX i ON src (note)");
+    try exec(allocator, db, "CREATE UNIQUE INDEX u ON src (note) USING BTREE");
+    try exec(allocator, db, "DROP INDEX i ON src");
+    try exec(allocator, db, "ALTER TABLE src ADD INDEX i2 (note), ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES dst (id), COMMENT = 'c', ENGINE = InnoDB");
+    try exec(allocator, db, "ALTER TABLE src ADD COLUMN z BIGINT, ALGORITHM = INPLACE, LOCK = NONE");
+    try exec(allocator, db,
+        \\ALTER TABLE src DROP INDEX i2, DROP FOREIGN KEY fk, RENAME INDEX a TO b, ALTER INDEX b INVISIBLE,
+        \\  DISABLE KEYS, AUTO_INCREMENT = 10, DEFAULT CHARSET = utf8mb4, CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+    );
+    const src = try db.openTable("src", .{});
+    try std.testing.expectEqual(@as(usize, 4), src.schema.columns.len);
+
+    try expectRunError(allocator, db, "CREATE INDEX i ON ghost (a)", thindb.net.Error.TableNotFound);
+    try expectRunError(allocator, db, "DROP INDEX i ON ghost", thindb.net.Error.TableNotFound);
+    try expectRunError(allocator, db, "ALTER TABLE ghost ENGINE = InnoDB", thindb.net.Error.TableNotFound);
+    try expectRunError(allocator, db, "ALTER TABLE src ADD PRIMARY KEY (note)", error.SqlInvalidProjection);
+    try expectRunError(allocator, db, "ALTER TABLE src DROP PRIMARY KEY", error.SqlInvalidProjection);
+}

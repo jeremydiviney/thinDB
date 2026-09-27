@@ -2365,15 +2365,18 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     .auto_increment = c.auto_increment,
                 };
             }
-            const schema_def: TableSchema = .{
-                .columns = cols,
-                .order_key = ct.order_key,
-                .unique = ct.unique,
-                .compression = ct.compression orelse types.default_table_compression,
-            };
+            const schema_def: TableSchema = if (ct.like) |src|
+                (try resolveTable(catalog, ctx.session.*, src)).schema
+            else
+                .{
+                    .columns = cols,
+                    .order_key = ct.order_key,
+                    .unique = ct.unique,
+                    .compression = ct.compression orelse types.default_table_compression,
+                };
             const opts: TableOptions = .{
-                .order_key = ct.order_key,
-                .unique = ct.unique,
+                .order_key = schema_def.order_key,
+                .unique = schema_def.unique,
                 .row_group_size = null,
             };
 
@@ -2447,6 +2450,10 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             };
             if (ops.items.len > 0) {
                 target.schema.alterTable(target.table_name, ops.items) catch |e| return thindb_api.remapError(Error, e);
+            } else if (rename_to == null) {
+                // Only no-op actions (an index, a table option): the table
+                // must still exist.
+                _ = try resolveTable(catalog, ctx.session.*, at.table);
             }
             if (rename_to) |to| {
                 target.schema.renameTable(target.table_name, to.table_name) catch |e| return thindb_api.remapError(Error, e);

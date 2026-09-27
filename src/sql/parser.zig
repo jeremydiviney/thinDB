@@ -1307,7 +1307,7 @@ pub const Parser = struct {
     /// MySQL's `DUAL`: the one-row source of a FROM-less SELECT. A
     /// backquoted `dual` still names a table.
     fn atDual(self: *const Parser) bool {
-        return self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "dual") and self.lex.src[self.lex.pos - 1] != '`';
+        return self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "dual") and !self.cur.quoted;
     }
 
     /// Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit, e.g.
