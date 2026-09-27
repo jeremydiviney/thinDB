@@ -951,20 +951,41 @@ fn handleQuery(
     while (query_end > 0 and payload[query_end - 1] == 0) query_end -= 1;
     const sql_text = payload[0..query_end];
 
-    if (try canned.match(allocator, sql_text, session.current_db, session.current_schema)) |probe| {
-        try dispatchProbe(allocator, w, session, probe);
-        try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
-        try w.flush();
-        return;
+    // Each statement of a batch is answered on its own, so one the canned
+    // matcher takes (SET, BEGIN) doesn't swallow the rest, and one that
+    // changes the session (SET search_path) does so before the next is
+    // parsed. The first error ends the batch.
+    var split_arena = std.heap.ArenaAllocator.init(allocator);
+    defer split_arena.deinit();
+    const statements = try sql.splitStatements(split_arena.allocator(), sql_text, .postgres);
+    const batch = statements.len > 1;
+    for (if (batch) statements else &.{sql_text}) |statement| {
+        runStatementText(allocator, w, r, catalog, session, statement, batch) catch |err| {
+            const mapped = errors.mapInternal(err);
+            try errors.sendErrorResponse(allocator, w, mapped.sqlstate, mapped.message);
+            break;
+        };
     }
-
-    runEngineQuery(allocator, w, r, catalog, session, sql_text) catch |err| {
-        const mapped = errors.mapInternal(err);
-        try errors.sendErrorResponse(allocator, w, mapped.sqlstate, mapped.message);
-    };
 
     try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
     try w.flush();
+}
+
+/// One statement's replies: the canned answer when the matcher takes it,
+/// else the engine's.
+fn runStatementText(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    catalog: *Catalog,
+    session: *SessionState,
+    sql_text: []const u8,
+    in_batch: bool,
+) !void {
+    if (try canned.match(allocator, sql_text, session.current_db, session.current_schema)) |probe| {
+        return try dispatchProbe(allocator, w, session, probe);
+    }
+    try runEngineQuery(allocator, w, r, catalog, session, sql_text, in_batch);
 }
 
 fn dispatchProbe(
@@ -1031,6 +1052,7 @@ fn runEngineQuery(
     catalog: *Catalog,
     session: *SessionState,
     sql_text: []const u8,
+    in_batch: bool,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1054,6 +1076,8 @@ fn runEngineQuery(
         return;
     }
 
+    // COPY takes the connection over until CopyDone, so it runs alone.
+    if (in_batch and op.* == .copy) return copy.Error.CopyMustBeSoleStatement;
     try runSingleStatement(allocator, w, r, catalog, session, op);
 }
 
