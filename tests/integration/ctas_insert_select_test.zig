@@ -321,11 +321,72 @@ test "INSERT SELECT: literals and narrower columns widen into the target types" 
     defer allocator.free(null_amt);
     try std.testing.expectEqualSlices(i64, &.{ 5, 101 }, null_amt);
 
-    // An integer the column can't hold, a fraction, and a NULL into a NOT
-    // NULL column are still rejected.
-    try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT 6, CAST(5000000000 AS BIGINT)", error.TypeMismatch);
-    try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT 7, 2.5", error.TypeMismatch);
+    // An integer the column can't hold and a NULL into a NOT NULL column
+    // are still rejected.
+    try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT 6, CAST(5000000000 AS BIGINT)", error.ValueOutOfRange);
     try helpers.expectRunError(allocator, db, "INSERT INTO sink2 (id, n) SELECT k + 200, m FROM src2", error.TypeMismatch);
+}
+
+test "INSERT and UPDATE: a value converts to its column's type as MySQL assigns it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE asg (id BIGINT NOT NULL, i INT, t TINYINT, d DOUBLE, b BOOLEAN, big BIGINT, PRIMARY KEY (id))");
+    try exec(allocator, db, "INSERT INTO asg (id, i) VALUES (1, '12'), (2, 1.6), (3, 1.5), (4, -1.5), (5, '1.6'), (6, ' 12 '), (7, '1e2'), (8, TRUE), (9, '+7'), (10, '.5'), (11, '-.5')");
+    try exec(allocator, db, "INSERT INTO asg (id, t, d, b, big) VALUES (20, 127.4, '1.5', 1, '9007199254740993'), (21, '-128', ' 2.5e1 ', '0', -3.5), (22, FALSE, TRUE, 0.5, NULL)");
+    try exec(allocator, db, "INSERT INTO asg (id, i) SELECT 30, '13'");
+    try exec(allocator, db, "INSERT INTO asg (id, i) SELECT 31, 2.5");
+    try exec(allocator, db, "CREATE TABLE src (k BIGINT NOT NULL, s VARCHAR(8), x DOUBLE, m DECIMAL(6,2), PRIMARY KEY (k))");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, '41', 40.5, 1.50), (2, NULL, -0.5, -2.50), (3, ' 7 ', NULL, NULL)");
+    try exec(allocator, db, "INSERT INTO asg (id, i, t, big, d) SELECT k + 40, s, x, m, s FROM src");
+    try exec(allocator, db, "UPDATE asg SET i = '44' WHERE id = 1");
+    try exec(allocator, db, "UPDATE asg SET t = i * 2.5 WHERE id = 3");
+
+    for (0..2) |pass| {
+        if (pass == 1) {
+            const t = try db.openTable("asg", .{});
+            try t.flush();
+            try exec(allocator, db, "UPDATE asg SET i = 4.5 WHERE id = 2");
+            try exec(allocator, db, "UPDATE asg SET big = '-17' WHERE id = 22");
+        }
+        const cases = .{
+            .{ "SELECT CAST(i AS BIGINT) FROM asg WHERE i IS NOT NULL ORDER BY id", &[_]i64{ 44, if (pass == 0) 2 else 5, 2, -2, 2, 12, 100, 1, 7, 1, -1, 13, 3, 41, 7 } },
+            .{ "SELECT CAST(t AS BIGINT) FROM asg WHERE t IS NOT NULL ORDER BY id", &[_]i64{ 5, 127, -128, 0, 41, -1 } },
+            .{ "SELECT CAST(d * 10 AS BIGINT) FROM asg WHERE d IS NOT NULL ORDER BY id", &[_]i64{ 15, 250, 10, 410, 70 } },
+            .{ "SELECT id FROM asg WHERE b ORDER BY id", &[_]i64{ 20, 22 } },
+            .{ "SELECT big FROM asg WHERE big IS NOT NULL ORDER BY id", if (pass == 0) &[_]i64{ 9007199254740993, -4, 2, -3 } else &[_]i64{ 9007199254740993, -4, -17, 2, -3 } },
+        };
+        inline for (cases) |c| {
+            const got = try collectBigints(allocator, db, c[0]);
+            defer allocator.free(got);
+            std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+                std.debug.print("query: {s}\n", .{c[0]});
+                return err;
+            };
+        }
+    }
+
+    const rejected = .{
+        .{ "INSERT INTO asg (id, i) VALUES (100, '12abc')", error.TypeMismatch },
+        .{ "INSERT INTO asg (id, i) VALUES (100, '')", error.TypeMismatch },
+        .{ "INSERT INTO asg (id, d) VALUES (100, 'abc')", error.TypeMismatch },
+        .{ "INSERT INTO asg (id, t) VALUES (100, 300)", error.ValueOutOfRange },
+        .{ "INSERT INTO asg (id, t) VALUES (100, '300')", error.ValueOutOfRange },
+        .{ "INSERT INTO asg (id, t) VALUES (100, 127.5)", error.ValueOutOfRange },
+        .{ "INSERT INTO asg (id, i) VALUES (100, 2147483647.5)", error.ValueOutOfRange },
+        .{ "INSERT INTO asg (id, t) SELECT 100, 200", error.ValueOutOfRange },
+        .{ "INSERT INTO asg (id, i) SELECT k + 100, 'x' FROM src", error.TypeMismatch },
+        .{ "UPDATE asg SET t = t + 200 WHERE id = 20", error.ValueOutOfRange },
+        .{ "UPDATE asg SET i = 'many' WHERE id = 1", error.TypeMismatch },
+    };
+    inline for (rejected) |c| try helpers.expectRunError(allocator, db, c[0], c[1]);
+    const unchanged = try collectBigints(allocator, db, "SELECT COUNT(*) FROM asg WHERE id >= 100 OR t > 127 OR i = 0");
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualSlices(i64, &.{0}, unchanged);
 }
 
 test "INSERT SELECT: a wider integer narrows into its column when every value fits" {
@@ -362,8 +423,8 @@ test "INSERT SELECT: a wider integer narrows into its column when every value fi
     try std.testing.expectEqualSlices(i64, &.{2}, null_ids);
 
     // A value the column can't hold fails the statement rather than clamping.
-    try helpers.expectRunError(allocator, db, "INSERT INTO slim (id, i) SELECT k + 20, big * 1000000000 FROM wide", error.TypeMismatch);
-    try helpers.expectRunError(allocator, db, "INSERT INTO slim (id, s) SELECT k + 20, big - 32768 FROM wide WHERE k = 3", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO slim (id, i) SELECT k + 20, big * 1000000000 FROM wide", error.ValueOutOfRange);
+    try helpers.expectRunError(allocator, db, "INSERT INTO slim (id, s) SELECT k + 20, big - 32768 FROM wide WHERE k = 3", error.ValueOutOfRange);
     const after = try collectBigints(allocator, db, "SELECT COUNT(*) FROM slim WHERE id > 20");
     defer allocator.free(after);
     try std.testing.expectEqualSlices(i64, &.{0}, after);
