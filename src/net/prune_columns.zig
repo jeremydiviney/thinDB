@@ -146,8 +146,10 @@ fn walkRoot(ctx: *Ctx, op: *ir.Op) void {
         .explain => |e| walkRoot(ctx, @constCast(e.inner)),
         .create_table_as => |c| walk(ctx, @constCast(c.source), null),
         .insert_select => |i| walk(ctx, @constCast(i.source), null),
+        .delete_op => |d| if (d.source) |s| walk(ctx, s, null),
+        .update_op => |u| if (u.source) |s| walk(ctx, s, null),
         .batch => |b| for (b.statements) |s| walkRoot(ctx, @constCast(s)),
-        .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
+        .ddl, .show, .insert, .copy, .set_var => {},
         else => walk(ctx, op, null),
     }
 }
@@ -157,8 +159,8 @@ fn walkRoot(ctx: *Ctx, op: *ir.Op) void {
 /// upstream need is derivable from their own item lists regardless.
 fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
     switch (op.*) {
-        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .delete_op, .update_op => {},
-        .explain, .create_table_as, .insert_select, .batch => walkRoot(ctx, op),
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var => {},
+        .explain, .create_table_as, .insert_select, .batch, .delete_op, .update_op => walkRoot(ctx, op),
         .limit => |l| walk(ctx, l.upstream, needed),
         .alias => |a| walk(ctx, a.upstream, needed),
         .exclude => |p| {

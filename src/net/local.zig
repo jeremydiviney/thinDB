@@ -34,6 +34,9 @@ const TableOptions = thindb_api.TableOptions;
 const AlterOp = thindb_api.AlterOp;
 const ApiError = thindb_api.Error;
 const ApiTable = thindb_api.Table;
+const update_mod = @import("../api/update.zig");
+const upsert_mod = @import("../api/upsert.zig");
+const engine = @import("../engine/engine.zig");
 
 const types = @import("../types.zig");
 const TableSchema = types.TableSchema;
@@ -2168,8 +2171,8 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .create_table_as => |c| try compileCreateTableAs(ctx, c),
         .insert_select => |i| try compileInsertSelect(ctx, i),
         .set_var => |sv| try compileSetVar(ctx, sv),
-        .delete_op => |d| try compileDelete(ctx, d),
-        .update_op => |u| try compileUpdate(ctx, u),
+        .delete_op => |d| if (d.source != null) try compileDeleteFromSource(ctx, d) else try compileDelete(ctx, d),
+        .update_op => |u| if (u.source != null) try compileUpdateFromSource(ctx, u) else try compileUpdate(ctx, u),
         .explain => |e| blk: {
             // Compile the inner statement, render its physical plan, and
             // return the plan as a one-column result. The inner query is
@@ -2226,7 +2229,6 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, u.table);
 
-    const update_mod = @import("../api/update.zig");
     const assigns_buf = try ctx.allocator.alloc(update_mod.Assignment, u.assignments.len);
     defer ctx.allocator.free(assigns_buf);
     for (u.assignments, assigns_buf) |src, *dst| {
@@ -2665,6 +2667,9 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     defer source.deinit();
 
     const src_schema = source.outputSchema();
+    const source_names = try aa.alloc([]const u8, src_schema.len);
+    for (src_schema, source_names) |c, *name| name.* = c.name;
+    const rule = try duplicateRule(aa, t, op.table, op.mode, op.on_duplicate, op.columns, source_names);
     const table_to_source = try aa.alloc(?usize, tbl_columns.len);
     @memset(table_to_source, null);
     if (op.columns) |cols| {
@@ -2678,54 +2683,258 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
         for (table_to_source, 0..) |*s, j| s.* = j;
     }
 
-    // picks[j] = the output column of `source` that lands in table column
-    // j: a source column as is, or a derivation appended after them.
-    const picks = try aa.alloc(usize, tbl_columns.len);
-    var derived: std.ArrayList(exec.Derived) = .empty;
-    for (tbl_columns, table_to_source, picks, 0..) |col, maybe_src, *pick, j| {
-        const expr = if (maybe_src) |i|
-            try insertWideningExpr(aa, src_schema[i], col.type) orelse {
-                pick.* = i;
-                continue;
-            }
-        else
-            try insertFillExpr(ctx, aa, col);
-        pick.* = src_schema.len + derived.items.len;
-        try derived.append(aa, .{ .name = try std.fmt.allocPrint(aa, "__insert_{d}", .{j}), .expr = expr });
-    }
-    if (derived.items.len > 0) source = try source.computeWithRegistry(derived.items, ctx.udf_registry);
-
+    const plan = try InsertColumnPlan.init(ctx, aa, t, &source, table_to_source, 0);
     const out_schema = source.outputSchema();
     const batch_schema = try aa.alloc(types.Column, tbl_columns.len);
     const views = try aa.alloc(storage.ColumnView, tbl_columns.len);
-    const assigned = try aa.alloc(bool, tbl_columns.len);
-    for (tbl_columns, picks, assigned) |col, pick, *a| a.* = exec_cast.assignsByRule(out_schema[pick].type, col.type);
     var total_rows: usize = 0;
     while (try source.next()) |b| {
-        for (table_to_source, picks) |maybe_src, pick| {
-            const src = maybe_src orelse continue;
-            if (pick != src and wideningDroppedValue(b.values[src], b.values[pick], b.row_count)) return Error.TypeMismatch;
+        try plan.fill(ctx, t, out_schema, b.values, b.row_count, batch_schema, views);
+        defer plan.release(ctx, views);
+        switch (rule) {
+            .replace => {
+                try t.insertBatch(batch_schema, views, b.row_count);
+                total_rows += b.row_count;
+            },
+            .resolve => |action| total_rows += duplicateAffectedRows(try t.insertBatchOnDuplicate(batch_schema, views, b.row_count, action)),
         }
-        var filled: usize = 0;
-        defer for (views[0..filled], assigned[0..filled]) |view, a| {
-            if (a) exec_cast.freeAssignedColumn(ctx.allocator, view);
-        };
-        for (tbl_columns, picks, assigned, batch_schema, views) |col, pick, a, *bs, *view| {
-            view.* = if (a)
-                try exec_cast.assignColumn(ctx.allocator, b.values[pick], out_schema[pick].type, col.type, b.row_count)
-            else
-                b.values[pick];
-            filled += 1;
-            // A NOT NULL column admits a nullable source whose rows hold no
-            // NULL, as MySQL does; a NULL row still fails in the memtable.
-            const nullable = out_schema[pick].nullable and (col.nullable or view.anyNull(b.row_count));
-            bs.* = .{ .name = col.name, .type = if (a) col.type else out_schema[pick].type, .nullable = nullable };
-        }
-        try t.insertBatch(batch_schema, views, b.row_count);
-        total_rows += b.row_count;
     }
     ctx.affected_rows = @intCast(total_rows);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
+}
+
+/// How an INSERT fills each column of its table from a source query: the
+/// source column it takes (after any widening appended to the query) and
+/// whether that converts by the assignment rule as each batch lands.
+const InsertColumnPlan = struct {
+    table_to_source: []const ?usize,
+    picks: []const usize,
+    assigned: []const bool,
+
+    /// Plan `t`'s columns from `source`: table column j takes source column
+    /// `table_to_source[j]` widened to its type, or the fill INSERT ...
+    /// VALUES uses when null. Widenings and fills are appended to `source`
+    /// under names `tag` keeps apart from another plan's over the same query.
+    fn init(
+        ctx: *CompileCtx,
+        aa: Allocator,
+        t: *ApiTable,
+        source: *Query,
+        table_to_source: []const ?usize,
+        tag: usize,
+    ) !InsertColumnPlan {
+        const tbl_columns = t.schema.columns;
+        const src_schema = source.outputSchema();
+        const picks = try aa.alloc(usize, tbl_columns.len);
+        var derived: std.ArrayList(exec.Derived) = .empty;
+        for (tbl_columns, table_to_source, picks, 0..) |col, maybe_src, *pick, j| {
+            const expr = if (maybe_src) |i|
+                try insertWideningExpr(aa, src_schema[i], col.type) orelse {
+                    pick.* = i;
+                    continue;
+                }
+            else
+                try insertFillExpr(ctx, aa, col);
+            pick.* = src_schema.len + derived.items.len;
+            try derived.append(aa, .{ .name = try std.fmt.allocPrint(aa, "__insert_{d}_{d}", .{ tag, j }), .expr = expr });
+        }
+        if (derived.items.len > 0) source.* = try source.computeWithRegistry(derived.items, ctx.udf_registry);
+
+        const out_schema = source.outputSchema();
+        const assigned = try aa.alloc(bool, tbl_columns.len);
+        for (tbl_columns, picks, assigned) |col, pick, *a| a.* = exec_cast.assignsByRule(out_schema[pick].type, col.type);
+        return .{ .table_to_source = table_to_source, .picks = picks, .assigned = assigned };
+    }
+
+    /// Fill `batch_schema` / `views` with the rows `t` takes from source
+    /// columns `values`. Free them with `release` once they have landed.
+    fn fill(
+        self: InsertColumnPlan,
+        ctx: *CompileCtx,
+        t: *ApiTable,
+        out_schema: []const types.Column,
+        values: []const storage.ColumnView,
+        row_count: usize,
+        batch_schema: []types.Column,
+        views: []storage.ColumnView,
+    ) !void {
+        for (self.table_to_source, self.picks) |maybe_src, pick| {
+            const src = maybe_src orelse continue;
+            if (pick != src and wideningDroppedValue(values[src], values[pick], row_count)) return Error.TypeMismatch;
+        }
+        var filled: usize = 0;
+        errdefer self.release(ctx, views[0..filled]);
+        for (t.schema.columns, self.picks, self.assigned, batch_schema, views) |col, pick, a, *bs, *view| {
+            view.* = if (a)
+                try exec_cast.assignColumn(ctx.allocator, values[pick], out_schema[pick].type, col.type, row_count)
+            else
+                values[pick];
+            filled += 1;
+            // A NOT NULL column admits a nullable source whose rows hold no
+            // NULL, as MySQL does; a NULL row still fails in the memtable.
+            const nullable = out_schema[pick].nullable and (col.nullable or view.anyNull(row_count));
+            bs.* = .{ .name = col.name, .type = if (a) col.type else out_schema[pick].type, .nullable = nullable };
+        }
+    }
+
+    fn release(self: InsertColumnPlan, ctx: *CompileCtx, views: []const storage.ColumnView) void {
+        for (views, self.assigned[0..views.len]) |view, a| {
+            if (a) exec_cast.freeAssignedColumn(ctx.allocator, view);
+        }
+    }
+};
+
+/// Run an UPDATE's or DELETE's SELECT (`UpdateOp.source`,
+/// `DeleteOp.source`) to completion, copying its rows out: it may read the
+/// tables the statement then writes.
+fn stageDmlSource(ctx: *CompileCtx, aa: Allocator, source: *Query) !engine.Memtable {
+    const out_schema = source.outputSchema();
+    // Positional names: a join's output may repeat one.
+    const columns = try aa.alloc(types.Column, out_schema.len);
+    for (out_schema, columns, 0..) |c, *s, i| {
+        s.* = .{ .name = try std.fmt.allocPrint(aa, "{d}", .{i}), .type = c.type, .nullable = true };
+    }
+    var staged = try engine.Memtable.init(ctx.allocator, .{ .columns = columns, .order_key = &.{}, .unique = false });
+    errdefer staged.deinit();
+    while (try source.next()) |b| try staged.insertColumnarBatch(columns, b.values[0..columns.len], b.row_count);
+    return staged;
+}
+
+fn stagedViews(aa: Allocator, staged: *const engine.Memtable) ![]storage.ColumnView {
+    const views = try aa.alloc(storage.ColumnView, staged.columns.len);
+    for (staged.columns, views) |c, *v| v.* = c.view();
+    return views;
+}
+
+fn isOrderKeyColumn(t: *const ApiTable, ci: usize) bool {
+    for (t.order_key_indices) |k| {
+        if (k == ci) return true;
+    }
+    return false;
+}
+
+/// Which of an UPDATE's candidate targets it writes: the only one, or the
+/// only one holding every assigned column.
+fn updateTargetIndex(tables: []const *ApiTable, assignments: []const ir.Assignment) !usize {
+    if (tables.len == 1) return 0;
+    var found: ?usize = null;
+    for (tables, 0..) |t, k| {
+        const holds_all = for (assignments) |a| {
+            if (t.schema.columnIndex(a.col) == null) break false;
+        } else true;
+        if (!holds_all) continue;
+        if (found != null) return Error.BadRequest;
+        found = k;
+    }
+    return found orelse Error.ColumnNotFound;
+}
+
+/// UPDATE in a form a filtered scan can't express (ORDER BY / LIMIT, a
+/// join, an alias). The SELECT yields each candidate target's columns,
+/// then one column per assignment value; the chosen target's rows, with
+/// the assigned columns replaced, are written back over their keys.
+fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const tables = try aa.alloc(*ApiTable, u.targets.len);
+    for (u.targets, tables) |target, *t| t.* = try resolveTable(catalog, ctx.session.*, target.table);
+    const k = try updateTargetIndex(tables, u.assignments);
+    const t = tables[k];
+    // Only a key identifies the row a SELECT returned.
+    if (!t.schema.unique) return Error.UnsupportedOp;
+
+    var offset: usize = 0;
+    var star_width: usize = 0;
+    for (tables, 0..) |x, i| {
+        if (i < k) offset += x.schema.columns.len;
+        star_width += x.schema.columns.len;
+    }
+    const table_to_source = try aa.alloc(?usize, t.schema.columns.len);
+    for (table_to_source, 0..) |*s, j| s.* = offset + j;
+    for (u.assignments, 0..) |a, i| {
+        const ci = t.schema.columnIndex(a.col) orelse return Error.ColumnNotFound;
+        // The key finds the row; moving it is not an update.
+        if (isOrderKeyColumn(t, ci)) return Error.UnsupportedOp;
+        table_to_source[ci] = star_width + i;
+    }
+
+    var source = try compileSubplan(ctx, u.source.?);
+    defer source.deinit();
+    if (source.outputSchema().len != star_width + u.assignments.len) return Error.BadRequest;
+    const plan = try InsertColumnPlan.init(ctx, aa, t, &source, table_to_source, 0);
+    const out_schema = try aa.dupe(types.Column, source.outputSchema());
+    var staged = try stageDmlSource(ctx, aa, &source);
+    defer staged.deinit();
+    const row_count: usize = @intCast(staged.row_count);
+    if (row_count == 0) return try EmptyOp.createWithCount(ctx.allocator, 0);
+
+    const batch_schema = try aa.alloc(types.Column, t.schema.columns.len);
+    const views = try aa.alloc(storage.ColumnView, t.schema.columns.len);
+    try plan.fill(ctx, t, out_schema, try stagedViews(aa, &staged), row_count, batch_schema, views);
+    defer plan.release(ctx, views);
+
+    // A row a join matched more than once is updated once.
+    var keys: std.StringHashMapUnmanaged(void) = .empty;
+    var key_buf: std.ArrayList(u8) = .empty;
+    for (0..row_count) |r| {
+        key_buf.clearRetainingCapacity();
+        for (t.order_key_indices) |ci| try views[ci].appendValueBytes(aa, &key_buf, @intCast(r));
+        try keys.put(aa, try aa.dupe(u8, key_buf.items), {});
+    }
+    try t.insertBatch(batch_schema, views, row_count);
+    const affected: usize = keys.count();
+    ctx.affected_rows = @intCast(affected);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
+}
+
+/// DELETE in a form a filtered scan can't express (ORDER BY / LIMIT, an
+/// alias, a join, several targets). The SELECT yields every target's
+/// columns; each target then deletes the keys of its rows.
+fn compileDeleteFromSource(ctx: *CompileCtx, d: ir.DeleteOp) anyerror!Query {
+    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const tables = try aa.alloc(*ApiTable, d.targets.len);
+    var star_width: usize = 0;
+    for (d.targets, tables) |target, *t| {
+        t.* = try resolveTable(catalog, ctx.session.*, target.table);
+        // Only a key identifies the row a SELECT returned.
+        if (!t.*.schema.unique) return Error.UnsupportedOp;
+        star_width += t.*.schema.columns.len;
+    }
+
+    var source = try compileSubplan(ctx, d.source.?);
+    defer source.deinit();
+    if (source.outputSchema().len != star_width) return Error.BadRequest;
+    var staged = try stageDmlSource(ctx, aa, &source);
+    defer staged.deinit();
+    const row_count: usize = @intCast(staged.row_count);
+    const values = try stagedViews(aa, &staged);
+
+    var deleted: usize = 0;
+    var offset: usize = 0;
+    for (tables) |t| {
+        defer offset += t.schema.columns.len;
+        var preds: std.ArrayList(?PredicateExpr) = .empty;
+        rows: for (0..row_count) |r| {
+            const conjuncts = try aa.alloc(PredicateExpr, t.order_key_indices.len);
+            for (t.order_key_indices, conjuncts) |ci, *c| {
+                const value = try upsert_mod.viewValueAt(aa, values[offset + ci], @intCast(r)) orelse continue :rows;
+                c.* = .{ .leaf = .{ .col = t.schema.columns[ci].name, .op = .eq, .val = value } };
+            }
+            try preds.append(aa, .{ .@"and" = conjuncts });
+        }
+        if (preds.items.len == 0) continue;
+        const counts = try aa.alloc(usize, preds.items.len);
+        deleted += (try t.deleteKeyedBatch(preds.items, counts)) orelse return Error.UnsupportedOp;
+    }
+    ctx.affected_rows = @intCast(deleted);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(deleted));
 }
 
 /// The cast that widens an INSERT source column into its target type, or
@@ -2915,6 +3124,10 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
     if (row_count == 0) {
         return try EmptyOp.createWithCount(ctx.allocator, 0);
     }
+    var rule_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer rule_arena.deinit();
+    const rule = try duplicateRule(rule_arena.allocator(), t, op.table, op.mode, op.on_duplicate, op.columns, null);
+    var affected: usize = row_count;
 
     // AUTO_INCREMENT resolution must run under the Table mutex so the
     // counter we reserve and the rows we hand to insertBatch stay in
@@ -2962,7 +3175,10 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
             }
         }
 
-        try t.insertBatchLocked(builder.schemaSlice(), builder.views(), row_count);
+        switch (rule) {
+            .replace => try t.insertBatchLocked(builder.schemaSlice(), builder.views(), row_count),
+            .resolve => |action| affected = duplicateAffectedRows(try t.insertBatchOnDuplicateLocked(builder.schemaSlice(), builder.views(), row_count, action)),
+        }
     } else {
         for (op.rows) |row| {
             for (tbl_schema.columns, 0..) |col, si| {
@@ -2986,11 +3202,184 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
             }
         }
 
-        try t.insertBatch(builder.schemaSlice(), builder.views(), row_count);
+        switch (rule) {
+            .replace => try t.insertBatch(builder.schemaSlice(), builder.views(), row_count),
+            .resolve => |action| affected = duplicateAffectedRows(try t.insertBatchOnDuplicate(builder.schemaSlice(), builder.views(), row_count, action)),
+        }
     }
 
-    ctx.affected_rows = @intCast(row_count);
-    return try EmptyOp.createWithCount(ctx.allocator, @intCast(row_count));
+    ctx.affected_rows = @intCast(affected);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
+}
+
+/// MySQL's affected-row count under ON DUPLICATE KEY UPDATE: one per new
+/// row, two per updated one.
+fn duplicateAffectedRows(counts: upsert_mod.DuplicateCounts) usize {
+    return counts.inserted + 2 * counts.updated;
+}
+
+/// What a unique table does with an INSERT row whose key it already holds:
+/// plain INSERT replaces the stored row; IGNORE and a merging ON DUPLICATE
+/// KEY UPDATE hand the rows to `Table.insertBatchOnDuplicate`.
+const DuplicateRule = union(enum) {
+    replace,
+    resolve: upsert_mod.OnDuplicate,
+};
+
+/// Reduce an INSERT's IGNORE / ON DUPLICATE KEY UPDATE to its rule. A table
+/// without a unique key never meets a duplicate. An update that sets every
+/// non-key column from the new row is a replace, the path bulk upserts take;
+/// one that changes nothing is IGNORE. `source_names` are an INSERT ...
+/// SELECT's output columns, which its assignments may name.
+fn duplicateRule(
+    aa: Allocator,
+    t: *ApiTable,
+    op_table: ir.TableRef,
+    mode: ir.InsertMode,
+    on_duplicate: ?ir.OnDuplicate,
+    insert_columns: ?[]const []const u8,
+    source_names: ?[]const []const u8,
+) !DuplicateRule {
+    if (!t.schema.unique) return .replace;
+    const od = on_duplicate orelse return if (mode == .ignore) .{ .resolve = .ignore } else .replace;
+    const scope: DuplicateScope = .{
+        .schema = t.schema,
+        .table_name = op_table.name,
+        .od = od,
+        .insert_columns = insert_columns,
+        .source_names = source_names,
+    };
+    const columns = t.schema.columns;
+    const from_new_row = try aa.alloc(bool, columns.len);
+    @memset(from_new_row, false);
+    var computed: std.ArrayList(update_mod.Assignment) = .empty;
+    for (od.assignments) |a| {
+        const ci = t.schema.columnIndex(a.col) orelse return Error.ColumnNotFound;
+        const value = try scope.resolve(aa, a.value);
+        const is_key = for (t.order_key_indices) |k| {
+            if (k == ci) break true;
+        } else false;
+        if (value == .col_ref) {
+            if (types.columnNameEql(value.col_ref, columns[ci].name)) continue;
+            if (std.mem.startsWith(u8, value.col_ref, upsert_mod.incoming_prefix) and
+                types.columnNameEql(value.col_ref[upsert_mod.incoming_prefix.len..], columns[ci].name))
+            {
+                from_new_row[ci] = true;
+                continue;
+            }
+        }
+        // The key found the stored row; moving it is not a merge.
+        if (is_key) return Error.UnsupportedOp;
+        try computed.append(aa, .{ .col = columns[ci].name, .value = value });
+    }
+
+    var replaces_row = computed.items.len == 0;
+    for (columns, from_new_row, 0..) |c, from_new, ci| {
+        const is_key = for (t.order_key_indices) |k| {
+            if (k == ci) break true;
+        } else false;
+        if (is_key) continue;
+        if (from_new) {
+            try computed.append(aa, .{ .col = c.name, .value = .{ .col_ref = try std.mem.concat(aa, u8, &.{ upsert_mod.incoming_prefix, c.name }) } });
+        } else {
+            replaces_row = false;
+        }
+    }
+    if (replaces_row) return .replace;
+    if (computed.items.len == 0) return .{ .resolve = .ignore };
+    return .{ .resolve = .{ .update = computed.items } };
+}
+
+/// The names an ON DUPLICATE KEY UPDATE expression may use, resolved to
+/// the stored row's columns (bare) or the new row's (`incoming_prefix`).
+const DuplicateScope = struct {
+    schema: TableSchema,
+    table_name: []const u8,
+    od: ir.OnDuplicate,
+    insert_columns: ?[]const []const u8,
+    source_names: ?[]const []const u8,
+
+    fn resolve(self: DuplicateScope, aa: Allocator, e: ir.Expr) !ir.Expr {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        try collectExprNames(aa, &names, e);
+        var renames: std.ArrayList(exec.predicate.ColRename) = .empty;
+        for (names.items) |name| {
+            try renames.append(aa, .{ .from = name, .to = try self.resolveName(aa, name) });
+        }
+        return try exec.expr_mod.deepCloneRenamed(aa, e, renames.items);
+    }
+
+    fn resolveName(self: DuplicateScope, aa: Allocator, name: []const u8) ![]const u8 {
+        if (std.mem.startsWith(u8, name, ir.insert_values_prefix)) {
+            const ci = self.schema.columnIndex(name[ir.insert_values_prefix.len..]) orelse return Error.ColumnNotFound;
+            return (try self.incoming(aa, ci)).col_ref;
+        }
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+            const qualifier = name[0..dot];
+            const col = name[dot + 1 ..];
+            if (std.ascii.eqlIgnoreCase(qualifier, self.table_name)) {
+                const ci = self.schema.columnIndex(col) orelse return Error.ColumnNotFound;
+                return self.schema.columns[ci].name;
+            }
+            if (self.od.row_alias) |alias| {
+                if (std.ascii.eqlIgnoreCase(qualifier, alias)) return (try self.rowAliasColumn(aa, col)) orelse Error.ColumnNotFound;
+            }
+            return (try self.sourceColumn(aa, col)) orelse Error.ColumnNotFound;
+        }
+        if (self.od.row_alias_columns != null) {
+            if (try self.rowAliasColumn(aa, name)) |ref| return ref;
+        }
+        if (self.schema.columnIndex(name)) |ci| return self.schema.columns[ci].name;
+        return (try self.sourceColumn(aa, name)) orelse Error.ColumnNotFound;
+    }
+
+    fn rowAliasColumn(self: DuplicateScope, aa: Allocator, name: []const u8) !?[]const u8 {
+        const alias_columns = self.od.row_alias_columns orelse {
+            const ci = self.schema.columnIndex(name) orelse return null;
+            return (try self.incoming(aa, ci)).col_ref;
+        };
+        for (alias_columns, 0..) |a, j| {
+            if (types.columnNameEql(a, name)) return (try self.incoming(aa, try self.insertColumn(j))).col_ref;
+        }
+        return null;
+    }
+
+    fn sourceColumn(self: DuplicateScope, aa: Allocator, name: []const u8) !?[]const u8 {
+        const source_names = self.source_names orelse return null;
+        for (source_names, 0..) |s, j| {
+            if (types.columnNameEql(s, name)) return (try self.incoming(aa, try self.insertColumn(j))).col_ref;
+        }
+        return null;
+    }
+
+    /// The table column position `j` of the insert's column list fills.
+    fn insertColumn(self: DuplicateScope, j: usize) !usize {
+        const cols = self.insert_columns orelse return if (j < self.schema.columns.len) j else Error.ColumnNotFound;
+        if (j >= cols.len) return Error.ColumnNotFound;
+        return self.schema.columnIndex(cols[j]) orelse Error.ColumnNotFound;
+    }
+
+    fn incoming(self: DuplicateScope, aa: Allocator, ci: usize) !ir.Expr {
+        return .{ .col_ref = try std.mem.concat(aa, u8, &.{ upsert_mod.incoming_prefix, self.schema.columns[ci].name }) };
+    }
+};
+
+/// The column names `e` reads. Subqueries and session variables are
+/// resolved by passes that never reach ON DUPLICATE KEY UPDATE.
+fn collectExprNames(aa: Allocator, out: *std.ArrayListUnmanaged([]const u8), e: ir.Expr) !void {
+    switch (e) {
+        .col_ref => |name| try out.append(aa, name),
+        .call => |c| for (c.args) |arg| try collectExprNames(aa, out, arg),
+        .case => |c| {
+            for (c.branches) |b| {
+                try exec.predicate.collectColumnNames(aa, out, b.cond);
+                try collectExprNames(aa, out, b.then);
+            }
+            if (c.else_branch) |eb| try collectExprNames(aa, out, eb.*);
+        },
+        .lit, .null_lit => {},
+        .scalar_subquery, .exists_subquery, .var_ref => return Error.UnsupportedOp,
+    }
 }
 
 /// Build a typed integer literal for the AI column type, given a

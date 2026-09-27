@@ -280,7 +280,25 @@ pub const AlterAction = union(enum) {
 pub const InsertMode = enum(u8) {
     insert = 0,
     replace = 1,
+    /// INSERT IGNORE: a row whose unique key is already present, in the
+    /// table or earlier in the statement, is skipped.
+    ignore = 2,
 };
+
+/// `ON DUPLICATE KEY UPDATE col = expr, ...`. An expression names the
+/// present row's columns bare or table-qualified, and the row being inserted
+/// through `VALUES(col)` (a column reference under `insert_values_prefix`),
+/// the row alias, or for INSERT ... SELECT the source's columns.
+pub const OnDuplicate = struct {
+    assignments: []const Assignment,
+    /// `VALUES (...) AS row_alias [(row_alias_columns)]`.
+    row_alias: ?[]const u8 = null,
+    row_alias_columns: ?[]const []const u8 = null,
+};
+
+/// `VALUES(col)` inside ON DUPLICATE KEY UPDATE parses to a reference to
+/// `col` under this prefix; compile resolves it before anything evaluates.
+pub const insert_values_prefix = "__insert_values__.";
 
 pub const InsertOp = struct {
     mode: InsertMode = .insert,
@@ -293,6 +311,7 @@ pub const InsertOp = struct {
     /// `columns.?.len` (when named) or the table schema width
     /// (positional).
     rows: []const []const ?Value,
+    on_duplicate: ?OnDuplicate = null,
 };
 
 /// Introspection statement payload. SHOW ops materialize one column
@@ -608,6 +627,18 @@ pub const DeleteOp = struct {
     /// Computed operands the predicate compares by name (`n % 3 = 0`
     /// compares a derived `n % 3` with 0), evaluated ahead of it per batch.
     derived: []const Derived = &.{},
+    /// The MySQL forms a filtered scan can't express — ORDER BY / LIMIT, an
+    /// alias, a join, several targets — select the rows to delete instead:
+    /// every target's columns, in `targets` order.
+    source: ?*Op = null,
+    targets: []const DmlTarget = &.{},
+};
+
+/// A table an UPDATE or DELETE over a SELECT writes, and the name its
+/// columns carry in that SELECT.
+pub const DmlTarget = struct {
+    table: TableRef,
+    qualifier: []const u8,
 };
 
 /// One `col = expr` assignment in an UPDATE statement.
@@ -627,6 +658,10 @@ pub const UpdateOp = struct {
     predicate: ?@import("../exec/predicate.zig").PredicateExpr,
     /// Same as `DeleteOp.derived`.
     derived: []const Derived = &.{},
+    /// As `DeleteOp.source`, followed by one column per assignment value;
+    /// the target is whichever of `targets` holds the assigned columns.
+    source: ?*Op = null,
+    targets: []const DmlTarget = &.{},
 };
 
 /// EXPLAIN <statement> — wraps an inner statement. Compiling it builds the
@@ -662,6 +697,7 @@ pub const InsertSelect = struct {
     table: TableRef,
     columns: ?[]const []const u8,
     source: *Op,
+    on_duplicate: ?OnDuplicate = null,
 };
 
 /// In-memory operator tree, built by the client query-builder and decoded
@@ -1094,6 +1130,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try encodeOp(allocator, out, c.source.*);
         },
         .insert_select => |i| {
+            if (i.on_duplicate != null) return EncodeError.OutOfMemory;
             try encodeTableRef(allocator, out, i.table);
             try out.append(allocator, @intFromEnum(i.mode));
             if (i.columns) |cols| {
@@ -1527,6 +1564,8 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
 }
 
 fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) EncodeError!void {
+    // ON DUPLICATE KEY UPDATE is server-local, like UPDATE.
+    if (i.on_duplicate != null) return EncodeError.OutOfMemory;
     try encodeTableRef(allocator, out, i.table);
     try out.append(allocator, @intFromEnum(i.mode));
     if (i.columns) |cols| {
@@ -2872,7 +2911,7 @@ fn decodeInsertMode(bytes: []const u8, cursor: *usize) DecodeError!InsertMode {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag = bytes[cursor.*];
     cursor.* += 1;
-    if (tag > @intFromEnum(InsertMode.replace)) return Error.IrCorrupt;
+    if (tag > @intFromEnum(InsertMode.ignore)) return Error.IrCorrupt;
     return @enumFromInt(tag);
 }
 

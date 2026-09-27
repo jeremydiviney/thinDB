@@ -21,6 +21,7 @@ const ReaderPreferringRwLock = @import("../util/reader_preferring_rwlock.zig").R
 const StatementGate = @import("../util/statement_gate.zig").StatementGate;
 
 const api = @import("api.zig");
+const upsert_mod = @import("upsert.zig");
 const Config = api.Config;
 const SyncMode = api.SyncMode;
 const Error = api.Error;
@@ -428,6 +429,42 @@ pub const Table = struct {
         try self.awaitWalDurable(wal_target);
     }
 
+    /// INSERT IGNORE / INSERT ... ON DUPLICATE KEY UPDATE on a unique table:
+    /// a row whose key the table holds follows `action` instead of replacing
+    /// the stored row (see upsert.zig).
+    pub fn insertBatchOnDuplicate(
+        self: *Table,
+        batch_schema: []const types.Column,
+        views: []const storage.ColumnView,
+        row_count: usize,
+        action: upsert_mod.OnDuplicate,
+    ) !upsert_mod.DuplicateCounts {
+        const statement_lease = try self.acquireStatement();
+        defer if (statement_lease) |lease| lease.release();
+        self.mutex.lockUncancelable(self.io);
+        var wal_target: ?u64 = null;
+        const counts = blk: {
+            defer self.mutex.unlock(self.io);
+            break :blk try upsert_mod.insertOnDuplicateLocked(self, batch_schema, views, row_count, action, &wal_target);
+        };
+        try self.awaitWalDurable(wal_target);
+        return counts;
+    }
+
+    /// `insertBatchOnDuplicate` for a caller already holding `self.mutex`.
+    pub fn insertBatchOnDuplicateLocked(
+        self: *Table,
+        batch_schema: []const types.Column,
+        views: []const storage.ColumnView,
+        row_count: usize,
+        action: upsert_mod.OnDuplicate,
+    ) !upsert_mod.DuplicateCounts {
+        var wal_target: ?u64 = null;
+        const counts = try upsert_mod.insertOnDuplicateLocked(self, batch_schema, views, row_count, action, &wal_target);
+        try self.awaitWalDurable(wal_target);
+        return counts;
+    }
+
     pub fn insertBatchInner(
         self: *Table,
         batch_schema: []const types.Column,
@@ -679,7 +716,6 @@ pub const Table = struct {
         // the segment but before the sidecar just costs pruning (probe treats
         // a missing sidecar as "no filter").
         if (self.schema.unique and self.order_key_indices.len > 0 and info.row_count > 0) {
-            const upsert_mod = @import("upsert.zig");
             var hashes: std.ArrayList(u64) = .empty;
             defer hashes.deinit(self.allocator);
             try upsert_mod.appendKeyHashes(self.allocator, &hashes, snapshot.views, self.order_key_indices, @intCast(info.row_count));
