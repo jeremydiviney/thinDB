@@ -69,10 +69,12 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value, null),
         .delete_op => |*d| {
+            if (d.source) |s| try resolveSubqueriesInOp(ctx, s);
             if (d.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
             for (d.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
         },
         .update_op => |*u| {
+            if (u.source) |s| try resolveSubqueriesInOp(ctx, s);
             if (u.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
             for (u.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
             for (u.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);

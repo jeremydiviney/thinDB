@@ -105,6 +105,8 @@ pub const ParseError = error{
     /// A column list over a query that projects `*`: the names it renames
     /// are only known once the query binds.
     SqlColumnListOverStar,
+    /// A multi-table UPDATE assigning columns of more than one table.
+    SqlUpdateTargetsUnsupported,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -4914,10 +4916,13 @@ pub const Parser = struct {
     /// predicate uses the full PredicateExpr grammar so AND/OR/IN
     /// (literal-list AND subquery) work — pre-compile resolution
     /// handles subqueries and `@var` references before the per-row
-    /// evaluation runs.
+    /// evaluation runs. MySQL's other forms go through `parseDeleteSource`.
     pub fn parseDelete(self: *Parser) ParseError!*ir.Op {
         try self.expect(.kw_delete);
-        try self.expect(.kw_from);
+        try self.skipDmlModifiers();
+        if (self.cur.tag != .kw_from) return try self.parseDeleteSource(false);
+        try self.advance();
+        if (try self.dmlNeedsSource(.kw_where)) return try self.parseDeleteSource(true);
         const tref = try self.parseTableRef();
         var pred: ?PredicateExpr = null;
         var derived: []const ir.Derived = &.{};
@@ -4935,8 +4940,11 @@ pub const Parser = struct {
     /// `SET x = x + 1`, `SET label = lower(name)`, or
     /// `SET y = (SELECT AVG(y) FROM t)`. Subqueries / `@vars` resolve
     /// in the pre-compile pass before the per-row evaluation runs.
+    /// MySQL's other forms go through `parseUpdateSource`.
     pub fn parseUpdate(self: *Parser) ParseError!*ir.Op {
         try self.expect(.kw_update);
+        try self.skipDmlModifiers();
+        if (try self.dmlNeedsSource(.kw_set)) return try self.parseUpdateSource();
         const tref = try self.parseTableRef();
         try self.expect(.kw_set);
 
@@ -4968,6 +4976,304 @@ pub const Parser = struct {
             .assignments = assigns_owned,
             .predicate = pred,
             .derived = derived,
+        } });
+    }
+
+    /// MySQL's DELETE / UPDATE modifiers, which mean nothing to a
+    /// single-writer table. `IGNORE` included: a statement that fails still
+    /// changes nothing.
+    fn skipDmlModifiers(self: *Parser) ParseError!void {
+        while (self.cur.tag == .kw_ignore or (self.cur.tag == .identifier and
+            (std.ascii.eqlIgnoreCase(self.cur.text, "low_priority") or std.ascii.eqlIgnoreCase(self.cur.text, "quick"))))
+        {
+            try self.advance();
+        }
+    }
+
+    /// Whether an UPDATE / DELETE takes `parseUpdateSource` /
+    /// `parseDeleteSource`: anything past a bare table name before `stop`
+    /// (an alias, a join, USING), a qualified SET target, or ORDER BY / LIMIT.
+    fn dmlNeedsSource(self: *Parser, stop: TokenTag) ParseError!bool {
+        var look = self.lex.*;
+        var tok = self.cur;
+        var expect_name = true;
+        while (tok.tag != stop) : (tok = try look.next()) {
+            switch (tok.tag) {
+                .eof, .semicolon, .kw_where, .kw_order, .kw_limit => break,
+                else => {},
+            }
+            const fits = if (expect_name) tok.tag == .identifier else tok.tag == .dot;
+            if (!fits) return true;
+            expect_name = !expect_name;
+        }
+        // No table, or one ending in a dot: the plain parser reports it.
+        if (expect_name) return false;
+        if (tok.tag == .kw_order or tok.tag == .kw_limit) return true;
+        if (tok.tag == .eof or tok.tag == .semicolon) return false;
+
+        var depth: usize = 0;
+        // 1 = a SET target comes next, 2 = one was just read.
+        var target_state: u2 = if (tok.tag == .kw_set) 1 else 0;
+        var in_set = tok.tag == .kw_set;
+        while (true) {
+            tok = try look.next();
+            const at_top = depth == 0;
+            switch (tok.tag) {
+                .eof, .semicolon => return false,
+                .lparen => depth += 1,
+                .rparen => depth -|= 1,
+                .kw_order, .kw_limit => if (at_top) return true,
+                .kw_where => if (at_top) {
+                    in_set = false;
+                },
+                .dot => if (target_state == 2) return true,
+                .identifier => if (at_top and std.ascii.eqlIgnoreCase(tok.text, "using")) return true,
+                else => {},
+            }
+            target_state = if (tok.tag == .comma and at_top and in_set)
+                1
+            else if (tok.tag == .identifier and target_state == 1)
+                2
+            else
+                0;
+        }
+    }
+
+    const DmlTable = struct {
+        table: ir.TableRef,
+        alias: ?[]const u8,
+    };
+
+    const DmlTableRefs = struct {
+        /// Source text, for the SELECT the statement becomes.
+        text: []const u8,
+        /// The tables named at the top level, with their aliases.
+        tables: []const DmlTable,
+    };
+
+    /// The table references of an UPDATE / DELETE, up to `stop` or WHERE /
+    /// ORDER BY / LIMIT / the statement end at the top level.
+    fn scanDmlTableRefs(self: *Parser, stop: TokenTag) ParseError!DmlTableRefs {
+        const start = self.prev_end;
+        var tables: std.ArrayList(DmlTable) = .empty;
+        var depth: usize = 0;
+        var at_table = true;
+        while (true) {
+            const tag = self.cur.tag;
+            if (tag == .eof or tag == .semicolon) break;
+            if (depth == 0 and (tag == stop or tag == .kw_where or tag == .kw_order or tag == .kw_limit)) break;
+            if (depth == 0 and at_table and tag == .identifier) {
+                at_table = false;
+                const table = try self.parseTableRef();
+                var alias: ?[]const u8 = null;
+                if (self.cur.tag == .kw_as) {
+                    try self.advance();
+                    alias = try self.dupedIdentLower();
+                } else if (self.implicitFromAliasAhead()) {
+                    alias = try self.dupedIdentLower();
+                }
+                try tables.append(self.arena, .{ .table = table, .alias = alias });
+                continue;
+            }
+            at_table = false;
+            switch (tag) {
+                .lparen => depth += 1,
+                .rparen => depth -|= 1,
+                .comma, .kw_join => at_table = depth == 0,
+                else => {},
+            }
+            try self.advance();
+        }
+        if (tables.items.len == 0) return ParseError.SqlExpectedIdent;
+        return .{ .text = self.sourceText()[start..self.prev_end], .tables = tables.items };
+    }
+
+    /// The table among `tables` that `name` denotes: its alias, or the name
+    /// of a table without one.
+    fn dmlTarget(tables: []const DmlTable, name: []const u8) ParseError!ir.DmlTarget {
+        for (tables) |t| {
+            const qualifier = t.alias orelse t.table.name;
+            if (std.ascii.eqlIgnoreCase(qualifier, name)) return .{ .table = t.table, .qualifier = qualifier };
+        }
+        return ParseError.SqlOnRefsUnknownTable;
+    }
+
+    /// Step past one SET value, returning its source text.
+    fn skipDmlValue(self: *Parser) ParseError![]const u8 {
+        const start = self.prev_end;
+        var depth: usize = 0;
+        while (true) {
+            switch (self.cur.tag) {
+                .eof, .semicolon => break,
+                .lparen, .kw_case => depth += 1,
+                .rparen, .kw_end => {
+                    if (depth == 0) break;
+                    depth -= 1;
+                },
+                .comma, .kw_where, .kw_order, .kw_limit => if (depth == 0) break,
+                else => {},
+            }
+            try self.advance();
+        }
+        if (self.prev_end == start) return ParseError.SqlExpectedValue;
+        return self.sourceText()[start..self.prev_end];
+    }
+
+    /// Step to the statement's end, returning the text passed over.
+    fn skipDmlTail(self: *Parser) ParseError![]const u8 {
+        const start = self.prev_end;
+        while (self.cur.tag != .eof and self.cur.tag != .semicolon) try self.advance();
+        return self.sourceText()[start..self.prev_end];
+    }
+
+    /// `SELECT <target>.*, ..., (<value>) AS __set_<i>, ... FROM <refs><tail>`,
+    /// parsed on its own.
+    fn parseDmlSelect(
+        self: *Parser,
+        targets: []const ir.DmlTarget,
+        values: []const []const u8,
+        refs: DmlTableRefs,
+        tail: []const u8,
+    ) ParseError!*ir.Op {
+        var sql: std.ArrayList(u8) = .empty;
+        try sql.appendSlice(self.arena, "SELECT ");
+        for (targets, 0..) |t, i| {
+            if (i > 0) try sql.appendSlice(self.arena, ", ");
+            try sql.append(self.arena, '`');
+            for (t.qualifier) |c| {
+                if (c == '`') try sql.append(self.arena, '`');
+                try sql.append(self.arena, c);
+            }
+            try sql.appendSlice(self.arena, "`.*");
+        }
+        for (values, 0..) |v, i| {
+            try sql.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", ({s}) AS __set_{d}", .{ v, i }));
+        }
+        try sql.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, " FROM {s}{s}", .{ refs.text, tail }));
+
+        var lex = Lexer.init(self.arena, sql.items);
+        lex.dialect = self.lex.dialect;
+        var sub = Parser{
+            .arena = self.arena,
+            .lex = &lex,
+            .cur = try lex.next(),
+            .udf_registry = self.udf_registry,
+            .sql_fns = self.sql_fns,
+        };
+        const op = try sub.parseStatement();
+        try sub.applyAutoMaterialize();
+        if (sub.cur.tag != .eof) return ParseError.SqlTrailingTokens;
+        return op;
+    }
+
+    /// DELETE forms a filtered scan can't express, as a SELECT of every
+    /// target's columns: `DELETE FROM t [AS a] ... [ORDER BY ...] [LIMIT n]`,
+    /// `DELETE t1[, t2] FROM <tables> ...` and `DELETE FROM t1[, t2] USING
+    /// <tables> ...`. `after_from` says FROM was consumed.
+    fn parseDeleteSource(self: *Parser, after_from: bool) ParseError!*ir.Op {
+        var names: std.ArrayList([]const u8) = .empty;
+        const refs = if (!after_from) blk: {
+            try self.parseDeleteTargetNames(&names);
+            try self.expect(.kw_from);
+            break :blk try self.scanDmlTableRefs(.kw_where);
+        } else if (try self.usingAhead()) blk: {
+            try self.parseDeleteTargetNames(&names);
+            if (!self.joinWordAhead("using")) return ParseError.SqlExpectedKeyword;
+            try self.advance();
+            break :blk try self.scanDmlTableRefs(.kw_where);
+        } else try self.scanDmlTableRefs(.kw_where);
+        const tail = try self.skipDmlTail();
+
+        var targets: std.ArrayList(ir.DmlTarget) = .empty;
+        if (names.items.len == 0) {
+            if (refs.tables.len != 1) return ParseError.SqlOnRefsUnknownTable;
+            const only = refs.tables[0];
+            try targets.append(self.arena, .{ .table = only.table, .qualifier = only.alias orelse only.table.name });
+        }
+        for (names.items) |name| try targets.append(self.arena, try dmlTarget(refs.tables, name));
+        const source = try self.parseDmlSelect(targets.items, &.{}, refs, tail);
+        return try self.allocOp(.{ .delete_op = .{
+            .table = targets.items[0].table,
+            .predicate = null,
+            .source = source,
+            .targets = targets.items,
+        } });
+    }
+
+    /// `t1[.*][, t2[.*] ...]`: the tables a multi-table DELETE removes rows
+    /// from, by alias or name.
+    fn parseDeleteTargetNames(self: *Parser, names: *std.ArrayList([]const u8)) ParseError!void {
+        while (true) {
+            var name = try self.dupedIdentLower();
+            while (self.cur.tag == .dot) {
+                try self.advance();
+                if (self.cur.tag == .star) {
+                    try self.advance();
+                    break;
+                }
+                name = try self.dupedIdentLower();
+            }
+            try names.append(self.arena, name);
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+    }
+
+    fn usingAhead(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        var tok = self.cur;
+        while (true) : (tok = try look.next()) {
+            switch (tok.tag) {
+                .eof, .semicolon, .kw_where, .lparen => return false,
+                .identifier => if (std.ascii.eqlIgnoreCase(tok.text, "using")) return true,
+                else => {},
+            }
+        }
+    }
+
+    /// UPDATE forms a filtered scan can't express, as a SELECT of each
+    /// candidate target's columns followed by the assignment values. SET
+    /// targets qualified by one table make it the target; unqualified ones
+    /// leave every named table a candidate, for compile to settle by which
+    /// holds the assigned columns.
+    fn parseUpdateSource(self: *Parser) ParseError!*ir.Op {
+        const refs = try self.scanDmlTableRefs(.kw_set);
+        try self.expect(.kw_set);
+        var assigns: std.ArrayList(ir.Assignment) = .empty;
+        var values: std.ArrayList([]const u8) = .empty;
+        var qualifier: ?[]const u8 = null;
+        while (true) {
+            var col = try self.dupedIdent();
+            if (self.cur.tag == .dot) {
+                try self.advance();
+                if (qualifier) |q| {
+                    if (!std.ascii.eqlIgnoreCase(q, col)) return ParseError.SqlUpdateTargetsUnsupported;
+                }
+                qualifier = col;
+                col = try self.dupedIdent();
+            }
+            try self.expect(.eq);
+            try values.append(self.arena, try self.skipDmlValue());
+            const value_name = try std.fmt.allocPrint(self.arena, "__set_{d}", .{assigns.items.len});
+            try assigns.append(self.arena, .{ .col = col, .value = .{ .col_ref = value_name } });
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        const tail = try self.skipDmlTail();
+
+        var targets: std.ArrayList(ir.DmlTarget) = .empty;
+        if (qualifier) |q| {
+            try targets.append(self.arena, try dmlTarget(refs.tables, q));
+        } else {
+            for (refs.tables) |t| try targets.append(self.arena, .{ .table = t.table, .qualifier = t.alias orelse t.table.name });
+        }
+        const source = try self.parseDmlSelect(targets.items, values.items, refs, tail);
+        return try self.allocOp(.{ .update_op = .{
+            .table = targets.items[0].table,
+            .assignments = assigns.items,
+            .predicate = null,
+            .source = source,
+            .targets = targets.items,
         } });
     }
 
