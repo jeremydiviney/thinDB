@@ -313,6 +313,10 @@ const SessionState = struct {
     /// The XA branch xid started on this connection (between XA START and XA
     /// END). While set, DML is staged into that branch instead of executing.
     xa_active: ?[]const u8 = null,
+    /// LAST_INSERT_ID() and ROW_COUNT() as the last statement left them
+    /// (see `recordOutcome`).
+    last_insert_id: u64 = 0,
+    row_count: i64 = -1,
 
     fn init(allocator: Allocator, catalog: *Catalog, backend_id: u32) !SessionState {
         return .{
@@ -343,10 +347,13 @@ const SessionState = struct {
         self.vars = s.vars;
     }
 
-    /// Drop the connection's user variables (end of connection, or a reset).
+    /// Drop the connection's user variables, LAST_INSERT_ID() and ROW_COUNT()
+    /// (end of connection, or a reset).
     fn resetVars(self: *SessionState) void {
         local.CompiledQuery.freeSessionVars(self.allocator, self.vars);
         self.vars = null;
+        self.last_insert_id = 0;
+        self.row_count = -1;
     }
 
     /// Open the per-session temp namespace if it hasn't been opened yet.
@@ -390,7 +397,20 @@ const SessionState = struct {
             .dialect = .mysql,
             .temp_namespace = self.temp_namespace,
             .vars = self.vars,
+            .last_insert_id = self.last_insert_id,
+            .row_count = self.row_count,
         };
+    }
+
+    /// Keep what a finished statement leaves for ROW_COUNT() and
+    /// LAST_INSERT_ID(): DML its affected rows, a result set -1, anything
+    /// else 0; the id only when the statement generated one.
+    fn recordOutcome(self: *SessionState, op: ir.Op, compiled: *const local.CompiledQuery) void {
+        self.row_count = switch (op) {
+            .insert, .insert_select, .delete_op, .update_op => std.math.cast(i64, compiled.affectedRows()) orelse std.math.maxInt(i64),
+            else => if (isSideEffectOp(op)) 0 else -1,
+        };
+        if (compiled.lastInsertId()) |id| self.last_insert_id = id;
     }
 
     /// OR-able status bits derived from session state. Callers combine
@@ -1096,6 +1116,14 @@ fn handleQuery(
     var seq_id: u8 = 1;
     const caps = session.client_caps;
 
+    // Every shortcut below matches the whole payload, so on a batch it would
+    // answer the first statement and drop the rest; the engine's batch path
+    // runs each statement and flags all but the last with more results.
+    if (try isMultiStatementPayload(allocator, payload)) {
+        try runEngineQuery(allocator, w, catalog, session, payload, &seq_id, profiler);
+        return;
+    }
+
     if (try trySetThindbEnvVar(allocator, payload)) {
         try handshake.sendOkPacketStatus(allocator, w, seq_id, 0, 0, session.transactionStatus());
         return;
@@ -1108,6 +1136,7 @@ fn handleQuery(
             .begin => session.in_transaction = true,
             .commit, .rollback => session.in_transaction = false,
         }
+        session.row_count = 0;
         try handshake.sendOkPacketStatus(
             allocator,
             w,
@@ -1120,6 +1149,7 @@ fn handleQuery(
     }
 
     if (try canned.match(allocator, payload, session.current_schema)) |outcome| {
+        session.row_count = if (outcome == .ok_packet or outcome == .kill) 0 else -1;
         switch (outcome) {
             .ok_packet => try handshake.sendOkPacketStatus(
                 allocator,
@@ -1179,7 +1209,27 @@ fn handleQuery(
 
     if (try sendSyntheticWorkbenchSelect(allocator, w, catalog, session, payload, &seq_id, caps)) return;
 
+    // XA transaction control (Flink exactly-once): `XA START|END|PREPARE|COMMIT|
+    // ROLLBACK|RECOVER ...`. Not thinDB SQL — intercept before the parser.
+    {
+        const t = std.mem.trim(u8, payload, " \t\r\n;");
+        if (t.len > 2 and std.ascii.eqlIgnoreCase(t[0..2], "XA") and (t[2] == ' ' or t[2] == '\t')) {
+            try handleXaCommand(allocator, w, catalog, session, t, seq_id);
+            return;
+        }
+    }
+
     try runEngineQuery(allocator, w, catalog, session, payload, &seq_id, profiler);
+}
+
+fn isMultiStatementPayload(allocator: Allocator, payload: []const u8) Allocator.Error!bool {
+    // Only a `;` ahead of the trailing ones can separate statements; most
+    // payloads have none and skip the lex.
+    const body = std.mem.trimEnd(u8, payload, " \t\r\n;");
+    if (std.mem.indexOfScalar(u8, body, ';') == null) return false;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    return sql.isMultiStatement(arena.allocator(), payload, .mysql);
 }
 
 fn sendSyntheticWorkbenchSelect(
@@ -3292,16 +3342,6 @@ fn runEngineQuery(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    // XA transaction control (Flink exactly-once): `XA START|END|PREPARE|COMMIT|
-    // ROLLBACK|RECOVER ...`. Not thinDB SQL — intercept before the parser.
-    {
-        const t = std.mem.trim(u8, payload, " \t\r\n;");
-        if (t.len > 2 and std.ascii.eqlIgnoreCase(t[0..2], "XA") and (t[2] == ' ' or t[2] == '\t')) {
-            try handleXaCommand(allocator, w, catalog, session, t, seq_id.*);
-            return;
-        }
-    }
-
     const parse_start = profiler.start();
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
     const op = sql.parseWithContext(arena.allocator(), payload, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
@@ -3428,6 +3468,7 @@ fn runKeyedDeleteBatch(
     profiler.addRowsAffected(total);
     for (stmts) |s| profiler.recordSqlKind(classifySqlKind(s.*));
 
+    session.row_count = std.math.cast(i64, counts[counts.len - 1]) orelse std.math.maxInt(i64);
     for (counts, 0..) |c, j| {
         const is_last = last_is_final and j + 1 == stmts.len;
         const base: u16 = session.transactionStatus();
@@ -3684,6 +3725,7 @@ fn runSingleStatement(
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
         session.captureVars(new_session);
+        session.recordOutcome(op.*, &compiled);
         applyTransactionVerb(session, op.*);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
@@ -3693,7 +3735,7 @@ fn runSingleStatement(
             w,
             seq_id.*,
             affected_rows,
-            0,
+            compiled.lastInsertId() orelse 0,
             (extra_status & ~handshake.SERVER_STATUS_IN_TRANS) | session.transactionStatus(),
         );
         profiler.recordSince(.query_write, write_start);
@@ -3744,6 +3786,7 @@ fn runSingleStatement(
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
     session.captureVars(new_session);
+    session.recordOutcome(op.*, &compiled);
     return true;
 }
 
@@ -4051,6 +4094,7 @@ fn handleStmtExecute(
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
         session.captureVars(new_session);
+        session.recordOutcome(op.*, &compiled);
         applyTransactionVerb(session, op.*);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
@@ -4060,7 +4104,7 @@ fn handleStmtExecute(
             w,
             seq_id,
             affected_rows,
-            0,
+            compiled.lastInsertId() orelse 0,
             session.transactionStatus(),
         );
         profiler.recordSince(.stmt_execute_write, write_start);
@@ -4130,6 +4174,7 @@ fn handleStmtExecute(
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
     session.captureVars(new_session);
+    session.recordOutcome(op.*, &compiled);
 }
 
 /// COM_STMT_CLOSE — destroy the prepared statement. No response.
@@ -4182,6 +4227,74 @@ fn handleStmtSendLongData(session: *SessionState, payload: []const u8) !void {
     }
     var buf = &stmt.long_data[param_index].?;
     try buf.appendSlice(stmt.allocator, data);
+}
+
+fn testPacketBodies(allocator: Allocator, bytes: []const u8) ![]const []const u8 {
+    var bodies: std.ArrayList([]const u8) = .empty;
+    errdefer bodies.deinit(allocator);
+    var pos: usize = 0;
+    while (pos + 4 <= bytes.len) {
+        const len = std.mem.readInt(u24, bytes[pos..][0..3], .little);
+        try bodies.append(allocator, bytes[pos + 4 ..][0..len]);
+        pos += 4 + len;
+    }
+    return bodies.toOwnedSlice(allocator);
+}
+
+/// Each OK packet's status flags; every reply these tests read has small
+/// affected-row and insert-id counts, so both are one-byte lenenc ints.
+fn testOkStatuses(allocator: Allocator, bytes: []const u8) ![]u16 {
+    const bodies = try testPacketBodies(allocator, bytes);
+    defer allocator.free(bodies);
+    const statuses = try allocator.alloc(u16, bodies.len);
+    errdefer allocator.free(statuses);
+    for (bodies, statuses) |body, *status| {
+        try std.testing.expect(body.len >= 5 and body[0] == 0x00);
+        status.* = std.mem.readInt(u16, body[3..5], .little);
+    }
+    return statuses;
+}
+
+test "a batch runs every statement, SETs and transaction verbs included" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41 | handshake.CLIENT_MULTI_STATEMENTS;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE mix (id INT, v INT)", &profiler);
+    const cases = .{
+        .{ "SET NAMES utf8mb4; INSERT INTO mix VALUES (1, 10)", 2 },
+        .{ "SET @@session.sql_mode = ''; SET autocommit = 1; INSERT INTO mix VALUES (2, 20); SET TRANSACTION ISOLATION LEVEL READ COMMITTED", 4 },
+        .{ "START TRANSACTION; INSERT INTO mix VALUES (3, 30); COMMIT;", 3 },
+        .{ "SET NAMES utf8mb4;", 1 },
+    };
+    inline for (cases) |case| {
+        out.clearRetainingCapacity();
+        try handleQuery(allocator, &out.writer, c, &session, case[0], &profiler);
+        const statuses = try testOkStatuses(allocator, out.written());
+        defer allocator.free(statuses);
+        try std.testing.expectEqual(@as(usize, case[1]), statuses.len);
+        for (statuses, 1..) |status, n| {
+            try std.testing.expectEqual(n < statuses.len, status & handshake.SERVER_MORE_RESULTS_EXISTS != 0);
+        }
+    }
+
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "SELECT COUNT(*) FROM mix", &profiler);
+    const bodies = try testPacketBodies(allocator, out.written());
+    defer allocator.free(bodies);
+    var saw_count = false;
+    for (bodies) |body| saw_count = saw_count or std.mem.eql(u8, body, "\x013");
+    try std.testing.expect(saw_count);
 }
 
 test "applyInitDb resolves flat db__schema name" {

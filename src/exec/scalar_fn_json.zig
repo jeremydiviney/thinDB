@@ -13,6 +13,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const common = @import("scalar_fn_common.zig");
+const dec = @import("scalar_fn_decimal.zig");
+const Type = @import("../types.zig").Type;
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
@@ -322,6 +324,269 @@ pub fn toJsonKernel(allocator: Allocator, args: []const ColumnView, out: *Column
 fn emitNull(allocator: Allocator, ss: anytype, out: *ColumnStore, row: usize) !void {
     try ss.appendValue(allocator, "");
     try out.appendValidBit(allocator, row, false);
+}
+
+// ---------------------------------------------------------------------------
+// Building JSON from SQL values
+// ---------------------------------------------------------------------------
+
+/// Row `row` of an argument of type `t` as the JSONB value MySQL makes of it:
+/// text is a JSON string (never parsed), a JSON argument embeds as is, a
+/// DECIMAL keeps its digits, and a date or datetime becomes its text.
+fn appendSqlValue(aa: Allocator, out: *std.ArrayList(u8), t: Type, arg: ColumnView, row: usize) !void {
+    if (!arg.isValid(row)) return jb.appendNull(aa, out);
+    if (t == .json) {
+        const norm = try jb.normalize(aa, stringViewOf(arg).rowBytes(row));
+        defer if (norm.owned) aa.free(norm.bytes);
+        return out.appendSlice(aa, norm.bytes);
+    }
+    var buf: [64]u8 = undefined;
+    switch (arg.data) {
+        .varchar, .string, .char, .json => |sv| try jb.appendString(aa, out, sv.rowBytes(row)),
+        .boolean => |s| try jb.appendBool(aa, out, s[row] != 0),
+        inline .tinyint, .smallint, .int, .bigint => |s| try jb.appendInt(aa, out, s[row]),
+        .largeint => |s| {
+            if (std.math.cast(i64, s[row])) |v| return jb.appendInt(aa, out, v);
+            const digits = std.fmt.bufPrint(&buf, "{d}", .{s[row]}) catch unreachable;
+            try jb.appendNumber(aa, out, if (std.math.cast(u64, s[row]) != null) .unsigned else .decimal, digits);
+        },
+        inline .float, .double => |s| {
+            const x: f64 = s[row];
+            if (std.math.isFinite(x)) try jb.appendDouble(aa, out, x) else try jb.appendNull(aa, out);
+        },
+        inline .decimal64, .decimal128 => |s| {
+            const scale: u8 = if (t.decimalSpec()) |spec| spec.s else 0;
+            try jb.appendNumber(aa, out, .decimal, dec.formatDecimal(&buf, s[row], scale));
+        },
+        .date => |s| try jb.appendString(aa, out, try common.formatDate(&buf, s[row])),
+        .datetime => |s| {
+            const text = try common.formatDateTime(&buf, s[row]);
+            if (std.mem.indexOfScalar(u8, text, '.') != null) return jb.appendString(aa, out, text);
+            const len = text.len;
+            @memcpy(buf[len..][0..7], ".000000");
+            try jb.appendString(aa, out, buf[0 .. len + 7]);
+        },
+        .uuid => |s| {
+            var bytes: [16]u8 = undefined;
+            std.mem.writeInt(u128, &bytes, s[row], .big);
+            const hex = std.fmt.bytesToHex(bytes, .lower);
+            try jb.appendString(aa, out, hex[0..8] ++ "-" ++ hex[8..12] ++ "-" ++ hex[12..16] ++ "-" ++ hex[16..20] ++ "-" ++ hex[20..32]);
+        },
+    }
+}
+
+/// An object member name from row `row` of an argument of type `t`: text as
+/// is, anything else as it prints (`1` → "1"). MySQL rejects a NULL name.
+fn appendMemberName(aa: Allocator, name: *std.ArrayList(u8), scratch: *std.ArrayList(u8), t: Type, arg: ColumnView, row: usize) !void {
+    if (!arg.isValid(row)) return error.JsonNullMemberName;
+    if (t.isString() and t != .json) return name.appendSlice(aa, stringViewOf(arg).rowBytes(row));
+    scratch.clearRetainingCapacity();
+    try appendSqlValue(aa, scratch, t, arg, row);
+    try jb.appendUnquoted(aa, name, scratch.items);
+}
+
+/// JSON_ARRAY(v, ...) → JSON. Never NULL: a NULL argument is a JSON null.
+pub fn jsonArrayKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = out_type;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    const offsets = try allocator.alloc(u32, args.len);
+    defer allocator.free(offsets);
+    var elems: std.ArrayList(u8) = .empty;
+    defer elems.deinit(allocator);
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(allocator);
+    for (0..row_count) |row| {
+        elems.clearRetainingCapacity();
+        doc.clearRetainingCapacity();
+        for (args, arg_types, offsets) |arg, t, *off| {
+            off.* = @intCast(elems.items.len);
+            try appendSqlValue(allocator, &elems, t, arg, row);
+        }
+        try jb.appendArray(allocator, &doc, elems.items, offsets);
+        try ss.appendValue(allocator, doc.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+const Span = struct { start: u32, end: u32 };
+
+/// JSON_OBJECT(k, v, ...) → JSON. Never NULL; a repeated name keeps its last
+/// value.
+pub fn jsonObjectKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = out_type;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    const pairs = args.len / 2;
+    const members = try allocator.alloc(jb.Member, pairs);
+    defer allocator.free(members);
+    const name_spans = try allocator.alloc(Span, pairs);
+    defer allocator.free(name_spans);
+    const value_spans = try allocator.alloc(Span, pairs);
+    defer allocator.free(value_spans);
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(allocator);
+    var values: std.ArrayList(u8) = .empty;
+    defer values.deinit(allocator);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(allocator);
+    for (0..row_count) |row| {
+        names.clearRetainingCapacity();
+        values.clearRetainingCapacity();
+        doc.clearRetainingCapacity();
+        for (name_spans, value_spans, 0..) |*name_span, *value_span, p| {
+            name_span.start = @intCast(names.items.len);
+            try appendMemberName(allocator, &names, &scratch, arg_types[2 * p], args[2 * p], row);
+            name_span.end = @intCast(names.items.len);
+            value_span.start = @intCast(values.items.len);
+            try appendSqlValue(allocator, &values, arg_types[2 * p + 1], args[2 * p + 1], row);
+            value_span.end = @intCast(values.items.len);
+        }
+        for (members, name_spans, value_spans) |*m, name_span, value_span| m.* = .{
+            .key = names.items[name_span.start..name_span.end],
+            .val = values.items[value_span.start..value_span.end],
+        };
+        try jb.appendObject(allocator, &doc, members);
+        try ss.appendValue(allocator, doc.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+// JSON_ARRAYAGG(v) is GROUP_CONCAT(__json_agg_element(v) SEPARATOR ''), which
+// packs each row's JSONB value back to back, wrapped in __json_agg_array;
+// JSON_OBJECTAGG packs a JSONB name string before each value the same way.
+// JSONB values are self-delimiting, so the wrapper splits them without a
+// separator, and a DECIMAL keeps its digits (a text round trip would read
+// `1.50` back as a double).
+
+/// __json_agg_element(v) → the JSONB bytes of `v` (JSON null for NULL).
+pub fn jsonAggElementKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = out_type;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var value: std.ArrayList(u8) = .empty;
+    defer value.deinit(allocator);
+    for (0..row_count) |row| {
+        value.clearRetainingCapacity();
+        try appendSqlValue(allocator, &value, arg_types[0], args[0], row);
+        try ss.appendValue(allocator, value.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+/// __json_agg_member(k, v) → a JSONB string of the name, then `v`'s JSONB.
+pub fn jsonAggMemberKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = out_type;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var name: std.ArrayList(u8) = .empty;
+    defer name.deinit(allocator);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    var packed_member: std.ArrayList(u8) = .empty;
+    defer packed_member.deinit(allocator);
+    for (0..row_count) |row| {
+        name.clearRetainingCapacity();
+        packed_member.clearRetainingCapacity();
+        try appendMemberName(allocator, &name, &scratch, arg_types[0], args[0], row);
+        try jb.appendString(allocator, &packed_member, name.items);
+        try appendSqlValue(allocator, &packed_member, arg_types[1], args[1], row);
+        try ss.appendValue(allocator, packed_member.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+/// The next packed JSONB value at `bytes[pos..]`, checked whole: the packed
+/// text is an ordinary string anyone can pass in.
+fn nextPackedValue(bytes: []const u8, pos: usize) ![]const u8 {
+    const len = jb.checkedValueLen(bytes[pos..]) orelse return error.JsonInvalid;
+    const v = bytes[pos..][0..len];
+    if (!jb.wellFormed(v)) return error.JsonInvalid;
+    return v;
+}
+
+/// __json_agg_array(packed) → the JSON array of the packed values. NULL (no
+/// rows) stays NULL.
+pub fn jsonAggArrayKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    const sv = stringViewOf(args[0]);
+    var offsets: std.ArrayList(u32) = .empty;
+    defer offsets.deinit(allocator);
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(allocator);
+    for (0..row_count) |row| {
+        if (!args[0].isValid(row)) {
+            try emitNull(allocator, ss, out, base + row);
+            continue;
+        }
+        const elems = sv.rowBytes(row);
+        offsets.clearRetainingCapacity();
+        doc.clearRetainingCapacity();
+        var pos: usize = 0;
+        while (pos < elems.len) {
+            try offsets.append(allocator, @intCast(pos));
+            pos += (try nextPackedValue(elems, pos)).len;
+        }
+        try jb.appendArray(allocator, &doc, elems, offsets.items);
+        try ss.appendValue(allocator, doc.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+/// __json_agg_object(packed) → the JSON object of the packed name/value
+/// pairs, a repeated name keeping its last value. NULL (no rows) stays NULL.
+pub fn jsonAggObjectKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    const sv = stringViewOf(args[0]);
+    var members: std.ArrayList(jb.Member) = .empty;
+    defer members.deinit(allocator);
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(allocator);
+    for (0..row_count) |row| {
+        if (!args[0].isValid(row)) {
+            try emitNull(allocator, ss, out, base + row);
+            continue;
+        }
+        const packed_members = sv.rowBytes(row);
+        members.clearRetainingCapacity();
+        doc.clearRetainingCapacity();
+        var pos: usize = 0;
+        while (pos < packed_members.len) {
+            const name = try nextPackedValue(packed_members, pos);
+            if (jb.tagOf(name) != .string) return error.JsonInvalid;
+            pos += name.len;
+            if (pos >= packed_members.len) return error.JsonInvalid;
+            const value = try nextPackedValue(packed_members, pos);
+            pos += value.len;
+            try members.append(allocator, .{ .key = name[5..], .val = value });
+        }
+        try jb.appendObject(allocator, &doc, members.items);
+        try ss.appendValue(allocator, doc.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+/// CAST(json AS CHAR) → the document's text as MySQL prints it.
+pub fn jsonToTextKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const sv = stringViewOf(args[0]);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    for (0..row_count) |row| {
+        text.clearRetainingCapacity();
+        if (args[0].isValid(row)) {
+            const bytes = sv.rowBytes(row);
+            if (jb.normalize(allocator, bytes)) |norm| {
+                defer if (norm.owned) allocator.free(norm.bytes);
+                try jb.toText(allocator, &text, norm.bytes);
+            } else |_| try text.appendSlice(allocator, bytes);
+        }
+        try ss.appendValue(allocator, text.items);
+    }
 }
 
 // ---------------------------------------------------------------------------

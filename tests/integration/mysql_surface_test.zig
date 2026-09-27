@@ -226,6 +226,7 @@ test "mysql predicates: a parenthesized operand takes the operator after it" {
         .{ "WHERE (s) NOT IN ('pear', 'kiwi')", &[_][]const u8{"3"} },
         .{ "WHERE (id) BETWEEN 2 AND 3", &[_][]const u8{ "2", "3" } },
         .{ "WHERE (s) REGEXP '^p'", &[_][]const u8{"2"} },
+        .{ "WHERE (s) SOUNDS LIKE 'pair'", &[_][]const u8{"2"} },
         .{ "WHERE (id) IS NOT NULL", &[_][]const u8{ "1", "2", "3" } },
         .{ "WHERE (id) + 1 = 3", &[_][]const u8{"2"} },
         .{ "WHERE (id) MOD 2 = 0", &[_][]const u8{"2"} },

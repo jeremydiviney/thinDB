@@ -1011,6 +1011,8 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 
 `ValueOutOfRange` means INSERT or UPDATE wrote a value its column's type can't hold, such as 300 into a TINYINT or 127.5 into a TINYINT after rounding. MySQL's strict mode fails the statement the same way; a CAST clamps instead.
 
+Scalar functions reject bad arguments with their own errors, which reach a client under their names: `JsonInvalid` (malformed JSON text or JSONB bytes), `JsonNullMemberName` (a NULL key in `JSON_OBJECT` / `JSON_OBJECTAGG`), `IncorrectArgumentsToSleep` (a NULL or negative `SLEEP`), `RegexInvalidPattern`, `RegexInvalidMatchType` (a `match_type` letter outside `c i m n u`), `RegexInvalidReturnOption` (a `REGEXP_INSTR` return option other than 0 or 1) and `RegexIndexOutOfBounds` (a `REGEXP_*` position below 1 or past the end of the subject). MySQL raises the same conditions as errors.
+
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` prefix, which ALTER TABLE's swap directories use (§9.2).

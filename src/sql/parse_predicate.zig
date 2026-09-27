@@ -325,7 +325,7 @@ fn parseScalarLhs(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
             return try parseColOps(p, try p.materializePredicateExpr(lhs));
         },
-        else => {},
+        else => if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs)),
     }
     // A lone literal is truthiness, as a bare column is (`WHERE 1`).
     if (isPredicateEnd(p)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
@@ -354,7 +354,10 @@ fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
         },
         // A bare expression is MySQL truthiness (`WHERE fn(x)`, `WHERE 1 + x`):
         // non-zero and non-NULL, as for a bare column.
-        else => return try makeExprComparisonPredicate(p, lhs, .neq, .{ .lit = .{ .int = 0 } }),
+        else => {
+            if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs));
+            return try makeExprComparisonPredicate(p, lhs, .neq, .{ .lit = .{ .int = 0 } });
+        },
     }
 }
 
@@ -513,6 +516,20 @@ fn parseComparisonTail(p: anytype, lhs: ir.Expr) @TypeOf(p.*).Err!?PredicateExpr
     return try makeExprComparisonPredicate(p, lhs, op, try p.parseScalar());
 }
 
+/// MySQL's `a SOUNDS LIKE b`, which is `SOUNDEX(a) = SOUNDEX(b)`, at the
+/// cursor. SOUNDS lexes as an identifier.
+fn soundsLikeAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    if (p.cur.tag != .identifier or !std.ascii.eqlIgnoreCase(p.cur.text, "sounds")) return false;
+    var look = p.lex.*;
+    return (try look.next()).tag == .kw_like;
+}
+
+fn soundexCall(p: anytype, arg: ir.Expr) @TypeOf(p.*).Err!ir.Expr {
+    const args = try p.arena.alloc(ir.Expr, 1);
+    args[0] = arg;
+    return .{ .call = .{ .fn_name = try p.arena.dupe(u8, "soundex"), .args = args } };
+}
+
 /// The operator tail shared by every LHS that resolves to a column name —
 /// plain columns, hidden computed columns, hidden window/aggregate outputs:
 /// IS [NOT] NULL, [NOT] BETWEEN, [NOT] LIKE, [NOT] IN, comparisons.
@@ -520,6 +537,13 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
 
     if (p.cur.tag == .kw_is) return try parseIsOps(p, .{ .col_ref = col_dup });
+
+    if (try soundsLikeAhead(p)) {
+        try p.advance();
+        try p.advance();
+        const lhs = try soundexCall(p, .{ .col_ref = col_dup });
+        return try makeExprComparisonPredicate(p, lhs, .eq, try soundexCall(p, try p.parseScalar()));
+    }
 
     // Optional NOT — gates BETWEEN / LIKE / IN below.
     var negate_predicate = false;
@@ -787,7 +811,7 @@ fn predicateHasColumnRef(pred: PredicateExpr) bool {
 }
 
 /// Whether the parenthesized group at the cursor is the operand of a value
-/// operator: a comparison, IS, [NOT] IN / BETWEEN / LIKE / REGEXP,
+/// operator: a comparison, IS, [NOT] IN / BETWEEN / LIKE / REGEXP, SOUNDS LIKE,
 /// arithmetic, a JSON arrow or a cast follows its `)`. No predicate grammar
 /// continues a boolean group with any of them, so the group is a value
 /// whatever it holds: `(id) = 1`, `(UPPER(s)) LIKE 'A%'`, `(a + b) * 2 > x`,
@@ -808,7 +832,8 @@ fn parenthesizedOperandAhead(p: anytype) @TypeOf(p.*).Err!bool {
     return isComparisonToken(op_tok.tag) or isArithToken(op_tok.tag) or switch (op_tok.tag) {
         .kw_between, .kw_in, .kw_is, .kw_like, .kw_regexp, .kw_not, .arrow, .arrow2 => true,
         .pipe_pipe, .coloncolon => look.dialect != .mysql,
-        .identifier => std.ascii.eqlIgnoreCase(op_tok.text, "mod"),
+        .identifier => std.ascii.eqlIgnoreCase(op_tok.text, "mod") or
+            (std.ascii.eqlIgnoreCase(op_tok.text, "sounds") and (try look.next()).tag == .kw_like),
         else => false,
     };
 }

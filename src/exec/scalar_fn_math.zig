@@ -9,6 +9,7 @@ const common = @import("scalar_fn_common.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const simd = @import("../util/simd.zig");
+const memory = @import("../memory.zig");
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 
@@ -748,4 +749,61 @@ pub fn atan2Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
     const x = args[1].data.double;
     var i: usize = 0;
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, std.math.atan2(y[i], x[i]));
+}
+
+// ---------------------------------------------------------------------------
+// MySQL misc: interval(n, n1, n2, ...) / sleep(seconds).
+// ---------------------------------------------------------------------------
+
+/// INTERVAL(n, n1, n2, ...): the index of the first bound above `n`, so the
+/// count of bounds at most `n` when they ascend, as MySQL requires. A NULL
+/// bound is passed over and a NULL `n` gives -1; the result is never NULL.
+pub fn intervalKernel(comptime field: []const u8) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const base = out.data.rowCount();
+            const dst = try reserveInts(i64, allocator, out, row_count);
+            for (dst, 0..) |*d, i| {
+                d.* = intervalIndex(field, args, i);
+                try out.appendValidBit(allocator, base + i, true);
+            }
+        }
+    }.kernel;
+}
+
+fn intervalIndex(comptime field: []const u8, args: []const ColumnView, row: usize) i64 {
+    if (!args[0].isValid(row)) return -1;
+    const n = @field(args[0].data, field)[row];
+    for (args[1..], 0..) |bound, i| {
+        if (bound.isValid(row) and @field(bound.data, field)[row] > n) return @intCast(i);
+    }
+    return @intCast(args.len - 1);
+}
+
+/// Longest single wait between checks for KILL QUERY or a dropped client.
+const SLEEP_SLICE: std.Io.Duration = .fromMilliseconds(100);
+
+/// SLEEP(seconds): waits once for every row it's evaluated on, then gives 0.
+/// NULL, negative and NaN waits are errors, as in MySQL.
+pub fn sleepKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    // Kernels carry no Io. The stdlib's process-wide instance is stateless
+    // for a clock read and a sleep, the only calls made through it, so any
+    // worker thread can use it.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const seconds = args[0].data.double;
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        if (!args[0].isValid(i) or !(seconds[i] >= 0)) return error.IncorrectArgumentsToSleep;
+        const wait_ns = @min(seconds[i] * std.time.ns_per_s, 1e18);
+        const deadline = std.Io.Clock.awake.now(io).addDuration(.fromNanoseconds(@intFromFloat(wait_ns)));
+        while (true) {
+            try memory.checkCancelled(allocator);
+            const left = std.Io.Clock.awake.now(io).durationTo(deadline);
+            if (left.nanoseconds <= 0) break;
+            const slice: std.Io.Duration = if (left.nanoseconds < SLEEP_SLICE.nanoseconds) left else SLEEP_SLICE;
+            std.Io.sleep(io, slice, .awake) catch {};
+        }
+        try out.data.bigint.append(allocator, 0);
+        try out.appendValidBit(allocator, base + i, true);
+    }
 }

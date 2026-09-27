@@ -2,10 +2,11 @@
 //! parsed once into a compact, self-describing byte tree so that path
 //! extraction is a pointer-walk instead of a re-parse of the text.
 //!
-//! A value is self-identifying: its first byte is a type tag in 0..=7, which
-//! can never begin valid JSON *text* (which starts with `{ [ " - digit t f
-//! n`, all >= 0x22). Kernels use `looksBinary` to accept either form, so the
-//! at-rest storage format can be flipped from text to JSONB independently.
+//! A value is self-identifying: its first byte is a type tag in 0..=8, which
+//! can never begin valid JSON *text* (which starts with whitespace or `{ [ "
+//! - digit t f n`, all >= 0x09). Kernels use `looksBinary` to accept either
+//! form, so the at-rest storage format can be flipped from text to JSONB
+//! independently.
 //!
 //! Layout (all integers little-endian, offsets relative to the value's own
 //! first byte so any sub-value slice is a valid standalone document):
@@ -21,9 +22,12 @@
 //!   object: [7][u32 byte_len][u32 count]
 //!           [Entry{u32 key_off,u32 key_len,u32 val_off} * count]
 //!           [key bytes...][values...]          (entries sorted by key bytes)
+//!   number: [8][NumberKind][u32 len][ASCII]  (exact: a DECIMAL, or an
+//!           integer past i64 up to u64)
 //!
 //! Object keys are sorted (bytewise) at encode time, giving a canonical form
-//! and O(log n) member lookup by binary search.
+//! and O(log n) member lookup by binary search. Text prints the way MySQL
+//! prints a JSON value: `, ` and `: ` separators, members shorter key first.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,13 +41,20 @@ pub const Tag = enum(u8) {
     string = 5,
     array = 6,
     object = 7,
+    number = 8,
+};
+
+/// What an exact `number` is, which JSON_TYPE reports.
+pub const NumberKind = enum(u8) {
+    decimal = 0,
+    unsigned = 1,
 };
 
 pub const Error = error{JsonInvalid} || Allocator.Error;
 
 /// True if `bytes` is (the start of) a JSONB value rather than JSON text.
 pub inline fn looksBinary(bytes: []const u8) bool {
-    return bytes.len > 0 and bytes[0] <= @intFromEnum(Tag.object);
+    return bytes.len > 0 and bytes[0] <= @intFromEnum(Tag.number);
 }
 
 fn readU32(b: []const u8, at: usize) u32 {
@@ -54,6 +65,101 @@ fn writeU32(list: *std.ArrayList(u8), aa: Allocator, v: u32) !void {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, v, .little);
     try list.appendSlice(aa, buf[0..]);
+}
+
+// ---------------------------------------------------------------------------
+// JSONB writers
+// ---------------------------------------------------------------------------
+
+pub fn appendNull(aa: Allocator, out: *std.ArrayList(u8)) Allocator.Error!void {
+    try out.append(aa, @intFromEnum(Tag.null));
+}
+
+pub fn appendBool(aa: Allocator, out: *std.ArrayList(u8), v: bool) Allocator.Error!void {
+    try out.append(aa, @intFromEnum(if (v) Tag.true else Tag.false));
+}
+
+pub fn appendInt(aa: Allocator, out: *std.ArrayList(u8), v: i64) Allocator.Error!void {
+    var buf: [9]u8 = undefined;
+    buf[0] = @intFromEnum(Tag.int);
+    std.mem.writeInt(i64, buf[1..9], v, .little);
+    try out.appendSlice(aa, &buf);
+}
+
+pub fn appendDouble(aa: Allocator, out: *std.ArrayList(u8), v: f64) Allocator.Error!void {
+    var buf: [9]u8 = undefined;
+    buf[0] = @intFromEnum(Tag.double);
+    std.mem.writeInt(u64, buf[1..9], @bitCast(v), .little);
+    try out.appendSlice(aa, &buf);
+}
+
+pub fn appendString(aa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
+    try out.append(aa, @intFromEnum(Tag.string));
+    try writeU32(out, aa, @intCast(s.len));
+    try out.appendSlice(aa, s);
+}
+
+/// An exact number from its canonical digits (`-12.50`, `18446744073709551615`).
+pub fn appendNumber(aa: Allocator, out: *std.ArrayList(u8), kind: NumberKind, digits: []const u8) Allocator.Error!void {
+    try out.appendSlice(aa, &.{ @intFromEnum(Tag.number), @intFromEnum(kind) });
+    try writeU32(out, aa, @intCast(digits.len));
+    try out.appendSlice(aa, digits);
+}
+
+/// An array of the JSONB values packed back to back in `elems`, value `i`
+/// starting at byte `offsets[i]`.
+pub fn appendArray(aa: Allocator, out: *std.ArrayList(u8), elems: []const u8, offsets: []const u32) Allocator.Error!void {
+    const start = out.items.len;
+    try out.append(aa, @intFromEnum(Tag.array));
+    const bytelen_pos = out.items.len;
+    try writeU32(out, aa, 0);
+    const count: u32 = @intCast(offsets.len);
+    try writeU32(out, aa, count);
+    const elems_base: u32 = @intCast(out.items.len + count * 4 - start);
+    for (offsets) |o| try writeU32(out, aa, elems_base + o);
+    try out.appendSlice(aa, elems);
+    std.mem.writeInt(u32, out.items[bytelen_pos..][0..4], @intCast(out.items.len - start), .little);
+}
+
+pub const Member = struct { key: []const u8, val: []const u8 };
+
+fn memberKeyLess(_: void, a: Member, b: Member) bool {
+    return std.mem.lessThan(u8, a.key, b.key);
+}
+
+/// An object of `members`, which it reorders in place. A repeated key keeps
+/// its last value, as MySQL does.
+pub fn appendObject(aa: Allocator, out: *std.ArrayList(u8), members: []Member) Allocator.Error!void {
+    std.mem.sort(Member, members, {}, memberKeyLess);
+    var kept: usize = 0;
+    for (members) |m| {
+        if (kept > 0 and std.mem.eql(u8, members[kept - 1].key, m.key)) {
+            members[kept - 1] = m;
+            continue;
+        }
+        members[kept] = m;
+        kept += 1;
+    }
+    const unique = members[0..kept];
+    const start = out.items.len;
+    try out.append(aa, @intFromEnum(Tag.object));
+    const bytelen_pos = out.items.len;
+    try writeU32(out, aa, 0);
+    try writeU32(out, aa, @intCast(unique.len));
+    const entries_pos = out.items.len;
+    try out.appendNTimes(aa, 0, unique.len * 12);
+    for (unique, 0..) |m, i| {
+        const entry = entries_pos + i * 12;
+        std.mem.writeInt(u32, out.items[entry..][0..4], @intCast(out.items.len - start), .little);
+        std.mem.writeInt(u32, out.items[entry + 4 ..][0..4], @intCast(m.key.len), .little);
+        try out.appendSlice(aa, m.key);
+    }
+    for (unique, 0..) |m, i| {
+        const entry = entries_pos + i * 12;
+        std.mem.writeInt(u32, out.items[entry + 8 ..][0..4], @intCast(out.items.len - start), .little);
+        try out.appendSlice(aa, m.val);
+    }
+    std.mem.writeInt(u32, out.items[bytelen_pos..][0..4], @intCast(out.items.len - start), .little);
 }
 
 // ---------------------------------------------------------------------------
@@ -179,28 +285,16 @@ const Parser = struct {
         const text = self.src[start..self.pos];
         if (text.len == 0) return Error.JsonInvalid;
         if (!is_float) {
-            if (std.fmt.parseInt(i64, text, 10)) |iv| {
-                try out.append(self.aa, @intFromEnum(Tag.int));
-                var buf: [8]u8 = undefined;
-                std.mem.writeInt(i64, &buf, iv, .little);
-                try out.appendSlice(self.aa, buf[0..]);
-                return;
-            } else |_| {}
+            if (std.fmt.parseInt(i64, text, 10)) |iv| return appendInt(self.aa, out, iv) else |_| {}
+            if (std.fmt.parseInt(u64, text, 10)) |_| return appendNumber(self.aa, out, .unsigned, text) else |_| {}
         }
         const fv = std.fmt.parseFloat(f64, text) catch return Error.JsonInvalid;
-        try out.append(self.aa, @intFromEnum(Tag.double));
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &buf, @bitCast(fv), .little);
-        try out.appendSlice(self.aa, buf[0..]);
+        if (!std.math.isFinite(fv)) return Error.JsonInvalid;
+        try appendDouble(self.aa, out, fv);
     }
 
     fn array(self: *Parser, out: *std.ArrayList(u8)) Error!void {
         self.pos += 1; // '['
-        const start = out.items.len;
-        try out.append(self.aa, @intFromEnum(Tag.array));
-        const bytelen_pos = out.items.len;
-        try writeU32(out, self.aa, 0);
-        // Encode elements into a scratch list, tracking their relative offsets.
         var elems: std.ArrayList(u8) = .empty;
         defer elems.deinit(self.aa);
         var offs: std.ArrayList(u32) = .empty;
@@ -225,14 +319,7 @@ const Parser = struct {
                 return Error.JsonInvalid;
             }
         }
-        const count: u32 = @intCast(offs.items.len);
-        try writeU32(out, self.aa, count);
-        const table_bytes = count * 4;
-        const elems_base: u32 = @intCast((out.items.len + table_bytes) - start);
-        for (offs.items) |o| try writeU32(out, self.aa, elems_base + o);
-        try out.appendSlice(self.aa, elems.items);
-        const total: u32 = @intCast(out.items.len - start);
-        std.mem.writeInt(u32, out.items[bytelen_pos..][0..4], total, .little);
+        try appendArray(self.aa, out, elems.items, offs.items);
     }
 
     fn object(self: *Parser, out: *std.ArrayList(u8)) Error!void {
@@ -283,43 +370,10 @@ const Parser = struct {
                 return Error.JsonInvalid;
             }
         }
-        // Canonicalize: sort by key bytes; last write wins on duplicates.
-        std.mem.sort(KV, kvs.items, {}, struct {
-            fn lt(_: void, a: KV, b: KV) bool {
-                return std.mem.lessThan(u8, a.key, b.key);
-            }
-        }.lt);
-
-        const start = out.items.len;
-        try out.append(self.aa, @intFromEnum(Tag.object));
-        const bytelen_pos = out.items.len;
-        try writeU32(out, self.aa, 0);
-        const count: u32 = @intCast(kvs.items.len);
-        try writeU32(out, self.aa, count);
-        const entries_pos = out.items.len;
-        for (0..count) |_| {
-            try writeU32(out, self.aa, 0); // key_off
-            try writeU32(out, self.aa, 0); // key_len
-            try writeU32(out, self.aa, 0); // val_off
-        }
-        // Key bytes region, then value region.
-        var key_offs: [*]u32 = undefined;
-        _ = &key_offs;
-        for (kvs.items, 0..) |kv, i| {
-            const koff: u32 = @intCast(out.items.len - start);
-            try out.appendSlice(self.aa, kv.key);
-            const entry = entries_pos + i * 12;
-            std.mem.writeInt(u32, out.items[entry..][0..4], koff, .little);
-            std.mem.writeInt(u32, out.items[entry + 4 ..][0..4], @intCast(kv.key.len), .little);
-        }
-        for (kvs.items, 0..) |kv, i| {
-            const voff: u32 = @intCast(out.items.len - start);
-            try out.appendSlice(self.aa, kv.val);
-            const entry = entries_pos + i * 12;
-            std.mem.writeInt(u32, out.items[entry + 8 ..][0..4], voff, .little);
-        }
-        const total: u32 = @intCast(out.items.len - start);
-        std.mem.writeInt(u32, out.items[bytelen_pos..][0..4], total, .little);
+        const members = try self.aa.alloc(Member, kvs.items.len);
+        defer self.aa.free(members);
+        for (kvs.items, members) |kv, *m| m.* = .{ .key = kv.key, .val = kv.val };
+        try appendObject(self.aa, out, members);
     }
 
     /// Decode a JSON string (at the opening quote) into `out` as raw bytes,
@@ -403,7 +457,89 @@ pub fn valueLen(v: []const u8) usize {
         .int, .double => 9,
         .string => 1 + 4 + readU32(v, 1),
         .array, .object => readU32(v, 1),
+        .number => 6 + readU32(v, 2),
     };
+}
+
+/// Byte length of the value starting at `v[0]`, or null when `v` is too short
+/// to hold it or its tag isn't one.
+pub fn checkedValueLen(v: []const u8) ?usize {
+    if (v.len == 0 or v[0] > @intFromEnum(Tag.number)) return null;
+    const header: usize = switch (tagOf(v)) {
+        .null, .false, .true => 1,
+        .int, .double => 9,
+        .string, .array, .object => 5,
+        .number => 6,
+    };
+    if (v.len < header) return null;
+    const len = valueLen(v);
+    return if (len >= header and len <= v.len) len else null;
+}
+
+/// True when `v` is exactly one JSONB value whose every offset and length
+/// stays inside it: bytes from outside the engine are safe to walk.
+pub fn wellFormed(v: []const u8) bool {
+    const len = checkedValueLen(v) orelse return false;
+    if (len != v.len) return false;
+    switch (tagOf(v)) {
+        .number => return v[1] <= @intFromEnum(NumberKind.unsigned),
+        .array, .object => {
+            if (len < 9) return false;
+            const count = readU32(v, 5);
+            const entry_size: usize = if (tagOf(v) == .array) 4 else 12;
+            if (count > (len - 9) / entry_size) return false;
+            const body_start = 9 + count * entry_size;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const e = 9 + i * entry_size;
+                if (tagOf(v) == .object) {
+                    const koff = readU32(v, e);
+                    if (koff > len or readU32(v, e + 4) > len - koff) return false;
+                }
+                // Past the entry table, so each child is shorter than `v`.
+                const off = readU32(v, e + entry_size - 4);
+                if (off < body_start or off >= len) return false;
+                const child_len = checkedValueLen(v[off..]) orelse return false;
+                if (!wellFormed(v[off..][0..child_len])) return false;
+            }
+            return true;
+        },
+        else => return true,
+    }
+}
+
+fn numberKind(v: []const u8) NumberKind {
+    return @enumFromInt(v[1]);
+}
+
+fn numberDigits(v: []const u8) []const u8 {
+    return v[6..][0..readU32(v, 2)];
+}
+
+fn memberKey(obj: []const u8, i: u32) []const u8 {
+    const e = 9 + i * 12;
+    return obj[readU32(obj, e)..][0..readU32(obj, e + 4)];
+}
+
+fn memberValue(obj: []const u8, i: u32) []const u8 {
+    const voff = readU32(obj, 9 + i * 12 + 8);
+    return obj[voff..][0..valueLen(obj[voff..])];
+}
+
+fn printKeyLess(obj: []const u8, a: u32, b: u32) bool {
+    const ka = memberKey(obj, a);
+    const kb = memberKey(obj, b);
+    if (ka.len != kb.len) return ka.len < kb.len;
+    return std.mem.lessThan(u8, ka, kb);
+}
+
+/// An object's member indexes in the order MySQL prints them and lists them
+/// in JSON_KEYS: shorter keys first, equal lengths bytewise. Caller frees.
+fn printOrder(aa: Allocator, obj: []const u8) Allocator.Error![]u32 {
+    const order = try aa.alloc(u32, readU32(obj, 5));
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, obj, printKeyLess);
+    return order;
 }
 
 /// Member lookup on an object value by key. Returns the child value slice.
@@ -471,6 +607,10 @@ pub fn typeName(v: []const u8) []const u8 {
         .string => "STRING",
         .array => "ARRAY",
         .object => "OBJECT",
+        .number => switch (numberKind(v)) {
+            .decimal => "DECIMAL",
+            .unsigned => "UNSIGNED INTEGER",
+        },
     };
 }
 
@@ -535,32 +675,23 @@ fn arrayContains(target_arr: []const u8, cand: []const u8) bool {
 }
 
 /// Build a freshly-allocated JSONB array of an object's keys (each a JSON
-/// string), or null if `obj` is not an object. Caller owns the slice.
+/// string) in MySQL's order, or null if `obj` is not an object. Caller owns
+/// the slice.
 pub fn keysArray(aa: Allocator, obj: []const u8) Allocator.Error!?[]u8 {
     if (tagOf(obj) != .object) return null;
-    const count = readU32(obj, 5);
+    const order = try printOrder(aa, obj);
+    defer aa.free(order);
+    var elems: std.ArrayList(u8) = .empty;
+    defer elems.deinit(aa);
+    const offsets = try aa.alloc(u32, order.len);
+    defer aa.free(offsets);
+    for (order, offsets) |i, *off| {
+        off.* = @intCast(elems.items.len);
+        try appendString(aa, &elems, memberKey(obj, i));
+    }
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(aa);
-    const start = out.items.len;
-    try out.append(aa, @intFromEnum(Tag.array));
-    const bytelen_pos = out.items.len;
-    try writeU32(&out, aa, 0);
-    try writeU32(&out, aa, count);
-    const table_pos = out.items.len;
-    for (0..count) |_| try writeU32(&out, aa, 0);
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const off: u32 = @intCast(out.items.len - start);
-        std.mem.writeInt(u32, out.items[table_pos + i * 4 ..][0..4], off, .little);
-        const e = 9 + i * 12;
-        const koff = readU32(obj, e);
-        const klen = readU32(obj, e + 4);
-        try out.append(aa, @intFromEnum(Tag.string));
-        try writeU32(&out, aa, klen);
-        try out.appendSlice(aa, obj[koff .. koff + klen]);
-    }
-    const total: u32 = @intCast(out.items.len - start);
-    std.mem.writeInt(u32, out.items[bytelen_pos..][0..4], total, .little);
+    try appendArray(aa, &out, elems.items, offsets);
     return try out.toOwnedSlice(aa);
 }
 
@@ -593,7 +724,8 @@ fn appendEscaped(aa: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(aa, '"');
 }
 
-/// Serialize a JSONB value to canonical JSON text into `out`.
+/// Serialize a JSONB value to JSON text into `out`, spelled as MySQL prints
+/// it.
 pub fn toText(aa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.Error!void {
     switch (tagOf(v)) {
         .null => try out.appendSlice(aa, "null"),
@@ -604,11 +736,8 @@ pub fn toText(aa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.E
             var buf: [24]u8 = undefined;
             try out.appendSlice(aa, std.fmt.bufPrint(&buf, "{d}", .{iv}) catch unreachable);
         },
-        .double => {
-            const fv: f64 = @bitCast(std.mem.readInt(u64, v[1..][0..8], .little));
-            var buf: [40]u8 = undefined;
-            try out.appendSlice(aa, std.fmt.bufPrint(&buf, "{d}", .{fv}) catch unreachable);
-        },
+        .double => try appendDoubleText(aa, out, @bitCast(std.mem.readInt(u64, v[1..][0..8], .little))),
+        .number => try out.appendSlice(aa, numberDigits(v)),
         .string => {
             const len = readU32(v, 1);
             try appendEscaped(aa, out, v[5 .. 5 + len]);
@@ -619,30 +748,64 @@ pub fn toText(aa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.E
             const table = 9;
             var i: u32 = 0;
             while (i < count) : (i += 1) {
-                if (i != 0) try out.append(aa, ',');
+                if (i != 0) try out.appendSlice(aa, ", ");
                 const off = readU32(v, table + i * 4);
                 try toText(aa, out, v[off..][0..valueLen(v[off..])]);
             }
             try out.append(aa, ']');
         },
         .object => {
+            const order = try printOrder(aa, v);
+            defer aa.free(order);
             try out.append(aa, '{');
-            const count = readU32(v, 5);
-            const entries = 9;
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                if (i != 0) try out.append(aa, ',');
-                const e = entries + i * 12;
-                const koff = readU32(v, e);
-                const klen = readU32(v, e + 4);
-                try appendEscaped(aa, out, v[koff .. koff + klen]);
-                try out.append(aa, ':');
-                const voff = readU32(v, e + 8);
-                try toText(aa, out, v[voff..][0..valueLen(v[voff..])]);
+            for (order, 0..) |member_index, n| {
+                if (n != 0) try out.appendSlice(aa, ", ");
+                try appendEscaped(aa, out, memberKey(v, member_index));
+                try out.appendSlice(aa, ": ");
+                try toText(aa, out, memberValue(v, member_index));
             }
             try out.append(aa, '}');
         },
     }
+}
+
+/// A double as MySQL prints one in JSON: its shortest round-trip digits,
+/// positional when the decimal exponent is in -14..15 (or the digits reach
+/// past the point), otherwise `d.ddde[-]x`; a positional integer gains `.0`.
+fn appendDoubleText(aa: Allocator, out: *std.ArrayList(u8), x: f64) Allocator.Error!void {
+    if (x == 0) return out.appendSlice(aa, if (std.math.signbit(x)) "-0.0" else "0.0");
+    const float_fmt = std.fmt.float;
+    const d = float_fmt.binaryToDecimal(u64, @bitCast(x), std.math.floatMantissaBits(f64), std.math.floatExponentBits(f64), false, &float_fmt.Backend64_TablesFull);
+    var digit_buf: [24]u8 = undefined;
+    const all_digits = std.fmt.bufPrint(&digit_buf, "{d}", .{d.mantissa}) catch unreachable;
+    const point: i32 = @as(i32, @intCast(all_digits.len)) + d.exponent;
+    const digits = std.mem.trimEnd(u8, all_digits, "0");
+    const len: i32 = @intCast(digits.len);
+    if (d.sign) try out.append(aa, '-');
+    if (point >= -14 and (point <= 15 or len > point)) {
+        if (point <= 0) {
+            try out.appendSlice(aa, "0.");
+            try out.appendNTimes(aa, '0', @intCast(-point));
+            try out.appendSlice(aa, digits);
+        } else if (point >= len) {
+            try out.appendSlice(aa, digits);
+            try out.appendNTimes(aa, '0', @intCast(point - len));
+            try out.appendSlice(aa, ".0");
+        } else {
+            const whole: usize = @intCast(point);
+            try out.appendSlice(aa, digits[0..whole]);
+            try out.append(aa, '.');
+            try out.appendSlice(aa, digits[whole..]);
+        }
+        return;
+    }
+    try out.append(aa, digits[0]);
+    if (digits.len > 1) {
+        try out.append(aa, '.');
+        try out.appendSlice(aa, digits[1..]);
+    }
+    var exp_buf: [8]u8 = undefined;
+    try out.appendSlice(aa, std.fmt.bufPrint(&exp_buf, "e{d}", .{point - 1}) catch unreachable);
 }
 
 /// Append the unquoted scalar form (JSON_UNQUOTE) of a JSONB value: a string
@@ -670,18 +833,87 @@ fn roundtrip(aa: Allocator, text: []const u8, expect: []const u8) !void {
     try std.testing.expectEqualStrings(expect, out.items);
 }
 
-test "encode/serialize round-trip (canonical, keys sorted)" {
+test "encode/serialize round-trip prints as MySQL does" {
     const aa = std.testing.allocator;
-    try roundtrip(aa, "  42 ", "42");
-    try roundtrip(aa, "-7", "-7");
-    try roundtrip(aa, "3.5", "3.5");
-    try roundtrip(aa, "true", "true");
-    try roundtrip(aa, "null", "null");
-    try roundtrip(aa, "\"a\\nb\"", "\"a\\nb\"");
-    try roundtrip(aa, "[1, 2, 3]", "[1,2,3]");
-    // keys canonicalized to sorted order
-    try roundtrip(aa, "{\"b\": 1, \"a\": 2}", "{\"a\":2,\"b\":1}");
-    try roundtrip(aa, "{\"z\": [1, {\"y\": 2}], \"a\": \"x\"}", "{\"a\":\"x\",\"z\":[1,{\"y\":2}]}");
+    const cases = .{
+        .{ "  42 ", "42" },
+        .{ "-7", "-7" },
+        .{ "3.5", "3.5" },
+        .{ "true", "true" },
+        .{ "null", "null" },
+        .{ "\"a\\nb\"", "\"a\\nb\"" },
+        .{ "[1,2,3]", "[1, 2, 3]" },
+        .{ "[]", "[]" },
+        .{ "{}", "{}" },
+        .{ "{\"b\":1,\"a\":2}", "{\"a\": 2, \"b\": 1}" },
+        .{ "{\"aa\":1,\"b\":2,\"c\":3,\"a\":4}", "{\"a\": 4, \"b\": 2, \"c\": 3, \"aa\": 1}" },
+        .{ "{\"z\": [1, {\"y\": 2}], \"a\": \"x\"}", "{\"a\": \"x\", \"z\": [1, {\"y\": 2}]}" },
+        .{ "{\"a\":1,\"a\":2,\"b\":3,\"a\":5}", "{\"a\": 5, \"b\": 3}" },
+        .{ "18446744073709551615", "18446744073709551615" },
+        .{ "-9223372036854775808", "-9223372036854775808" },
+        .{ "18446744073709551616", "1.8446744073709552e19" },
+    };
+    inline for (cases) |c| try roundtrip(aa, c[0], c[1]);
+}
+
+test "doubles print as MySQL prints them in JSON" {
+    const aa = std.testing.allocator;
+    const cases = .{
+        .{ 1.5e-15, "0.0000000000000015" },
+        .{ 1.5e-16, "1.5e-16" },
+        .{ 1e14, "100000000000000.0" },
+        .{ 1e15, "1e15" },
+        .{ 100.0, "100.0" },
+        .{ 0.1, "0.1" },
+        .{ -0.0, "-0.0" },
+        .{ 0.0, "0.0" },
+        .{ -1.5, "-1.5" },
+        .{ -1e20, "-1e20" },
+        .{ 123456789.0, "123456789.0" },
+        .{ 1234567890123456789.0, "1.2345678901234568e18" },
+        .{ 12345678901234567.0, "1.2345678901234568e16" },
+        .{ 1.7976931348623157e308, "1.7976931348623157e308" },
+        .{ 5e-324, "5e-324" },
+        .{ 1e-7, "0.0000001" },
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(aa);
+    inline for (cases) |c| {
+        out.clearRetainingCapacity();
+        try appendDoubleText(aa, &out, c[0]);
+        try std.testing.expectEqualStrings(c[1], out.items);
+    }
+}
+
+test "exact numbers keep their digits and report their JSON type" {
+    const aa = std.testing.allocator;
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(aa);
+    try appendNumber(aa, &doc, .decimal, "1.50");
+    try std.testing.expect(looksBinary(doc.items));
+    try std.testing.expectEqual(doc.items.len, valueLen(doc.items));
+    try std.testing.expectEqualStrings("DECIMAL", typeName(doc.items));
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(aa);
+    try toText(aa, &text, doc.items);
+    try std.testing.expectEqualStrings("1.50", text.items);
+
+    const unsigned = try encodeFromText(aa, "18446744073709551615");
+    defer aa.free(unsigned);
+    try std.testing.expectEqualStrings("UNSIGNED INTEGER", typeName(unsigned));
+    try std.testing.expectError(Error.JsonInvalid, encodeFromText(aa, "1e999"));
+}
+
+test "JSON_KEYS lists keys shorter first" {
+    const aa = std.testing.allocator;
+    const obj = try encodeFromText(aa, "{\"bb\":1,\"a\":2,\"ccc\":3,\"b\":4}");
+    defer aa.free(obj);
+    const keys = (try keysArray(aa, obj)).?;
+    defer aa.free(keys);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(aa);
+    try toText(aa, &text, keys);
+    try std.testing.expectEqualStrings("[\"a\", \"b\", \"bb\", \"ccc\"]", text.items);
 }
 
 test "navigate via binary offsets" {
@@ -712,6 +944,33 @@ test "invalid text is rejected" {
     try std.testing.expectError(Error.JsonInvalid, encodeFromText(aa, "[1,2"));
     try std.testing.expectError(Error.JsonInvalid, encodeFromText(aa, "nul"));
     try std.testing.expectError(Error.JsonInvalid, encodeFromText(aa, "1 2"));
+}
+
+test "wellFormed accepts encoded values and rejects corrupt offsets" {
+    const aa = std.testing.allocator;
+    const texts = .{ "null", "-3", "2.5", "\"x\"", "[]", "[1, [2, {\"a\": null}]]", "{\"k\": [1], \"kk\": \"v\"}", "18446744073709551615" };
+    inline for (texts) |t| {
+        const b = try encodeFromText(aa, t);
+        defer aa.free(b);
+        try std.testing.expect(wellFormed(b));
+        try std.testing.expectEqual(b.len, checkedValueLen(b).?);
+        try std.testing.expect(!wellFormed(b[0 .. b.len - 1]));
+    }
+
+    const arr = try encodeFromText(aa, "[1, 2]");
+    defer aa.free(arr);
+    const bad = try aa.dupe(u8, arr);
+    defer aa.free(bad);
+    std.mem.writeInt(u32, bad[9..13], 0, .little);
+    try std.testing.expect(!wellFormed(bad));
+    @memcpy(bad, arr);
+    std.mem.writeInt(u32, bad[9..13], @intCast(bad.len), .little);
+    try std.testing.expect(!wellFormed(bad));
+    @memcpy(bad, arr);
+    std.mem.writeInt(u32, bad[5..9], 1000, .little);
+    try std.testing.expect(!wellFormed(bad));
+    try std.testing.expect(checkedValueLen(&.{9}) == null);
+    try std.testing.expect(checkedValueLen("") == null);
 }
 
 test "looksBinary discriminates text vs binary" {
