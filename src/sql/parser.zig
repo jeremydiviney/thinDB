@@ -1779,12 +1779,12 @@ pub const Parser = struct {
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
 
-        // Literal at projection start: `SELECT 1`, `SELECT 'x'`,
-        // `SELECT 1 + 2`. Route through the expression parser so binary
-        // operators and aliasing work. (`GROUP BY 1` then references it
-        // as ordinal 1.)
+        // Literal or user variable at projection start: `SELECT 1`,
+        // `SELECT 'x'`, `SELECT 1 + 2`, `SELECT @w`. Route through the
+        // expression parser so binary operators and aliasing work.
+        // (`GROUP BY 1` then references it as ordinal 1.)
         switch (self.cur.tag) {
-            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null => {
+            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier => {
                 const expr = try self.parseScalar();
                 const default_name = try self.exprDefaultName(expr);
                 const alias = try self.maybeAlias(default_name);
@@ -3366,21 +3366,26 @@ pub const Parser = struct {
         };
     }
 
+    /// A select-list item's `[AS] alias`, or `fallback` when none follows.
+    /// The AS is optional, as in MySQL/StarRocks; keywords such as FROM
+    /// are not identifiers, so an item's end is never read as its alias.
+    /// On MySQL a string names the column too (`1 'a'`, `1 AS "a"`, where
+    /// `"a"` is a string). MySQL allows that only here, never for a table.
     fn maybeAlias(self: *Parser, fallback: []const u8) ParseError![]const u8 {
-        if (self.cur.tag == .kw_as) {
+        const explicit = self.cur.tag == .kw_as;
+        if (explicit) try self.advance();
+        if (self.cur.tag == .string and self.lex.dialect == .mysql) {
+            const name = self.cur.value.string;
+            if (name.len == 0) return ParseError.SqlExpectedIdent;
             try self.advance();
-            const name = try self.expectIdent();
             return try self.arena.dupe(u8, name);
         }
-        // Implicit alias: `expr alias_ident` (no AS keyword) — common
-        // in MySQL/StarRocks. Only if next token is a bare identifier.
         if (self.cur.tag == .identifier) {
-            // But we have to be careful — keywords like FROM are NOT
-            // identifiers, so the lookahead naturally stops at them.
             const name = self.cur.text;
             try self.advance();
             return try self.arena.dupe(u8, name);
         }
+        if (explicit) return ParseError.SqlExpectedIdent;
         return fallback;
     }
 
@@ -3488,21 +3493,13 @@ pub const Parser = struct {
         var merged_names: std.ArrayList([]const u8) = .empty;
 
         while (self.joinStartAhead()) {
-            // CROSS JOIN takes no ON clause.
-            if (self.cur.tag == .kw_cross) {
-                try self.advance();
-                if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
-                try self.advance();
-                const right = try self.parseFromTarget();
-                const right_op = try self.nameJoinInput(right);
-                root = try self.crossJoin(root, right_op);
-                try left_names.append(self.arena, right.name);
-                try inputs.append(self.arena, .{ .name = right.name, .op = right_op });
-                star = try self.appendInputStar(star, right.name, right_op);
-                continue;
-            }
             const natural = self.joinWordAhead("natural");
             if (natural) try self.advance();
+            const cross = !natural and self.cur.tag == .kw_cross;
+            if (cross) {
+                try self.advance();
+                if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
+            }
             // MySQL's STRAIGHT_JOIN is an inner join that pins the join
             // order, which thinDB already takes as written.
             const straight = !natural and self.joinWordAhead("straight_join");
@@ -3512,7 +3509,14 @@ pub const Parser = struct {
             const right_input = try self.nameJoinInput(right);
             var right_op = right_input;
 
-            if (straight and self.cur.tag != .kw_on) {
+            // MySQL reads [INNER] JOIN, CROSS JOIN and STRAIGHT_JOIN alike:
+            // an inner join whose ON / USING is optional, and a cross join
+            // without one. Elsewhere CROSS JOIN takes no condition and
+            // [INNER] JOIN requires one.
+            const condition_optional = cross or straight or (jtype == .inner and self.lex.dialect == .mysql);
+            const condition_allowed = !cross or self.lex.dialect == .mysql;
+            const condition_follows = self.cur.tag == .kw_on or self.joinWordAhead("using");
+            if (!natural and condition_optional and !(condition_allowed and condition_follows)) {
                 root = try self.crossJoin(root, right_input);
                 try left_names.append(self.arena, right.name);
                 try inputs.append(self.arena, .{ .name = right.name, .op = right_input });
@@ -4981,12 +4985,9 @@ pub const Parser = struct {
         if (side != .left and side != .right) return false;
         if (side_expr != .col_ref) return ParseError.SqlOnNonEquiUnsupported;
         const col = try self.joinColName(side_expr);
-        const pred = if (exec_expr.decimalLiteral(literal_expr) != null) PredicateExpr{ .leaf = .{
-            .col = col,
-            .op = op,
-            .val = exec_expr.literalValue(literal_expr) orelse return ParseError.SqlExpectedValue,
-        } } else switch (literal_expr) {
-            .lit => |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } },
+        // A decimal constant no Value holds exactly is a `.call`, filtered
+        // by its exact value like any other constant expression.
+        const pred = if (exec_expr.exactLiteralValue(literal_expr)) |v| PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = v } } else switch (literal_expr) {
             .null_lit => PredicateExpr.unknown,
             // `col <op> @var`: the pre-compile pass rewrites leaf_var to a
             // literal leaf once the session value is known.
