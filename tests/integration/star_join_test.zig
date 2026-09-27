@@ -165,3 +165,34 @@ test "SELECT * over USING and NATURAL joins lists each merged column once, first
         try std.testing.expectEqualSlices(?i64, case[2], cells);
     }
 }
+
+test "a star repeating another item's column names the repeat name_N" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE o (id BIGINT NOT NULL, big BIGINT, PRIMARY KEY (id))");
+    try exec(allocator, db, "INSERT INTO o (id, big) VALUES (1, 10), (2, 20)");
+
+    const cases = .{
+        .{ "SELECT *, big FROM o ORDER BY id", &[_][]const u8{ "id", "big", "big_1" }, &[_]?i64{ 1, 10, 10, 2, 20, 20 } },
+        .{ "SELECT id, o.* FROM o ORDER BY id", &[_][]const u8{ "id", "id_1", "big" }, &[_]?i64{ 1, 1, 10, 2, 2, 20 } },
+        .{ "SELECT *, * FROM o ORDER BY id", &[_][]const u8{ "id", "big", "id_1", "big_1" }, &[_]?i64{ 1, 10, 1, 10, 2, 20, 2, 20 } },
+        .{ "SELECT big, * FROM o WHERE id = 2", &[_][]const u8{ "big", "id", "big_1" }, &[_]?i64{ 20, 2, 20 } },
+        .{ "SELECT d.big_1 FROM (SELECT *, big FROM o) d ORDER BY d.id", &[_][]const u8{"big_1"}, &[_]?i64{ 10, 20 } },
+        .{ "WITH c AS (SELECT * FROM o) SELECT *, big FROM c ORDER BY id", &[_][]const u8{ "id", "big", "big_1" }, &[_]?i64{ 1, 10, 10, 2, 20, 20 } },
+        .{ "SELECT a.*, b.big FROM o a JOIN o b ON a.id = b.id ORDER BY a.id", &[_][]const u8{ "id", "a.big", "b.big" }, &[_]?i64{ 1, 10, 10, 2, 20, 20 } },
+    };
+    inline for (cases) |case| {
+        var q = try helpers.runSqlCtx(allocator, db, case[0]);
+        defer q.deinit();
+        expectNames(q.outputSchema(), case[1]) catch |err| {
+            std.debug.print("query: {s}\n", .{case[0]});
+            return err;
+        };
+        const cells = try collectCells(allocator, &q);
+        defer allocator.free(cells);
+        try std.testing.expectEqualSlices(?i64, case[2], cells);
+    }
+}
