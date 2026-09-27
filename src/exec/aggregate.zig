@@ -257,7 +257,11 @@ pub const AccState = union(enum) {
     value_acc: ValueAcc,
     max_by: MaxByAcc,
     bitwise: BitwiseAcc,
-    distinct_numeric: std.ArrayListUnmanaged(f64),
+    /// SUM/AVG(DISTINCT) over an integer or decimal column: every value's
+    /// exact mantissa, deduplicated at finalize.
+    distinct_exact: std.ArrayListUnmanaged(i128),
+    /// SUM/AVG(DISTINCT) over a float column.
+    distinct_float: std.ArrayListUnmanaged(f64),
 
     /// Welford's online algorithm: numerically stable variance/stddev.
     /// Covers stddev_pop, stddev_samp, var_pop, var_samp.
@@ -468,25 +472,19 @@ fn bitwiseUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, 
     }
 }
 
-fn rowF64(view: ColumnView, row: usize) f64 {
-    return switch (view.data) {
-        .boolean => |v| @floatFromInt(v[row]),
-        .tinyint => |v| @floatFromInt(v[row]),
-        .smallint => |v| @floatFromInt(v[row]),
-        .int => |v| @floatFromInt(v[row]),
-        .bigint, .decimal64 => |v| @floatFromInt(v[row]),
-        .largeint, .decimal128 => |v| @floatFromInt(v[row]),
-        .float => |v| v[row],
-        .double => |v| v[row],
-        else => unreachable,
-    };
-}
-
 fn distinctNumericUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
-    var r: u32 = row_start;
-    while (r < row_end) : (r += 1) {
-        if (!view.isValid(r)) continue;
-        try s.distinct_numeric.append(aa, rowF64(view, r));
+    switch (view.data) {
+        inline .boolean, .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (view.isValid(r)) try s.distinct_exact.append(aa, v);
+            }
+        },
+        inline .float, .double => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (view.isValid(r)) try s.distinct_float.append(aa, v);
+            }
+        },
+        else => return Error.AggregateUnsupportedType,
     }
 }
 
@@ -2392,11 +2390,16 @@ pub const Aggregate = struct {
         try self.accumulateAggsBatched(batch, self.pf_gids.items);
     }
 
+    fn aggInputType(self: *Aggregate, ai: usize) ?Type {
+        const idx = self.agg_col_indices[ai] orelse return null;
+        return self.upstream.outputSchema()[idx].type;
+    }
+
     fn appendSingleResult(self: *Aggregate) !void {
         // No GROUP BY ⇒ the combined-distinct gate never fires; every distinct
         // aggregate stays on its AccState set, so `cd_count` is always null.
         for (self.aggs, 0..) |a, ai| {
-            try appendAccToColumn(self.allocator, a, self.single_state[ai], &self.output_columns[ai], self.output_schema[ai].type, null);
+            try appendAccToColumn(self.allocator, a, self.single_state[ai], &self.output_columns[ai], self.aggInputType(ai), self.output_schema[ai].type, null);
         }
     }
 
@@ -2441,7 +2444,7 @@ pub const Aggregate = struct {
         for (self.aggs, 0..) |a, ai| {
             const out_idx = self.group_col_indices.len + ai;
             const cd_count: ?u64 = if (self.cd[ai]) |c| c.counts.items[gid] else null;
-            try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type, cd_count);
+            try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.aggInputType(ai), self.output_schema[out_idx].type, cd_count);
         }
     }
 
@@ -2670,7 +2673,8 @@ pub const SortedAggregate = struct {
             // SortedAggregate keeps every distinct aggregate on its per-group
             // AccState set (O(1)-in-cardinality streaming reset between groups),
             // so it never uses the combined-distinct path.
-            try appendAccToColumn(self.allocator, a, self.cur_state[ai], &self.output_columns[out_idx], self.output_schema[out_idx].type, null);
+            const in_t: ?Type = if (self.agg_col_indices[ai]) |i| self.upstream.outputSchema()[i].type else null;
+            try appendAccToColumn(self.allocator, a, self.cur_state[ai], &self.output_columns[out_idx], in_t, self.output_schema[out_idx].type, null);
         }
         // Group done — drop its transient state, keep the buffer for reuse.
         _ = self.arena.reset(.retain_capacity);
@@ -3034,7 +3038,10 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .any_value, .first, .last => .{ .value_acc = .{} },
         .max_by, .max_by_key => .{ .max_by = .{} },
         .bit_and, .bit_or, .bit_xor => .{ .bitwise = .{} },
-        .sum_distinct, .avg_distinct => .{ .distinct_numeric = .empty },
+        .sum_distinct, .avg_distinct => if (in != null and in.?.isFloat())
+            .{ .distinct_float = .empty }
+        else
+            .{ .distinct_exact = .empty },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
         .count_distinct => blk: {
             if (in) |t| if (intKeyBits(t)) |vb| break :blk if (vb <= 32)
@@ -3163,7 +3170,8 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
             break :blk .bigint;
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
-        .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
+        .sum_distinct => aggOutputType(.sum, in),
+        .avg, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
         .bool_and, .bool_or => .boolean,
         .any_value, .first, .last, .max_by => in orelse return Error.AggregateColumnRequired,
         // The output is the KEY column's type, unknowable from `in` —
@@ -3909,11 +3917,26 @@ fn avgUpdateInt(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) vo
     }
 }
 
+/// The sum and count of the distinct values in `values`, which it sorts.
+fn distinctRun(comptime T: type, values: []T) struct { sum: T, count: u64 } {
+    std.mem.sortUnstable(T, values, {}, std.sort.asc(T));
+    var sum: T = 0;
+    var count: u64 = 0;
+    for (values, 0..) |v, i| {
+        if (i > 0 and v == values[i - 1]) continue;
+        sum += v;
+        count += 1;
+    }
+    return .{ .sum = sum, .count = count };
+}
+
 pub fn appendAccToColumn(
     allocator: Allocator,
     spec: AggSpec,
     state: AccState,
     col: *ColumnStore,
+    /// The aggregate's input column type; null for COUNT(*).
+    in_type: ?Type,
     out_type: Type,
     /// For a combined COUNT(DISTINCT int) aggregate, the group's distinct count
     /// from the gid-indexed `CombinedDistinct.counts` — overrides the
@@ -4056,25 +4079,30 @@ pub fn appendAccToColumn(
                 try col.data.bigint.append(allocator, b.value);
             }
         },
-        .sum_distinct, .avg_distinct => {
-            const vals = state.distinct_numeric.items;
-            if (vals.len == 0) {
+        .sum_distinct, .avg_distinct => switch (state) {
+            .distinct_exact => |list| if (list.items.len == 0) {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else {
-                std.mem.sortUnstable(f64, @constCast(vals), {}, std.sort.asc(f64));
-                var sum: f64 = 0.0;
-                var count: u64 = 0;
-                var prev: ?f64 = null;
-                for (vals) |v| {
-                    if (prev == null or v != prev.?) {
-                        sum += v;
-                        count += 1;
-                        prev = v;
-                    }
+                const distinct = distinctRun(i128, list.items);
+                if (func == .avg_distinct) {
+                    const mean = @as(f64, @floatFromInt(distinct.sum)) / @as(f64, @floatFromInt(distinct.count));
+                    try col.data.double.append(allocator, mean / avgScaleDiv(in_type));
+                } else switch (out_type) {
+                    .largeint => try col.data.largeint.append(allocator, distinct.sum),
+                    .decimal128 => try col.data.decimal128.append(allocator, distinct.sum),
+                    // DESIGN.md §3.4: an integer SUM wraps to BIGINT.
+                    else => try col.data.bigint.append(allocator, @truncate(distinct.sum)),
                 }
-                try col.data.double.append(allocator, if (func == .avg_distinct) sum / @as(f64, @floatFromInt(count)) else sum);
-            }
+            },
+            .distinct_float => |list| if (list.items.len == 0) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else {
+                const distinct = distinctRun(f64, list.items);
+                try col.data.double.append(allocator, if (func == .avg_distinct) distinct.sum / @as(f64, @floatFromInt(distinct.count)) else distinct.sum);
+            },
+            else => unreachable,
         },
         .var_pop, .var_samp, .stddev_pop, .stddev_samp => {
             const w = state.welford;

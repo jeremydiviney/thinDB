@@ -389,7 +389,7 @@ pub const UdfAggregate = struct {
                             .builtin => |s| s,
                             .udf => return Error.AggregateUnsupportedType,
                         };
-                        try aggregate_mod.appendAccToColumn(self.allocator, b.spec, builtin_slot, out, b.output_type, null);
+                        try aggregate_mod.appendAccToColumn(self.allocator, b.spec, builtin_slot, out, b.input_type, b.output_type, null);
                     },
                 }
                 if (out.rowCount() != before + 1) return Error.AggregateUnsupportedType;

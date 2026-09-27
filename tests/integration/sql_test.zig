@@ -3596,7 +3596,7 @@ test "sql: unit-first date functions and aggregate aliases execute" {
     try std.testing.expectEqual(@as(u8, 0), b.values[1].data.boolean[0]);
     try std.testing.expectEqual(@as(u8, 1), b.values[2].data.boolean[0]);
     try std.testing.expectEqual(@as(i64, 7), b.values[3].data.bigint[0]);
-    try std.testing.expectApproxEqAbs(@as(f64, 7.0), b.values[4].data.double[0], 1e-9);
+    try std.testing.expectEqual(@as(i64, 7), b.values[4].data.bigint[0]);
     try std.testing.expectApproxEqAbs(@as(f64, 7.0 / 3.0), b.values[5].data.double[0], 1e-9);
     try std.testing.expectEqual(@as(i64, 3), b.values[6].data.bigint[0]);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[7].data.double[0], 1e-9);

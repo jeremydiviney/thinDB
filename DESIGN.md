@@ -173,7 +173,8 @@ reduction) accumulates exactly in i128 and truncates to BIGINT at emit. That
 equals the wrapped sum, because truncation commutes with addition mod 2^64.
 ORDER BY and HAVING on a SUM see the emitted, wrapped value. `AVG` divides the
 exact sum and returns `DOUBLE`. `MIN`/`MAX` return the input type. `COUNT`
-returns `BIGINT`.
+returns `BIGINT`. `SUM(DISTINCT x)` and `AVG(DISTINCT x)` add up the exact
+distinct values and have the same types as `SUM(x)` and `AVG(x)`.
 
 **Decimal precision/scale propagation**:
 
