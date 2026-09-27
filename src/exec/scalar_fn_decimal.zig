@@ -524,6 +524,68 @@ pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: T
     }
 }
 
+/// MySQL's `FORMAT(x, d)`: `x` rounded to `d` places (clamped to 0..30),
+/// its integer part grouped by thousands with `,`. A DECIMAL or an integer
+/// rounds half away from zero; a float rounds its binary value half to even,
+/// as MySQL rounds a double, so `FORMAT(1.005e0, 2)` is `1.00`. A value
+/// that rounds to zero drops its sign.
+pub fn formatKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    var row: usize = 0;
+    while (row < n) : (row += 1) {
+        text.clearRetainingCapacity();
+        if (rowValid(args, row)) {
+            const places: u8 = @intCast(std.math.clamp(mantissaAt(args[1], row), 0, 30));
+            try appendFormatted(allocator, &text, arg_types[0], args[0], row, places);
+        }
+        try common.stringStoreOf(out).appendValue(allocator, text.items);
+    }
+}
+
+fn appendFormatted(allocator: Allocator, text: *std.ArrayList(u8), t: Type, v: ColumnView, row: usize, places: u8) !void {
+    if (!t.isFloat()) {
+        if (rescale(mantissaAt(v, row), scaleOf(t), places)) |m| return appendGroupedMantissa(allocator, text, m, places);
+    }
+    const x = f64At(v, t, row);
+    const scaled = roundHalfEven(x * pow10f(places));
+    if (@abs(scaled) < 1e38) return appendGroupedMantissa(allocator, text, @intFromFloat(scaled), places);
+    // Past DECIMAL's range: the double's whole digits, grouped.
+    var digits: std.ArrayList(u8) = .empty;
+    defer digits.deinit(allocator);
+    try digits.print(allocator, "{d:.0}", .{x});
+    try appendGrouped(allocator, text, digits.items, "");
+}
+
+fn roundHalfEven(x: f64) f64 {
+    return if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x);
+}
+
+fn appendGroupedMantissa(allocator: Allocator, text: *std.ArrayList(u8), m: i128, places: u8) !void {
+    const mag: u128 = @abs(m);
+    const factor: u128 = @intCast(pow10(places));
+    var whole_buf: [48]u8 = undefined;
+    const whole = std.fmt.bufPrint(&whole_buf, "{s}{d}", .{ @as([]const u8, if (m < 0) "-" else ""), mag / factor }) catch unreachable;
+    var frac_buf: [40]u8 = undefined;
+    const frac = std.fmt.bufPrint(&frac_buf, "{d:0>[1]}", .{ mag % factor, @as(usize, places) }) catch unreachable;
+    try appendGrouped(allocator, text, whole, if (places == 0) "" else frac);
+}
+
+/// `whole` (digits after an optional `-`) grouped by thousands, then `frac`.
+fn appendGrouped(allocator: Allocator, text: *std.ArrayList(u8), whole: []const u8, frac: []const u8) !void {
+    const negative = whole.len > 0 and whole[0] == '-';
+    const digits = if (negative) whole[1..] else whole;
+    if (negative) try text.append(allocator, '-');
+    for (digits, 0..) |c, i| {
+        if (i > 0 and (digits.len - i) % 3 == 0) try text.append(allocator, ',');
+        try text.append(allocator, c);
+    }
+    if (frac.len == 0) return;
+    try text.append(allocator, '.');
+    try text.appendSlice(allocator, frac);
+}
+
 /// Render `mantissa / 10^s` as a fixed-point string into `buf`.
 fn formatDecimal(buf: []u8, mantissa: i128, s: u8) []const u8 {
     if (s == 0) return std.fmt.bufPrint(buf, "{d}", .{mantissa}) catch "0";
