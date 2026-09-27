@@ -2666,8 +2666,8 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const out_schema = source.outputSchema();
     const batch_schema = try aa.alloc(types.Column, tbl_columns.len);
     const views = try aa.alloc(storage.ColumnView, tbl_columns.len);
-    const narrowed = try aa.alloc(bool, tbl_columns.len);
-    for (tbl_columns, picks, narrowed) |col, pick, *n| n.* = narrowsInteger(out_schema[pick].type, col.type);
+    const assigned = try aa.alloc(bool, tbl_columns.len);
+    for (tbl_columns, picks, assigned) |col, pick, *a| a.* = exec_cast.assignsByRule(out_schema[pick].type, col.type);
     var total_rows: usize = 0;
     while (try source.next()) |b| {
         for (table_to_source, picks) |maybe_src, pick| {
@@ -2675,19 +2675,19 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
             if (pick != src and wideningDroppedValue(b.values[src], b.values[pick], b.row_count)) return Error.TypeMismatch;
         }
         var filled: usize = 0;
-        defer for (views[0..filled], narrowed[0..filled]) |view, n| {
-            if (n) freeNarrowedColumn(ctx.allocator, view);
+        defer for (views[0..filled], assigned[0..filled]) |view, a| {
+            if (a) exec_cast.freeAssignedColumn(ctx.allocator, view);
         };
-        for (tbl_columns, picks, narrowed, batch_schema, views) |col, pick, n, *bs, *view| {
-            view.* = if (n)
-                try narrowIntegerColumn(ctx.allocator, b.values[pick], col.type, b.row_count) orelse return Error.TypeMismatch
+        for (tbl_columns, picks, assigned, batch_schema, views) |col, pick, a, *bs, *view| {
+            view.* = if (a)
+                try exec_cast.assignColumn(ctx.allocator, b.values[pick], out_schema[pick].type, col.type, b.row_count)
             else
                 b.values[pick];
             filled += 1;
             // A NOT NULL column admits a nullable source whose rows hold no
             // NULL, as MySQL does; a NULL row still fails in the memtable.
             const nullable = out_schema[pick].nullable and (col.nullable or view.anyNull(b.row_count));
-            bs.* = .{ .name = col.name, .type = if (n) col.type else out_schema[pick].type, .nullable = nullable };
+            bs.* = .{ .name = col.name, .type = if (a) col.type else out_schema[pick].type, .nullable = nullable };
         }
         try t.insertBatch(batch_schema, views, b.row_count);
         total_rows += b.row_count;
@@ -2700,18 +2700,16 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
 /// null when the column lands as is. A decimal target always takes one when
 /// the types differ: the memtable matches decimal columns on tag alone, so a
 /// payload at another scale would be stored misread. Text parses into a DATE
-/// or DATETIME target. Other targets widen along the implicit-cast ladder
-/// short of its lossy steps; the ladder reaches FLOAT only through DOUBLE, so
-/// a FLOAT target never casts. Anything else passes through: a wider integer
-/// narrows batch by batch, and the memtable admits or rejects the rest.
+/// or DATETIME target. An integer, float or boolean target converts batch by
+/// batch by the assignment rule instead (`exec_cast.assignColumn`). Other
+/// targets widen along the implicit-cast ladder short of its lossy steps;
+/// the memtable admits or rejects the rest.
 fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?exec.Expr {
-    if (std.meta.eql(src.type, target)) return null;
+    if (std.meta.eql(src.type, target) or exec_cast.assignsByRule(src.type, target)) return null;
     const widens = if (target.isDecimal())
         src.type.isInteger() or src.type.isFloat() or src.type.isDecimal() or src.type == .boolean
     else if ((target == .date or target == .datetime) and src.type.isString())
         true
-    else if (target == .float)
-        false
     else if (exec_cast.castCost(@as(types.TypeTag, src.type), @as(types.TypeTag, target))) |cost|
         cost > 0 and cost < exec_cast.LOSSY_CAST_COST
     else
@@ -2732,50 +2730,6 @@ fn wideningDroppedValue(src: storage.ColumnView, widened: storage.ColumnView, ro
         if (src.isValid(i) and !widened.isValid(i)) return true;
     }
     return false;
-}
-
-/// Whether an INSERT source column is an integer wider than its integer
-/// table column. MySQL assigns such a value when it fits the column.
-fn narrowsInteger(src: types.Type, target: types.Type) bool {
-    if (!src.isInteger() or !target.isInteger()) return false;
-    const cost = exec_cast.castCost(@as(types.TypeTag, target), @as(types.TypeTag, src)) orelse return false;
-    return cost > 0;
-}
-
-/// `src` at the table column's narrower integer width, in `allocator`, or
-/// null when a value falls outside the column's range: INSERT ... VALUES
-/// rejects such a value, and MySQL's strict mode fails the statement rather
-/// than clamping it as a CAST does. A NULL row narrows to 0 whatever its
-/// payload.
-fn narrowIntegerColumn(allocator: Allocator, src: storage.ColumnView, target: types.Type, rows: usize) Allocator.Error!?storage.ColumnView {
-    switch (target) {
-        inline .tinyint, .smallint, .int, .bigint => |_, tag| {
-            const T = std.meta.Child(@FieldType(storage.column.ValueView, @tagName(tag)));
-            const dst = try allocator.alloc(T, rows);
-            switch (src.data) {
-                inline .smallint, .int, .bigint, .largeint => |values| for (values[0..rows], dst, 0..) |v, *d, i| {
-                    if (std.math.cast(T, v)) |fits| {
-                        d.* = fits;
-                    } else if (src.isValid(i)) {
-                        allocator.free(dst);
-                        return null;
-                    } else {
-                        d.* = 0;
-                    }
-                },
-                else => unreachable,
-            }
-            return .{ .data = @unionInit(storage.column.ValueView, @tagName(tag), dst), .nulls = src.nulls };
-        },
-        else => unreachable,
-    }
-}
-
-fn freeNarrowedColumn(allocator: Allocator, view: storage.ColumnView) void {
-    switch (view.data) {
-        inline .tinyint, .smallint, .int, .bigint => |values| allocator.free(values),
-        else => unreachable,
-    }
 }
 
 /// The value for a table column an INSERT ... SELECT column list omits: the
@@ -2915,7 +2869,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
                     if (user_cell) |uv| {
                         // Explicit value; observe to push counter
                         // past it. integer-only validated at create.
-                        t.observeAutoIncrement(integerValueAsI128(uv) catch return Error.TypeMismatch);
+                        t.observeAutoIncrement(try exec_cast.assignValue(i128, uv));
                         break :blk uv;
                     }
                     // Omitted or explicit NULL → take the next id.
@@ -2963,20 +2917,6 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
 
     ctx.affected_rows = @intCast(row_count);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(row_count));
-}
-
-/// Extract an integer Value as i128 for AUTO_INCREMENT counter
-/// observation. Rejects non-integer tags so a stray DEFAULT for a
-/// text/decimal column never bumps the counter.
-fn integerValueAsI128(v: Value) !i128 {
-    return switch (v) {
-        .tinyint => |x| @as(i128, x),
-        .smallint => |x| @as(i128, x),
-        .int => |x| @as(i128, x),
-        .bigint => |x| @as(i128, x),
-        .largeint => |x| x,
-        else => Error.TypeMismatch,
-    };
 }
 
 /// Build a typed integer literal for the AI column type, given a
@@ -3145,14 +3085,14 @@ pub const InsertColumnBuilder = struct {
 
     fn appendCoerced(self: *InsertColumnBuilder, col_idx: usize, col: types.Column, v: Value) !void {
         switch (col.type) {
-            .int => self.writeFixedInt(col_idx, i32, try coerceToI32(v)),
-            .bigint => self.writeFixedInt(col_idx, i64, try coerceToI64(v)),
-            .smallint => self.writeFixedInt(col_idx, i16, try coerceToI16(v)),
-            .tinyint => self.writeFixedBytes(col_idx, &[_]u8{@as(u8, @bitCast(try coerceToI8(v)))}),
-            .largeint => self.writeFixedInt(col_idx, i128, try coerceToI128(v)),
-            .boolean => self.writeFixedBytes(col_idx, &[_]u8{@intFromBool(try coerceToBool(v))}),
-            .float => self.writeFixedFloat(col_idx, f32, try coerceToF32(v)),
-            .double => self.writeFixedFloat(col_idx, f64, try coerceToF64(v)),
+            .int => self.writeFixedInt(col_idx, i32, try exec_cast.assignValue(i32, v)),
+            .bigint => self.writeFixedInt(col_idx, i64, try exec_cast.assignValue(i64, v)),
+            .smallint => self.writeFixedInt(col_idx, i16, try exec_cast.assignValue(i16, v)),
+            .tinyint => self.writeFixedBytes(col_idx, &[_]u8{@as(u8, @bitCast(try exec_cast.assignValue(i8, v)))}),
+            .largeint => self.writeFixedInt(col_idx, i128, try exec_cast.assignValue(i128, v)),
+            .boolean => self.writeFixedBytes(col_idx, &[_]u8{@intFromBool(try exec_cast.assignValue(bool, v))}),
+            .float => self.writeFixedFloat(col_idx, f32, try exec_cast.assignValue(f32, v)),
+            .double => self.writeFixedFloat(col_idx, f64, try exec_cast.assignValue(f64, v)),
             .date => self.writeFixedInt(col_idx, i32, try coerceToDate(v)),
             .datetime => self.writeFixedInt(col_idx, i64, try coerceToDateTime(v)),
             .decimal64 => |spec| self.writeFixedInt(col_idx, i64, try coerceToDecimal64(v, spec)),
@@ -3218,84 +3158,6 @@ pub const InsertColumnBuilder = struct {
         return self.view_slice;
     }
 };
-
-fn coerceToI64(v: Value) !i64 {
-    return switch (v) {
-        .int => |x| @as(i64, x),
-        .bigint => |x| x,
-        .smallint => |x| @as(i64, x),
-        .tinyint => |x| @as(i64, x),
-        else => Error.TypeMismatch,
-    };
-}
-
-fn coerceToI32(v: Value) !i32 {
-    return switch (v) {
-        .int => |x| x,
-        .bigint => |x| if (x >= std.math.minInt(i32) and x <= std.math.maxInt(i32)) @intCast(x) else Error.TypeMismatch,
-        .smallint => |x| @as(i32, x),
-        .tinyint => |x| @as(i32, x),
-        else => Error.TypeMismatch,
-    };
-}
-
-fn coerceToI16(v: Value) !i16 {
-    return switch (v) {
-        .int => |x| if (x >= std.math.minInt(i16) and x <= std.math.maxInt(i16)) @intCast(x) else Error.TypeMismatch,
-        .bigint => |x| if (x >= std.math.minInt(i16) and x <= std.math.maxInt(i16)) @intCast(x) else Error.TypeMismatch,
-        .smallint => |x| x,
-        .tinyint => |x| @as(i16, x),
-        else => Error.TypeMismatch,
-    };
-}
-
-fn coerceToI8(v: Value) !i8 {
-    return switch (v) {
-        .int => |x| if (x >= std.math.minInt(i8) and x <= std.math.maxInt(i8)) @intCast(x) else Error.TypeMismatch,
-        .bigint => |x| if (x >= std.math.minInt(i8) and x <= std.math.maxInt(i8)) @intCast(x) else Error.TypeMismatch,
-        .smallint => |x| if (x >= std.math.minInt(i8) and x <= std.math.maxInt(i8)) @intCast(x) else Error.TypeMismatch,
-        .tinyint => |x| x,
-        else => Error.TypeMismatch,
-    };
-}
-
-fn coerceToI128(v: Value) !i128 {
-    return switch (v) {
-        .int => |x| @as(i128, x),
-        .bigint => |x| @as(i128, x),
-        .smallint => |x| @as(i128, x),
-        .tinyint => |x| @as(i128, x),
-        .largeint => |x| x,
-        else => Error.TypeMismatch,
-    };
-}
-
-fn coerceToBool(v: Value) !bool {
-    return switch (v) {
-        .boolean => |x| x,
-        else => Error.TypeMismatch,
-    };
-}
-
-fn coerceToF32(v: Value) !f32 {
-    return switch (v) {
-        .float => |x| x,
-        .double => |x| @floatCast(x),
-        .int => |x| @floatFromInt(x),
-        .bigint => |x| @floatFromInt(x),
-        else => Error.TypeMismatch,
-    };
-}
-
-fn coerceToF64(v: Value) !f64 {
-    return switch (v) {
-        .float => |x| @floatCast(x),
-        .double => |x| x,
-        .int => |x| @floatFromInt(x),
-        .bigint => |x| @floatFromInt(x),
-        else => Error.TypeMismatch,
-    };
-}
 
 fn coerceToText(v: Value) ![]const u8 {
     return switch (v) {
