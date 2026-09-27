@@ -1062,6 +1062,48 @@ test "sql: ORDER BY ordinal sorts by the Nth SELECT item" {
     try std.testing.expect(dbs >= 1);
 }
 
+test "sql: ORDER BY ordinal counts each column a star expands to" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE o (id BIGINT NOT NULL, k BIGINT NOT NULL, qty BIGINT, big BIGINT NOT NULL, PRIMARY KEY (id))");
+    try helpers.exec(allocator, db, "INSERT INTO o VALUES (1, 1, 5, 30), (2, 2, NULL, 10), (3, 1, 2, 20), (4, 2, 7, 40), (5, 3, NULL, 50)");
+
+    const cases = .{
+        .{ "SELECT * FROM o ORDER BY 4 DESC", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT * FROM o ORDER BY 2, 1 DESC", &[_]i64{ 3, 1, 4, 2, 5 } },
+        .{ "SELECT o.* FROM o ORDER BY 4", &[_]i64{ 2, 3, 1, 4, 5 } },
+        .{ "SELECT * FROM o ORDER BY o.big DESC", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT d.* FROM (SELECT id, big AS b FROM o) d ORDER BY 2", &[_]i64{ 2, 3, 1, 4, 5 } },
+        .{ "SELECT 0 - id AS neg, * FROM o ORDER BY big DESC", &[_]i64{ -5, -4, -1, -3, -2 } },
+        .{ "WITH c AS (SELECT * FROM o) SELECT 0 - id AS neg, * FROM c ORDER BY 5 DESC", &[_]i64{ -5, -4, -1, -3, -2 } },
+        .{ "SELECT 0 - id AS neg, * FROM o ORDER BY 5 DESC", &[_]i64{ -5, -4, -1, -3, -2 } },
+        .{ "SELECT id * 10 AS t, * FROM o ORDER BY 3 DESC, 1", &[_]i64{ 50, 20, 40, 10, 30 } },
+        .{ "SELECT *, 0 - big AS neg FROM o ORDER BY 5", &[_]i64{ 5, 4, 1, 3, 2 } },
+        .{ "SELECT a.*, b.* FROM o a JOIN o b ON a.k = b.id ORDER BY 6 DESC, 1", &[_]i64{ 2, 4, 1, 3, 5 } },
+        .{ "SELECT * FROM o a JOIN o b ON a.k = b.id ORDER BY 6 DESC, 1", &[_]i64{ 2, 4, 1, 3, 5 } },
+        .{ "SELECT * FROM o WHERE id < 3 UNION ALL SELECT * FROM o WHERE id > 3 ORDER BY 4", &[_]i64{ 2, 1, 4, 5 } },
+        .{ "(SELECT * FROM o) ORDER BY 1 DESC LIMIT 2", &[_]i64{ 5, 4 } },
+        .{ "WITH c AS (SELECT id, big FROM o) SELECT * FROM c ORDER BY 2 DESC", &[_]i64{ 5, 4, 1, 3, 2 } },
+    };
+    inline for (cases) |c| {
+        const got = helpers.collectBigintsCtx(allocator, db, c[0]) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.runSqlCtx(allocator, db, "SELECT * FROM o ORDER BY 5"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.runSqlCtx(allocator, db, "SELECT *, 1 AS one FROM o ORDER BY 6"));
+}
+
 test "sql: ORDER BY an expression sorts on its value" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
