@@ -1128,6 +1128,7 @@ fn handleQuery(
             .begin => session.in_transaction = true,
             .commit, .rollback => session.in_transaction = false,
         }
+        session.row_count = 0;
         try handshake.sendOkPacketStatus(
             allocator,
             w,
@@ -1140,6 +1141,7 @@ fn handleQuery(
     }
 
     if (try canned.match(allocator, payload, session.current_schema)) |outcome| {
+        session.row_count = if (outcome == .ok_packet or outcome == .kill) 0 else -1;
         switch (outcome) {
             .ok_packet => try handshake.sendOkPacketStatus(
                 allocator,
