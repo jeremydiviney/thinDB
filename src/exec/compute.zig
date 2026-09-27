@@ -2088,7 +2088,7 @@ fn buildCallPlan(
 
     var r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     const coerce_literals = if (r) |resolved| parsesTextToTemporal(resolved.func) else true;
-    if (coerce_literals and try coerceTemporalStringLiterals(runtime_allocator, c.fn_name, arg_plans, arg_types)) {
+    if (coerce_literals and try coerceTemporalStringLiterals(runtime_allocator, c.fn_name, arg_plans, arg_types, false)) {
         r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     }
     if (r == null) r = try resolveWithTypedNulls(runtime_allocator, aa, udf_registry, c.fn_name, arg_plans, arg_types);
@@ -2276,6 +2276,11 @@ fn resolveWithTypedNulls(
         try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
         return r;
     }
+    // Last, a NULL beside text that must read as a date takes the date
+    // overload's type (`TIMESTAMPDIFF(DAY, NULL, '2026-01-01')`).
+    if (try coerceTemporalStringLiterals(runtime_allocator, fn_name, arg_plans, arg_types, true)) {
+        return try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, arg_types);
+    }
     return null;
 }
 
@@ -2288,11 +2293,13 @@ fn commitNullTypes(runtime_allocator: Allocator, arg_plans: []ArgPlan, arg_types
     }
 }
 
+/// With `nulls_fit`, a NULL literal fits any parameter and takes its type.
 fn coerceTemporalStringLiterals(
     runtime_allocator: Allocator,
     fn_name: []const u8,
     arg_plans: []ArgPlan,
     arg_types: []Type,
+    nulls_fit: bool,
 ) !bool {
     for (scalar_fn.overloadsOf(fn_name)) |f| {
         if (!scalar_fn.scalarArityMatches(f, arg_types.len)) continue;
@@ -2300,6 +2307,7 @@ fn coerceTemporalStringLiterals(
         var any_coerce = false;
         for (arg_types, 0..) |given, i| {
             const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
+            if (nulls_fit and arg_plans[i] == .null_lit) continue;
             if (foldStringTag(@as(types.TypeTag, declared)) == foldStringTag(@as(types.TypeTag, given))) continue;
             if (cast.castCost(@as(types.TypeTag, given), @as(types.TypeTag, declared)) != null) continue;
             // The only otherwise-unreachable mismatch we repair: a string
@@ -2316,6 +2324,12 @@ fn coerceTemporalStringLiterals(
 
         for (arg_types, 0..) |*at, i| {
             const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
+            if (nulls_fit and arg_plans[i] == .null_lit) {
+                replaceBuf(runtime_allocator, &arg_plans[i].null_lit.buf, try ColumnStore.init(runtime_allocator, declared, true));
+                arg_plans[i].null_lit.ty = declared;
+                at.* = declared;
+                continue;
+            }
             if (declared != .date and declared != .datetime) continue;
             const new_val = litTemporalValue(arg_plans[i], declared) orelse continue;
             const slot = arg_plans[i].lit;
