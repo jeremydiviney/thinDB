@@ -26,7 +26,8 @@ const local = @import("local.zig");
 const pgcat = @import("pg_catalog.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const compute = @import("../exec/compute.zig");
-const Expr = @import("../exec/expr.zig").Expr;
+const expr_mod = @import("../exec/expr.zig");
+const Expr = expr_mod.Expr;
 const PredicateExpr = @import("../exec/predicate.zig").PredicateExpr;
 const UdfRegistry = @import("../udf.zig").UdfRegistry;
 
@@ -166,8 +167,12 @@ const Finder = struct {
                 for (c.args) |arg| if (try self.checkExpr(arg, scope)) |u| return u;
             },
             .case => |cs| {
+                for (cs.operands) |o| if (try self.checkExpr(o.expr, scope)) |u| return u;
+                var refs: std.ArrayListUnmanaged([]const u8) = .empty;
                 for (cs.branches) |b| {
-                    if (try self.checkPredicate(b.cond, scope)) |u| return u;
+                    refs.clearRetainingCapacity();
+                    try expr_mod.collectCaseConditionRefs(self.arena, &refs, cs, b.cond);
+                    for (refs.items) |c| if (!has(scope, c)) return .{ .column = c };
                     if (try self.checkExpr(b.then, scope)) |u| return u;
                 }
                 if (cs.else_branch) |eb| return self.checkExpr(eb.*, scope);

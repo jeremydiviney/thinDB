@@ -801,6 +801,83 @@ test "CASE, IF and COALESCE raise only where a row takes the failing branch" {
     try std.testing.expectEqualSlices(?f64, &.{ 0, 8, 0, 64, 0, 216, 0, 512, 0 }, got.items);
 }
 
+test "a WHEN's computed operand is evaluated only on the rows still open at that WHEN" {
+    // A condition compares columns, so a computed operand such as d * d * d
+    // was anchored below the CASE and computed for every row, including rows
+    // an earlier WHEN had taken. MySQL, StarRocks and DuckDB compute it only
+    // for the rows that reach its WHEN (#193).
+    const allocator = std.testing.allocator;
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 2 });
+        defer db.close();
+        // Odd ids hold a d whose cube overflows DECIMAL(38,0); an earlier
+        // WHEN takes them wherever the cube is read.
+        try helpers.exec(allocator, db, "CREATE TABLE g (id BIGINT PRIMARY KEY, d DECIMAL(18,0) NOT NULL, n DECIMAL(10,2), k INT NOT NULL)");
+        try helpers.exec(allocator, db,
+            \\INSERT INTO g (id, d, n, k) VALUES
+            \\(1, 999999999999999999, 2.00, 1), (2, 2, NULL, 2),
+            \\(3, 999999999999999999, 3.00, 1), (4, 4, NULL, 2)
+        );
+
+        const per_row = .{
+            .{ "CASE WHEN d > 100 THEN 1 WHEN d * d * d > 0 THEN 2 ELSE 3 END", .{ 1, 2, 1, 2 } },
+            // Simple CASE: a WHEN value is computed only for the rows it
+            // is compared on.
+            .{ "CASE d WHEN 999999999999999999 THEN 1 WHEN d * d * d - 6 THEN 2 ELSE 3 END", .{ 1, 2, 1, 3 } },
+            .{ "CASE k WHEN 1 THEN 1 WHEN (d * d * d > 10) + 1 THEN 2 ELSE 3 END", .{ 1, 3, 1, 2 } },
+            // Nested: a CASE inside a later WHEN, and in a THEN or ELSE.
+            .{ "CASE WHEN d > 100 THEN 1 WHEN (CASE WHEN d * d * d > 10 THEN 1 ELSE 0 END) = 1 THEN 2 ELSE 3 END", .{ 1, 3, 1, 2 } },
+            .{ "CASE WHEN d > 100 THEN 1 ELSE CASE WHEN d * d * d > 10 THEN 2 ELSE 3 END END", .{ 1, 3, 1, 2 } },
+            .{ "CASE WHEN d < 100 THEN CASE WHEN k = 2 THEN CASE WHEN d * d * d > 10 THEN 2 ELSE 3 END END ELSE 1 END", .{ 1, 3, 1, 2 } },
+            .{ "IF(d > 100, 1, IF(d * d * d > 10, 2, 3))", .{ 1, 3, 1, 2 } },
+            .{ "COALESCE(n, CASE WHEN d * d * d > 10 THEN 20 ELSE 30 END)", .{ 2, 30, 3, 20 } },
+            .{ "IFNULL(n, IF(d * d * d > 10, 20, 30))", .{ 2, 30, 3, 20 } },
+            .{ "CASE WHEN d > 100 THEN 1 ELSE (d * d * d > 10) END", .{ 1, 0, 1, 1 } },
+            .{ "CASE WHEN d > 100 THEN 1 WHEN ISNULL(d * d * d) THEN 2 ELSE 3 END", .{ 1, 3, 1, 3 } },
+            // One operand read by two later WHENs, and inside NOT / OR.
+            .{ "CASE WHEN d > 100 THEN 1 WHEN d * d * d IN (4, 8) THEN 2 WHEN d * d * d BETWEEN 10 AND 100 THEN 3 END", .{ 1, 2, 1, 3 } },
+            .{ "CASE WHEN d > 100 THEN 1 WHEN NOT (d * d * d > 10) OR d * d * d = 64 THEN 2 ELSE 3 END", .{ 1, 2, 1, 2 } },
+            .{ "CASE WHEN d > 100 THEN 1 WHEN CAST(d AS DECIMAL(5,2)) > 3 THEN 2 ELSE 3 END", .{ 1, 3, 1, 2 } },
+            // Two copies of one CASE agree.
+            .{ "CASE WHEN d > 100 THEN 1 WHEN d * d * d > 10 THEN 2 ELSE 3 END * 10 + CASE WHEN d > 100 THEN 1 WHEN d * d * d > 10 THEN 2 ELSE 3 END", .{ 11, 33, 11, 22 } },
+        };
+        const aggregated = .{
+            .{ "SELECT SUM(CASE WHEN d > 100 THEN 1 WHEN d * d * d > 10 THEN 10 ELSE 100 END) FROM g", &[_]?f64{112} },
+            .{ "SELECT SUM(CASE WHEN d > 100 THEN 1 WHEN d * d * d > 10 THEN 10 ELSE 100 END) FROM g GROUP BY k ORDER BY k", &[_]?f64{ 2, 110 } },
+            .{ "SELECT COUNT(CASE WHEN d > 100 THEN NULL WHEN d * d * d > 10 THEN 1 END) FROM g GROUP BY k ORDER BY k", &[_]?f64{ 0, 1 } },
+            // Over aggregates: the cube of k = 1's sum overflows.
+            .{ "SELECT CASE WHEN MAX(d) > 100 THEN 1 WHEN SUM(d) * SUM(d) * SUM(d) > 5 THEN 2 ELSE 3 END FROM g GROUP BY k ORDER BY k", &[_]?f64{ 1, 2 } },
+        };
+        const ids = .{
+            .{ "SELECT id FROM g WHERE CASE WHEN d > 100 THEN 0 WHEN d * d * d > 10 THEN 1 ELSE 0 END = 1 ORDER BY id", &[_]i64{4} },
+            .{ "SELECT id FROM g ORDER BY CASE WHEN d > 100 THEN 2 WHEN d * d * d > 10 THEN 0 ELSE 1 END, id", &[_]i64{ 4, 2, 1, 3 } },
+            .{ "SELECT k FROM g GROUP BY k HAVING CASE WHEN MAX(d) > 100 THEN 0 WHEN SUM(d) * SUM(d) * SUM(d) > 5 THEN 1 ELSE 0 END = 1", &[_]i64{2} },
+        };
+        for (0..2) |pass| {
+            if (pass == 1) try (try db.openTable("g", .{})).flush();
+            inline for (per_row) |c| {
+                const want: [4]?f64 = c[1];
+                try expectNumericColumn(allocator, db, "SELECT " ++ c[0] ++ " FROM g ORDER BY id", &want);
+            }
+            inline for (aggregated) |c| try expectNumericColumn(allocator, db, c[0], c[1]);
+            inline for (ids) |c| {
+                const got = try helpers.collectBigints(allocator, db, c[0]);
+                defer allocator.free(got);
+                try std.testing.expectEqualSlices(i64, c[1], got);
+            }
+
+            // A row still open at the failing WHEN still fails, and a first
+            // WHEN is read by every row.
+            try expectQueryError(allocator, db, "SELECT CASE WHEN d < 0 THEN 1 WHEN d * d * d > 0 THEN 2 END FROM g", error.ArithmeticOverflow);
+            try expectQueryError(allocator, db, "SELECT CASE WHEN d < 0 THEN 1 WHEN CAST(d AS DECIMAL(5,2)) > 3 THEN 2 END FROM g", error.ArithmeticOverflow);
+            try expectQueryError(allocator, db, "SELECT CASE WHEN d * d * d > 0 THEN 1 ELSE 2 END FROM g", error.ArithmeticOverflow);
+            try expectQueryError(allocator, db, "SELECT SUM(CASE WHEN d < 0 THEN 1 WHEN d * d * d > 0 THEN 2 END) FROM g GROUP BY k", error.ArithmeticOverflow);
+        }
+    }
+}
+
 test "TRIM removes spaces, a character set, or whole copies of a string" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

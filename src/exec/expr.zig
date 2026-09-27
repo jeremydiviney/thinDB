@@ -71,8 +71,43 @@ pub const Expr = union(enum) {
     pub const Case = struct {
         branches: []const Branch,
         else_branch: ?*const Expr,
+        /// Computed operands the conditions compare by name. The CASE
+        /// computes each one at the first WHEN that reads it, over only the
+        /// rows no earlier WHEN took, so an operand never raises on a row it
+        /// can't decide. The names are the CASE's own: nothing outside its
+        /// conditions reads them.
+        operands: []const Operand = &.{},
+
+        pub fn operandNamed(self: Case, name: []const u8) bool {
+            return operandListed(self.operands, name);
+        }
+    };
+
+    pub const Operand = struct {
+        name: []const u8,
+        expr: Expr,
     };
 };
+
+pub fn operandListed(operands: []const Expr.Operand, name: []const u8) bool {
+    for (operands) |o| if (types.columnNameEql(o.name, name)) return true;
+    return false;
+}
+
+/// The name of a CASE's operand `k` (`Expr.Case.operands`). Positional, so
+/// two copies of one CASE are the same tree.
+pub fn caseOperandName(arena: Allocator, k: usize) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "__case_operand_{d}", .{k});
+}
+
+/// The columns a CASE condition reads from the CASE's input: every name it
+/// compares except the CASE's own operands.
+pub fn collectCaseConditionRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), cs: Expr.Case, cond: PredicateExpr) Allocator.Error!void {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer names.deinit(allocator);
+    try predicate_mod.collectColumnNames(allocator, &names, cond);
+    for (names.items) |name| if (!cs.operandNamed(name)) try out.append(allocator, name);
+}
 
 /// Build a column-reference expression. String borrowed from caller —
 /// stable through the lifetime of the resulting Expr. For inline use:
@@ -137,7 +172,12 @@ pub fn deepCloneRenamed(out_arena: Allocator, e: Expr, renames: []const predicat
                 eb_owned.* = try deepCloneRenamed(out_arena, eb.*, renames);
                 else_dup = eb_owned;
             }
-            break :blk .{ .case = .{ .branches = branches_dup, .else_branch = else_dup } };
+            const operands_dup = try out_arena.alloc(Expr.Operand, cs.operands.len);
+            for (cs.operands, operands_dup) |o, *dst| dst.* = .{
+                .name = try out_arena.dupe(u8, o.name),
+                .expr = try deepCloneRenamed(out_arena, o.expr, renames),
+            };
+            break :blk .{ .case = .{ .branches = branches_dup, .else_branch = else_dup, .operands = operands_dup } };
         },
         // Opaque pointer aliased — the IR arena owns the pointee.
         .scalar_subquery => |p| .{ .scalar_subquery = p },
@@ -169,6 +209,10 @@ pub fn eql(a: Expr, b: Expr) bool {
                 if (!predicate_mod.eql(x.cond, y.cond) or !eql(x.then, y.then)) break :blk false;
             }
             if (cs.else_branch) |eb| if (!eql(eb.*, o.else_branch.?.*)) break :blk false;
+            if (cs.operands.len != o.operands.len) break :blk false;
+            for (cs.operands, o.operands) |x, y| {
+                if (!types.columnNameEql(x.name, y.name) or !eql(x.expr, y.expr)) break :blk false;
+            }
             break :blk true;
         },
         .scalar_subquery, .exists_subquery => false,
