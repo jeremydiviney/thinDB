@@ -1087,3 +1087,61 @@ test "string pipeline memory: parallel extrema preserve nulls, bytes, ties and p
         try std.testing.expectEqual(@as(usize, 0), empty_rows);
     }
 }
+
+/// The first column of `sql`'s rows as text.
+fn firstColumnText(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) ![]?[]u8 {
+    var q = try helpers.runSqlCtx(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(?[]u8) = .empty;
+    errdefer {
+        for (out.items) |v| if (v) |x| allocator.free(x);
+        out.deinit(allocator);
+    }
+    while (try q.next()) |batch| {
+        const col = batch.values[0];
+        for (0..batch.row_count) |row| {
+            const text: ?[]u8 = if (!col.isValid(row)) null else switch (col.data) {
+                .string, .varchar, .char => |sv| try allocator.dupe(u8, sv.rowBytes(row)),
+                inline .int, .bigint => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
+                else => return error.TestUnexpectedType,
+            };
+            errdefer if (text) |x| allocator.free(x);
+            try out.append(allocator, text);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "V2 group-topN: ORDER BY and HAVING read a hashed group key from the finished groups (issue #329)" {
+    // A string key, or integer keys wider than 128 bits together, group by a
+    // digest whose key values only exist once emit reads them back.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ds (id INT, s VARCHAR(10), a BIGINT, b BIGINT, c BIGINT)");
+    try exec(allocator, db, "INSERT INTO ds VALUES (1, 'b', 3, 1, 1), (2, 'c', 1, 2, 2), (3, 'a', 2, 3, 3), (4, 'd', 5, 4, 4), (5, 'e', 4, 5, 5)");
+    const t = try db.openTable("ds", .{});
+    try t.flush();
+
+    const cases = .{
+        .{ "SELECT CONCAT('v', s) AS z, COUNT(*) AS n FROM ds GROUP BY z ORDER BY z", &[_][]const u8{ "va", "vb", "vc", "vd", "ve" } },
+        .{ "SELECT CONCAT('v', s) AS z, COUNT(*) AS n FROM ds GROUP BY z ORDER BY z DESC LIMIT 2", &[_][]const u8{ "ve", "vd" } },
+        .{ "SELECT CONCAT('v', s) AS z, COUNT(*) AS n FROM ds GROUP BY z ORDER BY z LIMIT 2 OFFSET 1", &[_][]const u8{ "vb", "vc" } },
+        .{ "SELECT CONCAT('v', s) AS z FROM ds GROUP BY z ORDER BY z", &[_][]const u8{ "va", "vb", "vc", "vd", "ve" } },
+        .{ "SELECT CAST(a AS CHAR) AS z, COUNT(*) AS n FROM ds GROUP BY z ORDER BY z", &[_][]const u8{ "1", "2", "3", "4", "5" } },
+        .{ "SELECT a, b, c, COUNT(*) AS n FROM ds GROUP BY a, b, c ORDER BY a", &[_][]const u8{ "1", "2", "3", "4", "5" } },
+        .{ "SELECT a, b, c, COUNT(*) AS n FROM ds GROUP BY a, b, c ORDER BY b DESC LIMIT 2 OFFSET 1", &[_][]const u8{ "5", "2" } },
+        .{ "SELECT a * 1 AS x, b, c, COUNT(*) AS n FROM ds GROUP BY x, b, c HAVING x > 2 ORDER BY x", &[_][]const u8{ "3", "4", "5" } },
+        .{ "SELECT CONCAT('v', s) AS z, COUNT(*) AS n FROM ds GROUP BY z HAVING z > 'vb' ORDER BY z", &[_][]const u8{ "vc", "vd", "ve" } },
+        .{ "SELECT CONCAT(s, '') AS z, SUM(a) AS t FROM ds GROUP BY z ORDER BY t DESC LIMIT 3", &[_][]const u8{ "d", "e", "b" } },
+    };
+    inline for (cases) |case| {
+        errdefer std.debug.print("query: {s}\n", .{case[0]});
+        const got = try firstColumnText(allocator, db, case[0]);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(case[1].len, got.len);
+        for (case[1], got) |want, cell| try std.testing.expectEqualStrings(want, cell.?);
+    }
+}
