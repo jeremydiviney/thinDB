@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const BoundSpan = @import("../sql/lexer.zig").BoundSpan;
 
 /// Per-protocol lexical knobs for `substituteWith`. Identifier quoting
 /// is the only divergence between PG and MySQL outside the actual
@@ -188,34 +189,61 @@ fn copyOneTokenInto(
     return i;
 }
 
+/// A statement with each placeholder replaced by its bound parameter's
+/// literal, and where those literals sit, for `Lexer.bound_params`.
+pub const BoundSql = struct {
+    sql: []u8,
+    params: []BoundSpan,
+
+    pub fn deinit(self: BoundSql, allocator: Allocator) void {
+        allocator.free(self.sql);
+        allocator.free(self.params);
+    }
+};
+
+fn appendParam(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    spans: *std.ArrayList(BoundSpan),
+    literal: ?[]const u8,
+) !void {
+    const text = literal orelse return out.appendSlice(allocator, "NULL");
+    const start = out.items.len;
+    try out.appendSlice(allocator, text);
+    try spans.append(allocator, .{ .start = start, .end = out.items.len });
+}
+
+fn finishBound(allocator: Allocator, out: *std.ArrayList(u8), spans: *std.ArrayList(BoundSpan)) !BoundSql {
+    const params = try spans.toOwnedSlice(allocator);
+    errdefer allocator.free(params);
+    return .{ .sql = try out.toOwnedSlice(allocator), .params = params };
+}
+
 /// Substitute each `?` outside string/identifier/comment context with
 /// `params[k]` (or `NULL` when the entry is null). MySQL semantics.
 pub fn substituteQuestionPlaceholders(
     allocator: Allocator,
     sql: []const u8,
     params: []const ?[]const u8,
-) ![]u8 {
+) !BoundSql {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
+    var spans: std.ArrayList(BoundSpan) = .empty;
+    defer spans.deinit(allocator);
 
     var i: usize = 0;
     var param_idx: usize = 0;
     while (i < sql.len) {
         if (sql[i] == '?') {
             if (param_idx >= params.len) return error.MissingParameter;
-            const text = params[param_idx];
+            try appendParam(allocator, &out, &spans, params[param_idx]);
             param_idx += 1;
-            if (text) |t| {
-                try out.appendSlice(allocator, t);
-            } else {
-                try out.appendSlice(allocator, "NULL");
-            }
             i += 1;
             continue;
         }
         i = try copyOneTokenInto(&out, allocator, sql, mysql_quotes, i);
     }
-    return try out.toOwnedSlice(allocator);
+    return try finishBound(allocator, &out, &spans);
 }
 
 pub const DollarError = error{
@@ -229,9 +257,11 @@ pub fn substituteDollarPlaceholders(
     allocator: Allocator,
     sql: []const u8,
     params: []const ?[]const u8,
-) ![]u8 {
+) !BoundSql {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
+    var spans: std.ArrayList(BoundSpan) = .empty;
+    defer spans.deinit(allocator);
 
     var i: usize = 0;
     while (i < sql.len) {
@@ -248,17 +278,13 @@ pub fn substituteDollarPlaceholders(
                 return DollarError.MalformedBindParam;
             };
             if (idx == 0 or idx > params.len) return DollarError.BindParamCountMismatch;
-            if (params[idx - 1]) |lit| {
-                try out.appendSlice(allocator, lit);
-            } else {
-                try out.appendSlice(allocator, "NULL");
-            }
+            try appendParam(allocator, &out, &spans, params[idx - 1]);
             i = j;
             continue;
         }
         i = try copyOneTokenInto(&out, allocator, sql, pg_quotes, i);
     }
-    return try out.toOwnedSlice(allocator);
+    return try finishBound(allocator, &out, &spans);
 }
 
 test "normalizeForCannedMatch strips trailing semicolons + lowercases" {
@@ -290,11 +316,14 @@ test "substituteQuestionPlaceholders preserves strings and comments" {
         "SELECT * FROM t WHERE a = ? AND b = ? AND c = '?' AND d = ?",
         params[0..],
     );
-    defer allocator.free(out);
+    defer out.deinit(allocator);
     try std.testing.expectEqualStrings(
         "SELECT * FROM t WHERE a = 42 AND b = 'hello''world' AND c = '?' AND d = NULL",
-        out,
+        out.sql,
     );
+    try std.testing.expectEqual(@as(usize, 2), out.params.len);
+    try std.testing.expectEqualStrings("42", out.sql[out.params[0].start..out.params[0].end]);
+    try std.testing.expectEqualStrings("'hello''world'", out.sql[out.params[1].start..out.params[1].end]);
 }
 
 test "substituteDollarPlaceholders replaces $N in order, preserves strings" {
@@ -302,14 +331,16 @@ test "substituteDollarPlaceholders replaces $N in order, preserves strings" {
     const params = [_]?[]const u8{ "42", "'hello''world'", null };
     const out = try substituteDollarPlaceholders(
         allocator,
-        "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = '$1' AND d = $3",
+        "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = '$1' AND d = $3 AND e = $2",
         params[0..],
     );
-    defer allocator.free(out);
+    defer out.deinit(allocator);
     try std.testing.expectEqualStrings(
-        "SELECT * FROM t WHERE a = 42 AND b = 'hello''world' AND c = '$1' AND d = NULL",
-        out,
+        "SELECT * FROM t WHERE a = 42 AND b = 'hello''world' AND c = '$1' AND d = NULL AND e = 'hello''world'",
+        out.sql,
     );
+    try std.testing.expectEqual(@as(usize, 3), out.params.len);
+    try std.testing.expectEqualStrings("'hello''world'", out.sql[out.params[2].start..out.params[2].end]);
 }
 
 test "substituteDollarPlaceholders honours -- and /* */ comments" {
@@ -320,10 +351,10 @@ test "substituteDollarPlaceholders honours -- and /* */ comments" {
         "SELECT $1 -- $1 in comment\n /* also $1 */ FROM t",
         params[0..],
     );
-    defer allocator.free(out);
+    defer out.deinit(allocator);
     try std.testing.expectEqualStrings(
         "SELECT 42 -- $1 in comment\n /* also $1 */ FROM t",
-        out,
+        out.sql,
     );
 }
 

@@ -2946,3 +2946,86 @@ test "mysql wire: an unqualified ON column resolves against the session's tables
     try client.sendQuit();
     if (sctx.err) |e| return e;
 }
+
+test "mysql wire: a bound parameter no DATE or DATETIME reads matches nothing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 213;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    for ([_][]const u8{
+        "CREATE TABLE dt (id BIGINT PRIMARY KEY, d DATE, ts DATETIME)",
+        "INSERT INTO dt VALUES (1, '2026-09-26', '2026-09-26 10:00:00'), (2, '2026-09-27', '2026-09-27 00:00:00')",
+    }) |sql_text| {
+        try client.sendQuery(sql_text);
+        const packet = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(packet.payload);
+        try std.testing.expectEqual(@as(u8, 0), packet.payload[0]);
+    }
+
+    // Spelled in the statement, the constant fails it with MySQL's 1525.
+    try client.sendQuery("SELECT id FROM dt WHERE d = 'abc'");
+    {
+        const packet = try mysql_packet.readPacket(allocator, &client.reader.interface);
+        defer allocator.free(packet.payload);
+        try std.testing.expectEqual(@as(u8, 0xff), packet.payload[0]);
+        try std.testing.expectEqual(@as(u16, 1525), std.mem.readInt(u16, packet.payload[1..3], .little));
+    }
+
+    // Bound, it matches nothing: MySQL returns no rows for such a parameter.
+    const statements = [_][]const u8{
+        "SELECT id FROM dt WHERE d = ?",
+        "SELECT id FROM dt WHERE d <> ?",
+        "SELECT id FROM dt WHERE ts >= ?",
+        "SELECT id FROM dt WHERE ts < ? AND id > 0",
+        "SELECT id FROM dt WHERE d BETWEEN ? AND '2026-12-31'",
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    for (statements) |sql_text| {
+        try client.sendStmtPrepare(sql_text);
+        const reply = try client.readPrepareReply(true);
+        for ([_][]const u8{ "", "abc", "Invalid Date" }) |value| {
+            var param: std.ArrayList(u8) = .empty;
+            defer param.deinit(allocator);
+            try encodeLenEncString(allocator, &param, value);
+            try client.sendStmtExecute(reply.stmt_id, &.{.{ .type_byte = MYSQL_TYPE_VAR_STRING, .value_bytes = param.items }});
+            const rows = client.readBinaryResultSet(arena.allocator(), true) catch |err| {
+                std.debug.print("bound '{s}' failed: {s}\n", .{ value, sql_text });
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 0), rows.len);
+        }
+    }
+
+    try client.sendStmtPrepare("SELECT id FROM dt WHERE d = ?");
+    const reply = try client.readPrepareReply(true);
+    var param: std.ArrayList(u8) = .empty;
+    defer param.deinit(allocator);
+    try encodeLenEncString(allocator, &param, "2026-9-27");
+    try client.sendStmtExecute(reply.stmt_id, &.{.{ .type_byte = MYSQL_TYPE_VAR_STRING, .value_bytes = param.items }});
+    const rows = try client.readBinaryResultSet(arena.allocator(), true);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 2), std.mem.readInt(i64, rows[0].cells[0..8], .little));
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}

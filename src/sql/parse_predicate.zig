@@ -29,6 +29,7 @@ const exec_predicate = @import("../exec/predicate.zig");
 const exec_expr = @import("../exec/expr.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
+const Predicate = exec_predicate.Predicate;
 
 const types = @import("../types.zig");
 const Value = types.Value;
@@ -116,6 +117,18 @@ fn flipOp(op: PredicateOp) PredicateOp {
     };
 }
 
+fn flipLeaf(leaf: Predicate) Predicate {
+    var flipped = leaf;
+    flipped.op = flipOp(leaf.op);
+    return flipped;
+}
+
+/// `col op val`, `val` a literal the statement holds: a constant it
+/// spells, or a bound parameter's value (`Parser.spelledValue`).
+pub fn literalLeaf(p: anytype, col: []const u8, op: PredicateOp, val: Value) PredicateExpr {
+    return .{ .leaf = .{ .col = col, .op = op, .val = val, .from_statement = p.spelledValue(val) } };
+}
+
 /// 3VL-correct negation, applied at parse time by pushing NOT down to the
 /// leaves. The mask evaluators collapse UNKNOWN to false, so a mask-level
 /// `.not` flip would turn every NULL row TRUE — `NOT (v > 15)` must keep
@@ -127,9 +140,9 @@ fn flipOp(op: PredicateOp) PredicateOp {
 /// `.not(.exists_subquery)` to thread the negation into the correlated set.
 pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr {
     switch (e) {
-        .leaf => |l| return .{ .leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
-        .day_leaf => |l| return .{ .day_leaf = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
-        .text_as_number => |l| return .{ .text_as_number = .{ .col = l.col, .op = flipOp(l.op), .val = l.val } },
+        .leaf => |l| return .{ .leaf = flipLeaf(l) },
+        .day_leaf => |l| return .{ .day_leaf = flipLeaf(l) },
+        .text_as_number => |l| return .{ .text_as_number = flipLeaf(l) },
         .leaf_col_col => |c| return .{ .leaf_col_col = .{ .left = c.left, .op = flipOp(c.op), .right = c.right } },
         .is_null => |c| return .{ .is_not_null = c },
         .is_not_null => |c| return .{ .is_null = c },
@@ -337,7 +350,7 @@ fn parseScalarLhs(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     const op_lhs = try parseComparisonToken(p);
     const rhs = try p.parseScalar();
     return switch (leafOperand(rhs)) {
-        .col_ref => |col| .{ .leaf = .{ .col = col, .op = reverseOp(op_lhs), .val = lhs_val } },
+        .col_ref => |col| literalLeaf(p, col, reverseOp(op_lhs), lhs_val),
         .lit => |rhs_val| try literalComparison(p, lhs_val, op_lhs, rhs_val),
         .null_lit => .unknown,
         else => try makeExprComparisonPredicate(p, lhs, op_lhs, rhs),
@@ -492,7 +505,7 @@ fn nullSafeEqual(p: anytype, lhs_expr: ir.Expr, rhs_expr: ir.Expr) @TypeOf(p.*).
     if (lhs == .lit or rhs == .lit) {
         const col = try anchorColumn(p, if (lhs == .lit) rhs else lhs);
         const val = if (lhs == .lit) lhs.lit else rhs.lit;
-        return try notNullAnd(p, col, .{ .leaf = .{ .col = col, .op = .eq, .val = val } });
+        return try notNullAnd(p, col, literalLeaf(p, col, .eq, val));
     }
     const a = try anchorColumn(p, lhs);
     const b = try anchorColumn(p, rhs);
@@ -656,7 +669,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
 
         const kids = try p.arena.alloc(PredicateExpr, values.items.len + expr_entries.items.len);
         for (values.items, kids[0..values.items.len]) |v, *kid| {
-            kid.* = .{ .leaf = .{ .col = col_dup, .op = .eq, .val = v } };
+            kid.* = literalLeaf(p, col_dup, .eq, v);
         }
         @memcpy(kids[values.items.len..], expr_entries.items);
         var pe: PredicateExpr = if (kids.len == 1) kids[0] else .{ .@"or" = kids };
@@ -768,7 +781,7 @@ fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, rhs
     const expr = if (exec_expr.hexLiteralBytes(rhs)) |bytes| try hexComparand(p, bytes, .{ .col_ref = col }) else rhs;
     return switch (leafOperand(expr)) {
         .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_dup } },
-        .lit => |val| .{ .leaf = .{ .col = col, .op = op, .val = val } },
+        .lit => |val| literalLeaf(p, col, op, val),
         .null_lit => .unknown,
         else => blk: {
             if (p.predicateDerivedEnabled() and exprHasColumnRef(expr)) {
@@ -995,7 +1008,7 @@ fn elementComparison(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_oper
     if (lhs == .null_lit or rhs == .null_lit) return .unknown;
     if (lhs == .lit) switch (rhs) {
         .lit => |rhs_val| return try literalComparison(p, lhs.lit, op, rhs_val),
-        .col_ref => |col| return .{ .leaf = .{ .col = col, .op = reverseOp(op), .val = lhs.lit } },
+        .col_ref => |col| return literalLeaf(p, col, reverseOp(op), lhs.lit),
         else => {},
     };
     return try makeExprComparisonPredicate(p, lhs, op, rhs);
@@ -1028,7 +1041,7 @@ pub fn makeExprComparisonPredicate(p: anytype, lhs_operand: ir.Expr, op: Predica
     };
     return switch (leafOperand(rhs)) {
         .col_ref => |rhs_col| .{ .leaf_col_col = .{ .left = lhs_col, .op = op, .right = rhs_col } },
-        .lit => |val| .{ .leaf = .{ .col = lhs_col, .op = op, .val = val } },
+        .lit => |val| literalLeaf(p, lhs_col, op, val),
         .null_lit => .unknown,
         else => blk: {
             const rhs_col = try p.materializePredicateExpr(rhs);

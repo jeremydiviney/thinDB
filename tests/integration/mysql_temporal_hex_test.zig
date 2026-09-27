@@ -123,9 +123,8 @@ test "a date whose day is past its month's end is invalid everywhere a date is r
     try helpers.expectRunError(allocator, db, "INSERT INTO dd VALUES (2, '2026-02-30', NULL)", error.TypeMismatch);
     try helpers.expectRunError(allocator, db, "INSERT INTO dd VALUES (2, NULL, '2026-04-31 10:00:00')", error.TypeMismatch);
     try helpers.expectRunError(allocator, db, "SELECT DATE '2026-02-30'", error.SqlExpectedValue);
-    // MySQL raises an error comparing with an impossible date; it matches
-    // nothing here, as a date string that doesn't parse at all does.
-    try expectRows(allocator, db, "SELECT id FROM dd WHERE d = '2026-02-30'", &.{});
+    // MySQL raises error 1525 comparing with an impossible date.
+    try helpers.expectRunError(allocator, db, "SELECT id FROM dd WHERE d = '2026-02-30'", error.InvalidTemporalLiteral);
     try expectRows(allocator, db, "SELECT id FROM dd WHERE d = '2026-02-28'", &.{"1"});
 }
 
