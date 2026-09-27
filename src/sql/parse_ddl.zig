@@ -764,7 +764,7 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     // CTAS path: `CREATE TABLE name AS SELECT ...`. No column list.
     if (p.cur.tag == .kw_as) {
         try p.advance();
-        if (p.cur.tag != .kw_select) return PE.SqlExpectedSelect;
+        if (!p.startsQuery(p.cur.tag)) return PE.SqlExpectedSelect;
         const source = try p.parseStatement();
         return try p.allocOp(.{ .create_table_as = .{
             .table = ref,
@@ -1027,8 +1027,8 @@ fn parseInsertLike(p: anytype, mode_in: ir.InsertMode) !*ir.Op {
 
     // INSERT INTO t (cols) SELECT ... — source rows from a query
     // rather than a VALUES list. Parsed before the VALUES branch so
-    // SELECT/WITH show up in the same dispatch position.
-    if (p.cur.tag == .kw_select or p.cur.tag == .kw_with) {
+    // SELECT/WITH/TABLE show up in the same dispatch position.
+    if (p.cur.tag != .kw_values and p.startsQuery(p.cur.tag)) {
         const source = try p.parseStatement();
         return try p.allocOp(.{ .insert_select = .{
             .mode = mode,
@@ -1137,7 +1137,7 @@ const InsertRows = struct {
             .mode = mode,
             .table = ref,
             .columns = columns,
-            .source = try valuesQuery(p, self.exprs.items),
+            .source = try valuesQuery(p, self.exprs.items, try valueColumnNames(p, self.width.?)),
             .on_duplicate = on_duplicate,
         } });
         return try p.allocOp(.{ .insert = .{
@@ -1226,25 +1226,27 @@ fn literalExprs(p: anytype, row: []const ?Value) ![]const ir.Expr {
     return out;
 }
 
-/// The rows of a VALUES list as the query INSERT ... SELECT reads: each row
-/// a FROM-less SELECT, all of them a UNION ALL, balanced so a long list
-/// nests only log2(rows) deep.
-fn valuesQuery(p: anytype, rows: []const []const ir.Expr) !*ir.Op {
+fn valueColumnNames(p: anytype, width: usize) ![]const []const u8 {
+    const names = try p.arena.alloc([]const u8, width);
+    for (names, 0..) |*name, i| name.* = try std.fmt.allocPrint(p.arena, "__value_{d}", .{i});
+    return names;
+}
+
+/// The rows of a VALUES list as a query: each row a FROM-less SELECT
+/// naming its cells `names`, all of them a UNION ALL, balanced so a long
+/// list nests only log2(rows) deep.
+pub fn valuesQuery(p: anytype, rows: []const []const ir.Expr, names: []const []const u8) !*ir.Op {
     if (rows.len > 1) {
         const half = rows.len / 2;
         return try p.allocOp(.{ .set_union = .{
-            .left = try valuesQuery(p, rows[0..half]),
-            .right = try valuesQuery(p, rows[half..]),
+            .left = try valuesQuery(p, rows[0..half], names),
+            .right = try valuesQuery(p, rows[half..], names),
             .all = true,
         } });
     }
     const row = rows[0];
     const derived = try p.arena.alloc(ir.Derived, row.len);
-    const names = try p.arena.alloc([]const u8, row.len);
-    for (row, derived, names, 0..) |e, *d, *name, i| {
-        name.* = try std.fmt.allocPrint(p.arena, "__value_{d}", .{i});
-        d.* = .{ .name = name.*, .expr = e };
-    }
+    for (row, derived, names) |e, *d, name| d.* = .{ .name = name, .expr = e };
     const single = try p.allocOp(.{ .single_row = {} });
     const compute = try p.allocOp(.{ .compute = .{ .derived = derived, .upstream = single } });
     return try p.allocOp(.{ .select = .{ .columns = names, .upstream = compute } });

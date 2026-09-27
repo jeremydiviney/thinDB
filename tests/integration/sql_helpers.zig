@@ -124,15 +124,19 @@ pub fn exec(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
     while (try q.next()) |_| {}
 }
 
-/// Collect every value from a single-column BIGINT result into a slice
-/// owned by `allocator`. Caller must `allocator.free` the returned slice.
+/// Collect every value from a single-column BIGINT or INT result into a
+/// slice owned by `allocator`. Caller must `allocator.free` the returned slice.
 pub fn collectBigints(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i64 {
     var q = try runSql(allocator, db, sql);
     defer q.deinit();
     var out: std.ArrayList(i64) = .empty;
     errdefer out.deinit(allocator);
     while (try q.next()) |batch| {
-        for (batch.values[0].data.bigint[0..batch.row_count]) |v| try out.append(allocator, v);
+        switch (batch.values[0].data) {
+            .bigint => |values| for (values[0..batch.row_count]) |v| try out.append(allocator, v),
+            .int => |values| for (values[0..batch.row_count]) |v| try out.append(allocator, v),
+            else => return error.TestUnexpectedResult,
+        }
     }
     return out.toOwnedSlice(allocator);
 }
