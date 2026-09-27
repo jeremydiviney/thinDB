@@ -123,7 +123,8 @@ fn compile_staged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage_co
     exec.prof.addPhase("compile.collect_stages", @intCast(exec.prof.nowTicks() - t_collect_stages));
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
     const t_final_block = exec.prof.nowTicks();
-    const inner = try compileBlock(input, root, &map);
+    var inner = try compileBlock(input, root, &map);
+    errdefer inner.deinit();
     exec.prof.addPhase("compile.final_block", @intCast(exec.prof.nowTicks() - t_final_block));
     set.releaseCompilePins();
     return mat_stage.StagedRoot.create(input.allocator, inner, set);

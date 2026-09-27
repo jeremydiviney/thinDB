@@ -616,12 +616,12 @@ pub const Scan = struct {
         table.mutex.lockUncancelable(table.io);
         defer table.mutex.unlock(table.io);
         const ms = table.memtable;
-        ms.acquire();
         const count = table.manifest.segments.items.len;
         const segs: []storage.ManifestEntry = if (allocator) |a|
             try a.dupe(storage.ManifestEntry, table.manifest.segments.items[0..count])
         else
             &.{};
+        ms.acquire();
         return .{
             .segment_count = count,
             .memtable_snap = ms,
@@ -710,14 +710,14 @@ pub const Scan = struct {
         if (injected_snap) |snap| {
             // Parallel worker: reuse the orchestrator's single captured view so
             // every worker agrees. Acquire our own pin (balanced by deinit).
-            segment_count = snap.segment_count;
-            memtable_snap = snap.memtable_snap;
-            memtable_snap.acquire();
-            memtable_row_count = snap.memtable_row_count;
             // snap.segments length == snap.segment_count by construction; a
             // count-only capture (empty segments) can't feed a worker that
             // reads entries, so this dupe is the authoritative source.
             segs = try allocator.dupe(storage.ManifestEntry, snap.segments);
+            segment_count = snap.segment_count;
+            memtable_snap = snap.memtable_snap;
+            memtable_snap.acquire();
+            memtable_row_count = snap.memtable_row_count;
         } else {
             table.mutex.lockUncancelable(table.io);
             segment_count = table.manifest.segments.items.len;
@@ -731,6 +731,7 @@ pub const Scan = struct {
             };
             table.mutex.unlock(table.io);
         }
+        errdefer memtable_snap.release();
 
         // Use the injected query-scoped accountant when present. Otherwise
         // mint our own from the table's configured budget (heap-allocated
