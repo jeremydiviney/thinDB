@@ -43,6 +43,7 @@ const ColumnStore = engine.ColumnStore;
 const api = @import("api.zig");
 const Table = api.Table;
 const DmlFilter = @import("delete.zig").DmlFilter;
+const upsert = @import("upsert.zig");
 
 const ir = @import("../ir/ir.zig");
 
@@ -155,7 +156,7 @@ fn processMemtable(
 
     var matched = try materializeMatched(t, batch, mask, matched_count);
     defer freeMaterializedRows(allocator, &matched);
-    var new_rows = try computeNewRows(t, matched, assignments);
+    var new_rows = try computeNewRows(t, matched, &.{}, assignments);
     defer freeMaterializedRows(allocator, &new_rows);
 
     const keep = try allocator.alloc(bool, mt_rows_at_start);
@@ -264,7 +265,7 @@ fn processOneSegment(
 
             var matched = try materializeMatched(t, batch, mask, matched_in_rg);
             defer freeMaterializedRows(allocator, &matched);
-            var new_rows = try computeNewRows(t, matched, assignments);
+            var new_rows = try computeNewRows(t, matched, &.{}, assignments);
             defer freeMaterializedRows(allocator, &new_rows);
 
             const replaced: Table.Replaced = .{ .segment = .{ .id = entry.segment_id, .offsets = offsets.items } };
@@ -285,12 +286,12 @@ fn processOneSegment(
 
 /// Rows with one ColumnStore per table schema column. Lives for the
 /// duration of one batch's processing.
-const MaterializedRows = struct {
+pub const MaterializedRows = struct {
     stores: []ColumnStore,
     row_count: usize,
 };
 
-fn freeMaterializedRows(allocator: std.mem.Allocator, rows: *MaterializedRows) void {
+pub fn freeMaterializedRows(allocator: std.mem.Allocator, rows: *MaterializedRows) void {
     for (rows.stores) |*c| c.deinit(allocator);
     allocator.free(rows.stores);
 }
@@ -317,21 +318,37 @@ fn materializeMatched(t: *Table, batch: exec.Batch, mask: []const bool, matched_
 /// Given the matched rows + assignments, produce rows where each column
 /// carries either the post-assignment value (for assigned cols) or the
 /// original value (for the others), via a SingleBatchSource(matched) →
-/// Compute(synthetic derived) pipeline.
-fn computeNewRows(
+/// Compute(synthetic derived) pipeline. `incoming` (empty for UPDATE) holds
+/// one more row per matched row, in the table's column order, that the
+/// assignments see under `upsert.incoming_prefix`: the row an INSERT ... ON
+/// DUPLICATE KEY UPDATE would have inserted.
+pub fn computeNewRows(
     t: *Table,
     matched: MaterializedRows,
+    incoming: []const ColumnView,
     assignments: []const Assignment,
 ) !MaterializedRows {
     const allocator = t.allocator;
     const schema = t.schema;
     const matched_count = matched.row_count;
 
-    const filtered_views = try allocator.alloc(ColumnView, schema.columns.len);
+    const width = schema.columns.len + incoming.len;
+    const filtered_views = try allocator.alloc(ColumnView, width);
     defer allocator.free(filtered_views);
-    for (matched.stores, filtered_views) |*c, *v| v.* = c.view();
+    for (matched.stores, filtered_views[0..schema.columns.len]) |*c, *v| v.* = c.view();
+    @memcpy(filtered_views[schema.columns.len..], incoming);
+    const batch_schema = try allocator.alloc(types.Column, width);
+    defer allocator.free(batch_schema);
+    @memcpy(batch_schema[0..schema.columns.len], schema.columns);
+    var names_made: usize = 0;
+    defer for (batch_schema[schema.columns.len..][0..names_made]) |c| allocator.free(c.name);
+    for (batch_schema[schema.columns.len..], schema.columns[0..incoming.len]) |*dst, c| {
+        dst.* = c;
+        dst.name = try std.mem.concat(allocator, u8, &.{ upsert.incoming_prefix, c.name });
+        names_made += 1;
+    }
     const filtered_batch: exec.Batch = .{
-        .schema = schema.columns,
+        .schema = batch_schema,
         .values = filtered_views,
         .row_count = matched_count,
     };
