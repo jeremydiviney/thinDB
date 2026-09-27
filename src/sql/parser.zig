@@ -219,6 +219,7 @@ fn bareTemporalFn(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "current_timestamp")) return "current_timestamp";
     if (std.ascii.eqlIgnoreCase(name, "localtimestamp")) return "localtimestamp";
     if (std.ascii.eqlIgnoreCase(name, "utc_timestamp")) return "utc_timestamp";
+    if (std.ascii.eqlIgnoreCase(name, "utc_time")) return "utc_time";
     if (std.ascii.eqlIgnoreCase(name, "current_time")) return "current_time";
     if (std.ascii.eqlIgnoreCase(name, "curtime")) return "curtime";
     if (std.ascii.eqlIgnoreCase(name, "localtime")) return "localtime";
@@ -242,7 +243,32 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
 fn unitFirstArgCall(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "date_diff") or
         std.ascii.eqlIgnoreCase(name, "timestampdiff") or
-        std.ascii.eqlIgnoreCase(name, "timestampadd");
+        std.ascii.eqlIgnoreCase(name, "timestampadd") or
+        std.ascii.eqlIgnoreCase(name, "get_format");
+}
+
+/// The wall-clock functions whose value is a TIME, whose precision picks
+/// the fraction digits they show.
+fn clockTimeFn(name: []const u8) bool {
+    inline for (.{ "current_time", "curtime", "utc_time" }) |n| {
+        if (std.ascii.eqlIgnoreCase(name, n)) return true;
+    }
+    return false;
+}
+
+/// MySQL's TIMESTAMPADD and TIMESTAMPDIFF also take ODBC's spelling of a
+/// unit, `SQL_TSI_DAY`.
+fn withoutTsiPrefix(word: []const u8) []const u8 {
+    return if (std.ascii.startsWithIgnoreCase(word, "sql_tsi_")) word["sql_tsi_".len..] else word;
+}
+
+/// The text a unit-like first argument names: a bare word or a text literal.
+fn unitWord(e: ir.Expr) ?[]const u8 {
+    return switch (e) {
+        .col_ref => |c| c,
+        .lit => |v| if (v == .text) v.text else null,
+        else => null,
+    };
 }
 
 /// An interval unit is a whole number of days, months, seconds or
@@ -2082,21 +2108,18 @@ pub const Parser = struct {
         const name = scalar_fn.canonicalName(typed_name);
         if (args.len == 1 and fspTemporalFn(name)) {
             // Timestamps carry microseconds whatever precision is asked
-            // for, as DATETIME(fsp) columns do.
+            // for, as DATETIME(fsp) columns do. A TIME is text, so it keeps
+            // the precision to show that many fraction digits.
             const fsp = literalInteger(args[0]) orelse return ParseError.SqlExpectedValue;
             if (fsp < 0 or fsp > 6) return ParseError.SqlExpectedValue;
-            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, name), .args = &.{} } };
+            const kept: []const ir.Expr = if (clockTimeFn(name)) try self.arena.dupe(ir.Expr, args) else &.{};
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, name), .args = kept } };
         }
         if (std.ascii.eqlIgnoreCase(name, "isnull") and args.len == 1) return try self.isNullValue(args[0]);
         if (std.ascii.eqlIgnoreCase(name, "timestampadd") and args.len == 3) {
             // `TIMESTAMPADD(unit, n, x)` is `x + INTERVAL n unit`, so a
             // DATE moved by hours becomes a DATETIME, as in MySQL.
-            const unit_word: ?[]const u8 = switch (args[0]) {
-                .col_ref => |c| c,
-                .lit => |v| if (v == .text) v.text else null,
-                else => null,
-            };
-            if (unit_word) |word| if (intervalUnit(word)) |unit| return try self.unitAddCall(unit, args[2], args[1]);
+            if (unitWord(args[0])) |word| if (intervalUnit(withoutTsiPrefix(word))) |unit| return try self.unitAddCall(unit, args[2], args[1]);
         }
         if (std.ascii.eqlIgnoreCase(name, "log") and args.len == 1) {
             // One-argument LOG is the natural log in MySQL and base 10 in
@@ -2114,6 +2137,20 @@ pub const Parser = struct {
                 .fn_name = try self.arena.dupe(u8, "date_diff"),
                 .args = normalized,
             } };
+        }
+        if (std.ascii.eqlIgnoreCase(name, "get_format") and args.len == 2) {
+            // Folded here so STR_TO_DATE(x, GET_FORMAT(...)) sees a constant
+            // format and takes its type from it.
+            if (unitWord(args[0])) |kind| if (args[1] == .lit and args[1].lit == .text) {
+                const format = datefmt.getFormat(kind, args[1].lit.text) orelse return ir.Expr{ .null_lit = .string };
+                return ir.Expr{ .lit = .{ .text = try self.arena.dupe(u8, format) } };
+            };
+        }
+        if (std.ascii.eqlIgnoreCase(name, "str_to_date") and args.len == 2 and args[1] == .lit and args[1].lit == .text and
+            datefmt.formatHasTimePart(args[1].lit.text) and !datefmt.formatHasDatePart(args[1].lit.text))
+        {
+            // A format with a time of day and no date part makes a TIME.
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "str_to_time"), .args = try self.arena.dupe(ir.Expr, args) } };
         }
         if (std.ascii.eqlIgnoreCase(name, "str_to_date") and args.len == 2 and args[1] == .lit and args[1].lit == .text and
             !datefmt.formatHasTimePart(args[1].lit.text))
@@ -2773,8 +2810,16 @@ pub const Parser = struct {
         // MySQL's units, plus DAYOFYEAR, which every engine that accepts it
         // numbers the same way. WEEK is WEEK(d), mode 0, as in MySQL.
         const fields = [_][]const u8{ "year", "quarter", "month", "week", "day", "dayofyear", "hour", "minute", "second", "microsecond" };
+        // A compound unit (`DAY_SECOND`) has its own function, extract_<unit>.
+        const compound = [_][]const u8{
+            "extract_year_month",      "extract_day_hour",           "extract_day_minute",         "extract_day_second",
+            "extract_day_microsecond", "extract_hour_minute",        "extract_hour_second",        "extract_hour_microsecond",
+            "extract_minute_second",   "extract_minute_microsecond", "extract_second_microsecond",
+        };
         const fn_name: []const u8 = for (fields) |f| {
             if (std.ascii.eqlIgnoreCase(field, f)) break f;
+        } else for (compound) |f| {
+            if (std.ascii.eqlIgnoreCase(field, f["extract_".len..])) break f;
         } else return ParseError.SqlExpectedKeyword;
         try self.advance();
         if (self.cur.tag != .kw_from) return ParseError.SqlExpectedFrom;
