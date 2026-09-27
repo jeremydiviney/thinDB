@@ -323,6 +323,43 @@ pub const mulKernel = arithImpl(.mul);
 pub const divKernel = arithImpl(.div);
 pub const modKernel = arithImpl(.mod);
 
+/// `a DIV b` over a float or decimal operand, as MySQL divides it: exactly,
+/// with a double read as its shortest digits, so `0.3e0 DIV 0.1e0` is 3.
+/// The quotient truncates toward zero into a BIGINT and raises past its
+/// range. `.zero_divisor`.
+pub fn intDivKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    var row: usize = 0;
+    while (row < n) : (row += 1) {
+        const divides = rowValid(args, row) and f64At(args[1], arg_types[1], row) != 0;
+        try out.data.bigint.append(allocator, if (divides) try truncatedQuotient(arg_types, args, row) else 0);
+    }
+}
+
+/// An operand as an exact scaled integer; null for a double past DECIMAL's
+/// range.
+fn exactAt(v: ColumnView, t: Type, row: usize) ?common.ScaledInt {
+    if (t.isFloat()) return common.floatDigits(f64At(v, t, row));
+    return .{ .m = mantissaAt(v, row), .s = scaleOf(t) };
+}
+
+fn truncatedQuotient(arg_types: []const Type, args: []const ColumnView, row: usize) error{ArithmeticOverflow}!i64 {
+    exact: {
+        const a = exactAt(args[0], arg_types[0], row) orelse break :exact;
+        const b = exactAt(args[1], arg_types[1], row) orelse break :exact;
+        const s = @max(a.s, b.s);
+        const num = mulPow10(a.m, s - a.s) orelse break :exact;
+        const den = mulPow10(b.m, s - b.s) orelse break :exact;
+        const q = std.math.divTrunc(i128, num, den) catch break :exact;
+        return std.math.cast(i64, q) orelse error.ArithmeticOverflow;
+    }
+    // Operands too wide to align exactly, or a divisor below DECIMAL's
+    // smallest step, divide as doubles.
+    const q = @trunc(f64At(args[0], arg_types[0], row) / f64At(args[1], arg_types[1], row));
+    if (!(q >= -0x1p63 and q < 0x1p63)) return error.ArithmeticOverflow;
+    return @intFromFloat(q);
+}
+
 // ---------------------------------------------------------------------------
 // Casts: decimal -> X and X -> decimal
 // ---------------------------------------------------------------------------

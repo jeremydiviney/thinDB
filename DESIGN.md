@@ -149,6 +149,12 @@ exactly on a decimal or integer column (see DOUBLE to DECIMAL below), so
 (`1e3`, `2.5E-3`, `6.02e+23`) is DOUBLE, and so is a literal of more than
 38 digits. A literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
 
+**`a DIV b` with a DOUBLE or DECIMAL operand** divides exactly, as MySQL
+does, reading a double as its shortest digits, and truncates the quotient
+toward zero into a BIGINT: `5.5 DIV 2` is 2, `5.5 DIV 0.5` is 11 and
+`0.3e0 DIV 0.1e0` is 3. A quotient past BIGINT's range raises, like MySQL's
+error 1690.
+
 Known difference: StarRocks returns LARGEINT for `ABS(BIGINT)`, so
 `ABS(BIGINT_MIN)` is `9223372036854775808` there. thinDB keeps BIGINT, which
 wraps to `BIGINT_MIN`.
@@ -1086,7 +1092,7 @@ Target Zig version: 0.16.
 | **Range / opaque predicates** | Single inequality `a OP b`, multi-range (BETWEEN), `extra_predicate` post-join filter, opaque callback via NLJ. Skew detection + auto-route on top. |
 | **Upserts** | StarRocks-style last-writer-wins on tables with `unique = true`. Insert auto-resolves; `Table.upsert()` is the self-documenting alias. |
 | **Crash durability** | WAL with leader-follower group commit (§8.1). `wal_enabled = true` + `sync_mode = .per_flush`. |
-| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). A string literal where a function takes a date or datetime is parsed once at plan time, including `CAST('…' AS DATE)`. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. |
+| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). An `INTERVAL` amount counts whole units: a fractional literal rounds half away from zero before the unit's factor applies (`INTERVAL 1.5 WEEK` is 14 days) and a text amount reads its leading integer, as MySQL does; any other amount takes an integer type. A string literal where a function takes a date or datetime is parsed once at plan time, including `CAST('…' AS DATE)`. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. |
 | **Statistical / set-oriented aggregates** | `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT`. |
 | **In-process Connection** | `thindb.local(...)` returns a Connection that mediates queries — same surface a future remote-mode Connection will expose. |
 

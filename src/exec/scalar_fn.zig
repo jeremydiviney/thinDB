@@ -127,6 +127,7 @@ pub fn resolveWithRegistry(
     // decimal operand never falls into an int/double overload that ignores scale.
     if (try resolveDecimal(aa, name, arg_types)) |ov| return ov;
     if (try resolveIntArith(aa, name, arg_types)) |ov| return ov;
+    if (try resolveFractionalIntDiv(aa, name, arg_types)) |ov| return ov;
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
@@ -493,6 +494,14 @@ fn resolveIntArith(aa: Allocator, name: []const u8, arg_types: []const Type) !?R
         },
         .arg_casts = if (any_cast) casts else null,
     };
+}
+
+/// `a DIV b` with a float or decimal operand: the exact quotient truncated
+/// into a BIGINT, as in MySQL (`dec.intDivKernel`). Integer operands resolve
+/// first, in `resolveIntArith`.
+fn resolveFractionalIntDiv(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (arg_types.len != 2 or !std.ascii.eqlIgnoreCase(name, "intdiv") or !allNumericLike(arg_types)) return null;
+    return try buildDecFn(aa, name, arg_types, .bigint, dec.intDivKernel, .zero_divisor);
 }
 
 /// Whether ANY overload named `name` exists — builtin, decimal-only, or a

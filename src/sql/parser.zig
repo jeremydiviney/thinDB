@@ -215,6 +215,33 @@ fn unitFirstArgCall(name: []const u8) bool {
 /// An interval unit is a whole number of days or months.
 const IntervalUnit = struct { fn_name: []const u8, factor: i32 };
 
+/// Decimal digits (`-2.5`, `.5`) rounded half away from zero.
+fn roundedDigits(digits: []const u8) ?i64 {
+    const negative = digits[0] == '-';
+    const body = if (negative) digits[1..] else digits;
+    const point = std.mem.indexOfScalar(u8, body, '.') orelse body.len;
+    var whole: i64 = if (point == 0) 0 else std.fmt.parseInt(i64, body[0..point], 10) catch return null;
+    if (point + 1 < body.len and body[point + 1] >= '5') whole = std.math.add(i64, whole, 1) catch return null;
+    return if (negative) -whole else whole;
+}
+
+fn roundedFloat(x: anytype) ?i64 {
+    const r = @round(x);
+    if (!(r >= -0x1p63 and r < 0x1p63)) return null;
+    return @intFromFloat(r);
+}
+
+/// The integer a text amount starts with (`'1.5'` is 1); null when it
+/// starts with no digit.
+fn leadingInteger(text: []const u8) ?i64 {
+    const t = std.mem.trim(u8, text, " \t");
+    var end: usize = if (t.len > 0 and (t[0] == '-' or t[0] == '+')) 1 else 0;
+    const digits_start = end;
+    while (end < t.len and std.ascii.isDigit(t[end])) end += 1;
+    if (end == digits_start) return null;
+    return std.fmt.parseInt(i64, t[0..end], 10) catch null;
+}
+
 fn intervalUnit(word: []const u8) ?IntervalUnit {
     const units = [_]struct { []const u8, IntervalUnit }{
         .{ "day", .{ .fn_name = "date_add", .factor = 1 } },
@@ -2085,18 +2112,25 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, unit.fn_name), .args = args } };
     }
 
+    /// An interval counts whole units. A fractional literal amount rounds
+    /// half away from zero before the unit's factor applies, and a text
+    /// amount reads its leading integer, as MySQL does: `INTERVAL 1.5 WEEK`
+    /// is 14 days and `INTERVAL '1.5' DAY` is 1 day.
     fn normalizeIntervalAmount(self: *Parser, amount: ir.Expr, negate: bool) ParseError!ir.Expr {
-        var out = switch (amount) {
+        const count: ?i64 = if (exec_expr.decimalLiteral(amount)) |d| roundedDigits(d.digits) else switch (amount) {
             .lit => |v| switch (v) {
-                .text => |s| blk: {
-                    const n = std.fmt.parseInt(i64, s, 10) catch return ParseError.SqlExpectedValue;
-                    if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ParseError.SqlExpectedValue;
-                    break :blk ir.Expr{ .lit = .{ .int = @intCast(n) } };
-                },
-                else => amount,
+                .text => |s| leadingInteger(s),
+                .double => |x| roundedFloat(x),
+                .float => |x| roundedFloat(x),
+                else => null,
             },
-            else => amount,
+            else => null,
         };
+        var out = amount;
+        if (count) |n| {
+            if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ParseError.SqlExpectedValue;
+            out = ir.Expr{ .lit = .{ .int = @intCast(n) } };
+        } else if (amount == .lit and amount.lit == .text) return ParseError.SqlExpectedValue;
         if (negate) out = try self.negateExpr(out);
         return out;
     }
