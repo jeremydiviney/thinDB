@@ -417,6 +417,11 @@ pub fn toDecimalKernel(allocator: Allocator, arg_types: []const Type, out_type: 
             .tinyint, .smallint, .int, .bigint, .largeint, .boolean => try orErr(mulPow10(mantissaAt(args[0], row), target.s), true),
             .float, .double => try floatMantissa(f64At(args[0], src, row), target.s),
             .varchar, .string, .char, .json => try textMantissa(common.stringViewOf(args[0]).rowBytes(row), target.s),
+            .date => try orErr(mulPow10(common.dateNumber(args[0].data.date[row]), target.s), true),
+            .datetime => blk: {
+                const number = common.datetimeNumber(args[0].data.datetime[row]);
+                break :blk try orErr(rescale(number.m, number.s, target.s), true);
+            },
             else => return error.ComputeNoSuchOverload,
         };
         try appendDec(allocator, out, out_type, m orelse 0, m != null);

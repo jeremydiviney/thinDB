@@ -150,5 +150,4 @@ test "result type: kinds that never meet are rejected" {
 
     try helpers.expectRunError(allocator, db, "SELECT CASE WHEN id = 1 THEN i ELSE d END FROM rt", error.ComputeUnsupportedExpr);
     try helpers.expectRunError(allocator, db, "SELECT i FROM rt UNION ALL SELECT d FROM rt", error.TypeMismatch);
-    try helpers.expectRunError(allocator, db, "SELECT SQRT(d) FROM rt", error.ComputeNoSuchOverload);
 }

@@ -137,11 +137,13 @@ pub fn resolveWithRegistry(
     if (try resolveFractionalIntDiv(aa, name, arg_types)) |ov| return ov;
     if (try resolveFormat(aa, name, arg_types)) |ov| return ov;
     if (try resolveTimeFromNumbers(aa, name, arg_types)) |ov| return ov;
+    if (try resolveCastTime(aa, name, arg_types)) |ov| return ov;
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveCharset(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveOrderKey(aa, name, arg_types)) |ov| return ov;
+    if (try resolveHexLiteralAs(aa, name, arg_types)) |ov| return ov;
 
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
@@ -538,6 +540,31 @@ fn resolveTimeFromNumbers(aa: Allocator, name: []const u8, arg_types: []const Ty
     return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
 }
 
+const CAST_TIME_PREFIX = "to_time:";
+
+/// The function CAST(x AS TIME(fsp)) lowers to. thinDB has no TIME type, so
+/// the precision rides in the name, as a DECIMAL target's does.
+pub fn castTimeFnName(arena: Allocator, fsp: u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, CAST_TIME_PREFIX ++ "{d}", .{fsp});
+}
+
+const CAST_TIME_KERNELS = blk: {
+    var kernels: [time.MAX_FSP + 1]TypedKernel = undefined;
+    for (&kernels, 0..) |*k, fsp| k.* = time.castTimeKernel(fsp);
+    break :blk kernels;
+};
+
+/// `to_time:<fsp>` over text, a date, a datetime or any number
+/// (`time.castTimeKernel`): each reads by its own type, so no cast applies.
+fn resolveCastTime(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (arg_types.len != 1 or !std.mem.startsWith(u8, name, CAST_TIME_PREFIX)) return null;
+    const fsp = std.fmt.parseInt(u8, name[CAST_TIME_PREFIX.len..], 10) catch return null;
+    if (fsp > time.MAX_FSP) return null;
+    const t = arg_types[0];
+    if (!(numericLike(t) or t.isString() or t.isTemporal())) return null;
+    return try buildDecFn(aa, name, arg_types, .string, CAST_TIME_KERNELS[fsp], .kernel_managed);
+}
+
 /// Internal: JSON_ARRAYAGG / JSON_OBJECTAGG lower to a GROUP_CONCAT of these
 /// per-row packings, which the matching wrapper builds the document from
 /// (`scalar_fn_json.zig`).
@@ -574,6 +601,7 @@ fn resolveJson(aa: Allocator, name: []const u8, arg_types: []const Type) !?Resol
 /// registered UDF. Name-only, so it holds before argument types are known.
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "to_decimal")) return true;
+    if (std.mem.startsWith(u8, name, CAST_TIME_PREFIX)) return true;
     if (std.ascii.eqlIgnoreCase(name, "json_array") or std.ascii.eqlIgnoreCase(name, "json_object")) return true;
     if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) or std.mem.eql(u8, name, JSON_AGG_MEMBER_FN)) return true;
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
@@ -581,6 +609,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
+    if (std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
     if (std.ascii.eqlIgnoreCase(name, "format")) return true;
@@ -698,6 +727,46 @@ fn resolveOrderKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?R
     return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
 }
 
+/// `expr.HEX_LITERAL_AS_FN`: the literal's integer when the first argument
+/// is a number, else its bytes.
+fn resolveHexLiteralAs(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (!std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN)) return null;
+    if (arg_types.len != 2 or !arg_types[1].isString()) return null;
+    const out: Type = if (numericLike(arg_types[0])) .largeint else .string;
+    return try buildDecFn(aa, name, arg_types, out, hexLiteralAsKernel, .propagates);
+}
+
+fn hexLiteralAsKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    const bytes = common.stringViewOf(args[1]);
+    if (out_type == .largeint) {
+        for (0..row_count) |row| try out.data.largeint.append(allocator, expr_mod.hexNumber(bytes.rowBytes(row)));
+        return;
+    }
+    return string.stringIdentityKernel(allocator, args[1..2], out, row_count);
+}
+
+/// Whether argument `i` of an `arity`-argument `name` call reads a number,
+/// so a hex literal there is its integer (`0x41 + 0`, `ABS(0x41)`,
+/// `CAST(0x41 AS SIGNED)`) rather than its bytes (`CONCAT(0x41, 1)`,
+/// `LENGTH(0x41)`), as in MySQL. A numeric cast reads a number; an argument
+/// the call returns (COALESCE, IF's branches) keeps its bytes, as does one
+/// any overload takes as text.
+pub fn readsNumberAt(registry: ?*const udf_mod.UdfRegistry, name: []const u8, arity: usize, i: usize) bool {
+    if (intCastTarget(name) != null or std.mem.startsWith(u8, name, "to_decimal")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float")) return true;
+    if (resultValueArgsStart(name)) |start| if (i >= start) return false;
+    for (builtins) |f| {
+        if (!std.ascii.eqlIgnoreCase(f.name, name) or !scalarArityMatches(f, arity)) continue;
+        if (scalarDeclaredTypeAt(f, i).isString()) return false;
+    }
+    if (registry) |reg| for (reg.scalarEntries()) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.name, name) or entry.arg_types.len != arity) continue;
+        if (entry.arg_types[i].isString()) return false;
+    };
+    return true;
+}
+
 fn textKeyTarget(spec: []const u8) ?Type {
     var it = std.mem.splitScalar(u8, spec, ':');
     const head = it.next() orelse return null;
@@ -721,7 +790,7 @@ fn resolveToDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?
     const p = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
     const s = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
     const src = arg_types[0];
-    if (!(numericLike(src) or src.isString())) return null;
+    if (!(numericLike(src) or src.isString() or src.isTemporal())) return null;
     return try buildDecFn(aa, name, arg_types, dec.decTypeFor(p, s), dec.toDecimalKernel, .kernel_managed);
 }
 
@@ -770,16 +839,12 @@ pub fn resultValueArgsStart(name: []const u8) ?usize {
 /// `'3abc' + 0`). Builtins and registered UDFs alike; the cheapest overload
 /// wins. A function no overload of which takes these arguments that way
 /// (`'7' DIV '2'`, whose integer and decimal forms resolve by type) reads
-/// its text arguments as doubles when that resolves it. Null when nothing
+/// its text arguments as doubles when that resolves it, and then its date or
+/// datetime arguments as numbers (`temporalNumberArgs`). Null when nothing
 /// resolves or no argument needs converting.
 pub fn convertedArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: []const u8, arg_types: []const Type) !?[]const ?Type {
-    var best: ?ScalarFn = null;
-    var best_cost: u64 = std.math.maxInt(u64);
-    for (builtins) |f| try considerConverted(aa, f, name, arg_types, &best, &best_cost);
-    if (registry) |reg| {
-        for (reg.scalarEntries()) |entry| try considerConverted(aa, scalarFromUdf(entry), name, arg_types, &best, &best_cost);
-    }
-    const f = best orelse return try textAsDoubleArgs(aa, registry, name, arg_types);
+    const f = try cheapestConverted(aa, registry, name, arg_types) orelse
+        return try textAsDoubleArgs(aa, registry, name, arg_types) orelse try temporalNumberArgs(aa, registry, name, arg_types);
     const targets = try aa.alloc(?Type, arg_types.len);
     var any = false;
     for (arg_types, targets, 0..) |given, *t, i| {
@@ -787,6 +852,34 @@ pub fn convertedArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name:
         any = any or t.* != null;
     }
     return if (any) targets else null;
+}
+
+fn cheapestConverted(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: []const u8, arg_types: []const Type) !?ScalarFn {
+    var best: ?ScalarFn = null;
+    var best_cost: u64 = std.math.maxInt(u64);
+    for (builtins) |f| try considerConverted(aa, f, name, arg_types, &best, &best_cost);
+    if (registry) |reg| {
+        for (reg.scalarEntries()) |entry| try considerConverted(aa, scalarFromUdf(entry), name, arg_types, &best, &best_cost);
+    }
+    return best;
+}
+
+/// A date or datetime argument read as its YYYYMMDD[HHMMSS] number
+/// (`to_bigint`), as MySQL reads one in a numeric context (`CURDATE() + 0`,
+/// `ABS(d)`, `d DIV 100`), when the call then resolves. Tried only after
+/// every other conversion, so a call that takes a date's text keeps it.
+fn temporalNumberArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: []const u8, arg_types: []const Type) !?[]const ?Type {
+    const numbers = try aa.alloc(Type, arg_types.len);
+    const targets = try aa.alloc(?Type, arg_types.len);
+    var any = false;
+    for (arg_types, numbers, targets) |given, *number, *target| {
+        target.* = if (given.isTemporal()) .bigint else null;
+        number.* = target.* orelse given;
+        any = any or target.* != null;
+    }
+    if (!any) return null;
+    if (try resolveWithRegistry(aa, registry, name, numbers) != null) return targets;
+    return if (try cheapestConverted(aa, registry, name, numbers) != null) targets else null;
 }
 
 fn considerConverted(aa: Allocator, f: ScalarFn, name: []const u8, arg_types: []const Type, best: *?ScalarFn, best_cost: *u64) !void {
@@ -1215,6 +1308,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_string", .arg_types = &.{.string}, .return_type = .string, .kernel = string.stringIdentityKernel },
     .{ .name = "to_string", .arg_types = &.{.{ .varchar = 0 }}, .return_type = .string, .kernel = string.stringIdentityKernel },
     .{ .name = "to_string", .arg_types = &.{.{ .char = 0 }}, .return_type = .string, .kernel = string.stringIdentityKernel },
+    .{ .name = expr_mod.HEX_LITERAL_FN, .arg_types = &.{.string}, .return_type = .string, .kernel = string.stringIdentityKernel },
     .{ .name = "to_bigint", .arg_types = &.{.int}, .return_type = .bigint, .kernel = math.intToBigintKernel },
     .{ .name = "to_double", .arg_types = &.{.int}, .return_type = .double, .kernel = math.intToDoubleKernel },
     .{ .name = "to_double", .arg_types = &.{.bigint}, .return_type = .double, .kernel = math.bigintToDoubleKernel },
@@ -1237,9 +1331,14 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_int", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = math.stringToIntKernel },
     .{ .name = "to_bigint", .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.doubleToBigintKernel },
     .{ .name = "to_bigint", .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.stringToBigintKernel },
+    // A date or datetime as a number is its YYYYMMDD[HHMMSS] digits, as in MySQL.
+    .{ .name = "to_bigint", .arg_types = &.{.date}, .return_type = .bigint, .kernel = date.dateToBigintKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.datetimeToBigintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.doubleToLargeintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.stringToLargeintKernel },
     .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.stringToDoubleKernel },
+    .{ .name = "to_double", .arg_types = &.{.date}, .return_type = .double, .kernel = date.dateToDoubleKernel },
+    .{ .name = "to_double", .arg_types = &.{.datetime}, .return_type = .double, .kernel = date.datetimeToDoubleKernel },
     .{ .name = "to_boolean", .arg_types = &.{.string}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = math.stringToBoolKernel },
     // Text or JSON read as a number where no CAST was written (`argConversion`).
     .{ .name = TEXT_AS_DOUBLE_FN, .arg_types = &.{.json}, .return_type = .double, .kernel = math.textAsDoubleKernel },

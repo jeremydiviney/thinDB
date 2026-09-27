@@ -829,6 +829,36 @@ pub fn dateFormatDateKernel(allocator: Allocator, args: []const ColumnView, out:
     }
 }
 
+/// A DATE as its number `YYYYMMDD` (`CAST(d AS SIGNED)`, `d + 0`).
+pub fn dateToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.date[0..row_count]) |d| try out.data.bigint.append(allocator, common.dateNumber(d));
+}
+
+/// A DATETIME as its number `YYYYMMDDHHMMSS`, rounded to the second first,
+/// as MySQL rounds it: 23:59:59.5 is the next day at 000000.
+pub fn datetimeToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const us_per_s = std.time.us_per_s;
+    for (args[0].data.datetime[0..row_count]) |dt| {
+        const fraction = @mod(dt, us_per_s);
+        const seconds = dt - fraction + @as(i64, if (fraction >= us_per_s / 2) us_per_s else 0);
+        try out.data.bigint.append(allocator, @intCast(@divExact(common.datetimeNumber(seconds).m, us_per_s)));
+    }
+}
+
+pub fn dateToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.date[0..row_count]) |d| try out.data.double.append(allocator, @floatFromInt(common.dateNumber(d)));
+}
+
+/// A DATETIME as its number `YYYYMMDDHHMMSS.ffffff`.
+pub fn datetimeToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.datetime[0..row_count]) |dt| {
+        const n = common.datetimeNumber(dt).m;
+        const whole: f64 = @floatFromInt(@divFloor(n, std.time.us_per_s));
+        const fraction: f64 = @floatFromInt(@mod(n, std.time.us_per_s));
+        try out.data.double.append(allocator, whole + fraction / std.time.us_per_s);
+    }
+}
+
 pub fn dateToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const ds = args[0].data.date;
     const ss = stringStoreOf(out);

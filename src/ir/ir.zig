@@ -311,7 +311,16 @@ pub const InsertOp = struct {
     /// `columns.?.len` (when named) or the table schema width
     /// (positional).
     rows: []const []const ?Value,
+    /// The cells written as hex literals (`0x3132`), in row then column
+    /// order. Each holds its bytes as text, and a numeric column takes their
+    /// integer instead, as MySQL stores one (12594).
+    hex_cells: []const InsertCell = &.{},
     on_duplicate: ?OnDuplicate = null,
+};
+
+pub const InsertCell = struct {
+    row: u32,
+    column: u32,
 };
 
 /// Introspection statement payload. SHOW ops materialize one column
@@ -1038,6 +1047,7 @@ pub const Op = union(OpTag) {
                 if (i.columns) |cols| allocator.free(cols);
                 for (i.rows) |row| allocator.free(row);
                 allocator.free(i.rows);
+                allocator.free(i.hex_cells);
             },
             .batch => |b| {
                 for (b.statements) |sub| {
@@ -1648,11 +1658,14 @@ fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) Enco
         try out.append(allocator, 0);
     }
     try appendU32(allocator, out, @intCast(i.rows.len));
-    for (i.rows) |row| {
+    var next_hex: usize = 0;
+    for (i.rows, 0..) |row, r| {
         try appendU32(allocator, out, @intCast(row.len));
-        for (row) |maybe_v| {
+        for (row, 0..) |maybe_v, c| {
+            const hex = next_hex < i.hex_cells.len and i.hex_cells[next_hex].row == r and i.hex_cells[next_hex].column == c;
+            if (hex) next_hex += 1;
             if (maybe_v) |v| {
-                try out.append(allocator, 1);
+                try out.append(allocator, if (hex) INSERT_HEX_CELL else 1);
                 try encodeValue(allocator, out, v);
             } else {
                 try out.append(allocator, 0);
@@ -1660,6 +1673,10 @@ fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) Enco
         }
     }
 }
+
+/// The presence byte of a VALUES cell written as a hex literal: present
+/// (non-zero) to a reader that predates it.
+const INSERT_HEX_CELL: u8 = 2;
 
 const ShowTag = enum(u8) {
     databases = 0,
@@ -2965,22 +2982,25 @@ fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
     errdefer allocator.free(rows);
     var inited: usize = 0;
     errdefer for (rows[0..inited]) |r| allocator.free(r);
-    for (rows) |*r| {
+    var hex_cells: std.ArrayList(InsertCell) = .empty;
+    errdefer hex_cells.deinit(allocator);
+    for (rows, 0..) |*r, row| {
         if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
         const ncells = readU32(bytes[cursor.* .. cursor.* + 4]);
         cursor.* += 4;
         const cells = try allocator.alloc(?Value, ncells);
         errdefer allocator.free(cells);
-        for (cells) |*v| {
+        for (cells, 0..) |*v, column| {
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
-            const present = bytes[cursor.*] != 0;
+            const presence = bytes[cursor.*];
             cursor.* += 1;
-            v.* = if (present) try decodeValue(bytes, cursor) else null;
+            if (presence == INSERT_HEX_CELL) try hex_cells.append(allocator, .{ .row = @intCast(row), .column = @intCast(column) });
+            v.* = if (presence != 0) try decodeValue(bytes, cursor) else null;
         }
         r.* = cells;
         inited += 1;
     }
-    return .{ .mode = mode, .table = ref, .columns = cols_opt, .rows = rows };
+    return .{ .mode = mode, .table = ref, .columns = cols_opt, .rows = rows, .hex_cells = try hex_cells.toOwnedSlice(allocator) };
 }
 
 fn decodeInsertMode(bytes: []const u8, cursor: *usize) DecodeError!InsertMode {
@@ -3557,6 +3577,26 @@ test "ir: replace values and replace-select round-trip" {
         try std.testing.expectEqualStrings("dst", decoded.insert_select.table.name);
         try std.testing.expect(decoded.insert_select.source.* == .scan);
     }
+}
+
+test "ir: an insert's hex-literal cells round-trip" {
+    const allocator = std.testing.allocator;
+    const row1 = [_]?Value{ .{ .bigint = 1 }, .{ .text = "12" }, null };
+    const row2 = [_]?Value{ .{ .text = "A" }, .{ .text = "B" }, .{ .text = "C" } };
+    const rows = [_][]const ?Value{ &row1, &row2 };
+    const hex = [_]InsertCell{ .{ .row = 0, .column = 1 }, .{ .row = 1, .column = 0 }, .{ .row = 1, .column = 2 } };
+    const root: Op = .{ .insert = .{ .table = .{ .name = "t" }, .columns = null, .rows = &rows, .hex_cells = &hex } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expectEqualSlices(InsertCell, &hex, decoded.insert.hex_cells);
+    try std.testing.expectEqualStrings("12", decoded.insert.rows[0][1].?.text);
+    try std.testing.expect(decoded.insert.rows[0][2] == null);
+    try std.testing.expectEqualStrings("C", decoded.insert.rows[1][2].?.text);
 }
 
 test "ir: select round-trips with multiple columns" {

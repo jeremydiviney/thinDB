@@ -222,9 +222,64 @@ pub fn decimalLiteralExpr(arena: Allocator, digits: []const u8, p: u8, s: u8) Al
 /// comparison takes `exactLiteralValue` instead.
 pub fn literalValue(e: Expr) ?Value {
     if (e == .lit) return e.lit;
+    if (hexLiteralBytes(e)) |bytes| return .{ .text = bytes };
     const d = decimalLiteral(e) orelse return null;
     if (d.s == 0) if (std.fmt.parseInt(i128, d.digits, 10)) |v| return .{ .largeint = v } else |_| {};
     return .{ .double = std.fmt.parseFloat(f64, d.digits) catch return null };
+}
+
+/// MySQL's hex literal (`0x41`, `X'41'`) as the tree carries it,
+/// `__hex_literal('<bytes>')`. It is its bytes where text is read and its
+/// big-endian integer where a number is (`0x41 = 65`, `0x41 + 0`), and
+/// which applies turns on where it lands: Compute decides when it plans the
+/// call reading it, a comparison when it meets the other side.
+pub const HEX_LITERAL_FN = "__hex_literal";
+
+/// Internal: `__hex_literal_as(x, '<bytes>')`, a hex literal read as a
+/// comparison with `x` reads it: its integer when `x` is a number, else its
+/// bytes.
+pub const HEX_LITERAL_AS_FN = "__hex_literal_as";
+
+pub fn hexLiteralExpr(arena: Allocator, bytes: []const u8) Allocator.Error!Expr {
+    const args = try arena.alloc(Expr, 1);
+    args[0] = .{ .lit = .{ .text = try arena.dupe(u8, bytes) } };
+    return .{ .call = .{ .fn_name = HEX_LITERAL_FN, .args = args } };
+}
+
+pub fn hexLiteralBytes(e: Expr) ?[]const u8 {
+    const c = switch (e) {
+        .call => |c| c,
+        else => return null,
+    };
+    if (c.args.len != 1 or !std.mem.eql(u8, c.fn_name, HEX_LITERAL_FN)) return null;
+    return switch (c.args[0]) {
+        .lit => |v| switch (v) {
+            .text => |t| t,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+pub fn hexLiteralAsExpr(arena: Allocator, other: Expr, bytes: []const u8) Allocator.Error!Expr {
+    const args = try arena.alloc(Expr, 2);
+    args[0] = other;
+    args[1] = .{ .lit = .{ .text = try arena.dupe(u8, bytes) } };
+    return .{ .call = .{ .fn_name = HEX_LITERAL_AS_FN, .args = args } };
+}
+
+/// A hex literal's bytes as the unsigned big-endian integer MySQL reads in a
+/// numeric context. Past eight bytes it reads as 0, as in MySQL.
+pub fn hexNumber(bytes: []const u8) u64 {
+    if (bytes.len > 8) return 0;
+    var n: u64 = 0;
+    for (bytes) |b| n = n << 8 | b;
+    return n;
+}
+
+pub fn hexLiteralNumber(bytes: []const u8) Value {
+    const n = hexNumber(bytes);
+    return if (n <= std.math.maxInt(i64)) .{ .bigint = @intCast(n) } else .{ .largeint = n };
 }
 
 /// A literal operand's value for a comparison leaf, or null when no Value
@@ -325,4 +380,24 @@ test "expr: deepClone produces an owned tree" {
     try std.testing.expectEqualStrings("name", cloned.call.args[0].col_ref);
     // The clone's strings live in the arena, not in the originals.
     try std.testing.expect(cloned.call.fn_name.ptr != orig.call.fn_name.ptr);
+}
+
+test "expr: a hex literal reads as its big-endian unsigned integer, 0 past eight bytes" {
+    const cases = .{
+        .{ "A", Value{ .bigint = 65 } },
+        .{ "12", Value{ .bigint = 12594 } },
+        .{ "", Value{ .bigint = 0 } },
+        .{ "\x01\x02\x03\x04\x05\x06\x07\x08", Value{ .bigint = 72623859790382856 } },
+        .{ "\x7f\xff\xff\xff\xff\xff\xff\xff", Value{ .bigint = std.math.maxInt(i64) } },
+        .{ "\xff\xff\xff\xff\xff\xff\xff\xff", Value{ .largeint = std.math.maxInt(u64) } },
+        .{ "ABCDEFGHI", Value{ .bigint = 0 } },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c[1], hexLiteralNumber(c[0]));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const e = try hexLiteralExpr(arena.allocator(), "A");
+    try std.testing.expectEqualStrings("A", hexLiteralBytes(e).?);
+    try std.testing.expectEqualStrings("A", literalValue(e).?.text);
+    try std.testing.expect(hexLiteralBytes(.{ .lit = .{ .text = "A" } }) == null);
 }
