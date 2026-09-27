@@ -207,6 +207,176 @@ test "mysql select hints: modifiers, index hints and STRAIGHT_JOIN are ignored" 
     try expectMysqlError(allocator, db, "SELECT SQL_CALC_FOUND_ROWS id FROM t LIMIT 1; SELECT FOUND_ROWS()", error.SqlFoundRowsUnsupported);
 }
 
+test "mysql predicates: a parenthesized operand takes the operator after it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "WHERE (id) = 1", &[_][]const u8{"1"} },
+        .{ "WHERE ((id)) = 1", &[_][]const u8{"1"} },
+        .{ "WHERE ((id) = 2)", &[_][]const u8{"2"} },
+        .{ "WHERE (id) = 1 OR (id) = 3", &[_][]const u8{ "1", "3" } },
+        .{ "WHERE (id) <=> 2", &[_][]const u8{"2"} },
+        .{ "WHERE (s) LIKE 'k%'", &[_][]const u8{"1"} },
+        .{ "WHERE (UPPER(s)) LIKE 'P%'", &[_][]const u8{"2"} },
+        .{ "WHERE (s) IN ('pear')", &[_][]const u8{"2"} },
+        .{ "WHERE (s) NOT IN ('pear', 'kiwi')", &[_][]const u8{"3"} },
+        .{ "WHERE (id) BETWEEN 2 AND 3", &[_][]const u8{ "2", "3" } },
+        .{ "WHERE (s) REGEXP '^p'", &[_][]const u8{"2"} },
+        .{ "WHERE (id) IS NOT NULL", &[_][]const u8{ "1", "2", "3" } },
+        .{ "WHERE (id) + 1 = 3", &[_][]const u8{"2"} },
+        .{ "WHERE (id) MOD 2 = 0", &[_][]const u8{"2"} },
+        .{ "WHERE (id + 1) * 2 = 6", &[_][]const u8{"2"} },
+        .{ "WHERE (1) = 1 AND id = 3", &[_][]const u8{"3"} },
+        .{ "WHERE (id = 1) = 1", &[_][]const u8{"1"} },
+        .{ "WHERE (id > 1) IS TRUE", &[_][]const u8{ "2", "3" } },
+        .{ "WHERE (id) IN (SELECT id FROM u)", &[_][]const u8{ "1", "3" } },
+        .{ "WHERE (SELECT MAX(id) FROM u) = id", &[_][]const u8{"3"} },
+    };
+    inline for (cases) |c| {
+        const sql = "SELECT CAST(id AS CHAR) FROM t " ++ c[0] ++ " ORDER BY id";
+        expectCells(allocator, db, sql, c[1]) catch |err| {
+            std.debug.print("case failed ({s}): {s}\n", .{ @errorName(err), sql });
+            return err;
+        };
+    }
+    try expectText(allocator, db, "SELECT IF((s) = 'kiwi', 'y', 'n') FROM t WHERE id = 1", "y");
+    try expectText(allocator, db, "SELECT CASE WHEN (id) = 2 THEN 'two' ELSE 'other' END FROM t WHERE id = 2", "two");
+    try expectText(allocator, db, "SELECT CAST(COUNT(*) AS CHAR) FROM t HAVING (COUNT(*)) = 3", "3");
+}
+
+test "mysql joins: an inner join's condition is optional, and CROSS JOIN takes one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    const counts = .{
+        .{ "SELECT COUNT(*) FROM t JOIN u", 6 },
+        .{ "SELECT COUNT(*) FROM t INNER JOIN u", 6 },
+        .{ "SELECT COUNT(*) FROM t JOIN u WHERE t.id = u.id", 2 },
+        .{ "SELECT COUNT(*) FROM t JOIN u JOIN u AS v ON u.id = v.id", 6 },
+        .{ "SELECT COUNT(*) FROM (SELECT 1 AS a) x JOIN (SELECT 2 AS b) y", 1 },
+        .{ "SELECT COUNT(*) FROM t CROSS JOIN u ON t.id = u.id", 2 },
+        .{ "SELECT SUM(u.w) FROM t CROSS JOIN u ON t.id = u.id", 400 },
+        .{ "SELECT COUNT(*) FROM t CROSS JOIN u USING (id)", 2 },
+        .{ "SELECT COUNT(*) FROM t CROSS JOIN u", 6 },
+    };
+    inline for (counts) |c| expectBigint(allocator, db, c[0], c[1]) catch |err| {
+        std.debug.print("case failed ({s}): {s}\n", .{ @errorName(err), c[0] });
+        return err;
+    };
+
+    try expectMysqlError(allocator, db, "SELECT COUNT(*) FROM t LEFT JOIN u", error.SqlExpectedJoinOn);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.SqlExpectedJoinOn, thindb.sql.parseDialect(arena, "SELECT COUNT(*) FROM t JOIN u", .neutral));
+    try std.testing.expectError(error.SqlTrailingTokens, thindb.sql.parseDialect(arena, "SELECT COUNT(*) FROM t CROSS JOIN u ON t.id = u.id", .postgres));
+}
+
+test "mysql literals: a fraction past a double's digits stays an exact decimal" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE dd (id BIGINT PRIMARY KEY, v DECIMAL(20,1), f DOUBLE, s VARCHAR(30))");
+    try run(allocator, db, "INSERT INTO dd VALUES (1, 123456789012345678.5, 1.5, 'a'), (2, 123456789012345680.0, 2.5, 'b')");
+    try run(allocator, db, "INSERT INTO dd VALUES (3, -123456789012345678.5, 0.1, 'c')");
+    try expectCells(allocator, db, "SELECT CAST(v AS CHAR), s FROM dd ORDER BY id", &.{
+        "123456789012345678.5",  "a",
+        "123456789012345680.0",  "b",
+        "-123456789012345678.5", "c",
+    });
+
+    const cases = .{
+        .{ "WHERE v = 123456789012345678.5", &[_][]const u8{"1"} },
+        .{ "WHERE 123456789012345678.5 = v", &[_][]const u8{"1"} },
+        .{ "WHERE v = -123456789012345678.5", &[_][]const u8{"3"} },
+        .{ "WHERE v IN (123456789012345678.5, 1.5)", &[_][]const u8{"1"} },
+        .{ "WHERE v NOT IN (123456789012345678.5)", &[_][]const u8{ "2", "3" } },
+        .{ "WHERE v > 123456789012345678.5", &[_][]const u8{"2"} },
+        .{ "WHERE v BETWEEN 123456789012345678.4 AND 123456789012345678.6", &[_][]const u8{"1"} },
+        .{ "WHERE (v) = 123456789012345678.5", &[_][]const u8{"1"} },
+        .{ "WHERE v = CAST('123456789012345678.5' AS DECIMAL(20,1))", &[_][]const u8{"1"} },
+        .{ "WHERE f = 1.5", &[_][]const u8{"1"} },
+        .{ "WHERE f IN (2.5, 0.1)", &[_][]const u8{ "2", "3" } },
+        .{ "WHERE v = 1.5", &[_][]const u8{} },
+    };
+    inline for (cases) |c| {
+        const sql = "SELECT CAST(id AS CHAR) FROM dd " ++ c[0] ++ " ORDER BY id";
+        expectCells(allocator, db, sql, c[1]) catch |err| {
+            std.debug.print("case failed ({s}): {s}\n", .{ @errorName(err), sql });
+            return err;
+        };
+    }
+    try expectCells(allocator, db, "SELECT CASE WHEN v = 123456789012345678.5 THEN 'hit' ELSE 'miss' END FROM dd ORDER BY id", &.{ "hit", "miss", "miss" });
+    try expectText(allocator, db, "SELECT CAST(e.id AS CHAR) FROM dd JOIN dd AS e ON dd.id = e.id AND e.v = 123456789012345678.5", "1");
+    try expectText(allocator, db, "SELECT IF(123456789012345678 = 123456789012345678.0, 'y', 'n')", "y");
+    try expectText(allocator, db, "SELECT IF(123456789012345678.5 = 123456789012345678.5, 'y', 'n')", "y");
+    try expectText(allocator, db, "SELECT IF(123456789012345678.5 > 123456789012345678.4, 'y', 'n')", "y");
+
+    // Rows with an expression are read as expressions, fractions as the
+    // decimals they spell, whichever row the expression is in.
+    try helpers.exec(allocator, db, "CREATE TABLE de (id BIGINT PRIMARY KEY, v DECIMAL(20,1), f DOUBLE, n BIGINT)");
+    try run(allocator, db, "INSERT INTO de VALUES (1, 123456789012345678.5, 0.1, 2.5), (2, 1 + 1, 2.5, -123456789012345678.5)");
+    try run(allocator, db, "INSERT INTO de VALUES (3, 1.5, 1e1, 7), (4, -123456789012345678.5, 0.25, 1)");
+    try run(allocator, db, "INSERT INTO de SET id = 5, v = 123456789012345678.5, f = 123456789012345678.5, n = 3");
+    try run(allocator, db, "INSERT INTO de SET id = 6, v = 123456789012345678.5 * 1, f = 0.5, n = 123456789012345.5");
+    try expectCells(allocator, db, "SELECT CAST(v AS CHAR), CAST(f AS CHAR), CAST(n AS CHAR) FROM de ORDER BY id", &.{
+        "123456789012345678.5",  "0.1",                "3",
+        "2.0",                   "2.5",                "-123456789012345679",
+        "1.5",                   "10",                 "7",
+        "-123456789012345678.5", "0.25",               "1",
+        "123456789012345678.5",  "123456789012345680", "3",
+        "123456789012345678.5",  "0.5",                "123456789012346",
+    });
+}
+
+fn expectNames(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, names: []const []const u8) !void {
+    var q = helpers.runSqlMysql(allocator, db, sql) catch |err| {
+        std.debug.print("case failed ({s}): {s}\n", .{ @errorName(err), sql });
+        return err;
+    };
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(names.len, schema.len);
+    for (names, schema) |name, col| try std.testing.expectEqualStrings(name, col.name);
+    while (try q.next()) |_| {}
+}
+
+test "mysql aliases: a string names a select-list item" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    try expectNames(allocator, db, "SELECT 1 'a'", &.{"a"});
+    try expectNames(allocator, db, "SELECT 1 AS 'a'", &.{"a"});
+    try expectNames(allocator, db, "SELECT 1 AS \"a\"", &.{"a"});
+    try expectNames(allocator, db, "SELECT 1 \"a b\", 2 'c'", &.{ "a b", "c" });
+    try expectNames(allocator, db, "SELECT COUNT(*) AS 'Total' FROM t", &.{"Total"});
+    try expectNames(allocator, db, "SELECT id = 1 'first' FROM t", &.{"first"});
+    try expectNames(allocator, db, "SELECT d.a FROM (SELECT 1 AS 'a') d", &.{"a"});
+    try expectCells(allocator, db, "SELECT s 'name' FROM t WHERE id = 1", &.{"kiwi"});
+    try expectNames(allocator, db, "SELECT s 'name' FROM t WHERE id = 1", &.{"name"});
+    try expectCells(allocator, db, "SELECT s AS 'k' FROM t ORDER BY k", &.{ "AB", "kiwi", "pear" });
+    try expectText(allocator, db, "SELECT 'x' 'y'", "xy");
+
+    try expectMysqlError(allocator, db, "SELECT 1 AS ''", error.SqlExpectedIdent);
+    try expectMysqlError(allocator, db, "SELECT x.id FROM t AS 'x'", error.SqlExpectedIdent);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.SqlExpectedIdent, thindb.sql.parseDialect(arena_state.allocator(), "SELECT 1 AS 'a'", .neutral));
+}
+
 test "mysql admin: transaction, lock, flush, savepoint and DO statements are no-ops" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -175,3 +175,40 @@ test "session var: scalar subquery as RHS of SET" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, ids);
 }
+
+fn expectVarItems(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, names: []const []const u8, values: []const ?i64) !void {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(names.len, schema.len);
+    for (names, schema) |name, col| try std.testing.expectEqualStrings(name, col.name);
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+    for (values, batch.values) |expected, view| {
+        if (expected == null) {
+            try std.testing.expect(!view.isValid(0));
+            continue;
+        }
+        const actual: i64 = switch (view.data) {
+            .bigint => |v| v[0],
+            .int => |v| v[0],
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(expected.?, actual);
+    }
+}
+
+test "session var: a bare var is a projection item" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    try expectVarItems(allocator, db, "SET @w = 5; SELECT @w", &.{"@w"}, &.{5});
+    try expectVarItems(allocator, db, "SET @w = 5; SELECT 1, @w", &.{ "1", "@w" }, &.{ 1, 5 });
+    try expectVarItems(allocator, db, "SET @w = 5; SELECT @w AS v, id FROM t WHERE id = 2", &.{ "v", "id" }, &.{ 5, 2 });
+    try expectVarItems(allocator, db, "SET @w = 5; SELECT @w + qty AS s FROM t WHERE id = 1", &.{"s"}, &.{15});
+    try expectVarItems(allocator, db, "SELECT @never_set", &.{"@never_set"}, &.{null});
+}

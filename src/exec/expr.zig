@@ -17,6 +17,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
+const scalar_fn_common = @import("scalar_fn_common.zig");
 const Value = types.Value;
 const Type = types.Type;
 
@@ -214,17 +215,54 @@ pub fn decimalLiteralExpr(arena: Allocator, digits: []const u8, p: u8, s: u8) Al
 }
 
 /// The value of a literal operand for a consumer that takes one where a
-/// DOUBLE serves: a comparison leaf, which places a double on a decimal or
-/// integer column by its shortest digits (the literal's own), or a numeric
-/// parameter such as a percentile. A decimal constant gives the double
-/// nearest its digits, except a whole number (an integer literal past
-/// BIGINT), which is LARGEINT: its double would drop digits past 2^53, and
-/// a LARGEINT meets any numeric column exactly.
+/// DOUBLE serves, such as a percentile or a session variable. A decimal
+/// constant gives the double nearest its digits, except a whole number (an
+/// integer literal past BIGINT), which is LARGEINT: its double would drop
+/// digits past 2^53, and a LARGEINT meets any numeric column exactly. A
+/// comparison takes `exactLiteralValue` instead.
 pub fn literalValue(e: Expr) ?Value {
     if (e == .lit) return e.lit;
     const d = decimalLiteral(e) orelse return null;
     if (d.s == 0) if (std.fmt.parseInt(i128, d.digits, 10)) |v| return .{ .largeint = v } else |_| {};
     return .{ .double = std.fmt.parseFloat(f64, d.digits) catch return null };
+}
+
+/// A literal operand's value for a comparison leaf, or null when no Value
+/// holds it exactly. A leaf places a double on a decimal or integer column
+/// by its shortest digits, so a fraction is its DOUBLE only when those are
+/// the literal's own digits: always for up to 15 significant digits. A
+/// longer one (`123456789012345678.5`) stays the decimal constant it is,
+/// which the comparison evaluates exactly.
+pub fn exactLiteralValue(e: Expr) ?Value {
+    const v = literalValue(e) orelse return null;
+    if (e == .lit or v != .double) return v;
+    return if (doubleHoldsDigits(decimalLiteral(e).?.digits, v.double)) v else null;
+}
+
+/// Whether a fractional literal token (`text`, lexed as `value`) keeps its
+/// value as a DOUBLE: an exponent form or one past 38 digits is a DOUBLE
+/// literal, and a plain decimal one is when the double holds its digits.
+pub fn fractionFitsDouble(text: []const u8, value: f64) bool {
+    if (std.mem.indexOfScalar(u8, text, '.') == null or std.mem.indexOfAny(u8, text, "eE") != null or text.len - 1 > 38) return true;
+    return doubleHoldsDigits(text, value);
+}
+
+fn doubleHoldsDigits(digits: []const u8, v: f64) bool {
+    const exact = switch (scalar_fn_common.textNumber(digits) orelse return false) {
+        .exact => |x| x,
+        .float => return false,
+    };
+    const shortest = scalar_fn_common.floatDigits(v) orelse return false;
+    return std.meta.eql(withoutTrailingZeros(exact), withoutTrailingZeros(shortest));
+}
+
+fn withoutTrailingZeros(x: scalar_fn_common.ScaledInt) scalar_fn_common.ScaledInt {
+    var out = x;
+    while (out.s > 0 and @rem(out.m, 10) == 0) {
+        out.m = @divTrunc(out.m, 10);
+        out.s -= 1;
+    }
+    return out;
 }
 
 fn cloneValue(out_arena: Allocator, v: Value) Allocator.Error!Value {

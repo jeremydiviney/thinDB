@@ -156,9 +156,15 @@ DECIMAL column stays DECIMAL. MySQL, StarRocks and DuckDB type literals the
 same way. The tree carries the literal as its digits cast to its own type
 (`expr.decimalLiteral`), and Compute folds that into one typed constant.
 Beside a DOUBLE operand the literal converts to DOUBLE, as any decimal does.
-A comparison reads it as the double nearest its digits. That double lands
-exactly on a decimal or integer column (see DOUBLE to DECIMAL below), so
-`x > 1.5` stays a leaf and keeps zonemap pruning. The exponent form
+A comparison reads it as the double nearest its digits when that double
+prints as those digits, as it does for any literal of up to 15 significant
+digits. That double lands exactly on a decimal or integer column (see DOUBLE
+to DECIMAL below), so `x > 1.5` stays a leaf and keeps zonemap pruning. A
+longer literal no double holds (`123456789012345678.5`) compares as the
+exact decimal it is, without pruning. An INSERT's literal row writes such a
+literal as its digits, which a DECIMAL column reads exactly; rows with an
+expression cell are read as expressions, where every fraction is its
+DECIMAL. The exponent form
 (`1e3`, `2.5E-3`, `6.02e+23`) is DOUBLE, and so is a literal of more than
 38 digits. A literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
 An integer literal past BIGINT is DECIMAL(n,0) of its digits, and DOUBLE past
