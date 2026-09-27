@@ -863,7 +863,7 @@ test "sql: MySQL column type spellings and modifiers" {
         \\)
     );
     try helpers.exec(allocator, db, "INSERT INTO my (id, u, su, m, ti, tu, c, s) VALUES (1, 4000000000, 60000, -5, -128, 255, 'abc', 'x')");
-    try helpers.expectRunError(allocator, db, "INSERT INTO my (id, ti, s) VALUES (2, 128, 'x')", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO my (id, ti, s) VALUES (2, 128, 'x')", error.ValueOutOfRange);
 
     var q = try runSql(allocator, db, "SELECT * FROM my");
     defer q.deinit();
