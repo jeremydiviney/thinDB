@@ -790,6 +790,9 @@ fn exprHasColumnRef(expr: ir.Expr) bool {
             break :blk false;
         },
         .case => |c| blk: {
+            for (c.operands) |o| {
+                if (exprHasColumnRef(o.expr)) break :blk true;
+            }
             for (c.branches) |branch| {
                 if (predicateHasColumnRef(branch.cond)) break :blk true;
                 if (exprHasColumnRef(branch.then)) break :blk true;

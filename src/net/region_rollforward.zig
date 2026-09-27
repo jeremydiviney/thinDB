@@ -1036,6 +1036,7 @@ fn hash_fusion_expr(registry: ?*const udf_mod.UdfRegistry, h: *std.hash.Wyhash, 
             for (call.args) |arg| try hash_fusion_expr(registry, h, arg);
         },
         .case => |case| {
+            for (case.operands) |operand| try hash_fusion_expr(registry, h, operand.expr);
             for (case.branches) |branch| try hash_fusion_expr(registry, h, branch.then);
             if (case.else_branch) |other| try hash_fusion_expr(registry, h, other.*);
         },
@@ -1310,6 +1311,11 @@ fn hashExpr(h: *std.hash.Wyhash, e: Expr) error{RegionUnhashable}!void {
             for (c.args) |a| try hashExpr(h, a);
         },
         .case => |c| {
+            hu(h, c.operands.len);
+            for (c.operands) |o| {
+                hstr(h, o.name);
+                try hashExpr(h, o.expr);
+            }
             hu(h, c.branches.len);
             for (c.branches) |br| {
                 try hashPred(h, br.cond);
@@ -1561,6 +1567,9 @@ const Builder = struct {
     /// Frame columns known constant (folded literal computes): groupings
     /// skip them as subkeys — a constant can't split groups.
     const_idxs: std.ArrayListUnmanaged(usize) = .empty,
+    /// Operands of the CASE whose conditions are being cloned: condition
+    /// refs to them are CASE-local, not frame columns.
+    case_locals: []const Expr.Operand = &.{},
 
     fn resolveIdx(b: *Builder, name: []const u8) !usize {
         if (types.splitQualifiedName(name)) |split| {
@@ -1702,9 +1711,13 @@ const Builder = struct {
                 break :blk .{ .call = .{ .fn_name = try b.a.dupe(u8, c.fn_name), .args = args } };
             },
             .case => |c| blk: {
+                const operands = try b.a.alloc(Expr.Operand, c.operands.len);
+                for (c.operands, operands) |src, *dst| {
+                    dst.* = .{ .name = try b.a.dupe(u8, src.name), .expr = try b.cloneExpr(src.expr) };
+                }
                 const branches = try b.a.alloc(Expr.Branch, c.branches.len);
                 for (c.branches, branches) |src, *dst| {
-                    dst.* = .{ .cond = try b.clonePred(src.cond), .then = try b.cloneExpr(src.then) };
+                    dst.* = .{ .cond = try b.cloneCaseCond(operands, src.cond), .then = try b.cloneExpr(src.then) };
                 }
                 var else_branch: ?*const Expr = null;
                 if (c.else_branch) |eb| {
@@ -1712,10 +1725,24 @@ const Builder = struct {
                     p.* = try b.cloneExpr(eb.*);
                     else_branch = p;
                 }
-                break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch } };
+                break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = operands } };
             },
             else => NoMatch,
         };
+    }
+
+    fn cloneCaseCond(b: *Builder, operands: []const Expr.Operand, cond: PredicateExpr) anyerror!PredicateExpr {
+        const outer = b.case_locals;
+        b.case_locals = operands;
+        defer b.case_locals = outer;
+        return b.clonePred(cond);
+    }
+
+    fn predColName(b: *Builder, name: []const u8) ![]const u8 {
+        for (b.case_locals) |o| {
+            if (types.columnNameEql(o.name, name)) return o.name;
+        }
+        return b.fb.cols.items[try b.resolveIdx(name)].name;
     }
 
     fn clonePred(b: *Builder, p: PredicateExpr) anyerror!PredicateExpr {
@@ -1723,30 +1750,17 @@ const Builder = struct {
             .leaf => |l| .{ .leaf = try b.cloneLeaf(l) },
             .day_leaf => |l| .{ .day_leaf = try b.cloneLeaf(l) },
             .text_as_number => |l| .{ .text_as_number = try b.cloneLeaf(l) },
-            .leaf_col_col => |cc| blk: {
-                const li = try b.resolveIdx(cc.left);
-                const ri = try b.resolveIdx(cc.right);
-                break :blk .{ .leaf_col_col = .{
-                    .left = b.fb.cols.items[li].name,
-                    .op = cc.op,
-                    .right = b.fb.cols.items[ri].name,
-                } };
-            },
-            .is_null => |name| blk: {
-                const idx = try b.resolveIdx(name);
-                break :blk .{ .is_null = b.fb.cols.items[idx].name };
-            },
-            .is_not_null => |name| blk: {
-                const idx = try b.resolveIdx(name);
-                break :blk .{ .is_not_null = b.fb.cols.items[idx].name };
-            },
-            .like => |l| blk: {
-                const idx = try b.resolveIdx(l.col);
-                break :blk .{ .like = .{
-                    .col = b.fb.cols.items[idx].name,
-                    .pattern = try b.a.dupe(u8, l.pattern),
-                } };
-            },
+            .leaf_col_col => |cc| .{ .leaf_col_col = .{
+                .left = try b.predColName(cc.left),
+                .op = cc.op,
+                .right = try b.predColName(cc.right),
+            } },
+            .is_null => |name| .{ .is_null = try b.predColName(name) },
+            .is_not_null => |name| .{ .is_not_null = try b.predColName(name) },
+            .like => |l| .{ .like = .{
+                .col = try b.predColName(l.col),
+                .pattern = try b.a.dupe(u8, l.pattern),
+            } },
             .@"and" => |kids| blk: {
                 const out = try b.a.alloc(PredicateExpr, kids.len);
                 for (kids, out) |src, *dst| dst.* = try b.clonePred(src);
@@ -1764,11 +1778,11 @@ const Builder = struct {
             },
             .always => |v| .{ .always = v },
             .in_set => |s| blk: {
-                const idx = try b.resolveIdx(s.col);
+                const col = try b.predColName(s.col);
                 const vals = try b.a.alloc(Value, s.values.len);
                 for (s.values, vals) |src, *dst| dst.* = try b.cloneValue(src);
                 break :blk .{ .in_set = .{
-                    .col = b.fb.cols.items[idx].name,
+                    .col = col,
                     .values = vals,
                     .negate = s.negate,
                 } };
@@ -1778,8 +1792,7 @@ const Builder = struct {
     }
 
     fn cloneLeaf(b: *Builder, l: predicate_mod.Predicate) !predicate_mod.Predicate {
-        const idx = try b.resolveIdx(l.col);
-        return .{ .col = b.fb.cols.items[idx].name, .op = l.op, .val = try b.cloneValue(l.val) };
+        return .{ .col = try b.predColName(l.col), .op = l.op, .val = try b.cloneValue(l.val) };
     }
 
     // ---- structural op appenders -----------------------------------------
@@ -2086,6 +2099,10 @@ fn cloneExprPlain(a: Allocator, e: Expr) anyerror!Expr {
             break :blk .{ .call = .{ .fn_name = try a.dupe(u8, c.fn_name), .args = args } };
         },
         .case => |c| blk: {
+            const operands = try a.alloc(Expr.Operand, c.operands.len);
+            for (c.operands, operands) |src, *dst| {
+                dst.* = .{ .name = try a.dupe(u8, src.name), .expr = try cloneExprPlain(a, src.expr) };
+            }
             const branches = try a.alloc(Expr.Branch, c.branches.len);
             for (c.branches, branches) |src, *dst| {
                 dst.* = .{ .cond = try clonePredPlain(a, src.cond), .then = try cloneExprPlain(a, src.then) };
@@ -2096,7 +2113,7 @@ fn cloneExprPlain(a: Allocator, e: Expr) anyerror!Expr {
                 p.* = try cloneExprPlain(a, eb.*);
                 else_branch = p;
             }
-            break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch } };
+            break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = operands } };
         },
         else => NoMatch,
     };
@@ -2169,6 +2186,10 @@ fn substDerivedRefs(a: Allocator, e: Expr, earlier: []const Derived) anyerror!Ex
             break :blk .{ .call = .{ .fn_name = c.fn_name, .args = args } };
         },
         .case => |c| blk: {
+            const operands = try a.alloc(Expr.Operand, c.operands.len);
+            for (c.operands, operands) |src, *dst| {
+                dst.* = .{ .name = src.name, .expr = try substDerivedRefs(a, src.expr, earlier) };
+            }
             const branches = try a.alloc(Expr.Branch, c.branches.len);
             for (c.branches, branches) |src, *dst| {
                 dst.* = .{ .cond = src.cond, .then = try substDerivedRefs(a, src.then, earlier) };
@@ -2179,7 +2200,7 @@ fn substDerivedRefs(a: Allocator, e: Expr, earlier: []const Derived) anyerror!Ex
                 p.* = try substDerivedRefs(a, eb.*, earlier);
                 else_branch = p;
             }
-            break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch } };
+            break :blk .{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = operands } };
         },
         else => e,
     };
@@ -3437,8 +3458,17 @@ fn exprColNames(a: Allocator, e: Expr, out: *std.ArrayListUnmanaged([]const u8))
         .col_ref => |n| try out.append(a, n),
         .call => |c| for (c.args) |arg| try exprColNames(a, arg, out),
         .case => |c| {
+            for (c.operands) |o| try exprColNames(a, o.expr, out);
             for (c.branches) |br| {
+                const start = out.items.len;
                 try predColNames(a, br.cond, out);
+                var kept = start;
+                for (out.items[start..]) |name| {
+                    if (c.operandNamed(name)) continue;
+                    out.items[kept] = name;
+                    kept += 1;
+                }
+                out.shrinkRetainingCapacity(kept);
                 try exprColNames(a, br.then, out);
             }
             if (c.else_branch) |eb| try exprColNames(a, eb.*, out);

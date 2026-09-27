@@ -997,6 +997,7 @@ fn collectExprCols(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const
         .col_ref => |nm| _ = try addNeeded(allocator, needed, table, nm),
         .call => |c| for (c.args) |arg| try collectExprCols(allocator, needed, table, arg),
         .case => |cs| {
+            for (cs.operands) |o| try collectExprCols(allocator, needed, table, o.expr);
             for (cs.branches) |b| {
                 try collectPredCols(allocator, needed, table, b.cond);
                 try collectExprCols(allocator, needed, table, b.then);

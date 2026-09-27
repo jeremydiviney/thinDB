@@ -316,6 +316,7 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
             for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg), lowered);
         },
         .case => |cs| {
+            for (cs.operands) |*o| try resolveSubqueriesInExpr(ctx, @constCast(&o.expr), lowered);
             for (cs.branches) |*br| {
                 if (lowered) |l| try lowerPredicateScalars(ctx, @constCast(&br.cond), l);
                 try resolveSubqueriesInPredicate(ctx, @constCast(&br.cond));
