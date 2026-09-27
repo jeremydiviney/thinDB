@@ -1730,7 +1730,10 @@ pub fn windowInputNames(allocator: Allocator, root: *const ir.Op, win: *const ir
         c.names.deinit(allocator);
         return null;
     }
-    return c.names.toOwnedSlice(allocator) catch null;
+    return c.names.toOwnedSlice(allocator) catch {
+        c.names.deinit(allocator);
+        return null;
+    };
 }
 
 fn walkAboveWindow(c: *ProjScan, allocator: Allocator, op: *const ir.Op, win: *const ir.Op) bool {
@@ -1801,7 +1804,10 @@ fn analyzeProjection(allocator: Allocator, root: *const ir.Op) ?[][]const u8 {
         c.names.deinit(allocator);
         return null;
     }
-    return c.names.toOwnedSlice(allocator) catch null;
+    return c.names.toOwnedSlice(allocator) catch {
+        c.names.deinit(allocator);
+        return null;
+    };
 }
 
 /// A join leaf needs references on its path through the current query block.
@@ -1813,7 +1819,10 @@ pub fn join_leaf_input_names(allocator: Allocator, root: *const ir.Op, leaf: *co
         c.names.deinit(allocator);
         return null;
     }
-    return c.names.toOwnedSlice(allocator) catch null;
+    return c.names.toOwnedSlice(allocator) catch {
+        c.names.deinit(allocator);
+        return null;
+    };
 }
 
 fn walk_join_leaf_path(c: *ProjScan, allocator: Allocator, op: *const ir.Op, leaf: *const ir.Op) bool {

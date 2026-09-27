@@ -1204,7 +1204,9 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     errdefer allocator.destroy(op);
     const hash_cols_owned = try hash_cols.toOwnedSlice(allocator);
     errdefer allocator.free(hash_cols_owned);
-    op.* = try GlobalAggregate.init(allocator, table, request, plans, try needed.toOwnedSlice(allocator), hash_cols_owned);
+    const needed_owned = try needed.toOwnedSlice(allocator);
+    errdefer allocator.free(needed_owned);
+    op.* = try GlobalAggregate.init(allocator, table, request, plans, needed_owned, hash_cols_owned);
     return exec.makeQuery(allocator, op);
 }
 
