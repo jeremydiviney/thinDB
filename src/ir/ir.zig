@@ -228,6 +228,9 @@ pub const CreateTable = struct {
     unique: bool = true,
     /// From `PROPERTIES ("compression" = "...")`; null = table default (lz4).
     compression: ?types.TableCompression = null,
+    /// `CREATE TABLE t LIKE src`: copy src's whole definition (columns,
+    /// key, defaults, compression). `columns` and `order_key` are empty.
+    like: ?TableRef = null,
 };
 
 /// `DROP TABLE [IF EXISTS] a, b, ...`.
@@ -1446,6 +1449,8 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             }
             // 255 = unset (table default); else types.TableCompression.
             try out.append(allocator, if (ct.compression) |comp| @intFromEnum(comp) else 255);
+            try out.append(allocator, @intFromBool(ct.like != null));
+            if (ct.like) |src| try encodeTableRef(allocator, out, src);
         },
         .drop_table => |dt| {
             try out.append(allocator, @intFromEnum(DdlTag.drop_table));
@@ -2710,6 +2715,10 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             const comp_byte = bytes[cursor.*];
             cursor.* += 1;
             if (comp_byte != 255 and comp_byte > @intFromEnum(types.TableCompression.lz4)) return Error.IrCorrupt;
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const has_like = bytes[cursor.*] != 0;
+            cursor.* += 1;
+            const like: ?TableRef = if (has_like) try decodeTableRef(bytes, cursor) else null;
             break :blk DdlOp{ .create_table = .{
                 .table = ref,
                 .if_not_exists = ine,
@@ -2718,6 +2727,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
                 .order_key = keys,
                 .unique = unique,
                 .compression = if (comp_byte == 255) null else @enumFromInt(comp_byte),
+                .like = like,
             } };
         },
         .drop_table => blk: {

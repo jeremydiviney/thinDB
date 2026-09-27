@@ -92,6 +92,14 @@ the whole list as numbers.
 
 Explicitly **out of scope for v1**: `JSON`, `ARRAY`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
+MySQL DDL type names without a type of their own map onto the table above:
+- `FIXED` is `DECIMAL`.
+- `BINARY`, `VARBINARY` and the `BLOB` family are `STRING`, which holds any bytes. `BINARY(n)` is not zero-padded.
+- `BIT(1)` is `BOOLEAN`, and a wider `BIT(n)` is `BIGINT`.
+- `YEAR` is `SMALLINT`.
+- `TIME` is `STRING`, holding the `HH:MM:SS[.ffffff]` text.
+- `ENUM` and `SET` are `STRING`; their label lists are not enforced.
+
 ### 3.2 Schema and order key
 
 Every table requires an **order key** at creation. The order key is one or more columns by which rows in every segment are physically sorted. It is the engine's only mechanism for:
@@ -101,6 +109,11 @@ Every table requires an **order key** at creation. The order key is one or more 
 - Efficient compaction (sorted merge of segments)
 
 The order key may be marked `unique = true` or `unique = false` (default).
+
+The order key is the only index and PRIMARY KEY the only enforced constraint. In SQL DDL:
+- Secondary indexes (`KEY`, `INDEX`, `FULLTEXT`, `SPATIAL`, `CREATE INDEX`) are accepted and dropped, since they are advisory to a columnar scan.
+- `UNIQUE`, `FOREIGN KEY` and `CHECK` are accepted as informational and not enforced, as in Snowflake, Redshift and BigQuery; they hold in the OLTP database the data comes from.
+- Generated columns compute values, so they are rejected rather than dropped.
 
 Columns are **NOT NULL by default**. To allow nulls, mark explicitly:
 
