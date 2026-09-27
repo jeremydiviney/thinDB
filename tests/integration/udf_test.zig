@@ -234,15 +234,21 @@ test "scalar UDF resolves through SQL compute" {
     try registerTestUdfs(db);
     try seed(db);
 
-    var q = try helpers.runSql(allocator, db, "SELECT score_bucket(x) AS b FROM t ORDER BY id");
-    defer q.deinit();
+    // A DOUBLE parameter takes a DECIMAL argument's value, as builtins do.
+    inline for (.{
+        "SELECT score_bucket(x) AS b FROM t ORDER BY id",
+        "SELECT score_bucket(CAST(x AS DECIMAL(10,2))) AS b FROM t ORDER BY id",
+    }) |sql| {
+        var q = try helpers.runSql(allocator, db, sql);
+        defer q.deinit();
 
-    var got: std.ArrayList(i32) = .empty;
-    defer got.deinit(allocator);
-    while (try q.next()) |batch| {
-        try got.appendSlice(allocator, batch.values[0].data.int[0..batch.row_count]);
+        var got: std.ArrayList(i32) = .empty;
+        defer got.deinit(allocator);
+        while (try q.next()) |batch| {
+            try got.appendSlice(allocator, batch.values[0].data.int[0..batch.row_count]);
+        }
+        try std.testing.expectEqualSlices(i32, &.{ 0, 1, 1 }, got.items);
     }
-    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 1 }, got.items);
 }
 
 test "aggregate UDF groups and finalizes state" {

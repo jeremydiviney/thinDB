@@ -213,6 +213,77 @@ test "decimal: literal digits past the scale never round into a match" {
     }
 }
 
+test "decimal: a double converts through its shortest digits" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // MySQL converts a DOUBLE through the digits it prints as: 1.005 lands
+    // on 1.01 although its binary value is just below 1.005.
+    try helpers.exec(allocator, db, "CREATE TABLE m (id INT PRIMARY KEY, a DECIMAL(10,2), f DOUBLE, x DECIMAL(38,18))");
+    try helpers.exec(allocator, db, "INSERT INTO m VALUES (1, 1.005, 1.005, 0.1), (2, -2.675, -2.675, 0.3), (3, '1.005', 0.29, 0.30000000000000004)");
+    try (try db.openTable("m", .{})).flush();
+
+    const decimals = .{
+        .{ "SELECT a FROM m ORDER BY id", &[_]i64{ 101, -268, 101 } },
+        .{ "SELECT CAST(f AS DECIMAL(10,2)) FROM m ORDER BY id", &[_]i64{ 101, -268, 29 } },
+        .{ "SELECT CAST(1.005 AS DECIMAL(10,2)) FROM m ORDER BY id", &[_]i64{ 101, 101, 101 } },
+    };
+    inline for (decimals) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try collectDecimal64(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+
+    // A double literal against a decimal column lands by the same digits,
+    // at any scale.
+    const matches = .{
+        .{ "SELECT id FROM m WHERE x = 0.1 ORDER BY id", &[_]i32{1} },
+        .{ "SELECT id FROM m WHERE x = 0.30000000000000004 ORDER BY id", &[_]i32{3} },
+        .{ "SELECT id FROM m WHERE x IN (0.3, 0.1) ORDER BY id", &[_]i32{ 1, 2 } },
+        .{ "SELECT id FROM m WHERE a = 1.01 ORDER BY id", &[_]i32{ 1, 3 } },
+    };
+    inline for (matches) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        const ids = try collectInt(allocator, &q, 0);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i32, c[1], ids);
+    }
+
+    try helpers.expectRunError(allocator, db, "INSERT INTO m VALUES (4, 123456789.5, 0, 0)", error.ValueOutOfRange);
+    try helpers.expectRunError(allocator, db, "INSERT INTO m VALUES (4, '123456789', 0, 0)", error.ValueOutOfRange);
+}
+
+test "decimal: a float function takes a decimal's value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seed(allocator, db);
+
+    const cases = .{
+        .{ "SELECT POWER(CAST(1.09 AS DECIMAL(3,2)), 3) FROM d ORDER BY id", [_]f64{ 1.295029, 1.295029, 1.295029 } },
+        .{ "SELECT POWER(b, 2) FROM d WHERE b IS NOT NULL ORDER BY id", [_]f64{ 16.0, 9.0 } },
+        .{ "SELECT SQRT(a) FROM d ORDER BY id", [_]f64{ 1.5811388300841898, 3.1622776601683795, 1.1111107055554816 } },
+        .{ "SELECT LN(b) + EXP(0 * b) FROM d WHERE b IS NOT NULL ORDER BY id", [_]f64{ 2.386294361119891, 2.09861228866811 } },
+        .{ "SELECT SIGN(a) * DEGREES(CAST(0 AS DECIMAL(2,1))) + ATAN2(a, 1) FROM d ORDER BY id", [_]f64{ 1.1902899496825317, 1.4711276743037347, 0.8899871408352549 } },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try collectDouble(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, v| try std.testing.expectApproxEqAbs(want, v, 1e-9);
+    }
+}
+
 test "decimal: SUM widens to DECIMAL(38,s), AVG divides out scale" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

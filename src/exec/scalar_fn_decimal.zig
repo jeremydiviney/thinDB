@@ -387,13 +387,13 @@ pub fn toDecimalKernel(allocator: Allocator, arg_types: []const Type, out_type: 
     }
 }
 
-/// A double as a mantissa at scale `s`, rounded half away from zero; null
-/// when it isn't finite.
+/// A double as a mantissa at scale `s`: its shortest digits
+/// (`common.floatDigits`) rounded half away from zero; null when it isn't
+/// finite.
 fn floatMantissa(x: f64, s: u8) error{ArithmeticOverflow}!?i128 {
     if (!std.math.isFinite(x)) return null;
-    const scaled = @round(x * pow10f(s));
-    if (@abs(scaled) >= 1e38) return error.ArithmeticOverflow;
-    return @as(i128, @intFromFloat(scaled));
+    const d = common.floatDigits(x) orelse return error.ArithmeticOverflow;
+    return rescale(d.m, d.s, s) orelse error.ArithmeticOverflow;
 }
 
 /// Text as a mantissa at scale `s`: any number `textNumber` reads, rounded
@@ -407,20 +407,15 @@ fn textMantissa(text: []const u8, s: u8) error{ArithmeticOverflow}!?i128 {
 
 /// Text as a mantissa at scale `s` with nothing rounded away: null when the
 /// text isn't a number or its value needs more fraction digits than `s`.
-/// An exponent form holds when the double it reads is that mantissa's value.
+/// An exponent form reads as the double's shortest digits.
 fn exactTextMantissa(text: []const u8, s: u8) ?i128 {
-    return switch (common.textNumber(text) orelse return null) {
-        .exact => |d| if (d.s <= s) mulPow10(d.m, s - d.s) else blk: {
-            const p = pow10(d.s - s);
-            break :blk if (@rem(d.m, p) == 0) @divExact(d.m, p) else null;
-        },
-        .float => |f| blk: {
-            const scaled = @round(f * pow10f(s));
-            if (!(@abs(scaled) < 1e38)) break :blk null;
-            const m: i128 = @intFromFloat(scaled);
-            break :blk if (@as(f64, @floatFromInt(m)) / pow10f(s) == f) m else null;
-        },
+    const d: common.ScaledInt = switch (common.textNumber(text) orelse return null) {
+        .exact => |d| d,
+        .float => |f| common.floatDigits(f) orelse return null,
     };
+    if (d.s <= s) return mulPow10(d.m, s - d.s);
+    const p = pow10(d.s - s);
+    return if (@rem(d.m, p) == 0) @divExact(d.m, p) else null;
 }
 
 /// A text value as a `ty` value when the comparison rule calls them equal,
@@ -726,6 +721,10 @@ test "textMantissa and formatDecimal round-trip" {
     try std.testing.expectEqual(@as(?i128, 150), try textMantissa("1.5e0", 2));
     try std.testing.expectEqual(@as(?i128, null), try textMantissa("abc", 2));
     try std.testing.expectEqual(@as(?i128, null), try floatMantissa(std.math.inf(f64), 2));
+    try std.testing.expectEqual(@as(?i128, 101), try floatMantissa(1.005, 2));
+    try std.testing.expectEqual(@as(?i128, -268), try floatMantissa(-2.675, 2));
+    try std.testing.expectEqual(@as(?i128, 30), try floatMantissa(@as(f64, 0.1) + @as(f64, 0.2), 2));
+    try std.testing.expectEqual(@as(?i128, 101), try textMantissa("1.005e0", 2));
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("1.230000", formatDecimal(&buf, 1230000, 6));
     try std.testing.expectEqualStrings("-0.50", formatDecimal(&buf, -50, 2));

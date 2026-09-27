@@ -2087,7 +2087,7 @@ fn buildCallPlan(
     }
     if (r == null) r = try resolveWithTypedNulls(runtime_allocator, aa, udf_registry, c.fn_name, arg_plans, arg_types);
     if (r == null) {
-        if (try retypedCall(aa, c, arg_plans, arg_types)) |rewritten| {
+        if (try retypedCall(aa, udf_registry, c, arg_plans, arg_types)) |rewritten| {
             for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
             built = 0;
             return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
@@ -2146,11 +2146,11 @@ fn buildCallPlan(
 /// A call no overload accepts as written, with its arguments converted so
 /// one does: the arguments a function returns (GREATEST, COALESCE, IF's
 /// branches) take their common type by the result-type rule, and otherwise
-/// a string parameter takes a number, decimal or date as its text
-/// (`CONCAT('Q', quarter)`). Literals are converted in place; everything
-/// else goes through the typed cast `CAST(x AS t)` lowers to. Null when
-/// no conversion applies, so the rewritten call can't recurse again.
-fn retypedCall(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
+/// each argument converts to its parameter (`scalar_fn.convertedArgs`).
+/// Literals are converted in place; everything else goes through the typed
+/// cast `CAST(x AS t)` lowers to. Null when no conversion applies, so the
+/// rewritten call can't recurse again.
+fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
     const args = try aa.alloc(Expr, c.args.len);
     for (args, c.args, arg_plans) |*a, orig, ap| a.* = if (ap == .lit) .{ .lit = ap.lit.value } else orig;
     if (scalar_fn.resultValueArgsStart(c.fn_name)) |start| if (start < args.len) {
@@ -2169,9 +2169,9 @@ fn retypedCall(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_type
         }
         return if (changed) Expr{ .call = .{ .fn_name = c.fn_name, .args = args } } else null;
     };
-    const wrap = try scalar_fn.stringifiedArgs(aa, c.fn_name, arg_types) orelse return null;
-    for (args, wrap) |*a, w| {
-        if (w) a.* = try convertedArg(aa, a.*, .string) orelse return null;
+    const targets = try scalar_fn.convertedArgs(aa, udf_registry, c.fn_name, arg_types) orelse return null;
+    for (args, targets) |*a, target| {
+        if (target) |t| a.* = try convertedArg(aa, a.*, t) orelse return null;
     }
     return Expr{ .call = .{ .fn_name = c.fn_name, .args = args } };
 }

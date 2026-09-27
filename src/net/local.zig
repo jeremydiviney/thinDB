@@ -41,6 +41,8 @@ const Value = types.Value;
 
 const exec = @import("../exec/exec.zig");
 const exec_cast = @import("../exec/cast.zig");
+const exec_common = @import("../exec/scalar_fn_common.zig");
+const exec_decimal = @import("../exec/scalar_fn_decimal.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const cte_stages = @import("cte_stages.zig");
 const Query = exec.Query;
@@ -3204,9 +3206,7 @@ fn coerceToDecimal64(v: Value, spec: @import("../types.zig").DecimalSpec) !i64 {
         .decimal64 => |d| d,
         .int => |x| try scaleIntToDecimal(i64, x, spec.s),
         .bigint => |x| try scaleIntToDecimal(i64, x, spec.s),
-        .float => |x| try scaleFloatToDecimal(i64, x, spec),
-        .double => |x| try scaleFloatToDecimal(i64, x, spec),
-        .text => |s| try parseDecimalLiteral(i64, s, spec),
+        .float, .double, .text => std.math.cast(i64, try decimalLiteralMantissa(v, spec)) orelse error.ValueOutOfRange,
         else => Error.TypeMismatch,
     };
 }
@@ -3217,23 +3217,27 @@ fn coerceToDecimal128(v: Value, spec: @import("../types.zig").DecimalSpec) !i128
         .decimal128 => |d| d,
         .int => |x| try scaleIntToDecimal(i128, x, spec.s),
         .bigint => |x| try scaleIntToDecimal(i128, x, spec.s),
-        .float => |x| try scaleFloatToDecimal(i128, x, spec),
-        .double => |x| try scaleFloatToDecimal(i128, x, spec),
-        .text => |s| try parseDecimalLiteral(i128, s, spec),
+        .float, .double, .text => try decimalLiteralMantissa(v, spec),
         else => Error.TypeMismatch,
     };
 }
 
-/// Floating literal → decimal mantissa. The lexer parses `1.50` to f64 before
-/// the column type is known, so a decimal-pointed literal inserted into a
-/// DECIMAL column arrives here; round to the column scale. Precision is bounded
-/// by f64 (~15 sig digits) — exact for the scales seen in practice.
-fn scaleFloatToDecimal(comptime T: type, x: f64, spec: @import("../types.zig").DecimalSpec) !T {
-    const factor = std.math.pow(f64, 10.0, @floatFromInt(spec.s));
-    const scaled = @round(x * factor);
-    const limit = std.math.pow(f64, 10.0, @floatFromInt(spec.p));
-    if (scaled >= limit or scaled <= -limit) return Error.TypeMismatch;
-    return @intFromFloat(scaled);
+/// A float or text literal as a DECIMAL(p,s) column's mantissa, by the
+/// assignment rule: its digits (a double's shortest ones) rounded half away
+/// from zero to the scale, and ValueOutOfRange past the precision.
+fn decimalLiteralMantissa(v: Value, spec: @import("../types.zig").DecimalSpec) !i128 {
+    const d: exec_common.ScaledInt = switch (v) {
+        .float => |x| exec_common.floatDigits(x) orelse return error.ValueOutOfRange,
+        .double => |x| exec_common.floatDigits(x) orelse return error.ValueOutOfRange,
+        .text => |s| switch (exec_common.textNumber(s) orelse return Error.TypeMismatch) {
+            .exact => |d| d,
+            .float => |f| exec_common.floatDigits(f) orelse return error.ValueOutOfRange,
+        },
+        else => return Error.TypeMismatch,
+    };
+    const m = exec_decimal.rescale(d.m, d.s, spec.s) orelse return error.ValueOutOfRange;
+    if (@abs(m) >= exec_decimal.pow10(spec.p)) return error.ValueOutOfRange;
+    return m;
 }
 
 fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {
@@ -3243,43 +3247,6 @@ fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {
         out = std.math.mul(T, out, 10) catch return Error.TypeMismatch;
     }
     return out;
-}
-
-pub fn parseDecimalLiteral(comptime T: type, s: []const u8, spec: @import("../types.zig").DecimalSpec) !T {
-    // Accept optional sign, digits, optional '.' followed by digits. Right-
-    // pad or truncate the fractional part to the column's scale.
-    var idx: usize = 0;
-    var negate = false;
-    if (idx < s.len and (s[idx] == '-' or s[idx] == '+')) {
-        negate = s[idx] == '-';
-        idx += 1;
-    }
-    var int_part: T = 0;
-    while (idx < s.len and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {
-        int_part = std.math.mul(T, int_part, 10) catch return Error.TypeMismatch;
-        int_part = std.math.add(T, int_part, @as(T, s[idx] - '0')) catch return Error.TypeMismatch;
-    }
-    var frac_digits: u8 = 0;
-    var frac_part: T = 0;
-    if (idx < s.len and s[idx] == '.') {
-        idx += 1;
-        while (idx < s.len and s[idx] >= '0' and s[idx] <= '9' and frac_digits < spec.s) : (idx += 1) {
-            frac_part = std.math.mul(T, frac_part, 10) catch return Error.TypeMismatch;
-            frac_part = std.math.add(T, frac_part, @as(T, s[idx] - '0')) catch return Error.TypeMismatch;
-            frac_digits += 1;
-        }
-        // Skip trailing digits beyond the target scale (truncate).
-        while (idx < s.len and s[idx] >= '0' and s[idx] <= '9') : (idx += 1) {}
-    }
-    if (idx != s.len) return Error.TypeMismatch;
-    // Right-pad the fractional part to the target scale.
-    while (frac_digits < spec.s) : (frac_digits += 1) {
-        frac_part = std.math.mul(T, frac_part, 10) catch return Error.TypeMismatch;
-    }
-    var scaled = std.math.mul(T, int_part, std.math.powi(T, 10, spec.s) catch return Error.TypeMismatch) catch return Error.TypeMismatch;
-    scaled = std.math.add(T, scaled, frac_part) catch return Error.TypeMismatch;
-    if (negate) scaled = -scaled;
-    return scaled;
 }
 
 /// `YYYY-MM-DD` → days since the Unix epoch. Uses civil-from-days math
@@ -3295,7 +3262,7 @@ pub fn parseDateLiteral(s: []const u8) !i32 {
 }
 
 pub fn parseDateTimeLiteral(s: []const u8) !i64 {
-    return @import("../exec/scalar_fn_common.zig").parseDateTimeString(s) catch Error.TypeMismatch;
+    return exec_common.parseDateTimeString(s) catch Error.TypeMismatch;
 }
 
 pub fn parseUuidLiteral(s: []const u8) !u128 {

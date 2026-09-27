@@ -21,6 +21,7 @@ const simd = @import("../util/simd.zig");
 const Error = exec.Error;
 const scalar_fn_common = @import("scalar_fn_common.zig");
 const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
+const decimal_rescale = @import("scalar_fn_decimal.zig").rescale;
 
 pub const PredicateOp = enum { eq, neq, lt, lte, gt, gte };
 
@@ -865,32 +866,23 @@ fn scalarComparableTo(lit: Scalar, col_type: types.Type) bool {
 /// A number against an integer (`scale` 0) or decimal column: exact when it
 /// lands on the column's grid of 10^-scale steps, else the two grid points
 /// around it.
+/// A double lands by its shortest digits (`floatDigits`), as it converts.
 fn placeOnGrid(lit: Scalar, scale: u8, col_type: types.Type) LiteralPlacement {
-    const steps: struct { lo: i128, hi: i128 } = switch (lit) {
-        .integer => |v| blk: {
-            const m = mulPow10(v, scale) orelse return .{ .beyond = sideOf(v < 0) };
-            break :blk .{ .lo = m, .hi = m };
-        },
-        .decimal => |d| blk: {
-            if (d.s <= scale) {
-                const m = mulPow10(d.m, scale - d.s) orelse return .{ .beyond = sideOf(d.m < 0) };
-                break :blk .{ .lo = m, .hi = m };
-            }
-            const step = decimal_pow10(d.s - scale);
-            const lo = @divFloor(d.m, step);
-            break :blk .{ .lo = lo, .hi = if (lo * step == d.m) lo else lo + 1 };
-        },
-        .float => |v| blk: {
-            if (!std.math.isFinite(v)) return .incomparable;
-            const scaled = v * std.math.pow(f64, 10.0, @floatFromInt(scale));
-            if (@abs(scaled) >= 1.0e38) return .{ .beyond = sideOf(scaled < 0) };
-            if (scaledIsIntegral(scaled)) {
-                const m: i128 = @intFromFloat(@round(scaled));
-                break :blk .{ .lo = m, .hi = m };
-            }
-            break :blk .{ .lo = @intFromFloat(@floor(scaled)), .hi = @intFromFloat(@ceil(scaled)) };
-        },
+    const d: ScaledInt = switch (lit) {
+        .integer => |v| .{ .m = v, .s = 0 },
+        .decimal => |d| d,
+        .float => |v| scalar_fn_common.floatDigits(v) orelse
+            return if (std.math.isFinite(v)) .{ .beyond = sideOf(v < 0) } else .incomparable,
         .micros, .text, .uuid => return .incomparable,
+    };
+    const steps: struct { lo: i128, hi: i128 } = blk: {
+        if (d.s <= scale) {
+            const m = mulPow10(d.m, scale - d.s) orelse return .{ .beyond = sideOf(d.m < 0) };
+            break :blk .{ .lo = m, .hi = m };
+        }
+        const step = decimal_pow10(d.s - scale);
+        const lo = @divFloor(d.m, step);
+        break :blk .{ .lo = lo, .hi = if (lo * step == d.m) lo else lo + 1 };
     };
     // Past the type's range on one side only when `lo` is its maximum or
     // `hi` its minimum: then the literal is still beyond every column value.
@@ -1099,20 +1091,12 @@ fn intToDecimalMantissa(iv: i128, scale: u8) error{NoWidening}!i128 {
     return m;
 }
 
+/// A double as a decimal column's mantissa, by its shortest digits
+/// (`floatDigits`): `.exact` only when no digit falls past the scale.
 fn floatToDecimalMantissa(v: f64, scale: u8, fit: DecimalFit) error{NoWidening}!i128 {
-    const factor = std.math.pow(f64, 10.0, @floatFromInt(scale));
-    const scaled = v * factor;
-    const rounded = @round(scaled);
-    if (!std.math.isFinite(rounded) or @abs(rounded) >= std.math.pow(f64, 2.0, 127.0)) return error.NoWidening;
-    if (fit == .exact and !scaledIsIntegral(scaled)) return error.NoWidening;
-    return @intFromFloat(rounded);
-}
-
-/// The scale product carries float noise (0.1 × 10 is not exactly 1.0), so
-/// integrality is judged at ulp scale rather than by `@trunc`.
-fn scaledIsIntegral(scaled: f64) bool {
-    const rounded = @round(scaled);
-    return @abs(scaled - rounded) <= @abs(rounded) * 1e-12 + 1e-9;
+    const d = scalar_fn_common.floatDigits(v) orelse return error.NoWidening;
+    if (fit == .exact and d.s > scale and @rem(d.m, decimal_pow10(d.s - scale)) != 0) return error.NoWidening;
+    return decimal_rescale(d.m, d.s, scale) orelse error.NoWidening;
 }
 
 fn parseDateString(s: []const u8) !i32 {

@@ -221,6 +221,33 @@ pub fn textNumber(raw: []const u8) ?TextNumber {
     return if (std.math.isFinite(f)) .{ .float = f } else null;
 }
 
+/// 10^38: every DECIMAL value's magnitude is below it.
+const DECIMAL_LIMIT: u128 = std.math.powi(u128, 10, 38) catch unreachable;
+
+/// A double as the decimal it prints as: the shortest digits that read back
+/// as the same double. MySQL converts a DOUBLE to a DECIMAL through these
+/// digits, so `1.005e0` is 1.005 rather than the binary value just below
+/// it. Null when it isn't finite or needs more than 38 digits before the
+/// point; digits past scale 38 round away.
+pub fn floatDigits(x: f64) ?ScaledInt {
+    if (!std.math.isFinite(x)) return null;
+    const float_fmt = std.fmt.float;
+    const d = float_fmt.binaryToDecimal(u64, @bitCast(x), std.math.floatMantissaBits(f64), std.math.floatExponentBits(f64), false, &float_fmt.Backend64_TablesFull);
+    const m: i128 = if (d.sign) -@as(i128, d.mantissa) else d.mantissa;
+    if (d.exponent >= 0) {
+        const unit = std.math.powi(i128, 10, @intCast(d.exponent)) catch return null;
+        const whole = std.math.mul(i128, m, unit) catch return null;
+        if (@abs(whole) >= DECIMAL_LIMIT) return null;
+        return .{ .m = whole, .s = 0 };
+    }
+    const s: u32 = @intCast(-d.exponent);
+    if (s <= 38) return .{ .m = m, .s = @intCast(s) };
+    const unit = std.math.powi(i128, 10, s - 38) catch return .{ .m = 0, .s = 38 };
+    const q = @divTrunc(m, unit);
+    const rounds_away = @abs(@rem(m, unit)) * 2 >= @abs(unit);
+    return .{ .m = if (!rounds_away) q else if (m < 0) q - 1 else q + 1, .s = 38 };
+}
+
 /// Text as a DOUBLE: any number `textNumber` reads, correctly rounded.
 pub fn textDouble(raw: []const u8) ?f64 {
     return switch (textNumber(raw) orelse return null) {
@@ -286,6 +313,22 @@ test "text as a number: what StarRocks casts, and nothing else" {
     try t.expectEqual(@as(?bool, false), textBoolean("0.0"));
     try t.expect(textBoolean("x") == null);
     try t.expect(textBoolean("") == null);
+}
+
+test "floatDigits: a double's shortest digits" {
+    const t = std.testing;
+    const cases = .{
+        .{ 1.005, ScaledInt{ .m = 1005, .s = 3 } },
+        .{ -2.675, ScaledInt{ .m = -2675, .s = 3 } },
+        .{ @as(f64, 0.1) + @as(f64, 0.2), ScaledInt{ .m = 30000000000000004, .s = 17 } },
+        .{ 100.0, ScaledInt{ .m = 100, .s = 0 } },
+        .{ 0.0, ScaledInt{ .m = 0, .s = 0 } },
+        .{ 1.5e20, ScaledInt{ .m = 150000000000000000000, .s = 0 } },
+        .{ 1.5e-40, ScaledInt{ .m = 0, .s = 38 } },
+        .{ 5.0e-38, ScaledInt{ .m = 5, .s = 38 } },
+    };
+    inline for (cases) |c| try t.expectEqual(c[1], floatDigits(c[0]).?);
+    inline for (.{ 1e38, -1e39, std.math.inf(f64), std.math.nan(f64) }) |bad| try t.expect(floatDigits(bad) == null);
 }
 
 test "parseDateTimeString: fractions, date-only, Z, rejects" {
