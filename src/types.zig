@@ -455,6 +455,40 @@ pub fn columnNameEql(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+fn columnNameIn(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (columnNameEql(n, name)) return true;
+    return false;
+}
+
+/// Rename each name an earlier one in `names` already uses to `name_N`, the
+/// smallest N no name claims: a result's columns bind by name, so a repeat
+/// keeps its first use (DuckDB's naming, as the parser gives repeated SELECT
+/// items). Returns the names it allocated, for the caller to free once the
+/// names are copied.
+pub fn dedupeColumnNames(allocator: std.mem.Allocator, names: [][]const u8) std.mem.Allocator.Error![][]u8 {
+    var renamed: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (renamed.items) |r| allocator.free(r);
+        renamed.deinit(allocator);
+    }
+    for (names, 0..) |*name, i| {
+        if (!columnNameIn(names[0..i], name.*)) continue;
+        var n: usize = 1;
+        while (true) : (n += 1) {
+            try renamed.ensureUnusedCapacity(allocator, 1);
+            const candidate = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ name.*, n });
+            if (columnNameIn(names, candidate)) {
+                allocator.free(candidate);
+                continue;
+            }
+            renamed.appendAssumeCapacity(candidate);
+            name.* = candidate;
+            break;
+        }
+    }
+    return renamed.toOwnedSlice(allocator);
+}
+
 pub const QualifiedName = struct {
     qualifier: []const u8,
     bare: []const u8,

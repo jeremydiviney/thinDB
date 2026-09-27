@@ -217,10 +217,13 @@ pub fn decimalLiteralExpr(arena: Allocator, digits: []const u8, p: u8, s: u8) Al
 /// DOUBLE serves: a comparison leaf, which places a double on a decimal or
 /// integer column by its shortest digits (the literal's own), or a numeric
 /// parameter such as a percentile. A decimal constant gives the double
-/// nearest its digits.
+/// nearest its digits, except a whole number (an integer literal past
+/// BIGINT), which is LARGEINT: its double would drop digits past 2^53, and
+/// a LARGEINT meets any numeric column exactly.
 pub fn literalValue(e: Expr) ?Value {
     if (e == .lit) return e.lit;
     const d = decimalLiteral(e) orelse return null;
+    if (d.s == 0) if (std.fmt.parseInt(i128, d.digits, 10)) |v| return .{ .largeint = v } else |_| {};
     return .{ .double = std.fmt.parseFloat(f64, d.digits) catch return null };
 }
 

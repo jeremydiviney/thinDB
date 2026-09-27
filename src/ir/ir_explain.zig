@@ -304,6 +304,20 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.append(allocator, '\n');
             if (u.source) |s| try explainOp(allocator, out, s.*, depth + 1);
         },
+        .admin => |a| {
+            try out.appendSlice(allocator, "Admin ");
+            switch (a) {
+                .ignored, .begin_transaction, .end_transaction => try out.appendSlice(allocator, @tagName(a)),
+                .table_maintenance => |m| {
+                    try out.appendSlice(allocator, @tagName(m.kind));
+                    for (m.tables) |t| {
+                        try out.append(allocator, ' ');
+                        try writeTableRef(allocator, out, t);
+                    }
+                },
+            }
+            try out.append(allocator, '\n');
+        },
     }
 }
 
@@ -512,6 +526,7 @@ fn explainShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) !void {
         .create_function => |name| {
             try writeAll(allocator, out, "ShowCreateFunction ", name, "\n");
         },
+        .create_database => |cd| try writeAll(allocator, out, "ShowCreateDatabase ", cd.name, "\n"),
     }
 }
 
