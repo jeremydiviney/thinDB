@@ -1093,6 +1093,9 @@ pub const CompileCtx = struct {
     /// Wire layers (MySQL OK_Packet, PG CommandComplete) read this after
     /// running the CompiledQuery. Zero for ops that don't mutate data.
     affected_rows: u64 = 0,
+    /// The first AUTO_INCREMENT id this statement's INSERT generated, which
+    /// becomes the session's LAST_INSERT_ID(); null when it generated none.
+    last_insert_id: ?u64 = null,
     /// Query-scoped memory accountant. Lazily created (via
     /// `queryAccountant`) the first time a Scan is compiled, then
     /// injected into every Scan / materialized buffer / subquery drain so
@@ -1288,6 +1291,11 @@ pub const CompiledQuery = struct {
     /// today; DELETE eventually). Zero for SELECT and metadata-only DDL.
     pub fn affectedRows(self: *const CompiledQuery) u64 {
         return self.ctx.affected_rows;
+    }
+
+    /// The first AUTO_INCREMENT id the statement generated, if any.
+    pub fn lastInsertId(self: *const CompiledQuery) ?u64 {
+        return self.ctx.last_insert_id;
     }
 };
 
@@ -3202,6 +3210,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
                     // Omitted or explicit NULL → take the next id.
                     const id = next_counter;
                     next_counter += 1;
+                    if (ctx.last_insert_id == null) ctx.last_insert_id = id;
                     break :blk integerLiteralForType(ai_col.type, id) catch return Error.TypeMismatch;
                 } else if (maybe_src) |src|
                     row[src]

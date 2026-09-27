@@ -587,7 +587,7 @@ fn appendGrouped(allocator: Allocator, text: *std.ArrayList(u8), whole: []const 
 }
 
 /// Render `mantissa / 10^s` as a fixed-point string into `buf`.
-fn formatDecimal(buf: []u8, mantissa: i128, s: u8) []const u8 {
+pub fn formatDecimal(buf: []u8, mantissa: i128, s: u8) []const u8 {
     if (s == 0) return std.fmt.bufPrint(buf, "{d}", .{mantissa}) catch "0";
     const neg = mantissa < 0;
     const mag: u128 = @abs(mantissa);

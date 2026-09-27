@@ -242,6 +242,8 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_left => "left",
         .kw_right => "right",
         .kw_truncate => "truncate",
+        .kw_insert => "insert",
+        .kw_interval => "interval",
         else => null,
     };
 }
@@ -1689,6 +1691,7 @@ pub const Parser = struct {
     }
 
     fn parseProjItem(self: *Parser) ParseError!ProjItem {
+        const item_start = self.prev_end;
         if (self.cur.tag == .star) {
             try self.advance();
             return ProjItem{ .name = "*", .kind = .{ .star = null } };
@@ -1889,7 +1892,13 @@ pub const Parser = struct {
             // stay as a bare scalar call.
             const scalar_atom = try self.makeScalarCallExpr(first, args);
             const expr = try self.continueBinaryFrom(scalar_atom);
-            const default_name = try self.exprDefaultName(expr);
+            // A JSON aggregate lowers to calls over a hidden column; it takes
+            // its name from the text as written, as MySQL names it.
+            const lowered_aggregate = jsonAggregateFor(first) != null and expr == .call and expr.call.args.ptr == scalar_atom.call.args.ptr;
+            const default_name = if (lowered_aggregate)
+                try self.arena.dupe(u8, std.mem.trim(u8, self.lex.src[item_start..self.prev_end], " \t\r\n"))
+            else
+                try self.exprDefaultName(expr);
             const alias = try self.maybeAlias(default_name);
             return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
         }
@@ -2091,7 +2100,11 @@ pub const Parser = struct {
                     if (depth == 0) return true;
                 },
                 .pipe_pipe => if (depth == 0 and self.lex.dialect == .mysql) return true,
-                .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(tok.text, "xor") and tok.text.ptr != self.cur.text.ptr) return true,
+                .identifier => if (depth == 0 and tok.text.ptr != self.cur.text.ptr) {
+                    if (std.ascii.eqlIgnoreCase(tok.text, "xor")) return true;
+                    var after_sounds = look;
+                    if (std.ascii.eqlIgnoreCase(tok.text, "sounds") and (try after_sounds.next()).tag == .kw_like) return true;
+                },
                 else => {},
             }
         }
@@ -2213,10 +2226,37 @@ pub const Parser = struct {
             inner[0] = .{ .call = .{ .fn_name = try self.arena.dupe(u8, "str_to_date"), .args = try self.arena.dupe(ir.Expr, args) } };
             return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "to_date"), .args = inner } };
         }
+        if (jsonAggregateFor(name)) |agg| return try self.jsonAggregateCall(name, agg, args);
         return ir.Expr{ .call = .{
             .fn_name = try self.arena.dupe(u8, name),
             .args = try self.normalizeScalarCallArgs(name, args),
         } };
+    }
+
+    const JsonAggregate = struct { packer: []const u8, wrapper: []const u8, arity: usize };
+
+    fn jsonAggregateFor(name: []const u8) ?JsonAggregate {
+        if (std.ascii.eqlIgnoreCase(name, "json_arrayagg"))
+            return .{ .packer = scalar_fn.JSON_AGG_ELEMENT_FN, .wrapper = scalar_fn.JSON_AGG_ARRAY_FN, .arity = 1 };
+        if (std.ascii.eqlIgnoreCase(name, "json_objectagg"))
+            return .{ .packer = scalar_fn.JSON_AGG_MEMBER_FN, .wrapper = scalar_fn.JSON_AGG_OBJECT_FN, .arity = 2 };
+        return null;
+    }
+
+    /// JSON_ARRAYAGG(v) / JSON_OBJECTAGG(k, v): a hidden GROUP_CONCAT, with no
+    /// separator, of each row's packed JSONB, which the wrapper turns into
+    /// the group's document. An empty group concatenates to NULL, as MySQL
+    /// returns.
+    fn jsonAggregateCall(self: *Parser, name: []const u8, agg: JsonAggregate, args: []const ir.Expr) ParseError!ir.Expr {
+        if (args.len != agg.arity) return ParseError.SqlInvalidProjection;
+        for (args) |a| if (a == .col_ref and std.mem.eql(u8, a.col_ref, "*")) return ParseError.SqlInvalidProjection;
+        const concat_args = try self.arena.alloc(ir.Expr, 2);
+        concat_args[0] = .{ .call = .{ .fn_name = agg.packer, .args = try self.arena.dupe(ir.Expr, args) } };
+        concat_args[1] = .{ .lit = .{ .text = "" } };
+        const hidden = try self.materializeAggregateExpr(name, .group_concat, concat_args, false);
+        const wrapper_args = try self.arena.alloc(ir.Expr, 1);
+        wrapper_args[0] = .{ .col_ref = hidden };
+        return .{ .call = .{ .fn_name = agg.wrapper, .args = wrapper_args } };
     }
 
     /// Whether a binary operator of the expression sub-language sits at the
@@ -2812,7 +2852,7 @@ pub const Parser = struct {
             }
             const is_minus = self.cur.tag == .minus;
             try self.advance();
-            if (self.cur.tag == .kw_interval) {
+            if (self.cur.tag == .kw_interval and !try self.intervalCallAhead()) {
                 lhs = try self.applyInterval(lhs, is_minus);
             } else {
                 const fn_name: []const u8 = if (is_minus) "sub" else "add";
@@ -4720,6 +4760,26 @@ pub const Parser = struct {
         }
     }
 
+    /// With `cur` on INTERVAL: whether it opens MySQL's `INTERVAL(n, n1, ...)`
+    /// function, whose parentheses hold a comma, rather than a date interval.
+    fn intervalCallAhead(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        if ((try look.next()).tag != .lparen) return false;
+        var depth: usize = 1;
+        while (true) {
+            switch ((try look.next()).tag) {
+                .eof => return false,
+                .lparen => depth += 1,
+                .rparen => {
+                    depth -= 1;
+                    if (depth == 0) return false;
+                },
+                .comma => if (depth == 1) return true,
+                else => {},
+            }
+        }
+    }
+
     /// With `cur` on `(` in an ON condition: whether the group holds
     /// conditions (`(a = b AND c IS NULL)`) rather than opening a scalar
     /// operand (`(a + 1) = b`). Only a condition group carries a comparison,
@@ -6307,7 +6367,8 @@ fn countAggs(proj: []const ProjItem) usize {
 pub fn isNondeterministicFn(name: []const u8) bool {
     if (bareTemporalFn(name) != null) return true;
     const names = [_][]const u8{
-        "now", "random", "rand", "uuid", "uuid_short", "sysdate", "unix_timestamp",
+        "now",   "random",         "rand",      "uuid", "uuid_short", "sysdate", "unix_timestamp",
+        "sleep", "last_insert_id", "row_count",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
     return false;

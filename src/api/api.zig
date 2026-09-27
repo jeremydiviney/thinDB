@@ -380,6 +380,13 @@ pub const Session = struct {
     /// Session copies share the same pointer so mutations from one
     /// statement are visible to the next.
     vars: ?*SessionVars = null,
+    /// LAST_INSERT_ID(): the first AUTO_INCREMENT id an INSERT generated on
+    /// this connection, 0 before any. The wire layer carries it between
+    /// statements.
+    last_insert_id: u64 = 0,
+    /// ROW_COUNT(): what the previous statement changed — its affected rows
+    /// for DML, -1 after a result set, 0 otherwise.
+    row_count: i64 = -1,
 };
 
 /// Per-connection variable storage. Names and string values are
