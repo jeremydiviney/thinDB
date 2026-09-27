@@ -1219,29 +1219,27 @@ pub fn strcmpKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     }
 }
 
-pub fn greatestStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a_sv = stringViewOf(args[0]);
-    const b_sv = stringViewOf(args[1]);
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const a = a_sv.rowBytes(i);
-        const b = b_sv.rowBytes(i);
-        try ss.appendValue(allocator, if (std.mem.order(u8, a, b) == .lt) b else a);
-    }
+/// GREATEST/LEAST over any number of string arguments, by byte order; the
+/// first of equal values wins.
+fn StringExtremum(comptime replace_when: std.math.Order) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const ss = stringStoreOf(out);
+            var i: usize = 0;
+            while (i < row_count) : (i += 1) {
+                var best = stringViewOf(args[0]).rowBytes(i);
+                for (args[1..]) |arg| {
+                    const x = stringViewOf(arg).rowBytes(i);
+                    if (std.mem.order(u8, x, best) == replace_when) best = x;
+                }
+                try ss.appendValue(allocator, best);
+            }
+        }
+    };
 }
 
-pub fn leastStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a_sv = stringViewOf(args[0]);
-    const b_sv = stringViewOf(args[1]);
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const a = a_sv.rowBytes(i);
-        const b = b_sv.rowBytes(i);
-        try ss.appendValue(allocator, if (std.mem.order(u8, a, b) == .gt) b else a);
-    }
-}
+pub const greatestStringKernel = StringExtremum(.gt).kernel;
+pub const leastStringKernel = StringExtremum(.lt).kernel;
 
 /// chr(int) — inverse of ascii. Out-of-range / negative input → empty string.
 pub fn chrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

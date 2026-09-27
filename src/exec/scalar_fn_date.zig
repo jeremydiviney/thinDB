@@ -147,6 +147,40 @@ pub fn dateAddYearsKernel(allocator: Allocator, args: []const ColumnView, out: *
     }
 }
 
+/// DATE_ADD over a DATETIME by whole days, months or years, keeping the time
+/// of day; a month or year step clamps the day to the destination month.
+fn DatetimeAddUnit(comptime unit: DateUnit, comptime negate: bool) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const dts = args[0].data.datetime;
+            const ns = args[1].data.int;
+            for (dts[0..row_count], ns[0..row_count]) |dt, n| try out.data.datetime.append(allocator, addUnitToDatetime(unit, dt, if (negate) -n else n));
+        }
+    };
+}
+
+pub const datetimeAddDaysKernel = DatetimeAddUnit(.day, false).kernel;
+pub const datetimeSubDaysKernel = DatetimeAddUnit(.day, true).kernel;
+pub const datetimeAddMonthsKernel = DatetimeAddUnit(.month, false).kernel;
+pub const datetimeAddYearsKernel = DatetimeAddUnit(.year, false).kernel;
+
+/// A DATETIME moved by a count of `step_micros`-long steps.
+fn DatetimeAddSteps(comptime step_micros: i64) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const dts = args[0].data.datetime;
+            const ns = args[1].data.bigint;
+            for (dts[0..row_count], ns[0..row_count]) |dt, n| {
+                const step = std.math.mul(i64, n, step_micros) catch return error.ArithmeticOverflow;
+                try out.data.datetime.append(allocator, std.math.add(i64, dt, step) catch return error.ArithmeticOverflow);
+            }
+        }
+    };
+}
+
+pub const datetimeAddSecondsKernel = DatetimeAddSteps(std.time.us_per_s).kernel;
+pub const datetimeAddMicrosKernel = DatetimeAddSteps(1).kernel;
+
 pub fn makedateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const years = args[0].data.int;
     const day_of_years = args[1].data.int;

@@ -582,6 +582,42 @@ test "sql: FETCH FIRST / OFFSET ROWS (ANSI/PG row limiting)" {
     }
 }
 
+test "sql: bare temporal keywords, NOW(fsp), ISNULL and one-argument LOG" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE tk (id BIGINT PRIMARY KEY, v INT, ts DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3))");
+    try helpers.exec(allocator, db, "INSERT INTO tk (id, v) VALUES (1, 10), (2, NULL)");
+    const cases = .{
+        .{ "SELECT id FROM tk WHERE CURRENT_TIMESTAMP >= ts ORDER BY id", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM tk WHERE CURRENT_DATE IS NOT NULL AND id = 1", &[_]i64{1} },
+        .{ "SELECT id FROM tk WHERE LOCALTIMESTAMP - INTERVAL 1 DAY < ts ORDER BY id", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM tk WHERE NOW(3) = NOW() AND CURRENT_TIMESTAMP(6) = CURRENT_TIMESTAMP ORDER BY id", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM tk WHERE ISNULL(v)", &[_]i64{2} },
+        .{ "SELECT id FROM tk WHERE NOT ISNULL(v * 2)", &[_]i64{1} },
+        .{ "SELECT id FROM tk WHERE ISNULL(NULL) AND NOT ISNULL(1) ORDER BY id", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM tk WHERE LOG(100) = 2 AND id = 1", &[_]i64{1} },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+    try helpers.expectRunError(allocator, db, "SELECT NOW(7)", error.SqlExpectedValue);
+
+    // MySQL's one-argument LOG is the natural log.
+    var q = try helpers.runSqlMysql(allocator, db, "SELECT id FROM tk WHERE LOG(100) > 4.6 AND LOG(100) < 4.7 AND ISNULL(v)");
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), b.row_count);
+    try std.testing.expectEqual(@as(i64, 2), b.values[0].data.bigint[0]);
+}
+
 test "sql: FROM-less SELECT evaluates expressions over one row" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
