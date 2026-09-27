@@ -185,6 +185,9 @@ pub const Token = struct {
         /// the `.dollar_param` token tag.
         dollar_param: u32,
     } = .none,
+    /// A backquoted or double-quoted identifier: never a keyword, even when
+    /// spelled like one of the contextual clause words (`INDEX`, `UNIQUE`).
+    quoted: bool = false,
 };
 
 pub const LexError = error{
@@ -628,7 +631,7 @@ pub const Lexer = struct {
             };
             if (as_string) return Token{ .tag = .string, .text = text, .value = .{ .string = content } };
             if (content.len == 0) return LexError.LexUnexpectedChar;
-            return Token{ .tag = .identifier, .text = content };
+            return Token{ .tag = .identifier, .text = content, .quoted = true };
         }
         return if (as_string) LexError.LexUnterminatedString else LexError.LexUnterminatedIdentifier;
     }
@@ -644,7 +647,7 @@ pub const Lexer = struct {
                 const text = self.src[start + 1 .. self.pos];
                 self.pos += 1;
                 if (text.len == 0) return LexError.LexUnexpectedChar;
-                return Token{ .tag = .identifier, .text = text };
+                return Token{ .tag = .identifier, .text = text, .quoted = true };
             }
         }
         return LexError.LexUnterminatedIdentifier;
