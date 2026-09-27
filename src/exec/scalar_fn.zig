@@ -922,6 +922,13 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "square", .arg_types = &.{.double}, .return_type = .double, .kernel = math.squareKernel },
     .{ .name = "bit_count", .arg_types = &.{.int}, .return_type = .int, .kernel = math.bitCountIntKernel },
     .{ .name = "bit_count", .arg_types = &.{.bigint}, .return_type = .int, .kernel = math.bitCountBigintKernel },
+    // The bitwise operators & | ^ ~ << >> lower to these, StarRocks' names.
+    .{ .name = "bitand", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"and") },
+    .{ .name = "bitor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"or") },
+    .{ .name = "bitxor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.xor) },
+    .{ .name = "bit_shift_left", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_left) },
+    .{ .name = "bit_shift_right", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_right) },
+    .{ .name = "bitnot", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.bitNotKernel },
     .{ .name = "bin", .arg_types = &.{.int}, .return_type = .string, .kernel = math.binIntKernel },
     .{ .name = "bin", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.binBigintKernel },
     .{ .name = "conv", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .kernel = math.convStringKernel },

@@ -143,6 +143,14 @@ pub const TokenTag = enum {
     arrow, // -> (MySQL JSON extract: JSON_EXTRACT)
     arrow2, // ->> (MySQL JSON extract + unquote: JSON_UNQUOTE(JSON_EXTRACT))
     pipe_pipe, // || (PG/ANSI string concat; MySQL logical OR)
+    null_safe_eq, // <=> (MySQL null-safe equality)
+    amp, // & (bitwise AND)
+    amp_amp, // && (MySQL logical AND)
+    pipe, // | (bitwise OR)
+    caret, // ^ (MySQL bitwise XOR; PG/neutral exponentiation)
+    tilde, // ~ (bitwise NOT)
+    shl, // <<
+    shr, // >>
     coloncolon, // :: (PG cast operator)
     comma, // ,
     dot, // .
@@ -285,7 +293,24 @@ pub const Lexer = struct {
                     self.pos += 2;
                     return Token{ .tag = .pipe_pipe, .text = self.src[start..self.pos] };
                 }
-                return LexError.LexUnexpectedChar;
+                self.pos += 1;
+                return Token{ .tag = .pipe, .text = self.src[start..self.pos] };
+            },
+            '&' => {
+                if (self.peekChar(1) == '&') {
+                    self.pos += 2;
+                    return Token{ .tag = .amp_amp, .text = self.src[start..self.pos] };
+                }
+                self.pos += 1;
+                return Token{ .tag = .amp, .text = self.src[start..self.pos] };
+            },
+            '^' => {
+                self.pos += 1;
+                return Token{ .tag = .caret, .text = self.src[start..self.pos] };
+            },
+            '~' => {
+                self.pos += 1;
+                return Token{ .tag = .tilde, .text = self.src[start..self.pos] };
             },
             ':' => {
                 if (self.peekChar(1) == ':') {
@@ -315,6 +340,10 @@ pub const Lexer = struct {
                 return LexError.LexUnexpectedChar;
             },
             '<' => {
+                if (self.peekChar(1) == '=' and self.peekChar(2) == '>') {
+                    self.pos += 3;
+                    return Token{ .tag = .null_safe_eq, .text = self.src[start..self.pos] };
+                }
                 if (self.peekChar(1) == '=') {
                     self.pos += 2;
                     return Token{ .tag = .lte, .text = self.src[start..self.pos] };
@@ -323,6 +352,10 @@ pub const Lexer = struct {
                     self.pos += 2;
                     return Token{ .tag = .neq, .text = self.src[start..self.pos] };
                 }
+                if (self.peekChar(1) == '<') {
+                    self.pos += 2;
+                    return Token{ .tag = .shl, .text = self.src[start..self.pos] };
+                }
                 self.pos += 1;
                 return Token{ .tag = .lt, .text = self.src[start..self.pos] };
             },
@@ -330,6 +363,10 @@ pub const Lexer = struct {
                 if (self.peekChar(1) == '=') {
                     self.pos += 2;
                     return Token{ .tag = .gte, .text = self.src[start..self.pos] };
+                }
+                if (self.peekChar(1) == '>') {
+                    self.pos += 2;
+                    return Token{ .tag = .shr, .text = self.src[start..self.pos] };
                 }
                 self.pos += 1;
                 return Token{ .tag = .gt, .text = self.src[start..self.pos] };
@@ -454,7 +491,9 @@ pub const Lexer = struct {
                 // engine intact, matching DuckDB/PostgreSQL — which never treat
                 // backslash as an escape in ordinary strings. Real C escapes
                 // (\n \t \r \0 \b \Z) still process for MySQL-client parity.
-                if (e >= '1' and e <= '9') {
+                // \% and \_ keep their backslash too, as in MySQL: LIKE reads
+                // them as a literal % and _.
+                if ((e >= '1' and e <= '9') or e == '%' or e == '_') {
                     buf[out] = '\\';
                     buf[out + 1] = e;
                     out += 2;
@@ -858,6 +897,12 @@ test "lexer: MySQL processes backslash escapes, PG/neutral treat backslash liter
         try std.testing.expectEqualStrings("a\tb", s.value.string);
     }
     {
+        var lx = Lexer.init(aa, "'a\\%b\\_c\\\\d'"); // SQL: 'a\%b\_c\\d'
+        lx.dialect = .mysql;
+        const s = try lx.next();
+        try std.testing.expectEqualStrings("a\\%b\\_c\\d", s.value.string);
+    }
+    {
         var lx = Lexer.init(aa, "'a\\tb'"); // neutral: backslash is literal
         const s = try lx.next();
         try std.testing.expectEqualStrings("a\\tb", s.value.string);
@@ -924,14 +969,16 @@ test "lexer: unterminated backtick errors cleanly" {
     try std.testing.expectError(LexError.LexUnterminatedIdentifier, lx.next());
 }
 
-test "lexer: operators including != <> <= >=" {
+test "lexer: operators including != <> <= >= <=> and the bitwise ones" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lx = Lexer.init(arena.allocator(), "a != b <> c <= d >= e < f > g = h");
+    var lx = Lexer.init(arena.allocator(), "a != b <> c <= d >= e < f > g = h <=> i & j && k | l ^ m << n >> ~o");
     const expected_tags = [_]TokenTag{
-        .identifier, .neq,        .identifier, .neq,        .identifier, .lte,        .identifier,
-        .gte,        .identifier, .lt,         .identifier, .gt,         .identifier, .eq,
-        .identifier,
+        .identifier, .neq,          .identifier, .neq,        .identifier, .lte,        .identifier,
+        .gte,        .identifier,   .lt,         .identifier, .gt,         .identifier, .eq,
+        .identifier, .null_safe_eq, .identifier, .amp,        .identifier, .amp_amp,    .identifier,
+        .pipe,       .identifier,   .caret,      .identifier, .shl,        .identifier, .shr,
+        .tilde,      .identifier,
     };
     for (expected_tags) |tag| {
         try std.testing.expectEqual(tag, (try lx.next()).tag);

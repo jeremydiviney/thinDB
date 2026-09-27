@@ -404,3 +404,61 @@ test "binary arith: scientific-notation and leading-dot literals are DOUBLE" {
 
     try helpers.expectRunError(allocator, db, "SELECT 1e400 FROM t", error.LexInvalidNumber);
 }
+
+test "binary arith: bitwise operators, shifts and MOD bind as in MySQL" {
+    // Values probed against MySQL 8.4, except that the bits are signed
+    // two's complement, as in StarRocks and DuckDB: ~10 is -11 (MySQL reads
+    // it unsigned) and >> keeps the sign.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    const cases = .{
+        .{ "SELECT qty & 12 FROM t ORDER BY id", &[_]i64{ 8, 4, 12 } },
+        .{ "SELECT qty | 1 FROM t ORDER BY id", &[_]i64{ 11, 21, 31 } },
+        .{ "SELECT ~qty FROM t ORDER BY id", &[_]i64{ -11, -21, -31 } },
+        .{ "SELECT qty << 2 FROM t ORDER BY id", &[_]i64{ 40, 80, 120 } },
+        .{ "SELECT qty >> 1 FROM t ORDER BY id", &[_]i64{ 5, 10, 15 } },
+        .{ "SELECT -qty >> 1 FROM t ORDER BY id", &[_]i64{ -5, -10, -15 } },
+        .{ "SELECT qty MOD 7 FROM t ORDER BY id", &[_]i64{ 3, 6, 2 } },
+        .{ "SELECT 1 | 2 & 3 FROM t WHERE id = 1", &[_]i64{3} },
+        .{ "SELECT 2 + 3 << 1 FROM t WHERE id = 1", &[_]i64{10} },
+        .{ "SELECT 1 + 2 | 4 FROM t WHERE id = 1", &[_]i64{7} },
+        .{ "SELECT CAST(7 mod 3 + 1 AS BIGINT) FROM t WHERE id = 1", &[_]i64{2} },
+        .{ "SELECT 1 << 64 FROM t WHERE id = 1", &[_]i64{0} },
+        .{ "SELECT -1 >> 70 FROM t WHERE id = 1", &[_]i64{-1} },
+        .{ "SELECT id FROM t WHERE qty & 4 = 4 ORDER BY id", &[_]i64{ 2, 3 } },
+        .{ "SELECT id FROM t WHERE qty MOD 20 = 10 ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT id FROM t WHERE ~qty < -15 ORDER BY id", &[_]i64{ 2, 3 } },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try collectBigint(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+
+    // `^` is XOR on MySQL, binding tighter than `*`, and exponentiation
+    // on PG and DuckDB.
+    const mysql_cases = .{
+        .{ "SELECT 5 ^ 3 FROM t WHERE id = 1", 6 },
+        .{ "SELECT 2 * 3 ^ 1 FROM t WHERE id = 1", 4 },
+    };
+    inline for (mysql_cases) |c| {
+        var q = try helpers.runSqlMysql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try collectBigint(allocator, &q, 0);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &.{c[1]}, got);
+    }
+    var pow = try runSql(allocator, db, "SELECT 2 ^ 3 FROM t WHERE id = 1");
+    defer pow.deinit();
+    const powered = try collectDouble(allocator, &pow, 0);
+    defer allocator.free(powered);
+    try std.testing.expectEqualSlices(f64, &.{8.0}, powered);
+}

@@ -1,5 +1,6 @@
 //! LIKE / NOT LIKE pattern matching. `%` matches zero-or-more, `_`
-//! matches one. NULL never matches (two-valued logic).
+//! matches one, and a backslash (or the ESCAPE character) makes the next
+//! character literal. NULL never matches (two-valued logic).
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -120,5 +121,52 @@ test "REGEXP and RLIKE match anywhere in the string" {
         const ids = try collectBigints(allocator, db, case[0]);
         defer allocator.free(ids);
         try std.testing.expectEqualSlices(i64, case[1], ids);
+    }
+}
+
+test "LIKE: backslash escapes by default, ESCAPE names another character" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    // Neutral-dialect strings keep a backslash as written: row 4 is a\b.
+    try exec(allocator, db, "CREATE TABLE lk (id BIGINT PRIMARY KEY, s VARCHAR(16))");
+    try exec(allocator, db, "INSERT INTO lk VALUES (1, 'a%b'), (2, 'axb'), (3, 'a_b'), (4, 'a\\b')");
+
+    const cases = .{
+        .{ "s LIKE 'a|%b' ESCAPE '|'", &[_]i64{1} },
+        .{ "s LIKE 'a\\%b'", &[_]i64{1} },
+        .{ "s LIKE 'a\\_b'", &[_]i64{3} },
+        .{ "s LIKE 'a_b'", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "s LIKE 'a\\\\b'", &[_]i64{4} },
+        .{ "s LIKE 'a\\b' ESCAPE ''", &[_]i64{4} },
+        .{ "s LIKE 'a\\b' ESCAPE '|'", &[_]i64{4} },
+        .{ "s NOT LIKE 'a!_b' ESCAPE '!'", &[_]i64{ 1, 2, 4 } },
+        .{ "s LIKE '%\\%%'", &[_]i64{1} },
+        .{ "'a%b' LIKE 'a|%b' ESCAPE '|' AND id = 2", &[_]i64{2} },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const ids = try collectBigints(allocator, db, "SELECT id FROM lk WHERE " ++ c[0] ++ " ORDER BY id");
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, c[1], ids);
+    }
+
+    // MySQL string literals keep \% and \_ for LIKE, and \\ is one
+    // backslash, so 'a\\\\b' is the pattern a\\b.
+    const mysql_cases = .{
+        .{ "SELECT id FROM lk WHERE s LIKE 'a\\%b'", &[_]i64{1} },
+        .{ "SELECT id FROM lk WHERE s LIKE 'a\\_b'", &[_]i64{3} },
+        .{ "SELECT id FROM lk WHERE s LIKE 'a\\\\\\\\b'", &[_]i64{4} },
+    };
+    inline for (mysql_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        var q = try helpers.runSqlMysql(allocator, db, c[0]);
+        defer q.deinit();
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(allocator);
+        while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint[0..batch.row_count]);
+        try std.testing.expectEqualSlices(i64, c[1], ids.items);
     }
 }

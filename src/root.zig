@@ -128,6 +128,7 @@ test {
     _ = @import("net/random_seed.zig");
     _ = @import("util/snapshot.zig");
     _ = @import("util/hll.zig");
+    _ = @import("util/like.zig");
     _ = @import("util/affinity.zig");
     _ = @import("util/core_scheduler.zig");
     _ = @import("util/huge_page.zig");

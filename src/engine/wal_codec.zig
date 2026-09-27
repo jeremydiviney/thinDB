@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
+const like = @import("../util/like.zig");
 const ValueTag = types.ValueTag;
 const Value = types.Value;
 
@@ -837,7 +838,7 @@ fn evaluatePredicateOnRow(mt: *Memtable, row: u32, p: OwnedPredicate) bool {
                 .char => |sv| sv.rowBytes(row),
                 else => break :blk false,
             };
-            break :blk likeMatch(cell, lp.pattern);
+            break :blk like.match(cell, lp.pattern);
         },
         .p_and => |kids| {
             for (kids) |k| {
@@ -942,31 +943,6 @@ fn rowStringBytes(view: ColumnView, row: u32) []const u8 {
         .char => |sv| sv.rowBytes(row),
         else => &[_]u8{},
     };
-}
-
-/// Recursive LIKE matcher — `%` matches any run, `_` matches one byte.
-/// Local copy to avoid the engine→exec import.
-fn likeMatch(text: []const u8, pattern: []const u8) bool {
-    var ti: usize = 0;
-    var pi: usize = 0;
-    var star_ti: ?usize = null;
-    var star_pi: usize = 0;
-    while (ti < text.len) {
-        if (pi < pattern.len and pattern[pi] == '%') {
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if (pi < pattern.len and (pattern[pi] == '_' or pattern[pi] == text[ti])) {
-            pi += 1;
-            ti += 1;
-        } else if (star_ti) |sti| {
-            pi = star_pi + 1;
-            ti = sti + 1;
-            star_ti = sti + 1;
-        } else return false;
-    }
-    while (pi < pattern.len and pattern[pi] == '%') pi += 1;
-    return pi == pattern.len;
 }
 
 test {

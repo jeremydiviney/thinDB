@@ -416,6 +416,31 @@ pub fn bitCountBigintKernel(allocator: Allocator, args: []const ColumnView, out:
     while (i < row_count) : (i += 1) try out.data.int.append(allocator, @intCast(@popCount(@as(u64, @bitCast(s[i])))));
 }
 
+pub const BitOp = enum { @"and", @"or", xor, shift_left, shift_right };
+
+/// The bitwise operators read a BIGINT as its two's-complement bits, as
+/// StarRocks and DuckDB do (MySQL reads them unsigned). A shift by a count
+/// outside 0..63 shifts every bit out; `>>` is arithmetic, keeping the sign.
+pub fn bitwiseKernel(comptime op: BitOp) Kernel {
+    return struct {
+        fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const dst = try reserveInts(i64, allocator, out, row_count);
+            for (dst, args[0].data.bigint[0..row_count], args[1].data.bigint[0..row_count]) |*d, a, b| d.* = switch (op) {
+                .@"and" => a & b,
+                .@"or" => a | b,
+                .xor => a ^ b,
+                .shift_left => if (b < 0 or b > 63) 0 else @bitCast(@as(u64, @bitCast(a)) << @intCast(b)),
+                .shift_right => if (b < 0 or b > 63) (if (a < 0) -1 else 0) else a >> @intCast(b),
+            };
+        }
+    }.f;
+}
+
+pub fn bitNotKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const dst = try reserveInts(i64, allocator, out, row_count);
+    for (dst, args[0].data.bigint[0..row_count]) |*d, a| d.* = ~a;
+}
+
 fn appendUnsignedBase(allocator: Allocator, ss: anytype, value: u128, base: u8) !void {
     const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
     var buf: [128]u8 = undefined;
