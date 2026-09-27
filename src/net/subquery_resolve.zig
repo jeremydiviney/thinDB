@@ -96,6 +96,10 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         },
         .join => |*j| {
             if (j.extra_predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
+            if (j.residual) |*res| {
+                for (res.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), null);
+                try resolveSubqueriesInPredicate(ctx, &res.predicate);
+            }
             try resolveSubqueriesInOp(ctx, @constCast(j.left));
             try resolveSubqueriesInOp(ctx, @constCast(j.right));
         },

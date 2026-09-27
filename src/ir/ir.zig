@@ -50,12 +50,21 @@ pub const JoinRangePredicate = exec_join.RangePredicate;
 pub const JoinAlgorithm = exec_join.Algorithm;
 pub const JoinType = exec_join.JoinType;
 
+/// An ON condition beyond a join's keys and ranges, over the joined schema:
+/// it decides which pairs match (`exec_join.Residual`).
+pub const JoinResidual = struct {
+    /// The expression operands `predicate` reads.
+    derived: []const Derived,
+    predicate: PredicateExpr,
+};
+
 const exec_expr = @import("../exec/expr.zig");
 pub const Expr = exec_expr.Expr;
 
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v5: create_table carries a table-compression byte.
-pub const version: u16 = 6;
+/// v7: join carries an optional ON residual.
+pub const version: u16 = 7;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -821,6 +830,9 @@ pub const Op = union(OpTag) {
         ranges: []const JoinRangePredicate,
         /// Optional post-join filter (Predicate over the joined schema).
         extra_predicate: ?PredicateExpr,
+        /// ON condition beyond the keys and ranges, set on outer joins only
+        /// (an inner join filters above itself instead).
+        residual: ?JoinResidual = null,
         skew_ratio_threshold: f32,
         skew_absolute_threshold: u32,
         skew_sample_interval: u32,
@@ -888,6 +900,7 @@ pub const Op = union(OpTag) {
                 if (j.on.len > 0) allocator.free(j.on);
                 if (j.ranges.len > 0) allocator.free(j.ranges);
                 if (j.extra_predicate) |pred| freeDecodedPredicate(pred, allocator);
+                if (j.residual) |res| freeDecodedResidual(res, allocator);
                 j.left.deinitDecoded(allocator);
                 allocator.destroy(j.left);
                 j.right.deinitDecoded(allocator);
@@ -1667,9 +1680,49 @@ fn encodeJoin(allocator: Allocator, out: *std.ArrayList(u8), j: Op.Join) EncodeE
     }
     try appendU32(allocator, out, j.skew_absolute_threshold);
     try appendU32(allocator, out, j.skew_sample_interval);
+    if (j.residual) |res| {
+        try out.append(allocator, 1);
+        try appendU32(allocator, out, @intCast(res.derived.len));
+        for (res.derived) |d| {
+            try appendU32(allocator, out, @intCast(d.name.len));
+            try out.appendSlice(allocator, d.name);
+            try encodeExpr(allocator, out, d.expr);
+        }
+        try encodePredicate(allocator, out, res.predicate);
+    } else {
+        try out.append(allocator, 0);
+    }
     // Two upstreams
     try encodeOp(allocator, out, j.left.*);
     try encodeOp(allocator, out, j.right.*);
+}
+
+fn decodeResidual(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!?JoinResidual {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const has_residual = bytes[cursor.*];
+    cursor.* += 1;
+    if (has_residual == 0) return null;
+    if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+    const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+    cursor.* += 4;
+    const derived = try allocator.alloc(Derived, n);
+    var decoded: usize = 0;
+    errdefer {
+        for (derived[0..decoded]) |d| freeDecodedExpr(d.expr, allocator);
+        allocator.free(derived);
+    }
+    for (derived) |*d| {
+        const name = try readString(bytes, cursor);
+        d.* = .{ .name = name, .expr = try decodeExpr(allocator, bytes, cursor) };
+        decoded += 1;
+    }
+    return .{ .derived = derived, .predicate = try decodePredicate(allocator, bytes, cursor) };
+}
+
+fn freeDecodedResidual(res: JoinResidual, allocator: Allocator) void {
+    for (res.derived) |d| freeDecodedExpr(d.expr, allocator);
+    allocator.free(res.derived);
+    freeDecodedPredicate(res.predicate, allocator);
 }
 
 const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2, case = 3, null_lit = 4 };
@@ -2158,6 +2211,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             cursor.* += 4;
             const skew_interval = readU32(bytes[cursor.* .. cursor.* + 4]);
             cursor.* += 4;
+            const residual = try decodeResidual(allocator, bytes, cursor);
+            errdefer if (residual) |res| freeDecodedResidual(res, allocator);
 
             const left_up = try allocator.create(Op);
             errdefer allocator.destroy(left_up);
@@ -2173,6 +2228,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 .on = on,
                 .ranges = ranges,
                 .extra_predicate = extra_predicate,
+                .residual = residual,
                 .skew_ratio_threshold = skew_ratio,
                 .skew_absolute_threshold = skew_abs,
                 .skew_sample_interval = skew_interval,
@@ -3391,6 +3447,46 @@ test "ir: join round-trips with on + range + extra_predicate + skew" {
     try std.testing.expectEqualStrings("orders", decoded.join.left.scan.table.name);
     try std.testing.expect(decoded.join.right.* == .scan);
     try std.testing.expectEqualStrings("items", decoded.join.right.scan.table.name);
+}
+
+test "ir: a join's ON residual round-trips" {
+    const allocator = std.testing.allocator;
+
+    var left_scan: Op = .{ .scan = .{ .table = .{ .name = "t" } } };
+    var right_scan: Op = .{ .scan = .{ .table = .{ .name = "o" } } };
+    const on_pairs = [_]JoinKeyPair{.{ .left = "id", .right = "tid" }};
+    const sum_args = [_]Expr{ .{ .col_ref = "qty" }, .{ .col_ref = "amount" } };
+    const derived = [_]Derived{.{ .name = "__pred_expr_0", .expr = .{ .call = .{ .fn_name = "add", .args = &sum_args } } }};
+    const root: Op = .{ .join = .{
+        .algorithm = .auto,
+        .join_type = .left,
+        .on = &on_pairs,
+        .ranges = &.{},
+        .extra_predicate = null,
+        .residual = .{
+            .derived = &derived,
+            .predicate = .{ .leaf = .{ .col = "__pred_expr_0", .op = .gt, .val = .{ .bigint = 20 } } },
+        },
+        .skew_ratio_threshold = 0.0,
+        .skew_absolute_threshold = 0,
+        .skew_sample_interval = 10,
+        .left = &left_scan,
+        .right = &right_scan,
+    } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    const res = decoded.join.residual orelse return error.TestExpectedResidual;
+    try std.testing.expectEqual(@as(usize, 1), res.derived.len);
+    try std.testing.expectEqualStrings("__pred_expr_0", res.derived[0].name);
+    try std.testing.expectEqualStrings("add", res.derived[0].expr.call.fn_name);
+    try std.testing.expectEqualStrings("__pred_expr_0", res.predicate.leaf.col);
+    try std.testing.expect(decoded.join.right.* == .scan);
 }
 
 test "ir: join with no on/ranges and no extra_predicate (pure-NLJ shape)" {

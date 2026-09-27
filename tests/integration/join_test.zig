@@ -2918,6 +2918,8 @@ test "join: parenthesized ON conditions join like the bare conjuncts" {
         .{ "SELECT b.bid FROM a JOIN b ON ((a.id + 1) = b.aid + 1) ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
         .{ "SELECT COALESCE(b.bid, 0) AS c FROM a LEFT JOIN b ON (a.id = b.aid AND b.amount > 60) ORDER BY a.id", &[_]i64{ 0, 0, 4 } },
         .{ "SELECT b.bid FROM a JOIN b ON (a.id = b.aid) JOIN a AS a2 ON (a2.id = b.aid) ORDER BY b.bid", &[_]i64{ 1, 2, 3, 4 } },
+        .{ "SELECT b.bid FROM a JOIN b ON (a.id = b.aid OR b.amount > 6) ORDER BY b.bid", &[_]i64{ 1, 2, 2, 2, 3, 3, 3, 4, 4, 4 } },
+        .{ "SELECT COALESCE(b.bid, 0) AS c FROM a LEFT JOIN b ON (a.id = b.aid OR b.amount > 60) ORDER BY a.id, c", &[_]i64{ 1, 2, 4, 3, 4, 4 } },
     };
     inline for (cases) |case| {
         const got = try helpers.collectBigints(allocator, db, case[0]);
@@ -2925,7 +2927,6 @@ test "join: parenthesized ON conditions join like the bare conjuncts" {
         try std.testing.expectEqualSlices(i64, case[1], got);
     }
 
-    try std.testing.expectError(error.SqlOnNonEquiUnsupported, helpers.runSql(allocator, db, "SELECT b.bid FROM a JOIN b ON (a.id = b.aid OR b.amount > 6)"));
     try std.testing.expectError(error.SqlExpectedToken, helpers.runSql(allocator, db, "SELECT b.bid FROM a JOIN b ON (a.id = b.aid"));
 }
 
@@ -3060,4 +3061,63 @@ test "join: an ON condition on the preserved side null-extends the rows it rejec
             try std.testing.expectEqualSlices(i64, case[1], got);
         }
     }
+}
+
+// Any ON condition beyond keys and one-sided filters (a cross-input
+// expression, <>, OR, a range on an outer join, a constant) decides per pair
+// whether two rows match.
+test "join: a general ON condition decides matching per pair" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT)");
+    try helpers.exec(allocator, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, NULL)");
+    try helpers.exec(allocator, db, "CREATE TABLE o (oid BIGINT PRIMARY KEY, tid BIGINT, amount INT)");
+    try helpers.exec(allocator, db, "INSERT INTO o VALUES (10, 1, 5), (11, 1, 7), (12, 3, 9), (13, 4, 1), (14, NULL, 8)");
+
+    const pair = "SELECT COALESCE(t.id, 0) * 100 + COALESCE(o.oid, 0) AS k FROM ";
+    const cases = .{
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND t.qty < o.amount * 2 ORDER BY k", &[_]i64{ 111, 200, 300, 400 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id < o.tid ORDER BY k", &[_]i64{ 112, 113, 212, 213, 313, 400 } },
+        .{ pair ++ "t RIGHT JOIN o ON t.id = o.tid AND o.amount <> t.qty - 3 ORDER BY k", &[_]i64{ 11, 13, 14, 110, 312 } },
+        .{ pair ++ "t FULL JOIN o ON t.id = o.tid AND t.qty + o.amount > 20 ORDER BY k", &[_]i64{ 10, 11, 13, 14, 100, 200, 312, 400 } },
+        .{ pair ++ "t JOIN o ON t.id = o.tid AND o.amount <> t.qty - 3 ORDER BY k", &[_]i64{ 110, 312 } },
+        .{ pair ++ "t JOIN o ON t.id = o.tid OR t.qty = o.amount * 4 ORDER BY k", &[_]i64{ 110, 111, 210, 312, 413 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid OR t.qty = o.amount * 4 ORDER BY k", &[_]i64{ 110, 111, 210, 312, 413 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND (t.qty > 15 OR o.amount > 6) ORDER BY k", &[_]i64{ 111, 200, 312, 400 } },
+        .{ pair ++ "t LEFT JOIN o ON t.id = o.tid AND o.oid IN (SELECT oid FROM o WHERE amount > 6) ORDER BY k", &[_]i64{ 111, 200, 312, 400 } },
+        .{ pair ++ "t RIGHT JOIN o ON t.qty > o.amount * 3 ORDER BY k", &[_]i64{ 113, 210, 213, 310, 311, 312, 313, 314 } },
+        .{ "SELECT COUNT(*) FROM t JOIN o ON TRUE", &[_]i64{20} },
+        .{ "SELECT COUNT(*) FROM t JOIN o ON 1 = 1", &[_]i64{20} },
+        .{ "SELECT COUNT(*) FROM t LEFT JOIN o ON 1 = 0", &[_]i64{4} },
+        .{ "SELECT COUNT(*) FROM t JOIN o ON id < tid", &[_]i64{5} },
+    };
+    for (0..2) |phase| {
+        if (phase == 1) for ([_][]const u8{ "t", "o" }) |name| {
+            const tbl = try db.openTable(name, .{});
+            try tbl.flush();
+        };
+        inline for (cases) |case| {
+            const got = try helpers.collectBigints(allocator, db, case[0]);
+            defer allocator.free(got);
+            try std.testing.expectEqualSlices(i64, case[1], got);
+        }
+    }
+
+    // The residual's operands stay out of the output.
+    inline for (.{
+        "SELECT * FROM t JOIN o ON t.id = o.tid AND t.qty + o.amount > 20",
+        "SELECT * FROM t LEFT JOIN o ON t.qty + o.amount > 20",
+    }) |sql| {
+        var q = try helpers.runSql(allocator, db, sql);
+        defer q.deinit();
+        try std.testing.expectEqual(@as(usize, 5), q.outputSchema().len);
+    }
+    try std.testing.expect(try planMentions(allocator, db, "SELECT o.oid FROM t LEFT JOIN o ON t.id = o.tid AND t.qty < o.amount", "ON residual"));
+    try helpers.expectRunError(allocator, db, "SELECT COUNT(*) FROM t JOIN o ON t.id = x.tid", error.SqlOnRefsUnknownTable);
+    try helpers.expectRunError(allocator, db, "SELECT COUNT(*) FROM t JOIN o ON t.id < x.tid", error.SqlOnRefsUnknownTable);
 }

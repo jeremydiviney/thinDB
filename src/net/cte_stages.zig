@@ -1842,7 +1842,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             errdefer right.deinit();
             markJoinBuildContiguous(input, j.join_type, left, right);
             const t_join = exec.prof.nowTicks();
-            const jq = try left.join(right, joinSpecOf(j, input.force_ordered));
+            const jq = try left.join(right, joinSpecOf(j, input));
             exec.prof.addPhase("compile.op.join", @intCast(exec.prof.nowTicks() - t_join));
             // Window-chain pairing: register the compiled hash join so a
             // downstream window can VERIFY (at pairing time) that this
@@ -2339,7 +2339,7 @@ fn rideSource(map: *StageMap, op: *const ir.Op, keys: ?ir.WindowSpec) ?RideSrc {
                 // opaque / empty-on shapes route to other algorithms with no
                 // order guarantee; only clean equi left joins walk through.
                 if (j.join_type != .left) return null;
-                if (j.on.len == 0 or j.ranges.len != 0) return null;
+                if (j.on.len == 0 or j.ranges.len != 0 or j.residual != null) return null;
                 if (j.algorithm != .auto and j.algorithm != .hash) return null;
                 // A/B + safety hatch: rides never cross joins when set.
                 if (getenv("THINDB_NO_JOIN_RIDE") != null) return null;
@@ -2525,19 +2525,20 @@ fn markJoinBuildContiguous(input: engine_v2.CompileInput, join_type: exec.JoinTy
     stage.fill_dop = @max(stage.fill_dop, input.effectiveDop());
 }
 
-fn joinSpecOf(j: anytype, force_ordered: bool) ir.JoinSpec {
+fn joinSpecOf(j: anytype, input: engine_v2.CompileInput) ir.JoinSpec {
     return .{
         .join_type = j.join_type,
         .algorithm = j.algorithm,
         .on = j.on,
         .ranges = j.ranges,
+        .residual = if (j.residual) |res| .{ .derived = res.derived, .predicate = res.predicate, .udf_registry = input.udf_registry } else null,
         .extra_predicate = j.extra_predicate,
         .skew_ratio_threshold = j.skew_ratio_threshold,
         .skew_absolute_threshold = j.skew_absolute_threshold,
         .skew_sample_interval = j.skew_sample_interval,
         // Inside a force_ordered chain (a downstream window/TVF rides the
         // source order) a left join must emit its left side in input order.
-        .preserve_left_order = force_ordered and j.join_type == .left,
+        .preserve_left_order = input.force_ordered and j.join_type == .left,
     };
 }
 
@@ -2777,7 +2778,7 @@ const JoinTree = struct {
             right = try engine_v2.computeDerivedFused(allocator, right, key_copies.items, input.udf_registry);
         }
 
-        var spec = joinSpecOf(j, input.force_ordered);
+        var spec = joinSpecOf(j, input);
         if (keys.items.len > 0) spec.on = try std.mem.concat(input.node_arena, ir.JoinKeyPair, &.{ j.on, keys.items });
         markJoinBuildContiguous(input, j.join_type, left, right);
         var joined = try left.join(right, spec);

@@ -39,6 +39,7 @@ const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 const cast = @import("cast.zig");
 const Compute = @import("compute.zig").Compute;
+const udf_mod = @import("../udf.zig");
 const scalar_fn = @import("scalar_fn.zig");
 const decimal = @import("scalar_fn_decimal.zig");
 
@@ -136,6 +137,16 @@ pub const RangePredicate = struct {
     right: []const u8,
 };
 
+/// An ON condition beyond the keys and ranges, over the output schema (left
+/// columns + kept right columns). It decides which candidate pairs match:
+/// an outer join null-extends a preserved row none of whose pairs pass.
+pub const Residual = struct {
+    /// The expression operands `predicate` reads, computed per pair.
+    derived: []const exec.Derived,
+    predicate: predicate.PredicateExpr,
+    udf_registry: ?*const udf_mod.UdfRegistry = null,
+};
+
 pub const Spec = struct {
     join_type: JoinType = .inner,
     on: []const KeyPair,
@@ -160,6 +171,9 @@ pub const Spec = struct {
     /// When `on` is empty AND `ranges` is non-empty, the planner
     /// picks the nested-loop algorithm (no equi prefix to exploit).
     ranges: []const RangePredicate = &.{},
+    /// ON residual. Routes the join to the nested-loop algorithm, which
+    /// evaluates it over batches of candidate pairs.
+    residual: ?Residual = null,
     /// Skew detection for hash joins. When BOTH conditions hold at end
     /// of build phase, the join transparently re-routes to sort-merge:
     ///   ratio:    top_freq / observed_total >= skew_ratio_threshold
@@ -494,7 +508,7 @@ const output_batch_rows: usize = 1024;
 /// Sentinel in FastTable.heads / .next chains and in build_rows_scratch
 /// (where it marks a preserved-side probe miss row). Never a valid build
 /// row index — build sides are capped well below u32 max.
-const FAST_EMPTY = std.math.maxInt(u32);
+pub const FAST_EMPTY = std.math.maxInt(u32);
 
 const FastKeyKind = enum { int, string, compound };
 
@@ -1299,7 +1313,7 @@ pub const Join = struct {
         // .auto picks range_sweep for the specialized pure-single-
         // range shape; nested_loop for empty `on`; the equi-driven
         // algorithms via chooseAlgorithm.
-        const chosen_stats: Algorithm = if (spec.opaque_predicate != null)
+        const chosen_stats: Algorithm = if (spec.opaque_predicate != null or spec.residual != null)
             .nested_loop
         else if (spec.algorithm == .auto)
             (if (canUseRangeSweep(spec)) .range_sweep else if (spec.on.len == 0) .nested_loop else chooseAlgorithm(left_in, right_in, spec.on))
@@ -1310,7 +1324,7 @@ pub const Join = struct {
         // key order; the rider only walks left equi-joins, so the pin
         // never conflicts with NLJ/range-sweep-only shapes).
         const chosen: Algorithm = if (spec.preserve_left_order and spec.join_type == .left and
-            spec.on.len > 0 and spec.opaque_predicate == null)
+            spec.on.len > 0 and spec.opaque_predicate == null and spec.residual == null)
             .hash
         else
             chosen_stats;
@@ -1340,6 +1354,7 @@ pub const Join = struct {
                 .algorithm = .nested_loop,
                 .extra_predicate = spec.extra_predicate,
                 .ranges = spec.ranges,
+                .residual = spec.residual,
                 .opaque_predicate = spec.opaque_predicate,
                 .left_key_tail = spec.left_key_tail,
             };
@@ -2827,7 +2842,7 @@ pub const Join = struct {
     /// Gather build-side rows into `out`, splitting `rows` into runs of
     /// real indices (bulk appendByIndices) and FAST_EMPTY miss runs
     /// (per-row NULL). Inner joins have no miss runs — one bulk call.
-    fn gatherBuildColumn(alloc: Allocator, view: ColumnView, rows: []const u32, out: *ColumnStore) !void {
+    pub fn gatherBuildColumn(alloc: Allocator, view: ColumnView, rows: []const u32, out: *ColumnStore) !void {
         var start: usize = 0;
         while (start < rows.len) {
             var end = start;
@@ -3247,7 +3262,7 @@ fn isStringTag(t: TypeTag) bool {
 }
 
 /// True if any key column has a NULL value at row `i`.
-fn anyKeyNull(batch: Batch, key_indices: []const usize, i: u32) bool {
+pub fn anyKeyNull(batch: Batch, key_indices: []const usize, i: u32) bool {
     for (key_indices) |idx| {
         if (!batch.values[idx].isValid(i)) return true;
     }
@@ -3256,7 +3271,7 @@ fn anyKeyNull(batch: Batch, key_indices: []const usize, i: u32) bool {
 
 /// Build a compound key for hashing/comparison. Mirrors the layout
 /// used by Aggregate's groupBy key builder.
-fn buildCompoundKey(
+pub fn buildCompoundKey(
     allocator: Allocator,
     out: *std.ArrayList(u8),
     batch: Batch,

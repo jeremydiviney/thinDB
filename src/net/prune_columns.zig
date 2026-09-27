@@ -470,6 +470,10 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
             }
             var ok = true;
             if (j.extra_predicate) |p| ok = collectPredicate(ctx.arena, p, &child);
+            if (j.residual) |res| {
+                for (res.derived) |d| ok = ok and collectExpr(ctx.arena, d.expr, &child);
+                ok = ok and collectPredicate(ctx.arena, res.predicate, &child);
+            }
             if (!ok) ctx.null_reason = "join-pred";
             if (!ok and trace()) std.debug.print("[prune] bail join: opaque extra predicate\n", .{});
             walk(ctx, j.left, if (ok) &child else null);

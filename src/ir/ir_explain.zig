@@ -171,6 +171,11 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
                 try explainPredicate(allocator, out, pred);
                 try out.append(allocator, ')');
             }
+            if (j.residual) |res| {
+                try out.appendSlice(allocator, " residual=(");
+                try explainPredicate(allocator, out, res.predicate);
+                try out.append(allocator, ')');
+            }
             try out.append(allocator, '\n');
             try explainOp(allocator, out, j.left.*, depth + 1);
             try explainOp(allocator, out, j.right.*, depth + 1);
