@@ -130,6 +130,7 @@ pub fn resolveWithRegistry(
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
+    if (try resolveOrderKey(aa, name, arg_types)) |ov| return ov;
 
     // Fast path: exact TypeTag match. No allocation, no cost calc.
     for (builtins) |f| {
@@ -478,6 +479,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
+    if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
     for (builtins) |f| if (std.ascii.eqlIgnoreCase(f.name, name)) return true;
@@ -567,6 +569,24 @@ fn resolveTextKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
     if (arg_types.len != 1 or !arg_types[0].isString()) return null;
     const target = textKeyTarget(name[TEXT_KEY_PREFIX.len..]) orelse return null;
     return try buildDecFn(aa, name, arg_types, target, dec.textKeyKernel, .kernel_managed);
+}
+
+/// Internal: a byte string per row that, compared as bytes, sorts like its
+/// arguments ascending with NULLs first (`string.orderKeyKernel`). The DESC
+/// twin sorts them descending with NULLs last. GROUP_CONCAT's ORDER BY packs
+/// its keys into one of these.
+pub const ORDER_KEY_FN = "__order_key";
+pub const ORDER_KEY_DESC_FN = "__order_key_desc";
+
+fn resolveOrderKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (arg_types.len == 0) return null;
+    const kernel: TypedKernel = if (std.mem.eql(u8, name, ORDER_KEY_FN))
+        string.orderKeyKernel
+    else if (std.mem.eql(u8, name, ORDER_KEY_DESC_FN))
+        string.orderKeyDescKernel
+    else
+        return null;
+    return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
 }
 
 fn textKeyTarget(spec: []const u8) ?Type {

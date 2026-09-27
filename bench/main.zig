@@ -704,7 +704,7 @@ fn benchGroupConcat(allocator: Allocator, io: Io, n_rows: usize) !void {
     const t0 = Io.Clock.awake.now(io);
     var base = try thindb.scan(allocator, t);
     var q = try base.groupBy(&.{"tag"}, &.{
-        .{ .func = .group_concat, .col = "tag", .as = "ts", .params = .{ .separator = "," } },
+        .{ .func = .group_concat, .col = "tag", .as = "ts", .params = .{ .concat = .{ .separator = "," } } },
     });
     defer q.deinit();
     var total_bytes: usize = 0;

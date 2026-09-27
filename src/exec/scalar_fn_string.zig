@@ -49,6 +49,78 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
     }
 }
 
+pub fn orderKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    try appendOrderKeys(allocator, args, out, row_count, false);
+}
+
+pub fn orderKeyDescKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    try appendOrderKeys(allocator, args, out, row_count, true);
+}
+
+/// Inverting every byte of an ascending key reverses its byte order, and
+/// moves the NULL marker from first to last.
+fn appendOrderKeys(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, descending: bool) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(allocator);
+    for (0..row_count) |row| {
+        key.clearRetainingCapacity();
+        for (args) |arg| try appendOrderKeyPart(allocator, &key, arg, row);
+        if (descending) for (key.items) |*b| {
+            b.* = ~b.*;
+        };
+        try ss.appendValue(allocator, key.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: ColumnView, row: usize) Allocator.Error!void {
+    if (!arg.isValid(row)) return key.append(allocator, 0);
+    try key.append(allocator, 1);
+    switch (arg.data) {
+        // A zero byte escapes to 0x00 0xFF and 0x00 0x00 ends the text, so a
+        // prefix sorts before every longer text, and the next key starts clean.
+        .varchar, .string, .char, .json => |sv| {
+            var rest = sv.rowBytes(row);
+            while (std.mem.indexOfScalar(u8, rest, 0)) |zero| {
+                try key.appendSlice(allocator, rest[0 .. zero + 1]);
+                try key.append(allocator, 0xFF);
+                rest = rest[zero + 1 ..];
+            }
+            try key.appendSlice(allocator, rest);
+            try key.appendSlice(allocator, &.{ 0, 0 });
+        },
+        inline .float, .double => |s| {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
+            const sign: Bits = @as(Bits, 1) << (@bitSizeOf(Bits) - 1);
+            // -0.0 sorts as 0.0. Negative values invert entirely so a larger
+            // magnitude sorts lower; positive ones only set the sign bit.
+            const bits: Bits = @bitCast(if (s[row] == 0) 0 else s[row]);
+            try appendBigEndian(allocator, key, if (bits & sign != 0) ~bits else bits | sign);
+        },
+        .boolean => |s| try key.append(allocator, @intFromBool(s[row] != 0)),
+        .uuid => |s| try appendBigEndian(allocator, key, s[row]),
+        // Dates, datetimes and decimals are signed integers too: with the sign
+        // bit flipped, big-endian bytes sort like the values.
+        inline .int, .bigint, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |s| {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
+            const bits: Bits = @bitCast(s[row]);
+            try appendBigEndian(allocator, key, bits ^ (@as(Bits, 1) << (@bitSizeOf(Bits) - 1)));
+        },
+    }
+}
+
+fn appendBigEndian(allocator: Allocator, key: *std.ArrayList(u8), bits: anytype) Allocator.Error!void {
+    var bytes: [@sizeOf(@TypeOf(bits))]u8 = undefined;
+    std.mem.writeInt(@TypeOf(bits), &bytes, bits, .big);
+    try key.appendSlice(allocator, &bytes);
+}
+
 pub fn stringIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     const ss = stringStoreOf(out);
@@ -666,10 +738,9 @@ pub fn concatWsKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
     }
 }
 
-/// `__row_key(a, b, ...)`: one byte string per row, equal for two rows
-/// exactly when every argument is, and NULL when any argument is. A column's
-/// type is fixed, so fixed-width values keep their bytes and only text needs a
-/// length prefix to stay unambiguous.
+/// `__row_key(a, b, ...)`: the ascending order key of the arguments, which
+/// is equal for two rows exactly when every argument is, and NULL when any
+/// argument is.
 pub fn rowKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
     _ = arg_types;
     _ = out_type;
@@ -681,28 +752,10 @@ pub fn rowKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Typ
         key.clearRetainingCapacity();
         const complete = for (args) |arg| {
             if (!arg.isValid(row)) break false;
-            try appendRowKeyPart(allocator, &key, arg, row);
+            try appendOrderKeyPart(allocator, &key, arg, row);
         } else true;
         try ss.appendValue(allocator, if (complete) key.items else "");
         try out.appendValidBit(allocator, base + row, complete);
-    }
-}
-
-fn appendRowKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: ColumnView, row: usize) Allocator.Error!void {
-    switch (arg.data) {
-        .varchar, .string, .char, .json => |sv| {
-            const bytes = sv.rowBytes(row);
-            const len: u64 = bytes.len;
-            try key.appendSlice(allocator, std.mem.asBytes(&len));
-            try key.appendSlice(allocator, bytes);
-        },
-        // -0.0 equals 0.0 but has other bytes.
-        inline .float, .double => |s| {
-            const v = if (s[row] == 0) 0 else s[row];
-            try key.appendSlice(allocator, std.mem.asBytes(&v));
-        },
-        .boolean => |s| try key.append(allocator, @intFromBool(s[row] != 0)),
-        inline else => |s| try key.appendSlice(allocator, std.mem.asBytes(&s[row])),
     }
 }
 

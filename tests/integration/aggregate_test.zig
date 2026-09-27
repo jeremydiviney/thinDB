@@ -179,12 +179,81 @@ test "aggregate: group_concat with separator preserves insertion order" {
 
     var base = try thindb.scan(allocator, t);
     var q = try base.aggregate(&.{
-        .{ .func = .group_concat, .col = "g", .as = "joined", .params = .{ .separator = ", " } },
+        .{ .func = .group_concat, .col = "g", .as = "joined", .params = .{ .concat = .{ .separator = ", " } } },
     });
     defer q.deinit();
     const b = (try q.next()).?;
     const sv = b.values[0].data.string;
     try std.testing.expectEqualStrings("alpha, beta, gamma", sv.rowBytes(0));
+}
+
+test "aggregate: GROUP_CONCAT takes any value type, ORDER BY, DISTINCT and SEPARATOR" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE gct (id BIGINT PRIMARY KEY, g VARCHAR(4), n INT, s VARCHAR(8), d DOUBLE, m DECIMAL(6,2), dt DATE)");
+    try helpers.exec(allocator, db, "INSERT INTO gct VALUES " ++
+        "(1, 'p', 10, 'b', 1.5, 2.50, '2024-01-02'), (2, 'p', 9, 'a', NULL, 1.00, '2023-05-06'), " ++
+        "(3, 'p', NULL, 'b', 2.0, NULL, NULL), (4, 'q', 9, NULL, -0.5, 3.25, '2024-01-02'), " ++
+        "(5, 'q', 100, 'c', 1e20, 0.00, '2020-02-29'), (6, 'q', 9, 'c', 3.0, 3.25, NULL)");
+
+    // Expected values match MySQL 8.4, except where a NULL order key sorts:
+    // MySQL's GROUP_CONCAT sorts it as a zero value, thinDB first ascending
+    // and last descending, as its ORDER BY does.
+    const cases = .{
+        .{ "SELECT GROUP_CONCAT(n ORDER BY id) FROM gct", &[_]?[]const u8{"10,9,9,100,9"} },
+        .{ "SELECT GROUP_CONCAT(n ORDER BY n) FROM gct", &[_]?[]const u8{"9,9,9,10,100"} },
+        .{ "SELECT GROUP_CONCAT(n ORDER BY n DESC) FROM gct", &[_]?[]const u8{"100,10,9,9,9"} },
+        .{ "SELECT GROUP_CONCAT(id ORDER BY n, id DESC) FROM gct", &[_]?[]const u8{"3,6,4,2,1,5"} },
+        .{ "SELECT GROUP_CONCAT(id ORDER BY n DESC, id) FROM gct", &[_]?[]const u8{"5,1,2,4,6,3"} },
+        .{ "SELECT GROUP_CONCAT(id ORDER BY d) FROM gct", &[_]?[]const u8{"2,4,1,3,6,5"} },
+        .{ "SELECT GROUP_CONCAT(s ORDER BY s DESC, id) FROM gct", &[_]?[]const u8{"c,c,b,b,a"} },
+        .{ "SELECT GROUP_CONCAT(id ORDER BY m DESC, id) FROM gct", &[_]?[]const u8{"4,6,1,2,5,3"} },
+        .{ "SELECT GROUP_CONCAT(id ORDER BY -n, id) FROM gct", &[_]?[]const u8{"3,5,1,2,4,6"} },
+        .{ "SELECT GROUP_CONCAT(id ORDER BY CONCAT(s, IF(id = 1, 'a', '')) DESC, id) FROM gct", &[_]?[]const u8{"5,6,1,3,2,4"} },
+        .{ "SELECT GROUP_CONCAT(DISTINCT n) FROM gct", &[_]?[]const u8{"9,10,100"} },
+        .{ "SELECT GROUP_CONCAT(DISTINCT n ORDER BY n DESC SEPARATOR '|') FROM gct", &[_]?[]const u8{"100|10|9"} },
+        .{ "SELECT GROUP_CONCAT(DISTINCT s) FROM gct", &[_]?[]const u8{"a,b,c"} },
+        .{ "SELECT GROUP_CONCAT(DISTINCT s ORDER BY id DESC) FROM gct", &[_]?[]const u8{"c,a,b"} },
+        .{ "SELECT GROUP_CONCAT(DISTINCT id % 2 ORDER BY id DESC) FROM gct", &[_]?[]const u8{"0,1"} },
+        .{ "SELECT GROUP_CONCAT(d ORDER BY id) FROM gct WHERE id <> 5", &[_]?[]const u8{"1.5,2,-0.5,3"} },
+        .{ "SELECT GROUP_CONCAT(m ORDER BY id) FROM gct", &[_]?[]const u8{"2.50,1.00,3.25,0.00,3.25"} },
+        .{ "SELECT GROUP_CONCAT(dt ORDER BY dt) FROM gct", &[_]?[]const u8{"2020-02-29,2023-05-06,2024-01-02,2024-01-02"} },
+        .{ "SELECT GROUP_CONCAT(n + 1 ORDER BY id SEPARATOR '') FROM gct", &[_]?[]const u8{"11101010110"} },
+        .{ "SELECT GROUP_CONCAT(n SEPARATOR ',') FROM gct WHERE id > 100", &[_]?[]const u8{null} },
+        .{ "SELECT STRING_AGG(s, '-' ORDER BY id DESC) FROM gct", &[_]?[]const u8{"c-c-b-a-b"} },
+        .{ "SELECT GROUP_CONCAT(s, n ORDER BY id) FROM gct GROUP BY g ORDER BY g", &[_]?[]const u8{ "b10,a9", "c100,c9" } },
+        .{ "SELECT GROUP_CONCAT(s, '-', n ORDER BY id SEPARATOR '; ') FROM gct GROUP BY g ORDER BY g", &[_]?[]const u8{ "b-10; a-9", "c-100; c-9" } },
+        .{ "SELECT GROUP_CONCAT(DISTINCT n ORDER BY n) FROM gct GROUP BY g ORDER BY g", &[_]?[]const u8{ "9,10", "9,100" } },
+        .{ "SELECT GROUP_CONCAT(n) FROM gct GROUP BY g HAVING GROUP_CONCAT(DISTINCT n) = '9,100'", &[_]?[]const u8{"9,100,9"} },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) {
+            const t = try db.openTable("gct", .{});
+            try t.flush();
+        }
+        inline for (cases) |c| {
+            const got = try helpers.collectStrings(allocator, db, c[0]);
+            defer helpers.freeStrings(allocator, got);
+            expectStringsEqual(c[1], got) catch |err| {
+                std.debug.print("query: {s}\n", .{c[0]});
+                return err;
+            };
+        }
+    }
+    try helpers.expectRunError(allocator, db, "SELECT GROUP_CONCAT(*) FROM gct", error.SqlInvalidProjection);
+    try helpers.expectRunError(allocator, db, "SELECT GROUP_CONCAT(n SEPARATOR 1) FROM gct", error.SqlExpectedToken);
+    try helpers.expectRunError(allocator, db, "SELECT COUNT(n ORDER BY n) FROM gct", error.SqlExpectedToken);
+}
+
+fn expectStringsEqual(want: []const ?[]const u8, got: []const ?[]u8) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        if (w) |ws| try std.testing.expectEqualStrings(ws, g orelse return error.TestExpectedEqual) else try std.testing.expect(g == null);
+    }
 }
 
 test "aggregate: grouped stddev_pop + count_distinct by tag" {

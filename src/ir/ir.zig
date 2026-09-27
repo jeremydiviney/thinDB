@@ -1576,10 +1576,10 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
                 std.mem.writeInt(u64, &b, bits, .little);
                 try out.appendSlice(allocator, &b);
             },
-            .separator => |sep| {
-                try out.append(allocator, 2);
-                try appendU32(allocator, out, @intCast(sep.len));
-                try out.appendSlice(allocator, sep);
+            .concat => |c| {
+                try out.append(allocator, if (c.distinct) 3 else 2);
+                try appendU32(allocator, out, @intCast(c.separator.len));
+                try out.appendSlice(allocator, c.separator);
             },
         }
     }
@@ -2054,9 +2054,9 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 const arg2_col: ?[]const u8 = if (has_arg2_col != 0) try readString(bytes, cursor) else null;
                 const as = try readString(bytes, cursor);
                 // AggParams tag: 0=none, 1=percentile (f64 payload),
-                // 2=separator (string payload). Older encoders omit
-                // it; we treat absence as .none for back-compat with
-                // pre-params IR.
+                // 2=concat separator (string payload), 3=the same, DISTINCT.
+                // Older encoders omit it; we treat absence as .none for
+                // back-compat with pre-params IR.
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const params_tag = bytes[cursor.*];
                 cursor.* += 1;
@@ -2068,7 +2068,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                         cursor.* += 8;
                         break :blk2 .{ .percentile = @as(f64, @bitCast(bits)) };
                     },
-                    2 => .{ .separator = try readString(bytes, cursor) },
+                    2, 3 => .{ .concat = .{ .separator = try readString(bytes, cursor), .distinct = params_tag == 3 } },
                     else => return Error.IrCorrupt,
                 };
                 a.* = .{ .func = func, .udf_name = udf_name, .udf_arg_cols = udf_arg_cols, .col = col, .arg2_col = arg2_col, .as = as, .params = params };
