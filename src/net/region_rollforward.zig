@@ -1153,9 +1153,9 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                         hu(h, 1);
                         hu(h, @bitCast(p));
                     },
-                    .separator => |s| {
-                        hu(h, 2);
-                        hstr(h, s);
+                    .concat => |c| {
+                        hu(h, if (c.distinct) 3 else 2);
+                        hstr(h, c.separator);
                     },
                 }
             }

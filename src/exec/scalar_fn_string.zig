@@ -13,6 +13,7 @@ const stringStoreOf = common.stringStoreOf;
 
 const store = @import("../engine/store.zig");
 const regex = @import("../util/regex.zig");
+const Type = @import("../types.zig").Type;
 
 // ---------------------------------------------------------------------------
 // Core string kernels (upper, lower, length, trims, reverse, concat,
@@ -46,6 +47,75 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
         const replaced = try re.replaceAllScratch(sv.rowBytes(i), replacement, &scratch);
         try store.StringStore.appendValue(stringStoreOf(out), allocator, replaced);
     }
+}
+
+pub fn orderKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    try appendOrderKeys(allocator, args, out, row_count, false);
+}
+
+pub fn orderKeyDescKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    try appendOrderKeys(allocator, args, out, row_count, true);
+}
+
+/// Inverting every byte of an ascending key reverses its byte order, and
+/// moves the NULL marker from first to last.
+fn appendOrderKeys(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, descending: bool) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(allocator);
+    for (0..row_count) |row| {
+        key.clearRetainingCapacity();
+        for (args) |arg| try appendOrderKeyPart(allocator, &key, arg, row);
+        if (descending) for (key.items) |*b| {
+            b.* = ~b.*;
+        };
+        try ss.appendValue(allocator, key.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: ColumnView, row: usize) Allocator.Error!void {
+    if (!arg.isValid(row)) return key.append(allocator, 0);
+    try key.append(allocator, 1);
+    switch (arg.data) {
+        // A zero byte escapes to 0x00 0xFF and 0x00 0x00 ends the text, so a
+        // prefix sorts before every longer text, and the next key starts clean.
+        .varchar, .string, .char, .json => |sv| {
+            for (sv.rowBytes(row)) |b| {
+                try key.append(allocator, b);
+                if (b == 0) try key.append(allocator, 0xFF);
+            }
+            try key.appendSlice(allocator, &.{ 0, 0 });
+        },
+        inline .float, .double => |s| {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
+            const sign: Bits = @as(Bits, 1) << (@bitSizeOf(Bits) - 1);
+            // -0.0 sorts as 0.0. Negative values invert entirely so a larger
+            // magnitude sorts lower; positive ones only set the sign bit.
+            const bits: Bits = @bitCast(if (s[row] == 0) 0 else s[row]);
+            try appendBigEndian(allocator, key, if (bits & sign != 0) ~bits else bits | sign);
+        },
+        .boolean => |s| try key.append(allocator, @intFromBool(s[row] != 0)),
+        .uuid => |s| try appendBigEndian(allocator, key, s[row]),
+        // Dates, datetimes and decimals are signed integers too: with the sign
+        // bit flipped, big-endian bytes sort like the values.
+        inline .int, .bigint, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |s| {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
+            const bits: Bits = @bitCast(s[row]);
+            try appendBigEndian(allocator, key, bits ^ (@as(Bits, 1) << (@bitSizeOf(Bits) - 1)));
+        },
+    }
+}
+
+fn appendBigEndian(allocator: Allocator, key: *std.ArrayList(u8), bits: anytype) Allocator.Error!void {
+    var bytes: [@sizeOf(@TypeOf(bits))]u8 = undefined;
+    std.mem.writeInt(@TypeOf(bits), &bytes, bits, .big);
+    try key.appendSlice(allocator, &bytes);
 }
 
 pub fn stringIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

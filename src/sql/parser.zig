@@ -347,7 +347,6 @@ const ParsedAgg = struct {
     arg_expr: ?ir.Expr = null,
     arg2_col: ?[]const u8 = null,
     arg2_expr: ?ir.Expr = null,
-    separator: ?[]const u8 = null,
     params: ir.AggParams = .none,
 };
 
@@ -1626,7 +1625,7 @@ pub const Parser = struct {
             // decide between aggregate / scalar / window based on what
             // follows.
             var saw_distinct = false;
-            const args = try self.parseCallArgList(&saw_distinct);
+            const args = try self.parseCallArgList(first, &saw_distinct);
             // Optional [IGNORE | RESPECT] NULLS between `)` and `OVER`.
             const ignore_nulls = try parse_window.parseIgnoreNulls(self);
 
@@ -1704,16 +1703,7 @@ pub const Parser = struct {
                     const alias = try self.maybeAlias(default_name);
                     return ProjItem{ .name = alias, .kind = .{ .expr = expr } };
                 }
-                if (saw_distinct) {
-                    const distinct_func: ir.AggFunc = switch (func) {
-                        .count => .count_distinct,
-                        .sum => .sum_distinct,
-                        .avg => .avg_distinct,
-                        else => return ParseError.SqlInvalidProjection,
-                    };
-                    return try self.aggCallFromArgs(first, distinct_func, args);
-                }
-                return try self.aggCallFromArgs(first, func, args);
+                return try self.aggCallFromArgs(first, func, args, saw_distinct);
             }
 
             // DISTINCT is only valid inside an aggregate; a scalar/window
@@ -1813,7 +1803,7 @@ pub const Parser = struct {
         if (std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring")) return try self.parseSubstringCall(name);
         if (std.ascii.eqlIgnoreCase(name, "trim")) return try self.parseTrimCall();
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
-        const args = try self.parseCallArgList(null);
+        const args = try self.parseCallArgList(name, null);
         return try self.makeScalarCallExpr(name, args);
     }
 
@@ -2156,14 +2146,15 @@ pub const Parser = struct {
     /// consumed and reported via `distinct_out` (for aggregate calls like
     /// `COUNT(DISTINCT col)`). Passing `null` for `distinct_out` rejects
     /// DISTINCT — it's only valid inside an aggregate.
-    pub fn parseCallArgList(self: *Parser, distinct_out: ?*bool) ParseError![]const ir.Expr {
+    pub fn parseCallArgList(self: *Parser, name: []const u8, distinct_out: ?*bool) ParseError![]const ir.Expr {
         try self.expect(.lparen);
+        var distinct = false;
         if (self.cur.tag == .kw_distinct) {
             try self.advance();
-            if (distinct_out) |p| p.* = true else return ParseError.SqlInvalidProjection;
-        } else if (distinct_out) |p| {
-            p.* = false;
+            if (distinct_out == null) return ParseError.SqlInvalidProjection;
+            distinct = true;
         }
+        if (distinct_out) |p| p.* = distinct;
         var args: std.ArrayList(ir.Expr) = .empty;
         if (self.cur.tag == .star) {
             try self.advance();
@@ -2176,8 +2167,65 @@ pub const Parser = struct {
                 try self.advance();
             }
         }
+        if (self.aggregateFuncForName(name) == .group_concat) {
+            const canonical = try self.parseConcatCallTail(args.items, distinct);
+            try self.expect(.rparen);
+            return canonical;
+        }
         try self.expect(.rparen);
         return try args.toOwnedSlice(self.arena);
+    }
+
+    /// The rest of a `GROUP_CONCAT([DISTINCT] v [, v ...] [ORDER BY k [ASC |
+    /// DESC], ...] [SEPARATOR 's'])` call, returned as its canonical
+    /// arguments `(value, separator [, order key])`. Several values
+    /// concatenate per row. A second argument that is a text literal is the
+    /// separator (STRING_AGG, and StarRocks' legacy GROUP_CONCAT). DISTINCT
+    /// without ORDER BY orders by the values, as MySQL does. The ORDER BY keys
+    /// pack into one key that compares as bytes.
+    fn parseConcatCallTail(self: *Parser, values: []const ir.Expr, distinct: bool) ParseError![]const ir.Expr {
+        if (values.len == 0) return ParseError.SqlInvalidProjection;
+        for (values) |v| if (v == .col_ref and std.mem.eql(u8, v.col_ref, "*")) return ParseError.SqlInvalidProjection;
+        var keys: std.ArrayList(ir.Expr) = .empty;
+        if (self.cur.tag == .kw_order) {
+            try self.advance();
+            try self.expect(.kw_by);
+            while (true) {
+                var key = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
+                if (self.cur.tag == .kw_desc) {
+                    try self.advance();
+                    const desc_args = try self.arena.alloc(ir.Expr, 1);
+                    desc_args[0] = key;
+                    key = .{ .call = .{ .fn_name = scalar_fn.ORDER_KEY_DESC_FN, .args = desc_args } };
+                } else if (self.cur.tag == .kw_asc) {
+                    try self.advance();
+                }
+                try keys.append(self.arena, key);
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
+        var separator: ?[]const u8 = null;
+        if (self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "separator")) {
+            try self.advance();
+            if (self.cur.tag != .string) return ParseError.SqlExpectedToken;
+            separator = try self.arena.dupe(u8, self.cur.value.string);
+            try self.advance();
+        }
+        var concatenated = values;
+        if (separator == null and values.len == 2 and values[1] == .lit and values[1].lit == .text) {
+            separator = values[1].lit.text;
+            concatenated = values[0..1];
+        }
+        if (distinct and keys.items.len == 0) try keys.appendSlice(self.arena, concatenated);
+        const out = try self.arena.alloc(ir.Expr, if (keys.items.len > 0) 3 else 2);
+        out[0] = if (concatenated.len == 1)
+            concatenated[0]
+        else
+            .{ .call = .{ .fn_name = "concat", .args = try self.arena.dupe(ir.Expr, concatenated) } };
+        out[1] = .{ .lit = .{ .text = separator orelse "," } };
+        if (keys.items.len > 0) out[2] = .{ .call = .{ .fn_name = scalar_fn.ORDER_KEY_FN, .args = try keys.toOwnedSlice(self.arena) } };
+        return out;
     }
 
     fn appendAggInputs(
@@ -2222,13 +2270,7 @@ pub const Parser = struct {
             .col = agg_cols[agg_i.*],
             .arg2_col = agg_arg2_cols[agg_i.*],
             .as = out_name,
-            .params = if (a.func == .group_concat)
-                switch (a.params) {
-                    .separator => a.params,
-                    else => .{ .separator = a.separator orelse "," },
-                }
-            else
-                a.params,
+            .params = a.params,
         });
         agg_i.* += 1;
     }
@@ -2240,9 +2282,18 @@ pub const Parser = struct {
     fn parsedAggFromArgs(
         self: *Parser,
         func_name: []const u8,
-        func: ir.AggFunc,
+        plain_func: ir.AggFunc,
         args: []const ir.Expr,
+        distinct: bool,
     ) ParseError!ParsedAggCall {
+        const func: ir.AggFunc = if (distinct) switch (plain_func) {
+            .count => .count_distinct,
+            .sum => .sum_distinct,
+            .avg => .avg_distinct,
+            .group_concat => .group_concat,
+            else => return ParseError.SqlInvalidProjection,
+        } else plain_func;
+        if (func == .group_concat) return try self.concatAggFromArgs(func_name, args, distinct);
         if (func == .udf) {
             if (args.len == 0) return ParseError.SqlInvalidProjection;
             const arg_cols = try self.arena.alloc([]const u8, args.len);
@@ -2275,9 +2326,8 @@ pub const Parser = struct {
             } };
         }
 
-        // GROUP_CONCAT / STRING_AGG take an optional second positional arg:
-        // the delimiter string literal. PERCENTILE_CONT(x, p) stores p as
-        // an aggregate param; MEDIAN(x) is percentile_cont(x, 0.5).
+        // PERCENTILE_CONT(x, p) stores p as an aggregate param; MEDIAN(x) is
+        // percentile_cont(x, 0.5).
         if (func == .max_by) {
             if (args.len != 2) return ParseError.SqlInvalidProjection;
             var value_col: ?[]const u8 = null;
@@ -2308,20 +2358,9 @@ pub const Parser = struct {
             } };
         }
 
-        var separator: ?[]const u8 = null;
         var params: ir.AggParams = .none;
         var value_args = args;
-        if (func == .group_concat and args.len == 2) {
-            separator = switch (args[1]) {
-                .lit => |v| switch (v) {
-                    .text => |s| try self.arena.dupe(u8, s),
-                    else => return ParseError.SqlInvalidProjection,
-                },
-                else => return ParseError.SqlInvalidProjection,
-            };
-            params = .{ .separator = separator.? };
-            value_args = args[0..1];
-        } else if (func == .percentile) {
+        if (func == .percentile) {
             if (std.ascii.eqlIgnoreCase(func_name, "median")) {
                 if (args.len != 1) return ParseError.SqlInvalidProjection;
                 params = .{ .percentile = 0.5 };
@@ -2377,8 +2416,32 @@ pub const Parser = struct {
             .udf_name = if (func == .udf) try self.arena.dupe(u8, func_name) else null,
             .col = arg_col,
             .arg_expr = arg_expr,
-            .separator = separator,
             .params = params,
+        } };
+    }
+
+    /// GROUP_CONCAT from its canonical `(value, separator [, order key])`
+    /// arguments (`parseConcatCallTail`). The value concatenates as text,
+    /// spelled as CAST(value AS CHAR) spells it.
+    fn concatAggFromArgs(self: *Parser, func_name: []const u8, args: []const ir.Expr, distinct: bool) ParseError!ParsedAggCall {
+        if (args.len < 2 or args.len > 3) return ParseError.SqlInvalidProjection;
+        const separator = switch (args[1]) {
+            .lit => |v| switch (v) {
+                .text => |s| s,
+                else => return ParseError.SqlInvalidProjection,
+            },
+            else => return ParseError.SqlInvalidProjection,
+        };
+        const arg_name = switch (args[0]) {
+            .col_ref => |c| c,
+            else => "expr",
+        };
+        return .{ .default_name = try std.fmt.allocPrint(self.arena, "{s}({s})", .{ func_name, arg_name }), .agg = .{
+            .func = .group_concat,
+            .col = null,
+            .arg_expr = try scalar_fn.toString(self.arena, args[0]),
+            .arg2_expr = if (args.len == 3) args[2] else null,
+            .params = .{ .concat = .{ .separator = separator, .distinct = distinct } },
         } };
     }
 
@@ -2387,8 +2450,9 @@ pub const Parser = struct {
         func_name: []const u8,
         func: ir.AggFunc,
         args: []const ir.Expr,
+        distinct: bool,
     ) ParseError!ProjItem {
-        const parsed = try self.parsedAggFromArgs(func_name, func, args);
+        const parsed = try self.parsedAggFromArgs(func_name, func, args, distinct);
         const alias = try self.maybeAlias(parsed.default_name);
         return ProjItem{ .name = alias, .kind = .{ .agg = parsed.agg } };
     }
@@ -2405,13 +2469,7 @@ pub const Parser = struct {
         saw_distinct: bool,
     ) ParseError![]const u8 {
         if (!self.aggregate_expr_refs_enabled) return ParseError.SqlInvalidProjection;
-        const actual_func: ir.AggFunc = if (saw_distinct) switch (func) {
-            .count => .count_distinct,
-            .sum => .sum_distinct,
-            .avg => .avg_distinct,
-            else => return ParseError.SqlInvalidProjection,
-        } else func;
-        const parsed = try self.parsedAggFromArgs(func_name, actual_func, args);
+        const parsed = try self.parsedAggFromArgs(func_name, func, args, saw_distinct);
         const name = std.fmt.allocPrint(self.arena, "__agg_expr_{d}", .{self.aggregate_expr_counter}) catch return ParseError.OutOfMemory;
         self.aggregate_expr_counter += 1;
         try self.aggregate_expr_refs.append(self.arena, .{ .name = name, .agg = parsed.agg });
@@ -2689,7 +2747,7 @@ pub const Parser = struct {
                 if (self.cur.tag == .lparen) {
                     if (self.scalarCallHasOwnSyntax(name)) return try self.parseScalarCallAfterName(name);
                     var saw_distinct = false;
-                    const nested_args = try self.parseCallArgList(&saw_distinct);
+                    const nested_args = try self.parseCallArgList(name, &saw_distinct);
                     const ignore_nulls = try parse_window.parseIgnoreNulls(self);
                     if (self.cur.tag == .kw_over) {
                         if (saw_distinct) return ParseError.SqlInvalidProjection;
@@ -4633,7 +4691,7 @@ pub const Parser = struct {
         if (self.cur.tag == .dot) return try self.dupQualifiedColRef(first);
         if (self.cur.tag != .lparen) return try self.arena.dupe(u8, renamedColumnSource(proj, first) orelse first);
         var distinct = false;
-        const args = try self.parseCallArgList(&distinct);
+        const args = try self.parseCallArgList(first, &distinct);
         // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
         // to the aggregate's canonical output column name (the
         // sort runs after the aggregate). Aliased aggregates are

@@ -1531,6 +1531,11 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 next_numeric_state_index += slot_width;
             },
             .group_concat => {
+                const params = switch (agg.params) {
+                    .concat => |c| c,
+                    else => return traceDecline(request, "group_concat params"),
+                };
+                if (agg.arg2_col != null or params.distinct) return traceDecline(request, "ordered or distinct group_concat");
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
                 const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
                 if (!isStringKeyType(input_type)) return traceDecline(request, "group_concat input type");
@@ -1549,10 +1554,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     .input_nullable = input_nullable,
                     .is_concat = true,
                     .concat_state_index = next_concat_state_index,
-                    .separator = switch (agg.params) {
-                        .separator => |s| s,
-                        else => ",",
-                    },
+                    .separator = params.separator,
                 };
                 next_string_state_index += 1;
                 next_concat_state_index += 1;

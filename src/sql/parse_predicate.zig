@@ -252,7 +252,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             return try parseExprOps(p, try p.parseScalarCallAfterName(col_dup));
         }
         var saw_distinct = false;
-        const args = try p.parseCallArgList(&saw_distinct);
+        const args = try p.parseCallArgList(col_dup, &saw_distinct);
         // Window call in a predicate position — only where the projection's
         // hoisting channels are live (CASE WHEN conditions inside the select
         // list); WHERE/HAVING contexts keep rejecting OVER. Checked before

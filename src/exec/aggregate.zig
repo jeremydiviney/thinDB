@@ -108,8 +108,9 @@ pub const AggFunc = enum {
     /// Exact continuous percentile. params.percentile in [0, 1].
     /// O(N) memory; sorts at finalize. Output double.
     percentile,
-    /// Concatenate string values with a separator. params.separator
-    /// is prepended before every value after the first. Output string.
+    /// Concatenate string values, `params.concat.separator` between them.
+    /// `arg2_col`, when set, is a per-row key the values sort by, compared
+    /// as bytes (ORDER BY). Output string.
     group_concat,
     /// User-defined aggregate. `AggSpec.udf_name` carries the registry name.
     udf,
@@ -134,7 +135,13 @@ fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
 pub const AggParams = union(enum) {
     none,
     percentile: f64,
+    concat: ConcatParams,
+};
+
+pub const ConcatParams = struct {
     separator: []const u8,
+    /// Each distinct value once, ordered by the first row it came from (MySQL).
+    distinct: bool = false,
 };
 
 pub const AggSpec = struct {
@@ -146,7 +153,7 @@ pub const AggSpec = struct {
     udf_arg_cols: []const []const u8 = &.{},
     /// Column to aggregate. `null` is only valid for `COUNT(*)`.
     col: ?[]const u8 = null,
-    /// Secondary key column for MAX_BY(value, key).
+    /// Secondary key column: MAX_BY(value, key)'s key, GROUP_CONCAT's order key.
     arg2_col: ?[]const u8 = null,
     /// Output column name.
     as: []const u8,
@@ -708,6 +715,31 @@ const WelfordAcc = struct {
 const ConcatAcc = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     nonempty: bool = false,
+    /// An ordered or DISTINCT GROUP_CONCAT keeps its values apart until
+    /// finalize: each entry's value bytes, then its order key, sit in `buf`.
+    entries: std.ArrayListUnmanaged(ConcatEntry) = .empty,
+};
+
+const ConcatEntry = struct {
+    start: usize,
+    value_len: u32,
+    key_len: u32,
+
+    fn value(e: ConcatEntry, buf: []const u8) []const u8 {
+        return buf[e.start..][0..e.value_len];
+    }
+
+    fn key(e: ConcatEntry, buf: []const u8) []const u8 {
+        return buf[e.start + e.value_len ..][0..e.key_len];
+    }
+
+    fn valueLess(buf: []const u8, a: ConcatEntry, b: ConcatEntry) bool {
+        return std.mem.order(u8, a.value(buf), b.value(buf)) == .lt;
+    }
+
+    fn keyLess(buf: []const u8, a: ConcatEntry, b: ConcatEntry) bool {
+        return std.mem.order(u8, a.key(buf), b.key(buf)) == .lt;
+    }
 };
 
 /// Batched COUNT(DISTINCT <int col>) state for one aggregate under a GROUP BY.
@@ -3222,8 +3254,9 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
         .group_concat => {
             const t = in orelse return Error.AggregateColumnRequired;
             if (!t.isString()) return Error.AggregateUnsupportedType;
+            if (arg2_in) |k| if (!k.isString()) return Error.AggregateUnsupportedType;
             switch (params) {
-                .separator => {},
+                .concat => {},
                 else => return Error.AggregateInvalidParam,
             }
         },
@@ -3637,11 +3670,15 @@ pub fn updateState(
             try percentileUpdate(aa, s, batch.values[col_idx.?], row_start, row_end);
         },
         .group_concat => {
-            const sep = switch (spec.params) {
-                .separator => |sv| sv,
+            const params = switch (spec.params) {
+                .concat => |c| c,
                 else => return Error.AggregateInvalidParam,
             };
-            try groupConcatUpdate(aa, s, batch.values[col_idx.?], row_start, row_end, sep);
+            const order_key: ?ColumnView = if (spec.arg2_col) |key_name|
+                batch.values[types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound]
+            else
+                null;
+            try groupConcatUpdate(aa, s, batch.values[col_idx.?], order_key, row_start, row_end, params);
         },
         .udf => return Error.AggregateUnsupportedType,
     }
@@ -3814,27 +3851,48 @@ fn percentileUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u3
 
 /// GROUP_CONCAT: append separator + value bytes for each non-null row.
 /// `nonempty` distinguishes "no values yet" from "first value was empty".
-fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32, sep: []const u8) !void {
+fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, order_key: ?ColumnView, row_start: u32, row_end: u32, params: ConcatParams) !void {
+    const collect = order_key != null or params.distinct;
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!view.isValid(r)) continue;
-        const bytes = switch (view.data) {
-            .string => |sv| sv.rowBytes(r),
-            .varchar => |sv| sv.rowBytes(r),
-            .char => |sv| sv.rowBytes(r),
-            .json => |sv| sv.rowBytes(r),
-            else => unreachable,
-        };
+        const bytes = stringRowBytes(view, r);
         const c = s.concat orelse blk: {
             const box = try aa.create(ConcatAcc);
             box.* = .{};
             s.concat = box;
             break :blk box;
         };
-        if (c.nonempty) try c.buf.appendSlice(aa, sep);
-        try c.buf.appendSlice(aa, bytes);
-        c.nonempty = true;
+        if (collect) {
+            const key = if (order_key) |k| stringRowBytes(k, r) else "";
+            try c.entries.append(aa, .{ .start = c.buf.items.len, .value_len = @intCast(bytes.len), .key_len = @intCast(key.len) });
+            try c.buf.appendSlice(aa, bytes);
+            try c.buf.appendSlice(aa, key);
+            c.nonempty = true;
+        } else {
+            if (c.nonempty) try c.buf.appendSlice(aa, params.separator);
+            try c.buf.appendSlice(aa, bytes);
+            c.nonempty = true;
+        }
     }
+}
+
+/// Sort and dedupe a collected GROUP_CONCAT in place. Both sorts are stable,
+/// so DISTINCT keeps each value's first row, and equal keys keep row order.
+/// Running it again changes nothing.
+fn orderConcatEntries(c: *ConcatAcc, distinct: bool) void {
+    const buf = c.buf.items;
+    if (distinct) {
+        std.mem.sort(ConcatEntry, c.entries.items, buf, ConcatEntry.valueLess);
+        var kept: usize = 0;
+        for (c.entries.items) |e| {
+            if (kept > 0 and std.mem.eql(u8, c.entries.items[kept - 1].value(buf), e.value(buf))) continue;
+            c.entries.items[kept] = e;
+            kept += 1;
+        }
+        c.entries.shrinkRetainingCapacity(kept);
+    }
+    std.mem.sort(ConcatEntry, c.entries.items, buf, ConcatEntry.keyLess);
 }
 
 /// Bytes of a string-family value at `row`. Caller must ensure the view
@@ -4131,7 +4189,19 @@ pub fn appendAccToColumn(
         },
         .group_concat => {
             if (state.concat) |c| {
-                try col.data.string.appendValue(allocator, c.buf.items);
+                if (c.entries.items.len == 0) {
+                    try col.data.string.appendValue(allocator, c.buf.items);
+                } else {
+                    const params = spec.params.concat;
+                    orderConcatEntries(c, params.distinct);
+                    var joined: std.ArrayList(u8) = .empty;
+                    defer joined.deinit(allocator);
+                    for (c.entries.items, 0..) |e, i| {
+                        if (i > 0) try joined.appendSlice(allocator, params.separator);
+                        try joined.appendSlice(allocator, e.value(c.buf.items));
+                    }
+                    try col.data.string.appendValue(allocator, joined.items);
+                }
             } else {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
