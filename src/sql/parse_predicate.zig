@@ -898,28 +898,13 @@ fn makeDayComparison(p: anytype, col: []const u8) @TypeOf(p.*).Err!PredicateExpr
     };
 }
 
-/// Parse an `identifier (. identifier)?` column reference at the
-/// current position. The two-segment form is preserved as the dotted
-/// string `qualifier.col` so a downstream lookup against a scan
-/// renamed via `FROM t AS alias` finds the right column. The plain
-/// form is preserved verbatim. Caller has already verified the
+/// The column reference at the cursor, as `col` or `table.col`
+/// (`Parser.dupQualifiedColRef`). Caller has already verified the
 /// current token is `.identifier`.
 pub fn parseQualifiedColRef(p: anytype) @TypeOf(p.*).Err![]const u8 {
-    const PE = @TypeOf(p.*).Err;
     const first = p.cur.text;
     try p.advance();
-    if (p.cur.tag != .dot) {
-        return try p.arena.dupe(u8, first);
-    }
-    try p.advance();
-    if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
-    const second = p.cur.text;
-    try p.advance();
-    const buf = try p.arena.alloc(u8, first.len + 1 + second.len);
-    @memcpy(buf[0..first.len], first);
-    buf[first.len] = '.';
-    @memcpy(buf[first.len + 1 ..], second);
-    return buf;
+    return try p.dupQualifiedColRef(first);
 }
 
 fn isTypedLiteralKeyword(s: []const u8) bool {
