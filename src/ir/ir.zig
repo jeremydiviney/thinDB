@@ -689,6 +689,9 @@ pub const DmlTarget = struct {
 pub const Assignment = struct {
     col: []const u8,
     value: Expr,
+    /// The qualifier of the table a multi-table UPDATE (`UpdateOp.source`)
+    /// assigns `col` of; null leaves it to the one target holding `col`.
+    target: ?[]const u8 = null,
 };
 
 /// `UPDATE t SET col = expr [, ...] [WHERE ...]` — modeled as
@@ -703,7 +706,8 @@ pub const UpdateOp = struct {
     /// Same as `DeleteOp.derived`.
     derived: []const Derived = &.{},
     /// As `DeleteOp.source`, followed by one column per assignment value;
-    /// the target is whichever of `targets` holds the assigned columns.
+    /// each assignment writes the target it names, or the one holding its
+    /// column.
     source: ?*Op = null,
     targets: []const DmlTarget = &.{},
 };

@@ -130,6 +130,9 @@ pub const TokenTag = enum {
     /// carries the name without the `@` prefix. Resolved to a literal
     /// by the pre-compile pass using the active Session.vars.
     at_identifier,
+    /// MySQL system variable: `@@name`, `@@session.name`. The `text` field
+    /// carries the name without the `@@` prefix, scope included.
+    system_variable,
 
     // Operators / punctuation.
     eq, // =
@@ -813,14 +816,16 @@ pub const Lexer = struct {
 
     fn lexAtVar(self: *Lexer) LexError!Token {
         self.pos += 1; // consume '@'
+        const system = self.pos < self.src.len and self.src[self.pos] == '@';
+        if (system) self.pos += 1;
         const name_start = self.pos;
         while (self.pos < self.src.len) : (self.pos += 1) {
             const c = self.src[self.pos];
-            if (!(std.ascii.isAlphanumeric(c) or c == '_')) break;
+            if (!(std.ascii.isAlphanumeric(c) or c == '_' or (system and c == '.'))) break;
         }
         const name = self.src[name_start..self.pos];
         if (name.len == 0) return LexError.LexUnexpectedChar;
-        return Token{ .tag = .at_identifier, .text = name };
+        return Token{ .tag = if (system) .system_variable else .at_identifier, .text = name };
     }
 
     /// `"..."`. On MySQL this is a string literal, backslash escapes and all,
@@ -1005,6 +1010,30 @@ fn keywordFor(s: []const u8) ?TokenTag {
         if (std.ascii.eqlIgnoreCase(s, kw.name)) return kw.tag;
     }
     return null;
+}
+
+/// Whether `src` holds more than one statement: a `;` outside strings,
+/// quoted names and comments with another token after it. Text that fails
+/// to lex counts as one statement, left for the parser to reject.
+pub fn isMultiStatement(arena: Allocator, src: []const u8, dialect: types.Dialect) Allocator.Error!bool {
+    var lex = Lexer.init(arena, src);
+    lex.dialect = dialect;
+    var statement_seen = false;
+    var separated = false;
+    while (true) {
+        const tok = lex.next() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+        switch (tok.tag) {
+            .eof => return false,
+            .semicolon => separated = statement_seen,
+            else => {
+                if (separated) return true;
+                statement_seen = true;
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1484,39 @@ test "lexer: hex literals are byte strings on MySQL and neutral" {
     var pg = Lexer.init(arena.allocator(), "X'41'");
     pg.dialect = .postgres;
     try std.testing.expectEqual(@as(TokenTag, .identifier), (try pg.next()).tag);
+}
+
+test "lexer: isMultiStatement counts statements, not semicolons" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "SELECT 1", false },
+        .{ "SELECT 1;", false },
+        .{ ";; SELECT 1 ;; -- done\n", false },
+        .{ "SELECT ';' AS s; /* ; */", false },
+        .{ "SELECT \"a;b\", `c;d`", false },
+        .{ "SELECT 'unterminated; SELECT 2", false },
+        .{ "SELECT 1;SELECT 2", true },
+        .{ "SET NAMES utf8mb4; INSERT INTO t VALUES (1)", true },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectEqual(c[1], try isMultiStatement(arena.allocator(), c[0], .mysql));
+    }
+}
+
+test "lexer: @@ names a system variable, scope included" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "@@session.sql_mode @@autocommit @v");
+    const scoped = try lx.next();
+    try std.testing.expectEqual(TokenTag.system_variable, scoped.tag);
+    try std.testing.expectEqualStrings("session.sql_mode", scoped.text);
+    const bare = try lx.next();
+    try std.testing.expectEqual(TokenTag.system_variable, bare.tag);
+    try std.testing.expectEqualStrings("autocommit", bare.text);
+    const user = try lx.next();
+    try std.testing.expectEqual(TokenTag.at_identifier, user.tag);
+    try std.testing.expectEqualStrings("v", user.text);
 }
 
 test "lexer: bit-value literals are integers" {

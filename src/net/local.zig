@@ -1093,6 +1093,9 @@ pub const CompileCtx = struct {
     /// Wire layers (MySQL OK_Packet, PG CommandComplete) read this after
     /// running the CompiledQuery. Zero for ops that don't mutate data.
     affected_rows: u64 = 0,
+    /// The first AUTO_INCREMENT id this statement's INSERT generated, which
+    /// becomes the session's LAST_INSERT_ID(); null when it generated none.
+    last_insert_id: ?u64 = null,
     /// Query-scoped memory accountant. Lazily created (via
     /// `queryAccountant`) the first time a Scan is compiled, then
     /// injected into every Scan / materialized buffer / subquery drain so
@@ -1288,6 +1291,11 @@ pub const CompiledQuery = struct {
     /// today; DELETE eventually). Zero for SELECT and metadata-only DDL.
     pub fn affectedRows(self: *const CompiledQuery) u64 {
         return self.ctx.affected_rows;
+    }
+
+    /// The first AUTO_INCREMENT id the statement generated, if any.
+    pub fn lastInsertId(self: *const CompiledQuery) ?u64 {
+        return self.ctx.last_insert_id;
     }
 };
 
@@ -2854,16 +2862,18 @@ fn isOrderKeyColumn(t: *const ApiTable, ci: usize) bool {
     return false;
 }
 
-/// Which of an UPDATE's candidate targets it writes: the only one, or the
-/// only one holding every assigned column.
-fn updateTargetIndex(tables: []const *ApiTable, assignments: []const ir.Assignment) !usize {
-    if (tables.len == 1) return 0;
+/// Which of an UPDATE's candidate targets an assignment writes: the one its
+/// qualifier names, or else the one table holding its column.
+fn assignmentTarget(targets: []const ir.DmlTarget, tables: []const *ApiTable, a: ir.Assignment) !usize {
+    if (a.target) |q| {
+        for (targets, 0..) |target, k| {
+            if (types.columnNameEql(target.qualifier, q)) return k;
+        }
+        return Error.TableNotFound;
+    }
     var found: ?usize = null;
     for (tables, 0..) |t, k| {
-        const holds_all = for (assignments) |a| {
-            if (t.schema.columnIndex(a.col) == null) break false;
-        } else true;
-        if (!holds_all) continue;
+        if (t.schema.columnIndex(a.col) == null) continue;
         if (found != null) return Error.BadRequest;
         found = k;
     }
@@ -2872,8 +2882,8 @@ fn updateTargetIndex(tables: []const *ApiTable, assignments: []const ir.Assignme
 
 /// UPDATE in a form a filtered scan can't express (ORDER BY / LIMIT, a
 /// join, an alias). The SELECT yields each candidate target's columns,
-/// then one column per assignment value; the chosen target's rows, with
-/// the assigned columns replaced, are written back over their keys.
+/// then one column per assignment value; each table an assignment writes
+/// takes its rows, with the assigned columns replaced, back over their keys.
 fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -2881,43 +2891,78 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const aa = arena.allocator();
 
     const tables = try aa.alloc(*ApiTable, u.targets.len);
-    for (u.targets, tables) |target, *t| t.* = try resolveTable(catalog, ctx.session.*, target.table);
-    const k = try updateTargetIndex(tables, u.assignments);
-    const t = tables[k];
-    // Only a key identifies the row a SELECT returned.
-    if (!t.schema.unique) return Error.UnsupportedOp;
-
-    var offset: usize = 0;
+    const offsets = try aa.alloc(usize, u.targets.len);
     var star_width: usize = 0;
-    for (tables, 0..) |x, i| {
-        if (i < k) offset += x.schema.columns.len;
-        star_width += x.schema.columns.len;
+    for (u.targets, tables, offsets) |target, *t, *offset| {
+        t.* = try resolveTable(catalog, ctx.session.*, target.table);
+        offset.* = star_width;
+        star_width += t.*.schema.columns.len;
     }
-    const table_to_source = try aa.alloc(?usize, t.schema.columns.len);
-    for (table_to_source, 0..) |*s, j| s.* = offset + j;
+
+    // Each written table's columns: its own source column, or an assignment's.
+    const table_to_source = try aa.alloc(?[]?usize, tables.len);
+    @memset(table_to_source, null);
     for (u.assignments, 0..) |a, i| {
+        const k = try assignmentTarget(u.targets, tables, a);
+        const t = tables[k];
+        // Only a key identifies the row a SELECT returned.
+        if (!t.schema.unique) return Error.UnsupportedOp;
         const ci = t.schema.columnIndex(a.col) orelse return Error.ColumnNotFound;
         // The key finds the row; moving it is not an update.
         if (isOrderKeyColumn(t, ci)) return Error.UnsupportedOp;
-        table_to_source[ci] = star_width + i;
+        const map = table_to_source[k] orelse blk: {
+            const own = try aa.alloc(?usize, t.schema.columns.len);
+            for (own, 0..) |*s, j| s.* = offsets[k] + j;
+            table_to_source[k] = own;
+            break :blk own;
+        };
+        map[ci] = star_width + i;
     }
 
     var source = try compileSubplan(ctx, u.source.?);
     defer source.deinit();
     if (source.outputSchema().len != star_width + u.assignments.len) return Error.BadRequest;
-    const plan = try InsertColumnPlan.init(ctx, aa, t, &source, table_to_source, 0);
+    const plans = try aa.alloc(?InsertColumnPlan, tables.len);
+    for (tables, table_to_source, plans, 0..) |t, maybe_map, *plan, k| {
+        const map = maybe_map orelse {
+            plan.* = null;
+            continue;
+        };
+        plan.* = try InsertColumnPlan.init(ctx, aa, t, &source, map, k);
+    }
     const out_schema = try aa.dupe(types.Column, source.outputSchema());
     var staged = try stageDmlSource(ctx, aa, &source);
     defer staged.deinit();
     const row_count: usize = @intCast(staged.row_count);
     if (row_count == 0) return try EmptyOp.createWithCount(ctx.allocator, 0);
+    const values = try stagedViews(aa, &staged);
 
+    var affected: usize = 0;
+    for (tables, plans) |t, maybe_plan| {
+        const plan = maybe_plan orelse continue;
+        affected += try writeUpdatedRows(ctx, aa, t, plan, out_schema, values, row_count);
+    }
+    ctx.affected_rows = @intCast(affected);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
+}
+
+/// Write `t`'s rows of an UPDATE's staged SELECT back over their keys,
+/// returning how many rows that updated: a row a join matched more than
+/// once is updated once.
+fn writeUpdatedRows(
+    ctx: *CompileCtx,
+    aa: Allocator,
+    t: *ApiTable,
+    plan: InsertColumnPlan,
+    out_schema: []const types.Column,
+    values: []const storage.ColumnView,
+    row_count: usize,
+) !usize {
     const batch_schema = try aa.alloc(types.Column, t.schema.columns.len);
     const views = try aa.alloc(storage.ColumnView, t.schema.columns.len);
-    try plan.fill(ctx, t, out_schema, try stagedViews(aa, &staged), row_count, batch_schema, views);
+    try plan.fill(ctx, t, out_schema, values, row_count, batch_schema, views);
     defer plan.release(ctx, views);
 
-    // A row a join matched more than once is updated once.
     var keys: std.StringHashMapUnmanaged(void) = .empty;
     var key_buf: std.ArrayList(u8) = .empty;
     for (0..row_count) |r| {
@@ -2926,9 +2971,7 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
         try keys.put(aa, try aa.dupe(u8, key_buf.items), {});
     }
     try t.insertBatch(batch_schema, views, row_count);
-    const affected: usize = keys.count();
-    ctx.affected_rows = @intCast(affected);
-    return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
+    return keys.count();
 }
 
 /// DELETE in a form a filtered scan can't express (ORDER BY / LIMIT, an
@@ -3205,6 +3248,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
                     // Omitted or explicit NULL → take the next id.
                     const id = next_counter;
                     next_counter += 1;
+                    if (ctx.last_insert_id == null) ctx.last_insert_id = id;
                     break :blk integerLiteralForType(ai_col.type, id) catch return Error.TypeMismatch;
                 } else if (maybe_src) |src|
                     row[src]

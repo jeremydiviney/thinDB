@@ -273,6 +273,12 @@ pub fn textDouble(raw: []const u8) ?f64 {
     };
 }
 
+/// A double where MySQL reads it as an integer argument (`ELT(2.5e0, ...)`,
+/// `INET_NTOA(1.5e0)`): rounded half to even, as C's rint rounds it.
+pub fn roundHalfEven(x: f64) f64 {
+    return if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x);
+}
+
 /// Text as an integer, the way StarRocks casts it to one: surrounding
 /// spaces ignored, an optional sign, then digits only. A fraction, an
 /// exponent or a value past i128 is not an integer.

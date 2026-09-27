@@ -12,7 +12,6 @@ const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 const Type = @import("../types.zig").Type;
 
-const store = @import("../engine/store.zig");
 const regex = @import("../util/regex.zig");
 
 // ---------------------------------------------------------------------------
@@ -21,31 +20,115 @@ const regex = @import("../util/regex.zig");
 // and char_length aliases — same kernel, different name in builtins[].
 // ---------------------------------------------------------------------------
 
-/// REGEXP_REPLACE(haystack, pattern, replacement). Pattern + replacement
-/// are read from row 0 and the regex compiled once per batch — i.e. they
-/// must be constant across the batch (the usual case: SQL literals). The
-/// replacement may use `\N` capture backrefs. Backed by the linear-time
-/// engine in util/regex.zig; unsupported regex features (lookaround,
-/// in-pattern backrefs) or malformed patterns surface as
-/// RegexInvalidPattern.
+/// REGEXP_REPLACE(haystack, pattern, replacement[, pos[, occurrence[,
+/// match_type]]]): the matches from character `pos` on, or only the
+/// `occurrence`-th of them when it's positive, replaced. The pattern,
+/// replacement and match type are read from row 0 and the regex compiled
+/// once per batch — i.e. they must be constant across the batch (the usual
+/// case: SQL literals). The replacement may use `\N` capture backrefs.
+/// Backed by the linear-time engine in util/regex.zig; unsupported regex
+/// features (lookaround, in-pattern backrefs) or malformed patterns
+/// surface as RegexInvalidPattern.
 pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
-    const pattern = stringViewOf(args[1]).rowBytes(0);
+    const base = out.data.rowCount();
+    var call = try RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null) orelse
+        return appendNullStrings(allocator, out, row_count);
+    defer call.deinit(allocator);
     const replacement = stringViewOf(args[2]).rowBytes(0);
-    var re = try regex.Regex.compile(allocator, pattern);
-    defer re.deinit();
     const sv = stringViewOf(args[0]);
-    // Matcher scratch reused across every row: the visited array, thread
-    // lists, capture arena, and slot buffers all persist between rows, so
-    // applying one pattern to a whole batch allocates ~nothing per row.
-    var scratch = regex.Scratch.init(allocator);
-    defer scratch.deinit();
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
+    for (0..row_count) |i| {
+        if (!allValid(args, i)) {
+            try stringStoreOf(out).appendValue(allocator, "");
+            try out.appendValidBit(allocator, base + i, false);
+            continue;
+        }
+        const s = sv.rowBytes(i);
+        const start = if (args.len > 3) try regexStart(s, args[3].data.bigint[i], 1) else 0;
+        // Occurrence 0 replaces every match; MySQL reads a negative one as 1.
+        const occurrence: usize = if (args.len > 4) switch (args[4].data.bigint[i]) {
+            std.math.minInt(i64)...-1 => 1,
+            else => |n| @intCast(n),
+        } else 0;
         // `replaced` is borrowed from the scratch's reused output buffer;
         // appendValue copies it into the column store, so no free per row.
-        const replaced = try re.replaceAllScratch(sv.rowBytes(i), replacement, &scratch);
-        try store.StringStore.appendValue(stringStoreOf(out), allocator, replaced);
+        const replaced = try call.re.replaceScratch(s, replacement, &call.scratch, start, occurrence);
+        try stringStoreOf(out).appendValue(allocator, replaced);
+        try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
+/// The compiled pattern of a REGEXP_* call and the matcher state its rows
+/// share: the visited array, thread lists, capture arena, and slot buffers
+/// all persist between rows, so applying one pattern to a whole batch
+/// allocates ~nothing per row. The pattern and match type come from row 0.
+const RegexCall = struct {
+    re: regex.Regex,
+    scratch: regex.Scratch,
+    slots: []?usize,
+
+    /// Null when the pattern or match type is NULL, which makes every row
+    /// NULL.
+    fn init(allocator: Allocator, pattern: ColumnView, match_type: ?ColumnView) !?RegexCall {
+        if (!pattern.isValid(0)) return null;
+        var options: regex.Options = .{};
+        if (match_type) |m| {
+            if (!m.isValid(0)) return null;
+            options = try regexMatchOptions(stringViewOf(m).rowBytes(0));
+        }
+        var re = try regex.Regex.compileWith(allocator, stringViewOf(pattern).rowBytes(0), options);
+        errdefer re.deinit();
+        const slots = try allocator.alloc(?usize, re.n_slots);
+        return .{ .re = re, .scratch = regex.Scratch.init(allocator), .slots = slots };
+    }
+
+    fn deinit(self: *RegexCall, allocator: Allocator) void {
+        allocator.free(self.slots);
+        self.scratch.deinit();
+        self.re.deinit();
+    }
+
+    /// Byte bounds of the `occurrence`-th match at or after byte `start`.
+    fn nth(self: *RegexCall, s: []const u8, start: usize, occurrence: usize) !?[2]usize {
+        @memset(self.slots, null);
+        if (!try self.re.findNth(&self.scratch, s, start, occurrence, self.slots)) return null;
+        return .{ self.slots[0].?, self.slots[1].? };
+    }
+};
+
+/// MySQL's match_type letters: c case-sensitive, i case-insensitive (the
+/// later of the two wins), n `.` matches line ends too, m and u multi-line
+/// and Unix line ends. `^` and `$` match at line ends here whatever the
+/// match type, so m and u change nothing.
+fn regexMatchOptions(match_type: []const u8) !regex.Options {
+    var options: regex.Options = .{};
+    for (match_type) |c| switch (c) {
+        'c' => options.case_insensitive = false,
+        'i' => options.case_insensitive = true,
+        'n' => options.dot_all = true,
+        'm', 'u' => {},
+        else => return error.RegexInvalidMatchType,
+    };
+    return options;
+}
+
+fn allValid(args: []const ColumnView, row: usize) bool {
+    for (args) |a| if (!a.isValid(row)) return false;
+    return true;
+}
+
+/// The byte offset of 1-based character position `pos` in `s`. MySQL
+/// accepts `past_end` positions after the last character.
+fn regexStart(s: []const u8, pos: i64, past_end: usize) !usize {
+    if (pos < 1 or @as(u64, @intCast(pos)) > charCount(s) + past_end) return error.RegexIndexOutOfBounds;
+    return charOffset(s, @intCast(pos - 1));
+}
+
+fn appendNullStrings(allocator: Allocator, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        try stringStoreOf(out).appendValue(allocator, "");
+        try out.appendValidBit(allocator, base + i, false);
     }
 }
 
@@ -853,59 +936,81 @@ pub fn splitPartKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     }
 }
 
+/// REGEXP_LIKE(s, pattern[, match_type]): whether `pattern` matches
+/// anywhere in `s`.
 pub fn regexpLikeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
-    const pattern = stringViewOf(args[1]).rowBytes(0);
-    var re = try regex.Regex.compile(allocator, pattern);
-    defer re.deinit();
-    var scratch = regex.Scratch.init(allocator);
-    defer scratch.deinit();
+    const base = out.data.rowCount();
+    var call = try RegexCall.init(allocator, args[1], if (args.len > 2) args[2] else null) orelse {
+        try out.data.boolean.appendNTimes(allocator, 0, row_count);
+        for (0..row_count) |i| try out.appendValidBit(allocator, base + i, false);
+        return;
+    };
+    defer call.deinit(allocator);
     const sv = stringViewOf(args[0]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const ok = try re.matchesWith(&scratch, sv.rowBytes(i), 0);
-        try out.data.boolean.append(allocator, if (ok) 1 else 0);
+    for (0..row_count) |i| {
+        const valid = allValid(args, i);
+        const ok = valid and try call.re.matchesWith(&call.scratch, sv.rowBytes(i), 0);
+        try out.data.boolean.append(allocator, @intFromBool(ok));
+        try out.appendValidBit(allocator, base + i, valid);
     }
 }
 
+/// REGEXP_INSTR(s, pattern[, pos[, occurrence[, return_option[,
+/// match_type]]]]): the character position where the `occurrence`-th match
+/// from character `pos` on starts, or just past its end when
+/// `return_option` is 1; 0 when there's no such match.
+pub fn regexpInstrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const base = out.data.rowCount();
+    var call = try RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null) orelse {
+        try out.data.bigint.appendNTimes(allocator, 0, row_count);
+        for (0..row_count) |i| try out.appendValidBit(allocator, base + i, false);
+        return;
+    };
+    defer call.deinit(allocator);
+    const sv = stringViewOf(args[0]);
+    for (0..row_count) |i| {
+        const valid = allValid(args, i);
+        try out.data.bigint.append(allocator, if (valid) try regexpInstrRow(&call, args, sv.rowBytes(i), i) else 0);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+fn regexpInstrRow(call: *RegexCall, args: []const ColumnView, s: []const u8, row: usize) !i64 {
+    const return_end = if (args.len > 4) switch (args[4].data.bigint[row]) {
+        0 => false,
+        1 => true,
+        else => return error.RegexInvalidReturnOption,
+    } else false;
+    // MySQL skips the position check for an empty subject.
+    const start = if (args.len > 2 and s.len > 0) try regexStart(s, args[2].data.bigint[row], 0) else 0;
+    const occurrence: usize = if (args.len > 3) @intCast(@max(args[3].data.bigint[row], 1)) else 1;
+    const bounds = try call.nth(s, start, occurrence) orelse return 0;
+    const at = if (return_end) bounds[1] else bounds[0];
+    return @intCast(charCount(s[0..at]) + 1);
+}
+
+/// REGEXP_SUBSTR(s, pattern[, pos[, occurrence[, match_type]]]): the text of
+/// the `occurrence`-th match from character `pos` on; NULL when there's no
+/// such match.
 pub fn regexpSubstrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
     const ss = stringStoreOf(out);
     const base = out.data.rowCount();
-    if (row_count == 0) return;
-    if (!args[1].isValid(0)) {
-        var row: usize = 0;
-        while (row < row_count) : (row += 1) {
-            try ss.appendValue(allocator, "");
-            try out.appendValidBit(allocator, base + row, false);
-        }
-        return;
-    }
-    const pattern = stringViewOf(args[1]).rowBytes(0);
-    var re = try regex.Regex.compile(allocator, pattern);
-    defer re.deinit();
-    var scratch = regex.Scratch.init(allocator);
-    defer scratch.deinit();
-    const slots = try allocator.alloc(?usize, re.n_slots);
-    defer allocator.free(slots);
+    var call = try RegexCall.init(allocator, args[1], if (args.len > 4) args[4] else null) orelse
+        return appendNullStrings(allocator, out, row_count);
+    defer call.deinit(allocator);
     const sv = stringViewOf(args[0]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        if (!args[0].isValid(i)) {
-            try ss.appendValue(allocator, "");
-            try out.appendValidBit(allocator, base + i, false);
-            continue;
-        }
-        @memset(slots, null);
+    for (0..row_count) |i| {
         const src = sv.rowBytes(i);
-        if (try re.findWith(&scratch, src, 0, slots)) {
-            const lo = slots[0] orelse 0;
-            const hi = slots[1] orelse lo;
-            try ss.appendValue(allocator, src[lo..hi]);
-            try out.appendValidBit(allocator, base + i, true);
-        } else {
-            try ss.appendValue(allocator, "");
-            try out.appendValidBit(allocator, base + i, false);
-        }
+        const bounds: ?[2]usize = if (allValid(args, i)) blk: {
+            const start = if (args.len > 2) try regexStart(src, args[2].data.bigint[i], 1) else 0;
+            const occurrence: usize = if (args.len > 3) @intCast(@max(args[3].data.bigint[i], 1)) else 1;
+            break :blk try call.nth(src, start, occurrence);
+        } else null;
+        try ss.appendValue(allocator, if (bounds) |b| src[b[0]..b[1]] else "");
+        try out.appendValidBit(allocator, base + i, bounds != null);
     }
 }
 
@@ -1255,6 +1360,157 @@ pub fn chrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSto
             try ss.appendValue(allocator, &b);
         }
     }
+}
+
+/// ELT(n, s1, s2, ...): the n-th string. NULL when `n` is NULL or outside
+/// 1..count, or when the string it picks is NULL, as in MySQL.
+pub fn eltKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        const picked: ?ColumnView = if (eltIndex(args[0], i, args.len - 1)) |n| args[n] else null;
+        const valid = if (picked) |p| p.isValid(i) else false;
+        try ss.appendValue(allocator, if (valid) stringViewOf(picked.?).rowBytes(i) else "");
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+fn eltIndex(n_arg: ColumnView, row: usize, count: usize) ?usize {
+    if (!n_arg.isValid(row)) return null;
+    switch (n_arg.data) {
+        .bigint => |s| return if (s[row] >= 1 and s[row] <= count) @intCast(s[row]) else null,
+        .double => |s| {
+            const n = common.roundHalfEven(s[row]);
+            return if (n >= 1 and n <= @as(f64, @floatFromInt(count))) @intFromFloat(n) else null;
+        },
+        else => unreachable, // the overloads take a BIGINT or DOUBLE `n`
+    }
+}
+
+/// INSERT(s, pos, len, new): `s` with the `len` characters from `pos`
+/// replaced by `new`. A position outside `s` leaves it unchanged; a
+/// negative length, or one past the end, replaces the rest.
+pub fn insertKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const positions = args[1].data.int;
+    const lengths = args[2].data.int;
+    const new_sv = stringViewOf(args[3]);
+    const ss = stringStoreOf(out);
+    var spliced: std.ArrayList(u8) = .empty;
+    defer spliced.deinit(allocator);
+    for (0..row_count) |i| {
+        const s = sv.rowBytes(i);
+        const pos = positions[i];
+        if (pos < 1 or pos > charCount(s)) {
+            try ss.appendValue(allocator, s);
+            continue;
+        }
+        const start = charOffset(s, @intCast(pos - 1));
+        const end = if (lengths[i] < 0) s.len else start + charOffset(s[start..], @intCast(lengths[i]));
+        spliced.clearRetainingCapacity();
+        try spliced.appendSlice(allocator, s[0..start]);
+        try spliced.appendSlice(allocator, new_sv.rowBytes(i));
+        try spliced.appendSlice(allocator, s[end..]);
+        try ss.appendValue(allocator, spliced.items);
+    }
+}
+
+/// QUOTE(s): `s` as a single-quoted SQL literal, with backslash, quote,
+/// NUL and Ctrl-Z escaped; the word NULL, unquoted, for NULL.
+pub fn quoteKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var quoted: std.ArrayList(u8) = .empty;
+    defer quoted.deinit(allocator);
+    for (0..row_count) |i| {
+        if (!args[0].isValid(i)) {
+            try ss.appendValue(allocator, "NULL");
+            try out.appendValidBit(allocator, base + i, true);
+            continue;
+        }
+        quoted.clearRetainingCapacity();
+        try quoted.append(allocator, '\'');
+        for (sv.rowBytes(i)) |c| switch (c) {
+            '\\' => try quoted.appendSlice(allocator, "\\\\"),
+            '\'' => try quoted.appendSlice(allocator, "\\'"),
+            0 => try quoted.appendSlice(allocator, "\\0"),
+            0x1a => try quoted.appendSlice(allocator, "\\Z"),
+            else => try quoted.append(allocator, c),
+        };
+        try quoted.append(allocator, '\'');
+        try ss.appendValue(allocator, quoted.items);
+        try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
+/// SOUNDEX(s), MySQL's variant: the first letter, then the code of every
+/// later letter that differs from the last code written, padded with zeros
+/// to four characters but never cut short. Only ASCII letters have codes; a
+/// multi-byte character can be the first letter (copied as is) and is
+/// skipped anywhere else. Text with no letter gives ''.
+pub fn soundexKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    for (0..row_count) |i| {
+        code.clearRetainingCapacity();
+        try appendSoundex(allocator, &code, sv.rowBytes(i));
+        try ss.appendValue(allocator, code.items);
+    }
+}
+
+const SOUNDEX_CODES = "01230120022455012623010202";
+
+fn soundexCode(c: u8) u8 {
+    const upper = std.ascii.toUpper(c);
+    return if (upper >= 'A' and upper <= 'Z') SOUNDEX_CODES[upper - 'A'] else '0';
+}
+
+/// Byte length of the valid UTF-8 character starting `s`, or null.
+fn utf8CharLen(s: []const u8) ?usize {
+    const len = std.unicode.utf8ByteSequenceLength(s[0]) catch return null;
+    if (len > s.len) return null;
+    _ = std.unicode.utf8Decode(s[0..len]) catch return null;
+    return len;
+}
+
+fn appendSoundex(allocator: Allocator, code: *std.ArrayList(u8), s: []const u8) !void {
+    var i: usize = 0;
+    var last: u8 = '0';
+    while (i < s.len) {
+        if (s[i] >= 0x80) {
+            const len = utf8CharLen(s[i..]) orelse return;
+            try code.appendSlice(allocator, s[i .. i + len]);
+            i += len;
+            break;
+        }
+        const c = s[i];
+        i += 1;
+        if (std.ascii.isAlphabetic(c)) {
+            try code.append(allocator, std.ascii.toUpper(c));
+            last = soundexCode(c);
+            break;
+        }
+    } else return;
+    var chars: usize = 1;
+    while (i < s.len) {
+        if (s[i] >= 0x80) {
+            i += utf8CharLen(s[i..]) orelse break;
+            continue;
+        }
+        const c = s[i];
+        i += 1;
+        if (!std.ascii.isAlphabetic(c)) continue;
+        const digit = soundexCode(c);
+        if (digit != '0' and digit != last) {
+            try code.append(allocator, digit);
+            last = digit;
+            chars += 1;
+        }
+    }
+    while (chars < 4) : (chars += 1) try code.append(allocator, '0');
 }
 
 test "foldBytes vectorized case-fold matches scalar across boundaries and non-alpha" {
