@@ -947,10 +947,14 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             // (the compile path validates it once the schema is known).
             .kw_default => {
                 try p.advance();
-                if (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "current_timestamp", "now", "localtimestamp" })) {
+                if (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "current_timestamp", "now", "localtimestamp", "localtime" })) {
                     try p.advance();
                     if (p.cur.tag == .lparen) {
                         try p.advance();
+                        if (p.cur.tag == .integer) {
+                            if (p.cur.value.integer > 6) return PE.SqlExpectedValue;
+                            try p.advance();
+                        }
                         try p.expect(.rparen);
                     }
                     default_now = true;

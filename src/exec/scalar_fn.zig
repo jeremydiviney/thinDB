@@ -658,12 +658,12 @@ fn resolveToDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?
     return try buildDecFn(aa, name, arg_types, dec.decTypeFor(p, s), dec.toDecimalKernel, .kernel_managed);
 }
 
-fn scalarArityMatches(f: ScalarFn, actual: usize) bool {
+pub fn scalarArityMatches(f: ScalarFn, actual: usize) bool {
     if (f.variadic_min_args) |min_args| return actual >= min_args and f.arg_types.len > 0;
     return f.arg_types.len == actual;
 }
 
-fn scalarDeclaredTypeAt(f: ScalarFn, i: usize) Type {
+pub fn scalarDeclaredTypeAt(f: ScalarFn, i: usize) Type {
     return if (f.variadic_min_args != null) f.arg_types[i % f.arg_types.len] else f.arg_types[i];
 }
 
@@ -910,6 +910,18 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "least", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.leastStringKernel },
     .{ .name = "least", .arg_types = &.{ .date, .date }, .return_type = .date, .kernel = math.leastDateKernel },
     .{ .name = "least", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .kernel = math.leastDatetimeKernel },
+    .{ .name = "greatest", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 3, .kernel = math.greatestIntKernel },
+    .{ .name = "greatest", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 3, .kernel = math.greatestBigintKernel },
+    .{ .name = "greatest", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 3, .kernel = math.greatestDoubleKernel },
+    .{ .name = "greatest", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 3, .kernel = string.greatestStringKernel },
+    .{ .name = "greatest", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 3, .kernel = math.greatestDateKernel },
+    .{ .name = "greatest", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 3, .kernel = math.greatestDatetimeKernel },
+    .{ .name = "least", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 3, .kernel = math.leastIntKernel },
+    .{ .name = "least", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 3, .kernel = math.leastBigintKernel },
+    .{ .name = "least", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 3, .kernel = math.leastDoubleKernel },
+    .{ .name = "least", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 3, .kernel = string.leastStringKernel },
+    .{ .name = "least", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 3, .kernel = math.leastDateKernel },
+    .{ .name = "least", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 3, .kernel = math.leastDatetimeKernel },
     // --- math (expanded) ---
     .{ .name = "sin", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sinKernel },
     .{ .name = "cos", .arg_types = &.{.double}, .return_type = .double, .kernel = math.cosKernel },
@@ -977,6 +989,12 @@ pub const builtins = [_]ScalarFn{
     // when it lowers `date + INTERVAL '<N>' MONTH|YEAR`.
     .{ .name = "date_add_months", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddMonthsKernel },
     .{ .name = "date_add_years", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddYearsKernel },
+    .{ .name = "date_add", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeAddDaysKernel },
+    .{ .name = "date_sub", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeSubDaysKernel },
+    .{ .name = "date_add_months", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeAddMonthsKernel },
+    .{ .name = "date_add_years", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeAddYearsKernel },
+    .{ .name = "date_add_seconds", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .kernel = date.datetimeAddSecondsKernel },
+    .{ .name = "date_add_micros", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .kernel = date.datetimeAddMicrosKernel },
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = date.fromUnixtimeKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },

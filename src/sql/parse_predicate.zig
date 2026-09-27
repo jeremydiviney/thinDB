@@ -231,6 +231,9 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .kw_case or p.keywordCallAhead()) return try parseExprOps(p, try p.parseCallAtom());
     if (p.cur.tag != .identifier) return PE.SqlExpectedIdent;
     var col_dup = try parseQualifiedColRef(p);
+    if (p.cur.tag != .lparen) {
+        if (try p.bareTemporalCall(col_dup)) |call| return try parseExprOps(p, call);
+    }
 
     // JSON extraction on the LHS: `doc->'$.x' op rhs` / `doc->>'$.x' op rhs`.
     // Desugars to a json_extract/json_value call and routes through the

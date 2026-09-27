@@ -1,11 +1,9 @@
-//! INTERVAL '<integer>' (DAY | MONTH | YEAR) — calendar-aware date
+//! INTERVAL '<integer>' <unit> — calendar-aware date and datetime
 //! arithmetic. Lowered at parse time to `date_add`, `date_add_months`,
-//! or `date_add_years`. Month/year add clamps the day on short
-//! destination months: `2024-01-31 + 1 month → 2024-02-29`.
-//!
-//! v1 scope: INTERVAL appears as right operand of `+` or `-` on a date
-//! expression in projections. Use in WHERE-clause comparisons requires
-//! pre-computing the constant date manually for now.
+//! `date_add_years`, `date_add_seconds` or `date_add_micros`. Month/year
+//! add clamps the day on short destination months:
+//! `2024-01-31 + 1 month → 2024-02-29`. A DATE moved by a sub-day unit
+//! becomes a DATETIME, as in MySQL.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -122,6 +120,52 @@ test "INTERVAL: unknown unit rejected at parse time" {
     defer arena.deinit();
     const err = thindb.sql.parse(arena.allocator(), "SELECT d + INTERVAL '1' FORTNIGHT FROM t");
     try std.testing.expectError(thindb.sql.ParseError.SqlExpectedKeyword, err);
+}
+
+test "INTERVAL: DATETIME keeps its time of day, and hours, minutes and seconds move either type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE dt (id BIGINT PRIMARY KEY, ts DATETIME, d DATE)");
+    try exec(allocator, db, "INSERT INTO dt VALUES (1, '2024-01-31 10:30:00', '2024-01-31'), (2, '2024-02-29 23:59:59', '2024-02-29')");
+
+    const text_cases = .{
+        .{ "ts + INTERVAL 1 DAY", .{ "2024-02-01 10:30:00", "2024-03-01 23:59:59" } },
+        .{ "ts - INTERVAL 1 MONTH", .{ "2023-12-31 10:30:00", "2024-01-29 23:59:59" } },
+        .{ "DATE_ADD(ts, INTERVAL 1 MONTH)", .{ "2024-02-29 10:30:00", "2024-03-29 23:59:59" } },
+        .{ "ts + INTERVAL 1 YEAR", .{ "2025-01-31 10:30:00", "2025-02-28 23:59:59" } },
+        .{ "DATE_SUB(ts, 1)", .{ "2024-01-30 10:30:00", "2024-02-28 23:59:59" } },
+        .{ "ts + INTERVAL 2 HOUR", .{ "2024-01-31 12:30:00", "2024-03-01 01:59:59" } },
+        .{ "ts - INTERVAL 90 MINUTE", .{ "2024-01-31 09:00:00", "2024-02-29 22:29:59" } },
+        .{ "DATE_ADD(ts, INTERVAL 1 SECOND)", .{ "2024-01-31 10:30:01", "2024-03-01 00:00:00" } },
+        .{ "d + INTERVAL 30 MINUTE", .{ "2024-01-31 00:30:00", "2024-02-29 00:30:00" } },
+        .{ "d + INTERVAL 1 DAY", .{ "2024-02-01", "2024-03-01" } },
+        .{ "TIMESTAMPADD(HOUR, 1, d)", .{ "2024-01-31 01:00:00", "2024-02-29 01:00:00" } },
+        .{ "TIMESTAMPADD(MONTH, 1, d)", .{ "2024-02-29", "2024-03-29" } },
+    };
+    inline for (text_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM dt ORDER BY id");
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 2), got.len);
+        try std.testing.expectEqualStrings(c[1][0], got[0].?);
+        try std.testing.expectEqualStrings(c[1][1], got[1].?);
+    }
+
+    const filter_cases = .{
+        .{ "SELECT id FROM dt WHERE ts - INTERVAL 1 DAY < '2024-02-01 00:00:00' ORDER BY id", &[_]i64{1} },
+        .{ "SELECT id FROM dt WHERE NOW() > ts - INTERVAL 1 DAY ORDER BY id", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM dt WHERE DATE_ADD(ts, INTERVAL 1 HOUR) >= '2024-03-01' ORDER BY id", &[_]i64{2} },
+        .{ "SELECT id FROM dt WHERE ts + INTERVAL 1500 MICROSECOND > ts ORDER BY id", &[_]i64{ 1, 2 } },
+    };
+    inline for (filter_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
+    }
 }
 
 test "ADDDATE / SUBDATE are MySQL spellings of DATE_ADD / DATE_SUB" {
