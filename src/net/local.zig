@@ -2267,7 +2267,7 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const assigns_buf = try ctx.allocator.alloc(update_mod.Assignment, u.assignments.len);
     defer ctx.allocator.free(assigns_buf);
     for (u.assignments, assigns_buf) |src, *dst| {
-        dst.* = .{ .col = src.col, .value = src.value };
+        dst.* = .{ .col = src.col, .value = hexAssigned(t.schema, src.col, src.value) };
     }
 
     const affected = try t.updateStreaming(u.predicate, u.derived, assigns_buf);
@@ -3348,7 +3348,10 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
             return Error.ColumnNotFound;
         }
     }
-    for (op.rows) |row| {
+    var rows_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer rows_arena.deinit();
+    const rows = try hexResolvedRows(rows_arena.allocator(), op, tbl_schema);
+    for (rows) |row| {
         if (row.len != source_widths) return Error.BadRequest;
         for (schema_to_source, 0..) |maybe_src, si| {
             if (maybe_src) |src| {
@@ -3362,7 +3365,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         }
     }
 
-    const row_count = op.rows.len;
+    const row_count = rows.len;
     if (row_count == 0) {
         return try EmptyOp.createWithCount(ctx.allocator, 0);
     }
@@ -3389,7 +3392,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         const ai_src = schema_to_source[ai_idx];
 
         var next_counter = t.reserveAutoIncrement(@intCast(row_count));
-        for (op.rows) |row| {
+        for (rows) |row| {
             for (tbl_schema.columns, 0..) |col, si| {
                 const maybe_src = schema_to_source[si];
                 const cell: ?Value = if (si == ai_idx) blk: {
@@ -3422,7 +3425,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
             .resolve => |action| affected = duplicateAffectedRows(try t.insertBatchOnDuplicateLocked(builder.schemaSlice(), builder.views(), row_count, action)),
         }
     } else {
-        for (op.rows) |row| {
+        for (rows) |row| {
             for (tbl_schema.columns, 0..) |col, si| {
                 const maybe_src = schema_to_source[si];
                 // Resolution order for the cell:
@@ -3452,6 +3455,50 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
 
     ctx.affected_rows = @intCast(affected);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
+}
+
+/// An assignment's value as the column stores it: a hex literal bound for a
+/// numeric column is its integer (`SET n = 0x3132` stores 12594), as MySQL
+/// stores one.
+fn hexAssigned(schema: TableSchema, col: []const u8, value: ir.Expr) ir.Expr {
+    const bytes = exec.expr_mod.hexLiteralBytes(value) orelse return value;
+    const ci = schema.columnIndex(col) orelse return value;
+    if (!storesHexAsNumber(schema.columns[ci].type)) return value;
+    return .{ .lit = exec.expr_mod.hexLiteralNumber(bytes) };
+}
+
+fn storesHexAsNumber(ty: types.Type) bool {
+    return ty.isInteger() or ty.isFloat() or ty.isDecimal() or ty == .boolean;
+}
+
+/// The rows with each hex-literal cell bound for a numeric column holding the
+/// literal's integer (`0x3132` stores 12594 in an INT), as MySQL stores
+/// one; a text column keeps its bytes. `op.rows` itself when no cell is hex.
+fn hexResolvedRows(aa: Allocator, op: ir.InsertOp, schema: TableSchema) ![]const []const ?Value {
+    if (op.hex_cells.len == 0) return op.rows;
+    const rows = try aa.dupe([]const ?Value, op.rows);
+    var copied_row: ?u32 = null;
+    var copy: []?Value = &.{};
+    for (op.hex_cells) |cell| {
+        if (cell.row >= rows.len or cell.column >= rows[cell.row].len) return Error.BadRequest;
+        const target = if (op.columns) |cols|
+            schema.columnIndex(cols[cell.column]) orelse return Error.ColumnNotFound
+        else
+            cell.column;
+        if (target >= schema.columns.len) return Error.BadRequest;
+        if (!storesHexAsNumber(schema.columns[target].type)) continue;
+        const bytes = switch (rows[cell.row][cell.column] orelse continue) {
+            .text => |t| t,
+            else => continue,
+        };
+        if (copied_row != cell.row) {
+            copy = try aa.dupe(?Value, rows[cell.row]);
+            rows[cell.row] = copy;
+            copied_row = cell.row;
+        }
+        copy[cell.column] = exec.expr_mod.hexLiteralNumber(bytes);
+    }
+    return rows;
 }
 
 /// MySQL's affected-row count under ON DUPLICATE KEY UPDATE: one per new
@@ -3947,16 +3994,10 @@ fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {
     return out;
 }
 
-/// `YYYY-MM-DD` → days since the Unix epoch. Uses civil-from-days math
-/// (Howard Hinnant's algorithm) for correctness across leap years.
+/// `YYYY-MM-DD` → days since the Unix epoch. A day the month doesn't have
+/// is rejected, as MySQL's strict mode rejects it on INSERT.
 pub fn parseDateLiteral(s: []const u8) !i32 {
-    if (s.len < 10) return Error.TypeMismatch;
-    if (s[4] != '-' or s[7] != '-') return Error.TypeMismatch;
-    const year = try parseIntField(i32, s[0..4]);
-    const month = try parseIntField(u32, s[5..7]);
-    const day = try parseIntField(u32, s[8..10]);
-    if (month < 1 or month > 12 or day < 1 or day > 31) return Error.TypeMismatch;
-    return civilToDays(year, month, day);
+    return exec_common.parseDateString(s) catch Error.TypeMismatch;
 }
 
 pub fn parseDateTimeLiteral(s: []const u8) !i64 {
@@ -3981,15 +4022,6 @@ pub fn parseUuidLiteral(s: []const u8) !u128 {
     }
     if (idx != 32) return Error.TypeMismatch;
     return out;
-}
-
-fn parseIntField(comptime T: type, s: []const u8) !T {
-    return std.fmt.parseInt(T, s, 10) catch return Error.TypeMismatch;
-}
-
-fn civilToDays(year: i32, month: u32, day: u32) !i32 {
-    if (month == 0 or day == 0) return Error.TypeMismatch;
-    return wire_format.daysFromCivil(year, month, day);
 }
 
 fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {

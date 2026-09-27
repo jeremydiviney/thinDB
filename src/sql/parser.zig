@@ -48,6 +48,8 @@ const exec_expr = @import("../exec/expr.zig");
 const exec_predicate = @import("../exec/predicate.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const datefmt = @import("../exec/scalar_fn_datefmt.zig");
+const date_text = @import("../exec/scalar_fn_common.zig");
+const time_fn = @import("../exec/scalar_fn_time.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
 
@@ -3165,8 +3167,30 @@ pub const Parser = struct {
     /// in a `cast_as_<T>(inner)` scalar call. Used by both CAST(... AS T)
     /// and the `inner::T` postfix.
     fn parseCastTarget(self: *Parser, inner: ir.Expr) ParseError!ir.Expr {
+        if (self.lex.dialect != .postgres and self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "time"))
+            return try self.parseTimeCast(inner);
         const ty = try self.parseCastType();
         return try self.castExprToType(inner, ty);
+    }
+
+    /// `TIME[(fsp)]` as a cast target: MySQL's TIME text, rounded to `fsp`
+    /// fraction digits (none when omitted). Cursor is on `TIME`.
+    fn parseTimeCast(self: *Parser, inner: ir.Expr) ParseError!ir.Expr {
+        try self.advance();
+        var fsp: u8 = 0;
+        if (self.cur.tag == .lparen) {
+            try self.advance();
+            if (self.cur.tag != .integer) return ParseError.SqlExpectedValue;
+            fsp = std.math.cast(u8, self.cur.value.integer) orelse return ParseError.SqlExpectedValue;
+            if (fsp > time_fn.MAX_FSP) return ParseError.SqlExpectedValue;
+            try self.advance();
+            try self.expect(.rparen);
+        }
+        if (inner == .null_lit) return ir.Expr{ .null_lit = .string };
+        return ir.Expr{ .call = .{
+            .fn_name = try scalar_fn.castTimeFnName(self.arena, fsp),
+            .args = try self.arena.dupe(ir.Expr, &.{inner}),
+        } };
     }
 
     /// A CAST target is a column type plus MySQL's cast-only spellings
@@ -3282,6 +3306,11 @@ pub const Parser = struct {
                 return try bigIntegerLiteral(self.arena, digits);
             },
             .integer, .string, .kw_true, .kw_false => {
+                if (self.cur.isHexLiteral()) {
+                    const bytes = self.cur.value.string;
+                    try self.advance();
+                    return try exec_expr.hexLiteralExpr(self.arena, bytes);
+                }
                 const v = try self.parseValue();
                 return ir.Expr{ .lit = v };
             },
@@ -3313,14 +3342,14 @@ pub const Parser = struct {
         if (self.cur.tag != .string) return null;
         const s = self.cur.value.string;
         if (std.ascii.eqlIgnoreCase(name, "date")) {
-            const days = parseDateString(s) catch return ParseError.SqlExpectedValue;
+            const days = date_text.parseDateString(s) catch return ParseError.SqlExpectedValue;
             try self.advance();
             return ir.Expr{ .lit = .{ .date = days } };
         }
         if (std.ascii.eqlIgnoreCase(name, "datetime") or
             std.ascii.eqlIgnoreCase(name, "timestamp"))
         {
-            const micros = parseDateTimeString(s) catch return ParseError.SqlExpectedValue;
+            const micros = date_text.parseDateTimeString(s) catch return ParseError.SqlExpectedValue;
             try self.advance();
             return ir.Expr{ .lit = .{ .datetime = micros } };
         }
@@ -3392,6 +3421,16 @@ pub const Parser = struct {
             .null_lit => return try self.arena.dupe(u8, "NULL"),
             .call => |c| {
                 if (exec_expr.decimalLiteral(e)) |d| return try self.arena.dupe(u8, d.digits);
+                if (exec_expr.hexLiteralBytes(e)) |bytes| {
+                    const name = try self.arena.alloc(u8, 2 + 2 * bytes.len);
+                    name[0] = '0';
+                    name[1] = 'x';
+                    for (bytes, 0..) |b, i| {
+                        name[2 + 2 * i] = std.fmt.hex_charset[b >> 4];
+                        name[3 + 2 * i] = std.fmt.hex_charset[b & 0xf];
+                    }
+                    return name;
+                }
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.arena);
                 try buf.appendSlice(self.arena, c.fn_name);
@@ -6493,7 +6532,7 @@ pub const Parser = struct {
                     try self.advance();
                     if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
                     const s = self.cur.value.string;
-                    const days = parseDateString(s) catch return ParseError.SqlExpectedValue;
+                    const days = date_text.parseDateString(s) catch return ParseError.SqlExpectedValue;
                     try self.advance();
                     return .{ .date = days };
                 }
@@ -6503,7 +6542,7 @@ pub const Parser = struct {
                     try self.advance();
                     if (self.cur.tag != .string) return ParseError.SqlExpectedValue;
                     const s = self.cur.value.string;
-                    const micros = parseDateTimeString(s) catch return ParseError.SqlExpectedValue;
+                    const micros = date_text.parseDateTimeString(s) catch return ParseError.SqlExpectedValue;
                     try self.advance();
                     return .{ .datetime = micros };
                 }
@@ -6511,26 +6550,6 @@ pub const Parser = struct {
             },
             else => return ParseError.SqlExpectedValue,
         }
-    }
-
-    /// Inline copy of `net.local.parseDateLiteral` — keeping parser.zig
-    /// free of the net layer dep.
-    fn parseDateString(s: []const u8) !i32 {
-        if (s.len < 10) return error.Invalid;
-        if (s[4] != '-' or s[7] != '-') return error.Invalid;
-        const year = try std.fmt.parseInt(i32, s[0..4], 10);
-        const month = try std.fmt.parseInt(u32, s[5..7], 10);
-        const day = try std.fmt.parseInt(u32, s[8..10], 10);
-        if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
-        return ymdToDays(year, month, day);
-    }
-
-    fn parseDateTimeString(s: []const u8) !i64 {
-        return @import("../exec/scalar_fn_common.zig").parseDateTimeString(s);
-    }
-
-    fn ymdToDays(year: i32, month: u32, day: u32) i32 {
-        return @import("../exec/scalar_fn_common.zig").ymdToDays(year, month, day);
     }
 
     pub fn allocOp(self: *Parser, op: ir.Op) ParseError!*ir.Op {
@@ -6589,6 +6608,17 @@ pub const Parser = struct {
 
     pub fn predicateDerivedEnabled(self: *const Parser) bool {
         return self.predicate_derived_enabled;
+    }
+
+    /// The expression a predicate operand named `name` stands for: a
+    /// computed operand's own expression (`materializePredicateExpr`), since
+    /// operands computed side by side can't read one another, or else the
+    /// column itself.
+    pub fn predicateOperandExpr(self: *const Parser, name: []const u8) ir.Expr {
+        for (self.predicate_derived.items[self.predicate_derived_scope..]) |d| {
+            if (std.mem.eql(u8, d.name, name)) return d.expr;
+        }
+        return .{ .col_ref = name };
     }
 
     // -----------------------------------------------------------------------

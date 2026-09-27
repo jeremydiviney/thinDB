@@ -1083,6 +1083,7 @@ fn parseInsertLike(p: anytype, mode_in: ir.InsertMode) !*ir.Op {
 /// loaders take; expression rows become the query INSERT ... SELECT reads.
 const InsertRows = struct {
     literal: std.ArrayList([]const ?Value) = .empty,
+    hex_cells: std.ArrayList(ir.InsertCell) = .empty,
     exprs: std.ArrayList([]const ir.Expr) = .empty,
     as_exprs: bool = false,
     row_vals: std.ArrayList(?Value) = .empty,
@@ -1126,6 +1127,10 @@ const InsertRows = struct {
         const literal = try literalCellAhead(p);
         if (!self.as_exprs) {
             if (!literal) return false;
+            if (p.cur.isHexLiteral()) try self.hex_cells.append(p.arena, .{
+                .row = @intCast(self.literal.items.len),
+                .column = @intCast(self.row_vals.items.len),
+            });
             try self.row_vals.append(p.arena, try parseInsertValue(p));
             return true;
         }
@@ -1171,6 +1176,7 @@ const InsertRows = struct {
             .table = ref,
             .columns = columns,
             .rows = self.literal.items,
+            .hex_cells = self.hex_cells.items,
             .on_duplicate = on_duplicate,
         } });
     }

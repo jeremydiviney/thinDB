@@ -1404,6 +1404,7 @@ fn affineUnary(e: Expr, up_schema: []const Column) ?struct { src_idx: usize, aff
     }
     const k = intFamilyValueI128(lit_v) orelse return null;
     const idx = columnIndex(up_schema, col_name) orelse return null;
+    if (!arithReadsStoredValue(up_schema[idx].type)) return null;
 
     var scale: i128 = undefined;
     var offset: i128 = undefined;
@@ -1453,6 +1454,13 @@ pub fn mayVary(e: Expr, registry: ?*const udf_mod.UdfRegistry) bool {
     }
 }
 
+/// Whether arithmetic over a column of type `t` reads the stored value its
+/// min/max describe. A date or datetime reads as its YYYYMMDD[HHMMSS]
+/// number, not its stored day or microsecond count.
+fn arithReadsStoredValue(t: Type) bool {
+    return !t.isTemporal();
+}
+
 fn classifyExpr(e: Expr, up_schema: []const Column) StatClass {
     const c = switch (e) {
         .call => |x| x,
@@ -1463,7 +1471,9 @@ fn classifyExpr(e: Expr, up_schema: []const Column) StatClass {
     if (c.args.len == 2 and c.args[0] == .col_ref and c.args[1] == .col_ref) {
         const idx1 = columnIndex(up_schema, c.args[0].col_ref) orelse return .none;
         const idx2 = columnIndex(up_schema, c.args[1].col_ref) orelse return .none;
-        const op: ?simd.BinOp = if (std.mem.eql(u8, c.fn_name, "add"))
+        const op: ?simd.BinOp = if (!arithReadsStoredValue(up_schema[idx1].type) or !arithReadsStoredValue(up_schema[idx2].type))
+            null
+        else if (std.mem.eql(u8, c.fn_name, "add"))
             .add
         else if (std.mem.eql(u8, c.fn_name, "sub"))
             .sub
@@ -1544,6 +1554,23 @@ test "NDV chains through deterministic functions (pigeonhole, never grows)" {
     // No provable shape (opaque) ⇒ unknown — never a fabricated number.
     const o = ResolvedDerived{ .name = "o", .output_type = .int, .stat_class = .none, .kind = .{ .call = undefined } };
     try std.testing.expectEqual(exec.ColCard.unknown, derivedColStat(o, &up_stats).ndv);
+}
+
+test "arithmetic over a date carries no min/max, since it reads the date's YYYYMMDD number" {
+    const up_schema = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "n", .type = .int },
+    };
+    const date_plus_one = [_]Expr{ .{ .col_ref = "d" }, .{ .lit = .{ .int = 1 } } };
+    const unary = classifyExpr(.{ .call = .{ .fn_name = "add", .args = &date_plus_one } }, &up_schema);
+    try std.testing.expect(unary == .unary);
+    try std.testing.expect(unary.unary.affine == null);
+    const date_plus_int = [_]Expr{ .{ .col_ref = "d" }, .{ .col_ref = "n" } };
+    const binary = classifyExpr(.{ .call = .{ .fn_name = "add", .args = &date_plus_int } }, &up_schema);
+    try std.testing.expect(binary == .binary);
+    try std.testing.expect(binary.binary.op == null);
+    const int_plus_one = [_]Expr{ .{ .col_ref = "n" }, .{ .lit = .{ .int = 1 } } };
+    try std.testing.expect(classifyExpr(.{ .call = .{ .fn_name = "add", .args = &int_plus_one } }, &up_schema).unary.affine != null);
 }
 
 /// Checked i128 add — null on overflow so a derived bound is never wrong.
@@ -2016,6 +2043,7 @@ fn buildCallPlan(
         .call => |x| x,
         else => return Error.ComputeUnsupportedExpr,
     };
+    if (try hexNumbersRead(aa, udf_registry, c)) |rewritten| return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
 
     const arg_plans = try aa.alloc(ArgPlan, c.args.len);
     const arg_types = try aa.alloc(Type, c.args.len);
@@ -2153,6 +2181,20 @@ fn buildCallPlan(
         .arg_reach = argReach(func),
     };
     return plan;
+}
+
+/// The call with each hex literal it reads as a number replaced by that
+/// integer (`scalar_fn.readsNumberAt`), or null when it reads none so.
+fn hexNumbersRead(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr.Call) Allocator.Error!?Expr {
+    var args: ?[]Expr = null;
+    for (c.args, 0..) |arg, i| {
+        const bytes = expr_mod.hexLiteralBytes(arg) orelse continue;
+        if (!scalar_fn.readsNumberAt(udf_registry, c.fn_name, c.args.len, i)) continue;
+        const out = args orelse try aa.dupe(Expr, c.args);
+        out[i] = .{ .lit = expr_mod.hexLiteralNumber(bytes) };
+        args = out;
+    }
+    return if (args) |a| Expr{ .call = .{ .fn_name = c.fn_name, .args = a } } else null;
 }
 
 /// A call no overload accepts as written, with its arguments converted so

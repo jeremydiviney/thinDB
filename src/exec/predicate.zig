@@ -983,15 +983,15 @@ pub fn tryWidenLiteral(val: *Value, target: ValueTag) error{NoWidening}!void {
             .date => {
                 // A datetime string equals a DATE only at midnight; any other
                 // time of day lies between two dates (placeLiteral folds it).
-                const d = if (parseDateTimeString(val.text)) |us| blk: {
+                const d = if (scalar_fn_common.parseDateTimeString(val.text)) |us| blk: {
                     if (@mod(us, std.time.us_per_day) != 0) return error.NoWidening;
                     break :blk std.math.cast(i32, @divFloor(us, std.time.us_per_day)) orelse return error.NoWidening;
-                } else |_| parseDateString(val.text) catch return error.NoWidening;
+                } else |_| scalar_fn_common.parseDateString(val.text) catch return error.NoWidening;
                 val.* = .{ .date = d };
                 return;
             },
             .datetime => {
-                const dt = parseDateTimeString(val.text) catch return error.NoWidening;
+                const dt = scalar_fn_common.parseDateTimeString(val.text) catch return error.NoWidening;
                 val.* = .{ .datetime = dt };
                 return;
             },
@@ -1098,20 +1098,6 @@ fn floatToDecimalMantissa(v: f64, scale: u8, fit: DecimalFit) error{NoWidening}!
     const d = scalar_fn_common.floatDigits(v) orelse return error.NoWidening;
     if (fit == .exact and d.s > scale and @rem(d.m, decimal_pow10(d.s - scale)) != 0) return error.NoWidening;
     return decimal_rescale(d.m, d.s, scale) orelse error.NoWidening;
-}
-
-fn parseDateString(s: []const u8) !i32 {
-    if (s.len < 10) return error.Invalid;
-    if (s[4] != '-' or s[7] != '-') return error.Invalid;
-    const year = try std.fmt.parseInt(i32, s[0..4], 10);
-    const month = try std.fmt.parseInt(u32, s[5..7], 10);
-    const day = try std.fmt.parseInt(u32, s[8..10], 10);
-    if (month < 1 or month > 12 or day < 1 or day > 31) return error.Invalid;
-    return @import("scalar_fn_common.zig").ymdToDays(year, month, day);
-}
-
-fn parseDateTimeString(s: []const u8) !i64 {
-    return @import("scalar_fn_common.zig").parseDateTimeString(s);
 }
 
 /// Push every leaf reachable through top-level ANDs down to the upstream so

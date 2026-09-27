@@ -60,7 +60,7 @@ test "failed statements leave the statement gate idle" {
         "SELECT id FROM fa WHERE n IN (SELECT dt FROM fb)",
         "SELECT id FROM fa WHERE EXISTS (SELECT 1 FROM fb WHERE fb.dt = fa.n)",
         "SELECT id FROM fa UNION ALL SELECT id, n FROM fb",
-        "SELECT fa.id, sqrt(fb.dt) AS v FROM fa JOIN fb ON fa.id = fb.id",
+        "SELECT fa.id, sqrt(fb.n, fb.dt) AS v FROM fa JOIN fb ON fa.id = fb.id",
         // A correlated lookup whose key matches two rows.
         "SELECT fb.id, (SELECT fc.id FROM fc WHERE fc.n = fb.n) AS x FROM fb",
         // Fails while running, past the join.
