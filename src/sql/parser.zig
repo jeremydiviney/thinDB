@@ -2010,13 +2010,7 @@ pub const Parser = struct {
             std.ascii.eqlIgnoreCase(name, "extract") or
             std.ascii.eqlIgnoreCase(name, "trim") or
             std.ascii.eqlIgnoreCase(name, "position") or
-            std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring") or
-            namesArgType(name);
-    }
-
-    /// CHARSET and COLLATION name their argument's type.
-    fn namesArgType(name: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(name, "charset") or std.ascii.eqlIgnoreCase(name, "collation");
+            std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring");
     }
 
     pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
@@ -2028,22 +2022,7 @@ pub const Parser = struct {
         if (std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring")) return try self.parseSubstringCall(name);
         if (std.ascii.eqlIgnoreCase(name, "trim")) return try self.parseTrimCall();
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
-        if (namesArgType(name)) return try self.parseArgTypeCall(name);
         const args = try self.parseCallArgList(name, null);
-        return try self.makeScalarCallExpr(name, args);
-    }
-
-    /// `CHARSET(x)` or `COLLATION(x)`. A bare NULL has no character set in
-    /// MySQL (`binary`), where a text NULL such as `CAST(NULL AS CHAR)` has
-    /// utf8mb4, and both parse to a text NULL; so a bare NULL argument is
-    /// retyped as a number's NULL, whose character set is binary.
-    fn parseArgTypeCall(self: *Parser, name: []const u8) ParseError!ir.Expr {
-        var look = self.lex.*;
-        var tok = try look.next();
-        while (tok.tag == .lparen) tok = try look.next();
-        const bare_null = tok.tag == .kw_null;
-        const args = try self.parseCallArgList(name, null);
-        if (bare_null and args.len == 1 and args[0] == .null_lit) return try self.makeScalarCallExpr(name, &.{.{ .null_lit = .bigint }});
         return try self.makeScalarCallExpr(name, args);
     }
 
@@ -2486,6 +2465,7 @@ pub const Parser = struct {
     /// DISTINCT — it's only valid inside an aggregate.
     pub fn parseCallArgList(self: *Parser, name: []const u8, distinct_out: ?*bool) ParseError![]const ir.Expr {
         try self.expect(.lparen);
+        const bare_null = namesArgType(name) and try self.bareNullAhead();
         var distinct = false;
         if (self.cur.tag == .kw_distinct) {
             try self.advance();
@@ -2511,7 +2491,25 @@ pub const Parser = struct {
             return canonical;
         }
         try self.expect(.rparen);
+        // A bare NULL has no character set in MySQL (`binary`), where a text
+        // NULL such as `CAST(NULL AS CHAR)` has utf8mb4; both parse to a
+        // text NULL, so CHARSET or COLLATION of a bare one takes a number's.
+        if (bare_null and args.items.len == 1 and args.items[0] == .null_lit) args.items[0] = .{ .null_lit = .bigint };
         return try args.toOwnedSlice(self.arena);
+    }
+
+    /// CHARSET and COLLATION name their argument's type.
+    fn namesArgType(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "charset") or std.ascii.eqlIgnoreCase(name, "collation");
+    }
+
+    /// Whether the value starting at `cur` is a bare NULL, in any number of
+    /// parentheses.
+    fn bareNullAhead(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        var tok = self.cur;
+        while (tok.tag == .lparen) tok = try look.next();
+        return tok.tag == .kw_null;
     }
 
     /// The rest of a `GROUP_CONCAT([DISTINCT] v [, v ...] [ORDER BY k [ASC |

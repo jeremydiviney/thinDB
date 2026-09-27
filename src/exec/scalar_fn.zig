@@ -834,13 +834,18 @@ fn textAsDoubleArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: 
 
 const CONVERT_COST: u64 = 1000;
 
+/// More than all the other conversions of a call's arguments add up to.
+const FRACTION_DROP_COST: u64 = 1_000_000;
+
 const ArgConversion = struct { cost: u64, target: ?Type = null };
 
 /// Text converts to a number only where no overload takes it as text, and
 /// to a double before an integer: MySQL types a text operand as DOUBLE, so
 /// `ABS('-2.5')` is 2.5. A double or decimal meets an integer parameter as
-/// the integer MySQL reads it as (`INTEGER_ARG_FN`), after any overload that
-/// takes it as it is or as text.
+/// the integer MySQL reads it as (`INTEGER_ARG_FN`), but only where no
+/// overload takes every argument without dropping a fraction: that costs
+/// more than any other conversion of the whole call, so `INTERVAL(2.5, 1,
+/// 2.5, 3)` still compares doubles.
 fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
     if (declared.isString()) {
         if (bindsAsIs(given, declared)) return .{ .cost = 0 };
@@ -853,7 +858,7 @@ fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
     }
     if (declared.isFloat() and given.isDecimal()) return .{ .cost = CONVERT_COST, .target = .double };
     if (declared.isInteger() and (given.isFloat() or given.isDecimal()))
-        return .{ .cost = CONVERT_COST + 3 + (argCastCost(.bigint, declared, true) orelse return null), .target = .bigint };
+        return .{ .cost = FRACTION_DROP_COST + (argCastCost(.bigint, declared, true) orelse return null), .target = .bigint };
     return .{ .cost = argCastCost(given, declared, true) orelse return null };
 }
 

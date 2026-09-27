@@ -415,3 +415,22 @@ test "appendColumnDef presents a qualified result name as table + bare name" {
     try appendColumnDef(allocator, &out, "db", "t", .{ .name = "0.5", .type = .double });
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x030.5\x030.5") != null);
 }
+
+test "formatCell writes a FLOAT or DOUBLE as MySQL does" {
+    const storage_column = @import("../../storage/column.zig");
+    const allocator = std.testing.allocator;
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    const doubles = [_]f64{ 1e100, 1e15, 1e14, 100, -0.0, 1.5e-16, @as(f64, 0.1) + @as(f64, 0.2), -2.5e-5 };
+    const double_text = [_][]const u8{ "1e100", "1e15", "100000000000000", "100", "-0", "1.5e-16", "0.30000000000000004", "-0.000025" };
+    const double_view: storage_column.ColumnView = .{ .data = .{ .double = &doubles } };
+    for (double_text, 0..) |want, row| {
+        try std.testing.expectEqualStrings(want, (try formatCell(&scratch, allocator, .{ .name = "d", .type = .double }, double_view, row)).?);
+    }
+    const floats = [_]f32{ 0.1, 3.4e38, 1234567 };
+    const float_text = [_][]const u8{ "0.1", "3.4e38", "1234567" };
+    const float_view: storage_column.ColumnView = .{ .data = .{ .float = &floats } };
+    for (float_text, 0..) |want, row| {
+        try std.testing.expectEqualStrings(want, (try formatCell(&scratch, allocator, .{ .name = "f", .type = .float }, float_view, row)).?);
+    }
+}

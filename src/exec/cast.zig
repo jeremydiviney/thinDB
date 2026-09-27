@@ -396,7 +396,11 @@ fn appendText(allocator: Allocator, text: *std.ArrayList(u8), v: types.Value, sc
     switch (v) {
         .text => |s| try text.appendSlice(allocator, s),
         .boolean => |b| try text.append(allocator, if (b) '1' else '0'),
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => |x| try text.print(allocator, "{d}", .{x}),
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |x| try text.print(allocator, "{d}", .{x}),
+        inline .float, .double => |x| {
+            var float_buf: [common.FLOAT_TEXT_MAX]u8 = undefined;
+            try text.appendSlice(allocator, common.floatText(&float_buf, x, .plain));
+        },
         inline .decimal64, .decimal128 => |m| try text.appendSlice(allocator, decimal.formatDecimal(&buf, m, scale)),
         .date => |d| try text.appendSlice(allocator, common.formatDate(&buf, d) catch return error.ValueOutOfRange),
         .datetime => |d| try text.appendSlice(allocator, common.formatDateTime(&buf, d) catch return error.ValueOutOfRange),
