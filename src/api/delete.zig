@@ -303,11 +303,11 @@ pub fn execDeleteKeyedBatch(
 /// re-counted in affected_rows — an upsert-superseded old copy matching the
 /// predicate would otherwise inflate the count (observed 2.02M reported vs
 /// 1.2M live rows on a keyed table).
-const TombCursor = struct {
+pub const TombCursor = struct {
     tombs: []const u32 = &.{},
     i: usize = 0,
 
-    fn isDead(self: *TombCursor, off: u32) bool {
+    pub fn isDead(self: *TombCursor, off: u32) bool {
         while (self.i < self.tombs.len and self.tombs[self.i] < off) self.i += 1;
         return self.i < self.tombs.len and self.tombs[self.i] == off;
     }

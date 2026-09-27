@@ -1005,14 +1005,17 @@ pub fn parseReplace(p: anytype) !*ir.Op {
     return parseInsertLike(p, .replace);
 }
 
-fn parseInsertLike(p: anytype, mode: ir.InsertMode) !*ir.Op {
+fn parseInsertLike(p: anytype, mode_in: ir.InsertMode) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     try p.advance(); // consume INSERT / REPLACE
-    if (p.cur.tag == .kw_into) {
+    var mode = mode_in;
+    // MySQL's scheduling modifiers mean nothing to a single-writer table.
+    while (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "low_priority", "delayed", "high_priority" })) try p.advance();
+    if (mode == .insert and p.cur.tag == .kw_ignore) {
+        mode = .ignore;
         try p.advance();
-    } else if (mode != .replace) {
-        return PE.SqlExpectedKeyword;
     }
+    if (p.cur.tag == .kw_into) try p.advance();
     const ref = try p.parseTableRef();
 
     var cols_opt: ?[]const []const u8 = null;
@@ -1032,92 +1035,162 @@ fn parseInsertLike(p: anytype, mode: ir.InsertMode) !*ir.Op {
             .table = ref,
             .columns = cols_opt,
             .source = source,
+            .on_duplicate = try parseOnDuplicate(p, mode, null, null),
         } });
     }
 
-    if (p.cur.tag != .kw_values) return PE.SqlExpectedKeyword;
-    try p.advance();
-
-    // Literal rows stay Values, the path bulk loaders take. The first cell
-    // that isn't a lone literal turns every row into expressions.
-    var rows: std.ArrayList([]const ?Value) = .empty;
-    var expr_rows: std.ArrayList([]const ir.Expr) = .empty;
-    var as_exprs = false;
-    var cells: std.ArrayList(ir.Expr) = .empty;
-    var width: ?usize = null;
-    while (true) {
-        try p.expect(.lparen);
-        var row_vals: std.ArrayList(?Value) = .empty;
-        cells.clearRetainingCapacity();
+    var rows: InsertRows = .{};
+    if (p.cur.tag == .kw_set) {
+        if (cols_opt != null) return PE.SqlExpectedKeyword;
+        try p.advance();
+        var names: std.ArrayList([]const u8) = .empty;
         while (true) {
-            const literal = try literalCellAhead(p);
-            if (!literal and !as_exprs) {
-                as_exprs = true;
-                for (rows.items) |row| try expr_rows.append(p.arena, try literalExprs(p, row));
-                for (row_vals.items) |v| try cells.append(p.arena, literalExpr(v));
-            }
-            if (!as_exprs) {
-                try row_vals.append(p.arena, try parseInsertValue(p));
-            } else {
-                try cells.append(p.arena, if (literal) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
-            }
+            try names.append(p.arena, try p.dupedIdent());
+            if (p.cur.tag != .eq) return PE.SqlExpectedToken;
+            try p.advance();
+            try rows.cell(p);
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+        try rows.endRow(p);
+        return try rows.finish(p, mode, ref, names.items, try parseOnDuplicate(p, mode, null, null));
+    }
+
+    if (p.cur.tag != .kw_values and !isIdentText(p, "value")) return PE.SqlExpectedKeyword;
+    try p.advance();
+    while (true) {
+        if (p.cur.tag == .kw_row) try p.advance();
+        try p.expect(.lparen);
+        while (true) {
+            try rows.cell(p);
             if (p.cur.tag != .comma) break;
             try p.advance();
         }
         try p.expect(.rparen);
-        const row_width = if (as_exprs) cells.items.len else row_vals.items.len;
-        if (row_width != (width orelse row_width)) return PE.SqlRowValueWidthMismatch;
-        width = row_width;
-        if (as_exprs) {
-            try expr_rows.append(p.arena, try p.arena.dupe(ir.Expr, cells.items));
-        } else {
-            try rows.append(p.arena, row_vals.items);
-        }
+        try rows.endRow(p);
         if (p.cur.tag != .comma) break;
         try p.advance();
     }
 
-    // MySQL upsert clause: `ON DUPLICATE KEY UPDATE col = VALUES(col), ...`.
-    // thinDB's INSERT already upserts on a unique table (last-writer-wins) and
-    // appends on a non-unique one — exactly this clause's full-row-replace
-    // semantics, and the form Flink's JDBC upsert sink emits. So validate that
-    // shape and drop it. Partial / expression updates (`c = c + VALUES(c)`)
-    // can't be a full replace, so reject them rather than silently mis-apply.
-    if (p.cur.tag == .kw_on) {
+    var row_alias: ?[]const u8 = null;
+    var row_alias_columns: ?[]const []const u8 = null;
+    if (p.cur.tag == .kw_as) {
         try p.advance();
-        if (!isIdentText(p, "duplicate")) return PE.SqlExpectedKeyword;
-        try p.advance();
-        if (p.cur.tag != .kw_key) return PE.SqlExpectedKeyword;
-        try p.advance();
-        if (p.cur.tag != .kw_update) return PE.SqlExpectedKeyword;
-        try p.advance();
-        while (true) {
-            const target = try p.dupedIdent();
-            if (p.cur.tag != .eq) return PE.SqlExpectedKeyword;
+        row_alias = try p.dupedIdent();
+        if (p.cur.tag == .lparen) {
             try p.advance();
-            if (p.cur.tag != .kw_values) return PE.SqlInvalidProjection;
-            try p.advance();
-            try p.expect(.lparen);
-            const src = try p.dupedIdent();
+            row_alias_columns = try p.parseIdentList();
             try p.expect(.rparen);
-            if (!std.ascii.eqlIgnoreCase(target, src)) return PE.SqlInvalidProjection;
-            if (p.cur.tag != .comma) break;
-            try p.advance();
+        }
+    }
+    return try rows.finish(p, mode, ref, cols_opt, try parseOnDuplicate(p, mode, row_alias, row_alias_columns));
+}
+
+/// An INSERT's rows as parsed. Literal rows stay Values, the path bulk
+/// loaders take. The first cell that isn't a lone literal turns every row
+/// into expressions.
+const InsertRows = struct {
+    literal: std.ArrayList([]const ?Value) = .empty,
+    exprs: std.ArrayList([]const ir.Expr) = .empty,
+    as_exprs: bool = false,
+    row_vals: std.ArrayList(?Value) = .empty,
+    cells: std.ArrayList(ir.Expr) = .empty,
+    width: ?usize = null,
+
+    fn cell(self: *InsertRows, p: anytype) !void {
+        const literal = try literalCellAhead(p);
+        if (!literal and !self.as_exprs) {
+            self.as_exprs = true;
+            for (self.literal.items) |row| try self.exprs.append(p.arena, try literalExprs(p, row));
+            for (self.row_vals.items) |v| try self.cells.append(p.arena, literalExpr(v));
+        }
+        if (!self.as_exprs) {
+            try self.row_vals.append(p.arena, try parseInsertValue(p));
+        } else {
+            try self.cells.append(p.arena, if (literal) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
         }
     }
 
-    if (as_exprs) return try p.allocOp(.{ .insert_select = .{
-        .mode = mode,
-        .table = ref,
-        .columns = cols_opt,
-        .source = try valuesQuery(p, expr_rows.items),
-    } });
-    return try p.allocOp(.{ .insert = .{
-        .mode = mode,
-        .table = ref,
-        .columns = cols_opt,
-        .rows = rows.items,
-    } });
+    fn endRow(self: *InsertRows, p: anytype) !void {
+        const PE = @TypeOf(p.*).Err;
+        const row_width = if (self.as_exprs) self.cells.items.len else self.row_vals.items.len;
+        if (row_width != (self.width orelse row_width)) return PE.SqlRowValueWidthMismatch;
+        self.width = row_width;
+        if (self.as_exprs) {
+            try self.exprs.append(p.arena, try p.arena.dupe(ir.Expr, self.cells.items));
+            self.cells.clearRetainingCapacity();
+        } else {
+            try self.literal.append(p.arena, self.row_vals.items);
+        }
+        self.row_vals = .empty;
+    }
+
+    fn finish(
+        self: *InsertRows,
+        p: anytype,
+        mode: ir.InsertMode,
+        ref: ir.TableRef,
+        columns: ?[]const []const u8,
+        on_duplicate: ?ir.OnDuplicate,
+    ) !*ir.Op {
+        if (self.as_exprs) return try p.allocOp(.{ .insert_select = .{
+            .mode = mode,
+            .table = ref,
+            .columns = columns,
+            .source = try valuesQuery(p, self.exprs.items),
+            .on_duplicate = on_duplicate,
+        } });
+        return try p.allocOp(.{ .insert = .{
+            .mode = mode,
+            .table = ref,
+            .columns = columns,
+            .rows = self.literal.items,
+            .on_duplicate = on_duplicate,
+        } });
+    }
+};
+
+/// `ON DUPLICATE KEY UPDATE col = expr [, ...]`, or null when the INSERT has
+/// none. Compile decides what the assignments amount to, since that turns on
+/// the table's key.
+fn parseOnDuplicate(
+    p: anytype,
+    mode: ir.InsertMode,
+    row_alias: ?[]const u8,
+    row_alias_columns: ?[]const []const u8,
+) !?ir.OnDuplicate {
+    const PE = @TypeOf(p.*).Err;
+    if (p.cur.tag != .kw_on or mode == .replace) return null;
+    try p.advance();
+    if (!isIdentText(p, "duplicate")) return PE.SqlExpectedKeyword;
+    try p.advance();
+    if (p.cur.tag != .kw_key) return PE.SqlExpectedKeyword;
+    try p.advance();
+    if (p.cur.tag != .kw_update) return PE.SqlExpectedKeyword;
+    try p.advance();
+
+    const outer_values_refs = p.insert_values_refs;
+    p.insert_values_refs = true;
+    defer p.insert_values_refs = outer_values_refs;
+    var assignments: std.ArrayList(ir.Assignment) = .empty;
+    while (true) {
+        var col = try p.dupedIdent();
+        // A qualified target can only name the insert's own table.
+        while (p.cur.tag == .dot) {
+            try p.advance();
+            col = try p.dupedIdent();
+        }
+        if (p.cur.tag != .eq) return PE.SqlExpectedToken;
+        try p.advance();
+        try assignments.append(p.arena, .{ .col = col, .value = try p.parseValueExpr() });
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    return .{
+        .assignments = assignments.items,
+        .row_alias = row_alias,
+        .row_alias_columns = row_alias_columns,
+    };
 }
 
 /// Whether the VALUES cell at the cursor is a lone literal: NULL, TRUE,
