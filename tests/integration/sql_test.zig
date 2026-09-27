@@ -614,6 +614,19 @@ test "sql: FROM-less SELECT evaluates expressions over one row" {
         try std.testing.expect(b.values[0].data.datetime[0] > 1_500_000_000_000_000);
         try std.testing.expect(b.values[1].data.date[0] > 18262);
     }
+    // MySQL's DUAL is the same one-row source; a backquoted `dual` is a table.
+    {
+        const got = try helpers.collectBigints(allocator, db, "SELECT CAST(40 + 2 AS BIGINT) FROM DUAL WHERE 1 = 1");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &[_]i64{42}, got);
+    }
+    {
+        try helpers.exec(allocator, db, "CREATE TABLE `dual` (id BIGINT PRIMARY KEY)");
+        try helpers.exec(allocator, db, "INSERT INTO `dual` VALUES (7), (8)");
+        const got = try helpers.collectBigints(allocator, db, "SELECT id FROM `dual` ORDER BY id");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8 }, got);
+    }
     // SELECT with string concat.
     {
         var q = try runSql(allocator, db, "SELECT 'a' || 'b' AS c");
