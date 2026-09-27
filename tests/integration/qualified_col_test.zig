@@ -6,6 +6,8 @@
 //! alias, `t.col` resolves via a prefix-strip fallback. Together
 //! that means everyday queries keep working while self-joins can
 //! disambiguate same-named columns from two scans of the same table.
+//! A bare name beside a select alias that shares it reads the FROM
+//! column, bare or qualified, as MySQL binds it.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -501,4 +503,85 @@ test "a schema- or database-qualified column resolves by its table name" {
     }
     try helpers.expectRunError(allocator, db, "SELECT main.t.nope FROM t", error.ColumnNotFound);
     try helpers.expectRunError(allocator, db, "SELECT a.main.t.id FROM t", error.SqlExpectedIdent);
+}
+
+fn setupShadowed(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, io, dir, .{});
+    errdefer db.close();
+    try exec(allocator, db, "CREATE TABLE dn (n INT, m INT)");
+    try exec(allocator, db, "INSERT INTO dn (n, m) VALUES (5, 7), (6, 8), (7, 9)");
+    try exec(allocator, db, "CREATE TABLE dk (k INT, n INT)");
+    try exec(allocator, db, "INSERT INTO dk (k, n) VALUES (5, 50), (6, 60), (7, 70)");
+    const t = try db.openTable("dn", .{});
+    try t.flush();
+    return db;
+}
+
+fn expectNamedCells(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, names: []const []const u8, cells: []const ?i64) !void {
+    errdefer std.debug.print("query: {s}\n", .{sql});
+    var q = try helpers.runSqlCtx(allocator, db, sql);
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(names.len, schema.len);
+    for (names, schema) |name, col| try std.testing.expectEqualStrings(name, col.name);
+    const got = try helpers.collectIntCells(allocator, &q);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(?i64, cells, got);
+}
+
+test "a select alias leaves the FROM column it names to the rest of the query (issue #321)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setupShadowed(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT 0 AS n, n FROM dn ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 0, 5, 0, 6, 0, 7 } },
+        .{ "SELECT n + 1 AS n, n FROM dn ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 6, 5, 7, 6, 8, 7 } },
+        .{ "SELECT n, n + 1 AS n FROM dn ORDER BY 1", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 5, 6, 6, 7, 7, 8 } },
+        .{ "SELECT CASE WHEN n > 5 THEN 1 ELSE 0 END AS n, n FROM dn WHERE n > 5 ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 1, 6, 1, 7 } },
+        // A bare ORDER BY name is the alias; an expression reads the column.
+        .{ "SELECT -n AS n, n FROM dn ORDER BY n", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ -7, 7, -6, 6, -5, 5 } },
+        .{ "SELECT -n AS n FROM dn ORDER BY n + 0", &[_][]const u8{"n"}, &[_]?i64{ -5, -6, -7 } },
+        // An alias no FROM column has still names the item for later items.
+        .{ "SELECT m + 1 AS b, b * 2 FROM dn ORDER BY 1", &[_][]const u8{ "b", "b * 2" }, &[_]?i64{ 8, 16, 9, 18, 10, 20 } },
+        // Beside `*` the item still takes the slot of the column it names.
+        .{ "SELECT *, n * 2 AS n FROM dn ORDER BY m", &[_][]const u8{ "n", "m" }, &[_]?i64{ 10, 7, 12, 8, 14, 9 } },
+        .{ "SELECT *, SUM(n) OVER () AS n FROM dn ORDER BY m", &[_][]const u8{ "n", "m" }, &[_]?i64{ 18, 7, 18, 8, 18, 9 } },
+        .{ "SELECT *, n * 2 AS n FROM (SELECT * FROM dn) d ORDER BY m", &[_][]const u8{ "n", "m" }, &[_]?i64{ 10, 7, 12, 8, 14, 9 } },
+        .{ "SELECT n * 2 AS n, dn.* FROM dn ORDER BY m", &[_][]const u8{ "n", "n_1", "m" }, &[_]?i64{ 10, 5, 7, 12, 6, 8, 14, 7, 9 } },
+        // A qualified reference to the same column names its repeat too.
+        .{ "SELECT m * 2 AS m, dn.m FROM dn ORDER BY 2", &[_][]const u8{ "m", "m_1" }, &[_]?i64{ 14, 7, 16, 8, 18, 9 } },
+        .{ "SELECT n, a.n FROM dn a ORDER BY 1", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 5, 5, 6, 6, 7, 7 } },
+        .{ "SELECT * FROM (SELECT 0 AS n, n FROM dn) d ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 0, 5, 0, 6, 0, 7 } },
+        .{ "WITH c AS (SELECT n * 10 AS n, n AS orig FROM dn) SELECT n + 1 AS n, n, orig FROM c ORDER BY 3", &[_][]const u8{ "n", "n_1", "orig" }, &[_]?i64{ 51, 50, 5, 61, 60, 6, 71, 70, 7 } },
+        .{ "SELECT a.m + 100 AS m, m FROM dn a JOIN dk b ON a.n = b.k ORDER BY 2", &[_][]const u8{ "m", "m_1" }, &[_]?i64{ 107, 7, 108, 8, 109, 9 } },
+        .{ "SELECT a.m + 100 AS k, k FROM dn a JOIN dk b ON a.n = b.k ORDER BY 2", &[_][]const u8{ "k", "k_1" }, &[_]?i64{ 107, 5, 108, 6, 109, 7 } },
+    };
+    inline for (cases) |case| try expectNamedCells(allocator, db, case[0], case[1], case[2]);
+}
+
+test "an aggregate or window alias leaves the FROM column it names to the rest of the query (issue #321)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setupShadowed(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT SUM(n) AS n, n FROM dn GROUP BY n ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 5, 5, 6, 6, 7, 7 } },
+        .{ "SELECT SUM(m) AS n, n FROM dn GROUP BY n ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 7, 5, 8, 6, 9, 7 } },
+        .{ "SELECT n + 1 AS n, COUNT(*) FROM dn GROUP BY n ORDER BY 1", &[_][]const u8{ "n", "COUNT(*)" }, &[_]?i64{ 6, 1, 7, 1, 8, 1 } },
+        .{ "SELECT m, SUM(n) AS n FROM dn GROUP BY m HAVING n > 5 ORDER BY 1", &[_][]const u8{ "m", "n" }, &[_]?i64{ 8, 6, 9, 7 } },
+        .{ "SELECT m, SUM(n) AS n FROM dn GROUP BY m ORDER BY n DESC", &[_][]const u8{ "m", "n" }, &[_]?i64{ 9, 7, 8, 6, 7, 5 } },
+        .{ "SELECT DISTINCT n % 2 AS n, n FROM dn ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 1, 5, 0, 6, 1, 7 } },
+        .{ "SELECT ROW_NUMBER() OVER (ORDER BY n DESC) AS n, n FROM dn ORDER BY 2", &[_][]const u8{ "n", "n_1" }, &[_]?i64{ 3, 5, 2, 6, 1, 7 } },
+        .{ "SELECT n + 1 AS n, SUM(n) OVER (ORDER BY n) AS s FROM dn ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 6, 5, 7, 11, 8, 18 } },
+        .{ "SELECT n * 2 AS n, SUM(n) OVER (PARTITION BY n) AS s FROM dn ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 10, 5, 12, 6, 14, 7 } },
+        // QUALIFY filters the finished row, where a bare alias is the item.
+        .{ "SELECT ROW_NUMBER() OVER (ORDER BY m DESC) AS n, m FROM dn QUALIFY n = 1", &[_][]const u8{ "n", "m" }, &[_]?i64{ 1, 9 } },
+        .{ "SELECT n * 2 AS n, ROW_NUMBER() OVER (ORDER BY m) AS r FROM dn QUALIFY dn.n > 6", &[_][]const u8{ "n", "r" }, &[_]?i64{ 14, 3 } },
+    };
+    inline for (cases) |case| try expectNamedCells(allocator, db, case[0], case[1], case[2]);
 }

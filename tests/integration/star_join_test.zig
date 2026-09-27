@@ -84,27 +84,7 @@ fn setupUsing(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.
     return db;
 }
 
-/// Every cell of an all-integer result, row by row, NULL as null.
-fn collectCells(allocator: std.mem.Allocator, q: *helpers.RunResult) ![]?i64 {
-    var out: std.ArrayList(?i64) = .empty;
-    errdefer out.deinit(allocator);
-    while (try q.next()) |batch| {
-        for (0..batch.row_count) |row| {
-            for (batch.values) |column| {
-                if (!column.isValid(row)) {
-                    try out.append(allocator, null);
-                    continue;
-                }
-                try out.append(allocator, switch (column.data) {
-                    .int => |values| values[row],
-                    .bigint => |values| values[row],
-                    else => return error.TestUnexpectedResult,
-                });
-            }
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
+const collectCells = helpers.collectIntCells;
 
 test "JOIN USING merges each named column and keeps both sides addressable" {
     const allocator = std.testing.allocator;

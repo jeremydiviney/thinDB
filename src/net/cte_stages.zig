@@ -479,8 +479,9 @@ fn compileTableBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
 /// A single-table block's qualifier names nothing but its one table, so the
 /// block compiles bare: under `FROM t a` (or plain `FROM t`), `a.qty`
 /// (`t.qty`) IS `qty`. Every operator of the chain reads the bare name, so
-/// no handler has to know about qualifiers. Output names are untouched — a
-/// projected `a.qty` already resolves to the source name `qty`. A chain with
+/// no handler has to know about qualifiers. A projected `a.qty` already
+/// outputs the source name `qty`, so output names stay unless dropping the
+/// qualifier makes two of them one. A chain with
 /// an inline derived-table alias keeps its names (that alias qualifies the
 /// block above it, not the scan).
 fn unqualifyTableBlock(input: engine_v2.CompileInput, op: *const ir.Op) !*const ir.Op {
@@ -519,7 +520,9 @@ fn cloneRenamedChain(arena: Allocator, op: *const ir.Op, renames: []const exec.p
     switch (op.*) {
         .scan => out.scan.alias = null,
         .select => |p| {
-            out.select.columns = try renameNames(arena, p.columns, renames);
+            const columns = try renameNames(arena, p.columns, renames);
+            out.select.columns = columns;
+            out.select.outputs = try distinctUnqualifiedOutputs(arena, p, columns);
             out.select.upstream = try cloneRenamedChain(arena, p.upstream, renames);
         },
         .exclude => |p| {
@@ -556,6 +559,29 @@ fn cloneRenamedChain(arena: Allocator, op: *const ir.Op, renames: []const exec.p
         else => unreachable,
     }
     return out;
+}
+
+/// The parser tells `n` and `t.n` apart by the qualifier, so `SELECT n, t.n`
+/// and `SELECT x AS n, t.n` reach here as distinct items; dropping the
+/// qualifier would give them one output name. The later one becomes
+/// `name_N`, as the parser names a repeat.
+fn distinctUnqualifiedOutputs(arena: Allocator, p: ir.Op.Project, columns: []const []const u8) !?[]const ?[]const u8 {
+    var targets: std.ArrayListUnmanaged([]const u8) = .empty;
+    var positions: std.ArrayListUnmanaged(usize) = .empty;
+    for (columns, 0..) |c, i| {
+        if (std.mem.eql(u8, c, "*") or std.mem.endsWith(u8, c, ".*")) continue;
+        const explicit: ?[]const u8 = if (p.outputs) |outs| outs[i] else null;
+        try targets.append(arena, explicit orelse c);
+        try positions.append(arena, i);
+    }
+    const renamed = try types.dedupeColumnNames(arena, targets.items);
+    if (renamed.len == 0) return p.outputs;
+    const outputs = try arena.alloc(?[]const u8, columns.len);
+    if (p.outputs) |outs| @memcpy(outputs, outs) else @memset(outputs, null);
+    for (targets.items, positions.items) |target, i| {
+        if (!std.mem.eql(u8, target, outputs[i] orelse columns[i])) outputs[i] = target;
+    }
+    return outputs;
 }
 
 fn renameNames(arena: Allocator, names: []const []const u8, renames: []const exec.predicate.ColRename) ![]const []const u8 {
