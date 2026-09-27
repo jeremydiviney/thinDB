@@ -237,6 +237,8 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_truncate => "truncate",
         .kw_insert => "insert",
         .kw_interval => "interval",
+        .kw_database => "database",
+        .kw_schema => "schema",
         else => null,
     };
 }
@@ -6126,15 +6128,16 @@ fn countAggs(proj: []const ProjItem) usize {
 }
 
 /// Scalar functions whose result depends on more than their arguments
-/// (wall clock, RNG, ...). A group key built from one of these is NOT a
-/// pure function of the other keys, so it must never be collapsed. The
-/// registry doesn't expose these yet, but list them so the rewrite stays
+/// (wall clock, RNG, the session, ...). A group key built from one of these
+/// is NOT a pure function of the other keys, so it must never be collapsed.
+/// The registry doesn't expose these yet, but list them so the rewrite stays
 /// correct the moment they land.
 pub fn isNondeterministicFn(name: []const u8) bool {
     if (bareTemporalFn(name) != null) return true;
     const names = [_][]const u8{
-        "now",   "random",         "rand",      "uuid", "uuid_short", "sysdate", "unix_timestamp",
-        "sleep", "last_insert_id", "row_count",
+        "now",         "random",         "rand",      "uuid",          "uuid_short", "sysdate",      "unix_timestamp",
+        "sleep",       "last_insert_id", "row_count", "connection_id", "user",       "current_user", "session_user",
+        "system_user", "database",       "schema",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return true;
     return false;

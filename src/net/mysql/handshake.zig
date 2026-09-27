@@ -7,6 +7,8 @@ const Allocator = std.mem.Allocator;
 const packet = @import("packet.zig");
 
 pub const server_version: []const u8 = "8.0.32-thinDB";
+/// What USER() and CURRENT_USER() report: trust auth has no real account.
+pub const reported_user: []const u8 = "thindb@localhost";
 
 pub const CLIENT_LONG_PASSWORD: u32 = 0x00000001;
 pub const CLIENT_LONG_FLAG: u32 = 0x00000004;
