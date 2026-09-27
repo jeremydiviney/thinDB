@@ -94,6 +94,9 @@ pub const ParseError = error{
     SqlSetOpAllUnsupported,
     /// Row values of different widths compared or matched by IN.
     SqlRowValueWidthMismatch,
+    /// `ALTER TABLE ... ADD COLUMN c ... FIRST | AFTER x`: new columns are
+    /// appended.
+    SqlColumnPositionUnsupported,
     /// A CTE's or derived table's column list whose length differs from
     /// its query's SELECT list (MySQL 1353).
     SqlColumnListCountMismatch,
@@ -815,14 +818,16 @@ pub const Parser = struct {
         var root: *ir.Op = undefined;
         var from_is_join = false;
         var proj = parsed_proj;
-        if (self.cur.tag == .kw_from) {
-            try self.advance();
+        const has_from = self.cur.tag == .kw_from;
+        if (has_from) try self.advance();
+        if (has_from and !self.atDual()) {
             const from = try self.parseFromClause();
             root = from.op;
             from_is_join = fromClauseIsJoin(root);
             if (from.sole_unaliased_name) |name| proj = try self.soleSourceStars(parsed_proj, name);
             if (from.merged_star) |columns| proj = try self.mergedJoinStars(parsed_proj, columns);
         } else {
+            if (has_from) try self.advance();
             root = try self.allocOp(.{ .single_row = {} });
         }
 
@@ -1297,6 +1302,12 @@ pub const Parser = struct {
         const query = try self.parseSetOpTail(root, proj, false);
         self.select_output = proj;
         return query;
+    }
+
+    /// MySQL's `DUAL`: the one-row source of a FROM-less SELECT. A
+    /// backquoted `dual` still names a table.
+    fn atDual(self: *const Parser) bool {
+        return self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "dual") and self.lex.src[self.lex.pos - 1] != '`';
     }
 
     /// Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit, e.g.

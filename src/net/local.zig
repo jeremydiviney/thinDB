@@ -2399,22 +2399,12 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             }
         },
         .drop_table => |dt| {
-            // Unqualified refs hit the temp namespace first. Per spec:
-            // DROP TABLE foo drops the temp if it shadows; the persistent
-            // table (if any) stays put.
-            if (dt.table.database == null and dt.table.schema == null) {
-                if (ctx.session.temp_namespace) |ns| {
-                    if (ns.contains(dt.table.name)) {
-                        ns.dropTable(dt.table.name) catch |e| return thindb_api.remapError(Error, e);
-                        return try EmptyOp.create(ctx.allocator);
-                    }
-                }
-            }
-            const sc = (try resolvePersistentTableTarget(catalog, ctx.session.*, dt.table)).schema;
-            sc.dropTable(dt.table.name) catch |e| switch (e) {
-                ApiError.TableNotFound => if (!dt.if_exists) return Error.TableNotFound,
-                else => return thindb_api.remapError(Error, e),
+            // A missing table fails the statement before anything is
+            // dropped, as MySQL's atomic DROP TABLE does.
+            if (!dt.if_exists) for (dt.tables) |ref| {
+                _ = try resolveTable(catalog, ctx.session.*, ref);
             };
+            for (dt.tables) |ref| try dropTable(ctx, catalog, ref, dt.if_exists);
         },
         .rename_table => |rt| {
             if (rt.from.database == null and rt.from.schema == null) {
@@ -2427,24 +2417,40 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             if (!sameNamespace(from, to)) return Error.UnsupportedOp;
             from.schema.renameTable(from.table_name, to.table_name) catch |e| return thindb_api.remapError(Error, e);
         },
-        .alter_table_add_column => |at| {
+        .alter_table => |at| {
             if (at.table.database == null and at.table.schema == null) {
                 if (ctx.session.temp_namespace) |ns| {
                     if (ns.contains(at.table.name)) return Error.UnsupportedOp;
                 }
             }
             const target = try resolvePersistentTableTarget(catalog, ctx.session.*, at.table);
-            const c = at.column;
-            if (c.auto_increment or c.default_now) return Error.UnsupportedOp;
-            const add_default: ?Value = if (c.default_value) |dv| try coerceDefaultLiteral(dv, c.column_type) else null;
-            if (add_default == null and !c.nullable) return Error.UnsupportedOp;
-            var ops = [_]AlterOp{.{ .add = .{
-                .name = c.name,
-                .type = c.column_type,
-                .nullable = c.nullable,
-                .default = add_default,
-            } }};
-            target.schema.alterTable(target.table_name, &ops) catch |e| return thindb_api.remapError(Error, e);
+            var ops: std.ArrayList(AlterOp) = .empty;
+            defer ops.deinit(ctx.allocator);
+            var rename_to: ?PersistentTableTarget = null;
+            for (at.actions) |action| switch (action) {
+                .add_column => |c| try ops.append(ctx.allocator, try addColumnOp(c)),
+                .drop_column => |name| try ops.append(ctx.allocator, .{ .drop = name }),
+                .rename_column => |r| try ops.append(ctx.allocator, .{ .rename = .{ .from = r.from, .to = r.to } }),
+                .change_column => |ch| {
+                    const t = try resolveTable(catalog, ctx.session.*, at.table);
+                    const i = types.findColumn(t.schema.columns, ch.from) orelse return Error.ColumnNotFound;
+                    if (!try changeKeepsDefinition(t.schema.columns[i], ch.column)) return Error.UnsupportedOp;
+                    if (!types.columnNameEql(ch.from, ch.column.name)) {
+                        try ops.append(ctx.allocator, .{ .rename = .{ .from = ch.from, .to = ch.column.name } });
+                    }
+                },
+                .rename_table => |ref| {
+                    const to = try resolvePersistentTableTarget(catalog, ctx.session.*, ref);
+                    if (!sameNamespace(target, to)) return Error.UnsupportedOp;
+                    rename_to = to;
+                },
+            };
+            if (ops.items.len > 0) {
+                target.schema.alterTable(target.table_name, ops.items) catch |e| return thindb_api.remapError(Error, e);
+            }
+            if (rename_to) |to| {
+                target.schema.renameTable(target.table_name, to.table_name) catch |e| return thindb_api.remapError(Error, e);
+            }
         },
         .truncate_table => |ref| {
             const t = try resolveTable(catalog, ctx.session.*, ref);
@@ -2766,6 +2772,47 @@ fn insertFillExpr(ctx: *CompileCtx, aa: Allocator, col: types.Column) !exec.Expr
     if (col.default_now) return .{ .lit = nowDatetime(ctx) };
     if (col.nullable) return .{ .null_lit = col.type };
     return Error.ColumnNotFound;
+}
+
+/// Unqualified refs hit the temp namespace first: DROP TABLE foo drops the
+/// temp table if it shadows, and the persistent table (if any) stays put.
+fn dropTable(ctx: *CompileCtx, catalog: *Catalog, ref: ir.TableRef, if_exists: bool) !void {
+    if (ref.database == null and ref.schema == null) {
+        if (ctx.session.temp_namespace) |ns| {
+            if (ns.contains(ref.name)) {
+                ns.dropTable(ref.name) catch |e| return thindb_api.remapError(Error, e);
+                return;
+            }
+        }
+    }
+    const sc = (try resolvePersistentTableTarget(catalog, ctx.session.*, ref)).schema;
+    sc.dropTable(ref.name) catch |e| switch (e) {
+        ApiError.TableNotFound => if (!if_exists) return Error.TableNotFound,
+        else => return thindb_api.remapError(Error, e),
+    };
+}
+
+/// An added column backfills existing rows with its default, or NULL.
+fn addColumnOp(c: ir.ColumnDef) !AlterOp {
+    if (c.auto_increment or c.default_now) return Error.UnsupportedOp;
+    const add_default: ?Value = if (c.default_value) |dv| try coerceDefaultLiteral(dv, c.column_type) else null;
+    if (add_default == null and !c.nullable) return Error.UnsupportedOp;
+    return .{ .add = .{
+        .name = c.name,
+        .type = c.column_type,
+        .nullable = c.nullable,
+        .default = add_default,
+    } };
+}
+
+/// `CHANGE` / `MODIFY` run only as a rename: a new type, nullability or
+/// default would need every segment rewritten with converted values.
+fn changeKeepsDefinition(existing: types.Column, def: ir.ColumnDef) !bool {
+    if (!std.meta.eql(existing.type, def.column_type) or existing.nullable != def.nullable) return false;
+    if (existing.default_now != def.default_now or existing.auto_increment != def.auto_increment) return false;
+    const default: ?Value = if (def.default_value) |dv| try coerceDefaultLiteral(dv, def.column_type) else null;
+    if (existing.default_value == null or default == null) return existing.default_value == null and default == null;
+    return existing.default_value.?.eql(default.?);
 }
 
 /// MySQL / StarRocks DDL quotes defaults freely (`DEFAULT "0"`,
