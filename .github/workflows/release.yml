@@ -27,8 +27,11 @@ on:
 permissions:
   contents: write
 
+# Concurrency is decided before the job's `if`, so a run the `if` skips
+# (a cancelled or failed ci) would still cancel the release in progress.
+# Only runs that publish share the group; the rest get one of their own.
 concurrency:
-  group: release
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') && 'release' || format('release-skip-{0}', github.run_id) }}
   cancel-in-progress: true
 
 env:
