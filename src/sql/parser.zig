@@ -2491,7 +2491,14 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{
             .fn_name = try self.arena.dupe(u8, name),
             .args = try self.normalizeScalarCallArgs(name, args),
+            .from_statement = self.spelledArgs(args),
         } };
+    }
+
+    /// No argument is a bound parameter's text (`spelledValue`).
+    fn spelledArgs(self: *const Parser, args: []const ir.Expr) bool {
+        for (args) |arg| if (arg == .lit and !self.spelledValue(arg.lit)) return false;
+        return true;
     }
 
     const JsonAggregate = struct { packer: []const u8, wrapper: []const u8, arity: usize };

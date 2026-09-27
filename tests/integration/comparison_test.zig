@@ -1,6 +1,6 @@
 //! The comparison rule (`predicate.typesComparable`) across every place a
 //! comparison is formed: WHERE literals and column pairs, IN lists,
-//! subquery results, correlated keys and join keys. Each case runs against
+//! subquery results, correlated keys, join keys and NULLIF. Each case runs against
 //! the memtable and again against flushed segments, whose encoded kernels
 //! and zonemaps see the coerced literals.
 
@@ -110,6 +110,46 @@ test "comparison: literals of another type take the column's type" {
         .{ .sql = "SELECT id FROM cm WHERE sm > -100000 ORDER BY id", .expected = &.{ 1, 2 } },
         .{ .sql = "SELECT id FROM cm WHERE sm < 32767.5 ORDER BY id", .expected = &.{ 1, 2 } },
         .{ .sql = "SELECT id FROM cm WHERE sm IN (100000, 2) ORDER BY id", .expected = &.{2} },
+    });
+}
+
+test "comparison: a typed temporal literal on the left compares as on the right (issue #325)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setupMixed(allocator, db);
+    try helpers.exec(allocator, db, "CREATE TABLE kd (id BIGINT PRIMARY KEY, date DATE, timestamp DATETIME)");
+    try helpers.exec(allocator, db, "INSERT INTO kd VALUES (1, '2024-03-05', '2024-03-05 10:00:00'), (2, '2024-03-06', '2024-03-06 00:00:00')");
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{ "cm", "kd" }, &.{
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' = d ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' < d ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-06' >= d ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' <=> d ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE TIMESTAMP '2024-03-05 10:00:00' = ts ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE DATETIME '2024-03-05 10:00:00' <= ts ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE NOT DATE '2024-03-05' = d ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' BETWEEN d AND ts ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' NOT BETWEEN d AND ts ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' IN (d, ts) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-06' NOT IN (d) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' + INTERVAL 1 DAY = d ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' = '2024-3-5' ORDER BY id", .expected = &.{ 1, 2, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE DATE '2024-03-05' < DATE '2024-03-06' ORDER BY id", .expected = &.{ 1, 2, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE IF(DATE '2024-03-05' IN (d), 1, 0) = 1 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE CASE WHEN DATE '2024-03-05' < d THEN 1 ELSE 0 END = 1 ORDER BY id", .expected = &.{2} },
+        // An IN list entry no literal leads compares with its value.
+        .{ .sql = "SELECT id FROM cm WHERE 2 IN (i, sm) ORDER BY id", .expected = &.{ 1, 2, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE 1 IN (sm, id + 1) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE 3 NOT IN (i, id) ORDER BY id", .expected = &.{1} },
+        // A column named for the keyword stays a column.
+        .{ .sql = "SELECT id FROM kd WHERE date = '2024-03-05' ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM kd WHERE date IN (DATE '2024-03-06') ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM kd WHERE DATE '2024-03-05' IN (date) ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM kd WHERE TIMESTAMP '2024-03-05 12:00:00' < timestamp ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM kd WHERE date = timestamp ORDER BY id", .expected = &.{2} },
     });
 }
 
@@ -477,6 +517,43 @@ test "comparison: text meets a DATE or DATETIME the way MySQL reads it" {
         .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm JOIN tx ON tx.s = cm.d ORDER BY p", .expected = &.{ 11, 22 } },
         .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm JOIN tx ON tx.s = cm.ts ORDER BY p", .expected = &.{ 11, 26 } },
     });
+}
+
+test "comparison: NULLIF reads a text constant against a DATE or DATETIME as = does (issue #326)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setupMixed(allocator, db);
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{"cm"}, &.{
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(d, '2024-03-05') IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(d, '2024-3-5') IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(d, '20240305') IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(d, '2024-03-06 00:00:00') IS NULL ORDER BY id", .expected = &.{ 2, 3 } },
+        // A time of day no DATE has never equals one.
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(d, '2024-03-05 10:00:00') IS NULL ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(ts, '2024-3-5 10:00') IS NULL ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(ts, '2024-03-05') IS NULL ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(DATE(ts), '2024-3-5') IS NULL ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF('2024-3-5', d) IS NULL ORDER BY id", .expected = &.{1} },
+        // The result is the DATE, so text compared with it reads as a date.
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(d, '2024-3-5') = '2024-3-6' ORDER BY id", .expected = &.{2} },
+        // Text meets text as text.
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(ds, '2024-3-5') IS NULL ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM cm WHERE NULLIF(s, 'apple') IS NULL ORDER BY id", .expected = &.{1} },
+    });
+
+    const statements = [_][]const u8{
+        "SELECT id, NULLIF(d, 'abc') AS x FROM cm",
+        "SELECT id, NULLIF(d, '') AS x FROM cm",
+        "SELECT id, NULLIF(ts, '2024-02-30') AS x FROM cm",
+        "SELECT id, NULLIF('abc', d) AS x FROM cm",
+        "SELECT id FROM cm WHERE NULLIF(d, 'abc') IS NULL",
+        "SELECT NULLIF(DATE '2024-03-05', 'abc') AS x",
+    };
+    try expectInvalidTemporal(allocator, db, &statements);
 }
 
 fn setupTextNumbers(allocator: std.mem.Allocator, db: *thindb.Database) !void {
