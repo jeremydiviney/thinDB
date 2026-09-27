@@ -265,6 +265,69 @@ pub fn floatDigits(x: f64) ?ScaledInt {
     return .{ .m = if (!rounds_away) q else if (m < 0) q - 1 else q + 1, .s = 38 };
 }
 
+/// The longest text `floatText` writes: a sign, `0.`, 14 zeros and 17 digits.
+pub const FLOAT_TEXT_MAX = 40;
+
+pub const FloatTextStyle = enum {
+    /// A DOUBLE or FLOAT value as text: `100`, `-0`, `1e15`.
+    plain,
+    /// A double inside JSON text, where a positional whole number keeps a
+    /// fraction: `100.0`, `0.0`.
+    json,
+};
+
+/// A float as MySQL writes it as text: its shortest round-trip digits,
+/// positional while the decimal point falls at most 15 places after the
+/// first digit (or inside the digits) and at most 14 zeros before it, and
+/// `d.ddde[-]x` otherwise, so `1e14` is `100000000000000` but `1e15` is
+/// `1e15`. A FLOAT keeps its own shortest digits where MySQL rounds it to
+/// six, as StarRocks and DuckDB do. A value that isn't finite writes as
+/// `inf`, `-inf` or `nan`.
+pub fn floatText(buf: *[FLOAT_TEXT_MAX]u8, x: anytype, style: FloatTextStyle) []const u8 {
+    const F = @TypeOf(x);
+    var w: std.Io.Writer = .fixed(buf);
+    writeFloatText(&w, F, x, style) catch unreachable;
+    return w.buffered();
+}
+
+fn writeFloatText(w: *std.Io.Writer, comptime F: type, x: F, style: FloatTextStyle) std.Io.Writer.Error!void {
+    if (std.math.isNan(x)) return w.writeAll("nan");
+    if (std.math.isInf(x)) return w.writeAll(if (x > 0) "inf" else "-inf");
+    if (std.math.signbit(x)) try w.writeByte('-');
+    if (x == 0) return w.writeAll(if (style == .json) "0.0" else "0");
+    const Bits = @Int(.unsigned, @bitSizeOf(F));
+    const float_fmt = std.fmt.float;
+    const d = float_fmt.binaryToDecimal(u64, @as(Bits, @bitCast(x)), std.math.floatMantissaBits(F), std.math.floatExponentBits(F), false, &float_fmt.Backend64_TablesFull);
+    var digit_buf: [24]u8 = undefined;
+    const all_digits = std.fmt.bufPrint(&digit_buf, "{d}", .{d.mantissa}) catch unreachable;
+    const point: i32 = @as(i32, @intCast(all_digits.len)) + d.exponent;
+    const digits = std.mem.trimEnd(u8, all_digits, "0");
+    const len: i32 = @intCast(digits.len);
+    if (point >= -14 and (point <= 15 or len > point)) {
+        if (point <= 0) {
+            try w.writeAll("0.");
+            try w.splatByteAll('0', @intCast(-point));
+            try w.writeAll(digits);
+        } else if (point >= len) {
+            try w.writeAll(digits);
+            try w.splatByteAll('0', @intCast(point - len));
+            if (style == .json) try w.writeAll(".0");
+        } else {
+            const whole: usize = @intCast(point);
+            try w.writeAll(digits[0..whole]);
+            try w.writeByte('.');
+            try w.writeAll(digits[whole..]);
+        }
+        return;
+    }
+    try w.writeByte(digits[0]);
+    if (digits.len > 1) {
+        try w.writeByte('.');
+        try w.writeAll(digits[1..]);
+    }
+    try w.print("e{d}", .{point - 1});
+}
+
 /// Text as a DOUBLE: any number `textNumber` reads, correctly rounded.
 pub fn textDouble(raw: []const u8) ?f64 {
     return switch (textNumber(raw) orelse return null) {
@@ -451,6 +514,41 @@ test "floatDigits: a double's shortest digits" {
     };
     inline for (cases) |c| try t.expectEqual(c[1], floatDigits(c[0]).?);
     inline for (.{ 1e38, -1e39, std.math.inf(f64), std.math.nan(f64) }) |bad| try t.expect(floatDigits(bad) == null);
+}
+
+test "floatText: doubles and floats as MySQL 8.4 writes them" {
+    const t = std.testing;
+    const cases = .{
+        .{ @as(f64, 1e100), "1e100" },
+        .{ @as(f64, 1e15), "1e15" },
+        .{ @as(f64, 1e14), "100000000000000" },
+        .{ @as(f64, 1e16), "1e16" },
+        .{ @as(f64, 1.5e17), "1.5e17" },
+        .{ @as(f64, 1e15) + 0.5, "1000000000000000.5" },
+        .{ @as(f64, 123456789012345678.0), "1.2345678901234568e17" },
+        .{ @as(f64, 1234567890123456.7), "1234567890123456.8" },
+        .{ @as(f64, 9.223372036854776e18), "9.223372036854776e18" },
+        .{ @as(f64, 1.5e-16), "1.5e-16" },
+        .{ @as(f64, 1e-15), "0.000000000000001" },
+        .{ @as(f64, -2.5e-5), "-0.000025" },
+        .{ @as(f64, 0.1) + @as(f64, 0.2), "0.30000000000000004" },
+        .{ @as(f64, 100.0), "100" },
+        .{ @as(f64, 0.0), "0" },
+        .{ @as(f64, -0.0), "-0" },
+        .{ @as(f64, 1.7976931348623157e308), "1.7976931348623157e308" },
+        .{ @as(f64, 5e-324), "5e-324" },
+        .{ std.math.inf(f64), "inf" },
+        .{ -std.math.inf(f64), "-inf" },
+        .{ @as(f32, 0.1), "0.1" },
+        .{ @as(f32, 3.4e38), "3.4e38" },
+        .{ @as(f32, 1234567.0), "1234567" },
+        .{ @as(f32, 1e-10), "0.0000000001" },
+    };
+    var buf: [FLOAT_TEXT_MAX]u8 = undefined;
+    inline for (cases) |c| try t.expectEqualStrings(c[1], floatText(&buf, c[0], .plain));
+    try t.expectEqualStrings("100.0", floatText(&buf, @as(f64, 100), .json));
+    try t.expectEqualStrings("0.0", floatText(&buf, @as(f64, 0), .json));
+    try t.expectEqualStrings("1e15", floatText(&buf, @as(f64, 1e15), .json));
 }
 
 test "parseDateTimeString: fractions, date-only, Z, rejects" {

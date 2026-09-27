@@ -3,8 +3,10 @@
 //! REGEXP_* match-type and position arguments, the JSON constructors and
 //! aggregates, LAST_INSERT_ID() and ROW_COUNT(); then text read where a
 //! number is expected, HEX of numbers, regex line anchors, JSON read as text
-//! by string functions, and the information functions (#276-#282). Expected
-//! values are MySQL 8.4 output for the same statements.
+//! by string functions, and the information functions (#276-#282); then
+//! doubles as text, fractional integer arguments, JSON_QUOTE, COLLATION and
+//! BENCHMARK (#295-#299). Expected values are MySQL 8.4 output for the same
+//! statements.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -299,6 +301,145 @@ const json_cases = [_]Case{
     .{ .sql = "CAST('{\"b\": [1, 2.5], \"a\": {\"y\": null}}' AS JSON)", .want = "{\"a\": {\"y\": null}, \"b\": [1, 2.5]}" },
 };
 
+/// A double or float becomes text as MySQL writes it, wherever it does:
+/// shortest round-trip digits, positional for a decimal exponent in
+/// -15..14, `d.ddde[-]x` otherwise.
+const double_text_cases = [_]Case{
+    .{ .sql = "CAST(1e100 AS CHAR)", .want = "1e100" },
+    .{ .sql = "CAST(1e15 AS CHAR)", .want = "1e15" },
+    .{ .sql = "CAST(1e14 AS CHAR)", .want = "100000000000000" },
+    .{ .sql = "CAST(1e16 AS CHAR)", .want = "1e16" },
+    .{ .sql = "CAST(1.5e17 AS CHAR)", .want = "1.5e17" },
+    .{ .sql = "CAST(100e0 AS CHAR)", .want = "100" },
+    .{ .sql = "CAST(-0e0 AS CHAR)", .want = "-0" },
+    .{ .sql = "CAST(0e0 AS CHAR)", .want = "0" },
+    .{ .sql = "CAST(1e-15 AS CHAR)", .want = "0.000000000000001" },
+    .{ .sql = "CAST(1e-16 AS CHAR)", .want = "1e-16" },
+    .{ .sql = "CAST(1.5e-15 AS CHAR)", .want = "0.0000000000000015" },
+    .{ .sql = "CAST(-1.5e0 AS CHAR)", .want = "-1.5" },
+    .{ .sql = "CAST(1e15 + 0.5 AS CHAR)", .want = "1000000000000000.5" },
+    .{ .sql = "CAST(1.7976931348623157e308 AS CHAR)", .want = "1.7976931348623157e308" },
+    .{ .sql = "CAST(5e-324 AS CHAR)", .want = "5e-324" },
+    .{ .sql = "CONCAT(1e100, '')", .want = "1e100" },
+    .{ .sql = "CONCAT(100e0, 'x')", .want = "100x" },
+    .{ .sql = "CONCAT(0.1e0 + 0.2e0, '')", .want = "0.30000000000000004" },
+    .{ .sql = "CONCAT(-1.5e-16, '')", .want = "-1.5e-16" },
+    .{ .sql = "CONCAT(POW(2, 70), '')", .want = "1.1805916207174113e21" },
+    .{ .sql = "CONCAT(1 / 3e0, '')", .want = "0.3333333333333333" },
+    .{ .sql = "CONCAT(SQRT(2), '')", .want = "1.4142135623730951" },
+    .{ .sql = "CONCAT_WS(',', 1e20, 2.5e0)", .want = "1e20,2.5" },
+    .{ .sql = "LENGTH(1e100)", .want = "5" },
+    .{ .sql = "LENGTH(1e15)", .want = "4" },
+    .{ .sql = "REPLACE(1e20, 'e', 'E')", .want = "1E20" },
+    .{ .sql = "UPPER(1e20)", .want = "1E20" },
+    .{ .sql = "LPAD(1.5e0, 5, '0')", .want = "001.5" },
+    .{ .sql = "CONCAT(CAST(1.1 AS FLOAT), '')", .want = "1.1" },
+    .{ .sql = "CONCAT(CAST(3.4e38 AS FLOAT), '')", .want = "3.4e38" },
+    .{ .sql = "CONCAT(CAST(1e-10 AS FLOAT), '')", .want = "0.0000000001" },
+    .{ .sql = "CONCAT(CAST(123.456 AS FLOAT), '')", .want = "123.456" },
+    .{ .sql = "CAST(JSON_ARRAY(1e20, 100e0, 0e0) AS CHAR)", .want = "[1e20, 100.0, 0.0]" },
+};
+
+/// A double or decimal meets an integer parameter as MySQL reads it: a
+/// double rounds half to even, a decimal half away from zero, and text reads
+/// its leading integer. A boolean widens to a double for text arithmetic.
+const integer_arg_cases = [_]Case{
+    .{ .sql = "ELT(1.5e0, 'x', 'y', 'z')", .want = "y" },
+    .{ .sql = "ELT(2.5e0, 'x', 'y', 'z')", .want = "y" },
+    .{ .sql = "ELT(1.5, 'x', 'y', 'z')", .want = "y" },
+    .{ .sql = "ELT('1.5', 'x', 'y', 'z')", .want = "x" },
+    .{ .sql = "ELT('2.9', 'x', 'y', 'z')", .want = "y" },
+    .{ .sql = "ELT('2e0', 'x', 'y', 'z')", .want = "y" },
+    .{ .sql = "ELT('abc', 'x', 'y', 'z')", .want = null },
+    .{ .sql = "ELT(-1.5e0, 'x')", .want = null },
+    .{ .sql = "ELT(CAST(NULL AS DECIMAL(5,2)), 'a')", .want = null },
+    .{ .sql = "REPEAT('a', 2.5e0)", .want = "aa" },
+    .{ .sql = "REPEAT('a', 3.5e0)", .want = "aaaa" },
+    .{ .sql = "REPEAT('a', 2.5)", .want = "aaa" },
+    .{ .sql = "REPEAT('a', 1.49)", .want = "a" },
+    .{ .sql = "REPEAT('ab', 1e0 + 1.4e0)", .want = "abab" },
+    .{ .sql = "LEFT('abcdef', 2.7e0)", .want = "abc" },
+    .{ .sql = "LEFT('abcdef', -0.5)", .want = "" },
+    .{ .sql = "RIGHT('abcdef', 1.5e0)", .want = "ef" },
+    .{ .sql = "SUBSTRING('abcdef', 1.5, 2.5)", .want = "bcd" },
+    .{ .sql = "SUBSTRING('abcdef', -1.5)", .want = "ef" },
+    .{ .sql = "MID('abcdef', 2.5e0, 2)", .want = "bc" },
+    .{ .sql = "INSERT('abcdef', 2.5, 1.5, 'X')", .want = "abXef" },
+    .{ .sql = "LPAD('a', 2.5e0, 'x')", .want = "xa" },
+    .{ .sql = "LOCATE('b', 'abcabc', 2.5)", .want = "5" },
+    .{ .sql = "CHAR_LENGTH(SPACE(1.5))", .want = "2" },
+    .{ .sql = "INET_NTOA(2.5e0)", .want = "0.0.0.2" },
+    .{ .sql = "TRUE + '1'", .want = "2" },
+    .{ .sql = "TRUE + '1.5'", .want = "2.5" },
+    .{ .sql = "FALSE - '2'", .want = "-2" },
+    .{ .sql = "TRUE * 'abc'", .want = "0" },
+    .{ .sql = "'1' + TRUE", .want = "2" },
+    .{ .sql = "TRUE / '2'", .want = "0.5" },
+    .{ .sql = "TRUE DIV '2'", .want = "0" },
+    .{ .sql = "TRUE + 1e0", .want = "2" },
+    .{ .sql = "CAST(TRUE + 2.5 AS CHAR)", .want = "3.5" },
+    .{ .sql = "CASE WHEN 1 = 1 THEN TRUE ELSE 1.5e0 END", .want = "1" },
+    .{ .sql = "GREATEST(TRUE, 0.5e0)", .want = "1" },
+    .{ .sql = "COALESCE(NULL, TRUE, 2.5e0)", .want = "1" },
+};
+
+const json_quote_cases = [_]Case{
+    .{ .sql = "JSON_QUOTE('a')", .want = "\"a\"" },
+    .{ .sql = "JSON_QUOTE('a\"b')", .want = "\"a\\\"b\"" },
+    .{ .sql = "JSON_QUOTE('a\\\\b')", .want = "\"a\\\\b\"" },
+    .{ .sql = "JSON_QUOTE(NULL)", .want = null },
+    .{ .sql = "JSON_QUOTE('')", .want = "\"\"" },
+    .{ .sql = "JSON_QUOTE('line1\\nline2\\ttab')", .want = "\"line1\\nline2\\ttab\"" },
+    .{ .sql = "JSON_QUOTE('é/ü')", .want = "\"é/ü\"" },
+    .{ .sql = "JSON_QUOTE('[1, 2]')", .want = "\"[1, 2]\"" },
+    .{ .sql = "JSON_QUOTE(JSON_QUOTE('a'))", .want = "\"\\\"a\\\"\"" },
+    .{ .sql = "CHAR_LENGTH(JSON_QUOTE('ab'))", .want = "4" },
+    .{ .sql = "JSON_TYPE(JSON_QUOTE('a'))", .want = "STRING" },
+    .{ .sql = "JSON_VALID(JSON_QUOTE('a\"b'))", .want = "1" },
+    .{ .sql = "CAST(JSON_EXTRACT(JSON_QUOTE('a'), '$') AS CHAR)", .want = "\"a\"" },
+    .{ .sql = "JSON_UNQUOTE(JSON_QUOTE('a\"b'))", .want = "a\"b" },
+    .{ .sql = "CHARSET(JSON_QUOTE('a'))", .want = "utf8mb4" },
+};
+
+/// COLLATION names its argument type's collation as CHARSET names its
+/// character set; a bare NULL has neither, and a system function's text is
+/// utf8mb3. BENCHMARK is 0, or NULL for a NULL or negative count.
+const type_name_cases = [_]Case{
+    .{ .sql = "COLLATION(1)", .want = "binary" },
+    .{ .sql = "COLLATION(NULL)", .want = "binary" },
+    .{ .sql = "COLLATION((NULL))", .want = "binary" },
+    .{ .sql = "COLLATION(1.5)", .want = "binary" },
+    .{ .sql = "COLLATION(1.5e0)", .want = "binary" },
+    .{ .sql = "COLLATION(TRUE)", .want = "binary" },
+    .{ .sql = "COLLATION(DATE '2024-01-02')", .want = "binary" },
+    .{ .sql = "COLLATION(NOW())", .want = "binary" },
+    .{ .sql = "COLLATION(JSON_ARRAY(1))", .want = "utf8mb4_bin" },
+    .{ .sql = "COLLATION(UUID())", .want = "utf8mb3_general_ci" },
+    .{ .sql = "COLLATION(VERSION())", .want = "utf8mb3_general_ci" },
+    .{ .sql = "COLLATION(CHARSET(1))", .want = "utf8mb3_general_ci" },
+    .{ .sql = "COLLATION(COLLATION(1))", .want = "utf8mb3_general_ci" },
+    .{ .sql = "CHARSET(NULL)", .want = "binary" },
+    .{ .sql = "CHARSET((NULL))", .want = "binary" },
+    .{ .sql = "CHARSET(NULL + 1)", .want = "binary" },
+    .{ .sql = "CHARSET(UUID())", .want = "utf8mb3" },
+    .{ .sql = "CHARSET(VERSION())", .want = "utf8mb3" },
+    .{ .sql = "CHARSET(CHARSET(1))", .want = "utf8mb3" },
+    .{ .sql = "CHARSET(COLLATION(1))", .want = "utf8mb3" },
+    .{ .sql = "CHARSET(IFNULL(NULL, 'a'))", .want = "utf8mb4" },
+    .{ .sql = "BENCHMARK(1, 1)", .want = "0" },
+    .{ .sql = "BENCHMARK(0, 1)", .want = "0" },
+    .{ .sql = "BENCHMARK(3, 'a')", .want = "0" },
+    .{ .sql = "BENCHMARK(2, NULL)", .want = "0" },
+    .{ .sql = "BENCHMARK(NULL, 1)", .want = null },
+    .{ .sql = "BENCHMARK(-1, 1)", .want = null },
+    .{ .sql = "BENCHMARK(1.5, 1)", .want = "0" },
+    .{ .sql = "BENCHMARK(-0.4, 1)", .want = "0" },
+    .{ .sql = "BENCHMARK(-1.5e0, 1)", .want = null },
+    .{ .sql = "BENCHMARK('3', 1)", .want = "0" },
+    .{ .sql = "BENCHMARK('-2', 1)", .want = null },
+    .{ .sql = "BENCHMARK(1, 1) + 1", .want = "1" },
+};
+
 const error_cases = [_][]const u8{
     "SELECT SLEEP(NULL)",
     "SELECT SLEEP(-1)",
@@ -404,6 +545,56 @@ test "MySQL misc functions: implicit conversions, HEX, regex anchors and CHARSET
             try expectCells(allocator, db, sql_buf.items, 0, &.{c.want});
         }
     }
+}
+
+test "MySQL misc functions: doubles as text, integer arguments, JSON_QUOTE, COLLATION and BENCHMARK match MySQL 8.4" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    var sql_buf: std.ArrayList(u8) = .empty;
+    defer sql_buf.deinit(allocator);
+    inline for (.{ double_text_cases, integer_arg_cases, json_quote_cases, type_name_cases }) |cases| {
+        for (cases) |c| {
+            sql_buf.clearRetainingCapacity();
+            try sql_buf.print(allocator, "SELECT {s}", .{c.sql});
+            try expectCells(allocator, db, sql_buf.items, 0, &.{c.want});
+        }
+    }
+    try expectCells(allocator, db, "SELECT COLLATION('a')", 0, &.{"utf8mb4_general_ci"});
+    try expectCells(allocator, db, "SELECT GROUP_CONCAT(x ORDER BY x) FROM (SELECT 1e100 x UNION ALL SELECT 1.5e0 UNION ALL SELECT 1e15) t", 0, &.{"1.5,1e15,1e100"});
+    try expectCells(allocator, db, "SELECT GROUP_CONCAT(REPEAT('a', x) ORDER BY x) FROM (SELECT 2.5 x UNION ALL SELECT 3.5 UNION ALL SELECT 1.49) t", 0, &.{"a,aaa,aaaa"});
+    try expectCells(allocator, db, "SELECT GROUP_CONCAT(ELT(x, 'p', 'q', 'r') ORDER BY x) FROM (SELECT 1.5e0 x UNION ALL SELECT 0.4e0 UNION ALL SELECT 2.5e0) t", 0, &.{"q,q"});
+}
+
+test "MySQL misc functions: FLOAT, DOUBLE and DECIMAL columns as text and as integer arguments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE fd (id BIGINT PRIMARY KEY, x FLOAT, y DOUBLE, d DECIMAL(10,2), s VARCHAR(40))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO fd (id, x, y, d, s) VALUES
+        \\ (1, 0.1, 1e100, 2.5, 'a'), (2, 3.4e38, 1.5e-16, 1.49, 'b'), (3, 1234567, 1e15, -1.5, 'c'), (4, NULL, NULL, NULL, NULL)
+    );
+
+    try expectCells(allocator, db, "SELECT CONCAT(x, '|', y) FROM fd ORDER BY id", 0, &.{ "0.1|1e100", "3.4e38|1.5e-16", "1234567|1e15", null });
+    try expectCells(allocator, db, "SELECT CAST(y AS CHAR) FROM fd ORDER BY id", 0, &.{ "1e100", "1.5e-16", "1e15", null });
+    try expectCells(allocator, db, "SELECT GROUP_CONCAT(y ORDER BY id) FROM fd", 0, &.{"1e100,1.5e-16,1e15"});
+    try expectCells(allocator, db, "SELECT JSON_QUOTE(CAST(x AS CHAR)) FROM fd ORDER BY id", 0, &.{ "\"0.1\"", "\"3.4e38\"", "\"1234567\"", null });
+    try expectCells(allocator, db, "SELECT REPEAT('a', d) FROM fd ORDER BY id", 0, &.{ "aaa", "a", "", null });
+    try expectCells(allocator, db, "SELECT ELT(d, 'p', 'q', 'r') FROM fd ORDER BY id", 0, &.{ "r", "p", null, null });
+    try expectCells(allocator, db, "SELECT LEFT('abcdef', y) FROM fd ORDER BY id", 0, &.{ "abcdef", "", "abcdef", null });
+    try expectCells(allocator, db, "SELECT BENCHMARK(d, y) FROM fd ORDER BY id", 0, &.{ "0", "0", null, null });
+    try expectCells(allocator, db, "SELECT COLLATION(s) FROM fd ORDER BY id", 0, &.{ "utf8mb4_general_ci", "utf8mb4_general_ci", "utf8mb4_general_ci", "utf8mb4_general_ci" });
+    try expectCells(allocator, db, "SELECT CHARSET(x) FROM fd WHERE id = 4", 0, &.{"binary"});
+
+    try helpers.exec(allocator, db, "INSERT INTO fd (id, s) VALUES (5, 1e100), (6, 2.5e0)");
+    try helpers.exec(allocator, db, "UPDATE fd SET s = y WHERE id = 3");
+    try expectCells(allocator, db, "SELECT s FROM fd WHERE id >= 3 ORDER BY id", 0, &.{ "1e15", null, "1e100", "2.5" });
 }
 
 test "MySQL misc functions: text and JSON columns convert per row" {
@@ -566,7 +757,8 @@ test "MySQL misc functions: information functions read the session" {
         .{ .sql = "SELECT DATABASE() AS db, 2", .want = "sales" },
         .{ .sql = "SELECT UPPER(SCHEMA())", .want = "SALES" },
         .{ .sql = "SELECT 'hit' WHERE CONNECTION_ID() = 42 AND DATABASE() = 'sales'", .want = "hit" },
-        .{ .sql = "SELECT CHARSET(DATABASE())", .want = "utf8mb4" },
+        .{ .sql = "SELECT CHARSET(DATABASE())", .want = "utf8mb3" },
+        .{ .sql = "SELECT COLLATION(USER())", .want = "utf8mb3_general_ci" },
     };
     for (cases) |c| try expectSessionCells(allocator, db, session, c.sql, &.{c.want});
 

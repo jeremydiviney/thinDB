@@ -529,26 +529,35 @@ pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: T
     }
 }
 
-/// HEX(decimal): the value rounded half away from zero to a BIGINT, as
-/// MySQL reads a DECIMAL as an integer (clamped to the BIGINT range), then
-/// printed as `common.integerHex` prints one.
+/// HEX(decimal): the value read as an integer (`integerArgAt`), printed
+/// as `common.integerHex` prints one.
 ///
 /// An integer literal past BIGINT is a DECIMAL of scale 0 here, but MySQL
 /// reads one up to 2^64 - 1 as BIGINT UNSIGNED, so a scale-0 value in that
 /// range keeps its bits (`HEX(18446744073709551615)` is FFFFFFFFFFFFFFFF).
 pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     _ = out_type;
-    const scale = scaleOf(arg_types[0]);
-    const unit = pow10(scale);
+    const t = arg_types[0];
     var buf: [16]u8 = undefined;
     for (0..n) |row| {
-        const whole = roundDiv(mantissaAt(args[0], row), unit);
-        const v: i64 = if (scale == 0)
-            common.wideIntegerAsBigint(whole)
-        else
-            std.math.cast(i64, whole) orelse if (whole < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+        const v = if (scaleOf(t) == 0) common.wideIntegerAsBigint(mantissaAt(args[0], row)) else integerArgAt(args[0], t, row);
         try common.stringStoreOf(out).appendValue(allocator, common.integerHex(&buf, v));
     }
+}
+
+/// A DECIMAL where MySQL reads it as an integer (`HEX(2.5)`,
+/// `REPEAT('a', 2.5)`): rounded half away from zero, clamped to the
+/// BIGINT range.
+pub fn integerArgAt(v: ColumnView, t: Type, row: usize) i64 {
+    const whole = roundDiv(mantissaAt(v, row), pow10(scaleOf(t)));
+    return std.math.cast(i64, whole) orelse if (whole < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+}
+
+pub fn integerArgKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    const dst = &out.data.bigint;
+    try dst.ensureUnusedCapacity(allocator, n);
+    for (0..n) |row| dst.appendAssumeCapacity(integerArgAt(args[0], arg_types[0], row));
 }
 
 /// MySQL's `FORMAT(x, d)`: `x` rounded to `d` places (clamped to 0..30),

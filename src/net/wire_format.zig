@@ -9,11 +9,13 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 
-const temporal_text = @import("../exec/scalar_fn_common.zig");
-pub const Ymd = temporal_text.Ymd;
-pub const civilFromDays = temporal_text.civilFromDays;
-pub const formatDate = temporal_text.formatDate;
-pub const formatDateTime = temporal_text.formatDateTime;
+const exec_text = @import("../exec/scalar_fn_common.zig");
+pub const Ymd = exec_text.Ymd;
+pub const civilFromDays = exec_text.civilFromDays;
+pub const formatDate = exec_text.formatDate;
+pub const formatDateTime = exec_text.formatDateTime;
+pub const FLOAT_TEXT_MAX = exec_text.FLOAT_TEXT_MAX;
+pub const floatText = exec_text.floatText;
 
 /// Inverse of `civilFromDays`. Howard Hinnant's "days_from_civil"
 /// algorithm. Returns days since 1970-01-01. Returns `error.InvalidDate`

@@ -384,8 +384,9 @@ fn formatCellText(
         .tinyint => |s| try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{s[row]})),
         .largeint => |s| try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{s[row]})),
         .boolean => |s| try out.appendSlice(allocator, if (s[row] != 0) "t" else "f"),
-        .float => |s| try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{@as(f64, s[row])})),
-        .double => |s| try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{s[row]})),
+        // A double's plain digits run past 300 characters.
+        .float => |s| try out.print(allocator, "{d}", .{@as(f64, s[row])}),
+        .double => |s| try out.print(allocator, "{d}", .{s[row]}),
         .date => |s| {
             var buf: [16]u8 = undefined;
             try out.appendSlice(allocator, try wire_format.formatDate(&buf, s[row]));

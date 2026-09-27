@@ -846,16 +846,27 @@ pub fn concatWsKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
 /// The character set MySQL names for a value of the argument's type: text
 /// and JSON are utf8mb4, every other type binary. A NULL still has a type,
 /// so the result is never NULL.
-pub fn charsetKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
-    _ = out_type;
-    _ = args;
-    const charset: []const u8 = if (arg_types[0].isString()) "utf8mb4" else "binary";
-    const ss = stringStoreOf(out);
-    const base = out.data.rowCount();
-    for (0..row_count) |row| {
-        try ss.appendValue(allocator, charset);
-        try out.appendValidBit(allocator, base + row, true);
-    }
+pub const charsetKernel = typeNamedKernel("utf8mb4", "utf8mb4", "binary");
+
+/// The collation MySQL names for a value of the argument's type, as
+/// `charsetKernel` names its character set: text collates as the connection
+/// does (`@@collation_connection`), JSON as utf8mb4_bin.
+pub const collationKernel = typeNamedKernel("utf8mb4_general_ci", "utf8mb4_bin", "binary");
+
+fn typeNamedKernel(comptime text: []const u8, comptime json: []const u8, comptime other: []const u8) common.TypedKernelFn {
+    return struct {
+        fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+            _ = out_type;
+            _ = args;
+            const name: []const u8 = if (arg_types[0] == .json) json else if (arg_types[0].isString()) text else other;
+            const ss = stringStoreOf(out);
+            const base = out.data.rowCount();
+            for (0..row_count) |row| {
+                try ss.appendValue(allocator, name);
+                try out.appendValidBit(allocator, base + row, true);
+            }
+        }
+    }.kernel;
 }
 
 /// `__row_key(a, b, ...)`: the ascending order key of the arguments, which
@@ -1414,14 +1425,8 @@ pub fn eltKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSto
 
 fn eltIndex(n_arg: ColumnView, row: usize, count: usize) ?usize {
     if (!n_arg.isValid(row)) return null;
-    switch (n_arg.data) {
-        .bigint => |s| return if (s[row] >= 1 and s[row] <= count) @intCast(s[row]) else null,
-        .double => |s| {
-            const n = common.roundHalfEven(s[row]);
-            return if (n >= 1 and n <= @as(f64, @floatFromInt(count))) @intFromFloat(n) else null;
-        },
-        else => unreachable, // the overloads take a BIGINT or DOUBLE `n`
-    }
+    const n = n_arg.data.bigint[row];
+    return if (n >= 1 and n <= count) @intCast(n) else null;
 }
 
 /// INSERT(s, pos, len, new): `s` with the `len` characters from `pos`

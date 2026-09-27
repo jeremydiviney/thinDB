@@ -11,6 +11,8 @@ const ColumnStore = common.ColumnStore;
 const simd = @import("../util/simd.zig");
 const memory = @import("../memory.zig");
 const jb = @import("json_binary.zig");
+const dec = @import("scalar_fn_decimal.zig");
+const Type = @import("../types.zig").Type;
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 
@@ -699,6 +701,12 @@ fn numericText(allocator: Allocator, v: ColumnView, row: usize, scratch: *std.Ar
 pub const textAsDoubleKernel = textAsNumber("double", common.leadingDouble);
 pub const textAsBigintKernel = textAsNumber("bigint", common.leadingInteger);
 
+pub fn doubleIntegerArgKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const dst = &out.data.bigint;
+    try dst.ensureUnusedCapacity(allocator, row_count);
+    for (args[0].data.double[0..row_count]) |x| dst.appendAssumeCapacity(common.doubleAsBigint(x));
+}
+
 pub fn intToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.int;
     const ss = stringStoreOf(out);
@@ -722,14 +730,17 @@ pub fn bigintToStringKernel(allocator: Allocator, args: []const ColumnView, out:
 }
 
 pub fn doubleToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.double;
+    try appendFloatTexts(allocator, args[0].data.double[0..row_count], out);
+}
+
+pub fn floatToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try appendFloatTexts(allocator, args[0].data.float[0..row_count], out);
+}
+
+fn appendFloatTexts(allocator: Allocator, values: anytype, out: *ColumnStore) !void {
     const ss = stringStoreOf(out);
-    var buf: [64]u8 = undefined;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const text = try std.fmt.bufPrint(&buf, "{d}", .{s[i]});
-        try ss.appendValue(allocator, text);
-    }
+    var buf: [common.FLOAT_TEXT_MAX]u8 = undefined;
+    for (values) |x| try ss.appendValue(allocator, common.floatText(&buf, x, .plain));
 }
 
 pub fn boolToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -819,6 +830,29 @@ fn intervalIndex(comptime field: []const u8, args: []const ColumnView, row: usiz
         if (bound.isValid(row) and @field(bound.data, field)[row] > n) return @intCast(i);
     }
     return @intCast(args.len - 1);
+}
+
+/// BENCHMARK(count, expr): 0, or NULL when `count` is NULL or negative, as
+/// in MySQL. `expr` is evaluated once, as an argument, not `count` times.
+pub fn benchmarkKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = out_type;
+    const dst = &out.data.bigint;
+    try dst.ensureUnusedCapacity(allocator, row_count);
+    const base = out.data.rowCount();
+    for (0..row_count) |row| {
+        const counted = args[0].isValid(row) and !negativeCount(arg_types[0], args[0], row);
+        dst.appendAssumeCapacity(0);
+        try out.appendValidBit(allocator, base + row, counted);
+    }
+}
+
+fn negativeCount(t: Type, v: ColumnView, row: usize) bool {
+    return switch (v.data) {
+        .float => |s| common.roundHalfEven(s[row]) < 0,
+        .double => |s| common.roundHalfEven(s[row]) < 0,
+        .string, .varchar, .char => common.leadingInteger(stringViewOf(v).rowBytes(row)) < 0,
+        else => dec.integerArgAt(v, t, row) < 0,
+    };
 }
 
 /// Longest single wait between checks for KILL QUERY or a dropped client.
