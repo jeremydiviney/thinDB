@@ -23,6 +23,14 @@ const Allocator = std.mem.Allocator;
 
 pub const Error = error{RegexInvalidPattern} || Allocator.Error;
 
+/// Pattern-wide flags, as SQL match types set them.
+pub const Options = struct {
+    /// ASCII letters match either case.
+    case_insensitive: bool = false,
+    /// `.` matches '\n' too.
+    dot_all: bool = false,
+};
+
 /// 256-bit set of matchable bytes.
 const CharClass = struct {
     bits: [32]u8 = [_]u8{0} ** 32,
@@ -39,6 +47,16 @@ const CharClass = struct {
     }
     fn contains(self: CharClass, b: u8) bool {
         return (self.bits[b >> 3] & (@as(u8, 1) << @intCast(b & 7))) != 0;
+    }
+    fn addOtherCases(self: *CharClass) void {
+        for ('a'..'z' + 1) |c| {
+            const lower: u8 = @intCast(c);
+            const upper = std.ascii.toUpper(lower);
+            if (self.contains(lower) or self.contains(upper)) {
+                self.add(lower);
+                self.add(upper);
+            }
+        }
     }
 };
 
@@ -76,6 +94,7 @@ const Parser = struct {
     pos: usize = 0,
     arena: Allocator,
     next_group: u32 = 1, // group 0 is the whole match
+    options: Options = .{},
 
     fn peek(self: *Parser) ?u8 {
         return if (self.pos < self.pat.len) self.pat[self.pos] else null;
@@ -89,6 +108,13 @@ const Parser = struct {
         const n = try self.arena.create(Node);
         n.* = v;
         return n;
+    }
+
+    fn literal(self: *Parser, b: u8) Error!*Node {
+        var cc: CharClass = .{};
+        cc.add(b);
+        if (self.options.case_insensitive) cc.addOtherCases();
+        return self.node(.{ .class = cc });
     }
 
     fn parseAlt(self: *Parser) Error!*Node {
@@ -197,8 +223,8 @@ const Parser = struct {
             '.' => {
                 _ = self.advance();
                 var cc: CharClass = .{};
-                cc.add('\n');
-                cc.negate(); // any byte except newline
+                if (!self.options.dot_all) cc.add('\n');
+                cc.negate();
                 return self.node(.{ .class = cc });
             },
             '^' => {
@@ -213,9 +239,7 @@ const Parser = struct {
             ')', '*', '+', '?', '{' => return Error.RegexInvalidPattern,
             else => {
                 _ = self.advance();
-                var cc: CharClass = .{};
-                cc.add(c);
-                return self.node(.{ .class = cc });
+                return self.literal(c);
             },
         }
     }
@@ -230,11 +254,7 @@ const Parser = struct {
             'd', 'D', 'w', 'W', 's', 'S' => {
                 return self.node(.{ .class = shorthandClass(c) });
             },
-            else => {
-                var cc: CharClass = .{};
-                cc.add(unescapeByte(c));
-                return self.node(.{ .class = cc });
-            },
+            else => return self.literal(unescapeByte(c)),
         }
     }
 
@@ -250,6 +270,7 @@ const Parser = struct {
         while (self.peek()) |c| {
             if (c == ']' and !first) {
                 _ = self.advance();
+                if (self.options.case_insensitive) cc.addOtherCases();
                 if (negated) cc.negate();
                 return self.node(.{ .class = cc });
             }
@@ -587,10 +608,14 @@ pub const Regex = struct {
     prefilter_bytes: []const u8,
 
     pub fn compile(allocator: Allocator, pattern: []const u8) Error!Regex {
+        return compileWith(allocator, pattern, .{});
+    }
+
+    pub fn compileWith(allocator: Allocator, pattern: []const u8, options: Options) Error!Regex {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        var parser = Parser{ .pat = pattern, .arena = arena.allocator() };
+        var parser = Parser{ .pat = pattern, .arena = arena.allocator(), .options = options };
         const root = try parser.parseAlt();
         if (parser.pos != pattern.len) return Error.RegexInvalidPattern; // trailing junk, e.g. unmatched ')'
 
@@ -993,6 +1018,20 @@ pub const Regex = struct {
         template: []const u8,
         scratch: *Scratch,
     ) Error![]const u8 {
+        return self.replaceScratch(input, template, scratch, 0, 0);
+    }
+
+    /// `replaceAllScratch` from byte `start` on, keeping the text before
+    /// it; a nonzero `occurrence` replaces only that match (1-based) and
+    /// leaves the others.
+    pub fn replaceScratch(
+        self: *const Regex,
+        input: []const u8,
+        template: []const u8,
+        scratch: *Scratch,
+        start: usize,
+        occurrence: usize,
+    ) Error![]const u8 {
         const allocator = scratch.backing;
         if (scratch.slots.len < self.n_slots) {
             scratch.slots = try scratch.backing.realloc(scratch.slots, self.n_slots);
@@ -1001,29 +1040,57 @@ pub const Regex = struct {
 
         const out = &scratch.out_buf;
         out.clearRetainingCapacity();
+        try out.appendSlice(allocator, input[0..start]);
 
-        var pos: usize = 0;
+        var pos: usize = start;
+        var seen: usize = 0;
         while (pos <= input.len) {
             const found = try self.findWith(scratch, input, pos, slots);
             if (!found) break;
             const m_start = slots[0].?;
             const m_end = slots[1].?;
-            // Copy the text before the match.
             try out.appendSlice(allocator, input[pos..m_start]);
-            // Expand the template.
-            try expandTemplate(allocator, out, template, input, slots);
-            if (m_end > pos) {
-                pos = m_end;
+            seen += 1;
+            if (occurrence == 0 or seen == occurrence) {
+                try expandTemplate(allocator, out, template, input, slots);
             } else {
-                // Empty match: emit one byte and advance to avoid looping.
-                if (m_end < input.len) try out.append(allocator, input[m_end]);
-                pos = m_end + 1;
+                try out.appendSlice(allocator, input[m_start..m_end]);
             }
+            pos = afterMatch(input, m_start, m_end);
+            // An empty match consumes nothing, so the character it sits
+            // before is copied here, not left for the next match to skip.
+            if (m_end == m_start) try out.appendSlice(allocator, input[m_end..@min(pos, input.len)]);
+            if (seen == occurrence) break;
         }
         if (pos < input.len) try out.appendSlice(allocator, input[pos..]);
         return out.items;
     }
+
+    /// The `occurrence`-th (1-based) match at or after byte `start`, each
+    /// search resuming where the previous match ended. False when there are
+    /// fewer matches.
+    pub fn findNth(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize, occurrence: usize, out_slots: []?usize) Error!bool {
+        var pos = start;
+        var seen: usize = 0;
+        while (pos <= input.len) {
+            if (!try self.findWith(scratch, input, pos, out_slots)) return false;
+            seen += 1;
+            if (seen >= occurrence) return true;
+            pos = afterMatch(input, out_slots[0].?, out_slots[1].?);
+        }
+        return false;
+    }
 };
+
+/// Where the search after a match resumes: its end, or past the whole
+/// UTF-8 character after an empty match, so the next search can't find
+/// the same empty match or start inside a character.
+fn afterMatch(input: []const u8, m_start: usize, m_end: usize) usize {
+    if (m_end > m_start) return m_end;
+    var next = m_end + 1;
+    while (next < input.len and input[next] & 0xC0 == 0x80) next += 1;
+    return next;
+}
 
 // ---------------------------------------------------------------------------
 // Lazy DFA — exact match-existence in one linear pass
@@ -1504,6 +1571,67 @@ test "regex: global replace + empty-match handling (no infinite loop)" {
     try expectReplace("o", "foo boo", "0", "f00 b00");
     // a* matches empty before 'b' and at end → leading/trailing inserts.
     try expectReplace("a*", "b", "X", "XbX");
+    try expectReplace("x*", "héllo", "-", "-h-é-l-l-o-");
+    try expectReplace("a*", "aaa", "X", "XX");
+}
+
+fn expectMatchWith(pattern: []const u8, options: Options, input: []const u8, should_match: bool) !void {
+    var re = try Regex.compileWith(std.testing.allocator, pattern, options);
+    defer re.deinit();
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const slots = try std.testing.allocator.alloc(?usize, re.n_slots);
+    defer std.testing.allocator.free(slots);
+    try std.testing.expectEqual(should_match, try re.findWith(&scratch, input, 0, slots));
+    try std.testing.expectEqual(should_match, try re.matchesWith(&scratch, input, 0));
+}
+
+test "regex: options fold ASCII case and let dot cross newlines" {
+    const cases = .{
+        .{ "b", Options{}, "ABC", false },
+        .{ "b", Options{ .case_insensitive = true }, "ABC", true },
+        .{ "[a-c]", Options{ .case_insensitive = true }, "B", true },
+        .{ "[^b]", Options{ .case_insensitive = true }, "B", false },
+        .{ "a.b", Options{}, "a\nb", false },
+        .{ "a.b", Options{ .dot_all = true }, "a\nb", true },
+    };
+    inline for (cases) |c| try expectMatchWith(c[0], c[1], c[2], c[3]);
+}
+
+test "regex: findNth counts matches from a start byte" {
+    var re = try Regex.compile(std.testing.allocator, "dog");
+    defer re.deinit();
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const slots = try std.testing.allocator.alloc(?usize, re.n_slots);
+    defer std.testing.allocator.free(slots);
+    const cases = .{
+        .{ 0, 1, @as(?usize, 0) },
+        .{ 0, 2, @as(?usize, 8) },
+        .{ 1, 1, @as(?usize, 8) },
+        .{ 0, 3, @as(?usize, null) },
+    };
+    inline for (cases) |c| {
+        const found = try re.findNth(&scratch, "dog cat dog", c[0], c[1], slots);
+        try std.testing.expectEqual(c[2] != null, found);
+        if (found) try std.testing.expectEqual(c[2].?, slots[0].?);
+    }
+}
+
+test "regex: replaceScratch keeps the prefix and replaces one occurrence" {
+    var re = try Regex.compile(std.testing.allocator, "b");
+    defer re.deinit();
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const cases = .{
+        .{ 0, 0, "aXc aXc aXc" },
+        .{ 0, 2, "abc aXc abc" },
+        .{ 2, 1, "abc aXc abc" },
+        .{ 0, 5, "abc abc abc" },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectEqualStrings(c[2], try re.replaceScratch("abc abc abc", "X", &scratch, c[0], c[1]));
+    }
 }
 
 test "regex: anchors bind to whole-string boundaries" {

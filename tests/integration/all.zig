@@ -90,6 +90,7 @@ test {
     _ = @import("udf_test.zig");
     _ = @import("table_fn_test.zig");
     _ = @import("table_fn_r8_test.zig");
+    _ = @import("mysql_misc_fns_test.zig");
 }
 
 test "integration entry exists" {

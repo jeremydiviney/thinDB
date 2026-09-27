@@ -50,6 +50,7 @@ const datefmt = @import("scalar_fn_datefmt.zig");
 const cond = @import("scalar_fn_cond.zig");
 const dec = @import("scalar_fn_decimal.zig");
 const json = @import("scalar_fn_json.zig");
+const inet = @import("scalar_fn_inet.zig");
 const common = @import("scalar_fn_common.zig");
 
 pub const NullStrategy = udf_mod.NullStrategy;
@@ -70,6 +71,10 @@ pub const ScalarFn = struct {
     /// is treated as a repeating prototype and expanded by the resolver into
     /// a call-specific descriptor before Compute plans casts/buffers.
     variadic_min_args: ?usize = null,
+    /// How many leading `arg_types` of a variadic overload are fixed
+    /// parameters that the prototype doesn't repeat: `ELT(n, s1, s2, ...)`
+    /// takes one number, then strings.
+    variadic_fixed: usize = 0,
     null_strategy: NullStrategy = .propagates,
     volatility: udf_mod.Volatility = .immutable,
     kernel: ?Kernel = null,
@@ -125,6 +130,7 @@ pub fn resolveWithRegistry(
     // Decimal-involving calls resolve to scale-aware typed kernels (the static
     // builtins table can't express a dynamic output scale). Checked first so a
     // decimal operand never falls into an int/double overload that ignores scale.
+    if (try resolveJson(aa, name, arg_types)) |ov| return ov;
     if (try resolveDecimal(aa, name, arg_types)) |ov| return ov;
     if (try resolveIntArith(aa, name, arg_types)) |ov| return ov;
     if (try resolveFractionalIntDiv(aa, name, arg_types)) |ov| return ov;
@@ -513,10 +519,44 @@ fn resolveFormat(aa: Allocator, name: []const u8, arg_types: []const Type) !?Res
     return try buildDecFn(aa, name, arg_types, .string, dec.formatKernel, .propagates);
 }
 
+/// Internal: JSON_ARRAYAGG / JSON_OBJECTAGG lower to a GROUP_CONCAT of these
+/// per-row packings, which the matching wrapper builds the document from
+/// (`scalar_fn_json.zig`).
+pub const JSON_AGG_ELEMENT_FN = "__json_agg_element";
+pub const JSON_AGG_MEMBER_FN = "__json_agg_member";
+pub const JSON_AGG_ARRAY_FN = "__json_agg_array";
+pub const JSON_AGG_OBJECT_FN = "__json_agg_object";
+
+/// JSON_ARRAY, JSON_OBJECT and the JSON aggregates' packers take arguments of
+/// any type, each becoming the JSON value MySQL makes of it; the JSON value
+/// of a DECIMAL needs its scale, so these are typed kernels. CAST(json AS
+/// CHAR) prints the document rather than copying its JSONB bytes.
+fn resolveJson(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (std.ascii.eqlIgnoreCase(name, "json_array"))
+        return try buildDecFn(aa, name, arg_types, .json, json.jsonArrayKernel, .kernel_managed);
+    if (std.ascii.eqlIgnoreCase(name, "json_object")) {
+        if (arg_types.len % 2 != 0) return null;
+        return try buildDecFn(aa, name, arg_types, .json, json.jsonObjectKernel, .kernel_managed);
+    }
+    if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) and arg_types.len == 1)
+        return try buildDecFn(aa, name, arg_types, .string, json.jsonAggElementKernel, .kernel_managed);
+    if (std.mem.eql(u8, name, JSON_AGG_MEMBER_FN) and arg_types.len == 2)
+        return try buildDecFn(aa, name, arg_types, .string, json.jsonAggMemberKernel, .kernel_managed);
+    if (std.ascii.eqlIgnoreCase(name, "to_string") and arg_types.len == 1 and arg_types[0] == .json) {
+        return .{
+            .func = .{ .name = name, .arg_types = try aa.dupe(Type, arg_types), .return_type = .string, .kernel = json.jsonToTextKernel },
+            .arg_casts = null,
+        };
+    }
+    return null;
+}
+
 /// Whether ANY overload named `name` exists — builtin, decimal-only, or a
 /// registered UDF. Name-only, so it holds before argument types are known.
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "to_decimal")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "json_array") or std.ascii.eqlIgnoreCase(name, "json_object")) return true;
+    if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) or std.mem.eql(u8, name, JSON_AGG_MEMBER_FN)) return true;
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
@@ -659,12 +699,14 @@ fn resolveToDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?
 }
 
 pub fn scalarArityMatches(f: ScalarFn, actual: usize) bool {
-    if (f.variadic_min_args) |min_args| return actual >= min_args and f.arg_types.len > 0;
+    if (f.variadic_min_args) |min_args| return actual >= min_args and f.arg_types.len > f.variadic_fixed;
     return f.arg_types.len == actual;
 }
 
 pub fn scalarDeclaredTypeAt(f: ScalarFn, i: usize) Type {
-    return if (f.variadic_min_args != null) f.arg_types[i % f.arg_types.len] else f.arg_types[i];
+    if (f.variadic_min_args == null or i < f.variadic_fixed) return f.arg_types[i];
+    const repeated = f.arg_types[f.variadic_fixed..];
+    return repeated[(i - f.variadic_fixed) % repeated.len];
 }
 
 /// `.varchar`/`.char` share the physical StringView representation of `.string`
@@ -762,6 +804,7 @@ fn expandScalarFn(aa: Allocator, f: ScalarFn, actual: usize) !ScalarFn {
     for (arg_types, 0..) |*slot, i| slot.* = scalarDeclaredTypeAt(f, i);
     out.arg_types = arg_types;
     out.variadic_min_args = null;
+    out.variadic_fixed = 0;
     return out;
 }
 
@@ -831,9 +874,21 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "left", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.leftKernel },
     .{ .name = "right", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.rightKernel },
     .{ .name = "replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.replaceKernel },
-    .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.regexpReplaceKernel },
-    .{ .name = "regexp_like", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.regexpLikeKernel },
+    .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpReplaceKernel },
+    .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpReplaceKernel },
+    .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string, .bigint, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpReplaceKernel },
+    .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string, .bigint, .bigint, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpReplaceKernel },
+    .{ .name = "regexp_like", .arg_types = &.{ .string, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = string.regexpLikeKernel },
+    .{ .name = "regexp_like", .arg_types = &.{ .string, .string, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = string.regexpLikeKernel },
     .{ .name = "regexp_substr", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
+    .{ .name = "regexp_substr", .arg_types = &.{ .string, .string, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
+    .{ .name = "regexp_substr", .arg_types = &.{ .string, .string, .bigint, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
+    .{ .name = "regexp_substr", .arg_types = &.{ .string, .string, .bigint, .bigint, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
+    .{ .name = "regexp_instr", .arg_types = &.{ .string, .string }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
+    .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
+    .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
+    .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
+    .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint, .bigint, .string }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
     // --- json ---
     .{ .name = "json_extract", .arg_types = &.{ .string, .string }, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonExtractKernel },
     .{ .name = "json_value", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonValueKernel },
@@ -844,6 +899,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "json_contains", .arg_types = &.{ .string, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonContainsKernel },
     .{ .name = "json_keys", .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonKeysKernel },
     .{ .name = "to_json", .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.toJsonKernel },
+    .{ .name = JSON_AGG_ARRAY_FN, .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonAggArrayKernel },
+    .{ .name = JSON_AGG_OBJECT_FN, .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonAggObjectKernel },
     // --- coalesce overloads ---
     .{ .name = "coalesce", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .absorbs, .kernel = cond.coalesceStringKernel },
     .{ .name = "coalesce", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 2, .null_strategy = .absorbs, .kernel = cond.coalesceStringKernel },
@@ -1133,6 +1190,26 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "initcap", .arg_types = &.{.string}, .return_type = .string, .kernel = string.initcapKernel },
     .{ .name = "translate", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.translateKernel },
     .{ .name = "chr", .arg_types = &.{.int}, .return_type = .string, .kernel = string.chrKernel },
+    .{ .name = "elt", .arg_types = &.{ .bigint, .string }, .return_type = .string, .variadic_min_args = 2, .variadic_fixed = 1, .null_strategy = .kernel_managed, .kernel = string.eltKernel },
+    .{ .name = "elt", .arg_types = &.{ .double, .string }, .return_type = .string, .variadic_min_args = 2, .variadic_fixed = 1, .null_strategy = .kernel_managed, .kernel = string.eltKernel },
+    .{ .name = "insert", .arg_types = &.{ .string, .int, .int, .string }, .return_type = .string, .kernel = string.insertKernel },
+    .{ .name = "quote", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.quoteKernel },
+    .{ .name = "soundex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.soundexKernel },
+    // --- network addresses ---
+    .{ .name = "inet_aton", .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = inet.inetAtonKernel },
+    .{ .name = "inet_ntoa", .arg_types = &.{.bigint}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = inet.inetNtoaKernel },
+    .{ .name = "inet_ntoa", .arg_types = &.{.double}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = inet.inetNtoaKernel },
+    .{ .name = "inet_ntoa", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = inet.inetNtoaKernel },
+    .{ .name = "inet6_aton", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = inet.inet6AtonKernel },
+    .{ .name = "inet6_ntoa", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = inet.inet6NtoaKernel },
+    .{ .name = "is_ipv4", .arg_types = &.{.string}, .return_type = .bigint, .kernel = inet.isIpv4Kernel },
+    .{ .name = "is_ipv6", .arg_types = &.{.string}, .return_type = .bigint, .kernel = inet.isIpv6Kernel },
+    .{ .name = "is_ipv4_compat", .arg_types = &.{.string}, .return_type = .bigint, .kernel = inet.isIpv4CompatKernel },
+    .{ .name = "is_ipv4_mapped", .arg_types = &.{.string}, .return_type = .bigint, .kernel = inet.isIpv4MappedKernel },
+    // --- MySQL misc ---
+    .{ .name = "interval", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = math.intervalKernel("bigint") },
+    .{ .name = "interval", .arg_types = &.{.double}, .return_type = .bigint, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = math.intervalKernel("double") },
+    .{ .name = "sleep", .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .volatility = .@"volatile", .kernel = math.sleepKernel },
 };
 
 /// Other dialects' spellings of builtins. The parser rewrites a call to

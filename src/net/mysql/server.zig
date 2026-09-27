@@ -313,6 +313,10 @@ const SessionState = struct {
     /// The XA branch xid started on this connection (between XA START and XA
     /// END). While set, DML is staged into that branch instead of executing.
     xa_active: ?[]const u8 = null,
+    /// LAST_INSERT_ID() and ROW_COUNT() as the last statement left them
+    /// (see `recordOutcome`).
+    last_insert_id: u64 = 0,
+    row_count: i64 = -1,
 
     fn init(allocator: Allocator, catalog: *Catalog, backend_id: u32) !SessionState {
         return .{
@@ -343,10 +347,13 @@ const SessionState = struct {
         self.vars = s.vars;
     }
 
-    /// Drop the connection's user variables (end of connection, or a reset).
+    /// Drop the connection's user variables, LAST_INSERT_ID() and ROW_COUNT()
+    /// (end of connection, or a reset).
     fn resetVars(self: *SessionState) void {
         local.CompiledQuery.freeSessionVars(self.allocator, self.vars);
         self.vars = null;
+        self.last_insert_id = 0;
+        self.row_count = -1;
     }
 
     /// Open the per-session temp namespace if it hasn't been opened yet.
@@ -390,7 +397,20 @@ const SessionState = struct {
             .dialect = .mysql,
             .temp_namespace = self.temp_namespace,
             .vars = self.vars,
+            .last_insert_id = self.last_insert_id,
+            .row_count = self.row_count,
         };
+    }
+
+    /// Keep what a finished statement leaves for ROW_COUNT() and
+    /// LAST_INSERT_ID(): DML its affected rows, a result set -1, anything
+    /// else 0; the id only when the statement generated one.
+    fn recordOutcome(self: *SessionState, op: ir.Op, compiled: *const local.CompiledQuery) void {
+        self.row_count = switch (op) {
+            .insert, .insert_select, .delete_op, .update_op => std.math.cast(i64, compiled.affectedRows()) orelse std.math.maxInt(i64),
+            else => if (isSideEffectOp(op)) 0 else -1,
+        };
+        if (compiled.lastInsertId()) |id| self.last_insert_id = id;
     }
 
     /// OR-able status bits derived from session state. Callers combine
@@ -3428,6 +3448,7 @@ fn runKeyedDeleteBatch(
     profiler.addRowsAffected(total);
     for (stmts) |s| profiler.recordSqlKind(classifySqlKind(s.*));
 
+    session.row_count = std.math.cast(i64, counts[counts.len - 1]) orelse std.math.maxInt(i64);
     for (counts, 0..) |c, j| {
         const is_last = last_is_final and j + 1 == stmts.len;
         const base: u16 = session.transactionStatus();
@@ -3684,6 +3705,7 @@ fn runSingleStatement(
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
         session.captureVars(new_session);
+        session.recordOutcome(op.*, &compiled);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
         const write_start = profiler.start();
@@ -3692,7 +3714,7 @@ fn runSingleStatement(
             w,
             seq_id.*,
             affected_rows,
-            0,
+            compiled.lastInsertId() orelse 0,
             extra_status,
         );
         profiler.recordSince(.query_write, write_start);
@@ -3743,6 +3765,7 @@ fn runSingleStatement(
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
     session.captureVars(new_session);
+    session.recordOutcome(op.*, &compiled);
     return true;
 }
 
@@ -4038,6 +4061,7 @@ fn handleStmtExecute(
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
         session.captureVars(new_session);
+        session.recordOutcome(op.*, &compiled);
         const affected_rows = compiled.affectedRows();
         profiler.addRowsAffected(affected_rows);
         const write_start = profiler.start();
@@ -4046,7 +4070,7 @@ fn handleStmtExecute(
             w,
             seq_id,
             affected_rows,
-            0,
+            compiled.lastInsertId() orelse 0,
             session.transactionStatus(),
         );
         profiler.recordSince(.stmt_execute_write, write_start);
@@ -4116,6 +4140,7 @@ fn handleStmtExecute(
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
     session.captureVars(new_session);
+    session.recordOutcome(op.*, &compiled);
 }
 
 /// COM_STMT_CLOSE — destroy the prepared statement. No response.
