@@ -651,21 +651,15 @@ pub fn resultValueArgsStart(name: []const u8) ?usize {
 /// implicit casts can't take it: a string parameter takes a number, a
 /// decimal or a date as its text, as in StarRocks (`CONCAT('Q', quarter)`),
 /// and a float parameter takes a decimal's value, as in MySQL and StarRocks
-/// (`POWER(1.09, n)`, `SQRT(price)`). The cheapest overload wins; null
-/// when no overload resolves that way or no argument needs converting.
-pub fn convertedArgs(aa: Allocator, name: []const u8, arg_types: []const Type) !?[]const ?Type {
+/// (`POWER(1.09, n)`, `SQRT(price)`). Builtins and registered UDFs alike;
+/// the cheapest overload wins. Null when no overload resolves that way or
+/// no argument needs converting.
+pub fn convertedArgs(aa: Allocator, registry: ?*const udf_mod.UdfRegistry, name: []const u8, arg_types: []const Type) !?[]const ?Type {
     var best: ?ScalarFn = null;
     var best_cost: u64 = std.math.maxInt(u64);
-    for (builtins) |f| {
-        if (!std.ascii.eqlIgnoreCase(f.name, name)) continue;
-        if (!scalarArityMatches(f, arg_types.len)) continue;
-        var total: u64 = 0;
-        for (arg_types, 0..) |given, i| {
-            total += (try argConversion(aa, given, scalarDeclaredTypeAt(f, i)) orelse break).cost;
-        } else if (total < best_cost) {
-            best_cost = total;
-            best = f;
-        }
+    for (builtins) |f| try considerConverted(aa, f, name, arg_types, &best, &best_cost);
+    if (registry) |reg| {
+        for (reg.scalarEntries()) |entry| try considerConverted(aa, scalarFromUdf(entry), name, arg_types, &best, &best_cost);
     }
     const f = best orelse return null;
     const targets = try aa.alloc(?Type, arg_types.len);
@@ -675,6 +669,19 @@ pub fn convertedArgs(aa: Allocator, name: []const u8, arg_types: []const Type) !
         any = any or t.* != null;
     }
     return if (any) targets else null;
+}
+
+fn considerConverted(aa: Allocator, f: ScalarFn, name: []const u8, arg_types: []const Type, best: *?ScalarFn, best_cost: *u64) !void {
+    if (!std.ascii.eqlIgnoreCase(f.name, name)) return;
+    if (!scalarArityMatches(f, arg_types.len)) return;
+    var total: u64 = 0;
+    for (arg_types, 0..) |given, i| {
+        total += (try argConversion(aa, given, scalarDeclaredTypeAt(f, i)) orelse return).cost;
+    }
+    if (total < best_cost.*) {
+        best_cost.* = total;
+        best.* = f;
+    }
 }
 
 const CONVERT_COST: u64 = 1000;
