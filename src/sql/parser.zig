@@ -702,6 +702,17 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Whether `tag` opens a query: SELECT, WITH, and MySQL's VALUES and
+    /// TABLE statements. In an ON DUPLICATE KEY UPDATE, `VALUES(col)` is
+    /// the inserted-value function instead.
+    pub fn startsQuery(self: *const Parser, tag: TokenTag) bool {
+        return switch (tag) {
+            .kw_select, .kw_with, .kw_table => true,
+            .kw_values => !self.insert_values_refs,
+            else => false,
+        };
+    }
+
     pub fn expect(self: *Parser, tag: TokenTag) ParseError!void {
         if (self.cur.tag != tag) return ParseError.SqlExpectedToken;
         try self.advance();
@@ -824,7 +835,12 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_with) {
             try self.parseCteList();
         }
-        if (self.cur.tag != .kw_select) return ParseError.SqlExpectedSelect;
+        switch (self.cur.tag) {
+            .kw_values => return try self.parseValuesStatement(union_arm),
+            .kw_table => return try self.parseTableStatement(union_arm),
+            .kw_select => {},
+            else => return ParseError.SqlExpectedSelect,
+        }
         try self.advance();
 
         // Optional DISTINCT — desugars to grouping on every projected item
@@ -1399,6 +1415,61 @@ pub const Parser = struct {
         const query = try self.parseSetOpTail(root, proj, from_inputs, false);
         self.select_output = proj;
         self.select_inputs = from_inputs;
+        return query;
+    }
+
+    /// `VALUES [ROW](expr, ...), ...`: a table of constant rows, standing
+    /// wherever a SELECT can. Columns are named as MySQL names them,
+    /// column_0 onward; PostgreSQL's column1 onward in its dialect.
+    fn parseValuesStatement(self: *Parser, union_arm: bool) ParseError!*ir.Op {
+        try self.advance();
+        var rows: std.ArrayList([]const ir.Expr) = .empty;
+        var width: ?usize = null;
+        while (true) {
+            if (self.cur.tag == .kw_row) try self.advance();
+            try self.expect(.lparen);
+            var cells: std.ArrayList(ir.Expr) = .empty;
+            while (true) {
+                try cells.append(self.arena, try self.parseValueExpr());
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+            try self.expect(.rparen);
+            if (cells.items.len != (width orelse cells.items.len)) return ParseError.SqlRowValueWidthMismatch;
+            width = cells.items.len;
+            try rows.append(self.arena, cells.items);
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        const output = try self.arena.alloc(ProjItem, width.?);
+        const names = try self.arena.alloc([]const u8, width.?);
+        for (output, names, 0..) |*item, *name, i| {
+            name.* = if (self.lex.dialect == .postgres)
+                try std.fmt.allocPrint(self.arena, "column{d}", .{i + 1})
+            else
+                try std.fmt.allocPrint(self.arena, "column_{d}", .{i});
+            item.* = .{ .name = name.*, .kind = .{ .col = name.* } };
+        }
+        return try self.finishQueryOperand(try parse_ddl.valuesQuery(self, rows.items, names), output, &.{}, union_arm);
+    }
+
+    /// `TABLE t`: MySQL's short form of `SELECT * FROM t`.
+    fn parseTableStatement(self: *Parser, union_arm: bool) ParseError!*ir.Op {
+        try self.advance();
+        if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
+        const target = try self.parseFromTarget();
+        const output = try self.arena.dupe(ProjItem, &.{.{ .name = "*", .kind = .{ .star = null } }});
+        const inputs = try self.arena.dupe(ChainInput, &.{.{ .name = target.name, .op = target.op }});
+        return try self.finishQueryOperand(target.op, output, inputs, union_arm);
+    }
+
+    /// A query operand with no clauses of its own: a UNION arm as is, else
+    /// the chain it leads with the ORDER BY / LIMIT over it.
+    fn finishQueryOperand(self: *Parser, operand: *ir.Op, output: []const ProjItem, inputs: []const ChainInput, union_arm: bool) ParseError!*ir.Op {
+        if (union_arm) return operand;
+        const query = try self.parseSetOpTail(operand, output, inputs, true);
+        self.select_output = output;
+        self.select_inputs = inputs;
         return query;
     }
 
@@ -3122,7 +3193,7 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_exists) {
             try self.advance();
             try self.expect(.lparen);
-            if (self.cur.tag != .kw_select and self.cur.tag != .kw_with) return ParseError.SqlExpectedSelect;
+            if (!self.startsQuery(self.cur.tag)) return ParseError.SqlExpectedSelect;
             const source = try self.parseStatement();
             try self.expect(.rparen);
             return ir.Expr{ .exists_subquery = @ptrCast(source) };
@@ -3225,7 +3296,7 @@ pub const Parser = struct {
                 // as a scalar_subquery node; everything else recurses
                 // through the binary expression parser.
                 try self.advance();
-                if (self.cur.tag == .kw_select or self.cur.tag == .kw_with) {
+                if (self.startsQuery(self.cur.tag)) {
                     const source = try self.parseStatement();
                     try self.expect(.rparen);
                     return ir.Expr{ .scalar_subquery = @ptrCast(source) };
@@ -4841,7 +4912,7 @@ pub const Parser = struct {
             const tok = try look.next();
             if (first_tok) {
                 first_tok = false;
-                if (tok.tag == .kw_select or tok.tag == .kw_with) return false;
+                if (self.startsQuery(tok.tag)) return false;
             }
             switch (tok.tag) {
                 .eof => return false,

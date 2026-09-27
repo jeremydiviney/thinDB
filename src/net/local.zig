@@ -1690,6 +1690,13 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
             projWalkOp(c, allocator, j.right);
         },
         .set_union => |u| {
+            // Arms line up by position, not name: an arm no SELECT list
+            // shapes (`SELECT * FROM t`, `TABLE t`) needs every column of
+            // its table, which a set of names can't say.
+            if (!armColumnsFixed(u.left) or !armColumnsFixed(u.right)) {
+                c.bail = true;
+                return;
+            }
             projWalkOp(c, allocator, u.left);
             projWalkOp(c, allocator, u.right);
         },
@@ -1710,6 +1717,23 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
         // pruning. Keeping every column is always correct.
         else => c.bail = true,
     }
+}
+
+/// Whether a set-operation arm's columns are fixed by a SELECT list or a
+/// GROUP BY rather than passed through at a source's full width.
+fn armColumnsFixed(op: *const ir.Op) bool {
+    return switch (op.*) {
+        .select, .group_by, .single_row => true,
+        .alias => |a| armColumnsFixed(a.upstream),
+        .limit => |l| armColumnsFixed(l.upstream),
+        .filter => |f| armColumnsFixed(f.upstream),
+        .order_by => |o| armColumnsFixed(o.upstream),
+        .compute => |cmp| armColumnsFixed(cmp.upstream),
+        .window => |w| armColumnsFixed(w.upstream),
+        .materialize => |m| armColumnsFixed(m.upstream),
+        .set_union => |u| armColumnsFixed(u.left) and armColumnsFixed(u.right),
+        else => false,
+    };
 }
 
 /// Names a single-scan query references, or null to keep all columns.
