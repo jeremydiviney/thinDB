@@ -94,6 +94,14 @@ pub const ParseError = error{
     SqlSetOpAllUnsupported,
     /// Row values of different widths compared or matched by IN.
     SqlRowValueWidthMismatch,
+    /// A CTE's or derived table's column list whose length differs from
+    /// its query's SELECT list (MySQL 1353).
+    SqlColumnListCountMismatch,
+    /// A column list naming one column twice (MySQL 1060).
+    SqlColumnListRepeated,
+    /// A column list over a query that projects `*`: the names it renames
+    /// are only known once the query binds.
+    SqlColumnListOverStar,
 } || LexError;
 
 const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
@@ -1539,8 +1547,8 @@ pub const Parser = struct {
 
     /// Operators bind by name, so a projection's outputs must be distinct.
     /// A repeated name (`SELECT 1, 1`, `SELECT id, NULL, NULL`, `a AS x, b AS
-    /// x`) keeps its first use; each later use becomes `name_N` with the
-    /// smallest N no item claims — DuckDB's naming.
+    /// x`, `x.id, y.qty AS id`) keeps its first use; each later use becomes
+    /// `name_N` with the smallest N no item claims — DuckDB's naming.
     fn dedupeProjectionNames(self: *Parser, items: []ProjItem) ParseError!void {
         for (items, 0..) |*item, i| {
             if (item.kind == .star or !projectionNameClaimed(items[0..i], item.name)) continue;
@@ -3254,17 +3262,19 @@ pub const Parser = struct {
             // boundary, it materializes: the subquery runs as its own stage
             // and the outer block scans the buffered result.
             try self.advance();
-            const op = try self.parseStatement();
+            const body = try self.parseStatement();
+            const output = self.select_output;
             try self.expect(.rparen);
-            const wrapped = try self.allocOp(.{ .materialize = .{
-                .upstream = op,
-                .structural_cse = true,
-            } });
-            // Optional AS, mandatory alias.
+            // Optional AS, mandatory alias, optional column list.
             if (self.cur.tag == .kw_as) try self.advance();
             if (self.cur.tag != .identifier) return ParseError.SqlSubqueryNeedsAlias;
             const alias = try self.arena.dupe(u8, self.cur.text);
             try self.advance();
+            const op = if (self.cur.tag == .lparen) try self.renameOutputs(body, output, try self.parseColumnList()) else body;
+            const wrapped = try self.allocOp(.{ .materialize = .{
+                .upstream = op,
+                .structural_cse = true,
+            } });
             return .{ .name = alias, .op = try self.applyAliasToFromOp(wrapped, alias, false) };
         }
         // Plain identifier — first check the CTE map (single-part name
@@ -3771,6 +3781,7 @@ pub const Parser = struct {
             }
             first = false;
 
+            const column_names: ?[]const []const u8 = if (self.cur.tag == .lparen) try self.parseColumnList() else null;
             if (self.cur.tag != .kw_as) return ParseError.SqlExpectedKeyword;
             try self.advance();
 
@@ -3790,7 +3801,8 @@ pub const Parser = struct {
             }
 
             try self.expect(.lparen);
-            const op = try self.parseStatement();
+            const body = try self.parseStatement();
+            const op = if (column_names) |names| try self.renameOutputs(body, self.select_output, names) else body;
             try self.expect(.rparen);
 
             const gop = try self.ctes.getOrPut(self.arena, name);
@@ -5109,6 +5121,36 @@ pub const Parser = struct {
         return null;
     }
 
+    /// `(name, ...)` after a CTE name or a derived table's alias: distinct
+    /// names, which rename the query's columns by position.
+    fn parseColumnList(self: *Parser) ParseError![]const []const u8 {
+        try self.expect(.lparen);
+        const names = try self.parseIdentList();
+        try self.expect(.rparen);
+        for (names, 0..) |name, i| {
+            if (nameIn(name, names[0..i])) return ParseError.SqlColumnListRepeated;
+        }
+        return names;
+    }
+
+    /// `body` with its columns renamed by position to `names`. `output` is
+    /// the SELECT list the parser recorded for `body`; a set operation's
+    /// columns are its first operand's.
+    fn renameOutputs(self: *Parser, body: *ir.Op, output: []const ProjItem, names: []const []const u8) ParseError!*ir.Op {
+        for (output) |p| if (p.kind == .star) return ParseError.SqlColumnListOverStar;
+        if (output.len != names.len) return ParseError.SqlColumnListCountMismatch;
+        const columns = try self.arena.alloc([]const u8, names.len);
+        const outputs = try self.arena.alloc(?[]const u8, names.len);
+        for (output, names, columns, outputs) |p, name, *column, *out| {
+            column.* = p.name;
+            out.* = name;
+        }
+        // The rename reads the query as a derived table does, through its own
+        // boundary, so it projects over any query shape.
+        const boundary = try self.allocOp(.{ .materialize = .{ .upstream = body, .structural_cse = true } });
+        return try self.allocOp(.{ .select = .{ .columns = columns, .outputs = outputs, .upstream = boundary } });
+    }
+
     pub fn parseIdentList(self: *Parser) ParseError![]const []const u8 {
         var items: std.ArrayList([]const u8) = .empty;
         defer items.deinit(self.arena);
@@ -5499,9 +5541,14 @@ fn selectDerivedCount(proj: []const ProjItem) u32 {
     return n;
 }
 
+/// Whether an item is named `name` or outputs it: an unaliased qualified
+/// column (`x.id`) outputs its bare name, which a later alias would
+/// otherwise replace.
 fn projectionNameClaimed(items: []const ProjItem, name: []const u8) bool {
     for (items) |item| {
-        if (item.kind != .star and types.columnNameEql(item.name, name)) return true;
+        if (item.kind == .star) continue;
+        if (types.columnNameEql(item.name, name)) return true;
+        if (item.kind == .col and Parser.projectOutputName(item) == null and types.columnNameEql(types.unqualifiedName(item.kind.col), name)) return true;
     }
     return false;
 }
