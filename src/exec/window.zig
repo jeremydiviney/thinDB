@@ -2528,6 +2528,7 @@ fn appendStringScratchRange(
             .string => |*ss| try ss.appendValue(allocator, bytes),
             .varchar => |*ss| try ss.appendValue(allocator, bytes),
             .char => |*ss| try ss.appendValue(allocator, bytes),
+            .json => |*ss| try ss.appendValue(allocator, bytes),
             else => return Error.WindowUnsupported,
         }
         try out.appendValidBit(allocator, row, scratch[i] != null);
@@ -2548,6 +2549,7 @@ fn appendStringScratchIndices(
             .string => |*ss| try ss.appendValue(allocator, bytes),
             .varchar => |*ss| try ss.appendValue(allocator, bytes),
             .char => |*ss| try ss.appendValue(allocator, bytes),
+            .json => |*ss| try ss.appendValue(allocator, bytes),
             else => return Error.WindowUnsupported,
         }
         try out.appendValidBit(allocator, row, scratch[idx] != null);
@@ -2612,9 +2614,7 @@ fn copyCellTo(src: ColumnStore, src_row: u32, cell: OutCell, out_row: u32) !void
     }
     if (cell.string_scratch) |s| {
         s[out_row] = switch (src.data) {
-            .string => |ss| ss.view().rowBytes(src_row),
-            .varchar => |ss| ss.view().rowBytes(src_row),
-            .char => |ss| ss.view().rowBytes(src_row),
+            .string, .varchar, .char, .json => |ss| ss.view().rowBytes(src_row),
             else => return Error.WindowUnsupported,
         };
         return;

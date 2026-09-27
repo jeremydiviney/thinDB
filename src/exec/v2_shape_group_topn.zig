@@ -1354,6 +1354,7 @@ fn appendStringAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type
         .varchar => try col.data.varchar.appendValue(allocator, bytes),
         .string => try col.data.string.appendValue(allocator, bytes),
         .char => try col.data.char.appendValue(allocator, bytes),
+        .json => try col.data.json.appendValue(allocator, bytes),
         else => return error.TypeMismatch,
     }
 }
