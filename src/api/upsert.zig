@@ -5,6 +5,7 @@
 //! (`insertOnDuplicateLocked`) before the rows reach it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const storage = @import("../storage/storage.zig");
@@ -49,14 +50,114 @@ pub fn serializeKeyBloom(allocator: Allocator, hashes: []const u64) ![]u8 {
     return out;
 }
 
-/// Drop the persistent index (memtable swapped or emptied, or rows it
-/// indexed taken back out). Keeps map + arena capacity for reuse; the next
-/// resolution rebuilds from row 0.
+/// Drop the persistent index (memtable swapped for unrelated rows or
+/// emptied, or rows it indexed taken back out). Keeps map + arena capacity
+/// for reuse; the next resolution rebuilds from row 0.
 pub fn resetIndex(t: *Table) void {
     t.upsert_idx.clearRetainingCapacity();
     if (t.upsert_idx_arena) |*a| _ = a.reset(.retain_capacity);
     t.upsert_idx_gen = null;
     t.upsert_idx_rows = 0;
+    t.upsert_idx_removed = 0;
+}
+
+/// Keep the key index valid across a swap to `next`: the live memtable
+/// without the rows at `removed` (ascending), the others in their order.
+/// The index moves to generation `gen`, the one `next` has or gets once
+/// installed. The removed rows' keys leave it and every other row id shifts
+/// down past them, so the next resolution indexes only the rows added
+/// after. Dropping the index instead makes that resolution encode and hash
+/// every memtable row again, which a DELETE, UPDATE or upsert of one
+/// memtable row paid in full (#346). A carry that can't allocate resets
+/// the index, which is always correct.
+pub fn carryIndex(t: *Table, removed: []const u32, next: *const engine.Memtable, gen: u64) void {
+    if (!t.schema.unique) return;
+    const bound = if (t.upsert_idx_gen) |g| g == t.memtable_gen else false;
+    if (!bound) return resetIndex(t);
+    removeIndexedRows(t, removed) catch return resetIndex(t);
+    // Removed keys leave their bytes in the arena. Past a quarter of the
+    // live keys, start over, so the arena does not grow for as long as the
+    // memtable lives.
+    if (t.upsert_idx_removed > t.upsert_idx.count() / 4) return resetIndex(t);
+    t.upsert_idx_gen = gen;
+    if (verify_carried_index) verifyIndex(t, next);
+}
+
+/// `carryIndex` for a swap described by a keep mask over the live memtable.
+pub fn carryIndexKept(t: *Table, keep: []const bool, next: *const engine.Memtable, gen: u64) void {
+    if (!t.schema.unique) return;
+    var removed: std.ArrayList(u32) = .empty;
+    defer removed.deinit(t.allocator);
+    for (keep, 0..) |k, row| {
+        if (!k) removed.append(t.allocator, @intCast(row)) catch return resetIndex(t);
+    }
+    carryIndex(t, removed.items, next, gen);
+}
+
+fn removeIndexedRows(t: *Table, removed: []const u32) !void {
+    const indexed = t.upsert_idx_rows;
+    const gone = for (removed, 0..) |row, i| {
+        if (row >= indexed) break removed[0..i];
+    } else removed;
+    if (gone.len == 0) return;
+
+    var keybuf: std.ArrayList(u8) = .empty;
+    defer keybuf.deinit(t.allocator);
+    for (gone) |row| {
+        keybuf.clearRetainingCapacity();
+        for (t.order_key_indices) |ci| try comparison.appendColumnValueBytes(t.allocator, &keybuf, t.memtable.columns[ci].view(), row);
+        const slot = t.upsert_idx.getIndex(keybuf.items) orelse return error.KeyNotIndexed;
+        // A later row with the same key (an upsert not yet committed) owns
+        // the entry; the removed row is the older one.
+        if (t.upsert_idx.values()[slot] != row) continue;
+        t.upsert_idx.swapRemoveAt(slot);
+        t.upsert_idx_removed += 1;
+    }
+
+    const rows = t.upsert_idx.values();
+    if (gone.len <= 8) {
+        for (rows) |*v| {
+            var below: u32 = 0;
+            for (gone) |row| below += @intFromBool(row < v.*);
+            v.* -= below;
+        }
+    } else {
+        const new_row = try t.allocator.alloc(u32, indexed);
+        defer t.allocator.free(new_row);
+        var shift: u32 = 0;
+        var next_gone: usize = 0;
+        for (new_row, 0..) |*slot, row| {
+            slot.* = @as(u32, @intCast(row)) - shift;
+            if (next_gone < gone.len and gone[next_gone] == row) {
+                shift += 1;
+                next_gone += 1;
+            }
+        }
+        for (rows) |*v| v.* = new_row[v.*];
+    }
+    t.upsert_idx_rows = indexed - @as(u32, @intCast(gone.len));
+}
+
+const verify_carried_index = builtin.is_test and std.debug.runtime_safety;
+
+/// Test builds: the carried index must equal one rebuilt from `mt`'s rows.
+fn verifyIndex(t: *Table, mt: *const engine.Memtable) void {
+    // Not the table's allocator: tests inject allocation failures into it.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    if (t.upsert_idx_rows > mt.row_count) std.debug.panic("upsert index covers {d} rows of {d}", .{ t.upsert_idx_rows, mt.row_count });
+    var rebuilt: std.StringHashMapUnmanaged(u32) = .empty;
+    for (0..t.upsert_idx_rows) |i| {
+        const key = compoundKeyFromColumnStores(aa, mt.columns, t.order_key_indices, @intCast(i)) catch @panic("OOM verifying the upsert index");
+        rebuilt.put(aa, key, @intCast(i)) catch @panic("OOM verifying the upsert index");
+    }
+    if (rebuilt.count() != t.upsert_idx.count()) std.debug.panic("upsert index holds {d} keys, a rebuild {d}", .{ t.upsert_idx.count(), rebuilt.count() });
+    var it = rebuilt.iterator();
+    while (it.next()) |e| {
+        const got = t.upsert_idx.get(e.key_ptr.*) orelse std.debug.panic("upsert index lacks the key of row {d}", .{e.value_ptr.*});
+        if (got != e.value_ptr.*) std.debug.panic("upsert index maps row {d}'s key to row {d}", .{ e.value_ptr.*, got });
+    }
 }
 
 /// What upsert resolution changes for the memtable rows it hasn't seen yet.
@@ -65,11 +166,14 @@ pub fn resetIndex(t: *Table) void {
 pub const Resolution = struct {
     /// The memtable without the older rows the new ones replace.
     deduped: ?*engine.Memtable = null,
+    /// Those rows, ascending.
+    dropped_rows: []u32 = &.{},
     /// Tombstone files with the segment rows the new ones replace added.
     tombstone_files: std.ArrayList(TombstoneFile) = .empty,
 
     pub fn deinit(self: *Resolution, allocator: Allocator) void {
         if (self.deduped) |mt| mt.release();
+        allocator.free(self.dropped_rows);
         for (self.tombstone_files.items) |f| allocator.free(f.bytes);
         self.tombstone_files.deinit(allocator);
         self.* = undefined;
@@ -93,10 +197,10 @@ pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64) !Resol
         return resolution;
     }
 
-    // Bind the persistent key index to the memtable generation. ANY swap
-    // (flush / delete / update / dedup-clone) bumps the generation via
-    // installMemtableLocked → rebuild from row 0; otherwise process only
-    // the rows added since last time. NOT a pointer compare — a freed
+    // Bind the persistent key index to the memtable generation. A swap
+    // bumps the generation via installMemtableLocked → rebuild from row 0,
+    // unless the swapper carried the index over (`carryIndex`); otherwise
+    // process only the rows added since last time. NOT a pointer compare — a freed
     // memtable's address can be reused by a later clone (ABA), silently
     // revalidating a stale index whose row mappings then tombstone
     // unrelated rows.
@@ -127,13 +231,20 @@ pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64) !Resol
     var prune_ok = true;
 
     const first_key_view = mt.columns[t.order_key_indices[0]].view();
+    var keybuf: std.ArrayList(u8) = .empty;
+    defer keybuf.deinit(t.allocator);
     for (start..n) |i| {
-        const key_bytes = try compoundKeyFromColumnStores(idx_aa, mt.columns, t.order_key_indices, @intCast(i));
-        const gop = try t.upsert_idx.getOrPut(t.allocator, key_bytes);
+        keybuf.clearRetainingCapacity();
+        for (t.order_key_indices) |ci| try comparison.appendColumnValueBytes(t.allocator, &keybuf, mt.columns[ci].view(), @intCast(i));
+        // Only a key the index lacks is copied into its arena: the arena
+        // lives as long as the index, which a carried index can make the
+        // whole memtable generation.
+        const gop = try t.upsert_idx.getOrPut(t.allocator, keybuf.items);
         if (gop.found_existing) {
             try dropped.append(t.allocator, gop.value_ptr.*);
         } else {
-            try new_keys.append(aa, try aa.dupe(u8, key_bytes));
+            gop.key_ptr.* = try idx_aa.dupe(u8, keybuf.items);
+            try new_keys.append(aa, try aa.dupe(u8, keybuf.items));
             if (try viewValueAt(aa, first_key_view, @intCast(i))) |v| {
                 try new_first_vals.append(aa, v);
             } else {
@@ -153,6 +264,8 @@ pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64) !Resol
         @memset(keep, true);
         for (dropped.items) |d| keep[d] = false;
         resolution.deduped = try mt.cloneWithRetainedRows(t.allocator, keep);
+        std.mem.sort(u32, dropped.items, {}, std.sort.asc(u32));
+        resolution.dropped_rows = try dropped.toOwnedSlice(t.allocator);
     }
 
     // ---- 2. Probe segments only for keys NEW to the memtable this batch. A
@@ -247,9 +360,8 @@ pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64) !Resol
 pub fn commitResolution(t: *Table, resolution: *Resolution) !void {
     if (resolution.deduped) |mt| {
         resolution.deduped = null;
+        carryIndex(t, resolution.dropped_rows, mt, t.memtable_gen + 1);
         t.installMemtableLocked(mt);
-        // The swap moved the rows the index points at.
-        resetIndex(t);
     }
     for (resolution.tombstone_files.items) |f| try t.writeTombstoneFile(f.segment_id, f.bytes);
 }
