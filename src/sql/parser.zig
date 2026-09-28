@@ -4269,7 +4269,7 @@ pub const Parser = struct {
         var resolved_name: []const u8 = first_dup;
         var alias_in_place = true;
         if (self.cur.tag == .lparen) {
-            if (self.lookupSqlFn(first_lc)) |def| {
+            if (try self.lookupSqlFn(first_lc)) |def| {
                 op = try self.expandSqlFunction(def);
                 alias_in_place = false;
             } else {
@@ -4295,11 +4295,8 @@ pub const Parser = struct {
             else
                 entry.op;
             alias_in_place = false;
-        } else if (self.cur.tag != .dot and self.plainViewDef(first_lc) != null) {
-            // A plain (non-materialized) view expands inline, like a
-            // zero-arg inline function. Materialized views are real tables
-            // and fall through to the scan path below.
-            op = try self.expandView(self.plainViewDef(first_lc).?);
+        } else if (try self.expandPlainView(first_lc)) |view_op| {
+            op = view_op;
             alias_in_place = false;
         } else {
             var parts_buf: [3][]const u8 = undefined;
@@ -4496,27 +4493,30 @@ pub const Parser = struct {
         return .{ .name = resolved_name, .op = op };
     }
 
-    fn lookupSqlFn(self: *Parser, name: []const u8) ?*const udf_mod.SqlTableFn {
+    fn lookupSqlFn(self: *Parser, name: []const u8) ParseError!?udf_mod.SqlTableFn {
         const ctx = self.sql_fns orelse return null;
-        return ctx.registry.get(ctx.db, name);
+        return try ctx.registry.get(self.arena, ctx.db, name);
     }
 
-    /// A non-materialized view named `name`, or null. Materialized views own
-    /// a backing table and resolve through the normal scan path instead.
-    fn plainViewDef(self: *Parser, name: []const u8) ?*const udf_mod.ViewDef {
+    /// The expansion of a plain (non-materialized) view named `name`, or
+    /// null. A plain view expands inline, like a zero-arg inline function;
+    /// materialized views own a backing table and resolve through the normal
+    /// scan path instead.
+    fn expandPlainView(self: *Parser, name: []const u8) ParseError!?*ir.Op {
+        if (self.cur.tag == .dot) return null;
         const ctx = self.sql_fns orelse return null;
         const vr = ctx.views orelse return null;
-        const def = vr.get(ctx.db, name) orelse return null;
-        return if (def.materialized) null else def;
+        const def = (try vr.get(self.arena, ctx.db, name)) orelse return null;
+        if (def.materialized) return null;
+        return try self.expandView(def);
     }
 
     /// Expand a plain-view reference: re-parse the stored defining query and
     /// wrap it in a single-reference Materialize (which compiles inline, so
     /// the view body behaves as if written in place). No parameters.
-    fn expandView(self: *Parser, def: *const udf_mod.ViewDef) ParseError!*ir.Op {
+    fn expandView(self: *Parser, def: udf_mod.ViewDef) ParseError!*ir.Op {
         if (self.fn_expand_depth >= 16) return ParseError.SqlFunctionArgMismatch;
-        const body = try self.arena.dupe(u8, def.body);
-        var sub_lex = Lexer.init(self.arena, body);
+        var sub_lex = Lexer.init(self.arena, def.body);
         sub_lex.dialect = self.lex.dialect;
         var sub = Parser{
             .arena = self.arena,
@@ -4544,23 +4544,17 @@ pub const Parser = struct {
     /// expects at every block boundary, and single-ref materialize bodies
     /// COMPILE INLINE (no stage, full pushdown/fusion), so each call site
     /// behaves as if its body had been written in place.
-    fn expandSqlFunction(self: *Parser, def: *const udf_mod.SqlTableFn) ParseError!*ir.Op {
+    fn expandSqlFunction(self: *Parser, def: udf_mod.SqlTableFn) ParseError!*ir.Op {
         if (self.fn_expand_depth >= 16) return ParseError.SqlFunctionArgMismatch;
         try self.expect(.lparen);
-        // Defensive copies into the arena: the registry entry can be
-        // replaced by concurrent DDL after this lookup (same documented
-        // race as table DDL mid-query).
-        const body = try self.arena.dupe(u8, def.body);
         const n_params = def.param_names.len;
-        const param_names = try self.arena.alloc([]const u8, n_params);
-        for (def.param_names, param_names) |src_name, *dst| dst.* = try self.arena.dupe(u8, src_name);
 
         var bindings: std.StringHashMapUnmanaged(Token) = .empty;
         var argi: usize = 0;
         if (self.cur.tag != .rparen) {
             while (true) {
                 if (argi >= n_params) return ParseError.SqlFunctionArgMismatch;
-                try bindings.put(self.arena, param_names[argi], try self.captureLiteralToken());
+                try bindings.put(self.arena, def.param_names[argi], try self.captureLiteralToken());
                 argi += 1;
                 if (self.cur.tag != .comma) break;
                 try self.advance();
@@ -4569,7 +4563,7 @@ pub const Parser = struct {
         try self.expect(.rparen);
         if (argi != n_params) return ParseError.SqlFunctionArgMismatch;
 
-        var sub_lex = Lexer.init(self.arena, body);
+        var sub_lex = Lexer.init(self.arena, def.body);
         sub_lex.dialect = self.lex.dialect;
         var sub = Parser{
             .arena = self.arena,

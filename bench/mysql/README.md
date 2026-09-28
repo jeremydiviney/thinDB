@@ -115,6 +115,17 @@ Three options put pressure on connection teardown and on reads racing DDL:
 bun run bench/mysql/stress_ddl.ts --port 3307 --pg-port 5433 --clients 8 --doublings 12 --killers 1 --readers 2 --pg-clients 2 --seconds 900
 ```
 
+Two more put pressure on view and SQL-function definitions, which the parser reads before its statement holds a lease (#368):
+
+| Option | What it runs |
+|---|---|
+| `--view-churners N` | Each churner owns a small database `stress_v<i>` with one 64-row base table. It loops `CREATE OR REPLACE VIEW` / `DROP VIEW` over views `v0`..`v3` and `CREATE OR REPLACE FUNCTION` / `DROP FUNCTION` over table functions `f0`..`f3`, with four versions of each definition. Now and then it creates and drops 40 throwaway views and functions so the registries grow and rehash. Every tenth round it drops its whole database. |
+| `--view-readers N` | Selects from those views and functions, joins one against the other, and runs `SHOW CREATE FUNCTION`, while the churners replace and drop them. A dropped view, function or database is expected. A count that matches no version, or a `SHOW CREATE FUNCTION` text that matches no version, is reported as an invariant failure. |
+
+```powershell
+bun run bench/mysql/stress_ddl.ts --port 3307 --clients 0 --view-churners 3 --view-readers 4 --seconds 600
+```
+
 Every id a kill is aimed at is recorded before the kill is sent, and ids are never reused. So an interrupted statement or a dropped connection whose id was never aimed at is reported as an invariant failure: the server did it on its own.
 
 When a client's write is killed, it opens a checker connection that nobody kills. It waits until the killed connection leaves the process list, and fails if that takes over a minute. It then checks that the write left all-or-nothing state. For example, a killed doubling insert leaves either the old row count or twice it. A killed RENAME leaves the rows under exactly one of the two names. After the check, the client starts its next cycle.
