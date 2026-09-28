@@ -99,7 +99,7 @@ test "cast: text converts only when it is a number of the target's kind" {
         .{ .sql = "SELECT CAST(CAST(s AS BIGINT) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "12", "5", NULL, NULL, NULL, NULL, "9999999999", NULL, NULL, NULL } },
         .{ .sql = "SELECT CAST(CAST(s AS DOUBLE) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "12", "5", "1.7", NULL, NULL, "1000", "9999999999", "-1.005", NULL, NULL } },
         .{ .sql = "SELECT CAST(CAST(s AS DECIMAL(18,2)) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "12.00", "5.00", "1.70", NULL, NULL, "1000.00", "9999999999.00", "-1.01", NULL, NULL } },
-        .{ .sql = "SELECT CAST(CAST(s AS BOOLEAN) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "true", "true", "true", NULL, NULL, "true", "true", "true", "false", NULL } },
+        .{ .sql = "SELECT CAST(CAST(s AS BOOLEAN) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "1", "1", "1", NULL, NULL, "1", "1", "1", "0", NULL } },
         .{ .sql = "SELECT CAST(CAST(' 7 ' AS INT) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"7"} },
         .{ .sql = "SELECT CAST(CAST('7x' AS DOUBLE) AS CHAR) FROM ct WHERE id = 1", .expected = &.{NULL} },
         .{ .sql = "SELECT CAST(id AS CHAR) FROM ct WHERE b = CAST(' 12 ' AS BIGINT)", .expected = &.{"1"} },
@@ -117,4 +117,29 @@ test "cast: a decimal past the target's precision raises" {
 
     try expectExecError(allocator, db, "SELECT CAST(x AS DECIMAL(10,2)) FROM ct WHERE id = 3", error.ArithmeticOverflow);
     try expectExecError(allocator, db, "SELECT CAST(s AS DECIMAL(10,2)) FROM ct WHERE id = 7", error.ArithmeticOverflow);
+}
+
+test "cast: a boolean becomes text as 1 or 0, except through PostgreSQL's cast" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT CAST(TRUE AS VARCHAR)", thindb.types.Dialect.neutral, "1" },
+        .{ "SELECT CONCAT(1 = 2, 'x')", thindb.types.Dialect.neutral, "0x" },
+        .{ "SELECT CAST(TRUE AS TEXT)", thindb.types.Dialect.postgres, "true" },
+        .{ "SELECT CAST(1 = 2 AS TEXT)", thindb.types.Dialect.postgres, "false" },
+        .{ "SELECT (1 = 1)::text", thindb.types.Dialect.postgres, "true" },
+        .{ "SELECT CAST(12 AS TEXT)", thindb.types.Dialect.postgres, "12" },
+    };
+    inline for (cases) |c| {
+        var q = try helpers.runSqlDialect(allocator, db, c[0], c[1]);
+        defer q.deinit();
+        const got = try helpers.columnText(allocator, &q);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqualStrings(c[2], got[0].?);
+    }
 }

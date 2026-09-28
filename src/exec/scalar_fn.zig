@@ -125,9 +125,11 @@ pub fn resolve(
 pub fn resolveWithRegistry(
     aa: Allocator,
     registry: ?*const udf_mod.UdfRegistry,
-    name: []const u8,
+    name_in: []const u8,
     arg_types: []const Type,
 ) !?ResolvedOverload {
+    if (try resolvePgBoolText(aa, name_in, arg_types)) |ov| return ov;
+    const name = if (std.mem.eql(u8, name_in, PG_TEXT_FN)) "to_string" else name_in;
     // Decimal-involving calls resolve to scale-aware typed kernels (the static
     // builtins table can't express a dynamic output scale). Checked first so a
     // decimal operand never falls into an int/double overload that ignores scale.
@@ -627,7 +629,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
-    if (std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN)) return true;
+    if (std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN) or std.mem.eql(u8, name, PG_TEXT_FN)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
     if (std.ascii.eqlIgnoreCase(name, "format")) return true;
@@ -761,6 +763,27 @@ fn resolveOrderKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?R
 
 /// `expr.HEX_LITERAL_AS_FN`: the literal's integer when the first argument
 /// is a number, else its bytes.
+/// PostgreSQL's cast to text. It spells a boolean `true` or `false`, where
+/// every other dialect writes it as `1` or `0` (`to_string`); any other type
+/// casts as `to_string` does.
+pub const PG_TEXT_FN = "__pg_text";
+
+/// Internal: UUID_SHORT(), given the statement's clock seconds by the
+/// pre-compile pass, as UUID() is given its seed.
+pub const UUID_SHORT_FN = "__uuid_short";
+
+/// Internal: `@@name`, which the pre-compile pass replaces with the value
+/// thinDB reports for the system variable.
+pub const SYSTEM_VARIABLE_FN = "__system_variable";
+
+fn resolvePgBoolText(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (!std.mem.eql(u8, name, PG_TEXT_FN) or arg_types.len != 1 or arg_types[0] != .boolean) return null;
+    return .{
+        .func = .{ .name = name, .arg_types = try aa.dupe(Type, arg_types), .return_type = .string, .kernel = math.boolToWordKernel },
+        .arg_casts = null,
+    };
+}
+
 fn resolveHexLiteralAs(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     if (!std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN)) return null;
     if (arg_types.len != 2 or !arg_types[1].isString()) return null;
@@ -1120,6 +1143,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "octet_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.lengthKernel },
     .{ .name = "char_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.charLengthKernel },
     // --- multi-arg string ---
+    .{ .name = "concat", .arg_types = &.{.string}, .return_type = .string, .kernel = string.concatNKernel },
     .{ .name = "concat", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.concat2Kernel },
     .{ .name = "concat", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.concat3Kernel },
     .{ .name = "concat", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 4, .kernel = string.concatNKernel },
@@ -1189,6 +1213,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "rand", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
     .{ .name = "random", .arg_types = &.{}, .return_type = .double, .volatility = .@"volatile", .kernel = math.randomKernel },
     .{ .name = "uuid", .arg_types = &.{.bigint}, .return_type = .string, .volatility = .@"volatile", .kernel = string.uuidKernel },
+    .{ .name = UUID_SHORT_FN, .arg_types = &.{.bigint}, .return_type = .largeint, .volatility = .@"volatile", .kernel = string.uuidShortKernel },
     // Integer MOD resolves in `resolveIntArith`. A floating operand on either
     // side: MySQL MOD keeps the dividend's sign (fmod), same as `%`.
     .{ .name = "mod", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.modDoubleKernel },
@@ -1499,10 +1524,10 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = string.base64EncodeKernel },
     .{ .name = "from_base64", .arg_types = &.{.string}, .return_type = .string, .kernel = string.base64DecodeKernel },
     // --- string (expanded set; matches DuckDB / MySQL / StarRocks parity) ---
-    .{ .name = "lpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .kernel = string.lpadKernel },
-    .{ .name = "rpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .kernel = string.rpadKernel },
-    .{ .name = "repeat", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.repeatKernel },
-    .{ .name = "space", .arg_types = &.{.int}, .return_type = .string, .kernel = string.spaceKernel },
+    .{ .name = "lpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.lpadKernel },
+    .{ .name = "rpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.rpadKernel },
+    .{ .name = "repeat", .arg_types = &.{ .string, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.repeatKernel },
+    .{ .name = "space", .arg_types = &.{.int}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.spaceKernel },
     .{ .name = "ascii", .arg_types = &.{.string}, .return_type = .int, .kernel = string.asciiKernel },
     .{ .name = "ord", .arg_types = &.{.string}, .return_type = .int, .kernel = string.ordKernel },
     .{ .name = "bit_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.bitLengthKernel },
@@ -1522,6 +1547,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "translate", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.translateKernel },
     .{ .name = "chr", .arg_types = &.{.int}, .return_type = .string, .kernel = string.chrKernel },
     .{ .name = "elt", .arg_types = &.{ .bigint, .string }, .return_type = .string, .variadic_min_args = 2, .variadic_fixed = 1, .null_strategy = .kernel_managed, .kernel = string.eltKernel },
+    .{ .name = "make_set", .arg_types = &.{ .bigint, .string }, .return_type = .string, .variadic_min_args = 2, .variadic_fixed = 1, .null_strategy = .kernel_managed, .kernel = string.makeSetKernel },
     .{ .name = "insert", .arg_types = &.{ .string, .int, .int, .string }, .return_type = .string, .kernel = string.insertKernel },
     .{ .name = "quote", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.quoteKernel },
     .{ .name = "soundex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.soundexKernel },

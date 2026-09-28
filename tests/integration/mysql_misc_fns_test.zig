@@ -5,8 +5,10 @@
 //! number is expected, HEX of numbers, regex line anchors, JSON read as text
 //! by string functions, and the information functions (#276-#282); then
 //! doubles as text, fractional integer arguments, JSON_QUOTE, COLLATION and
-//! BENCHMARK (#295-#299). Expected values are MySQL 8.4 output for the same
-//! statements.
+//! BENCHMARK (#295-#299); then numbers and booleans as text, oversized
+//! string results, MAKE_SET, UUID_SHORT, CURRENT_ROLE and system variables
+//! in expressions (#316, #318). Expected values are MySQL 8.4 output for the
+//! same statements.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -404,6 +406,62 @@ const json_quote_cases = [_]Case{
 /// COLLATION names its argument type's collation as CHARSET names its
 /// character set; a bare NULL has neither, and a system function's text is
 /// utf8mb3. BENCHMARK is 0, or NULL for a NULL or negative count.
+/// A number, boolean or date is its text where a string is expected: LIKE,
+/// one-argument CONCAT, a boolean as 1 or 0. A string result past the
+/// max_allowed_packet thinDB reports (16 MiB) is NULL, a huge double count
+/// included. Then MAKE_SET, CURRENT_ROLE, UUID_SHORT and `@@name` inside an
+/// expression.
+const text_leftover_cases = [_]Case{
+    .{ .sql = "12 LIKE '1%'", .want = "1" },
+    .{ .sql = "12 NOT LIKE '1%'", .want = "0" },
+    .{ .sql = "1.5e0 LIKE '1.5'", .want = "1" },
+    .{ .sql = "1e100 LIKE '1e1%'", .want = "1" },
+    .{ .sql = "2.50 LIKE '2.5_'", .want = "1" },
+    .{ .sql = "(1 = 1) LIKE '1'", .want = "1" },
+    .{ .sql = "DATE '2020-01-02' LIKE '2020%'", .want = "1" },
+    .{ .sql = "CONCAT(2)", .want = "2" },
+    .{ .sql = "CONCAT(1.5e0)", .want = "1.5" },
+    .{ .sql = "CONCAT('a')", .want = "a" },
+    .{ .sql = "CONCAT(NULL)", .want = null },
+    .{ .sql = "CAST(TRUE AS CHAR)", .want = "1" },
+    .{ .sql = "CAST(FALSE AS CHAR)", .want = "0" },
+    .{ .sql = "CONCAT(TRUE, 'x')", .want = "1x" },
+    .{ .sql = "CONCAT(1 = 1, '')", .want = "1" },
+    .{ .sql = "LENGTH(TRUE)", .want = "1" },
+    .{ .sql = "REPLACE(TRUE, '1', 'y')", .want = "y" },
+    .{ .sql = "REPEAT('b', 9223372036854775807) IS NULL", .want = "1" },
+    .{ .sql = "LENGTH(REPEAT('b', 9223372036854775807))", .want = null },
+    .{ .sql = "REPEAT('b', 3.4e38) IS NULL", .want = "1" },
+    .{ .sql = "LENGTH(REPEAT('ab', 8388608))", .want = "16777216" },
+    .{ .sql = "REPEAT('ab', 8388609) IS NULL", .want = "1" },
+    .{ .sql = "LPAD('a', 16777217, 'x') IS NULL", .want = "1" },
+    .{ .sql = "RPAD('a', 1e300, 'xy') IS NULL", .want = "1" },
+    .{ .sql = "LENGTH(RPAD('a', 16777216, 'xy'))", .want = "16777216" },
+    .{ .sql = "SPACE(16777217) IS NULL", .want = "1" },
+    .{ .sql = "LENGTH(SPACE(16777216))", .want = "16777216" },
+    .{ .sql = "LPAD('a', 3, 'xy')", .want = "xya" },
+    .{ .sql = "RPAD('abc', 2, 'x')", .want = "ab" },
+    .{ .sql = "REPEAT(NULL, 2)", .want = null },
+    .{ .sql = "LPAD('a', NULL, 'x')", .want = null },
+    .{ .sql = "SPACE(NULL)", .want = null },
+    .{ .sql = "MAKE_SET(3, 'a', 'b')", .want = "a,b" },
+    .{ .sql = "MAKE_SET('3.9', 'a', 'b', 'c')", .want = "a,b" },
+    .{ .sql = "MAKE_SET(3.9, 'a', 'b', 'c')", .want = "c" },
+    .{ .sql = "MAKE_SET(5, 'a', NULL, 'c')", .want = "a,c" },
+    .{ .sql = "MAKE_SET(3, '', 'b')", .want = ",b" },
+    .{ .sql = "MAKE_SET(NULL, 'a')", .want = null },
+    .{ .sql = "MAKE_SET(0, 'a')", .want = "" },
+    .{ .sql = "MAKE_SET(-1, 'a', 'b')", .want = "a,b" },
+    .{ .sql = "CURRENT_ROLE()", .want = "NONE" },
+    .{ .sql = "CHARSET(CURRENT_ROLE())", .want = "utf8mb3" },
+    .{ .sql = "UUID_SHORT() > 0", .want = "1" },
+    .{ .sql = "1 + @@auto_increment_increment", .want = "2" },
+    .{ .sql = "@@SESSION.auto_increment_increment * 3", .want = "3" },
+    .{ .sql = "CHARSET(@@version)", .want = "utf8mb3" },
+    .{ .sql = "CHARSET(@@auto_increment_increment)", .want = "binary" },
+    .{ .sql = "@@version_comment IS NOT NULL", .want = "1" },
+};
+
 const type_name_cases = [_]Case{
     .{ .sql = "COLLATION(1)", .want = "binary" },
     .{ .sql = "COLLATION(NULL)", .want = "binary" },
@@ -556,7 +614,7 @@ test "MySQL misc functions: doubles as text, integer arguments, JSON_QUOTE, COLL
 
     var sql_buf: std.ArrayList(u8) = .empty;
     defer sql_buf.deinit(allocator);
-    inline for (.{ double_text_cases, integer_arg_cases, json_quote_cases, type_name_cases }) |cases| {
+    inline for (.{ double_text_cases, integer_arg_cases, json_quote_cases, type_name_cases, text_leftover_cases }) |cases| {
         for (cases) |c| {
             sql_buf.clearRetainingCapacity();
             try sql_buf.print(allocator, "SELECT {s}", .{c.sql});
@@ -768,4 +826,26 @@ test "MySQL misc functions: information functions read the session" {
 
     try expectFailure(allocator, db, "SELECT CONNECTION_ID()");
     try expectFailure(allocator, db, "SELECT USER()");
+}
+
+test "MySQL misc functions: LIKE reads a number, boolean or date column as its text" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE lk (id BIGINT PRIMARY KEY, n INT, d DOUBLE, m DECIMAL(10,2), b BOOLEAN, dt DATE)");
+    try helpers.exec(allocator, db, "INSERT INTO lk VALUES (1, 12, 1.5, 2.5, TRUE, '2020-01-02'), (2, 21, 1e100, -3, FALSE, '2021-05-06'), (3, NULL, NULL, NULL, NULL, NULL)");
+
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("lk", .{})).flush();
+        try expectCells(allocator, db, "SELECT id FROM lk WHERE n LIKE '1%'", 0, &.{"1"});
+        try expectCells(allocator, db, "SELECT id FROM lk WHERE n NOT LIKE '1%'", 0, &.{"2"});
+        try expectCells(allocator, db, "SELECT id FROM lk WHERE d LIKE '1e%'", 0, &.{"2"});
+        try expectCells(allocator, db, "SELECT id FROM lk WHERE m LIKE '%.50'", 0, &.{"1"});
+        try expectCells(allocator, db, "SELECT id FROM lk WHERE b LIKE '0'", 0, &.{"2"});
+        try expectCells(allocator, db, "SELECT id FROM lk WHERE dt LIKE '2021%' AND n > 0", 0, &.{"2"});
+        try expectCells(allocator, db, "SELECT n LIKE '%1' FROM lk ORDER BY id", 0, &.{ "0", "1", null });
+        try expectCells(allocator, db, "SELECT id FROM lk WHERE @@auto_increment_increment = 1 AND n > @@auto_increment_increment * 20", 0, &.{"2"});
+    }
 }

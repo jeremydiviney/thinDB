@@ -290,8 +290,7 @@ pub fn sendQueryResultStatus(
                     try row_payload.append(allocator, 0xFB);
                 }
             }
-            try packet.writePacket(w, seq_id.*, row_payload.items);
-            seq_id.* +%= 1;
+            try packet.writeLogicalPacket(w, seq_id, row_payload.items);
         }
         if (prof.enabled) prof.addPhase("mysql.text.encode_write", @intCast(@max(0, prof.nowTicks() - write_start)));
     }
