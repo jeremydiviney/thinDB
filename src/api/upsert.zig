@@ -263,9 +263,9 @@ pub fn applyUpsertResolution(t: *Table) !void {
 
 /// Full-key Bloom candidates for a keyed DELETE/UPDATE (#143). When the
 /// predicate's top-level AND conjuncts (or a bare leaf) pin every order-key
-/// column with equality — allowing at most one column an IN set of ≤256
-/// values — return the compound-key hashes, encoded exactly as the Bloom was
-/// built. Returns null when the key set can't be derived (caller scans
+/// column with equality — allowing at most one column an IN list of ≤256
+/// values (an IN set, or the OR of equalities a literal list parses to) —
+/// return the compound-key hashes, encoded exactly as the Bloom was built. Returns null when the key set can't be derived (caller scans
 /// normally). Allocated in `aa`.
 pub fn keyHashesFromPredicateExpr(
     t: *Table,
@@ -296,11 +296,12 @@ pub fn keyHashesFromPredicateExpr(
                     eq_vals[k] = p.val;
                 }
             },
-            .in_set => |s| {
-                if (!s.negate and types.columnNameEql(s.col, col_name) and eq_vals[k] == null) {
+            .in_set, .@"or" => {
+                const listed = (try inListValues(aa, c, col_name)) orelse continue;
+                if (eq_vals[k] == null) {
                     if (in_vals != null and in_pos != k) return null; // two IN-bound key columns
-                    if (s.values.len == 0 or s.values.len > max_keys) return null;
-                    in_vals = s.values;
+                    if (listed.len == 0 or listed.len > max_keys) return null;
+                    in_vals = listed;
                     in_pos = k;
                 }
             },
@@ -324,9 +325,26 @@ pub fn keyHashesFromPredicateExpr(
     return try hashes.toOwnedSlice(aa);
 }
 
-/// Flatten a (possibly nested) AND tree into its leaf/in_set conjuncts.
-/// Returns false when the expression contains any non-conjunctive node
-/// (OR, NOT, ...) — the caller must then skip bloom gating entirely.
+/// The values of an IN list on `col_name`: a non-negated IN set, or an OR
+/// of equalities on that one column. Null for any other conjunct.
+fn inListValues(aa: Allocator, conjunct: exec.predicate.PredicateExpr, col_name: []const u8) !?[]const types.Value {
+    switch (conjunct) {
+        .in_set => |s| return if (!s.negate and types.columnNameEql(s.col, col_name)) s.values else null,
+        .@"or" => |arms| {
+            const col = exec.predicate.eqDisjunctionColumn(arms) orelse return null;
+            if (!types.columnNameEql(col, col_name)) return null;
+            const values = try aa.alloc(types.Value, arms.len);
+            for (arms, values) |arm, *v| v.* = arm.leaf.val;
+            return values;
+        },
+        else => return null,
+    }
+}
+
+/// Flatten a (possibly nested) AND tree into its leaf and IN-list conjuncts
+/// (an IN set, or an OR of equalities on one column). Returns false when the
+/// expression contains any other OR, a NOT, ... — the caller must then skip
+/// bloom gating entirely.
 pub fn appendConjuncts(
     aa: Allocator,
     list: *std.ArrayList(exec.predicate.PredicateExpr),
@@ -340,6 +358,11 @@ pub fn appendConjuncts(
             return true;
         },
         .leaf, .in_set => {
+            try list.append(aa, expr);
+            return true;
+        },
+        .@"or" => |arms| {
+            if (exec.predicate.eqDisjunctionColumn(arms) == null) return false;
             try list.append(aa, expr);
             return true;
         },
@@ -788,6 +811,46 @@ test "memtable swaps invalidate the incremental upsert index (gen counter, not p
     // No flush happened: every live row is in the memtable, and dedup
     // physically removes older versions — exactly 6 keys must remain.
     try std.testing.expectEqual(@as(u32, 6), t.memtable.row_count);
+}
+
+test "keyed Bloom gate: a literal IN list, spelled as an OR of equalities, pins the key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const Pe = exec.PredicateExpr;
+    const listed = [_]Pe{
+        .{ .leaf = .{ .col = "ID", .op = .eq, .val = .{ .bigint = 1 } } },
+        .{ .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 2 } } },
+        .{ .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 3 } } },
+    };
+    const in_list: Pe = .{ .@"or" = &listed };
+    const with_extra = [_]Pe{ in_list, .{ .leaf = .{ .col = "v", .op = .gt, .val = .{ .int = 0 } } } };
+
+    var point_hashes: [3]u64 = undefined;
+    for (&listed, &point_hashes) |arm, *h| h.* = (try keyHashesFromPredicateExpr(t, aa, arm)).?[0];
+    try std.testing.expectEqualSlices(u64, &point_hashes, (try keyHashesFromPredicateExpr(t, aa, in_list)).?);
+    try std.testing.expectEqualSlices(u64, &point_hashes, (try keyHashesFromPredicateExpr(t, aa, .{ .@"and" = &with_extra })).?);
+
+    // An OR over two columns, or a NOT IN, pins nothing.
+    const mixed = [_]Pe{ listed[0], with_extra[1] };
+    try std.testing.expect((try keyHashesFromPredicateExpr(t, aa, .{ .@"or" = &mixed })) == null);
+    try std.testing.expect((try keyHashesFromPredicateExpr(t, aa, .{ .not = &in_list })) == null);
 }
 
 test "upsert probe with zonemap pruning still tombstones the old segment copy" {

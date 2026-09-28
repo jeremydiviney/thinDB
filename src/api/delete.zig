@@ -338,17 +338,62 @@ pub const LiveSegment = struct {
     }
 };
 
-const RgHint = struct {
-    col_idx: usize,
-    op: exec.PredicateOp,
-    val: types.Value,
+const RgHint = union(enum) {
+    compare: struct { col_idx: usize, op: exec.PredicateOp, val: types.Value },
+    /// `col IN (values)`: some value has to fall in the row group's range.
+    any_equal: struct { col_idx: usize, values: []const types.Value },
+};
+
+/// What a DML filter lets a segment pass skip: row groups whose zonemaps
+/// rule out every match, and the columns the filter never reads.
+pub const SegmentPrune = struct {
+    hints: []const RgHint,
+    /// Columns the filter (and its computed operands) read.
+    ref_cols: []const bool,
+
+    /// `pred` is the validated filter; null keeps every row group and
+    /// references no column. Allocates in `aa`, an arena.
+    pub fn init(
+        aa: std.mem.Allocator,
+        columns: []const Column,
+        derived: []const exec.Derived,
+        pred: ?predicate.PredicateExpr,
+    ) !SegmentPrune {
+        var hints: std.ArrayList(RgHint) = .empty;
+        const ref_cols = try aa.alloc(bool, columns.len);
+        @memset(ref_cols, false);
+        if (pred) |p| {
+            collectDeletePruneInfo(columns, derived, p, aa, &hints, ref_cols) catch |err| switch (err) {
+                error.UnknownShape => {
+                    @memset(ref_cols, true);
+                    hints.clearRetainingCapacity();
+                },
+                else => return err,
+            };
+        }
+        return .{ .hints = hints.items, .ref_cols = ref_cols };
+    }
+
+    pub fn rowGroupCanMatch(self: SegmentPrune, rg: storage.RowGroupMeta) bool {
+        for (self.hints) |hint| switch (hint) {
+            .compare => |h| if (!predicate.statsOverlapPredicate(rg.stats[h.col_idx], h.op, h.val)) return false,
+            .any_equal => |h| {
+                const stats = rg.stats[h.col_idx];
+                for (h.values) |v| {
+                    if (predicate.statsOverlapPredicate(stats, .eq, v)) break;
+                } else return false;
+            },
+        };
+        return true;
+    }
 };
 
 /// Walk a predicate collecting (a) row-group zonemap prune hints from
-/// AND-tree leaf comparisons and (b) the set of columns the predicate
-/// references. Errors on any node shape it doesn't understand — the caller
-/// then falls back to decode-everything / prune-nothing, which is always
-/// correct.
+/// AND-tree leaf comparisons and IN lists (an IN set, or an OR of equalities
+/// on one column) and (b) the set of columns the predicate references, under
+/// ORs and NOTs too. Errors on any node shape it doesn't understand —
+/// the caller then falls back to decode-everything / prune-nothing, which
+/// is always correct.
 fn collectDeletePruneInfo(
     columns: []const Column,
     derived: []const exec.Derived,
@@ -362,14 +407,13 @@ fn collectDeletePruneInfo(
         .leaf => |p| {
             if (types.findColumn(columns, p.col)) |ci| {
                 ref_cols[ci] = true;
-                try hints.append(aa, .{ .col_idx = ci, .op = p.op, .val = p.val });
+                try hints.append(aa, .{ .compare = .{ .col_idx = ci, .op = p.op, .val = p.val } });
             } else try markDerivedInputs(columns, derived, p.col, aa, ref_cols);
         },
-        .in_set, .text_as_number_set => |s| {
-            // IN sets don't produce a single-op hint; referenced-column
-            // tracking alone is the win here.
+        .in_set => |s| {
             if (types.findColumn(columns, s.col)) |ci| {
                 ref_cols[ci] = true;
+                if (!s.negate) try hints.append(aa, .{ .any_equal = .{ .col_idx = ci, .values = s.values } });
             } else try markDerivedInputs(columns, derived, s.col, aa, ref_cols);
         },
         // Text read as a number has no zonemap order to prune by.
@@ -377,6 +421,29 @@ fn collectDeletePruneInfo(
             if (types.findColumn(columns, p.col)) |ci| {
                 ref_cols[ci] = true;
             } else try markDerivedInputs(columns, derived, p.col, aa, ref_cols);
+        },
+        .text_as_number_set => |s| {
+            if (types.findColumn(columns, s.col)) |ci| {
+                ref_cols[ci] = true;
+            } else try markDerivedInputs(columns, derived, s.col, aa, ref_cols);
+        },
+        .@"or" => |arms| {
+            const in_list_col = if (predicate.eqDisjunctionColumn(arms)) |col| types.findColumn(columns, col) else null;
+            if (in_list_col) |ci| {
+                ref_cols[ci] = true;
+                const values = try aa.alloc(types.Value, arms.len);
+                for (arms, values) |arm, *v| v.* = arm.leaf.val;
+                try hints.append(aa, .{ .any_equal = .{ .col_idx = ci, .values = values } });
+                return;
+            }
+            // An arm's hint doesn't hold for the whole OR; only the columns
+            // it reads are kept.
+            var arm_hints: std.ArrayList(RgHint) = .empty;
+            for (arms) |arm| try collectDeletePruneInfo(columns, derived, arm, aa, &arm_hints, ref_cols);
+        },
+        .not => |child| {
+            var negated_hints: std.ArrayList(RgHint) = .empty;
+            try collectDeletePruneInfo(columns, derived, child.*, aa, &negated_hints, ref_cols);
         },
         else => return error.UnknownShape,
     }
@@ -483,21 +550,11 @@ pub fn execDeleteByExpr(
     else
         null;
 
-    // Row-group prune hints + referenced-column set. Top-level AND-leaf
-    // conjuncts prune row groups via the footer zonemaps (a keyed CDC
-    // delete on an order-key-sorted segment prunes to ~one row group);
-    // whatever the predicate's shape, only the columns it references get
-    // decoded. Falls back to no-prune/all-columns on unhandled shapes.
-    const ga = gate_arena.allocator();
-    var rg_hints: std.ArrayList(RgHint) = .empty;
-    const ref_cols: []bool = try ga.alloc(bool, t.schema.columns.len);
-    @memset(ref_cols, false);
-    if (pred_or_null) |p| {
-        collectDeletePruneInfo(t.schema.columns, derived, p, ga, &rg_hints, ref_cols) catch {
-            @memset(ref_cols, true);
-            rg_hints.clearRetainingCapacity();
-        };
-    }
+    // Top-level AND conjuncts prune row groups via the footer zonemaps (a
+    // keyed CDC delete on an order-key-sorted segment prunes to ~one row
+    // group); whatever the predicate's shape, only the columns it
+    // references get decoded.
+    const prune = try SegmentPrune.init(gate_arena.allocator(), t.schema.columns, derived, pred_or_null);
 
     // The memtable rows to keep, worked out before any segment write so a
     // failure here leaves the table as it was.
@@ -546,14 +603,7 @@ pub fn execDeleteByExpr(
                 continue;
             }
 
-            var rg_can_match = true;
-            for (rg_hints.items) |h| {
-                if (!predicate.statsOverlapPredicate(rg.stats[h.col_idx], h.op, h.val)) {
-                    rg_can_match = false;
-                    break;
-                }
-            }
-            if (!rg_can_match) {
+            if (!prune.rowGroupCanMatch(rg)) {
                 row_offset += n;
                 continue;
             }
@@ -567,7 +617,7 @@ pub fn execDeleteByExpr(
             }
             @memset(owned_cols, null);
             for (t.schema.columns, 0..) |_, ci| {
-                if (ref_cols[ci]) {
+                if (prune.ref_cols[ci]) {
                     owned_cols[ci] = try seg.decodeColumn(t.allocator, t.schema, rg_idx, ci);
                 }
             }
