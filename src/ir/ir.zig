@@ -66,7 +66,8 @@ pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v7: join carries an optional ON residual.
 /// v8: drop_table carries a table list; alter_table carries actions.
 /// v9: a CASE carries the operands its conditions compute.
-pub const version: u16 = 9;
+/// v10: a join key pair carries a null-safe byte.
+pub const version: u16 = 10;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -1883,6 +1884,7 @@ fn encodeJoin(allocator: Allocator, out: *std.ArrayList(u8), j: Op.Join) EncodeE
         try out.appendSlice(allocator, kp.left);
         try appendU32(allocator, out, @intCast(kp.right.len));
         try out.appendSlice(allocator, kp.right);
+        try out.append(allocator, @intFromBool(kp.null_safe));
     }
     // Ranges
     try appendU32(allocator, out, @intCast(j.ranges.len));
@@ -2408,7 +2410,9 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             for (on) |*kp| {
                 const l = try readString(bytes, cursor);
                 const r = try readString(bytes, cursor);
-                kp.* = .{ .left = l, .right = r };
+                if (cursor.* >= bytes.len or bytes[cursor.*] > 1) return Error.IrCorrupt;
+                kp.* = .{ .left = l, .right = r, .null_safe = bytes[cursor.*] == 1 };
+                cursor.* += 1;
             }
 
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;

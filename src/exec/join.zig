@@ -76,7 +76,39 @@ const appendOneFromView = cell_io.appendOneFromView;
 pub const KeyPair = struct {
     left: []const u8,
     right: []const u8,
+    /// `left <=> right`: a NULL key matches a NULL key. Such a join runs as a
+    /// hash join (a nested loop under a residual or an opaque predicate),
+    /// never sort-merge, which drops NULL keys.
+    null_safe: bool = false,
 };
+
+pub fn anyNullSafeKey(on: []const KeyPair) bool {
+    for (on) |pair| if (pair.null_safe) return true;
+    return false;
+}
+
+pub fn keyIsNullSafe(null_safe: []const bool, k: usize) bool {
+    return k < null_safe.len and null_safe[k];
+}
+
+/// `KeyPair.null_safe` per pair, or empty when no pair is null-safe.
+pub fn nullSafeKeyFlags(aa: Allocator, on: []const KeyPair) ![]const bool {
+    if (!anyNullSafeKey(on)) return &.{};
+    const flags = try aa.alloc(bool, on.len);
+    for (on, flags) |pair, *f| f.* = pair.null_safe;
+    return flags;
+}
+
+/// Bit k set when key k is null-safe; zero past `MAX_FAST_KEYS` keys,
+/// which never take the FastTable.
+fn nullSafeKeyMask(null_safe: []const bool) u8 {
+    if (null_safe.len > MAX_FAST_KEYS) return 0;
+    var mask: u8 = 0;
+    for (null_safe, 0..) |ns, k| {
+        if (ns) mask |= @as(u8, 1) << @intCast(k);
+    }
+    return mask;
+}
 
 pub const JoinType = enum {
     inner,
@@ -282,10 +314,11 @@ fn normalizeJoinKeyTypes(
     var right_casts: std.ArrayList(exec.Derived) = .empty;
 
     const on = try aa.dupe(KeyPair, spec.on);
+    var null_flags: std.ArrayList(KeyPair) = .empty;
     for (on) |*pair| {
         const left_idx = columnIndex(left_schema, pair.left) orelse return Error.ColumnNotFound;
         const right_idx = columnIndex(right_schema, pair.right) orelse return Error.ColumnNotFound;
-        pair.left = try convertKeyPair(
+        const left_key = try convertKeyPair(
             aa,
             &left_keys,
             &right_casts,
@@ -295,6 +328,10 @@ fn normalizeJoinKeyTypes(
             pair.right,
             right_schema[right_idx].type,
         );
+        const converted = !std.mem.eql(u8, left_key, pair.left) or derivedNamed(right_casts.items, pair.right);
+        if (pair.null_safe and converted)
+            try null_flags.append(aa, try nullFlagKeyPair(aa, &left_keys, &right_casts, pair.left, pair.right));
+        pair.left = left_key;
     }
 
     const ranges = try aa.dupe(RangePredicate, spec.ranges);
@@ -314,7 +351,7 @@ fn normalizeJoinKeyTypes(
     }
 
     var normalized_spec = spec;
-    normalized_spec.on = on;
+    normalized_spec.on = if (null_flags.items.len > 0) try std.mem.concat(aa, KeyPair, &.{ on, null_flags.items }) else on;
     normalized_spec.ranges = ranges;
     normalized_spec.left_key_tail = spec.left_key_tail + left_keys.items.len;
     var left_out = left;
@@ -327,6 +364,37 @@ fn normalizeJoinKeyTypes(
         right_out = try right_out.compute(try right_casts.toOwnedSlice(aa));
     }
     return .{ .left = left_out, .right = right_out, .spec = normalized_spec };
+}
+
+fn derivedNamed(derived: []const exec.Derived, name: []const u8) bool {
+    for (derived) |d| if (types.columnNameEql(d.name, name)) return true;
+    return false;
+}
+
+/// A plain key pair equating whether a null-safe pair's keys are NULL before
+/// conversion. A conversion can make a non-NULL key NULL (text that reads as
+/// no number), which the converted null-safe key would match to a real NULL.
+fn nullFlagKeyPair(
+    aa: Allocator,
+    left_keys: *std.ArrayList(exec.Derived),
+    right_casts: *std.ArrayList(exec.Derived),
+    left_name: []const u8,
+    right_name: []const u8,
+) !KeyPair {
+    const left_flag = try std.fmt.allocPrint(aa, "__join_key_left_{d}", .{left_keys.items.len});
+    try left_keys.append(aa, .{ .name = left_flag, .expr = try nullFlagExpr(aa, left_name) });
+    const right_flag = try std.fmt.allocPrint(aa, "__join_key_right_null_{d}", .{right_casts.items.len});
+    try right_casts.append(aa, .{ .name = right_flag, .expr = try nullFlagExpr(aa, right_name) });
+    return .{ .left = left_flag, .right = right_flag };
+}
+
+/// `CASE WHEN name IS NULL THEN 1 ELSE 0 END`.
+fn nullFlagExpr(aa: Allocator, name: []const u8) !exec.Expr {
+    const branches = try aa.alloc(exec.Expr.Branch, 1);
+    branches[0] = .{ .cond = .{ .is_null = try aa.dupe(u8, name) }, .then = .{ .lit = .{ .int = 1 } } };
+    const not_null = try aa.create(exec.Expr);
+    not_null.* = .{ .lit = .{ .int = 0 } };
+    return .{ .case = .{ .branches = branches, .else_branch = not_null } };
 }
 
 /// How a join compares a key pair: for equality (hashed or sorted) or for
@@ -510,7 +578,9 @@ const output_batch_rows: usize = 1024;
 /// row index — build sides are capped well below u32 max.
 pub const FAST_EMPTY = std.math.maxInt(u32);
 
-const FastKeyKind = enum { int, string, compound };
+/// `null_safe` is `compound` whose null-safe keys (`FastTable.null_safe_keys`)
+/// digest and compare NULL as a value.
+const FastKeyKind = enum { int, string, compound, null_safe };
 
 /// Compile-time mirror of tryBuildFastTable's key-type gate.
 fn fastKindOfType(t: TypeTag) ?FastKeyKind {
@@ -559,6 +629,61 @@ fn compoundRowsEqual(probe_views: []const ColumnView, probe_row: u32, build_view
     return true;
 }
 
+/// What a NULL cell of a null-safe key digests as. Any fixed value works:
+/// the chain walk compares the cells.
+const NULL_CELL_DIGEST: u64 = 0x6a09e667f3bcc909;
+
+fn nullSafeCompoundDigest(views: []const ColumnView, row: u32) u64 {
+    var h: u64 = 0x9e3779b97f4a7c15;
+    for (views) |v| h = fastMix(h ^ (if (v.isValid(row)) fastCellDigest(v, row) else NULL_CELL_DIGEST));
+    return h;
+}
+
+/// Whether `row` has a NULL in a key that isn't null-safe (bit k of
+/// `null_safe_keys` clear for key k): such a row matches nothing.
+fn anyRejectedNull(views: []const ColumnView, null_safe_keys: u8, row: u32) bool {
+    for (views, 0..) |v, k| {
+        if (!v.isValid(row) and (null_safe_keys >> @intCast(k)) & 1 == 0) return true;
+    }
+    return false;
+}
+
+/// `compoundRowsEqual` with NULL equal to NULL. Only rows without a NULL in
+/// a key that isn't null-safe get here.
+fn nullSafeRowsEqual(probe_views: []const ColumnView, probe_row: u32, build_views: []const ColumnView, build_row: u32) bool {
+    for (probe_views, build_views) |pv, bv| {
+        const probe_valid = pv.isValid(probe_row);
+        if (probe_valid != bv.isValid(build_row)) return false;
+        if (probe_valid and !compareCellsOp(pv, probe_row, bv, build_row, .eq)) return false;
+    }
+    return true;
+}
+
+inline fn compoundDigestOf(comptime kind: FastKeyKind, views: []const ColumnView, row: u32) u64 {
+    return if (kind == .null_safe) nullSafeCompoundDigest(views, row) else fastCompoundDigest(views, row);
+}
+
+inline fn compoundKeysEqual(comptime kind: FastKeyKind, probe_views: []const ColumnView, probe_row: u32, build_views: []const ColumnView, build_row: u32) bool {
+    return if (kind == .null_safe)
+        nullSafeRowsEqual(probe_views, probe_row, build_views, build_row)
+    else
+        compoundRowsEqual(probe_views, probe_row, build_views, build_row);
+}
+
+/// Whether probe row `row` matches nothing for its NULL keys. `probe_views`
+/// is read by the multi-view kinds, `key_view` by the others.
+inline fn probeKeyRejected(comptime kind: FastKeyKind, ft: *const FastTable, key_view: ColumnView, probe_views: []const ColumnView, row: u32) bool {
+    return switch (kind) {
+        .int, .string => !key_view.isValid(row),
+        .compound => anyViewNull(probe_views, row),
+        .null_safe => anyRejectedNull(probe_views, ft.null_safe_keys, row),
+    };
+}
+
+fn keyViewsPerKey(kind: FastKeyKind) bool {
+    return kind == .compound or kind == .null_safe;
+}
+
 /// Open-addressing hash table over a single build-side join key,
 /// replacing the byte-compound StringHashMap for the probe hot loop.
 /// Int-family keys are widened to 64 bits (exact, no verification);
@@ -587,9 +712,11 @@ pub const FastTable = struct {
     /// View over the build key column, captured after buildPhase
     /// (build views are immutable from then on). Single-key kinds only.
     build_key_view: ColumnView,
-    /// `.compound` only: one view per key column, in `on`-pair order.
-    /// Arena-owned; empty for single-key kinds.
+    /// `.compound` and `.null_safe` only: one view per key column, in
+    /// `on`-pair order. Arena-owned; empty for single-key kinds.
     build_key_views: []const ColumnView = &.{},
+    /// `.null_safe` only: bit k set when key k matches NULL to NULL.
+    null_safe_keys: u8 = 0,
 };
 
 pub const FastBuild = struct {
@@ -686,6 +813,7 @@ const InsertJob = struct {
     heads: []u32,
     chain_next: []u32,
     mask: u64,
+    null_safe_keys: u8 = 0,
     /// Allocates the chain on the first duplicate; null when the chain was
     /// allocated up front.
     lazy_chain: ?Allocator = null,
@@ -711,6 +839,7 @@ const InsertJob = struct {
             const valid = switch (kind) {
                 .int, .string => job.key_view.isValid(row),
                 .compound => !anyViewNull(job.key_views, row),
+                .null_safe => !anyRejectedNull(job.key_views, job.null_safe_keys, row),
             };
             if (!valid) continue;
             const key = job.digests[row];
@@ -759,6 +888,7 @@ const RangedRows = struct {
 const PartitionPass = struct {
     kind: FastKeyKind,
     views: []const ColumnView,
+    null_safe_keys: u8,
     digests: []u64,
     mask: u64,
     range_shift: u6,
@@ -778,7 +908,7 @@ const PartitionPass = struct {
         var c: [PARALLEL_INSERT_RANGES]u32 = .{0} ** PARALLEL_INSERT_RANGES;
         var row: u32 = @intCast(lo);
         while (row < hi) : (row += 1) {
-            const digest = digestRow(kind, p.views, row) orelse {
+            const digest = digestRow(kind, p.views, p.null_safe_keys, row) orelse {
                 p.digests[row] = 0;
                 p.range_of[row] = NULL_RANGE;
                 continue;
@@ -805,7 +935,7 @@ const PartitionPass = struct {
     }
 };
 
-fn partitionRows(scratch: Allocator, kind: FastKeyKind, views: []const ColumnView, digests: []u64, mask: u64, range_shift: u6, workers: usize) !RangedRows {
+fn partitionRows(scratch: Allocator, kind: FastKeyKind, views: []const ColumnView, null_safe_keys: u8, digests: []u64, mask: u64, range_shift: u6, workers: usize) !RangedRows {
     const n = digests.len;
     const range_of = try scratch.alloc(u8, n);
     defer scratch.free(range_of);
@@ -816,6 +946,7 @@ fn partitionRows(scratch: Allocator, kind: FastKeyKind, views: []const ColumnVie
     var pass = PartitionPass{
         .kind = kind,
         .views = views,
+        .null_safe_keys = null_safe_keys,
         .digests = digests,
         .mask = mask,
         .range_shift = range_shift,
@@ -894,16 +1025,20 @@ pub fn defaultBuildThreads() usize {
 }
 
 /// `scratch` holds the per-row digests only for the duration of the build;
-/// `threads` bounds the digest pre-pass workers.
-pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const ColumnView, n: u32, needs_chain: bool, threads: usize) !?FastBuild {
+/// `threads` bounds the digest pre-pass workers. Bit k of `null_safe_keys`
+/// makes key k match NULL to NULL.
+pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const ColumnView, null_safe_keys: u8, n: u32, needs_chain: bool, threads: usize) !?FastBuild {
     const key_view = key_views[0];
-    const kind: FastKeyKind = if (key_views.len > 1) .compound else switch (key_view.data) {
+    const kind: FastKeyKind = if (null_safe_keys != 0) .null_safe else if (key_views.len > 1) .compound else switch (key_view.data) {
         .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
         .varchar, .string, .char, .json => .string,
         else => return null,
     };
+    if (kind == .null_safe) for (key_views) |v| {
+        if (fastKindOfType(std.meta.activeTag(v.data)) == null) return null;
+    };
     var owned_key_views: []ColumnView = &.{};
-    if (kind == .compound) owned_key_views = try aa.dupe(ColumnView, key_views);
+    if (keyViewsPerKey(kind)) owned_key_views = try aa.dupe(ColumnView, key_views);
 
     const cap = std.math.ceilPowerOfTwoAssert(usize, @max(16, @as(usize, n) * 2));
     const slot_keys = try aa.alloc(u64, cap);
@@ -925,9 +1060,9 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
     const t_start = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
     const digests = try scratch.alloc(u64, n);
     defer scratch.free(digests);
-    const digest_views: []const ColumnView = if (kind == .compound) owned_key_views else key_views[0..1];
+    const digest_views: []const ColumnView = if (keyViewsPerKey(kind)) owned_key_views else key_views[0..1];
     const ranged_build = n >= PARALLEL_INSERT_MIN_ROWS;
-    if (!ranged_build) digestAll(kind, digest_views, digests, threads);
+    if (!ranged_build) digestAll(kind, digest_views, null_safe_keys, digests, threads);
 
     if (ranged_build and chain_next.len == 0) {
         chain_next = try aa.alloc(u32, n);
@@ -942,6 +1077,7 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
         .heads = heads,
         .chain_next = chain_next,
         .mask = mask,
+        .null_safe_keys = null_safe_keys,
         .lazy_chain = aa,
     };
     var keys_unique = true;
@@ -950,7 +1086,7 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
     if (ranged_build) {
         const range_len: u64 = cap / PARALLEL_INSERT_RANGES;
         const workers: usize = @max(@as(usize, 1), @min(threads, MAX_DIGEST_WORKERS));
-        const ranged_rows = try partitionRows(scratch, kind, digest_views, digests, mask, std.math.log2_int(u64, range_len), workers);
+        const ranged_rows = try partitionRows(scratch, kind, digest_views, null_safe_keys, digests, mask, std.math.log2_int(u64, range_len), workers);
         defer ranged_rows.free(scratch);
         t_insert = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         var ins = RangeInsert{
@@ -1007,6 +1143,7 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
             .next = chain_next,
             .build_key_view = key_view,
             .build_key_views = owned_key_views,
+            .null_safe_keys = null_safe_keys,
         },
         .keys_unique = keys_unique,
     };
@@ -1015,35 +1152,38 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
 const DigestJob = struct {
     kind: FastKeyKind,
     views: []const ColumnView,
+    null_safe_keys: u8,
     digests: []u64,
     start: u32,
     end: u32,
 
     fn run(job: *const DigestJob) void {
         switch (job.kind) {
-            inline else => |k| digestRange(k, job.views, job.digests, job.start, job.end),
+            inline else => |k| digestRange(k, job.views, job.null_safe_keys, job.digests, job.start, job.end),
         }
     }
 };
 
-/// A key row's digest; null for a NULL key, which never enters the table.
-inline fn digestRow(comptime kind: FastKeyKind, views: []const ColumnView, row: u32) ?u64 {
+/// A key row's digest; null for a NULL key that matches nothing, which never
+/// enters the table.
+inline fn digestRow(comptime kind: FastKeyKind, views: []const ColumnView, null_safe_keys: u8, row: u32) ?u64 {
     const kv = views[0];
     return switch (kind) {
         .int => if (kv.isValid(row)) fastIntKey(kv, row) else null,
         .string => if (kv.isValid(row)) std.hash.Wyhash.hash(0, stringRowBytes(kv, row)) else null,
         .compound => if (anyViewNull(views, row)) null else fastCompoundDigest(views, row),
+        .null_safe => if (anyRejectedNull(views, null_safe_keys, row)) null else nullSafeCompoundDigest(views, row),
     };
 }
 
 /// A NULL key row gets digest 0; the insert re-checks validity and skips
 /// it, so the value is never used.
-fn digestRange(comptime kind: FastKeyKind, views: []const ColumnView, digests: []u64, start: u32, end: u32) void {
+fn digestRange(comptime kind: FastKeyKind, views: []const ColumnView, null_safe_keys: u8, digests: []u64, start: u32, end: u32) void {
     var row = start;
-    while (row < end) : (row += 1) digests[row] = digestRow(kind, views, row) orelse 0;
+    while (row < end) : (row += 1) digests[row] = digestRow(kind, views, null_safe_keys, row) orelse 0;
 }
 
-fn digestAll(kind: FastKeyKind, views: []const ColumnView, digests: []u64, threads: usize) void {
+fn digestAll(kind: FastKeyKind, views: []const ColumnView, null_safe_keys: u8, digests: []u64, threads: usize) void {
     const n: u32 = @intCast(digests.len);
     const by_rows: usize = n / DIGEST_ROWS_PER_WORKER;
     const workers: usize = @max(@as(usize, 1), @min(@min(threads, by_rows), MAX_DIGEST_WORKERS));
@@ -1052,6 +1192,7 @@ fn digestAll(kind: FastKeyKind, views: []const ColumnView, digests: []u64, threa
         jobs[w] = .{
             .kind = kind,
             .views = views,
+            .null_safe_keys = null_safe_keys,
             .digests = digests,
             .start = @intCast(@as(usize, n) * w / workers),
             .end = @intCast(if (w + 1 == workers) n else @as(usize, n) * (w + 1) / workers),
@@ -1128,6 +1269,9 @@ pub const Join = struct {
     /// name against the side's CURRENT outputSchema().
     left_key_names: []const []const u8,
     right_key_names: []const []const u8,
+    /// Per `on` pair: whether it matches NULL to NULL (`KeyPair.null_safe`).
+    /// Empty when no pair does. Arena-owned.
+    null_safe_keys: []const bool = &.{},
 
     /// Optional skew detector. Set when Spec.skew_ratio_threshold > 0;
     /// observed during buildPhase, checked at end. Allocated in
@@ -1322,9 +1466,12 @@ pub const Join = struct {
         // An order-preserving left join must emit probe(left)-row-major:
         // hash is the only algorithm with that property (sort-merge emits
         // key order; the rider only walks left equi-joins, so the pin
-        // never conflicts with NLJ/range-sweep-only shapes).
-        const chosen: Algorithm = if (spec.preserve_left_order and spec.join_type == .left and
-            spec.on.len > 0 and spec.opaque_predicate == null and spec.residual == null)
+        // never conflicts with NLJ/range-sweep-only shapes). Sort-merge
+        // drops NULL keys, so a null-safe key takes hash too.
+        const any_null_safe = anyNullSafeKey(spec.on);
+        const chosen: Algorithm = if ((spec.preserve_left_order and spec.join_type == .left and
+            spec.on.len > 0 and spec.opaque_predicate == null and spec.residual == null) or
+            (any_null_safe and chosen_stats == .sort_merge))
             .hash
         else
             chosen_stats;
@@ -1399,6 +1546,7 @@ pub const Join = struct {
                 return Error.JoinKeyTypeMismatch;
             }
         }
+        const null_safe_keys = try nullSafeKeyFlags(aa, spec.on);
 
         // Resolve range predicates into column indices.
         const resolved_ranges = try aa.alloc(Join.ResolvedRange, spec.ranges.len);
@@ -1525,6 +1673,7 @@ pub const Join = struct {
             .join_type = spec.join_type,
             .left_key_names = left_key_names,
             .right_key_names = right_key_names,
+            .null_safe_keys = null_safe_keys,
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
             .ranges = resolved_ranges,
@@ -1608,8 +1757,9 @@ pub const Join = struct {
         // walk + parallel probe absorb heavy buckets far better than the
         // bucket-list walk the reroute was built to escape.
         // The skew re-route hands the join to sort-merge mid-flight —
-        // key-ordered emission, incompatible with order preservation.
-        if (spec.skew_ratio_threshold > 0.0 and !self.probe_fused and !spec.preserve_left_order) {
+        // key-ordered emission, incompatible with order preservation, and
+        // no NULL keys, which a null-safe key matches.
+        if (spec.skew_ratio_threshold > 0.0 and !self.probe_fused and !spec.preserve_left_order and !any_null_safe) {
             const arena_alloc = self.arena.allocator();
             const det = try arena_alloc.create(@import("skew.zig").MisraGries);
             det.* = @import("skew.zig").MisraGries.init(arena_alloc);
@@ -1775,7 +1925,15 @@ pub const Join = struct {
     }
 
     pub fn explain(self: *Join, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
-        try exec.explainLine(out, allocator, depth, "HashJoin");
+        try exec.explainIndent(out, allocator, depth);
+        try out.appendSlice(allocator, "HashJoin on=[");
+        for (self.left_key_names, self.right_key_names, 0..) |left_name, right_name, k| {
+            if (k > 0) try out.appendSlice(allocator, ", ");
+            try out.appendSlice(allocator, left_name);
+            try out.appendSlice(allocator, if (keyIsNullSafe(self.null_safe_keys, k)) "<=>" else "=");
+            try out.appendSlice(allocator, right_name);
+        }
+        try out.appendSlice(allocator, "]\n");
         try self.left.explain(out, allocator, depth + 1);
         try self.right.explain(out, allocator, depth + 1);
     }
@@ -2044,7 +2202,7 @@ pub const Join = struct {
         const probe_schema = if (self.build_is_left) self.right.outputSchema() else self.left.outputSchema();
         var probe = if (self.build_is_left) &self.right else &self.left;
         const jtrace = getenv("THINDB_TRACE_JOINFUSE") != null;
-        keys: for (build_names, probe_names) |bname, pname| {
+        keys: for (build_names, probe_names, 0..) |bname, pname, k| {
             const bci = columnIndex(build_schema, bname) orelse continue;
             const pci = columnIndex(probe_schema, pname) orelse continue;
             if (bci >= self.build_views.len) continue;
@@ -2056,7 +2214,12 @@ pub const Join = struct {
             var mx: ?types.Value = null;
             var row: usize = 0;
             while (row < self.build_rows) : (row += 1) {
-                if (!view.isValid(row)) continue;
+                if (!view.isValid(row)) {
+                    // A NULL build key of a null-safe pair matches NULL
+                    // probe keys, which a range hint would drop.
+                    if (keyIsNullSafe(self.null_safe_keys, k)) continue :keys;
+                    continue;
+                }
                 const v = keyValueAt(view, row) orelse continue :keys;
                 if (mn == null or v.compare(mn.?) == .lt) mn = v;
                 if (mx == null or v.compare(mx.?) == .gt) mx = v;
@@ -2101,9 +2264,9 @@ pub const Join = struct {
                     var i: u32 = 0;
                     while (i < n) : (i += 1) {
                         if ((self.build_rows + i) % self.skew_sample_interval != 0) continue;
-                        if (anyKeyNull(batch, key_indices, i)) continue;
+                        if (anyKeyNull(batch, key_indices, self.null_safe_keys, i)) continue;
                         self.key_scratch.clearRetainingCapacity();
-                        try buildCompoundKey(self.allocator, &self.key_scratch, batch, key_indices, i);
+                        try buildCompoundKey(self.allocator, &self.key_scratch, batch, key_indices, self.null_safe_keys, i);
                         try det.observe(self.key_scratch.items);
                     }
                 }
@@ -2122,9 +2285,9 @@ pub const Join = struct {
                 // counts every batch row. Bumping here shifted every
                 // subsequent id and over-counted the total (OOB reads in
                 // emit and the FULL drain).
-                if (anyKeyNull(batch, key_indices, i)) continue;
+                if (anyKeyNull(batch, key_indices, self.null_safe_keys, i)) continue;
                 self.key_scratch.clearRetainingCapacity();
-                try buildCompoundKey(self.allocator, &self.key_scratch, batch, key_indices, i);
+                try buildCompoundKey(self.allocator, &self.key_scratch, batch, key_indices, self.null_safe_keys, i);
 
                 const aa = self.arena.allocator();
                 const gop = try self.hash_table.getOrPut(aa, self.key_scratch.items);
@@ -2225,7 +2388,7 @@ pub const Join = struct {
             casts[ncasts] = spec;
             ncasts += 1;
         }
-        const shared = (try src.stage.sharedJoinBuild(keys[0..key_indices.len], casts[0..ncasts], self.join_type == .full)) orelse return false;
+        const shared = (try src.stage.sharedJoinBuild(keys[0..key_indices.len], casts[0..ncasts], nullSafeKeyMask(self.null_safe_keys), self.join_type == .full)) orelse return false;
         for (self.build_views, src.map, src.casts) |*v, col, slot_cast| v.* = shared.viewFor(col, slot_cast);
         self.build_rows = shared.rows;
         self.fast_table = shared.table;
@@ -2247,7 +2410,7 @@ pub const Join = struct {
         const build_key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
         var key_views: [MAX_FAST_KEYS]ColumnView = undefined;
         for (build_key_indices, 0..) |ki, i| key_views[i] = self.build_views[ki];
-        const built = (try buildFastTable(self.arena.allocator(), self.allocator, key_views[0..build_key_indices.len], self.build_rows, self.join_type == .full, defaultBuildThreads())) orelse return;
+        const built = (try buildFastTable(self.arena.allocator(), self.allocator, key_views[0..build_key_indices.len], nullSafeKeyMask(self.null_safe_keys), self.build_rows, self.join_type == .full, defaultBuildThreads())) orelse return;
         self.fast_table = built.table;
         if (!built.keys_unique) self.build_keys_unique = false;
     }
@@ -2348,12 +2511,26 @@ pub const Join = struct {
         probe_rows: *std.ArrayListUnmanaged(u32),
         build_rows: *std.ArrayListUnmanaged(u32),
     ) !void {
+        switch (ft.kind) {
+            inline else => |kind| try self.collectPairsOf(kind, ft, batch, alloc, probe_rows, build_rows),
+        }
+    }
+
+    fn collectPairsOf(
+        self: *Join,
+        comptime kind: FastKeyKind,
+        ft: *const FastTable,
+        batch: Batch,
+        alloc: Allocator,
+        probe_rows: *std.ArrayListUnmanaged(u32),
+        build_rows: *std.ArrayListUnmanaged(u32),
+    ) !void {
         const probe_key_idx = if (self.build_is_left) self.right_key_indices[0] else self.left_key_indices[0];
         const preserved = self.probeSidePreserved();
         const n = batch.row_count;
         const key_view = batch.values[probe_key_idx];
         var pkv_buf: [MAX_FAST_KEYS]ColumnView = undefined;
-        const probe_views = if (ft.kind == .compound) self.probeKeyViews(batch, &pkv_buf) else &.{};
+        const probe_views = if (comptime keyViewsPerKey(kind)) self.probeKeyViews(batch, &pkv_buf) else &.{};
 
         probe_rows.clearRetainingCapacity();
         build_rows.clearRetainingCapacity();
@@ -2362,13 +2539,12 @@ pub const Join = struct {
 
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            const key_null = if (ft.kind == .compound) anyViewNull(probe_views, i) else !key_view.isValid(i);
-            if (key_null) {
+            if (probeKeyRejected(kind, ft, key_view, probe_views, i)) {
                 if (preserved) try pushPair(alloc, probe_rows, build_rows, i, FAST_EMPTY);
                 continue;
             }
             var found = false;
-            switch (ft.kind) {
+            switch (kind) {
                 .int => {
                     const key = fastIntKey(key_view, i);
                     var slot = fastMix(key) & ft.mask;
@@ -2421,15 +2597,15 @@ pub const Join = struct {
                         slot = nextSlot(slot, ft.wrap_mask);
                     }
                 },
-                .compound => {
-                    const key = fastCompoundDigest(probe_views, i);
+                .compound, .null_safe => {
+                    const key = compoundDigestOf(kind, probe_views, i);
                     var slot = key & ft.mask;
                     while (true) {
                         const head = ft.heads[slot];
                         if (head == FAST_EMPTY) break;
                         if (ft.slot_keys[slot] == key) {
                             if (ft.next.len == 0) {
-                                if (compoundRowsEqual(probe_views, i, ft.build_key_views, head)) {
+                                if (compoundKeysEqual(kind, probe_views, i, ft.build_key_views, head)) {
                                     found = true;
                                     try pushPair(alloc, probe_rows, build_rows, i, head);
                                     if (self.matched_build) |*mb| mb.set(head);
@@ -2438,7 +2614,7 @@ pub const Join = struct {
                             }
                             var r = head;
                             while (r != FAST_EMPTY) : (r = ft.next[r]) {
-                                if (!compoundRowsEqual(probe_views, i, ft.build_key_views, r)) continue;
+                                if (!compoundKeysEqual(kind, probe_views, i, ft.build_key_views, r)) continue;
                                 found = true;
                                 try pushPair(alloc, probe_rows, build_rows, i, r);
                                 if (self.matched_build) |*mb| mb.set(r);
@@ -2594,7 +2770,13 @@ pub const Join = struct {
     /// equality against genuine mismatches. `probe_views` is read only by
     /// the compound kind.
     fn fastLookupFirst(ft: *const FastTable, key_view: ColumnView, probe_views: []const ColumnView, i: u32) u32 {
-        switch (ft.kind) {
+        return switch (ft.kind) {
+            inline else => |kind| fastLookupFirstOf(kind, ft, key_view, probe_views, i),
+        };
+    }
+
+    fn fastLookupFirstOf(comptime kind: FastKeyKind, ft: *const FastTable, key_view: ColumnView, probe_views: []const ColumnView, i: u32) u32 {
+        switch (kind) {
             .int => {
                 const key = fastIntKey(key_view, i);
                 var slot = fastMix(key) & ft.mask;
@@ -2624,19 +2806,19 @@ pub const Join = struct {
                     slot = nextSlot(slot, ft.wrap_mask);
                 }
             },
-            .compound => {
-                const key = fastCompoundDigest(probe_views, i);
+            .compound, .null_safe => {
+                const key = compoundDigestOf(kind, probe_views, i);
                 var slot = key & ft.mask;
                 while (true) {
                     const head = ft.heads[slot];
                     if (head == FAST_EMPTY) return FAST_EMPTY;
                     if (ft.slot_keys[slot] == key) {
                         if (ft.next.len == 0) {
-                            return if (compoundRowsEqual(probe_views, i, ft.build_key_views, head)) head else FAST_EMPTY;
+                            return if (compoundKeysEqual(kind, probe_views, i, ft.build_key_views, head)) head else FAST_EMPTY;
                         }
                         var r = head;
                         while (r != FAST_EMPTY) : (r = ft.next[r]) {
-                            if (compoundRowsEqual(probe_views, i, ft.build_key_views, r)) return r;
+                            if (compoundKeysEqual(kind, probe_views, i, ft.build_key_views, r)) return r;
                         }
                         return FAST_EMPTY;
                     }
@@ -2668,28 +2850,36 @@ pub const Join = struct {
         try out_rows.ensureUnusedCapacity(alloc, n);
         const probe_key_indices = if (self.build_is_left) self.right_key_indices else self.left_key_indices;
         if (self.fast_table) |*ft| {
-            const key_view = batch.values[probe_key_indices[0]];
-            var pkv_buf: [MAX_FAST_KEYS]ColumnView = undefined;
-            const probe_views = if (ft.kind == .compound) self.probeKeyViews(batch, &pkv_buf) else &.{};
-            var i: u32 = 0;
-            while (i < n) : (i += 1) {
-                const key_null = if (ft.kind == .compound) anyViewNull(probe_views, i) else !key_view.isValid(i);
-                var m: u32 = if (!key_null) fastLookupFirst(ft, key_view, probe_views, i) else FAST_EMPTY;
-                if (m != FAST_EMPTY and self.ranges.len > 0 and !self.passesAllRanges(batch, i, m)) m = FAST_EMPTY;
-                out_rows.appendAssumeCapacity(m);
+            switch (ft.kind) {
+                inline else => |kind| self.resolveFastPassMatches(kind, ft, batch, out_rows),
             }
         } else {
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 var m: u32 = FAST_EMPTY;
-                if (!anyKeyNull(batch, probe_key_indices, i)) {
+                if (!anyKeyNull(batch, probe_key_indices, self.null_safe_keys, i)) {
                     self.key_scratch.clearRetainingCapacity();
-                    try buildCompoundKey(self.allocator, &self.key_scratch, batch, probe_key_indices, i);
+                    try buildCompoundKey(self.allocator, &self.key_scratch, batch, probe_key_indices, self.null_safe_keys, i);
                     if (self.hash_table.get(self.key_scratch.items)) |bucket| m = bucket.items[0];
                 }
                 if (m != FAST_EMPTY and self.ranges.len > 0 and !self.passesAllRanges(batch, i, m)) m = FAST_EMPTY;
                 out_rows.appendAssumeCapacity(m);
             }
+        }
+    }
+
+    /// `resolvePassMatches` over the FastTable; `out_rows` has room for
+    /// every probe row.
+    fn resolveFastPassMatches(self: *Join, comptime kind: FastKeyKind, ft: *const FastTable, batch: Batch, out_rows: *std.ArrayListUnmanaged(u32)) void {
+        const probe_key_indices = if (self.build_is_left) self.right_key_indices else self.left_key_indices;
+        const key_view = batch.values[probe_key_indices[0]];
+        var pkv_buf: [MAX_FAST_KEYS]ColumnView = undefined;
+        const probe_views = if (comptime keyViewsPerKey(kind)) self.probeKeyViews(batch, &pkv_buf) else &.{};
+        var i: u32 = 0;
+        while (i < batch.row_count) : (i += 1) {
+            var m: u32 = if (probeKeyRejected(kind, ft, key_view, probe_views, i)) FAST_EMPTY else fastLookupFirstOf(kind, ft, key_view, probe_views, i);
+            if (m != FAST_EMPTY and self.ranges.len > 0 and !self.passesAllRanges(batch, i, m)) m = FAST_EMPTY;
+            out_rows.appendAssumeCapacity(m);
         }
     }
 
@@ -2888,9 +3078,9 @@ pub const Join = struct {
                     continue;
                 }
                 // Look up this probe row.
-                if (!anyKeyNull(batch, probe_key_indices, self.cur_probe_row)) {
+                if (!anyKeyNull(batch, probe_key_indices, self.null_safe_keys, self.cur_probe_row)) {
                     self.key_scratch.clearRetainingCapacity();
-                    try buildCompoundKey(self.allocator, &self.key_scratch, batch, probe_key_indices, self.cur_probe_row);
+                    try buildCompoundKey(self.allocator, &self.key_scratch, batch, probe_key_indices, self.null_safe_keys, self.cur_probe_row);
                     if (self.hash_table.get(self.key_scratch.items)) |bucket| {
                         self.cur_match_list = bucket.items;
                         self.cur_match_pos = 0;
@@ -3260,45 +3450,61 @@ fn isStringTag(t: TypeTag) bool {
     };
 }
 
-/// True if any key column has a NULL value at row `i`.
-pub fn anyKeyNull(batch: Batch, key_indices: []const usize, i: u32) bool {
-    for (key_indices) |idx| {
-        if (!batch.values[idx].isValid(i)) return true;
+/// True if row `i` has a NULL in a key that NULL can't match: any key but
+/// a null-safe one (`null_safe`, per key, empty when none is).
+pub fn anyKeyNull(batch: Batch, key_indices: []const usize, null_safe: []const bool, i: u32) bool {
+    for (key_indices, 0..) |idx, k| {
+        if (!batch.values[idx].isValid(i) and !keyIsNullSafe(null_safe, k)) return true;
     }
     return false;
 }
 
 /// Build a compound key for hashing/comparison. Mirrors the layout
-/// used by Aggregate's groupBy key builder.
+/// used by Aggregate's groupBy key builder. A null-safe key (`null_safe`,
+/// per key, empty when none is) leads with a byte telling NULL from a value.
 pub fn buildCompoundKey(
     allocator: Allocator,
     out: *std.ArrayList(u8),
     batch: Batch,
     key_indices: []const usize,
+    null_safe: []const bool,
     row: u32,
 ) !void {
-    for (key_indices) |ci| {
+    if (null_safe.len == 0) {
+        for (key_indices) |ci| try appendKeyCell(allocator, out, batch.values[ci], row);
+        return;
+    }
+    for (key_indices, null_safe) |ci, ns| {
         const view = batch.values[ci];
-        switch (view.data) {
-            .int => |s| try appendInt(allocator, out, i32, s[row]),
-            .bigint => |s| try appendInt(allocator, out, i64, s[row]),
-            .boolean => |s| try out.append(allocator, s[row]),
-            .float => |s| try appendBits(allocator, out, u32, types.canonicalFloatBits(s[row])),
-            .double => |s| try appendBits(allocator, out, u64, types.canonicalFloatBits(s[row])),
-            .date => |s| try appendInt(allocator, out, i32, s[row]),
-            .datetime => |s| try appendInt(allocator, out, i64, s[row]),
-            .tinyint => |s| try out.append(allocator, @bitCast(s[row])),
-            .smallint => |s| try appendInt(allocator, out, i16, s[row]),
-            .largeint => |s| try appendInt(allocator, out, i128, s[row]),
-            .decimal64 => |s| try appendInt(allocator, out, i64, s[row]),
-            .decimal128 => |s| try appendInt(allocator, out, i128, s[row]),
-            .uuid => |s| try appendInt(allocator, out, u128, s[row]),
-            .varchar, .string, .char, .json => |sv| {
-                const bytes = sv.rowBytes(row);
-                try appendBits(allocator, out, u32, @intCast(bytes.len));
-                try out.appendSlice(allocator, bytes);
-            },
+        if (ns) {
+            const valid = view.isValid(row);
+            try out.append(allocator, @intFromBool(valid));
+            if (!valid) continue;
         }
+        try appendKeyCell(allocator, out, view, row);
+    }
+}
+
+fn appendKeyCell(allocator: Allocator, out: *std.ArrayList(u8), view: ColumnView, row: u32) !void {
+    switch (view.data) {
+        .int => |s| try appendInt(allocator, out, i32, s[row]),
+        .bigint => |s| try appendInt(allocator, out, i64, s[row]),
+        .boolean => |s| try out.append(allocator, s[row]),
+        .float => |s| try appendBits(allocator, out, u32, types.canonicalFloatBits(s[row])),
+        .double => |s| try appendBits(allocator, out, u64, types.canonicalFloatBits(s[row])),
+        .date => |s| try appendInt(allocator, out, i32, s[row]),
+        .datetime => |s| try appendInt(allocator, out, i64, s[row]),
+        .tinyint => |s| try out.append(allocator, @bitCast(s[row])),
+        .smallint => |s| try appendInt(allocator, out, i16, s[row]),
+        .largeint => |s| try appendInt(allocator, out, i128, s[row]),
+        .decimal64 => |s| try appendInt(allocator, out, i64, s[row]),
+        .decimal128 => |s| try appendInt(allocator, out, i128, s[row]),
+        .uuid => |s| try appendInt(allocator, out, u128, s[row]),
+        .varchar, .string, .char, .json => |sv| {
+            const bytes = sv.rowBytes(row);
+            try appendBits(allocator, out, u32, @intCast(bytes.len));
+            try out.appendSlice(allocator, bytes);
+        },
     }
 }
 
@@ -3404,8 +3610,8 @@ test "join: FastTable build is identical with threaded digests" {
         defer arena_a.deinit();
         var arena_b = std.heap.ArenaAllocator.init(allocator);
         defer arena_b.deinit();
-        const serial = (try buildFastTable(arena_a.allocator(), allocator, views, n, compound, 1)).?;
-        const threaded = (try buildFastTable(arena_b.allocator(), allocator, views, n, compound, 4)).?;
+        const serial = (try buildFastTable(arena_a.allocator(), allocator, views, 0, n, compound, 1)).?;
+        const threaded = (try buildFastTable(arena_b.allocator(), allocator, views, 0, n, compound, 4)).?;
         try expectSameFastTable(serial, threaded);
         try std.testing.expect(!serial.keys_unique);
     }
@@ -3422,12 +3628,12 @@ test "join: FastTable ranged parallel build finds every key" {
     const key = ColumnView{ .data = .{ .bigint = vals } };
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const built = (try buildFastTable(arena.allocator(), allocator, &.{key}, n, false, 4)).?;
+    const built = (try buildFastTable(arena.allocator(), allocator, &.{key}, 0, n, false, 4)).?;
     try std.testing.expect(built.table.wrap_mask < built.table.mask);
     try std.testing.expect(!built.keys_unique);
     var arena_one = std.heap.ArenaAllocator.init(allocator);
     defer arena_one.deinit();
-    const one_thread = (try buildFastTable(arena_one.allocator(), allocator, &.{key}, n, false, 1)).?;
+    const one_thread = (try buildFastTable(arena_one.allocator(), allocator, &.{key}, 0, n, false, 1)).?;
     try expectSameFastTable(one_thread, built);
 
     var first = std.AutoHashMap(i64, u32).init(allocator);
@@ -3442,4 +3648,62 @@ test "join: FastTable ranged parallel build finds every key" {
     }
     const absent = ColumnView{ .data = .{ .bigint = &.{-1} } };
     try std.testing.expectEqual(FAST_EMPTY, Join.fastLookupFirst(&built.table, absent, &.{}, 0));
+}
+
+test "join: null-safe FastTable matches a NULL key to a NULL key" {
+    const allocator = std.testing.allocator;
+    const n: u32 = PARALLEL_INSERT_MIN_ROWS + 777;
+    const vals = try allocator.alloc(i64, n);
+    defer allocator.free(vals);
+    const tags = try allocator.alloc(i32, n);
+    defer allocator.free(tags);
+    const val_valid = try allocator.alloc(u8, (n + 7) / 8);
+    defer allocator.free(val_valid);
+    const tag_valid = try allocator.alloc(u8, (n + 7) / 8);
+    defer allocator.free(tag_valid);
+    @memset(val_valid, 0);
+    @memset(tag_valid, 0);
+    var prng = std.Random.DefaultPrng.init(13);
+    const rnd = prng.random();
+    for (vals, tags, 0..) |*v, *t, i| {
+        // NULL cells keep random data: a null-safe key must not read it.
+        v.* = rnd.intRangeAtMost(i64, 0, 50_000);
+        t.* = @intCast(i % 3);
+        const bit = @as(u8, 1) << @intCast(i & 7);
+        if (i % 7 != 0) val_valid[i >> 3] |= bit;
+        if (i % 11 != 0) tag_valid[i >> 3] |= bit;
+    }
+    const val_view = ColumnView{ .data = .{ .bigint = vals }, .nulls = val_valid };
+    const tag_view = ColumnView{ .data = .{ .int = tags }, .nulls = tag_valid };
+    const views: []const ColumnView = &.{ val_view, tag_view };
+    const null_safe_keys: u8 = 0b01;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const built = (try buildFastTable(arena.allocator(), allocator, views, null_safe_keys, n, false, 4)).?;
+    try std.testing.expectEqual(FastKeyKind.null_safe, built.table.kind);
+    try std.testing.expect(!built.keys_unique);
+    var arena_one = std.heap.ArenaAllocator.init(allocator);
+    defer arena_one.deinit();
+    const one_thread = (try buildFastTable(arena_one.allocator(), allocator, views, null_safe_keys, n, false, 1)).?;
+    try expectSameFastTable(one_thread, built);
+
+    var first = std.AutoHashMap([2]i64, u32).init(allocator);
+    defer first.deinit();
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (!tag_view.isValid(i)) continue;
+        const gop = try first.getOrPut(.{ if (val_view.isValid(i)) vals[i] else -1, tags[i] });
+        if (!gop.found_existing) gop.value_ptr.* = i;
+    }
+    i = 0;
+    while (i < n) : (i += 1) {
+        const rejected = probeKeyRejected(.null_safe, &built.table, val_view, views, i);
+        try std.testing.expectEqual(!tag_view.isValid(i), rejected);
+        if (rejected) continue;
+        const expected = first.get(.{ if (val_view.isValid(i)) vals[i] else -1, tags[i] }).?;
+        try std.testing.expectEqual(expected, Join.fastLookupFirst(&built.table, val_view, views, i));
+    }
+    const absent_views: []const ColumnView = &.{ .{ .data = .{ .bigint = &.{-1} } }, .{ .data = .{ .int = &.{0} } } };
+    try std.testing.expectEqual(FAST_EMPTY, Join.fastLookupFirst(&built.table, absent_views[0], absent_views, 0));
 }

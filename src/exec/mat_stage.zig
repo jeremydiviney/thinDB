@@ -383,6 +383,8 @@ pub const MaterializedResult = struct {
 pub const SharedJoinBuild = struct {
     keys: []const KeySpec,
     casts: []const ColumnCast,
+    /// Bit k set when key k matches NULL to NULL (`join.buildFastTable`).
+    null_safe_keys: u8,
     needs_chain: bool,
     arena: std.heap.ArenaAllocator,
     /// Concatenated copy of a chunked result; empty when the result was
@@ -395,8 +397,8 @@ pub const SharedJoinBuild = struct {
     table: join_mod.FastTable,
     keys_unique: bool,
 
-    fn matches(self: *const SharedJoinBuild, keys: []const KeySpec, casts: []const ColumnCast, needs_chain: bool) bool {
-        if (self.needs_chain != needs_chain or self.keys.len != keys.len or self.casts.len != casts.len) return false;
+    fn matches(self: *const SharedJoinBuild, keys: []const KeySpec, casts: []const ColumnCast, null_safe_keys: u8, needs_chain: bool) bool {
+        if (self.needs_chain != needs_chain or self.null_safe_keys != null_safe_keys or self.keys.len != keys.len or self.casts.len != casts.len) return false;
         for (self.keys, keys) |a, b| if (!a.eql(b)) return false;
         for (self.casts, casts) |a, b| if (!a.eql(b)) return false;
         return true;
@@ -1006,18 +1008,19 @@ pub const Stage = struct {
     /// The hash-join build over this stage's result for `keys` (stage
     /// columns with their casts, in join-pair order), with every cast in
     /// `casts` evaluated once over its column; built on first request and
-    /// shared afterwards. `needs_chain` distinguishes a FULL join's table.
+    /// shared afterwards. `needs_chain` distinguishes a FULL join's table,
+    /// `null_safe_keys` one whose keys match NULL.
     /// Runs the stage if it hasn't run. Null when the key types have no
     /// fast lane or a cast has no plain kernel (the join keeps its own
     /// general build).
-    pub fn sharedJoinBuild(self: *Stage, keys: []const KeySpec, casts: []const ColumnCast, needs_chain: bool) !?SharedJoinBuild {
+    pub fn sharedJoinBuild(self: *Stage, keys: []const KeySpec, casts: []const ColumnCast, null_safe_keys: u8, needs_chain: bool) !?SharedJoinBuild {
         try self.ensureRun();
         const res = self.result orelse return null;
         if (res.total_rows > std.math.maxInt(u32)) return null;
         while (!self.join_build_lock.tryLock()) std.atomic.spinLoopHint();
         defer self.join_build_lock.unlock();
         for (res.join_builds.items) |*jb| {
-            if (jb.matches(keys, casts, needs_chain)) return jb.*;
+            if (jb.matches(keys, casts, null_safe_keys, needs_chain)) return jb.*;
         }
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -1054,7 +1057,7 @@ pub const Stage = struct {
         const bytes = join_mod.fastTableBytes(rows, needs_chain);
         if (self.accountant) |acct| try acct.reserve(.join_build, bytes);
         errdefer if (self.accountant) |acct| acct.release(.join_build, bytes);
-        const built = (try join_mod.buildFastTable(aa, self.allocator, key_views[0..keys.len], rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
+        const built = (try join_mod.buildFastTable(aa, self.allocator, key_views[0..keys.len], null_safe_keys, rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
         self.join_build_reserved += bytes;
         const owned_casts = try aa.alloc(ColumnCast, casts.len);
         for (casts, owned_casts) |c, *o| o.* = .{ .col = c.col, .fn_name = try aa.dupe(u8, c.fn_name) };
@@ -1063,6 +1066,7 @@ pub const Stage = struct {
         const jb: SharedJoinBuild = .{
             .keys = owned_keys,
             .casts = owned_casts,
+            .null_safe_keys = null_safe_keys,
             .needs_chain = needs_chain,
             .arena = arena,
             .copies = copies,
