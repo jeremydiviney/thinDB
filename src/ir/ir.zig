@@ -1052,6 +1052,7 @@ pub const Op = union(OpTag) {
                 for (i.rows) |row| allocator.free(row);
                 allocator.free(i.rows);
                 allocator.free(i.hex_cells);
+                if (i.on_duplicate) |od| freeDecodedOnDuplicate(od, allocator);
             },
             .batch => |b| {
                 for (b.statements) |sub| {
@@ -1091,6 +1092,7 @@ pub const Op = union(OpTag) {
                 if (i.columns) |cols| allocator.free(cols);
                 i.source.deinitDecoded(allocator);
                 allocator.destroy(i.source);
+                if (i.on_duplicate) |od| freeDecodedOnDuplicate(od, allocator);
             },
             // Never reached: SET / DELETE / UPDATE / admin statements aren't wire-decoded.
             .set_var, .delete_op, .update_op, .admin => {},
@@ -1212,20 +1214,11 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try encodeOp(allocator, out, c.source.*);
         },
         .insert_select => |i| {
-            if (i.on_duplicate != null) return EncodeError.OutOfMemory;
             try encodeTableRef(allocator, out, i.table);
-            try out.append(allocator, @intFromEnum(i.mode));
-            if (i.columns) |cols| {
-                try out.append(allocator, 1);
-                try appendU32(allocator, out, @intCast(cols.len));
-                for (cols) |c| {
-                    try appendU32(allocator, out, @intCast(c.len));
-                    try out.appendSlice(allocator, c);
-                }
-            } else {
-                try out.append(allocator, 0);
-            }
+            try encodeInsertMode(allocator, out, i.mode, i.on_duplicate);
+            try encodeOptNames(allocator, out, i.columns);
             try encodeOp(allocator, out, i.source.*);
+            if (i.on_duplicate) |od| try encodeOnDuplicate(allocator, out, od);
         },
         // `SET @name = expr` is a server-local statement; the in-process
         // SQL path executes it without wire round-trip. Wire-encoding
@@ -1649,20 +1642,9 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
 }
 
 fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) EncodeError!void {
-    // ON DUPLICATE KEY UPDATE is server-local, like UPDATE.
-    if (i.on_duplicate != null) return EncodeError.OutOfMemory;
     try encodeTableRef(allocator, out, i.table);
-    try out.append(allocator, @intFromEnum(i.mode));
-    if (i.columns) |cols| {
-        try out.append(allocator, 1);
-        try appendU32(allocator, out, @intCast(cols.len));
-        for (cols) |c| {
-            try appendU32(allocator, out, @intCast(c.len));
-            try out.appendSlice(allocator, c);
-        }
-    } else {
-        try out.append(allocator, 0);
-    }
+    try encodeInsertMode(allocator, out, i.mode, i.on_duplicate);
+    try encodeOptNames(allocator, out, i.columns);
     try appendU32(allocator, out, @intCast(i.rows.len));
     var next_hex: usize = 0;
     for (i.rows, 0..) |row, r| {
@@ -1678,11 +1660,45 @@ fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) Enco
             }
         }
     }
+    if (i.on_duplicate) |od| try encodeOnDuplicate(allocator, out, od);
 }
 
 /// The presence byte of a VALUES cell written as a hex literal: present
 /// (non-zero) to a reader that predates it.
 const INSERT_HEX_CELL: u8 = 2;
+
+/// Set in an INSERT's mode byte when an ON DUPLICATE KEY UPDATE clause
+/// follows its rows or source. The encoding without one is unchanged, so
+/// staged XA statements survive an upgrade, and a reader that predates the
+/// clause rejects the byte rather than dropping it.
+const INSERT_ON_DUPLICATE: u8 = 0x80;
+
+fn encodeInsertMode(allocator: Allocator, out: *std.ArrayList(u8), mode: InsertMode, on_duplicate: ?OnDuplicate) EncodeError!void {
+    const flag: u8 = if (on_duplicate != null) INSERT_ON_DUPLICATE else 0;
+    try out.append(allocator, @intFromEnum(mode) | flag);
+}
+
+fn encodeOptNames(allocator: Allocator, out: *std.ArrayList(u8), names: ?[]const []const u8) EncodeError!void {
+    const list = names orelse return out.append(allocator, 0);
+    try out.append(allocator, 1);
+    try appendU32(allocator, out, @intCast(list.len));
+    for (list) |name| {
+        try appendU32(allocator, out, @intCast(name.len));
+        try out.appendSlice(allocator, name);
+    }
+}
+
+fn encodeOnDuplicate(allocator: Allocator, out: *std.ArrayList(u8), od: OnDuplicate) EncodeError!void {
+    try appendU32(allocator, out, @intCast(od.assignments.len));
+    for (od.assignments) |a| {
+        try appendU32(allocator, out, @intCast(a.col.len));
+        try out.appendSlice(allocator, a.col);
+        try encodeExpr(allocator, out, a.value);
+        try encodeOptString(allocator, out, a.target);
+    }
+    try encodeOptString(allocator, out, od.row_alias);
+    try encodeOptNames(allocator, out, od.row_alias_columns);
+}
 
 const ShowTag = enum(u8) {
     databases = 0,
@@ -2497,28 +2513,19 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         },
         .insert_select => blk: {
             const ref = try decodeTableRef(bytes, cursor);
-            const mode = try decodeInsertMode(bytes, cursor);
-            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
-            const has_cols = bytes[cursor.*] != 0;
-            cursor.* += 1;
-            var cols_opt: ?[]const []const u8 = null;
-            if (has_cols) {
-                if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
-                const n = readU32(bytes[cursor.* .. cursor.* + 4]);
-                cursor.* += 4;
-                const cols = try allocator.alloc([]const u8, n);
-                errdefer allocator.free(cols);
-                for (cols) |*c| c.* = try readString(bytes, cursor);
-                cols_opt = cols;
-            }
+            const head = try decodeInsertMode(bytes, cursor);
+            const cols_opt = try decodeOptNames(allocator, bytes, cursor);
+            errdefer if (cols_opt) |c| allocator.free(c);
             const source = try allocator.create(Op);
             errdefer allocator.destroy(source);
             source.* = try decodeOp(allocator, bytes, cursor);
+            errdefer source.deinitDecoded(allocator);
             break :blk Op{ .insert_select = .{
-                .mode = mode,
+                .mode = head.mode,
                 .table = ref,
                 .columns = cols_opt,
                 .source = source,
+                .on_duplicate = if (head.on_duplicate) try decodeOnDuplicate(allocator, bytes, cursor) else null,
             } };
         },
         // SET / DELETE / UPDATE / EXPLAIN / single_row are never
@@ -2978,19 +2985,8 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
 
 fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!InsertOp {
     const ref = try decodeTableRef(bytes, cursor);
-    const mode = try decodeInsertMode(bytes, cursor);
-    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
-    const has_cols = bytes[cursor.*] != 0;
-    cursor.* += 1;
-    const cols_opt: ?[]const []const u8 = if (has_cols) blk: {
-        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
-        const n = readU32(bytes[cursor.* .. cursor.* + 4]);
-        cursor.* += 4;
-        const out = try allocator.alloc([]const u8, n);
-        errdefer allocator.free(out);
-        for (out) |*c| c.* = try readString(bytes, cursor);
-        break :blk out;
-    } else null;
+    const head = try decodeInsertMode(bytes, cursor);
+    const cols_opt = try decodeOptNames(allocator, bytes, cursor);
     errdefer if (cols_opt) |c| allocator.free(c);
 
     if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
@@ -3018,15 +3014,63 @@ fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         r.* = cells;
         inited += 1;
     }
-    return .{ .mode = mode, .table = ref, .columns = cols_opt, .rows = rows, .hex_cells = try hex_cells.toOwnedSlice(allocator) };
+    const on_duplicate = if (head.on_duplicate) try decodeOnDuplicate(allocator, bytes, cursor) else null;
+    errdefer if (on_duplicate) |od| freeDecodedOnDuplicate(od, allocator);
+    return .{
+        .mode = head.mode,
+        .table = ref,
+        .columns = cols_opt,
+        .rows = rows,
+        .hex_cells = try hex_cells.toOwnedSlice(allocator),
+        .on_duplicate = on_duplicate,
+    };
 }
 
-fn decodeInsertMode(bytes: []const u8, cursor: *usize) DecodeError!InsertMode {
+const InsertHead = struct { mode: InsertMode, on_duplicate: bool };
+
+fn decodeInsertMode(bytes: []const u8, cursor: *usize) DecodeError!InsertHead {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
-    const tag = bytes[cursor.*];
+    const byte = bytes[cursor.*];
     cursor.* += 1;
+    const tag = byte & ~INSERT_ON_DUPLICATE;
     if (tag > @intFromEnum(InsertMode.ignore)) return Error.IrCorrupt;
-    return @enumFromInt(tag);
+    return .{ .mode = @enumFromInt(tag), .on_duplicate = byte & INSERT_ON_DUPLICATE != 0 };
+}
+
+fn decodeOptNames(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!?[]const []const u8 {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const present = bytes[cursor.*] != 0;
+    cursor.* += 1;
+    if (!present) return null;
+    const names = try allocator.alloc([]const u8, try decodeCount(bytes, cursor));
+    errdefer allocator.free(names);
+    for (names) |*name| name.* = try readString(bytes, cursor);
+    return names;
+}
+
+fn decodeOnDuplicate(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!OnDuplicate {
+    const assignments = try allocator.alloc(Assignment, try decodeCount(bytes, cursor));
+    errdefer allocator.free(assignments);
+    var decoded: usize = 0;
+    errdefer for (assignments[0..decoded]) |a| freeDecodedExpr(a.value, allocator);
+    for (assignments) |*a| {
+        const col = try readString(bytes, cursor);
+        const value = try decodeExpr(allocator, bytes, cursor);
+        errdefer freeDecodedExpr(value, allocator);
+        a.* = .{ .col = col, .value = value, .target = try decodeOptString(bytes, cursor) };
+        decoded += 1;
+    }
+    return .{
+        .assignments = assignments,
+        .row_alias = try decodeOptString(bytes, cursor),
+        .row_alias_columns = try decodeOptNames(allocator, bytes, cursor),
+    };
+}
+
+fn freeDecodedOnDuplicate(od: OnDuplicate, allocator: Allocator) void {
+    for (od.assignments) |a| freeDecodedExpr(a.value, allocator);
+    allocator.free(od.assignments);
+    if (od.row_alias_columns) |cols| allocator.free(cols);
 }
 
 fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
@@ -3633,6 +3677,75 @@ test "ir: an insert's hex-literal cells round-trip" {
     try std.testing.expectEqualStrings("12", decoded.insert.rows[0][1].?.text);
     try std.testing.expect(decoded.insert.rows[0][2] == null);
     try std.testing.expectEqualStrings("C", decoded.insert.rows[1][2].?.text);
+}
+
+test "ir: ON DUPLICATE KEY UPDATE round-trips on VALUES and SELECT inserts" {
+    const allocator = std.testing.allocator;
+    const sum = [_]Expr{ .{ .col_ref = "v" }, .{ .col_ref = insert_values_prefix ++ "v" } };
+    const assignments = [_]Assignment{
+        .{ .col = "v", .value = .{ .call = .{ .fn_name = "add", .args = &sum } } },
+        .{ .col = "w", .value = .{ .lit = .{ .bigint = 7 } } },
+        .{ .col = "n", .value = .{ .null_lit = .bigint }, .target = "t" },
+    };
+    const alias_columns = [_][]const u8{ "a", "b" };
+    const row = [_]?Value{ .{ .bigint = 1 }, .{ .bigint = 5 } };
+    const rows = [_][]const ?Value{&row};
+    var source: Op = .{ .scan = .{ .table = .{ .name = "src" } } };
+    const cases = [_]Op{
+        .{ .insert = .{ .mode = .ignore, .table = .{ .name = "t" }, .columns = &alias_columns, .rows = &rows, .on_duplicate = .{
+            .assignments = &assignments,
+            .row_alias = "new",
+            .row_alias_columns = &alias_columns,
+        } } },
+        .{ .insert = .{ .table = .{ .name = "t" }, .columns = null, .rows = &rows, .on_duplicate = .{ .assignments = &assignments, .row_alias = "new" } } },
+        .{ .insert_select = .{ .table = .{ .name = "t" }, .columns = &alias_columns, .source = &source, .on_duplicate = .{ .assignments = &assignments } } },
+    };
+    for (cases) |root| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try encode(allocator, &buf, root);
+        var decoded = try decode(allocator, buf.items);
+        defer decoded.deinitDecoded(allocator);
+
+        try std.testing.expectEqual(std.meta.activeTag(root), std.meta.activeTag(decoded));
+        const want, const got = switch (root) {
+            .insert => |i| .{ i.on_duplicate.?, decoded.insert.on_duplicate.? },
+            .insert_select => |i| .{ i.on_duplicate.?, decoded.insert_select.on_duplicate.? },
+            else => unreachable,
+        };
+        try std.testing.expectEqual(want.assignments.len, got.assignments.len);
+        for (want.assignments, got.assignments) |w, g| {
+            try std.testing.expectEqualStrings(w.col, g.col);
+            try std.testing.expect(exec_expr.eql(w.value, g.value));
+            try std.testing.expectEqual(w.target == null, g.target == null);
+            if (w.target) |target| try std.testing.expectEqualStrings(target, g.target.?);
+        }
+        try std.testing.expectEqual(want.row_alias == null, got.row_alias == null);
+        if (want.row_alias) |alias| try std.testing.expectEqualStrings(alias, got.row_alias.?);
+        try std.testing.expectEqual(want.row_alias_columns == null, got.row_alias_columns == null);
+        if (want.row_alias_columns) |cols| for (cols, got.row_alias_columns.?) |w, g| try std.testing.expectEqualStrings(w, g);
+
+        for (header_size..buf.items.len) |n| {
+            if (decode(allocator, buf.items[0..n])) |op| {
+                var partial = op;
+                partial.deinitDecoded(allocator);
+                return error.TestUnexpectedResult;
+            } else |_| {}
+        }
+    }
+}
+
+test "ir: an INSERT's mode byte is unchanged without ON DUPLICATE KEY UPDATE" {
+    const allocator = std.testing.allocator;
+    const row = [_]?Value{.{ .bigint = 1 }};
+    const rows = [_][]const ?Value{&row};
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, .{ .insert = .{ .mode = .ignore, .table = .{ .name = "t" }, .columns = null, .rows = &rows } });
+    const mode_at = header_size + 1 + 1 + 1 + 4 + 1;
+    try std.testing.expectEqual(@intFromEnum(InsertMode.ignore), buf.items[mode_at]);
+    buf.items[mode_at] = 3;
+    try std.testing.expectError(Error.IrCorrupt, decode(allocator, buf.items));
 }
 
 test "ir: select round-trips with multiple columns" {
