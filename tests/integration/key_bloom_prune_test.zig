@@ -90,11 +90,25 @@ test "full-key bloom pruning: point, IN, absent, conjunct, keyed DELETE/UPDATE" 
         defer allocator.free(ids);
         try std.testing.expectEqualSlices(i64, &.{ 41, 43 }, ids);
     }
-    // Total row count reflects exactly one delete.
+    // Keyed UPDATE and DELETE with an IN list through the gate: keys in two
+    // segments (then in the memtable, once updated) and keys held nowhere.
+    try exec(allocator, db, "UPDATE t SET grp = 88 WHERE id IN (60, 61, 999999)");
+    {
+        const ids = try collectIds(allocator, db, "SELECT id FROM t WHERE grp = 88");
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, &.{ 60, 61 }, ids);
+    }
+    try exec(allocator, db, "DELETE FROM t WHERE id IN (60, 62, 999998)");
+    {
+        const ids = try collectIds(allocator, db, "SELECT id FROM t WHERE id IN (60, 61, 62)");
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, &.{61}, ids);
+    }
+    // Total row count reflects exactly three deletes.
     {
         const n = try collectIds(allocator, db, "SELECT COUNT(*) FROM t");
         defer allocator.free(n);
-        try std.testing.expectEqual(@as(i64, 599), n[0]);
+        try std.testing.expectEqual(@as(i64, 597), n[0]);
     }
 }
 
