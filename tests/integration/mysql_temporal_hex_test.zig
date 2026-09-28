@@ -1,8 +1,8 @@
 //! MySQL's implicit conversions around temporals and hex literals: CAST AS
 //! TIME (#261), dates whose day is past the month's end (#262), dates and
-//! datetimes read as numbers (#263), and hex literals read as integers in a
-//! numeric context (#269). Every expected value is MySQL 8.4's unless a
-//! comment says otherwise.
+//! datetimes read as numbers (#263) and summed as numbers (#305), and hex
+//! literals read as integers in a numeric context (#269). Every expected
+//! value is MySQL 8.4's unless a comment says otherwise.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -14,6 +14,16 @@ const exec = helpers.exec;
 fn firstColumnText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]?[]u8 {
     var q = try helpers.runSql(allocator, db, sql);
     defer q.deinit();
+    return columnText(allocator, &q);
+}
+
+fn mysqlFirstColumnText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]?[]u8 {
+    var q = try helpers.runSqlMysqlSession(allocator, db, sql);
+    defer q.deinit();
+    return columnText(allocator, &q);
+}
+
+fn columnText(allocator: std.mem.Allocator, q: *helpers.RunResult) ![]?[]u8 {
     var out: std.ArrayList(?[]u8) = .empty;
     errdefer {
         for (out.items) |v| if (v) |x| allocator.free(x);
@@ -39,6 +49,19 @@ fn expectRows(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: 
         std.debug.print("sql: {s}\n", .{sql});
         return err;
     };
+    try expectText(allocator, got, sql, want);
+}
+
+fn expectMysqlRows(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: []const ?[]const u8) !void {
+    const got = mysqlFirstColumnText(allocator, db, sql) catch |err| {
+        std.debug.print("sql: {s}\n", .{sql});
+        return err;
+    };
+    try expectText(allocator, got, sql, want);
+}
+
+/// Checks `got` against `want` and frees it.
+fn expectText(allocator: std.mem.Allocator, got: []?[]u8, sql: []const u8, want: []const ?[]const u8) !void {
     defer helpers.freeStrings(allocator, got);
     errdefer std.debug.print("sql: {s}\n", .{sql});
     try std.testing.expectEqual(want.len, got.len);
@@ -176,6 +199,59 @@ test "a date or datetime in a numeric context is its YYYYMMDD[HHMMSS] number" {
     try expectRows(allocator, db, "SELECT id FROM dn WHERE d + 0 = 20260926", &.{"1"});
     try expectRows(allocator, db, "SELECT id FROM dn WHERE d + 0 > 20260300 ORDER BY id", &.{"1"});
     try expectRows(allocator, db, "SELECT SUM(d + 0) FROM dn", &.{"40521154"});
+}
+
+test "an aggregate over a DATE or DATETIME sums its number in MySQL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE ag (id BIGINT PRIMARY KEY, d DATE, ts DATETIME, g INT, k VARCHAR(5))");
+    try exec(allocator, db,
+        \\INSERT INTO ag VALUES (1, '2026-09-26', '2026-09-26 10:05:03', 1, 'a'),
+        \\  (2, '2026-09-27', '2026-09-27 23:59:59', 1, 'a'), (3, NULL, NULL, 2, 'b'),
+        \\  (4, '2001-01-01', '2001-01-01 00:00:00', 2, 'b'), (5, '1999-12-31', '1999-12-31 23:59:59', 2, 'b')
+    );
+
+    // MySQL types SUM and AVG here DECIMAL (20130796.2500); the values are
+    // the same.
+    const cases = .{
+        .{ "SELECT SUM(d) FROM ag", &[_]?[]const u8{"80523185"} },
+        .{ "SELECT AVG(d) FROM ag", &[_]?[]const u8{"20130796.25"} },
+        .{ "SELECT SUM(ts) FROM ag", &[_]?[]const u8{"80523185572421"} },
+        .{ "SELECT AVG(ts) FROM ag", &[_]?[]const u8{"20130796393105.25"} },
+        .{ "SELECT SUM(DISTINCT d) FROM ag", &[_]?[]const u8{"80523185"} },
+        .{ "SELECT AVG(DISTINCT d) FROM ag", &[_]?[]const u8{"20130796.25"} },
+        .{ "SELECT SUM(d + INTERVAL 1 DAY) FROM ag", &[_]?[]const u8{"80532058"} },
+        .{ "SELECT BIT_XOR(d) FROM ag", &[_]?[]const u8{"24267"} },
+        .{ "SELECT STDDEV_POP(d) FROM ag", &[_]?[]const u8{"130301.15723848158"} },
+        .{ "SELECT SUM(d) FROM ag WHERE d > 20000000", &[_]?[]const u8{"60531954"} },
+        .{ "SELECT MIN(d) + 0 FROM ag", &[_]?[]const u8{"19991231"} },
+        .{ "SELECT SUM(d) FROM ag GROUP BY g ORDER BY g", &[_]?[]const u8{ "40521853", "40001332" } },
+        .{ "SELECT AVG(d) FROM ag GROUP BY g ORDER BY g", &[_]?[]const u8{ "20260926.5", "20000666" } },
+        .{ "SELECT SUM(d) FROM ag GROUP BY k ORDER BY k", &[_]?[]const u8{ "40521853", "40001332" } },
+        .{ "SELECT STDDEV_POP(d) FROM ag GROUP BY g ORDER BY g", &[_]?[]const u8{ "0.5", "9435" } },
+        .{ "SELECT VAR_SAMP(d) FROM ag WHERE g = 1", &[_]?[]const u8{"0.5"} },
+        .{ "SELECT BIT_OR(d) FROM ag GROUP BY g ORDER BY g", &[_]?[]const u8{ "20260927", "20012799" } },
+        .{ "SELECT BIT_AND(ts) FROM ag GROUP BY g ORDER BY g", &[_]?[]const u8{ "20260926030871", "19939691071296" } },
+        .{ "SELECT SUM(ts) FROM ag GROUP BY g HAVING SUM(ts) > 40000000000000 ORDER BY g", &[_]?[]const u8{ "40521853336462", "40001332235959" } },
+        .{ "SELECT SUM(d) + 1 FROM ag GROUP BY g ORDER BY g", &[_]?[]const u8{ "40521854", "40001333" } },
+        .{ "WITH c AS (SELECT d, g FROM ag WHERE id < 4) SELECT SUM(d) FROM c GROUP BY g ORDER BY g", &[_]?[]const u8{ "40521853", null } },
+        .{ "SELECT SUM(d) FROM (SELECT d FROM ag ORDER BY id LIMIT 2) s", &[_]?[]const u8{"40521853"} },
+        // MySQL can't join a TEMPORARY table with itself; each row matches once.
+        .{ "SELECT SUM(x.d) FROM ag x JOIN ag y ON x.id = y.id", &[_]?[]const u8{"80523185"} },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("ag", .{})).flush();
+        inline for (cases) |c| try expectMysqlRows(allocator, db, c[0], c[1]);
+    }
+
+    // The other dialects reject a number-only aggregate over a temporal.
+    try helpers.expectRunError(allocator, db, "SELECT SUM(d) FROM ag", error.AggregateUnsupportedType);
+    try helpers.expectRunError(allocator, db, "SELECT g, STDDEV_POP(d) FROM ag GROUP BY g", error.AggregateUnsupportedType);
 }
 
 test "a hex literal is its integer in a numeric context and its bytes elsewhere" {

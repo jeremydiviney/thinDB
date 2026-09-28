@@ -273,8 +273,66 @@ pub fn temporalAt(v: ColumnView, i: usize) ?Temporal {
     };
 }
 
-fn validTemporalAt(v: ColumnView, i: usize) ?Temporal {
-    return if (v.isValid(i)) temporalAt(v, i) else null;
+/// A TIME function's arguments, each read as the function reads it (`at`).
+const TimeArgs = struct {
+    views: []const ColumnView,
+    /// Each argument's type, when a number is among them.
+    types: ?[]const Type = null,
+
+    /// Row `i` of argument `k`: a number as `numberTemporal` reads it, by
+    /// its digits rather than its text, and anything else as `temporalAt`
+    /// reads it.
+    fn at(self: TimeArgs, k: usize, i: usize) ?Temporal {
+        const v = self.views[k];
+        if (!v.isValid(i)) return null;
+        if (self.types) |ts| if (!(ts[k].isString() or ts[k].isTemporal())) {
+            return numberTemporal(dec.exactAt(v, ts[k], i) orelse return null, numericFsp(ts[k]));
+        };
+        return temporalAt(v, i);
+    }
+};
+
+const TimeRows = fn (allocator: Allocator, args: TimeArgs, out: *ColumnStore, row_count: usize) anyerror!void;
+
+/// A TIME function's kernel over text, DATEs and DATETIMEs.
+fn textKernel(comptime rows: TimeRows) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+            return rows(allocator, .{ .views = args }, out, row_count);
+        }
+    }.kernel;
+}
+
+/// A TIME function's kernel when a number is among its arguments.
+fn numberKernel(comptime rows: TimeRows) common.TypedKernelFn {
+    return struct {
+        fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+            _ = out_type;
+            return rows(allocator, .{ .views = args, .types = arg_types }, out, row_count);
+        }
+    }.kernel;
+}
+
+/// A TIME function's kernel and result type when a number is among its
+/// arguments (`arg_types`), which reads by its digits: `HOUR(8390000)` is
+/// NULL, as 839 hours is no TIME, where `HOUR('8390000')` clamps to 838.
+/// Null for a function that takes no TIME.
+pub fn numberArgFn(name: []const u8, arg_types: []const Type) ?struct { kernel: common.TypedKernelFn, return_type: Type } {
+    const eql = std.ascii.eqlIgnoreCase;
+    if (arg_types.len == 1) {
+        inline for (std.meta.fields(ClockPart)) |f| {
+            if (eql(name, f.name)) return .{ .kernel = numberKernel(clockPartRows(@enumFromInt(f.value))), .return_type = .int };
+        }
+        if (eql(name, "time_to_sec")) return .{ .kernel = numberKernel(timeToSecRows), .return_type = .bigint };
+        if (eql(name, "time")) return .{ .kernel = numberKernel(timeRows), .return_type = .string };
+    }
+    if (arg_types.len == 2) {
+        if (eql(name, "timediff")) return .{ .kernel = numberKernel(timediffRows), .return_type = .string };
+        const moved: Type = if (arg_types[0] == .datetime) .datetime else .string;
+        if (eql(name, "addtime")) return .{ .kernel = numberKernel(addTimeRows(1)), .return_type = moved };
+        if (eql(name, "subtime")) return .{ .kernel = numberKernel(addTimeRows(-1)), .return_type = moved };
+    }
+    return null;
 }
 
 fn clampTime(micros: i64) i64 {
@@ -288,10 +346,12 @@ fn appendText(allocator: Allocator, out: *ColumnStore, base: usize, i: usize, te
 
 /// TIME_TO_SEC: a TIME's whole seconds, keeping its sign, or a DATETIME's
 /// seconds into its day.
-pub fn timeToSecKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+pub const timeToSecKernel = textKernel(timeToSecRows);
+
+fn timeToSecRows(allocator: Allocator, args: TimeArgs, out: *ColumnStore, row_count: usize) anyerror!void {
     const base = out.data.rowCount();
     for (0..row_count) |i| {
-        const t = validTemporalAt(args[0], i);
+        const t = args.at(0, i);
         const secs: i64 = if (t) |v| switch (v) {
             .time => |x| @divTrunc(x.value, US_PER_S),
             .datetime => |x| @divFloor(@mod(x.value, US_PER_DAY), US_PER_S),
@@ -306,11 +366,15 @@ pub const ClockPart = enum { hour, minute, second, microsecond };
 /// HOUR, MINUTE, SECOND or MICROSECOND of text: a TIME's magnitude
 /// (`HOUR('-838:00:00')` is 838) or a DATETIME's time of day.
 pub fn clockPartKernel(comptime part: ClockPart) Kernel {
+    return textKernel(clockPartRows(part));
+}
+
+fn clockPartRows(comptime part: ClockPart) TimeRows {
     return struct {
-        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+        fn rows(allocator: Allocator, args: TimeArgs, out: *ColumnStore, row_count: usize) anyerror!void {
             const base = out.data.rowCount();
             for (0..row_count) |i| {
-                const t = validTemporalAt(args[0], i);
+                const t = args.at(0, i);
                 const magnitude: u64 = if (t) |v| switch (v) {
                     .time => |x| @abs(x.value),
                     .datetime => |x| @intCast(@mod(x.value, US_PER_DAY)),
@@ -326,15 +390,17 @@ pub fn clockPartKernel(comptime part: ClockPart) Kernel {
                 try out.appendValidBit(allocator, base + i, t != null);
             }
         }
-    }.kernel;
+    }.rows;
 }
 
 /// TIME(x): a TIME as itself, a DATETIME's time of day.
-pub fn timeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+pub const timeKernel = textKernel(timeRows);
+
+fn timeRows(allocator: Allocator, args: TimeArgs, out: *ColumnStore, row_count: usize) anyerror!void {
     const base = out.data.rowCount();
     var buf: [48]u8 = undefined;
     for (0..row_count) |i| {
-        const value: ?Micros = if (validTemporalAt(args[0], i)) |v| switch (v) {
+        const value: ?Micros = if (args.at(0, i)) |v| switch (v) {
             .time => |x| x,
             .datetime => |x| .{ .value = @mod(x.value, US_PER_DAY), .fsp = x.fsp },
         } else null;
@@ -346,7 +412,7 @@ pub fn timeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
 pub const MAX_FSP: u8 = 6;
 
 /// CAST(x AS TIME(fsp)): text, a DATE or a DATETIME as `temporalAt` reads it
-/// (a DATETIME gives its time of day), a number as `numberTime` reads it,
+/// (a DATETIME gives its time of day), a number as `numberTemporal` reads it,
 /// rounded half away from zero to `fsp` digits and shown with exactly that
 /// many. A time of day can round up to 24:00:00, as in MySQL.
 pub fn castTimeKernel(comptime fsp: u8) common.TypedKernelFn {
@@ -354,15 +420,10 @@ pub fn castTimeKernel(comptime fsp: u8) common.TypedKernelFn {
         fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
             _ = out_type;
             const base = out.data.rowCount();
-            const t = arg_types[0];
-            const numeric = !(t.isString() or t.isTemporal());
+            const read: TimeArgs = .{ .views = args, .types = arg_types };
             var buf: [48]u8 = undefined;
             for (0..row_count) |i| {
-                const micros: ?i64 = if (!args[0].isValid(i))
-                    null
-                else if (numeric)
-                    (if (dec.exactAt(args[0], t, i)) |n| numberTime(n) else null)
-                else if (temporalAt(args[0], i)) |v| switch (v) {
+                const micros: ?i64 = if (read.at(0, i)) |v| switch (v) {
                     .time => |x| x.value,
                     .datetime => |x| @mod(x.value, US_PER_DAY),
                 } else null;
@@ -381,45 +442,105 @@ fn roundTime(micros: i64, fsp: u8) i64 {
     return if (micros < 0) -magnitude else magnitude;
 }
 
-/// A number as MySQL reads it for a TIME: `[-]HHMMSS[.f]` with minutes and
-/// seconds within 59, or from 10^10 up a `[YY]YYMMDDHHMMSS` datetime's time
-/// of day. Past 838:59:59 otherwise it is no TIME, unlike text, which clamps.
-/// The fraction rounds to the microsecond after the fields are checked, so
-/// 59.9999999 is 00:01:00.
-fn numberTime(n: common.ScaledInt) ?i64 {
+/// A number as MySQL reads it for a TIME, showing `fsp` fraction digits:
+/// `[-]HHMMSS[.f]` with minutes and seconds within 59, or from 10^10 up a
+/// `[YY]YYMMDDHHMMSS` DATETIME. Past 838:59:59 otherwise it is no TIME,
+/// unlike text, which clamps. The fraction rounds to the microsecond after
+/// the fields are checked, so 59.9999999 is 00:01:00, and a TIME it carries
+/// past 838:59:59 clamps.
+fn numberTemporal(n: common.ScaledInt, fsp: u8) ?Temporal {
     const scale = dec.pow10(n.s);
     const magnitude: i128 = @intCast(@abs(n.m));
     const whole = @divTrunc(magnitude, scale);
     const fraction: i64 = @intCast(dec.rescale(@mod(magnitude, scale), n.s, MAX_FSP) orelse return null);
-    const time_of_day: i64 = if (whole <= 8_385_959) blk: {
-        const w: i64 = @intCast(whole);
-        const minute = @mod(@divTrunc(w, 100), 100);
-        const second = @mod(w, 100);
-        if (minute > 59 or second > 59) return null;
-        break :blk ((@divTrunc(w, 10_000) * 60 + minute) * 60 + second) * US_PER_S;
-    } else blk: {
+    if (whole > 8_385_959) {
         if (n.m < 0 or whole < 10_000_000_000) return null;
         var buf: [40]u8 = undefined;
         const digits = std.fmt.bufPrint(&buf, "{d}", .{whole}) catch return null;
-        break :blk switch (scanDatetime(digits, false)) {
-            .valid => |m| @mod(m.value, US_PER_DAY),
-            .not_datetime, .invalid => return null,
+        return switch (scanDatetime(digits, false)) {
+            .valid => |m| .{ .datetime = .{ .value = m.value + fraction, .fsp = fsp } },
+            .not_datetime, .invalid => null,
         };
+    }
+    const w: i64 = @intCast(whole);
+    const minute = @mod(@divTrunc(w, 100), 100);
+    const second = @mod(w, 100);
+    if (minute > 59 or second > 59) return null;
+    const micros = @min(((@divTrunc(w, 10_000) * 60 + minute) * 60 + second) * US_PER_S + fraction, MAX_TIME_MICROS);
+    return .{ .time = .{ .value = if (n.m < 0) -micros else micros, .fsp = fsp } };
+}
+
+/// A datetime's fields, which need not name a day: MySQL compares a
+/// number with a DATE or DATETIME by these (`numberDatetimeFields`).
+pub const DatetimeFields = struct {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    /// The fraction, rounded to the microsecond: up to a whole second.
+    micros: i64,
+};
+
+/// A number as MySQL's number_to_datetime reads one to compare with a DATE
+/// or DATETIME: `YYMMDD` (years 2000-2069 up to 691231, 1970-1999 from
+/// 700101), `YYYYMMDD`, `YYMMDDhhmmss` or `YYYYMMDDhhmmss` by its size,
+/// its fraction the microseconds. A zero month or day, or a day past its
+/// month's end, still reads (`20260900`); null for a negative number, one
+/// between those forms' ranges, a month past 12, a day past 31 or a time of
+/// day past 23:59:59.
+pub fn numberDatetimeFields(n: common.ScaledInt) ?DatetimeFields {
+    if (n.m < 0) return null;
+    const scale = dec.pow10(n.s);
+    const whole = @divTrunc(n.m, scale);
+    const fraction: i64 = @intCast(dec.rescale(@mod(n.m, scale), n.s, MAX_FSP) orelse return null);
+    const clock: bool, const short_year: bool = if (whole < 101)
+        return null
+    else if (whole <= 991_231)
+        .{ false, true }
+    else if (whole < 10_000_101)
+        return null
+    else if (whole <= 99_991_231)
+        .{ false, false }
+    else if (whole < 101_000_000)
+        return null
+    else if (whole <= 991_231_235_959)
+        .{ true, true }
+    else if (whole < 10_000_101_000_000 or whole > 99_991_231_235_959)
+        return null
+    else
+        .{ true, false };
+    const hms: u32 = if (clock) @intCast(@mod(whole, 1_000_000)) else 0;
+    const ymd: u32 = @intCast(if (clock) @divTrunc(whole, 1_000_000) else whole);
+    var year: i32 = @intCast(ymd / 10_000);
+    if (short_year) year += if (year < 70) 2000 else 1900;
+    const f: DatetimeFields = .{
+        .year = year,
+        .month = ymd / 100 % 100,
+        .day = ymd % 100,
+        .hour = hms / 10_000,
+        .minute = hms / 100 % 100,
+        .second = hms % 100,
+        .micros = fraction,
     };
-    const micros = time_of_day + fraction;
-    return if (n.m < 0) -micros else micros;
+    if (f.month > 12 or f.day > 31 or f.hour > 23 or f.minute > 59 or f.second > 59) return null;
+    return f;
 }
 
 /// TIMEDIFF(a, b): a - b as a TIME, for two TIMEs or two DATETIMEs; one of
 /// each is NULL, and so is a DATE beside a DATETIME, as MySQL has them. It
 /// shows the larger of the two fraction digit counts.
-pub fn timediffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+pub const timediffKernel = textKernel(timediffRows);
+
+fn timediffRows(allocator: Allocator, args: TimeArgs, out: *ColumnStore, row_count: usize) anyerror!void {
     const base = out.data.rowCount();
     var buf: [48]u8 = undefined;
-    const date_beside_datetime = (args[0].data == .date and args[1].data == .datetime) or
-        (args[0].data == .datetime and args[1].data == .date);
+    const views = args.views;
+    const date_beside_datetime = (views[0].data == .date and views[1].data == .datetime) or
+        (views[0].data == .datetime and views[1].data == .date);
     for (0..row_count) |i| {
-        const diff = if (date_beside_datetime) null else timeDiff(validTemporalAt(args[0], i), validTemporalAt(args[1], i));
+        const diff = if (date_beside_datetime) null else timeDiff(args.at(0, i), args.at(1, i));
         try appendText(allocator, out, base, i, if (diff) |d| try formatTime(&buf, d.value, d.fsp) else null);
     }
 }
@@ -440,12 +561,16 @@ const MAX_DATETIME_MICROS: i64 = @as(i64, 2_932_897) * US_PER_DAY - 1;
 /// 0-9999. A DATETIME-typed first argument gives a DATETIME; text gives
 /// text, with six fraction digits when either argument has a fraction.
 pub fn addTimeKernel(comptime sign: i64) Kernel {
+    return textKernel(addTimeRows(sign));
+}
+
+fn addTimeRows(comptime sign: i64) TimeRows {
     return struct {
-        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+        fn rows(allocator: Allocator, args: TimeArgs, out: *ColumnStore, row_count: usize) anyerror!void {
             const base = out.data.rowCount();
             var buf: [48]u8 = undefined;
             for (0..row_count) |i| {
-                const sum = addTime(sign, validTemporalAt(args[0], i), validTemporalAt(args[1], i));
+                const sum = addTime(sign, args.at(0, i), args.at(1, i));
                 if (out.data == .datetime) {
                     const dt: ?i64 = if (sum) |s| switch (s) {
                         .datetime => |x| x.value,
@@ -462,7 +587,7 @@ pub fn addTimeKernel(comptime sign: i64) Kernel {
                 try appendText(allocator, out, base, i, text);
             }
         }
-    }.kernel;
+    }.rows;
 }
 
 fn addTime(sign: i64, a: ?Temporal, b: ?Temporal) ?Temporal {
@@ -605,8 +730,9 @@ pub fn extractClockKernel(comptime unit: ClockUnit) Kernel {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
             const base = out.data.rowCount();
+            const read: TimeArgs = .{ .views = args };
             for (0..row_count) |i| {
-                const t = validTemporalAt(args[0], i);
+                const t = read.at(0, i);
                 try out.data.bigint.append(allocator, if (t) |v| clockUnitValue(unit, clockFields(v)) else 0);
                 try out.appendValidBit(allocator, base + i, t != null);
             }
@@ -699,17 +825,53 @@ test "EXTRACT's clock units follow MySQL's day, hour and sign rules" {
     inline for (cases) |c| try t.expectEqual(@as(i64, c[2]), clockUnitValue(c[0], clockFields(parseTime(c[1]).?)));
 }
 
-test "a number reads as a TIME by its HHMMSS digits, or a datetime's time of day" {
+test "a number reads as datetime fields the way MySQL's number_to_datetime reads it" {
+    const S = common.ScaledInt;
+    const F = DatetimeFields;
+    const cases = .{
+        .{ S{ .m = 20260926, .s = 0 }, @as(?F, .{ .year = 2026, .month = 9, .day = 26, .hour = 0, .minute = 0, .second = 0, .micros = 0 }) },
+        .{ S{ .m = 260926, .s = 0 }, @as(?F, .{ .year = 2026, .month = 9, .day = 26, .hour = 0, .minute = 0, .second = 0, .micros = 0 }) },
+        .{ S{ .m = 101, .s = 0 }, @as(?F, .{ .year = 2000, .month = 1, .day = 1, .hour = 0, .minute = 0, .second = 0, .micros = 0 }) },
+        .{ S{ .m = 991231, .s = 0 }, @as(?F, .{ .year = 1999, .month = 12, .day = 31, .hour = 0, .minute = 0, .second = 0, .micros = 0 }) },
+        .{ S{ .m = 202609261005035, .s = 1 }, @as(?F, .{ .year = 2026, .month = 9, .day = 26, .hour = 10, .minute = 5, .second = 3, .micros = 500_000 }) },
+        .{ S{ .m = 260926100503, .s = 0 }, @as(?F, .{ .year = 2026, .month = 9, .day = 26, .hour = 10, .minute = 5, .second = 3, .micros = 0 }) },
+        .{ S{ .m = 10000000000, .s = 0 }, @as(?F, .{ .year = 2001, .month = 0, .day = 0, .hour = 0, .minute = 0, .second = 0, .micros = 0 }) },
+        .{ S{ .m = 20260230, .s = 0 }, @as(?F, .{ .year = 2026, .month = 2, .day = 30, .hour = 0, .minute = 0, .second = 0, .micros = 0 }) },
+        .{ S{ .m = 100, .s = 0 }, @as(?F, null) },
+        .{ S{ .m = 2026, .s = 0 }, @as(?F, null) },
+        .{ S{ .m = 9991231, .s = 0 }, @as(?F, null) },
+        .{ S{ .m = 20261301, .s = 0 }, @as(?F, null) },
+        .{ S{ .m = 20260932, .s = 0 }, @as(?F, null) },
+        .{ S{ .m = 2026092610050, .s = 0 }, @as(?F, null) },
+        .{ S{ .m = 20260926250000, .s = 0 }, @as(?F, null) },
+        .{ S{ .m = -20260926, .s = 0 }, @as(?F, null) },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c[1], numberDatetimeFields(c[0]));
+}
+
+test "a number reads as a TIME by its HHMMSS digits, or as a DATETIME" {
     const S = common.ScaledInt;
     const clock = (10 * 3600 + 5 * 60 + 3) * US_PER_S;
+    const time_of_day = struct {
+        fn of(t: ?Temporal) ?i64 {
+            return switch (t orelse return null) {
+                .time => |x| x.value,
+                .datetime => |x| @mod(x.value, US_PER_DAY),
+            };
+        }
+    }.of;
     const cases = .{
         .{ S{ .m = 100503, .s = 0 }, @as(?i64, clock) },
         .{ S{ .m = -1005035, .s = 1 }, @as(?i64, -(clock + 500_000)) },
         .{ S{ .m = 106000, .s = 0 }, @as(?i64, null) },
         .{ S{ .m = 8390000, .s = 0 }, @as(?i64, null) },
+        .{ S{ .m = -8390000, .s = 0 }, @as(?i64, null) },
+        .{ S{ .m = 8385959, .s = 0 }, @as(?i64, MAX_TIME_MICROS) },
+        .{ S{ .m = 83859599999999, .s = 7 }, @as(?i64, MAX_TIME_MICROS) },
         .{ S{ .m = 20260926100503, .s = 0 }, @as(?i64, clock) },
         .{ S{ .m = 20260230100503, .s = 0 }, @as(?i64, null) },
         .{ S{ .m = 599999999, .s = 7 }, @as(?i64, 60 * US_PER_S) },
     };
-    inline for (cases) |c| try std.testing.expectEqual(c[1], numberTime(c[0]));
+    inline for (cases) |c| try std.testing.expectEqual(c[1], time_of_day(numberTemporal(c[0], 0)));
+    try std.testing.expect(numberTemporal(.{ .m = 20260926100503, .s = 0 }, 0).? == .datetime);
 }

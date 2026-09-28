@@ -270,15 +270,6 @@ fn unitFirstArgCall(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "get_format");
 }
 
-/// The wall-clock functions whose value is a TIME, whose precision picks
-/// the fraction digits they show.
-fn clockTimeFn(name: []const u8) bool {
-    inline for (.{ "current_time", "curtime", "utc_time" }) |n| {
-        if (std.ascii.eqlIgnoreCase(name, n)) return true;
-    }
-    return false;
-}
-
 /// MySQL's TIMESTAMPADD and TIMESTAMPDIFF also take ODBC's spelling of a
 /// unit, `SQL_TSI_DAY`.
 fn withoutTsiPrefix(word: []const u8) []const u8 {
@@ -2433,13 +2424,10 @@ pub const Parser = struct {
         const name = scalar_fn.canonicalName(typed_name);
         if (std.ascii.eqlIgnoreCase(name, "found_rows")) return ParseError.SqlFoundRowsUnsupported;
         if (args.len == 1 and fspTemporalFn(name)) {
-            // Timestamps carry microseconds whatever precision is asked
-            // for, as DATETIME(fsp) columns do. A TIME is text, so it keeps
-            // the precision to show that many fraction digits.
+            // The precision picks how many fraction digits the clock keeps.
             const fsp = literalInteger(args[0]) orelse return ParseError.SqlExpectedValue;
             if (fsp < 0 or fsp > 6) return ParseError.SqlExpectedValue;
-            const kept: []const ir.Expr = if (clockTimeFn(name)) try self.arena.dupe(ir.Expr, args) else &.{};
-            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, name), .args = kept } };
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, name), .args = try self.arena.dupe(ir.Expr, args) } };
         }
         if (std.ascii.eqlIgnoreCase(name, "isnull") and args.len == 1) return try self.isNullValue(args[0]);
         if (std.ascii.eqlIgnoreCase(name, "timestampadd") and args.len == 3) {

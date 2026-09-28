@@ -2180,7 +2180,7 @@ fn buildCallPlan(
         }
         built += 1;
     }
-    if (try nullifTextPlaced(aa, c, arg_plans, arg_types)) |rewritten| {
+    if (try nullifConstantPlaced(aa, c, arg_plans, arg_types)) |rewritten| {
         for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
         built = 0;
         return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
@@ -2288,19 +2288,33 @@ fn hexNumbersRead(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: E
     return if (args) |a| Expr{ .call = .{ .fn_name = c.fn_name, .args = a } } else null;
 }
 
-/// NULLIF(a, b) is NULL where `a = b`, so a text constant meeting a DATE or
-/// DATETIME argument reads as that comparison reads it
-/// (`predicate.placeComparedText`): the call compares the value it names, or,
-/// when no value of the type equals it, NULL, which never matches, so the
+/// NULLIF(a, b) is NULL where `a = b`, so a constant meeting an argument it
+/// compares with only by reading reads as that comparison reads it: text
+/// against a DATE or DATETIME (`predicate.placeComparedText`), and a number
+/// `b` against a DATE or DATETIME `a` or the reverse
+/// (`predicate.placeComparedValue`). The call compares the value it names,
+/// or, when no value of the type equals it, NULL, which never matches, so the
 /// call returns `a`. Null when no argument is such a constant.
-fn nullifTextPlaced(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
+fn nullifConstantPlaced(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
     if (!std.ascii.eqlIgnoreCase(c.fn_name, "nullif") or c.args.len != 2) return null;
     for (arg_plans, 0..) |ap, i| {
-        if (ap != .lit or ap.lit.value != .text) continue;
+        if (ap != .lit) continue;
         const other = arg_types[1 - i];
-        if (other != .date and other != .datetime) continue;
+        const placed: ?types.Value = if (ap.lit.value == .text) text: {
+            if (other != .date and other != .datetime) continue;
+            break :text try predicate_mod.placeComparedText(ap.lit.value.text, other, c.from_statement);
+        } else number: {
+            // Placed as the other's type, a first argument would return as it.
+            if (i == 0 or !predicate_mod.temporalBesideNumber(ap.lit.ty, other)) continue;
+            const value: types.Value = if (ap.lit.ty.decimalSpec()) |spec| .{ .double = scalar_decimal.mantissaToDouble(switch (ap.lit.value) {
+                .decimal64 => |x| x,
+                .decimal128 => |x| x,
+                else => continue,
+            }, spec.s) } else ap.lit.value;
+            break :number predicate_mod.placeComparedValue(value, other);
+        };
         const args = try aa.dupe(Expr, c.args);
-        if (try predicate_mod.placeComparedText(ap.lit.value.text, other, c.from_statement)) |v| {
+        if (placed) |v| {
             args[i] = .{ .lit = v };
         } else {
             args[1] = .{ .null_lit = arg_types[0] };
