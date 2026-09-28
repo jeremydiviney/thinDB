@@ -1301,3 +1301,181 @@ test "aggregate: DISTINCT stays in the default column name and apart from the pl
         };
     }
 }
+
+/// Every cell of every row, left to right, as a number.
+fn collectNumberCells(allocator: std.mem.Allocator, q: *helpers.RunResult) ![]?f64 {
+    var out: std.ArrayList(?f64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            for (batch.values) |column| {
+                if (!column.isValid(row)) {
+                    try out.append(allocator, null);
+                    continue;
+                }
+                try out.append(allocator, switch (column.data) {
+                    .tinyint => |values| @floatFromInt(values[row]),
+                    .smallint => |values| @floatFromInt(values[row]),
+                    .int => |values| @floatFromInt(values[row]),
+                    .bigint => |values| @floatFromInt(values[row]),
+                    .double => |values| values[row],
+                    else => return error.TestUnexpectedResult,
+                });
+            }
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn expectNumberRows(allocator: std.mem.Allocator, db: *thindb.Database, dialect: thindb.types.Dialect, sql: []const u8, expected: []const ?f64) !void {
+    errdefer std.debug.print("{s} ({s})\n", .{ sql, @tagName(dialect) });
+    var q = try helpers.runSqlDialect(allocator, db, sql, dialect);
+    defer q.deinit();
+    const cells = try collectNumberCells(allocator, &q);
+    defer allocator.free(cells);
+    try std.testing.expectEqual(expected.len, cells.len);
+    for (expected, cells) |want, got| {
+        if (want) |v| {
+            try std.testing.expectApproxEqAbs(v, got orelse return error.TestExpectedEqual, 1e-9);
+        } else {
+            try std.testing.expectEqual(@as(?f64, null), got);
+        }
+    }
+}
+
+test "aggregate: STD, STDDEV and VARIANCE are the population statistics, PostgreSQL's STDDEV and VARIANCE the sample ones (issue #341)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE sv (id BIGINT PRIMARY KEY, g INT, n INT, x DOUBLE)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO sv VALUES (1, 1, 1, 1.5), (2, 1, 2, 2.5), (3, 2, NULL, NULL), (4, 2, 4, -4),
+        \\  (5, 2, 8, 8.25), (6, 3, 5, 5), (7, 4, NULL, NULL)
+    );
+
+    // `population` is MySQL 8.4's answer, for the neutral and MySQL dialects;
+    // `postgres` reads STDDEV and VARIANCE as MySQL's STDDEV_SAMP and
+    // VAR_SAMP answer them (null: the case orders NULLs, which PostgreSQL
+    // places apart).
+    const cases = [_]struct { sql: []const u8, population: []const ?f64, postgres: ?[]const ?f64 }{
+        .{ .sql = "SELECT STD(n), STDDEV(n), VARIANCE(n) FROM sv", .population = &.{ 2.449489742783178, 2.449489742783178, 6.0 }, .postgres = &.{ 2.449489742783178, 2.7386127875258306, 7.5 } },
+        .{
+            .sql = "SELECT STDDEV_POP(n), STDDEV_SAMP(n), VAR_POP(n), VAR_SAMP(n), VARIANCE_POP(n), VARIANCE_SAMP(n) FROM sv",
+            .population = &.{ 2.449489742783178, 2.7386127875258306, 6.0, 7.5, 6.0, 7.5 },
+            .postgres = &.{ 2.449489742783178, 2.7386127875258306, 6.0, 7.5, 6.0, 7.5 },
+        },
+        .{ .sql = "SELECT STD(x), STDDEV(x), VARIANCE(x) FROM sv", .population = &.{ 4.060788100849391, 4.060788100849391, 16.490000000000002 }, .postgres = &.{ 4.060788100849391, 4.540099117860755, 20.6125 } },
+        .{
+            .sql = "SELECT g, STD(n), STDDEV(n), VARIANCE(n), STDDEV_SAMP(n), VAR_SAMP(n) FROM sv GROUP BY g ORDER BY g",
+            .population = &.{
+                1.0, 0.5,  0.5,  0.25, 0.7071067811865476, 0.5,
+                2.0, 2.0,  2.0,  4.0,  2.8284271247461903, 8.0,
+                3.0, 0.0,  0.0,  0.0,  null,               null,
+                4.0, null, null, null, null,               null,
+            },
+            .postgres = &.{
+                1.0, 0.5,  0.7071067811865476, 0.5,  0.7071067811865476, 0.5,
+                2.0, 2.0,  2.8284271247461903, 8.0,  2.8284271247461903, 8.0,
+                3.0, 0.0,  null,               null, null,               null,
+                4.0, null, null,               null, null,               null,
+            },
+        },
+        .{
+            .sql = "SELECT g, std(x), stddev(x), variance(x) FROM sv GROUP BY g ORDER BY g",
+            .population = &.{ 1.0, 0.5, 0.5, 0.25, 2.0, 6.125, 6.125, 37.515625, 3.0, 0.0, 0.0, 0.0, 4.0, null, null, null },
+            .postgres = &.{ 1.0, 0.5, 0.7071067811865476, 0.5, 2.0, 6.125, 8.662058069535208, 75.03125, 3.0, 0.0, null, null, 4.0, null, null, null },
+        },
+        // Group-topN.
+        .{ .sql = "SELECT g, STDDEV(n) AS s FROM sv WHERE g < 3 GROUP BY g ORDER BY s DESC LIMIT 1", .population = &.{ 2.0, 2.0 }, .postgres = &.{ 2.0, 2.8284271247461903 } },
+        .{ .sql = "SELECT g, VARIANCE(n) AS v FROM sv WHERE g < 3 GROUP BY g ORDER BY v LIMIT 1", .population = &.{ 1.0, 0.25 }, .postgres = &.{ 1.0, 0.5 } },
+        .{ .sql = "SELECT g, VARIANCE(n) AS v FROM sv GROUP BY g ORDER BY v LIMIT 3", .population = &.{ 4.0, null, 3.0, 0.0, 1.0, 0.25 }, .postgres = null },
+        .{ .sql = "SELECT g, VARIANCE(n) FROM sv GROUP BY g WITH ROLLUP ORDER BY g", .population = &.{ null, 6.0, 1.0, 0.25, 2.0, 4.0, 3.0, 0.0, 4.0, null }, .postgres = null },
+        .{ .sql = "SELECT g, STDDEV(n) FROM sv GROUP BY g HAVING STDDEV(n) > 1 ORDER BY g", .population = &.{ 2.0, 2.0 }, .postgres = &.{ 2.0, 2.8284271247461903 } },
+        .{ .sql = "SELECT g, VARIANCE(n) FROM sv GROUP BY g HAVING VARIANCE(n) = 0 ORDER BY g", .population = &.{ 3.0, 0.0 }, .postgres = &.{} },
+        .{ .sql = "SELECT g, VARIANCE(n) + 1 FROM sv GROUP BY g ORDER BY g", .population = &.{ 1.0, 1.25, 2.0, 5.0, 3.0, 1.0, 4.0, null }, .postgres = &.{ 1.0, 1.5, 2.0, 9.0, 3.0, null, 4.0, null } },
+        .{ .sql = "WITH c AS (SELECT g, n FROM sv WHERE id < 7) SELECT STD(n), VARIANCE(n) FROM c", .population = &.{ 2.449489742783178, 6.0 }, .postgres = &.{ 2.449489742783178, 7.5 } },
+        .{ .sql = "SELECT VARIANCE(n + 1), STD(n * 2), STDDEV(n * 2) FROM sv", .population = &.{ 6.0, 4.898979485566356, 4.898979485566356 }, .postgres = &.{ 7.5, 4.898979485566356, 5.477225575051661 } },
+        // One row: the population statistics are 0, the sample ones NULL.
+        .{ .sql = "SELECT STDDEV(n), VARIANCE(n), STDDEV_SAMP(n), VAR_SAMP(n) FROM sv WHERE g = 3", .population = &.{ 0.0, 0.0, null, null }, .postgres = &.{ null, null, null, null } },
+        .{ .sql = "SELECT STDDEV(n), VARIANCE(n), STDDEV_POP(n), VAR_POP(n) FROM sv WHERE g = 4", .population = &.{ null, null, null, null }, .postgres = &.{ null, null, null, null } },
+        .{ .sql = "SELECT STDDEV(n), VARIANCE(n), STD(n) FROM sv WHERE id > 100", .population = &.{ null, null, null }, .postgres = &.{ null, null, null } },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("sv", .{})).flush();
+        for (cases) |c| {
+            try expectNumberRows(allocator, db, .neutral, c.sql, c.population);
+            try expectNumberRows(allocator, db, .mysql, c.sql, c.population);
+            if (c.postgres) |rows| try expectNumberRows(allocator, db, .postgres, c.sql, rows);
+        }
+    }
+}
+
+test "aggregate: SELECT DISTINCT dedups a grouped query's rows (issue #342)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE dg (id BIGINT PRIMARY KEY, g INT, n INT)");
+    try helpers.exec(allocator, db, "INSERT INTO dg VALUES (1, 1, 1), (2, 1, 2), (3, 2, NULL), (4, 2, 4), (5, 2, 8), (6, 3, NULL), (7, 4, NULL)");
+
+    // Each answer is MySQL 8.4's.
+    const cases = [_]struct { sql: []const u8, expected: []const ?f64 }{
+        .{ .sql = "SELECT DISTINCT COUNT(*) AS c FROM dg WHERE id <> 5 AND g < 3 GROUP BY g", .expected = &.{2.0} },
+        .{ .sql = "SELECT DISTINCT SUM(n) FROM dg GROUP BY g ORDER BY 1", .expected = &.{ null, 3.0, 12.0 } },
+        .{ .sql = "SELECT DISTINCT MAX(n) FROM dg GROUP BY g ORDER BY 1", .expected = &.{ null, 2.0, 8.0 } },
+        .{ .sql = "SELECT DISTINCT AVG(n) FROM dg GROUP BY g ORDER BY 1", .expected = &.{ null, 1.5, 6.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(*) FROM dg GROUP BY g ORDER BY 1", .expected = &.{ 1.0, 2.0, 3.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g ORDER BY 1", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(DISTINCT n) FROM dg GROUP BY g ORDER BY 1", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(*) FROM dg", .expected = &.{7.0} },
+        .{ .sql = "SELECT DISTINCT g FROM dg GROUP BY g ORDER BY g", .expected = &.{ 1.0, 2.0, 3.0, 4.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n), COUNT(n) FROM dg GROUP BY g ORDER BY 1", .expected = &.{ 0.0, 0.0, 2.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n), COUNT(*) FROM dg GROUP BY g ORDER BY 1, 2", .expected = &.{ 0.0, 1.0, 2.0, 2.0, 2.0, 3.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) * 10 AS c FROM dg GROUP BY g ORDER BY c", .expected = &.{ 0.0, 20.0 } },
+        .{ .sql = "SELECT DISTINCT MAX(n) - MIN(n) AS r FROM dg GROUP BY g ORDER BY r", .expected = &.{ null, 1.0, 4.0 } },
+        .{ .sql = "SELECT DISTINCT g DIV 3 AS h, COUNT(n) FROM dg GROUP BY g ORDER BY 1, 2", .expected = &.{ 0.0, 2.0, 1.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT g AS k, COUNT(n) AS c FROM dg GROUP BY k HAVING c >= 0 ORDER BY k", .expected = &.{ 1.0, 2.0, 2.0, 2.0, 3.0, 0.0, 4.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT dg.g, COUNT(n) FROM dg GROUP BY dg.g ORDER BY 1", .expected = &.{ 1.0, 2.0, 2.0, 2.0, 3.0, 0.0, 4.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg a GROUP BY a.g ORDER BY 1", .expected = &.{ 0.0, 2.0 } },
+        // HAVING runs before the dedup.
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g HAVING c > 0", .expected = &.{2.0} },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g HAVING COUNT(*) < 3 ORDER BY c", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g HAVING SUM(n) IS NULL", .expected = &.{0.0} },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g HAVING MAX(id) > 2 ORDER BY c", .expected = &.{ 0.0, 2.0 } },
+        // ORDER BY and LIMIT run after it.
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g ORDER BY c DESC LIMIT 1", .expected = &.{2.0} },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g ORDER BY c LIMIT 1 OFFSET 1", .expected = &.{2.0} },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g ORDER BY c + 1", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g ORDER BY -c", .expected = &.{ 2.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g ORDER BY COUNT(n)", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g ORDER BY COUNT(n) + 1 DESC", .expected = &.{ 2.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n), g FROM dg GROUP BY g ORDER BY g DESC LIMIT 2", .expected = &.{ 0.0, 4.0, 0.0, 3.0 } },
+        // A key the SELECT list doesn't carry orders each row by its first
+        // occurrence in that order.
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g ORDER BY g", .expected = &.{ 2.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g ORDER BY g DESC", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g ORDER BY MAX(id)", .expected = &.{ 2.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g ORDER BY MAX(id) DESC", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g ORDER BY SUM(n) DESC", .expected = &.{ 2.0, 0.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g ORDER BY SUM(n), c", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(*) AS c FROM dg GROUP BY g ORDER BY MIN(n) DESC", .expected = &.{ 3.0, 2.0, 1.0 } },
+        .{ .sql = "SELECT DISTINCT g DIV 2 AS h FROM dg GROUP BY g ORDER BY SUM(n) DESC", .expected = &.{ 1.0, 0.0, 2.0 } },
+        // Around it.
+        .{ .sql = "SELECT COUNT(*) FROM (SELECT DISTINCT COUNT(n) AS c FROM dg GROUP BY g) s", .expected = &.{2.0} },
+        .{ .sql = "WITH c AS (SELECT DISTINCT COUNT(n) AS k FROM dg GROUP BY g) SELECT k FROM c ORDER BY k", .expected = &.{ 0.0, 2.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g UNION ALL SELECT 5 ORDER BY 1", .expected = &.{ 0.0, 2.0, 5.0 } },
+        .{ .sql = "SELECT DISTINCT COUNT(n) FROM dg GROUP BY g WITH ROLLUP ORDER BY 1", .expected = &.{ 0.0, 2.0, 4.0 } },
+        .{ .sql = "SELECT DISTINCT SUM(COUNT(n)) OVER () FROM dg GROUP BY g", .expected = &.{4.0} },
+        .{ .sql = "SELECT DISTINCT COUNT(n) AS c, SUM(COUNT(n)) OVER () AS t FROM dg GROUP BY g ORDER BY c", .expected = &.{ 0.0, 4.0, 2.0, 4.0 } },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("dg", .{})).flush();
+        for (cases) |c| {
+            try expectNumberRows(allocator, db, .neutral, c.sql, c.expected);
+            try expectNumberRows(allocator, db, .mysql, c.sql, c.expected);
+        }
+    }
+}
