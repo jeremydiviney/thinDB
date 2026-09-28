@@ -129,6 +129,21 @@ pub fn writePacket(w: *std.Io.Writer, seq_id: u8, payload: []const u8) !void {
     try w.writeAll(payload);
 }
 
+/// Write `payload` as one logical packet, advancing `seq_id` past it. MySQL
+/// frames a payload of 16 MiB - 1 bytes or more as full-size packets and a
+/// final shorter one, possibly empty, so a row that long reaches the client
+/// rather than failing the connection.
+pub fn writeLogicalPacket(w: *std.Io.Writer, seq_id: *u8, payload: []const u8) !void {
+    var rest = payload;
+    while (true) {
+        const chunk = rest[0..@min(rest.len, max_payload_len)];
+        try writePacket(w, seq_id.*, chunk);
+        seq_id.* +%= 1;
+        rest = rest[chunk.len..];
+        if (chunk.len < max_payload_len) return;
+    }
+}
+
 pub const Header = struct { len: u32, seq_id: u8 };
 
 /// Read one packet's 4-byte header. Blocking here is "idle between

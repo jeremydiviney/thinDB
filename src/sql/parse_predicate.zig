@@ -218,7 +218,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         _ = try p.parseScalar();
         return .unknown;
     }
-    if (p.cur.tag == .tilde or try literalLedAhead(p)) {
+    if (p.cur.tag == .tilde or p.cur.tag == .system_variable or try literalLedAhead(p)) {
         return try parseScalarLhs(p);
     }
     // `@var op X` — a session var on the LHS (constant guard, e.g.

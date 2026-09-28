@@ -445,6 +445,20 @@ pub fn uuidKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     }
 }
 
+/// Process-wide, so databases sharing a process never hand out the same
+/// UUID_SHORT.
+var uuid_short_counter = std.atomic.Value(u64).init(0);
+
+/// UUID_SHORT(): MySQL's `(startup seconds << 24) + counter`, with the
+/// statement's clock seconds (`args[0]`) for the startup time. Both terms
+/// only grow, so each value is larger than every earlier one.
+pub fn uuidShortKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const first = uuid_short_counter.fetchAdd(row_count, .monotonic);
+    const seconds: u64 = @intCast(@max(args[0].data.bigint[0], 0));
+    for (0..row_count) |k| try out.data.largeint.append(allocator, @as(i128, seconds << 24) + first + k);
+}
+
 pub fn reverseKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     const ss = stringStoreOf(out);
@@ -1188,6 +1202,18 @@ pub fn rpadKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
     try padKernel(allocator, args, out, row_count, .right);
 }
 
+/// The longest string REPEAT, LPAD, RPAD and SPACE build: the
+/// max_allowed_packet thinDB reports. MySQL answers a longer result with
+/// NULL rather than building it. These kernels own their validity bitmap
+/// (`.kernel_managed`).
+pub const MAX_STRING_RESULT: usize = 16 * 1024 * 1024;
+
+/// A result `len` bytes long, or null when it's past `MAX_STRING_RESULT`.
+fn resultLen(len: anytype) ?usize {
+    const n = std.math.cast(usize, len) orelse return null;
+    return if (n <= MAX_STRING_RESULT) n else null;
+}
+
 /// LPAD / RPAD(s, len, pad): `s` cut or padded to `len` characters, the
 /// pad repeating as needed. An empty pad leaves a short `s` as it is.
 fn padKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, side: enum { left, right }) !void {
@@ -1195,66 +1221,68 @@ fn padKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, 
     const lens = args[1].data.int;
     const pad_sv = stringViewOf(args[2]);
     const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     for (0..row_count) |i| {
-        const src = sv.rowBytes(i);
-        const pad = pad_sv.rowBytes(i);
-        const target: usize = @intCast(@max(lens[i], 0));
-        const src_chars = charCount(src);
-        if (src_chars >= target or pad.len == 0) {
-            try ss.appendValue(allocator, charSlice(src, 0, @min(src_chars, target)));
-            continue;
-        }
-        const needed = target - src_chars;
-        const pad_chars = charCount(pad);
         buf.clearRetainingCapacity();
-        if (side == .right) try buf.appendSlice(allocator, src);
-        for (0..needed / pad_chars) |_| try buf.appendSlice(allocator, pad);
-        try buf.appendSlice(allocator, charSlice(pad, 0, needed % pad_chars));
-        if (side == .left) try buf.appendSlice(allocator, src);
+        const valid = allValid(args, i) and try padRow(allocator, &buf, sv.rowBytes(i), lens[i], pad_sv.rowBytes(i), side == .left);
         try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
     }
+}
+
+/// `src` padded or cut to `target` characters into `buf`, or false when the
+/// result would be past `MAX_STRING_RESULT`.
+fn padRow(allocator: Allocator, buf: *std.ArrayList(u8), src: []const u8, target_in: i32, pad: []const u8, left: bool) !bool {
+    const target: usize = @intCast(@max(target_in, 0));
+    const src_chars = charCount(src);
+    if (src_chars >= target or pad.len == 0) {
+        try buf.appendSlice(allocator, charSlice(src, 0, @min(src_chars, target)));
+        return true;
+    }
+    const needed = target - src_chars;
+    const pad_chars = charCount(pad);
+    const partial = charSlice(pad, 0, needed % pad_chars);
+    _ = resultLen(@as(u128, needed / pad_chars) * pad.len + partial.len + src.len) orelse return false;
+    if (!left) try buf.appendSlice(allocator, src);
+    for (0..needed / pad_chars) |_| try buf.appendSlice(allocator, pad);
+    try buf.appendSlice(allocator, partial);
+    if (left) try buf.appendSlice(allocator, src);
+    return true;
 }
 
 pub fn repeatKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     const ns = args[1].data.int;
     const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
         const src = sv.rowBytes(i);
-        const n = ns[i];
-        if (n <= 0 or src.len == 0) {
-            try ss.appendValue(allocator, "");
-            continue;
-        }
-        const total: usize = src.len * @as(usize, @intCast(n));
-        var buf = try allocator.alloc(u8, total);
-        defer allocator.free(buf);
-        var k: usize = 0;
-        while (k < @as(usize, @intCast(n))) : (k += 1) {
-            @memcpy(buf[k * src.len ..][0..src.len], src);
-        }
-        try ss.appendValue(allocator, buf);
+        const n: usize = @intCast(@max(ns[i], 0));
+        buf.clearRetainingCapacity();
+        const valid = allValid(args, i) and resultLen(@as(u128, src.len) * n) != null;
+        if (valid) for (0..n) |_| try buf.appendSlice(allocator, src);
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
     }
 }
 
 pub fn spaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const ns = args[0].data.int;
     const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const n = ns[i];
-        if (n <= 0) {
-            try ss.appendValue(allocator, "");
-            continue;
-        }
-        const len: usize = @intCast(n);
-        const buf = try allocator.alloc(u8, len);
-        defer allocator.free(buf);
-        @memset(buf, ' ');
-        try ss.appendValue(allocator, buf);
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        const len = resultLen(@max(ns[i], 0));
+        const valid = args[0].isValid(i) and len != null;
+        buf.clearRetainingCapacity();
+        if (valid) try buf.appendNTimes(allocator, ' ', len.?);
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
     }
 }
 
@@ -1419,6 +1447,30 @@ pub fn eltKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSto
         const picked: ?ColumnView = if (eltIndex(args[0], i, args.len - 1)) |n| args[n] else null;
         const valid = if (picked) |p| p.isValid(i) else false;
         try ss.appendValue(allocator, if (valid) stringViewOf(picked.?).rowBytes(i) else "");
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// MAKE_SET(bits, s1, s2, ...): the strings whose bit is set in `bits`
+/// (s1 for bit 0), joined by commas. A NULL string is skipped; NULL `bits`
+/// is NULL, as in MySQL.
+pub fn makeSetKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(allocator);
+    for (0..row_count) |i| {
+        const valid = args[0].isValid(i);
+        joined.clearRetainingCapacity();
+        const bits: u64 = @bitCast(args[0].data.bigint[i]);
+        var first = true;
+        for (args[1..@min(args.len, 65)], 0..) |s, bit| {
+            if (!valid or bits >> @intCast(bit) & 1 == 0 or !s.isValid(i)) continue;
+            if (!first) try joined.append(allocator, ',');
+            try joined.appendSlice(allocator, stringViewOf(s).rowBytes(i));
+            first = false;
+        }
+        try ss.appendValue(allocator, joined.items);
         try out.appendValidBit(allocator, base + i, valid);
     }
 }
