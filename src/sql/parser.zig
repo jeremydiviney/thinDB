@@ -46,6 +46,7 @@ const types = @import("../types.zig");
 const Value = types.Value;
 const exec_expr = @import("../exec/expr.zig");
 const exec_predicate = @import("../exec/predicate.zig");
+const exec_aggregate = @import("../exec/aggregate.zig");
 const exec_compute = @import("../exec/compute.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const datefmt = @import("../exec/scalar_fn_datefmt.zig");
@@ -117,10 +118,12 @@ pub const ParseError = error{
     SqlPrepareExecuteUnsupported,
 } || LexError;
 
-/// `postgres` names the function a name means in PostgreSQL where it differs:
-/// MySQL and StarRocks read STD, STDDEV and VARIANCE as the population
-/// statistics, PostgreSQL reads STDDEV and VARIANCE as the sample ones.
-const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.AggFunc = null }{
+/// `postgres` and `mysql` name the function a name means in that dialect
+/// where it differs: MySQL and StarRocks read STD, STDDEV and VARIANCE as
+/// the population statistics, PostgreSQL reads STDDEV and VARIANCE as the
+/// sample ones; MySQL's BIT_AND, BIT_OR and BIT_XOR are BIGINT UNSIGNED, as
+/// its bit operators are (`scalar_fn.bitOperatorFn`).
+const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.AggFunc = null, mysql: ?ir.AggFunc = null }{
     .{ .name = "count", .func = .count },
     .{ .name = "sum", .func = .sum },
     .{ .name = "min", .func = .min },
@@ -134,9 +137,9 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "first", .func = .first },
     .{ .name = "last", .func = .last },
     .{ .name = "max_by", .func = .max_by },
-    .{ .name = "bit_and", .func = .bit_and },
-    .{ .name = "bit_or", .func = .bit_or },
-    .{ .name = "bit_xor", .func = .bit_xor },
+    .{ .name = "bit_and", .func = .bit_and, .mysql = .unsigned_bit_and },
+    .{ .name = "bit_or", .func = .bit_or, .mysql = .unsigned_bit_or },
+    .{ .name = "bit_xor", .func = .bit_xor, .mysql = .unsigned_bit_xor },
     .{ .name = "std", .func = .stddev_pop },
     .{ .name = "stddev", .func = .stddev_pop, .postgres = .stddev_samp },
     .{ .name = "stddev_pop", .func = .stddev_pop },
@@ -158,7 +161,11 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
 fn aggForName(name: []const u8, dialect: types.Dialect) ?ir.AggFunc {
     for (AggNames) |entry| {
         if (!std.ascii.eqlIgnoreCase(name, entry.name)) continue;
-        return if (dialect == .postgres) entry.postgres orelse entry.func else entry.func;
+        return switch (dialect) {
+            .postgres => entry.postgres orelse entry.func,
+            .mysql => entry.mysql orelse entry.func,
+            .neutral => entry.func,
+        };
     }
     return null;
 }
@@ -187,9 +194,9 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .first => "first",
         .last => "last",
         .max_by => "max_by",
-        .bit_and => "bit_and",
-        .bit_or => "bit_or",
-        .bit_xor => "bit_xor",
+        .bit_and, .unsigned_bit_and => "bit_and",
+        .bit_or, .unsigned_bit_or => "bit_or",
+        .bit_xor, .unsigned_bit_xor => "bit_xor",
         .stddev_pop => "stddev_pop",
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
@@ -2991,8 +2998,13 @@ pub const Parser = struct {
             // Any other argument — SUM(a * b), COUNT(upper(name)),
             // SUM((SELECT ...)) — is hoisted into a synthetic Compute
             // column before the GroupBy step; see parseStatement's
-            // pre-aggregate pass.
-            else => arg_expr = value_args[0],
+            // pre-aggregate pass. A hex literal is the integer it spells
+            // where the aggregate takes numbers (`SUM(0x41)` sums 65) and
+            // its bytes elsewhere (`MAX(0x41)` is 'A'), as in MySQL.
+            else => |e| arg_expr = if (exec_expr.hexLiteralBytes(e)) |bytes|
+                if (exec_aggregate.takesNumbers(func)) .{ .lit = exec_expr.hexLiteralNumber(bytes) } else e
+            else
+                e,
         }
         const default_name = blk: {
             var buf: std.ArrayList(u8) = .empty;

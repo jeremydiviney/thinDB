@@ -1,7 +1,7 @@
 //! MySQL's implicit conversions around temporals and hex literals: CAST AS
 //! TIME (#261), dates whose day is past the month's end (#262), dates and
 //! datetimes read as numbers (#263) and summed as numbers (#305), and hex
-//! literals read as integers in a numeric context (#269). Every expected
+//! literals read as integers in a numeric context (#269, #308). Every expected
 //! value is MySQL 8.4's unless a comment says otherwise.
 
 const std = @import("std");
@@ -316,4 +316,88 @@ test "a hex literal is its integer in a numeric context and its bytes elsewhere"
     try exec(allocator, db, "UPDATE hx SET v = 0x3133, s = 0x3133 WHERE id = 1");
     try expectRows(allocator, db, "SELECT v FROM hx WHERE id = 1", &.{"12595"});
     try expectRows(allocator, db, "SELECT s FROM hx WHERE id = 1", &.{"13"});
+}
+
+test "a hex literal leads IN and BETWEEN, sums, stays unsigned and stores by its column" {
+    // #308's leftovers.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const cases = .{
+        .{ "0x41 IN (65, 66)", "1" },
+        .{ "0x41 IN (1, 2)", "0" },
+        .{ "0x41 NOT IN (65)", "0" },
+        .{ "0x41 IN ('A', 'B')", "1" },
+        .{ "0x41 IN (NULL, 65)", "1" },
+        .{ "0x41 BETWEEN 60 AND 70", "1" },
+        .{ "0x41 NOT BETWEEN 60 AND 70", "0" },
+        .{ "0x41 BETWEEN 'A' AND 'B'", "1" },
+        // The integer is BIGINT UNSIGNED.
+        .{ "0x7FFFFFFFFFFFFFFF + 1", "9223372036854775808" },
+        .{ "0x7FFFFFFFFFFFFFFF * 2", "18446744073709551614" },
+        .{ "CAST(0x7FFFFFFFFFFFFFFF + 1 AS CHAR)", "9223372036854775808" },
+        // A decimal integer literal keeps BIGINT, which wraps as in StarRocks.
+        .{ "9223372036854775807 + 1", "-9223372036854775808" },
+        // CONV converts the literal's integer, whatever from_base says.
+        .{ "CONV(X'FF', 16, 10)", "255" },
+        .{ "CONV(0xFF, 2, 10)", "255" },
+        .{ "CONV(0x41, 10, 16)", "41" },
+        .{ "CONV(0xFFFFFFFFFFFFFFFF, 10, -10)", "-1" },
+        .{ "CONV(0xFF, 37, 10)", null },
+        .{ "CONV(X'', 16, 10)", null },
+        .{ "BIN(X'')", null },
+        // A LARGEINT place count rounds as any integer does.
+        .{ "CAST(ROUND(1.2345, 0x02) AS CHAR)", "1.23" },
+    };
+    inline for (cases) |c| try expectRows(allocator, db, "SELECT " ++ c[0], &.{c[1]});
+
+    try exec(allocator, db, "CREATE TABLE hx (id INT PRIMARY KEY, v INT, s VARCHAR(10), b BIGINT, m DECIMAL(10,2), d DOUBLE)");
+    // `1 + 0` makes the rows expressions rather than literals.
+    try exec(allocator, db, "INSERT INTO hx VALUES (1 + 0, 0x3132, 0x3132, 0x7FFFFFFFFFFFFFFF, 0x41, 0x41), (2, 0x41, 0x41, 2, 1.5, 2.5)");
+    try exec(allocator, db, "INSERT INTO hx (id, s, v, b, m, d) SELECT 3, 0x3133, 0x3133, 0xFF, 0x42, 0x42");
+    try expectRows(allocator, db, "SELECT v FROM hx ORDER BY id", &.{ "12594", "65", "12595" });
+    try expectRows(allocator, db, "SELECT s FROM hx ORDER BY id", &.{ "12", "A", "13" });
+    try expectRows(allocator, db, "SELECT b FROM hx ORDER BY id", &.{ "9223372036854775807", "2", "255" });
+    try expectRows(allocator, db, "SELECT CAST(m AS CHAR) FROM hx ORDER BY id", &.{ "65.00", "1.50", "66.00" });
+    try expectRows(allocator, db, "SELECT d FROM hx ORDER BY id", &.{ "65", "2.5", "66" });
+    try exec(allocator, db, "UPDATE hx SET b = 0x43, d = 0x43 WHERE id = 2");
+    try expectRows(allocator, db, "SELECT b FROM hx WHERE id = 2", &.{"67"});
+    try expectRows(allocator, db, "SELECT d FROM hx WHERE id = 2", &.{"67"});
+
+    const filters = .{
+        .{ "0x41 IN (v, 1)", &[_][]const u8{"2"} },
+        .{ "0x41 IN (s)", &[_][]const u8{"2"} },
+        .{ "0x02 BETWEEN id AND 5", &[_][]const u8{ "1", "2" } },
+        .{ "0x02 NOT BETWEEN id AND 5", &[_][]const u8{"3"} },
+    };
+    inline for (filters) |f| {
+        const want: []const []const u8 = f[1];
+        var opt: [3]?[]const u8 = undefined;
+        for (want, 0..) |w, i| opt[i] = w;
+        try expectRows(allocator, db, "SELECT id FROM hx WHERE " ++ f[0] ++ " ORDER BY id", opt[0..want.len]);
+    }
+
+    // An aggregate that takes only numbers sums the integer; MIN and MAX
+    // keep the bytes.
+    try expectRows(allocator, db, "SELECT SUM(0x41) FROM hx", &.{"195"});
+    try expectRows(allocator, db, "SELECT CAST(AVG(0x41) AS CHAR) FROM hx", &.{"65"});
+    try expectRows(allocator, db, "SELECT SUM(0x41) FROM hx WHERE id > 10", &.{null});
+    try expectRows(allocator, db, "SELECT MAX(0x41) FROM hx", &.{"A"});
+    try expectMysqlRows(allocator, db, "SELECT SUM(0x7FFFFFFFFFFFFFFF) FROM hx WHERE id < 3", &.{"18446744073709551614"});
+
+    try exec(allocator, db, "CREATE TABLE hj (id INT, w INT)");
+    try exec(allocator, db, "INSERT INTO hj VALUES (1, 0), (2, 0)");
+    try exec(allocator, db, "UPDATE hx JOIN hj ON hx.id = hj.id SET hx.v = 0x3136, hx.s = 0x3137 WHERE hj.w = 0");
+    try expectRows(allocator, db, "SELECT v FROM hx ORDER BY id", &.{ "12598", "12598", "12595" });
+    try expectRows(allocator, db, "SELECT s FROM hx ORDER BY id", &.{ "17", "17", "13" });
+
+    try exec(allocator, db, "CREATE TABLE hd (id INT, v INT DEFAULT 0x3132, s VARCHAR(10) DEFAULT 0x3132, b BIGINT DEFAULT 0xFF)");
+    try exec(allocator, db, "INSERT INTO hd (id) VALUES (1)");
+    try expectRows(allocator, db, "SELECT v FROM hd", &.{"12594"});
+    try expectRows(allocator, db, "SELECT s FROM hd", &.{"12"});
+    try expectRows(allocator, db, "SELECT b FROM hd", &.{"255"});
 }

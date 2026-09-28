@@ -689,6 +689,7 @@ fn nAt(v: ColumnView, row: usize) i128 {
         .smallint => |s| s[row],
         .int => |s| s[row],
         .bigint => |s| s[row],
+        .largeint => |s| s[row],
         else => 0,
     };
 }

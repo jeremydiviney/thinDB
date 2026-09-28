@@ -326,9 +326,22 @@ pub fn hexNumber(bytes: []const u8) u64 {
     return n;
 }
 
+/// A hex literal's integer is BIGINT UNSIGNED in MySQL, held in a LARGEINT
+/// at any size, so arithmetic past 2^63 - 1 stays positive
+/// (`0x7FFFFFFFFFFFFFFF + 1`), as a bit operator's result does.
 pub fn hexLiteralNumber(bytes: []const u8) Value {
-    const n = hexNumber(bytes);
-    return if (n <= std.math.maxInt(i64)) .{ .bigint = @intCast(n) } else .{ .largeint = n };
+    return .{ .largeint = hexNumber(bytes) };
+}
+
+/// A hex literal stored in a column of type `ty`, as MySQL stores one: its
+/// integer in a numeric column (`0x3132` stores 12594 in an INT), its bytes
+/// in any other.
+pub fn hexStoredValue(bytes: []const u8, ty: Type) Value {
+    return if (storesHexAsNumber(ty)) hexLiteralNumber(bytes) else .{ .text = bytes };
+}
+
+pub fn storesHexAsNumber(ty: Type) bool {
+    return ty.isInteger() or ty.isFloat() or ty.isDecimal() or ty == .boolean;
 }
 
 /// A literal operand's value for a comparison leaf, or null when no Value
@@ -431,17 +444,26 @@ test "expr: deepClone produces an owned tree" {
     try std.testing.expect(cloned.call.fn_name.ptr != orig.call.fn_name.ptr);
 }
 
-test "expr: a hex literal reads as its big-endian unsigned integer, 0 past eight bytes" {
+test "expr: a hex literal reads as its big-endian BIGINT UNSIGNED, 0 past eight bytes" {
     const cases = .{
-        .{ "A", Value{ .bigint = 65 } },
-        .{ "12", Value{ .bigint = 12594 } },
-        .{ "", Value{ .bigint = 0 } },
-        .{ "\x01\x02\x03\x04\x05\x06\x07\x08", Value{ .bigint = 72623859790382856 } },
-        .{ "\x7f\xff\xff\xff\xff\xff\xff\xff", Value{ .bigint = std.math.maxInt(i64) } },
-        .{ "\xff\xff\xff\xff\xff\xff\xff\xff", Value{ .largeint = std.math.maxInt(u64) } },
-        .{ "ABCDEFGHI", Value{ .bigint = 0 } },
+        .{ "A", 65 },
+        .{ "12", 12594 },
+        .{ "", 0 },
+        .{ "\x01\x02\x03\x04\x05\x06\x07\x08", 72623859790382856 },
+        .{ "\x7f\xff\xff\xff\xff\xff\xff\xff", std.math.maxInt(i64) },
+        .{ "\xff\xff\xff\xff\xff\xff\xff\xff", std.math.maxInt(u64) },
+        .{ "ABCDEFGHI", 0 },
     };
-    inline for (cases) |c| try std.testing.expectEqual(c[1], hexLiteralNumber(c[0]));
+    inline for (cases) |c| try std.testing.expectEqual(Value{ .largeint = c[1] }, hexLiteralNumber(c[0]));
+
+    const stored = .{
+        .{ Type.int, Value{ .largeint = 12594 } },
+        .{ Type.double, Value{ .largeint = 12594 } },
+        .{ Type.boolean, Value{ .largeint = 12594 } },
+        .{ Type.string, Value{ .text = "12" } },
+        .{ Type.date, Value{ .text = "12" } },
+    };
+    inline for (stored) |c| try std.testing.expectEqualDeep(c[1], hexStoredValue("12", c[0]));
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -2273,7 +2273,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const func_byte = bytes[cursor.*];
                 cursor.* += 1;
-                if (func_byte > @intFromEnum(AggFunc.udf)) return Error.IrCorrupt;
+                if (func_byte >= @typeInfo(AggFunc).@"enum".fields.len) return Error.IrCorrupt;
                 const func: AggFunc = @enumFromInt(func_byte);
                 const udf_name = try readOptString(bytes, cursor);
                 if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;

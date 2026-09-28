@@ -1438,18 +1438,14 @@ fn joinGroupedInner(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []cons
     return alias;
 }
 
-/// An outer row that misses the join reads the aggregate over zero rows:
-/// 0 for the counts, NULL for everything else.
+/// An outer row that misses the join reads the aggregate over zero rows
+/// (`aggregate.emptyValue`): 0 for the counts, NULL for most others.
 fn missedJoinValue(ctx: *CompileCtx, func: ir.AggFunc, agg_col: []const u8) !ir.Expr {
-    return switch (func) {
-        .count, .count_if, .count_distinct => blk: {
-            const args = try ctx.nodeArena().alloc(ir.Expr, 2);
-            args[0] = .{ .col_ref = agg_col };
-            args[1] = .{ .lit = .{ .bigint = 0 } };
-            break :blk .{ .call = .{ .fn_name = "coalesce", .args = args } };
-        },
-        else => .{ .col_ref = agg_col },
-    };
+    const empty = exec.aggregate_op.emptyValue(func) orelse return .{ .col_ref = agg_col };
+    const args = try ctx.nodeArena().alloc(ir.Expr, 2);
+    args[0] = .{ .col_ref = agg_col };
+    args[1] = .{ .lit = empty };
+    return .{ .call = .{ .fn_name = "coalesce", .args = args } };
 }
 
 /// The expression of `SELECT <expr>` with no FROM, the form a comparison's

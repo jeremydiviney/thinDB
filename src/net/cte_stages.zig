@@ -1643,7 +1643,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             errdefer up.deinit();
             const t_op = exec.prof.nowTicks();
             defer exec.prof.addPhase("compile.op.group_by", @intCast(exec.prof.nowTicks() - t_op));
-            const aggs = try engine_v2.temporalAggNumbers(input, &up, g.aggs);
+            const aggs = try engine_v2.mysqlAggInputs(input, &up, g.aggs);
             // Probe-fused join below: aggregate the joined batches inside
             // the scan workers (partial per chunk, serial combine here)
             // instead of hashing the full join output on this thread.
