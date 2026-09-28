@@ -2982,21 +2982,24 @@ test "mysql wire: a bound parameter no DATE or DATETIME reads matches nothing" {
     }
 
     // Spelled in the statement, the constant fails it with MySQL's 1525.
-    try client.sendQuery("SELECT id FROM dt WHERE d = 'abc'");
-    {
+    for ([_][]const u8{ "SELECT id FROM dt WHERE d = 'abc'", "SELECT id, NULLIF(d, 'abc') FROM dt" }) |sql_text| {
+        try client.sendQuery(sql_text);
         const packet = try mysql_packet.readPacket(allocator, &client.reader.interface);
         defer allocator.free(packet.payload);
         try std.testing.expectEqual(@as(u8, 0xff), packet.payload[0]);
         try std.testing.expectEqual(@as(u16, 1525), std.mem.readInt(u16, packet.payload[1..3], .little));
     }
 
-    // Bound, it matches nothing: MySQL returns no rows for such a parameter.
+    // Bound, it matches nothing: MySQL returns no rows for such a parameter,
+    // and NULLIF returns its first argument.
     const statements = [_][]const u8{
         "SELECT id FROM dt WHERE d = ?",
         "SELECT id FROM dt WHERE d <> ?",
         "SELECT id FROM dt WHERE ts >= ?",
         "SELECT id FROM dt WHERE ts < ? AND id > 0",
         "SELECT id FROM dt WHERE d BETWEEN ? AND '2026-12-31'",
+        "SELECT id FROM dt WHERE NULLIF(d, ?) IS NULL",
+        "SELECT id FROM dt WHERE NULLIF(ts, ?) IS NULL",
     };
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

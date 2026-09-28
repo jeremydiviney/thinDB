@@ -2180,6 +2180,11 @@ fn buildCallPlan(
         }
         built += 1;
     }
+    if (try nullifTextPlaced(aa, c, arg_plans, arg_types)) |rewritten| {
+        for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
+        built = 0;
+        return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
+    }
     // Retyping a literal never changes whether the call is integer arithmetic,
     // so later literals still see the right decision.
     for (arg_plans, arg_types) |ap, *at| {
@@ -2281,6 +2286,28 @@ fn hexNumbersRead(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: E
         args = out;
     }
     return if (args) |a| Expr{ .call = .{ .fn_name = c.fn_name, .args = a } } else null;
+}
+
+/// NULLIF(a, b) is NULL where `a = b`, so a text constant meeting a DATE or
+/// DATETIME argument reads as that comparison reads it
+/// (`predicate.placeComparedText`): the call compares the value it names, or,
+/// when no value of the type equals it, NULL, which never matches, so the
+/// call returns `a`. Null when no argument is such a constant.
+fn nullifTextPlaced(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
+    if (!std.ascii.eqlIgnoreCase(c.fn_name, "nullif") or c.args.len != 2) return null;
+    for (arg_plans, 0..) |ap, i| {
+        if (ap != .lit or ap.lit.value != .text) continue;
+        const other = arg_types[1 - i];
+        if (other != .date and other != .datetime) continue;
+        const args = try aa.dupe(Expr, c.args);
+        if (try predicate_mod.placeComparedText(ap.lit.value.text, other, c.from_statement)) |v| {
+            args[i] = .{ .lit = v };
+        } else {
+            args[1] = .{ .null_lit = arg_types[0] };
+        }
+        return Expr{ .call = .{ .fn_name = c.fn_name, .args = args, .from_statement = c.from_statement } };
+    }
+    return null;
 }
 
 /// A call no overload accepts as written, with its arguments converted so

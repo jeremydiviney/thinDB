@@ -605,10 +605,8 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                         const leaf = p.*;
                         expr.* = .{ .text_as_number = leaf };
                     },
-                    .not_temporal => if (p.from_statement) {
-                        recordInvalidTemporal(col_type, p.val.text);
-                        return Error.InvalidTemporalLiteral;
-                    } else {
+                    .not_temporal => {
+                        try rejectUnreadTemporal(col_type, p.val.text, p.from_statement);
                         expr.* = .unknown;
                     },
                     .incomparable => return Error.PredicateTypeMismatch,
@@ -785,6 +783,29 @@ fn recordInvalidTemporal(col_type: types.Type, text: []const u8) void {
     const type_name = if (col_type == .date) "DATE" else "DATETIME";
     const message = std.fmt.bufPrint(&invalid_temporal_message_buf, "Incorrect {s} value: '{s}'", .{ type_name, value }) catch unreachable;
     invalid_temporal_message_len = message.len;
+}
+
+/// Text no date reads, compared with a DATE or DATETIME: a constant the
+/// statement spells fails it, as MySQL raises `Incorrect DATE value`; any
+/// other value never matches.
+fn rejectUnreadTemporal(col_type: types.Type, text: []const u8, from_statement: bool) Error!void {
+    if (!from_statement) return;
+    recordInvalidTemporal(col_type, text);
+    return Error.InvalidTemporalLiteral;
+}
+
+/// Text a comparison outside a `.leaf` holds against a value of `col_type`
+/// (NULLIF's), placed as `validateExpr` places a leaf's: the value it names,
+/// or null when no value of the type equals it.
+pub fn placeComparedText(text: []const u8, col_type: types.Type, from_statement: bool) Error!?Value {
+    return switch (placeLiteral(.{ .text = text }, col_type)) {
+        .exact => |v| v,
+        .not_temporal => {
+            try rejectUnreadTemporal(col_type, text, from_statement);
+            return null;
+        },
+        .between, .beyond, .null_text, .parse_rows, .incomparable => null,
+    };
 }
 
 /// The message for this thread's last `InvalidTemporalLiteral` (MySQL's

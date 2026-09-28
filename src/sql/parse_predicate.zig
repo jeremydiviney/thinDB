@@ -218,7 +218,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         _ = try p.parseScalar();
         return .unknown;
     }
-    if (isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus or p.cur.tag == .tilde) {
+    if (p.cur.tag == .tilde or try literalLedAhead(p)) {
         return try parseScalarLhs(p);
     }
     // `@var op X` — a session var on the LHS (constant guard, e.g.
@@ -633,8 +633,9 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         }
         var values: std.ArrayList(Value) = .empty;
         defer values.deinit(p.arena);
-        // Entries no Value holds exactly compare as the decimals they are, and
-        // a hex literal as the column reads it (`hexComparand`).
+        // Entries no Value holds exactly compare as the decimals they are, a
+        // hex literal as the column reads it (`hexComparand`), and an entry
+        // no literal leads (`1 IN (a, b)`) as a comparison with that value.
         var expr_entries: std.ArrayList(PredicateExpr) = .empty;
         defer expr_entries.deinit(p.arena);
         var saw_value = false;
@@ -645,7 +646,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
             if (p.cur.tag == .kw_null) {
                 try p.advance();
                 saw_value = true;
-            } else if (p.cur.isHexLiteral() or try inexactFractionAhead(p)) {
+            } else if (p.cur.isHexLiteral() or try inexactFractionAhead(p) or !try literalLedAhead(p)) {
                 try expr_entries.append(p.arena, try makeComparisonExprPredicate(p, col_dup, .eq, try p.parseScalar()));
                 saw_value = true;
             } else {
@@ -1153,6 +1154,19 @@ fn isTypedLiteralKeyword(s: []const u8) bool {
     return std.ascii.eqlIgnoreCase(s, "date") or
         std.ascii.eqlIgnoreCase(s, "datetime") or
         std.ascii.eqlIgnoreCase(s, "timestamp");
+}
+
+/// A typed temporal literal (`DATE '...'`, `TIMESTAMP '...'`) at the cursor,
+/// rather than a column that shares the keyword's name.
+fn typedLiteralAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    if (p.cur.tag != .identifier or !isTypedLiteralKeyword(p.cur.text)) return false;
+    var look = p.lex.*;
+    return (try look.next()).tag == .string;
+}
+
+/// A literal, signed or typed, starts at the cursor.
+fn literalLedAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    return isLiteralLhsTokenStart(p.cur.tag) or p.cur.tag == .minus or p.cur.tag == .plus or try typedLiteralAhead(p);
 }
 
 fn isLiteralLhsTokenStart(tag: anytype) bool {

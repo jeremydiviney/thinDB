@@ -585,3 +585,53 @@ test "an aggregate or window alias leaves the FROM column it names to the rest o
     };
     inline for (cases) |case| try expectNamedCells(allocator, db, case[0], case[1], case[2]);
 }
+
+test "a GROUP BY name reads the FROM column before a select alias that shares it (issue #328)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setupShadowed(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT n % 2 AS n, COUNT(*) AS c FROM dn GROUP BY n ORDER BY 1, 2", &[_][]const u8{ "n", "c" }, &[_]?i64{ 0, 1, 1, 1, 1, 1 } },
+        // HAVING reads the grouped column; a bare ORDER BY name reads the alias.
+        .{ "SELECT n % 2 AS n, SUM(m) AS s FROM dn GROUP BY n HAVING n > 5 ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 0, 8, 1, 9 } },
+        .{ "SELECT n - 5 AS n, COUNT(*) AS c FROM dn GROUP BY n HAVING n < 7 ORDER BY 1", &[_][]const u8{ "n", "c" }, &[_]?i64{ 0, 1, 1, 1 } },
+        .{ "SELECT n % 2 AS n, m FROM dn GROUP BY n, m ORDER BY n, m", &[_][]const u8{ "n", "m" }, &[_]?i64{ 0, 8, 1, 7, 1, 9 } },
+        .{ "SELECT SUM(m) AS n, COUNT(*) AS c FROM dn GROUP BY n ORDER BY 1", &[_][]const u8{ "n", "c" }, &[_]?i64{ 7, 1, 8, 1, 9, 1 } },
+        // A name no FROM column has, an ordinal and an expression reach the item.
+        .{ "SELECT n % 2 AS k, COUNT(*) AS c FROM dn GROUP BY k ORDER BY 1", &[_][]const u8{ "k", "c" }, &[_]?i64{ 0, 1, 1, 2 } },
+        .{ "SELECT n % 2 AS n, COUNT(*) AS c FROM dn GROUP BY 1 ORDER BY 1", &[_][]const u8{ "n", "c" }, &[_]?i64{ 0, 1, 1, 2 } },
+        .{ "SELECT n % 2 AS n, COUNT(*) AS c FROM dn GROUP BY n % 2 ORDER BY 1", &[_][]const u8{ "n", "c" }, &[_]?i64{ 0, 1, 1, 2 } },
+        .{ "SELECT DISTINCT n % 2 AS n FROM dn ORDER BY 1", &[_][]const u8{"n"}, &[_]?i64{ 0, 1 } },
+        .{ "SELECT n * 10 AS n, SUM(m) AS s FROM dn GROUP BY n WITH ROLLUP ORDER BY 2", &[_][]const u8{ "n", "s" }, &[_]?i64{ 50, 7, 60, 8, 70, 9, null, 24 } },
+        .{ "SELECT n % 2 AS n, GROUPING(n) AS g, COUNT(*) AS c FROM dn GROUP BY n WITH ROLLUP ORDER BY 2, 1", &[_][]const u8{ "n", "g", "c" }, &[_]?i64{ 0, 0, 1, 1, 0, 1, 1, 0, 1, null, 1, 3 } },
+        .{ "SELECT n % 2 AS n, COUNT(*) AS c FROM (SELECT n FROM dn) t GROUP BY n ORDER BY 1, 2", &[_][]const u8{ "n", "c" }, &[_]?i64{ 0, 1, 1, 1, 1, 1 } },
+        .{ "SELECT a.m % 2 AS m, COUNT(*) AS c FROM dn a JOIN dk b ON a.n = b.k GROUP BY m ORDER BY 1, 2", &[_][]const u8{ "m", "c" }, &[_]?i64{ 0, 1, 1, 1, 1, 1 } },
+    };
+    inline for (cases) |case| try expectNamedCells(allocator, db, case[0], case[1], case[2]);
+
+    // The column the GROUP BY names leaves another column's alias ungrouped,
+    // as MySQL's ONLY_FULL_GROUP_BY rejects it.
+    try std.testing.expectError(error.SqlMixedAggAndPlainProjection, helpers.runSqlCtx(allocator, db, "SELECT n AS m, COUNT(*) FROM dn GROUP BY m"));
+}
+
+test "SELECT * skips the hidden ORDER BY keys and WHERE operands beside a computed item (issue #330)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setupShadowed(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT *, n * 2 AS z FROM dn ORDER BY m + 0", &[_][]const u8{ "n", "m", "z" }, &[_]?i64{ 5, 7, 10, 6, 8, 12, 7, 9, 14 } },
+        .{ "SELECT *, SUM(n) OVER () AS z FROM dn ORDER BY m + 0", &[_][]const u8{ "n", "m", "z" }, &[_]?i64{ 5, 7, 18, 6, 8, 18, 7, 9, 18 } },
+        .{ "SELECT *, n * 2 AS z FROM (SELECT * FROM dn) d ORDER BY m + 0", &[_][]const u8{ "n", "m", "z" }, &[_]?i64{ 5, 7, 10, 6, 8, 12, 7, 9, 14 } },
+        .{ "SELECT *, n * 2 AS z FROM (SELECT * FROM dn) d WHERE m + 1 > 3 ORDER BY m", &[_][]const u8{ "n", "m", "z" }, &[_]?i64{ 5, 7, 10, 6, 8, 12, 7, 9, 14 } },
+        .{ "SELECT *, ROW_NUMBER() OVER (ORDER BY m) AS rn FROM dn WHERE m + 1 > 3 ORDER BY m * 2 DESC", &[_][]const u8{ "n", "m", "rn" }, &[_]?i64{ 7, 9, 3, 6, 8, 2, 5, 7, 1 } },
+        .{ "SELECT d.*, n * 2 AS z FROM dn d ORDER BY m + 0", &[_][]const u8{ "n", "m", "z" }, &[_]?i64{ 5, 7, 10, 6, 8, 12, 7, 9, 14 } },
+        .{ "WITH c AS (SELECT *, n + 1 AS k FROM dn) SELECT *, k * 2 AS z FROM c WHERE m + 1 > 3 ORDER BY m + 0", &[_][]const u8{ "n", "m", "k", "z" }, &[_]?i64{ 5, 7, 6, 12, 6, 8, 7, 14, 7, 9, 8, 16 } },
+    };
+    inline for (cases) |case| try expectNamedCells(allocator, db, case[0], case[1], case[2]);
+}
