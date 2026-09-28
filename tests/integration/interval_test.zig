@@ -456,3 +456,44 @@ test "INTERVAL: a fractional amount rounds to whole units before the unit's fact
         try std.testing.expectEqualSlices(i32, want, got);
     }
 }
+
+test "INTERVAL: an interval may lead a sum, but not a difference (issue #322)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE dt (id BIGINT PRIMARY KEY, ts DATETIME, d DATE)");
+    try exec(allocator, db, "INSERT INTO dt VALUES (1, '2024-01-31 10:30:00', '2024-01-31'), (2, '2024-02-29 23:59:59', '2024-02-29')");
+
+    const text_cases = .{
+        .{ "INTERVAL 1 DAY + d", .{ "2024-02-01", "2024-03-01" } },
+        .{ "INTERVAL 1 MONTH + ts", .{ "2024-02-29 10:30:00", "2024-03-29 23:59:59" } },
+        .{ "INTERVAL 30 MINUTE + d", .{ "2024-01-31 00:30:00", "2024-02-29 00:30:00" } },
+        .{ "INTERVAL 1 DAY + d + INTERVAL 1 HOUR", .{ "2024-02-01 01:00:00", "2024-03-01 01:00:00" } },
+        .{ "INTERVAL 1 DAY + DATE '2024-01-02'", .{ "2024-01-03", "2024-01-03" } },
+    };
+    inline for (text_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM dt ORDER BY id");
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 2), got.len);
+        try std.testing.expectEqualStrings(c[1][0], got[0].?);
+        try std.testing.expectEqualStrings(c[1][1], got[1].?);
+    }
+
+    const dates = try collectDates(allocator, db, "SELECT INTERVAL 1 DAY + DATE '2024-01-02'");
+    defer allocator.free(dates);
+    const moved = try collectDates(allocator, db, "SELECT DATE '2024-01-02' + INTERVAL 1 DAY");
+    defer allocator.free(moved);
+    try std.testing.expectEqualSlices(i32, moved, dates);
+
+    const ids = try helpers.collectBigints(allocator, db, "SELECT id FROM dt WHERE INTERVAL 1 DAY + d = '2024-03-01'");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{2}, ids);
+
+    try helpers.expectRunError(allocator, db, "SELECT INTERVAL 1 DAY - d FROM dt", error.SqlExpectedToken);
+    const interval_fn = try helpers.collectBigints(allocator, db, "SELECT INTERVAL(5, 1, 10)");
+    defer allocator.free(interval_fn);
+    try std.testing.expectEqualSlices(i64, &.{1}, interval_fn);
+}

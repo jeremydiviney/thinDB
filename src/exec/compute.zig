@@ -152,6 +152,10 @@ const CallPlan = struct {
     arg_runtime_types: []const Type,
     arg_casts: ?[]const ?CastKernel,
     cast_buffers: ?[]?ColumnStore,
+    /// Each argument's column for the batch being evaluated, sized to the
+    /// call's arity at plan time so a variadic call takes any number of
+    /// arguments without allocating per batch.
+    arg_views: []ColumnView,
     /// Where this call writes its result. Aliased to a parent slot
     /// (derived_cols[i] at the root) OR owned scratch (internal nodes).
     /// `output_owned = true` means Compute.deinit will free it.
@@ -267,7 +271,10 @@ const CaseOperand = struct {
     first_branch: usize,
 };
 
-const MAX_CASE_BRANCHES: usize = 16;
+/// Which THEN or ELSE source a row takes (`evalCase`). The value one past
+/// the last branch marks the ELSE, or a row no branch matched.
+const CaseWinner = u16;
+const MAX_CASE_BRANCHES: usize = std.math.maxInt(CaseWinner);
 
 /// One CASE branch's THEN (or the ELSE) value for the current batch. A
 /// scalar source holds a single row that every row it wins reads.
@@ -960,9 +967,7 @@ pub const Compute = struct {
         // 1. Evaluate and coerce each arg (post-order). An argument that
         // fails over the whole batch, of a call that reads it on only some
         // rows (`ArgReach`), runs again over just those rows.
-        var arg_views_buf: [16]ColumnView = undefined;
-        if (plan.args.len > arg_views_buf.len) return Error.ComputeTooManyArgs;
-        const arg_views = arg_views_buf[0..plan.args.len];
+        const arg_views = plan.arg_views;
         var reached: std.ArrayList(ColumnStore) = .empty;
         defer {
             for (reached.items) |*s| s.deinit(self.allocator);
@@ -1032,9 +1037,9 @@ pub const Compute = struct {
         // winners[i] indexes the THEN/ELSE sources: the first branch whose
         // condition holds, else the ELSE slot; with no ELSE,
         // `branches.len` marks an unmatched (NULL) row.
-        const winners = try self.allocator.alloc(u8, n);
+        const winners = try self.allocator.alloc(CaseWinner, n);
         defer self.allocator.free(winners);
-        @memset(winners, @as(u8, @intCast(plan.branches.len)));
+        @memset(winners, @as(CaseWinner, @intCast(plan.branches.len)));
         const cond_buf = try self.allocator.alloc(bool, n);
         defer self.allocator.free(cond_buf);
         const open = try self.allocator.alloc(bool, n);
@@ -1074,7 +1079,8 @@ pub const Compute = struct {
             }
         }
 
-        var srcs_buf: [MAX_CASE_BRANCHES + 1]CaseSrc = undefined;
+        const srcs_buf = try self.allocator.alloc(CaseSrc, plan.branches.len + 1);
+        defer self.allocator.free(srcs_buf);
         for (plan.branches, 0..) |br, bi| {
             srcs_buf[bi] = try self.reachedCaseSrc(plan, br.then_src, br.cast_kernel, br.cast_buf, in_values, winners, bi, &reached);
         }
@@ -1102,7 +1108,7 @@ pub const Compute = struct {
         cast_kernel: ?CastKernel,
         cast_buf: ?*ColumnStore,
         in_values: []const ColumnView,
-        winners: []const u8,
+        winners: []const CaseWinner,
         slot: usize,
         reached: *std.ArrayList(ColumnStore),
     ) anyerror!CaseSrc {
@@ -2266,6 +2272,7 @@ fn buildCallPlan(
         .arg_runtime_types = arg_types,
         .arg_casts = rr.arg_casts,
         .cast_buffers = cast_buffers,
+        .arg_views = try aa.alloc(ColumnView, arg_plans.len),
         .output = output_buf,
         .output_owned = true,
         .output_type = func.return_type,
@@ -2937,12 +2944,14 @@ fn assembleCaseFixed(
     comptime tag: types.TypeTag,
     out: *ColumnStore,
     srcs: []const CaseSrc,
-    winners: []const u8,
+    winners: []const CaseWinner,
 ) !void {
     const T = std.meta.Child(@TypeOf(list.items));
     try list.resize(allocator, winners.len);
-    var ptrs: [MAX_CASE_BRANCHES + 2][*]const T = undefined;
-    var strides: [MAX_CASE_BRANCHES + 2]usize = undefined;
+    const ptrs = try allocator.alloc([*]const T, srcs.len + 1);
+    defer allocator.free(ptrs);
+    const strides = try allocator.alloc(usize, srcs.len + 1);
+    defer allocator.free(strides);
     for (srcs, 0..) |s, k| {
         ptrs[k] = @field(s.view.data, @tagName(tag)).ptr;
         strides[k] = @intFromBool(!s.scalar);
@@ -2961,9 +2970,9 @@ fn assembleCaseStrings(
     ss: *store.StringStore,
     out: *ColumnStore,
     srcs: []const CaseSrc,
-    winners: []const u8,
+    winners: []const CaseWinner,
 ) !void {
-    const unmatched: u8 = @intCast(srcs.len);
+    const unmatched: CaseWinner = @intCast(srcs.len);
     for (winners, 0..) |w, i| {
         if (w == unmatched) {
             try ss.appendValue(allocator, "");
@@ -2980,11 +2989,11 @@ fn assembleCaseStrings(
 /// Validity of an assembled fixed-width CASE column: a row is NULL when it
 /// matched no branch of an ELSE-less CASE or its winning source is NULL
 /// there. Outputs proven non-null at plan time carry no bitmap.
-fn setCaseValidity(allocator: Allocator, out: *ColumnStore, srcs: []const CaseSrc, winners: []const u8) !void {
+fn setCaseValidity(allocator: Allocator, out: *ColumnStore, srcs: []const CaseSrc, winners: []const CaseWinner) !void {
     const bits: *std.ArrayList(u8) = if (out.nulls) |*b| b else return;
     try bits.resize(allocator, (winners.len + 7) >> 3);
     @memset(bits.items, 0);
-    const unmatched: u8 = @intCast(srcs.len);
+    const unmatched: CaseWinner = @intCast(srcs.len);
     for (winners, 0..) |w, i| {
         if (w == unmatched) continue;
         if (!srcs[w].view.isValid(srcs[w].row(i))) continue;

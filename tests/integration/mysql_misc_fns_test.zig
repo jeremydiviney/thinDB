@@ -828,6 +828,51 @@ test "MySQL misc functions: information functions read the session" {
     try expectFailure(allocator, db, "SELECT USER()");
 }
 
+test "MySQL misc functions: a variadic call takes any number of arguments (issue #322)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, s VARCHAR(10))");
+    try helpers.exec(allocator, db, "INSERT INTO t VALUES (1, 'a'), (2, NULL)");
+
+    const letters = "abcdefghijklmnopqrstuvw";
+    var args: std.ArrayList(u8) = .empty;
+    defer args.deinit(allocator);
+    for (letters, 0..) |ch, i| {
+        if (i > 0) try args.appendSlice(allocator, ", ");
+        try args.print(allocator, "'{c}'", .{ch});
+    }
+    var nulls: std.ArrayList(u8) = .empty;
+    defer nulls.deinit(allocator);
+    for (0..40) |_| try nulls.appendSlice(allocator, "NULL, ");
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+
+    sql.clearRetainingCapacity();
+    try sql.print(allocator, "SELECT CONCAT({s})", .{args.items});
+    try expectCells(allocator, db, sql.items, 0, &.{letters});
+    sql.clearRetainingCapacity();
+    try sql.print(allocator, "SELECT CONCAT_WS('', {s}, {s})", .{ args.items, args.items });
+    try expectCells(allocator, db, sql.items, 0, &.{letters ++ letters});
+    sql.clearRetainingCapacity();
+    try sql.print(allocator, "SELECT ELT(23, {s})", .{args.items});
+    try expectCells(allocator, db, sql.items, 0, &.{"w"});
+    sql.clearRetainingCapacity();
+    try sql.print(allocator, "SELECT FIELD('w', {s})", .{args.items});
+    try expectCells(allocator, db, sql.items, 0, &.{"23"});
+    sql.clearRetainingCapacity();
+    try sql.print(allocator, "SELECT COALESCE({s}'x')", .{nulls.items});
+    try expectCells(allocator, db, sql.items, 0, &.{"x"});
+    sql.clearRetainingCapacity();
+    try sql.print(allocator, "SELECT COALESCE({s}s, 'none') FROM t ORDER BY id", .{nulls.items});
+    try expectCells(allocator, db, sql.items, 0, &.{ "a", "none" });
+    sql.clearRetainingCapacity();
+    try sql.print(allocator, "SELECT CONCAT(s, {s}) FROM t ORDER BY id", .{args.items});
+    try expectCells(allocator, db, sql.items, 0, &.{ "a" ++ letters, null });
+}
+
 test "MySQL misc functions: LIKE reads a number, boolean or date column as its text" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
