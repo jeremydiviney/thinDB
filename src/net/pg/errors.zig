@@ -48,6 +48,7 @@ pub fn mapInternal(err: anyerror) Mapped {
         .numeric_out_of_range => .{ .sqlstate = "22003".*, .message = "numeric value out of range" },
         .value_out_of_range => .{ .sqlstate = "22003".*, .message = "value out of range for column type" },
         .subquery_multiple_rows => .{ .sqlstate = "21000".*, .message = "more than one row returned by a subquery used as an expression" },
+        .recursion_depth_exceeded => .{ .sqlstate = "54000".*, .message = "recursive query aborted after 1001 iterations" },
         .invalid_temporal_literal => .{ .sqlstate = "22007".*, .message = predicate.takeInvalidTemporalMessage() orelse "invalid input syntax for type date or timestamp" },
         .unknown => .{ .sqlstate = "42000".*, .message = name },
     };
@@ -62,13 +63,34 @@ pub fn sendErrorResponse(
     sqlstate: [5]u8,
     message: []const u8,
 ) !void {
+    return sendResponse(allocator, w, "ERROR", sqlstate, message);
+}
+
+/// An ErrorResponse with severity FATAL: the server closes the connection
+/// after it, with no ReadyForQuery.
+pub fn sendFatalResponse(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    sqlstate: [5]u8,
+    message: []const u8,
+) !void {
+    return sendResponse(allocator, w, "FATAL", sqlstate, message);
+}
+
+fn sendResponse(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    severity: []const u8,
+    sqlstate: [5]u8,
+    message: []const u8,
+) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
 
     try payload.append(allocator, 'S');
-    try packet.appendCString(allocator, &payload, "ERROR");
+    try packet.appendCString(allocator, &payload, severity);
     try payload.append(allocator, 'V');
-    try packet.appendCString(allocator, &payload, "ERROR");
+    try packet.appendCString(allocator, &payload, severity);
     try payload.append(allocator, 'C');
     try packet.appendCString(allocator, &payload, &sqlstate);
     try payload.append(allocator, 'M');

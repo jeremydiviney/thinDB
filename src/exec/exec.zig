@@ -102,6 +102,9 @@ pub const Error = error{
     ValueOutOfRange,
     /// A scalar subquery returned more than one row for a row that reads it.
     SubqueryMultipleRows,
+    /// A recursive CTE still produced rows after 1000 iterations (MySQL's
+    /// default cte_max_recursion_depth).
+    RecursiveCteDepthExceeded,
     /// Compute operator: no derived columns provided.
     ComputeNoColumns,
     /// Table-valued UDF contract violations: call-site PARTITION BY vs

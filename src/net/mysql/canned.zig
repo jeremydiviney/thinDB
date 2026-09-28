@@ -27,13 +27,11 @@ pub const Outcome = union(enum) {
     empty_variables,
     /// Reply with an empty Workbench/driver metadata result set.
     empty_result: EmptyResultKind,
-    /// `KILL [QUERY|CONNECTION] <id>` — wire layer looks up the
-    /// target in the connection registry, sets its cancel flag, and
-    /// replies OK (or ERR 1094 if no such id). We don't distinguish
-    /// KILL QUERY vs KILL CONNECTION yet; both abort the current
-    /// query at the next batch boundary and leave the connection
-    /// open.
-    kill: u32,
+    /// `KILL [QUERY|CONNECTION] <id>` — the wire layer interrupts the
+    /// target's statement and, unless `connection` is false (KILL
+    /// QUERY), closes the target connection too. A bare KILL kills the
+    /// connection, as in MySQL.
+    kill: struct { id: u32, connection: bool },
     /// `SHOW [FULL] PROCESSLIST` — the wire layer lists every registered
     /// connection. `full` keeps the whole statement text instead of its
     /// first 100 bytes.
@@ -109,18 +107,18 @@ pub fn match(
 
     if (std.mem.eql(u8, lc, "reset connection")) return Outcome{ .reset_connection = {} };
 
-    // KILL [QUERY|CONNECTION] <id> — strip the optional verb, then
-    // parse the trailing integer.
     if (std.mem.startsWith(u8, lc, "kill ")) {
         var rest: []const u8 = lc[5..];
+        var connection = true;
         if (std.mem.startsWith(u8, rest, "query ")) {
             rest = rest[6..];
+            connection = false;
         } else if (std.mem.startsWith(u8, rest, "connection ")) {
             rest = rest[11..];
         }
         rest = std.mem.trim(u8, rest, " \t\r\n");
         const id = std.fmt.parseInt(u32, rest, 10) catch return null;
-        return Outcome{ .kill = id };
+        return Outcome{ .kill = .{ .id = id, .connection = connection } };
     }
 
     // `SELECT 1` deliberately NOT canned: the engine's FROM-less SELECT
@@ -269,6 +267,19 @@ test "canned matches version comment with limit" {
     switch (m.?) {
         .single_value => |sv| try std.testing.expectEqualStrings("thinDB", sv.val),
         else => return error.TestUnexpectedResult,
+    }
+}
+
+test "canned KILL keeps its verb, a bare KILL killing the connection" {
+    const cases = .{
+        .{ .sql = "KILL 7", .id = 7, .connection = true },
+        .{ .sql = "KILL CONNECTION 8", .id = 8, .connection = true },
+        .{ .sql = "kill query 9;", .id = 9, .connection = false },
+    };
+    inline for (cases) |c| {
+        const m = (try match(std.testing.allocator, c.sql, "")).?;
+        try std.testing.expectEqual(@as(u32, c.id), m.kill.id);
+        try std.testing.expectEqual(c.connection, m.kill.connection);
     }
 }
 

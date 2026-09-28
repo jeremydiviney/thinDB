@@ -960,7 +960,7 @@ pub const SessionTables = struct {
     ) Allocator.Error!?[]const []const u8 {
         const self: *const SessionTables = @ptrCast(@alignCast(context));
         const ref: ir.TableRef = .{ .database = database, .schema = schema, .name = name };
-        if (pgcat.match(ref) != null) return null;
+        if (pgcat.match(ref, self.session.dialect) != null) return null;
         const table = resolveTable(self.catalog, self.session, ref) catch return null;
         const names = try arena.alloc([]const u8, table.schema.columns.len);
         for (table.schema.columns, names) |col, *column_name| column_name.* = try arena.dupe(u8, col.name);
@@ -1524,30 +1524,28 @@ pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
     return try compileOp(ctx, op);
 }
 
-/// True when any scan in the plan resolves to a pg_catalog virtual table
-/// (PG/neutral dialects only — MySQL has no such schema, mirroring the
-/// compileOp gate). Such plans compile as generic staged blocks over the
-/// PgCatalogSource batches (cte_stages).
+/// True when any scan in the plan resolves to a virtual catalog relation
+/// (`pgcat.match`, which knows what each dialect sees). Such plans compile
+/// as generic staged blocks over the PgCatalogSource batches (cte_stages).
 fn referencesPgCatalog(op: *const ir.Op, session: Session) bool {
-    if (session.dialect == .mysql) return false;
-    return scanMatchesPgCatalog(op);
+    return scanMatchesPgCatalog(op, session.dialect);
 }
 
-fn scanMatchesPgCatalog(op: *const ir.Op) bool {
+fn scanMatchesPgCatalog(op: *const ir.Op, dialect: thindb_api.Dialect) bool {
     return switch (op.*) {
-        .scan => |s| pgcat.match(s.table) != null,
-        .select => |p| scanMatchesPgCatalog(p.upstream),
-        .exclude => |p| scanMatchesPgCatalog(p.upstream),
-        .filter => |f| scanMatchesPgCatalog(f.upstream),
-        .order_by => |o| scanMatchesPgCatalog(o.upstream),
-        .group_by => |g| scanMatchesPgCatalog(g.upstream),
-        .compute => |c| scanMatchesPgCatalog(c.upstream),
-        .alias => |a| scanMatchesPgCatalog(a.upstream),
-        .limit => |l| scanMatchesPgCatalog(l.upstream),
-        .window => |w| scanMatchesPgCatalog(w.upstream),
-        .materialize => |m| scanMatchesPgCatalog(m.upstream),
-        .join => |j| scanMatchesPgCatalog(j.left) or scanMatchesPgCatalog(j.right),
-        .set_union => |u| scanMatchesPgCatalog(u.left) or scanMatchesPgCatalog(u.right),
+        .scan => |s| pgcat.match(s.table, dialect) != null,
+        .select => |p| scanMatchesPgCatalog(p.upstream, dialect),
+        .exclude => |p| scanMatchesPgCatalog(p.upstream, dialect),
+        .filter => |f| scanMatchesPgCatalog(f.upstream, dialect),
+        .order_by => |o| scanMatchesPgCatalog(o.upstream, dialect),
+        .group_by => |g| scanMatchesPgCatalog(g.upstream, dialect),
+        .compute => |c| scanMatchesPgCatalog(c.upstream, dialect),
+        .alias => |a| scanMatchesPgCatalog(a.upstream, dialect),
+        .limit => |l| scanMatchesPgCatalog(l.upstream, dialect),
+        .window => |w| scanMatchesPgCatalog(w.upstream, dialect),
+        .materialize => |m| scanMatchesPgCatalog(m.upstream, dialect),
+        .join => |j| scanMatchesPgCatalog(j.left, dialect) or scanMatchesPgCatalog(j.right, dialect),
+        .set_union => |u| scanMatchesPgCatalog(u.left, dialect) or scanMatchesPgCatalog(u.right, dialect),
         else => false,
     };
 }

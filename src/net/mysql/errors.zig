@@ -28,6 +28,7 @@ pub fn mapInternal(err: anyerror, fallback_msg: ?[]const u8) Mapped {
         .numeric_out_of_range => .{ .code = 1690, .sqlstate = "22003".*, .message = "Numeric value out of range" },
         .value_out_of_range => .{ .code = 1264, .sqlstate = "22003".*, .message = "Out of range value for column" },
         .subquery_multiple_rows => .{ .code = 1242, .sqlstate = "21000".*, .message = "Subquery returns more than 1 row" },
+        .recursion_depth_exceeded => .{ .code = 3636, .sqlstate = "HY000".*, .message = "Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value." },
         .invalid_temporal_literal => .{ .code = 1525, .sqlstate = "HY000".*, .message = predicate.takeInvalidTemporalMessage() orelse "Incorrect DATE or DATETIME value" },
         .unknown => .{ .code = 1064, .sqlstate = "42000".*, .message = fallback_msg orelse @errorName(err) },
     };

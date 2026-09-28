@@ -116,6 +116,33 @@ pub const ParseError = error{
     /// SQL-level PREPARE / EXECUTE / DEALLOCATE PREPARE. Prepared
     /// statements go through the binary protocol (COM_STMT_PREPARE).
     SqlPrepareExecuteUnsupported,
+    /// A recursive CTE body that isn't a UNION of anchor and recursive
+    /// arms (MySQL 3573).
+    SqlRecursiveCteNoUnion,
+    /// A recursive CTE whose first arm, or an arm after a recursive one,
+    /// references the CTE (MySQL 3574).
+    SqlRecursiveCteAnchorFirst,
+    /// A recursive arm referencing the CTE more than once, or inside a
+    /// subquery or derived table (MySQL 3577).
+    SqlRecursiveCteReference,
+    /// Aggregation, GROUP BY or a window function in a recursive arm
+    /// (MySQL 3575).
+    SqlRecursiveCteAggregate,
+    /// SELECT DISTINCT in a recursive arm (MySQL 1235).
+    SqlRecursiveCteDistinct,
+    /// ORDER BY in a recursive arm or over the recursive CTE's UNION
+    /// (MySQL 1235).
+    SqlRecursiveCteOrderBy,
+    /// LIMIT inside a recursive arm (MySQL 1235).
+    SqlRecursiveCteLimit,
+    /// The recursive reference on the NULL-extended side of an outer join
+    /// (MySQL 3576).
+    SqlRecursiveCteOuterJoin,
+    /// A recursive reference inside an INTERSECT or EXCEPT operand.
+    SqlRecursiveCteSetOp,
+    /// A recursive CTE without a column list whose first arm's column names
+    /// aren't known at parse time (it selects `*` over an unknown table).
+    SqlRecursiveCteColumnsUnknown,
 } || LexError;
 
 /// `postgres` and `mysql` name the function a name means in that dialect
@@ -578,6 +605,71 @@ const CteEntry = struct {
     hint: MaterializeHint,
 };
 
+const RecursiveParse = struct {
+    name: []const u8,
+    info: *ir.Op.Recursive,
+    /// `query_depth` of the body's own statement.
+    depth: u32,
+    columns: ?[]const []const u8,
+    /// Output names of the body's first operand, once it has parsed.
+    first_names: ?[]const []const u8 = null,
+    self_refs: u32 = 0,
+};
+
+/// What one operand of a recursive CTE's UNION holds within its own query
+/// block. Derived tables and other CTEs are subqueries: a reference inside
+/// one is not counted in `refs`.
+const RecursiveArmScan = struct {
+    refs: u32 = 0,
+    outer_nullable: bool = false,
+    aggregate: bool = false,
+    order: bool = false,
+    limit: bool = false,
+    set_op: bool = false,
+};
+
+fn scanRecursiveArm(op: *const ir.Op, info: *const ir.Op.Recursive, nullable: bool, out: *RecursiveArmScan) void {
+    switch (op.*) {
+        .materialize => |m| if (m.recursion) |r| switch (r) {
+            .self_ref => |owner| if (owner == info) {
+                out.refs += 1;
+                out.outer_nullable = out.outer_nullable or nullable;
+            },
+            .cte => {},
+        },
+        .select, .exclude => |p| scanRecursiveArm(p.upstream, info, nullable, out),
+        .filter => |f| scanRecursiveArm(f.upstream, info, nullable, out),
+        .compute => |c| scanRecursiveArm(c.upstream, info, nullable, out),
+        .alias => |a| scanRecursiveArm(a.upstream, info, nullable, out),
+        .group_by => |g| {
+            out.aggregate = true;
+            scanRecursiveArm(g.upstream, info, nullable, out);
+        },
+        .window => |w| {
+            out.aggregate = true;
+            scanRecursiveArm(w.upstream, info, nullable, out);
+        },
+        .order_by => |o| {
+            out.order = true;
+            scanRecursiveArm(o.upstream, info, nullable, out);
+        },
+        .limit => |l| {
+            out.limit = true;
+            scanRecursiveArm(l.upstream, info, nullable, out);
+        },
+        .join => |j| {
+            scanRecursiveArm(j.left, info, nullable or j.join_type == .right or j.join_type == .full, out);
+            scanRecursiveArm(j.right, info, nullable or j.join_type == .left or j.join_type == .full, out);
+        },
+        .set_union => |u| {
+            out.set_op = out.set_op or u.kind != .@"union";
+            scanRecursiveArm(u.left, info, nullable, out);
+            scanRecursiveArm(u.right, info, nullable, out);
+        },
+        else => {},
+    }
+}
+
 const FromTarget = struct {
     name: []const u8,
     op: *ir.Op,
@@ -679,6 +771,14 @@ pub const Parser = struct {
     /// Flat scope: nested SELECTs can reference outer CTEs but
     /// redefining an existing name errors.
     ctes: std.StringHashMapUnmanaged(CteEntry) = .empty,
+    /// The `WITH RECURSIVE` CTE whose body is being parsed; references to
+    /// its name resolve to self-reference boundaries.
+    recursive_parse: ?*RecursiveParse = null,
+    /// Nesting depth of `parseStatement`: tells a recursive CTE body's own
+    /// first operand from a subquery's.
+    query_depth: u32 = 0,
+    /// The innermost SELECT being parsed is SELECT DISTINCT.
+    select_distinct: bool = false,
     /// `WITH KEYED BY (...)` declaration for the current statement's CTE
     /// block; stamped onto every CTE materialize boundary so the region
     /// compiler can find and verify the block. First declaration wins.
@@ -890,6 +990,11 @@ pub const Parser = struct {
     pub fn parseStatement(self: *Parser) ParseError!*ir.Op {
         const union_arm = self.union_arm;
         self.union_arm = false;
+        self.query_depth += 1;
+        defer self.query_depth -= 1;
+        const outer_distinct = self.select_distinct;
+        self.select_distinct = false;
+        defer self.select_distinct = outer_distinct;
         // A subquery inside a CASE anchors its own operands.
         const outer_case = self.case_scope;
         self.case_scope = .{ .operand_mark = self.case_operands.items.len };
@@ -942,6 +1047,7 @@ pub const Parser = struct {
         // with aggregates / GROUP BY / HAVING / window functions / `*` is
         // rejected: those need a second dedup layer above the aggregate.
         const distinct = try self.parseSelectModifiers();
+        self.select_distinct = distinct;
 
         // Projection list. Scalar projection expressions may contain
         // aggregate calls; collect those as hidden aggregate outputs so the
@@ -1662,6 +1768,9 @@ pub const Parser = struct {
     /// output names, the first operand's. A lone SELECT has already read its
     /// own ORDER BY / LIMIT; a parenthesized one reads them here.
     fn parseSetOpTail(self: *Parser, first: *ir.Op, output: []const ProjItem, inputs: []const ChainInput, parenthesized: bool) ParseError!*ir.Op {
+        if (self.recursive_parse) |rb| {
+            if (rb.first_names == null and rb.depth == self.query_depth) rb.first_names = try self.sourceColumns(first);
+        }
         var root = try self.parseIntersectArms(first);
         while (true) {
             const kind: ir.SetKind = switch (self.cur.tag) {
@@ -4167,6 +4276,9 @@ pub const Parser = struct {
                 const format = fileFormatForFunction(first_lc) orelse return ParseError.SqlUnsupportedFileFunction;
                 op = try self.parseFileTableFunction(format);
             }
+        } else if (self.cur.tag != .dot and self.recursive_parse != null and std.mem.eql(u8, self.recursive_parse.?.name, first_lc)) {
+            op = try self.recursiveSelfRef(self.recursive_parse.?, first_dup);
+            alias_in_place = false;
         } else if (self.cur.tag != .dot and self.ctes.get(first_lc) != null) {
             const entry = self.ctes.get(first_lc).?;
             // NOT MATERIALIZED = regenerate per use: each reference gets its
@@ -4668,12 +4780,20 @@ pub const Parser = struct {
     fn parseCteList(self: *Parser) ParseError!void {
         try self.advance(); // consume WITH
         var first = true;
+        var recursive = false;
         while (true) {
             if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
             // CTE names are object names: stored/looked up lowercased so
             // `WITH Foo ... FROM foo` resolves (idents now lex as-typed).
             const name = try std.ascii.allocLowerString(self.arena, self.cur.text);
             try self.advance();
+
+            // RECURSIVE is not reserved: a CTE named `recursive` is followed
+            // by AS or its column list, never by another name.
+            if (first and !recursive and self.cur.tag == .identifier and std.mem.eql(u8, name, "recursive")) {
+                recursive = true;
+                continue;
+            }
 
             // `WITH KEYED BY (k1, k2, ...) cte AS (...)`: declared keyed-
             // region block. Disambiguated one token late — a CTE actually
@@ -4716,8 +4836,23 @@ pub const Parser = struct {
             }
 
             try self.expect(.lparen);
+            if (recursive and self.ctes.contains(name)) return ParseError.SqlCteRedefined;
+            const outer_recursive = self.recursive_parse;
+            defer self.recursive_parse = outer_recursive;
+            const rb: ?*RecursiveParse = if (recursive) blk: {
+                const r = try self.arena.create(RecursiveParse);
+                r.* = .{
+                    .name = name,
+                    .info = try self.arena.create(ir.Op.Recursive),
+                    .depth = self.query_depth + 1,
+                    .columns = column_names,
+                };
+                break :blk r;
+            } else null;
+            if (rb) |r| self.recursive_parse = r;
             const body = try self.parseStatement();
-            const op = if (column_names) |names| try self.renameOutputs(body, self.select_output, names) else body;
+            const renamed = if (column_names) |names| try self.renameOutputs(body, self.select_output, names) else body;
+            const op = if (rb) |r| (if (r.self_refs > 0) try self.recursiveCte(r, body, renamed) else renamed) else renamed;
             try self.expect(.rparen);
 
             const gop = try self.ctes.getOrPut(self.arena, name);
@@ -4727,6 +4862,112 @@ pub const Parser = struct {
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
+    }
+
+    /// A recursive CTE's reference to itself: a boundary the staged compiler
+    /// binds to the working set of the iteration that compiles it. Its body
+    /// only names the columns, for resolution ahead of compile; an unnamed
+    /// one is reported once the arms are known to be in order.
+    fn recursiveSelfRef(self: *Parser, rb: *RecursiveParse, name: []const u8) ParseError!*ir.Op {
+        if (self.select_distinct) return ParseError.SqlRecursiveCteDistinct;
+        rb.self_refs += 1;
+        const names = rb.columns orelse rb.first_names orelse &.{};
+        const derived = try self.arena.alloc(ir.Derived, names.len);
+        for (names, derived) |n, *d| d.* = .{ .name = types.unqualifiedName(n), .expr = .{ .null_lit = .bigint } };
+        const leaf = try self.allocOp(.{ .single_row = {} });
+        const names_op = try self.allocOp(.{ .compute = .{ .derived = derived, .upstream = leaf } });
+        return try self.allocOp(.{ .materialize = .{
+            .upstream = names_op,
+            .name = name,
+            .recursion = .{ .self_ref = rb.info },
+        } });
+    }
+
+    /// Validate a `WITH RECURSIVE` body that references itself and split it
+    /// into anchor and recursive arms (MySQL's rules): a UNION whose leading
+    /// arms don't reference the CTE and whose remaining arms each reference
+    /// it once, in their own FROM, outside an outer join's NULL-extended
+    /// side, with no aggregation, window, DISTINCT, ORDER BY or LIMIT. A
+    /// LIMIT over the whole body bounds the iteration; ORDER BY over it is
+    /// refused. `renamed` (the body under the column list) is what the
+    /// statement's own passes see.
+    fn recursiveCte(self: *Parser, rb: *RecursiveParse, body: *ir.Op, renamed: *ir.Op) ParseError!*ir.Op {
+        var top = body;
+        var limit: ?u64 = null;
+        var offset: u64 = 0;
+        if (top.* == .limit) {
+            limit = top.limit.n;
+            offset = top.limit.offset;
+            top = top.limit.upstream;
+        }
+        var probe = top;
+        while (true) switch (probe.*) {
+            .order_by => return ParseError.SqlRecursiveCteOrderBy,
+            .exclude => |p| probe = p.upstream,
+            .compute => |c| probe = c.upstream,
+            else => break,
+        };
+
+        // The UNION chain is left-deep: collect its operands right to left.
+        var arms: std.ArrayList(*ir.Op) = .empty;
+        var all: std.ArrayList(bool) = .empty;
+        var spine: std.ArrayList(*ir.Op) = .empty;
+        var cur = top;
+        while (cur.* == .set_union and cur.set_union.kind == .@"union") {
+            try arms.append(self.arena, cur.set_union.right);
+            try all.append(self.arena, cur.set_union.all);
+            try spine.append(self.arena, cur);
+            cur = cur.set_union.left;
+        }
+        try arms.append(self.arena, cur);
+        std.mem.reverse(*ir.Op, arms.items);
+        std.mem.reverse(bool, all.items);
+        std.mem.reverse(*ir.Op, spine.items);
+
+        const scans = try self.arena.alloc(RecursiveArmScan, arms.items.len);
+        var direct: u32 = 0;
+        for (arms.items, scans) |arm, *scan| {
+            scan.* = .{};
+            scanRecursiveArm(arm, rb.info, false, scan);
+            direct += scan.refs;
+        }
+        if (direct != rb.self_refs) return ParseError.SqlRecursiveCteReference;
+        for (scans) |scan| {
+            if (scan.refs > 1) return ParseError.SqlRecursiveCteReference;
+            if (scan.refs > 0 and scan.set_op) return ParseError.SqlRecursiveCteSetOp;
+        }
+        if (arms.items.len == 1) return ParseError.SqlRecursiveCteNoUnion;
+        var first_recursive: usize = 0;
+        while (scans[first_recursive].refs == 0) first_recursive += 1;
+        if (first_recursive == 0) return ParseError.SqlRecursiveCteAnchorFirst;
+        for (scans[first_recursive..]) |scan| {
+            if (scan.refs == 0) return ParseError.SqlRecursiveCteAnchorFirst;
+            if (scan.aggregate) return ParseError.SqlRecursiveCteAggregate;
+            if (scan.order) return ParseError.SqlRecursiveCteOrderBy;
+            if (scan.limit) return ParseError.SqlRecursiveCteLimit;
+            if (scan.outer_nullable) return ParseError.SqlRecursiveCteOuterJoin;
+        }
+        if (rb.columns == null and rb.first_names == null) return ParseError.SqlRecursiveCteColumnsUnknown;
+
+        var step = arms.items[first_recursive];
+        for (arms.items[first_recursive + 1 ..]) |arm| {
+            step = try self.allocOp(.{ .set_union = .{ .left = step, .right = arm, .all = true } });
+        }
+        var distinct = false;
+        for (all.items[first_recursive - 1 ..]) |a| distinct = distinct or !a;
+        rb.info.* = .{
+            .anchor = if (first_recursive == 1) arms.items[0] else spine.items[first_recursive - 2],
+            .step = step,
+            .distinct = distinct,
+            .columns = rb.columns,
+            .limit = limit,
+            .offset = offset,
+        };
+        return try self.allocOp(.{ .materialize = .{
+            .upstream = renamed,
+            .name = rb.name,
+            .recursion = .{ .cte = rb.info },
+        } });
     }
 
     fn joinStartAhead(self: *const Parser) bool {
@@ -4972,14 +5213,9 @@ pub const Parser = struct {
                 continue;
             };
             const right_name = try self.materializeJoinOperand(.{ .col_ref = key.right }, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            try pairs.append(self.arena, .{ .left = try self.arena.dupe(u8, key.left), .right = right_name });
+            try pairs.append(self.arena, .{ .left = try self.arena.dupe(u8, key.left), .right = right_name, .null_safe = key.null_safe });
         }
-        if (pairs.items.len == 0) {
-            const one = ir.Expr{ .lit = .{ .int = 1 } };
-            const left_name = try self.materializeJoinOperand(one, .left, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            const right_name = try self.materializeJoinOperand(one, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
-        }
+        if (pairs.items.len == 0) try self.appendConstantJoinPair(&pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = &.{},
@@ -4993,20 +5229,44 @@ pub const Parser = struct {
         };
     }
 
-    const ResidualKey = struct { left: []const u8, right: []const u8 };
+    const ResidualKey = struct { left: []const u8, right: []const u8, null_safe: bool };
 
     /// The left and right columns a conjunct equates, when it is a column
     /// equality across the two inputs.
     fn residualKeyColumns(self: *Parser, c: PredicateExpr, scope: *JoinScope, derived: []const ir.Derived) ParseError!?ResidualKey {
-        if (c != .leaf_col_col or c.leaf_col_col.op != .eq) return null;
-        const a = c.leaf_col_col.left;
-        const b = c.leaf_col_col.right;
-        if (derivedNamed(derived, a) or derivedNamed(derived, b)) return null;
-        const a_side = try self.residualColumnSide(a, scope) orelse return null;
-        const b_side = try self.residualColumnSide(b, scope) orelse return null;
-        if (a_side == .left and b_side == .right) return .{ .left = a, .right = b };
-        if (a_side == .right and b_side == .left) return .{ .left = b, .right = a };
+        const eq = equatedColumns(c) orelse return null;
+        if (derivedNamed(derived, eq.a) or derivedNamed(derived, eq.b)) return null;
+        const a_side = try self.residualColumnSide(eq.a, scope) orelse return null;
+        const b_side = try self.residualColumnSide(eq.b, scope) orelse return null;
+        if (a_side == .left and b_side == .right) return .{ .left = eq.a, .right = eq.b, .null_safe = eq.null_safe };
+        if (a_side == .right and b_side == .left) return .{ .left = eq.b, .right = eq.a, .null_safe = eq.null_safe };
         return null;
+    }
+
+    const EquatedColumns = struct { a: []const u8, b: []const u8, null_safe: bool };
+
+    /// The columns `a = b` equates, or `a <=> b` as `nullSafeEqual` lowers
+    /// it: `(a IS NULL AND b IS NULL) OR (a IS NOT NULL AND b IS NOT NULL
+    /// AND a = b)`.
+    fn equatedColumns(c: PredicateExpr) ?EquatedColumns {
+        switch (c) {
+            .leaf_col_col => |cc| return if (cc.op == .eq) .{ .a = cc.left, .b = cc.right, .null_safe = false } else null,
+            .@"or" => |kids| {
+                if (kids.len != 2 or kids[0] != .@"and" or kids[1] != .@"and") return null;
+                const both_null = kids[0].@"and";
+                const equal = kids[1].@"and";
+                if (both_null.len != 2 or equal.len != 3 or equal[2] != .leaf_col_col) return null;
+                const cc = equal[2].leaf_col_col;
+                if (cc.op != .eq) return null;
+                if (both_null[0] != .is_null or both_null[1] != .is_null) return null;
+                if (equal[0] != .is_not_null or equal[1] != .is_not_null) return null;
+                const names = [_][]const u8{ both_null[0].is_null, both_null[1].is_null, equal[0].is_not_null, equal[1].is_not_null };
+                const expected = [_][]const u8{ cc.left, cc.right, cc.left, cc.right };
+                for (names, expected) |n, e| if (!std.mem.eql(u8, n, e)) return null;
+                return .{ .a = cc.left, .b = cc.right, .null_safe = true };
+            },
+            else => return null,
+        }
     }
 
     fn derivedNamed(derived: []const ir.Derived, name: []const u8) bool {
@@ -5095,15 +5355,29 @@ pub const Parser = struct {
                     negated = true;
                     try self.advance();
                 }
-                if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                if (self.cur.tag == .kw_distinct) {
+                    // `IS DISTINCT FROM` holds for a NULL against a value, which no
+                    // key match does: the general form reads it.
+                    if (!negated) return ParseError.SqlOnNonEquiUnsupported;
+                    try self.advance();
+                    try self.expect(.kw_from);
+                    const rhs = try self.parseCallArg();
+                    try self.addJoinNullSafeKey(lhs, rhs, scope, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
+                } else {
+                    if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                    try self.advance();
+                    try self.addJoinNullCondition(
+                        lhs,
+                        negated,
+                        scope,
+                        &left_filters,
+                        &right_filters,
+                    );
+                }
+            } else if (self.cur.tag == .null_safe_eq) {
                 try self.advance();
-                try self.addJoinNullCondition(
-                    lhs,
-                    negated,
-                    scope,
-                    &left_filters,
-                    &right_filters,
-                );
+                const rhs = try self.parseCallArg();
+                try self.addJoinNullSafeKey(lhs, rhs, scope, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
             } else if (self.cur.tag == .kw_between) {
                 try self.advance();
                 const lower = try self.parseCallArg();
@@ -5168,16 +5442,13 @@ pub const Parser = struct {
             // to an equi join on a synthesized constant key so every row pairs
             // with every filtered row and outer-join NULL padding works as-is.
             if (left_filters.items.len == 0 and right_filters.items.len == 0) return ParseError.SqlOnNonEquiUnsupported;
-            const one = ir.Expr{ .lit = .{ .int = 1 } };
-            const left_name = try self.materializeJoinOperand(one, .left, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            const right_name = try self.materializeJoinOperand(one, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
+            try self.appendConstantJoinPair(&pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
         }
         self.dropRedundantOuterJoinNotNullFilters(jtype, &left_filters, &right_filters, pairs.items, ranges.items);
         const preserved_left = jtype == .left or jtype == .full;
         const preserved_right = jtype == .right or jtype == .full;
-        if (preserved_left) try self.foldPreservedSideConditions(.left, &left_filters, &pairs.items[0], &left_derived, &right_derived, &hidden_left, &synth_counter);
-        if (preserved_right) try self.foldPreservedSideConditions(.right, &right_filters, &pairs.items[0], &left_derived, &right_derived, &hidden_left, &synth_counter);
+        if (preserved_left) try self.foldPreservedSideConditions(.left, &left_filters, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
+        if (preserved_right) try self.foldPreservedSideConditions(.right, &right_filters, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = try ranges.toOwnedSlice(self.arena),
@@ -5193,12 +5464,14 @@ pub const Parser = struct {
     /// that side's rows match, not which survive: a row failing it still
     /// comes out, null-extended. So rather than filter the input, the
     /// conditions fold into the side's first key as `CASE WHEN <conditions>
-    /// THEN key END`, and a failing row's NULL key matches nothing.
+    /// THEN key END`, and a failing row's NULL key matches nothing. A
+    /// null-safe key would match that NULL, so the first plain key takes
+    /// them, or a constant key pair when every key is null-safe.
     fn foldPreservedSideConditions(
         self: *Parser,
         side: JoinExprSide,
         filters: *std.ArrayList(PredicateExpr),
-        pair: *ir.JoinKeyPair,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
         left_derived: *std.ArrayList(ir.Derived),
         right_derived: *std.ArrayList(ir.Derived),
         hidden_left: *std.ArrayList([]const u8),
@@ -5206,6 +5479,13 @@ pub const Parser = struct {
     ) ParseError!void {
         const cond = try self.joinFilterFromParts(filters) orelse return;
         filters.clearRetainingCapacity();
+        const index = for (pairs.items, 0..) |p, i| {
+            if (!p.null_safe) break i;
+        } else blk: {
+            try self.appendConstantJoinPair(pairs, left_derived, right_derived, hidden_left, synth_counter);
+            break :blk pairs.items.len - 1;
+        };
+        const pair = &pairs.items[index];
         const key = if (side == .left) &pair.left else &pair.right;
         const derived = if (side == .left) left_derived else right_derived;
         const branches = try self.arena.alloc(ir.Expr.Branch, 1);
@@ -5267,6 +5547,7 @@ pub const Parser = struct {
         col: []const u8,
     ) bool {
         for (pairs) |pair| {
+            if (pair.null_safe) continue;
             const key = if (left_side) pair.left else pair.right;
             if (types.columnNameEql(key, col)) return true;
         }
@@ -5354,11 +5635,46 @@ pub const Parser = struct {
             .lte => .lte,
             .gt => .gt,
             .gte => .gte,
-            // `<=>` matches NULL keys, which a hash join key never does: it
-            // takes the general residual form.
-            .neq, .null_safe_eq => ParseError.SqlOnNonEquiUnsupported,
+            .neq => ParseError.SqlOnNonEquiUnsupported,
             else => ParseError.SqlExpectedToken,
         };
+    }
+
+    /// `a <=> b` across the two inputs keys the join as a null-safe pair.
+    /// Any other `<=>` is a one-input test the general form reads.
+    fn addJoinNullSafeKey(
+        self: *Parser,
+        lhs: ir.Expr,
+        rhs: ir.Expr,
+        scope: *JoinScope,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        const lhs_side = try self.joinExprSide(lhs, scope);
+        const rhs_side = try self.joinExprSide(rhs, scope);
+        if (lhs_side == .mixed or rhs_side == .mixed) return ParseError.SqlOnRefsUnknownTable;
+        const left_first = lhs_side == .left and rhs_side == .right;
+        if (!left_first and !(lhs_side == .right and rhs_side == .left)) return ParseError.SqlOnNonEquiUnsupported;
+        const left_name = try self.materializeJoinOperand(if (left_first) lhs else rhs, .left, left_derived, right_derived, hidden_left, synth_counter);
+        const right_name = try self.materializeJoinOperand(if (left_first) rhs else lhs, .right, left_derived, right_derived, hidden_left, synth_counter);
+        try pairs.append(self.arena, .{ .left = left_name, .right = right_name, .null_safe = true });
+    }
+
+    fn appendConstantJoinPair(
+        self: *Parser,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        const one = ir.Expr{ .lit = .{ .int = 1 } };
+        const left_name = try self.materializeJoinOperand(one, .left, left_derived, right_derived, hidden_left, synth_counter);
+        const right_name = try self.materializeJoinOperand(one, .right, left_derived, right_derived, hidden_left, synth_counter);
+        try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
     }
 
     fn addJoinBetweenCondition(
@@ -7105,6 +7421,7 @@ pub const Parser = struct {
             };
             if (!should_wrap) continue;
             const cte_op = entry.value_ptr.op;
+            if (cte_op.* == .materialize and cte_op.materialize.recursion != null) continue;
             // In-place wrap: move the existing contents into a new
             // arena-owned Op, then overwrite the original with a
             // Materialize variant pointing at it. All references that
