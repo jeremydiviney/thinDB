@@ -540,6 +540,15 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
         },
 
         .materialize => |m| {
+            // A recursive CTE's arms read every column of the previous
+            // iteration, so they keep them all; a self-reference's body only
+            // names those columns.
+            if (m.recursion) |rec| {
+                if (rec == .self_ref or ctx.visited.contains(op)) return;
+                ctx.visited.put(ctx.arena, op, {}) catch return;
+                walk(ctx, m.upstream, null);
+                return;
+            }
             const mn = ctx.matNeed(op) orelse {
                 walk(ctx, m.upstream, null);
                 return;
