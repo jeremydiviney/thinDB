@@ -345,3 +345,47 @@ test "xa startup resolves real table files at each durable commit phase" {
         }
     }
 }
+
+test "xa commit merges a staged ON DUPLICATE KEY UPDATE" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try api.Database.open(a, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const schema: @import("../types.zig").TableSchema = .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .bigint } },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    try t.insert(&.{.{ .id = @as(i64, 1), .v = @as(i64, 10) }});
+    try t.flush();
+
+    const sum = [_]ir.Expr{ .{ .col_ref = "v" }, .{ .col_ref = ir.insert_values_prefix ++ "v" } };
+    const assignments = [_]ir.Assignment{.{ .col = "v", .value = .{ .call = .{ .fn_name = "add", .args = &sum } } }};
+    const merged = [_]?@import("../types.zig").Value{ .{ .bigint = 1 }, .{ .bigint = 5 } };
+    const inserted = [_]?@import("../types.zig").Value{ .{ .bigint = 2 }, .{ .bigint = 7 } };
+    const rows = [_][]const ?@import("../types.zig").Value{ &merged, &inserted };
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(a);
+    try ir.encode(a, &encoded, .{ .insert = .{
+        .table = .{ .name = "t" },
+        .columns = null,
+        .rows = &rows,
+        .on_duplicate = .{ .assignments = &assignments },
+    } });
+    const catalog = db.catalog.?;
+    try catalog.xa.begin("upsert", "main");
+    try catalog.xa.stage("upsert", encoded.items);
+    try catalog.xa.end("upsert");
+    try catalog.xa.prepare("upsert");
+    try commit(a, catalog, "upsert", false);
+
+    var q = try @import("../exec/exec.zig").scan(a, t);
+    defer q.deinit();
+    var values: std.ArrayList(i64) = .empty;
+    defer values.deinit(a);
+    while (try q.next()) |b| try values.appendSlice(a, b.values[1].data.bigint[0..b.row_count]);
+    std.mem.sort(i64, values.items, {}, std.sort.asc(i64));
+    try std.testing.expectEqualSlices(i64, &.{ 7, 15 }, values.items);
+}
