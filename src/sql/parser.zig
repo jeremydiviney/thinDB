@@ -117,7 +117,10 @@ pub const ParseError = error{
     SqlPrepareExecuteUnsupported,
 } || LexError;
 
-const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
+/// `postgres` names the function a name means in PostgreSQL where it differs:
+/// MySQL and StarRocks read STD, STDDEV and VARIANCE as the population
+/// statistics, PostgreSQL reads STDDEV and VARIANCE as the sample ones.
+const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.AggFunc = null }{
     .{ .name = "count", .func = .count },
     .{ .name = "sum", .func = .sum },
     .{ .name = "min", .func = .min },
@@ -134,13 +137,13 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
     .{ .name = "bit_and", .func = .bit_and },
     .{ .name = "bit_or", .func = .bit_or },
     .{ .name = "bit_xor", .func = .bit_xor },
-    .{ .name = "std", .func = .stddev_samp },
-    .{ .name = "stddev", .func = .stddev_samp },
+    .{ .name = "std", .func = .stddev_pop },
+    .{ .name = "stddev", .func = .stddev_pop, .postgres = .stddev_samp },
     .{ .name = "stddev_pop", .func = .stddev_pop },
     .{ .name = "stddev_samp", .func = .stddev_samp },
     .{ .name = "var_pop", .func = .var_pop },
     .{ .name = "var_samp", .func = .var_samp },
-    .{ .name = "variance", .func = .var_samp },
+    .{ .name = "variance", .func = .var_pop, .postgres = .var_samp },
     .{ .name = "variance_pop", .func = .var_pop },
     .{ .name = "variance_samp", .func = .var_samp },
     .{ .name = "count_distinct", .func = .count_distinct },
@@ -152,9 +155,10 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc }{
     .{ .name = "string_agg", .func = .group_concat },
 };
 
-fn aggForName(name: []const u8) ?ir.AggFunc {
+fn aggForName(name: []const u8, dialect: types.Dialect) ?ir.AggFunc {
     for (AggNames) |entry| {
-        if (std.ascii.eqlIgnoreCase(name, entry.name)) return entry.func;
+        if (!std.ascii.eqlIgnoreCase(name, entry.name)) continue;
+        return if (dialect == .postgres) entry.postgres orelse entry.func else entry.func;
     }
     return null;
 }
@@ -783,7 +787,7 @@ pub const Parser = struct {
     }
 
     pub fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
-        if (aggForName(name)) |func| return func;
+        if (aggForName(name, self.lex.dialect)) |func| return func;
         if (self.udf_registry) |registry| {
             if (registry.hasAggregateName(name)) return .udf;
         }
@@ -1165,13 +1169,16 @@ pub const Parser = struct {
         // those over grouped output per group above it.
         var post_group_pred_derived: []const ir.Derived = &.{};
         var group_alias_renames: []const exec_predicate.ColRename = &.{};
-        if (distinct) {
+        // Over a grouped query DISTINCT dedups the grouped rows, after HAVING
+        // and before ORDER BY (`distinctRows`).
+        const distinct_as_group = distinct and !has_agg and !has_group;
+        if (distinct_as_group) {
             // SELECT DISTINCT a, b, expr ≡ SELECT a, b, expr GROUP BY 1, 2, 3:
             // every projected item becomes a grouping key (markGroupKey
             // rejects `*`, aggregates, and window items). The grouped path
             // below then adds a hidden COUNT(*) — the engines need at least
             // one aggregate — and a final Project drops it.
-            if (has_agg or has_group or pending_having != null) return ParseError.SqlInvalidProjection;
+            if (pending_having != null) return ParseError.SqlInvalidProjection;
             var dcols: std.ArrayList([]const u8) = .empty;
             defer dcols.deinit(self.arena);
             const dgk = try self.arena.alloc(bool, proj.len);
@@ -1369,7 +1376,7 @@ pub const Parser = struct {
             // cores require at least one — add a hidden COUNT(*); the forced
             // Project below drops it from the output.
             var hidden_group_count = false;
-            if (distinct) {
+            if (distinct_as_group) {
                 try aggs_buf.append(self.arena, .{ .func = .count, .col = null, .as = "__distinct_count" });
             } else if (aggs_buf.items.len == 0) {
                 try aggs_buf.append(self.arena, .{ .func = .count, .col = null, .as = "__group_count" });
@@ -1434,9 +1441,14 @@ pub const Parser = struct {
                 if (!has_window) return ParseError.SqlInvalidProjection;
                 root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
             }
-
             // Apply ORDER BY on the grouped schema.
             root = try self.addOrderKeyComputes(root, order_anchors, order_keys);
+            var rename_floor: *const ir.Op = group_op;
+            if (distinct and !distinct_as_group) {
+                if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, group_op, group_alias_renames);
+                root = try self.distinctRows(root, proj, pending_order_specs orelse &.{}, group_alias_renames);
+                rename_floor = root;
+            }
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
             }
@@ -1448,7 +1460,7 @@ pub const Parser = struct {
             if (distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
-            if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, group_op, group_alias_renames);
+            if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, rename_floor, group_alias_renames);
         } else {
             // HAVING without GROUP BY / aggregates is rejected — would
             // be silently equivalent to WHERE, which masks user intent.
@@ -1820,6 +1832,36 @@ pub const Parser = struct {
             .star_skip_trailing = star_skip_trailing,
             .upstream = upstream,
         } });
+    }
+
+    /// Each of the grouped rows `upstream` carries for `proj` once: a GroupBy
+    /// on every item's column, with the hidden COUNT(*) the grouped cores
+    /// need, which the final Project drops. An ORDER BY key the SELECT list
+    /// doesn't carry orders a row by its first occurrence in that order, as
+    /// MySQL orders it: the key's least value ascending, its greatest
+    /// descending.
+    fn distinctRows(
+        self: *Parser,
+        upstream: *ir.Op,
+        proj: []const ProjItem,
+        order_specs: []const @import("../exec/sort.zig").SortSpec,
+        renames: []const exec_predicate.ColRename,
+    ) ParseError!*ir.Op {
+        var cols: std.ArrayList([]const u8) = .empty;
+        for (proj) |p| {
+            const name = try self.projectSourceName(p);
+            // Items reading one column are one key.
+            if (!nameInList(name, cols.items)) try cols.append(self.arena, name);
+        }
+        var aggs: std.ArrayList(ir.AggSpec) = .empty;
+        try aggs.append(self.arena, .{ .func = .count, .col = null, .as = "__distinct_count" });
+        next_spec: for (order_specs) |spec| {
+            const name = exec_predicate.renameOf(renames, spec.col);
+            if (nameInList(name, cols.items)) continue;
+            for (aggs.items) |a| if (types.columnNameEql(a.as, name)) continue :next_spec;
+            try aggs.append(self.arena, .{ .func = if (spec.desc) .max else .min, .col = name, .as = name });
+        }
+        return self.allocOp(.{ .group_by = .{ .group_cols = try cols.toOwnedSlice(self.arena), .aggs = try aggs.toOwnedSlice(self.arena), .upstream = upstream } });
     }
 
     fn projectSourceName(self: *Parser, p: ProjItem) ParseError![]const u8 {
