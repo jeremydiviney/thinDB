@@ -12,6 +12,7 @@ test {
     _ = @import("uuid_test.zig");
     _ = @import("json_test.zig");
     _ = @import("views_test.zig");
+    _ = @import("recursive_cte_test.zig");
     _ = @import("where_expr_test.zig");
     _ = @import("nonunique_table_test.zig");
     _ = @import("on_duplicate_key_test.zig");

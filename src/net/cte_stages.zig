@@ -36,10 +36,11 @@ const join_mod = @import("../exec/join.zig");
 const cast = @import("../exec/cast.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const udf = @import("../udf.zig");
+const recursive_cte = @import("recursive_cte.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
 
-const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
+pub const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 
 /// True when the plan needs the staged compiler: any materialize boundary
 /// (CTE / FROM-subquery), join, window, or set-union node anywhere in the
@@ -326,6 +327,21 @@ fn collectStages(
                 if (rep != op) try map.put(input.allocator, op, stage);
                 return; // shared CTE / duplicate: one stage, many readers
             }
+            // A recursive CTE always stages: its driver iterates to a
+            // fixpoint once, and each reference reads the result. Its
+            // self-references bind per iteration, inside the driver.
+            if (rep.materialize.recursion) |rec| switch (rec) {
+                .self_ref => return,
+                .cte => |info| {
+                    try collectStages(input, info.anchor, set, map, cse);
+                    try collectStages(input, info.step, set, map, cse);
+                    const stage = try set.addStage(try recursive_cte.create(input, info, map), input.accountant);
+                    stage.name = rep.materialize.name orelse "";
+                    try map.put(input.allocator, rep, stage);
+                    if (rep != op) try map.put(input.allocator, op, stage);
+                    return;
+                },
+            };
             try collectStages(input, rep.materialize.upstream, set, map, cse);
             // Single reference → no stage; the body compiles inline at the
             // use site (buildGenericBlock's .materialize arm) — including
@@ -1408,6 +1424,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 defer exec.prof.addPhase("compile.op.matscan", @intCast(exec.prof.nowTicks() - t_ms));
                 return mat_stage.MatScan.create(input.allocator, stage);
             }
+            if (m.recursion != null) return error.UnsupportedQueryShape;
             return compileBlock(input, m.upstream, map);
         },
         .table_fn => |t| {
@@ -2077,7 +2094,10 @@ fn outputIsNullLiteral(op: *const ir.Op, name: []const u8) bool {
         .filter => |f| cur = f.upstream,
         .order_by => |o| cur = o.upstream,
         .limit => |l| cur = l.upstream,
-        .materialize => |m| cur = m.upstream,
+        .materialize => |m| {
+            if (m.recursion != null) return false;
+            cur = m.upstream;
+        },
         else => return false,
     };
 }
@@ -2100,7 +2120,7 @@ fn nullDerived(arena: std.mem.Allocator, col_name: []const u8, ty: types.Type) !
 /// preserved). Everything lives in the statement's node arena: the Compute
 /// keeps a shallow dupe of the derived list, so the expr internals must
 /// outlive compile.
-fn castDerived(arena: std.mem.Allocator, col_name: []const u8, fn_name: []const u8) !ir.Derived {
+pub fn castDerived(arena: std.mem.Allocator, col_name: []const u8, fn_name: []const u8) !ir.Derived {
     const name = try arena.dupe(u8, col_name);
     const args = try arena.alloc(ir.Expr, 1);
     args[0] = .{ .col_ref = name };
