@@ -601,6 +601,25 @@ test "comparison: a number meets a DATE or DATETIME the way MySQL reads it" {
         .{ .sql = "SELECT id FROM nd WHERE s = DATE '2026-09-26' ORDER BY id", .expected = &.{} },
         .{ .sql = "SELECT id FROM nd WHERE g < TIMESTAMP '2026-09-26 10:05:03.5' ORDER BY id", .expected = &.{ 1, 2, 3, 4, 5 } },
         .{ .sql = "SELECT id FROM nd WHERE g IN (DATE '2026-09-26', 1) ORDER BY id", .expected = &.{ 1, 2 } },
+        // NULLIF compares as = does.
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 20260926) IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 260926) IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 20260926000001) IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 20260926.0) IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 20260900) IS NULL ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 2026) IS NULL ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 991231) IS NULL ORDER BY id", .expected = &.{ 3, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(ts, 20260926100503.5) IS NULL ORDER BY id", .expected = &.{ 1, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(ts, 20260926100503) IS NULL ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(ts, 20260927) IS NULL ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(t0, 20260927235959) IS NULL ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(t0, 1e13) IS NULL ORDER BY id", .expected = &.{3} },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(d, 20260926) = '2026-09-27' ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(g + 20260925, DATE '2026-09-26') IS NULL ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(s + 20260920, DATE '2026-09-26') IS NULL ORDER BY id", .expected = &.{ 2, 3 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(g * 1000000 + 20260926100502, TIMESTAMP '2026-09-26 10:05:03') IS NULL ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(DATE '2026-09-26', 20260926) IS NULL ORDER BY id", .expected = &.{ 1, 2, 3, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE NULLIF(20260926, DATE '2026-09-26') IS NULL ORDER BY id", .expected = &.{ 1, 2, 3, 4, 5 } },
     });
 }
 

@@ -794,6 +794,17 @@ fn rejectUnreadTemporal(col_type: types.Type, text: []const u8, from_statement: 
     return Error.InvalidTemporalLiteral;
 }
 
+/// A number constant against a DATE or DATETIME, or a DATE or DATETIME
+/// constant against a number, that a comparison outside a `.leaf` holds
+/// (NULLIF's), placed as `validateExpr` places a leaf's: the value of
+/// `col_type` it names, or null when no value of the type equals it.
+pub fn placeComparedValue(val: Value, col_type: types.Type) ?Value {
+    return switch (placeLiteral(val, col_type)) {
+        .exact => |v| v,
+        else => null,
+    };
+}
+
 /// Text a comparison outside a `.leaf` holds against a value of `col_type`
 /// (NULLIF's), placed as `validateExpr` places a leaf's: the value it names,
 /// or null when no value of the type equals it.
@@ -2252,7 +2263,7 @@ pub fn evaluateColColMask(left: ColumnView, left_type: types.Type, right: Column
 /// A DATE or DATETIME column against a number column, which MySQL compares
 /// by the temporal's number (`cellNumber`). Not a join key pair: the two
 /// hash apart.
-fn temporalBesideNumber(a: types.Type, b: types.Type) bool {
+pub fn temporalBesideNumber(a: types.Type, b: types.Type) bool {
     const ka = comparisonKind(a);
     const kb = comparisonKind(b);
     return (ka == .temporal and kb == .number) or (ka == .number and kb == .temporal);
