@@ -537,3 +537,85 @@ test "mysql admin: SHOW CREATE DATABASE" {
 
     try expectMysqlError(allocator, db, "SHOW CREATE DATABASE nope", error.DatabaseNotFound);
 }
+
+/// The first column of a result as the MySQL wire prints it, NULL as null.
+fn expectColumn(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, expected: []const ?[]const u8) !void {
+    errdefer std.debug.print("case failed: {s}\n", .{sql});
+    var q = try helpers.runSqlMysql(allocator, db, sql);
+    defer q.deinit();
+    const cells = try helpers.columnText(allocator, &q);
+    defer helpers.freeStrings(allocator, cells);
+    try std.testing.expectEqual(expected.len, cells.len);
+    for (expected, cells) |want, got| {
+        if (want) |text| {
+            try std.testing.expectEqualStrings(text, got orelse return error.TestUnexpectedResult);
+        } else try std.testing.expect(got == null);
+    }
+}
+
+test "mysql operators: ! is a NOT that binds tighter than arithmetic (issue #322)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT !1", "0" },
+        .{ "SELECT !0", "1" },
+        .{ "SELECT !NULL", null },
+        .{ "SELECT !0.0", "1" },
+        .{ "SELECT !0.5", "0" },
+        .{ "SELECT !2 + 1", "1" },
+        .{ "SELECT -!0", "-1" },
+        .{ "SELECT !-1", "0" },
+        .{ "SELECT !(1 > 0)", "0" },
+        .{ "SELECT ! !2", "1" },
+        // MySQL's lexer drops the second `!` of `!!`.
+        .{ "SELECT !!2", "0" },
+        .{ "SELECT !!!0", "0" },
+        .{ "SELECT !1 = 0", "1" },
+        .{ "SELECT 1 != 2", "1" },
+    };
+    inline for (cases) |c| {
+        const want: ?[]const u8 = c[1];
+        try expectColumn(allocator, db, c[0], &.{want});
+    }
+    try expectColumn(allocator, db, "SELECT !(id - 2) FROM t ORDER BY id", &.{ "0", "1", "0" });
+    try expectColumn(allocator, db, "SELECT CAST(id AS CHAR) FROM t WHERE !(id - 2)", &.{"2"});
+    try expectColumn(allocator, db, "SELECT CAST(id AS CHAR) FROM t WHERE !id = 0 AND id != 2 ORDER BY id", &.{ "1", "3" });
+}
+
+test "mysql operators: BINARY casts to text and COLLATE leaves its operand as it is (issue #322)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openDb(allocator, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT BINARY 'a'", "a" },
+        .{ "SELECT BINARY 'a' = 'A'", "0" },
+        .{ "SELECT BINARY 1 + 1", "2" },
+        .{ "SELECT BINARY(12)", "12" },
+        .{ "SELECT 'a' COLLATE utf8mb4_bin", "a" },
+        .{ "SELECT 'a' COLLATE 'utf8mb4_bin'", "a" },
+        .{ "SELECT 'a' = 'A' COLLATE utf8mb4_general_ci", "0" },
+        .{ "SELECT CONCAT('a' COLLATE utf8mb4_bin, 'b')", "ab" },
+    };
+    inline for (cases) |c| try expectColumn(allocator, db, c[0], &.{c[1]});
+
+    try expectColumn(allocator, db, "SELECT BINARY s FROM t ORDER BY id", &.{ "kiwi", "pear", "AB" });
+    try expectColumn(allocator, db, "SELECT CAST(id AS CHAR) FROM t WHERE BINARY s = 'AB'", &.{"3"});
+    try expectColumn(allocator, db, "SELECT s COLLATE utf8mb4_bin FROM t ORDER BY id", &.{ "kiwi", "pear", "AB" });
+    try expectColumn(allocator, db, "SELECT CAST(id AS CHAR) FROM t WHERE s COLLATE utf8mb4_bin = 'AB'", &.{"3"});
+    try expectColumn(allocator, db, "SELECT CAST(id AS CHAR) FROM t WHERE s = 'AB' COLLATE utf8mb4_bin", &.{"3"});
+    try expectColumn(allocator, db, "SELECT s FROM t ORDER BY s COLLATE utf8mb4_bin DESC", &.{ "pear", "kiwi", "AB" });
+    try expectColumn(allocator, db, "SELECT s FROM t WHERE s LIKE 'k%' COLLATE utf8mb4_bin", &.{"kiwi"});
+
+    // With no operand after it, BINARY is a column's name.
+    try helpers.exec(allocator, db, "CREATE TABLE b (id BIGINT PRIMARY KEY, `binary` VARCHAR(10))");
+    try run(allocator, db, "INSERT INTO b VALUES (1, 'x')");
+    try expectColumn(allocator, db, "SELECT binary FROM b", &.{"x"});
+    try expectColumn(allocator, db, "SELECT BINARY binary FROM b", &.{"x"});
+}
