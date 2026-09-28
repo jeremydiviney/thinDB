@@ -1254,6 +1254,11 @@ fn sendSyntheticWorkbenchSelect(
     // would silently drop the rest. The engine handles it.
     if (topLevelKeyword(lc, "union") != null) return false;
 
+    // Parallel case-preserved view of the same normalized statement:
+    // matching runs on `lc`, column labels slice from `orig` at the same
+    // offsets so they echo the client's typed case.
+    const orig_full = sql_text_mod.normalizeForCannedMatchKeepCase(payload);
+
     const from_idx = topLevelKeyword(lc, "from");
     if (from_idx) |idx| {
         const tail = lc[idx..];
@@ -1266,6 +1271,7 @@ fn sendSyntheticWorkbenchSelect(
             w,
             catalog,
             lc["select ".len..idx],
+            orig_full["select ".len..idx],
             tail,
             seq_id,
             client_caps,
@@ -1273,16 +1279,11 @@ fn sendSyntheticWorkbenchSelect(
 
         var cols = std.ArrayList(types.Column).empty;
         defer cols.deinit(allocator);
-        try appendSelectColumns(allocator, &cols, lc["select ".len..idx]);
+        try appendSelectColumns(allocator, &cols, lc["select ".len..idx], orig_full["select ".len..idx]);
         if (cols.items.len == 0) try cols.append(allocator, .{ .name = "Name", .type = .string });
         try sendEmptyColumns(allocator, w, cols.items, seq_id, client_caps);
         return true;
     }
-
-    // Parallel case-preserved view of the same normalized statement:
-    // matching runs on `lc`, column labels slice from `orig` at the same
-    // offsets so they echo the client's typed case.
-    const orig_full = sql_text_mod.normalizeForCannedMatchKeepCase(payload);
 
     var select_list: []const u8 = lc["select ".len..];
     var orig_list: []const u8 = orig_full["select ".len..];
@@ -1337,13 +1338,15 @@ fn appendSelectColumns(
     allocator: Allocator,
     cols: *std.ArrayList(types.Column),
     select_list: []const u8,
+    orig_list: []const u8,
 ) !void {
     var start: usize = 0;
     while (start < select_list.len) {
         const end = nextTopLevelComma(select_list, start) orelse select_list.len;
         const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        const orig_raw = std.mem.trim(u8, orig_list[start..end], " \t\r\n");
         if (raw_expr.len > 0 and !std.mem.eql(u8, raw_expr, "*")) {
-            const alias = stripAlias(raw_expr).alias orelse raw_expr;
+            const alias = stripAlias(orig_raw).alias orelse orig_raw;
             try cols.append(allocator, .{ .name = stripIdentifierQuotes(alias), .type = .string, .nullable = true });
         }
         start = end + 1;
@@ -1357,15 +1360,25 @@ fn StripAliasResult(comptime T: type) type {
     };
 }
 
+/// The AS keyword matches in any case, so a lowered statement and its
+/// case-preserved twin split at the same offset: callers match on the
+/// lowered text and take the alias from the original.
 fn stripAlias(raw_expr: []const u8) StripAliasResult([]const u8) {
     const expr = std.mem.trim(u8, raw_expr, " \t\r\n");
-    if (std.mem.lastIndexOf(u8, expr, " as ")) |idx| {
-        return .{
-            .expr = std.mem.trim(u8, expr[0..idx], " \t\r\n"),
-            .alias = std.mem.trim(u8, expr[idx + 4 ..], " \t\r\n"),
-        };
+    if (expr.len < 4) return .{ .expr = expr, .alias = null };
+    var pos = expr.len - 4;
+    while (true) : (pos -= 1) {
+        if (std.ascii.isWhitespace(expr[pos]) and
+            std.ascii.eqlIgnoreCase(expr[pos + 1 .. pos + 3], "as") and
+            std.ascii.isWhitespace(expr[pos + 3]))
+        {
+            return .{
+                .expr = std.mem.trim(u8, expr[0..pos], " \t\r\n"),
+                .alias = std.mem.trim(u8, expr[pos + 4 ..], " \t\r\n"),
+            };
+        }
+        if (pos == 0) return .{ .expr = expr, .alias = null };
     }
-    return .{ .expr = expr, .alias = null };
 }
 
 fn stripIdentifierQuotes(s_in: []const u8) []const u8 {
@@ -2338,6 +2351,7 @@ fn sendInformationSchemaSelect(
     w: *std.Io.Writer,
     catalog: *Catalog,
     select_list: []const u8,
+    orig_list: []const u8,
     tail: []const u8,
     seq_id: *u8,
     client_caps: u32,
@@ -2348,7 +2362,7 @@ fn sendInformationSchemaSelect(
 
     var projections = std.ArrayList(InfoProjection).empty;
     defer projections.deinit(allocator);
-    try appendInfoProjections(allocator, &projections, select_list, kind);
+    try appendInfoProjections(allocator, &projections, select_list, orig_list, kind);
 
     var cols = std.ArrayList(types.Column).empty;
     defer cols.deinit(allocator);
@@ -2442,6 +2456,7 @@ fn appendInfoProjections(
     allocator: Allocator,
     projections: *std.ArrayList(InfoProjection),
     select_list: []const u8,
+    orig_list: []const u8,
     kind: InfoSchemaKind,
 ) !void {
     var saw_star = false;
@@ -2449,13 +2464,13 @@ fn appendInfoProjections(
     while (start < select_list.len) {
         const end = nextTopLevelComma(select_list, start) orelse select_list.len;
         const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        const orig_raw = std.mem.trim(u8, orig_list[start..end], " \t\r\n");
         if (raw_expr.len > 0) {
             if (std.mem.eql(u8, raw_expr, "*") or std.mem.endsWith(u8, raw_expr, ".*")) {
                 saw_star = true;
             } else {
-                const stripped = stripAlias(raw_expr);
-                const key = infoColumnKey(stripped.expr);
-                const name = stripIdentifierQuotes(stripped.alias orelse key);
+                const key = infoColumnKey(stripAlias(raw_expr).expr);
+                const name = stripIdentifierQuotes(stripAlias(orig_raw).alias orelse key);
                 try projections.append(allocator, .{
                     .column = .{ .name = name, .type = .string, .nullable = true },
                     .key = key,
@@ -4320,5 +4335,50 @@ test "SHOW CREATE TABLE, SHOW COLUMNS and information_schema report ON UPDATE CU
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x2dDEFAULT_GENERATED on update CURRENT_TIMESTAMP") != null);
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x1bon update CURRENT_TIMESTAMP") != null);
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x11DEFAULT_GENERATED") != null);
+    }
+}
+
+/// The first column's name in a result-set reply: the column-def packet
+/// after the column count carries catalog, schema, table and org_table
+/// ahead of the name, each a short lenenc string in these tests.
+fn testFirstColumnName(allocator: Allocator, bytes: []const u8) ![]const u8 {
+    const bodies = try testPacketBodies(allocator, bytes);
+    defer allocator.free(bodies);
+    try std.testing.expect(bodies.len >= 2);
+    const def = bodies[1];
+    var pos: usize = 0;
+    for (0..4) |_| pos += 1 + def[pos];
+    return def[pos + 1 ..][0..def[pos]];
+}
+
+test "a FROM-less shim SELECT and an information_schema SELECT name a column by its alias in any AS case" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE named (id INT)", &profiler);
+    const cases = .{
+        .{ "SELECT CONNECTION_ID() AS id", "id" },
+        .{ "select connection_id() as id", "id" },
+        .{ "SELECT CONNECTION_ID() As Id", "Id" },
+        .{ "SELECT DATABASE()\n\tAS\tDb", "Db" },
+        .{ "SELECT CONNECTION_ID() AS `Conn Id`", "Conn Id" },
+        .{ "SELECT CONNECTION_ID()", "CONNECTION_ID()" },
+        .{ "SELECT TABLE_NAME AS TableName FROM information_schema.TABLES WHERE TABLE_NAME = 'named'", "TableName" },
+    };
+    inline for (cases) |case| {
+        out.clearRetainingCapacity();
+        try handleQuery(allocator, &out.writer, c, &session, case[0], &profiler);
+        try std.testing.expectEqualStrings(case[1], try testFirstColumnName(allocator, out.written()));
     }
 }
