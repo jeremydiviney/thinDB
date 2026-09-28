@@ -390,11 +390,14 @@ pub const ZigFnHandle = struct {
     lib: Dyn,
     /// The submitted source (owned).
     source: []const u8,
+    /// The database whose `_functions/` persists this function (owned).
+    database: []const u8,
 
     pub fn deinit(self: *ZigFnHandle, allocator: Allocator) void {
         self.lib.close();
         allocator.free(self.name);
         allocator.free(self.source);
+        allocator.free(self.database);
     }
 };
 
@@ -468,6 +471,7 @@ pub fn compileAndLoad(
     scratch_path: []const u8,
     name: []const u8,
     source: []const u8,
+    database: []const u8,
     dll_seq: u64,
     registry: *udf_mod.UdfRegistry,
     compile_log: *std.ArrayList(u8),
@@ -573,7 +577,7 @@ pub fn compileAndLoad(
 
     const dll_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ scratch_path, dll_name });
     defer allocator.free(dll_path);
-    return loadAndRegister(allocator, dll_path, name, source, registry);
+    return loadAndRegister(allocator, dll_path, name, source, database, registry);
 }
 
 /// Open a compiled function library, validate the handshake, and register
@@ -584,6 +588,7 @@ pub fn loadAndRegister(
     dll_path: []const u8,
     name: []const u8,
     source: []const u8,
+    database: []const u8,
     registry: *udf_mod.UdfRegistry,
 ) !ZigFnHandle {
     var lib = Dyn.open(dll_path) catch return Error.FunctionInvalidDefinition;
@@ -634,6 +639,12 @@ pub fn loadAndRegister(
         if (b == 0 or b >= desc.n_tables) return Error.FunctionInvalidDefinition;
     }
 
+    const owned_name = try std.ascii.allocLowerString(allocator, name);
+    errdefer allocator.free(owned_name);
+    const owned_source = try allocator.dupe(u8, source);
+    errdefer allocator.free(owned_source);
+    const owned_database = try allocator.dupe(u8, database);
+    errdefer allocator.free(owned_database);
     try registry.registerTable(.{
         .name = name,
         .input_schemas = input_schemas,
@@ -650,9 +661,10 @@ pub fn loadAndRegister(
     });
 
     return .{
-        .name = try std.ascii.allocLowerString(allocator, name),
+        .name = owned_name,
         .lib = lib,
-        .source = try allocator.dupe(u8, source),
+        .source = owned_source,
+        .database = owned_database,
     };
 }
 

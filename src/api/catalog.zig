@@ -247,6 +247,8 @@ pub const Catalog = struct {
         try text.appendSlice(self.allocator, cf.body);
         try text.appendSlice(self.allocator, "\n)");
 
+        // A session can still name a database another connection dropped.
+        const db = self.database(db_name) orelse return Error.DatabaseNotFound;
         try self.sql_fns.register(db_name, .{
             .name = cf.name,
             .param_names = cf.param_names,
@@ -256,7 +258,6 @@ pub const Catalog = struct {
         }, cf.or_replace or skip_persist);
 
         if (skip_persist) return;
-        const db = self.database(db_name) orelse return Error.DatabaseNotFound;
         var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch
             try db.db_dir.createDirPathOpen(self.io, "_functions", .{});
         defer dir.close(self.io);
@@ -314,6 +315,7 @@ pub const Catalog = struct {
         try text.appendSlice(self.allocator, " AS ");
         try text.appendSlice(self.allocator, cv.body);
 
+        const db = self.database(db_name) orelse return Error.DatabaseNotFound;
         try self.views.register(db_name, .{
             .name = cv.name,
             .materialized = cv.materialized,
@@ -322,7 +324,6 @@ pub const Catalog = struct {
         }, cv.or_replace or skip_persist);
 
         if (skip_persist) return;
-        const db = self.database(db_name) orelse return Error.DatabaseNotFound;
         var dir = db.db_dir.openDir(self.io, "_views", .{}) catch
             try db.db_dir.createDirPathOpen(self.io, "_views", .{});
         defer dir.close(self.io);
@@ -379,7 +380,7 @@ pub const Catalog = struct {
             // holds the library path; persistence stores that path.
             self.databases_mutex.lockUncancelable(self.io);
             defer self.databases_mutex.unlock(self.io);
-            var handle = zigfn.loadAndRegister(self.allocator, source, lower, source, &self.udfs) catch |err| return switch (err) {
+            var handle = zigfn.loadAndRegister(self.allocator, source, lower, source, db_name, &self.udfs) catch |err| return switch (err) {
                 zigfn.Error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
                 else => err,
             };
@@ -417,6 +418,7 @@ pub const Catalog = struct {
             scratch_path,
             lower,
             source,
+            db_name,
             seq,
             &self.udfs,
             &log,
@@ -466,6 +468,21 @@ pub const Catalog = struct {
             dir.deleteFile(self.io, pname) catch {};
         }
         return true;
+    }
+
+    fn unloadZigFunctions(self: *Catalog, db_name: []const u8) void {
+        self.databases_mutex.lockUncancelable(self.io);
+        defer self.databases_mutex.unlock(self.io);
+        var i: usize = 0;
+        while (i < self.zig_fns.items.len) {
+            if (!std.mem.eql(u8, self.zig_fns.items[i].database, db_name)) {
+                i += 1;
+                continue;
+            }
+            var handle = self.zig_fns.swapRemove(i);
+            _ = self.udfs.dropTable(handle.name);
+            handle.deinit(self.allocator);
+        }
     }
 
     fn dllPathFileName(buf: []u8, name: []const u8) ![]const u8 {
@@ -647,6 +664,12 @@ pub const Catalog = struct {
             probe.close(self.io);
         }
 
+        // Its views and functions leave memory with the database, before the
+        // directory: a delete that fails partway must not hand them to a
+        // database created later under this name.
+        self.views.dropDatabase(name);
+        self.sql_fns.dropDatabase(name);
+        self.unloadZigFunctions(name);
         try self.root_dir.deleteTree(self.io, name);
     }
 
