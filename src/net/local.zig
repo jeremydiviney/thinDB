@@ -2614,7 +2614,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
         },
         .create_view => |cv| {
             const db_name = ctx.session.current_db;
-            if (!cv.or_replace and catalog.views.get(db_name, cv.name) != null) return Error.TableAlreadyExists;
+            if (!cv.or_replace and catalog.views.contains(db_name, cv.name)) return Error.TableAlreadyExists;
             // Validate the defining query parses now, not at first use.
             {
                 var va = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -2646,12 +2646,10 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             if (!existed and !dv.if_exists) return Error.TableNotFound;
         },
         .refresh_view => |name| {
-            const def = catalog.views.get(ctx.session.current_db, name) orelse return Error.TableNotFound;
+            const def = (try catalog.views.get(ctx.allocator, ctx.session.current_db, name)) orelse return Error.TableNotFound;
+            defer def.deinit(ctx.allocator);
             if (!def.materialized) return Error.UnsupportedOp;
-            // Copy the body: the registry entry can change under concurrent DDL.
-            const body = try ctx.allocator.dupe(u8, def.body);
-            defer ctx.allocator.free(body);
-            const n = try buildMaterializedView(ctx, catalog, name, body, true, false);
+            const n = try buildMaterializedView(ctx, catalog, name, def.body, true, false);
             ctx.affected_rows = @intCast(n);
         },
     }
@@ -4271,8 +4269,9 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
         },
         .create_function => |fname| blk: {
             // SQL inline function: the canonical persisted CREATE text.
-            if (catalog.sql_fns.get(ctx.session.current_db, fname)) |def| {
-                var one = [_][]u8{@constCast(def.create_text)};
+            if (try catalog.sql_fns.get(ctx.allocator, ctx.session.current_db, fname)) |def| {
+                defer def.deinit(ctx.allocator);
+                const one = [_][]const u8{def.create_text};
                 break :blk try TextRowsOp.create(ctx.allocator, "Create Function", &one);
             }
             // LANGUAGE zig function: reconstruct the CREATE around the

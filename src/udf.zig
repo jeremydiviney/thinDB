@@ -281,12 +281,60 @@ pub const SqlTableFn = struct {
     /// The verbatim CREATE FUNCTION statement — the persistence format:
     /// stored as `<db>/_functions/<name>.sql` and re-parsed on open.
     create_text: []const u8,
+
+    pub fn clone(self: SqlTableFn, allocator: Allocator) Allocator.Error!SqlTableFn {
+        const name = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(name);
+        const param_names = try allocator.alloc([]const u8, self.param_names.len);
+        var copied: usize = 0;
+        errdefer {
+            for (param_names[0..copied]) |p| allocator.free(p);
+            allocator.free(param_names);
+        }
+        for (self.param_names) |p| {
+            param_names[copied] = try allocator.dupe(u8, p);
+            copied += 1;
+        }
+        const param_types = try allocator.dupe(Type, self.param_types);
+        errdefer allocator.free(param_types);
+        const body = try allocator.dupe(u8, self.body);
+        errdefer allocator.free(body);
+        const create_text = try allocator.dupe(u8, self.create_text);
+        return .{
+            .name = name,
+            .param_names = param_names,
+            .param_types = param_types,
+            .body = body,
+            .create_text = create_text,
+        };
+    }
+
+    pub fn deinit(self: SqlTableFn, allocator: Allocator) void {
+        allocator.free(self.name);
+        for (self.param_names) |p| allocator.free(p);
+        allocator.free(self.param_names);
+        allocator.free(self.param_types);
+        allocator.free(self.body);
+        allocator.free(self.create_text);
+    }
 };
+
+/// The registry key `<db>\x00<lowercased name>` in `buf`, or null when it
+/// does not fit (no registered name can be that long).
+fn lookupKey(buf: *[512]u8, db: []const u8, name: []const u8) ?[]const u8 {
+    const len = db.len + 1 + name.len;
+    if (len > buf.len) return null;
+    @memcpy(buf[0..db.len], db);
+    buf[db.len] = 0;
+    for (name, buf[db.len + 1 ..][0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+    return buf[0..len];
+}
 
 /// Catalog-owned registry of SQL inline table functions, keyed by
 /// `<database>\x00<name>` (functions are database-scoped like tables).
-/// All strings are owned copies. Thread-safe: parse-time lookups and
-/// DDL mutations take the mutex.
+/// All strings are owned copies. Thread-safe: every read and DDL mutation
+/// takes the mutex, and no pointer into the map is handed out — the parser
+/// reads definitions before its statement holds a lease.
 pub const SqlFnRegistry = struct {
     allocator: Allocator,
     map: std.StringHashMapUnmanaged(SqlTableFn) = .empty,
@@ -300,19 +348,10 @@ pub const SqlFnRegistry = struct {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
-            self.freeFn(e.value_ptr.*);
+            e.value_ptr.deinit(self.allocator);
         }
         self.map.deinit(self.allocator);
         self.* = undefined;
-    }
-
-    fn freeFn(self: *SqlFnRegistry, f: SqlTableFn) void {
-        self.allocator.free(f.name);
-        for (f.param_names) |p| self.allocator.free(p);
-        self.allocator.free(f.param_names);
-        self.allocator.free(f.param_types);
-        self.allocator.free(f.body);
-        self.allocator.free(f.create_text);
     }
 
     fn key(allocator: Allocator, db: []const u8, name: []const u8) ![]u8 {
@@ -337,40 +376,21 @@ pub const SqlFnRegistry = struct {
         const k = try key(self.allocator, db, f.name);
         errdefer self.allocator.free(k);
         const name = try lowerName(self.allocator, f.name);
-        errdefer self.allocator.free(name);
-        const param_names = try self.allocator.alloc([]const u8, f.param_names.len);
-        var pn: usize = 0;
-        errdefer {
-            for (param_names[0..pn]) |p| self.allocator.free(p);
-            self.allocator.free(param_names);
-        }
-        for (f.param_names) |p| {
-            param_names[pn] = try self.allocator.dupe(u8, p);
-            pn += 1;
-        }
-        const param_types = try self.allocator.dupe(Type, f.param_types);
-        errdefer self.allocator.free(param_types);
-        const body = try self.allocator.dupe(u8, f.body);
-        errdefer self.allocator.free(body);
-        const create_text = try self.allocator.dupe(u8, f.create_text);
-        errdefer self.allocator.free(create_text);
-        const owned: SqlTableFn = .{
-            .name = name,
-            .param_names = param_names,
-            .param_types = param_types,
-            .body = body,
-            .create_text = create_text,
-        };
+        defer self.allocator.free(name);
+        var lowered = f;
+        lowered.name = name;
+        const owned = try lowered.clone(self.allocator);
+        errdefer owned.deinit(self.allocator);
 
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         const gop = try self.map.getOrPut(self.allocator, k);
         if (gop.found_existing) {
-            // The error return frees k + every `owned` component via the
-            // errdefers above — no manual frees here or they double-free.
+            // The error return frees k and `owned` via the errdefers above —
+            // no manual frees here or they double-free.
             if (!replace) return Error.FunctionAlreadyExists;
             self.allocator.free(k);
-            self.freeFn(gop.value_ptr.*);
+            gop.value_ptr.deinit(self.allocator);
             gop.value_ptr.* = owned;
         } else {
             gop.value_ptr.* = owned;
@@ -385,17 +405,12 @@ pub const SqlFnRegistry = struct {
         defer self.mutex.unlock();
         if (self.map.fetchRemove(k)) |kv| {
             self.allocator.free(kv.key);
-            self.freeFn(kv.value);
+            kv.value.deinit(self.allocator);
             return true;
         }
         return false;
     }
 
-    /// Parse-time lookup. The returned pointer stays valid only while no
-    /// concurrent register/drop mutates this entry — callers copy what
-    /// they need into their arena before releasing implied ownership
-    /// (queries parse fast; DDL on a function mid-parse of a query using
-    /// it is a documented race we accept like table DDL).
     /// Names of every function registered for `db`, allocated copies.
     pub fn listNames(self: *SqlFnRegistry, allocator: Allocator, db: []const u8) ![][]u8 {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -415,15 +430,16 @@ pub const SqlFnRegistry = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    pub fn get(self: *SqlFnRegistry, db: []const u8, name: []const u8) ?*const SqlTableFn {
+    /// A copy of the definition in `allocator`, or null. The copy is taken
+    /// under the mutex: a concurrent replace or drop frees the entry, and
+    /// any register can move it.
+    pub fn get(self: *SqlFnRegistry, allocator: Allocator, db: []const u8, name: []const u8) Allocator.Error!?SqlTableFn {
         var kbuf: [512]u8 = undefined;
-        if (db.len + 1 + name.len > kbuf.len) return null;
-        @memcpy(kbuf[0..db.len], db);
-        kbuf[db.len] = 0;
-        for (name, kbuf[db.len + 1 ..][0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+        const k = lookupKey(&kbuf, db, name) orelse return null;
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        return self.map.getPtr(kbuf[0 .. db.len + 1 + name.len]);
+        const def = self.map.get(k) orelse return null;
+        return try def.clone(allocator);
     }
 };
 
@@ -440,10 +456,31 @@ pub const ViewDef = struct {
     /// Verbatim CREATE statement — the `<db>/_views/<name>.sql` persistence
     /// format, re-parsed on catalog open.
     create_text: []const u8,
+
+    pub fn clone(self: ViewDef, allocator: Allocator) Allocator.Error!ViewDef {
+        const name = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(name);
+        const body = try allocator.dupe(u8, self.body);
+        errdefer allocator.free(body);
+        const create_text = try allocator.dupe(u8, self.create_text);
+        return .{
+            .name = name,
+            .materialized = self.materialized,
+            .body = body,
+            .create_text = create_text,
+        };
+    }
+
+    pub fn deinit(self: ViewDef, allocator: Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.body);
+        allocator.free(self.create_text);
+    }
 };
 
 /// Catalog-owned registry of views, keyed `<database>\x00<name>` like the
-/// function registry. All strings are owned copies; thread-safe.
+/// function registry. All strings are owned copies; thread-safe, and like
+/// the function registry it hands out copies, never pointers into the map.
 pub const ViewRegistry = struct {
     allocator: Allocator,
     map: std.StringHashMapUnmanaged(ViewDef) = .empty,
@@ -457,16 +494,10 @@ pub const ViewRegistry = struct {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
-            self.freeView(e.value_ptr.*);
+            e.value_ptr.deinit(self.allocator);
         }
         self.map.deinit(self.allocator);
         self.* = undefined;
-    }
-
-    fn freeView(self: *ViewRegistry, v: ViewDef) void {
-        self.allocator.free(v.name);
-        self.allocator.free(v.body);
-        self.allocator.free(v.create_text);
     }
 
     fn viewKey(allocator: Allocator, db: []const u8, name: []const u8) ![]u8 {
@@ -483,17 +514,11 @@ pub const ViewRegistry = struct {
         const k = try viewKey(self.allocator, db, v.name);
         errdefer self.allocator.free(k);
         const name = try lowerName(self.allocator, v.name);
-        errdefer self.allocator.free(name);
-        const body = try self.allocator.dupe(u8, v.body);
-        errdefer self.allocator.free(body);
-        const create_text = try self.allocator.dupe(u8, v.create_text);
-        errdefer self.allocator.free(create_text);
-        const owned: ViewDef = .{
-            .name = name,
-            .materialized = v.materialized,
-            .body = body,
-            .create_text = create_text,
-        };
+        defer self.allocator.free(name);
+        var lowered = v;
+        lowered.name = name;
+        const owned = try lowered.clone(self.allocator);
+        errdefer owned.deinit(self.allocator);
 
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -501,7 +526,7 @@ pub const ViewRegistry = struct {
         if (gop.found_existing) {
             if (!replace) return Error.ViewAlreadyExists;
             self.allocator.free(k);
-            self.freeView(gop.value_ptr.*);
+            gop.value_ptr.deinit(self.allocator);
             gop.value_ptr.* = owned;
         } else {
             gop.value_ptr.* = owned;
@@ -516,21 +541,30 @@ pub const ViewRegistry = struct {
         defer self.mutex.unlock();
         if (self.map.fetchRemove(k)) |kv| {
             self.allocator.free(kv.key);
-            self.freeView(kv.value);
+            kv.value.deinit(self.allocator);
             return true;
         }
         return false;
     }
 
-    pub fn get(self: *ViewRegistry, db: []const u8, name: []const u8) ?*const ViewDef {
+    /// A copy of the definition in `allocator`, or null. The copy is taken
+    /// under the mutex: a concurrent replace or drop frees the entry, and
+    /// any register can move it.
+    pub fn get(self: *ViewRegistry, allocator: Allocator, db: []const u8, name: []const u8) Allocator.Error!?ViewDef {
         var kbuf: [512]u8 = undefined;
-        if (db.len + 1 + name.len > kbuf.len) return null;
-        @memcpy(kbuf[0..db.len], db);
-        kbuf[db.len] = 0;
-        for (name, kbuf[db.len + 1 ..][0..name.len]) |c, *o| o.* = std.ascii.toLower(c);
+        const k = lookupKey(&kbuf, db, name) orelse return null;
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        return self.map.getPtr(kbuf[0 .. db.len + 1 + name.len]);
+        const def = self.map.get(k) orelse return null;
+        return try def.clone(allocator);
+    }
+
+    pub fn contains(self: *ViewRegistry, db: []const u8, name: []const u8) bool {
+        var kbuf: [512]u8 = undefined;
+        const k = lookupKey(&kbuf, db, name) orelse return false;
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        return self.map.contains(k);
     }
 
     /// Names of every view registered for `db`, allocated copies.
@@ -921,4 +955,69 @@ test "udf registry rejects duplicates and reserved builtins" {
         .return_type = .int,
         .kernel = noop,
     }));
+}
+
+// The parser reads view and function definitions before its statement holds
+// a lease (#368), so a lookup's result must survive a concurrent replace,
+// drop, or map growth.
+test "registry lookups return copies that outlive replace, growth and drop" {
+    const testing = std.testing;
+    var views = ViewRegistry.init(testing.allocator);
+    defer views.deinit();
+    try views.register("db", .{ .name = "V", .materialized = false, .body = "SELECT 1", .create_text = "CREATE VIEW V AS SELECT 1" }, false);
+    const view = (try views.get(testing.allocator, "db", "v")).?;
+    defer view.deinit(testing.allocator);
+
+    try views.register("db", .{ .name = "v", .materialized = true, .body = "SELECT 2", .create_text = "CREATE VIEW v AS SELECT 2" }, true);
+    var name_buf: [16]u8 = undefined;
+    for (0..64) |i| {
+        const filler = try std.fmt.bufPrint(&name_buf, "filler_{d}", .{i});
+        try views.register("db", .{ .name = filler, .materialized = false, .body = "SELECT 3", .create_text = "CREATE VIEW f AS SELECT 3" }, false);
+    }
+    try testing.expect(try views.drop("db", "v"));
+
+    try testing.expectEqualStrings("v", view.name);
+    try testing.expect(!view.materialized);
+    try testing.expectEqualStrings("SELECT 1", view.body);
+    try testing.expectEqualStrings("CREATE VIEW V AS SELECT 1", view.create_text);
+    try testing.expect((try views.get(testing.allocator, "db", "v")) == null);
+    try testing.expect(!views.contains("db", "v"));
+    try testing.expect(views.contains("db", "FILLER_7"));
+
+    var fns = SqlFnRegistry.init(testing.allocator);
+    defer fns.deinit();
+    try fns.register("db", .{ .name = "F", .param_names = &.{"a"}, .param_types = &.{.bigint}, .body = "SELECT a", .create_text = "CREATE FUNCTION F(a BIGINT)" }, false);
+    const f = (try fns.get(testing.allocator, "db", "f")).?;
+    defer f.deinit(testing.allocator);
+
+    try fns.register("db", .{ .name = "f", .param_names = &.{ "b", "c" }, .param_types = &.{ .int, .string }, .body = "SELECT b, c", .create_text = "CREATE FUNCTION f(b INT, c STRING)" }, true);
+    try testing.expect(try fns.drop("db", "f"));
+
+    try testing.expectEqualStrings("f", f.name);
+    try testing.expectEqual(@as(usize, 1), f.param_names.len);
+    try testing.expectEqualStrings("a", f.param_names[0]);
+    try testing.expectEqualSlices(Type, &.{.bigint}, f.param_types);
+    try testing.expectEqualStrings("SELECT a", f.body);
+    try testing.expectEqualStrings("CREATE FUNCTION F(a BIGINT)", f.create_text);
+    try testing.expect((try fns.get(testing.allocator, "db", "f")) == null);
+}
+
+test "a registry copy that runs out of memory frees what it copied" {
+    const testing = std.testing;
+    var fns = SqlFnRegistry.init(testing.allocator);
+    defer fns.deinit();
+    try fns.register("db", .{ .name = "g", .param_names = &.{ "a", "b" }, .param_types = &.{ .int, .int }, .body = "SELECT a + b", .create_text = "CREATE FUNCTION g(a INT, b INT)" }, false);
+    var views = ViewRegistry.init(testing.allocator);
+    defer views.deinit();
+    try views.register("db", .{ .name = "w", .materialized = false, .body = "SELECT 1", .create_text = "CREATE VIEW w AS SELECT 1" }, false);
+
+    const copy_both = struct {
+        fn run(allocator: Allocator, fn_registry: *SqlFnRegistry, view_registry: *ViewRegistry) !void {
+            const f = (try fn_registry.get(allocator, "db", "g")).?;
+            defer f.deinit(allocator);
+            const view = (try view_registry.get(allocator, "db", "w")).?;
+            view.deinit(allocator);
+        }
+    }.run;
+    try testing.checkAllAllocationFailures(testing.allocator, copy_both, .{ &fns, &views });
 }
