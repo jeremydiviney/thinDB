@@ -18,8 +18,9 @@
 //!
 //!   Sequence of records, each:
 //!     type u8             1   (1=insert, 2=delete, 3=flush_marker,
-//!                                  4=delete_expr, 5=replace; 2 and 4 are
-//!                                  only read, from logs older binaries wrote)
+//!                                  4=delete_expr, 5=replace, 6=statement;
+//!                                  2 and 4 are only read, from logs older
+//!                                  binaries wrote)
 //!     payload_len u32     4
 //!     payload bytes       N
 //!     checksum u64        8   (XxHash64 of [type ++ payload_len ++ payload])
@@ -39,11 +40,18 @@
 //! Flush-marker payload:
 //!     max_segment_id u64   (records BEFORE this marker are redundant)
 //!
-//! Replace payload (one UPDATE or DELETE batch):
+//! Replace payload (one step of an UPDATE or DELETE):
 //!     retracted rows       (insert-payload layout)
 //!     segment_id u64
 //!     offset_count u32 + offset u32 each   (tombstoned in that segment)
 //!     replacement rows     (insert-payload layout)
+//!
+//! Statement payload (an UPDATE or DELETE of more than one step):
+//!     step_count u32
+//!     per step: payload_len u32 + replace payload
+//!
+//! A one-step statement logs a plain `replace` record. Older binaries reject
+//! a `statement` record as WalUnknownRecord rather than skip it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -99,15 +107,18 @@ pub const RecordType = enum(u8) {
     /// A DELETE's `PredicateExpr`, replayed by evaluating it over the
     /// memtable. Only older binaries wrote it, like `delete`.
     delete_expr = 4,
-    /// One UPDATE or DELETE batch: the memtable rows it retracts, the offsets
-    /// it tombstones in one segment, and the rows that replace them (none for
-    /// a DELETE). One record, so replay applies an UPDATE's deletes and their
-    /// replacements together or not at all. Replay hands the offsets back to
-    /// the table, which merges them into the segment's tombstone file.
+    /// One step of an UPDATE or DELETE: the memtable rows it retracts, the
+    /// offsets it tombstones in one segment, and the rows that replace them
+    /// (none for a DELETE). Replay hands the offsets back to the table, which
+    /// merges them into the segment's tombstone file.
     replace = 5,
+    /// Every step of one UPDATE or DELETE, each a `replace` payload, under
+    /// one checksum: replay applies the whole statement or none of it (#335).
+    statement = 6,
 };
 
-/// Segment offsets that `replace` records tombstone, per segment id.
+/// Segment offsets to tombstone, per segment id: those replayed records
+/// carry, or those a running statement has staged.
 pub const SegmentTombstones = std.AutoArrayHashMapUnmanaged(u64, std.ArrayList(u32));
 
 pub fn addSegmentTombstones(allocator: Allocator, map: *SegmentTombstones, segment_id: u64, offsets: []const u32) !void {
@@ -117,24 +128,82 @@ pub fn addSegmentTombstones(allocator: Allocator, map: *SegmentTombstones, segme
     try entry.value_ptr.appendSlice(allocator, offsets);
 }
 
-/// Room for `n` more offsets of segment `segment_id`, so that
-/// `addSegmentTombstonesAssumeCapacity` can't fail.
-pub fn reserveSegmentTombstones(allocator: Allocator, map: *SegmentTombstones, segment_id: u64, n: usize) !void {
-    if (n == 0) return;
-    const entry = try map.getOrPut(allocator, segment_id);
-    if (!entry.found_existing) entry.value_ptr.* = .empty;
-    try entry.value_ptr.ensureUnusedCapacity(allocator, n);
-}
-
-pub fn addSegmentTombstonesAssumeCapacity(map: *SegmentTombstones, segment_id: u64, offsets: []const u32) void {
-    if (offsets.len == 0) return;
-    map.getPtr(segment_id).?.appendSliceAssumeCapacity(offsets);
-}
-
 pub fn deinitSegmentTombstones(allocator: Allocator, map: *SegmentTombstones) void {
     for (map.values()) |*offsets| offsets.deinit(allocator);
     map.deinit(allocator);
     map.* = .empty;
+}
+
+/// The steps of one UPDATE or DELETE, encoded as they are staged and logged
+/// together by `WalWriter.appendStatement`.
+pub const StatementSteps = struct {
+    /// The statement payload: a step count, then each step's length and
+    /// `replace` payload.
+    bytes: std.ArrayList(u8) = .empty,
+    count: u32 = 0,
+
+    const step_count_size = 4;
+    const step_len_size = 4;
+
+    pub fn deinit(self: *StatementSteps, allocator: Allocator) void {
+        self.bytes.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn clear(self: *StatementSteps) void {
+        self.bytes.clearRetainingCapacity();
+        self.count = 0;
+    }
+
+    pub fn append(
+        self: *StatementSteps,
+        allocator: Allocator,
+        schema: []const types.Column,
+        retracted: []const ColumnStore,
+        retracted_rows: usize,
+        segment_id: u64,
+        offsets: []const u32,
+        inserted: []const ColumnStore,
+        inserted_rows: usize,
+    ) !void {
+        const start = self.bytes.items.len;
+        errdefer self.bytes.shrinkRetainingCapacity(start);
+        if (start == 0) try self.bytes.appendNTimes(allocator, 0, step_count_size);
+        const len_at = self.bytes.items.len;
+        try self.bytes.appendNTimes(allocator, 0, step_len_size);
+        try encodeReplacePayload(allocator, &self.bytes, schema, retracted, retracted_rows, segment_id, offsets, inserted, inserted_rows);
+        const step_len = self.bytes.items.len - len_at - step_len_size;
+        format.writeU32(self.bytes.items[len_at..][0..step_len_size], @intCast(step_len));
+        self.count += 1;
+        format.writeU32(self.bytes.items[0..step_count_size], self.count);
+    }
+
+    /// The only step's `replace` payload.
+    fn onlyStep(self: *const StatementSteps) []const u8 {
+        std.debug.assert(self.count == 1);
+        return self.bytes.items[step_count_size + step_len_size ..];
+    }
+};
+
+/// Encode a `replace` payload onto `out`: the rows a step retracts from
+/// the memtable, the offsets it tombstones in segment `segment_id`, and the
+/// replacement rows. Either side may be empty.
+fn encodeReplacePayload(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    schema: []const types.Column,
+    retracted: []const ColumnStore,
+    retracted_rows: usize,
+    segment_id: u64,
+    offsets: []const u32,
+    inserted: []const ColumnStore,
+    inserted_rows: usize,
+) !void {
+    try codec.encodeRows(allocator, out, schema, retracted, 0, retracted_rows);
+    try format.appendU64(allocator, out, segment_id);
+    try format.appendU32(allocator, out, @intCast(offsets.len));
+    for (offsets) |offset| try format.appendU32(allocator, out, offset);
+    try codec.encodeRows(allocator, out, schema, inserted, 0, inserted_rows);
 }
 
 pub const Error = error{
@@ -256,28 +325,12 @@ pub const WalWriter = struct {
         return self.writeRecord(.insert, payload.items);
     }
 
-    /// Encode one UPDATE or DELETE batch as a `replace` record (no fsync):
-    /// the rows it retracts from the memtable, the offsets it tombstones in
-    /// segment `segment_id`, and the replacement rows. Either side may be
-    /// empty.
-    pub fn appendReplace(
-        self: *WalWriter,
-        schema: []const types.Column,
-        retracted: []const ColumnStore,
-        retracted_rows: usize,
-        segment_id: u64,
-        offsets: []const u32,
-        inserted: []const ColumnStore,
-        inserted_rows: usize,
-    ) !u64 {
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-        try codec.encodeRows(self.allocator, &payload, schema, retracted, 0, retracted_rows);
-        try format.appendU64(self.allocator, &payload, segment_id);
-        try format.appendU32(self.allocator, &payload, @intCast(offsets.len));
-        for (offsets) |offset| try format.appendU32(self.allocator, &payload, offset);
-        try codec.encodeRows(self.allocator, &payload, schema, inserted, 0, inserted_rows);
-        return self.writeRecord(.replace, payload.items);
+    /// Log a statement's steps as one record (no fsync): a `replace` record
+    /// for a single step, a `statement` record for more.
+    pub fn appendStatement(self: *WalWriter, steps: *const StatementSteps) !u64 {
+        std.debug.assert(steps.count > 0);
+        if (steps.count == 1) return self.writeRecord(.replace, steps.onlyStep());
+        return self.writeRecord(.statement, steps.bytes.items);
     }
 
     pub fn appendFlushMarker(self: *WalWriter, max_segment_id: u64) !u64 {
@@ -520,6 +573,7 @@ pub fn replayFromCheckpoint(
             .delete => try codec.applyDeleteRecord(allocator, rec.payload, mt),
             .delete_expr => try codec.applyDeleteExprRecord(allocator, rec.payload, mt),
             .replace => try codec.applyReplaceRecord(allocator, rec.payload, mt, tombstones),
+            .statement => try codec.applyStatementRecord(allocator, rec.payload, mt, tombstones),
             .flush_marker => {},
         }
         did_replay = true;
@@ -538,7 +592,7 @@ const ReadRecord = struct {
 fn readRecord(bytes: []const u8, off: usize) !ReadRecord {
     if (off + record_header_size > bytes.len) return Error.WalTooSmall;
     const tag_byte = bytes[off];
-    if (tag_byte < 1 or tag_byte > @intFromEnum(RecordType.replace)) return Error.WalUnknownRecord;
+    if (tag_byte < 1 or tag_byte > @intFromEnum(RecordType.statement)) return Error.WalUnknownRecord;
     const t: RecordType = @enumFromInt(tag_byte);
     const payload_len = format.readU32(bytes[off + 1 .. off + 5]);
     const payload_end = off + record_header_size + payload_len;
@@ -621,8 +675,13 @@ test "wal replace records retract one equal row each and hand back their offsets
         var writer = try WalWriter.create(a, io, tmp.dir, 99);
         defer writer.deinit();
         _ = try writer.appendInsert(&live, 0, 4);
-        _ = try writer.appendReplace(schema.columns, retracted.columns, 1, 7, &.{ 4, 1 }, inserted.columns, 1);
-        _ = try writer.appendReplace(schema.columns, &.{}, 0, 8, &.{0}, &.{}, 0);
+        var steps: StatementSteps = .{};
+        defer steps.deinit(a);
+        try steps.append(a, schema.columns, retracted.columns, 1, 7, &.{ 4, 1 }, inserted.columns, 1);
+        _ = try writer.appendStatement(&steps);
+        steps.clear();
+        try steps.append(a, schema.columns, &.{}, 0, 8, &.{0}, &.{}, 0);
+        _ = try writer.appendStatement(&steps);
     }
 
     var recovered = try Memtable.init(a, schema);
@@ -639,6 +698,165 @@ test "wal replace records retract one equal row each and hand back their offsets
     try std.testing.expectEqual(@as(usize, 2), tombstones.count());
     try std.testing.expectEqualSlices(u32, &.{ 4, 1 }, tombstones.get(7).?.items);
     try std.testing.expectEqualSlices(u32, &.{0}, tombstones.get(8).?.items);
+}
+
+/// A log the release before #335 wrote: two inserts around a flush marker,
+/// then `replace` records carrying rows and offsets, offsets alone, and a
+/// retraction alone. Its schema is `golden_schema`, its fingerprint 0x5eed.
+const golden_wal_hex =
+    "7444425702000000ed5e000000000000fef606d7aa4147ea190a16ef0ece16d501280000000200000001000000000000" ++
+    "000200000000000000010a0000000000000001000000610200000062623b6555ad1d8d75470308000000030000000000" ++
+    "00006e0580a434333f88013900000003000000030000000000000004000000000000000500000000000000051e000000" ++
+    "000000003200000001000000630200000064640100000065a0fc3e974001ecd405410000000100000004000000000000" ++
+    "0000000000000200000064640700000000000000020000000400000001000000010000000400000000000000012c0000" ++
+    "00010000007a32afdd1f725639e805180000000000000008000000000000000100000000000000000000007dfb88a135" ++
+    "05405b0526000000010000000300000000000000011e00000001000000630000000000000000000000000000000061a4" ++
+    "752881116b88";
+
+const golden_schema = types.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "v", .type = .int, .nullable = true },
+        .{ .name = "s", .type = .string },
+    },
+    .order_key = &.{"id"},
+    .unique = false,
+};
+
+test "a log the previous release wrote replays unchanged" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var golden: [golden_wal_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&golden, golden_wal_hex);
+    try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = &golden });
+
+    var recovered = try Memtable.init(a, golden_schema);
+    defer recovered.deinit();
+    var tombstones: SegmentTombstones = .empty;
+    defer deinitSegmentTombstones(a, &tombstones);
+    _ = try replayFromCheckpoint(a, io, tmp.dir, 0x5eed, &recovered, .{}, &tombstones);
+
+    try std.testing.expectEqualSlices(i64, &.{ 5, 4 }, recovered.columns[0].data.bigint.items);
+    try std.testing.expectEqualSlices(i32, &.{ 50, 44 }, recovered.columns[1].view().data.int);
+    const strings = recovered.columns[2].view().data.string;
+    try std.testing.expectEqualStrings("e", strings.rowBytes(0));
+    try std.testing.expectEqualStrings("z", strings.rowBytes(1));
+    try std.testing.expectEqual(@as(usize, 2), tombstones.count());
+    try std.testing.expectEqualSlices(u32, &.{ 4, 1 }, tombstones.get(7).?.items);
+    try std.testing.expectEqualSlices(u32, &.{0}, tombstones.get(8).?.items);
+}
+
+test "a one-step statement logs the replace record the previous release did" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var first = try Memtable.init(a, golden_schema);
+    defer first.deinit();
+    try first.insertRows(&.{
+        .{ .id = @as(i64, 1), .v = @as(?i32, 10), .s = "a" },
+        .{ .id = @as(i64, 2), .v = @as(?i32, null), .s = "bb" },
+    });
+    var live = try Memtable.init(a, golden_schema);
+    defer live.deinit();
+    try live.insertRows(&.{
+        .{ .id = @as(i64, 3), .v = @as(?i32, 30), .s = "c" },
+        .{ .id = @as(i64, 4), .v = @as(?i32, null), .s = "dd" },
+        .{ .id = @as(i64, 5), .v = @as(?i32, 50), .s = "e" },
+    });
+    var retract4 = try Memtable.init(a, golden_schema);
+    defer retract4.deinit();
+    try retract4.insertRows(&.{.{ .id = @as(i64, 4), .v = @as(?i32, null), .s = "dd" }});
+    var insert4 = try Memtable.init(a, golden_schema);
+    defer insert4.deinit();
+    try insert4.insertRows(&.{.{ .id = @as(i64, 4), .v = @as(?i32, 44), .s = "z" }});
+    var retract3 = try Memtable.init(a, golden_schema);
+    defer retract3.deinit();
+    try retract3.insertRows(&.{.{ .id = @as(i64, 3), .v = @as(?i32, 30), .s = "c" }});
+    const columns = golden_schema.columns;
+    {
+        var writer = try WalWriter.create(a, io, tmp.dir, 0x5eed);
+        defer writer.deinit();
+        _ = try writer.appendInsert(&first, 0, 2);
+        _ = try writer.appendFlushMarker(3);
+        _ = try writer.appendInsert(&live, 0, 3);
+        var steps: StatementSteps = .{};
+        defer steps.deinit(a);
+        try steps.append(a, columns, retract4.columns, 1, 7, &.{ 4, 1 }, insert4.columns, 1);
+        _ = try writer.appendStatement(&steps);
+        steps.clear();
+        try steps.append(a, columns, &.{}, 0, 8, &.{0}, &.{}, 0);
+        _ = try writer.appendStatement(&steps);
+        steps.clear();
+        try steps.append(a, columns, retract3.columns, 1, 0, &.{}, &.{}, 0);
+        _ = try writer.appendStatement(&steps);
+    }
+    const written = try tmp.dir.readFileAlloc(io, wal_filename, a, .unlimited);
+    defer a.free(written);
+    var golden: [golden_wal_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&golden, golden_wal_hex);
+    // Bytes 16..32 of the header are the log's random generation.
+    try std.testing.expectEqualSlices(u8, golden[0..16], written[0..16]);
+    try std.testing.expectEqualSlices(u8, golden[header_size..], written[header_size..]);
+}
+
+test "a statement record replays all its steps, or none once torn" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "tag", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var live = try Memtable.init(a, schema);
+    defer live.deinit();
+    try live.insertRows(&.{
+        .{ .id = @as(i64, 1), .tag = "a" },
+        .{ .id = @as(i64, 2), .tag = "b" },
+        .{ .id = @as(i64, 3), .tag = "c" },
+    });
+    var retract1 = try Memtable.init(a, schema);
+    defer retract1.deinit();
+    try retract1.insertRows(&.{.{ .id = @as(i64, 1), .tag = "a" }});
+    var retract2 = try Memtable.init(a, schema);
+    defer retract2.deinit();
+    try retract2.insertRows(&.{.{ .id = @as(i64, 2), .tag = "b" }});
+    var insert2 = try Memtable.init(a, schema);
+    defer insert2.deinit();
+    try insert2.insertRows(&.{.{ .id = @as(i64, 2), .tag = "z" }});
+    {
+        var writer = try WalWriter.create(a, io, tmp.dir, 77);
+        defer writer.deinit();
+        _ = try writer.appendInsert(&live, 0, 3);
+        var steps: StatementSteps = .{};
+        defer steps.deinit(a);
+        try steps.append(a, schema.columns, retract2.columns, 1, 7, &.{3}, insert2.columns, 1);
+        try steps.append(a, schema.columns, retract1.columns, 1, 8, &.{ 5, 0 }, &.{}, 0);
+        _ = try writer.appendStatement(&steps);
+    }
+
+    var recovered = try Memtable.init(a, schema);
+    defer recovered.deinit();
+    var tombstones: SegmentTombstones = .empty;
+    defer deinitSegmentTombstones(a, &tombstones);
+    _ = try replayFromCheckpoint(a, io, tmp.dir, 77, &recovered, .{}, &tombstones);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, recovered.columns[0].data.bigint.items);
+    try std.testing.expectEqualStrings("z", recovered.columns[1].view().data.string.rowBytes(1));
+    try std.testing.expectEqualSlices(u32, &.{3}, tombstones.get(7).?.items);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 0 }, tombstones.get(8).?.items);
+
+    const bytes = try tmp.dir.readFileAlloc(io, wal_filename, a, .unlimited);
+    defer a.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = bytes[0 .. bytes.len - 1] });
+    recovered.clear();
+    deinitSegmentTombstones(a, &tombstones);
+    _ = try replayFromCheckpoint(a, io, tmp.dir, 77, &recovered, .{}, &tombstones);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, recovered.columns[0].data.bigint.items);
+    try std.testing.expectEqual(@as(usize, 0), tombstones.count());
 }
 
 test "truncate failure clears the group-commit coordinator" {

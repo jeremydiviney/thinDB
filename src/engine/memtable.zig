@@ -153,30 +153,7 @@ pub const Memtable = struct {
     /// auto-flush size triggers. Doesn't include ArrayList overhead or any
     /// auxiliary indexes — just the data.
     pub fn byteSize(self: Memtable) usize {
-        var total: usize = 0;
-        for (self.columns) |col| {
-            total += switch (col.data) {
-                .int => |l| l.items.len * @sizeOf(i32),
-                .bigint => |l| l.items.len * @sizeOf(i64),
-                .boolean => |l| l.items.len,
-                .varchar => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
-                .string => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
-                .float => |l| l.items.len * @sizeOf(f32),
-                .double => |l| l.items.len * @sizeOf(f64),
-                .date => |l| l.items.len * @sizeOf(i32),
-                .datetime => |l| l.items.len * @sizeOf(i64),
-                .tinyint => |l| l.items.len,
-                .smallint => |l| l.items.len * @sizeOf(i16),
-                .largeint => |l| l.items.len * @sizeOf(i128),
-                .char => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
-                .json => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
-                .decimal64 => |l| l.items.len * @sizeOf(i64),
-                .decimal128 => |l| l.items.len * @sizeOf(i128),
-                .uuid => |l| l.items.len * @sizeOf(u128),
-            };
-            if (col.nulls) |n| total += n.items.len;
-        }
-        return total;
+        return columnsByteSize(self.columns);
     }
 
     pub fn clear(self: *Memtable) void {
@@ -864,6 +841,34 @@ fn asConstSlice(v: anytype) []const u8 {
         }
     }
     @compileError("asConstSlice unsupported type " ++ @typeName(V));
+}
+
+/// The data bytes of `columns`, as `Memtable.byteSize` counts them.
+pub fn columnsByteSize(columns: []const ColumnStore) usize {
+    var total: usize = 0;
+    for (columns) |col| {
+        total += switch (col.data) {
+            .int => |l| l.items.len * @sizeOf(i32),
+            .bigint => |l| l.items.len * @sizeOf(i64),
+            .boolean => |l| l.items.len,
+            .varchar => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+            .string => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+            .float => |l| l.items.len * @sizeOf(f32),
+            .double => |l| l.items.len * @sizeOf(f64),
+            .date => |l| l.items.len * @sizeOf(i32),
+            .datetime => |l| l.items.len * @sizeOf(i64),
+            .tinyint => |l| l.items.len,
+            .smallint => |l| l.items.len * @sizeOf(i16),
+            .largeint => |l| l.items.len * @sizeOf(i128),
+            .char => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+            .json => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+            .decimal64 => |l| l.items.len * @sizeOf(i64),
+            .decimal128 => |l| l.items.len * @sizeOf(i128),
+            .uuid => |l| l.items.len * @sizeOf(u128),
+        };
+        if (col.nulls) |n| total += n.items.len;
+    }
+    return total;
 }
 
 // ---------------------------------------------------------------------------

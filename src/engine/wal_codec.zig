@@ -4,8 +4,9 @@
 //!
 //! Used by wal.zig:
 //!   - WalWriter.appendInsert  -> encodeRows
-//!   - WalWriter.appendReplace -> encodeRows
-//!   - replay apply step       -> applyInsertRecord, applyReplaceRecord, and
+//!   - StatementSteps.append   -> encodeRows
+//!   - replay apply step       -> applyInsertRecord, applyReplaceRecord,
+//!                                applyStatementRecord, and
 //!                                applyDeleteRecord / applyDeleteExprRecord
 //!                                for logs that older binaries left behind
 
@@ -62,6 +63,28 @@ pub fn applyReplaceRecord(
     try retractRows(allocator, mt, &retracted);
     try wal.addSegmentTombstones(allocator, tombstones, segment_id, offsets);
     _ = try decodeRows(allocator, payload, cursor, mt);
+}
+
+/// Apply a `statement` record: each of its steps as a `replace` record, in
+/// order.
+pub fn applyStatementRecord(
+    allocator: Allocator,
+    payload: []const u8,
+    mt: *Memtable,
+    tombstones: *wal.SegmentTombstones,
+) !void {
+    if (payload.len < 4) return Error.WalCorrupt;
+    const step_count = format.readU32(payload[0..4]);
+    var cursor: usize = 4;
+    for (0..step_count) |_| {
+        if (cursor + 4 > payload.len) return Error.WalCorrupt;
+        const step_len: usize = format.readU32(payload[cursor..][0..4]);
+        cursor += 4;
+        if (cursor + step_len > payload.len) return Error.WalCorrupt;
+        try applyReplaceRecord(allocator, payload[cursor..][0..step_len], mt, tombstones);
+        cursor += step_len;
+    }
+    if (cursor != payload.len) return Error.WalCorrupt;
 }
 
 /// Drop the recovered memtable rows `retracted` names. A plain table loses one

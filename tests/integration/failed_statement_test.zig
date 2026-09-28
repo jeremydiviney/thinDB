@@ -307,9 +307,6 @@ const DmlCase = struct {
     sql: []const u8,
     /// The table the statement writes.
     target: []const u8,
-    /// False for a statement that writes both memtable and segment rows.
-    /// Each write is atomic, the statement is not (#335).
-    atomic: bool = true,
 };
 
 /// Run against `createDmlDb`'s table: rows 1-3 flushed, rows 4-5 in the
@@ -321,10 +318,10 @@ const dml_cases = [_]DmlCase{
     .{ .sql = "CREATE TABLE dc AS SELECT id, g, n FROM da WHERE g = 2", .target = "dc" },
     .{ .sql = "UPDATE da SET n = n + 1 WHERE id = 1", .target = "da" },
     .{ .sql = "UPDATE da SET n = n * 2 WHERE n + g > 40", .target = "da" },
-    .{ .sql = "UPDATE da SET n = n + g WHERE g * 2 + id > 5", .target = "da", .atomic = false },
+    .{ .sql = "UPDATE da SET n = n + g WHERE g * 2 + id > 5", .target = "da" },
     .{ .sql = "DELETE FROM da WHERE id = 2", .target = "da" },
     .{ .sql = "DELETE FROM da WHERE id + g = 4", .target = "da" },
-    .{ .sql = "DELETE FROM da WHERE id * 2 > 5 AND g = 1", .target = "da", .atomic = false },
+    .{ .sql = "DELETE FROM da WHERE id * 2 > 5 AND g = 1", .target = "da" },
 };
 
 fn openDmlDb(allocator: std.mem.Allocator, dir: std.Io.Dir) !*thindb.Database {
@@ -355,16 +352,6 @@ fn tableRows(allocator: std.mem.Allocator, db: *thindb.Database, table: []const 
 fn sameRows(a: ?[]const i64, b: ?[]const i64) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(i64, a.?, b.?);
-}
-
-/// Whether every row of `rows` is a row of `a` or of `b`.
-fn rowsFrom(rows: ?[]const i64, a: ?[]const i64, b: ?[]const i64) bool {
-    for (rows orelse return true) |v| {
-        const in_a = std.mem.indexOfScalar(i64, a orelse &.{}, v) != null;
-        const in_b = std.mem.indexOfScalar(i64, b orelse &.{}, v) != null;
-        if (!in_a and !in_b) return false;
-    }
-    return true;
 }
 
 const DmlRun = struct {
@@ -429,10 +416,7 @@ fn expectEveryDmlAllocationFailureClean(failing: *FailingAllocator, tmp: std.tes
         const now = try tableRows(allocator, db, case.target);
         defer if (now) |rows| allocator.free(rows);
         const diverged = !outcome.fenced and !sameRows(outcome.live, now);
-        const torn = if (case.atomic)
-            !sameRows(now, before) and !sameRows(now, after)
-        else
-            !rowsFrom(now, before, after);
+        const torn = !sameRows(now, before) and !sameRows(now, after);
         if (diverged or torn) {
             std.debug.print("{s} reopens as {any} (readers saw {any}, before {any}, after {any}), fenced={}, failed={}: {s}\n", .{ case.target, now, outcome.live, before, after, outcome.fenced, outcome.run.failed, case.sql });
             printInducedFailure(failing, k);
