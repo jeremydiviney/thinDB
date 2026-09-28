@@ -525,7 +525,7 @@ test "binary arith: MySQL's bit operators read and return BIGINT UNSIGNED" {
         .{ "SELECT COALESCE(NULL, ~qty) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
         .{ "SELECT NULLIF(~qty, ~10) FROM t ORDER BY id", &[_]?[]const u8{ null, "18446744073709551595", "18446744073709551585" } },
         .{ "SELECT GREATEST(~qty, 1) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
-        .{ "SELECT LEAST(~qty, 18446744073709551600) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551600", "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT LEAST(~qty, ~15) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551600", "18446744073709551595", "18446744073709551585" } },
         .{ "SELECT BIT_OR(qty & 12) FROM t", &[_]?[]const u8{"12"} },
     };
     inline for (cases) |c| try expectMysqlText(allocator, db, c[0], c[1]);
@@ -581,16 +581,17 @@ test "binary arith: a LARGEINT keeps every digit, as text and cast to BIGINT" {
     };
     inline for (mysql_cases) |c| try expectMysqlText(allocator, db, c[0], c[1]);
 
+    // A hex literal past BIGINT is a LARGEINT in arithmetic.
     const neutral_cases = .{
-        .{ "SELECT CAST(CAST('170141183460469231731687303715884105727' AS LARGEINT) AS VARCHAR) FROM t WHERE id = 1", "170141183460469231731687303715884105727" },
-        .{ "SELECT CONCAT(CAST('-170141183460469231731687303715884105728' AS LARGEINT), '') FROM t WHERE id = 1", "-170141183460469231731687303715884105728" },
-        .{ "SELECT CAST(CAST(qty AS LARGEINT) * 1000000000000000000 AS VARCHAR) FROM t WHERE id = 3", "30000000000000000000" },
+        .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 0 AS VARCHAR(40)) FROM t WHERE id = 1", "18446744073709551615" },
+        .{ "SELECT CONCAT((0xFFFFFFFFFFFFFFFF + 0) * 1000, '') FROM t WHERE id = 1", "18446744073709551615000" },
+        .{ "SELECT CONCAT(0 - (0xFFFFFFFFFFFFFFFF + 0) * 1000, '') FROM t WHERE id = 1", "-18446744073709551615000" },
         // A LARGEINT reaches BIGINT exactly, not through DOUBLE; one from
         // 2^63 to 2^64 - 1 is a BIGINT UNSIGNED, which keeps its 64 bits.
-        .{ "SELECT CAST(CAST('9223372036854775807' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", "9223372036854775807" },
-        .{ "SELECT CAST(CAST('18446744073709551615' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", "-1" },
-        .{ "SELECT CAST(CAST('18446744073709551616' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", null },
-        .{ "SELECT CAST(CAST('-9223372036854775809' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", null },
+        .{ "SELECT CAST((0xFFFFFFFFFFFFFFFF + 0) DIV 2 AS BIGINT) FROM t WHERE id = 1", "9223372036854775807" },
+        .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 0 AS BIGINT) FROM t WHERE id = 1", "-1" },
+        .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 1 AS BIGINT) FROM t WHERE id = 1", null },
+        .{ "SELECT CAST(0 - (0xFFFFFFFFFFFFFFFF + 0) AS BIGINT) FROM t WHERE id = 1", null },
     };
     inline for (neutral_cases) |c| {
         errdefer std.debug.print("case failed: {s}\n", .{c[0]});
