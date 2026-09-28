@@ -1223,6 +1223,63 @@ test "pg wire: pg_stat_activity finds a running query and pg_terminate_backend c
     if (admin_ctx.err) |e| return e;
 }
 
+fn acceptMysqlOne(server: *thindb.MysqlServer) void {
+    server.acceptOne() catch {};
+}
+
+test "pg wire: connections on every wire sharing a registry get distinct ids" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const mysql_addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 108 } };
+    var mysql_server = try thindb.serveMysql(allocator, io, catalog, mysql_addr, null);
+    defer mysql_server.destroy();
+    defer mysql_server.close();
+    mysql_server.registry = &registry;
+
+    const pg_addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 109 } };
+    var pg_server = try thindb.servePg(allocator, io, catalog, pg_addr, null);
+    defer pg_server.destroy();
+    defer pg_server.close();
+    pg_server.registry = &registry;
+
+    const mysql_thread = try std.Thread.spawn(.{}, acceptMysqlOne, .{mysql_server});
+    defer mysql_thread.join();
+    const mysql_client = try mysql_addr.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer mysql_client.close(io);
+    for (0..1000) |_| {
+        if (registry.count() == 1) break;
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    } else return error.MysqlConnectionNeverRegistered;
+
+    var pg_ctx: ServerCtx = .{ .server = pg_server, .n = 1 };
+    const pg_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&pg_ctx});
+    defer pg_thread.join();
+    var client = try TestClient.connect(allocator, io, pg_addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendQuery("SELECT pid FROM pg_stat_activity ORDER BY pid");
+    const listed = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), listed.rows.len);
+    try std.testing.expectEqualStrings("1", listed.rows[0][0].?);
+    try std.testing.expectEqualStrings("2", listed.rows[1][0].?);
+
+    try client.sendTerminate();
+    if (pg_ctx.err) |e| return e;
+}
+
 test "pg wire: BEGIN/COMMIT/ROLLBACK flip the ReadyForQuery tx_status byte" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

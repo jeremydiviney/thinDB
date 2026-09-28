@@ -114,6 +114,13 @@ pub const Server = struct {
         self.allocator.destroy(self);
     }
 
+    /// Every wire sharing a registry draws ids from it, so a KILL or a
+    /// process-list id names one connection across all of them.
+    fn nextConnectionId(self: *Server) u32 {
+        if (self.registry) |reg| return reg.nextBackendId();
+        return self.connection_counter.fetchAdd(1, .monotonic) + 1;
+    }
+
     /// Accept ONE connection and serve it synchronously on the calling
     /// thread. Used by tests that want a deterministic accept count.
     pub fn acceptOne(self: *Server) !void {
@@ -134,7 +141,7 @@ pub const Server = struct {
         }
         defer self.limiter.release();
 
-        const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+        const cid = self.nextConnectionId();
         handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password, self.registry, self.profile) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
@@ -160,7 +167,7 @@ pub const Server = struct {
                 stream.close(self.io);
                 continue;
             }
-            const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+            const cid = self.nextConnectionId();
             const job = self.allocator.create(ConnJob) catch {
                 self.limiter.release();
                 stream.close(self.io);
