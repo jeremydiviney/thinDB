@@ -90,22 +90,30 @@ pub fn write(
     scratch: Allocator,
     sync: bool,
 ) !void {
+    const bytes = try encode(scratch, offsets);
+    defer scratch.free(bytes);
+    try writeEncoded(io, segments_dir, seg_id, bytes, sync);
+}
+
+/// The file `write` writes for `offsets`.
+pub fn encode(allocator: Allocator, offsets: []const u32) ![]u8 {
+    const bytes = try allocator.alloc(u8, 12 + offsets.len * 4 + trailer_size);
+    @memcpy(bytes[0..4], &tombstone_magic);
+    format.writeU16(bytes[4..6], tombstone_version);
+    format.writeU16(bytes[6..8], 0);
+    format.writeU32(bytes[8..12], @intCast(offsets.len));
+    for (offsets, 0..) |off, i| format.writeU32(bytes[12 + i * 4 ..][0..4], off);
+    @memcpy(bytes[bytes.len - trailer_size ..], &tombstone_magic);
+    return bytes;
+}
+
+/// Atomically replace the tombstone file with `encode`'s `bytes`.
+pub fn writeEncoded(io: Io, segments_dir: Io.Dir, seg_id: u64, bytes: []const u8, sync: bool) !void {
     var name_buf: [32]u8 = undefined;
     const file_name = try fileNameFor(&name_buf, seg_id);
     var tmp_buf: [40]u8 = undefined;
     const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{file_name});
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(scratch);
-
-    try buf.appendSlice(scratch, &tombstone_magic);
-    try appendU16(scratch, &buf, tombstone_version);
-    try appendU16(scratch, &buf, 0);
-    try appendU32(scratch, &buf, @intCast(offsets.len));
-    for (offsets) |off| try appendU32(scratch, &buf, off);
-    try buf.appendSlice(scratch, &tombstone_magic);
-
-    try @import("storage.zig").writeFileAtomic(io, segments_dir, tmp_name, file_name, buf.items, sync);
+    try @import("storage.zig").writeFileAtomic(io, segments_dir, tmp_name, file_name, bytes, sync);
 }
 
 /// Read existing tombstones (if any), merge in `new_offsets`, dedupe, sort,
@@ -119,6 +127,19 @@ pub fn merge(
     new_offsets: []const u32,
     sync: bool,
 ) !void {
+    const bytes = try encodeMerged(allocator, io, segments_dir, seg_id, new_offsets);
+    defer allocator.free(bytes);
+    try writeEncoded(io, segments_dir, seg_id, bytes, sync);
+}
+
+/// The file `merge` writes: the segment's tombstones with `new_offsets` added.
+pub fn encodeMerged(
+    allocator: Allocator,
+    io: Io,
+    segments_dir: Io.Dir,
+    seg_id: u64,
+    new_offsets: []const u32,
+) ![]u8 {
     var combined: std.ArrayList(u32) = .empty;
     defer combined.deinit(allocator);
 
@@ -140,11 +161,8 @@ pub fn merge(
     }
     combined.items.len = write_idx;
 
-    try write(io, segments_dir, seg_id, combined.items, allocator, sync);
+    return encode(allocator, combined.items);
 }
-
-const appendU16 = format.appendU16;
-const appendU32 = format.appendU32;
 
 test "round-trip tombstone offsets" {
     const allocator = std.testing.allocator;

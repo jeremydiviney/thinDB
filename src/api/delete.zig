@@ -31,6 +31,13 @@ pub fn execDelete(t: *Table, pred: exec.Predicate, wal_target: *?u64) !usize {
 
     var total: usize = 0;
 
+    // The memtable rows to keep, worked out before any segment write so a
+    // failure here leaves the table as it was.
+    const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
+    defer t.allocator.free(keep);
+    const mt_view = t.memtable.columns[col_idx].view();
+    for (keep, 0..) |*k, i| k.* = !comparison.evalRow(mt_view, @intCast(i), pred);
+
     // ---- Segments ----
     for (t.manifest.segments.items) |entry| {
         var name_buf: [32]u8 = undefined;
@@ -85,15 +92,7 @@ pub fn execDelete(t: *Table, pred: exec.Predicate, wal_target: *?u64) !usize {
     // atomically swap the table's pointer, retire the old. Concurrent scans
     // that captured the old memtable continue to see the pre-delete state
     // until they finish; the old memtable's columns are never mutated again.
-    if (t.memtable.row_count > 0) {
-        const n: usize = @intCast(t.memtable.row_count);
-        const keep = try t.allocator.alloc(bool, n);
-        defer t.allocator.free(keep);
-        const view = t.memtable.columns[col_idx].view();
-        for (0..n) |i| keep[i] = !comparison.evalRow(view, @intCast(i), pred);
-        total += try t.deleteMemtableRowsLocked(keep, wal_target);
-    }
-
+    total += try t.deleteMemtableRowsLocked(keep, wal_target);
     return total;
 }
 
@@ -203,6 +202,23 @@ pub fn execDeleteKeyedBatch(
 
     var keybuf: std.ArrayList(u8) = .empty;
 
+    // The memtable rows to keep, worked out before any segment write so a
+    // failure here leaves the table as it was.
+    const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
+    defer t.allocator.free(keep);
+    for (keep, 0..) |*k, i| {
+        keybuf.clearRetainingCapacity();
+        for (oki) |ci| {
+            try comparison.appendColumnValueBytes(aa, &keybuf, t.memtable.columns[ci].view(), @intCast(i));
+        }
+        k.* = true;
+        if (key_map.get(keybuf.items)) |stmt_idx| {
+            k.* = false;
+            counts[stmt_idx] += 1;
+            total += 1;
+        }
+    }
+
     // ---- Segments ----
     for (t.manifest.segments.items) |entry| {
         if (!upsert.bloomAdmitsAny(entry.key_bloom, hashes.items)) continue;
@@ -235,13 +251,12 @@ pub fn execDeleteKeyedBatch(
             }
 
             const decoded = try aa.alloc(storage.OwnedColumn, oki.len);
-            for (oki, 0..) |col_idx, k| {
-                decoded[k] = try seg.decodeColumn(t.allocator, t.schema, rg_idx, col_idx);
+            var decoded_count: usize = 0;
+            defer for (decoded[0..decoded_count]) |*c| c.deinit(t.allocator);
+            for (oki, decoded) |col_idx, *c| {
+                c.* = try seg.decodeColumn(t.allocator, t.schema, rg_idx, col_idx);
+                decoded_count += 1;
             }
-            defer for (decoded) |*c| {
-                var d = c.*;
-                d.deinit(t.allocator);
-            };
 
             var row: u32 = 0;
             while (row < n) : (row += 1) {
@@ -270,30 +285,7 @@ pub fn execDeleteKeyedBatch(
 
     // ---- Memtable ----
     // Same snapshot-isolated clone-and-swap shape as `execDeleteByExpr`.
-    if (t.memtable.row_count > 0) {
-        const n: usize = @intCast(t.memtable.row_count);
-        const keep = try t.allocator.alloc(bool, n);
-        defer t.allocator.free(keep);
-
-        var matched_any = false;
-        for (0..n) |i| {
-            keybuf.clearRetainingCapacity();
-            for (oki) |ci| {
-                try comparison.appendColumnValueBytes(aa, &keybuf, t.memtable.columns[ci].view(), @intCast(i));
-            }
-            if (key_map.get(keybuf.items)) |stmt_idx| {
-                keep[i] = false;
-                matched_any = true;
-                counts[stmt_idx] += 1;
-                total += 1;
-            } else {
-                keep[i] = true;
-            }
-        }
-
-        if (matched_any) _ = try t.deleteMemtableRowsLocked(keep, wal_target);
-    }
-
+    _ = try t.deleteMemtableRowsLocked(keep, wal_target);
     return total;
 }
 
@@ -474,6 +466,27 @@ pub fn execDeleteByExpr(
         };
     }
 
+    // The memtable rows to keep, worked out before any segment write so a
+    // failure here leaves the table as it was.
+    const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
+    defer t.allocator.free(keep);
+    if (pred_or_null == null) {
+        @memset(keep, false);
+    } else if (keep.len > 0) {
+        const views = try t.allocator.alloc(storage.ColumnView, t.schema.columns.len);
+        defer t.allocator.free(views);
+        for (t.memtable.columns, views) |*c, *v| v.* = c.view();
+        const fake_batch: exec.Batch = .{
+            .schema = t.schema.columns,
+            .values = views,
+            .row_count = keep.len,
+        };
+        const mask = try t.allocator.alloc(bool, keep.len);
+        defer t.allocator.free(mask);
+        try filter.?.evaluate(t.allocator, fake_batch, mask);
+        for (mask, keep) |m, *k| k.* = !m;
+    }
+
     // ---- Segments ----
     for (t.manifest.segments.items) |entry| {
         if (key_hashes) |hs| {
@@ -568,30 +581,7 @@ pub fn execDeleteByExpr(
 
     // ---- Memtable ----
     // Same snapshot-isolated clone-and-swap shape as `execDelete`.
-    if (t.memtable.row_count > 0) {
-        const n: usize = @intCast(t.memtable.row_count);
-        const keep = try t.allocator.alloc(bool, n);
-        defer t.allocator.free(keep);
-
-        if (pred_or_null == null) {
-            @memset(keep, false);
-        } else {
-            const views = try t.allocator.alloc(storage.ColumnView, t.schema.columns.len);
-            defer t.allocator.free(views);
-            for (t.memtable.columns, views) |*c, *v| v.* = c.view();
-            const fake_batch: exec.Batch = .{
-                .schema = t.schema.columns,
-                .values = views,
-                .row_count = n,
-            };
-            const mask = try t.allocator.alloc(bool, n);
-            defer t.allocator.free(mask);
-            try filter.?.evaluate(t.allocator, fake_batch, mask);
-            for (mask, keep) |m, *k| k.* = !m;
-        }
-        total += try t.deleteMemtableRowsLocked(keep, wal_target);
-    }
-
+    total += try t.deleteMemtableRowsLocked(keep, wal_target);
     return total;
 }
 

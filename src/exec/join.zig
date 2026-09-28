@@ -2778,7 +2778,6 @@ pub const Join = struct {
             alloc.free(chunks);
         }
         for (chunks) |*ch| {
-            ch.* = .{};
             const cols = try alloc.alloc(ColumnStore, self.output_schema.len);
             var inited: usize = 0;
             errdefer {
@@ -2789,9 +2788,9 @@ pub const Join = struct {
                 store.* = try ColumnStore.init(alloc, col.type, col.nullable);
                 inited += 1;
             }
-            ch.out_cols = cols;
+            const views = try alloc.alloc(ColumnView, self.output_schema.len);
+            ch.* = .{ .out_cols = cols, .views = views };
             done += 1;
-            ch.views = try alloc.alloc(ColumnView, self.output_schema.len);
         }
         self.probe_chunks = chunks;
     }

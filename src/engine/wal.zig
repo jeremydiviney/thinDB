@@ -117,6 +117,20 @@ pub fn addSegmentTombstones(allocator: Allocator, map: *SegmentTombstones, segme
     try entry.value_ptr.appendSlice(allocator, offsets);
 }
 
+/// Room for `n` more offsets of segment `segment_id`, so that
+/// `addSegmentTombstonesAssumeCapacity` can't fail.
+pub fn reserveSegmentTombstones(allocator: Allocator, map: *SegmentTombstones, segment_id: u64, n: usize) !void {
+    if (n == 0) return;
+    const entry = try map.getOrPut(allocator, segment_id);
+    if (!entry.found_existing) entry.value_ptr.* = .empty;
+    try entry.value_ptr.ensureUnusedCapacity(allocator, n);
+}
+
+pub fn addSegmentTombstonesAssumeCapacity(map: *SegmentTombstones, segment_id: u64, offsets: []const u32) void {
+    if (offsets.len == 0) return;
+    map.getPtr(segment_id).?.appendSliceAssumeCapacity(offsets);
+}
+
 pub fn deinitSegmentTombstones(allocator: Allocator, map: *SegmentTombstones) void {
     for (map.values()) |*offsets| offsets.deinit(allocator);
     map.deinit(allocator);
