@@ -3215,6 +3215,17 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
     };
 }
 
+/// An aggregate that takes only numbers, over a DATE or DATETIME input. MySQL
+/// reads the input as the number it spells there (`SUM(d)` sums YYYYMMDD);
+/// thinDB rejects it in the other dialects.
+pub fn readsTemporalAsNumber(func: AggFunc, in: Type) bool {
+    if (!in.isTemporal()) return false;
+    return switch (func) {
+        .sum, .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
+}
+
 pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type) !void {
     switch (func) {
         .count => return,

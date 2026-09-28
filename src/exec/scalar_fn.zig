@@ -137,6 +137,7 @@ pub fn resolveWithRegistry(
     if (try resolveFractionalIntDiv(aa, name, arg_types)) |ov| return ov;
     if (try resolveFormat(aa, name, arg_types)) |ov| return ov;
     if (try resolveTimeFromNumbers(aa, name, arg_types)) |ov| return ov;
+    if (try resolveTimeOfNumber(aa, name, arg_types)) |ov| return ov;
     if (try resolveCastTime(aa, name, arg_types)) |ov| return ov;
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveCharset(aa, name, arg_types)) |ov| return ov;
@@ -541,6 +542,19 @@ fn resolveTimeFromNumbers(aa: Allocator, name: []const u8, arg_types: []const Ty
         return null;
     for (arg_types) |t| if (!numericLike(t) and !t.isString()) return null;
     return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
+}
+
+/// HOUR, TIME_TO_SEC, TIMEDIFF, ADDTIME and the other TIME functions when a
+/// number is among the arguments: it reads by its digits (`time.numberArgFn`),
+/// not as text, so `HOUR(8390000)` is NULL where `HOUR('8390000')` clamps.
+fn resolveTimeOfNumber(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    var numbers: usize = 0;
+    for (arg_types) |t| {
+        if (numericLike(t)) numbers += 1 else if (!(t.isString() or t.isTemporal())) return null;
+    }
+    if (numbers == 0) return null;
+    const f = time.numberArgFn(name, arg_types) orelse return null;
+    return try buildDecFn(aa, name, arg_types, f.return_type, f.kernel, .kernel_managed);
 }
 
 const CAST_TIME_PREFIX = "to_time:";

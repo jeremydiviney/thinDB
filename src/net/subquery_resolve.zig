@@ -33,6 +33,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const TableSchema = types.TableSchema;
 const Value = types.Value;
+const Dialect = types.Dialect;
 
 const exec = @import("../exec/exec.zig");
 const Batch = exec.Batch;
@@ -227,6 +228,26 @@ fn clockTimeFsp(c: exec.expr_mod.Expr.Call) ?u8 {
     return null;
 }
 
+/// The microseconds in one step of each precision, 0 to 6 fraction digits.
+const FSP_STEP_MICROS = [_]i64{ 1_000_000, 100_000, 10_000, 1_000, 100, 10, 1 };
+
+/// The fraction digits a NOW / CURRENT_TIMESTAMP / SYSDATE call keeps: its
+/// literal precision argument, else 0 in MySQL, whose bare forms give whole
+/// seconds, and 6 in the other dialects; null for any other call.
+fn timestampFsp(dialect: Dialect, c: exec.expr_mod.Expr.Call) ?u8 {
+    const names = [_][]const u8{ "now", "current_timestamp", "localtimestamp", "localtime", "utc_timestamp", "sysdate" };
+    for (names) |n| {
+        if (!std.ascii.eqlIgnoreCase(c.fn_name, n)) continue;
+        if (c.args.len == 0) return if (dialect == .mysql) 0 else 6;
+        if (c.args.len != 1 or c.args[0] != .lit) return null;
+        return switch (c.args[0].lit) {
+            inline .tinyint, .smallint, .int, .bigint => |fsp| if (fsp >= 0 and fsp <= 6) @intCast(fsp) else null,
+            else => null,
+        };
+    }
+    return null;
+}
+
 /// CHARSET or COLLATION of a system function's result (`CHARSET(VERSION())`),
 /// which MySQL gives as utf8mb3 text. It's answered before the function
 /// becomes a literal, whose text is utf8mb4 like any other; null for any
@@ -268,17 +289,12 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                 e.* = .{ .lit = .{ .text = try (try ctx.subqueryArena()).dupe(u8, text) } };
                 return;
             }
+            if (timestampFsp(ctx.session.dialect, c)) |fsp| {
+                // Truncated, not rounded, to the precision, as MySQL does.
+                e.* = .{ .lit = .{ .datetime = ctx.now_micros - @mod(ctx.now_micros, FSP_STEP_MICROS[fsp]) } };
+                return;
+            }
             if (c.args.len == 0) {
-                if (std.ascii.eqlIgnoreCase(c.fn_name, "now") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "current_timestamp") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "localtimestamp") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "utc_timestamp") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "sysdate") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "localtime"))
-                {
-                    e.* = .{ .lit = .{ .datetime = ctx.now_micros } };
-                    return;
-                }
                 if (std.ascii.eqlIgnoreCase(c.fn_name, "current_date") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "curdate") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "utc_date"))

@@ -103,14 +103,14 @@ test "col op col: rejected when the kinds never compare" {
     try exec(
         allocator,
         db,
-        "CREATE TABLE m (id BIGINT PRIMARY KEY, day DATE NOT NULL, qty INT NOT NULL)",
+        "CREATE TABLE m (id BIGINT PRIMARY KEY, u UUID NOT NULL, qty INT NOT NULL)",
     );
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const root = try thindb.sql.parse(
         arena.allocator(),
-        "SELECT id FROM m WHERE qty = day",
+        "SELECT id FROM m WHERE qty = u",
     );
     const cq = thindb.net.compile(allocator, db, root);
     if (cq) |ok| {

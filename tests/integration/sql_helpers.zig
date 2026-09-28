@@ -84,6 +84,23 @@ pub fn runSqlDialect(allocator: std.mem.Allocator, db: anytype, sql: []const u8,
     };
 }
 
+/// `runSql` as the MySQL wire runs a statement: parsed and compiled in the
+/// MySQL dialect, which follows MySQL where the dialects differ (`NOW()`
+/// gives whole seconds, `SUM` over a DATE sums its YYYYMMDD number).
+/// Single-statement only.
+pub fn runSqlMysqlSession(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const root = try thindb.sql.parseDialect(arena.allocator(), sql, .mysql);
+    const cq = try thindb.net.compileWithSession(allocator, db, .{ .dialect = .mysql }, root);
+    return .{
+        .arena = arena,
+        .cq = cq,
+        .owned_vars = cq.sessionValue().vars,
+        .backing_allocator = allocator,
+    };
+}
+
 /// Like `runSql` but parses with the database's SQL-function, view and
 /// table registries in scope, as a server connection does: a bare
 /// `FROM viewname` expands and an unqualified `JOIN ... ON` column finds
