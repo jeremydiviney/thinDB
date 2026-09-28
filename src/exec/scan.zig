@@ -2502,24 +2502,10 @@ pub const Scan = struct {
         out: []bool,
     ) !bool {
         var vals: [64]Value = undefined;
-        const folded = blk: {
-            if (arms.len > vals.len) break :blk false;
-            const col = switch (arms[0]) {
-                .leaf => |l| l.col,
-                else => break :blk false,
-            };
-            for (arms, 0..) |arm, i| {
-                const l = switch (arm) {
-                    .leaf => |l| l,
-                    else => break :blk false,
-                };
-                if (l.op != .eq or !@import("../types.zig").columnNameEql(l.col, col)) break :blk false;
-                vals[i] = l.val;
-            }
-            break :blk true;
-        };
-        if (folded) {
-            const set = predicate.InSet{ .col = arms[0].leaf.col, .values = vals[0..arms.len], .negate = false };
+        const in_list_col = if (arms.len <= vals.len) predicate.eqDisjunctionColumn(arms) else null;
+        if (in_list_col) |col| {
+            for (arms, vals[0..arms.len]) |arm, *v| v.* = arm.leaf.val;
+            const set = predicate.InSet{ .col = col, .values = vals[0..arms.len], .negate = false };
             if (try self.buildInSetMask(seg, rg_idx, rg_count, set, active, out)) return true;
         }
 

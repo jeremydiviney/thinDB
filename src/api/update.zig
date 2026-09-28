@@ -43,6 +43,7 @@ const ColumnStore = engine.ColumnStore;
 const api = @import("api.zig");
 const Table = api.Table;
 const DmlFilter = @import("delete.zig").DmlFilter;
+const SegmentPrune = @import("delete.zig").SegmentPrune;
 const upsert = @import("upsert.zig");
 
 const ir = @import("../ir/ir.zig");
@@ -103,7 +104,7 @@ pub fn execUpdateStreaming(
 
         // -- Phase 2: segments[0..segs_at_start] -----------------
         if (segs_at_start > 0) {
-            affected += processSegments(t, filter_ref, assignments, segs_at_start, &wal_target) catch |err| switch (err) {
+            affected += processSegments(t, filter_ref, derived, assignments, segs_at_start, &wal_target) catch |err| switch (err) {
                 error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
                 else => return err,
             };
@@ -175,13 +176,14 @@ fn processMemtable(
 fn processSegments(
     t: *Table,
     filter: ?*const DmlFilter,
+    derived: []const exec.Derived,
     assignments: []const Assignment,
     segs_at_start: usize,
     wal_target: *?u64,
 ) !usize {
     // Full-key Bloom gate (#143): a keyed UPDATE (every order-key column
     // pinned by AND-equality) skips segments whose Bloom rejects the key(s)
-    // — this path otherwise decodes EVERY column of EVERY row group.
+    // without opening them.
     var gate_arena = std.heap.ArenaAllocator.init(t.allocator);
     defer gate_arena.deinit();
     const upsert_mod = @import("upsert.zig");
@@ -190,6 +192,8 @@ fn processSegments(
     else
         null;
 
+    const prune = try SegmentPrune.init(gate_arena.allocator(), t.schema.columns, derived, if (filter) |f| f.predicate else null);
+
     var total: usize = 0;
     var i: usize = 0;
     while (i < segs_at_start) : (i += 1) {
@@ -197,7 +201,7 @@ fn processSegments(
         if (key_hashes) |hs| {
             if (!upsert_mod.bloomAdmitsAny(entry.key_bloom, hs)) continue;
         }
-        total += try processOneSegment(t, filter, assignments, entry, wal_target);
+        total += try processOneSegment(t, filter, prune, assignments, entry, wal_target);
     }
     return total;
 }
@@ -205,6 +209,7 @@ fn processSegments(
 fn processOneSegment(
     t: *Table,
     filter: ?*const DmlFilter,
+    prune: SegmentPrune,
     assignments: []const Assignment,
     entry: storage.manifest.ManifestEntry,
     wal_target: *?u64,
@@ -222,21 +227,25 @@ fn processOneSegment(
     var row_offset: u32 = 0;
     for (seg.info.row_groups, 0..) |rg, rg_idx| {
         const n = rg.row_count;
+        defer row_offset += n;
+        if (!prune.rowGroupCanMatch(rg)) continue;
 
-        // Decode all schema columns for this row group. (Future: only
-        // decode columns referenced by predicate + assignments.)
-        const owned_cols = try allocator.alloc(storage.OwnedColumn, t.schema.columns.len);
+        // The filter's columns first; the rest only once a row matches.
+        // Unread columns are empty views the filter never touches.
+        const owned_cols = try allocator.alloc(?storage.OwnedColumn, t.schema.columns.len);
         defer {
-            for (owned_cols) |*oc| oc.deinit(allocator);
+            for (owned_cols) |*oc| if (oc.*) |*c| c.deinit(allocator);
             allocator.free(owned_cols);
         }
-        for (t.schema.columns, 0..) |_, ci| {
-            owned_cols[ci] = try seg.decodeColumn(allocator, t.schema, rg_idx, ci);
-        }
-
+        @memset(owned_cols, null);
         const views = try allocator.alloc(ColumnView, t.schema.columns.len);
         defer allocator.free(views);
-        for (owned_cols, views) |oc, *v| v.* = oc.view();
+        @memset(views, .{ .data = .{ .int = &.{} } });
+        for (owned_cols, views, prune.ref_cols, 0..) |*oc, *v, referenced, ci| {
+            if (!referenced) continue;
+            oc.* = try seg.decodeColumn(allocator, t.schema, rg_idx, ci);
+            v.* = oc.*.?.view();
+        }
 
         const batch: exec.Batch = .{
             .schema = t.schema.columns,
@@ -252,12 +261,14 @@ fn processOneSegment(
             @memset(mask, true);
         }
 
-        var matched_in_rg: usize = 0;
-        for (mask) |m| if (m) {
-            matched_in_rg += 1;
-        };
+        const matched_in_rg = std.mem.countScalar(bool, mask, true);
 
         if (matched_in_rg > 0) {
+            for (owned_cols, views, 0..) |*oc, *v, ci| {
+                if (oc.* != null) continue;
+                oc.* = try seg.decodeColumn(allocator, t.schema, rg_idx, ci);
+                v.* = oc.*.?.view();
+            }
             offsets.clearRetainingCapacity();
             for (mask, 0..) |m, k| if (m) {
                 try offsets.append(allocator, row_offset + @as(u32, @intCast(k)));
@@ -272,7 +283,6 @@ fn processOneSegment(
             if (try t.replaceRowsLocked(replaced, new_rows.stores, new_rows.row_count)) |target| wal_target.* = target;
             deleted += matched_in_rg;
         }
-        row_offset += n;
     }
 
     // One tombstone-file rewrite per segment, not per row group.
