@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const storage = @import("../storage/storage.zig");
 const exec = @import("../exec/exec.zig");
 const types = @import("../types.zig");
+const json_binary = @import("../exec/json_binary.zig");
 
 pub fn cmpU32(target: u32, item: u32) std.math.Order {
     return std.math.order(target, item);
@@ -52,7 +53,18 @@ pub fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
         .decimal64 => |s| cmpVal(i64, s[row], pred.val.decimal64, pred.op),
         .decimal128 => |s| cmpVal(i128, s[row], pred.val.decimal128, pred.op),
         .uuid => |s| cmpVal(u128, s[row], pred.val.uuid, pred.op),
-        .json => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
+        .json => |sv| cmpJson(sv.rowBytes(row), pred.val.text, pred.op),
+    };
+}
+
+/// Equality under MySQL's JSON comparison, which numerically equal numbers
+/// meet with different bytes.
+fn cmpJson(cell: []const u8, text: []const u8, op: exec.PredicateOp) bool {
+    const eq = json_binary.compareOperands(json_binary.textOperand(cell), json_binary.textOperand(text)) == .eq;
+    return switch (op) {
+        .eq => eq,
+        .neq => !eq,
+        else => unreachable, // pre-validated upstream
     };
 }
 

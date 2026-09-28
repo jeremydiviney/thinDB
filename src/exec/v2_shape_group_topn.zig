@@ -214,10 +214,12 @@ const TopRows = struct {
 const FinalRows = struct {
     allocator: Allocator,
     items: []SiloCore.TopRow = &.{},
-    owned: bool = false,
+    // The allocation `items` sits in, when this owns one: an OFFSET page is a
+    // prefix of it, and the free must name the whole allocation.
+    owned: []SiloCore.TopRow = &.{},
 
     fn deinit(self: *FinalRows) void {
-        if (self.owned and self.items.len > 0) self.allocator.free(self.items);
+        if (self.owned.len > 0) self.allocator.free(self.owned);
         self.* = .{ .allocator = self.allocator };
     }
 };
@@ -587,6 +589,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .state_index = agg_plan.state_index,
             .wide = agg_plan.wide,
             .is_string = agg_plan.is_string,
+            .is_json = agg_plan.is_string and agg_plan.output_type == .json,
             .str_input_index = agg_plan.str_input_index,
             .str_state_index = agg_plan.str_state_index,
             .is_distinct = agg_plan.is_distinct,
@@ -747,7 +750,7 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
     const end = limitEnd(start, len, op.request.limit);
     const emit_len = end - start;
     if (start != 0 and emit_len != 0) std.mem.copyForwards(SiloCore.TopRow, candidates[0..emit_len], candidates[start..end]);
-    return .{ .allocator = op.allocator, .items = candidates[0..emit_len], .owned = true };
+    return .{ .allocator = op.allocator, .items = candidates[0..emit_len], .owned = candidates };
 }
 
 fn limitEnd(start: usize, len: usize, limit: usize) usize {
@@ -1573,8 +1576,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     return traceDecline(request, "temporal read as a number");
                 // SUM/AVG over a 64-bit integer accumulates exactly into i128
                 // (a BIGINT SUM wraps at emit, AVG divides the exact sum): the
-                // aggregate takes TWO state slots (lo, hi) and runs in the
-                // generic per-row program.
+                // aggregate takes TWO state slots (lo, hi).
                 // MIN/MAX over a 64-bit int holds a single value — never wide.
                 const wide = (agg.func == .sum or agg.func == .avg) and physicalTypeFor(input_type) == .i64;
                 const slot_width: u16 = (if (wide) @as(u16, 2) else 1) + @as(u16, @intFromBool(input_nullable));

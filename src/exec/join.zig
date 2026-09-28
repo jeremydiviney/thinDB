@@ -44,6 +44,7 @@ const scalar_fn = @import("scalar_fn.zig");
 const decimal = @import("scalar_fn_decimal.zig");
 
 const predicate = @import("predicate.zig");
+const json_binary = @import("json_binary.zig");
 const Predicate = predicate.Predicate;
 
 const transform = @import("../engine/transform.zig");
@@ -3524,7 +3525,7 @@ fn appendBits(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v
 /// ColumnStore) into `dst` (an output ColumnStore).
 /// Compare two cells from same-typed columns with the given op.
 /// Returns false for NULL on either side (two-valued logic). Strings
-/// use lex byte order. Floats use IEEE compare (NaN never compares
+/// use lex byte order, JSON MySQL's JSON order. Floats use IEEE compare (NaN never compares
 /// true to anything — handled implicitly).
 pub fn compareCellsOp(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32, op: predicate.PredicateOp) bool {
     if (!left.isValid(lrow) or !right.isValid(rrow)) return false;
@@ -3545,7 +3546,7 @@ pub fn compareCellsOp(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32,
         .varchar => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.varchar.rowBytes(rrow), op),
         .string => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.string.rowBytes(rrow), op),
         .char => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.char.rowBytes(rrow), op),
-        .json => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.json.rowBytes(rrow), op),
+        .json => |sv| return orderOp(json_binary.compare(sv.rowBytes(lrow), right.data.json.rowBytes(rrow)), op),
     }
 }
 
@@ -3561,7 +3562,10 @@ fn cmpOp(comptime T: type, a: T, b: T, op: predicate.PredicateOp) bool {
 }
 
 fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
-    const ord = std.mem.order(u8, a, b);
+    return orderOp(std.mem.order(u8, a, b), op);
+}
+
+fn orderOp(ord: std.math.Order, op: predicate.PredicateOp) bool {
     return switch (op) {
         .eq => ord == .eq,
         .neq => ord != .eq,

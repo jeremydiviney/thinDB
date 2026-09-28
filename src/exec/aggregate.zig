@@ -25,6 +25,7 @@ const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
+const json_binary = @import("json_binary.zig");
 const Predicate = predicate.Predicate;
 
 pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices: []const usize, pred: Predicate) !void {
@@ -376,7 +377,8 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .decimal64 => |v| std.math.order(v[row], val.decimal64),
         .decimal128 => |v| std.math.order(v[row], val.decimal128),
         .uuid => |v| std.math.order(v[row], val.uuid),
-        .varchar, .string, .char, .json => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
+        .varchar, .string, .char => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
+        .json => |sv| json_binary.compare(sv.rowBytes(row), val.text),
     };
 }
 
@@ -1839,18 +1841,18 @@ pub const Aggregate = struct {
                     }
                 }
             },
-            .varchar, .string, .char, .json => |sv| {
+            inline .varchar, .string, .char, .json => |sv, tag| {
                 const col = self.agg_cols[ai].other;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
                     const bytes = sv.rowBytes(r);
                     const s = &col[g];
                     if (is_min) {
-                        if (s.min_str == null or std.mem.order(u8, bytes, s.min_str.?) == .lt) {
+                        if (s.min_str == null or json_binary.columnOrder(tag == .json, bytes, s.min_str.?) == .lt) {
                             s.min_str = try aa.dupe(u8, bytes);
                         }
                     } else {
-                        if (s.max_str == null or std.mem.order(u8, bytes, s.max_str.?) == .gt) {
+                        if (s.max_str == null or json_binary.columnOrder(tag == .json, bytes, s.max_str.?) == .gt) {
                             s.max_str = try aa.dupe(u8, bytes);
                         }
                     }
@@ -3548,12 +3550,12 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.min_float == null or v < s.min_float.?) s.min_float = v;
                 },
-                .varchar, .string, .char, .json => {
+                inline .varchar, .string, .char, .json => |sv, tag| {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
-                        const bytes = stringRowBytes(view, r);
-                        if (s.min_str == null or std.mem.order(u8, bytes, s.min_str.?) == .lt) {
+                        const bytes = sv.rowBytes(r);
+                        if (s.min_str == null or json_binary.columnOrder(tag == .json, bytes, s.min_str.?) == .lt) {
                             s.min_str = try aa.dupe(u8, bytes);
                         }
                     }
@@ -3625,12 +3627,12 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.max_float == null or v > s.max_float.?) s.max_float = v;
                 },
-                .varchar, .string, .char, .json => {
+                inline .varchar, .string, .char, .json => |sv, tag| {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
-                        const bytes = stringRowBytes(view, r);
-                        if (s.max_str == null or std.mem.order(u8, bytes, s.max_str.?) == .gt) {
+                        const bytes = sv.rowBytes(r);
+                        if (s.max_str == null or json_binary.columnOrder(tag == .json, bytes, s.max_str.?) == .gt) {
                             s.max_str = try aa.dupe(u8, bytes);
                         }
                     }

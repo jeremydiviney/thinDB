@@ -31,6 +31,7 @@ const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
+const json_binary = @import("json_binary.zig");
 const compute = @import("compute.zig");
 const udf_mod = @import("../udf.zig");
 const expr = @import("expr.zig");
@@ -337,7 +338,7 @@ const Lane = struct {
                 if (self.ns[i] == 0) {
                     try self.setStr(i, other.sstr[i]);
                 } else {
-                    const cmp = std.mem.order(u8, other.sstr[i], self.sstr[i]);
+                    const cmp = json_binary.columnOrder(p.output_type == .json, other.sstr[i], self.sstr[i]);
                     const better = if (p.op == .min) cmp == .lt else cmp == .gt;
                     if (better) try self.setStr(i, other.sstr[i]);
                 }
@@ -438,18 +439,22 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
                 .varchar, .string, .char, .json => |s| s,
                 else => continue,
             };
-            var r: usize = 0;
-            while (r < n) : (r += 1) {
-                if (!view.isValid(r)) continue;
-                lane.ns[i] += 1;
-                const b = sv.rowBytes(r);
-                if (lane.ns[i] == 1) {
-                    try lane.setStr(i, b);
-                } else {
-                    const cmp = std.mem.order(u8, b, lane.sstr[i]);
-                    const better = if (p.op == .min) cmp == .lt else cmp == .gt;
-                    if (better) try lane.setStr(i, b);
-                }
+            switch (p.output_type == .json) {
+                inline else => |json| {
+                    var r: usize = 0;
+                    while (r < n) : (r += 1) {
+                        if (!view.isValid(r)) continue;
+                        lane.ns[i] += 1;
+                        const b = sv.rowBytes(r);
+                        if (lane.ns[i] == 1) {
+                            try lane.setStr(i, b);
+                        } else {
+                            const cmp = json_binary.columnOrder(json, b, lane.sstr[i]);
+                            const better = if (p.op == .min) cmp == .lt else cmp == .gt;
+                            if (better) try lane.setStr(i, b);
+                        }
+                    }
+                },
             }
             continue;
         }
