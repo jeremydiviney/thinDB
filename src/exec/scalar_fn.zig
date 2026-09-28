@@ -421,7 +421,10 @@ pub fn intArithResultType(op: IntArithOp, a: Type, b: Type) ?Type {
 /// the arithmetic sees it. In integer arithmetic an integer literal takes the
 /// narrowest of TINYINT/SMALLINT/INT/BIGINT holding it, as StarRocks types
 /// literals, so `smallint_col + 1` is SMALLINT + TINYINT → INT rather than
-/// INT + INT → BIGINT. Every other call keeps the parser's literal.
+/// INT + INT → BIGINT. A LARGEINT literal, which no integer's digits spell
+/// (past BIGINT they are a DECIMAL), is a hex literal's BIGINT UNSIGNED
+/// (`expr.hexLiteralNumber`) and stays one, so `0x7FFFFFFFFFFFFFFF + 1` is
+/// 2^63, as in MySQL. Every other call keeps the parser's literal.
 pub fn arithOperandLiteral(name: []const u8, arg_types: []const Type, lit: types.Value) types.Value {
     const op = intArithOp(name) orelse return lit;
     if (arg_types.len != 2 or intArithResultType(op, arg_types[0], arg_types[1]) == null) return lit;
@@ -430,14 +433,12 @@ pub fn arithOperandLiteral(name: []const u8, arg_types: []const Type, lit: types
         .smallint => |x| x,
         .int => |x| x,
         .bigint => |x| x,
-        .largeint => |x| x,
         else => return lit,
     };
     if (std.math.cast(i8, x)) |n| return .{ .tinyint = n };
     if (std.math.cast(i16, x)) |n| return .{ .smallint = n };
     if (std.math.cast(i32, x)) |n| return .{ .int = n };
-    if (std.math.cast(i64, x)) |n| return .{ .bigint = n };
-    return .{ .largeint = x };
+    return .{ .bigint = @intCast(x) };
 }
 
 /// Whether `name(arg_types)` is arithmetic over a float operand, which is
@@ -801,8 +802,19 @@ pub fn readsNumberAt(registry: ?*const udf_mod.UdfRegistry, name: []const u8, ar
 
 /// BIN and CONV take their number as its text, yet a hex literal there is
 /// the number it spells, as MySQL reads it (`BIN(0x41)` is 1000001).
-fn readsNumberAsText(name: []const u8) bool {
+pub fn readsNumberAsText(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "bin") or std.ascii.eqlIgnoreCase(name, "conv");
+}
+
+/// Internal: CONV over a hex literal's integer (`math.convBitsKernel`).
+pub const CONV_BITS_FN = "__conv_bits";
+
+/// The function a call takes once its hex literal first argument reads as
+/// its integer, when that is not the call's own: CONV converts the integer
+/// itself, whatever `from_base` says, where its decimal text would read in
+/// `from_base` (`CONV(X'FF', 16, 10)` is 255, not 597).
+pub fn hexNumberFn(name: []const u8, arity: usize) []const u8 {
+    return if (arity == 3 and std.ascii.eqlIgnoreCase(name, "conv")) CONV_BITS_FN else name;
 }
 
 fn textKeyTarget(spec: []const u8) ?Type {
@@ -1269,6 +1281,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "conv", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.convKernel },
     .{ .name = "bin", .arg_types = &.{.boolean}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.binBooleanKernel },
     .{ .name = "conv", .arg_types = &.{ .boolean, .int, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.convBooleanKernel },
+    .{ .name = CONV_BITS_FN, .arg_types = &.{ .largeint, .int, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.convBitsKernel },
     .{ .name = "truncate", .arg_types = &.{ .double, .int }, .return_type = .double, .kernel = math.truncateKernel },
     .{ .name = "degrees", .arg_types = &.{.double}, .return_type = .double, .kernel = math.degreesKernel },
     .{ .name = "radians", .arg_types = &.{.double}, .return_type = .double, .kernel = math.radiansKernel },

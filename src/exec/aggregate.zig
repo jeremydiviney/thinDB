@@ -115,6 +115,14 @@ pub const AggFunc = enum {
     group_concat,
     /// User-defined aggregate. `AggSpec.udf_name` carries the registry name.
     udf,
+    /// MySQL's BIT_AND, BIT_OR and BIT_XOR, as the MySQL dialect reads those
+    /// names: each value is read as BIGINT UNSIGNED and the result is one,
+    /// held in a LARGEINT, and no rows give the operation's identity (all
+    /// ones for AND, 0 for OR and XOR) rather than NULL. They come last so
+    /// every aggregate the IR encodes keeps its number.
+    unsigned_bit_and,
+    unsigned_bit_or,
+    unsigned_bit_xor,
 };
 
 /// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
@@ -124,7 +132,7 @@ pub const AggFunc = enum {
 /// excluded; count/sum/min/max/avg/stddev/variance all keep fixed-size state.
 fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
-        .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
+        .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
         .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
     };
     return true;
@@ -474,9 +482,9 @@ fn bitwiseUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, 
             s.bitwise.seen = true;
             s.bitwise.value = v;
         } else switch (func) {
-            .bit_and => s.bitwise.value &= v,
-            .bit_or => s.bitwise.value |= v,
-            .bit_xor => s.bitwise.value ^= v,
+            .bit_and, .unsigned_bit_and => s.bitwise.value &= v,
+            .bit_or, .unsigned_bit_or => s.bitwise.value |= v,
+            .bit_xor, .unsigned_bit_xor => s.bitwise.value ^= v,
             else => unreachable,
         }
     }
@@ -3073,6 +3081,9 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .any_value, .first, .last => .{ .value_acc = .{} },
         .max_by, .max_by_key => .{ .max_by = .{} },
         .bit_and, .bit_or, .bit_xor => .{ .bitwise = .{} },
+        // The identity is already seen, so no rows give it.
+        .unsigned_bit_and => .{ .bitwise = .{ .seen = true, .value = -1 } },
+        .unsigned_bit_or, .unsigned_bit_xor => .{ .bitwise = .{ .seen = true } },
         .sum_distinct, .avg_distinct => if (in != null and in.?.isFloat())
             .{ .distinct_float = .empty }
         else
@@ -3133,12 +3144,20 @@ pub fn aggOutputTypeFor(a: AggSpec, in: ?Type) !Type {
     return aggOutputType(a.func, in);
 }
 
-/// Whether an aggregate's output column can hold NULL: everything except the
-/// COUNT family (which finalizes to 0 over zero qualifying inputs).
+/// Whether an aggregate's output column can hold NULL: everything but those
+/// with a value over zero qualifying inputs (`emptyValue`).
 pub fn aggOutputNullable(func: AggFunc) bool {
+    return emptyValue(func) == null;
+}
+
+/// What an aggregate gives over no rows, or null for NULL: 0 for the COUNT
+/// family, the identity for MySQL's bit aggregates.
+pub fn emptyValue(func: AggFunc) ?types.Value {
     return switch (func) {
-        .count, .count_if, .count_distinct => false,
-        else => true,
+        .count, .count_if, .count_distinct => .{ .bigint = 0 },
+        .unsigned_bit_and => .{ .largeint = std.math.maxInt(u64) },
+        .unsigned_bit_or, .unsigned_bit_xor => .{ .largeint = 0 },
+        else => null,
     };
 }
 
@@ -3213,8 +3232,18 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         // internal producers must set `out_type_override`.
         .max_by_key => Error.AggregateUnsupportedType,
         .bit_and, .bit_or, .bit_xor => .bigint,
+        .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => .largeint,
         .group_concat => .string,
         .udf => Error.AggregateUnsupportedType,
+    };
+}
+
+/// Whether an aggregate takes only numbers, so MySQL reads its input as a
+/// number where the input could be one (a hex literal, a DATE).
+pub fn takesNumbers(func: AggFunc) bool {
+    return switch (func) {
+        .sum, .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => true,
+        else => false,
     };
 }
 
@@ -3222,9 +3251,15 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
 /// reads the input as the number it spells there (`SUM(d)` sums YYYYMMDD);
 /// thinDB rejects it in the other dialects.
 pub fn readsTemporalAsNumber(func: AggFunc, in: Type) bool {
-    if (!in.isTemporal()) return false;
+    return in.isTemporal() and takesNumbers(func);
+}
+
+/// A MySQL bit aggregate over a double, decimal or text input, which reads
+/// each value as MySQL's bit operators read an operand (`x | 0`): a double
+/// or decimal rounded, text as the integer it starts with.
+pub fn readsOperandBits(func: AggFunc, in: Type) bool {
     return switch (func) {
-        .sum, .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .bit_and, .bit_or, .bit_xor => true,
+        .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => in.isFloat() or in.isDecimal() or in.isString(),
         else => false,
     };
 }
@@ -3249,7 +3284,7 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
             _ = in orelse return Error.AggregateColumnRequired;
             _ = arg2_in orelse return Error.AggregateColumnRequired;
         },
-        .bit_and, .bit_or, .bit_xor => {
+        .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => {
             const t = in orelse return Error.AggregateColumnRequired;
             if (!(t == .boolean or t == .tinyint or t == .smallint or t == .int or t == .bigint or t == .largeint)) return Error.AggregateUnsupportedType;
         },
@@ -3676,7 +3711,7 @@ pub fn updateState(
             const key_idx = types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound;
             try maxByUpdate(aa, s, batch.values[col_idx.?], batch.values[key_idx], row_start, row_end);
         },
-        .bit_and, .bit_or, .bit_xor => {
+        .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => {
             try bitwiseUpdate(s, func, batch.values[col_idx.?], row_start, row_end);
         },
         .sum_distinct, .avg_distinct => {
@@ -4150,6 +4185,9 @@ pub fn appendAccToColumn(
             } else {
                 try col.data.bigint.append(allocator, b.value);
             }
+        },
+        .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => {
+            try col.data.largeint.append(allocator, @as(u64, @bitCast(state.bitwise.value)));
         },
         .sum_distinct, .avg_distinct => switch (state) {
             .distinct_exact => |list| if (list.items.len == 0) {

@@ -10,7 +10,8 @@
 //!   - `/`, DIV and MOD by zero return NULL
 //!   - integer result types and wrapping match StarRocks (DESIGN.md §3.4)
 //!   - scientific-notation and leading-dot literals are DOUBLE
-//!   - bit operators: signed as in StarRocks, BIGINT UNSIGNED in MySQL
+//!   - bit operators and BIT_AND/OR/XOR: signed as in StarRocks, BIGINT
+//!     UNSIGNED in MySQL
 //!   - BIT_COUNT, BIN and CONV, and integers of any width written as text
 
 const std = @import("std");
@@ -561,6 +562,60 @@ test "binary arith: BIT_COUNT, BIN and CONV read a value as MySQL does" {
         .{ "SELECT CONV(5, 10, 37) FROM t WHERE id = 1", &[_]?[]const u8{null} },
     };
     inline for (cases) |c| try expectMysqlText(allocator, db, c[0], c[1]);
+}
+
+test "binary arith: MySQL's BIT_AND, BIT_OR and BIT_XOR return BIGINT UNSIGNED" {
+    // Values probed against MySQL 8.4 (#349).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE bz (id INT, v INT, d DOUBLE, m DECIMAL(10,2), c VARCHAR(20))");
+    try helpers.exec(allocator, db, "INSERT INTO bz VALUES (1, -3, 2.7, 2.5, '12abc'), (2, 5, -1.5, -2.5, '-3'), (3, NULL, NULL, NULL, NULL)");
+
+    const all_ones = "18446744073709551615";
+    const cases = .{
+        .{ "SELECT BIT_AND(v) FROM bz", &[_]?[]const u8{"5"} },
+        .{ "SELECT BIT_OR(v) FROM bz", &[_]?[]const u8{"18446744073709551613"} },
+        .{ "SELECT BIT_XOR(v) FROM bz", &[_]?[]const u8{"18446744073709551608"} },
+        // No rows, or only NULLs, give the operation's identity.
+        .{ "SELECT BIT_AND(v) FROM bz WHERE id > 10", &[_]?[]const u8{all_ones} },
+        .{ "SELECT BIT_OR(v) FROM bz WHERE id > 10", &[_]?[]const u8{"0"} },
+        .{ "SELECT BIT_XOR(v) FROM bz WHERE id = 3", &[_]?[]const u8{"0"} },
+        .{ "SELECT BIT_AND(v) FROM bz GROUP BY id ORDER BY id", &[_]?[]const u8{ "18446744073709551613", "5", all_ones } },
+        .{ "SELECT BIT_AND(v) FROM bz WHERE id > 10 GROUP BY id", &[_]?[]const u8{} },
+        .{ "SELECT BIT_OR(v) + 1 FROM bz", &[_]?[]const u8{"18446744073709551614"} },
+        .{ "SELECT BIT_OR(~v) FROM bz", &[_]?[]const u8{"18446744073709551610"} },
+        .{ "SELECT BIT_OR(v) FROM bz HAVING BIT_OR(v) > 5", &[_]?[]const u8{"18446744073709551613"} },
+        .{ "SELECT CAST(BIT_OR(v) AS SIGNED) FROM bz", &[_]?[]const u8{"-3"} },
+        .{ "SELECT CONCAT(BIT_XOR(v), '') FROM bz", &[_]?[]const u8{"18446744073709551608"} },
+        // A double rounds half to even, a decimal half away from zero, and
+        // text reads as the integer it starts with, as for `|`.
+        .{ "SELECT BIT_AND(d) FROM bz", &[_]?[]const u8{"2"} },
+        .{ "SELECT BIT_XOR(d) FROM bz", &[_]?[]const u8{"18446744073709551613"} },
+        .{ "SELECT BIT_AND(m) FROM bz", &[_]?[]const u8{"1"} },
+        .{ "SELECT BIT_XOR(m) FROM bz", &[_]?[]const u8{"18446744073709551614"} },
+        .{ "SELECT BIT_AND(c) FROM bz", &[_]?[]const u8{"12"} },
+        .{ "SELECT BIT_XOR(c) FROM bz", &[_]?[]const u8{"18446744073709551601"} },
+        .{ "SELECT (SELECT BIT_AND(v) FROM bz WHERE id > 10) FROM bz WHERE id = 1", &[_]?[]const u8{all_ones} },
+        .{ "SELECT (SELECT BIT_AND(b2.v) FROM bz b2 WHERE b2.id = bz.id + 100) FROM bz ORDER BY id", &[_]?[]const u8{ all_ones, all_ones, all_ones } },
+    };
+    inline for (cases) |c| try expectMysqlText(allocator, db, c[0], c[1]);
+
+    // The other dialects keep StarRocks' signed BIGINT, NULL over no rows.
+    const neutral_cases = .{
+        .{ "SELECT BIT_OR(v) FROM bz", "-3" },
+        .{ "SELECT BIT_XOR(v) FROM bz", "-8" },
+        .{ "SELECT BIT_AND(v) FROM bz WHERE id > 10", null },
+    };
+    inline for (neutral_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        try expectColumnText(allocator, &q, &.{c[1]});
+    }
+    try helpers.expectRunError(allocator, db, "SELECT BIT_AND(d) FROM bz", error.AggregateUnsupportedType);
 }
 
 test "binary arith: a LARGEINT keeps every digit, as text and cast to BIGINT" {

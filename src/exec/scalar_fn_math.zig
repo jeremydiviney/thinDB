@@ -466,13 +466,17 @@ pub const convKernel = baseConversionKernel(.text, null);
 pub const binKernel = baseConversionKernel(.text, .{ 10, 2 });
 pub const convBooleanKernel = baseConversionKernel(.boolean, null);
 pub const binBooleanKernel = baseConversionKernel(.boolean, .{ 10, 2 });
+/// CONV over a hex literal's integer, held in a LARGEINT: MySQL converts the
+/// literal's own 64 bits rather than any text, so `from_base` must be a base
+/// but names none of its digits (`CONV(X'FF', 16, 10)` is 255).
+pub const convBitsKernel = baseConversionKernel(.bits, null);
 
-fn baseConversionKernel(comptime source: enum { text, boolean }, comptime fixed_bases: ?[2]i32) Kernel {
+fn baseConversionKernel(comptime source: enum { text, boolean, bits }, comptime fixed_bases: ?[2]i32) Kernel {
     return struct {
         fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
             const sv = switch (source) {
                 .text => stringViewOf(args[0]),
-                .boolean => {},
+                .boolean, .bits => {},
             };
             const ss = stringStoreOf(out);
             const first = out.data.rowCount();
@@ -485,6 +489,11 @@ fn baseConversionKernel(comptime source: enum { text, boolean }, comptime fixed_
                     const n = switch (source) {
                         .text => sv.rowBytes(i),
                         .boolean => if (args[0].data.boolean[i] != 0) "1" else "0",
+                        .bits => {
+                            if (!validBase(from_base) or !validBase(to_base)) break :blk null;
+                            const bits: u64 = @truncate(@as(u128, @bitCast(args[0].data.largeint[i])));
+                            break :blk baseText(&buf, bits, @intCast(@abs(to_base)), to_base < 0);
+                        },
                     };
                     break :blk convText(&buf, n, from_base, to_base);
                 };
