@@ -961,6 +961,10 @@ pub const SessionTables = struct {
         const self: *const SessionTables = @ptrCast(@alignCast(context));
         const ref: ir.TableRef = .{ .database = database, .schema = schema, .name = name };
         if (pgcat.match(ref, self.session.dialect) != null) return null;
+        // The parser runs before its statement takes a lease, and a DROP
+        // frees the table under its exclusive one.
+        const lease = self.catalog.acquireStatement(false) catch return null;
+        defer lease.release();
         const table = resolveTable(self.catalog, self.session, ref) catch return null;
         const names = try arena.alloc([]const u8, table.schema.columns.len);
         for (table.schema.columns, names) |col, *column_name| column_name.* = try arena.dupe(u8, col.name);

@@ -235,6 +235,57 @@ test "dropDatabase: cascade-drops all schemas" {
     try std.testing.expectError(thindb.Error.DatabaseNotFound, cat.dropDatabase("scratch"));
 }
 
+/// A table lookup the parser makes, run on its own thread.
+const ParseLookup = struct {
+    tables: thindb.net.SessionTables,
+    arena: std.heap.ArenaAllocator,
+    columns: ?[]const []const u8 = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ParseLookup) void {
+        const view = self.tables.columns();
+        self.columns = view.lookup(view.context, self.arena.allocator(), null, null, "orders") catch null;
+        self.done.store(true, .release);
+    }
+};
+
+// The parser looks tables up before its statement takes a lease (#90): a
+// lookup that ignored the gate read a table a concurrent DROP DATABASE had
+// already freed.
+test "Catalog: a parse-time table lookup waits out a DROP DATABASE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cat = try thindb.Catalog.open(allocator, io, tmp.dir, .{});
+    defer cat.close();
+    const db = try cat.createDatabase("doomed");
+    _ = try db.table("orders", schema_v1, opts_v1);
+
+    var lookup: ParseLookup = .{
+        .tables = .{ .catalog = cat, .session = .{ .current_db = "doomed" } },
+        .arena = .init(allocator),
+    };
+    defer lookup.arena.deinit();
+
+    const looked_up_during_drop = drop: {
+        var drop_lease: ?thindb.Catalog.StatementLease = try cat.acquireStatement(true);
+        errdefer if (drop_lease) |lease| lease.release();
+        const thread = try std.Thread.spawn(.{}, ParseLookup.run, .{&lookup});
+        defer {
+            if (drop_lease) |lease| lease.release();
+            drop_lease = null;
+            thread.join();
+        }
+        try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+        const early = lookup.done.load(.acquire);
+        try cat.dropDatabase("doomed");
+        break :drop early;
+    };
+    try std.testing.expect(!looked_up_during_drop);
+    try std.testing.expect(lookup.columns == null);
+}
+
 test "back-compat: Database.open + db.table still works" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
