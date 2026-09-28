@@ -28,6 +28,7 @@ const ir = @import("../ir/ir.zig");
 const api = @import("../api/api.zig");
 const Catalog = api.Catalog;
 const Session = api.Session;
+const conn_registry = @import("conn_registry.zig");
 
 pub const Table = enum {
     pg_namespace,
@@ -42,25 +43,37 @@ pub const Table = enum {
     info_schemata,
     info_tables,
     info_columns,
+    info_processlist,
+    perf_processlist,
+    pg_stat_activity,
 };
 
-/// Recognize a FROM target as a `pg_catalog` or `information_schema`
-/// relation. pg_catalog matches a bare name (`pg_class`) or one explicitly
-/// qualified — the `pg_` prefix is reserved, so a bare match never shadows a
-/// user table. information_schema relations match ONLY when qualified: a
-/// bare `tables` must stay a user table.
-pub fn match(ref: ir.TableRef) ?Table {
+/// Recognize a FROM target as a `pg_catalog`, `information_schema` or
+/// process-list relation. pg_catalog matches a bare name (`pg_class`) or one
+/// explicitly qualified — the `pg_` prefix is reserved, so a bare match never
+/// shadows a user table. information_schema relations match ONLY when
+/// qualified: a bare `tables` must stay a user table. The MySQL dialect sees
+/// only the process lists: the MySQL wire answers its other metadata probes
+/// itself, and a bare `pg_class` there is a user table.
+pub fn match(ref: ir.TableRef, dialect: api.Dialect) ?Table {
     if (ref.database != null) return null;
     if (ref.schema) |s| {
         if (std.ascii.eqlIgnoreCase(s, "information_schema")) {
+            if (std.ascii.eqlIgnoreCase(ref.name, "processlist")) return .info_processlist;
+            if (dialect == .mysql) return null;
             if (std.ascii.eqlIgnoreCase(ref.name, "schemata")) return .info_schemata;
             if (std.ascii.eqlIgnoreCase(ref.name, "tables")) return .info_tables;
             if (std.ascii.eqlIgnoreCase(ref.name, "columns")) return .info_columns;
             return null;
         }
+        if (std.ascii.eqlIgnoreCase(s, "performance_schema")) {
+            return if (std.ascii.eqlIgnoreCase(ref.name, "processlist")) .perf_processlist else null;
+        }
         if (!std.ascii.eqlIgnoreCase(s, "pg_catalog")) return null;
     }
+    if (dialect == .mysql) return null;
     const n = ref.name;
+    if (std.ascii.eqlIgnoreCase(n, "pg_stat_activity")) return .pg_stat_activity;
     if (std.ascii.eqlIgnoreCase(n, "pg_namespace")) return .pg_namespace;
     if (std.ascii.eqlIgnoreCase(n, "pg_class")) return .pg_class;
     if (std.ascii.eqlIgnoreCase(n, "pg_attribute")) return .pg_attribute;
@@ -144,6 +157,37 @@ fn colString(a: Allocator, vals: []const []const u8) !ColumnView {
     }
     return .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes } } };
 }
+fn colBigint(a: Allocator, vals: []const i64) !ColumnView {
+    return .{ .data = .{ .bigint = try a.dupe(i64, vals) } };
+}
+
+/// Validity bitmap for optional values; null when every value is present.
+fn validity(a: Allocator, vals: anytype) !?[]const u8 {
+    for (vals) |v| {
+        if (v == null) break;
+    } else return null;
+    const bitmap = try a.alloc(u8, storage.column.bitmapBytes(vals.len));
+    @memset(bitmap, 0);
+    for (vals, 0..) |v, i| storage.column.setValidBit(bitmap, i, v != null);
+    return bitmap;
+}
+fn colOptString(a: Allocator, vals: []const ?[]const u8) !ColumnView {
+    const texts = try a.alloc([]const u8, vals.len);
+    for (vals, texts) |v, *text| text.* = v orelse "";
+    var view = try colString(a, texts);
+    view.nulls = try validity(a, vals);
+    return view;
+}
+fn colOptInt(a: Allocator, vals: []const ?i32) !ColumnView {
+    const ints = try a.alloc(i32, vals.len);
+    for (vals, ints) |v, *int| int.* = v orelse 0;
+    return .{ .data = .{ .int = ints }, .nulls = try validity(a, vals) };
+}
+fn colOptDatetime(a: Allocator, vals: []const ?i64) !ColumnView {
+    const micros = try a.alloc(i64, vals.len);
+    for (vals, micros) |v, *us| us.* = v orelse 0;
+    return .{ .data = .{ .datetime = micros }, .nulls = try validity(a, vals) };
+}
 
 pub const PgCatalogSource = struct {
     gpa: Allocator,
@@ -216,6 +260,9 @@ pub fn build(gpa: Allocator, catalog: *Catalog, session: Session, table: Table) 
         .info_schemata => try buildInfoSchemata(a, catalog, session, self),
         .info_tables => try buildInfoTables(a, catalog, session, self),
         .info_columns => try buildInfoColumns(a, catalog, session, self),
+        .info_processlist => try buildProcessList(a, catalog, session, self, false),
+        .perf_processlist => try buildProcessList(a, catalog, session, self, true),
+        .pg_stat_activity => try buildStatActivity(a, catalog, session, self),
     }
     return exec.makeQuery(gpa, self);
 }
@@ -430,6 +477,149 @@ fn buildInfoColumns(a: Allocator, catalog: *Catalog, session: Session, self: *Pg
     self.schema = schema;
     self.views = views;
     self.row_count = n;
+}
+
+fn listProcesses(a: Allocator, session: Session) ![]conn_registry.Process {
+    const registry = session.connections orelse return &.{};
+    return registry.processList(a);
+}
+
+/// MySQL's `information_schema.PROCESSLIST`, the rows SHOW FULL PROCESSLIST
+/// prints; `performance_schema.processlist` adds EXECUTION_ENGINE.
+fn buildProcessList(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource, with_engine: bool) !void {
+    const processes = try listProcesses(a, session);
+    const now_ms = conn_registry.nowMs(catalog.io);
+    const n = processes.len;
+    const ids = try a.alloc(i64, n);
+    const users = try a.alloc([]const u8, n);
+    const hosts = try a.alloc([]const u8, n);
+    const dbs = try a.alloc(?[]const u8, n);
+    const commands = try a.alloc([]const u8, n);
+    const times = try a.alloc(i32, n);
+    const states = try a.alloc(?[]const u8, n);
+    const infos = try a.alloc(?[]const u8, n);
+    const engines = try a.alloc([]const u8, n);
+    for (processes, 0..) |*process, i| {
+        const activity = &process.activity;
+        ids[i] = process.backend_id;
+        users[i] = if (activity.user.len > 0) activity.user.slice() else "unauthenticated user";
+        hosts[i] = activity.host.slice();
+        dbs[i] = if (activity.db.len > 0) activity.db.slice() else null;
+        commands[i] = activity.command.label();
+        times[i] = std.math.cast(i32, (now_ms -| activity.since_ms) / std.time.ms_per_s) orelse std.math.maxInt(i32);
+        states[i] = activity.command.state();
+        infos[i] = if (activity.command.running()) activity.info.slice() else null;
+        engines[i] = "PRIMARY";
+    }
+
+    const width: usize = if (with_engine) 9 else 8;
+    const schema = try a.alloc(Column, width);
+    schema[0] = .{ .name = "ID", .type = .bigint };
+    schema[1] = .{ .name = "USER", .type = .string };
+    schema[2] = .{ .name = "HOST", .type = .string };
+    schema[3] = .{ .name = "DB", .type = .string, .nullable = true };
+    schema[4] = .{ .name = "COMMAND", .type = .string };
+    schema[5] = .{ .name = "TIME", .type = .int };
+    schema[6] = .{ .name = "STATE", .type = .string, .nullable = true };
+    schema[7] = .{ .name = "INFO", .type = .string, .nullable = true };
+    const views = try a.alloc(ColumnView, width);
+    views[0] = try colBigint(a, ids);
+    views[1] = try colString(a, users);
+    views[2] = try colString(a, hosts);
+    views[3] = try colOptString(a, dbs);
+    views[4] = try colString(a, commands);
+    views[5] = try colInt(a, times);
+    views[6] = try colOptString(a, states);
+    views[7] = try colOptString(a, infos);
+    if (with_engine) {
+        schema[8] = .{ .name = "EXECUTION_ENGINE", .type = .string };
+        views[8] = try colString(a, engines);
+    }
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+/// PostgreSQL's `pg_stat_activity`, the columns tools commonly read. A
+/// connection's awake-clock marks become wall-clock timestamps by their age.
+/// `query` is the running statement's text, empty while idle.
+fn buildStatActivity(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
+    const processes = try listProcesses(a, session);
+    const now_ms = conn_registry.nowMs(catalog.io);
+    const now_us = std.Io.Timestamp.now(catalog.io, .real).toMicroseconds();
+    const n = processes.len;
+    const datnames = try a.alloc(?[]const u8, n);
+    const pids = try a.alloc(i32, n);
+    const usenames = try a.alloc(?[]const u8, n);
+    const applications = try a.alloc([]const u8, n);
+    const addrs = try a.alloc(?[]const u8, n);
+    const ports = try a.alloc(?i32, n);
+    const backend_starts = try a.alloc(?i64, n);
+    const query_starts = try a.alloc(?i64, n);
+    const state_changes = try a.alloc(?i64, n);
+    const states = try a.alloc(?[]const u8, n);
+    const queries = try a.alloc([]const u8, n);
+    const backend_types = try a.alloc([]const u8, n);
+    for (processes, 0..) |*process, i| {
+        const activity = &process.activity;
+        const db = activity.db.slice();
+        datnames[i] = if (db.len == 0) null else if (std.mem.indexOf(u8, db, "__")) |sep| db[0..sep] else db;
+        pids[i] = @bitCast(process.backend_id);
+        usenames[i] = if (activity.user.len > 0) activity.user.slice() else null;
+        applications[i] = activity.application.slice();
+        const peer = splitPeer(activity.host.slice());
+        addrs[i] = peer.addr;
+        ports[i] = peer.port;
+        backend_starts[i] = now_us - @as(i64, @intCast((now_ms -| activity.connected_ms) * std.time.us_per_ms));
+        state_changes[i] = now_us - @as(i64, @intCast((now_ms -| activity.since_ms) * std.time.us_per_ms));
+        query_starts[i] = if (activity.command.running()) state_changes[i] else null;
+        states[i] = switch (activity.command) {
+            .connect => null,
+            .sleep => "idle",
+            .query, .prepare, .execute => "active",
+        };
+        queries[i] = activity.info.slice();
+        backend_types[i] = "client backend";
+    }
+
+    const schema = try a.alloc(Column, 12);
+    schema[0] = .{ .name = "datname", .type = .string, .nullable = true };
+    schema[1] = .{ .name = "pid", .type = .int };
+    schema[2] = .{ .name = "usename", .type = .string, .nullable = true };
+    schema[3] = .{ .name = "application_name", .type = .string };
+    schema[4] = .{ .name = "client_addr", .type = .string, .nullable = true };
+    schema[5] = .{ .name = "client_port", .type = .int, .nullable = true };
+    schema[6] = .{ .name = "backend_start", .type = .datetime };
+    schema[7] = .{ .name = "query_start", .type = .datetime, .nullable = true };
+    schema[8] = .{ .name = "state_change", .type = .datetime };
+    schema[9] = .{ .name = "state", .type = .string, .nullable = true };
+    schema[10] = .{ .name = "query", .type = .string };
+    schema[11] = .{ .name = "backend_type", .type = .string };
+    const views = try a.alloc(ColumnView, 12);
+    views[0] = try colOptString(a, datnames);
+    views[1] = try colInt(a, pids);
+    views[2] = try colOptString(a, usenames);
+    views[3] = try colString(a, applications);
+    views[4] = try colOptString(a, addrs);
+    views[5] = try colOptInt(a, ports);
+    views[6] = try colOptDatetime(a, backend_starts);
+    views[7] = try colOptDatetime(a, query_starts);
+    views[8] = try colOptDatetime(a, state_changes);
+    views[9] = try colOptString(a, states);
+    views[10] = try colString(a, queries);
+    views[11] = try colString(a, backend_types);
+    self.schema = schema;
+    self.views = views;
+    self.row_count = n;
+}
+
+const Peer = struct { addr: ?[]const u8, port: ?i32 };
+
+/// Split a peer written `ip:port` (IPv6 as `[ip]:port`).
+fn splitPeer(host: []const u8) Peer {
+    const colon = std.mem.lastIndexOfScalar(u8, host, ':') orelse return .{ .addr = null, .port = null };
+    const port = std.fmt.parseInt(i32, host[colon + 1 ..], 10) catch null;
+    return .{ .addr = std.mem.trim(u8, host[0..colon], "[]"), .port = port };
 }
 
 /// The `pg_views` system view over the catalog's registered views. thinDB

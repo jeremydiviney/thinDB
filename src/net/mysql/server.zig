@@ -114,6 +114,13 @@ pub const Server = struct {
         self.allocator.destroy(self);
     }
 
+    /// Every wire sharing a registry draws ids from it, so a KILL or a
+    /// process-list id names one connection across all of them.
+    fn nextConnectionId(self: *Server) u32 {
+        if (self.registry) |reg| return reg.nextBackendId();
+        return self.connection_counter.fetchAdd(1, .monotonic) + 1;
+    }
+
     /// Accept ONE connection and serve it synchronously on the calling
     /// thread. Used by tests that want a deterministic accept count.
     pub fn acceptOne(self: *Server) !void {
@@ -134,7 +141,7 @@ pub const Server = struct {
         }
         defer self.limiter.release();
 
-        const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+        const cid = self.nextConnectionId();
         handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password, self.registry, self.profile) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
@@ -160,7 +167,7 @@ pub const Server = struct {
                 stream.close(self.io);
                 continue;
             }
-            const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+            const cid = self.nextConnectionId();
             const job = self.allocator.create(ConnJob) catch {
                 self.limiter.release();
                 stream.close(self.io);
@@ -332,7 +339,12 @@ const SessionState = struct {
     fn deinit(self: *SessionState) void {
         self.dropTempNamespace();
         self.resetVars();
-        if (self.xa_active) |x| self.allocator.free(x);
+        // A branch still ACTIVE when its connection goes can never be ended
+        // or prepared, so it is rolled back, as MySQL rolls it back.
+        if (self.xa_active) |x| {
+            self.catalog.xa.rollback(x) catch {};
+            self.allocator.free(x);
+        }
         self.xa_active = null;
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
@@ -403,6 +415,7 @@ const SessionState = struct {
             .connection_id = self.backend_id,
             .user = handshake.reported_user,
             .server_version = handshake.server_version,
+            .connections = self.registry,
         };
     }
 
@@ -836,7 +849,7 @@ fn handleConnection(
         conn_state.endCommand(processDb(&session, &db_buf), nowMs(io));
     }
 
-    while (true) {
+    while (!conn_state.closeRequested()) {
         const read_start = profiler.start();
         // Both read waits are marked for the reaper (#164). Header wait
         // = idle between commands: unbounded UNLESS bytes are queued on
@@ -1183,12 +1196,22 @@ fn handleQuery(
             .empty_variables => try result.sendEmptyVariables(allocator, w, &seq_id, caps),
             .empty_result => |kind| try sendMetadataResult(allocator, w, catalog, session, payload, kind, &seq_id, caps),
             .processlist => |list| try sendProcessList(allocator, w, catalog.io, session, list.full, &seq_id, caps),
-            .kill => |target_id| {
-                // No registry → KILL is a no-op success. With a
-                // registry, look up the target and set its cancel
-                // flag. Unknown id → ER_NO_SUCH_THREAD (1094).
+            .kill => |kill| {
+                // Killing its own connection interrupts the KILL itself, as
+                // MySQL does; the socket must stay up so the reply reaches
+                // the client, and the command loop closes afterwards.
+                if (session.conn_state) |own| {
+                    if (own.backend_id == kill.id) {
+                        if (kill.connection) own.requestClose();
+                        const mapped = errors.mapInternal(error.QueryCancelled, null);
+                        try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+                        return;
+                    }
+                }
+                // No registry → KILL of a peer is a no-op success.
                 if (session.registry) |reg| {
-                    if (!reg.requestCancel(target_id, 0)) {
+                    const found = if (kill.connection) reg.requestClose(catalog.io, kill.id) else reg.requestCancel(kill.id, 0);
+                    if (!found) {
                         try handshake.sendErrPacket(allocator, w, seq_id, 1094, "HY000".*, "Unknown thread id");
                         return;
                     }
@@ -1262,6 +1285,7 @@ fn sendSyntheticWorkbenchSelect(
     const from_idx = topLevelKeyword(lc, "from");
     if (from_idx) |idx| {
         const tail = lc[idx..];
+        if (readsProcessList(tail)) return false;
         if (std.mem.indexOf(u8, tail, "information_schema") == null and
             std.mem.indexOf(u8, tail, "`information_schema`") == null)
             return false;
@@ -1332,6 +1356,25 @@ fn sendSyntheticWorkbenchSelect(
     try result.sendTextRow(allocator, w, cells.items, seq_id);
     try result.sendResultTerminator(allocator, w, seq_id, client_caps);
     return true;
+}
+
+/// Whether a FROM clause reads a process-list relation. The engine serves
+/// those as virtual tables (pg_catalog.zig) under any WHERE / ORDER BY /
+/// projection, so the metadata shim leaves them alone.
+fn readsProcessList(from_tail: []const u8) bool {
+    const rest = std.mem.trimStart(u8, from_tail["from".len..], " \t\r\n");
+    const end = std.mem.indexOfAny(u8, rest, " \t\r\n,;()") orelse rest.len;
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    for (rest[0..end]) |c| {
+        if (c == '`') continue;
+        if (len == buf.len) return false;
+        buf[len] = c;
+        len += 1;
+    }
+    const target = buf[0..len];
+    return std.mem.eql(u8, target, "information_schema.processlist") or
+        std.mem.eql(u8, target, "performance_schema.processlist");
 }
 
 fn appendSelectColumns(
@@ -3195,10 +3238,6 @@ fn sendProcessList(
     const now_ms = nowMs(io);
     for (processes) |process| {
         const activity = &process.activity;
-        const running = switch (activity.command) {
-            .query, .prepare, .execute => true,
-            .connect, .sleep => false,
-        };
         var id_buf: [16]u8 = undefined;
         var time_buf: [24]u8 = undefined;
         const info = activity.info.slice();
@@ -3209,12 +3248,8 @@ fn sendProcessList(
             if (activity.db.len > 0) activity.db.slice() else null,
             activity.command.label(),
             try std.fmt.bufPrint(&time_buf, "{d}", .{(now_ms -| activity.since_ms) / std.time.ms_per_s}),
-            switch (activity.command) {
-                .connect => "login",
-                .sleep => "",
-                .query, .prepare, .execute => "executing",
-            },
-            if (!running) null else if (full) info else conn_registry.utf8Prefix(info, 100),
+            activity.command.state(),
+            if (!activity.command.running()) null else if (full) info else conn_registry.utf8Prefix(info, 100),
         };
         try result.sendTextRow(allocator, w, cells[0..], seq_id);
     }

@@ -1,11 +1,14 @@
 //! Process-wide connection registry — used for cross-connection
-//! cancellation: MySQL `KILL <id>` and PG `CancelRequest` /
+//! cancellation: MySQL `KILL QUERY <id>` and PG `CancelRequest` /
 //! `pg_cancel_backend(pid)` both need to reach into another
 //! connection's state, set its cancel flag, and let the executor
 //! abort at the next batch boundary. The reaper sets the same flag
 //! when a client disconnects mid-query (`cancelAbandonedQueries`).
+//! MySQL `KILL [CONNECTION] <id>` and `pg_terminate_backend(pid)`
+//! also close the target connection (`requestClose`).
 //! `processList` snapshots what every connection is doing, for
-//! SHOW PROCESSLIST, so a runaway query's id can be found to KILL it.
+//! SHOW PROCESSLIST and the process-list relations, so a runaway
+//! query's id can be found to KILL it.
 //!
 //! One Registry is shared across all wire frontends (mysql, pg,
 //! native). Each accepted connection registers a ConnectionState on
@@ -76,6 +79,22 @@ pub const Command = enum {
             .execute => "Execute",
         };
     }
+
+    pub fn running(self: Command) bool {
+        return switch (self) {
+            .query, .prepare, .execute => true,
+            .connect, .sleep => false,
+        };
+    }
+
+    /// The PROCESSLIST State column.
+    pub fn state(self: Command) []const u8 {
+        return switch (self) {
+            .connect => "login",
+            .sleep => "",
+            .query, .prepare, .execute => "executing",
+        };
+    }
 };
 
 pub const Activity = struct {
@@ -86,6 +105,10 @@ pub const Activity = struct {
     user: BoundedText(64) = .{},
     /// The client's address, `ip:port`.
     host: BoundedText(64) = .{},
+    /// The PostgreSQL client's `application_name`; empty on MySQL.
+    application: BoundedText(64) = .{},
+    /// Awake-clock milliseconds when the connection was accepted.
+    connected_ms: u64 = 0,
     db: BoundedText(128) = .{},
     command: Command = .connect,
     /// Awake-clock milliseconds when `command` began.
@@ -118,6 +141,11 @@ pub const ConnectionState = struct {
     /// the connection meanwhile, nobody is left to receive the result, so
     /// `Registry.cancelAbandonedQueries` cancels the statement.
     cancel_on_disconnect: std.atomic.Value(bool) = .{ .raw = false },
+    /// Set by a KILL CONNECTION or pg_terminate_backend aimed at this
+    /// connection. The connection's own thread closes the connection at
+    /// its next command boundary, releasing the session exactly as a
+    /// client disconnect does.
+    close_requested: std.atomic.Value(bool) = .{ .raw = false },
     /// Socket handle for the net_read_timeout reaper (#164). Set once,
     /// before `Registry.register` publishes this state (the register
     /// lock is the publication barrier). Null for transports that
@@ -166,8 +194,23 @@ pub const ConnectionState = struct {
         self.cancel_flag.store(true, .release);
     }
 
+    /// Clear a stale cancel before a new statement. A pending close keeps
+    /// the flag set: with both flags seq_cst, a `requestClose` racing this
+    /// either stores its cancel after the clear or has its close seen here.
     pub fn clearCancel(self: *ConnectionState) void {
-        self.cancel_flag.store(false, .release);
+        self.cancel_flag.store(false, .seq_cst);
+        if (self.close_requested.load(.seq_cst)) self.cancel_flag.store(true, .seq_cst);
+    }
+
+    /// Interrupt the running statement and have this connection's thread
+    /// close the connection at its next command boundary.
+    pub fn requestClose(self: *ConnectionState) void {
+        self.close_requested.store(true, .seq_cst);
+        self.cancel_flag.store(true, .seq_cst);
+    }
+
+    pub fn closeRequested(self: *const ConnectionState) bool {
+        return self.close_requested.load(.acquire);
     }
 
     pub fn isCancelled(self: *const ConnectionState) bool {
@@ -195,6 +238,13 @@ pub const ConnectionState = struct {
         defer self.activity_lock.unlock();
         self.activity.host.set(host);
         self.activity.since_ms = now_ms;
+        self.activity.connected_ms = now_ms;
+    }
+
+    pub fn setApplication(self: *ConnectionState, name: []const u8) void {
+        self.activity_lock.lock();
+        defer self.activity_lock.unlock();
+        self.activity.application.set(name);
     }
 
     pub fn setUser(self: *ConnectionState, user: []const u8) void {
@@ -287,6 +337,26 @@ pub const Registry = struct {
         const state = self.entries.get(backend_id) orelse return false;
         if (secret_or_zero != 0 and state.secret_key != secret_or_zero) return false;
         state.requestCancel();
+        return true;
+    }
+
+    /// Kill a peer connection: cancel its statement, ask its thread to close
+    /// the connection, and shut its socket down so a read or write the
+    /// thread is blocked in returns now. The thread then leaves through its
+    /// normal error path, which releases everything the connection holds.
+    /// Windows is the exception: a shutdown there does not complete a read
+    /// already pending, so an idle target leaves once its client closes its
+    /// end or the stack times the half-closed connection out.
+    /// Shutdown, not close, under the registry lock, for the reasons
+    /// `reapStalledReads` gives. A connection killing itself calls
+    /// `ConnectionState.requestClose` instead, so its reply still goes
+    /// out. Returns false on an unknown id.
+    pub fn requestClose(self: *Registry, io: std.Io, backend_id: u32) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const state = self.entries.get(backend_id) orelse return false;
+        state.requestClose();
+        if (state.reap_socket) |handle| io.vtable.netShutdown(io.userdata, handle, .both) catch {};
         return true;
     }
 
@@ -514,6 +584,35 @@ test "cancelAbandonedQueries cancels only an armed statement whose client is gon
     try std.testing.expectEqual(@as(usize, 1), reg.cancelAbandonedQueries());
     try std.testing.expect(s.isCancelled());
     try std.testing.expectEqual(@as(usize, 0), reg.cancelAbandonedQueries());
+}
+
+test "requestClose cancels, marks the close and shuts the peer's socket down" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    defer listener.deinit(io);
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer client.close(io);
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    var s = ConnectionState.init(4, 0);
+    s.reap_socket = accepted.socket.handle;
+    try reg.register(&s);
+    defer reg.unregister(4);
+
+    try std.testing.expect(!reg.requestClose(io, 99));
+    try std.testing.expect(reg.requestClose(io, 4));
+    try std.testing.expect(s.closeRequested());
+    try std.testing.expect(s.isCancelled());
+    s.clearCancel();
+    try std.testing.expect(s.isCancelled());
+
+    var buf: [8]u8 = undefined;
+    var reader = client.reader(io, &buf);
+    try std.testing.expectError(error.EndOfStream, reader.interface.takeByte());
 }
 
 test "processList snapshots each connection's activity in id order" {

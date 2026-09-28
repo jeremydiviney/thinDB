@@ -967,7 +967,7 @@ test "pg wire: pg_cancel_backend on unknown pid returns 'f'" {
     if (sctx.err) |e| return e;
 }
 
-test "pg wire: pg_cancel_backend on self returns 't' and sets the cancel flag" {
+test "pg wire: pg_cancel_backend on self cancels the calling statement" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1001,12 +1001,283 @@ test "pg wire: pg_cancel_backend on self returns 't' and sets the cancel flag" {
     // fetchAdd returns 0, we add 1).
     try client.sendQuery("SELECT pg_cancel_backend(1)");
     const r = try client.readQueryReply(arena.allocator());
-    try std.testing.expect(r.error_code == null);
-    try std.testing.expectEqual(@as(usize, 1), r.rows.len);
-    try std.testing.expectEqualStrings("t", r.rows[0][0].?);
+    try std.testing.expectEqualStrings("57014", r.error_code.?);
+
+    try client.sendQuery("SELECT 1");
+    const after = try client.readQueryReply(arena.allocator());
+    try std.testing.expect(after.error_code == null);
+    try std.testing.expectEqualStrings("1", after.rows[0][0].?);
 
     try client.sendTerminate();
     if (sctx.err) |e| return e;
+}
+
+const slow_probe = @import("slow_probe.zig");
+
+/// The server closed the connection: the next read ends the stream (or, on
+/// Windows, may see the reset instead).
+fn expectConnectionClosed(client: *TestClient) !void {
+    for (0..64) |_| {
+        const frame = pg_packet.readFrame(client.allocator, &client.reader.interface) catch return;
+        client.allocator.free(frame.payload);
+    }
+    return error.ConnectionStillOpen;
+}
+
+test "pg wire: a read-only query is cancelled once its client disconnects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: slow_probe.SlowProbe = .{ .io = io };
+    try slow_probe.seed(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 105;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    var server_joined = false;
+    defer if (!server_joined) t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    var client_open = true;
+    defer if (client_open) client.close();
+    try client.completeStartup("postgres", null);
+
+    try client.sendQuery("SELECT max(slow_probe(id)) AS m FROM t");
+    try probe.awaitFirstBatch();
+    try std.testing.expectEqual(@as(usize, 0), registry.cancelAbandonedQueries());
+
+    client.close();
+    client_open = false;
+    var cancelled: usize = 0;
+    for (0..400) |_| {
+        cancelled = registry.cancelAbandonedQueries();
+        if (cancelled != 0) break;
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cancelled);
+
+    t.join();
+    server_joined = true;
+    try std.testing.expect(probe.rows.load(.monotonic) < slow_probe.total_rows);
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: a write keeps running after its client disconnects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: slow_probe.SlowProbe = .{ .io = io };
+    try slow_probe.seed(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 106;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 2 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    {
+        var writer_client = try TestClient.connect(allocator, io, addr);
+        defer writer_client.close();
+        try writer_client.completeStartup("postgres", null);
+        try writer_client.sendQuery("INSERT INTO dst SELECT slow_probe(id) FROM t");
+        try probe.awaitFirstBatch();
+    }
+
+    var cancelled: usize = 0;
+    for (0..2000) |_| {
+        if (probe.rows.load(.monotonic) >= slow_probe.total_rows) break;
+        cancelled += registry.cancelAbandonedQueries();
+        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), cancelled);
+
+    // The server serves one connection at a time, so this startup waits
+    // for the INSERT to finish.
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendQuery("SELECT count(*) FROM dst");
+    const r = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("4096", r.rows[0][0].?);
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
+test "pg wire: pg_stat_activity finds a running query and pg_terminate_backend closes it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: slow_probe.SlowProbe = .{ .io = io };
+    try slow_probe.seed(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 107;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    // Ids follow connect order: runner 1, admin 2.
+    var runner_ctx: ServerCtx = .{ .server = server, .n = 1 };
+    const runner_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&runner_ctx});
+    var runner_joined = false;
+    defer if (!runner_joined) runner_thread.join();
+    var runner = try TestClient.connect(allocator, io, addr);
+    defer runner.close();
+    try runner.completeStartup("postgres", null);
+    const slow_sql = "SELECT max(slow_probe(id)) AS m FROM t";
+    try runner.sendQuery(slow_sql);
+    try probe.awaitFirstBatch();
+
+    var admin_ctx: ServerCtx = .{ .server = server, .n = 1 };
+    const admin_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&admin_ctx});
+    var admin_joined = false;
+    defer if (!admin_joined) admin_thread.join();
+    var admin = try TestClient.connect(allocator, io, addr);
+    defer admin.close();
+    try admin.completeStartup("postgres", null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try admin.sendQuery("SELECT pid, datname, usename, client_addr, state, query FROM pg_stat_activity WHERE state = 'active' AND pid <> 2 ORDER BY pid");
+    const active = try admin.readQueryReply(arena.allocator());
+    try std.testing.expect(active.error_code == null);
+    try std.testing.expectEqual(@as(usize, 1), active.rows.len);
+    try std.testing.expectEqualStrings("1", active.rows[0][0].?);
+    try std.testing.expectEqualStrings("main", active.rows[0][1].?);
+    try std.testing.expectEqualStrings("postgres", active.rows[0][2].?);
+    try std.testing.expectEqualStrings("127.0.0.1", active.rows[0][3].?);
+    try std.testing.expectEqualStrings("active", active.rows[0][4].?);
+    try std.testing.expectEqualStrings(slow_sql, active.rows[0][5].?);
+
+    try admin.sendQuery("SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND query_start IS NOT NULL");
+    const counted = try admin.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("2", counted.rows[0][0].?);
+
+    try admin.sendQuery("SELECT pg_terminate_backend(1)");
+    const terminated = try admin.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("t", terminated.rows[0][0].?);
+    try expectConnectionClosed(&runner);
+    runner_thread.join();
+    runner_joined = true;
+    try std.testing.expect(probe.rows.load(.monotonic) < slow_probe.total_rows);
+
+    try admin.sendQuery("SELECT pg_terminate_backend(1)");
+    const gone = try admin.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("f", gone.rows[0][0].?);
+
+    // Terminating itself ends the connection with a FATAL and no
+    // ReadyForQuery.
+    try admin.sendQuery("SELECT pg_terminate_backend(2)");
+    {
+        const fatal = try pg_packet.readFrame(allocator, &admin.reader.interface);
+        defer allocator.free(fatal.payload);
+        try std.testing.expectEqual(@as(u8, 'E'), fatal.type_byte);
+        try std.testing.expect(std.mem.indexOf(u8, fatal.payload, "FATAL") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fatal.payload, "57P01") != null);
+    }
+    try expectConnectionClosed(&admin);
+    admin_thread.join();
+    admin_joined = true;
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
+
+    if (runner_ctx.err) |e| return e;
+    if (admin_ctx.err) |e| return e;
+}
+
+fn acceptMysqlOne(server: *thindb.MysqlServer) void {
+    server.acceptOne() catch {};
+}
+
+test "pg wire: connections on every wire sharing a registry get distinct ids" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const mysql_addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 108 } };
+    var mysql_server = try thindb.serveMysql(allocator, io, catalog, mysql_addr, null);
+    defer mysql_server.destroy();
+    defer mysql_server.close();
+    mysql_server.registry = &registry;
+
+    const pg_addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 109 } };
+    var pg_server = try thindb.servePg(allocator, io, catalog, pg_addr, null);
+    defer pg_server.destroy();
+    defer pg_server.close();
+    pg_server.registry = &registry;
+
+    const mysql_thread = try std.Thread.spawn(.{}, acceptMysqlOne, .{mysql_server});
+    defer mysql_thread.join();
+    const mysql_client = try mysql_addr.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer mysql_client.close(io);
+    for (0..1000) |_| {
+        if (registry.count() == 1) break;
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    } else return error.MysqlConnectionNeverRegistered;
+
+    var pg_ctx: ServerCtx = .{ .server = pg_server, .n = 1 };
+    const pg_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&pg_ctx});
+    defer pg_thread.join();
+    var client = try TestClient.connect(allocator, io, pg_addr);
+    defer client.close();
+    try client.completeStartup("postgres", null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendQuery("SELECT pid FROM pg_stat_activity ORDER BY pid");
+    const listed = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), listed.rows.len);
+    try std.testing.expectEqualStrings("1", listed.rows[0][0].?);
+    try std.testing.expectEqualStrings("2", listed.rows[1][0].?);
+
+    try client.sendTerminate();
+    if (pg_ctx.err) |e| return e;
 }
 
 test "pg wire: BEGIN/COMMIT/ROLLBACK flip the ReadyForQuery tx_status byte" {
