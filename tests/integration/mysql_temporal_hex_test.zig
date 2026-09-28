@@ -14,34 +14,13 @@ const exec = helpers.exec;
 fn firstColumnText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]?[]u8 {
     var q = try helpers.runSql(allocator, db, sql);
     defer q.deinit();
-    return columnText(allocator, &q);
+    return helpers.columnText(allocator, &q);
 }
 
 fn mysqlFirstColumnText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]?[]u8 {
     var q = try helpers.runSqlMysqlSession(allocator, db, sql);
     defer q.deinit();
-    return columnText(allocator, &q);
-}
-
-fn columnText(allocator: std.mem.Allocator, q: *helpers.RunResult) ![]?[]u8 {
-    var out: std.ArrayList(?[]u8) = .empty;
-    errdefer {
-        for (out.items) |v| if (v) |x| allocator.free(x);
-        out.deinit(allocator);
-    }
-    while (try q.next()) |batch| {
-        const col = batch.values[0];
-        for (0..batch.row_count) |row| {
-            const text: ?[]u8 = if (!col.isValid(row)) null else switch (col.data) {
-                .string, .varchar, .char => |sv| try allocator.dupe(u8, sv.rowBytes(row)),
-                inline .boolean, .tinyint, .smallint, .int, .bigint, .largeint, .double => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
-                else => return error.TestUnexpectedType,
-            };
-            errdefer if (text) |x| allocator.free(x);
-            try out.append(allocator, text);
-        }
-    }
-    return out.toOwnedSlice(allocator);
+    return helpers.columnText(allocator, &q);
 }
 
 fn expectRows(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: []const ?[]const u8) !void {

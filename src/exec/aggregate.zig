@@ -37,6 +37,7 @@ pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices
 }
 
 const simd = @import("../util/simd.zig");
+const scalar_common = @import("scalar_fn_common.zig");
 
 const native_endian = @import("builtin").cpu.arch.endian();
 
@@ -458,6 +459,8 @@ fn rowI64(view: ColumnView, row: usize) i64 {
         .smallint => |v| v[row],
         .int => |v| v[row],
         .bigint => |v| v[row],
+        // A bit operator's BIGINT UNSIGNED result, as MySQL's bit functions read it.
+        .largeint => |v| scalar_common.wideIntegerAsBigint(v[row]),
         else => unreachable,
     };
 }
@@ -3248,7 +3251,7 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
         },
         .bit_and, .bit_or, .bit_xor => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!(t == .boolean or t == .tinyint or t == .smallint or t == .int or t == .bigint)) return Error.AggregateUnsupportedType;
+            if (!(t == .boolean or t == .tinyint or t == .smallint or t == .int or t == .bigint or t == .largeint)) return Error.AggregateUnsupportedType;
         },
         .min, .max => {
             const t = in orelse return Error.AggregateColumnRequired;

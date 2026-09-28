@@ -54,12 +54,23 @@ fn isNumericType(t: types.Type) bool {
     };
 }
 
-fn mysqlTypeOf(t: types.Type) struct { type_byte: u8, decimals: u8, len: u32, charset: u16 } {
+/// The result-set protocol a column definition describes: the text
+/// protocol's cells are text, the binary protocol's are typed.
+pub const Protocol = enum { text, binary };
+
+fn mysqlTypeOf(t: types.Type, protocol: Protocol) struct { type_byte: u8, decimals: u8, len: u32, charset: u16 } {
     return switch (t) {
         .tinyint => .{ .type_byte = MYSQL_TYPE_TINY, .decimals = 0, .len = 4, .charset = CHARSET_BINARY },
         .smallint => .{ .type_byte = MYSQL_TYPE_SHORT, .decimals = 0, .len = 6, .charset = CHARSET_BINARY },
         .int => .{ .type_byte = MYSQL_TYPE_LONG, .decimals = 0, .len = 11, .charset = CHARSET_BINARY },
-        .bigint, .largeint => .{ .type_byte = MYSQL_TYPE_LONGLONG, .decimals = 0, .len = 20, .charset = CHARSET_BINARY },
+        .bigint => .{ .type_byte = MYSQL_TYPE_LONGLONG, .decimals = 0, .len = 20, .charset = CHARSET_BINARY },
+        // A binary LONGLONG cell is 8 bytes, which hold neither a BIGINT
+        // UNSIGNED past 2^63 - 1 nor a negative value beside one, so a binary
+        // result says DECIMAL(39, 0), whose cell is its digits.
+        .largeint => switch (protocol) {
+            .text => .{ .type_byte = MYSQL_TYPE_LONGLONG, .decimals = 0, .len = 20, .charset = CHARSET_BINARY },
+            .binary => .{ .type_byte = MYSQL_TYPE_NEWDECIMAL, .decimals = 0, .len = 40, .charset = CHARSET_BINARY },
+        },
         .boolean => .{ .type_byte = MYSQL_TYPE_TINY, .decimals = 0, .len = 1, .charset = CHARSET_BINARY },
         .float => .{ .type_byte = MYSQL_TYPE_FLOAT, .decimals = 0x1f, .len = 12, .charset = CHARSET_BINARY },
         .double => .{ .type_byte = MYSQL_TYPE_DOUBLE, .decimals = 0x1f, .len = 22, .charset = CHARSET_BINARY },
@@ -81,6 +92,7 @@ pub fn appendColumnDef(
     schema_name: []const u8,
     table_name: []const u8,
     col: Column,
+    protocol: Protocol,
 ) !void {
     // A qualified result name (`e.id`, kept so two join sides stay
     // distinct inside the plan) is presented the way MySQL presents it:
@@ -97,7 +109,7 @@ pub fn appendColumnDef(
     try packet.appendLenEncString(allocator, out, name);
     try packet.appendLenEncInt(allocator, out, 0x0c);
 
-    const info = mysqlTypeOf(col.type);
+    const info = mysqlTypeOf(col.type, protocol);
 
     var cs_buf: [2]u8 = undefined;
     std.mem.writeInt(u16, &cs_buf, info.charset, .little);
@@ -307,7 +319,7 @@ pub fn sendResultHeader(
     defer coldef.deinit(allocator);
     for (schema) |col| {
         coldef.clearRetainingCapacity();
-        try appendColumnDef(allocator, &coldef, schema_name, table_name, col);
+        try appendColumnDef(allocator, &coldef, schema_name, table_name, col, .text);
         try packet.writePacket(w, seq_id.*, coldef.items);
         seq_id.* +%= 1;
     }
@@ -406,14 +418,26 @@ test "appendColumnDef presents a qualified result name as table + bare name" {
     const allocator = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    try appendColumnDef(allocator, &out, "db", "", .{ .name = "e.id", .type = .bigint });
+    try appendColumnDef(allocator, &out, "db", "", .{ .name = "e.id", .type = .bigint }, .text);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01e\x01e\x02id\x02id") != null);
     out.clearRetainingCapacity();
-    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "t.price * t.qty", .type = .double });
+    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "t.price * t.qty", .type = .double }, .text);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x0ft.price * t.qty\x0ft.price * t.qty") != null);
     out.clearRetainingCapacity();
-    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "0.5", .type = .double });
+    try appendColumnDef(allocator, &out, "db", "t", .{ .name = "0.5", .type = .double }, .text);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x01t\x01t\x030.5\x030.5") != null);
+}
+
+test "a LARGEINT column is BIGINT in a text result and DECIMAL in a binary one" {
+    // The binary cell `prepared.appendBinaryCell` writes for a LARGEINT is
+    // its digits, which a LONGLONG column would read as 8 bytes.
+    const cases = .{
+        .{ types.Type.largeint, Protocol.text, MYSQL_TYPE_LONGLONG },
+        .{ types.Type.largeint, Protocol.binary, MYSQL_TYPE_NEWDECIMAL },
+        .{ types.Type.bigint, Protocol.text, MYSQL_TYPE_LONGLONG },
+        .{ types.Type.bigint, Protocol.binary, MYSQL_TYPE_LONGLONG },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c[2], mysqlTypeOf(c[0], c[1]).type_byte);
 }
 
 test "formatCell writes a FLOAT or DOUBLE as MySQL does" {

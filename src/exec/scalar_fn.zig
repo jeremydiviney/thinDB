@@ -782,11 +782,12 @@ fn hexLiteralAsKernel(allocator: Allocator, arg_types: []const Type, out_type: T
 /// `CAST(0x41 AS SIGNED)`) rather than its bytes (`CONCAT(0x41, 1)`,
 /// `LENGTH(0x41)`), as in MySQL. A numeric cast reads a number; an argument
 /// the call returns (COALESCE, IF's branches) keeps its bytes, as does one
-/// any overload takes as text.
+/// any overload takes as text, except BIN's and CONV's number.
 pub fn readsNumberAt(registry: ?*const udf_mod.UdfRegistry, name: []const u8, arity: usize, i: usize) bool {
     if (intCastTarget(name) != null or std.mem.startsWith(u8, name, "to_decimal")) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (resultValueArgsStart(name)) |start| if (i >= start) return false;
+    if (i == 0 and readsNumberAsText(name)) return true;
     for (builtins) |f| {
         if (!std.ascii.eqlIgnoreCase(f.name, name) or !scalarArityMatches(f, arity)) continue;
         if (scalarDeclaredTypeAt(f, i).isString()) return false;
@@ -796,6 +797,12 @@ pub fn readsNumberAt(registry: ?*const udf_mod.UdfRegistry, name: []const u8, ar
         if (entry.arg_types[i].isString()) return false;
     };
     return true;
+}
+
+/// BIN and CONV take their number as its text, yet a hex literal there is
+/// the number it spells, as MySQL reads it (`BIN(0x41)` is 1000001).
+fn readsNumberAsText(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "bin") or std.ascii.eqlIgnoreCase(name, "conv");
 }
 
 fn textKeyTarget(spec: []const u8) ?Type {
@@ -969,6 +976,24 @@ fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
     return .{ .cost = argCastCost(given, declared, true) orelse return null };
 }
 
+/// The bit operators `& | ^ ~ << >>`, by the StarRocks function each
+/// lowers to outside MySQL.
+pub const BitOperator = enum { bitand, bitor, bitxor, bitnot, bit_shift_left, bit_shift_right };
+
+/// The function bit operator `op` lowers to in `dialect`. MySQL reads the
+/// operands as BIGINT UNSIGNED and returns one, held in a LARGEINT (`~1` is
+/// 18446744073709551614, `-1 >> 1` is 2^63 - 1), so it takes internal
+/// twins of StarRocks' functions, which keep BIGINT's two's complement as
+/// DuckDB and PG do.
+pub fn bitOperatorFn(op: BitOperator, dialect: types.Dialect) []const u8 {
+    return switch (op) {
+        inline else => |o| switch (dialect) {
+            .mysql => "__mysql_" ++ @tagName(o),
+            .neutral, .postgres => @tagName(o),
+        },
+    };
+}
+
 /// Internal: a double or decimal read as an integer argument, as MySQL reads
 /// one where a function takes an integer (`REPEAT('a', 2.5)`, `ELT(1.5e0,
 /// ...)`): a double rounds half to even (`common.doubleAsBigint`), a decimal
@@ -1127,6 +1152,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "coalesce", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 2, .null_strategy = .absorbs, .kernel = cond.coalesceIntKernel },
     .{ .name = "coalesce", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .absorbs, .kernel = cond.coalesceBigintKernel },
     .{ .name = "coalesce", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 2, .null_strategy = .absorbs, .kernel = cond.coalesceBigintKernel },
+    .{ .name = "coalesce", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .null_strategy = .absorbs, .kernel = cond.coalesceLargeintKernel },
+    .{ .name = "coalesce", .arg_types = &.{.largeint}, .return_type = .largeint, .variadic_min_args = 2, .null_strategy = .absorbs, .kernel = cond.coalesceLargeintKernel },
     .{ .name = "coalesce", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .absorbs, .kernel = cond.coalesceDoubleKernel },
     .{ .name = "coalesce", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 2, .null_strategy = .absorbs, .kernel = cond.coalesceDoubleKernel },
     .{ .name = "coalesce", .arg_types = &.{ .boolean, .boolean }, .return_type = .boolean, .null_strategy = .absorbs, .kernel = cond.coalesceBooleanKernel },
@@ -1176,24 +1203,28 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "log2", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.log2Kernel },
     .{ .name = "greatest", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.greatestIntKernel },
     .{ .name = "greatest", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.greatestBigintKernel },
+    .{ .name = "greatest", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.greatestLargeintKernel },
     .{ .name = "greatest", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.greatestDoubleKernel },
     .{ .name = "greatest", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.greatestStringKernel },
     .{ .name = "greatest", .arg_types = &.{ .date, .date }, .return_type = .date, .kernel = math.greatestDateKernel },
     .{ .name = "greatest", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .kernel = math.greatestDatetimeKernel },
     .{ .name = "least", .arg_types = &.{ .int, .int }, .return_type = .int, .kernel = math.leastIntKernel },
     .{ .name = "least", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.leastBigintKernel },
+    .{ .name = "least", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.leastLargeintKernel },
     .{ .name = "least", .arg_types = &.{ .double, .double }, .return_type = .double, .kernel = math.leastDoubleKernel },
     .{ .name = "least", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.leastStringKernel },
     .{ .name = "least", .arg_types = &.{ .date, .date }, .return_type = .date, .kernel = math.leastDateKernel },
     .{ .name = "least", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .kernel = math.leastDatetimeKernel },
     .{ .name = "greatest", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 3, .kernel = math.greatestIntKernel },
     .{ .name = "greatest", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 3, .kernel = math.greatestBigintKernel },
+    .{ .name = "greatest", .arg_types = &.{.largeint}, .return_type = .largeint, .variadic_min_args = 3, .kernel = math.greatestLargeintKernel },
     .{ .name = "greatest", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 3, .kernel = math.greatestDoubleKernel },
     .{ .name = "greatest", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 3, .kernel = string.greatestStringKernel },
     .{ .name = "greatest", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 3, .kernel = math.greatestDateKernel },
     .{ .name = "greatest", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 3, .kernel = math.greatestDatetimeKernel },
     .{ .name = "least", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 3, .kernel = math.leastIntKernel },
     .{ .name = "least", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 3, .kernel = math.leastBigintKernel },
+    .{ .name = "least", .arg_types = &.{.largeint}, .return_type = .largeint, .variadic_min_args = 3, .kernel = math.leastLargeintKernel },
     .{ .name = "least", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 3, .kernel = math.leastDoubleKernel },
     .{ .name = "least", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 3, .kernel = string.leastStringKernel },
     .{ .name = "least", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 3, .kernel = math.leastDateKernel },
@@ -1208,19 +1239,36 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "cot", .arg_types = &.{.double}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.cotKernel },
     .{ .name = "cbrt", .arg_types = &.{.double}, .return_type = .double, .kernel = math.cbrtKernel },
     .{ .name = "square", .arg_types = &.{.double}, .return_type = .double, .kernel = math.squareKernel },
-    .{ .name = "bit_count", .arg_types = &.{.int}, .return_type = .int, .kernel = math.bitCountIntKernel },
-    .{ .name = "bit_count", .arg_types = &.{.bigint}, .return_type = .int, .kernel = math.bitCountBigintKernel },
-    // The bitwise operators & | ^ ~ << >> lower to these, StarRocks' names.
+    // A LARGEINT overload comes before its BIGINT twin: a call mixing the
+    // two ties on cost, and the tie goes to the first, which must not
+    // narrow the LARGEINT.
+    .{ .name = "bit_count", .arg_types = &.{.largeint}, .return_type = .bigint, .kernel = math.bitCountKernel(i128) },
+    .{ .name = "bit_count", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.bitCountKernel(i64) },
+    .{ .name = bitOperatorFn(.bitand, .mysql), .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.@"and", i128) },
+    .{ .name = bitOperatorFn(.bitand, .mysql), .arg_types = &.{ .bigint, .bigint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.@"and", i64) },
+    .{ .name = bitOperatorFn(.bitor, .mysql), .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.@"or", i128) },
+    .{ .name = bitOperatorFn(.bitor, .mysql), .arg_types = &.{ .bigint, .bigint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.@"or", i64) },
+    .{ .name = bitOperatorFn(.bitxor, .mysql), .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.xor, i128) },
+    .{ .name = bitOperatorFn(.bitxor, .mysql), .arg_types = &.{ .bigint, .bigint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.xor, i64) },
+    .{ .name = bitOperatorFn(.bit_shift_left, .mysql), .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.shift_left, i128) },
+    .{ .name = bitOperatorFn(.bit_shift_left, .mysql), .arg_types = &.{ .bigint, .bigint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.shift_left, i64) },
+    .{ .name = bitOperatorFn(.bit_shift_right, .mysql), .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.shift_right, i128) },
+    .{ .name = bitOperatorFn(.bit_shift_right, .mysql), .arg_types = &.{ .bigint, .bigint }, .return_type = .largeint, .kernel = math.unsignedBitwiseKernel(.shift_right, i64) },
+    .{ .name = bitOperatorFn(.bitnot, .mysql), .arg_types = &.{.largeint}, .return_type = .largeint, .kernel = math.unsignedBitNotKernel(i128) },
+    .{ .name = bitOperatorFn(.bitnot, .mysql), .arg_types = &.{.bigint}, .return_type = .largeint, .kernel = math.unsignedBitNotKernel(i64) },
+    // StarRocks' bit functions, which the operators lower to outside MySQL.
     .{ .name = "bitand", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"and") },
     .{ .name = "bitor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"or") },
     .{ .name = "bitxor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.xor) },
     .{ .name = "bit_shift_left", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_left) },
     .{ .name = "bit_shift_right", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_right) },
     .{ .name = "bitnot", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.bitNotKernel },
-    .{ .name = "bin", .arg_types = &.{.int}, .return_type = .string, .kernel = math.binIntKernel },
-    .{ .name = "bin", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.binBigintKernel },
-    .{ .name = "conv", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .kernel = math.convStringKernel },
-    .{ .name = "conv", .arg_types = &.{ .bigint, .int, .int }, .return_type = .string, .kernel = math.convBigintKernel },
+    // A number reaches BIN and CONV as its text, as MySQL reads it there
+    // (`readsNumberAsText`).
+    .{ .name = "bin", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.binKernel },
+    .{ .name = "conv", .arg_types = &.{ .string, .int, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.convKernel },
+    .{ .name = "bin", .arg_types = &.{.boolean}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.binBooleanKernel },
+    .{ .name = "conv", .arg_types = &.{ .boolean, .int, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.convBooleanKernel },
     .{ .name = "truncate", .arg_types = &.{ .double, .int }, .return_type = .double, .kernel = math.truncateKernel },
     .{ .name = "degrees", .arg_types = &.{.double}, .return_type = .double, .kernel = math.degreesKernel },
     .{ .name = "radians", .arg_types = &.{.double}, .return_type = .double, .kernel = math.radiansKernel },
@@ -1236,12 +1284,14 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "ifnull", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .absorbs, .kernel = cond.ifnullStringKernel },
     .{ .name = "ifnull", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .absorbs, .kernel = cond.ifnullIntKernel },
     .{ .name = "ifnull", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .absorbs, .kernel = cond.ifnullBigintKernel },
+    .{ .name = "ifnull", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .null_strategy = .absorbs, .kernel = cond.coalesceLargeintKernel },
     .{ .name = "ifnull", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .absorbs, .kernel = cond.ifnullDoubleKernel },
     .{ .name = "ifnull", .arg_types = &.{ .boolean, .boolean }, .return_type = .boolean, .null_strategy = .absorbs, .kernel = cond.ifnullBooleanKernel },
     .{ .name = "ifnull", .arg_types = &.{ .date, .date }, .return_type = .date, .null_strategy = .absorbs, .kernel = cond.ifnullDateKernel },
     .{ .name = "ifnull", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .null_strategy = .absorbs, .kernel = cond.ifnullDatetimeKernel },
     .{ .name = "nullif", .arg_types = &.{ .int, .int }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = cond.nullifIntKernel },
     .{ .name = "nullif", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = cond.nullifBigintKernel },
+    .{ .name = "nullif", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = cond.nullifLargeintKernel },
     .{ .name = "nullif", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = cond.nullifStringKernel },
     .{ .name = "nullif", .arg_types = &.{ .double, .double }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = cond.nullifDoubleKernel },
     .{ .name = "nullif", .arg_types = &.{ .boolean, .boolean }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = cond.nullifBooleanKernel },
@@ -1388,6 +1438,7 @@ pub const builtins = [_]ScalarFn{
     // A date or datetime as a number is its YYYYMMDD[HHMMSS] digits, as in MySQL.
     .{ .name = "to_bigint", .arg_types = &.{.date}, .return_type = .bigint, .kernel = date.dateToBigintKernel },
     .{ .name = "to_bigint", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.datetimeToBigintKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.largeint}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.largeintToBigintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.doubleToLargeintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.stringToLargeintKernel },
     .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.stringToDoubleKernel },
@@ -1408,8 +1459,9 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_date", .arg_types = &.{.string}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.stringToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.string}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.stringToDatetimeKernel },
     // Stringify numerics.
-    .{ .name = "to_string", .arg_types = &.{.int}, .return_type = .string, .kernel = math.intToStringKernel },
-    .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.bigintToStringKernel },
+    .{ .name = "to_string", .arg_types = &.{.int}, .return_type = .string, .kernel = math.integerToStringKernel(i32) },
+    .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.integerToStringKernel(i64) },
+    .{ .name = "to_string", .arg_types = &.{.largeint}, .return_type = .string, .kernel = math.integerToStringKernel(i128) },
     .{ .name = "to_string", .arg_types = &.{.double}, .return_type = .string, .kernel = math.doubleToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.float}, .return_type = .string, .kernel = math.floatToStringKernel },
     .{ .name = "to_string", .arg_types = &.{.boolean}, .return_type = .string, .kernel = math.boolToStringKernel },

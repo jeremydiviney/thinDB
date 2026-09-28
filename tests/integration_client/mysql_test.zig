@@ -355,6 +355,17 @@ const TestClient = struct {
     };
 
     fn readBinaryResultSet(self: *TestClient, arena: std.mem.Allocator, deprecate_eof: bool) ![]const BinaryRow {
+        return (try self.readBinaryResult(arena, deprecate_eof)).rows;
+    }
+
+    /// A binary-protocol result set: each column definition's MYSQL_TYPE_*
+    /// byte, and the rows as `readBinaryResultSet` returns them.
+    const BinaryResult = struct {
+        column_types: []const u8,
+        rows: []const BinaryRow,
+    };
+
+    fn readBinaryResult(self: *TestClient, arena: std.mem.Allocator, deprecate_eof: bool) !BinaryResult {
         const col_count_pkt = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
         defer self.allocator.free(col_count_pkt.payload);
         if (col_count_pkt.payload.len == 0) return error.MalformedResultSet;
@@ -364,10 +375,17 @@ const TestClient = struct {
         var cursor: usize = 0;
         const col_count = try mysql_packet.readLenEncInt(col_count_pkt.payload, &cursor);
 
-        var i: u64 = 0;
-        while (i < col_count) : (i += 1) {
+        const column_types = try arena.alloc(u8, @intCast(col_count));
+        for (column_types) |*column_type| {
             const p = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
-            self.allocator.free(p.payload);
+            defer self.allocator.free(p.payload);
+            // catalog, schema, table, org_table, name, org_name, then the
+            // fixed fields' length, charset (2) and column length (4).
+            var c: usize = 0;
+            for (0..6) |_| _ = try mysql_packet.readLenEncString(p.payload, &c);
+            c += 1 + 2 + 4;
+            if (c >= p.payload.len) return error.MalformedResultSet;
+            column_type.* = p.payload[c];
         }
         if (!deprecate_eof) {
             const eof = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
@@ -389,7 +407,7 @@ const TestClient = struct {
             const cells_owned = try arena.dupe(u8, row_pkt.payload[1 + nullmap_bytes ..]);
             try rows.append(arena, .{ .nullmap = nullmap_owned, .cells = cells_owned });
         }
-        return try rows.toOwnedSlice(arena);
+        return .{ .column_types = column_types, .rows = try rows.toOwnedSlice(arena) };
     }
 
     /// Run the caching_sha2_password client side of the handshake.
@@ -2178,6 +2196,7 @@ const MYSQL_TYPE_LONG: u8 = 0x03;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
+const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 
 fn encodeLenEncString(allocator: std.mem.Allocator, payload: *std.ArrayList(u8), s: []const u8) !void {
     try mysql_packet.appendLenEncString(allocator, payload, s);
@@ -2290,6 +2309,67 @@ test "mysql wire: COM_STMT_EXECUTE returns rows matching the bound int param" {
 
     const r1_id = std.mem.readInt(i64, rows[1].cells[0..8], .little);
     try std.testing.expectEqual(@as(i64, 3), r1_id);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: COM_STMT_EXECUTE declares a LARGEINT column DECIMAL and sends its digits" {
+    // A bit operator's BIGINT UNSIGNED result is a LARGEINT (#323). Its
+    // binary cell is its digits, which a LONGLONG column would misread.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 50), .tag = "b" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 214;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("SELECT id, ~qty FROM orders WHERE id <= ? ORDER BY id");
+    const reply = try client.readPrepareReply(true);
+
+    var val_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &val_buf, 2, .little);
+    try client.sendStmtExecute(reply.stmt_id, &.{.{ .type_byte = MYSQL_TYPE_LONGLONG, .value_bytes = &val_buf }});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const result = try client.readBinaryResult(arena.allocator(), true);
+    try std.testing.expectEqualSlices(u8, &.{ MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL }, result.column_types);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+
+    // Each row: id (8-byte LE), then the LARGEINT as a length-prefixed string.
+    const want = [_][]const u8{ "18446744073709551605", "18446744073709551565" };
+    for (result.rows, 1.., want) |row, id, digits| {
+        try std.testing.expectEqual(@as(i64, @intCast(id)), std.mem.readInt(i64, row.cells[0..8], .little));
+        var c: usize = 8;
+        try std.testing.expectEqualStrings(digits, try mysql_packet.readLenEncString(row.cells, &c));
+        try std.testing.expectEqual(row.cells.len, c);
+    }
 
     try client.sendQuit();
     if (sctx.err) |e| return e;

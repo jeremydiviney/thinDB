@@ -197,6 +197,41 @@ Known difference: StarRocks returns LARGEINT for `ABS(BIGINT)`, so
 `ABS(BIGINT_MIN)` is `9223372036854775808` there. thinDB keeps BIGINT, which
 wraps to `BIGINT_MIN`.
 
+**Bit operators** `& | ^ ~ << >>` follow MySQL in the MySQL dialect. Each
+operand reads as BIGINT UNSIGNED: a negative integer as its 64 two's-complement
+bits, a double or decimal as the BIGINT MySQL rounds it to, text as the
+integer it starts with. The result is BIGINT UNSIGNED, held in a LARGEINT, so
+`~1` is 18446744073709551614, `-1 >> 1` is 9223372036854775807 (zeros shift
+in), and a shift count outside 0..63 gives 0. The other dialects lower the
+operators to StarRocks' `bitand`, `bitor`, `bitxor`, `bitnot`,
+`bit_shift_left` and `bit_shift_right`, which keep BIGINT's two's complement,
+as StarRocks, DuckDB and PG do: `~1` is -2 and `>>` keeps the sign. The choice
+is made once, in `scalar_fn.bitOperatorFn`. The aggregates BIT_AND/OR/XOR
+still return a signed BIGINT in every dialect, reading a LARGEINT input as its
+64 bits (#349).
+
+A LARGEINT stays exact where a result takes it: COALESCE, IFNULL, NULLIF,
+GREATEST and LEAST return LARGEINT, where MySQL returns a DECIMAL of the same
+digits. Cast to BIGINT (`CAST(x AS SIGNED)`), a LARGEINT from 2^63 to
+2^64 - 1 keeps its 64 bits as MySQL does, so `CAST(~5 AS SIGNED)` is -6, where
+StarRocks gives NULL; any other LARGEINT past BIGINT is NULL. `CAST(x AS
+UNSIGNED)` is still a signed BIGINT. An integer of any width, LARGEINT
+included, becomes text digit for digit (`CAST(… AS CHAR)`, CONCAT and every
+other text context). The MySQL wire presents a LARGEINT column as BIGINT in a
+text result, and as DECIMAL(39, 0) in a prepared statement's binary result,
+whose 8-byte BIGINT cell can't hold values past 2^63 - 1 beside negative ones.
+MySQL says BIGINT UNSIGNED.
+
+`BIT_COUNT(n)` counts the one bits of `n` as BIGINT UNSIGNED, so a negative
+value of any width has 64. `CONV(n, from_base, to_base)` reads `n` as its
+text, as MySQL does, in base |from_base|, up to the first byte that isn't a
+digit. It reads signed BIGINT when `from_base` is negative and BIGINT
+UNSIGNED otherwise, and writes uppercase digits, signed when `to_base` is
+negative: `CONV(-1, 10, 16)` is `FFFFFFFFFFFFFFFF`. `BIN(n)` is
+`CONV(n, 10, 2)`, so `BIN(2.7)` is `10`. A boolean is MySQL's 1 or 0 there, and
+a hex literal the number it spells (`BIN(0x41)` is `1000001`). A base outside
+2..36 or an empty `n` gives NULL.
+
 **Math functions** return NULL where the result would be NaN or ±inf: a
 domain error (`SQRT(-1)`, `LN(0)`, `ASIN(2)`, `LOG(1, x)`), overflow
 (`EXP(1000)`, `POW(10, 400)`), or a zero divisor in a float `%`, `MOD` or

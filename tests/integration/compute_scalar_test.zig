@@ -525,7 +525,7 @@ test "scalar: expanded missing-function kernels through Compute" {
     try std.testing.expectEqualStrings("or", b.values[base_cols + 13].data.string.rowBytes(1));
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[base_cols + 14].data.double[1], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 64.0), b.values[base_cols + 15].data.double[1], 1e-9);
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 1, 2 }, b.values[base_cols + 16].data.int[0..2]);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, b.values[base_cols + 16].data.bigint[0..2]);
     try std.testing.expectEqualStrings("Thursday", b.values[base_cols + 17].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("January", b.values[base_cols + 18].data.string.rowBytes(0));
     try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 34 }, b.values[base_cols + 19].data.date[0..2]);

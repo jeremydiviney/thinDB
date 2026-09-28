@@ -3113,7 +3113,7 @@ pub const Parser = struct {
         var lhs = first;
         while (self.cur.tag == .pipe) {
             try self.advance();
-            lhs = try self.makeBinary("bitor", lhs, try self.parseBitAnd());
+            lhs = try self.makeBinary(scalar_fn.bitOperatorFn(.bitor, self.lex.dialect), lhs, try self.parseBitAnd());
         }
         return lhs;
     }
@@ -3126,7 +3126,7 @@ pub const Parser = struct {
         var lhs = first;
         while (self.cur.tag == .amp) {
             try self.advance();
-            lhs = try self.makeBinary("bitand", lhs, try self.parseShift());
+            lhs = try self.makeBinary(scalar_fn.bitOperatorFn(.bitand, self.lex.dialect), lhs, try self.parseShift());
         }
         return lhs;
     }
@@ -3138,7 +3138,7 @@ pub const Parser = struct {
     fn continueShift(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
         var lhs = first;
         while (self.cur.tag == .shl or self.cur.tag == .shr) {
-            const fn_name: []const u8 = if (self.cur.tag == .shl) "bit_shift_left" else "bit_shift_right";
+            const fn_name = scalar_fn.bitOperatorFn(if (self.cur.tag == .shl) .bit_shift_left else .bit_shift_right, self.lex.dialect);
             try self.advance();
             lhs = try self.makeBinary(fn_name, lhs, try self.parseAddSub());
         }
@@ -3200,7 +3200,7 @@ pub const Parser = struct {
     fn continueBitXor(self: *Parser, first: ir.Expr) ParseError!ir.Expr {
         var lhs = first;
         while (self.cur.tag == .caret) {
-            const fn_name: []const u8 = if (self.lex.dialect == .mysql) "bitxor" else "pow";
+            const fn_name: []const u8 = if (self.lex.dialect == .mysql) scalar_fn.bitOperatorFn(.bitxor, .mysql) else "pow";
             try self.advance();
             lhs = try self.makeBinary(fn_name, lhs, try self.parseCallAtom());
         }
@@ -3487,7 +3487,7 @@ pub const Parser = struct {
                 try self.advance();
                 const args = try self.arena.alloc(ir.Expr, 1);
                 args[0] = try self.parseCallAtom();
-                return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "bitnot"), .args = args } };
+                return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, scalar_fn.bitOperatorFn(.bitnot, self.lex.dialect)), .args = args } };
             },
             .floating => {
                 const tok = self.cur;

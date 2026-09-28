@@ -78,6 +78,20 @@ pub fn coalesceBigintKernel(allocator: Allocator, args: []const ColumnView, out:
     }
 }
 
+pub fn coalesceLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        var v: i128 = 0;
+        for (args) |arg| {
+            if (arg.isValid(i)) {
+                v = arg.data.largeint[i];
+                break;
+            }
+        }
+        try out.data.largeint.append(allocator, v);
+    }
+}
+
 pub fn coalesceDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
@@ -287,6 +301,7 @@ fn NullifFixed(comptime field: []const u8) type {
 
 pub const nullifIntKernel = NullifFixed("int").kernel;
 pub const nullifBigintKernel = NullifFixed("bigint").kernel;
+pub const nullifLargeintKernel = NullifFixed("largeint").kernel;
 pub const nullifDoubleKernel = NullifFixed("double").kernel;
 pub const nullifBooleanKernel = NullifFixed("boolean").kernel;
 pub const nullifDateKernel = NullifFixed("date").kernel;
