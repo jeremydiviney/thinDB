@@ -917,6 +917,35 @@ pub const Op = union(OpTag) {
         /// The CTE this boundary came from — labels its stage in the
         /// `--profile-ops` `[cte]` lines. Parse-time only, not serialized.
         name: ?[]const u8 = null,
+        /// `WITH RECURSIVE`: set on the CTE's own boundary and on each
+        /// reference its recursive arms make to it. Parse-time only; encode
+        /// refuses it rather than drop it.
+        recursion: ?Recursion = null,
+    };
+
+    /// `.cte` marks the recursive CTE's boundary, run by the iteration
+    /// driver; `.self_ref` marks a reference from one of its recursive arms,
+    /// bound to the working set of the iteration that compiles it. The
+    /// `.self_ref` body is a names-only leaf that never executes.
+    pub const Recursion = union(enum) {
+        cte: *const Recursive,
+        self_ref: *const Recursive,
+    };
+
+    pub const Recursive = struct {
+        /// The arms that don't reference the CTE, chained as written.
+        anchor: *Op,
+        /// The arms that do, UNION ALL-chained when there are several.
+        step: *Op,
+        /// A UNION DISTINCT at or after the first recursive arm: a row the
+        /// result already holds is not new, so cycles terminate.
+        distinct: bool,
+        /// The CTE's column list; otherwise the anchor names the columns.
+        columns: ?[]const []const u8,
+        /// LIMIT / OFFSET over the whole body. Iteration stops once
+        /// `offset + limit` rows exist.
+        limit: ?u64 = null,
+        offset: u64 = 0,
     };
 
     pub const Alias = struct {
@@ -1188,6 +1217,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .compute => |c| try encodeCompute(allocator, out, c),
         .join => |j| try encodeJoin(allocator, out, j),
         .materialize => |m| {
+            if (m.recursion != null) return EncodeError.OutOfMemory;
             try out.append(allocator, @intFromBool(m.forced));
             try encodeOp(allocator, out, m.upstream.*);
         },

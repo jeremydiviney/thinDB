@@ -827,6 +827,54 @@ See [REGION_PLAN.md](docs/plans/REGION_PLAN.md) and
 [REGION_ELIGIBILITY_PLAN.md](docs/plans/REGION_ELIGIBILITY_PLAN.md) for the
 runtime design, supported constructs, and remaining work.
 
+### 6.6 Recursive CTEs
+
+`WITH RECURSIVE` lets any CTE in its list read itself; ordinary CTEs and
+column lists work in the same list. The rules are MySQL 8.4's. A recursive
+body is one or more anchor SELECTs that do not read the CTE, then `UNION ALL`
+or `UNION [DISTINCT]`, then one or more recursive SELECTs. Each recursive
+SELECT reads the CTE exactly once, in its FROM clause (joins are fine, but not
+as the nullable side of an outer join), never in a subquery or derived table.
+A recursive SELECT may not aggregate, use a window function, GROUP BY, ORDER
+BY, LIMIT or SELECT DISTINCT, or sit under INTERSECT or EXCEPT. Each rule has
+its own parse error (`SqlRecursiveCte*`). A LIMIT/OFFSET over the whole body
+is allowed and stops the recursion once enough rows exist.
+
+The anchor fixes the columns: names from the column list, else the anchor's;
+types from the anchor, except that an integer narrower than BIGINT widens to
+BIGINT. MySQL types an integer literal BIGINT where thinDB types it by its
+value, and a counter seeded by `SELECT 1` must not stop at INT. Recursive
+rows land in those types as a write into a table's columns does (§9.8
+`ValueOutOfRange`): a fraction rounds half away from zero into an integer,
+a number becomes its text in a string column, a value the column can't hold
+fails the statement. Pairs outside that rule, such as a wider DECIMAL, convert
+as CAST converts them, and a type with no conversion is a `TypeMismatch`.
+Strings keep their full value; thinDB does not enforce
+`CHAR(n)`/`VARCHAR(n)` lengths, so a string that grows past the anchor's
+length is kept where MySQL's strict mode fails with 1406. Every column is
+nullable.
+
+Execution is semi-naive. The parser marks the CTE's `materialize` node with
+the anchor, the recursive arms and the union kind; each self-reference is a
+marker node. The CTE is an ordinary stage (§6.3), so later references, joins
+and aggregates read its materialized result like any other CTE's. The stage's
+query is one iteration driver (`src/net/recursive_cte.zig`). It runs the
+anchor, and then, while the latest iteration added rows, compiles the
+recursive arms afresh with every self-reference bound to a one-stage working
+set holding exactly those rows, and runs them. Each iteration's rows are
+streamed out and kept only as the next working set. Under `UNION DISTINCT`
+the driver keeps every row it has produced as key bytes and drops a row it
+has already seen, so a cycle ends once it adds nothing new. Under `UNION ALL`
+a cycle needs its own bound. Mixing ALL and DISTINCT after the anchor counts
+as DISTINCT. The rows of the current and next iterations and the DISTINCT key
+set count against the query's memory accountant.
+
+The driver aborts before iteration 1001 if the working set is not empty yet
+(`RecursiveCteDepthExceeded`), MySQL's default `cte_max_recursion_depth`;
+the limit is fixed, as thinDB has no session variable for it. A recursive CTE
+is compiled at run time, so it can't be encoded for the native protocol or an
+XA branch.
+
 ---
 
 ## 7. Compaction
@@ -1122,6 +1170,7 @@ ComputeNoSuchOverload, ComputeTooManyArgs,
 JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
 JoinColumnNameCollision,
 MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
+RecursiveCteDepthExceeded,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -1135,6 +1184,8 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 Scalar functions reject bad arguments with their own errors, which reach a client under their names: `JsonInvalid` (malformed JSON text or JSONB bytes), `JsonNullMemberName` (a NULL key in `JSON_OBJECT` / `JSON_OBJECTAGG`), `IncorrectArgumentsToSleep` (a NULL or negative `SLEEP`), `RegexInvalidPattern`, `RegexInvalidMatchType` (a `match_type` letter outside `c i m n u`), `RegexInvalidReturnOption` (a `REGEXP_INSTR` return option other than 0 or 1) and `RegexIndexOutOfBounds` (a `REGEXP_*` position below 1 or past the end of the subject). MySQL raises the same conditions as errors.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
+
+`RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` prefix, which ALTER TABLE's swap directories use (§9.2).
 
