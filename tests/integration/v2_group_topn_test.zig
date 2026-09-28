@@ -1145,3 +1145,140 @@ test "V2 group-topN: ORDER BY and HAVING read a hashed group key from the finish
         for (case[1], got) |want, cell| try std.testing.expectEqualStrings(want, cell.?);
     }
 }
+
+fn cellNumber(col: anytype, row: usize) !?f64 {
+    if (!col.isValid(row)) return null;
+    return switch (col.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |s| @floatFromInt(s[row]),
+        inline .float, .double => |s| @floatCast(s[row]),
+        else => error.TestUnexpectedType,
+    };
+}
+
+fn expectPlanRunsGroupTopN(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) !void {
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    var q = try runSql(allocator, db, explain_sql);
+    defer q.deinit();
+    var found = false;
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            if (std.mem.indexOf(u8, batch.values[0].data.string.rowBytes(i), "V2 group-topN") != null) found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "V2 group-topN: nullable and BIGINT aggregates agree at DOP 1 and DOP 4" {
+    // DOP 1 folds each staged chunk straight into one group table; DOP 4
+    // partitions chunks into buckets folded by several workers. Nullable
+    // inputs take the validity-aware fold kernels, BIGINT SUM/AVG the
+    // two-slot wide state, and group 0 sees only NULL inputs.
+    const allocator = std.testing.allocator;
+    const group_count = 20_011;
+    const Row = struct { id: i64, g: ?i32, v: ?i32, b: ?i64, d: ?f64 };
+    const Expected = struct {
+        id_sum: i64 = 0,
+        count: i64 = 0,
+        v_sum: i64 = 0,
+        v_n: i64 = 0,
+        v_min: ?i64 = null,
+        v_max: ?i64 = null,
+        b_sum: i64 = 0,
+        b_n: i64 = 0,
+        d_sum: f64 = 0,
+        d_min: ?f64 = null,
+        d_max: ?f64 = null,
+    };
+    const rows = try allocator.alloc(Row, group_count * 6);
+    defer allocator.free(rows);
+    const expected = try allocator.alloc(Expected, group_count);
+    defer allocator.free(expected);
+    @memset(expected, .{});
+    for (rows, 0..) |*row, i| {
+        // Row pairs share a group, so the fold sees adjacent runs as well as
+        // scattered rows. SUM(id) = 12g + const, a tie-free ranking.
+        const g = (i / 2) % group_count;
+        const all_null = g == 0;
+        const v: ?i32 = if (all_null or i % 7 == 0) null else @as(i32, @intCast((i * 37) % 1000)) - 500;
+        const b: ?i64 = if (all_null or i % 5 == 0) null else @as(i64, @intCast(i)) * 3_000_000_019;
+        const d: ?f64 = if (all_null or i % 3 == 0) null else (@as(f64, @floatFromInt((i * 13) % 512)) - 256) * 0.25;
+        row.* = .{ .id = @intCast(i), .g = @intCast(g), .v = v, .b = b, .d = d };
+        const e = &expected[g];
+        e.id_sum += @intCast(i);
+        e.count += 1;
+        if (v) |x| {
+            const wide_x: i64 = x;
+            e.v_sum += wide_x;
+            e.v_n += 1;
+            e.v_min = if (e.v_min) |m| @min(m, wide_x) else wide_x;
+            e.v_max = if (e.v_max) |m| @max(m, wide_x) else wide_x;
+        }
+        if (b) |x| {
+            e.b_sum += x;
+            e.b_n += 1;
+        }
+        if (d) |x| {
+            e.d_sum += x;
+            e.d_min = if (e.d_min) |m| @min(m, x) else x;
+            e.d_max = if (e.d_max) |m| @max(m, x) else x;
+        }
+    }
+    const int_sql = "SELECT g, SUM(id) AS si, COUNT(*) AS c, SUM(v) AS sv, AVG(v) AS av, MIN(v) AS mnv, MAX(v) AS mxv, SUM(b) AS sb FROM agg_rows GROUP BY g ORDER BY si DESC";
+    const float_sql = "SELECT g, SUM(id) AS si, AVG(b) AS ab, SUM(d) AS sd, MIN(d) AS mnd, MAX(d) AS mxd FROM agg_rows GROUP BY g ORDER BY si DESC";
+    const pages = .{ .{ group_count, 0 }, .{ 25, 7 } };
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("agg_rows", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g", .type = .int, .nullable = true },
+                .{ .name = "v", .type = .int, .nullable = true },
+                .{ .name = "b", .type = .bigint, .nullable = true },
+                .{ .name = "d", .type = .double, .nullable = true },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"} });
+        try t.insert(rows);
+        try t.flush();
+        inline for (.{ int_sql, float_sql }) |base_sql| {
+            try expectPlanRunsGroupTopN(allocator, db, base_sql ++ " LIMIT 10");
+            inline for (pages) |page| {
+                const sql = std.fmt.comptimePrint("{s} LIMIT {d} OFFSET {d}", .{ base_sql, page[0], page[1] });
+                errdefer std.debug.print("dop={d} query: {s}\n", .{ dop, sql });
+                var q = try runSql(allocator, db, sql);
+                defer q.deinit();
+                var rank: usize = page[1];
+                while (try q.next()) |batch| {
+                    for (0..batch.row_count) |r| {
+                        const g: usize = @intCast(batch.values[0].data.int[r]);
+                        try std.testing.expectEqual(group_count - 1 - rank, g);
+                        const e = expected[g];
+                        try std.testing.expectEqual(@as(?f64, @floatFromInt(e.id_sum)), try cellNumber(batch.values[1], r));
+                        if (comptime std.mem.eql(u8, base_sql, int_sql)) {
+                            const v_avg: ?f64 = if (e.v_n == 0) null else @as(f64, @floatFromInt(e.v_sum)) / @as(f64, @floatFromInt(e.v_n));
+                            try std.testing.expectEqual(@as(?f64, @floatFromInt(e.count)), try cellNumber(batch.values[2], r));
+                            try std.testing.expectEqual(if (e.v_n == 0) null else @as(?f64, @floatFromInt(e.v_sum)), try cellNumber(batch.values[3], r));
+                            try std.testing.expectEqual(v_avg, try cellNumber(batch.values[4], r));
+                            try std.testing.expectEqual(if (e.v_min) |x| @as(?f64, @floatFromInt(x)) else null, try cellNumber(batch.values[5], r));
+                            try std.testing.expectEqual(if (e.v_max) |x| @as(?f64, @floatFromInt(x)) else null, try cellNumber(batch.values[6], r));
+                            try std.testing.expectEqual(if (e.b_n == 0) null else @as(?f64, @floatFromInt(e.b_sum)), try cellNumber(batch.values[7], r));
+                        } else {
+                            const b_avg: ?f64 = if (e.b_n == 0) null else @as(f64, @floatFromInt(e.b_sum)) / @as(f64, @floatFromInt(e.b_n));
+                            try std.testing.expectEqual(b_avg, try cellNumber(batch.values[2], r));
+                            try std.testing.expectEqual(if (e.d_min == null) null else @as(?f64, e.d_sum), try cellNumber(batch.values[3], r));
+                            try std.testing.expectEqual(e.d_min, try cellNumber(batch.values[4], r));
+                            try std.testing.expectEqual(e.d_max, try cellNumber(batch.values[5], r));
+                        }
+                        rank += 1;
+                    }
+                }
+                try std.testing.expectEqual(@as(usize, page[1] + @min(page[0], group_count - page[1])), rank);
+            }
+        }
+    }
+}
