@@ -315,6 +315,14 @@ pub fn typeHasStats(t: @import("../types.zig").Type) bool {
     };
 }
 
+/// False for JSON, which compares by MySQL's JSON rules rather than by the
+/// order or equality of its stored JSONB bytes: min/max stats, Bloom hashes
+/// and encoded-block kernels built on those bytes can't answer a JSON
+/// comparison.
+pub fn bytesFollowComparison(t: @import("../types.zig").Type) bool {
+    return t != .json;
+}
+
 /// How a column type uses the `Stats.sum` slot — drives both the writer's
 /// accumulation and the cross-row-group/segment fold (integer add vs f64 add
 /// vs min, see `Stats`).

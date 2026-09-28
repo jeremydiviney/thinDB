@@ -423,6 +423,8 @@ pub const AggregateSpec = struct {
     // keeps its result in string state slot `str_state_index` (not the numeric
     // slots). False/0 for every numeric aggregate.
     is_string: bool = false,
+    // String MIN/MAX over JSON, which orders by MySQL's JSON rules.
+    is_json: bool = false,
     str_input_index: u16 = 0,
     str_state_index: u16 = 0,
     // COUNT(DISTINCT col): reads the carried integer `input_column_index` and
@@ -764,6 +766,7 @@ fn runHarness(
             .input_column_index = agg.input_column_index,
             .state_index = agg.state_index,
             .is_string = agg.is_string,
+            .is_json = agg.is_json,
             .str_input_index = agg.str_input_index,
             .str_state_index = agg.str_state_index,
             .is_distinct = agg.is_distinct,

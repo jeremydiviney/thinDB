@@ -15,6 +15,7 @@ const api_mod = @import("../api/api.zig");
 const storage_mod = @import("../storage/storage.zig");
 const types_mod = @import("../types.zig");
 const rowloc = @import("rowloc.zig");
+const json_binary = @import("json_binary.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const build_options = @import("build_options");
 const udf_mod = @import("../udf.zig");
@@ -453,6 +454,8 @@ pub const GroupAggregateSpec = struct {
     // running extreme in the parallel string-state slot `str_state_index` (not
     // the numeric `slots[]`). `is_string` is false for every numeric aggregate.
     is_string: bool = false,
+    // String MIN/MAX over JSON, which orders by MySQL's JSON rules.
+    is_json: bool = false,
     str_input_index: u16 = 0,
     str_state_index: u16 = 0,
     // COUNT(DISTINCT col): reads the carried integer payload `input_column_index`
@@ -834,6 +837,7 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
             a.aggregates[i].input_column_index != b.aggregates[i].input_column_index or
             a.aggregates[i].state_index != b.aggregates[i].state_index or
             a.aggregates[i].is_string != b.aggregates[i].is_string or
+            a.aggregates[i].is_json != b.aggregates[i].is_json or
             a.aggregates[i].str_input_index != b.aggregates[i].str_input_index or
             a.aggregates[i].str_state_index != b.aggregates[i].str_state_index or
             a.aggregates[i].wide != b.aggregates[i].wide or
@@ -4754,7 +4758,7 @@ fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Alloc
             acc.bytes = try str_arena.dupe(u8, b);
             acc.present = true;
         } else {
-            const cmp = std.mem.order(u8, b, acc.bytes);
+            const cmp = json_binary.columnOrder(agg.is_json, b, acc.bytes);
             const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
             if (is_better) acc.bytes = try str_arena.dupe(u8, b);
         }

@@ -2121,7 +2121,7 @@ pub const Window = struct {
                 if (best_idx < 0) {
                     best_idx = @intCast(r);
                 } else {
-                    const ord = transform.compareInColumn(col, @intCast(best_idx), r);
+                    const ord = transform.compareValuesInColumn(col, @intCast(best_idx), r);
                     const replace = if (is_min) (ord == .gt) else (ord == .lt);
                     if (replace) best_idx = @intCast(r);
                 }
@@ -2307,7 +2307,7 @@ pub const Window = struct {
                 best_idx = @intCast(r);
                 continue;
             }
-            const ord = transform.compareInColumn(col, @intCast(best_idx), r);
+            const ord = transform.compareValuesInColumn(col, @intCast(best_idx), r);
             const replace = if (is_min) (ord == .gt) else (ord == .lt);
             if (replace) best_idx = @intCast(r);
         }
@@ -3099,7 +3099,10 @@ pub fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
         .uuid => |l| @truncate(l.items[row] >> 64),
         .float => |l| floatNorm(@as(f64, l.items[row])),
         .double => |l| floatNorm(l.items[row]),
-        .varchar, .string, .char, .json => |s| stringPrefix(s.rowBytesWide(row)),
+        .varchar, .string, .char => |s| stringPrefix(s.rowBytesWide(row)),
+        // JSON's bytes don't follow its order: every row ties here and the
+        // comparator decides.
+        .json => 0,
     };
     return if (desc) ~norm else norm;
 }

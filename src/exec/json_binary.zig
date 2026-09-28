@@ -676,6 +676,188 @@ fn arrayContains(target_arr: []const u8, cand: []const u8) bool {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Comparison: MySQL's JSON order
+// ---------------------------------------------------------------------------
+
+/// A JSON value's rank in MySQL's comparison order, lowest first. Two values
+/// of different kinds order by kind alone.
+pub const Kind = enum(u8) { null, number, string, object, array, boolean };
+
+/// Integers and exact numbers keep every digit; a double stays a double.
+pub const Number = union(enum) { exact: common.ScaledInt, double: f64 };
+
+/// One side of a JSON comparison. A SQL value takes part as MySQL converts it
+/// to JSON: text is a JSON string, a number a JSON number, a boolean a JSON
+/// boolean. Arrays and objects stay JSONB.
+pub const Operand = union(Kind) {
+    null,
+    number: Number,
+    string: []const u8,
+    object: []const u8,
+    array: []const u8,
+    boolean: bool,
+};
+
+pub fn operand(v: []const u8) Operand {
+    return switch (tagOf(v)) {
+        .null => .null,
+        .false => .{ .boolean = false },
+        .true => .{ .boolean = true },
+        .int => .{ .number = .{ .exact = .{ .m = std.mem.readInt(i64, v[1..9], .little), .s = 0 } } },
+        .double => .{ .number = .{ .double = @bitCast(std.mem.readInt(u64, v[1..9], .little)) } },
+        .number => .{ .number = digitsNumber(numberDigits(v)) },
+        .string => .{ .string = v[5..][0..readU32(v, 1)] },
+        .array => .{ .array = v },
+        .object => .{ .object = v },
+    };
+}
+
+/// Text on the other side of a comparison with JSON: JSONB (a JSON
+/// expression's value) is that value, any other text a JSON string.
+pub fn textOperand(text: []const u8) Operand {
+    return if (looksBinary(text)) operand(text) else .{ .string = text };
+}
+
+fn digitsNumber(digits: []const u8) Number {
+    const n = common.textNumber(digits) orelse return .{ .double = std.fmt.parseFloat(f64, digits) catch 0 };
+    return switch (n) {
+        .exact => |d| .{ .exact = d },
+        .float => |f| .{ .double = f },
+    };
+}
+
+/// Order of two JSONB values under MySQL's JSON comparison: by kind first
+/// (`Kind`), then numbers by value across integer, double and decimal,
+/// strings by their bytes, booleans false first, arrays element by element
+/// and objects as `objectOrder` walks them. Bytes that are not JSONB (a NULL
+/// slot's empty payload) order bytewise, which keeps the order total.
+pub fn compare(a: []const u8, b: []const u8) std.math.Order {
+    if (!looksBinary(a) or !looksBinary(b)) return std.mem.order(u8, a, b);
+    return compareOperands(operand(a), operand(b));
+}
+
+/// Order of two values of one string-family column: MySQL's JSON order for
+/// JSON, bytewise for text. Inline, so a comptime-known `json` leaves one
+/// branch in the caller's loop.
+pub inline fn columnOrder(json: bool, a: []const u8, b: []const u8) std.math.Order {
+    return if (json) compare(a, b) else std.mem.order(u8, a, b);
+}
+
+pub fn compareOperands(a: Operand, b: Operand) std.math.Order {
+    const kind_order = std.math.order(@intFromEnum(std.meta.activeTag(a)), @intFromEnum(std.meta.activeTag(b)));
+    if (kind_order != .eq) return kind_order;
+    return switch (a) {
+        .null => .eq,
+        .number => |x| numberOrder(x, b.number),
+        .string => |x| std.mem.order(u8, x, b.string),
+        .object => |x| objectOrder(x, b.object),
+        .array => |x| arrayOrder(x, b.array),
+        .boolean => |x| std.math.order(@intFromBool(x), @intFromBool(b.boolean)),
+    };
+}
+
+fn numberOrder(a: Number, b: Number) std.math.Order {
+    return switch (a) {
+        .exact => |x| switch (b) {
+            .exact => |y| scaledOrder(x, y),
+            .double => |y| exactDoubleOrder(x, y),
+        },
+        .double => |x| switch (b) {
+            .exact => |y| exactDoubleOrder(y, x).invert(),
+            .double => |y| std.math.order(x, y),
+        },
+    };
+}
+
+/// MySQL compares an exact number with a double by the double's shortest
+/// decimal digits, so `1.5` equals a DECIMAL `1.50`.
+fn exactDoubleOrder(x: common.ScaledInt, y: f64) std.math.Order {
+    if (common.floatDigits(y)) |yd| return scaledOrder(x, yd);
+    // Past what a DECIMAL holds, the double's magnitude decides.
+    const xf = @as(f64, @floatFromInt(x.m)) / std.math.pow(f64, 10.0, @floatFromInt(x.s));
+    return std.math.order(xf, y);
+}
+
+fn scaledOrder(a: common.ScaledInt, b: common.ScaledInt) std.math.Order {
+    if (a.s == b.s) return std.math.order(a.m, b.m);
+    if (a.s < b.s) return rescaledOrder(a.m, b.s - a.s, b.m);
+    return rescaledOrder(b.m, a.s - b.s, a.m).invert();
+}
+
+/// Order of `m × 10^shift` against `other`. A product past i128 lies beyond
+/// every value `other` can hold, so the sign of `m` decides.
+fn rescaledOrder(m: i128, shift: u8, other: i128) std.math.Order {
+    if (m == 0) return std.math.order(0, other);
+    const unit = std.math.powi(i128, 10, shift) catch return if (m > 0) .gt else .lt;
+    const scaled = std.math.mul(i128, m, unit) catch return if (m > 0) .gt else .lt;
+    return std.math.order(scaled, other);
+}
+
+fn elementValue(arr: []const u8, i: u32) []const u8 {
+    const off = readU32(arr, 9 + i * 4);
+    return arr[off..][0..valueLen(arr[off..])];
+}
+
+/// Element by element; a shorter array whose elements all equal the longer
+/// one's first elements orders first.
+fn arrayOrder(a: []const u8, b: []const u8) std.math.Order {
+    const count_a = readU32(a, 5);
+    const count_b = readU32(b, 5);
+    var i: u32 = 0;
+    while (i < @min(count_a, count_b)) : (i += 1) {
+        const ord = compare(elementValue(a, i), elementValue(b, i));
+        if (ord != .eq) return ord;
+    }
+    return std.math.order(count_a, count_b);
+}
+
+/// MySQL orders two objects by member count, then member by member in its
+/// key order (shorter keys first, `printKeyLess`), comparing each pair's keys
+/// bytewise and then their values. Equal objects have equal members.
+fn objectOrder(a: []const u8, b: []const u8) std.math.Order {
+    const count_order = std.math.order(readU32(a, 5), readU32(b, 5));
+    if (count_order != .eq) return count_order;
+    var walk_a: KeyOrderWalk = .{ .obj = a };
+    var walk_b: KeyOrderWalk = .{ .obj = b };
+    while (walk_a.next()) |ma| {
+        const mb = walk_b.next() orelse return .gt;
+        const key_order = std.mem.order(u8, memberKey(a, ma), memberKey(b, mb));
+        if (key_order != .eq) return key_order;
+        const value_order = compare(memberValue(a, ma), memberValue(b, mb));
+        if (value_order != .eq) return value_order;
+    }
+    return .eq;
+}
+
+/// An object's members in MySQL's key order without allocating. Keys are
+/// stored bytewise, so the members of one key length already sit in order:
+/// the walk takes each length in turn, shortest first.
+const KeyOrderWalk = struct {
+    obj: []const u8,
+    key_len: usize = 0,
+    pos: u32 = 0,
+
+    fn next(self: *KeyOrderWalk) ?u32 {
+        const count = readU32(self.obj, 5);
+        while (true) {
+            while (self.pos < count) {
+                const i = self.pos;
+                self.pos += 1;
+                if (memberKey(self.obj, i).len == self.key_len) return i;
+            }
+            var longer: ?usize = null;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const len = memberKey(self.obj, i).len;
+                if (len > self.key_len and (longer == null or len < longer.?)) longer = len;
+            }
+            self.key_len = longer orelse return null;
+            self.pos = 0;
+        }
+    }
+};
+
 /// Build a freshly-allocated JSONB array of an object's keys (each a JSON
 /// string) in MySQL's order, or null if `obj` is not an object. Caller owns
 /// the slice.
@@ -952,4 +1134,59 @@ test "looksBinary discriminates text vs binary" {
     const b = try encodeFromText(aa, "{}");
     defer aa.free(b);
     try std.testing.expect(looksBinary(b));
+}
+
+test "compare orders JSON values as MySQL 8.4 does" {
+    const aa = std.testing.allocator;
+    // Each pair's order as MySQL 8.4 reports it for `a < b` / `a = b`.
+    const cases = .{
+        .{ "null", "-1e300", .lt },
+        .{ "3", "3.0", .eq },
+        .{ "-0.0", "0", .eq },
+        .{ "2.5", "3", .lt },
+        .{ "9223372036854775807", "9223372036854775808", .lt },
+        .{ "18446744073709551615", "1.8e19", .gt },
+        .{ "\"5\"", "10", .gt },
+        .{ "\"a\"", "\"B\"", .gt },
+        .{ "\"ab\"", "\"a\"", .gt },
+        .{ "\"é\"", "\"z\"", .gt },
+        .{ "{}", "\"z\"", .gt },
+        .{ "[]", "{\"a\": 1}", .gt },
+        .{ "false", "[1]", .gt },
+        .{ "false", "true", .lt },
+        .{ "[1, [2, 3]]", "[1, [2, 4]]", .lt },
+        .{ "[1, [2]]", "[1, 5]", .gt },
+        .{ "[[]]", "[{}]", .gt },
+        .{ "[1, 2]", "[1, 2, 0]", .lt },
+        .{ "[2]", "[1, 9]", .gt },
+        .{ "[1]", "[1.0]", .eq },
+        .{ "{\"a\": 1}", "{\"b\": 1}", .lt },
+        .{ "{\"a\": 1}", "{\"a\": 2}", .lt },
+        .{ "{\"a\": 1, \"b\": 1}", "{\"b\": 0}", .gt },
+        .{ "{\"b\": 1, \"aa\": 5}", "{\"b\": 2, \"aa\": 0}", .lt },
+        .{ "{\"b\": 1, \"aa\": 1}", "{\"ab\": 1, \"ac\": 1}", .gt },
+        .{ "{\"aa\": 1}", "{\"b\": 1}", .lt },
+        .{ "{\"a\": 1, \"b\": 2}", "{\"b\": 2, \"a\": 1.0}", .eq },
+    };
+    inline for (cases) |c| {
+        const a = try encodeFromText(aa, c[0]);
+        defer aa.free(a);
+        const b = try encodeFromText(aa, c[1]);
+        defer aa.free(b);
+        try std.testing.expectEqual(@as(std.math.Order, c[2]), compare(a, b));
+        try std.testing.expectEqual(@as(std.math.Order, c[2]).invert(), compare(b, a));
+    }
+
+    var exact: std.ArrayList(u8) = .empty;
+    defer exact.deinit(aa);
+    try appendNumber(aa, &exact, .decimal, "1.50");
+    const double = try encodeFromText(aa, "1.5");
+    defer aa.free(double);
+    try std.testing.expectEqual(std.math.Order.eq, compare(exact.items, double));
+
+    const x = try encodeFromText(aa, "\"x\"");
+    defer aa.free(x);
+    try std.testing.expectEqual(std.math.Order.eq, compareOperands(operand(x), textOperand("x")));
+    try std.testing.expectEqual(std.math.Order.lt, compareOperands(textOperand("\"x\""), operand(x)));
+    try std.testing.expectEqual(std.math.Order.eq, compareOperands(operand(x), textOperand(x)));
 }

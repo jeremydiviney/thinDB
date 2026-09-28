@@ -10,6 +10,7 @@ const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 
 const store = @import("store.zig");
+const json_binary = @import("../exec/json_binary.zig");
 const ColumnStore = store.ColumnStore;
 const DataStore = store.DataStore;
 const StringStore = store.StringStore;
@@ -23,7 +24,7 @@ pub fn rowIsValid(col: ColumnStore, row: u32) bool {
     return (nb.items[byte_idx] & (@as(u8, 1) << @intCast(row & 7))) != 0;
 }
 
-/// Validity-aware variant of `compareInColumn` for QUERY-side consumers
+/// Validity-aware variant of `compareValuesInColumn` for QUERY-side consumers
 /// (Sort, TopN, Window): NULL orders before every value (the dialect's
 /// NULLs-first-ASC convention; DESC handling in the callers puts it last),
 /// two NULLs compare equal. A NULL slot's payload bytes are encoding
@@ -39,14 +40,26 @@ pub fn compareInColumnNullsFirst(col: ColumnStore, a: u32, b: u32) std.math.Orde
             return if (av) .gt else .lt;
         }
     }
-    return compareInColumn(col, a, b);
+    return compareValuesInColumn(col, a, b);
+}
+
+/// Query-side value order of row `a` vs row `b`: MySQL's JSON order for
+/// JSON, `compareInColumn` for every other type. Validity is not consulted.
+pub fn compareValuesInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
+    return columnRowOrder(col, a, b, true);
 }
 
 /// Compare row `a` vs row `b` within a single column. Lexicographic order
 /// for strings, numeric order for everything else. Used by sort kernels.
 /// Raw value order — validity is NOT consulted (storage merge contract);
-/// query-side ordering goes through `compareInColumnNullsFirst`.
+/// query-side ordering goes through `compareInColumnNullsFirst`. JSON keeps
+/// its stored bytes' order here, so an order key's byte-equal values, which
+/// key hashing and the unique-key merge treat as one key, stay adjacent.
 pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
+    return columnRowOrder(col, a, b, false);
+}
+
+fn columnRowOrder(col: ColumnStore, a: u32, b: u32, comptime json_values: bool) std.math.Order {
     return switch (col.data) {
         .int => |l| std.math.order(l.items[a], l.items[b]),
         .bigint => |l| std.math.order(l.items[a], l.items[b]),
@@ -55,7 +68,7 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
         .varchar => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .string => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .char => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
-        .json => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
+        .json => |s| json_binary.columnOrder(json_values, s.rowBytesWide(a), s.rowBytesWide(b)),
         .tinyint => |l| std.math.order(l.items[a], l.items[b]),
         .smallint => |l| std.math.order(l.items[a], l.items[b]),
         .largeint => |l| std.math.order(l.items[a], l.items[b]),
@@ -75,6 +88,10 @@ pub fn compareInColumn(col: ColumnStore, a: u32, b: u32) std.math.Order {
 /// k-way merge across segments produces the same total order as the single-table
 /// `buildSortedSnapshot` sort. The two views' tags must match.
 pub fn compareViewRows(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.math.Order {
+    return viewRowOrder(va, a, vb, b, false);
+}
+
+fn viewRowOrder(va: ColumnView, a: usize, vb: ColumnView, b: usize, comptime json_values: bool) std.math.Order {
     return switch (va.data) {
         .int => |l| std.math.order(l[a], vb.data.int[b]),
         .bigint => |l| std.math.order(l[a], vb.data.bigint[b]),
@@ -82,7 +99,7 @@ pub fn compareViewRows(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.m
         .varchar => |s| std.mem.order(u8, s.rowBytes(a), vb.data.varchar.rowBytes(b)),
         .string => |s| std.mem.order(u8, s.rowBytes(a), vb.data.string.rowBytes(b)),
         .char => |s| std.mem.order(u8, s.rowBytes(a), vb.data.char.rowBytes(b)),
-        .json => |s| std.mem.order(u8, s.rowBytes(a), vb.data.json.rowBytes(b)),
+        .json => |s| json_binary.columnOrder(json_values, s.rowBytes(a), vb.data.json.rowBytes(b)),
         .tinyint => |l| std.math.order(l[a], vb.data.tinyint[b]),
         .smallint => |l| std.math.order(l[a], vb.data.smallint[b]),
         .largeint => |l| std.math.order(l[a], vb.data.largeint[b]),
@@ -108,7 +125,13 @@ pub fn compareViewRowsNullsFirst(va: ColumnView, a: usize, vb: ColumnView, b: us
         if (av == bv) return .eq;
         return if (av) .gt else .lt;
     }
-    return compareViewRows(va, a, vb, b);
+    return compareViewValues(va, a, vb, b);
+}
+
+/// `compareViewRows` under the query-side value order: MySQL's JSON order for
+/// JSON (`compareValuesInColumn`). Validity is not consulted.
+pub fn compareViewValues(va: ColumnView, a: usize, vb: ColumnView, b: usize) std.math.Order {
+    return viewRowOrder(va, a, vb, b, true);
 }
 
 /// Borrowed row-range view over a column — the zero-copy slicing primitive

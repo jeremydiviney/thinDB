@@ -931,7 +931,7 @@ const CandidateHeap = struct {
 /// comparator agree — a NaN row raises the row group's `max` to the NaN sentinel,
 /// keeping it from being wrongly pruned.
 fn leadingKeyTypeSupported(t: types.Type) bool {
-    return storage.format.typeHasStats(t);
+    return storage.format.typeHasStats(t) and storage.format.bytesFollowComparison(t);
 }
 
 /// Read stored row `r`'s key value as an i128 in the same per-type encoding the

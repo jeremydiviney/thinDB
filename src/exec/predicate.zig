@@ -21,6 +21,7 @@ const simd = @import("../util/simd.zig");
 const like_pattern = @import("../util/like.zig");
 const Error = exec.Error;
 const scalar_fn_common = @import("scalar_fn_common.zig");
+const json_binary = @import("json_binary.zig");
 const cast = @import("cast.zig");
 const scalar_fn_time = @import("scalar_fn_time.zig");
 const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
@@ -918,6 +919,8 @@ fn sideOf(negative: bool) Side {
 }
 
 fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
+    // The literal meets JSON as MySQL converts it (`valueJsonOperand`).
+    if (col_type == .json) return if (valueJsonOperand(val) != null) .{ .exact = val } else .incomparable;
     const kind = comparisonKind(col_type);
     // Text meets a temporal column only as `textMicros` reads it:
     // `coerceValue` takes a date prefix, so it would read
@@ -1670,7 +1673,7 @@ fn compareCellToValue(view: ColumnView, idx: usize, op: PredicateOp, ref: Value)
         .varchar => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
         .string => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
         .char => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
-        .json => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
+        .json => |sv| orderMatches(jsonOrder(sv.rowBytes(idx), valueJsonOperand(ref)), op),
     };
 }
 
@@ -1959,7 +1962,8 @@ fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
         .decimal64 => |s| ref == .decimal64 and s[idx] == ref.decimal64,
         .decimal128 => |s| ref == .decimal128 and s[idx] == ref.decimal128,
         .uuid => |s| ref == .uuid and s[idx] == ref.uuid,
-        .varchar, .string, .char, .json => |sv| switch (ref) {
+        .json => |sv| jsonOrder(sv.rowBytes(idx), valueJsonOperand(ref)) == .eq,
+        .varchar, .string, .char => |sv| switch (ref) {
             .text => |t| std.mem.eql(u8, sv.rowBytes(idx), t),
             else => textOrder(sv.rowBytes(idx), valueScalar(ref, 0)) == .eq,
         },
@@ -2006,9 +2010,10 @@ pub fn evaluateInSetMask(allocator: std.mem.Allocator, view: ColumnView, values:
             inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid => |col, tag| {
                 return evalInSortedSet(allocator, @field(ValueTag, @tagName(tag)), view, col, values, negate, n, mask);
             },
-            inline .varchar, .string, .char, .json => |sv| return evalInTextHashSet(allocator, sv, view, values, negate, n, mask),
-            // Float `==` (NaN, -0.0) and two-valued booleans stay on the scan.
-            .float, .double, .boolean => {},
+            inline .varchar, .string, .char => |sv| return evalInTextHashSet(allocator, sv, view, values, negate, n, mask),
+            // Float `==` (NaN, -0.0) and two-valued booleans stay on the scan,
+            // as does JSON, whose equal values needn't share bytes.
+            .float, .double, .boolean, .json => {},
         }
     }
     // Outer per-column-type dispatch keeps the inner loop type-mono.
@@ -2048,7 +2053,6 @@ pub fn evaluateInSetMask(allocator: std.mem.Allocator, view: ColumnView, values:
         .varchar => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         .string => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         .char => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
-        .json => |sv| try evalInSetStringy(sv, values, negate, view, n, mask),
         // Validation brought every set value to the column's type.
         else => for (0..n) |i| {
             if (!view.isValid(i)) {
@@ -2240,6 +2244,49 @@ fn cellScalar(view: ColumnView, ty: types.Type, i: usize) Scalar {
     };
 }
 
+/// A value on the other side of a comparison with JSON, converted to JSON as
+/// MySQL converts it: text is a JSON string (JSONB, a JSON expression's value,
+/// stays that value), a number a JSON number and a boolean a JSON boolean.
+/// Null for a value MySQL ranks among JSON's temporal and opaque kinds, which
+/// no JSONB value here holds, and for a decimal, which carries no scale here.
+fn valueJsonOperand(v: Value) ?json_binary.Operand {
+    return switch (v) {
+        .text => |t| json_binary.textOperand(t),
+        .boolean => |b| .{ .boolean = b },
+        .float => |x| .{ .number = .{ .double = x } },
+        .double => |x| .{ .number = .{ .double = x } },
+        .tinyint => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
+        .smallint => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
+        .int => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
+        .bigint => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
+        .largeint => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
+        .decimal64, .decimal128, .date, .datetime, .uuid => null,
+    };
+}
+
+/// Row `i` of a column compared with JSON (`valueJsonOperand`).
+fn cellJsonOperand(view: ColumnView, ty: types.Type, i: usize) ?json_binary.Operand {
+    return switch (view.data) {
+        .json => |sv| json_binary.textOperand(sv.rowBytes(i)),
+        .varchar, .string, .char => |sv| .{ .string = sv.rowBytes(i) },
+        .boolean => |s| .{ .boolean = s[i] != 0 },
+        .float => |s| .{ .number = .{ .double = s[i] } },
+        .double => |s| .{ .number = .{ .double = s[i] } },
+        .date, .datetime, .uuid => null,
+        .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => switch (cellScalar(view, ty, i)) {
+            .integer => |m| .{ .number = .{ .exact = .{ .m = m, .s = 0 } } },
+            .decimal => |d| .{ .number = .{ .exact = d } },
+            else => null,
+        },
+    };
+}
+
+/// A JSON cell against a converted value; null when the value has no JSON
+/// form to compare by.
+fn jsonOrder(cell: []const u8, other: ?json_binary.Operand) ?std.math.Order {
+    return json_binary.compareOperands(json_binary.textOperand(cell), other orelse return null);
+}
+
 /// A value in comparison form; `decimal_scale` places a decimal mantissa.
 fn valueScalar(v: Value, decimal_scale: u8) Scalar {
     return switch (v) {
@@ -2362,7 +2409,13 @@ fn sameRepresentation(a: types.Type, b: types.Type) bool {
 /// Per-row col-vs-col comparison under the comparison rule. NULL on either
 /// side → mask[i] = false (two-valued logic).
 pub fn evaluateColColMask(left: ColumnView, left_type: types.Type, right: ColumnView, right_type: types.Type, op: PredicateOp, n: usize, mask: []bool) void {
-    if (sameRepresentation(left_type, right_type)) {
+    if (left_type == .json or right_type == .json) {
+        for (0..n) |i| {
+            const l = cellJsonOperand(left, left_type, i);
+            const r = cellJsonOperand(right, right_type, i);
+            mask[i] = l != null and r != null and orderMatches(json_binary.compareOperands(l.?, r.?), op);
+        }
+    } else if (sameRepresentation(left_type, right_type)) {
         sameRepresentationMask(left, right, op, n, mask);
     } else if (temporalBesideNumber(left_type, right_type)) {
         for (0..n) |i| mask[i] = orderMatches(numberOrder(cellNumber(left, left_type, i), cellNumber(right, right_type, i)), op);
@@ -2492,7 +2545,11 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
         .int => |s| cmpInto(i32, s[0..n], p.val.int, mask[0..n], op),
         .bigint => |s| cmpInto(i64, s[0..n], p.val.bigint, mask[0..n], op),
         .boolean => |s| cmpInto(u8, s[0..n], @intFromBool(p.val.boolean), mask[0..n], op),
-        .varchar, .char, .json => |sv| {
+        .json => |sv| {
+            const want = valueJsonOperand(p.val) orelse return Error.PredicateTypeMismatch;
+            for (0..n) |i| mask[i] = orderMatches(json_binary.compareOperands(json_binary.textOperand(sv.rowBytes(i)), want), op);
+        },
+        .varchar, .char => |sv| {
             if (p.val.text.len == 0 and (op == .eq or op == .neq)) {
                 emptyStringMask(sv, op == .eq, n, mask[0..n]);
             } else {

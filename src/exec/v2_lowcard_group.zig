@@ -53,6 +53,7 @@ const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
+const json_binary = @import("json_binary.zig");
 const Scan = @import("scan.zig").Scan;
 const SiloCore = exec.silo_group_core;
 const platform = @import("../util/platform.zig");
@@ -1441,7 +1442,7 @@ fn compareBySpec(ctx: SortCtx, spec: SortSpec, a_gid: u32, b_gid: u32) std.math.
                 const dict = op.dicts[pi].?;
                 const ac: u32 = @intCast(truncBits(keyOfGid(merged, a_gid) >> @intCast(p.offset), 32));
                 const bc: u32 = @intCast(truncBits(keyOfGid(merged, b_gid) >> @intCast(p.offset), 32));
-                return std.mem.order(u8, dict.decode(ac), dict.decode(bc));
+                return json_binary.columnOrder(p.typ == .json, dict.decode(ac), dict.decode(bc));
             }
             const av = unpackKeyPart(keyOfGid(merged, a_gid), p);
             const bv = unpackKeyPart(keyOfGid(merged, b_gid), p);
