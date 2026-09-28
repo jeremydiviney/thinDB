@@ -301,17 +301,13 @@ test "comparison: a text join key meets a number or temporal key by value" {
     });
 }
 
-test "comparison: kinds that never compare are rejected" {
+test "comparison: a subquery's DATE never meets a number" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
     defer db.close();
     try setupMixed(allocator, db);
-
-    try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE i = d", error.PredicateTypeMismatch);
-    try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE ts > 5", error.PredicateTypeMismatch);
-    try helpers.expectRunError(allocator, db, "SELECT id FROM cm WHERE i IN (DATE '2024-03-05', DATE '2024-03-06')", error.PredicateTypeMismatch);
 
     // A subquery's column meets the rule by its type, whatever rows it returns.
     try helpers.exec(allocator, db, "CREATE TABLE ck (id BIGINT PRIMARY KEY, d DATE, i INT)");
@@ -476,6 +472,95 @@ test "comparison: text meets a DATE or DATETIME the way MySQL reads it" {
         .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm, tx WHERE tx.s = cm.ts ORDER BY p", .expected = &.{ 11, 26 } },
         .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm JOIN tx ON tx.s = cm.d ORDER BY p", .expected = &.{ 11, 22 } },
         .{ .sql = "SELECT cm.id * 10 + tx.id AS p FROM cm JOIN tx ON tx.s = cm.ts ORDER BY p", .expected = &.{ 11, 26 } },
+    });
+}
+
+test "comparison: a number meets a DATE or DATETIME the way MySQL reads it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE nd (id BIGINT PRIMARY KEY, d DATE, ts DATETIME(6), t0 DATETIME, g INT, s SMALLINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO nd VALUES
+        \\  (1, '2026-09-26', '2026-09-26 10:05:03.5', '2026-09-26 10:05:03', 1, 5),
+        \\  (2, '2026-09-27', '2026-09-27 00:00:00', '2026-09-27 23:59:59', 1, 6),
+        \\  (3, NULL, NULL, NULL, 2, NULL),
+        \\  (4, '2001-01-01', '2001-01-01 00:00:00', '2001-01-01 00:00:00', 2, 7),
+        \\  (5, '1999-12-31', '1999-12-31 23:59:59', '1999-12-31 23:59:59', 2, 8)
+    );
+
+    // Each answer is MySQL 8.4's.
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{"nd"}, &.{
+        .{ .sql = "SELECT id FROM nd WHERE d = 20260926 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE d = 260926 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE d = 991231 ORDER BY id", .expected = &.{5} },
+        .{ .sql = "SELECT id FROM nd WHERE d = 10101 ORDER BY id", .expected = &.{4} },
+        // A number no datetime reads compares with each row's own number.
+        .{ .sql = "SELECT id FROM nd WHERE d = 2026 ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE d > 2026 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d <> 2026 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d > 0 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d > -20260926 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d = TRUE ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE d > 20260926.5 ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM nd WHERE d = 20260926.9 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE d = 2.0260926e7 ORDER BY id", .expected = &.{1} },
+        // A DATE column meets a datetime number by its day.
+        .{ .sql = "SELECT id FROM nd WHERE d = 20260926000001 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE d < 20260926000001 ORDER BY id", .expected = &.{ 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d > 20260926000001 ORDER BY id", .expected = &.{2} },
+        // A zero month or day, or a day past its month's end, lies before the next real day.
+        .{ .sql = "SELECT id FROM nd WHERE d = 20260900 ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE d > 20260900 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE d > 260900 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE d < 20260230 ORDER BY id", .expected = &.{ 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d > 20260931 ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE d >= 20010229 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE d >= 20260000 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE d < 20261399 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d = 20261399 ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE d > 10000100 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d > 1e10 ORDER BY id", .expected = &.{ 1, 2, 4 } },
+        .{ .sql = "SELECT id FROM nd WHERE d < 99991232 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d > 99991231240000 ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE t0 = 20260926100503 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE t0 = 260926100503 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE t0 > 20260926 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE t0 = 20010101 ORDER BY id", .expected = &.{4} },
+        .{ .sql = "SELECT id FROM nd WHERE t0 > 20260926250000 ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM nd WHERE t0 >= 20260926100560 ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM nd WHERE t0 > 20260900000000 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE t0 < 20270000000000 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE t0 > 2026092610050 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE t0 < 691231235959 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE ts = 20260926100503.5 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE ts > 20260926100503.4 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE ts < 20260926100503.6 ORDER BY id", .expected = &.{ 1, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE ts = 20260926100503 ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE t0 IN (20260926100503, 20010101) ORDER BY id", .expected = &.{ 1, 4 } },
+        .{ .sql = "SELECT id FROM nd WHERE d IN (20260900, 20260927) ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM nd WHERE d NOT IN (20260926, 20260927) ORDER BY id", .expected = &.{ 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE t0 NOT IN (20260926100503, 19991231235959) ORDER BY id", .expected = &.{ 2, 4 } },
+        .{ .sql = "SELECT id FROM nd WHERE d BETWEEN 20010101 AND 20260926 ORDER BY id", .expected = &.{ 1, 4 } },
+        .{ .sql = "SELECT id FROM nd WHERE d BETWEEN 20260926000001 AND 20270101 ORDER BY id", .expected = &.{ 1, 2 } },
+        .{ .sql = "SELECT id FROM nd WHERE d <=> 20260926 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE 20260926 < d ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM nd WHERE NOT (d > 20260900) ORDER BY id", .expected = &.{ 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE d = 20260926 + 1 ORDER BY id", .expected = &.{2} },
+        .{ .sql = "SELECT id FROM nd WHERE d = 20260926 OR t0 < 20000101 ORDER BY id", .expected = &.{ 1, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE IF(d = 260926, 1, 0) = 1 ORDER BY id", .expected = &.{1} },
+        .{ .sql = "SELECT id FROM nd WHERE CASE WHEN d > 20260230 THEN 1 ELSE 0 END = 1 ORDER BY id", .expected = &.{ 1, 2 } },
+        // A number column meets a DATE or DATETIME as its number.
+        .{ .sql = "SELECT id FROM nd WHERE d = g ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE d > g ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE g < t0 ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE s < d ORDER BY id", .expected = &.{ 1, 2, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE g < DATE '2026-09-26' ORDER BY id", .expected = &.{ 1, 2, 3, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE s = DATE '2026-09-26' ORDER BY id", .expected = &.{} },
+        .{ .sql = "SELECT id FROM nd WHERE g < TIMESTAMP '2026-09-26 10:05:03.5' ORDER BY id", .expected = &.{ 1, 2, 3, 4, 5 } },
+        .{ .sql = "SELECT id FROM nd WHERE g IN (DATE '2026-09-26', 1) ORDER BY id", .expected = &.{ 1, 2 } },
     });
 }
 

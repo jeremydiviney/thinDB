@@ -49,10 +49,10 @@ test "failed statements leave the statement gate idle" {
     defer tmp.cleanup();
     const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
     try helpers.exec(allocator, db, "CREATE TABLE fa (id BIGINT PRIMARY KEY, n INT, s VARCHAR(10), dt DATE)");
-    try helpers.exec(allocator, db, "CREATE TABLE fb (id BIGINT PRIMARY KEY, n INT, dt DATE)");
+    try helpers.exec(allocator, db, "CREATE TABLE fb (id BIGINT PRIMARY KEY, n INT, dt DATE, u UUID)");
     try helpers.exec(allocator, db, "CREATE TABLE fc (id BIGINT PRIMARY KEY, n INT)");
     try helpers.exec(allocator, db, "INSERT INTO fa VALUES (1, 1, 'a', '2024-01-01'), (2, 2, 'b', '2024-01-02')");
-    try helpers.exec(allocator, db, "INSERT INTO fb VALUES (1, 1, '2024-01-01'), (2, 0, '2024-01-02')");
+    try helpers.exec(allocator, db, "INSERT INTO fb (id, n, dt) VALUES (1, 1, '2024-01-01'), (2, 0, '2024-01-02')");
     try helpers.exec(allocator, db, "INSERT INTO fc VALUES (1, 1), (2, 1)");
 
     const statements = [_][]const u8{
@@ -62,7 +62,7 @@ test "failed statements leave the statement gate idle" {
         "SELECT fa.id FROM fa LEFT JOIN fb ON fa.n = fb.dt",
         "SELECT fa.id FROM fa JOIN fb ON fa.n < fb.dt",
         "SELECT fa.id FROM fa JOIN fb ON fa.id = fb.id JOIN fc ON fb.dt = fc.n",
-        "SELECT fa.id FROM fa JOIN fb ON fa.id = fb.id WHERE fa.n > 0 AND fb.n >= 0 AND fa.n = fb.dt",
+        "SELECT fa.id FROM fa JOIN fb ON fa.id = fb.id WHERE fa.n > 0 AND fb.n >= 0 AND fa.n = fb.u",
         "WITH x AS (SELECT fa.id FROM fa JOIN fb ON fa.n = fb.dt) SELECT id FROM x",
         "SELECT id FROM fc WHERE id IN (SELECT fa.id FROM fa JOIN fb ON fa.n = fb.dt)",
         // Columns and functions that don't resolve, or don't take their arguments.
@@ -71,7 +71,7 @@ test "failed statements leave the statement gate idle" {
         "SELECT id FROM fa ORDER BY nope",
         "SELECT n, COUNT(*) AS c FROM fa GROUP BY nope",
         "SELECT ROW_NUMBER() OVER (ORDER BY nope) AS r FROM fa",
-        "SELECT id FROM fa WHERE n = dt",
+        "SELECT id FROM fb WHERE n = u",
         "SELECT id FROM fa WHERE n IN (SELECT dt FROM fb)",
         "SELECT id FROM fa WHERE EXISTS (SELECT 1 FROM fb WHERE fb.dt = fa.n)",
         "SELECT id FROM fa UNION ALL SELECT id, n FROM fb",

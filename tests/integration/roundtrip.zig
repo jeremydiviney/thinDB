@@ -1059,9 +1059,9 @@ test "error: filter predicate type mismatch on each new type" {
     defer db.close();
     const t = try db.table("t", schema, opts);
 
-    // A number never meets a date.
+    // A number never meets a UUID.
     var base = try thindb.scan(allocator, t);
-    const q = base.filter(thindb.leafExpr("small", .eq, .{ .date = 1 }));
+    const q = base.filter(thindb.leafExpr("small", .eq, .{ .uuid = 1 }));
     try std.testing.expectError(error.PredicateTypeMismatch, q);
     base.deinit();
 

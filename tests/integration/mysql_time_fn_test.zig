@@ -59,6 +59,41 @@ test "MySQL date and TIME functions over constants" {
         .{ "TIME_TO_SEC(TIMESTAMP '2026-09-26 10:05:03')", "36303" },
         .{ "TIME_TO_SEC(100503)", "36303" },
         .{ "TIME_TO_SEC('abc')", null },
+        // A number reads as a TIME by its HHMMSS digits, or as a DATETIME
+        // from 14 digits on. Past 838:59:59, or with a minute or second past
+        // 59, it's no TIME, where text clamps to 838:59:59.
+        .{ "HOUR(8390000)", null },
+        .{ "MINUTE(8390000)", null },
+        .{ "SECOND(-8390000)", null },
+        .{ "MICROSECOND(8390000)", null },
+        .{ "TIME_TO_SEC(8390000)", null },
+        .{ "TIME(8390000)", null },
+        .{ "ADDTIME(8390000, 1)", null },
+        .{ "SUBTIME(8390000, 1)", null },
+        .{ "TIMEDIFF(8390000, 0)", null },
+        .{ "ADDTIME('10:00:00', 8390000)", null },
+        .{ "HOUR('8390000')", "838" },
+        .{ "TIME_TO_SEC('8390000')", "3020399" },
+        .{ "ADDTIME('8390000', 1)", "838:59:59" },
+        .{ "TIMEDIFF('839:00:00', 0)", "838:59:59" },
+        .{ "HOUR(8385959)", "838" },
+        .{ "TIME_TO_SEC(-8385959)", "-3020399" },
+        .{ "HOUR(8385959.5)", "838" },
+        .{ "TIME_TO_SEC(8385959.9999999)", "3020399" },
+        .{ "HOUR(1261)", null },
+        .{ "TIME_TO_SEC(1299)", null },
+        .{ "HOUR(1260.5)", null },
+        .{ "ADDTIME('10:00:00', 1261)", null },
+        .{ "HOUR(1e7)", null },
+        .{ "TIME_TO_SEC(1.5e3)", "900" },
+        .{ "HOUR(20260926100503)", "10" },
+        .{ "TIME_TO_SEC(20260926100503)", "36303" },
+        .{ "MICROSECOND(123.45)", "450000" },
+        .{ "TIME_TO_SEC(123.45)", "83" },
+        .{ "TIMEDIFF(1000, 500)", "00:05:00" },
+        .{ "HOUR(0)", "0" },
+        .{ "HOUR(TRUE)", "0" },
+        .{ "SEC_TO_TIME(8390000)", "838:59:59" },
         .{ "SEC_TO_TIME(3661)", "01:01:01" },
         .{ "SEC_TO_TIME(-3661)", "-01:01:01" },
         .{ "SEC_TO_TIME(3661.5)", "01:01:01.5" },
@@ -196,6 +231,27 @@ test "MySQL date and TIME functions over columns" {
         const want: [3]?[]const u8 = c[1];
         try expectText(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM tm ORDER BY id", &want);
     }
+}
+
+test "NOW and its synonyms give whole seconds in MySQL unless given a precision" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // NOW(n) truncates to n fraction digits, as MySQL does.
+    var q = try helpers.runSqlMysqlSession(allocator, db,
+        \\SELECT MICROSECOND(NOW()), MICROSECOND(CURRENT_TIMESTAMP), MICROSECOND(LOCALTIMESTAMP()),
+        \\  MICROSECOND(LOCALTIME), MICROSECOND(SYSDATE()), MICROSECOND(UTC_TIMESTAMP()), MICROSECOND(NOW(0)),
+        \\  MICROSECOND(NOW(3)) % 1000, MICROSECOND(CURRENT_TIMESTAMP(1)) % 100000,
+        \\  CASE WHEN NOW(3) <= NOW(6) AND NOW() <= NOW(3) THEN 1 ELSE 0 END, LENGTH(CAST(NOW() AS CHAR))
+    );
+    defer q.deinit();
+    const cells = try helpers.collectIntCells(allocator, &q);
+    defer allocator.free(cells);
+    try std.testing.expectEqualSlices(?i64, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 19 }, cells);
 }
 
 test "CURTIME and UTC_TIME are the statement's time of day as TIME text" {

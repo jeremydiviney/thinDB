@@ -84,6 +84,7 @@ Values of different types compare by value, as in StarRocks and MySQL
 - A DATE meets a DATETIME at midnight.
 - Text meets a number by reading the text as one, the way a CAST reads it. Text that doesn't read as a number compares as NULL.
 - Text meets a DATE or DATETIME by reading it the way MySQL's `str_to_datetime` does. That reader takes any punctuation between fields (`'2026-9-1'`, `'2026/09/01'`), digits alone (`'20260901'`, `'260901'`) and a partial time (`'2026-09-01 10:00'`), and it ignores text after the last field. It rejects impossible values: `'2026-09-31'`, month 13, hour 24 and minute or second 60, fewer than three date fields, a zero date or zero date part, and a year past 9999. A text row that doesn't read as a date compares as NULL. A string constant the statement spells that doesn't read as one fails the statement with `InvalidTemporalLiteral` (§9.8); the same text bound as a parameter matches nothing.
+- A number meets a DATE or DATETIME the way MySQL compares them, in a literal comparison or a column pair (`predicate.placeTemporalNumber`). A number reads as a datetime by its size, as MySQL's `number_to_datetime` does: `YYMMDD`, `YYYYMMDD`, `YYMMDDhhmmss` or `YYYYMMDDhhmmss`, with any fraction as microseconds. A DATE column takes the datetime's day, so `d = 20260926000001` matches 2026-09-26. A zero month or day, or a day past its month's end (`20260900`, `20260230`), lies just before the next real day. Any other number (`2026`, a month of 13, an hour of 25) is compared with each row's own number (YYYYMMDD or YYYYMMDDhhmmss). A number column compared with a DATE or DATETIME reads the temporal as its number. Join keys, subquery results and correlated keys never pair a number with a temporal: the statement fails (`PredicateTypeMismatch`, or `JoinKeyTypeMismatch` for a join key).
 
 So `code = 12` matches `'12'`, `'12.0'` and `' 12 '` but not `'12abc'`. A
 text column compared with a number is evaluated row by row, with no zone-map
@@ -100,6 +101,10 @@ MySQL DDL type names without a type of their own map onto the table above:
 - `YEAR` is `SMALLINT`.
 - `TIME` is `STRING`, holding the `HH:MM:SS[.ffffff]` text.
 - `ENUM` and `SET` are `STRING`; their label lists are not enforced.
+
+A TIME function (`HOUR`, `TIME_TO_SEC`, `TIME`, `TIMEDIFF`, `ADDTIME` and the rest) reads a number argument as MySQL does. It reads the `HHMMSS` digits, or a DATETIME from 14 digits on. A number past 838:59:59, or one whose minute or second is past 59, is no TIME and gives NULL. Text past the range clamps to 838:59:59 instead.
+
+`NOW()` and its synonyms (`CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `SYSDATE`, `UTC_TIMESTAMP`) read the clock once per statement. In the MySQL dialect the bare forms give whole seconds and `NOW(n)` truncates to `n` fraction digits, as MySQL does. The other dialects keep microseconds. A column's `DEFAULT CURRENT_TIMESTAMP` also keeps microseconds, since a DATETIME stores no declared precision.
 
 ### 3.2 Schema and order key
 
@@ -179,6 +184,8 @@ an integer, since BIT columns are integers here. A charset introducer
 (`_utf8mb4'…'`, `_binary X'…'`) is dropped, and one naming a charset other
 than UTF-8 or binary admits only ASCII text, since thinDB does not transcode.
 Adjacent string literals concatenate (`'a' 'b'` is `'ab'`).
+
+A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
 
 **`a DIV b` with a DOUBLE or DECIMAL operand** divides exactly, as MySQL
 does, reading a double as its shortest digits, and truncates the quotient
