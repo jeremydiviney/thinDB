@@ -474,12 +474,7 @@ pub const Table = struct {
         try self.ensureUsable();
         const before_count: usize = @intCast(self.memtable.row_count);
         try self.appendBatchLocked(batch_schema, views, row_count);
-        var wal_target: ?u64 = null;
-        if (self.wal) |*w| {
-            wal_target = try w.appendInsert(self.memtable, before_count, @intCast(self.memtable.row_count));
-        }
-        try self.settleInsertLocked();
-        return wal_target;
+        return self.commitInsertLocked(before_count);
     }
 
     /// The memtable half of a columnar insert; the caller logs it.
@@ -497,13 +492,29 @@ pub const Table = struct {
         }
     }
 
-    /// Follow-up to a logged insert: last-writer-wins on unique keys, then
-    /// the auto-flush triggers.
-    fn settleInsertLocked(self: *Table) !void {
-        if (self.schema.unique) {
-            try @import("upsert.zig").applyUpsertResolution(self);
+    /// Log the memtable rows from `before_count` on and resolve their keys
+    /// (last writer wins on a unique table). Up to the log record a failure
+    /// takes the rows back out, leaving the table as it was. After it, only
+    /// a tombstone write can fail, and that fences the table so a reopen
+    /// replays the log.
+    fn commitInsertLocked(self: *Table, before_count: usize) !?u64 {
+        var resolution: upsert_mod.Resolution = .{};
+        defer resolution.deinit(self.allocator);
+        var wal_target: ?u64 = null;
+        {
+            errdefer {
+                self.memtable.truncate(before_count);
+                if (self.schema.unique) upsert_mod.resetIndex(self);
+            }
+            if (self.schema.unique) resolution = try upsert_mod.prepareResolution(self, self.memtable, self.memtable_gen);
+            if (self.wal) |*w| wal_target = try w.appendInsert(self.memtable, before_count, @intCast(self.memtable.row_count));
         }
+        upsert_mod.commitResolution(self, &resolution) catch |err| {
+            self.requireRecovery();
+            return err;
+        };
         try self.maybeAutoFlushLocked();
+        return wal_target;
     }
 
     /// Rows one UPDATE or DELETE batch removes: memtable rows (`keep[i]`
@@ -517,7 +528,11 @@ pub const Table = struct {
     /// Apply one UPDATE or DELETE batch: remove `replaced` and insert `rows`
     /// (none for a DELETE) in its place. Both halves go into one `replace`
     /// WAL record before either is applied, so recovery can't keep the delete
-    /// and lose the rows (#48).
+    /// and lose the rows (#48). The batch is staged first, so a failure up
+    /// to the record leaves the table as it was: the memtable rows it keeps
+    /// in a private clone, room for its segment offsets, and its new rows
+    /// past the live memtable's end. After the record, as for an insert, only
+    /// a tombstone write can fail, and that fences the table.
     /// Segment offsets wait in `wal_tombstones` for
     /// `mergeLoggedTombstonesLocked`. Returns the WAL offset to await.
     pub fn replaceRowsLocked(
@@ -527,24 +542,53 @@ pub const Table = struct {
         row_count: usize,
     ) !?u64 {
         try self.ensureUsable();
-        var wal_target: ?u64 = null;
-        if (self.wal) |*w| wal_target = switch (replaced) {
-            .memtable => |m| try w.appendReplace(self.schema.columns, m.rows, m.row_count, 0, &.{}, rows, row_count),
-            .segment => |s| try w.appendReplace(self.schema.columns, &.{}, 0, s.id, s.offsets, rows, row_count),
-        };
+        var staged: ?*engine.Memtable = null;
+        defer if (staged) |mt| mt.release();
         switch (replaced) {
-            .memtable => |m| if (try self.memtable.cloneWithRetainedRows(self.allocator, m.keep)) |kept| {
-                self.installMemtableLocked(kept);
-            },
-            .segment => |s| try engine.wal.addSegmentTombstones(self.allocator, &self.wal_tombstones, s.id, s.offsets),
+            .memtable => |m| staged = try self.memtable.cloneWithRetainedRows(self.allocator, m.keep),
+            .segment => |s| try engine.wal.reserveSegmentTombstones(self.allocator, &self.wal_tombstones, s.id, s.offsets.len),
         }
-        if (row_count > 0) {
-            const views = try self.allocator.alloc(storage.ColumnView, rows.len);
-            defer self.allocator.free(views);
-            for (rows, views) |*store, *view| view.* = store.view();
-            try self.appendBatchLocked(self.schema.columns, views, row_count);
-            try self.settleInsertLocked();
+        const before_count: usize = @intCast(self.memtable.row_count);
+        var resolution: upsert_mod.Resolution = .{};
+        defer resolution.deinit(self.allocator);
+        var wal_target: ?u64 = null;
+        {
+            errdefer {
+                if (staged == null) self.memtable.truncate(before_count);
+                if (self.schema.unique) upsert_mod.resetIndex(self);
+            }
+            if (row_count > 0) {
+                const views = try self.allocator.alloc(storage.ColumnView, rows.len);
+                defer self.allocator.free(views);
+                for (rows, views) |*store, *view| view.* = store.view();
+                if (staged) |mt| {
+                    try mt.insertColumnarBatch(self.schema.columns, views, row_count);
+                } else {
+                    try self.appendBatchLocked(self.schema.columns, views, row_count);
+                }
+                if (self.schema.unique) resolution = if (staged) |mt|
+                    try upsert_mod.prepareResolution(self, mt, self.memtable_gen + 1)
+                else
+                    try upsert_mod.prepareResolution(self, self.memtable, self.memtable_gen);
+            }
+            if (self.wal) |*w| wal_target = switch (replaced) {
+                .memtable => |m| try w.appendReplace(self.schema.columns, m.rows, m.row_count, 0, &.{}, rows, row_count),
+                .segment => |s| try w.appendReplace(self.schema.columns, &.{}, 0, s.id, s.offsets, rows, row_count),
+            };
         }
+        if (staged) |mt| {
+            staged = null;
+            self.installMemtableLocked(mt);
+        }
+        switch (replaced) {
+            .memtable => {},
+            .segment => |s| engine.wal.addSegmentTombstonesAssumeCapacity(&self.wal_tombstones, s.id, s.offsets),
+        }
+        upsert_mod.commitResolution(self, &resolution) catch |err| {
+            self.requireRecovery();
+            return err;
+        };
+        if (row_count > 0) try self.maybeAutoFlushLocked();
         return wal_target;
     }
 
@@ -572,6 +616,7 @@ pub const Table = struct {
     pub fn mergeLoggedTombstonesLocked(self: *Table) !void {
         const sync = self.syncEnabled();
         for (self.wal_tombstones.keys(), self.wal_tombstones.values()) |segment_id, offsets| {
+            if (offsets.items.len == 0) continue;
             const listed = for (self.manifest.segments.items) |entry| {
                 if (entry.segment_id == segment_id) break true;
             } else false;
@@ -593,21 +638,10 @@ pub const Table = struct {
         const was_empty = self.memtable.isEmpty();
         const before_count: usize = @intCast(self.memtable.row_count);
         try self.memtable.insertRows(rows);
-        const after_count: usize = @intCast(self.memtable.row_count);
-
-        var wal_target: ?u64 = null;
-        if (self.wal) |*w| {
-            wal_target = try w.appendInsert(self.memtable, before_count, after_count);
-        }
-
         if (was_empty and !self.memtable.isEmpty()) {
             self.first_write_ts = Io.Clock.awake.now(self.io);
         }
-        if (self.schema.unique) {
-            try @import("upsert.zig").applyUpsertResolution(self);
-        }
-        try self.maybeAutoFlushLocked();
-        return wal_target;
+        return self.commitInsertLocked(before_count);
     }
 
     /// Retire-replace the active memtable. EVERY swap must route through
@@ -896,6 +930,19 @@ pub const Table = struct {
             self.recordIoFailure(err);
             return err;
         };
+    }
+
+    /// Replace segment `id`'s tombstone file with `bytes` from
+    /// `storage.tombstone.encodeMerged`, as `mergeTombstones` would.
+    pub fn writeTombstoneFile(self: *Table, id: u64, bytes: []const u8) !void {
+        try self.ensureUsable();
+        const sync = self.syncEnabled();
+        if (sync) if (self.wal) |*w| try w.awaitAllDurable(self.io);
+        storage.tombstone.writeEncoded(self.io, self.segments_dir, id, bytes, sync) catch |err| {
+            self.recordIoFailure(err);
+            return err;
+        };
+        self.seg_handles.invalidateTombstones(self.allocator, id);
     }
 
     fn replaceWal(self: *Table) !void {

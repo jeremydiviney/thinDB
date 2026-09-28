@@ -321,6 +321,10 @@ pub const Schema = struct {
             return existing;
         }
 
+        // A table this call creates goes again if opening it fails part way,
+        // so a failed CREATE TABLE leaves no table behind.
+        const creating = !try self.tableOnDisk(name);
+        errdefer if (creating) self.schema_dir.deleteTree(self.io, name) catch {};
         const t = try Table.open(
             self.allocator,
             self.io,
@@ -334,6 +338,20 @@ pub const Schema = struct {
 
         try self.tables.put(t.name, t);
         return t;
+    }
+
+    /// Whether `name` has a table directory holding its schema.
+    fn tableOnDisk(self: *Schema, name: []const u8) !bool {
+        var dir = self.schema_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close(self.io);
+        dir.access(self.io, "schema.bin", .{ .read = true }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     /// Open an existing table by name. The schema is loaded from the

@@ -175,6 +175,17 @@ pub const StringStore = struct {
         return .{ .offsets = self.offsets.items, .bytes = self.bytes.items };
     }
 
+    /// Drop the values from row `rows` on, keeping the capacity.
+    pub fn truncate(self: *StringStore, rows: usize) void {
+        if (self.wide_offsets) |*wo| {
+            wo.shrinkRetainingCapacity(rows + 1);
+            self.bytes.shrinkRetainingCapacity(@intCast(wo.items[rows]));
+            return;
+        }
+        self.offsets.shrinkRetainingCapacity(rows + 1);
+        self.bytes.shrinkRetainingCapacity(self.offsets.items[rows]);
+    }
+
     pub fn clear(self: *StringStore) void {
         self.bytes.clearRetainingCapacity();
         if (self.wide_offsets) |*wo| {
@@ -260,6 +271,18 @@ pub const ColumnStore = struct {
     pub fn clear(self: *ColumnStore) void {
         self.data.clear();
         if (self.nulls) |*n| n.clearRetainingCapacity();
+    }
+
+    /// Drop the rows from `rows` on, keeping the capacity. The validity bits
+    /// past the end go back to 0, as the append paths expect.
+    pub fn truncate(self: *ColumnStore, rows: usize) void {
+        self.data.truncate(rows);
+        const nulls = self.nullsPtr() orelse return;
+        nulls.shrinkRetainingCapacity(@min(nulls.items.len, (rows + 7) >> 3));
+        const partial: u3 = @intCast(rows & 7);
+        if (partial != 0 and nulls.items.len > rows >> 3) {
+            nulls.items[rows >> 3] &= (@as(u8, 1) << partial) - 1;
+        }
     }
 
     /// Append a single validity bit for the row at index `row` (= current row
@@ -722,6 +745,13 @@ pub const DataStore = union(TypeTag) {
         }
     }
 
+    pub fn truncate(self: *DataStore, rows: usize) void {
+        switch (self.*) {
+            .varchar, .string, .char, .json => |*s| s.truncate(rows),
+            inline else => |*l| l.shrinkRetainingCapacity(rows),
+        }
+    }
+
     /// Append a placeholder/null value (zero for ints, false for bool,
     /// empty for strings). Used when the row's actual value is NULL — the
     /// data slot still has to be filled to keep row indices aligned.
@@ -771,3 +801,32 @@ pub const DataStore = union(TypeTag) {
         }
     }
 };
+
+test "truncate leaves a column as if the dropped rows were never appended" {
+    const allocator = std.testing.allocator;
+    const values = [_][]const u8{ "a", "", "bcd", "ef", "g", "hij", "", "k", "lm", "nop", "q" };
+    inline for (.{ 0, 3, 8, 10 }) |keep| {
+        var truncated = try ColumnStore.init(allocator, .{ .string = {} }, true);
+        defer truncated.deinit(allocator);
+        var fresh = try ColumnStore.init(allocator, .{ .string = {} }, true);
+        defer fresh.deinit(allocator);
+        for (values, 0..) |v, i| {
+            try truncated.data.string.appendValue(allocator, v);
+            try truncated.appendValidBit(allocator, i, i % 3 != 1);
+        }
+        truncated.truncate(keep);
+        for (values[0..keep], 0..) |v, i| {
+            try fresh.data.string.appendValue(allocator, v);
+            try fresh.appendValidBit(allocator, i, i % 3 != 1);
+        }
+        for (keep..keep + 2) |i| {
+            try truncated.data.string.appendValue(allocator, "zz");
+            try truncated.appendValidBit(allocator, i, true);
+            try fresh.data.string.appendValue(allocator, "zz");
+            try fresh.appendValidBit(allocator, i, true);
+        }
+        try std.testing.expectEqualSlices(u32, fresh.data.string.offsets.items, truncated.data.string.offsets.items);
+        try std.testing.expectEqualStrings(fresh.data.string.bytes.items, truncated.data.string.bytes.items);
+        try std.testing.expectEqualSlices(u8, fresh.nulls.?.items, truncated.nulls.?.items);
+    }
+}
