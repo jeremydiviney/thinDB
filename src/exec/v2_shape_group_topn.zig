@@ -1544,10 +1544,10 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 // like a 64-bit int (mantissa) and recovers scale at emit.
                 if (input_type == .decimal128) return traceDecline(request, "decimal128 aggregate");
                 // Temporal MIN/MAX folds as the day/µs int; SUM/AVG over a
-                // temporal is a dialect error (validateAggFn) — decline here
-                // too so the silo never emits a nonsense µs sum.
-                if ((input_type == .date or input_type == .datetime) and agg.func != .min and agg.func != .max)
-                    return traceDecline(request, "temporal sum/avg");
+                // temporal reads its YYYYMMDD number in MySQL and is an error
+                // elsewhere, which the generic group-by handles.
+                if (aggregate.readsTemporalAsNumber(agg.func, input_type))
+                    return traceDecline(request, "temporal read as a number");
                 // SUM/AVG over a 64-bit integer accumulates exactly into i128
                 // (a BIGINT SUM wraps at emit, AVG divides the exact sum): the
                 // aggregate takes TWO state slots (lo, hi) and runs in the
@@ -1605,6 +1605,8 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
             .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
                 const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
+                if (aggregate.readsTemporalAsNumber(agg.func, input_type))
+                    return traceDecline(request, "temporal read as a number");
                 // Welford state: non-null count + mean + M2, three slots.
                 if (next_numeric_state_index + 2 > MAX_AGGS) return traceDecline(request, "aggregate state count");
                 const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "aggregate input");

@@ -624,7 +624,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .leaf_col_col => |lc| {
             const li = types.findColumn(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = types.findColumn(schema, lc.right) orelse return Error.ColumnNotFound;
-            if (!typesComparable(schema[li].type, schema[ri].type)) return Error.PredicateTypeMismatch;
+            if (!typesComparable(schema[li].type, schema[ri].type) and !temporalBesideNumber(schema[li].type, schema[ri].type)) return Error.PredicateTypeMismatch;
         },
         .is_null, .is_not_null => |col_name| {
             _ = types.findColumn(schema, col_name) orelse return Error.ColumnNotFound;
@@ -794,6 +794,17 @@ fn rejectUnreadTemporal(col_type: types.Type, text: []const u8, from_statement: 
     return Error.InvalidTemporalLiteral;
 }
 
+/// A number constant against a DATE or DATETIME, or a DATE or DATETIME
+/// constant against a number, that a comparison outside a `.leaf` holds
+/// (NULLIF's), placed as `validateExpr` places a leaf's: the value of
+/// `col_type` it names, or null when no value of the type equals it.
+pub fn placeComparedValue(val: Value, col_type: types.Type) ?Value {
+    return switch (placeLiteral(val, col_type)) {
+        .exact => |v| v,
+        else => null,
+    };
+}
+
 /// Text a comparison outside a `.leaf` holds against a value of `col_type`
 /// (NULLIF's), placed as `validateExpr` places a leaf's: the value it names,
 /// or null when no value of the type equals it.
@@ -900,10 +911,15 @@ fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
         var exact = val;
         if (coerceValue(&exact, col_type)) |_| return .{ .exact = exact } else |_| {}
     }
+    if (kind == .temporal) if (numberDigits(val)) |n| return placeTemporalNumber(n, col_type);
     const lit: Scalar = switch (val) {
         .text => |t| textScalar(t, col_type) orelse return if (kind == .temporal) .not_temporal else .null_text,
         // No scale to place it by: only a decimal column (coerceValue) takes it.
         .decimal64, .decimal128 => return .incomparable,
+        // A number column meets a DATE or DATETIME as its number, as MySQL
+        // compares them.
+        .date => |days| if (kind == .number) .{ .integer = scalar_fn_common.dateNumber(days) } else valueScalar(val, 0),
+        .datetime => |micros| if (kind == .number) .{ .decimal = scalar_fn_common.datetimeNumber(micros) } else valueScalar(val, 0),
         else => valueScalar(val, 0),
     };
     if (!scalarComparableTo(lit, col_type)) {
@@ -920,6 +936,78 @@ fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
         .varchar, .string, .char, .json => .{ .exact = .{ .text = lit.text } },
         .boolean, .uuid => .incomparable,
     };
+}
+
+/// A number literal's exact digits; null for any other value, and for a
+/// decimal, which carries no scale here.
+fn numberDigits(val: Value) ?ScaledInt {
+    return switch (valueScalar(val, 0)) {
+        .integer => |v| .{ .m = v, .s = 0 },
+        .float => |v| scalar_fn_common.floatDigits(v),
+        .decimal, .micros, .text, .uuid => null,
+    };
+}
+
+/// A number against a DATE or DATETIME column, as MySQL compares them. A
+/// number that reads as datetime fields (`numberDatetimeFields`) is that
+/// value, a DATE taking its day; fields no day has (`20260900`) lie between
+/// the latest value before them and the next. Any other number compares with
+/// each row's own number (YYYYMMDD, YYYYMMDDhhmmss), which orders as the rows
+/// do, so it too lands between two values.
+fn placeTemporalNumber(n: ScaledInt, col_type: types.Type) LiteralPlacement {
+    if (scalar_fn_time.numberDatetimeFields(n)) |f| {
+        const clock = (@as(i64, f.hour) * 3600 + f.minute * 60 + f.second) * std.time.us_per_s + f.micros;
+        return placeFields(.{ f.year, f.month, f.day }, col_type, clock);
+    }
+    const whole = @divFloor(n.m, decimal_pow10(n.s));
+    const clock_digits: i128 = if (col_type == .datetime) 1_000_000 else 1;
+    const ymd = @divFloor(whole, clock_digits);
+    if (ymd < 10101) return .{ .beyond = .below };
+    if (ymd > 99991231) return .{ .beyond = .above };
+    const hms: i64 = @intCast(@mod(whole, clock_digits));
+    const hour = @divFloor(hms, 10_000);
+    const minute = @mod(@divFloor(hms, 100), 100);
+    const second = @mod(hms, 100);
+    const clock_past_range = hour > 23 or minute > 59 or second > 59;
+    // A time of day past its range lies after the day's last second.
+    const clock: i64 = if (clock_past_range)
+        std.time.us_per_day - std.time.us_per_s
+    else
+        (hour * 3600 + minute * 60 + second) * std.time.us_per_s;
+    const year: i32 = @intCast(@divFloor(ymd, 10000));
+    const date_fields: struct { i32, u32, u32 } = .{ year, @intCast(@mod(@divFloor(ymd, 100), 100)), @intCast(@mod(ymd, 100)) };
+    const placed = placeFields(date_fields, col_type, clock);
+    if (!clock_past_range or placed != .exact) return placed;
+    const last_second = placed.exact.datetime;
+    return .{ .between = .{ .lo = .{ .datetime = last_second + std.time.us_per_s - 1 }, .hi = .{ .datetime = last_second + std.time.us_per_s } } };
+}
+
+/// A year, month and day against a DATE or DATETIME column, at `clock`
+/// microseconds into the day. Fields no day has lie after the latest value
+/// before them: a zero month after the year before, a month past 12 after
+/// its year, a zero day after the month before, and a day past its month's
+/// end after that month.
+fn placeFields(f: struct { i32, u32, u32 }, col_type: types.Type, clock: i64) LiteralPlacement {
+    const us_per_day = std.time.us_per_day;
+    const year, const month, const day = f;
+    if (scalar_fn_common.validDate(year, month, day)) {
+        const days = scalar_fn_common.ymdToDays(year, month, day);
+        if (col_type == .date) return .{ .exact = .{ .date = days } };
+        return .{ .exact = .{ .datetime = @as(i64, days) * us_per_day + clock } };
+    }
+    const before: struct { i32, u32, u32 } = if (month == 0 or (month == 1 and day == 0))
+        .{ year - 1, 12, 31 }
+    else if (month > 12)
+        .{ year, 12, 31 }
+    else if (day == 0)
+        .{ year, month - 1, scalar_fn_common.lastDayOfMonth(year, month - 1) }
+    else
+        .{ year, month, scalar_fn_common.lastDayOfMonth(year, month) };
+    if (before[0] < 0) return .{ .beyond = .below };
+    const lo_day = scalar_fn_common.ymdToDays(before[0], before[1], before[2]);
+    if (col_type == .date) return .{ .between = .{ .lo = .{ .date = lo_day }, .hi = .{ .date = lo_day + 1 } } };
+    const next_midnight = (@as(i64, lo_day) + 1) * us_per_day;
+    return .{ .between = .{ .lo = .{ .datetime = next_midnight - 1 }, .hi = .{ .datetime = next_midnight } } };
 }
 
 /// Text compared against a column: it meets a number or a temporal by
@@ -2007,7 +2095,10 @@ pub fn comparisonKind(ty: types.Type) ComparisonKind {
 /// THE comparison rule, as StarRocks and MySQL apply it: numbers compare by
 /// value across integer, decimal and float types; a DATE meets a DATETIME at
 /// midnight; text meets a number or a temporal by parsing (text that doesn't
-/// parse compares as NULL); text against text is bytewise.
+/// parse compares as NULL); text against text is bytewise. A number meets a
+/// DATE or DATETIME only as a literal or a column pair, as MySQL compares
+/// them (`placeTemporalNumber`, `temporalBesideNumber`); a join key, a
+/// subquery's column or a correlated key never pairs the two.
 pub fn typesComparable(a: types.Type, b: types.Type) bool {
     const ka = comparisonKind(a);
     const kb = comparisonKind(b);
@@ -2160,11 +2251,32 @@ fn sameRepresentation(a: types.Type, b: types.Type) bool {
 pub fn evaluateColColMask(left: ColumnView, left_type: types.Type, right: ColumnView, right_type: types.Type, op: PredicateOp, n: usize, mask: []bool) void {
     if (sameRepresentation(left_type, right_type)) {
         sameRepresentationMask(left, right, op, n, mask);
+    } else if (temporalBesideNumber(left_type, right_type)) {
+        for (0..n) |i| mask[i] = orderMatches(numberOrder(cellNumber(left, left_type, i), cellNumber(right, right_type, i)), op);
     } else {
         for (0..n) |i| mask[i] = orderMatches(scalarOrder(cellScalar(left, left_type, i), cellScalar(right, right_type, i)), op);
     }
     clearNullRows(left.nulls, mask[0..n]);
     clearNullRows(right.nulls, mask[0..n]);
+}
+
+/// A DATE or DATETIME column against a number column, which MySQL compares
+/// by the temporal's number (`cellNumber`). Not a join key pair: the two
+/// hash apart.
+pub fn temporalBesideNumber(a: types.Type, b: types.Type) bool {
+    const ka = comparisonKind(a);
+    const kb = comparisonKind(b);
+    return (ka == .temporal and kb == .number) or (ka == .number and kb == .temporal);
+}
+
+/// Row `i` as a number: a DATE as YYYYMMDD, a DATETIME as
+/// YYYYMMDDhhmmss.ffffff.
+fn cellNumber(view: ColumnView, ty: types.Type, i: usize) Scalar {
+    return switch (view.data) {
+        .date => |s| .{ .integer = scalar_fn_common.dateNumber(s[i]) },
+        .datetime => |s| .{ .decimal = scalar_fn_common.datetimeNumber(s[i]) },
+        else => cellScalar(view, ty, i),
+    };
 }
 
 fn sameRepresentationMask(left: ColumnView, right: ColumnView, op: PredicateOp, n: usize, mask: []bool) void {
@@ -2652,8 +2764,59 @@ test "placeLiteral lands each literal on the column's values" {
     try t.expectEqual(Side.below, placeLiteral(.{ .double = -32768.5 }, .smallint).beyond);
 
     try t.expect(placeLiteral(.{ .text = "12abc" }, .int) == .null_text);
-    try t.expect(placeLiteral(.{ .date = 1 }, .int) == .incomparable);
-    try t.expect(placeLiteral(.{ .bigint = 1 }, .date) == .incomparable);
+    try t.expect(placeLiteral(.{ .uuid = 1 }, .int) == .incomparable);
+    try t.expect(placeLiteral(.{ .bigint = 1 }, .uuid) == .incomparable);
+}
+
+test "placeLiteral reads a number against a DATE or DATETIME as MySQL does" {
+    const t = std.testing;
+    const us_per_day = std.time.us_per_day;
+    const days = scalar_fn_common.ymdToDays;
+    const sep26 = days(2026, 9, 26);
+    const clock: i64 = (10 * 3600 + 5 * 60 + 3) * std.time.us_per_s;
+    const at_sep26: i64 = @as(i64, sep26) * us_per_day;
+    const exact = .{
+        .{ Value{ .bigint = 20260926 }, types.Type.date, Value{ .date = sep26 } },
+        .{ Value{ .int = 260926 }, types.Type.date, Value{ .date = sep26 } },
+        .{ Value{ .bigint = 20260926000001 }, types.Type.date, Value{ .date = sep26 } },
+        .{ Value{ .double = 20260926.9 }, types.Type.date, Value{ .date = sep26 } },
+        .{ Value{ .bigint = 20260926 }, types.Type.datetime, Value{ .datetime = at_sep26 } },
+        .{ Value{ .bigint = 20260926100503 }, types.Type.datetime, Value{ .datetime = at_sep26 + clock } },
+        .{ Value{ .double = 20260926100503.5 }, types.Type.datetime, Value{ .datetime = at_sep26 + clock + 500_000 } },
+        // A number column meets a date or datetime as its number.
+        .{ Value{ .date = sep26 }, types.Type.int, Value{ .int = 20260926 } },
+        .{ Value{ .datetime = at_sep26 + clock }, types.Type.bigint, Value{ .bigint = 20260926100503 } },
+    };
+    inline for (exact) |c| try t.expectEqual(c[2], placeLiteral(c[0], c[1]).exact);
+
+    const between = .{
+        // No day has a zero day or month: they lie before the month or year.
+        .{ Value{ .bigint = 20260900 }, types.Type.date, Value{ .date = days(2026, 8, 31) }, Value{ .date = days(2026, 9, 1) } },
+        .{ Value{ .bigint = 260900 }, types.Type.date, Value{ .date = days(2026, 8, 31) }, Value{ .date = days(2026, 9, 1) } },
+        .{ Value{ .bigint = 20260231 }, types.Type.date, Value{ .date = days(2026, 2, 28) }, Value{ .date = days(2026, 3, 1) } },
+        .{ Value{ .bigint = 20010100 }, types.Type.datetime, Value{ .datetime = @as(i64, days(2001, 1, 1)) * us_per_day - 1 }, Value{ .datetime = @as(i64, days(2001, 1, 1)) * us_per_day } },
+        // No datetime reads: compared with each row's number.
+        .{ Value{ .bigint = 20261399 }, types.Type.date, Value{ .date = days(2026, 12, 31) }, Value{ .date = days(2027, 1, 1) } },
+        .{ Value{ .bigint = 20260926250000 }, types.Type.datetime, Value{ .datetime = at_sep26 + us_per_day - 1 }, Value{ .datetime = at_sep26 + us_per_day } },
+        .{ Value{ .datetime = at_sep26 + clock + 500_000 }, types.Type.bigint, Value{ .bigint = 20260926100503 }, Value{ .bigint = 20260926100504 } },
+    };
+    inline for (between) |c| {
+        const got = placeLiteral(c[0], c[1]).between;
+        try t.expectEqual(c[2], got.lo);
+        try t.expectEqual(c[3], got.hi);
+    }
+
+    const beyond = .{
+        .{ Value{ .bigint = 2026 }, types.Type.date, Side.below },
+        .{ Value{ .bigint = 0 }, types.Type.date, Side.below },
+        .{ Value{ .bigint = -20260926 }, types.Type.date, Side.below },
+        .{ Value{ .boolean = true }, types.Type.date, Side.below },
+        .{ Value{ .bigint = 99 }, types.Type.datetime, Side.below },
+        .{ Value{ .bigint = 99991232 }, types.Type.date, Side.above },
+        .{ Value{ .bigint = 99991231240000 }, types.Type.date, Side.above },
+        .{ Value{ .date = sep26 }, types.Type.smallint, Side.above },
+    };
+    inline for (beyond) |c| try t.expectEqual(c[2], placeLiteral(c[0], c[1]).beyond);
 }
 
 test "placeLiteral reads text against a DATE or DATETIME as MySQL does" {

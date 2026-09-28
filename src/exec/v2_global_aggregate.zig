@@ -1145,7 +1145,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                         p.is_float = false;
                         p.output_type = ctyp;
                     } else {
-                        if (!aggInputSupported(ctyp)) return declineFree(allocator, plans, &needed);
+                        if (!aggInputSupported(ctyp) or aggregate.readsTemporalAsNumber(agg.func, ctyp)) return declineFree(allocator, plans, &needed);
                         const out_type = aggregate.aggOutputTypeFor(agg, ctyp) catch return declineFree(allocator, plans, &needed);
                         p.is_float = isFloatType(ctyp);
                         if (ctyp.decimalSpec()) |sp| p.input_scale = sp.s;
