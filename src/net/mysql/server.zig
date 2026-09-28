@@ -3938,7 +3938,7 @@ fn handleStmtPrepare(
         const schema = stmt.column_schema.?;
         for (schema) |col| {
             coldef.clearRetainingCapacity();
-            try result.appendColumnDef(allocator, &coldef, session.current_db, "", col);
+            try result.appendColumnDef(allocator, &coldef, session.current_db, "", col, .binary);
             try packet.writePacket(w, seq_id, coldef.items);
             seq_id +%= 1;
         }
@@ -4133,7 +4133,7 @@ fn handleStmtExecute(
     defer coldef.deinit(allocator);
     for (schema) |col| {
         coldef.clearRetainingCapacity();
-        try result.appendColumnDef(allocator, &coldef, session.current_db, "", col);
+        try result.appendColumnDef(allocator, &coldef, session.current_db, "", col, .binary);
         try packet.writePacket(w, seq_id, coldef.items);
         seq_id +%= 1;
     }

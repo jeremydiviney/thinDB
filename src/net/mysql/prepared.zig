@@ -495,9 +495,7 @@ fn appendBinaryCell(
             try out.appendSlice(allocator, b[0..8]);
         },
         .largeint => |s| {
-            // i128 doesn't have a stable MySQL binary type. Render as
-            // ASCII via NEWDECIMAL-style lenenc string so the client
-            // sees a meaningful value.
+            // A binary result declares the column DECIMAL (`result.mysqlTypeOf`).
             var buf: [48]u8 = undefined;
             const text = try std.fmt.bufPrint(&buf, "{d}", .{s[row]});
             try packet.appendLenEncString(allocator, out, text);

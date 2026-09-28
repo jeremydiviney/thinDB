@@ -10,6 +10,8 @@
 //!   - `/`, DIV and MOD by zero return NULL
 //!   - integer result types and wrapping match StarRocks (DESIGN.md §3.4)
 //!   - scientific-notation and leading-dot literals are DOUBLE
+//!   - bit operators: signed as in StarRocks, BIGINT UNSIGNED in MySQL
+//!   - BIT_COUNT, BIN and CONV, and integers of any width written as text
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -406,9 +408,10 @@ test "binary arith: scientific-notation and leading-dot literals are DOUBLE" {
 }
 
 test "binary arith: bitwise operators, shifts and MOD bind as in MySQL" {
-    // Values probed against MySQL 8.4, except that the bits are signed
-    // two's complement, as in StarRocks and DuckDB: ~10 is -11 (MySQL reads
-    // it unsigned) and >> keeps the sign.
+    // Values probed against MySQL 8.4, except that outside the MySQL
+    // dialect the operators are StarRocks' bit functions, whose bits are
+    // signed two's complement as in DuckDB and PG: ~10 is -11 and >> keeps
+    // the sign. MySQL's unsigned reading is tested below.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -443,22 +446,156 @@ test "binary arith: bitwise operators, shifts and MOD bind as in MySQL" {
         try std.testing.expectEqualSlices(i64, c[1], got);
     }
 
-    // `^` is XOR on MySQL, binding tighter than `*`, and exponentiation
-    // on PG and DuckDB.
-    const mysql_cases = .{
-        .{ "SELECT 5 ^ 3 FROM t WHERE id = 1", 6 },
-        .{ "SELECT 2 * 3 ^ 1 FROM t WHERE id = 1", 4 },
+    const pg_cases = .{
+        .{ "SELECT ~qty FROM t ORDER BY id", &[_]i64{ -11, -21, -31 } },
+        .{ "SELECT -qty >> 1 FROM t ORDER BY id", &[_]i64{ -5, -10, -15 } },
+        .{ "SELECT -qty | 0 FROM t ORDER BY id", &[_]i64{ -10, -20, -30 } },
     };
-    inline for (mysql_cases) |c| {
-        var q = try helpers.runSqlMysql(allocator, db, c[0]);
+    inline for (pg_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        var q = try helpers.runSqlDialect(allocator, db, c[0], .postgres);
         defer q.deinit();
         const got = try collectBigint(allocator, &q, 0);
         defer allocator.free(got);
-        try std.testing.expectEqualSlices(i64, &.{c[1]}, got);
+        try std.testing.expectEqualSlices(i64, c[1], got);
     }
+
+    // `^` is XOR on MySQL (tested below) and exponentiation on PG and DuckDB.
     var pow = try runSql(allocator, db, "SELECT 2 ^ 3 FROM t WHERE id = 1");
     defer pow.deinit();
     const powered = try collectDouble(allocator, &pow, 0);
     defer allocator.free(powered);
     try std.testing.expectEqualSlices(f64, &.{8.0}, powered);
+}
+
+/// `sql`'s first column, run as the MySQL wire runs it, is `want` as text.
+fn expectMysqlText(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: []const ?[]const u8) !void {
+    errdefer std.debug.print("case failed: {s}\n", .{sql});
+    var q = try helpers.runSqlMysqlSession(allocator, db, sql);
+    defer q.deinit();
+    try expectColumnText(allocator, &q, want);
+}
+
+fn expectColumnText(allocator: std.mem.Allocator, q: *RunResult, want: []const ?[]const u8) !void {
+    const got = try helpers.columnText(allocator, q);
+    defer helpers.freeStrings(allocator, got);
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        if (w) |text| {
+            try std.testing.expect(g != null);
+            try std.testing.expectEqualStrings(text, g.?);
+        } else try std.testing.expect(g == null);
+    }
+}
+
+test "binary arith: MySQL's bit operators read and return BIGINT UNSIGNED" {
+    // Values probed against MySQL 8.4 (#323).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    const cases = .{
+        .{ "SELECT ~qty FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT -qty >> 1 FROM t ORDER BY id", &[_]?[]const u8{ "9223372036854775803", "9223372036854775798", "9223372036854775793" } },
+        .{ "SELECT -qty | 0 FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551606", "18446744073709551596", "18446744073709551586" } },
+        .{ "SELECT qty & 12 FROM t ORDER BY id", &[_]?[]const u8{ "8", "4", "12" } },
+        .{ "SELECT qty ^ 5 FROM t ORDER BY id", &[_]?[]const u8{ "15", "17", "27" } },
+        .{ "SELECT qty << 60 FROM t ORDER BY id", &[_]?[]const u8{ "11529215046068469760", "4611686018427387904", "16140901064495857664" } },
+        .{ "SELECT ~qty & 255 FROM t ORDER BY id", &[_]?[]const u8{ "245", "235", "225" } },
+        // A double rounds half to even, a decimal half away from zero, and
+        // text reads as the integer it starts with.
+        .{ "SELECT price | 0 FROM t ORDER BY id", &[_]?[]const u8{ "2", "2", "4" } },
+        .{ "SELECT 2.5 | 0 FROM t WHERE id = 1", &[_]?[]const u8{"3"} },
+        .{ "SELECT '12abc' & 7 FROM t WHERE id = 1", &[_]?[]const u8{"4"} },
+        .{ "SELECT 0xFFFFFFFFFFFFFFFF & -2 FROM t WHERE id = 1", &[_]?[]const u8{"18446744073709551614"} },
+        .{ "SELECT 1 << 63 FROM t WHERE id = 1", &[_]?[]const u8{"9223372036854775808"} },
+        .{ "SELECT 1 << 64 FROM t WHERE id = 1", &[_]?[]const u8{"0"} },
+        .{ "SELECT 1 << -1 FROM t WHERE id = 1", &[_]?[]const u8{"0"} },
+        .{ "SELECT -1 >> 70 FROM t WHERE id = 1", &[_]?[]const u8{"0"} },
+        .{ "SELECT 5 ^ 3 FROM t WHERE id = 1", &[_]?[]const u8{"6"} },
+        .{ "SELECT 2 * 3 ^ 1 FROM t WHERE id = 1", &[_]?[]const u8{"4"} },
+        .{ "SELECT id FROM t WHERE ~qty > 18446744073709551590 ORDER BY id", &[_]?[]const u8{ "1", "2" } },
+        // The result keeps its value where it is compared, chosen or cast.
+        .{ "SELECT CAST(~qty AS SIGNED) FROM t ORDER BY id", &[_]?[]const u8{ "-11", "-21", "-31" } },
+        .{ "SELECT CAST(1 << 63 AS SIGNED) FROM t WHERE id = 1", &[_]?[]const u8{"-9223372036854775808"} },
+        .{ "SELECT IFNULL(~qty, 0) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT COALESCE(NULL, ~qty) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT NULLIF(~qty, ~10) FROM t ORDER BY id", &[_]?[]const u8{ null, "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT GREATEST(~qty, 1) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT LEAST(~qty, 18446744073709551600) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551600", "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT BIT_OR(qty & 12) FROM t", &[_]?[]const u8{"12"} },
+    };
+    inline for (cases) |c| try expectMysqlText(allocator, db, c[0], c[1]);
+}
+
+test "binary arith: BIT_COUNT, BIN and CONV read a value as MySQL does" {
+    // Values probed against MySQL 8.4 (#323).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    const cases = .{
+        .{ "SELECT BIT_COUNT(-1) FROM t WHERE id = 1", &[_]?[]const u8{"64"} },
+        .{ "SELECT BIT_COUNT(~qty) FROM t ORDER BY id", &[_]?[]const u8{ "62", "62", "60" } },
+        .{ "SELECT BIN(-1) FROM t WHERE id = 1", &[_]?[]const u8{"1" ** 64} },
+        .{ "SELECT BIN(qty) FROM t ORDER BY id", &[_]?[]const u8{ "1010", "10100", "11110" } },
+        // A number reaches BIN as its text, so a fraction is cut, not rounded.
+        .{ "SELECT BIN(price) FROM t ORDER BY id", &[_]?[]const u8{ "1", "10", "11" } },
+        .{ "SELECT BIN(TRUE) FROM t WHERE id = 1", &[_]?[]const u8{"1"} },
+        .{ "SELECT BIN(0x41) FROM t WHERE id = 1", &[_]?[]const u8{"1000001"} },
+        .{ "SELECT BIN('') FROM t WHERE id = 1", &[_]?[]const u8{null} },
+        .{ "SELECT CONV(qty * 10 + 5, 10, 16) FROM t ORDER BY id", &[_]?[]const u8{ "69", "CD", "131" } },
+        .{ "SELECT CONV(-1, 10, 16) FROM t WHERE id = 1", &[_]?[]const u8{"FFFFFFFFFFFFFFFF"} },
+        .{ "SELECT CONV('ff', 16, -10) FROM t WHERE id = 1", &[_]?[]const u8{"255"} },
+        .{ "SELECT CONV('8000000000000000', 16, -10) FROM t WHERE id = 1", &[_]?[]const u8{"-9223372036854775808"} },
+        .{ "SELECT CONV('-8000000000000001', -16, 10) FROM t WHERE id = 1", &[_]?[]const u8{"9223372036854775808"} },
+        .{ "SELECT CONV('zz', 36, 2) FROM t WHERE id = 1", &[_]?[]const u8{"10100001111"} },
+        .{ "SELECT CONV('12x', 10, 36) FROM t WHERE id = 1", &[_]?[]const u8{"C"} },
+        .{ "SELECT CONV(5, 1, 10) FROM t WHERE id = 1", &[_]?[]const u8{null} },
+        .{ "SELECT CONV(5, 10, 37) FROM t WHERE id = 1", &[_]?[]const u8{null} },
+    };
+    inline for (cases) |c| try expectMysqlText(allocator, db, c[0], c[1]);
+}
+
+test "binary arith: a LARGEINT keeps every digit, as text and cast to BIGINT" {
+    // #309: a LARGEINT reached text through DOUBLE, so
+    // 18446744073709551615 became 18446744073709552000.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    const mysql_cases = .{
+        .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 0 AS CHAR) FROM t WHERE id = 1", &[_]?[]const u8{"18446744073709551615"} },
+        .{ "SELECT CONCAT(~qty, '') FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
+        .{ "SELECT CONCAT_WS(',', ~0, 0xFFFFFFFFFFFFFFFF + 0) FROM t WHERE id = 1", &[_]?[]const u8{"18446744073709551615,18446744073709551615"} },
+        .{ "SELECT LENGTH(~qty) FROM t ORDER BY id", &[_]?[]const u8{ "20", "20", "20" } },
+    };
+    inline for (mysql_cases) |c| try expectMysqlText(allocator, db, c[0], c[1]);
+
+    const neutral_cases = .{
+        .{ "SELECT CAST(CAST('170141183460469231731687303715884105727' AS LARGEINT) AS VARCHAR) FROM t WHERE id = 1", "170141183460469231731687303715884105727" },
+        .{ "SELECT CONCAT(CAST('-170141183460469231731687303715884105728' AS LARGEINT), '') FROM t WHERE id = 1", "-170141183460469231731687303715884105728" },
+        .{ "SELECT CAST(CAST(qty AS LARGEINT) * 1000000000000000000 AS VARCHAR) FROM t WHERE id = 3", "30000000000000000000" },
+        // A LARGEINT reaches BIGINT exactly, not through DOUBLE; one from
+        // 2^63 to 2^64 - 1 is a BIGINT UNSIGNED, which keeps its 64 bits.
+        .{ "SELECT CAST(CAST('9223372036854775807' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", "9223372036854775807" },
+        .{ "SELECT CAST(CAST('18446744073709551615' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", "-1" },
+        .{ "SELECT CAST(CAST('18446744073709551616' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", null },
+        .{ "SELECT CAST(CAST('-9223372036854775809' AS LARGEINT) AS BIGINT) FROM t WHERE id = 1", null },
+    };
+    inline for (neutral_cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        try expectColumnText(allocator, &q, &.{c[1]});
+    }
 }

@@ -242,11 +242,13 @@ fn Extremum(comptime field: []const u8, comptime take_max: bool) type {
 
 pub const greatestIntKernel = Extremum("int", true).kernel;
 pub const greatestBigintKernel = Extremum("bigint", true).kernel;
+pub const greatestLargeintKernel = Extremum("largeint", true).kernel;
 pub const greatestDoubleKernel = Extremum("double", true).kernel;
 pub const greatestDateKernel = Extremum("date", true).kernel;
 pub const greatestDatetimeKernel = Extremum("datetime", true).kernel;
 pub const leastIntKernel = Extremum("int", false).kernel;
 pub const leastBigintKernel = Extremum("bigint", false).kernel;
+pub const leastLargeintKernel = Extremum("largeint", false).kernel;
 pub const leastDoubleKernel = Extremum("double", false).kernel;
 pub const leastDateKernel = Extremum("date", false).kernel;
 pub const leastDatetimeKernel = Extremum("datetime", false).kernel;
@@ -375,23 +377,68 @@ pub fn squareKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, s[i] * s[i]);
 }
 
-pub fn bitCountIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.int;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @intCast(@popCount(@as(u32, @bitCast(s[i])))));
+/// A BIGINT or LARGEINT as the BIGINT UNSIGNED MySQL's bit functions read:
+/// a negative BIGINT as its two's-complement bits, and a LARGEINT, which
+/// holds the BIGINT UNSIGNED values past BIGINT, as
+/// `common.wideIntegerAsBigint` keeps it.
+fn unsignedBits(x: anytype) u64 {
+    return switch (@TypeOf(x)) {
+        i64 => @bitCast(x),
+        i128 => @bitCast(common.wideIntegerAsBigint(x)),
+        else => @compileError("no BIGINT UNSIGNED reading of " ++ @typeName(@TypeOf(x))),
+    };
 }
 
-pub fn bitCountBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.int.append(allocator, @intCast(@popCount(@as(u64, @bitCast(s[i])))));
+/// MySQL's BIT_COUNT: the one bits of the value as BIGINT UNSIGNED, so a
+/// negative value of any width has 64.
+pub fn bitCountKernel(comptime T: type) Kernel {
+    return struct {
+        fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const dst = try reserveInts(i64, allocator, out, row_count);
+            for (dst, @field(args[0].data, intField(T))[0..row_count]) |*d, x| d.* = @popCount(unsignedBits(x));
+        }
+    }.f;
 }
 
 pub const BitOp = enum { @"and", @"or", xor, shift_left, shift_right };
 
-/// The bitwise operators read a BIGINT as its two's-complement bits, as
-/// StarRocks and DuckDB do (MySQL reads them unsigned). A shift by a count
-/// outside 0..63 shifts every bit out; `>>` is arithmetic, keeping the sign.
+/// MySQL's bit operators over BIGINT UNSIGNED (`unsignedBits`), the result
+/// held in a LARGEINT: `-1 | 0` is 18446744073709551615, and `>>` shifts
+/// zeros in. A count outside 0..63, a negative one included, shifts every
+/// bit out.
+pub fn unsignedBitwiseKernel(comptime op: BitOp, comptime T: type) Kernel {
+    return struct {
+        fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const field = comptime intField(T);
+            const dst = try reserveInts(i128, allocator, out, row_count);
+            for (dst, @field(args[0].data, field)[0..row_count], @field(args[1].data, field)[0..row_count]) |*d, a_in, b_in| {
+                const a = unsignedBits(a_in);
+                const b = unsignedBits(b_in);
+                d.* = switch (op) {
+                    .@"and" => a & b,
+                    .@"or" => a | b,
+                    .xor => a ^ b,
+                    .shift_left => if (b > 63) 0 else a << @intCast(b),
+                    .shift_right => if (b > 63) 0 else a >> @intCast(b),
+                };
+            }
+        }
+    }.f;
+}
+
+pub fn unsignedBitNotKernel(comptime T: type) Kernel {
+    return struct {
+        fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const dst = try reserveInts(i128, allocator, out, row_count);
+            for (dst, @field(args[0].data, intField(T))[0..row_count]) |*d, x| d.* = ~unsignedBits(x);
+        }
+    }.f;
+}
+
+/// StarRocks' bit functions, which the operators lower to outside MySQL,
+/// read a BIGINT as its two's-complement bits, as DuckDB and PG do. A shift
+/// by a count outside 0..63 shifts every bit out; `>>` is arithmetic,
+/// keeping the sign.
 pub fn bitwiseKernel(comptime op: BitOp) Kernel {
     return struct {
         fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -412,103 +459,96 @@ pub fn bitNotKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     for (dst, args[0].data.bigint[0..row_count]) |*d, a| d.* = ~a;
 }
 
-fn appendUnsignedBase(allocator: Allocator, ss: anytype, value: u128, base: u8) !void {
-    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    var buf: [128]u8 = undefined;
-    var n: usize = 0;
-    var v = value;
-    if (v == 0) {
-        buf[buf.len - 1] = '0';
-        n = 1;
-    } else {
-        while (v != 0) : (n += 1) {
-            const b128: u128 = base;
-            const rem: usize = @intCast(v % b128);
-            buf[buf.len - 1 - n] = digits[rem];
-            v /= b128;
+/// MySQL's CONV(n, from_base, to_base), and BIN(n) as CONV(n, 10, 2). `n`
+/// is read as its text, so `BIN(2.7)` converts "2.7", which reads as 2; a
+/// boolean is MySQL's integer 1 or 0, so its text is that digit.
+pub const convKernel = baseConversionKernel(.text, null);
+pub const binKernel = baseConversionKernel(.text, .{ 10, 2 });
+pub const convBooleanKernel = baseConversionKernel(.boolean, null);
+pub const binBooleanKernel = baseConversionKernel(.boolean, .{ 10, 2 });
+
+fn baseConversionKernel(comptime source: enum { text, boolean }, comptime fixed_bases: ?[2]i32) Kernel {
+    return struct {
+        fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const sv = switch (source) {
+                .text => stringViewOf(args[0]),
+                .boolean => {},
+            };
+            const ss = stringStoreOf(out);
+            const first = out.data.rowCount();
+            var buf: [65]u8 = undefined;
+            for (0..row_count) |i| {
+                const text: ?[]const u8 = for (args) |a| {
+                    if (!a.isValid(i)) break null;
+                } else blk: {
+                    const from_base, const to_base = fixed_bases orelse .{ args[1].data.int[i], args[2].data.int[i] };
+                    const n = switch (source) {
+                        .text => sv.rowBytes(i),
+                        .boolean => if (args[0].data.boolean[i] != 0) "1" else "0",
+                    };
+                    break :blk convText(&buf, n, from_base, to_base);
+                };
+                try ss.appendValue(allocator, text orelse "");
+                try out.appendValidBit(allocator, first + i, text != null);
+            }
         }
-    }
-    try ss.appendValue(allocator, buf[buf.len - n ..]);
+    }.f;
 }
 
-pub fn binIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.int;
-    const ss = stringStoreOf(out);
+/// `text` read in base |from_base| and written in base |to_base|, each
+/// signed when negative; null for a base outside 2..36 or empty text.
+fn convText(buf: *[65]u8, text: []const u8, from_base: i32, to_base: i32) ?[]const u8 {
+    if (text.len == 0 or !validBase(from_base) or !validBase(to_base)) return null;
+    return baseText(buf, baseValue(text, @intCast(@abs(from_base)), from_base < 0), @intCast(@abs(to_base)), to_base < 0);
+}
+
+fn validBase(base: i32) bool {
+    return @abs(base) >= 2 and @abs(base) <= 36;
+}
+
+/// Text as MySQL's my_strntoull reads it, or my_strntoll when `signed`:
+/// leading spaces, a sign, then the digits of `base` up to the first byte
+/// that isn't one, so no digit at all reads as 0. Unsigned, a value past
+/// 2^64 - 1 is 2^64 - 1 and a '-' negates modulo 2^64; signed, the value
+/// saturates to BIGINT. Either way the result is the 64 bits.
+fn baseValue(text: []const u8, base: u8, signed: bool) u64 {
     var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const value: u128 = if (s[i] < 0) @as(u128, @as(u32, @bitCast(s[i]))) else @intCast(s[i]);
-        try appendUnsignedBase(allocator, ss, value, 2);
+    while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+    const negative = i < text.len and text[i] == '-';
+    if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
+    const past_unsigned: u128 = @as(u128, std.math.maxInt(u64)) + 1;
+    var magnitude: u128 = 0;
+    for (text[i..]) |c| {
+        const digit = std.fmt.charToDigit(c, base) catch break;
+        magnitude = @min(magnitude * base + digit, past_unsigned);
     }
+    if (signed) {
+        const limit: u128 = if (negative) @as(u128, 1) << 63 else std.math.maxInt(i64);
+        const m: i128 = @intCast(@min(magnitude, limit));
+        return @bitCast(@as(i64, @intCast(if (negative) -m else m)));
+    }
+    if (magnitude == past_unsigned) return std.math.maxInt(u64);
+    const m: u64 = @intCast(magnitude);
+    return if (negative) 0 -% m else m;
 }
 
-pub fn binBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.bigint;
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const value: u128 = if (s[i] < 0) @as(u128, @as(u64, @bitCast(s[i]))) else @intCast(s[i]);
-        try appendUnsignedBase(allocator, ss, value, 2);
+/// `bits` in `base` with uppercase letter digits: a negative BIGINT with a
+/// '-' when `signed`, and BIGINT UNSIGNED otherwise.
+fn baseText(buf: *[65]u8, bits: u64, base: u8, signed: bool) []const u8 {
+    const negative = signed and @as(i64, @bitCast(bits)) < 0;
+    var v = if (negative) 0 -% bits else bits;
+    var n: usize = buf.len;
+    while (true) {
+        n -= 1;
+        buf[n] = std.fmt.digitToChar(@intCast(v % base), .upper);
+        v /= base;
+        if (v == 0) break;
     }
-}
-
-fn digitValue(c: u8) ?u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'z' => 10 + (c - 'a'),
-        'A'...'Z' => 10 + (c - 'A'),
-        else => null,
-    };
-}
-
-fn parseUnsignedBase(bytes: []const u8, base: u8) ?u128 {
-    if (base < 2 or base > 36) return null;
-    var v: u128 = 0;
-    var saw = false;
-    for (bytes) |c| {
-        const d = digitValue(c) orelse return null;
-        if (d >= base) return null;
-        v = v * @as(u128, base) + @as(u128, d);
-        saw = true;
+    if (negative) {
+        n -= 1;
+        buf[n] = '-';
     }
-    return if (saw) v else null;
-}
-
-pub fn convStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
-    const from_bases = args[1].data.int;
-    const to_bases = args[2].data.int;
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const fb = from_bases[i];
-        const tb = to_bases[i];
-        if (fb < 2 or fb > 36 or tb < 2 or tb > 36) {
-            try ss.appendValue(allocator, "");
-            continue;
-        }
-        const v = parseUnsignedBase(sv.rowBytes(i), @intCast(fb)) orelse {
-            try ss.appendValue(allocator, "");
-            continue;
-        };
-        try appendUnsignedBase(allocator, ss, v, @intCast(tb));
-    }
-}
-
-pub fn convBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const values = args[0].data.bigint;
-    const _from_bases = args[1].data.int;
-    const to_bases = args[2].data.int;
-    const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        _ = _from_bases[i];
-        const tb = to_bases[i];
-        if (tb < 2 or tb > 36 or values[i] < 0) {
-            try ss.appendValue(allocator, "");
-            continue;
-        }
-        try appendUnsignedBase(allocator, ss, @intCast(values[i]), @intCast(tb));
-    }
+    return buf[n..];
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +687,17 @@ pub const stringToIntKernel = IntCast(i32).from_text;
 pub const doubleToBigintKernel = IntCast(i64).from_double;
 pub const stringToBigintKernel = IntCast(i64).from_text;
 pub const doubleToLargeintKernel = IntCast(i128).from_double;
+
+/// A LARGEINT from 2^63 to 2^64 - 1 is a BIGINT UNSIGNED (a MySQL bit
+/// operator's result, `0xFFFFFFFFFFFFFFFF + 0`), and keeps its 64 bits as
+/// BIGINT, as MySQL's CAST AS SIGNED keeps them (`CAST(~5 AS SIGNED)` is -6).
+/// Any other value past BIGINT is NULL.
+pub const largeintToBigintKernel = convertOrNull("bigint", struct {
+    fn f(v: ColumnView, row: usize) ?i64 {
+        const x = v.data.largeint[row];
+        return std.math.cast(i64, x) orelse @bitCast(std.math.cast(u64, x) orelse return null);
+    }
+}.f);
 pub const stringToLargeintKernel = IntCast(i128).from_text;
 
 pub const stringToDoubleKernel = convertOrNull("double", struct {
@@ -707,26 +758,16 @@ pub fn doubleIntegerArgKernel(allocator: Allocator, args: []const ColumnView, ou
     for (args[0].data.double[0..row_count]) |x| dst.appendAssumeCapacity(common.doubleAsBigint(x));
 }
 
-pub fn intToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.int;
-    const ss = stringStoreOf(out);
-    var buf: [16]u8 = undefined;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const text = try std.fmt.bufPrint(&buf, "{d}", .{s[i]});
-        try ss.appendValue(allocator, text);
-    }
-}
-
-pub fn bigintToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.bigint;
-    const ss = stringStoreOf(out);
-    var buf: [24]u8 = undefined;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const text = try std.fmt.bufPrint(&buf, "{d}", .{s[i]});
-        try ss.appendValue(allocator, text);
-    }
+/// An integer of any width as its exact digits: a LARGEINT must not reach
+/// text through DOUBLE, which keeps only 17 of its digits.
+pub fn integerToStringKernel(comptime T: type) Kernel {
+    return struct {
+        fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const ss = stringStoreOf(out);
+            var buf: [48]u8 = undefined;
+            for (@field(args[0].data, intField(T))[0..row_count]) |x| try ss.appendValue(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x}));
+        }
+    }.f;
 }
 
 pub fn doubleToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
