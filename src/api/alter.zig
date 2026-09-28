@@ -182,6 +182,7 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
             .nullable = c.nullable,
             .default_value = if (c.default_value) |v| try cloneValue(aa, v) else null,
             .default_now = c.default_now,
+            .on_update_now = c.on_update_now,
             .auto_increment = c.auto_increment,
         });
         try sources.append(aa, .{ .from_old = idx });
@@ -215,9 +216,21 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
                 .name = name_copy,
                 .type = add.type,
                 .nullable = add.nullable,
-                .default_value = default_owned,
+                .default_value = if (add.default_now) null else default_owned,
+                .default_now = add.default_now,
+                .on_update_now = add.on_update_now,
             });
             try sources.append(aa, if (default_owned) |v| .{ .add_with_default = v } else .add_null);
+        },
+        .set_clauses => |sc| {
+            const idx = findColumn(cols.items, sc.name) orelse return api.Error.ColumnNotFound;
+            const col = &cols.items[idx];
+            if (sc.default) |default| {
+                if (!valueTagMatchesType(default, col.type)) return api.Error.UnsupportedAlterOp;
+            }
+            col.default_value = if (sc.default) |v| try cloneValue(aa, v) else null;
+            col.default_now = sc.default_now;
+            col.on_update_now = sc.on_update_now;
         },
     };
 

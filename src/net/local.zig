@@ -2313,13 +2313,18 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
     const t = try resolveTable(catalog, ctx.session.*, u.table);
 
-    const assigns_buf = try ctx.allocator.alloc(update_mod.Assignment, u.assignments.len);
-    defer ctx.allocator.free(assigns_buf);
-    for (u.assignments, assigns_buf) |src, *dst| {
-        dst.* = .{ .col = src.col, .value = hexAssigned(t.schema, src.col, src.value) };
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const named = try aa.alloc([]const u8, u.assignments.len);
+    var assigns: std.ArrayList(update_mod.Assignment) = .empty;
+    for (u.assignments, named) |src, *name| {
+        name.* = src.col;
+        try assigns.append(aa, .{ .col = src.col, .value = hexAssigned(t.schema, src.col, src.value) });
     }
+    try assigns.appendSlice(aa, try onUpdateStamps(ctx, aa, t.schema, named));
 
-    const affected = try t.updateStreaming(u.predicate, u.derived, assigns_buf);
+    const affected = try t.updateStreaming(u.predicate, u.derived, assigns.items);
     ctx.affected_rows = @intCast(affected);
     return try EmptyOp.createWithCount(ctx.allocator, affected);
 }
@@ -2484,16 +2489,14 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     if (!c.column_type.isInteger()) return Error.TypeMismatch;
                     saw_auto_increment = true;
                 }
-                // Coerce the DEFAULT literal to the column type so a
-                // mismatch errors at CREATE TABLE rather than first INSERT.
-                const dflt: ?Value = if (c.default_value) |dv| try coerceDefaultLiteral(dv, c.column_type) else null;
-                if (c.default_now and c.column_type != .datetime) return Error.TypeMismatch;
+                const clauses = try columnClauses(c);
                 cols[ci] = .{
                     .name = c.name,
                     .type = c.column_type,
                     .nullable = c.nullable,
-                    .default_value = dflt,
-                    .default_now = c.default_now,
+                    .default_value = clauses.default_value,
+                    .default_now = clauses.default_now,
+                    .on_update_now = clauses.on_update_now,
                     .auto_increment = c.auto_increment,
                 };
             }
@@ -2563,13 +2566,24 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             defer ops.deinit(ctx.allocator);
             var rename_to: ?PersistentTableTarget = null;
             for (at.actions) |action| switch (action) {
-                .add_column => |c| try ops.append(ctx.allocator, try addColumnOp(c)),
+                .add_column => |c| try ops.append(ctx.allocator, try addColumnOp(ctx, c)),
                 .drop_column => |name| try ops.append(ctx.allocator, .{ .drop = name }),
                 .rename_column => |r| try ops.append(ctx.allocator, .{ .rename = .{ .from = r.from, .to = r.to } }),
                 .change_column => |ch| {
                     const t = try resolveTable(catalog, ctx.session.*, at.table);
                     const i = types.findColumn(t.schema.columns, ch.from) orelse return Error.ColumnNotFound;
-                    if (!try changeKeepsDefinition(t.schema.columns[i], ch.column)) return Error.UnsupportedOp;
+                    const existing = t.schema.columns[i];
+                    // A new type or nullability would need every segment
+                    // rewritten with converted values.
+                    if (!std.meta.eql(existing.type, ch.column.column_type) or existing.nullable != ch.column.nullable) return Error.UnsupportedOp;
+                    if (existing.auto_increment != ch.column.auto_increment) return Error.UnsupportedOp;
+                    const clauses = try columnClauses(ch.column);
+                    if (!clauses.sameAs(existing)) try ops.append(ctx.allocator, .{ .set_clauses = .{
+                        .name = ch.from,
+                        .default = clauses.default_value,
+                        .default_now = clauses.default_now,
+                        .on_update_now = clauses.on_update_now,
+                    } });
                     if (!types.columnNameEql(ch.from, ch.column.name)) {
                         try ops.append(ctx.allocator, .{ .rename = .{ .from = ch.from, .to = ch.column.name } });
                     }
@@ -2801,7 +2815,7 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const src_schema = source.outputSchema();
     const source_names = try aa.alloc([]const u8, src_schema.len);
     for (src_schema, source_names) |c, *name| name.* = c.name;
-    const rule = try duplicateRule(aa, t, op.table, op.mode, op.on_duplicate, op.columns, source_names);
+    const rule = try duplicateRule(ctx, aa, t, op.table, op.mode, op.on_duplicate, op.columns, source_names);
     const table_to_source = try aa.alloc(?usize, tbl_columns.len);
     @memset(table_to_source, null);
     if (op.columns) |cols| {
@@ -3069,8 +3083,10 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const table_to_source = try aa.alloc(?[]?usize, tables.len);
     @memset(table_to_source, null);
     var numeric: std.ArrayList([]const u8) = .empty;
-    for (u.assignments, 0..) |a, i| {
+    const assignment_tables = try aa.alloc(usize, u.assignments.len);
+    for (u.assignments, assignment_tables, 0..) |a, *assignment_table, i| {
         const k = try assignmentTarget(u.targets, tables, a);
+        assignment_table.* = k;
         const t = tables[k];
         // Only a key identifies the row a SELECT returned.
         if (!t.schema.unique) return Error.UnsupportedOp;
@@ -3090,6 +3106,30 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     var source = try compileSubplan(ctx, try hexStoredNamed(aa, u.source.?, numeric.items));
     defer source.deinit();
     if (source.outputSchema().len != star_width + u.assignments.len) return Error.BadRequest;
+    // Each written table's ON UPDATE stamps join the source as columns of
+    // their own.
+    var stamp_columns: std.ArrayList(exec.Derived) = .empty;
+    const stamped = try aa.alloc(?[]const bool, tables.len);
+    for (tables, table_to_source, stamped, 0..) |t, maybe_map, *marks, k| {
+        marks.* = null;
+        const map = maybe_map orelse continue;
+        var named: std.ArrayList([]const u8) = .empty;
+        for (u.assignments, assignment_tables) |a, ak| {
+            if (ak == k) try named.append(aa, a.col);
+        }
+        const stamps = try onUpdateStamps(ctx, aa, t.schema, named.items);
+        if (stamps.len == 0) continue;
+        const table_marks = try aa.alloc(bool, t.schema.columns.len);
+        @memset(table_marks, false);
+        for (stamps) |s| {
+            const ci = t.schema.columnIndex(s.col).?;
+            table_marks[ci] = true;
+            map[ci] = star_width + u.assignments.len + stamp_columns.items.len;
+            try stamp_columns.append(aa, .{ .name = try std.fmt.allocPrint(aa, "__stamp_{d}_{d}", .{ k, ci }), .expr = s.value });
+        }
+        marks.* = table_marks;
+    }
+    if (stamp_columns.items.len > 0) source = try source.compute(stamp_columns.items);
     const plans = try aa.alloc(?InsertColumnPlan, tables.len);
     for (tables, table_to_source, plans, 0..) |t, maybe_map, *plan, k| {
         const map = maybe_map orelse {
@@ -3106,9 +3146,9 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     const values = try stagedViews(aa, &staged);
 
     var affected: usize = 0;
-    for (tables, plans) |t, maybe_plan| {
+    for (tables, plans, offsets, stamped) |t, maybe_plan, offset, marks| {
         const plan = maybe_plan orelse continue;
-        affected += try writeUpdatedRows(ctx, aa, t, plan, out_schema, values, row_count);
+        affected += try writeUpdatedRows(ctx, aa, t, plan, out_schema, values, row_count, offset, marks);
     }
     ctx.affected_rows = @intCast(affected);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(affected));
@@ -3125,6 +3165,8 @@ fn writeUpdatedRows(
     out_schema: []const types.Column,
     all_values: []const storage.ColumnView,
     all_rows: usize,
+    own_offset: usize,
+    stamped: ?[]const bool,
 ) !usize {
     const rows = try rowsNamingTarget(aa, t, plan, out_schema, all_values, all_rows);
     const values = rows.values;
@@ -3134,6 +3176,18 @@ fn writeUpdatedRows(
     const views = try aa.alloc(storage.ColumnView, t.schema.columns.len);
     try plan.fill(ctx, t, out_schema, values, row_count, batch_schema, views);
     defer plan.release(ctx, views);
+    if (stamped) |marks| {
+        // A stamp keeps the old value in each row the SET list leaves as it was.
+        const old = values[own_offset..][0..t.schema.columns.len];
+        const assigned = try aa.alloc(bool, marks.len);
+        for (assigned, plan.table_to_source, marks, 0..) |*a, src, is_stamp, ci| a.* = !is_stamp and src.? != own_offset + ci;
+        const changed = try update_mod.changedRows(aa, old, views, assigned, row_count);
+        for (marks, t.schema.columns, 0..) |is_stamp, column, ci| {
+            if (!is_stamp) continue;
+            const kept = try update_mod.stampedColumn(aa, column, old[ci], views[ci], changed);
+            views[ci] = kept.view();
+        }
+    }
 
     var keys: std.StringHashMapUnmanaged(void) = .empty;
     var key_buf: std.ArrayList(u8) = .empty;
@@ -3302,27 +3356,45 @@ fn dropTable(ctx: *CompileCtx, catalog: *Catalog, ref: ir.TableRef, if_exists: b
     };
 }
 
-/// An added column backfills existing rows with its default, or NULL.
-fn addColumnOp(c: ir.ColumnDef) !AlterOp {
-    if (c.auto_increment or c.default_now) return Error.UnsupportedOp;
-    const add_default: ?Value = if (c.default_value) |dv| try coerceDefaultLiteral(dv, c.column_type) else null;
-    if (add_default == null and !c.nullable) return Error.UnsupportedOp;
+/// An added column backfills existing rows with its default, or NULL. A
+/// DEFAULT CURRENT_TIMESTAMP gives them the ALTER's time, as MySQL does.
+fn addColumnOp(ctx: *CompileCtx, c: ir.ColumnDef) !AlterOp {
+    if (c.auto_increment) return Error.UnsupportedOp;
+    const clauses = try columnClauses(c);
+    const backfill: ?Value = if (clauses.default_now) nowDatetime(ctx) else clauses.default_value;
+    if (backfill == null and !c.nullable) return Error.UnsupportedOp;
     return .{ .add = .{
         .name = c.name,
         .type = c.column_type,
         .nullable = c.nullable,
-        .default = add_default,
+        .default = backfill,
+        .default_now = clauses.default_now,
+        .on_update_now = clauses.on_update_now,
     } };
 }
 
-/// `CHANGE` / `MODIFY` run only as a rename: a new type, nullability or
-/// default would need every segment rewritten with converted values.
-fn changeKeepsDefinition(existing: types.Column, def: ir.ColumnDef) !bool {
-    if (!std.meta.eql(existing.type, def.column_type) or existing.nullable != def.nullable) return false;
-    if (existing.default_now != def.default_now or existing.auto_increment != def.auto_increment) return false;
-    const default: ?Value = if (def.default_value) |dv| try coerceDefaultLiteral(dv, def.column_type) else null;
-    if (existing.default_value == null or default == null) return existing.default_value == null and default == null;
-    return existing.default_value.?.eql(default.?);
+/// A column definition's DEFAULT and ON UPDATE clauses, the DEFAULT literal
+/// coerced to the column's type so a mismatch fails the DDL rather than the
+/// first INSERT. CURRENT_TIMESTAMP fits a datetime column only.
+const ColumnClauses = struct {
+    default_value: ?Value,
+    default_now: bool,
+    on_update_now: bool,
+
+    fn sameAs(self: ColumnClauses, c: types.Column) bool {
+        if (self.default_now != c.default_now or self.on_update_now != c.on_update_now) return false;
+        if (self.default_value == null or c.default_value == null) return self.default_value == null and c.default_value == null;
+        return self.default_value.?.eql(c.default_value.?);
+    }
+};
+
+fn columnClauses(c: ir.ColumnDef) !ColumnClauses {
+    if ((c.default_now or c.on_update_now) and c.column_type != .datetime) return Error.TypeMismatch;
+    return .{
+        .default_value = if (c.default_value) |dv| try coerceDefaultLiteral(dv, c.column_type) else null,
+        .default_now = c.default_now,
+        .on_update_now = c.on_update_now,
+    };
 }
 
 /// MySQL / StarRocks DDL quotes defaults freely (`DEFAULT "0"`,
@@ -3346,11 +3418,33 @@ fn coerceDefaultLiteral(dv: Value, col_type: types.Type) !Value {
     return v;
 }
 
-/// Wall-clock fill for a `DEFAULT CURRENT_TIMESTAMP` column omitted from an
-/// INSERT (microseconds since the epoch, the datetime storage unit).
+/// The statement's timestamp, as `DEFAULT CURRENT_TIMESTAMP` and `ON UPDATE
+/// CURRENT_TIMESTAMP` store it: to the microsecond, the datetime storage
+/// unit, whatever precision the column declares.
 fn nowDatetime(ctx: *CompileCtx) Value {
-    const ts = std.Io.Clock.real.now(ctx.db.io);
-    return .{ .datetime = @intCast(@divTrunc(ts.nanoseconds, 1000)) };
+    return .{ .datetime = ctx.now_micros };
+}
+
+/// MySQL's ON UPDATE CURRENT_TIMESTAMP: an UPDATE of `schema`'s rows sets
+/// each such column its SET list leaves out to the statement's timestamp,
+/// in the rows it changes. Returns those stamp assignments
+/// (`update_mod.Assignment.stamp`); `assigned` names the columns the SET
+/// list names. A key column is left alone: it finds the row.
+fn onUpdateStamps(ctx: *CompileCtx, aa: Allocator, schema: TableSchema, assigned: []const []const u8) ![]const update_mod.Assignment {
+    var stamps: std.ArrayList(update_mod.Assignment) = .empty;
+    for (schema.columns) |c| {
+        if (!c.on_update_now) continue;
+        const named = for (assigned) |name| {
+            if (types.columnNameEql(name, c.name)) break true;
+        } else false;
+        if (named) continue;
+        const is_key = for (schema.order_key) |k| {
+            if (types.columnNameEql(k, c.name)) break true;
+        } else false;
+        if (is_key) continue;
+        try stamps.append(aa, .{ .col = c.name, .value = .{ .lit = nowDatetime(ctx) }, .stamp = true });
+    }
+    return stamps.items;
 }
 
 fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
@@ -3415,7 +3509,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
     }
     var rule_arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer rule_arena.deinit();
-    const rule = try duplicateRule(rule_arena.allocator(), t, op.table, op.mode, op.on_duplicate, op.columns, null);
+    const rule = try duplicateRule(ctx, rule_arena.allocator(), t, op.table, op.mode, op.on_duplicate, op.columns, null);
     var affected: usize = row_count;
 
     // AUTO_INCREMENT resolution must run under the Table mutex so the
@@ -3659,6 +3753,7 @@ const DuplicateRule = union(enum) {
 /// one that changes nothing is IGNORE. `source_names` are an INSERT ...
 /// SELECT's output columns, which its assignments may name.
 fn duplicateRule(
+    ctx: *CompileCtx,
     aa: Allocator,
     t: *ApiTable,
     op_table: ir.TableRef,
@@ -3714,6 +3809,9 @@ fn duplicateRule(
     }
     if (replaces_row) return .replace;
     if (computed.items.len == 0) return .{ .resolve = .ignore };
+    const named = try aa.alloc([]const u8, od.assignments.len);
+    for (od.assignments, named) |a, *name| name.* = a.col;
+    try computed.appendSlice(aa, try onUpdateStamps(ctx, aa, t.schema, named));
     return .{ .resolve = .{ .update = computed.items } };
 }
 

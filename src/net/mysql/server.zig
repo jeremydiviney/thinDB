@@ -1737,6 +1737,7 @@ fn allocCreateTableText(allocator: Allocator, t: *Table) ![]u8 {
         } else if (col.default_now) {
             try out.appendSlice(allocator, " DEFAULT CURRENT_TIMESTAMP");
         }
+        if (col.on_update_now) try out.appendSlice(allocator, " ON UPDATE CURRENT_TIMESTAMP");
         if (col.auto_increment) try out.appendSlice(allocator, " AUTO_INCREMENT");
     }
     if (t.schema.unique) {
@@ -1910,7 +1911,7 @@ fn sendColumnsResult(
                 defer if (default_text) |d| allocator.free(d);
                 const key = columnKey(table, col.name);
                 const nullable = if (col.nullable) "YES" else "NO";
-                const extra: []const u8 = if (col.auto_increment) "auto_increment" else "";
+                const extra = columnExtra(col);
                 if (full) {
                     const cells = [_]?[]const u8{
                         col.name,
@@ -2301,6 +2302,16 @@ fn allocInfoDataType(allocator: Allocator, t: types.Type) ![]u8 {
 
 fn columnCollation(col: types.Column) ?[]const u8 {
     return if (col.type.isString()) "utf8mb4_general_ci" else null;
+}
+
+/// The EXTRA text MySQL 8.4 reports for a column in SHOW COLUMNS and
+/// information_schema.COLUMNS.
+fn columnExtra(col: types.Column) []const u8 {
+    if (col.auto_increment) return "auto_increment";
+    if (col.default_now and col.on_update_now) return "DEFAULT_GENERATED on update CURRENT_TIMESTAMP";
+    if (col.default_now) return "DEFAULT_GENERATED";
+    if (col.on_update_now) return "on update CURRENT_TIMESTAMP";
+    return "";
 }
 
 fn columnKey(t: *Table, col_name: []const u8) []const u8 {
@@ -2950,7 +2961,8 @@ fn infoCell(
         const col = row.column orelse return try cellDup(allocator, owned, "");
         return try cellDup(allocator, owned, columnKey(t, col.name));
     }
-    if (keyContains(key, "extra") or keyContains(key, "column_comment") or keyContains(key, "generation_expression"))
+    if (keyContains(key, "extra")) return try cellDup(allocator, owned, if (row.column) |c| columnExtra(c) else "");
+    if (keyContains(key, "column_comment") or keyContains(key, "generation_expression"))
         return try cellDup(allocator, owned, "");
     if (keyContains(key, "privileges")) return try cellDup(allocator, owned, "select,insert,update,references");
     if (keyContains(key, "srs_id")) return null;
@@ -4334,4 +4346,44 @@ test "applyInitDb honors schema-within-current-db lookup" {
     try applyInitDb(c, &session, "reports");
     try std.testing.expectEqualStrings("main", session.current_db);
     try std.testing.expectEqualStrings("reports", session.current_schema);
+}
+
+test "SHOW CREATE TABLE, SHOW COLUMNS and information_schema report ON UPDATE CURRENT_TIMESTAMP as MySQL 8.4 does" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE stamped (id INT PRIMARY KEY, " ++
+        "a DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, b DATETIME ON UPDATE CURRENT_TIMESTAMP, " ++
+        "c DATETIME DEFAULT CURRENT_TIMESTAMP)", &profiler);
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "SHOW CREATE TABLE stamped", &profiler);
+    const ddl = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`a` datetime(6) DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`b` datetime(6) ON UPDATE CURRENT_TIMESTAMP,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`c` datetime(6) DEFAULT CURRENT_TIMESTAMP,") != null);
+
+    // Each EXTRA cell, with its length prefix, so one can't match inside another.
+    const queries = [_][]const u8{
+        "SHOW COLUMNS FROM stamped",
+        "SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS WHERE TABLE_NAME = 'stamped'",
+    };
+    for (queries) |query| {
+        out.clearRetainingCapacity();
+        try handleQuery(allocator, &out.writer, c, &session, query, &profiler);
+        const rows = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, rows, "\x2dDEFAULT_GENERATED on update CURRENT_TIMESTAMP") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rows, "\x1bon update CURRENT_TIMESTAMP") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rows, "\x11DEFAULT_GENERATED") != null);
+    }
 }

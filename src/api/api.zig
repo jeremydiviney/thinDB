@@ -70,12 +70,26 @@ pub const AlterOp = union(enum) {
     /// Rename a column. Existing data unchanged; only the schema name
     /// changes. Errors if `to` is already a column name.
     rename: RenameColumn,
+    /// Replace a column's DEFAULT and ON UPDATE CURRENT_TIMESTAMP clauses.
+    /// Existing rows keep their values.
+    set_clauses: SetClauses,
 
     pub const AddColumn = struct {
         name: []const u8,
         type: @import("../types.zig").Type,
         nullable: bool = false,
         default: ?@import("../types.zig").Value = null,
+        /// The column's DEFAULT is CURRENT_TIMESTAMP; `default` holds the
+        /// time existing rows take.
+        default_now: bool = false,
+        on_update_now: bool = false,
+    };
+
+    pub const SetClauses = struct {
+        name: []const u8,
+        default: ?@import("../types.zig").Value = null,
+        default_now: bool = false,
+        on_update_now: bool = false,
     };
 
     pub const RenameColumn = struct {

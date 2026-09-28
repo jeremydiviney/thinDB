@@ -54,6 +54,9 @@ const ir = @import("../ir/ir.zig");
 pub const Assignment = struct {
     col: []const u8,
     value: ir.Expr,
+    /// Lands only in the rows the other assignments change; the rest keep
+    /// the column as it was. MySQL's ON UPDATE CURRENT_TIMESTAMP.
+    stamp: bool = false,
 };
 
 /// Streaming UPDATE entry point. Caller pre-resolved the predicate,
@@ -441,5 +444,110 @@ pub fn computeNewRows(
         );
     }
 
+    for (assignments) |a| {
+        if (a.stamp) {
+            try keepUnchangedRows(allocator, schema, assignments, matched.stores, out_stores, matched_count);
+            break;
+        }
+    }
     return .{ .stores = out_stores, .row_count = matched_count };
+}
+
+/// Put back, in each row no other assignment changes, the old value of
+/// every stamp assignment's column (`Assignment.stamp`).
+fn keepUnchangedRows(
+    allocator: std.mem.Allocator,
+    schema: types.TableSchema,
+    assignments: []const Assignment,
+    old: []const ColumnStore,
+    new: []ColumnStore,
+    rows: usize,
+) !void {
+    const width = schema.columns.len;
+    const assigned = try allocator.alloc(bool, width);
+    defer allocator.free(assigned);
+    const stamped = try allocator.alloc(bool, width);
+    defer allocator.free(stamped);
+    @memset(assigned, false);
+    @memset(stamped, false);
+    for (assignments) |a| {
+        const ci = schema.columnIndex(a.col) orelse continue;
+        if (a.stamp) stamped[ci] = true else assigned[ci] = true;
+    }
+    const old_views = try allocator.alloc(ColumnView, width);
+    defer allocator.free(old_views);
+    const new_views = try allocator.alloc(ColumnView, width);
+    defer allocator.free(new_views);
+    for (old, new, old_views, new_views) |*o, *n, *ov, *nv| {
+        ov.* = o.view();
+        nv.* = n.view();
+    }
+    const changed = try changedRows(allocator, old_views, new_views, assigned, rows);
+    defer allocator.free(changed);
+    for (stamped, schema.columns, 0..) |s, column, ci| {
+        if (!s) continue;
+        const kept = try stampedColumn(allocator, column, old_views[ci], new_views[ci], changed);
+        new[ci].deinit(allocator);
+        new[ci] = kept;
+    }
+}
+
+/// The rows an UPDATE changes: those where a column `assigned` marks holds
+/// a new value unlike its old one.
+pub fn changedRows(
+    allocator: std.mem.Allocator,
+    old: []const ColumnView,
+    new: []const ColumnView,
+    assigned: []const bool,
+    rows: usize,
+) ![]bool {
+    const changed = try allocator.alloc(bool, rows);
+    errdefer allocator.free(changed);
+    @memset(changed, false);
+    var old_bytes: std.ArrayList(u8) = .empty;
+    defer old_bytes.deinit(allocator);
+    var new_bytes: std.ArrayList(u8) = .empty;
+    defer new_bytes.deinit(allocator);
+    for (old, new, assigned) |o, n, is_assigned| {
+        if (!is_assigned) continue;
+        for (changed, 0..) |*c, r| {
+            if (c.*) continue;
+            const valid = o.isValid(r);
+            if (valid != n.isValid(r)) {
+                c.* = true;
+                continue;
+            }
+            if (!valid) continue;
+            old_bytes.clearRetainingCapacity();
+            new_bytes.clearRetainingCapacity();
+            try o.appendValueBytes(allocator, &old_bytes, @intCast(r));
+            try n.appendValueBytes(allocator, &new_bytes, @intCast(r));
+            c.* = !std.mem.eql(u8, old_bytes.items, new_bytes.items);
+        }
+    }
+    return changed;
+}
+
+/// `column` as a stamp assignment leaves it: `new` in the rows `changed`
+/// marks, `old` elsewhere.
+pub fn stampedColumn(
+    allocator: std.mem.Allocator,
+    column: types.Column,
+    old: ColumnView,
+    new: ColumnView,
+    changed: []const bool,
+) !ColumnStore {
+    const rows = changed.len;
+    const picks = try allocator.alloc(u32, rows);
+    defer allocator.free(picks);
+    for (picks, 0..) |*p, r| p.* = @intCast(r);
+    var both = try ColumnStore.init(allocator, column.type, column.nullable);
+    defer both.deinit(allocator);
+    try engine.transform.appendByIndices(allocator, old, picks, &both);
+    try engine.transform.appendByIndices(allocator, new, picks, &both);
+    for (picks, changed, 0..) |*p, c, r| p.* = @intCast(if (c) rows + r else r);
+    var out = try ColumnStore.init(allocator, column.type, column.nullable);
+    errdefer out.deinit(allocator);
+    try engine.transform.appendByIndices(allocator, both.view(), picks, &out);
+    return out;
 }
