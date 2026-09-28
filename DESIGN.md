@@ -178,8 +178,17 @@ An integer literal past BIGINT is DECIMAL(n,0) of its digits, and DOUBLE past
 `-9223372036854775808` is BIGINT, as in MySQL.
 
 In the MySQL dialect a hex literal (`0x41`, `X'41'`) is a byte string, as
-MySQL types it, stored like BINARY columns as text; unlike MySQL it does not
-turn into a number in a numeric context. A bit literal (`b'101'`, `0b101`) is
+MySQL types it, stored like BINARY columns as text. As in MySQL it is the
+integer it spells in a numeric context: in arithmetic, as an argument a
+function reads as a number, beside a number in a comparison, IN or BETWEEN,
+and in SUM, AVG and the other aggregates that take only numbers (`SUM(0x41)`
+adds 65, `MAX(0x41)` is `'A'`). That integer is BIGINT UNSIGNED, held in a
+LARGEINT, so `0x7FFFFFFFFFFFFFFF + 1` is 9223372036854775808; unlike MySQL, a
+result below 0 is negative rather than an error (`0x01 - 2` is -1). Stored in
+a numeric column, by INSERT, UPDATE, a column DEFAULT or a SELECT feeding an
+INSERT, it is that integer (`0x3132` stores 12594 in an INT); in any other
+column, its bytes. `CONV(X'FF', 16, 10)` is 255, as MySQL converts the
+literal's integer whatever `from_base` says. A bit literal (`b'101'`, `0b101`) is
 an integer, since BIT columns are integers here. A charset introducer
 (`_utf8mb4'…'`, `_binary X'…'`) is dropped, and one naming a charset other
 than UTF-8 or binary admits only ASCII text, since thinDB does not transcode.
@@ -207,8 +216,13 @@ operators to StarRocks' `bitand`, `bitor`, `bitxor`, `bitnot`,
 `bit_shift_left` and `bit_shift_right`, which keep BIGINT's two's complement,
 as StarRocks, DuckDB and PG do: `~1` is -2 and `>>` keeps the sign. The choice
 is made once, in `scalar_fn.bitOperatorFn`. The aggregates BIT_AND/OR/XOR
-still return a signed BIGINT in every dialect, reading a LARGEINT input as its
-64 bits (#349).
+follow MySQL the same way in the MySQL dialect: each value reads as BIGINT
+UNSIGNED, as an operator's operand does, and the result is one, held in a
+LARGEINT. No rows, or only NULLs, give the operation's identity rather than
+NULL: BIT_AND 18446744073709551615, BIT_OR and BIT_XOR 0. The parser picks
+these unsigned forms by dialect (`AggNames.mysql`). The other dialects keep
+StarRocks' aggregates, which return a signed BIGINT, NULL over no rows, and
+read a LARGEINT input as its 64 bits.
 
 A LARGEINT stays exact where a result takes it: COALESCE, IFNULL, NULLIF,
 GREATEST and LEAST return LARGEINT, where MySQL returns a DECIMAL of the same

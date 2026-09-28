@@ -9,6 +9,7 @@ const std = @import("std");
 
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
+const exec_expr = @import("../exec/expr.zig");
 const parse_predicate = @import("parse_predicate.zig");
 const Value = types.Value;
 
@@ -1137,8 +1138,10 @@ const InsertRows = struct {
         // A fraction is the DECIMAL constant it spells, as anywhere else in
         // an expression, so the rows meet at a decimal that holds each one's
         // digits rather than at a DOUBLE.
+        // A hex literal stays one, so compile stores it by the column it
+        // lands in: its integer in a numeric column, its bytes elsewhere.
         const fraction = (try parse_predicate.unsignedTokenAhead(p)).tag == .floating;
-        try self.cells.append(p.arena, if (literal and !fraction) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
+        try self.cells.append(p.arena, if (literal and !fraction and !p.cur.isHexLiteral()) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
         return true;
     }
 
@@ -1419,6 +1422,8 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
                         try p.expect(.rparen);
                     }
                     default_now = true;
+                } else if (p.cur.isHexLiteral()) {
+                    default_value = exec_expr.hexStoredValue((try p.parseValue()).text, ty);
                 } else {
                     default_value = try p.parseValue();
                 }

@@ -525,7 +525,7 @@ fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan)
     errdefer q.deinit();
 
     try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
-    q = try q.udfGroupBy(plan.group_by.group_cols, try temporalAggNumbers(input, &q, plan.group_by.aggs), registry);
+    q = try q.udfGroupBy(plan.group_by.group_cols, try mysqlAggInputs(input, &q, plan.group_by.aggs), registry);
     // HAVING runs as a generic filter over the (small) grouped output.
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
     if (plan.order_by) |o| {
@@ -555,7 +555,7 @@ fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNP
     errdefer q.deinit();
 
     try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
-    q = try q.groupBy(plan.group_by.group_cols, try temporalAggNumbers(input, &q, plan.group_by.aggs));
+    q = try q.groupBy(plan.group_by.group_cols, try mysqlAggInputs(input, &q, plan.group_by.aggs));
     if (plan.having_filter) |f| q = try q.filter(f.predicate);
     if (plan.order_by) |o| {
         if (plan.limit) |l| {
@@ -760,11 +760,12 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
 
 /// `aggs` as they read `q`'s output in MySQL, where a DATE or DATETIME
 /// input to a numbers-only aggregate is the number it spells
-/// (`aggregate_op.readsTemporalAsNumber`): those read a column of that number
-/// that this layers onto `q`. `aggs` itself when none does, or in the
-/// other dialects, which reject it.
-pub fn temporalAggNumbers(input: CompileInput, q: *exec.Query, aggs: []const exec.AggSpec) ![]const exec.AggSpec {
-    if (input.session.dialect != .mysql) return aggs;
+/// (`aggregate_op.readsTemporalAsNumber`), and a bit aggregate reads a
+/// double, decimal or text value as MySQL's bit operators read an operand
+/// (`aggregate_op.readsOperandBits`): those read a column of that number
+/// that this layers onto `q`. `aggs` itself when none does. The other
+/// dialects reject a temporal input.
+pub fn mysqlAggInputs(input: CompileInput, q: *exec.Query, aggs: []const exec.AggSpec) ![]const exec.AggSpec {
     const schema = q.outputSchema();
     var derived: std.ArrayListUnmanaged(ir.Derived) = .empty;
     defer derived.deinit(input.allocator);
@@ -772,10 +773,16 @@ pub fn temporalAggNumbers(input: CompileInput, q: *exec.Query, aggs: []const exe
     for (aggs, 0..) |a, i| {
         const col = a.col orelse continue;
         const idx = types.findColumn(schema, col) orelse continue;
-        if (!exec.aggregate_op.readsTemporalAsNumber(a.func, schema[idx].type)) continue;
+        const in = schema[idx].type;
+        const expr = if (input.session.dialect == .mysql and exec.aggregate_op.readsTemporalAsNumber(a.func, in))
+            try exec.expr_mod.call(input.node_arena, "to_bigint", &.{.{ .col_ref = col }})
+        else if (exec.aggregate_op.readsOperandBits(a.func, in))
+            try exec.expr_mod.call(input.node_arena, exec.scalar_fn.bitOperatorFn(.bitor, .mysql), &.{ .{ .col_ref = col }, .{ .lit = .{ .bigint = 0 } } })
+        else
+            continue;
         if (out.len == 0) out = try input.node_arena.dupe(exec.AggSpec, aggs);
         const name = try std.fmt.allocPrint(input.node_arena, "__agg_number_{d}", .{i});
-        try derived.append(input.allocator, .{ .name = name, .expr = try exec.expr_mod.call(input.node_arena, "to_bigint", &.{.{ .col_ref = col }}) });
+        try derived.append(input.allocator, .{ .name = name, .expr = expr });
         out[i].col = name;
     }
     if (derived.items.len == 0) return aggs;
@@ -1599,7 +1606,7 @@ fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: Gl
     errdefer q.deinit();
 
     try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
-    const aggs = try temporalAggNumbers(input, &q, plan.group_by.aggs);
+    const aggs = try mysqlAggInputs(input, &q, plan.group_by.aggs);
     if (hasUdfAgg(aggs)) {
         const registry = input.udf_registry orelse return error.UnsupportedQueryShape;
         q = try q.udfGroupBy(&.{}, aggs, registry);

@@ -2795,7 +2795,7 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     defer arena.deinit();
     const aa = arena.allocator();
 
-    var source = try compileSubplan(ctx, op.source);
+    var source = try compileSubplan(ctx, try hexStoredInsertSource(aa, op, t));
     defer source.deinit();
 
     const src_schema = source.outputSchema();
@@ -3068,6 +3068,7 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     // Each written table's columns: its own source column, or an assignment's.
     const table_to_source = try aa.alloc(?[]?usize, tables.len);
     @memset(table_to_source, null);
+    var numeric: std.ArrayList([]const u8) = .empty;
     for (u.assignments, 0..) |a, i| {
         const k = try assignmentTarget(u.targets, tables, a);
         const t = tables[k];
@@ -3083,9 +3084,10 @@ fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
             break :blk own;
         };
         map[ci] = star_width + i;
+        if (a.value == .col_ref and exec.expr_mod.storesHexAsNumber(t.schema.columns[ci].type)) try numeric.append(aa, a.value.col_ref);
     }
 
-    var source = try compileSubplan(ctx, u.source.?);
+    var source = try compileSubplan(ctx, try hexStoredNamed(aa, u.source.?, numeric.items));
     defer source.deinit();
     if (source.outputSchema().len != star_width + u.assignments.len) return Error.BadRequest;
     const plans = try aa.alloc(?InsertColumnPlan, tables.len);
@@ -3505,12 +3507,106 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
 fn hexAssigned(schema: TableSchema, col: []const u8, value: ir.Expr) ir.Expr {
     const bytes = exec.expr_mod.hexLiteralBytes(value) orelse return value;
     const ci = schema.columnIndex(col) orelse return value;
-    if (!storesHexAsNumber(schema.columns[ci].type)) return value;
+    if (!exec.expr_mod.storesHexAsNumber(schema.columns[ci].type)) return value;
     return .{ .lit = exec.expr_mod.hexLiteralNumber(bytes) };
 }
 
-fn storesHexAsNumber(ty: types.Type) bool {
-    return ty.isInteger() or ty.isFloat() or ty.isDecimal() or ty == .boolean;
+/// An INSERT ... SELECT's query with each column it computes as a hex
+/// literal for a numeric column of `t` holding the literal's integer, as
+/// `hexResolvedRows` stores a literal VALUES cell. Expression VALUES rows
+/// reach here as such a query (`parse_ddl.valuesQuery`). A column behind a
+/// `*` keeps what it computes.
+fn hexStoredInsertSource(aa: Allocator, op: ir.InsertSelect, t: *ApiTable) Allocator.Error!*ir.Op {
+    const numeric = try aa.alloc(bool, if (op.columns) |cols| cols.len else t.schema.columns.len);
+    for (numeric, 0..) |*n, i| {
+        const ci = if (op.columns) |cols| t.schema.columnIndex(cols[i]) else i;
+        n.* = if (ci) |c| exec.expr_mod.storesHexAsNumber(t.schema.columns[c].type) else false;
+    }
+    return try hexStoredAt(aa, op.source, numeric);
+}
+
+/// `source` with its columns at the positions `numeric` marks stored as
+/// numbers (`hexStoredNamed`), each branch of a UNION by position.
+fn hexStoredAt(aa: Allocator, source: *ir.Op, numeric: []const bool) Allocator.Error!*ir.Op {
+    var copy = source.*;
+    switch (copy) {
+        .set_union => |*u| {
+            u.left = try hexStoredAt(aa, u.left, numeric);
+            u.right = try hexStoredAt(aa, u.right, numeric);
+            if (u.left == source.set_union.left and u.right == source.set_union.right) return source;
+        },
+        .order_by => |*o| {
+            o.upstream = try hexStoredAt(aa, o.upstream, numeric);
+            if (o.upstream == source.order_by.upstream) return source;
+        },
+        .limit => |*l| {
+            l.upstream = try hexStoredAt(aa, l.upstream, numeric);
+            if (l.upstream == source.limit.upstream) return source;
+        },
+        .select => |*p| {
+            var names: std.ArrayList([]const u8) = .empty;
+            for (p.columns, 0..) |c, i| {
+                if (std.mem.endsWith(u8, c, "*")) return source;
+                if (i < numeric.len and numeric[i]) try names.append(aa, c);
+            }
+            p.upstream = try hexStoredNamed(aa, p.upstream, names.items);
+            if (p.upstream == source.select.upstream) return source;
+        },
+        else => return source,
+    }
+    const out = try aa.create(ir.Op);
+    out.* = copy;
+    return out;
+}
+
+/// `source` with each column named in `numeric` that it computes as a hex
+/// literal holding the literal's integer, as `hexAssigned` stores one in a
+/// numeric column. The ops down to each such Compute are copied; `source`
+/// itself when it computes none.
+fn hexStoredNamed(aa: Allocator, source: *ir.Op, numeric: []const []const u8) Allocator.Error!*ir.Op {
+    if (numeric.len == 0) return source;
+    var copy = source.*;
+    switch (copy) {
+        .compute => |*c| {
+            var derived: ?[]ir.Derived = null;
+            for (c.derived, 0..) |d, i| {
+                const bytes = exec.expr_mod.hexLiteralBytes(d.expr) orelse continue;
+                if (!nameListed(numeric, d.name)) continue;
+                const out = derived orelse try aa.dupe(ir.Derived, c.derived);
+                out[i].expr = .{ .lit = exec.expr_mod.hexLiteralNumber(bytes) };
+                derived = out;
+            }
+            c.upstream = try hexStoredNamed(aa, c.upstream, numeric);
+            if (derived == null and c.upstream == source.compute.upstream) return source;
+            if (derived) |d| c.derived = d;
+        },
+        .select, .exclude => |*p| {
+            const before = p.upstream;
+            p.upstream = try hexStoredNamed(aa, before, numeric);
+            if (p.upstream == before) return source;
+        },
+        .filter => |*f| {
+            f.upstream = try hexStoredNamed(aa, f.upstream, numeric);
+            if (f.upstream == source.filter.upstream) return source;
+        },
+        .order_by => |*o| {
+            o.upstream = try hexStoredNamed(aa, o.upstream, numeric);
+            if (o.upstream == source.order_by.upstream) return source;
+        },
+        .limit => |*l| {
+            l.upstream = try hexStoredNamed(aa, l.upstream, numeric);
+            if (l.upstream == source.limit.upstream) return source;
+        },
+        else => return source,
+    }
+    const out = try aa.create(ir.Op);
+    out.* = copy;
+    return out;
+}
+
+fn nameListed(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (types.columnNameEql(n, name)) return true;
+    return false;
 }
 
 /// The rows with each hex-literal cell bound for a numeric column holding the
@@ -3528,7 +3624,7 @@ fn hexResolvedRows(aa: Allocator, op: ir.InsertOp, schema: TableSchema) ![]const
         else
             cell.column;
         if (target >= schema.columns.len) return Error.BadRequest;
-        if (!storesHexAsNumber(schema.columns[target].type)) continue;
+        if (!exec.expr_mod.storesHexAsNumber(schema.columns[target].type)) continue;
         const bytes = switch (rows[cell.row][cell.column] orelse continue) {
             .text => |t| t,
             else => continue,
@@ -3994,8 +4090,7 @@ fn coerceToUuid(v: Value) !u128 {
 fn coerceToDecimal64(v: Value, spec: @import("../types.zig").DecimalSpec) !i64 {
     return switch (v) {
         .decimal64 => |d| d,
-        .int => |x| try scaleIntToDecimal(i64, x, spec.s),
-        .bigint => |x| try scaleIntToDecimal(i64, x, spec.s),
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |x| try scaleIntToDecimal(i64, x, spec.s),
         .float, .double, .text => std.math.cast(i64, try decimalLiteralMantissa(v, spec)) orelse error.ValueOutOfRange,
         else => Error.TypeMismatch,
     };
@@ -4005,8 +4100,7 @@ fn coerceToDecimal128(v: Value, spec: @import("../types.zig").DecimalSpec) !i128
     return switch (v) {
         .decimal64 => |d| @as(i128, d),
         .decimal128 => |d| d,
-        .int => |x| try scaleIntToDecimal(i128, x, spec.s),
-        .bigint => |x| try scaleIntToDecimal(i128, x, spec.s),
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |x| try scaleIntToDecimal(i128, x, spec.s),
         .float, .double, .text => try decimalLiteralMantissa(v, spec),
         else => Error.TypeMismatch,
     };
@@ -4031,7 +4125,7 @@ fn decimalLiteralMantissa(v: Value, spec: @import("../types.zig").DecimalSpec) !
 }
 
 fn scaleIntToDecimal(comptime T: type, x: anytype, scale: u8) !T {
-    var out: T = @intCast(x);
+    var out: T = std.math.cast(T, x) orelse return error.ValueOutOfRange;
     var i: u8 = 0;
     while (i < scale) : (i += 1) {
         out = std.math.mul(T, out, 10) catch return Error.TypeMismatch;

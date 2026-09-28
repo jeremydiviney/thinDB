@@ -329,9 +329,12 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
 /// constant columns and the comparison keeps or drops every row.
 fn parseScalarLhs(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     const lhs = try p.parseScalar();
-    if (exec_expr.hexLiteralBytes(lhs) != null and isComparisonToken(p.cur.tag) and p.cur.tag != .null_safe_eq) {
-        const op = try parseComparisonToken(p);
-        return try elementComparison(p, lhs, op, try p.parseScalar());
+    if (exec_expr.hexLiteralBytes(lhs) != null) {
+        if (isComparisonToken(p.cur.tag) and p.cur.tag != .null_safe_eq) {
+            const op = try parseComparisonToken(p);
+            return try elementComparison(p, lhs, op, try p.parseScalar());
+        }
+        if (try hexRangeOrList(p, lhs)) |pred| return pred;
     }
     const lhs_val = switch (leafOperand(lhs)) {
         .lit => |v| v,
@@ -355,6 +358,57 @@ fn parseScalarLhs(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         .null_lit => .unknown,
         else => try makeExprComparisonPredicate(p, lhs, op_lhs, rhs),
     };
+}
+
+/// `hex [NOT] BETWEEN lo AND hi` or `hex [NOT] IN (a, ...)` with a hex
+/// literal on the left: each bound or entry compared with the literal as that
+/// operand reads it (`elementComparison`), its integer against a number and
+/// its bytes against a string. Null, with nothing consumed, before any other
+/// tail or `IN (SELECT ...)`. NULL entries drop out of the list, as they do
+/// after a column.
+fn hexRangeOrList(p: anytype, hex: ir.Expr) @TypeOf(p.*).Err!?PredicateExpr {
+    const PE = @TypeOf(p.*).Err;
+    var look = p.lex.*;
+    const tail = if (p.cur.tag == .kw_not) try look.next() else p.cur;
+    switch (tail.tag) {
+        .kw_between => {},
+        .kw_in => {
+            if ((try look.next()).tag != .lparen or p.startsQuery((try look.next()).tag)) return null;
+        },
+        else => return null,
+    }
+    const negated = p.cur.tag == .kw_not;
+    if (negated) try p.advance();
+    const tested: PredicateExpr = if (p.cur.tag == .kw_between) blk: {
+        try p.advance();
+        const lo = try p.parseScalar();
+        if (p.cur.tag != .kw_and) return PE.SqlExpectedKeyword;
+        try p.advance();
+        const kids = try p.arena.alloc(PredicateExpr, 2);
+        kids[0] = try elementComparison(p, hex, .gte, lo);
+        kids[1] = try elementComparison(p, hex, .lte, try p.parseScalar());
+        break :blk .{ .@"and" = kids };
+    } else blk: {
+        try p.advance();
+        try p.expect(.lparen);
+        var kids: std.ArrayList(PredicateExpr) = .empty;
+        while (true) {
+            if (p.cur.tag == .kw_null) {
+                try p.advance();
+            } else {
+                try kids.append(p.arena, try elementComparison(p, hex, .eq, try p.parseScalar()));
+            }
+            if (p.cur.tag != .comma) break;
+            try p.advance();
+        }
+        try p.expect(.rparen);
+        break :blk switch (kids.items.len) {
+            0 => .{ .always = false },
+            1 => kids.items[0],
+            else => .{ .@"or" = kids.items },
+        };
+    };
+    return if (negated) try negatePredicate(p, tested) else tested;
 }
 
 /// The operator tail after a scalar expression (a call, a parenthesized

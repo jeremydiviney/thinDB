@@ -2275,17 +2275,22 @@ fn buildCallPlan(
 }
 
 /// The call with each hex literal it reads as a number replaced by that
-/// integer (`scalar_fn.readsNumberAt`), or null when it reads none so.
+/// integer (`scalar_fn.readsNumberAt`), taking the function that reads a
+/// first one so (`scalar_fn.hexNumberFn`), or null when it reads none so.
 fn hexNumbersRead(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr.Call) Allocator.Error!?Expr {
     var args: ?[]Expr = null;
     for (c.args, 0..) |arg, i| {
         const bytes = expr_mod.hexLiteralBytes(arg) orelse continue;
         if (!scalar_fn.readsNumberAt(udf_registry, c.fn_name, c.args.len, i)) continue;
+        // `X''` stays empty text there, which BIN and CONV give NULL for.
+        if (bytes.len == 0 and i == 0 and scalar_fn.readsNumberAsText(c.fn_name)) continue;
         const out = args orelse try aa.dupe(Expr, c.args);
         out[i] = .{ .lit = expr_mod.hexLiteralNumber(bytes) };
         args = out;
     }
-    return if (args) |a| Expr{ .call = .{ .fn_name = c.fn_name, .args = a } } else null;
+    const a = args orelse return null;
+    const first_read = expr_mod.hexLiteralBytes(c.args[0]) != null and a[0] != .call;
+    return Expr{ .call = .{ .fn_name = if (first_read) scalar_fn.hexNumberFn(c.fn_name, c.args.len) else c.fn_name, .args = a } };
 }
 
 /// NULLIF(a, b) is NULL where `a = b`, so a constant meeting an argument it
