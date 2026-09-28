@@ -382,6 +382,24 @@ pub fn computeNewRows(
     };
     defer compute_q.deinit();
 
+    // An assigned value that doesn't land in its column as it is takes the
+    // column's cast first, as an INSERT's does.
+    var cast_arena = std.heap.ArenaAllocator.init(allocator);
+    defer cast_arena.deinit();
+    const ca = cast_arena.allocator();
+    const cast_names = try ca.alloc(?[]const u8, assignments.len);
+    var casts: std.ArrayList(exec.Derived) = .empty;
+    const assigned_schema = compute_q.outputSchema();
+    for (assignments, synth_names, cast_names, 0..) |asn, syn, *cast_name, i| {
+        cast_name.* = null;
+        const target = schema.columns[schema.columnIndex(asn.col) orelse continue].type;
+        const from = assigned_schema[columnIn(assigned_schema, syn).?].type;
+        const expr = try cast.assignmentCastExpr(ca, syn, from, target) orelse continue;
+        cast_name.* = try std.fmt.allocPrint(ca, "__updc_{d}", .{i});
+        try casts.append(ca, .{ .name = cast_name.*.?, .expr = expr });
+    }
+    if (casts.items.len > 0) compute_q = try compute_q.compute(casts.items);
+
     // Drain Compute (just one batch out, since input is one batch).
     var got: ?exec.Batch = null;
     while (try compute_q.next()) |b| {
@@ -403,22 +421,18 @@ pub fn computeNewRows(
     for (schema.columns, 0..) |sc, ci| {
         var src_view: ColumnView = matched.stores[ci].view();
         var src_type = sc.type;
-        // Was this column assigned? If so, replace src_view with the
-        // synthetic column from Compute's output.
-        for (assignments, synth_names) |asn, syn| {
-            if (@import("../types.zig").columnNameEql(asn.col, sc.name)) {
-                // Find synthetic column in `out`'s schema. The synthetic
-                // name is generated internally so it's an exact match;
-                // no case-folding needed.
-                for (out.schema, 0..) |out_col, oi| {
-                    if (std.mem.eql(u8, out_col.name, syn)) {
-                        src_view = out.values[oi];
-                        src_type = out_col.type;
-                        break;
-                    }
-                }
-                break;
+        for (assignments, synth_names, cast_names) |asn, syn, cast_name| {
+            if (!types.columnNameEql(asn.col, sc.name)) continue;
+            const oi = columnIn(out.schema, syn).?;
+            src_view = out.values[oi];
+            src_type = out.schema[oi].type;
+            if (cast_name) |name| {
+                const cast_i = columnIn(out.schema, name).?;
+                if (cast.assignmentDroppedValue(src_view, out.values[cast_i], matched_count)) return error.TypeMismatch;
+                src_view = out.values[cast_i];
+                src_type = out.schema[cast_i].type;
             }
+            break;
         }
         const assigned: ?ColumnView = if (cast.assignsByRule(src_type, sc.type))
             try cast.assignColumn(allocator, src_view, src_type, sc.type, matched_count)
@@ -442,4 +456,12 @@ pub fn computeNewRows(
     }
 
     return .{ .stores = out_stores, .row_count = matched_count };
+}
+
+/// The column named `name`, one `computeNewRows` generated, so matched exactly.
+fn columnIn(columns: []const types.Column, name: []const u8) ?usize {
+    for (columns, 0..) |c, i| {
+        if (std.mem.eql(u8, c.name, name)) return i;
+    }
+    return null;
 }
