@@ -1926,7 +1926,7 @@ pub const Parser = struct {
         const tok = try look.next();
         if (keywordScalarName(tok.tag) != null) return true;
         return switch (tok.tag) {
-            .identifier, .integer, .big_integer, .floating, .string, .star, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case, .kw_not, .kw_exists, .kw_distinct, .kw_all => true,
+            .identifier, .integer, .big_integer, .floating, .string, .star, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .system_variable, .kw_null, .kw_true, .kw_false, .kw_case, .kw_not, .kw_exists, .kw_distinct, .kw_all => true,
             else => false,
         };
     }
@@ -2027,7 +2027,7 @@ pub const Parser = struct {
         // expression parser so binary operators and aliasing work.
         // (`GROUP BY 1` then references it as ordinal 1.)
         const scalar_led = switch (self.cur.tag) {
-            .plus, .minus, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier => true,
+            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier, .system_variable => true,
             else => try self.prefixOperatorAhead(),
         };
         if (scalar_led) return try self.namedExprItem(item_start, try self.parseScalar());
@@ -2593,7 +2593,7 @@ pub const Parser = struct {
         var look = self.lex.*;
         const next = try look.next();
         return switch (next.tag) {
-            .identifier, .integer, .big_integer, .floating, .string, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case => true,
+            .identifier, .integer, .big_integer, .floating, .string, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .system_variable, .kw_null, .kw_true, .kw_false, .kw_case => true,
             else => keywordScalarName(next.tag) != null,
         };
     }
@@ -3390,7 +3390,10 @@ pub const Parser = struct {
 
     fn castExprToType(self: *Parser, inner: ir.Expr, ty: types.Type) ParseError!ir.Expr {
         if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
-        const fn_name = try scalar_fn.castFnName(self.arena, ty) orelse return ParseError.SqlInvalidProjection;
+        const fn_name = if (self.lex.dialect == .postgres and ty.isString() and ty != .json)
+            scalar_fn.PG_TEXT_FN
+        else
+            try scalar_fn.castFnName(self.arena, ty) orelse return ParseError.SqlInvalidProjection;
         const args = try self.arena.alloc(ir.Expr, 1);
         args[0] = inner;
         return ir.Expr{ .call = .{ .fn_name = fn_name, .args = args } };
@@ -3589,6 +3592,12 @@ pub const Parser = struct {
                 const var_name = try self.arena.dupe(u8, self.cur.text);
                 try self.advance();
                 return ir.Expr{ .var_ref = var_name };
+            },
+            .system_variable => {
+                const args = try self.arena.alloc(ir.Expr, 1);
+                args[0] = .{ .lit = .{ .text = try self.arena.dupe(u8, self.cur.text) } };
+                try self.advance();
+                return ir.Expr{ .call = .{ .fn_name = scalar_fn.SYSTEM_VARIABLE_FN, .args = args } };
             },
             .lparen => {
                 // Parenthesized sub-expression OR scalar subquery.

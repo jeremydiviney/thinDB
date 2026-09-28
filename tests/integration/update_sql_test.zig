@@ -558,3 +558,158 @@ test "a DECIMAL UPDATE replays from the WAL as it was stored (#352)" {
     defer db.close();
     try expectDecimals(allocator, db, "up", &.{ "1.13", "4.00", "1.13" });
 }
+
+const old_ts = "'2001-01-01 00:00:00'";
+const recent = "'2020-01-01 00:00:00'";
+
+fn expectIds(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, want: []const i64) !void {
+    const got = try collectBigints(allocator, db, sql);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(i64, want, got);
+}
+
+/// Every value of the single DATETIME column `sql` returns.
+fn collectDatetimes(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) ![]i64 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(i64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (batch.values[0].data.datetime[0..batch.row_count]) |v| try out.append(allocator, v);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "ON UPDATE CURRENT_TIMESTAMP stamps the rows an UPDATE changes, with one timestamp (#251)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ou (id BIGINT PRIMARY KEY, v INT, note VARCHAR(8), " ++
+        "ts DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, also DATETIME ON UPDATE NOW())");
+    try exec(allocator, db, "INSERT INTO ou VALUES (1, 10, 'a', " ++ old_ts ++ ", NULL), (2, 20, 'b', " ++ old_ts ++ ", NULL), " ++
+        "(3, 30, NULL, " ++ old_ts ++ ", NULL)");
+    const t = try db.openTable("ou", .{});
+    try t.flush();
+    try exec(allocator, db, "INSERT INTO ou VALUES (4, 40, 'd', " ++ old_ts ++ ", NULL)");
+
+    // Row 2 already holds 20, so it doesn't change and isn't stamped.
+    try exec(allocator, db, "UPDATE ou SET v = 20 WHERE id <= 2");
+    try expectIds(allocator, db, "SELECT id FROM ou WHERE ts > " ++ recent ++ " AND ts = also ORDER BY id", &.{1});
+    try expectIds(allocator, db, "SELECT id FROM ou WHERE ts = " ++ old_ts ++ " AND also IS NULL ORDER BY id", &.{ 2, 3, 4 });
+
+    // NULL to NULL is no change either. Segment and memtable rows take the
+    // statement's one timestamp.
+    try exec(allocator, db, "UPDATE ou SET note = NULL");
+    try expectIds(allocator, db, "SELECT id FROM ou WHERE ts = " ++ old_ts ++ " AND also IS NULL ORDER BY id", &.{3});
+    const stamps = try collectDatetimes(allocator, db, "SELECT ts FROM ou WHERE id <> 3 AND ts = also ORDER BY id");
+    defer allocator.free(stamps);
+    try std.testing.expectEqual(@as(usize, 3), stamps.len);
+    for (stamps) |s| try std.testing.expectEqual(stamps[0], s);
+
+    // An explicit assignment wins, even of the value the row holds.
+    try exec(allocator, db, "UPDATE ou SET v = 31, ts = ts WHERE id = 3");
+    try expectIds(allocator, db, "SELECT id FROM ou WHERE ts = " ++ old_ts ++ " AND also > " ++ recent, &.{3});
+    try exec(allocator, db, "UPDATE ou SET also = NULL, v = 32 WHERE id = 3");
+    try expectIds(allocator, db, "SELECT id FROM ou WHERE ts > " ++ recent ++ " AND also IS NULL", &.{3});
+}
+
+test "ON DUPLICATE KEY UPDATE stamps as UPDATE does, and the CDC upsert keeps its source timestamp (#251)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE cdc (id BIGINT PRIMARY KEY, m INT, n VARCHAR(8), " ++
+        "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+    try exec(allocator, db, "INSERT INTO cdc VALUES (1, 1, 'a', " ++ old_ts ++ "), (2, 2, 'b', " ++ old_ts ++ "), (3, 3, 'c', " ++ old_ts ++ ")");
+    const t = try db.openTable("cdc", .{});
+    try t.flush();
+
+    // The update branch leaves updated_at out; row 2's m doesn't change.
+    try exec(allocator, db, "INSERT INTO cdc (id, m) VALUES (1, 10), (2, 2) ON DUPLICATE KEY UPDATE m = VALUES(m)");
+    try expectIds(allocator, db, "SELECT id FROM cdc WHERE updated_at > " ++ recent ++ " ORDER BY id", &.{1});
+    try exec(allocator, db, "INSERT INTO cdc (id, m, updated_at) VALUES (3, 30, " ++ old_ts ++ ") " ++
+        "ON DUPLICATE KEY UPDATE m = VALUES(m) + 3, updated_at = VALUES(updated_at)");
+    try expectIds(allocator, db, "SELECT m FROM cdc WHERE id = 3 AND updated_at = " ++ old_ts, &.{33});
+
+    // The Flink sink's shape: every column from the new row, updated_at included.
+    const rows = "(1, 100, 'x', '2005-05-05 05:05:05'), (2, 2, 'b', '2006-06-06 06:06:06'), (3, 3, 'c', " ++ old_ts ++ "), " ++
+        "(5, 5, 'e', '2007-07-07 07:07:07')";
+    try exec(allocator, db, "INSERT INTO cdc (id, m, n, updated_at) VALUES " ++ rows ++ " ON DUPLICATE KEY UPDATE " ++
+        "id = VALUES(id), m = VALUES(m), n = VALUES(n), updated_at = VALUES(updated_at)");
+    try exec(allocator, db, "CREATE TABLE plain (id BIGINT PRIMARY KEY, m INT, n VARCHAR(8), updated_at DATETIME NOT NULL)");
+    try exec(allocator, db, "INSERT INTO plain VALUES " ++ rows);
+    const want = try collectDatetimes(allocator, db, "SELECT updated_at FROM plain ORDER BY id");
+    defer allocator.free(want);
+    const got = try collectDatetimes(allocator, db, "SELECT updated_at FROM cdc ORDER BY id");
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(i64, want, got);
+}
+
+test "UPDATE ... JOIN stamps the changed rows of each table it writes (#251)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ju (id BIGINT PRIMARY KEY, v INT, ts DATETIME ON UPDATE CURRENT_TIMESTAMP)");
+    try exec(allocator, db, "CREATE TABLE js (id BIGINT PRIMARY KEY, v INT, ts DATETIME ON UPDATE CURRENT_TIMESTAMP)");
+    try exec(allocator, db, "INSERT INTO ju VALUES (1, 1, NULL), (2, 2, NULL), (3, 3, NULL)");
+    try exec(allocator, db, "INSERT INTO js VALUES (1, 10, NULL), (2, 2, NULL)");
+
+    try exec(allocator, db, "UPDATE ju JOIN js ON ju.id = js.id SET ju.v = js.v");
+    try expectIds(allocator, db, "SELECT id FROM ju WHERE ts > " ++ recent ++ " ORDER BY id", &.{1});
+    try expectIds(allocator, db, "SELECT id FROM js WHERE ts IS NOT NULL", &.{});
+
+    // An explicit assignment wins, even of the value the row holds.
+    try exec(allocator, db, "UPDATE ju JOIN js ON ju.id = js.id SET ju.v = js.v + 1, ju.ts = ju.ts WHERE ju.id = 2");
+    try expectIds(allocator, db, "SELECT id FROM ju WHERE ts IS NULL ORDER BY id", &.{ 2, 3 });
+
+    // Both tables written: js row 2 already holds 2.
+    try exec(allocator, db, "UPDATE ju JOIN js ON ju.id = js.id SET ju.v = 0, js.v = 2 WHERE ju.id = 2");
+    try expectIds(allocator, db, "SELECT id FROM ju WHERE ts > " ++ recent ++ " ORDER BY id", &.{ 1, 2 });
+    try expectIds(allocator, db, "SELECT id FROM js WHERE ts IS NOT NULL", &.{});
+    try exec(allocator, db, "UPDATE ju JOIN js ON ju.id = js.id SET ju.v = 0, js.v = 20 WHERE ju.id = 2");
+    try expectIds(allocator, db, "SELECT id FROM js WHERE ts > " ++ recent, &.{2});
+}
+
+test "ON UPDATE timestamps replay from the WAL as they were stored (#251)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const config: thindb.Config = .{ .wal_enabled = true, .auto_flush_secs = 0 };
+    var before: []i64 = undefined;
+    var manifest: []u8 = undefined;
+    var wal: []u8 = undefined;
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, config);
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE wu (id BIGINT PRIMARY KEY, v INT, ts DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+        try exec(allocator, db, "INSERT INTO wu (id, v) VALUES (1, 1), (2, 2)");
+        const t = try db.openTable("wu", .{});
+        try t.flush();
+        try exec(allocator, db, "INSERT INTO wu (id, v) VALUES (3, 3)");
+        try exec(allocator, db, "UPDATE wu SET v = v + 1 WHERE id >= 2");
+        try exec(allocator, db, "INSERT INTO wu (id, v) VALUES (1, 10) ON DUPLICATE KEY UPDATE v = VALUES(v)");
+        before = try collectDatetimes(arena.allocator(), db, "SELECT ts FROM wu ORDER BY id");
+        manifest = try t.table_dir.readFileAlloc(io, "manifest", arena.allocator(), .unlimited);
+        wal = try t.table_dir.readFileAlloc(io, "wal", arena.allocator(), .unlimited);
+    }
+    try std.testing.expectEqual(@as(usize, 3), before.len);
+    // As if the process had died right after the upsert.
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/wu/manifest", .data = manifest });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/wu/wal", .data = wal });
+    var db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    const after = try collectDatetimes(allocator, db, "SELECT ts FROM wu ORDER BY id");
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(i64, before, after);
+}

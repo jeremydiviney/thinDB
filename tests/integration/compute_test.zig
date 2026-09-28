@@ -518,7 +518,7 @@ test "compute: conversion — numeric widening, narrowing, parsing, stringifying
     try std.testing.expectEqualSlices(?i32, &[_]?i32{ 123, null }, s_to_i.items);
     try std.testing.expectEqualSlices(?f64, &[_]?f64{ 123.0, null }, s_to_d.items);
     try std.testing.expectEqualStrings("42|-7|", i_to_s_concat.items);
-    try std.testing.expectEqualStrings("true|false|", b_to_s_concat.items);
+    try std.testing.expectEqualStrings("1|0|", b_to_s_concat.items);
 }
 
 test "compute: hash — md5, sha1, sha256, crc32 produce expected digests" {

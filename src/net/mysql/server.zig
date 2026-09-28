@@ -1414,7 +1414,9 @@ fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8, connect
     if (std.mem.eql(u8, expr, "null")) return .null_value;
 
     if (std.mem.startsWith(u8, expr, "@@")) {
-        return .{ .text = syntheticVariableValue(expr[2..], current_schema) };
+        // Only a bare name: the engine evaluates one inside an expression.
+        for (expr[2..]) |c| if (!isIdentByte(c) and c != '.') return null;
+        return .{ .text = handshake.systemVariableValue(expr[2..], current_schema) };
     }
 
     if (std.mem.eql(u8, expr, "version()")) return .{ .text = handshake.server_version };
@@ -1428,72 +1430,6 @@ fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8, connect
     if (std.mem.eql(u8, expr, "connection_id")) return .{ .text = connection_id };
 
     return null;
-}
-
-fn syntheticVariableValue(var_in: []const u8, current_schema: []const u8) []const u8 {
-    var v = std.mem.trim(u8, var_in, " \t\r\n");
-    if (std.mem.startsWith(u8, v, "global.")) v = v["global.".len..];
-    if (std.mem.startsWith(u8, v, "session.")) v = v["session.".len..];
-    if (std.mem.startsWith(u8, v, "local.")) v = v["local.".len..];
-
-    if (std.mem.eql(u8, v, "version")) return handshake.server_version;
-    if (std.mem.eql(u8, v, "version_comment")) return "thinDB";
-    if (std.mem.eql(u8, v, "version_compile_os")) return osLabel();
-    if (std.mem.eql(u8, v, "version_compile_machine")) return "x86_64";
-    if (std.mem.eql(u8, v, "protocol_version")) return "10";
-    if (std.mem.eql(u8, v, "license")) return "thinDB";
-    if (std.mem.eql(u8, v, "hostname")) return "localhost";
-    if (std.mem.eql(u8, v, "port")) return "3307";
-    if (std.mem.eql(u8, v, "server_id")) return "1";
-
-    if (std.mem.eql(u8, v, "database") or std.mem.eql(u8, v, "schema")) return current_schema;
-    if (std.mem.eql(u8, v, "max_allowed_packet")) return "16777216";
-    if (std.mem.eql(u8, v, "net_buffer_length")) return "16384";
-    if (std.mem.eql(u8, v, "wait_timeout")) return "28800";
-    if (std.mem.eql(u8, v, "interactive_timeout")) return "28800";
-    if (std.mem.eql(u8, v, "max_connections")) return "256";
-    if (std.mem.eql(u8, v, "group_concat_max_len")) return "1024";
-    if (std.mem.eql(u8, v, "sql_select_limit")) return "18446744073709551615";
-
-    if (std.mem.eql(u8, v, "tx_isolation") or std.mem.eql(u8, v, "transaction_isolation"))
-        return "REPEATABLE-READ";
-    if (std.mem.eql(u8, v, "sql_mode")) return "STRICT_TRANS_TABLES";
-    if (std.mem.eql(u8, v, "autocommit")) return "1";
-    if (std.mem.eql(u8, v, "lower_case_table_names")) return "1";
-    if (std.mem.eql(u8, v, "auto_increment_increment")) return "1";
-    if (std.mem.eql(u8, v, "auto_increment_offset")) return "1";
-    // Writable server. MySQL Connector/J parses these as integers on every
-    // batch (isReadOnly()); returning "" throws NumberFormatException and
-    // breaks the JDBC sink. thinDB is never read-only.
-    if (std.mem.eql(u8, v, "read_only") or
-        std.mem.eql(u8, v, "super_read_only") or
-        std.mem.eql(u8, v, "transaction_read_only") or
-        std.mem.eql(u8, v, "tx_read_only")) return "0";
-    if (std.mem.eql(u8, v, "default_storage_engine") or std.mem.eql(u8, v, "storage_engine")) return "thinDB";
-
-    if (std.mem.eql(u8, v, "character_set_client") or
-        std.mem.eql(u8, v, "character_set_connection") or
-        std.mem.eql(u8, v, "character_set_results") or
-        std.mem.eql(u8, v, "character_set_server") or
-        std.mem.eql(u8, v, "character_set_database"))
-        return "utf8mb4";
-    if (std.mem.eql(u8, v, "collation_connection") or
-        std.mem.eql(u8, v, "collation_server") or
-        std.mem.eql(u8, v, "collation_database"))
-        return "utf8mb4_general_ci";
-    if (std.mem.eql(u8, v, "time_zone")) return "SYSTEM";
-    if (std.mem.eql(u8, v, "system_time_zone")) return "UTC";
-
-    if (std.mem.startsWith(u8, v, "have_")) return "NO";
-    return "";
-}
-
-fn osLabel() []const u8 {
-    return switch (@import("builtin").os.tag) {
-        .windows => "Windows",
-        .macos => "macOS",
-        else => "Linux",
-    };
 }
 
 fn topLevelKeyword(text: []const u8, keyword: []const u8) ?usize {
@@ -1737,6 +1673,7 @@ fn allocCreateTableText(allocator: Allocator, t: *Table) ![]u8 {
         } else if (col.default_now) {
             try out.appendSlice(allocator, " DEFAULT CURRENT_TIMESTAMP");
         }
+        if (col.on_update_now) try out.appendSlice(allocator, " ON UPDATE CURRENT_TIMESTAMP");
         if (col.auto_increment) try out.appendSlice(allocator, " AUTO_INCREMENT");
     }
     if (t.schema.unique) {
@@ -1910,7 +1847,7 @@ fn sendColumnsResult(
                 defer if (default_text) |d| allocator.free(d);
                 const key = columnKey(table, col.name);
                 const nullable = if (col.nullable) "YES" else "NO";
-                const extra: []const u8 = if (col.auto_increment) "auto_increment" else "";
+                const extra = columnExtra(col);
                 if (full) {
                     const cells = [_]?[]const u8{
                         col.name,
@@ -2301,6 +2238,16 @@ fn allocInfoDataType(allocator: Allocator, t: types.Type) ![]u8 {
 
 fn columnCollation(col: types.Column) ?[]const u8 {
     return if (col.type.isString()) "utf8mb4_general_ci" else null;
+}
+
+/// The EXTRA text MySQL 8.4 reports for a column in SHOW COLUMNS and
+/// information_schema.COLUMNS.
+fn columnExtra(col: types.Column) []const u8 {
+    if (col.auto_increment) return "auto_increment";
+    if (col.default_now and col.on_update_now) return "DEFAULT_GENERATED on update CURRENT_TIMESTAMP";
+    if (col.default_now) return "DEFAULT_GENERATED";
+    if (col.on_update_now) return "on update CURRENT_TIMESTAMP";
+    return "";
 }
 
 fn columnKey(t: *Table, col_name: []const u8) []const u8 {
@@ -2950,7 +2897,8 @@ fn infoCell(
         const col = row.column orelse return try cellDup(allocator, owned, "");
         return try cellDup(allocator, owned, columnKey(t, col.name));
     }
-    if (keyContains(key, "extra") or keyContains(key, "column_comment") or keyContains(key, "generation_expression"))
+    if (keyContains(key, "extra")) return try cellDup(allocator, owned, if (row.column) |c| columnExtra(c) else "");
+    if (keyContains(key, "column_comment") or keyContains(key, "generation_expression"))
         return try cellDup(allocator, owned, "");
     if (keyContains(key, "privileges")) return try cellDup(allocator, owned, "select,insert,update,references");
     if (keyContains(key, "srs_id")) return null;
@@ -4167,8 +4115,7 @@ fn handleStmtExecute(
         while (r < batch.row_count) : (r += 1) {
             row_payload.clearRetainingCapacity();
             try prepared.appendBinaryRow(allocator, &row_payload, batch.schema, batch.values, r);
-            try packet.writePacket(w, seq_id, row_payload.items);
-            seq_id +%= 1;
+            try packet.writeLogicalPacket(w, &seq_id, row_payload.items);
         }
         profiler.recordSince(.stmt_execute_write, row_write_start);
     }
@@ -4334,4 +4281,44 @@ test "applyInitDb honors schema-within-current-db lookup" {
     try applyInitDb(c, &session, "reports");
     try std.testing.expectEqualStrings("main", session.current_db);
     try std.testing.expectEqualStrings("reports", session.current_schema);
+}
+
+test "SHOW CREATE TABLE, SHOW COLUMNS and information_schema report ON UPDATE CURRENT_TIMESTAMP as MySQL 8.4 does" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE stamped (id INT PRIMARY KEY, " ++
+        "a DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, b DATETIME ON UPDATE CURRENT_TIMESTAMP, " ++
+        "c DATETIME DEFAULT CURRENT_TIMESTAMP)", &profiler);
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "SHOW CREATE TABLE stamped", &profiler);
+    const ddl = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`a` datetime(6) DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`b` datetime(6) ON UPDATE CURRENT_TIMESTAMP,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`c` datetime(6) DEFAULT CURRENT_TIMESTAMP,") != null);
+
+    // Each EXTRA cell, with its length prefix, so one can't match inside another.
+    const queries = [_][]const u8{
+        "SHOW COLUMNS FROM stamped",
+        "SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS WHERE TABLE_NAME = 'stamped'",
+    };
+    for (queries) |query| {
+        out.clearRetainingCapacity();
+        try handleQuery(allocator, &out.writer, c, &session, query, &profiler);
+        const rows = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, rows, "\x2dDEFAULT_GENERATED on update CURRENT_TIMESTAMP") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rows, "\x1bon update CURRENT_TIMESTAMP") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rows, "\x11DEFAULT_GENERATED") != null);
+    }
 }

@@ -46,6 +46,7 @@ const ir = @import("../ir/ir.zig");
 
 const local = @import("local.zig");
 const wire_format = @import("wire_format.zig");
+const mysql_handshake = @import("mysql/handshake.zig");
 const CompileCtx = local.CompileCtx;
 const Error = local.Error;
 
@@ -202,6 +203,8 @@ fn sessionInfoExpr(ctx: *CompileCtx, name: []const u8) !?ir.Expr {
     }
     const text: []const u8 = text: {
         if (std.ascii.eqlIgnoreCase(name, "version")) break :text session.server_version orelse return null;
+        // No role is ever active.
+        if (std.ascii.eqlIgnoreCase(name, "current_role")) break :text "NONE";
         const user_fns = [_][]const u8{ "user", "current_user", "session_user", "system_user" };
         for (user_fns) |f| if (std.ascii.eqlIgnoreCase(name, f)) break :text session.user orelse return null;
         if (session.dialect != .mysql) return null;
@@ -260,9 +263,24 @@ fn systemTextTypeName(c: exec.expr_mod.Expr.Call) ?[]const u8 {
         "utf8mb3_general_ci"
     else
         return null;
-    const system_fns = [_][]const u8{ "version", "database", "schema", "user", "current_user", "session_user", "system_user", "uuid", "charset", "collation" };
-    for (system_fns) |f| if (std.ascii.eqlIgnoreCase(c.args[0].call.fn_name, f)) return name;
+    const arg = c.args[0].call;
+    if (std.mem.eql(u8, arg.fn_name, exec.scalar_fn.SYSTEM_VARIABLE_FN))
+        return if (systemVariableValue(arg, "") catch null) |v| (if (v == .text) name else null) else null;
+    const system_fns = [_][]const u8{ "version", "database", "schema", "user", "current_user", "session_user", "system_user", "current_role", "uuid", "charset", "collation" };
+    for (system_fns) |f| if (std.ascii.eqlIgnoreCase(arg.fn_name, f)) return name;
     return null;
+}
+
+/// The value `@@name` (a `SYSTEM_VARIABLE_FN` call) stands for: what thinDB
+/// reports for the variable, an integer when it reads as one
+/// (`@@auto_increment_increment`), else its text. Null for any other call.
+fn systemVariableValue(c: exec.expr_mod.Expr.Call, current_schema: []const u8) error{NameTooLong}!?types.Value {
+    if (!std.mem.eql(u8, c.fn_name, exec.scalar_fn.SYSTEM_VARIABLE_FN) or c.args.len != 1 or c.args[0] != .lit or c.args[0].lit != .text) return null;
+    var buf: [128]u8 = undefined;
+    const typed = c.args[0].lit.text;
+    if (typed.len > buf.len) return error.NameTooLong;
+    const text = mysql_handshake.systemVariableValue(std.ascii.lowerString(&buf, typed), current_schema);
+    if (std.fmt.parseInt(i64, text, 10)) |n| return .{ .bigint = n } else |_| return .{ .text = text };
 }
 
 /// `lowered` collects the correlated scalar subqueries of a Compute's
@@ -314,6 +332,12 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                     e.* = info;
                     return;
                 }
+                if (std.ascii.eqlIgnoreCase(c.fn_name, "uuid_short")) {
+                    const args = try (try ctx.subqueryArena()).alloc(ir.Expr, 1);
+                    args[0] = .{ .lit = .{ .bigint = @divFloor(ctx.now_micros, std.time.us_per_s) } };
+                    e.* = .{ .call = .{ .fn_name = exec.scalar_fn.UUID_SHORT_FN, .args = args } };
+                    return;
+                }
                 if (std.ascii.eqlIgnoreCase(c.fn_name, "uuid")) {
                     // Kernels carry no Io, so UUID() takes its entropy as a
                     // fresh per-statement seed from the database's.
@@ -327,6 +351,10 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
             }
             if (systemTextTypeName(c)) |text| {
                 e.* = .{ .lit = .{ .text = text } };
+                return;
+            }
+            if (systemVariableValue(c, ctx.session.current_schema) catch null) |v| {
+                e.* = .{ .lit = if (v == .text) .{ .text = try (try ctx.subqueryArena()).dupe(u8, v.text) } else v };
                 return;
             }
             for (c.args) |*arg| try resolveSubqueriesInExpr(ctx, @constCast(arg), lowered);

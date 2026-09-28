@@ -11,7 +11,8 @@
 //!     type_tag u8
 //!     nullable u8     (added v2; 0 = NOT NULL, 1 = nullable)
 //!     type_extra u32  (varchar N or 0)
-//!     default_value  (v3: 1 presence byte + optional payload)
+//!     default_value  (v3: 1 presence byte + optional payload; the byte's
+//!                     bit 2 is ON UPDATE CURRENT_TIMESTAMP, see encodeDefault)
 //!     auto_increment u8 (v4: 0 = none, 1 = AUTO_INCREMENT)
 //!   order_key_count u32
 //!   For each order_key name:
@@ -91,6 +92,7 @@ pub const SchemaOwner = struct {
                 .nullable = c.nullable,
                 .default_value = if (c.default_value) |dv| try cloneValue(aa, dv) else null,
                 .default_now = c.default_now,
+                .on_update_now = c.on_update_now,
                 .auto_increment = c.auto_increment,
             };
         }
@@ -133,9 +135,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator,
             else => 0,
         };
         try appendU32(scratch, &buf, extra);
-        // v3: column DEFAULT value. 0 = none, 1 = present (+ payload),
-        // 2 = CURRENT_TIMESTAMP (no payload).
-        try encodeDefault(scratch, &buf, c.default_value, c.default_now);
+        try encodeDefault(scratch, &buf, c);
         // v4: AUTO_INCREMENT flag.
         try buf.append(scratch, @intFromBool(c.auto_increment));
     }
@@ -226,6 +226,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .nullable = nullable,
             .default_value = dflt.value,
             .default_now = dflt.now,
+            .on_update_now = dflt.on_update_now,
             .auto_increment = auto_increment,
         };
     }
@@ -299,21 +300,28 @@ pub fn schemasEqual(a: TableSchema, b: TableSchema) bool {
 const appendU16 = format.appendU16;
 const appendU32 = format.appendU32;
 
-/// Encode an optional `DEFAULT` value into the schema buffer (v3+).
-/// Layout: 1 presence byte (0 = no default, 1 = present, 2 =
-/// CURRENT_TIMESTAMP with no payload). When present: 1 byte ValueTag + the
-/// type's payload bytes (little-endian for ints, IEEE-754 little-endian
-/// for floats, length-prefixed bytes for text).
-fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), v: ?types.Value, default_now: bool) !void {
-    if (default_now) {
-        try buf.append(scratch, 2);
+/// Encode a column's `DEFAULT` and `ON UPDATE` clauses into the schema
+/// buffer (v3+). Layout: 1 presence byte, whose bits 0-1 give the DEFAULT
+/// (0 = none, 1 = present, 2 = CURRENT_TIMESTAMP with no payload) and bit 2
+/// ON UPDATE CURRENT_TIMESTAMP. When present: 1 byte ValueTag + the type's
+/// payload bytes (little-endian for ints, IEEE-754 little-endian for floats,
+/// length-prefixed bytes for text).
+///
+/// Bit 2 came after v5 without a version bump, so every existing schema
+/// reads as before; a release older than it reads a column that sets the
+/// bit as one with a DEFAULT value, and so misreads the table (DESIGN.md
+/// §4.2).
+fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), c: Column) !void {
+    const on_update: u8 = if (c.on_update_now) 4 else 0;
+    if (c.default_now) {
+        try buf.append(scratch, 2 | on_update);
         return;
     }
-    const dv = v orelse {
-        try buf.append(scratch, 0);
+    const dv = c.default_value orelse {
+        try buf.append(scratch, on_update);
         return;
     };
-    try buf.append(scratch, 1);
+    try buf.append(scratch, 1 | on_update);
     try buf.append(scratch, @intFromEnum(@as(types.ValueTag, dv)));
     var tmp: [16]u8 = undefined;
     switch (dv) {
@@ -370,15 +378,20 @@ fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), v: ?types.Value, d
     }
 }
 
-const DecodedDefault = struct { value: ?types.Value = null, now: bool = false };
+const DecodedDefault = struct { value: ?types.Value = null, now: bool = false, on_update_now: bool = false };
 
 fn decodeDefault(arena: Allocator, bytes: []const u8, cursor: *usize) !DecodedDefault {
     if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
     const present = bytes[cursor.*];
     cursor.* += 1;
-    if (present == 0) return .{};
-    if (present == 2) return .{ .now = true };
-    return .{ .value = try decodeDefaultValue(arena, bytes, cursor) };
+    if (present & ~@as(u8, 7) != 0) return Error.SchemaCorrupt;
+    const on_update_now = present & 4 != 0;
+    return switch (present & 3) {
+        0 => .{ .on_update_now = on_update_now },
+        1 => .{ .value = try decodeDefaultValue(arena, bytes, cursor), .on_update_now = on_update_now },
+        2 => .{ .now = true, .on_update_now = on_update_now },
+        else => Error.SchemaCorrupt,
+    };
 }
 
 fn decodeDefaultValue(arena: Allocator, bytes: []const u8, cursor: *usize) !?types.Value {
@@ -590,4 +603,105 @@ test "SchemaOwner.clone deep-copies into a fresh arena" {
 
     try std.testing.expect(schemasEqual(src, owner.view()));
     try std.testing.expectEqualStrings("id", owner.view().columns[0].name);
+}
+
+/// A schema.bin the release before ON UPDATE CURRENT_TIMESTAMP wrote: every
+/// DEFAULT kind, AUTO_INCREMENT, a unique key and lz4.
+const golden_v5_schema_hex =
+    "744442430500000006000000020000006964020000000000000103000000717479010100" ++
+    "00000001010700000000050000006c6162656c0401100000000104010000007800030000" ++
+    "00616d740e01020a0000010c7d0000000000000000070000006372656174656409010000" ++
+    "00000200040000006e6f7465050100000000000001000000020000006964010274444243";
+
+fn goldenSchemaBytes() ![golden_v5_schema_hex.len / 2]u8 {
+    var bytes: [golden_v5_schema_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_v5_schema_hex);
+    return bytes;
+}
+
+test "a schema written before ON UPDATE CURRENT_TIMESTAMP reads as before and writes back unchanged" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const golden = try goldenSchemaBytes();
+    try tmp.dir.writeFile(io, .{ .sub_path = schema_filename, .data = &golden });
+
+    var owner = try readSchema(allocator, io, tmp.dir);
+    defer owner.deinit();
+    const s = owner.view();
+    try std.testing.expectEqual(@as(usize, 6), s.columns.len);
+    const id = s.columns[0];
+    try std.testing.expectEqualStrings("id", id.name);
+    try std.testing.expect(id.type == .bigint and !id.nullable and id.auto_increment and id.default_value == null);
+    try std.testing.expect(s.columns[1].type == .int and s.columns[1].default_value.?.eql(.{ .int = 7 }));
+    try std.testing.expectEqual(types.Type{ .varchar = 16 }, s.columns[2].type);
+    try std.testing.expectEqualStrings("x", s.columns[2].default_value.?.text);
+    try std.testing.expectEqual(types.Type{ .decimal64 = .{ .p = 10, .s = 2 } }, s.columns[3].type);
+    try std.testing.expect(s.columns[3].default_value.?.eql(.{ .decimal64 = 125 }));
+    try std.testing.expect(s.columns[4].type == .datetime and s.columns[4].default_now and s.columns[4].default_value == null);
+    try std.testing.expect(s.columns[5].type == .string and s.columns[5].nullable and s.columns[5].default_value == null and !s.columns[5].default_now);
+    for (s.columns) |c| try std.testing.expect(!c.on_update_now);
+    try std.testing.expectEqual(@as(usize, 1), s.order_key.len);
+    try std.testing.expectEqualStrings("id", s.order_key[0]);
+    try std.testing.expect(s.unique);
+    try std.testing.expectEqual(types.TableCompression.lz4, s.compression);
+
+    // The same bytes, so a release before ON UPDATE reads the table too.
+    try writeSchema(io, tmp.dir, s, allocator, false);
+    const rewritten = try tmp.dir.readFileAlloc(io, schema_filename, allocator, .unlimited);
+    defer allocator.free(rewritten);
+    try std.testing.expectEqualSlices(u8, &golden, rewritten);
+}
+
+test "ON UPDATE CURRENT_TIMESTAMP is bit 2 of the DEFAULT presence byte" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes = try goldenSchemaBytes();
+    const presence = std.mem.indexOf(u8, &bytes, "created").? + "created".len + 6;
+    try std.testing.expectEqual(@as(u8, 2), bytes[presence]);
+
+    bytes[presence] = 2 | 4;
+    try tmp.dir.writeFile(io, .{ .sub_path = schema_filename, .data = &bytes });
+    {
+        var owner = try readSchema(allocator, io, tmp.dir);
+        defer owner.deinit();
+        const created = owner.view().columns[4];
+        try std.testing.expect(created.default_now and created.on_update_now);
+        for (owner.view().columns[0..4]) |c| try std.testing.expect(!c.on_update_now);
+    }
+
+    bytes[presence] = 2 | 8;
+    try tmp.dir.writeFile(io, .{ .sub_path = schema_filename, .data = &bytes });
+    try std.testing.expectError(Error.SchemaCorrupt, readSchema(allocator, io, tmp.dir));
+}
+
+test "round-trip schema keeps ON UPDATE CURRENT_TIMESTAMP beside each DEFAULT kind" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint, .nullable = false },
+            .{ .name = "both", .type = .datetime, .default_now = true, .on_update_now = true },
+            .{ .name = "only", .type = .datetime, .on_update_now = true },
+            .{ .name = "fixed", .type = .datetime, .default_value = .{ .datetime = 86_400_000_000 }, .on_update_now = true },
+            .{ .name = "made", .type = .datetime, .default_now = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    try writeSchema(io, tmp.dir, schema, allocator, false);
+    var owner = try readSchema(allocator, io, tmp.dir);
+    defer owner.deinit();
+    for (schema.columns, owner.view().columns) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try std.testing.expectEqual(want.default_now, got.default_now);
+        try std.testing.expectEqual(want.on_update_now, got.on_update_now);
+        try std.testing.expectEqual(want.default_value == null, got.default_value == null);
+        if (want.default_value) |v| try std.testing.expect(v.eql(got.default_value.?));
+    }
 }

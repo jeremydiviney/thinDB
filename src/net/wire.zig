@@ -351,10 +351,12 @@ pub fn decodeSchema(allocator: Allocator, bytes: []const u8, cursor: *usize) !Ta
 }
 
 /// Encode one AlterOp. Layout:
-///   [op_tag u8]                          0=add, 1=drop, 2=rename
-///   add:     [name_len u32][name][type_tag u8][nullable u8][type_extra u32][has_default u8][value?]
+///   [op_tag u8]                          0=add, 1=drop, 2=rename, 3=set_clauses
+///   add:     [name_len u32][name][type_tag u8][nullable u8][type_extra u32][clauses u8][value?]
 ///   drop:    [name_len u32][name]
 ///   rename:  [from_len u32][from][to_len u32][to]
+///   set_clauses: [name_len u32][name][clauses u8][value?]
+/// `clauses`: see `encodeClauses`.
 pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp) !void {
     switch (op) {
         .add => |a| {
@@ -363,12 +365,12 @@ pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp)
             try out.append(allocator, @intFromEnum(@as(TypeTag, a.type)));
             try out.append(allocator, @intFromBool(a.nullable));
             try appendU32(allocator, out, typeExtra(a.type));
-            if (a.default) |default| {
-                try out.append(allocator, 1);
-                try ir.encodeValue(allocator, out, default);
-            } else {
-                try out.append(allocator, 0);
-            }
+            try encodeClauses(allocator, out, a.default, a.default_now, a.on_update_now);
+        },
+        .set_clauses => |sc| {
+            try out.append(allocator, 3);
+            try appendLenString(allocator, out, sc.name);
+            try encodeClauses(allocator, out, sc.default, sc.default_now, sc.on_update_now);
         },
         .drop => |name| {
             try out.append(allocator, 1);
@@ -380,6 +382,29 @@ pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp)
             try appendLenString(allocator, out, r.to);
         },
     }
+}
+
+/// A column's DEFAULT and ON UPDATE clauses: a byte whose bit 0 says a
+/// value follows, bit 1 that the DEFAULT is CURRENT_TIMESTAMP and bit 2
+/// that the column has ON UPDATE CURRENT_TIMESTAMP.
+fn encodeClauses(allocator: Allocator, out: *std.ArrayList(u8), default: ?@import("../types.zig").Value, default_now: bool, on_update_now: bool) !void {
+    const flags: u8 = @as(u8, @intFromBool(default != null)) | @as(u8, @intFromBool(default_now)) << 1 | @as(u8, @intFromBool(on_update_now)) << 2;
+    try out.append(allocator, flags);
+    if (default) |v| try ir.encodeValue(allocator, out, v);
+}
+
+const Clauses = struct { default: ?@import("../types.zig").Value, default_now: bool, on_update_now: bool };
+
+fn decodeClauses(allocator: Allocator, bytes: []const u8, cursor: *usize) !Clauses {
+    if (cursor.* + 1 > bytes.len) return Error.WireCorrupt;
+    const flags = bytes[cursor.*];
+    cursor.* += 1;
+    if (flags & ~@as(u8, 7) != 0) return Error.WireCorrupt;
+    return .{
+        .default = if (flags & 1 != 0) try dupeValue(allocator, ir.decodeValue(bytes, cursor) catch return Error.WireCorrupt) else null,
+        .default_now = flags & 2 != 0,
+        .on_update_now = flags & 4 != 0,
+    };
 }
 
 /// Inverse of `encodeAlterOp`. Allocates into `allocator` — an arena
@@ -399,19 +424,14 @@ pub fn decodeAlterOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !A
             const extra = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
             cursor.* += 4;
             const t = try typeFromTagAndExtra(tag_byte, extra);
-            if (cursor.* + 1 > bytes.len) return Error.WireCorrupt;
-            const has_default = bytes[cursor.*];
-            cursor.* += 1;
-            const default: ?@import("../types.zig").Value = switch (has_default) {
-                0 => null,
-                1 => try dupeValue(allocator, ir.decodeValue(bytes, cursor) catch return Error.WireCorrupt),
-                else => return Error.WireCorrupt,
-            };
+            const clauses = try decodeClauses(allocator, bytes, cursor);
             break :blk AlterOp{ .add = .{
                 .name = try allocator.dupe(u8, name),
                 .type = t,
                 .nullable = nullable,
-                .default = default,
+                .default = clauses.default,
+                .default_now = clauses.default_now,
+                .on_update_now = clauses.on_update_now,
             } };
         },
         1 => blk: {
@@ -424,6 +444,16 @@ pub fn decodeAlterOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !A
             break :blk AlterOp{ .rename = .{
                 .from = try allocator.dupe(u8, from),
                 .to = try allocator.dupe(u8, to),
+            } };
+        },
+        3 => blk: {
+            const name = try allocator.dupe(u8, try readLenString(bytes, cursor));
+            const clauses = try decodeClauses(allocator, bytes, cursor);
+            break :blk AlterOp{ .set_clauses = .{
+                .name = name,
+                .default = clauses.default,
+                .default_now = clauses.default_now,
+                .on_update_now = clauses.on_update_now,
             } };
         },
         else => Error.WireCorrupt,
@@ -960,4 +990,26 @@ test "wire: batch encode -> decode round-trip preserves data" {
     try std.testing.expect(db2.values[3].isValid(0));
     try std.testing.expect(!db2.values[3].isValid(1));
     try std.testing.expect(db2.values[3].isValid(2));
+}
+
+test "wire: ALTER ops carry DEFAULT and ON UPDATE CURRENT_TIMESTAMP" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const ops = [_]AlterOp{
+        .{ .add = .{ .name = "at", .type = .datetime, .nullable = false, .default = .{ .datetime = 7 }, .default_now = true, .on_update_now = true } },
+        .{ .set_clauses = .{ .name = "at", .default = null, .default_now = false, .on_update_now = true } },
+        .{ .add = .{ .name = "n", .type = .int, .nullable = true, .default = .{ .int = 3 } } },
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    for (ops) |op| try encodeAlterOp(aa, &buf, op);
+    var cursor: usize = 0;
+    const add = (try decodeAlterOp(aa, buf.items, &cursor)).add;
+    try std.testing.expect(add.default.?.eql(.{ .datetime = 7 }) and add.default_now and add.on_update_now);
+    const set = (try decodeAlterOp(aa, buf.items, &cursor)).set_clauses;
+    try std.testing.expectEqualStrings("at", set.name);
+    try std.testing.expect(set.default == null and !set.default_now and set.on_update_now);
+    const plain = (try decodeAlterOp(aa, buf.items, &cursor)).add;
+    try std.testing.expect(plain.default.?.eql(.{ .int = 3 }) and !plain.default_now and !plain.on_update_now);
+    try std.testing.expectEqual(buf.items.len, cursor);
 }
