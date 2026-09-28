@@ -504,6 +504,9 @@ pub const Params = struct {
 
 pub const RunRequest = struct {
     table: *api.Table,
+    // What the run reads; the caller keeps it pinned until it has resolved
+    // the rowrefs in the result (see `SiloCore.RunConfig.snapshot`).
+    snapshot: exec.Scan.Snapshot,
     shape: Shape,
     params: Params,
     scan_columns: ?[]const []const u8 = null,
@@ -620,7 +623,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: SiloCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -641,7 +644,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
+    try runHarness(allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -667,9 +670,8 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
 // run count (≈ the union of all columns' run boundaries, conservatively their
 // sum) must leave an average run of ≥4 rows. Derived keys (absent from the
 // schema) and segment-less tables decline — per-row staging is the default.
-fn keyColumnsRunStructured(table: *api.Table, key_columns: []const SiloCore.GroupKeyColumnSpec) bool {
+fn keyColumnsRunStructured(table: *api.Table, segs: []const storage.ManifestEntry, key_columns: []const SiloCore.GroupKeyColumnSpec) bool {
     if (key_columns.len == 0) return false;
-    const segs = table.manifest.segments.items;
     if (segs.len == 0) return false;
     const entry = table.acquireSegment(segs[segs.len / 2].segment_id) catch return false;
     defer table.releaseSegment(entry);
@@ -699,6 +701,7 @@ fn keyColumnsRunStructured(table: *api.Table, key_columns: []const SiloCore.Grou
 fn runHarness(
     allocator: Allocator,
     table: *api.Table,
+    snapshot: exec.Scan.Snapshot,
     cpus: []const usize,
     shape: Shape,
     params: Params,
@@ -825,7 +828,7 @@ fn runHarness(
         // staging inflation (measured: Q31/Q32-class +15-20%) — require
         // storage-proven run structure on every key column first.
         if (shape.aggregate_inputs.len != 0 and
-            !keyColumnsRunStructured(table, group_key_columns_buf[0..shape.group_key_inputs.len])) break :blk false;
+            !keyColumnsRunStructured(table, snapshot.segments, group_key_columns_buf[0..shape.group_key_inputs.len])) break :blk false;
         break :blk true;
     };
     // Weighted staged columns carry RUN PARTIALS, not row values: widen to
@@ -890,6 +893,7 @@ fn runHarness(
     try SiloCore.runSiloGrid(allocator, table, cpus, .{
         .dop = params.dop,
         .bucket_count = params.bucket_count,
+        .snapshot = snapshot,
         .silo_grid = true,
         .scan_filter = true,
         .chunk_rows = params.raw_chunk_rows,

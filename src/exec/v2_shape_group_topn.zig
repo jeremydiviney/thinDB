@@ -181,6 +181,7 @@ const StageTimes = struct {
 const ExecutionContext = struct {
     allocator: Allocator,
     table: *api.Table,
+    snapshot: Scan.Snapshot,
     request: Request,
     plan: ShapePlan,
     dop: usize,
@@ -494,7 +495,19 @@ const GroupTopNPipeline = struct {
     }
 
     fn execute(self: *GroupTopNPipeline) !void {
-        var ctx = try prepareExecution(self.allocator, self.table, self.request, self.plan);
+        // The aggregation and the emit read one snapshot: a hashed key comes
+        // back by late-materializing each group's rowref, and a rowref only
+        // means something in the view of the table that produced it. A flush,
+        // DELETE or compaction in between renumbers the memtable and segments.
+        const table = self.table;
+        table.ddl_lock.lockSharedUncancelable(table.io);
+        defer table.ddl_lock.unlockShared(table.io);
+        const snapshot = try Scan.captureSnapshotAlloc(table, self.allocator);
+        defer {
+            snapshot.memtable_snap.release();
+            self.allocator.free(snapshot.segments);
+        }
+        var ctx = try prepareExecution(self.allocator, table, snapshot, self.request, self.plan);
         var rows = try runGroupTopNStage(&ctx);
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
@@ -503,17 +516,18 @@ const GroupTopNPipeline = struct {
         var final_rows = try prepareFinalRows(self, grouped);
         defer final_rows.deinit();
         try exec.memory.checkCancelled(self.allocator);
-        try emitResultStage(self, final_rows.items);
+        try emitResultStage(self, snapshot, final_rows.items);
         ctx.times.emit_ticks = exec.prof.nowTicks() - emit_t0;
         traceProfile(ctx);
     }
 };
 
-fn prepareExecution(allocator: Allocator, table: *api.Table, request: Request, plan: ShapePlan) !ExecutionContext {
+fn prepareExecution(allocator: Allocator, table: *api.Table, snapshot: Scan.Snapshot, request: Request, plan: ShapePlan) !ExecutionContext {
     const t0 = exec.prof.nowTicks();
     var ctx = ExecutionContext{
         .allocator = allocator,
         .table = table,
+        .snapshot = snapshot,
         .request = request,
         .plan = plan,
         .dop = @max(@as(usize, 1), request.dop),
@@ -609,6 +623,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
 
     var result = try GroupTopNEngine.run(core_allocator, .{
         .table = ctx.table,
+        .snapshot = ctx.snapshot,
         .shape = .{
             .key_width = if (ctx.plan.hashed) .u128 else GroupTopNEngine.KeyWidth.fromBits(ctx.plan.layout.total_bits),
             .key_bits = ctx.plan.layout.total_bits,
@@ -918,8 +933,8 @@ fn compareF64(a: f64, b: f64) i8 {
     return 0;
 }
 
-fn emitResultStage(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) !void {
-    if (op.plan.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, rows);
+fn emitResultStage(op: *GroupTopNPipeline, snapshot: Scan.Snapshot, rows: []const SiloCore.TopRow) !void {
+    if (op.plan.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, snapshot, rows);
     if (rows.len == 0) return;
     const workers = emitWorkerCount(op, rows.len);
     if (workers <= 1) {
@@ -1072,7 +1087,6 @@ const MatPartition = struct {
     allocator: Allocator,
     late_q: Query,
     late: *LateScan,
-    scan: *Scan,
     locs: []const i64,
     derived: []const compute.Derived,
     udf_registry: ?*const udf_mod.UdfRegistry,
@@ -1083,18 +1097,27 @@ const MatPartition = struct {
     fetch_ticks: i64 = 0,
     compute_ticks: i64 = 0,
 
-    fn create(allocator: Allocator, op: *GroupTopNPipeline, names: []const []const u8, derived: []const compute.Derived, locs: []const i64) !MatPartition {
-        const scan_ptr = try Scan.allocWithProjectionLoc(allocator, op.table, null, names, false, null);
+    /// `snapshot` is the one the aggregation that produced `locs` read.
+    fn create(
+        allocator: Allocator,
+        table: *api.Table,
+        snapshot: Scan.Snapshot,
+        udf_registry: ?*const udf_mod.UdfRegistry,
+        names: []const []const u8,
+        derived: []const compute.Derived,
+        locs: []const i64,
+    ) !MatPartition {
+        const scan_ptr = try Scan.allocWithProjectionLoc(allocator, table, null, names, false, snapshot);
         var inner = exec.makeQuery(allocator, scan_ptr);
         errdefer inner.deinit();
-        const late_q = try LateScan.create(allocator, inner, scan_ptr, op.table, names);
+        const late_q = try LateScan.create(allocator, inner, scan_ptr, table, names);
         const late = exec.queryAs(LateScan, late_q) orelse return error.UnsupportedQueryShape;
-        return .{ .allocator = allocator, .late_q = late_q, .late = late, .scan = scan_ptr, .locs = locs, .derived = derived, .udf_registry = op.request.udf_registry };
+        return .{ .allocator = allocator, .late_q = late_q, .late = late, .locs = locs, .derived = derived, .udf_registry = udf_registry };
     }
 
     fn materialize(self: *MatPartition) !void {
         const t0 = exec.prof.nowTicks();
-        try self.late.materializeInto(self.locs, self.scan.memtableSnap());
+        try self.late.materializeInto(self.locs);
         const m = self.late.outputColumns();
         self.views = try self.allocator.alloc(ColumnView, m.columns.len);
         for (m.columns, self.views) |*c, *v| v.* = c.view();
@@ -1129,7 +1152,7 @@ fn matPartitionWorker(p: *MatPartition) void {
 // recovered by late-materializing each survivor's carried __rowloc against the
 // base table (reusing LateScan's per-(segment,row-group) single-row reader).
 // Aggregates still come straight from the grouped TopRow.
-fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) !void {
+fn emitResultStageHashed(op: *GroupTopNPipeline, snapshot: Scan.Snapshot, rows: []const SiloCore.TopRow) !void {
     if (rows.len == 0) return;
     const allocator = op.allocator;
     const part_count = op.plan.layout.part_count;
@@ -1190,7 +1213,7 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
 
     const t_mat = exec.prof.nowTicks();
     if (workers <= 1) {
-        var part = try MatPartition.create(allocator, op, names, derived, locs);
+        var part = try MatPartition.create(allocator, op.table, snapshot, op.request.udf_registry, names, derived, locs);
         defer part.deinit();
         try part.materialize();
         const mat_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_mat);
@@ -1215,7 +1238,7 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, rows: []const SiloCore.TopRow) 
         const p0 = rows.len * w / workers;
         const p1 = if (w + 1 == workers) rows.len else rows.len * (w + 1) / workers;
         part_starts[w] = p0;
-        p.* = try MatPartition.create(try EmitRanges.workerAllocator(op), op, names, derived, locs[p0..p1]);
+        p.* = try MatPartition.create(try EmitRanges.workerAllocator(op), op.table, snapshot, op.request.udf_registry, names, derived, locs[p0..p1]);
         created += 1;
     }
     const mat_threads = try allocator.alloc(?std.Thread, workers);
@@ -2130,3 +2153,47 @@ fn envUsize(comptime name: [:0]const u8, default: usize) usize {
 }
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+// The emit used to open a fresh scan to late-materialize the hashed keys, so a
+// DELETE between the aggregation and the emit made it read the rowrefs against
+// another memtable: other rows' keys, or bytes past the end of it.
+test "hashed-key emit reads rowrefs from the aggregation snapshot" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .{ .varchar = 64 } } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    const Row = struct { id: i64, s: []const u8 };
+    const names = [_][]const u8{ "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13" };
+    var rows: [names.len]Row = undefined;
+    for (&rows, names, 0..) |*row, name, id| row.* = .{ .id = @intCast(id), .s = name };
+    try t.insert(rows[0..6]);
+    try t.flush();
+    try t.insert(rows[6..]);
+
+    const snapshot = try Scan.captureSnapshotAlloc(t, allocator);
+    defer {
+        snapshot.memtable_snap.release();
+        allocator.free(snapshot.segments);
+    }
+    _ = try t.delete(.{ .col = "id", .op = .lte, .val = .{ .bigint = 7 } });
+
+    const locs = [_]i64{ rowloc.packSegment(0, 0, 3), rowloc.packMemtable(1), rowloc.packMemtable(5) };
+    var part = try MatPartition.create(allocator, t, snapshot, null, &.{"s"}, &.{}, &locs);
+    defer part.deinit();
+    try part.materialize();
+    const keys = part.result.values[0].data.varchar;
+    try std.testing.expectEqualStrings("s3", keys.rowBytes(0));
+    try std.testing.expectEqualStrings("s7", keys.rowBytes(1));
+    try std.testing.expectEqualStrings("s11", keys.rowBytes(2));
+}

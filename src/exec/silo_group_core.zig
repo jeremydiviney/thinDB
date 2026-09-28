@@ -3457,9 +3457,9 @@ fn topLess(_: void, a: TopRow, b: TopRow) bool {
     return better(a, b);
 }
 
-fn totalRows(table: *thindb.api.Table) u64 {
-    var n: u64 = table.memtable.row_count;
-    for (table.manifest.segments.items) |s| n += s.row_count;
+fn totalRows(snap: Scan.Snapshot) u64 {
+    var n: u64 = snap.memtable_row_count;
+    for (snap.segments) |s| n += s.row_count;
     return n;
 }
 
@@ -6260,6 +6260,10 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
 pub const RunConfig = struct {
     dop: usize,
     bucket_count: usize,
+    // The view of the table the run reads. The caller captures it under the
+    // table's shared ddl_lock and keeps both until it has resolved the rowrefs
+    // the run returns, which index this snapshot's segments and memtable.
+    snapshot: Scan.Snapshot,
     // Free the staging-chunk pools (gigabytes of recycled RawRows slabs) on a
     // detached thread after the result is built, instead of on the wire path.
     // Requires `allocator` to be thread-safe and to outlive the query — the
@@ -6405,7 +6409,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             });
         }
     }
-    const total = totalRows(table);
+    const snap = cfg.snapshot;
+    const total = totalRows(snap);
     const dop = @max(@as(usize, 1), cfg.dop);
 
     const chunk_rows = chooseGridChunkRows(cfg.chunk_rows, cfg.chunk_rows_set);
@@ -6418,14 +6423,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const scan_coalesce_tiles = cfg.scan_coalesce_tiles;
 
     const snapshot_setup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
-    table.ddl_lock.lockSharedUncancelable(table.io);
-    defer table.ddl_lock.unlockShared(table.io);
-
-    const snap = try Scan.captureSnapshotAlloc(table, allocator);
-    var pin_held = true;
-    defer if (pin_held) snap.memtable_snap.release();
-    defer allocator.free(snap.segments);
-
     const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
     defer allocator.free(seg_start);
     var total_rgs: usize = 0;
@@ -6687,8 +6684,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;
-    snap.memtable_snap.release();
-    pin_held = false;
 
     var group_ticks = try allocator.alloc(i64, n_workers);
     defer allocator.free(group_ticks);
