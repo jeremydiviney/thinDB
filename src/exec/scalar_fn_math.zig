@@ -793,13 +793,20 @@ fn appendFloatTexts(allocator: Allocator, values: anytype, out: *ColumnStore) !v
     for (values) |x| try ss.appendValue(allocator, common.floatText(&buf, x, .plain));
 }
 
+/// A boolean as the integer it is, `1` or `0`, as MySQL and StarRocks write
+/// it wherever a number becomes text.
 pub fn boolToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.boolean;
+    try appendBoolTexts(allocator, args[0].data.boolean[0..row_count], out, .{ "0", "1" });
+}
+
+/// PostgreSQL's CAST(bool AS TEXT): `true` or `false`.
+pub fn boolToWordKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try appendBoolTexts(allocator, args[0].data.boolean[0..row_count], out, .{ "false", "true" });
+}
+
+fn appendBoolTexts(allocator: Allocator, values: []const u8, out: *ColumnStore, texts: [2][]const u8) !void {
     const ss = stringStoreOf(out);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try ss.appendValue(allocator, if (s[i] != 0) "true" else "false");
-    }
+    for (values) |b| try ss.appendValue(allocator, texts[@intFromBool(b != 0)]);
 }
 
 pub fn bigintToLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

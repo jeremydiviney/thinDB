@@ -21,6 +21,7 @@ const simd = @import("../util/simd.zig");
 const like_pattern = @import("../util/like.zig");
 const Error = exec.Error;
 const scalar_fn_common = @import("scalar_fn_common.zig");
+const cast = @import("cast.zig");
 const scalar_fn_time = @import("scalar_fn_time.zig");
 const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
 const decimal_rescale = @import("scalar_fn_decimal.zig").rescale;
@@ -646,7 +647,8 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .text_as_number_set => |s| try expectTextColumn(schema, s.col),
         .like => |lp| {
             const idx = types.findColumn(schema, lp.col) orelse return Error.ColumnNotFound;
-            if (!schema[idx].type.isString()) return Error.UnsupportedOperatorForType;
+            const ty = schema[idx].type;
+            if (!ty.isString() and !cast.assignsByRule(ty, .string)) return Error.UnsupportedOperatorForType;
         },
         .@"and" => |children| {
             for (children) |*c| try validateExpr(@constCast(c), schema);
@@ -1428,8 +1430,7 @@ pub fn evaluatePredicate(
         },
         .like => |lp| {
             const col_idx = findCol(schema, lp.col) orelse return Error.ColumnNotFound;
-            const view = batch.values[col_idx];
-            try evaluateLikeMask(view, lp.pattern, batch.row_count, out, null);
+            try evaluateLikeColumn(allocator, batch.values[col_idx], schema[col_idx].type, lp.pattern, batch.row_count, out, null);
         },
         .@"and" => |children| {
             if (children.len == 0) {
@@ -1527,7 +1528,7 @@ pub fn evaluateExprGuided(
         },
         .like => |lp| {
             const col_idx = findCol(schema, lp.col) orelse return Error.ColumnNotFound;
-            try evaluateLikeMask(batch.values[col_idx], lp.pattern, batch.row_count, out, active);
+            try evaluateLikeColumn(allocator, batch.values[col_idx], schema[col_idx].type, lp.pattern, batch.row_count, out, active);
         },
         .@"and" => |children| {
             if (children.len == 0) {
@@ -2450,6 +2451,16 @@ fn sameRepresentationMask(left: ColumnView, right: ColumnView, op: PredicateOp, 
             for (0..n) |i| mask[i] = cmpStr(l.rowBytes(i), r.rowBytes(i), op);
         },
     }
+}
+
+/// LIKE over a column of any type with a text form: a number, boolean, DATE
+/// or DATETIME matches as the text MySQL writes for it (`12 LIKE '1%'`),
+/// converted a batch at a time by the assignment rule.
+fn evaluateLikeColumn(allocator: std.mem.Allocator, view: ColumnView, ty: types.Type, pattern: []const u8, n: usize, mask: []bool, active: ?[]const bool) !void {
+    if (ty.isString()) return evaluateLikeMask(view, pattern, n, mask, active);
+    const text = try cast.assignColumn(allocator, view, ty, .string, n);
+    defer cast.freeAssignedColumn(allocator, text);
+    try evaluateLikeMask(text, pattern, n, mask, active);
 }
 
 /// Per-row LIKE evaluation: matches NULL → false (two-valued logic).

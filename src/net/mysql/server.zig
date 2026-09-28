@@ -1414,7 +1414,9 @@ fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8, connect
     if (std.mem.eql(u8, expr, "null")) return .null_value;
 
     if (std.mem.startsWith(u8, expr, "@@")) {
-        return .{ .text = syntheticVariableValue(expr[2..], current_schema) };
+        // Only a bare name: the engine evaluates one inside an expression.
+        for (expr[2..]) |c| if (!isIdentByte(c) and c != '.') return null;
+        return .{ .text = handshake.systemVariableValue(expr[2..], current_schema) };
     }
 
     if (std.mem.eql(u8, expr, "version()")) return .{ .text = handshake.server_version };
@@ -1428,72 +1430,6 @@ fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8, connect
     if (std.mem.eql(u8, expr, "connection_id")) return .{ .text = connection_id };
 
     return null;
-}
-
-fn syntheticVariableValue(var_in: []const u8, current_schema: []const u8) []const u8 {
-    var v = std.mem.trim(u8, var_in, " \t\r\n");
-    if (std.mem.startsWith(u8, v, "global.")) v = v["global.".len..];
-    if (std.mem.startsWith(u8, v, "session.")) v = v["session.".len..];
-    if (std.mem.startsWith(u8, v, "local.")) v = v["local.".len..];
-
-    if (std.mem.eql(u8, v, "version")) return handshake.server_version;
-    if (std.mem.eql(u8, v, "version_comment")) return "thinDB";
-    if (std.mem.eql(u8, v, "version_compile_os")) return osLabel();
-    if (std.mem.eql(u8, v, "version_compile_machine")) return "x86_64";
-    if (std.mem.eql(u8, v, "protocol_version")) return "10";
-    if (std.mem.eql(u8, v, "license")) return "thinDB";
-    if (std.mem.eql(u8, v, "hostname")) return "localhost";
-    if (std.mem.eql(u8, v, "port")) return "3307";
-    if (std.mem.eql(u8, v, "server_id")) return "1";
-
-    if (std.mem.eql(u8, v, "database") or std.mem.eql(u8, v, "schema")) return current_schema;
-    if (std.mem.eql(u8, v, "max_allowed_packet")) return "16777216";
-    if (std.mem.eql(u8, v, "net_buffer_length")) return "16384";
-    if (std.mem.eql(u8, v, "wait_timeout")) return "28800";
-    if (std.mem.eql(u8, v, "interactive_timeout")) return "28800";
-    if (std.mem.eql(u8, v, "max_connections")) return "256";
-    if (std.mem.eql(u8, v, "group_concat_max_len")) return "1024";
-    if (std.mem.eql(u8, v, "sql_select_limit")) return "18446744073709551615";
-
-    if (std.mem.eql(u8, v, "tx_isolation") or std.mem.eql(u8, v, "transaction_isolation"))
-        return "REPEATABLE-READ";
-    if (std.mem.eql(u8, v, "sql_mode")) return "STRICT_TRANS_TABLES";
-    if (std.mem.eql(u8, v, "autocommit")) return "1";
-    if (std.mem.eql(u8, v, "lower_case_table_names")) return "1";
-    if (std.mem.eql(u8, v, "auto_increment_increment")) return "1";
-    if (std.mem.eql(u8, v, "auto_increment_offset")) return "1";
-    // Writable server. MySQL Connector/J parses these as integers on every
-    // batch (isReadOnly()); returning "" throws NumberFormatException and
-    // breaks the JDBC sink. thinDB is never read-only.
-    if (std.mem.eql(u8, v, "read_only") or
-        std.mem.eql(u8, v, "super_read_only") or
-        std.mem.eql(u8, v, "transaction_read_only") or
-        std.mem.eql(u8, v, "tx_read_only")) return "0";
-    if (std.mem.eql(u8, v, "default_storage_engine") or std.mem.eql(u8, v, "storage_engine")) return "thinDB";
-
-    if (std.mem.eql(u8, v, "character_set_client") or
-        std.mem.eql(u8, v, "character_set_connection") or
-        std.mem.eql(u8, v, "character_set_results") or
-        std.mem.eql(u8, v, "character_set_server") or
-        std.mem.eql(u8, v, "character_set_database"))
-        return "utf8mb4";
-    if (std.mem.eql(u8, v, "collation_connection") or
-        std.mem.eql(u8, v, "collation_server") or
-        std.mem.eql(u8, v, "collation_database"))
-        return "utf8mb4_general_ci";
-    if (std.mem.eql(u8, v, "time_zone")) return "SYSTEM";
-    if (std.mem.eql(u8, v, "system_time_zone")) return "UTC";
-
-    if (std.mem.startsWith(u8, v, "have_")) return "NO";
-    return "";
-}
-
-fn osLabel() []const u8 {
-    return switch (@import("builtin").os.tag) {
-        .windows => "Windows",
-        .macos => "macOS",
-        else => "Linux",
-    };
 }
 
 fn topLevelKeyword(text: []const u8, keyword: []const u8) ?usize {
@@ -4167,8 +4103,7 @@ fn handleStmtExecute(
         while (r < batch.row_count) : (r += 1) {
             row_payload.clearRetainingCapacity();
             try prepared.appendBinaryRow(allocator, &row_payload, batch.schema, batch.values, r);
-            try packet.writePacket(w, seq_id, row_payload.items);
-            seq_id +%= 1;
+            try packet.writeLogicalPacket(w, &seq_id, row_payload.items);
         }
         profiler.recordSince(.stmt_execute_write, row_write_start);
     }

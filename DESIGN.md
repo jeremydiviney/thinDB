@@ -196,6 +196,8 @@ Adjacent string literals concatenate (`'a' 'b'` is `'ab'`).
 
 A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
 
+A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
+
 **`a DIV b` with a DOUBLE or DECIMAL operand** divides exactly, as MySQL
 does, reading a double as its shortest digits, and truncates the quotient
 toward zero into a BIGINT: `5.5 DIV 2` is 2, `5.5 DIV 0.5` is 11 and
