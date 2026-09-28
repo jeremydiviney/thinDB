@@ -43,6 +43,7 @@ const ColumnStore = engine.ColumnStore;
 const api = @import("api.zig");
 const Table = api.Table;
 const DmlFilter = @import("delete.zig").DmlFilter;
+const LiveSegment = @import("delete.zig").LiveSegment;
 const upsert = @import("upsert.zig");
 
 const ir = @import("../ir/ir.zig");
@@ -210,10 +211,9 @@ fn processOneSegment(
     wal_target: *?u64,
 ) !usize {
     const allocator = t.allocator;
-    var name_buf: [32]u8 = undefined;
-    const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-    var seg = try storage.readSegment(allocator, t.io, t.segments_dir, file_name, t.schema);
-    defer seg.deinit();
+    var live = try LiveSegment.open(t, entry.segment_id);
+    defer live.close(t);
+    const seg = live.segment();
 
     var offsets: std.ArrayList(u32) = .empty;
     defer offsets.deinit(allocator);
@@ -254,10 +254,7 @@ fn processOneSegment(
             @memset(mask, true);
         }
 
-        var matched_in_rg: usize = 0;
-        for (mask) |m| if (m) {
-            matched_in_rg += 1;
-        };
+        const matched_in_rg = live.keepLive(row_offset, mask);
 
         if (matched_in_rg > 0) {
             offsets.clearRetainingCapacity();

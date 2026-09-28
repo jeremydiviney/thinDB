@@ -529,12 +529,9 @@ fn collectStoredRows(
     for (t.manifest.segments.items) |entry| {
         if (found == slot_current.len) break;
         if (!bloomAdmitsAny(entry.key_bloom, hashes.items)) continue;
-        const handle = try t.acquireSegment(entry.segment_id);
-        defer t.releaseSegment(handle);
-        const seg = &handle.seg;
-        const tombs = try t.segmentTombstones(t.allocator, handle);
-        defer if (tombs) |x| t.allocator.free(x);
-        var dead = delete_mod.TombCursor{ .tombs = tombs orelse &.{} };
+        var live = try delete_mod.LiveSegment.open(t, entry.segment_id);
+        defer live.close(t);
+        const seg = live.segment();
 
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
@@ -558,7 +555,7 @@ fn collectStoredRows(
             hit_slots.clearRetainingCapacity();
             for (0..rg.row_count) |r| {
                 const row: u32 = @intCast(r);
-                if (dead.isDead(row_offset + row)) continue;
+                if (!live.isLive(row_offset + row)) continue;
                 const key = try compoundKeyFromOwnedColumns(aa, decoded_keys, row);
                 const slot = slot_of.get(key) orelse continue;
                 if (slot_current[slot] != null) continue;
