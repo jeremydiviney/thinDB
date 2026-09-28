@@ -32,10 +32,11 @@ pub const Probe = union(enum) {
     set_search_path: []const u8,
     /// `pg_cancel_backend(<pid>)` — wire layer looks up the target in
     /// the connection registry, sets its cancel flag, and replies a
-    /// single-row "t"/"f" boolean. `pg_terminate_backend` shares the
-    /// same shape; we don't distinguish (we have no way to forcibly
-    /// close the target's socket).
+    /// single-row "t"/"f" boolean.
     cancel_backend: u32,
+    /// `pg_terminate_backend(<pid>)` — as `cancel_backend`, and the
+    /// target connection is closed too.
+    terminate_backend: u32,
 };
 
 pub const StaticRows = struct {
@@ -96,13 +97,10 @@ pub fn match(
     if (std.mem.eql(u8, lc, "rollback") or std.mem.startsWith(u8, lc, "rollback "))
         return Probe{ .accept = "ROLLBACK" };
 
-    // pg_cancel_backend(<pid>) / pg_terminate_backend(<pid>) — both
-    // route to the connection registry's requestCancel. PG returns a
-    // bool indicating success.
     if (parseCancelBackend(lc, "select pg_cancel_backend(")) |pid|
         return Probe{ .cancel_backend = pid };
     if (parseCancelBackend(lc, "select pg_terminate_backend(")) |pid|
-        return Probe{ .cancel_backend = pid };
+        return Probe{ .terminate_backend = pid };
     if (std.mem.eql(u8, lc, "discard all"))
         return Probe{ .discard_temp = "DISCARD ALL" };
     if (std.mem.eql(u8, lc, "discard temp") or std.mem.eql(u8, lc, "discard temporary"))

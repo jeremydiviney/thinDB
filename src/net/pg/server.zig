@@ -341,6 +341,7 @@ const SessionState = struct {
             .current_schema = self.current_schema,
             .dialect = .postgres,
             .temp_namespace = self.temp_namespace,
+            .connections = self.registry,
         };
     }
 };
@@ -367,6 +368,10 @@ fn handleConnection(
     var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
     var host_buf: [64]u8 = undefined;
     conn_state.setPeer(std.fmt.bufPrint(&host_buf, "{f}", .{stream.socket.address}) catch "", conn_registry.nowMs(io));
+    // Published by `register`. This wire sets no transfer marks, so the
+    // socket serves only the disconnect probe and connection kills, never
+    // the stalled-read reaper.
+    conn_state.reap_socket = stream.socket.handle;
     if (registry) |reg| {
         try reg.register(&conn_state);
     }
@@ -380,7 +385,7 @@ fn handleConnection(
         conn_state.endCommand(processDb(&session, &db_buf), conn_registry.nowMs(io));
     }
 
-    while (true) {
+    while (!conn_state.closeRequested()) {
         const frame = packet.readFrame(allocator, r) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
@@ -645,6 +650,8 @@ fn runExtendedStatement(
     op: *const ir.Op,
 ) !void {
     if (op.* == .copy) return copy.Error.CopyMustBeSoleStatement;
+    if (session.conn_state) |state| state.setCancelOnDisconnect(local.producesOnlyResult(op));
+    defer if (session.conn_state) |state| state.setCancelOnDisconnect(false);
 
     const statement_lease = try catalog.acquireStatement(local.changesCatalog(op));
     defer statement_lease.release();
@@ -783,7 +790,10 @@ fn completeStartup(
             return false;
         };
     }
-    if (params.application_name) |an| try session.replaceAppName(an);
+    if (params.application_name) |an| {
+        try session.replaceAppName(an);
+        if (session.conn_state) |state| state.setApplication(an);
+    }
 
     if (auth_creds) |creds| {
         if (!try runScramSha256(allocator, w, r, creds)) return false;
@@ -966,9 +976,11 @@ fn handleQuery(
             try errors.sendErrorResponse(allocator, w, mapped.sqlstate, mapped.message);
             break;
         };
+        if (closeRequested(session)) break;
     }
 
-    try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
+    // A killed connection closes without ReadyForQuery, as after a FATAL.
+    if (!closeRequested(session)) try startup.sendReadyForQuery(allocator, w, session.txStatusByte());
     try w.flush();
 }
 
@@ -1034,16 +1046,42 @@ fn dispatchProbe(
             for (sr.rows) |row| try result.sendDataRow(allocator, w, row);
             try sendSelectComplete(allocator, w, sr.rows.len);
         },
+        // Signalling its own backend interrupts the signalling statement,
+        // as in PostgreSQL; a self-terminate keeps the socket up so the
+        // FATAL reaches the client, and the command loop closes afterwards.
         .cancel_backend => |pid| {
-            const success = if (session.registry) |reg| reg.requestCancel(pid, 0) else false;
-            const cols = [_]@import("../../types.zig").Column{.{ .name = "pg_cancel_backend", .type = .boolean, .nullable = false }};
-            try result.sendRowDescription(allocator, w, cols[0..]);
-            const cell: ?[]const u8 = if (success) "t" else "f";
-            const cells = [_]?[]const u8{cell};
-            try result.sendDataRow(allocator, w, cells[0..]);
-            try sendSelectComplete(allocator, w, 1);
+            if (ownState(session, pid) != null) return error.QueryCancelled;
+            const found = if (session.registry) |reg| reg.requestCancel(pid, 0) else false;
+            try sendBackendSignalResult(allocator, w, "pg_cancel_backend", found);
+        },
+        .terminate_backend => |pid| {
+            if (ownState(session, pid)) |own| {
+                own.requestClose();
+                try errors.sendFatalResponse(allocator, w, "57P01".*, "terminating connection due to administrator command");
+                return;
+            }
+            const found = if (session.registry) |reg| reg.requestClose(session.catalog.io, pid) else false;
+            try sendBackendSignalResult(allocator, w, "pg_terminate_backend", found);
         },
     }
+}
+
+fn ownState(session: *SessionState, backend_id: u32) ?*ConnectionState {
+    const state = session.conn_state orelse return null;
+    return if (state.backend_id == backend_id) state else null;
+}
+
+fn closeRequested(session: *const SessionState) bool {
+    const state = session.conn_state orelse return false;
+    return state.closeRequested();
+}
+
+fn sendBackendSignalResult(allocator: Allocator, w: *std.Io.Writer, function_name: []const u8, found: bool) !void {
+    const cols = [_]@import("../../types.zig").Column{.{ .name = function_name, .type = .boolean, .nullable = false }};
+    try result.sendRowDescription(allocator, w, cols[0..]);
+    const cells = [_]?[]const u8{if (found) "t" else "f"};
+    try result.sendDataRow(allocator, w, cells[0..]);
+    try sendSelectComplete(allocator, w, 1);
 }
 
 fn runEngineQuery(
@@ -1094,6 +1132,8 @@ fn runSingleStatement(
     session: *SessionState,
     op: *const ir.Op,
 ) !void {
+    if (session.conn_state) |state| state.setCancelOnDisconnect(local.producesOnlyResult(op));
+    defer if (session.conn_state) |state| state.setCancelOnDisconnect(false);
     // COPY is wire-driven and can't ride the generic compile path —
     // hand it off before we open a CompileCtx.
     const statement_lease = try catalog.acquireStatement(local.changesCatalog(op));

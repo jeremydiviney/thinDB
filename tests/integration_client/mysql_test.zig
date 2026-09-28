@@ -1708,7 +1708,23 @@ test "mysql wire: KILL <unknown_id> → ER_NO_SUCH_THREAD (1094)" {
     if (sctx.err) |e| return e;
 }
 
-test "mysql wire: KILL <self_id> sets the cancel flag (no registry → no-op success)" {
+fn expectErrPacket(client: *TestClient, code: u16) !void {
+    const pkt = try mysql_packet.readPacket(client.allocator, &client.reader.interface);
+    defer client.allocator.free(pkt.payload);
+    try std.testing.expect(pkt.payload.len > 3);
+    try std.testing.expectEqual(@as(u8, 0xFF), pkt.payload[0]);
+    try std.testing.expectEqual(code, std.mem.readInt(u16, pkt.payload[1..3], .little));
+}
+
+/// The server closed the connection: the next read ends the stream (or, on
+/// Windows, may see the reset instead).
+fn expectConnectionClosed(client: *TestClient) !void {
+    const pkt = mysql_packet.readPacket(client.allocator, &client.reader.interface) catch return;
+    client.allocator.free(pkt.payload);
+    return error.ConnectionStillOpen;
+}
+
+test "mysql wire: KILL of its own connection interrupts itself; only KILL QUERY keeps the connection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1730,77 +1746,36 @@ test "mysql wire: KILL <self_id> sets the cancel flag (no registry → no-op suc
 
     var sctx: ServerCtx = .{ .server = server, .n = 1 };
     const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
-    defer t.join();
+    var server_joined = false;
+    defer if (!server_joined) t.join();
 
     var client = try TestClient.connect(allocator, io, addr);
     defer client.close();
     try client.doHandshake(null);
 
-    // The first connection's id is the value after the first
-    // fetchAdd, which is 1 (server.connection_counter starts at 0;
-    // fetchAdd returns 0 and we +1). KILLing it should succeed.
-    try client.sendQuery("KILL 1");
-    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
-    defer allocator.free(pkt.payload);
-    try std.testing.expectEqual(@as(u8, 0x00), pkt.payload[0]);
+    // The first connection's id is 1.
+    try client.sendQuery("KILL QUERY 1");
+    try expectErrPacket(&client, 1317);
+    try client.sendQuery("SELECT 1");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqualStrings("1", rows[0][0].?);
 
-    try client.sendQuit();
+    try client.sendQuery("KILL 1");
+    try expectErrPacket(&client, 1317);
+    try expectConnectionClosed(&client);
+
+    t.join();
+    server_joined = true;
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
     if (sctx.err) |e| return e;
 }
 
-/// A scalar UDF that sleeps on every batch, so a statement calling it is
-/// still running when the test acts on it.
-const SlowProbe = struct {
-    io: std.Io,
-    rows: std.atomic.Value(usize) = .init(0),
-
-    fn kernel(ctx: *const thindb.udf.ScalarContext, args: []const thindb.storage.ColumnView, out: *thindb.engine.ColumnStore, count: usize) !void {
-        const self: *SlowProbe = @ptrCast(@alignCast(ctx.user_data.?));
-        _ = self.rows.fetchAdd(count, .monotonic);
-        try out.data.bigint.appendSlice(ctx.allocator, args[0].data.bigint[0..count]);
-        try std.Io.sleep(self.io, .fromMilliseconds(20), .awake);
-    }
-
-    fn awaitFirstBatch(self: *SlowProbe) !void {
-        for (0..1000) |_| {
-            if (self.rows.load(.monotonic) > 0) return;
-            try std.Io.sleep(self.io, .fromMilliseconds(5), .awake);
-        }
-        return error.ProbeNeverCalled;
-    }
-};
-
-const slow_probe_rows: usize = 4096;
-const schema_ids = thindb.TableSchema{
-    .columns = &.{.{ .name = "id", .type = .bigint }},
-    .order_key = &.{"id"},
-    .unique = false,
-};
-const ok_ids = [_][]const u8{"id"};
-const opts_ids = thindb.TableOptions{
-    .order_key = &ok_ids,
-    .row_group_size = 128,
-};
-
-/// Registers `slow_probe` and seeds `main.public.t` with enough row groups
-/// that a statement over it spans many probe batches; `dst` starts empty.
-fn seedSlowProbe(catalog: *thindb.Catalog, probe: *SlowProbe) !void {
-    try catalog.registerScalarUdf(.{
-        .name = "slow_probe",
-        .arg_types = &.{.bigint},
-        .return_type = .bigint,
-        .volatility = .immutable,
-        .kernel = SlowProbe.kernel,
-        .user_data = probe,
-    });
-    const sc = catalog.database("main").?.schema("public").?;
-    const t = try sc.table("t", schema_ids, opts_ids);
-    var rows: [slow_probe_rows]struct { id: i64 } = undefined;
-    for (&rows, 0..) |*row, i| row.* = .{ .id = @intCast(i) };
-    try t.insert(&rows);
-    try t.flush();
-    _ = try sc.table("dst", schema_ids, opts_ids);
-}
+const slow_probe = @import("slow_probe.zig");
+const SlowProbe = slow_probe.SlowProbe;
+const slow_probe_rows = slow_probe.total_rows;
+const seedSlowProbe = slow_probe.seed;
 
 test "mysql wire: a read-only query is cancelled once its client disconnects" {
     const allocator = std.testing.allocator;
@@ -1910,7 +1885,7 @@ test "mysql wire: a write keeps running after its client disconnects" {
     if (sctx.err) |e| return e;
 }
 
-test "mysql wire: SHOW PROCESSLIST finds a running query and KILL interrupts it" {
+test "mysql wire: SHOW PROCESSLIST finds a running query and KILL QUERY interrupts it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1976,7 +1951,7 @@ test "mysql wire: SHOW PROCESSLIST finds a running query and KILL interrupts it"
     const short = try admin.readResultSet(arena.allocator());
     try std.testing.expectEqualStrings(slow_sql[0..100], short[0][7].?);
 
-    try admin.sendQuery("KILL 1");
+    try admin.sendQuery("KILL QUERY 1");
     {
         const ok = try mysql_packet.readPacket(allocator, &admin.reader.interface);
         defer allocator.free(ok.payload);
@@ -2004,10 +1979,139 @@ test "mysql wire: SHOW PROCESSLIST finds a running query and KILL interrupts it"
     try std.testing.expectEqualStrings("", idle[6].?);
     try std.testing.expect(idle[7] == null);
 
+    try runner.sendQuery("SELECT 1");
+    const after = try runner.readResultSet(arena.allocator());
+    try std.testing.expectEqualStrings("1", after[0][0].?);
+
     try runner.sendQuit();
     try admin.sendQuit();
     if (runner_ctx.err) |e| return e;
     if (admin_ctx.err) |e| return e;
+}
+
+test "mysql wire: KILL closes a running connection found through information_schema.PROCESSLIST, and an idle one" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: SlowProbe = .{ .io = io };
+    try seedSlowProbe(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 66;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    // Ids follow connect order: runner 1, idler 2, admin 3.
+    var runner_ctx: ServerCtx = .{ .server = server, .n = 1 };
+    const runner_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&runner_ctx});
+    var runner_joined = false;
+    defer if (!runner_joined) runner_thread.join();
+    var runner = try TestClient.connect(allocator, io, addr);
+    defer runner.close();
+    try runner.doHandshake("main");
+    const slow_sql = "SELECT max(slow_probe(id)) AS m FROM t";
+    try runner.sendQuery(slow_sql);
+    try probe.awaitFirstBatch();
+
+    var idler_ctx: ServerCtx = .{ .server = server, .n = 1 };
+    const idler_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&idler_ctx});
+    var idler_joined = false;
+    defer if (!idler_joined) idler_thread.join();
+    var idler = try TestClient.connect(allocator, io, addr);
+    var idler_open = true;
+    defer if (idler_open) idler.close();
+    try idler.doHandshake("main");
+    for ([_][]const u8{ "CREATE TEMP TABLE scratch (id BIGINT PRIMARY KEY)", "XA START 'killed'" }) |setup| {
+        try idler.sendQuery(setup);
+        const ok = try mysql_packet.readPacket(allocator, &idler.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    var admin_ctx: ServerCtx = .{ .server = server, .n = 1 };
+    const admin_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&admin_ctx});
+    defer admin_thread.join();
+    var admin = try TestClient.connect(allocator, io, addr);
+    defer admin.close();
+    try admin.doHandshake("main");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try admin.sendQuery("SELECT ID, USER, DB, STATE, INFO FROM information_schema.PROCESSLIST WHERE COMMAND = 'Query' AND ID <> CONNECTION_ID() AND TIME >= 0 ORDER BY ID DESC");
+    const running = try admin.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), running.len);
+    try std.testing.expectEqualStrings("1", running[0][0].?);
+    try std.testing.expectEqualStrings("test", running[0][1].?);
+    try std.testing.expectEqualStrings("main__public", running[0][2].?);
+    try std.testing.expectEqualStrings("executing", running[0][3].?);
+    try std.testing.expectEqualStrings(slow_sql, running[0][4].?);
+
+    try admin.sendQuery("SELECT ID, EXECUTION_ENGINE FROM performance_schema.processlist ORDER BY ID");
+    const all = try admin.readResultSet(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    for (all, [_][]const u8{ "1", "2", "3" }) |row, id| {
+        try std.testing.expectEqualStrings(id, row[0].?);
+        try std.testing.expectEqualStrings("PRIMARY", row[1].?);
+    }
+
+    try admin.sendQuery("KILL 1");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &admin.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+    // The runner's reply, if any gets out before the socket goes, ends in
+    // ER_QUERY_INTERRUPTED; then the connection is gone.
+    for (0..16) |_| {
+        const pkt = mysql_packet.readPacket(allocator, &runner.reader.interface) catch break;
+        allocator.free(pkt.payload);
+    } else return error.RunnerStillOpen;
+    runner_thread.join();
+    runner_joined = true;
+    try std.testing.expect(probe.rows.load(.monotonic) < slow_probe_rows);
+
+    try admin.sendQuery("KILL CONNECTION 2");
+    {
+        const ok = try mysql_packet.readPacket(allocator, &admin.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+    try expectConnectionClosed(&idler);
+    // A client closes its end once it sees the server's close. Windows
+    // completes the server's already-pending read only then, not on the
+    // shutdown itself.
+    idler.close();
+    idler_open = false;
+    idler_thread.join();
+    idler_joined = true;
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "_temp/2", .{}));
+    // The killed connection's ACTIVE branch was rolled back, so its xid is
+    // free again.
+    for ([_][]const u8{ "XA START 'killed'", "XA END 'killed'", "XA ROLLBACK 'killed'" }) |xa| {
+        try admin.sendQuery(xa);
+        const ok = try mysql_packet.readPacket(allocator, &admin.reader.interface);
+        defer allocator.free(ok.payload);
+        try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    try admin.sendQuery("KILL 2");
+    try expectErrPacket(&admin, 1094);
+
+    try admin.sendQuit();
+    if (runner_ctx.err) |e| return e;
+    if (idler_ctx.err) |e| return e;
 }
 
 test "mysql wire: limiter at zero capacity emits ER_CON_COUNT_ERROR on accept" {
