@@ -2831,7 +2831,7 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
             continue;
         }
         try staged.append(ctx.allocator, aa, t, plan, out_schema, batch_schema, views, b.row_count);
-        if (staged.bytes > INSERT_SELECT_STAGE_BYTES) {
+        if (staged.bytes > t.stage_bytes) {
             total_rows += try staged.write(aa, t, rule);
             staged.deinit(ctx.allocator);
             staged = .{};
@@ -2842,13 +2842,6 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     ctx.affected_rows = @intCast(total_rows);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
 }
-
-/// How many bytes of rows an INSERT ... SELECT gathers before writing any.
-/// Within the bound the rows land in one batch, which the table validates
-/// whole before taking any of it, so a source that fails part way or a row
-/// the table refuses leaves nothing behind, as MySQL rolls the statement
-/// back. A larger copy writes what it gathered, then streams batch by batch.
-const INSERT_SELECT_STAGE_BYTES: usize = 64 << 20;
 
 fn writeInsertRows(t: *ApiTable, rule: DuplicateRule, batch_schema: []const types.Column, views: []const storage.ColumnView, row_count: usize) !usize {
     switch (rule) {

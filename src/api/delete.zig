@@ -1,7 +1,7 @@
-//! Delete-by-predicate orchestration. Per segment: prune by stats where
-//! possible, otherwise decode the predicate column and emit tombstones for
-//! matching rows. Memtable rows are removed through
-//! `Table.deleteMemtableRowsLocked`, which logs them first.
+//! Delete-by-predicate orchestration, as the steps of one
+//! `Table.Statement`: the memtable rows first, then per row group the
+//! matching segment rows, pruned by stats where possible. The caller
+//! commits the statement.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -17,9 +17,9 @@ const comparison = @import("comparison.zig");
 const upsert = @import("upsert.zig");
 const bloom = @import("../util/bloom.zig");
 
-/// Implements `Table.delete`. Returns the number of rows deleted;
-/// `wal_target` receives the WAL offset to await.
-pub fn execDelete(t: *Table, pred: exec.Predicate, wal_target: *?u64) !usize {
+/// Implements `Table.delete` within `s`. Returns the number of rows
+/// deleted.
+pub fn execDelete(t: *Table, s: *Table.Statement, pred: exec.Predicate) !usize {
     const col_idx = t.schema.columnIndex(pred.col) orelse return exec.Error.ColumnNotFound;
     const col_type = t.schema.columns[col_idx].type;
     if (ValueTag.fromType(col_type) != std.meta.activeTag(pred.val)) {
@@ -30,22 +30,26 @@ pub fn execDelete(t: *Table, pred: exec.Predicate, wal_target: *?u64) !usize {
     }
 
     var total: usize = 0;
+    const segs_at_start = t.manifest.segments.items.len;
 
-    // The memtable rows to keep, worked out before any segment write so a
-    // failure here leaves the table as it was.
-    const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
-    defer t.allocator.free(keep);
-    const mt_view = t.memtable.columns[col_idx].view();
-    for (keep, 0..) |*k, i| k.* = !comparison.evalRow(mt_view, @intCast(i), pred);
+    // ---- Memtable ----
+    // First, so that a chunk commit's flush can't write matching rows out.
+    {
+        const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
+        defer t.allocator.free(keep);
+        const mt_view = t.memtable.columns[col_idx].view();
+        for (keep, 0..) |*k, i| k.* = !comparison.evalRow(mt_view, @intCast(i), pred);
+        total += try t.deleteMemtableRowsLocked(s, keep);
+    }
 
     // ---- Segments ----
-    for (t.manifest.segments.items) |entry| {
+    var deleted: std.ArrayList(u32) = .empty;
+    defer deleted.deinit(t.allocator);
+    for (0..segs_at_start) |si| {
+        const entry = t.manifest.segments.items[si];
         var live = try LiveSegment.open(t, entry.segment_id);
         defer live.close(t);
         const seg = live.segment();
-
-        var deleted: std.ArrayList(u32) = .empty;
-        defer deleted.deinit(t.allocator);
 
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
@@ -61,6 +65,7 @@ pub fn execDelete(t: *Table, pred: exec.Predicate, wal_target: *?u64) !usize {
             defer col.deinit(t.allocator);
 
             const n = rg.row_count;
+            deleted.clearRetainingCapacity();
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 if (comparison.evalRow(col.view(), i, pred) and live.isLive(row_offset + i)) {
@@ -68,27 +73,19 @@ pub fn execDelete(t: *Table, pred: exec.Predicate, wal_target: *?u64) !usize {
                 }
             }
             row_offset += rg.row_count;
-        }
-
-        if (deleted.items.len > 0) {
-            try t.mergeTombstones(
-                t.allocator,
-                entry.segment_id,
-                deleted.items,
-                t.syncEnabled(),
-            );
-            t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
-            total += deleted.items.len;
+            total += try stageSegmentRows(t, s, entry.segment_id, deleted.items);
         }
     }
-
-    // ---- Memtable ----
-    // Snapshot-isolated path: build a NEW memtable with the surviving rows,
-    // atomically swap the table's pointer, retire the old. Concurrent scans
-    // that captured the old memtable continue to see the pre-delete state
-    // until they finish; the old memtable's columns are never mutated again.
-    total += try t.deleteMemtableRowsLocked(keep, wal_target);
     return total;
+}
+
+/// Stage the removal of `offsets`, rows of one row group of segment
+/// `segment_id`, and return how many. One step per row group keeps each
+/// step's log payload bounded by the row-group size.
+fn stageSegmentRows(t: *Table, s: *Table.Statement, segment_id: u64, offsets: []const u32) !usize {
+    if (offsets.len == 0) return 0;
+    try t.replaceRowsLocked(s, .{ .segment = .{ .id = segment_id, .offsets = offsets } }, &.{}, 0);
+    return offsets.len;
 }
 
 /// A statement's full order key, encoded with the same byte layout the
@@ -162,14 +159,14 @@ pub fn keyedBatchEligible(t: *Table, preds: []const ?predicate.PredicateExpr) !b
 /// statements credits the first). Returns null — before any mutation —
 /// when the batch isn't eligible; total matched rows otherwise.
 ///
-/// Caller holds the table mutex. Literals must already be widened
-/// (`validateExpr`), same as `execDeleteByExpr`. `wal_target` receives
-/// the WAL offset to await.
+/// Caller holds the table mutex and runs the batch as statement `s`.
+/// Literals must already be widened (`validateExpr`), same as
+/// `execDeleteByExpr`.
 pub fn execDeleteKeyedBatch(
     t: *Table,
+    s: *Table.Statement,
     preds: []const ?predicate.PredicateExpr,
     counts: []usize,
-    wal_target: *?u64,
 ) !?usize {
     std.debug.assert(preds.len == counts.len);
     if (!t.schema.unique or t.order_key_indices.len == 0) return null;
@@ -196,34 +193,37 @@ pub fn execDeleteKeyedBatch(
     var total: usize = 0;
 
     var keybuf: std.ArrayList(u8) = .empty;
+    const segs_at_start = t.manifest.segments.items.len;
 
-    // The memtable rows to keep, worked out before any segment write so a
-    // failure here leaves the table as it was.
-    const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
-    defer t.allocator.free(keep);
-    for (keep, 0..) |*k, i| {
-        keybuf.clearRetainingCapacity();
-        for (oki) |ci| {
-            try comparison.appendColumnValueBytes(aa, &keybuf, t.memtable.columns[ci].view(), @intCast(i));
+    // ---- Memtable ----
+    // First, so that a chunk commit's flush can't write matching rows out.
+    {
+        const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
+        defer t.allocator.free(keep);
+        for (keep, 0..) |*k, i| {
+            keybuf.clearRetainingCapacity();
+            for (oki) |ci| {
+                try comparison.appendColumnValueBytes(aa, &keybuf, t.memtable.columns[ci].view(), @intCast(i));
+            }
+            k.* = true;
+            if (key_map.get(keybuf.items)) |stmt_idx| {
+                k.* = false;
+                counts[stmt_idx] += 1;
+            }
         }
-        k.* = true;
-        if (key_map.get(keybuf.items)) |stmt_idx| {
-            k.* = false;
-            counts[stmt_idx] += 1;
-            total += 1;
-        }
+        total += try t.deleteMemtableRowsLocked(s, keep);
     }
 
     // ---- Segments ----
-    for (t.manifest.segments.items) |entry| {
+    var deleted: std.ArrayList(u32) = .empty;
+    defer deleted.deinit(t.allocator);
+    for (0..segs_at_start) |si| {
+        const entry = t.manifest.segments.items[si];
         if (!upsert.bloomAdmitsAny(entry.key_bloom, hashes.items)) continue;
 
         var live = try LiveSegment.open(t, entry.segment_id);
         defer live.close(t);
         const seg = live.segment();
-
-        var deleted: std.ArrayList(u32) = .empty;
-        defer deleted.deinit(t.allocator);
 
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
@@ -249,6 +249,7 @@ pub fn execDeleteKeyedBatch(
                 decoded_count += 1;
             }
 
+            deleted.clearRetainingCapacity();
             var row: u32 = 0;
             while (row < n) : (row += 1) {
                 keybuf.clearRetainingCapacity();
@@ -260,23 +261,9 @@ pub fn execDeleteKeyedBatch(
                 }
             }
             row_offset += n;
-        }
-
-        if (deleted.items.len > 0) {
-            try t.mergeTombstones(
-                t.allocator,
-                entry.segment_id,
-                deleted.items,
-                t.syncEnabled(),
-            );
-            t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
-            total += deleted.items.len;
+            total += try stageSegmentRows(t, s, entry.segment_id, deleted.items);
         }
     }
-
-    // ---- Memtable ----
-    // Same snapshot-isolated clone-and-swap shape as `execDeleteByExpr`.
-    _ = try t.deleteMemtableRowsLocked(keep, wal_target);
     return total;
 }
 
@@ -297,10 +284,11 @@ pub const TombCursor = struct {
 };
 
 /// A flushed segment as a DML statement may match it: pinned, with the
-/// tombstones in force when it was opened. A tombstoned row is gone —
-/// matching it re-deletes it (inflating the count) or, for an UPDATE, brings
-/// it back or overwrites its live successor with stale values (#343).
-/// Row offsets must be visited in increasing order.
+/// tombstones in force when it was opened, those the running statement has
+/// staged included. A tombstoned row is gone — matching it re-deletes it
+/// (inflating the count) or, for an UPDATE, brings it back or overwrites
+/// its live successor with stale values (#343). Row offsets must be
+/// visited in increasing order.
 pub const LiveSegment = struct {
     handle: *storage.cache.SegmentHandles.Entry,
     tombs: ?[]u32,
@@ -309,7 +297,12 @@ pub const LiveSegment = struct {
     pub fn open(t: *Table, segment_id: u64) !LiveSegment {
         const handle = try t.acquireSegment(segment_id);
         errdefer t.releaseSegment(handle);
-        const tombs = try t.segmentTombstones(t.allocator, handle);
+        const on_disk = try t.segmentTombstones(t.allocator, handle);
+        const staged = if (t.statement) |s| s.tombstones.get(segment_id) else null;
+        const tombs = if (staged != null and staged.?.items.len > 0) blk: {
+            defer if (on_disk) |x| t.allocator.free(x);
+            break :blk try withStagedOffsets(t.allocator, on_disk orelse &.{}, staged.?.items);
+        } else on_disk;
         return .{ .handle = handle, .tombs = tombs, .dead = .{ .tombs = tombs orelse &.{} } };
     }
 
@@ -337,6 +330,24 @@ pub const LiveSegment = struct {
         return kept;
     }
 };
+
+/// `tombs` and `staged` in one sorted, deduplicated list.
+fn withStagedOffsets(allocator: std.mem.Allocator, tombs: []const u32, staged: []const u32) ![]u32 {
+    var all: std.ArrayList(u32) = .empty;
+    errdefer all.deinit(allocator);
+    try all.ensureTotalCapacityPrecise(allocator, tombs.len + staged.len);
+    all.appendSliceAssumeCapacity(tombs);
+    all.appendSliceAssumeCapacity(staged);
+    std.sort.pdq(u32, all.items, {}, std.sort.asc(u32));
+    var kept: usize = 0;
+    for (all.items, 0..) |v, i| {
+        if (i > 0 and all.items[i - 1] == v) continue;
+        all.items[kept] = v;
+        kept += 1;
+    }
+    all.shrinkRetainingCapacity(kept);
+    return all.toOwnedSlice(allocator);
+}
 
 const RgHint = union(enum) {
     compare: struct { col_idx: usize, op: exec.PredicateOp, val: types.Value },
@@ -518,20 +529,16 @@ pub const DmlFilter = struct {
 };
 
 /// `DELETE FROM t [WHERE expr]` — generalized delete accepting the
-/// rich `PredicateExpr` (AND/OR/IN/etc). Same per-segment streaming
-/// shape as `execDelete` — tombstone offsets accumulate per segment
-/// (bounded by segment size, never by total table size), get merged
-/// into the segment's tombstone file, then the buffer is freed
-/// before moving to the next segment. Memtable rows are filtered
-/// via clone-and-swap, same as the simple `execDelete` path.
+/// rich `PredicateExpr` (AND/OR/IN/etc), within `s`. Same shape as
+/// `execDelete`: the memtable step, then one step per matching row group.
 ///
 /// `pred_in == null` means delete every row; `derived` are the computed
-/// operands it compares. `wal_target` receives the WAL offset to await.
+/// operands it compares.
 pub fn execDeleteByExpr(
     t: *Table,
+    s: *Table.Statement,
     pred_in: ?predicate.PredicateExpr,
     derived: []const exec.Derived,
-    wal_target: *?u64,
 ) !usize {
     var total: usize = 0;
 
@@ -556,29 +563,37 @@ pub fn execDeleteByExpr(
     // references get decoded.
     const prune = try SegmentPrune.init(gate_arena.allocator(), t.schema.columns, derived, pred_or_null);
 
-    // The memtable rows to keep, worked out before any segment write so a
-    // failure here leaves the table as it was.
-    const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
-    defer t.allocator.free(keep);
-    if (pred_or_null == null) {
-        @memset(keep, false);
-    } else if (keep.len > 0) {
-        const views = try t.allocator.alloc(storage.ColumnView, t.schema.columns.len);
-        defer t.allocator.free(views);
-        for (t.memtable.columns, views) |*c, *v| v.* = c.view();
-        const fake_batch: exec.Batch = .{
-            .schema = t.schema.columns,
-            .values = views,
-            .row_count = keep.len,
-        };
-        const mask = try t.allocator.alloc(bool, keep.len);
-        defer t.allocator.free(mask);
-        try filter.?.evaluate(t.allocator, fake_batch, mask);
-        for (mask, keep) |m, *k| k.* = !m;
+    const segs_at_start = t.manifest.segments.items.len;
+
+    // ---- Memtable ----
+    // First, so that a chunk commit's flush can't write matching rows out.
+    {
+        const keep = try t.allocator.alloc(bool, @intCast(t.memtable.row_count));
+        defer t.allocator.free(keep);
+        if (pred_or_null == null) {
+            @memset(keep, false);
+        } else if (keep.len > 0) {
+            const views = try t.allocator.alloc(storage.ColumnView, t.schema.columns.len);
+            defer t.allocator.free(views);
+            for (t.memtable.columns, views) |*c, *v| v.* = c.view();
+            const fake_batch: exec.Batch = .{
+                .schema = t.schema.columns,
+                .values = views,
+                .row_count = keep.len,
+            };
+            const mask = try t.allocator.alloc(bool, keep.len);
+            defer t.allocator.free(mask);
+            try filter.?.evaluate(t.allocator, fake_batch, mask);
+            for (mask, keep) |m, *k| k.* = !m;
+        }
+        total += try t.deleteMemtableRowsLocked(s, keep);
     }
 
     // ---- Segments ----
-    for (t.manifest.segments.items) |entry| {
+    var deleted: std.ArrayList(u32) = .empty;
+    defer deleted.deinit(t.allocator);
+    for (0..segs_at_start) |si| {
+        const entry = t.manifest.segments.items[si];
         if (key_hashes) |hs| {
             if (!@import("upsert.zig").bloomAdmitsAny(entry.key_bloom, hs)) continue;
         }
@@ -586,12 +601,10 @@ pub fn execDeleteByExpr(
         defer live.close(t);
         const seg = live.segment();
 
-        var deleted: std.ArrayList(u32) = .empty;
-        defer deleted.deinit(t.allocator);
-
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
             const n = rg.row_count;
+            deleted.clearRetainingCapacity();
 
             if (pred_or_null == null) {
                 // No predicate → every row tombstoned. Skip decoding.
@@ -600,6 +613,7 @@ pub fn execDeleteByExpr(
                     if (live.isLive(row_offset + i)) try deleted.append(t.allocator, row_offset + i);
                 }
                 row_offset += n;
+                total += try stageSegmentRows(t, s, entry.segment_id, deleted.items);
                 continue;
             }
 
@@ -642,23 +656,9 @@ pub fn execDeleteByExpr(
                 if (m) try deleted.append(t.allocator, row_offset + @as(u32, @intCast(i)));
             }
             row_offset += n;
-        }
-
-        if (deleted.items.len > 0) {
-            try t.mergeTombstones(
-                t.allocator,
-                entry.segment_id,
-                deleted.items,
-                t.syncEnabled(),
-            );
-            t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
-            total += deleted.items.len;
+            total += try stageSegmentRows(t, s, entry.segment_id, deleted.items);
         }
     }
-
-    // ---- Memtable ----
-    // Same snapshot-isolated clone-and-swap shape as `execDelete`.
-    total += try t.deleteMemtableRowsLocked(keep, wal_target);
     return total;
 }
 
@@ -688,17 +688,16 @@ test "delete: affected count excludes already-tombstoned rows" {
     });
     try t.flush();
 
-    var wal_target: ?u64 = null;
     const pred = exec.Predicate{ .col = "v", .op = .lte, .val = .{ .int = 2 } };
-    try std.testing.expectEqual(@as(usize, 2), try execDelete(t, pred, &wal_target));
+    try std.testing.expectEqual(@as(usize, 2), try t.delete(pred));
     // The matching rows are dead now; re-running the same predicate must
     // report 0, not re-count the tombstoned copies.
-    try std.testing.expectEqual(@as(usize, 0), try execDelete(t, pred, &wal_target));
+    try std.testing.expectEqual(@as(usize, 0), try t.delete(pred));
 
     var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "v", .op = .gte, .val = .{ .int = 1 } } };
     try predicate.validateExpr(&expr, t.schema.columns);
-    try std.testing.expectEqual(@as(usize, 1), try execDeleteByExpr(t, expr, &.{}, &wal_target));
-    try std.testing.expectEqual(@as(usize, 0), try execDeleteByExpr(t, expr, &.{}, &wal_target));
+    try std.testing.expectEqual(@as(usize, 1), try t.deleteByExpr(expr, &.{}));
+    try std.testing.expectEqual(@as(usize, 0), try t.deleteByExpr(expr, &.{}));
 }
 
 test "keyed batch delete: one sweep, per-statement counts, literal widening" {

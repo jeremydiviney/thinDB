@@ -184,8 +184,10 @@ const TombstoneFile = struct { segment_id: u64, bytes: []u8 };
 
 /// Last writer wins: each of `mt`'s unseen rows replaces the older row with
 /// its order key, in the memtable or in a flushed segment. `gen` is the
-/// memtable generation `mt` has, or gets once installed.
-pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64) !Resolution {
+/// memtable generation `mt` has, or gets once installed. The segment rows
+/// go into `statement_rows` when a statement collects them for its commit,
+/// and into the resolution's tombstone files otherwise.
+pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64, statement_rows: ?*engine.wal.SegmentTombstones) !Resolution {
     std.debug.assert(t.order_key_indices.len > 0);
     var resolution: Resolution = .{};
     errdefer resolution.deinit(t.allocator);
@@ -346,7 +348,9 @@ pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64) !Resol
             row_offset += rg.row_count;
         }
 
-        if (deleted.items.len > 0) {
+        if (statement_rows) |rows| {
+            try engine.wal.addSegmentTombstones(t.allocator, rows, entry.segment_id, deleted.items);
+        } else if (deleted.items.len > 0) {
             try resolution.tombstone_files.ensureUnusedCapacity(t.allocator, 1);
             const bytes = try storage.tombstone.encodeMerged(t.allocator, t.io, t.segments_dir, entry.segment_id, deleted.items);
             resolution.tombstone_files.appendAssumeCapacity(.{ .segment_id = entry.segment_id, .bytes = bytes });
@@ -368,7 +372,7 @@ pub fn commitResolution(t: *Table, resolution: *Resolution) !void {
 
 /// Resolve the memtable rows no resolution has seen, in one step.
 pub fn applyUpsertResolution(t: *Table) !void {
-    var resolution = try prepareResolution(t, t.memtable, t.memtable_gen);
+    var resolution = try prepareResolution(t, t.memtable, t.memtable_gen, null);
     defer resolution.deinit(t.allocator);
     try commitResolution(t, &resolution);
 }

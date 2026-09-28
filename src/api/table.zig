@@ -134,10 +134,12 @@ pub const Table = struct {
 
     /// WAL writer when `Config.wal_enabled = true`. `null` otherwise.
     wal: ?engine.wal.WalWriter,
-    /// Segment offsets an UPDATE has logged in `replace` records but not yet
-    /// merged into the segments' tombstone files. Must reach those files
-    /// before a flush retires the WAL (see `mergeLoggedTombstonesLocked`).
-    wal_tombstones: engine.wal.SegmentTombstones = .empty,
+    /// The UPDATE or DELETE staging steps on this table, between
+    /// `beginStatementLocked` and its commit or `endStatementLocked`.
+    statement: ?*Statement = null,
+    /// `STATEMENT_STAGE_BYTES`, which tests lower to cross it with a few
+    /// rows.
+    stage_bytes: usize = STATEMENT_STAGE_BYTES,
 
     /// Serializes writers vs. the background flusher. Public mutating
     /// entry points (`insert`, `delete`, `flush`, `compact`) lock this
@@ -236,7 +238,7 @@ pub const Table = struct {
         // false but a WAL file is present from a previous run, we still
         // replay it so no acked writes are silently dropped.
         var replayed_tombstones: engine.wal.SegmentTombstones = .empty;
-        errdefer engine.wal.deinitSegmentTombstones(allocator, &replayed_tombstones);
+        defer engine.wal.deinitSegmentTombstones(allocator, &replayed_tombstones);
         const replayed = try engine.wal.replayFromCheckpoint(allocator, io, table_dir, fp, memtable, manifest.wal_checkpoint, &replayed_tombstones);
         if (replayed.did_replay) manifest.wal_checkpoint = replayed.checkpoint;
 
@@ -291,11 +293,8 @@ pub const Table = struct {
             .manifest = manifest,
             .memtable = memtable,
             .wal = null,
-            .wal_tombstones = replayed_tombstones,
             .next_segment_id = .init(manifest.nextSegmentId()),
         };
-        replayed_tombstones = .empty;
-        errdefer engine.wal.deinitSegmentTombstones(allocator, &self.wal_tombstones);
 
         // Reclaim orphaned segment files: a crash mid-compaction, or a #137
         // pending delete that never drained before shutdown, leaves .dat/
@@ -304,8 +303,8 @@ pub const Table = struct {
         self.sweepOrphanedSegmentFiles() catch {};
         self.loadKeyBloomSidecars();
         // The fresh WAL created below drops the replayed log, so the offsets
-        // its `replace` records carry must be in the segments first.
-        try self.mergeLoggedTombstonesLocked();
+        // its records carry must be in the segments first.
+        try self.mergeReplayedTombstonesLocked(&replayed_tombstones);
 
         // If we replayed WAL records into a unique-key table's memtable,
         // re-run upsert resolution so any same-key dupes get tombstoned
@@ -333,7 +332,6 @@ pub const Table = struct {
         const allocator = self.allocator;
         const io = self.io;
         self.pending_deletes.deinit(allocator);
-        engine.wal.deinitSegmentTombstones(allocator, &self.wal_tombstones);
         if (self.wal) |*w| w.deinit();
         self.upsert_idx.deinit(allocator);
         if (self.upsert_idx_arena) |*a| a.deinit();
@@ -512,7 +510,7 @@ pub const Table = struct {
                 self.memtable.truncate(before_count);
                 if (self.schema.unique) upsert_mod.resetIndex(self);
             }
-            if (self.schema.unique) resolution = try upsert_mod.prepareResolution(self, self.memtable, self.memtable_gen);
+            if (self.schema.unique) resolution = try upsert_mod.prepareResolution(self, self.memtable, self.memtable_gen, null);
             if (self.wal) |*w| wal_target = try w.appendInsert(self.memtable, before_count, @intCast(self.memtable.row_count));
         }
         upsert_mod.commitResolution(self, &resolution) catch |err| {
@@ -523,7 +521,45 @@ pub const Table = struct {
         return wal_target;
     }
 
-    /// Rows one UPDATE or DELETE batch removes: memtable rows (`keep[i]`
+    /// How much change a statement stages before it commits any: an UPDATE
+    /// or DELETE (`Statement`), or the rows an INSERT ... SELECT gathers into
+    /// one batch, which the table validates whole before taking any of it.
+    /// Within the bound a failed statement leaves nothing behind, as MySQL
+    /// rolls it back. Past it, an UPDATE or DELETE commits in chunks of about
+    /// this size and an INSERT ... SELECT streams batch by batch, so memory
+    /// stays bounded.
+    pub const STATEMENT_STAGE_BYTES: usize = 64 << 20;
+
+    /// One UPDATE or DELETE, staged step by step and committed whole (#335).
+    ///
+    /// A step changes the live memtable at once. Its segment offsets and its
+    /// log record wait here for `commitStatementLocked`, so a statement that
+    /// fails first leaves nothing on disk, and `endStatementLocked` puts the
+    /// memtable back. No reader sees a staged step: readers capture the
+    /// memtable under the table mutex, which the statement holds throughout.
+    ///
+    /// Past `STATEMENT_STAGE_BYTES` of staged change a statement commits what
+    /// it has, flushes if due, and goes on as a new chunk. It is then atomic
+    /// per chunk, not whole.
+    pub const Statement = struct {
+        /// The memtable the chunk started from, and its row count.
+        base: *engine.Memtable = undefined,
+        base_rows: usize = 0,
+        base_first_write_ts: ?Io.Timestamp = null,
+        /// Set once a step swapped `base` out. The table's reference to it
+        /// passes to the statement, so a rollback can put it back.
+        holds_base: bool = false,
+        /// The segment rows the chunk deletes, per segment: its own, and the
+        /// older versions of the keys it writes.
+        tombstones: engine.wal.SegmentTombstones = .empty,
+        steps: engine.wal.StatementSteps = .{},
+        /// Whether a step removed or added memtable rows.
+        touches_memtable: bool = false,
+        staged_bytes: usize = 0,
+        wal_target: ?u64 = null,
+    };
+
+    /// Rows one step of an UPDATE or DELETE removes: memtable rows (`keep[i]`
     /// false for each, `rows` holding their values) or offsets in one
     /// segment.
     pub const Replaced = union(enum) {
@@ -531,79 +567,82 @@ pub const Table = struct {
         segment: struct { id: u64, offsets: []const u32 },
     };
 
-    /// Apply one UPDATE or DELETE batch: remove `replaced` and insert `rows`
-    /// (none for a DELETE) in its place. Both halves go into one `replace`
-    /// WAL record before either is applied, so recovery can't keep the delete
-    /// and lose the rows (#48). The batch is staged first, so a failure up
-    /// to the record leaves the table as it was: the memtable rows it keeps
-    /// in a private clone, room for its segment offsets, and its new rows
-    /// past the live memtable's end. After the record, as for an insert, only
-    /// a tombstone write can fail, and that fences the table.
-    /// Segment offsets wait in `wal_tombstones` for
-    /// `mergeLoggedTombstonesLocked`. Returns the WAL offset to await.
+    /// Start `s` on this table. Pair with `endStatementLocked`.
+    pub fn beginStatementLocked(self: *Table, s: *Statement) void {
+        std.debug.assert(self.statement == null);
+        s.base = self.memtable;
+        s.base_rows = @intCast(self.memtable.row_count);
+        s.base_first_write_ts = self.first_write_ts;
+        s.holds_base = false;
+        s.touches_memtable = false;
+        s.staged_bytes = 0;
+        self.statement = s;
+    }
+
+    /// Stage one step of `s`: remove `replaced` and add `rows` (none for a
+    /// DELETE) in its place. Both halves go into the statement's log record
+    /// together, so recovery can't keep the delete and lose the rows (#48).
     pub fn replaceRowsLocked(
         self: *Table,
+        s: *Statement,
         replaced: Replaced,
         rows: []const engine.ColumnStore,
         row_count: usize,
-    ) !?u64 {
+    ) !void {
+        std.debug.assert(self.statement == s);
         try self.ensureUsable();
         var staged: ?*engine.Memtable = null;
         defer if (staged) |mt| mt.release();
+        var removed_bytes: usize = 0;
         switch (replaced) {
-            .memtable => |m| staged = try self.memtable.cloneWithRetainedRows(self.allocator, m.keep),
-            .segment => |s| try engine.wal.reserveSegmentTombstones(self.allocator, &self.wal_tombstones, s.id, s.offsets.len),
+            .memtable => |m| {
+                staged = try self.memtable.cloneWithRetainedRows(self.allocator, m.keep);
+                removed_bytes = engine.memtable.columnsByteSize(m.rows);
+            },
+            .segment => |seg| {
+                try engine.wal.addSegmentTombstones(self.allocator, &s.tombstones, seg.id, seg.offsets);
+                removed_bytes = seg.offsets.len * @sizeOf(u32);
+            },
         }
-        const before_count: usize = @intCast(self.memtable.row_count);
+        if (staged) |mt| upsert_mod.carryIndexKept(self, replaced.memtable.keep, mt, self.memtable_gen + 1);
         var resolution: upsert_mod.Resolution = .{};
         defer resolution.deinit(self.allocator);
-        var wal_target: ?u64 = null;
-        {
-            errdefer {
-                if (staged == null) self.memtable.truncate(before_count);
-                if (self.schema.unique) upsert_mod.resetIndex(self);
+        if (row_count > 0) {
+            const views = try self.allocator.alloc(storage.ColumnView, rows.len);
+            defer self.allocator.free(views);
+            for (rows, views) |*store, *view| view.* = store.view();
+            if (staged) |mt| {
+                try mt.insertColumnarBatch(self.schema.columns, views, row_count);
+            } else {
+                try self.appendBatchLocked(self.schema.columns, views, row_count);
             }
-            if (staged) |mt| upsert_mod.carryIndexKept(self, replaced.memtable.keep, mt, self.memtable_gen + 1);
-            if (row_count > 0) {
-                const views = try self.allocator.alloc(storage.ColumnView, rows.len);
-                defer self.allocator.free(views);
-                for (rows, views) |*store, *view| view.* = store.view();
-                if (staged) |mt| {
-                    try mt.insertColumnarBatch(self.schema.columns, views, row_count);
-                } else {
-                    try self.appendBatchLocked(self.schema.columns, views, row_count);
-                }
-                if (self.schema.unique) resolution = if (staged) |mt|
-                    try upsert_mod.prepareResolution(self, mt, self.memtable_gen + 1)
-                else
-                    try upsert_mod.prepareResolution(self, self.memtable, self.memtable_gen);
-            }
-            if (self.wal) |*w| wal_target = switch (replaced) {
-                .memtable => |m| try w.appendReplace(self.schema.columns, m.rows, m.row_count, 0, &.{}, rows, row_count),
-                .segment => |s| try w.appendReplace(self.schema.columns, &.{}, 0, s.id, s.offsets, rows, row_count),
-            };
+            if (self.schema.unique) resolution = if (staged) |mt|
+                try upsert_mod.prepareResolution(self, mt, self.memtable_gen + 1, &s.tombstones)
+            else
+                try upsert_mod.prepareResolution(self, self.memtable, self.memtable_gen, &s.tombstones);
         }
+        if (self.wal != null) switch (replaced) {
+            .memtable => |m| try s.steps.append(self.allocator, self.schema.columns, m.rows, m.row_count, 0, &.{}, rows, row_count),
+            .segment => |seg| try s.steps.append(self.allocator, self.schema.columns, &.{}, 0, seg.id, seg.offsets, rows, row_count),
+        };
         if (staged) |mt| {
             staged = null;
             self.installMemtableLocked(mt);
         }
-        switch (replaced) {
-            .memtable => {},
-            .segment => |s| engine.wal.addSegmentTombstonesAssumeCapacity(&self.wal_tombstones, s.id, s.offsets),
+        try upsert_mod.commitResolution(self, &resolution);
+        if (replaced == .memtable or row_count > 0) s.touches_memtable = true;
+        s.staged_bytes += removed_bytes + engine.memtable.columnsByteSize(rows);
+        if (s.staged_bytes > self.stage_bytes) {
+            try self.commitStagedLocked(s);
+            try self.maybeAutoFlushLocked();
+            self.beginStatementLocked(s);
         }
-        upsert_mod.commitResolution(self, &resolution) catch |err| {
-            self.requireRecovery();
-            return err;
-        };
-        if (row_count > 0) try self.maybeAutoFlushLocked();
-        return wal_target;
     }
 
-    /// Drop the memtable rows `keep` marks false and return how many. They go
-    /// into the WAL first as a `replace` record with nothing in their place,
-    /// so replay removes exactly these rows instead of re-running the DELETE's
-    /// predicate (#61). `wal_target` receives the WAL offset to await.
-    pub fn deleteMemtableRowsLocked(self: *Table, keep: []const bool, wal_target: *?u64) !usize {
+    /// Stage the removal of the memtable rows `keep` marks false and return
+    /// how many. The log names these rows, so replay removes exactly them
+    /// instead of re-running the DELETE's predicate (#61).
+    pub fn deleteMemtableRowsLocked(self: *Table, s: *Statement, keep: []const bool) !usize {
         const removed_count = std.mem.countScalar(bool, keep, false);
         if (removed_count == 0) return 0;
         const removed_mask = try self.allocator.alloc(bool, keep.len);
@@ -613,16 +652,91 @@ pub const Table = struct {
         defer if (removed) |mt| mt.release();
         const rows = if (removed) |mt| mt.columns else self.memtable.columns;
         const replaced: Replaced = .{ .memtable = .{ .keep = keep, .rows = rows, .row_count = removed_count } };
-        if (try self.replaceRowsLocked(replaced, &.{}, 0)) |target| wal_target.* = target;
+        try self.replaceRowsLocked(s, replaced, &.{}, 0);
         return removed_count;
     }
 
-    /// Merge `wal_tombstones` into the segments' tombstone files. Offsets for
-    /// a segment the manifest no longer lists are dropped: it was compacted
-    /// or truncated away after they had been merged.
-    pub fn mergeLoggedTombstonesLocked(self: *Table) !void {
+    /// Commit what `s` has staged and end it. Returns the WAL offset to
+    /// await once the table mutex is released.
+    pub fn commitStatementLocked(self: *Table, s: *Statement) !?u64 {
+        try self.commitStagedLocked(s);
+        // The statement has committed. Failing it now for a flush would
+        // invite a retry that applies it twice; the memtable is intact, and
+        // the next write or the background flusher tries the flush again.
+        self.maybeAutoFlushLocked() catch {};
+        return s.wal_target;
+    }
+
+    /// Take back what `s` staged since it last committed, if anything, and
+    /// free it.
+    pub fn endStatementLocked(self: *Table, s: *Statement) void {
+        if (self.statement == s) self.rollbackStatementLocked(s);
+        engine.wal.deinitSegmentTombstones(self.allocator, &s.tombstones);
+        s.steps.deinit(self.allocator);
+    }
+
+    /// Log the chunk's steps as one record, then write its tombstone files,
+    /// and end the chunk. A failure up to the record leaves the chunk to
+    /// `endStatementLocked`. After it the chunk stands, and a failed
+    /// tombstone write fences the table so a reopen replays the log. A chunk
+    /// whose only change is offsets in one segment needs no record: its one
+    /// tombstone file write commits it.
+    fn commitStagedLocked(self: *Table, s: *Statement) !void {
+        try self.ensureUsable();
+        const TombstoneFile = struct { segment_id: u64, bytes: []u8 };
+        var files: std.ArrayList(TombstoneFile) = .empty;
+        defer {
+            for (files.items) |f| self.allocator.free(f.bytes);
+            files.deinit(self.allocator);
+        }
+        try files.ensureTotalCapacity(self.allocator, s.tombstones.count());
+        for (s.tombstones.keys(), s.tombstones.values()) |segment_id, offsets| {
+            const bytes = try storage.tombstone.encodeMerged(self.allocator, self.io, self.segments_dir, segment_id, offsets.items);
+            files.appendAssumeCapacity(.{ .segment_id = segment_id, .bytes = bytes });
+        }
+        const logged = self.wal != null and (s.touches_memtable or files.items.len > 1);
+        if (logged) s.wal_target = try self.wal.?.appendStatement(&s.steps);
+        for (files.items, 0..) |f, i| self.writeTombstoneFile(f.segment_id, f.bytes) catch |err| {
+            if (!logged and i == 0) return err;
+            self.requireRecovery();
+            self.endChunkLocked(s);
+            return err;
+        };
+        self.endChunkLocked(s);
+    }
+
+    fn endChunkLocked(self: *Table, s: *Statement) void {
+        self.statement = null;
+        if (s.holds_base) s.base.release();
+        s.holds_base = false;
+        engine.wal.deinitSegmentTombstones(self.allocator, &s.tombstones);
+        s.steps.clear();
+    }
+
+    fn rollbackStatementLocked(self: *Table, s: *Statement) void {
+        self.statement = null;
+        if (s.holds_base) {
+            s.holds_base = false;
+            const staged = self.memtable;
+            self.memtable = s.base;
+            self.memtable_gen += 1;
+            s.base.retired.store(false, .release);
+            staged.retire();
+            staged.release();
+        }
+        std.debug.assert(self.memtable == s.base);
+        self.memtable.truncate(s.base_rows);
+        self.first_write_ts = s.base_first_write_ts;
+        if (self.schema.unique) upsert_mod.resetIndex(self);
+    }
+
+    /// Merge the offsets replayed `replace` records carry into the segments'
+    /// tombstone files. Offsets for a segment the manifest no longer lists
+    /// are dropped: it was compacted or truncated away after they had been
+    /// merged.
+    fn mergeReplayedTombstonesLocked(self: *Table, replayed: *const engine.wal.SegmentTombstones) !void {
         const sync = self.syncEnabled();
-        for (self.wal_tombstones.keys(), self.wal_tombstones.values()) |segment_id, offsets| {
+        for (replayed.keys(), replayed.values()) |segment_id, offsets| {
             if (offsets.items.len == 0) continue;
             const listed = for (self.manifest.segments.items) |entry| {
                 if (entry.segment_id == segment_id) break true;
@@ -631,7 +745,6 @@ pub const Table = struct {
             try self.mergeTombstones(self.allocator, segment_id, offsets.items, sync);
             self.seg_handles.invalidateTombstones(self.allocator, segment_id);
         }
-        engine.wal.deinitSegmentTombstones(self.allocator, &self.wal_tombstones);
     }
 
     /// Mutates the memtable + appends bytes to the WAL (no fsync). The
@@ -657,13 +770,18 @@ pub const Table = struct {
     /// (`upsert.carryIndex`). Binding that index by pointer identity is an
     /// ABA data-loss bug — the allocator can hand a later clone the freed
     /// memtable's address, and the stale index's row mappings then
-    /// tombstone unrelated rows on the next upsert. Caller holds the table
-    /// mutex.
+    /// tombstone unrelated rows on the next upsert. A running statement
+    /// takes over the table's reference to the memtable it started from, so
+    /// a rollback can put it back. Caller holds the table mutex.
     pub fn installMemtableLocked(self: *Table, new_mt: *engine.Memtable) void {
         const old_mt = self.memtable;
         self.memtable = new_mt;
         self.memtable_gen += 1;
         old_mt.retire();
+        if (self.statement) |s| if (old_mt == s.base) {
+            s.holds_base = true;
+            return;
+        };
         old_mt.release();
     }
 
@@ -704,10 +822,14 @@ pub const Table = struct {
 
     pub fn flushLocked(self: *Table) !void {
         try self.ensureUsable();
-        // The WAL is replaced below; offsets only it records go first.
-        try self.mergeLoggedTombstonesLocked();
+        std.debug.assert(self.statement == null);
         if (self.memtable.isEmpty()) {
             self.first_write_ts = null;
+            // What the log's records wrote is in the tombstone files or was
+            // taken back by a later record, so it can go. This way a clean
+            // stop always leaves an empty log, which the previous release can
+            // open, while a `statement` record would stop it (#335).
+            if (self.wal) |*w| if (w.physical_offset > engine.wal.header_size) try self.replaceWal();
             return;
         }
 
@@ -1007,7 +1129,11 @@ pub const Table = struct {
         {
             defer self.mutex.unlock(self.io);
             try self.ensureUsable();
-            deleted = try @import("delete.zig").execDelete(self, pred, &wal_target);
+            var stmt: Statement = .{};
+            self.beginStatementLocked(&stmt);
+            defer self.endStatementLocked(&stmt);
+            deleted = try @import("delete.zig").execDelete(self, &stmt, pred);
+            wal_target = try self.commitStatementLocked(&stmt);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
@@ -1017,10 +1143,8 @@ pub const Table = struct {
     /// rich PredicateExpr. Subqueries and `@vars` must already be
     /// resolved by the pre-compile pass. `pred == null` deletes every
     /// row; `derived` are the computed operands it compares by name.
-    /// Returns the deleted row count. Streams per segment so
-    /// memory stays bounded by segment size. Segment rows are durable
-    /// through their tombstone files, memtable rows through the WAL
-    /// (`deleteMemtableRowsLocked`).
+    /// Returns the deleted row count. Runs as one `Statement`, streaming
+    /// row group by row group.
     pub fn deleteByExpr(self: *Table, pred: ?exec.PredicateExpr, derived: []const exec.Derived) !usize {
         const statement_lease = try self.acquireStatement();
         defer if (statement_lease) |lease| lease.release();
@@ -1031,7 +1155,11 @@ pub const Table = struct {
         {
             defer self.mutex.unlock(self.io);
             try self.ensureUsable();
-            deleted = try @import("delete.zig").execDeleteByExpr(self, pred, derived, &wal_target);
+            var stmt: Statement = .{};
+            self.beginStatementLocked(&stmt);
+            defer self.endStatementLocked(&stmt);
+            deleted = try @import("delete.zig").execDeleteByExpr(self, &stmt, pred, derived);
+            wal_target = try self.commitStatementLocked(&stmt);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
@@ -1069,15 +1197,18 @@ pub const Table = struct {
             defer self.mutex.unlock(self.io);
             try self.ensureUsable();
             if (!try del.keyedBatchEligible(self, local_preds)) return null;
-            deleted = try del.execDeleteKeyedBatch(self, local_preds, counts, &wal_target);
+            var stmt: Statement = .{};
+            self.beginStatementLocked(&stmt);
+            defer self.endStatementLocked(&stmt);
+            deleted = try del.execDeleteKeyedBatch(self, &stmt, local_preds, counts);
+            wal_target = try self.commitStatementLocked(&stmt);
         }
         try self.awaitWalDurable(wal_target);
         return deleted;
     }
 
     /// SQL `UPDATE t SET ... [WHERE expr]`: per-batch delete+insert pairs
-    /// under the table mutex, so memory stays bounded regardless of how
-    /// many rows the UPDATE touches (see update.zig).
+    /// under the table mutex, committed as one statement (see update.zig).
     pub fn updateStreaming(
         self: *Table,
         pred: ?exec.PredicateExpr,

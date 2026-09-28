@@ -316,7 +316,7 @@ Result precisions exceeding 38 are clamped to 38, with overflow → error rather
 
 The manifest selects the active immutable segments. Flush and compaction build a candidate without changing the published in-memory list. They finish the referenced output files, atomically replace `manifest` via `manifest.tmp`, then install the new in-memory state. Failed publication retains the old input ownership. TRUNCATE follows the same rule: publish an empty manifest and WAL checkpoint before replacing the memtable and reclaiming old files; segment IDs remain monotonic while deferred deletion is possible. Late deletes found during compaction reconciliation are written to the output tombstone before that output is selected.
 
-Manifest v11 has a 56-byte header, including a 16-byte WAL generation and the covered physical byte offset. This checkpoint makes a published flush recoverable even if subsequent WAL replacement fails. WAL v2 has a 32-byte header with its generation. Readers also accept manifest v10 and WAL v1. Older binaries cannot read newly written formats; downgrade testing must use an untouched snapshot.
+Manifest v11 has a 56-byte header, including a 16-byte WAL generation and the covered physical byte offset. This checkpoint makes a published flush recoverable even if subsequent WAL replacement fails. WAL v2 has a 32-byte header with its generation. Readers also accept manifest v10 and WAL v1. Older binaries cannot read newly written formats; downgrade testing must use an untouched snapshot. The one exception is the WAL's `statement` record (type 6, §5.5), added within v2: a clean stop leaves the log with no records (§5.5), which the previous release opens, and a release older than the record rejects one it meets (`WalUnknownRecord`) instead of skipping it.
 
 The exact binary layouts live in [src/storage/manifest.zig](src/storage/manifest.zig) and [src/engine/wal.zig](src/engine/wal.zig). Segment entries include row/byte counts, leading-key statistics, per-column statistics, and cardinality sketches.
 
@@ -438,20 +438,31 @@ DELETE is **predicate-based** (Model B): users may delete by any condition the f
 try orders.delete(.{ .col = "status", .op = .eq, .val = .{ .string = "cancelled" } });
 ```
 
-Execution:
+Execution, as one statement (below):
 
-1. Take a manifest snapshot.
-2. For each segment in the snapshot:
+1. Scan the memtable. Its matching rows are removed at once, by swapping in a memtable without them (the memtable hasn't been flushed yet, so true removal is fine). This is the statement's first step.
+2. For each segment the manifest lists when the statement starts:
    a. Scan its row groups, evaluating the predicate.
-   b. For each matching row, record its in-segment offset.
-   c. Append all matched offsets to `<seg_id>.tomb` (creating the file if it didn't exist).
-3. The memtable is also scanned. Matching rows go into the WAL as a `replace` record that retracts them and inserts nothing, then are removed (the memtable hasn't been flushed yet, so true removal is fine).
+   b. Each row group's matching in-segment offsets are one more step, staged.
+3. Commit: log the steps, then merge the staged offsets into the `<seg_id>.tomb` files.
 
 The WAL records the rows a DELETE removed, never its predicate. Replay therefore has no predicate evaluator that could drift from the live one: it removes exactly what the live DELETE removed. Older binaries logged the predicate (`delete` / `delete_expr` records). Replay still reads those from a log such a binary left behind, but nothing writes them.
 
 A delete that runs concurrently with reads is invisible to them — readers see the manifest snapshot taken at their query start, including the tomb file state at that moment. New deletes append to the tomb file; readers using an older snapshot just see fewer tombstoned rows than the live state.
 
-UPDATE is delete + insert in batches: the memtable's matching rows form one batch, and each matching row group of a segment forms another. Each batch goes into the WAL as one `replace` record before it is applied. The record carries the batch's deletes (the retracted memtable rows, or segment offsets) together with the replacement rows. Replay retracts memtable rows, appends the replacements and merges the offsets into the `.tomb` files. On a plain table a retracted row removes one equal row. On a unique table it removes every row with its key, since until the post-replay upsert pass the recovered memtable still holds the versions that later inserts superseded. A crash can therefore leave an UPDATE applied up to some batch. It never keeps a delete without its replacement, and never keeps both versions of a row. Segment offsets reach the `.tomb` file once per segment. They also reach it before any flush retires the WAL, since an auto-flush can fire mid-UPDATE.
+UPDATE is delete + insert in steps: the memtable's matching rows form one step, and each matching row group of a segment forms another. A step's log payload carries its deletes (the retracted memtable rows, or segment offsets) together with the replacement rows. Replay retracts memtable rows, appends the replacements and merges the offsets into the `.tomb` files. On a plain table a retracted row removes one equal row. On a unique table it removes every row with its key, since until the post-replay upsert pass the recovered memtable still holds the versions that later inserts superseded. The replacement rows go to the memtable, and an UPDATE matches only the segments listed when it started, so it never matches its own output.
+
+**Statement atomicity.** An UPDATE or DELETE commits once, through `Table.Statement` (#335). Its steps change the live memtable at once. The statement holds the table mutex throughout, and readers capture the memtable under that mutex, so no reader sees part of a statement. Everything else is staged: the segment offsets (the statement's own and, on a unique table, the older versions of the keys an UPDATE writes) and each step's log payload. At commit the statement writes one WAL record, then the `.tomb` files:
+
+- A one-step statement logs a plain `replace` record, byte for byte what earlier releases wrote.
+- A statement of more steps logs a `statement` record (type 6): every step's `replace` payload under one checksum. Replay applies all of it, or none of it once torn.
+- A statement whose only change is offsets in one segment (a point DELETE of a flushed key) logs nothing. Its one atomic `.tomb` replacement commits it.
+
+A failure before the record takes the memtable back (the statement keeps the memtable it started from until it commits) and leaves nothing on disk. After the record the statement stands: a failed `.tomb` write fences the database with `RecoveryRequired`, and a reopen replays the record. A failed auto-flush after the commit doesn't fail the statement, since a retry would apply it twice; the next write or the background flusher retries the flush.
+
+**Known limitation: the staging bound.** A statement stages at most `Table.STATEMENT_STAGE_BYTES` (64 MB, the bound INSERT ... SELECT also stages under) of change: removed memtable rows, replacement rows and segment offsets. Past it, the statement commits what it staged, flushes if due, and continues as a new chunk, so its memory stays bounded. Such a statement is atomic per chunk, not as a whole: a failure in a later chunk leaves the earlier chunks committed. If whole-statement atomicity for big UPDATEs ever matters, the path is to spill a statement's replacement rows to segments it doesn't publish until commit, and publish them with its tombstones in one manifest swap.
+
+**Clean stop and downgrade.** A clean close flushes every table. The flush retires the WAL only after everything its records cover is durable: the segment is written, the manifest is published and the tombstones are written. When the memtable is empty, there is nothing to flush, but the log is retired anyway: every committed statement wrote its tombstone files before returning, and whatever the log's records added to the memtable, a later record took back. So a clean stop always leaves a log with no records. The previous release opens that log, so downgrading after a clean stop is safe, while a `statement` record left by a crash stops it loudly.
 
 ---
 
@@ -880,7 +891,7 @@ Throughput scales sub-linearly with thread count (each fsync is now amortized ov
 
 Truncate (called at end of flush) coordinates with `awaitDurable`: it drains the current leader, then bumps `synced_offset` to the pre-truncate `write_offset` so any pending waiters from before the truncate become no-ops (their data is now in a segment, not the WAL).
 
-Tombstones never get ahead of the log. A tombstone can hide a row whose replacement, from an UPDATE or a unique-key upsert, so far lives only in the WAL. So `Table.mergeTombstones` syncs the WAL before it writes a `.tomb` file whenever sync is on.
+Tombstones never get ahead of the log. A tombstone can hide a row whose replacement, from an UPDATE or a unique-key upsert, so far lives only in the WAL. So every `.tomb` write (`Table.writeTombstoneFile`, `Table.mergeTombstones`) syncs the WAL first whenever sync is on.
 
 ---
 

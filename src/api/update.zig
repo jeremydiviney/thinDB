@@ -1,30 +1,29 @@
-//! Streaming UPDATE — per-segment "delete-old + insert-new" pairs
-//! that keep memory bounded by row-group size + memtable budget,
-//! regardless of how many rows the UPDATE touches.
+//! Streaming UPDATE — per-row-group "delete-old + insert-new" steps
+//! of one `Table.Statement`, so memory stays bounded by row-group size
+//! and the statement's staging bound, however many rows the UPDATE
+//! touches.
 //!
 //! Architecture:
 //!   1. Lock the table mutex (held for the whole UPDATE — concurrent
 //!      readers stay snapshot-isolated via their own Scan captures).
 //!   2. Snapshot bounds: (segs_at_start, mt_rows_at_start). New
-//!      segments created by auto-flush during step 4 land beyond
-//!      segs_at_start and are never touched by the tombstone step.
+//!      segments a chunk commit flushes land beyond segs_at_start and
+//!      are never matched.
 //!   3. Memtable phase — process rows [0..mt_rows_at_start]:
 //!      decode → predicate mask → compute new values via assignments
 //!      → clone memtable with non-matching rows + append the new
-//!      replacements. Done BEFORE any segment work so the memtable
-//!      can't get auto-flushed while still holding matching rows.
+//!      replacements. Done BEFORE any segment work so a chunk flush
+//!      can't write matching rows out first.
 //!   4. Segment phase — for each segment[0..segs_at_start], iterate
 //!      row groups: decode → predicate mask → compute new values →
-//!      append new rows to the live memtable (may auto-flush) →
-//!      record matched offsets. After all row groups, merge
-//!      tombstones for that segment.
-//!   5. Unlock.
+//!      append new rows to the live memtable and stage the matched
+//!      offsets.
+//!   5. Commit the statement: one log record, then the tombstone files.
 //!
-//! Per-batch atomicity: the memtable phase and each matching row group
-//! is one batch, logged as one `replace` WAL record holding both its
-//! deletes and its replacement rows (`Table.replaceRowsLocked`). A crash
-//! keeps or drops whole batches; it never keeps a delete without its
-//! rows or the rows without their delete (#48).
+//! Atomicity (#335): up to `Table.STATEMENT_STAGE_BYTES` of staged
+//! change the UPDATE is all-or-nothing, on failure and across a crash.
+//! Past it, it commits in chunks of about that size and is atomic per
+//! chunk.
 //!
 //! Assignment evaluation reuses the standard Compute operator wired
 //! via SingleBatchSource so we don't duplicate that machinery here.
@@ -84,20 +83,17 @@ pub fn execUpdateStreaming(
     {
         defer t.mutex.unlock(t.io);
         try t.ensureUsable();
+        var stmt: Table.Statement = .{};
+        t.beginStatementLocked(&stmt);
+        defer t.endStatementLocked(&stmt);
 
         // Snapshot bounds. These freeze for the duration of the UPDATE.
         const segs_at_start = t.manifest.segments.items.len;
         const mt_rows_at_start: usize = @intCast(t.memtable.row_count);
 
-        // Batches applied before a failure keep their replacement rows in
-        // the memtable, so their logged offsets must still reach the
-        // segments. If even that fails, only a reopen (which replays the
-        // log) restores a consistent table.
-        errdefer t.mergeLoggedTombstonesLocked() catch t.requireRecovery();
-
         // -- Phase 1: memtable rows [0..mt_rows_at_start] --------
         if (mt_rows_at_start > 0) {
-            affected += processMemtable(t, filter_ref, assignments, mt_rows_at_start, &wal_target) catch |err| switch (err) {
+            affected += processMemtable(t, &stmt, filter_ref, assignments, mt_rows_at_start) catch |err| switch (err) {
                 error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
                 else => return err,
             };
@@ -105,11 +101,12 @@ pub fn execUpdateStreaming(
 
         // -- Phase 2: segments[0..segs_at_start] -----------------
         if (segs_at_start > 0) {
-            affected += processSegments(t, filter_ref, derived, assignments, segs_at_start, &wal_target) catch |err| switch (err) {
+            affected += processSegments(t, &stmt, filter_ref, derived, assignments, segs_at_start) catch |err| switch (err) {
                 error.ColumnTypeMismatch => return exec.Error.TypeMismatch,
                 else => return err,
             };
         }
+        wal_target = try t.commitStatementLocked(&stmt);
     }
     try t.awaitWalDurable(wal_target);
     return affected;
@@ -121,10 +118,10 @@ pub fn execUpdateStreaming(
 
 fn processMemtable(
     t: *Table,
+    s: *Table.Statement,
     filter: ?*const DmlFilter,
     assignments: []const Assignment,
     mt_rows_at_start: usize,
-    wal_target: *?u64,
 ) !usize {
     const allocator = t.allocator;
 
@@ -166,7 +163,7 @@ fn processMemtable(
     for (mask, keep) |m, *k| k.* = !m;
 
     const replaced: Table.Replaced = .{ .memtable = .{ .keep = keep, .rows = matched.stores, .row_count = matched.row_count } };
-    if (try t.replaceRowsLocked(replaced, new_rows.stores, new_rows.row_count)) |target| wal_target.* = target;
+    try t.replaceRowsLocked(s, replaced, new_rows.stores, new_rows.row_count);
     return matched_count;
 }
 
@@ -176,11 +173,11 @@ fn processMemtable(
 
 fn processSegments(
     t: *Table,
+    s: *Table.Statement,
     filter: ?*const DmlFilter,
     derived: []const exec.Derived,
     assignments: []const Assignment,
     segs_at_start: usize,
-    wal_target: *?u64,
 ) !usize {
     // Full-key Bloom gate (#143): a keyed UPDATE (every order-key column
     // pinned by AND-equality) skips segments whose Bloom rejects the key(s)
@@ -202,18 +199,18 @@ fn processSegments(
         if (key_hashes) |hs| {
             if (!upsert_mod.bloomAdmitsAny(entry.key_bloom, hs)) continue;
         }
-        total += try processOneSegment(t, filter, prune, assignments, entry, wal_target);
+        total += try processOneSegment(t, s, filter, prune, assignments, entry);
     }
     return total;
 }
 
 fn processOneSegment(
     t: *Table,
+    s: *Table.Statement,
     filter: ?*const DmlFilter,
     prune: SegmentPrune,
     assignments: []const Assignment,
     entry: storage.manifest.ManifestEntry,
-    wal_target: *?u64,
 ) !usize {
     const allocator = t.allocator;
     var live = try LiveSegment.open(t, entry.segment_id);
@@ -280,13 +277,11 @@ fn processOneSegment(
             defer freeMaterializedRows(allocator, &new_rows);
 
             const replaced: Table.Replaced = .{ .segment = .{ .id = entry.segment_id, .offsets = offsets.items } };
-            if (try t.replaceRowsLocked(replaced, new_rows.stores, new_rows.row_count)) |target| wal_target.* = target;
+            try t.replaceRowsLocked(s, replaced, new_rows.stores, new_rows.row_count);
             deleted += matched_in_rg;
         }
     }
 
-    // One tombstone-file rewrite per segment, not per row group.
-    try t.mergeLoggedTombstonesLocked();
     return deleted;
 }
 
