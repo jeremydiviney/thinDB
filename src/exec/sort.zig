@@ -21,6 +21,7 @@ const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
+const json_binary = @import("json_binary.zig");
 const Predicate = predicate.Predicate;
 
 pub const SortSpec = struct {
@@ -100,12 +101,12 @@ fn sortStringPermAsc(allocator: Allocator, perm: []u32, view: storage.StringView
     try exec.memory.sort(u32, perm, Cmp{ .v = view }, allocator, Cmp.lessThan);
 }
 
-fn sortStringPermCompare(allocator: Allocator, perm: []u32, view: anytype, desc: bool) error{QueryCancelled}!void {
+fn sortStringPermCompare(allocator: Allocator, perm: []u32, view: anytype, desc: bool, comptime json: bool) error{QueryCancelled}!void {
     const Cmp = struct {
         v: @TypeOf(view),
         d: bool,
         pub fn lessThan(c: @This(), a: u32, b: u32) bool {
-            const ord = std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b));
+            const ord = json_binary.columnOrder(json, c.v.rowBytes(a), c.v.rowBytes(b));
             return if (c.d) ord == .gt else ord == .lt;
         }
     };
@@ -176,21 +177,26 @@ fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool
 
 fn sortSingleKeyValid(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) error{QueryCancelled}!void {
     switch (col.data) {
-        inline .varchar, .string, .char, .json => |s| {
+        inline .varchar, .string, .char, .json => |s, tag| {
             // A column past 4 GiB carries u64 offsets (StringStore.wide_offsets);
             // the u32-offset radix can't index it, so fall back to the generic
             // comparison sort over the wide view (correct, just slower). Rare.
             if (s.isWide()) {
-                try sortStringPermCompare(allocator, perm, s.wideView(), desc);
+                try sortStringPermCompare(allocator, perm, s.wideView(), desc, tag == .json);
                 return;
             }
             const view = s.view();
+            // JSON orders by MySQL's JSON rules, which its bytes don't follow.
+            if (tag == .json) {
+                try sortStringPermCompare(allocator, perm, view, desc, true);
+                return;
+            }
             // MSD radix sort by string bytes — O(n · key-prefix) instead of
             // the comparison sort's O(n log n · compare-length). Algorithmic
             // (no SIMD). Needs an n-sized index scratch; if that alloc fails,
             // fall back to a plain comparison sort.
             const tmp = allocator.alloc(u32, perm.len) catch {
-                try sortStringPermCompare(allocator, perm, view, desc);
+                try sortStringPermCompare(allocator, perm, view, desc, false);
                 return;
             };
             defer allocator.free(tmp);

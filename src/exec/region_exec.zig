@@ -264,7 +264,7 @@ fn viewOrderRows(v: ColumnView, a: usize, b: usize) std.math.Order {
         if (av == bv) return .eq;
         return if (!av) .lt else .gt;
     }
-    return @import("../engine/transform.zig").compareViewRows(v, a, v, b);
+    return @import("../engine/transform.zig").compareViewValues(v, a, v, b);
 }
 
 fn stringViewOf(v: ColumnView) storage.StringView {
@@ -2115,7 +2115,7 @@ pub const RegionWorker = struct {
                 for (ks, 0..) |*k, i| k.* = .{ .norm = normI64(v.isValid(i), vals[i]), .str = "" };
                 return .{ .keys = ks, .lossy = false };
             },
-            .varchar, .string, .char, .json => |sv| {
+            .varchar, .string, .char => |sv| {
                 const ks = try sa.alloc(RowKey, rows);
                 for (ks, 0..) |*k, i| {
                     const valid = v.isValid(i);
@@ -2124,6 +2124,7 @@ pub const RegionWorker = struct {
                 }
                 return .{ .keys = ks, .lossy = false };
             },
+            // JSON's bytes don't follow its order: rows compare by value.
             else => return .{ .keys = null, .lossy = false },
         }
     }

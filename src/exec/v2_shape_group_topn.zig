@@ -575,6 +575,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .state_index = agg_plan.state_index,
             .wide = agg_plan.wide,
             .is_string = agg_plan.is_string,
+            .is_json = agg_plan.is_string and agg_plan.output_type == .json,
             .str_input_index = agg_plan.str_input_index,
             .str_state_index = agg_plan.str_state_index,
             .is_distinct = agg_plan.is_distinct,

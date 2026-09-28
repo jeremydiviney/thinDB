@@ -1220,6 +1220,7 @@ pub const Scan = struct {
 
     fn addInPrune(self: *Scan, s: predicate.InSet) !void {
         const col_idx = types.findColumn(self.table.schema.columns, s.col) orelse return;
+        if (!storage.format.bytesFollowComparison(self.table.schema.columns[col_idx].type)) return;
         // Keep the typed values verbatim when this is an order-key column —
         // the full-key Bloom pass needs exact hash-encoding fidelity, which
         // the i128 reduction below can't provide (and drops strings).
@@ -1308,7 +1309,8 @@ pub const Scan = struct {
         // Drop hints for types whose `Stats` slot is `{0, 0}` — no usable
         // min/max. statsOverlapPredicate would conservatively return true
         // anyway, but skipping the append avoids the per-row-group work.
-        if (!storage.format.typeHasStats(self.table.schema.columns[col_idx].type)) return;
+        const col_type = self.table.schema.columns[col_idx].type;
+        if (!storage.format.typeHasStats(col_type) or !storage.format.bytesFollowComparison(col_type)) return;
 
         // Cross-leaf blank exclusion: prune hints are exactly the top-level
         // AND conjuncts, so a sibling hint on the same column that rules out
@@ -2308,6 +2310,7 @@ pub const Scan = struct {
             return false;
         };
         const col_type = self.table.schema.columns[pred_phys].type;
+        if (!storage.format.bytesFollowComparison(col_type)) return false;
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
         const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -2569,6 +2572,7 @@ pub const Scan = struct {
             return false;
         };
         const col_type = self.table.schema.columns[pred_phys].type;
+        if (!storage.format.bytesFollowComparison(col_type)) return false;
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, self.table.cacheRef());
         defer block.release(self.allocator, self.table.cacheRef());

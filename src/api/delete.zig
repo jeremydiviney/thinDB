@@ -56,7 +56,7 @@ pub fn execDelete(t: *Table, s: *Table.Statement, pred: exec.Predicate) !usize {
             // Quick prune via stats. String columns prune too (eq + range via
             // the 16-byte prefix class — `statsOverlapPredicate` stays
             // conservative on prefix ties, so no matching row is skipped).
-            if (!exec.statsOverlapPredicate(rg.stats[col_idx], pred.op, pred.val)) {
+            if (storage.format.bytesFollowComparison(col_type) and !exec.statsOverlapPredicate(rg.stats[col_idx], pred.op, pred.val)) {
                 row_offset += rg.row_count;
                 continue;
             }
@@ -418,13 +418,15 @@ fn collectDeletePruneInfo(
         .leaf => |p| {
             if (types.findColumn(columns, p.col)) |ci| {
                 ref_cols[ci] = true;
-                try hints.append(aa, .{ .compare = .{ .col_idx = ci, .op = p.op, .val = p.val } });
+                if (storage.format.bytesFollowComparison(columns[ci].type))
+                    try hints.append(aa, .{ .compare = .{ .col_idx = ci, .op = p.op, .val = p.val } });
             } else try markDerivedInputs(columns, derived, p.col, aa, ref_cols);
         },
         .in_set => |s| {
             if (types.findColumn(columns, s.col)) |ci| {
                 ref_cols[ci] = true;
-                if (!s.negate) try hints.append(aa, .{ .any_equal = .{ .col_idx = ci, .values = s.values } });
+                if (!s.negate and storage.format.bytesFollowComparison(columns[ci].type))
+                    try hints.append(aa, .{ .any_equal = .{ .col_idx = ci, .values = s.values } });
             } else try markDerivedInputs(columns, derived, s.col, aa, ref_cols);
         },
         // Text read as a number has no zonemap order to prune by.
@@ -442,6 +444,7 @@ fn collectDeletePruneInfo(
             const in_list_col = if (predicate.eqDisjunctionColumn(arms)) |col| types.findColumn(columns, col) else null;
             if (in_list_col) |ci| {
                 ref_cols[ci] = true;
+                if (!storage.format.bytesFollowComparison(columns[ci].type)) return;
                 const values = try aa.alloc(types.Value, arms.len);
                 for (arms, values) |arm, *v| v.* = arm.leaf.val;
                 try hints.append(aa, .{ .any_equal = .{ .col_idx = ci, .values = values } });
