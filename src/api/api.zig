@@ -407,6 +407,10 @@ pub const Session = struct {
     connection_id: ?u32 = null,
     user: ?[]const u8 = null,
     server_version: ?[]const u8 = null,
+    /// The server's connections, which the process-list relations
+    /// (information_schema.PROCESSLIST, pg_stat_activity) list. Null in
+    /// embedded use, where those relations are empty.
+    connections: ?*@import("../net/conn_registry.zig").Registry = null,
 };
 
 /// Per-connection variable storage. Names and string values are

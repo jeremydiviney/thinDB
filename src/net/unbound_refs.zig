@@ -250,7 +250,7 @@ const Finder = struct {
     }
 
     fn scanNames(self: *Finder, s: ir.Op.Scan) Allocator.Error!?*const NameSet {
-        if (pgcat.match(s.table) != null) return null;
+        if (pgcat.match(s.table, self.session.dialect) != null) return null;
         const cat = self.catalog orelse return null;
         const table = local.resolveTable(cat, self.session, s.table) catch return null;
         const set = try self.newSet();
