@@ -180,6 +180,19 @@ pub const InSet = struct {
     value_type: ?types.Type = null,
 };
 
+/// The column an OR tests when every arm is `col = literal` on that one
+/// column: the parser spells a literal `col IN (a, b, ...)` this way, so such
+/// an OR is an IN list and can be matched as a set.
+pub fn eqDisjunctionColumn(arms: []const PredicateExpr) ?[]const u8 {
+    if (arms.len == 0 or arms[0] != .leaf) return null;
+    const col = arms[0].leaf.col;
+    for (arms) |arm| switch (arm) {
+        .leaf => |l| if (l.op != .eq or !types.columnNameEql(l.col, col)) return null,
+        else => return null,
+    };
+    return col;
+}
+
 pub const ColColPred = struct {
     left: []const u8,
     op: PredicateOp,
@@ -1437,6 +1450,7 @@ pub fn evaluatePredicate(
                 @memset(out, false);
                 return;
             }
+            if (try evaluateEqDisjunction(allocator, children, schema, batch, out)) return;
             try evaluatePredicate(allocator, children[0], schema, batch, out);
             if (children.len == 1) return;
             const scratch = try allocator.alloc(bool, out.len);
@@ -1455,7 +1469,7 @@ pub fn evaluatePredicate(
         .always => |b| @memset(out, b),
         .in_set => |s| {
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
-            try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
+            try evaluateInSetMask(allocator, batch.values[col_idx], s.values, s.negate, batch.row_count, out);
         },
         .text_as_number => |p| {
             const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
@@ -1534,6 +1548,7 @@ pub fn evaluateExprGuided(
                 @memset(out, false);
                 return;
             }
+            if (try evaluateEqDisjunction(allocator, children, schema, batch, out)) return;
             try evaluateExprGuided(allocator, children[0], schema, batch, out, active);
             if (children.len == 1) return;
             const scratch = try allocator.alloc(bool, out.len);
@@ -1561,7 +1576,7 @@ pub fn evaluateExprGuided(
         .always => |b| @memset(out, b),
         .in_set => |s| {
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
-            try evaluateInSetMask(batch.values[col_idx], s.values, s.negate, batch.row_count, out);
+            try evaluateInSetMask(allocator, batch.values[col_idx], s.values, s.negate, batch.row_count, out);
         },
         .text_as_number => |p| {
             const col_idx = findCol(schema, p.col) orelse return Error.ColumnNotFound;
@@ -1950,11 +1965,51 @@ fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
     };
 }
 
+/// Longest IN list checked by scanning it per row.
+const IN_SET_LINEAR_MAX = 8;
+/// Fewest rows worth building a lookup set for: below this, scanning a long
+/// list per row costs about what sorting it would.
+const IN_SET_LOOKUP_MIN_ROWS = 32;
+
+/// A long `col = a OR col = b OR ...` (a literal IN list) through the set
+/// lookup of `evaluateInSetMask` rather than one pass per literal. Same
+/// answer: validation gave every literal the column's type, which is what the
+/// set compares, and a NULL row fails both. False when the lookup would not
+/// run, leaving the arms to the caller.
+fn evaluateEqDisjunction(allocator: std.mem.Allocator, arms: []const PredicateExpr, schema: []const Column, batch: anytype, out: []bool) !bool {
+    if (arms.len <= IN_SET_LINEAR_MAX or batch.row_count < IN_SET_LOOKUP_MIN_ROWS) return false;
+    const col = eqDisjunctionColumn(arms) orelse return false;
+    const view = batch.values[findCol(schema, col) orelse return Error.ColumnNotFound];
+    switch (view.data) {
+        .float, .double, .boolean => return false,
+        else => {},
+    }
+    const values = try allocator.alloc(Value, arms.len);
+    defer allocator.free(values);
+    for (arms, values) |arm, *v| v.* = arm.leaf.val;
+    try evaluateInSetMask(allocator, view, values, false, batch.row_count, out);
+    return true;
+}
+
 /// Per-row set-membership check. `negate=false` → IN, `true` → NOT IN.
 /// Set is guaranteed NULL-free (the resolver drops NULLs at materialization).
 /// Two-valued logic: NULL in the column never matches → IN false, NOT IN
 /// also false (consistent with the IN side).
-pub fn evaluateInSetMask(view: ColumnView, values: []const Value, negate: bool, n: usize, mask: []bool) !void {
+///
+/// A long list is looked up per row (binary search over a sorted copy, or a
+/// hash set for text) so a DELETE/UPDATE with thousands of keys costs
+/// O(rows × log keys), not O(rows × keys) (#340).
+pub fn evaluateInSetMask(allocator: std.mem.Allocator, view: ColumnView, values: []const Value, negate: bool, n: usize, mask: []bool) !void {
+    if (values.len > IN_SET_LINEAR_MAX and n >= IN_SET_LOOKUP_MIN_ROWS) {
+        switch (view.data) {
+            inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid => |col, tag| {
+                return evalInSortedSet(allocator, @field(ValueTag, @tagName(tag)), view, col, values, negate, n, mask);
+            },
+            inline .varchar, .string, .char, .json => |sv| return evalInTextHashSet(allocator, sv, view, values, negate, n, mask),
+            // Float `==` (NaN, -0.0) and two-valued booleans stay on the scan.
+            .float, .double, .boolean => {},
+        }
+    }
     // Outer per-column-type dispatch keeps the inner loop type-mono.
     switch (view.data) {
         .int => |col| {
@@ -2046,6 +2101,63 @@ fn evaluateTextAsNumberSetMask(view: ColumnView, col_type: types.Type, s: InSet,
         }
         mask[i] = if (s.negate) !found and !unknown else found;
     }
+}
+
+/// Same matching as the per-row scan: only values of the column's own tag
+/// can equal a cell.
+fn evalInSortedSet(
+    allocator: std.mem.Allocator,
+    comptime tag: ValueTag,
+    view: ColumnView,
+    col: anytype,
+    values: []const Value,
+    negate: bool,
+    n: usize,
+    mask: []bool,
+) !void {
+    const T = std.meta.Elem(@TypeOf(col));
+    const buf = try allocator.alloc(T, values.len);
+    defer allocator.free(buf);
+    var len: usize = 0;
+    for (values) |v| {
+        if (std.meta.activeTag(v) != tag) continue;
+        buf[len] = @field(v, @tagName(tag));
+        len += 1;
+    }
+    const set = buf[0..len];
+    if (set.len == 0) {
+        for (0..n) |i| mask[i] = negate and view.isValid(i);
+        return;
+    }
+    std.sort.pdq(T, set, {}, std.sort.asc(T));
+    const lo = set[0];
+    const hi = set[set.len - 1];
+    for (0..n) |i| {
+        const x = col[i];
+        const found = x >= lo and x <= hi and sortedContains(T, set, x);
+        mask[i] = view.isValid(i) and found != negate;
+    }
+}
+
+/// `sorted` is ascending and non-empty. `base` ends on the last element
+/// ≤ `x` (or the first, when every element is greater).
+fn sortedContains(comptime T: type, sorted: []const T, x: T) bool {
+    var base: usize = 0;
+    var len = sorted.len;
+    while (len > 1) {
+        const half = len / 2;
+        if (sorted[base + half] <= x) base += half;
+        len -= half;
+    }
+    return sorted[base] == x;
+}
+
+fn evalInTextHashSet(allocator: std.mem.Allocator, sv: anytype, view: ColumnView, values: []const Value, negate: bool, n: usize, mask: []bool) !void {
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    defer set.deinit(allocator);
+    try set.ensureTotalCapacity(allocator, @intCast(values.len));
+    for (values) |v| if (v == .text) set.putAssumeCapacity(v.text, {});
+    for (0..n) |i| mask[i] = view.isValid(i) and set.contains(sv.rowBytes(i)) != negate;
 }
 
 fn evalInSetStringy(sv: anytype, values: []const Value, negate: bool, view: ColumnView, n: usize, mask: []bool) !void {
@@ -2728,6 +2840,139 @@ test "clearNullRows clears exactly the NULL rows across word boundaries" {
     var untouched = [_]bool{ true, false, true };
     clearNullRows(null, &untouched);
     try std.testing.expectEqualSlices(bool, &[_]bool{ true, false, true }, &untouched);
+}
+
+fn expectInSetMaskMatchesScan(view: ColumnView, values: []const Value, rows: usize) !void {
+    var got: [200]bool = undefined;
+    var want: [200]bool = undefined;
+    for ([_]bool{ false, true }) |negate| {
+        try evaluateInSetMask(std.testing.allocator, view, values, negate, rows, got[0..rows]);
+        for (want[0..rows], 0..) |*w, i| {
+            const found = for (values) |v| {
+                if (cellMatchesValue(view, i, v)) break true;
+            } else false;
+            w.* = view.isValid(i) and found != negate;
+        }
+        try std.testing.expectEqualSlices(bool, want[0..rows], got[0..rows]);
+    }
+}
+
+test "evaluateInSetMask: set lookups agree with the per-row scan" {
+    var prng = std.Random.DefaultPrng.init(0x340);
+    const rand = prng.random();
+    const n = 200;
+    var nulls: [(n + 7) / 8]u8 = undefined;
+    rand.bytes(&nulls);
+    var values: [300]Value = undefined;
+    // Both sides of the lookup thresholds: short and long lists, few and many rows.
+    const list_lens = [_]usize{ 0, 1, 8, 9, 40, 300 };
+    const row_counts = [_]usize{ 5, 31, 32, n };
+
+    inline for (.{ .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid }) |tag| {
+        const T = @FieldType(Value, @tagName(tag));
+        var col: [n]T = undefined;
+        for (&col) |*c| c.* = @intCast(rand.intRangeAtMost(u8, 0, 60));
+        for ([_]?[]const u8{ null, &nulls }) |bitmap| {
+            const view: ColumnView = .{ .data = @unionInit(storage.column.ValueView, @tagName(tag), &col), .nulls = bitmap };
+            for (list_lens) |len| {
+                for (values[0..len], 0..) |*v, i| {
+                    // A value of another type never matches, on either path.
+                    v.* = if (i % 13 == 5) .{ .double = 7 } else @unionInit(Value, @tagName(tag), @intCast(rand.intRangeAtMost(u8, 0, 70)));
+                }
+                for (row_counts) |rows| try expectInSetMaskMatchesScan(view, values[0..len], rows);
+            }
+        }
+    }
+
+    const words = [_][]const u8{ "", "a", "ab", "abc", "b", "east", "west", "north", "south", "é", "longer than sixteen bytes" };
+    var offsets: [n + 1]u32 = undefined;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    offsets[0] = 0;
+    for (1..n + 1) |i| {
+        try bytes.appendSlice(std.testing.allocator, words[rand.uintLessThan(usize, words.len)]);
+        offsets[i] = @intCast(bytes.items.len);
+    }
+    const sv: storage.StringView = .{ .offsets = &offsets, .bytes = bytes.items };
+    for ([_]?[]const u8{ null, &nulls }) |bitmap| {
+        const view: ColumnView = .{ .data = .{ .varchar = sv }, .nulls = bitmap };
+        for (list_lens) |len| {
+            for (values[0..len]) |*v| v.* = .{ .text = words[rand.uintLessThan(usize, words.len)] };
+            if (len > 0) values[0] = .{ .text = "absent" };
+            for (row_counts) |rows| try expectInSetMaskMatchesScan(view, values[0..len], rows);
+        }
+    }
+}
+
+test "an OR of equalities on one column matches as its arms do, NOT and all" {
+    const t = std.testing;
+    var prng = std.Random.DefaultPrng.init(0x340);
+    const rand = prng.random();
+    const n = 200;
+    var nulls: [(n + 7) / 8]u8 = undefined;
+    rand.bytes(&nulls);
+    var ids: [n]i64 = undefined;
+    for (&ids) |*c| c.* = rand.intRangeAtMost(i64, -5, 60);
+    var scores: [n]f64 = undefined;
+    for (&scores) |*c| c.* = @floatFromInt(rand.intRangeAtMost(u8, 0, 20));
+    const words = [_][]const u8{ "", "a", "ab", "east", "west", "north", "south", "é" };
+    var offsets: [n + 1]u32 = undefined;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(t.allocator);
+    offsets[0] = 0;
+    for (1..n + 1) |i| {
+        try bytes.appendSlice(t.allocator, words[rand.uintLessThan(usize, words.len)]);
+        offsets[i] = @intCast(bytes.items.len);
+    }
+    const schema = [_]Column{
+        .{ .name = "id", .type = .bigint, .nullable = true },
+        .{ .name = "region", .type = .{ .varchar = 16 }, .nullable = true },
+        .{ .name = "score", .type = .double },
+    };
+    const views = [_]ColumnView{
+        .{ .data = .{ .bigint = &ids }, .nulls = &nulls },
+        .{ .data = .{ .varchar = .{ .offsets = &offsets, .bytes = bytes.items } }, .nulls = &nulls },
+        .{ .data = .{ .double = &scores } },
+    };
+
+    var arms: [40]PredicateExpr = undefined;
+    // Arm counts on both sides of the set lookup's threshold, row counts too.
+    for ([_]usize{ 1, 8, 9, 40 }) |len| {
+        for ([_][]const u8{ "id", "REGION", "score" }) |col| {
+            for (arms[0..len]) |*arm| arm.* = .{ .leaf = .{ .col = col, .op = .eq, .val = switch (col[0]) {
+                'i' => .{ .bigint = rand.intRangeAtMost(i64, -10, 70) },
+                'R' => .{ .text = words[rand.uintLessThan(usize, words.len)] },
+                else => .{ .double = @floatFromInt(rand.intRangeAtMost(u8, 0, 25)) },
+            } } };
+            const any_arm: PredicateExpr = .{ .@"or" = arms[0..len] };
+            const none_of: PredicateExpr = .{ .not = &any_arm };
+            for ([_]usize{ 31, 32, n }) |rows| {
+                const batch = .{ .values = &views, .row_count = rows };
+                var want: [n]bool = @splat(false);
+                var arm_mask: [n]bool = undefined;
+                for (arms[0..len]) |arm| {
+                    try evaluateMaskWithPred(views[findCol(&schema, arm.leaf.col).?], arm.leaf, rows, arm_mask[0..rows]);
+                    for (want[0..rows], arm_mask[0..rows]) |*w, m| w.* = w.* or m;
+                }
+                var got: [n]bool = undefined;
+                try evaluatePredicate(t.allocator, any_arm, &schema, batch, got[0..rows]);
+                try t.expectEqualSlices(bool, want[0..rows], got[0..rows]);
+                try evaluateExprGuided(t.allocator, any_arm, &schema, batch, got[0..rows], null);
+                try t.expectEqualSlices(bool, want[0..rows], got[0..rows]);
+                try evaluatePredicate(t.allocator, none_of, &schema, batch, got[0..rows]);
+                for (want[0..rows], got[0..rows]) |w, g| try t.expectEqual(!w, g);
+            }
+        }
+    }
+
+    const mixed = [_]PredicateExpr{
+        .{ .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 1 } } },
+        .{ .leaf = .{ .col = "id", .op = .gt, .val = .{ .bigint = 50 } } },
+    };
+    try t.expectEqualStrings("id", eqDisjunctionColumn(mixed[0..1]).?);
+    try t.expect(eqDisjunctionColumn(&mixed) == null);
+    const two_columns = [_]PredicateExpr{ mixed[0], .{ .leaf = .{ .col = "score", .op = .eq, .val = .{ .double = 1 } } } };
+    try t.expect(eqDisjunctionColumn(&two_columns) == null);
 }
 
 test "textNumber parses what StarRocks compares as a number" {
