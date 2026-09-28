@@ -1383,6 +1383,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
     var saw_not_null = false;
     var default_value: ?types.Value = null;
     var default_now = false;
+    var on_update_now = false;
     while (true) {
         switch (p.cur.tag) {
             .kw_not => {
@@ -1411,22 +1412,20 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             // (the compile path validates it once the schema is known).
             .kw_default => {
                 try p.advance();
-                if (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "current_timestamp", "now", "localtimestamp", "localtime" })) {
-                    try p.advance();
-                    if (p.cur.tag == .lparen) {
-                        try p.advance();
-                        if (p.cur.tag == .integer) {
-                            if (p.cur.value.integer > 6) return PE.SqlExpectedValue;
-                            try p.advance();
-                        }
-                        try p.expect(.rparen);
-                    }
+                if (try skipCurrentTimestamp(p)) {
                     default_now = true;
                 } else if (p.cur.isHexLiteral()) {
                     default_value = exec_expr.hexStoredValue((try p.parseValue()).text, ty);
                 } else {
                     default_value = try p.parseValue();
                 }
+            },
+            // MySQL's ON UPDATE CURRENT_TIMESTAMP.
+            .kw_on => {
+                try p.advance();
+                try p.expect(.kw_update);
+                if (!try skipCurrentTimestamp(p)) return PE.SqlExpectedKeyword;
+                on_update_now = true;
             },
             .kw_auto_increment => {
                 try p.advance();
@@ -1515,6 +1514,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             .nullable = nullable,
             .default_value = default_value,
             .default_now = default_now,
+            .on_update_now = on_update_now,
             .auto_increment = auto_increment,
         },
         .is_pk = is_pk,
@@ -1586,6 +1586,24 @@ fn skipLabelList(p: anytype) !void {
         try p.advance();
     }
     try p.expect(.rparen);
+}
+
+/// `CURRENT_TIMESTAMP` or a synonym, with an optional precision, as a column
+/// DEFAULT or ON UPDATE value: whether one was there. The value is stored to
+/// the microsecond whatever the precision.
+fn skipCurrentTimestamp(p: anytype) !bool {
+    const PE = @TypeOf(p.*).Err;
+    if (!(p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "current_timestamp", "now", "localtimestamp", "localtime" }))) return false;
+    try p.advance();
+    if (p.cur.tag == .lparen) {
+        try p.advance();
+        if (p.cur.tag == .integer) {
+            if (p.cur.value.integer > 6) return PE.SqlExpectedValue;
+            try p.advance();
+        }
+        try p.expect(.rparen);
+    }
+    return true;
 }
 
 /// A fractional-seconds precision, `(0)` to `(6)`. Storage is always

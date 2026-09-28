@@ -184,3 +184,61 @@ test "DEFAULT: survives reopen via schema.bin (v3 round-trip)" {
     try std.testing.expectEqualStrings("guest", batch.values[0].data.varchar.rowBytes(0));
     try std.testing.expectEqualStrings("guest", batch.values[0].data.varchar.rowBytes(1));
 }
+
+const old_ts = "'2001-01-01 00:00:00'";
+const recent = "'2020-01-01 00:00:00'";
+
+fn expectIds(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, want: []const i64) !void {
+    const got = try helpers.collectBigints(allocator, db, sql);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(i64, want, got);
+}
+
+fn expectClauses(db: *thindb.Database, table: []const u8, column: []const u8, default_now: bool, on_update_now: bool) !void {
+    const t = try db.openTable(table, .{});
+    const c = t.schema.columns[t.schema.columnIndex(column).?];
+    try std.testing.expectEqual(default_now, c.default_now);
+    try std.testing.expectEqual(on_update_now, c.on_update_now);
+}
+
+test "ON UPDATE CURRENT_TIMESTAMP: ALTER adds, changes and drops it; LIKE and reopen keep it (#251)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        // The fsp forms parse; the value is kept to the microsecond.
+        try exec(allocator, db, "CREATE TABLE al (id BIGINT PRIMARY KEY, v INT, " ++
+            "ts DATETIME(3) NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3))");
+        try exec(allocator, db, "INSERT INTO al (id, v, ts) VALUES (1, 1, " ++ old_ts ++ "), (2, 2, " ++ old_ts ++ ")");
+        const t = try db.openTable("al", .{});
+        try t.flush();
+
+        try exec(allocator, db, "ALTER TABLE al ADD COLUMN made DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+        try expectClauses(db, "al", "made", true, true);
+        try expectIds(allocator, db, "SELECT id FROM al WHERE made > " ++ recent ++ " ORDER BY id", &.{ 1, 2 });
+
+        try exec(allocator, db, "ALTER TABLE al MODIFY COLUMN ts DATETIME(3) NULL");
+        try expectClauses(db, "al", "ts", false, false);
+        try exec(allocator, db, "UPDATE al SET v = 5 WHERE id = 1");
+        try expectIds(allocator, db, "SELECT id FROM al WHERE ts = " ++ old_ts ++ " ORDER BY id", &.{ 1, 2 });
+
+        try exec(allocator, db, "ALTER TABLE al CHANGE COLUMN ts stamp DATETIME NULL ON UPDATE CURRENT_TIMESTAMP");
+        try expectClauses(db, "al", "stamp", false, true);
+        try expectRunError(allocator, db, "ALTER TABLE al MODIFY COLUMN v INT ON UPDATE CURRENT_TIMESTAMP", error.TypeMismatch);
+        try expectRunError(allocator, db, "CREATE TABLE bad (id INT, v INT ON UPDATE CURRENT_TIMESTAMP)", error.TypeMismatch);
+
+        try exec(allocator, db, "CREATE TABLE copied LIKE al");
+        try expectClauses(db, "copied", "stamp", false, true);
+        try expectClauses(db, "copied", "made", true, true);
+    }
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try expectClauses(db, "al", "stamp", false, true);
+    try expectClauses(db, "al", "made", true, true);
+    try exec(allocator, db, "UPDATE al SET v = 9 WHERE id = 2");
+    try expectIds(allocator, db, "SELECT id FROM al WHERE stamp > " ++ recent, &.{2});
+    try expectIds(allocator, db, "SELECT id FROM al WHERE stamp = " ++ old_ts, &.{1});
+}

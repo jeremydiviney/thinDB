@@ -106,6 +106,14 @@ A TIME function (`HOUR`, `TIME_TO_SEC`, `TIME`, `TIMEDIFF`, `ADDTIME` and the re
 
 `NOW()` and its synonyms (`CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `SYSDATE`, `UTC_TIMESTAMP`) read the clock once per statement. In the MySQL dialect the bare forms give whole seconds and `NOW(n)` truncates to `n` fraction digits, as MySQL does. The other dialects keep microseconds. A column's `DEFAULT CURRENT_TIMESTAMP` also keeps microseconds, since a DATETIME stores no declared precision.
 
+A DATETIME column may declare `ON UPDATE CURRENT_TIMESTAMP`, as in MySQL 8.4. The rule applies to a single-table UPDATE, a joined UPDATE, and the update branch of `INSERT ... ON DUPLICATE KEY UPDATE`:
+- The statement sets the column to its timestamp in each row where some other column changes value.
+- A SET list that assigns the column itself wins, even when it assigns the value the row already holds. So the CDC upsert, which assigns every column from the new row, keeps its source's timestamp.
+- The statement reads the clock once. Every row it stamps, and every row a `DEFAULT CURRENT_TIMESTAMP` fills, gets the same value, kept to the microsecond whatever precision the clause declares.
+- A key column is never stamped, since the key finds the row.
+
+REPLACE and INSERT use the DEFAULT as usual. The WAL logs an updated row's values, so replay never reads the clock again. `SHOW CREATE TABLE`, `SHOW COLUMNS` and `information_schema.COLUMNS.EXTRA` report the clause as MySQL 8.4 does.
+
 ### 3.2 Schema and order key
 
 Every table requires an **order key** at creation. The order key is one or more columns by which rows in every segment are physically sorted. It is the engine's only mechanism for:
@@ -333,6 +341,8 @@ Result precisions exceeding 38 are clamped to 38, with overflow → error rather
 The manifest selects the active immutable segments. Flush and compaction build a candidate without changing the published in-memory list. They finish the referenced output files, atomically replace `manifest` via `manifest.tmp`, then install the new in-memory state. Failed publication retains the old input ownership. TRUNCATE follows the same rule: publish an empty manifest and WAL checkpoint before replacing the memtable and reclaiming old files; segment IDs remain monotonic while deferred deletion is possible. Late deletes found during compaction reconciliation are written to the output tombstone before that output is selected.
 
 Manifest v11 has a 56-byte header, including a 16-byte WAL generation and the covered physical byte offset. This checkpoint makes a published flush recoverable even if subsequent WAL replacement fails. WAL v2 has a 32-byte header with its generation. Readers also accept manifest v10 and WAL v1. Older binaries cannot read newly written formats; downgrade testing must use an untouched snapshot. The one exception is the WAL's `statement` record (type 6, §5.5), added within v2: a clean stop leaves the log with no records (§5.5), which the previous release opens, and a release older than the record rejects one it meets (`WalUnknownRecord`) instead of skipping it.
+
+`schema.bin` has a similar exception. A column's `ON UPDATE CURRENT_TIMESTAMP` is bit 2 of its DEFAULT presence byte, added within schema v5 (`src/storage/schema_file.zig`). Every existing schema reads unchanged, and a table that declares no such column is written byte for byte as before. A release older than the bit takes a column that sets it for one with a DEFAULT value, so it fails on or misreads that table's schema. Downgrading past the bit is safe only for tables that don't declare the clause.
 
 The exact binary layouts live in [src/storage/manifest.zig](src/storage/manifest.zig) and [src/engine/wal.zig](src/engine/wal.zig). Segment entries include row/byte counts, leading-key statistics, per-column statistics, and cardinality sketches.
 

@@ -373,6 +373,10 @@ pub const Column = struct {
     /// the wall-clock time. Datetime columns only; exclusive with
     /// `default_value`.
     default_now: bool = false,
+    /// `ON UPDATE CURRENT_TIMESTAMP`: an UPDATE, or the update branch of
+    /// an upsert, that changes a row without assigning this column sets it
+    /// to the statement's timestamp. Datetime columns only.
+    on_update_now: bool = false,
     /// MySQL-style AUTO_INCREMENT attribute. At most one column per
     /// table; type must be an integer width. The owning Table holds
     /// a monotonic counter in its manifest; INSERT fills omitted /

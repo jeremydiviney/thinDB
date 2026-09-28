@@ -206,6 +206,8 @@ pub const ColumnDef = struct {
     /// INSERT fills the wall-clock time at insert. Datetime columns only;
     /// exclusive with `default_value`.
     default_now: bool = false,
+    /// `ON UPDATE CURRENT_TIMESTAMP`; see `types.Column.on_update_now`.
+    on_update_now: bool = false,
     /// MySQL-style AUTO_INCREMENT attribute. When set, the column is
     /// integer-typed and the table maintains a per-table monotonic
     /// counter that fills NULL/omitted inserts. Counter advances past
@@ -1502,13 +1504,15 @@ fn encodeColumnDef(allocator: Allocator, out: *std.ArrayList(u8), c: ColumnDef) 
     try out.appendSlice(allocator, c.name);
     try encodeType(allocator, out, c.column_type);
     try out.append(allocator, @intFromBool(c.nullable));
+    // The DEFAULT kind, with ON UPDATE CURRENT_TIMESTAMP as bit 2.
+    const on_update: u8 = if (c.on_update_now) 4 else 0;
     if (c.default_value) |dv| {
-        try out.append(allocator, 1);
+        try out.append(allocator, 1 | on_update);
         try encodeValue(allocator, out, dv);
     } else if (c.default_now) {
-        try out.append(allocator, 2);
+        try out.append(allocator, 2 | on_update);
     } else {
-        try out.append(allocator, 0);
+        try out.append(allocator, on_update);
     }
     try out.append(allocator, @intFromBool(c.auto_increment));
 }
@@ -2773,8 +2777,10 @@ fn decodeColumnDef(bytes: []const u8, cursor: *usize) DecodeError!ColumnDef {
     const nullable = bytes[cursor.*] != 0;
     cursor.* += 1;
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
-    const has_default = bytes[cursor.*];
+    const default_byte = bytes[cursor.*];
     cursor.* += 1;
+    if (default_byte & ~@as(u8, 7) != 0) return Error.IrCorrupt;
+    const has_default = default_byte & 3;
     const default_value: ?Value = switch (has_default) {
         0, 2 => null,
         1 => try decodeValue(bytes, cursor),
@@ -2789,6 +2795,7 @@ fn decodeColumnDef(bytes: []const u8, cursor: *usize) DecodeError!ColumnDef {
         .nullable = nullable,
         .default_value = default_value,
         .default_now = has_default == 2,
+        .on_update_now = default_byte & 4 != 0,
         .auto_increment = auto_increment,
     };
 }
@@ -3497,12 +3504,16 @@ test "ir: ddl rename alter drop and truncate round-trip" {
         .nullable = false,
         .default_value = .{ .int = 0 },
     };
+    const stamped: ColumnDef = .{ .name = "at", .column_type = .datetime, .nullable = true, .default_now = true, .on_update_now = true };
+    const fixed_stamped: ColumnDef = .{ .name = "at", .column_type = .datetime, .nullable = true, .default_value = .{ .datetime = 5 }, .on_update_now = true };
     const actions = [_]AlterAction{
         .{ .add_column = score },
         .{ .drop_column = "old" },
         .{ .rename_column = .{ .from = "a", .to = "b" } },
         .{ .change_column = .{ .from = "c", .column = score } },
         .{ .rename_table = .{ .schema = "s", .name = "t2" } },
+        .{ .add_column = stamped },
+        .{ .change_column = .{ .from = "at", .column = fixed_stamped } },
     };
     const dropped = [_]TableRef{ .{ .name = "a" }, .{ .database = "d", .name = "b" } };
     const cases = [_]Op{
@@ -3532,6 +3543,12 @@ test "ir: ddl rename alter drop and truncate round-trip" {
                 try std.testing.expectEqualStrings("b", at.actions[2].rename_column.to);
                 try std.testing.expectEqualStrings("c", at.actions[3].change_column.from);
                 try std.testing.expectEqualStrings("t2", at.actions[4].rename_table.name);
+                try std.testing.expect(!at.actions[0].add_column.on_update_now);
+                const got_stamped = at.actions[5].add_column;
+                try std.testing.expect(got_stamped.default_now and got_stamped.on_update_now and got_stamped.default_value == null);
+                const got_fixed = at.actions[6].change_column.column;
+                try std.testing.expect(!got_fixed.default_now and got_fixed.on_update_now);
+                try std.testing.expect(got_fixed.default_value.?.eql(.{ .datetime = 5 }));
             },
             .drop_table => |dt| {
                 try std.testing.expectEqual(dropped.len, dt.tables.len);
