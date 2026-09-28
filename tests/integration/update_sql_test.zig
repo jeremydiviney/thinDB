@@ -347,3 +347,104 @@ test "UPDATE: WHERE with a computed operand — segment and memtable rows (#94)"
         try std.testing.expectEqualSlices(i64, c.qtys, qtys);
     }
 }
+
+fn affectedRows(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !u64 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |_| {}
+    return q.affectedRows();
+}
+
+const DeadRowsMode = enum {
+    /// No segment: every row stays in the memtable.
+    memtable,
+    /// The load is flushed; later statements work over one segment.
+    flushed,
+    /// A flush after every statement spreads each row's dead and live
+    /// copies over several segments.
+    flush_each,
+    /// A flush and a compaction after every statement: the dead copies are
+    /// dropped as they appear.
+    compacted,
+};
+
+/// Runs `sql`, checks its affected-row count, then moves the rows as `mode` says.
+fn dmlStep(allocator: std.mem.Allocator, db: *thindb.Database, mode: DeadRowsMode, sql: []const u8, affected: ?u64) !void {
+    const got = try affectedRows(allocator, db, sql);
+    if (affected) |want| std.testing.expectEqual(want, got) catch |err| {
+        std.debug.print("{s} ({s})\n", .{ sql, @tagName(mode) });
+        return err;
+    };
+    const t = try db.openTable("t", .{});
+    switch (mode) {
+        .memtable, .flushed => {},
+        .flush_each => try t.flush(),
+        .compacted => {
+            try t.flush();
+            try t.compact();
+        },
+    }
+}
+
+test "UPDATE, DELETE and ON DUPLICATE KEY UPDATE match only live rows (#343)" {
+    const allocator = std.testing.allocator;
+    inline for (.{ true, false }) |keyed| {
+        inline for (.{ DeadRowsMode.memtable, .flushed, .flush_each, .compacted }) |mode| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+            defer db.close();
+            try exec(allocator, db, if (keyed)
+                "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)"
+            else
+                "CREATE TABLE t (id BIGINT NOT NULL, qty INT NOT NULL)");
+            try exec(allocator, db, "CREATE TABLE s (k BIGINT PRIMARY KEY)");
+            try exec(allocator, db, "INSERT INTO s (k) VALUES (3), (4)");
+            try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+            if (mode != .memtable) try (try db.openTable("t", .{})).flush();
+
+            // A second UPDATE builds on the first, not on the copy it replaced.
+            try dmlStep(allocator, db, mode, "UPDATE t SET qty = qty + 1 WHERE id = 1", 1);
+            try dmlStep(allocator, db, mode, "UPDATE t SET qty = qty + 1 WHERE id = 1", 1);
+            // A deleted row stays deleted.
+            try dmlStep(allocator, db, mode, "DELETE FROM t WHERE id = 2", 1);
+            try dmlStep(allocator, db, mode, "UPDATE t SET qty = 0 WHERE id = 2", 0);
+            try dmlStep(allocator, db, mode, "DELETE FROM t WHERE id = 2", 0);
+            try dmlStep(allocator, db, mode, "UPDATE t SET qty = qty + 100 WHERE id IN (SELECT k FROM s)", 2);
+            try dmlStep(allocator, db, mode, "UPDATE t SET qty = qty + 1000", 3);
+            try std.testing.expectEqual(@as(usize, 3), try countOf(allocator, db, "SELECT COUNT(*) FROM t"));
+            try expectRows(allocator, db, &.{ 1, 3, 4 }, &.{ 1012, 1130, 1140 });
+
+            if (keyed) {
+                // The forms that run a SELECT and write back by key, and the
+                // upsert's own lookup of the stored row.
+                try dmlStep(allocator, db, mode, "UPDATE t SET qty = qty + 1 ORDER BY id LIMIT 1", 1);
+                try dmlStep(allocator, db, mode, "UPDATE t JOIN s ON t.id = s.k SET t.qty = t.qty + 1 WHERE s.k = 3", 1);
+                try dmlStep(allocator, db, mode, "INSERT INTO t (id, qty) VALUES (2, 7) ON DUPLICATE KEY UPDATE qty = qty + 1", null);
+                try dmlStep(allocator, db, mode, "INSERT INTO t (id, qty) VALUES (4, 0) ON DUPLICATE KEY UPDATE qty = qty + 1", null);
+                try dmlStep(allocator, db, mode, "INSERT INTO t (id, qty) VALUES (4, 0) ON DUPLICATE KEY UPDATE qty = qty + 1", null);
+                try dmlStep(allocator, db, mode, "DELETE FROM t ORDER BY id DESC LIMIT 1", 1);
+                try dmlStep(allocator, db, mode, "INSERT INTO t (id, qty) VALUES (4, 5) ON DUPLICATE KEY UPDATE qty = qty + 1", null);
+                try expectRows(allocator, db, &.{ 1, 2, 3, 4 }, &.{ 1013, 7, 1131, 5 });
+            } else {
+                try dmlStep(allocator, db, mode, "DELETE FROM t WHERE qty > 1100", 2);
+                try expectRows(allocator, db, &.{1}, &.{1012});
+            }
+        }
+    }
+}
+
+fn countOf(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !usize {
+    const got = try collectBigints(allocator, db, sql);
+    defer allocator.free(got);
+    return @intCast(got[0]);
+}
+
+fn expectRows(allocator: std.mem.Allocator, db: anytype, ids: []const i64, qtys: []const i64) !void {
+    const got_ids = try collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+    defer allocator.free(got_ids);
+    try std.testing.expectEqualSlices(i64, ids, got_ids);
+    const got_qtys = try collectBigints(allocator, db, "SELECT CAST(qty AS BIGINT) FROM t ORDER BY id ASC");
+    defer allocator.free(got_qtys);
+    try std.testing.expectEqualSlices(i64, qtys, got_qtys);
+}
