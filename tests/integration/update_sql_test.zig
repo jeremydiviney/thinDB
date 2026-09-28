@@ -449,6 +449,116 @@ fn expectRows(allocator: std.mem.Allocator, db: anytype, ids: []const i64, qtys:
     try std.testing.expectEqualSlices(i64, qtys, got_qtys);
 }
 
+/// The DECIMAL column `m` of `table`, as text, ordered by id.
+fn expectDecimals(allocator: std.mem.Allocator, db: anytype, comptime table: []const u8, expected: []const []const u8) !void {
+    const got = try helpers.collectStrings(allocator, db, "SELECT CAST(m AS CHAR) FROM " ++ table ++ " ORDER BY id");
+    defer helpers.freeStrings(allocator, got);
+    try std.testing.expectEqual(expected.len, got.len);
+    for (expected, got) |want, g| try std.testing.expectEqualStrings(want, g.?);
+}
+
+test "UPDATE and ON DUPLICATE KEY UPDATE write a DECIMAL column as INSERT does (#352)" {
+    const allocator = std.testing.allocator;
+    inline for (.{ false, true }) |flushed| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE up (id INT PRIMARY KEY, m DECIMAL(10,2), d DOUBLE, v INT)");
+        try exec(allocator, db, "CREATE TABLE ins (id INT PRIMARY KEY, m DECIMAL(10,2))");
+        try exec(allocator, db, "INSERT INTO up VALUES (1, 1.5, 2.5, 3), (2, 2.5, 3.5, 4), (3, 3.25, 4.5, 5)");
+        if (flushed) try (try db.openTable("up", .{})).flush();
+
+        try exec(allocator, db, "UPDATE up SET m = 1.125 WHERE id = 1");
+        try exec(allocator, db, "UPDATE up SET m = 12345678.5 WHERE id = 2");
+        try exec(allocator, db, "UPDATE up SET m = -2.345 WHERE id = 3");
+        try expectDecimals(allocator, db, "up", &.{ "1.13", "12345678.50", "-2.35" });
+        try exec(allocator, db, "INSERT INTO ins VALUES (1, 1.125), (2, 12345678.5), (3, -2.345)");
+        try expectDecimals(allocator, db, "ins", &.{ "1.13", "12345678.50", "-2.35" });
+
+        try exec(allocator, db, "UPDATE up SET m = 67 WHERE id = 3");
+        try exec(allocator, db, "UPDATE up SET m = m * m WHERE id = 1");
+        try exec(allocator, db, "UPDATE up SET m = v + 1 WHERE id = 2");
+        try expectDecimals(allocator, db, "up", &.{ "1.28", "5.00", "67.00" });
+        try exec(allocator, db, "UPDATE up SET m = d");
+        try expectDecimals(allocator, db, "up", &.{ "2.50", "3.50", "4.50" });
+        try exec(allocator, db, "UPDATE up SET m = '7.5' WHERE id = 1");
+        try expectDecimals(allocator, db, "up", &.{ "7.50", "3.50", "4.50" });
+
+        // A value the column can't hold fails the statement and changes nothing.
+        try helpers.expectRunError(allocator, db, "UPDATE up SET m = 'abc' WHERE id = 1", error.TypeMismatch);
+        try helpers.expectRunError(allocator, db, "UPDATE up SET m = 123456789.5", error.ArithmeticOverflow);
+        try expectDecimals(allocator, db, "up", &.{ "7.50", "3.50", "4.50" });
+        try helpers.expectRunError(allocator, db, "INSERT INTO ins VALUES (4, 'abc')", error.TypeMismatch);
+        try helpers.expectRunError(allocator, db, "INSERT INTO ins VALUES (4, 123456789.5)", error.ValueOutOfRange);
+        try helpers.expectRunError(allocator, db, "INSERT INTO ins SELECT 4, 'abc'", error.TypeMismatch);
+        try exec(allocator, db, "INSERT INTO ins SELECT 4, '7.125'");
+        try expectDecimals(allocator, db, "ins", &.{ "1.13", "12345678.50", "-2.35", "7.13" });
+
+        try exec(allocator, db, "INSERT INTO up (id, m) VALUES (3, 9.5) ON DUPLICATE KEY UPDATE m = 1.125");
+        try exec(allocator, db, "INSERT INTO up (id, m) VALUES (2, 9.5) ON DUPLICATE KEY UPDATE m = 7");
+        try expectDecimals(allocator, db, "up", &.{ "7.50", "7.00", "1.13" });
+    }
+}
+
+test "the CDC upsert shape stores DECIMAL values as a plain INSERT does (#352)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    // One row per spelling: at the column's scale, at another scale, an
+    // integer; keys 1 to 3 exist already, 4 to 6 are new.
+    const rows = "(1, 2.55, 1.25), (2, 3.125, 2.5), (3, 4, 3), (4, 5.555, 4.125), (5, -6.5, 5), (6, 7, 6.00)";
+    try exec(allocator, db, "CREATE TABLE ref (id INT PRIMARY KEY, m DECIMAL(10,2), n DECIMAL(12,4))");
+    try exec(allocator, db, "INSERT INTO ref (id, m, n) VALUES " ++ rows);
+    try exec(allocator, db, "CREATE TABLE cdc (id INT PRIMARY KEY, m DECIMAL(10,2), n DECIMAL(12,4))");
+    try exec(allocator, db, "INSERT INTO cdc (id, m, n) VALUES (1, 0, 0), (2, 0, 0), (3, 0, 0)");
+    try (try db.openTable("cdc", .{})).flush();
+    try exec(allocator, db, "INSERT INTO cdc (id, m, n) VALUES " ++ rows ++ " ON DUPLICATE KEY UPDATE m = VALUES(m), n = VALUES(n)");
+
+    const expected = [_][]const u8{ "2.55", "3.13", "4.00", "5.56", "-6.50", "7.00" };
+    try expectDecimals(allocator, db, "ref", &expected);
+    try expectDecimals(allocator, db, "cdc", &expected);
+    const ref_n = try helpers.collectStrings(allocator, db, "SELECT CAST(n AS CHAR) FROM ref ORDER BY id");
+    defer helpers.freeStrings(allocator, ref_n);
+    const cdc_n = try helpers.collectStrings(allocator, db, "SELECT CAST(n AS CHAR) FROM cdc ORDER BY id");
+    defer helpers.freeStrings(allocator, cdc_n);
+    for (ref_n, cdc_n) |r, c| try std.testing.expectEqualStrings(r.?, c.?);
+    try std.testing.expectEqualStrings("2.5000", cdc_n[1].?);
+}
+
+test "a DECIMAL UPDATE replays from the WAL as it was stored (#352)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const config: thindb.Config = .{ .wal_enabled = true, .auto_flush_secs = 0 };
+    var manifest: []u8 = undefined;
+    var wal: []u8 = undefined;
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, config);
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE up (id INT PRIMARY KEY, m DECIMAL(10,2), v INT)");
+        try exec(allocator, db, "INSERT INTO up VALUES (1, 1.5, 3)");
+        const t = try db.openTable("up", .{});
+        try t.flush();
+        try exec(allocator, db, "INSERT INTO up VALUES (2, 2.5, 4), (3, 3.25, 5)");
+        try exec(allocator, db, "UPDATE up SET m = CASE WHEN id = 2 THEN v ELSE 1.125 END");
+        try expectDecimals(allocator, db, "up", &.{ "1.13", "4.00", "1.13" });
+        manifest = try t.table_dir.readFileAlloc(io, "manifest", arena.allocator(), .unlimited);
+        wal = try t.table_dir.readFileAlloc(io, "wal", arena.allocator(), .unlimited);
+    }
+    // As if the process had died right after the UPDATE.
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/up/manifest", .data = manifest });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/up/wal", .data = wal });
+    var db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    try expectDecimals(allocator, db, "up", &.{ "1.13", "4.00", "1.13" });
+}
+
 const old_ts = "'2001-01-01 00:00:00'";
 const recent = "'2020-01-01 00:00:00'";
 
