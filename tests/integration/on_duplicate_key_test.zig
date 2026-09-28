@@ -155,6 +155,31 @@ test "ON DUPLICATE KEY UPDATE binds subqueries and user variables" {
     try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 70, 23, 100, 100 });
 }
 
+test "ON DUPLICATE KEY UPDATE mixes subqueries with the new row and stamps ON UPDATE columns" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE dim (id INT NOT NULL, a INT NOT NULL, ts DATETIME ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (id))");
+    try exec(allocator, db, "INSERT INTO dim (id, a) VALUES (1, 10), (2, 20), (3, 30)");
+    try exec(allocator, db, "CREATE TABLE other (w INT NOT NULL, PRIMARY KEY (w))");
+    try exec(allocator, db, "INSERT INTO other (w) VALUES (7), (70)");
+
+    try exec(allocator, db, "INSERT INTO dim (id, a) VALUES (1, 5) ON DUPLICATE KEY UPDATE a = VALUES(a) + (SELECT MIN(w) FROM other)");
+    try exec(allocator, db, "SET @x = 3; INSERT INTO dim (id, a) VALUES (2, 4) AS new ON DUPLICATE KEY UPDATE a = new.a * (SELECT MIN(w) FROM other) + @x");
+    try exec(allocator, db, "INSERT INTO dim (id, a) VALUES (3, 0) ON DUPLICATE KEY UPDATE a = (SELECT MAX(w) - 40 FROM other)");
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 12, 31, 30 });
+    try expectInts(allocator, db, "SELECT id FROM dim WHERE ts IS NULL", &.{3});
+
+    const merge = "INSERT INTO dim (id, a) SELECT w, w + 1 FROM other ON DUPLICATE KEY UPDATE a = VALUES(a) - (SELECT MIN(w) FROM other)";
+    try exec(allocator, db, merge);
+    try expectInts(allocator, db, "SELECT id FROM dim WHERE ts IS NULL ORDER BY id", &.{ 3, 7, 70 });
+    try exec(allocator, db, merge);
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 12, 31, 30, 1, 64 });
+    try expectInts(allocator, db, "SELECT id FROM dim WHERE ts IS NULL", &.{3});
+}
+
 test "ON DUPLICATE KEY UPDATE rejects a moved key and unknown names" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
