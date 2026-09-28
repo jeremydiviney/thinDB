@@ -464,15 +464,14 @@ pub const GroupAggregateSpec = struct {
     distinct_state_index: u16 = 0,
     // SUM/AVG over a 64-bit integer input accumulates in i128: the aggregate
     // owns TWO consecutive slots — lo u64 bits at `state_index - 1`, hi i64
-    // at `state_index`. Only the generic per-row program supports wide state;
-    // the fused count/sum/avg and weight-fold kernels decline it.
+    // at `state_index`. The fused count/sum/avg and weight-fold kernels
+    // decline it.
     wide: bool = false,
     // The input column is nullable: NULL rows are skipped in the fold (a
     // nullable COUNT(col) accumulates its own slot instead of mirroring the
     // group row count). `valid_count_index` (0 = none) is the companion slot
     // holding the group's non-null input count — the AVG denominator and the
-    // all-NULL → NULL finalize signal for SUM/AVG/MIN/MAX. Generic per-row
-    // program only, like wide.
+    // all-NULL → NULL finalize signal for SUM/AVG/MIN/MAX.
     nullable: bool = false,
     valid_count_index: u16 = 0,
     // GROUP_CONCAT: reads `str_columns[str_input_index]` (like string MIN/MAX)
@@ -2036,6 +2035,10 @@ const PipeShared = struct {
     direct_final_local: bool = false,
     local_parts: []WorkerParts = &.{},
     shared_scan_buffers: ?*SharedScanBuffers = null,
+    // Set when one worker runs the whole grid over a single bucket: with no
+    // peer to hand work to, a filled staging chunk folds straight into that
+    // bucket rather than queueing for a stage pass that only copies it again.
+    serial_fold_scratch: ?*GroupScratch = null,
 
     fn grouping_complete(self: *const PipeShared) bool {
         // Closing every producer makes the remaining row count monotone.
@@ -3783,15 +3786,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             active.len_rows = idx + 1;
             accepted += 1;
         }
-        if (active.len() == raw_chunk_rows) {
-            if (shared.raw_scan_queues.len > 0) {
-                const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
-                try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, active, raw_chunk_rows, &shared.outstanding_chunks, &shared.pending_group_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
-            } else {
-                try publishRawRows(shared, parts.worker_index, active, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
-            }
-            parts.published_chunks += 1;
-        }
+        if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
     }
     parts.scanned_count += batch.row_count;
     parts.row_count += accepted;
@@ -4397,12 +4392,28 @@ inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []
 }
 
 fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize) !void {
+    if (shared.serial_fold_scratch) |scratch| return foldActiveRawRows(parts, shared, scratch);
     if (shared.raw_scan_queues.len > 0) {
         const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
         try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &shared.outstanding_chunks, &shared.pending_group_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
     } else {
         try publishRawRows(shared, parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
     }
+    parts.published_chunks += 1;
+}
+
+fn foldActiveRawRows(parts: *WorkerParts, shared: *PipeShared, scratch: *GroupScratch) !void {
+    const staged = parts.raw_active_rows;
+    if (staged.len() == 0) return;
+    const rows = GroupRows{
+        .slab = staged.slab,
+        .len_rows = staged.len_rows,
+        .capacity_rows = staged.capacity_rows,
+        .layout = staged.layout,
+        .str = staged.str,
+    };
+    try shared.buckets[0].fold_rows(shared.allocator, scratch, rows, shared.input_rows_per_bucket);
+    parts.raw_active_rows.clearRetainingCapacity();
     parts.published_chunks += 1;
 }
 
@@ -4987,10 +4998,9 @@ fn groupChunkRowsDirectKeys(
                 needs_kernels = true;
                 if (agg.op == .min or agg.op == .max) has_extreme = true;
                 if (agg.state_index == 0) kernelizable = false;
-                // Wide (two-slot i128) state — the monomorphic kernels do
-                // single-slot i64 math; keep the per-row program. Nullable
-                // inputs need per-row validity checks the kernels don't do.
-                if (agg.wide or agg.nullable) kernelizable = false;
+                // A nullable input's first-touch and AVG denominator live in
+                // its valid-count slot; without one only the program folds it.
+                if (agg.nullable and agg.valid_count_index == 0) kernelizable = false;
             },
             // Welford's three-slot sequential update has no kernel form.
             .welford => kernelizable = false,
@@ -5082,23 +5092,10 @@ fn groupChunkRowsDirectKeys(
     if (needs_kernels) {
         for (aggregates) |agg| {
             if (agg.is_string or agg.is_distinct or agg.is_concat or agg.is_udf) continue;
-            switch (agg.op) {
-                .count_star, .count_col => {},
-                .sum, .avg => if (aggInputIsFloat(rows, agg))
-                    foldKernelSumFloat(states, gids, rows, agg)
-                else
-                    foldKernelSumInt(states, gids, rows, agg),
-                .min => if (aggInputIsFloat(rows, agg))
-                    foldKernelExtremeFloat(true, states, gids, rows, agg)
-                else
-                    foldKernelExtremeInt(true, states, gids, rows, agg),
-                .max => if (aggInputIsFloat(rows, agg))
-                    foldKernelExtremeFloat(false, states, gids, rows, agg)
-                else
-                    foldKernelExtremeInt(false, states, gids, rows, agg),
-                // All force or skip the kernel pass.
-                .count_distinct, .welford, .concat, .udf => unreachable,
-            }
+            if (aggInputHasValidity(rows, agg))
+                foldAggregateKernel(true, states, gids, rows, agg)
+            else
+                foldAggregateKernel(false, states, gids, rows, agg);
         }
     }
 
@@ -5232,8 +5229,50 @@ inline fn mirrorCountSlots(states: *StateSlab, gid: u32, aggregates: []const Gro
 // prefetched ahead — group records are DRAM-resident at silo cardinalities,
 // and the look-ahead overlaps those independent misses (the per-row program
 // chained them).
-fn foldKernelSumInt(states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+//
+// `nullable` kernels read the input's validity bytes: a NULL row folds
+// nothing, and each run adds its non-null count to the aggregate's
+// valid-count slot, which also decides MIN/MAX first-touch (the group may
+// have seen only NULLs so far, so the creating row's tag doesn't).
+fn foldAggregateKernel(comptime nullable: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+    switch (agg.op) {
+        .count_star, .count_col => {},
+        .sum, .avg => if (aggInputIsFloat(rows, agg))
+            foldKernelSumFloat(nullable, states, gids, rows, agg)
+        else if (agg.wide)
+            foldKernelSumInt(i128, nullable, states, gids, rows, agg)
+        else
+            foldKernelSumInt(i64, nullable, states, gids, rows, agg),
+        .min => if (aggInputIsFloat(rows, agg))
+            foldKernelExtreme(f64, true, nullable, states, gids, rows, agg)
+        else
+            foldKernelExtreme(i64, true, nullable, states, gids, rows, agg),
+        .max => if (aggInputIsFloat(rows, agg))
+            foldKernelExtreme(f64, false, nullable, states, gids, rows, agg)
+        else
+            foldKernelExtreme(i64, false, nullable, states, gids, rows, agg),
+        // All force or skip the kernel pass.
+        .count_distinct, .welford, .concat, .udf => unreachable,
+    }
+}
+
+inline fn aggInputHasValidity(rows: GroupRows, agg: GroupAggregateSpec) bool {
+    if (!agg.nullable) return false;
+    const ic = agg.input_column_index orelse return false;
+    return rows.layout.columns[ic].nullable;
+}
+
+inline fn aggInputValidBytes(comptime nullable: bool, rows: GroupRows, agg: GroupAggregateSpec) []const u8 {
+    if (!nullable) return &.{};
+    return rows.validAll(rows.layout.columns[agg.input_column_index.?].valid_index);
+}
+
+// `Acc` is i64 for narrow state and i128 for the two-slot wide state (lo u64
+// bits at `state_index - 1`, hi at `state_index`).
+fn foldKernelSumInt(comptime Acc: type, comptime nullable: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
     const si: usize = agg.state_index;
+    const vci: usize = agg.valid_count_index;
+    const valid = aggInputValidBytes(nullable, rows, agg);
     switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
         inline .i8, .i16, .i32, .i64 => |pt| {
             const T = groupPhysicalT(pt);
@@ -5244,10 +5283,24 @@ fn foldKernelSumInt(states: *StateSlab, gids: []const u32, rows: GroupRows, agg:
                 if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
                 // Adjacent-equal gid run: accumulate in a register, store once.
                 const g = gids[r] & ~NEW_GID_BIT;
-                var acc: i64 = vals[r];
-                var rr = r + 1;
-                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) acc += vals[rr];
-                states.slotsOf(g)[si - 1] += acc;
+                var acc: Acc = 0;
+                var n_valid: i64 = 0;
+                var rr = r;
+                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) {
+                    if (nullable) {
+                        const ok = valid[rr] != 0;
+                        acc += if (ok) vals[rr] else 0;
+                        n_valid += @intFromBool(ok);
+                    } else acc += vals[rr];
+                }
+                if (!nullable) n_valid = @intCast(rr - r);
+                const slots = states.slotsOf(g);
+                if (Acc == i128) {
+                    const sum = wideStateValue(slots, si) + acc;
+                    slots[si - 1] = @bitCast(@as(u64, @truncate(@as(u128, @bitCast(sum)))));
+                    slots[si] = @intCast(sum >> 64);
+                } else slots[si - 1] += acc;
+                if (vci != 0) slots[vci - 1] += n_valid;
                 r = rr;
             }
         },
@@ -5255,8 +5308,10 @@ fn foldKernelSumInt(states: *StateSlab, gids: []const u32, rows: GroupRows, agg:
     }
 }
 
-fn foldKernelSumFloat(states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+fn foldKernelSumFloat(comptime nullable: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
     const si: usize = agg.state_index;
+    const vci: usize = agg.valid_count_index;
+    const valid = aggInputValidBytes(nullable, rows, agg);
     switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
         inline .f32, .f64 => |pt| {
             const T = groupPhysicalT(pt);
@@ -5266,12 +5321,22 @@ fn foldKernelSumFloat(states: *StateSlab, gids: []const u32, rows: GroupRows, ag
                 const pf = r + PREFETCH_DIST_STATES;
                 if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
                 const g = gids[r] & ~NEW_GID_BIT;
-                var acc: f64 = @floatCast(vals[r]);
-                var rr = r + 1;
-                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) acc += @as(f64, @floatCast(vals[rr]));
-                const slot = &states.slotsOf(g)[si - 1];
-                const cur: f64 = @bitCast(slot.*);
-                slot.* = @bitCast(cur + acc);
+                var acc: f64 = 0;
+                var n_valid: i64 = 0;
+                var rr = r;
+                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) {
+                    const v: f64 = @floatCast(vals[rr]);
+                    if (nullable) {
+                        const ok = valid[rr] != 0;
+                        acc += if (ok) v else 0;
+                        n_valid += @intFromBool(ok);
+                    } else acc += v;
+                }
+                if (!nullable) n_valid = @intCast(rr - r);
+                const slots = states.slotsOf(g);
+                const cur: f64 = @bitCast(slots[si - 1]);
+                slots[si - 1] = @bitCast(cur + acc);
+                if (vci != 0) slots[vci - 1] += n_valid;
                 r = rr;
             }
         },
@@ -5279,10 +5344,13 @@ fn foldKernelSumFloat(states: *StateSlab, gids: []const u32, rows: GroupRows, ag
     }
 }
 
-fn foldKernelExtremeInt(comptime is_min: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
+// `V` is i64 for integer inputs and f64 (bit-cast into the slot) for floats.
+fn foldKernelExtreme(comptime V: type, comptime is_min: bool, comptime nullable: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
     const si: usize = agg.state_index;
+    const vci: usize = agg.valid_count_index;
+    const valid = aggInputValidBytes(nullable, rows, agg);
     switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
-        inline .i8, .i16, .i32, .i64 => |pt| {
+        inline else => |pt| if (comptime (V == f64) == physicalIsFloat(pt)) {
             const T = groupPhysicalT(pt);
             const vals = rows.columnTypedAll(T, agg.input_column_index.?);
             var r: usize = 0;
@@ -5293,48 +5361,29 @@ fn foldKernelExtremeInt(comptime is_min: bool, states: *StateSlab, gids: []const
                 // NEW_GID_BIT: reduce the run in a register, one tagged store.
                 const tag_new = gids[r] & NEW_GID_BIT != 0;
                 const g = gids[r] & ~NEW_GID_BIT;
-                var best: i64 = vals[r];
-                var rr = r + 1;
-                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) {
-                    const v: i64 = vals[rr];
-                    if (if (is_min) v < best else v > best) best = v;
+                var best: V = undefined;
+                var n_valid: i64 = 0;
+                var rr = r;
+                if (!nullable) {
+                    best = if (V == f64) @floatCast(vals[r]) else vals[r];
+                    n_valid = 1;
+                    rr = r + 1;
                 }
-                const slot = &states.slotsOf(g)[si - 1];
-                const improves = if (is_min) best < slot.* else best > slot.*;
-                if (tag_new or improves) slot.* = best;
+                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) {
+                    if (nullable and valid[rr] == 0) continue;
+                    const v: V = if (V == f64) @floatCast(vals[rr]) else vals[rr];
+                    if ((nullable and n_valid == 0) or (if (is_min) v < best else v > best)) best = v;
+                    n_valid += 1;
+                }
                 r = rr;
+                if (n_valid == 0) continue;
+                const slots = states.slotsOf(g);
+                const first = if (nullable) slots[vci - 1] == 0 else tag_new;
+                const cur: V = if (V == f64) @bitCast(slots[si - 1]) else slots[si - 1];
+                if (first or (if (is_min) best < cur else best > cur)) slots[si - 1] = if (V == f64) @bitCast(best) else best;
+                if (vci != 0) slots[vci - 1] += n_valid;
             }
         },
-        .f32, .f64 => {},
-    }
-}
-
-fn foldKernelExtremeFloat(comptime is_min: bool, states: *StateSlab, gids: []const u32, rows: GroupRows, agg: GroupAggregateSpec) void {
-    const si: usize = agg.state_index;
-    switch (rows.layout.columns[agg.input_column_index.?].physical_type) {
-        inline .f32, .f64 => |pt| {
-            const T = groupPhysicalT(pt);
-            const vals = rows.columnTypedAll(T, agg.input_column_index.?);
-            var r: usize = 0;
-            while (r < gids.len) {
-                const pf = r + PREFETCH_DIST_STATES;
-                if (pf < gids.len) prefetchStateSlots(states, gids[pf] & ~NEW_GID_BIT);
-                const tag_new = gids[r] & NEW_GID_BIT != 0;
-                const g = gids[r] & ~NEW_GID_BIT;
-                var best: f64 = @floatCast(vals[r]);
-                var rr = r + 1;
-                while (rr < gids.len and (gids[rr] & ~NEW_GID_BIT) == g) : (rr += 1) {
-                    const v: f64 = @floatCast(vals[rr]);
-                    if (if (is_min) v < best else v > best) best = v;
-                }
-                const slot = &states.slotsOf(g)[si - 1];
-                const cur: f64 = @bitCast(slot.*);
-                const improves = if (is_min) best < cur else best > cur;
-                if (tag_new or improves) slot.* = @bitCast(best);
-                r = rr;
-            }
-        },
-        else => {},
     }
 }
 
@@ -6066,8 +6115,7 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
 
     if (job.raw_group_mode != .off and job.shared.raw_scan_queues.len > 0) {
         const publish_t0 = if (job.profile) platform.nowTicks() else 0;
-        const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
-        try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.pending_group_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
+        try publishActiveRawRows(job.local, job.shared, job.raw_chunk_rows);
         if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
 
@@ -6082,8 +6130,7 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
     if (job.raw_group_mode != .off) {
         const publish_t0 = if (job.profile) platform.nowTicks() else 0;
         if (job.shared.raw_scan_queues.len > 0) {
-            const qidx = chooseRawScanPublishLane(job.shared, job.local.raw_scan_lane, @max(@as(usize, 1), job.raw_chunk_rows / 2));
-            try publishRawRowsToQueue(job.shared, &job.shared.raw_scan_queues[qidx], job.worker_index, &job.local.raw_active_rows, job.raw_chunk_rows, &job.shared.outstanding_chunks, &job.shared.pending_group_rows, &job.local.raw_scan_queue_lock_ticks, &job.local.raw_recycle_lock_ticks);
+            try publishActiveRawRows(job.local, job.shared, job.raw_chunk_rows);
         }
         if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
@@ -6478,7 +6525,15 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // Measured on the 660K-row Title GROUP BY: 256 buckets ≈ 28-32ms,
     // 4-64 ≈ 22ms, 1 ≈ 29ms (serial group lane overshoots).
     const small_input = work_rgs <= 64;
-    const bucket_count = if (small_input) @min(cfg.bucket_count, @max(@as(usize, 4), n_workers)) else cfg.bucket_count;
+    // Partitioning only pays when workers fold buckets in parallel; a lone
+    // worker folds one table directly (see PipeShared.serial_fold_scratch).
+    const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
+    const bucket_count = if (serial_fold)
+        1
+    else if (small_input)
+        @min(cfg.bucket_count, @max(@as(usize, 4), n_workers))
+    else
+        cfg.bucket_count;
     const route_block_rows = chooseRouteBlockRows(bucket_count, cfg.route_block_rows, cfg.route_block_rows_set);
 
     const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null);
@@ -6640,6 +6695,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .shared_scan_buffers = shared_scan_buffers_ptr,
     };
     raw_queues_moved_to_shared = true;
+    var serial_fold_scratch: GroupScratch = .{};
+    defer serial_fold_scratch.deinit(allocator);
+    if (serial_fold) shared.serial_fold_scratch = &serial_fold_scratch;
     var heavy_teardown_scheduled = false;
     defer if (!heavy_teardown_scheduled) deinitRawQueues(&shared);
     if (use_dedicated_raw_stage) {
