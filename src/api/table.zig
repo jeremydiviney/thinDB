@@ -109,19 +109,25 @@ pub const Table = struct {
     /// → current live memtable row index. Persists across insert batches so
     /// upsert resolution processes only the NEW rows (O(batch)) instead of
     /// rescanning the whole memtable (O(n) per batch → O(n²) total). Bound to
-    /// one memtable generation via `memtable_gen`; ANY swap (flush / delete /
-    /// update / dedup-clone) forces a rebuild. Key bytes live in
-    /// `upsert_idx_arena`.
+    /// one memtable generation via `memtable_gen`. A swap to a memtable that
+    /// keeps the old one's rows in order, minus some (delete / update /
+    /// dedup-clone / copy for a pinned reader), carries it over
+    /// (`upsert.carryIndex`); any other swap (flush, truncate, ALTER) forces
+    /// a rebuild. Key bytes live in `upsert_idx_arena`.
     ///
     /// The binding was previously the memtable POINTER — a proven data-loss
     /// ABA: the allocator can hand a later clone the freed memtable's
     /// address, revalidating a stale index whose row mappings then tombstone
     /// UNRELATED rows on the next upsert (rows acked to the client silently
     /// vanish). The counter can't be reused.
-    upsert_idx: std.StringHashMapUnmanaged(u32) = .empty,
+    /// An array map: a carry rewrites every row id, and its values are one
+    /// dense array however large the map has been.
+    upsert_idx: std.StringArrayHashMapUnmanaged(u32) = .empty,
     upsert_idx_arena: ?std.heap.ArenaAllocator = null,
     upsert_idx_gen: ?u64 = null,
     upsert_idx_rows: u32 = 0,
+    /// Keys carried swaps have removed since the last rebuild.
+    upsert_idx_removed: u32 = 0,
 
     /// Bumped by `installMemtableLocked` on every memtable retire-replace.
     memtable_gen: u64 = 0,
@@ -557,6 +563,7 @@ pub const Table = struct {
                 if (staged == null) self.memtable.truncate(before_count);
                 if (self.schema.unique) upsert_mod.resetIndex(self);
             }
+            if (staged) |mt| upsert_mod.carryIndexKept(self, replaced.memtable.keep, mt, self.memtable_gen + 1);
             if (row_count > 0) {
                 const views = try self.allocator.alloc(storage.ColumnView, rows.len);
                 defer self.allocator.free(views);
@@ -646,10 +653,12 @@ pub const Table = struct {
 
     /// Retire-replace the active memtable. EVERY swap must route through
     /// here: the generation bump is what invalidates the incremental upsert
-    /// index. Binding that index by pointer identity is an ABA data-loss
-    /// bug — the allocator can hand a later clone the freed memtable's
-    /// address, and the stale index's row mappings then tombstone unrelated
-    /// rows on the next upsert. Caller holds the table mutex.
+    /// index, unless the swapper carried it to the new generation first
+    /// (`upsert.carryIndex`). Binding that index by pointer identity is an
+    /// ABA data-loss bug — the allocator can hand a later clone the freed
+    /// memtable's address, and the stale index's row mappings then
+    /// tombstone unrelated rows on the next upsert. Caller holds the table
+    /// mutex.
     pub fn installMemtableLocked(self: *Table, new_mt: *engine.Memtable) void {
         const old_mt = self.memtable;
         self.memtable = new_mt;
@@ -667,6 +676,7 @@ pub const Table = struct {
     fn cloneMemtableIfPinnedLocked(self: *Table) !void {
         if (!self.memtable.hasSnapshotReaders()) return;
         const cloned = try self.memtable.cloneAll(self.allocator);
+        upsert_mod.carryIndex(self, &.{}, cloned, self.memtable_gen + 1);
         self.installMemtableLocked(cloned);
     }
 
