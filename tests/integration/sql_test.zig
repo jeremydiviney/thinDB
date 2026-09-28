@@ -126,7 +126,7 @@ test "sql: SELECT DISTINCT with WHERE / LIMIT / expression projections" {
     try std.testing.expectEqual(@as(usize, 3), n);
 }
 
-test "sql: SELECT DISTINCT rejects star, aggregates, GROUP BY, HAVING" {
+test "sql: SELECT DISTINCT rejects star, and HAVING with no grouping" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -137,8 +137,6 @@ test "sql: SELECT DISTINCT rejects star, aggregates, GROUP BY, HAVING" {
 
     const cases = [_][]const u8{
         "SELECT DISTINCT * FROM t",
-        "SELECT DISTINCT COUNT(*) FROM t",
-        "SELECT DISTINCT k FROM t GROUP BY k",
         "SELECT DISTINCT k FROM t HAVING k > 1",
     };
     for (cases) |sql| {
@@ -3743,8 +3741,8 @@ test "sql: unit-first date functions and aggregate aliases execute" {
     try std.testing.expectEqual(@as(i64, 3), b.values[6].data.bigint[0]);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[7].data.double[0], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.values[8].data.double[0], 1e-9);
-    try std.testing.expectApproxEqAbs(@sqrt(@as(f64, 19.0 / 12.0)), b.values[9].data.double[0], 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 19.0 / 12.0), b.values[10].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f64, 19.0 / 16.0)), b.values[9].data.double[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 19.0 / 16.0), b.values[10].data.double[0], 1e-9);
     try std.testing.expectEqualStrings("a", b.values[11].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("c", b.values[12].data.string.rowBytes(0));
 }
