@@ -13,6 +13,12 @@
 //   --pg-clients N  PostgreSQL-wire clients (needs --pg-port) that abandon
 //                   queries, send CancelRequests and pg_cancel_backend /
 //                   pg_terminate_backend stress connections of either wire.
+// And on view and SQL-function definitions, which the parser reads before its
+// statement holds a lease (#368):
+//   --view-churners N  replace, drop and recreate views and table functions
+//                      in a database of their own;
+//   --view-readers N   expand those views and functions from other
+//                      connections meanwhile.
 // A killed write must leave all-or-nothing state: the client checks that on
 // a connection nobody kills, then starts its next cycle.
 //
@@ -39,6 +45,8 @@ const { values: args } = parseArgs({
     killers: { type: "string", default: "0" },
     readers: { type: "string", default: "0" },
     "pg-clients": { type: "string", default: "0" },
+    "view-churners": { type: "string", default: "0" },
+    "view-readers": { type: "string", default: "0" },
   },
 });
 
@@ -48,6 +56,9 @@ const doublings = Number(args.doublings);
 const pgPort = Number(args["pg-port"]);
 const pgClientCount = Number(args["pg-clients"]);
 if (pgClientCount > 0 && pgPort === 0) throw new Error("--pg-clients needs --pg-port");
+const viewChurnerCount = Number(args["view-churners"]);
+const viewReaderCount = Number(args["view-readers"]);
+if (viewReaderCount > 0 && viewChurnerCount === 0) throw new Error("--view-readers needs --view-churners");
 
 class InvariantError extends Error {}
 class StallError extends Error {}
@@ -83,6 +94,9 @@ const stats = {
   expectedReaderErrors: 0,
   pgQueries: 0,
   pgAbandoned: 0,
+  viewDdl: 0,
+  viewReads: 0,
+  expectedViewErrors: 0,
   tornReads: [] as string[],
   refusedConnects: 0,
   sqlErrors: new Map<string, number>(),
@@ -473,6 +487,151 @@ async function reader(id: number): Promise<void> {
   }
 }
 
+const VIEW_SLOTS = 4;
+const GROWTH_ENTRIES = 40;
+const BASE_ROWS = 64;
+const VIEW_VERSIONS = [1, 2, 3, 4];
+// Every version of every view and function selects a multiple of 16 rows, or
+// none while a recreated base table is still empty, so any other count is a
+// reader that expanded a definition nobody registered.
+const VIEW_COUNTS = new Set([0, ...VIEW_VERSIONS.map((v) => 16 * v)]);
+
+function viewBody(version: number): string {
+  return `SELECT n, g FROM base WHERE n <= ${16 * version}`;
+}
+
+function functionBody(version: number): string {
+  return `SELECT n, g FROM base WHERE n <= ${16 * version} AND n > x`;
+}
+
+// Fill both registries well past their size and empty them again, so their
+// maps grow and rehash, moving every entry, while readers look them up.
+async function growRegistries(session: Session, id: number): Promise<void> {
+  for (let i = 0; i < GROWTH_ENTRIES; i++) {
+    await step(session, `CREATE OR REPLACE VIEW grow${id}_${i} AS SELECT 1 AS one`);
+    await step(session, `CREATE OR REPLACE FUNCTION growf${id}_${i}(x BIGINT) RETURNS TABLE AS (SELECT x AS one)`);
+  }
+  for (let i = 0; i < GROWTH_ENTRIES; i++) {
+    await step(session, `DROP VIEW IF EXISTS grow${id}_${i}`);
+    await step(session, `DROP FUNCTION IF EXISTS growf${id}_${i}`);
+  }
+}
+
+// Replace, drop and recreate views v0..v3 and functions f0..f3 over one base
+// table, dropping the whole database every tenth round.
+async function viewChurner(id: number): Promise<void> {
+  const who = `view churner ${id}`;
+  const database = `stress_v${id}`;
+  for (let round = 0; Date.now() < deadline && !stats.serverDown; round++) {
+    let session: Session | undefined;
+    try {
+      const admin = await open(`${who} admin`);
+      try {
+        if (round % 10 === 9) await step(admin, `DROP DATABASE IF EXISTS ${database}`);
+        await step(admin, `CREATE DATABASE IF NOT EXISTS ${database}`);
+      } finally {
+        await close(admin);
+      }
+      session = await open(who, `${database}__public`);
+      await step(session, "CREATE TABLE IF NOT EXISTS base (n BIGINT NOT NULL, g INT NOT NULL, PRIMARY KEY (n))");
+      const baseRows = await scalar(session, "SELECT COUNT(*) FROM base");
+      if (baseRows === 0) {
+        const values = Array.from({ length: BASE_ROWS }, (_, i) => `(${i + 1}, ${(i + 1) % 7})`).join(", ");
+        await step(session, `INSERT INTO base (n, g) VALUES ${values}`, expectOneOf("base", [0, BASE_ROWS], "base insert"));
+      } else if (baseRows !== BASE_ROWS) {
+        throw new InvariantError(`base has ${baseRows} rows, expected 0 or ${BASE_ROWS}`);
+      }
+      for (let i = 0; i < 30 && Date.now() < deadline; i++) {
+        const slot = Math.floor(random() * VIEW_SLOTS);
+        const version = pick(VIEW_VERSIONS);
+        const roll = random();
+        if (roll < 0.35) await step(session, `CREATE OR REPLACE VIEW v${slot} AS ${viewBody(version)}`);
+        else if (roll < 0.5) await step(session, `DROP VIEW IF EXISTS v${slot}`);
+        else if (roll < 0.8) await step(session, `CREATE OR REPLACE FUNCTION f${slot}(x BIGINT) RETURNS TABLE AS (${functionBody(version)})`);
+        else if (roll < 0.95) await step(session, `DROP FUNCTION IF EXISTS f${slot}`);
+        else await growRegistries(session, id);
+        stats.viewDdl++;
+      }
+    } catch (err) {
+      if (!(await recordError(who, err))) return;
+    } finally {
+      if (session) await close(session);
+    }
+  }
+}
+
+const VIEW_READS: { sql: (slot: number) => string; counts: boolean }[] = [
+  { sql: (slot) => `SELECT COUNT(*) FROM v${slot}`, counts: true },
+  { sql: (slot) => `SELECT COUNT(*) FROM f${slot}(0)`, counts: true },
+  { sql: (slot) => `SELECT COUNT(*) FROM v${slot} a JOIN f${slot}(0) b ON a.n = b.n`, counts: true },
+  { sql: (slot) => `SELECT g, COUNT(*) FROM v${slot} GROUP BY g ORDER BY g LIMIT 3`, counts: false },
+  { sql: (slot) => `SHOW CREATE FUNCTION f${slot}`, counts: false },
+];
+
+// A view, function, table or database the churner has just dropped.
+function isExpectedViewError(err: unknown): boolean {
+  const { errno, message } = errorFields(err);
+  return READER_EXPECTED_ERRNOS.has(errno) || message.includes("SqlUnsupportedFileFunction") || message.includes("FunctionNotFound");
+}
+
+function checkViewRead(sql: string, rows: any[], counts: boolean, who: string): void {
+  if (counts) {
+    const got = Number(Object.values(rows[0] ?? {})[0] ?? 0);
+    if (!VIEW_COUNTS.has(got)) {
+      const message = `${who}: ${sql} returned ${got}, expected one of ${[...VIEW_COUNTS].join(", ")}`;
+      stats.invariantFailures.push(message);
+      console.error(`INVARIANT ${message}`);
+    }
+    return;
+  }
+  if (!sql.startsWith("SHOW CREATE FUNCTION") || rows.length === 0) return;
+  const text = String(Object.values(rows[0])[0] ?? "");
+  if (!VIEW_VERSIONS.some((v) => text.includes(functionBody(v)))) {
+    const message = `${who}: ${sql} returned ${JSON.stringify(text.slice(0, 200))}`;
+    stats.invariantFailures.push(message);
+    console.error(`INVARIANT ${message}`);
+  }
+}
+
+// Expand the churners' views and functions while they are being replaced and
+// dropped. Every read that succeeds must match some version that was
+// registered.
+async function viewReader(id: number): Promise<void> {
+  const who = `view reader ${id}`;
+  while (Date.now() < deadline && !stats.serverDown) {
+    let session: Session | undefined;
+    try {
+      session = await open(who, `stress_v${Math.floor(random() * viewChurnerCount)}__public`);
+      for (let i = 0; i < 25 && Date.now() < deadline; i++) {
+        const read = pick(VIEW_READS);
+        const sql = read.sql(Math.floor(random() * VIEW_SLOTS));
+        try {
+          const rows = await run(session.conn, sql);
+          stats.viewReads++;
+          checkViewRead(sql, rows, read.counts, who);
+        } catch (err) {
+          if (isExpectedViewError(err)) {
+            stats.expectedViewErrors++;
+            continue;
+          }
+          if (!(await isKill(err, session.id, who))) throw err;
+          stats.killedStatements++;
+          if (killOutcome(err) === "lost") break;
+        }
+      }
+    } catch (err) {
+      if (isExpectedViewError(err)) {
+        stats.expectedViewErrors++;
+        await Bun.sleep(20);
+      } else if (!(await recordError(who, err))) {
+        return;
+      }
+    } finally {
+      if (session) await close(session);
+    }
+  }
+}
+
 const PROCESS_LIST_READS = [
   { sql: "SHOW PROCESSLIST", complete: true },
   { sql: "SHOW FULL PROCESSLIST", complete: true },
@@ -770,7 +929,8 @@ const progress = setInterval(() => {
   const k = stats.kills;
   console.error(
     `[${Math.round((Date.now() - started) / 1000)}s] cycles=${stats.cycles} killedCycles=${stats.killedCycles} statements=${stats.statements} abandoned=${stats.abandoned} ` +
-      `kills=${k.query}q/${k.connection}c/${k.pgCancel}pc/${k.pgTerminate}pt/${k.cancelRequest}cr readerQueries=${stats.readerQueries} pgQueries=${stats.pgQueries} errors=${errors}`,
+      `kills=${k.query}q/${k.connection}c/${k.pgCancel}pc/${k.pgTerminate}pt/${k.cancelRequest}cr readerQueries=${stats.readerQueries} pgQueries=${stats.pgQueries} ` +
+      `viewDdl=${stats.viewDdl} viewReads=${stats.viewReads} errors=${errors}`,
   );
 }, 30_000);
 const count = (value: string | undefined) => Number(value ?? "0");
@@ -779,6 +939,8 @@ await Promise.all([
   ...Array.from({ length: count(args.readers) }, (_, i) => reader(i)),
   ...Array.from({ length: count(args.killers) }, (_, i) => killer(i)),
   ...Array.from({ length: pgClientCount }, (_, i) => pgClient(i)),
+  ...Array.from({ length: viewChurnerCount }, (_, i) => viewChurner(i)),
+  ...Array.from({ length: viewReaderCount }, (_, i) => viewReader(i)),
 ]);
 clearInterval(progress);
 
@@ -788,6 +950,8 @@ const summary = {
   readers: count(args.readers),
   killers: count(args.killers),
   pgClients: pgClientCount,
+  viewChurners: viewChurnerCount,
+  viewReaders: viewReaderCount,
   cycles: stats.cycles,
   killedCycles: stats.killedCycles,
   statements: stats.statements,
@@ -800,6 +964,9 @@ const summary = {
   expectedReaderErrors: stats.expectedReaderErrors,
   pgQueries: stats.pgQueries,
   pgAbandoned: stats.pgAbandoned,
+  viewDdl: stats.viewDdl,
+  viewReads: stats.viewReads,
+  expectedViewErrors: stats.expectedViewErrors,
   tornReads: stats.tornReads.length,
   tornReadSamples: stats.tornReads.slice(0, 5),
   refusedConnects: stats.refusedConnects,
