@@ -151,7 +151,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             for (j.on, 0..) |kp, i| {
                 if (i > 0) try out.appendSlice(allocator, ", ");
                 try out.appendSlice(allocator, kp.left);
-                try out.append(allocator, '=');
+                try out.appendSlice(allocator, if (kp.null_safe) "<=>" else "=");
                 try out.appendSlice(allocator, kp.right);
             }
             try out.append(allocator, ']');

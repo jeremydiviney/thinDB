@@ -4907,14 +4907,9 @@ pub const Parser = struct {
                 continue;
             };
             const right_name = try self.materializeJoinOperand(.{ .col_ref = key.right }, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            try pairs.append(self.arena, .{ .left = try self.arena.dupe(u8, key.left), .right = right_name });
+            try pairs.append(self.arena, .{ .left = try self.arena.dupe(u8, key.left), .right = right_name, .null_safe = key.null_safe });
         }
-        if (pairs.items.len == 0) {
-            const one = ir.Expr{ .lit = .{ .int = 1 } };
-            const left_name = try self.materializeJoinOperand(one, .left, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            const right_name = try self.materializeJoinOperand(one, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
-        }
+        if (pairs.items.len == 0) try self.appendConstantJoinPair(&pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = &.{},
@@ -4928,20 +4923,44 @@ pub const Parser = struct {
         };
     }
 
-    const ResidualKey = struct { left: []const u8, right: []const u8 };
+    const ResidualKey = struct { left: []const u8, right: []const u8, null_safe: bool };
 
     /// The left and right columns a conjunct equates, when it is a column
     /// equality across the two inputs.
     fn residualKeyColumns(self: *Parser, c: PredicateExpr, scope: *JoinScope, derived: []const ir.Derived) ParseError!?ResidualKey {
-        if (c != .leaf_col_col or c.leaf_col_col.op != .eq) return null;
-        const a = c.leaf_col_col.left;
-        const b = c.leaf_col_col.right;
-        if (derivedNamed(derived, a) or derivedNamed(derived, b)) return null;
-        const a_side = try self.residualColumnSide(a, scope) orelse return null;
-        const b_side = try self.residualColumnSide(b, scope) orelse return null;
-        if (a_side == .left and b_side == .right) return .{ .left = a, .right = b };
-        if (a_side == .right and b_side == .left) return .{ .left = b, .right = a };
+        const eq = equatedColumns(c) orelse return null;
+        if (derivedNamed(derived, eq.a) or derivedNamed(derived, eq.b)) return null;
+        const a_side = try self.residualColumnSide(eq.a, scope) orelse return null;
+        const b_side = try self.residualColumnSide(eq.b, scope) orelse return null;
+        if (a_side == .left and b_side == .right) return .{ .left = eq.a, .right = eq.b, .null_safe = eq.null_safe };
+        if (a_side == .right and b_side == .left) return .{ .left = eq.b, .right = eq.a, .null_safe = eq.null_safe };
         return null;
+    }
+
+    const EquatedColumns = struct { a: []const u8, b: []const u8, null_safe: bool };
+
+    /// The columns `a = b` equates, or `a <=> b` as `nullSafeEqual` lowers
+    /// it: `(a IS NULL AND b IS NULL) OR (a IS NOT NULL AND b IS NOT NULL
+    /// AND a = b)`.
+    fn equatedColumns(c: PredicateExpr) ?EquatedColumns {
+        switch (c) {
+            .leaf_col_col => |cc| return if (cc.op == .eq) .{ .a = cc.left, .b = cc.right, .null_safe = false } else null,
+            .@"or" => |kids| {
+                if (kids.len != 2 or kids[0] != .@"and" or kids[1] != .@"and") return null;
+                const both_null = kids[0].@"and";
+                const equal = kids[1].@"and";
+                if (both_null.len != 2 or equal.len != 3 or equal[2] != .leaf_col_col) return null;
+                const cc = equal[2].leaf_col_col;
+                if (cc.op != .eq) return null;
+                if (both_null[0] != .is_null or both_null[1] != .is_null) return null;
+                if (equal[0] != .is_not_null or equal[1] != .is_not_null) return null;
+                const names = [_][]const u8{ both_null[0].is_null, both_null[1].is_null, equal[0].is_not_null, equal[1].is_not_null };
+                const expected = [_][]const u8{ cc.left, cc.right, cc.left, cc.right };
+                for (names, expected) |n, e| if (!std.mem.eql(u8, n, e)) return null;
+                return .{ .a = cc.left, .b = cc.right, .null_safe = true };
+            },
+            else => return null,
+        }
     }
 
     fn derivedNamed(derived: []const ir.Derived, name: []const u8) bool {
@@ -5030,15 +5049,29 @@ pub const Parser = struct {
                     negated = true;
                     try self.advance();
                 }
-                if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                if (self.cur.tag == .kw_distinct) {
+                    // `IS DISTINCT FROM` holds for a NULL against a value, which no
+                    // key match does: the general form reads it.
+                    if (!negated) return ParseError.SqlOnNonEquiUnsupported;
+                    try self.advance();
+                    try self.expect(.kw_from);
+                    const rhs = try self.parseCallArg();
+                    try self.addJoinNullSafeKey(lhs, rhs, scope, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
+                } else {
+                    if (self.cur.tag != .kw_null) return ParseError.SqlExpectedNull;
+                    try self.advance();
+                    try self.addJoinNullCondition(
+                        lhs,
+                        negated,
+                        scope,
+                        &left_filters,
+                        &right_filters,
+                    );
+                }
+            } else if (self.cur.tag == .null_safe_eq) {
                 try self.advance();
-                try self.addJoinNullCondition(
-                    lhs,
-                    negated,
-                    scope,
-                    &left_filters,
-                    &right_filters,
-                );
+                const rhs = try self.parseCallArg();
+                try self.addJoinNullSafeKey(lhs, rhs, scope, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
             } else if (self.cur.tag == .kw_between) {
                 try self.advance();
                 const lower = try self.parseCallArg();
@@ -5103,16 +5136,13 @@ pub const Parser = struct {
             // to an equi join on a synthesized constant key so every row pairs
             // with every filtered row and outer-join NULL padding works as-is.
             if (left_filters.items.len == 0 and right_filters.items.len == 0) return ParseError.SqlOnNonEquiUnsupported;
-            const one = ir.Expr{ .lit = .{ .int = 1 } };
-            const left_name = try self.materializeJoinOperand(one, .left, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            const right_name = try self.materializeJoinOperand(one, .right, &left_derived, &right_derived, &hidden_left, &synth_counter);
-            try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
+            try self.appendConstantJoinPair(&pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
         }
         self.dropRedundantOuterJoinNotNullFilters(jtype, &left_filters, &right_filters, pairs.items, ranges.items);
         const preserved_left = jtype == .left or jtype == .full;
         const preserved_right = jtype == .right or jtype == .full;
-        if (preserved_left) try self.foldPreservedSideConditions(.left, &left_filters, &pairs.items[0], &left_derived, &right_derived, &hidden_left, &synth_counter);
-        if (preserved_right) try self.foldPreservedSideConditions(.right, &right_filters, &pairs.items[0], &left_derived, &right_derived, &hidden_left, &synth_counter);
+        if (preserved_left) try self.foldPreservedSideConditions(.left, &left_filters, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
+        if (preserved_right) try self.foldPreservedSideConditions(.right, &right_filters, &pairs, &left_derived, &right_derived, &hidden_left, &synth_counter);
         return .{
             .on = try pairs.toOwnedSlice(self.arena),
             .ranges = try ranges.toOwnedSlice(self.arena),
@@ -5128,12 +5158,14 @@ pub const Parser = struct {
     /// that side's rows match, not which survive: a row failing it still
     /// comes out, null-extended. So rather than filter the input, the
     /// conditions fold into the side's first key as `CASE WHEN <conditions>
-    /// THEN key END`, and a failing row's NULL key matches nothing.
+    /// THEN key END`, and a failing row's NULL key matches nothing. A
+    /// null-safe key would match that NULL, so the first plain key takes
+    /// them, or a constant key pair when every key is null-safe.
     fn foldPreservedSideConditions(
         self: *Parser,
         side: JoinExprSide,
         filters: *std.ArrayList(PredicateExpr),
-        pair: *ir.JoinKeyPair,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
         left_derived: *std.ArrayList(ir.Derived),
         right_derived: *std.ArrayList(ir.Derived),
         hidden_left: *std.ArrayList([]const u8),
@@ -5141,6 +5173,13 @@ pub const Parser = struct {
     ) ParseError!void {
         const cond = try self.joinFilterFromParts(filters) orelse return;
         filters.clearRetainingCapacity();
+        const index = for (pairs.items, 0..) |p, i| {
+            if (!p.null_safe) break i;
+        } else blk: {
+            try self.appendConstantJoinPair(pairs, left_derived, right_derived, hidden_left, synth_counter);
+            break :blk pairs.items.len - 1;
+        };
+        const pair = &pairs.items[index];
         const key = if (side == .left) &pair.left else &pair.right;
         const derived = if (side == .left) left_derived else right_derived;
         const branches = try self.arena.alloc(ir.Expr.Branch, 1);
@@ -5202,6 +5241,7 @@ pub const Parser = struct {
         col: []const u8,
     ) bool {
         for (pairs) |pair| {
+            if (pair.null_safe) continue;
             const key = if (left_side) pair.left else pair.right;
             if (types.columnNameEql(key, col)) return true;
         }
@@ -5289,11 +5329,46 @@ pub const Parser = struct {
             .lte => .lte,
             .gt => .gt,
             .gte => .gte,
-            // `<=>` matches NULL keys, which a hash join key never does: it
-            // takes the general residual form.
-            .neq, .null_safe_eq => ParseError.SqlOnNonEquiUnsupported,
+            .neq => ParseError.SqlOnNonEquiUnsupported,
             else => ParseError.SqlExpectedToken,
         };
+    }
+
+    /// `a <=> b` across the two inputs keys the join as a null-safe pair.
+    /// Any other `<=>` is a one-input test the general form reads.
+    fn addJoinNullSafeKey(
+        self: *Parser,
+        lhs: ir.Expr,
+        rhs: ir.Expr,
+        scope: *JoinScope,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        const lhs_side = try self.joinExprSide(lhs, scope);
+        const rhs_side = try self.joinExprSide(rhs, scope);
+        if (lhs_side == .mixed or rhs_side == .mixed) return ParseError.SqlOnRefsUnknownTable;
+        const left_first = lhs_side == .left and rhs_side == .right;
+        if (!left_first and !(lhs_side == .right and rhs_side == .left)) return ParseError.SqlOnNonEquiUnsupported;
+        const left_name = try self.materializeJoinOperand(if (left_first) lhs else rhs, .left, left_derived, right_derived, hidden_left, synth_counter);
+        const right_name = try self.materializeJoinOperand(if (left_first) rhs else lhs, .right, left_derived, right_derived, hidden_left, synth_counter);
+        try pairs.append(self.arena, .{ .left = left_name, .right = right_name, .null_safe = true });
+    }
+
+    fn appendConstantJoinPair(
+        self: *Parser,
+        pairs: *std.ArrayList(ir.JoinKeyPair),
+        left_derived: *std.ArrayList(ir.Derived),
+        right_derived: *std.ArrayList(ir.Derived),
+        hidden_left: *std.ArrayList([]const u8),
+        synth_counter: *usize,
+    ) ParseError!void {
+        const one = ir.Expr{ .lit = .{ .int = 1 } };
+        const left_name = try self.materializeJoinOperand(one, .left, left_derived, right_derived, hidden_left, synth_counter);
+        const right_name = try self.materializeJoinOperand(one, .right, left_derived, right_derived, hidden_left, synth_counter);
+        try pairs.append(self.arena, .{ .left = left_name, .right = right_name });
     }
 
     fn addJoinBetweenCondition(

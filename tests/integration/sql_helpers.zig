@@ -127,6 +127,29 @@ pub fn runSqlCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !Ru
     };
 }
 
+/// `runSqlCtx` in the MySQL dialect: parsed and compiled as a MySQL wire
+/// connection runs a statement. Single-statement only.
+pub fn runSqlMysqlCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const cat = db.catalog.?;
+    const tables: thindb.net.SessionTables = .{ .catalog = cat, .session = .{ .current_db = db.name } };
+    const root = try thindb.sql.parseWithContext(
+        arena.allocator(),
+        sql,
+        .mysql,
+        &cat.udfs,
+        .{ .registry = &cat.sql_fns, .db = db.name, .views = &cat.views, .tables = tables.columns() },
+    );
+    const cq = try thindb.net.compileWithSession(allocator, db, .{ .dialect = .mysql }, root);
+    return .{
+        .arena = arena,
+        .cq = cq,
+        .owned_vars = cq.sessionValue().vars,
+        .backing_allocator = allocator,
+    };
+}
+
 pub fn execCtx(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
     var q = try runSqlCtx(allocator, db, sql);
     defer q.deinit();
