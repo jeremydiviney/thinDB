@@ -364,8 +364,8 @@ test "a hex literal leads IN and BETWEEN, sums, stays unsigned and stores by its
     try expectRows(allocator, db, "SELECT b FROM hx ORDER BY id", &.{ "9223372036854775807", "2", "255" });
     try expectRows(allocator, db, "SELECT CAST(m AS CHAR) FROM hx ORDER BY id", &.{ "65.00", "1.50", "66.00" });
     try expectRows(allocator, db, "SELECT d FROM hx ORDER BY id", &.{ "65", "2.5", "66" });
-    try exec(allocator, db, "UPDATE hx SET m = 0x43, d = 0x43 WHERE id = 2");
-    try expectRows(allocator, db, "SELECT CAST(m AS CHAR) FROM hx WHERE id = 2", &.{"67.00"});
+    try exec(allocator, db, "UPDATE hx SET b = 0x43, d = 0x43 WHERE id = 2");
+    try expectRows(allocator, db, "SELECT b FROM hx WHERE id = 2", &.{"67"});
     try expectRows(allocator, db, "SELECT d FROM hx WHERE id = 2", &.{"67"});
 
     const filters = .{
