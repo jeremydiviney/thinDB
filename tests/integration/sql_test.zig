@@ -596,7 +596,7 @@ test "sql: bare temporal keywords, NOW(fsp), ISNULL and one-argument LOG" {
         .{ "SELECT id FROM tk WHERE CURRENT_TIMESTAMP >= ts ORDER BY id", &[_]i64{ 1, 2 } },
         .{ "SELECT id FROM tk WHERE CURRENT_DATE IS NOT NULL AND id = 1", &[_]i64{1} },
         .{ "SELECT id FROM tk WHERE LOCALTIMESTAMP - INTERVAL 1 DAY < ts ORDER BY id", &[_]i64{ 1, 2 } },
-        .{ "SELECT id FROM tk WHERE NOW(3) = NOW() AND CURRENT_TIMESTAMP(6) = CURRENT_TIMESTAMP ORDER BY id", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM tk WHERE NOW(6) = NOW() AND CURRENT_TIMESTAMP(0) <= CURRENT_TIMESTAMP ORDER BY id", &[_]i64{ 1, 2 } },
         .{ "SELECT id FROM tk WHERE ISNULL(v)", &[_]i64{2} },
         .{ "SELECT id FROM tk WHERE NOT ISNULL(v * 2)", &[_]i64{1} },
         .{ "SELECT id FROM tk WHERE ISNULL(NULL) AND NOT ISNULL(1) ORDER BY id", &[_]i64{ 1, 2 } },

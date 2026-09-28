@@ -44,6 +44,7 @@ const api = @import("api.zig");
 const Table = api.Table;
 const DmlFilter = @import("delete.zig").DmlFilter;
 const SegmentPrune = @import("delete.zig").SegmentPrune;
+const LiveSegment = @import("delete.zig").LiveSegment;
 const upsert = @import("upsert.zig");
 
 const ir = @import("../ir/ir.zig");
@@ -215,10 +216,9 @@ fn processOneSegment(
     wal_target: *?u64,
 ) !usize {
     const allocator = t.allocator;
-    var name_buf: [32]u8 = undefined;
-    const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
-    var seg = try storage.readSegment(allocator, t.io, t.segments_dir, file_name, t.schema);
-    defer seg.deinit();
+    var live = try LiveSegment.open(t, entry.segment_id);
+    defer live.close(t);
+    const seg = live.segment();
 
     var offsets: std.ArrayList(u32) = .empty;
     defer offsets.deinit(allocator);
@@ -261,7 +261,7 @@ fn processOneSegment(
             @memset(mask, true);
         }
 
-        const matched_in_rg = std.mem.countScalar(bool, mask, true);
+        const matched_in_rg = live.keepLive(row_offset, mask);
 
         if (matched_in_rg > 0) {
             for (owned_cols, views, 0..) |*oc, *v, ci| {
@@ -367,19 +367,24 @@ pub fn computeNewRows(
     // Compute's `Derived` list uses synthetic names so its outputs
     // don't collide with the upstream cols of the same name.
     const synth_names = try allocator.alloc([]u8, assignments.len);
+    var synth_made: usize = 0;
     defer {
-        for (synth_names) |s| allocator.free(s);
+        for (synth_names[0..synth_made]) |s| allocator.free(s);
         allocator.free(synth_names);
     }
     const derived = try allocator.alloc(exec.Derived, assignments.len);
     defer allocator.free(derived);
     for (assignments, 0..) |asn, i| {
         synth_names[i] = try std.fmt.allocPrint(allocator, "__upd_{d}__{s}", .{ i, asn.col });
+        synth_made += 1;
         derived[i] = .{ .name = synth_names[i], .expr = asn.value };
     }
 
     var src_q = try @import("../exec/single_batch.zig").SingleBatchSource.create(allocator, filtered_batch);
-    var compute_q = try src_q.compute(derived);
+    var compute_q = src_q.compute(derived) catch |err| {
+        src_q.deinit();
+        return err;
+    };
     defer compute_q.deinit();
 
     // Drain Compute (just one batch out, since input is one batch).

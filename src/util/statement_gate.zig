@@ -14,9 +14,14 @@ pub const StatementGate = struct {
     closing: bool = false,
     closing_owner: std.Thread.Id = undefined,
     allocator_owners: usize = 0,
-    allocator_idle: Io.Condition = .init,
+    /// Bumped by each release once closing starts, so the closer's timed
+    /// wait wakes as soon as a lease goes.
+    close_releases: std.atomic.Value(u32) = .init(0),
 
     const Owner = struct { exclusive: bool, references: usize };
+
+    const CLOSE_FIRST_LOG_SECS = 5;
+    const CLOSE_LOG_INTERVAL_SECS = 10;
 
     pub const Lease = struct {
         gate: *StatementGate,
@@ -31,10 +36,12 @@ pub const StatementGate = struct {
             const done = entry.references == 0;
             const exclusive = entry.exclusive;
             if (done) _ = gate.owners.remove(self.owner);
+            const wake_closer = done and gate.noteCloseReleaseLocked();
             gate.owners_mutex.unlock(gate.io);
             if (done) {
                 if (exclusive) gate.lock.unlock(gate.io) else gate.lock.unlockShared(gate.io);
             }
+            if (wake_closer) gate.wakeCloser();
         }
     };
 
@@ -45,8 +52,9 @@ pub const StatementGate = struct {
             self.gate.owners_mutex.lockUncancelable(self.gate.io);
             std.debug.assert(self.gate.allocator_owners > 0);
             self.gate.allocator_owners -= 1;
-            if (self.gate.allocator_owners == 0) self.gate.allocator_idle.broadcast(self.gate.io);
+            const wake_closer = self.gate.noteCloseReleaseLocked();
             self.gate.owners_mutex.unlock(self.gate.io);
+            if (wake_closer) self.gate.wakeCloser();
         }
     };
 
@@ -74,11 +82,75 @@ pub const StatementGate = struct {
         self.closing = true;
         self.closing_owner = std.Thread.getCurrentId();
         self.owners_mutex.unlock(self.io);
+        // Every lock holder past this point is a leased statement or an
+        // acquire about to fail with DatabaseClosed, so waiting for the
+        // leases first lets the wait log who holds them.
+        self.awaitClosePending(.statements);
         self.lock.lockUncancelable(self.io);
         self.lock.unlock(self.io);
-        self.owners_mutex.lockUncancelable(self.io);
-        defer self.owners_mutex.unlock(self.io);
-        while (self.allocator_owners != 0) self.allocator_idle.waitUncancelable(self.io, &self.owners_mutex);
+        self.awaitClosePending(.lifetimes);
+    }
+
+    const ClosePending = enum { statements, lifetimes };
+
+    /// Waits, with no deadline, until nothing of `pending` is held. Once the
+    /// wait passes a few seconds it logs what is still held, and keeps
+    /// logging periodically, so a close stuck on a leaked lease says so.
+    fn awaitClosePending(self: *StatementGate, pending: ClosePending) void {
+        const io = self.io;
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        const start = Io.Clock.Timestamp.now(io, .awake);
+        var log_at_secs: i64 = CLOSE_FIRST_LOG_SECS;
+        self.owners_mutex.lockUncancelable(io);
+        defer self.owners_mutex.unlock(io);
+        while (self.closePendingCountLocked(pending) != 0) {
+            const log_at = start.addDuration(.{ .raw = .fromSeconds(log_at_secs), .clock = .awake });
+            if (Io.Clock.Timestamp.now(io, .awake).compare(.gte, log_at)) {
+                self.logClosePendingLocked(pending, log_at_secs);
+                log_at_secs += CLOSE_LOG_INTERVAL_SECS;
+                continue;
+            }
+            // Read under the mutex: a release after this bumps the word, so
+            // the futex wait returns at once instead of missing it.
+            const seen = self.close_releases.load(.acquire);
+            self.owners_mutex.unlock(io);
+            io.futexWaitTimeout(u32, &self.close_releases.raw, seen, .{ .deadline = log_at }) catch |err| switch (err) {
+                error.Canceled => unreachable,
+            };
+            self.owners_mutex.lockUncancelable(io);
+        }
+    }
+
+    fn closePendingCountLocked(self: *const StatementGate, pending: ClosePending) usize {
+        return switch (pending) {
+            .statements => self.owners.count(),
+            .lifetimes => self.allocator_owners,
+        };
+    }
+
+    fn logClosePendingLocked(self: *const StatementGate, pending: ClosePending, waited_secs: i64) void {
+        switch (pending) {
+            .statements => {
+                std.log.warn("database close has waited {d}s for {d} statement lease(s)", .{ waited_secs, self.owners.count() });
+                var it = self.owners.iterator();
+                while (it.next()) |entry| {
+                    const mode = if (entry.value_ptr.exclusive) "exclusive" else "shared";
+                    std.log.warn("  thread {d}: {s} lease, {d} reference(s)", .{ entry.key_ptr.*, mode, entry.value_ptr.references });
+                }
+            },
+            .lifetimes => std.log.warn("database close has waited {d}s for {d} query memory or background sweep lease(s)", .{ waited_secs, self.allocator_owners }),
+        }
+    }
+
+    fn noteCloseReleaseLocked(self: *StatementGate) bool {
+        if (!self.closing) return false;
+        _ = self.close_releases.fetchAdd(1, .release);
+        return true;
+    }
+
+    fn wakeCloser(self: *StatementGate) void {
+        self.io.futexWake(u32, &self.close_releases.raw, std.math.maxInt(u32));
     }
 
     pub fn acquire(self: *StatementGate, exclusive: bool) !Lease {
@@ -155,4 +227,38 @@ test "statement gate waits for allocator cleanup without blocking later statemen
     }
     try std.testing.expect(!closer.done.load(.acquire));
     try std.testing.expectError(error.DatabaseClosed, gate.acquire(false));
+}
+
+test "statement gate close waits for a held statement lease" {
+    var gate = StatementGate.init(std.testing.allocator, std.testing.io);
+    defer gate.deinit();
+    const reader = try gate.acquire(false);
+    const Closer = struct {
+        gate: *StatementGate,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.gate.beginClose();
+            self.done.store(true, .release);
+        }
+    };
+    var closer = Closer{ .gate = &gate };
+    const thread = std.Thread.spawn(.{}, Closer.run, .{&closer}) catch |err| {
+        reader.release();
+        return err;
+    };
+    {
+        defer thread.join();
+        defer reader.release();
+        while (true) {
+            gate.owners_mutex.lockUncancelable(gate.io);
+            const closing = gate.closing;
+            gate.owners_mutex.unlock(gate.io);
+            if (closing) break;
+            std.atomic.spinLoopHint();
+        }
+        const nested = try gate.acquire(false);
+        nested.release();
+        try std.testing.expect(!closer.done.load(.acquire));
+    }
+    try std.testing.expect(closer.done.load(.acquire));
 }

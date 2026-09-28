@@ -1476,12 +1476,10 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 }
             }
             if (tvf_ordered or any_borrow) eff_input.force_ordered = true;
-            var ups: std.ArrayList(exec.Query) = .empty;
+            var ups: std.ArrayList(exec.Query) = try .initCapacity(input.allocator, t.inputs.len);
             defer ups.deinit(input.allocator);
             errdefer for (ups.items) |*u| u.deinit();
-            for (t.inputs) |inp| {
-                try ups.append(input.allocator, try compileBlock(eff_input, inp, map));
-            }
+            for (t.inputs) |inp| ups.appendAssumeCapacity(try compileBlock(eff_input, inp, map));
             // A ride that crossed LEFT joins holds only if the compiled
             // operators kept the probe-order pin; sort on any doubt.
             if (tvf_ordered and tvf_n_crossed > 0 and
@@ -1493,7 +1491,9 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             {
                 tvf_ordered = false;
             }
-            const q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
+            var q = try exec.table_fn.TableFnExec.create(input.allocator, ups.items, entry, t.args, t.partition_by, t.order_by, input.effectiveDop());
+            ups.clearRetainingCapacity();
+            errdefer q.deinit();
             if (exec.queryAs(exec.table_fn.TableFnExec, q)) |tf| {
                 tf.input_ordered = tvf_ordered;
                 if (n_tin == 1) {
@@ -1516,10 +1516,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     std.debug.print("[tvf] compile {s}: advertises output order\n", .{t.name});
                 }
             }
-            if (t.alias) |a| {
-                errdefer @constCast(&q).deinit();
-                return exec.AliasRename.create(input.allocator, q, a);
-            }
+            if (t.alias) |a| return exec.AliasRename.create(input.allocator, q, a);
             return q;
         },
         .alias => |a| {
@@ -1646,10 +1643,11 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             errdefer up.deinit();
             const t_op = exec.prof.nowTicks();
             defer exec.prof.addPhase("compile.op.group_by", @intCast(exec.prof.nowTicks() - t_op));
+            const aggs = try engine_v2.temporalAggNumbers(input, &up, g.aggs);
             // Probe-fused join below: aggregate the joined batches inside
             // the scan workers (partial per chunk, serial combine here)
             // instead of hashing the full join output on this thread.
-            if (try group_route.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, g.aggs, g.top_k, g.emit_limit)) |q| return q;
+            if (try group_route.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, aggs, g.top_k, g.emit_limit)) |q| return q;
             // When the input reads materialized stages, defer the hash-vs-sort
             // decision to runtime: priming those stages yields exact realized
             // row counts, which beat compile-time estimates down a deep CTE
@@ -1669,7 +1667,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     up,
                     owned,
                     g.group_cols,
-                    g.aggs,
+                    aggs,
                     g.top_k,
                     g.emit_limit,
                     input.db.config.query_memory_budget,
@@ -1678,7 +1676,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             }
             if (getenv("THINDB_TRACE_GBROUTE") != null) {
                 std.debug.print("[gbroute-compile] no stages beneath group_by: keys={d} aggs=", .{g.group_cols.len});
-                for (g.aggs) |a| std.debug.print("{s},", .{@tagName(a.func)});
+                for (aggs) |a| std.debug.print("{s},", .{@tagName(a.func)});
                 std.debug.print(" upper_rows={d}\n", .{up.stats().upper_rows});
             }
             return group_route.routeGroupByDop(
@@ -1686,7 +1684,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 try exec.memory.trackedBackend(input.db.allocator, input.accountant),
                 &up,
                 g.group_cols,
-                g.aggs,
+                aggs,
                 g.top_k,
                 g.emit_limit,
                 input.db.config.query_memory_budget,

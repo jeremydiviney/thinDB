@@ -79,7 +79,9 @@ pub fn cpuLayout(allocator: Allocator) !CpuLayout {
     const n = len / @sizeOf(LogicalProcInfo);
 
     var primaries: std.ArrayListUnmanaged(usize) = .empty;
+    errdefer primaries.deinit(allocator);
     var siblings: std.ArrayListUnmanaged(usize) = .empty;
+    defer siblings.deinit(allocator);
     for (buf[0..n]) |info| {
         if (info.relationship != RelationProcessorCore) continue;
         var mask = info.processor_mask;
@@ -97,7 +99,6 @@ pub fn cpuLayout(allocator: Allocator) !CpuLayout {
     }
     const physical_count = primaries.items.len;
     try primaries.appendSlice(allocator, siblings.items);
-    siblings.deinit(allocator);
     return .{
         .order = try primaries.toOwnedSlice(allocator),
         .physical_count = physical_count,

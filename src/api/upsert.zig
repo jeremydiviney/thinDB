@@ -49,39 +49,61 @@ pub fn serializeKeyBloom(allocator: Allocator, hashes: []const u64) ![]u8 {
     return out;
 }
 
-/// After `insertRows`, every newly-inserted row whose order key already
-/// exists somewhere in the table (older memtable row, or a flushed segment)
-/// causes the older copy to be tombstoned. Always keeps the LAST occurrence
-/// in the memtable.
-/// Drop the persistent index (memtable swapped/emptied). Keeps map + arena
-/// capacity for reuse; the next resolution rebuilds from row 0.
-fn upsertIndexReset(t: *Table) void {
+/// Drop the persistent index (memtable swapped or emptied, or rows it
+/// indexed taken back out). Keeps map + arena capacity for reuse; the next
+/// resolution rebuilds from row 0.
+pub fn resetIndex(t: *Table) void {
     t.upsert_idx.clearRetainingCapacity();
     if (t.upsert_idx_arena) |*a| _ = a.reset(.retain_capacity);
     t.upsert_idx_gen = null;
     t.upsert_idx_rows = 0;
 }
 
-pub fn applyUpsertResolution(t: *Table) !void {
-    std.debug.assert(t.order_key_indices.len > 0);
+/// What upsert resolution changes for the memtable rows it hasn't seen yet.
+/// Working it out changes nothing but the key index, so a writer can still
+/// take the rows back out (and `resetIndex`) until it logs them.
+pub const Resolution = struct {
+    /// The memtable without the older rows the new ones replace.
+    deduped: ?*engine.Memtable = null,
+    /// Tombstone files with the segment rows the new ones replace added.
+    tombstone_files: std.ArrayList(TombstoneFile) = .empty,
 
-    const n: usize = @intCast(t.memtable.row_count);
+    pub fn deinit(self: *Resolution, allocator: Allocator) void {
+        if (self.deduped) |mt| mt.release();
+        for (self.tombstone_files.items) |f| allocator.free(f.bytes);
+        self.tombstone_files.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const TombstoneFile = struct { segment_id: u64, bytes: []u8 };
+
+/// Last writer wins: each of `mt`'s unseen rows replaces the older row with
+/// its order key, in the memtable or in a flushed segment. `gen` is the
+/// memtable generation `mt` has, or gets once installed.
+pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64) !Resolution {
+    std.debug.assert(t.order_key_indices.len > 0);
+    var resolution: Resolution = .{};
+    errdefer resolution.deinit(t.allocator);
+    errdefer resetIndex(t);
+
+    const n: usize = @intCast(mt.row_count);
     if (n == 0) {
-        upsertIndexReset(t);
-        return;
+        resetIndex(t);
+        return resolution;
     }
 
-    // Bind the persistent key index to the current memtable generation
-    // counter. ANY swap (flush / delete / update / dedup-clone) bumps the
-    // counter via installMemtableLocked → rebuild from row 0; otherwise
-    // process only the rows added since last time. NOT a pointer compare —
-    // a freed memtable's address can be reused by a later clone (ABA),
-    // silently revalidating a stale index whose row mappings then
-    // tombstone unrelated rows.
-    const same_gen = if (t.upsert_idx_gen) |g| g == t.memtable_gen else false;
+    // Bind the persistent key index to the memtable generation. ANY swap
+    // (flush / delete / update / dedup-clone) bumps the generation via
+    // installMemtableLocked → rebuild from row 0; otherwise process only
+    // the rows added since last time. NOT a pointer compare — a freed
+    // memtable's address can be reused by a later clone (ABA), silently
+    // revalidating a stale index whose row mappings then tombstone
+    // unrelated rows.
+    const same_gen = if (t.upsert_idx_gen) |g| g == gen else false;
     if (!same_gen or t.upsert_idx_rows > n) {
-        upsertIndexReset(t);
-        t.upsert_idx_gen = t.memtable_gen;
+        resetIndex(t);
+        t.upsert_idx_gen = gen;
     }
     if (t.upsert_idx_arena == null) t.upsert_idx_arena = std.heap.ArenaAllocator.init(t.allocator);
     const idx_aa = t.upsert_idx_arena.?.allocator();
@@ -93,21 +115,20 @@ pub fn applyUpsertResolution(t: *Table) !void {
     const aa = arena.allocator();
 
     // ---- 1. Incremental intra-memtable dedup: only the NEW rows. Look each
-    // new row's key up in the persistent index; a hit tombstones the older
+    // new row's key up in the persistent index; a hit drops the older
     // memtable row (last writer wins) and a miss is a key we must also probe
     // against segments (below).
     var dropped: std.ArrayList(u32) = .empty;
     defer dropped.deinit(t.allocator);
     var new_keys: std.ArrayList([]const u8) = .empty; // arena-owned; survive an index reset
     // First order-key column value per NEW key, for row-group zonemap
-    // pruning during the segment probe (#138). String bytes are duped into
-    // the arena — the memtable may be swapped before the probe runs.
+    // pruning during the segment probe (#138).
     var new_first_vals: std.ArrayList(types.Value) = .empty;
     var prune_ok = true;
 
-    const first_key_view = t.memtable.columns[t.order_key_indices[0]].view();
+    const first_key_view = mt.columns[t.order_key_indices[0]].view();
     for (start..n) |i| {
-        const key_bytes = try compoundKeyFromColumnStores(idx_aa, t.memtable.columns, t.order_key_indices, @intCast(i));
+        const key_bytes = try compoundKeyFromColumnStores(idx_aa, mt.columns, t.order_key_indices, @intCast(i));
         const gop = try t.upsert_idx.getOrPut(t.allocator, key_bytes);
         if (gop.found_existing) {
             try dropped.append(t.allocator, gop.value_ptr.*);
@@ -123,25 +144,21 @@ pub fn applyUpsertResolution(t: *Table) !void {
     }
     t.upsert_idx_rows = @intCast(n);
 
-    // Snapshot-isolated retire-replace for the tombstoned older rows. Scans
-    // that pinned the pre-resolution memtable keep seeing them; new scans see
-    // the deduped state. The swap changes row indices, so drop the index (the
-    // next batch rebuilds against the cloned memtable).
+    // Snapshot-isolated retire-replace for the dropped older rows, on
+    // commit: scans that pinned the pre-resolution memtable keep seeing
+    // them; new scans see the deduped state.
     if (dropped.items.len > 0) {
         const keep = try t.allocator.alloc(bool, n);
         defer t.allocator.free(keep);
         @memset(keep, true);
         for (dropped.items) |d| keep[d] = false;
-        if (try t.memtable.cloneWithRetainedRows(t.allocator, keep)) |new_mt| {
-            t.installMemtableLocked(new_mt);
-            upsertIndexReset(t);
-        }
+        resolution.deduped = try mt.cloneWithRetainedRows(t.allocator, keep);
     }
 
     // ---- 2. Probe segments only for keys NEW to the memtable this batch. A
     // key needs a segment tombstone check exactly once — when it first enters
     // the memtable; a re-insert already tombstoned its segment match.
-    if (new_keys.items.len == 0 or t.manifest.segments.items.len == 0) return;
+    if (new_keys.items.len == 0 or t.manifest.segments.items.len == 0) return resolution;
 
     var surviving_set: std.StringHashMapUnmanaged(void) = .empty;
     try surviving_set.ensureTotalCapacity(aa, @intCast(new_keys.items.len));
@@ -198,13 +215,12 @@ pub fn applyUpsertResolution(t: *Table) !void {
             }
 
             const decoded_keys = try aa.alloc(storage.OwnedColumn, t.order_key_indices.len);
-            for (t.order_key_indices, 0..) |col_idx, i| {
-                decoded_keys[i] = try seg.decodeColumn(t.allocator, t.schema, rg_idx, col_idx);
+            var decoded_count: usize = 0;
+            defer for (decoded_keys[0..decoded_count]) |*c| c.deinit(t.allocator);
+            for (t.order_key_indices, decoded_keys) |col_idx, *c| {
+                c.* = try seg.decodeColumn(t.allocator, t.schema, rg_idx, col_idx);
+                decoded_count += 1;
             }
-            defer for (decoded_keys) |*c| {
-                var d = c.*;
-                d.deinit(t.allocator);
-            };
 
             const rg_n = rg.row_count;
             var row: u32 = 0;
@@ -218,15 +234,31 @@ pub fn applyUpsertResolution(t: *Table) !void {
         }
 
         if (deleted.items.len > 0) {
-            try t.mergeTombstones(
-                t.allocator,
-                entry.segment_id,
-                deleted.items,
-                t.syncEnabled(),
-            );
-            t.seg_handles.invalidateTombstones(t.allocator, entry.segment_id);
+            try resolution.tombstone_files.ensureUnusedCapacity(t.allocator, 1);
+            const bytes = try storage.tombstone.encodeMerged(t.allocator, t.io, t.segments_dir, entry.segment_id, deleted.items);
+            resolution.tombstone_files.appendAssumeCapacity(.{ .segment_id = entry.segment_id, .bytes = bytes });
         }
     }
+    return resolution;
+}
+
+/// Apply `resolution` once the table holds the rows it resolved. Only the
+/// tombstone file writes can fail.
+pub fn commitResolution(t: *Table, resolution: *Resolution) !void {
+    if (resolution.deduped) |mt| {
+        resolution.deduped = null;
+        t.installMemtableLocked(mt);
+        // The swap moved the rows the index points at.
+        resetIndex(t);
+    }
+    for (resolution.tombstone_files.items) |f| try t.writeTombstoneFile(f.segment_id, f.bytes);
+}
+
+/// Resolve the memtable rows no resolution has seen, in one step.
+pub fn applyUpsertResolution(t: *Table) !void {
+    var resolution = try prepareResolution(t, t.memtable, t.memtable_gen);
+    defer resolution.deinit(t.allocator);
+    try commitResolution(t, &resolution);
 }
 
 /// Full-key Bloom candidates for a keyed DELETE/UPDATE (#143). When the
@@ -520,12 +552,9 @@ fn collectStoredRows(
     for (t.manifest.segments.items) |entry| {
         if (found == slot_current.len) break;
         if (!bloomAdmitsAny(entry.key_bloom, hashes.items)) continue;
-        const handle = try t.acquireSegment(entry.segment_id);
-        defer t.releaseSegment(handle);
-        const seg = &handle.seg;
-        const tombs = try t.segmentTombstones(t.allocator, handle);
-        defer if (tombs) |x| t.allocator.free(x);
-        var dead = delete_mod.TombCursor{ .tombs = tombs orelse &.{} };
+        var live = try delete_mod.LiveSegment.open(t, entry.segment_id);
+        defer live.close(t);
+        const seg = live.segment();
 
         var row_offset: u32 = 0;
         for (seg.info.row_groups, 0..) |rg, rg_idx| {
@@ -549,7 +578,7 @@ fn collectStoredRows(
             hit_slots.clearRetainingCapacity();
             for (0..rg.row_count) |r| {
                 const row: u32 = @intCast(r);
-                if (dead.isDead(row_offset + row)) continue;
+                if (!live.isLive(row_offset + row)) continue;
                 const key = try compoundKeyFromOwnedColumns(aa, decoded_keys, row);
                 const slot = slot_of.get(key) orelse continue;
                 if (slot_current[slot] != null) continue;

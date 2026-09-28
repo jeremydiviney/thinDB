@@ -184,6 +184,13 @@ pub const Memtable = struct {
         self.row_count = 0;
     }
 
+    /// Drop the rows from `rows` on, including any part of a failed append.
+    /// Keeps the capacity, so rows a pinned reader sees stay where they are.
+    pub fn truncate(self: *Memtable, rows: usize) void {
+        for (self.columns) |*c| c.truncate(rows);
+        self.row_count = rows;
+    }
+
     /// Replace the memtable's column buffers, keeping only rows where
     /// `keep[i] == true`. Returns the number of rows kept. If all rows are
     /// kept, returns without rebuilding.
@@ -391,6 +398,8 @@ pub const Memtable = struct {
     pub fn insertRows(self: *Memtable, rows: anytype) !void {
         const Rows = @TypeOf(rows);
         const rows_info = @typeInfo(Rows);
+        const before: usize = @intCast(self.row_count);
+        errdefer self.truncate(before);
 
         switch (rows_info) {
             .pointer => |p| switch (p.size) {
@@ -470,10 +479,8 @@ pub const Memtable = struct {
             batch_idx_for_schema[si] = bi;
         }
 
-        // Append each column. v1: no rollback on partial-column-append
-        // failure — the only realistic failure is OOM, which is terminal
-        // in practice. If that limitation matters later, swap in a snapshot/
-        // restore of every column's ArrayList lengths.
+        const before: usize = @intCast(self.row_count);
+        errdefer self.truncate(before);
         for (0..self.schema.columns.len) |si| {
             const view = column_views[batch_idx_for_schema[si]];
             self.appendColumnFromView(si, view, row_count) catch |err| switch (err) {
