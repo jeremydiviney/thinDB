@@ -826,19 +826,63 @@ test "null-safe equality joins NULL keys, inner and outer" {
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
     defer db.close();
-    try exec(allocator, db, "CREATE TABLE ns (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)");
-    try exec(allocator, db, "INSERT INTO ns VALUES (1, 1, 1), (2, 1, 2), (3, NULL, 1), (4, NULL, NULL), (5, 0, NULL)");
+    try exec(allocator, db, "CREATE TABLE ns (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, s VARCHAR(8), d DOUBLE, t VARCHAR(8))");
+    try exec(allocator, db, "INSERT INTO ns VALUES (1, 1, 1, 'p', 1.5, '1'), (2, 1, 2, NULL, NULL, 'x'), (3, NULL, 1, 'p', 1.5, NULL), " ++
+        "(4, NULL, NULL, NULL, NULL, '2'), (5, 0, NULL, 'q', 2.5, NULL)");
+    try exec(allocator, db, "CREATE TABLE nn (id BIGINT PRIMARY KEY, k BIGINT)");
+    try exec(allocator, db, "INSERT INTO nn VALUES (1, NULL), (2, NULL)");
 
+    // Expected values from DuckDB (IS NOT DISTINCT FROM); the text key
+    // against a BIGINT key from MySQL 8.4, which DuckDB won't compare.
     const cases = .{
         .{ "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON x.a <=> y.b ORDER BY 1", &[_]i64{ 11, 13, 21, 23, 34, 35, 44, 45 } },
         .{ "SELECT x.id * 10 + COALESCE(y.id, 0) FROM ns x LEFT JOIN ns y ON x.a <=> y.b AND y.id > 2 ORDER BY 1", &[_]i64{ 13, 23, 34, 35, 44, 45, 50 } },
+        .{ "SELECT COALESCE(x.id, 0) * 10 + y.id FROM ns x RIGHT JOIN ns y ON x.a <=> y.b ORDER BY 1", &[_]i64{ 2, 11, 13, 21, 23, 34, 35, 44, 45 } },
+        .{ "SELECT COALESCE(x.id, 0) * 10 + COALESCE(y.id, 0) FROM ns x FULL JOIN ns y ON x.a <=> y.b AND x.id < 4 ORDER BY 1", &[_]i64{ 2, 11, 13, 21, 23, 34, 35, 40, 50 } },
+        .{ "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON x.a <=> y.b AND x.s = y.s ORDER BY 1", &[_]i64{ 11, 13 } },
+        .{ "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON x.a <=> y.b AND x.s <=> y.s ORDER BY 1", &[_]i64{ 11, 13, 44 } },
+        .{ "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON x.s <=> y.s ORDER BY 1", &[_]i64{ 11, 13, 22, 24, 31, 33, 42, 44, 55 } },
+        .{ "SELECT x.id * 10 + COALESCE(y.id, 0) FROM ns x LEFT JOIN ns y ON x.d <=> y.d AND y.id <> 3 ORDER BY 1", &[_]i64{ 11, 22, 24, 31, 42, 44, 55 } },
+        .{ "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON x.t <=> y.b ORDER BY 1", &[_]i64{ 11, 13, 34, 35, 42, 54, 55 } },
+        .{ "SELECT x.id * 10 + COALESCE(y.id, 0) FROM ns x LEFT JOIN ns y ON x.t <=> y.b ORDER BY 1", &[_]i64{ 11, 13, 20, 34, 35, 42, 54, 55 } },
+        .{ "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON CAST(x.a AS CHAR) <=> y.b ORDER BY 1", &[_]i64{ 11, 13, 21, 23, 34, 35, 44, 45 } },
+        .{ "SELECT x.id * 10 + COALESCE(y.id, 0) FROM ns x LEFT JOIN ns y ON x.a <=> y.b AND (x.id < 3 OR y.id < 3) ORDER BY 1", &[_]i64{ 11, 13, 21, 23, 30, 40, 50 } },
+        .{ "SELECT x.id * 10 + COALESCE(y.id, 0) FROM ns x LEFT JOIN ns y ON x.a <=> y.b AND x.id > 2 ORDER BY 1", &[_]i64{ 10, 20, 34, 35, 44, 45, 50 } },
+        .{ "SELECT x.id * 10 + COALESCE(y.id, 0) FROM ns x LEFT JOIN ns y ON x.a <=> y.b AND x.a IS NOT NULL ORDER BY 1", &[_]i64{ 11, 13, 21, 23, 30, 40, 50 } },
+        .{ "SELECT x.id * 10 + COALESCE(z.id, 0) FROM ns x LEFT JOIN nn z ON x.a <=> z.k ORDER BY 1", &[_]i64{ 10, 20, 31, 32, 41, 42, 50 } },
+        .{ "SELECT COALESCE(x.id, 0) * 10 + z.id FROM ns x RIGHT JOIN nn z ON x.b <=> z.k ORDER BY 1", &[_]i64{ 41, 42, 51, 52 } },
+        .{ "SELECT COALESCE(x.id, 0) * 10 + COALESCE(y.id, 0) FROM ns x FULL JOIN ns y ON x.b <=> y.a AND x.s = y.s ORDER BY 1", &[_]i64{ 2, 3, 4, 5, 11, 20, 31, 40, 50 } },
     };
     inline for (cases) |c| {
         errdefer std.debug.print("case failed: {s}\n", .{c[0]});
         const got = try helpers.collectBigints(allocator, db, c[0]);
         defer allocator.free(got);
         try std.testing.expectEqualSlices(i64, c[1], got);
+        // Parsed and compiled as a MySQL connection does.
+        var session = try helpers.runSqlMysqlCtx(allocator, db, c[0]);
+        defer session.deinit();
+        const got_session = try helpers.collectIntCells(allocator, &session);
+        defer allocator.free(got_session);
+        try std.testing.expectEqual(c[1].len, got_session.len);
+        for (c[1], got_session) |want, cell| try std.testing.expectEqual(@as(?i64, want), cell);
     }
+
+    var pg = try helpers.runSqlDialect(allocator, db, "SELECT x.id * 10 + y.id FROM ns x JOIN ns y ON x.a IS NOT DISTINCT FROM y.b ORDER BY 1", .postgres);
+    defer pg.deinit();
+    const pg_got = try helpers.collectIntCells(allocator, &pg);
+    defer allocator.free(pg_got);
+    const pg_want = [_]?i64{ 11, 13, 21, 23, 34, 35, 44, 45 };
+    try std.testing.expectEqualSlices(?i64, &pg_want, pg_got);
+
+    var plan = try helpers.runSql(allocator, db, "EXPLAIN SELECT x.id FROM ns x JOIN ns y ON x.a <=> y.b");
+    defer plan.deinit();
+    var keyed = false;
+    while (try plan.next()) |b| {
+        for (0..b.row_count) |i| {
+            if (std.mem.indexOf(u8, b.values[0].data.string.rowBytes(i), "HashJoin on=[x.a<=>") != null) keyed = true;
+        }
+    }
+    try std.testing.expect(keyed);
 }
 
 test "null literal arguments with no typed sibling take an overload's parameter type" {

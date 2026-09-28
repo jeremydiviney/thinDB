@@ -1177,6 +1177,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
             for (j.on) |p| {
                 hstr(h, p.left);
                 hstr(h, p.right);
+                hu(h, @intFromBool(p.null_safe));
             }
             hu(h, j.ranges.len);
             for (j.ranges) |r| {
@@ -3653,8 +3654,10 @@ fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
     }
 }
 
+/// Region probes drop NULL keys, which a null-safe key matches.
 fn supports_region_join(j: *const ir.Op.Join) bool {
-    return (j.join_type == .left or j.join_type == .inner) and j.extra_predicate == null and j.ranges.len == 0 and j.residual == null;
+    return (j.join_type == .left or j.join_type == .inner) and j.extra_predicate == null and j.ranges.len == 0 and j.residual == null and
+        !exec.join_op.anyNullSafeKey(j.on);
 }
 
 fn dispatchJoin(b: *Builder, j: *const ir.Op.Join, above: []const Step) anyerror!void {

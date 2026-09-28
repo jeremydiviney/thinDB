@@ -180,6 +180,8 @@ pub const NestedLoopJoin = struct {
     /// when there's no equi part (pure range / pure NLJ).
     left_key_indices: []usize,
     right_key_indices: []usize,
+    /// Per equi key: whether it matches NULL to NULL. Empty when none does.
+    null_safe_keys: []const bool,
 
     /// Range predicates resolved to column indices. AND-combined.
     ranges: []const join_mod.Join.ResolvedRange,
@@ -387,6 +389,7 @@ pub const NestedLoopJoin = struct {
             .right = right,
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
+            .null_safe_keys = try join_mod.nullSafeKeyFlags(aa, spec.on),
             .ranges = resolved_ranges,
             .opaque_predicate = spec.opaque_predicate,
             .residual = residual,
@@ -592,9 +595,9 @@ pub const NestedLoopJoin = struct {
         const right_batch = Batch{ .schema = self.right.outputSchema(), .values = rs.right_views, .row_count = self.right_rows };
         var r: u32 = 0;
         while (r < self.right_rows) : (r += 1) {
-            if (join_mod.anyKeyNull(right_batch, self.right_key_indices, r)) continue;
+            if (join_mod.anyKeyNull(right_batch, self.right_key_indices, self.null_safe_keys, r)) continue;
             rs.key_scratch.clearRetainingCapacity();
-            try join_mod.buildCompoundKey(self.allocator, &rs.key_scratch, right_batch, self.right_key_indices, r);
+            try join_mod.buildCompoundKey(self.allocator, &rs.key_scratch, right_batch, self.right_key_indices, self.null_safe_keys, r);
             const entry = try index.getOrPut(aa, rs.key_scratch.items);
             if (!entry.found_existing) {
                 entry.key_ptr.* = try aa.dupe(u8, rs.key_scratch.items);
@@ -609,9 +612,9 @@ pub const NestedLoopJoin = struct {
         const index = rs.index orelse return .{ .rows = null, .count = self.right_rows };
         const none: Candidates = .{ .rows = &.{}, .count = 0 };
         const left_batch = Batch{ .schema = self.left.outputSchema(), .values = rs.left_views, .row_count = self.left_rows };
-        if (join_mod.anyKeyNull(left_batch, self.left_key_indices, self.left_cursor)) return none;
+        if (join_mod.anyKeyNull(left_batch, self.left_key_indices, self.null_safe_keys, self.left_cursor)) return none;
         rs.key_scratch.clearRetainingCapacity();
-        try join_mod.buildCompoundKey(self.allocator, &rs.key_scratch, left_batch, self.left_key_indices, self.left_cursor);
+        try join_mod.buildCompoundKey(self.allocator, &rs.key_scratch, left_batch, self.left_key_indices, self.null_safe_keys, self.left_cursor);
         const bucket = index.get(rs.key_scratch.items) orelse return none;
         return .{ .rows = bucket.items, .count = @intCast(bucket.items.len) };
     }
@@ -734,23 +737,32 @@ pub const NestedLoopJoin = struct {
     }
 
     fn outerHasNullKey(self: NestedLoopJoin) bool {
-        for (self.left_key_indices) |idx| {
-            if (!self.left_materialized[idx].view().isValid(self.left_cursor)) return true;
+        for (self.left_key_indices, 0..) |idx, k| {
+            if (!self.left_materialized[idx].view().isValid(self.left_cursor) and !self.keyNullSafe(k)) return true;
         }
         return false;
     }
 
     fn innerHasNullKey(self: NestedLoopJoin) bool {
-        for (self.right_key_indices) |idx| {
-            if (!self.right_materialized[idx].view().isValid(self.right_cursor)) return true;
+        for (self.right_key_indices, 0..) |idx, k| {
+            if (!self.right_materialized[idx].view().isValid(self.right_cursor) and !self.keyNullSafe(k)) return true;
         }
         return false;
     }
 
+    fn keyNullSafe(self: NestedLoopJoin, k: usize) bool {
+        return join_mod.keyIsNullSafe(self.null_safe_keys, k);
+    }
+
     fn passesEquiKeys(self: NestedLoopJoin) bool {
-        for (self.left_key_indices, self.right_key_indices) |li, ri| {
+        for (self.left_key_indices, self.right_key_indices, 0..) |li, ri, k| {
             const lv = self.left_materialized[li].view();
             const rv = self.right_materialized[ri].view();
+            if (self.keyNullSafe(k)) {
+                const left_valid = lv.isValid(self.left_cursor);
+                if (left_valid != rv.isValid(self.right_cursor)) return false;
+                if (!left_valid) continue;
+            }
             if (!join_mod.compareCellsOp(lv, self.left_cursor, rv, self.right_cursor, .eq)) return false;
         }
         return true;

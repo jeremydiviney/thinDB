@@ -514,7 +514,9 @@ pub const Compute = struct {
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
         var resolved_count: usize = 0;
         errdefer for (resolved[0..resolved_count]) |r| freeResolvedDerived(allocator, r);
-        for (derived, resolved) |d, *r| {
+        // Resolved plans keep pieces of their expression (a CASE keeps its
+        // conditions), so they resolve from the copy this Compute owns.
+        for (derived_ir, resolved) |d, *r| {
             r.* = try resolveDerived(allocator, aa, d, up_schema, udf_registry);
             resolved_count += 1;
         }
@@ -3137,6 +3139,34 @@ test "retains its own copy of the derived IR after the caller's scratch dies" {
     try std.testing.expectEqualStrings("a", c.derived_ir[0].name);
     try std.testing.expectEqualStrings("to_bigint", c.derived_ir[0].expr.call.fn_name);
     try std.testing.expectEqualStrings("a", c.derived_ir[0].expr.call.args[0].col_ref);
+}
+
+test "a CASE evaluates its own copy of the derived IR after the caller's scratch dies" {
+    // Join.create builds a null-safe key's NULL flag, a CASE, in the same
+    // dying arena. The CASE plan kept the caller's conditions, and the
+    // ReleaseFast server failed the join's build with ColumnNotFound once
+    // those bytes were reused.
+    const allocator = std.testing.allocator;
+    const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
+    const schema = [_]Column{.{ .name = "a", .type = .bigint, .nullable = true }};
+    const values = [_]i64{ 7, 0, 9 };
+    const views = [_]storage.ColumnView{.{ .data = .{ .bigint = &values }, .nulls = &.{0b101} }};
+    const source = try SingleBatchSource.create(allocator, .{ .schema = &schema, .values = &views, .row_count = values.len });
+    var name_buf = "flag".*;
+    var col_buf = "a".*;
+    var branches = [_]Expr.Branch{.{ .cond = .{ .is_null = &col_buf }, .then = .{ .lit = .{ .int = 1 } } }};
+    const else_zero: Expr = .{ .lit = .{ .int = 0 } };
+    var derived = [_]Derived{.{ .name = &name_buf, .expr = .{ .case = .{ .branches = &branches, .else_branch = &else_zero } } }};
+    var q = try Compute.create(allocator, source, &derived);
+    defer q.deinit();
+
+    @memset(&name_buf, '?');
+    col_buf[0] = '?';
+    branches[0] = .{ .cond = .{ .is_null = "gone" }, .then = .{ .lit = .{ .int = 5 } } };
+
+    const batch = (try q.next()).?;
+    try std.testing.expectEqualStrings("flag", batch.schema[1].name);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 0 }, batch.values[1].data.int);
 }
 
 /// Upstream for the construction-failure tests: `a INT NULL, s VARCHAR NULL`, no rows.

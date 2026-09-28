@@ -66,7 +66,8 @@ pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v7: join carries an optional ON residual.
 /// v8: drop_table carries a table list; alter_table carries actions.
 /// v9: a CASE carries the operands its conditions compute.
-pub const version: u16 = 9;
+/// v10: a join key pair carries a null-safe byte.
+pub const version: u16 = 10;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -917,6 +918,35 @@ pub const Op = union(OpTag) {
         /// The CTE this boundary came from — labels its stage in the
         /// `--profile-ops` `[cte]` lines. Parse-time only, not serialized.
         name: ?[]const u8 = null,
+        /// `WITH RECURSIVE`: set on the CTE's own boundary and on each
+        /// reference its recursive arms make to it. Parse-time only; encode
+        /// refuses it rather than drop it.
+        recursion: ?Recursion = null,
+    };
+
+    /// `.cte` marks the recursive CTE's boundary, run by the iteration
+    /// driver; `.self_ref` marks a reference from one of its recursive arms,
+    /// bound to the working set of the iteration that compiles it. The
+    /// `.self_ref` body is a names-only leaf that never executes.
+    pub const Recursion = union(enum) {
+        cte: *const Recursive,
+        self_ref: *const Recursive,
+    };
+
+    pub const Recursive = struct {
+        /// The arms that don't reference the CTE, chained as written.
+        anchor: *Op,
+        /// The arms that do, UNION ALL-chained when there are several.
+        step: *Op,
+        /// A UNION DISTINCT at or after the first recursive arm: a row the
+        /// result already holds is not new, so cycles terminate.
+        distinct: bool,
+        /// The CTE's column list; otherwise the anchor names the columns.
+        columns: ?[]const []const u8,
+        /// LIMIT / OFFSET over the whole body. Iteration stops once
+        /// `offset + limit` rows exist.
+        limit: ?u64 = null,
+        offset: u64 = 0,
     };
 
     pub const Alias = struct {
@@ -1188,6 +1218,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .compute => |c| try encodeCompute(allocator, out, c),
         .join => |j| try encodeJoin(allocator, out, j),
         .materialize => |m| {
+            if (m.recursion != null) return EncodeError.OutOfMemory;
             try out.append(allocator, @intFromBool(m.forced));
             try encodeOp(allocator, out, m.upstream.*);
         },
@@ -1853,6 +1884,7 @@ fn encodeJoin(allocator: Allocator, out: *std.ArrayList(u8), j: Op.Join) EncodeE
         try out.appendSlice(allocator, kp.left);
         try appendU32(allocator, out, @intCast(kp.right.len));
         try out.appendSlice(allocator, kp.right);
+        try out.append(allocator, @intFromBool(kp.null_safe));
     }
     // Ranges
     try appendU32(allocator, out, @intCast(j.ranges.len));
@@ -2378,7 +2410,9 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             for (on) |*kp| {
                 const l = try readString(bytes, cursor);
                 const r = try readString(bytes, cursor);
-                kp.* = .{ .left = l, .right = r };
+                if (cursor.* >= bytes.len or bytes[cursor.*] > 1) return Error.IrCorrupt;
+                kp.* = .{ .left = l, .right = r, .null_safe = bytes[cursor.*] == 1 };
+                cursor.* += 1;
             }
 
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;

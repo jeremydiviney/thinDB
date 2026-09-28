@@ -500,6 +500,9 @@ fn trySplitComputeOverUnion(
     const union_op: *ir.Op = switch (up.*) {
         .set_union => up,
         .materialize => |m| blk: {
+            // A recursive CTE's arms are its iteration driver's plan: an arm
+            // that gained a column would no longer line up with the others.
+            if (m.recursion != null) return;
             if ((mat_refs.get(up) orelse 0) != 1) return;
             if (m.upstream.* != .set_union) return;
             break :blk @constCast(m.upstream);

@@ -48,6 +48,7 @@ pub fn mapInternal(err: anyerror) Mapped {
         .numeric_out_of_range => .{ .sqlstate = "22003".*, .message = "numeric value out of range" },
         .value_out_of_range => .{ .sqlstate = "22003".*, .message = "value out of range for column type" },
         .subquery_multiple_rows => .{ .sqlstate = "21000".*, .message = "more than one row returned by a subquery used as an expression" },
+        .recursion_depth_exceeded => .{ .sqlstate = "54000".*, .message = "recursive query aborted after 1001 iterations" },
         .invalid_temporal_literal => .{ .sqlstate = "22007".*, .message = predicate.takeInvalidTemporalMessage() orelse "invalid input syntax for type date or timestamp" },
         .unknown => .{ .sqlstate = "42000".*, .message = name },
     };
