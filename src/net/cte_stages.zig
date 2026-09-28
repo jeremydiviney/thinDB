@@ -749,11 +749,10 @@ fn cloneStrippedScanAlias(arena: std.mem.Allocator, op: *const ir.Op) !*ir.Op {
 }
 
 /// Build the in-memory PgCatalogSource leaf (alias-renamed if the scan is
-/// aliased) when `s` names a pg_catalog virtual table — PG/neutral dialects
-/// only, MySQL resolves the same name as a real table. Null = real scan.
+/// aliased) when `s` names a virtual catalog relation the session's dialect
+/// sees. Null = real scan.
 fn tryPgCatalogLeaf(input: engine_v2.CompileInput, s: anytype) !?exec.Query {
-    if (input.session.dialect == .mysql) return null;
-    const vt = pgcat.match(s.table) orelse return null;
+    const vt = pgcat.match(s.table, input.session.dialect) orelse return null;
     const catalog = local.catalogFor(input.db) orelse return local.Error.DatabaseNotFound;
     const base = try pgcat.build(input.allocator, catalog, input.session, vt);
     if (s.alias) |alias| {
@@ -766,11 +765,10 @@ fn tryPgCatalogLeaf(input: engine_v2.CompileInput, s: anytype) !?exec.Query {
 /// Whether the block's bottom scan is a pg_catalog virtual table (the walk
 /// mirrors blockSource; only called for `.table`-sourced blocks).
 fn blockScanIsPgCatalog(input: engine_v2.CompileInput, op: *const ir.Op) bool {
-    if (input.session.dialect == .mysql) return false;
     var cur = op;
     while (true) {
         switch (cur.*) {
-            .scan => |s| return pgcat.match(s.table) != null,
+            .scan => |s| return pgcat.match(s.table, input.session.dialect) != null,
             .select => |p| cur = p.upstream,
             .exclude => |p| cur = p.upstream,
             .filter => |f| cur = f.upstream,

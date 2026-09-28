@@ -114,6 +114,13 @@ pub const Server = struct {
         self.allocator.destroy(self);
     }
 
+    /// Every wire sharing a registry draws ids from it, so a KILL or a
+    /// process-list id names one connection across all of them.
+    fn nextConnectionId(self: *Server) u32 {
+        if (self.registry) |reg| return reg.nextBackendId();
+        return self.connection_counter.fetchAdd(1, .monotonic) + 1;
+    }
+
     /// Accept ONE connection and serve it synchronously on the calling
     /// thread. Used by tests that want a deterministic accept count.
     pub fn acceptOne(self: *Server) !void {
@@ -134,7 +141,7 @@ pub const Server = struct {
         }
         defer self.limiter.release();
 
-        const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+        const cid = self.nextConnectionId();
         handleConnection(self.allocator, self.io, self.catalog, stream, cid, self.auth_password, self.registry, self.profile) catch |err| {
             std.debug.print("mysql: connection error: {s}\n", .{@errorName(err)});
         };
@@ -160,7 +167,7 @@ pub const Server = struct {
                 stream.close(self.io);
                 continue;
             }
-            const cid = self.connection_counter.fetchAdd(1, .monotonic) + 1;
+            const cid = self.nextConnectionId();
             const job = self.allocator.create(ConnJob) catch {
                 self.limiter.release();
                 stream.close(self.io);
@@ -332,7 +339,12 @@ const SessionState = struct {
     fn deinit(self: *SessionState) void {
         self.dropTempNamespace();
         self.resetVars();
-        if (self.xa_active) |x| self.allocator.free(x);
+        // A branch still ACTIVE when its connection goes can never be ended
+        // or prepared, so it is rolled back, as MySQL rolls it back.
+        if (self.xa_active) |x| {
+            self.catalog.xa.rollback(x) catch {};
+            self.allocator.free(x);
+        }
         self.xa_active = null;
         self.allocator.free(self.current_db);
         self.allocator.free(self.current_schema);
@@ -403,6 +415,7 @@ const SessionState = struct {
             .connection_id = self.backend_id,
             .user = handshake.reported_user,
             .server_version = handshake.server_version,
+            .connections = self.registry,
         };
     }
 
@@ -836,7 +849,7 @@ fn handleConnection(
         conn_state.endCommand(processDb(&session, &db_buf), nowMs(io));
     }
 
-    while (true) {
+    while (!conn_state.closeRequested()) {
         const read_start = profiler.start();
         // Both read waits are marked for the reaper (#164). Header wait
         // = idle between commands: unbounded UNLESS bytes are queued on
@@ -1183,12 +1196,22 @@ fn handleQuery(
             .empty_variables => try result.sendEmptyVariables(allocator, w, &seq_id, caps),
             .empty_result => |kind| try sendMetadataResult(allocator, w, catalog, session, payload, kind, &seq_id, caps),
             .processlist => |list| try sendProcessList(allocator, w, catalog.io, session, list.full, &seq_id, caps),
-            .kill => |target_id| {
-                // No registry → KILL is a no-op success. With a
-                // registry, look up the target and set its cancel
-                // flag. Unknown id → ER_NO_SUCH_THREAD (1094).
+            .kill => |kill| {
+                // Killing its own connection interrupts the KILL itself, as
+                // MySQL does; the socket must stay up so the reply reaches
+                // the client, and the command loop closes afterwards.
+                if (session.conn_state) |own| {
+                    if (own.backend_id == kill.id) {
+                        if (kill.connection) own.requestClose();
+                        const mapped = errors.mapInternal(error.QueryCancelled, null);
+                        try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
+                        return;
+                    }
+                }
+                // No registry → KILL of a peer is a no-op success.
                 if (session.registry) |reg| {
-                    if (!reg.requestCancel(target_id, 0)) {
+                    const found = if (kill.connection) reg.requestClose(catalog.io, kill.id) else reg.requestCancel(kill.id, 0);
+                    if (!found) {
                         try handshake.sendErrPacket(allocator, w, seq_id, 1094, "HY000".*, "Unknown thread id");
                         return;
                     }
@@ -1254,9 +1277,15 @@ fn sendSyntheticWorkbenchSelect(
     // would silently drop the rest. The engine handles it.
     if (topLevelKeyword(lc, "union") != null) return false;
 
+    // Parallel case-preserved view of the same normalized statement:
+    // matching runs on `lc`, column labels slice from `orig` at the same
+    // offsets so they echo the client's typed case.
+    const orig_full = sql_text_mod.normalizeForCannedMatchKeepCase(payload);
+
     const from_idx = topLevelKeyword(lc, "from");
     if (from_idx) |idx| {
         const tail = lc[idx..];
+        if (readsProcessList(tail)) return false;
         if (std.mem.indexOf(u8, tail, "information_schema") == null and
             std.mem.indexOf(u8, tail, "`information_schema`") == null)
             return false;
@@ -1266,6 +1295,7 @@ fn sendSyntheticWorkbenchSelect(
             w,
             catalog,
             lc["select ".len..idx],
+            orig_full["select ".len..idx],
             tail,
             seq_id,
             client_caps,
@@ -1273,16 +1303,11 @@ fn sendSyntheticWorkbenchSelect(
 
         var cols = std.ArrayList(types.Column).empty;
         defer cols.deinit(allocator);
-        try appendSelectColumns(allocator, &cols, lc["select ".len..idx]);
+        try appendSelectColumns(allocator, &cols, lc["select ".len..idx], orig_full["select ".len..idx]);
         if (cols.items.len == 0) try cols.append(allocator, .{ .name = "Name", .type = .string });
         try sendEmptyColumns(allocator, w, cols.items, seq_id, client_caps);
         return true;
     }
-
-    // Parallel case-preserved view of the same normalized statement:
-    // matching runs on `lc`, column labels slice from `orig` at the same
-    // offsets so they echo the client's typed case.
-    const orig_full = sql_text_mod.normalizeForCannedMatchKeepCase(payload);
 
     var select_list: []const u8 = lc["select ".len..];
     var orig_list: []const u8 = orig_full["select ".len..];
@@ -1333,17 +1358,38 @@ fn sendSyntheticWorkbenchSelect(
     return true;
 }
 
+/// Whether a FROM clause reads a process-list relation. The engine serves
+/// those as virtual tables (pg_catalog.zig) under any WHERE / ORDER BY /
+/// projection, so the metadata shim leaves them alone.
+fn readsProcessList(from_tail: []const u8) bool {
+    const rest = std.mem.trimStart(u8, from_tail["from".len..], " \t\r\n");
+    const end = std.mem.indexOfAny(u8, rest, " \t\r\n,;()") orelse rest.len;
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    for (rest[0..end]) |c| {
+        if (c == '`') continue;
+        if (len == buf.len) return false;
+        buf[len] = c;
+        len += 1;
+    }
+    const target = buf[0..len];
+    return std.mem.eql(u8, target, "information_schema.processlist") or
+        std.mem.eql(u8, target, "performance_schema.processlist");
+}
+
 fn appendSelectColumns(
     allocator: Allocator,
     cols: *std.ArrayList(types.Column),
     select_list: []const u8,
+    orig_list: []const u8,
 ) !void {
     var start: usize = 0;
     while (start < select_list.len) {
         const end = nextTopLevelComma(select_list, start) orelse select_list.len;
         const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        const orig_raw = std.mem.trim(u8, orig_list[start..end], " \t\r\n");
         if (raw_expr.len > 0 and !std.mem.eql(u8, raw_expr, "*")) {
-            const alias = stripAlias(raw_expr).alias orelse raw_expr;
+            const alias = stripAlias(orig_raw).alias orelse orig_raw;
             try cols.append(allocator, .{ .name = stripIdentifierQuotes(alias), .type = .string, .nullable = true });
         }
         start = end + 1;
@@ -1357,15 +1403,25 @@ fn StripAliasResult(comptime T: type) type {
     };
 }
 
+/// The AS keyword matches in any case, so a lowered statement and its
+/// case-preserved twin split at the same offset: callers match on the
+/// lowered text and take the alias from the original.
 fn stripAlias(raw_expr: []const u8) StripAliasResult([]const u8) {
     const expr = std.mem.trim(u8, raw_expr, " \t\r\n");
-    if (std.mem.lastIndexOf(u8, expr, " as ")) |idx| {
-        return .{
-            .expr = std.mem.trim(u8, expr[0..idx], " \t\r\n"),
-            .alias = std.mem.trim(u8, expr[idx + 4 ..], " \t\r\n"),
-        };
+    if (expr.len < 4) return .{ .expr = expr, .alias = null };
+    var pos = expr.len - 4;
+    while (true) : (pos -= 1) {
+        if (std.ascii.isWhitespace(expr[pos]) and
+            std.ascii.eqlIgnoreCase(expr[pos + 1 .. pos + 3], "as") and
+            std.ascii.isWhitespace(expr[pos + 3]))
+        {
+            return .{
+                .expr = std.mem.trim(u8, expr[0..pos], " \t\r\n"),
+                .alias = std.mem.trim(u8, expr[pos + 4 ..], " \t\r\n"),
+            };
+        }
+        if (pos == 0) return .{ .expr = expr, .alias = null };
     }
-    return .{ .expr = expr, .alias = null };
 }
 
 fn stripIdentifierQuotes(s_in: []const u8) []const u8 {
@@ -2338,6 +2394,7 @@ fn sendInformationSchemaSelect(
     w: *std.Io.Writer,
     catalog: *Catalog,
     select_list: []const u8,
+    orig_list: []const u8,
     tail: []const u8,
     seq_id: *u8,
     client_caps: u32,
@@ -2348,7 +2405,7 @@ fn sendInformationSchemaSelect(
 
     var projections = std.ArrayList(InfoProjection).empty;
     defer projections.deinit(allocator);
-    try appendInfoProjections(allocator, &projections, select_list, kind);
+    try appendInfoProjections(allocator, &projections, select_list, orig_list, kind);
 
     var cols = std.ArrayList(types.Column).empty;
     defer cols.deinit(allocator);
@@ -2442,6 +2499,7 @@ fn appendInfoProjections(
     allocator: Allocator,
     projections: *std.ArrayList(InfoProjection),
     select_list: []const u8,
+    orig_list: []const u8,
     kind: InfoSchemaKind,
 ) !void {
     var saw_star = false;
@@ -2449,13 +2507,13 @@ fn appendInfoProjections(
     while (start < select_list.len) {
         const end = nextTopLevelComma(select_list, start) orelse select_list.len;
         const raw_expr = std.mem.trim(u8, select_list[start..end], " \t\r\n");
+        const orig_raw = std.mem.trim(u8, orig_list[start..end], " \t\r\n");
         if (raw_expr.len > 0) {
             if (std.mem.eql(u8, raw_expr, "*") or std.mem.endsWith(u8, raw_expr, ".*")) {
                 saw_star = true;
             } else {
-                const stripped = stripAlias(raw_expr);
-                const key = infoColumnKey(stripped.expr);
-                const name = stripIdentifierQuotes(stripped.alias orelse key);
+                const key = infoColumnKey(stripAlias(raw_expr).expr);
+                const name = stripIdentifierQuotes(stripAlias(orig_raw).alias orelse key);
                 try projections.append(allocator, .{
                     .column = .{ .name = name, .type = .string, .nullable = true },
                     .key = key,
@@ -3180,10 +3238,6 @@ fn sendProcessList(
     const now_ms = nowMs(io);
     for (processes) |process| {
         const activity = &process.activity;
-        const running = switch (activity.command) {
-            .query, .prepare, .execute => true,
-            .connect, .sleep => false,
-        };
         var id_buf: [16]u8 = undefined;
         var time_buf: [24]u8 = undefined;
         const info = activity.info.slice();
@@ -3194,12 +3248,8 @@ fn sendProcessList(
             if (activity.db.len > 0) activity.db.slice() else null,
             activity.command.label(),
             try std.fmt.bufPrint(&time_buf, "{d}", .{(now_ms -| activity.since_ms) / std.time.ms_per_s}),
-            switch (activity.command) {
-                .connect => "login",
-                .sleep => "",
-                .query, .prepare, .execute => "executing",
-            },
-            if (!running) null else if (full) info else conn_registry.utf8Prefix(info, 100),
+            activity.command.state(),
+            if (!activity.command.running()) null else if (full) info else conn_registry.utf8Prefix(info, 100),
         };
         try result.sendTextRow(allocator, w, cells[0..], seq_id);
     }
@@ -4320,5 +4370,50 @@ test "SHOW CREATE TABLE, SHOW COLUMNS and information_schema report ON UPDATE CU
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x2dDEFAULT_GENERATED on update CURRENT_TIMESTAMP") != null);
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x1bon update CURRENT_TIMESTAMP") != null);
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x11DEFAULT_GENERATED") != null);
+    }
+}
+
+/// The first column's name in a result-set reply: the column-def packet
+/// after the column count carries catalog, schema, table and org_table
+/// ahead of the name, each a short lenenc string in these tests.
+fn testFirstColumnName(allocator: Allocator, bytes: []const u8) ![]const u8 {
+    const bodies = try testPacketBodies(allocator, bytes);
+    defer allocator.free(bodies);
+    try std.testing.expect(bodies.len >= 2);
+    const def = bodies[1];
+    var pos: usize = 0;
+    for (0..4) |_| pos += 1 + def[pos];
+    return def[pos + 1 ..][0..def[pos]];
+}
+
+test "a FROM-less shim SELECT and an information_schema SELECT name a column by its alias in any AS case" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE named (id INT)", &profiler);
+    const cases = .{
+        .{ "SELECT CONNECTION_ID() AS id", "id" },
+        .{ "select connection_id() as id", "id" },
+        .{ "SELECT CONNECTION_ID() As Id", "Id" },
+        .{ "SELECT DATABASE()\n\tAS\tDb", "Db" },
+        .{ "SELECT CONNECTION_ID() AS `Conn Id`", "Conn Id" },
+        .{ "SELECT CONNECTION_ID()", "CONNECTION_ID()" },
+        .{ "SELECT TABLE_NAME AS TableName FROM information_schema.TABLES WHERE TABLE_NAME = 'named'", "TableName" },
+    };
+    inline for (cases) |case| {
+        out.clearRetainingCapacity();
+        try handleQuery(allocator, &out.writer, c, &session, case[0], &profiler);
+        try std.testing.expectEqualStrings(case[1], try testFirstColumnName(allocator, out.written()));
     }
 }
