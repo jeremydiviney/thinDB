@@ -30,6 +30,8 @@ const TypeTag = types.TypeTag;
 
 const decimal = @import("scalar_fn_decimal.zig");
 const common = @import("scalar_fn_common.zig");
+const scalar_fn = @import("scalar_fn.zig");
+const Expr = @import("expr.zig").Expr;
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -485,6 +487,44 @@ pub fn freeAssignedColumn(allocator: Allocator, view: ColumnView) void {
         },
         else => unreachable,
     }
+}
+
+/// The cast a column `name` of type `from` takes before it is written into a
+/// column of type `to`, or null when it lands as is or converts by the
+/// assignment rule as it lands (`assignColumn`). A decimal target always
+/// takes one when the types differ: the memtable matches decimal columns on
+/// tag alone, so a payload at another scale would be stored misread. Text
+/// parses into a DATE or DATETIME target. Other targets widen along the
+/// implicit-cast ladder short of its lossy steps; the memtable admits or
+/// rejects the rest. A row the cast turns NULL is a failed write
+/// (`assignmentDroppedValue`). Allocates in `arena`.
+pub fn assignmentCastExpr(arena: Allocator, name: []const u8, from: Type, to: Type) !?Expr {
+    if (std.meta.eql(from, to) or assignsByRule(from, to)) return null;
+    const widens = if (to.isDecimal())
+        from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean or (from.isString() and from != .json)
+    else if ((to == .date or to == .datetime) and from.isString())
+        true
+    else if (castCost(@as(TypeTag, from), @as(TypeTag, to))) |cost|
+        cost > 0 and cost < LOSSY_CAST_COST
+    else
+        false;
+    if (!widens) return null;
+    const fn_name = try scalar_fn.castFnName(arena, to) orelse return null;
+    const args = try arena.alloc(Expr, 1);
+    args[0] = .{ .col_ref = name };
+    return .{ .call = .{ .fn_name = fn_name, .args = args } };
+}
+
+/// Whether a column cast by `assignmentCastExpr` is NULL where its source
+/// had a value, as for text that isn't a number or a date. INSERT ... VALUES
+/// rejects such a value, so every other write does too rather than storing
+/// NULL.
+pub fn assignmentDroppedValue(src: ColumnView, converted: ColumnView, rows: usize) bool {
+    if (!converted.anyNull(rows)) return false;
+    for (0..rows) |i| {
+        if (src.isValid(i) and !converted.isValid(i)) return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------

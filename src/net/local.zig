@@ -2944,7 +2944,7 @@ const InsertColumnPlan = struct {
         var derived: std.ArrayList(exec.Derived) = .empty;
         for (tbl_columns, table_to_source, picks, 0..) |col, maybe_src, *pick, j| {
             const expr = if (maybe_src) |i|
-                try insertWideningExpr(aa, src_schema[i], col.type) orelse {
+                try exec_cast.assignmentCastExpr(aa, src_schema[i].name, src_schema[i].type, col.type) orelse {
                     pick.* = i;
                     continue;
                 }
@@ -2975,7 +2975,7 @@ const InsertColumnPlan = struct {
     ) !void {
         for (self.table_to_source, self.picks) |maybe_src, pick| {
             const src = maybe_src orelse continue;
-            if (pick != src and wideningDroppedValue(values[src], values[pick], row_count)) return Error.TypeMismatch;
+            if (pick != src and exec_cast.assignmentDroppedValue(values[src], values[pick], row_count)) return Error.TypeMismatch;
         }
         var filled: usize = 0;
         errdefer self.release(ctx, views[0..filled]);
@@ -3220,43 +3220,6 @@ fn compileDeleteFromSource(ctx: *CompileCtx, d: ir.DeleteOp) anyerror!Query {
     }
     ctx.affected_rows = @intCast(deleted);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(deleted));
-}
-
-/// The cast that widens an INSERT source column into its target type, or
-/// null when the column lands as is. A decimal target always takes one when
-/// the types differ: the memtable matches decimal columns on tag alone, so a
-/// payload at another scale would be stored misread. Text parses into a DATE
-/// or DATETIME target. An integer, float or boolean target converts batch by
-/// batch by the assignment rule instead (`exec_cast.assignColumn`), as does
-/// a number, DATE or DATETIME into a text target. Other
-/// targets widen along the implicit-cast ladder short of its lossy steps;
-/// the memtable admits or rejects the rest.
-fn insertWideningExpr(aa: Allocator, src: types.Column, target: types.Type) !?exec.Expr {
-    if (std.meta.eql(src.type, target) or exec_cast.assignsByRule(src.type, target)) return null;
-    const widens = if (target.isDecimal())
-        src.type.isInteger() or src.type.isFloat() or src.type.isDecimal() or src.type == .boolean
-    else if ((target == .date or target == .datetime) and src.type.isString())
-        true
-    else if (exec_cast.castCost(@as(types.TypeTag, src.type), @as(types.TypeTag, target))) |cost|
-        cost > 0 and cost < exec_cast.LOSSY_CAST_COST
-    else
-        false;
-    if (!widens) return null;
-    const fn_name = try exec.scalar_fn.castFnName(aa, target) orelse return null;
-    const args = try aa.alloc(exec.Expr, 1);
-    args[0] = .{ .col_ref = src.name };
-    return .{ .call = .{ .fn_name = fn_name, .args = args } };
-}
-
-/// Whether a widened INSERT column is NULL where its source had a value, as
-/// for text that isn't a date. INSERT ... VALUES rejects such a value, so
-/// INSERT ... SELECT does too rather than storing NULL.
-fn wideningDroppedValue(src: storage.ColumnView, widened: storage.ColumnView, rows: usize) bool {
-    if (!widened.anyNull(rows)) return false;
-    for (0..rows) |i| {
-        if (src.isValid(i) and !widened.isValid(i)) return true;
-    }
-    return false;
 }
 
 /// The value for a table column an INSERT ... SELECT column list omits: the
