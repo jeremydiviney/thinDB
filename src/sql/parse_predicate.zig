@@ -218,7 +218,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         _ = try p.parseScalar();
         return .unknown;
     }
-    if (p.cur.tag == .tilde or try literalLedAhead(p)) {
+    if (try p.prefixOperatorAhead() or try literalLedAhead(p)) {
         return try parseScalarLhs(p);
     }
     // `@var op X` — a session var on the LHS (constant guard, e.g.
@@ -307,7 +307,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // computed column and the normal operator tail anchors to it.
     if (try isArithAhead(p)) {
         const lhs = try p.continueBinaryFrom(.{ .col_ref = col_dup });
-        col_dup = try p.materializePredicateExpr(lhs);
+        col_dup = switch (lhs) {
+            .col_ref => |c| c,
+            else => try p.materializePredicateExpr(lhs),
+        };
     }
     return try parseColOps(p, col_dup);
 }
@@ -439,10 +442,10 @@ fn isArithToken(tag: anytype) bool {
     };
 }
 
-/// Whether a binary operator continues the operand before the cursor:
-/// an operator token, or MySQL's `MOD` word.
+/// Whether an operator continues the operand before the cursor: an
+/// operator token, MySQL's `MOD` word, or a `COLLATE` clause.
 fn isArithAhead(p: anytype) @TypeOf(p.*).Err!bool {
-    return isArithToken(p.cur.tag) or try p.modOperatorAhead();
+    return isArithToken(p.cur.tag) or try p.modOperatorAhead() or try p.collateAhead();
 }
 
 /// Tokens that close a predicate: the call/CASE punctuation around an IF
@@ -641,6 +644,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         if (p.cur.tag != .string) return PE.SqlExpectedValue;
         var pattern: []const u8 = try p.arena.dupe(u8, p.cur.value.string);
         try p.advance();
+        try p.skipCollations();
         if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "escape")) {
             try p.advance();
             if (p.cur.tag != .string) return PE.SqlExpectedValue;
@@ -1059,7 +1063,7 @@ fn rowComparison(p: anytype, lhs: []const ir.Expr, op: PredicateOp, rhs: []const
     }
 }
 
-fn elementComparison(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_operand: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+pub fn elementComparison(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_operand: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const operands = try hexResolved(p, lhs_operand, rhs_operand);
     const lhs = leafOperand(operands[0]);
     const rhs = leafOperand(operands[1]);

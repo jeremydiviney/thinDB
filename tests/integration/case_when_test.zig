@@ -519,3 +519,36 @@ test "a predicate reads as a value in a CASE or IF branch (issue #332)" {
         for (got, [_][]const u8{ "big", "small", "big", "small" }) |cell, want| try std.testing.expectEqualStrings(want, cell.?);
     }
 }
+
+test "CASE WHEN: a CASE takes any number of branches (issue #322)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1), (150), (300), (301)");
+
+    var branches: std.ArrayList(u8) = .empty;
+    defer branches.deinit(allocator);
+    for (1..301) |k| try branches.print(allocator, " WHEN id = {d} THEN {d}", .{ k, k * 10 });
+    const cases = .{
+        .{ "SELECT CASE{s} END FROM t ORDER BY id", [_]?[]const u8{ "10", "1500", "3000", null } },
+        .{ "SELECT CASE{s} ELSE -1 END FROM t ORDER BY id", [_]?[]const u8{ "10", "1500", "3000", "-1" } },
+        .{ "SELECT CONCAT('v', CASE{s} ELSE 'none' END) FROM t ORDER BY id", [_]?[]const u8{ "v10", "v1500", "v3000", "vnone" } },
+    };
+    inline for (cases) |c| {
+        const sql = try std.fmt.allocPrint(allocator, c[0], .{branches.items});
+        defer allocator.free(sql);
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        const got = try helpers.columnText(allocator, &q);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, cell| {
+            if (want) |text| {
+                try std.testing.expectEqualStrings(text, cell orelse return error.TestUnexpectedResult);
+            } else try std.testing.expect(cell == null);
+        }
+    }
+}

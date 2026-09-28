@@ -155,6 +155,7 @@ pub const TokenTag = enum {
     pipe, // | (bitwise OR)
     caret, // ^ (MySQL bitwise XOR; PG/neutral exponentiation)
     tilde, // ~ (bitwise NOT)
+    bang, // ! (MySQL's prefix NOT)
     shl, // <<
     shr, // >>
     coloncolon, // :: (PG cast operator)
@@ -363,7 +364,10 @@ pub const Lexer = struct {
                     self.pos += 2;
                     return Token{ .tag = .neq, .text = self.src[start..self.pos] };
                 }
-                return LexError.LexUnexpectedChar;
+                // MySQL's lexer drops the second `!` of `!!`, so `!!x` is `!x`
+                // there.
+                self.pos += if (self.dialect == .mysql and self.peekChar(1) == '!') 2 else 1;
+                return Token{ .tag = .bang, .text = self.src[start..self.pos] };
             },
             '<' => {
                 if (self.peekChar(1) == '=' and self.peekChar(2) == '>') {
@@ -1261,21 +1265,27 @@ test "lexer: unterminated backtick errors cleanly" {
     try std.testing.expectError(LexError.LexUnterminatedIdentifier, lx.next());
 }
 
-test "lexer: operators including != <> <= >= <=> and the bitwise ones" {
+test "lexer: operators including != <> <= >= <=> ! and the bitwise ones" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lx = Lexer.init(arena.allocator(), "a != b <> c <= d >= e < f > g = h <=> i & j && k | l ^ m << n >> ~o");
+    var lx = Lexer.init(arena.allocator(), "a != b <> c <= d >= e < f > g = h <=> i & j && k | l ^ m << n >> ~o != !!p");
     const expected_tags = [_]TokenTag{
         .identifier, .neq,          .identifier, .neq,        .identifier, .lte,        .identifier,
         .gte,        .identifier,   .lt,         .identifier, .gt,         .identifier, .eq,
         .identifier, .null_safe_eq, .identifier, .amp,        .identifier, .amp_amp,    .identifier,
         .pipe,       .identifier,   .caret,      .identifier, .shl,        .identifier, .shr,
-        .tilde,      .identifier,
+        .tilde,      .identifier,   .neq,        .bang,       .bang,       .identifier,
     };
     for (expected_tags) |tag| {
         try std.testing.expectEqual(tag, (try lx.next()).tag);
     }
     try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+
+    var mysql = Lexer.init(arena.allocator(), "!!p ! !q");
+    mysql.dialect = .mysql;
+    for ([_]TokenTag{ .bang, .identifier, .bang, .bang, .identifier, .eof }) |tag| {
+        try std.testing.expectEqual(tag, (try mysql.next()).tag);
+    }
 }
 
 test "lexer: integer + float + string literals" {

@@ -1926,7 +1926,7 @@ pub const Parser = struct {
         const tok = try look.next();
         if (keywordScalarName(tok.tag) != null) return true;
         return switch (tok.tag) {
-            .identifier, .integer, .big_integer, .floating, .string, .star, .lparen, .minus, .plus, .tilde, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case, .kw_not, .kw_exists, .kw_distinct, .kw_all => true,
+            .identifier, .integer, .big_integer, .floating, .string, .star, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case, .kw_not, .kw_exists, .kw_distinct, .kw_all => true,
             else => false,
         };
     }
@@ -2026,13 +2026,11 @@ pub const Parser = struct {
         // `SELECT 'x'`, `SELECT 1 + 2`, `SELECT @w`. Route through the
         // expression parser so binary operators and aliasing work.
         // (`GROUP BY 1` then references it as ordinal 1.)
-        switch (self.cur.tag) {
-            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier => {
-                const expr = try self.parseScalar();
-                return try self.namedExprItem(item_start, expr);
-            },
-            else => {},
-        }
+        const scalar_led = switch (self.cur.tag) {
+            .plus, .minus, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier => true,
+            else => try self.prefixOperatorAhead(),
+        };
+        if (scalar_led) return try self.namedExprItem(item_start, try self.parseScalar());
 
         // A call with its own argument syntax (CAST(x AS t), EXTRACT(f FROM x),
         // CONVERT(x, t), DATE_ADD(x, INTERVAL n u)), before the
@@ -2056,13 +2054,7 @@ pub const Parser = struct {
 
         // Identifier or function call. Look ahead: `(` after an identifier
         // means a call.
-        if (keywordScalarName(self.cur.tag)) |first| {
-            try self.advance();
-            if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
-            const scalar_atom = try self.parseScalarCallAfterName(first);
-            const expr = try self.continueBinaryFrom(scalar_atom);
-            return try self.namedExprItem(item_start, expr);
-        }
+        if (keywordScalarName(self.cur.tag) != null) return try self.namedExprItem(item_start, try self.parseScalar());
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const first = self.cur.text;
         try self.advance();
@@ -2443,6 +2435,15 @@ pub const Parser = struct {
         return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = try self.closeCase(outer) } };
     }
 
+    /// MySQL's `!x`, NOT spelled as a prefix operator: `x = 0` as a value,
+    /// so it is NULL where `x` is.
+    fn logicalNotValue(self: *Parser, operand: ir.Expr) ParseError!ir.Expr {
+        const outer = self.openCase();
+        errdefer self.abandonCase(outer);
+        const pred = try parse_predicate.elementComparison(self, operand, .eq, .{ .lit = .{ .int = 0 } });
+        return try self.predicateAsValue(pred, outer);
+    }
+
     /// MySQL's `ISNULL(x)`: `x IS NULL` as a value.
     fn isNullValue(self: *Parser, arg: ir.Expr) ParseError!ir.Expr {
         const outer = self.openCase();
@@ -2569,20 +2570,57 @@ pub const Parser = struct {
     fn binaryOpAhead(self: *Parser) ParseError!bool {
         return switch (self.cur.tag) {
             .plus, .minus, .star, .slash, .percent, .kw_div, .pipe_pipe, .arrow, .arrow2, .amp, .pipe, .caret, .shl, .shr => true,
-            else => try self.modOperatorAhead(),
+            else => try self.modOperatorAhead() or try self.collateAhead(),
         };
     }
 
     /// `MOD` between two operands is MySQL's spelling of `%`. It lexes as
     /// an identifier, so it is the operator only when a value follows it.
     pub fn modOperatorAhead(self: *Parser) ParseError!bool {
-        if (self.cur.tag != .identifier or !std.ascii.eqlIgnoreCase(self.cur.text, "mod")) return false;
+        return try self.operatorWordAhead("mod");
+    }
+
+    /// `BINARY x` is MySQL's `CAST(x AS BINARY)`. BINARY lexes as an
+    /// identifier, so it is the operator only when an operand follows it.
+    fn binaryOperatorAhead(self: *Parser) ParseError!bool {
+        return try self.operatorWordAhead("binary");
+    }
+
+    /// Whether the unquoted word `word` sits at the cursor with an operand
+    /// after it, so it is an operator rather than a column's name.
+    fn operatorWordAhead(self: *Parser, word: []const u8) ParseError!bool {
+        if (self.cur.tag != .identifier or self.cur.quoted or !std.ascii.eqlIgnoreCase(self.cur.text, word)) return false;
         var look = self.lex.*;
         const next = try look.next();
         return switch (next.tag) {
-            .identifier, .integer, .big_integer, .floating, .string, .lparen, .minus, .plus, .tilde, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case => true,
+            .identifier, .integer, .big_integer, .floating, .string, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .kw_null, .kw_true, .kw_false, .kw_case => true,
             else => keywordScalarName(next.tag) != null,
         };
+    }
+
+    /// Whether a prefix operator that binds tighter than every binary one
+    /// sits at the cursor: `~`, `!` or `BINARY`.
+    pub fn prefixOperatorAhead(self: *Parser) ParseError!bool {
+        return self.cur.tag == .tilde or self.cur.tag == .bang or try self.binaryOperatorAhead();
+    }
+
+    /// Whether `COLLATE name` follows an operand. COLLATE lexes as an
+    /// identifier; the name is a word or a quoted string.
+    pub fn collateAhead(self: *Parser) ParseError!bool {
+        if (self.cur.tag != .identifier or self.cur.quoted or !std.ascii.eqlIgnoreCase(self.cur.text, "collate")) return false;
+        var look = self.lex.*;
+        const next = try look.next();
+        return next.tag == .identifier or next.tag == .string;
+    }
+
+    /// Consumes each `COLLATE name` at the cursor. Text compares as its
+    /// bytes whatever the collation, as StarRocks compares it, so the clause
+    /// leaves the operand as it is.
+    pub fn skipCollations(self: *Parser) ParseError!void {
+        while (try self.collateAhead()) {
+            try self.advance();
+            try self.advance();
+        }
     }
 
     /// `||` is string concatenation on PG/neutral but logical OR on MySQL;
@@ -2597,6 +2635,7 @@ pub const Parser = struct {
     /// identifier/call/dotted-col but not yet checked for an
     /// operator). Returns `atom` unchanged if no operator follows.
     pub fn continueBinaryFrom(self: *Parser, atom: ir.Expr) ParseError!ir.Expr {
+        try self.skipCollations();
         // JSON `->`/`->>` bind tighter than arithmetic — consume any that
         // trail the already-parsed atom before climbing precedence levels.
         const xored = try self.continueBitXor(try self.consumeJsonArrows(atom));
@@ -2621,10 +2660,26 @@ pub const Parser = struct {
     /// Cursor sits on an interval's unit word: consume it and build the
     /// calendar kernel call that moves `base` by `amount` of that unit.
     fn intervalCall(self: *Parser, base: ir.Expr, amount: ir.Expr) ParseError!ir.Expr {
+        return try self.unitAddCall(try self.parseIntervalUnit(), base, amount);
+    }
+
+    fn parseIntervalUnit(self: *Parser) ParseError!IntervalUnit {
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const unit = intervalUnit(self.cur.text) orelse return ParseError.SqlExpectedKeyword;
         try self.advance();
-        return try self.unitAddCall(unit, base, amount);
+        return unit;
+    }
+
+    /// `INTERVAL n unit + x`: MySQL lets an interval lead a sum, though not
+    /// a difference. `x` takes every arithmetic operator after the plus, as
+    /// in MySQL, and stops at a comparison: MySQL would move the comparison's
+    /// boolean by the interval, where StarRocks compares the moved value.
+    fn parseLeadingInterval(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.kw_interval);
+        const amount = try self.normalizeIntervalAmount(try self.parseScalar(), false);
+        const unit = try self.parseIntervalUnit();
+        try self.expect(.plus);
+        return try self.unitAddCall(unit, try self.parseScalar(), amount);
     }
 
     fn unitAddCall(self: *Parser, unit: IntervalUnit, base: ir.Expr, amount: ir.Expr) ParseError!ir.Expr {
@@ -3310,6 +3365,7 @@ pub const Parser = struct {
             try self.advance();
             atom = try self.parseCastTarget(atom);
         }
+        try self.skipCollations();
         return try self.consumeJsonArrows(atom);
     }
 
@@ -3435,6 +3491,11 @@ pub const Parser = struct {
             try self.expect(.rparen);
             return ir.Expr{ .col_ref = name };
         }
+        if (self.cur.tag == .kw_interval and !try self.intervalCallAhead()) return try self.parseLeadingInterval();
+        if (try self.binaryOperatorAhead()) {
+            try self.advance();
+            return try self.castExprToType(try self.parseCallAtom(), .string);
+        }
         if (keywordScalarName(self.cur.tag)) |name| {
             try self.advance();
             if (self.cur.tag != .lparen) return ParseError.SqlExpectedToken;
@@ -3494,6 +3555,10 @@ pub const Parser = struct {
                 try self.advance();
                 const rhs = try self.parseCallAtom();
                 return try self.negateExpr(rhs);
+            },
+            .bang => {
+                try self.advance();
+                return try self.logicalNotValue(try self.parseCallAtom());
             },
             .tilde => {
                 try self.advance();
