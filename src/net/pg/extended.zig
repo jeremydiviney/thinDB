@@ -610,6 +610,8 @@ fn tryDryCompile(
     const op = sql_mod.parseDialect(aa, substituted.sql, .postgres) catch return null;
     if (isSideEffect(op.*)) return null;
 
+    const lease = catalog.acquireStatement(false) catch return null;
+    defer lease.release();
     const db = catalog.database(session.current_db) orelse return null;
     var compiled = local.compileWithSession(aa, db, session, op) catch return null;
     defer compiled.deinit();

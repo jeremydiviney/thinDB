@@ -13,6 +13,7 @@ const std = @import("std");
 
 test {
     _ = @import("v2_global_aggregate.zig");
+    _ = @import("v2_shape_group_topn.zig");
 }
 const Allocator = std.mem.Allocator;
 

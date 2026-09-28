@@ -989,6 +989,8 @@ fn processDb(session: *const SessionState, buf: []u8) []const u8 {
 }
 
 fn applyInitDb(catalog: *Catalog, session: *SessionState, name: []const u8) !void {
+    const lease = try catalog.acquireStatement(false);
+    defer lease.release();
     const target = try local.resolveUseTarget(catalog, session.current_db, name);
     try session.replace(target.db, target.schema);
 }
@@ -1568,6 +1570,10 @@ fn sendMetadataResult(
     seq_id: *u8,
     client_caps: u32,
 ) !void {
+    // These answers read the catalog outside any statement; the lease keeps
+    // a concurrent DROP from freeing what they read.
+    const lease = try catalog.acquireStatement(false);
+    defer lease.release();
     return switch (kind) {
         .tables => sendTablesResult(allocator, w, catalog, session, payload, seq_id, client_caps),
         .full_tables => sendFullTablesResult(allocator, w, catalog, session, payload, seq_id, client_caps),
@@ -2400,6 +2406,8 @@ fn sendInformationSchemaSelect(
     client_caps: u32,
 ) !bool {
     const kind = informationSchemaKind(tail) orelse return false;
+    const lease = try catalog.acquireStatement(false);
+    defer lease.release();
     const filters = parseInfoFilters(tail);
     var lim = parseInfoLimit(tail);
 
@@ -3303,6 +3311,8 @@ fn sendFlattenedDatabases(
     seq_id: *u8,
     client_caps: u32,
 ) !void {
+    const lease = try catalog.acquireStatement(false);
+    defer lease.release();
     const db_names = try catalog.listDatabases(allocator);
     defer {
         for (db_names) |n| allocator.free(n);
@@ -3877,6 +3887,8 @@ fn handleStmtPrepare(
             const dummy_op = sql.parseWithContext(arena.allocator(), dummy_sql, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch break :blk;
             if (dummy_op.* == .batch) break :blk;
             if (isSideEffectOp(dummy_op.*)) break :blk;
+            const lease = catalog.acquireStatement(false) catch break :blk;
+            defer lease.release();
             const main_db = catalog.database(session.current_db) orelse break :blk;
             var compiled = local.compileWithSession(arena.allocator(), main_db, session.asSession(), dummy_op) catch break :blk;
             defer compiled.deinit();

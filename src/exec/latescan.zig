@@ -49,8 +49,11 @@ pub const LateScan = struct {
     /// + memtable pin (released when this is deinit'd). Kept alive until after
     /// the fetch so `inner_scan.memtableSnap()` stays valid.
     inner: Query,
-    /// Bottom Scan of `inner` — the source of `memtableSnap()` and the table
-    /// the locations point into. Borrowed (owned by `inner`).
+    /// Bottom Scan of `inner`. Borrowed (owned by `inner`). A location is a
+    /// segment index and a memtable row in the snapshot of the scan that
+    /// produced it, so every location resolves against this scan's pinned
+    /// segments and memtable, never the table's live ones: a flush, DELETE or
+    /// compaction since then renumbers both.
     inner_scan: *Scan,
     table: *Table,
 
@@ -65,12 +68,6 @@ pub const LateScan = struct {
     views: []ColumnView,
 
     done: bool = false,
-
-    /// When non-null, `appendMemtableRow` resolves memtable survivors against
-    /// this snapshot instead of `inner_scan.memtableSnap()`. Set only by the
-    /// external `materializeInto` entry point (the zonemap top-N operator owns
-    /// its own pinned snapshot); the normal `fetch` path leaves it null.
-    materialize_snap_override: ?*engine.Memtable = null,
 
     /// Scratch for one (segment, row-group) run of survivor offsets; reused
     /// across runs so a multi-million-row emit does not grow a list per run.
@@ -193,11 +190,11 @@ pub const LateScan = struct {
 
     /// Public wide-column materializer for callers that collect survivor
     /// `__rowloc`s themselves (e.g. the zonemap top-N operator). `locs` is in
-    /// the final emit order; memtable survivors resolve against `snap`. The
-    /// resolved output columns are read back via `outputColumns`. Kept here so
-    /// the late-mat fetch logic lives in exactly one place.
-    pub fn materializeInto(self: *LateScan, locs: []const i64, snap: *engine.Memtable) !void {
-        self.materialize_snap_override = snap;
+    /// the final emit order and must come from a scan over the same snapshot
+    /// as `inner_scan`. The resolved output columns are read back via
+    /// `outputColumns`. Kept here so the late-mat fetch logic lives in
+    /// exactly one place.
+    pub fn materializeInto(self: *LateScan, locs: []const i64) !void {
         try self.materialize(locs);
     }
 
@@ -232,8 +229,7 @@ pub const LateScan = struct {
                         if (cur_entry) |e| self.table.releaseSegment(e);
                         cur_entry = null;
                         cur_seg_idx = seg.seg_idx;
-                        const entry = self.table.manifest.segments.items[seg.seg_idx];
-                        cur_entry = try self.table.acquireSegment(entry.segment_id);
+                        cur_entry = try self.table.acquireSegment(self.inner_scan.segs[seg.seg_idx].segment_id);
                     }
                     // Gather the maximal run of consecutive survivors sharing
                     // this (segment, row group) so each column decodes once.
@@ -327,7 +323,7 @@ pub const LateScan = struct {
     }
 
     fn appendMemtableRow(self: *LateScan, row: usize) !void {
-        const snap = self.materialize_snap_override orelse self.inner_scan.memtableSnap();
+        const snap = self.inner_scan.memtableSnap();
         const one = [_]u32{@intCast(row)};
         for (self.out_phys, 0..) |phys, out_idx| {
             try engine.transform.appendByIndices(

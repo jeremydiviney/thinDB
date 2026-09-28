@@ -176,10 +176,14 @@ const TestClient = struct {
     }
 
     fn sendQuery(self: *TestClient, sql_text: []const u8) !void {
+        try self.sendCommand(0x03, sql_text);
+    }
+
+    fn sendCommand(self: *TestClient, command: u8, body: []const u8) !void {
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
-        try payload.append(self.allocator, 0x03);
-        try payload.appendSlice(self.allocator, sql_text);
+        try payload.append(self.allocator, command);
+        try payload.appendSlice(self.allocator, body);
         try mysql_packet.writePacket(&self.writer.interface, 0, payload.items);
         try self.writer.interface.flush();
     }
@@ -497,9 +501,13 @@ const TestClient = struct {
     fn readResultSet(self: *TestClient, dest_arena: std.mem.Allocator) ![]const []const ?[]const u8 {
         const col_count_pkt = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
         defer self.allocator.free(col_count_pkt.payload);
+        return self.readResultRows(dest_arena, col_count_pkt.payload);
+    }
 
+    /// The rows of a result set whose column-count packet was already read.
+    fn readResultRows(self: *TestClient, dest_arena: std.mem.Allocator, col_count_payload: []const u8) ![]const []const ?[]const u8 {
         var cursor: usize = 0;
-        const col_count = try mysql_packet.readLenEncInt(col_count_pkt.payload, &cursor);
+        const col_count = try mysql_packet.readLenEncInt(col_count_payload, &cursor);
 
         var i: u64 = 0;
         while (i < col_count) : (i += 1) {
@@ -3126,6 +3134,79 @@ test "mysql wire: an unqualified ON column resolves against the session's tables
         defer allocator.free(packet.payload);
         try std.testing.expectEqual(@as(u8, 0xff), packet.payload[0]);
         try std.testing.expectEqual(@as(u16, 1052), std.mem.readInt(u16, packet.payload[1..3], .little));
+    }
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+const doomed_schema = thindb.TableSchema{
+    .columns = &.{.{ .name = "doomed_col", .type = .bigint }},
+    .order_key = &.{"doomed_col"},
+    .unique = false,
+};
+const doomed_opts = thindb.TableOptions{ .order_key = &.{"doomed_col"} };
+
+/// Whether a reply shows nothing of the dropped `doomed` database: an ERR,
+/// or a result set none of whose cells names it.
+fn replyForgetsDoomed(client: *TestClient, arena: std.mem.Allocator) !bool {
+    const first = try mysql_packet.readPacket(arena, &client.reader.interface);
+    if (first.payload[0] == 0xFF) return true;
+    if (first.payload[0] == 0x00) return false;
+    const rows = try client.readResultRows(arena, first.payload);
+    for (rows) |row| for (row) |cell| {
+        if (std.mem.indexOf(u8, cell orelse "", "doomed") != null) return false;
+    };
+    return true;
+}
+
+// Metadata answers and COM_INIT_DB read the catalog outside any statement
+// (#90). Each must wait out a DROP DATABASE's lease rather than read the
+// database the drop frees.
+test "mysql wire: catalog reads outside a statement wait out a DROP DATABASE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 67 } };
+    const server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer thread.join();
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main");
+
+    const com_query: u8 = 0x03;
+    const com_init_db: u8 = 0x02;
+    const probes = .{
+        .{ com_query, "SHOW TABLES FROM `doomed__public`" },
+        .{ com_query, "SHOW FULL COLUMNS FROM `doomed_t` FROM `doomed__public`" },
+        .{ com_query, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'doomed__public'" },
+        .{ com_query, "SHOW DATABASES" },
+        .{ com_init_db, "doomed__public" },
+    };
+    inline for (probes) |probe| {
+        const db = try catalog.createDatabase("doomed");
+        _ = try db.table("doomed_t", doomed_schema, doomed_opts);
+        {
+            var drop_lease: ?thindb.Catalog.StatementLease = try catalog.acquireStatement(true);
+            defer if (drop_lease) |lease| lease.release();
+            try client.sendCommand(probe[0], probe[1]);
+            try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+            try catalog.dropDatabase("doomed");
+            drop_lease.?.release();
+            drop_lease = null;
+        }
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        if (!try replyForgetsDoomed(&client, arena.allocator())) {
+            std.debug.print("answered from the dropped database: {s}\n", .{probe[1]});
+            return error.TestUnexpectedResult;
+        }
     }
     try client.sendQuit();
     if (sctx.err) |e| return e;

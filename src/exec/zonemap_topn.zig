@@ -301,7 +301,7 @@ pub const ZonemapTopN = struct {
         // zero-row batch is an out-of-bounds read — the #46 server crash.
         if (locs.len == 0) return null;
 
-        try self.late.materializeInto(locs, self.inner_scan.memtableSnap());
+        try self.late.materializeInto(locs);
         const out = self.late.outputColumns();
         for (out.columns, 0..) |c, i| self.late.views[i] = c.view();
         return Batch{
@@ -438,8 +438,7 @@ pub const ZonemapTopN = struct {
 
         var seg_idx: usize = 0;
         while (seg_idx < self.segment_count) : (seg_idx += 1) {
-            const entry = self.table.manifest.segments.items[seg_idx];
-            const handle = try self.table.acquireSegment(entry.segment_id);
+            const handle = try self.table.acquireSegment(self.inner_scan.segs[seg_idx].segment_id);
             defer self.table.releaseSegment(handle);
 
             for (handle.seg.info.row_groups, 0..) |rg, rg_idx| {
@@ -626,8 +625,7 @@ const SegCache = struct {
     fn segment(self: *SegCache, z: *const ZonemapTopN, allocator: Allocator, seg_idx: usize) !*storage.ReadSegment {
         _ = allocator;
         if (self.entries[seg_idx] == null) {
-            const entry = z.table.manifest.segments.items[seg_idx];
-            self.entries[seg_idx] = try z.table.acquireSegment(entry.segment_id);
+            self.entries[seg_idx] = try z.table.acquireSegment(z.inner_scan.segs[seg_idx].segment_id);
         }
         return &self.entries[seg_idx].?.seg;
     }
