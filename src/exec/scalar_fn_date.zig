@@ -379,16 +379,28 @@ fn addMonths(days: i32, n_months: i64) ?i32 {
     return common.ymdToDays(year, month, @min(@as(u32, ymd.day), common.lastDayOfMonth(year, month)));
 }
 
+/// UNIX_TIMESTAMP: whole seconds since 1970-01-01 00:00:00 UTC. A time
+/// before 1970 is 0, as in StarRocks and MySQL.
 pub fn unixTimestampKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @divFloor(s[i], 1_000_000));
+    for (args[0].data.datetime[0..row_count]) |micros| {
+        const seconds: i64 = @max(@divFloor(micros, std.time.us_per_s), 0);
+        try out.data.bigint.append(allocator, seconds);
+    }
 }
 
+const LAST_UNIX_SECOND: i64 = @divFloor(common.LAST_DATETIME_MICROS, std.time.us_per_s);
+
+/// FROM_UNIXTIME: the DATETIME `n` seconds after 1970-01-01 00:00:00 UTC. A
+/// negative count is NULL, as in StarRocks and MySQL, and so is one past
+/// 9999-12-31 23:59:59.
 pub fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.bigint;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, s[i] * 1_000_000);
+    const base = out.data.rowCount();
+    const counts = args[0].data.bigint;
+    for (0..row_count) |i| {
+        const valid = args[0].isValid(i) and counts[i] >= 0 and counts[i] <= LAST_UNIX_SECOND;
+        try out.data.datetime.append(allocator, if (valid) counts[i] * std.time.us_per_s else 0);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
 }
 
 /// CAST(datetime AS date) — drop the time-of-day (floor to the day).
