@@ -465,3 +465,89 @@ test "text that isn't a literal reads as CAST reads it where a date function wan
         try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM one", &.{c[1]});
     }
 }
+
+test "a number reads as CAST(n AS DATETIME) reads it where a date function wants a date or datetime, as in StarRocks (issue #424)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE nums (id BIGINT PRIMARY KEY, n BIGINT)");
+    try exec(allocator, db, "INSERT INTO nums VALUES (1, 20260131), (2, 20260131103000), (3, 260131), (4, 2026), " ++
+        "(5, 20261301), (6, 20260131240000), (7, -20260131), (8, NULL)");
+
+    // Expected values are StarRocks', one per row of `nums`: YYYYMMDD,
+    // YYYYMMDDhhmmss and YYMMDD read, and any other number is NULL.
+    const cases = .{
+        .{ "DATE_ADD(n, INTERVAL 1 DAY)", [_]?[]const u8{ "2026-02-01 00:00:00", "2026-02-01 10:30:00", "2026-02-01 00:00:00", null, null, null, null, null } },
+        .{ "n + INTERVAL 1 MONTH", [_]?[]const u8{ "2026-02-28 00:00:00", "2026-02-28 10:30:00", "2026-02-28 00:00:00", null, null, null, null, null } },
+        .{ "DATE_SUB(n, INTERVAL 1 HOUR)", [_]?[]const u8{ "2026-01-30 23:00:00", "2026-01-31 09:30:00", "2026-01-30 23:00:00", null, null, null, null, null } },
+        .{ "TIMESTAMPADD(MINUTE, 90, n)", [_]?[]const u8{ "2026-01-31 01:30:00", "2026-01-31 12:00:00", "2026-01-31 01:30:00", null, null, null, null, null } },
+        .{ "YEAR(n)", [_]?[]const u8{ "2026", "2026", "2026", null, null, null, null, null } },
+        .{ "MONTH(n)", [_]?[]const u8{ "1", "1", "1", null, null, null, null, null } },
+        .{ "DAY(n)", [_]?[]const u8{ "31", "31", "31", null, null, null, null, null } },
+        .{ "QUARTER(n)", [_]?[]const u8{ "1", "1", "1", null, null, null, null, null } },
+        .{ "DAYOFWEEK(n)", [_]?[]const u8{ "7", "7", "7", null, null, null, null, null } },
+        .{ "DAYOFYEAR(n)", [_]?[]const u8{ "31", "31", "31", null, null, null, null, null } },
+        .{ "WEEK(n, 1)", [_]?[]const u8{ "5", "5", "5", null, null, null, null, null } },
+        .{ "YEARWEEK(n)", [_]?[]const u8{ "202604", "202604", "202604", null, null, null, null, null } },
+        .{ "WEEKOFYEAR(n)", [_]?[]const u8{ "5", "5", "5", null, null, null, null, null } },
+        .{ "LAST_DAY(n)", [_]?[]const u8{ "2026-01-31", "2026-01-31", "2026-01-31", null, null, null, null, null } },
+        .{ "DAYNAME(n)", [_]?[]const u8{ "Saturday", "Saturday", "Saturday", null, null, null, null, null } },
+        .{ "MONTHNAME(n)", [_]?[]const u8{ "January", "January", "January", null, null, null, null, null } },
+        .{ "TO_DAYS(n)", [_]?[]const u8{ "740012", "740012", "740012", null, null, null, null, null } },
+        .{ "DATEDIFF(n, '2026-01-01')", [_]?[]const u8{ "30", "30", "30", null, null, null, null, null } },
+        .{ "DATEDIFF(20260301, n)", [_]?[]const u8{ "29", "29", "29", null, null, null, null, null } },
+        .{ "DATE_DIFF('hour', n, '2026-01-01')", [_]?[]const u8{ "720", "730", "720", null, null, null, null, null } },
+        .{ "TIMESTAMPDIFF(HOUR, '2026-01-01', n)", [_]?[]const u8{ "720", "730", "720", null, null, null, null, null } },
+        .{ "MONTHS_DIFF(n, 20251115)", [_]?[]const u8{ "2", "2", "2", null, null, null, null, null } },
+        .{ "DAYS_DIFF(n, DATE '2026-01-01')", [_]?[]const u8{ "30", "30", "30", null, null, null, null, null } },
+        .{ "DATE_FORMAT(n, '%Y-%m-%d %H:%i')", [_]?[]const u8{ "2026-01-31 00:00", "2026-01-31 10:30", "2026-01-31 00:00", null, null, null, null, null } },
+        .{ "DATE_TRUNC('month', n)", [_]?[]const u8{ "2026-01-01 00:00:00", "2026-01-01 00:00:00", "2026-01-01 00:00:00", null, null, null, null, null } },
+        .{ "UNIX_TIMESTAMP(n)", [_]?[]const u8{ "1769817600", "1769855400", "1769817600", null, null, null, null, null } },
+    };
+    inline for (cases) |c| {
+        const want: [8]?[]const u8 = c[1];
+        try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM nums ORDER BY id", &want);
+    }
+
+    const in_2026 = try collectBigints(allocator, db, "SELECT id FROM nums WHERE YEAR(n) = 2026 ORDER BY id");
+    defer allocator.free(in_2026);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, in_2026);
+
+    // Every integer width, a float, a boolean, a literal and any other
+    // expression reads so. StarRocks takes no decimal here; thinDB reads
+    // one as CAST does.
+    try exec(allocator, db, "CREATE TABLE typed (id BIGINT PRIMARY KEY, i INT, si SMALLINT, x DOUBLE, f FLOAT, b BOOLEAN, d DECIMAL(16,1))");
+    try exec(allocator, db, "INSERT INTO typed VALUES (1, 20260131, 101, 20260131103000.9, 20260131, true, 20260131.7)");
+    const typed_cases = .{
+        .{ "YEAR(i)", "2026" },
+        .{ "YEAR(si)", "2000" },
+        .{ "DATE_FORMAT(x, '%Y-%m-%d %H:%i:%s')", "2026-01-31 10:30:00" },
+        .{ "YEAR(f)", null },
+        .{ "YEAR(b)", null },
+        .{ "YEAR(d)", "2026" },
+        .{ "YEAR(20260131.7)", "2026" },
+        .{ "DATE_FORMAT(20260131103000.9, '%Y-%m-%d %H:%i:%s')", "2026-01-31 10:30:00" },
+        .{ "YEAR(id + 20260130)", "2026" },
+        .{ "YEAR(20260131)", "2026" },
+        .{ "MONTH(260131)", "1" },
+        .{ "YEAR(2026)", null },
+        .{ "DATE_ADD(20260131, INTERVAL 1 DAY)", "2026-02-01 00:00:00" },
+        .{ "MONTHS_DIFF(20260131, 20251231)", "1" },
+        .{ "DATEDIFF(20260131, '2026-01-01')", "30" },
+        .{ "DATEDIFF(20260131, DATE '2026-01-01')", "30" },
+        .{ "DATEDIFF(20260131, CONCAT('2026-01-0', id))", "30" },
+        .{ "DATEDIFF(20260131, NULL)", null },
+        .{ "DATE_FORMAT(20260131103000, '%Y-%m-%d %H:%i:%s')", "2026-01-31 10:30:00" },
+    };
+    inline for (typed_cases) |c| {
+        try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM typed", &.{c[1]});
+    }
+
+    // A function that returns one of its arguments meets a number and a
+    // date at their common type, which StarRocks makes the number (#430):
+    // the date is its YYYYMMDD number there, not the number a date.
+    try expectStrings(allocator, db, "SELECT CAST(COALESCE(i, DATE '2026-01-01') AS CHAR) FROM typed", &.{"20260131"});
+    try expectStrings(allocator, db, "SELECT CAST(GREATEST(i, DATE '2026-01-01') AS CHAR) FROM typed", &.{"20260131"});
+}

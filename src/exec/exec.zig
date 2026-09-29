@@ -324,13 +324,15 @@ pub const VTable = struct {
     canCodeColumn: *const fn (ptr: *anyopaque, name: []const u8) bool,
     /// Phase 4.2 multi-key: roll back a Scan's coded-column setup (gate undo).
     clearDictCodeColumns: *const fn (ptr: *anyopaque) void,
-    /// Restrict this operator's MATERIALIZED output to the named columns — the
-    /// only ones a downstream consumer (e.g. a GROUP BY) actually reads. Lets the
-    /// parallel-scan materialize skip deep-copying columns that were decoded only
-    /// to feed a fused filter/compute (e.g. `URL` behind `length(URL)` + `URL<>''`)
-    /// and are dead above. A fused (pass-through) Filter forwards it; an UNFUSED
-    /// Filter swallows it (its predicate still needs those columns at runtime).
-    /// Every other operator no-ops via `makeQuery`'s `@hasDecl` guard.
+    /// Restrict this operator's output to the named columns — the only ones a
+    /// downstream consumer (e.g. a GROUP BY) actually reads. Lets a parallel
+    /// scan skip carrying and deep-copying columns that were decoded only to
+    /// feed a fused filter/compute (e.g. `URL` behind `length(URL)` +
+    /// `URL<>''`) and are dead above. The consumer must read the result through
+    /// the names, since the schema may shrink. A fused (pass-through) Filter
+    /// forwards it; an UNFUSED Filter swallows it (its predicate still needs
+    /// those columns at runtime). Every other operator no-ops via
+    /// `makeQuery`'s `@hasDecl` guard.
     setEmitProjection: *const fn (ptr: *anyopaque, keep: []const []const u8) anyerror!void,
     /// True when the column DATA (and any sidecar payloads) behind every batch
     /// this operator emits stays valid until the operator's deinit — only the
@@ -590,7 +592,7 @@ pub const Query = struct {
     }
 
     /// Tell the underlying parallel scan that the consumer above only reads
-    /// `keep` — so its materialize can drop dead columns (decoded for a fused
+    /// `keep` — so it can drop dead columns (decoded for a fused
     /// filter/compute, never read above). See `VTable.setEmitProjection`.
     pub fn setEmitProjection(self: Query, keep: []const []const u8) !void {
         return self.vtable.setEmitProjection(self.ptr, keep);
