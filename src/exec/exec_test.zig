@@ -1254,6 +1254,109 @@ test "parallel scan matches serial across DOP levels (with fused filter)" {
     }
 }
 
+test "parallel scan: the next pull frees the materialized buffer the consumer was given" {
+    // Batch data lives only until the next pull, so a consumer that copies its
+    // input (sort, partitioned aggregate) must not also keep the scan's copy
+    // charged: each emitted survivor buffer goes back as soon as the consumer
+    // asks for the next batch.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    var next_id: i64 = 0;
+    for (0..4) |_| {
+        var rows: [100]struct { id: i64, v: i32 } = undefined;
+        for (&rows) |*r| {
+            r.id = next_id;
+            r.v = @intCast(@mod(next_id, 7));
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+
+    const survivors = 250;
+    const expected = blk: {
+        var ids: [survivors]i64 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(150 + i);
+        break :blk ids;
+    };
+    const materialize = @intFromEnum(exec.memory.Source.materialize);
+
+    inline for (.{ 1, 4 }) |dop| {
+        // Physical tracking (the scan mints its own accountant from the table
+        // budget, as on the server): freeing is what lowers the charge.
+        {
+            var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+            const ps = exec.queryAs(exec.ParallelScan, base).?;
+            var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+            defer q.deinit();
+            var got: std.ArrayList(i64) = .empty;
+            defer got.deinit(allocator);
+            var first: usize = 0;
+            var prev: usize = std.math.maxInt(usize);
+            while (try q.next()) |b| {
+                try std.testing.expect(ps.mode == .materialize);
+                const charged = ps.acct.?.current_bytes;
+                if (got.items.len == 0) first = charged;
+                try std.testing.expect(charged < prev);
+                prev = charged;
+                try got.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+            }
+            try std.testing.expect(first - ps.acct.?.current_bytes >= survivors * (@sizeOf(i64) + @sizeOf(i32)));
+            std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
+            try std.testing.expectEqualSlices(i64, &expected, got.items);
+        }
+        // Reserved accounting: the `.materialize` reservation steps down with
+        // each pull and reaches zero at the end of the stream.
+        {
+            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
+            var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+            defer q.deinit();
+            var rows: usize = 0;
+            var batches: usize = 0;
+            var prev: usize = std.math.maxInt(usize);
+            while (try q.next()) |b| {
+                const charged = acct.by_source[materialize];
+                try std.testing.expect(charged > 0 and charged < prev);
+                prev = charged;
+                rows += b.row_count;
+                batches += 1;
+            }
+            try std.testing.expectEqual(@as(usize, survivors), rows);
+            if (dop > 1) try std.testing.expect(batches > 1);
+            try std.testing.expectEqual(@as(usize, 0), acct.by_source[materialize]);
+        }
+        // A consumer that stops early (LIMIT) leaves the rest to deinit.
+        {
+            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            {
+                var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
+                var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+                defer q.deinit();
+                _ = try q.next();
+                _ = try q.next();
+            }
+            try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
+        }
+    }
+}
+
 const SlotHolder = struct {
     sched: *core_scheduler.CoreScheduler,
     release: *std.atomic.Value(bool),
@@ -3004,6 +3107,139 @@ test "parallel scan compute split: safe derived fused, unsafe (CASE) stays seria
         std.sort.pdq(i64, b, {}, std.sort.asc(i64));
         try std.testing.expectEqualSlices(i64, a, b);
     }
+}
+
+test "parallel scan: a filter on a fused derived column runs in the workers; a compute alone streams" {
+    // `WHERE a % 32 = 0` lowers to a Filter on a hidden computed column above
+    // a fused Compute. No Scan can take that predicate, so the workers must
+    // apply it inside their compute pipelines, bounding what they materialize.
+    // With no filter, the fused compute keeps every row, so the scan must
+    // stream instead of copying the whole table before its first emit.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    const pool = [_][]const u8{ "x", "xx", "xxx", "xxxx", "xxxxx" };
+    var rows: [128]struct { id: i64, s: []const u8 } = undefined;
+    for (&rows, 0..) |*r, i| {
+        r.id = @intCast(i);
+        r.s = if (i % 7 == 0) "" else pool[i % 5];
+    }
+    try t.insert(&rows);
+    try t.flush();
+    var tail: [16]struct { id: i64, s: []const u8 } = undefined;
+    for (&tail, 0..) |*r, i| {
+        r.id = @intCast(128 + i);
+        r.s = pool[i % 5];
+    }
+    try t.insert(&tail);
+
+    const derived = [_]@import("compute.zig").Derived{
+        .{ .name = "l", .expr = .{ .call = .{ .fn_name = "length", .args = &.{.{ .col_ref = "s" }} } } },
+    };
+    const long_only = leafExpr("l", .gte, .{ .int = 3 });
+
+    const sortedLengths = struct {
+        fn run(a: std.mem.Allocator, q: *Query) ![]i32 {
+            var out: std.ArrayList(i32) = .empty;
+            errdefer out.deinit(a);
+            while (try q.next()) |b| try out.appendSlice(a, b.values[2].data.int[0..b.row_count]);
+            const s = try out.toOwnedSlice(a);
+            std.sort.pdq(i32, s, {}, std.sort.asc(i32));
+            return s;
+        }
+    }.run;
+
+    const expect_all = blk: {
+        var base = try scan(allocator, t);
+        var q = try base.compute(&derived);
+        defer q.deinit();
+        break :blk try sortedLengths(allocator, &q);
+    };
+    defer allocator.free(expect_all);
+    const expect_long = blk: {
+        var base = try scan(allocator, t);
+        var computed = try base.compute(&derived);
+        var q = try computed.filter(long_only);
+        defer q.deinit();
+        break :blk try sortedLengths(allocator, &q);
+    };
+    defer allocator.free(expect_long);
+    try std.testing.expect(expect_long.len > 0 and expect_long.len < expect_all.len);
+
+    inline for (.{ 1, 2, 4, 8 }) |dop| {
+        {
+            var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+            const ps = exec.queryAs(exec.ParallelScan, base).?;
+            try std.testing.expect(try base.tryFuseCompute(&derived));
+            var q = try base.filter(long_only);
+            defer q.deinit();
+            try std.testing.expect(exec.queryAs(@import("filter.zig").Filter, q).?.fused);
+            const got = try sortedLengths(allocator, &q);
+            defer allocator.free(got);
+            try std.testing.expect(ps.mode == .materialize);
+            try std.testing.expectEqualSlices(i32, expect_long, got);
+        }
+        {
+            var q = try exec.ParallelScan.create(allocator, t, null, null, dop);
+            defer q.deinit();
+            const ps = exec.queryAs(exec.ParallelScan, q).?;
+            try std.testing.expect(try q.tryFuseCompute(&derived));
+            const got = try sortedLengths(allocator, &q);
+            defer allocator.free(got);
+            try std.testing.expect(ps.mode == .round);
+            try std.testing.expectEqualSlices(i32, expect_all, got);
+        }
+    }
+}
+
+test "parallel buffer scan: a filter on a fused derived column runs in the stripe workers and still streams" {
+    const allocator = std.testing.allocator;
+    const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
+    const storage = @import("../storage/storage.zig");
+    const n: usize = @import("mat_stage.zig").chunk_rows * 2 + 500;
+    const data = try allocator.alloc(i64, n);
+    defer allocator.free(data);
+    for (data, 0..) |*d, i| d.* = @intCast(i);
+    const source_schema = [_]types.Column{.{ .name = "v", .type = .bigint }};
+    const source_views = [_]storage.ColumnView{.{ .data = .{ .bigint = data }, .nulls = null }};
+
+    const set = try exec.StageSet.create(allocator);
+    defer set.deinit();
+    const source = try SingleBatchSource.create(allocator, .{ .schema = &source_schema, .values = &source_views, .row_count = n });
+    const stage = try set.addStage(source, null);
+
+    var base = try exec.ParallelScan.createOverStage(allocator, allocator, stage, null, 3);
+    const ps = exec.queryAs(exec.ParallelScan, base).?;
+    const derived = [_]@import("compute.zig").Derived{
+        .{ .name = "m", .expr = .{ .call = .{ .fn_name = "mod", .args = &.{ .{ .col_ref = "v" }, .{ .lit = .{ .bigint = 7 } } } } } },
+    };
+    try std.testing.expect(try base.tryFuseCompute(&derived));
+    var q = try base.filter(leafExpr("m", .eq, .{ .bigint = 0 }));
+    defer q.deinit();
+    try std.testing.expect(exec.queryAs(@import("filter.zig").Filter, q).?.fused);
+
+    var count: usize = 0;
+    while (try q.next()) |b| {
+        for (b.values[0].data.bigint[0..b.row_count]) |v| try std.testing.expectEqual(@as(i64, 0), @mod(v, 7));
+        count += b.row_count;
+    }
+    try std.testing.expect(ps.mode == .round);
+    try std.testing.expectEqual((n + 6) / 7, count);
 }
 
 test "SetUnion probe forwarding: join probes union arms inside scan workers" {
