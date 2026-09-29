@@ -343,7 +343,7 @@ fn normalizeJoinKeyTypes(
             aa,
             &left_keys,
             &right_casts,
-            .order,
+            .{ .order = rp.op },
             rp.left,
             left_schema[left_idx].type,
             rp.right,
@@ -399,15 +399,15 @@ fn nullFlagExpr(aa: Allocator, name: []const u8) !exec.Expr {
 }
 
 /// How a join compares a key pair: for equality (hashed or sorted) or for
-/// order (a range predicate).
-const KeyUse = enum { equality, order };
+/// order, by a range predicate's operator (`left <op> right`).
+const KeyUse = union(enum) { equality, order: predicate.PredicateOp };
 
 /// A conversion one join key takes before the join.
 const KeyConversion = union(enum) {
     /// CAST to the type.
     cast: Type,
-    /// Text read exactly as the type (`scalar_fn.textKeyFnName`).
-    text_key: Type,
+    /// Read as the type another way (`scalar_fn.keyFnName`).
+    read: struct { reading: scalar_fn.KeyReading, target: Type },
 };
 
 const KeyConversions = struct {
@@ -454,7 +454,8 @@ fn convertKeyPair(
 /// Text meeting a number or a temporal is read as the other key's type: for
 /// equality exactly, so `'12.0'` meets 12, `'12.5'` meets no integer and
 /// text that isn't a number meets nothing; for order both keys meet as DOUBLE,
-/// or as DATETIME against a temporal.
+/// or as DATETIME against a temporal. Numbers meet at their common type,
+/// unless that is a decimal short of one key's values (`cappedDecimalKeys`).
 fn joinKeyConversions(left: Type, right: Type, use: KeyUse) KeyConversions {
     const left_kind = predicate.comparisonKind(left);
     const right_kind = predicate.comparisonKind(right);
@@ -465,16 +466,68 @@ fn joinKeyConversions(left: Type, right: Type, use: KeyUse) KeyConversions {
         return .{ .left = flipped.right, .right = flipped.left };
     }
     const target = commonJoinKeyType(left, right) orelse return .{};
-    return .{
-        .left = if (std.meta.eql(left, target)) null else .{ .cast = target },
-        .right = if (std.meta.eql(right, target)) null else .{ .cast = target },
-    };
+    if (target.decimalSpec()) |spec| {
+        if (!decimalHoldsEvery(spec, left)) return cappedDecimalKeys(left, right, true, target, use);
+        if (!decimalHoldsEvery(spec, right)) return cappedDecimalKeys(left, right, false, target, use);
+    }
+    return .{ .left = castTo(left, target), .right = castTo(right, target) };
+}
+
+fn castTo(t: Type, target: Type) ?KeyConversion {
+    return if (std.meta.eql(t, target)) null else .{ .cast = target };
+}
+
+/// Whether DECIMAL(`spec`) holds every value of `t`. None holds every
+/// LARGEINT, whose values run to 39 digits.
+fn decimalHoldsEvery(spec: types.DecimalSpec, t: Type) bool {
+    if (t == .largeint) return false;
+    const own = decimal.promoteSpec(t) orelse return true;
+    return own.s <= spec.s and own.p - own.s <= spec.p - spec.s;
+}
+
+/// Conversions for a key pair whose common decimal (`common`, capped at 38
+/// digits) can't hold every value of one key, the wide one: a LARGEINT, or
+/// a key with more integer digits than `common` keeps beside the other
+/// key's scale. The other key's values all lie within `common`, so a wide
+/// value past it equals none of them: for equality the wide key reads as
+/// the `common` value it equals, NULL (no match) past it. For order the
+/// keys meet at the wide key's own type instead, the other key rounded to
+/// its scale in the direction that keeps the order: for `w` on the wide
+/// key's scale, `w > r` and `w <= r` hold exactly as they do against
+/// `floor(r)`, and `w < r` and `w >= r` as against `ceil(r)`.
+fn cappedDecimalKeys(left: Type, right: Type, left_is_wide: bool, common: Type, use: KeyUse) KeyConversions {
+    const wide = if (left_is_wide) left else right;
+    const other = if (left_is_wide) right else left;
+    var wide_conversion: ?KeyConversion = .{ .read = .{ .reading = .exact, .target = common } };
+    var other_conversion = castTo(other, common);
+    switch (use) {
+        .equality => {},
+        .order => |op| {
+            const own: Type = if (wide == .largeint) .largeint else blk: {
+                const spec = decimal.promoteSpec(wide).?;
+                break :blk decimal.decTypeFor(spec.p, spec.s);
+            };
+            // `w <op> r`, or `r <op> w` when the wide key is on the right.
+            const wide_above: bool = switch (op) {
+                .gt, .gte => left_is_wide,
+                .lt, .lte => !left_is_wide,
+                .eq, .neq => return .{ .left = castTo(left, common), .right = castTo(right, common) },
+            };
+            const strict = op == .gt or op == .lt;
+            wide_conversion = castTo(wide, own);
+            other_conversion = .{ .read = .{ .reading = if (wide_above == strict) .floor else .ceil, .target = own } };
+        },
+    }
+    return if (left_is_wide)
+        .{ .left = wide_conversion, .right = other_conversion }
+    else
+        .{ .left = other_conversion, .right = wide_conversion };
 }
 
 /// Conversions for a text key (`.left`) meeting a key of type `value`.
 fn textMeetsValue(value: Type, value_kind: predicate.ComparisonKind, use: KeyUse) KeyConversions {
     const shared: Type = if (value_kind == .temporal) .datetime else .double;
-    if (use == .equality and value != .float and value != .double) return .{ .left = .{ .text_key = value } };
+    if (use == .equality and value != .float and value != .double) return .{ .left = .{ .read = .{ .reading = .exact, .target = value } } };
     return .{
         .left = .{ .cast = shared },
         .right = if (std.meta.eql(value, shared)) null else .{ .cast = shared },
@@ -509,7 +562,7 @@ fn joinKeyCoercionEligible(name: []const u8) bool {
 fn keyConversionExpr(aa: Allocator, name: []const u8, conversion: KeyConversion) !?exec.Expr {
     const fn_name = (switch (conversion) {
         .cast => |target| try scalar_fn.castFnName(aa, target),
-        .text_key => |target| try scalar_fn.textKeyFnName(aa, target),
+        .read => |r| try scalar_fn.keyFnName(aa, r.reading, r.target),
     }) orelse return null;
     const args = try aa.alloc(exec.Expr, 1);
     args[0] = .{ .col_ref = try aa.dupe(u8, name) };
@@ -534,9 +587,9 @@ fn convertedKeyType(t: Type, conversion: ?KeyConversion) Type {
             .uuid => t,
             else => target,
         },
-        .text_key => |target| switch (target) {
+        .read => |r| switch (r.target) {
             .float, .double, .varchar, .char, .string, .json, .uuid => t,
-            else => target,
+            else => r.target,
         },
     };
 }

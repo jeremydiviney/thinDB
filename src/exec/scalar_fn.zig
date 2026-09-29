@@ -144,7 +144,7 @@ pub fn resolveWithRegistry(
     if (try resolveSingleRow(aa, name, arg_types)) |ov| return ov;
     if (try resolveCharset(aa, name, arg_types)) |ov| return ov;
     if (try resolveBenchmark(aa, name, arg_types)) |ov| return ov;
-    if (try resolveTextKey(aa, name, arg_types)) |ov| return ov;
+    if (try resolveKeyFn(aa, name, arg_types)) |ov| return ov;
     if (try resolveRowKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveOrderKey(aa, name, arg_types)) |ov| return ov;
     if (try resolveHexLiteralAs(aa, name, arg_types)) |ov| return ov;
@@ -636,7 +636,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
     inline for (.{ "charset", "collation", "benchmark" }) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
-    if (std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return true;
+    if (keyFnParts(name) != null) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
     if (std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN) or std.mem.eql(u8, name, PG_TEXT_FN)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
@@ -734,31 +734,59 @@ pub fn castFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
     return try arena.dupe(u8, name);
 }
 
-const TEXT_KEY_PREFIX = "text_key:";
+/// How a join reads one key as a type where CAST would read it otherwise
+/// (`keyFnName`).
+pub const KeyReading = enum {
+    /// The type's value the key equals under the comparison rule, NULL when
+    /// there is none: text `'12.0'` is 12 and `'12.5'` no integer, and a
+    /// number past a decimal's range none of its values.
+    exact,
+    /// A number rounded down to the type's scale.
+    floor,
+    /// A number rounded up to the type's scale.
+    ceil,
+};
 
-/// The function that reads a text join key as `ty`, the other key's type:
-/// each row becomes the `ty` value it equals under the comparison rule, or
-/// NULL (`dec.textKeyKernel`). The target rides in the name, as CAST's
-/// DECIMAL target does; null when no such reading exists.
-pub fn textKeyFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
-    if (ty.decimalSpec()) |spec| return try std.fmt.allocPrint(arena, TEXT_KEY_PREFIX ++ "decimal:{d}:{d}", .{ spec.p, spec.s });
+const KEY_FN_PREFIX = "key_";
+
+/// The function that reads a join key as `ty` by `reading`. The target
+/// rides in the name, as CAST's DECIMAL target does; null when no such
+/// reading exists.
+pub fn keyFnName(arena: Allocator, reading: KeyReading, ty: Type) Allocator.Error!?[]const u8 {
+    if (ty.decimalSpec()) |spec| return try std.fmt.allocPrint(arena, KEY_FN_PREFIX ++ "{s}:decimal:{d}:{d}", .{ @tagName(reading), spec.p, spec.s });
     return switch (ty) {
-        .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .date, .datetime => try std.fmt.allocPrint(arena, TEXT_KEY_PREFIX ++ "{s}", .{@tagName(ty)}),
+        .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .date, .datetime => try std.fmt.allocPrint(arena, KEY_FN_PREFIX ++ "{s}:{s}", .{ @tagName(reading), @tagName(ty) }),
         else => null,
     };
 }
 
-/// True for a function a join lays over one key column to convert it:
-/// `castFnName`'s and `textKeyFnName`'s.
-pub fn isKeyConversionFn(name: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(name, "to_") or std.mem.startsWith(u8, name, TEXT_KEY_PREFIX);
+/// The reading and the target spelling of a `keyFnName` name.
+fn keyFnParts(name: []const u8) ?struct { KeyReading, []const u8 } {
+    if (!std.mem.startsWith(u8, name, KEY_FN_PREFIX)) return null;
+    const rest = name[KEY_FN_PREFIX.len..];
+    const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    const reading = std.meta.stringToEnum(KeyReading, rest[0..colon]) orelse return null;
+    return .{ reading, rest[colon + 1 ..] };
 }
 
-fn resolveTextKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
-    if (!std.mem.startsWith(u8, name, TEXT_KEY_PREFIX)) return null;
-    if (arg_types.len != 1 or !arg_types[0].isString()) return null;
-    const target = textKeyTarget(name[TEXT_KEY_PREFIX.len..]) orelse return null;
-    return try buildDecFn(aa, name, arg_types, target, dec.textKeyKernel, .kernel_managed);
+/// True for a function a join lays over one key column to convert it:
+/// `castFnName`'s and `keyFnName`'s.
+pub fn isKeyConversionFn(name: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(name, "to_") or keyFnParts(name) != null;
+}
+
+fn resolveKeyFn(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    const reading, const target_spec = keyFnParts(name) orelse return null;
+    if (arg_types.len != 1) return null;
+    const target = keyTarget(target_spec) orelse return null;
+    const src = arg_types[0];
+    const number = src.isInteger() or src.isDecimal() or src == .boolean;
+    const kernel: TypedKernel = switch (reading) {
+        .exact => if (src.isString()) dec.textKeyKernel else if (number) dec.numberKeyKernel else return null,
+        .floor => if (number) dec.floorKeyKernel else return null,
+        .ceil => if (number) dec.ceilKeyKernel else return null,
+    };
+    return try buildDecFn(aa, name, arg_types, target, kernel, .kernel_managed);
 }
 
 /// Internal: a byte string per row that, compared as bytes, sorts like its
@@ -858,7 +886,7 @@ pub fn hexNumberFn(name: []const u8, arity: usize) []const u8 {
     return if (arity == 3 and std.ascii.eqlIgnoreCase(name, "conv")) CONV_BITS_FN else name;
 }
 
-fn textKeyTarget(spec: []const u8) ?Type {
+fn keyTarget(spec: []const u8) ?Type {
     var it = std.mem.splitScalar(u8, spec, ':');
     const head = it.next() orelse return null;
     if (std.mem.eql(u8, head, "decimal")) {

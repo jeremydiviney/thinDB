@@ -140,7 +140,7 @@ follow this, so `-0.0` and `0.0` form one group. MIN and MAX skip NaN.
 
 Values of different types compare by value, as in StarRocks and MySQL
 (`predicate.typesComparable`):
-- Numbers compare across integer, decimal and float types.
+- Numbers compare across integer, decimal and float types, integers and decimals exactly. That holds in a join as well, even when no 38-digit decimal holds both keys (a LARGEINT beside any decimal, a BIGINT beside DECIMAL(38,20)); StarRocks compares such a pair as DOUBLE.
 - A DATE meets a DATETIME at midnight.
 - Text meets a number by reading the text as one, the way a CAST reads it. Text that doesn't read as a number compares as NULL.
 - Text meets a DATE or DATETIME by reading it the way MySQL's `str_to_datetime` does. That reader takes any punctuation between fields (`'2026-9-1'`, `'2026/09/01'`), digits alone (`'20260901'`, `'260901'`) and a partial time (`'2026-09-01 10:00'`), and it ignores text after the last field. It rejects impossible values: `'2026-09-31'`, month 13, hour 24 and minute or second 60, fewer than three date fields, a zero date or zero date part, and a year past 9999. A text row that doesn't read as a date compares as NULL. A string constant the statement spells that doesn't read as one fails the statement with `InvalidTemporalLiteral` (§9.8); the same text bound as a parameter matches nothing. NULLIF compares its arguments this way too: `NULLIF(d, '2026-9-26')` is NULL on that day and the DATE on any other.

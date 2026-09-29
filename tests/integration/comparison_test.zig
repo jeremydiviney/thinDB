@@ -341,6 +341,114 @@ test "comparison: a text join key meets a number or temporal key by value" {
     });
 }
 
+test "comparison: a join key no common decimal holds matches by value (issue #433)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE wk (id BIGINT PRIMARY KEY, li LARGEINT, bi BIGINT, d0 DECIMAL(38,0), d5 DECIMAL(30,5))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO wk VALUES
+        \\  (1, 170141183460469231731687303715884105727, 9223372036854775807, 99999999999999999999999999999999999999, 9999999999999999999999999.99999),
+        \\  (2, 2, 2, 2, 2.5),
+        \\  (3, -170141183460469231731687303715884105727, -9223372036854775808, -99999999999999999999999999999999999999, -2.5),
+        \\  (4, 1000000000000000000000000001, 1, 1000000000000000000000000001, 0.00001),
+        \\  (5, NULL, NULL, NULL, NULL)
+    );
+    try helpers.exec(allocator, db, "CREATE TABLE nk (id BIGINT PRIMARY KEY, d1 DECIMAL(2,1), d10 DECIMAL(38,10), d20 DECIMAL(38,20))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO nk VALUES
+        \\  (1, 1.5, 1.5, 1.5),
+        \\  (2, 2.0, 2, 2),
+        \\  (3, -9.9, 9999999999999999999999999999.9999999999, 999999999999999999.99999999999999999999),
+        \\  (4, 9.9, 1000000000000000000000000001, -999999999999999999.99999999999999999999),
+        \\  (5, NULL, -9999999999999999999999999999.9999999999, 2.5),
+        \\  (6, 2.5, NULL, NULL)
+    );
+    try helpers.exec(allocator, db, "CREATE TABLE ek (id BIGINT PRIMARY KEY, d10 DECIMAL(38,10), d20 DECIMAL(38,20))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ek VALUES
+        \\  (1, 1000000000000000000000000000.5, 2.50000000000000000001),
+        \\  (2, 1000000000000000000000000001.5, 2.49999999999999999999),
+        \\  (3, 1000000000000000000000000001, 0.00001)
+    );
+
+    // Each pair reads as wk.id * 10 + nk.id (or ek.id). No decimal of 38
+    // digits holds both keys of any pair, so a key past the common decimal
+    // meets nothing and still orders by its value.
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{ "wk", "nk", "ek" }, &.{
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li = nk.d1 ORDER BY p", .expected = &.{22} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li < nk.d1 ORDER BY p", .expected = &.{ 24, 26, 31, 32, 33, 34, 36 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li >= nk.d1 ORDER BY p", .expected = &.{ 11, 12, 13, 14, 16, 21, 22, 23, 41, 42, 43, 44, 46 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li <=> nk.d1 ORDER BY p", .expected = &.{ 22, 55 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d1 = wk.li ORDER BY p", .expected = &.{22} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d1 > wk.li ORDER BY p", .expected = &.{ 24, 26, 31, 32, 33, 34, 36 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d1 <= wk.li ORDER BY p", .expected = &.{ 11, 12, 13, 14, 16, 21, 22, 23, 41, 42, 43, 44, 46 } },
+        .{ .sql = "SELECT wk.id * 10 + COALESCE(nk.id, 0) AS p FROM wk LEFT JOIN nk ON wk.li = nk.d1 ORDER BY p", .expected = &.{ 10, 22, 30, 40, 50 } },
+        .{ .sql = "SELECT wk.id FROM wk WHERE wk.li IN (SELECT d1 FROM nk) ORDER BY wk.id", .expected = &.{2} },
+        .{ .sql = "SELECT nk.id FROM nk WHERE nk.d1 IN (SELECT li FROM wk) ORDER BY nk.id", .expected = &.{2} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li = nk.d10 ORDER BY p", .expected = &.{ 22, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li < nk.d10 ORDER BY p", .expected = &.{ 23, 24, 31, 32, 33, 34, 35, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li >= nk.d10 ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 25, 41, 42, 44, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.li <=> nk.d10 ORDER BY p", .expected = &.{ 22, 44, 56 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d10 = wk.li ORDER BY p", .expected = &.{ 22, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d10 > wk.li ORDER BY p", .expected = &.{ 23, 24, 31, 32, 33, 34, 35, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d10 <= wk.li ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 25, 41, 42, 44, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + COALESCE(nk.id, 0) AS p FROM wk LEFT JOIN nk ON wk.li = nk.d10 ORDER BY p", .expected = &.{ 10, 22, 30, 44, 50 } },
+        .{ .sql = "SELECT wk.id FROM wk WHERE wk.li IN (SELECT d10 FROM nk) ORDER BY wk.id", .expected = &.{ 2, 4 } },
+        .{ .sql = "SELECT nk.id FROM nk WHERE nk.d10 IN (SELECT li FROM wk) ORDER BY nk.id", .expected = &.{ 2, 4 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.bi = nk.d20 ORDER BY p", .expected = &.{22} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.bi < nk.d20 ORDER BY p", .expected = &.{ 23, 25, 31, 32, 33, 34, 35, 41, 42, 43, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.bi >= nk.d20 ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 24, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.bi <=> nk.d20 ORDER BY p", .expected = &.{ 22, 56 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d20 = wk.bi ORDER BY p", .expected = &.{22} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d20 > wk.bi ORDER BY p", .expected = &.{ 23, 25, 31, 32, 33, 34, 35, 41, 42, 43, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d20 <= wk.bi ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 24, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + COALESCE(nk.id, 0) AS p FROM wk LEFT JOIN nk ON wk.bi = nk.d20 ORDER BY p", .expected = &.{ 10, 22, 30, 40, 50 } },
+        .{ .sql = "SELECT wk.id FROM wk WHERE wk.bi IN (SELECT d20 FROM nk) ORDER BY wk.id", .expected = &.{2} },
+        .{ .sql = "SELECT nk.id FROM nk WHERE nk.d20 IN (SELECT bi FROM wk) ORDER BY nk.id", .expected = &.{2} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d0 = nk.d10 ORDER BY p", .expected = &.{ 22, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d0 < nk.d10 ORDER BY p", .expected = &.{ 23, 24, 31, 32, 33, 34, 35, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d0 >= nk.d10 ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 25, 41, 42, 44, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d0 <=> nk.d10 ORDER BY p", .expected = &.{ 22, 44, 56 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d10 = wk.d0 ORDER BY p", .expected = &.{ 22, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d10 > wk.d0 ORDER BY p", .expected = &.{ 23, 24, 31, 32, 33, 34, 35, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d10 <= wk.d0 ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 25, 41, 42, 44, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + COALESCE(nk.id, 0) AS p FROM wk LEFT JOIN nk ON wk.d0 = nk.d10 ORDER BY p", .expected = &.{ 10, 22, 30, 44, 50 } },
+        .{ .sql = "SELECT wk.id FROM wk WHERE wk.d0 IN (SELECT d10 FROM nk) ORDER BY wk.id", .expected = &.{ 2, 4 } },
+        .{ .sql = "SELECT nk.id FROM nk WHERE nk.d10 IN (SELECT d0 FROM wk) ORDER BY nk.id", .expected = &.{ 2, 4 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d5 = nk.d20 ORDER BY p", .expected = &.{25} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d5 < nk.d20 ORDER BY p", .expected = &.{ 23, 31, 32, 33, 35, 41, 42, 43, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d5 >= nk.d20 ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 24, 25, 34, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM wk JOIN nk ON wk.d5 <=> nk.d20 ORDER BY p", .expected = &.{ 25, 56 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d20 = wk.d5 ORDER BY p", .expected = &.{25} },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d20 > wk.d5 ORDER BY p", .expected = &.{ 23, 31, 32, 33, 35, 41, 42, 43, 45 } },
+        .{ .sql = "SELECT wk.id * 10 + nk.id AS p FROM nk JOIN wk ON nk.d20 <= wk.d5 ORDER BY p", .expected = &.{ 11, 12, 13, 14, 15, 21, 22, 24, 25, 34, 44 } },
+        .{ .sql = "SELECT wk.id * 10 + COALESCE(nk.id, 0) AS p FROM wk LEFT JOIN nk ON wk.d5 = nk.d20 ORDER BY p", .expected = &.{ 10, 25, 30, 40, 50 } },
+        .{ .sql = "SELECT wk.id FROM wk WHERE wk.d5 IN (SELECT d20 FROM nk) ORDER BY wk.id", .expected = &.{2} },
+        .{ .sql = "SELECT nk.id FROM nk WHERE nk.d20 IN (SELECT d5 FROM wk) ORDER BY nk.id", .expected = &.{5} },
+        // StarRocks reads these pairs as DOUBLE, where 2.5 meets
+        // 2.50000000000000000001; thinDB compares them exactly, in a join as
+        // in WHERE.
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.li = ek.d10 ORDER BY p", .expected = &.{43} },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.li < ek.d10 ORDER BY p", .expected = &.{ 21, 22, 23, 31, 32, 33, 42 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.li <= ek.d10 ORDER BY p", .expected = &.{ 21, 22, 23, 31, 32, 33, 42, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.li > ek.d10 ORDER BY p", .expected = &.{ 11, 12, 13, 41 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.li >= ek.d10 ORDER BY p", .expected = &.{ 11, 12, 13, 41, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d0 = ek.d10 ORDER BY p", .expected = &.{43} },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d0 < ek.d10 ORDER BY p", .expected = &.{ 21, 22, 23, 31, 32, 33, 42 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d0 <= ek.d10 ORDER BY p", .expected = &.{ 21, 22, 23, 31, 32, 33, 42, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d0 > ek.d10 ORDER BY p", .expected = &.{ 11, 12, 13, 41 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d0 >= ek.d10 ORDER BY p", .expected = &.{ 11, 12, 13, 41, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d5 = ek.d20 ORDER BY p", .expected = &.{43} },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d5 < ek.d20 ORDER BY p", .expected = &.{ 21, 31, 32, 33, 41, 42 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d5 <= ek.d20 ORDER BY p", .expected = &.{ 21, 31, 32, 33, 41, 42, 43 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d5 > ek.d20 ORDER BY p", .expected = &.{ 11, 12, 13, 22, 23 } },
+        .{ .sql = "SELECT wk.id * 10 + ek.id AS p FROM wk JOIN ek ON wk.d5 >= ek.d20 ORDER BY p", .expected = &.{ 11, 12, 13, 22, 23, 43 } },
+    });
+}
+
 test "comparison: a subquery's DATE never meets a number" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
