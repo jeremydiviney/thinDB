@@ -1417,7 +1417,14 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .bigint, .kernel = date.dateDiffDateKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.dateDiffDatetimeKernel },
+    .{ .name = "years_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.yearsDiffKernel },
     .{ .name = "months_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.monthsDiffKernel },
+    .{ .name = "weeks_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.weeksDiffKernel },
+    .{ .name = "days_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.daysDiffKernel },
+    .{ .name = "hours_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.hoursDiffKernel },
+    .{ .name = "minutes_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.minutesDiffKernel },
+    .{ .name = "seconds_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.secondsDiffKernel },
+    .{ .name = "milliseconds_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.millisecondsDiffKernel },
     // DATEs widen to DATETIMEs at midnight, which leaves every unit's
     // count unchanged.
     .{ .name = "timestampdiff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.timestampDiffKernel },
