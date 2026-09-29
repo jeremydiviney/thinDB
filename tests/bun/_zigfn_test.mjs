@@ -112,6 +112,15 @@ const rows3 = await q("dll-call", "SELECT running FROM TABLE(zt_running((SELECT 
 const got3 = rows3 ? rows3.map(r => Number(r.running)).join(",") : "";
 if (got3 !== "20,60,80,120,180") { console.log(`dll-values: FAIL (${got3})`); failed++; } else console.log("dll-values: OK");
 await q("dll-drop", "DROP FUNCTION zt_running");
+// DROP DATABASE unloads the LANGUAGE zig functions that database persists (#370).
+await q("dropdb-create", "CREATE DATABASE zt_dropdb");
+await q("dropdb-use", "USE zt_dropdb__public");
+await q("dropdb-fn", `CREATE FUNCTION zt_running LANGUAGE zig USING '${dll}'`);
+await q("dropdb-use-main", "USE main__public");
+await q("dropdb-drop", "DROP DATABASE zt_dropdb");
+await q("dropdb-post-drop", "SELECT * FROM TABLE(zt_running((SELECT id, g, amt FROM zt)) PARTITION BY g)", "UnsupportedQueryShape");
+await q("dropdb-recreate", `CREATE FUNCTION zt_running LANGUAGE zig USING '${dll}'`);
+await q("dropdb-cleanup", "DROP FUNCTION zt_running");
 // Pass-through tier: narrow kernel (Input) + carried columns (Carry) with
 // operator-filled pass-through outputs; row_aligned enforced by the
 // create-time validation subprocess.
