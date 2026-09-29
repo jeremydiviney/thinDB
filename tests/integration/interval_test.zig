@@ -1,9 +1,9 @@
 //! INTERVAL '<integer>' <unit> — calendar-aware date and datetime
-//! arithmetic. Lowered at parse time to `date_add`, `date_add_months`,
-//! `date_add_years`, `date_add_seconds` or `date_add_micros`. Month/year
-//! add clamps the day on short destination months:
-//! `2024-01-31 + 1 month → 2024-02-29`. A DATE moved by a sub-day unit
-//! becomes a DATETIME, as in MySQL.
+//! arithmetic. Lowered at parse time to one kernel per unit (`date_add`,
+//! `date_add_weeks`, ... `date_add_micros`). Month/year add clamps the day
+//! on short destination months: `2024-01-31 + 1 month → 2024-02-29`. A DATE
+//! moved by a sub-day unit becomes a DATETIME, as in MySQL. A result outside
+//! years 0-9999 is NULL, as in StarRocks.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -165,6 +165,52 @@ test "INTERVAL: DATETIME keeps its time of day, and hours, minutes and seconds m
         const got = try helpers.collectBigints(allocator, db, c[0]);
         defer allocator.free(got);
         try std.testing.expectEqualSlices(i64, c[1], got);
+    }
+}
+
+test "INTERVAL: a result outside years 0-9999, or a count past INT, is NULL (issue #398)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE edge (id BIGINT PRIMARY KEY, d DATE NOT NULL, ts DATETIME NOT NULL, m INT, n BIGINT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO edge VALUES (1, '9999-12-31', '9999-12-31 23:59:59', NULL, 1), " ++
+        "(2, '0000-01-01', '0000-01-01 00:00:00', 1, -1), (3, '2026-01-31', '2026-01-31 10:00:00', -31, 3000000000)");
+
+    // Every expected value is StarRocks 4.0's, except that a DATE moved by
+    // days or more stays a DATE. A count past INT is NULL even where the
+    // move would land in range (row 3's 3000000000 microseconds).
+    const cases = .{
+        .{ "d + INTERVAL 1 DAY", .{ null, "0000-01-02", "2026-02-01" } },
+        .{ "d - INTERVAL 1 DAY", .{ "9999-12-30", null, "2026-01-30" } },
+        .{ "DATE_SUB(d, n)", .{ "9999-12-30", "0000-01-02", null } },
+        .{ "ADDDATE(d, m)", .{ null, "0000-01-02", "2025-12-31" } },
+        .{ "d + INTERVAL 1 WEEK", .{ null, "0000-01-08", "2026-02-07" } },
+        .{ "d + INTERVAL 1 MONTH", .{ null, "0000-02-01", "2026-02-28" } },
+        .{ "d - INTERVAL 1 QUARTER", .{ "9999-09-30", null, "2025-10-31" } },
+        .{ "d + INTERVAL 1 YEAR", .{ null, "0001-01-01", "2027-01-31" } },
+        .{ "d + INTERVAL 2147483647 YEAR", .{ null, null, null } },
+        .{ "d - INTERVAL '-2147483648' DAY", .{ null, null, null } },
+        .{ "d + INTERVAL 24 HOUR", .{ null, "0000-01-02 00:00:00", "2026-02-01 00:00:00" } },
+        .{ "d + INTERVAL 9223372036854775807 HOUR", .{ null, null, null } },
+        .{ "ts + INTERVAL 1 SECOND", .{ null, "0000-01-01 00:00:01", "2026-01-31 10:00:01" } },
+        .{ "ts - INTERVAL n MICROSECOND", .{ "9999-12-31 23:59:58.999999", "0000-01-01 00:00:00.000001", null } },
+        .{ "ts + INTERVAL '3000000000' MICROSECOND", .{ null, null, null } },
+        .{ "ts + INTERVAL m HOUR", .{ null, "0000-01-01 01:00:00", "2026-01-30 03:00:00" } },
+        .{ "ts + INTERVAL 1 DAY", .{ null, "0000-01-02 00:00:00", "2026-02-01 10:00:00" } },
+        .{ "DATE_SUB(ts, 1)", .{ "9999-12-30 23:59:59", null, "2026-01-30 10:00:00" } },
+        .{ "ts + INTERVAL 1 MONTH", .{ null, "0000-02-01 00:00:00", "2026-02-28 10:00:00" } },
+        .{ "TIMESTAMPADD(YEAR, -1, ts)", .{ "9998-12-31 23:59:59", null, "2025-01-31 10:00:00" } },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const got = try helpers.collectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM edge ORDER BY id");
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 3), got.len);
+        inline for (c[1], 0..) |want, row| {
+            if (@TypeOf(want) == @TypeOf(null)) try std.testing.expect(got[row] == null) else try std.testing.expectEqualStrings(want, got[row].?);
+        }
     }
 }
 
