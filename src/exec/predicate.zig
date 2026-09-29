@@ -39,6 +39,13 @@ pub const Predicate = struct {
     /// A bound parameter's value or an API caller's never matches instead,
     /// as MySQL returns no rows for a prepared statement's parameter.
     from_statement: bool = false,
+    /// The leaf is a condition's test of `col` itself (`WHERE x`, `x OR y`),
+    /// not a comparison the statement spells: `col` read as
+    /// `CAST(col AS BOOLEAN)` against `val`, 0. That is `col <> 0` for a
+    /// number, but text reads as `textBoolean` reads it, where a comparison
+    /// with a number reads it as a number (`'0.5' <> 0` holds, `'0.5'` is
+    /// UNKNOWN).
+    as_boolean: bool = false,
 };
 
 /// Boolean expression over Predicates.
@@ -324,7 +331,7 @@ pub fn eql(a: PredicateExpr, b: PredicateExpr) bool {
 }
 
 fn leafEql(a: Predicate, b: Predicate) bool {
-    return a.op == b.op and types.columnNameEql(a.col, b.col) and a.val.eql(b.val);
+    return a.op == b.op and a.as_boolean == b.as_boolean and types.columnNameEql(a.col, b.col) and a.val.eql(b.val);
 }
 
 fn setEql(a: InSet, b: InSet) bool {
@@ -576,6 +583,7 @@ fn cloneLeaf(out_arena: std.mem.Allocator, lf: Predicate, renames: []const ColRe
         .op = lf.op,
         .val = try cloneValue(out_arena, lf.val),
         .from_statement = lf.from_statement,
+        .as_boolean = lf.as_boolean,
     };
 }
 
@@ -2076,10 +2084,22 @@ fn expectTextColumn(schema: []const Column, name: []const u8) Error!void {
     if (comparisonKind(schema[idx].type) != .text) return Error.PredicateTypeMismatch;
 }
 
-/// `.text_as_number`: each row's text read as a number against the literal.
+/// `.text_as_number`: each row's text read as a number against the literal,
+/// or as a BOOLEAN's 1 or 0 for an `as_boolean` leaf.
 fn evaluateTextAsNumberMask(view: ColumnView, col_type: types.Type, p: Predicate, n: usize, mask: []bool) void {
     const rhs = valueScalar(p.val, 0);
-    for (0..n) |i| mask[i] = view.isValid(i) and orderMatches(scalarOrder(cellScalar(view, col_type, i), rhs), p.op);
+    for (0..n) |i| {
+        if (!view.isValid(i)) {
+            mask[i] = false;
+            continue;
+        }
+        const cell = cellScalar(view, col_type, i);
+        const order = if (!p.as_boolean) scalarOrder(cell, rhs) else if (scalar_fn_common.textBoolean(cell.text)) |b|
+            numberOrder(.{ .integer = @intFromBool(b) }, rhs)
+        else
+            null;
+        mask[i] = orderMatches(order, p.op);
+    }
 }
 
 /// `.text_as_number_set`, element by element: `a IN (b, c)` is

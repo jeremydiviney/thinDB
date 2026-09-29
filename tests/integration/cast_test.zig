@@ -99,7 +99,7 @@ test "cast: text converts only when it is a number of the target's kind" {
         .{ .sql = "SELECT CAST(CAST(s AS BIGINT) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "12", "5", NULL, NULL, NULL, NULL, "9999999999", NULL, NULL, NULL } },
         .{ .sql = "SELECT CAST(CAST(s AS DOUBLE) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "12", "5", "1.7", NULL, NULL, "1000", "9999999999", "-1.005", NULL, NULL } },
         .{ .sql = "SELECT CAST(CAST(s AS DECIMAL(18,2)) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "12.00", "5.00", "1.70", NULL, NULL, "1000.00", "9999999999.00", "-1.01", NULL, NULL } },
-        .{ .sql = "SELECT CAST(CAST(s AS BOOLEAN) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "1", "1", "1", NULL, NULL, "1", "1", "1", "0", NULL } },
+        .{ .sql = "SELECT CAST(CAST(s AS BOOLEAN) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "1", "1", NULL, NULL, NULL, NULL, NULL, NULL, "0", NULL } },
         .{ .sql = "SELECT CAST(CAST(' 7 ' AS INT) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"7"} },
         .{ .sql = "SELECT CAST(CAST('7x' AS DOUBLE) AS CHAR) FROM ct WHERE id = 1", .expected = &.{NULL} },
         .{ .sql = "SELECT CAST(id AS CHAR) FROM ct WHERE b = CAST(' 12 ' AS BIGINT)", .expected = &.{"1"} },
