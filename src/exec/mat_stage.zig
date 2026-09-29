@@ -714,6 +714,8 @@ pub const Stage = struct {
     /// their own threads; the FINAL release is still single-threaded.
     uses_total: std.atomic.Value(usize) = .init(0),
     uses_done: std.atomic.Value(usize) = .init(0),
+    /// Holds the compile pin `addStage` registers (see `releaseCompilePin`).
+    compile_pinned: bool = true,
     free_thread: ?std.Thread = null,
     /// Query-scoped accountant the buffered result is charged against
     /// (null = no tracking). All reserve/release calls happen on the
@@ -1126,6 +1128,14 @@ pub const Stage = struct {
         }
     }
 
+    /// Drop the compile pin once no block left to compile can bind this
+    /// stage. A stage whose readers have all finished frees here.
+    pub fn releaseCompilePin(self: *Stage) void {
+        if (!self.compile_pinned) return;
+        self.compile_pinned = false;
+        self.releaseUse();
+    }
+
     pub fn deinit(self: *Stage) void {
         if (self.free_thread) |th| th.join();
         if (self.result) |res| freeResultThread(res);
@@ -1202,21 +1212,23 @@ pub const StageSet = struct {
             // (createOverStage's barrier), and such a run can fully drain an
             // upstream stage whose later consumers haven't compiled (and so
             // haven't registered) yet — without the pin, the result would
-            // free out from under them. Released by releaseCompilePins once
-            // the whole plan is built.
+            // free out from under them. The staged compiler releases it once
+            // every block that reads the stage has compiled
+            // (`releaseCompilePin`), and releaseCompilePins releases the
+            // rest once the whole plan is built.
             .uses_total = .init(1),
         };
         try self.stages.append(self.allocator, stage);
         return stage;
     }
 
-    /// Release every stage's compile pin (see addStage) — call exactly once,
-    /// after the whole plan (all stage bodies + the root block) has compiled
-    /// and every real consumer is registered. A stage fully drained during an
-    /// eager compile-time run frees here; the rest free when their last
-    /// runtime reader finishes.
+    /// Release every compile pin still held (see addStage) — call exactly
+    /// once, after the whole plan (all stage bodies + the root block) has
+    /// compiled and every real consumer is registered. A stage fully drained
+    /// during an eager compile-time run frees here; the rest free when their
+    /// last runtime reader finishes.
     pub fn releaseCompilePins(self: *StageSet) void {
-        for (self.stages.items) |stage| stage.releaseUse();
+        for (self.stages.items) |stage| stage.releaseCompilePin();
     }
 
     pub fn deinit(self: *StageSet) void {

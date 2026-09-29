@@ -255,6 +255,10 @@ test "recursive cte: ordinary CTEs in the same list" {
             .sql = "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM a WHERE n < 3), b(n) AS (SELECT n FROM a UNION ALL SELECT n + 100 FROM b WHERE n < 100) SELECT n FROM b ORDER BY n",
             .rows = "1;2;3;101;102;103",
         },
+        .{
+            .sql = "WITH RECURSIVE lim AS MATERIALIZED (SELECT 4 AS m), cap AS MATERIALIZED (SELECT m - 1 AS m FROM lim), r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r, lim WHERE n < lim.m) SELECT n FROM r, cap WHERE n < cap.m ORDER BY n",
+            .rows = "1;2",
+        },
     };
     inline for (cases) |c| try expectRows(allocator, db, c.sql, c.rows);
 }

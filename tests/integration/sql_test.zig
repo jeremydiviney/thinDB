@@ -3552,6 +3552,103 @@ test "sql: a budget in the old GROUP BY plan-flip gap completes with the plan th
     }
 }
 
+/// `depth` MATERIALIZED CTEs over `base`, each a projection of the one
+/// before. With `rejoin`, one more CTE joins the last back to the first on
+/// `id`, and the root reads the first as well as that one.
+fn stageChainSql(allocator: std.mem.Allocator, depth: usize, rejoin: bool) ![]u8 {
+    var sql: std.ArrayList(u8) = .empty;
+    errdefer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "WITH m1 AS MATERIALIZED (SELECT id, cust, amount * 2 AS amount FROM base)");
+    for (2..depth + 1) |level| {
+        try sql.print(allocator, ", m{d} AS MATERIALIZED (SELECT id, cust, amount + 1 AS amount FROM m{d})", .{ level, level - 1 });
+    }
+    if (rejoin) {
+        try sql.print(allocator,
+            \\, m{d} AS MATERIALIZED (SELECT a.id AS id, a.cust AS cust, a.amount + b.amount AS amount
+            \\FROM m{d} a JOIN m1 b ON a.id = b.id)
+            \\SELECT COUNT(*) AS n, SUM(amount) AS s FROM m{d}
+            \\UNION ALL SELECT COUNT(*) AS n, SUM(amount) AS s FROM m1
+        , .{ depth + 1, depth, depth + 1 });
+    } else {
+        try sql.print(allocator, " SELECT COUNT(*) AS n, SUM(amount) AS s FROM m{d}", .{depth});
+    }
+    return sql.toOwnedSlice(allocator);
+}
+
+const StageChainRun = struct {
+    /// (n, s) per result row, sorted by s.
+    rows: [2][2]f64 = undefined,
+    row_count: usize = 0,
+    peak: usize = 0,
+};
+
+/// `stageChainSql` over `rows` seeded rows on 4 threads, so each CTE body
+/// is a parallel scan that runs the stage before it while it compiles.
+fn runStageChain(allocator: std.mem.Allocator, rows: usize, depth: usize, rejoin: bool) !StageChainRun {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
+        .query_memory_budget = 1 << 30,
+        .memory_budget = 1 << 30,
+        .auto_flush_secs = 0,
+        .max_dop = 4,
+    });
+    defer db.close();
+    try seedRollforward(db, rows);
+
+    const sql = try stageChainSql(allocator, depth, rejoin);
+    defer allocator.free(sql);
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var run: StageChainRun = .{};
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            if (run.row_count == run.rows.len) return error.TestUnexpectedResult;
+            run.rows[run.row_count] = .{ @floatFromInt(batch.values[0].data.bigint[row]), batch.values[1].data.double[row] };
+            run.row_count += 1;
+        }
+    }
+    std.mem.sort([2]f64, run.rows[0..run.row_count], {}, struct {
+        fn lessThan(_: void, a: [2]f64, b: [2]f64) bool {
+            return a[1] < b[1];
+        }
+    }.lessThan);
+    run.peak = q.cq.ctx.accountant.?.peak_bytes;
+    return run;
+}
+
+test "sql: a stage frees once its last reader has run, not when the plan finishes compiling" {
+    const allocator = std.testing.allocator;
+    const rows = 200_000;
+    var amounts: f64 = 0;
+    for (0..rows) |i| amounts += @floatFromInt(i % 997);
+    // Each CTE body is a parallel scan that runs the stage before it while
+    // the plan compiles, and every stage used to stay charged until the
+    // whole plan had compiled: a chain of N stages held all N at once
+    // (issue #415). A stage now frees once its last reader has run, so
+    // the charged peak no longer grows with the chain's length.
+    const shallow = try runStageChain(allocator, rows, 2, false);
+    const deep = try runStageChain(allocator, rows, 8, false);
+    try std.testing.expectEqual(@as(usize, 1), shallow.row_count);
+    try std.testing.expectEqual(@as(usize, 1), deep.row_count);
+    try std.testing.expectEqual([2]f64{ rows, 2 * amounts + rows }, shallow.rows[0]);
+    try std.testing.expectEqual([2]f64{ rows, 2 * amounts + 7 * rows }, deep.rows[0]);
+    try std.testing.expect(deep.peak < shallow.peak * 2);
+}
+
+test "sql: a stage read by a later CTE and the root outlives the stages between" {
+    const allocator = std.testing.allocator;
+    const rows = 20_000;
+    var amounts: f64 = 0;
+    for (0..rows) |i| amounts += @floatFromInt(i % 997);
+    // m1 feeds m2 and is read again by m7 and by the root; m2..m6 each free
+    // once the stage after them has run, while m1 must stay readable.
+    const run = try runStageChain(allocator, rows, 6, true);
+    try std.testing.expectEqual(@as(usize, 2), run.row_count);
+    try std.testing.expectEqual([2]f64{ rows, 2 * amounts }, run.rows[0]);
+    try std.testing.expectEqual([2]f64{ rows, 4 * amounts + 5 * rows }, run.rows[1]);
+}
+
 test "sql: blocking paths release all actual capacity at teardown" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
