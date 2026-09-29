@@ -1335,7 +1335,7 @@ fn planContains(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const
 }
 
 const GD_GROUPS = 1009;
-const GdRow = struct { id: i64, g: i32, s: ?[]const u8, c: []const u8, d: ?f64, v: ?i32 };
+const GdRow = struct { id: i64, g: i32, gn: ?i32, s: ?[]const u8, c: []const u8, d: ?f64, v: ?i32 };
 
 const GdExpected = struct {
     n: []i64,
@@ -1395,9 +1395,11 @@ const GdExpected = struct {
     }
 };
 
-fn checkGroupedDistinct(allocator: std.mem.Allocator, db: *thindb.Database, e: GdExpected, comptime having: []const u8, route: []const u8) !void {
-    const multi_sql = "SELECT g, COUNT(DISTINCT s) AS ds, COUNT(DISTINCT c) AS dc, COUNT(DISTINCT d) AS dd, COUNT(*) AS n FROM gd GROUP BY g" ++ having;
-    const case_sql = "SELECT g, COUNT(DISTINCT CASE WHEN v > 0 THEN s END) AS cs, COUNT(DISTINCT IF(v > 0, id % 97, NULL)) AS ci FROM gd GROUP BY g" ++ having;
+// Key `g` takes the lowcard route; `gn`, the same values in a nullable
+// column, the silo's group-topN route.
+fn checkGroupedDistinct(allocator: std.mem.Allocator, db: *thindb.Database, e: GdExpected, comptime key: []const u8, comptime having: []const u8, route: []const u8) !void {
+    const multi_sql = "SELECT " ++ key ++ ", COUNT(DISTINCT s) AS ds, COUNT(DISTINCT c) AS dc, COUNT(DISTINCT d) AS dd, COUNT(*) AS n FROM gd GROUP BY " ++ key ++ having;
+    const case_sql = "SELECT " ++ key ++ ", COUNT(DISTINCT CASE WHEN v > 0 THEN s END) AS cs, COUNT(DISTINCT IF(v > 0, id % 97, NULL)) AS ci FROM gd GROUP BY " ++ key ++ having;
     inline for (.{ multi_sql, case_sql }) |sql| {
         errdefer std.debug.print("route={s} query: {s}\n", .{ route, sql });
         try std.testing.expect(try planContains(allocator, db, sql, route));
@@ -1506,6 +1508,7 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
         row.* = .{
             .id = @intCast(i),
             .g = @intCast(g),
+            .gn = @intCast(g),
             .s = if (all_null or p % 50 == 0) null else s_pool[p],
             .c = c_pool[(i * 5) % c_pool.len],
             .d = if (all_null or i % 13 == 0) null else if (i % 3 == 0) d_pool[i % d_pool.len] else @as(f64, @floatFromInt(i % 300)) * 0.5,
@@ -1526,6 +1529,7 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
             .columns = &.{
                 .{ .name = "id", .type = .bigint },
                 .{ .name = "g", .type = .int },
+                .{ .name = "gn", .type = .int, .nullable = true },
                 .{ .name = "s", .type = .string, .nullable = true },
                 .{ .name = "c", .type = .string },
                 .{ .name = "d", .type = .double, .nullable = true },
@@ -1542,8 +1546,9 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
         @memset(live, false);
         @memset(live[0 .. (batches - 1) * batch_rows], true);
         try expected.compute(allocator, rows, live);
-        try checkGroupedDistinct(allocator, db, expected, "", "lowcard");
-        try checkGroupedDistinct(allocator, db, expected, " HAVING COUNT(*) > 0", "V2 group-topN");
+        try checkGroupedDistinct(allocator, db, expected, "g", "", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, "g", " HAVING COUNT(*) > 0", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, "gn", " HAVING COUNT(*) > 0", "V2 group-topN");
         // The low-NDV non-nullable string folds as dict codes, the nullable
         // one by bytes; the CASE/IF inputs are derived string and int values.
         try std.testing.expect(try planContains(allocator, db, "SELECT g, COUNT(DISTINCT s), COUNT(DISTINCT c), COUNT(DISTINCT d) FROM gd GROUP BY g", "distinct string,coded,float"));
@@ -1557,8 +1562,9 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
         // The DELETE ran before the memtable batch arrived.
         for (live, 0..) |*keep, i| keep.* = i >= (batches - 1) * batch_rows or i % 17 != 0;
         try expected.compute(allocator, rows, live);
-        try checkGroupedDistinct(allocator, db, expected, "", "lowcard");
-        try checkGroupedDistinct(allocator, db, expected, " HAVING COUNT(*) > 0", "V2 group-topN");
+        try checkGroupedDistinct(allocator, db, expected, "g", "", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, "g", " HAVING COUNT(*) > 0", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, "gn", " HAVING COUNT(*) > 0", "V2 group-topN");
 
         // A string result and a string distinct share the staged string lane.
         const mixed_sql = "SELECT g, MIN(s) AS lo, COUNT(DISTINCT s) AS ds FROM gd GROUP BY g HAVING COUNT(*) > 0";
@@ -1665,6 +1671,219 @@ test "V2 grouped string COUNT(DISTINCT) stays inside the query budget and leaks 
             // A finished silo query tears its workspace down asynchronously,
             // so only a rejected query's reservations must be gone already.
             if (rejected) try std.testing.expectEqual(@as(usize, 0), db.config.memory_pool.?.inUse());
+        }
+    }
+}
+
+// Issue #375: a HAVING Filter and a post-aggregate Compute, in whichever order
+// the parser and the predicate pushdown leave them, keep the V2 group routes.
+const HvRow = struct { id: i64, g: i32, gn: ?i32, u: i64, w: i32, x: ?i32 };
+const HvStats = struct { key: ?i64, n: i64, du: i64, sw: i64, sx: ?i64 };
+const HvOut = [3]?i64;
+const HvCase = struct {
+    sql: []const u8,
+    // Whether the non-nullable key `g` takes the lowcard route; the nullable
+    // key `gn` always takes the group-topN route.
+    lowcard: bool = true,
+    want: *const fn (HvStats) ?HvOut,
+    order_col: ?usize = null,
+    desc: bool = false,
+    limit: ?usize = null,
+    offset: usize = 0,
+};
+
+fn hvStats(allocator: std.mem.Allocator, rows: []const HvRow, comptime key: []const u8) ![]HvStats {
+    var out: std.ArrayList(HvStats) = .empty;
+    errdefer out.deinit(allocator);
+    var masks: std.ArrayList(u32) = .empty;
+    defer masks.deinit(allocator);
+    for (rows) |r| {
+        const k: ?i64 = if (comptime std.mem.eql(u8, key, "g")) r.g else if (r.gn) |v| v else null;
+        const i = for (out.items, 0..) |s, i| {
+            if (std.meta.eql(s.key, k)) break i;
+        } else blk: {
+            try out.append(allocator, .{ .key = k, .n = 0, .du = 0, .sw = 0, .sx = null });
+            try masks.append(allocator, 0);
+            break :blk out.items.len - 1;
+        };
+        const s = &out.items[i];
+        s.n += 1;
+        s.sw += r.w;
+        if (r.x) |x| s.sx = (s.sx orelse 0) + x;
+        masks.items[i] |= @as(u32, 1) << @intCast(r.u);
+    }
+    for (out.items, masks.items) |*s, m| s.du = @popCount(m);
+    return out.toOwnedSlice(allocator);
+}
+
+fn hvLess(order_col: ?usize, desc: bool, a: HvOut, b: HvOut) bool {
+    const cols: []const usize = if (order_col) |c| &.{c} else &.{ 0, 1, 2 };
+    for (cols) |c| {
+        const x = a[c] orelse std.math.minInt(i64);
+        const y = b[c] orelse std.math.minInt(i64);
+        if (x != y) return if (desc) x > y else x < y;
+    }
+    return false;
+}
+
+fn sortHv(rows: []HvOut, order_col: ?usize, desc: bool) void {
+    const Ctx = struct { col: ?usize, desc: bool };
+    std.mem.sort(HvOut, rows, Ctx{ .col = order_col, .desc = desc }, struct {
+        fn lessThan(ctx: Ctx, a: HvOut, b: HvOut) bool {
+            return hvLess(ctx.col, ctx.desc, a, b);
+        }
+    }.lessThan);
+}
+
+fn checkHvCase(allocator: std.mem.Allocator, db: *thindb.Database, stats: []const HvStats, c: HvCase, route: []const u8) !void {
+    errdefer std.debug.print("route={s} query: {s}\n", .{ route, c.sql });
+    try std.testing.expect(try planContains(allocator, db, c.sql, route));
+
+    var want: std.ArrayList(HvOut) = .empty;
+    defer want.deinit(allocator);
+    for (stats) |s| if (c.want(s)) |row| try want.append(allocator, row);
+    sortHv(want.items, c.order_col, c.desc);
+    const start = @min(c.offset, want.items.len);
+    const end = if (c.limit) |l| @min(start + l, want.items.len) else want.items.len;
+
+    var got: std.ArrayList(HvOut) = .empty;
+    defer got.deinit(allocator);
+    var q = try runSql(allocator, db, c.sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |r| {
+            var row: HvOut = .{ null, null, null };
+            for (batch.values, 0..) |col, ci| {
+                if (try cellNumber(col, r)) |v| row[ci] = @intFromFloat(v);
+            }
+            try got.append(allocator, row);
+        }
+    }
+    if (c.order_col == null) sortHv(got.items, null, false);
+    try std.testing.expectEqualSlices(HvOut, want.items[start..end], got.items);
+}
+
+test "V2 group routes keep HAVING with post-aggregate expressions in any order (issue #375)" {
+    const allocator = std.testing.allocator;
+    // Group g has 3g rows and g distinct u values; gn nulls every fourth row
+    // of each group into one NULL group; x is NULL throughout group 2.
+    var rows: std.ArrayList(HvRow) = .empty;
+    defer rows.deinit(allocator);
+    for (1..6) |g| {
+        for (0..3 * g) |j| {
+            try rows.append(allocator, .{
+                .id = @intCast(rows.items.len),
+                .g = @intCast(g),
+                .gn = if (j % 4 == 3) null else @intCast(g),
+                .u = @intCast(j % g),
+                .w = @intCast(10 * g + j),
+                .x = if (g == 2) null else @intCast(j),
+            });
+        }
+    }
+
+    const Fns = struct {
+        fn distinctPlusCount(s: HvStats) ?HvOut {
+            return if (s.n > 4) .{ s.key, s.du * 10 + s.n, null } else null;
+        }
+        fn sumPlusCount(s: HvStats) ?HvOut {
+            return if (s.n > 4) .{ s.key, s.sw * 10 + s.n, null } else null;
+        }
+        fn aliasFilter(s: HvStats) ?HvOut {
+            const e = s.sw * 10 + s.n;
+            return if (e > 3000) .{ s.key, e, null } else null;
+        }
+        fn exprFilter(s: HvStats) ?HvOut {
+            return if (s.sw * 2 > 600) .{ s.key, s.n, null } else null;
+        }
+        fn splitFilter(s: HvStats) ?HvOut {
+            const e = s.sw * 10 + s.n;
+            return if (s.n > 2 and e > 1000) .{ s.key, e, s.n } else null;
+        }
+        fn orFilter(s: HvStats) ?HvOut {
+            const e = s.sw * 10 + s.n;
+            return if (e > 3000 or s.n < 3) .{ s.key, e, null } else null;
+        }
+        fn derivedKey(s: HvStats) ?HvOut {
+            return if (s.n > 4) .{ if (s.key) |k| k + 1 else null, s.du + s.sw, null } else null;
+        }
+        fn nullSum(s: HvStats) ?HvOut {
+            return .{ s.key, if (s.sx) |x| x + 1 else null, null };
+        }
+        fn nullSumFilter(s: HvStats) ?HvOut {
+            const x = s.sx orelse return null;
+            return if (x + 1 > 0) .{ s.key, x + 1, null } else null;
+        }
+        fn none(_: HvStats) ?HvOut {
+            return null;
+        }
+    };
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        errdefer std.debug.print("dop={d}\n", .{dop});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("hv", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g", .type = .int },
+                .{ .name = "gn", .type = .int, .nullable = true },
+                .{ .name = "u", .type = .bigint },
+                .{ .name = "w", .type = .int },
+                .{ .name = "x", .type = .int, .nullable = true },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 16 });
+        try t.insert(rows.items);
+        try t.flush();
+
+        inline for (.{ "g", "gn" }) |k| {
+            const stats = try hvStats(allocator, rows.items, k);
+            defer allocator.free(stats);
+            const cases = [_]HvCase{
+                .{ .sql = "SELECT " ++ k ++ ", COUNT(DISTINCT u)*10 + COUNT(*) AS e FROM hv GROUP BY " ++ k ++ " HAVING COUNT(*) > 4", .want = Fns.distinctPlusCount },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(w)*10 + COUNT(*) AS e FROM hv GROUP BY " ++ k ++ " HAVING COUNT(*) > 4", .want = Fns.sumPlusCount },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(w)*10 + COUNT(*) AS e FROM hv GROUP BY " ++ k ++ " HAVING e > 3000", .want = Fns.aliasFilter },
+                .{ .sql = "SELECT " ++ k ++ ", COUNT(*) AS c FROM hv GROUP BY " ++ k ++ " HAVING SUM(w)*2 > 600", .want = Fns.exprFilter },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(w)*10 + COUNT(*) AS e, COUNT(*) AS c FROM hv GROUP BY " ++ k ++ " HAVING c > 2 AND e > 1000 ORDER BY e DESC LIMIT 2", .want = Fns.splitFilter, .order_col = 1, .desc = true, .limit = 2 },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(w)*10 + COUNT(*) AS e FROM hv GROUP BY " ++ k ++ " HAVING e > 3000 OR COUNT(*) < 3 ORDER BY e LIMIT 2 OFFSET 1", .want = Fns.orFilter, .order_col = 1, .limit = 2, .offset = 1 },
+                .{ .sql = "SELECT " ++ k ++ " + 1 AS k1, COUNT(DISTINCT u) + SUM(w) AS e FROM hv GROUP BY k1 HAVING COUNT(*) > 4", .want = Fns.derivedKey, .lowcard = false },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(x) + 1 AS s FROM hv GROUP BY " ++ k ++ " HAVING COUNT(*) > 0", .want = Fns.nullSum, .lowcard = false },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(x) + 1 AS s FROM hv GROUP BY " ++ k ++ " HAVING s > 0", .want = Fns.nullSumFilter, .lowcard = false },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(w)*10 + COUNT(*) AS e FROM hv GROUP BY " ++ k ++ " HAVING COUNT(*) > 1000", .want = Fns.none },
+                .{ .sql = "SELECT " ++ k ++ ", SUM(w)*10 + COUNT(*) AS e FROM hv WHERE w < 0 GROUP BY " ++ k ++ " HAVING COUNT(*) > 0", .want = Fns.none },
+            };
+            for (cases) |c| {
+                const route = if (comptime std.mem.eql(u8, k, "g")) (if (c.lowcard) "lowcard" else "V2 group-topN") else "V2 group-topN";
+                try checkHvCase(allocator, db, stats, c, route);
+            }
+        }
+
+        // The global aggregate reads its post-aggregate chain the same way.
+        var sum_w: i64 = 0;
+        for (rows.items) |r| sum_w += r.w;
+        const global_cases = .{
+            .{ "SELECT SUM(w)*2 AS s FROM hv HAVING s > 0", @as(?i64, sum_w * 2) },
+            .{ "SELECT SUM(w)*2 AS s FROM hv HAVING s < 0", @as(?i64, null) },
+        };
+        inline for (global_cases) |gc| {
+            errdefer std.debug.print("query: {s}\n", .{gc[0]});
+            try std.testing.expect(try planContains(allocator, db, gc[0], "V2 global"));
+            var q = try runSql(allocator, db, gc[0]);
+            defer q.deinit();
+            var got: ?i64 = null;
+            var n: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    got = if (try cellNumber(batch.values[0], r)) |v| @intFromFloat(v) else null;
+                    n += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, if (gc[1] == null) 0 else 1), n);
+            try std.testing.expectEqual(gc[1], got);
         }
     }
 }
