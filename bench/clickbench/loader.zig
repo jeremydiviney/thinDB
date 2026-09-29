@@ -441,7 +441,7 @@ fn parseDateTimeOrZero(s: []const u8) !i64 {
 fn ymdToDays(year: i32, month: u32, day: u32) i32 {
     var y: i32 = year;
     if (month <= 2) y -= 1;
-    const era: i32 = @divFloor(if (y >= 0) y else y - 399, 400);
+    const era: i32 = @divFloor(y, 400);
     const yoe: u32 = @intCast(y - era * 400);
     const m_adj: i32 = @intCast(if (month > 2) month - 3 else month + 9);
     const doy: u32 = @intCast(@divFloor(153 * m_adj + 2, 5) + @as(i32, @intCast(day)) - 1);

@@ -113,7 +113,9 @@ test "a date whose day is past its month's end is invalid everywhere a date is r
         .{ "CAST('2026-02-30' AS DATE)", null },
         .{ "CAST('2026-02-30' AS DATETIME)", null },
         .{ "CAST('2026-04-31 10:00:00' AS DATETIME)", null },
-        .{ "DATE('0000-02-29')", null },
+        .{ "DATE('1900-02-29')", null },
+        // Year 0 is a leap year, as in StarRocks; MySQL has no 0000-02-29.
+        .{ "DATE('0000-02-29')", "0000-02-29" },
         .{ "DATE('2024-02-29')", "2024-02-29" },
         .{ "DATE('2026-02-28')", "2026-02-28" },
     };

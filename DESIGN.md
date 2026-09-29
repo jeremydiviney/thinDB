@@ -74,6 +74,13 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | | `DATETIME` | i64 microseconds since 1970-01-01 UTC. No timezone awareness — applications convert at boundaries. |
 | Boolean | `BOOLEAN` | u8 (0/1) |
 
+Dates run from 0000-01-01 to 9999-12-31 in the proleptic Gregorian
+calendar, where year 0 is a leap year, as in StarRocks. So `0000-02-29` is a
+date, 0000-01-01 is a Saturday, `TO_DAYS('0000-01-01')` is 0 and
+`FROM_DAYS(59)` is 0000-02-29. MySQL counts year 0 as 365 days with no
+February 29, which moves its weekdays and day numbers before 0000-03-01 by
+one.
+
 Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
 after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
 follow this, so `-0.0` and `0.0` form one group. MIN and MAX skip NaN.
