@@ -135,6 +135,50 @@ pub fn routeGroupByDop(
     return routeGroupBy(allocator, worker_alloc, upstream, group_cols, aggs, top_k, emit_limit, budget, partition_dop);
 }
 
+/// Narrow a keyed GROUP BY's input to the columns it reads: its keys and
+/// every aggregate's inputs. Nothing above the aggregate can read any other
+/// input column, but a plan that buffers its input (the partitioned
+/// aggregate's chunks, the sort before a streamed group, a realized input)
+/// would copy each of them for the whole input: a Compute below passes
+/// through the wide column its expression read (issue #390). A parallel scan
+/// is told first, so its fused compute and its survivor copy drop those
+/// columns too. The input stays as it is when the GROUP BY reads every
+/// column, has no keys (nothing is buffered), names a column the input lacks
+/// (the aggregate reports it), or a kept column's label resolves to another.
+/// Ownership follows `routeGroupBy`: `upstream` is reassigned only on
+/// success.
+pub fn narrowToAggregateInputs(
+    allocator: Allocator,
+    upstream: *Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+) !void {
+    if (group_cols.len == 0) return;
+    const schema = upstream.outputSchema();
+    const read = try allocator.alloc(bool, schema.len);
+    defer allocator.free(read);
+    @memset(read, false);
+    for (group_cols) |name| read[types.findColumn(schema, name) orelse return] = true;
+    for (aggs) |a| {
+        if (a.col) |name| read[types.findColumn(schema, name) orelse return] = true;
+        if (a.arg2_col) |name| read[types.findColumn(schema, name) orelse return] = true;
+        for (a.udf_arg_cols) |name| read[types.findColumn(schema, name) orelse return] = true;
+    }
+    const kept = std.mem.count(bool, read, &.{true});
+    if (kept == schema.len) return;
+    const names = try allocator.alloc([]const u8, kept);
+    defer allocator.free(names);
+    var n: usize = 0;
+    for (schema, read, 0..) |col, keep, i| {
+        if (!keep) continue;
+        if (types.findColumn(schema, col.name) != i) return;
+        names[n] = col.name;
+        n += 1;
+    }
+    try upstream.setEmitProjection(names);
+    upstream.* = try upstream.project(names);
+}
+
 /// True when the partitioned aggregate can carry this GROUP BY on
 /// `partition_dop` threads: keyed, no top-k or LIMIT emit (the hash path's
 /// early-outs serve those), over an input big enough to repay the threads.

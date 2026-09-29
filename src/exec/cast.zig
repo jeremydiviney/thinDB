@@ -244,13 +244,18 @@ pub fn argNarrowingKernelFor(from: TypeTag, to: TypeTag) ?CastKernel {
 /// THE result-type rule: the type one result takes when it may hold a value
 /// of either type — CASE/IF branches, COALESCE/GREATEST/LEAST arguments,
 /// UNION arms. StarRocks semantics: decimals meet at the precision and scale
-/// covering both, a decimal and a float meet as DOUBLE, integers widen, DATE
-/// meets DATETIME as DATETIME, and anything meets text as text. Null when
-/// the two never share a result (a number and a date).
+/// covering both, a decimal and a float meet as DOUBLE, a LARGEINT and a
+/// decimal as `largeintMeetsDecimal` says, integers widen, DATE meets
+/// DATETIME as DATETIME, a number meets a date as `numberMeetsTemporal`
+/// says, and anything meets text as text. Null when the two never share a
+/// result (a UUID and a number).
 pub fn commonType(a: Type, b: Type) ?Type {
     if (sameRepresentation(a, b)) return if (a.isString()) commonText(a, b) else a;
+    if (numberMeetsTemporal(a, b) orelse numberMeetsTemporal(b, a)) |t| return t;
     if (a.isDecimal() or b.isDecimal()) {
         if (a.isFloat() or b.isFloat()) return .double;
+        if (a == .largeint) return largeintMeetsDecimal(b);
+        if (b == .largeint) return largeintMeetsDecimal(a);
         if (decimal.commonSpec(&.{ a, b })) |spec| return decimal.decTypeFor(spec.p, spec.s);
     }
     const at: TypeTag = a;
@@ -261,6 +266,30 @@ pub fn commonType(a: Type, b: Type) ?Type {
     }
     if (a.isString() or b.isString()) return .string;
     return null;
+}
+
+/// A number and a DATE or DATETIME meet as in StarRocks, which reads the
+/// date as its YYYYMMDD number, an INT, and the datetime as its
+/// YYYYMMDDhhmmss number, a BIGINT (`CAST(d AS BIGINT)`). An integer or
+/// BOOLEAN widens with that number; a decimal meets either as DOUBLE, and so
+/// does a float a DATETIME. A float and a DATE meet as text, as StarRocks
+/// meets them. Null when `n` is no number or `t` no date.
+fn numberMeetsTemporal(n: Type, t: Type) ?Type {
+    if (t != .date and t != .datetime) return null;
+    if (n.isDecimal()) return .double;
+    if (n.isFloat()) return if (t == .date) .string else .double;
+    if (!n.isInteger() and n != .boolean) return null;
+    return commonType(n, if (t == .date) .int else .bigint);
+}
+
+/// No decimal covers a LARGEINT, whose values run to 39 digits. Beside a
+/// decimal with a fraction it meets as DOUBLE, as in StarRocks. Beside a
+/// DECIMAL(p,0), StarRocks meets it at DECIMAL(38,0) and lets that type's
+/// values run past its 38 digits; thinDB's decimals keep their precision, so
+/// the type covering both is LARGEINT, which holds every DECIMAL(p,0) value
+/// and prints the same digits.
+fn largeintMeetsDecimal(d: Type) Type {
+    return if (d.decimalSpec().?.s > 0) .double else .largeint;
 }
 
 /// Two declared-length text types meet at the longer VARCHAR, as in MySQL;
@@ -723,8 +752,19 @@ test "commonType: one result type for values of either type" {
         .{ @as(Type, .{ .varchar = 10 }), @as(Type, .{ .varchar = 20 }), @as(?Type, .{ .varchar = 20 }) },
         .{ @as(Type, .{ .char = 3 }), @as(Type, .{ .varchar = 2 }), @as(?Type, .{ .varchar = 3 }) },
         .{ @as(Type, .{ .varchar = 10 }), @as(Type, .string), @as(?Type, .string) },
-        .{ @as(Type, .int), @as(Type, .date), @as(?Type, null) },
-        .{ dec_10_2, @as(Type, .datetime), @as(?Type, null) },
+        // A number beside a date, as StarRocks' IF, COALESCE and GREATEST type it.
+        .{ @as(Type, .tinyint), @as(Type, .date), @as(?Type, .int) },
+        .{ @as(Type, .boolean), @as(Type, .date), @as(?Type, .int) },
+        .{ @as(Type, .int), @as(Type, .date), @as(?Type, .int) },
+        .{ @as(Type, .smallint), @as(Type, .datetime), @as(?Type, .bigint) },
+        .{ @as(Type, .bigint), @as(Type, .date), @as(?Type, .bigint) },
+        .{ @as(Type, .largeint), @as(Type, .datetime), @as(?Type, .largeint) },
+        .{ dec_10_2, @as(Type, .date), @as(?Type, .double) },
+        .{ dec_10_2, @as(Type, .datetime), @as(?Type, .double) },
+        .{ @as(Type, .float), @as(Type, .datetime), @as(?Type, .double) },
+        .{ @as(Type, .double), @as(Type, .date), @as(?Type, .string) },
+        .{ @as(Type, .int), @as(Type, .uuid), @as(?Type, null) },
+        .{ @as(Type, .uuid), @as(Type, .date), @as(?Type, null) },
     };
     inline for (cases) |c| {
         try std.testing.expectEqual(c[2], commonType(c[0], c[1]));

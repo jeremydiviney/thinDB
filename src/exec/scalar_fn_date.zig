@@ -721,7 +721,7 @@ pub fn monthnameFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
 
 /// A DATE_DIFF or TIMESTAMPDIFF unit: MySQL's, with or without its SQL_TSI_
 /// prefix, StarRocks' millisecond, or any spelling `parseDateUnit` accepts.
-const DiffUnit = enum { microsecond, millisecond, second, minute, hour, day, week, month, quarter, year };
+pub const DiffUnit = enum { microsecond, millisecond, second, minute, hour, day, week, month, quarter, year };
 
 fn parseDiffUnit(text: []const u8) error{ComputeUnsupportedExpr}!DiffUnit {
     const unit = if (std.ascii.startsWithIgnoreCase(text, "sql_tsi_")) text["sql_tsi_".len..] else text;
@@ -879,6 +879,37 @@ pub const minutesDiffKernel = UnitsDiff(.minute).kernel;
 pub const secondsDiffKernel = UnitsDiff(.second).kernel;
 pub const millisecondsDiffKernel = UnitsDiff(.millisecond).kernel;
 
+/// StarRocks' YEARS_ADD(dt, n) and the rest of that family down to
+/// MICROSECONDS_ADD(dt, n), each with a _SUB that moves `dt` back: `dt`
+/// moved by `n` units as DATE_ADD moves it (`addUnitToDatetime`), a month
+/// step clamping the day. The count is a BIGINT so that one past StarRocks'
+/// INT reaches here and is NULL rather than saturated; a result outside
+/// years 0-9999 is NULL too.
+pub fn unitsAddKernel(comptime unit: DiffUnit, comptime negate: bool) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const base = out.data.rowCount();
+            const dts = args[0].data.datetime;
+            const ns = args[1].data.bigint;
+            for (0..row_count) |i| {
+                const count: ?i32 = if (args[0].isValid(i) and args[1].isValid(i)) std.math.cast(i32, ns[i]) else null;
+                // StarRocks negates the INT count, which wraps INT's least value to itself.
+                const moved = if (count) |n| addDiffUnitToDatetime(unit, dts[i], if (negate) 0 -% n else n) else null;
+                try out.data.datetime.append(allocator, moved orelse 0);
+                try out.appendValidBit(allocator, base + i, moved != null);
+            }
+        }
+    }.kernel;
+}
+
+fn addDiffUnitToDatetime(unit: DiffUnit, micros: i64, n: i32) ?i64 {
+    return switch (unit) {
+        .microsecond => datetimeInRange(micros +| @as(i64, n)),
+        .millisecond => datetimeInRange(micros +| @as(i64, n) * std.time.us_per_ms),
+        inline else => |u| addUnitToDatetime(@field(DateUnit, @tagName(u)), micros, n),
+    };
+}
+
 pub fn timestampDiffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const unit = try parseDiffUnit(stringViewOf(args[0]).rowBytes(0));
     const start = args[1].data.datetime;
@@ -984,6 +1015,12 @@ pub const dateFormatDateKernel = DateFormat(.date).kernel;
 /// A DATE as its number `YYYYMMDD` (`CAST(d AS SIGNED)`, `d + 0`).
 pub fn dateToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     for (args[0].data.date[0..row_count]) |d| try out.data.bigint.append(allocator, common.dateNumber(d));
+}
+
+/// A DATE as its number `YYYYMMDD`, as StarRocks casts one to INT. Every
+/// DATE fits, since the last is 9999-12-31.
+pub fn dateToIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.date[0..row_count]) |d| try out.data.int.append(allocator, @intCast(common.dateNumber(d)));
 }
 
 /// A DATETIME as its number `YYYYMMDDHHMMSS`, rounded to the second first,

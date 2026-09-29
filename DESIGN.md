@@ -279,7 +279,7 @@ an integer, since BIT columns are integers here. A charset introducer
 than UTF-8 or binary admits only ASCII text, since thinDB does not transcode.
 Adjacent string literals concatenate (`'a' 'b'` is `'ab'`).
 
-A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored; `CAST(x AS LARGEINT)`, which MySQL lacks, drops it as StarRocks does. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
+A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored; `CAST(x AS LARGEINT)`, which MySQL lacks, drops it as StarRocks does. A number and a date that meet in one result (IF and CASE branches, COALESCE, IFNULL, GREATEST, LEAST, UNION arms) meet as that number, as in StarRocks (`cast.commonType`). Beside an integer or boolean, a DATE is an INT and a DATETIME a BIGINT, widened to the integer's type. Beside a decimal, either is DOUBLE, and so is a DATETIME beside a float. A float and a DATE meet as text, as StarRocks meets them. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
 
 A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
 
@@ -313,7 +313,13 @@ read a LARGEINT input as its 64 bits.
 
 A LARGEINT stays exact where a result takes it: COALESCE, IFNULL, NULLIF,
 GREATEST and LEAST return LARGEINT, where MySQL returns a DECIMAL of the same
-digits. Cast to BIGINT (`CAST(x AS SIGNED)`), a LARGEINT from 2^63 to
+digits. No decimal holds a LARGEINT's 39 digits, so where a LARGEINT meets a
+decimal in one result (those functions, IF and CASE branches, UNION arms), the
+result is DOUBLE when the decimal has a fraction, as in StarRocks. Beside a
+DECIMAL(p,0) the result is LARGEINT, which holds every value of both and
+prints the same digits StarRocks does; StarRocks says DECIMAL(38,0) and lets
+its values run past 38 digits, which thinDB's decimals don't
+(`cast.commonType`). Cast to BIGINT (`CAST(x AS SIGNED)`), a LARGEINT from 2^63 to
 2^64 - 1 keeps its 64 bits as MySQL does, so `CAST(~5 AS SIGNED)` is -6, where
 StarRocks gives NULL; any other LARGEINT past BIGINT is NULL. `CAST(x AS
 UNSIGNED)` is still a signed BIGINT. An integer of any width, LARGEINT

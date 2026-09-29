@@ -1634,16 +1634,32 @@ pub const ParallelScan = struct {
         self.owns_out_schema = true;
     }
 
-    /// A downstream consumer reports it reads only `keep`. On the materialize
-    /// path, drop every other output column from the survivor deep-copy — they
-    /// were decoded purely to feed a fused filter/compute (e.g. `URL` behind
-    /// `length(URL)` + `URL<>''`) and nothing above reads them. Safe because the
-    /// forwarding chain only reaches here past a fused (pass-through) Filter; an
-    /// unfused Filter swallows the projection before it reaches us.
-    /// No-op for the round (stream) path — that emits the scan's already-pruned
-    /// columns, so there is nothing dead to drop.
+    /// A downstream consumer reports it reads only `keep`. With a fused
+    /// compute, each worker's chain projects to `keep`: the compute passes
+    /// through the columns its expressions read, and the materialize drain
+    /// (or the owned chunks a realizing consumer takes) would deep-copy them
+    /// for the whole input (issue #390). Otherwise the materialize path drops
+    /// every other output column from the survivor deep-copy — they were
+    /// decoded purely to feed a fused filter (e.g. `URL` behind `URL<>''`)
+    /// and nothing above reads them. Safe because the forwarding chain only
+    /// reaches here past a fused (pass-through) Filter; an unfused Filter
+    /// swallows the projection before it reaches us. The round (stream) path
+    /// of a scan without a compute emits the scan's already-pruned columns,
+    /// so there is nothing dead to drop.
     pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
-        if (self.agg_fused or !self.materializesOnPull()) return;
+        if (self.agg_fused) return;
+        if (self.compute_fused and self.mode == .unset and self.probe_sink == null and self.emit_keep == null) {
+            const schema = self.compute_q[0].outputSchema();
+            const all_present = for (keep) |name| {
+                if (types.findColumn(schema, name) == null) break false;
+            } else true;
+            if (all_present) {
+                for (self.compute_q) |*wq| wq.* = try wq.project(keep);
+                self.out_schema = self.compute_q[0].outputSchema();
+                return;
+            }
+        }
+        if (!self.materializesOnPull()) return;
         try self.applyEmitProjection(keep);
     }
 
