@@ -489,3 +489,30 @@ test "alterTable: swap directory names are reserved" {
     try std.testing.expectError(thindb.Error.TableNotFound, db.dropTable("__alter_new_orders"));
     try std.testing.expectError(thindb.Error.TableNotFound, db.renameTable("__alter_new_orders", "shadow"));
 }
+
+test "drop, rename and alter refuse to run under a shared statement lease" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("orders", schema_v1, opts_v1);
+    try t.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" }});
+
+    // The caller's statement may have resolved the table, so freeing or
+    // rewriting it here could pull it out from under that statement.
+    {
+        const lease = try db.owned_catalog.?.acquireStatement(false);
+        defer lease.release();
+        try std.testing.expectError(thindb.Error.TableBusy, db.dropTable("orders"));
+        try std.testing.expectError(thindb.Error.TableBusy, db.renameTable("orders", "renamed"));
+        try std.testing.expectError(thindb.Error.TableBusy, db.alterTable("orders", &.{.{ .drop = "tag" }}));
+    }
+    try std.testing.expectEqual(t, try db.openTable("orders", .{}));
+    try std.testing.expectEqual(@as(usize, 4), t.schema.columns.len);
+    try db.dropTable("orders");
+    try std.testing.expectError(thindb.Error.TableNotFound, db.openTable("orders", .{}));
+}

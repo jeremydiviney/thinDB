@@ -123,6 +123,238 @@ test "CTAS: rejects when target exists (unless IF NOT EXISTS)" {
     try exec(allocator, db, "CREATE TABLE IF NOT EXISTS dst AS SELECT id FROM src");
 }
 
+const taken_schema: thindb.TableSchema = .{
+    .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "tag", .type = .string, .nullable = true } },
+    .order_key = &.{"id"},
+    .unique = false,
+};
+const taken_opts: thindb.TableOptions = .{ .order_key = &.{"id"} };
+
+fn countBuildDirs(sc: *thindb.api.Schema) !usize {
+    var n: usize = 0;
+    var it = sc.schema_dir.iterate();
+    while (try it.next(sc.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "__ctas_")) n += 1;
+    }
+    return n;
+}
+
+/// A UDF a CTAS query calls while its target is being built: it looks at the
+/// target as any other statement would at that moment.
+const BuildProbe = struct {
+    db: *thindb.Database,
+    action: enum { observe, fail, take_name },
+    calls: usize = 0,
+    resolvable: bool = true,
+    listed: bool = true,
+    build_dirs: usize = 0,
+
+    fn kernel(ctx: *const thindb.udf.ScalarContext, args: []const thindb.storage.ColumnView, out: *thindb.engine.ColumnStore, count: usize) !void {
+        const self: *BuildProbe = @ptrCast(@alignCast(ctx.user_data.?));
+        self.calls += 1;
+        self.resolvable = if (self.db.openTable("dst", .{})) |_| true else |err| switch (err) {
+            error.TableNotFound => false,
+            else => return err,
+        };
+        const sc = self.db.schema("public").?;
+        const names = try sc.listTables(std.testing.allocator);
+        defer {
+            for (names) |name| std.testing.allocator.free(name);
+            std.testing.allocator.free(names);
+        }
+        self.listed = false;
+        for (names) |name| {
+            if (std.mem.eql(u8, name, "dst") or std.mem.startsWith(u8, name, "__ctas_")) self.listed = true;
+        }
+        self.build_dirs = try countBuildDirs(sc);
+        switch (self.action) {
+            .observe => {},
+            .fail => return error.ProbeFailed,
+            .take_name => _ = try self.db.table("dst", taken_schema, taken_opts),
+        }
+        try out.data.bigint.appendSlice(ctx.allocator, args[0].data.bigint[0..count]);
+    }
+
+    fn open(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, probe: *BuildProbe) !*thindb.Database {
+        const db = try thindb.Database.open(allocator, io, dir, .{});
+        errdefer db.close();
+        probe.db = db;
+        try db.registerScalarUdf(.{
+            .name = "build_probe",
+            .arg_types = &.{.bigint},
+            .return_type = .bigint,
+            .kernel = kernel,
+            .user_data = probe,
+        });
+        try exec(allocator, db, "CREATE TABLE src (id BIGINT PRIMARY KEY)");
+        try exec(allocator, db, "INSERT INTO src (id) VALUES (1)");
+        return db;
+    }
+};
+
+test "CTAS: the target stays hidden while its query runs, and a failed query leaves nothing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var probe: BuildProbe = .{ .db = undefined, .action = .fail };
+    var db = try BuildProbe.open(allocator, io, tmp.dir, &probe);
+    defer db.close();
+    const sc = db.schema("public").?;
+
+    // A concurrent statement resolving the target mid-build would hold a
+    // table the failure frees (#377).
+    try expectStatementFails(allocator, db, "CREATE TABLE dst AS SELECT build_probe(id) AS id FROM src");
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.build_dirs);
+    try std.testing.expect(!probe.resolvable);
+    try std.testing.expect(!probe.listed);
+    try std.testing.expectError(thindb.Error.TableNotFound, db.openTable("dst", .{}));
+    try std.testing.expectEqual(@as(usize, 0), try countBuildDirs(sc));
+    try std.testing.expectError(error.FileNotFound, sc.schema_dir.access(io, "dst", .{}));
+
+    probe.action = .observe;
+    probe.calls = 0;
+    try exec(allocator, db, "CREATE TABLE dst AS SELECT build_probe(id) AS id FROM src");
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!probe.resolvable);
+    try std.testing.expect(!probe.listed);
+    try std.testing.expectEqual(@as(usize, 0), try countBuildDirs(sc));
+    const ids = try collectBigints(allocator, db, "SELECT id FROM dst");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{1}, ids);
+}
+
+test "CTAS: a name taken while the query runs fails the publish, or leaves IF NOT EXISTS a no-op" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var probe: BuildProbe = .{ .db = undefined, .action = .take_name };
+    var db = try BuildProbe.open(allocator, io, tmp.dir, &probe);
+    defer db.close();
+    const sc = db.schema("public").?;
+
+    inline for (.{ false, true }) |if_not_exists| {
+        const sql = if (if_not_exists)
+            "CREATE TABLE IF NOT EXISTS dst AS SELECT build_probe(id) AS id FROM src"
+        else
+            "CREATE TABLE dst AS SELECT build_probe(id) AS id FROM src";
+        if (if_not_exists) {
+            var q = try helpers.runSql(allocator, db, sql);
+            defer q.deinit();
+            try std.testing.expectEqual(@as(u64, 0), q.affectedRows());
+        } else {
+            try helpers.expectRunError(allocator, db, sql, thindb.net.Error.TableAlreadyExists);
+        }
+        // The table that took the name stands, empty; the build is gone.
+        const dst = try db.openTable("dst", .{});
+        try std.testing.expectEqual(@as(usize, 2), dst.schema.columns.len);
+        const n = try collectBigints(allocator, db, "SELECT COUNT(*) FROM dst");
+        defer allocator.free(n);
+        try std.testing.expectEqualSlices(i64, &.{0}, n);
+        try std.testing.expectEqual(@as(usize, 0), try countBuildDirs(sc));
+        try db.dropTable("dst");
+    }
+}
+
+test "CTAS: two builds of one name publish one table, and the loser leaves nothing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const sc = db.schema("public").?;
+
+    var first = try sc.beginTableBuild("dst", taken_schema, taken_opts);
+    defer first.deinit();
+    try first.table.insert(&.{.{ .id = @as(i64, 1), .tag = "first" }});
+    {
+        var second = try sc.beginTableBuild("dst", taken_schema, taken_opts);
+        defer second.deinit();
+        try second.table.insert(&.{.{ .id = @as(i64, 2), .tag = "second" }});
+        try std.testing.expectEqual(@as(usize, 2), try countBuildDirs(sc));
+
+        try first.publish();
+        try std.testing.expectError(thindb.Error.TableAlreadyExists, second.publish());
+    }
+    try std.testing.expectEqual(@as(usize, 0), try countBuildDirs(sc));
+    try std.testing.expectError(thindb.Error.TableAlreadyExists, sc.beginTableBuild("dst", taken_schema, taken_opts));
+
+    const ids = try collectBigints(allocator, db, "SELECT id FROM dst");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{1}, ids);
+    try std.testing.expectError(thindb.Error.ReservedTableName, sc.beginTableBuild("__ctas_9", taken_schema, taken_opts));
+    try std.testing.expectError(thindb.Error.ReservedTableName, db.table("__ctas_9", taken_schema, taken_opts));
+}
+
+test "CTAS: a target that exists only on disk is refused, neither filled nor dropped" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var probe: BuildProbe = .{ .db = undefined, .action = .observe };
+        var db = try BuildProbe.open(allocator, io, tmp.dir, &probe);
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE dst AS SELECT id FROM src");
+    }
+    // Reopened, `dst` is on disk but not yet open, with the very schema the
+    // CTAS below infers.
+    var probe: BuildProbe = .{ .db = undefined, .action = .fail };
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    probe.db = db;
+    try db.registerScalarUdf(.{
+        .name = "build_probe",
+        .arg_types = &.{.bigint},
+        .return_type = .bigint,
+        .kernel = BuildProbe.kernel,
+        .user_data = &probe,
+    });
+    try helpers.expectRunError(allocator, db, "CREATE TABLE dst AS SELECT id FROM src", thindb.net.Error.TableAlreadyExists);
+    try helpers.expectRunError(allocator, db, "CREATE TABLE dst AS SELECT build_probe(id) AS id FROM src", thindb.net.Error.TableAlreadyExists);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    const ids = try collectBigints(allocator, db, "SELECT id FROM dst");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{1}, ids);
+}
+
+test "CTAS: a build directory a crash left is deleted on reopen and never listed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("half", taken_schema, taken_opts);
+        try t.insert(&.{.{ .id = @as(i64, 1), .tag = "x" }});
+        try t.flush();
+    }
+    // A complete table under a build name, as a crash between the query's end
+    // and the publish leaves one.
+    {
+        var public = try tmp.dir.openDir(io, "main/public", .{});
+        defer public.close(io);
+        try std.Io.Dir.rename(public, "half", public, "__ctas_0", io);
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const sc = db.schema("public").?;
+    try std.testing.expectEqual(@as(usize, 0), try countBuildDirs(sc));
+    const names = try sc.listTables(allocator);
+    defer {
+        for (names) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 0), names.len);
+    try std.testing.expectError(thindb.Error.TableNotFound, db.openTable("__ctas_0", .{}));
+    try std.testing.expectError(thindb.Error.TableNotFound, db.openTable("half", .{}));
+}
+
 test "INSERT SELECT: full positional copy" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
