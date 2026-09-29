@@ -2656,11 +2656,22 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     .{ .registry = &catalog.sql_fns, .db = db_name, .views = &catalog.views, .tables = tables.columns() },
                 ) catch return Error.FunctionInvalidDefinition;
             }
-            if (cv.materialized) {
-                const n = try buildMaterializedView(ctx, catalog, cv.name, cv.body, cv.or_replace, true);
-                ctx.affected_rows = @intCast(n);
+            if (!cv.materialized) {
+                catalog.registerView(db_name, cv, false) catch |e| return thindb_api.remapError(Error, e);
+                return try EmptyOp.create(ctx.allocator);
             }
-            catalog.registerView(db_name, cv, false) catch |e| return thindb_api.remapError(Error, e);
+            const sc = try currentPersistentSchema(catalog, ctx.session.*);
+            var mv = try buildMaterializedView(ctx, catalog, sc, cv.name, cv.body, if (cv.or_replace) .replace else .create);
+            defer mv.build.deinit();
+            mv.build.publish() catch |e| return thindb_api.remapError(Error, e);
+            // The view is registered only once its table stands, and a table
+            // the publish created goes again if registering fails, so a failed
+            // CREATE leaves neither.
+            catalog.registerView(db_name, cv, false) catch |e| {
+                if (!mv.build.replaced) sc.dropTable(cv.name) catch {};
+                return thindb_api.remapError(Error, e);
+            };
+            ctx.affected_rows = @intCast(mv.rows);
         },
         .drop_view => |dv| {
             const db_name = try currentDbName(ctx.session.*);
@@ -2678,26 +2689,40 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             const def = (try catalog.views.get(ctx.allocator, try currentDbName(ctx.session.*), name)) orelse return Error.TableNotFound;
             defer def.deinit(ctx.allocator);
             if (!def.materialized) return Error.UnsupportedOp;
-            const n = try buildMaterializedView(ctx, catalog, name, def.body, true, false);
-            ctx.affected_rows = @intCast(n);
+            const sc = try currentPersistentSchema(catalog, ctx.session.*);
+            var mv = try buildMaterializedView(ctx, catalog, sc, name, def.body, .refresh);
+            defer mv.build.deinit();
+            mv.build.publish() catch |e| return thindb_api.remapError(Error, e);
+            ctx.affected_rows = @intCast(mv.rows);
         },
     }
     return try EmptyOp.create(ctx.allocator);
 }
 
-/// Build (or REFRESH) a materialized view's backing table: re-parse the
-/// defining query, compile it, and stream its rows into a table named
-/// `name`. On create the table is made fresh (dropped first if `replace`);
-/// on refresh the existing table is truncated and refilled. Returns the row
-/// count. The parsed IR lives in a local arena that outlives the drain.
+fn currentPersistentSchema(catalog: *Catalog, session: Session) !*DbSchema {
+    const db = try currentDatabase(catalog, session);
+    return db.schema(session.current_schema) orelse Error.SchemaNotFound;
+}
+
+const MaterializedViewBuild = struct {
+    build: thindb_api.TableBuild,
+    rows: usize,
+};
+
+/// Fill a materialized view's backing table from its defining query, as a
+/// `TableBuild` the caller publishes: until then the table that holds the
+/// name, if any, keeps its rows, so a query that fails part way changes
+/// nothing. `.create` refuses a name a table holds; `.replace` (CREATE OR
+/// REPLACE) and `.refresh` take it over. The parsed IR lives in a local
+/// arena that outlives the drain.
 fn buildMaterializedView(
     ctx: *CompileCtx,
     catalog: *Catalog,
+    sc: *DbSchema,
     name: []const u8,
     body: []const u8,
-    replace: bool,
-    is_create: bool,
-) anyerror!usize {
+    mode: enum { create, replace, refresh },
+) anyerror!MaterializedViewBuild {
     var pa = std.heap.ArenaAllocator.init(ctx.allocator);
     defer pa.deinit();
     const tables: SessionTables = .{ .catalog = catalog, .session = ctx.session.* };
@@ -2709,13 +2734,13 @@ fn buildMaterializedView(
         .{ .registry = &catalog.sql_fns, .db = ctx.session.current_db, .views = &catalog.views, .tables = tables.columns() },
     ) catch return Error.FunctionInvalidDefinition;
 
+    // Released before the caller publishes: the query may read the table the
+    // publish replaces, and a scan it keeps open would hold that table's
+    // ddl_lock against the swap.
     var source = try compileSubplan(ctx, parsed);
     defer source.deinit();
     const src_schema = source.outputSchema();
     if (src_schema.len == 0) return Error.BadRequest;
-
-    const db = try currentDatabase(catalog, ctx.session.*);
-    const sc = db.schema(ctx.session.current_schema) orelse return Error.SchemaNotFound;
 
     const cols = try ctx.allocator.alloc(types.Column, src_schema.len);
     defer ctx.allocator.free(cols);
@@ -2726,28 +2751,25 @@ fn buildMaterializedView(
     const target_schema: TableSchema = .{ .columns = cols, .order_key = order_key, .unique = false };
     const opts: TableOptions = .{ .order_key = order_key, .unique = false, .row_group_size = null };
 
-    sc.tables_mutex.lockUncancelable(sc.io);
-    var exists = sc.tables.get(name) != null;
-    sc.tables_mutex.unlock(sc.io);
-    if (is_create and exists) {
-        if (!replace) return Error.TableAlreadyExists;
-        sc.dropTable(name) catch |e| return thindb_api.remapError(Error, e);
-        exists = false;
-    }
-
-    const t = if (exists)
-        try resolveTable(catalog, ctx.session.*, .{ .name = name })
-    else
-        sc.table(name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
-    if (exists) try t.truncate();
-
-    var total: usize = 0;
-    while (try source.next()) |b| {
-        try t.insertBatch(b.schema, b.values, b.row_count);
-        total += b.row_count;
-    }
-    try t.flush();
-    return total;
+    var build = switch (mode) {
+        .create => sc.beginTableBuild(name, target_schema, opts),
+        .replace => sc.beginTableReplacement(name, target_schema, opts),
+        // REFRESH keeps the backing table as it stands: its columns, keys,
+        // compression and row group size, whatever an ALTER made of them.
+        .refresh => if (sc.openTable(name, .{})) |current|
+            sc.beginTableReplacement(name, current.schema, .{
+                .order_key = current.schema.order_key,
+                .unique = current.schema.unique,
+                .row_group_size = current.row_group_size,
+            })
+        else |e| switch (e) {
+            ApiError.TableNotFound => sc.beginTableReplacement(name, target_schema, opts),
+            else => return thindb_api.remapError(Error, e),
+        },
+    } catch |e| return thindb_api.remapError(Error, e);
+    errdefer build.deinit();
+    const rows = try insertAll(&source, build.table);
+    return .{ .build = build, .rows = rows };
 }
 
 /// CREATE TABLE name AS SELECT ... — infer target schema from the
