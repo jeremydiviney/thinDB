@@ -412,6 +412,16 @@ pub const MemoryAccountant = struct {
         return self.budget - self.current_bytes;
     }
 
+    /// Bytes this statement can still reserve: what its own budget has left,
+    /// capped by what the shared pool has free.
+    pub fn headroom(self: *MemoryAccountant) usize {
+        self.lock();
+        defer self.reservation_lock.unlock();
+        const own = self.budget - self.current_bytes;
+        const pool = self.pool orelse return own;
+        return @min(own, pool.budget -| pool.inUse());
+    }
+
     fn logRefusal(self: *MemoryAccountant, failing: Source, want: usize, pool: ?*MemoryPool) void {
         if (self.refusal_logged) return;
         self.refusal_logged = true;
@@ -473,6 +483,21 @@ test "memory: shared pool constrains accountants across queries" {
     try q2.reserve(.hash_aggregate, 600);
     q2.release(.hash_aggregate, 1000);
     try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+}
+
+test "memory: headroom is the budget left, capped by the pool's free bytes" {
+    var pool = MemoryPool.init(1000);
+    var q1 = MemoryAccountant.initWithPool(700, &pool);
+    var q2 = MemoryAccountant.initWithPool(0, &pool);
+    try q1.reserve(.sort, 200);
+    try std.testing.expectEqual(@as(usize, 500), q1.headroom());
+    try q2.reserve(.hash_aggregate, 600);
+    try std.testing.expectEqual(@as(usize, 200), q1.headroom());
+    try std.testing.expectEqual(@as(usize, 200), q2.headroom());
+    q1.release(.sort, 200);
+    q2.release(.hash_aggregate, 600);
+    var alone = MemoryAccountant.init(300);
+    try std.testing.expectEqual(@as(usize, 300), alone.headroom());
 }
 
 test "memory: per-query ceiling trips before the pool and reserves nothing" {

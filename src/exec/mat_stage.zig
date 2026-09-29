@@ -313,6 +313,21 @@ pub const MaterializedResult = struct {
         return &self.chunks.items[self.chunks.items.len - 1];
     }
 
+    /// Record each string column's measured mean width in `stats` (indexed
+    /// like the schema), for consumers that size copies of this result.
+    fn measureWidths(self: *const MaterializedResult, stats: []exec.ColStat) void {
+        if (stats.len != self.schema.len) return;
+        for (self.schema, stats, 0..) |sc, *stat, i| {
+            if (!sc.type.isString()) continue;
+            var payload: u64 = 0;
+            for (self.chunks.items) |c| {
+                if (c.rows == 0) continue;
+                payload += exec.stringPayloadBytes(if (c.views.len > 0) c.views[i] else c.cols[i].view());
+            }
+            stat.avg_width = exec.avgWidth(payload, self.total_rows);
+        }
+    }
+
     /// Bytes held by a string-family column store; 0 for fixed-width.
     fn colStrBytes(col: *const engine.ColumnStore) usize {
         return switch (col.data) {
@@ -854,6 +869,7 @@ pub const Stage = struct {
         self.result = res;
         self.stats_upper_rows = res.total_rows;
         exec.capColStats(self.col_stats, res.total_rows);
+        res.measureWidths(self.col_stats);
         if (prof_on) {
             const wall = exec.prof.nowTicks() - w0;
             // Nested upstream stages triggered lazily during this drain charge
@@ -1159,10 +1175,11 @@ pub const StageSet = struct {
         const src_stats = q.stats();
         // A per-column array of the wrong length carries no usable mapping —
         // treat it like "no information" rather than misattribute bounds.
-        const col_stats = try aa.dupe(
-            exec.ColStat,
-            if (src_stats.column_stats.len == src.len) src_stats.column_stats else &.{},
-        );
+        // One entry per column either way, so the run can record the
+        // widths it measures.
+        const col_stats = try aa.alloc(exec.ColStat, src.len);
+        const known = src_stats.column_stats.len == src.len;
+        for (col_stats, 0..) |*stat, i| stat.* = if (known) src_stats.column_stats[i] else .{};
         const sort_keys = try aa.alloc([]const u8, src_stats.sort_state.keys.len);
         for (src_stats.sort_state.keys, sort_keys) |k, *d| d.* = try aa.dupe(u8, k);
         const sort_state: exec.SortState = .{

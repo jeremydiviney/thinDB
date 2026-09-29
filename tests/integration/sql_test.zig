@@ -3472,48 +3472,84 @@ const rollforward_sql =
     \\FROM by_cust GROUP BY month ORDER BY month
 ;
 
-test "sql: a budget bounds a cross + aggregate + window pipeline's worker arenas" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
+const RollforwardRun = struct {
+    lines: [][]u8,
+    peak: usize,
+
+    fn deinit(self: RollforwardRun, allocator: std.mem.Allocator) void {
+        for (self.lines) |line| allocator.free(line);
+        allocator.free(self.lines);
+    }
+};
+
+/// `rollforward_sql` over 20,000 seeded rows on 4 threads with `budget` as
+/// both the statement's budget and the shared pool: every result row as
+/// text, and the statement's charged peak.
+fn runRollforward(allocator: std.mem.Allocator, budget: usize) !RollforwardRun {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Parallel stage, window and partitioned-aggregate memory holds most of
-    // this pipeline's footprint. When it went uncharged the whole query fit
-    // in the budget while holding several times that.
-    //
-    // The GROUP BY router sizes its plan to the budget, so the budget picks
-    // the plan as well as the ceiling. At 96 MiB both CTE GROUP BYs take the
-    // partitioned path, and the charged pipeline needs about 116 MiB. With
-    // the partition memory uncharged it fits in about 47 MiB. Near 64 MiB
-    // the router picks sort-based plans that need 52 to 62 MiB, so the
-    // outcome there depends on timing.
-    var db = try thindb.Database.open(allocator, io, tmp.dir, .{
-        .query_memory_budget = 96 << 20,
-        .memory_budget = 96 << 20,
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
+        .query_memory_budget = budget,
+        .memory_budget = budget,
         .auto_flush_secs = 0,
         .max_dop = 4,
     });
     defer db.close();
     try seedRollforward(db, 20_000);
 
-    var rejected = false;
-    if (runSql(allocator, db, rollforward_sql)) |value| {
-        var q = value;
-        defer q.deinit();
-        while (true) {
-            const batch = q.next() catch |err| {
-                try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
-                rejected = true;
-                break;
-            };
-            if (batch == null) break;
-        }
-    } else |err| {
-        try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
-        rejected = true;
+    var lines: std.ArrayList([]u8) = .empty;
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
     }
-    try std.testing.expect(rejected);
-    try std.testing.expectEqual(@as(usize, 0), db.config.memory_pool.?.inUse());
+    var q = try runSql(allocator, db, rollforward_sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            var line: std.ArrayList(u8) = .empty;
+            defer line.deinit(allocator);
+            for (batch.values) |col| {
+                if (!col.isValid(row)) {
+                    try line.appendSlice(allocator, "NULL|");
+                    continue;
+                }
+                switch (col.data) {
+                    .string => |sv| try line.print(allocator, "{s}|", .{sv.rowBytes(row)}),
+                    inline .bigint, .double => |values| try line.print(allocator, "{d}|", .{values[row]}),
+                    else => return error.TestUnexpectedType,
+                }
+            }
+            const owned = try line.toOwnedSlice(allocator);
+            errdefer allocator.free(owned);
+            try lines.append(allocator, owned);
+        }
+    }
+    const peak = q.cq.ctx.accountant.?.peak_bytes;
+    const owned_lines = try lines.toOwnedSlice(allocator);
+    return .{ .lines = owned_lines, .peak = peak };
+}
+
+test "sql: a budget in the old GROUP BY plan-flip gap completes with the plan that fits" {
+    const allocator = std.testing.allocator;
+    // At 96 MiB the budget-blind router took the partitioned plan for both
+    // CTE GROUP BYs, and the charged pipeline needs about 116 MiB, so the
+    // statement failed where a smaller budget's sort-based plans fit
+    // (issue #388). Priced against what the statement has left, 96 and
+    // 80 MiB now pick plans that fit and give the same rows.
+    const roomy = try runRollforward(allocator, 1 << 30);
+    defer roomy.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 40), roomy.lines.len);
+    // With room, both GROUP BYs partition, and their worker memory is
+    // charged: about 116 MiB, against about 47 MiB uncharged.
+    try std.testing.expect(roomy.peak > 90 << 20);
+
+    inline for (.{ 96 << 20, 80 << 20 }) |budget| {
+        const run = try runRollforward(allocator, budget);
+        defer run.deinit(allocator);
+        try std.testing.expect(run.peak <= budget);
+        try std.testing.expectEqual(roomy.lines.len, run.lines.len);
+        for (roomy.lines, run.lines) |want, got| try std.testing.expectEqualStrings(want, got);
+    }
 }
 
 test "sql: blocking paths release all actual capacity at teardown" {
