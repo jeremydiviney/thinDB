@@ -341,3 +341,51 @@ test "CAST and DATE() read text and numbers as StarRocks does (issue #399)" {
     try exec(allocator, db, "INSERT INTO spelled SELECT id, s FROM spell WHERE id IN (1, 2, 4)");
     try expectStrings(allocator, db, "SELECT CAST(d AS CHAR) FROM spelled ORDER BY id", &.{ "2026-01-01", "2026-01-01", "2026-01-01" });
 }
+
+test "a text literal keeps its time of day in date functions and stays text where text fits, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE one (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO one VALUES (1)");
+
+    // Expected values are StarRocks'. Text takes a DATETIME parameter
+    // before a DATE one; a function that takes only a DATE takes the day.
+    const cases = .{
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 DAY)", "2026-01-02 10:30:00" },
+        .{ "DATE_SUB('2026-01-01 10:30:00', INTERVAL 1 DAY)", "2025-12-31 10:30:00" },
+        .{ "DATE_SUB('2026-01-01 10:30:00', INTERVAL 1 HOUR)", "2026-01-01 09:30:00" },
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 WEEK)", "2026-01-08 10:30:00" },
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 QUARTER)", "2026-04-01 10:30:00" },
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 YEAR)", "2027-01-01 10:30:00" },
+        .{ "ADDDATE('2026-01-01 10:30:00', 1)", "2026-01-02 10:30:00" },
+        .{ "SUBDATE('2026-01-01 10:30:00', 1)", "2025-12-31 10:30:00" },
+        .{ "'2026-01-01 10:30:00' + INTERVAL 1 MONTH", "2026-02-01 10:30:00" },
+        .{ "INTERVAL 1 DAY + '2026-01-01 10:30:00'", "2026-01-02 10:30:00" },
+        .{ "TIMESTAMPADD(DAY, 1, '2026-01-01 10:30:00')", "2026-01-02 10:30:00" },
+        .{ "TIMESTAMPADD(MONTH, 1, '2026-01-01 10:30:00')", "2026-02-01 10:30:00" },
+        .{ "DATE_ADD('2026-01-31', INTERVAL 1 DAY)", "2026-02-01 00:00:00" },
+        .{ "'2026-01-31' + INTERVAL 1 MONTH", "2026-02-28 00:00:00" },
+        .{ "DATE_ADD('2026/1/31', INTERVAL 1 DAY)", "2026-02-01 00:00:00" },
+        .{ "LAST_DAY('2026/2/1 10:00')", "2026-02-28" },
+        .{ "DAYNAME('2026-01-01 10:30:00')", "Thursday" },
+        .{ "WEEK('2026-01-01 10:30:00', 1)", "1" },
+        .{ "TO_DAYS('2026-01-01 10:30:00')", "739982" },
+        .{ "DATEDIFF('2026-01-02 01:00:00', '2026-01-01 23:00:00')", "1" },
+        .{ "DATEDIFF('2026-01-02 01:00:00', DATE '2026-01-01')", "1" },
+        .{ "TIMESTAMPDIFF(HOUR, '2026-01-01 23:00:00', '2026-01-02 01:00:00')", "2" },
+        // Text beside a DATE where text fits stays text.
+        .{ "COALESCE('2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "COALESCE(NULL, '2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "COALESCE('2026/1/1', DATE '2026-01-02')", "2026/1/1" },
+        .{ "IFNULL('2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "GREATEST('2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "LEAST('2026/1/1', DATE '2026-01-02')", "2026-01-02" },
+    };
+    inline for (cases) |c| {
+        try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM one", &.{c[1]});
+    }
+    try expectStrings(allocator, db, "SELECT CAST(DATE_ADD('abc', INTERVAL 1 DAY) AS CHAR) FROM one", &.{null});
+}
