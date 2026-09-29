@@ -3747,7 +3747,7 @@ test "sql: unit-first date functions and aggregate aliases execute" {
     _ = try seedT(db);
 
     {
-        var q = try runSql(allocator, db, "SELECT date_diff(day, current_date, timestampadd(day, 1, current_date)) AS dd FROM t LIMIT 1");
+        var q = try runSql(allocator, db, "SELECT date_diff(day, timestampadd(day, 1, current_date), current_date) AS dd FROM t LIMIT 1");
         defer q.deinit();
         const b = (try q.next()).?;
         try std.testing.expectEqual(@as(i64, 1), b.values[0].data.bigint[0]);

@@ -330,12 +330,132 @@ test "date unit functions know WEEK and QUARTER and reject unknown units" {
     const unknown_units = .{
         "SELECT date_trunc('fortnight', d) AS r FROM t",
         "SELECT TIMESTAMPDIFF(FORTNIGHT, d, DATE '2024-06-30') AS r FROM t",
+        "SELECT DATE_DIFF('fortnight', d, DATE '2024-06-30') AS r FROM t",
     };
     inline for (unknown_units) |sql| {
         var q = try runSql(allocator, db, sql);
         defer q.deinit();
         try std.testing.expectError(error.ComputeUnsupportedExpr, q.next());
     }
+}
+
+fn expectTexts(allocator: std.mem.Allocator, db: anytype, sql: []const u8, want: []const ?[]const u8) !void {
+    const got = try helpers.collectStrings(allocator, db, sql);
+    defer helpers.freeStrings(allocator, got);
+    errdefer std.debug.print("sql: {s}\n", .{sql});
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        if (w) |text| try std.testing.expectEqualStrings(text, g orelse return error.TestUnexpectedResult) else try std.testing.expect(g == null);
+    }
+}
+
+test "DATE_DIFF(unit, a, b) is a - b in whole units, and MONTHS_DIFF(a, b) too, as in StarRocks (issue #413)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // Every value is StarRocks 4.0's. DATE_DIFF counts a month once the
+    // later month's last day is reached, where MONTHS_DIFF and TIMESTAMPDIFF
+    // wait for the earlier value's day.
+    const cases = .{
+        .{ "DATE_DIFF('day', DATE '2026-01-31', DATE '2026-01-01')", "30" },
+        .{ "DATE_DIFF('day', DATE '2026-01-01', DATE '2026-01-31')", "-30" },
+        .{ "DATE_DIFF('millisecond', DATE '2026-01-31', DATE '2026-01-01')", "2592000000" },
+        .{ "DATE_DIFF('second', DATE '2026-03-01', DATE '2026-01-31')", "2505600" },
+        .{ "DATE_DIFF('minute', DATE '2026-03-01', DATE '2026-01-31')", "41760" },
+        .{ "DATE_DIFF('hour', DATE '2026-03-01', DATE '2026-01-31')", "696" },
+        .{ "DATE_DIFF('week', DATE '2026-01-31', DATE '2026-01-01')", "4" },
+        .{ "DATE_DIFF('week', DATE '2026-01-01', DATE '2026-01-31')", "-4" },
+        .{ "DATE_DIFF('month', DATE '2026-01-31', DATE '2026-01-01')", "0" },
+        .{ "DATE_DIFF('month', DATE '2026-01-01', DATE '2026-01-31')", "0" },
+        .{ "DATE_DIFF('month', DATE '2026-03-01', DATE '2026-01-31')", "1" },
+        .{ "DATE_DIFF('month', DATE '2026-03-28', DATE '2026-01-31')", "1" },
+        .{ "DATE_DIFF('month', DATE '2024-02-29', DATE '2024-01-31')", "1" },
+        .{ "DATE_DIFF('month', DATE '2024-01-31', DATE '2024-02-29')", "-1" },
+        .{ "DATE_DIFF('month', DATE '2024-02-28', DATE '2024-01-31')", "0" },
+        .{ "DATE_DIFF('month', DATE '2024-04-30', DATE '2024-03-31')", "1" },
+        .{ "DATE_DIFF('quarter', DATE '2024-02-29', DATE '2023-11-30')", "1" },
+        .{ "DATE_DIFF('quarter', DATE '2023-11-30', DATE '2024-02-29')", "-1" },
+        .{ "DATE_DIFF('year', DATE '2023-02-28', DATE '2020-02-29')", "3" },
+        .{ "DATE_DIFF('year', DATE '2024-02-29', DATE '2025-02-28')", "-1" },
+        .{ "DATE_DIFF('year', DATE '2026-01-01', DATE '2026-06-01')", "0" },
+        .{ "DATE_DIFF('day', DATETIME '2026-01-02 01:00:00', DATETIME '2026-01-01 23:00:00')", "0" },
+        .{ "DATE_DIFF('hour', DATETIME '2026-01-02 01:00:00', DATETIME '2026-01-01 23:00:00')", "2" },
+        .{ "DATE_DIFF('minute', DATETIME '2026-01-02 01:00:00', DATETIME '2026-01-01 23:00:00')", "120" },
+        .{ "DATE_DIFF('millisecond', DATETIME '2026-01-02 01:00:00', DATETIME '2026-01-01 23:00:00')", "7200000" },
+        .{ "DATE_DIFF('hour', DATETIME '2026-01-01 23:00:00', DATETIME '2026-01-02 01:00:00')", "-2" },
+        .{ "DATE_DIFF('day', DATETIME '2026-03-31 10:00:00', DATETIME '2026-02-28 11:00:00')", "30" },
+        .{ "DATE_DIFF('day', DATETIME '2026-02-28 11:00:00', DATETIME '2026-03-31 10:00:00')", "-30" },
+        .{ "DATE_DIFF('hour', DATETIME '2026-03-31 10:00:00', DATETIME '2026-02-28 11:00:00')", "743" },
+        .{ "DATE_DIFF('month', DATETIME '2026-03-31 10:00:00', DATETIME '2026-02-28 11:00:00')", "1" },
+        .{ "DATE_DIFF('month', DATETIME '2026-02-28 11:00:00', DATETIME '2026-03-31 10:00:00')", "-1" },
+        .{ "DATE_DIFF('day', DATETIME '2027-01-01 00:00:00', DATETIME '2026-01-01 00:00:01')", "364" },
+        .{ "DATE_DIFF('month', DATETIME '2027-01-01 00:00:00', DATETIME '2026-01-01 00:00:01')", "11" },
+        .{ "DATE_DIFF('quarter', DATETIME '2027-01-01 00:00:00', DATETIME '2026-01-01 00:00:01')", "3" },
+        .{ "DATE_DIFF('year', DATETIME '2027-01-01 00:00:00', DATETIME '2026-01-01 00:00:01')", "0" },
+        .{ "DATE_DIFF('year', DATETIME '2025-02-28 00:00:00', DATETIME '2024-02-29 00:00:00')", "1" },
+        .{ "DATE_DIFF('week', DATETIME '2026-01-08 00:00:00', DATETIME '2026-01-01 00:00:01')", "0" },
+        .{ "DATE_DIFF('minute', DATETIME '2026-01-08 00:00:00', DATETIME '2026-01-01 00:00:01')", "10079" },
+        .{ "DATE_DIFF('month', DATETIME '2024-02-29 10:00:00', DATETIME '2024-01-31 11:00:00')", "0" },
+        .{ "DATE_DIFF('month', DATETIME '2024-02-29 12:00:00', DATETIME '2024-01-31 11:00:00')", "1" },
+        .{ "DATE_DIFF('month', DATETIME '2024-01-31 11:00:00', DATETIME '2024-02-29 12:00:00')", "-1" },
+        .{ "DATE_DIFF('month', DATETIME '2026-02-01 00:00:00', DATETIME '2026-01-01 00:00:00.5')", "0" },
+        .{ "DATE_DIFF('millisecond', DATETIME '2026-01-01 00:00:01.2', DATETIME '2026-01-01 00:00:00.8')", "400" },
+        .{ "DATE_DIFF('second', DATETIME '2026-01-01 00:00:01.2', DATETIME '2026-01-01 00:00:00.8')", "0" },
+        .{ "DATE_DIFF('second', DATETIME '2026-01-01 00:00:00', DATETIME '2026-01-01 00:00:01.5')", "-1" },
+        .{ "DATE_DIFF('millisecond', DATETIME '2026-01-01 00:00:00', DATETIME '2026-01-01 00:00:00.0015')", "-1" },
+        .{ "DATE_DIFF('hour', DATETIME '2026-01-02 00:00:00', DATETIME '2026-01-01 00:00:00.5')", "23" },
+        .{ "DATE_DIFF('day', DATETIME '2026-01-02 00:00:00', DATETIME '2026-01-01 00:00:00.5')", "0" },
+        .{ "DATE_DIFF('second', DATETIME '1969-12-31 23:59:59.5', DATETIME '1970-01-01 00:00:00.25')", "0" },
+        .{ "DATE_DIFF('month', DATETIME '1969-03-31 12:00:00', DATETIME '1969-02-28 12:00:00.000001')", "1" },
+        .{ "DATE_DIFF('second', DATETIME '9999-12-31 23:59:59', DATETIME '0000-01-01 00:00:00')", "315569519999" },
+        .{ "DATE_DIFF('month', DATETIME '9999-12-31 23:59:59', DATETIME '0000-01-01 00:00:00')", "119999" },
+        .{ "DATE_DIFF('year', DATETIME '0000-01-01 00:00:00', DATETIME '9999-12-31 23:59:59')", "-9999" },
+        .{ "DATE_DIFF('second', DATE '2026-01-01', DATETIME '2025-12-31 23:59:59')", "1" },
+        .{ "DATE_DIFF('day', DATE '2026-01-01', DATETIME '2025-12-31 23:59:59')", "0" },
+        .{ "DATE_DIFF('month', DATETIME '2026-03-15 08:00:00', DATE '2026-01-15')", "2" },
+        .{ "DATE_DIFF('month', DATE '2026-01-15', DATETIME '2026-03-15 08:00:00')", "-2" },
+        .{ "DATE_DIFF('day', '2026-01-02 01:00:00', '2026-01-01 23:00:00')", "0" },
+        .{ "DATE_DIFF('hour', '2026-01-02 01:00:00', '2026-01-01 23:00:00')", "2" },
+        .{ "DATE_DIFF('millisecond', '2026-01-02 01:00:00', '2026-01-01 23:00:00')", "7200000" },
+        .{ "DATE_DIFF('day', '2026-01-31', '2026-01-01')", "30" },
+        .{ "DATE_DIFF('day', '2026/01/31', '20260101')", "30" },
+        .{ "DATE_DIFF('day', 'abc', '2026-01-01')", null },
+        .{ "DATE_DIFF('DAY', DATE '2026-01-31', DATE '2026-01-01')", "30" },
+        .{ "DATE_DIFF('Hour', DATE '2026-01-31', DATE '2026-01-01')", "720" },
+        .{ "DATE_DIFF('day', DATE '2026-01-31', NULL)", null },
+        .{ "DATE_DIFF(NULL, DATE '2026-01-31', DATE '2026-01-01')", null },
+        .{ "DATE_DIFF(NULL, NULL, NULL)", null },
+        .{ "MONTHS_DIFF(DATE '2024-02-29', DATE '2024-01-31')", "0" },
+        .{ "MONTHS_DIFF(DATE '2024-02-29', DATE '2023-11-30')", "2" },
+        .{ "MONTHS_DIFF(DATE '2023-02-28', DATE '2020-02-29')", "35" },
+        .{ "MONTHS_DIFF(DATETIME '2026-02-15 10:00:00', DATETIME '2026-01-15 11:00:00')", "0" },
+        .{ "MONTHS_DIFF(DATETIME '2026-01-15 11:00:00', DATETIME '2026-02-15 10:00:00')", "0" },
+        .{ "MONTHS_DIFF(DATETIME '2026-04-15 00:00:00', DATE '2026-01-15')", "3" },
+        .{ "MONTHS_DIFF(DATE '2026-01-20', DATE '2026-04-15')", "-2" },
+        .{ "MONTHS_DIFF('2026-04-15', '2026-01-20')", "2" },
+        // StarRocks gives -1 for an earlier value in the same month, where
+        // MySQL's TIMESTAMPDIFF(MONTH, b, a) gives 0.
+        .{ "MONTHS_DIFF(DATE '2026-01-01', DATE '2026-01-31')", "-1" },
+        .{ "MONTHS_DIFF(DATE '2026-01-31', DATE '2026-01-01')", "0" },
+        .{ "MONTHS_DIFF(DATE '2026-01-01', NULL)", null },
+        .{ "TIMESTAMPDIFF(MILLISECOND, DATETIME '2026-01-01 00:00:00', DATETIME '2026-01-01 00:00:01.5')", "1500" },
+    };
+    inline for (cases) |c| try expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
+
+    // A unit may differ by row, and a NULL unit makes its row NULL. A bare
+    // name first is a unit word, as in `DATE_DIFF(day, a, b)`, so the column
+    // goes through LOWER.
+    try exec(allocator, db, "CREATE TABLE dd (id BIGINT PRIMARY KEY, u VARCHAR(20), a DATETIME, b DATE)");
+    try exec(allocator, db,
+        \\INSERT INTO dd VALUES (1, 'day', '2026-01-02 01:00:00', '2026-01-01'), (2, 'month', '2024-02-29 00:00:00', '2024-01-31'),
+        \\  (3, NULL, '2026-01-02 00:00:00', '2026-01-01'), (4, 'week', '2026-01-01 00:00:00', '2026-01-31'),
+        \\  (5, 'millisecond', '2026-01-01 00:00:00.5', '2026-01-01'), (6, 'month', NULL, '2026-01-01')
+    );
+    try expectTexts(allocator, db, "SELECT CAST(DATE_DIFF(LOWER(u), a, b) AS CHAR) FROM dd ORDER BY id", &.{ "1", "1", null, "-4", "500", null });
+    try expectTexts(allocator, db, "SELECT CAST(MONTHS_DIFF(a, b) AS CHAR) FROM dd ORDER BY id", &.{ "0", "0", "0", "-1", "0", null });
 }
 
 test "calendar functions work before 1970" {

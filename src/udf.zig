@@ -972,7 +972,7 @@ pub fn isReservedScalarName(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "__")) return true;
     // Syntax lowers to these rather than calling them by name: INTERVAL,
     // TIMESTAMPADD, TRIM(... FROM), EXTRACT, the bit and JSON operators,
-    // REGEXP, SOUNDS LIKE, CAST, STR_TO_DATE and MONTHS_DIFF.
+    // REGEXP, SOUNDS LIKE, CAST and STR_TO_DATE.
     const lowered = [_][]const u8{
         "date_add_weeks",             "date_add_quarters",          "date_add_hours",           "date_add_minutes",
         "date_add_seconds",           "date_add_micros",            "ltrim_substring",          "rtrim_substring",
@@ -982,7 +982,7 @@ pub fn isReservedScalarName(name: []const u8) bool {
         "extract_minute_microsecond", "extract_second_microsecond", "bitand",                   "bitor",
         "bitxor",                     "bitnot",                     "bit_shift_left",           "bit_shift_right",
         "json_extract",               "json_value",                 "regexp_like",              "soundex",
-        "to_json",                    "str_to_time",                "date_diff",
+        "to_json",                    "str_to_time",
     };
     for (lowered) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     const names = [_][]const u8{
@@ -1002,7 +1002,7 @@ pub fn isReservedScalarName(name: []const u8) bool {
         "unhex",          "to_base64",         "from_base64",  "lpad",            "rpad",            "repeat",
         "space",          "ascii",             "position",     "instr",           "substring_index", "strcmp",
         "lcase",          "ucase",             "power",        "ceiling",         "chr",             "substr",
-        "mid",            "date",              "char",         "months_add",
+        "mid",            "date",              "char",         "months_add",      "months_diff",     "date_diff",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     return false;

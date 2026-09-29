@@ -529,8 +529,8 @@ pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     }
 }
 
-/// A unit named by the constant string argument of `date_trunc`,
-/// `date_diff`/`timestampdiff` and `timestampadd`.
+/// A unit named by the constant string argument of `date_trunc` and
+/// `timestampadd`. `DiffUnit` adds to it for `date_diff` and `timestampdiff`.
 const DateUnit = enum { second, minute, hour, day, week, month, quarter, year };
 
 /// An unknown unit fails the call: a value passed through unchanged would be a
@@ -697,99 +697,135 @@ pub fn monthnameFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
     }
 }
 
-fn monthDiff(start_days: i32, end_days: i32) i64 {
-    const s = daysToYmd(start_days);
-    const e = daysToYmd(end_days);
-    var months = (@as(i64, e.year) - s.year) * 12 + (@as(i64, e.month) - s.month);
-    if (months > 0 and e.day < s.day) months -= 1;
-    if (months < 0 and e.day > s.day) months += 1;
-    return months;
-}
-
-fn diffDate(unit: DateUnit, start_days: i32, end_days: i32) i64 {
-    const days = @as(i64, end_days) - start_days;
-    return switch (unit) {
-        .day => days,
-        .week => @divTrunc(days, 7),
-        .month => monthDiff(start_days, end_days),
-        .quarter => @divTrunc(monthDiff(start_days, end_days), 3),
-        .year => @divTrunc(monthDiff(start_days, end_days), 12),
-        .second => days * 86_400,
-        .minute => days * 1_440,
-        .hour => days * 24,
-    };
-}
-
-fn diffDatetime(unit: DateUnit, start_us: i64, end_us: i64) i64 {
-    const delta = end_us -| start_us;
-    const days = @as(i64, daysFromDatetime(end_us)) - daysFromDatetime(start_us);
-    return switch (unit) {
-        .second => @divTrunc(delta, 1_000_000),
-        .minute => @divTrunc(delta, 60 * 1_000_000),
-        .hour => @divTrunc(delta, 3_600 * 1_000_000),
-        .day => days,
-        .week => @divTrunc(days, 7),
-        .month => monthDiff(daysFromDatetime(start_us), daysFromDatetime(end_us)),
-        .quarter => @divTrunc(monthDiff(daysFromDatetime(start_us), daysFromDatetime(end_us)), 3),
-        .year => @divTrunc(monthDiff(daysFromDatetime(start_us), daysFromDatetime(end_us)), 12),
-    };
-}
-
-pub fn dateDiffDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
-    const start = args[1].data.date;
-    const end = args[2].data.date;
-    for (start[0..row_count], end[0..row_count]) |s, e| try out.data.bigint.append(allocator, diffDate(unit, s, e));
-}
-
-pub fn dateDiffDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
-    const start = args[1].data.datetime;
-    const end = args[2].data.datetime;
-    for (start[0..row_count], end[0..row_count]) |s, e| try out.data.bigint.append(allocator, diffDatetime(unit, s, e));
-}
-
-/// A TIMESTAMPDIFF unit: MySQL's, with or without its SQL_TSI_ prefix, or
-/// any spelling `parseDateUnit` accepts.
-const DiffUnit = enum { microsecond, second, minute, hour, day, week, month, quarter, year };
+/// A DATE_DIFF or TIMESTAMPDIFF unit: MySQL's, with or without its SQL_TSI_
+/// prefix, StarRocks' millisecond, or any spelling `parseDateUnit` accepts.
+const DiffUnit = enum { microsecond, millisecond, second, minute, hour, day, week, month, quarter, year };
 
 fn parseDiffUnit(text: []const u8) error{ComputeUnsupportedExpr}!DiffUnit {
     const unit = if (std.ascii.startsWithIgnoreCase(text, "sql_tsi_")) text["sql_tsi_".len..] else text;
     if (std.ascii.eqlIgnoreCase(unit, "microsecond") or std.ascii.eqlIgnoreCase(unit, "microseconds")) return .microsecond;
+    if (std.ascii.eqlIgnoreCase(unit, "millisecond") or std.ascii.eqlIgnoreCase(unit, "milliseconds")) return .millisecond;
     return switch (try parseDateUnit(unit)) {
         inline else => |u| @field(DiffUnit, @tagName(u)),
     };
 }
 
-/// TIMESTAMPDIFF(unit, start, end) as MySQL computes it: the whole units
-/// elapsed from `start` to `end`, negative when `end` is earlier.
-fn timestampDiff(unit: DiffUnit, start: i64, end: i64) i64 {
-    const delta = end -| start;
-    const seconds = @divTrunc(delta, std.time.us_per_s);
+/// The length of one `DiffUnit`: a fixed count of microseconds, or of
+/// calendar months.
+const UnitSpan = union(enum) { micros: i64, months: i64 };
+
+fn unitSpan(unit: DiffUnit) UnitSpan {
     return switch (unit) {
-        .microsecond => delta,
-        .second => seconds,
-        .minute => @divTrunc(seconds, 60),
-        .hour => @divTrunc(seconds, 3_600),
-        .day => @divTrunc(seconds, 86_400),
-        .week => @divTrunc(seconds, 7 * 86_400),
-        .month => elapsedMonths(start, end),
-        .quarter => @divTrunc(elapsedMonths(start, end), 3),
-        .year => @divTrunc(elapsedMonths(start, end), 12),
+        .microsecond => .{ .micros = 1 },
+        .millisecond => .{ .micros = std.time.us_per_ms },
+        .second => .{ .micros = std.time.us_per_s },
+        .minute => .{ .micros = std.time.us_per_min },
+        .hour => .{ .micros = std.time.us_per_hour },
+        .day => .{ .micros = std.time.us_per_day },
+        .week => .{ .micros = std.time.us_per_week },
+        .month => .{ .months = 1 },
+        .quarter => .{ .months = 3 },
+        .year => .{ .months = 12 },
     };
 }
 
-/// Whole months from `start` to `end`: a month counts once the later
-/// value's day of the month and time of day reach the earlier one's.
-fn elapsedMonths(start: i64, end: i64) i64 {
+/// When a month has passed from a day that the later month is too short
+/// to hold, such as from 2024-01-31 to 2024-02-29.
+const MonthEnd = enum {
+    /// TIMESTAMPDIFF: not within that month.
+    never,
+    /// DATE_DIFF: on the later month's last day, where the earlier value
+    /// moved by the month lands.
+    at_last_day,
+};
+
+/// Whole months from `start` to `end`, negative when `end` is earlier: a
+/// month counts once the later value's day of the month and time of day
+/// reach the earlier one's, that day held to the later month's length under
+/// `.at_last_day`.
+fn elapsedMonths(start: i64, end: i64, month_end: MonthEnd) i64 {
     const earlier = @min(start, end);
     const later = @max(start, end);
     const b = daysToYmd(daysFromDatetime(earlier));
     const e = daysToYmd(daysFromDatetime(later));
     var months = (@as(i64, e.year) - b.year) * 12 + (@as(i64, e.month) - b.month);
+    const day: u32 = switch (month_end) {
+        .never => b.day,
+        .at_last_day => @min(b.day, common.lastDayOfMonth(e.year, e.month)),
+    };
     const time_before = @mod(later, std.time.us_per_day) < @mod(earlier, std.time.us_per_day);
-    if (e.day < b.day or (e.day == b.day and time_before)) months -= 1;
+    if (e.day < day or (e.day == day and time_before)) months -= 1;
     return if (end < start) -months else months;
+}
+
+/// TIMESTAMPDIFF(unit, start, end) as MySQL computes it: the whole units
+/// elapsed from `start` to `end`, negative when `end` is earlier.
+fn timestampDiff(unit: DiffUnit, start: i64, end: i64) i64 {
+    return switch (unitSpan(unit)) {
+        .micros => |n| @divTrunc(end -| start, n),
+        .months => |n| @divTrunc(elapsedMonths(start, end, .never), n),
+    };
+}
+
+/// DATE_DIFF(unit, later, earlier) as StarRocks computes it: the whole
+/// units elapsed from `earlier` to `later`, negative when `later` is the
+/// earlier one. It is TIMESTAMPDIFF with its values swapped, but for a
+/// month that ends before the earlier value's day.
+fn dateDiff(unit: DiffUnit, later: i64, earlier: i64) i64 {
+    return switch (unitSpan(unit)) {
+        .micros => |n| @divTrunc(later -| earlier, n),
+        .months => |n| @divTrunc(elapsedMonths(earlier, later, .at_last_day), n),
+    };
+}
+
+/// DATE_DIFF over DATEs, each its midnight, or over DATETIMEs. The unit may
+/// differ by row, as in StarRocks; a row whose unit is NULL is NULL.
+fn DateDiff(comptime temporal: Temporal) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const units = stringViewOf(args[0]);
+            const later = @field(args[1].data, @tagName(temporal));
+            const earlier = @field(args[2].data, @tagName(temporal));
+            var parsed: ?struct { text: []const u8, unit: DiffUnit } = null;
+            for (0..row_count) |i| {
+                if (!args[0].isValid(i)) {
+                    try out.data.bigint.append(allocator, 0);
+                    continue;
+                }
+                const text = units.rowBytes(i);
+                if (parsed == null or !std.mem.eql(u8, parsed.?.text, text)) parsed = .{ .text = text, .unit = try parseDiffUnit(text) };
+                try out.data.bigint.append(allocator, dateDiff(parsed.?.unit, micros(later[i]), micros(earlier[i])));
+            }
+        }
+
+        fn micros(value: anytype) i64 {
+            return switch (temporal) {
+                .date => @as(i64, value) * std.time.us_per_day,
+                .datetime => value,
+            };
+        }
+    };
+}
+
+pub const dateDiffDateKernel = DateDiff(.date).kernel;
+pub const dateDiffDatetimeKernel = DateDiff(.datetime).kernel;
+
+/// MONTHS_DIFF(a, b) as StarRocks computes it: TIMESTAMPDIFF(MONTH, b, a),
+/// except that an `a` earlier than `b` in the same month is -1, not 0.
+fn monthsDiff(a: i64, b: i64) i64 {
+    const x = daysToYmd(daysFromDatetime(a));
+    const y = daysToYmd(daysFromDatetime(b));
+    const months = (@as(i64, x.year) - y.year) * 12 + (@as(i64, x.month) - y.month);
+    const a_into_month = a - @as(i64, common.ymdToDays(x.year, x.month, 1)) * std.time.us_per_day;
+    const b_into_month = b - @as(i64, common.ymdToDays(y.year, y.month, 1)) * std.time.us_per_day;
+    if (months >= 0) return if (a_into_month < b_into_month) months - 1 else months;
+    return if (a_into_month > b_into_month) months + 1 else months;
+}
+
+pub fn monthsDiffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const a = args[0].data.datetime;
+    const b = args[1].data.datetime;
+    for (a[0..row_count], b[0..row_count]) |x, y| try out.data.bigint.append(allocator, monthsDiff(x, y));
 }
 
 pub fn timestampDiffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -1003,6 +1039,43 @@ test "TIMESTAMPDIFF counts whole units as MySQL does" {
     };
     inline for (cases) |c| try std.testing.expectEqual(@as(i64, c[3]), timestampDiff(try parseDiffUnit(c[0]), c[1], c[2]));
     try std.testing.expectError(error.ComputeUnsupportedExpr, parseDiffUnit("SQL_TSI_FORTNIGHT"));
+}
+
+test "DATE_DIFF and MONTHS_DIFF count from their second value to their first, as StarRocks does" {
+    const dt = struct {
+        fn at(y: i32, mo: u32, d: u32, h: i64, mi: i64, us: i64) i64 {
+            return @as(i64, common.ymdToDays(y, mo, d)) * std.time.us_per_day + (h * 60 + mi) * std.time.us_per_min + us;
+        }
+    }.at;
+    // Every expected value is StarRocks 4.0's.
+    const date_diff_cases = .{
+        .{ "day", dt(2026, 1, 2, 1, 0, 0), dt(2026, 1, 1, 23, 0, 0), 0 },
+        .{ "hour", dt(2026, 1, 1, 23, 0, 0), dt(2026, 1, 2, 1, 0, 0), -2 },
+        .{ "millisecond", dt(2026, 1, 1, 0, 0, 0), dt(2026, 1, 1, 0, 0, 1_500), -1 },
+        .{ "second", dt(2026, 1, 1, 0, 0, 1_200_000), dt(2026, 1, 1, 0, 0, 800_000), 0 },
+        .{ "month", dt(2024, 2, 29, 0, 0, 0), dt(2024, 1, 31, 0, 0, 0), 1 },
+        .{ "month", dt(2024, 1, 31, 0, 0, 0), dt(2024, 2, 29, 0, 0, 0), -1 },
+        .{ "month", dt(2024, 2, 28, 0, 0, 0), dt(2024, 1, 31, 0, 0, 0), 0 },
+        .{ "month", dt(2024, 2, 29, 10, 0, 0), dt(2024, 1, 31, 11, 0, 0), 0 },
+        .{ "month", dt(2024, 2, 29, 12, 0, 0), dt(2024, 1, 31, 11, 0, 0), 1 },
+        .{ "month", dt(2026, 2, 1, 0, 0, 0), dt(2026, 1, 1, 0, 0, 500_000), 0 },
+        .{ "month", dt(2026, 1, 1, 0, 0, 0), dt(2026, 1, 31, 0, 0, 0), 0 },
+        .{ "quarter", dt(2024, 2, 29, 0, 0, 0), dt(2023, 11, 30, 0, 0, 0), 1 },
+        .{ "year", dt(2023, 2, 28, 0, 0, 0), dt(2020, 2, 29, 0, 0, 0), 3 },
+        .{ "year", dt(0, 1, 1, 0, 0, 0), dt(9999, 12, 31, 23, 59, 59_000_000), -9999 },
+    };
+    inline for (date_diff_cases) |c| try std.testing.expectEqual(@as(i64, c[3]), dateDiff(try parseDiffUnit(c[0]), c[1], c[2]));
+    const months_diff_cases = .{
+        .{ dt(2024, 2, 29, 0, 0, 0), dt(2024, 1, 31, 0, 0, 0), 0 },
+        .{ dt(2024, 1, 31, 0, 0, 0), dt(2024, 2, 29, 0, 0, 0), 0 },
+        .{ dt(2023, 2, 28, 0, 0, 0), dt(2020, 2, 29, 0, 0, 0), 35 },
+        .{ dt(2026, 2, 15, 10, 0, 0), dt(2026, 1, 15, 11, 0, 0), 0 },
+        .{ dt(2026, 1, 15, 11, 0, 0), dt(2026, 2, 15, 10, 0, 0), 0 },
+        .{ dt(2026, 1, 20, 0, 0, 0), dt(2026, 4, 15, 0, 0, 0), -2 },
+        .{ dt(2026, 1, 31, 0, 0, 0), dt(2026, 1, 1, 0, 0, 0), 0 },
+        .{ dt(2026, 1, 1, 0, 0, 0), dt(2026, 1, 31, 0, 0, 0), -1 },
+    };
+    inline for (months_diff_cases) |c| try std.testing.expectEqual(@as(i64, c[2]), monthsDiff(c[0], c[1]));
 }
 
 test "date arithmetic that leaves years 0-9999 is null, whatever its count" {

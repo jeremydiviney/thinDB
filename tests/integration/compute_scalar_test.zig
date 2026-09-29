@@ -496,7 +496,7 @@ test "scalar: expanded missing-function kernels through Compute" {
         .{ .name = "dn", .expr = try F.dayname(aa, E.col("d")) },
         .{ .name = "mn", .expr = try F.monthname(aa, E.col("d")) },
         .{ .name = "added", .expr = try F.timestampAdd(aa, lit_day, E.col("n"), E.col("d")) },
-        .{ .name = "dd", .expr = try F.dateDiffUnit(aa, lit_day, E.col("d"), try F.timestampAdd(aa, lit_day, E.col("n"), E.col("d"))) },
+        .{ .name = "dd", .expr = try F.dateDiffUnit(aa, lit_day, try F.timestampAdd(aa, lit_day, E.col("n"), E.col("d")), E.col("d")) },
         .{ .name = "sha", .expr = try F.sha2(aa, E.col("s"), lit_256) },
         .{ .name = "md", .expr = try F.md5sum(aa, &.{ E.col("s"), E.col("needle") }) },
         .{ .name = "xx", .expr = try F.xxHash3_128(aa, E.col("s")) },

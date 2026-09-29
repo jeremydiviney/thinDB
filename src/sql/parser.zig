@@ -2612,17 +2612,6 @@ pub const Parser = struct {
             const log_fn = if (self.lex.dialect == .mysql) "ln" else "log10";
             return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, log_fn), .args = try self.arena.dupe(ir.Expr, args) } };
         }
-        if (std.ascii.eqlIgnoreCase(name, "months_diff")) {
-            if (args.len != 2) return ParseError.SqlInvalidProjection;
-            const normalized = try self.arena.alloc(ir.Expr, 3);
-            normalized[0] = .{ .lit = .{ .text = try self.arena.dupe(u8, "month") } };
-            normalized[1] = args[1];
-            normalized[2] = args[0];
-            return ir.Expr{ .call = .{
-                .fn_name = try self.arena.dupe(u8, "date_diff"),
-                .args = normalized,
-            } };
-        }
         if (std.ascii.eqlIgnoreCase(name, "get_format") and args.len == 2) {
             // Folded here so STR_TO_DATE(x, GET_FORMAT(...)) sees a constant
             // format and takes its type from it.
@@ -8246,7 +8235,7 @@ test "no scalar UDF can take a function that syntax lowers to" {
     defer arena.deinit();
     const cast_targets = [_]types.Type{ .int, .bigint, .smallint, .tinyint, .largeint, .float, .double, .boolean, .date, .datetime, .string, .json };
     for (cast_targets) |ty| try std.testing.expect(udf_mod.isReservedScalarName((try scalar_fn.castFnName(arena.allocator(), ty)).?));
-    inline for (.{ "ltrim_substring", "json_extract", "json_value", "regexp_like", "soundex", "str_to_time", "date_diff", scalar_fn.ORDER_KEY_FN }) |name| {
+    inline for (.{ "ltrim_substring", "json_extract", "json_value", "regexp_like", "soundex", "str_to_time", scalar_fn.ORDER_KEY_FN }) |name| {
         try std.testing.expect(udf_mod.isReservedScalarName(name));
     }
     try std.testing.expect(!udf_mod.isReservedScalarName("score_bucket"));
