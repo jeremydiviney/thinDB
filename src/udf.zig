@@ -330,6 +330,24 @@ fn lookupKey(buf: *[512]u8, db: []const u8, name: []const u8) ?[]const u8 {
     return buf[0..len];
 }
 
+fn keyInDatabase(map_key: []const u8, db: []const u8) bool {
+    return map_key.len > db.len + 1 and std.mem.eql(u8, map_key[0..db.len], db) and map_key[db.len] == 0;
+}
+
+/// Free and remove every entry of `db`. The caller holds the registry mutex.
+fn removeDatabaseEntries(comptime V: type, allocator: Allocator, map: *std.StringHashMapUnmanaged(V), db: []const u8) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (!keyInDatabase(entry.key_ptr.*, db)) continue;
+        const map_key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        // removeByPtr only tombstones the slot, so the iterator stays valid.
+        map.removeByPtr(entry.key_ptr);
+        allocator.free(map_key);
+        value.deinit(allocator);
+    }
+}
+
 /// Catalog-owned registry of SQL inline table functions, keyed by
 /// `<database>\x00<name>` (functions are database-scoped like tables).
 /// All strings are owned copies. Thread-safe: every read and DDL mutation
@@ -411,6 +429,12 @@ pub const SqlFnRegistry = struct {
         return false;
     }
 
+    pub fn dropDatabase(self: *SqlFnRegistry, db: []const u8) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        removeDatabaseEntries(SqlTableFn, self.allocator, &self.map, db);
+    }
+
     /// Names of every function registered for `db`, allocated copies.
     pub fn listNames(self: *SqlFnRegistry, allocator: Allocator, db: []const u8) ![][]u8 {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -423,8 +447,7 @@ pub const SqlFnRegistry = struct {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             const map_key = entry.key_ptr.*;
-            if (map_key.len <= db.len + 1) continue;
-            if (!std.mem.eql(u8, map_key[0..db.len], db) or map_key[db.len] != 0) continue;
+            if (!keyInDatabase(map_key, db)) continue;
             try out.append(allocator, try allocator.dupe(u8, map_key[db.len + 1 ..]));
         }
         return out.toOwnedSlice(allocator);
@@ -547,6 +570,12 @@ pub const ViewRegistry = struct {
         return false;
     }
 
+    pub fn dropDatabase(self: *ViewRegistry, db: []const u8) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        removeDatabaseEntries(ViewDef, self.allocator, &self.map, db);
+    }
+
     /// A copy of the definition in `allocator`, or null. The copy is taken
     /// under the mutex: a concurrent replace or drop frees the entry, and
     /// any register can move it.
@@ -579,8 +608,7 @@ pub const ViewRegistry = struct {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             const map_key = entry.key_ptr.*;
-            if (map_key.len <= db.len + 1) continue;
-            if (!std.mem.eql(u8, map_key[0..db.len], db) or map_key[db.len] != 0) continue;
+            if (!keyInDatabase(map_key, db)) continue;
             try out.append(allocator, try allocator.dupe(u8, map_key[db.len + 1 ..]));
         }
         return out.toOwnedSlice(allocator);
@@ -1000,6 +1028,46 @@ test "registry lookups return copies that outlive replace, growth and drop" {
     try testing.expectEqualStrings("SELECT a", f.body);
     try testing.expectEqualStrings("CREATE FUNCTION F(a BIGINT)", f.create_text);
     try testing.expect((try fns.get(testing.allocator, "db", "f")) == null);
+}
+
+test "dropping a database removes only that database's views and functions" {
+    const testing = std.testing;
+    var views = ViewRegistry.init(testing.allocator);
+    defer views.deinit();
+    var fns = SqlFnRegistry.init(testing.allocator);
+    defer fns.deinit();
+
+    const dbs = [_][]const u8{ "probe", "probe_v", "probe_vx" };
+    var name_buf: [16]u8 = undefined;
+    for (dbs) |db| for (0..40) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "item_{d}", .{i});
+        try views.register(db, .{ .name = name, .materialized = false, .body = "SELECT 1", .create_text = "CREATE VIEW v AS SELECT 1" }, false);
+        try fns.register(db, .{ .name = name, .param_names = &.{"x"}, .param_types = &.{.bigint}, .body = "SELECT x", .create_text = "CREATE FUNCTION f(x BIGINT)" }, false);
+    };
+
+    views.dropDatabase("probe_v");
+    fns.dropDatabase("probe_v");
+
+    for (dbs) |db| {
+        const kept = !std.mem.eql(u8, db, "probe_v");
+        const view_names = try views.listNames(testing.allocator, db);
+        defer {
+            for (view_names) |n| testing.allocator.free(n);
+            testing.allocator.free(view_names);
+        }
+        try testing.expectEqual(@as(usize, if (kept) 40 else 0), view_names.len);
+        const fn_names = try fns.listNames(testing.allocator, db);
+        defer {
+            for (fn_names) |n| testing.allocator.free(n);
+            testing.allocator.free(fn_names);
+        }
+        try testing.expectEqual(@as(usize, if (kept) 40 else 0), fn_names.len);
+    }
+    try testing.expect(views.contains("probe", "item_0"));
+    try testing.expect((try fns.get(testing.allocator, "probe_v", "item_0")) == null);
+
+    try views.register("probe_v", .{ .name = "item_0", .materialized = false, .body = "SELECT 2", .create_text = "CREATE VIEW item_0 AS SELECT 2" }, false);
+    try fns.register("probe_v", .{ .name = "item_0", .param_names = &.{}, .param_types = &.{}, .body = "SELECT 2", .create_text = "CREATE FUNCTION item_0()" }, false);
 }
 
 test "a registry copy that runs out of memory frees what it copied" {

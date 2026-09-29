@@ -465,6 +465,10 @@ pub const GroupAggregateSpec = struct {
     // every other aggregate.
     is_distinct: bool = false,
     distinct_state_index: u16 = 0,
+    // COUNT(DISTINCT) over a string input: reads `str_columns[str_input_index]`
+    // instead of a numeric payload and keeps membership in the exact
+    // (gid, bytes) set `DistinctSlots.strs[distinct_state_index]`.
+    distinct_str: bool = false,
     // SUM/AVG over a 64-bit integer input accumulates in i128: the aggregate
     // owns TWO consecutive slots — lo u64 bits at `state_index - 1`, hi i64
     // at `state_index`. The fused count/sum/avg and weight-fold kernels
@@ -511,7 +515,7 @@ const MAX_GROUP_PAYLOAD_COLUMNS: usize = 16;
 // String MIN/MAX support. A query may carry up to this many distinct string
 // agg-input columns (Q23 needs 2: MIN(URL), MIN(Title)) and that many string
 // aggregate slots. Both are 0/unused for the numeric-only common case.
-const MAX_GROUP_STR_COLUMNS: usize = 2;
+const MAX_GROUP_STR_COLUMNS: usize = 4;
 const MAX_GROUP_STR_SLOTS: usize = 2;
 
 // COUNT(DISTINCT) support. A query may carry up to this many distinct aggregates;
@@ -694,6 +698,25 @@ pub const DistinctSet = struct {
     }
 };
 
+// Per-bucket COUNT(DISTINCT) membership, indexed by an aggregate's
+// distinct_state_index: integer and float inputs key (gid, value bits) in
+// `ints`, string inputs key (gid, bytes) in `strs`. An index uses one of them.
+const DistinctSlots = struct {
+    ints: [MAX_GROUP_DISTINCT_SLOTS]DistinctSet = [_]DistinctSet{.{}} ** MAX_GROUP_DISTINCT_SLOTS,
+    strs: [MAX_GROUP_DISTINCT_SLOTS]group_table.DistinctStrSet = [_]group_table.DistinctStrSet{.{}} ** MAX_GROUP_DISTINCT_SLOTS,
+
+    // Releases the sets rather than keeping capacity, like `DistinctSet.clear`.
+    fn clear(self: *DistinctSlots, allocator: Allocator) void {
+        for (&self.ints) |*d| d.clear(allocator);
+        for (&self.strs) |*d| d.deinit(allocator);
+    }
+
+    fn deinit(self: *DistinctSlots, allocator: Allocator) void {
+        for (&self.ints) |*d| d.deinit(allocator);
+        for (&self.strs) |*d| d.deinit(allocator);
+    }
+};
+
 pub const GroupStrColumnSpec = struct {
     source_name: []const u8,
 };
@@ -839,6 +862,9 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
             a.aggregates[i].is_json != b.aggregates[i].is_json or
             a.aggregates[i].str_input_index != b.aggregates[i].str_input_index or
             a.aggregates[i].str_state_index != b.aggregates[i].str_state_index or
+            a.aggregates[i].is_distinct != b.aggregates[i].is_distinct or
+            a.aggregates[i].distinct_str != b.aggregates[i].distinct_str or
+            a.aggregates[i].distinct_state_index != b.aggregates[i].distinct_state_index or
             a.aggregates[i].wide != b.aggregates[i].wide or
             a.aggregates[i].nullable != b.aggregates[i].nullable or
             a.aggregates[i].valid_count_index != b.aggregates[i].valid_count_index)
@@ -1748,7 +1774,7 @@ const PipeBucket = struct {
     // One combined membership set per COUNT(DISTINCT) field. Indexed by the
     // aggregate's distinct_state_index; only the first `layout.distinct_slot_count`
     // are touched. Each holds (gid,value) keys for this bucket's groups.
-    distinct_sets: [MAX_GROUP_DISTINCT_SLOTS]DistinctSet = [_]DistinctSet{.{}} ** MAX_GROUP_DISTINCT_SLOTS,
+    distinct_sets: DistinctSlots = .{},
     row_count: u64 = 0,
 
     fn init(allocator: Allocator, expected_groups: usize) !PipeBucket {
@@ -1984,7 +2010,7 @@ const PipeBucket = struct {
         self.str_states.deinit(allocator);
         self.concat_states.deinit(allocator);
         self.udf_states.deinit(allocator);
-        for (&self.distinct_sets) |*d| d.deinit(allocator);
+        self.distinct_sets.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
         self.states.deinit(allocator);
@@ -2880,7 +2906,7 @@ fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     // live); here the blobs are stale, so just drop them and reclaim the arena.
     bucket.udf_states.clearRetainingCapacity();
     _ = bucket.udf_arena.reset(.retain_capacity);
-    for (&bucket.distinct_sets) |*d| d.clear(allocator);
+    bucket.distinct_sets.clear(allocator);
 }
 
 fn deinitRawQueues(shared: *PipeShared) void {
@@ -4648,6 +4674,8 @@ fn validateGroupAggregateProgram(aggregates: []const GroupAggregateSpec, column_
         switch (agg.op) {
             .count_star => {},
             .count_col, .sum, .avg, .min, .max, .count_distinct => {
+                // A string COUNT(DISTINCT) reads a str_columns lane, not a payload.
+                if (agg.distinct_str) continue;
                 const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
                 if (input_index >= column_count) return error.UnsupportedOperatorForType;
             },
@@ -4700,7 +4728,7 @@ fn groupChunkRowsDirect(
     concat_states: *std.ArrayListUnmanaged(ConcatRow),
     udf_states: *std.ArrayListUnmanaged(UdfStateRow),
     udf_arena: Allocator,
-    distinct_sets: []DistinctSet,
+    distinct_sets: *DistinctSlots,
     scratch: *GroupScratch,
     allocator: Allocator,
     str_arena: Allocator,
@@ -4722,11 +4750,11 @@ fn groupChunkRowsDirect(
         if (allocation_profile) |profile| profile.table_growths += 1;
     }
     try states.ensureUnusedCapacity(allocator, n);
-    if (rows.layout.has_str_payload) try str_states.ensureUnusedCapacity(allocator, n);
+    if (hasStringResults(rows.layout)) try str_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_concat) try concat_states.ensureUnusedCapacity(allocator, n);
     if (rows.layout.has_udf) try udf_states.ensureUnusedCapacity(allocator, n);
     if (allocation_profile) |profile| profile.ticks += platform.nowTicks() - allocation_t0;
-    if (rows.layout.distinct_slot_count > distinct_sets.len) return error.UnsupportedOperatorForType;
+    if (rows.layout.distinct_slot_count > MAX_GROUP_DISTINCT_SLOTS) return error.UnsupportedOperatorForType;
 
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
     try validateGroupAggregateProgram(rows.layout.aggregates, rows.layout.columns.len);
@@ -4750,6 +4778,19 @@ fn groupChunkRowsDirect(
         .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
         .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
+}
+
+fn hasStringExtreme(aggregates: []const GroupAggregateSpec) bool {
+    for (aggregates) |agg| if (agg.is_string) return true;
+    return false;
+}
+
+// Whether each group carries string results (string MIN/MAX, GROUP_CONCAT) in
+// the side `str_states` row. A string COUNT(DISTINCT) also stages the string
+// lane but emits a number, so a layout whose only string reader is a distinct
+// keeps the numeric per-group state, top-N and all-groups emit.
+fn hasStringResults(layout: GroupRowsLayout) bool {
+    return layout.has_str_payload and (layout.has_concat or hasStringExtreme(layout.aggregates));
 }
 
 // Fold one row's string MIN/MAX values into group `gid`'s side accumulators.
@@ -4959,7 +5000,7 @@ fn groupChunkRowsDirectKeys(
     udf_states: *std.ArrayListUnmanaged(UdfStateRow),
     udf_arena: Allocator,
     str_arena: Allocator,
-    distinct_sets: []DistinctSet,
+    distinct_sets: *DistinctSlots,
     gids_buf: *std.ArrayListUnmanaged(u32),
     allocator: Allocator,
     keys: anytype,
@@ -4969,7 +5010,8 @@ fn groupChunkRowsDirectKeys(
     rows: GroupRows,
     rowrefs: []const i64,
 ) !void {
-    const has_str = rows.layout.has_str_payload;
+    const has_str = hasStringResults(rows.layout);
+    const has_str_fold = rows.layout.has_str_payload and hasStringExtreme(aggregates);
     const has_concat = rows.layout.has_concat;
     const has_distinct = rows.layout.distinct_slot_count > 0;
     const n = row_count;
@@ -5077,7 +5119,7 @@ fn groupChunkRowsDirectKeys(
         } else {
             states.head(gid).count += run_len;
         }
-        if (has_str) {
+        if (has_str_fold) {
             var rr = r;
             while (rr < run_end) : (rr += 1) try foldGroupStr(str_states, str_arena, gid, aggregates, rows, rr);
         }
@@ -5122,7 +5164,7 @@ fn groupChunkRowsDirectKeysProgram(
     udf_states: *std.ArrayListUnmanaged(UdfStateRow),
     udf_arena: Allocator,
     str_arena: Allocator,
-    distinct_sets: []DistinctSet,
+    distinct_sets: *DistinctSlots,
     gids_buf: *std.ArrayListUnmanaged(u32),
     allocator: Allocator,
     keys: anytype,
@@ -5135,7 +5177,8 @@ fn groupChunkRowsDirectKeysProgram(
     // Weighted rows would silently undercount here (per-row +1 program); the
     // COUNT-only weight gate guarantees this path never sees them.
     std.debug.assert(!rows.layout.has_weight);
-    const has_str = rows.layout.has_str_payload;
+    const has_str = hasStringResults(rows.layout);
+    const has_str_fold = rows.layout.has_str_payload and hasStringExtreme(aggregates);
     const has_concat = rows.layout.has_concat;
     const has_udf = rows.layout.has_udf;
     const has_distinct = rows.layout.distinct_slot_count > 0;
@@ -5160,7 +5203,7 @@ fn groupChunkRowsDirectKeysProgram(
         // vary within the run).
         if (have_prev and key == prev_key) {
             try updateGroupStateProgram(states.ref(prev_gid), aggregates, rows, r);
-            if (has_str) try foldGroupStr(str_states, str_arena, prev_gid, aggregates, rows, r);
+            if (has_str_fold) try foldGroupStr(str_states, str_arena, prev_gid, aggregates, rows, r);
             if (has_concat) try foldGroupConcat(concat_states, str_arena, prev_gid, aggregates, rows, r);
             if (has_udf) try foldGroupUdf(udf_states, udf_arena, prev_gid, aggregates, rows, r, n);
             if (has_distinct) gids[r] = prev_gid;
@@ -5173,7 +5216,7 @@ fn groupChunkRowsDirectKeysProgram(
             table.commit(probe.slot, key, new_gid);
             if (has_str) {
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
-                try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
+                if (has_str_fold) try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
             }
             if (has_concat) {
                 concat_states.appendAssumeCapacity([_]ConcatCell{.empty} ** MAX_GROUP_CONCAT_SLOTS);
@@ -5191,7 +5234,7 @@ fn groupChunkRowsDirectKeysProgram(
             continue;
         }
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
-        if (has_str) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
+        if (has_str_fold) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
         if (has_concat) try foldGroupConcat(concat_states, str_arena, probe.gid, aggregates, rows, r);
         if (has_udf) try foldGroupUdf(udf_states, udf_arena, probe.gid, aggregates, rows, r, n);
         if (has_distinct) gids[r] = probe.gid;
@@ -5410,7 +5453,7 @@ inline fn groupPhysicalT(comptime pt: GroupColumnType) type {
 // inserting the current row, overlapping the independent cache misses. A
 // first-ever (gid, value) bumps the group's distinct-count slot.
 fn foldGroupDistinctChunk(
-    distinct_sets: []DistinctSet,
+    distinct_sets: *DistinctSlots,
     allocator: Allocator,
     states: *StateSlab,
     gids: []const u32,
@@ -5420,7 +5463,12 @@ fn foldGroupDistinctChunk(
     const n = gids.len;
     for (aggregates) |agg| {
         if (!agg.is_distinct) continue;
-        const dset = &distinct_sets[agg.distinct_state_index];
+        if (agg.distinct_state_index >= MAX_GROUP_DISTINCT_SLOTS) return error.UnsupportedOperatorForType;
+        if (agg.distinct_str) {
+            try foldGroupDistinctStr(&distinct_sets.strs[agg.distinct_state_index], allocator, states, gids, rows, agg.str_input_index, agg.state_index);
+            continue;
+        }
+        const dset = &distinct_sets.ints[agg.distinct_state_index];
         try dset.ensureForBatch(allocator, n);
         const input_index = agg.input_column_index orelse return error.UnsupportedOperatorForType;
         if (input_index >= rows.layout.columns.len) return error.UnsupportedOperatorForType;
@@ -5441,8 +5489,70 @@ fn foldGroupDistinctChunk(
                 };
                 try foldGroupDistinctTyped(T, dset, states, gids, rows.columnTypedAll(T, input_index), valid, agg.state_index);
             },
-            // The planner scopes distinct inputs to the integer family.
-            .f32, .f64 => return error.UnsupportedOperatorForType,
+            inline .f32, .f64 => |pt| {
+                const T = if (pt == .f32) f32 else f64;
+                try foldGroupDistinctTyped(T, dset, states, gids, rows.columnTypedAll(T, input_index), valid, agg.state_index);
+            },
+        }
+    }
+}
+
+// The 64 bits a value contributes to the (gid, value) composite: an integer's
+// two's-complement pattern, a float's canonical bits (-0.0 and 0.0 are one
+// value, and so is every NaN — #82). A float widens to f64 first so both float
+// widths share one encoding.
+inline fn distinctValueBits(comptime T: type, v: T) u64 {
+    return switch (@typeInfo(T)) {
+        .float => types_mod.canonicalFloatBits(@as(f64, v)),
+        else => @bitCast(@as(i64, v)),
+    };
+}
+
+// String COUNT(DISTINCT) over the staged StrStore lane. Each row's digest is
+// computed once, PREFETCH_DIST_DISTINCT rows ahead of its insert, and parked in
+// a ring so the prefetch and the insert share it. NULL refs never count; an
+// adjacent repeat of the same (gid, bytes) skips the probe.
+fn foldGroupDistinctStr(
+    set: *group_table.DistinctStrSet,
+    allocator: Allocator,
+    states: *StateSlab,
+    gids: []const u32,
+    rows: GroupRows,
+    str_input_index: u16,
+    state_index: u16,
+) !void {
+    const k = rows.layout.str_columns.len;
+    if (str_input_index >= k) return error.UnsupportedOperatorForType;
+    const n = gids.len;
+    const RING = 32;
+    comptime std.debug.assert(PREFETCH_DIST_DISTINCT < RING);
+    var ring: [RING]u64 = undefined;
+    for (0..@min(n, PREFETCH_DIST_DISTINCT)) |r| {
+        ring[r % RING] = group_table.distinctStrDigest(rows.str.get(k, r, str_input_index));
+    }
+    var prev_gid: u32 = 0;
+    var prev_bytes: ?[]const u8 = null;
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        const pf = r + PREFETCH_DIST_DISTINCT;
+        if (pf < n) {
+            const d_pf = group_table.distinctStrDigest(rows.str.get(k, pf, str_input_index));
+            ring[pf % RING] = d_pf;
+            set.prefetch(gids[pf], d_pf);
+        }
+        if (rows.str.isNull(k, r, str_input_index)) continue;
+        const bytes = rows.str.get(k, r, str_input_index);
+        const gid = gids[r];
+        if (prev_bytes) |pb| {
+            if (gid == prev_gid and std.mem.eql(u8, pb, bytes)) continue;
+        }
+        prev_gid = gid;
+        prev_bytes = bytes;
+        // Reserved per insert, not per chunk: a chunk of repeats would
+        // otherwise size the set for rows that are never new.
+        try set.ensureFor(allocator, 1);
+        if (try set.insertNew(allocator, gid, ring[r % RING], bytes)) {
+            try addAggregateStateValue(states.ref(gid), state_index, 1);
         }
     }
 }
@@ -5479,20 +5589,19 @@ fn foldGroupDistinctTypedImpl(
     while (r < n) : (r += 1) {
         const pf = r + PREFETCH_DIST_DISTINCT;
         if (pf < n) {
-            const v_pf: i64 = vals[pf];
-            dset.prefetchKey(DistinctSet.key(gids[pf], @bitCast(v_pf)));
+            dset.prefetchKey(DistinctSet.key(gids[pf], distinctValueBits(T, vals[pf])));
         }
         if (has_valid) {
             if (vb[r] == 0) continue;
         }
-        const v: i64 = vals[r];
+        const v = distinctValueBits(T, vals[r]);
         // The table's physical order clusters repeated values (UserID etc.)
         // into adjacent runs: an identical (gid, value) pair can't be new, so
         // skip the cache-missing set probe entirely. With a validity lane the
         // previous row may have been a skipped NULL carrying an artifact value
         // equal to this one — disable the shortcut there.
-        if (!has_valid and r > 0 and gids[r] == gids[r - 1] and v == @as(i64, vals[r - 1])) continue;
-        const composite = DistinctSet.key(gids[r], @bitCast(v));
+        if (!has_valid and r > 0 and gids[r] == gids[r - 1] and v == distinctValueBits(T, vals[r - 1])) continue;
+        const composite = DistinctSet.key(gids[r], v);
         if (dset.insertNewBatch(composite)) {
             try addAggregateStateValue(states.ref(gids[r]), state_index, 1);
         }
@@ -5917,7 +6026,7 @@ fn collectOwnedTop(shared: *PipeShared, worker_index: usize, worker_count: usize
     const top_t0 = if (profile) platform.nowTicks() else 0;
     if (top_out.items.len == 0) return;
     var b = worker_index;
-    const has_str = shared.group_rows_layout.has_str_payload;
+    const has_str = hasStringResults(shared.group_rows_layout);
     const has_concat = shared.group_rows_layout.has_concat;
     const has_udf = shared.group_rows_layout.has_udf;
     var udf_scratch = UdfEmitScratch{ .allocator = shared.allocator };
@@ -6922,7 +7031,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const total_ticks = platform.nowTicks() - total_t0;
     const function_ticks = platform.nowTicks() - function_t0;
     if (cfg.result_out) |out| {
-        const has_str_out = cfg.group_rows_layout.has_str_payload;
+        const has_str_out = hasStringResults(cfg.group_rows_layout);
         const has_udf_out = cfg.group_rows_layout.has_udf;
         var udf_scratch = UdfEmitScratch{ .allocator = allocator };
         defer udf_scratch.deinit();
