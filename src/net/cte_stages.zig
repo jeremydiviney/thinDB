@@ -1651,6 +1651,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // the scan workers (partial per chunk, serial combine here)
             // instead of hashing the full join output on this thread.
             if (try group_route.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, aggs, g.top_k, g.emit_limit)) |q| return q;
+            try group_route.narrowToAggregateInputs(input.allocator, &up, g.group_cols, aggs);
             // When the input reads materialized stages, defer the hash-vs-sort
             // decision to runtime: priming those stages yields exact realized
             // row counts, which beat compile-time estimates down a deep CTE

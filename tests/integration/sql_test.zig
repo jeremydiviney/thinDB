@@ -4218,3 +4218,94 @@ test "sql: a CTE or derived table column list renames the query's columns by pos
     // The listed names replace the query's own.
     try helpers.expectRunError(allocator, db, "WITH t(a) AS (SELECT id FROM x) SELECT id FROM t", error.ColumnNotFound);
 }
+
+const WIDE_PAD = 1000;
+
+/// `wide`: `rows` rows of a bigint group key over 1000 groups and a
+/// `WIDE_PAD`-byte string led by a three-digit code. Group g holds rows
+/// g + 1000k, whose codes are 7g + 7000k mod 1000 = 7g mod 1000: every row of
+/// a group shares one code, and code c belongs to group 143c mod 1000.
+fn seedWide(db: anytype, rows: usize) !void {
+    const t = try db.table("wide", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "g", .type = .bigint },
+            .{ .name = "s", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"}, .unique = false });
+    const Row = struct { id: i64, g: i64, s: []const u8 };
+    const allocator = std.testing.allocator;
+    const texts = try allocator.alloc([WIDE_PAD]u8, rows);
+    defer allocator.free(texts);
+    const batch = try allocator.alloc(Row, rows);
+    defer allocator.free(batch);
+    for (batch, texts, 0..) |*row, *text, i| {
+        @memset(text, 'x');
+        _ = std.fmt.bufPrint(text[0..3], "{d:0>3}", .{(i * 7) % 1000}) catch unreachable;
+        row.* = .{ .id = @intCast(i), .g = @intCast(i % 1000), .s = text };
+    }
+    try t.insert(batch);
+    try t.flush();
+}
+
+/// Run `sql` to completion: its rows as `key:value;` text when it returns
+/// two columns, `value;` when one, and the statement's charged peak.
+fn runWide(allocator: std.mem.Allocator, db: anytype, sql: []const u8, out: *std.ArrayList(u8)) !usize {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            const value = batch.values[batch.values.len - 1].data.string.rowBytes(row);
+            if (batch.values.len == 2) {
+                try out.print(allocator, "{d}:{s};", .{ batch.values[0].data.bigint[row], value });
+            } else {
+                try out.print(allocator, "{s};", .{value});
+            }
+        }
+    }
+    return q.cq.ctx.accountant.?.peak_bytes;
+}
+
+test "sql: a GROUP BY buffers only the columns its keys and aggregates read" {
+    const allocator = std.testing.allocator;
+    const rows = 100_000;
+    const raw = rows * WIDE_PAD;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
+        .query_memory_budget = 1 << 30,
+        .memory_budget = 1 << 30,
+        .auto_flush_secs = 0,
+        .max_dop = 4,
+    });
+    defer db.close();
+    try seedWide(db, rows);
+    const want = "0:000;143:001;286:002;429:003;572:004;";
+
+    // Ordering on a string MIN takes the generic GROUP BY, which buffers its
+    // input. `s` feeds only the Compute below it, and the Compute passes `s`
+    // through: the realized input used to copy every byte of it, on top of
+    // the scan decoding it (issue #390).
+    {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(allocator);
+        const peak = try runWide(allocator, db, "SELECT g, MIN(LEFT(s, 3)) AS m FROM wide GROUP BY g ORDER BY m LIMIT 5", &got);
+        try std.testing.expectEqualStrings(want, got.items);
+        try std.testing.expect(peak < raw * 3 / 2);
+    }
+
+    // Over a stage, the partitioned aggregate's chunks used to copy `s` out
+    // of the stage: the grouped query now costs little beyond the stage.
+    {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(allocator);
+        const stage_peak = try runWide(allocator, db, "WITH w AS MATERIALIZED (SELECT g, s FROM wide) SELECT MIN(LEFT(s, 3)) AS m FROM w", &got);
+        try std.testing.expectEqualStrings("000;", got.items);
+        got.clearRetainingCapacity();
+        const peak = try runWide(allocator, db, "WITH w AS MATERIALIZED (SELECT g, s FROM wide) SELECT g, MIN(LEFT(s, 3)) AS m FROM w GROUP BY g ORDER BY m LIMIT 5", &got);
+        try std.testing.expectEqualStrings(want, got.items);
+        try std.testing.expect(peak < stage_peak + raw * 2 / 5);
+    }
+}
