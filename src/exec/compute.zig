@@ -2215,10 +2215,11 @@ fn buildCallPlan(
     }
 
     var r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
-    const coerce_literals = if (r) |resolved| parsesTextToTemporal(resolved.func) else true;
-    if (coerce_literals and try coerceTemporalStringLiterals(runtime_allocator, c.fn_name, arg_plans, arg_types, false)) {
-        r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
-    }
+    const coerced = if (r) |resolved|
+        try foldTextRead(runtime_allocator, resolved.func, arg_plans, arg_types)
+    else
+        try coerceTemporalStringLiterals(runtime_allocator, aa, c.fn_name, arg_plans, arg_types, .{});
+    if (coerced) r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     if (r == null) r = try resolveWithTypedNulls(runtime_allocator, aa, udf_registry, c.fn_name, arg_plans, arg_types);
     if (r == null) {
         if (try retypedCall(aa, udf_registry, c, arg_plans, arg_types)) |rewritten| {
@@ -2226,6 +2227,11 @@ fn buildCallPlan(
             built = 0;
             return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
         }
+    }
+    // Last, text that doesn't read as a date where one is wanted is NULL, as
+    // a CAST would make it (`UNIX_TIMESTAMP('garbage')`).
+    if (r == null and try coerceTemporalStringLiterals(runtime_allocator, aa, c.fn_name, arg_plans, arg_types, .{ .nulls = true, .unreadable_text = true })) {
+        r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
     }
     const rr = r orelse return Error.ComputeNoSuchOverload;
 
@@ -2472,7 +2478,7 @@ fn resolveWithTypedNulls(
     }
     // Last, a NULL beside text that must read as a date takes the date
     // overload's type (`TIMESTAMPDIFF(DAY, NULL, '2026-01-01')`).
-    if (try coerceTemporalStringLiterals(runtime_allocator, fn_name, arg_plans, arg_types, true)) {
+    if (try coerceTemporalStringLiterals(runtime_allocator, aa, fn_name, arg_plans, arg_types, .{ .nulls = true })) {
         return try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, arg_types);
     }
     return null;
@@ -2487,13 +2493,26 @@ fn commitNullTypes(runtime_allocator: Allocator, arg_plans: []ArgPlan, arg_types
     }
 }
 
-/// With `nulls_fit`, a NULL literal fits any parameter and takes its type.
+/// What `coerceTemporalStringLiterals` lets meet a parameter besides a
+/// value of its own type and text that reads as its date or datetime.
+const TemporalFit = struct {
+    /// A NULL literal fits any parameter and takes its type.
+    nulls: bool = false,
+    /// Text that doesn't read as the parameter's date or datetime becomes a
+    /// NULL of that type, as a CAST would make it.
+    unreadable_text: bool = false,
+};
+
+/// Retype the text literals of a call to the first overload of `fn_name`
+/// that wants a date or datetime where each one sits, read as a CAST to
+/// that type reads it (`litTemporalValue`). Returns whether it retyped any.
 fn coerceTemporalStringLiterals(
     runtime_allocator: Allocator,
+    aa: Allocator,
     fn_name: []const u8,
     arg_plans: []ArgPlan,
     arg_types: []Type,
-    nulls_fit: bool,
+    fit: TemporalFit,
 ) !bool {
     for (scalar_fn.overloadsOf(fn_name)) |f| {
         if (!scalar_fn.scalarArityMatches(f, arg_types.len)) continue;
@@ -2501,13 +2520,12 @@ fn coerceTemporalStringLiterals(
         var any_coerce = false;
         for (arg_types, 0..) |given, i| {
             const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
-            if (nulls_fit and arg_plans[i] == .null_lit) continue;
+            if (fit.nulls and arg_plans[i] == .null_lit) continue;
             if (foldStringTag(@as(types.TypeTag, declared)) == foldStringTag(@as(types.TypeTag, given))) continue;
             if (cast.castCost(@as(types.TypeTag, given), @as(types.TypeTag, declared)) != null) continue;
-            // The only otherwise-unreachable mismatch we repair: a string
-            // LITERAL where the overload wants a temporal type, and the literal
-            // actually parses as that type.
-            if ((declared == .date or declared == .datetime) and litTemporalValue(arg_plans[i], declared) != null) {
+            if ((declared == .date or declared == .datetime) and
+                (litTemporalValue(arg_plans[i], declared) != null or (fit.unreadable_text and isTextLiteral(arg_plans[i]))))
+            {
                 any_coerce = true;
                 continue;
             }
@@ -2518,29 +2536,68 @@ fn coerceTemporalStringLiterals(
 
         for (arg_types, 0..) |*at, i| {
             const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
-            if (nulls_fit and arg_plans[i] == .null_lit) {
+            if (fit.nulls and arg_plans[i] == .null_lit) {
                 replaceBuf(runtime_allocator, &arg_plans[i].null_lit.buf, try ColumnStore.init(runtime_allocator, declared, true));
                 arg_plans[i].null_lit.ty = declared;
                 at.* = declared;
                 continue;
             }
             if (declared != .date and declared != .datetime) continue;
-            const new_val = litTemporalValue(arg_plans[i], declared) orelse continue;
-            const slot = arg_plans[i].lit;
-            replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, try literalType(new_val), false));
-            slot.value = new_val;
-            slot.ty = try literalType(new_val);
-            at.* = try literalType(new_val);
+            if (litTemporalValue(arg_plans[i], declared)) |new_val| {
+                const slot = arg_plans[i].lit;
+                replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, try literalType(new_val), false));
+                slot.value = new_val;
+                slot.ty = try literalType(new_val);
+                at.* = try literalType(new_val);
+            } else if (fit.unreadable_text and isTextLiteral(arg_plans[i])) {
+                const slot = try aa.create(NullSlot);
+                slot.* = .{ .ty = declared, .buf = try ColumnStore.init(runtime_allocator, declared, true) };
+                arg_plans[i].lit.buf.deinit(runtime_allocator);
+                arg_plans[i] = .{ .null_lit = slot };
+                at.* = declared;
+            }
         }
         return true;
     }
     return false;
 }
 
-/// Whether `f` reads text as a date or datetime, as `CAST(text AS DATE)` does.
-fn parsesTextToTemporal(f: scalar_fn.ScalarFn) bool {
-    return f.arg_types.len == 1 and f.arg_types[0].isString() and
-        (f.return_type == .date or f.return_type == .datetime);
+fn isTextLiteral(ap: ArgPlan) bool {
+    return ap == .lit and ap.lit.value == .text;
+}
+
+/// When the call resolved to `f`, which reads text as a date or datetime
+/// (`CAST(text AS DATE)`, `DATE(text)`), and its argument is a text
+/// literal, read the literal once here with `f`'s own kernel. The literal
+/// becomes a constant of `f`'s return type, so folding can't change the
+/// result. Text that doesn't read is left for the kernel to make NULL.
+/// Returns whether it folded.
+fn foldTextRead(runtime_allocator: Allocator, f: scalar_fn.ScalarFn, arg_plans: []ArgPlan, arg_types: []Type) !bool {
+    if (f.arg_types.len != 1 or !f.arg_types[0].isString() or !isTextLiteral(arg_plans[0])) return false;
+    if (f.return_type != .date and f.return_type != .datetime) return false;
+    const kernel = f.kernel orelse return false;
+    const slot = arg_plans[0].lit;
+
+    var text = try ColumnStore.init(runtime_allocator, .string, false);
+    defer text.deinit(runtime_allocator);
+    try text.data.string.appendValue(runtime_allocator, slot.value.text);
+    var read = try ColumnStore.init(runtime_allocator, f.return_type, true);
+    defer read.deinit(runtime_allocator);
+    kernel(runtime_allocator, &.{text.view()}, &read, 1) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    if (!read.view().isValid(0)) return false;
+    const value: types.Value = switch (f.return_type) {
+        .date => .{ .date = read.data.date.items[0] },
+        .datetime => .{ .datetime = read.data.datetime.items[0] },
+        else => return false,
+    };
+    replaceBuf(runtime_allocator, &slot.buf, try ColumnStore.init(runtime_allocator, f.return_type, false));
+    slot.value = value;
+    slot.ty = f.return_type;
+    arg_types[0] = f.return_type;
+    return true;
 }
 
 /// `.varchar`/`.char` share `.string`'s representation; fold them for matching.
@@ -2552,9 +2609,9 @@ fn foldStringTag(t: types.TypeTag) types.TypeTag {
 }
 
 /// If `ap` is a string literal that parses as `target` (`.date`/`.datetime`),
-/// return the coerced Value; otherwise null. It parses exactly as the per-row
-/// text kernels do, so folding a literal never changes a result. Pure — used
-/// both to test feasibility and to commit.
+/// return the coerced Value; otherwise null. It reads the text as
+/// `CAST(text AS DATE)` or `CAST(text AS DATETIME)` does. Pure — used both
+/// to test feasibility and to commit.
 fn litTemporalValue(ap: ArgPlan, target: types.TypeTag) ?types.Value {
     const slot = switch (ap) {
         .lit => |s| s,

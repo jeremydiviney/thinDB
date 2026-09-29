@@ -186,18 +186,225 @@ pub fn parseDateTimeString(s: []const u8) !i64 {
     return @as(i64, days) * 86_400_000_000 + day_micros;
 }
 
-/// Text as a DATE, the way CAST and a date-typed argument read it: the
-/// leading `YYYY-MM-DD`, so a datetime string gives its day. Null when the
-/// text isn't a date.
+/// Text as a DATE, as StarRocks' `CAST(text AS DATE)` reads a column. Ten
+/// characters, once space is trimmed, are read as `plainDate`, and any other
+/// text field by field (`scanMoment`). Only the date must be valid: a time
+/// of day after it is read but not checked, so `'2026-01-01 25:00:00'` is
+/// 2026-01-01. Null when the text isn't a date.
 pub fn textToDate(s: []const u8) ?i32 {
-    return parseDateString(s) catch null;
+    const trimmed = trimDateSpace(s);
+    if (trimmed.len == 10) if (plainDate(trimmed)) |m| return m.days();
+    return (scanMoment(s) orelse return null).days();
 }
 
-/// Text as a DATETIME, the way CAST and a datetime-typed argument read it.
-/// Text that starts with a date but has no time of day this parser accepts
-/// is midnight of that date. Null when the text isn't a date.
+/// Text as a DATETIME, as StarRocks' `CAST(text AS DATETIME)` reads a
+/// column: a `plainDate` of ten characters is midnight, a `plainDatetime`
+/// whose values are valid is read as such, and any other text is read field
+/// by field (`scanMoment`). The date and the time of day must both be
+/// valid. Null when the text isn't a datetime.
 pub fn textToDatetime(s: []const u8) ?i64 {
-    return parseDateTimeString(s) catch @as(i64, textToDate(s) orelse return null) * std.time.us_per_day;
+    const trimmed = trimDateSpace(s);
+    if (trimmed.len == 10) if (plainDate(trimmed)) |m| return m.micros();
+    if (plainDatetime(trimmed)) |m| if (m.micros()) |us| return us;
+    return (scanMoment(s) orelse return null).micros();
+}
+
+/// A number as a DATETIME, as StarRocks casts one (`numberDigits`). Null
+/// when the number isn't a datetime.
+pub fn numberToDatetime(n: i64) ?i64 {
+    const digits = numberDigits(n) orelse return null;
+    const moment: Moment = .{
+        .year = @intCast(@divTrunc(digits, 10_000_000_000)),
+        .month = @intCast(@mod(@divTrunc(digits, 100_000_000), 100)),
+        .day = @intCast(@mod(@divTrunc(digits, 1_000_000), 100)),
+        .hour = @intCast(@mod(@divTrunc(digits, 10_000), 100)),
+        .minute = @intCast(@mod(@divTrunc(digits, 100), 100)),
+        .second = @intCast(@mod(digits, 100)),
+    };
+    return moment.micros();
+}
+
+/// A number as a DATE: the day of `numberToDatetime`, so its time of day
+/// must be valid too (`20260101240000` is null), as in StarRocks.
+pub fn numberToDate(n: i64) ?i32 {
+    return daysFromDatetime(numberToDatetime(n) orelse return null);
+}
+
+/// A double as a DATETIME: its whole part, truncated toward zero, read as
+/// `numberToDatetime` reads a number.
+pub fn doubleToDatetime(x: f64) ?i64 {
+    if (!(@abs(x) < 1e15)) return null;
+    return numberToDatetime(@intFromFloat(@trunc(x)));
+}
+
+/// A double as a DATE: the day of `doubleToDatetime`.
+pub fn doubleToDate(x: f64) ?i32 {
+    return daysFromDatetime(doubleToDatetime(x) orelse return null);
+}
+
+/// A number's digits as `YYYYMMDDhhmmss`. The number is read by its size:
+/// `YYMMDD`, `YYYYMMDD`, `YYMMDDhhmmss` or `YYYYMMDDhhmmss`, where a
+/// two-digit year below 70 is in the 2000s and any other in the 1900s. A
+/// number between those sizes, or one that no size fits, isn't a date.
+fn numberDigits(n: i64) ?i64 {
+    if (n >= 101 and n <= 691_231) return (n + 20_000_000) * 1_000_000;
+    if (n >= 700_101 and n <= 991_231) return (n + 19_000_000) * 1_000_000;
+    if (n >= 10_000_101 and n <= 99_991_231) return n * 1_000_000;
+    if (n >= 101_000_000 and n <= 691_231_235_959) return n + 20_000_000_000_000;
+    if (n >= 700_101_000_000 and n <= 991_231_235_959) return n + 19_000_000_000_000;
+    if (n > 991_231_235_959 and n <= 99_999_999_999_999) return n;
+    return null;
+}
+
+/// A date and time of day read from text or a number, before its range is
+/// checked.
+const Moment = struct {
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32 = 0,
+    minute: u32 = 0,
+    second: u32 = 0,
+    microsecond: u32 = 0,
+
+    fn days(self: Moment) ?i32 {
+        const year: i32 = @intCast(self.year);
+        if (!validDate(year, self.month, self.day)) return null;
+        return ymdToDays(year, self.month, self.day);
+    }
+
+    fn micros(self: Moment) ?i64 {
+        if (self.hour > 23 or self.minute > 59 or self.second > 59) return null;
+        const clock = (@as(i64, self.hour) * 60 + self.minute) * 60 + self.second;
+        return @as(i64, self.days() orelse return null) * std.time.us_per_day + clock * std.time.us_per_s + self.microsecond;
+    }
+};
+
+/// Space around a date: ' ' and the control characters \t \n \v \f \r.
+fn isDateSpace(c: u8) bool {
+    return c == ' ' or (c >= '\t' and c <= '\r');
+}
+
+/// A printable ASCII character that is neither a letter, a digit nor a space.
+fn isDatePunct(c: u8) bool {
+    return c > ' ' and c < 0x7f and !std.ascii.isAlphanumeric(c);
+}
+
+fn trimDateSpace(s: []const u8) []const u8 {
+    var start: usize = 0;
+    var end = s.len;
+    while (start < end and isDateSpace(s[start])) start += 1;
+    while (end > start and isDateSpace(s[end - 1])) end -= 1;
+    return s[start..end];
+}
+
+fn allDigits(s: []const u8) bool {
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+fn digitsValue(s: []const u8) u32 {
+    var value: u32 = 0;
+    for (s) |c| value = value * 10 + (c - '0');
+    return value;
+}
+
+/// `YYYY?MM?DD` at the start of `t`, where each `?` is any one character
+/// but a digit. Its values aren't checked.
+fn plainDate(t: []const u8) ?Moment {
+    if (t.len < 10 or !allDigits(t[0..4]) or std.ascii.isDigit(t[4]) or
+        !allDigits(t[5..7]) or std.ascii.isDigit(t[7]) or !allDigits(t[8..10])) return null;
+    return .{ .year = digitsValue(t[0..4]), .month = digitsValue(t[5..7]), .day = digitsValue(t[8..10]) };
+}
+
+/// A plain date followed by `hh?mm?ss`, either right after a `T` (19
+/// characters in all) or as the last eight characters after a run of
+/// space.
+fn plainDatetime(t: []const u8) ?Moment {
+    if (t.len < 19 or !std.ascii.isDigit(t[9])) return null;
+    const clock = if (t.len == 19 and t[10] == 'T' and std.ascii.isDigit(t[11])) t[11..] else blk: {
+        for (t[10 .. t.len - 8]) |c| if (!isDateSpace(c)) return null;
+        break :blk t[t.len - 8 ..];
+    };
+    if (!allDigits(clock[0..2]) or std.ascii.isDigit(clock[2]) or
+        !allDigits(clock[3..5]) or std.ascii.isDigit(clock[5]) or !allDigits(clock[6..8])) return null;
+    var moment = plainDate(t) orelse return null;
+    moment.hour = digitsValue(clock[0..2]);
+    moment.minute = digitsValue(clock[3..5]);
+    moment.second = digitsValue(clock[6..8]);
+    return moment;
+}
+
+/// Text read as up to seven numeric fields: year, month, day, hour, minute,
+/// second and a fraction of a second. At least the first three must be
+/// there. Leading space is skipped; reading stops at the first character
+/// that can't continue a field, and the rest of the text is ignored.
+///
+/// - When the leading run of digits (a `T` may sit among them) reaches the
+///   end of the text or a `.`, fields have fixed widths: a four-digit year
+///   when the run is 4, 8 or at least 14 characters long and a two-digit one
+///   otherwise, then two digits a field. Otherwise each field is a whole run
+///   of digits, and a field over 999999 isn't a date.
+/// - Fields are separated by punctuation. Space may also separate the day
+///   from the time, but nowhere else in the date or the time; a letter ends
+///   the reading.
+/// - A `T` right after the day starts the time.
+/// - Only a `.` after the seconds starts the fraction, whose first six
+///   digits are read.
+/// - A two-digit year below 70 is in the 2000s, and any other in the 1900s.
+fn scanMoment(s: []const u8) ?Moment {
+    var i: usize = 0;
+    while (i < s.len and isDateSpace(s[i])) i += 1;
+    if (i == s.len or !std.ascii.isDigit(s[i])) return null;
+
+    var run_end = i;
+    while (run_end < s.len and (std.ascii.isDigit(s[run_end]) or s[run_end] == 'T')) run_end += 1;
+    const fixed_widths = run_end == s.len or s[run_end] == '.';
+    const run_len = run_end - i;
+    const short_year = !(run_len == 4 or run_len == 8 or run_len >= 14);
+
+    var fields = [_]u32{0} ** 7;
+    var widths = [_]usize{0} ** 7;
+    var count: usize = 0;
+    while (count < fields.len and i < s.len and std.ascii.isDigit(s[i])) {
+        const max_width: usize = if (count == 6) 6 else if (!fixed_widths) std.math.maxInt(usize) else if (count == 0 and !short_year) 4 else 2;
+        const start = i;
+        var value: u32 = 0;
+        while (i < s.len and std.ascii.isDigit(s[i]) and i - start < max_width) : (i += 1) {
+            value = value * 10 + (s[i] - '0');
+            if (value > 999_999) return null;
+        }
+        fields[count] = value;
+        widths[count] = i - start;
+        count += 1;
+        if (i == s.len or count == fields.len) break;
+        if (count == 3 and s[i] == 'T') {
+            i += 1;
+            continue;
+        }
+        if (count == 6) {
+            if (s[i] != '.') break;
+            i += 1;
+            continue;
+        }
+        while (i < s.len and (isDatePunct(s[i]) or isDateSpace(s[i]))) : (i += 1) {
+            if (isDateSpace(s[i]) and count != 3) return null;
+        }
+    }
+    if (count < 3) return null;
+
+    const two_digit_year = if (fixed_widths) short_year else widths[0] == 2;
+    var fraction = fields[6];
+    for (widths[6]..6) |_| fraction *= 10;
+    return .{
+        .year = if (!two_digit_year) fields[0] else if (fields[0] < 70) fields[0] + 2000 else fields[0] + 1900,
+        .month = fields[1],
+        .day = fields[2],
+        .hour = fields[3],
+        .minute = fields[4],
+        .second = fields[5],
+        .microsecond = fraction,
+    };
 }
 
 pub const TEXT_SPACE = " \t\r\n";
@@ -701,4 +908,282 @@ test "daysToYmd and microsToHms before the epoch" {
     try std.testing.expectEqual(@as(u5, 10), t.hour);
     try std.testing.expectEqual(@as(u6, 7), t.minute);
     try std.testing.expectEqual(@as(u6, 9), t.second);
+}
+
+/// Expected `?[]const u8` against a read date or datetime, compared as the
+/// text StarRocks prints.
+const ExpectRead = struct {
+    fn date(expected: ?[]const u8, got: ?i32) !void {
+        var buf: [32]u8 = undefined;
+        const text: ?[]const u8 = if (got) |days| try formatDate(&buf, days) else null;
+        try expectOptionalText(expected, text);
+    }
+
+    fn datetime(expected: ?[]const u8, got: ?i64) !void {
+        var buf: [32]u8 = undefined;
+        const text: ?[]const u8 = if (got) |micros| try formatDateTime(&buf, micros) else null;
+        try expectOptionalText(expected, text);
+    }
+
+    fn expectOptionalText(expected: ?[]const u8, got: ?[]const u8) !void {
+        if (expected == null or got == null) return std.testing.expectEqual(expected == null, got == null);
+        try std.testing.expectEqualStrings(expected.?, got.?);
+    }
+};
+
+test "text reads as a date as StarRocks casts a column: CAST AS DATE, DATE(), CAST AS DATETIME (issue #399)" {
+    // StarRocks 4.0's results, with the text wrapped in IF(RAND() < 2, x, NULL)
+    // so that its backend casts it: the frontend folds a constant differently.
+    const Case = struct { text: []const u8, cast_date: ?[]const u8, date_fn: ?[]const u8, cast_datetime: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .text = "2026-01-01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-1-1", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-1", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "20260101", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "260101", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026/01/01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026.01.01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026:01:01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026 01 01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 10:00:00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00" },
+        .{ .text = "2026-01-01T10:00:00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00" },
+        .{ .text = "2026-01-01 garbage", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = " 2026-01-01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 ", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "26-01-01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "6-1-1", .cast_date = "0006-01-01", .date_fn = "0006-01-01", .cast_datetime = "0006-01-01 00:00:00" },
+        .{ .text = "0-1-1", .cast_date = "0000-01-01", .date_fn = "0000-01-01", .cast_datetime = "0000-01-01 00:00:00" },
+        .{ .text = "00000101", .cast_date = "0000-01-01", .date_fn = "0000-01-01", .cast_datetime = "0000-01-01 00:00:00" },
+        .{ .text = "99991231", .cast_date = "9999-12-31", .date_fn = "9999-12-31", .cast_datetime = "9999-12-31 00:00:00" },
+        .{ .text = "100000101", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-13-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-02-30", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-00-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "0000-00-00", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "202601", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "+2026-01-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "1_23-01-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "-001-01-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026--01-01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01x", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "20260101103000", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "20260101 103000", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00" },
+        .{ .text = "2026-1-1 1:2:3", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 01:02:03" },
+        .{ .text = "2026-01-01 25:00:00", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:00:00.123", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00.123000" },
+        .{ .text = "12026-01-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-001-01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-001", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "x2026-01-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = " ", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026/1/1", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01Z", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01T", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "26-1-1", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "69-01-01", .cast_date = "2069-01-01", .date_fn = "2069-01-01", .cast_datetime = "2069-01-01 00:00:00" },
+        .{ .text = "70-01-01", .cast_date = "1970-01-01", .date_fn = "1970-01-01", .cast_datetime = "1970-01-01 00:00:00" },
+        .{ .text = "0069-01-01", .cast_date = "0069-01-01", .date_fn = "0069-01-01", .cast_datetime = "0069-01-01 00:00:00" },
+        .{ .text = "690101", .cast_date = "2069-01-01", .date_fn = "2069-01-01", .cast_datetime = "2069-01-01 00:00:00" },
+        .{ .text = "700101", .cast_date = "1970-01-01", .date_fn = "1970-01-01", .cast_datetime = "1970-01-01 00:00:00" },
+        .{ .text = "0101", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "101", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "1231", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-1", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 00:00:00 UTC", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 10:61:00", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:00:61", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 1:2", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 01:02:00" },
+        .{ .text = "2026-01-01  10:00:00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00" },
+        .{ .text = "2026_01_01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01-", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-1-01T1:2:3", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 01:02:03" },
+        .{ .text = "260101103000", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2601011030", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026010110", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:00:00.1234567", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00.123456" },
+        .{ .text = "9999-12-31 23:59:59.9999999", .cast_date = "9999-12-31", .date_fn = "9999-12-31", .cast_datetime = "9999-12-31 23:59:59.999999" },
+        .{ .text = "0000-01-01", .cast_date = "0000-01-01", .date_fn = "0000-01-01", .cast_datetime = "0000-01-01 00:00:00" },
+        .{ .text = "0001-01-01", .cast_date = "0001-01-01", .date_fn = "0001-01-01", .cast_datetime = "0001-01-01 00:00:00" },
+        .{ .text = "2026-01 01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026 01-01", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 10 30 00", .cast_date = null, .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10:30 00", .cast_date = null, .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10: 30:00", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10 :30:00", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "9901011", .cast_date = "1999-01-01", .date_fn = "1999-01-01", .cast_datetime = "1999-01-01 01:00:00" },
+        .{ .text = "99010112", .cast_date = "9901-01-12", .date_fn = "9901-01-12", .cast_datetime = "9901-01-12 00:00:00" },
+        .{ .text = "990101123", .cast_date = "1999-01-01", .date_fn = "1999-01-01", .cast_datetime = "1999-01-01 12:03:00" },
+        .{ .text = "9901011230", .cast_date = "1999-01-01", .date_fn = "1999-01-01", .cast_datetime = "1999-01-01 12:30:00" },
+        .{ .text = "99010112304", .cast_date = "1999-01-01", .date_fn = "1999-01-01", .cast_datetime = "1999-01-01 12:30:04" },
+        .{ .text = "990101123045", .cast_date = "1999-01-01", .date_fn = "1999-01-01", .cast_datetime = "1999-01-01 12:30:45" },
+        .{ .text = "9901011230451", .cast_date = "1999-01-01", .date_fn = "1999-01-01", .cast_datetime = "1999-01-01 12:30:45" },
+        .{ .text = "202601011030001", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "20260101103000.5", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.500000" },
+        .{ .text = "260101103000.5", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.500000" },
+        .{ .text = "20260101.5", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 05:00:00" },
+        .{ .text = "260101.5", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 05:00:00" },
+        .{ .text = "2026010110.5", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "0026-01-01", .cast_date = "0026-01-01", .date_fn = "0026-01-01", .cast_datetime = "0026-01-01 00:00:00" },
+        .{ .text = "00-01-01", .cast_date = "2000-01-01", .date_fn = "2000-01-01", .cast_datetime = "2000-01-01 00:00:00" },
+        .{ .text = "000101", .cast_date = "2000-01-01", .date_fn = "2000-01-01", .cast_datetime = "2000-01-01 00:00:00" },
+        .{ .text = "000000", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "00000000", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 24:00:00", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:30:00.", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10:30:00.abc", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10:30:00:123", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10.30.00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01T10", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00" },
+        .{ .text = "20260101T103000", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "20260101T10:30:00", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:30:00.123456789", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.123456" },
+        .{ .text = "2026-01-01 1:2:3.4", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 01:02:03.400000" },
+        .{ .text = "2026-01-0000001", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-1000000", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:30:00 5", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10:30:00.5 x", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.500000" },
+        .{ .text = "20260101253000", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 garbage:99", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 99", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:99", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-1-1 25", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 -10:00:00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00" },
+        .{ .text = "2026-01-01 10:30:00.999999999", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.999999" },
+        .{ .text = "2026-01-01 23:59:59.9999995", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 23:59:59.999999" },
+        .{ .text = "2026-01-01+10:00:00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:00:00" },
+        .{ .text = "2026-01-01/10/30/00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01T10:30:00Z", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01T10:30:00+08:00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10:30:00 +08:00", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-02-29", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2024-02-29", .cast_date = "2024-02-29", .date_fn = "2024-02-29", .cast_datetime = "2024-02-29 00:00:00" },
+        .{ .text = "1900-02-29", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2000-02-29", .cast_date = "2000-02-29", .date_fn = "2000-02-29", .cast_datetime = "2000-02-29 00:00:00" },
+        .{ .text = "9999-12-31 23:59:59", .cast_date = "9999-12-31", .date_fn = "9999-12-31", .cast_datetime = "9999-12-31 23:59:59" },
+        .{ .text = "9999-12-31 24:00:00", .cast_date = "9999-12-31", .date_fn = null, .cast_datetime = null },
+        .{ .text = "10000-01-01", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 00:00:00.000001", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00.000001" },
+        .{ .text = "2026-1-1 0:0:0", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 000000", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 103000", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 1030", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01T103000", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "20260101 10:30:00", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "26-01-01 10:30", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "69-12-31 23:59:59", .cast_date = "2069-12-31", .date_fn = "2069-12-31", .cast_datetime = "2069-12-31 23:59:59" },
+        .{ .text = "1-1-1", .cast_date = "0001-01-01", .date_fn = "0001-01-01", .cast_datetime = "0001-01-01 00:00:00" },
+        .{ .text = "01-1-1", .cast_date = "2001-01-01", .date_fn = "2001-01-01", .cast_datetime = "2001-01-01 00:00:00" },
+        .{ .text = "001-1-1", .cast_date = "0001-01-01", .date_fn = "0001-01-01", .cast_datetime = "0001-01-01 00:00:00" },
+        .{ .text = "0001-1-1", .cast_date = "0001-01-01", .date_fn = "0001-01-01", .cast_datetime = "0001-01-01 00:00:00" },
+        .{ .text = "99-1-1", .cast_date = "1999-01-01", .date_fn = "1999-01-01", .cast_datetime = "1999-01-01 00:00:00" },
+        .{ .text = "100-1-1", .cast_date = "0100-01-01", .date_fn = "0100-01-01", .cast_datetime = "0100-01-01 00:00:00" },
+        .{ .text = "999-1-1", .cast_date = "0999-01-01", .date_fn = "0999-01-01", .cast_datetime = "0999-01-01 00:00:00" },
+        .{ .text = "12-12-12", .cast_date = "2012-12-12", .date_fn = "2012-12-12", .cast_datetime = "2012-12-12 00:00:00" },
+        .{ .text = "123-12-12", .cast_date = "0123-12-12", .date_fn = "0123-12-12", .cast_datetime = "0123-12-12 00:00:00" },
+        .{ .text = "2026-01-01 10:30:00.1", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.100000" },
+        .{ .text = "2026-01-01 10:30:00.12", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.120000" },
+        .{ .text = "2026-01-01 10:30:00.000", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01 10:30:0.5", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.500000" },
+        .{ .text = "2026-01-01 1:2:3.456789", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 01:02:03.456789" },
+        .{ .text = "2026-01-01 10:30:60", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-01 10:60:00", .cast_date = "2026-01-01", .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-01-32", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-04-31", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026-12-31", .cast_date = "2026-12-31", .date_fn = "2026-12-31", .cast_datetime = "2026-12-31 00:00:00" },
+        .{ .text = "2026--1-1", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01T10:30", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .text = "2026-01-01T", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01TT10", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 10:30:00.5.5", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00.500000" },
+        .{ .text = "  2026-01-01  ", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01\t", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "1", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "12", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "123456789012345678", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "20261", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "2026011", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = "20260101 ", .cast_date = null, .date_fn = null, .cast_datetime = null },
+        .{ .text = " 20260101", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .text = "2026-01-01 10:30:00 PM", .cast_date = "2026-01-01", .date_fn = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("text: '{s}'\n", .{c.text});
+        try ExpectRead.date(c.cast_date, textToDate(c.text));
+        const datetime = textToDatetime(c.text);
+        try ExpectRead.date(c.date_fn, if (datetime) |micros| daysFromDatetime(micros) else null);
+        try ExpectRead.datetime(c.cast_datetime, datetime);
+    }
+    // StarRocks reads '0000-02-29' as NULL. thinDB's calendar makes year 0 a
+    // leap year (DESIGN.md §3.1), so the day is there.
+    try ExpectRead.date("0000-02-29", textToDate("0000-02-29"));
+    try ExpectRead.datetime("0000-02-29 10:00:00", textToDatetime("0000-02-29 10:00:00"));
+}
+
+test "numbers read as a date as StarRocks casts a column (issue #399)" {
+    // DATE(n) gives what CAST(n AS DATE) does for every one of these.
+    const Case = struct { number: i64, cast_date: ?[]const u8, cast_datetime: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .number = 20260101, .cast_date = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .number = 260101, .cast_date = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .number = 20260101103000, .cast_date = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .number = 0, .cast_date = null, .cast_datetime = null },
+        .{ .number = 101, .cast_date = "2000-01-01", .cast_datetime = "2000-01-01 00:00:00" },
+        .{ .number = 2026, .cast_date = null, .cast_datetime = null },
+        .{ .number = 20261301, .cast_date = null, .cast_datetime = null },
+        .{ .number = -20260101, .cast_date = null, .cast_datetime = null },
+        .{ .number = 99991231, .cast_date = "9999-12-31", .cast_datetime = "9999-12-31 00:00:00" },
+        .{ .number = 100000101, .cast_date = null, .cast_datetime = null },
+        .{ .number = 1231, .cast_date = "2000-12-31", .cast_datetime = "2000-12-31 00:00:00" },
+        .{ .number = 70101, .cast_date = "2007-01-01", .cast_datetime = "2007-01-01 00:00:00" },
+        .{ .number = 691231, .cast_date = "2069-12-31", .cast_datetime = "2069-12-31 00:00:00" },
+        .{ .number = 20260230, .cast_date = null, .cast_datetime = null },
+        .{ .number = 260101103000, .cast_date = "2026-01-01", .cast_datetime = "2026-01-01 10:30:00" },
+        .{ .number = 2601011030, .cast_date = null, .cast_datetime = null },
+        .{ .number = 20260101000000, .cast_date = "2026-01-01", .cast_datetime = "2026-01-01 00:00:00" },
+        .{ .number = 20260101235959, .cast_date = "2026-01-01", .cast_datetime = "2026-01-01 23:59:59" },
+        .{ .number = 20260101240000, .cast_date = null, .cast_datetime = null },
+        .{ .number = 991231, .cast_date = "1999-12-31", .cast_datetime = "1999-12-31 00:00:00" },
+        .{ .number = 991231235959, .cast_date = "1999-12-31", .cast_datetime = "1999-12-31 23:59:59" },
+        .{ .number = 19991231, .cast_date = "1999-12-31", .cast_datetime = "1999-12-31 00:00:00" },
+        .{ .number = 10000101, .cast_date = "1000-01-01", .cast_datetime = "1000-01-01 00:00:00" },
+        .{ .number = 101000000, .cast_date = "2000-01-01", .cast_datetime = "2000-01-01 00:00:00" },
+        .{ .number = 1000000, .cast_date = null, .cast_datetime = null },
+        .{ .number = 10101, .cast_date = "2001-01-01", .cast_datetime = "2001-01-01 00:00:00" },
+        .{ .number = 100, .cast_date = null, .cast_datetime = null },
+        .{ .number = 99, .cast_date = null, .cast_datetime = null },
+        .{ .number = 1, .cast_date = null, .cast_datetime = null },
+        .{ .number = 9991231, .cast_date = null, .cast_datetime = null },
+        .{ .number = 99999999999999, .cast_date = null, .cast_datetime = null },
+        .{ .number = 100000000000000, .cast_date = null, .cast_datetime = null },
+        .{ .number = -1, .cast_date = null, .cast_datetime = null },
+        .{ .number = 1000101, .cast_date = null, .cast_datetime = null },
+        .{ .number = 69, .cast_date = null, .cast_datetime = null },
+        .{ .number = 70, .cast_date = null, .cast_datetime = null },
+        .{ .number = 691231235959, .cast_date = "2069-12-31", .cast_datetime = "2069-12-31 23:59:59" },
+        .{ .number = 700101000000, .cast_date = "1970-01-01", .cast_datetime = "1970-01-01 00:00:00" },
+        .{ .number = 5000101000000, .cast_date = "0500-01-01", .cast_datetime = "0500-01-01 00:00:00" },
+        .{ .number = 991231235960, .cast_date = null, .cast_datetime = null },
+        .{ .number = 1000101000000, .cast_date = "0100-01-01", .cast_datetime = "0100-01-01 00:00:00" },
+        .{ .number = 9991231235959, .cast_date = "0999-12-31", .cast_datetime = "0999-12-31 23:59:59" },
+        .{ .number = 10000101000000, .cast_date = "1000-01-01", .cast_datetime = "1000-01-01 00:00:00" },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("number: {d}\n", .{c.number});
+        try ExpectRead.date(c.cast_date, numberToDate(c.number));
+        try ExpectRead.datetime(c.cast_datetime, numberToDatetime(c.number));
+        try ExpectRead.date(c.cast_date, doubleToDate(@floatFromInt(c.number)));
+        try ExpectRead.datetime(c.cast_datetime, doubleToDatetime(@floatFromInt(c.number)));
+    }
+    // A double's fraction is dropped, toward zero.
+    try ExpectRead.datetime("2026-01-01 00:00:00", doubleToDatetime(20260101.9));
+    try ExpectRead.datetime("2026-01-01 23:59:59", doubleToDatetime(20260101235959.99));
+    try ExpectRead.datetime("1999-12-31 23:59:59", doubleToDatetime(991231235959.5));
+    try ExpectRead.date(null, doubleToDate(100.9));
+    try ExpectRead.date(null, doubleToDate(-0.5));
+    try ExpectRead.date(null, doubleToDate(1e20));
+    try ExpectRead.date(null, doubleToDate(std.math.nan(f64)));
 }
