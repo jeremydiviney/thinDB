@@ -729,52 +729,42 @@ fn unitSpan(unit: DiffUnit) UnitSpan {
     };
 }
 
-/// When a month has passed from a day that the later month is too short
-/// to hold, such as from 2024-01-31 to 2024-02-29.
-const MonthEnd = enum {
-    /// TIMESTAMPDIFF: not within that month.
-    never,
-    /// DATE_DIFF: on the later month's last day, where the earlier value
-    /// moved by the month lands.
-    at_last_day,
-};
-
 /// Whole months from `start` to `end`, negative when `end` is earlier: a
 /// month counts once the later value's day of the month and time of day
-/// reach the earlier one's, that day held to the later month's length under
-/// `.at_last_day`.
-fn elapsedMonths(start: i64, end: i64, month_end: MonthEnd) i64 {
+/// reach the earlier one's, that day held to the later month's length, so
+/// 2024-01-31 to 2024-02-29 is a month.
+fn elapsedMonths(start: i64, end: i64) i64 {
     const earlier = @min(start, end);
     const later = @max(start, end);
     const b = daysToYmd(daysFromDatetime(earlier));
     const e = daysToYmd(daysFromDatetime(later));
     var months = (@as(i64, e.year) - b.year) * 12 + (@as(i64, e.month) - b.month);
-    const day: u32 = switch (month_end) {
-        .never => b.day,
-        .at_last_day => @min(b.day, common.lastDayOfMonth(e.year, e.month)),
-    };
+    const day = @min(b.day, common.lastDayOfMonth(e.year, e.month));
     const time_before = @mod(later, std.time.us_per_day) < @mod(earlier, std.time.us_per_day);
     if (e.day < day or (e.day == day and time_before)) months -= 1;
     return if (end < start) -months else months;
 }
 
-/// TIMESTAMPDIFF(unit, start, end) as MySQL computes it: the whole units
-/// elapsed from `start` to `end`, negative when `end` is earlier.
+/// TIMESTAMPDIFF(unit, start, end) as StarRocks computes it: `end - start`
+/// in whole units. A month and a year count as MONTHS_DIFF(end, start) and
+/// YEARS_DIFF(end, start) do (`periodsDiff`), and a quarter, which StarRocks
+/// lacks, as three such months.
 fn timestampDiff(unit: DiffUnit, start: i64, end: i64) i64 {
+    if (unit == .year) return periodsDiff(.year, end, start);
     return switch (unitSpan(unit)) {
         .micros => |n| @divTrunc(end -| start, n),
-        .months => |n| @divTrunc(elapsedMonths(start, end, .never), n),
+        .months => |n| @divTrunc(periodsDiff(.month, end, start), n),
     };
 }
 
 /// DATE_DIFF(unit, later, earlier) as StarRocks computes it: the whole
 /// units elapsed from `earlier` to `later`, negative when `later` is the
-/// earlier one. It is TIMESTAMPDIFF with its values swapped, but for a
-/// month that ends before the earlier value's day.
+/// earlier one. Unlike TIMESTAMPDIFF, a month may end on the later month's
+/// last day (`elapsedMonths`).
 fn dateDiff(unit: DiffUnit, later: i64, earlier: i64) i64 {
     return switch (unitSpan(unit)) {
         .micros => |n| @divTrunc(later -| earlier, n),
-        .months => |n| @divTrunc(elapsedMonths(earlier, later, .at_last_day), n),
+        .months => |n| @divTrunc(elapsedMonths(earlier, later), n),
     };
 }
 
@@ -810,22 +800,44 @@ fn DateDiff(comptime temporal: Temporal) type {
 pub const dateDiffDateKernel = DateDiff(.date).kernel;
 pub const dateDiffDatetimeKernel = DateDiff(.datetime).kernel;
 
-/// MONTHS_DIFF(a, b) as StarRocks computes it: TIMESTAMPDIFF(MONTH, b, a),
-/// except that an `a` earlier than `b` in the same month is -1, not 0.
-fn monthsDiff(a: i64, b: i64) i64 {
+const Period = enum { month, year };
+
+/// Whole months or years from `b` to `a`, as StarRocks counts them in
+/// MONTHS_DIFF(a, b), YEARS_DIFF(a, b) and TIMESTAMPDIFF(unit, b, a): the
+/// difference of their period numbers, less one when that isn't negative
+/// and `a` is less far into its period than `b` is into its own, plus one
+/// when it is negative and `a` is further in. So an `a` earlier than `b` in
+/// the same period is -1, where MySQL's TIMESTAMPDIFF gives 0; otherwise
+/// the two agree, and neither holds a day to a shorter month's length.
+fn periodsDiff(comptime period: Period, a: i64, b: i64) i64 {
     const x = daysToYmd(daysFromDatetime(a));
     const y = daysToYmd(daysFromDatetime(b));
-    const months = (@as(i64, x.year) - y.year) * 12 + (@as(i64, x.month) - y.month);
-    const a_into_month = a - @as(i64, common.ymdToDays(x.year, x.month, 1)) * std.time.us_per_day;
-    const b_into_month = b - @as(i64, common.ymdToDays(y.year, y.month, 1)) * std.time.us_per_day;
-    if (months >= 0) return if (a_into_month < b_into_month) months - 1 else months;
-    return if (a_into_month > b_into_month) months + 1 else months;
+    const periods = switch (period) {
+        .month => (@as(i64, x.year) - y.year) * 12 + (@as(i64, x.month) - y.month),
+        .year => @as(i64, x.year) - y.year,
+    };
+    const a_into = intoPeriod(period, x, a);
+    const b_into = intoPeriod(period, y, b);
+    if (periods >= 0) return if (a_into < b_into) periods - 1 else periods;
+    return if (a_into > b_into) periods + 1 else periods;
+}
+
+/// How far `micros`, which falls on `ymd`, is into its month or year, as a
+/// number that orders by month (for a year), day, then time of day. A year
+/// compares month and day rather than days since January 1, so 2024-03-01
+/// to 2025-03-01 is a whole year across the leap day.
+fn intoPeriod(comptime period: Period, ymd: @TypeOf(daysToYmd(0)), micros: i64) i64 {
+    const month: i64 = switch (period) {
+        .month => 0,
+        .year => ymd.month,
+    };
+    return (month * 32 + ymd.day) * std.time.us_per_day + @mod(micros, std.time.us_per_day);
 }
 
 pub fn monthsDiffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const a = args[0].data.datetime;
     const b = args[1].data.datetime;
-    for (a[0..row_count], b[0..row_count]) |x, y| try out.data.bigint.append(allocator, monthsDiff(x, y));
+    for (a[0..row_count], b[0..row_count]) |x, y| try out.data.bigint.append(allocator, periodsDiff(.month, x, y));
 }
 
 pub fn timestampDiffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
@@ -1015,13 +1027,15 @@ test "date unit parse is case-insensitive and rejects unknown units" {
     try std.testing.expectError(error.ComputeUnsupportedExpr, parseDateUnit("fortnight"));
 }
 
-test "TIMESTAMPDIFF counts whole units as MySQL does" {
+test "TIMESTAMPDIFF counts whole units as StarRocks does" {
     const dt = struct {
         fn at(y: i32, mo: u32, d: u32, h: i64, mi: i64, s: i64) i64 {
             return @as(i64, common.ymdToDays(y, mo, d)) * std.time.us_per_day + ((h * 60 + mi) * 60 + s) * std.time.us_per_s;
         }
     }.at;
-    // Every expected value is MySQL 8.4's.
+    // Every expected value is StarRocks 4.0's, and MySQL 8.4 agrees with
+    // it. StarRocks has no QUARTER, MICROSECOND or SQL_TSI_ spelling; those
+    // values are MySQL's.
     const cases = .{
         .{ "MONTH", dt(2026, 1, 31, 10, 0, 0), dt(2026, 2, 28, 9, 0, 0), 0 },
         .{ "MONTH", dt(2026, 1, 15, 10, 0, 0), dt(2026, 2, 15, 10, 0, 0), 1 },
@@ -1029,6 +1043,10 @@ test "TIMESTAMPDIFF counts whole units as MySQL does" {
         .{ "MONTH", dt(2026, 2, 15, 9, 0, 0), dt(2026, 1, 15, 10, 0, 0), 0 },
         .{ "MONTH", dt(2026, 3, 31, 0, 0, 0), dt(2026, 2, 28, 0, 0, 0), -1 },
         .{ "YEAR", dt(2024, 2, 29, 0, 0, 0), dt(2025, 2, 28, 0, 0, 0), 0 },
+        .{ "YEAR", dt(2024, 3, 1, 0, 0, 0), dt(2025, 3, 1, 0, 0, 0), 1 },
+        .{ "YEAR", dt(2024, 12, 31, 0, 0, 0), dt(2025, 12, 31, 0, 0, 0), 1 },
+        .{ "YEAR", dt(2025, 3, 1, 0, 0, 0), dt(2024, 2, 29, 0, 0, 0), -1 },
+        .{ "YEAR", dt(2026, 6, 15, 10, 0, 0), dt(2025, 6, 15, 10, 0, 0) + 1, 0 },
         .{ "QUARTER", dt(2026, 1, 1, 0, 0, 0), dt(2026, 12, 31, 23, 59, 59), 3 },
         .{ "WEEK", dt(2026, 1, 1, 0, 0, 0), dt(2025, 12, 17, 0, 0, 1), -2 },
         .{ "MICROSECOND", dt(2026, 1, 1, 0, 0, 0), dt(2026, 1, 1, 0, 0, 1) + 500_000, 1_500_000 },
@@ -1039,6 +1057,19 @@ test "TIMESTAMPDIFF counts whole units as MySQL does" {
     };
     inline for (cases) |c| try std.testing.expectEqual(@as(i64, c[3]), timestampDiff(try parseDiffUnit(c[0]), c[1], c[2]));
     try std.testing.expectError(error.ComputeUnsupportedExpr, parseDiffUnit("SQL_TSI_FORTNIGHT"));
+
+    // An end earlier than the start in the same month (MONTH) or year
+    // (YEAR) is -1 in StarRocks; MySQL gives 0.
+    const same_period = .{
+        .{ "MONTH", dt(2026, 1, 31, 0, 0, 0), dt(2026, 1, 1, 0, 0, 0), -1 },
+        .{ "MONTH", dt(2026, 1, 1, 0, 0, 0) + 500_000, dt(2026, 1, 1, 0, 0, 0), -1 },
+        .{ "MONTH", dt(2026, 1, 1, 0, 0, 0), dt(2026, 1, 31, 0, 0, 0), 0 },
+        .{ "QUARTER", dt(2026, 1, 31, 0, 0, 0), dt(2026, 1, 1, 0, 0, 0), 0 },
+        .{ "YEAR", dt(2026, 6, 1, 0, 0, 0), dt(2026, 1, 1, 0, 0, 0), -1 },
+        .{ "YEAR", dt(2024, 3, 1, 0, 0, 0), dt(2024, 1, 31, 0, 0, 0), -1 },
+        .{ "YEAR", dt(2026, 1, 1, 0, 0, 0), dt(2026, 6, 1, 0, 0, 0), 0 },
+    };
+    inline for (same_period) |c| try std.testing.expectEqual(@as(i64, c[3]), timestampDiff(try parseDiffUnit(c[0]), c[1], c[2]));
 }
 
 test "DATE_DIFF and MONTHS_DIFF count from their second value to their first, as StarRocks does" {
@@ -1075,7 +1106,7 @@ test "DATE_DIFF and MONTHS_DIFF count from their second value to their first, as
         .{ dt(2026, 1, 31, 0, 0, 0), dt(2026, 1, 1, 0, 0, 0), 0 },
         .{ dt(2026, 1, 1, 0, 0, 0), dt(2026, 1, 31, 0, 0, 0), -1 },
     };
-    inline for (months_diff_cases) |c| try std.testing.expectEqual(@as(i64, c[2]), monthsDiff(c[0], c[1]));
+    inline for (months_diff_cases) |c| try std.testing.expectEqual(@as(i64, c[2]), periodsDiff(.month, c[0], c[1]));
 }
 
 test "date arithmetic that leaves years 0-9999 is null, whatever its count" {

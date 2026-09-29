@@ -458,6 +458,221 @@ test "DATE_DIFF(unit, a, b) is a - b in whole units, and MONTHS_DIFF(a, b) too, 
     try expectTexts(allocator, db, "SELECT CAST(MONTHS_DIFF(a, b) AS CHAR) FROM dd ORDER BY id", &.{ "0", "0", "0", "-1", "0", null });
 }
 
+test "TIMESTAMPDIFF(MONTH|YEAR) counts as StarRocks does: -1 for an end earlier in the same month or year (issue #418)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // Every value is StarRocks 4.0's, from constant-only SELECTs run plain
+    // and with the backend forced (`IF(RAND() < 2, x, NULL)`); the two forms
+    // agreed on every one. Start, end, then MONTH and YEAR. StarRocks holds
+    // no day to a shorter month's length, as MySQL doesn't.
+    const month_year = [_]struct { []const u8, []const u8, i64, i64 }{
+        .{ "DATE '2024-01-31'", "DATE '2024-02-29'", 0, 0 },
+        .{ "DATE '2024-02-29'", "DATE '2024-01-31'", 0, -1 },
+        .{ "DATE '2024-01-31'", "DATE '2024-02-28'", 0, 0 },
+        .{ "DATE '2024-02-28'", "DATE '2024-01-31'", 0, -1 },
+        .{ "DATE '2024-01-31'", "DATE '2024-03-01'", 1, 0 },
+        .{ "DATE '2024-03-01'", "DATE '2024-01-31'", -1, -1 },
+        .{ "DATE '2024-03-31'", "DATE '2024-04-30'", 0, 0 },
+        .{ "DATE '2024-04-30'", "DATE '2024-03-31'", 0, -1 },
+        .{ "DATE '2023-11-30'", "DATE '2024-02-29'", 2, 0 },
+        .{ "DATE '2024-02-29'", "DATE '2023-11-30'", -2, 0 },
+        .{ "DATETIME '2024-01-31 10:00:00'", "DATETIME '2024-02-29 12:00:00'", 0, 0 },
+        .{ "DATETIME '2024-01-31 12:00:00'", "DATETIME '2024-02-29 10:00:00'", 0, 0 },
+        .{ "DATE '2024-02-29'", "DATE '2025-02-28'", 11, 0 },
+        .{ "DATE '2025-02-28'", "DATE '2024-02-29'", -11, 0 },
+        .{ "DATE '2020-02-29'", "DATE '2023-02-28'", 35, 2 },
+        .{ "DATE '2023-02-28'", "DATE '2020-02-29'", -35, -2 },
+        .{ "DATE '2024-02-29'", "DATE '2028-02-29'", 48, 4 },
+        .{ "DATE '2024-03-01'", "DATE '2025-02-28'", 11, 0 },
+        .{ "DATE '2026-01-31'", "DATE '2026-01-01'", -1, -1 },
+        .{ "DATE '2026-01-01'", "DATE '2026-01-31'", 0, 0 },
+        .{ "DATETIME '2026-01-15 11:00:00'", "DATETIME '2026-01-15 10:00:00'", -1, -1 },
+        .{ "DATETIME '2026-01-15 10:00:00'", "DATETIME '2026-01-15 11:00:00'", 0, 0 },
+        .{ "DATETIME '2026-01-01 00:00:00.5'", "DATETIME '2026-01-01 00:00:00'", -1, -1 },
+        .{ "DATE '2026-06-01'", "DATE '2026-01-01'", -5, -1 },
+        .{ "DATE '2026-01-01'", "DATE '2026-06-01'", 5, 0 },
+        .{ "DATETIME '2026-12-31 23:59:59'", "DATETIME '2026-01-01 00:00:00'", -11, -1 },
+        .{ "DATE '2026-03-15'", "DATE '2026-01-20'", -1, -1 },
+        .{ "DATE '2026-03-15'", "DATE '2026-01-10'", -2, -1 },
+        .{ "DATE '2026-01-20'", "DATE '2026-03-15'", 1, 0 },
+        .{ "DATE '2026-01-15'", "DATE '2026-02-15'", 1, 0 },
+        .{ "DATETIME '2026-01-15 10:00:00'", "DATETIME '2026-02-15 09:59:59'", 0, 0 },
+        .{ "DATETIME '2026-02-15 10:00:00'", "DATETIME '2026-01-15 10:00:00.000001'", 0, -1 },
+        .{ "DATETIME '2027-01-01 00:00:00'", "DATETIME '2026-01-01 00:00:01'", -11, 0 },
+        .{ "DATETIME '2026-01-01 00:00:01'", "DATETIME '2027-01-01 00:00:00'", 11, 0 },
+        .{ "DATE '2025-12-31'", "DATE '2026-01-01'", 0, 0 },
+        .{ "DATE '2026-01-01'", "DATE '2025-12-31'", 0, 0 },
+        .{ "DATETIME '0000-01-01 00:00:00'", "DATETIME '9999-12-31 23:59:59'", 119999, 9999 },
+        .{ "DATETIME '9999-12-31 23:59:59'", "DATETIME '0000-01-01 00:00:00'", -119999, -9999 },
+    };
+    for (month_year) |c| {
+        try expectDiff(allocator, db, "TIMESTAMPDIFF(MONTH, {s}, {s})", .{ c[0], c[1] }, c[2]);
+        try expectDiff(allocator, db, "TIMESTAMPDIFF(YEAR, {s}, {s})", .{ c[0], c[1] }, c[3]);
+    }
+    // A year compares month and day, not days since January 1.
+    const years = [_]struct { []const u8, []const u8, i64 }{
+        .{ "DATE '2024-03-01'", "DATE '2025-03-01'", 1 },
+        .{ "DATE '2025-03-01'", "DATE '2024-03-01'", -1 },
+        .{ "DATE '2024-12-31'", "DATE '2025-12-31'", 1 },
+        .{ "DATE '2025-12-31'", "DATE '2024-12-31'", -1 },
+        .{ "DATE '2023-03-01'", "DATE '2024-02-29'", 0 },
+        .{ "DATE '2024-02-29'", "DATE '2023-03-01'", 0 },
+        .{ "DATE '2024-02-29'", "DATE '2025-03-01'", 1 },
+        .{ "DATE '2025-03-01'", "DATE '2024-02-29'", -1 },
+        .{ "DATETIME '2025-06-15 10:00:00'", "DATETIME '2026-06-15 09:59:59'", 0 },
+        .{ "DATETIME '2026-06-15 09:59:59'", "DATETIME '2025-06-15 10:00:00'", 0 },
+        .{ "DATETIME '2025-06-15 10:00:00'", "DATETIME '2026-06-15 10:00:00'", 1 },
+        .{ "DATETIME '2026-06-15 10:00:00'", "DATETIME '2025-06-15 10:00:00.000001'", 0 },
+        .{ "DATE '9999-12-31'", "DATE '9999-01-01'", -1 },
+        .{ "'2026-06-01'", "'2026-01-01'", -1 },
+    };
+    for (years) |c| try expectDiff(allocator, db, "TIMESTAMPDIFF(YEAR, {s}, {s})", .{ c[0], c[1] }, c[2]);
+    try expectDiff(allocator, db, "TIMESTAMPDIFF(MONTH, {s}, {s})", .{ "DATE '0000-01-31'", "DATE '0000-01-01'" }, -1);
+    try expectDiff(allocator, db, "TIMESTAMPDIFF(MONTH, {s}, {s})", .{ "DATETIME '9999-12-31 23:59:59'", "DATE '9999-12-31'" }, -1);
+    try expectDiff(allocator, db, "TIMESTAMPDIFF(MONTH, {s}, {s})", .{ "'2026-01-31'", "'2026-01-01'" }, -1);
+    try expectDiff(allocator, db, "TIMESTAMPDIFF(MONTH, {s}, {s})", .{ "DATE '2026-01-01'", "NULL" }, null);
+    try expectDiff(allocator, db, "TIMESTAMPDIFF(YEAR, {s}, {s})", .{ "NULL", "DATE '2026-01-01'" }, null);
+    // QUARTER, which StarRocks lacks, is three of its months.
+    try expectDiff(allocator, db, "TIMESTAMPDIFF(QUARTER, {s}, {s})", .{ "DATE '2026-12-31'", "DATE '2026-01-01'" }, -3);
+    try expectDiff(allocator, db, "TIMESTAMPDIFF(QUARTER, {s}, {s})", .{ "DATE '2026-04-15'", "DATE '2026-01-01'" }, -1);
+
+    // The fixed units truncate the elapsed time: MILLISECOND, SECOND,
+    // MINUTE, HOUR, DAY and WEEK.
+    const fixed = [_]struct { []const u8, []const u8, [6]i64 }{
+        .{ "DATETIME '2026-01-01 00:00:00.8'", "DATETIME '2026-01-01 00:00:01.2'", .{ 400, 0, 0, 0, 0, 0 } },
+        .{ "DATETIME '2026-01-01 00:00:01.2'", "DATETIME '2026-01-01 00:00:00.8'", .{ -400, 0, 0, 0, 0, 0 } },
+        .{ "DATETIME '2026-01-01 00:00:00.5'", "DATETIME '2026-01-02 00:00:00'", .{ 86399500, 86399, 1439, 23, 0, 0 } },
+        .{ "DATETIME '2026-01-02 00:00:00'", "DATETIME '2026-01-01 00:00:00.5'", .{ -86399500, -86399, -1439, -23, 0, 0 } },
+        .{ "DATETIME '2026-01-01 23:00:00'", "DATETIME '2026-01-02 01:00:00'", .{ 7200000, 7200, 120, 2, 0, 0 } },
+        .{ "DATE '2026-01-31'", "DATE '2026-01-01'", .{ -2592000000, -2592000, -43200, -720, -30, -4 } },
+        .{ "DATETIME '2026-01-01 00:00:01'", "DATETIME '2026-01-08 00:00:00'", .{ 604799000, 604799, 10079, 167, 6, 0 } },
+        .{ "DATETIME '2025-12-31 23:58:30'", "DATETIME '2026-01-01 00:00:00'", .{ 90000, 90, 1, 0, 0, 0 } },
+    };
+    const fixed_units = [_][]const u8{ "MILLISECOND", "SECOND", "MINUTE", "HOUR", "DAY", "WEEK" };
+    for (fixed) |c| for (fixed_units, c[2]) |unit, want| {
+        try expectDiff(allocator, db, "TIMESTAMPDIFF({s}, {s}, {s})", .{ unit, c[0], c[1] }, want);
+    };
+
+    // A cohort's month index for an invoice dated `d`, from a customer's
+    // start `s`, in two spellings. The second can meet a same-month pair:
+    // the last day of the month before `s`'s, and the first day of `d`'s.
+    const cohort_a = "CAST(TIMESTAMPDIFF(MONTH, LAST_DAY({s} - INTERVAL 1 MONTH) + INTERVAL 1 DAY, ADDDATE(LAST_DAY(SUBDATE({s}, INTERVAL 1 MONTH)), 1)) AS SIGNED)";
+    const cohort_b = "CAST(TIMESTAMPDIFF(MONTH, LAST_DAY(SUBDATE({s}, INTERVAL 1 MONTH)), ADDDATE(LAST_DAY(SUBDATE({s}, INTERVAL 1 MONTH)), 1)) AS SIGNED)";
+    const cohorts = [_]struct { []const u8, []const u8, i64, i64 }{
+        .{ "DATE '2024-01-31'", "DATE '2024-02-29'", 1, 1 },
+        .{ "DATE '2024-01-31'", "DATE '2024-03-31'", 2, 2 },
+        .{ "DATE '2024-01-31'", "DATE '2026-01-15'", 24, 24 },
+        .{ "DATE '2024-01-31'", "DATE '2026-01-01'", 24, 24 },
+        .{ "DATE '2024-01-31'", "DATE '2025-12-31'", 23, 23 },
+        .{ "DATE '2024-01-31'", "DATE '2023-12-31'", -1, -1 },
+        .{ "DATE '2024-01-31'", "DATETIME '2026-03-31 12:00:00'", 26, 26 },
+        .{ "DATE '2024-02-29'", "DATE '2024-02-29'", 0, 0 },
+        .{ "DATE '2024-02-29'", "DATE '2024-03-31'", 1, 1 },
+        .{ "DATE '2024-02-29'", "DATE '2026-01-15'", 23, 23 },
+        .{ "DATE '2024-02-29'", "DATE '2026-01-01'", 23, 23 },
+        .{ "DATE '2024-02-29'", "DATE '2025-12-31'", 22, 22 },
+        .{ "DATE '2024-02-29'", "DATE '2023-12-31'", -2, -1 },
+        .{ "DATE '2024-02-29'", "DATETIME '2026-03-31 12:00:00'", 25, 25 },
+        .{ "DATE '2024-03-01'", "DATE '2024-02-29'", -1, -1 },
+        .{ "DATE '2024-03-01'", "DATE '2024-03-31'", 0, 0 },
+        .{ "DATE '2024-03-01'", "DATE '2026-01-15'", 22, 22 },
+        .{ "DATE '2024-03-01'", "DATE '2026-01-01'", 22, 22 },
+        .{ "DATE '2024-03-01'", "DATE '2025-12-31'", 21, 21 },
+        .{ "DATE '2024-03-01'", "DATE '2023-12-31'", -3, -2 },
+        .{ "DATE '2024-03-01'", "DATETIME '2026-03-31 12:00:00'", 24, 24 },
+        .{ "DATE '2025-12-31'", "DATE '2024-02-29'", -22, -21 },
+        .{ "DATE '2025-12-31'", "DATE '2024-03-31'", -21, -20 },
+        .{ "DATE '2025-12-31'", "DATE '2026-01-15'", 1, 1 },
+        .{ "DATE '2025-12-31'", "DATE '2026-01-01'", 1, 1 },
+        .{ "DATE '2025-12-31'", "DATE '2025-12-31'", 0, 0 },
+        .{ "DATE '2025-12-31'", "DATE '2023-12-31'", -24, -23 },
+        .{ "DATE '2025-12-31'", "DATETIME '2026-03-31 12:00:00'", 3, 3 },
+        .{ "DATE '2026-01-15'", "DATE '2024-02-29'", -23, -22 },
+        .{ "DATE '2026-01-15'", "DATE '2024-03-31'", -22, -21 },
+        .{ "DATE '2026-01-15'", "DATE '2026-01-15'", 0, 0 },
+        .{ "DATE '2026-01-15'", "DATE '2026-01-01'", 0, 0 },
+        .{ "DATE '2026-01-15'", "DATE '2025-12-31'", -1, -1 },
+        .{ "DATE '2026-01-15'", "DATE '2023-12-31'", -25, -24 },
+        .{ "DATE '2026-01-15'", "DATETIME '2026-03-31 12:00:00'", 2, 2 },
+        .{ "DATE '2026-01-01'", "DATE '2024-02-29'", -23, -22 },
+        .{ "DATE '2026-01-01'", "DATE '2024-03-31'", -22, -21 },
+        .{ "DATE '2026-01-01'", "DATE '2026-01-15'", 0, 0 },
+        .{ "DATE '2026-01-01'", "DATE '2026-01-01'", 0, 0 },
+        .{ "DATE '2026-01-01'", "DATE '2025-12-31'", -1, -1 },
+        .{ "DATE '2026-01-01'", "DATE '2023-12-31'", -25, -24 },
+        .{ "DATE '2026-01-01'", "DATETIME '2026-03-31 12:00:00'", 2, 2 },
+        .{ "DATETIME '2026-01-01 10:00:00'", "DATE '2024-02-29'", -23, -22 },
+        .{ "DATETIME '2026-01-01 10:00:00'", "DATE '2024-03-31'", -22, -21 },
+        .{ "DATETIME '2026-01-01 10:00:00'", "DATE '2026-01-15'", 0, 0 },
+        .{ "DATETIME '2026-01-01 10:00:00'", "DATE '2026-01-01'", 0, 0 },
+        .{ "DATETIME '2026-01-01 10:00:00'", "DATE '2025-12-31'", -1, -1 },
+        .{ "DATETIME '2026-01-01 10:00:00'", "DATE '2023-12-31'", -25, -24 },
+        .{ "DATETIME '2026-01-01 10:00:00'", "DATETIME '2026-03-31 12:00:00'", 2, 2 },
+        .{ "DATETIME '2024-02-29 23:59:59'", "DATE '2024-02-29'", 0, 0 },
+        .{ "DATETIME '2024-02-29 23:59:59'", "DATE '2024-03-31'", 1, 1 },
+        .{ "DATETIME '2024-02-29 23:59:59'", "DATE '2026-01-15'", 23, 23 },
+        .{ "DATETIME '2024-02-29 23:59:59'", "DATE '2026-01-01'", 23, 23 },
+        .{ "DATETIME '2024-02-29 23:59:59'", "DATE '2025-12-31'", 22, 22 },
+        .{ "DATETIME '2024-02-29 23:59:59'", "DATE '2023-12-31'", -2, -1 },
+        .{ "DATETIME '2024-02-29 23:59:59'", "DATETIME '2026-03-31 12:00:00'", 25, 25 },
+    };
+    for (cohorts) |c| {
+        try expectDiff(allocator, db, cohort_a, .{ c[0], c[1] }, c[2]);
+        try expectDiff(allocator, db, cohort_b, .{ c[0], c[1] }, c[3]);
+    }
+
+    // A renewal's month count: one more unless the days of the month match.
+    const renewal = "CASE WHEN DAY({s}) = DAY({s}) THEN TIMESTAMPDIFF(MONTH, {s}, {s}) ELSE TIMESTAMPDIFF(MONTH, {s}, {s}) + 1 END";
+    const renewals = [_]struct { []const u8, []const u8, i64 }{
+        .{ "DATE '2025-01-31'", "DATE '2025-02-28'", 1 },
+        .{ "DATE '2025-01-15'", "DATE '2026-01-15'", 12 },
+        .{ "DATE '2025-01-15'", "DATE '2026-01-14'", 12 },
+        .{ "DATE '2024-02-29'", "DATE '2025-02-28'", 12 },
+        .{ "DATE '2025-03-31'", "DATE '2025-02-28'", 0 },
+        .{ "DATE '2025-01-31'", "DATE '2025-03-31'", 2 },
+        .{ "DATETIME '2025-01-15 10:00:00'", "DATETIME '2025-02-15 09:00:00'", 0 },
+        .{ "DATE '2025-06-30'", "DATE '2025-06-01'", 0 },
+    };
+    for (renewals) |c| try expectDiff(allocator, db, renewal, .{ c[0], c[1], c[0], c[1], c[0], c[1] }, c[2]);
+
+    // The same cohort indexes over columns.
+    try exec(allocator, db, "CREATE TABLE cohort (id BIGINT PRIMARY KEY, s DATETIME, d DATETIME)");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var want_a: std.ArrayList(?[]const u8) = .empty;
+    var want_b: std.ArrayList(?[]const u8) = .empty;
+    for (cohorts, 1..) |c, id| {
+        try exec(allocator, db, try std.fmt.allocPrint(aa, "INSERT INTO cohort VALUES ({d}, {s}, {s})", .{ id, quotedPart(c[0]), quotedPart(c[1]) }));
+        try want_a.append(aa, try std.fmt.allocPrint(aa, "{d}", .{c[2]}));
+        try want_b.append(aa, try std.fmt.allocPrint(aa, "{d}", .{c[3]}));
+    }
+    try exec(allocator, db, "INSERT INTO cohort VALUES (1000, NULL, '2026-01-01')");
+    try want_a.append(aa, null);
+    try want_b.append(aa, null);
+    try expectTexts(allocator, db, try std.fmt.allocPrint(aa, "SELECT CAST(" ++ cohort_a ++ " AS CHAR) FROM cohort ORDER BY id", .{ "s", "d" }), want_a.items);
+    try expectTexts(allocator, db, try std.fmt.allocPrint(aa, "SELECT CAST(" ++ cohort_b ++ " AS CHAR) FROM cohort ORDER BY id", .{ "s", "d" }), want_b.items);
+}
+
+/// Expects `SELECT CAST(<expr> AS CHAR)`, `expr` being `fmt` over `args`,
+/// to give `want`, or NULL.
+fn expectDiff(allocator: std.mem.Allocator, db: anytype, comptime fmt: []const u8, args: anytype, want: ?i64) !void {
+    const sql = try std.fmt.allocPrint(allocator, "SELECT CAST(" ++ fmt ++ " AS CHAR)", args);
+    defer allocator.free(sql);
+    var buf: [24]u8 = undefined;
+    const text: ?[]const u8 = if (want) |w| try std.fmt.bufPrint(&buf, "{d}", .{w}) else null;
+    try expectTexts(allocator, db, sql, &.{text});
+}
+
+/// `'2024-01-31'` from `DATE '2024-01-31'`: a typed literal's quoted part.
+fn quotedPart(literal: []const u8) []const u8 {
+    return literal[std.mem.indexOfScalar(u8, literal, '\'').?..];
+}
+
 test "calendar functions work before 1970" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
