@@ -46,6 +46,13 @@ pub fn isReservedTableName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, reserved_table_prefix);
 }
 
+/// Where a swap sets `table_name`'s original aside: an ALTER's, or a
+/// replacing table build's publish (`TableBuild`). Recovery treats both
+/// alike, since both commit when the new tree takes the name.
+pub fn asideName(buf: []u8, table_name: []const u8) ![]u8 {
+    return std.fmt.bufPrint(buf, aside_prefix ++ "{s}", .{table_name});
+}
+
 /// Delete the shadow and the aside an ALTER of `table_name` may have left.
 pub fn deleteAlterLeftovers(io: Io, schema_dir: Io.Dir, table_name: []const u8) !void {
     var name_buf: [256]u8 = undefined;
@@ -58,8 +65,10 @@ pub fn deleteAlterLeftovers(io: Io, schema_dir: Io.Dir, table_name: []const u8) 
 /// Resolve the ALTER swaps a crash or a persistent refusal interrupted in
 /// `schema_dir`. A swap commits when its shadow takes the table's name, so
 /// an interrupted one rolls back: an aside returns to its table's name, and
-/// a shadow is deleted once its table stands. Runs as the schema opens,
-/// before any of its tables does.
+/// a shadow is deleted once its table stands. A replacing table build's
+/// publish sets its original aside the same way; the schema deletes the
+/// build itself after this. Runs as the schema opens, before any of its
+/// tables does.
 pub fn recoverInterruptedAlters(allocator: Allocator, io: Io, schema_dir: Io.Dir) !void {
     var names: std.ArrayList([]u8) = .empty;
     defer {
@@ -331,7 +340,7 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     var shadow_name_buf: [256]u8 = undefined;
     const shadow_name = try std.fmt.bufPrint(&shadow_name_buf, shadow_prefix ++ "{s}", .{t.name});
     var aside_name_buf: [256]u8 = undefined;
-    const aside_name = try std.fmt.bufPrint(&aside_name_buf, aside_prefix ++ "{s}", .{t.name});
+    const aside_name = try asideName(&aside_name_buf, t.name);
 
     var shadow_dir = try s.schema_dir.createDirPathOpen(t.io, shadow_name, .{});
     var shadow_segs = try shadow_dir.createDirPathOpen(t.io, "segments", .{});

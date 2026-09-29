@@ -58,7 +58,7 @@ fn parseCancelBackend(lc: []const u8, prefix: []const u8) ?u32 {
 pub fn match(
     allocator: Allocator,
     sql: []const u8,
-    current_db: []const u8,
+    current_db: ?[]const u8,
     current_schema: []const u8,
 ) !?Probe {
     const lc = try sql_text.normalizeForCannedMatch(allocator, sql);

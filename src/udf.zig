@@ -533,7 +533,18 @@ pub const ViewRegistry = struct {
 
     /// Register (copies everything). `replace=false` errors on collision.
     pub fn register(self: *ViewRegistry, db: []const u8, v: ViewDef, replace: bool) !void {
+        if (try self.put(db, v, replace)) |previous| previous.deinit(self.allocator);
+    }
+
+    /// `register`, handing back the definition it replaced (null when it
+    /// added one), which the caller owns: `restore` takes it to undo the
+    /// register.
+    pub fn put(self: *ViewRegistry, db: []const u8, v: ViewDef, replace: bool) !?ViewDef {
         try validateName(v.name);
+        // `get`, `contains` and `restore` find only keys that fit the lookup
+        // buffer, so a longer one would register a view nothing reaches.
+        var kbuf: [512]u8 = undefined;
+        if (lookupKey(&kbuf, db, v.name) == null) return Error.FunctionInvalidDefinition;
         const k = try viewKey(self.allocator, db, v.name);
         errdefer self.allocator.free(k);
         const name = try lowerName(self.allocator, v.name);
@@ -549,10 +560,35 @@ pub const ViewRegistry = struct {
         if (gop.found_existing) {
             if (!replace) return Error.ViewAlreadyExists;
             self.allocator.free(k);
-            gop.value_ptr.deinit(self.allocator);
+            const previous = gop.value_ptr.*;
             gop.value_ptr.* = owned;
-        } else {
-            gop.value_ptr.* = owned;
+            return previous;
+        }
+        gop.value_ptr.* = owned;
+        return null;
+    }
+
+    /// Undo a `put` of `name`: reinstate the definition it replaced, taking
+    /// ownership of it, or remove the one it added.
+    pub fn restore(self: *ViewRegistry, db: []const u8, name: []const u8, previous: ?ViewDef) void {
+        var kbuf: [512]u8 = undefined;
+        // `put` refused any name whose key does not fit, so this finds what
+        // it registered.
+        const k = lookupKey(&kbuf, db, name) orelse {
+            if (previous) |p| p.deinit(self.allocator);
+            return;
+        };
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (previous) |p| {
+            // A drop since the `put` took what it registered; the view stays
+            // dropped.
+            const current = self.map.getPtr(k) orelse return p.deinit(self.allocator);
+            current.deinit(self.allocator);
+            current.* = p;
+        } else if (self.map.fetchRemove(k)) |kv| {
+            self.allocator.free(kv.key);
+            kv.value.deinit(self.allocator);
         }
     }
 
@@ -620,7 +656,9 @@ pub const ViewRegistry = struct {
 /// view registry so a bare `FROM viewname` can be expanded inline.
 pub const SqlFnCtx = struct {
     registry: *SqlFnRegistry,
-    db: []const u8,
+    /// The database whose functions and views are in scope; null when the
+    /// session has none, so none are.
+    db: ?[]const u8,
     views: ?*ViewRegistry = null,
     /// Absent = an unqualified `JOIN ... ON` column can't be attributed to
     /// a base-table input.

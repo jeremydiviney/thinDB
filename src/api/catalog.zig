@@ -22,6 +22,8 @@ const zigfn = @import("zigfn.zig");
 const memory = @import("../memory.zig");
 const storage = @import("../storage/storage.zig");
 const StatementGate = @import("../util/statement_gate.zig").StatementGate;
+const write_journal = @import("../storage/write_journal.zig");
+const temp_namespace = @import("temp_namespace.zig");
 
 var zig_fn_seq: u64 = 1;
 
@@ -72,6 +74,32 @@ pub const Catalog = struct {
         return self.statement_gate.acquire(exclusive);
     }
 
+    pub const zig_fn_build_dir_name = "_zigfn_build";
+
+    /// The engine's own directories beside the database directories in the
+    /// root: the XA branch store and commit journal, the per-session temp
+    /// namespaces, and LANGUAGE zig build scratch (which holds the loaded
+    /// libraries). No database takes one of these names in any letter case,
+    /// since Windows and macOS fold case. The set is explicit rather than
+    /// every name with a leading underscore, so a user database such as
+    /// `_staging` keeps working.
+    pub const reserved_database_names = [_][]const u8{
+        write_journal.xa_dir_name,
+        temp_namespace.temp_root_dir_name,
+        zig_fn_build_dir_name,
+    };
+
+    /// The rule every path from a database name to a root directory applies:
+    /// discovery, CREATE, DROP and USE. A database name is one path component
+    /// outside `reserved_database_names`.
+    pub fn validateDatabaseName(name: []const u8) error{InvalidDatabaseName}!void {
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidDatabaseName;
+        if (std.mem.indexOfAny(u8, name, "/\\\x00") != null) return error.InvalidDatabaseName;
+        for (reserved_database_names) |reserved| {
+            if (std.ascii.eqlIgnoreCase(name, reserved)) return error.InvalidDatabaseName;
+        }
+    }
+
     pub fn open(
         allocator: Allocator,
         io: Io,
@@ -96,12 +124,12 @@ pub const Catalog = struct {
             else => return err,
         };
         errdefer ownership_lock.close(io);
-        try @import("../storage/write_journal.zig").recover(allocator, io, root_dir);
+        try write_journal.recover(allocator, io, root_dir);
         // Best-effort sweep of any `_temp/` left behind by an ungraceful
         // exit. Per-session dirs only ever belong to a process that's
         // currently alive; if we're booting fresh, every previous tenant
         // is gone.
-        @import("temp_namespace.zig").sweepStaleTempDirs(io, root_dir);
+        temp_namespace.sweepStaleTempDirs(io, root_dir);
 
         // The shared cross-query memory pool. A caller-provided pool (multi-
         // Catalog processes sharing one budget) is adopted as-is; otherwise
@@ -301,7 +329,8 @@ pub const Catalog = struct {
 
     /// Register a view from its parsed CREATE statement and persist the
     /// canonical statement to `<db>/_views/<name>.sql`. `skip_persist=true`
-    /// on the load-from-disk path.
+    /// on the load-from-disk path. A definition that fails to persist is
+    /// taken back, so a failed call leaves the registry as it found it.
     pub fn registerView(
         self: *Catalog,
         db_name: []const u8,
@@ -316,20 +345,30 @@ pub const Catalog = struct {
         try text.appendSlice(self.allocator, cv.body);
 
         const db = self.database(db_name) orelse return Error.DatabaseNotFound;
-        try self.views.register(db_name, .{
+        const previous = try self.views.put(db_name, .{
             .name = cv.name,
             .materialized = cv.materialized,
             .body = cv.body,
             .create_text = text.items,
         }, cv.or_replace or skip_persist);
+        if (!skip_persist) self.persistView(db, cv.name, text.items) catch |err| {
+            self.views.restore(db_name, cv.name, previous);
+            return err;
+        };
+        if (previous) |p| p.deinit(self.views.allocator);
+    }
 
-        if (skip_persist) return;
+    fn persistView(self: *Catalog, db: *Database, name: []const u8, text: []const u8) !void {
         var dir = db.db_dir.openDir(self.io, "_views", .{}) catch
             try db.db_dir.createDirPathOpen(self.io, "_views", .{});
         defer dir.close(self.io);
         var namebuf: [300]u8 = undefined;
-        const fname = try fnFileName(&namebuf, cv.name);
-        try dir.writeFile(self.io, .{ .sub_path = fname, .data = text.items });
+        const fname = try fnFileName(&namebuf, name);
+        var tmpbuf: [304]u8 = undefined;
+        // Not `.sql`, so `loadViews` never reads a half-written one.
+        const tmp_name = try std.fmt.bufPrint(&tmpbuf, "{s}.tmp", .{fname});
+        // A replaced definition stays whole until the new one takes its name.
+        try storage.writeFileAtomic(self.io, dir, tmp_name, fname, text, self.config.sync_mode != .none);
     }
 
     pub fn dropView(self: *Catalog, db_name: []const u8, name: []const u8) !bool {
@@ -394,7 +433,7 @@ pub const Catalog = struct {
             try pdir.writeFile(self.io, .{ .sub_path = pname, .data = source });
             return;
         }
-        const scratch_rel = try std.fmt.allocPrint(self.allocator, "_zigfn_build/{s}_{s}", .{ db_name, lower });
+        const scratch_rel = try std.fmt.allocPrint(self.allocator, "{s}/{s}_{s}", .{ zig_fn_build_dir_name, db_name, lower });
         defer self.allocator.free(scratch_rel);
         var scratch_dir = try self.root_dir.createDirPathOpen(self.io, scratch_rel, .{});
         defer scratch_dir.close(self.io);
@@ -552,7 +591,7 @@ pub const Catalog = struct {
     }
 
     /// Scan `root_dir` for subdirectories and adopt each one as a Database
-    /// in `out_map`. Skips reserved names (currently just `_temp/`). Used
+    /// in `out_map`, except the engine's own (`validateDatabaseName`). Used
     /// at Catalog open to surface previously-persisted databases.
     fn discoverDatabasesOnDisk(
         allocator: Allocator,
@@ -561,7 +600,6 @@ pub const Catalog = struct {
         config: Config,
         out_map: *std.StringHashMap(*Database),
     ) !void {
-        const temp_name = @import("temp_namespace.zig").temp_root_dir_name;
         // The root_dir handle may not have iterate-access; try opening a
         // sibling handle with iterate. If that fails (e.g. permissions),
         // skip discovery — non-fatal, callers can still create databases
@@ -571,8 +609,7 @@ pub const Catalog = struct {
         var dir_it = iter_dir.iterate();
         while (try dir_it.next(io)) |entry| {
             if (entry.kind != .directory) continue;
-            if (std.mem.eql(u8, entry.name, temp_name)) continue;
-            if (std.mem.eql(u8, entry.name, "_xa")) continue;
+            validateDatabaseName(entry.name) catch continue;
             if (out_map.get(entry.name) != null) continue;
             // Database.create is idempotent on existing on-disk state: it
             // re-opens the dir, re-opens the `public` schema, and the
@@ -611,6 +648,7 @@ pub const Catalog = struct {
     }
 
     pub fn createDatabase(self: *Catalog, name: []const u8) !*Database {
+        try validateDatabaseName(name);
         const lease = try self.acquireStatement(false);
         defer lease.release();
         self.databases_mutex.lockUncancelable(self.io);
@@ -635,6 +673,7 @@ pub const Catalog = struct {
     /// Get-or-create. Used by the back-compat `Database.open` shim to
     /// adopt an existing on-disk database directory without erroring.
     pub fn createOrOpenDatabase(self: *Catalog, name: []const u8) !*Database {
+        try validateDatabaseName(name);
         const lease = try self.acquireStatement(false);
         defer lease.release();
         self.databases_mutex.lockUncancelable(self.io);
@@ -647,22 +686,16 @@ pub const Catalog = struct {
         return db;
     }
 
+    /// Drops only a loaded database. A directory the catalog never adopted,
+    /// the engine's own or one discovery skipped, is never deleted by name.
     pub fn dropDatabase(self: *Catalog, name: []const u8) !void {
+        try validateDatabaseName(name);
         const lease = try self.acquireStatement(true);
         defer lease.release();
         self.databases_mutex.lockUncancelable(self.io);
-        const maybe = self.databases.fetchRemove(name);
+        const entry = self.databases.fetchRemove(name);
         self.databases_mutex.unlock(self.io);
-
-        if (maybe) |entry| {
-            entry.value.closeInPlace();
-        } else {
-            var probe = self.root_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
-                error.FileNotFound => return Error.DatabaseNotFound,
-                else => return err,
-            };
-            probe.close(self.io);
-        }
+        (entry orelse return Error.DatabaseNotFound).value.closeInPlace();
 
         // Its views and functions leave memory with the database, before the
         // directory: a delete that fails partway must not hand them to a

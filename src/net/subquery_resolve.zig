@@ -209,7 +209,7 @@ fn sessionInfoExpr(ctx: *CompileCtx, name: []const u8) !?ir.Expr {
         for (user_fns) |f| if (std.ascii.eqlIgnoreCase(name, f)) break :text session.user orelse return null;
         if (session.dialect != .mysql) return null;
         if (!std.ascii.eqlIgnoreCase(name, "database") and !std.ascii.eqlIgnoreCase(name, "schema")) return null;
-        if (session.current_schema.len == 0) return .{ .null_lit = .string };
+        if (session.current_db == null or session.current_schema.len == 0) return .{ .null_lit = .string };
         break :text session.current_schema;
     };
     return .{ .lit = .{ .text = try (try ctx.subqueryArena()).dupe(u8, text) } };
@@ -342,7 +342,7 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                     // Kernels carry no Io, so UUID() takes its entropy as a
                     // fresh per-statement seed from the database's.
                     var seed: [8]u8 = undefined;
-                    ctx.db.io.random(&seed);
+                    ctx.catalog.io.random(&seed);
                     const args = try (try ctx.subqueryArena()).alloc(ir.Expr, 1);
                     args[0] = .{ .lit = .{ .bigint = std.mem.readInt(i64, &seed, .little) } };
                     e.* = .{ .call = .{ .fn_name = c.fn_name, .args = args } };
@@ -735,7 +735,7 @@ fn analyzeFilteredScan(ctx: *CompileCtx, below: *const ir.Op) !?CorrelationInfo 
         .scan => |*s| s,
         else => return null,
     };
-    const catalog = local.catalogFor(ctx.db) orelse return null;
+    const catalog = ctx.catalog;
     const t = local.resolveTable(catalog, ctx.session.*, scan_op.table) catch return null;
 
     var info = CorrelationInfo.init();

@@ -53,7 +53,7 @@ test "tcp: scan round-trips a small batch over a real socket" {
     defer server.close();
 
     // Seed via the underlying Database (until createTable RPC lands).
-    const t = try server.db.table("orders", schema_v1, opts_v1);
+    const t = try server.db.?.table("orders", schema_v1, opts_v1);
     try t.insert(&.{
         .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
         .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
@@ -136,7 +136,7 @@ test "tcp: createTable round-trips a full schema (columns + order_key + unique)"
 
     // The server now has the table — seed it via the in-process Database
     // pointer (insert RPC lands next), then verify by scanning over TCP.
-    const t = server.db.tables.get("products") orelse unreachable;
+    const t = server.db.?.tables.get("products") orelse unreachable;
     try t.insert(&.{
         .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
         .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
@@ -171,7 +171,7 @@ test "tcp: insert rows + read back via scan, all over the socket" {
     defer server.close();
 
     // Pre-create the table in-process (createTable RPC is tested separately).
-    _ = try server.db.table("orders", schema_v1, opts_v1);
+    _ = try server.db.?.table("orders", schema_v1, opts_v1);
 
     const ServerCtx = struct {
         server: *thindb.TcpServer,
@@ -257,7 +257,7 @@ test "tcp: insert with nullable fields preserves nulls through scan" {
         .unique = true,
     };
     const ok = [_][]const u8{"id"};
-    _ = try server.db.table("events", nullable_schema, .{
+    _ = try server.db.?.table("events", nullable_schema, .{
         .order_key = &ok,
         .unique = true,
         .row_group_size = 4,
@@ -334,7 +334,7 @@ test "tcp: insert accepts the &.{ ... } tuple shape over the wire" {
     defer server.destroy();
     defer server.close();
 
-    _ = try server.db.table("orders", schema_v1, opts_v1);
+    _ = try server.db.?.table("orders", schema_v1, opts_v1);
 
     const ServerCtx = struct {
         server: *thindb.TcpServer,
@@ -392,7 +392,7 @@ test "tcp: alterTable add column populates default + appears in scan output" {
     defer server.close();
 
     // Seed in-process so we have rows to verify the default-fill against.
-    const t = try server.db.table("orders", schema_v1, opts_v1);
+    const t = try server.db.?.table("orders", schema_v1, opts_v1);
     try t.insert(&.{
         .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
         .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = true, .tag = "b" },
@@ -470,7 +470,7 @@ test "tcp: auth accepts matching token, rejects missing + wrong token" {
     defer server.close();
     server.auth_token = "s3cret-token-do-not-reuse";
 
-    _ = try server.db.table("t", schema_v1, opts_v1);
+    _ = try server.db.?.table("t", schema_v1, opts_v1);
 
     const ServerCtx = struct {
         server: *thindb.TcpServer,
@@ -549,7 +549,7 @@ test "tcp: compression round-trips a large scan when both sides opt in" {
     // Seed enough rows that the resulting batch payload exceeds the
     // compression threshold (4 KB). 2_000 rows × ~20 bytes/row =
     // ~40 KB raw — comfortably past the threshold.
-    const t = try server.db.table("big", schema_v1, opts_v1);
+    const t = try server.db.?.table("big", schema_v1, opts_v1);
     var i: i64 = 0;
     while (i < 2_000) : (i += 1) {
         try t.insert(&.{.{ .id = i, .qty = @as(i32, @intCast(i)), .active = true, .tag = "compressed" }});
@@ -615,7 +615,7 @@ test "tcp: resp_error carries a typed code, client maps to typed Error" {
     defer server.close();
 
     // Seed one table so we can trigger TableAlreadyExists too.
-    _ = try server.db.table("existing", schema_v1, opts_v1);
+    _ = try server.db.?.table("existing", schema_v1, opts_v1);
 
     const ServerCtx = struct {
         server: *thindb.TcpServer,
@@ -675,7 +675,7 @@ test "tcp: dropTable removes the table and frees its directory" {
     defer server.destroy();
     defer server.close();
 
-    const t = try server.db.table("victims", schema_v1, opts_v1);
+    const t = try server.db.?.table("victims", schema_v1, opts_v1);
     try t.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 5), .active = true, .tag = "x" }});
     try t.flush();
 
@@ -735,7 +735,7 @@ test "tcp: delete with leaf predicate removes matching rows + returns count" {
     defer server.destroy();
     defer server.close();
 
-    const t = try server.db.table("orders", schema_v1, opts_v1);
+    const t = try server.db.?.table("orders", schema_v1, opts_v1);
     try t.insert(&.{
         .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
         .{ .id = @as(i64, 2), .qty = @as(i32, 20), .active = false, .tag = "b" },
@@ -798,7 +798,7 @@ test "tcp: query with where + limit returns the right rows" {
     defer server.destroy();
     defer server.close();
 
-    const t = try server.db.table("orders", schema_v1, opts_v1);
+    const t = try server.db.?.table("orders", schema_v1, opts_v1);
     try t.insert(&.{
         .{ .id = @as(i64, 1), .qty = @as(i32, 10), .active = true, .tag = "a" },
         .{ .id = @as(i64, 2), .qty = @as(i32, 100), .active = true, .tag = "b" },
