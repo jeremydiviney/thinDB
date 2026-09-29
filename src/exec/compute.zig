@@ -2357,8 +2357,10 @@ fn nullifConstantPlaced(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan,
 /// their text, and otherwise each argument converts to its parameter
 /// (`scalar_fn.convertedArgs`). Literals are converted in place; everything
 /// else goes through the typed cast `CAST(x AS t)` lowers to, or, for text
-/// read as a number, the reading MySQL gives it with no CAST. Null when no
-/// conversion applies, so the rewritten call can't recurse again.
+/// read as a number, the reading MySQL gives it with no CAST. A function that
+/// reads its arguments as CAST does (`scalar_fn.readsArgsAsCast`) takes
+/// that cast for every one. Null when no conversion applies, so the rewritten
+/// call can't recurse again.
 fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
     const args = try aa.alloc(Expr, c.args.len);
     // A literal slot may hold a retyped value; a decimal one keeps its digits'
@@ -2382,8 +2384,10 @@ fn retypedCall(aa: Allocator, udf_registry: ?*const udf_mod.UdfRegistry, c: Expr
         return if (changed) Expr{ .call = .{ .fn_name = c.fn_name, .args = args } } else null;
     };
     const targets = try scalar_fn.convertedArgs(aa, udf_registry, c.fn_name, arg_types) orelse return null;
+    const as_cast = scalar_fn.readsArgsAsCast(c.fn_name);
     for (args, arg_types, targets) |*a, given, target| {
-        if (target) |t| a.* = try convertedArg(aa, a.*, given, t) orelse return null;
+        const t = target orelse continue;
+        a.* = (if (as_cast) try castCall(aa, a.*, t) else try convertedArg(aa, a.*, given, t)) orelse return null;
     }
     return Expr{ .call = .{ .fn_name = c.fn_name, .args = args } };
 }
@@ -2402,6 +2406,10 @@ fn convertedArg(aa: Allocator, e: Expr, given: Type, target: Type) !?Expr {
         var v = lv;
         if (predicate_mod.coerceValueRounded(&v, target)) |_| return Expr{ .lit = v } else |_| {}
     };
+    return castCall(aa, e, target);
+}
+
+fn castCall(aa: Allocator, e: Expr, target: Type) !?Expr {
     const name = try scalar_fn.castFnName(aa, target) orelse return null;
     return Expr{ .call = .{ .fn_name = name, .args = try aa.dupe(Expr, &.{e}) } };
 }

@@ -392,18 +392,40 @@ pub fn unixTimestampKernel(allocator: Allocator, args: []const ColumnView, out: 
 
 const LAST_UNIX_SECOND: i64 = @divFloor(common.LAST_DATETIME_MICROS, std.time.us_per_s);
 
-/// FROM_UNIXTIME: the DATETIME `n` seconds after 1970-01-01 00:00:00 UTC. A
-/// negative count is NULL, as in StarRocks and MySQL, and so is one past
-/// 9999-12-31 23:59:59, the end of the DATETIME range. StarRocks stops 16
-/// hours earlier, at 9999-12-31 07:59:59, a time-zone guard band; thinDB
-/// keeps one calendar end for every function instead.
+/// The moment `count` seconds after 1970-01-01 00:00:00 UTC, or null for a
+/// negative count, as in StarRocks and MySQL, or for one past 9999-12-31
+/// 23:59:59, the end of the DATETIME range. StarRocks stops 16 hours
+/// earlier, at 9999-12-31 07:59:59, a time-zone guard band; thinDB keeps one
+/// calendar end for every function instead.
+fn unixMoment(count: i64) ?i64 {
+    if (count < 0 or count > LAST_UNIX_SECOND) return null;
+    return count * std.time.us_per_s;
+}
+
+fn unixMomentAt(counts: ColumnView, row: usize) ?i64 {
+    return if (counts.isValid(row)) unixMoment(counts.data.bigint[row]) else null;
+}
+
+/// FROM_UNIXTIME(n): the DATETIME `unixMoment` gives. A count that isn't an
+/// integer is read as CAST reads it (`scalar_fn.readsArgsAsCast`).
 pub fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();
-    const counts = args[0].data.bigint;
     for (0..row_count) |i| {
-        const valid = args[0].isValid(i) and counts[i] >= 0 and counts[i] <= LAST_UNIX_SECOND;
-        try out.data.datetime.append(allocator, if (valid) counts[i] * std.time.us_per_s else 0);
-        try out.appendValidBit(allocator, base + i, valid);
+        const moment = unixMomentAt(args[0], i);
+        try out.data.datetime.append(allocator, moment orelse 0);
+        try out.appendValidBit(allocator, base + i, moment != null);
+    }
+}
+
+/// FROM_UNIXTIME(n, format): that moment as DATE_FORMAT renders it.
+pub fn fromUnixtimeFormatKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    const formats = stringViewOf(args[1]);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        const fmt = if (args[1].isValid(i)) formats.rowBytes(i) else null;
+        try appendFormatted(allocator, out, &buf, base + i, unixMomentAt(args[0], i), fmt);
     }
 }
 
@@ -856,39 +878,43 @@ pub const timestampAddDatetimeKernel = TimestampAdd(.datetime).kernel;
 // hundred ns.
 // ---------------------------------------------------------------------------
 
-fn dateFormatRow(
-    allocator: Allocator,
-    out: *ColumnStore,
-    fmt: []const u8,
-    days: i32,
-    micros_into_day: i64,
-) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try datefmt.format(allocator, &buf, fmt, days, micros_into_day);
+/// Appends `micros` rendered under `fmt` (`datefmt.mysqlFormat`) as output
+/// row `row`: NULL when either is NULL or the format is empty, as in
+/// StarRocks. `buf` is scratch reused across rows.
+fn appendFormatted(allocator: Allocator, out: *ColumnStore, buf: *std.ArrayList(u8), row: usize, micros: ?i64, fmt: ?[]const u8) !void {
+    const mysql_fmt = if (fmt) |f| datefmt.mysqlFormat(f) else null;
+    if (micros == null or mysql_fmt == null) {
+        try stringStoreOf(out).appendValue(allocator, "");
+        return out.appendValidBit(allocator, row, false);
+    }
+    buf.clearRetainingCapacity();
+    try datefmt.format(allocator, buf, mysql_fmt.?, daysFromDatetime(micros.?), @mod(micros.?, std.time.us_per_day));
     try stringStoreOf(out).appendValue(allocator, buf.items);
+    try out.appendValidBit(allocator, row, true);
 }
 
-pub fn dateFormatDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const dts = args[0].data.datetime;
-    const fmt_sv = stringViewOf(args[1]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const micros = dts[i];
-        const days = daysFromDatetime(micros);
-        const micros_into_day = @mod(micros, std.time.us_per_day);
-        try dateFormatRow(allocator, out, fmt_sv.rowBytes(i), days, micros_into_day);
-    }
+fn DateFormat(comptime temporal: Temporal) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const base = out.data.rowCount();
+            const values = @field(args[0].data, @tagName(temporal));
+            const formats = stringViewOf(args[1]);
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            for (0..row_count) |i| {
+                const micros: ?i64 = if (!args[0].isValid(i)) null else switch (temporal) {
+                    .date => @as(i64, values[i]) * std.time.us_per_day,
+                    .datetime => values[i],
+                };
+                const fmt = if (args[1].isValid(i)) formats.rowBytes(i) else null;
+                try appendFormatted(allocator, out, &buf, base + i, micros, fmt);
+            }
+        }
+    };
 }
 
-pub fn dateFormatDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const ds = args[0].data.date;
-    const fmt_sv = stringViewOf(args[1]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try dateFormatRow(allocator, out, fmt_sv.rowBytes(i), ds[i], 0);
-    }
-}
+pub const dateFormatDatetimeKernel = DateFormat(.datetime).kernel;
+pub const dateFormatDateKernel = DateFormat(.date).kernel;
 
 /// A DATE as its number `YYYYMMDD` (`CAST(d AS SIGNED)`, `d + 0`).
 pub fn dateToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

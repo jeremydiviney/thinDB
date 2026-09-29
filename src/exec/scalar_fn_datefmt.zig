@@ -173,6 +173,20 @@ fn dayOrdinalSuffix(day: u32) []const u8 {
     };
 }
 
+/// The MySQL format string DATE_FORMAT and FROM_UNIXTIME render `fmt` by.
+/// StarRocks also takes three Java-style patterns, spelled exactly so, and
+/// gives NULL for an empty format, so an empty format has none.
+pub fn mysqlFormat(fmt: []const u8) ?[]const u8 {
+    if (fmt.len == 0) return null;
+    const java_patterns = [_]struct { java: []const u8, mysql: []const u8 }{
+        .{ .java = "yyyy-MM-dd", .mysql = "%Y-%m-%d" },
+        .{ .java = "yyyy-MM-dd HH:mm:ss", .mysql = "%Y-%m-%d %H:%i:%s" },
+        .{ .java = "yyyyMMdd", .mysql = "%Y%m%d" },
+    };
+    for (java_patterns) |p| if (std.mem.eql(u8, fmt, p.java)) return p.mysql;
+    return fmt;
+}
+
 /// Appends `days` + `micros_into_day` rendered under a MySQL format string.
 /// An unknown specifier prints its letter, as MySQL does.
 pub fn format(allocator: Allocator, buf: *std.ArrayList(u8), fmt: []const u8, days: i32, micros_into_day: i64) !void {
