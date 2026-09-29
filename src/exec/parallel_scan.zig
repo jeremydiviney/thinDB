@@ -720,6 +720,10 @@ pub const ParallelScan = struct {
     wbufs: []WorkerBuf = &.{},
     emit_views: []ColumnView = &.{},
     emit_cursor: usize = 0,
+    /// The buffer behind the last emitted batch. Batch data lives only until
+    /// the next pull (this scan never claims `stableData`), so that pull
+    /// frees it and hands its bytes back to the budget.
+    held: ?usize = null,
     reserved_bytes: usize = 0,
 
     // Fused projection Compute (set via tryFuseCompute): when present, each
@@ -2055,14 +2059,35 @@ pub const ParallelScan = struct {
     /// Emit each worker's materialized survivor buffer as one batch, in slice
     /// order (worker 0 first) — the canonical serial row order.
     fn nextMaterialize(self: *ParallelScan) !?Batch {
+        if (self.held) |i| {
+            self.held = null;
+            const t_free = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+            self.freeWorkerBuf(&self.wbufs[i]);
+            if (exec.prof.enabled) exec.prof.addPhase("pscan.emit.free_buffers", @intCast(exec.prof.nowTicks() - t_free));
+        }
         while (self.emit_cursor < self.wbufs.len) {
             const wb = &self.wbufs[self.emit_cursor];
             self.emit_cursor += 1;
             if (wb.row_count == 0) continue;
+            self.held = self.emit_cursor - 1;
             for (wb.columns, self.emit_views) |*c, *v| v.* = c.view();
             return Batch{ .schema = self.out_schema, .values = self.emit_views, .row_count = wb.row_count };
         }
         return null;
+    }
+
+    /// Frees a buffer's column data and releases its share of the
+    /// `.materialize` reservation. Keeps `row_count` and the ticks, which
+    /// profiling reads. A second call is a no-op.
+    fn freeWorkerBuf(self: *ParallelScan, wb: *WorkerBuf) void {
+        for (wb.columns) |*c| c.deinit(self.worker_alloc);
+        if (wb.columns.len > 0) self.worker_alloc.free(wb.columns);
+        wb.columns = &.{};
+        const bytes = @min(wb.bytes, self.reserved_bytes);
+        wb.bytes = 0;
+        if (bytes == 0) return;
+        if (self.acct) |a| a.release(.materialize, bytes);
+        self.reserved_bytes -= bytes;
     }
 
     /// Run one `next()` on every live worker concurrently, then stage their
