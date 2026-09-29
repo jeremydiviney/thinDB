@@ -389,3 +389,79 @@ test "a text literal keeps its time of day in date functions and stays text wher
     }
     try expectStrings(allocator, db, "SELECT CAST(DATE_ADD('abc', INTERVAL 1 DAY) AS CHAR) FROM one", &.{null});
 }
+
+test "text that isn't a literal reads as CAST reads it where a date function wants a date or datetime, as in StarRocks (issue #412)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE s (id BIGINT PRIMARY KEY, s VARCHAR(40))");
+    try exec(allocator, db, "INSERT INTO s VALUES (1, '2026-01-01 10:30:00'), (2, '2026-01-31'), (3, '2026/1/31 10:00'), " ++
+        "(4, '2026-02-29'), (5, '20260131'), (6, 'abc'), (7, ''), (8, NULL)");
+
+    // Expected values are StarRocks', one per row of `s`: text takes a
+    // DATETIME parameter before a DATE one, and text that doesn't read is
+    // NULL.
+    const cases = .{
+        .{ "DATE_ADD(s, INTERVAL 1 DAY)", [_]?[]const u8{ "2026-01-02 10:30:00", "2026-02-01 00:00:00", "2026-02-01 10:00:00", null, "2026-02-01 00:00:00", null, null, null } },
+        .{ "s + INTERVAL 1 MONTH", [_]?[]const u8{ "2026-02-01 10:30:00", "2026-02-28 00:00:00", "2026-02-28 10:00:00", null, "2026-02-28 00:00:00", null, null, null } },
+        .{ "DATE_SUB(s, INTERVAL 1 HOUR)", [_]?[]const u8{ "2026-01-01 09:30:00", "2026-01-30 23:00:00", "2026-01-31 09:00:00", null, "2026-01-30 23:00:00", null, null, null } },
+        .{ "TIMESTAMPADD(MINUTE, 90, s)", [_]?[]const u8{ "2026-01-01 12:00:00", "2026-01-31 01:30:00", "2026-01-31 11:30:00", null, "2026-01-31 01:30:00", null, null, null } },
+        .{ "YEAR(s)", [_]?[]const u8{ "2026", "2026", "2026", null, "2026", null, null, null } },
+        .{ "MONTH(s)", [_]?[]const u8{ "1", "1", "1", null, "1", null, null, null } },
+        .{ "DAY(s)", [_]?[]const u8{ "1", "31", "31", null, "31", null, null, null } },
+        .{ "QUARTER(s)", [_]?[]const u8{ "1", "1", "1", null, "1", null, null, null } },
+        .{ "DAYOFWEEK(s)", [_]?[]const u8{ "5", "7", "7", null, "7", null, null, null } },
+        .{ "DAYOFYEAR(s)", [_]?[]const u8{ "1", "31", "31", null, "31", null, null, null } },
+        .{ "WEEK(s, 1)", [_]?[]const u8{ "1", "5", "5", null, "5", null, null, null } },
+        .{ "YEARWEEK(s)", [_]?[]const u8{ "202552", "202604", "202604", null, "202604", null, null, null } },
+        .{ "WEEKOFYEAR(s)", [_]?[]const u8{ "1", "5", "5", null, "5", null, null, null } },
+        .{ "LAST_DAY(s)", [_]?[]const u8{ "2026-01-31", "2026-01-31", "2026-01-31", null, "2026-01-31", null, null, null } },
+        .{ "DAYNAME(s)", [_]?[]const u8{ "Thursday", "Saturday", "Saturday", null, "Saturday", null, null, null } },
+        .{ "MONTHNAME(s)", [_]?[]const u8{ "January", "January", "January", null, "January", null, null, null } },
+        .{ "TO_DAYS(s)", [_]?[]const u8{ "739982", "740012", "740012", null, "740012", null, null, null } },
+        .{ "DATEDIFF(s, '2026-01-01')", [_]?[]const u8{ "0", "30", "30", null, "30", null, null, null } },
+        .{ "DATEDIFF('2026-03-01', s)", [_]?[]const u8{ "59", "29", "29", null, "29", null, null, null } },
+        .{ "DATE_DIFF('hour', s, '2026-01-01')", [_]?[]const u8{ "10", "720", "730", null, "720", null, null, null } },
+        .{ "TIMESTAMPDIFF(HOUR, '2026-01-01', s)", [_]?[]const u8{ "10", "720", "730", null, "720", null, null, null } },
+        .{ "TIMESTAMPDIFF(MONTH, s, '2026-03-01')", [_]?[]const u8{ "1", "1", "1", null, "1", null, null, null } },
+        .{ "MONTHS_DIFF(s, '2025-11-15')", [_]?[]const u8{ "1", "2", "2", null, "2", null, null, null } },
+        .{ "DATE_FORMAT(s, '%Y-%m-%d %H:%i')", [_]?[]const u8{ "2026-01-01 10:30", "2026-01-31 00:00", "2026-01-31 10:00", null, "2026-01-31 00:00", null, null, null } },
+        .{ "DATE_TRUNC('month', s)", [_]?[]const u8{ "2026-01-01 00:00:00", "2026-01-01 00:00:00", "2026-01-01 00:00:00", null, "2026-01-01 00:00:00", null, null, null } },
+        .{ "UNIX_TIMESTAMP(s)", [_]?[]const u8{ "1767263400", "1769817600", "1769853600", null, "1769817600", null, null, null } },
+    };
+    inline for (cases) |c| {
+        const want: [8]?[]const u8 = c[1];
+        try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM s ORDER BY id", &want);
+    }
+
+    const in_2026 = try collectBigints(allocator, db, "SELECT id FROM s WHERE YEAR(s) = 2026 ORDER BY id");
+    defer allocator.free(in_2026);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 5 }, in_2026);
+
+    // Any text expression reads so, beside literals of either kind; where
+    // text fits the call, it stays text.
+    const expr = "IF(id = 1, '2026-01-01 10:30:00', NULL)";
+    const later = "IF(id = 1, '2026-01-02 01:00:00', NULL)";
+    const expr_cases = .{
+        .{ "DATE_ADD(" ++ expr ++ ", INTERVAL 1 DAY)", "2026-01-02 10:30:00" },
+        .{ "DATE_ADD(CONCAT('2026-01-', id), INTERVAL 1 DAY)", "2026-01-02 00:00:00" },
+        .{ "DATEDIFF(" ++ later ++ ", " ++ expr ++ ")", "1" },
+        .{ "DATEDIFF(" ++ later ++ ", '2026-01-01')", "1" },
+        .{ "DATEDIFF(" ++ later ++ ", DATE '2026-01-01')", "1" },
+        .{ "DATE_DIFF('hour', " ++ later ++ ", " ++ expr ++ ")", "14" },
+        .{ "TIMESTAMPDIFF(MINUTE, " ++ expr ++ ", " ++ later ++ ")", "870" },
+        .{ "DATE_TRUNC('hour', " ++ expr ++ ")", "2026-01-01 10:00:00" },
+        .{ "TO_DATE(" ++ expr ++ ")", "2026-01-01" },
+        .{ "DATE(" ++ expr ++ ")", "2026-01-01" },
+        .{ "COALESCE(" ++ expr ++ ", DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "GREATEST(" ++ expr ++ ", DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "IFNULL(" ++ expr ++ ", DATE '2026-01-01')", "2026-01-01 10:30:00" },
+    };
+    try exec(allocator, db, "CREATE TABLE one (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO one VALUES (1)");
+    inline for (expr_cases) |c| {
+        try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM one", &.{c[1]});
+    }
+}
