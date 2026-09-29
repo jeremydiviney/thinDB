@@ -268,6 +268,17 @@ pub const ColumnStore = struct {
         };
     }
 
+    /// Bytes the store's buffers hold, spare capacity included: what
+    /// `deinit` hands back to the allocator.
+    pub fn heldBytes(self: ColumnStore) usize {
+        const validity = if (self.nulls) |n| n.capacity else 0;
+        return validity + switch (self.data) {
+            .varchar, .string, .char, .json => |ss| ss.offsets.capacity * @sizeOf(u32) + ss.bytes.capacity +
+                if (ss.wide_offsets) |wo| wo.capacity * @sizeOf(u64) else 0,
+            inline else => |list| list.capacity * @sizeOf(std.meta.Elem(@TypeOf(list.items))),
+        };
+    }
+
     pub fn clear(self: *ColumnStore) void {
         self.data.clear();
         if (self.nulls) |*n| n.clearRetainingCapacity();

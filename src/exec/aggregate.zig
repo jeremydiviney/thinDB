@@ -131,7 +131,7 @@ pub const AggFunc = enum {
 /// grow without bound. COUNT(DISTINCT) (a per-group set), PERCENTILE (keeps every
 /// value), GROUP_CONCAT (keeps every value), and UDAFs (opaque state) are
 /// excluded; count/sum/min/max/avg/stddev/variance all keep fixed-size state.
-fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
+pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
         .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
