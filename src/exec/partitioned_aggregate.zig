@@ -56,19 +56,27 @@ const Partition = struct {
     agg_done: bool = false,
 };
 
-/// Single-batch source over a partition's gathered input columns — the serial
-/// Aggregate drains it exactly like a scan leaf.
+/// Source over a partition's gathered input columns — the serial Aggregate
+/// drains it exactly like a scan leaf, in scan-sized windows. The Aggregate
+/// sizes each batch for its worst case (every row a new group, every value a
+/// new distinct pair), so one partition-sized batch made a 93M-row partition
+/// with five groups reserve state for 134M groups (issue #375).
 const InputScan = struct {
     schema: []const Column,
+    source: []const ColumnView,
     views: []ColumnView,
     rows: usize,
-    yielded: bool = false,
+    offset: usize = 0,
+
+    /// A multiple of 8, so each window's validity bitmap starts on a byte.
+    const batch_rows: usize = 64 * 1024;
 
     pub fn next(self: *InputScan) !?Batch {
-        if (self.yielded) return null;
-        self.yielded = true;
-        if (self.rows == 0) return null;
-        return Batch{ .schema = self.schema, .values = self.views, .row_count = self.rows };
+        if (self.offset >= self.rows) return null;
+        const take = @min(batch_rows, self.rows - self.offset);
+        for (self.source, self.views) |src, *view| view.* = engine.transform.subViewAligned(src, self.offset, take);
+        self.offset += take;
+        return Batch{ .schema = self.schema, .values = self.views, .row_count = take };
     }
     pub fn deinit(_: *InputScan) void {}
     pub fn outputSchema(self: *InputScan) []const Column {
@@ -392,7 +400,8 @@ pub const PartitionedAggregate = struct {
 
         const in_views = try aa.alloc(ColumnView, up_schema.len);
         for (part.in_cols, in_views) |*store, *v| v.* = store.view();
-        var scan = InputScan{ .schema = up_schema, .views = in_views, .rows = part.in_rows };
+        const window_views = try aa.alloc(ColumnView, up_schema.len);
+        var scan = InputScan{ .schema = up_schema, .source = in_views, .views = window_views, .rows = part.in_rows };
         var permuted_scan: PermutedInputScan = undefined;
 
         // These columns are already stable in the partition arena, so sort a
@@ -683,6 +692,7 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
 
     var views: [4]ColumnView = undefined;
     for (&views, &stores) |*v, *s| v.* = s.view();
+    var window: [4]ColumnView = undefined;
     const group_cols = [_][]const u8{"key"};
     const aggs = [_]AggSpec{
         .{ .func = .count, .col = null, .as = "c" },
@@ -690,7 +700,7 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
         .{ .func = .max_by, .col = "label", .arg2_col = "ord", .as = "mb" },
     };
 
-    var scan_p = InputScan{ .schema = &schema, .views = &views, .rows = N };
+    var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = N };
     var pa = try PartitionedAggregate.create(a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
@@ -699,7 +709,7 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
     }
     pa.deinit();
 
-    var scan_s = InputScan{ .schema = &schema, .views = &views, .rows = N };
+    var scan_s = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = N };
     var ser = try @import("aggregate.zig").Aggregate.create(a, exec.makeQuery(a, &scan_s), &group_cols, &aggs, null, null);
     const ser_lines = try testCollectSorted(a, &ser);
     defer {
@@ -742,6 +752,7 @@ test "PartitionedAggregate sort+stream core keeps a group's rows in input order"
 
     var views: [4]ColumnView = undefined;
     for (&views, &stores) |*v, *s| v.* = s.view();
+    var window: [4]ColumnView = undefined;
     const group_cols = [_][]const u8{"key"};
     // The repeated groups carry a different ord/label per row and an equal
     // MAX_BY argument, so the order the core sees the rows in decides the
@@ -752,7 +763,7 @@ test "PartitionedAggregate sort+stream core keeps a group's rows in input order"
         .{ .func = .max_by, .col = "label", .arg2_col = "tie", .as = "mb" },
     };
 
-    var scan_p = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
     var pa = try PartitionedAggregate.create(a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
@@ -761,7 +772,7 @@ test "PartitionedAggregate sort+stream core keeps a group's rows in input order"
     }
     pa.deinit();
 
-    var scan_s = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var scan_s = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
     var ser = try aggregate.Aggregate.create(a, exec.makeQuery(a, &scan_s), &group_cols, &aggs, null, null);
     const ser_lines = try testCollectSorted(a, &ser);
     defer {
@@ -804,6 +815,7 @@ test "PartitionedAggregate near-unique direct sort matches serial aggregate" {
 
     var views: [4]ColumnView = undefined;
     for (&views, &stores) |*v, *s| v.* = s.view();
+    var window: [4]ColumnView = undefined;
     const group_cols = [_][]const u8{"key"};
     const aggs = [_]AggSpec{
         .{ .func = .count, .col = null, .as = "c" },
@@ -811,7 +823,7 @@ test "PartitionedAggregate near-unique direct sort matches serial aggregate" {
         .{ .func = .max_by, .col = "label", .arg2_col = "ord", .as = "mb" },
     };
 
-    var scan_p = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
     var pa = try PartitionedAggregate.create(a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
@@ -820,7 +832,7 @@ test "PartitionedAggregate near-unique direct sort matches serial aggregate" {
     }
     pa.deinit();
 
-    var scan_s = InputScan{ .schema = &schema, .views = &views, .rows = row_count };
+    var scan_s = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
     var ser = try aggregate.Aggregate.create(a, exec.makeQuery(a, &scan_s), &group_cols, &aggs, null, null);
     const ser_lines = try testCollectSorted(a, &ser);
     defer {
@@ -832,6 +844,69 @@ test "PartitionedAggregate near-unique direct sort matches serial aggregate" {
     try testing.expectEqual(@as(usize, group_count), par_lines.len);
     try testing.expectEqual(ser_lines.len, par_lines.len);
     for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
+}
+
+test "PartitionedAggregate drains a partition in windows with exact NULL and distinct counts" {
+    const a = testing.allocator;
+    // Five groups over four partitions: some partition holds two groups, so
+    // its rows span several windows, and the last window is not a multiple of 8.
+    const row_count = 3 * InputScan.batch_rows + 1003;
+    const group_count = 5;
+
+    const schema = [_]Column{
+        .{ .name = "g", .type = .bigint, .nullable = false },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var stores: [2]engine_store = undefined;
+    for (&stores, schema) |*s, col| s.* = try engine_store.init(a, col.type, col.nullable);
+    defer for (&stores) |*s| s.deinit(a);
+
+    const Pair = struct { g: i64, v: i64 };
+    var pairs: std.AutoHashMapUnmanaged(Pair, void) = .empty;
+    defer pairs.deinit(a);
+    var want_rows = [_]i64{0} ** group_count;
+    var want_valid = [_]i64{0} ** group_count;
+    var want_distinct = [_]i64{0} ** group_count;
+    for (0..row_count) |i| {
+        const g: i64 = @intCast(i % group_count);
+        // Each group sees each value twice; every seventh row is NULL.
+        const v: i64 = @intCast(i / 10);
+        const valid = i % 7 != 0;
+        try stores[0].data.bigint.append(a, g);
+        try stores[1].appendValidBit(a, i, valid);
+        try stores[1].data.bigint.append(a, if (valid) v else 0);
+        want_rows[@intCast(g)] += 1;
+        if (valid) {
+            want_valid[@intCast(g)] += 1;
+            const gop = try pairs.getOrPut(a, .{ .g = g, .v = v });
+            if (!gop.found_existing) want_distinct[@intCast(g)] += 1;
+        }
+    }
+
+    var views: [2]ColumnView = undefined;
+    for (&views, &stores) |*v, *s| v.* = s.view();
+    var window: [2]ColumnView = undefined;
+    const group_cols = [_][]const u8{"g"};
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .count, .col = "v", .as = "cv" },
+        .{ .func = .count_distinct, .col = "v", .as = "dv" },
+    };
+
+    var scan = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
+    var pa = try PartitionedAggregate.create(a, exec.makeQuery(a, &scan), &group_cols, &aggs, 4);
+    defer pa.deinit();
+    var seen: usize = 0;
+    while (try pa.next()) |b| {
+        for (0..b.row_count) |row| {
+            const g: usize = @intCast(testReadI128(b.values[0], row));
+            try testing.expectEqual(@as(i128, want_rows[g]), testReadI128(b.values[1], row));
+            try testing.expectEqual(@as(i128, want_valid[g]), testReadI128(b.values[2], row));
+            try testing.expectEqual(@as(i128, want_distinct[g]), testReadI128(b.values[3], row));
+            seen += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, group_count), seen);
 }
 
 test "two-phase max_by via max_by_key partials matches single-phase (NULL-value trap)" {
@@ -903,7 +978,8 @@ test "two-phase max_by via max_by_key partials matches single-phase (NULL-value 
         try fillStores(a, &stores, rows);
         var views: [3]ColumnView = undefined;
         for (&views, &stores) |*v, *s| v.* = s.view();
-        var scan = InputScan{ .schema = &schema, .views = &views, .rows = rows.len };
+        var window: [3]ColumnView = undefined;
+        var scan = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = rows.len };
         var agg = try Aggregate.create(a, exec.makeQuery(a, &scan), &group_cols, &part_aggs, null, null);
         defer agg.deinit();
         while (try agg.next()) |b| {
@@ -951,7 +1027,8 @@ test "two-phase max_by via max_by_key partials matches single-phase (NULL-value 
     };
     var part_views: [3]ColumnView = undefined;
     for (&part_views, &part_stores) |*v, *s| v.* = s.view();
-    var part_scan = InputScan{ .schema = &part_schema, .views = &part_views, .rows = part_stores[0].rowCount() };
+    var part_window: [3]ColumnView = undefined;
+    var part_scan = InputScan{ .schema = &part_schema, .source = &part_views, .views = &part_window, .rows = part_stores[0].rowCount() };
     var comb = try Aggregate.create(a, exec.makeQuery(a, &part_scan), &group_cols, &combine_aggs, null, null);
     const two_phase = try collect(a, &comb);
     defer {
@@ -968,7 +1045,8 @@ test "two-phase max_by via max_by_key partials matches single-phase (NULL-value 
     try fillStores(a, &all_stores, chunk_b[0..]);
     var all_views: [3]ColumnView = undefined;
     for (&all_views, &all_stores) |*v, *s| v.* = s.view();
-    var all_scan = InputScan{ .schema = &schema, .views = &all_views, .rows = chunk_a.len + chunk_b.len };
+    var all_window: [3]ColumnView = undefined;
+    var all_scan = InputScan{ .schema = &schema, .source = &all_views, .views = &all_window, .rows = chunk_a.len + chunk_b.len };
     var single = try Aggregate.create(a, exec.makeQuery(a, &all_scan), &group_cols, &[_]AggSpec{
         .{ .func = .max_by, .col = "val", .arg2_col = "ord", .as = "v" },
     }, null, null);
