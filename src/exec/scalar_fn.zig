@@ -1380,19 +1380,29 @@ pub const builtins = [_]ScalarFn{
     // --- date arithmetic + epoch conversion ---
     .{ .name = "datediff", .arg_types = &.{ .date, .date }, .return_type = .int, .kernel = date.datediffKernel },
     .{ .name = "datediff", .arg_types = &.{ .datetime, .datetime }, .return_type = .int, .kernel = date.datediffDatetimeKernel },
-    .{ .name = "date_add", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddKernel },
-    .{ .name = "date_sub", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateSubKernel },
-    // Calendar-aware month/year addition; clamps day on short destination
-    // months (`2024-01-31 + 1 month → 2024-02-29`). Used by the parser
-    // when it lowers `date + INTERVAL '<N>' MONTH|YEAR`.
-    .{ .name = "date_add_months", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddMonthsKernel },
-    .{ .name = "date_add_years", .arg_types = &.{ .date, .int }, .return_type = .date, .kernel = date.dateAddYearsKernel },
-    .{ .name = "date_add", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeAddDaysKernel },
-    .{ .name = "date_sub", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeSubDaysKernel },
-    .{ .name = "date_add_months", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeAddMonthsKernel },
-    .{ .name = "date_add_years", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .kernel = date.datetimeAddYearsKernel },
-    .{ .name = "date_add_seconds", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .kernel = date.datetimeAddSecondsKernel },
-    .{ .name = "date_add_micros", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .kernel = date.datetimeAddMicrosKernel },
+    // Each interval unit has its own kernel, which the parser calls when it
+    // lowers `x + INTERVAL n unit`, so the unit's size applies inside the
+    // range check. A month step clamps the day on a short destination month
+    // (`2024-01-31 + 1 month → 2024-02-29`), and a result outside years
+    // 0-9999 is NULL, as in StarRocks.
+    .{ .name = "date_add", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddDaysKernel },
+    .{ .name = "date_sub", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateSubDaysKernel },
+    .{ .name = "date_add_weeks", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddWeeksKernel },
+    .{ .name = "date_add_months", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddMonthsKernel },
+    .{ .name = "date_add_quarters", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddQuartersKernel },
+    .{ .name = "date_add_years", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddYearsKernel },
+    .{ .name = "date_add", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddDaysKernel },
+    .{ .name = "date_sub", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeSubDaysKernel },
+    .{ .name = "date_add_weeks", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddWeeksKernel },
+    .{ .name = "date_add_months", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMonthsKernel },
+    .{ .name = "date_add_quarters", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddQuartersKernel },
+    .{ .name = "date_add_years", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddYearsKernel },
+    // A sub-day count is a BIGINT so that one past INT reaches the kernel,
+    // which reads it as NULL, where a narrowing cast would saturate it.
+    .{ .name = "date_add_hours", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddHoursKernel },
+    .{ .name = "date_add_minutes", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMinutesKernel },
+    .{ .name = "date_add_seconds", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddSecondsKernel },
+    .{ .name = "date_add_micros", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMicrosKernel },
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = date.fromUnixtimeKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
@@ -1401,8 +1411,8 @@ pub const builtins = [_]ScalarFn{
     // DATEs widen to DATETIMEs at midnight, which leaves every unit's
     // count unchanged.
     .{ .name = "timestampdiff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.timestampDiffKernel },
-    .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .date }, .return_type = .date, .kernel = date.timestampAddDateKernel },
-    .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .datetime }, .return_type = .datetime, .kernel = date.timestampAddDatetimeKernel },
+    .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .date }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.timestampAddDateKernel },
+    .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .datetime }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.timestampAddDatetimeKernel },
     // --- date (expanded MySQL-style helpers) ---
     .{ .name = "dayname", .arg_types = &.{.date}, .return_type = .string, .kernel = date.daynameFromDateKernel },
     .{ .name = "dayname", .arg_types = &.{.datetime}, .return_type = .string, .kernel = date.daynameFromDatetimeKernel },

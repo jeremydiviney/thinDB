@@ -323,9 +323,10 @@ fn unitWord(e: ir.Expr) ?[]const u8 {
     };
 }
 
-/// An interval unit is a whole number of days, months, seconds or
-/// microseconds.
-const IntervalUnit = struct { fn_name: []const u8, factor: i32 };
+/// The kernel that moves a date by a count of one interval unit. The
+/// kernel applies the unit's size, so a count past INT, or a product past
+/// BIGINT, reads as NULL instead of wrapping.
+const IntervalUnit = struct { fn_name: []const u8 };
 
 /// Decimal digits (`-2.5`, `.5`) rounded half away from zero.
 fn roundedDigits(digits: []const u8) ?i64 {
@@ -356,15 +357,15 @@ fn leadingInteger(text: []const u8) ?i64 {
 
 fn intervalUnit(word: []const u8) ?IntervalUnit {
     const units = [_]struct { []const u8, IntervalUnit }{
-        .{ "day", .{ .fn_name = "date_add", .factor = 1 } },
-        .{ "week", .{ .fn_name = "date_add", .factor = 7 } },
-        .{ "month", .{ .fn_name = "date_add_months", .factor = 1 } },
-        .{ "quarter", .{ .fn_name = "date_add_months", .factor = 3 } },
-        .{ "year", .{ .fn_name = "date_add_years", .factor = 1 } },
-        .{ "hour", .{ .fn_name = "date_add_seconds", .factor = 3600 } },
-        .{ "minute", .{ .fn_name = "date_add_seconds", .factor = 60 } },
-        .{ "second", .{ .fn_name = "date_add_seconds", .factor = 1 } },
-        .{ "microsecond", .{ .fn_name = "date_add_micros", .factor = 1 } },
+        .{ "day", .{ .fn_name = "date_add" } },
+        .{ "week", .{ .fn_name = "date_add_weeks" } },
+        .{ "month", .{ .fn_name = "date_add_months" } },
+        .{ "quarter", .{ .fn_name = "date_add_quarters" } },
+        .{ "year", .{ .fn_name = "date_add_years" } },
+        .{ "hour", .{ .fn_name = "date_add_hours" } },
+        .{ "minute", .{ .fn_name = "date_add_minutes" } },
+        .{ "second", .{ .fn_name = "date_add_seconds" } },
+        .{ "microsecond", .{ .fn_name = "date_add_micros" } },
     };
     const singular = if (word.len > 1 and (word[word.len - 1] == 's' or word[word.len - 1] == 'S')) word[0 .. word.len - 1] else word;
     for (units) |u| if (std.ascii.eqlIgnoreCase(singular, u[0])) return u[1];
@@ -2792,20 +2793,17 @@ pub const Parser = struct {
     }
 
     fn unitAddCall(self: *Parser, unit: IntervalUnit, base: ir.Expr, amount: ir.Expr) ParseError!ir.Expr {
-        const scaled = if (unit.factor == 1)
-            amount
-        else
-            try self.makeBinary("mul", amount, .{ .lit = .{ .int = unit.factor } });
         const args = try self.arena.alloc(ir.Expr, 2);
         args[0] = base;
-        args[1] = scaled;
+        args[1] = amount;
         return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, unit.fn_name), .args = args } };
     }
 
     /// An interval counts whole units. A fractional literal amount rounds
-    /// half away from zero before the unit's factor applies, and a text
-    /// amount reads its leading integer, as MySQL does: `INTERVAL 1.5 WEEK`
-    /// is 14 days and `INTERVAL '1.5' DAY` is 1 day.
+    /// half away from zero, and a text amount reads its leading integer, as
+    /// MySQL does: `INTERVAL 1.5 WEEK` is 14 days and `INTERVAL '1.5' DAY`
+    /// is 1 day. A count past INT stays a BIGINT, which moves a date to NULL,
+    /// as in StarRocks.
     fn normalizeIntervalAmount(self: *Parser, amount: ir.Expr, negate: bool) ParseError!ir.Expr {
         const count: ?i64 = if (exec_expr.decimalLiteral(amount)) |d| roundedDigits(d.digits) else switch (amount) {
             .lit => |v| switch (v) {
@@ -2816,19 +2814,22 @@ pub const Parser = struct {
             },
             else => null,
         };
-        var out = amount;
-        if (count) |n| {
-            if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ParseError.SqlExpectedValue;
-            out = ir.Expr{ .lit = .{ .int = @intCast(n) } };
-        } else if (amount == .lit and amount.lit == .text) return ParseError.SqlExpectedValue;
-        if (negate) out = try self.negateExpr(out);
-        return out;
+        if (count) |whole| {
+            // Saturating: BIGINT's extremes are both far past INT.
+            const n = if (negate) 0 -| whole else whole;
+            return ir.Expr{ .lit = if (std.math.cast(i32, n)) |small| .{ .int = small } else .{ .bigint = n } };
+        }
+        if (amount == .lit and amount.lit == .text) return ParseError.SqlExpectedValue;
+        return if (negate) try self.negateExpr(amount) else amount;
     }
 
     fn negateExpr(self: *Parser, expr: ir.Expr) ParseError!ir.Expr {
         switch (expr) {
             .lit => |v| switch (v) {
-                .int => |x| return ir.Expr{ .lit = .{ .int = -x } },
+                .int => |x| {
+                    if (x == std.math.minInt(i32)) return ir.Expr{ .lit = .{ .bigint = -@as(i64, x) } };
+                    return ir.Expr{ .lit = .{ .int = -x } };
+                },
                 .bigint => |x| {
                     if (x == std.math.minInt(i64)) return try bigIntegerLiteral(self.arena, "9223372036854775808");
                     return ir.Expr{ .lit = .{ .bigint = -x } };
