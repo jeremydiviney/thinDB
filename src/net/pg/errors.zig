@@ -34,6 +34,8 @@ pub fn mapInternal(err: anyerror) Mapped {
         return .{ .sqlstate = "22P04".*, .message = "malformed COPY row" };
     if (std.mem.eql(u8, name, "CopyMustBeSoleStatement"))
         return .{ .sqlstate = "0A000".*, .message = "COPY must be the only statement in its query" };
+    if (std.mem.eql(u8, name, "InvalidTemporalParam"))
+        return .{ .sqlstate = "22008".*, .message = "date or timestamp parameter out of range" };
 
     return switch (error_map.classify(name)) {
         .table_not_found => .{ .sqlstate = "42P01".*, .message = "relation does not exist" },

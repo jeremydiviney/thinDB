@@ -114,6 +114,8 @@ test "a date whose day is past its month's end is invalid everywhere a date is r
         .{ "CAST('2026-02-30' AS DATETIME)", null },
         .{ "CAST('2026-04-31 10:00:00' AS DATETIME)", null },
         .{ "DATE('1900-02-29')", null },
+        .{ "DATE('-001-01-01')", null },
+        .{ "CAST('-001-06-15' AS DATETIME)", null },
         // Year 0 is a leap year, as in StarRocks; MySQL has no 0000-02-29.
         .{ "DATE('0000-02-29')", "0000-02-29" },
         .{ "DATE('2024-02-29')", "2024-02-29" },
@@ -126,6 +128,7 @@ test "a date whose day is past its month's end is invalid everywhere a date is r
     // MySQL's strict mode rejects the row (error 1292).
     try helpers.expectRunError(allocator, db, "INSERT INTO dd VALUES (2, '2026-02-30', NULL)", error.TypeMismatch);
     try helpers.expectRunError(allocator, db, "INSERT INTO dd VALUES (2, NULL, '2026-04-31 10:00:00')", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO dd VALUES (2, '-001-01-01', NULL)", error.TypeMismatch);
     try helpers.expectRunError(allocator, db, "SELECT DATE '2026-02-30'", error.SqlExpectedValue);
     // MySQL raises error 1525 comparing with an impossible date.
     try helpers.expectRunError(allocator, db, "SELECT id FROM dd WHERE d = '2026-02-30'", error.InvalidTemporalLiteral);

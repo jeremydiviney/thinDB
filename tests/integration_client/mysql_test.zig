@@ -2375,6 +2375,8 @@ const MYSQL_TYPE_LONG: u8 = 0x03;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
+const MYSQL_TYPE_DATE: u8 = 0x0a;
+const MYSQL_TYPE_DATETIME: u8 = 0x0c;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 
 fn encodeLenEncString(allocator: std.mem.Allocator, payload: *std.ArrayList(u8), s: []const u8) !void {
@@ -3360,6 +3362,81 @@ test "mysql wire: a bound parameter no DATE or DATETIME reads matches nothing" {
     const rows = try client.readBinaryResultSet(arena.allocator(), true);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 2), std.mem.readInt(i64, rows[0].cells[0..8], .little));
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: a binary DATE or DATETIME parameter no date holds fails its statement with 1292" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 215;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    try expectQueryOk(&client, "CREATE TABLE bd (id BIGINT PRIMARY KEY, d DATE, ts DATETIME(6))");
+    try expectQueryOk(&client, "INSERT INTO bd VALUES (1, '2026-09-29', '2026-09-29 10:00:00')");
+
+    try client.sendStmtPrepare("SELECT id FROM bd WHERE d = ?");
+    const select = try client.readPrepareReply(true);
+    const sept_29 = [_]u8{ 4, 0xea, 0x07, 9, 29 };
+    // A day 0 of March once cast -1 to an unsigned day of the year, and
+    // mysql2 sends an invalid JavaScript Date as every part zero.
+    const invalid = .{
+        .{ MYSQL_TYPE_DATE, &[_]u8{0} },
+        .{ MYSQL_TYPE_DATE, &[_]u8{ 4, 0xea, 0x07, 3, 0 } },
+        .{ MYSQL_TYPE_DATE, &[_]u8{ 4, 0xea, 0x07, 2, 30 } },
+        .{ MYSQL_TYPE_DATETIME, &[_]u8{ 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+        .{ MYSQL_TYPE_DATETIME, &[_]u8{ 7, 0xea, 0x07, 9, 29, 24, 0, 0 } },
+    };
+    for (0..2) |_| {
+        try client.sendStmtExecute(select.stmt_id, &.{.{ .type_byte = MYSQL_TYPE_DATE, .value_bytes = &sept_29 }});
+        const rows = try client.readBinaryResultSet(arena.allocator(), true);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, rows[0].cells[0..8], .little));
+        inline for (invalid) |c| {
+            try client.sendStmtExecute(select.stmt_id, &.{.{ .type_byte = c[0], .value_bytes = c[1] }});
+            const err = try mysql_packet.readPacket(allocator, &client.reader.interface);
+            defer allocator.free(err.payload);
+            try std.testing.expectEqual(@as(u8, 0xff), err.payload[0]);
+            try std.testing.expectEqual(@as(u16, 1292), std.mem.readInt(u16, err.payload[1..3], .little));
+            try std.testing.expectEqualStrings("22007", err.payload[4..9]);
+        }
+    }
+
+    try client.sendStmtPrepare("INSERT INTO bd VALUES (?, ?, ?)");
+    const insert = try client.readPrepareReply(true);
+    var id_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &id_buf, 2, .little);
+    try client.sendStmtExecute(insert.stmt_id, &.{
+        .{ .type_byte = MYSQL_TYPE_LONGLONG, .value_bytes = &id_buf },
+        .{ .type_byte = MYSQL_TYPE_DATE, .value_bytes = &.{ 4, 0, 0, 2, 29 } },
+        .{ .type_byte = MYSQL_TYPE_DATETIME, .value_bytes = &.{ 11, 0x0f, 0x27, 12, 31, 23, 59, 59, 0x3f, 0x42, 0x0f, 0x00 } },
+    });
+    const ok = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(ok.payload);
+    try std.testing.expectEqual(@as(u8, 0x00), ok.payload[0]);
+    try std.testing.expectEqualStrings("0000-02-29", (try queryCell(&client, arena.allocator(), "SELECT CAST(d AS CHAR) FROM bd WHERE id = 2")).?);
+    try std.testing.expectEqualStrings("9999-12-31 23:59:59.999999", (try queryCell(&client, arena.allocator(), "SELECT CAST(ts AS CHAR) FROM bd WHERE id = 2")).?);
 
     try client.sendQuit();
     if (sctx.err) |e| return e;

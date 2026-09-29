@@ -3952,6 +3952,10 @@ fn handleStmtExecute(
     const decode_start = profiler.start();
     const params = prepared.decodeExecuteParams(arena_alloc, stmt, payload, after_header) catch |err| {
         profiler.recordSince(.stmt_execute_decode, decode_start);
+        if (err == error.InvalidTemporalParam) {
+            try handshake.sendErrPacket(allocator, w, seq_id, 1292, "22007".*, "Incorrect DATE or DATETIME value in a parameter");
+            return;
+        }
         const msg = switch (err) {
             error.NoBoundParamTypes => "missing parameter types on first execute",
             error.LongDataAndValueBoth => "long-data and value both bound for same param",
