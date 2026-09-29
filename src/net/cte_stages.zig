@@ -921,6 +921,7 @@ const AdaptiveGroupBy = struct {
             if (trace_gb) std.debug.print("[gbroute-adaptive]   -> partitioned\n", .{});
             self.chosen = try partitioned_aggregate.PartitionedAggregate.create(
                 self.allocator,
+                self.worker_alloc,
                 self.up,
                 self.group_cols,
                 self.aggs,

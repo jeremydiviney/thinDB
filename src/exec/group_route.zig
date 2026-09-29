@@ -80,7 +80,7 @@ pub fn routeGroupByDop(
         if (getenv_gr("THINDB_TRACE_GBROUTE") != null) {
             std.debug.print("[gbroute-compile]   -> partitioned (no-stage fallback, dop={d})\n", .{dop});
         }
-        return partitioned_aggregate.PartitionedAggregate.create(allocator, upstream.*, group_cols, aggs, dop);
+        return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, dop);
     }
     return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
 }

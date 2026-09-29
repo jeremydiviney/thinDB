@@ -176,6 +176,9 @@ pub const MemoryAccountant = struct {
     /// Accounted level whose crossing takes the next watchdog sample.
     watch_next_bytes: usize = 0,
     watch_logged: std.atomic.Value(bool) = .init(false),
+    /// Set by the first refused reservation's breakdown; guarded by
+    /// `reservation_lock`.
+    refusal_logged: bool = false,
     resident_peak: std.atomic.Value(u64) = .init(0),
 
     pub fn checkCancelled(self: *const MemoryAccountant) error{QueryCancelled}!void {
@@ -279,10 +282,10 @@ pub const MemoryAccountant = struct {
     /// Reserve `bytes` from the budget, attributing them to `source`.
     /// Returns `MemoryBudgetExceeded` when the reservation would exceed
     /// the per-query budget OR the shared pool; does NOT update state in
-    /// that case (no partial state), but dumps a per-source breakdown to
-    /// stderr first so the failure is auditable. A failed reservation
-    /// propagates terminally (no operator retries it), so this fires at
-    /// most once per over-budget query.
+    /// that case (no partial state). The statement's first refusal dumps a
+    /// per-source breakdown to stderr so the failure is auditable; the
+    /// refusals that follow it (parallel workers each reaching the ceiling
+    /// before the error unwinds) stay quiet.
     pub fn reserve(self: *MemoryAccountant, source: Source, bytes: usize) Error!void {
         if (self.physical_tracking) return;
         self.lock();
@@ -297,16 +300,12 @@ pub const MemoryAccountant = struct {
     /// True when the reservation crossed the next watchdog sampling level.
     fn reserveLocked(self: *MemoryAccountant, source: Source, bytes: usize) Error!bool {
         if (bytes > self.budget - self.current_bytes) {
-            self.dumpBreakdown(source, bytes);
+            self.logRefusal(source, bytes, null);
             return Error.MemoryBudgetExceeded;
         }
         if (self.pool) |p| {
             if (!p.tryReserve(bytes)) {
-                self.dumpBreakdown(source, bytes);
-                std.debug.print(
-                    "[mem-audit]   shared pool: {d} MiB in use of {d} MiB (other queries hold the rest)\n",
-                    .{ p.inUse() / (1024 * 1024), p.budget / (1024 * 1024) },
-                );
+                self.logRefusal(source, bytes, p);
                 return Error.MemoryBudgetExceeded;
             }
         }
@@ -413,7 +412,9 @@ pub const MemoryAccountant = struct {
         return self.budget - self.current_bytes;
     }
 
-    fn dumpBreakdown(self: *const MemoryAccountant, failing: Source, want: usize) void {
+    fn logRefusal(self: *MemoryAccountant, failing: Source, want: usize, pool: ?*MemoryPool) void {
+        if (self.refusal_logged) return;
+        self.refusal_logged = true;
         const mib = 1024 * 1024;
         std.debug.print(
             "[mem-audit] MemoryBudgetExceeded: +{d} MiB for '{s}' would exceed budget {d} MiB (in use {d} MiB)\n",
@@ -423,6 +424,10 @@ pub const MemoryAccountant = struct {
             const v = self.by_source[@intFromEnum(@field(Source, f.name))];
             if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ f.name, v / mib });
         }
+        if (pool) |p| std.debug.print(
+            "[mem-audit]   shared pool: {d} MiB in use of {d} MiB (other queries hold the rest)\n",
+            .{ p.inUse() / mib, p.budget / mib },
+        );
     }
 };
 

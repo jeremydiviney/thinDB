@@ -3477,12 +3477,19 @@ test "sql: a budget bounds a cross + aggregate + window pipeline's worker arenas
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Parallel stage, window and partitioned-aggregate arenas hold most of
-    // this pipeline's memory. When they went uncharged the whole query fit
-    // in 64 MiB of accounted memory while holding several times that.
+    // Parallel stage, window and partitioned-aggregate memory holds most of
+    // this pipeline's footprint. When it went uncharged the whole query fit
+    // in the budget while holding several times that.
+    //
+    // The GROUP BY router sizes its plan to the budget, so the budget picks
+    // the plan as well as the ceiling. At 96 MiB both CTE GROUP BYs take the
+    // partitioned path, and the charged pipeline needs about 116 MiB. With
+    // the partition memory uncharged it fits in about 47 MiB. Near 64 MiB
+    // the router picks sort-based plans that need 52 to 62 MiB, so the
+    // outcome there depends on timing.
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
-        .query_memory_budget = 64 << 20,
-        .memory_budget = 64 << 20,
+        .query_memory_budget = 96 << 20,
+        .memory_budget = 96 << 20,
         .auto_flush_secs = 0,
         .max_dop = 4,
     });
