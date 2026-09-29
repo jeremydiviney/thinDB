@@ -542,6 +542,122 @@ test "UNIX_TIMESTAMP before 1970 is 0, and FROM_UNIXTIME of a negative count is 
     }
 }
 
+test "FROM_UNIXTIME(n, format) renders as DATE_FORMAT does and reads its count as CAST does, as in StarRocks (issues #408, #409)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // StarRocks 4.0's values, from constant-only SELECTs with the backend
+    // forced (`IF(RAND() < 2, x, NULL)`), except the last two.
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "FROM_UNIXTIME(0, '%Y-%m-%d')", "1970-01-01" },
+        .{ "FROM_UNIXTIME(1767263400, '%Y-%m-%d %H:%i:%s')", "2026-01-01 10:30:00" },
+        .{ "FROM_UNIXTIME(1767263400, '%W %M %D %y %j %a %b %c %e %f %p %r %T %U %u %V %v %X %x %%')", "Thursday January 1st 26 001 Thu Jan 1 1 000000 AM 10:30:00 AM 10:30:00 00 01 52 01 2025 2026 %" },
+        .{ "FROM_UNIXTIME(1767263405, '%Y-%m-%d %T.%f')", "2026-01-01 10:30:05.000000" },
+        .{ "FROM_UNIXTIME(-1, '%Y')", null },
+        .{ "FROM_UNIXTIME(0, NULL)", null },
+        .{ "FROM_UNIXTIME(NULL, '%Y')", null },
+        .{ "FROM_UNIXTIME(0, '')", null },
+        .{ "FROM_UNIXTIME(1.5, '')", null },
+        .{ "FROM_UNIXTIME(0, 'abc')", "abc" },
+        .{ "FROM_UNIXTIME(0, '%Q')", "Q" },
+        .{ "FROM_UNIXTIME(1767263400, ' ')", " " },
+        .{ "FROM_UNIXTIME(1767263400, '%')", "%" },
+        .{ "FROM_UNIXTIME(1767263400, '%Y%')", "2026%" },
+        .{ "FROM_UNIXTIME(0, 'yyyy-MM-dd')", "1970-01-01" },
+        .{ "FROM_UNIXTIME(0, 'yyyy-MM-dd HH:mm:ss')", "1970-01-01 00:00:00" },
+        .{ "FROM_UNIXTIME(0, 'yyyyMMdd')", "19700101" },
+        .{ "FROM_UNIXTIME(1767263400, 'yyyy/MM/dd')", "yyyy/MM/dd" },
+        .{ "FROM_UNIXTIME(1767263400, 'yyyy-MM-dd HH:mm')", "yyyy-MM-dd HH:mm" },
+        .{ "FROM_UNIXTIME(1767263400, 'HH:mm:ss')", "HH:mm:ss" },
+        .{ "FROM_UNIXTIME(1.5, '%Y-%m-%d %H:%i:%s')", "1970-01-01 00:00:01" },
+        .{ "FROM_UNIXTIME(1767263400.999999, '%f')", "000000" },
+        .{ "FROM_UNIXTIME(12, 34)", "34" },
+        .{ "FROM_UNIXTIME(12, 5.5)", "5.5" },
+        .{ "FROM_UNIXTIME(CAST(12 AS TINYINT), '%s')", "12" },
+        .{ "CAST(FROM_UNIXTIME(1.5) AS CHAR)", "1970-01-01 00:00:01" },
+        .{ "CAST(FROM_UNIXTIME(1.9) AS CHAR)", "1970-01-01 00:00:01" },
+        .{ "CAST(FROM_UNIXTIME(-0.5) AS CHAR)", "1970-01-01 00:00:00" },
+        .{ "CAST(FROM_UNIXTIME(-1.5) AS CHAR)", null },
+        .{ "CAST(FROM_UNIXTIME(1.5e0) AS CHAR)", "1970-01-01 00:00:01" },
+        .{ "CAST(FROM_UNIXTIME(CAST(1.5 AS DOUBLE)) AS CHAR)", "1970-01-01 00:00:01" },
+        .{ "CAST(FROM_UNIXTIME(CAST(1.9 AS FLOAT)) AS CHAR)", "1970-01-01 00:00:01" },
+        .{ "CAST(FROM_UNIXTIME(1767263400.999) AS CHAR)", "2026-01-01 10:30:00" },
+        .{ "CAST(FROM_UNIXTIME(1767263400.9999999999) AS CHAR)", "2026-01-01 10:30:00" },
+        .{ "CAST(FROM_UNIXTIME(1e20) AS CHAR)", null },
+        .{ "CAST(FROM_UNIXTIME(9223372036854775807.5) AS CHAR)", null },
+        .{ "CAST(FROM_UNIXTIME(TRUE) AS CHAR)", "1970-01-01 00:00:01" },
+        .{ "CAST(FROM_UNIXTIME('12') AS CHAR)", "1970-01-01 00:00:12" },
+        .{ "CAST(FROM_UNIXTIME(' 12') AS CHAR)", "1970-01-01 00:00:12" },
+        .{ "CAST(FROM_UNIXTIME('+12') AS CHAR)", "1970-01-01 00:00:12" },
+        .{ "CAST(FROM_UNIXTIME('-0') AS CHAR)", "1970-01-01 00:00:00" },
+        .{ "CAST(FROM_UNIXTIME('1.5') AS CHAR)", null },
+        .{ "CAST(FROM_UNIXTIME('1e3') AS CHAR)", null },
+        .{ "CAST(FROM_UNIXTIME('12abc') AS CHAR)", null },
+        .{ "CAST(FROM_UNIXTIME('abc') AS CHAR)", null },
+        .{ "CAST(FROM_UNIXTIME('') AS CHAR)", null },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:00', '')", null },
+        .{ "DATE_FORMAT(DATE '2026-01-01', '')", null },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:00', 'yyyy-MM-dd')", "2026-01-01" },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:05.123456', 'yyyy-MM-dd HH:mm:ss')", "2026-01-01 10:30:05" },
+        .{ "DATE_FORMAT(DATETIME '0001-02-03 04:05:06', 'yyyy-MM-dd HH:mm:ss')", "0001-02-03 04:05:06" },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:00', 'yyyyMMdd')", "20260101" },
+        .{ "DATE_FORMAT(DATE '2026-01-01', 'yyyy-MM-dd HH:mm:ss')", "2026-01-01 00:00:00" },
+        .{ "DATE_FORMAT('1970-01-01', 'yyyy-MM-dd')", "1970-01-01" },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:05', 'yyyy-MM-dd HH:mm:ss.SSS')", "yyyy-MM-dd HH:mm:ss.SSS" },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:05', 'yyyyMMddHHmmss')", "yyyyMMddHHmmss" },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:05', ' yyyy-MM-dd')", " yyyy-MM-dd" },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:05', 'YYYY-MM-dd')", "YYYY-MM-dd" },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:05', 'yyyy-mm-dd')", "yyyy-mm-dd" },
+        // thinDB's DATETIME range ends at 9999-12-31 23:59:59. StarRocks gives
+        // NULL after 9999-12-31 07:59:59, a time-zone guard band.
+        .{ "FROM_UNIXTIME(253402300799, '%Y-%m-%d %H:%i:%s')", "9999-12-31 23:59:59" },
+        .{ "CAST(FROM_UNIXTIME(253402300799.5) AS CHAR)", "9999-12-31 23:59:59" },
+    };
+    for (cases) |c| {
+        const sql = try std.fmt.allocPrint(allocator, "SELECT {s}", .{c[0]});
+        defer allocator.free(sql);
+        errdefer std.debug.print("failed: {s}\n", .{sql});
+        const got = try helpers.collectStrings(allocator, db, sql);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        if (c[1]) |want| {
+            try std.testing.expect(got[0] != null);
+            try std.testing.expectEqualStrings(want, got[0].?);
+        } else try std.testing.expect(got[0] == null);
+    }
+
+    // The same readings over columns, a format per row.
+    try exec(allocator, db, "CREATE TABLE fu (id BIGINT PRIMARY KEY, x DOUBLE, d DECIMAL(20, 10), s VARCHAR(20), f VARCHAR(30))");
+    try exec(allocator, db, "INSERT INTO fu VALUES (1, 1.5, 1767263400.9999999999, '12', '%Y-%m-%d %H:%i:%s'), " ++
+        "(2, -0.5, -0.5, ' 12', ''), (3, -1.5, -1.5, '1.5', NULL), (4, 1e20, 0.9, 'abc', 'yyyyMMdd'), (5, NULL, NULL, NULL, 'yyyy/MM/dd')");
+    const column_cases = [_]struct { []const u8, [5]?[]const u8 }{
+        .{ "CAST(FROM_UNIXTIME(x) AS CHAR)", .{ "1970-01-01 00:00:01", "1970-01-01 00:00:00", null, null, null } },
+        .{ "CAST(FROM_UNIXTIME(d) AS CHAR)", .{ "2026-01-01 10:30:00", "1970-01-01 00:00:00", null, "1970-01-01 00:00:00", null } },
+        .{ "CAST(FROM_UNIXTIME(s) AS CHAR)", .{ "1970-01-01 00:00:12", "1970-01-01 00:00:12", null, null, null } },
+        .{ "FROM_UNIXTIME(1767263405, f)", .{ "2026-01-01 10:30:05", null, null, "20260101", "yyyy/MM/dd" } },
+        .{ "FROM_UNIXTIME(x, f)", .{ "1970-01-01 00:00:01", null, null, null, null } },
+        .{ "DATE_FORMAT(DATETIME '2026-01-01 10:30:05', f)", .{ "2026-01-01 10:30:05", null, null, "20260101", "yyyy/MM/dd" } },
+        .{ "DATE_FORMAT(DATE '2026-01-01', f)", .{ "2026-01-01 00:00:00", null, null, "20260101", "yyyy/MM/dd" } },
+    };
+    for (column_cases) |c| {
+        const sql = try std.fmt.allocPrint(allocator, "SELECT {s} FROM fu ORDER BY id", .{c[0]});
+        defer allocator.free(sql);
+        errdefer std.debug.print("failed: {s}\n", .{sql});
+        const got = try helpers.collectStrings(allocator, db, sql);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, g| {
+            if (want) |text| {
+                try std.testing.expect(g != null);
+                try std.testing.expectEqualStrings(text, g.?);
+            } else try std.testing.expect(g == null);
+        }
+    }
+}
+
 test "DATE_FORMAT, STR_TO_DATE and the week functions match MySQL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

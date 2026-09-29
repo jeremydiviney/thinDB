@@ -1042,6 +1042,14 @@ pub fn integerArgFn(given: Type, target: Type) ?[]const u8 {
     return if (target.isInteger() and (given.isFloat() or given.isDecimal())) INTEGER_ARG_FN else null;
 }
 
+/// Whether `name` reads an argument `convertedArgs` converts as CAST reads
+/// it, rather than as MySQL reads a function argument. StarRocks reads
+/// FROM_UNIXTIME's count so: `1.5` is 1 and `-0.5` is 0, truncated toward
+/// zero, where MySQL's reading rounds; and `'1.5'` or `1e20` is NULL.
+pub fn readsArgsAsCast(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "from_unixtime");
+}
+
 /// Internal: text or JSON read as the number it starts with, where a
 /// numeric parameter meets it and no CAST was written
 /// (`common.leadingDouble`, `common.leadingInteger`).
@@ -1405,6 +1413,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_add_micros", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMicrosKernel },
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeKernel },
+    .{ .name = "from_unixtime", .arg_types = &.{ .bigint, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeFormatKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .bigint, .kernel = date.dateDiffDateKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.dateDiffDatetimeKernel },
@@ -1427,8 +1436,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "quarter", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.quarterFromDatetimeKernel },
     .{ .name = "last_day", .arg_types = &.{.date}, .return_type = .date, .kernel = date.lastDayFromDateKernel },
     .{ .name = "last_day", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.lastDayFromDatetimeKernel },
-    .{ .name = "date_format", .arg_types = &.{ .datetime, .string }, .return_type = .string, .kernel = date.dateFormatDatetimeKernel },
-    .{ .name = "date_format", .arg_types = &.{ .date, .string }, .return_type = .string, .kernel = date.dateFormatDateKernel },
+    .{ .name = "date_format", .arg_types = &.{ .datetime, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.dateFormatDatetimeKernel },
+    .{ .name = "date_format", .arg_types = &.{ .date, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.dateFormatDateKernel },
     .{ .name = "str_to_date", .arg_types = &.{ .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = datefmt.strToDateKernel },
     .{ .name = "str_to_time", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = datefmt.strToTimeKernel },
     .{ .name = "get_format", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = datefmt.getFormatKernel },
