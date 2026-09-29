@@ -1254,6 +1254,109 @@ test "parallel scan matches serial across DOP levels (with fused filter)" {
     }
 }
 
+test "parallel scan: the next pull frees the materialized buffer the consumer was given" {
+    // Batch data lives only until the next pull, so a consumer that copies its
+    // input (sort, partitioned aggregate) must not also keep the scan's copy
+    // charged: each emitted survivor buffer goes back as soon as the consumer
+    // asks for the next batch.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    var next_id: i64 = 0;
+    for (0..4) |_| {
+        var rows: [100]struct { id: i64, v: i32 } = undefined;
+        for (&rows) |*r| {
+            r.id = next_id;
+            r.v = @intCast(@mod(next_id, 7));
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+
+    const survivors = 250;
+    const expected = blk: {
+        var ids: [survivors]i64 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(150 + i);
+        break :blk ids;
+    };
+    const materialize = @intFromEnum(exec.memory.Source.materialize);
+
+    inline for (.{ 1, 4 }) |dop| {
+        // Physical tracking (the scan mints its own accountant from the table
+        // budget, as on the server): freeing is what lowers the charge.
+        {
+            var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+            const ps = exec.queryAs(exec.ParallelScan, base).?;
+            var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+            defer q.deinit();
+            var got: std.ArrayList(i64) = .empty;
+            defer got.deinit(allocator);
+            var first: usize = 0;
+            var prev: usize = std.math.maxInt(usize);
+            while (try q.next()) |b| {
+                try std.testing.expect(ps.mode == .materialize);
+                const charged = ps.acct.?.current_bytes;
+                if (got.items.len == 0) first = charged;
+                try std.testing.expect(charged < prev);
+                prev = charged;
+                try got.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+            }
+            try std.testing.expect(first - ps.acct.?.current_bytes >= survivors * (@sizeOf(i64) + @sizeOf(i32)));
+            std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
+            try std.testing.expectEqualSlices(i64, &expected, got.items);
+        }
+        // Reserved accounting: the `.materialize` reservation steps down with
+        // each pull and reaches zero at the end of the stream.
+        {
+            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
+            var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+            defer q.deinit();
+            var rows: usize = 0;
+            var batches: usize = 0;
+            var prev: usize = std.math.maxInt(usize);
+            while (try q.next()) |b| {
+                const charged = acct.by_source[materialize];
+                try std.testing.expect(charged > 0 and charged < prev);
+                prev = charged;
+                rows += b.row_count;
+                batches += 1;
+            }
+            try std.testing.expectEqual(@as(usize, survivors), rows);
+            if (dop > 1) try std.testing.expect(batches > 1);
+            try std.testing.expectEqual(@as(usize, 0), acct.by_source[materialize]);
+        }
+        // A consumer that stops early (LIMIT) leaves the rest to deinit.
+        {
+            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            {
+                var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
+                var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
+                defer q.deinit();
+                _ = try q.next();
+                _ = try q.next();
+            }
+            try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
+        }
+    }
+}
+
 const SlotHolder = struct {
     sched: *core_scheduler.CoreScheduler,
     release: *std.atomic.Value(bool),
