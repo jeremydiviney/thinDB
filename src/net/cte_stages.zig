@@ -118,8 +118,10 @@ fn compile_staged(input_in: engine_v2.CompileInput, root: *const ir.Op, stage_co
         std.debug.print("[region] region engaged\n", .{});
     }
     wrapWindowsInMaterialize(input.node_arena, @constCast(root), &cse, null) catch {};
+    var pins = try CompilePins.plan(input.allocator, root, &cse, &map);
+    defer pins.deinit(input.allocator);
     const t_collect_stages = exec.prof.nowTicks();
-    try collectStages(input, root, set, &map, &cse);
+    try collectStages(input, root, set, &map, &cse, &pins);
     exec.prof.addPhase("compile.collect_stages", @intCast(exec.prof.nowTicks() - t_collect_stages));
     if (stage_count_out) |out| out.* = @intCast(set.stages.items.len);
     const t_final_block = exec.prof.nowTicks();
@@ -307,6 +309,134 @@ fn countMatRefs(allocator: Allocator, op: *const ir.Op, cse: *MatCse) anyerror!v
     }
 }
 
+/// Whether `collectStages` compiles the canonical node `rep`'s body as a
+/// stage of its own, rather than inline at its one use site. A recursive
+/// CTE's self-reference is neither: its driver binds it per iteration.
+fn stagesBody(rep: *const ir.Op, cse: *const MatCse) bool {
+    if (rep.materialize.recursion) |rec| return rec == .cte;
+    const single_ref = (cse.refs.get(rep) orelse 1) <= 1;
+    // Profiling overrides that stage normally-inlined single-ref CTEs so
+    // `--profile-ops` emits a distinct `[cte]` line per block (both
+    // correctness-neutral, both add the copy tax inlining avoids):
+    //   THINDB_PROFILE_FORCE_STAGE   — EVERY CTE (incl. pure streaming).
+    //   THINDB_PROFILE_STAGE_BARRIERS — only CTEs whose own operations
+    //     already form a barrier (GROUP BY / ORDER BY / WINDOW / JOIN /
+    //     UNION) — those buffer internally anyway, so staging them is
+    //     close to the real execution; thin streaming CTEs stay fused.
+    const prof_stage = forceStageAll() or
+        (stageBarriersOnly() and bodyFormsBarrier(rep.materialize.upstream));
+    return !((single_ref or noStage()) and !rep.materialize.forced and !prof_stage);
+}
+
+/// Compile pins held for blocks still to compile. Every stage holds one
+/// from `addStage`: an eager compile-time run could otherwise free a stage
+/// before a block compiled after it binds it. A block is the root or a
+/// stage's body, and it binds only the stages it reads. So a stage's pin
+/// drops once every block that reads it has compiled, and a stage whose
+/// readers have all run frees then, not when the whole plan has compiled.
+const CompilePins = struct {
+    /// Blocks not yet compiled that read each staged node.
+    pending: std.AutoHashMapUnmanaged(*const ir.Op, u32) = .empty,
+    /// The staged nodes each staged node's body reads.
+    reads: std.AutoHashMapUnmanaged(*const ir.Op, []const *const ir.Op) = .empty,
+
+    fn deinit(self: *CompilePins, allocator: Allocator) void {
+        var it = self.reads.valueIterator();
+        while (it.next()) |r| allocator.free(r.*);
+        self.reads.deinit(allocator);
+        self.pending.deinit(allocator);
+    }
+
+    /// The reads of the root block and, in turn, of every staged body they
+    /// reach. A node `map` already holds (a declared keyed region) has a
+    /// stage but no body compiled here.
+    fn plan(allocator: Allocator, root: *const ir.Op, cse: *const MatCse, map: *const StageMap) !CompilePins {
+        var self: CompilePins = .{};
+        errdefer self.deinit(allocator);
+        var bodies: std.ArrayListUnmanaged(*const ir.Op) = .empty;
+        defer bodies.deinit(allocator);
+        var reads: std.ArrayListUnmanaged(*const ir.Op) = .empty;
+        defer reads.deinit(allocator);
+        try blockReads(allocator, root, cse, map, &reads);
+        try self.count(allocator, reads.items, map, &bodies);
+        var i: usize = 0;
+        while (i < bodies.items.len) : (i += 1) {
+            const node = bodies.items[i];
+            reads.clearRetainingCapacity();
+            if (node.materialize.recursion) |rec| switch (rec) {
+                .cte => |info| {
+                    try blockReads(allocator, info.anchor, cse, map, &reads);
+                    try blockReads(allocator, info.step, cse, map, &reads);
+                },
+                .self_ref => {},
+            } else try blockReads(allocator, node.materialize.upstream, cse, map, &reads);
+            try self.count(allocator, reads.items, map, &bodies);
+            const owned = try allocator.dupe(*const ir.Op, reads.items);
+            errdefer allocator.free(owned);
+            try self.reads.put(allocator, node, owned);
+        }
+        return self;
+    }
+
+    fn count(self: *CompilePins, allocator: Allocator, reads: []const *const ir.Op, map: *const StageMap, bodies: *std.ArrayListUnmanaged(*const ir.Op)) !void {
+        for (reads) |node| {
+            const gop = try self.pending.getOrPut(allocator, node);
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+                continue;
+            }
+            gop.value_ptr.* = 1;
+            if (!map.contains(node)) try bodies.append(allocator, node);
+        }
+    }
+
+    /// `node`'s body has compiled, so every stage it reads has registered
+    /// its uses from it.
+    fn bodyCompiled(self: *CompilePins, node: *const ir.Op, map: *const StageMap) void {
+        const reads = self.reads.get(node) orelse return;
+        for (reads) |read| {
+            const left = self.pending.getPtr(read) orelse continue;
+            left.* -= 1;
+            if (left.* == 0) if (map.get(read)) |stage| stage.releaseCompilePin();
+        }
+    }
+};
+
+/// The staged nodes a block reads, each once: the walk descends through
+/// bodies that compile inline and stops at nodes with a stage.
+fn blockReads(allocator: Allocator, op: *const ir.Op, cse: *const MatCse, map: *const StageMap, reads: *std.ArrayListUnmanaged(*const ir.Op)) anyerror!void {
+    switch (op.*) {
+        .materialize => {
+            const rep = cse.canon.get(op) orelse op;
+            if (rep.materialize.recursion) |rec| if (rec == .self_ref) return;
+            if (map.contains(rep) or stagesBody(rep, cse)) {
+                for (reads.items) |read| if (read == rep) return;
+                return reads.append(allocator, rep);
+            }
+            try blockReads(allocator, rep.materialize.upstream, cse, map, reads);
+        },
+        .select => |p| try blockReads(allocator, p.upstream, cse, map, reads),
+        .exclude => |p| try blockReads(allocator, p.upstream, cse, map, reads),
+        .filter => |f| try blockReads(allocator, f.upstream, cse, map, reads),
+        .order_by => |o| try blockReads(allocator, o.upstream, cse, map, reads),
+        .group_by => |g| try blockReads(allocator, g.upstream, cse, map, reads),
+        .compute => |c| try blockReads(allocator, c.upstream, cse, map, reads),
+        .alias => |a| try blockReads(allocator, a.upstream, cse, map, reads),
+        .limit => |l| try blockReads(allocator, l.upstream, cse, map, reads),
+        .window => |w| try blockReads(allocator, w.upstream, cse, map, reads),
+        .table_fn => |t| for (t.inputs) |inp| try blockReads(allocator, inp, cse, map, reads),
+        .join => |j| {
+            try blockReads(allocator, j.left, cse, map, reads);
+            try blockReads(allocator, j.right, cse, map, reads);
+        },
+        .set_union => |u| {
+            try blockReads(allocator, u.left, cse, map, reads);
+            try blockReads(allocator, u.right, cse, map, reads);
+        },
+        else => {},
+    }
+}
+
 /// Post-order walk: a stage's own upstream stages exist (and are compiled)
 /// before the stage's body compiles, so its MatScan leaves can bind.
 fn collectStages(
@@ -315,6 +445,7 @@ fn collectStages(
     set: *mat_stage.StageSet,
     map: *StageMap,
     cse: *const MatCse,
+    pins: *CompilePins,
 ) anyerror!void {
     switch (op.*) {
         .materialize => {
@@ -332,16 +463,17 @@ fn collectStages(
             if (rep.materialize.recursion) |rec| switch (rec) {
                 .self_ref => return,
                 .cte => |info| {
-                    try collectStages(input, info.anchor, set, map, cse);
-                    try collectStages(input, info.step, set, map, cse);
+                    try collectStages(input, info.anchor, set, map, cse, pins);
+                    try collectStages(input, info.step, set, map, cse, pins);
                     const stage = try set.addStage(try recursive_cte.create(input, info, map), input.accountant);
                     stage.name = rep.materialize.name orelse "";
                     try map.put(input.allocator, rep, stage);
                     if (rep != op) try map.put(input.allocator, op, stage);
+                    pins.bodyCompiled(rep, map);
                     return;
                 },
             };
-            try collectStages(input, rep.materialize.upstream, set, map, cse);
+            try collectStages(input, rep.materialize.upstream, set, map, cse, pins);
             // Single reference → no stage; the body compiles inline at the
             // use site (buildGenericBlock's .materialize arm) — including
             // UNION bodies, which stream arm-then-arm through exec.SetUnion
@@ -351,18 +483,7 @@ fn collectStages(
             // An explicit `AS MATERIALIZED` CTE stages regardless — the user
             // demanded a real buffer (and the budget charge that comes with
             // it).
-            const single_ref = (cse.refs.get(rep) orelse 1) <= 1;
-            // Profiling overrides that stage normally-inlined single-ref CTEs so
-            // `--profile-ops` emits a distinct `[cte]` line per block (both
-            // correctness-neutral, both add the copy tax inlining avoids):
-            //   THINDB_PROFILE_FORCE_STAGE   — EVERY CTE (incl. pure streaming).
-            //   THINDB_PROFILE_STAGE_BARRIERS — only CTEs whose own operations
-            //     already form a barrier (GROUP BY / ORDER BY / WINDOW / JOIN /
-            //     UNION) — those buffer internally anyway, so staging them is
-            //     close to the real execution; thin streaming CTEs stay fused.
-            const prof_stage = forceStageAll() or
-                (stageBarriersOnly() and bodyFormsBarrier(rep.materialize.upstream));
-            if ((single_ref or noStage()) and !rep.materialize.forced and !prof_stage) return;
+            if (!stagesBody(rep, cse)) return;
             const c0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const child0 = if (exec.prof.enabled) exec.prof.cteChildTicks() else 0;
             var q = try compileBlock(input, rep.materialize.upstream, map);
@@ -406,24 +527,25 @@ fn collectStages(
             }
             try map.put(input.allocator, rep, stage);
             if (rep != op) try map.put(input.allocator, op, stage);
+            pins.bodyCompiled(rep, map);
         },
-        .select => |p| try collectStages(input, p.upstream, set, map, cse),
-        .exclude => |p| try collectStages(input, p.upstream, set, map, cse),
-        .filter => |f| try collectStages(input, f.upstream, set, map, cse),
-        .order_by => |o| try collectStages(input, o.upstream, set, map, cse),
-        .group_by => |g| try collectStages(input, g.upstream, set, map, cse),
-        .compute => |c| try collectStages(input, c.upstream, set, map, cse),
-        .alias => |a| try collectStages(input, a.upstream, set, map, cse),
-        .limit => |l| try collectStages(input, l.upstream, set, map, cse),
-        .window => |w| try collectStages(input, w.upstream, set, map, cse),
-        .table_fn => |t| for (t.inputs) |inp| try collectStages(input, inp, set, map, cse),
+        .select => |p| try collectStages(input, p.upstream, set, map, cse, pins),
+        .exclude => |p| try collectStages(input, p.upstream, set, map, cse, pins),
+        .filter => |f| try collectStages(input, f.upstream, set, map, cse, pins),
+        .order_by => |o| try collectStages(input, o.upstream, set, map, cse, pins),
+        .group_by => |g| try collectStages(input, g.upstream, set, map, cse, pins),
+        .compute => |c| try collectStages(input, c.upstream, set, map, cse, pins),
+        .alias => |a| try collectStages(input, a.upstream, set, map, cse, pins),
+        .limit => |l| try collectStages(input, l.upstream, set, map, cse, pins),
+        .window => |w| try collectStages(input, w.upstream, set, map, cse, pins),
+        .table_fn => |t| for (t.inputs) |inp| try collectStages(input, inp, set, map, cse, pins),
         .join => |j| {
-            try collectStages(input, j.left, set, map, cse);
-            try collectStages(input, j.right, set, map, cse);
+            try collectStages(input, j.left, set, map, cse, pins);
+            try collectStages(input, j.right, set, map, cse, pins);
         },
         .set_union => |u| {
-            try collectStages(input, u.left, set, map, cse);
-            try collectStages(input, u.right, set, map, cse);
+            try collectStages(input, u.left, set, map, cse, pins);
+            try collectStages(input, u.right, set, map, cse, pins);
         },
         else => {},
     }

@@ -856,11 +856,28 @@ fn intoPeriod(comptime period: Period, ymd: @TypeOf(daysToYmd(0)), micros: i64) 
     return (month * 32 + ymd.day) * std.time.us_per_day + @mod(micros, std.time.us_per_day);
 }
 
-pub fn monthsDiffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const a = args[0].data.datetime;
-    const b = args[1].data.datetime;
-    for (a[0..row_count], b[0..row_count]) |x, y| try out.data.bigint.append(allocator, periodsDiff(.month, x, y));
+/// StarRocks' YEARS_DIFF(a, b), MONTHS_DIFF(a, b) and the rest of that
+/// family down to MILLISECONDS_DIFF(a, b): `a - b` in whole units, counted
+/// as TIMESTAMPDIFF(unit, b, a) counts them. There is no QUARTERS_DIFF or
+/// MICROSECONDS_DIFF, as in StarRocks.
+fn UnitsDiff(comptime unit: DiffUnit) type {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const a = args[0].data.datetime;
+            const b = args[1].data.datetime;
+            for (a[0..row_count], b[0..row_count]) |x, y| try out.data.bigint.append(allocator, timestampDiff(unit, y, x));
+        }
+    };
 }
+
+pub const yearsDiffKernel = UnitsDiff(.year).kernel;
+pub const monthsDiffKernel = UnitsDiff(.month).kernel;
+pub const weeksDiffKernel = UnitsDiff(.week).kernel;
+pub const daysDiffKernel = UnitsDiff(.day).kernel;
+pub const hoursDiffKernel = UnitsDiff(.hour).kernel;
+pub const minutesDiffKernel = UnitsDiff(.minute).kernel;
+pub const secondsDiffKernel = UnitsDiff(.second).kernel;
+pub const millisecondsDiffKernel = UnitsDiff(.millisecond).kernel;
 
 pub fn timestampDiffKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const unit = try parseDiffUnit(stringViewOf(args[0]).rowBytes(0));
