@@ -20,6 +20,7 @@
 //! batch's prefetch look-ahead.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 /// gid sentinel marking an empty slot. `n_groups` can never reach this value
@@ -1268,6 +1269,171 @@ pub const DistinctU128Set = struct {
     }
 };
 
+/// The digest `DistinctStrSet` locates a value by (single-seed Wyhash).
+pub fn distinctStrDigest(bytes: []const u8) u64 {
+    const h = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, bytes);
+    // Test builds keep 8 bits so every suite that folds a string COUNT(DISTINCT)
+    // drives the exact-compare collision chain; at full width no test-sized
+    // input ever collides.
+    return if (builtin.is_test) h & 0xFF else h;
+}
+
+/// Exact membership set over (gid, byte string) pairs, for grouped
+/// COUNT(DISTINCT) over a string input. A slot carries the value's digest,
+/// group, and length, plus either the bytes themselves (≤ 8 bytes, zero-padded)
+/// or a (page, offset) reference into the set's own byte pages. The digest only
+/// places and pre-filters a probe: equality is decided on the bytes, so two
+/// values whose digests collide occupy two slots on one probe chain. Bytes are
+/// copied once per NEW pair, into pages from the caller's (query-accounted)
+/// allocator that grow geometrically up to `MAX_PAGE`; a repeat sighting
+/// copies nothing. Same reserve-then-prefetch contract as the lean integer
+/// sets: `ensureFor` before a batch keeps slot addresses stable.
+pub const DistinctStrSet = struct {
+    pub const Slot = struct {
+        digest: u64,
+        data: u64,
+        gid: u32,
+        len: u32,
+    };
+
+    slots: []Slot = &.{},
+    len: usize = 0,
+    pages: std.ArrayListUnmanaged([]u8) = .empty,
+    // The page new bytes are appended to (values too large for a fill page
+    // get a dedicated page and leave this one current).
+    fill_page: usize = 0,
+    fill_used: usize = 0,
+    page_bytes: usize = 0,
+
+    pub const INLINE_MAX: usize = 8;
+    const EMPTY_LEN: u32 = std.math.maxInt(u32);
+    const EMPTY_SLOT: Slot = .{ .digest = 0, .data = 0, .gid = 0, .len = EMPTY_LEN };
+    const FIRST_PAGE: usize = 4096;
+    const MAX_PAGE: usize = 1 << 20;
+
+    pub const empty: DistinctStrSet = .{};
+
+    pub fn deinit(self: *DistinctStrSet, allocator: Allocator) void {
+        if (self.slots.len != 0) allocator.free(self.slots);
+        for (self.pages.items) |p| allocator.free(p);
+        self.pages.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn count(self: DistinctStrSet) usize {
+        return self.len;
+    }
+
+    pub inline fn occupied(slot: Slot) bool {
+        return slot.len != EMPTY_LEN;
+    }
+
+    inline fn slotHash(gid: u32, digest: u64) u64 {
+        return mix64(digest ^ mix64(gid));
+    }
+
+    inline fn packInline(bytes: []const u8) u64 {
+        var buf = [_]u8{0} ** INLINE_MAX;
+        @memcpy(buf[0..bytes.len], bytes);
+        return std.mem.readInt(u64, &buf, .little);
+    }
+
+    pub fn ensureFor(self: *DistinctStrSet, allocator: Allocator, additional: usize) !void {
+        if (self.slots.len == 0) {
+            const slots = try allocator.alloc(Slot, capacityFor(additional));
+            @memset(slots, EMPTY_SLOT);
+            self.slots = slots;
+            return;
+        }
+        if ((self.len + additional) * 4 >= self.slots.len * 3) try self.grow(allocator, additional);
+    }
+
+    fn grow(self: *DistinctStrSet, allocator: Allocator, additional: usize) !void {
+        var new_cap = self.slots.len;
+        while ((self.len + additional) * 4 >= new_cap * 3) new_cap *= 2;
+        const slots = try allocator.alloc(Slot, new_cap);
+        @memset(slots, EMPTY_SLOT);
+        const new_mask = new_cap - 1;
+        for (self.slots) |s| {
+            if (!occupied(s)) continue;
+            var i = @as(usize, @truncate(slotHash(s.gid, s.digest))) & new_mask;
+            while (occupied(slots[i])) : (i = (i + 1) & new_mask) {}
+            slots[i] = s;
+        }
+        allocator.free(self.slots);
+        self.slots = slots;
+    }
+
+    pub inline fn prefetch(self: *DistinctStrSet, gid: u32, digest: u64) void {
+        if (self.slots.len == 0) return;
+        @prefetch(&self.slots[@as(usize, @truncate(slotHash(gid, digest))) & (self.slots.len - 1)], .{ .rw = .write, .locality = 1 });
+    }
+
+    /// Insert (gid, bytes), whose digest is `digest`; returns whether the pair
+    /// is new. Room must have been reserved with `ensureFor`. On an allocation
+    /// failure the set is unchanged.
+    pub fn insertNew(self: *DistinctStrSet, allocator: Allocator, gid: u32, digest: u64, bytes: []const u8) !bool {
+        const len: u32 = @intCast(bytes.len);
+        const is_inline = bytes.len <= INLINE_MAX;
+        const inline_bits = if (is_inline) packInline(bytes) else 0;
+        const mask = self.slots.len - 1;
+        var b = @as(usize, @truncate(slotHash(gid, digest))) & mask;
+        while (true) : (b = (b + 1) & mask) {
+            const s = &self.slots[b];
+            if (!occupied(s.*)) {
+                const data = if (is_inline) inline_bits else try self.storeBytes(allocator, bytes);
+                s.* = .{ .digest = digest, .data = data, .gid = gid, .len = len };
+                self.len += 1;
+                return true;
+            }
+            if (s.digest != digest or s.gid != gid or s.len != len) continue;
+            if (is_inline) {
+                if (s.data == inline_bits) return false;
+            } else if (std.mem.eql(u8, self.pageBytes(s.data, s.len), bytes)) {
+                return false;
+            }
+        }
+    }
+
+    /// The value an occupied slot holds. An inline value is unpacked into `buf`.
+    pub fn bytesOf(self: *const DistinctStrSet, slot: Slot, buf: *[INLINE_MAX]u8) []const u8 {
+        if (slot.len <= INLINE_MAX) {
+            std.mem.writeInt(u64, buf, slot.data, .little);
+            return buf[0..slot.len];
+        }
+        return self.pageBytes(slot.data, slot.len);
+    }
+
+    inline fn pageBytes(self: *const DistinctStrSet, data: u64, len: u32) []const u8 {
+        const page: usize = @intCast(data >> 32);
+        const off: usize = @as(u32, @truncate(data));
+        return self.pages.items[page][off..][0..len];
+    }
+
+    fn storeBytes(self: *DistinctStrSet, allocator: Allocator, bytes: []const u8) !u64 {
+        const fits = self.pages.items.len != 0 and self.fill_used + bytes.len <= self.pages.items[self.fill_page].len;
+        if (fits) {
+            const off = self.fill_used;
+            @memcpy(self.pages.items[self.fill_page][off..][0..bytes.len], bytes);
+            self.fill_used += bytes.len;
+            return (@as(u64, self.fill_page) << 32) | off;
+        }
+        const page_size = std.math.clamp(self.page_bytes, FIRST_PAGE, MAX_PAGE);
+        try self.pages.ensureUnusedCapacity(allocator, 1);
+        const dedicated = bytes.len * 2 > page_size;
+        const page = try allocator.alloc(u8, if (dedicated) bytes.len else page_size);
+        self.pages.appendAssumeCapacity(page);
+        self.page_bytes += page.len;
+        const index = self.pages.items.len - 1;
+        @memcpy(page[0..bytes.len], bytes);
+        if (!dedicated) {
+            self.fill_page = index;
+            self.fill_used = bytes.len;
+        }
+        return @as(u64, index) << 32;
+    }
+};
+
 /// Open-addressing table that holds the COUNT(*) *inside* the slot, for the
 /// `GROUP BY <single int col> … COUNT(*)` fast path. The classic two-array
 /// shape (a `{key,gid}` group table plus a separate per-gid count array) costs
@@ -1834,4 +2000,77 @@ test "ByteGroupTable getOrPut + grow with external keys" {
         try std.testing.expect(p.found);
         try std.testing.expectEqual(@as(u32, @intCast(i)), p.gid);
     }
+}
+
+test "DistinctStrSet separates values whose digests collide" {
+    const allocator = std.testing.allocator;
+    var set = DistinctStrSet.empty;
+    defer set.deinit(allocator);
+
+    const values = [_][]const u8{ "", "a", "a\x00", "abcdefgh", "abcdefgi", "abcdefghi", "abcdefghj", "a much longer value that lives in a byte page" };
+    try set.ensureFor(allocator, values.len * 2);
+    for (values) |v| try std.testing.expect(try set.insertNew(allocator, 3, 7, v));
+    for (values) |v| try std.testing.expect(!try set.insertNew(allocator, 3, 7, v));
+    // The same bytes under another group are a new pair.
+    try std.testing.expect(try set.insertNew(allocator, 4, 7, "abcdefghi"));
+    try std.testing.expect(!try set.insertNew(allocator, 4, 7, "abcdefghi"));
+    try std.testing.expectEqual(values.len + 1, set.count());
+
+    var seen: usize = 0;
+    var buf: [DistinctStrSet.INLINE_MAX]u8 = undefined;
+    for (set.slots) |s| {
+        if (!DistinctStrSet.occupied(s)) continue;
+        const bytes = set.bytesOf(s, &buf);
+        var matched = false;
+        for (values) |v| matched = matched or std.mem.eql(u8, v, bytes);
+        try std.testing.expect(matched);
+        seen += 1;
+    }
+    try std.testing.expectEqual(values.len + 1, seen);
+}
+
+test "DistinctStrSet grows, pages long values, and keeps every pair" {
+    const allocator = std.testing.allocator;
+    var set = DistinctStrSet.empty;
+    defer set.deinit(allocator);
+
+    const n: usize = 6000;
+    var pass: usize = 0;
+    while (pass < 2) : (pass += 1) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var buf: [64]u8 = undefined;
+            const v = std.fmt.bufPrint(&buf, "value-{d}-{s}", .{ i, if (i % 3 == 0) "padded out past one inline word" else "" }) catch unreachable;
+            try set.ensureFor(allocator, 1);
+            const is_new = try set.insertNew(allocator, @intCast(i % 5), distinctStrDigest(v), v);
+            try std.testing.expectEqual(pass == 0, is_new);
+        }
+    }
+    try std.testing.expectEqual(n, set.count());
+
+    const huge = try allocator.alloc(u8, DistinctStrSet.MAX_PAGE + 17);
+    defer allocator.free(huge);
+    @memset(huge, 'x');
+    try set.ensureFor(allocator, 2);
+    try std.testing.expect(try set.insertNew(allocator, 0, distinctStrDigest(huge), huge));
+    try std.testing.expect(!try set.insertNew(allocator, 0, distinctStrDigest(huge), huge));
+    try std.testing.expect(try set.insertNew(allocator, 0, distinctStrDigest("after the huge one"), "after the huge one"));
+    try std.testing.expectEqual(n + 2, set.count());
+}
+
+fn distinctStrSetFixture(allocator: Allocator) !void {
+    var set = DistinctStrSet.empty;
+    defer set.deinit(allocator);
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var buf: [48]u8 = undefined;
+        const v = std.fmt.bufPrint(&buf, "{d}-some bytes beyond the inline word", .{i}) catch unreachable;
+        try set.ensureFor(allocator, 1);
+        _ = try set.insertNew(allocator, @intCast(i % 3), distinctStrDigest(v), v);
+    }
+    try std.testing.expectEqual(@as(usize, 300), set.count());
+}
+
+test "DistinctStrSet releases everything after a failed allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctStrSetFixture, .{});
 }
