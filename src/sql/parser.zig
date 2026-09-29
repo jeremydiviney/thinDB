@@ -8243,19 +8243,19 @@ fn reverseRangeOp(op: PredicateOp) PredicateOp {
 
 test "no scalar UDF can take a function that syntax lowers to" {
     const units = [_][]const u8{ "day", "week", "month", "quarter", "year", "hour", "minute", "second", "microsecond" };
-    for (units) |unit| try std.testing.expect(udf_mod.isReservedScalarName(intervalUnit(unit).?.fn_name));
-    for (EXTRACT_FIELDS ++ EXTRACT_COMPOUND_FNS) |name| try std.testing.expect(udf_mod.isReservedScalarName(name));
+    for (units) |unit| try std.testing.expect(scalar_fn.isReservedScalarUdfName(intervalUnit(unit).?.fn_name));
+    for (EXTRACT_FIELDS ++ EXTRACT_COMPOUND_FNS) |name| try std.testing.expect(scalar_fn.isReservedScalarUdfName(name));
     for (std.enums.values(scalar_fn.BitOperator)) |op| {
-        for (std.enums.values(types.Dialect)) |dialect| try std.testing.expect(udf_mod.isReservedScalarName(scalar_fn.bitOperatorFn(op, dialect)));
+        for (std.enums.values(types.Dialect)) |dialect| try std.testing.expect(scalar_fn.isReservedScalarUdfName(scalar_fn.bitOperatorFn(op, dialect)));
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const cast_targets = [_]types.Type{ .int, .bigint, .smallint, .tinyint, .largeint, .float, .double, .boolean, .date, .datetime, .string, .json };
-    for (cast_targets) |ty| try std.testing.expect(udf_mod.isReservedScalarName((try scalar_fn.castFnName(arena.allocator(), ty)).?));
+    for (cast_targets) |ty| try std.testing.expect(scalar_fn.isReservedScalarUdfName((try scalar_fn.castFnName(arena.allocator(), ty)).?));
     inline for (.{ "ltrim_substring", "json_extract", "json_value", "regexp_like", "soundex", "str_to_time", scalar_fn.ORDER_KEY_FN }) |name| {
-        try std.testing.expect(udf_mod.isReservedScalarName(name));
+        try std.testing.expect(scalar_fn.isReservedScalarUdfName(name));
     }
-    try std.testing.expect(!udf_mod.isReservedScalarName("score_bucket"));
+    try std.testing.expect(!scalar_fn.isReservedScalarUdfName("score_bucket"));
 }
 
 test "sql table function: CREATE parse, body capture, validation, expansion" {

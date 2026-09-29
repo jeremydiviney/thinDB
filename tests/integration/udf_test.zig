@@ -436,6 +436,46 @@ test "multiple aggregate UDFs can mix with multiple built-ins" {
     try std.testing.expectEqual(@as(i64, 1), batch.values[4].data.bigint[1]);
 }
 
+test "creating a scalar UDF refuses any name a builtin answers to (issue #407)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // A builtin, its alias the parser rewrites, a name syntax lowers to,
+    // generated and special-cased resolver names, builtins added after the
+    // first UDFs, and the engine's `__` names.
+    const reserved = [_][]const u8{
+        "upper",      "UCASE",      "date_add_hours", "extract_day_hour", "json_array",     "bitand",
+        "years_diff", "Weeks_Diff", "to_largeint",    "__order_key",      "__not_yet_used",
+    };
+    for (reserved) |name| {
+        std.testing.expectError(thindb.Error.FunctionAlreadyExists, db.registerScalarUdf(.{
+            .name = name,
+            .arg_types = &.{.double},
+            .return_type = .int,
+            .kernel = scoreBucketKernel,
+        })) catch |err| {
+            std.debug.print("registered a reserved name: {s}\n", .{name});
+            return err;
+        };
+    }
+    try db.registerScalarUdf(.{
+        .name = "score_bucket",
+        .arg_types = &.{.double},
+        .return_type = .int,
+        .kernel = scoreBucketKernel,
+    });
+    try std.testing.expectError(thindb.Error.FunctionAlreadyExists, db.registerScalarUdf(.{
+        .name = "Score_Bucket",
+        .arg_types = &.{.double},
+        .return_type = .int,
+        .kernel = scoreBucketKernel,
+    }));
+}
+
 test "UDF definitions are process-local and not persisted" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

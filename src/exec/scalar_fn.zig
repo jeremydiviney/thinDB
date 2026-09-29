@@ -641,6 +641,15 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     return false;
 }
 
+/// Whether a scalar UDF may not take `name`: the builtin resolver answers
+/// to it, as itself or as the alias the parser rewrites (`ucase`), so a UDF
+/// under it would take calls meant for a builtin, or for the function some
+/// syntax lowers to, or never be called; or it starts `__`, as the engine's
+/// own functions do.
+pub fn isReservedScalarUdfName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "__") or nameResolvable(null, canonicalName(name));
+}
+
 /// CHARSET(x) and COLLATION(x) depend on x's type alone, so they take any
 /// argument, NULL too.
 fn resolveCharset(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {

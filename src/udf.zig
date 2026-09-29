@@ -842,7 +842,6 @@ pub const UdfRegistry = struct {
     pub fn registerScalar(self: *UdfRegistry, udf: ScalarUdf) !void {
         try validateName(udf.name);
         if (udf.arg_types.len > 16) return Error.FunctionInvalidDefinition;
-        if (isReservedScalarName(udf.name)) return Error.FunctionAlreadyExists;
         if (self.scalarOverloadExists(udf.name, udf.arg_types)) return Error.FunctionAlreadyExists;
 
         const name = try lowerName(self.allocator, udf.name);
@@ -965,50 +964,9 @@ fn isReservedAggregateName(name: []const u8) bool {
     return false;
 }
 
-/// Whether a scalar UDF may not take `name`: a UDF under it would win calls
-/// meant for a builtin, or for the function some syntax lowers to. Names
-/// starting `__` are the engine's own.
-pub fn isReservedScalarName(name: []const u8) bool {
-    if (std.mem.startsWith(u8, name, "__")) return true;
-    // Syntax lowers to these rather than calling them by name: INTERVAL,
-    // TIMESTAMPADD, TRIM(... FROM), EXTRACT, the bit and JSON operators,
-    // REGEXP, SOUNDS LIKE, CAST and STR_TO_DATE.
-    const lowered = [_][]const u8{
-        "date_add_weeks",             "date_add_quarters",          "date_add_hours",           "date_add_minutes",
-        "date_add_seconds",           "date_add_micros",            "ltrim_substring",          "rtrim_substring",
-        "trim_substring",             "week",                       "microsecond",              "extract_year_month",
-        "extract_day_hour",           "extract_day_minute",         "extract_day_second",       "extract_day_microsecond",
-        "extract_hour_minute",        "extract_hour_second",        "extract_hour_microsecond", "extract_minute_second",
-        "extract_minute_microsecond", "extract_second_microsecond", "bitand",                   "bitor",
-        "bitxor",                     "bitnot",                     "bit_shift_left",           "bit_shift_right",
-        "json_extract",               "json_value",                 "regexp_like",              "soundex",
-        "to_json",                    "str_to_time",
-    };
-    for (lowered) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
-    const names = [_][]const u8{
-        "upper",          "lower",             "ltrim",        "rtrim",           "trim",            "reverse",
-        "length",         "octet_length",      "char_length",  "concat",          "substring",       "replace",
-        "regexp_replace", "coalesce",          "ifnull",       "nullif",          "abs",             "ceil",
-        "floor",          "round",             "sign",         "mod",             "add",             "sub",
-        "mul",            "div",               "intdiv",       "pow",             "sqrt",            "exp",
-        "ln",             "log10",             "log2",         "greatest",        "least",           "truncate",
-        "degrees",        "radians",           "atan2",        "dayofweek",       "dayofyear",       "quarter",
-        "last_day",       "date_add",          "date_sub",     "date_add_months", "date_add_years",  "extract",
-        "date_trunc",     "year",              "month",        "day",             "makedate",        "hour",
-        "minute",         "second",            "datediff",     "unix_timestamp",  "from_unixtime",   "date_format",
-        "now",            "current_timestamp", "current_date", "to_bigint",       "to_double",       "to_int",
-        "to_smallint",    "to_tinyint",        "to_largeint",  "to_boolean",      "to_date",         "to_datetime",
-        "to_string",      "md5",               "sha1",         "sha256",          "crc32",           "hex",
-        "unhex",          "to_base64",         "from_base64",  "lpad",            "rpad",            "repeat",
-        "space",          "ascii",             "position",     "instr",           "substring_index", "strcmp",
-        "lcase",          "ucase",             "power",        "ceiling",         "chr",             "substr",
-        "mid",            "date",              "char",         "months_add",      "months_diff",     "date_diff",
-    };
-    for (names) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
-    return false;
-}
-
-test "udf registry rejects duplicates and reserved builtins" {
+// Creating a function reserves builtin names (`Catalog.registerScalarUdf`);
+// the registry itself takes any name.
+test "udf registry rejects a duplicate overload and takes a builtin's name" {
     const testing = std.testing;
     var reg = UdfRegistry.init(testing.allocator);
     defer reg.deinit();
@@ -1021,25 +979,12 @@ test "udf registry rejects duplicates and reserved builtins" {
         }
     }.kernel;
 
-    try testing.expectError(Error.FunctionAlreadyExists, reg.registerScalar(.{
+    try reg.registerScalar(.{
         .name = "upper",
         .arg_types = &.{.string},
         .return_type = .string,
         .kernel = noop,
-    }));
-    try testing.expectError(Error.FunctionAlreadyExists, reg.registerScalar(.{
-        .name = "DATE_ADD_HOURS",
-        .arg_types = &.{ .date, .int },
-        .return_type = .datetime,
-        .kernel = noop,
-    }));
-    try testing.expectError(Error.FunctionAlreadyExists, reg.registerScalar(.{
-        .name = "__order_key",
-        .arg_types = &.{.int},
-        .return_type = .string,
-        .kernel = noop,
-    }));
-
+    });
     try reg.registerScalar(.{
         .name = "score_bucket",
         .arg_types = &.{.double},
