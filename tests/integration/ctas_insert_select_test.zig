@@ -206,9 +206,9 @@ test "CTAS: the target stays hidden while its query runs, and a failed query lea
     // table the failure frees (#377).
     try expectStatementFails(allocator, db, "CREATE TABLE dst AS SELECT build_probe(id) AS id FROM src");
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
-    try std.testing.expectEqual(@as(usize, 1), probe.build_dirs);
     try std.testing.expect(!probe.resolvable);
     try std.testing.expect(!probe.listed);
+    try std.testing.expectEqual(@as(usize, 1), probe.build_dirs);
     try std.testing.expectError(thindb.Error.TableNotFound, db.openTable("dst", .{}));
     try std.testing.expectEqual(@as(usize, 0), try countBuildDirs(sc));
     try std.testing.expectError(error.FileNotFound, sc.schema_dir.access(io, "dst", .{}));
