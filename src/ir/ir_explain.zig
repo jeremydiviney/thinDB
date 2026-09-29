@@ -619,7 +619,11 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
 fn explainPredicate(allocator: Allocator, out: *std.ArrayList(u8), p: PredicateExpr) anyerror!void {
     switch (p) {
         .leaf, .text_as_number => |l| {
-            try out.appendSlice(allocator, l.col);
+            if (l.as_boolean) {
+                try out.appendSlice(allocator, "CAST(");
+                try out.appendSlice(allocator, l.col);
+                try out.appendSlice(allocator, " AS BOOLEAN)");
+            } else try out.appendSlice(allocator, l.col);
             try out.append(allocator, ' ');
             try out.appendSlice(allocator, opSymbol(l.op));
             try out.append(allocator, ' ');

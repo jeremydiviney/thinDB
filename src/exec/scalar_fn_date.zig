@@ -201,27 +201,21 @@ fn makeDate(year: i32, day_of_year: i32) ?i32 {
     if (day_of_year <= 0 or year < 0 or year > 9999) return null;
     const full_year = if (year >= 100) year else year + @as(i32, if (year < 70) 2000 else 1900);
     const days = @as(i64, common.ymdToDays(full_year, 1, 1)) + day_of_year - 1;
-    if (days > LAST_DATE_DAYS) return null;
+    if (days > common.LAST_DATE_DAYS) return null;
     return @intCast(days);
 }
 
-/// 9999-12-31, the last day MySQL's day numbers reach.
-const LAST_DATE_DAYS: i64 = 2_932_896;
+/// The day number of 1970-01-01 (TO_DAYS): days since 0000-01-01.
+const DAY_NUMBER_OF_EPOCH: i64 = -@as(i64, common.FIRST_DATE_DAYS);
 
-/// MySQL's day number of 1970-01-01 (TO_DAYS).
-const DAY_NUMBER_OF_EPOCH: i64 = 719_528;
-
-/// MySQL's day number (TO_DAYS) of a date: days since year 0, which MySQL
-/// counts as 365 days long. Null for 0000-02-29, which MySQL has no day
-/// for, and before year 0.
+/// The day number (TO_DAYS) of a date: days since 0000-01-01, in the one
+/// calendar every date reads (`common.validDate`), where year 0 has 366
+/// days, as StarRocks counts them. MySQL counts year 0 as 365 days, so its
+/// numbers for 0000-01-01 through 0000-02-28 are one higher. Null before
+/// year 0.
 fn dayNumber(days: i32) ?i64 {
-    const ymd = daysToYmd(days);
-    if (ymd.year < 0) return null;
-    if (ymd.year == 0 and ymd.month <= 2) {
-        if (ymd.month == 2 and ymd.day == 29) return null;
-        return @as(i64, days) + DAY_NUMBER_OF_EPOCH + 1;
-    }
-    return @as(i64, days) + DAY_NUMBER_OF_EPOCH;
+    const number = @as(i64, days) + DAY_NUMBER_OF_EPOCH;
+    return if (number < 0) null else number;
 }
 
 pub fn toDaysKernel(comptime temporal: enum { date, datetime }) Kernel {
@@ -254,15 +248,15 @@ pub fn toSecondsKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     }
 }
 
-/// FROM_DAYS: the date of a MySQL day number. Numbers before 0001-01-01
-/// or past 9999-12-31 are NULL; MySQL gives its zero date for most of
-/// them, which a DATE can't hold.
+/// FROM_DAYS: the date of a day number (`dayNumber`). Numbers before
+/// 0000-01-01 or past 9999-12-31 are NULL. StarRocks gives its zero date
+/// before 0000-01-01, and MySQL before 0001-01-01; a DATE can't hold it.
 pub fn fromDaysKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();
     const numbers = args[0].data.bigint;
     for (0..row_count) |i| {
         const n = numbers[i];
-        const valid = args[0].isValid(i) and n >= 366 and n <= LAST_DATE_DAYS + DAY_NUMBER_OF_EPOCH;
+        const valid = args[0].isValid(i) and n >= 0 and n <= common.LAST_DATE_DAYS + DAY_NUMBER_OF_EPOCH;
         try out.data.date.append(allocator, if (valid) @intCast(n - DAY_NUMBER_OF_EPOCH) else 0);
         try out.appendValidBit(allocator, base + i, valid);
     }
@@ -944,18 +938,19 @@ test "TIMESTAMPDIFF counts whole units as MySQL does" {
     try std.testing.expectError(error.ComputeUnsupportedExpr, parseDiffUnit("SQL_TSI_FORTNIGHT"));
 }
 
-test "periods, day numbers and zone offsets follow MySQL" {
+test "periods, day numbers and zone offsets follow MySQL, and year 0 StarRocks" {
     const t = std.testing;
-    // Every expected value is MySQL 8.4's.
+    // Every expected value is MySQL 8.4's, except day numbers before
+    // 0000-03-01, which are StarRocks'.
     inline for (.{ .{ 202601, 13, 202702 }, .{ 6901, 1, 206902 }, .{ 7001, -1, 196912 }, .{ 1, -1, 199912 }, .{ 9912, 1, 200001 } }) |c| {
         try t.expectEqual(@as(u64, c[2]), monthsPeriod(periodMonths(c[0]) +% @as(u64, @bitCast(@as(i64, c[1])))));
     }
     try t.expectEqual(@as(u64, 313), periodMonths(202601) -% periodMonths(199912));
     inline for (.{ 0, -5, 202600, 202613 }) |p| try t.expect(!validPeriod(p));
-    inline for (.{ .{ 0, 1, 1, 1 }, .{ 0, 3, 1, 60 }, .{ 1970, 1, 1, 719_528 }, .{ 2026, 9, 26, 740_250 }, .{ 1, 1, 1, 366 } }) |c| {
+    inline for (.{ .{ 0, 1, 1, 0 }, .{ 0, 2, 29, 59 }, .{ 0, 3, 1, 60 }, .{ 1970, 1, 1, 719_528 }, .{ 2026, 9, 26, 740_250 }, .{ 1, 1, 1, 366 } }) |c| {
         try t.expectEqual(@as(?i64, c[3]), dayNumber(common.ymdToDays(c[0], c[1], c[2])));
     }
-    try t.expectEqual(@as(?i64, null), dayNumber(common.ymdToDays(0, 2, 29)));
+    try t.expectEqual(@as(?i64, null), dayNumber(common.ymdToDays(-1, 12, 31)));
     inline for (.{ .{ "+14:00", 50_400 }, .{ "-13:59", -50_340 }, .{ "+5:30", 19_800 }, .{ "+05:3", 18_180 }, .{ "utc", 0 } }) |c| {
         try t.expectEqual(@as(?i64, c[1]), zoneOffsetSeconds(c[0]));
     }

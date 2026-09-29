@@ -38,6 +38,7 @@ pub const Error = error{
     UnsupportedParamFormat,
     UnsupportedParamOid,
     MalformedBindParam,
+    InvalidTemporalParam,
     InvalidDescribeTarget,
     InvalidCloseTarget,
 };
@@ -491,20 +492,23 @@ fn renderBinaryParam(arena: Allocator, raw: []const u8, oid: u32) ![]const u8 {
             break :blk try std.fmt.allocPrint(arena, "{d}", .{v});
         },
         OID_TEXT, 0 => try renderStringLiteral(arena, raw),
+        // A date or timestamp renders as the text-format literal, so a DATE
+        // column reads it as that day and not as a YYYYMMDD number. PG's
+        // infinity and -infinity are the extreme integers, and like any
+        // value past years 0-9999 no DATE holds them.
         OID_DATE => blk: {
             if (raw.len != 4) return Error.MalformedBindParam;
-            const pg_days = std.mem.readInt(i32, raw[0..4], .big);
-            const unix_days = pg_days + PG_DATE_EPOCH_UNIX_DAYS;
-            // thinDB's parser doesn't accept ISO date literals; emit
-            // the underlying integer the same way MySQL prepared does
-            // for temporal types.
-            break :blk try std.fmt.allocPrint(arena, "{d}", .{unix_days});
+            const days = @as(i64, std.mem.readInt(i32, raw[0..4], .big)) + PG_DATE_EPOCH_UNIX_DAYS;
+            if (days < wire_format.FIRST_DATE_DAYS or days > wire_format.LAST_DATE_DAYS) return Error.InvalidTemporalParam;
+            var buf: [16]u8 = undefined;
+            break :blk try renderStringLiteral(arena, try wire_format.formatDate(&buf, @intCast(days)));
         },
         OID_TIMESTAMP => blk: {
             if (raw.len != 8) return Error.MalformedBindParam;
-            const pg_micros = std.mem.readInt(i64, raw[0..8], .big);
-            const unix_micros = pg_micros + PG_TIMESTAMP_EPOCH_UNIX_MICROS;
-            break :blk try std.fmt.allocPrint(arena, "{d}", .{unix_micros});
+            const micros = std.math.add(i64, std.mem.readInt(i64, raw[0..8], .big), PG_TIMESTAMP_EPOCH_UNIX_MICROS) catch return Error.InvalidTemporalParam;
+            if (micros < wire_format.FIRST_DATETIME_MICROS or micros > wire_format.LAST_DATETIME_MICROS) return Error.InvalidTemporalParam;
+            var buf: [40]u8 = undefined;
+            break :blk try renderStringLiteral(arena, try wire_format.formatDateTime(&buf, micros));
         },
         OID_UUID => blk: {
             if (raw.len != 16) return Error.MalformedBindParam;
@@ -809,6 +813,44 @@ test "renderOneParam decodes binary int8 BE" {
     std.mem.writeInt(i64, &raw, 9_000_000_000, .big);
     const out = try renderOneParam(arena.allocator(), &raw, 1, OID_INT8);
     try std.testing.expectEqualStrings("9000000000", out);
+}
+
+test "renderOneParam reads a binary date or timestamp as its text, and one no DATE holds as an error" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const dates = .{
+        .{ 0, "'2000-01-01'" },
+        .{ 9_768, "'2026-09-29'" },
+        .{ -730_485, "'0000-01-01'" },
+        .{ 2_921_939, "'9999-12-31'" },
+    };
+    inline for (dates) |c| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(i32, &raw, c[0], .big);
+        try std.testing.expectEqualStrings(c[1], try renderOneParam(arena.allocator(), &raw, 1, OID_DATE));
+    }
+    const timestamps = .{
+        .{ 0, "'2000-01-01 00:00:00'" },
+        .{ -500_000, "'1999-12-31 23:59:59.500000'" },
+        .{ 843_991_271_000_000, "'2026-09-29 10:01:11'" },
+    };
+    inline for (timestamps) |c| {
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(i64, &raw, c[0], .big);
+        try std.testing.expectEqualStrings(c[1], try renderOneParam(arena.allocator(), &raw, 1, OID_TIMESTAMP));
+    }
+    // PG's infinity and -infinity are the extreme integers.
+    inline for (.{ std.math.maxInt(i32), std.math.minInt(i32), -730_486, 2_921_940 }) |days| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(i32, &raw, days, .big);
+        try std.testing.expectError(Error.InvalidTemporalParam, renderOneParam(arena.allocator(), &raw, 1, OID_DATE));
+    }
+    inline for (.{ std.math.maxInt(i64), std.math.minInt(i64) }) |micros| {
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(i64, &raw, micros, .big);
+        try std.testing.expectError(Error.InvalidTemporalParam, renderOneParam(arena.allocator(), &raw, 1, OID_TIMESTAMP));
+    }
 }
 
 test "renderOneParam text-format text wraps as SQL string literal" {

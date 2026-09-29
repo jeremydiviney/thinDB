@@ -770,6 +770,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
             .op = p.op,
             .val = try cloneValue(aa, p.val),
             .from_statement = p.from_statement,
+            .as_boolean = p.as_boolean,
         } },
         .day_leaf => |p| PredicateExpr{ .day_leaf = .{
             .col = try aa.dupe(u8, p.col),

@@ -320,7 +320,7 @@ fn decodeBinaryValue(
         result_mod.MYSQL_TYPE_DATE,
         result_mod.MYSQL_TYPE_DATETIME,
         result_mod.MYSQL_TYPE_TIMESTAMP,
-        => try decodeBinaryTemporal(arena, body, cursor),
+        => try decodeBinaryTemporal(arena, body, cursor, meta.type_byte),
         result_mod.MYSQL_TYPE_NULL => "NULL",
         else => return error.UnsupportedParamType,
     };
@@ -330,43 +330,35 @@ fn decodeBinaryValue(
 /// prefixed) and render as a quoted temporal literal ('YYYY-MM-DD' /
 /// 'YYYY-MM-DD HH:MM:SS[.ffffff]') — exactly what a text-protocol client
 /// would send, so the value coerces into date/datetime AND string columns
-/// alike. The old raw-integer form (µs / days) fails type-checking against
-/// native datetime columns.
-fn decodeBinaryTemporal(arena: Allocator, body: []const u8, cursor: *usize) ![]const u8 {
+/// alike. A DATE parameter is its day, whatever time follows it, as MySQL
+/// reads it. Parts no DATE or DATETIME holds (a zero month or day, February
+/// 30, year 10000, hour 24, a million microseconds) are
+/// `InvalidTemporalParam`, as StarRocks fails the statement; so is the
+/// empty value, MySQL's zero date. MySQL keeps such a value and rejects it
+/// where it is stored.
+fn decodeBinaryTemporal(arena: Allocator, body: []const u8, cursor: *usize, type_byte: u8) ![]const u8 {
     if (cursor.* + 1 > body.len) return error.MalformedExecute;
     const len = body[cursor.*];
     cursor.* += 1;
     if (cursor.* + len > body.len) return error.MalformedExecute;
-    if (len == 0) return "NULL";
-    if (len < 4) return error.MalformedExecute;
-    const year = std.mem.readInt(u16, body[cursor.*..][0..2], .little);
-    const month = body[cursor.* + 2];
-    const day = body[cursor.* + 3];
-    var hour: u8 = 0;
-    var minute: u8 = 0;
-    var second: u8 = 0;
-    var micros: u32 = 0;
-    if (len >= 7) {
-        hour = body[cursor.* + 4];
-        minute = body[cursor.* + 5];
-        second = body[cursor.* + 6];
-    }
-    if (len >= 11) {
-        micros = std.mem.readInt(u32, body[cursor.*..][7..11], .little);
-    }
+    const value = body[cursor.*..][0..len];
     cursor.* += len;
-
-    const days_since_epoch: i64 = wire_format.daysFromCivil(@intCast(year), month, day);
-    if (len == 4) {
-        var buf: [16]u8 = undefined;
-        const txt = try wire_format.formatDate(&buf, @intCast(days_since_epoch));
-        return try std.fmt.allocPrint(arena, "'{s}'", .{txt});
-    }
-    const seconds_of_day: i64 = (@as(i64, hour) * 3600) + (@as(i64, minute) * 60) + @as(i64, second);
-    const total_micros: i64 = days_since_epoch * 86_400_000_000 + seconds_of_day * 1_000_000 + @as(i64, micros);
-    var buf: [40]u8 = undefined;
-    const txt = try wire_format.formatDateTime(&buf, total_micros);
-    return try std.fmt.allocPrint(arena, "'{s}'", .{txt});
+    if (len == 0) return error.InvalidTemporalParam;
+    if (len < 4) return error.MalformedExecute;
+    const year = std.mem.readInt(u16, value[0..2], .little);
+    const month = value[2];
+    const day = value[3];
+    if (!wire_format.validDate(year, month, day)) return error.InvalidTemporalParam;
+    if (type_byte == result_mod.MYSQL_TYPE_DATE or len < 7)
+        return std.fmt.allocPrint(arena, "'{d:0>4}-{d:0>2}-{d:0>2}'", .{ year, month, day });
+    const hour = value[4];
+    const minute = value[5];
+    const second = value[6];
+    const micros: u32 = if (len >= 11) std.mem.readInt(u32, value[7..11], .little) else 0;
+    if (hour > 23 or minute > 59 or second > 59 or micros >= std.time.us_per_s) return error.InvalidTemporalParam;
+    if (micros == 0)
+        return std.fmt.allocPrint(arena, "'{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}'", .{ year, month, day, hour, minute, second });
+    return std.fmt.allocPrint(arena, "'{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}'", .{ year, month, day, hour, minute, second, micros });
 }
 
 // ---------------------------------------------------------------------------
@@ -512,12 +504,12 @@ fn appendBinaryCell(
             try out.appendSlice(allocator, b[0..8]);
         },
         .date => |s| {
-            const ymd = wire_format.civilFromDays(@intCast(s[row]));
+            const ymd = wire_format.daysToYmd(s[row]);
             try out.append(allocator, 4);
-            std.mem.writeInt(u16, b[0..2], @intCast(ymd.y), .little);
+            std.mem.writeInt(u16, b[0..2], @intCast(ymd.year), .little);
             try out.appendSlice(allocator, b[0..2]);
-            try out.append(allocator, @intCast(ymd.m));
-            try out.append(allocator, @intCast(ymd.d));
+            try out.append(allocator, ymd.month);
+            try out.append(allocator, ymd.day);
         },
         .datetime => |s| try appendBinaryDateTime(allocator, out, s[row]),
         .decimal64 => |s| {
@@ -542,33 +534,21 @@ fn appendBinaryCell(
 }
 
 fn appendBinaryDateTime(allocator: Allocator, out: *std.ArrayList(u8), micros: i64) !void {
-    const sec = @divFloor(micros, 1_000_000);
-    var us = @rem(micros, 1_000_000);
-    var s = sec;
-    if (us < 0) {
-        us += 1_000_000;
-        s -= 1;
-    }
-    const day = @divFloor(s, 86_400);
-    var tod = @rem(s, 86_400);
-    if (tod < 0) tod += 86_400;
-    const ymd = wire_format.civilFromDays(@intCast(day));
-    const hours: u8 = @intCast(@divFloor(tod, 3600));
-    const minutes: u8 = @intCast(@divFloor(@rem(tod, 3600), 60));
-    const seconds: u8 = @intCast(@rem(tod, 60));
-    const has_micros = us != 0;
-    try out.append(allocator, if (has_micros) 11 else 7);
+    const ymd = wire_format.daysToYmd(wire_format.daysFromDatetime(micros));
+    const hms = wire_format.microsToHms(micros);
+    const fraction: u32 = @intCast(@mod(micros, std.time.us_per_s));
+    try out.append(allocator, if (fraction != 0) 11 else 7);
     var b2: [2]u8 = undefined;
-    std.mem.writeInt(u16, &b2, @intCast(ymd.y), .little);
+    std.mem.writeInt(u16, &b2, @intCast(ymd.year), .little);
     try out.appendSlice(allocator, &b2);
-    try out.append(allocator, @intCast(ymd.m));
-    try out.append(allocator, @intCast(ymd.d));
-    try out.append(allocator, hours);
-    try out.append(allocator, minutes);
-    try out.append(allocator, seconds);
-    if (has_micros) {
+    try out.append(allocator, ymd.month);
+    try out.append(allocator, ymd.day);
+    try out.append(allocator, hms.hour);
+    try out.append(allocator, hms.minute);
+    try out.append(allocator, hms.second);
+    if (fraction != 0) {
         var b4: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b4, @intCast(us), .little);
+        std.mem.writeInt(u32, &b4, fraction, .little);
         try out.appendSlice(allocator, &b4);
     }
 }
@@ -576,6 +556,78 @@ fn appendBinaryDateTime(allocator: Allocator, out: *std.ArrayList(u8), micros: i
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "binary DATE and DATETIME carry year 0 before March as the day they are (issue #393)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const params = [_]u8{ 4, 0, 0, 1, 1, 7, 0, 0, 2, 28, 23, 59, 59 };
+    var cursor: usize = 0;
+    try std.testing.expectEqualStrings("'0000-01-01'", try decodeBinaryTemporal(arena.allocator(), &params, &cursor, result_mod.MYSQL_TYPE_DATE));
+    try std.testing.expectEqualStrings("'0000-02-28 23:59:59'", try decodeBinaryTemporal(arena.allocator(), &params, &cursor, result_mod.MYSQL_TYPE_DATETIME));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try appendBinaryDateTime(allocator, &out, @as(i64, wire_format.ymdToDays(0, 2, 28)) * std.time.us_per_day);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 0, 0, 2, 28, 0, 0, 0 }, out.items);
+
+    // Half a second before the epoch is 1969-12-31 23:59:59.5.
+    out.clearRetainingCapacity();
+    try appendBinaryDateTime(allocator, &out, -500_000);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 0xb1, 0x07, 12, 31, 23, 59, 59, 0x20, 0xa1, 0x07, 0x00 }, out.items);
+}
+
+test "a binary DATE or DATETIME parameter no date holds fails the statement, whatever its parts" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const DATE = result_mod.MYSQL_TYPE_DATE;
+    const DATETIME = result_mod.MYSQL_TYPE_DATETIME;
+    const valid = .{
+        .{ DATE, &[_]u8{ 4, 0xea, 0x07, 9, 29 }, "'2026-09-29'" },
+        .{ DATE, &[_]u8{ 4, 0, 0, 2, 29 }, "'0000-02-29'" },
+        .{ DATE, &[_]u8{ 4, 0x0f, 0x27, 12, 31 }, "'9999-12-31'" },
+        // A DATE is its day, as MySQL reads it, so its time goes unread.
+        .{ DATE, &[_]u8{ 7, 0xea, 0x07, 9, 29, 25, 61, 61 }, "'2026-09-29'" },
+        .{ DATETIME, &[_]u8{ 4, 0xea, 0x07, 9, 29 }, "'2026-09-29'" },
+        .{ DATETIME, &[_]u8{ 7, 0xea, 0x07, 9, 29, 23, 59, 59 }, "'2026-09-29 23:59:59'" },
+        .{ result_mod.MYSQL_TYPE_TIMESTAMP, &[_]u8{ 11, 0xea, 0x07, 9, 29, 10, 11, 12, 0x3f, 0x42, 0x0f, 0x00 }, "'2026-09-29 10:11:12.999999'" },
+    };
+    inline for (valid) |c| {
+        var cursor: usize = 0;
+        try std.testing.expectEqualStrings(c[2], try decodeBinaryTemporal(arena.allocator(), c[1], &cursor, c[0]));
+        try std.testing.expectEqual(c[1].len, cursor);
+    }
+    const invalid = .{
+        .{ DATE, &[_]u8{0} },
+        .{ DATE, &[_]u8{ 4, 0, 0, 0, 0 } },
+        .{ DATE, &[_]u8{ 4, 0xea, 0x07, 0, 10 } },
+        .{ DATE, &[_]u8{ 4, 0xea, 0x07, 9, 0 } },
+        // Day 0 of March once cast -1 to an unsigned day of the year.
+        .{ DATE, &[_]u8{ 4, 0xea, 0x07, 3, 0 } },
+        .{ DATE, &[_]u8{ 4, 0xea, 0x07, 13, 1 } },
+        .{ DATE, &[_]u8{ 4, 0xea, 0x07, 2, 30 } },
+        .{ DATE, &[_]u8{ 4, 0xea, 0x07, 1, 32 } },
+        .{ DATE, &[_]u8{ 4, 0x10, 0x27, 1, 1 } },
+        .{ DATE, &[_]u8{ 4, 0xff, 0xff, 0xff, 0xff } },
+        .{ DATETIME, &[_]u8{0} },
+        // mysql2 sends an invalid JavaScript Date as every part zero.
+        .{ DATETIME, &[_]u8{ 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+        .{ DATETIME, &[_]u8{ 7, 0xea, 0x07, 3, 0, 10, 0, 0 } },
+        .{ DATETIME, &[_]u8{ 7, 0xea, 0x07, 9, 29, 24, 0, 0 } },
+        .{ DATETIME, &[_]u8{ 7, 0xea, 0x07, 9, 29, 10, 60, 0 } },
+        .{ DATETIME, &[_]u8{ 7, 0xea, 0x07, 9, 29, 10, 0, 60 } },
+        .{ DATETIME, &[_]u8{ 11, 0xea, 0x07, 9, 29, 10, 0, 0, 0x40, 0x42, 0x0f, 0x00 } },
+    };
+    inline for (invalid) |c| {
+        var cursor: usize = 0;
+        try std.testing.expectError(error.InvalidTemporalParam, decodeBinaryTemporal(arena.allocator(), c[1], &cursor, c[0]));
+    }
+    var cursor: usize = 0;
+    try std.testing.expectError(error.MalformedExecute, decodeBinaryTemporal(arena.allocator(), &.{ 3, 0xea, 0x07, 9 }, &cursor, DATE));
+    cursor = 0;
+    try std.testing.expectError(error.MalformedExecute, decodeBinaryTemporal(arena.allocator(), &.{ 7, 0xea, 0x07, 9, 29 }, &cursor, DATETIME));
+}
 
 test "countPlaceholders skips strings + comments" {
     const allocator = std.testing.allocator;

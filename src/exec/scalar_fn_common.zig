@@ -115,11 +115,22 @@ pub fn datetimeNumber(micros: i64) ScaledInt {
     return .{ .m = whole * std.time.us_per_s + @mod(micros, std.time.us_per_s), .s = 6 };
 }
 
-/// Whether (year, month, day) names a real day, as MySQL judges it: the day
-/// is within its month, and MySQL's year 0 has no February 29.
+/// The first and last days a DATE holds, 0000-01-01 and 9999-12-31, as
+/// days since the epoch.
+pub const FIRST_DATE_DAYS: i32 = -719_528;
+pub const LAST_DATE_DAYS: i32 = 2_932_896;
+
+/// The first and last microseconds a DATETIME holds, 0000-01-01 00:00:00
+/// and 9999-12-31 23:59:59.999999.
+pub const FIRST_DATETIME_MICROS: i64 = @as(i64, FIRST_DATE_DAYS) * std.time.us_per_day;
+pub const LAST_DATETIME_MICROS: i64 = (@as(i64, LAST_DATE_DAYS) + 1) * std.time.us_per_day - 1;
+
+/// Whether (year, month, day) names a day a DATE holds: a year from 0 to
+/// 9999, and a day within its month in the proleptic Gregorian calendar,
+/// where year 0 is a leap year, as StarRocks reads it. MySQL's year 0 has
+/// no February 29.
 pub fn validDate(year: i32, month: u32, day: u32) bool {
-    if (month < 1 or month > 12 or day < 1 or day > lastDayOfMonth(year, month)) return false;
-    return !(year == 0 and month == 2 and day == 29);
+    return year >= 0 and year <= 9999 and month >= 1 and month <= 12 and day >= 1 and day <= lastDayOfMonth(year, month);
 }
 
 /// Parse a `YYYY-MM-DD` date string to days-since-epoch. Accepts a trailing
@@ -387,15 +398,14 @@ pub fn textInteger(raw: []const u8) ?i128 {
 }
 
 /// Text as a BOOLEAN, the way StarRocks casts it: `true` or `false` in any
-/// case, or a number, which is true when nonzero.
+/// case, or an INT (`textInteger`), which is true when nonzero. A fraction,
+/// an exponent or an integer past INT is no BOOLEAN.
 pub fn textBoolean(raw: []const u8) ?bool {
     const text = std.mem.trim(u8, raw, TEXT_SPACE);
     if (std.ascii.eqlIgnoreCase(text, "true")) return true;
     if (std.ascii.eqlIgnoreCase(text, "false")) return false;
-    return switch (textNumber(text) orelse return null) {
-        .exact => |d| d.m != 0,
-        .float => |f| f != 0,
-    };
+    const n = std.math.cast(i32, textInteger(text) orelse return null) orelse return null;
+    return n != 0;
 }
 
 /// Text where MySQL expects a DOUBLE and no CAST was written: the longest
@@ -494,10 +504,9 @@ test "text as a number: what StarRocks casts, and nothing else" {
 
     try t.expectEqual(@as(?bool, true), textBoolean(" TRUE "));
     try t.expectEqual(@as(?bool, false), textBoolean("False"));
-    try t.expectEqual(@as(?bool, true), textBoolean("2"));
-    try t.expectEqual(@as(?bool, false), textBoolean("0.0"));
-    try t.expect(textBoolean("x") == null);
-    try t.expect(textBoolean("") == null);
+    try t.expectEqual(@as(?bool, true), textBoolean("\t-2147483648\n"));
+    try t.expectEqual(@as(?bool, false), textBoolean("+00"));
+    inline for (.{ "x", "", "0.0", "0.5", "1e2", "2147483648", "- 1", "1 1" }) |bad| try t.expect(textBoolean(bad) == null);
 }
 
 test "floatDigits: a double's shortest digits" {
@@ -564,8 +573,12 @@ test "parseDateTimeString: fractions, date-only, Z, rejects" {
     try std.testing.expectError(error.Invalid, parseDateTimeString("1783663005455833"));
 }
 
-test "a date's day must exist in its month, as MySQL judges it" {
+test "a date's day must exist in its month, in years 0 to 9999" {
     const cases = .{
+        .{ "0000-01-01", true },
+        .{ "9999-12-31", true },
+        .{ "-001-01-01", false },
+        .{ "-999-12-31", false },
         .{ "2026-02-28", true },
         .{ "2026-02-29", false },
         .{ "2026-02-30", false },
@@ -574,7 +587,8 @@ test "a date's day must exist in its month, as MySQL judges it" {
         .{ "2024-02-29", true },
         .{ "2000-02-29", true },
         .{ "1900-02-29", false },
-        .{ "0000-02-29", false },
+        .{ "0000-02-29", true },
+        .{ "0100-02-29", false },
         .{ "2026-13-01", false },
         .{ "2026-00-10", false },
         .{ "2026-01-00", false },
@@ -593,53 +607,22 @@ test "a date or datetime as MySQL's YYYYMMDD[HHMMSS] number" {
     try std.testing.expectEqual(ScaledInt{ .m = 19691231235959250000, .s = 6 }, datetimeNumber(try parseDateTimeString("1969-12-31 23:59:59.25")));
 }
 
-pub const Ymd = struct { y: i32, m: u32, d: u32 };
-
-pub fn civilFromDays(days_since_epoch: i64) Ymd {
-    const z = days_since_epoch + 719468;
-    const era_div: i64 = if (z >= 0) @divFloor(z, 146097) else @divFloor(z - 146096, 146097);
-    const era = era_div;
-    const doe: u64 = @intCast(z - era * 146097);
-    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const y_iso: i64 = @as(i64, @intCast(yoe)) + era * 400;
-    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const mp = (5 * doy + 2) / 153;
-    const d = doy - (153 * mp + 2) / 5 + 1;
-    const m = if (mp < 10) mp + 3 else mp - 9;
-    const y = y_iso + @as(i64, @intFromBool(m <= 2));
-    return .{ .y = @intCast(y), .m = @intCast(m), .d = @intCast(d) };
-}
-
 /// The canonical text of a DATE (`YYYY-MM-DD`), as the wire and `CAST(d AS CHAR)` print it.
 pub fn formatDate(buf: []u8, days_since_epoch: i32) ![]const u8 {
-    const ymd = civilFromDays(@intCast(days_since_epoch));
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(ymd.y)), ymd.m, ymd.d });
+    const ymd = daysToYmd(days_since_epoch);
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(ymd.year)), ymd.month, ymd.day });
 }
 
 /// The canonical text of a DATETIME: fractional seconds only when nonzero.
 pub fn formatDateTime(buf: []u8, micros_since_epoch: i64) ![]const u8 {
-    const sec = @divFloor(micros_since_epoch, 1_000_000);
-    var us = @rem(micros_since_epoch, 1_000_000);
-    var s = sec;
-    if (us < 0) {
-        us += 1_000_000;
-        s -= 1;
-    }
-    const day = @divFloor(s, 86_400);
-    var tod = @rem(s, 86_400);
-    if (tod < 0) tod += 86_400;
-    const ymd = civilFromDays(@intCast(day));
-    // Zig 0.16's `{d:0>N}` prints a leading `+` for signed values; cast
-    // to unsigned before formatting (values are guaranteed non-negative
-    // after the normalization above).
-    const hours: u32 = @intCast(@divFloor(tod, 3600));
-    const minutes: u32 = @intCast(@divFloor(@rem(tod, 3600), 60));
-    const seconds: u32 = @intCast(@rem(tod, 60));
-    const us_u: u32 = @intCast(us);
-    const year_u: u32 = @intCast(ymd.y);
-    if (us == 0)
-        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year_u, ymd.m, ymd.d, hours, minutes, seconds });
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year_u, ymd.m, ymd.d, hours, minutes, seconds, us_u });
+    const ymd = daysToYmd(daysFromDatetime(micros_since_epoch));
+    const hms = microsToHms(micros_since_epoch);
+    // Zig 0.16's `{d:0>N}` prints a leading `+` for a signed value.
+    const year: u32 = @intCast(ymd.year);
+    const micros: u32 = @intCast(@mod(micros_since_epoch, std.time.us_per_s));
+    if (micros == 0)
+        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year, ymd.month, ymd.day, hms.hour, hms.minute, hms.second });
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year, ymd.month, ymd.day, hms.hour, hms.minute, hms.second, micros });
 }
 
 /// Days in month for a given (year, 1-indexed month). Handles Feb leap-year.
@@ -676,8 +659,36 @@ test "daysToYmd round-trips ymdToDays and matches std decomposition" {
     }
 }
 
+test "every date from 0000-01-01 to 9999-12-31 prints as the day it parses from (issue #393)" {
+    // Year 0 is a leap year: 0000-01-01 is 366 days before 0001-01-01 and
+    // 719,528 before the epoch, as StarRocks counts them.
+    try std.testing.expectEqual(@as(i32, -719_528), ymdToDays(0, 1, 1));
+    try std.testing.expectEqual(@as(i32, -719_469), ymdToDays(0, 2, 29));
+    try std.testing.expectEqual(@as(i32, -719_162), ymdToDays(1, 1, 1));
+    var buf: [32]u8 = undefined;
+    var days = ymdToDays(0, 1, 1);
+    const last = ymdToDays(9999, 12, 31);
+    while (days <= last) : (days += 1) {
+        const text = try formatDate(&buf, days);
+        const back = parseDateString(text) catch |err| {
+            std.debug.print("{d} prints as {s}\n", .{ days, text });
+            return err;
+        };
+        try std.testing.expectEqual(days, back);
+    }
+    const cases = .{
+        .{ "0000-01-01 00:00:00", "0000-01-01 00:00:00" },
+        .{ "0000-02-28 23:59:59.5", "0000-02-28 23:59:59.500000" },
+        .{ "0000-02-29 12:00:00", "0000-02-29 12:00:00" },
+        .{ "0000-12-31 23:59:59.000001", "0000-12-31 23:59:59.000001" },
+        .{ "1969-12-31 23:59:59.5", "1969-12-31 23:59:59.500000" },
+        .{ "1900-06-15 10:20:30.25", "1900-06-15 10:20:30.250000" },
+    };
+    inline for (cases) |c| try std.testing.expectEqualStrings(c[1], try formatDateTime(&buf, try parseDateTimeString(c[0])));
+}
+
 test "daysToYmd and microsToHms before the epoch" {
-    var days = ymdToDays(1, 1, 1);
+    var days = ymdToDays(0, 1, 1);
     while (days < 0) : (days += 1) {
         const ymd = daysToYmd(days);
         try std.testing.expectEqual(days, ymdToDays(ymd.year, ymd.month, ymd.day));

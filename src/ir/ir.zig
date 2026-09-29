@@ -67,7 +67,8 @@ pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v8: drop_table carries a table list; alter_table carries actions.
 /// v9: a CASE carries the operands its conditions compute.
 /// v10: a join key pair carries a null-safe byte.
-pub const version: u16 = 10;
+/// v11: a predicate leaf can test its column's truth (`as_boolean_leaf`).
+pub const version: u16 = 11;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -2042,13 +2043,14 @@ const PredTag = enum(u8) {
     like = 6,
     leaf_col_col = 7,
     day_leaf = 8,
+    as_boolean_leaf = 9,
 };
 
 pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: PredicateExpr) EncodeError!void {
     switch (expr) {
         // Validation's text-against-number form re-validates from the leaf.
         .leaf, .text_as_number => |p| {
-            try out.append(allocator, @intFromEnum(PredTag.leaf));
+            try out.append(allocator, @intFromEnum(if (p.as_boolean) PredTag.as_boolean_leaf else PredTag.leaf));
             try out.append(allocator, @intFromEnum(p.op));
             try appendU32(allocator, out, @intCast(p.col.len));
             try out.appendSlice(allocator, p.col);
@@ -3206,11 +3208,11 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(PredTag.day_leaf)) return Error.IrCorrupt;
+    if (tag_byte > @intFromEnum(PredTag.as_boolean_leaf)) return Error.IrCorrupt;
     const tag: PredTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
-        .leaf => blk: {
+        .leaf, .as_boolean_leaf => blk: {
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const op_byte = bytes[cursor.*];
             cursor.* += 1;
@@ -3218,7 +3220,7 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
             const op: PredicateOp = @enumFromInt(op_byte);
             const col = try readString(bytes, cursor);
             const val = try decodeValue(bytes, cursor);
-            break :blk PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = val } };
+            break :blk PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = val, .as_boolean = tag == .as_boolean_leaf } };
         },
         .day_leaf => blk: {
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
@@ -3955,6 +3957,30 @@ test "ir: a join's ON residual round-trips" {
     try std.testing.expectEqualStrings("add", res.derived[0].expr.call.fn_name);
     try std.testing.expectEqualStrings("__pred_expr_0", res.predicate.leaf.col);
     try std.testing.expect(decoded.join.right.* == .scan);
+}
+
+test "ir: a leaf that tests its column's truth round-trips apart from its comparison" {
+    const allocator = std.testing.allocator;
+
+    var scan: Op = .{ .scan = .{ .table = .{ .name = "t" } } };
+    const arms = [_]PredicateExpr{
+        .{ .leaf = .{ .col = "s", .op = .neq, .val = .{ .int = 0 }, .as_boolean = true } },
+        .{ .leaf = .{ .col = "s", .op = .neq, .val = .{ .int = 0 } } },
+    };
+    const root: Op = .{ .filter = .{ .predicate = .{ .@"or" = &arms }, .upstream = &scan } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    const got = decoded.filter.predicate.@"or";
+    try std.testing.expect(got[0].leaf.as_boolean);
+    try std.testing.expect(!got[1].leaf.as_boolean);
+    try std.testing.expect(exec_predicate.eql(root.filter.predicate, decoded.filter.predicate));
+    try std.testing.expect(!exec_predicate.eql(arms[0], arms[1]));
 }
 
 test "ir: join with no on/ranges and no extra_predicate (pure-NLJ shape)" {

@@ -370,9 +370,17 @@ pub fn assignScaled(comptime T: type, m: i128, scale: u8) AssignError!T {
 }
 
 /// Text written into a `T` column: a number read from the text, which an
-/// integer column takes exactly, digit for digit.
+/// integer column takes exactly, digit for digit. A BOOLEAN column also
+/// takes the words CAST reads (`textBoolean`), and any number, as the
+/// assignment rule lands one in any number column.
 pub fn assignText(comptime T: type, text: []const u8) AssignError!T {
-    if (T == bool) return common.textBoolean(text) orelse error.TypeMismatch;
+    if (T == bool) {
+        if (common.textBoolean(text)) |b| return b;
+        return switch (common.textNumber(text) orelse return error.TypeMismatch) {
+            .exact => |d| d.m != 0,
+            .float => |f| f != 0,
+        };
+    }
     if (@typeInfo(T) == .float) return assignNumber(T, common.textDouble(text) orelse return error.TypeMismatch);
     return switch (common.textNumber(text) orelse return error.TypeMismatch) {
         .exact => |d| assignScaled(T, d.m, d.s),
@@ -776,6 +784,9 @@ test "assignment: numbers and numeric text land in integer, float and boolean co
     try t.expectEqual(@as(f64, 1), try assignNumber(f64, true));
     try t.expectEqual(@as(f32, 2.5), try assignScaled(f32, 25, 1));
     try t.expectEqual(true, try assignText(bool, "true"));
+    try t.expectEqual(true, try assignText(bool, "0.5"));
+    try t.expectEqual(false, try assignText(bool, " 0.0 "));
+    try t.expectError(error.TypeMismatch, assignText(bool, "abc"));
     try t.expectEqual(true, try assignNumber(bool, @as(i32, 5)));
     try t.expectEqual(false, try assignNumber(bool, @as(f64, 0)));
 

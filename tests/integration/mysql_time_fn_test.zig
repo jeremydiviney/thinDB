@@ -35,13 +35,16 @@ test "MySQL date and TIME functions over constants" {
     const cases = .{
         .{ "TO_DAYS('2026-09-26')", "740250" },
         .{ "TO_DAYS('2026-09-26 10:05:03')", "740250" },
-        .{ "TO_DAYS(DATE '0000-01-01')", "1" },
+        // StarRocks: MySQL counts year 0 as 365 days, so its number is 1.
+        .{ "TO_DAYS(DATE '0000-01-01')", "0" },
         .{ "TO_DAYS('0000-03-01')", "60" },
         .{ "TO_SECONDS('2026-09-26 10:05:03')", "63957636303" },
         .{ "FROM_DAYS(740250)", "2026-09-26" },
         .{ "FROM_DAYS(366)", "0001-01-01" },
-        // MySQL gives its zero date, which a DATE can't hold.
-        .{ "FROM_DAYS(365)", null },
+        // StarRocks: MySQL gives its zero date for a day in year 0.
+        .{ "FROM_DAYS(365)", "0000-12-31" },
+        // A zero date, which a DATE can't hold.
+        .{ "FROM_DAYS(-1)", null },
         .{ "PERIOD_ADD(202601, 13)", "202702" },
         .{ "PERIOD_ADD(6901, 1)", "206902" },
         .{ "PERIOD_DIFF(202601, 199912)", "313" },
