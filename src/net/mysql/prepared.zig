@@ -356,7 +356,7 @@ fn decodeBinaryTemporal(arena: Allocator, body: []const u8, cursor: *usize) ![]c
     }
     cursor.* += len;
 
-    const days_since_epoch: i64 = wire_format.daysFromCivil(@intCast(year), month, day);
+    const days_since_epoch: i64 = wire_format.ymdToDays(year, month, day);
     if (len == 4) {
         var buf: [16]u8 = undefined;
         const txt = try wire_format.formatDate(&buf, @intCast(days_since_epoch));
@@ -512,12 +512,12 @@ fn appendBinaryCell(
             try out.appendSlice(allocator, b[0..8]);
         },
         .date => |s| {
-            const ymd = wire_format.civilFromDays(@intCast(s[row]));
+            const ymd = wire_format.daysToYmd(s[row]);
             try out.append(allocator, 4);
-            std.mem.writeInt(u16, b[0..2], @intCast(ymd.y), .little);
+            std.mem.writeInt(u16, b[0..2], @intCast(ymd.year), .little);
             try out.appendSlice(allocator, b[0..2]);
-            try out.append(allocator, @intCast(ymd.m));
-            try out.append(allocator, @intCast(ymd.d));
+            try out.append(allocator, ymd.month);
+            try out.append(allocator, ymd.day);
         },
         .datetime => |s| try appendBinaryDateTime(allocator, out, s[row]),
         .decimal64 => |s| {
@@ -542,33 +542,21 @@ fn appendBinaryCell(
 }
 
 fn appendBinaryDateTime(allocator: Allocator, out: *std.ArrayList(u8), micros: i64) !void {
-    const sec = @divFloor(micros, 1_000_000);
-    var us = @rem(micros, 1_000_000);
-    var s = sec;
-    if (us < 0) {
-        us += 1_000_000;
-        s -= 1;
-    }
-    const day = @divFloor(s, 86_400);
-    var tod = @rem(s, 86_400);
-    if (tod < 0) tod += 86_400;
-    const ymd = wire_format.civilFromDays(@intCast(day));
-    const hours: u8 = @intCast(@divFloor(tod, 3600));
-    const minutes: u8 = @intCast(@divFloor(@rem(tod, 3600), 60));
-    const seconds: u8 = @intCast(@rem(tod, 60));
-    const has_micros = us != 0;
-    try out.append(allocator, if (has_micros) 11 else 7);
+    const ymd = wire_format.daysToYmd(wire_format.daysFromDatetime(micros));
+    const hms = wire_format.microsToHms(micros);
+    const fraction: u32 = @intCast(@mod(micros, std.time.us_per_s));
+    try out.append(allocator, if (fraction != 0) 11 else 7);
     var b2: [2]u8 = undefined;
-    std.mem.writeInt(u16, &b2, @intCast(ymd.y), .little);
+    std.mem.writeInt(u16, &b2, @intCast(ymd.year), .little);
     try out.appendSlice(allocator, &b2);
-    try out.append(allocator, @intCast(ymd.m));
-    try out.append(allocator, @intCast(ymd.d));
-    try out.append(allocator, hours);
-    try out.append(allocator, minutes);
-    try out.append(allocator, seconds);
-    if (has_micros) {
+    try out.append(allocator, ymd.month);
+    try out.append(allocator, ymd.day);
+    try out.append(allocator, hms.hour);
+    try out.append(allocator, hms.minute);
+    try out.append(allocator, hms.second);
+    if (fraction != 0) {
         var b4: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b4, @intCast(us), .little);
+        std.mem.writeInt(u32, &b4, fraction, .little);
         try out.appendSlice(allocator, &b4);
     }
 }
@@ -576,6 +564,26 @@ fn appendBinaryDateTime(allocator: Allocator, out: *std.ArrayList(u8), micros: i
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "binary DATE and DATETIME carry year 0 before March as the day they are (issue #393)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const params = [_]u8{ 4, 0, 0, 1, 1, 7, 0, 0, 2, 28, 23, 59, 59 };
+    var cursor: usize = 0;
+    try std.testing.expectEqualStrings("'0000-01-01'", try decodeBinaryTemporal(arena.allocator(), &params, &cursor));
+    try std.testing.expectEqualStrings("'0000-02-28 23:59:59'", try decodeBinaryTemporal(arena.allocator(), &params, &cursor));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try appendBinaryDateTime(allocator, &out, @as(i64, wire_format.ymdToDays(0, 2, 28)) * std.time.us_per_day);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 0, 0, 2, 28, 0, 0, 0 }, out.items);
+
+    // Half a second before the epoch is 1969-12-31 23:59:59.5.
+    out.clearRetainingCapacity();
+    try appendBinaryDateTime(allocator, &out, -500_000);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 0xb1, 0x07, 12, 31, 23, 59, 59, 0x20, 0xa1, 0x07, 0x00 }, out.items);
+}
 
 test "countPlaceholders skips strings + comments" {
     const allocator = std.testing.allocator;
