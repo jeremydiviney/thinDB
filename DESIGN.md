@@ -119,9 +119,10 @@ StarRocks' frontend folds a constant CAST by rules of its own: it reads a
 way the backend reads a column, so a literal and a column holding the same
 text agree. A text literal meets a function as a text column does first, so
 `COALESCE('2026/1/1', DATE '2026-01-02')` is the text, as in StarRocks.
-Where only a DATE or DATETIME fits, the literal is read as a CAST to that
-type reads it, and text that doesn't read is NULL
-(`UNIX_TIMESTAMP('garbage')`). Text takes a DATETIME parameter before a DATE
+Where only a DATE or DATETIME fits, text is read as a CAST to that type
+reads it, and text that doesn't read is NULL (`UNIX_TIMESTAMP('garbage')`).
+A literal is read once at plan time; a column or any other text expression
+is read per row the same way. Text takes a DATETIME parameter before a DATE
 one, as StarRocks casts it, so `DATE_ADD('2026-01-01 10:30:00', INTERVAL 1
 DAY)` is 2026-01-02 10:30:00 and `DATE_ADD('2026-01-31', INTERVAL 1 DAY)` is
 2026-02-01 00:00:00; a function that takes only a DATE there takes the text's
