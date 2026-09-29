@@ -55,6 +55,43 @@ const MAX_PARTS: usize = 32;
 /// Rows a partition's aggregate reads per batch (see `ChunkScan`).
 pub const PARTITION_BATCH_ROWS: usize = 64 * 1024;
 
+/// How each partition aggregates its rows.
+pub const Core = enum {
+    /// A hash table, unless the scatter's distinct-key estimate finds the
+    /// keys near-unique (`estimatesCore`, `nearUnique`).
+    auto,
+    /// Sort the partition by its keys and stream its groups, holding one
+    /// group's state at a time.
+    sort,
+};
+
+/// Rows per partition below which the scatter skips the distinct-key
+/// estimate.
+const ESTIMATE_MIN_PART_ROWS: u64 = 4096;
+
+/// True when the `auto` core estimates the distinct keys and may sort: only
+/// heavy per-group states make the choice matter.
+pub fn estimatesCore(aggs: []const AggSpec, rows: u64, n_parts: u64) bool {
+    return heavyStateAggCount(aggs) >= 2 and rows >= ESTIMATE_MIN_PART_ROWS *| n_parts;
+}
+
+/// Near-unique keys open a group for nearly every row, where sorting beats a
+/// hash table holding a heap state per group.
+pub fn nearUnique(groups: u64, rows: u64) bool {
+    return groups *| 10 >= rows *| 9;
+}
+
+/// Aggregates whose per-group state lives on the heap (a `Value` copy or
+/// worse). Near-unique group counts multiply that cost by the row count.
+fn heavyStateAggCount(aggs: []const AggSpec) usize {
+    var n: usize = 0;
+    for (aggs) |a| switch (a.func) {
+        .max_by, .max_by_key, .any_value, .first, .last, .group_concat, .count_distinct, .sum_distinct, .avg_distinct => n += 1,
+        else => {},
+    };
+    return n;
+}
+
 /// Partitions the operator splits its input into for a thread hint.
 pub fn partitionCount(n_parts_hint: usize) usize {
     return @max(@as(usize, 2), @min(n_parts_hint, MAX_PARTS));
@@ -327,12 +364,14 @@ pub const PartitionedAggregate = struct {
     /// The scatter feeds each row's key hash to a distinct-key estimate that
     /// picks the core; only heavy per-group states make the choice matter.
     track_ndv: bool = false,
-    /// Chosen from a distinct-key estimate over the scatter hashes:
-    /// near-unique groups with heavy per-group states (MAX_BY/ANY_VALUE/...)
-    /// make the hash core pay a heap state + string dupes for EVERY group;
-    /// sort+stream holds one live group. Low-NDV shapes keep the hash core —
-    /// the sort would be pure loss there.
-    sorted_stream: bool = false,
+    /// Set by the `sort` core, or chosen by the `auto` core from a
+    /// distinct-key estimate over the scatter hashes: near-unique groups with
+    /// heavy per-group states (MAX_BY/ANY_VALUE/...) make the hash core pay a
+    /// heap state + string dupes for EVERY group; sort+stream holds one live
+    /// group. Low-NDV shapes keep the hash core — the sort would be pure loss
+    /// there.
+    sorted_stream: bool,
+    core: Core,
 
     pub fn create(
         allocator: Allocator,
@@ -341,6 +380,7 @@ pub const PartitionedAggregate = struct {
         group_cols: []const []const u8,
         aggs: []const AggSpec,
         n_parts_hint: usize,
+        core: Core,
     ) !Query {
         // Not the retaining pool: its power-of-two classes would charge up to
         // twice each chunk's exact size, and a chunk lives until its
@@ -381,6 +421,8 @@ pub const PartitionedAggregate = struct {
             .parts = parts,
             .workers = workers,
             .views = views,
+            .sorted_stream = core == .sort,
+            .core = core,
         };
         return exec.makeQuery(allocator, self);
     }
@@ -580,18 +622,6 @@ pub const PartitionedAggregate = struct {
         return rows;
     }
 
-    /// Aggregates whose per-group state lives on the heap (a `Value` copy or
-    /// worse). Near-unique group counts multiply that cost by the row count —
-    /// the trigger for the sort+stream core.
-    fn heavyStateAggCount(aggs: []const AggSpec) usize {
-        var n: usize = 0;
-        for (aggs) |a| switch (a.func) {
-            .max_by, .max_by_key, .any_value, .first, .last, .group_concat, .count_distinct, .sum_distinct, .avg_distinct => n += 1,
-            else => {},
-        };
-        return n;
-    }
-
     /// Phase B (one worker per partition): run the serial Aggregate over the
     /// partition's rows and retain its output rows. Whatever chunks the run
     /// left unread (an error stops it early) are released here.
@@ -741,7 +771,7 @@ pub const PartitionedAggregate = struct {
         // thread's phase work.
         const spawn_ok = spawned == self.n_parts - 1;
 
-        self.track_ndv = heavyStateAggCount(self.aggs) >= 2;
+        self.track_ndv = self.core == .auto and heavyStateAggCount(self.aggs) >= 2;
         var rows_in: u64 = 0;
         var bytes_in: usize = 0;
         var pull_ticks: i64 = 0;
@@ -785,11 +815,11 @@ pub const PartitionedAggregate = struct {
         // unique, 3.6M rows) the hash core still wins — the sort's row-bound
         // cost only pays off when nearly every row opens a fresh group's
         // heap states.
-        if (self.track_ndv and rows_in >= 4096 * self.n_parts) {
+        if (self.core == .auto and estimatesCore(self.aggs, rows_in, self.n_parts)) {
             var ndv: hll.Hll = .{};
             for (self.workers) |*w| ndv.merge(&w.ndv);
             const est = ndv.estimate();
-            self.sorted_stream = est * 10 >= rows_in * 9;
+            self.sorted_stream = nearUnique(est, rows_in);
             if (prof_on) std.debug.print(
                 "[hprof] pagg.core: est_groups/rows={d}/{d} heavy_aggs={d} -> {s}\n",
                 .{ est, rows_in, heavyStateAggCount(self.aggs), if (self.sorted_stream) "sort+stream" else "hash" },
@@ -851,7 +881,11 @@ pub const PartitionedAggregate = struct {
 
     pub fn explain(self: *PartitionedAggregate, out: *std.ArrayList(u8), alloc: Allocator, depth: usize) !void {
         var buf: [80]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "PartitionedAggregate parts={d}", .{self.n_parts}) catch "PartitionedAggregate";
+        const core = switch (self.core) {
+            .auto => "",
+            .sort => " sort core",
+        };
+        const line = std.fmt.bufPrint(&buf, "PartitionedAggregate parts={d}{s}", .{ self.n_parts, core }) catch "PartitionedAggregate";
         try exec.explainLine(out, alloc, depth, line);
         try self.up.explain(out, alloc, depth + 1);
     }
@@ -985,7 +1019,7 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
     };
 
     var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = N };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
         for (par_lines) |l| a.free(l);
@@ -1048,7 +1082,7 @@ test "PartitionedAggregate sort+stream core keeps a group's rows in input order"
     };
 
     var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
         for (par_lines) |line| a.free(line);
@@ -1108,7 +1142,7 @@ test "PartitionedAggregate near-unique direct sort matches serial aggregate" {
     };
 
     var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
         for (par_lines) |line| a.free(line);
@@ -1178,7 +1212,7 @@ test "PartitionedAggregate drains a partition in windows with exact NULL and dis
     };
 
     var scan = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan), &group_cols, &aggs, 4);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan), &group_cols, &aggs, 4, .auto);
     defer pa.deinit();
     var seen: usize = 0;
     while (try pa.next()) |b| {
@@ -1525,7 +1559,7 @@ test "PartitionedAggregate over many odd-sized batches of strings, JSON and NULL
 
     var batch_views: [mixed_schema.len]ColumnView = undefined;
     var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &list_scan), &group_cols, &mixed_aggs, 4);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &list_scan), &group_cols, &mixed_aggs, 4, .auto);
     const par_lines = try testCollectLines(a, &pa);
     defer testFreeLines(a, par_lines);
     pa.deinit();
@@ -1590,7 +1624,7 @@ test "PartitionedAggregate charges about the raw input bytes and frees the input
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;
     var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
-    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), &group_cols, aggs, n_parts);
+    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), &group_cols, aggs, n_parts, .auto);
     var groups: usize = 0;
     groups += (try pa.next()).?.row_count;
     // Every partition has aggregated: only the outputs are still charged.

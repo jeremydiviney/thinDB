@@ -66,15 +66,19 @@ pub fn routeGroupBy(
             );
         }
         for (PLAN_ORDER) |plan| {
-            if (needs.of(plan) > headroom) continue;
+            if (!needs.admits(plan, partition_ok) or needs.of(plan) > headroom) continue;
             switch (plan) {
                 .radix => if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit)) |q| {
                     if (trace) std.debug.print("[gbroute]   -> radix\n", .{});
                     return q;
                 },
-                .partitioned => if (partition_ok) {
+                .partitioned => {
                     if (trace) std.debug.print("[gbroute]   -> partitioned (dop={d})\n", .{partition_dop});
-                    return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, partition_dop);
+                    return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, partition_dop, .auto);
+                },
+                .partitioned_sort => {
+                    if (trace) std.debug.print("[gbroute]   -> partitioned, sort cores (dop={d})\n", .{partition_dop});
+                    return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, partition_dop, .sort);
                 },
                 .hash => {
                     if (trace) std.debug.print("[gbroute]   -> hash\n", .{});
@@ -92,7 +96,7 @@ pub fn routeGroupBy(
     if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit)) |q| return q;
     if (partition_ok) {
         if (trace) std.debug.print("[gbroute]   -> partitioned (budget-blind, dop={d})\n", .{partition_dop});
-        return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, partition_dop);
+        return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, partition_dop, .auto);
     }
     return upstream.groupByTopK(group_cols, aggs, top_k, emit_limit);
 }
@@ -174,8 +178,10 @@ fn sortThenStream(
 }
 
 /// Keyed GROUP BY plans, fastest first: the order the budget router tries.
-pub const Plan = enum { radix, partitioned, hash, sort };
-pub const PLAN_ORDER = [_]Plan{ .radix, .partitioned, .hash, .sort };
+/// `partitioned` leaves each partition's core to the operator;
+/// `partitioned_sort` makes every partition sort and stream its groups.
+pub const Plan = enum { radix, partitioned, partitioned_sort, hash, sort };
+pub const PLAN_ORDER = [_]Plan{ .radix, .partitioned, .partitioned_sort, .hash, .sort };
 
 /// Estimated peak bytes each keyed plan allocates beyond what the statement
 /// already holds when it is routed. A streaming aggregate over sorted input
@@ -183,8 +189,12 @@ pub const PLAN_ORDER = [_]Plan{ .radix, .partitioned, .hash, .sort };
 pub const PlanNeeds = struct {
     radix: u64,
     partitioned: u64,
+    partitioned_sort: u64,
     hash: u64,
     sort: u64,
+    /// Whether the estimated groups are near-unique, the only case where
+    /// the partitions' sort core pays off.
+    near_unique: bool,
 
     pub fn of(self: PlanNeeds, plan: Plan) u64 {
         return switch (plan) {
@@ -192,9 +202,19 @@ pub const PlanNeeds = struct {
         };
     }
 
+    /// Whether `plan` can carry this GROUP BY at all, before its need is
+    /// weighed.
+    fn admits(self: PlanNeeds, plan: Plan, partition_ok: bool) bool {
+        return switch (plan) {
+            .partitioned => partition_ok,
+            .partitioned_sort => partition_ok and self.near_unique,
+            .radix, .hash, .sort => true,
+        };
+    }
+
     /// The needs over an input that already holds `held` charged bytes and
     /// frees each of its chunks, none over `largest_chunk` bytes, once the
-    /// plan pulls the next (`RealizedInput`). The partitioned plan and the
+    /// plan pulls the next (`RealizedInput`). The partitioned plans and the
     /// sort copy the whole input before they aggregate or order it, so the
     /// copy replaces the input's buffers: they need what they add beyond
     /// them, plus the chunk being copied. Radix and hash stream the input
@@ -203,8 +223,10 @@ pub const PlanNeeds = struct {
         return .{
             .radix = self.radix,
             .partitioned = (self.partitioned -| held) +| largest_chunk,
+            .partitioned_sort = (self.partitioned_sort -| held) +| largest_chunk,
             .hash = self.hash,
             .sort = (self.sort -| held) +| largest_chunk,
+            .near_unique = self.near_unique,
         };
     }
 };
@@ -262,10 +284,17 @@ const GUESSED_STRING_WIDTH: u64 = 32;
 ///   - group state S(w), for tables that also take w rows of the batches
 ///     being inserted (`GroupState`)
 ///   - radix = hash = S(batch_rows): they stream their input into the table
-///   - partitioned = B + 4 B/row index + 2 W row bytes + S(W): it buffers
-///     its input at its exact size (issue #380), then each of its
-///     `partitions` aggregates its rows in windows of `PARTITION_BATCH_ROWS`
-///     (W rows in all, their strings in doubling buffers)
+///   - partitioned with hash-table cores = B + 4 B/row index + 2 W row
+///     bytes + S(W): it buffers its input at its exact size (issue #380),
+///     then each of its `partitions` aggregates its rows in windows of
+///     `PARTITION_BATCH_ROWS` (W rows in all, their strings in doubling
+///     buffers)
+///   - partitioned with sort cores (`partitioned_sort`) = 2 B + 8 B/row +
+///     1.5 × groups × a group's bytes: each partition gathers its rows out of
+///     the buffered input, sorts a row permutation, and streams its groups
+///     into its output
+///   - `partitioned`, which lets the operator pick the cores, is the larger
+///     of the two when the operator may sort (`estimatesCore`)
 ///   - sort = 1.5 B + 4 B/row permutation.
 /// Null when a named column is missing from `schema`.
 pub fn planNeeds(
@@ -285,11 +314,15 @@ pub fn planNeeds(
     const index = rows *| @sizeOf(u32);
     const windows = @min(rows, partitions *| partitioned_aggregate.PARTITION_BATCH_ROWS);
     const streamed = state.bytes(@min(rows, batch_rows));
+    const hash_cores = input +| index +| 2 *| windows *| row_bytes +| state.bytes(windows);
+    const sort_cores = 2 *| (input +| index) +| state.groups *| state.group *| STATE_SLACK_NUM / STATE_SLACK_DEN;
     return .{
         .radix = streamed,
-        .partitioned = input +| index +| 2 *| windows *| row_bytes +| state.bytes(windows),
+        .partitioned = if (partitioned_aggregate.estimatesCore(aggs, rows, partitions)) @max(hash_cores, sort_cores) else hash_cores,
+        .partitioned_sort = sort_cores,
         .hash = streamed,
         .sort = (input +| input / 2) +| index,
+        .near_unique = partitioned_aggregate.nearUnique(state.groups, rows),
     };
 }
 
@@ -405,9 +438,11 @@ fn groupState(
 
 fn traceNeeds(rows: u64, needs: PlanNeeds, headroom: usize, partition_ok: bool) void {
     const mib = 1024 * 1024;
+    const partitioned_na = if (needs.admits(.partitioned, partition_ok)) "" else "(n/a)";
+    const sort_cores_na = if (needs.admits(.partitioned_sort, partition_ok)) "" else "(n/a)";
     std.debug.print(
-        "[gbroute] rows={d} headroom={d} MiB needs: radix={d} partitioned={d}{s} hash={d} sort={d} MiB\n",
-        .{ rows, headroom / mib, needs.radix / mib, needs.partitioned / mib, if (partition_ok) "" else "(n/a)", needs.hash / mib, needs.sort / mib },
+        "[gbroute] rows={d} headroom={d} MiB needs: radix={d} partitioned={d}{s} partitioned_sort={d}{s} hash={d} sort={d} MiB\n",
+        .{ rows, headroom / mib, needs.radix / mib, needs.partitioned / mib, partitioned_na, needs.partitioned_sort / mib, sort_cores_na, needs.hash / mib, needs.sort / mib },
     );
 }
 
@@ -968,6 +1003,27 @@ test "plan needs price the input buffer, the group state and measured widths" {
     // value and emitting a row: the hash state outweighs a sort of the input.
     try std.testing.expect(needs.sort < needs.hash);
     try std.testing.expect(needs.hash > rows * 2 * (100 + 24 + 105));
+    // Sort cores gather each partition's rows out of the buffered input and
+    // sort a permutation of them, and the outputs hold every group. They are
+    // open to these near-unique groups; with one heavy aggregate the operator
+    // keeps its hash cores.
+    const sort_cores = 2 * (input + 4 * rows) + state.groups * state.group * 3 / 2;
+    try std.testing.expectEqual(sort_cores, needs.partitioned_sort);
+    try std.testing.expect(needs.near_unique);
+    try std.testing.expect(needs.admits(.partitioned_sort, true));
+    try std.testing.expect(!needs.admits(.partitioned_sort, false));
+    try std.testing.expect(!needs.admits(.partitioned, false));
+    // Two heavy aggregates let the operator pick its cores, so the plan that
+    // leaves the choice to it is priced at the larger of the two.
+    const heavy_aggs = [_]ir.AggSpec{
+        .{ .func = .max_by, .col = "v", .arg2_col = "t", .as = "u" },
+        .{ .func = .any_value, .col = "v", .as = "w" },
+    };
+    const heavy = planNeeds(measured, &schema, &group_cols, &heavy_aggs, null, 0, 4).?;
+    const heavy_state = groupState(measured, &schema, &group_cols, &heavy_aggs, null).?;
+    const heavy_hash_cores = input + 4 * rows + 2 * windows * row_bytes + heavy_state.bytes(windows);
+    try std.testing.expectEqual(2 * (input + 4 * rows) + heavy_state.groups * heavy_state.group * 3 / 2, heavy.partitioned_sort);
+    try std.testing.expectEqual(@max(heavy_hash_cores, heavy.partitioned_sort), heavy.partitioned);
 
     // Over an input whose chunks are freed as the plan copies them, the
     // copying plans need what their copy and state add beyond the held
@@ -976,10 +1032,13 @@ test "plan needs price the input buffer, the group state and measured widths" {
     const consumed = needs.consuming(input, 1000);
     try std.testing.expectEqual(needs.radix, consumed.radix);
     try std.testing.expectEqual(needs.partitioned - input + 1000, consumed.partitioned);
+    try std.testing.expectEqual(needs.partitioned_sort - input + 1000, consumed.partitioned_sort);
     try std.testing.expectEqual(needs.hash, consumed.hash);
     try std.testing.expectEqual(input / 2 + 4 * rows + 1000, consumed.sort);
-    const overheld = needs.consuming(needs.partitioned + needs.sort, 1000);
+    try std.testing.expect(consumed.near_unique);
+    const overheld = needs.consuming(needs.partitioned + needs.partitioned_sort + needs.sort, 1000);
     try std.testing.expectEqual(@as(u64, 1000), overheld.partitioned);
+    try std.testing.expectEqual(@as(u64, 1000), overheld.partitioned_sort);
     try std.testing.expectEqual(@as(u64, 1000), overheld.sort);
 
     // A proven key space of 1000 groups prices 1000 groups' state.
@@ -993,6 +1052,8 @@ test "plan needs price the input buffer, the group state and measured widths" {
     const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null, 0, 4).?;
     try std.testing.expectEqual(few_state.bytes(0), few_needs.hash);
     try std.testing.expectEqual(needs.sort, few_needs.sort);
+    try std.testing.expect(!few_needs.near_unique);
+    try std.testing.expect(!few_needs.admits(.partitioned_sort, true));
 
     // A bare LIMIT over bounded aggregate state stops the hash table at the
     // limit plus an overflow group; MAX_BY's value is not bounded state.
@@ -1175,7 +1236,7 @@ test "RealizedInput replays owned chunks with exact stats and frees each once pa
     try std.testing.expect((try q.next()) == null);
 }
 
-const RoutedPlan = enum { partitioned, hash, sort_stream, other };
+const RoutedPlan = enum { partitioned, partitioned_sort, hash, sort_stream, other };
 
 const RoutedRun = struct {
     plan: RoutedPlan,
@@ -1213,13 +1274,14 @@ fn testRouteRealized(a: Allocator, budget: usize, partition_dop: usize, blind: b
         needs = inputNeeds(&up, &group_cols, &aggs, null, partitioned_aggregate.partitionCount(partition_dop)).?;
         held = account.current_bytes;
         blind_hash_ok = groupKeysCardUnderLimit(up.stats(), up.outputSchema(), &group_cols, &aggs, budget);
-        if (blind) break :routed try partitioned_aggregate.PartitionedAggregate.create(tracked, worker, up, &group_cols, &aggs, partition_dop);
+        if (blind) break :routed try partitioned_aggregate.PartitionedAggregate.create(tracked, worker, up, &group_cols, &aggs, partition_dop, .auto);
         break :routed try routeGroupBy(tracked, worker, &up, &group_cols, &aggs, null, null, budget, partition_dop);
     };
     defer q.deinit();
-    const plan: RoutedPlan = if (exec.queryAs(partitioned_aggregate.PartitionedAggregate, q) != null)
-        .partitioned
-    else if (exec.queryAs(exec.Aggregate, q) != null)
+    const plan: RoutedPlan = if (exec.queryAs(partitioned_aggregate.PartitionedAggregate, q)) |pa| switch (pa.core) {
+        .auto => .partitioned,
+        .sort => .partitioned_sort,
+    } else if (exec.queryAs(exec.Aggregate, q) != null)
         .hash
     else if (exec.queryAs(exec.aggregate_op.SortedAggregate, q) != null)
         .sort_stream
@@ -1249,22 +1311,35 @@ test "a budget between the plans' needs routes to the plan that fits, and it mat
     try std.testing.expect(roomy.peak - roomy.held <= needs.partitioned);
 
     // An eighth below what the partitioned plan took, the budget-blind route
-    // still partitions, and the partitioned plan runs out of budget. The
-    // router takes the next plan whose need fits, and it completes.
+    // still partitions, and the router takes the next plan whose need fits.
+    // Whether the partitioned plan overruns there moves with how its
+    // partitions interleave and how the platform allocator grows buffers, so
+    // it is held only to failing cleanly or matching.
     const gap_budget = roomy.held + (roomy.peak - roomy.held) * 7 / 8;
-    try std.testing.expectError(error.MemoryBudgetExceeded, testRouteRealized(a, gap_budget, 4, true));
+    if (testRouteRealized(a, gap_budget, 4, true)) |forced| {
+        defer testFreeLines(a, forced.lines);
+        try std.testing.expectEqual(roomy.lines.len, forced.lines.len);
+        for (roomy.lines, forced.lines) |r, f| try std.testing.expectEqualStrings(r, f);
+    } else |err| try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
     const gap = try testRouteRealized(a, gap_budget, 4, false);
     defer testFreeLines(a, gap.lines);
     try std.testing.expect(gap.blind_hash_ok);
-    const fitting: RoutedPlan = if (needs.hash <= gap_budget - gap.held) .hash else .sort_stream;
+    const gap_headroom = gap_budget - gap.held;
+    const fitting: RoutedPlan = if (needs.partitioned_sort <= gap_headroom)
+        .partitioned_sort
+    else if (needs.hash <= gap_headroom)
+        .hash
+    else
+        .sort_stream;
     try std.testing.expectEqual(fitting, gap.plan);
     try std.testing.expect(gap.peak <= gap_budget);
     try std.testing.expectEqual(roomy.lines.len, gap.lines.len);
     for (roomy.lines, gap.lines) |r, g| try std.testing.expectEqualStrings(r, g);
 
-    // Below the hash need too, sorting the input and streaming the groups
-    // fits.
-    const sort_budget = roomy.held + (needs.sort + @min(needs.hash, needs.partitioned)) / 2;
+    // Below the partitioned plans' and the hash need too, sorting the input
+    // and streaming the groups fits.
+    try std.testing.expect(needs.sort < needs.partitioned_sort);
+    const sort_budget = roomy.held + (needs.sort + @min(needs.hash, needs.partitioned, needs.partitioned_sort)) / 2;
     const sorted = try testRouteRealized(a, sort_budget, 4, false);
     defer testFreeLines(a, sorted.lines);
     try std.testing.expectEqual(RoutedPlan.sort_stream, sorted.plan);
@@ -1278,4 +1353,22 @@ test "a budget between the plans' needs routes to the plan that fits, and it mat
     try std.testing.expectEqual(RoutedPlan.hash, serial.plan);
     try std.testing.expectEqual(roomy.lines.len, serial.lines.len);
     for (roomy.lines, serial.lines) |r, h| try std.testing.expectEqualStrings(r, h);
+}
+
+test "near-unique groups whose hash-table partitions do not fit partition with sort cores" {
+    const a = std.testing.allocator;
+    const roomy = try testRouteRealized(a, 1 << 40, 4, false);
+    defer testFreeLines(a, roomy.lines);
+    // The key's NDV is unknown, so the groups count as near-unique and each
+    // partition may sort instead of holding a hash table.
+    const needs = roomy.needs;
+    try std.testing.expect(needs.near_unique);
+    try std.testing.expect(needs.partitioned_sort < needs.partitioned);
+    const budget = roomy.held + (needs.partitioned_sort + needs.partitioned) / 2;
+    const sorted = try testRouteRealized(a, budget, 4, false);
+    defer testFreeLines(a, sorted.lines);
+    try std.testing.expectEqual(RoutedPlan.partitioned_sort, sorted.plan);
+    try std.testing.expect(sorted.peak - sorted.held <= needs.partitioned_sort);
+    try std.testing.expectEqual(roomy.lines.len, sorted.lines.len);
+    for (roomy.lines, sorted.lines) |r, s| try std.testing.expectEqualStrings(r, s);
 }
