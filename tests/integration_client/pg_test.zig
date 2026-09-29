@@ -2324,6 +2324,79 @@ test "pg wire ext: Parse + Bind (binary int4 param) + Execute returns matching r
     if (sctx.err) |e| return e;
 }
 
+test "pg wire ext: binary date and timestamp params read as their days, and infinity is refused" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const port: u16 = test_port_base + 111;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "CREATE TABLE pd (id BIGINT PRIMARY KEY, d DATE, ts DATETIME)",
+        "INSERT INTO pd VALUES (1, '2026-09-29', '2026-09-29 10:01:11'), (2, '2026-09-30', '2026-09-30 00:00:00')",
+    }) |sql_text| {
+        try client.sendQuery(sql_text);
+        const reply = try client.readQueryReply(arena.allocator());
+        try std.testing.expect(reply.error_code == null);
+    }
+
+    // Days and microseconds since 2000-01-01, PG's epoch.
+    var sept_29: [4]u8 = undefined;
+    std.mem.writeInt(i32, &sept_29, 9_768, .big);
+    var sept_29_clock: [8]u8 = undefined;
+    std.mem.writeInt(i64, &sept_29_clock, 843_991_271_000_000, .big);
+    // PG's infinity is the largest integer of each type.
+    var infinity_date: [4]u8 = undefined;
+    std.mem.writeInt(i32, &infinity_date, std.math.maxInt(i32), .big);
+    var infinity_ts: [8]u8 = undefined;
+    std.mem.writeInt(i64, &infinity_ts, std.math.maxInt(i64), .big);
+    const Case = struct { date: []const u8, ts: []const u8, error_code: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .date = &sept_29, .ts = &sept_29_clock, .error_code = null },
+        .{ .date = &infinity_date, .ts = &sept_29_clock, .error_code = "22008" },
+        .{ .date = &sept_29, .ts = &infinity_ts, .error_code = "22008" },
+        .{ .date = &sept_29, .ts = &sept_29_clock, .error_code = null },
+    };
+    const oids = [_]u32{ 1082, 1114 };
+    for (cases) |c| {
+        try client.sendParse("", "SELECT id FROM pd WHERE d = $1 AND ts = $2", oids[0..]);
+        const params = [_]TestClient.BindParam{ .{ .value = c.date, .format = 1 }, .{ .value = c.ts, .format = 1 } };
+        try client.sendBind("", "", params[0..], &.{});
+        try client.sendExecute("", 0);
+        try client.sendSync();
+        const r = try client.readExtendedReplies(arena.allocator());
+        if (c.error_code) |code| {
+            try std.testing.expectEqualStrings(code, r.error_code.?);
+            continue;
+        }
+        try std.testing.expect(r.error_code == null);
+        try std.testing.expectEqual(@as(usize, 1), r.rows.len);
+        try std.testing.expectEqualStrings("1", r.rows[0][0].?);
+    }
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
 test "pg wire ext: syntax error → ErrorResponse + frames skipped until Sync" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

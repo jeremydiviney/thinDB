@@ -201,15 +201,12 @@ fn makeDate(year: i32, day_of_year: i32) ?i32 {
     if (day_of_year <= 0 or year < 0 or year > 9999) return null;
     const full_year = if (year >= 100) year else year + @as(i32, if (year < 70) 2000 else 1900);
     const days = @as(i64, common.ymdToDays(full_year, 1, 1)) + day_of_year - 1;
-    if (days > LAST_DATE_DAYS) return null;
+    if (days > common.LAST_DATE_DAYS) return null;
     return @intCast(days);
 }
 
-/// 9999-12-31, the last day MySQL's day numbers reach.
-const LAST_DATE_DAYS: i64 = 2_932_896;
-
 /// The day number of 1970-01-01 (TO_DAYS): days since 0000-01-01.
-const DAY_NUMBER_OF_EPOCH: i64 = 719_528;
+const DAY_NUMBER_OF_EPOCH: i64 = -@as(i64, common.FIRST_DATE_DAYS);
 
 /// The day number (TO_DAYS) of a date: days since 0000-01-01, in the one
 /// calendar every date reads (`common.validDate`), where year 0 has 366
@@ -259,7 +256,7 @@ pub fn fromDaysKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
     const numbers = args[0].data.bigint;
     for (0..row_count) |i| {
         const n = numbers[i];
-        const valid = args[0].isValid(i) and n >= 0 and n <= LAST_DATE_DAYS + DAY_NUMBER_OF_EPOCH;
+        const valid = args[0].isValid(i) and n >= 0 and n <= common.LAST_DATE_DAYS + DAY_NUMBER_OF_EPOCH;
         try out.data.date.append(allocator, if (valid) @intCast(n - DAY_NUMBER_OF_EPOCH) else 0);
         try out.appendValidBit(allocator, base + i, valid);
     }

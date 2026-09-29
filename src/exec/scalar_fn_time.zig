@@ -138,7 +138,7 @@ fn scanDatetime(s: []const u8, datetime_only: bool) DatetimeScan {
     if (year_len == 2 and !zero_date) year += if (year < 70) 2000 else 1900;
     const month = fields[1];
     const day = fields[2];
-    if (year > 9999 or !common.validDate(year, month, day) or fields[3] > 23 or fields[4] > 59 or fields[5] > 59) return .invalid;
+    if (!common.validDate(year, month, day) or fields[3] > 23 or fields[4] > 59 or fields[5] > 59) return .invalid;
     const seconds = (@as(i64, fields[3]) * 60 + fields[4]) * 60 + fields[5];
     const micros = @as(i64, common.ymdToDays(year, month, day)) * US_PER_DAY + seconds * US_PER_S + frac.micros;
     return .{ .valid = .{ .value = micros + @intFromBool(frac.round_up), .fsp = frac.digits } };
@@ -552,10 +552,6 @@ fn timeDiff(a: ?Temporal, b: ?Temporal) ?Micros {
     return .{ .value = clampTime(x.micros().value -| y.micros().value), .fsp = @max(x.micros().fsp, y.micros().fsp) };
 }
 
-/// DATETIMEs a sum can land on: years 0 to 9999.
-const MIN_DATETIME_MICROS: i64 = @as(i64, -719_528) * US_PER_DAY;
-const MAX_DATETIME_MICROS: i64 = @as(i64, 2_932_897) * US_PER_DAY - 1;
-
 /// ADDTIME (`sign` 1) or SUBTIME (-1): a TIME or DATETIME moved by a TIME;
 /// NULL when the second argument is not a TIME or the sum leaves years
 /// 0-9999. A DATETIME-typed first argument gives a DATETIME; text gives
@@ -602,7 +598,7 @@ fn addTime(sign: i64, a: ?Temporal, b: ?Temporal) ?Temporal {
         .time => |t| .{ .time = .{ .value = clampTime(t.value + sign * delta), .fsp = fsp } },
         .datetime => |t| blk: {
             const moved = t.value +| sign * delta;
-            if (moved < MIN_DATETIME_MICROS or moved > MAX_DATETIME_MICROS) break :blk null;
+            if (moved < common.FIRST_DATETIME_MICROS or moved > common.LAST_DATETIME_MICROS) break :blk null;
             break :blk .{ .datetime = .{ .value = moved, .fsp = fsp } };
         },
     };

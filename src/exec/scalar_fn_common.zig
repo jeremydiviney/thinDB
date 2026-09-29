@@ -115,11 +115,22 @@ pub fn datetimeNumber(micros: i64) ScaledInt {
     return .{ .m = whole * std.time.us_per_s + @mod(micros, std.time.us_per_s), .s = 6 };
 }
 
-/// Whether (year, month, day) names a real day: the day is within its month
-/// in the proleptic Gregorian calendar, where year 0 is a leap year, as
-/// StarRocks reads it. MySQL's year 0 has no February 29.
+/// The first and last days a DATE holds, 0000-01-01 and 9999-12-31, as
+/// days since the epoch.
+pub const FIRST_DATE_DAYS: i32 = -719_528;
+pub const LAST_DATE_DAYS: i32 = 2_932_896;
+
+/// The first and last microseconds a DATETIME holds, 0000-01-01 00:00:00
+/// and 9999-12-31 23:59:59.999999.
+pub const FIRST_DATETIME_MICROS: i64 = @as(i64, FIRST_DATE_DAYS) * std.time.us_per_day;
+pub const LAST_DATETIME_MICROS: i64 = (@as(i64, LAST_DATE_DAYS) + 1) * std.time.us_per_day - 1;
+
+/// Whether (year, month, day) names a day a DATE holds: a year from 0 to
+/// 9999, and a day within its month in the proleptic Gregorian calendar,
+/// where year 0 is a leap year, as StarRocks reads it. MySQL's year 0 has
+/// no February 29.
 pub fn validDate(year: i32, month: u32, day: u32) bool {
-    return month >= 1 and month <= 12 and day >= 1 and day <= lastDayOfMonth(year, month);
+    return year >= 0 and year <= 9999 and month >= 1 and month <= 12 and day >= 1 and day <= lastDayOfMonth(year, month);
 }
 
 /// Parse a `YYYY-MM-DD` date string to days-since-epoch. Accepts a trailing
@@ -564,8 +575,12 @@ test "parseDateTimeString: fractions, date-only, Z, rejects" {
     try std.testing.expectError(error.Invalid, parseDateTimeString("1783663005455833"));
 }
 
-test "a date's day must exist in its month" {
+test "a date's day must exist in its month, in years 0 to 9999" {
     const cases = .{
+        .{ "0000-01-01", true },
+        .{ "9999-12-31", true },
+        .{ "-001-01-01", false },
+        .{ "-999-12-31", false },
         .{ "2026-02-28", true },
         .{ "2026-02-29", false },
         .{ "2026-02-30", false },
