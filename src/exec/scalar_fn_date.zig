@@ -380,7 +380,9 @@ fn addMonths(days: i32, n_months: i64) ?i32 {
 }
 
 /// UNIX_TIMESTAMP: whole seconds since 1970-01-01 00:00:00 UTC. A time
-/// before 1970 is 0, as in StarRocks and MySQL.
+/// before 1970 is 0, as in StarRocks and MySQL. Every DATETIME through
+/// 9999-12-31 23:59:59 has its count; StarRocks gives 0 past 9999-12-31
+/// 07:59:59, a time-zone guard band thinDB doesn't copy.
 pub fn unixTimestampKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     for (args[0].data.datetime[0..row_count]) |micros| {
         const seconds: i64 = @max(@divFloor(micros, std.time.us_per_s), 0);
@@ -392,7 +394,9 @@ const LAST_UNIX_SECOND: i64 = @divFloor(common.LAST_DATETIME_MICROS, std.time.us
 
 /// FROM_UNIXTIME: the DATETIME `n` seconds after 1970-01-01 00:00:00 UTC. A
 /// negative count is NULL, as in StarRocks and MySQL, and so is one past
-/// 9999-12-31 23:59:59.
+/// 9999-12-31 23:59:59, the end of the DATETIME range. StarRocks stops 16
+/// hours earlier, at 9999-12-31 07:59:59, a time-zone guard band; thinDB
+/// keeps one calendar end for every function instead.
 pub fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();
     const counts = args[0].data.bigint;
