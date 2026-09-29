@@ -103,6 +103,9 @@ pub const Error = error{
     ValueOutOfRange,
     /// A scalar subquery returned more than one row for a row that reads it.
     SubqueryMultipleRows,
+    /// A subquery reads an enclosing query's columns in a form that can't be
+    /// decorrelated, such as a reference two levels out.
+    UnsupportedCorrelatedSubquery,
     /// A recursive CTE still produced rows after 1000 iterations (MySQL's
     /// default cte_max_recursion_depth).
     RecursiveCteDepthExceeded,

@@ -1662,29 +1662,6 @@ pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column,
     }
 }
 
-fn compareCellToValue(view: ColumnView, idx: usize, op: PredicateOp, ref: Value) !bool {
-    return switch (view.data) {
-        .int => |s| if (ref == .int) cmp(i32, s[idx], ref.int, op) else false,
-        .bigint => |s| if (ref == .bigint) cmp(i64, s[idx], ref.bigint, op) else false,
-        .smallint => |s| if (ref == .smallint) cmp(i16, s[idx], ref.smallint, op) else false,
-        .tinyint => |s| if (ref == .tinyint) cmp(i8, s[idx], ref.tinyint, op) else false,
-        .largeint => |s| if (ref == .largeint) cmp(i128, s[idx], ref.largeint, op) else false,
-        .float => |s| if (ref == .float) cmp(f32, s[idx], ref.float, op) else false,
-        .double => |s| if (ref == .double) cmp(f64, s[idx], ref.double, op) else false,
-        .boolean => |s| if (ref == .boolean) cmp(u8, s[idx], @intFromBool(ref.boolean), op) else false,
-        .date => |s| if (ref == .date) cmp(i32, s[idx], ref.date, op) else false,
-        .datetime => |s| if (ref == .datetime) cmp(i64, s[idx], ref.datetime, op) else false,
-        .decimal64 => |s| if (ref == .decimal64) cmp(i64, s[idx], ref.decimal64, op) else false,
-        .decimal128 => |s| if (ref == .decimal128) cmp(i128, s[idx], ref.decimal128, op) else false,
-        .uuid => |s| if (ref == .uuid) cmp(u128, s[idx], ref.uuid, op) else false,
-        // Strings: full lexicographic comparison (all six ops).
-        .varchar => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
-        .string => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
-        .char => |sv| if (ref == .text) cmpStr(sv.rowBytes(idx), ref.text, op) else false,
-        .json => |sv| orderMatches(jsonOrder(sv.rowBytes(idx), valueJsonOperand(ref)), op),
-    };
-}
-
 fn evaluateDayMask(view: ColumnView, p: Predicate, n: usize, out: []bool) !void {
     if (p.val != .int) return Error.PredicateTypeMismatch;
     const want = p.val.int;
@@ -1727,8 +1704,9 @@ fn emptyStringMask(sv: anytype, want_empty: bool, n: usize, mask: []bool) void {
 ///   1. Build the equi-key tuple from `outer_keys`. NULL in any key → no match.
 ///   2. Linear-scan `groups` for the matching key tuple.
 ///   3. Within that group, check whether any inner value satisfies
-///      `value op outer_range_value` using the cached min/max — a
-///      single compare for open-ended ops.
+///      `value op outer_range_value` (and the upper bound, when closed)
+///      under the comparison rule, since the inner range column's type
+///      needn't be the outer column's.
 ///   4. Apply `negate` (NOT EXISTS).
 ///
 /// Empty group / no matching group → no inner row matches → EXISTS
@@ -1747,7 +1725,13 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
         findCol(schema, c) orelse return Error.ColumnNotFound
     else
         null;
-    const closed_range = range_upper_idx != null;
+    const bounds = RangeProbe{
+        .op = s.op,
+        .op_upper = s.op_upper,
+        .value_scale = decimalScale(s.range_type),
+        .sorted = rangeValuesOrdered(s.range_type, schema[range_idx].type) and
+            (range_upper_idx == null or rangeValuesOrdered(s.range_type, schema[range_upper_idx.?].type)),
+    };
 
     var i: usize = 0;
     while (i < batch.row_count) : (i += 1) {
@@ -1792,25 +1776,9 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
         }
 
         if (matched_group) |g| {
-            if (g.values.len == 0) {
-                out[i] = s.negate;
-                continue;
-            }
-            const exists = if (closed_range)
-                try evaluateClosedRange(g.values, range_view, batch.values[range_upper_idx.?], i, s.op, s.op_upper.?)
-            else blk: {
-                // Open-ended range collapses to a min/max compare.
-                //   inner.x >  outer.y  → exists iff max > y
-                //   inner.x >= outer.y  → exists iff max >= y
-                //   inner.x <  outer.y  → exists iff min < y
-                //   inner.x <= outer.y  → exists iff min <= y
-                const probe: Value = switch (s.op) {
-                    .gt, .gte => g.values[g.values.len - 1], // max
-                    .lt, .lte => g.values[0], // min
-                    else => return Error.PredicateTypeMismatch,
-                };
-                break :blk try compareCellToValue(range_view, i, reverseRangeOp(s.op), probe);
-            };
+            const lower = cellScalar(range_view, schema[range_idx].type, i);
+            const upper: ?Scalar = if (range_upper_idx) |ui| cellScalar(batch.values[ui], schema[ui].type, i) else null;
+            const exists = try bounds.anyMatches(g.values, lower, upper);
             out[i] = if (s.negate) !exists else exists;
         } else {
             out[i] = s.negate;
@@ -1818,91 +1786,54 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
     }
 }
 
-/// Closed-range existence check. Given a bucket's sorted ascending
-/// `values` and an outer row's lower/upper bound cells, return whether
-/// any value satisfies `lower_op outer.lower` AND `upper_op outer.upper`.
-///
-/// Strategy: bsearch for the first value ≥ the effective lower bound.
-/// If found and ≤ the effective upper bound, EXISTS; else no.
-///
-///   lower_op = .gt   →  value >  lo  → first value strictly greater
-///   lower_op = .gte  →  value >= lo  → first value >=
-///   upper_op = .lt   →  value <  hi
-///   upper_op = .lte  →  value <= hi
-fn evaluateClosedRange(
-    values: []const Value,
-    lower_view: anytype,
-    upper_view: anytype,
-    row_idx: usize,
-    lower_op: PredicateOp,
-    upper_op: PredicateOp,
-) !bool {
-    // Materialize lo/hi as Values so we can use Value.compare.
-    const lo = try extractValueFromView(lower_view, row_idx);
-    const hi = try extractValueFromView(upper_view, row_idx);
+/// A group's inner values probed against one outer row's bound(s).
+const RangeProbe = struct {
+    /// `value op lower`: `.gt`/`.gte`/`.lt`/`.lte` when open, `.gt`/`.gte` when closed.
+    op: PredicateOp,
+    /// `value op_upper upper`, `.lt` or `.lte`; set iff the range is closed.
+    op_upper: ?PredicateOp,
+    value_scale: u8,
+    /// The values' ascending order is also their order as they compare with
+    /// the outer bounds, so the ends answer an open range and a binary search
+    /// a closed one. Otherwise every value is compared.
+    sorted: bool,
 
-    // Binary search for first value that satisfies the lower bound.
-    // For .gte: first value with value >= lo  → lower_bound(lo)
-    // For .gt:  first value with value >  lo  → upper_bound(lo)
-    var lo_idx: usize = 0;
-    var hi_idx: usize = values.len;
-    while (lo_idx < hi_idx) {
-        const mid = lo_idx + (hi_idx - lo_idx) / 2;
-        const cmp_res = values[mid].compare(lo);
-        const before_target = switch (lower_op) {
-            .gte => cmp_res == .lt, // need value >= lo
-            .gt => cmp_res != .gt, // need value > lo
-            else => return Error.PredicateTypeMismatch,
+    fn anyMatches(self: RangeProbe, values: []const Value, lower: Scalar, upper: ?Scalar) Error!bool {
+        if (values.len == 0) return false;
+        if (!self.sorted) {
+            for (values) |v| if (try self.satisfies(v, lower, upper)) return true;
+            return false;
+        }
+        if (upper == null) return switch (self.op) {
+            .gt, .gte => try self.satisfies(values[values.len - 1], lower, null),
+            .lt, .lte => try self.satisfies(values[0], lower, null),
+            else => Error.PredicateTypeMismatch,
         };
-        if (before_target) lo_idx = mid + 1 else hi_idx = mid;
+        if (self.op != .gt and self.op != .gte) return Error.PredicateTypeMismatch;
+        var lo: usize = 0;
+        var hi: usize = values.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (orderMatches(scalarOrder(valueScalar(values[mid], self.value_scale), lower), self.op)) hi = mid else lo = mid + 1;
+        }
+        return lo < values.len and try self.satisfies(values[lo], lower, upper);
     }
 
-    if (lo_idx >= values.len) return false;
+    fn satisfies(self: RangeProbe, v: Value, lower: Scalar, upper: ?Scalar) Error!bool {
+        const x = valueScalar(v, self.value_scale);
+        if (!orderMatches(scalarOrder(x, lower), self.op)) return false;
+        const u = upper orelse return true;
+        const op_upper = self.op_upper orelse return Error.PredicateTypeMismatch;
+        if (op_upper != .lt and op_upper != .lte) return Error.PredicateTypeMismatch;
+        return orderMatches(scalarOrder(x, u), op_upper);
+    }
+};
 
-    // Check the first candidate against the upper bound.
-    const candidate = values[lo_idx];
-    const upper_cmp = candidate.compare(hi);
-    return switch (upper_op) {
-        .lte => upper_cmp != .gt, // value <= hi
-        .lt => upper_cmp == .lt, // value < hi
-        else => Error.PredicateTypeMismatch,
-    };
-}
-
-/// Pull a typed Value out of a single cell of a ColumnView. Mirrors
-/// the existing extractScalarValueAt helper in subquery_resolve but
-/// inline here so the evaluator stays self-contained.
-fn extractValueFromView(view: anytype, idx: usize) !Value {
-    return switch (view.data) {
-        .int => |s| .{ .int = s[idx] },
-        .bigint => |s| .{ .bigint = s[idx] },
-        .smallint => |s| .{ .smallint = s[idx] },
-        .tinyint => |s| .{ .tinyint = s[idx] },
-        .largeint => |s| .{ .largeint = s[idx] },
-        .float => |s| .{ .float = s[idx] },
-        .double => |s| .{ .double = s[idx] },
-        .boolean => |s| .{ .boolean = s[idx] != 0 },
-        .date => |s| .{ .date = s[idx] },
-        .datetime => |s| .{ .datetime = s[idx] },
-        .decimal64 => |s| .{ .decimal64 = s[idx] },
-        .decimal128 => |s| .{ .decimal128 = s[idx] },
-        .uuid => |s| .{ .uuid = s[idx] },
-        // Strings aren't supported in range comparisons.
-        .varchar, .string, .char, .json => Error.UnsupportedOperatorForType,
-    };
-}
-
-/// Flip a range op so `inner op outer` becomes the equivalent
-/// `outer op' inner`. Used by the range evaluator to phrase the
-/// existence check as "outer compared-against probe(min|max)".
-fn reverseRangeOp(op: PredicateOp) PredicateOp {
-    return switch (op) {
-        .gt => .lt,
-        .gte => .lte,
-        .lt => .gt,
-        .lte => .gte,
-        else => unreachable,
-    };
+/// Whether values of `value_type`, sorted in that type's order, stay sorted
+/// as they compare with a column of `outer_type`. Text sorts by bytes but
+/// meets a number or a temporal by parsing, so it doesn't.
+fn rangeValuesOrdered(value_type: types.Type, outer_type: types.Type) bool {
+    return comparisonKind(value_type) != .text or comparisonKind(outer_type) == .text;
 }
 
 /// Per-row tuple lookup against a materialized correlated set.
