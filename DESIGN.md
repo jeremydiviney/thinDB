@@ -1282,6 +1282,7 @@ SortNoKeys,
 AggregateNoSpecs, AggregateColumnRequired,
 AggregateUnsupportedType, AggregateInvalidParam,
 ArithmeticOverflow, ValueOutOfRange, SubqueryMultipleRows,
+UnsupportedCorrelatedSubquery,
 ComputeNoColumns, ComputeNameCollision, ComputeUnsupportedExpr,
 ComputeNoSuchOverload, ComputeTooManyArgs,
 JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
@@ -1301,6 +1302,8 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 Scalar functions reject bad arguments with their own errors, which reach a client under their names: `JsonInvalid` (malformed JSON text or JSONB bytes), `JsonNullMemberName` (a NULL key in `JSON_OBJECT` / `JSON_OBJECTAGG`), `IncorrectArgumentsToSleep` (a NULL or negative `SLEEP`), `RegexInvalidPattern`, `RegexInvalidMatchType` (a `match_type` letter outside `c i m n u`), `RegexInvalidReturnOption` (a `REGEXP_INSTR` return option other than 0 or 1) and `RegexIndexOutOfBounds` (a `REGEXP_*` position below 1 or past the end of the subject). MySQL raises the same conditions as errors.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
+
+`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form thinDB can't decorrelate: a reference two levels out, an outer column outside the WHERE's `inner = outer` and `inner < outer` comparisons (as under OR, or in an expression that also reads the subquery's own columns), a scalar subquery correlated by a range comparison, or a correlated LIMIT inside IN. The outer side of such a comparison may be an expression over the outer row (`y.id = x.k + 10`), which the enclosing query computes for each of its rows. A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. Any other correlated subquery runs once, without its correlations. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 

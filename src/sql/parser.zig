@@ -4269,6 +4269,7 @@ pub const Parser = struct {
         if (self.cur.tag == .lparen) {
             if (try self.lookupSqlFn(first_lc)) |def| {
                 op = try self.expandSqlFunction(def);
+                op.materialize.name = first_dup;
                 alias_in_place = false;
             } else {
                 const format = fileFormatForFunction(first_lc) orelse return ParseError.SqlUnsupportedFileFunction;
@@ -4295,6 +4296,7 @@ pub const Parser = struct {
             alias_in_place = false;
         } else if (try self.expandPlainView(first_lc)) |view_op| {
             op = view_op;
+            op.materialize.name = first_dup;
             alias_in_place = false;
         } else {
             var parts_buf: [3][]const u8 = undefined;

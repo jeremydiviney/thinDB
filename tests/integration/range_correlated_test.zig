@@ -5,7 +5,9 @@
 //! (after applying all non-correlated filters), buckets rows by any
 //! equi-correlation keys, and stores each bucket's range-column
 //! values sorted with min/max cached. Per outer row evaluation
-//! collapses to a single min/max compare for open-ended ops.
+//! collapses to a single min/max compare for open-ended ops, made under
+//! the comparison rule, so the inner and outer columns needn't share a
+//! type.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -302,4 +304,49 @@ test "range EXISTS: with inner-local filter applied before materialization" {
     );
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, ids);
+}
+
+test "range EXISTS / IN: the inner range column compares by value with an outer column of another type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE mx_a (id BIGINT PRIMARY KEY, lo INT, hi BIGINT, d DATE, dc DECIMAL(10,2), f DOUBLE)");
+    try exec(allocator, db, "CREATE TABLE mx_b (id BIGINT PRIMARY KEY, n BIGINT, m DECIMAL(12,3), dt DATETIME, g DOUBLE, s SMALLINT, t VARCHAR(4))");
+    try exec(allocator, db, "INSERT INTO mx_a VALUES (1, 5, 12, '2024-01-02', 5.50, 1.5), (2, 20, 25, '2024-03-01', 20.00, 30.0), " ++
+        "(3, NULL, 40, '2023-12-31', NULL, NULL), (4, 0, 3, '2024-02-15', 0.01, 0.0), (5, 12, 12, '2024-01-01', 12.25, 12.25), (6, 7, 9, NULL, 7.10, 9.5)");
+    try exec(allocator, db, "INSERT INTO mx_b VALUES (1, 3, 5.500, '2024-01-01 12:00:00', 1.5, 2, '9'), (2, 12, 12.250, '2024-01-02 00:00:00', 12.25, 12, '12'), " ++
+        "(3, 8, 7.105, '2024-02-15 23:59:59', 9.5, 8, '100'), (4, NULL, NULL, NULL, NULL, NULL, NULL), (5, 18, 19.999, '2023-12-31 00:00:00', 30.0, 18, '18')");
+    const t1 = try db.openTable("mx_a", .{});
+    try t1.flush();
+    const t2 = try db.openTable("mx_b", .{});
+    try t2.flush();
+
+    // Rows are DuckDB's, except the VARCHAR-against-INT cases, which DuckDB
+    // refuses to compare; those follow the numeric reading of the text.
+    const cases = .{
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.n > a.lo)", &[_]i64{ 1, 4, 5, 6 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.n < a.lo)", &[_]i64{ 1, 2, 5, 6 } },
+        .{ "WHERE NOT EXISTS (SELECT 1 FROM mx_b b WHERE b.n >= a.lo)", &[_]i64{ 2, 3 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.m <= a.dc)", &[_]i64{ 1, 2, 5, 6 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.n >= a.lo AND b.n < a.hi)", &[_]i64{ 1, 6 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.m BETWEEN a.lo AND a.hi)", &[_]i64{ 1, 6 } },
+        .{ "WHERE NOT EXISTS (SELECT 1 FROM mx_b b WHERE b.m > a.lo AND b.m <= a.hi)", &[_]i64{ 2, 3, 4, 5 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.dt < a.d)", &[_]i64{ 1, 2, 4, 5 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.dt >= a.d)", &[_]i64{ 1, 3, 4, 5 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.g > a.dc)", &[_]i64{ 1, 2, 4, 5, 6 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.m > a.f)", &[_]i64{ 1, 4, 5, 6 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.id = a.id AND b.s <= a.lo)", &[_]i64{ 1, 2 } },
+        .{ "WHERE a.lo IN (SELECT b.s FROM mx_b b WHERE b.n <= a.hi)", &[_]i64{5} },
+        .{ "WHERE a.lo NOT IN (SELECT b.s FROM mx_b b WHERE b.n <= a.hi AND b.s IS NOT NULL)", &[_]i64{ 1, 2, 4, 6 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.t > a.lo)", &[_]i64{ 1, 2, 4, 5, 6 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.t < a.lo)", &[_]i64{ 2, 5 } },
+        .{ "WHERE EXISTS (SELECT 1 FROM mx_b b WHERE b.t >= a.lo AND b.t < a.hi)", &[_]i64{1} },
+    };
+    inline for (cases) |case| {
+        const ids = try collectBigints(allocator, db, "SELECT a.id FROM mx_a a " ++ case[0] ++ " ORDER BY a.id");
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, case[1], ids);
+    }
 }

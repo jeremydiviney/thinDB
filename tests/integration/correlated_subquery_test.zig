@@ -4,8 +4,9 @@
 //! pre-compile pass detects correlation in the inner's WHERE clause,
 //! rewrites the inner to project the correlation keys, drains the
 //! rewritten inner into a tuple set, and replaces the predicate with
-//! a per-row tuple lookup. Equi-correlations only; inner shape is
-//! Filter(AND-conjunction, Scan(T)).
+//! a per-row tuple lookup. The inner FROM may be a table, CTE, view or
+//! derived table, and a column reference binds in the innermost query
+//! whose FROM has it, as SQL scopes names.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -13,6 +14,7 @@ const helpers = @import("sql_helpers.zig");
 const runSql = helpers.runSql;
 const exec = helpers.exec;
 const collectBigints = helpers.collectBigints;
+const collectIntCells = helpers.collectIntCells;
 
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
@@ -211,4 +213,146 @@ test "correlated subqueries: SELECT 1 / SELECT * and refs qualified by the inner
         defer allocator.free(got);
         try std.testing.expectEqualSlices(i64, case[1], got);
     }
+}
+
+fn setupScopes(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, io, dir, .{});
+    errdefer db.close();
+    try exec(allocator, db, "CREATE TABLE ex_t (id BIGINT PRIMARY KEY, v INT, k INT)");
+    try exec(allocator, db, "CREATE TABLE ex_u (id BIGINT PRIMARY KEY, v INT, w VARCHAR(4))");
+    try exec(allocator, db, "INSERT INTO ex_t VALUES (1, 5, 10), (2, 2, 20), (3, NULL, 30), (4, 7, 40), (5, 2, 50)");
+    try exec(allocator, db, "INSERT INTO ex_u VALUES (10, 2, 'a'), (20, 7, 'b'), (30, NULL, 'c'), (40, 2, 'd'), (50, 9, 'e')");
+    const t1 = try db.openTable("ex_t", .{});
+    try t1.flush();
+    const t2 = try db.openTable("ex_u", .{});
+    try t2.flush();
+    try exec(allocator, db, "CREATE VIEW vu AS SELECT id, v, w FROM ex_u");
+    return db;
+}
+
+fn expectCells(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: []const ?i64) !void {
+    var q = try helpers.runSqlCtx(allocator, db, sql);
+    defer q.deinit();
+    const cells = try collectIntCells(allocator, &q);
+    defer allocator.free(cells);
+    try std.testing.expectEqualSlices(?i64, expected, cells);
+}
+
+// Each form names the inner relation `y`; it has an `ex_u` column list the
+// outer `ex_t x` shares `id` and `v` with, so a reference bound in the
+// wrong scope changes the rows. Expected rows are DuckDB's.
+const scope_forms = .{
+    .{ "", "ex_u y" },
+    .{ "", "(SELECT id, v, w FROM ex_u) y" },
+    .{ "WITH y AS (SELECT id, v, w FROM ex_u) ", "y" },
+    .{ "WITH c AS (SELECT id, v, w FROM ex_u) ", "c y" },
+    .{ "WITH y AS (SELECT d.id, d.v, d.w FROM (SELECT id, v, w FROM ex_u) d) ", "y" },
+    .{ "", "vu y" },
+};
+
+const scope_queries = .{
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.v = x.v) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE NOT EXISTS (SELECT 1 FROM ", " WHERE y.v = x.v) ORDER BY x.id", &[_]?i64{ 1, 3 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE v = x.v) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.id = k AND y.v > 5) ORDER BY x.id", &[_]?i64{ 2, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.v > x.v) ORDER BY x.id", &[_]?i64{ 1, 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.v = x.v AND y.w <> 'a') ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT y.v FROM ", " WHERE y.id >= x.k) ORDER BY x.id", &[_]?i64{2} },
+    .{ "SELECT x.id FROM ex_t x WHERE x.v NOT IN (SELECT y.v FROM ", " WHERE y.id >= x.k AND y.v IS NOT NULL) ORDER BY x.id", &[_]?i64{ 1, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE (SELECT COUNT(*) FROM ", " WHERE y.v = x.v) > 0 ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id, (SELECT MAX(y.id) FROM ", " WHERE y.v = x.v) AS m FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, null, 2, 40, 3, null, 4, 20, 5, 40 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u z WHERE z.v = x.v AND EXISTS (SELECT 1 FROM ", " WHERE y.id = z.id AND y.w <> 'd')) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT ex_t.id FROM ex_t WHERE EXISTS (SELECT 1 FROM ", " WHERE y.v = ex_t.v) ORDER BY ex_t.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT y.v FROM ", " WHERE y.v = x.v GROUP BY y.v) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " JOIN ex_u z ON z.id = y.id WHERE y.v = x.v AND z.w <> 'a') ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT DISTINCT y.v FROM ", " WHERE y.v = x.v) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.v = x.v LIMIT 1) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id, CASE WHEN NOT EXISTS (SELECT 1 FROM ", " WHERE y.v = x.v) THEN 1 ELSE 0 END AS f FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 1, 2, 0, 3, 1, 4, 0, 5, 0 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.id = x.k + 10) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4 } },
+    .{ "SELECT x.id FROM ex_t x WHERE NOT EXISTS (SELECT 1 FROM ", " WHERE y.id = x.k + 10 AND y.v IS NOT NULL) ORDER BY x.id", &[_]?i64{ 2, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.v > x.v + 3) ORDER BY x.id", &[_]?i64{ 1, 2, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT y.v FROM ", " WHERE y.id = x.k + 20) ORDER BY x.id", &[_]?i64{2} },
+    .{ "SELECT x.id FROM ex_t x WHERE x.v NOT IN (SELECT y.v FROM ", " WHERE y.id >= x.k - 10 AND y.v IS NOT NULL) ORDER BY x.id", &[_]?i64{ 1, 4 } },
+    .{ "SELECT x.id, (SELECT MAX(y.v) FROM ", " WHERE y.id = x.k - 10) AS m FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, null, 2, 2, 3, 7, 4, null, 5, 2 } },
+    .{ "SELECT x.id, (SELECT y.v FROM ", " WHERE y.id = x.id * 10) AS v FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 2, 2, 7, 3, null, 4, 2, 5, 9 } },
+    .{ "SELECT x.id, CASE WHEN EXISTS (SELECT 1 FROM ", " WHERE y.id = x.k + 10) THEN 1 ELSE 0 END AS f FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 1, 2, 1, 3, 1, 4, 1, 5, 0 } },
+};
+
+test "correlated subqueries over a CTE, view or derived table bind outer references to the outer query" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    inline for (scope_forms) |form| {
+        inline for (scope_queries) |query| {
+            expectCells(allocator, db, form[0] ++ query[0] ++ form[1] ++ query[1], query[2]) catch |err| {
+                std.debug.print("failed: {s}{s}{s}{s}\n", .{ form[0], query[0], form[1], query[1] });
+                return err;
+            };
+        }
+    }
+}
+
+test "correlated subqueries: an inner relation shadows the outer name, and an unaliased CTE or view qualifies its columns" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u x WHERE x.v = 9) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT id, v, w FROM ex_u) x WHERE x.v = 9) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4, 5 } },
+        .{ "WITH y AS (SELECT id, v, w FROM ex_u) SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM y x WHERE x.v = 9) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM vu WHERE vu.v = x.v) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE NOT EXISTS (SELECT 1 FROM vu WHERE vu.v = x.v) ORDER BY x.id", &[_]?i64{ 1, 3 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT vu.v FROM vu WHERE vu.id >= x.k) ORDER BY x.id", &[_]?i64{2} },
+        .{ "SELECT x.id, (SELECT MAX(vu.id) FROM vu WHERE vu.v = x.v) AS m FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, null, 2, 40, 3, null, 4, 20, 5, 40 } },
+        .{ "WITH y AS (SELECT id, v FROM ex_u) SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM y WHERE y.v = x.v) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    };
+    inline for (cases) |case| try expectCells(allocator, db, case[0], case[1]);
+}
+
+test "correlated subqueries that can't be decorrelated are rejected rather than bound to an inner column" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id > 15 AND EXISTS (SELECT 1 FROM ex_u z WHERE z.id = y.id AND z.v = x.v)) ORDER BY x.id",
+        "WITH y AS (SELECT id, v FROM ex_u) SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM y WHERE y.id > 15 AND EXISTS (SELECT 1 FROM ex_u z WHERE z.id = y.id AND z.v = x.v)) ORDER BY x.id",
+        "SELECT x.id, (SELECT COUNT(*) FROM ex_u y WHERE y.id = x.k + 10 OR y.id = x.k) AS n FROM ex_t x ORDER BY x.id",
+        "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT id FROM ex_u) y WHERE y.id + x.k = 60) ORDER BY x.id",
+    };
+    inline for (cases) |sql| try helpers.expectRunError(allocator, db, sql, error.UnsupportedCorrelatedSubquery);
+}
+
+test "correlated scalar over a CTE that shadows its table, keyed by an expression over the outer row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE rr (id BIGINT PRIMARY KEY, p INT, c VARCHAR(4), d DATE, amount BIGINT)");
+    try exec(allocator, db, "INSERT INTO rr VALUES (1, 1, 'c1', '2024-01-01', 100), (2, 1, 'c1', '2024-04-01', 0), (3, 1, 'c2', '2024-01-01', 50), " ++
+        "(4, 1, 'c2', '2024-04-01', 70), (5, 1, 'c3', '2024-04-01', 30), (6, 2, 'c1', '2024-01-01', 999), (7, 1, 'c1', '2023-10-01', 5)");
+    const t = try db.openTable("rr", .{});
+    try t.flush();
+
+    // Each row's amount three months earlier, as a quarterly cohort report
+    // reads it. Rows are DuckDB's.
+    var q = try helpers.runSqlMysqlCtx(allocator, db,
+        \\WITH rr AS (SELECT id, p, c, d, amount FROM rr WHERE p = 1)
+        \\SELECT i.id, CAST(COALESCE((SELECT SUM(CAST(COALESCE(c1.amount, 0) AS SIGNED)) FROM rr c1
+        \\  WHERE c1.p = i.p AND c1.c = i.c AND c1.d = ADDDATE(i.d, INTERVAL -3 MONTH)), 0) AS SIGNED) AS last_amount
+        \\FROM rr i ORDER BY i.c, i.d
+    );
+    defer q.deinit();
+    const cells = try collectIntCells(allocator, &q);
+    defer allocator.free(cells);
+    try std.testing.expectEqualSlices(?i64, &.{ 7, 0, 1, 5, 2, 100, 3, 0, 4, 50, 5, 0 }, cells);
 }

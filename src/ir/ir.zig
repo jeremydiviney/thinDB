@@ -916,8 +916,10 @@ pub const Op = union(OpTag) {
         /// Incompatible portions retain ordinary staging; compatible CTEs
         /// can reenter regions downstream. Parse-time only, not serialized.
         region_keys: ?[]const []const u8 = null,
-        /// The CTE this boundary came from — labels its stage in the
-        /// `--profile-ops` `[cte]` lines. Parse-time only, not serialized.
+        /// The CTE, view or table function this boundary came from: the
+        /// name that qualifies its columns in a FROM that doesn't alias it,
+        /// and its stage's label in the `--profile-ops` `[cte]` lines.
+        /// Parse-time only, not serialized.
         name: ?[]const u8 = null,
         /// `WITH RECURSIVE`: set on the CTE's own boundary and on each
         /// reference its recursive arms make to it. Parse-time only; encode

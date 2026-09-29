@@ -15,23 +15,23 @@
 //!
 //! Tier 2 — correlated EXISTS / IN / scalar / range:
 //!   For predicates whose inner WHERE includes `inner_col op outer_col`
-//!   conjuncts (one side from the FROM-table, the other not), we
-//!   materialize a per-outer-key lookup table once and rewrite the
-//!   predicate into the `correlated_set` / `correlated_scalar` /
-//!   `correlated_range` form. The Filter then evaluates per outer
-//!   row via tuple lookup or min/max compare without re-executing
-//!   the inner.
+//!   conjuncts (one side bound by the subquery's own scope, the other by
+//!   an enclosing query's, as SQL scopes names), we materialize a
+//!   per-outer-key lookup table once and rewrite the predicate into the
+//!   `correlated_set` / `correlated_scalar` / `correlated_range` form.
+//!   The Filter then evaluates per outer row via tuple lookup or min/max
+//!   compare without re-executing the inner.
 //!
-//! Operators never see subquery variants. If a path here returns
-//! `false` or `error.UnsupportedOp`, the predicate retains its
-//! subquery form and compilation errors out — surfacing the
-//! unsupported shape to the user.
+//! Operators never see subquery variants. A subquery compiled on its own
+//! must read nothing outside itself: one that reads an enclosing query in
+//! a way these paths can't decorrelate fails with
+//! `error.UnsupportedCorrelatedSubquery`, since compiled alone its outer
+//! names would bind to inner columns of the same bare name.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
-const TableSchema = types.TableSchema;
 const Value = types.Value;
 const Dialect = types.Dialect;
 
@@ -74,12 +74,12 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value, null),
         .delete_op => |*d| {
             if (d.source) |s| try resolveSubqueriesInOp(ctx, s);
-            if (d.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
+            if (d.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred, null);
             for (d.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
         },
         .update_op => |*u| {
             if (u.source) |s| try resolveSubqueriesInOp(ctx, s);
-            if (u.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
+            if (u.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred, null);
             for (u.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
             for (u.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
         },
@@ -92,7 +92,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
             var lowered: LoweredScalars = .{};
             for (c.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), &lowered);
             try resolveSubqueriesInOp(ctx, @constCast(c.upstream));
-            if (lowered.joins.items.len > 0) {
+            if (lowered.any()) {
                 const compute = try newOp(ctx, .{ .compute = .{
                     .derived = c.derived,
                     .upstream = try joinLoweredScalars(ctx, @constCast(c.upstream), lowered),
@@ -101,10 +101,10 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
             }
         },
         .join => |*j| {
-            if (j.extra_predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred);
+            if (j.extra_predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred, null);
             if (j.residual) |*res| {
                 for (res.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), null);
-                try resolveSubqueriesInPredicate(ctx, &res.predicate);
+                try resolveSubqueriesInPredicate(ctx, &res.predicate, null);
             }
             try resolveSubqueriesInOp(ctx, @constCast(j.left));
             try resolveSubqueriesInOp(ctx, @constCast(j.right));
@@ -137,7 +137,7 @@ fn resolveDuplicateAssignments(ctx: *CompileCtx, on_duplicate: ?ir.OnDuplicate) 
     for (od.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
 }
 
-fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror!void {
+fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr, lowered: ?*LoweredScalars) anyerror!void {
     switch (pred.*) {
         .leaf, .day_leaf, .leaf_col_col, .is_null, .is_not_null, .like, .always, .in_set, .text_as_number, .text_as_number_set, .correlated_set, .correlated_scalar, .correlated_range, .unknown => {},
         .leaf_var => |v| {
@@ -156,22 +156,17 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
             };
         },
         .exists_subquery => |src| {
-            // Detect correlation. If the inner has any leaf_col_col
-            // referencing a column outside its FROM-table, treat as
-            // correlated and materialize a key set. Otherwise fall
-            // back to the uncorrelated EXISTS path.
-            if (try maybeResolveCorrelatedExists(ctx, pred, src, false)) return;
-            const has_rows = try runExistsSubquery(ctx, src);
-            pred.* = .{ .always = has_rows };
+            if (try resolveCorrelatedBlock(ctx, pred, src, false, null, lowered)) return;
+            pred.* = .{ .always = try runExistsSubquery(ctx, src) };
         },
         .in_subquery => |s| {
-            if (try maybeResolveCorrelatedIn(ctx, pred, s)) return;
+            if (try resolveCorrelatedBlock(ctx, pred, s.source, s.negate, s, lowered)) return;
             if (s.rest_cols.len > 0) return try resolveRowIn(ctx, pred, s);
             const drained = try runInSubquery(ctx, s.source);
             pred.* = .{ .in_set = .{ .col = s.col, .values = drained.values, .negate = s.negate, .value_type = drained.ty } };
         },
-        .@"and" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
-        .@"or" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c)),
+        .@"and" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c), lowered),
+        .@"or" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c), lowered),
         .not => |child| {
             // NOT EXISTS at parse time wraps an exists_subquery in
             // a `.not`; if that exists_subquery turns out to be
@@ -180,13 +175,11 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr) anyerror
             // the unwrap inline.
             if (child.* == .exists_subquery) {
                 const src = child.exists_subquery;
-                if (try maybeResolveCorrelatedExists(ctx, pred, src, true)) return;
-                // Uncorrelated case: resolve inner, NOT the result.
-                const has_rows = try runExistsSubquery(ctx, src);
-                pred.* = .{ .always = !has_rows };
+                if (try resolveCorrelatedBlock(ctx, pred, src, true, null, lowered)) return;
+                pred.* = .{ .always = !try runExistsSubquery(ctx, src) };
                 return;
             }
-            try resolveSubqueriesInPredicate(ctx, @constCast(child));
+            try resolveSubqueriesInPredicate(ctx, @constCast(child), lowered);
         },
     }
 }
@@ -363,7 +356,7 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
             for (cs.operands) |*o| try resolveSubqueriesInExpr(ctx, @constCast(&o.expr), lowered);
             for (cs.branches) |*br| {
                 if (lowered) |l| try lowerPredicateScalars(ctx, @constCast(&br.cond), l);
-                try resolveSubqueriesInPredicate(ctx, @constCast(&br.cond));
+                try resolveSubqueriesInPredicate(ctx, @constCast(&br.cond), lowered);
                 try resolveSubqueriesInExpr(ctx, @constCast(&br.then), lowered);
             }
             if (cs.else_branch) |eb| try resolveSubqueriesInExpr(ctx, @constCast(eb), lowered);
@@ -379,8 +372,19 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
             };
         },
         .exists_subquery => |opaque_ptr| {
-            const has_rows = try runExistsSubquery(ctx, opaque_ptr);
-            e.* = .{ .lit = .{ .boolean = has_rows } };
+            // Read as a CASE condition, a correlated EXISTS decorrelates as
+            // one in a WHERE does.
+            const na = ctx.nodeArena();
+            const branches = try na.alloc(exec.expr_mod.Expr.Branch, 1);
+            branches[0] = .{ .cond = .{ .exists_subquery = opaque_ptr }, .then = .{ .lit = .{ .boolean = true } } };
+            try resolveSubqueriesInPredicate(ctx, &branches[0].cond, lowered);
+            if (branches[0].cond == .always) {
+                e.* = .{ .lit = .{ .boolean = branches[0].cond.always } };
+                return;
+            }
+            const no_rows = try na.create(ir.Expr);
+            no_rows.* = .{ .lit = .{ .boolean = false } };
+            e.* = .{ .case = .{ .branches = branches, .else_branch = no_rows } };
         },
     }
 }
@@ -395,7 +399,7 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
 /// from upstream operators that emit a heading empty batch.
 fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
-    try resolveSubqueriesInOp(ctx, inner);
+    try prepareSubplan(ctx, inner);
 
     var q = try local.compileSubplan(ctx, inner);
     defer q.deinit();
@@ -420,7 +424,7 @@ const DrainedSet = struct {
 
 fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
-    try resolveSubqueriesInOp(ctx, inner);
+    try prepareSubplan(ctx, inner);
 
     var q = try local.compileSubplan(ctx, inner);
     defer q.deinit();
@@ -456,7 +460,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet 
 /// tuple set.
 fn resolveRowIn(ctx: *CompileCtx, pred: *PredicateExpr, s: exec.predicate.InSubquery) !void {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(s.source)));
-    try resolveSubqueriesInOp(ctx, inner);
+    try prepareSubplan(ctx, inner);
 
     var q = try local.compileSubplan(ctx, inner);
     defer q.deinit();
@@ -497,14 +501,19 @@ fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize) ![]const []const Valu
     return try rows.toOwnedSlice(aa);
 }
 
-/// An IN predicate over a tuple set whose first `in_width` outer columns
-/// are the IN side. A NULL there never matches either way, as for a
-/// single-column IN set, so NOT IN keeps those rows out.
+/// A probe of a tuple set whose first `in_width` outer columns are an IN's
+/// compared side (none for EXISTS).
 fn inTupleSet(aa: Allocator, set: exec.predicate.CorrelatedSet, in_width: usize) !PredicateExpr {
-    if (!set.negate) return .{ .correlated_set = set };
-    const kids = try aa.alloc(PredicateExpr, in_width + 1);
-    for (set.outer_cols[0..in_width], kids[0..in_width]) |c, *kid| kid.* = .{ .is_not_null = c };
-    kids[in_width] = .{ .correlated_set = set };
+    return nullGuarded(aa, set.outer_cols[0..in_width], set.negate, .{ .correlated_set = set });
+}
+
+/// A NULL among IN's compared columns never matches either way, as for a
+/// single-column IN set, so NOT IN keeps those rows out.
+fn nullGuarded(aa: Allocator, in_cols: []const []const u8, negate: bool, probe: PredicateExpr) !PredicateExpr {
+    if (!negate or in_cols.len == 0) return probe;
+    const kids = try aa.alloc(PredicateExpr, in_cols.len + 1);
+    for (in_cols, kids[0..in_cols.len]) |c, *kid| kid.* = .{ .is_not_null = c };
+    kids[in_cols.len] = probe;
     return .{ .@"and" = kids };
 }
 
@@ -556,8 +565,7 @@ fn valueExpr(arena: Allocator, tv: TypedValue) !ir.Expr {
 /// More rows or columns → error.
 fn runScalarSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !ScalarResult {
     const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
-    // Resolve any further-nested subqueries first.
-    try resolveSubqueriesInOp(ctx, inner);
+    try prepareSubplan(ctx, inner);
 
     var q = try local.compileSubplan(ctx, inner);
     defer q.deinit();
@@ -632,7 +640,402 @@ fn extractScalarValueAt(allocator: Allocator, view: storage.ColumnView, idx: usi
 }
 
 // =============================================================================
-// Correlation analysis — common to all correlated subquery resolvers.
+// Name scope: which names a subquery block binds itself.
+// =============================================================================
+
+/// How deep scope analysis follows nested relations.
+const SCOPE_DEPTH_LIMIT = 64;
+
+/// How many operators one column enumeration visits. CTE bodies are shared
+/// subtrees, so walking them as a tree can cost far more than the DAG.
+const SCOPE_WALK_BUDGET = 4096;
+
+/// A relation a block's FROM names. `columns` lists every name its rows
+/// could carry (a superset), null when they can't be enumerated here.
+const Range = struct {
+    name: ?[]const u8,
+    columns: ?[]const []const u8,
+};
+
+/// The names a subquery block binds itself: the relations its FROM names and
+/// the columns its operators compute. Any other name comes from an
+/// enclosing query.
+const Scope = struct {
+    ranges: []const Range,
+    derived: []const []const u8,
+    /// Computed columns that read only the enclosing row, handed to the
+    /// enclosing query to compute (`from`, the block's own name).
+    outer: []const exec.predicate.ColRename = &.{},
+
+    /// Whether `ref` binds inside the block, as SQL scopes names: a qualified
+    /// name by its qualifier, an unqualified one to the innermost block that
+    /// has the column. A relation whose name or columns are unknown could
+    /// bind anything, so it claims every such reference.
+    fn binds(self: Scope, ref: []const u8) bool {
+        for (self.outer) |r| if (types.columnNameEql(r.from, ref)) return false;
+        for (self.derived) |name| if (types.columnNameEql(name, ref)) return true;
+        if (types.splitQualifiedName(ref)) |split| {
+            const qualifier = lastSegment(split.qualifier);
+            for (self.ranges) |r| {
+                const name = r.name orelse return true;
+                if (types.columnNameEql(name, qualifier)) return true;
+            }
+            return false;
+        }
+        for (self.ranges) |r| {
+            const columns = r.columns orelse return true;
+            for (columns) |c| if (types.columnNameEql(types.unqualifiedName(c), ref)) return true;
+        }
+        return false;
+    }
+};
+
+/// The relation name that ends a qualifier (`db.t` → `t`).
+fn lastSegment(qualifier: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, qualifier, '.') orelse return qualifier;
+    return qualifier[dot + 1 ..];
+}
+
+/// A query block: its operators from the top down, over the relation its
+/// FROM reads.
+const Block = struct {
+    chain: []const *const ir.Op,
+    from: *const ir.Op,
+};
+
+fn splitBlock(ctx: *CompileCtx, top: *const ir.Op) !Block {
+    var chain: std.ArrayList(*const ir.Op) = .empty;
+    var cur = top;
+    while (blockUpstream(cur)) |upstream| {
+        try chain.append(ctx.nodeArena(), cur);
+        cur = upstream;
+    }
+    return .{ .chain = chain.items, .from = cur };
+}
+
+/// The upstream of an operator that sits in a block above its FROM; null for
+/// a relation.
+fn blockUpstream(op: *const ir.Op) ?*const ir.Op {
+    return switch (op.*) {
+        .limit => |l| l.upstream,
+        .select, .exclude => |p| p.upstream,
+        .order_by => |o| o.upstream,
+        .compute => |c| c.upstream,
+        .window => |w| w.upstream,
+        .filter => |f| f.upstream,
+        .group_by => |g| g.upstream,
+        else => null,
+    };
+}
+
+const ScopeBuilder = struct {
+    ctx: *CompileCtx,
+    /// Enumerate each relation's columns. A scope that only binds qualified
+    /// names needs the relations' names alone.
+    with_columns: bool,
+    ranges: std.ArrayList(Range) = .empty,
+    derived: std.ArrayList([]const u8) = .empty,
+
+    fn build(ctx: *CompileCtx, block: Block, with_columns: bool) !Scope {
+        var builder: ScopeBuilder = .{ .ctx = ctx, .with_columns = with_columns };
+        try builder.relation(block.from, 0);
+        for (block.chain) |op| try builder.computed(op);
+        return .{ .ranges = builder.ranges.items, .derived = builder.derived.items };
+    }
+
+    fn relation(self: *ScopeBuilder, op: *const ir.Op, depth: u32) Allocator.Error!void {
+        const na = self.ctx.nodeArena();
+        if (depth >= SCOPE_DEPTH_LIMIT) return self.ranges.append(na, .{ .name = null, .columns = null });
+        switch (op.*) {
+            .scan => |s| try self.ranges.append(na, .{
+                .name = s.alias orelse s.table.name,
+                .columns = if (self.with_columns) try tableColumns(self.ctx, s.table) else null,
+            }),
+            .alias => |a| try self.ranges.append(na, .{ .name = a.alias, .columns = try self.columnsOf(a.upstream) }),
+            .materialize => |m| try self.ranges.append(na, .{ .name = m.name, .columns = try self.columnsOf(m.upstream) }),
+            .table_fn => |t| try self.ranges.append(na, .{
+                .name = t.alias orelse t.name,
+                .columns = if (self.with_columns) try tableFnColumns(self.ctx, t) else null,
+            }),
+            .file_scan => |f| try self.ranges.append(na, .{ .name = f.alias, .columns = null }),
+            .single_row => {},
+            .join => |j| {
+                try self.relation(j.left, depth + 1);
+                try self.relation(j.right, depth + 1);
+                if (j.residual) |r| for (r.derived) |d| try self.derived.append(na, d.name);
+            },
+            else => if (blockUpstream(op)) |upstream| {
+                // A join input the block's own operators wrap, as a lowered
+                // scalar subquery's join reads the rows below it.
+                try self.computed(op);
+                try self.relation(upstream, depth + 1);
+            } else try self.ranges.append(na, .{ .name = null, .columns = null }),
+        }
+    }
+
+    fn computed(self: *ScopeBuilder, op: *const ir.Op) !void {
+        const na = self.ctx.nodeArena();
+        switch (op.*) {
+            .compute => |c| for (c.derived) |d| try self.derived.append(na, d.name),
+            .window => |w| for (w.calls) |call| try self.derived.append(na, call.output_name),
+            .group_by => |g| for (g.aggs) |a| try self.derived.append(na, a.as),
+            else => {},
+        }
+    }
+
+    fn columnsOf(self: *ScopeBuilder, op: *const ir.Op) !?[]const []const u8 {
+        if (!self.with_columns) return null;
+        var budget: u32 = SCOPE_WALK_BUDGET;
+        return try outputColumns(self.ctx, op, 0, &budget);
+    }
+};
+
+/// Every name a relation's rows could carry, a superset of its output
+/// names, or null when they can't be enumerated here. A missing name would
+/// let an inner column pass for an outer one, so any doubt widens the list
+/// or answers null.
+fn outputColumns(ctx: *CompileCtx, op: *const ir.Op, depth: u32, budget: *u32) Allocator.Error!?[]const []const u8 {
+    if (depth >= SCOPE_DEPTH_LIMIT or budget.* == 0) return null;
+    budget.* -= 1;
+    const na = ctx.nodeArena();
+    var names: std.ArrayList([]const u8) = .empty;
+    switch (op.*) {
+        .scan => |s| return try tableColumns(ctx, s.table),
+        .table_fn => |t| return try tableFnColumns(ctx, t),
+        .single_row => return &.{},
+        .alias => |a| return try outputColumns(ctx, a.upstream, depth + 1, budget),
+        .materialize => |m| return try outputColumns(ctx, m.upstream, depth + 1, budget),
+        .set_union => |u| return try outputColumns(ctx, u.left, depth + 1, budget),
+        .limit, .order_by, .filter, .exclude => return try outputColumns(ctx, blockUpstream(op).?, depth + 1, budget),
+        .select => |p| for (p.columns, 0..) |c, i| {
+            if (isStar(c)) {
+                const upstream = try outputColumns(ctx, p.upstream, depth + 1, budget) orelse return null;
+                try names.appendSlice(na, upstream);
+                continue;
+            }
+            const output = if (p.outputs) |outs| (if (i < outs.len) outs[i] else null) else null;
+            try names.append(na, output orelse c);
+        },
+        .compute => |c| {
+            try names.appendSlice(na, try outputColumns(ctx, c.upstream, depth + 1, budget) orelse return null);
+            for (c.derived) |d| try names.append(na, d.name);
+        },
+        .window => |w| {
+            try names.appendSlice(na, try outputColumns(ctx, w.upstream, depth + 1, budget) orelse return null);
+            for (w.calls) |call| try names.append(na, call.output_name);
+        },
+        .group_by => |g| {
+            try names.appendSlice(na, g.group_cols);
+            for (g.aggs) |a| try names.append(na, a.as);
+        },
+        .join => |j| {
+            try names.appendSlice(na, try outputColumns(ctx, j.left, depth + 1, budget) orelse return null);
+            try names.appendSlice(na, try outputColumns(ctx, j.right, depth + 1, budget) orelse return null);
+        },
+        else => return null,
+    }
+    return names.items;
+}
+
+fn isStar(column: []const u8) bool {
+    return std.mem.eql(u8, column, "*") or std.mem.endsWith(u8, column, ".*");
+}
+
+fn tableColumns(ctx: *CompileCtx, ref: ir.TableRef) Allocator.Error!?[]const []const u8 {
+    const table = local.resolveTable(ctx.catalog, ctx.session.*, ref) catch return null;
+    const names = try ctx.nodeArena().alloc([]const u8, table.schema.columns.len);
+    for (table.schema.columns, names) |col, *name| name.* = col.name;
+    return names;
+}
+
+fn tableFnColumns(ctx: *CompileCtx, t: ir.Op.TableFn) Allocator.Error!?[]const []const u8 {
+    const registry = ctx.udf_registry orelse return null;
+    const entry = registry.tableByName(t.name) orelse return null;
+    const names = try ctx.nodeArena().alloc([]const u8, entry.output_schema.len);
+    for (entry.output_schema, names) |col, *name| name.* = col.name;
+    return names;
+}
+
+/// Where the names a block reads bind: inside it (`inner`), or in an
+/// enclosing query (`outer`).
+const RefSides = struct {
+    scope: Scope,
+    /// Count qualified names only. Compiled alone, an unqualified name binds
+    /// to the block's own column when it has one, as SQL scopes it, and
+    /// fails as unknown otherwise; only a qualified outer name can bind to
+    /// the wrong column.
+    qualified_only: bool = false,
+    /// The operands of the CASE whose condition is being read: names the
+    /// CASE makes up, not columns.
+    case_operands: []const exec.expr_mod.Expr.Operand = &.{},
+    inner: bool = false,
+    outer: bool = false,
+    /// A nested subquery was read, whose own names aren't counted here.
+    nested: bool = false,
+
+    fn readName(self: *RefSides, ref: []const u8) void {
+        if (ref.len == 0 or exec.expr_mod.operandListed(self.case_operands, ref)) return;
+        if (self.qualified_only and types.splitQualifiedName(ref) == null) return;
+        if (self.scope.binds(ref)) self.inner = true else self.outer = true;
+    }
+
+    /// A subquery marker reads its compared columns; its own block is read
+    /// once it resolves.
+    fn readPredicate(self: *RefSides, pred: PredicateExpr) void {
+        switch (pred) {
+            .leaf, .day_leaf, .text_as_number => |l| self.readName(l.col),
+            .leaf_col_col => |c| {
+                self.readName(c.left);
+                self.readName(c.right);
+            },
+            .is_null, .is_not_null => |col| self.readName(col),
+            .like => |l| self.readName(l.col),
+            .in_set, .text_as_number_set => |s| self.readName(s.col),
+            .leaf_var => |v| self.readName(v.col),
+            .scalar_subquery => |s| {
+                self.nested = true;
+                self.readName(s.col);
+            },
+            .in_subquery => |s| {
+                self.nested = true;
+                self.readName(s.col);
+                for (s.rest_cols) |col| self.readName(col);
+            },
+            .correlated_set => |s| for (s.outer_cols) |col| self.readName(col),
+            .correlated_scalar => |s| {
+                self.readName(s.outer_compared);
+                for (s.outer_keys) |col| self.readName(col);
+            },
+            .correlated_range => |r| {
+                for (r.outer_keys) |col| self.readName(col);
+                self.readName(r.outer_range_col);
+                if (r.outer_range_col_upper) |col| self.readName(col);
+            },
+            .@"and", .@"or" => |children| for (children) |child| self.readPredicate(child),
+            .not => |child| self.readPredicate(child.*),
+            .exists_subquery => self.nested = true,
+            .always, .unknown => {},
+        }
+    }
+
+    fn readExpr(self: *RefSides, e: ir.Expr) void {
+        switch (e) {
+            .col_ref => |name| self.readName(name),
+            .call => |c| for (c.args) |arg| self.readExpr(arg),
+            .case => |cs| {
+                for (cs.operands) |o| self.readExpr(o.expr);
+                const enclosing = self.case_operands;
+                self.case_operands = cs.operands;
+                for (cs.branches) |br| self.readPredicate(br.cond);
+                self.case_operands = enclosing;
+                for (cs.branches) |br| self.readExpr(br.then);
+                if (cs.else_branch) |eb| self.readExpr(eb.*);
+            },
+            .scalar_subquery, .exists_subquery => self.nested = true,
+            .lit, .null_lit, .var_ref => {},
+        }
+    }
+
+    /// The names a block operator reads itself, not those of its upstream.
+    fn readOp(self: *RefSides, op: *const ir.Op) void {
+        switch (op.*) {
+            .select => |p| for (p.columns) |col| if (!isStar(col)) self.readName(col),
+            .order_by => |o| for (o.specs) |s| self.readName(s.col),
+            .compute => |c| for (c.derived) |d| self.readExpr(d.expr),
+            .window => |w| {
+                for (w.specs) |spec| {
+                    for (spec.partition_by) |col| self.readName(col);
+                    for (spec.order_by) |s| self.readName(s.col);
+                }
+                for (w.calls) |call| for (call.args) |arg| self.readExpr(arg);
+            },
+            .filter => |f| self.readPredicate(f.predicate),
+            .group_by => |g| {
+                for (g.group_cols) |col| self.readName(col);
+                for (g.aggs) |a| {
+                    if (a.col) |col| self.readName(col);
+                    if (a.arg2_col) |col| self.readName(col);
+                    for (a.udf_arg_cols) |col| self.readName(col);
+                }
+            },
+            .join => |j| {
+                for (j.on) |pair| {
+                    self.readName(pair.left);
+                    self.readName(pair.right);
+                }
+                for (j.ranges) |r| {
+                    self.readName(r.left);
+                    self.readName(r.right);
+                }
+                if (j.extra_predicate) |p| self.readPredicate(p);
+                if (j.residual) |r| {
+                    for (r.derived) |d| self.readExpr(d.expr);
+                    self.readPredicate(r.predicate);
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+fn readsOuter(scope: Scope, op: *const ir.Op) bool {
+    var sides: RefSides = .{ .scope = scope };
+    sides.readOp(op);
+    return sides.outer;
+}
+
+// =============================================================================
+// Scope guard: a subquery compiled on its own must read nothing outside it.
+// =============================================================================
+
+/// Resolve a subquery's own subqueries, then check it reads no enclosing
+/// query: compiled alone, an outer-qualified name would bind to whatever
+/// inner column shares its bare name.
+fn prepareSubplan(ctx: *CompileCtx, op: *ir.Op) !void {
+    try resolveSubqueriesInOp(ctx, op);
+    try requireOwnScope(ctx, op, 0);
+}
+
+const ScopeError = error{UnsupportedCorrelatedSubquery} || Allocator.Error;
+
+fn requireOwnScope(ctx: *CompileCtx, op: *const ir.Op, depth: u32) ScopeError!void {
+    if (depth >= SCOPE_DEPTH_LIMIT) return;
+    if (op.* == .set_union) {
+        try requireOwnScope(ctx, op.set_union.left, depth + 1);
+        try requireOwnScope(ctx, op.set_union.right, depth + 1);
+        return;
+    }
+    const block = try splitBlock(ctx, op);
+    var sides: RefSides = .{ .scope = try ScopeBuilder.build(ctx, block, false), .qualified_only = true };
+    for (block.chain) |o| sides.readOp(o);
+    if (sides.outer) return error.UnsupportedCorrelatedSubquery;
+    try requireRelationScope(ctx, block.from, depth + 1);
+}
+
+fn requireRelationScope(ctx: *CompileCtx, op: *const ir.Op, depth: u32) ScopeError!void {
+    if (depth >= SCOPE_DEPTH_LIMIT) return;
+    switch (op.*) {
+        .scan, .file_scan, .single_row => {},
+        .alias => |a| try requireRelationScope(ctx, a.upstream, depth + 1),
+        // A named boundary is a CTE, view or function, whose body is its own
+        // statement-level scope.
+        .materialize => |m| if (m.name == null) try requireOwnScope(ctx, m.upstream, depth + 1),
+        .table_fn => |t| for (t.inputs) |input| try requireOwnScope(ctx, input, depth + 1),
+        .set_union => try requireOwnScope(ctx, op, depth + 1),
+        .join => |j| {
+            const block: Block = .{ .chain = &.{}, .from = op };
+            var sides: RefSides = .{ .scope = try ScopeBuilder.build(ctx, block, false), .qualified_only = true };
+            sides.readOp(op);
+            if (sides.outer) return error.UnsupportedCorrelatedSubquery;
+            try requireRelationScope(ctx, j.left, depth + 1);
+            try requireRelationScope(ctx, j.right, depth + 1);
+        },
+        else => if (blockUpstream(op) != null) try requireOwnScope(ctx, op, depth + 1),
+    }
+}
+
+// =============================================================================
+// Correlation analysis, common to all correlated subquery resolvers.
 // =============================================================================
 
 /// One non-equi correlation conjunct, canonicalized so the predicate
@@ -656,279 +1059,380 @@ fn flipRangeOp(op: exec.PredicateOp) exec.PredicateOp {
     };
 }
 
-/// Inner-correlation analysis result. `inner_cols` and `outer_cols`
-/// are parallel: for each i, `inner_cols[i]` is the inner-side
-/// column name (what the rewritten inner projects) and
-/// `outer_cols[i]` is the outer-side column name (what the eventual
-/// per-row lookup keys against). Equi correlations only.
+/// A subquery WHERE's conjuncts, sorted. `inner_cols` and `outer_cols` are
+/// parallel: `inner_cols[i] = outer_cols[i]` is one equi correlation, the
+/// inner name what the rewritten subquery projects and the outer one what
+/// each outer row probes with. Lists live in the node arena.
 const CorrelationInfo = struct {
-    inner_cols: std.ArrayList([]const u8),
-    outer_cols: std.ArrayList([]const u8),
-    /// Range correlations — captured separately because they need
-    /// per-group sorting rather than tuple hashing.
-    range_corrs: std.ArrayList(RangeCorr),
-    /// Non-correlation predicates that should stay in the inner's
-    /// WHERE clause (col-vs-lit or col-vs-col where both sides are
-    /// inner-local). Slice into the original IR — read-only.
-    kept_predicates: std.ArrayList(PredicateExpr),
-    /// The underlying scan we'll project from in the rewritten inner.
-    scan: ?*const ir.Op.Scan = null,
+    inner_cols: std.ArrayList([]const u8) = .empty,
+    outer_cols: std.ArrayList([]const u8) = .empty,
+    /// Range correlations, kept apart: they probe sorted values rather than
+    /// hashed tuples.
+    range_corrs: std.ArrayList(RangeCorr) = .empty,
+    /// Conjuncts that read only the subquery's own names, kept in its WHERE.
+    kept_predicates: std.ArrayList(PredicateExpr) = .empty,
+    /// Correlation operands computed from the outer row alone (`x.k + 1` in
+    /// `y.id = x.k + 1`). The outer query computes them, under these names,
+    /// for its rows to probe with.
+    outer_values: std.ArrayList(ir.Derived) = .empty,
+    /// Each outer value's name in the subquery, to its name in `outer_values`.
+    outer_renames: std.ArrayList(exec.predicate.ColRename) = .empty,
+    /// The relation the WHERE filters, as the rewritten subquery reads it.
+    input: *const ir.Op,
 
-    fn init() CorrelationInfo {
-        return .{
-            .inner_cols = .empty,
-            .outer_cols = .empty,
-            .range_corrs = .empty,
-            .kept_predicates = .empty,
-        };
+    fn correlated(self: *const CorrelationInfo) bool {
+        return self.outer_cols.items.len > 0 or self.range_corrs.items.len > 0;
     }
-    fn deinit(self: *CorrelationInfo, allocator: Allocator) void {
-        self.inner_cols.deinit(allocator);
-        self.outer_cols.deinit(allocator);
-        self.range_corrs.deinit(allocator);
-        self.kept_predicates.deinit(allocator);
+
+    /// Point each correlation at the outer query's name for its outer value.
+    fn renameOuterValues(self: *CorrelationInfo) void {
+        const renames = self.outer_renames.items;
+        for (self.outer_cols.items) |*col| col.* = exec.predicate.renameOf(renames, col.*);
+        for (self.range_corrs.items) |*r| r.outer_col = exec.predicate.renameOf(renames, r.outer_col);
     }
 };
 
-/// If the inner Op fits a canonical correlated shape — Select/Project
-/// wrappers on top of `Filter(AND-conjunction, Scan(T))` — analyze
-/// the AND-conjuncts to extract equi-correlations. Returns null if
-/// the shape doesn't match (caller falls back to the uncorrelated
-/// path). Returns an empty CorrelationInfo when the shape matches
-/// but there are no correlations.
-///
-/// What an EXISTS inner selects never changes its result, so its computed
-/// select items (`SELECT 1`) are skipped rather than blocking the match.
-const InnerSelectList = enum { used, ignored };
-
-fn analyzeCorrelation(ctx: *CompileCtx, inner: *ir.Op, select_list: InnerSelectList) !?CorrelationInfo {
-    // Walk through Project / Exclude layers to find the underlying
-    // Filter (or Scan, if there's no WHERE).
-    var cur: *const ir.Op = inner;
-    while (true) {
-        switch (cur.*) {
-            .select, .exclude => |p| cur = p.upstream,
-            .compute => |c| switch (select_list) {
-                .ignored => cur = c.upstream,
-                .used => return null,
-            },
-            .filter, .scan => break,
-            else => return null,
+/// The columns a compute under a subquery's WHERE keeps computing. One that
+/// reads only the outer row moves to `info.outer_values` instead, and
+/// `scope` stops binding its name. Null when one reads both rows, or a
+/// nested subquery.
+fn splitOuterValues(ctx: *CompileCtx, scope: *Scope, info: *CorrelationInfo, derived: []const ir.Derived) !?[]const ir.Derived {
+    const na = ctx.nodeArena();
+    var kept: std.ArrayList(ir.Derived) = .empty;
+    for (derived) |d| {
+        var sides: RefSides = .{ .scope = scope.* };
+        sides.readExpr(d.expr);
+        if (sides.nested) return null;
+        if (!sides.outer) {
+            try kept.append(na, d);
+            continue;
         }
+        if (sides.inner) return null;
+        const name = try std.fmt.allocPrint(na, "__csq_o{d}", .{ctx.lowered_scalars});
+        ctx.lowered_scalars += 1;
+        try info.outer_values.append(na, .{ .name = name, .expr = d.expr });
+        try info.outer_renames.append(na, .{ .from = d.name, .to = name });
+        scope.outer = info.outer_renames.items;
     }
-
-    return analyzeFilteredScan(ctx, cur);
+    return kept.items;
 }
 
-/// The correlations and kept predicates of a subquery's `Filter(Scan)` or
-/// `Scan`; null for any other input. Caller owns the result.
-fn analyzeFilteredScan(ctx: *CompileCtx, below: *const ir.Op) !?CorrelationInfo {
-    var filter_pred: ?PredicateExpr = null;
-    const scan_op: *const ir.Op.Scan = switch (below.*) {
-        .filter => |*f| blk: {
-            filter_pred = f.predicate;
-            break :blk switch (f.upstream.*) {
-                .scan => |*s| s,
-                else => return null,
-            };
-        },
-        .scan => |*s| s,
-        else => return null,
-    };
-    const catalog = ctx.catalog;
-    const t = local.resolveTable(catalog, ctx.session.*, scan_op.table) catch return null;
+/// Whether an exclude drops a column the subquery handed to the outer query.
+fn excludesOuterValue(info: *const CorrelationInfo, columns: []const []const u8) bool {
+    for (columns) |col| for (info.outer_renames.items) |r| if (types.columnNameEql(col, r.from)) return true;
+    return false;
+}
 
-    var info = CorrelationInfo.init();
-    errdefer info.deinit(ctx.allocator);
-    info.scan = scan_op;
-    if (filter_pred) |pred| try collectConjuncts(ctx, pred, t.schema, rangeName(scan_op), &info);
+/// The correlations and kept predicates of a subquery's WHERE: `below` is
+/// `Filter(where, input)` or the input alone, the input being the FROM
+/// under any columns the WHERE computes. Null when that input reads the
+/// outer row other than as a correlation's operand, or a conjunct ties to
+/// it some other way.
+fn analyzeWhere(ctx: *CompileCtx, below: *const ir.Op) !?CorrelationInfo {
+    const input = if (below.* == .filter) below.filter.upstream else below;
+    const block = try splitBlock(ctx, input);
+    for (block.chain) |op| if (op.* != .compute and op.* != .exclude) return null;
+    var scope = try ScopeBuilder.build(ctx, block, true);
+    var info: CorrelationInfo = .{ .input = input };
+    var rebuilt: *ir.Op = @constCast(block.from);
+    var i = block.chain.len;
+    while (i > 0) {
+        i -= 1;
+        switch (block.chain[i].*) {
+            .compute => |c| {
+                const derived = (try splitOuterValues(ctx, &scope, &info, c.derived)) orelse return null;
+                if (derived.len > 0) rebuilt = try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = rebuilt } });
+            },
+            .exclude => |e| {
+                if (excludesOuterValue(&info, e.columns)) return null;
+                var copy = e;
+                copy.upstream = rebuilt;
+                rebuilt = try newOp(ctx, .{ .exclude = copy });
+            },
+            else => unreachable,
+        }
+    }
+    if (info.outer_values.items.len > 0) info.input = rebuilt;
+    if (below.* == .filter and !try collectConjuncts(ctx, below.filter.predicate, scope, &info)) return null;
+    info.renameOuterValues();
     return info;
 }
 
-/// Strict "does this col-ref belong to the inner scan?" check. Unlike
-/// the generic `types.findColumn` smart matcher, this rejects refs
-/// whose qualifier doesn't name the inner scan — otherwise the
-/// correlation analyzer would mistake `outer_alias.colname` for an
-/// inner col whenever the bare column name happens to exist in the
-/// inner table (very common: `region`, `id`, `created_at`, etc.).
-fn refIsInnerLocal(ref: []const u8, inner_schema: TableSchema, inner_name: []const u8) bool {
-    if (types.splitQualifiedName(ref)) |split| {
-        if (!types.columnNameEql(split.qualifier, inner_name)) return false;
-        return inner_schema.columnIndex(split.bare) != null;
-    }
-    return inner_schema.columnIndex(ref) != null;
-}
-
-/// The name that qualifies a scan's columns: its alias, else its table.
-fn rangeName(scan: *const ir.Op.Scan) []const u8 {
-    return scan.alias orelse scan.table.name;
-}
-
-fn collectConjuncts(
-    ctx: *CompileCtx,
-    pred: PredicateExpr,
-    inner_schema: TableSchema,
-    inner_name: []const u8,
-    info: *CorrelationInfo,
-) !void {
+/// Sort a WHERE's conjuncts into correlations with the outer row and
+/// predicates the subquery keeps. False when a conjunct reads the outer row
+/// any other way.
+fn collectConjuncts(ctx: *CompileCtx, pred: PredicateExpr, scope: Scope, info: *CorrelationInfo) Allocator.Error!bool {
+    const na = ctx.nodeArena();
     switch (pred) {
-        .@"and" => |children| for (children) |c| try collectConjuncts(ctx, c, inner_schema, inner_name, info),
-        .leaf_col_col => |lc| {
-            const left_local = refIsInnerLocal(lc.left, inner_schema, inner_name);
-            const right_local = refIsInnerLocal(lc.right, inner_schema, inner_name);
-            if (left_local and right_local) {
-                // Pure inner predicate — keep in rewritten inner.
-                try info.kept_predicates.append(ctx.allocator, pred);
-            } else if (left_local and !right_local) {
-                if (lc.op == .eq) {
-                    try info.inner_cols.append(ctx.allocator, lc.left);
-                    try info.outer_cols.append(ctx.allocator, lc.right);
-                } else if (lc.op == .lt or lc.op == .lte or lc.op == .gt or lc.op == .gte) {
-                    try info.range_corrs.append(ctx.allocator, .{
-                        .inner_col = lc.left,
-                        .op = lc.op,
-                        .outer_col = lc.right,
-                    });
-                } else {
-                    return Error.UnsupportedOp;
-                }
-            } else if (!left_local and right_local) {
-                if (lc.op == .eq) {
-                    try info.inner_cols.append(ctx.allocator, lc.right);
-                    try info.outer_cols.append(ctx.allocator, lc.left);
-                } else if (lc.op == .lt or lc.op == .lte or lc.op == .gt or lc.op == .gte) {
-                    // Flip so inner is always on the left of the op.
-                    try info.range_corrs.append(ctx.allocator, .{
-                        .inner_col = lc.right,
-                        .op = flipRangeOp(lc.op),
-                        .outer_col = lc.left,
-                    });
-                } else {
-                    return Error.UnsupportedOp;
-                }
-            } else {
-                // Neither side in the inner table — can't possibly
-                // be a correlation we can handle.
-                return Error.UnsupportedOp;
-            }
+        .@"and" => |children| {
+            for (children) |child| if (!try collectConjuncts(ctx, child, scope, info)) return false;
+            return true;
         },
-        // col cmp literal / IS NULL / LIKE etc. — all inner-local;
-        // keep as-is. (The leaf's col is assumed inner-local; the
-        // eventual compile-time validateExpr will catch typos.)
-        else => try info.kept_predicates.append(ctx.allocator, pred),
-    }
-}
-
-/// Build a rewritten inner Op suitable for materialization. Drops
-/// correlation predicates and projects `selected` (IN's columns; EXISTS
-/// selects none) ahead of the correlation-key columns.
-fn buildRewrittenInner(
-    ctx: *CompileCtx,
-    _: *ir.Op,
-    info: CorrelationInfo,
-    selected: []const []const u8,
-) !*ir.Op {
-    const aa = try ctx.subqueryArena();
-
-    // Reuse the underlying Scan; build a fresh Filter/Select chain on
-    // top so we don't mutate caller IR.
-    const scan_clone = try aa.create(ir.Op);
-    scan_clone.* = .{ .scan = info.scan.?.* };
-
-    // Build kept-predicate AND-conjunction if any survive.
-    var upstream: *ir.Op = scan_clone;
-    if (info.kept_predicates.items.len > 0) {
-        const new_pred: PredicateExpr = if (info.kept_predicates.items.len == 1)
-            info.kept_predicates.items[0]
-        else blk: {
-            const kids = try aa.alloc(PredicateExpr, info.kept_predicates.items.len);
-            for (info.kept_predicates.items, kids) |src, *dst| dst.* = src;
-            break :blk PredicateExpr{ .@"and" = kids };
-        };
-        const filter = try aa.create(ir.Op);
-        filter.* = .{ .filter = .{ .predicate = new_pred, .upstream = upstream } };
-        upstream = filter;
-    }
-
-    const cols = try aa.alloc([]const u8, selected.len + info.inner_cols.items.len);
-    @memcpy(cols[0..selected.len], selected);
-    @memcpy(cols[selected.len..], info.inner_cols.items);
-    const project = try aa.create(ir.Op);
-    project.* = .{ .select = .{ .columns = cols, .upstream = upstream } };
-    return project;
-}
-
-// =============================================================================
-// Correlated EXISTS / NOT EXISTS — equi + range paths.
-// =============================================================================
-
-/// Detect + decorrelate a correlated EXISTS / NOT EXISTS inner. Returns
-/// true if the inner was correlated and `pred.*` was rewritten to a
-/// `.correlated_set` / `.correlated_range`; false if the inner is
-/// uncorrelated (caller falls back to the Tier 2 path).
-fn maybeResolveCorrelatedExists(
-    ctx: *CompileCtx,
-    pred: *PredicateExpr,
-    source_opaque: *const anyopaque,
-    negate: bool,
-) !bool {
-    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(source_opaque)));
-    var info = (try analyzeCorrelation(ctx, inner, .ignored)) orelse return false;
-    defer info.deinit(ctx.allocator);
-
-    // Range-correlation path: single open-ended op, or a pair of
-    // ops that form a closed BETWEEN-style range on the same inner
-    // column. Larger or mixed-shape multi-range conjuncts fall back
-    // to the bail path — caller surfaces them as unsupported.
-    if (info.range_corrs.items.len == 1) {
-        return try resolveCorrelatedExistsRange(ctx, pred, info, negate);
-    }
-    if (info.range_corrs.items.len == 2 and isClosedRange(info.range_corrs.items)) {
-        return try resolveCorrelatedExistsRange(ctx, pred, info, negate);
-    }
-    if (info.range_corrs.items.len > 1) return false;
-    if (info.outer_cols.items.len == 0) return false;
-
-    // Build rewritten inner: drop correlation predicates; project the
-    // inner-side correlation keys (so the materialized rows are
-    // exactly the lookup-tuple values).
-    const rewritten = try buildRewrittenInner(ctx, inner, info, &.{});
-
-    // Drain.
-    var q = try local.compileSubplan(ctx, rewritten);
-    defer q.deinit();
-
-    const aa = try ctx.subqueryArena();
-    const outer_cols_owned = try aa.alloc([]const u8, info.outer_cols.items.len);
-    for (info.outer_cols.items, outer_cols_owned) |c, *dst| dst.* = try aa.dupe(u8, c);
-
-    var rows: std.ArrayList([]const Value) = .empty;
-    while (try q.next()) |batch| {
-        var i: usize = 0;
-        while (i < batch.row_count) : (i += 1) {
-            const tuple = try aa.alloc(Value, info.outer_cols.items.len);
-            var has_null = false;
-            for (0..info.outer_cols.items.len) |j| {
-                const view = batch.values[j];
-                if (!view.isValid(i)) {
-                    has_null = true;
-                    break;
-                }
-                tuple[j] = try extractKeyValueAt(aa, view, q.outputSchema()[j].type, i);
+        .leaf_col_col => |lc| {
+            const left_inner = scope.binds(lc.left);
+            const right_inner = scope.binds(lc.right);
+            if (left_inner and right_inner) {
+                try info.kept_predicates.append(na, pred);
+                return true;
             }
-            // Drop NULL-containing tuples — dialect mirrors NOT IN.
-            if (has_null) continue;
-            try rows.append(aa, tuple);
-        }
+            if (!left_inner and !right_inner) return false;
+            const corr: RangeCorr = if (left_inner)
+                .{ .inner_col = lc.left, .op = lc.op, .outer_col = lc.right }
+            else
+                .{ .inner_col = lc.right, .op = flipRangeOp(lc.op), .outer_col = lc.left };
+            switch (corr.op) {
+                .eq => {
+                    try info.inner_cols.append(na, corr.inner_col);
+                    try info.outer_cols.append(na, corr.outer_col);
+                },
+                .lt, .lte, .gt, .gte => try info.range_corrs.append(na, corr),
+                .neq => return false,
+            }
+            return true;
+        },
+        else => {
+            var sides: RefSides = .{ .scope = scope };
+            sides.readPredicate(pred);
+            if (sides.outer) return false;
+            try info.kept_predicates.append(na, pred);
+            return true;
+        },
     }
-    const rows_owned = try rows.toOwnedSlice(aa);
+}
 
-    pred.* = .{ .correlated_set = .{
-        .outer_cols = outer_cols_owned,
-        .rows = rows_owned,
-        .negate = negate,
-        .inner_types = try columnTypes(aa, q.outputSchema()[0..info.outer_cols.items.len]),
-    } };
+/// The relation a rewritten subquery reads: a fresh node for a table scan,
+/// the shared node otherwise, so a CTE's readers still share its stage.
+fn reuseInput(ctx: *CompileCtx, input: *const ir.Op) !*ir.Op {
+    if (input.* == .scan) return try newOp(ctx, input.*);
+    return @constCast(input);
+}
+
+/// The subquery's input rows under its own (non-correlation) predicates.
+fn keptRows(ctx: *CompileCtx, info: *const CorrelationInfo) !*ir.Op {
+    const input = try reuseInput(ctx, info.input);
+    if (info.kept_predicates.items.len == 0) return input;
+    return try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, info.kept_predicates.items), .upstream = input } });
+}
+
+// =============================================================================
+// Correlated EXISTS / NOT EXISTS / IN / NOT IN.
+// =============================================================================
+
+/// An EXISTS or IN subquery block ready to decorrelate: the operators kept
+/// above its FROM, bottom first, with its WHERE's conjuncts sorted.
+const CorrelatedBlock = struct {
+    info: CorrelationInfo,
+    /// Operators the rewritten subquery keeps, bottom first: filters,
+    /// computes, excludes and groupings.
+    kept: []const *const ir.Op,
+    /// The kept filter that is the block's WHERE.
+    where: ?*const ir.Op,
+    /// The columns IN compares against, as the kept operators name them.
+    selected: []const []const u8,
+    /// A global aggregate with no filter above it: one row for every outer
+    /// row, whatever the correlation.
+    one_row: bool,
+};
+
+/// Null when the block isn't correlated through its WHERE, or when some
+/// other part of it reads the outer row: the uncorrelated paths take it.
+/// `in_width` is IN's column count; null for EXISTS.
+fn analyzeBlockCorrelation(ctx: *CompileCtx, top: *const ir.Op, in_width: ?usize) !?CorrelatedBlock {
+    const na = ctx.nodeArena();
+    const block = try splitBlock(ctx, top);
+    var chain = block.chain;
+    if (chain.len > 0 and chain[0].* == .limit) {
+        // A LIMIT inside IN or with an OFFSET decides which rows each
+        // outer row sees; one inside EXISTS never changes whether any exist.
+        const l = chain[0].limit;
+        if (in_width != null or l.offset != 0 or l.n == 0) return null;
+        chain = chain[1..];
+    }
+    var selected: []const []const u8 = &.{};
+    if (in_width) |width| {
+        var names: ?[]const []const u8 = null;
+        while (chain.len > 0 and chain[0].* == .select) : (chain = chain[1..]) {
+            const s = chain[0].select;
+            if (names) |outer_names| {
+                const mapped = try na.alloc([]const u8, outer_names.len);
+                for (outer_names, mapped) |name, *dst| dst.* = selectSourceColumn(s, name) orelse return null;
+                names = mapped;
+            } else {
+                for (s.columns) |col| if (isStar(col)) return null;
+                names = s.columns;
+            }
+        }
+        selected = names orelse return null;
+        if (selected.len != width) return Error.BadRequest;
+    } else {
+        // Whether any rows exist never depends on what the block computes
+        // above its last filter or grouping.
+        const last = for (chain, 0..) |op, i| {
+            if (op.* == .filter or op.* == .group_by) break i;
+        } else chain.len;
+        chain = chain[last..];
+    }
+
+    var scope = try ScopeBuilder.build(ctx, block, true);
+    var info: CorrelationInfo = .{ .input = block.from };
+    var kept: std.ArrayList(*const ir.Op) = .empty;
+    var where: ?*const ir.Op = null;
+    var grouped = false;
+    var global_group = false;
+    var filtered_above_global = false;
+    var i = chain.len;
+    while (i > 0) {
+        i -= 1;
+        const op = chain[i];
+        switch (op.*) {
+            .order_by => continue,
+            .filter => |f| if (!grouped and where == null) {
+                where = op;
+                if (!try collectConjuncts(ctx, f.predicate, scope, &info)) return null;
+            } else {
+                if (global_group) filtered_above_global = true;
+                if (readsOuter(scope, op)) return null;
+            },
+            .compute => |c| if (where == null and !grouped) {
+                const derived = (try splitOuterValues(ctx, &scope, &info, c.derived)) orelse return null;
+                if (derived.len == 0) continue;
+                if (derived.len < c.derived.len) {
+                    try kept.append(na, try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = c.upstream } }));
+                    continue;
+                }
+            } else if (readsOuter(scope, op)) return null,
+            .exclude => |e| if (excludesOuterValue(&info, e.columns)) return null,
+            .group_by => |g| {
+                if (readsOuter(scope, op)) return null;
+                grouped = true;
+                if (g.group_cols.len == 0) global_group = true;
+            },
+            else => return null,
+        }
+        try kept.append(na, op);
+    }
+    info.renameOuterValues();
+    if (!info.correlated()) return null;
+    for (selected) |name| if (!scope.binds(name)) return null;
+    if (global_group) {
+        if (in_width != null or filtered_above_global) return null;
+    } else if (grouped and info.range_corrs.items.len > 0) {
+        // Grouping by a range column would split the groups each outer row
+        // aggregates over.
+        return null;
+    }
+    for (kept.items) |op| if (op.* == .exclude) for (op.exclude.columns) |col| {
+        for (info.inner_cols.items) |key| if (sameColumn(col, key)) return null;
+        for (info.range_corrs.items) |r| if (sameColumn(col, r.inner_col)) return null;
+    };
+    return .{
+        .info = info,
+        .kept = kept.items,
+        .where = where,
+        .selected = selected,
+        .one_row = global_group,
+    };
+}
+
+/// Whether two names read the same column of one block: equal, or one
+/// unqualified and naming the other's column.
+fn sameColumn(a: []const u8, b: []const u8) bool {
+    if (types.columnNameEql(a, b)) return true;
+    if (types.splitQualifiedName(a) != null and types.splitQualifiedName(b) != null) return false;
+    return types.columnNameEql(types.unqualifiedName(a), types.unqualifiedName(b));
+}
+
+/// The block without its correlations, projecting `columns`: its WHERE
+/// keeps only the subquery's own conjuncts, and each grouping also groups
+/// by the equi correlation keys, so every key's rows aggregate apart.
+fn rebuildBlock(ctx: *CompileCtx, block: *const CorrelatedBlock, columns: []const []const u8) !*ir.Op {
+    const na = ctx.nodeArena();
+    var cur = try reuseInput(ctx, block.info.input);
+    for (block.kept) |op| {
+        if (op == block.where) {
+            if (block.info.kept_predicates.items.len == 0) continue;
+            cur = try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, block.info.kept_predicates.items), .upstream = cur } });
+            continue;
+        }
+        cur = try newOp(ctx, switch (op.*) {
+            .filter => |f| .{ .filter = .{ .predicate = f.predicate, .upstream = cur } },
+            .compute => |c| .{ .compute = .{ .derived = c.derived, .upstream = cur } },
+            .exclude => |e| blk: {
+                var copy = e;
+                copy.upstream = cur;
+                break :blk .{ .exclude = copy };
+            },
+            .group_by => |g| blk: {
+                var copy = g;
+                var group_cols: std.ArrayList([]const u8) = .empty;
+                try group_cols.appendSlice(na, g.group_cols);
+                for (block.info.inner_cols.items) |key| {
+                    for (group_cols.items) |col| {
+                        if (sameColumn(col, key)) break;
+                    } else try group_cols.append(na, key);
+                }
+                copy.group_cols = group_cols.items;
+                copy.upstream = cur;
+                break :blk .{ .group_by = copy };
+            },
+            // analyzeBlockCorrelation keeps no other operator.
+            else => unreachable,
+        });
+    }
+    return try newOp(ctx, .{ .select = .{ .columns = columns, .upstream = cur } });
+}
+
+/// Decorrelate an EXISTS (`in_subquery` null) or IN subquery whose WHERE ties its
+/// rows to the outer row. The rewritten subquery runs once; its rows, keyed
+/// by the inner side of each correlation (IN's compared columns first),
+/// become a set each outer row probes. A correlation operand computed from
+/// the outer row alone goes to `lowered`, for the operator reading `pred`
+/// to compute below itself. False when the subquery isn't correlated that
+/// way, leaving it to the uncorrelated paths.
+fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const anyopaque, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !bool {
+    const top: *const ir.Op = @ptrCast(@alignCast(source));
+    const in_width: ?usize = if (in_subquery) |s| 1 + s.rest_cols.len else null;
+    const block = (try analyzeBlockCorrelation(ctx, top, in_width)) orelse return false;
+    if (block.one_row) {
+        pred.* = .{ .always = !negate };
+        return true;
+    }
+    const ranges = block.info.range_corrs.items;
+    if (ranges.len > 2 or (ranges.len == 2 and !isClosedRange(ranges))) return false;
+    if (block.info.outer_values.items.len > 0 and lowered == null) return false;
+
+    const aa = try ctx.subqueryArena();
+    const n_in = block.selected.len;
+    const inner_keys = try std.mem.concat(aa, []const u8, &.{ block.selected, block.info.inner_cols.items });
+    const outer_keys = try aa.alloc([]const u8, inner_keys.len);
+    if (in_subquery) |s| {
+        outer_keys[0] = try aa.dupe(u8, s.col);
+        for (s.rest_cols, outer_keys[1..n_in]) |c, *dst| dst.* = try aa.dupe(u8, c);
+    }
+    for (block.info.outer_cols.items, outer_keys[n_in..]) |c, *dst| dst.* = try aa.dupe(u8, c);
+
+    if (ranges.len == 0) {
+        const rewritten = try rebuildBlock(ctx, &block, inner_keys);
+        try prepareSubplan(ctx, rewritten);
+        var q = try local.compileSubplan(ctx, rewritten);
+        defer q.deinit();
+        pred.* = try inTupleSet(aa, .{
+            .outer_cols = outer_keys,
+            .rows = try drainTuples(ctx, &q, inner_keys.len),
+            .negate = negate,
+            .inner_types = try columnTypes(aa, q.outputSchema()[0..inner_keys.len]),
+        }, n_in);
+        if (lowered) |l| try l.computeOuterValues(ctx, &block.info);
+        return true;
+    }
+    const bounds = rangeBounds(ranges);
+    const range_col = [_][]const u8{bounds.lower.inner_col};
+    const columns = try std.mem.concat(aa, []const u8, &.{ &range_col, inner_keys });
+    const rewritten = try rebuildBlock(ctx, &block, columns);
+    try prepareSubplan(ctx, rewritten);
+    const probe = try correlatedRange(ctx, rewritten, bounds, outer_keys, negate);
+    pred.* = try nullGuarded(aa, outer_keys[0..n_in], negate, probe);
+    if (lowered) |l| try l.computeOuterValues(ctx, &block.info);
     return true;
 }
 
@@ -945,45 +1449,33 @@ fn isClosedRange(corrs: []const RangeCorr) bool {
     return is_lower_0 != is_lower_1;
 }
 
-/// Materialize a range-correlated EXISTS inner. Projects
-/// `(equi_inner_cols..., range_inner_col)`, drains, buckets rows by
-/// the equi-key tuple, sorts each bucket's range values ascending.
-/// Per outer row the eval is then a single min/max compare for the
-/// open-ended case, or a bsearch for the closed BETWEEN case.
-fn resolveCorrelatedExistsRange(
-    ctx: *CompileCtx,
-    pred: *PredicateExpr,
-    info: CorrelationInfo,
-    negate: bool,
-) !bool {
-    // Pick the lower-bound conjunct (for `range`) and, when present,
-    // the upper-bound conjunct. Open-ended ranges have only one.
-    var range = info.range_corrs.items[0];
-    var upper: ?RangeCorr = null;
-    if (info.range_corrs.items.len == 2) {
-        const a = info.range_corrs.items[0];
-        const b = info.range_corrs.items[1];
-        const a_is_lower = a.op == .gt or a.op == .gte;
-        if (a_is_lower) {
-            range = a;
-            upper = b;
-        } else {
-            range = b;
-            upper = a;
-        }
-    }
+/// A range correlation's probe: an open-ended one's single conjunct, or a
+/// closed one's lower-bound conjunct and its upper bound.
+const RangeBounds = struct {
+    lower: RangeCorr,
+    upper: ?RangeCorr,
+};
+
+fn rangeBounds(corrs: []const RangeCorr) RangeBounds {
+    if (corrs.len == 1) return .{ .lower = corrs[0], .upper = null };
+    const first_is_lower = corrs[0].op == .gt or corrs[0].op == .gte;
+    return if (first_is_lower)
+        .{ .lower = corrs[0], .upper = corrs[1] }
+    else
+        .{ .lower = corrs[1], .upper = corrs[0] };
+}
+
+/// Drain a range-correlated subquery. `rewritten` projects the range's
+/// inner column, then the key columns `outer_keys` probe with; its rows are
+/// bucketed by key tuple, each bucket's range values sorted ascending. Per
+/// outer row the eval is then a single min/max compare for the open-ended
+/// case, or a bsearch for the closed BETWEEN case.
+fn correlatedRange(ctx: *CompileCtx, rewritten: *ir.Op, bounds: RangeBounds, outer_keys: []const []const u8, negate: bool) !PredicateExpr {
     const aa = try ctx.subqueryArena();
-
-    // Build rewritten inner. Reuse buildRewrittenInner by routing the
-    // range inner col through `extra_first_col` and the equi cols as
-    // info.inner_cols — that way Select projects (range_col,
-    // equi_inner_cols...). We'll un-permute on drain.
-    const rewritten = try buildRewrittenInner(ctx, undefined, info, &.{range.inner_col});
-
     var q = try local.compileSubplan(ctx, rewritten);
     defer q.deinit();
 
-    const n_keys = info.inner_cols.items.len;
+    const n_keys = outer_keys.len;
 
     // First pass: drain into flat (key_tuple, range_value) rows.
     const RowEntry = struct {
@@ -1010,6 +1502,14 @@ fn resolveCorrelatedExistsRange(
             }
             if (any_null) continue;
             const v = try extractScalarValueAt(aa, range_view, i);
+            // A NaN meets no bound, and it sorts last, where it would stand
+            // in for the group's largest value.
+            const nan = switch (v) {
+                .float => |f| std.math.isNan(f),
+                .double => |f| std.math.isNan(f),
+                else => false,
+            };
+            if (nan) continue;
             try rows.append(ctx.allocator, .{ .key = key, .value = v });
         }
     }
@@ -1052,28 +1552,17 @@ fn resolveCorrelatedExistsRange(
         out.* = .{ .key = k, .values = arena_vals };
     }
 
-    const outer_keys_owned = try aa.alloc([]const u8, info.outer_cols.items.len);
-    for (info.outer_cols.items, outer_keys_owned) |c, *dst| dst.* = try aa.dupe(u8, c);
-
-    var outer_upper_col: ?[]const u8 = null;
-    var op_upper: ?exec.PredicateOp = null;
-    if (upper) |u| {
-        outer_upper_col = try aa.dupe(u8, u.outer_col);
-        op_upper = u.op;
-    }
-
-    pred.* = .{ .correlated_range = .{
-        .outer_keys = outer_keys_owned,
-        .outer_range_col = try aa.dupe(u8, range.outer_col),
-        .op = range.op,
-        .outer_range_col_upper = outer_upper_col,
-        .op_upper = op_upper,
+    return .{ .correlated_range = .{
+        .outer_keys = outer_keys,
+        .outer_range_col = try aa.dupe(u8, bounds.lower.outer_col),
+        .op = bounds.lower.op,
+        .outer_range_col_upper = if (bounds.upper) |u| try aa.dupe(u8, u.outer_col) else null,
+        .op_upper = if (bounds.upper) |u| u.op else null,
         .groups = groups_owned,
         .negate = negate,
         .key_types = try columnTypes(aa, q.outputSchema()[1 .. 1 + n_keys]),
         .range_type = q.outputSchema()[0].type,
     } };
-    return true;
 }
 
 fn keysEqual(a: []const Value, b: []const Value) bool {
@@ -1090,66 +1579,11 @@ fn valueLessThan(_: void, a: Value, b: Value) bool {
 }
 
 // =============================================================================
-// Correlated IN / NOT IN.
-// =============================================================================
-
-/// Detect + decorrelate a correlated IN / NOT IN inner. Returns true
-/// when correlated; otherwise the caller does the uncorrelated path.
-fn maybeResolveCorrelatedIn(ctx: *CompileCtx, pred: *PredicateExpr, s: anytype) !bool {
-    const inner: *ir.Op = @ptrCast(@alignCast(@constCast(s.source)));
-    var info = (try analyzeCorrelation(ctx, inner, .used)) orelse return false;
-    defer info.deinit(ctx.allocator);
-    if (info.outer_cols.items.len == 0) return false;
-    // Range correlation in IN-subquery context isn't supported yet —
-    // the IN set depends on the outer range value, which can't be
-    // hash-keyed. Bail; caller surfaces as unsupported.
-    if (info.range_corrs.items.len > 0) return false;
-    const in_cols = innerSelectedColumns(inner) orelse return false;
-    const in_width = 1 + s.rest_cols.len;
-    if (in_cols.len != in_width) return Error.BadRequest;
-
-    // Rewritten inner projects the IN columns FIRST (so the outer's
-    // `s.col` and `s.rest_cols` match against them), then the
-    // correlation keys.
-    const rewritten = try buildRewrittenInner(ctx, inner, info, in_cols);
-
-    var q = try local.compileSubplan(ctx, rewritten);
-    defer q.deinit();
-
-    const aa = try ctx.subqueryArena();
-    const total_cols = in_width + info.outer_cols.items.len;
-    const outer_cols_owned = try aa.alloc([]const u8, total_cols);
-    outer_cols_owned[0] = try aa.dupe(u8, s.col);
-    for (s.rest_cols, outer_cols_owned[1..in_width]) |c, *dst| dst.* = try aa.dupe(u8, c);
-    for (info.outer_cols.items, outer_cols_owned[in_width..]) |c, *dst| dst.* = try aa.dupe(u8, c);
-
-    pred.* = try inTupleSet(aa, .{
-        .outer_cols = outer_cols_owned,
-        .rows = try drainTuples(ctx, &q, total_cols),
-        .negate = s.negate,
-        .inner_types = try columnTypes(aa, q.outputSchema()[0..total_cols]),
-    }, in_width);
-    return true;
-}
-
-/// The columns an IN subquery's inner selects, named as the inner scan
-/// knows them.
-fn innerSelectedColumns(inner: *const ir.Op) ?[]const []const u8 {
-    const project = switch (inner.*) {
-        .select => |p| p,
-        else => return null,
-    };
-    for (project.columns) |col| if (std.mem.endsWith(u8, col, "*")) return null;
-    return project.columns;
-}
-
-// =============================================================================
 // Correlated scalar subqueries in a Compute or Filter — LEFT JOIN lowering.
 // =============================================================================
 
-/// A scalar subquery that is one global aggregate over `Filter(Scan)` or
-/// `Scan`, with its WHERE conjuncts sorted into correlations and kept
-/// predicates. Caller owns `info`.
+/// A scalar subquery that is one global aggregate over its WHERE and FROM,
+/// with its WHERE conjuncts sorted into correlations and kept predicates.
 const ScalarAggregate = struct {
     aggs: []const ir.AggSpec,
     /// Aggregate arguments computed per inner row (`SUM(qty * price)`).
@@ -1200,14 +1634,13 @@ fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAg
         pre = below.compute.derived;
         below = below.compute.upstream;
     }
-    const info = (try analyzeFilteredScan(ctx, below)) orelse return null;
+    const info = (try analyzeWhere(ctx, below)) orelse return null;
     return .{ .aggs = gb.aggs, .pre = pre, .post = post, .selected = selected.?, .info = info };
 }
 
 /// A scalar subquery that reads one inner row per outer row: a column or
-/// expression over `Filter(Scan)` or `Scan`, optionally ordered and
-/// limited, with its WHERE conjuncts sorted into correlations and kept
-/// predicates. Caller owns `info`.
+/// expression over its WHERE and FROM, optionally ordered and limited, with
+/// its WHERE conjuncts sorted into correlations and kept predicates.
 const ScalarLookup = struct {
     /// Per-row expressions (the selected expression, ORDER BY keys), each
     /// layer over the one before it.
@@ -1250,12 +1683,12 @@ fn analyzeScalarLookup(ctx: *CompileCtx, source: *const anyopaque) !?ScalarLooku
                 try computes.append(na, c.derived);
                 cur = c.upstream;
             },
-            .filter, .scan => break,
-            else => return null,
+            .filter => break,
+            else => if (blockUpstream(cur) == null) break else return null,
         }
     }
     std.mem.reverse([]const ir.Derived, computes.items);
-    const info = (try analyzeFilteredScan(ctx, cur)) orelse return null;
+    const info = (try analyzeWhere(ctx, cur)) orelse return null;
     return .{
         .computes = computes.items,
         .order = order orelse &.{},
@@ -1294,8 +1727,24 @@ const LoweredScalars = struct {
     /// Comparison right sides over the subqueries' results (`x > (SELECT
     /// ...) - 1`), evaluated per outer row.
     compared_values: std.ArrayList(ir.Derived) = .empty,
+    /// Correlation operands the subqueries read from the outer row alone,
+    /// computed below the joins.
+    outer_values: std.ArrayList(ir.Derived) = .empty,
     /// Join-side and value columns, dropped once the operator has read them.
     hidden: std.ArrayList([]const u8) = .empty,
+
+    /// Whether the operator reads anything computed or joined below it.
+    fn any(self: *const LoweredScalars) bool {
+        return self.joins.items.len > 0 or self.outer_values.items.len > 0;
+    }
+
+    fn computeOuterValues(self: *LoweredScalars, ctx: *CompileCtx, info: *const CorrelationInfo) !void {
+        const na = ctx.nodeArena();
+        for (info.outer_values.items) |v| {
+            try self.outer_values.append(na, v);
+            try self.hidden.append(na, v.name);
+        }
+    }
 };
 
 const LoweredJoin = struct {
@@ -1317,30 +1766,19 @@ fn conjunction(ctx: *CompileCtx, preds: []const PredicateExpr) !PredicateExpr {
 /// Lower a correlated scalar subquery into `lowered`, returning the column
 /// its value reads as; null leaves any other shape to the other paths.
 fn lowerCorrelatedScalar(ctx: *CompileCtx, source: *const anyopaque, lowered: *LoweredScalars) !?[]const u8 {
-    if (try analyzeScalarAggregate(ctx, source)) |found| {
-        var shape = found;
-        defer shape.info.deinit(ctx.allocator);
-        if (!equiCorrelated(shape.info)) return null;
+    if (try analyzeScalarAggregate(ctx, source)) |shape| {
+        if (!equiCorrelated(&shape.info)) return null;
         return try lowerScalarAggregate(ctx, shape, lowered);
     }
-    if (try analyzeScalarLookup(ctx, source)) |found| {
-        var shape = found;
-        defer shape.info.deinit(ctx.allocator);
-        if (!equiCorrelated(shape.info)) return null;
+    if (try analyzeScalarLookup(ctx, source)) |shape| {
+        if (!equiCorrelated(&shape.info)) return null;
         return try lowerScalarLookup(ctx, shape, lowered);
     }
     return null;
 }
 
-fn equiCorrelated(info: CorrelationInfo) bool {
+fn equiCorrelated(info: *const CorrelationInfo) bool {
     return info.outer_cols.items.len > 0 and info.range_corrs.items.len == 0;
-}
-
-/// The inner scan under the subquery's own (non-correlation) predicates.
-fn scanKeptRows(ctx: *CompileCtx, info: *const CorrelationInfo) !*ir.Op {
-    const scan = try newOp(ctx, .{ .scan = info.scan.?.* });
-    if (info.kept_predicates.items.len == 0) return scan;
-    return try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, info.kept_predicates.items), .upstream = scan } });
 }
 
 fn groupByKeys(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []const ir.AggSpec, input: *ir.Op) !*ir.Op {
@@ -1353,7 +1791,7 @@ fn groupByKeys(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []const ir.
 
 fn lowerScalarAggregate(ctx: *CompileCtx, shape: ScalarAggregate, lowered: *LoweredScalars) ![]const u8 {
     const na = ctx.nodeArena();
-    var inner = try scanKeptRows(ctx, &shape.info);
+    var inner = try keptRows(ctx, &shape.info);
     if (shape.pre.len > 0) {
         inner = try newOp(ctx, .{ .compute = .{ .derived = shape.pre, .upstream = inner } });
     }
@@ -1388,7 +1826,7 @@ fn lowerScalarAggregate(ctx: *CompileCtx, shape: ScalarAggregate, lowered: *Lowe
 /// matched more than one row, and reads NULL when it matched none.
 fn lowerScalarLookup(ctx: *CompileCtx, shape: ScalarLookup, lowered: *LoweredScalars) ![]const u8 {
     const na = ctx.nodeArena();
-    var inner = try scanKeptRows(ctx, &shape.info);
+    var inner = try keptRows(ctx, &shape.info);
     for (shape.computes) |derived| {
         inner = try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = inner } });
     }
@@ -1461,8 +1899,9 @@ fn joinGroupedInner(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []cons
     inner = try newOp(ctx, .{ .select = .{ .columns = columns, .outputs = outputs, .upstream = inner } });
     inner = try newOp(ctx, .{ .materialize = .{ .upstream = inner, .structural_cse = true } });
     const right = try newOp(ctx, .{ .alias = .{ .alias = alias, .upstream = inner } });
-    try resolveSubqueriesInOp(ctx, right);
+    try prepareSubplan(ctx, right);
     try lowered.joins.append(na, .{ .on = on, .right = right });
+    try lowered.computeOuterValues(ctx, info);
     return alias;
 }
 
@@ -1490,9 +1929,12 @@ fn singleRowExpr(source: *const anyopaque) ?*ir.Expr {
 
 /// `input` LEFT JOINed with each lowered subquery, value columns on top.
 fn joinLoweredScalars(ctx: *CompileCtx, input: *ir.Op, lowered: LoweredScalars) !*ir.Op {
-    var left = input;
+    var top = input;
+    if (lowered.outer_values.items.len > 0) {
+        top = try newOp(ctx, .{ .compute = .{ .derived = lowered.outer_values.items, .upstream = top } });
+    }
     for (lowered.joins.items) |j| {
-        left = try newOp(ctx, .{ .join = .{
+        top = try newOp(ctx, .{ .join = .{
             .algorithm = .auto,
             .join_type = .left,
             .on = j.on,
@@ -1501,12 +1943,11 @@ fn joinLoweredScalars(ctx: *CompileCtx, input: *ir.Op, lowered: LoweredScalars) 
             .skew_ratio_threshold = 0.3,
             .skew_absolute_threshold = 20_000,
             .skew_sample_interval = 10,
-            .left = left,
+            .left = top,
             .right = j.right,
         } });
     }
-    var top = try newOp(ctx, .{ .compute = .{ .derived = lowered.values.items, .upstream = left } });
-    for ([_][]const ir.Derived{ lowered.post_values.items, lowered.compared_values.items }) |derived| {
+    for ([_][]const ir.Derived{ lowered.values.items, lowered.post_values.items, lowered.compared_values.items }) |derived| {
         if (derived.len > 0) top = try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = top } });
     }
     return top;
@@ -1553,13 +1994,15 @@ fn resolveFilterSubqueries(ctx: *CompileCtx, op: *ir.Op) !void {
     var below: std.ArrayList(PredicateExpr) = .empty;
     for (conjuncts) |*c| {
         const joins_before = lowered.joins.items.len;
+        const values_before = lowered.outer_values.items.len;
         try lowerPredicateScalars(ctx, c, &lowered);
-        try resolveSubqueriesInPredicate(ctx, c);
-        const side = if (lowered.joins.items.len > joins_before) &above else &below;
+        try resolveSubqueriesInPredicate(ctx, c, &lowered);
+        const reads_lowered = lowered.joins.items.len > joins_before or lowered.outer_values.items.len > values_before;
+        const side = if (reads_lowered) &above else &below;
         try side.append(ctx.nodeArena(), c.*);
     }
     try resolveSubqueriesInOp(ctx, @constCast(f.upstream));
-    if (lowered.joins.items.len == 0) {
+    if (!lowered.any()) {
         op.filter.predicate = try conjunction(ctx, below.items);
         return;
     }
@@ -1578,57 +2021,22 @@ fn resolveFilterSubqueries(ctx: *CompileCtx, op: *ir.Op) !void {
 // Correlated scalar subquery.
 // =============================================================================
 
-/// Detect + decorrelate a correlated scalar subquery. The inner must
-/// be `GroupBy([], [agg], Filter(preds, Scan(T)))` — i.e., a single
-/// global aggregate with optional filter. We rewrite by promoting
-/// the correlation keys into the GROUP BY, drop correlation
-/// predicates, and materialize key_tuple → agg_value. Returns true
-/// when correlated and pred.* was rewritten.
+/// Decorrelate a correlated scalar subquery that is one global aggregate:
+/// grouped by the correlation keys instead, its rows map each key to the
+/// aggregate the outer row compares with. Returns true when correlated and
+/// pred.* was rewritten.
 fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anytype) !bool {
-    var shape = (try analyzeScalarAggregate(ctx, sq.source)) orelse return false;
-    defer shape.info.deinit(ctx.allocator);
+    const shape = (try analyzeScalarAggregate(ctx, sq.source)) orelse return false;
     const info = &shape.info;
-    const scan_op = info.scan.?;
-    if (info.outer_cols.items.len == 0) return false;
+    if (info.outer_cols.items.len == 0 or info.outer_values.items.len > 0) return false;
     if (shape.aggs.len != 1 or shape.pre.len > 0 or shape.post.len > 0) return false;
-    // Range correlation in scalar subquery context isn't supported
-    // yet — the materialized agg can't be keyed by an open-ended
-    // range, so we'd need per-row eval. Bail.
+    // A range correlation can't key the aggregate: each outer row would
+    // aggregate its own range of rows.
     if (info.range_corrs.items.len > 0) return false;
 
-    // Build rewritten inner:
-    //   Scan(T)
-    //   └ Filter(kept_predicates)        [if any]
-    //     └ GroupBy(group_cols = inner_cols, aggs = [original_agg])
-    //
-    // The result rows are (inner_correlation_keys..., agg_value).
     const aa = try ctx.subqueryArena();
-    const scan_clone = try aa.create(ir.Op);
-    scan_clone.* = .{ .scan = scan_op.* };
-
-    var upstream: *ir.Op = scan_clone;
-    if (info.kept_predicates.items.len > 0) {
-        const new_pred: PredicateExpr = if (info.kept_predicates.items.len == 1)
-            info.kept_predicates.items[0]
-        else blk: {
-            const kids = try aa.alloc(PredicateExpr, info.kept_predicates.items.len);
-            for (info.kept_predicates.items, kids) |src, *dst| dst.* = src;
-            break :blk PredicateExpr{ .@"and" = kids };
-        };
-        const f = try aa.create(ir.Op);
-        f.* = .{ .filter = .{ .predicate = new_pred, .upstream = upstream } };
-        upstream = f;
-    }
-    const group_cols = try aa.alloc([]const u8, info.inner_cols.items.len);
-    for (info.inner_cols.items, group_cols) |c, *dst| dst.* = c;
-    const aggs = try aa.alloc(ir.AggSpec, 1);
-    aggs[0] = shape.aggs[0];
-    const gb_new = try aa.create(ir.Op);
-    gb_new.* = .{ .group_by = .{
-        .group_cols = group_cols,
-        .aggs = aggs,
-        .upstream = upstream,
-    } };
+    const gb_new = try groupByKeys(ctx, info, shape.aggs, try keptRows(ctx, info));
+    try prepareSubplan(ctx, gb_new);
 
     // Drain. Output schema is [inner_correlation_keys..., agg_value].
     var q = try local.compileSubplan(ctx, gb_new);
