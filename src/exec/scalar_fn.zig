@@ -1408,6 +1408,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .bigint, .kernel = date.dateDiffDateKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.dateDiffDatetimeKernel },
+    .{ .name = "months_diff", .arg_types = &.{ .datetime, .datetime }, .return_type = .bigint, .kernel = date.monthsDiffKernel },
     // DATEs widen to DATETIMEs at midnight, which leaves every unit's
     // count unchanged.
     .{ .name = "timestampdiff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.timestampDiffKernel },
@@ -2005,8 +2006,9 @@ pub fn dayname(arena: Allocator, arg: Expr) !Expr {
 pub fn monthname(arena: Allocator, arg: Expr) !Expr {
     return expr_mod.call(arena, "monthname", &.{arg});
 }
-pub fn dateDiffUnit(arena: Allocator, unit: Expr, start: Expr, end: Expr) !Expr {
-    return expr_mod.call(arena, "date_diff", &.{ unit, start, end });
+/// `later - earlier` in whole units, as SQL's DATE_DIFF(unit, later, earlier).
+pub fn dateDiffUnit(arena: Allocator, unit: Expr, later: Expr, earlier: Expr) !Expr {
+    return expr_mod.call(arena, "date_diff", &.{ unit, later, earlier });
 }
 pub fn timestampDiff(arena: Allocator, unit: Expr, start: Expr, end: Expr) !Expr {
     return expr_mod.call(arena, "timestampdiff", &.{ unit, start, end });
