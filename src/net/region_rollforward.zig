@@ -92,7 +92,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     // This hint retains no rows or resolved expressions. Rebuild the selected
     // subtree from fresh IR after a data change instead of re-executing outer
     // candidates that previously failed. A stale hint still has to compile.
-    if (shape_hash) |shape| if (cacheFor(input.db)) |cache| {
+    if (shape_hash) |shape| if (inputCache(input)) |cache| {
         if (cache.boundary(shape)) |selected_depth| hint: {
             var anchor = top;
             for (0..selected_depth) |_| anchor = region_spine_upstream(anchor) orelse break :hint;
@@ -143,11 +143,11 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                     const bh = hashAnchor(cur);
                     const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = depth } else null;
                     if (tryCachedAt(input, cur, keys, bh, declaration)) |q| {
-                        if (shape_hash) |shape| if (cacheFor(input.db)) |cache| cache.remember_boundary(shape, depth);
+                        if (shape_hash) |shape| if (inputCache(input)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     }
                     if (buildRegion(input, cur, keys, bh, declaration)) |q| {
-                        if (shape_hash) |shape| if (cacheFor(input.db)) |cache| cache.remember_boundary(shape, depth);
+                        if (shape_hash) |shape| if (inputCache(input)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     } else |e| {
                         if (e == error.OutOfMemory) return e;
@@ -555,7 +555,7 @@ test "region fusion rejection fingerprints distinguish keys sharing and executio
     defer refs.deinit(allocator);
     try refs.put(allocator, &anchor, 2);
     try refs.put(allocator, &equivalent, 2);
-    var input = engine_v2.CompileInput{ .allocator = allocator, .node_arena = allocator, .db = db, .session = .{}, .region_ref_counts = &refs };
+    var input = engine_v2.CompileInput{ .allocator = allocator, .node_arena = allocator, .catalog = db.owned_catalog.?, .session = .{}, .region_ref_counts = &refs };
     const first = hash_fusion_attempt(input, &anchor, &.{"key"}).?;
     try std.testing.expectEqual(first, hash_fusion_attempt(input, &equivalent, &.{"key"}).?);
     try std.testing.expect(first != hash_fusion_attempt(input, &anchor, &.{"other"}).?);
@@ -601,6 +601,16 @@ test "region fusion rejection fingerprints exclude volatile calls and track immu
 
 /// Get-or-create the per-database cache slot. Uses the DATABASE allocator —
 /// the cache must outlive any single query or connection.
+/// The session's current database: regions read their unqualified tables
+/// from it and keep their cache on it. Null when the session has none.
+fn sessionDb(input: engine_v2.CompileInput) ?*@import("../api/api.zig").Database {
+    return input.catalog.database(input.session.current_db orelse return null);
+}
+
+fn inputCache(input: engine_v2.CompileInput) ?*Cache {
+    return cacheFor(sessionDb(input) orelse return null);
+}
+
 fn cacheFor(db: anytype) ?*Cache {
     db.region_cache_lock.lock();
     defer db.region_cache_lock.unlock();
@@ -642,7 +652,7 @@ fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
                 break :blk tt;
             }
         }
-        break :blk input.db.openTable(name, .{}) catch return null;
+        break :blk (sessionDb(input) orelse return null).openTable(name, .{}) catch return null;
     };
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
@@ -762,7 +772,7 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
         if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] declaration unhashable: search boundaries\n", .{});
         return null;
     };
-    const cache = cacheFor(input.db) orelse return null;
+    const cache = inputCache(input) orelse return null;
     const selected = blk: {
         cache.mu.lock();
         defer cache.mu.unlock();
@@ -789,7 +799,7 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
 
 fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
     const hash = anchor_hash orelse return null;
-    const cache = cacheFor(input.db) orelse return null;
+    const cache = inputCache(input) orelse return null;
 
     const entry = cache.checkout(hash) orelse return null;
     const ctx = entry.ctx.?;
@@ -840,7 +850,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     try collectAndLeaves(qa, pl.entry_filter, &prune_leaves);
 
     const table = switch (pl.entry) {
-        .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
+        .scan => |scan| (sessionDb(input) orelse return NoMatch).openTable(scan.table.name, .{}) catch return NoMatch,
         .staged => null,
     };
     // Same entry transformation as the build path — the cached program's
@@ -904,7 +914,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         qa.free(op_sides);
     };
     for (ctx.side_specs.items, op_sides) |*spec, *s| {
-        const st = input.db.openTable(spec.table, .{}) catch return NoMatch;
+        const st = (sessionDb(input) orelse return NoMatch).openTable(spec.table, .{}) catch return NoMatch;
         const sbs = try buildScanSources(input, st, spec.prune, spec.filter, spec.scan_cols, n_threads);
         s.* = .{
             .scan_schema = spec.scan_schema,
@@ -969,7 +979,8 @@ fn hash_fusion_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys
     hu(&h, shape);
     hu(&h, keys.len);
     for (keys) |key| hstr(&h, key);
-    hstr(&h, input.session.current_db);
+    hu(&h, @intFromBool(input.session.current_db != null));
+    if (input.session.current_db) |db| hstr(&h, db);
     hstr(&h, input.session.current_schema);
     hu(&h, @intFromEnum(input.session.dialect));
     hu(&h, input.effectiveDop());
@@ -1048,7 +1059,7 @@ fn hash_fusion_expr(registry: ?*const udf_mod.UdfRegistry, h: *std.hash.Wyhash, 
 fn hash_declaration_sources(input: engine_v2.CompileInput, h: *std.hash.Wyhash, node: *const ir.Op) error{RegionUnhashable}!void {
     switch (node.*) {
         .scan => |s| {
-            if (s.table.database) |db| if (!std.ascii.eqlIgnoreCase(db, input.db.name)) return Unhashable;
+            if (s.table.database) |db| if (!std.ascii.eqlIgnoreCase(db, input.session.current_db orelse return Unhashable)) return Unhashable;
             if (s.table.schema) |schema| if (!std.ascii.eqlIgnoreCase(schema, "public")) return Unhashable;
             hu(h, tableVersionOf(input, s.table.name) orelse return Unhashable);
         },
@@ -2721,7 +2732,7 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
         break :blk false;
     };
     const rejection_hash = if (fused) hash_fusion_attempt(input, anchor, declared_keys) else null;
-    const cache = if (rejection_hash != null) cacheFor(input.db) else null;
+    const cache = if (rejection_hash != null) inputCache(input) else null;
     if (cache) |c| if (c.fusion_rejected(rejection_hash.?)) {
         if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] rejected fusion reused: staged fallback\n", .{});
         return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, null);
@@ -2742,8 +2753,8 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     if (anchor_hash == null and getenv("THINDB_REGION_TRACE") != null) {
         std.debug.print("[region] anchor unhashable — never cached\n", .{});
     }
-    const cache: ?*Cache = if (anchor_hash != null) cacheFor(input.db) else null;
-    const gpa = if (cache != null) input.db.allocator else input.allocator;
+    const cache: ?*Cache = if (anchor_hash != null) inputCache(input) else null;
+    const gpa = if (cache != null) input.catalog.allocator else input.allocator;
     const qa = input.allocator;
     const ctx = try gpa.create(Ctx);
     ctx.* = .{
@@ -2780,7 +2791,7 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     try collectAndLeaves(a, pl.entry_filter, &prune_leaves);
 
     const table = switch (pl.entry) {
-        .scan => |scan| input.db.openTable(scan.table.name, .{}) catch return NoMatch,
+        .scan => |scan| (sessionDb(input) orelse return NoMatch).openTable(scan.table.name, .{}) catch return NoMatch,
         .staged => null,
     };
 
@@ -4308,7 +4319,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             try filt_list.append(a, cloned);
         }
 
-        const side_table = b.input.db.openTable(se.scan.table.name, .{}) catch return NoMatch;
+        const side_table = (sessionDb(b.input) orelse return NoMatch).openTable(se.scan.table.name, .{}) catch return NoMatch;
 
         // Pinned ON pairs (left bound to an entry literal) filter the side
         // scan directly when the side column is a stored column; the pair

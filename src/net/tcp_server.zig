@@ -41,12 +41,13 @@ pub const Error = error{
 pub const Server = struct {
     allocator: Allocator,
     io: Io,
-    db: *Database,
+    /// Requests look up the "main" database here each time, under their
+    /// statement lease: a DROP DATABASE on another wire frees it.
+    catalog: *Catalog,
+    /// The Database `serveTcp` opened and owns; null under
+    /// `serveTcpCatalog`, whose caller owns the Catalog.
+    db: ?*Database,
     listener: std.Io.net.Server,
-    /// True when this Server owns `db` (created via `serveTcp`); false
-    /// when the caller passed in a Catalog-rooted Database via
-    /// `serveTcpCatalog` and is responsible for that Database's lifetime.
-    owns_db: bool,
     limiter: *ConnectionLimiter,
     owns_limiter: bool,
     idle_timeout_secs: u32 = 0,
@@ -83,7 +84,7 @@ pub const Server = struct {
     }
 
     pub fn destroy(self: *Server) void {
-        if (self.owns_db) self.db.close();
+        if (self.db) |db| db.close();
         if (self.owns_limiter) self.allocator.destroy(self.limiter);
         self.allocator.destroy(self);
     }
@@ -107,7 +108,7 @@ pub const Server = struct {
         }
         defer self.limiter.release();
 
-        try handleConnection(self.allocator, self.io, self.db, stream, self.compress_writes, self.auth_token);
+        try handleConnection(self.allocator, self.io, self.catalog, stream, self.compress_writes, self.auth_token);
     }
 
     /// Long-running accept loop. Each connection runs on its own thread
@@ -138,7 +139,7 @@ pub const Server = struct {
             job.* = .{
                 .allocator = self.allocator,
                 .io = self.io,
-                .db = self.db,
+                .catalog = self.catalog,
                 .stream = stream,
                 .compress_writes = self.compress_writes,
                 .auth_token = self.auth_token,
@@ -162,7 +163,7 @@ pub const Server = struct {
 const ConnJob = struct {
     allocator: Allocator,
     io: Io,
-    db: *Database,
+    catalog: *Catalog,
     stream: std.Io.net.Stream,
     compress_writes: bool,
     auth_token: ?[]const u8,
@@ -172,7 +173,7 @@ const ConnJob = struct {
         defer self.allocator.destroy(self);
         defer self.limiter.release();
         defer self.stream.close(self.io);
-        handleConnection(self.allocator, self.io, self.db, self.stream, self.compress_writes, self.auth_token) catch |err| {
+        handleConnection(self.allocator, self.io, self.catalog, self.stream, self.compress_writes, self.auth_token) catch |err| {
             std.debug.print("tcp_server: connection error: {s}\n", .{@errorName(err)});
         };
     }
@@ -202,9 +203,9 @@ pub fn serveTcp(
     self.* = .{
         .allocator = allocator,
         .io = io,
+        .catalog = db.owned_catalog.?,
         .db = db,
         .listener = listener,
-        .owns_db = true,
         .limiter = limiter,
         .owns_limiter = true,
         .idle_timeout_secs = config.idle_timeout_secs,
@@ -227,8 +228,7 @@ pub fn serveTcpCatalog(
     address: std.Io.net.IpAddress,
     limiter: ?*ConnectionLimiter,
 ) !*Server {
-    const db = catalog.database(back_compat_database_name) orelse
-        try catalog.createDatabase(back_compat_database_name);
+    if (catalog.database(back_compat_database_name) == null) _ = try catalog.createDatabase(back_compat_database_name);
 
     var listen_addr = address;
     const listener = try @import("../util/tcp_listener.zig").listen(&listen_addr, io);
@@ -244,9 +244,9 @@ pub fn serveTcpCatalog(
     self.* = .{
         .allocator = allocator,
         .io = io,
-        .db = db,
+        .catalog = catalog,
+        .db = null,
         .listener = listener,
-        .owns_db = false,
         .limiter = effective_limiter,
         .owns_limiter = limiter == null,
         .idle_timeout_secs = catalog.config.idle_timeout_secs,
@@ -277,7 +277,7 @@ fn sendTooManyConnectionsNative(
 fn handleConnection(
     allocator: Allocator,
     io: Io,
-    db: *Database,
+    catalog: *Catalog,
     stream: std.Io.net.Stream,
     compress_writes: bool,
     auth_token: ?[]const u8,
@@ -321,31 +321,33 @@ fn handleConnection(
 
     const payload = frame.payload;
 
-    var statement_lease: ?@import("../api/catalog.zig").Catalog.StatementLease = null;
-    defer if (statement_lease) |lease| lease.release();
-    if (frame.msg_type != .req_query) {
-        if (local.catalogFor(db)) |catalog| {
-            const ddl = switch (frame.msg_type) {
-                .req_create_table, .req_drop_table, .req_rename_table, .req_alter_table => true,
-                else => false,
-            };
-            statement_lease = catalog.acquireStatement(ddl) catch |err| {
-                try sendError(allocator, &writer.interface, err);
-                try writer.interface.flush();
-                return;
-            };
-        }
+    // The read path streams batches and holds its own lease through them;
+    // admin/write requests reply with a single resp_ok (optionally carrying
+    // a small payload) or a resp_error.
+    if (frame.msg_type == .req_query) {
+        handleQuery(allocator, catalog, payload, &writer.interface, compress_writes) catch |err| {
+            try sendError(allocator, &writer.interface, err);
+        };
+        try writer.interface.flush();
+        return;
     }
+    const ddl = switch (frame.msg_type) {
+        .req_create_table, .req_drop_table, .req_rename_table, .req_alter_table => true,
+        else => false,
+    };
+    const statement_lease = catalog.acquireStatement(ddl) catch |err| {
+        try sendError(allocator, &writer.interface, err);
+        try writer.interface.flush();
+        return;
+    };
+    defer statement_lease.release();
+    const db = catalog.database(back_compat_database_name) orelse {
+        try sendError(allocator, &writer.interface, error.DatabaseNotFound);
+        try writer.interface.flush();
+        return;
+    };
 
-    // Dispatch on request type. Read-path streams batches via
-    // handleQuery; admin/write requests reply with a single resp_ok
-    // (optionally carrying a small payload) or a resp_error.
     switch (@intFromEnum(frame.msg_type)) {
-        @intFromEnum(wire.MsgType.req_query) => {
-            handleQuery(allocator, db, payload, &writer.interface, compress_writes) catch |err| {
-                try sendError(allocator, &writer.interface, err);
-            };
-        },
         @intFromEnum(wire.MsgType.req_create_table) => {
             handleCreateTable(allocator, db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
@@ -395,7 +397,7 @@ fn handleConnection(
 
 fn handleQuery(
     allocator: Allocator,
-    db: *Database,
+    catalog: *Catalog,
     ir_bytes: []const u8,
     writer: *std.Io.Writer,
     compress_writes: bool,
@@ -406,7 +408,7 @@ fn handleQuery(
     var op = try ir.decode(arena.allocator(), ir_bytes);
 
     // Compile the server-side query (V2-first, same as the SQL frontends).
-    var server_query = try local.compileWithSession(allocator, db, .{}, &op);
+    var server_query = try local.compileCatalogWithOptions(allocator, catalog, .{ .current_db = back_compat_database_name }, &op, .{});
     defer server_query.deinit();
 
     // Stream batches — resp_batch payloads are typically large

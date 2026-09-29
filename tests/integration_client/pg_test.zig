@@ -2960,3 +2960,62 @@ test "pg wire ext: a Bind value no DATE or TIMESTAMP reads matches nothing" {
     try client.sendTerminate();
     if (sctx.err) |e| return e;
 }
+
+// A session whose current database is dropped keeps working with none (#372):
+// only an unqualified table reference needs one.
+test "pg wire: dropping the current database leaves the session with none selected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const tbl = try catalog.database("main").?.schema("public").?.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .tag = "b" },
+    });
+    try tbl.flush();
+    _ = try catalog.createDatabase("probe_v");
+
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 372 } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "probe_v");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendQuery("DROP DATABASE probe_v");
+    try std.testing.expect((try client.readQueryReply(arena.allocator())).error_code == null);
+
+    const answers = [_]struct { sql: []const u8, value: ?[]const u8 }{
+        .{ .sql = "SELECT current_database()", .value = null },
+        .{ .sql = "SELECT 1", .value = "1" },
+        .{ .sql = "SELECT id FROM main.public.orders WHERE id = 2", .value = "2" },
+    };
+    for (answers) |answer| {
+        try client.sendQuery(answer.sql);
+        const reply = try client.readQueryReply(arena.allocator());
+        if (reply.error_code) |code| {
+            std.debug.print("{s} failed: {s} {s}\n", .{ answer.sql, code, reply.error_message orelse "" });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 1), reply.rows.len);
+        if (answer.value) |value| {
+            try std.testing.expectEqualStrings(value, reply.rows[0][0].?);
+        } else try std.testing.expectEqual(@as(?[]const u8, null), reply.rows[0][0]);
+    }
+    try client.sendQuery("SELECT id FROM orders");
+    const refused = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("3D000", refused.error_code.?);
+    try std.testing.expectEqualStrings("no database selected", refused.error_message.?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}

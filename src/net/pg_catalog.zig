@@ -268,7 +268,7 @@ pub fn build(gpa: Allocator, catalog: *Catalog, session: Session, table: Table) 
 }
 
 fn currentDb(catalog: *Catalog, session: Session) ?*api.Database {
-    return catalog.database(session.current_db);
+    return catalog.database(session.current_db orelse return null);
 }
 
 fn buildNamespace(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalogSource) !void {
@@ -379,7 +379,7 @@ fn buildInfoSchemata(a: Allocator, catalog: *Catalog, session: Session, self: *P
     if (currentDb(catalog, session)) |db| {
         const schema_names = try db.listSchemas(a);
         for (schema_names) |n| {
-            try catalogs.append(a, session.current_db);
+            try catalogs.append(a, db.name);
             try names.append(a, n);
         }
     }
@@ -412,7 +412,7 @@ fn buildInfoTables(a: Allocator, catalog: *Catalog, session: Session, self: *PgC
     const cats = try a.alloc([]const u8, n);
     const ttypes = try a.alloc([]const u8, n);
     for (0..n) |i| {
-        cats[i] = session.current_db;
+        cats[i] = session.current_db orelse "";
         ttypes[i] = "BASE TABLE";
     }
     const schema = try a.alloc(Column, 4);
@@ -457,7 +457,7 @@ fn buildInfoColumns(a: Allocator, catalog: *Catalog, session: Session, self: *Pg
     }
     const n = colnames.items.len;
     const cats = try a.alloc([]const u8, n);
-    for (0..n) |i| cats[i] = session.current_db;
+    for (0..n) |i| cats[i] = session.current_db orelse "";
     const schema = try a.alloc(Column, 7);
     schema[0] = .{ .name = "table_catalog", .type = .string };
     schema[1] = .{ .name = "table_schema", .type = .string };
@@ -637,7 +637,7 @@ fn buildPgViews(a: Allocator, catalog: *Catalog, session: Session, self: *PgCata
         while (it.next()) |e| {
             const key = e.key_ptr.*;
             const sep = std.mem.indexOfScalar(u8, key, 0) orelse continue;
-            if (!std.mem.eql(u8, key[0..sep], session.current_db)) continue;
+            if (!std.mem.eql(u8, key[0..sep], session.current_db orelse continue)) continue;
             try schemanames.append(a, try a.dupe(u8, session.current_schema));
             try viewnames.append(a, try a.dupe(u8, e.value_ptr.name));
             try defs.append(a, try a.dupe(u8, e.value_ptr.body));
@@ -890,7 +890,7 @@ fn buildProc(a: Allocator, catalog: *Catalog, session: Session, self: *PgCatalog
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     var langs: std.ArrayListUnmanaged([]const u8) = .empty;
 
-    const sql_names = try catalog.sql_fns.listNames(a, session.current_db);
+    const sql_names = if (session.current_db) |db_name| try catalog.sql_fns.listNames(a, db_name) else try a.alloc([]u8, 0);
     for (sql_names) |n| {
         try names.append(a, n);
         try langs.append(a, "sql");

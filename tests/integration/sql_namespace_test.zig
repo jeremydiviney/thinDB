@@ -241,7 +241,7 @@ test "sql namespace: USE db opens the database's default schema (#83)" {
     var use_q = try runSql(allocator, db, "USE warehouse");
     defer use_q.deinit();
     const post_session = use_q.cq.sessionValue();
-    try std.testing.expectEqualStrings("warehouse", post_session.current_db);
+    try std.testing.expectEqualStrings("warehouse", post_session.current_db.?);
     try std.testing.expectEqualStrings("public", post_session.current_schema);
 
     var q = try runSqlSession(allocator, db, post_session, "SELECT id FROM t");
@@ -269,7 +269,7 @@ test "sql namespace: USE db.schema shifts both" {
     var use_q = try runSql(allocator, db, "USE warehouse.reports");
     defer use_q.deinit();
     const post_session = use_q.cq.sessionValue();
-    try std.testing.expectEqualStrings("warehouse", post_session.current_db);
+    try std.testing.expectEqualStrings("warehouse", post_session.current_db.?);
     try std.testing.expectEqualStrings("reports", post_session.current_schema);
 
     var q = try runSqlSession(allocator, db, post_session, "SELECT id FROM t");
@@ -501,4 +501,55 @@ test "sql namespace: USE nonexistent schema of a known db errors" {
     defer arena.deinit();
     const root = try thindb.sql.parse(arena.allocator(), "USE main__ghost");
     try std.testing.expectError(thindb.net.Error.SchemaNotFound, thindb.net.compile(allocator, db, root));
+}
+
+// MySQL leaves a session that drops its current database with none (#372):
+// only an unqualified table reference needs one.
+test "sql namespace: dropping the current database leaves the session with none selected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seed(db, "t");
+    _ = try db.owned_catalog.?.createDatabase("doomed");
+
+    var drop_q = try runSqlSession(allocator, db, .{ .current_db = "doomed" }, "DROP DATABASE doomed");
+    defer drop_q.deinit();
+    const post_session = drop_q.cq.sessionValue();
+    try std.testing.expectEqual(@as(?[]const u8, null), post_session.current_db);
+
+    try std.testing.expectError(thindb.Error.NoDatabaseSelected, runSqlSession(allocator, db, post_session, "SELECT id FROM t"));
+    var q = try runSqlSession(allocator, db, post_session, "SELECT id FROM main.public.t");
+    defer q.deinit();
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids);
+
+    var use_q = try runSqlSession(allocator, db, post_session, "USE main");
+    defer use_q.deinit();
+    try std.testing.expectEqualStrings("main", use_q.cq.sessionValue().current_db.?);
+}
+
+// A session holds its current database by name, so a drop elsewhere leaves it
+// naming nothing: it then behaves as one with none selected.
+test "sql namespace: a current database dropped elsewhere counts as none selected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seed(db, "t");
+    _ = try db.owned_catalog.?.createDatabase("doomed");
+    try db.owned_catalog.?.dropDatabase("doomed");
+
+    const stale: thindb.api.Session = .{ .current_db = "doomed" };
+    try std.testing.expectError(thindb.Error.NoDatabaseSelected, runSqlSession(allocator, db, stale, "SELECT id FROM t"));
+    var q = try runSqlSession(allocator, db, stale, "SELECT id FROM main.public.t WHERE id = 2");
+    defer q.deinit();
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{2}, ids);
 }

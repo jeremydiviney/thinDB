@@ -8,6 +8,8 @@ pub const Category = enum {
     table_already_exists,
     database_not_found,
     database_already_exists,
+    invalid_database_name,
+    no_database_selected,
     schema_not_found,
     schema_already_exists,
     column_not_found,
@@ -26,6 +28,8 @@ pub fn classify(err_name: []const u8) Category {
     if (std.mem.eql(u8, err_name, "TableAlreadyExists")) return .table_already_exists;
     if (std.mem.eql(u8, err_name, "DatabaseNotFound")) return .database_not_found;
     if (std.mem.eql(u8, err_name, "DatabaseAlreadyExists")) return .database_already_exists;
+    if (std.mem.eql(u8, err_name, "InvalidDatabaseName")) return .invalid_database_name;
+    if (std.mem.eql(u8, err_name, "NoDatabaseSelected")) return .no_database_selected;
     if (std.mem.eql(u8, err_name, "SchemaNotFound")) return .schema_not_found;
     if (std.mem.eql(u8, err_name, "SchemaAlreadyExists")) return .schema_already_exists;
     if (std.mem.eql(u8, err_name, "ColumnNotFound")) return .column_not_found;
@@ -42,6 +46,8 @@ pub fn classify(err_name: []const u8) Category {
 test "classify recognizes known errors" {
     try std.testing.expectEqual(Category.table_not_found, classify("TableNotFound"));
     try std.testing.expectEqual(Category.database_already_exists, classify("DatabaseAlreadyExists"));
+    try std.testing.expectEqual(Category.invalid_database_name, classify("InvalidDatabaseName"));
+    try std.testing.expectEqual(Category.no_database_selected, classify("NoDatabaseSelected"));
     try std.testing.expectEqual(Category.query_cancelled, classify("QueryCancelled"));
     try std.testing.expectEqual(Category.numeric_out_of_range, classify("ArithmeticOverflow"));
     try std.testing.expectEqual(Category.value_out_of_range, classify("ValueOutOfRange"));

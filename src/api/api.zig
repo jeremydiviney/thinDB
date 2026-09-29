@@ -18,6 +18,13 @@ pub const Error = error{
     UnsupportedAlterOp,
     DatabaseNotFound,
     DatabaseAlreadyExists,
+    /// A database name that can't name a database directory: one of the
+    /// engine's own root directories (`Catalog.reserved_database_names`),
+    /// or not a single path component.
+    InvalidDatabaseName,
+    /// An unqualified name needs the session's current database, and the
+    /// session has none: it dropped it, or another session did.
+    NoDatabaseSelected,
     SchemaNotFound,
     SchemaAlreadyExists,
     FunctionAlreadyExists,
@@ -386,7 +393,11 @@ pub const UdfNullStrategy = udf.NullStrategy;
 pub const Dialect = @import("../types.zig").Dialect;
 
 pub const Session = struct {
-    current_db: []const u8 = "main",
+    /// Null when the session has no current database, as MySQL leaves a
+    /// session whose default database was dropped. Statements that name
+    /// every table fully keep working; an unqualified name fails with
+    /// `NoDatabaseSelected`.
+    current_db: ?[]const u8 = "main",
     current_schema: []const u8 = "public",
     dialect: Dialect = .neutral,
     temp_namespace: ?*TempNamespace = null,

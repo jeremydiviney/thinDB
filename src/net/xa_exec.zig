@@ -29,7 +29,7 @@ pub fn commit(allocator: Allocator, catalog: *api.Catalog, xid: []const u8, one_
     defer arena.deinit();
     const a = arena.allocator();
     const session: api.Session = .{ .current_db = branch.db, .current_schema = branch.schema };
-    const db = catalog.database(branch.db) orelse return api.Error.DatabaseNotFound;
+    _ = catalog.database(branch.db) orelse return api.Error.DatabaseNotFound;
     const ops = try a.alloc(ir.Op, branch.stmts.items.len);
     var targets: std.ArrayList(Target) = .empty;
     for (branch.stmts.items, ops) |encoded, *op| {
@@ -79,7 +79,7 @@ pub fn commit(allocator: Allocator, catalog: *api.Catalog, xid: []const u8, one_
         return err;
     };
     defer journal.deinit();
-    apply(allocator, db, session, ops, targets.items) catch |err| {
+    apply(allocator, catalog, session, ops, targets.items) catch |err| {
         rollback(allocator, catalog, &journal, targets.items, paths) catch {
             catalog.statement_gate.recovery_required.store(true, .release);
             return api.Error.RecoveryRequired;
@@ -101,9 +101,9 @@ pub fn commit(allocator: Allocator, catalog: *api.Catalog, xid: []const u8, one_
     };
 }
 
-fn apply(allocator: Allocator, db: *api.Database, session: api.Session, ops: []ir.Op, targets: []const Target) !void {
+fn apply(allocator: Allocator, catalog: *api.Catalog, session: api.Session, ops: []ir.Op, targets: []const Target) !void {
     for (ops) |*op| {
-        var compiled = try local.compileInStatement(allocator, db, session, op);
+        var compiled = try local.compileInStatement(allocator, catalog, session, op);
         defer compiled.deinit();
         while (try compiled.next()) |_| {}
     }

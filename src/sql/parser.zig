@@ -4495,7 +4495,7 @@ pub const Parser = struct {
 
     fn lookupSqlFn(self: *Parser, name: []const u8) ParseError!?udf_mod.SqlTableFn {
         const ctx = self.sql_fns orelse return null;
-        return try ctx.registry.get(self.arena, ctx.db, name);
+        return try ctx.registry.get(self.arena, ctx.db orelse return null, name);
     }
 
     /// The expansion of a plain (non-materialized) view named `name`, or
@@ -4506,7 +4506,7 @@ pub const Parser = struct {
         if (self.cur.tag == .dot) return null;
         const ctx = self.sql_fns orelse return null;
         const vr = ctx.views orelse return null;
-        const def = (try vr.get(self.arena, ctx.db, name)) orelse return null;
+        const def = (try vr.get(self.arena, ctx.db orelse return null, name)) orelse return null;
         if (def.materialized) return null;
         return try self.expandView(def);
     }
