@@ -19,6 +19,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const storage = @import("../storage/storage.zig");
+const write_journal = @import("../storage/write_journal.zig");
 
 const max_branch_bytes = 64 << 20;
 const max_xid_bytes = 1024;
@@ -93,8 +94,8 @@ pub const XaManager = struct {
     pub fn setStorage(self: *XaManager, io: Io, root: Io.Dir) !void {
         // The fallback must also open with .iterate: a dir opened without it
         // cannot be listed on Linux (O_PATH fd), only Windows tolerates that.
-        const dir = root.openDir(io, "_xa", .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => try root.createDirPathOpen(io, "_xa", .{
+        const dir = root.openDir(io, write_journal.xa_dir_name, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => try root.createDirPathOpen(io, write_journal.xa_dir_name, .{
                 .open_options = .{ .iterate = true },
             }),
             else => return err,
@@ -267,7 +268,7 @@ pub const XaManager = struct {
     // ---- durability ----
 
     fn fileName(buf: []u8, xid: []const u8) ?[]const u8 {
-        return @import("../storage/write_journal.zig").branchFileName(buf, xid);
+        return write_journal.branchFileName(buf, xid);
     }
 
     /// Serialize {xid, db, stmts} and write it to the branch's `.xa` file.

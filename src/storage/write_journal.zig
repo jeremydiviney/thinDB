@@ -3,6 +3,9 @@ const storage = @import("storage.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+/// The catalog root's XA directory: branch records and the commit journal.
+pub const xa_dir_name = "_xa";
+
 pub const Metadata = struct { xid: []const u8, tables: []const []const u8 };
 
 /// One catalog commit runs at a time. Immutable segments are retained while
@@ -15,7 +18,7 @@ pub const WriteJournal = struct {
     dir: Io.Dir,
 
     pub fn begin(allocator: Allocator, io: Io, root: Io.Dir, metadata: Metadata) !WriteJournal {
-        const parent = try root.openDir(io, "_xa", .{ .iterate = true });
+        const parent = try root.openDir(io, xa_dir_name, .{ .iterate = true });
         errdefer parent.close(io);
         try removeResolved(io, parent);
         try parent.createDir(io, "commit", .default_dir);
@@ -105,7 +108,7 @@ pub const WriteJournal = struct {
 };
 
 pub fn recover(allocator: Allocator, io: Io, root: Io.Dir) !void {
-    const parent = root.openDir(io, "_xa", .{ .iterate = true }) catch |err| switch (err) {
+    const parent = root.openDir(io, xa_dir_name, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };

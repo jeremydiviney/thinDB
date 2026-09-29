@@ -337,6 +337,20 @@ Result precisions exceeding 38 are clamped to 38, with overflow → error rather
 
 `<seg_id>` is a monotonically increasing u64. `.tomb` files are absent until the first delete that hits that segment.
 
+A catalog root holds databases, each holding schemas of tables laid out as above, beside the engine's own directories:
+
+```
+<root>/
+  <database>/
+    <schema>/<table_name>/...
+    _functions/                    ← persisted function sources
+  _xa/                             ← XA branch records and the commit journal
+  _temp/                           ← per-session temporary tables (swept at open)
+  _zigfn_build/                    ← zig function build scratch
+```
+
+Every other directory under the root is a database. The engine's names are reserved (`Catalog.reserved_database_names`, compared without case), and one check, `Catalog.validateDatabaseName`, guards every path that maps a name to a root directory: discovery at open skips them, and CREATE DATABASE, DROP DATABASE, USE and COM_INIT_DB refuse them with `InvalidDatabaseName` (§9.8). The same check refuses a name that isn't a single path component: empty, `.`, `..`, or containing `/`, `\` or NUL. The set is explicit rather than every name with a leading underscore, so a user database such as `_staging` keeps working; a new engine directory at the root must join it. DROP DATABASE removes only a database the catalog loaded, never a directory by name alone.
+
 ### 4.2 Manifest
 
 The manifest selects the active immutable segments. Flush and compaction build a candidate without changing the published in-memory list. They finish the referenced output files, atomically replace `manifest` via `manifest.tmp`, then install the new in-memory state. Failed publication retains the old input ownership. TRUNCATE follows the same rule: publish an empty manifest and WAL checkpoint before replacing the memtable and reclaiming old files; segment IDs remain monotonic while deferred deletion is possible. Late deletes found during compaction reconciliation are written to the output tombstone before that output is selected.
@@ -1168,6 +1182,7 @@ ColumnAlreadyExists, UnsupportedAlterOp,
 FunctionAlreadyExists, FunctionInvalidDefinition,
 WalOrphaned, XaBranchTooLarge, XaInvalidXid,
 DatabaseInUse, TableBusy, ReservedTableName, RecoveryRequired, DurabilityUncertain, DatabaseClosed,
+InvalidDatabaseName, NoDatabaseSelected,
 ```
 
 `WalOrphaned`: a `wal` file sits inside the table's `segments/` directory. Replay only reads the log beside the manifest, so that file holds acknowledged rows a normal open would silently drop; the table refuses to open until an operator moves the log into place (same schema fingerprint) or aside.
@@ -1203,6 +1218,10 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` prefix, which ALTER TABLE's swap directories use (§9.2).
+
+`InvalidDatabaseName` rejects a database name reserved for the engine's own root directories, or one that isn't a single path component (§4.1), even under IF EXISTS or IF NOT EXISTS, since MySQL checks the name first too. The MySQL wire reports it as 1102 (`42000`, `Incorrect database name`), the PostgreSQL wire as `42602`.
+
+`NoDatabaseSelected` means a statement needed the session's current database and the session has none. A session holds its current database by name (`Session.current_db`, null for none). It loses it by dropping that database, as a MySQL session does, or when another session drops it: each statement treats a name the catalog no longer holds as none. Without a current database, USE, CREATE and DROP DATABASE, SHOW DATABASES, FROM-less SELECTs and fully qualified table references keep working. An unqualified table reference fails with this error, as do statements that act on the current database: functions, views, schemas and XA START. `DATABASE()` and `current_database()` return NULL and PROCESSLIST shows a NULL db. MySQL keeps the dropped name in a session whose database another session dropped; thinDB reports none there too. The MySQL wire reports it as 1046 (`3D000`, `No database selected`), the PostgreSQL wire as `3D000`.
 
 `DatabaseInUse` means another catalog owns the root's OS lock. `TableBusy` rejects an unsafe same-thread upgrade from a live query lease to destructive DDL. `DatabaseClosed` rejects new operations during close. `DurabilityUncertain` means a file replacement succeeded but parent-directory sync failed. The affected table/catalog is fenced at the persistence boundary, before releasing the mutation lock; queued writers recheck that state after acquiring the table lock. `RecoveryRequired` means that publication or an XA persistence/rollback outcome requires restart recovery; operations are rejected until reopening resolves the journal. XA admission rejects records exceeding its 64 MiB serialized recovery limit (`XaBranchTooLarge`) or invalid XIDs (`XaInvalidXid`, at most 1024 bytes).
 

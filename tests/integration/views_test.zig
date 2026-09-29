@@ -137,9 +137,10 @@ test "DROP DATABASE takes its views and functions with it (#370)" {
         try expectEqual(@as(i64, 7), try firstIntIn(allocator, db, "probe_v", "SELECT * FROM gf(7)"));
 
         try exec(allocator, db, "DROP DATABASE probe_v");
-        // A session still using the dropped database defines nothing there.
-        try expectError(error.DatabaseNotFound, execIn(allocator, db, "probe_v", "CREATE VIEW late AS SELECT 3 AS three"));
-        try expectError(error.DatabaseNotFound, execIn(allocator, db, "probe_v", "CREATE FUNCTION lf(x BIGINT) RETURNS TABLE AS (SELECT x AS three)"));
+        // A session still naming the dropped database has none (#372), so it
+        // defines nothing there.
+        try expectError(error.NoDatabaseSelected, execIn(allocator, db, "probe_v", "CREATE VIEW late AS SELECT 3 AS three"));
+        try expectError(error.NoDatabaseSelected, execIn(allocator, db, "probe_v", "CREATE FUNCTION lf(x BIGINT) RETURNS TABLE AS (SELECT x AS three)"));
         try exec(allocator, db, "CREATE DATABASE probe_v");
 
         try expectError(error.TableNotFound, firstIntIn(allocator, db, "probe_v", "SELECT * FROM ghost"));

@@ -3364,3 +3364,183 @@ test "mysql wire: a bound parameter no DATE or DATETIME reads matches nothing" {
     try client.sendQuit();
     if (sctx.err) |e| return e;
 }
+
+fn expectQueryOk(client: *TestClient, sql_text: []const u8) !void {
+    try client.sendQuery(sql_text);
+    const packet = try mysql_packet.readPacket(client.allocator, &client.reader.interface);
+    defer client.allocator.free(packet.payload);
+    if (packet.payload[0] == 0x00) return;
+    if (packet.payload[0] == 0xFF and packet.payload.len > 9) {
+        std.debug.print("{s} failed: {d} {s}\n", .{ sql_text, std.mem.readInt(u16, packet.payload[1..3], .little), packet.payload[9..] });
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// The one cell a one-row query returns.
+fn queryCell(client: *TestClient, arena: std.mem.Allocator, sql_text: []const u8) !?[]const u8 {
+    try client.sendQuery(sql_text);
+    const first = try mysql_packet.readPacket(arena, &client.reader.interface);
+    if (first.payload[0] == 0xFF) {
+        if (first.payload.len > 9) {
+            std.debug.print("{s} failed: {d} {s}\n", .{ sql_text, std.mem.readInt(u16, first.payload[1..3], .little), first.payload[9..] });
+        }
+        return error.TestUnexpectedResult;
+    }
+    const rows = try client.readResultRows(arena, first.payload);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    return rows[0][0];
+}
+
+fn expectQueryErr(client: *TestClient, sql_text: []const u8, code: u16, sqlstate: []const u8) !void {
+    try client.sendQuery(sql_text);
+    const packet = try mysql_packet.readPacket(client.allocator, &client.reader.interface);
+    defer client.allocator.free(packet.payload);
+    if (packet.payload[0] != 0xFF) {
+        std.debug.print("{s} was not refused\n", .{sql_text});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(code, std.mem.readInt(u16, packet.payload[1..3], .little));
+    try std.testing.expectEqualStrings(sqlstate, packet.payload[4..9]);
+}
+
+fn seedCurrentDbProbe(client: *TestClient) !void {
+    for ([_][]const u8{
+        "CREATE DATABASE probe",
+        "CREATE TABLE probe__public.t (id BIGINT PRIMARY KEY)",
+        "INSERT INTO probe__public.t VALUES (7)",
+        "CREATE DATABASE probe_v",
+        "USE probe_v__public",
+    }) |sql_text| try expectQueryOk(client, sql_text);
+}
+
+/// A session whose current database is gone behaves as MySQL's with none
+/// selected (#372): only an unqualified table reference fails.
+fn expectSessionWithoutDatabase(client: *TestClient, arena: std.mem.Allocator) !void {
+    try std.testing.expectEqual(@as(?[]const u8, null), try queryCell(client, arena, "SELECT DATABASE()"));
+    try std.testing.expectEqualStrings("1", (try queryCell(client, arena, "SELECT 1")).?);
+    try std.testing.expectEqualStrings("7", (try queryCell(client, arena, "SELECT id FROM probe__public.t")).?);
+    try expectQueryErr(client, "SELECT id FROM t", 1046, "3D000");
+    try client.sendQuery("SHOW DATABASES");
+    _ = try client.readResultSet(arena);
+    try expectQueryOk(client, "CREATE DATABASE probe_v");
+    try expectQueryOk(client, "USE probe__public");
+    try std.testing.expectEqualStrings("7", (try queryCell(client, arena, "SELECT id FROM t")).?);
+}
+
+test "mysql wire: dropping the current database leaves the session with none selected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 372 } };
+    const server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer thread.join();
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try seedCurrentDbProbe(&client);
+    try expectQueryOk(&client, "DROP DATABASE probe_v");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try expectSessionWithoutDatabase(&client, arena.allocator());
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+test "mysql wire: a current database another session drops leaves this one with none selected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 373 } };
+    const server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx_a: ServerCtx = .{ .server = server, .n = 1 };
+    const thread_a = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx_a});
+    defer thread_a.join();
+    var client_a = try TestClient.connect(allocator, io, addr);
+    defer client_a.close();
+    try client_a.doHandshake(null);
+    try seedCurrentDbProbe(&client_a);
+
+    var sctx_b: ServerCtx = .{ .server = server, .n = 1 };
+    const thread_b = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx_b});
+    defer thread_b.join();
+    var client_b = try TestClient.connect(allocator, io, addr);
+    defer client_b.close();
+    try client_b.doHandshake(null);
+    try expectQueryOk(&client_b, "DROP DATABASE probe_v");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try expectSessionWithoutDatabase(&client_a, arena.allocator());
+
+    try client_a.sendQuit();
+    try client_b.sendQuit();
+    if (sctx_a.err) |e| return e;
+    if (sctx_b.err) |e| return e;
+}
+
+test "mysql wire: the engine's own root directories are not databases" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 374 } };
+    const server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    const markers = [_][]const u8{ "_xa/keep", "_temp/keep", "_zigfn_build/main_f/keep" };
+    for (markers) |marker| {
+        try tmp.dir.createDirPath(io, std.fs.path.dirname(marker).?);
+        try tmp.dir.writeFile(io, .{ .sub_path = marker, .data = "engine" });
+    }
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer thread.join();
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    for ([_][]const u8{
+        "DROP DATABASE _xa",
+        "DROP DATABASE IF EXISTS _temp",
+        "DROP DATABASE `_ZIGFN_BUILD`",
+        "CREATE DATABASE _xa",
+        "CREATE DATABASE IF NOT EXISTS _temp",
+        "USE _zigfn_build",
+        "USE _xa__public",
+    }) |sql_text| try expectQueryErr(&client, sql_text, 1102, "42000");
+    try client.sendCommand(0x02, "_temp__public");
+    try expectErrPacket(&client, 1102);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendQuery("SHOW DATABASES");
+    const rows = try client.readResultSet(arena.allocator());
+    for (rows) |row| {
+        if (std.mem.startsWith(u8, row[0].?, "_")) {
+            std.debug.print("SHOW DATABASES lists {s}\n", .{row[0].?});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+
+    for (markers) |marker| try tmp.dir.access(io, marker, .{});
+}

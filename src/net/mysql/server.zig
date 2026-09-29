@@ -269,7 +269,8 @@ fn sendTooManyConnections(
 }
 
 const SessionState = struct {
-    current_db: []u8,
+    /// Null once the session has no current database (see `Session`).
+    current_db: ?[]u8,
     current_schema: []u8,
     allocator: Allocator,
     /// Catalog root used to lazily open the per-session temp namespace
@@ -346,7 +347,7 @@ const SessionState = struct {
             self.allocator.free(x);
         }
         self.xa_active = null;
-        self.allocator.free(self.current_db);
+        if (self.current_db) |db| self.allocator.free(db);
         self.allocator.free(self.current_schema);
         var it = self.prepared_statements.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit();
@@ -393,11 +394,21 @@ const SessionState = struct {
         }
     }
 
-    fn replace(self: *SessionState, db: []const u8, schema: []const u8) !void {
-        const new_db = try self.allocator.dupe(u8, db);
-        errdefer self.allocator.free(new_db);
+    /// Forget a current database another session dropped, so this session
+    /// answers DATABASE() and PROCESSLIST as one with none. Statements see the
+    /// same through compile, which re-checks under the statement lease.
+    fn forgetDroppedDb(self: *SessionState) void {
+        const db = self.current_db orelse return;
+        if (self.catalog.database(db) != null) return;
+        self.allocator.free(db);
+        self.current_db = null;
+    }
+
+    fn replace(self: *SessionState, db: ?[]const u8, schema: []const u8) !void {
+        const new_db = if (db) |name| try self.allocator.dupe(u8, name) else null;
+        errdefer if (new_db) |name| self.allocator.free(name);
         const new_schema = try self.allocator.dupe(u8, schema);
-        self.allocator.free(self.current_db);
+        if (self.current_db) |name| self.allocator.free(name);
         self.allocator.free(self.current_schema);
         self.current_db = new_db;
         self.current_schema = new_schema;
@@ -826,6 +837,7 @@ fn handleConnection(
         const cmd = pkt.payload[0];
         const body = pkt.payload[1..];
         const command_start = profiler.start();
+        session.forgetDroppedDb();
         var db_buf: [256]u8 = undefined;
         if (processCommand(cmd)) |command| {
             conn_state.beginCommand(command, commandText(&session, cmd, body), processDb(&session, &db_buf), nowMs(io));
@@ -930,9 +942,11 @@ fn commandText(session: *const SessionState, cmd: u8, body: []const u8) []const 
     return stmt.sql;
 }
 
-/// The session's current schema as `USE` and `SHOW TABLES` name it.
+/// The session's current schema as `USE` and `SHOW TABLES` name it; empty
+/// (PROCESSLIST's NULL) when the session has no current database.
 fn processDb(session: *const SessionState, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}__{s}", .{ session.current_db, session.current_schema }) catch session.current_db;
+    const db = session.current_db orelse return "";
+    return std.fmt.bufPrint(buf, "{s}__{s}", .{ db, session.current_schema }) catch db;
 }
 
 fn applyInitDb(catalog: *Catalog, session: *SessionState, name: []const u8) !void {
@@ -1114,7 +1128,7 @@ fn handleQuery(
         return;
     }
 
-    if (try canned.match(allocator, payload, session.current_schema)) |outcome| {
+    if (try canned.match(allocator, payload, if (session.current_db != null) session.current_schema else "")) |outcome| {
         session.row_count = if (outcome == .ok_packet or outcome == .kill) 0 else -1;
         switch (outcome) {
             .ok_packet => try handshake.sendOkPacketStatus(
@@ -1288,7 +1302,8 @@ fn sendSyntheticWorkbenchSelect(
             // the WHOLE statement to the engine, which answers FROM-less
             // SELECTs with proper values and types. Answering "" here (the
             // old fallback) silently lost values.
-            const value = syntheticSelectValue(expr, session.current_schema, connection_id) orelse return false;
+            const database: ?[]const u8 = if (session.current_db != null) session.current_schema else null;
+            const value = syntheticSelectValue(expr, database, connection_id) orelse return false;
             const col_name = stripIdentifierQuotes(stripAlias(orig_raw).alias orelse orig_raw);
             try cols.append(allocator, .{ .name = col_name, .type = .string, .nullable = value == .null_value });
             try cells.append(allocator, switch (value) {
@@ -1414,18 +1429,20 @@ const SyntheticValue = union(enum) { text: []const u8, null_value };
 /// evaluates FROM-less SELECTs with real values and types). This layer only
 /// exists for the multi-column `@@var` init probes drivers send, which the
 /// engine has no system-variable support for.
-fn syntheticSelectValue(expr_in: []const u8, current_schema: []const u8, connection_id: []const u8) ?SyntheticValue {
+fn syntheticSelectValue(expr_in: []const u8, database: ?[]const u8, connection_id: []const u8) ?SyntheticValue {
     const expr = std.mem.trim(u8, expr_in, " \t\r\n");
     if (std.mem.eql(u8, expr, "null")) return .null_value;
 
     if (std.mem.startsWith(u8, expr, "@@")) {
         // Only a bare name: the engine evaluates one inside an expression.
         for (expr[2..]) |c| if (!isIdentByte(c) and c != '.') return null;
-        return .{ .text = handshake.systemVariableValue(expr[2..], current_schema) };
+        return .{ .text = handshake.systemVariableValue(expr[2..], database orelse "") };
     }
 
     if (std.mem.eql(u8, expr, "version()")) return .{ .text = handshake.server_version };
-    if (std.mem.eql(u8, expr, "database()") or std.mem.eql(u8, expr, "schema()")) return .{ .text = current_schema };
+    if (std.mem.eql(u8, expr, "database()") or std.mem.eql(u8, expr, "schema()")) {
+        return if (database) |name| .{ .text = name } else .null_value;
+    }
     if (std.mem.eql(u8, expr, "user()") or
         std.mem.eql(u8, expr, "current_user()") or
         std.mem.eql(u8, expr, "session_user()") or
@@ -1986,11 +2003,11 @@ fn resolveMetadataSchema(
             return .{ .db_name = db.name, .schema_name = sc.name, .schema = sc };
         }
 
-        if (catalog.database(session.current_db)) |cur_db| {
+        if (session.current_db) |cur| if (catalog.database(cur)) |cur_db| {
             if (cur_db.schema(name)) |sc| {
                 return .{ .db_name = cur_db.name, .schema_name = sc.name, .schema = sc };
             }
-        }
+        };
         if (catalog.database(name)) |db| {
             if (db.schema("public")) |sc| {
                 return .{ .db_name = db.name, .schema_name = sc.name, .schema = sc };
@@ -1999,7 +2016,7 @@ fn resolveMetadataSchema(
         return null;
     }
 
-    const db = catalog.database(session.current_db) orelse return null;
+    const db = catalog.database(session.current_db orelse return null) orelse return null;
     const sc = db.schema(session.current_schema) orelse return null;
     return .{ .db_name = db.name, .schema_name = sc.name, .schema = sc };
 }
@@ -3407,9 +3424,7 @@ fn runKeyedDeleteBatch(
     if (session.xa_active != null) return null;
     const lease = try catalog.acquireStatement(false);
     defer lease.release();
-    const main_db = catalog.database(session.current_db) orelse return null;
-    const cat = local.catalogFor(main_db) orelse return null;
-    const t = local.resolveTable(cat, session.asSession(), stmts[0].delete_op.table) catch return null;
+    const t = local.resolveTable(catalog, session.asSession(), stmts[0].delete_op.table) catch return null;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -3526,8 +3541,9 @@ fn handleXaCommand(
     }
     if (eq(verb, "start") or eq(verb, "begin")) {
         if (session.xa_active != null) return xaErr(allocator, w, seq_id, error.XaProtocol);
+        const db = session.current_db orelse return xaErr(allocator, w, seq_id, error.NoDatabaseSelected);
         const owned_xid = allocator.dupe(u8, xid) catch |err| return xaErr(allocator, w, seq_id, err);
-        catalog.xa.beginInSchema(xid, session.current_db, session.current_schema) catch |err| {
+        catalog.xa.beginInSchema(xid, db, session.current_schema) catch |err| {
             allocator.free(owned_xid);
             return xaErr(allocator, w, seq_id, err);
         };
@@ -3602,10 +3618,6 @@ fn runSingleStatement(
     defer statement_lease.release();
     var qlease = core_scheduler.global().acquire();
     defer qlease.release();
-    const main_db = catalog.database(session.current_db) orelse {
-        try handshake.sendErrPacket(allocator, w, seq_id.*, 1049, "42000".*, "Unknown database");
-        return false;
-    };
 
     if (needsTempNamespace(op.*)) {
         _ = session.ensureTempNamespace() catch |err| {
@@ -3657,7 +3669,7 @@ fn runSingleStatement(
     const compile_start = profiler.start();
     var unbound: ?local.Unbound = null;
     defer if (unbound) |u| qalloc.free(u.name());
-    var compiled = local.compileInStatementWithOptions(qalloc, main_db, session.asSession(), op, .{
+    var compiled = local.compileInStatementWithOptions(qalloc, catalog, session.asSession(), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
         .unbound = &unbound,
@@ -3711,7 +3723,7 @@ fn runSingleStatement(
         allocator,
         w,
         &compiled,
-        session.current_db,
+        session.current_db orelse "",
         "",
         seq_id,
         session.client_caps,
@@ -3836,8 +3848,7 @@ fn handleStmtPrepare(
             if (isSideEffectOp(dummy_op.*)) break :blk;
             const lease = catalog.acquireStatement(false) catch break :blk;
             defer lease.release();
-            const main_db = catalog.database(session.current_db) orelse break :blk;
-            var compiled = local.compileWithSession(arena.allocator(), main_db, session.asSession(), dummy_op) catch break :blk;
+            var compiled = local.compileInStatement(arena.allocator(), catalog, session.asSession(), dummy_op) catch break :blk;
             defer compiled.deinit();
             const schema = compiled.outputSchema();
 
@@ -3895,7 +3906,7 @@ fn handleStmtPrepare(
         const schema = stmt.column_schema.?;
         for (schema) |col| {
             coldef.clearRetainingCapacity();
-            try result.appendColumnDef(allocator, &coldef, session.current_db, "", col, .binary);
+            try result.appendColumnDef(allocator, &coldef, session.current_db orelse "", "", col, .binary);
             try packet.writePacket(w, seq_id, coldef.items);
             seq_id +%= 1;
         }
@@ -3998,10 +4009,6 @@ fn handleStmtExecute(
         return;
     };
     defer statement_lease.release();
-    const main_db = catalog.database(session.current_db) orelse {
-        try handshake.sendErrPacket(allocator, w, seq_id, 1049, "42000".*, "Unknown database");
-        return;
-    };
 
     if (needsTempNamespace(op.*)) {
         _ = session.ensureTempNamespace() catch |err| {
@@ -4035,7 +4042,7 @@ fn handleStmtExecute(
     const compile_start = profiler.start();
     var unbound: ?local.Unbound = null;
     defer if (unbound) |u| allocator.free(u.name());
-    var compiled = local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{
+    var compiled = local.compileInStatementWithOptions(allocator, catalog, session.asSession(), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
         .unbound = &unbound,
@@ -4090,7 +4097,7 @@ fn handleStmtExecute(
     defer coldef.deinit(allocator);
     for (schema) |col| {
         coldef.clearRetainingCapacity();
-        try result.appendColumnDef(allocator, &coldef, session.current_db, "", col, .binary);
+        try result.appendColumnDef(allocator, &coldef, session.current_db orelse "", "", col, .binary);
         try packet.writePacket(w, seq_id, coldef.items);
         seq_id +%= 1;
     }
@@ -4272,7 +4279,7 @@ test "applyInitDb resolves flat db__schema name" {
     var session = try SessionState.init(allocator, c, 1);
     defer session.deinit();
     try applyInitDb(c, &session, "alpha__public");
-    try std.testing.expectEqualStrings("alpha", session.current_db);
+    try std.testing.expectEqualStrings("alpha", session.current_db.?);
     try std.testing.expectEqualStrings("public", session.current_schema);
 }
 
@@ -4288,7 +4295,7 @@ test "applyInitDb honors schema-within-current-db lookup" {
     var session = try SessionState.init(allocator, c, 2);
     defer session.deinit();
     try applyInitDb(c, &session, "reports");
-    try std.testing.expectEqualStrings("main", session.current_db);
+    try std.testing.expectEqualStrings("main", session.current_db.?);
     try std.testing.expectEqualStrings("reports", session.current_schema);
 }
 
