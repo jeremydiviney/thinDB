@@ -1404,7 +1404,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_add_seconds", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddSecondsKernel },
     .{ .name = "date_add_micros", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMicrosKernel },
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
-    .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .kernel = date.fromUnixtimeKernel },
+    .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .bigint, .kernel = date.dateDiffDateKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.dateDiffDatetimeKernel },

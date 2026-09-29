@@ -965,7 +965,26 @@ fn isReservedAggregateName(name: []const u8) bool {
     return false;
 }
 
-fn isReservedScalarName(name: []const u8) bool {
+/// Whether a scalar UDF may not take `name`: a UDF under it would win calls
+/// meant for a builtin, or for the function some syntax lowers to. Names
+/// starting `__` are the engine's own.
+pub fn isReservedScalarName(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "__")) return true;
+    // Syntax lowers to these rather than calling them by name: INTERVAL,
+    // TIMESTAMPADD, TRIM(... FROM), EXTRACT, the bit and JSON operators,
+    // REGEXP, SOUNDS LIKE, CAST, STR_TO_DATE and MONTHS_DIFF.
+    const lowered = [_][]const u8{
+        "date_add_weeks",             "date_add_quarters",          "date_add_hours",           "date_add_minutes",
+        "date_add_seconds",           "date_add_micros",            "ltrim_substring",          "rtrim_substring",
+        "trim_substring",             "week",                       "microsecond",              "extract_year_month",
+        "extract_day_hour",           "extract_day_minute",         "extract_day_second",       "extract_day_microsecond",
+        "extract_hour_minute",        "extract_hour_second",        "extract_hour_microsecond", "extract_minute_second",
+        "extract_minute_microsecond", "extract_second_microsecond", "bitand",                   "bitor",
+        "bitxor",                     "bitnot",                     "bit_shift_left",           "bit_shift_right",
+        "json_extract",               "json_value",                 "regexp_like",              "soundex",
+        "to_json",                    "str_to_time",                "date_diff",
+    };
+    for (lowered) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     const names = [_][]const u8{
         "upper",          "lower",             "ltrim",        "rtrim",           "trim",            "reverse",
         "length",         "octet_length",      "char_length",  "concat",          "substring",       "replace",
@@ -1005,6 +1024,18 @@ test "udf registry rejects duplicates and reserved builtins" {
     try testing.expectError(Error.FunctionAlreadyExists, reg.registerScalar(.{
         .name = "upper",
         .arg_types = &.{.string},
+        .return_type = .string,
+        .kernel = noop,
+    }));
+    try testing.expectError(Error.FunctionAlreadyExists, reg.registerScalar(.{
+        .name = "DATE_ADD_HOURS",
+        .arg_types = &.{ .date, .int },
+        .return_type = .datetime,
+        .kernel = noop,
+    }));
+    try testing.expectError(Error.FunctionAlreadyExists, reg.registerScalar(.{
+        .name = "__order_key",
+        .arg_types = &.{.int},
         .return_type = .string,
         .kernel = noop,
     }));

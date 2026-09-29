@@ -372,6 +372,17 @@ fn intervalUnit(word: []const u8) ?IntervalUnit {
     return null;
 }
 
+/// EXTRACT's fields: MySQL's units, plus DAYOFYEAR, which every engine that
+/// accepts it numbers the same way. WEEK is WEEK(d), mode 0, as in MySQL.
+const EXTRACT_FIELDS = [_][]const u8{ "year", "quarter", "month", "week", "day", "dayofyear", "hour", "minute", "second", "microsecond" };
+
+/// A compound EXTRACT unit (`DAY_SECOND`) has its own function, extract_<unit>.
+const EXTRACT_COMPOUND_FNS = [_][]const u8{
+    "extract_year_month",      "extract_day_hour",           "extract_day_minute",         "extract_day_second",
+    "extract_day_microsecond", "extract_hour_minute",        "extract_hour_second",        "extract_hour_microsecond",
+    "extract_minute_second",   "extract_minute_microsecond", "extract_second_microsecond",
+};
+
 const DateAddSubKind = enum { add, sub };
 
 fn dateAddSubName(name: []const u8) ?DateAddSubKind {
@@ -3392,18 +3403,9 @@ pub const Parser = struct {
         try self.expect(.lparen);
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
         const field = self.cur.text;
-        // MySQL's units, plus DAYOFYEAR, which every engine that accepts it
-        // numbers the same way. WEEK is WEEK(d), mode 0, as in MySQL.
-        const fields = [_][]const u8{ "year", "quarter", "month", "week", "day", "dayofyear", "hour", "minute", "second", "microsecond" };
-        // A compound unit (`DAY_SECOND`) has its own function, extract_<unit>.
-        const compound = [_][]const u8{
-            "extract_year_month",      "extract_day_hour",           "extract_day_minute",         "extract_day_second",
-            "extract_day_microsecond", "extract_hour_minute",        "extract_hour_second",        "extract_hour_microsecond",
-            "extract_minute_second",   "extract_minute_microsecond", "extract_second_microsecond",
-        };
-        const fn_name: []const u8 = for (fields) |f| {
+        const fn_name: []const u8 = for (EXTRACT_FIELDS) |f| {
             if (std.ascii.eqlIgnoreCase(field, f)) break f;
-        } else for (compound) |f| {
+        } else for (EXTRACT_COMPOUND_FNS) |f| {
             if (std.ascii.eqlIgnoreCase(field, f["extract_".len..])) break f;
         } else return ParseError.SqlExpectedKeyword;
         try self.advance();
@@ -8231,6 +8233,23 @@ fn reverseRangeOp(op: PredicateOp) PredicateOp {
         .gte => .lte,
         else => op,
     };
+}
+
+test "no scalar UDF can take a function that syntax lowers to" {
+    const units = [_][]const u8{ "day", "week", "month", "quarter", "year", "hour", "minute", "second", "microsecond" };
+    for (units) |unit| try std.testing.expect(udf_mod.isReservedScalarName(intervalUnit(unit).?.fn_name));
+    for (EXTRACT_FIELDS ++ EXTRACT_COMPOUND_FNS) |name| try std.testing.expect(udf_mod.isReservedScalarName(name));
+    for (std.enums.values(scalar_fn.BitOperator)) |op| {
+        for (std.enums.values(types.Dialect)) |dialect| try std.testing.expect(udf_mod.isReservedScalarName(scalar_fn.bitOperatorFn(op, dialect)));
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cast_targets = [_]types.Type{ .int, .bigint, .smallint, .tinyint, .largeint, .float, .double, .boolean, .date, .datetime, .string, .json };
+    for (cast_targets) |ty| try std.testing.expect(udf_mod.isReservedScalarName((try scalar_fn.castFnName(arena.allocator(), ty)).?));
+    inline for (.{ "ltrim_substring", "json_extract", "json_value", "regexp_like", "soundex", "str_to_time", "date_diff", scalar_fn.ORDER_KEY_FN }) |name| {
+        try std.testing.expect(udf_mod.isReservedScalarName(name));
+    }
+    try std.testing.expect(!udf_mod.isReservedScalarName("score_bucket"));
 }
 
 test "sql table function: CREATE parse, body capture, validation, expansion" {

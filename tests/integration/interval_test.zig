@@ -386,6 +386,42 @@ test "calendar functions work before 1970" {
     try std.testing.expectEqualSlices(i64, &.{2}, day_match);
 }
 
+test "UNIX_TIMESTAMP before 1970 is 0, and FROM_UNIXTIME of a negative count is NULL (issue #400)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ep (id BIGINT PRIMARY KEY, ts DATETIME NOT NULL, d DATE NOT NULL, n BIGINT)");
+    try exec(allocator, db, "INSERT INTO ep VALUES (1, '1969-12-31 23:59:59', '1969-12-31', -1), " ++
+        "(2, '1970-01-01 00:00:01', '1970-01-02', 0), (3, '9999-12-31 23:59:59', '9999-12-31', 253402300799), " ++
+        "(4, '0000-01-01 00:00:00', '0000-01-01', 253402300800), (5, '2026-01-01 00:00:00.5', '2026-01-01', NULL)");
+
+    // StarRocks 4.0 and MySQL 8.4 give 0 before 1970 and NULL for a negative
+    // count. Both stop earlier at the top: StarRocks after 9999-12-31
+    // 07:59:59, MySQL after 3001-01-18 23:59:59. thinDB stops where DATETIME
+    // does.
+    const seconds = try helpers.collectBigints(allocator, db, "SELECT UNIX_TIMESTAMP(ts) FROM ep ORDER BY id");
+    defer allocator.free(seconds);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1, 253402300799, 0, 1767225600 }, seconds);
+    const day_seconds = try helpers.collectBigints(allocator, db, "SELECT UNIX_TIMESTAMP(d) FROM ep ORDER BY id");
+    defer allocator.free(day_seconds);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 86400, 253402214400, 0, 1767225600 }, day_seconds);
+
+    const moments = try helpers.collectStrings(allocator, db, "SELECT CAST(FROM_UNIXTIME(n) AS CHAR) FROM ep ORDER BY id");
+    defer helpers.freeStrings(allocator, moments);
+    const want = [_]?[]const u8{ null, "1970-01-01 00:00:00", "9999-12-31 23:59:59", null, null };
+    try std.testing.expectEqual(want.len, moments.len);
+    for (want, moments) |w, m| {
+        if (w) |text| try std.testing.expectEqualStrings(text, m.?) else try std.testing.expect(m == null);
+    }
+    inline for (.{ "9223372036854775807", "-9223372036854775808" }) |extreme| {
+        const got = try helpers.collectStrings(allocator, db, "SELECT CAST(FROM_UNIXTIME(" ++ extreme ++ ") AS CHAR)");
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expect(got.len == 1 and got[0] == null);
+    }
+}
+
 test "DATE_FORMAT, STR_TO_DATE and the week functions match MySQL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
