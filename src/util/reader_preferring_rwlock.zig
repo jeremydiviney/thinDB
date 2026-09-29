@@ -14,7 +14,8 @@
 //! DDL takes the catalog statement gate exclusively before this lock, so no new
 //! statement starts and the readers drain. A compaction commit waits for a gap,
 //! but only until a deadline (`lockBefore`): on a table whose readers never
-//! drain it gives up rather than wait forever.
+//! drain it gives up rather than wait forever. It also gives up as soon as DDL
+//! asks for the table (`give_up`), so DDL never waits out that deadline.
 
 const std = @import("std");
 const Io = std.Io;
@@ -45,7 +46,7 @@ pub const ReaderPreferringRwLock = struct {
         self.readers -= 1;
         if (self.readers == 0) {
             self.changed.broadcast(io);
-            self.wakeTimedWriters(io);
+            self.wakeTimedWritersLocked(io);
         }
     }
 
@@ -56,15 +57,22 @@ pub const ReaderPreferringRwLock = struct {
         self.writing = true;
     }
 
-    /// `lockUncancelable` that gives up once `deadline` passes. Returns
-    /// false, without the lock, when it timed out.
-    pub fn lockBefore(self: *ReaderPreferringRwLock, io: Io, deadline: Io.Clock.Timestamp) bool {
+    /// `lockUncancelable` that gives up once `deadline` passes, or once
+    /// `give_up` reads nonzero (whoever sets it calls `wakeTimedWriters`
+    /// afterwards). Returns false, without the lock, when it gave up.
+    pub fn lockBefore(
+        self: *ReaderPreferringRwLock,
+        io: Io,
+        deadline: Io.Clock.Timestamp,
+        give_up: ?*const std.atomic.Value(u32),
+    ) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.timed_writers += 1;
         defer self.timed_writers -= 1;
         while (self.writing or self.readers > 0) {
             if (Io.Clock.Timestamp.now(io, deadline.clock).compare(.gte, deadline)) return false;
+            if (give_up) |flag| if (flag.load(.acquire) != 0) return false;
             // Read under the mutex: a release after this bumps the word, so the
             // futex wait below returns at once instead of missing it.
             const seen = self.released.load(.acquire);
@@ -82,10 +90,17 @@ pub const ReaderPreferringRwLock = struct {
         defer self.mutex.unlock(io);
         self.writing = false;
         self.changed.broadcast(io);
-        self.wakeTimedWriters(io);
+        self.wakeTimedWritersLocked(io);
     }
 
-    fn wakeTimedWriters(self: *ReaderPreferringRwLock, io: Io) void {
+    /// Wake every `lockBefore` caller so it rechecks its `give_up` flag.
+    pub fn wakeTimedWriters(self: *ReaderPreferringRwLock, io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.wakeTimedWritersLocked(io);
+    }
+
+    fn wakeTimedWritersLocked(self: *ReaderPreferringRwLock, io: Io) void {
         if (self.timed_writers == 0) return;
         _ = self.released.fetchAdd(1, .release);
         io.futexWake(u32, &self.released.raw, std.math.maxInt(u32));
@@ -140,12 +155,41 @@ test "a timed writer gives up while readers keep the lock" {
     const io = std.testing.io;
     var lock: ReaderPreferringRwLock = .init;
     lock.lockSharedUncancelable(io);
-    try std.testing.expect(!lock.lockBefore(io, deadlineIn(io, 30)));
+    try std.testing.expect(!lock.lockBefore(io, deadlineIn(io, 30), null));
     lock.lockSharedUncancelable(io);
     lock.unlockShared(io);
     lock.unlockShared(io);
-    try std.testing.expect(lock.lockBefore(io, deadlineIn(io, 30)));
+    try std.testing.expect(lock.lockBefore(io, deadlineIn(io, 30), null));
     lock.unlock(io);
+}
+
+test "a timed writer gives up when asked, long before its deadline" {
+    const io = std.testing.io;
+    var lock: ReaderPreferringRwLock = .init;
+    lock.lockSharedUncancelable(io);
+    defer lock.unlockShared(io);
+    const Writer = struct {
+        lock: *ReaderPreferringRwLock,
+        io: Io,
+        give_up: std.atomic.Value(u32) = .init(0),
+        acquired: ?bool = null,
+        fn run(self: *@This()) void {
+            self.acquired = self.lock.lockBefore(self.io, deadlineIn(self.io, 60_000), &self.give_up);
+        }
+    };
+    var writer: Writer = .{ .lock = &lock, .io = io };
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    while (true) {
+        lock.mutex.lockUncancelable(io);
+        const parked = lock.timed_writers > 0;
+        lock.mutex.unlock(io);
+        if (parked) break;
+        std.Thread.yield() catch {};
+    }
+    writer.give_up.store(1, .release);
+    lock.wakeTimedWriters(io);
+    thread.join();
+    try std.testing.expectEqual(@as(?bool, false), writer.acquired);
 }
 
 test "a timed writer takes the lock when the last reader leaves" {
@@ -159,7 +203,7 @@ test "a timed writer takes the lock when the last reader leaves" {
         acquired: std.atomic.Value(bool) = .init(false),
         fn run(self: *@This()) void {
             self.waiting.store(true, .release);
-            if (self.lock.lockBefore(self.io, deadlineIn(self.io, 10_000))) {
+            if (self.lock.lockBefore(self.io, deadlineIn(self.io, 10_000), null)) {
                 self.acquired.store(true, .release);
                 self.lock.unlock(self.io);
             }

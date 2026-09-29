@@ -1,7 +1,8 @@
 //! A background merge runs without a statement lease (#87): DDL and XA COMMIT
-//! must not queue behind it, and every path that frees its table must wait for
-//! it instead. A reader holding the table's `ddl_lock` parks the merge at its
-//! commit, which sequences each race deterministically.
+//! must not queue behind it, and a path that frees or rewrites its table stops
+//! it rather than waiting it out (see also util/merge_preempt_test.zig). A
+//! reader holding the table's `ddl_lock` parks the merge at its commit, which
+//! sequences each race deterministically.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -45,9 +46,11 @@ const ParkedMerge = struct {
     thread: ?std.Thread = null,
     reader_held: bool = false,
     worked: bool = false,
+    swept: std.atomic.Value(bool) = .init(false),
 
     fn sweep(self: *ParkedMerge) void {
         self.worked = self.catalog.backgroundCompactSweep() catch false;
+        self.swept.store(true, .release);
     }
 
     fn start(self: *ParkedMerge) !void {
@@ -63,6 +66,15 @@ const ParkedMerge = struct {
             if (passed(self.io, deadline)) return error.MergeNeverReachedCommit;
             try std.Io.sleep(self.io, .fromMilliseconds(1), .awake);
         }
+    }
+
+    fn sweepEndsWithin(self: *ParkedMerge, ms: i64) !bool {
+        const deadline = deadlineIn(self.io, ms);
+        while (!self.swept.load(.acquire)) {
+            if (passed(self.io, deadline)) return false;
+            try std.Io.sleep(self.io, .fromMilliseconds(1), .awake);
+        }
+        return true;
     }
 
     /// Let the merge commit and wait for the sweep to end. `t` may be freed
@@ -151,66 +163,56 @@ test "DDL runs while a background merge waits to commit" {
     try std.testing.expectEqual(@as(i64, 4), try countRows(allocator, db));
 }
 
-fn dropSchema(db: *thindb.Database, name: []const u8) !void {
-    try db.dropSchema(name);
+fn renameOrders(db: *thindb.Database) !void {
+    try db.renameTable("orders", "renamed");
 }
 
-test "DROP SCHEMA waits for a background merge of its table" {
+fn countDataFiles(dir: std.Io.Dir, io: std.Io) !usize {
+    var iter_dir = try dir.openDir(io, ".", .{ .iterate = true });
+    defer iter_dir.close(io);
+    var it = iter_dir.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".dat")) n += 1;
+    }
+    return n;
+}
+
+test "a merge waiting to commit gives way to DDL on its table, and a later sweep merges" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db = try thindb.Database.open(allocator, io, tmp.dir, cfg);
     defer db.close();
-    const aux = try db.createSchema("aux");
-    const t = try aux.table("orders", schema_v1, opts_v1);
+    const t = try db.table("orders", schema_v1, opts_v1);
     try fillTwoSegments(t);
 
-    var drop: Background(dropSchema) = .{ .args = .{ db, "aux" } };
-    defer drop.join();
+    var rename: Background(renameOrders) = .{ .args = .{db} };
+    defer rename.join();
     var parked: ParkedMerge = .{ .t = t, .io = io, .catalog = db.owned_catalog.? };
     defer parked.finish();
     try parked.start();
-    try drop.start();
-    try std.testing.expect(!try drop.finishesWithin(io, 100));
+    try rename.start();
+    // The merge stops waiting at once and deletes its output, so the sweep
+    // ends while the reader still holds the table. The rename itself still
+    // waits for that reader, as it waits for any statement on the table.
+    try std.testing.expect(try parked.sweepEndsWithin(5_000));
+    try std.testing.expect(!parked.worked);
+    try std.testing.expect(!try rename.finishesWithin(io, 50));
+    try std.testing.expectEqual(@as(usize, 2), try countDataFiles(t.segments_dir, io));
 
     parked.finish();
-    drop.join();
-    try std.testing.expect(!drop.failed);
-    try std.testing.expect(parked.worked);
-    try std.testing.expect(db.schema("aux") == null);
-    try std.testing.expectError(error.FileNotFound, db.db_dir.access(io, "aux", .{}));
-}
+    rename.join();
+    try std.testing.expect(!rename.failed);
+    try std.testing.expectEqual(@as(usize, 2), t.segmentCount());
 
-fn dropDatabase(catalog: *thindb.Catalog, name: []const u8) !void {
-    try catalog.dropDatabase(name);
-}
-
-test "DROP DATABASE waits for a background merge of its table" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const catalog = try thindb.Catalog.open(allocator, io, tmp.dir, cfg);
-    defer catalog.close();
-    const other = try catalog.createDatabase("other");
-    const t = try other.table("orders", schema_v1, opts_v1);
-    try fillTwoSegments(t);
-
-    var drop: Background(dropDatabase) = .{ .args = .{ catalog, "other" } };
-    defer drop.join();
-    var parked: ParkedMerge = .{ .t = t, .io = io, .catalog = catalog };
-    defer parked.finish();
-    try parked.start();
-    try drop.start();
-    try std.testing.expect(!try drop.finishesWithin(io, 100));
-
-    parked.finish();
-    drop.join();
-    try std.testing.expect(!drop.failed);
-    try std.testing.expect(parked.worked);
-    try std.testing.expect(catalog.database("other") == null);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "other", .{}));
+    try std.testing.expect(try db.backgroundCompactSweep());
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+    try std.testing.expectEqual(@as(usize, 1), try countDataFiles(t.segments_dir, io));
+    const vals = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM renamed WHERE qty > 0");
+    defer allocator.free(vals);
+    try std.testing.expectEqualSlices(i64, &.{4}, vals);
 }
 
 fn closeDatabase(db: *thindb.Database) !void {

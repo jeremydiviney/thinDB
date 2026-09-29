@@ -146,7 +146,7 @@ pub const ConnectionState = struct {
     /// its next command boundary, releasing the session exactly as a
     /// client disconnect does.
     close_requested: std.atomic.Value(bool) = .{ .raw = false },
-    /// Socket handle for the net_read_timeout reaper (#164). Set once,
+    /// Socket handle for the transfer reaper (#164). Set once,
     /// before `Registry.register` publishes this state (the register
     /// lock is the publication barrier). Null for transports that
     /// don't arm the reaper.
@@ -161,8 +161,10 @@ pub const ConnectionState = struct {
     ///   1 — packet-BODY read: the client committed to a length, so
     ///     the wait is bounded hard by net_read_timeout (MySQL
     ///     semantics).
-    ///   2 — response WRITE: bounded by net_write_timeout (2× the
-    ///     read timeout, mirroring MySQL's 30/60 defaults).
+    ///   2 — response WRITE (`GuardedStreamWriter`): bounded by
+    ///     net_write_timeout. A client that stops reading its result
+    ///     would otherwise hold the statement's gate lease and core
+    ///     slot for as long as it likes (#87).
     ///
     /// Why (#164): the 2026-07-11 incident held one sink connection at
     /// zero packets for 559 s while the server kept serving others — a
@@ -278,6 +280,48 @@ pub const ConnectionState = struct {
 /// registry doesn't have a reason to depend on. The registry is
 /// touched only on connection accept/close + cancellation, so
 /// spinning is fine.
+/// A connection's socket writer. Every send, including the implicit
+/// ones when a large result overflows the buffer, carries a write mark
+/// on the connection's state, so the reaper can end a send the client
+/// has stopped draining. Must not move once `interface` is in use.
+pub const GuardedStreamWriter = struct {
+    stream_writer: std.Io.net.Stream.Writer,
+    stream_vtable: *const std.Io.Writer.VTable,
+    state: *ConnectionState,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain, .sendFile = sendFile };
+
+    pub fn init(stream: std.Io.net.Stream, io: std.Io, buffer: []u8, state: *ConnectionState) GuardedStreamWriter {
+        var stream_writer = stream.writer(io, buffer);
+        const stream_vtable = stream_writer.interface.vtable;
+        stream_writer.interface.vtable = &vtable;
+        return .{ .stream_writer = stream_writer, .stream_vtable = stream_vtable, .state = state };
+    }
+
+    pub fn interface(self: *GuardedStreamWriter) *std.Io.Writer {
+        return &self.stream_writer.interface;
+    }
+
+    fn fromInterface(w: *std.Io.Writer) *GuardedStreamWriter {
+        const stream_writer: *std.Io.net.Stream.Writer = @alignCast(@fieldParentPtr("interface", w));
+        return @alignCast(@fieldParentPtr("stream_writer", stream_writer));
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self = fromInterface(w);
+        self.state.beginWrite(nowMs(self.stream_writer.io));
+        defer self.state.endTransfer();
+        return self.stream_vtable.drain(w, data, splat);
+    }
+
+    fn sendFile(w: *std.Io.Writer, file_reader: *std.Io.File.Reader, limit: std.Io.Limit) std.Io.Writer.FileError!usize {
+        const self = fromInterface(w);
+        self.state.beginWrite(nowMs(self.stream_writer.io));
+        defer self.state.endTransfer();
+        return self.stream_vtable.sendFile(w, file_reader, limit);
+    }
+};
+
 const SpinLock = struct {
     state: std.atomic.Value(bool) = .{ .raw = false },
 
@@ -348,7 +392,7 @@ pub const Registry = struct {
     /// already pending, so an idle target leaves once its client closes its
     /// end or the stack times the half-closed connection out.
     /// Shutdown, not close, under the registry lock, for the reasons
-    /// `reapStalledReads` gives. A connection killing itself calls
+    /// `reapStalledTransfers` gives. A connection killing itself calls
     /// `ConnectionState.requestClose` instead, so its reply still goes
     /// out. Returns false on an unknown id.
     pub fn requestClose(self: *Registry, io: std.Io, backend_id: u32) bool {
@@ -394,10 +438,20 @@ pub const Registry = struct {
     /// recovers in seconds, not minutes.
     const wedge_probe_grace_ms: u64 = 10_000;
 
-    /// Stalled-read enforcement (#164). Two independent conditions:
+    /// How long a stalled transfer may wait before the reaper ends its
+    /// connection, in milliseconds. 0 disables that class.
+    pub const TransferLimits = struct {
+        /// net_read_timeout: a read inside a packet (class 1). Also
+        /// gates the wedged-read probe (class 0).
+        read_ms: u64,
+        /// net_write_timeout: a send the client is not draining (class 2).
+        write_ms: u64,
+    };
+
+    /// Stalled-transfer enforcement (#164, #87). Three conditions:
     ///
     ///   1. net_read_timeout: a mid-packet read (client committed to a
-    ///      length, payload incomplete) older than `timeout_ms`. MySQL
+    ///      length, payload incomplete) older than `read_ms`. MySQL
     ///      semantics (its default is 30 s).
     ///   2. Wedged read: a header read pending past the grace period
     ///      while the socket has bytes QUEUED — an idle connection has
@@ -405,18 +459,18 @@ pub const Registry = struct {
     ///      mean the pended read lost its completion (Windows AFD race,
     ///      the 559 s incident signature). Idle connections are never
     ///      touched: no bytes, no reap, no matter how long they idle.
+    ///   3. net_write_timeout: a send older than `write_ms`. The client
+    ///      has stopped reading, and the statement behind the send holds
+    ///      its gate lease and core slot until the send ends.
     ///
-    /// Shutdown — not close — so the handle stays valid for the owning
-    /// thread (no reuse race); the pending read completes with EOF or
-    /// reset and the connection thread exits through its normal error
-    /// path. Runs under the registry lock, which excludes a concurrent
-    /// unregister: an entry seen here cannot have had its socket closed
-    /// yet (close happens after unregister on the connection thread).
-    ///
-    /// `io` supplies netShutdown — on Windows the Io.net sockets are
-    /// AFD handles that ws2_32 calls reject, so the shutdown must go
-    /// through the same Io vtable that opened them.
-    pub fn reapStalledReads(self: *Registry, io: std.Io, now_ms: u64, timeout_ms: u64) usize {
+    /// The connection is aborted, not closed (`socket_probe.abortTransfers`),
+    /// so the handle stays valid for the owning thread (no reuse race);
+    /// the pending transfer fails and the connection thread exits through
+    /// its normal error path, releasing what the statement held. Runs
+    /// under the registry lock, which excludes a concurrent unregister:
+    /// an entry seen here cannot have had its socket closed yet (close
+    /// happens after unregister on the connection thread).
+    pub fn reapStalledTransfers(self: *Registry, io: std.Io, now_ms: u64, limits: TransferLimits) usize {
         const socket_probe = @import("socket_probe.zig");
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -433,32 +487,32 @@ pub const Registry = struct {
             const handle = state.reap_socket orelse continue;
 
             switch (class) {
-                1 => { // packet-body read: net_read_timeout
-                    if (timeout_ms == 0 or waited < timeout_ms) continue;
+                1 => { // packet-body read
+                    if (limits.read_ms == 0 or waited < limits.read_ms) continue;
                     std.debug.print(
-                        "thindb: net_read_timeout: connection {d} stuck mid-packet for {d}ms — shutting down its socket\n",
+                        "thindb: net_read_timeout: connection {d} stuck mid-packet for {d}ms — aborting it\n",
                         .{ state.backend_id, waited },
                     );
                 },
-                2 => { // response write: net_write_timeout = 2× read timeout
-                    if (timeout_ms == 0 or waited < timeout_ms * 2) continue;
+                2 => { // response write
+                    if (limits.write_ms == 0 or waited < limits.write_ms) continue;
                     std.debug.print(
-                        "thindb: net_write_timeout: connection {d} response write stuck for {d}ms — shutting down its socket\n",
+                        "thindb: net_write_timeout: connection {d} response write stuck for {d}ms — aborting it\n",
                         .{ state.backend_id, waited },
                     );
                 },
                 else => { // header read: idle unless bytes are queued
-                    if (waited < wedge_probe_grace_ms) continue;
+                    if (limits.read_ms == 0 or waited < wedge_probe_grace_ms) continue;
                     const avail = socket_probe.bytesAvailable(handle) orelse continue;
                     if (avail == 0) continue; // genuinely idle
                     std.debug.print(
-                        "thindb: wedged read: connection {d} has {d} bytes queued but its read has pended {d}ms — shutting down its socket\n",
+                        "thindb: wedged read: connection {d} has {d} bytes queued but its read has pended {d}ms — aborting it\n",
                         .{ state.backend_id, avail, waited },
                     );
                 },
             }
             state.endTransfer(); // one-shot per stall
-            io.vtable.netShutdown(io.userdata, handle, .both) catch {};
+            socket_probe.abortTransfers(self.allocator, io, handle);
             reaped += 1;
         }
         return reaped;
@@ -470,7 +524,7 @@ pub const Registry = struct {
     /// long or runaway query otherwise keeps its cores and memory with
     /// nobody waiting for it. Statements that write are left to finish,
     /// as MySQL finishes them. Runs under the registry lock for the same
-    /// reason as `reapStalledReads`: a registered socket is still open.
+    /// reason as `reapStalledTransfers`: a registered socket is still open.
     pub fn cancelAbandonedQueries(self: *Registry) usize {
         const socket_probe = @import("socket_probe.zig");
         self.mutex.lock();
@@ -539,11 +593,82 @@ test "transfer-wait marks encode class; reap skips unarmed sockets" {
 
     // No socket armed: even a grossly stale mid-packet mark is skipped.
     s.beginRead(1_000, true);
-    try std.testing.expectEqual(@as(usize, 0), reg.reapStalledReads(io, 10_000_000, 15_000));
+    try std.testing.expectEqual(@as(usize, 0), reg.reapStalledTransfers(io, 10_000_000, .{ .read_ms = 15_000, .write_ms = 30_000 }));
 
     s.endTransfer();
     try std.testing.expectEqual(@as(u64, 0), s.transfer_wait.load(.monotonic));
     reg.unregister(7);
+}
+
+const StalledSender = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    state: *ConnectionState,
+    result: ?std.Io.Writer.Error = null,
+    bytes_sent: usize = 0,
+    done: std.atomic.Value(bool) = .init(false),
+
+    /// Far more than loopback buffers hold, so the send blocks for good
+    /// once the peer stops reading.
+    const give_up_bytes: usize = 1 << 30;
+
+    fn run(self: *StalledSender) void {
+        defer self.done.store(true, .release);
+        var buffer: [16 * 1024]u8 = undefined;
+        var writer: GuardedStreamWriter = .init(self.stream, self.io, &buffer, self.state);
+        const chunk: [64 * 1024]u8 = @splat('x');
+        while (self.bytes_sent < give_up_bytes) : (self.bytes_sent += chunk.len) {
+            writer.interface().writeAll(&chunk) catch |err| {
+                self.result = err;
+                return;
+            };
+        }
+    }
+};
+
+test "the write deadline aborts a send the client stopped draining" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    defer listener.deinit(io);
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    var client_open = true;
+    defer if (client_open) client.close(io);
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    var s = ConnectionState.init(5, 0);
+    s.reap_socket = accepted.socket.handle;
+    try reg.register(&s);
+    defer reg.unregister(5);
+
+    var sender: StalledSender = .{ .io = io, .stream = accepted, .state = &s };
+    const thread = try std.Thread.spawn(.{}, StalledSender.run, .{&sender});
+    var reaped: usize = 0;
+    for (0..1000) |_| {
+        reaped = reg.reapStalledTransfers(io, nowMs(io), .{ .read_ms = 0, .write_ms = 200 });
+        if (reaped > 0) break;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    var send_ended = false;
+    for (0..10_000) |_| {
+        send_ended = sender.done.load(.acquire);
+        if (send_ended) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    if (!send_ended) {
+        // Unblock the sender so a failing run ends instead of hanging.
+        client.close(io);
+        client_open = false;
+    }
+    thread.join();
+
+    try std.testing.expectEqual(@as(usize, 1), reaped);
+    try std.testing.expect(send_ended);
+    try std.testing.expectEqual(@as(?std.Io.Writer.Error, error.WriteFailed), sender.result);
+    try std.testing.expectEqual(@as(u64, 0), s.transfer_wait.load(.acquire));
 }
 
 test "cancelAbandonedQueries cancels only an armed statement whose client is gone" {

@@ -1132,6 +1132,73 @@ test "pg wire: a write keeps running after its client disconnects" {
     if (sctx.err) |e| return e;
 }
 
+/// A result far larger than loopback socket buffers, so a client that never
+/// reads it leaves the server's send blocked.
+const unread_result_query = "SELECT id, repeat('x', 8192) AS pad FROM t";
+
+/// Reaps with a short write deadline until the stalled send is ended.
+fn reapStalledWrite(registry: *thindb.ConnectionRegistry, io: std.Io) !usize {
+    for (0..3000) |_| {
+        const reaped = registry.reapStalledTransfers(io, thindb.conn_registry.nowMs(io), .{ .read_ms = 0, .write_ms = 200 });
+        if (reaped != 0) return reaped;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    return 0;
+}
+
+fn connectionsDrainWithin(registry: *thindb.ConnectionRegistry, io: std.Io, ms: usize) !bool {
+    for (0..ms) |_| {
+        if (registry.count() == 0) return true;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    return false;
+}
+
+test "pg wire: a client that stops reading its result hits the write deadline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    var probe: slow_probe.SlowProbe = .{ .io = io };
+    try slow_probe.seed(catalog, &probe);
+
+    var registry = thindb.ConnectionRegistry.init(allocator);
+    defer registry.deinit();
+
+    const port: u16 = test_port_base + 110;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    server.registry = &registry;
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    var server_joined = false;
+    defer if (!server_joined) t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    // Runs before the join: a failing run's blocked send ends with the reset.
+    defer client.close();
+    try client.completeStartup("postgres", null);
+    try client.sendQuery(unread_result_query);
+
+    try std.testing.expectEqual(@as(usize, 1), try reapStalledWrite(&registry, io));
+    // The statement fails, and the connection closes and unregisters.
+    try std.testing.expect(try connectionsDrainWithin(&registry, io, 10_000));
+    t.join();
+    server_joined = true;
+    if (sctx.err) |e| return e;
+
+    // Nothing of the statement is left holding the catalog gate.
+    const lease = try catalog.acquireStatement(true);
+    lease.release();
+}
+
 test "pg wire: pg_stat_activity finds a running query and pg_terminate_backend closes it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -167,7 +167,14 @@ pub const Table = struct {
 
     /// Serializes compaction against itself (background sweep vs. explicit
     /// COMPACT). Held for a whole compaction; does NOT block scans/inserts.
+    /// A background merge holds no statement lease, so this lock alone keeps
+    /// its table alive: every path that frees or rewrites the table takes it
+    /// first, through `lockCompactPreempting`.
     compact_lock: Io.Mutex = .init,
+
+    /// How many callers of `lockCompactPreempting` are waiting. A background
+    /// merge polls it and abandons itself when it reads nonzero.
+    merge_preempt: std.atomic.Value(u32) = .init(0),
 
     /// Monotonic source of new segment IDs. Initialized to `max(id)+1` at
     /// open and bumped atomically on every segment creation (flush AND
@@ -1226,7 +1233,7 @@ pub const Table = struct {
     pub fn truncate(self: *Table) !void {
         const statement_lease = try self.acquireStatement();
         defer if (statement_lease) |lease| lease.release();
-        self.compact_lock.lockUncancelable(self.io);
+        self.lockCompactPreempting();
         defer self.compact_lock.unlock(self.io);
         self.ddl_lock.lockUncancelable(self.io);
         defer self.ddl_lock.unlock(self.io);
@@ -1256,6 +1263,20 @@ pub const Table = struct {
         // Keep IDs monotonic while old files may remain queued for deletion.
         try self.replaceWal();
         for (previous.segments.items) |entry| try self.deleteSegmentFiles(entry.segment_id);
+    }
+
+    /// Take `compact_lock` for a path that frees or rewrites the table: DROP,
+    /// ALTER, RENAME, TRUNCATE, XA COMMIT and schema teardown. Those usually
+    /// hold the catalog gate exclusively, which queues every new statement, so
+    /// they must not wait out a background merge that can run for minutes
+    /// (#87). The merge sees the request between steps, and also while it
+    /// waits to commit, deletes what it wrote and releases the lock; its
+    /// segments stay for a later sweep.
+    pub fn lockCompactPreempting(self: *Table) void {
+        _ = self.merge_preempt.fetchAdd(1, .acq_rel);
+        defer _ = self.merge_preempt.fetchSub(1, .acq_rel);
+        self.ddl_lock.wakeTimedWriters(self.io);
+        self.compact_lock.lockUncancelable(self.io);
     }
 
     /// Merge all segments into a single new segment. Drops tombstoned rows.

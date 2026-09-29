@@ -658,57 +658,6 @@ fn profilePhaseName(phase: ProfilePhase) []const u8 {
 /// net_read_timeout reaper compares against (cmd/server.zig).
 const nowMs = conn_registry.nowMs;
 
-// ---------------------------------------------------------------------------
-// Guarded socket writes (#164): every send on a connection's stream writer is
-// bracketed with a transfer-wait mark so the reaper can bound a wedged
-// response write (net_write_timeout — a stuck send otherwise hangs until the
-// client gives up, exactly the failure class a server must bound itself).
-// Interposing at the drain vtable catches every send, including implicit
-// drains when a large result set overflows the write buffer. Threadlocal is
-// safe here because each connection owns a dedicated thread for its whole
-// lifetime.
-// ---------------------------------------------------------------------------
-
-const WriteGuard = struct { state: *ConnectionState, io: Io };
-threadlocal var tl_write_guard: ?WriteGuard = null;
-
-/// The stream writer's original vtable — one static value for every
-/// `Io.net.Stream.Writer`, captured at first interpose. Atomic only to
-/// keep the cross-thread publication defined; all stores write the same
-/// pointer.
-var orig_stream_writer_vtable = std.atomic.Value(?*const Io.Writer.VTable).init(null);
-
-const guarded_writer_vtable: Io.Writer.VTable = .{
-    .drain = guardedDrain,
-    .sendFile = guardedSendFile,
-};
-
-fn interposeWriteGuard(w: *Io.Writer, state: *ConnectionState, io: Io) void {
-    orig_stream_writer_vtable.store(w.vtable, .release);
-    w.vtable = &guarded_writer_vtable;
-    tl_write_guard = .{ .state = state, .io = io };
-}
-
-fn guardedDrain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-    const orig = orig_stream_writer_vtable.load(.acquire).?;
-    if (tl_write_guard) |g| {
-        g.state.beginWrite(nowMs(g.io));
-        defer g.state.endTransfer();
-        return orig.drain(w, data, splat);
-    }
-    return orig.drain(w, data, splat);
-}
-
-fn guardedSendFile(w: *Io.Writer, file_reader: *std.Io.File.Reader, limit: std.Io.Limit) Io.Writer.FileError!usize {
-    const orig = orig_stream_writer_vtable.load(.acquire).?;
-    if (tl_write_guard) |g| {
-        g.state.beginWrite(nowMs(g.io));
-        defer g.state.endTransfer();
-        return orig.sendFile(w, file_reader, limit);
-    }
-    return orig.sendFile(w, file_reader, limit);
-}
-
 fn classifySqlKind(op: ir.Op) SqlKind {
     return switch (std.meta.activeTag(op)) {
         .scan,
@@ -745,8 +694,6 @@ fn handleConnection(
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
-    var writer = stream.writer(io, &write_buf);
-    const w = &writer.interface;
     const r = &reader.interface;
 
     var session = try SessionState.init(allocator, catalog, connection_id);
@@ -762,13 +709,13 @@ fn handleConnection(
     var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
     // Arm the reaper BEFORE register publishes the state (#164): a
     // guarded read or write that stalls past its timeout gets the
-    // socket shut down, which completes the wedged operation and lets
+    // connection aborted, which fails the wedged operation and lets
     // this thread exit through the normal error path.
     conn_state.reap_socket = stream.socket.handle;
     var host_buf: [64]u8 = undefined;
     conn_state.setPeer(std.fmt.bufPrint(&host_buf, "{f}", .{stream.socket.address}) catch "", nowMs(io));
-    interposeWriteGuard(w, &conn_state, io);
-    defer tl_write_guard = null;
+    var writer: conn_registry.GuardedStreamWriter = .init(stream, io, &write_buf, &conn_state);
+    const w = writer.interface();
     if (registry) |reg| {
         try reg.register(&conn_state);
     }
