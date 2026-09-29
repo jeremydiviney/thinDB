@@ -432,6 +432,9 @@ pub const AggregateSpec = struct {
     // the running count slot. False/0 for every other aggregate.
     is_distinct: bool = false,
     distinct_state_index: u16 = 0,
+    // COUNT(DISTINCT) over a string: the input is
+    // `string_aggregate_inputs[str_input_index]`, not a numeric column.
+    distinct_str: bool = false,
     // SUM/AVG over a 64-bit integer input: i128 accumulation across two
     // consecutive slots (lo at state_index-1, hi at state_index). Generic
     // per-row program only; fused/weighted kernels decline.
@@ -774,6 +777,7 @@ fn runHarness(
             .str_state_index = agg.str_state_index,
             .is_distinct = agg.is_distinct,
             .distinct_state_index = agg.distinct_state_index,
+            .distinct_str = agg.distinct_str,
             .wide = agg.wide,
             .nullable = agg.nullable,
             .valid_count_index = agg.valid_count_index,

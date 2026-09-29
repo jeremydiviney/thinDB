@@ -38,6 +38,14 @@
 //! composite → same partition in every worker) both rely on. A batch without
 //! the sidecar (tombstoned row group, memtable rows, a scan that declined
 //! coding) falls back to interning each row's bytes into the same dict.
+//!
+//! COUNT(DISTINCT) takes integer, float (canonical bits), and string inputs.
+//! A string input that is itself codeable rides the same dict machinery as a
+//! 32-bit value; any other string keys an exact (gid, bytes) set per
+//! partition, scattered by a hash of (packed key, value digest) so the merge
+//! stays one thread per partition. A derived (row-local) aggregate input is
+//! evaluated per batch by a Compute layered on the worker's scan batch, so the
+//! scan's code sidecars still reach the key columns.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -53,6 +61,8 @@ const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
+const compute = @import("compute.zig");
+const udf_mod = @import("../udf.zig");
 const json_binary = @import("json_binary.zig");
 const Scan = @import("scan.zig").Scan;
 const SiloCore = exec.silo_group_core;
@@ -69,6 +79,7 @@ pub const Request = @import("v2_shape_group_topn.zig").Request;
 
 const GroupTable = group_table.IntKeyMemsetTable(64);
 const DistinctSet = SiloCore.DistinctSet;
+const DistinctStrSet = group_table.DistinctStrSet;
 const CountSlotTable = group_table.CountSlotTable;
 
 const MAX_KEYS: usize = 8;
@@ -86,6 +97,11 @@ const GATE_GROUPS: u64 = 64 * 1024;
 const GATE_STATE_BYTES: u64 = 4 << 20;
 
 const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct };
+
+// How a COUNT(DISTINCT) input becomes membership: an integer's bits, a float's
+// canonical bits, a string's 32-bit global dict code (all three through the
+// composite sets), or a string's bytes (the exact per-partition string sets).
+const DistinctKind = enum { int, float, coded, string };
 
 const GlobalDict = exec.GlobalDict;
 
@@ -111,6 +127,7 @@ const AggPlan = struct {
     // width of its value (composite = key << value_bits | value), and the
     // membership-set tier sized to key_bits + value_bits.
     distinct_index: u16 = 0,
+    distinct_kind: DistinctKind = .int,
     value_bits: u8 = 0,
     tier: DistinctSet.Tier = .u64,
 };
@@ -171,21 +188,27 @@ inline fn distinctPartition(tier: DistinctSet.Tier, key: u128, parts: usize) usi
     return @intCast((@as(u128, h) *% @as(u128, parts)) >> 64);
 }
 
+// Same partition in every worker for a string distinct: the packed key and the
+// value digest together pick it, so equal (key, value) pairs meet in one merge.
+inline fn stringPartition(key: u64, digest: u64, parts: usize) usize {
+    const h = group_table.hashU128((@as(u128, key) << 64) | digest);
+    return @intCast((@as(u128, h) *% @as(u128, parts)) >> 64);
+}
+
 pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Query {
     if (request.group_cols.len == 0 or request.group_cols.len > MAX_KEYS) return null;
     if (request.aggs.len == 0 or request.aggs.len > MAX_AGGS) return null;
-    // HAVING and derived columns stay on the silo path: a derived group key
-    // has no stored stats to gate on, and HAVING needs its predicate machinery.
+    // HAVING stays on the silo path: it needs its predicate machinery.
     if (request.having_filter != null) return null;
-    if (request.derived.len != 0) return null;
 
     // Group keys: real integer-family table columns, plus low-card string
     // columns as 32-bit dict codes (codeability proven on the probe below),
-    // packing into ≤64 bits.
+    // packing into ≤64 bits. A derived key has no stored stats to gate on.
     var parts: [MAX_KEYS]KeyPart = undefined;
     var key_bits: u16 = 0;
     var n_coded: usize = 0;
     for (request.group_cols, 0..) |name, i| {
+        if (findDerived(request.derived, name) != null) return null;
         const typ = columnType(table, name) orelse return null;
         // A NULL key slot's batch value is an encoding artifact (FOR base /
         // dict entry 0); the packed key carries no validity bit, so nullable
@@ -203,6 +226,46 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     }
     if (key_bits > 64) return null;
 
+    // Projected columns: keys plus every aggregate input, a derived input
+    // expanded to the table columns its expression reads.
+    var needed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer needed.deinit(allocator);
+    for (request.group_cols) |name| try addNeeded(allocator, &needed, name);
+    for (request.aggs) |agg| {
+        const nm = agg.col orelse continue;
+        if (!try addInputColumns(allocator, &needed, table, request.derived, nm, request.derived.len)) return null;
+    }
+
+    // A coded key column's batch value is an empty-string placeholder — no
+    // derived input may read it either.
+    if (n_coded > 0) {
+        for (request.derived) |d| {
+            var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer refs.deinit(allocator);
+            try compute.collectColumnRefs(allocator, &refs, d.expr);
+            for (refs.items) |ref| {
+                for (parts[0..request.group_cols.len]) |p| {
+                    if (p.coded and types.columnNameEql(p.name, ref)) return null;
+                }
+            }
+        }
+    }
+
+    // Derived input types come from a probe Compute's output schema; it
+    // fetches no rows.
+    var schema_q: ?Query = null;
+    defer if (schema_q) |*q| q.deinit();
+    var schema: ?[]const Column = null;
+    if (request.derived.len > 0) {
+        const scan = Scan.allocWithProjectionLoc(allocator, table, null, needed.items, false, null) catch return null;
+        var sq = exec.makeQuery(allocator, scan);
+        schema_q = sq.computeWithRegistry(request.derived, request.udf_registry) catch {
+            sq.deinit();
+            return null;
+        };
+        schema = schema_q.?.outputSchema();
+    }
+
     var aggs = try allocator.alloc(AggPlan, request.aggs.len);
     errdefer allocator.free(aggs);
     var n_distinct: u16 = 0;
@@ -210,12 +273,12 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         switch (agg.func) {
             .count => {
                 if (agg.col) |col_name| {
-                    if (columnType(table, col_name) == null) return declineFree(allocator, aggs);
+                    if (inputType(table, schema, col_name) == null) return declineFree(allocator, aggs);
                     // The direct kernels are NULL-blind on inputs: COUNT(col)
                     // would count NULL rows and SUM would fold artifact
                     // payloads. Nullable inputs decline to the silo, which
                     // routes them to the validity-aware legacy aggregate.
-                    if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
+                    if (inputNullable(table, schema, col_name)) return declineFree(allocator, aggs);
                     aggs[i] = .{ .op = .count_col, .input_name = col_name, .output_type = .bigint, .name = agg.as };
                 } else {
                     aggs[i] = .{ .op = .count_star, .input_name = null, .output_type = .bigint, .name = agg.as };
@@ -223,8 +286,8 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             },
             .sum, .avg, .min, .max => {
                 const col_name = agg.col orelse return declineFree(allocator, aggs);
-                const typ = columnType(table, col_name) orelse return declineFree(allocator, aggs);
-                if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
+                const typ = inputType(table, schema, col_name) orelse return declineFree(allocator, aggs);
+                if (inputNullable(table, schema, col_name)) return declineFree(allocator, aggs);
                 if (keyTypeBits(typ) == null and !isFloatType(typ)) return declineFree(allocator, aggs);
                 // Temporal SUM/AVG is a dialect error (validateAggFn) — decline
                 // so the shape errors consistently instead of this lane quietly
@@ -253,16 +316,23 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 };
             },
             .count_distinct => {
+                // Every distinct kernel skips NULL rows, so a nullable input
+                // is fine here: NULL is never a counted value.
                 const col_name = agg.col orelse return declineFree(allocator, aggs);
-                const typ = columnType(table, col_name) orelse return declineFree(allocator, aggs);
-                if (columnNullable(table, col_name)) return declineFree(allocator, aggs);
-                const vbits = keyTypeBits(typ) orelse return declineFree(allocator, aggs);
+                const typ = inputType(table, schema, col_name) orelse return declineFree(allocator, aggs);
+                const kind: DistinctKind = if (isStringType(typ)) .string else if (isFloatType(typ)) .float else .int;
+                const vbits: u8 = switch (kind) {
+                    .int => keyTypeBits(typ) orelse return declineFree(allocator, aggs),
+                    .float => 64,
+                    .coded, .string => 32,
+                };
                 aggs[i] = .{
                     .op = .count_distinct,
                     .input_name = col_name,
                     .output_type = .bigint,
                     .name = agg.as,
                     .distinct_index = n_distinct,
+                    .distinct_kind = kind,
                     .value_bits = vbits,
                     .tier = tierFor(key_bits + vbits),
                 };
@@ -295,70 +365,54 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         if (!found) return declineFree(allocator, aggs);
     }
 
-    // Projected columns: keys + aggregate inputs, de-duplicated.
-    var needed: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer needed.deinit(allocator);
-    for (request.group_cols) |name| try addNeeded(allocator, &needed, name);
-    for (aggs) |a| {
-        if (a.input_name) |nm| try addNeeded(allocator, &needed, nm);
-    }
-
     // Cardinality gate via a probe scan: the saturating product of per-key
     // HLL NDV bounds, clamped to the row-count ceiling, is a sound upper bound
     // for the COMBINED key cardinality. Unknown NDV on any key → silo. The
     // probe also proves the WHERE fuses, so the per-worker opens can't fail.
     var est_groups: u64 = 0;
     {
-        const probe = Scan.allocWithProjectionLoc(allocator, table, null, needed.items, false, null) catch {
-            needed.deinit(allocator);
+        const probe = Scan.allocWithProjectionLoc(allocator, table, null, needed.items, false, null) catch
             return declineFree(allocator, aggs);
-        };
         defer probe.deinit();
         if (request.where_filter) |w| {
             const fused = probe.tryFuseFilter(w) catch false;
-            if (!fused) {
-                needed.deinit(allocator);
-                return declineFree(allocator, aggs);
-            }
+            if (!fused) return declineFree(allocator, aggs);
         }
         // String keys must be codeable (non-nullable, flushed, exact NDV under
         // the dict-code cap) — otherwise the silo's hash path handles them.
         for (parts[0..request.group_cols.len]) |p| {
-            if (p.coded and !probe.canCodeColumn(p.name)) {
-                needed.deinit(allocator);
-                return declineFree(allocator, aggs);
-            }
+            if (p.coded and !probe.canCodeColumn(p.name)) return declineFree(allocator, aggs);
+        }
+        // A string distinct input that is a codeable table column read by no
+        // other input folds as its 32-bit dict code — no bytes materialize.
+        for (aggs) |*a| {
+            if (a.op != .count_distinct or a.distinct_kind != .string) continue;
+            const nm = a.input_name.?;
+            if (findDerived(request.derived, nm) != null) continue;
+            if (!try readOnlyBy(allocator, request.derived, aggs, a, nm)) continue;
+            if (!probe.canCodeColumn(nm)) continue;
+            a.distinct_kind = .coded;
+            a.tier = tierFor(key_bits + a.value_bits);
         }
         const st = probe.stats();
-        const schema = probe.outputSchema();
+        const probe_schema = probe.outputSchema();
         var product: u64 = 1;
         for (request.group_cols) |name| {
-            const idx = types.findColumn(schema, name) orelse {
-                needed.deinit(allocator);
-                return declineFree(allocator, aggs);
-            };
-            if (idx >= st.column_stats.len) {
-                needed.deinit(allocator);
-                return declineFree(allocator, aggs);
-            }
+            const idx = types.findColumn(probe_schema, name) orelse return declineFree(allocator, aggs);
+            if (idx >= st.column_stats.len) return declineFree(allocator, aggs);
             switch (st.column_stats[idx].ndv) {
                 .exact => |n| product *|= @max(n, 1),
-                .unknown => {
-                    needed.deinit(allocator);
-                    return declineFree(allocator, aggs);
-                },
+                .unknown => return declineFree(allocator, aggs),
             }
         }
         est_groups = @max(@min(product, @max(st.upper_rows, 1)), 1);
     }
     const state_stride: u64 = 8 + @as(u64, request.aggs.len) * 24;
-    if (est_groups > GATE_GROUPS or est_groups * state_stride > GATE_STATE_BYTES) {
-        needed.deinit(allocator);
-        return declineFree(allocator, aggs);
-    }
+    if (est_groups > GATE_GROUPS or est_groups * state_stride > GATE_STATE_BYTES) return declineFree(allocator, aggs);
 
-    // One shared dict per coded key column, owned by the operator: every
-    // worker interns into it, so codes are comparable across workers.
+    // One shared dict per coded key column and per coded distinct input,
+    // owned by the operator: every worker interns into it, so codes are
+    // comparable across workers.
     const dicts = try allocator.alloc(?*GlobalDict, request.group_cols.len);
     errdefer allocator.free(dicts);
     @memset(dicts, null);
@@ -372,12 +426,25 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         d.* = .{};
         dicts[i] = d;
     }
+    const distinct_dicts = try allocator.alloc(?*GlobalDict, aggs.len);
+    errdefer allocator.free(distinct_dicts);
+    @memset(distinct_dicts, null);
+    errdefer for (distinct_dicts) |md| if (md) |d| {
+        d.deinit(allocator);
+        allocator.destroy(d);
+    };
+    for (aggs, 0..) |a, i| {
+        if (a.op != .count_distinct or a.distinct_kind != .coded) continue;
+        const d = try allocator.create(GlobalDict);
+        d.* = .{};
+        distinct_dicts[i] = d;
+    }
 
-    const needed_owned = try needed.toOwnedSlice(allocator);
+    const needed_owned = try allocator.dupe([]const u8, needed.items);
     errdefer allocator.free(needed_owned);
     const op = try allocator.create(LowCardGroup);
     errdefer allocator.destroy(op);
-    op.* = try LowCardGroup.init(allocator, table, request, parts, aggs, n_distinct, @intCast(key_bits), est_groups, needed_owned, dicts);
+    op.* = try LowCardGroup.init(allocator, table, request, parts, aggs, n_distinct, @intCast(key_bits), est_groups, needed_owned, dicts, distinct_dicts);
     return exec.makeQuery(allocator, op);
 }
 
@@ -393,13 +460,99 @@ fn addNeeded(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const u8), 
     try needed.append(allocator, name);
 }
 
-// Scan + driver pair per worker; no Compute layer (derived shapes decline).
+fn findDerived(derived: []const compute.Derived, name: []const u8) ?compute.Derived {
+    for (derived) |d| if (types.columnNameEql(d.name, name)) return d;
+    return null;
+}
+
+// Add the table columns behind input `name`: itself, or — for a derived
+// input — every column its expression reads, through derived-on-derived
+// references (`depth` bounds that walk by the derived list's length). False
+// when a name resolves to neither.
+fn addInputColumns(
+    allocator: Allocator,
+    needed: *std.ArrayListUnmanaged([]const u8),
+    table: *api.Table,
+    derived: []const compute.Derived,
+    name: []const u8,
+    depth: usize,
+) !bool {
+    if (findDerived(derived, name)) |d| {
+        if (depth == 0) return false;
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer refs.deinit(allocator);
+        try compute.collectColumnRefs(allocator, &refs, d.expr);
+        for (refs.items) |ref| {
+            if (types.columnNameEql(ref, name)) {
+                if (columnType(table, ref) == null) return false;
+                try addNeeded(allocator, needed, ref);
+                continue;
+            }
+            if (!try addInputColumns(allocator, needed, table, derived, ref, depth - 1)) return false;
+        }
+        return true;
+    }
+    if (columnType(table, name) == null) return false;
+    try addNeeded(allocator, needed, name);
+    return true;
+}
+
+// Whether distinct aggregate `self` is the only reader of column `name`:
+// no other aggregate input names it and no derived expression reads it.
+fn readOnlyBy(allocator: Allocator, derived: []const compute.Derived, aggs: []const AggPlan, self: *const AggPlan, name: []const u8) !bool {
+    for (aggs) |*a| {
+        if (a == self) continue;
+        const nm = a.input_name orelse continue;
+        if (types.columnNameEql(nm, name)) return false;
+    }
+    for (derived) |d| {
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer refs.deinit(allocator);
+        try compute.collectColumnRefs(allocator, &refs, d.expr);
+        for (refs.items) |ref| {
+            if (types.columnNameEql(ref, name)) return false;
+        }
+    }
+    return true;
+}
+
+fn inputType(table: *api.Table, schema: ?[]const Column, name: []const u8) ?Type {
+    if (schema) |s| {
+        if (types.findColumn(s, name)) |i| return s[i].type;
+    }
+    return columnType(table, name);
+}
+
+fn inputNullable(table: *api.Table, schema: ?[]const Column, name: []const u8) bool {
+    if (schema) |s| {
+        if (types.findColumn(s, name)) |i| return s[i].nullable;
+    }
+    return columnNullable(table, name);
+}
+
+// Scan + driver pair per worker. Derived aggregate inputs evaluate in a
+// Compute layered on the scan and fed the scan's own batch (`evalBatch`), so
+// the key columns keep reading the scan batch — whose code sidecars a
+// Compute's output batch doesn't carry.
 const ScanSource = struct {
     scan: *Scan,
     drive: Query,
+    // Owns `drive` when present.
+    derive: ?Query = null,
 
-    fn next(self: *ScanSource) !?Batch {
-        return self.drive.next();
+    const Pair = struct {
+        // Keys and coded inputs read this batch.
+        scan: Batch,
+        // Every other aggregate input reads this one: the scan batch with the
+        // derived columns added by name.
+        aggs: Batch,
+    };
+
+    fn next(self: *ScanSource) !?Pair {
+        const b = (try self.drive.next()) orelse return null;
+        const d = self.derive orelse return .{ .scan = b, .aggs = b };
+        const c = exec.queryAs(compute.Compute, d) orelse return error.UnsupportedQueryShape;
+        return .{ .scan = b, .aggs = try c.evalBatch(b) };
     }
 
     fn resetRange(self: *ScanSource, start_seg: usize, start_rg: usize, end_seg: usize, end_rg: usize, scan_memtable: bool) void {
@@ -407,7 +560,7 @@ const ScanSource = struct {
     }
 
     fn deinit(self: *ScanSource) void {
-        self.drive.deinit();
+        if (self.derive) |*d| d.deinit() else self.drive.deinit();
     }
 };
 
@@ -419,9 +572,14 @@ fn openScanSource(
     snap: ?Scan.Snapshot,
     parts: []const KeyPart,
     dicts: []const ?*GlobalDict,
+    aggs: []const AggPlan,
+    distinct_dicts: []const ?*GlobalDict,
+    derived: []const compute.Derived,
+    udf_registry: ?*const udf_mod.UdfRegistry,
 ) !ScanSource {
     const scan = try Scan.allocWithProjectionLoc(allocator, table, null, needed, false, snap);
-    errdefer scan.deinit();
+    var drive = exec.makeQuery(allocator, scan);
+    errdefer drive.deinit();
     if (where_filter) |w| {
         // tryBuild proved fusibility on the probe scan; never run unfiltered.
         if (!try scan.tryFuseFilter(w)) return error.UnsupportedQueryShape;
@@ -431,7 +589,12 @@ fn openScanSource(
     for (parts, 0..) |p, i| {
         if (p.coded) _ = scan.setDictCodeColumn(p.name, dicts[i].?);
     }
-    return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan) };
+    for (aggs, 0..) |a, i| {
+        if (a.op == .count_distinct and a.distinct_kind == .coded) _ = scan.setDictCodeColumn(a.input_name.?, distinct_dicts[i].?);
+    }
+    if (derived.len == 0) return .{ .scan = scan, .drive = drive };
+    const derive = try drive.computeWithRegistry(derived, udf_registry);
+    return .{ .scan = scan, .drive = drive, .derive = derive };
 }
 
 // One worker's private aggregation state: a packed-key group table plus
@@ -443,31 +606,46 @@ const WState = struct {
     counts: std.ArrayListUnmanaged(u64) = .empty,
     slots: std.ArrayListUnmanaged(i128) = .empty,
     ns: std.ArrayListUnmanaged(u64) = .empty,
-    // n_distinct × parts membership sets, indexed [d * parts + partition].
+    // n_distinct × parts membership sets, indexed [d * parts + partition]:
+    // `dsets` for int/float/coded inputs, `ssets` for string inputs.
     dsets: []DistinctSet = &.{},
+    ssets: []DistinctStrSet = &.{},
+    // gid → merged gid, filled after the scalar merge for the string merge.
+    mgid_of: []u32 = &.{},
     // Per-batch scratch (reused): each row's packed key and resolved gid, so
-    // the per-aggregate kernels run over dense arrays instead of re-probing.
+    // the per-aggregate kernels run over dense arrays instead of re-probing;
+    // `codes_scratch` holds a coded input's codes when a batch lacks the sidecar.
     keys_scratch: std.ArrayListUnmanaged(u64) = .empty,
     gids_scratch: std.ArrayListUnmanaged(u32) = .empty,
+    codes_scratch: std.ArrayListUnmanaged(u32) = .empty,
 
     fn init(allocator: Allocator, expected_groups: usize, aggs: []const AggPlan, n_distinct: u16, dop_parts: usize) !WState {
         var self: WState = .{ .table = try GroupTable.init(allocator, expected_groups) };
         errdefer self.table.deinit(allocator);
-        const dsets = try allocator.alloc(DistinctSet, @as(usize, n_distinct) * dop_parts);
+        const n_sets = @as(usize, n_distinct) * dop_parts;
+        const dsets = try allocator.alloc(DistinctSet, n_sets);
+        errdefer allocator.free(dsets);
         @memset(dsets, .{});
         for (aggs) |a| {
             if (a.op != .count_distinct) continue;
             for (dsets[@as(usize, a.distinct_index) * dop_parts ..][0..dop_parts]) |*d| d.configure(a.tier);
         }
+        const ssets = try allocator.alloc(DistinctStrSet, n_sets);
+        @memset(ssets, .{});
         self.dsets = dsets;
+        self.ssets = ssets;
         return self;
     }
 
     fn deinit(self: *WState, allocator: Allocator) void {
         for (self.dsets) |*d| d.deinit(allocator);
         if (self.dsets.len > 0) allocator.free(self.dsets);
+        for (self.ssets) |*d| d.deinit(allocator);
+        if (self.ssets.len > 0) allocator.free(self.ssets);
+        if (self.mgid_of.len > 0) allocator.free(self.mgid_of);
         self.keys_scratch.deinit(allocator);
         self.gids_scratch.deinit(allocator);
+        self.codes_scratch.deinit(allocator);
         self.counts.deinit(allocator);
         self.slots.deinit(allocator);
         self.ns.deinit(allocator);
@@ -482,6 +660,7 @@ const Worker = struct {
     state: WState,
     parts: []const KeyPart,
     dicts: []const ?*GlobalDict,
+    distinct_dicts: []const ?*GlobalDict,
     aggs: []const AggPlan,
     key_bits: u8,
     dop_parts: usize,
@@ -538,17 +717,22 @@ fn workerRun(w: *Worker) !void {
 }
 
 fn driveTile(w: *Worker, have_resolved: *bool) !void {
-    while (try w.source.next()) |batch| {
+    while (try w.source.next()) |pair| {
         if (!have_resolved.*) {
             for (w.parts, 0..) |p, i| {
-                w.resolved_keys[i] = batch.columnIndex(p.name) orelse return error.UnsupportedQueryShape;
+                w.resolved_keys[i] = pair.scan.columnIndex(p.name) orelse return error.UnsupportedQueryShape;
             }
             for (w.aggs, 0..) |a, i| {
-                w.resolved_aggs[i] = if (a.input_name) |nm| (batch.columnIndex(nm) orelse return error.UnsupportedQueryShape) else null;
+                const nm = a.input_name orelse {
+                    w.resolved_aggs[i] = null;
+                    continue;
+                };
+                const src = if (a.op == .count_distinct and a.distinct_kind == .coded) pair.scan else pair.aggs;
+                w.resolved_aggs[i] = src.columnIndex(nm) orelse return error.UnsupportedQueryShape;
             }
             have_resolved.* = true;
         }
-        try foldBatch(w, batch);
+        try foldBatch(w, pair);
     }
 }
 
@@ -598,7 +782,8 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
 // packed keys, then each aggregate runs ONE specialized kernel over the dense
 // gid array — the op dispatch and the ValueView tag switch both hoisted out
 // of the row loops.
-fn foldBatch(w: *Worker, batch: Batch) !void {
+fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
+    const batch = pair.scan;
     const n = batch.row_count;
     if (n == 0) return;
     const st = &w.state;
@@ -647,7 +832,9 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
     const slots = st.slots.items;
     for (w.aggs, 0..) |a, i| {
         if (a.op == .count_star) continue;
-        const view = batch.values[w.resolved_aggs[i].?];
+        const coded = a.op == .count_distinct and a.distinct_kind == .coded;
+        const ci = w.resolved_aggs[i].?;
+        const view = if (coded) batch.values[ci] else pair.aggs.values[ci];
         switch (a.op) {
             .count_star => unreachable,
             .count_col => foldCountCol(view, gids, ns, n_aggs, i),
@@ -663,15 +850,14 @@ fn foldBatch(w: *Worker, batch: Batch) !void {
                 foldExtremeFloat(false, view, gids, ns, slots, n_aggs, i)
             else
                 foldExtremeInt(false, view, gids, ns, slots, n_aggs, i),
-            .count_distinct => try foldDistinctKernel(
-                allocator,
-                view,
-                keys,
-                st.dsets[@as(usize, a.distinct_index) * w.dop_parts ..][0..w.dop_parts],
-                w.dop_parts,
-                a.value_bits,
-                a.tier,
-            ),
+            .count_distinct => {
+                const at = @as(usize, a.distinct_index) * w.dop_parts;
+                switch (a.distinct_kind) {
+                    .int, .float => try foldDistinctKernel(allocator, view, keys, st.dsets[at..][0..w.dop_parts], w.dop_parts, a.value_bits, a.tier),
+                    .coded => try foldDistinctCoded(w, view, if (batch.coded) |sc| sc[ci] else null, i, keys, st.dsets[at..][0..w.dop_parts], a.tier),
+                    .string => try foldDistinctStrKernel(allocator, view, keys, gids, st.ssets[at..][0..w.dop_parts]),
+                }
+            },
         }
     }
 }
@@ -816,34 +1002,134 @@ fn foldDistinctKernel(
     tier: DistinctSet.Tier,
 ) !void {
     switch (view.data) {
-        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
-            const n = keys.len;
-            var prev_comp: u128 = 0;
-            var have_prev = false;
-            var r: usize = 0;
-            while (r < n) : (r += 1) {
-                if (!view.isValid(r)) continue;
-                const pf = r + PREFETCH_DIST_DISTINCT;
-                if (pf < n and view.isValid(pf)) {
-                    const c_pf = compositeOf(keys[pf], @as(i64, s[pf]), value_bits);
-                    dsets[distinctPartition(tier, c_pf, parts_n)].prefetchKey(c_pf);
-                }
-                const comp = compositeOf(keys[r], @as(i64, s[r]), value_bits);
-                // Physical order clusters repeated (key, value) pairs into
-                // adjacent runs; an identical composite can't be new — skip
-                // the cache-missing set probe.
-                if (have_prev and comp == prev_comp) continue;
-                prev_comp = comp;
-                have_prev = true;
-                _ = try dsets[distinctPartition(tier, comp, parts_n)].insertIsNew(allocator, comp);
-            }
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64, .float, .double => |s| {
+            try foldDistinctValues(@TypeOf(s[0]), allocator, s, view, keys, dsets, parts_n, value_bits, tier);
         },
         else => {},
     }
 }
 
-inline fn compositeOf(key: u64, value: i64, value_bits: u8) u128 {
-    const raw: u64 = @bitCast(value);
+fn foldDistinctValues(
+    comptime T: type,
+    allocator: Allocator,
+    vals: []const T,
+    view: ColumnView,
+    keys: []const u64,
+    dsets: []DistinctSet,
+    parts_n: usize,
+    value_bits: u8,
+    tier: DistinctSet.Tier,
+) !void {
+    const n = keys.len;
+    var prev_comp: u128 = 0;
+    var have_prev = false;
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        const pf = r + PREFETCH_DIST_DISTINCT;
+        if (pf < n and view.isValid(pf)) {
+            const c_pf = compositeOf(keys[pf], distinctValueBits(T, vals[pf]), value_bits);
+            dsets[distinctPartition(tier, c_pf, parts_n)].prefetchKey(c_pf);
+        }
+        const comp = compositeOf(keys[r], distinctValueBits(T, vals[r]), value_bits);
+        // Physical order clusters repeated (key, value) pairs into
+        // adjacent runs; an identical composite can't be new — skip
+        // the cache-missing set probe.
+        if (have_prev and comp == prev_comp) continue;
+        prev_comp = comp;
+        have_prev = true;
+        _ = try dsets[distinctPartition(tier, comp, parts_n)].insertIsNew(allocator, comp);
+    }
+}
+
+// A float contributes its canonical bits (-0.0 and 0.0 are one value, and so
+// is every NaN — #82), widened to f64 so both float widths share one encoding.
+inline fn distinctValueBits(comptime T: type, v: T) u64 {
+    return switch (@typeInfo(T)) {
+        .float => types.canonicalFloatBits(@as(f64, v)),
+        else => @bitCast(@as(i64, v)),
+    };
+}
+
+// A coded string input folds its 32-bit global dict code like an integer
+// value. The scan's code sidecar supplies the codes; a batch without one
+// (tombstoned row group, memtable rows) interns each row's bytes into the same
+// shared dict, so every batch kind agrees on a value's code.
+fn foldDistinctCoded(
+    w: *Worker,
+    view: ColumnView,
+    sidecar: ?exec.CodedColumn,
+    agg_i: usize,
+    keys: []const u64,
+    dsets: []DistinctSet,
+    tier: DistinctSet.Tier,
+) !void {
+    const n = keys.len;
+    const codes: []const u32 = if (sidecar) |cc| cc.codes[0..n] else blk: {
+        const dict = w.distinct_dicts[agg_i].?;
+        const sv = switch (view.data) {
+            .varchar, .string, .char, .json => |s| s,
+            else => return error.UnsupportedQueryShape,
+        };
+        try w.state.codes_scratch.resize(w.allocator, n);
+        const out = w.state.codes_scratch.items[0..n];
+        for (out, 0..) |*c, r| {
+            c.* = if (view.isValid(r)) try dict.intern(w.allocator, sv.rowBytes(r)) else 0;
+        }
+        break :blk out;
+    };
+    try foldDistinctValues(u32, w.allocator, codes, view, keys, dsets, w.dop_parts, 32, tier);
+}
+
+// String COUNT(DISTINCT) by bytes: each (worker gid, value) pair lands in the
+// exact string set of the partition its (packed key, digest) hashes to. A
+// row's digest is computed once, PREFETCH_DIST_DISTINCT rows ahead of its
+// insert, and parked in a ring so the prefetch and the insert share it. NULL
+// rows never count; an adjacent repeat of the same (gid, bytes) skips the
+// probe.
+fn foldDistinctStrKernel(
+    allocator: Allocator,
+    view: ColumnView,
+    keys: []const u64,
+    gids: []const u32,
+    ssets: []DistinctStrSet,
+) !void {
+    const sv = switch (view.data) {
+        .varchar, .string, .char, .json => |s| s,
+        else => return error.UnsupportedQueryShape,
+    };
+    const parts_n = ssets.len;
+    const n = keys.len;
+    const RING = 32;
+    comptime std.debug.assert(PREFETCH_DIST_DISTINCT < RING);
+    var ring: [RING]u64 = undefined;
+    for (0..@min(n, PREFETCH_DIST_DISTINCT)) |r| ring[r % RING] = group_table.distinctStrDigest(sv.rowBytes(r));
+    var prev_gid: u32 = 0;
+    var prev_bytes: ?[]const u8 = null;
+    var r: usize = 0;
+    while (r < n) : (r += 1) {
+        const pf = r + PREFETCH_DIST_DISTINCT;
+        if (pf < n) {
+            const d_pf = group_table.distinctStrDigest(sv.rowBytes(pf));
+            ring[pf % RING] = d_pf;
+            if (view.isValid(pf)) ssets[stringPartition(keys[pf], d_pf, parts_n)].prefetch(gids[pf], d_pf);
+        }
+        if (!view.isValid(r)) continue;
+        const bytes = sv.rowBytes(r);
+        const gid = gids[r];
+        if (prev_bytes) |pb| {
+            if (gid == prev_gid and std.mem.eql(u8, pb, bytes)) continue;
+        }
+        prev_gid = gid;
+        prev_bytes = bytes;
+        const digest = ring[r % RING];
+        const set = &ssets[stringPartition(keys[r], digest, parts_n)];
+        try set.ensureFor(allocator, 1);
+        _ = try set.insertNew(allocator, gid, digest, bytes);
+    }
+}
+
+inline fn compositeOf(key: u64, raw: u64, value_bits: u8) u128 {
     return (@as(u128, key) << @intCast(value_bits)) | truncBits(raw, value_bits);
 }
 
@@ -868,6 +1154,9 @@ const PartMergeJob = struct {
     allocator: Allocator,
     cpu: ?usize,
     counts: []CountSlotTable,
+    // merged gid → packed key: a string set holds worker gids, which each
+    // worker's `mgid_of` lifts to merged gids before the union.
+    merged_keys: []const u64,
     err: ?anyerror = null,
 };
 
@@ -884,6 +1173,10 @@ fn partMergeRun(job: *PartMergeJob) !void {
     for (job.aggs) |a| {
         if (a.op != .count_distinct) continue;
         const d: usize = a.distinct_index;
+        if (a.distinct_kind == .string) {
+            try mergeStrPartition(job, d);
+            continue;
+        }
         var out: DistinctSet = .{};
         out.configure(a.tier);
         defer out.deinit(job.allocator);
@@ -934,6 +1227,53 @@ fn mergeSetInto(allocator: Allocator, out: *DistinctSet, src: *const DistinctSet
     }
 }
 
+// A (group, string) pair hashes to the same partition in every worker, so the
+// union runs per partition. A partition only one worker populated is already
+// duplicate-free (a worker's gids map to distinct merged groups): its entries
+// count straight through without re-hashing their bytes.
+fn mergeStrPartition(job: *PartMergeJob, d: usize) !void {
+    const allocator = job.allocator;
+    const cnt = &job.counts[d];
+    var total: usize = 0;
+    var sources: usize = 0;
+    for (job.workers) |*w| {
+        const c = w.state.ssets[d * job.dop_parts + job.part].count();
+        total += c;
+        sources += @intFromBool(c != 0);
+    }
+    if (total == 0) return;
+    if (sources == 1) {
+        for (job.workers) |*w| {
+            const src = &w.state.ssets[d * job.dop_parts + job.part];
+            if (src.count() == 0) continue;
+            try cnt.ensureFor(allocator, @min(src.count(), job.merged_keys.len));
+            for (src.slots, 0..) |s, i| {
+                if (!DistinctStrSet.occupied(s)) continue;
+                if (i % 4096 == 0) try exec.memory.checkCancelled(allocator);
+                cnt.insert(job.merged_keys[w.state.mgid_of[s.gid]]);
+            }
+        }
+        return;
+    }
+    var out: DistinctStrSet = .{};
+    defer out.deinit(allocator);
+    try out.ensureFor(allocator, total);
+    for (job.workers) |*w| {
+        const src = &w.state.ssets[d * job.dop_parts + job.part];
+        if (src.count() == 0) continue;
+        var buf: [DistinctStrSet.INLINE_MAX]u8 = undefined;
+        for (src.slots, 0..) |s, i| {
+            if (!DistinctStrSet.occupied(s)) continue;
+            if (i % 4096 == 0) try exec.memory.checkCancelled(allocator);
+            const mgid = w.state.mgid_of[s.gid];
+            if (try out.insertNew(allocator, mgid, s.digest, src.bytesOf(s, &buf))) {
+                try cnt.ensureFor(allocator, 1);
+                cnt.insert(job.merged_keys[mgid]);
+            }
+        }
+    }
+}
+
 inline fn mergeOne(allocator: Allocator, out: *DistinctSet, composite: u128, cnt: *CountSlotTable, value_bits: u8) !void {
     if (out.insertNewBatch(composite)) {
         try cnt.ensureFor(allocator, 1);
@@ -972,7 +1312,14 @@ const LowCardGroup = struct {
     // Per-key-part shared global dict (null for non-coded parts). Owned.
     dicts: []?*GlobalDict,
     aggs: []AggPlan,
+    // Per-aggregate shared dict of a coded COUNT(DISTINCT) input (null for
+    // every other aggregate). Owned.
+    distinct_dicts: []?*GlobalDict,
     n_distinct: u16,
+    // Borrowed from the request: row-local aggregate inputs a Compute layered
+    // on each worker's scan evaluates.
+    derived: []const compute.Derived,
+    udf_registry: ?*const udf_mod.UdfRegistry,
     where_filter: ?PredicateExpr,
     order_specs: []const SortSpec,
     limit: usize,
@@ -998,6 +1345,7 @@ const LowCardGroup = struct {
         est_groups: u64,
         needed: []const []const u8,
         dicts: []?*GlobalDict,
+        distinct_dicts: []?*GlobalDict,
     ) !LowCardGroup {
         const n_out = request.group_cols.len + aggs.len;
         const output_schema = try allocator.alloc(Column, n_out);
@@ -1032,7 +1380,10 @@ const LowCardGroup = struct {
             .key_bits = key_bits,
             .dicts = dicts,
             .aggs = aggs,
+            .distinct_dicts = distinct_dicts,
             .n_distinct = n_distinct,
+            .derived = request.derived,
+            .udf_registry = request.udf_registry,
             .where_filter = request.where_filter,
             .order_specs = request.order_specs,
             .limit = request.limit,
@@ -1052,6 +1403,11 @@ const LowCardGroup = struct {
             self.allocator.destroy(d);
         };
         self.allocator.free(self.dicts);
+        for (self.distinct_dicts) |md| if (md) |d| {
+            d.deinit(self.allocator);
+            self.allocator.destroy(d);
+        };
+        self.allocator.free(self.distinct_dicts);
         for (self.output_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
@@ -1077,7 +1433,16 @@ const LowCardGroup = struct {
     }
 
     pub fn explain(self: *LowCardGroup, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        try exec.explainLine(out, allocator, depth, "HashAggregate (V2 lowcard direct: private-fold/partition-merge)");
+        try exec.explainIndent(out, allocator, depth);
+        try out.appendSlice(allocator, "HashAggregate (V2 lowcard direct: private-fold/partition-merge");
+        var sep: []const u8 = "; distinct ";
+        for (self.aggs) |a| {
+            if (a.op != .count_distinct) continue;
+            try out.appendSlice(allocator, sep);
+            try out.appendSlice(allocator, @tagName(a.distinct_kind));
+            sep = ",";
+        }
+        try out.appendSlice(allocator, ")\n");
         try exec.explainIndent(out, allocator, depth + 1);
         try out.appendSlice(allocator, "Scan ");
         try out.appendSlice(allocator, self.table.name);
@@ -1152,7 +1517,19 @@ const LowCardGroup = struct {
 
         var next_rg = std.atomic.Value(usize).init(0);
         for (workers, 0..) |*w, i| {
-            var source = try openScanSource(allocator, table, self.needed, self.where_filter, snap, self.parts[0..self.part_count], self.dicts);
+            var source = try openScanSource(
+                allocator,
+                table,
+                self.needed,
+                self.where_filter,
+                snap,
+                self.parts[0..self.part_count],
+                self.dicts,
+                self.aggs,
+                self.distinct_dicts,
+                self.derived,
+                self.udf_registry,
+            );
             errdefer source.deinit();
             w.* = .{
                 .index = i,
@@ -1161,6 +1538,7 @@ const LowCardGroup = struct {
                 .state = try WState.init(allocator, @intCast(self.est_groups), self.aggs, self.n_distinct, n_workers),
                 .parts = self.parts[0..self.part_count],
                 .dicts = self.dicts,
+                .distinct_dicts = self.distinct_dicts,
                 .aggs = self.aggs,
                 .key_bits = self.key_bits,
                 .dop_parts = n_workers,
@@ -1204,8 +1582,12 @@ const LowCardGroup = struct {
     fn mergeScalars(self: *LowCardGroup, workers: []Worker, merged: *Merged) !void {
         const allocator = self.allocator;
         const n_aggs = self.aggs.len;
+        const lift_gids = for (self.aggs) |a| {
+            if (a.op == .count_distinct and a.distinct_kind == .string) break true;
+        } else false;
         for (workers) |*w| {
             const wst = &w.state;
+            if (lift_gids) wst.mgid_of = try allocator.alloc(u32, wst.counts.items.len);
             for (wst.table.slots) |s| {
                 if (s.gid == group_table.EMPTY) continue;
                 const key: u64 = s.lo;
@@ -1222,6 +1604,7 @@ const LowCardGroup = struct {
                     merged.table.commit(probe.slot, key, mgid);
                 }
                 merged.counts.items[mgid] += wst.counts.items[wgid];
+                if (lift_gids) wst.mgid_of[wgid] = mgid;
                 for (self.aggs, 0..) |a, i| {
                     const w_ns = wst.ns.items[wgid * n_aggs + i];
                     if (w_ns == 0) continue;
@@ -1285,6 +1668,7 @@ const LowCardGroup = struct {
                 .allocator = allocator,
                 .cpu = if (cpus.len == 0) null else cpus[p % cpus.len],
                 .counts = count_tables[p * self.n_distinct ..][0..self.n_distinct],
+                .merged_keys = merged.keys.items,
             };
         }
 

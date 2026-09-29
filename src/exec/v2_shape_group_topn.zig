@@ -49,7 +49,7 @@ const MAX_GROUP_KEYS: usize = 8;
 // the inline ceiling on the transient result row), not a per-group memory cost.
 const MAX_AGGS: usize = 16;
 const MAX_AGG_INPUTS: usize = 16;
-const MAX_STRING_AGG_INPUTS: usize = 2;
+const MAX_STRING_AGG_INPUTS: usize = 4;
 const MAX_STRING_AGG_SLOTS: usize = 2;
 // Mirrors the harness core's MAX_GROUP_CONCAT_SLOTS.
 const MAX_CONCAT_SLOTS: usize = 2;
@@ -123,6 +123,9 @@ const AggregatePlan = struct {
     // in the numeric state_index. Output is a bigint count.
     is_distinct: bool = false,
     distinct_state_index: u16 = 0,
+    // COUNT(DISTINCT) over a string: the input is the staged string column
+    // string_aggregate_inputs[str_input_index] (no numeric input column).
+    distinct_str: bool = false,
     // The input column is nullable: NULL rows skip the fold. For numeric
     // SUM/AVG/MIN/MAX the companion slot `valid_count_index` holds the
     // group's non-null input count (AVG denominator, all-NULL → NULL output);
@@ -594,6 +597,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .str_state_index = agg_plan.str_state_index,
             .is_distinct = agg_plan.is_distinct,
             .distinct_state_index = agg_plan.distinct_state_index,
+            .distinct_str = agg_plan.distinct_str,
             .nullable = agg_plan.input_nullable,
             .valid_count_index = agg_plan.valid_count_index,
             .is_concat = agg_plan.is_concat,
@@ -1651,13 +1655,35 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
             .count_distinct => {
                 const col_name = agg.col orelse return traceDecline(request, "count distinct column");
                 const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "count distinct type");
-                // v1 scopes the distinct column to ≤64-bit integers: the value
-                // bit-packs into the (gid,value) composite key losslessly. String
-                // / float / >64-bit distinct columns are declined (not yet wired).
-                const width = intTypeBits(input_type) orelse return traceDecline(request, "count distinct non-integer");
-                if (width > 64) return traceDecline(request, "count distinct width");
                 if (next_distinct_state_index >= MAX_DISTINCT_AGG_SLOTS) return traceDecline(request, "count distinct slot count");
                 if (next_numeric_state_index > MAX_AGGS) return traceDecline(request, "aggregate state count");
+                // A string value keys an exact (gid, bytes) set; JSON counts
+                // byte-distinct binary documents, as its GROUP BY groups them.
+                if (isStringKeyType(input_type)) {
+                    const str_input_idx = addStringAggInput(&string_aggregate_inputs, &string_aggregate_input_count, col_name) orelse return traceDecline(request, "count distinct string input");
+                    aggregates[agg_i] = .{
+                        .name = agg.as,
+                        .func = agg.func,
+                        .input_column_index = null,
+                        .input_type = .i64,
+                        .state_index = next_numeric_state_index,
+                        .output_type = aggregate.aggOutputTypeFor(agg, input_type) catch return null,
+                        .is_distinct = true,
+                        .distinct_state_index = next_distinct_state_index,
+                        .distinct_str = true,
+                        .str_input_index = str_input_idx,
+                        .input_nullable = input_nullable,
+                    };
+                    next_numeric_state_index += 1;
+                    next_distinct_state_index += 1;
+                    continue;
+                }
+                // Integers ≤64 bits bit-pack into the (gid, value) composite
+                // losslessly; a float keys by its canonical bits.
+                if (input_type != .float and input_type != .double) {
+                    const width = intTypeBits(input_type) orelse return traceDecline(request, "count distinct input type");
+                    if (width > 64) return traceDecline(request, "count distinct width");
+                }
                 const input_idx = addAggregateInput(table, schema, &aggregate_inputs, &aggregate_input_count, col_name) orelse return traceDecline(request, "count distinct input");
                 aggregates[agg_i] = .{
                     .name = agg.as,

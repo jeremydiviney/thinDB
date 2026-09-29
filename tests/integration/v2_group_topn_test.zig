@@ -1282,3 +1282,389 @@ test "V2 group-topN: nullable and BIGINT aggregates agree at DOP 1 and DOP 4" {
         }
     }
 }
+
+// One (group, value) membership for the grouped COUNT(DISTINCT) reference: a
+// string value in `str`, a numeric one's canonical bits in `num`.
+const RefPair = struct {
+    g: usize,
+    num: u64 = 0,
+    str: []const u8 = "",
+
+    fn lessThan(_: void, a: RefPair, b: RefPair) bool {
+        if (a.g != b.g) return a.g < b.g;
+        switch (std.mem.order(u8, a.str, b.str)) {
+            .lt => return true,
+            .gt => return false,
+            .eq => return a.num < b.num,
+        }
+    }
+
+    fn eql(a: RefPair, b: RefPair) bool {
+        return a.g == b.g and a.num == b.num and std.mem.eql(u8, a.str, b.str);
+    }
+};
+
+fn refDistinctCounts(pairs: []RefPair, counts: []i64) void {
+    @memset(counts, 0);
+    std.mem.sort(RefPair, pairs, {}, RefPair.lessThan);
+    for (pairs, 0..) |p, i| {
+        if (i > 0 and RefPair.eql(pairs[i - 1], p)) continue;
+        counts[p.g] += 1;
+    }
+}
+
+// -0.0 and 0.0 are one value, and so is every NaN (#82).
+fn canonicalDoubleBits(x: f64) u64 {
+    if (std.math.isNan(x)) return 0x7ff8_0000_0000_0000;
+    if (x == 0) return 0;
+    return @bitCast(x);
+}
+
+fn planContains(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, needle: []const u8) !bool {
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    var q = try runSql(allocator, db, explain_sql);
+    defer q.deinit();
+    var found = false;
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            if (std.mem.indexOf(u8, batch.values[0].data.string.rowBytes(i), needle) != null) found = true;
+        }
+    }
+    return found;
+}
+
+const GD_GROUPS = 1009;
+const GdRow = struct { id: i64, g: i32, s: ?[]const u8, c: []const u8, d: ?f64, v: ?i32 };
+
+const GdExpected = struct {
+    n: []i64,
+    ds: []i64,
+    dc: []i64,
+    dd: []i64,
+    case_s: []i64,
+    if_id: []i64,
+    min_s: []?[]const u8,
+
+    fn init(allocator: std.mem.Allocator) !GdExpected {
+        var e: GdExpected = undefined;
+        inline for (.{ "n", "ds", "dc", "dd", "case_s", "if_id" }) |f| {
+            @field(e, f) = try allocator.alloc(i64, GD_GROUPS);
+        }
+        e.min_s = try allocator.alloc(?[]const u8, GD_GROUPS);
+        return e;
+    }
+
+    fn deinit(self: GdExpected, allocator: std.mem.Allocator) void {
+        inline for (.{ "n", "ds", "dc", "dd", "case_s", "if_id" }) |f| allocator.free(@field(self, f));
+        allocator.free(self.min_s);
+    }
+
+    fn compute(self: GdExpected, allocator: std.mem.Allocator, rows: []const GdRow, live: []const bool) !void {
+        @memset(self.n, 0);
+        @memset(self.min_s, null);
+        var pairs: std.ArrayList(RefPair) = .empty;
+        defer pairs.deinit(allocator);
+        inline for (.{ "ds", "dc", "dd", "case_s", "if_id" }) |f| {
+            pairs.clearRetainingCapacity();
+            for (rows, live) |r, keep| {
+                if (!keep) continue;
+                const g: usize = @intCast(r.g);
+                const pair: ?RefPair = if (comptime std.mem.eql(u8, f, "ds"))
+                    (if (r.s) |s| RefPair{ .g = g, .str = s } else null)
+                else if (comptime std.mem.eql(u8, f, "dc"))
+                    RefPair{ .g = g, .str = r.c }
+                else if (comptime std.mem.eql(u8, f, "dd"))
+                    (if (r.d) |d| RefPair{ .g = g, .num = canonicalDoubleBits(d) } else null)
+                else if (comptime std.mem.eql(u8, f, "case_s"))
+                    (if (r.v != null and r.v.? > 0 and r.s != null) RefPair{ .g = g, .str = r.s.? } else null)
+                else
+                    (if (r.v != null and r.v.? > 0) RefPair{ .g = g, .num = @intCast(@mod(r.id, 97)) } else null);
+                if (pair) |p| try pairs.append(allocator, p);
+            }
+            refDistinctCounts(pairs.items, @field(self, f));
+        }
+        for (rows, live) |r, keep| {
+            if (!keep) continue;
+            const g: usize = @intCast(r.g);
+            self.n[g] += 1;
+            if (r.s) |s| {
+                if (self.min_s[g] == null or std.mem.order(u8, s, self.min_s[g].?) == .lt) self.min_s[g] = s;
+            }
+        }
+    }
+};
+
+fn checkGroupedDistinct(allocator: std.mem.Allocator, db: *thindb.Database, e: GdExpected, comptime having: []const u8, route: []const u8) !void {
+    const multi_sql = "SELECT g, COUNT(DISTINCT s) AS ds, COUNT(DISTINCT c) AS dc, COUNT(DISTINCT d) AS dd, COUNT(*) AS n FROM gd GROUP BY g" ++ having;
+    const case_sql = "SELECT g, COUNT(DISTINCT CASE WHEN v > 0 THEN s END) AS cs, COUNT(DISTINCT IF(v > 0, id % 97, NULL)) AS ci FROM gd GROUP BY g" ++ having;
+    inline for (.{ multi_sql, case_sql }) |sql| {
+        errdefer std.debug.print("route={s} query: {s}\n", .{ route, sql });
+        try std.testing.expect(try planContains(allocator, db, sql, route));
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        var seen = [_]bool{false} ** GD_GROUPS;
+        var groups: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const g: usize = @intCast(batch.values[0].data.int[r]);
+                try std.testing.expect(!seen[g]);
+                seen[g] = true;
+                groups += 1;
+                const want: []const i64 = if (comptime std.mem.eql(u8, sql, multi_sql))
+                    &.{ e.ds[g], e.dc[g], e.dd[g], e.n[g] }
+                else
+                    &.{ e.case_s[g], e.if_id[g] };
+                for (want, 1..) |w, ci| {
+                    errdefer std.debug.print("group {d} column {d}\n", .{ g, ci });
+                    try std.testing.expectEqual(@as(?f64, @floatFromInt(w)), try cellNumber(batch.values[ci], r));
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, GD_GROUPS), groups);
+    }
+}
+
+// A byte-string distinct grouped by a dict-coded string key, optionally next
+// to a COUNT(DISTINCT) over that key itself, which is 1 in every group (the
+// key's coded batch value is a placeholder, so that shape stays on the silo).
+fn checkKeyDistinct(allocator: std.mem.Allocator, db: *thindb.Database, rows: []const GdRow, live: []const bool, c_pool: []const []const u8, comptime with_key: bool, comptime having: []const u8, route: []const u8) !void {
+    const sql = "SELECT c, COUNT(DISTINCT s) AS ds" ++ (if (with_key) ", COUNT(DISTINCT c) AS dk" else "") ++ " FROM gd GROUP BY c" ++ having;
+    errdefer std.debug.print("route={s} query: {s}\n", .{ route, sql });
+    try std.testing.expect(try planContains(allocator, db, sql, route));
+    var pairs: std.ArrayList(RefPair) = .empty;
+    defer pairs.deinit(allocator);
+    for (rows, live) |r, keep| {
+        if (!keep) continue;
+        const ci = for (c_pool, 0..) |c, k| {
+            if (std.mem.eql(u8, c, r.c)) break k;
+        } else return error.TestUnexpectedResult;
+        if (r.s) |s| try pairs.append(allocator, .{ .g = ci, .str = s });
+    }
+    const want = try allocator.alloc(i64, c_pool.len);
+    defer allocator.free(want);
+    refDistinctCounts(pairs.items, want);
+
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var groups: usize = 0;
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |r| {
+            const key = batch.values[0].data.string.rowBytes(r);
+            const ci = for (c_pool, 0..) |c, k| {
+                if (std.mem.eql(u8, c, key)) break k;
+            } else return error.TestUnexpectedResult;
+            groups += 1;
+            try std.testing.expectEqual(@as(?f64, @floatFromInt(want[ci])), try cellNumber(batch.values[1], r));
+            if (with_key) try std.testing.expectEqual(@as(?f64, 1), try cellNumber(batch.values[2], r));
+        }
+    }
+    try std.testing.expectEqual(c_pool.len, groups);
+}
+
+test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on both group routes at DOP 1 and DOP 4" {
+    // Group 0 sees only NULL s/d/v, so its string, double and conditional
+    // distinct counts are 0. The test build narrows the string digest to 8
+    // bits, so equal-digest chains are the norm. Phase 1 reads coded and
+    // byte-string inputs from flushed segments; phase 2 adds tombstones and
+    // memtable rows, whose batches carry no dict-code sidecar.
+    const allocator = std.testing.allocator;
+    const batches = 4;
+    const batch_rows = 3000;
+    const rows = try allocator.alloc(GdRow, batches * batch_rows);
+    defer allocator.free(rows);
+    const live = try allocator.alloc(bool, rows.len);
+    defer allocator.free(live);
+
+    var s_pool: [600][]const u8 = undefined;
+    var s_bytes: [600][48]u8 = undefined;
+    for (&s_pool, &s_bytes, 0..) |*s, *buf, p| {
+        s.* = switch (p % 50) {
+            1 => "",
+            2 => "a",
+            3 => "a\x00",
+            4 => "\x00",
+            5 => "12345678",
+            6 => "123456789",
+            else => blk: {
+                const len = 3 + (p * 7) % 40;
+                @memset(buf[0..len], 'x');
+                _ = try std.fmt.bufPrint(buf[0..3], "{d:0>3}", .{p});
+                break :blk buf[0..len];
+            },
+        };
+    }
+    const c_pool = [_][]const u8{ "", "\x00\x01", "alpha", "beta", "a-value-longer-than-eight-bytes", "a-value-longer-than-eight-bytez", "Z", "z" };
+    const nan_a: f64 = @bitCast(@as(u64, 0x7ff8_0000_0000_0001));
+    const nan_b: f64 = @bitCast(@as(u64, 0xfff8_0000_0000_0000));
+    const d_pool = [_]f64{ -0.0, 0.0, nan_a, nan_b, 1.5, -2.25, 1e300, -1e-300 };
+
+    for (rows, 0..) |*row, i| {
+        const g: usize = if (i % 2 == 0) (i / 4) % GD_GROUPS else (i * 7) % GD_GROUPS;
+        const p = (i * 2_654_435_761) % 600;
+        const all_null = g == 0;
+        row.* = .{
+            .id = @intCast(i),
+            .g = @intCast(g),
+            .s = if (all_null or p % 50 == 0) null else s_pool[p],
+            .c = c_pool[(i * 5) % c_pool.len],
+            .d = if (all_null or i % 13 == 0) null else if (i % 3 == 0) d_pool[i % d_pool.len] else @as(f64, @floatFromInt(i % 300)) * 0.5,
+            .v = if (all_null or i % 11 == 0) null else @as(i32, @intCast((i * 37) % 200)) - 100,
+        };
+    }
+
+    var expected = try GdExpected.init(allocator);
+    defer expected.deinit(allocator);
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        errdefer std.debug.print("dop={d}\n", .{dop});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("gd", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g", .type = .int },
+                .{ .name = "s", .type = .string, .nullable = true },
+                .{ .name = "c", .type = .string },
+                .{ .name = "d", .type = .double, .nullable = true },
+                .{ .name = "v", .type = .int, .nullable = true },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 256 });
+
+        for (0..batches - 1) |b| {
+            try t.insert(rows[b * batch_rows ..][0..batch_rows]);
+            try t.flush();
+        }
+        @memset(live, false);
+        @memset(live[0 .. (batches - 1) * batch_rows], true);
+        try expected.compute(allocator, rows, live);
+        try checkGroupedDistinct(allocator, db, expected, "", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, " HAVING COUNT(*) > 0", "V2 group-topN");
+        // The low-NDV non-nullable string folds as dict codes, the nullable
+        // one by bytes; the CASE/IF inputs are derived string and int values.
+        try std.testing.expect(try planContains(allocator, db, "SELECT g, COUNT(DISTINCT s), COUNT(DISTINCT c), COUNT(DISTINCT d) FROM gd GROUP BY g", "distinct string,coded,float"));
+        try std.testing.expect(try planContains(allocator, db, "SELECT g, COUNT(DISTINCT CASE WHEN v > 0 THEN s END), COUNT(DISTINCT IF(v > 0, id % 97, NULL)) FROM gd GROUP BY g", "distinct string,int"));
+        try checkKeyDistinct(allocator, db, rows, live, &c_pool, false, "", "lowcard");
+        try checkKeyDistinct(allocator, db, rows, live, &c_pool, true, "", "V2 group-topN");
+        try checkKeyDistinct(allocator, db, rows, live, &c_pool, true, " HAVING COUNT(*) > 0", "V2 group-topN");
+
+        try exec(allocator, db, "DELETE FROM gd WHERE id % 17 = 0");
+        try t.insert(rows[(batches - 1) * batch_rows ..]);
+        // The DELETE ran before the memtable batch arrived.
+        for (live, 0..) |*keep, i| keep.* = i >= (batches - 1) * batch_rows or i % 17 != 0;
+        try expected.compute(allocator, rows, live);
+        try checkGroupedDistinct(allocator, db, expected, "", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, " HAVING COUNT(*) > 0", "V2 group-topN");
+
+        // A string result and a string distinct share the staged string lane.
+        const mixed_sql = "SELECT g, MIN(s) AS lo, COUNT(DISTINCT s) AS ds FROM gd GROUP BY g HAVING COUNT(*) > 0";
+        var q = try runSql(allocator, db, mixed_sql);
+        defer q.deinit();
+        var groups: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const g: usize = @intCast(batch.values[0].data.int[r]);
+                groups += 1;
+                try std.testing.expectEqual(expected.min_s[g] != null, batch.values[1].isValid(r));
+                if (expected.min_s[g]) |lo| try std.testing.expectEqualStrings(lo, batch.values[1].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(expected.ds[g])), try cellNumber(batch.values[2], r));
+            }
+        }
+        try std.testing.expectEqual(@as(usize, GD_GROUPS), groups);
+    }
+}
+
+test "V2 grouped COUNT(DISTINCT json) counts byte-distinct documents like GROUP BY" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE gj (id INT, g INT NOT NULL, j JSON)");
+    try exec(allocator, db,
+        \\INSERT INTO gj VALUES (1, 1, '{"a":1}'), (2, 1, '{"a": 1}'), (3, 1, '{"b":[1,2]}'), (4, 1, NULL),
+        \\(5, 2, '[1,2]'), (6, 2, '[1,2]'), (7, 2, '[1, 2]'), (8, 2, '"x"'), (9, 3, NULL), (10, 3, NULL)
+    );
+    const t = try db.openTable("gj", .{});
+    try t.flush();
+    const reference = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT g, j FROM gj WHERE j IS NOT NULL GROUP BY g, j) t GROUP BY g ORDER BY g");
+    defer allocator.free(reference);
+    try std.testing.expectEqual(@as(usize, 2), reference.len);
+    inline for (.{ "", " HAVING COUNT(*) > 0" }) |having| {
+        const got = try helpers.collectBigints(allocator, db, "SELECT COUNT(DISTINCT j) FROM gj GROUP BY g" ++ having ++ " ORDER BY g");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &.{ reference[0], reference[1], 0 }, got);
+    }
+}
+
+test "V2 grouped string COUNT(DISTINCT) stays inside the query budget and leaks nothing when it fails" {
+    const allocator = std.testing.allocator;
+    const group_count = 61;
+    const Row = struct { id: i64, g: i32, payload: []const u8 };
+    const rows = try allocator.alloc(Row, 4096);
+    defer allocator.free(rows);
+    const bytes = try allocator.alloc(u8, rows.len * 200);
+    defer allocator.free(bytes);
+    for (rows, 0..) |*row, i| {
+        const b = bytes[i * 200 ..][0..200];
+        @memset(b, 'p');
+        _ = try std.fmt.bufPrint(b[0..8], "{d:0>8}", .{i});
+        row.* = .{ .id = @intCast(i), .g = @intCast(i % group_count), .payload = b };
+    }
+    const budgets = [_]usize{ 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024 };
+    for (budgets, 0..) |budget, bi| {
+        errdefer std.debug.print("budget={d}\n", .{budget});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
+            .query_memory_budget = budget,
+            .auto_flush_secs = 0,
+            .max_dop = 4,
+        });
+        defer db.close();
+        const t = try db.table("wide_distinct", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "g", .type = .int }, .{ .name = "payload", .type = .string } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 256 });
+        try t.insert(rows);
+        try t.flush();
+        inline for (.{ "", " HAVING COUNT(*) > 0" }) |having| {
+            const sql = "SELECT g, COUNT(DISTINCT payload) FROM wide_distinct GROUP BY g" ++ having;
+            // Every payload is distinct, so the sets alone need more than the
+            // smallest budget and far less than the largest.
+            var rejected = false;
+            var groups: usize = 0;
+            if (runSql(allocator, db, sql)) |value| {
+                var q = value;
+                defer q.deinit();
+                while (true) {
+                    const batch = (q.next() catch |err| {
+                        try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
+                        rejected = true;
+                        break;
+                    }) orelse break;
+                    for (0..batch.row_count) |r| {
+                        const g: usize = @intCast(batch.values[0].data.int[r]);
+                        const want: i64 = @intCast((rows.len - g + group_count - 1) / group_count);
+                        try std.testing.expectEqual(@as(?f64, @floatFromInt(want)), try cellNumber(batch.values[1], r));
+                        groups += 1;
+                    }
+                }
+            } else |err| {
+                try std.testing.expectEqual(error.MemoryBudgetExceeded, err);
+                rejected = true;
+            }
+            if (!rejected) try std.testing.expectEqual(@as(usize, group_count), groups);
+            if (bi == 0) try std.testing.expect(rejected);
+            if (bi == budgets.len - 1) try std.testing.expect(!rejected);
+            // A finished silo query tears its workspace down asynchronously,
+            // so only a rejected query's reservations must be gone already.
+            if (rejected) try std.testing.expectEqual(@as(usize, 0), db.config.memory_pool.?.inUse());
+        }
+    }
+}
