@@ -2241,14 +2241,21 @@ fn buildCallPlan(
         }
     }
     // Text that isn't a literal reads as a CAST to the date or datetime the
-    // call wants there, as a literal does (`DATE_ADD(s, INTERVAL 1 DAY)`).
-    if (r == null) if (temporalOverload(c.fn_name, arg_plans, arg_types, .{ .nulls = true, .unreadable_text = true, .text_exprs = true })) |f| {
-        if (try textExprsRead(aa, c, f, arg_plans, arg_types)) |rewritten| {
+    // call wants there, as a literal does (`DATE_ADD(s, INTERVAL 1 DAY)`);
+    // then a number does too (`YEAR(20260131)`).
+    const reads = [_]TemporalFit{
+        .{ .nulls = true, .unreadable_text = true, .text_exprs = true },
+        .{ .nulls = true, .unreadable_text = true, .text_exprs = true, .numbers = true },
+    };
+    for (reads) |fit| {
+        if (r != null) break;
+        const f = temporalOverload(c.fn_name, arg_plans, arg_types, fit) orelse continue;
+        if (try argsReadAsTemporal(aa, c, f, arg_plans, arg_types, fit)) |rewritten| {
             for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
             built = 0;
             return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
         }
-    };
+    }
     const rr = r orelse return Error.ComputeNoSuchOverload;
 
     // Cast scratch buffers (one per coerced arg).
@@ -2521,8 +2528,10 @@ const TemporalFit = struct {
     /// NULL of that type, as a CAST would make it.
     unreadable_text: bool = false,
     /// Text that isn't a literal fits a date or datetime parameter too
-    /// (`textExprsRead`).
+    /// (`argsReadAsTemporal`).
     text_exprs: bool = false,
+    /// So does a number (`numberReadsAsTemporal`).
+    numbers: bool = false,
 };
 
 /// Retype the text literals of a call to the first overload of `fn_name`
@@ -2593,7 +2602,8 @@ fn fitsTemporalOverload(f: scalar_fn.ScalarFn, arg_plans: []const ArgPlan, arg_t
         if (!wanted) return false;
         const reads = litTemporalValue(ap, declared) != null or
             (fit.unreadable_text and isTextLiteral(ap)) or
-            (fit.text_exprs and isTextExpr(ap, given));
+            (fit.text_exprs and isTextExpr(ap, given)) or
+            (fit.numbers and numberReadsAsTemporal(f, i, ap, given));
         if (!reads) return false;
         any_coerce = true;
     }
@@ -2608,17 +2618,30 @@ fn isTextExpr(ap: ArgPlan, given: Type) bool {
     return ap != .lit and ap != .null_lit and given.isString();
 }
 
-/// The call with each text argument that isn't a literal, where overload
-/// `f` wants a date or datetime, read as `CAST(x AS DATETIME)` or
-/// `CAST(x AS DATE)` reads it, so text that doesn't read is NULL. Its
+/// Whether a number where `f` takes a date or datetime at `i` reads as one,
+/// as StarRocks reads it there, and a decimal as CAST reads one. An argument
+/// the call returns (GREATEST, COALESCE, IF's branches) doesn't: it meets
+/// the others at their common type.
+fn numberReadsAsTemporal(f: scalar_fn.ScalarFn, i: usize, ap: ArgPlan, given: Type) bool {
+    if (ap == .null_lit) return false;
+    if (scalar_fn.resultValueArgsStart(f.name)) |start| if (i >= start) return false;
+    return given.isInteger() or given.isFloat() or given.isDecimal() or given == .boolean;
+}
+
+/// The call with each argument that `fit` lets meet a date or datetime
+/// parameter of overload `f` as a value of another type, other than a
+/// literal of its own, read as `CAST(x AS DATETIME)` or `CAST(x AS DATE)`
+/// reads it: text that isn't a literal, and a number when `fit.numbers`
+/// (`YYYYMMDD` or `YYYYMMDDhhmmss`). Whatever doesn't read is NULL. Text
 /// literals are left for the call to fit as it fits any. Null when `f`
 /// takes no such argument as a date or datetime.
-fn textExprsRead(aa: Allocator, c: Expr.Call, f: scalar_fn.ScalarFn, arg_plans: []const ArgPlan, arg_types: []const Type) !?Expr {
+fn argsReadAsTemporal(aa: Allocator, c: Expr.Call, f: scalar_fn.ScalarFn, arg_plans: []const ArgPlan, arg_types: []const Type, fit: TemporalFit) !?Expr {
     const args = try aa.dupe(Expr, c.args);
     var any = false;
     for (args, arg_plans, arg_types, 0..) |*a, ap, given, i| {
         const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
-        if (!isTextExpr(ap, given) or (declared != .date and declared != .datetime)) continue;
+        if (declared != .date and declared != .datetime) continue;
+        if (!isTextExpr(ap, given) and !(fit.numbers and numberReadsAsTemporal(f, i, ap, given))) continue;
         const name = try scalar_fn.castFnName(aa, declared) orelse return null;
         const read = try aa.dupe(Expr, &.{a.*});
         a.* = .{ .call = .{ .fn_name = name, .args = read } };

@@ -126,7 +126,11 @@ is read per row the same way. Text takes a DATETIME parameter before a DATE
 one, as StarRocks casts it, so `DATE_ADD('2026-01-01 10:30:00', INTERVAL 1
 DAY)` is 2026-01-02 10:30:00 and `DATE_ADD('2026-01-31', INTERVAL 1 DAY)` is
 2026-02-01 00:00:00; a function that takes only a DATE there takes the text's
-day. Typed literals (`DATE '2026-01-01'`) and
+day. A number there, once nothing else fits, is read the same way as a CAST
+reads it, so `YEAR(20260131)` is 2026 and `YEAR(2026)` is NULL; a
+function that returns one of its arguments (GREATEST, COALESCE) doesn't
+read it so, since its arguments meet at their common type instead. Typed
+literals (`DATE '2026-01-01'`) and
 INSERT … VALUES keep the strict `YYYY-MM-DD[ hh:mm:ss[.ffffff]]` form, and
 comparisons read text as MySQL does (below).
 
