@@ -244,13 +244,16 @@ pub fn argNarrowingKernelFor(from: TypeTag, to: TypeTag) ?CastKernel {
 /// THE result-type rule: the type one result takes when it may hold a value
 /// of either type — CASE/IF branches, COALESCE/GREATEST/LEAST arguments,
 /// UNION arms. StarRocks semantics: decimals meet at the precision and scale
-/// covering both, a decimal and a float meet as DOUBLE, integers widen, DATE
-/// meets DATETIME as DATETIME, and anything meets text as text. Null when
-/// the two never share a result (a number and a date).
+/// covering both, a decimal and a float meet as DOUBLE, a LARGEINT and a
+/// decimal as `largeintMeetsDecimal` says, integers widen, DATE meets
+/// DATETIME as DATETIME, and anything meets text as text. Null when the two
+/// never share a result (a number and a date).
 pub fn commonType(a: Type, b: Type) ?Type {
     if (sameRepresentation(a, b)) return if (a.isString()) commonText(a, b) else a;
     if (a.isDecimal() or b.isDecimal()) {
         if (a.isFloat() or b.isFloat()) return .double;
+        if (a == .largeint) return largeintMeetsDecimal(b);
+        if (b == .largeint) return largeintMeetsDecimal(a);
         if (decimal.commonSpec(&.{ a, b })) |spec| return decimal.decTypeFor(spec.p, spec.s);
     }
     const at: TypeTag = a;
@@ -261,6 +264,16 @@ pub fn commonType(a: Type, b: Type) ?Type {
     }
     if (a.isString() or b.isString()) return .string;
     return null;
+}
+
+/// No decimal covers a LARGEINT, whose values run to 39 digits. Beside a
+/// decimal with a fraction it meets as DOUBLE, as in StarRocks. Beside a
+/// DECIMAL(p,0), StarRocks meets it at DECIMAL(38,0) and lets that type's
+/// values run past its 38 digits; thinDB's decimals keep their precision, so
+/// the type covering both is LARGEINT, which holds every DECIMAL(p,0) value
+/// and prints the same digits.
+fn largeintMeetsDecimal(d: Type) Type {
+    return if (d.decimalSpec().?.s > 0) .double else .largeint;
 }
 
 /// Two declared-length text types meet at the longer VARCHAR, as in MySQL;

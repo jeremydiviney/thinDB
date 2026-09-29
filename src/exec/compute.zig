@@ -1806,12 +1806,12 @@ const CaseUnifyState = struct {
 fn unifyCaseType(current: ?Type, next: Type, next_src: BranchSrc, st: *CaseUnifyState) ?Type {
     if (next_src == .null_lit) return current orelse next;
     defer st.only_null_so_far = false;
-    if (next.decimalSpec() == null and next.isInteger() and next_src != .lit) {
-        st.int_contribs_all_lits = false;
-    }
+    // A LARGEINT literal has more digits than any decimal holds.
+    const int_lit = next.isInteger() and next != .largeint and next_src == .lit;
+    if (next.isInteger() and !int_lit) st.int_contribs_all_lits = false;
     if (st.only_null_so_far and current != null) return next;
     const cur = current orelse return next;
-    if (cur.isDecimal() and next.isInteger() and next_src == .lit) return cur;
+    if (cur.isDecimal() and int_lit) return cur;
     if (next.isDecimal() and cur.isInteger() and st.int_contribs_all_lits) return next;
     return cast.commonType(cur, next);
 }

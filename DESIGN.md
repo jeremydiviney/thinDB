@@ -313,7 +313,13 @@ read a LARGEINT input as its 64 bits.
 
 A LARGEINT stays exact where a result takes it: COALESCE, IFNULL, NULLIF,
 GREATEST and LEAST return LARGEINT, where MySQL returns a DECIMAL of the same
-digits. Cast to BIGINT (`CAST(x AS SIGNED)`), a LARGEINT from 2^63 to
+digits. No decimal holds a LARGEINT's 39 digits, so where a LARGEINT meets a
+decimal in one result (those functions, IF and CASE branches, UNION arms), the
+result is DOUBLE when the decimal has a fraction, as in StarRocks. Beside a
+DECIMAL(p,0) the result is LARGEINT, which holds every value of both and
+prints the same digits StarRocks does; StarRocks says DECIMAL(38,0) and lets
+its values run past 38 digits, which thinDB's decimals don't
+(`cast.commonType`). Cast to BIGINT (`CAST(x AS SIGNED)`), a LARGEINT from 2^63 to
 2^64 - 1 keeps its 64 bits as MySQL does, so `CAST(~5 AS SIGNED)` is -6, where
 StarRocks gives NULL; any other LARGEINT past BIGINT is NULL. `CAST(x AS
 UNSIGNED)` is still a signed BIGINT. An integer of any width, LARGEINT

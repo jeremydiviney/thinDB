@@ -152,3 +152,56 @@ test "result type: kinds that never meet are rejected" {
     try helpers.expectRunError(allocator, db, "SELECT CASE WHEN id = 1 THEN i ELSE d END FROM rt", error.ComputeUnsupportedExpr);
     try helpers.expectRunError(allocator, db, "SELECT i FROM rt UNION ALL SELECT d FROM rt", error.TypeMismatch);
 }
+
+test "result type: a LARGEINT meets a decimal with a fraction as DOUBLE, and one without as LARGEINT (issue #426)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE rt (id BIGINT PRIMARY KEY, li LARGEINT, a DECIMAL(10,2), z DECIMAL(10,0))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO rt VALUES
+        \\  (1, 170141183460469231731687303715884105727, 1.50, 1),
+        \\  (2, 7, 1.25, 99999),
+        \\  (3, NULL, 2.00, NULL),
+        \\  (4, -170141183460469231731687303715884105728, NULL, 5)
+    );
+
+    // Expected values are StarRocks': DOUBLE beside a fraction, and every
+    // digit beside DECIMAL(p,0), which StarRocks types DECIMAL(38,0). A
+    // double is written as thinDB writes one, with no '+' in its exponent.
+    const big = "170141183460469231731687303715884105727";
+    const min = "-170141183460469231731687303715884105728";
+    const big_double = "1.7014118346046923e38";
+    const min_double = "-1.7014118346046923e38";
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{
+        .{ .sql = "SELECT CAST(IF(id <= 2, li, a) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big_double, "7", "2", NULL } },
+        .{ .sql = "SELECT CAST(CASE WHEN id <= 2 THEN li ELSE a END AS CHAR) FROM rt ORDER BY id", .expected = &.{ big_double, "7", "2", NULL } },
+        .{ .sql = "SELECT CAST(COALESCE(li, a) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big_double, "7", "2", min_double } },
+        .{ .sql = "SELECT CAST(IFNULL(li, a) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big_double, "7", "2", min_double } },
+        .{ .sql = "SELECT CAST(GREATEST(li, a) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big_double, "7", NULL, NULL } },
+        .{ .sql = "SELECT CAST(LEAST(li, a) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "1.5", "1.25", NULL, NULL } },
+        .{ .sql = "SELECT CAST(NULLIF(li, a) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big_double, "7", NULL, min_double } },
+        .{ .sql = "SELECT CAST(IF(id <= 2, li, z) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big, "7", NULL, "5" } },
+        .{ .sql = "SELECT CAST(CASE WHEN id <= 2 THEN li ELSE z END AS CHAR) FROM rt ORDER BY id", .expected = &.{ big, "7", NULL, "5" } },
+        .{ .sql = "SELECT CAST(COALESCE(li, z) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big, "7", NULL, min } },
+        .{ .sql = "SELECT CAST(GREATEST(li, z) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big, "99999", NULL, "5" } },
+        .{ .sql = "SELECT CAST(LEAST(li, z) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "1", "7", NULL, min } },
+        .{ .sql = "SELECT CAST(IF(id = 1, " ++ big ++ ", 1.5) AS CHAR) FROM rt ORDER BY id", .expected = &.{ big_double, "1.5", "1.5", "1.5" } },
+        .{ .sql = "SELECT CAST(CASE WHEN id = 1 THEN a ELSE " ++ big ++ " END AS CHAR) FROM rt ORDER BY id", .expected = &.{ "1.5", big_double, big_double, big_double } },
+        .{ .sql = "SELECT CAST(CASE WHEN id = 1 THEN z ELSE " ++ big ++ " END AS CHAR) FROM rt ORDER BY id", .expected = &.{ "1", big, big, big } },
+        .{ .sql = "SELECT CAST(v AS CHAR) AS t FROM (SELECT li AS v FROM rt WHERE id <= 2 UNION ALL SELECT a FROM rt WHERE id = 2) u ORDER BY v", .expected = &.{ "1.25", "7", big_double } },
+        .{ .sql = "SELECT CAST(v AS CHAR) AS t FROM (SELECT li AS v FROM rt WHERE id <= 2 UNION ALL SELECT z FROM rt WHERE id = 2) u ORDER BY v", .expected = &.{ "7", "99999", big } },
+        .{ .sql = "WITH u AS (SELECT li AS v FROM rt WHERE id <= 2 UNION ALL SELECT a FROM rt WHERE id = 2) SELECT CAST(v AS CHAR) FROM u ORDER BY v", .expected = &.{ "1.25", "7", big_double } },
+        .{ .sql = "WITH u AS (SELECT li AS v FROM rt WHERE id <= 2 UNION ALL SELECT z FROM rt WHERE id = 2) SELECT CAST(v AS CHAR) FROM u ORDER BY v", .expected = &.{ "7", "99999", big } },
+    });
+
+    // A VALUES list with an expression cell meets its rows at the common
+    // type too, before each lands in its column.
+    try helpers.exec(allocator, db, "CREATE TABLE lv (id BIGINT PRIMARY KEY, v LARGEINT)");
+    try helpers.exec(allocator, db, "INSERT INTO lv VALUES (1, " ++ big ++ "), (2, 99999999999999999999999999999999999999), (3, 1 + 1)");
+    try expectCases(allocator, db, &.{
+        .{ .sql = "SELECT CAST(v AS CHAR) FROM lv ORDER BY id", .expected = &.{ big, "99999999999999999999999999999999999999", "2" } },
+    });
+}
