@@ -236,6 +236,13 @@ pub const PlanNeeds = struct {
     partitioned_sort: u64,
     hash: u64,
     sort: u64,
+    /// The partitioned plan's need with hash-table cores, and the input
+    /// bytes those cores buffer at once (a round).
+    hash_cores: u64,
+    round: u64,
+    /// Whether the partitioned plan's operator may pick sort cores, which
+    /// prices it at the larger of the two cores' needs.
+    may_sort: bool,
     /// Whether the estimated groups are near-unique, the only case where
     /// the partitions' sort core pays off.
     near_unique: bool,
@@ -259,17 +266,23 @@ pub const PlanNeeds = struct {
     /// The needs over an input that already holds `held` charged bytes and
     /// frees each of its chunks, none over `largest_chunk` bytes, once the
     /// plan pulls the next (`RealizedInput`). The partitioned plans and the
-    /// sort copy the input as they pull it (hash cores a round of it at a
-    /// time), so the copy replaces the input's buffers: they need what they
-    /// add beyond them, plus the chunk being copied. Radix and hash stream
-    /// the input into their tables while its buffers are still held.
+    /// sort copy the input as they pull it, so the copy replaces the input's
+    /// buffers: they need what they add beyond them, plus the chunk being
+    /// copied. Hash cores hold only a round of the copy, so only a round of
+    /// the held buffers offsets it. Radix and hash stream the input into
+    /// their tables while its buffers are still held.
     pub fn consuming(self: PlanNeeds, held: u64, largest_chunk: u64) PlanNeeds {
+        const hash_cores = (self.hash_cores -| @min(held, self.round)) +| largest_chunk;
+        const partitioned_sort = (self.partitioned_sort -| held) +| largest_chunk;
         return .{
             .radix = self.radix,
-            .partitioned = (self.partitioned -| held) +| largest_chunk,
-            .partitioned_sort = (self.partitioned_sort -| held) +| largest_chunk,
+            .partitioned = if (self.may_sort) @max(hash_cores, partitioned_sort) else hash_cores,
+            .partitioned_sort = partitioned_sort,
             .hash = self.hash,
             .sort = (self.sort -| held) +| largest_chunk,
+            .hash_cores = hash_cores,
+            .round = self.round,
+            .may_sort = self.may_sort,
             .near_unique = self.near_unique,
         };
     }
@@ -365,12 +378,16 @@ pub fn planNeeds(
     const round = @min(input, round_rows *| row_bytes);
     const hash_cores = round +| round_rows *| @sizeOf(u32) +| 2 *| windows *| row_bytes +| state.bytes(windows);
     const sort_cores = 2 *| (input +| index) +| state.groups *| state.group *| STATE_SLACK_NUM / STATE_SLACK_DEN;
+    const may_sort = partitioned_aggregate.estimatesCore(aggs, rows, partitions);
     return .{
         .radix = streamed,
-        .partitioned = if (partitioned_aggregate.estimatesCore(aggs, rows, partitions)) @max(hash_cores, sort_cores) else hash_cores,
+        .partitioned = if (may_sort) @max(hash_cores, sort_cores) else hash_cores,
         .partitioned_sort = sort_cores,
         .hash = streamed,
         .sort = (input +| input / 2) +| index,
+        .hash_cores = hash_cores,
+        .round = round,
+        .may_sort = may_sort,
         .near_unique = partitioned_aggregate.nearUnique(state.groups, rows),
     };
 }
@@ -1095,9 +1112,18 @@ test "plan needs price the input buffer, the group state and measured widths" {
     try std.testing.expectEqual(input / 2 + 4 * rows + 1000, consumed.sort);
     try std.testing.expect(consumed.near_unique);
     const overheld = needs.consuming(needs.partitioned + needs.partitioned_sort + needs.sort, 1000);
-    try std.testing.expectEqual(@as(u64, 1000), overheld.partitioned);
+    try std.testing.expectEqual(needs.partitioned - input + 1000, overheld.partitioned);
     try std.testing.expectEqual(@as(u64, 1000), overheld.partitioned_sort);
     try std.testing.expectEqual(@as(u64, 1000), overheld.sort);
+    // Hash cores copy a round at a time, so the held input past a round
+    // still sits beside their tables.
+    const rounded_consumed = rounded.consuming(input, 1000);
+    try std.testing.expectEqual(rounded.partitioned - round_rows * row_bytes + 1000, rounded_consumed.partitioned);
+    try std.testing.expectEqual(consumed.partitioned_sort, rounded_consumed.partitioned_sort);
+    // When the operator may sort its partitions, the plan is priced at the
+    // larger of the two cores' needs after the credit too.
+    const heavy_consumed = heavy.consuming(input, 1000);
+    try std.testing.expectEqual(@max(heavy_hash_cores - input + 1000, heavy.partitioned_sort - input + 1000), heavy_consumed.partitioned);
 
     // A proven key space of 1000 groups prices 1000 groups' state.
     const few = exec.PipelineStats{ .upper_rows = rows, .column_stats = &.{
