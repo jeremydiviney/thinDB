@@ -2544,12 +2544,12 @@ pub const Parser = struct {
         return ir.Expr{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = try self.closeCase(outer) } };
     }
 
-    /// MySQL's `!x`, NOT spelled as a prefix operator: `x = 0` as a value,
-    /// so it is NULL where `x` is.
+    /// MySQL's `!x`, NOT spelled as a prefix operator: the negation of `x`'s
+    /// truth as a value, so it is NULL where that truth is.
     fn logicalNotValue(self: *Parser, operand: ir.Expr) ParseError!ir.Expr {
         const outer = self.openCase();
         errdefer self.abandonCase(outer);
-        const pred = try parse_predicate.elementComparison(self, operand, .eq, .{ .lit = .{ .int = 0 } });
+        const pred = try parse_predicate.negatePredicate(self, try parse_predicate.truthPredicate(self, operand));
         return try self.predicateAsValue(pred, outer);
     }
 

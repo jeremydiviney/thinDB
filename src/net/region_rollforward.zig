@@ -1348,6 +1348,7 @@ fn hashPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void 
         .leaf, .day_leaf, .text_as_number => |l| {
             hstr(h, l.col);
             hu(h, @intFromEnum(l.op));
+            hu(h, @intFromBool(l.as_boolean));
             hashValue(h, l.val);
         },
         .leaf_col_col => |l| {
@@ -1804,7 +1805,7 @@ const Builder = struct {
     }
 
     fn cloneLeaf(b: *Builder, l: predicate_mod.Predicate) !predicate_mod.Predicate {
-        return .{ .col = try b.predColName(l.col), .op = l.op, .val = try b.cloneValue(l.val) };
+        return .{ .col = try b.predColName(l.col), .op = l.op, .val = try b.cloneValue(l.val), .as_boolean = l.as_boolean };
     }
 
     // ---- structural op appenders -----------------------------------------
@@ -2183,7 +2184,7 @@ fn clonePredPlain(a: Allocator, p: PredicateExpr) anyerror!PredicateExpr {
 }
 
 fn cloneLeafPlain(a: Allocator, l: predicate_mod.Predicate) !predicate_mod.Predicate {
-    return .{ .col = try a.dupe(u8, lastSegment(l.col)), .op = l.op, .val = try cloneValuePlain(a, l.val) };
+    return .{ .col = try a.dupe(u8, lastSegment(l.col)), .op = l.op, .val = try cloneValuePlain(a, l.val), .as_boolean = l.as_boolean };
 }
 
 /// Inline earlier derived outputs into a later expr: the side runs ONE

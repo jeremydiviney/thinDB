@@ -35,6 +35,7 @@ const types = @import("../types.zig");
 const Value = types.Value;
 const ir = @import("../ir/ir.zig");
 const parse_window = @import("parse_window.zig");
+const scalar_fn_common = @import("../exec/scalar_fn_common.zig");
 
 pub fn parseBoolExpr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     return try parseOr(p);
@@ -212,8 +213,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         const null_lhs: ir.Expr = .{ .null_lit = .string };
         if (p.cur.tag == .kw_is) return try parseIsOps(p, null_lhs);
         if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, null_lhs)).?;
-        if (isPredicateEnd(p)) return .unknown;
-        if (!isComparisonToken(p.cur.tag)) return PE.SqlExpectedToken;
+        if (!isComparisonToken(p.cur.tag)) return .unknown;
         _ = try parseComparisonToken(p);
         _ = try p.parseScalar();
         return .unknown;
@@ -224,13 +224,13 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // `@var op X` — a session var on the LHS (constant guard, e.g.
     // `@comparisonMonths > 1`). Symmetric to the literal-LHS form above: the
     // var resolves to a literal pre-compile, so both sides materialize as
-    // constant columns. A bare `@var` is truthiness (`@var <> 0`).
+    // constant columns. A bare `@var` is its truth (`truthPredicate`).
     if (p.cur.tag == .at_identifier) {
         const var_name = try p.arena.dupe(u8, p.cur.text);
         try p.advance();
         const lhs_expr = ir.Expr{ .var_ref = var_name };
         if (try parseComparisonTail(p, lhs_expr)) |pred| return pred;
-        return try makeExprComparisonPredicate(p, lhs_expr, .neq, .{ .lit = .{ .int = 0 } });
+        return try truthPredicate(p, lhs_expr);
     }
     // A CASE expression or a keyword-named call (`IF(...)`) can only be a
     // scalar operand here.
@@ -350,9 +350,9 @@ fn parseScalarLhs(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         },
         else => if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs)),
     }
-    // A lone literal is truthiness, as a bare column is (`WHERE 1`).
-    if (isPredicateEnd(p)) return try literalComparison(p, lhs_val, .neq, .{ .int = 0 });
     if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, lhs)).?;
+    // A lone literal is its truth, as a bare column is (`WHERE 1`).
+    if (!isComparisonToken(p.cur.tag)) return try truthPredicate(p, lhs);
     const op_lhs = try parseComparisonToken(p);
     const rhs = try p.parseScalar();
     return switch (leafOperand(rhs)) {
@@ -426,11 +426,11 @@ fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
         .kw_is, .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
             return try parseColOps(p, try anchorColumn(p, lhs));
         },
-        // A bare expression is MySQL truthiness (`WHERE fn(x)`, `WHERE 1 + x`):
-        // non-zero and non-NULL, as for a bare column.
+        // A bare expression is its truth (`WHERE fn(x)`, `WHERE 1 + x`), as
+        // a bare column is.
         else => {
             if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs));
-            return try makeExprComparisonPredicate(p, lhs, .neq, .{ .lit = .{ .int = 0 } });
+            return try truthPredicate(p, lhs);
         },
     }
 }
@@ -446,17 +446,6 @@ fn isArithToken(tag: anytype) bool {
 /// operator token, MySQL's `MOD` word, or a `COLLATE` clause.
 fn isArithAhead(p: anytype) @TypeOf(p.*).Err!bool {
     return isArithToken(p.cur.tag) or try p.modOperatorAhead() or try p.collateAhead();
-}
-
-/// Tokens that close a predicate: the call/CASE punctuation around an IF
-/// or WHEN condition, boolean connectives, and the clause keywords that
-/// can follow a WHERE / HAVING.
-fn isPredicateEnd(p: anytype) bool {
-    return switch (p.cur.tag) {
-        .rparen, .comma, .kw_and, .amp_amp, .kw_or, .kw_then, .eof, .semicolon, .kw_group, .kw_order, .kw_limit, .kw_having => true,
-        .pipe_pipe => p.lex.dialect == .mysql,
-        else => xorKeywordHere(p),
-    };
 }
 
 /// What an `IS [NOT] ...` tests: NULL (UNKNOWN is its synonym), TRUE,
@@ -486,44 +475,68 @@ fn parseIsTail(p: anytype) @TypeOf(p.*).Err!IsTail {
 }
 
 /// `x IS [NOT] NULL | UNKNOWN | TRUE | FALSE | DISTINCT FROM y`. None of
-/// them is ever UNKNOWN: IS TRUE holds for a non-NULL non-zero value, so
-/// its negation keeps the NULL rows.
+/// them is ever UNKNOWN: IS TRUE holds where `x`'s truth
+/// (`truthPredicate`) is TRUE, so its negation keeps the rows where `x`
+/// is NULL or text that reads as no boolean.
 fn parseIsOps(p: anytype, lhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const tail = try parseIsTail(p);
-    if (tail.what == .distinct_from) {
-        const same = try nullSafeEqual(p, lhs, try p.parseScalar());
-        return if (tail.negated) same else try negatePredicate(p, same);
-    }
-    const operand = leafOperand(lhs);
-    const tested: PredicateExpr = switch (operand) {
-        .null_lit => .{ .always = tail.what == .null },
-        .lit => |v| switch (tail.what) {
-            .null => .{ .always = false },
-            .true => if (literalTruth(v)) |t| .{ .always = t } else try literalComparison(p, v, .neq, .{ .int = 0 }),
-            .false => if (literalTruth(v)) |t| .{ .always = !t } else try literalComparison(p, v, .eq, .{ .int = 0 }),
-            .distinct_from => unreachable,
+    const tested: PredicateExpr = switch (tail.what) {
+        .distinct_from => {
+            const same = try nullSafeEqual(p, lhs, try p.parseScalar());
+            return if (tail.negated) same else try negatePredicate(p, same);
         },
-        else => blk: {
-            const col = try anchorColumn(p, operand);
-            break :blk switch (tail.what) {
-                .null => .{ .is_null = col },
-                .true => try notNullAnd(p, col, .{ .leaf = .{ .col = col, .op = .neq, .val = .{ .int = 0 } } }),
-                .false => try notNullAnd(p, col, .{ .leaf = .{ .col = col, .op = .eq, .val = .{ .int = 0 } } }),
-                .distinct_from => unreachable,
-            };
+        .null => switch (leafOperand(lhs)) {
+            .null_lit => .{ .always = true },
+            .lit => .{ .always = false },
+            else => |operand| .{ .is_null = try anchorColumn(p, operand) },
         },
+        .true => try unknownAsFalse(p, try truthPredicate(p, lhs)),
+        .false => try unknownAsFalse(p, try negatePredicate(p, try truthPredicate(p, lhs))),
     };
     return if (tail.negated) try negatePredicate(p, tested) else tested;
 }
 
-fn literalTruth(v: Value) ?bool {
+/// The truth of `operand` where a condition stands (`WHERE x`, `x OR y`,
+/// `NOT x`, `IF(x, ...)`): `CAST(x AS BOOLEAN)`, as StarRocks reads it,
+/// and UNKNOWN where that is NULL. A constant folds (`literalTruth`);
+/// anything else is an `as_boolean` leaf on the column that holds it.
+pub fn truthPredicate(p: anytype, operand: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+    const value = if (exec_expr.hexLiteralBytes(operand)) |bytes| ir.Expr{ .lit = exec_expr.hexLiteralNumber(bytes) } else leafOperand(operand);
+    switch (value) {
+        .null_lit => return .unknown,
+        .lit => |v| if (literalTruth(v)) |folded| return folded,
+        else => {},
+    }
+    return .{ .leaf = .{ .col = try anchorColumn(p, value), .op = .neq, .val = .{ .int = 0 }, .as_boolean = true } };
+}
+
+/// A constant's `CAST(v AS BOOLEAN)`: a number is TRUE unless it is zero,
+/// and text is what `textBoolean` reads, UNKNOWN when it reads as no
+/// boolean. Null for a DATE, DATETIME or UUID, which the engine reads.
+fn literalTruth(v: Value) ?PredicateExpr {
     return switch (v) {
-        .boolean => |b| b,
-        .int => |x| x != 0,
-        .bigint => |x| x != 0,
-        .double => |x| x != 0,
-        else => null,
+        .boolean => |b| .{ .always = b },
+        inline .int, .bigint, .tinyint, .smallint, .largeint, .float, .double, .decimal64, .decimal128 => |x| .{ .always = x != 0 },
+        .text => |s| if (scalar_fn_common.textBoolean(s)) |b| .{ .always = b } else .unknown,
+        .date, .datetime, .uuid => null,
     };
+}
+
+/// `pred` with UNKNOWN read as FALSE, as `x IS TRUE` reads `x`'s truth.
+/// It is never UNKNOWN, so its negation holds wherever `pred` isn't TRUE.
+/// The mask-level `.not` reads UNKNOWN as FALSE (`negatePredicate`): two
+/// keep `pred`'s TRUE rows, and negate to one.
+fn unknownAsFalse(p: anytype, pred: PredicateExpr) @TypeOf(p.*).Err!PredicateExpr {
+    switch (pred) {
+        .always => return pred,
+        .unknown => return .{ .always = false },
+        else => {},
+    }
+    const inner = try p.arena.create(PredicateExpr);
+    inner.* = pred;
+    const outer = try p.arena.create(PredicateExpr);
+    outer.* = .{ .not = inner };
+    return .{ .not = outer };
 }
 
 /// `pred` guarded by `col IS NOT NULL`, so that negating it keeps the
@@ -740,24 +753,12 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     // boolean-level NOT was already consumed by parseNot.
     if (negate_predicate) return PE.SqlExpectedKeyword;
 
-    // A bare column where the predicate ends (`IF(isActive, 1, 0)`,
-    // `WHERE flag AND ...`) is MySQL truthiness: non-zero and non-NULL.
-    if (isPredicateEnd(p)) {
-        return .{ .leaf = .{ .col = col_dup, .op = .neq, .val = .{ .int = 0 } } };
-    }
     if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, .{ .col_ref = col_dup })).?;
-
-    // Comparison.
-    const op: PredicateOp = switch (p.cur.tag) {
-        .eq => .eq,
-        .neq => .neq,
-        .lt => .lt,
-        .lte => .lte,
-        .gt => .gt,
-        .gte => .gte,
-        else => return PE.SqlExpectedToken,
-    };
-    try p.advance();
+    // A column no operator follows (`IF(isActive, 1, 0)`, `WHERE flag AND
+    // ...`, `SELECT a OR b AS c`) is its truth. Whatever follows is the
+    // enclosing clause's to read.
+    if (!isComparisonToken(p.cur.tag)) return try truthPredicate(p, .{ .col_ref = col_dup });
+    const op = try parseComparisonToken(p);
 
     // Column-vs-column comparison: `col1 op col2`. Detected when the
     // RHS starts with a plain identifier rather than a literal —

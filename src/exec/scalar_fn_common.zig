@@ -398,15 +398,14 @@ pub fn textInteger(raw: []const u8) ?i128 {
 }
 
 /// Text as a BOOLEAN, the way StarRocks casts it: `true` or `false` in any
-/// case, or a number, which is true when nonzero.
+/// case, or an INT (`textInteger`), which is true when nonzero. A fraction,
+/// an exponent or an integer past INT is no BOOLEAN.
 pub fn textBoolean(raw: []const u8) ?bool {
     const text = std.mem.trim(u8, raw, TEXT_SPACE);
     if (std.ascii.eqlIgnoreCase(text, "true")) return true;
     if (std.ascii.eqlIgnoreCase(text, "false")) return false;
-    return switch (textNumber(text) orelse return null) {
-        .exact => |d| d.m != 0,
-        .float => |f| f != 0,
-    };
+    const n = std.math.cast(i32, textInteger(text) orelse return null) orelse return null;
+    return n != 0;
 }
 
 /// Text where MySQL expects a DOUBLE and no CAST was written: the longest
@@ -505,10 +504,9 @@ test "text as a number: what StarRocks casts, and nothing else" {
 
     try t.expectEqual(@as(?bool, true), textBoolean(" TRUE "));
     try t.expectEqual(@as(?bool, false), textBoolean("False"));
-    try t.expectEqual(@as(?bool, true), textBoolean("2"));
-    try t.expectEqual(@as(?bool, false), textBoolean("0.0"));
-    try t.expect(textBoolean("x") == null);
-    try t.expect(textBoolean("") == null);
+    try t.expectEqual(@as(?bool, true), textBoolean("\t-2147483648\n"));
+    try t.expectEqual(@as(?bool, false), textBoolean("+00"));
+    inline for (.{ "x", "", "0.0", "0.5", "1e2", "2147483648", "- 1", "1 1" }) |bad| try t.expect(textBoolean(bad) == null);
 }
 
 test "floatDigits: a double's shortest digits" {
