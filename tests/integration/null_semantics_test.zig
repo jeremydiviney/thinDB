@@ -916,3 +916,123 @@ test "null literal arguments with no typed sibling take an overload's parameter 
         };
     }
 }
+
+/// The first column of `sql`, run in `dialect`, as the MySQL wire prints it.
+fn expectTexts(allocator: std.mem.Allocator, db: *thindb.Database, dialect: thindb.types.Dialect, sql: []const u8, expected: []const ?[]const u8) !void {
+    var q = try helpers.runSqlDialect(allocator, db, sql, dialect);
+    defer q.deinit();
+    const got = try helpers.columnText(allocator, &q);
+    defer helpers.freeStrings(allocator, got);
+    errdefer std.debug.print("query: {s}\n", .{sql});
+    try std.testing.expectEqual(expected.len, got.len);
+    for (expected, got) |want, have| {
+        if (want) |text| {
+            try std.testing.expect(have != null);
+            try std.testing.expectEqualStrings(text, have.?);
+        } else try std.testing.expect(have == null);
+    }
+}
+
+test "a value where a condition stands reads as CAST(x AS BOOLEAN) (issue #391)" {
+    // Expected values probed against StarRocks: a condition reads its
+    // operand as CAST(x AS BOOLEAN), so text is `true`, `false` or an INT,
+    // and other text is UNKNOWN. MySQL instead reads the number text starts
+    // with (`'abc' OR 0` is 0 there); the StarRocks dialect is the one the
+    // workload speaks. XOR and IS TRUE, which StarRocks lacks, read the same
+    // truth, and IS TRUE / IS FALSE are never UNKNOWN.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE bc (id BIGINT PRIMARY KEY, s VARCHAR(16), n DOUBLE)");
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO bc VALUES (1, 'abc', 1.5), (2, '1', 0), (3, '0', 0), (4, NULL, -0.25), (5, '0.5', 2), " ++
+            "(6, 'true', 0), (7, ' FALSE ', NULL), (8, '2147483648', 0), (9, '-3', NULL)",
+    );
+
+    const N: ?[]const u8 = null;
+    const truth_of_s: []const ?[]const u8 = &.{ N, "1", "0", N, N, "1", "0", N, "1" };
+    const not_s: []const ?[]const u8 = &.{ N, "0", "1", N, N, "0", "1", N, "0" };
+    // A select-list operand of OR, AND or XOR is followed by an alias, an
+    // alias without AS, or FROM, all of which close it.
+    const value_cases = .{
+        .{ "SELECT s OR 0 AS c FROM bc ORDER BY id", truth_of_s },
+        .{ "SELECT s AND 1 c FROM bc ORDER BY id", truth_of_s },
+        .{ "SELECT s XOR 0 FROM bc ORDER BY id", truth_of_s },
+        .{ "SELECT CAST(s AS BOOLEAN) FROM bc ORDER BY id", truth_of_s },
+        .{ "SELECT NOT s FROM bc ORDER BY id", not_s },
+        .{ "SELECT s OR 1 FROM bc ORDER BY id", &[_]?[]const u8{ "1", "1", "1", "1", "1", "1", "1", "1", "1" } },
+        .{ "SELECT s AND 0 FROM bc ORDER BY id", &[_]?[]const u8{ "0", "0", "0", "0", "0", "0", "0", "0", "0" } },
+        .{ "SELECT s OR NULL FROM bc ORDER BY id", &[_]?[]const u8{ N, "1", N, N, N, "1", N, N, "1" } },
+        .{ "SELECT NULL OR s FROM bc ORDER BY id", &[_]?[]const u8{ N, "1", N, N, N, "1", N, N, "1" } },
+        .{ "SELECT s AND NULL FROM bc ORDER BY id", &[_]?[]const u8{ N, N, "0", N, N, N, "0", N, N } },
+        .{ "SELECT NULL AND s FROM bc ORDER BY id", &[_]?[]const u8{ N, N, "0", N, N, N, "0", N, N } },
+        .{ "SELECT n OR 0 FROM bc ORDER BY id", &[_]?[]const u8{ "1", "0", "0", "1", "1", "0", N, "0", N } },
+        .{ "SELECT s OR n FROM bc ORDER BY id", &[_]?[]const u8{ "1", "1", "0", "1", "1", "1", N, N, "1" } },
+        .{ "SELECT NOT (s OR n) FROM bc ORDER BY id", &[_]?[]const u8{ "0", "0", "1", "0", "0", "0", N, N, "0" } },
+        .{ "SELECT s AND NOT n FROM bc ORDER BY id", &[_]?[]const u8{ "0", "1", "0", "0", "0", "1", "0", N, N } },
+        .{ "SELECT s XOR n FROM bc ORDER BY id", &[_]?[]const u8{ N, "1", "0", N, N, "1", N, N, N } },
+        .{ "SELECT IF(s, 'y', 'n') FROM bc ORDER BY id", &[_]?[]const u8{ "n", "y", "n", "n", "n", "y", "n", "n", "y" } },
+        .{ "SELECT CASE WHEN s THEN 'y' ELSE 'n' END FROM bc ORDER BY id", &[_]?[]const u8{ "n", "y", "n", "n", "n", "y", "n", "n", "y" } },
+        .{ "SELECT s IS TRUE FROM bc ORDER BY id", &[_]?[]const u8{ "0", "1", "0", "0", "0", "1", "0", "0", "1" } },
+        .{ "SELECT s IS NOT TRUE FROM bc ORDER BY id", &[_]?[]const u8{ "1", "0", "1", "1", "1", "0", "1", "1", "0" } },
+        .{ "SELECT s IS FALSE FROM bc ORDER BY id", &[_]?[]const u8{ "0", "0", "1", "0", "0", "0", "1", "0", "0" } },
+        .{ "SELECT s IS NOT FALSE FROM bc ORDER BY id", &[_]?[]const u8{ "1", "1", "0", "1", "1", "1", "0", "1", "1" } },
+        .{ "SELECT (s OR n) IS UNKNOWN FROM bc ORDER BY id", &[_]?[]const u8{ "0", "0", "0", "0", "0", "0", "1", "1", "0" } },
+        .{ "SELECT MIN(s OR 'x') FROM bc", &[_]?[]const u8{"1"} },
+        .{ "SELECT MAX(s OR 'x') FROM bc", &[_]?[]const u8{"1"} },
+        .{ "SELECT COUNT(s OR 'x') FROM bc", &[_]?[]const u8{"3"} },
+        .{ "SELECT SUM(s OR 0) FROM bc", &[_]?[]const u8{"3"} },
+        .{ "SELECT COUNT(s AND 1) FROM bc", &[_]?[]const u8{"5"} },
+        .{ "SELECT MIN(NOT s) FROM bc", &[_]?[]const u8{"0"} },
+        .{ "SELECT SUM(IF(s, 1, 0)) FROM bc", &[_]?[]const u8{"3"} },
+        .{ "SELECT MIN(s OR 'x') FROM bc WHERE id IN (1, 5)", &[_]?[]const u8{N} },
+        .{ "SELECT COUNT(s OR 'x') FROM bc WHERE id IN (1, 5)", &[_]?[]const u8{"0"} },
+        .{ "SELECT MIN(s OR 0), id % 2 FROM bc GROUP BY id % 2 ORDER BY 1", &[_]?[]const u8{ "0", "1" } },
+        .{ "SELECT id % 2 FROM bc GROUP BY id % 2 HAVING MIN(s OR 0) ORDER BY 1", &[_]?[]const u8{"0"} },
+        .{ "SELECT 'abc' OR 'x' AS c FROM bc WHERE id = 1", &[_]?[]const u8{N} },
+        .{ "SELECT ' TRUE ' AND '-3' AS c FROM bc WHERE id = 1", &[_]?[]const u8{"1"} },
+        .{ "SELECT '0.5' OR 0 FROM bc WHERE id = 1", &[_]?[]const u8{N} },
+        .{ "SELECT NOT 'false' FROM bc WHERE id = 1", &[_]?[]const u8{"1"} },
+        .{ "SELECT NULL OR 'true' FROM bc WHERE id = 1", &[_]?[]const u8{"1"} },
+        .{ "SELECT 'false' AND NULL FROM bc WHERE id = 1", &[_]?[]const u8{"0"} },
+        .{ "SELECT 'abc' IS FALSE FROM bc WHERE id = 1", &[_]?[]const u8{"0"} },
+        .{ "SELECT '2147483648' IS NOT TRUE FROM bc WHERE id = 1", &[_]?[]const u8{"1"} },
+    };
+    const where_cases = .{
+        .{ "s", &[_]i64{ 2, 6, 9 } },
+        .{ "NOT s", &[_]i64{ 3, 7 } },
+        .{ "s OR n", &[_]i64{ 1, 2, 4, 5, 6, 9 } },
+        .{ "NOT (s OR n)", &[_]i64{3} },
+        .{ "s AND NOT n", &[_]i64{ 2, 6 } },
+        .{ "NULL OR s", &[_]i64{ 2, 6, 9 } },
+        .{ "s XOR n", &[_]i64{ 2, 6 } },
+        .{ "NOT (s XOR n)", &[_]i64{3} },
+        .{ "s IS NOT TRUE", &[_]i64{ 1, 3, 4, 5, 7, 8 } },
+        .{ "NOT (s IS TRUE)", &[_]i64{ 1, 3, 4, 5, 7, 8 } },
+        .{ "s IS FALSE", &[_]i64{ 3, 7 } },
+        .{ "CASE WHEN s THEN 1 END", &[_]i64{ 2, 6, 9 } },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("bc", .{})).flush();
+        inline for (value_cases) |c| try expectTexts(allocator, db, .neutral, c[0], c[1]);
+        inline for (where_cases) |c| {
+            const got = try helpers.collectBigints(allocator, db, "SELECT id FROM bc WHERE " ++ c[0] ++ " ORDER BY id");
+            defer allocator.free(got);
+            std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+                std.debug.print("WHERE {s} (pass {d})\n", .{ c[0], pass });
+                return err;
+            };
+        }
+    }
+
+    // `||` is OR and `!` is NOT on the MySQL wire, as in StarRocks without
+    // PIPES_AS_CONCAT; the other dialects concatenate.
+    try expectTexts(allocator, db, .mysql, "SELECT s || 0 AS c FROM bc ORDER BY id", truth_of_s);
+    try expectTexts(allocator, db, .mysql, "SELECT !s FROM bc ORDER BY id", not_s);
+    try expectTexts(allocator, db, .mysql, "SELECT id FROM bc WHERE s || n ORDER BY id", &.{ "1", "2", "4", "5", "6", "9" });
+    try expectTexts(allocator, db, .neutral, "SELECT s || 'x' FROM bc WHERE id = 2", &.{"1x"});
+}

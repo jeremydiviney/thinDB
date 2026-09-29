@@ -92,6 +92,21 @@ or Bloom pruning. An IN list compares each element on its own, so
 `code IN ('x', 12)` means `code = 'x' OR code = 12`. StarRocks instead reads
 the whole list as numbers.
 
+A value that stands where a condition does (`WHERE x`, `x OR y`, `NOT x`,
+`IF(x, ...)`, `CASE WHEN x`, `XOR`) reads as `CAST(x AS BOOLEAN)`, as in
+StarRocks (`parse_predicate.truthPredicate`). A number is TRUE unless it is
+zero. Trimmed text in any case is TRUE or FALSE when it spells `true`,
+`false` or an INT (`' TRUE '`, `'-3'`, `'0'`); any other text is UNKNOWN. So
+`'abc' OR 0` is NULL and `WHERE s` keeps neither `'abc'` nor `'0.5'`. MySQL
+reads the number the text starts with instead, which makes `'abc' OR 0`
+give 0 and `'0.5'` TRUE. `x IS [NOT] TRUE` and `x IS [NOT] FALSE` test that
+truth and are never UNKNOWN. A comparison (`s = 1`) still reads text as a
+number, as above. Assigning text to a BOOLEAN column keeps MySQL's rule:
+`'0.5'` stores TRUE, and text that reads as no number fails. In the MySQL
+dialect `||` is OR and `!` is NOT, as in StarRocks and MySQL without
+`PIPES_AS_CONCAT`, which `SET sql_mode` doesn't turn on. The other dialects
+read `||` as concatenation.
+
 Explicitly **out of scope for v1**: `JSON`, `ARRAY`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 MySQL DDL type names without a type of their own map onto the table above:
@@ -1334,7 +1349,7 @@ Target Zig version: 0.16.
 | **Range / opaque predicates** | Single inequality `a OP b`, multi-range (BETWEEN), `extra_predicate` post-join filter, opaque callback via NLJ. Skew detection + auto-route on top. |
 | **Upserts** | StarRocks-style last-writer-wins on tables with `unique = true`. Insert auto-resolves; `Table.upsert()` is the self-documenting alias. |
 | **Crash durability** | WAL with leader-follower group commit (§8.1). `wal_enabled = true` + `sync_mode = .per_flush`. |
-| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). An `INTERVAL` amount counts whole units: a fractional literal rounds half away from zero before the unit's factor applies (`INTERVAL 1.5 WEEK` is 14 days) and a text amount reads its leading integer, as MySQL does; any other amount takes an integer type. A string literal where a function takes a date or datetime is parsed once at plan time, including `CAST('…' AS DATE)`. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. Every write (INSERT, UPDATE, ON DUPLICATE KEY UPDATE) converts a value into a DECIMAL column as `CAST` to the column's type does: it rounds half away from zero to the scale, raises past the precision, and rejects text that isn't a number. |
+| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). An `INTERVAL` amount counts whole units: a fractional literal rounds half away from zero before the unit's factor applies (`INTERVAL 1.5 WEEK` is 14 days) and a text amount reads its leading integer, as MySQL does; any other amount takes an integer type. A string literal where a function takes a date or datetime is parsed once at plan time, including `CAST('…' AS DATE)`. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal, and BOOLEAN `true`, `false` or an INT, §3.1). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. Every write (INSERT, UPDATE, ON DUPLICATE KEY UPDATE) converts a value into a DECIMAL column as `CAST` to the column's type does: it rounds half away from zero to the scale, raises past the precision, and rejects text that isn't a number. |
 | **Statistical / set-oriented aggregates** | `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT`. |
 | **In-process Connection** | `thindb.local(...)` returns a Connection that mediates queries — same surface a future remote-mode Connection will expose. |
 
