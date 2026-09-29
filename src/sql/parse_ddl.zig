@@ -1135,13 +1135,17 @@ const InsertRows = struct {
             try self.row_vals.append(p.arena, try parseInsertValue(p));
             return true;
         }
-        // A fraction is the DECIMAL constant it spells, as anywhere else in
-        // an expression, so the rows meet at a decimal that holds each one's
-        // digits rather than at a DOUBLE.
+        // A fraction, or an integer past BIGINT, reads as anywhere else in
+        // an expression, a DECIMAL of its digits where one holds them, so
+        // the rows meet at a type that keeps each one's digits rather than
+        // at a DOUBLE.
         // A hex literal stays one, so compile stores it by the column it
         // lands in: its integer in a numeric column, its bytes elsewhere.
-        const fraction = (try parse_predicate.unsignedTokenAhead(p)).tag == .floating;
-        try self.cells.append(p.arena, if (literal and !fraction and !p.cur.isHexLiteral()) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
+        const decimal = switch ((try parse_predicate.unsignedTokenAhead(p)).tag) {
+            .floating, .big_integer => true,
+            else => false,
+        };
+        try self.cells.append(p.arena, if (literal and !decimal and !p.cur.isHexLiteral()) literalExpr(try parseInsertValue(p)) else try p.parseValueExpr());
         return true;
     }
 
@@ -1235,10 +1239,10 @@ fn literalCellAhead(p: anytype) !bool {
     var look = p.lex.*;
     var tok = p.cur;
     switch (tok.tag) {
-        .kw_null, .kw_true, .kw_false, .string, .integer, .floating => {},
+        .kw_null, .kw_true, .kw_false, .string, .integer, .big_integer, .floating => {},
         .plus, .minus => {
             tok = try look.next();
-            if (tok.tag != .integer and tok.tag != .floating) return false;
+            if (tok.tag != .integer and tok.tag != .big_integer and tok.tag != .floating) return false;
         },
         .identifier => {
             if (!asciiEqlAny(tok.text, &.{ "date", "datetime", "timestamp" })) return false;
@@ -1635,6 +1639,7 @@ pub fn parseColumnType(p: anytype) !types.Type {
     // names so DDL and casts emitted by PG clients/ORMs parse unchanged.
     // An UNSIGNED integer widens to the next type that holds its range,
     // except BIGINT UNSIGNED, which keeps 64 bits.
+    if (asciiEqlAny(name, &.{"largeint"})) return integerType(p, .largeint, .largeint);
     if (asciiEqlAny(name, &.{ "bigint", "int8" })) return integerType(p, .bigint, .bigint);
     if (asciiEqlAny(name, &.{ "int", "integer", "int4" })) return integerType(p, .int, .bigint);
     if (asciiEqlAny(name, &.{ "mediumint", "middleint", "int3" })) return integerType(p, .int, .int);

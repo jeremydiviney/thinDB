@@ -2836,6 +2836,7 @@ pub const Parser = struct {
                 },
                 .smallint => |x| return ir.Expr{ .lit = .{ .smallint = -x } },
                 .tinyint => |x| return ir.Expr{ .lit = .{ .tinyint = -x } },
+                .largeint => |x| if (x != std.math.minInt(i128)) return ir.Expr{ .lit = .{ .largeint = -x } },
                 .float => |x| return ir.Expr{ .lit = .{ .float = -x } },
                 .double => |x| return ir.Expr{ .lit = .{ .double = -x } },
                 else => {},
@@ -3657,7 +3658,12 @@ pub const Parser = struct {
             },
             .minus => {
                 try self.advance();
+                // LARGEINT's minimum is LARGEINT, as in StarRocks, though
+                // its digits alone lex past it.
+                const largeint_min = self.cur.tag == .big_integer and
+                    if (signedMagnitude(self.cur.value.big_integer, true)) |v| v == std.math.minInt(i128) else false;
                 const rhs = try self.parseCallAtom();
+                if (largeint_min and rhs == .lit) return ir.Expr{ .lit = .{ .largeint = std.math.minInt(i128) } };
                 return try self.negateExpr(rhs);
             },
             .bang => {
@@ -7845,9 +7851,13 @@ fn exprEqual(a: ir.Expr, b: ir.Expr) bool {
 }
 
 /// An integer literal past BIGINT in an expression: DECIMAL(n,0) as in
-/// MySQL, and DOUBLE past DECIMAL's 38 digits (MySQL's own cap is 65).
+/// MySQL; past DECIMAL's 38 digits, LARGEINT while it fits, as StarRocks
+/// types it, and DOUBLE after that (MySQL's own DECIMAL cap is 65).
 fn bigIntegerLiteral(arena: std.mem.Allocator, digits: []const u8) ParseError!ir.Expr {
-    if (digits.len > 38) return .{ .lit = .{ .double = try bigIntegerDouble(digits, false) } };
+    if (digits.len > 38) {
+        if (std.fmt.parseInt(i128, digits, 10)) |v| return .{ .lit = .{ .largeint = v } } else |_| {}
+        return .{ .lit = .{ .double = try bigIntegerDouble(digits, false) } };
+    }
     return try exec_expr.decimalLiteralExpr(arena, digits, @intCast(digits.len), 0);
 }
 
@@ -7855,10 +7865,17 @@ fn bigIntegerLiteral(arena: std.mem.Allocator, digits: []const u8) ParseError!ir
 /// DEFAULT): LARGEINT while it fits, which coerces exactly to the column it
 /// meets, else DOUBLE. A negated one that fits BIGINT is a BIGINT.
 fn bigIntegerValue(digits: []const u8, negate: bool) ParseError!Value {
-    const magnitude = std.fmt.parseInt(i128, digits, 10) catch return .{ .double = try bigIntegerDouble(digits, negate) };
-    const v = if (negate) -magnitude else magnitude;
+    const v = signedMagnitude(digits, negate) orelse return .{ .double = try bigIntegerDouble(digits, negate) };
     if (std.math.cast(i64, v)) |small| return .{ .bigint = small };
     return .{ .largeint = v };
+}
+
+/// The integer `digits` spell, negated when `negate`, while it fits
+/// LARGEINT, whose minimum's magnitude alone does not.
+fn signedMagnitude(digits: []const u8, negate: bool) ?i128 {
+    const magnitude = std.fmt.parseInt(u128, digits, 10) catch return null;
+    if (negate) return std.math.negateCast(magnitude) catch null;
+    return std.math.cast(i128, magnitude);
 }
 
 fn bigIntegerDouble(digits: []const u8, negate: bool) ParseError!f64 {

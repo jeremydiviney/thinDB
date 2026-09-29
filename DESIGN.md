@@ -251,8 +251,10 @@ expression cell are read as expressions, where every fraction is its
 DECIMAL. The exponent form
 (`1e3`, `2.5E-3`, `6.02e+23`) is DOUBLE, and so is a literal of more than
 38 digits. A literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
-An integer literal past BIGINT is DECIMAL(n,0) of its digits, and DOUBLE past
-38 digits; MySQL keeps DECIMAL to 65 digits, but thinDB's DECIMAL stops at 38.
+An integer literal past BIGINT is DECIMAL(n,0) of its digits. Past 38
+digits it is LARGEINT while it fits, as StarRocks types it
+(`170141183460469231731687303715884105727`), and DOUBLE after that; MySQL
+keeps DECIMAL to 65 digits, but thinDB's DECIMAL stops at 38.
 `-9223372036854775808` is BIGINT, as in MySQL.
 
 In the MySQL dialect a hex literal (`0x41`, `X'41'`) is a byte string, as
@@ -272,7 +274,7 @@ an integer, since BIT columns are integers here. A charset introducer
 than UTF-8 or binary admits only ASCII text, since thinDB does not transcode.
 Adjacent string literals concatenate (`'a' 'b'` is `'ab'`).
 
-A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
+A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored; `CAST(x AS LARGEINT)`, which MySQL lacks, drops it as StarRocks does. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
 
 A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
 

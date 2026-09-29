@@ -980,6 +980,20 @@ pub fn datetimeToBigintKernel(allocator: Allocator, args: []const ColumnView, ou
     }
 }
 
+/// A DATE as its number `YYYYMMDD`, as StarRocks casts one to LARGEINT.
+pub fn dateToLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.date[0..row_count]) |d| try out.data.largeint.append(allocator, common.dateNumber(d));
+}
+
+/// A DATETIME as its number `YYYYMMDDHHMMSS`, as StarRocks casts one to
+/// LARGEINT: the fraction of a second is dropped, where the BIGINT cast
+/// rounds as MySQL does. MySQL has no LARGEINT.
+pub fn datetimeToLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.datetime[0..row_count]) |dt| {
+        try out.data.largeint.append(allocator, @divFloor(common.datetimeNumber(dt).m, std.time.us_per_s));
+    }
+}
+
 pub fn dateToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     for (args[0].data.date[0..row_count]) |d| try out.data.double.append(allocator, @floatFromInt(common.dateNumber(d)));
 }
