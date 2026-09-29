@@ -215,10 +215,10 @@ pub const PlanNeeds = struct {
     /// The needs over an input that already holds `held` charged bytes and
     /// frees each of its chunks, none over `largest_chunk` bytes, once the
     /// plan pulls the next (`RealizedInput`). The partitioned plans and the
-    /// sort copy the whole input before they aggregate or order it, so the
-    /// copy replaces the input's buffers: they need what they add beyond
-    /// them, plus the chunk being copied. Radix and hash stream the input
-    /// into their tables while its buffers are still held.
+    /// sort copy the input as they pull it (hash cores a round of it at a
+    /// time), so the copy replaces the input's buffers: they need what they
+    /// add beyond them, plus the chunk being copied. Radix and hash stream
+    /// the input into their tables while its buffers are still held.
     pub fn consuming(self: PlanNeeds, held: u64, largest_chunk: u64) PlanNeeds {
         return .{
             .radix = self.radix,
@@ -244,9 +244,10 @@ pub fn inputNeeds(
 ) ?PlanNeeds {
     const st = upstream.stats();
     const schema = upstream.outputSchema();
+    const round = partitioned_aggregate.roundBytes(if (upstream.accountant()) |a| a.budget else null);
     const realized = exec.queryAs(RealizedInput, upstream.*) orelse
-        return planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions);
-    const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, realized.largest_chunk_rows, partitions) orelse return null;
+        return planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions, round);
+    const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, realized.largest_chunk_rows, partitions, round) orelse return null;
     return needs.consuming(realized.held_bytes, realized.largest_chunk_bytes);
 }
 
@@ -284,11 +285,12 @@ const GUESSED_STRING_WIDTH: u64 = 32;
 ///   - group state S(w), for tables that also take w rows of the batches
 ///     being inserted (`GroupState`)
 ///   - radix = hash = S(batch_rows): they stream their input into the table
-///   - partitioned with hash-table cores = B + 4 B/row index + 2 W row
+///   - partitioned with hash-table cores = R + 4 B/row index + 2 W row
 ///     bytes + S(W): it buffers its input at its exact size (issue #380),
-///     then each of its `partitions` aggregates its rows in windows of
-///     `PARTITION_BATCH_ROWS` (W rows in all, their strings in doubling
-///     buffers)
+///     but only a round of it: R is the smaller of B and `round_bytes` plus
+///     the batch that crosses it. Each of its `partitions` absorbs its rows
+///     of a round in windows of `PARTITION_BATCH_ROWS` (W rows in all, their
+///     strings in doubling buffers)
 ///   - partitioned with sort cores (`partitioned_sort`) = 2 B + 8 B/row +
 ///     1.5 × groups × a group's bytes: each partition gathers its rows out of
 ///     the buffered input, sorts a row permutation, and streams its groups
@@ -305,6 +307,7 @@ pub fn planNeeds(
     emit_limit: ?u32,
     batch_rows: u64,
     partitions: u64,
+    round_bytes: u64,
 ) ?PlanNeeds {
     const rows = st.upper_rows;
     var row_bytes: u64 = 0;
@@ -314,7 +317,9 @@ pub fn planNeeds(
     const index = rows *| @sizeOf(u32);
     const windows = @min(rows, partitions *| partitioned_aggregate.PARTITION_BATCH_ROWS);
     const streamed = state.bytes(@min(rows, batch_rows));
-    const hash_cores = input +| index +| 2 *| windows *| row_bytes +| state.bytes(windows);
+    const round_rows = @min(rows, round_bytes / @max(row_bytes, 1) +| batch_rows);
+    const round = @min(input, round_rows *| row_bytes);
+    const hash_cores = round +| round_rows *| @sizeOf(u32) +| 2 *| windows *| row_bytes +| state.bytes(windows);
     const sort_cores = 2 *| (input +| index) +| state.groups *| state.group *| STATE_SLACK_NUM / STATE_SLACK_DEN;
     return .{
         .radix = streamed,
@@ -968,6 +973,8 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .func = .count, .col = null, .as = "c" },
     };
     const rows: u64 = 1_000_000;
+    // A round past the input's size buffers all of it.
+    const whole = std.math.maxInt(u64);
 
     // A row of k (20 B + offset), v (100 B + offset + validity) and t.
     const measured = exec.PipelineStats{ .upper_rows = rows, .column_stats = &.{
@@ -975,7 +982,7 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .avg_width = 100 },
         .{},
     } };
-    const needs = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 4).?;
+    const needs = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 4, whole).?;
     const row_bytes = 24 + 105 + 8;
     const input = rows * row_bytes;
     // A slot holds the hash, group id, key slice and both aggregates' cells;
@@ -988,7 +995,7 @@ test "plan needs price the input buffer, the group state and measured widths" {
     try std.testing.expectEqual(state.bytes(0), needs.hash);
     try std.testing.expectEqual(needs.hash, needs.radix);
     // A streamed batch widens the table and adds its scratch.
-    const batched = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4).?;
+    const batched = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4, whole).?;
     try std.testing.expectEqual(state.bytes(1000), batched.hash);
     try std.testing.expect(batched.hash > needs.hash);
     // Four partitions read windows of 64Ki rows, and each one's table takes
@@ -996,8 +1003,15 @@ test "plan needs price the input buffer, the group state and measured widths" {
     const windows = 4 * partitioned_aggregate.PARTITION_BATCH_ROWS;
     try std.testing.expectEqual(input + 4 * rows + 2 * windows * row_bytes + state.bytes(windows), needs.partitioned);
     try std.testing.expectEqual(input + input / 2 + 4 * rows, needs.sort);
+    // Hash cores buffer a round of the input at a time: its bytes, plus the
+    // batch that crosses it.
+    const round_rows = 10_000_000 / row_bytes + 1000;
+    const rounded = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4, 10_000_000).?;
+    try std.testing.expectEqual(round_rows * row_bytes + 4 * round_rows + 2 * windows * row_bytes + state.bytes(windows), rounded.partitioned);
+    try std.testing.expectEqual(needs.sort, rounded.sort);
+    try std.testing.expectEqual(needs.partitioned_sort, rounded.partitioned_sort);
     // Windows past the input's rows hold only its rows.
-    const wide = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 16).?;
+    const wide = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 16, whole).?;
     try std.testing.expectEqual(input + 4 * rows + 2 * input + state.bytes(rows), wide.partitioned);
     // An unknown key NDV prices a group per row, each copying out its MAX_BY
     // value and emitting a row: the hash state outweighs a sort of the input.
@@ -1019,7 +1033,7 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .func = .max_by, .col = "v", .arg2_col = "t", .as = "u" },
         .{ .func = .any_value, .col = "v", .as = "w" },
     };
-    const heavy = planNeeds(measured, &schema, &group_cols, &heavy_aggs, null, 0, 4).?;
+    const heavy = planNeeds(measured, &schema, &group_cols, &heavy_aggs, null, 0, 4, whole).?;
     const heavy_state = groupState(measured, &schema, &group_cols, &heavy_aggs, null).?;
     const heavy_hash_cores = input + 4 * rows + 2 * windows * row_bytes + heavy_state.bytes(windows);
     try std.testing.expectEqual(2 * (input + 4 * rows) + heavy_state.groups * heavy_state.group * 3 / 2, heavy.partitioned_sort);
@@ -1049,7 +1063,7 @@ test "plan needs price the input buffer, the group state and measured widths" {
     } };
     const few_state = groupState(few, &schema, &group_cols, &aggs, null).?;
     try std.testing.expectEqual(@as(u64, 1000), few_state.groups);
-    const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null, 0, 4).?;
+    const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null, 0, 4, whole).?;
     try std.testing.expectEqual(few_state.bytes(0), few_needs.hash);
     try std.testing.expectEqual(needs.sort, few_needs.sort);
     try std.testing.expect(!few_needs.near_unique);
@@ -1060,10 +1074,10 @@ test "plan needs price the input buffer, the group state and measured widths" {
     const count_only = [_]ir.AggSpec{.{ .func = .count, .col = null, .as = "c" }};
     try std.testing.expectEqual(rows, groupState(measured, &schema, &group_cols, &count_only, null).?.groups);
     try std.testing.expectEqual(@as(u64, 11), groupState(measured, &schema, &group_cols, &count_only, 10).?.groups);
-    try std.testing.expectEqual(needs.hash, planNeeds(measured, &schema, &group_cols, &aggs, 10, 0, 4).?.hash);
+    try std.testing.expectEqual(needs.hash, planNeeds(measured, &schema, &group_cols, &aggs, 10, 0, 4, whole).?.hash);
 
     // Unmeasured strings take the 32-byte guess.
-    const guessed = planNeeds(.{ .upper_rows = rows }, &schema, &group_cols, &aggs, null, 0, 4).?;
+    const guessed = planNeeds(.{ .upper_rows = rows }, &schema, &group_cols, &aggs, null, 0, 4, whole).?;
     const guessed_input = rows * (36 + 37 + 8);
     try std.testing.expectEqual(guessed_input + guessed_input / 2 + 4 * rows, guessed.sort);
 
@@ -1080,12 +1094,12 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{},
         .{},
     } };
-    const small_sets = planNeeds(small_t, &schema, &group_cols, &distinct_aggs, null, 0, 4).?.hash;
-    const all_sets = planNeeds(all_t, &schema, &group_cols, &distinct_aggs, null, 0, 4).?.hash;
+    const small_sets = planNeeds(small_t, &schema, &group_cols, &distinct_aggs, null, 0, 4, whole).?.hash;
+    const all_sets = planNeeds(all_t, &schema, &group_cols, &distinct_aggs, null, 0, 4, whole).?.hash;
     try std.testing.expectEqual((rows - 10_000) * ((8 + 16) * 4 / 3 * SET_GROWTH), all_sets - small_sets);
 
     const missing = [_]ir.AggSpec{.{ .func = .max, .col = "nope", .as = "m" }};
-    try std.testing.expectEqual(@as(?PlanNeeds, null), planNeeds(measured, &schema, &group_cols, &missing, null, 0, 4));
+    try std.testing.expectEqual(@as(?PlanNeeds, null), planNeeds(measured, &schema, &group_cols, &missing, null, 0, 4, whole));
 }
 
 const test_schema = [_]types.Column{

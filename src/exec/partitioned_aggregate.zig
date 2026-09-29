@@ -14,14 +14,20 @@
 //! cross-partition merge — which is what lets it carry ANY aggregate the serial
 //! core supports (MAX_BY, ANY_VALUE, COUNT(DISTINCT), …) and any key type.
 //!
-//! The input is buffered once, at its exact size: every upstream batch is
-//! split into contiguous slices, and each scatter worker copies its slice into
-//! a chunk and buckets the chunk's rows by partition. A partition reads its
+//! The input is buffered at its exact size: every upstream batch is split
+//! into contiguous slices, and each scatter worker copies its slice into a
+//! chunk and buckets the chunk's rows by partition. A partition reads its
 //! rows from every chunk in input order, and the last partition to read a
-//! chunk frees it, so the buffer shrinks while the partitions aggregate. The
-//! charge is the raw input bytes plus four bytes a row. Growing one store per
-//! partition and column instead strands every outgrown buffer in an arena,
-//! which charged 7-8x the raw bytes (issue #380).
+//! chunk frees it. The charge is the raw input bytes plus four bytes a row.
+//! Growing one store per partition and column instead strands every
+//! outgrown buffer in an arena, which charged 7-8x the raw bytes (issue
+//! #380).
+//!
+//! Hash cores keep one serial `Aggregate` per partition for the whole input
+//! and aggregate it a round at a time: once the unread chunks hold
+//! `roundBytes`, every partition absorbs its rows of them and frees them, so
+//! only a round of input is ever buffered. Sort cores need their whole
+//! partition before they sort it, so they buffer the whole input.
 //!
 //! Chunks, outputs and each partition's operators come from the thread-safe
 //! worker allocator (the workers allocate concurrently); the per-query
@@ -95,6 +101,21 @@ fn heavyStateAggCount(aggs: []const AggSpec) usize {
 /// Partitions the operator splits its input into for a thread hint.
 pub fn partitionCount(n_parts_hint: usize) usize {
     return @max(@as(usize, 2), @min(n_parts_hint, MAX_PARTS));
+}
+
+/// A round of input is at most this share of the statement's budget...
+const ROUND_BUDGET_SHARE: usize = 16;
+
+/// ...and at most this many bytes. Past a few hundred MiB a round only
+/// holds memory: the partitions' tables persist across rounds, so the work
+/// per row is the same.
+const MAX_ROUND_BYTES: usize = 256 << 20;
+
+/// The unread chunk bytes that start a round of hash-core aggregation, under
+/// a statement budget of `budget` bytes (null: no budget).
+pub fn roundBytes(budget: ?usize) usize {
+    const b = budget orelse return MAX_ROUND_BYTES;
+    return @max(1, @min(MAX_ROUND_BYTES, b / ROUND_BUDGET_SHARE));
 }
 
 /// A batch is split into at most one slice per this many rows: each slice
@@ -176,22 +197,27 @@ const Worker = struct {
     err: ?anyerror = null,
 };
 
-/// A partition's read position over the chunks and the serial aggregate's
-/// retained output.
+/// A partition's read position over the chunks, its hash core while the
+/// rounds feed it, and the serial aggregate's retained output.
 const Partition = struct {
     /// Next chunk to read; every chunk before it has been released.
     cursor: usize = 0,
+    /// The hash core's source; it lives here because the core keeps a
+    /// pointer to it across rounds.
+    scan: ?ChunkScan = null,
+    core: ?*aggregate.Aggregate = null,
     out_cols: []engine.ColumnStore = &.{},
     out_rows: usize = 0,
     err: ?anyerror = null,
 };
 
-/// Source over one partition's rows across every chunk, in input order. The
-/// Aggregate sizes each batch for its worst case (every row a new group, every
-/// value a new distinct pair), so one partition-sized batch made a 93M-row
-/// partition with five groups reserve state for 134M groups (issue #375); the
-/// rows therefore arrive in scan-sized windows. Each chunk is released once
-/// its rows are copied out.
+/// Source over one partition's rows across every chunk scattered so far, in
+/// input order; it returns null once it reaches the last one, and resumes
+/// when a later round adds more. The Aggregate sizes each batch for its
+/// worst case (every row a new group, every value a new distinct pair), so
+/// one partition-sized batch made a 93M-row partition with five groups
+/// reserve state for 134M groups (issue #375); the rows therefore arrive in
+/// scan-sized windows. Each chunk is released once its rows are copied out.
 const ChunkScan = struct {
     owner: *PartitionedAggregate,
     part_idx: usize,
@@ -372,6 +398,8 @@ pub const PartitionedAggregate = struct {
     /// there.
     sorted_stream: bool,
     core: Core,
+    /// Unread chunk bytes that start a round (`roundBytes`).
+    round_bytes: usize,
 
     pub fn create(
         allocator: Allocator,
@@ -423,6 +451,7 @@ pub const PartitionedAggregate = struct {
             .views = views,
             .sorted_stream = core == .sort,
             .core = core,
+            .round_bytes = roundBytes(if (up.accountant()) |a| a.budget else null),
         };
         return exec.makeQuery(allocator, self);
     }
@@ -480,17 +509,19 @@ pub const PartitionedAggregate = struct {
         }
     }
 
-    /// Two-phase worker pool: thread `t` scatters slice `t` of each batch,
-    /// then aggregates partition `t`.
+    /// Worker pool: thread `t` scatters slice `t` of each batch and
+    /// aggregates partition `t`.
     ///
     ///   .scatter   — the conn thread pulled a batch; every worker copies its
     ///                slice into a chunk and buckets the slice's rows by
     ///                partition. Barrier per batch — the views die at the
     ///                next pull.
+    ///   .absorb    — a round's chunks are in; each worker's hash core
+    ///                absorbs its partition's rows of them.
     ///   .aggregate — after the last batch, each worker runs the serial
     ///                Aggregate over its partition's rows.
     ///
-    /// The conn thread participates as worker 0 in both phases.
+    /// The conn thread participates as worker 0 in every phase.
     const Pool = struct {
         owner: *PartitionedAggregate,
         batch: Batch = undefined,
@@ -501,7 +532,7 @@ pub const PartitionedAggregate = struct {
         parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-        const Mode = enum { scatter, aggregate };
+        const Mode = enum { scatter, absorb, aggregate };
 
         fn workerMain(pool: *Pool, worker_idx: usize) void {
             var seen: usize = 0;
@@ -524,6 +555,7 @@ pub const PartitionedAggregate = struct {
             const self = pool.owner;
             switch (pool.mode) {
                 .scatter => self.scatterOne(worker_idx, pool.batch, pool.slices),
+                .absorb => self.absorbOne(worker_idx),
                 .aggregate => self.aggregateOne(worker_idx),
             }
         }
@@ -633,6 +665,34 @@ pub const PartitionedAggregate = struct {
         while (part.cursor < self.chunks.items.len) : (part.cursor += 1) self.releaseChunk(part.cursor);
     }
 
+    /// One round (one worker per partition): the partition's hash core
+    /// absorbs its rows of every chunk scattered since the last round, and
+    /// frees them.
+    fn absorbOne(self: *PartitionedAggregate, part_idx: usize) void {
+        const part = &self.parts[part_idx];
+        const core = self.openHashCore(part_idx) catch |e| {
+            part.err = e;
+            return;
+        };
+        core.absorb() catch |e| {
+            part.err = e;
+        };
+    }
+
+    /// The partition's hash core, created on first use.
+    fn openHashCore(self: *PartitionedAggregate, part_idx: usize) !*aggregate.Aggregate {
+        const part = &self.parts[part_idx];
+        if (part.core) |core| return core;
+        part.scan = try ChunkScan.init(self.worker_alloc, self, part_idx);
+        const src = exec.makeQuery(self.worker_alloc, &part.scan.?);
+        part.core = aggregate.Aggregate.createOperator(self.worker_alloc, src, self.group_cols, self.aggs, null, null) catch |e| {
+            part.scan.?.deinit();
+            part.scan = null;
+            return e;
+        };
+        return part.core.?;
+    }
+
     /// The partition's rows copied into one set of stores at their exact size,
     /// for the permutation sort; null when a string column would pass the 4 GiB
     /// a column view can address.
@@ -720,10 +780,14 @@ pub const PartitionedAggregate = struct {
             }, SortCtx.lessThan);
             permuted_scan = try PermutedInputScan.init(alloc, up_schema, in_views, perm);
             break :blk try exec.makeQuery(alloc, &permuted_scan.?).streamGroupBy(self.group_cols, self.aggs);
+        } else if (!self.sorted_stream) blk: {
+            const core = try self.openHashCore(part_idx);
+            // This run's `agg.deinit()` frees it from here on.
+            part.core = null;
+            break :blk exec.makeQuery(alloc, core);
         } else blk: {
             chunk_scan = try ChunkScan.init(alloc, self, part_idx);
             const src = exec.makeQuery(alloc, &chunk_scan.?);
-            if (!self.sorted_stream) break :blk try aggregate.Aggregate.create(alloc, src, self.group_cols, self.aggs, null, null);
             // Near-unique groups: sort this partition by the group keys and
             // stream — one live group's state instead of a hash table
             // holding a heap state per group.
@@ -744,6 +808,36 @@ pub const PartitionedAggregate = struct {
             out_rows += b.row_count;
         }
         part.out_rows = out_rows;
+    }
+
+    /// Every partition's hash core absorbs the chunks scattered since the
+    /// last round.
+    fn runRound(self: *PartitionedAggregate, pool: *Pool, spawn_ok: bool) !void {
+        if (spawn_ok) {
+            pool.runBarrier(.absorb);
+        } else {
+            for (0..self.n_parts) |p| self.absorbOne(p);
+        }
+        for (self.parts) |*p| if (p.err) |e| return e;
+    }
+
+    /// The `auto` core's choice over the first `rows_in` rows: the scatter
+    /// hashes identify each row's group, so a HyperLogLog over them (~3%
+    /// error) gives the group count before any partition aggregates. ≥90%
+    /// unique picks the sort core: at moderate ratios (measured: 73% unique,
+    /// 3.6M rows) the hash core still wins — the sort's row-bound cost only
+    /// pays off when nearly every row opens a fresh group's heap states.
+    fn keysLookNearUnique(self: *PartitionedAggregate, rows_in: u64) bool {
+        if (self.core != .auto or !estimatesCore(self.aggs, rows_in, self.n_parts)) return false;
+        var ndv: hll.Hll = .{};
+        for (self.workers) |*w| ndv.merge(&w.ndv);
+        const est = ndv.estimate();
+        const near = nearUnique(est, rows_in);
+        if (exec.prof.enabled) std.debug.print(
+            "[hprof] pagg.core: est_groups/rows={d}/{d} heavy_aggs={d} -> {s}\n",
+            .{ est, rows_in, heavyStateAggCount(self.aggs), if (near) "sort+stream" else "hash" },
+        );
+        return near;
     }
 
     fn run(self: *PartitionedAggregate) !void {
@@ -772,10 +866,17 @@ pub const PartitionedAggregate = struct {
         const spawn_ok = spawned == self.n_parts - 1;
 
         self.track_ndv = self.core == .auto and heavyStateAggCount(self.aggs) >= 2;
+        // The `auto` core settles on hash at the first round unless the keys
+        // look near-unique so far; then it buffers the rest and chooses from
+        // the whole input, as a sort core needs its whole partition.
+        var rounds_open = self.core == .auto;
+        var rounds: usize = 0;
+        var unread_bytes: usize = 0;
         var rows_in: u64 = 0;
         var bytes_in: usize = 0;
         var pull_ticks: i64 = 0;
         var scatter_ticks: i64 = 0;
+        var absorb_ticks: i64 = 0;
         while (true) {
             const p0 = if (prof_on) exec.prof.nowTicks() else 0;
             const maybe = try self.up.next();
@@ -800,31 +901,32 @@ pub const PartitionedAggregate = struct {
             // retry the refused growth batch after batch.
             for (self.workers[0..slices]) |*w| if (w.err) |e| return e;
             rows_in += batch.row_count;
-            if (prof_on) {
-                for (batch.values) |view| bytes_in += viewBytes(view, batch.row_count);
-                scatter_ticks += exec.prof.nowTicks() - s0;
+            var batch_bytes: usize = 0;
+            for (batch.values) |view| batch_bytes += viewBytes(view, batch.row_count);
+            bytes_in += batch_bytes;
+            unread_bytes += batch_bytes + batch.row_count * @sizeOf(u32);
+            if (prof_on) scatter_ticks += exec.prof.nowTicks() - s0;
+
+            if (!rounds_open or unread_bytes < self.round_bytes) continue;
+            if (rounds == 0) {
+                // Too few rows yet for the estimate to choose from.
+                if (self.track_ndv and !estimatesCore(self.aggs, rows_in, self.n_parts)) continue;
+                if (self.keysLookNearUnique(rows_in)) {
+                    rounds_open = false;
+                    continue;
+                }
+                // Settled on hash cores: the estimate has served.
+                self.track_ndv = false;
             }
+            const r0 = if (prof_on) exec.prof.nowTicks() else 0;
+            try self.runRound(&pool, spawn_ok);
+            if (prof_on) absorb_ticks += exec.prof.nowTicks() - r0;
+            rounds += 1;
+            unread_bytes = 0;
         }
         const t1 = if (prof_on) exec.prof.nowTicks() else 0;
 
-        // Core selection: the scatter hashes identify each row's group, so a
-        // HyperLogLog over them (~3% error) gives the group count before any
-        // partition runs — every partition then aggregates in the one
-        // parallel phase (a serial hash-core probe of partition 0 used to
-        // precede it). ≥90% unique: at moderate ratios (measured: 73%
-        // unique, 3.6M rows) the hash core still wins — the sort's row-bound
-        // cost only pays off when nearly every row opens a fresh group's
-        // heap states.
-        if (self.core == .auto and estimatesCore(self.aggs, rows_in, self.n_parts)) {
-            var ndv: hll.Hll = .{};
-            for (self.workers) |*w| ndv.merge(&w.ndv);
-            const est = ndv.estimate();
-            self.sorted_stream = nearUnique(est, rows_in);
-            if (prof_on) std.debug.print(
-                "[hprof] pagg.core: est_groups/rows={d}/{d} heavy_aggs={d} -> {s}\n",
-                .{ est, rows_in, heavyStateAggCount(self.aggs), if (self.sorted_stream) "sort+stream" else "hash" },
-            );
-        }
+        if (rounds == 0 and self.keysLookNearUnique(rows_in)) self.sorted_stream = true;
 
         const chunk_count = self.chunks.items.len;
         if (spawn_ok) {
@@ -834,10 +936,12 @@ pub const PartitionedAggregate = struct {
         }
         if (prof_on) {
             const t2 = exec.prof.nowTicks();
-            std.debug.print("[hprof] pagg.scatter {d:.2} ms (pull={d:.2} split+copy={d:.2})  pagg.partitions {d:.2} ms  (parts={d} rows={d} in={d} MiB chunks={d})\n", .{
+            std.debug.print("[hprof] pagg.scatter {d:.2} ms (pull={d:.2} split+copy={d:.2} rounds={d} absorb={d:.2})  pagg.partitions {d:.2} ms  (parts={d} rows={d} in={d} MiB chunks={d})\n", .{
                 exec.prof.ticksToMs(t1 - t0),
                 exec.prof.ticksToMs(pull_ticks),
                 exec.prof.ticksToMs(scatter_ticks),
+                rounds,
+                exec.prof.ticksToMs(absorb_ticks),
                 exec.prof.ticksToMs(t2 - t1),
                 self.n_parts,
                 rows_in,
@@ -895,7 +999,11 @@ pub const PartitionedAggregate = struct {
         const t_free = exec.prof.nowTicks();
         for (self.chunks.items) |maybe| if (maybe) |chunk| chunk.destroy(self.worker_alloc);
         self.chunks.deinit(self.allocator);
-        for (self.parts) |*p| freeStores(self.worker_alloc, p.out_cols);
+        for (self.parts) |*p| {
+            if (p.core) |core| core.deinit();
+            if (p.scan) |*scan| scan.deinit();
+            freeStores(self.worker_alloc, p.out_cols);
+        }
         exec.prof.addPhase("pagg.deinit.buffers", @intCast(exec.prof.nowTicks() - t_free));
         self.allocator.free(self.parts);
         self.allocator.free(self.workers);
@@ -1586,9 +1694,9 @@ test "PartitionedAggregate over many odd-sized batches of strings, JSON and NULL
     try testing.expectEqual(input.rows, total);
 }
 
-fn testTrackedAccountant(a: Allocator) !*exec.memory.MemoryAccountant {
+fn testTrackedAccountant(a: Allocator, budget: usize) !*exec.memory.MemoryAccountant {
     const account = try a.create(exec.memory.MemoryAccountant);
-    account.* = exec.memory.MemoryAccountant.initWithPool(1 << 40, null);
+    account.* = exec.memory.MemoryAccountant.initWithPool(budget, null);
     account.trackAllocations(a);
     return account;
 }
@@ -1606,7 +1714,7 @@ test "PartitionedAggregate charges about the raw input bytes and frees the input
     // Each partition runs one serial aggregate, whose state is sized for a
     // window of new groups however few groups there are.
     const serial_peak = blk: {
-        const account = try testTrackedAccountant(a);
+        const account = try testTrackedAccountant(a, 1 << 40);
         defer account.releaseOwner(a);
         const tracked = try account.executionAllocator();
         var all_views: [mixed_schema.len]ColumnView = undefined;
@@ -1619,7 +1727,7 @@ test "PartitionedAggregate charges about the raw input bytes and frees the input
         break :blk account.peak_bytes;
     };
 
-    const account = try testTrackedAccountant(a);
+    const account = try testTrackedAccountant(a, 1 << 40);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;
@@ -1640,4 +1748,113 @@ test "PartitionedAggregate charges about the raw input bytes and frees the input
     try testing.expect(account.peak_bytes < raw + raw / 2 + n_parts * serial_peak);
     try testing.expect(after_run < raw / 64);
     try testing.expectEqual(@as(usize, 0), account.current_bytes);
+}
+
+/// The serial aggregate's output lines over `input`, the reference the
+/// partitioned runs must match.
+fn testSerialLines(a: Allocator, input: *MixedInput, group_cols: []const []const u8, aggs: []const AggSpec) ![][]u8 {
+    var all_views: [mixed_schema.len]ColumnView = undefined;
+    for (&all_views, &input.all) |*v, *s| v.* = s.view();
+    var window: [mixed_schema.len]ColumnView = undefined;
+    var scan = InputScan{ .schema = &mixed_schema, .source = &all_views, .views = &window, .rows = input.rows };
+    var ser = try aggregate.Aggregate.create(a, exec.makeQuery(a, &scan), group_cols, aggs, null, null);
+    defer ser.deinit();
+    return testCollectLines(a, &ser);
+}
+
+/// Runs the partitioned aggregate over `input` under `budget`, in rounds of
+/// `round_bytes` when given, checks its rows against `expected` and that it
+/// kept its hash cores, and returns its accounted peak.
+fn testHashCorePeak(
+    a: Allocator,
+    input: *MixedInput,
+    group_cols: []const []const u8,
+    aggs: []const AggSpec,
+    budget: usize,
+    round_bytes: ?usize,
+    expected: []const []u8,
+) !usize {
+    const account = try testTrackedAccountant(a, budget);
+    defer account.releaseOwner(a);
+    const tracked = try account.executionAllocator();
+    var batch_views: [mixed_schema.len]ColumnView = undefined;
+    var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
+    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), group_cols, aggs, 2, .auto);
+    const lines = blk: {
+        defer pa.deinit();
+        const op = exec.queryAs(PartitionedAggregate, pa).?;
+        if (round_bytes) |bytes| op.round_bytes = bytes;
+        const lines = try testCollectLines(a, &pa);
+        errdefer testFreeLines(a, lines);
+        try testing.expect(!op.sorted_stream);
+        break :blk lines;
+    };
+    defer testFreeLines(a, lines);
+    try testing.expectEqual(expected.len, lines.len);
+    for (lines, expected) |line, want| try testing.expectEqualStrings(want, line);
+    try testing.expectEqual(@as(usize, 0), account.current_bytes);
+    return account.peak_bytes;
+}
+
+test "PartitionedAggregate hash cores aggregate the input a round at a time" {
+    const a = testing.allocator;
+    const sizes = [_]usize{16384} ** 96 ++ [_]usize{4099};
+    var input = try MixedInput.init(a, &sizes);
+    defer input.deinit(a);
+    const raw = input.rawBatchBytes();
+    const group_cols = [_][]const u8{"k"};
+
+    // Without a budget a round (256 MiB) is past this ~105 MB input, so the
+    // partitions buffer all of it. Under a budget of that peak, a round is a
+    // sixteenth of it. COUNT and MIN(double) keep the partitions' state
+    // small beside the input.
+    const light_aggs = [_]AggSpec{ mixed_aggs[0], mixed_aggs[4] };
+    const light = try testSerialLines(a, &input, &group_cols, &light_aggs);
+    defer testFreeLines(a, light);
+    const whole_peak = try testHashCorePeak(a, &input, &group_cols, &light_aggs, 1 << 40, null, light);
+    try testing.expect(whole_peak > raw);
+    const round_peak = try testHashCorePeak(a, &input, &group_cols, &light_aggs, whole_peak, null, light);
+    try testing.expect(round_peak + raw / 2 < whole_peak);
+
+    // Rounds of 1 MiB carry every kind of aggregate state across about a
+    // hundred rounds. Three heavy aggregates make the core an estimate at
+    // the first round, and 38 keys over 1.6M rows keep the hash cores.
+    const all = try testSerialLines(a, &input, &group_cols, &mixed_aggs);
+    defer testFreeLines(a, all);
+    _ = try testHashCorePeak(a, &input, &group_cols, &mixed_aggs, 1 << 40, 1 << 20, all);
+}
+
+test "PartitionedAggregate keeps buffering once the first round's keys look near-unique" {
+    const a = testing.allocator;
+    const sizes = [_]usize{16384} ** 16;
+    var input = try MixedInput.init(a, &sizes);
+    defer input.deinit(a);
+    const raw = input.rawBatchBytes();
+    const group_cols = [_][]const u8{"o"};
+    const aggs = [_]AggSpec{
+        .{ .func = .max_by, .col = "j", .arg2_col = "n", .as = "mj" },
+        .{ .func = .any_value, .col = "s", .as = "av" },
+    };
+    const ser_lines = try testSerialLines(a, &input, &group_cols, &aggs);
+    defer testFreeLines(a, ser_lines);
+
+    // Rounds of half the input would start halfway, but the sort core the
+    // unique keys call for needs each partition whole.
+    const account = try testTrackedAccountant(a, 8 * raw);
+    defer account.releaseOwner(a);
+    const tracked = try account.executionAllocator();
+    var batch_views: [mixed_schema.len]ColumnView = undefined;
+    var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
+    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), &group_cols, &aggs, 2, .auto);
+    const par_lines = blk: {
+        defer pa.deinit();
+        const lines = try testCollectLines(a, &pa);
+        try testing.expect(exec.queryAs(PartitionedAggregate, pa).?.sorted_stream);
+        break :blk lines;
+    };
+    defer testFreeLines(a, par_lines);
+
+    try testing.expectEqual(input.rows, ser_lines.len);
+    try testing.expectEqual(ser_lines.len, par_lines.len);
+    for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
 }

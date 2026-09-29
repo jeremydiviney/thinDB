@@ -1006,6 +1006,19 @@ pub const Aggregate = struct {
         top_k: ?TopKHint,
         emit_limit: ?u32,
     ) !Query {
+        return makeQuery(allocator, try createOperator(allocator, upstream, group_cols, aggs, top_k, emit_limit));
+    }
+
+    /// `create` without the `Query` handle, for a caller that feeds the
+    /// aggregate a round of input at a time (`absorb`).
+    pub fn createOperator(
+        allocator: Allocator,
+        upstream: Query,
+        group_cols: []const []const u8,
+        aggs: []const AggSpec,
+        top_k: ?TopKHint,
+        emit_limit: ?u32,
+    ) !*Aggregate {
         if (aggs.len == 0) return Error.AggregateNoSpecs;
         const up_schema = upstream.outputSchema();
 
@@ -1324,7 +1337,7 @@ pub const Aggregate = struct {
                 if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};
             }
         }
-        return makeQuery(allocator, self);
+        return self;
     }
 
     pub fn deinit(self: *Aggregate) void {
@@ -1456,13 +1469,21 @@ pub const Aggregate = struct {
         try self.upstream.explain(out, allocator, depth + 1);
     }
 
+    /// Accumulates the upstream's batches until it returns null, without
+    /// emitting. An upstream that ends each round of its input with a null
+    /// and resumes on the next call feeds the aggregate a round at a time;
+    /// `next()` then takes the last round and emits.
+    pub fn absorb(self: *Aggregate) !void {
+        while (try self.upstream.next()) |batch| {
+            try self.accumulateBatch(batch);
+        }
+    }
+
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;
 
-        while (try self.upstream.next()) |batch| {
-            try self.accumulateBatch(batch);
-        }
+        try self.absorb();
 
         // Count-in-slot is purely an accumulate optimization: lower its
         // `{key,count}` slots into the standard `gkeys_int` / `gstate` arrays
