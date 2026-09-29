@@ -351,27 +351,36 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
 
     // COALESCE / IFNULL — first non-null, all operands decimal/int.
     if ((std.ascii.eqlIgnoreCase(name, "coalesce") or std.ascii.eqlIgnoreCase(name, "ifnull")) and allDecimalOrInt(arg_types)) {
-        const spec = dec.commonSpec(arg_types) orelse return null;
-        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.coalesceKernel, .absorbs);
+        const rt = decimalResultOf(arg_types) orelse return null;
+        return try buildDecFn(aa, name, arg_types, rt, dec.coalesceKernel, .absorbs);
     }
 
     if (std.ascii.eqlIgnoreCase(name, "nullif") and arg_types.len == 2 and allDecimalOrInt(arg_types)) {
-        const spec = dec.commonSpec(arg_types) orelse return null;
-        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.nullifKernel, .kernel_managed);
+        const rt = decimalResultOf(arg_types) orelse return null;
+        return try buildDecFn(aa, name, arg_types, rt, dec.nullifKernel, .kernel_managed);
     }
 
     if (std.ascii.eqlIgnoreCase(name, "if") and arg_types.len == 3 and arg_types[0] == .boolean and allDecimalOrInt(arg_types[1..])) {
-        const spec = dec.commonSpec(arg_types[1..]) orelse return null;
-        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), dec.ifKernel, .kernel_managed);
+        const rt = decimalResultOf(arg_types[1..]) orelse return null;
+        return try buildDecFn(aa, name, arg_types, rt, dec.ifKernel, .kernel_managed);
     }
 
     if ((std.ascii.eqlIgnoreCase(name, "greatest") or std.ascii.eqlIgnoreCase(name, "least")) and allDecimalOrInt(arg_types)) {
-        const spec = dec.commonSpec(arg_types) orelse return null;
+        const rt = decimalResultOf(arg_types) orelse return null;
         const k = if (std.ascii.eqlIgnoreCase(name, "greatest")) dec.greatestKernel else dec.leastKernel;
-        return try buildDecFn(aa, name, arg_types, dec.decTypeFor(spec.p, spec.s), k, .propagates);
+        return try buildDecFn(aa, name, arg_types, rt, k, .propagates);
     }
 
     return null;
+}
+
+/// The decimal a function returning one of `args` returns: the type they
+/// meet at by the result-type rule (`cast.commonType`). Null when that is
+/// no decimal (a LARGEINT beside one), so the call converts its arguments to
+/// that type instead.
+fn decimalResultOf(args: []const Type) ?Type {
+    const t = cast.commonTypeOf(args) orelse return null;
+    return if (t.isDecimal()) t else null;
 }
 
 // ---------------------------------------------------------------------------
