@@ -986,6 +986,12 @@ pub fn dateToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *
     for (args[0].data.date[0..row_count]) |d| try out.data.bigint.append(allocator, common.dateNumber(d));
 }
 
+/// A DATE as its number `YYYYMMDD`, as StarRocks casts one to INT. Every
+/// DATE fits, since the last is 9999-12-31.
+pub fn dateToIntKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.date[0..row_count]) |d| try out.data.int.append(allocator, @intCast(common.dateNumber(d)));
+}
+
 /// A DATETIME as its number `YYYYMMDDHHMMSS`, rounded to the second first,
 /// as MySQL rounds it: 23:59:59.5 is the next day at 000000.
 pub fn datetimeToBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

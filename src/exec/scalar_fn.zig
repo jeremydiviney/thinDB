@@ -1512,6 +1512,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_bigint", .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.stringToBigintKernel },
     // A date or datetime as a number is its YYYYMMDD[HHMMSS] digits, as in MySQL.
     .{ .name = "to_bigint", .arg_types = &.{.date}, .return_type = .bigint, .kernel = date.dateToBigintKernel },
+    .{ .name = "to_int", .arg_types = &.{.date}, .return_type = .int, .kernel = date.dateToIntKernel },
     .{ .name = "to_bigint", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.datetimeToBigintKernel },
     .{ .name = "to_bigint", .arg_types = &.{.largeint}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.largeintToBigintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.doubleToLargeintKernel },

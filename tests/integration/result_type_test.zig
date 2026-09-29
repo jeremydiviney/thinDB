@@ -141,14 +141,61 @@ test "result type: UNION arms meet at one type" {
     });
 }
 
+test "result type: a number meets a DATE as its YYYYMMDD number and a DATETIME as its YYYYMMDDhhmmss number (issue #430)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db,
+        \\CREATE TABLE rt (id BIGINT PRIMARY KEY, ti TINYINT, i INT, li LARGEINT, bo BOOLEAN, f FLOAT,
+        \\  x DOUBLE, a DECIMAL(10,2), d DATE, ts DATETIME)
+    );
+    try helpers.exec(allocator, db,
+        \\INSERT INTO rt VALUES
+        \\  (1, 5, 20260131, 20260131, true, 1.5, 20260131, 1.50, '2026-01-01', '2026-01-01 10:20:30'),
+        \\  (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2026-02-03', '2026-02-03 04:05:06'),
+        \\  (3, 7, 20260131, 20260131, false, 1.5, 20260131, 1.50, NULL, NULL)
+    );
+
+    // StarRocks' results. An integer meets a DATE as INT and a DATETIME as
+    // BIGINT, a decimal meets either as DOUBLE, a float meets a DATETIME as
+    // DOUBLE and a DATE as text.
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{
+        .{ .sql = "SELECT CAST(CAST(d AS INT) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260101", "20260203", NULL } },
+        .{ .sql = "SELECT CAST(COALESCE(i, d) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", "20260203", "20260131" } },
+        .{ .sql = "SELECT CAST(IFNULL(i, ts) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", "20260203040506", "20260131" } },
+        .{ .sql = "SELECT CAST(COALESCE(i, d, ts) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", "20260203", "20260131" } },
+        .{ .sql = "SELECT CAST(GREATEST(i, d) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", NULL, NULL } },
+        .{ .sql = "SELECT CAST(LEAST(i, d) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260101", NULL, NULL } },
+        .{ .sql = "SELECT CAST(GREATEST(i, ts) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260101102030", NULL, NULL } },
+        .{ .sql = "SELECT CAST(IF(id = 1, ti, d) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "5", "20260203", NULL } },
+        .{ .sql = "SELECT CAST(CASE WHEN id = 1 THEN bo ELSE d END AS CHAR) FROM rt ORDER BY id", .expected = &.{ "1", "20260203", NULL } },
+        .{ .sql = "SELECT CAST(CASE WHEN id = 1 THEN ts ELSE ti END AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260101102030", NULL, "7" } },
+        .{ .sql = "SELECT CAST(COALESCE(li, ts) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", "20260203040506", "20260131" } },
+        .{ .sql = "SELECT CAST(COALESCE(a, d) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "1.5", "20260203", "1.5" } },
+        .{ .sql = "SELECT CAST(COALESCE(x, ts) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", "20260203040506", "20260131" } },
+        .{ .sql = "SELECT COALESCE(x, d) FROM rt ORDER BY id", .expected = &.{ "20260131", "2026-02-03", "20260131" } },
+        .{ .sql = "SELECT GREATEST(f, d) FROM rt ORDER BY id", .expected = &.{ "2026-01-01", NULL, NULL } },
+        .{ .sql = "SELECT LEAST(f, d) FROM rt ORDER BY id", .expected = &.{ "1.5", NULL, NULL } },
+        .{ .sql = "SELECT CAST(IF(id = 1, 20260131, DATE '2026-01-01') AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", "20260101", "20260101" } },
+        .{ .sql = "SELECT CAST(CASE WHEN id = 1 THEN 20260131 ELSE DATE '2026-01-01' END AS CHAR) FROM rt ORDER BY id", .expected = &.{ "20260131", "20260101", "20260101" } },
+        .{ .sql = "SELECT CAST(GREATEST(20260131, DATE '2026-01-01') AS CHAR) FROM rt WHERE id = 1", .expected = &.{"20260131"} },
+        .{ .sql = "SELECT CAST(COALESCE(20260131, TIMESTAMP '2026-01-01 10:00:00') AS CHAR) FROM rt WHERE id = 1", .expected = &.{"20260131"} },
+        .{ .sql = "SELECT CAST(v AS CHAR) FROM (SELECT i AS v FROM rt WHERE id = 1 UNION ALL SELECT d FROM rt WHERE id <= 2) u ORDER BY v", .expected = &.{ "20260101", "20260131", "20260203" } },
+        .{ .sql = "WITH u AS (SELECT x AS v FROM rt WHERE id = 1 UNION ALL SELECT ts FROM rt WHERE id <= 2) SELECT CAST(v AS CHAR) FROM u ORDER BY v", .expected = &.{ "20260131", "20260101102030", "20260203040506" } },
+    });
+}
+
 test "result type: kinds that never meet are rejected" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
     defer db.close();
-    try setup(allocator, db);
+    try helpers.exec(allocator, db, "CREATE TABLE rt (id BIGINT PRIMARY KEY, u UUID, i INT, d DATE)");
 
-    try helpers.expectRunError(allocator, db, "SELECT CASE WHEN id = 1 THEN i ELSE d END FROM rt", error.ComputeUnsupportedExpr);
-    try helpers.expectRunError(allocator, db, "SELECT i FROM rt UNION ALL SELECT d FROM rt", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT CASE WHEN id = 1 THEN i ELSE u END FROM rt", error.ComputeUnsupportedExpr);
+    try helpers.expectRunError(allocator, db, "SELECT i FROM rt UNION ALL SELECT u FROM rt", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT d FROM rt UNION ALL SELECT u FROM rt", error.TypeMismatch);
 }
