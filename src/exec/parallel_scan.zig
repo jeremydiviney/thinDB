@@ -731,6 +731,10 @@ pub const ParallelScan = struct {
     compute_q: []Query = &.{},
     compute_built: usize = 0,
     compute_fused: bool = false,
+    /// A filter over the fused computes' output (it reads a derived column,
+    /// so no Scan could take it) runs inside each `compute_q[i]`. Like a
+    /// scan-fused filter, it bounds the survivors the workers hand upward.
+    compute_filtered: bool = false,
 
     // Fused PARTIAL aggregate (set via tryFuseAggregate, two-phase GROUP BY):
     // each worker drains `agg_q[i]` (a partial Aggregate over its ranged Scan)
@@ -1247,6 +1251,7 @@ pub const ParallelScan = struct {
     }
 
     pub fn tryFuseFilter(self: *ParallelScan, expr: predicate.PredicateExpr) !bool {
+        if (self.compute_fused) return self.fuseFilterIntoComputes(expr);
         // Every worker is an identical Scan over the same table/projection, so
         // fusion succeeds (or not) uniformly. Apply to all to stay consistent.
         var fused = false;
@@ -1255,6 +1260,40 @@ pub const ParallelScan = struct {
             if (i == 0) fused = r;
         }
         return fused;
+    }
+
+    /// Filter offered above the fused computes. A predicate on base columns
+    /// commutes past each worker's Compute into its Scan. One that reads a
+    /// derived column (`WHERE a % 32 = 0` lowers to a filter on a hidden
+    /// computed column) is layered on top of every `compute_q[i]` instead,
+    /// so the stripe workers apply it rather than a serial Filter seeing
+    /// every computed row. Declines once something past the computes shapes
+    /// the emission (a probe sink's joined rows, an emit projection) or the
+    /// strategy is settled.
+    fn fuseFilterIntoComputes(self: *ParallelScan, expr: predicate.PredicateExpr) !bool {
+        if (self.mode != .unset or self.probe_sink != null or self.emit_keep != null) return false;
+        var pushed = false;
+        for (self.compute_q, 0..) |*wq, i| {
+            const r = try wq.tryFuseFilter(expr);
+            if (i == 0) pushed = r;
+        }
+        if (pushed) return true;
+        for (self.compute_q) |*wq| wq.* = try wq.filter(expr);
+        self.compute_filtered = true;
+        return true;
+    }
+
+    /// Materialize drains every survivor into worker buffers before the first
+    /// emit, so it only pays when something inside the workers bounds the
+    /// survivors: a partial aggregate, or a filter fused over a TABLE. A fused
+    /// compute alone keeps every row and streams. A BUFFER source streams even
+    /// when filtered: the stage already holds its rows, and copying them again
+    /// wholesale is what blows the budget on wide stages.
+    fn materializesOnPull(self: *const ParallelScan) bool {
+        if (self.agg_fused) return true;
+        if (self.table == null) return false;
+        if (self.compute_filtered) return true;
+        return self.workers.len > 0 and self.workers[0].fusedActive();
     }
 
     /// Absorb a row-local projection Compute: build one Compute per worker over
@@ -1600,8 +1639,7 @@ pub const ParallelScan = struct {
     /// No-op for the round (stream) path — that emits the scan's already-pruned
     /// columns, so there is nothing dead to drop.
     pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
-        if (self.stage_deferred and self.workers.len == 0) return; // round path: nothing dead to drop
-        if (!(self.workers[0].fusedActive() or self.compute_fused)) return;
+        if (self.agg_fused or !self.materializesOnPull()) return;
         try self.applyEmitProjection(keep);
     }
 
@@ -1640,7 +1678,7 @@ pub const ParallelScan = struct {
 
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         var buf: [192]u8 = undefined;
-        const tag = if (self.ordered) "ordered" else if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) "materialize+compute" else if (self.workers.len == 0) "deferred" else if (self.workers[0].fusedActive()) "materialize" else "stream";
+        const tag = if (self.ordered) "ordered" else if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) (if (self.materializesOnPull()) "materialize+compute" else "stream+compute") else if (self.workers.len == 0) "deferred" else if (self.workers[0].fusedActive()) "materialize" else "stream";
         const src_name = if (self.table) |t| t.name else "<buffer>";
         const line = std.fmt.bufPrint(&buf, "ParallelScan {s} (DOP={d}, {s})", .{ src_name, self.n_threads, tag }) catch "ParallelScan";
         try exec.explainLine(out, allocator, depth, line);
@@ -1758,19 +1796,12 @@ pub const ParallelScan = struct {
         if (self.mode == .unset) {
             self.rebalanceChunksForPruning();
             // Fusion happens after create() (the wrapping Filter/Compute fuse on
-            // their way up), so the strategy is settled by the first pull. Over
-            // a TABLE, a fused filter (bounded survivors) or compute ⇒
-            // materialize + concat. Over a BUFFER source, fused filters AND
-            // computes stream (round mode): the workers evaluate per stripe and
-            // emit batch-at-a-time, so a streaming CTE chain crosses the stage
-            // boundary parallel with NO full-result copy — duplicating an
-            // already-materialized buffer wholesale is what blows the memory
-            // budget on wide stages. (A STAGE consumer still gets materialized
-            // buffers via takeOwnedChunks, which decides its own mode above.)
-            const buffer_src = self.table == null;
-            const force_mat = self.agg_fused or
-                ((self.workers[0].fusedActive() or self.compute_fused) and !buffer_src);
-            self.mode = if (force_mat) .materialize else .round;
+            // their way up), so the strategy is settled by the first pull.
+            // Unless `materializesOnPull`, the scan streams in round mode: the
+            // workers evaluate per stripe and emit batch-at-a-time. (A STAGE
+            // consumer still gets materialized buffers via takeOwnedChunks,
+            // which decides its own mode above.)
+            self.mode = if (self.materializesOnPull()) .materialize else .round;
             if (self.mode == .materialize) try self.runMaterialize();
         }
         return switch (self.mode) {
