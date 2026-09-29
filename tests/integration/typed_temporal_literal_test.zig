@@ -546,8 +546,8 @@ test "a number reads as CAST(n AS DATETIME) reads it where a date function wants
     }
 
     // A function that returns one of its arguments meets a number and a
-    // date at their common type, which StarRocks makes the number (#430),
-    // so the number isn't read as a date there.
-    try std.testing.expectError(error.ComputeNoSuchOverload, helpers.collectStrings(allocator, db, "SELECT COALESCE(i, DATE '2026-01-01') FROM typed"));
-    try std.testing.expectError(error.ComputeNoSuchOverload, helpers.collectStrings(allocator, db, "SELECT GREATEST(i, DATE '2026-01-01') FROM typed"));
+    // date at their common type, which StarRocks makes the number (#430):
+    // the date is its YYYYMMDD number there, not the number a date.
+    try expectStrings(allocator, db, "SELECT CAST(COALESCE(i, DATE '2026-01-01') AS CHAR) FROM typed", &.{"20260131"});
+    try expectStrings(allocator, db, "SELECT CAST(GREATEST(i, DATE '2026-01-01') AS CHAR) FROM typed", &.{"20260131"});
 }
