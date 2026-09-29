@@ -1685,7 +1685,7 @@ fn allocCreateTableText(allocator: Allocator, t: *Table) ![]u8 {
     errdefer out.deinit(allocator);
     try out.print(allocator, "CREATE TABLE `{s}` (", .{t.name});
     for (t.schema.columns, 0..) |col, i| {
-        const type_text = try allocMysqlColumnType(allocator, col.type);
+        const type_text = try allocDdlColumnType(allocator, col.type);
         defer allocator.free(type_text);
         try out.print(allocator, "{s}\n  `{s}` {s}", .{ if (i == 0) "" else ",", col.name, type_text });
         if (!col.nullable) try out.appendSlice(allocator, " NOT NULL");
@@ -2192,6 +2192,14 @@ fn tokenAtIgnoreCase(text: []const u8, i: usize, token: []const u8) bool {
     if (i > 0 and isIdentByte(text[i - 1])) return false;
     if (i + token.len < text.len and isIdentByte(text[i + token.len])) return false;
     return true;
+}
+
+/// A column's type as CREATE TABLE spells it. Only LARGEINT differs from
+/// `allocMysqlColumnType`, which shows it to MySQL clients as the
+/// decimal(38,0) they know; DDL that runs again needs the type itself.
+fn allocDdlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
+    if (t == .largeint) return allocator.dupe(u8, "largeint");
+    return allocMysqlColumnType(allocator, t);
 }
 
 fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
@@ -4341,6 +4349,34 @@ test "SHOW CREATE TABLE, SHOW COLUMNS and information_schema report ON UPDATE CU
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x1bon update CURRENT_TIMESTAMP") != null);
         try std.testing.expect(std.mem.indexOf(u8, rows, "\x11DEFAULT_GENERATED") != null);
     }
+}
+
+test "SHOW CREATE TABLE spells LARGEINT so its DDL runs again, where SHOW COLUMNS shows the decimal(38,0) MySQL knows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE lg (id LARGEINT PRIMARY KEY, v LARGEINT)", &profiler);
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "SHOW CREATE TABLE lg", &profiler);
+    const ddl = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`id` largeint NOT NULL,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`v` largeint,") != null);
+
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "SHOW COLUMNS FROM lg", &profiler);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "decimal(38,0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "largeint") == null);
 }
 
 /// The first column's name in a result-set reply: the column-def packet
