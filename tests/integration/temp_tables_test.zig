@@ -429,6 +429,44 @@ test "temp tables: duplicate CREATE TEMP TABLE returns TableAlreadyExists" {
     );
 }
 
+fn failingKernel(ctx: *const thindb.udf.ScalarContext, args: []const thindb.storage.ColumnView, out: *thindb.engine.ColumnStore, count: usize) !void {
+    _ = .{ ctx, args, out, count };
+    return error.ProbeFailed;
+}
+
+test "temp tables: a CTAS whose query fails leaves no temp table" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try db.registerScalarUdf(.{
+        .name = "fail_probe",
+        .arg_types = &.{.bigint},
+        .return_type = .bigint,
+        .kernel = failingKernel,
+    });
+
+    const catalog = thindb.net.catalogFor(db).?;
+    var ns = try thindb.TempNamespace.open(allocator, io, catalog.root_dir, 51, catalog.config);
+    defer ns.close();
+    const session: thindb.api.Session = .{ .temp_namespace = ns };
+
+    try runAndDrain(allocator, db, session, "CREATE TABLE src (id BIGINT PRIMARY KEY)");
+    try runAndDrain(allocator, db, session, "INSERT INTO src VALUES (1), (2)");
+    try expectCompileError(allocator, db, session, "CREATE TEMPORARY TABLE bad AS SELECT fail_probe(id) AS id FROM src", error.ProbeFailed);
+    try std.testing.expect(!ns.contains("bad"));
+    try std.testing.expectError(error.FileNotFound, ns.tmp_dir.access(io, "bad", .{}));
+
+    try runAndDrain(allocator, db, session, "CREATE TEMPORARY TABLE bad AS SELECT id FROM src");
+    var q = try runSqlSession(allocator, db, session, "SELECT id FROM bad ORDER BY id");
+    defer q.deinit();
+    const ids = try collectI64Column(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, ids);
+}
+
 test "keyed region: recreated temporary lookups validate contents schema and session" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
