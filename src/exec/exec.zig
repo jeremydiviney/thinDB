@@ -411,14 +411,35 @@ pub const ColCard = union(enum) {
 /// (the same encoding `statsOverlapPredicate` compares against) and are only
 /// populated for fixed-width int-family columns (integers, temporal,
 /// boolean, decimal); they stay `null` for float, string, and uuid columns
-/// whose manifest stats aren't a usable numeric range. All three fields are
-/// PROVABLE UPPER/inclusive bounds — operators only ever tighten them, never
-/// estimate beyond what the data guarantees.
+/// whose manifest stats aren't a usable numeric range. `ndv`, `min` and `max`
+/// are PROVABLE UPPER/inclusive bounds — operators only ever tighten them,
+/// never estimate beyond what the data guarantees.
 pub const ColStat = struct {
     ndv: ColCard = .unknown,
     min: ?i128 = null,
     max: ?i128 = null,
+    /// Mean payload bytes per row of a string column, measured on a realized
+    /// buffer (a stage's result, a drained GROUP BY input). A measurement,
+    /// not a bound: operators carry it through unchanged, so a filter's
+    /// survivors may average differently. Null = not measured.
+    avg_width: ?u32 = null,
 };
+
+/// `ColStat.avg_width` for `payload` string bytes spread over `rows` rows,
+/// rounded up. Null when there are no rows to measure.
+pub fn avgWidth(payload: u64, rows: u64) ?u32 {
+    if (rows == 0) return null;
+    const mean = payload / rows + @intFromBool(payload % rows != 0);
+    return @intCast(@min(mean, std.math.maxInt(u32)));
+}
+
+/// String payload bytes a view holds (0 for fixed-width data).
+pub fn stringPayloadBytes(view: storage.ColumnView) u64 {
+    return switch (view.data) {
+        .varchar, .string, .char, .json => |sv| sv.offsets[sv.offsets.len - 1] - sv.offsets[0],
+        else => 0,
+    };
+}
 
 /// Cap a column statistic's distinct-value bound at `upper_rows`: a column
 /// can never hold more distinct values than there are rows. Leaves min/max
@@ -1100,6 +1121,7 @@ pub fn concatJoinStats(
 /// known sum saturating-adds; an unknown on either side stays unknown. Range:
 /// the union spans both, so min/max widen to the outer bounds — but only when
 /// BOTH sides bound that end (a null on either side means that end is unbounded).
+/// Width: the union's mean lies between the sides', so the wider one covers it.
 pub fn mergeUnionColStat(l: ColStat, r: ColStat) ColStat {
     const ndv: ColCard = switch (l.ndv) {
         .unknown => .unknown,
@@ -1110,7 +1132,8 @@ pub fn mergeUnionColStat(l: ColStat, r: ColStat) ColStat {
     };
     const min: ?i128 = if (l.min) |lm| (if (r.min) |rm| @min(lm, rm) else null) else null;
     const max: ?i128 = if (l.max) |lm| (if (r.max) |rm| @max(lm, rm) else null) else null;
-    return .{ .ndv = ndv, .min = min, .max = max };
+    const avg_width: ?u32 = if (l.avg_width) |lw| (if (r.avg_width) |rw| @max(lw, rw) else null) else null;
+    return .{ .ndv = ndv, .min = min, .max = max, .avg_width = avg_width };
 }
 
 /// Build the per-column stats for a UNION ALL over two arms whose schemas align

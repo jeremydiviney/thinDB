@@ -147,6 +147,7 @@ test {
     _ = @import("exec/region_exec.zig");
     _ = @import("exec/partitioned_aggregate.zig");
     _ = @import("exec/parallel_reduce.zig");
+    _ = @import("exec/group_route.zig");
     _ = @import("util/query_cancellation_test.zig");
     _ = @import("util/cancellable_sort.zig");
     _ = @import("util/tcp_listener.zig");

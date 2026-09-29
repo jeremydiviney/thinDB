@@ -26,7 +26,6 @@ const ir = @import("../ir/ir.zig");
 const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const group_route = @import("../exec/group_route.zig");
-const partitioned_aggregate = @import("../exec/partitioned_aggregate.zig");
 const mat_stage = @import("../exec/mat_stage.zig");
 const window_op = @import("../exec/window.zig");
 const local = @import("local.zig");
@@ -820,23 +819,28 @@ fn collectBlockStages(
     }
 }
 
-/// Defers the GROUP BY hash-vs-sort decision to first `next()`: it `ensureRun`s
-/// the materialized stages its input reads, so `routeGroupBy` sees the realized
-/// row count (not a pre-run estimate) — the right call for deep CTE chains
-/// where an estimate compounds badly. EXPLAIN never calls `next()`, so the plan
-/// stays cheap to print and the stages aren't run.
+/// Defers the GROUP BY plan choice to first `next()`, where the input's size
+/// is known rather than estimated. It `ensureRun`s the materialized stages
+/// its input reads, so the router sees their realized row counts and string
+/// widths — the right call for deep CTE chains where an estimate compounds
+/// badly. With `realize` it also drains an input that can hand over its
+/// buffers (a filtered table scan materializes its survivors anyway) and
+/// routes on those exact bytes through `RealizedInput`: a pre-filter row
+/// bound can price a plan out, or in, by an order of magnitude. EXPLAIN never
+/// calls `next()`, so the plan stays cheap to print and nothing runs.
 const AdaptiveGroupBy = struct {
     allocator: Allocator,
     /// Thread-safe allocator for parallel routes (global reduce workers).
     worker_alloc: Allocator,
     up: exec.Query,
-    stages: []*mat_stage.Stage,
+    stages: []const *mat_stage.Stage,
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     top_k: ?ir.Op.TopK,
     emit_limit: ?u32,
     budget: usize,
     max_dop: usize,
+    realize: bool,
     output_schema: []types.Column,
     chosen: ?exec.Query = null,
     routed: bool = false,
@@ -845,13 +849,14 @@ const AdaptiveGroupBy = struct {
         allocator: Allocator,
         worker_alloc: Allocator,
         up: exec.Query,
-        stages: []*mat_stage.Stage,
+        stages: []const *mat_stage.Stage,
         group_cols: []const []const u8,
         aggs: []const ir.AggSpec,
         top_k: ?ir.Op.TopK,
         emit_limit: ?u32,
         budget: usize,
         max_dop: usize,
+        realize: bool,
     ) !exec.Query {
         const schema = try exec.aggregate_op.outputSchemaFor(allocator, up.outputSchema(), group_cols, aggs);
         errdefer allocator.free(schema);
@@ -867,6 +872,7 @@ const AdaptiveGroupBy = struct {
             .emit_limit = emit_limit,
             .budget = budget,
             .max_dop = max_dop,
+            .realize = realize,
             .output_schema = schema,
         };
         return exec.makeQuery(allocator, self);
@@ -876,13 +882,18 @@ const AdaptiveGroupBy = struct {
         if (self.routed) return;
         self.routed = true;
         for (self.stages) |s| try s.ensureRun();
+        if (self.realize) {
+            if (try self.up.takeOwnedChunks()) |owned| {
+                self.up = try group_route.RealizedInput.create(self.allocator, self.up, owned);
+            }
+        }
         const trace_gb = getenv("THINDB_TRACE_GBROUTE") != null;
         if (trace_gb) {
             std.debug.print("[gbroute-adaptive] keys={d} aggs=", .{self.group_cols.len});
             for (self.aggs) |a| std.debug.print("{s},", .{@tagName(a.func)});
             std.debug.print(
-                " upper_rows={d} max_dop={d} top_k={} emit_limit={} stages={d}\n",
-                .{ self.up.stats().upper_rows, self.max_dop, self.top_k != null, self.emit_limit != null, self.stages.len },
+                " upper_rows={d} max_dop={d} top_k={} emit_limit={} stages={d} realized={}\n",
+                .{ self.up.stats().upper_rows, self.max_dop, self.top_k != null, self.emit_limit != null, self.stages.len, exec.queryAs(group_route.RealizedInput, self.up) != null },
             );
         }
         // A GLOBAL aggregate (no keys) over a big primed buffer: fold partials
@@ -899,45 +910,21 @@ const AdaptiveGroupBy = struct {
                 return;
             }
         }
-        // A plain (no top-k / no limit) GROUP BY over a buffer with a realized
-        // row count worth threading: try the specialized serial-beating paths
-        // (sorted-stream, radix) first, and if both decline — the string-key /
-        // MAX_BY / ANY_VALUE shapes the radix path can't carry — partition the
-        // input across cores instead of falling to the serial hash aggregate.
-        if (self.group_cols.len > 0 and self.max_dop > 1 and self.top_k == null and self.emit_limit == null and
-            self.up.stats().upper_rows >= partitioned_aggregate.MIN_ROWS_FOR_PARALLEL and
-            getenv("THINDB_NO_PARALLEL_GROUP") == null)
-        {
-            if (try group_route.routeStreamGroupBy(self.allocator, &self.up, self.group_cols, self.aggs, self.budget)) |q| {
-                if (trace_gb) std.debug.print("[gbroute-adaptive]   -> stream\n", .{});
-                self.chosen = q;
-                return;
-            }
-            if (try group_route.routeRadixGroupBy(self.up, self.group_cols, self.aggs, self.top_k, self.emit_limit)) |q| {
-                if (trace_gb) std.debug.print("[gbroute-adaptive]   -> radix\n", .{});
-                self.chosen = q;
-                return;
-            }
-            if (trace_gb) std.debug.print("[gbroute-adaptive]   -> partitioned\n", .{});
-            self.chosen = try partitioned_aggregate.PartitionedAggregate.create(
-                self.allocator,
-                self.worker_alloc,
-                self.up,
-                self.group_cols,
-                self.aggs,
-                self.max_dop,
-            );
-            return;
-        }
-        if (trace_gb) std.debug.print("[gbroute-adaptive]   -> serial routeGroupBy (gate failed)\n", .{});
+        // A keyed GROUP BY the radix path can't carry (string keys, MAX_BY,
+        // ANY_VALUE) may partition its input across cores instead of taking
+        // the serial hash aggregate, when that fits the budget.
+        const partition_gate = if (self.realize) "THINDB_NO_PAGG_FALLBACK" else "THINDB_NO_PARALLEL_GROUP";
+        const partition_dop: usize = if (getenv(partition_gate) == null) self.max_dop else 1;
         self.chosen = try group_route.routeGroupBy(
             self.allocator,
+            self.worker_alloc,
             &self.up,
             self.group_cols,
             self.aggs,
             self.top_k,
             self.emit_limit,
             self.budget,
+            partition_dop,
         );
     }
 
@@ -1688,12 +1675,32 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     g.emit_limit,
                     input.catalog.config.query_memory_budget,
                     input.effectiveDop(),
+                    false,
                 );
             }
             if (getenv("THINDB_TRACE_GBROUTE") != null) {
                 std.debug.print("[gbroute-compile] no stages beneath group_by: keys={d} aggs=", .{g.group_cols.len});
                 for (aggs) |a| std.debug.print("{s},", .{@tagName(a.func)});
                 std.debug.print(" upper_rows={d}\n", .{up.stats().upper_rows});
+            }
+            // The partitioned plan's fit turns on the input's bytes, and a
+            // filtered table's row bound is pre-filter: route once the input
+            // has drained, on what survived.
+            const pagg_dop: usize = if (getenv("THINDB_NO_PAGG_FALLBACK") != null) 1 else input.effectiveDop();
+            if (group_route.routesOnInputSize(up.stats(), g.group_cols, g.top_k, g.emit_limit, pagg_dop)) {
+                return AdaptiveGroupBy.create(
+                    input.allocator,
+                    try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
+                    up,
+                    &.{},
+                    g.group_cols,
+                    aggs,
+                    g.top_k,
+                    g.emit_limit,
+                    input.catalog.config.query_memory_budget,
+                    input.effectiveDop(),
+                    true,
+                );
             }
             return group_route.routeGroupByDop(
                 input.allocator,
