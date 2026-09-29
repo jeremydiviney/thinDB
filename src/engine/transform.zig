@@ -1094,7 +1094,7 @@ pub fn applyPermutation(
     src: ColumnStore,
     perm: []const u32,
 ) !ColumnStore {
-    const dst_data: DataStore = switch (src.data) {
+    var dst_data: DataStore = switch (src.data) {
         .int => |l| blk: {
             var dst: std.ArrayList(i32) = try .initCapacity(allocator, perm.len);
             errdefer dst.deinit(allocator);
@@ -1198,6 +1198,8 @@ pub fn applyPermutation(
             break :blk DataStore{ .uuid = dst };
         },
     };
+
+    errdefer dst_data.deinit(allocator);
 
     var nulls: ?std.ArrayList(u8) = null;
     if (src.nulls) |src_bits| {

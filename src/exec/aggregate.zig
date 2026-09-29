@@ -1288,23 +1288,25 @@ pub const Aggregate = struct {
                 // The set holds ≤ one entry per distinct (gid, value) pair, so its
                 // size is bounded by the value column's cardinality estimate (the
                 // dominant term) plus 10% headroom, and in all cases by the row
-                // count — there is never an *unbounded* case at this stage, only
-                // "no tighter estimate than the rows". Allocate a modest initial
-                // (ADAPTIVE_INITIAL); on first overflow grow straight to that
-                // bound in one rehash rather than doubling repeatedly (which cost
-                // Q08 ~8 ms). Growing to the *estimate*, not the row count, is
-                // load-bearing: a high-card-but-not-unique value (Q08: 5M rows,
-                // ~1M distinct UserIDs) would otherwise jump to a 5M-slot / 128 MB
-                // table and eat ~16 ms of sentinel-fill.
+                // count. Allocate a modest initial (ADAPTIVE_INITIAL); on first
+                // overflow grow straight to the estimate in one rehash rather than
+                // doubling repeatedly (which cost Q08 ~8 ms). Growing to the
+                // *estimate*, not the row count, is load-bearing: a high-card-but-
+                // not-unique value (Q08: 5M rows, ~1M distinct UserIDs) would
+                // otherwise jump to a 5M-slot / 128 MB table and eat ~16 ms of
+                // sentinel-fill. With no estimate the set doubles, so it stays
+                // bounded by the pairs actually seen: a partitioned-aggregate
+                // partition (no column stats) of 93M rows holding 16M pairs would
+                // otherwise jump to 134M slots (issue #375).
                 const row_ceiling = @max(st.upper_rows, 1);
-                var bound: usize = row_ceiling;
+                var estimate: ?usize = null;
                 if (idx < st.column_stats.len) {
                     switch (st.column_stats[idx].ndv) {
-                        .exact => |nd| bound = @intCast(@min(nd +| nd / 10, row_ceiling)),
+                        .exact => |nd| estimate = @intCast(@min(nd +| nd / 10, row_ceiling)),
                         .unknown => {},
                     }
                 }
-                const presize = @min(bound, ADAPTIVE_INITIAL);
+                const presize = @min(estimate orelse row_ceiling, ADAPTIVE_INITIAL);
                 if (vbits <= 32) {
                     // value ≤32 bits + u32 gid ⇒ combined key fits a u64: an
                     // 8-byte-slot key-only set (no `grow_target`; it doubles).
@@ -1314,7 +1316,9 @@ pub const Aggregate = struct {
                     };
                 } else {
                     var table = IntTable96.init(aa, presize) catch try IntTable96.init(aa, 0);
-                    if (bound > presize) table.grow_target = group_table.capacityFor(bound);
+                    if (estimate) |bound| {
+                        if (bound > presize) table.grow_target = group_table.capacityFor(bound);
+                    }
                     slot.* = .{ .set = .{ .wide = table }, .vbits = vbits };
                 }
                 if (cap > 0) slot.*.?.counts.ensureTotalCapacity(aa, cap) catch {};

@@ -2784,44 +2784,52 @@ fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
         .row_group_size = null,
     };
 
-    var t: *ApiTable = undefined;
-    var persistent_schema: ?*DbSchema = null;
-    if (op.is_temp) {
-        const ns = ctx.session.temp_namespace orelse return Error.UnsupportedOp;
-        if (ns.contains(op.table.name)) {
-            if (op.if_not_exists) return try EmptyOp.createWithCount(ctx.allocator, 0);
-            return Error.TableAlreadyExists;
-        }
-        t = ns.createTable(op.table.name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
-    } else {
-        const sc = (try resolvePersistentTableTarget(catalog, ctx.session.*, op.table)).schema;
-
-        sc.tables_mutex.lockUncancelable(sc.io);
-        const exists = sc.tables.get(op.table.name) != null;
-        sc.tables_mutex.unlock(sc.io);
-        if (exists) {
-            if (op.if_not_exists) return try EmptyOp.createWithCount(ctx.allocator, 0);
-            return Error.TableAlreadyExists;
-        }
-        t = sc.table(op.table.name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
-        persistent_schema = sc;
-    }
     // A CTAS whose query fails leaves no table behind, as MySQL's atomic
     // DDL rolls it back: a retry would otherwise meet a half-filled table.
-    // The query's error is the one to report, so a failed drop is ignored.
-    errdefer if (persistent_schema) |sc| {
-        sc.dropTable(op.table.name) catch {};
-    } else if (ctx.session.temp_namespace) |ns| {
-        ns.dropTable(op.table.name) catch {};
+    const total_rows = if (op.is_temp) blk: {
+        const ns = ctx.session.temp_namespace orelse return Error.UnsupportedOp;
+        if (ns.contains(op.table.name)) return ctasTargetExists(ctx, op);
+        const t = ns.createTable(op.table.name, target_schema, opts) catch |e| return thindb_api.remapError(Error, e);
+        // Only this session resolves its temp tables, and it is busy with
+        // this statement, so no other statement can hold the one dropped
+        // here. The query's error is the one to report.
+        errdefer ns.dropTable(op.table.name) catch {};
+        break :blk try insertAll(&source, t);
+    } else blk: {
+        const sc = (try resolvePersistentTableTarget(catalog, ctx.session.*, op.table)).schema;
+        // A CTAS holds only a shared statement lease, as the statements
+        // beside it do, so its table stays unpublished until the query
+        // succeeds: a failure then frees a table none of them can have
+        // resolved.
+        var build = sc.beginTableBuild(op.table.name, target_schema, opts) catch |e| switch (e) {
+            ApiError.TableAlreadyExists => return ctasTargetExists(ctx, op),
+            else => return thindb_api.remapError(Error, e),
+        };
+        defer build.deinit();
+        const n = try insertAll(&source, build.table);
+        // Another session may have taken the name while the query ran.
+        build.publish() catch |e| switch (e) {
+            ApiError.TableAlreadyExists => return ctasTargetExists(ctx, op),
+            else => return thindb_api.remapError(Error, e),
+        };
+        break :blk n;
     };
+    ctx.affected_rows = @intCast(total_rows);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
+}
 
+fn ctasTargetExists(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
+    if (op.if_not_exists) return try EmptyOp.createWithCount(ctx.allocator, 0);
+    return Error.TableAlreadyExists;
+}
+
+fn insertAll(source: *Query, t: *ApiTable) !usize {
     var total_rows: usize = 0;
     while (try source.next()) |b| {
         try t.insertBatch(b.schema, b.values, b.row_count);
         total_rows += b.row_count;
     }
-    ctx.affected_rows = @intCast(total_rows);
-    return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
+    return total_rows;
 }
 
 /// INSERT INTO target [(cols)] SELECT ... — drain the source query

@@ -62,7 +62,7 @@ pub const Compressor = struct {
         );
         if (c.ZSTD_isError(written) != 0) return Error.ZstdEncodeFailed;
 
-        return allocator.realloc(dst, written) catch dst[0..written];
+        return try allocator.realloc(dst, written);
     }
 };
 
@@ -135,7 +135,7 @@ pub fn lz4CompressHC(allocator: Allocator, input: []const u8) ![]u8 {
         lz4hc_level,
     );
     if (written <= 0) return Error.Lz4EncodeFailed;
-    return allocator.realloc(dst, @intCast(written)) catch dst[0..@intCast(written)];
+    return try allocator.realloc(dst, @intCast(written));
 }
 
 /// Decompress an LZ4 block into `dst`, which must be exactly the original
