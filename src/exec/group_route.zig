@@ -20,6 +20,7 @@ const Query = exec.Query;
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
 const storage = @import("../storage/storage.zig");
+const engine = @import("../engine/engine.zig");
 const partitioned_aggregate = @import("partitioned_aggregate.zig");
 const parallel_reduce = @import("parallel_reduce.zig");
 
@@ -51,9 +52,19 @@ pub fn routeGroupBy(
         exec.force_group_by == .auto;
     if (group_cols.len > 0 and exec.force_group_by == .auto and !groupKeysSortedPrefix(st.sort_state, group_cols)) budgeted: {
         const account = upstream.accountant() orelse break :budgeted;
-        const needs = planNeeds(st, upstream.outputSchema(), group_cols, aggs, emit_limit) orelse break :budgeted;
+        const needs = inputNeeds(upstream, group_cols, aggs, emit_limit, partitioned_aggregate.partitionCount(partition_dop)) orelse break :budgeted;
         const headroom = account.headroom();
-        if (trace) traceNeeds(st.upper_rows, needs, headroom, partition_ok);
+        if (trace) {
+            traceNeeds(st.upper_rows, needs, headroom, partition_ok);
+            if (exec.queryAs(RealizedInput, upstream.*)) |r| std.debug.print(
+                "[gbroute]   realized input: {d} chunks, held={d} MiB, largest={d} MiB\n",
+                .{ r.owned.chunks.len, r.held_bytes >> 20, r.largest_chunk_bytes >> 20 },
+            );
+            if (groupState(st, upstream.outputSchema(), group_cols, aggs, emit_limit)) |gs| std.debug.print(
+                "[gbroute]   state: groups={d} slot={d} B group={d} B sets={d} MiB\n",
+                .{ gs.groups, gs.slot, gs.group, gs.sets >> 20 },
+            );
+        }
         for (PLAN_ORDER) |plan| {
             if (needs.of(plan) > headroom) continue;
             switch (plan) {
@@ -180,30 +191,82 @@ pub const PlanNeeds = struct {
             inline else => |p| @field(self, @tagName(p)),
         };
     }
+
+    /// The needs over an input that already holds `held` charged bytes and
+    /// frees each of its chunks, none over `largest_chunk` bytes, once the
+    /// plan pulls the next (`RealizedInput`). The partitioned plan and the
+    /// sort copy the whole input before they aggregate or order it, so the
+    /// copy replaces the input's buffers: they need what they add beyond
+    /// them, plus the chunk being copied. Radix and hash stream the input
+    /// into their tables while its buffers are still held.
+    pub fn consuming(self: PlanNeeds, held: u64, largest_chunk: u64) PlanNeeds {
+        return .{
+            .radix = self.radix,
+            .partitioned = (self.partitioned -| held) +| largest_chunk,
+            .hash = self.hash,
+            .sort = (self.sort -| held) +| largest_chunk,
+        };
+    }
 };
 
-/// Growth of a group table past its live bytes: its arrays double as groups
-/// arrive and copied string payloads land in growing buffers, so up to half
-/// of what is held is slack.
-const GROUP_STATE_GROWTH: u64 = 2;
+/// `planNeeds` for `upstream` as the router prices it, with the partitioned
+/// plan split `partitions` ways; over a `RealizedInput`, the batches are its
+/// chunks and the copying plans are credited with the buffers their copy
+/// frees.
+pub fn inputNeeds(
+    upstream: *Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    emit_limit: ?u32,
+    partitions: u64,
+) ?PlanNeeds {
+    const st = upstream.stats();
+    const schema = upstream.outputSchema();
+    const realized = exec.queryAs(RealizedInput, upstream.*) orelse
+        return planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions);
+    const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, realized.largest_chunk_rows, partitions) orelse return null;
+    return needs.consuming(realized.held_bytes, realized.largest_chunk_bytes);
+}
+
+/// Rows a table scan's batch carries: one row group at the default size.
+const SCAN_BATCH_ROWS: u64 = 64 * 1024;
+
+/// A hash aggregate's slack over its live bytes: its arena sizes each new
+/// node at 1.5x the last plus the request, and its output columns grow by
+/// half.
+const STATE_SLACK_NUM: u64 = 3;
+const STATE_SLACK_DEN: u64 = 2;
+
+/// A group table's slots per entry it holds: the 0.75 load factor, rounded
+/// up to a power of two.
+const SLOTS_NUM: u64 = 8;
+const SLOTS_DEN: u64 = 3;
+
+/// Per-row scratch an Aggregate keeps for its largest batch: each row's key
+/// slice, hash and group id.
+const BATCH_SCRATCH_BYTES: u64 = 16 + 8 + 4;
+
+/// Growth of a DISTINCT value set past its live bytes: it doubles as values
+/// arrive.
+const SET_GROWTH: u64 = 2;
 
 /// Width assumed for a string value that no stage or realized buffer has
 /// measured — the same guess `memory.estimateColumnBytes` makes.
 const GUESSED_STRING_WIDTH: u64 = 32;
 
 /// Each keyed plan's estimated peak over an input described by `st` (row
-/// bound, key NDV bounds, measured string widths) and `schema`:
+/// bound, key NDV bounds, measured string widths) and `schema`, read in
+/// batches of at most `batch_rows`:
 ///   - input buffer B = rows × Σ column bytes (a string's width plus its
 ///     4-byte offset, a validity byte when nullable)
-///   - group state S = groups × per-group bytes + distinct/collect sets,
-///     where groups is the product of the keys' NDV bounds capped at rows,
-///     or rows when any key's NDV is unknown; under a bare LIMIT whose
-///     aggregates keep bounded state the hash table stops at `emit_limit`
-///     groups plus an overflow group (the hash plan is the only one that
-///     takes a LIMIT)
-///   - partitioned = B + 4 B/row index + S (it buffers its input at its
-///     exact size, issue #380); radix = B + S; hash = S (it streams its
-///     input); sort = 1.5 B + 4 B/row permutation.
+///   - group state S(w), for tables that also take w rows of the batches
+///     being inserted (`GroupState`)
+///   - radix = hash = S(batch_rows): they stream their input into the table
+///   - partitioned = B + 4 B/row index + 2 W row bytes + S(W): it buffers
+///     its input at its exact size (issue #380), then each of its
+///     `partitions` aggregates its rows in windows of `PARTITION_BATCH_ROWS`
+///     (W rows in all, their strings in doubling buffers)
+///   - sort = 1.5 B + 4 B/row permutation.
 /// Null when a named column is missing from `schema`.
 pub fn planNeeds(
     st: exec.PipelineStats,
@@ -211,17 +274,21 @@ pub fn planNeeds(
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     emit_limit: ?u32,
+    batch_rows: u64,
+    partitions: u64,
 ) ?PlanNeeds {
     const rows = st.upper_rows;
     var row_bytes: u64 = 0;
     for (0..schema.len) |i| row_bytes += columnRowBytes(st, schema, i);
     const input = rows *| row_bytes;
-    const state = groupStateBytes(st, schema, group_cols, aggs, emit_limit) orelse return null;
+    const state = groupState(st, schema, group_cols, aggs, emit_limit) orelse return null;
     const index = rows *| @sizeOf(u32);
+    const windows = @min(rows, partitions *| partitioned_aggregate.PARTITION_BATCH_ROWS);
+    const streamed = state.bytes(@min(rows, batch_rows));
     return .{
-        .radix = input +| state,
-        .partitioned = input +| index +| state,
-        .hash = state,
+        .radix = streamed,
+        .partitioned = input +| index +| 2 *| windows *| row_bytes +| state.bytes(windows),
+        .hash = streamed,
         .sort = (input +| input / 2) +| index,
     };
 }
@@ -253,25 +320,46 @@ fn estimateGroups(st: exec.PipelineStats, schema: []const types.Column, group_co
     return @min(product, rows);
 }
 
-/// Group table bytes: per group, the slot and key copy with every
-/// aggregate's state at the 0.75 load factor, the string payloads the state
-/// copies out of the batches, and the emitted row; plus the per-group value
-/// sets of DISTINCT aggregates and the values GROUP_CONCAT / PERCENTILE keep.
-fn groupStateBytes(
+/// A hash aggregate's state. `groups` is the product of the keys' NDV bounds
+/// capped at rows, or rows when any key's NDV is unknown; under a bare LIMIT
+/// whose aggregates keep bounded state the table stops at `emit_limit`
+/// groups plus an overflow group (the hash plan is the only one that takes
+/// a LIMIT).
+const GroupState = struct {
+    groups: u64,
+    /// A table slot: its hash and group id, the key slice, and every
+    /// aggregate's cell.
+    slot: u64,
+    /// The key and string payloads a group's state copies out of the
+    /// batches, and its emitted row.
+    group: u64,
+    /// The per-group value sets of DISTINCT aggregates and the values
+    /// GROUP_CONCAT / PERCENTILE keep.
+    sets: u64,
+
+    /// The state when the tables also take `batch_rows`: an Aggregate grows
+    /// its table and cells to hold a whole batch before inserting it, and
+    /// keeps per-row scratch for it.
+    fn bytes(self: GroupState, batch_rows: u64) u64 {
+        const slots = (self.groups +| batch_rows) *| SLOTS_NUM / SLOTS_DEN;
+        const live = slots *| self.slot +| self.groups *| self.group +| batch_rows *| BATCH_SCRATCH_BYTES;
+        return live *| STATE_SLACK_NUM / STATE_SLACK_DEN +| self.sets;
+    }
+};
+
+fn groupState(
     st: exec.PipelineStats,
     schema: []const types.Column,
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     emit_limit: ?u32,
-) ?u64 {
+) ?GroupState {
     const rows = st.upper_rows;
-    var table: u64 = 16 + 16;
-    var payload: u64 = 0;
-    var out: u64 = 0;
+    var slot: u64 = 16 + 16;
+    var group: u64 = 0;
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc) orelse return null;
-        table += valueWidth(st, schema, idx);
-        out += columnRowBytes(st, schema, idx);
+        group += valueWidth(st, schema, idx) + columnRowBytes(st, schema, idx);
     }
     const all_groups = estimateGroups(st, schema, group_cols);
     const capped = emit_limit != null and exec.aggregate_op.aggsAllowGroupCap(aggs);
@@ -282,39 +370,37 @@ fn groupStateBytes(
         const key_idx: ?usize = if (a.arg2_col) |name| (types.findColumn(schema, name) orelse return null) else null;
         const in_t: ?types.Type = if (in_idx) |i| schema[i].type else null;
         const key_t: ?types.Type = if (key_idx) |i| schema[i].type else null;
-        table += exec.aggregate_op.aggStateWidth(a.func, in_t, key_t);
+        slot += exec.aggregate_op.aggStateWidth(a.func, in_t, key_t);
         switch (a.func) {
             .min, .max, .any_value, .first, .last, .max_by => {
                 const string_value = if (in_t) |t| t.isString() else false;
                 if (string_value) {
-                    payload += valueWidth(st, schema, in_idx.?);
-                    out += columnRowBytes(st, schema, in_idx.?);
+                    group += valueWidth(st, schema, in_idx.?) + columnRowBytes(st, schema, in_idx.?);
                 } else {
-                    out += 16;
+                    group += 16;
                 }
                 const string_key = if (key_t) |t| t.isString() else false;
-                if (string_key) payload += valueWidth(st, schema, key_idx.?);
+                if (string_key) group += valueWidth(st, schema, key_idx.?);
             },
             .count_distinct, .sum_distinct, .avg_distinct => {
-                out += 16;
+                group += 16;
                 const i = in_idx orelse continue;
                 const pairs = if (i < st.column_stats.len) switch (st.column_stats[i].ndv) {
                     .exact => |n| @min(rows, groups *| n),
                     .unknown => rows,
                 } else rows;
-                sets +|= pairs *| ((valueWidth(st, schema, i) + 16) * 4 / 3 * GROUP_STATE_GROWTH);
+                sets +|= pairs *| ((valueWidth(st, schema, i) + 16) * 4 / 3 * SET_GROWTH);
             },
             .group_concat, .percentile => {
-                out += 16;
+                group += 16;
                 var width: u64 = if (in_idx) |i| valueWidth(st, schema, i) else 0;
                 if (key_idx) |i| width += valueWidth(st, schema, i);
                 sets +|= rows *| width;
             },
-            else => out += 16,
+            else => group += 16,
         }
     }
-    const per_group = GROUP_STATE_GROWTH * (table * 4 / 3 + payload + out);
-    return (groups *| per_group) +| sets;
+    return .{ .groups = groups, .slot = slot, .group = group, .sets = sets };
 }
 
 fn traceNeeds(rows: u64, needs: PlanNeeds, headroom: usize, partition_ok: bool) void {
@@ -375,9 +461,9 @@ pub fn routeStreamGroupBy(
 /// A drained pipeline's owned chunks (`Query.takeOwnedChunks`) replayed as
 /// batches, so a GROUP BY can route on its input's realized size. A chunk is
 /// freed when the consumer pulls the next one: the chosen plan's own copy
-/// replaces the buffer instead of doubling it. Stats are exact: the realized
-/// row count, the source's column bounds and each string column's measured
-/// width.
+/// replaces the buffer instead of doubling it (`PlanNeeds.consuming`).
+/// Stats are exact: the realized row count, the source's column bounds and
+/// each string column's measured width.
 pub const RealizedInput = struct {
     allocator: Allocator,
     source: Query,
@@ -389,6 +475,12 @@ pub const RealizedInput = struct {
     views: []storage.ColumnView,
     col_stats: []exec.ColStat,
     rows: u64,
+    /// Bytes the chunks hold, each chunk's column stores and store array.
+    held_bytes: u64,
+    /// The most any one chunk holds.
+    largest_chunk_bytes: u64,
+    /// The most rows any one chunk carries.
+    largest_chunk_rows: u64,
 
     /// Takes `owned` whatever happens, and `source` on success (a drained
     /// pipeline, kept for its schema and sort order until deinit).
@@ -400,7 +492,17 @@ pub const RealizedInput = struct {
         const col_stats = try allocator.alloc(exec.ColStat, schema.len);
         errdefer allocator.free(col_stats);
         var rows: u64 = 0;
-        for (owned.chunks) |c| rows += c.rows;
+        var held_bytes: u64 = 0;
+        var largest_chunk_bytes: u64 = 0;
+        var largest_chunk_rows: u64 = 0;
+        for (owned.chunks) |c| {
+            rows += c.rows;
+            var chunk_bytes: u64 = c.stores.len * @sizeOf(engine.ColumnStore);
+            for (c.stores) |store| chunk_bytes += store.heldBytes();
+            held_bytes += chunk_bytes;
+            largest_chunk_bytes = @max(largest_chunk_bytes, chunk_bytes);
+            largest_chunk_rows = @max(largest_chunk_rows, c.rows);
+        }
         const bounds = source.stats().column_stats;
         for (col_stats, schema, 0..) |*stat, col, i| {
             stat.* = if (i < bounds.len) bounds[i] else .{};
@@ -418,6 +520,9 @@ pub const RealizedInput = struct {
             .views = views,
             .col_stats = col_stats,
             .rows = rows,
+            .held_bytes = held_bytes,
+            .largest_chunk_bytes = largest_chunk_bytes,
+            .largest_chunk_rows = largest_chunk_rows,
         };
         return exec.makeQuery(allocator, self);
     }
@@ -835,15 +940,47 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .avg_width = 100 },
         .{},
     } };
-    const needs = planNeeds(measured, &schema, &group_cols, &aggs, null).?;
-    const input = rows * (24 + 105 + 8);
-    try std.testing.expectEqual(input + needs.hash, needs.radix);
-    try std.testing.expectEqual(input + 4 * rows + needs.hash, needs.partitioned);
+    const needs = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 4).?;
+    const row_bytes = 24 + 105 + 8;
+    const input = rows * row_bytes;
+    // A slot holds the hash, group id, key slice and both aggregates' cells;
+    // a group copies its key and MAX_BY value and emits them with its count.
+    const state = groupState(measured, &schema, &group_cols, &aggs, null).?;
+    const cells = exec.aggregate_op.aggStateWidth(.max_by, schema[1].type, .bigint) + exec.aggregate_op.aggStateWidth(.count, null, null);
+    try std.testing.expectEqual(16 + 16 + cells, state.slot);
+    try std.testing.expectEqual((20 + 24) + (100 + 105) + 16, state.group);
+    try std.testing.expectEqual(rows, state.groups);
+    try std.testing.expectEqual(state.bytes(0), needs.hash);
+    try std.testing.expectEqual(needs.hash, needs.radix);
+    // A streamed batch widens the table and adds its scratch.
+    const batched = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4).?;
+    try std.testing.expectEqual(state.bytes(1000), batched.hash);
+    try std.testing.expect(batched.hash > needs.hash);
+    // Four partitions read windows of 64Ki rows, and each one's table takes
+    // its window on top of its groups.
+    const windows = 4 * partitioned_aggregate.PARTITION_BATCH_ROWS;
+    try std.testing.expectEqual(input + 4 * rows + 2 * windows * row_bytes + state.bytes(windows), needs.partitioned);
     try std.testing.expectEqual(input + input / 2 + 4 * rows, needs.sort);
+    // Windows past the input's rows hold only its rows.
+    const wide = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 16).?;
+    try std.testing.expectEqual(input + 4 * rows + 2 * input + state.bytes(rows), wide.partitioned);
     // An unknown key NDV prices a group per row, each copying out its MAX_BY
     // value and emitting a row: the hash state outweighs a sort of the input.
     try std.testing.expect(needs.sort < needs.hash);
     try std.testing.expect(needs.hash > rows * 2 * (100 + 24 + 105));
+
+    // Over an input whose chunks are freed as the plan copies them, the
+    // copying plans need what their copy and state add beyond the held
+    // buffers, plus the chunk being copied; the streaming plans keep their
+    // whole state on top of them.
+    const consumed = needs.consuming(input, 1000);
+    try std.testing.expectEqual(needs.radix, consumed.radix);
+    try std.testing.expectEqual(needs.partitioned - input + 1000, consumed.partitioned);
+    try std.testing.expectEqual(needs.hash, consumed.hash);
+    try std.testing.expectEqual(input / 2 + 4 * rows + 1000, consumed.sort);
+    const overheld = needs.consuming(needs.partitioned + needs.sort, 1000);
+    try std.testing.expectEqual(@as(u64, 1000), overheld.partitioned);
+    try std.testing.expectEqual(@as(u64, 1000), overheld.sort);
 
     // A proven key space of 1000 groups prices 1000 groups' state.
     const few = exec.PipelineStats{ .upper_rows = rows, .column_stats = &.{
@@ -851,21 +988,23 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .avg_width = 100 },
         .{},
     } };
-    const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null).?;
-    try std.testing.expectEqual(needs.hash, few_needs.hash * 1000);
+    const few_state = groupState(few, &schema, &group_cols, &aggs, null).?;
+    try std.testing.expectEqual(@as(u64, 1000), few_state.groups);
+    const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null, 0, 4).?;
+    try std.testing.expectEqual(few_state.bytes(0), few_needs.hash);
     try std.testing.expectEqual(needs.sort, few_needs.sort);
 
     // A bare LIMIT over bounded aggregate state stops the hash table at the
     // limit plus an overflow group; MAX_BY's value is not bounded state.
     const count_only = [_]ir.AggSpec{.{ .func = .count, .col = null, .as = "c" }};
-    const unlimited = planNeeds(measured, &schema, &group_cols, &count_only, null).?;
-    const limited = planNeeds(measured, &schema, &group_cols, &count_only, 10).?;
-    try std.testing.expectEqual(unlimited.hash / rows * 11, limited.hash);
-    try std.testing.expectEqual(needs.hash, planNeeds(measured, &schema, &group_cols, &aggs, 10).?.hash);
+    try std.testing.expectEqual(rows, groupState(measured, &schema, &group_cols, &count_only, null).?.groups);
+    try std.testing.expectEqual(@as(u64, 11), groupState(measured, &schema, &group_cols, &count_only, 10).?.groups);
+    try std.testing.expectEqual(needs.hash, planNeeds(measured, &schema, &group_cols, &aggs, 10, 0, 4).?.hash);
 
     // Unmeasured strings take the 32-byte guess.
-    const guessed = planNeeds(.{ .upper_rows = rows }, &schema, &group_cols, &aggs, null).?;
-    try std.testing.expectEqual(rows * (36 + 37 + 8), guessed.radix - guessed.hash);
+    const guessed = planNeeds(.{ .upper_rows = rows }, &schema, &group_cols, &aggs, null, 0, 4).?;
+    const guessed_input = rows * (36 + 37 + 8);
+    try std.testing.expectEqual(guessed_input + guessed_input / 2 + 4 * rows, guessed.sort);
 
     // A DISTINCT set holds a (group, value) pair per distinct pair, bounded
     // by the rows and by groups × the value's NDV.
@@ -880,12 +1019,12 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{},
         .{},
     } };
-    const small_sets = planNeeds(small_t, &schema, &group_cols, &distinct_aggs, null).?.hash;
-    const all_sets = planNeeds(all_t, &schema, &group_cols, &distinct_aggs, null).?.hash;
-    try std.testing.expectEqual((rows - 10_000) * ((8 + 16) * 4 / 3 * GROUP_STATE_GROWTH), all_sets - small_sets);
+    const small_sets = planNeeds(small_t, &schema, &group_cols, &distinct_aggs, null, 0, 4).?.hash;
+    const all_sets = planNeeds(all_t, &schema, &group_cols, &distinct_aggs, null, 0, 4).?.hash;
+    try std.testing.expectEqual((rows - 10_000) * ((8 + 16) * 4 / 3 * SET_GROWTH), all_sets - small_sets);
 
     const missing = [_]ir.AggSpec{.{ .func = .max, .col = "nope", .as = "m" }};
-    try std.testing.expectEqual(@as(?PlanNeeds, null), planNeeds(measured, &schema, &group_cols, &missing, null));
+    try std.testing.expectEqual(@as(?PlanNeeds, null), planNeeds(measured, &schema, &group_cols, &missing, null, 0, 4));
 }
 
 const test_schema = [_]types.Column{
@@ -898,7 +1037,6 @@ const test_schema = [_]types.Column{
 /// 5003 string keys, a distinct string value per row, and a unique ordering
 /// column for MAX_BY.
 fn testOwnedChunks(alloc: Allocator, chunk_rows: []const usize) !exec.OwnedChunks {
-    const engine = @import("../engine/engine.zig");
     const chunks = try alloc.alloc(exec.OwnedChunk, chunk_rows.len);
     var built: usize = 0;
     errdefer {
@@ -1022,12 +1160,18 @@ test "RealizedInput replays owned chunks with exact stats and frees each once pa
     try std.testing.expectEqual(exec.avgWidth(key_bytes, 6000), st.column_stats[0].avg_width);
     try std.testing.expect(st.column_stats[1].avg_width.? > 10);
     try std.testing.expectEqual(@as(?u32, null), st.column_stats[2].avg_width);
+    // Every tracked byte but the chunk array is a chunk's.
+    const chunk_array = 3 * @sizeOf(exec.OwnedChunk);
+    const realized = exec.queryAs(RealizedInput, q).?;
+    try std.testing.expectEqual(held - chunk_array, realized.held_bytes);
+    try std.testing.expectEqual(@as(u64, 3000), realized.largest_chunk_rows);
 
     try std.testing.expectEqual(@as(usize, 1000), (try q.next()).?.row_count);
     try std.testing.expectEqual(held, account.current_bytes);
     try std.testing.expectEqual(@as(usize, 2000), (try q.next()).?.row_count);
     try std.testing.expect(account.current_bytes < held);
     try std.testing.expectEqual(@as(usize, 3000), (try q.next()).?.row_count);
+    try std.testing.expectEqual(chunk_array + realized.largest_chunk_bytes, account.current_bytes);
     try std.testing.expect((try q.next()) == null);
 }
 
@@ -1037,12 +1181,18 @@ const RoutedRun = struct {
     plan: RoutedPlan,
     lines: [][]u8,
     needs: PlanNeeds,
+    /// Bytes charged when the plan was chosen.
     held: usize,
+    peak: usize,
+    /// Whether the budget-blind route admitted the hash-table plans (and so
+    /// the partitioned one) at this budget.
+    blind_hash_ok: bool,
 };
 
 /// Route MAX_BY + COUNT over a realized input under `budget` and run the
-/// chosen plan to completion.
-fn testRouteRealized(a: Allocator, budget: usize) !RoutedRun {
+/// chosen plan to completion; `blind` runs the partitioned plan the
+/// budget-blind route picks instead.
+fn testRouteRealized(a: Allocator, budget: usize, partition_dop: usize, blind: bool) !RoutedRun {
     const account = try testAccountant(a, budget);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
@@ -1056,12 +1206,15 @@ fn testRouteRealized(a: Allocator, budget: usize) !RoutedRun {
     };
     var needs: PlanNeeds = undefined;
     var held: usize = undefined;
+    var blind_hash_ok: bool = undefined;
     var q = routed: {
         var up = try RealizedInput.create(tracked, exec.makeQuery(tracked, &drained), owned);
         errdefer up.deinit();
-        needs = planNeeds(up.stats(), up.outputSchema(), &group_cols, &aggs, null).?;
+        needs = inputNeeds(&up, &group_cols, &aggs, null, partitioned_aggregate.partitionCount(partition_dop)).?;
         held = account.current_bytes;
-        break :routed try routeGroupBy(tracked, worker, &up, &group_cols, &aggs, null, null, budget, 4);
+        blind_hash_ok = groupKeysCardUnderLimit(up.stats(), up.outputSchema(), &group_cols, &aggs, budget);
+        if (blind) break :routed try partitioned_aggregate.PartitionedAggregate.create(tracked, worker, up, &group_cols, &aggs, partition_dop);
+        break :routed try routeGroupBy(tracked, worker, &up, &group_cols, &aggs, null, null, budget, partition_dop);
     };
     defer q.deinit();
     const plan: RoutedPlan = if (exec.queryAs(partitioned_aggregate.PartitionedAggregate, q) != null)
@@ -1072,30 +1225,57 @@ fn testRouteRealized(a: Allocator, budget: usize) !RoutedRun {
         .sort_stream
     else
         .other;
-    return .{ .plan = plan, .lines = try testLines(a, &q), .needs = needs, .held = held };
+    const lines = try testLines(a, &q);
+    return .{
+        .plan = plan,
+        .lines = lines,
+        .needs = needs,
+        .held = held,
+        .peak = account.peak_bytes,
+        .blind_hash_ok = blind_hash_ok,
+    };
 }
 
-test "a budget between the plans' needs routes to the plan that fits, and it matches the partitioned result" {
+test "a budget between the plans' needs routes to the plan that fits, and it matches the other plans' result" {
     const a = std.testing.allocator;
-    const roomy = try testRouteRealized(a, 1 << 40);
+    const roomy = try testRouteRealized(a, 1 << 40, 4, false);
     defer testFreeLines(a, roomy.lines);
     try std.testing.expectEqual(RoutedPlan.partitioned, roomy.plan);
     try std.testing.expectEqual(@as(usize, 5003), roomy.lines.len);
+    // The key's NDV is unknown, so the hash-table plans price a group per
+    // row. The partitioned plan stays within its price.
     const needs = roomy.needs;
-    try std.testing.expect(needs.sort < needs.hash and needs.hash < needs.partitioned);
+    try std.testing.expect(needs.sort < needs.hash and needs.sort < needs.partitioned);
+    try std.testing.expect(roomy.peak - roomy.held <= needs.partitioned);
 
-    // Between the hash and partitioned needs the budget-blind route took the
-    // partitioned plan; the hash aggregate fits.
-    const mid = try testRouteRealized(a, roomy.held + (needs.hash + needs.partitioned) / 2);
-    defer testFreeLines(a, mid.lines);
-    try std.testing.expectEqual(RoutedPlan.hash, mid.plan);
-    try std.testing.expectEqual(roomy.lines.len, mid.lines.len);
-    for (roomy.lines, mid.lines) |r, m| try std.testing.expectEqualStrings(r, m);
+    // An eighth below what the partitioned plan took, the budget-blind route
+    // still partitions, and the partitioned plan runs out of budget. The
+    // router takes the next plan whose need fits, and it completes.
+    const gap_budget = roomy.held + (roomy.peak - roomy.held) * 7 / 8;
+    try std.testing.expectError(error.MemoryBudgetExceeded, testRouteRealized(a, gap_budget, 4, true));
+    const gap = try testRouteRealized(a, gap_budget, 4, false);
+    defer testFreeLines(a, gap.lines);
+    try std.testing.expect(gap.blind_hash_ok);
+    const fitting: RoutedPlan = if (needs.hash <= gap_budget - gap.held) .hash else .sort_stream;
+    try std.testing.expectEqual(fitting, gap.plan);
+    try std.testing.expect(gap.peak <= gap_budget);
+    try std.testing.expectEqual(roomy.lines.len, gap.lines.len);
+    for (roomy.lines, gap.lines) |r, g| try std.testing.expectEqualStrings(r, g);
 
-    // Below the hash need, sorting the input and streaming the groups fits.
-    const tight = try testRouteRealized(a, roomy.held + (needs.sort + needs.hash) / 2);
-    defer testFreeLines(a, tight.lines);
-    try std.testing.expectEqual(RoutedPlan.sort_stream, tight.plan);
-    try std.testing.expectEqual(roomy.lines.len, tight.lines.len);
-    for (roomy.lines, tight.lines) |r, t| try std.testing.expectEqualStrings(r, t);
+    // Below the hash need too, sorting the input and streaming the groups
+    // fits.
+    const sort_budget = roomy.held + (needs.sort + @min(needs.hash, needs.partitioned)) / 2;
+    const sorted = try testRouteRealized(a, sort_budget, 4, false);
+    defer testFreeLines(a, sorted.lines);
+    try std.testing.expectEqual(RoutedPlan.sort_stream, sorted.plan);
+    try std.testing.expect(sorted.peak <= sort_budget);
+    try std.testing.expectEqual(roomy.lines.len, sorted.lines.len);
+    for (roomy.lines, sorted.lines) |r, s| try std.testing.expectEqualStrings(r, s);
+
+    // With no threads to partition across, the hash aggregate carries it.
+    const serial = try testRouteRealized(a, 1 << 40, 1, false);
+    defer testFreeLines(a, serial.lines);
+    try std.testing.expectEqual(RoutedPlan.hash, serial.plan);
+    try std.testing.expectEqual(roomy.lines.len, serial.lines.len);
+    for (roomy.lines, serial.lines) |r, h| try std.testing.expectEqualStrings(r, h);
 }

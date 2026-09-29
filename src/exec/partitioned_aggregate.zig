@@ -52,6 +52,14 @@ pub const MIN_ROWS_FOR_PARALLEL: u64 = 96 * 1024;
 
 const MAX_PARTS: usize = 32;
 
+/// Rows a partition's aggregate reads per batch (see `ChunkScan`).
+pub const PARTITION_BATCH_ROWS: usize = 64 * 1024;
+
+/// Partitions the operator splits its input into for a thread hint.
+pub fn partitionCount(n_parts_hint: usize) usize {
+    return @max(@as(usize, 2), @min(n_parts_hint, MAX_PARTS));
+}
+
 /// A batch is split into at most one slice per this many rows: each slice
 /// becomes a chunk with a few allocations of its own.
 const MIN_SLICE_ROWS: usize = 8192;
@@ -156,7 +164,7 @@ const ChunkScan = struct {
     /// Rows of the cursor chunk already copied out.
     taken: usize = 0,
 
-    const batch_rows: usize = 64 * 1024;
+    const batch_rows = PARTITION_BATCH_ROWS;
 
     fn init(allocator: Allocator, owner: *PartitionedAggregate, part_idx: usize) !ChunkScan {
         const schema = owner.up.outputSchema();
@@ -349,7 +357,7 @@ pub const PartitionedAggregate = struct {
             slot.* = types.findColumn(up_schema, name) orelse return error.ColumnNotFound;
         }
 
-        const n_parts = @max(@as(usize, 2), @min(n_parts_hint, MAX_PARTS));
+        const n_parts = partitionCount(n_parts_hint);
         const parts = try allocator.alloc(Partition, n_parts);
         errdefer allocator.free(parts);
         for (parts) |*p| p.* = .{};
