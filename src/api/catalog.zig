@@ -18,6 +18,7 @@ const Schema = SchemaMod.Schema;
 
 const snapshot = @import("../util/snapshot.zig");
 const udf_mod = @import("../udf.zig");
+const scalar_fn = @import("../exec/scalar_fn.zig");
 const zigfn = @import("zigfn.zig");
 const memory = @import("../memory.zig");
 const storage = @import("../storage/storage.zig");
@@ -566,7 +567,13 @@ pub const Catalog = struct {
         }
     }
 
+    /// Builtin names are reserved here, where an application creates a
+    /// function, rather than in `UdfRegistry.registerScalar`: udf.zig is
+    /// embedded in the `LANGUAGE zig` SDK and can't see the builtin table,
+    /// and should scalar UDFs ever persist, one loaded back must load even
+    /// when a later builtin took its name.
     pub fn registerScalarUdf(self: *Catalog, desc: udf_mod.ScalarUdf) !void {
+        if (scalar_fn.isReservedScalarUdfName(desc.name)) return Error.FunctionAlreadyExists;
         return self.udfs.registerScalar(desc) catch |err| switch (err) {
             udf_mod.Error.FunctionAlreadyExists => Error.FunctionAlreadyExists,
             udf_mod.Error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
