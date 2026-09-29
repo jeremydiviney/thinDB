@@ -433,28 +433,69 @@ pub fn dateToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out:
     while (i < row_count) : (i += 1) try out.data.datetime.append(allocator, @as(i64, s[i]) * std.time.us_per_day);
 }
 
-/// CAST(text AS DATE). Text that isn't a date is NULL, as in MySQL.
-pub fn stringToDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+/// Each row of `args[0]` read by `read` into the `field` column of `out`,
+/// NULL where `read` gives null.
+fn readRows(
+    comptime field: []const u8,
+    comptime read: anytype,
+    allocator: Allocator,
+    args: []const ColumnView,
+    out: *ColumnStore,
+    row_count: usize,
+) !void {
     if (row_count == 0) return;
     const base = out.data.rowCount();
-    const text = stringViewOf(args[0]);
     for (0..row_count) |i| {
-        const days = if (args[0].isValid(i)) common.textToDate(text.rowBytes(i)) else null;
-        try out.data.date.append(allocator, days orelse 0);
-        try out.appendValidBit(allocator, base + i, days != null);
+        const value = if (!args[0].isValid(i)) null else switch (@typeInfo(@TypeOf(read)).@"fn".params[0].type.?) {
+            []const u8 => read(stringViewOf(args[0]).rowBytes(i)),
+            i64 => read(args[0].data.bigint[i]),
+            f64 => read(args[0].data.double[i]),
+            else => @compileError("readRows reads text, BIGINT or DOUBLE"),
+        };
+        try @field(out.data, field).append(allocator, value orelse 0);
+        try out.appendValidBit(allocator, base + i, value != null);
     }
 }
 
-/// CAST(text AS DATETIME). Text that isn't a date is NULL, as in MySQL.
+/// The day of text read as a DATETIME: what DATE(text) gives in StarRocks,
+/// where a time of day that isn't valid makes the whole text NULL.
+fn textDatetimeDay(s: []const u8) ?i32 {
+    return daysFromDatetime(common.textToDatetime(s) orelse return null);
+}
+
+/// CAST(text AS DATE). Text that isn't a date is NULL.
+pub fn stringToDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try readRows("date", common.textToDate, allocator, args, out, row_count);
+}
+
+/// CAST(text AS DATETIME). Text that isn't a datetime is NULL.
 pub fn stringToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    if (row_count == 0) return;
-    const base = out.data.rowCount();
-    const text = stringViewOf(args[0]);
-    for (0..row_count) |i| {
-        const micros = if (args[0].isValid(i)) common.textToDatetime(text.rowBytes(i)) else null;
-        try out.data.datetime.append(allocator, micros orelse 0);
-        try out.appendValidBit(allocator, base + i, micros != null);
-    }
+    try readRows("datetime", common.textToDatetime, allocator, args, out, row_count);
+}
+
+/// DATE(text): the text read as a DATETIME, then its day.
+pub fn stringDatetimeDayKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try readRows("date", textDatetimeDay, allocator, args, out, row_count);
+}
+
+/// CAST(n AS DATE) and DATE(n). A number that isn't a date is NULL.
+pub fn bigintToDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try readRows("date", common.numberToDate, allocator, args, out, row_count);
+}
+
+/// CAST(x AS DATE) and DATE(x) of a double.
+pub fn doubleToDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try readRows("date", common.doubleToDate, allocator, args, out, row_count);
+}
+
+/// CAST(n AS DATETIME). A number that isn't a datetime is NULL.
+pub fn bigintToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try readRows("datetime", common.numberToDatetime, allocator, args, out, row_count);
+}
+
+/// CAST(x AS DATETIME) of a double.
+pub fn doubleToDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try readRows("datetime", common.doubleToDatetime, allocator, args, out, row_count);
 }
 
 /// DATE_TRUNC(unit, datetime) → datetime truncated down to the unit

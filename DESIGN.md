@@ -80,7 +80,54 @@ date, 0000-01-01 is a Saturday, `TO_DAYS('0000-01-01')` is 0 and
 `FROM_DAYS(59)` is 0000-02-29. MySQL counts year 0 as 365 days with no
 February 29, which moves its weekdays and day numbers before 0000-03-01 by
 one. Date arithmetic whose result leaves this range is NULL, as in
-StarRocks: `DATE_ADD('9999-12-31', INTERVAL 1 DAY)` is NULL.
+StarRocks: `DATE_ADD('9999-12-31', INTERVAL 1 DAY)` is NULL. One deliberate
+exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
+reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
+the day it is, so every reader agrees with the one calendar.
+
+`CAST(text AS DATE)`, `CAST(text AS DATETIME)` and `DATE(text)` read text
+the way StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
+`textToDatetime`):
+- Space around the text is ignored. Ten characters are read as
+  `YYYY?MM?DD`, where each `?` is any one character but a digit
+  (`'2026/01/01'`).
+- Any other text is read as fields: year, month, day, hour, minute, second
+  and a fraction of up to six digits.
+  - Punctuation separates fields (`'2026-1-1 1:2:3'`, `'2026.01.01 10.30.00'`).
+    Space separates only the day from the time, and a `T` after the day
+    also starts the time.
+  - Digits alone have fixed widths: a four-digit year when the run is 4, 8
+    or at least 14 long (`'20260101103000'`), a two-digit one otherwise
+    (`'260101'`).
+  - A two-digit year below 70 is in the 2000s and any other in the 1900s.
+  - Reading stops at a letter or at anything that can't continue a field,
+    and the rest is ignored: `'2026-01-01T10:30:00+08:00'` is 10:30:00.
+  - Fewer than three fields is NULL.
+- A value outside its range is NULL: month 13, `'2026-02-30'`, a year past
+  9999 and, for a DATETIME, hour 24 or minute or second 60.
+- `CAST(text AS DATE)` checks only the date, so `'2026-01-01 25:00:00'` is
+  2026-01-01. `DATE(text)` reads the text as a DATETIME and takes its day,
+  so there it is NULL.
+- A number is read by its size as `YYMMDD`, `YYYYMMDD`, `YYMMDDhhmmss` or
+  `YYYYMMDDhhmmss`, a double truncated toward zero. Its time of day must be
+  valid for a DATE too: `CAST(20260101240000 AS DATE)` is NULL. StarRocks
+  rejects a DECIMAL here; thinDB reads it as a double.
+
+StarRocks' frontend folds a constant CAST by rules of its own: it reads a
+`Z` or `+08:00` suffix as a time zone, and it reads `'20260101 '` and
+`20260101240000`, which the backend makes NULL. thinDB reads a constant the
+way the backend reads a column, so a literal and a column holding the same
+text agree. A text literal meets a function as a text column does first, so
+`COALESCE('2026/1/1', DATE '2026-01-02')` is the text, as in StarRocks.
+Where only a DATE or DATETIME fits, the literal is read as a CAST to that
+type reads it, and text that doesn't read is NULL
+(`UNIX_TIMESTAMP('garbage')`). Text takes a DATETIME parameter before a DATE
+one, as StarRocks casts it, so `DATE_ADD('2026-01-01 10:30:00', INTERVAL 1
+DAY)` is 2026-01-02 10:30:00 and `DATE_ADD('2026-01-31', INTERVAL 1 DAY)` is
+2026-02-01 00:00:00; a function that takes only a DATE there takes the text's
+day. Typed literals (`DATE '2026-01-01'`) and
+INSERT … VALUES keep the strict `YYYY-MM-DD[ hh:mm:ss[.ffffff]]` form, and
+comparisons read text as MySQL does (below).
 
 Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
 after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
@@ -1357,7 +1404,7 @@ Target Zig version: 0.16.
 | **Range / opaque predicates** | Single inequality `a OP b`, multi-range (BETWEEN), `extra_predicate` post-join filter, opaque callback via NLJ. Skew detection + auto-route on top. |
 | **Upserts** | StarRocks-style last-writer-wins on tables with `unique = true`. Insert auto-resolves; `Table.upsert()` is the self-documenting alias. |
 | **Crash durability** | WAL with leader-follower group commit (§8.1). `wal_enabled = true` + `sync_mode = .per_flush`. |
-| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). An `INTERVAL` amount counts whole units: a fractional literal rounds half away from zero (`INTERVAL 1.5 WEEK` is 14 days) and a text amount reads its leading integer, as MySQL does; any other amount takes an integer type. The count is an INT, as in StarRocks: a count past INT's range moves a date to NULL. A string literal where a function takes a date or datetime is parsed once at plan time, including `CAST('…' AS DATE)`. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal, and BOOLEAN `true`, `false` or an INT, §3.1). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. Every write (INSERT, UPDATE, ON DUPLICATE KEY UPDATE) converts a value into a DECIMAL column as `CAST` to the column's type does: it rounds half away from zero to the scale, raises past the precision, and rejects text that isn't a number. |
+| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). An `INTERVAL` amount counts whole units: a fractional literal rounds half away from zero (`INTERVAL 1.5 WEEK` is 14 days) and a text amount reads its leading integer, as MySQL does; any other amount takes an integer type. The count is an INT, as in StarRocks: a count past INT's range moves a date to NULL. A string literal meets a function as a string column does first; where only a date or datetime fits, it is read once at plan time, as a CAST to that type reads it, a DATETIME before a DATE (§3.1), and text that doesn't read is NULL. `CAST('…' AS DATE)` and `DATE('…')` read a literal once with their own kernels. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal, and BOOLEAN `true`, `false` or an INT, §3.1). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. Every write (INSERT, UPDATE, ON DUPLICATE KEY UPDATE) converts a value into a DECIMAL column as `CAST` to the column's type does: it rounds half away from zero to the scale, raises past the precision, and rejects text that isn't a number. |
 | **Statistical / set-oriented aggregates** | `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT`. |
 | **In-process Connection** | `thindb.local(...)` returns a Connection that mediates queries — same surface a future remote-mode Connection will expose. |
 

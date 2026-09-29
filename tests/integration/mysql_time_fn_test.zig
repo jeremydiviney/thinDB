@@ -156,9 +156,11 @@ test "MySQL date and TIME functions over constants" {
         .{ "EXTRACT(DAY_HOUR FROM '1 10:05:03')", "34" },
         .{ "EXTRACT(MICROSECOND FROM '10:00:00.5')", "500000" },
         .{ "TIMESTAMPADD(MICROSECOND, 1, '2026-01-01')", "2026-01-01 00:00:00.000001" },
-        .{ "TIMESTAMPADD(QUARTER, 1, '2026-01-31')", "2026-04-30" },
-        .{ "TIMESTAMPADD(WEEK, 1, '2026-01-31')", "2026-02-07" },
-        .{ "TIMESTAMPADD(SQL_TSI_MONTH, 1, '2026-01-31')", "2026-02-28" },
+        // StarRocks: text takes the DATETIME overload, where MySQL keeps
+        // date-only text a date.
+        .{ "TIMESTAMPADD(QUARTER, 1, '2026-01-31')", "2026-04-30 00:00:00" },
+        .{ "TIMESTAMPADD(WEEK, 1, '2026-01-31')", "2026-02-07 00:00:00" },
+        .{ "TIMESTAMPADD(SQL_TSI_MONTH, 1, '2026-01-31')", "2026-02-28 00:00:00" },
         .{ "TIMESTAMPDIFF(QUARTER, '2026-01-01', '2026-12-31')", "3" },
         .{ "TIMESTAMPDIFF(WEEK, '2026-01-01', '2026-12-31')", "52" },
         .{ "TIMESTAMPDIFF(MICROSECOND, '2026-01-01', '2026-01-01 00:00:01.5')", "1500000" },

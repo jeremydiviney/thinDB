@@ -97,7 +97,8 @@ test "result type: GREATEST, LEAST and COALESCE return their arguments' common t
         .{ .sql = "SELECT CAST(GREATEST(i, x, 2.75) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "2.75", "3.25", NULL } },
         .{ .sql = "SELECT CAST(LEAST(id, i, 3) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "1", "2", NULL } },
         .{ .sql = "SELECT CAST(GREATEST(a, b, 2) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "2.0000", "3.2500", "2.0000" } },
-        .{ .sql = "SELECT CAST(LEAST(d, ts, '2024-03-05 12:00:00') AS CHAR) FROM rt ORDER BY id", .expected = &.{ "2024-03-05 00:00:00", "2024-03-05 10:00:00", NULL } },
+        // Text among them makes the common type text, as in StarRocks.
+        .{ .sql = "SELECT CAST(LEAST(d, ts, '2024-03-05 12:00:00') AS CHAR) FROM rt ORDER BY id", .expected = &.{ "2024-03-05", "2024-03-05 10:00:00", NULL } },
         .{ .sql = "SELECT GREATEST(s, 'banana', 'cherry') FROM rt ORDER BY id", .expected = &.{ "cherry", "pear", "kiwi" } },
         .{ .sql = "SELECT LEAST(s, 'banana', 'cherry', s) FROM rt ORDER BY id", .expected = &.{ "apple", "banana", "banana" } },
     });
