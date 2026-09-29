@@ -1503,10 +1503,25 @@ pub const builtins = [_]ScalarFn{
     // date <-> datetime
     .{ .name = "to_date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },
-    // Text parsing: text that isn't a date is NULL. Compute parses a literal
-    // argument once at plan time instead (coerceTemporalStringLiterals).
+    // Numbers and text read as dates, as StarRocks casts them: a value that
+    // isn't a date is NULL. Compute reads a text literal once at plan time
+    // instead, with the same kernel (`foldTextRead`). Narrower integers widen
+    // to bigint. A decimal converts to double and is truncated: converting
+    // it to text costs the same, so the number overloads come first to win
+    // that tie.
+    .{ .name = "to_date", .arg_types = &.{.bigint}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.bigintToDateKernel },
+    .{ .name = "to_date", .arg_types = &.{.double}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.doubleToDateKernel },
+    .{ .name = "to_datetime", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.bigintToDatetimeKernel },
+    .{ .name = "to_datetime", .arg_types = &.{.double}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.doubleToDatetimeKernel },
     .{ .name = "to_date", .arg_types = &.{.string}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.stringToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.string}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.stringToDatetimeKernel },
+    // DATE(x) is CAST(x AS DATE) except for text, which it reads as a
+    // DATETIME, so an invalid time of day makes it NULL.
+    .{ .name = "date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
+    .{ .name = "date", .arg_types = &.{.date}, .return_type = .date, .kernel = date.dateIdentityKernel },
+    .{ .name = "date", .arg_types = &.{.bigint}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.bigintToDateKernel },
+    .{ .name = "date", .arg_types = &.{.double}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.doubleToDateKernel },
+    .{ .name = "date", .arg_types = &.{.string}, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.stringDatetimeDayKernel },
     // Stringify numerics.
     .{ .name = "to_string", .arg_types = &.{.int}, .return_type = .string, .kernel = math.integerToStringKernel(i32) },
     .{ .name = "to_string", .arg_types = &.{.bigint}, .return_type = .string, .kernel = math.integerToStringKernel(i64) },
@@ -1609,7 +1624,6 @@ fn extractBuiltins() [3 * (std.meta.fields(time.ClockUnit).len + 1)]ScalarFn {
 const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     .{ .alias = "substr", .name = "substring" },
     .{ .alias = "mid", .name = "substring" },
-    .{ .alias = "date", .name = "to_date" },
     .{ .alias = "lcase", .name = "lower" },
     .{ .alias = "ucase", .name = "upper" },
     .{ .alias = "power", .name = "pow" },

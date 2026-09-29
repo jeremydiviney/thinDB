@@ -280,3 +280,112 @@ test "year 0 dates print, store and compute as the days they are (issue #393)" {
     // A fraction before the epoch printed a second early.
     try expectStrings(allocator, db, "SELECT CAST(CAST('1969-12-31 23:59:59.5' AS DATETIME) AS CHAR) FROM y0 WHERE id = 1", &.{"1969-12-31 23:59:59.500000"});
 }
+
+test "CAST and DATE() read text and numbers as StarRocks does (issue #399)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE spell (id BIGINT PRIMARY KEY, s VARCHAR(40), n BIGINT, x DOUBLE)");
+    try exec(allocator, db, "INSERT INTO spell (id, s, n, x) VALUES " ++
+        "(1, '2026/1/1', 20260101, 20260101.9), " ++
+        "(2, '20260101103000', 260101103000, 260101.5), " ++
+        "(3, '2026-01-01 25:00:00', 20260101240000, -1), " ++
+        "(4, ' 26-1-1 1:2:3.5 ', 1231, 991231), " ++
+        "(5, '2026-01-01 10 30 00', 2026, 1e20), " ++
+        "(6, 'garbage', NULL, NULL)");
+    const t = try db.openTable("spell", .{});
+    try t.flush();
+
+    // The same text read per row from a column and folded from a literal.
+    const texts = [_][]const u8{ "2026/1/1", "20260101103000", "2026-01-01 25:00:00", " 26-1-1 1:2:3.5 ", "2026-01-01 10 30 00", "garbage" };
+    const cast_date = [_]?[]const u8{ "2026-01-01", "2026-01-01", "2026-01-01", "2026-01-01", null, null };
+    const date_fn = [_]?[]const u8{ "2026-01-01", "2026-01-01", null, "2026-01-01", "2026-01-01", null };
+    const cast_datetime = [_]?[]const u8{ "2026-01-01 00:00:00", "2026-01-01 10:30:00", null, "2026-01-01 01:02:03.500000", "2026-01-01 10:30:00", null };
+    try expectStrings(allocator, db, "SELECT CAST(CAST(s AS DATE) AS CHAR) FROM spell ORDER BY id", &cast_date);
+    try expectStrings(allocator, db, "SELECT CAST(DATE(s) AS CHAR) FROM spell ORDER BY id", &date_fn);
+    try expectStrings(allocator, db, "SELECT CAST(CAST(s AS DATETIME) AS CHAR) FROM spell ORDER BY id", &cast_datetime);
+    for (texts, cast_date, date_fn, cast_datetime) |text, want_date, want_date_fn, want_datetime| {
+        var buf: [160]u8 = undefined;
+        try expectStrings(allocator, db, try std.fmt.bufPrint(&buf, "SELECT CAST(CAST('{s}' AS DATE) AS CHAR) FROM spell WHERE id = 1", .{text}), &.{want_date});
+        try expectStrings(allocator, db, try std.fmt.bufPrint(&buf, "SELECT CAST(DATE('{s}') AS CHAR) FROM spell WHERE id = 1", .{text}), &.{want_date_fn});
+        try expectStrings(allocator, db, try std.fmt.bufPrint(&buf, "SELECT CAST(CAST('{s}' AS DATETIME) AS CHAR) FROM spell WHERE id = 1", .{text}), &.{want_datetime});
+    }
+
+    try expectStrings(allocator, db, "SELECT CAST(CAST(n AS DATE) AS CHAR) FROM spell ORDER BY id", &.{ "2026-01-01", "2026-01-01", null, "2000-12-31", null, null });
+    try expectStrings(allocator, db, "SELECT CAST(DATE(n) AS CHAR) FROM spell ORDER BY id", &.{ "2026-01-01", "2026-01-01", null, "2000-12-31", null, null });
+    try expectStrings(allocator, db, "SELECT CAST(CAST(n AS DATETIME) AS CHAR) FROM spell ORDER BY id", &.{ "2026-01-01 00:00:00", "2026-01-01 10:30:00", null, "2000-12-31 00:00:00", null, null });
+    try expectStrings(allocator, db, "SELECT CAST(CAST(x AS DATE) AS CHAR) FROM spell ORDER BY id", &.{ "2026-01-01", "2026-01-01", null, "1999-12-31", null, null });
+    try expectStrings(allocator, db, "SELECT CAST(CAST(20260101 AS DATE) AS CHAR) FROM spell WHERE id = 1", &.{"2026-01-01"});
+    // StarRocks rejects a DECIMAL; thinDB reads it as a double, truncated.
+    try expectStrings(allocator, db, "SELECT CAST(CAST(20260101103000.5 AS DATETIME) AS CHAR) FROM spell WHERE id = 1", &.{"2026-01-01 10:30:00"});
+    try expectStrings(allocator, db, "SELECT CAST(DATE(20260101.5) AS CHAR) FROM spell WHERE id = 1", &.{"2026-01-01"});
+
+    // A literal that reads is a non-null constant.
+    var constant = try runSql(allocator, db, "SELECT CAST('2026/1/1' AS DATE), DATE('2026-01-01T10:30:00Z') FROM spell WHERE id = 1");
+    defer constant.deinit();
+    try std.testing.expectEqual(false, constant.outputSchema()[0].nullable);
+    try std.testing.expectEqual(false, constant.outputSchema()[1].nullable);
+
+    // Text a function wants as a date reads as a CAST would read it, and
+    // text that doesn't read is NULL, as in StarRocks.
+    try expectStrings(allocator, db, "SELECT CAST(UNIX_TIMESTAMP('2026/1/1 10:30') AS CHAR) FROM spell WHERE id = 1", &.{"1767263400"});
+    try expectStrings(allocator, db, "SELECT CAST(UNIX_TIMESTAMP('garbage') AS CHAR) FROM spell WHERE id = 1", &.{null});
+    try expectStrings(allocator, db, "SELECT CAST(YEAR('garbage') AS CHAR) FROM spell WHERE id = 1", &.{null});
+
+    // INSERT ... SELECT reads text into a DATE column as CAST does.
+    try exec(allocator, db, "CREATE TABLE spelled (id BIGINT PRIMARY KEY, d DATE)");
+    try exec(allocator, db, "INSERT INTO spelled SELECT id, s FROM spell WHERE id IN (1, 2, 4)");
+    try expectStrings(allocator, db, "SELECT CAST(d AS CHAR) FROM spelled ORDER BY id", &.{ "2026-01-01", "2026-01-01", "2026-01-01" });
+}
+
+test "a text literal keeps its time of day in date functions and stays text where text fits, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE one (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO one VALUES (1)");
+
+    // Expected values are StarRocks'. Text takes a DATETIME parameter
+    // before a DATE one; a function that takes only a DATE takes the day.
+    const cases = .{
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 DAY)", "2026-01-02 10:30:00" },
+        .{ "DATE_SUB('2026-01-01 10:30:00', INTERVAL 1 DAY)", "2025-12-31 10:30:00" },
+        .{ "DATE_SUB('2026-01-01 10:30:00', INTERVAL 1 HOUR)", "2026-01-01 09:30:00" },
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 WEEK)", "2026-01-08 10:30:00" },
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 QUARTER)", "2026-04-01 10:30:00" },
+        .{ "DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 YEAR)", "2027-01-01 10:30:00" },
+        .{ "ADDDATE('2026-01-01 10:30:00', 1)", "2026-01-02 10:30:00" },
+        .{ "SUBDATE('2026-01-01 10:30:00', 1)", "2025-12-31 10:30:00" },
+        .{ "'2026-01-01 10:30:00' + INTERVAL 1 MONTH", "2026-02-01 10:30:00" },
+        .{ "INTERVAL 1 DAY + '2026-01-01 10:30:00'", "2026-01-02 10:30:00" },
+        .{ "TIMESTAMPADD(DAY, 1, '2026-01-01 10:30:00')", "2026-01-02 10:30:00" },
+        .{ "TIMESTAMPADD(MONTH, 1, '2026-01-01 10:30:00')", "2026-02-01 10:30:00" },
+        .{ "DATE_ADD('2026-01-31', INTERVAL 1 DAY)", "2026-02-01 00:00:00" },
+        .{ "'2026-01-31' + INTERVAL 1 MONTH", "2026-02-28 00:00:00" },
+        .{ "DATE_ADD('2026/1/31', INTERVAL 1 DAY)", "2026-02-01 00:00:00" },
+        .{ "LAST_DAY('2026/2/1 10:00')", "2026-02-28" },
+        .{ "DAYNAME('2026-01-01 10:30:00')", "Thursday" },
+        .{ "WEEK('2026-01-01 10:30:00', 1)", "1" },
+        .{ "TO_DAYS('2026-01-01 10:30:00')", "739982" },
+        .{ "DATEDIFF('2026-01-02 01:00:00', '2026-01-01 23:00:00')", "1" },
+        .{ "DATEDIFF('2026-01-02 01:00:00', DATE '2026-01-01')", "1" },
+        .{ "TIMESTAMPDIFF(HOUR, '2026-01-01 23:00:00', '2026-01-02 01:00:00')", "2" },
+        // Text beside a DATE where text fits stays text.
+        .{ "COALESCE('2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "COALESCE(NULL, '2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "COALESCE('2026/1/1', DATE '2026-01-02')", "2026/1/1" },
+        .{ "IFNULL('2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "GREATEST('2026-01-01 10:30:00', DATE '2026-01-01')", "2026-01-01 10:30:00" },
+        .{ "LEAST('2026/1/1', DATE '2026-01-02')", "2026-01-02" },
+    };
+    inline for (cases) |c| {
+        try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM one", &.{c[1]});
+    }
+    try expectStrings(allocator, db, "SELECT CAST(DATE_ADD('abc', INTERVAL 1 DAY) AS CHAR) FROM one", &.{null});
+}
