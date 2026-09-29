@@ -80,9 +80,9 @@ pub fn retainSweepLifetime(gate: ?*StatementGate) !?StatementGate.LifetimeLease 
     return if (gate) |g| try g.retainAllocator() else null;
 }
 
-/// Directory names under this prefix hold a table that CREATE TABLE ... AS
-/// SELECT is still filling: no table is created, renamed, listed or opened
-/// under one, and a schema deletes any a crash left as it opens.
+/// Directory names under this prefix hold a table a `TableBuild` is still
+/// filling: no table is created, renamed, listed or opened under one, and a
+/// schema deletes any a crash left as it opens.
 const table_build_prefix = "__ctas_";
 /// The prefix and the decimal digits of any u64.
 const table_build_dir_name_max = table_build_prefix.len + 20;
@@ -91,8 +91,10 @@ fn isReservedTableName(name: []const u8) bool {
     return alter.isReservedTableName(name) or std.mem.startsWith(u8, name, table_build_prefix);
 }
 
-/// A crash ends a build's statement with it, before anything was published,
-/// so every build directory a schema finds as it opens is garbage.
+/// A crash ends a build's statement with it. A build directory that stands
+/// is one whose publish never took its name, and a replacing build's original
+/// is back under that name by now (`alter.recoverInterruptedAlters` runs
+/// first), so every build directory a schema finds as it opens is garbage.
 fn deleteTableBuildLeftovers(allocator: Allocator, io: Io, schema_dir: Io.Dir) !void {
     var names: std.ArrayList([]u8) = .empty;
     defer {
@@ -116,16 +118,23 @@ fn deleteTableBuildLeftovers(allocator: Allocator, io: Io, schema_dir: Io.Dir) !
 }
 
 /// A table no other statement can resolve: its directory has a reserved name
-/// and the schema's map does not hold it. CREATE TABLE ... AS SELECT fills
-/// one and publishes it only once its query has succeeded, so a failed query
-/// frees a table nobody else can hold (see `Schema.dropTable`). The build
+/// and the schema's map does not hold it. CREATE TABLE ... AS SELECT and
+/// CREATE MATERIALIZED VIEW fill one and publish it only once their query has
+/// succeeded, so a failed query frees a table nobody else can hold (see
+/// `Schema.dropTable`). A replacing build (`Schema.beginTableReplacement`)
+/// publishes over the table that holds its name, which keeps its rows until
+/// then: REFRESH MATERIALIZED VIEW and CREATE OR REPLACE use one. The build
 /// holds a statement lease until `deinit`, so its schema outlives it.
 pub const TableBuild = struct {
     schema: *Schema,
     table: *Table,
     /// The name it publishes under; the table takes it on publish.
     name: []u8,
+    /// Whether the publish may take the name from the table that holds it.
+    replaces: bool,
     published: bool = false,
+    /// Whether the publish took the name from a table, and freed it.
+    replaced: bool = false,
     lease: ?StatementGate.Lease,
     dir_name_buf: [table_build_dir_name_max]u8,
     dir_name_len: usize,
@@ -135,38 +144,118 @@ pub const TableBuild = struct {
     }
 
     /// Publish the table under its name, with every row in place. A table or
-    /// directory that took the name meanwhile fails it with
-    /// TableAlreadyExists, and the build stays unpublished.
+    /// directory that holds the name fails it with TableAlreadyExists, unless
+    /// a replacing build takes the name from a table, and the build stays
+    /// unpublished.
     pub fn publish(build: *TableBuild) !void {
         if (build.published) return Error.TableAlreadyExists;
         const s = build.schema;
         const t = build.table;
-        // The log keeps rows until a flush and lives inside the directory the
-        // rename moves; flushed, it holds nothing live and starts afresh in
-        // the published directory.
+        // Flushed, the rows are in segments before any name moves, and the
+        // log, which lives inside the directory the rename moves, holds
+        // nothing live and starts afresh in the published directory.
         const had_wal = t.wal != null;
-        if (had_wal) try t.flush();
+        try t.flush();
 
         s.tables_mutex.lockUncancelable(s.io);
         defer s.tables_mutex.unlock(s.io);
         if (s.dropping.contains(build.name)) return Error.TableBusy;
-        if (s.tables.contains(build.name) or try s.nameTakenOnDisk(build.name)) return Error.TableAlreadyExists;
+        const current = s.tables.get(build.name);
+        if (current != null and !build.replaces) return Error.TableAlreadyExists;
+        if (current == null and try s.nameTakenOnDisk(build.name)) return Error.TableAlreadyExists;
         try s.tables.ensureUnusedCapacity(1);
+        if (current) |old| return build.swapIn(old, had_wal);
 
         // A refused rename moved nothing, so the build is still whole to
         // discard.
         closeTableHandles(t);
         try storage.retryTransientWindowsRefusal(s.io, Io.Dir.rename, .{ s.schema_dir, build.dirName(), s.schema_dir, build.name, s.io });
-        s.allocator.free(t.name);
-        t.name = build.name;
-        s.tables.putAssumeCapacity(t.name, t);
-        build.published = true;
+        build.takeName();
         // The table stands under its name on disk now. As in renameTable, a
         // failure below leaves it without directory handles, so fence it
         // until reopen.
         errdefer t.requireRecovery();
         try s.reopenTableDirs(t, t.name, had_wal);
         if (t.syncEnabled()) storage.syncDirectory(s.io, s.schema_dir) catch return Error.DurabilityUncertain;
+    }
+
+    /// Publish over `old`, which holds the name, with ALTER's swap (DESIGN.md
+    /// §9.2): set `old` aside, rename the build into its place, then free and
+    /// delete `old`. The rename commits. An open after a crash at any step
+    /// finds exactly one of the two under the name: before the commit it puts
+    /// the aside back and deletes the build, after it deletes the aside.
+    /// Freeing `old` is safe because a replacing build holds the exclusive
+    /// lease, so no statement holds `old` (see `Schema.dropTable`). Caller
+    /// holds `tables_mutex` and has reserved a slot in the map.
+    fn swapIn(build: *TableBuild, old: *Table, had_wal: bool) !void {
+        const s = build.schema;
+        const t = build.table;
+        // compact_lock first, as in dropTable: a merge holds no ddl_lock.
+        old.lockCompactPreempting();
+        old.ddl_lock.lockUncancelable(old.io);
+        old.mutex.lockUncancelable(old.io);
+        var old_locked = true;
+        defer if (old_locked) {
+            old.mutex.unlock(old.io);
+            old.ddl_lock.unlock(old.io);
+            old.compact_lock.unlock(old.io);
+        };
+        try old.ensureUsable();
+        try alter.deleteAlterLeftovers(s.io, s.schema_dir, build.name);
+        var aside_buf: [256]u8 = undefined;
+        const aside_name = try alter.asideName(&aside_buf, build.name);
+
+        // As in renameTable: flushed, the old log carries nothing live, so a
+        // swap that stops short of its commit reopens `old` with a fresh one.
+        const old_had_wal = old.wal != null;
+        if (old_had_wal) try old.flushLocked();
+        closeTableHandles(t);
+        closeTableHandles(old);
+        // A refused rename moved nothing, so both stay where they stand.
+        storage.retryTransientWindowsRefusal(s.io, Io.Dir.rename, .{ s.schema_dir, build.name, s.schema_dir, aside_name, s.io }) catch |err| {
+            s.reopenTableDirs(old, build.name, old_had_wal) catch old.requireRecovery();
+            return err;
+        };
+        build.moveIntoPlace() catch |err| {
+            // Not committed: put `old` back now, or fence it until the next
+            // open does.
+            if (storage.retryTransientWindowsRefusal(s.io, Io.Dir.rename, .{ s.schema_dir, aside_name, s.schema_dir, build.name, s.io })) |_| {
+                s.reopenTableDirs(old, build.name, old_had_wal) catch old.requireRecovery();
+            } else |_| old.requireRecovery();
+            return err;
+        };
+
+        _ = s.tables.remove(build.name);
+        build.takeName();
+        build.replaced = true;
+        old_locked = false;
+        old.close();
+        errdefer t.requireRecovery();
+        try s.reopenTableDirs(t, t.name, had_wal);
+        if (t.syncEnabled()) storage.syncDirectory(s.io, s.schema_dir) catch return Error.DurabilityUncertain;
+        // Committed: an aside the delete leaves is garbage, which the next
+        // open, or DROP, RENAME or ALTER of the name, removes.
+        storage.retryTransientWindowsRefusal(s.io, Io.Dir.deleteTree, .{ s.schema_dir, s.io, aside_name }) catch {};
+    }
+
+    /// Make the aside's rename durable, then rename the build into the name:
+    /// the commit of `swapIn`.
+    fn moveIntoPlace(build: *TableBuild) !void {
+        const s = build.schema;
+        if (build.table.syncEnabled()) storage.syncDirectory(s.io, s.schema_dir) catch return Error.DurabilityUncertain;
+        try storage.retryTransientWindowsRefusal(s.io, Io.Dir.rename, .{ s.schema_dir, build.dirName(), s.schema_dir, build.name, s.io });
+    }
+
+    /// Give the table its name and its entry in the schema's map, once its
+    /// directory stands under the name. Caller holds `tables_mutex` and has
+    /// reserved a slot in the map.
+    fn takeName(build: *TableBuild) void {
+        const s = build.schema;
+        const t = build.table;
+        s.allocator.free(t.name);
+        t.name = build.name;
+        s.tables.putAssumeCapacity(t.name, t);
+        build.published = true;
     }
 
     /// Release the build. An unpublished table goes with it, directory and
@@ -495,17 +584,48 @@ pub const Schema = struct {
         table_schema: TableSchema,
         options: TableOptions,
     ) !TableBuild {
+        return self.startTableBuild(name, table_schema, options, false);
+    }
+
+    /// Begin a table whose publish replaces the table that holds `name`, if
+    /// one does; that table keeps its rows until the publish. The build holds
+    /// the exclusive lease, since its publish frees the table it replaces
+    /// (see `Schema.dropTable`).
+    pub fn beginTableReplacement(
+        self: *Schema,
+        name: []const u8,
+        table_schema: TableSchema,
+        options: TableOptions,
+    ) !TableBuild {
+        return self.startTableBuild(name, table_schema, options, true);
+    }
+
+    fn startTableBuild(
+        self: *Schema,
+        name: []const u8,
+        table_schema: TableSchema,
+        options: TableOptions,
+        replaces: bool,
+    ) !TableBuild {
         if (isReservedTableName(name)) return Error.ReservedTableName;
         try table_schema.validate();
-        const lease = if (self.config.statement_gate) |gate| try gate.acquire(false) else null;
+        const lease = if (self.config.statement_gate) |gate| try gate.acquire(replaces) else null;
         errdefer if (lease) |l| l.release();
-        {
-            self.tables_mutex.lockUncancelable(self.io);
-            defer self.tables_mutex.unlock(self.io);
-            if (self.dropping.contains(name)) return Error.TableBusy;
-            if (self.tables.contains(name)) return Error.TableAlreadyExists;
+        if (replaces) {
+            // The publish closes the table it replaces, so it must be open.
+            _ = self.openTable(name, .{}) catch |err| switch (err) {
+                Error.TableNotFound => {},
+                else => return err,
+            };
+        } else {
+            {
+                self.tables_mutex.lockUncancelable(self.io);
+                defer self.tables_mutex.unlock(self.io);
+                if (self.dropping.contains(name)) return Error.TableBusy;
+                if (self.tables.contains(name)) return Error.TableAlreadyExists;
+            }
+            if (try self.tableOnDisk(name)) return Error.TableAlreadyExists;
         }
-        if (try self.tableOnDisk(name)) return Error.TableAlreadyExists;
 
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
@@ -513,6 +633,7 @@ pub const Schema = struct {
             .schema = self,
             .table = undefined,
             .name = owned_name,
+            .replaces = replaces,
             .lease = lease,
             .dir_name_buf = undefined,
             .dir_name_len = 0,

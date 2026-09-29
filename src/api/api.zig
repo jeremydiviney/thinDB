@@ -357,6 +357,7 @@ pub const OpenOptions = struct {
 pub const Table = @import("table.zig").Table;
 pub const schemaFingerprint = @import("table.zig").schemaFingerprint;
 pub const Schema = @import("schema.zig").Schema;
+pub const TableBuild = @import("schema.zig").TableBuild;
 pub const Database = @import("database.zig").Database;
 pub const default_schema_name = @import("database.zig").default_schema_name;
 pub const Catalog = @import("catalog.zig").Catalog;

@@ -257,3 +257,87 @@ test "durability: a refused RENAME TABLE leaves the table usable under its name"
     try db.renameTable("moving", "moved");
     try expectIds(a, try db.openTable("moved", .{}), &.{ 7, 8 });
 }
+
+fn replaceWithIds(a: std.mem.Allocator, db: *api.Database, name: []const u8, ids: []const i64) !void {
+    const schema = db.schema("public") orelse return error.SchemaNotFound;
+    var build = try schema.beginTableReplacement(name, alter_test_table, .{ .order_key = &.{"id"} });
+    defer build.deinit();
+    for (ids) |id| try build.table.insert(&.{.{ .id = id }});
+    try expectIds(a, build.table, ids);
+    try build.publish();
+}
+
+fn expectNoSwapLeftovers(tmp: std.testing.TmpDir) !void {
+    var public = try tmp.dir.openDir(std.testing.io, "main/public", .{ .iterate = true });
+    defer public.close(std.testing.io);
+    var it = public.iterate();
+    while (try it.next(std.testing.io)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.name, "__"));
+}
+
+test "durability: a replacing publish whose commit is refused puts the original back" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "__ctas_" };
+    defer fault.threaded.deinit();
+    const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
+    defer db.close();
+    const table = try db.table("replaced", alter_test_table, .{ .order_key = &.{"id"} });
+    try table.insert(&.{.{ .id = @as(i64, 7) }});
+    try table.flush();
+    fault.rename_failures = std.math.maxInt(usize);
+    try std.testing.expectError(error.AccessDenied, replaceWithIds(a, db, "replaced", &.{ 1, 2 }));
+    try std.testing.expectEqual(table, try db.openTable("replaced", .{}));
+    try table.insert(&.{.{ .id = @as(i64, 8) }});
+    try table.flush();
+    try expectIds(a, table, &.{ 7, 8 });
+    try expectNoSwapLeftovers(tmp);
+    fault.rename_failures = 0;
+    try replaceWithIds(a, db, "replaced", &.{ 1, 2 });
+    try expectIds(a, try db.openTable("replaced", .{}), &.{ 1, 2 });
+    try expectNoSwapLeftovers(tmp);
+}
+
+test "durability: a replacing publish refused the aside leaves the original usable" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Only the swap's first rename moves a directory named for the table.
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "replaced" };
+    defer fault.threaded.deinit();
+    const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
+    defer db.close();
+    const table = try db.table("replaced", alter_test_table, .{ .order_key = &.{"id"} });
+    try table.insert(&.{.{ .id = @as(i64, 7) }});
+    fault.rename_failures = std.math.maxInt(usize);
+    try std.testing.expectError(error.AccessDenied, replaceWithIds(a, db, "replaced", &.{ 1, 2 }));
+    try std.testing.expectEqual(table, try db.openTable("replaced", .{}));
+    try table.insert(&.{.{ .id = @as(i64, 8) }});
+    try table.flush();
+    try expectIds(a, table, &.{ 7, 8 });
+    try expectNoSwapLeftovers(tmp);
+}
+
+test "durability: a replacing publish refused both commit and rollback fences the original until reopen restores it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        // Refuses the build's rename into the name and the aside's back.
+        var fault = DirectorySyncFault{ .threaded = .init(a, .{}), .rename_fail_prefix = "__" };
+        defer fault.threaded.deinit();
+        const db = try api.Database.open(a, fault.io(), tmp.dir, .{});
+        defer db.close();
+        const table = try db.table("replaced", alter_test_table, .{ .order_key = &.{"id"} });
+        try table.insert(&.{.{ .id = @as(i64, 7) }});
+        try table.flush();
+        fault.rename_failures = std.math.maxInt(usize);
+        try std.testing.expectError(error.AccessDenied, replaceWithIds(a, db, "replaced", &.{ 1, 2 }));
+        try std.testing.expectError(error.RecoveryRequired, table.insert(&.{.{ .id = @as(i64, 8) }}));
+        try std.testing.expectError(error.RecoveryRequired, exec.scan(a, table));
+    }
+    const db = try api.Database.open(a, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try expectIds(a, try db.openTable("replaced", .{}), &.{7});
+    try expectNoSwapLeftovers(tmp);
+}

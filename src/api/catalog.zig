@@ -301,7 +301,8 @@ pub const Catalog = struct {
 
     /// Register a view from its parsed CREATE statement and persist the
     /// canonical statement to `<db>/_views/<name>.sql`. `skip_persist=true`
-    /// on the load-from-disk path.
+    /// on the load-from-disk path. A definition that fails to persist is
+    /// taken back, so a failed call leaves the registry as it found it.
     pub fn registerView(
         self: *Catalog,
         db_name: []const u8,
@@ -316,20 +317,30 @@ pub const Catalog = struct {
         try text.appendSlice(self.allocator, cv.body);
 
         const db = self.database(db_name) orelse return Error.DatabaseNotFound;
-        try self.views.register(db_name, .{
+        const previous = try self.views.put(db_name, .{
             .name = cv.name,
             .materialized = cv.materialized,
             .body = cv.body,
             .create_text = text.items,
         }, cv.or_replace or skip_persist);
+        if (!skip_persist) self.persistView(db, cv.name, text.items) catch |err| {
+            self.views.restore(db_name, cv.name, previous);
+            return err;
+        };
+        if (previous) |p| p.deinit(self.views.allocator);
+    }
 
-        if (skip_persist) return;
+    fn persistView(self: *Catalog, db: *Database, name: []const u8, text: []const u8) !void {
         var dir = db.db_dir.openDir(self.io, "_views", .{}) catch
             try db.db_dir.createDirPathOpen(self.io, "_views", .{});
         defer dir.close(self.io);
         var namebuf: [300]u8 = undefined;
-        const fname = try fnFileName(&namebuf, cv.name);
-        try dir.writeFile(self.io, .{ .sub_path = fname, .data = text.items });
+        const fname = try fnFileName(&namebuf, name);
+        var tmpbuf: [304]u8 = undefined;
+        // Not `.sql`, so `loadViews` never reads a half-written one.
+        const tmp_name = try std.fmt.bufPrint(&tmpbuf, "{s}.tmp", .{fname});
+        // A replaced definition stays whole until the new one takes its name.
+        try storage.writeFileAtomic(self.io, dir, tmp_name, fname, text, self.config.sync_mode != .none);
     }
 
     pub fn dropView(self: *Catalog, db_name: []const u8, name: []const u8) !bool {
