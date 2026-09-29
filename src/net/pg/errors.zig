@@ -39,6 +39,8 @@ pub fn mapInternal(err: anyerror) Mapped {
         .table_not_found => .{ .sqlstate = "42P01".*, .message = "relation does not exist" },
         .database_not_found => .{ .sqlstate = "3D000".*, .message = "database does not exist" },
         .database_already_exists => .{ .sqlstate = "42P04".*, .message = "database already exists" },
+        .invalid_database_name => .{ .sqlstate = "42602".*, .message = "invalid database name" },
+        .no_database_selected => .{ .sqlstate = "3D000".*, .message = "no database selected" },
         .schema_not_found => .{ .sqlstate = "3F000".*, .message = "schema does not exist" },
         .schema_already_exists => .{ .sqlstate = "42P06".*, .message = "schema already exists" },
         .table_already_exists => .{ .sqlstate = "42P07".*, .message = "relation already exists" },

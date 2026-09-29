@@ -244,7 +244,8 @@ fn sendTooManyConnections(
 }
 
 const SessionState = struct {
-    current_db: []u8,
+    /// Null once the session has no current database (see `Session`).
+    current_db: ?[]u8,
     current_schema: []u8,
     application_name: []u8,
     allocator: Allocator,
@@ -322,16 +323,25 @@ const SessionState = struct {
     fn deinit(self: *SessionState) void {
         self.dropTempNamespace();
         self.ext.deinit(self.allocator);
-        self.allocator.free(self.current_db);
+        if (self.current_db) |db| self.allocator.free(db);
         self.allocator.free(self.current_schema);
         self.allocator.free(self.application_name);
     }
 
-    fn replaceDbSchema(self: *SessionState, db: []const u8, schema: []const u8) !void {
-        const new_db = try self.allocator.dupe(u8, db);
-        errdefer self.allocator.free(new_db);
+    /// Forget a current database another session dropped, so this session
+    /// answers current_database() and pg_stat_activity as one with none.
+    fn forgetDroppedDb(self: *SessionState) void {
+        const db = self.current_db orelse return;
+        if (self.catalog.database(db) != null) return;
+        self.allocator.free(db);
+        self.current_db = null;
+    }
+
+    fn replaceDbSchema(self: *SessionState, db: ?[]const u8, schema: []const u8) !void {
+        const new_db = if (db) |name| try self.allocator.dupe(u8, name) else null;
+        errdefer if (new_db) |name| self.allocator.free(name);
         const new_schema = try self.allocator.dupe(u8, schema);
-        self.allocator.free(self.current_db);
+        if (self.current_db) |name| self.allocator.free(name);
         self.allocator.free(self.current_schema);
         self.current_db = new_db;
         self.current_schema = new_schema;
@@ -418,6 +428,7 @@ fn handleConnection(
             continue;
         }
 
+        session.forgetDroppedDb();
         var db_buf: [256]u8 = undefined;
         if (processCommand(&session, frame.type_byte, frame.payload)) |tracked| {
             conn_state.beginCommand(tracked.command, tracked.text, processDb(&session, &db_buf), conn_registry.nowMs(io));
@@ -665,13 +676,11 @@ fn runExtendedStatement(
     const statement_lease = try catalog.acquireStatement(local.changesCatalog(op));
     defer statement_lease.release();
 
-    const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
-
     if (needsTempNamespace(op.*)) {
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{
+    var compiled = try local.compileInStatementWithOptions(allocator, catalog, session.asSession(), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
     });
@@ -745,7 +754,8 @@ fn processCommand(session: *const SessionState, type_byte: u8, payload: []const 
 /// The session's current schema as the MySQL wire's `USE` names it, so
 /// both wires' rows read alike in SHOW PROCESSLIST.
 fn processDb(session: *const SessionState, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}__{s}", .{ session.current_db, session.current_schema }) catch session.current_db;
+    const db = session.current_db orelse return "";
+    return std.fmt.bufPrint(buf, "{s}__{s}", .{ db, session.current_schema }) catch db;
 }
 
 /// Handles SSLRequest negotiation if needed, then the real StartupMessage
@@ -1151,13 +1161,11 @@ fn runSingleStatement(
         return copy.handleCopy(allocator, w, r, catalog, session.asSession(), op.copy);
     }
 
-    const main_db = catalog.database(session.current_db) orelse return ApiError.DatabaseNotFound;
-
     if (needsTempNamespace(op.*)) {
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileInStatementWithOptions(allocator, main_db, session.asSession(), op, .{
+    var compiled = try local.compileInStatementWithOptions(allocator, catalog, session.asSession(), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
     });
@@ -1252,7 +1260,7 @@ test "applyDatabase resolves an existing database" {
     var session = try SessionState.init(allocator, c, 1);
     defer session.deinit();
     try applyDatabase(c, &session, "alpha");
-    try std.testing.expectEqualStrings("alpha", session.current_db);
+    try std.testing.expectEqualStrings("alpha", session.current_db.?);
     try std.testing.expectEqualStrings("public", session.current_schema);
 }
 

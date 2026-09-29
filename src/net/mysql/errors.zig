@@ -19,6 +19,8 @@ pub fn mapInternal(err: anyerror, fallback_msg: ?[]const u8) Mapped {
         .table_not_found => .{ .code = 1146, .sqlstate = "42S02".*, .message = "Table not found" },
         .database_not_found => .{ .code = 1049, .sqlstate = "42000".*, .message = "Unknown database" },
         .database_already_exists => .{ .code = 1007, .sqlstate = "HY000".*, .message = "Database exists" },
+        .invalid_database_name => .{ .code = 1102, .sqlstate = "42000".*, .message = "Incorrect database name" },
+        .no_database_selected => .{ .code = 1046, .sqlstate = "3D000".*, .message = "No database selected" },
         .schema_not_found => .{ .code = 1146, .sqlstate = "42S02".*, .message = "Schema not found" },
         .schema_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Schema exists" },
         .table_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Table exists" },
@@ -38,6 +40,16 @@ test "mapInternal recognizes catalog errors" {
     const m = mapInternal(error.TableNotFound, "x");
     try std.testing.expectEqual(@as(u16, 1146), m.code);
     try std.testing.expectEqualStrings("42S02", &m.sqlstate);
+}
+
+test "mapInternal reports a missing current database and a reserved name as MySQL does" {
+    const none = mapInternal(error.NoDatabaseSelected, null);
+    try std.testing.expectEqual(@as(u16, 1046), none.code);
+    try std.testing.expectEqualStrings("3D000", &none.sqlstate);
+    try std.testing.expectEqualStrings("No database selected", none.message);
+    const reserved = mapInternal(error.InvalidDatabaseName, null);
+    try std.testing.expectEqual(@as(u16, 1102), reserved.code);
+    try std.testing.expectEqualStrings("42000", &reserved.sqlstate);
 }
 
 test "mapInternal reports a cancelled query as interrupted" {

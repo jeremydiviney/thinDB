@@ -6,6 +6,7 @@ const thindb = @import("thindb");
 const common = @import("common.zig");
 const schema_v1 = common.schema_v1;
 const opts_v1 = common.opts_v1;
+const sql_helpers = @import("sql_helpers.zig");
 
 fn freeNames(allocator: std.mem.Allocator, names: [][]u8) void {
     for (names) |n| allocator.free(n);
@@ -311,4 +312,63 @@ test "back-compat: Database.open + db.table still works" {
     defer db.close();
     const t = try db.table("orders", schema_v1, opts_v1);
     try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+}
+
+// The catalog root also holds the engine's own directories (#373). None of
+// them is a database, so none can be created, dropped or used by name, and a
+// drop never deletes a directory the catalog did not load.
+test "Catalog: reserved root directory names are refused and never deleted" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(a, io, tmp.dir, .{});
+    defer db.close();
+    const cat = db.owned_catalog.?;
+    const markers = [_][]const u8{ "_xa/keep", "_temp/keep", "_zigfn_build/main_f/keep", "orphan/keep" };
+    for (markers) |marker| {
+        try tmp.dir.createDirPath(io, std.fs.path.dirname(marker).?);
+        try tmp.dir.writeFile(io, .{ .sub_path = marker, .data = "engine" });
+    }
+
+    for ([_][]const u8{ "_xa", "_XA", "_temp", "_zigfn_build", "", "..", "../escape", "a/b" }) |name| {
+        try std.testing.expectError(thindb.Error.InvalidDatabaseName, cat.dropDatabase(name));
+        try std.testing.expectError(thindb.Error.InvalidDatabaseName, cat.createDatabase(name));
+    }
+    for ([_][]const u8{
+        "DROP DATABASE _xa",
+        "DROP DATABASE IF EXISTS _temp",
+        "CREATE DATABASE _zigfn_build",
+        "CREATE DATABASE IF NOT EXISTS _xa",
+        "USE _temp",
+    }) |sql_text| try sql_helpers.expectRunError(a, db, sql_text, thindb.Error.InvalidDatabaseName);
+    try std.testing.expectError(thindb.Error.DatabaseNotFound, cat.dropDatabase("orphan"));
+
+    for (markers) |marker| try tmp.dir.access(io, marker, .{});
+    const names = try cat.listDatabases(a);
+    defer freeNames(a, names);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("main", names[0]);
+}
+
+// A zig function builds under `_zigfn_build` (#373). Reopening must not adopt
+// that directory as a database, which would list it and give it a `public`.
+test "Catalog: reopening skips the zig function build directory" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const cat = try thindb.Catalog.open(a, io, tmp.dir, .{});
+        defer cat.close();
+        _ = try cat.createDatabase("main");
+        try tmp.dir.createDirPath(io, thindb.Catalog.zig_fn_build_dir_name ++ "/main_f");
+    }
+    const cat = try thindb.Catalog.open(a, io, tmp.dir, .{});
+    defer cat.close();
+    const names = try cat.listDatabases(a);
+    defer freeNames(a, names);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("main", names[0]);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, thindb.Catalog.zig_fn_build_dir_name ++ "/public", .{}));
 }

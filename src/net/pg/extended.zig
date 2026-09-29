@@ -612,8 +612,7 @@ fn tryDryCompile(
 
     const lease = catalog.acquireStatement(false) catch return null;
     defer lease.release();
-    const db = catalog.database(session.current_db) orelse return null;
-    var compiled = local.compileWithSession(aa, db, session, op) catch return null;
+    var compiled = local.compileInStatement(aa, catalog, session, op) catch return null;
     defer compiled.deinit();
 
     const schema = compiled.outputSchema();

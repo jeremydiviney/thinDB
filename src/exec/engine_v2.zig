@@ -51,7 +51,7 @@ pub const SimplePipelineSpec = struct {
 
 pub const CompileInput = struct {
     allocator: std.mem.Allocator,
-    db: *api.Database,
+    catalog: *api.Catalog,
     session: api.Session,
     prune_names: ?[][]const u8 = null,
     // Query-lifetime arena for plan-node data the operator tree borrows but
@@ -87,7 +87,7 @@ pub const CompileInput = struct {
     region_ref_counts: ?*const std.AutoHashMapUnmanaged(*const ir.Op, u32) = null,
 
     pub fn effectiveDop(self: *const CompileInput) usize {
-        const base = self.db.config.max_dop;
+        const base = self.catalog.config.max_dop;
         if (self.dop_cap) |cap| return @min(base, cap);
         return base;
     }
@@ -582,7 +582,7 @@ fn collectProtectedAggNames(allocator: std.mem.Allocator, plan: GroupTopNPlan) !
 fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchGroupTopN(root) orelse return null;
 
-    const table = try resolveTable(input.db, input.session, plan.scan.table);
+    const table = try resolveTable(input.catalog, input.session, plan.scan.table);
     // The silo may reconstruct selected keys from source-row locations.
     // Volatile expressions must retain the values used during grouping.
     for (plan.derived) |d| {
@@ -993,7 +993,7 @@ fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
 }
 
 fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?exec.Query {
-    const table = try resolveTable(input.db, input.session, plan.scan.table);
+    const table = try resolveTable(input.catalog, input.session, plan.scan.table);
 
     // The parallel reducer fuses the WHERE into its scan, below the Compute
     // that materializes hidden predicate anchors; only the operator pipeline
@@ -1383,7 +1383,7 @@ fn predicateOrAlways(filter: ?ir.Op.Filter) exec.PredicateExpr {
 // for just the survivors.
 fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     const plan = matchScanSelect(root) orelse return null;
-    const table = try resolveTable(input.db, input.session, plan.scan.table);
+    const table = try resolveTable(input.catalog, input.session, plan.scan.table);
 
     if (plan.limit) |l| {
         if (plan.project_outputs == null and plan.exclude_count == 0 and plan.post_compute_count == 0) {
@@ -1617,15 +1617,14 @@ fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: Gl
     return q;
 }
 
-pub fn resolveTable(db: *api.Database, session: api.Session, ref: ir.TableRef) !*api.Table {
+pub fn resolveTable(catalog: *api.Catalog, session: api.Session, ref: ir.TableRef) !*api.Table {
     if (ref.database == null and ref.schema == null) {
         if (session.temp_namespace) |ns| {
             if (ns.findTable(ref.name)) |t| return t;
         }
     }
 
-    const catalog = catalogFor(db) orelse return error.DatabaseNotFound;
-    var db_name: []const u8 = ref.database orelse session.current_db;
+    var db_name: ?[]const u8 = ref.database orelse session.current_db;
     var schema_name: []const u8 = ref.schema orelse session.current_schema;
     if (ref.database == null and ref.schema != null) {
         if (splitDoubleUnderscore(ref.schema.?)) |parts| {
@@ -1633,7 +1632,7 @@ pub fn resolveTable(db: *api.Database, session: api.Session, ref: ir.TableRef) !
             schema_name = parts.schema;
         }
     }
-    const resolved_db = catalog.database(db_name) orelse return error.DatabaseNotFound;
+    const resolved_db = catalog.database(db_name orelse return error.NoDatabaseSelected) orelse return error.DatabaseNotFound;
     const schema = resolved_db.schema(schema_name) orelse return error.SchemaNotFound;
     {
         schema.tables_mutex.lockUncancelable(schema.io);
@@ -1641,12 +1640,6 @@ pub fn resolveTable(db: *api.Database, session: api.Session, ref: ir.TableRef) !
         if (schema.tables.get(ref.name)) |t| return t;
     }
     return schema.openTable(ref.name, .{});
-}
-
-fn catalogFor(db: *api.Database) ?*api.Catalog {
-    if (db.catalog) |catalog| return catalog;
-    if (db.owned_catalog) |catalog| return catalog;
-    return null;
 }
 
 fn splitDoubleUnderscore(s: []const u8) ?struct { db: []const u8, schema: []const u8 } {

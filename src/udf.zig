@@ -620,7 +620,9 @@ pub const ViewRegistry = struct {
 /// view registry so a bare `FROM viewname` can be expanded inline.
 pub const SqlFnCtx = struct {
     registry: *SqlFnRegistry,
-    db: []const u8,
+    /// The database whose functions and views are in scope; null when the
+    /// session has none, so none are.
+    db: ?[]const u8,
     views: ?*ViewRegistry = null,
     /// Absent = an unqualified `JOIN ... ON` column can't be attributed to
     /// a base-table input.

@@ -515,7 +515,7 @@ fn unqualifyTableBlock(input: engine_v2.CompileInput, op: *const ir.Op) !*const 
             else => return op,
         };
     };
-    const table = engine_v2.resolveTable(input.db, input.session, scan.table) catch return op;
+    const table = engine_v2.resolveTable(input.catalog, input.session, scan.table) catch return op;
     const qualifier = scan.alias orelse scan.table.name;
     const arena = input.node_arena;
     const columns = table.schema.columns;
@@ -753,7 +753,7 @@ fn cloneStrippedScanAlias(arena: std.mem.Allocator, op: *const ir.Op) !*ir.Op {
 /// sees. Null = real scan.
 fn tryPgCatalogLeaf(input: engine_v2.CompileInput, s: anytype) !?exec.Query {
     const vt = pgcat.match(s.table, input.session.dialect) orelse return null;
-    const catalog = local.catalogFor(input.db) orelse return local.Error.DatabaseNotFound;
+    const catalog = input.catalog;
     const base = try pgcat.build(input.allocator, catalog, input.session, vt);
     if (s.alias) |alias| {
         errdefer @constCast(&base).deinit();
@@ -1086,21 +1086,21 @@ fn tryStageParallelScan(input: engine_v2.CompileInput, op: *const ir.Op, map: *S
     return try switch (mode) {
         .deferred => exec.ParallelScan.createOverStageDeferred(
             input.allocator,
-            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+            try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
             stage,
             input.accountant,
             input.effectiveDop(),
         ),
         .eager => exec.ParallelScan.createOverStage(
             input.allocator,
-            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+            try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
             stage,
             input.accountant,
             input.effectiveDop(),
         ),
         .ordered => exec.ParallelScan.createOverStageOrdered(
             input.allocator,
-            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+            try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
             stage,
             input.accountant,
             input.effectiveDop(),
@@ -1406,7 +1406,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
         },
         .single_row => return local.SingleRowSource.create(input.allocator),
         .file_scan => |f| {
-            const base = try exec.fileScan(input.allocator, input.db.io, input.db.config.file_scan_access, f, null);
+            const base = try exec.fileScan(input.allocator, input.catalog.io, input.catalog.config.file_scan_access, f, null);
             if (f.alias) |alias| {
                 errdefer @constCast(&base).deinit();
                 return exec.AliasRename.create(input.allocator, base, alias);
@@ -1678,14 +1678,14 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 errdefer input.allocator.free(owned);
                 return AdaptiveGroupBy.create(
                     input.allocator,
-                    try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+                    try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
                     up,
                     owned,
                     g.group_cols,
                     aggs,
                     g.top_k,
                     g.emit_limit,
-                    input.db.config.query_memory_budget,
+                    input.catalog.config.query_memory_budget,
                     input.effectiveDop(),
                 );
             }
@@ -1696,13 +1696,13 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             }
             return group_route.routeGroupByDop(
                 input.allocator,
-                try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+                try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
                 &up,
                 g.group_cols,
                 aggs,
                 g.top_k,
                 g.emit_limit,
-                input.db.config.query_memory_budget,
+                input.catalog.config.query_memory_budget,
                 input.effectiveDop(),
             );
         },
@@ -1943,13 +1943,13 @@ fn distinctRows(input: engine_v2.CompileInput, unioned: exec.Query) !exec.Query 
         const aggs = try input.node_arena.dupe(ir.AggSpec, &.{.{ .func = .count, .col = null, .as = "__union_distinct_count" }});
         const q = try group_route.routeGroupByDop(
             input.allocator,
-            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+            try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
             &up,
             names,
             aggs,
             null,
             null,
-            input.db.config.query_memory_budget,
+            input.catalog.config.query_memory_budget,
             input.effectiveDop(),
         );
         break :blk .{ q, names };
@@ -1989,13 +1989,13 @@ fn setOpRows(input: engine_v2.CompileInput, unioned: exec.Query, keep: exec.Pred
         });
         const q = try group_route.routeGroupByDop(
             input.allocator,
-            try exec.memory.trackedBackend(input.db.allocator, input.accountant),
+            try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
             &up,
             names,
             aggs,
             null,
             null,
-            input.db.config.query_memory_budget,
+            input.catalog.config.query_memory_budget,
             input.effectiveDop(),
         );
         break :blk .{ q, names };

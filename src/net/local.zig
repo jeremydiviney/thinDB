@@ -77,6 +77,8 @@ pub const Error = error{
     UnsupportedOp,
     DatabaseNotFound,
     DatabaseAlreadyExists,
+    InvalidDatabaseName,
+    NoDatabaseSelected,
     SchemaNotFound,
     SchemaAlreadyExists,
     FunctionAlreadyExists,
@@ -978,7 +980,7 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
             if (ns.findTable(ref.name)) |t| return t;
         }
     }
-    const ns = tableNamespace(session, ref);
+    const ns = try tableNamespace(session, ref);
     const db = catalog.database(ns.db) orelse return Error.DatabaseNotFound;
     const sc = db.schema(ns.schema) orelse return Error.SchemaNotFound;
     {
@@ -990,12 +992,22 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
 }
 
 /// The (database, schema) a persistent table reference names.
-fn tableNamespace(session: Session, ref: ir.TableRef) NameParts {
+fn tableNamespace(session: Session, ref: ir.TableRef) Error!NameParts {
     // MySQL-style `db__schema.table` arrives here as ref.schema = "db__schema",
     // ref.database = null. Flatten it back to (db, schema) so the resolver
     // doesn't go hunting for a literal schema named "db__schema".
     if (ref.database == null) if (ref.schema) |s| if (splitDoubleUnderscore(s)) |parts| return parts;
-    return .{ .db = ref.database orelse session.current_db, .schema = ref.schema orelse session.current_schema };
+    return .{ .db = ref.database orelse try currentDbName(session), .schema = ref.schema orelse session.current_schema };
+}
+
+/// The session's current database name; `NoDatabaseSelected` when it has none.
+pub fn currentDbName(session: Session) Error![]const u8 {
+    return session.current_db orelse Error.NoDatabaseSelected;
+}
+
+/// The session's current database. Caller holds a statement lease.
+pub fn currentDatabase(catalog: *Catalog, session: Session) Error!*Database {
+    return catalog.database(try currentDbName(session)) orelse Error.NoDatabaseSelected;
 }
 
 const PersistentTableTarget = struct {
@@ -1006,19 +1018,12 @@ const PersistentTableTarget = struct {
 };
 
 pub fn resolvePersistentTableTarget(catalog: *Catalog, session: Session, ref: ir.TableRef) !PersistentTableTarget {
-    var db_name: []const u8 = ref.database orelse session.current_db;
-    var schema_name: []const u8 = ref.schema orelse session.current_schema;
-    if (ref.database == null and ref.schema != null) {
-        if (splitDoubleUnderscore(ref.schema.?)) |parts| {
-            db_name = parts.db;
-            schema_name = parts.schema;
-        }
-    }
-    const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
-    const sc = db.schema(schema_name) orelse return Error.SchemaNotFound;
+    const ns = try tableNamespace(session, ref);
+    const db = catalog.database(ns.db) orelse return Error.DatabaseNotFound;
+    const sc = db.schema(ns.schema) orelse return Error.SchemaNotFound;
     return .{
-        .db_name = db_name,
-        .schema_name = schema_name,
+        .db_name = ns.db,
+        .schema_name = ns.schema,
         .schema = sc,
         .table_name = ref.name,
     };
@@ -1041,15 +1046,17 @@ fn splitDoubleUnderscore(name: []const u8) ?NameParts {
 /// `db__schema` names both parts. A bare name is a schema of the current
 /// database, else a database's default schema: clients run
 /// `CREATE DATABASE x; USE x` and expect to be in `x`.
-pub fn resolveUseTarget(catalog: *Catalog, current_db: []const u8, name: []const u8) Error!NameParts {
+pub fn resolveUseTarget(catalog: *Catalog, current_db: ?[]const u8, name: []const u8) Error!NameParts {
     if (splitDoubleUnderscore(name)) |parts| {
+        try Catalog.validateDatabaseName(parts.db);
         const db = catalog.database(parts.db) orelse return Error.DatabaseNotFound;
         _ = db.schema(parts.schema) orelse return Error.SchemaNotFound;
         return parts;
     }
-    if (catalog.database(current_db)) |db| {
-        if (db.schema(name) != null) return .{ .db = current_db, .schema = name };
-    }
+    if (current_db) |cur| if (catalog.database(cur)) |db| {
+        if (db.schema(name) != null) return .{ .db = cur, .schema = name };
+    };
+    try Catalog.validateDatabaseName(name);
     const db = catalog.database(name) orelse return Error.DatabaseNotFound;
     _ = db.schema(thindb_api.default_schema_name) orelse return Error.SchemaNotFound;
     return .{ .db = name, .schema = thindb_api.default_schema_name };
@@ -1067,7 +1074,7 @@ pub fn resolveUseTarget(catalog: *Catalog, current_db: []const u8, name: []const
 
 pub const CompileCtx = struct {
     allocator: Allocator,
-    db: *Database,
+    catalog: *Catalog,
     udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
     /// Mutable so DDL `USE` statements can update `current_db` /
     /// `current_schema` for subsequent statements that share the
@@ -1185,17 +1192,17 @@ pub const CompileCtx = struct {
     /// (budget 0, no pool).
     pub fn queryAccountant(self: *CompileCtx) !?*exec.memory.MemoryAccountant {
         if (self.accountant) |a| return a;
-        const budget = thindb_api.autoQueryBudgetBytes(self.db.config.query_memory_budget);
-        const pool = self.db.config.memory_pool;
+        const budget = thindb_api.autoQueryBudgetBytes(self.catalog.config.query_memory_budget);
+        const pool = self.catalog.config.memory_pool;
         if (budget == 0 and pool == null and self.cancel_flag == null) return null;
-        const acc = try self.db.allocator.create(exec.memory.MemoryAccountant);
-        errdefer self.db.allocator.destroy(acc);
+        const acc = try self.catalog.allocator.create(exec.memory.MemoryAccountant);
+        errdefer self.catalog.allocator.destroy(acc);
         acc.* = exec.memory.MemoryAccountant.initWithPool(budget, pool);
         acc.cancel_flag = self.cancel_flag;
         acc.connection_id = self.connection_id;
-        acc.trackAllocations(self.db.allocator);
-        try acc.retainGate(self.db.config.statement_gate);
-        self.accountant_allocator = self.db.allocator;
+        acc.trackAllocations(self.catalog.allocator);
+        try acc.retainGate(self.catalog.config.statement_gate);
+        self.accountant_allocator = self.catalog.allocator;
         self.accountant = acc;
         return acc;
     }
@@ -1393,14 +1400,21 @@ pub const CompileOptions = struct {
 };
 
 pub fn compileWithOptions(allocator: Allocator, db: *Database, session: Session, root: *const ir.Op, options: CompileOptions) !CompiledQuery {
-    var lease: ?Catalog.StatementLease = null;
-    if (catalogFor(db)) |catalog| lease = try catalog.acquireStatement(changesCatalog(root));
-    errdefer if (lease) |l| l.release();
-    var compiled = try compileInStatementWithOptions(allocator, db, session, root, options);
+    const catalog = catalogFor(db) orelse return Error.DatabaseNotFound;
+    return compileCatalogWithOptions(allocator, catalog, session, root, options);
+}
+
+/// Compile against the catalog alone, taking the statement lease. The
+/// session names the current database, if any; the database-taking entry
+/// points above only find the catalog through theirs.
+pub fn compileCatalogWithOptions(allocator: Allocator, catalog: *Catalog, session: Session, root: *const ir.Op, options: CompileOptions) !CompiledQuery {
+    const lease = try catalog.acquireStatement(changesCatalog(root));
+    errdefer lease.release();
+    var compiled = try compileInStatementWithOptions(allocator, catalog, session, root, options);
     // Statement handlers finish eagerly and return owned metadata or an empty
     // result. Keeping those results alive must not block later DDL.
     if (!engine_v2.isSelectQuery(root)) {
-        if (lease) |l| l.release();
+        lease.release();
     } else {
         compiled.statement_lease = lease;
     }
@@ -1408,22 +1422,27 @@ pub fn compileWithOptions(allocator: Allocator, db: *Database, session: Session,
 }
 
 /// Caller owns the catalog statement lease, including through query teardown.
-pub fn compileInStatement(allocator: Allocator, db: *Database, session: Session, root: *const ir.Op) !CompiledQuery {
-    return compileInStatementWithOptions(allocator, db, session, root, .{});
+pub fn compileInStatement(allocator: Allocator, catalog: *Catalog, session: Session, root: *const ir.Op) !CompiledQuery {
+    return compileInStatementWithOptions(allocator, catalog, session, root, .{});
 }
 
-pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, session: Session, root: *const ir.Op, options: CompileOptions) !CompiledQuery {
+pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, session: Session, root: *const ir.Op, options: CompileOptions) !CompiledQuery {
     if (options.cancel_flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     const session_cell = try allocator.create(Session);
     session_cell.* = session;
     errdefer allocator.destroy(session_cell);
+    // A current database another session dropped leaves this one with none,
+    // exactly as dropping it itself would. The lease keeps the answer stable.
+    if (session.current_db) |name| if (catalog.database(name) == null) {
+        session_cell.current_db = null;
+    };
 
     var ctx = CompileCtx{
         .allocator = allocator,
-        .db = db,
-        .udf_registry = if (catalogFor(db)) |catalog| &catalog.udfs else null,
+        .catalog = catalog,
+        .udf_registry = &catalog.udfs,
         .session = session_cell,
-        .now_micros = std.Io.Timestamp.now(db.io, .real).toMicroseconds(),
+        .now_micros = std.Io.Timestamp.now(catalog.io, .real).toMicroseconds(),
         .cancel_flag = options.cancel_flag,
         .connection_id = options.connection_id,
     };
@@ -1440,19 +1459,19 @@ pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, sessio
     // by every handler. Runs on resolved predicates (concrete leaves).
     if (ctx.cancel_flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     const t_push_join_filters = exec.prof.nowTicks();
-    try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
+    try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_join_filters", @intCast(exec.prof.nowTicks() - t_push_join_filters));
     // Compute-through-union: split a Compute over UNION ALL into per-arm
     // computes so stage-backed arms parallelise the evaluation (terminal
     // compute push); the union'd operator itself has nothing to fuse into.
     const t_push_compute_unions = exec.prof.nowTicks();
-    try predicate_pushdown.pushComputeThroughUnions(ctx.nodeArena(), catalogFor(db), session_cell.*, @constCast(root));
+    try predicate_pushdown.pushComputeThroughUnions(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_compute_unions", @intCast(exec.prof.nowTicks() - t_push_compute_unions));
     // The two removal rewrites below delete SQL before any operator binds it,
     // so a reference that can never resolve would vanish with its unused item
     // and the statement would run. Keep the tree whole then: the binder
     // rejects it exactly as it rejects the same reference in a used item.
-    const unbound = try unbound_refs.find(ctx.nodeArena(), catalogFor(db), session_cell.*, ctx.udf_registry, root);
+    const unbound = try unbound_refs.find(ctx.nodeArena(), catalog, session_cell.*, ctx.udf_registry, root);
     if (unbound) |u| if (options.unbound) |out| {
         out.* = try u.dupe(allocator);
     };
@@ -1478,7 +1497,7 @@ pub fn compileInStatementWithOptions(allocator: Allocator, db: *Database, sessio
     ctx.prune_names = analyzeProjection(allocator, root);
     const v2_input = engine_v2.CompileInput{
         .allocator = try ctx.executionAllocator(),
-        .db = db,
+        .catalog = catalog,
         .session = session_cell.*,
         .prune_names = ctx.prune_names,
         .udf_registry = ctx.udf_registry,
@@ -1513,7 +1532,7 @@ pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
     if (engine_v2.isSelectQuery(op)) {
         const v2_input = engine_v2.CompileInput{
             .allocator = try ctx.executionAllocator(),
-            .db = ctx.db,
+            .catalog = ctx.catalog,
             .session = ctx.session.*,
             .prune_names = ctx.prune_names,
             .udf_registry = ctx.udf_registry,
@@ -2296,7 +2315,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
 /// `Table.deleteByExpr` (which streams per segment), and report
 /// the affected row count back through CompileCtx.
 fn compileDelete(ctx: *CompileCtx, d: ir.DeleteOp) !Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     const t = try resolveTable(catalog, ctx.session.*, d.table);
     const deleted = try t.deleteByExpr(d.predicate, d.derived);
     ctx.affected_rows = @intCast(deleted);
@@ -2312,7 +2331,7 @@ fn compileDelete(ctx: *CompileCtx, d: ir.DeleteOp) !Query {
 /// Subqueries / @var refs in the predicate and assignment exprs are
 /// already resolved by the pre-compile pass before this runs.
 fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     const t = try resolveTable(catalog, ctx.session.*, u.table);
 
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -2369,14 +2388,14 @@ fn compileAdmin(ctx: *CompileCtx, a: ir.AdminOp) !Query {
 /// A table is labelled `db__schema.table`, the database name the MySQL wire
 /// lists it under.
 fn compileTableMaintenance(ctx: *CompileCtx, m: ir.TableMaintenance) !Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
     const op_name = @tagName(m.kind);
     var cells: std.ArrayList([]const u8) = .empty;
     for (m.tables) |ref| {
-        const ns = tableNamespace(ctx.session.*, ref);
+        const ns = try tableNamespace(ctx.session.*, ref);
         const label = try std.fmt.allocPrint(aa, "{s}__{s}.{s}", .{ ns.db, ns.schema, ref.name });
         const exists = if (resolveTable(catalog, ctx.session.*, ref)) |_| true else |err| switch (err) {
             error.TableNotFound, error.SchemaNotFound, error.DatabaseNotFound => false,
@@ -2395,7 +2414,7 @@ fn compileTableMaintenance(ctx: *CompileCtx, m: ir.TableMaintenance) !Query {
 }
 
 fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     switch (d) {
         .create_database => |ns| {
             if (catalog.createDatabase(ns.name)) |_| {} else |e| switch (e) {
@@ -2403,9 +2422,16 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                 else => return thindb_api.remapError(Error, e),
             }
         },
-        .drop_database => |ns| catalog.dropDatabase(ns.name) catch |e| switch (e) {
-            error.DatabaseNotFound => if (!ns.if_exists) return Error.DatabaseNotFound,
-            else => return thindb_api.remapError(Error, e),
+        .drop_database => |ns| {
+            if (catalog.dropDatabase(ns.name)) |_| {
+                // MySQL leaves a session that drops its current database with none.
+                if (ctx.session.current_db) |cur| if (std.mem.eql(u8, cur, ns.name)) {
+                    ctx.session.current_db = null;
+                };
+            } else |e| switch (e) {
+                error.DatabaseNotFound => if (!ns.if_exists) return Error.DatabaseNotFound,
+                else => return thindb_api.remapError(Error, e),
+            }
         },
         .create_sql_function => |cf| {
             // Trial-parse the body (every parameter bound to NULL) so
@@ -2424,10 +2450,10 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     return Error.FunctionInvalidDefinition;
                 };
             }
-            catalog.registerSqlFunction(ctx.session.current_db, cf, false) catch |e| return thindb_api.remapError(Error, e);
+            catalog.registerSqlFunction(try currentDbName(ctx.session.*), cf, false) catch |e| return thindb_api.remapError(Error, e);
         },
         .create_zig_function => |zf| {
-            catalog.createZigFunction(ctx.session.current_db, zf.name, zf.source, zf.or_replace, zf.using_path) catch |err| return switch (err) {
+            catalog.createZigFunction(try currentDbName(ctx.session.*), zf.name, zf.source, zf.or_replace, zf.using_path) catch |err| return switch (err) {
                 error.FunctionAlreadyExists => Error.FunctionAlreadyExists,
                 error.FunctionInvalidDefinition => Error.FunctionInvalidDefinition,
                 error.DatabaseNotFound => Error.DatabaseNotFound,
@@ -2435,21 +2461,22 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             };
         },
         .drop_sql_function => |df| {
-            var existed = catalog.dropSqlFunction(ctx.session.current_db, df.name) catch |e| return thindb_api.remapError(Error, e);
+            const db_name = try currentDbName(ctx.session.*);
+            var existed = catalog.dropSqlFunction(db_name, df.name) catch |e| return thindb_api.remapError(Error, e);
             if (!existed) {
-                existed = catalog.dropZigFunction(ctx.session.current_db, df.name) catch false;
+                existed = catalog.dropZigFunction(db_name, df.name) catch false;
             }
             if (!existed and !df.if_exists) return Error.FunctionNotFound;
         },
         .create_schema => |ns| {
-            const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+            const db = try currentDatabase(catalog, ctx.session.*);
             if (db.createSchema(ns.name)) |_| {} else |e| switch (e) {
                 error.SchemaAlreadyExists => if (!ns.if_not_exists) return Error.SchemaAlreadyExists,
                 else => return thindb_api.remapError(Error, e),
             }
         },
         .drop_schema => |ns| {
-            const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+            const db = try currentDatabase(catalog, ctx.session.*);
             db.dropSchema(ns.name) catch |e| switch (e) {
                 error.SchemaNotFound => if (!ns.if_exists) return Error.SchemaNotFound,
                 else => return thindb_api.remapError(Error, e),
@@ -2465,6 +2492,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             ctx.session.current_schema = sc_owned;
         },
         .use_database_schema => |p| {
+            try Catalog.validateDatabaseName(p.database);
             const db = catalog.database(p.database) orelse return Error.DatabaseNotFound;
             _ = db.schema(p.schema) orelse return Error.SchemaNotFound;
             const db_owned = try ctx.allocator.dupe(u8, p.database);
@@ -2613,7 +2641,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             ctx.affected_rows = 0;
         },
         .create_view => |cv| {
-            const db_name = ctx.session.current_db;
+            const db_name = try currentDbName(ctx.session.*);
             if (!cv.or_replace and catalog.views.contains(db_name, cv.name)) return Error.TableAlreadyExists;
             // Validate the defining query parses now, not at first use.
             {
@@ -2635,9 +2663,10 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             catalog.registerView(db_name, cv, false) catch |e| return thindb_api.remapError(Error, e);
         },
         .drop_view => |dv| {
-            const existed = catalog.dropView(ctx.session.current_db, dv.name) catch |e| return thindb_api.remapError(Error, e);
+            const db_name = try currentDbName(ctx.session.*);
+            const existed = catalog.dropView(db_name, dv.name) catch |e| return thindb_api.remapError(Error, e);
             if (existed and dv.materialized) {
-                if (catalog.database(ctx.session.current_db)) |db| {
+                if (catalog.database(db_name)) |db| {
                     if (db.schema(ctx.session.current_schema)) |sc| {
                         sc.dropTable(dv.name) catch {};
                     }
@@ -2646,7 +2675,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             if (!existed and !dv.if_exists) return Error.TableNotFound;
         },
         .refresh_view => |name| {
-            const def = (try catalog.views.get(ctx.allocator, ctx.session.current_db, name)) orelse return Error.TableNotFound;
+            const def = (try catalog.views.get(ctx.allocator, try currentDbName(ctx.session.*), name)) orelse return Error.TableNotFound;
             defer def.deinit(ctx.allocator);
             if (!def.materialized) return Error.UnsupportedOp;
             const n = try buildMaterializedView(ctx, catalog, name, def.body, true, false);
@@ -2685,7 +2714,7 @@ fn buildMaterializedView(
     const src_schema = source.outputSchema();
     if (src_schema.len == 0) return Error.BadRequest;
 
-    const db = catalog.database(ctx.session.current_db) orelse return Error.DatabaseNotFound;
+    const db = try currentDatabase(catalog, ctx.session.*);
     const sc = db.schema(ctx.session.current_schema) orelse return Error.SchemaNotFound;
 
     const cols = try ctx.allocator.alloc(types.Column, src_schema.len);
@@ -2725,7 +2754,7 @@ fn buildMaterializedView(
 /// source query's output schema, create the table, then drain the
 /// source and bulk-insert.
 fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
 
     var source = try compileSubplan(ctx, op.source);
     defer source.deinit();
@@ -2801,7 +2830,7 @@ fn compileCreateTableAs(ctx: *CompileCtx, op: ir.CreateTableAs) anyerror!Query {
 /// narrowed to it when every value fits or, when the column list omits
 /// it, the fill INSERT ... VALUES uses.
 fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     const t = try resolveTable(catalog, ctx.session.*, op.table);
     const tbl_columns = t.schema.columns;
 
@@ -3065,7 +3094,7 @@ fn assignmentTarget(targets: []const ir.DmlTarget, tables: []const *ApiTable, a:
 /// then one column per assignment value; each table an assignment writes
 /// takes its rows, with the assigned columns replaced, back over their keys.
 fn compileUpdateFromSource(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -3233,7 +3262,7 @@ fn rowsNamingTarget(
 /// alias, a join, several targets). The SELECT yields every target's
 /// columns; each target then deletes the keys of its rows.
 fn compileDeleteFromSource(ctx: *CompileCtx, d: ir.DeleteOp) anyerror!Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -3411,7 +3440,7 @@ fn onUpdateStamps(ctx: *CompileCtx, aa: Allocator, schema: TableSchema, assigned
 }
 
 fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     const t = try resolveTable(catalog, ctx.session.*, op.table);
     const tbl_schema = t.schema;
 
@@ -4225,7 +4254,7 @@ pub fn parseUuidLiteral(s: []const u8) !u128 {
 }
 
 fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
-    const catalog = catalogFor(ctx.db) orelse return Error.DatabaseNotFound;
+    const catalog = ctx.catalog;
     return switch (s) {
         .databases => blk: {
             const names = try catalog.listDatabases(ctx.allocator);
@@ -4233,14 +4262,14 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
             break :blk try TextRowsOp.create(ctx.allocator, "name", names);
         },
         .schemas => |db_arg| blk: {
-            const db_name = db_arg orelse ctx.session.current_db;
+            const db_name = db_arg orelse try currentDbName(ctx.session.*);
             const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
             const names = try db.listSchemas(ctx.allocator);
             defer freeOwnedNames(ctx.allocator, names);
             break :blk try TextRowsOp.create(ctx.allocator, "name", names);
         },
         .tables => |ref| blk: {
-            const db_name = ref.database orelse ctx.session.current_db;
+            const db_name = ref.database orelse try currentDbName(ctx.session.*);
             const db = catalog.database(db_name) orelse return Error.DatabaseNotFound;
             const sc_name = ref.schema orelse ctx.session.current_schema;
             const sc = db.schema(sc_name) orelse return Error.SchemaNotFound;
@@ -4254,7 +4283,10 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
                 for (names.items) |n| ctx.allocator.free(n);
                 names.deinit(ctx.allocator);
             }
-            const sql_names = try catalog.sql_fns.listNames(ctx.allocator, ctx.session.current_db);
+            const sql_names = if (ctx.session.current_db) |db_name|
+                try catalog.sql_fns.listNames(ctx.allocator, db_name)
+            else
+                try ctx.allocator.alloc([]u8, 0);
             defer ctx.allocator.free(sql_names);
             for (sql_names) |n| try names.append(ctx.allocator, n);
             for (catalog.udfs.tables.items) |t| {
@@ -4269,11 +4301,11 @@ fn compileShow(ctx: *CompileCtx, s: ir.ShowOp) !Query {
         },
         .create_function => |fname| blk: {
             // SQL inline function: the canonical persisted CREATE text.
-            if (try catalog.sql_fns.get(ctx.allocator, ctx.session.current_db, fname)) |def| {
+            if (ctx.session.current_db) |db_name| if (try catalog.sql_fns.get(ctx.allocator, db_name, fname)) |def| {
                 defer def.deinit(ctx.allocator);
                 const one = [_][]const u8{def.create_text};
                 break :blk try TextRowsOp.create(ctx.allocator, "Create Function", &one);
-            }
+            };
             // LANGUAGE zig function: reconstruct the CREATE around the
             // persisted source; embedded registrations have no source.
             if (catalog.udfs.tableByName(fname)) |entry| {
