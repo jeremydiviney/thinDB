@@ -247,18 +247,97 @@ fn chooseShape(spec: SimplePipelineSpec) Shape {
     return .stream_scan;
 }
 
+/// One step of the chain an aggregate's grouped output runs through before
+/// the SELECT list's decorators: a Compute (a select expression over
+/// aggregates, a collapsed key, a HAVING operand) or a HAVING Filter.
+const PostAggStep = union(enum) {
+    compute: []const ir.Derived,
+    filter: exec.PredicateExpr,
+};
+
+/// The HAVING Filters and Computes between an aggregate and the decorators
+/// above it, in whatever order the parser and the predicate pushdown (which
+/// sinks a conjunct below a Compute it doesn't read) left them. The Filters
+/// below every Compute read only keys and aggregates: they are `having`,
+/// which an aggregate core may evaluate in pass. `steps` is the rest, in
+/// the order it runs over the grouped output.
+const PostAggChain = struct {
+    group_by: ir.Op.GroupBy,
+    having: ?exec.PredicateExpr,
+    steps: []const PostAggStep,
+};
+
+fn peelPostAggChain(arena: std.mem.Allocator, top: *const ir.Op) !?PostAggChain {
+    var ops: std.ArrayListUnmanaged(*const ir.Op) = .empty;
+    var op = top;
+    while (true) {
+        switch (op.*) {
+            .filter => |f| {
+                try ops.append(arena, op);
+                op = f.upstream;
+            },
+            .compute => |c| {
+                try ops.append(arena, op);
+                op = c.upstream;
+            },
+            else => break,
+        }
+    }
+    if (op.* != .group_by) return null;
+
+    var core = ops.items.len;
+    while (core > 0 and ops.items[core - 1].* == .filter) core -= 1;
+    const having_ops = ops.items[core..];
+    const having: ?exec.PredicateExpr = switch (having_ops.len) {
+        0 => null,
+        1 => having_ops[0].filter.predicate,
+        else => blk: {
+            const kids = try arena.alloc(exec.PredicateExpr, having_ops.len);
+            for (having_ops, kids) |h, *k| k.* = h.filter.predicate;
+            break :blk .{ .@"and" = kids };
+        },
+    };
+    const steps = try arena.alloc(PostAggStep, core);
+    for (steps, 0..) |*s, i| {
+        s.* = switch (ops.items[core - 1 - i].*) {
+            .filter => |f| .{ .filter = f.predicate },
+            .compute => |c| .{ .compute = c.derived },
+            else => unreachable,
+        };
+    }
+    return .{ .group_by = op.group_by, .having = having, .steps = steps };
+}
+
+fn postStepsFilter(steps: []const PostAggStep) bool {
+    for (steps) |s| if (s == .filter) return true;
+    return false;
+}
+
+fn postStepsDefine(steps: []const PostAggStep, name: []const u8) bool {
+    for (steps) |s| switch (s) {
+        .compute => |derived| if (nameInDerivedList(derived, name)) return true,
+        .filter => {},
+    };
+    return false;
+}
+
+// Updates `q` in place, so the caller's errdefer always holds the whole tree.
+fn applyPostAggSteps(q: *exec.Query, steps: []const PostAggStep, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !void {
+    for (steps) |s| q.* = switch (s) {
+        .compute => |derived| try q.computeWithRegistry(derived, udf_registry),
+        .filter => |pred| try q.filter(pred),
+    };
+}
+
 const GroupTopNPlan = struct {
     scan: ir.Op.Scan,
     where_filter: ?ir.Op.Filter,
-    having_filter: ?ir.Op.Filter,
+    having: ?exec.PredicateExpr,
     group_by: ir.Op.GroupBy,
     order_by: ?ir.Op.OrderBy,
     limit: ?ir.Op.Limit,
     derived: []const ir.Derived = &.{},
-    // Post-aggregate derived columns: collapsed group keys (a function of a
-    // surviving plain-column key, e.g. `ClientIP - 1`) recomputed once per
-    // output group above the aggregate. Empty for plain shapes.
-    post_agg_derived: []const ir.Derived = &.{},
+    post_steps: []const PostAggStep = &.{},
     // Final output column order (SELECT list) when a reordering Project sits
     // above the post-aggregate Compute. Null when the group output order is the
     // final order.
@@ -269,7 +348,7 @@ const GroupTopNPlan = struct {
     output_names: ?[]const ?[]const u8 = null,
 };
 
-fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
+fn matchGroupTopN(arena: std.mem.Allocator, root: *const ir.Op) !?GroupTopNPlan {
     var op = root;
     // The reordering Project, LIMIT, and ORDER BY decorators can nest in either
     // order above the aggregate. A renamed or computed output column forces a
@@ -298,31 +377,19 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
             else => break,
         }
     }
-    var having_filter: ?ir.Op.Filter = null;
-    if (op.* == .filter) {
-        having_filter = op.filter;
-        op = op.filter.upstream;
-    }
-    // A post-aggregate Compute (collapsed group keys recomputed above the
-    // aggregate) sits directly on the GroupBy, below HAVING/ORDER BY. Peel it;
-    // the handler recomputes those columns over the grouped output.
-    var post_agg_derived: []const ir.Derived = &.{};
-    if (op.* == .compute) {
-        post_agg_derived = op.compute.derived;
-        op = op.compute.upstream;
-    }
-    if (op.* != .group_by) return null;
-    const group_by = op.group_by;
+    const chain = (try peelPostAggChain(arena, op)) orelse return null;
+    const group_by = chain.group_by;
     if (group_by.group_cols.len == 0) return null;
     // The top Project's column order is the final output order. With a
-    // post-aggregate Compute it genuinely reorders (group output is
-    // [keys, aggs]; SELECT interleaves the derived columns), so capture the
-    // order instead of demanding a pass-through. Only a plain column-name
-    // reorder is handled (no nested output expressions at this level).
+    // post-aggregate Compute (the chain's steps always start with one) it
+    // genuinely reorders (group output is [keys, aggs]; SELECT interleaves
+    // the derived columns), so capture the order instead of demanding a
+    // pass-through. Only a plain column-name reorder is handled (no nested
+    // output expressions at this level).
     var output_columns: ?[]const []const u8 = null;
     var output_names: ?[]const ?[]const u8 = null;
     if (top_project) |p| {
-        if (post_agg_derived.len != 0) {
+        if (chain.steps.len != 0) {
             // The post-agg Compute genuinely reorders [keys, aggs]; trust the
             // SELECT order. A per-column rename (`URL AS Dst`) rides along.
             output_columns = p.columns;
@@ -378,12 +445,12 @@ fn matchGroupTopN(root: *const ir.Op) ?GroupTopNPlan {
     return .{
         .scan = source.scan,
         .where_filter = where_filter,
-        .having_filter = having_filter,
+        .having = chain.having,
         .group_by = group_by,
         .order_by = order_by,
         .limit = limit,
         .derived = derived,
-        .post_agg_derived = post_agg_derived,
+        .post_steps = chain.steps,
         .output_columns = output_columns,
         .output_names = output_names,
     };
@@ -526,20 +593,36 @@ fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan)
 
     try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
     q = try q.udfGroupBy(plan.group_by.group_cols, try mysqlAggInputs(input, &q, plan.group_by.aggs), registry);
-    // HAVING runs as a generic filter over the (small) grouped output.
-    if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    try finishOperatorGroupBy(input, &q, plan);
+    return q;
+}
+
+// The operator builders' tail over the grouped output: HAVING, the
+// post-aggregate chain, ORDER BY / LIMIT, then the SELECT order. The chain
+// runs before ORDER BY / LIMIT when they must see it (a chain Filter decides
+// which groups LIMIT counts; ORDER BY may rank a column the chain computes),
+// and after them otherwise, over only the groups LIMIT keeps.
+fn finishOperatorGroupBy(input: CompileInput, q: *exec.Query, plan: GroupTopNPlan) !void {
+    if (plan.having) |h| q.* = try q.filter(h);
+    const chain_first = postStepsFilter(plan.post_steps) or orderReadsPostSteps(plan);
+    if (chain_first) try applyPostAggSteps(q, plan.post_steps, input.udf_registry);
     if (plan.order_by) |o| {
         if (plan.limit) |l| {
-            q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));
+            q.* = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));
         } else {
-            q = try q.orderBy(o.specs);
+            q.* = try q.orderBy(o.specs);
         }
     } else if (plan.limit) |l| {
-        q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+        q.* = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
     }
-    if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
-    q = try applyOutputProjection(allocator, q, plan.output_columns, plan.output_names);
-    return q;
+    if (!chain_first) try applyPostAggSteps(q, plan.post_steps, input.udf_registry);
+    q.* = try applyOutputProjection(input.allocator, q.*, plan.output_columns, plan.output_names);
+}
+
+fn orderReadsPostSteps(plan: GroupTopNPlan) bool {
+    const o = plan.order_by orelse return false;
+    for (o.specs) |s| if (postStepsDefine(plan.post_steps, s.col)) return true;
+    return false;
 }
 
 fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan) !exec.Query {
@@ -556,18 +639,7 @@ fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNP
 
     try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
     q = try q.groupBy(plan.group_by.group_cols, try mysqlAggInputs(input, &q, plan.group_by.aggs));
-    if (plan.having_filter) |f| q = try q.filter(f.predicate);
-    if (plan.order_by) |o| {
-        if (plan.limit) |l| {
-            q = try q.topN(o.specs, @intCast(l.n), @intCast(l.offset));
-        } else {
-            q = try q.orderBy(o.specs);
-        }
-    } else if (plan.limit) |l| {
-        q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
-    }
-    if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
-    q = try applyOutputProjection(allocator, q, plan.output_columns, plan.output_names);
+    try finishOperatorGroupBy(input, &q, plan);
     return q;
 }
 
@@ -575,12 +647,12 @@ fn collectProtectedAggNames(allocator: std.mem.Allocator, plan: GroupTopNPlan) !
     var set: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer set.deinit(allocator);
     if (plan.order_by) |o| for (o.specs) |s| try appendNameUnique(allocator, &set, s.col);
-    if (plan.having_filter) |f| try exec.predicate.collectColumnNames(allocator, &set, f.predicate);
+    if (plan.having) |h| try exec.predicate.collectColumnNames(allocator, &set, h);
     return set.toOwnedSlice(allocator);
 }
 
 fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
-    const plan = matchGroupTopN(root) orelse return null;
+    const plan = (try matchGroupTopN(input.node_arena, root)) orelse return null;
 
     const table = try resolveTable(input.db, input.session, plan.scan.table);
     // The silo may reconstruct selected keys from source-row locations.
@@ -598,7 +670,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // core's HAVING evaluator is numeric-only; this rewrite is what lets
     // `HAVING string_key = '...'` run at all — and it prunes rows earlier.
     var eff_where: ?exec.PredicateExpr = if (plan.where_filter) |f| f.predicate else null;
-    var eff_having: ?exec.PredicateExpr = if (plan.having_filter) |f| f.predicate else null;
+    var eff_having: ?exec.PredicateExpr = plan.having;
     if (eff_having) |h| {
         const split = try pushKeyOnlyHavingIntoWhere(input, table, plan.group_by.group_cols, h, eff_where);
         eff_where = split.where;
@@ -653,6 +725,9 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
             }
         }
     }
+    // A Filter in the post-aggregate chain decides which groups ORDER BY and
+    // LIMIT see, so the core emits every group and they wait for the chain.
+    if (postStepsFilter(plan.post_steps) and (order_specs.len > 0 or plan.limit != null)) post_sort = true;
 
     // Algebraic reduction for the grouped core, same as the global path:
     // collapse affine aggregates (SUM/MIN/MAX of a·col+b) onto a shared base set,
@@ -699,26 +774,37 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     };
 
     // Provably-low-cardinality group keys take the direct (scatter-free)
-    // private-table handler; everything else runs the silo grid.
-    const built_q = (try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, request)) orelse
-        (try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request));
-    if (built_q) |silo_q| {
-        var q = silo_q;
-        // Post-aggregate enrich: the grouped pipeline emits [keys, aggs] in
-        // count-/order-ranked order. The affine late-materialization (reduced
-        // aggregates) and the collapsed-key recompute are independent Computes
-        // over that small output; then reorder to the SELECT list. ORDER BY/LIMIT
-        // already ran inside the pipeline on the grouped columns — except in the
-        // string-key-order case, which sorts the grouped output here.
+    // private-table handler; everything else runs the silo grid. The direct
+    // handler has no HAVING evaluator: it emits a HAVING query's groups
+    // unfiltered and unranked, and the HAVING, ORDER BY and LIMIT run over its
+    // (small) output below.
+    var lowcard_request = request;
+    if (eff_having != null) {
+        lowcard_request.having_filter = null;
+        lowcard_request.order_specs = &.{};
+        lowcard_request.limit = 0;
+        lowcard_request.offset = 0;
+    }
+    var having_outside = false;
+    var built_q = try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, lowcard_request);
+    if (built_q != null) {
+        having_outside = eff_having != null;
+    } else {
+        built_q = try v2_pipeline.tryBuildGroupTopN(input.allocator, table, request);
+    }
+    if (built_q) |core_q| {
+        // The core emits [keys, aggs], ranked and limited in pass unless the
+        // ranking waits for the post-aggregate chain. The affine
+        // late-materialization and the chain run over that small output, then
+        // the ranking that waited (ORDER BY may name a column they produce),
+        // then the SELECT order.
+        var q = core_q;
         errdefer q.deinit();
-        // The post-agg Computes (affine late-materialization, collapsed/derived
-        // keys) must run BEFORE the post-sort: ORDER BY may name a column they
-        // produce. For the string-group-key post-sort the key is already in the
-        // grouped output, so sorting after the Computes is equally correct.
+        if (having_outside) q = try q.filter(eff_having.?);
         if (affine_post.len > 0) q = try q.computeWithRegistry(affine_post, input.udf_registry);
-        if (plan.post_agg_derived.len > 0) q = try q.computeWithRegistry(plan.post_agg_derived, input.udf_registry);
-        if (post_sort) {
-            q = try q.orderBy(order_specs);
+        try applyPostAggSteps(&q, plan.post_steps, input.udf_registry);
+        if (post_sort or having_outside) {
+            if (order_specs.len > 0) q = try q.orderBy(order_specs);
             if (plan.limit) |l| q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
         }
         q = try applyOutputProjection(input.allocator, q, eff_out_cols, plan.output_names);
@@ -874,12 +960,12 @@ const getenv_c = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]cons
 const GlobalAggregatePlan = struct {
     scan: ir.Op.Scan,
     where_filter: ?ir.Op.Filter,
-    having_filter: ?ir.Op.Filter,
+    having: ?exec.PredicateExpr,
     group_by: ir.Op.GroupBy,
     derived: []const ir.Derived = &.{},
-    /// Post-aggregate scalar expressions over the aggregate outputs
-    /// (`SELECT SUM(a) / COUNT(*)` hoists to hidden aggs + this layer).
-    post_derived: []const ir.Derived = &.{},
+    /// The post-aggregate chain over the one aggregate row (`SELECT SUM(a) /
+    /// COUNT(*)` hoists to hidden aggs + a Compute step).
+    post_steps: []const PostAggStep = &.{},
     /// SELECT-list columns when a post layer exists (drops hidden
     /// `__agg_expr_*` outputs) or the list renames a column; null = emit
     /// the aggregate output as-is.
@@ -889,7 +975,7 @@ const GlobalAggregatePlan = struct {
     output_renames: ?[]const ?[]const u8 = null,
 };
 
-fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
+fn matchGlobalAggregate(arena: std.mem.Allocator, root: *const ir.Op) !?GlobalAggregatePlan {
     var op = root;
     var top_project: ?ir.Op.Project = null;
     if (op.* == .select) {
@@ -900,26 +986,13 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
     if (op.* == .limit) op = op.limit.upstream;
     if (op.* == .order_by) op = op.order_by.upstream;
 
-    // Post-aggregate Compute: scalar expressions over the aggregate outputs
-    // (hidden `__agg_expr_*` refs from `SELECT SUM(a) / COUNT(*)` shapes).
-    var post_derived: []const ir.Derived = &.{};
-    if (op.* == .compute) {
-        post_derived = op.compute.derived;
-        op = op.compute.upstream;
-    }
-
-    var having_filter: ?ir.Op.Filter = null;
-    if (op.* == .filter) {
-        having_filter = op.filter;
-        op = op.filter.upstream;
-    }
-    if (op.* != .group_by) return null;
-    const group_by = op.group_by;
+    const chain = (try peelPostAggChain(arena, op)) orelse return null;
+    const group_by = chain.group_by;
     if (group_by.group_cols.len != 0) return null;
     var output_names: ?[]const []const u8 = null;
     var output_renames: ?[]const ?[]const u8 = null;
     if (top_project) |p| {
-        if (post_derived.len == 0) {
+        if (chain.steps.len == 0) {
             if (!projectMatchesGroupOutput(p, group_by)) return null;
             if (p.outputs != null) {
                 output_names = p.columns;
@@ -936,13 +1009,7 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
                         break;
                     }
                 }
-                if (!found) for (post_derived) |d| {
-                    if (types.columnNameEql(d.name, c)) {
-                        found = true;
-                        break;
-                    }
-                };
-                if (!found) return null;
+                if (!found and !postStepsDefine(chain.steps, c)) return null;
             }
             output_names = p.columns;
             output_renames = p.outputs;
@@ -975,20 +1042,20 @@ fn matchGlobalAggregate(root: *const ir.Op) ?GlobalAggregatePlan {
     return .{
         .scan = source.scan,
         .where_filter = where_filter,
-        .having_filter = having_filter,
+        .having = chain.having,
         .group_by = group_by,
         .derived = derived,
-        .post_derived = post_derived,
+        .post_steps = chain.steps,
         .output_names = output_names,
         .output_renames = output_renames,
     };
 }
 
 fn buildGlobalAggregate(input: CompileInput, root: *const ir.Op) !?exec.Query {
-    const plan = matchGlobalAggregate(root) orelse return null;
+    const plan = (try matchGlobalAggregate(input.node_arena, root)) orelse return null;
     var base = (try buildGlobalAggregateBase(input, plan)) orelse return null;
     errdefer base.deinit();
-    if (plan.post_derived.len > 0) base = try base.computeWithRegistry(plan.post_derived, input.udf_registry);
+    try applyPostAggSteps(&base, plan.post_steps, input.udf_registry);
     return try applyOutputProjection(input.allocator, base, plan.output_names, plan.output_renames);
 }
 
@@ -1016,7 +1083,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
             .udf_registry = input.udf_registry,
             .aggs = plan.group_by.aggs,
             .where_filter = if (plan.where_filter) |f| f.predicate else null,
-            .having_filter = if (plan.having_filter) |f| f.predicate else null,
+            .having_filter = plan.having,
             .derived = plan.derived,
             .dop = input.effectiveDop(),
         })) |q| return q;
@@ -1028,7 +1095,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
     // SUM(ResolutionWidth+k) become SUM+COUNT + a post-agg Compute. Only when
     // there's no HAVING (it would bind to the original aliases the base set
     // replaces; global+HAVING is declined regardless).
-    if (plan.having_filter == null and plan.post_derived.len == 0) {
+    if (plan.having == null and plan.post_steps.len == 0) {
         if (try affine_agg.reduce(input.node_arena, table.schema.columns, &.{}, plan.group_by.aggs, plan.derived, &.{})) |red| {
             return try buildGlobalAggregateReduced(input, table, plan, red);
         }
@@ -1042,7 +1109,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
     // types, and for any stats-dependent spec an empty memtable and zero
     // tombstones) and returns null to fall through to the scan pipeline
     // whenever any fails.
-    if (plan.where_filter == null and plan.having_filter == null and plan.derived.len == 0 and plan.post_derived.len == 0) {
+    if (plan.where_filter == null and plan.having == null and plan.derived.len == 0 and plan.post_steps.len == 0) {
         if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs)) |q| return q;
     }
 
@@ -1057,7 +1124,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
         .udf_registry = input.udf_registry,
         .aggs = plan.group_by.aggs,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
-        .having_filter = if (plan.having_filter) |f| f.predicate else null,
+        .having_filter = plan.having,
         .derived = plan.derived,
         .dop = input.effectiveDop(),
     })) |q| return q;
@@ -1613,7 +1680,7 @@ fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: Gl
     } else {
         q = try q.aggregate(aggs);
     }
-    if (plan.having_filter) |f| q = try q.filter(f.predicate);
+    if (plan.having) |h| q = try q.filter(h);
     return q;
 }
 
