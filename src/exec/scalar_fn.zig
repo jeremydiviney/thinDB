@@ -1062,10 +1062,13 @@ pub fn integerArgFn(given: Type, target: Type) ?[]const u8 {
 
 /// Whether `name` reads an argument `convertedArgs` converts as CAST reads
 /// it, rather than as MySQL reads a function argument. StarRocks reads
-/// FROM_UNIXTIME's count so: `1.5` is 1 and `-0.5` is 0, truncated toward
-/// zero, where MySQL's reading rounds; and `'1.5'` or `1e20` is NULL.
+/// FROM_UNIXTIME's count so, and the count of YEARS_ADD and the rest of its
+/// family: `1.5` is 1 and `-0.5` is 0, truncated toward zero, where MySQL's
+/// reading rounds; and `'1.5'` or `1e20` is NULL.
 pub fn readsArgsAsCast(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "from_unixtime");
+    if (std.ascii.eqlIgnoreCase(name, "from_unixtime")) return true;
+    for (unit_add_sub_builtins) |f| if (std.ascii.eqlIgnoreCase(name, f.name)) return true;
+    return false;
 }
 
 /// Internal: text or JSON read as the number it starts with, where a
@@ -1629,7 +1632,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "interval", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = math.intervalKernel("bigint") },
     .{ .name = "interval", .arg_types = &.{.double}, .return_type = .bigint, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = math.intervalKernel("double") },
     .{ .name = "sleep", .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .volatility = .@"volatile", .kernel = math.sleepKernel },
-} ++ extractBuiltins();
+} ++ extractBuiltins() ++ unit_add_sub_builtins;
 
 /// `extract_<unit>` over text, a DATETIME or a DATE for each of MySQL's
 /// compound EXTRACT units, which the parser lowers EXTRACT(unit FROM x) to.
@@ -1655,6 +1658,25 @@ fn extractBuiltins() [3 * (std.meta.fields(time.ClockUnit).len + 1)]ScalarFn {
     return fns;
 }
 
+/// StarRocks' YEARS_ADD(dt, n) through MICROSECONDS_ADD(dt, n) and the _SUB
+/// of each, one pair per unit (`date.unitsAddKernel`). A DATE widens to a
+/// DATETIME, so every one returns a DATETIME, as in StarRocks.
+const unit_add_sub_builtins = unitAddSubBuiltins();
+
+fn unitAddSubBuiltins() [2 * std.meta.fields(date.DiffUnit).len]ScalarFn {
+    var fns: [2 * std.meta.fields(date.DiffUnit).len]ScalarFn = undefined;
+    for (std.enums.values(date.DiffUnit), 0..) |unit, u| {
+        for ([_]bool{ false, true }, 0..) |negate, i| fns[u * 2 + i] = .{
+            .name = @tagName(unit) ++ if (negate) "s_sub" else "s_add",
+            .arg_types = &.{ .datetime, .bigint },
+            .return_type = .datetime,
+            .null_strategy = .kernel_managed,
+            .kernel = date.unitsAddKernel(unit, negate),
+        };
+    }
+    return fns;
+}
+
 /// Other dialects' spellings of builtins. The parser rewrites a call to
 /// its canonical name, so an alias carries every overload of its target
 /// and every later name check sees one name.
@@ -1666,7 +1688,6 @@ const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     .{ .alias = "power", .name = "pow" },
     .{ .alias = "ceiling", .name = "ceil" },
     .{ .alias = "char", .name = "chr" },
-    .{ .alias = "months_add", .name = "date_add_months" },
 };
 
 pub fn canonicalName(name: []const u8) []const u8 {
