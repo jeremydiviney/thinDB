@@ -64,7 +64,7 @@ pub fn commit(allocator: Allocator, catalog: *api.Catalog, xid: []const u8, one_
         target.table.compact_lock.unlock(catalog.io);
     };
     for (targets.items, paths) |target, *path| {
-        target.table.compact_lock.lockUncancelable(catalog.io);
+        target.table.lockCompactPreempting();
         locked += 1;
         target.table.sync_mode = .per_flush;
         try target.table.flush();

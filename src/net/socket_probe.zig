@@ -1,6 +1,7 @@
 //! Socket probes for the connection reaper (#164): questions the reaper
 //! asks about another thread's socket without reading from it or
-//! disturbing a read that thread has posted.
+//! disturbing a read that thread has posted, and the abort it applies
+//! to a connection whose transfer stalled.
 //!
 //! Zig 0.16's Io.net sockets on Windows are AFD NT handles, which ws2_32
 //! rejects (WSAENOTSOCK), so the Windows probes go through the same NT
@@ -127,6 +128,71 @@ fn peerClosedWindows(handle: std.Io.net.Socket.Handle) ?bool {
     if (status != .SUCCESS) return null;
     if (info.handle_count == 0) return false;
     return info.events & (afd_poll_disconnect | afd_poll_abort | afd_poll_local_close) != 0;
+}
+
+/// End the connection from any thread, so a read or send another thread
+/// has pending on it returns an error now. POSIX `shutdown` wakes both.
+/// A graceful disconnect on Windows wakes neither: it queues behind a
+/// pending send and leaves a pending read posted. So there the connection
+/// is reset (an abortive AFD disconnect), which fails both at once.
+/// Best effort; the handle stays open for its owner to close. Returns within
+/// about two seconds, because the reaper calls it under the registry lock.
+pub fn abortTransfers(allocator: std.mem.Allocator, io: std.Io, handle: std.Io.net.Socket.Handle) void {
+    switch (builtin.os.tag) {
+        .windows => abortTransfersWindows(allocator, handle),
+        else => io.vtable.netShutdown(io.userdata, handle, .both) catch {},
+    }
+}
+
+fn abortTransfersWindows(allocator: std.mem.Allocator, handle: std.Io.net.Socket.Handle) void {
+    const windows = std.os.windows;
+    // The kernel reads `info` and writes `iosb` until the request completes,
+    // so they live on the heap: a request that outlasts the bounded waits
+    // below leaks them rather than leave the kernel a dead stack frame.
+    const Request = struct {
+        info: windows.AFD.PARTIAL_DISCONNECT_INFO,
+        iosb: windows.IO_STATUS_BLOCK,
+    };
+    const request = allocator.create(Request) catch return;
+    request.* = .{
+        .info = .{
+            .DisconnectMode = .{ .SEND = true, .RECEIVE = true, .ABORTIVE = true },
+            .Timeout = -1,
+        },
+        .iosb = undefined,
+    };
+    var event: windows.HANDLE = undefined;
+    if (windows.ntdll.NtCreateEvent(&event, windows.ACCESS_MASK.Specific.Event.ALL_ACCESS, null, .Notification, .FALSE) != .SUCCESS) {
+        allocator.destroy(request);
+        return;
+    }
+    // Closing the handle is safe while the request is pending: the request
+    // holds its own reference to the event.
+    defer _ = windows.ntdll.NtClose(event);
+
+    const status = windows.ntdll.NtDeviceIoControlFile(
+        handle,
+        event,
+        null, // APC routine: completion signals `event`, on this thread's terms
+        null,
+        &request.iosb,
+        windows.IOCTL.AFD.PARTIAL_DISCONNECT,
+        @ptrCast(&request.info),
+        @sizeOf(windows.AFD.PARTIAL_DISCONNECT_INFO),
+        null,
+        0,
+    );
+    const bound: windows.LARGE_INTEGER = -1000 * std.time.ns_per_ms / 100; // relative, 100 ns units
+    const completed = status != .PENDING or
+        windows.ntdll.NtWaitForSingleObject(event, .FALSE, &bound) == .SUCCESS or
+        cancelled: {
+            // Cancelling by the IOSB's address touches only this request,
+            // never the owner's pending read or send.
+            var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
+            _ = windows.ntdll.NtCancelIoFileEx(handle, &request.iosb, &cancel_iosb);
+            break :cancelled windows.ntdll.NtWaitForSingleObject(event, .FALSE, &bound) == .SUCCESS;
+        };
+    if (completed) allocator.destroy(request);
 }
 
 test "peerClosed tells an open connection from one the peer closed" {

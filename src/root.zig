@@ -151,4 +151,5 @@ test {
     _ = @import("util/cancellable_sort.zig");
     _ = @import("util/tcp_listener.zig");
     _ = @import("util/durability_fault_test.zig");
+    _ = @import("util/merge_preempt_test.zig");
 }

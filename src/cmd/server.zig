@@ -466,10 +466,14 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Connection reaper — see ReaperCtx.
     const net_read_timeout_secs = envU64(init.environ_map, "THINDB_NET_READ_TIMEOUT_SECS", 30);
+    const net_write_timeout_secs = envU64(init.environ_map, "THINDB_NET_WRITE_TIMEOUT_SECS", 60);
     var reaper_ctx: ReaperCtx = .{
         .registry = &shared_registry,
         .io = io,
-        .timeout_ms = net_read_timeout_secs * 1000,
+        .limits = .{
+            .read_ms = net_read_timeout_secs * std.time.ms_per_s,
+            .write_ms = net_write_timeout_secs * std.time.ms_per_s,
+        },
     };
     const reaper_thread = try std.Thread.spawn(.{}, ReaperCtx.run, .{&reaper_ctx});
 
@@ -558,19 +562,26 @@ const CompactorCtx = struct {
 };
 
 /// Connection reaper: every sweep of the connection registry
-///   - shuts down any socket stuck mid-packet longer than `timeout_ms`
-///     (#164). Mirrors MySQL's net_read_timeout (default 30 s); override
-///     with `THINDB_NET_READ_TIMEOUT_SECS` (0 disables). A wedged
-///     mid-packet read otherwise hangs until the client gives up — the
-///     2026-07-11 incident held a Flink sink connection at zero packets
-///     for 559 s.
+///   - aborts any MySQL connection stuck mid-packet longer than
+///     `limits.read_ms` (#164). Mirrors MySQL's net_read_timeout
+///     (default 30 s); override with `THINDB_NET_READ_TIMEOUT_SECS`
+///     (0 disables). A wedged mid-packet read otherwise hangs until the
+///     client gives up — the 2026-07-11 incident held a Flink sink
+///     connection at zero packets for 559 s.
+///   - aborts any MySQL or PostgreSQL connection whose response send has
+///     not moved for `limits.write_ms` (#87). Mirrors MySQL's
+///     net_write_timeout (default 60 s); override with
+///     `THINDB_NET_WRITE_TIMEOUT_SECS` (0 disables). A client that stops
+///     reading its result otherwise keeps the statement's gate lease, so
+///     every DDL queues behind it. The statement fails and the
+///     connection closes. The 5 s poll can add up to 5 s to either limit.
 ///   - cancels read-only queries whose client has disconnected, which
 ///     would otherwise run to completion for nobody (2026-09-04: a
 ///     runaway query outlived its killed client and needed a restart).
 const ReaperCtx = struct {
     registry: *thindb.ConnectionRegistry,
     io: Io,
-    timeout_ms: u64,
+    limits: thindb.ConnectionRegistry.TransferLimits,
 
     fn run(self: *ReaperCtx) void {
         const poll: Io.Duration = .fromMilliseconds(5000);
@@ -578,7 +589,7 @@ const ReaperCtx = struct {
             Io.sleep(self.io, poll, .awake) catch return;
             const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
             const now_ms: u64 = @intCast(@divTrunc(@max(now_ns, 0), std.time.ns_per_ms));
-            if (self.timeout_ms > 0) _ = self.registry.reapStalledReads(self.io, now_ms, self.timeout_ms);
+            _ = self.registry.reapStalledTransfers(self.io, now_ms, self.limits);
             _ = self.registry.cancelAbandonedQueries();
         }
     }

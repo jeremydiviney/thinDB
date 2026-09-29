@@ -445,11 +445,21 @@ const MergeGatherJob = struct {
     }
 };
 
+/// Whether a path that frees or rewrites the table asked the merge to stop
+/// (`Table.lockCompactPreempting`). Null for a merge nothing may stop.
+fn preempted(preempt: ?*const std.atomic.Value(u32)) bool {
+    const flag = preempt orelse return false;
+    return flag.load(.acquire) != 0;
+}
+
 /// Streaming k-way merge of the (already order-key-sorted) input segments into
 /// one new segment, dropping tombstoned rows. Returns the written segment's
 /// `SegmentInfo` (caller owns), or null when every input row was tombstoned
 /// (no segment is written). Holds at most one decoded row-group per input plus
 /// one output row-group plus the in-flight segment buffer — never all rows.
+/// Returns `error.MergePreempted`, having written nothing, once `preempt`
+/// reads nonzero before an input opens, an output row group encodes, or the
+/// output file is written.
 fn streamMerge(
     t: *Table,
     seg_ids: []const u64,
@@ -457,6 +467,7 @@ fn streamMerge(
     new_seg_id: u64,
     file_name: []const u8,
     sync: bool,
+    preempt: ?*const std.atomic.Value(u32),
 ) !?storage.format.SegmentInfo {
     const ncols = t.schema.columns.len;
 
@@ -480,6 +491,7 @@ fn streamMerge(
     var opened: usize = 0;
     errdefer for (cursors[0..opened]) |*c| c.deinit();
     for (seg_ids) |id| {
+        if (preempted(preempt)) return error.MergePreempted;
         cursors[opened] = try MergeCursor.open(t, id);
         opened += 1;
         try cursors[opened - 1].advanceToValid();
@@ -575,17 +587,20 @@ fn streamMerge(
         try src.next();
 
         if (picks.items.len == t.row_group_size) {
+            if (preempted(preempt)) return error.MergePreempted;
             try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer, &key_hashes);
         }
     }
 
     if (picks.items.len > 0) {
+        if (preempted(preempt)) return error.MergePreempted;
         try flushMergeBatch(t, &picks, &batch_gens, out_cols, out_views, &writer, &key_hashes);
     }
 
     for (cursors[0..opened]) |*c| c.deinit();
     opened = 0;
 
+    if (preempted(preempt)) return error.MergePreempted;
     var out_info = try writer.finish(t.io, t.segments_dir, file_name, sync);
     errdefer out_info.deinit(t.allocator);
     // Attach the compound-key Bloom over the merged rows (unique tables), so the
@@ -690,23 +705,40 @@ fn unionInputSketches(t: *Table, seg_ids: []const u64, ncols: usize) ![]u8 {
 ///            delete the old files.
 pub fn mergeSegments(t: *Table, seg_ids: []const u64) !void {
     if (seg_ids.len == 0) return;
-    var pending = try mergeAside(t, seg_ids);
+    var pending = try mergeAside(t, seg_ids, null);
     defer pending.deinit(t.allocator);
     try commitMerge(t, &pending);
 }
 
 /// How long a background merge waits for the table's readers to drain before
-/// it gives up its commit. The wait holds `compact_lock`, so it also bounds
-/// how long DROP, ALTER, TRUNCATE and XA COMMIT on the table queue behind it.
+/// it gives up its commit. DDL on the table no longer waits for it (it stops
+/// the merge instead), so what it bounds is the compactor thread, which
+/// serves every table: a table whose scans always overlap costs the others at
+/// most this long per attempt. Long enough to outlast any ordinary statement,
+/// so a table that is merely busy still finds a gap between its readers.
 pub const background_commit_wait: Io.Duration = .fromSeconds(60);
 
-/// `mergeSegments` for the background compactor: the commit gives up after
-/// `commit_wait` (see `commitMergeBefore`). Returns whether the merge landed.
+/// `mergeSegments` for the background compactor. It holds no statement lease,
+/// only `compact_lock`, and stops early for a path that frees or rewrites the
+/// table (`Table.lockCompactPreempting`); its commit gives up after
+/// `commit_wait` (see `commitMergeBefore`). A merge that stops deletes what it
+/// wrote and leaves its inputs published for a later sweep. Returns whether
+/// the merge landed.
 pub fn mergeInBackground(t: *Table, seg_ids: []const u64, commit_wait: Io.Duration) !bool {
     if (seg_ids.len == 0) return false;
-    var pending = try mergeAside(t, seg_ids);
+    var pending = mergeAside(t, seg_ids, &t.merge_preempt) catch |err| switch (err) {
+        error.MergePreempted => {
+            logPreempted(t);
+            return false;
+        },
+        else => |e| return e,
+    };
     defer pending.deinit(t.allocator);
     return commitMergeBefore(t, &pending, .fromNow(t.io, .{ .raw = commit_wait, .clock = .awake }));
+}
+
+fn logPreempted(t: *const Table) void {
+    std.log.info("compaction of table '{s}' stopped for DDL; its segments stay for a later sweep", .{t.name});
 }
 
 /// Everything `commitMerge` needs from the aside phase. `deinit` is safe to
@@ -733,7 +765,10 @@ pub const PendingMerge = struct {
     }
 };
 
-pub fn mergeAside(t: *Table, seg_ids_in: []const u64) !PendingMerge {
+/// The aside phase. Returns `error.MergePreempted`, having written nothing,
+/// when `preempt` reads nonzero at one of its checks (see `streamMerge`).
+pub fn mergeAside(t: *Table, seg_ids_in: []const u64, preempt: ?*const std.atomic.Value(u32)) !PendingMerge {
+    if (preempted(preempt)) return error.MergePreempted;
     const seg_ids = try t.allocator.dupe(u64, seg_ids_in);
     errdefer t.allocator.free(seg_ids);
 
@@ -791,7 +826,7 @@ pub fn mergeAside(t: *Table, seg_ids_in: []const u64) !PendingMerge {
         var name_buf: [32]u8 = undefined;
         const file_name = try Table.segmentFileName(&name_buf, new_seg_id);
 
-        var maybe_info = try streamMerge(t, seg_ids, prior_sketches.items, new_seg_id, file_name, sync);
+        var maybe_info = try streamMerge(t, seg_ids, prior_sketches.items, new_seg_id, file_name, sync, preempt);
         if (maybe_info) |*info| {
             defer info.deinit(t.allocator);
             // Persist the merged Bloom as the segment's sidecar (#140) —
@@ -822,12 +857,17 @@ pub fn commitMerge(t: *Table, pending: *PendingMerge) !void {
 
 /// `commitMerge` that abandons the merge if the table's readers still hold
 /// `ddl_lock` at `deadline`: `ddl_lock` prefers readers, so on a table that is
-/// never idle the commit would otherwise wait forever. Abandoning is always
-/// safe: the output was never published, so deleting it leaves the inputs
-/// live for a later sweep. Returns false when abandoned.
+/// never idle the commit would otherwise wait forever. It also abandons, at
+/// once, when a path that frees or rewrites the table asks for it. Abandoning
+/// is always safe: the output was never published, so deleting it leaves the
+/// inputs live for a later sweep. Returns false when abandoned.
 pub fn commitMergeBefore(t: *Table, pending: *PendingMerge, deadline: Io.Clock.Timestamp) !bool {
-    if (!t.ddl_lock.lockBefore(t.io, deadline)) {
-        std.log.warn("compaction abandoned: readers held table '{s}' past the commit deadline", .{t.name});
+    if (preempted(&t.merge_preempt) or !t.ddl_lock.lockBefore(t.io, deadline, &t.merge_preempt)) {
+        if (preempted(&t.merge_preempt)) {
+            logPreempted(t);
+        } else {
+            std.log.warn("compaction abandoned: readers held table '{s}' past the commit deadline", .{t.name});
+        }
         try t.deleteSegmentFiles(pending.new_seg_id);
         return false;
     }
@@ -1075,7 +1115,7 @@ test "commitMerge re-applies deletes that land during the aside merge" {
     // (empty) tombstones and writes the merged output; THEN a keyed delete
     // lands on an input segment; THEN the commit swaps. Without the
     // late-tombstone reconciliation the deleted row is resurrected.
-    var pending = try mergeAside(t, &input_ids);
+    var pending = try mergeAside(t, &input_ids, null);
     defer pending.deinit(allocator);
 
     const pred = exec.predicate.PredicateExpr{
@@ -1175,7 +1215,7 @@ test "a statement opens another scan on a table whose merge commit waits for its
         t.manifest.segments.items[0].segment_id,
         t.manifest.segments.items[1].segment_id,
     };
-    var pending = try mergeAside(t, &input_ids);
+    var pending = try mergeAside(t, &input_ids, null);
     defer pending.deinit(allocator);
 
     var first = try exec.scan(allocator, t);

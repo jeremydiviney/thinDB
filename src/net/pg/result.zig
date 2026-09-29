@@ -194,17 +194,14 @@ pub fn sendQueryResult(
         var r: usize = 0;
         while (r < batch.row_count) : (r += 1) {
             cells.clearRetainingCapacity();
+            // Also on a failed send, as when the client stops reading.
+            defer for (cells.items) |c| if (c) |s| allocator.free(s);
             for (batch.schema, 0..) |col, ci| {
+                try cells.ensureUnusedCapacity(allocator, 1);
                 const text_opt = try formatCell(&scratch, allocator, col, batch.values[ci], r);
-                if (text_opt) |text| {
-                    const copy = try allocator.dupe(u8, text);
-                    try cells.append(allocator, copy);
-                } else {
-                    try cells.append(allocator, null);
-                }
+                cells.appendAssumeCapacity(if (text_opt) |text| try allocator.dupe(u8, text) else null);
             }
             try sendDataRow(allocator, w, cells.items);
-            for (cells.items) |c| if (c) |s| allocator.free(s);
             row_count += 1;
         }
     }

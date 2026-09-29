@@ -366,8 +366,6 @@ fn handleConnection(
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
-    var writer = stream.writer(io, &write_buf);
-    const w = &writer.interface;
     const r = &reader.interface;
 
     var session = try SessionState.init(allocator, catalog, connection_id);
@@ -376,10 +374,13 @@ fn handleConnection(
     var conn_state = ConnectionState.init(connection_id, ConnectionState.deriveSecret(connection_id));
     var host_buf: [64]u8 = undefined;
     conn_state.setPeer(std.fmt.bufPrint(&host_buf, "{f}", .{stream.socket.address}) catch "", conn_registry.nowMs(io));
-    // Published by `register`. This wire sets no transfer marks, so the
-    // socket serves only the disconnect probe and connection kills, never
-    // the stalled-read reaper.
+    // Published by `register`. This wire marks only its writes, so the
+    // reaper bounds a send the client stopped draining (#87) but leaves
+    // reads alone; the socket also serves the disconnect probe and
+    // connection kills.
     conn_state.reap_socket = stream.socket.handle;
+    var writer: conn_registry.GuardedStreamWriter = .init(stream, io, &write_buf, &conn_state);
+    const w = writer.interface();
     if (registry) |reg| {
         try reg.register(&conn_state);
     }

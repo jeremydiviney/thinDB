@@ -131,9 +131,9 @@ pub const Schema = struct {
         while (it.next()) |entry| {
             const t = entry.value_ptr.*;
             // A background merge holds no statement lease, so the gate a
-            // drop or shutdown holds does not exclude it. Wait it out, as
+            // drop or shutdown holds does not exclude it. Stop it, as
             // dropTable does, before freeing the table under it.
-            t.compact_lock.lockUncancelable(t.io);
+            t.lockCompactPreempting();
             // Persist any memtable residue before teardown, WAL or not. A
             // WAL-backed table could lean on replay instead, but that makes
             // restart durability hinge on the log being found where the next
@@ -425,9 +425,9 @@ pub const Schema = struct {
 
         if (maybe_existing) |entry| {
             const t = entry.value;
-            // compact_lock before ddl_lock (global order) so we wait out an
-            // in-flight compaction that holds no ddl_lock during its merge.
-            t.compact_lock.lockUncancelable(t.io);
+            // compact_lock before ddl_lock (global order): an in-flight
+            // compaction holds no ddl_lock during its merge, so stop it.
+            t.lockCompactPreempting();
             t.ddl_lock.lockUncancelable(t.io);
             t.close();
         } else {
@@ -483,7 +483,7 @@ pub const Schema = struct {
 
         const t = self.tables.get(old_name) orelse return Error.TableNotFound;
 
-        t.compact_lock.lockUncancelable(t.io);
+        t.lockCompactPreempting();
         defer t.compact_lock.unlock(t.io);
         t.ddl_lock.lockUncancelable(t.io);
         defer t.ddl_lock.unlock(t.io);
