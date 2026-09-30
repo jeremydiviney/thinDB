@@ -519,9 +519,12 @@ test "binary arith: MySQL's bit operators read and return BIGINT UNSIGNED" {
         .{ "SELECT 5 ^ 3 FROM t WHERE id = 1", &[_]?[]const u8{"6"} },
         .{ "SELECT 2 * 3 ^ 1 FROM t WHERE id = 1", &[_]?[]const u8{"4"} },
         .{ "SELECT id FROM t WHERE ~qty > 18446744073709551590 ORDER BY id", &[_]?[]const u8{ "1", "2" } },
-        // The result keeps its value where it is compared, chosen or cast.
-        .{ "SELECT CAST(~qty AS SIGNED) FROM t ORDER BY id", &[_]?[]const u8{ "-11", "-21", "-31" } },
-        .{ "SELECT CAST(1 << 63 AS SIGNED) FROM t WHERE id = 1", &[_]?[]const u8{"-9223372036854775808"} },
+        // The result keeps its value where it is compared or chosen. Past
+        // BIGINT it doesn't fit a SIGNED cast, which makes it NULL, as
+        // StarRocks does (#450), where MySQL keeps its 64 bits.
+        .{ "SELECT CAST(~qty AS SIGNED) FROM t ORDER BY id", &[_]?[]const u8{ null, null, null } },
+        .{ "SELECT CAST(1 << 63 AS SIGNED) FROM t WHERE id = 1", &[_]?[]const u8{null} },
+        .{ "SELECT CAST(~qty & 255 AS SIGNED) FROM t ORDER BY id", &[_]?[]const u8{ "245", "235", "225" } },
         .{ "SELECT IFNULL(~qty, 0) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
         .{ "SELECT COALESCE(NULL, ~qty) FROM t ORDER BY id", &[_]?[]const u8{ "18446744073709551605", "18446744073709551595", "18446744073709551585" } },
         .{ "SELECT NULLIF(~qty, ~10) FROM t ORDER BY id", &[_]?[]const u8{ null, "18446744073709551595", "18446744073709551585" } },
@@ -588,7 +591,8 @@ test "binary arith: MySQL's BIT_AND, BIT_OR and BIT_XOR return BIGINT UNSIGNED" 
         .{ "SELECT BIT_OR(v) + 1 FROM bz", &[_]?[]const u8{"18446744073709551614"} },
         .{ "SELECT BIT_OR(~v) FROM bz", &[_]?[]const u8{"18446744073709551610"} },
         .{ "SELECT BIT_OR(v) FROM bz HAVING BIT_OR(v) > 5", &[_]?[]const u8{"18446744073709551613"} },
-        .{ "SELECT CAST(BIT_OR(v) AS SIGNED) FROM bz", &[_]?[]const u8{"-3"} },
+        .{ "SELECT CAST(BIT_OR(v) AS SIGNED) FROM bz", &[_]?[]const u8{null} },
+        .{ "SELECT CAST(BIT_AND(v) AS SIGNED) FROM bz", &[_]?[]const u8{"5"} },
         .{ "SELECT CONCAT(BIT_XOR(v), '') FROM bz", &[_]?[]const u8{"18446744073709551608"} },
         // A double rounds half to even, a decimal half away from zero, and
         // text reads as the integer it starts with, as for `|`.
@@ -641,10 +645,10 @@ test "binary arith: a LARGEINT keeps every digit, as text and cast to BIGINT" {
         .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 0 AS VARCHAR(40)) FROM t WHERE id = 1", "18446744073709551615" },
         .{ "SELECT CONCAT((0xFFFFFFFFFFFFFFFF + 0) * 1000, '') FROM t WHERE id = 1", "18446744073709551615000" },
         .{ "SELECT CONCAT(0 - (0xFFFFFFFFFFFFFFFF + 0) * 1000, '') FROM t WHERE id = 1", "-18446744073709551615000" },
-        // A LARGEINT reaches BIGINT exactly, not through DOUBLE; one from
-        // 2^63 to 2^64 - 1 is a BIGINT UNSIGNED, which keeps its 64 bits.
+        // A LARGEINT reaches BIGINT exactly, not through DOUBLE, and one
+        // past BIGINT is NULL, as in StarRocks (#450).
         .{ "SELECT CAST((0xFFFFFFFFFFFFFFFF + 0) DIV 2 AS BIGINT) FROM t WHERE id = 1", "9223372036854775807" },
-        .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 0 AS BIGINT) FROM t WHERE id = 1", "-1" },
+        .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 0 AS BIGINT) FROM t WHERE id = 1", null },
         .{ "SELECT CAST(0xFFFFFFFFFFFFFFFF + 1 AS BIGINT) FROM t WHERE id = 1", null },
         .{ "SELECT CAST(0 - (0xFFFFFFFFFFFFFFFF + 0) AS BIGINT) FROM t WHERE id = 1", null },
     };

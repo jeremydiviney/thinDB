@@ -147,6 +147,92 @@ test "cast: a boolean becomes text as 1 or 0, except through PostgreSQL's cast" 
     }
 }
 
+/// How a statement is parsed and compiled: in a dialect, or as a MySQL wire
+/// connection runs it.
+const Run = enum { neutral, mysql, postgres, mysql_session };
+
+fn expectRunTexts(allocator: std.mem.Allocator, db: *thindb.Database, run: Run, c: Case) !void {
+    var q = try switch (run) {
+        .neutral => helpers.runSqlDialect(allocator, db, c.sql, .neutral),
+        .mysql => helpers.runSqlDialect(allocator, db, c.sql, .mysql),
+        .postgres => helpers.runSqlDialect(allocator, db, c.sql, .postgres),
+        .mysql_session => helpers.runSqlMysqlSession(allocator, db, c.sql),
+    };
+    defer q.deinit();
+    const got = try helpers.columnText(allocator, &q);
+    defer helpers.freeStrings(allocator, got);
+    try std.testing.expectEqual(c.expected.len, got.len);
+    for (c.expected, got) |want, cell| try std.testing.expectEqualStrings(want, cell orelse NULL);
+}
+
+test "cast: an integer that doesn't fit a narrower integer is NULL, cast or passed to a narrower parameter (issue #450)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    // NOT NULL columns, so only the narrowing can make a result NULL.
+    try helpers.exec(allocator, db, "CREATE TABLE nw (id INT NOT NULL, b BIGINT NOT NULL, l LARGEINT NOT NULL)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO nw VALUES
+        \\  (1, 7, 7),
+        \\  (2, 2147483648, 9223372036854775808),
+        \\  (3, -2147483649, 18446744073709551615),
+        \\  (4, 9223372036854775807, -9223372036854775809)
+    );
+
+    // Each expected value is StarRocks 4.0's, from its backend: the
+    // `IF(RAND() < 2, x, NULL)` wrapper keeps its frontend from folding x.
+    const cases = [_]Case{
+        .{ .sql = "SELECT CAST(l AS BIGINT) FROM nw ORDER BY id", .expected = &.{ "7", NULL, NULL, NULL } },
+        .{ .sql = "SELECT CAST(l AS INT) FROM nw ORDER BY id", .expected = &.{ "7", NULL, NULL, NULL } },
+        .{ .sql = "SELECT CAST(b AS INT) FROM nw ORDER BY id", .expected = &.{ "7", NULL, NULL, NULL } },
+        .{ .sql = "SELECT LEFT('abcdefghi', b) FROM nw ORDER BY id", .expected = &.{ "abcdefg", NULL, NULL, NULL } },
+        .{ .sql = "SELECT LEFT('abcdefghi', l) FROM nw ORDER BY id", .expected = &.{ "abcdefg", NULL, NULL, NULL } },
+        .{ .sql = "SELECT SUBSTR('abcdefghi', 2, b) FROM nw ORDER BY id", .expected = &.{ "bcdefgh", NULL, NULL, NULL } },
+        .{ .sql = "SELECT LEFT('abcdefghi', b - 2147483641) FROM nw ORDER BY id", .expected = &.{ "", "abcdefg", NULL, NULL } },
+        .{ .sql = "SELECT CAST(CAST('9223372036854775807' AS LARGEINT) AS BIGINT)", .expected = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT CAST(CAST('-9223372036854775808' AS LARGEINT) AS BIGINT)", .expected = &.{"-9223372036854775808"} },
+        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('9223372036854775808' AS LARGEINT), NULL) AS BIGINT)", .expected = &.{NULL} },
+        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('18446744073709551615' AS LARGEINT), NULL) AS BIGINT)", .expected = &.{NULL} },
+        .{ .sql = "SELECT LEFT('abcdef', 4294967298)", .expected = &.{NULL} },
+        .{ .sql = "SELECT LEFT('abcdef', IF(RAND() < 2, 4294967298, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT LEFT('abcdef', IF(RAND() < 2, 2147483647, NULL))", .expected = &.{"abcdef"} },
+        .{ .sql = "SELECT RIGHT('abcdef', IF(RAND() < 2, 4294967298, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT SUBSTR('abcdef', 2, IF(RAND() < 2, 4294967298, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT SUBSTRING_INDEX('a.b.c', '.', IF(RAND() < 2, 4294967297, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT ROUND(1.25e0, IF(RAND() < 2, 4294967297, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT LEFT('abcdef', IF(RAND() < 2, 1e15, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT LEFT('abcdef', IF(RAND() < 2, 1e100, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT LEFT('abcdef', IF(RAND() < 2, 2.5e0, NULL))", .expected = &.{"ab"} },
+        .{ .sql = "SELECT LEFT('abcdef', IF(RAND() < 2, 1000000000000000.0, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT bitnot(IF(RAND() < 2, 1e100, NULL))", .expected = &.{NULL} },
+        .{ .sql = "SELECT bit_shift_left(1, IF(RAND() < 2, 1e100, NULL))", .expected = &.{NULL} },
+    };
+    // MySQL's spellings, where they parse: the BIGINT cast's names and
+    // INTERVAL arithmetic.
+    const mysql_cases = [_]Case{
+        .{ .sql = "SELECT CAST(l AS SIGNED) FROM nw ORDER BY id", .expected = &.{ "7", NULL, NULL, NULL } },
+        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('18446744073709551615' AS LARGEINT), NULL) AS SIGNED)", .expected = &.{NULL} },
+        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('18446744073709551615' AS LARGEINT), NULL) AS UNSIGNED)", .expected = &.{NULL} },
+        // Text read as a date beside a count that narrows to INT.
+        .{ .sql = "SELECT CAST(DATE_ADD('2020-01-31', INTERVAL id + 1 MONTH) AS CHAR) FROM nw ORDER BY id", .expected = &.{ "2020-03-31 00:00:00", "2020-04-30 00:00:00", "2020-05-31 00:00:00", "2020-06-30 00:00:00" } },
+        .{ .sql = "SELECT CAST(DATE_ADD('2020-01-01', INTERVAL b DAY) AS CHAR) FROM nw ORDER BY id", .expected = &.{ "2020-01-08 00:00:00", NULL, NULL, NULL } },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("nw", .{})).flush();
+        for ([_]Run{ .neutral, .mysql, .postgres, .mysql_session }) |run| {
+            const all = [_][]const Case{ &cases, if (run == .postgres) &.{} else &mysql_cases };
+            for (all) |list| for (list) |c| {
+                expectRunTexts(allocator, db, run, c) catch |err| {
+                    std.debug.print("case failed ({s}, {t}): {s}\n", .{ @errorName(err), run, c.sql });
+                    return err;
+                };
+            };
+        }
+    }
+}
+
 fn expectLargeintCases(allocator: std.mem.Allocator, db: *thindb.Database, cases: anytype) !void {
     inline for (cases) |c| {
         var q = try helpers.runSqlMysql(allocator, db, c[0]);

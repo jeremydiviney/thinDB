@@ -662,15 +662,10 @@ pub fn truncatedInt(comptime T: type, x: f64) ?T {
     return @intFromFloat(t);
 }
 
+/// The CASTs to an integer from a double or text. An integer source narrows
+/// by `cast.intNarrowKernel`.
 fn IntCast(comptime T: type) type {
     return struct {
-        fn fromInteger(comptime src_field: []const u8) Kernel {
-            return convertOrNull(intField(T), struct {
-                fn f(v: ColumnView, row: usize) ?T {
-                    return std.math.cast(T, @field(v.data, src_field)[row]);
-                }
-            }.f);
-        }
         const from_double = convertOrNull(intField(T), struct {
             fn f(v: ColumnView, row: usize) ?T {
                 return truncatedInt(T, v.data.double[row]);
@@ -684,29 +679,15 @@ fn IntCast(comptime T: type) type {
     };
 }
 
-pub const bigintToTinyintKernel = IntCast(i8).fromInteger("bigint");
 pub const doubleToTinyintKernel = IntCast(i8).from_double;
 pub const stringToTinyintKernel = IntCast(i8).from_text;
-pub const bigintToSmallintKernel = IntCast(i16).fromInteger("bigint");
 pub const doubleToSmallintKernel = IntCast(i16).from_double;
 pub const stringToSmallintKernel = IntCast(i16).from_text;
-pub const bigintToIntKernel = IntCast(i32).fromInteger("bigint");
 pub const doubleToIntKernel = IntCast(i32).from_double;
 pub const stringToIntKernel = IntCast(i32).from_text;
 pub const doubleToBigintKernel = IntCast(i64).from_double;
 pub const stringToBigintKernel = IntCast(i64).from_text;
 pub const doubleToLargeintKernel = IntCast(i128).from_double;
-
-/// A LARGEINT from 2^63 to 2^64 - 1 is a BIGINT UNSIGNED (a MySQL bit
-/// operator's result, `0xFFFFFFFFFFFFFFFF + 0`), and keeps its 64 bits as
-/// BIGINT, as MySQL's CAST AS SIGNED keeps them (`CAST(~5 AS SIGNED)` is -6).
-/// Any other value past BIGINT is NULL.
-pub const largeintToBigintKernel = convertOrNull("bigint", struct {
-    fn f(v: ColumnView, row: usize) ?i64 {
-        const x = v.data.largeint[row];
-        return std.math.cast(i64, x) orelse @bitCast(std.math.cast(u64, x) orelse return null);
-    }
-}.f);
 pub const stringToLargeintKernel = IntCast(i128).from_text;
 
 pub const stringToDoubleKernel = convertOrNull("double", struct {
@@ -761,11 +742,13 @@ fn numericText(allocator: Allocator, v: ColumnView, row: usize, scratch: *std.Ar
 pub const textAsDoubleKernel = textAsNumber("double", common.leadingDouble);
 pub const textAsBigintKernel = textAsNumber("bigint", common.leadingInteger);
 
-pub fn doubleIntegerArgKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const dst = &out.data.bigint;
-    try dst.ensureUnusedCapacity(allocator, row_count);
-    for (args[0].data.double[0..row_count]) |x| dst.appendAssumeCapacity(common.doubleAsBigint(x));
-}
+/// A double passed where a function takes an integer: rounded half to even,
+/// as MySQL reads it, and NULL past BIGINT, as a CAST is.
+pub const doubleIntegerArgKernel = convertOrNull("bigint", struct {
+    fn f(v: ColumnView, row: usize) ?i64 {
+        return truncatedInt(i64, common.roundHalfEven(v.data.double[row]));
+    }
+}.f);
 
 /// An integer of any width as its exact digits: a LARGEINT must not reach
 /// text through DOUBLE, which keeps only 17 of its digits.
