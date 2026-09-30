@@ -851,6 +851,7 @@ fn clonePredicate(aa: Allocator, expr: PredicateExpr) Allocator.Error!PredicateE
                 .rows = rows,
                 .value_type = s.value_type,
                 .key_types = try aa.dupe(types.Type, s.key_types),
+                .missing = if (s.missing) |m| try cloneValue(aa, m) else null,
             } };
         },
         .correlated_range => |s| blk: {
@@ -1969,7 +1970,7 @@ fn hasUdfAgg(aggs: []const AggSpec) bool {
     return false;
 }
 
-fn stripAlias(alias: []const u8, name: []const u8) ?[]const u8 {
+pub fn stripAlias(alias: []const u8, name: []const u8) ?[]const u8 {
     const dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
     if (!types.columnNameEql(name[0..dot], alias)) return null;
     return name[dot + 1 ..];
@@ -2105,7 +2106,7 @@ fn projectHasReplaceTarget(p: ir.Op.Project, name: []const u8) bool {
 /// The SELECT's own pipeline between the Project and its FROM source derives
 /// `name`: an ORDER BY key, a WHERE operand or a window result no projection
 /// item names.
-fn selectPipelineDerives(upstream: *const ir.Op, name: []const u8) bool {
+pub fn selectPipelineDerives(upstream: *const ir.Op, name: []const u8) bool {
     var op = upstream;
     while (true) {
         switch (op.*) {

@@ -343,13 +343,82 @@ test "correlated subqueries the domain can't carry are rejected rather than boun
     var db = try setupScopes(allocator, std.testing.io, tmp.dir);
     defer db.close();
 
+    // An outer aggregate beside an ungrouped outer column has no group to
+    // aggregate in, and nested in another aggregate it has no query to; a
+    // FULL JOIN would need every domain row on its dependent side, and a
+    // star over a join names columns the lift can't spell out.
     const cases = .{
-        "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT id FROM ex_u WHERE ex_u.id > x.k) y) ORDER BY x.id",
-        "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT * FROM (SELECT v FROM ex_u) y WHERE y.v <> x.v) ORDER BY x.id",
-        "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT MAX(y.v) FROM ex_u y WHERE y.id <> x.k) ORDER BY x.id",
         "SELECT x.id, (SELECT SUM(x.v) FROM ex_u y WHERE y.id <> x.k) AS s FROM ex_t x ORDER BY x.id",
+        "SELECT SUM((SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10)) AS s FROM ex_t x",
+        "SELECT x.id, (SELECT COUNT(*) FROM ex_u a FULL JOIN (SELECT id FROM ex_u WHERE v = x.v) b ON a.id = b.id) AS n FROM ex_t x ORDER BY x.id",
+        "SELECT x.id, (SELECT COUNT(*) FROM (SELECT * FROM ex_u a JOIN ex_u b ON a.id = b.id WHERE a.id > x.k) d) AS n FROM ex_t x ORDER BY x.id",
     };
     inline for (cases) |sql| try helpers.expectRunError(allocator, db, sql, error.UnsupportedCorrelatedSubquery);
+}
+
+test "correlated subqueries with an outer column in the FROM, a correlated UNION or a star lift onto the domain" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Rows are DuckDB's.
+    const cases = .{
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT id FROM ex_u WHERE ex_u.id > x.k) y) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM (SELECT id FROM ex_u WHERE ex_u.id > x.k) y) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 4, 2, 3, 3, 2, 4, 1, 5, 0 } },
+        .{ "SELECT x.id, (SELECT MAX(y.v) FROM (SELECT * FROM ex_u WHERE ex_u.id > x.k) y) AS m FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 9, 2, 9, 3, 9, 4, 9, 5, null } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM (SELECT id FROM ex_u WHERE id > x.k UNION ALL SELECT id FROM vu WHERE v = x.v) d) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 4, 2, 5, 3, 2, 4, 2, 5, 2 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u a LEFT JOIN (SELECT id FROM ex_u WHERE v = x.v) b ON a.id = b.id WHERE b.id IS NULL) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 5, 2, 3, 3, 5, 4, 4, 5, 3 } },
+        .{ "SELECT x.id, (SELECT COUNT(b.id) FROM (SELECT id FROM ex_u WHERE v = x.v) b RIGHT JOIN ex_u a ON b.id = a.id) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 2, 3, 0, 4, 1, 5, 2 } },
+        .{ "SELECT x.id, (SELECT SUM(d.c) FROM (SELECT COUNT(*) AS c FROM ex_u WHERE id > x.k) d) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 4, 2, 3, 3, 2, 4, 1, 5, 0 } },
+        .{ "SELECT x.id, (SELECT SUM(d.id) FROM (SELECT id FROM ex_u WHERE id > x.k ORDER BY id LIMIT 2) d) AS s FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 50, 2, 70, 3, 90, 4, 50, 5, null } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.v = x.v UNION ALL SELECT 1 FROM ex_u z WHERE z.id = x.k + 20) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT y.v FROM ex_u y WHERE y.id > x.k UNION SELECT 5) ORDER BY x.id", &[_]?i64{ 1, 2 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v NOT IN (SELECT y.v FROM ex_u y WHERE y.id > x.k AND y.v IS NOT NULL UNION SELECT 9) ORDER BY x.id", &[_]?i64{ 1, 4, 5 } },
+        .{ "SELECT x.id, (SELECT y.v FROM ex_u y WHERE y.id = x.k UNION ALL SELECT z.v FROM ex_u z WHERE z.id = x.k + 1000) AS v FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 2, 2, 7, 3, null, 4, 2, 5, 9 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT * FROM (SELECT v FROM ex_u) y WHERE y.v <> x.v) ORDER BY x.id", &[_]?i64{} },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT * FROM (SELECT v FROM ex_u) y WHERE y.v < x.v + 3) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+        .{ "SELECT x.id, (SELECT * FROM (SELECT v FROM ex_u WHERE id = x.k + 10) y) AS v FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 7, 2, null, 3, 2, 4, 9, 5, null } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT MAX(y.v) FROM ex_u y WHERE y.id <> x.k) ORDER BY x.id", &[_]?i64{} },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT MIN(y.v) FROM ex_u y WHERE y.id > x.k) ORDER BY x.id", &[_]?i64{2} },
+        .{ "SELECT x.id FROM ex_t x WHERE x.id - 1 IN (SELECT * FROM (SELECT COUNT(*) AS c FROM ex_u WHERE id > x.k) d) ORDER BY x.id", &[_]?i64{3} },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT COUNT(*) FROM ex_u y WHERE y.id > x.k OR y.v = x.v) ORDER BY x.id", &[_]?i64{5} },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+test "a subquery's aggregate over only outer columns aggregates in the outer query" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Rows are DuckDB's. The outer group's value holds whatever rows the
+    // subquery sees, and none leaves it NULL.
+    const cases = .{
+        .{ "SELECT x.k, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", &[_]?i64{ 10, 5, 20, 2, 30, null, 40, 7, 50, 2 } },
+        .{ "SELECT x.k, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 99) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", &[_]?i64{ 10, null, 20, null, 30, null, 40, null, 50, null } },
+        .{ "SELECT x.k, (SELECT SUM(x.v) + COUNT(*) FROM ex_u y WHERE y.v > 2) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", &[_]?i64{ 10, 7, 20, 4, 30, null, 40, 9, 50, 4 } },
+        .{ "SELECT x.k, (SELECT MIN(x.v) + MAX(y.v) FROM ex_u y WHERE y.id < 35) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", &[_]?i64{ 10, 12, 20, 9, 30, null, 40, 14, 50, 9 } },
+        .{ "SELECT x.k, (SELECT MAX(x.v) FROM ex_u y WHERE y.id = x.k + 10) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", &[_]?i64{ 10, 5, 20, 2, 30, null, 40, 7, 50, null } },
+        .{ "SELECT x.k FROM ex_t x GROUP BY x.k HAVING EXISTS (SELECT 1 FROM ex_u y WHERE y.v = SUM(x.v)) ORDER BY x.k", &[_]?i64{ 20, 40, 50 } },
+        .{ "SELECT x.k FROM ex_t x GROUP BY x.k HAVING (SELECT COUNT(*) FROM ex_u y WHERE y.v < SUM(x.v)) > 1 ORDER BY x.k", &[_]?i64{ 10, 40 } },
+        .{ "SELECT (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x", &[_]?i64{16} },
+        .{ "SELECT MAX(x.id) AS m, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x WHERE x.id > 1", &[_]?i64{ 5, 11 } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
 }
 
 test "correlated NOT IN lifted onto its domain skips NULLs in the set as the keyed paths do" {
@@ -415,6 +484,71 @@ test "correlated subqueries keyed by an outer expression in DELETE, UPDATE and a
         \\SELECT x.id, z.id AS zid FROM ex_t x LEFT JOIN ex_u z
         \\  ON z.v = x.v AND EXISTS (SELECT 1 FROM ex_u y WHERE y.id = x.k + 10) ORDER BY x.id, zid
     , &.{ 1, null, 2, 10, 2, 40, 3, null, 4, 20, 5, null });
+}
+
+test "correlated DELETE and UPDATE no keyed path takes write the rows found by the target's primary key" {
+    const allocator = std.testing.allocator;
+    // Rows are DuckDB's.
+    const cases = .{
+        .{ "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 30 OR y.v = ex_t.v)", &[_]?i64{ 3, null } },
+        .{ "UPDATE ex_t SET v = v + 100 WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id <> ex_t.k AND y.v = ex_t.v)", &[_]?i64{ 1, 5, 2, 102, 3, null, 4, 107, 5, 102 } },
+        .{ "DELETE FROM ex_t WHERE ex_t.v IN (SELECT y.v FROM ex_u y WHERE y.id <> ex_t.k)", &[_]?i64{ 1, 5, 3, null } },
+        .{ "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id - ex_t.k = 10 AND y.v > ex_t.v)", &[_]?i64{ 2, 2, 3, null, 5, 2 } },
+        .{ "UPDATE ex_t SET v = -1 WHERE NOT EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 30 OR y.v = ex_t.v + 1)", &[_]?i64{ 1, 5, 2, 2, 3, -1, 4, -1, 5, -1 } },
+        // A key no inner row has still counts zero rows.
+        .{ "DELETE FROM ex_t WHERE ex_t.v * 0 = (SELECT COUNT(*) FROM ex_u y WHERE y.id = ex_t.k + 10)", &[_]?i64{ 1, 5, 2, 2, 3, null, 4, 7 } },
+    };
+    inline for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+        defer db.close();
+        try exec(allocator, db, case[0]);
+        expectCells(allocator, db, "SELECT id, v FROM ex_t ORDER BY id", case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+test "correlated DELETE and UPDATE on a target without a primary key fail when no keyed path takes them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE np (id BIGINT, v INT, k INT)");
+    try exec(allocator, db, "INSERT INTO np SELECT id, v, k FROM ex_t");
+
+    // Without a key there's no sound row identity to write the found rows
+    // by, so these fail, and a keyed one still runs.
+    try helpers.expectRunError(allocator, db, "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = np.k OR y.v = np.v)", error.UnsupportedCorrelatedSubquery);
+    try helpers.expectRunError(allocator, db, "UPDATE np SET v = 0 WHERE np.v IN (SELECT y.v FROM ex_u y WHERE y.id <> np.k)", error.UnsupportedCorrelatedSubquery);
+    try expectCells(allocator, db, "SELECT id, v FROM np ORDER BY id", &.{ 1, 5, 2, 2, 3, null, 4, 7, 5, 2 });
+    try exec(allocator, db, "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = np.k + 10)");
+    try expectCells(allocator, db, "SELECT id, v FROM np ORDER BY id", &.{ 5, 2 });
+}
+
+test "an outer join's ON correlated by OR, <> or terms over both rows matches the pairs it keeps" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Rows are DuckDB's, from the inner join matched back on each side's id.
+    const cases = .{
+        .{ "SELECT x.id, z.id AS zid FROM ex_t x LEFT JOIN ex_u z ON z.v = x.v AND EXISTS (SELECT 1 FROM ex_u y WHERE y.id = x.k + 20 OR y.v = z.v + 5) ORDER BY x.id, zid", &[_]?i64{ 1, null, 2, 10, 2, 40, 3, null, 4, null, 5, 10, 5, 40 } },
+        .{ "SELECT x.id, z.id AS zid FROM ex_t x RIGHT JOIN ex_u z ON z.v = x.v AND EXISTS (SELECT 1 FROM ex_u y WHERE y.id <> x.k AND y.v = z.v) ORDER BY x.id, zid", &[_]?i64{ null, 30, null, 50, 2, 10, 2, 40, 4, 20, 5, 10, 5, 40 } },
+        .{ "SELECT x.id, z.id AS zid FROM ex_t x FULL JOIN ex_u z ON z.v >= x.v AND EXISTS (SELECT 1 FROM ex_u y WHERE y.id + z.id = x.k + 50) ORDER BY x.id, zid", &[_]?i64{ null, 10, null, 30, 1, 20, 1, 50, 2, 20, 2, 40, 2, 50, 3, null, 4, 50, 5, 50 } },
+        .{ "SELECT x.id, z.id AS zid FROM ex_t x LEFT JOIN ex_u z ON z.v = x.v AND (SELECT COUNT(*) FROM ex_u y WHERE y.id <> x.k AND y.v >= z.v) > 2 ORDER BY x.id, zid", &[_]?i64{ 1, null, 2, 10, 2, 40, 3, null, 4, null, 5, 10, 5, 40 } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
 }
 
 test "correlated scalar over a CTE that shadows its table, keyed by an expression over the outer row" {
