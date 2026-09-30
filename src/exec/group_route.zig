@@ -52,15 +52,19 @@ pub fn routeGroupBy(
         exec.force_group_by == .auto;
     if (group_cols.len > 0 and exec.force_group_by == .auto and !groupKeysSortedPrefix(st.sort_state, group_cols)) budgeted: {
         const account = upstream.accountant() orelse break :budgeted;
-        const needs = inputNeeds(upstream, group_cols, aggs, emit_limit, partitioned_aggregate.partitionCount(partition_dop)) orelse break :budgeted;
+        const priced_cols = try allocator.alloc(exec.ColStat, upstream.outputSchema().len);
+        defer allocator.free(priced_cols);
+        const priced = try withSampledWidths(allocator, upstream, st, priced_cols);
+        const needs = inputNeeds(upstream, priced, group_cols, aggs, emit_limit, partitioned_aggregate.partitionCount(partition_dop)) orelse break :budgeted;
         const headroom = account.headroom();
         if (trace) {
             traceNeeds(st.upper_rows, needs, headroom, partition_ok);
+            traceInput(st, priced, upstream.outputSchema());
             if (exec.queryAs(RealizedInput, upstream.*)) |r| std.debug.print(
                 "[gbroute]   realized input: {d} chunks, held={d} MiB, largest={d} MiB\n",
                 .{ r.owned.chunks.len, r.held_bytes >> 20, r.largest_chunk_bytes >> 20 },
             );
-            if (groupState(st, upstream.outputSchema(), group_cols, aggs, emit_limit)) |gs| std.debug.print(
+            if (groupState(priced, upstream.outputSchema(), group_cols, aggs, emit_limit)) |gs| std.debug.print(
                 "[gbroute]   state: groups={d} slot={d} B group={d} B sets={d} MiB\n",
                 .{ gs.groups, gs.slot, gs.group, gs.sets >> 20 },
             );
@@ -297,18 +301,18 @@ pub const PlanNeeds = struct {
     }
 };
 
-/// `planNeeds` for `upstream` as the router prices it, with the partitioned
-/// plan split `partitions` ways; over a `RealizedInput`, the batches are its
-/// chunks and the copying plans are credited with the buffers their copy
-/// frees.
+/// `planNeeds` for `upstream` described by `st` (its stats as the router
+/// prices them, `withSampledWidths`), with the partitioned plan split
+/// `partitions` ways; over a `RealizedInput`, the batches are its chunks and
+/// the copying plans are credited with the buffers their copy frees.
 pub fn inputNeeds(
     upstream: *Query,
+    st: exec.PipelineStats,
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     emit_limit: ?u32,
     partitions: u64,
 ) ?PlanNeeds {
-    const st = upstream.stats();
     const schema = upstream.outputSchema();
     const round = partitioned_aggregate.roundBytes(if (upstream.accountant()) |a| a.budget else null);
     const realized = exec.queryAs(RealizedInput, upstream.*) orelse
@@ -339,8 +343,8 @@ const BATCH_SCRATCH_BYTES: u64 = 16 + 8 + 4;
 /// arrive.
 const SET_GROWTH: u64 = 2;
 
-/// Width assumed for a string value that no stage or realized buffer has
-/// measured — the same guess `memory.estimateColumnBytes` makes.
+/// Width assumed for a string value that no stage, realized buffer or table
+/// sample has measured — the same guess `memory.estimateColumnBytes` makes.
 const GUESSED_STRING_WIDTH: u64 = 32;
 
 /// Each keyed plan's estimated peak over an input described by `st` (row
@@ -376,8 +380,7 @@ pub fn planNeeds(
     round_bytes: u64,
 ) ?PlanNeeds {
     const rows = st.upper_rows;
-    var row_bytes: u64 = 0;
-    for (0..schema.len) |i| row_bytes += columnRowBytes(st, schema, i);
+    const row_bytes = rowBytes(st, schema);
     const input = rows *| row_bytes;
     const state = groupState(st, schema, group_cols, aggs, emit_limit) orelse return null;
     const index = rows *| @sizeOf(u32);
@@ -412,6 +415,41 @@ fn columnRowBytes(st: exec.PipelineStats, schema: []const types.Column, idx: usi
     const offset: u64 = if (schema[idx].type.isString()) @sizeOf(u32) else 0;
     const validity: u64 = @intFromBool(schema[idx].nullable);
     return valueWidth(st, schema, idx) + offset + validity;
+}
+
+fn rowBytes(st: exec.PipelineStats, schema: []const types.Column) u64 {
+    var bytes: u64 = 0;
+    for (0..schema.len) |i| bytes += columnRowBytes(st, schema, i);
+    return bytes;
+}
+
+/// `st` with its column stats copied into `out` (one per output column of
+/// `upstream`), giving each string column no stage or realized buffer
+/// measured the width `Query.sampleWidths` samples from its table. An
+/// unfiltered table input is then priced from its data rather than the
+/// 32-byte guess, which can be off by 3x on a URL column (issue #397).
+fn withSampledWidths(
+    allocator: Allocator,
+    upstream: *Query,
+    st: exec.PipelineStats,
+    out: []exec.ColStat,
+) !exec.PipelineStats {
+    const schema = upstream.outputSchema();
+    const widths = try allocator.alloc(?u32, schema.len);
+    defer allocator.free(widths);
+    var unmeasured = false;
+    for (schema, out, widths, 0..) |col, *o, *w, i| {
+        o.* = if (i < st.column_stats.len) st.column_stats[i] else .{};
+        w.* = o.avg_width;
+        if (col.type.isString() and o.avg_width == null) unmeasured = true;
+    }
+    if (unmeasured) try upstream.sampleWidths(widths);
+    for (schema, out, widths) |col, *o, w| {
+        if (col.type.isString() and o.avg_width == null) o.avg_width = w;
+    }
+    var priced = st;
+    priced.column_stats = out;
+    return priced;
 }
 
 fn estimateGroups(st: exec.PipelineStats, schema: []const types.Column, group_cols: []const []const u8) u64 {
@@ -509,6 +547,17 @@ fn groupState(
         }
     }
     return .{ .groups = groups, .slot = slot, .group = group, .sets = sets };
+}
+
+fn traceInput(st: exec.PipelineStats, priced: exec.PipelineStats, schema: []const types.Column) void {
+    std.debug.print("[gbroute]   input={d} MiB ({d} B/row):", .{ (st.upper_rows *| rowBytes(priced, schema)) >> 20, rowBytes(priced, schema) });
+    for (schema, 0..) |col, i| {
+        if (!col.type.isString()) continue;
+        const measured = i < st.column_stats.len and st.column_stats[i].avg_width != null;
+        const how = if (measured) "measured" else if (priced.column_stats[i].avg_width != null) "sampled" else "guessed";
+        std.debug.print(" {s}={d} B {s}", .{ col.name, valueWidth(priced, schema, i), how });
+    }
+    std.debug.print("\n", .{});
 }
 
 fn traceNeeds(rows: u64, needs: PlanNeeds, headroom: usize, partition_ok: bool) void {
@@ -1366,7 +1415,7 @@ fn testRouteRealized(a: Allocator, budget: usize, partition_dop: usize, blind: b
     var q = routed: {
         var up = try RealizedInput.create(tracked, exec.makeQuery(tracked, &drained), owned);
         errdefer up.deinit();
-        needs = inputNeeds(&up, &group_cols, &aggs, null, partitioned_aggregate.partitionCount(partition_dop)).?;
+        needs = inputNeeds(&up, up.stats(), &group_cols, &aggs, null, partitioned_aggregate.partitionCount(partition_dop)).?;
         held = account.current_bytes;
         blind_hash_ok = groupKeysCardUnderLimit(up.stats(), up.outputSchema(), &group_cols, &aggs, budget);
         if (blind) break :routed try partitioned_aggregate.PartitionedAggregate.create(tracked, worker, up, &group_cols, &aggs, partition_dop, .auto);

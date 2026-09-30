@@ -162,6 +162,19 @@ pub const Project = struct {
         return self.upstream.stableData();
     }
 
+    /// `VTable.sampleWidths` through `column_map`.
+    pub fn sampleWidths(self: *Project, widths: []?u32) !void {
+        if (self.probe_fused or widths.len != self.column_map.len) return;
+        const up = try self.allocator.alloc(?u32, self.upstream.outputSchema().len);
+        defer self.allocator.free(up);
+        @memset(up, null);
+        for (self.column_map, widths) |src, w| {
+            if (w != null) up[src] = w;
+        }
+        try self.upstream.sampleWidths(up);
+        for (self.column_map, widths) |src, *w| w.* = up[src];
+    }
+
     /// Stage adoption crosses a projection by permuting each chunk's store
     /// array per `column_map` (dropped columns free, in output order after).
     /// A duplicate source can't share store ownership — decline BEFORE taking
