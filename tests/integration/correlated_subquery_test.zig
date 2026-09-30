@@ -7,6 +7,8 @@
 //! a per-row tuple lookup. The inner FROM may be a table, CTE, view or
 //! derived table, and a column reference binds in the innermost query
 //! whose FROM has it, as SQL scopes names.
+//! A subquery correlated any other way joins its domain, the distinct
+//! outer values it reads (DESIGN.md §6.7).
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -275,7 +277,26 @@ const scope_queries = .{
     .{ "SELECT x.id FROM ex_t x WHERE x.v NOT IN (SELECT y.v FROM ", " WHERE y.id >= x.k - 10 AND y.v IS NOT NULL) ORDER BY x.id", &[_]?i64{ 1, 4 } },
     .{ "SELECT x.id, (SELECT MAX(y.v) FROM ", " WHERE y.id = x.k - 10) AS m FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, null, 2, 2, 3, 7, 4, null, 5, 2 } },
     .{ "SELECT x.id, (SELECT y.v FROM ", " WHERE y.id = x.id * 10) AS v FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 2, 2, 7, 3, null, 4, 2, 5, 9 } },
-    .{ "SELECT x.id, CASE WHEN EXISTS (SELECT 1 FROM ", " WHERE y.id = x.k + 10) THEN 1 ELSE 0 END AS f FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 1, 2, 1, 3, 1, 4, 1, 5, 0 } },
+    .{ "SELECT x.id, CASE WHEN EXISTS (SELECT 1 FROM ", " WHERE y.id = x.k + 10) THEN 1 ELSE 0 END AS f FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 1, 2, 1, 3, 1, 4, 1, 5, 0 } }, // Lifted onto the domain of outer values: a reference two levels out,
+    // correlation under OR, over both rows or by <>, a range-correlated
+    // scalar, and a correlated LIMIT.
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u z WHERE z.id > 15 AND EXISTS (SELECT 1 FROM ", " WHERE y.id = z.id AND y.v = x.v)) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.id > 15 AND EXISTS (SELECT 1 FROM ex_u z WHERE z.id = y.id AND z.v = x.v)) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id, (SELECT COUNT(*) FROM ", " WHERE y.id = x.k + 10 OR y.id = x.k) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 2, 2, 2, 3, 2, 4, 2, 5, 1 } },
+    .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ", " WHERE y.id + x.k = 50) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4 } },
+    .{ "SELECT x.id, (SELECT COUNT(*) FROM ", " WHERE y.id <> x.k AND y.v > x.v) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 2, 2, 1, 3, 0, 4, 1, 5, 1 } },
+    .{ "SELECT x.id FROM ex_t x WHERE x.v = (SELECT MIN(y.v) FROM ", " WHERE y.id > x.k) ORDER BY x.id", &[_]?i64{2} },
+    .{ "SELECT x.id, (SELECT MAX(y.v) FROM ", " WHERE y.id <= x.k) AS m FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 2, 2, 7, 3, 7, 4, 7, 5, 9 } },
+    .{ "SELECT x.id FROM ex_t x WHERE x.v NOT IN (SELECT y.v FROM ", " WHERE y.id <= x.k ORDER BY y.id DESC LIMIT 1) ORDER BY x.id", &[_]?i64{ 1, 2, 4, 5 } },
+    .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT y.v FROM ", " WHERE y.id <> x.k ORDER BY y.id LIMIT 2) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+    .{ "SELECT x.id, (SELECT y.v FROM ", " WHERE y.id <> x.k ORDER BY y.id LIMIT 1 OFFSET 1) AS s FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, null, 2, null, 3, 7, 4, 7, 5, 7 } },
+    .{ "SELECT x.id, (SELECT y.v FROM ", " WHERE y.id <> x.k AND y.v = 9) AS s FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 9, 2, 9, 3, 9, 4, 9, 5, null } },
+    .{ "SELECT x.id FROM ex_t x WHERE x.id < 3 AND x.v NOT IN (SELECT y.v FROM ", " WHERE y.id <> x.k AND y.v IS NOT NULL) ORDER BY x.id", &[_]?i64{1} },
+    .{ "SELECT x.id FROM ex_t x WHERE x.k >= 30 AND x.v < (SELECT MAX(y.v) FROM ", " WHERE y.id <> x.k) ORDER BY x.id", &[_]?i64{ 4, 5 } },
+    // A NULL outer value matches no inner row, yet its outer row still
+    // finds its domain row: a count of 0, or what the outer-only terms give.
+    .{ "SELECT x.id, (SELECT COUNT(*) FROM ", " WHERE y.v = x.v OR y.id < 0) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 2, 3, 0, 4, 1, 5, 2 } },
+    .{ "SELECT x.id, (SELECT COUNT(*) FROM ", " WHERE y.id > 25 AND x.v IS NULL) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 0, 3, 3, 4, 0, 5, 0 } },
 };
 
 test "correlated subqueries over a CTE, view or derived table bind outer references to the outer query" {
@@ -315,7 +336,7 @@ test "correlated subqueries: an inner relation shadows the outer name, and an un
     inline for (cases) |case| try expectCells(allocator, db, case[0], case[1]);
 }
 
-test "correlated subqueries that can't be decorrelated are rejected rather than bound to an inner column" {
+test "correlated subqueries the domain can't carry are rejected rather than bound to an inner column" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -323,12 +344,77 @@ test "correlated subqueries that can't be decorrelated are rejected rather than 
     defer db.close();
 
     const cases = .{
-        "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id > 15 AND EXISTS (SELECT 1 FROM ex_u z WHERE z.id = y.id AND z.v = x.v)) ORDER BY x.id",
-        "WITH y AS (SELECT id, v FROM ex_u) SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM y WHERE y.id > 15 AND EXISTS (SELECT 1 FROM ex_u z WHERE z.id = y.id AND z.v = x.v)) ORDER BY x.id",
-        "SELECT x.id, (SELECT COUNT(*) FROM ex_u y WHERE y.id = x.k + 10 OR y.id = x.k) AS n FROM ex_t x ORDER BY x.id",
-        "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT id FROM ex_u) y WHERE y.id + x.k = 60) ORDER BY x.id",
+        "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT id FROM ex_u WHERE ex_u.id > x.k) y) ORDER BY x.id",
+        "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT * FROM (SELECT v FROM ex_u) y WHERE y.v <> x.v) ORDER BY x.id",
+        "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT MAX(y.v) FROM ex_u y WHERE y.id <> x.k) ORDER BY x.id",
+        "SELECT x.id, (SELECT SUM(x.v) FROM ex_u y WHERE y.id <> x.k) AS s FROM ex_t x ORDER BY x.id",
     };
     inline for (cases) |sql| try helpers.expectRunError(allocator, db, sql, error.UnsupportedCorrelatedSubquery);
+}
+
+test "correlated NOT IN lifted onto its domain skips NULLs in the set as the keyed paths do" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Each pair asks one question through a keyed path and through the
+    // domain. id 2's set is {NULL} and id 1's holds a NULL: a skipped NULL
+    // keeps the row. A NULL outer value is never NOT IN, even an empty set.
+    const pairs = .{
+        .{ "y.id = x.k + 10", "y.id - x.k = 10", &[_]?i64{ 1, 2, 4, 5 } },
+        .{ "y.id >= x.k", "y.id - x.k >= 0", &[_]?i64{ 1, 4, 5 } },
+        .{ "y.id = x.k + 30", "y.id - x.k = 30", &[_]?i64{ 1, 2, 4, 5 } },
+    };
+    inline for (pairs) |pair| {
+        inline for (.{ pair[0], pair[1] }) |corr| {
+            try expectCells(allocator, db, "SELECT x.id FROM ex_t x WHERE x.v NOT IN (SELECT y.v FROM ex_u y WHERE " ++ corr ++ ") ORDER BY x.id", pair[2]);
+        }
+    }
+}
+
+test "correlated scalar lifted onto its domain fails an outer row whose value matches several rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Only id 5 passes the other conjunct, and its value matches one row.
+    try expectCells(allocator, db, "SELECT x.id FROM ex_t x WHERE x.id = 5 AND x.v = (SELECT y.v FROM ex_u y WHERE y.id <> x.k AND y.id > 30)", &.{5});
+
+    var q = try runSql(allocator, db, "SELECT x.id, (SELECT y.v FROM ex_u y WHERE y.id <> x.k) AS s FROM ex_t x");
+    defer q.deinit();
+    while (q.next()) |batch| {
+        if (batch == null) return error.TestUnexpectedSuccess;
+    } else |err| try std.testing.expectEqual(error.SubqueryMultipleRows, err);
+}
+
+test "correlated subqueries keyed by an outer expression in DELETE, UPDATE and a join's ON" {
+    const allocator = std.testing.allocator;
+    const cases = .{
+        .{ "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 10)", &[_]?i64{ 5, 2 } },
+        .{ "UPDATE ex_t SET v = 0 WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 10 AND y.v > 2)", &[_]?i64{ 1, 0, 2, 2, 3, null, 4, 0, 5, 2 } },
+        .{ "DELETE FROM ex_t WHERE ex_t.v IN (SELECT y.v FROM (SELECT id, v FROM ex_u) y WHERE y.id = ex_t.k * 2)", &[_]?i64{ 1, 5, 3, null, 4, 7, 5, 2 } },
+    };
+    inline for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+        defer db.close();
+        try exec(allocator, db, case[0]);
+        try expectCells(allocator, db, "SELECT id, v FROM ex_t ORDER BY id", case[1]);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try expectCells(allocator, db,
+        \\SELECT x.id, z.id AS zid FROM ex_t x LEFT JOIN ex_u z
+        \\  ON z.v = x.v AND EXISTS (SELECT 1 FROM ex_u y WHERE y.id = x.k + 10) ORDER BY x.id, zid
+    , &.{ 1, null, 2, 10, 2, 40, 3, null, 4, 20, 5, null });
 }
 
 test "correlated scalar over a CTE that shadows its table, keyed by an expression over the outer row" {

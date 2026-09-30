@@ -975,6 +975,66 @@ the limit is fixed, as thinDB has no session variable for it. A recursive CTE
 is compiled at run time, so it can't be encoded for the native protocol or an
 XA branch.
 
+### 6.7 Correlated subqueries
+
+A correlated subquery is rewritten before execution onto operators the
+engine already has (`src/net/subquery_resolve.zig`); nothing runs it again
+per outer row. Its names bind as SQL scopes them (§9.8), and the ones it
+reads from enclosing queries, one level out or more, are its correlation.
+Two strategies apply, the first that fits.
+
+Keyed. When the subquery's WHERE ties its own columns to enclosing values
+only by equalities (`inner = outer`) and ranges (`inner < outer`), its inner
+block runs once without those terms and projects their inner sides. The
+outer side may be an expression over the outer row (`y.id = x.k + 10`),
+which the enclosing operator computes first. EXISTS, IN and a single
+aggregate compared in a WHERE become a lookup each outer row probes with its
+own values; any other scalar is grouped by its keys and LEFT JOINed back.
+This is the only strategy for a DELETE or UPDATE predicate and a join's ON,
+which have no input rows to join a result back to.
+
+Domain. Any other correlated subquery in a filter or an expression is lifted
+onto its domain: the distinct combinations of the enclosing values it reads,
+drawn from the rows the enclosing operator reads. The subquery's FROM joins
+the domain. A WHERE conjunct comparing a FROM column with a domain value by
+`=` becomes a hash key, and one by `<`, `<=`, `>` or `>=` a range; every
+other correlated term (under OR, reading both rows, `<>`) filters the joined
+pairs. Each GROUP BY and window partition also groups by the domain values,
+and a LIMIT keeps its rows per domain row, numbered in the ORDER BY under
+it. The result, keyed by the domain values, is LEFT JOINed back to the
+enclosing operator's rows:
+
+- EXISTS and IN read whether a marker row matched. IN compares its columns
+  with `=`.
+- A scalar aggregate reads its value. An outer row whose domain row reached
+  no inner row reads the aggregate over no rows: COUNT is 0, the others NULL.
+- Any other scalar reads its row through SINGLE_ROW: `SubqueryMultipleRows`
+  for an outer row that matched more than one, NULL for none (§9.8).
+
+In the join with the FROM, a NULL enclosing value compares with plain `=`
+and matches no inner row; the join back matches NULL to NULL, so its outer
+row still finds its domain row (a count of 0, a NULL scalar). NOT IN keeps
+thinDB's IN-set dialect on every path: NULLs among the subquery's values are
+skipped, and a NULL compared value never passes.
+
+The enclosing operator's conjuncts that read no subquery narrow the domain's
+source first. A source cheap and deterministic to run again (a base-table
+scan under filters, projections and computes free of volatile functions such
+as RAND, NOW or UUID, or a buffer already materialized) is replayed to build
+the domain. Any other, such as a join, aggregate or window, is materialized
+once, charged to the statement's memory accountant, and read by both.
+
+A lifted join with neither a key nor a single range (only OR, `<>` or mixed
+terms) runs as a nested loop. It buffers the subquery's FROM rows and the
+domain rows, charged to the accountant (`MemoryBudgetExceeded` past the
+budget), and streams the pairs. The budget bounds those buffers, not the
+pair count: the time is |FROM| × |domain| pairs, about 50–70 million a
+second on one core. The loop checks for cancellation every 65,536 pairs, so
+KILL and a disconnect stop it promptly (§8.3).
+
+A shape neither strategy carries raises `UnsupportedCorrelatedSubquery`
+(§9.8); it is never compiled with an outer name bound to an inner column.
+
 ---
 
 ## 7. Compaction
@@ -1103,7 +1163,7 @@ Worker-side scratch (stage, window and partition arenas, parallel-scan decode bu
 
 A watchdog compares process memory with what the budgets explain: resident memory minus the block cache, the idle scratch pool and all accounted query bytes. It samples at stage boundaries, at every 1/16 of the budget of accounted growth (64 MiB–1 GiB), and at statement end. When the gap passes max(2 GiB, budget/4) it logs one `[mem-watch]` line per statement, naming the statement and PROCESSLIST ids.
 
-Wire handlers reset their cancellation token at statement acceptance, before parsing/compilation. Compilation and eager subqueries share the token with execution. Scans, worker scheduling, sort partitions/passes, regional operations, and merge loops check it cooperatively. `QueryCancelled` unwinds ordinary resource ownership. Polling does not preempt a native UDF callback or an operating-system I/O call; this is cooperative cancellation, not a hard latency guarantee.
+Wire handlers reset their cancellation token at statement acceptance, before parsing/compilation. Compilation and eager subqueries share the token with execution. Scans, worker scheduling, sort partitions/passes, regional operations, nested-loop joins, and merge loops check it cooperatively. `QueryCancelled` unwinds ordinary resource ownership. Polling does not preempt a native UDF callback or an operating-system I/O call; this is cooperative cancellation, not a hard latency guarantee.
 
 The server trips the same token when a client disconnects mid-statement, on either wire. Its connection reaper probes each connection's socket every 5 s, and cancels a statement whose only product is its result set (not a write, DDL or EXPLAIN) once the peer has closed. Writes run to completion, as in MySQL.
 
@@ -1303,7 +1363,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
-`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form thinDB can't decorrelate: a reference two levels out, an outer column outside the WHERE's `inner = outer` and `inner < outer` comparisons (as under OR, or in an expression that also reads the subquery's own columns), a scalar subquery correlated by a range comparison, or a correlated LIMIT inside IN. The outer side of such a comparison may be an expression over the outer row (`y.id = x.k + 10`), which the enclosing query computes for each of its rows. A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. Any other correlated subquery runs once, without its correlations. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
+`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): an enclosing column in the subquery's FROM (a derived table that reads it, as LATERAL would), an aggregate whose argument reads only enclosing columns (`SUM(x.v)` inside the subquery, which SQL aggregates in the enclosing query), a UNION inside the subquery that reads them, or, in a DELETE or UPDATE predicate or a join's ON, a correlation other than equalities and ranges on the subquery's own columns. A subquery correlated some other way also can't use `SELECT *`, or be an IN over an aggregate without GROUP BY. A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 
