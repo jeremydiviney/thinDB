@@ -19,6 +19,12 @@
 //! candidates consume the query budget. Dropped rows' bytes are released
 //! back to the accountant, so memory stays O(keep) regardless of input size.
 //!
+//! Oversized batches: a batch holding more than `keep` rows (a hash
+//! aggregate emits every group in one) is narrowed to its best `keep`
+//! candidates by a bounded heap over row indices before anything is copied,
+//! so memory stays O(keep) and the work O(rows · log keep) whatever the
+//! upstream's batch size.
+//!
 //! The planner fuses `Limit(OrderBy(X))` into a single `TopN(X)` — see
 //! the `.limit` compile path in net/local.zig.
 
@@ -314,8 +320,15 @@ pub const TopN = struct {
     fn drainAndSelect(self: *TopN) !void {
         const acc = self.upstream.accountant();
         const prune_threshold = std.math.mul(usize, self.keep, 2) catch std.math.maxInt(usize);
+        var heap: []u32 = &.{};
+        defer self.allocator.free(heap);
 
         while (try self.upstream.next()) |batch| {
+            if (self.keep > 0 and batch.row_count > self.keep) {
+                if (heap.len == 0) heap = try self.allocator.alloc(u32, self.keep);
+                try self.selectFromBatch(batch, heap, acc);
+                continue;
+            }
             // A pathologically huge LIMIT (keep == maxInt) never prunes —
             // accumulate everything and fall back to a single final sort.
             if (self.keep == 0 or !self.threshold_active) {
@@ -366,6 +379,74 @@ pub const TopN = struct {
         const end = std.math.add(usize, self.offset, self.limit) catch n;
         self.emit_end = @min(end, n);
         self.drained = true;
+    }
+
+    /// Copy in only the rows of a batch holding more than `keep` that can
+    /// still be emitted: its best `keep`, and once a cut line exists only
+    /// those strictly better than it. Copying and sorting the whole batch
+    /// instead made one huge batch cost a full copy and sort (issue #395).
+    /// `heap` holds `keep` row indices, the worst kept one on top.
+    fn selectFromBatch(self: *TopN, batch: Batch, heap: []u32, acc: ?*exec.memory.MemoryAccountant) !void {
+        var len: usize = 0;
+        for (0..batch.row_count) |row| {
+            if (self.threshold_active and !self.isCandidate(batch.values, row, self.worst_idx)) continue;
+            const r: u32 = @intCast(row);
+            if (len < heap.len) {
+                heap[len] = r;
+                self.siftUp(batch.values, heap[0 .. len + 1]);
+                len += 1;
+            } else if (self.batchRowBefore(batch.values, r, heap[0])) {
+                heap[0] = r;
+                self.siftDown(batch.values, heap);
+            }
+        }
+        if (len == 0) return;
+
+        const kept = heap[0..len];
+        std.mem.sort(u32, kept, {}, std.sort.asc(u32));
+        const b = len * self.row_bytes;
+        if (acc) |a| try a.reserve(.topn, b);
+        self.reserved_bytes += b;
+        for (batch.values, 0..) |view, ci| {
+            try engine.memtable.appendByIndices(self.allocator, view, kept, &self.accumulated[ci]);
+        }
+        self.accumulated_rows += len;
+        try self.prune(acc);
+    }
+
+    /// True when batch row `a` sorts strictly before batch row `b`.
+    fn batchRowBefore(self: *TopN, views: []const ColumnView, a: u32, b: u32) bool {
+        for (self.sort_col_indices, 0..) |ci, i| {
+            const ord = engine.transform.compareViewRowsNullsFirst(views[ci], a, views[ci], b);
+            if (ord == .lt) return !self.sort_desc[i];
+            if (ord == .gt) return self.sort_desc[i];
+        }
+        return false;
+    }
+
+    /// Restore the heap after appending its last element.
+    fn siftUp(self: *TopN, views: []const ColumnView, heap: []u32) void {
+        var i = heap.len - 1;
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (!self.batchRowBefore(views, heap[parent], heap[i])) break;
+            std.mem.swap(u32, &heap[parent], &heap[i]);
+            i = parent;
+        }
+    }
+
+    /// Restore the heap after replacing its top.
+    fn siftDown(self: *TopN, views: []const ColumnView, heap: []u32) void {
+        var i: usize = 0;
+        while (true) {
+            const left = 2 * i + 1;
+            if (left >= heap.len) break;
+            const right = left + 1;
+            const worse = if (right < heap.len and self.batchRowBefore(views, heap[left], heap[right])) right else left;
+            if (!self.batchRowBefore(views, heap[i], heap[worse])) break;
+            std.mem.swap(u32, &heap[i], &heap[worse]);
+            i = worse;
+        }
     }
 
     /// Sort the buffer, keep the best `keep` rows, drop the rest — and
