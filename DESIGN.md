@@ -137,6 +137,45 @@ literals (`DATE '2026-01-01'`) and
 INSERT … VALUES keep the strict `YYYY-MM-DD[ hh:mm:ss[.ffffff]]` form, and
 comparisons read text as MySQL does (below).
 
+A DATETIME carries no zone. CONVERT_TZ and FROM_UNIXTIME(n, format, zone)
+read a zone's text with one reader (`exec/time_zone.zig`). It accepts:
+- A fixed offset. That covers MySQL's `+H:MM` from -13:59 to +14:00, and
+  StarRocks' `+h`, `+hh`, `+hhmm`, `+hh:mm`, `+hhmmss` and `+hh:mm:ss` up
+  to 18 hours, bare or after `UTC`, `GMT` or `UT`. It also covers cctz's
+  `Fixed/UTC+hh:mm:ss`, `Z`, `CST` (+08:00, as StarRocks reads it), and
+  `SYSTEM` or `UTC` in any case, since thinDB's clock runs in UTC.
+- A tz database name (`America/New_York`), read from its TZif file (RFC
+  8536) under `TZDIR`, else /usr/share/zoneinfo, where cctz (and so
+  StarRocks) reads it. The file's changes give the offset through its last
+  one, and its footer's POSIX TZ rule gives it after that. A name is
+  `/`-separated parts of letters, digits, `_`, `-`, `+` and `.`, none empty
+  or starting with `.`, so no name leaves the directory. StarRocks also
+  takes `Asia/../Asia/Shanghai`. Whether case matters is up to the file
+  system: on Linux it does, as in StarRocks. A leap-second (`right/`) file,
+  or a footer the reader can't parse, is no zone. Windows has no zone files,
+  so there a name is known only under `TZDIR`. The tests set `TZDIR` to the
+  fixtures in tests/fixtures/zoneinfo, so every platform sees the same zones.
+
+Parsed zones are cached once per process and shared by every database, so a
+tzdata update takes effect when the process restarts. A spin lock guards the
+map only; files are read outside it, and when two threads load one zone at
+once, one copy is kept. Names that are no zone are cached too, up
+to 4096. A kernel remembers the previous row's zone, so a constant zone
+costs one lookup per batch.
+
+A local time that a change skips or repeats reads with the offset in effect
+before the change, as cctz's `pre` does. So 02:30 on New York's
+spring-forward day is 07:30 UTC, and 01:30 on its fall-back day is 05:30
+UTC. A zone the reader doesn't know makes CONVERT_TZ NULL, and FROM_UNIXTIME
+renders it as UTC, as in StarRocks. An empty zone is NULL in both.
+
+CONVERT_TZ converts every value, as StarRocks does. MySQL returns a value
+whose instant is outside 1970-01-01 00:00:01 to 3001-01-18 23:59:59 UTC
+unchanged. A result outside years 0 to 9999 is NULL, where StarRocks gives a
+value it can't print. FROM_UNIXTIME reads a count up to 9999-12-31 23:59:59
+UTC and gives NULL for a local time past that. StarRocks gives NULL for any
+count from 253402243200 on.
+
 Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
 after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
 follow this, so `-0.0` and `0.0` form one group. MIN and MAX skip NaN.

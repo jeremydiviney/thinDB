@@ -1079,6 +1079,155 @@ test "FROM_UNIXTIME(n, format) renders as DATE_FORMAT does and reads its count a
     }
 }
 
+test "FROM_UNIXTIME(n, format, zone) renders local time in a named or fixed zone, as in StarRocks (issue #419)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // StarRocks 4.0's values, from constant-only SELECTs, plain and with the
+    // backend forced, unless a comment says otherwise. Named zones come from
+    // the TZif fixtures under tests/fixtures/zoneinfo (`build.zig` sets TZDIR).
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "1969-12-31 19:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "1970-01-01 08:00:00" },
+        // New York's 2026 spring-forward and fall-back instants, and 1970's.
+        .{ "1772953199, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-03-08 01:59:59" },
+        .{ "1772953200, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-03-08 03:00:00" },
+        .{ "1793512799, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-11-01 01:59:59" },
+        .{ "1793512800, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-11-01 01:00:00" },
+        .{ "9961199, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "1970-04-26 01:59:59" },
+        .{ "9961200, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "1970-04-26 03:00:00" },
+        // The file lists changes through 2037; later ones come from its footer
+        // rule.
+        .{ "2140668000, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2037-11-01 01:00:00" },
+        .{ "2152162800, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2038-03-14 03:00:00" },
+        .{ "2210241600, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2040-01-15 07:00:00" },
+        .{ "2224756800, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2040-07-01 08:00:00" },
+        .{ "4118126400, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2100-07-01 08:00:00" },
+        // A half-hour daylight shift, south of the equator.
+        .{ "1767225600, '%Y-%m-%d %H:%i:%s', 'Australia/Lord_Howe'", "2026-01-01 11:00:00" },
+        .{ "1782000000, '%Y-%m-%d %H:%i:%s', 'Australia/Lord_Howe'", "2026-06-21 10:30:00" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', '+14:00'", "9999-12-31 21:59:59" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "9999-12-31 15:59:59" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "9999-12-31 02:59:59" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', '-14:00'", "9999-12-30 17:59:59" },
+        // StarRocks gives NULL for a count past 253402243199. thinDB reads a
+        // count to the end of its calendar, as the two-argument form does, and
+        // gives NULL for a local time past it.
+        .{ "253402300799, '%Y-%m-%d %H:%i:%s', 'UTC'", "9999-12-31 23:59:59" },
+        .{ "253402300799, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "9999-12-31 18:59:59" },
+        .{ "253402300799, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", null },
+        .{ "-1, '%Y-%m-%d %H:%i:%s', 'UTC'", null },
+        .{ "NULL, '%Y-%m-%d %H:%i:%s', 'UTC'", null },
+        .{ "0, NULL, 'UTC'", null },
+        .{ "0, '%Y-%m-%d %H:%i:%s', NULL", null },
+        .{ "1.5, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "1970-01-01 08:00:01" },
+        .{ "1.7, '%Y-%m-%d %H:%i:%s', 'UTC'", "1970-01-01 00:00:01" },
+        .{ "'100', '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "1970-01-01 08:01:40" },
+        .{ "0, '%Y-%m-%d', 'America/New_York'", "1969-12-31" },
+        .{ "0, '%r %W', 'America/New_York'", "07:00:00 PM Wednesday" },
+        .{ "0, '%f|%T', 'Asia/Shanghai'", "000000|08:00:00" },
+        .{ "0, '', 'Asia/Shanghai'", null },
+        .{ "0, 'x', 'Asia/Shanghai'", "x" },
+        .{ "0, 'yyyy-MM-dd HH:mm:ss', 'Asia/Shanghai'", "1970-01-01 08:00:00" },
+        // Fixed offsets.
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'utc'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Z'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'CST'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:00'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-08:00'", "1969-12-31 16:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+0800'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+1234'", "1970-01-01 12:34:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+8'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+080000'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:00:30'", "1970-01-01 08:00:30" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+05:45'", "1970-01-01 05:45:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+14:01'", "1970-01-01 14:01:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-13:59'", "1969-12-31 10:01:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-14:01'", "1969-12-31 09:59:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+18:00'", "1970-01-01 18:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-18:00'", "1969-12-31 06:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC+8'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC-8'", "1969-12-31 16:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'GMT+18'", "1970-01-01 18:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UT+8'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC+08:00'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Fixed/UTC+08:00:00'", "1970-01-01 08:00:00" },
+        // A zone thinDB doesn't know renders as UTC; an empty one is NULL.
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'bogus'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', ''", null },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'America'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', ' America/New_York'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai '", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai/'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '/Asia/Shanghai'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'cst'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'utc+8'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC0'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+24:00'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+18:01'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '08:00'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08-00'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+123'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+0860'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC+8:00'", "1970-01-01 00:00:00" },
+        // thinDB alone. StarRocks reads `Asia/../Asia/Shanghai` as Shanghai, but
+        // thinDB refuses a name part that starts with `.`, so no name leaves the
+        // zone directory. `+8:00` and `+08:0030` are MySQL's offset spellings,
+        // which StarRocks renders as UTC. StarRocks reads `+08:60` as 09:00.
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/../Asia/Shanghai'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+8:00'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:0030'", "1970-01-01 08:30:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:60'", "1970-01-01 00:00:00" },
+    };
+    for (cases) |c| {
+        inline for (.{ "SELECT FROM_UNIXTIME({s})", "SELECT IF(RAND() < 2, FROM_UNIXTIME({s}), NULL)" }) |shape| {
+            const sql = try std.fmt.allocPrint(allocator, shape, .{c[0]});
+            defer allocator.free(sql);
+            errdefer std.debug.print("failed: {s}\n", .{sql});
+            const got = try helpers.collectStrings(allocator, db, sql);
+            defer helpers.freeStrings(allocator, got);
+            try std.testing.expectEqual(@as(usize, 1), got.len);
+            if (c[1]) |want| {
+                try std.testing.expect(got[0] != null);
+                try std.testing.expectEqualStrings(want, got[0].?);
+            } else try std.testing.expect(got[0] == null);
+        }
+    }
+
+    // A zone and a format per row; a row naming the previous row's zone
+    // reuses it.
+    try exec(allocator, db, "CREATE TABLE fz (id BIGINT PRIMARY KEY, n BIGINT, z VARCHAR(40), f VARCHAR(30))");
+    try exec(allocator, db, "INSERT INTO fz VALUES (1, 1772953200, 'America/New_York', '%Y-%m-%d %H:%i:%s'), " ++
+        "(2, 1793512800, 'America/New_York', NULL), (3, 1793512800, 'America/New_York', '%Y-%m-%d %H:%i:%s'), " ++
+        "(4, 0, 'Asia/Shanghai', '%Y-%m-%d %H:%i:%s'), (5, 0, 'bogus', '%Y-%m-%d %H:%i:%s'), (6, 0, '', '%Y-%m-%d %H:%i:%s'), " ++
+        "(7, 0, NULL, '%Y-%m-%d %H:%i:%s'), (8, 1782000000, 'Australia/Lord_Howe', '%Y-%m-%d %H:%i:%s'), (9, 0, '+05:45', '%H:%i'), " ++
+        "(10, NULL, 'UTC', '%Y-%m-%d %H:%i:%s')");
+    const column_cases = [_]struct { []const u8, [10]?[]const u8 }{
+        .{ "FROM_UNIXTIME(n, f, z)", .{ "2026-03-08 03:00:00", null, "2026-11-01 01:00:00", "1970-01-01 08:00:00", "1970-01-01 00:00:00", null, null, "2026-06-21 10:30:00", "05:45", null } },
+        .{ "FROM_UNIXTIME(n, '%Y-%m-%d %H:%i:%s', z)", .{ "2026-03-08 03:00:00", "2026-11-01 01:00:00", "2026-11-01 01:00:00", "1970-01-01 08:00:00", "1970-01-01 00:00:00", null, null, "2026-06-21 10:30:00", "1970-01-01 05:45:00", null } },
+        .{ "FROM_UNIXTIME(n, '%H:%i', 'America/New_York')", .{ "03:00", "01:00", "01:00", "19:00", "19:00", "19:00", "19:00", "20:00", "19:00", null } },
+    };
+    for (column_cases) |c| {
+        const sql = try std.fmt.allocPrint(allocator, "SELECT {s} FROM fz ORDER BY id", .{c[0]});
+        defer allocator.free(sql);
+        errdefer std.debug.print("failed: {s}\n", .{sql});
+        const got = try helpers.collectStrings(allocator, db, sql);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, g| {
+            if (want) |text| {
+                try std.testing.expect(g != null);
+                try std.testing.expectEqualStrings(text, g.?);
+            } else try std.testing.expect(g == null);
+        }
+    }
+}
+
 test "DATE_FORMAT, STR_TO_DATE and the week functions match MySQL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

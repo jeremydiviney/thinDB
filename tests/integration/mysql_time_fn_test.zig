@@ -134,11 +134,12 @@ test "MySQL date and TIME functions over constants" {
         .{ "TIMEDIFF(DATE '2026-01-02', DATE '2026-01-01')", "24:00:00" },
         .{ "CONVERT_TZ('2026-01-01 00:00:00', '+00:00', '+05:30')", "2026-01-01 05:30:00" },
         .{ "CONVERT_TZ('2026-01-01 00:00:00', '+05:30', '-08:00')", "2025-12-31 10:30:00" },
-        .{ "CONVERT_TZ('2026-01-01 00:00:00', '+00:00', '+14:01')", null },
-        .{ "CONVERT_TZ('1970-01-01 00:00:00', '+00:00', '+01:00')", "1970-01-01 00:00:00" },
-        // A MySQL without time zone tables knows no named zone; thinDB also
-        // knows UTC.
-        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'Europe/Paris', '+00:00')", null },
+        // StarRocks: MySQL's offsets end at +14:00.
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', '+00:00', '+14:01')", "2026-01-01 14:01:00" },
+        .{ "CONVERT_TZ('1970-01-01 00:00:00', '+00:00', '+01:00')", "1970-01-01 01:00:00" },
+        // A zone thinDB doesn't know is NULL, as in StarRocks and in a MySQL
+        // without time zone tables.
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'Mars/Olympus_Mons', '+00:00')", null },
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+01:00')", "2026-01-01 01:00:00" },
         .{ "EXTRACT(YEAR_MONTH FROM '2026-09-26 10:05:03')", "202609" },
         .{ "EXTRACT(YEAR_MONTH FROM DATE '2026-09-26')", "202609" },
@@ -235,6 +236,113 @@ test "MySQL date and TIME functions over columns" {
     inline for (cases) |c| {
         const want: [3]?[]const u8 = c[1];
         try expectText(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM tm ORDER BY id", &want);
+    }
+}
+
+test "CONVERT_TZ reads named zones with their daylight rules, as StarRocks does (issue #419)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // StarRocks 4.0's values, from constant-only SELECTs, plain and with the
+    // backend forced, unless a comment says otherwise.
+    const cases = .{
+        // Named zones, read from the TZif fixtures under tests/fixtures/zoneinfo.
+        .{ "CONVERT_TZ('2026-07-01 12:00:00', 'UTC', 'America/New_York')", "2026-07-01 08:00:00" },
+        .{ "CONVERT_TZ('2026-07-01 12:00:00', 'America/New_York', 'Asia/Shanghai')", "2026-07-02 00:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'Australia/Lord_Howe')", "2026-01-01 11:00:00" },
+        .{ "CONVERT_TZ('2040-07-01 12:00:00', 'UTC', 'America/New_York')", "2040-07-01 08:00:00" },
+        // A local time the spring-forward skips, or the fall-back repeats, reads
+        // with the offset before the change.
+        .{ "CONVERT_TZ('2026-03-08 02:00:00', 'America/New_York', 'UTC')", "2026-03-08 07:00:00" },
+        .{ "CONVERT_TZ('2026-03-08 02:30:00', 'America/New_York', 'UTC')", "2026-03-08 07:30:00" },
+        .{ "CONVERT_TZ('2026-03-08 03:00:00', 'America/New_York', 'UTC')", "2026-03-08 07:00:00" },
+        .{ "CONVERT_TZ('2026-11-01 01:00:00', 'America/New_York', 'UTC')", "2026-11-01 05:00:00" },
+        .{ "CONVERT_TZ('2026-11-01 01:30:00', 'America/New_York', 'UTC')", "2026-11-01 05:30:00" },
+        .{ "CONVERT_TZ('2026-11-01 02:00:00', 'America/New_York', 'UTC')", "2026-11-01 07:00:00" },
+        .{ "CONVERT_TZ('2026-11-01 05:30:00', 'UTC', 'America/New_York')", "2026-11-01 01:30:00" },
+        .{ "CONVERT_TZ('2026-11-01 06:30:00', 'UTC', 'America/New_York')", "2026-11-01 01:30:00" },
+        .{ "CONVERT_TZ('1969-12-31 20:00:00', 'America/New_York', 'UTC')", "1970-01-01 01:00:00" },
+        // Every instant converts, where MySQL returns a value outside
+        // 1970-01-01 00:00:01 to 3001-01-18 23:59:59 UTC unchanged. Before a
+        // zone's first change, its local mean time holds.
+        .{ "CONVERT_TZ('1970-01-01 00:00:00', 'UTC', 'America/New_York')", "1969-12-31 19:00:00" },
+        .{ "CONVERT_TZ('1970-01-01 00:00:00', 'UTC', '+08:00')", "1970-01-01 08:00:00" },
+        .{ "CONVERT_TZ('1969-12-31 23:59:59', 'UTC', '+00:00')", "1969-12-31 23:59:59" },
+        .{ "CONVERT_TZ('1960-01-01 00:00:00', 'UTC', 'America/New_York')", "1959-12-31 19:00:00" },
+        .{ "CONVERT_TZ('1960-07-01 12:00:00', 'UTC', 'America/New_York')", "1960-07-01 08:00:00" },
+        .{ "CONVERT_TZ('1960-07-01 08:00:00', 'America/New_York', 'UTC')", "1960-07-01 12:00:00" },
+        .{ "CONVERT_TZ('1900-01-01 12:00:00', 'UTC', 'America/New_York')", "1900-01-01 07:00:00" },
+        .{ "CONVERT_TZ('1900-01-01 12:00:00', 'UTC', 'Asia/Shanghai')", "1900-01-01 20:05:43" },
+        .{ "CONVERT_TZ('1900-01-01 12:00:00', 'Asia/Shanghai', 'UTC')", "1900-01-01 03:54:17" },
+        .{ "CONVERT_TZ('1000-03-01 00:00:00', 'Australia/Lord_Howe', 'UTC')", "1000-02-28 13:23:40" },
+        .{ "CONVERT_TZ('0001-01-01 00:00:00', 'UTC', 'America/New_York')", "0000-12-31 19:03:58" },
+        .{ "CONVERT_TZ('0000-01-01 10:00:00', 'UTC', 'America/New_York')", "0000-01-01 05:03:58" },
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', 'America/New_York', 'UTC')", "0000-01-01 04:56:02" },
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', 'UTC', '+08:00')", "0000-01-01 08:00:00" },
+        .{ "CONVERT_TZ('3001-01-19 00:00:00', 'UTC', '+08:00')", "3001-01-19 08:00:00" },
+        .{ "CONVERT_TZ('3001-01-19 00:00:00', 'UTC', 'America/New_York')", "3001-01-18 19:00:00" },
+        .{ "CONVERT_TZ('3001-07-01 12:00:00', 'UTC', 'America/New_York')", "3001-07-01 08:00:00" },
+        .{ "CONVERT_TZ('9999-07-01 12:00:00', 'UTC', 'America/New_York')", "9999-07-01 08:00:00" },
+        .{ "CONVERT_TZ('9999-12-31 23:00:00', '+08:00', 'UTC')", "9999-12-31 15:00:00" },
+        // Fixed offsets MySQL doesn't read.
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'CST')", "2026-01-01 08:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'Z', 'Asia/Shanghai')", "2026-01-01 08:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+0830')", "2026-01-01 08:30:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+08:00:00')", "2026-01-01 08:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+15:00')", "2026-01-01 15:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '-18:00')", "2025-12-31 06:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'UTC+8')", "2026-01-01 08:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'GMT-8')", "2025-12-31 16:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'Fixed/UTC+08:00:00')", "2026-01-01 08:00:00" },
+        // Zones thinDB doesn't know, and an empty one.
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'bogus')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'bogus', 'UTC')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'bogus', 'Asia/Shanghai')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'America')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'Asia/Shanghai ')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '/Asia/Shanghai')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'cst')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+24:00')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '08:00')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+0860')", null },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'UTC+8:00')", null },
+        // thinDB alone. StarRocks gives NULL for MySQL's `SYSTEM`, `utc` and
+        // `+8:00`.
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'SYSTEM', 'Asia/Shanghai')", "2026-01-01 08:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'utc', 'Asia/Shanghai')", "2026-01-01 08:00:00" },
+        .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+8:00')", "2026-01-01 08:00:00" },
+        // A result outside years 0-9999 is NULL, where StarRocks gives a value
+        // it can't print (`C601-07-16 19:03:58`, `:000-01-01 07:00:00`).
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', 'UTC', 'America/New_York')", null },
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', '+08:00', 'UTC')", null },
+        .{ "CONVERT_TZ('9999-12-31 23:00:00', 'UTC', '+08:00')", null },
+        .{ "CONVERT_TZ('9999-12-31 20:00:00', 'America/New_York', 'UTC')", null },
+    };
+    inline for (cases) |c| {
+        try expectText(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
+        try expectText(allocator, db, "SELECT CAST(IF(RAND() < 2, " ++ c[0] ++ ", NULL) AS CHAR)", &.{c[1]});
+    }
+
+    // A zone per row; a row naming the previous row's zone reuses it.
+    try exec(allocator, db, "CREATE TABLE cz (id BIGINT PRIMARY KEY, ts DATETIME, z VARCHAR(40))");
+    try exec(allocator, db,
+        \\INSERT INTO cz VALUES (1, '2026-03-08 02:30:00', 'America/New_York'), (2, '2026-11-01 01:30:00', 'America/New_York'),
+        \\  (3, '2026-07-01 12:00:00', 'Asia/Shanghai'), (4, '2026-01-01 00:00:00', 'bogus'), (5, '2026-01-01 00:00:00', NULL),
+        \\  (6, '2026-01-01 00:00:00.5', '+05:45'), (7, NULL, 'UTC')
+    );
+    const column_cases = .{
+        .{ "CONVERT_TZ(ts, z, 'UTC')", .{ "2026-03-08 07:30:00", "2026-11-01 05:30:00", "2026-07-01 04:00:00", null, null, "2025-12-31 18:15:00.500000", null } },
+        .{ "CONVERT_TZ(ts, 'UTC', z)", .{ "2026-03-07 21:30:00", "2026-10-31 21:30:00", "2026-07-01 20:00:00", null, null, "2026-01-01 05:45:00.500000", null } },
+        .{ "CONVERT_TZ(ts, 'America/New_York', 'Asia/Shanghai')", .{ "2026-03-08 15:30:00", "2026-11-01 13:30:00", "2026-07-02 00:00:00", "2026-01-01 13:00:00", "2026-01-01 13:00:00", "2026-01-01 13:00:00.500000", null } },
+    };
+    inline for (column_cases) |c| {
+        const want: [7]?[]const u8 = c[1];
+        try expectText(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM cz ORDER BY id", &want);
     }
 }
 
