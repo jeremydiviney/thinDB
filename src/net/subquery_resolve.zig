@@ -75,9 +75,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value, null),
         .delete_op => |*d| {
             if (d.source) |s| try resolveSubqueriesInOp(ctx, s);
-            for (d.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
-            const pred = d.predicate orelse return;
-            switch (try resolveDmlPredicate(ctx, d.table, pred, d.derived)) {
+            switch (try resolveDmlPredicate(ctx, d.table, d.predicate, d.derived, &.{})) {
                 .in_place => |p| {
                     d.predicate = p.predicate;
                     d.derived = p.derived;
@@ -91,11 +89,14 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
             }
         },
         .update_op => |*u| {
-            if (u.source) |s| try resolveSubqueriesInOp(ctx, s);
-            for (u.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
-            for (u.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
-            const pred = u.predicate orelse return;
-            switch (try resolveDmlPredicate(ctx, u.table, pred, u.derived)) {
+            // A multi-table UPDATE's values read its joined rows, not the
+            // target's alone.
+            const values = if (u.source) |s| blk: {
+                try resolveSubqueriesInOp(ctx, s);
+                for (u.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
+                break :blk &.{};
+            } else u.assignments;
+            switch (try resolveDmlPredicate(ctx, u.table, u.predicate, u.derived, values)) {
                 .in_place => |p| {
                     u.predicate = p.predicate;
                     u.derived = p.derived;
@@ -730,6 +731,20 @@ const Scope = struct {
         for (self.derived) |name| if (types.columnNameEql(name, ref)) return false;
         return self.binds(ref);
     }
+
+    /// The scope of the operators above a select, where its output names
+    /// bind too. An item named by its text reads like a qualified column
+    /// (`x.k + z.id` as column `k + z.id` of `x`), so only its select
+    /// tells it apart.
+    fn above(self: Scope, na: Allocator, p: ir.Op.Project) Allocator.Error!Scope {
+        const outputs = p.outputs orelse return self;
+        var derived: std.ArrayList([]const u8) = .empty;
+        try derived.appendSlice(na, self.derived);
+        for (outputs) |output| if (output) |o| try derived.append(na, o);
+        var copy = self;
+        copy.derived = derived.items;
+        return copy;
+    }
 };
 
 /// The relation name that ends a qualifier (`db.t` → `t`).
@@ -1049,7 +1064,13 @@ fn requireOwnScope(ctx: *CompileCtx, op: *const ir.Op, depth: u32) ScopeError!vo
     }
     const block = try splitBlock(ctx, op);
     var sides: RefSides = .{ .scope = try ScopeBuilder.build(ctx, block, false), .qualified_only = true };
-    for (block.chain) |o| sides.readOp(o);
+    var i = block.chain.len;
+    while (i > 0) {
+        i -= 1;
+        const o = block.chain[i];
+        sides.readOp(o);
+        if (o.* == .select) sides.scope = try sides.scope.above(ctx.nodeArena(), o.select);
+    }
     if (sides.outer) return error.UnsupportedCorrelatedSubquery;
     try requireRelationScope(ctx, block.from, depth + 1);
 }
@@ -2224,7 +2245,7 @@ fn lowerConjuncts(ctx: *CompileCtx, input: *ir.Op, pred: PredicateExpr, late_sca
 /// A DELETE's or UPDATE's predicate resolved against the target's rows.
 const DmlPredicate = union(enum) {
     /// Keyed lookups only: the statement filters its own scan as before.
-    in_place: struct { predicate: PredicateExpr, derived: []const ir.Derived },
+    in_place: struct { predicate: ?PredicateExpr, derived: []const ir.Derived },
     /// A subquery lowered to joins: the statement writes the rows these
     /// select, found again by the target's key.
     rows: DmlRows,
@@ -2239,22 +2260,136 @@ const DmlRows = struct {
 /// Keyed paths resolve first, so a predicate they take keeps its plan.
 /// One a subquery lowers to joins needs a key to find each row it selects:
 /// without one there's no sound row identity, and the statement fails as
-/// unsupported.
-fn resolveDmlPredicate(ctx: *CompileCtx, table: ir.TableRef, pred: PredicateExpr, derived: []const ir.Derived) !DmlPredicate {
+/// unsupported. The values the predicate computes first, and those an
+/// UPDATE assigns (`values`), read the target's rows as their domain, as a
+/// filter's computes read its input.
+fn resolveDmlPredicate(ctx: *CompileCtx, table: ir.TableRef, pred: ?PredicateExpr, derived: []const ir.Derived, values: []const ir.Assignment) !DmlPredicate {
     const na = ctx.nodeArena();
+    const swapped: SwappedComparisons = if (pred) |p| try swapSubqueryComparisons(ctx, p, derived) else .{ .predicate = .{ .always = true }, .derived = derived };
     var input = try newOp(ctx, .{ .scan = .{ .table = table, .alias = table.name } });
-    if (derived.len > 0) input = try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = input } });
-    const resolved = try lowerConjuncts(ctx, input, pred, true);
+    var computed: LoweredScalars = .{ .domain = .{ .input = input } };
+    for (swapped.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), &computed);
+    for (values) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), &computed);
+    if (computed.any()) input = try joinLoweredScalars(ctx, computed.domain.?.operatorInput(), computed);
+    if (swapped.derived.len > 0) input = try newOp(ctx, .{ .compute = .{ .derived = swapped.derived, .upstream = input } });
+    const resolved = try lowerConjuncts(ctx, input, swapped.predicate, true);
     const lowered = resolved.lowered;
-    if (lowered.joins.items.len == 0) return .{ .in_place = .{
-        .predicate = try conjunction(ctx, resolved.conjuncts),
-        .derived = if (lowered.outer_values.items.len == 0) derived else try std.mem.concat(na, ir.Derived, &.{ derived, lowered.outer_values.items }),
+    if (lowered.joins.items.len == 0 and !computed.any()) return .{ .in_place = .{
+        .predicate = if (pred == null) null else try conjunction(ctx, resolved.conjuncts),
+        .derived = if (lowered.outer_values.items.len == 0) swapped.derived else try std.mem.concat(na, ir.Derived, &.{ swapped.derived, lowered.outer_values.items }),
     } };
     const t = try local.resolveTable(ctx.catalog, ctx.session.*, table);
     if (!t.schema.unique) return error.UnsupportedCorrelatedSubquery;
     const columns = try na.alloc([]const u8, t.schema.columns.len);
     for (t.schema.columns, columns) |col, *name| name.* = try std.fmt.allocPrint(na, "{s}.{s}", .{ table.name, col.name });
-    return .{ .rows = .{ .rows = try resolved.filteredRows(ctx), .table = table, .columns = columns } };
+    const rows = if (lowered.any())
+        try resolved.filteredRows(ctx)
+    else
+        try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, resolved.conjuncts), .upstream = input } });
+    return .{ .rows = .{ .rows = rows, .table = table, .columns = columns } };
+}
+
+const SwappedComparisons = struct {
+    predicate: PredicateExpr,
+    derived: []const ir.Derived,
+};
+
+/// A statement's predicate with each comparison that reads a correlated
+/// scalar subquery the statement computes as a value first (`(SELECT ...) =
+/// 1`) spelled `1 = (SELECT ...)`, as the parser spells the subquery on the
+/// right: the keyed path then filters in place on any target, as it does
+/// that order. A literal operand becomes a value the comparison reads. A
+/// subquery value read any other way stays computed.
+fn swapSubqueryComparisons(ctx: *CompileCtx, pred: PredicateExpr, derived: []const ir.Derived) !SwappedComparisons {
+    const na = ctx.nodeArena();
+    var swap: ComparisonSwap = .{ .ctx = ctx, .derived = derived };
+    const out = try swap.predicate(pred);
+    if (swap.swapped.items.len == 0) return .{ .predicate = pred, .derived = derived };
+    var reads: std.ArrayListUnmanaged([]const u8) = .empty;
+    try exec.predicate.collectColumnNames(na, &reads, out);
+    var kept: std.ArrayList(ir.Derived) = .empty;
+    for (derived) |d| {
+        const unread = listed(swap.swapped.items, d.name) and !listed(reads.items, d.name) and !derivedReads(derived, d.name);
+        if (!unread) try kept.append(na, d);
+    }
+    try kept.appendSlice(na, swap.literals.items);
+    return .{ .predicate = out, .derived = kept.items };
+}
+
+const ComparisonSwap = struct {
+    ctx: *CompileCtx,
+    derived: []const ir.Derived,
+    swapped: std.ArrayList([]const u8) = .empty,
+    literals: std.ArrayList(ir.Derived) = .empty,
+
+    fn predicate(self: *ComparisonSwap, pred: PredicateExpr) !PredicateExpr {
+        const na = self.ctx.nodeArena();
+        switch (pred) {
+            .leaf => |l| {
+                if (l.as_boolean) return pred;
+                const source = (try self.subqueryOf(l.col)) orelse return pred;
+                const name = try std.fmt.allocPrint(na, "__csq_lit{d}", .{self.ctx.lowered_scalars});
+                self.ctx.lowered_scalars += 1;
+                try self.literals.append(na, .{ .name = name, .expr = .{ .lit = l.val } });
+                return .{ .scalar_subquery = .{ .col = name, .op = flipRangeOp(l.op), .source = source } };
+            },
+            .leaf_col_col => |c| {
+                const left = try self.subqueryOf(c.left);
+                const right = try self.subqueryOf(c.right);
+                if (left != null and right != null) return pred;
+                if (right) |source| return .{ .scalar_subquery = .{ .col = c.left, .op = c.op, .source = source } };
+                if (left) |source| return .{ .scalar_subquery = .{ .col = c.right, .op = flipRangeOp(c.op), .source = source } };
+                return pred;
+            },
+            .@"and", .@"or" => |children| {
+                const copies = try na.alloc(PredicateExpr, children.len);
+                for (children, copies) |child, *dst| dst.* = try self.predicate(child);
+                return if (pred == .@"and") .{ .@"and" = copies } else .{ .@"or" = copies };
+            },
+            .not => |child| {
+                const copy = try na.create(PredicateExpr);
+                copy.* = try self.predicate(child.*);
+                return .{ .not = copy };
+            },
+            else => return pred,
+        }
+    }
+
+    /// The subquery a correlated scalar value named `name` holds alone.
+    fn subqueryOf(self: *ComparisonSwap, name: []const u8) !?*const anyopaque {
+        for (self.derived) |d| {
+            if (!types.columnNameEql(d.name, name)) continue;
+            const source = switch (d.expr) {
+                .scalar_subquery => |s| s,
+                else => return null,
+            };
+            if (!try readsFree(self.ctx, @ptrCast(@alignCast(source)))) return null;
+            try self.swapped.append(self.ctx.nodeArena(), d.name);
+            return source;
+        }
+        return null;
+    }
+};
+
+/// Whether any of `derived` reads `name`.
+fn derivedReads(derived: []const ir.Derived, name: []const u8) bool {
+    for (derived) |d| if (exprReadsName(d.expr, name)) return true;
+    return false;
+}
+
+fn exprReadsName(e: ir.Expr, name: []const u8) bool {
+    return switch (e) {
+        .col_ref => |ref| types.columnNameEql(ref, name),
+        .lit, .null_lit, .var_ref, .scalar_subquery, .exists_subquery => false,
+        .call => |c| for (c.args) |arg| {
+            if (exprReadsName(arg, name)) break true;
+        } else false,
+        .case => |cs| {
+            for (cs.operands) |o| if (exprReadsName(o.expr, name)) return true;
+            for (cs.branches) |br| if (exec.predicate.touchesColumn(br.cond, name) or exprReadsName(br.then, name)) return true;
+            return if (cs.else_branch) |eb| exprReadsName(eb.*, name) else false;
+        },
+    };
 }
 
 /// The SELECT a statement over `rows` writes from: every target column,
@@ -2851,8 +2986,22 @@ const FreeNames = struct {
                     if (try expandStars(self.ctx, p.*)) |expanded| p.* = expanded else self.stars += 1;
                 }
                 const columns = try na.alloc([]const u8, p.columns.len);
-                for (p.columns, columns) |col, *dst| dst.* = if (isStar(col)) col else try self.readName(col);
+                var outputs: ?[]?[]const u8 = null;
+                for (p.columns, columns, 0..) |col, *dst, i| {
+                    dst.* = if (isStar(col)) col else try self.readName(col);
+                    if (std.mem.eql(u8, dst.*, col) or outputName(p.*, i) != null) continue;
+                    // An item that returns an enclosing column keeps that
+                    // column's name, not the domain column's it now reads.
+                    const named = outputs orelse blk: {
+                        const kept = try na.alloc(?[]const u8, p.columns.len);
+                        for (kept, 0..) |*output, j| output.* = outputName(p.*, j);
+                        outputs = kept;
+                        break :blk kept;
+                    };
+                    named[i] = referenceName(p.*, i);
+                }
                 p.columns = columns;
+                if (outputs) |named| p.outputs = named;
                 try self.bindOutputs(p.*);
             },
             .order_by => |*ob| {
@@ -2907,15 +3056,9 @@ const FreeNames = struct {
         return try newOp(self.ctx, copy);
     }
 
-    /// A select's output names bind in the operators above it.
     fn bindOutputs(self: *FreeNames, p: ir.Op.Project) !void {
-        const outputs = p.outputs orelse return;
-        const na = self.ctx.nodeArena();
         const scope = &self.scopes.items[self.scopes.items.len - 1];
-        var derived: std.ArrayList([]const u8) = .empty;
-        try derived.appendSlice(na, scope.derived);
-        for (outputs) |output| if (output) |o| try derived.append(na, o);
-        scope.derived = derived.items;
+        scope.* = try scope.above(self.ctx.nodeArena(), p);
     }
 };
 
@@ -3372,6 +3515,23 @@ fn keptByGrouping(g: ir.Op.GroupBy, name: []const u8) bool {
     for (g.group_cols) |col| if (sameColumn(col, name)) return true;
     for (g.aggs) |a| if (types.columnNameEql(a.as, name)) return true;
     return false;
+}
+
+/// The name a select gives item `i`, a column reference without an output
+/// name, as its compile does: the bare column, or the reference as written
+/// where another item's name is that bare column too.
+fn referenceName(p: ir.Op.Project, i: usize) []const u8 {
+    const bare = types.unqualifiedName(p.columns[i]);
+    for (p.columns, 0..) |other, j| {
+        if (j == i or isStar(other)) continue;
+        if (types.columnNameEql(outputName(p, j) orelse types.unqualifiedName(other), bare)) return p.columns[i];
+    }
+    return bare;
+}
+
+fn outputName(p: ir.Op.Project, i: usize) ?[]const u8 {
+    const outputs = p.outputs orelse return null;
+    return if (i < outputs.len) outputs[i] else null;
 }
 
 /// Whether a select without stars projects `name`.
