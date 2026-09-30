@@ -267,3 +267,161 @@ test "narrow MAX_BY / MAX_BY_KEY / ANY_VALUE / FIRST cells match the wide path a
     }
     try std.testing.expectEqual(GROUPS, groups_seen);
 }
+
+const improving_schema = [_]Column{
+    .{ .name = "g", .type = .int, .nullable = false },
+    .{ .name = "run", .type = .int, .nullable = false },
+    .{ .name = "o", .type = .bigint, .nullable = false },
+    .{ .name = "f", .type = .double, .nullable = false },
+    .{ .name = "up", .type = .string, .nullable = false },
+    .{ .name = "down", .type = .string, .nullable = false },
+};
+
+const IMPROVING_GROUPS: usize = 38;
+const IMPROVING_RUNS: usize = 4;
+const IMPROVING_BATCH: usize = 4096;
+
+/// Row `i` of `rows` rows, with every order key and `up` ascending and
+/// `down` descending, so each row improves its group's MAX_BY, MAX, MIN and
+/// LAST. The strings' lengths wander between 9 and 57 bytes, so a group's
+/// successive copies change size.
+fn improvingString(buf: []u8, n: usize, i: usize) ![]const u8 {
+    const pad = "x" ** 48;
+    return std.fmt.bufPrint(buf, "{d:0>9}{s}", .{ n, pad[0 .. (i * 7) % 49] });
+}
+
+const ImprovingSource = struct {
+    allocator: std.mem.Allocator,
+    rows: usize,
+    scratch: [improving_schema.len]ColumnStore,
+    views: [improving_schema.len]ColumnView = undefined,
+    pos: usize = 0,
+
+    fn init(a: std.mem.Allocator, rows: usize) !ImprovingSource {
+        var self = ImprovingSource{ .allocator = a, .rows = rows, .scratch = undefined };
+        var inited: usize = 0;
+        errdefer for (self.scratch[0..inited]) |*c| c.deinit(a);
+        for (&self.scratch, improving_schema) |*c, col| {
+            c.* = try ColumnStore.init(a, col.type, col.nullable);
+            inited += 1;
+        }
+        return self;
+    }
+
+    pub fn next(self: *ImprovingSource) !?Batch {
+        if (self.pos >= self.rows) return null;
+        const hi = @min(self.rows, self.pos + IMPROVING_BATCH);
+        for (&self.scratch) |*c| c.clear();
+        var buf: [64]u8 = undefined;
+        for (self.pos..hi) |i| {
+            try self.scratch[0].data.int.append(self.allocator, @intCast(i % IMPROVING_GROUPS));
+            try self.scratch[1].data.int.append(self.allocator, @intCast(i * IMPROVING_RUNS / self.rows));
+            try self.scratch[2].data.bigint.append(self.allocator, @intCast(i));
+            try self.scratch[3].data.double.append(self.allocator, @floatFromInt(i));
+            try self.scratch[4].data.string.appendValue(self.allocator, try improvingString(&buf, i, i));
+            try self.scratch[5].data.string.appendValue(self.allocator, try improvingString(&buf, self.rows - i, i));
+        }
+        for (&self.scratch, &self.views) |*c, *v| v.* = c.view();
+        const n = hi - self.pos;
+        self.pos = hi;
+        return .{ .schema = improving_schema[0..], .values = self.views[0..], .row_count = n };
+    }
+
+    pub fn deinit(self: *ImprovingSource) void {
+        for (&self.scratch) |*c| c.deinit(self.allocator);
+    }
+
+    pub fn outputSchema(_: *ImprovingSource) []const Column {
+        return improving_schema[0..];
+    }
+
+    pub fn addPrune(_: *ImprovingSource, _: exec.Predicate) !void {}
+
+    pub fn stats(self: *ImprovingSource) exec.PipelineStats {
+        return .{ .upper_rows = self.rows };
+    }
+
+    pub fn accountant(_: *ImprovingSource) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+
+    pub fn explain(_: *ImprovingSource, _: *std.ArrayList(u8), _: std.mem.Allocator, _: usize) !void {}
+};
+
+const improving_aggs = [_]AggSpec{
+    .{ .func = .max_by, .col = "up", .arg2_col = "o", .as = "mb_narrow" },
+    .{ .func = .max_by, .col = "up", .arg2_col = "f", .as = "mb_wide" },
+    .{ .func = .max_by, .col = "o", .arg2_col = "up", .as = "mb_str_key" },
+    .{ .func = .max, .col = "up", .as = "mx" },
+    .{ .func = .min, .col = "down", .as = "mn" },
+    .{ .func = .last, .col = "up", .as = "lst" },
+};
+
+const ImprovingShape = enum { grouped, single, sorted };
+
+/// Runs `improving_aggs` over `rows` improving rows in the given shape,
+/// checks every group's result is its last row's, and returns the
+/// aggregate's accounted peak.
+fn improvingPeak(a: std.mem.Allocator, rows: usize, shape: ImprovingShape) !usize {
+    const account = try a.create(exec.memory.MemoryAccountant);
+    account.* = exec.memory.MemoryAccountant.initWithPool(1 << 40, null);
+    account.trackAllocations(a);
+    defer account.releaseOwner(a);
+    const tracked = try account.executionAllocator();
+
+    var src = try ImprovingSource.init(a, rows);
+    const q = exec.makeQuery(tracked, &src);
+    const made = switch (shape) {
+        .grouped => q.groupBy(&.{"g"}, &improving_aggs),
+        .single => q.groupBy(&.{}, &improving_aggs),
+        .sorted => q.streamGroupBy(&.{"run"}, &improving_aggs),
+    };
+    var agg = made catch |e| {
+        src.deinit();
+        return e;
+    };
+    defer agg.deinit();
+
+    const n_keys: usize = if (shape == .single) 0 else 1;
+    var seen: usize = 0;
+    var buf: [64]u8 = undefined;
+    while (try agg.next()) |b| {
+        for (0..b.row_count) |r| {
+            const last = switch (shape) {
+                .grouped => blk: {
+                    const g: usize = @intCast(b.values[0].data.int[r]);
+                    break :blk rows - 1 - (rows - 1 + IMPROVING_GROUPS - g) % IMPROVING_GROUPS;
+                },
+                .single => rows - 1,
+                .sorted => blk: {
+                    const run: usize = @intCast(b.values[0].data.int[r]);
+                    break :blk ((run + 1) * rows - 1) / IMPROVING_RUNS;
+                },
+            };
+            const up = try improvingString(&buf, last, last);
+            for ([_]usize{ 0, 1, 3, 5 }) |ai| try std.testing.expectEqualStrings(up, b.values[n_keys + ai].data.string.rowBytes(r));
+            try std.testing.expectEqual(@as(i64, @intCast(last)), b.values[n_keys + 2].data.bigint[r]);
+            const down = try improvingString(&buf, rows - last, last);
+            try std.testing.expectEqualStrings(down, b.values[n_keys + 4].data.string.rowBytes(r));
+            seen += 1;
+        }
+    }
+    const want_groups: usize = switch (shape) {
+        .grouped => IMPROVING_GROUPS,
+        .single => 1,
+        .sorted => IMPROVING_RUNS,
+    };
+    try std.testing.expectEqual(want_groups, seen);
+    return account.peak_bytes;
+}
+
+test "MAX_BY, MIN/MAX and LAST keep a state bounded by the groups when every row improves them" {
+    const a = std.testing.allocator;
+    // A copy kept per improving row would add about 30 MB over the extra
+    // 150K rows.
+    for ([_]ImprovingShape{ .grouped, .single, .sorted }) |shape| {
+        const small = try improvingPeak(a, 50_000, shape);
+        const large = try improvingPeak(a, 200_000, shape);
+        try std.testing.expect(large < small + (1 << 20));
+    }
+}

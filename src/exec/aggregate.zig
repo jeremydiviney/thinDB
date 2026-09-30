@@ -38,6 +38,7 @@ pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices
 }
 
 const simd = @import("../util/simd.zig");
+const StringBank = @import("../util/string_bank.zig").StringBank;
 const scalar_common = @import("scalar_fn_common.zig");
 
 const native_endian = @import("builtin").cpu.arch.endian();
@@ -265,8 +266,9 @@ pub const AccState = union(enum) {
     /// instead of 48 (the `?i128`'s 16-byte alignment would dominate).
     min_large: LargeAcc,
     max_large: LargeAcc,
-    /// MIN/MAX over string-family columns. Holds the running extreme as
-    /// arena-dup'd bytes (the view's bytes are transient per batch).
+    /// MIN/MAX over string-family columns. Holds the running extreme as a
+    /// copy in the operator's `StringBank` (the view's bytes are transient
+    /// per batch).
     min_str: ?[]const u8,
     max_str: ?[]const u8,
     avg: AvgAcc,
@@ -347,11 +349,23 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
     };
 }
 
-fn valueUpdate(aa: Allocator, s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
+/// `valueFromRow` for a state that replaces its value: a string takes over
+/// the bank block of the value it replaces, `old` (null when there is none).
+fn replaceValueFromRow(bank: *StringBank, aa: Allocator, old: ?types.Value, view: ColumnView, row: u32) !types.Value {
+    return switch (view.data) {
+        .varchar, .string, .char, .json => .{ .text = try bank.replace(aa, if (old) |v| v.text else "", stringRowBytes(view, @intCast(row))) },
+        else => valueFromRow(aa, view, row),
+    };
+}
+
+fn valueUpdate(aa: Allocator, bank: *StringBank, s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!view.isValid(r)) continue;
-        if (func == .last or !s.value_acc.seen) {
+        if (func == .last) {
+            s.value_acc.value = try replaceValueFromRow(bank, aa, if (s.value_acc.seen) s.value_acc.value else null, view, r);
+            s.value_acc.seen = true;
+        } else if (!s.value_acc.seen) {
             s.value_acc.value = try valueFromRow(aa, view, r);
             s.value_acc.seen = true;
         }
@@ -382,15 +396,20 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
     };
 }
 
-fn maxByUpdate(aa: Allocator, s: *AccState, value_view: ColumnView, key_view: ColumnView, row_start: u32, row_end: u32) !void {
+fn maxByUpdate(aa: Allocator, bank: *StringBank, s: *AccState, value_view: ColumnView, key_view: ColumnView, row_start: u32, row_end: u32) !void {
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!value_view.isValid(r) or !key_view.isValid(r)) continue;
         if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
-        s.max_by.key = try valueFromRow(aa, key_view, r);
-        s.max_by.value = try valueFromRow(aa, value_view, r);
-        s.max_by.seen = true;
+        try replaceMaxBy(bank, aa, s, value_view, key_view, r);
     }
+}
+
+fn replaceMaxBy(bank: *StringBank, aa: Allocator, s: *AccState, value_view: ColumnView, key_view: ColumnView, row: u32) !void {
+    const seen = s.max_by.seen;
+    s.max_by.key = try replaceValueFromRow(bank, aa, if (seen) s.max_by.key else null, key_view, row);
+    s.max_by.value = try replaceValueFromRow(bank, aa, if (seen) s.max_by.value else null, value_view, row);
+    s.max_by.seen = true;
 }
 
 /// Row loop of the narrow MAX_BY scatter, specialized per key slice type and
@@ -411,7 +430,8 @@ fn maxByNarrowRows(bank: *StringBank, aa: Allocator, col: []MaxByNarrow, gids: [
         s.key = k;
         if (V == storage.StringView) {
             const bytes = vs.rowBytes(r);
-            s.val = .{ .str = (try bank.dupe(aa, bytes)).ptr };
+            const old: []const u8 = if (s.seen) s.val.str[0..s.len] else "";
+            s.val = .{ .str = (try bank.replace(aa, old, bytes)).ptr };
             s.len = @intCast(bytes.len);
         } else if (V != void) {
             s.val = .{ .int = vs[r] };
@@ -667,29 +687,6 @@ const ValueNarrow = struct {
     seen: bool = false,
 };
 
-/// Chunked byte bank for the string payloads the narrow cells keep: one arena
-/// chunk at a time instead of one arena `dupe` per improving row. Chunks
-/// never move, so a pointer into one stays valid for the operator's life; a
-/// superseded payload is abandoned in place (as the arena dupes were).
-const StringBank = struct {
-    chunk: []u8 = &.{},
-    used: usize = 0,
-
-    const CHUNK_BYTES: usize = 256 * 1024;
-
-    fn dupe(self: *StringBank, aa: Allocator, bytes: []const u8) ![]const u8 {
-        if (bytes.len > CHUNK_BYTES / 4) return aa.dupe(u8, bytes);
-        if (self.used + bytes.len > self.chunk.len) {
-            self.chunk = try aa.alloc(u8, CHUNK_BYTES);
-            self.used = 0;
-        }
-        const dst = self.chunk[self.used .. self.used + bytes.len];
-        @memcpy(dst, bytes);
-        self.used += bytes.len;
-        return dst;
-    }
-};
-
 /// The `types.Value` a narrow scalar cell stands for, tagged by the column
 /// type it was filled from (the reverse of the kernels' i64 widening). Only
 /// `narrowScalar` types ever reach a narrow cell.
@@ -892,7 +889,7 @@ pub const Aggregate = struct {
     /// per-aggregate columns cut a COUNT/SUM/AVG group from 96 B to ~40 B.
     /// Arena-owned (the backing slices live in `arena`), like `gstate` was.
     agg_cols: []AggCol = &.{},
-    /// Byte bank for the narrow cells' string payloads; arena-backed.
+    /// The string copies of every state, in `arena`.
     str_bank: StringBank = .{},
     /// Reused scratch (arena, length `aggs.len`) into which the emit paths
     /// gather one group's columns back into `[]AccState`, so the existing
@@ -1530,6 +1527,7 @@ pub const Aggregate = struct {
     fn evict(self: *Aggregate) void {
         if (self.evicted) return;
         _ = self.arena.reset(.free_all);
+        self.str_bank.reset();
         if (self.upstream.accountant()) |a| a.release(.hash_aggregate, self.reserved_bytes);
         self.reserved_bytes = 0;
         self.evicted = true;
@@ -1569,7 +1567,7 @@ pub const Aggregate = struct {
         const aa_state = self.arena.allocator();
         if (self.group_col_indices.len == 0) {
             for (self.aggs, 0..) |a, ai| {
-                try updateState(aa_state, &self.single_state[ai], a, batch, self.agg_col_indices[ai], 0, @intCast(n));
+                try updateState(aa_state, &self.str_bank, &self.single_state[ai], a, batch, self.agg_col_indices[ai], 0, @intCast(n));
             }
             return;
         }
@@ -1627,7 +1625,7 @@ pub const Aggregate = struct {
                     var r: u32 = 0;
                     while (r < gids.len) : (r += 1) {
                         const s = &col[gids[r]];
-                        try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
+                        try updateStateRow(aa_state, &self.str_bank, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
                 .max_by, .max_by_key => switch (self.agg_cols[ai]) {
@@ -1643,7 +1641,7 @@ pub const Aggregate = struct {
                     var r: u32 = 0;
                     while (r < gids.len) : (r += 1) {
                         const s = &col[gids[r]];
-                        try updateStateRow(aa_state, s, a, batch, self.agg_col_indices[ai], r);
+                        try updateStateRow(aa_state, &self.str_bank, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
             }
@@ -1762,9 +1760,7 @@ pub const Aggregate = struct {
             if (!value_view.isValid(r) or !key_view.isValid(r)) continue;
             const s = &col[gids[r]];
             if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
-            s.max_by.key = try valueFromRow(aa, key_view, r);
-            s.max_by.value = try valueFromRow(aa, value_view, r);
-            s.max_by.seen = true;
+            try replaceMaxBy(&self.str_bank, aa, s, value_view, key_view, r);
         }
     }
 
@@ -1816,8 +1812,8 @@ pub const Aggregate = struct {
     }
 
     /// MIN (`is_min`) / MAX scatter. Numeric int/large/float use the present-
-    /// flagged accumulator forms; strings arena-dup the running extreme. NULLs
-    /// skipped. Mirrors `updateStateRow`/`updateState` per-row semantics: which
+    /// flagged accumulator forms; strings keep the running extreme in
+    /// `str_bank`. NULLs skipped. Mirrors `updateStateRow`/`updateState` per-row semantics: which
     /// int widths fold into `min_int`/`max_int` (i64) vs `min_large`/`max_large`
     /// (i128), `date`→i64, `datetime`→i64, `decimal64`→i64, etc.
     fn scatterMinMax(self: *Aggregate, ai: usize, gids: []const u32, view: ColumnView, aa: Allocator, comptime is_min: bool) !void {
@@ -1874,11 +1870,11 @@ pub const Aggregate = struct {
                     const s = &col[g];
                     if (is_min) {
                         if (s.min_str == null or json_binary.columnOrder(tag == .json, bytes, s.min_str.?) == .lt) {
-                            s.min_str = try aa.dupe(u8, bytes);
+                            s.min_str = try self.str_bank.replace(aa, s.min_str orelse "", bytes);
                         }
                     } else {
                         if (s.max_str == null or json_binary.columnOrder(tag == .json, bytes, s.max_str.?) == .gt) {
-                            s.max_str = try aa.dupe(u8, bytes);
+                            s.max_str = try self.str_bank.replace(aa, s.max_str orelse "", bytes);
                         }
                     }
                 }
@@ -2582,6 +2578,8 @@ pub const SortedAggregate = struct {
     /// groups.
     cur_key: std.ArrayList(u8),
     cur_state: []AccState,
+    /// The open group's string copies, in `arena`.
+    str_bank: StringBank = .{},
     open: bool = false,
     /// Scratch for building a candidate row's key to compare against
     /// `cur_key`.
@@ -2748,6 +2746,7 @@ pub const SortedAggregate = struct {
         }
         // Group done — drop its transient state, keep the buffer for reuse.
         _ = self.arena.reset(.retain_capacity);
+        self.str_bank.reset();
         self.open = false;
     }
 
@@ -2788,7 +2787,7 @@ pub const SortedAggregate = struct {
                 }
                 if (!self.open) try self.beginGroup();
                 for (self.aggs, 0..) |a, ai| {
-                    try updateState(self.arena.allocator(), &self.cur_state[ai], a, batch, self.agg_col_indices[ai], self.cur_row, self.cur_row + 1);
+                    try updateState(self.arena.allocator(), &self.str_bank, &self.cur_state[ai], a, batch, self.agg_col_indices[ai], self.cur_row, self.cur_row + 1);
                 }
                 self.cur_row += 1;
             }
@@ -3355,7 +3354,7 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
 /// aggregates — get a direct scalar update here; everything else (MIN/MAX, AVG,
 /// stddev, distinct, percentile, group_concat) defers to `updateState` so there
 /// is exactly one definition of their semantics.
-fn updateStateRow(aa: Allocator, s: *AccState, spec: AggSpec, batch: Batch, col_idx: ?usize, row: u32) !void {
+fn updateStateRow(aa: Allocator, bank: *StringBank, s: *AccState, spec: AggSpec, batch: Batch, col_idx: ?usize, row: u32) !void {
     switch (spec.func) {
         .count => {
             if (col_idx) |idx| {
@@ -3391,12 +3390,13 @@ fn updateStateRow(aa: Allocator, s: *AccState, spec: AggSpec, batch: Batch, col_
             s.sum_int.seen = true;
         },
         .udf => return Error.AggregateUnsupportedType,
-        else => try updateState(aa, s, spec, batch, col_idx, row, row + 1),
+        else => try updateState(aa, bank, s, spec, batch, col_idx, row, row + 1),
     }
 }
 
 pub fn updateState(
     aa: Allocator,
+    bank: *StringBank,
     s: *AccState,
     spec: AggSpec,
     batch: Batch,
@@ -3581,7 +3581,7 @@ pub fn updateState(
                         if (!view.isValid(r)) continue;
                         const bytes = sv.rowBytes(r);
                         if (s.min_str == null or json_binary.columnOrder(tag == .json, bytes, s.min_str.?) == .lt) {
-                            s.min_str = try aa.dupe(u8, bytes);
+                            s.min_str = try bank.replace(aa, s.min_str orelse "", bytes);
                         }
                     }
                 },
@@ -3658,7 +3658,7 @@ pub fn updateState(
                         if (!view.isValid(r)) continue;
                         const bytes = sv.rowBytes(r);
                         if (s.max_str == null or json_binary.columnOrder(tag == .json, bytes, s.max_str.?) == .gt) {
-                            s.max_str = try aa.dupe(u8, bytes);
+                            s.max_str = try bank.replace(aa, s.max_str orelse "", bytes);
                         }
                     }
                 },
@@ -3731,12 +3731,12 @@ pub fn updateState(
             try boolUpdate(s, func, batch.values[col_idx.?], row_start, row_end);
         },
         .any_value, .first, .last => {
-            try valueUpdate(aa, s, func, batch.values[col_idx.?], row_start, row_end);
+            try valueUpdate(aa, bank, s, func, batch.values[col_idx.?], row_start, row_end);
         },
         .max_by, .max_by_key => {
             const key_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
             const key_idx = types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound;
-            try maxByUpdate(aa, s, batch.values[col_idx.?], batch.values[key_idx], row_start, row_end);
+            try maxByUpdate(aa, bank, s, batch.values[col_idx.?], batch.values[key_idx], row_start, row_end);
         },
         .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => {
             try bitwiseUpdate(s, func, batch.values[col_idx.?], row_start, row_end);
