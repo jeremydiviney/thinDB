@@ -1032,6 +1032,20 @@ domain so every domain row sees its rows. A `SELECT *` in a lifted block is
 first spelled out from the columns its relations carry; a star it can't
 spell out, such as one over a join whose columns share names, isn't lifted.
 
+A join's ON inside the subquery may read enclosing columns too. An inner
+join's ON filters the pairs it makes as a WHERE above it would, so either
+strategy takes its correlated terms as a WHERE's (`JOIN b ON a.id = b.id
+AND b.v = x.v`). An outer join's conjunct that reads enclosing columns and
+nothing of the preserved input filters the other input before the join: it
+holds or fails for a whole row of that input, whatever row it would pair
+with, so every preserved row is still kept (`LEFT JOIN b ON a.id = b.id AND
+b.v = x.v`). One that also reads the preserved input, or a value the ON
+computes, stays in the join's residual, which checks each pair once both
+inputs carry the domain values. A FULL JOIN's isn't lifted, as above. A name
+in an ON belongs to the subquery's FROM before any enclosing query: one
+qualified by a relation of the same FROM that the ON can't see (`FROM a, b
+JOIN c ON a.id = c.bid`) raises `SqlOnRefsUnknownTable`, as at the top level.
+
 An aggregate in a subquery whose arguments read only enclosing columns
 (`SUM(x.v)`) belongs to the enclosing query, as SQL scopes it. Before either
 strategy runs it moves there: into the enclosing GROUP BY, or a new global
