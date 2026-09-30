@@ -630,6 +630,8 @@ Join routing (`.algorithm = .auto`): opaque predicate → NLJ; pure single-range
 
 A key pair can be null-safe (`KeyPair.null_safe`): an ON conjunct `a <=> b` or `a IS NOT DISTINCT FROM b` across the two inputs keys the join like `a = b`, except that a NULL key matches a NULL key. SMJ drops NULL keys, so a join with a null-safe key never takes SMJ or the skew re-route. The hash join keeps NULL as a value of that key, NLJ compares it as one, and build-key scan hints skip a null-safe key whose build side holds a NULL. When a key's types differ and a conversion can turn a value into NULL, the pair also gets a plain key on both sides' null flags, so a converted NULL matches only a NULL. An outer join's preserved-side ON conditions fold into a plain key. When every key is null-safe, they fold into a constant key pair.
 
+A table function's input relation carries each declared input column by name and in order, and a nullable column can't feed a NOT NULL field. A column of another type converts to the declared type as an INSERT into a column of that type would (§9.8 `ValueOutOfRange`). The casts `cast.assignmentCastExpr` gives (text, DATE or DATETIME into DATE or DATETIME, a number or text into DECIMAL) run as a `Compute` over the input. The pairs an INSERT converts as its rows land (one number type into another, a number or date into text, text into a number) convert each drained batch with `cast.assignColumn`. When every type already matches, the call reads the input's columns without a copy, as before. A pair the rule refuses, such as a number into a DATE, is `TableFnInputMismatch` when the call is built. A value that fails its conversion, such as text that isn't a date or a number the field can't hold, is `TableFnInputMismatch` when its batch is drained, with a diagnostic line naming the column. A converted partition or order key is sorted again even when the input arrives ordered, since converting can reorder it.
+
 **Memtable scan**: every Scan also reads from the (potentially non-empty) memtable of the table. Memtable rows are processed identically to segment rows. This gives read-your-writes consistency.
 
 ### 6.3 Execution model
@@ -890,6 +892,11 @@ per range or over the complete shard.
 Passthrough TVF outputs use their declared string-family type even when the
 input uses another compatible string type. Borrowed views preserve the
 original bytes and NULL bitmap without copying or changing input columns.
+A TVF input whose type differs from its declaration converts in a region only
+through a cast between DATE and DATETIME, which can't drop a value, and only
+on a column that is neither a range key nor the routed column. Any other
+conversion (§6.2) leaves the query to ordinary execution, so both paths
+return the same rows and raise the same errors.
 Frame-replacing TVFs retain routed-key provenance only under their existing
 `ordered_output` contract: the call's partition columns must be present in
 the output and preserve their values. The compiler binds the route to that
@@ -1352,6 +1359,7 @@ JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
 JoinColumnNameCollision,
 MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 RecursiveCteDepthExceeded,
+TableFnExecutionMismatch, TableFnInputMismatch, TableFnOutputMismatch,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -1369,6 +1377,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): an enclosing column in the subquery's FROM (a derived table that reads it, as LATERAL would), an aggregate whose argument reads only enclosing columns (`SUM(x.v)` inside the subquery, which SQL aggregates in the enclosing query), a UNION inside the subquery that reads them, or, in a DELETE or UPDATE predicate or a join's ON, a correlation other than equalities and ranges on the subquery's own columns. A subquery correlated some other way also can't use `SELECT *`, or be an IN over an aggregate without GROUP BY. A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
+
+`TableFnInputMismatch` means a table function's input relation doesn't fit its declared input (§6.2): a column is missing, extra, out of order, nullable where the field isn't, or of a type an INSERT into the declared type refuses, or a value failed its conversion. `TableFnExecutionMismatch` means the call's PARTITION BY contradicts the declared execution mode; `TableFnOutputMismatch` means the callback left its output columns of unequal length.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` or `__ctas_` prefix, which ALTER TABLE's swap and table builds use (§9.2, §8.2).
 

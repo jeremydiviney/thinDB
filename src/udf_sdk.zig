@@ -459,7 +459,9 @@ pub fn inputTypesOf(comptime Mod: type) []const type {
 /// struct declaration (field order = call order). No decl = no args.
 pub fn argTypesFor(comptime Mod: type) []const types.Type {
     if (!@hasDecl(Mod, "Args")) return &.{};
-    comptime {
+    // Computed in a comptime block and returned from runtime code, so an
+    // in-process `registerTableFn` (a runtime call) can take it too.
+    const result = comptime blk: {
         const fields = @typeInfo(Mod.Args).@"struct".fields;
         var out: [fields.len]types.Type = undefined;
         for (fields, 0..) |f, i| {
@@ -470,8 +472,9 @@ pub fn argTypesFor(comptime Mod: type) []const types.Type {
             out[i] = columnTypeFor(T);
         }
         const frozen = out;
-        return &frozen;
-    }
+        break :blk &frozen;
+    };
+    return result;
 }
 
 /// Decode one raw call argument into the field type an `Args` struct

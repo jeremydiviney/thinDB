@@ -9,7 +9,13 @@
 //!
 //! The TYPE CONTRACT enforced at create (= query compile):
 //!   - the input subquery's schema must carry every declared input column,
-//!     name-for-name and type-for-type, and nothing else;
+//!     name-for-name, and nothing else;
+//!   - a column of another type converts to the declared type as an INSERT
+//!     into a column of that type would: a Compute over the input for the
+//!     casts `cast.assignmentCastExpr` gives, `cast.assignColumn` on each
+//!     drained batch for the pairs INSERT converts as rows land. A
+//!     conversion the rule refuses, or a value that fails it, is
+//!     TableFnInputMismatch;
 //!   - a nullable upstream column cannot feed a NOT NULL declared column
 //!     (the reverse widening is fine);
 //!   - PARTITION BY presence must match the function's declared execution
@@ -58,6 +64,7 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
+const cast = @import("cast.zig");
 
 /// Test hook: std.testing.allocator is single-threaded, so tests run the
 /// serial path unless they opt in with a thread-safe allocator of their own.
@@ -70,6 +77,8 @@ pub const TableFnExec = struct {
     /// execution path stays byte-identical; the multi path indexes these
     /// arrays directly.
     upstreams: []Query,
+    /// Per input, the conversions applied to every pulled batch.
+    conversions: []InputConversion,
     input_maps: [][]usize,
     key_idxs: [][]usize,
     order_idxs: [][]usize,
@@ -115,6 +124,9 @@ pub const TableFnExec = struct {
     /// (a covered window-stage ride): skip the sort — identity permutation,
     /// adjacent-equal run boundaries.
     input_ordered: bool = false,
+    /// Input 0 converts a partition or order column, so `input_ordered`
+    /// (proven on the supplied values) doesn't carry over.
+    keys_converted: bool = false,
     /// Observability (tests + trace attribution): columns the last execute
     /// actually bound as borrowed views (0 = bind declined or no plan).
     borrowed_bound: usize = 0,
@@ -171,8 +183,23 @@ pub const TableFnExec = struct {
         const upstreams = try allocator.dupe(Query, ups);
         errdefer allocator.free(upstreams);
 
-        // Per input: shape contract (exact column set, exact types, sound
-        // nullability) + key/order columns resolved in ITS declared schema.
+        // The assignment casts each input takes, built before any upstream
+        // is wrapped so a refused input leaves every upstream to the caller.
+        var cast_arena = std.heap.ArenaAllocator.init(allocator);
+        defer cast_arena.deinit();
+        const ca = cast_arena.allocator();
+        const input_casts = try ca.alloc([]const exec.Derived, n_in);
+        const conversions = try allocator.alloc(InputConversion, n_in);
+        var conversions_built: usize = 0;
+        errdefer {
+            for (conversions[0..conversions_built]) |c| c.deinit(allocator);
+            allocator.free(conversions);
+        }
+        var keys_converted = false;
+
+        // Per input: shape contract (exact column set, each type as declared
+        // or converted to it, sound nullability) + key/order columns
+        // resolved in ITS declared schema.
         const input_maps = try allocator.alloc([]usize, n_in);
         errdefer allocator.free(input_maps);
         const key_idxs = try allocator.alloc([]usize, n_in);
@@ -194,21 +221,39 @@ pub const TableFnExec = struct {
             }
             const imap = try allocator.alloc(usize, decl_schema.len);
             errdefer allocator.free(imap);
-            for (decl_schema, imap) |decl, *slot| {
+            const converted = try ca.alloc(bool, decl_schema.len);
+            var casts: std.ArrayList(exec.Derived) = .empty;
+            var checks: std.ArrayList(CastCheck) = .empty;
+            var assigned: std.ArrayList(AssignedInput) = .empty;
+            for (decl_schema, imap, converted) |decl, *slot, *conv| {
                 const ui = types.findColumn(up_schema, decl.name) orelse {
                     std.debug.print("[table_fn] {s} input {d}: declared column '{s}' not supplied\n", .{ entry.name, i, decl.name });
                     return Error.TableFnInputMismatch;
                 };
-                if (!inputTypeMatches(up_schema[ui].type, decl.type)) {
-                    std.debug.print("[table_fn] {s} input {d}: column '{s}' is {s}, declared {s}\n", .{ entry.name, i, decl.name, @tagName(std.meta.activeTag(up_schema[ui].type)), @tagName(std.meta.activeTag(decl.type)) });
-                    return Error.TableFnInputMismatch;
+                const up = up_schema[ui];
+                slot.* = ui;
+                conv.* = true;
+                switch (try inputBinding(ca, up.name, up.type, decl.type)) {
+                    .as_is => conv.* = false,
+                    .cast => |c| {
+                        slot.* = up_schema.len + casts.items.len;
+                        if (c.can_drop) try checks.append(ca, .{ .source = ui, .cast = slot.*, .name = decl.name, .type = decl.type });
+                        try casts.append(ca, .{ .name = try std.fmt.allocPrint(ca, "__table_fn_input_{d}", .{slot.*}), .expr = c.expr });
+                    },
+                    .assigned => try assigned.append(ca, .{ .source = ui, .name = decl.name, .from = up.type, .to = decl.type }),
+                    .refused => {
+                        std.debug.print("[table_fn] {s} input {d}: column '{s}' is {s}, declared {s}\n", .{ entry.name, i, decl.name, @tagName(std.meta.activeTag(up.type)), @tagName(std.meta.activeTag(decl.type)) });
+                        return Error.TableFnInputMismatch;
+                    },
                 }
-                if (up_schema[ui].nullable and !decl.nullable) {
+                if (up.nullable and !decl.nullable) {
                     std.debug.print("[table_fn] {s} input {d}: column '{s}' is nullable, declared NOT NULL\n", .{ entry.name, i, decl.name });
                     return Error.TableFnInputMismatch;
                 }
-                slot.* = ui;
             }
+            input_casts[i] = casts.items;
+            conversions[i] = try InputConversion.init(allocator, checks.items, assigned.items);
+            conversions_built += 1;
             // Broadcast inputs are never co-grouped: the call keys need
             // not resolve in their schema and they are never sorted.
             var is_bcast = false;
@@ -224,6 +269,15 @@ pub const TableFnExec = struct {
             errdefer allocator.free(oidx);
             if (!is_bcast) for (order_by, oidx) |spec, *slot| {
                 slot.* = types.findColumn(decl_schema, spec.col) orelse return Error.TableFnInputMismatch;
+            };
+            // A pre-ordered ride proves the order of the supplied values;
+            // a conversion can merge or reorder keys (DATETIME → DATE,
+            // text).
+            if (i == 0) for (kidx) |k| {
+                keys_converted = keys_converted or converted[k];
+            };
+            if (i == 0) for (oidx) |k| {
+                keys_converted = keys_converted or converted[k];
             };
             input_maps[i] = imap;
             key_idxs[i] = kidx;
@@ -249,11 +303,28 @@ pub const TableFnExec = struct {
         errdefer allocator.free(col_stats);
         @memset(col_stats, .{});
 
+        // Wrapping is the last fallible step bar one: on any failure the
+        // layers come off again and the caller still owns every upstream.
+        var wrapped: usize = 0;
+        errdefer for (upstreams[0..wrapped], ups[0..wrapped]) |top, base| {
+            if (top.ptr != base.ptr) exec.Compute.deinitLayersOver(top, base);
+        };
+        for (upstreams, input_casts, input_maps, entry.input_schemas, conversions) |*up, casts, imap, decl_schema, conv| {
+            if (casts.len > 0) up.* = try up.compute(casts);
+            wrapped += 1;
+            const out = up.outputSchema();
+            for (decl_schema, imap) |decl, ui| {
+                if (conv.assigns(ui)) continue;
+                if (!inputTypeMatches(out[ui].type, decl.type)) return Error.TableFnInputMismatch;
+            }
+        }
+
         const self = try allocator.create(TableFnExec);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .upstreams = upstreams,
+            .conversions = conversions,
             .input_maps = input_maps,
             .key_idxs = key_idxs,
             .order_idxs = order_idxs,
@@ -268,6 +339,7 @@ pub const TableFnExec = struct {
             .views = views,
             .col_stats = col_stats,
             .dop = @max(1, dop),
+            .keys_converted = keys_converted,
         };
         return makeQuery(allocator, self);
     }
@@ -289,6 +361,8 @@ pub const TableFnExec = struct {
         self.allocator.free(self.call_args);
         for (self.upstreams) |*up| up.deinit();
         self.allocator.free(self.upstreams);
+        for (self.conversions) |c| c.deinit(self.allocator);
+        self.allocator.free(self.conversions);
         if (!self.adopted_out) {
             for (self.output_cols) |*c| c.deinit(self.allocator);
         }
@@ -461,6 +535,8 @@ pub const TableFnExec = struct {
             for (self.borrow_map, 0..) |m, ci| {
                 if (ci >= n_cols) break;
                 const si = m orelse continue;
+                // A column the input converts drains from its cast slot.
+                if (!inputTypeMatches(res.schema[si].type, self.entry.input_schemas[0][ci].type)) continue;
                 borrowed_views[ci] = exec.mat_stage.MaterializedResult.presentAsSchemaType(
                     ad.stores[si].view(),
                     self.entry.input_schemas[0][ci].type,
@@ -529,8 +605,13 @@ pub const TableFnExec = struct {
             dp.preps = try self.allocator.alloc(transform.PreparedAppend, n_cols);
             dp.bounds = try self.allocator.alloc(usize, max_tiles + 1);
         }
+        const conv_views = try self.allocator.alloc(ColumnView, self.upstream.outputSchema().len);
+        defer self.allocator.free(conv_views);
+        const converts = self.conversions[0].assigned.len > 0;
         var accumulated: usize = 0;
-        while (try self.upstream.next()) |batch| {
+        while (try self.upstream.next()) |pulled| {
+            const batch = try self.convertBatch(0, pulled, conv_views);
+            defer if (converts) self.releaseConverted(0, conv_views);
             if (n_dworkers > 0) {
                 dp.batch = batch;
                 dp.runPhase(.prepare, owned.len, n_dworkers);
@@ -602,8 +683,9 @@ pub const TableFnExec = struct {
         defer if (digests) |d| self.allocator.free(d);
         for (perm, 0..) |*p, i| p.* = @intCast(i);
         const have_keys = self.key_idx.len + self.order_idx.len > 0;
-        const identity_perm = self.input_ordered or !have_keys;
-        if (have_keys and !self.input_ordered) {
+        const pre_ordered = self.input_ordered and !self.keys_converted;
+        const identity_perm = pre_ordered or !have_keys;
+        if (have_keys and !pre_ordered) {
             digests = try self.packedSort(input_views, perm);
             if (digests == null) {
                 const lctx = LessCtx{ .self = self, .views = input_views };
@@ -612,7 +694,7 @@ pub const TableFnExec = struct {
         }
 
         if (trace) {
-            if (self.input_ordered and have_keys) {
+            if (pre_ordered and have_keys) {
                 std.debug.print("[tvf] sort: skipped (pre-ordered input)\n", .{});
             } else {
                 std.debug.print("[tvf] sort: {d:.0}ms\n", .{prof.ticksToMs(prof.nowTicks() - t0)});
@@ -873,6 +955,7 @@ pub const TableFnExec = struct {
                     for (self.multi_borrow_maps[i], 0..) |m, ci| {
                         if (ci >= decl.len) break;
                         const si = m orelse continue;
+                        if (!inputTypeMatches(res.schema[si].type, decl[ci].type)) continue;
                         borrowed[ci] = exec.mat_stage.MaterializedResult.presentAsSchemaType(
                             ad.stores[si].view(),
                             decl[ci].type,
@@ -886,7 +969,12 @@ pub const TableFnExec = struct {
             const t_drain = if (trace) prof.nowTicks() else 0;
             var accumulated: usize = 0;
             var up = self.upstreams[i];
-            while (try up.next()) |batch| {
+            const conv_views = try a.alloc(ColumnView, up.outputSchema().len);
+            defer a.free(conv_views);
+            const converts = self.conversions[i].assigned.len > 0;
+            while (try up.next()) |pulled| {
+                const batch = try self.convertBatch(i, pulled, conv_views);
+                defer if (converts) self.releaseConverted(i, conv_views);
                 for (self.input_maps[i], cols, 0..) |ui, *store, ci| {
                     if (borrowed[ci] != null) continue;
                     try transform.appendAllColumn(a, batch.values[ui], store);
@@ -1935,7 +2023,7 @@ pub const TableFnExec = struct {
     /// (varchar/string/char) is mutually compatible — all three share the
     /// same StringView representation, and a declared `[]const u8` input
     /// must accept a VARCHAR(n) table column.
-    fn inputTypeMatches(actual: types.Type, declared: types.Type) bool {
+    pub fn inputTypeMatches(actual: types.Type, declared: types.Type) bool {
         if (std.meta.eql(actual, declared)) return true;
         const string_family = switch (actual) {
             .varchar, .string, .char, .json => true,
@@ -1946,6 +2034,113 @@ pub const TableFnExec = struct {
             .varchar, .string, .char, .json => true,
             else => false,
         };
+    }
+
+    /// How a supplied input column reaches a declared input of another
+    /// type: as an INSERT into a column of the declared type converts it,
+    /// or not at all. The keyed-regions path binds its inputs through this
+    /// too, so both agree on what a call accepts.
+    pub const InputBinding = union(enum) {
+        as_is,
+        /// A projection over the input (`cast.assignmentCastExpr`).
+        cast: struct {
+            expr: exec.Expr,
+            /// A valid value can come out NULL (text that isn't a date, a
+            /// number past the decimal's precision): the call then fails
+            /// as the INSERT would.
+            can_drop: bool,
+        },
+        /// Converted batch by batch as the input drains
+        /// (`cast.assignColumn`), as INSERT converts these pairs while the
+        /// rows land: numbers of another width or kind, number and text.
+        assigned,
+        refused,
+    };
+
+    pub fn inputBinding(arena: Allocator, name: []const u8, have: types.Type, declared: types.Type) !InputBinding {
+        if (inputTypeMatches(have, declared)) return .as_is;
+        if (try cast.assignmentCastExpr(arena, name, have, declared)) |expr| {
+            return .{ .cast = .{ .expr = expr, .can_drop = have.isString() or declared.isDecimal() } };
+        }
+        return if (cast.assignsByRule(have, declared)) .assigned else .refused;
+    }
+
+    /// A droppable input cast: the supplied column and its converted slot,
+    /// both upstream-output indices.
+    const CastCheck = struct {
+        source: usize,
+        cast: usize,
+        name: []const u8,
+        type: types.Type,
+    };
+
+    /// An upstream-output column converted as each batch drains.
+    const AssignedInput = struct {
+        source: usize,
+        name: []const u8,
+        from: types.Type,
+        to: types.Type,
+    };
+
+    const InputConversion = struct {
+        checks: []const CastCheck,
+        assigned: []const AssignedInput,
+
+        fn init(allocator: Allocator, checks: []const CastCheck, assigned: []const AssignedInput) !InputConversion {
+            const owned_checks = try allocator.dupe(CastCheck, checks);
+            errdefer allocator.free(owned_checks);
+            return .{ .checks = owned_checks, .assigned = try allocator.dupe(AssignedInput, assigned) };
+        }
+
+        fn deinit(self: InputConversion, allocator: Allocator) void {
+            allocator.free(self.checks);
+            allocator.free(self.assigned);
+        }
+
+        fn assigns(self: InputConversion, source: usize) bool {
+            for (self.assigned) |a| {
+                if (a.source == source) return true;
+            }
+            return false;
+        }
+    };
+
+    /// `batch` as input `input`'s declared columns read it: a projected
+    /// cast that dropped a value fails the call, and each assigned column
+    /// is converted into `views` (sized to the upstream's width). Release
+    /// the result with `releaseConverted`.
+    fn convertBatch(self: *const TableFnExec, input: usize, batch: Batch, views: []ColumnView) !Batch {
+        const conv = self.conversions[input];
+        for (conv.checks) |c| {
+            if (!cast.assignmentDroppedValue(batch.values[c.source], batch.values[c.cast], batch.row_count)) continue;
+            std.debug.print("[table_fn] {s} input {d}: column '{s}' holds a value that is not a {s}\n", .{
+                self.entry.name, input, c.name, @tagName(std.meta.activeTag(c.type)),
+            });
+            return Error.TableFnInputMismatch;
+        }
+        if (conv.assigned.len == 0) return batch;
+        @memcpy(views[0..batch.values.len], batch.values);
+        var done: usize = 0;
+        errdefer for (conv.assigned[0..done]) |a| cast.freeAssignedColumn(self.allocator, views[a.source]);
+        for (conv.assigned) |a| {
+            views[a.source] = cast.assignColumn(self.allocator, batch.values[a.source], a.from, a.to, batch.row_count) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TypeMismatch, error.ValueOutOfRange => {
+                    std.debug.print("[table_fn] {s} input {d}: column '{s}' holds a value that is not a {s} ({s})\n", .{
+                        self.entry.name, input, a.name, @tagName(std.meta.activeTag(a.to)), @errorName(err),
+                    });
+                    return Error.TableFnInputMismatch;
+                },
+            };
+            done += 1;
+        }
+        var out = batch;
+        out.values = views[0..batch.values.len];
+        return out;
+    }
+
+    fn releaseConverted(self: *const TableFnExec, input: usize, views: []const ColumnView) void {
+        for (self.conversions[input].assigned) |a| cast.freeAssignedColumn(self.allocator, views[a.source]);
     }
 
     /// One row's flattened sort identity: partition keys collapse to a
