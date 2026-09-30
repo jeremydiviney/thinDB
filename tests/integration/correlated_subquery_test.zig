@@ -524,6 +524,9 @@ test "correlated DELETE and UPDATE on a target without a primary key fail when n
     // by, so these fail, and a keyed one still runs.
     try helpers.expectRunError(allocator, db, "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = np.k OR y.v = np.v)", error.UnsupportedCorrelatedSubquery);
     try helpers.expectRunError(allocator, db, "UPDATE np SET v = 0 WHERE np.v IN (SELECT y.v FROM ex_u y WHERE y.id <> np.k)", error.UnsupportedCorrelatedSubquery);
+    try helpers.expectRunError(allocator, db, "UPDATE np SET v = 0 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v) + 1 = 2", error.UnsupportedCorrelatedSubquery);
+    try helpers.expectRunError(allocator, db, "DELETE FROM np WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v <> np.v) = 2", error.UnsupportedCorrelatedSubquery);
+    try helpers.expectRunError(allocator, db, "UPDATE np SET v = (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v)", error.UnsupportedCorrelatedSubquery);
     try expectCells(allocator, db, "SELECT id, v FROM np ORDER BY id", &.{ 1, 5, 2, 2, 3, null, 4, 7, 5, 2 });
     try exec(allocator, db, "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = np.k + 10)");
     try expectCells(allocator, db, "SELECT id, v FROM np ORDER BY id", &.{ 5, 2 });
@@ -655,4 +658,103 @@ test "correlated scalar over a CTE that shadows its table, keyed by an expressio
     const cells = try collectIntCells(allocator, &q);
     defer allocator.free(cells);
     try std.testing.expectEqualSlices(?i64, &.{ 7, 0, 1, 5, 2, 100, 3, 0, 4, 50, 5, 0 }, cells);
+}
+
+test "a correlated subquery's item that returns an outer column, or opens with its qualifier, keeps its name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // `x.k + y.id` reads like column `k + y.id` of `x`, and `x.k` reads
+    // the domain's column once lifted, yet each is the item's own value.
+    // Rows are DuckDB's.
+    const cases = .{
+        .{ "SELECT x.id, (SELECT x.k + y.id FROM ex_u y WHERE y.id <> x.k AND y.v = 9) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 60, 2, 70, 3, 80, 4, 90, 5, null } },
+        .{ "SELECT x.id, (SELECT y.id + x.k FROM ex_u y WHERE y.id <> x.k AND y.v = 9) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 60, 2, 70, 3, 80, 4, 90, 5, null } },
+        .{ "SELECT x.id, (SELECT x.k FROM ex_u y WHERE y.id <> x.k AND y.v = 9) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 10, 2, 20, 3, 30, 4, 40, 5, null } },
+        .{ "SELECT x.id, (SELECT x.k FROM ex_u y WHERE y.id > x.k LIMIT 1) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 10, 2, 20, 3, 30, 4, 40, 5, null } },
+        .{ "SELECT x.id, (SELECT DISTINCT x.k FROM ex_u y WHERE y.id > x.k) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 10, 2, 20, 3, 30, 4, 40, 5, null } },
+        .{ "SELECT x.id, (SELECT x.k + y.id AS s FROM ex_u y WHERE y.id > x.k ORDER BY s DESC LIMIT 1) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 60, 2, 70, 3, 80, 4, 90, 5, null } },
+        .{ "SELECT x.id, (SELECT x.k + y.id FROM ex_u y WHERE y.id > x.k ORDER BY x.k + y.id DESC LIMIT 1) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 60, 2, 70, 3, 80, 4, 90, 5, null } },
+        .{ "SELECT x.id FROM ex_t x WHERE (SELECT x.v FROM ex_u y WHERE y.id > x.k AND y.v = 9) = 5 ORDER BY x.id", &[_]?i64{1} },
+        .{ "SELECT x.id, (SELECT SUM(d.k) FROM (SELECT x.k FROM ex_u y WHERE y.id > x.k) d) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 40, 2, 60, 3, 60, 4, 40, 5, null } },
+        .{ "SELECT x.id, (SELECT MAX(d.q) FROM (SELECT x.k + y.id AS q FROM ex_u y WHERE y.id > x.k) d) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 60, 2, 70, 3, 80, 4, 90, 5, null } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.id * 10 IN (SELECT x.k FROM ex_u y WHERE y.id <> x.k AND y.v = 2) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.k + 10 IN (SELECT x.k + y.id FROM ex_u y WHERE y.id <> x.k) ORDER BY x.id", &[_]?i64{ 2, 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.id * 10 NOT IN (SELECT x.k FROM ex_u y WHERE y.id <> x.k AND y.v = 2) ORDER BY x.id", &[_]?i64{} },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT x.k FROM ex_u y WHERE y.id <> x.k AND y.v = x.v) ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT x.v, y.v FROM ex_u y WHERE y.id > x.k AND y.v = x.v) ORDER BY x.id", &[_]?i64{2} },
+        .{ "SELECT x.id, (SELECT x.k + y.id FROM ex_u y WHERE y.id = x.k UNION ALL SELECT x.k + z.id FROM ex_u z WHERE z.id = x.k + 1000) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 20, 2, 40, 3, 60, 4, 80, 5, 100 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT x.v FROM ex_u y WHERE y.id = x.k + 10 UNION SELECT y.v FROM ex_u y WHERE y.id > x.k) ORDER BY x.id", &[_]?i64{ 1, 2, 4 } },
+        .{ "SELECT x.id, (SELECT x.k FROM (SELECT id, v FROM ex_u) y WHERE y.id <> x.k AND y.v = 9) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 10, 2, 20, 3, 30, 4, 40, 5, null } },
+        .{ "WITH c AS (SELECT id, v, k FROM ex_t) SELECT x.id, (SELECT x.k + y.id FROM vu y WHERE y.id <> x.k AND y.v = 9) AS n FROM c x ORDER BY x.id", &[_]?i64{ 1, 60, 2, 70, 3, 80, 4, 90, 5, null } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+/// `np` is a copy of `ex_t` without a key.
+fn expectRowsAfter(allocator: std.mem.Allocator, statement: []const u8, table: []const u8, expected: []const ?i64) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE np (id BIGINT, v INT, k INT)");
+    try exec(allocator, db, "INSERT INTO np SELECT id, v, k FROM ex_t");
+    const t = try db.openTable("np", .{});
+    try t.flush();
+    try exec(allocator, db, statement);
+    const select = try std.fmt.allocPrint(allocator, "SELECT id, v, k FROM {s} ORDER BY id", .{table});
+    defer allocator.free(select);
+    expectCells(allocator, db, select, expected) catch |err| {
+        std.debug.print("failed: {s}\n", .{statement});
+        return err;
+    };
+}
+
+test "correlated DELETE and UPDATE comparing a keyed correlated scalar with a literal filter in place on any target" {
+    const allocator = std.testing.allocator;
+    // The subquery on either side of the comparison, a literal or a value
+    // over the target's row on the other. Each runs on the keyed target and
+    // on its key-less copy. Rows are DuckDB's.
+    const cases = .{
+        .{ "UPDATE ex_t SET v = -1 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v) = 1", "UPDATE np SET v = -1 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v) = 1", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, null, 30, 4, -1, 40, 5, 2, 50 } },
+        .{ "UPDATE ex_t SET v = -2 WHERE 1 = (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v AND y.id <> 40)", "UPDATE np SET v = -2 WHERE 1 = (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v AND y.id <> 40)", &[_]?i64{ 1, 5, 10, 2, -2, 20, 3, null, 30, 4, -2, 40, 5, -2, 50 } },
+        .{ "UPDATE ex_t SET v = -3 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v AND y.id <> 40) = 0", "UPDATE np SET v = -3 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v AND y.id <> 40) = 0", &[_]?i64{ 1, -3, 10, 2, 2, 20, 3, -3, 30, 4, 7, 40, 5, 2, 50 } },
+        .{ "UPDATE ex_t SET v = -4 WHERE (SELECT MAX(y.id) FROM ex_u y WHERE y.v = ex_t.v AND y.id <> 40) = 10", "UPDATE np SET v = -4 WHERE (SELECT MAX(y.id) FROM ex_u y WHERE y.v = np.v AND y.id <> 40) = 10", &[_]?i64{ 1, 5, 10, 2, -4, 20, 3, null, 30, 4, 7, 40, 5, -4, 50 } },
+        .{ "UPDATE ex_t SET v = -5 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v) = ex_t.id - 3", "UPDATE np SET v = -5 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v) = np.id - 3", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, -5, 30, 4, -5, 40, 5, -5, 50 } },
+        .{ "UPDATE ex_t SET v = -6 WHERE NOT ((SELECT MAX(y.id) FROM ex_u y WHERE y.v = ex_t.v) > 30)", "UPDATE np SET v = -6 WHERE NOT ((SELECT MAX(y.id) FROM ex_u y WHERE y.v = np.v) > 30)", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, null, 30, 4, -6, 40, 5, 2, 50 } },
+        .{ "UPDATE ex_t SET v = -7 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v) = 1 OR ex_t.id = 3", "UPDATE np SET v = -7 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v) = 1 OR np.id = 3", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, -7, 30, 4, -7, 40, 5, 2, 50 } },
+        .{ "DELETE FROM ex_t WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v) = 1", "DELETE FROM np WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v) = 1", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, null, 30, 5, 2, 50 } },
+        .{ "DELETE FROM ex_t WHERE (SELECT MAX(y.id) FROM ex_u y WHERE y.v = ex_t.v) > 15", "DELETE FROM np WHERE (SELECT MAX(y.id) FROM ex_u y WHERE y.v = np.v) > 15", &[_]?i64{ 1, 5, 10, 3, null, 30 } },
+        .{ "DELETE FROM ex_t WHERE 15 < (SELECT MIN(y.id) FROM ex_u y WHERE y.v = ex_t.v)", "DELETE FROM np WHERE 15 < (SELECT MIN(y.id) FROM ex_u y WHERE y.v = np.v)", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, null, 30, 5, 2, 50 } },
+    };
+    inline for (cases) |case| {
+        try expectRowsAfter(allocator, case[0], "ex_t", case[2]);
+        try expectRowsAfter(allocator, case[1], "np", case[2]);
+    }
+}
+
+test "correlated DELETE and UPDATE computing a correlated scalar no keyed path takes, or assigning one, write the rows found by the primary key" {
+    const allocator = std.testing.allocator;
+    // Rows are DuckDB's.
+    const cases = .{
+        .{ "UPDATE ex_t SET v = -8 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v) + 1 = 2", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, null, 30, 4, -8, 40, 5, 2, 50 } },
+        .{ "UPDATE ex_t SET v = -9 WHERE (SELECT MAX(y.id) FROM ex_u y WHERE y.v = ex_t.v) IS NULL", &[_]?i64{ 1, -9, 10, 2, 2, 20, 3, -9, 30, 4, 7, 40, 5, 2, 50 } },
+        .{ "DELETE FROM ex_t WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v <> ex_t.v) = 2", &[_]?i64{ 1, 5, 10, 3, null, 30, 4, 7, 40 } },
+        .{ "UPDATE ex_t SET v = -10 WHERE COALESCE((SELECT SUM(y.id) FROM ex_u y WHERE y.v = ex_t.v), 0) > 20", &[_]?i64{ 1, 5, 10, 2, -10, 20, 3, null, 30, 4, 7, 40, 5, -10, 50 } },
+        .{ "UPDATE ex_t SET v = (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v)", &[_]?i64{ 1, 0, 10, 2, 2, 20, 3, 0, 30, 4, 1, 40, 5, 2, 50 } },
+        .{ "UPDATE ex_t SET k = (SELECT MAX(y.id) FROM ex_u y WHERE y.v = ex_t.v) WHERE ex_t.id < 4", &[_]?i64{ 1, 5, null, 2, 2, 40, 3, null, null, 4, 7, 40, 5, 2, 50 } },
+        .{ "UPDATE ex_t SET v = 100 + (SELECT COUNT(*) FROM ex_u y WHERE y.v <> ex_t.v)", &[_]?i64{ 1, 104, 10, 2, 102, 20, 3, 100, 30, 4, 103, 40, 5, 102, 50 } },
+        .{ "UPDATE ex_t SET k = (SELECT MIN(y.id) FROM ex_u y WHERE y.v = ex_t.v) WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = ex_t.v) = 2", &[_]?i64{ 1, 5, 10, 2, 2, 10, 3, null, 30, 4, 7, 40, 5, 2, 10 } },
+        .{ "DELETE FROM ex_t WHERE ex_t.id * 10 IN (SELECT ex_t.k FROM ex_u y WHERE y.id <> ex_t.k AND y.v = 2)", &[_]?i64{} },
+        .{ "UPDATE ex_t SET v = 0 WHERE (SELECT ex_t.v FROM ex_u y WHERE y.id > ex_t.k AND y.v = 9) = 5", &[_]?i64{ 1, 0, 10, 2, 2, 20, 3, null, 30, 4, 7, 40, 5, 2, 50 } },
+    };
+    inline for (cases) |case| try expectRowsAfter(allocator, case[0], "ex_t", case[1]);
 }
