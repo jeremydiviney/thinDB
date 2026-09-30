@@ -645,7 +645,8 @@ test "MySQL misc functions: FLOAT, DOUBLE and DECIMAL columns as text and as int
     try expectCells(allocator, db, "SELECT JSON_QUOTE(CAST(x AS CHAR)) FROM fd ORDER BY id", 0, &.{ "\"0.1\"", "\"3.4e38\"", "\"1234567\"", null });
     try expectCells(allocator, db, "SELECT REPEAT('a', d) FROM fd ORDER BY id", 0, &.{ "aaa", "a", "", null });
     try expectCells(allocator, db, "SELECT ELT(d, 'p', 'q', 'r') FROM fd ORDER BY id", 0, &.{ "r", "p", null, null });
-    try expectCells(allocator, db, "SELECT LEFT('abcdef', y) FROM fd ORDER BY id", 0, &.{ "abcdef", "", "abcdef", null });
+    // Past INT the count is NULL, as in StarRocks, where MySQL clamps it (#450).
+    try expectCells(allocator, db, "SELECT LEFT('abcdef', y) FROM fd ORDER BY id", 0, &.{ null, "", null, null });
     try expectCells(allocator, db, "SELECT BENCHMARK(d, y) FROM fd ORDER BY id", 0, &.{ "0", "0", null, null });
     try expectCells(allocator, db, "SELECT COLLATION(s) FROM fd ORDER BY id", 0, &.{ "utf8mb4_general_ci", "utf8mb4_general_ci", "utf8mb4_general_ci", "utf8mb4_general_ci" });
     try expectCells(allocator, db, "SELECT CHARSET(x) FROM fd WHERE id = 4", 0, &.{"binary"});

@@ -20,6 +20,7 @@ const types = @import("../types.zig");
 const Type = types.Type;
 const DecimalSpec = types.DecimalSpec;
 
+const cast = @import("cast.zig");
 const common = @import("scalar_fn_common.zig");
 const time = @import("scalar_fn_time.zig");
 const ColumnView = common.ColumnView;
@@ -595,19 +596,26 @@ pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, 
     }
 }
 
-/// A DECIMAL where MySQL reads it as an integer (`HEX(2.5)`,
-/// `REPEAT('a', 2.5)`): rounded half away from zero, clamped to the
-/// BIGINT range.
+/// A DECIMAL where MySQL reads it as an integer (`HEX(2.5)`, BENCHMARK's
+/// count): rounded half away from zero, clamped to the BIGINT range.
 pub fn integerArgAt(v: ColumnView, t: Type, row: usize) i64 {
     const whole = roundDiv(mantissaAt(v, row), pow10(scaleOf(t)));
     return std.math.cast(i64, whole) orelse if (whole < 0) std.math.minInt(i64) else std.math.maxInt(i64);
 }
 
+/// A DECIMAL passed where a function takes an integer: rounded as
+/// `integerArgAt` rounds it, and NULL past BIGINT (`cast.narrowInt`).
 pub fn integerArgKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     _ = out_type;
     const dst = &out.data.bigint;
+    const base = out.data.rowCount();
+    const den = pow10(scaleOf(arg_types[0]));
     try dst.ensureUnusedCapacity(allocator, n);
-    for (0..n) |row| dst.appendAssumeCapacity(integerArgAt(args[0], arg_types[0], row));
+    for (0..n) |row| {
+        const v = if (args[0].isValid(row)) cast.narrowInt(i64, roundDiv(mantissaAt(args[0], row), den)) else null;
+        dst.appendAssumeCapacity(v orelse 0);
+        try out.appendValidBit(allocator, base + row, v != null);
+    }
 }
 
 /// MySQL's `FORMAT(x, d)`: `x` rounded to `d` places (clamped to 0..30),

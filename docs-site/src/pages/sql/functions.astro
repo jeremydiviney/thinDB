@@ -122,7 +122,7 @@ FROM events;`} />
   <h2 id="special-forms">Special SQL forms</h2>
   <div class="table-scroll"><table><thead><tr><th>Form</th><th>Behavior</th></tr></thead><tbody>
     <tr><td><code>EXTRACT(field FROM value)</code></td><td>Lowers to <code>year</code>, <code>month</code>, <code>day</code>, <code>hour</code>, <code>minute</code>, or <code>second</code>. Other fields are rejected.</td></tr>
-    <tr><td><code>CAST(value AS type)</code></td><td>Lowers to the appropriate typed conversion, including precision/scale-aware decimal casts. Text cast to <code>DATE</code> or <code>DATETIME</code> is NULL when it isn't a date.</td></tr>
+    <tr><td><code>CAST(value AS type)</code></td><td>Lowers to the appropriate typed conversion, including precision/scale-aware decimal casts. Text cast to <code>DATE</code> or <code>DATETIME</code> is NULL when it isn't a date. A number cast to an integer type is NULL outside that type's range, as in StarRocks: a LARGEINT past 2^63 - 1 cast to <code>BIGINT</code> is NULL, and so is a number argument outside the range of a function's integer parameter.</td></tr>
     <tr><td><code>json -&gt; path</code></td><td>MySQL-style JSON extraction; lowers to <code>json_extract</code>.</td></tr>
     <tr><td><code>json -&gt;&gt; path</code></td><td>JSON scalar extraction; lowers to <code>json_value</code>.</td></tr>
     <tr><td><code>read_csv</code>, <code>read_json</code>, <code>read_parquet</code></td><td>Table-source functions gated by the server's <code>--file-root</code>. They are not scalar calls.</td></tr>

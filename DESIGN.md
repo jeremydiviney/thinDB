@@ -322,10 +322,11 @@ result is DOUBLE when the decimal has a fraction, as in StarRocks. Beside a
 DECIMAL(p,0) the result is LARGEINT, which holds every value of both and
 prints the same digits StarRocks does; StarRocks says DECIMAL(38,0) and lets
 its values run past 38 digits, which thinDB's decimals don't
-(`cast.commonType`). Cast to BIGINT (`CAST(x AS SIGNED)`), a LARGEINT from 2^63 to
-2^64 - 1 keeps its 64 bits as MySQL does, so `CAST(~5 AS SIGNED)` is -6, where
-StarRocks gives NULL; any other LARGEINT past BIGINT is NULL. `CAST(x AS
-UNSIGNED)` is still a signed BIGINT. An integer of any width, LARGEINT
+(`cast.commonType`). An integer cast to a narrower integer type is NULL
+where it doesn't fit, as in StarRocks and in every dialect (`cast.narrowInt`):
+a LARGEINT past BIGINT's range cast to BIGINT (`CAST(x AS SIGNED)`) is NULL,
+so the MySQL dialect's `CAST(~5 AS SIGNED)` is NULL, where MySQL keeps the 64
+bits and gives -6. `CAST(x AS UNSIGNED)` is still a signed BIGINT. An integer of any width, LARGEINT
 included, becomes text digit for digit (`CAST(… AS CHAR)`, CONCAT and every
 other text context). The MySQL wire presents a LARGEINT column as BIGINT in a
 text result, and as DECIMAL(39, 0) in a prepared statement's binary result,
@@ -1000,8 +1001,8 @@ outer side may be an expression over the outer row (`y.id = x.k + 10`),
 which the enclosing operator computes first. EXISTS, IN and a single
 aggregate compared in a WHERE become a lookup each outer row probes with its
 own values; any other scalar is grouped by its keys and LEFT JOINed back.
-This is the only strategy for a DELETE or UPDATE predicate and a join's ON,
-which have no input rows to join a result back to.
+A DELETE or UPDATE predicate and a join's ON take it first too; the rest of
+theirs is below.
 
 Domain. Any other correlated subquery in a filter or an expression is lifted
 onto its domain: the distinct combinations of the enclosing values it reads,
@@ -1011,8 +1012,10 @@ the domain. A WHERE conjunct comparing a FROM column with a domain value by
 other correlated term (under OR, reading both rows, `<>`) filters the joined
 pairs. Each GROUP BY and window partition also groups by the domain values,
 and a LIMIT keeps its rows per domain row, numbered in the ORDER BY under
-it. The result, keyed by the domain values, is LEFT JOINed back to the
-enclosing operator's rows:
+it. An aggregate without GROUP BY below the top of the block still yields a
+row for every domain row, over no rows where none reached it. The result,
+keyed by the domain values, is LEFT JOINed back to the enclosing operator's
+rows:
 
 - EXISTS and IN read whether a marker row matched. IN compares its columns
   with `=`.
@@ -1026,6 +1029,39 @@ and matches no inner row; the join back matches NULL to NULL, so its outer
 row still finds its domain row (a count of 0, a NULL scalar). NOT IN keeps
 thinDB's IN-set dialect on every path: NULLs among the subquery's values are
 skipped, and a NULL compared value never passes.
+
+A FROM that itself reads enclosing values, as a LATERAL derived table would,
+is lifted in place rather than joined. A relation that reads them carries the
+domain values through its own operators, its WHERE staying an ordinary
+filter over the domain rows it joined; a join between two such relations
+matches on them too, and a relation that reads none is crossed with the
+domain. A FULL JOIN with a side that reads them isn't lifted: its unmatched
+rows would need every domain row. A UNION inside the subquery lifts each
+arm the same way, an arm that reads nothing enclosing crossed with the
+domain so every domain row sees its rows. A `SELECT *` in a lifted block is
+first spelled out from the columns its relations carry; a star it can't
+spell out, such as one over a join whose columns share names, isn't lifted.
+
+An aggregate in a subquery whose arguments read only enclosing columns
+(`SUM(x.v)`) belongs to the enclosing query, as SQL scopes it. Before either
+strategy runs it moves there: into the enclosing GROUP BY, or a new global
+aggregate when the enclosing SELECT has none, and the subquery reads it as an
+enclosing value, keyed or lifted like any other. An expression over such
+aggregates and the subquery's own (`SUM(x.v) + COUNT(*)`) reads the
+subquery's one aggregate row, joined to every outer row. Nested in another
+aggregate, or beside an ungrouped outer column, it has no query to aggregate
+in, and the statement fails as it does in SQL.
+
+A DELETE or UPDATE whose predicate no keyed path takes lifts it over the
+target's own rows, as a SELECT whose domain is drawn from them, and writes
+the rows that SELECT keeps, found again by the target's primary key, as the
+multi-table form does. A target without a primary key has no sound row
+identity to find them by, so the statement raises
+`UnsupportedCorrelatedSubquery`. An outer join whose ON no keyed path takes
+numbers each input's rows once in a buffer. The pairs its keys and ranges
+match are the domain for the condition and the values it computes; the pairs
+the condition keeps, as number pairs, are what the outer join then matches
+on, so a row with no kept pair is still NULL-extended.
 
 The enclosing operator's conjuncts that read no subquery narrow the domain's
 source first. A source cheap and deterministic to run again (a base-table
@@ -1044,6 +1080,10 @@ KILL and a disconnect stop it promptly (§8.3).
 
 A shape neither strategy carries raises `UnsupportedCorrelatedSubquery`
 (§9.8); it is never compiled with an outer name bound to an inner column.
+Besides the ones above, a lifted scalar that returns an enclosing column
+as-is does, as does one returning an expression named by text that opens
+with the enclosing qualifier (`SELECT x.k + z.id`, whose name reads as a
+column of `x`).
 
 ---
 
@@ -1366,7 +1406,7 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 
 `ArithmeticOverflow` comes from decimal arithmetic and casts that leave the declared precision, and from `SUM(LARGEINT)` past the i128 range. Integer arithmetic and integer `SUM` up to BIGINT wrap instead of raising it (§3.4).
 
-`ValueOutOfRange` means INSERT or UPDATE wrote a value its column's type can't hold, such as 300 into a TINYINT or 127.5 into a TINYINT after rounding. MySQL's strict mode fails the statement the same way; a CAST clamps instead.
+`ValueOutOfRange` means INSERT or UPDATE wrote a value its column's type can't hold, such as 300 into a TINYINT or 127.5 into a TINYINT after rounding. MySQL's strict mode fails the statement the same way, as does StarRocks' strict INSERT; a CAST gives NULL instead (§3.4).
 
 `InvalidTemporalLiteral` means a DATE or DATETIME was compared with a string constant that doesn't read as a date or datetime (§3.1), as in `d = ''`, `d = 'abc'` or `d < '2026-09-31'`. The statement fails when it is planned, before it returns or changes any rows. The constant comes from the statement itself: written in its text, the value of a constant expression or a scalar subquery, or a user variable it reads. The rule is the same for every comparison form: `=`, `<>`, `<`, `<=>`, BETWEEN, IN, CASE, HAVING, a JOIN's ON and NULLIF. A NULL, a text column, a CAST, and rows an IN subquery returns never raise it. Neither does a bound parameter (MySQL's COM_STMT_EXECUTE, a PostgreSQL Bind) or a value an embedded caller passes in a predicate or an expression: the comparison matches no row, as MySQL's binary protocol returns no rows with a warning. Text equal to one of the statement's bound parameters counts as bound wherever it appears. DML staged in an XA branch replays from its encoded plan, which doesn't record where a value came from, so a bad constant there matches nothing instead of failing XA COMMIT. The MySQL wire reports the error as 1525 (`HY000`) with MySQL's message, `Incorrect DATE value: 'abc'`. The PostgreSQL wire reports it as `22007` with the same message. MySQL raises 1525 for the same constants in the text protocol, with two exceptions that only warn and skip the value: BETWEEN and an IN list of two or more values. thinDB fails those too. MySQL's UPDATE and DELETE raise 1292 (`Incorrect date value`) where thinDB raises 1525.
 
@@ -1374,7 +1414,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
-`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): an enclosing column in the subquery's FROM (a derived table that reads it, as LATERAL would), an aggregate whose argument reads only enclosing columns (`SUM(x.v)` inside the subquery, which SQL aggregates in the enclosing query), a UNION inside the subquery that reads them, or, in a DELETE or UPDATE predicate or a join's ON, a correlation other than equalities and ranges on the subquery's own columns. A subquery correlated some other way also can't use `SELECT *`, or be an IN over an aggregate without GROUP BY. A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
+`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), a lifted scalar that returns an enclosing column as-is or an expression named by text that opens with the enclosing qualifier, an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 
@@ -1493,7 +1533,7 @@ Target Zig version: 0.16.
 | **Range / opaque predicates** | Single inequality `a OP b`, multi-range (BETWEEN), `extra_predicate` post-join filter, opaque callback via NLJ. Skew detection + auto-route on top. |
 | **Upserts** | StarRocks-style last-writer-wins on tables with `unique = true`. Insert auto-resolves; `Table.upsert()` is the self-documenting alias. |
 | **Crash durability** | WAL with leader-follower group commit (§8.1). `wal_enabled = true` + `sync_mode = .per_flush`. |
-| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow, saturating, to a narrower integer parameter. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4). An `INTERVAL` amount counts whole units: a fractional literal rounds half away from zero (`INTERVAL 1.5 WEEK` is 14 days) and a text amount reads its leading integer, as MySQL does; any other amount takes an integer type. The count is an INT, as in StarRocks: a count past INT's range moves a date to NULL. A string literal meets a function as a string column does first; where only a date or datetime fits, it is read once at plan time, as a CAST to that type reads it, a DATETIME before a DATE (§3.1), and text that doesn't read is NULL. `CAST('…' AS DATE)` and `DATE('…')` read a literal once with their own kernels. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal, and BOOLEAN `true`, `false` or an INT, §3.1). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. Every write (INSERT, UPDATE, ON DUPLICATE KEY UPDATE) converts a value into a DECIMAL column as `CAST` to the column's type does: it rounds half away from zero to the scale, raises past the precision, and rejects text that isn't a number. |
+| **Implicit type coercion** | DuckDB/StarRocks-style: numeric widening, int → float/double, bool → ints, date → datetime. Exact-match overload selection takes the fast path; coercion is cost-ranked when no exact overload exists. Only when no overload is reachable by widening does an integer argument narrow to a narrower integer parameter, NULL where it doesn't fit, as an explicit `CAST` narrows. StarRocks casts function arguments the same way, so `date_add(d, n + 1)` still resolves although `n + 1` is BIGINT (§3.4), and `LEFT(s, 4294967297)` is NULL. A double or decimal argument to an integer parameter rounds as MySQL reads it (`REPEAT('a', 2.5)` is `aaa`), and is NULL past the parameter's range, as in StarRocks, where MySQL clamps it: `LEFT(s, 1e15)` is NULL. A table function's integer argument binds narrowed to its declared type the same way; a NULL reaching a parameter the function can't take NULL for raises `TableFnInputMismatch`. An `INTERVAL` amount counts whole units: a fractional literal rounds half away from zero (`INTERVAL 1.5 WEEK` is 14 days) and a text amount reads its leading integer, as MySQL does; any other amount takes an integer type. The count is an INT, as in StarRocks: a count past INT's range moves a date to NULL. A string literal meets a function as a string column does first; where only a date or datetime fits, it is read once at plan time, as a CAST to that type reads it, a DATETIME before a DATE (§3.1), and text that doesn't read is NULL. `CAST('…' AS DATE)` and `DATE('…')` read a literal once with their own kernels. A string column converts only by explicit `CAST`, which yields NULL for text that isn't a value of the target type: a date, or a number of the target's kind (an integer type takes only a trimmed integer literal, and BOOLEAN `true`, `false` or an INT, §3.1). An explicit `CAST` of a number into an integer type truncates toward zero and yields NULL outside the target's range, as StarRocks does; a DECIMAL target raises on a value past its precision. INSERT … SELECT parses text into a DATE/DATETIME column and rejects text that isn't a date. Every write (INSERT, UPDATE, ON DUPLICATE KEY UPDATE) converts a value into a DECIMAL column as `CAST` to the column's type does: it rounds half away from zero to the scale, raises past the precision, and rejects text that isn't a number. |
 | **Statistical / set-oriented aggregates** | `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT`. |
 | **In-process Connection** | `thindb.local(...)` returns a Connection that mediates queries — same surface a future remote-mode Connection will expose. |
 
