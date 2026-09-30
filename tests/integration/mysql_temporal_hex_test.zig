@@ -209,7 +209,8 @@ test "an aggregate over a DATE or DATETIME sums its number in MySQL" {
         .{ "SELECT AVG(ts) FROM ag", &[_]?[]const u8{"20130796393105.25"} },
         .{ "SELECT SUM(DISTINCT d) FROM ag", &[_]?[]const u8{"80523185"} },
         .{ "SELECT AVG(DISTINCT d) FROM ag", &[_]?[]const u8{"20130796.25"} },
-        .{ "SELECT SUM(d + INTERVAL 1 DAY) FROM ag", &[_]?[]const u8{"80532058"} },
+        // A DATE moved a day is a DATETIME, which sums its YYYYMMDDhhmmss.
+        .{ "SELECT SUM(d + INTERVAL 1 DAY) FROM ag", &[_]?[]const u8{"80532058000000"} },
         .{ "SELECT BIT_XOR(d) FROM ag", &[_]?[]const u8{"24267"} },
         .{ "SELECT STDDEV_POP(d) FROM ag", &[_]?[]const u8{"130301.15723848158"} },
         .{ "SELECT SUM(d) FROM ag WHERE d > 20000000", &[_]?[]const u8{"60531954"} },

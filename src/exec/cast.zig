@@ -531,7 +531,9 @@ pub fn freeAssignedColumn(allocator: Allocator, view: ColumnView) void {
 /// assignment rule as it lands (`assignColumn`). A decimal target always
 /// takes one when the types differ: the memtable matches decimal columns on
 /// tag alone, so a payload at another scale would be stored misread. Text
-/// parses into a DATE or DATETIME target. Other targets widen along the
+/// parses into a DATE or DATETIME target, and a DATETIME lands in a DATE
+/// column as its day, as MySQL and StarRocks store it: a DATE stepped by
+/// days is a DATETIME at midnight. Other targets widen along the
 /// implicit-cast ladder short of its lossy steps; the memtable admits or
 /// rejects the rest. A row the cast turns NULL is a failed write
 /// (`assignmentDroppedValue`). Allocates in `arena`.
@@ -539,8 +541,8 @@ pub fn assignmentCastExpr(arena: Allocator, name: []const u8, from: Type, to: Ty
     if (std.meta.eql(from, to) or assignsByRule(from, to)) return null;
     const widens = if (to.isDecimal())
         from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean or (from.isString() and from != .json)
-    else if ((to == .date or to == .datetime) and from.isString())
-        true
+    else if (to == .date or to == .datetime)
+        from.isString() or from == .date or from == .datetime
     else if (castCost(@as(TypeTag, from), @as(TypeTag, to))) |cost|
         cost > 0 and cost < LOSSY_CAST_COST
     else

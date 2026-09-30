@@ -119,6 +119,33 @@ test "scalar_fn: a wider integer argument narrows only when nothing widens" {
     try std.testing.expect((try resolve(aa, "date_add", &.{ .date, .double })) == null);
 }
 
+test "scalar_fn: a DATE stepped by any unit is a DATETIME (#414)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const cases = .{
+        .{ "date_add", &[_]types.Type{ .date, .int } },
+        .{ "date_sub", &[_]types.Type{ .date, .int } },
+        .{ "date_add", &[_]types.Type{ .date, .bigint } },
+        .{ "date_add_weeks", &[_]types.Type{ .date, .int } },
+        .{ "date_add_months", &[_]types.Type{ .date, .int } },
+        .{ "date_add_quarters", &[_]types.Type{ .date, .int } },
+        .{ "date_add_years", &[_]types.Type{ .date, .int } },
+        .{ "date_add_hours", &[_]types.Type{ .date, .bigint } },
+        .{ "days_add", &[_]types.Type{ .date, .bigint } },
+        .{ "weeks_sub", &[_]types.Type{ .date, .bigint } },
+        .{ "months_add", &[_]types.Type{ .date, .bigint } },
+        .{ "quarters_add", &[_]types.Type{ .date, .bigint } },
+        .{ "years_sub", &[_]types.Type{ .date, .bigint } },
+        .{ "timestampadd", &[_]types.Type{ .string, .int, .date } },
+    };
+    inline for (cases) |c| {
+        const r = (try resolve(aa, c[0], c[1])) orelse return error.NotFound;
+        try std.testing.expectEqual(@as(TypeTag, .datetime), @as(TypeTag, r.func.return_type));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Expanded scalar function registry (lpad/rpad/repeat/space/ascii/position/
 // instr/substring_index/strcmp + truncate/degrees/radians/atan2 + date funcs

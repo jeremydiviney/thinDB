@@ -116,43 +116,35 @@ pub fn datediffDatetimeKernel(allocator: Allocator, args: []const ColumnView, ou
 
 const Temporal = enum { date, datetime };
 
-/// DATE_ADD over a DATE or DATETIME by `n` days, weeks, months, quarters or
-/// years (DATE_SUB negates `n`), keeping the time of day; a month step clamps
-/// the day to the destination month (`2024-01-31 + 1 month → 2024-02-29`).
-/// A result outside years 0-9999 is NULL, as in StarRocks.
-fn AddUnit(comptime temporal: Temporal, comptime unit: DateUnit, comptime negate: bool) type {
+/// DATE_ADD over a DATETIME by `n` days, weeks, months, quarters or years
+/// (DATE_SUB negates `n`), keeping the time of day; a month step clamps the
+/// day to the destination month (`2024-01-31 + 1 month → 2024-02-29`). A
+/// DATE reaches it widened to midnight. A result outside years 0-9999 is
+/// NULL, as in StarRocks.
+fn AddUnit(comptime unit: DateUnit, comptime negate: bool) type {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
             const base = out.data.rowCount();
-            const values = @field(args[0].data, @tagName(temporal));
+            const values = args[0].data.datetime;
             const ns = args[1].data.int;
             for (0..row_count) |i| {
                 // Saturating: a count of days or more past INT's range moves
                 // any date outside years 0-9999 either way.
                 const n = if (negate) 0 -| ns[i] else ns[i];
-                const moved = if (args[0].isValid(i) and args[1].isValid(i)) switch (temporal) {
-                    .date => addUnitToDate(unit, values[i], n),
-                    .datetime => addUnitToDatetime(unit, values[i], n),
-                } else null;
-                try @field(out.data, @tagName(temporal)).append(allocator, moved orelse 0);
+                const moved = if (args[0].isValid(i) and args[1].isValid(i)) addUnitToDatetime(unit, values[i], n) else null;
+                try out.data.datetime.append(allocator, moved orelse 0);
                 try out.appendValidBit(allocator, base + i, moved != null);
             }
         }
     };
 }
 
-pub const dateAddDaysKernel = AddUnit(.date, .day, false).kernel;
-pub const dateSubDaysKernel = AddUnit(.date, .day, true).kernel;
-pub const dateAddWeeksKernel = AddUnit(.date, .week, false).kernel;
-pub const dateAddMonthsKernel = AddUnit(.date, .month, false).kernel;
-pub const dateAddQuartersKernel = AddUnit(.date, .quarter, false).kernel;
-pub const dateAddYearsKernel = AddUnit(.date, .year, false).kernel;
-pub const datetimeAddDaysKernel = AddUnit(.datetime, .day, false).kernel;
-pub const datetimeSubDaysKernel = AddUnit(.datetime, .day, true).kernel;
-pub const datetimeAddWeeksKernel = AddUnit(.datetime, .week, false).kernel;
-pub const datetimeAddMonthsKernel = AddUnit(.datetime, .month, false).kernel;
-pub const datetimeAddQuartersKernel = AddUnit(.datetime, .quarter, false).kernel;
-pub const datetimeAddYearsKernel = AddUnit(.datetime, .year, false).kernel;
+pub const datetimeAddDaysKernel = AddUnit(.day, false).kernel;
+pub const datetimeSubDaysKernel = AddUnit(.day, true).kernel;
+pub const datetimeAddWeeksKernel = AddUnit(.week, false).kernel;
+pub const datetimeAddMonthsKernel = AddUnit(.month, false).kernel;
+pub const datetimeAddQuartersKernel = AddUnit(.quarter, false).kernel;
+pub const datetimeAddYearsKernel = AddUnit(.year, false).kernel;
 
 /// A DATETIME moved by a count of `step_micros`-long steps. The count is an
 /// INT, as in StarRocks: one past INT's range is NULL, and so is a result
@@ -917,56 +909,38 @@ pub fn timestampDiffKernel(allocator: Allocator, args: []const ColumnView, out: 
     for (start[0..row_count], end[0..row_count]) |s, e| try out.data.bigint.append(allocator, timestampDiff(unit, s, e));
 }
 
-/// A DATE moved by `n` of `unit`, or null outside years 0-9999. A sub-day
-/// unit moves the date's midnight and keeps the day it lands on.
-fn addUnitToDate(unit: DateUnit, days: i32, n: i32) ?i32 {
-    return switch (unit) {
+/// A DATETIME moved by `n` of `unit`, keeping the time of day for a unit of
+/// a day or more, or null outside years 0-9999.
+fn addUnitToDatetime(unit: DateUnit, micros: i64, n: i32) ?i64 {
+    const days = daysFromDatetime(micros);
+    const moved_days = switch (unit) {
+        .second => return datetimeInRange(micros +| @as(i64, n) * std.time.us_per_s),
+        .minute => return datetimeInRange(micros +| @as(i64, n) * std.time.us_per_min),
+        .hour => return datetimeInRange(micros +| @as(i64, n) * std.time.us_per_hour),
         .day => dateInRange(@as(i64, days) + n),
         .week => dateInRange(@as(i64, days) + @as(i64, n) * 7),
         .month => addMonths(days, n),
         .quarter => addMonths(days, @as(i64, n) * 3),
         .year => addMonths(days, @as(i64, n) * 12),
-        .hour, .minute, .second => daysFromDatetime(addUnitToDatetime(unit, @as(i64, days) * std.time.us_per_day, n) orelse return null),
-    };
-}
-
-/// A DATETIME moved by `n` of `unit`, keeping the time of day for a unit of
-/// a day or more, or null outside years 0-9999.
-fn addUnitToDatetime(unit: DateUnit, micros: i64, n: i32) ?i64 {
-    return switch (unit) {
-        .second => datetimeInRange(micros +| @as(i64, n) * std.time.us_per_s),
-        .minute => datetimeInRange(micros +| @as(i64, n) * std.time.us_per_min),
-        .hour => datetimeInRange(micros +| @as(i64, n) * std.time.us_per_hour),
-        .day, .week, .month, .quarter, .year => {
-            const days = addUnitToDate(unit, daysFromDatetime(micros), n) orelse return null;
-            return @as(i64, days) * std.time.us_per_day + @mod(micros, std.time.us_per_day);
-        },
-    };
+    } orelse return null;
+    return @as(i64, moved_days) * std.time.us_per_day + @mod(micros, std.time.us_per_day);
 }
 
 /// TIMESTAMPADD(unit, n, x) with its unit given as text; the parser turns a
-/// unit word into an interval. A result outside years 0-9999 is NULL.
-fn TimestampAdd(comptime temporal: Temporal) type {
-    return struct {
-        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-            const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
-            const base = out.data.rowCount();
-            const ns = args[1].data.int;
-            const values = @field(args[2].data, @tagName(temporal));
-            for (0..row_count) |i| {
-                const moved = if (args[1].isValid(i) and args[2].isValid(i)) switch (temporal) {
-                    .date => addUnitToDate(unit, values[i], ns[i]),
-                    .datetime => addUnitToDatetime(unit, values[i], ns[i]),
-                } else null;
-                try @field(out.data, @tagName(temporal)).append(allocator, moved orelse 0);
-                try out.appendValidBit(allocator, base + i, moved != null);
-            }
-        }
-    };
+/// unit word into an interval. A DATE reaches it widened to midnight, so a
+/// DATE moved by hours keeps its time, as MySQL moves it. A result outside
+/// years 0-9999 is NULL.
+pub fn timestampAddKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
+    const base = out.data.rowCount();
+    const ns = args[1].data.int;
+    const values = args[2].data.datetime;
+    for (0..row_count) |i| {
+        const moved = if (args[1].isValid(i) and args[2].isValid(i)) addUnitToDatetime(unit, values[i], ns[i]) else null;
+        try out.data.datetime.append(allocator, moved orelse 0);
+        try out.appendValidBit(allocator, base + i, moved != null);
+    }
 }
-
-pub const timestampAddDateKernel = TimestampAdd(.date).kernel;
-pub const timestampAddDatetimeKernel = TimestampAdd(.datetime).kernel;
 
 // ---------------------------------------------------------------------------
 // date_format: MySQL's specifiers (scalar_fn_datefmt.zig). Per-row format
@@ -1204,7 +1178,6 @@ test "DATE_DIFF and MONTHS_DIFF count from their second value to their first, as
 }
 
 test "date arithmetic that leaves years 0-9999 is null, whatever its count" {
-    const day = common.ymdToDays;
     const dt = struct {
         fn at(y: i32, mo: u32, d: u32, h: i64, mi: i64, s: i64) i64 {
             return @as(i64, common.ymdToDays(y, mo, d)) * std.time.us_per_day + ((h * 60 + mi) * 60 + s) * std.time.us_per_s;
@@ -1212,30 +1185,28 @@ test "date arithmetic that leaves years 0-9999 is null, whatever its count" {
     }.at;
     const max = std.math.maxInt(i32);
     const min = std.math.minInt(i32);
-    // Every expected value is StarRocks 4.0's.
-    const dates = .{
-        .{ DateUnit.day, day(9999, 12, 30), 1, day(9999, 12, 31) },
-        .{ DateUnit.day, day(9999, 12, 31), 1, null },
-        .{ DateUnit.day, day(0, 1, 1), -1, null },
-        .{ DateUnit.day, day(2026, 1, 1), max, null },
-        .{ DateUnit.day, day(2026, 1, 1), min, null },
-        .{ DateUnit.week, day(9999, 12, 24), 1, day(9999, 12, 31) },
-        .{ DateUnit.week, day(9999, 12, 25), 1, null },
-        .{ DateUnit.month, day(9999, 11, 30), 1, day(9999, 12, 30) },
-        .{ DateUnit.month, day(9999, 12, 15), 1, null },
-        .{ DateUnit.month, day(0, 1, 31), -1, null },
-        .{ DateUnit.month, day(2026, 1, 1), max, null },
-        .{ DateUnit.quarter, day(2026, 1, 1), min, null },
-        .{ DateUnit.year, day(9998, 2, 28), 1, day(9999, 2, 28) },
-        .{ DateUnit.year, day(0, 2, 29), 1, day(1, 2, 28) },
-        .{ DateUnit.year, day(9999, 1, 1), 1, null },
+    // Every expected value is StarRocks 4.0's. A DATE moves as its midnight.
+    const midnights = .{
+        .{ DateUnit.day, dt(9999, 12, 30, 0, 0, 0), 1, dt(9999, 12, 31, 0, 0, 0) },
+        .{ DateUnit.day, dt(9999, 12, 31, 0, 0, 0), 1, null },
+        .{ DateUnit.day, dt(0, 1, 1, 0, 0, 0), -1, null },
+        .{ DateUnit.day, dt(2026, 1, 1, 0, 0, 0), min, null },
+        .{ DateUnit.week, dt(9999, 12, 24, 0, 0, 0), 1, dt(9999, 12, 31, 0, 0, 0) },
+        .{ DateUnit.week, dt(9999, 12, 25, 0, 0, 0), 1, null },
+        .{ DateUnit.month, dt(9999, 11, 30, 0, 0, 0), 1, dt(9999, 12, 30, 0, 0, 0) },
+        .{ DateUnit.month, dt(0, 1, 31, 0, 0, 0), -1, null },
+        .{ DateUnit.month, dt(2026, 1, 1, 0, 0, 0), max, null },
+        .{ DateUnit.quarter, dt(2026, 1, 1, 0, 0, 0), min, null },
+        .{ DateUnit.year, dt(9998, 2, 28, 0, 0, 0), 1, dt(9999, 2, 28, 0, 0, 0) },
+        .{ DateUnit.year, dt(0, 2, 29, 0, 0, 0), 1, dt(1, 2, 28, 0, 0, 0) },
+        .{ DateUnit.year, dt(9999, 1, 1, 0, 0, 0), 1, null },
         // A year count times 12 once wrapped INT, landing on 2025-01-01.
-        .{ DateUnit.year, day(2026, 1, 1), max, null },
-        .{ DateUnit.hour, day(9999, 12, 31), 23, day(9999, 12, 31) },
-        .{ DateUnit.hour, day(9999, 12, 31), 24, null },
-        .{ DateUnit.second, day(0, 1, 1), -1, null },
+        .{ DateUnit.year, dt(2026, 1, 1, 0, 0, 0), max, null },
+        .{ DateUnit.hour, dt(9999, 12, 31, 0, 0, 0), 23, dt(9999, 12, 31, 23, 0, 0) },
+        .{ DateUnit.hour, dt(9999, 12, 31, 0, 0, 0), 24, null },
+        .{ DateUnit.second, dt(0, 1, 1, 0, 0, 0), -1, null },
     };
-    inline for (dates) |c| try std.testing.expectEqual(@as(?i32, c[3]), addUnitToDate(c[0], c[1], c[2]));
+    inline for (midnights) |c| try std.testing.expectEqual(@as(?i64, c[3]), addUnitToDatetime(c[0], c[1], c[2]));
     const datetimes = .{
         .{ DateUnit.second, dt(9999, 12, 31, 23, 59, 58), 1, dt(9999, 12, 31, 23, 59, 59) },
         .{ DateUnit.second, dt(9999, 12, 31, 23, 59, 59), 1, null },

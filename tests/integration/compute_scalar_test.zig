@@ -528,7 +528,8 @@ test "scalar: expanded missing-function kernels through Compute" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2 }, b.values[base_cols + 16].data.bigint[0..2]);
     try std.testing.expectEqualStrings("Thursday", b.values[base_cols + 17].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("January", b.values[base_cols + 18].data.string.rowBytes(0));
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 2, 34 }, b.values[base_cols + 19].data.date[0..2]);
+    const day = std.time.us_per_day;
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 2 * day, 34 * day }, b.values[base_cols + 19].data.datetime[0..2]);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, b.values[base_cols + 20].data.bigint[0..2]);
     try std.testing.expectEqual(@as(usize, 64), b.values[base_cols + 21].data.string.rowBytes(0).len);
     try std.testing.expectEqual(@as(usize, 32), b.values[base_cols + 22].data.string.rowBytes(0).len);

@@ -80,7 +80,10 @@ date, 0000-01-01 is a Saturday, `TO_DAYS('0000-01-01')` is 0 and
 `FROM_DAYS(59)` is 0000-02-29. MySQL counts year 0 as 365 days with no
 February 29, which moves its weekdays and day numbers before 0000-03-01 by
 one. Date arithmetic whose result leaves this range is NULL, as in
-StarRocks: `DATE_ADD('9999-12-31', INTERVAL 1 DAY)` is NULL. One deliberate
+StarRocks: `DATE_ADD('9999-12-31', INTERVAL 1 DAY)` is NULL. Date
+arithmetic returns a DATETIME, as in StarRocks: a DATE moves as its midnight,
+so `DATE '2026-01-31' + INTERVAL 1 MONTH` is 2026-02-28 00:00:00, and a
+DATETIME written into a DATE column lands as its day. One deliberate
 exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
 reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
 the day it is, so every reader agrees with the one calendar.
