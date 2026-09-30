@@ -48,7 +48,7 @@ pub fn routeGroupBy(
 ) !Query {
     const trace = getenv_gr("THINDB_TRACE_GBROUTE") != null;
     const st = upstream.stats();
-    const partition_ok = partitionCandidate(st, group_cols, top_k, emit_limit, partition_dop) and
+    const partition_ok = partitionCandidate(st, upstream.outputSchema(), group_cols, aggs, top_k, emit_limit, partition_dop) and
         exec.force_group_by == .auto;
     if (group_cols.len > 0 and exec.force_group_by == .auto and !groupKeysSortedPrefix(st.sort_state, group_cols)) budgeted: {
         const account = upstream.accountant() orelse break :budgeted;
@@ -180,17 +180,24 @@ pub fn narrowToAggregateInputs(
 }
 
 /// True when the partitioned aggregate can carry this GROUP BY on
-/// `partition_dop` threads: keyed, no top-k or LIMIT emit (the hash path's
-/// early-outs serve those), over an input big enough to repay the threads.
+/// `partition_dop` threads and may beat the hash plan: keyed, no top-k or
+/// LIMIT emit (the hash path's early-outs serve those), over an input big
+/// enough to repay the threads, with a key space not proven cache-resident.
+/// A few groups leave the partitions little to split, and a skewed few put
+/// nearly every row in one partition, while the plan still copies its whole
+/// input (issue #396: 44 keys, 4x slower than the hash plan).
 fn partitionCandidate(
     st: exec.PipelineStats,
+    schema: []const types.Column,
     group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
     top_k: ?ir.Op.TopK,
     emit_limit: ?u32,
     partition_dop: usize,
 ) bool {
     return partition_dop > 1 and group_cols.len > 0 and top_k == null and emit_limit == null and
-        st.upper_rows >= partitioned_aggregate.MIN_ROWS_FOR_PARALLEL;
+        st.upper_rows >= partitioned_aggregate.MIN_ROWS_FOR_PARALLEL and
+        !keySpaceCacheResident(st, schema, group_cols, aggs);
 }
 
 /// True when the budget router would weigh the partitioned plan, whose fit
@@ -198,13 +205,15 @@ fn partitionCandidate(
 /// (`RealizedInput`) routes on exact bytes instead of the pre-filter bound.
 pub fn routesOnInputSize(
     st: exec.PipelineStats,
+    schema: []const types.Column,
     group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
     top_k: ?ir.Op.TopK,
     emit_limit: ?u32,
     partition_dop: usize,
 ) bool {
     return exec.force_group_by == .auto and
-        partitionCandidate(st, group_cols, top_k, emit_limit, partition_dop) and
+        partitionCandidate(st, schema, group_cols, aggs, top_k, emit_limit, partition_dop) and
         !groupKeysSortedPrefix(st.sort_state, group_cols);
 }
 
@@ -685,6 +694,29 @@ pub const RealizedInput = struct {
 /// resident and the hash path's inline-state / count-slot fast paths win.
 pub const RADIX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// True when the key space is proven to fit a cache-resident group table:
+/// every key's NDV is exact, and their product (at most the rows) times a
+/// group's table bytes stays within `RADIX_CACHE_BYTES`.
+pub fn keySpaceCacheResident(
+    st: exec.PipelineStats,
+    schema: []const types.Column,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+) bool {
+    var groups: u64 = 1;
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return false;
+        if (idx >= st.column_stats.len) return false;
+        switch (st.column_stats[idx].ndv) {
+            .exact => |nd| groups *|= nd,
+            .unknown => return false,
+        }
+    }
+    groups = @min(groups, @max(st.upper_rows, 1));
+    const per_group = perGroupTableBytes(schema, group_cols, aggs);
+    return per_group != 0 and groups *| per_group <= RADIX_CACHE_BYTES;
+}
+
 /// Radix-partitioned aggregate routing — the standard high-cardinality path.
 /// Returns a RadixAggregate Query when the GROUP BY qualifies: a native integer
 /// key (string/dict-coded keys still take the coded paths the radix operator
@@ -727,33 +759,12 @@ pub fn routeRadixGroupBy(
         // group table on the hash path that beats the generic compact core.
         if (group_cols.len == 1 and aggs.len == 1 and aggs[0].func == .count and aggs[0].col == null) return null;
 
-        const st = upstream.stats();
-        var est: u64 = 1;
-        var known = true;
-        for (group_cols) |gc| {
-            const idx = types.findColumn(schema, gc).?;
-            if (idx >= st.column_stats.len) {
-                known = false;
-                break;
-            }
-            switch (st.column_stats[idx].ndv) {
-                .exact => |nd| est *|= nd,
-                .unknown => {
-                    known = false;
-                    break;
-                },
-            }
-        }
         // Known low-cardinality → the hash path's inline-state / count-slot fast
         // paths win, so decline. UNKNOWN cardinality → take radix: its adaptive
         // sizing bounds the worst case (an unexpectedly-huge group count would
         // otherwise hit the generic 96B-state path), trading a few ms on
         // unknown-but-low for bounded behaviour on unknown-but-high.
-        if (known) {
-            est = @min(est, @max(st.upper_rows, 1));
-            const per_group_bytes = perGroupTableBytes(schema, group_cols, aggs);
-            if (per_group_bytes != 0 and est *| per_group_bytes <= RADIX_CACHE_BYTES) return null;
-        }
+        if (keySpaceCacheResident(upstream.stats(), schema, group_cols, aggs)) return null;
     }
 
     const rtk: ?exec.radix_aggregate.TopK = if (top_k) |tk|
@@ -1455,4 +1466,39 @@ test "near-unique groups whose hash-table partitions do not fit partition with s
     try std.testing.expect(sorted.peak - sorted.held <= needs.partitioned_sort);
     try std.testing.expectEqual(roomy.lines.len, sorted.lines.len);
     for (roomy.lines, sorted.lines) |r, s| try std.testing.expectEqualStrings(r, s);
+}
+
+test "a proven cache-resident key space takes the hash plan, not the partitioned one (issue #396)" {
+    const a = std.testing.allocator;
+    const aggs = [_]ir.AggSpec{
+        .{ .func = .max_by, .col = "v", .arg2_col = "t", .as = "u" },
+        .{ .func = .count, .col = null, .as = "c" },
+    };
+    const group_cols = [_][]const u8{"k"};
+    // The same input and budget partition while the key's NDV is unknown.
+    const unknown = try testRouteRealized(a, 1 << 40, 4, false);
+    defer testFreeLines(a, unknown.lines);
+    try std.testing.expectEqual(RoutedPlan.partitioned, unknown.plan);
+
+    const account = try testAccountant(a, 1 << 40);
+    defer account.releaseOwner(a);
+    const tracked = try account.executionAllocator();
+    const worker = try account.wrapAllocator(a);
+    const owned = try testOwnedChunks(worker, &.{ 30_000, 30_000, 30_000, 30_000 });
+    var drained = TestDrained{ .account = account };
+    var q = routed: {
+        var up = try RealizedInput.create(tracked, exec.makeQuery(tracked, &drained), owned);
+        errdefer up.deinit();
+        // Its 5003 keys, proven: their group table stays cache-resident.
+        exec.queryAs(RealizedInput, up).?.col_stats[0].ndv = .{ .exact = 5003 };
+        try std.testing.expect(keySpaceCacheResident(up.stats(), up.outputSchema(), &group_cols, &aggs));
+        try std.testing.expect(!routesOnInputSize(up.stats(), up.outputSchema(), &group_cols, &aggs, null, null, 4));
+        break :routed try routeGroupBy(tracked, worker, &up, &group_cols, &aggs, null, null, 1 << 40, 4);
+    };
+    defer q.deinit();
+    try std.testing.expect(exec.queryAs(exec.Aggregate, q) != null);
+    const lines = try testLines(a, &q);
+    defer testFreeLines(a, lines);
+    try std.testing.expectEqual(unknown.lines.len, lines.len);
+    for (unknown.lines, lines) |p, h| try std.testing.expectEqualStrings(p, h);
 }

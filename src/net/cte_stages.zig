@@ -1810,7 +1810,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             // filtered table's row bound is pre-filter: route once the input
             // has drained, on what survived.
             const pagg_dop: usize = if (getenv("THINDB_NO_PAGG_FALLBACK") != null) 1 else input.effectiveDop();
-            if (group_route.routesOnInputSize(up.stats(), g.group_cols, g.top_k, g.emit_limit, pagg_dop)) {
+            if (group_route.routesOnInputSize(up.stats(), up.outputSchema(), g.group_cols, aggs, g.top_k, g.emit_limit, pagg_dop)) {
                 return AdaptiveGroupBy.create(
                     input.allocator,
                     try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
