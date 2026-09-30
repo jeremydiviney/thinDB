@@ -469,9 +469,16 @@ fn exactTextMantissa(text: []const u8, s: u8) ?i128 {
         .exact => |d| d,
         .float => |f| common.floatDigits(f) orelse return null,
     };
-    if (d.s <= s) return mulPow10(d.m, s - d.s);
-    const p = pow10(d.s - s);
-    return if (@rem(d.m, p) == 0) @divExact(d.m, p) else null;
+    return exactRescale(d.m, d.s, s);
+}
+
+/// A mantissa at scale `from_s` moved to scale `to_s` with nothing rounded
+/// away: null when the value needs more fraction digits than `to_s`, or
+/// overflows.
+fn exactRescale(m: i128, from_s: u8, to_s: u8) ?i128 {
+    if (from_s <= to_s) return mulPow10(m, to_s - from_s);
+    const p = pow10(from_s - to_s);
+    return if (@rem(m, p) == 0) @divExact(m, p) else null;
 }
 
 /// A text value as a `ty` value when the comparison rule calls them equal,
@@ -497,27 +504,69 @@ fn textKeyValue(ty: Type, text: []const u8) ?i128 {
     };
 }
 
-/// A text join key read as the other key's type (`join.zig`): each row is
-/// the `out_type` value the text equals under the comparison rule, NULL when
-/// there is none, so a hash on the result matches what `=` matches.
-pub fn textKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
-    _ = arg_types;
-    const text = common.stringViewOf(args[0]);
-    const base = out.data.rowCount();
-    switch (out.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .date, .datetime, .decimal64, .decimal128 => |*list| {
-            const T = @typeInfo(@TypeOf(list.items)).pointer.child;
-            try list.ensureUnusedCapacity(allocator, n);
-            for (0..n) |row| {
-                const wide = if (args[0].isValid(row)) textKeyValue(out_type, text.rowBytes(row)) else null;
-                const v: ?T = if (wide) |w| std.math.cast(T, w) else null;
-                list.appendAssumeCapacity(v orelse 0);
-                try out.appendValidBit(allocator, base + row, v != null);
-            }
-        },
-        else => return error.ComputeNoSuchOverload,
-    }
+/// A mantissa at `ty`'s scale as a `ty` value: null when `ty` is a decimal
+/// too narrow for it. Integer targets are narrowed by the caller.
+fn withinPrecision(ty: Type, m: i128) ?i128 {
+    const spec = ty.decimalSpec() orelse return m;
+    return if (@abs(m) < pow10(spec.p)) m else null;
 }
+
+fn textKeyAt(src: Type, target: Type, arg: ColumnView, row: usize) ?i128 {
+    _ = src;
+    return textKeyValue(target, common.stringViewOf(arg).rowBytes(row));
+}
+
+fn numberKeyAt(src: Type, target: Type, arg: ColumnView, row: usize) ?i128 {
+    return withinPrecision(target, exactRescale(mantissaAt(arg, row), scaleOf(src), scaleOf(target)) orelse return null);
+}
+
+fn RoundedKey(comptime up: bool) type {
+    return struct {
+        fn at(src: Type, target: Type, arg: ColumnView, row: usize) ?i128 {
+            const m = mantissaAt(arg, row);
+            const from_s = scaleOf(src);
+            const to_s = scaleOf(target);
+            if (from_s <= to_s) return withinPrecision(target, mulPow10(m, to_s - from_s) orelse return null);
+            const p = pow10(from_s - to_s);
+            const down = @divFloor(m, p);
+            return withinPrecision(target, if (up and @mod(m, p) != 0) down + 1 else down);
+        }
+    };
+}
+
+/// A join key read as the other key's type (`join.zig`): each row is the
+/// `out_type` value `valueAt` reads from it, NULL where it reads none.
+fn keyKernel(comptime valueAt: fn (src: Type, target: Type, arg: ColumnView, row: usize) ?i128) common.TypedKernelFn {
+    return &struct {
+        fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+            const base = out.data.rowCount();
+            switch (out.data) {
+                inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .date, .datetime, .decimal64, .decimal128 => |*list| {
+                    const T = @typeInfo(@TypeOf(list.items)).pointer.child;
+                    try list.ensureUnusedCapacity(allocator, n);
+                    for (0..n) |row| {
+                        const wide = if (args[0].isValid(row)) valueAt(arg_types[0], out_type, args[0], row) else null;
+                        const v: ?T = if (wide) |w| std.math.cast(T, w) else null;
+                        list.appendAssumeCapacity(v orelse 0);
+                        try out.appendValidBit(allocator, base + row, v != null);
+                    }
+                },
+                else => return error.ComputeNoSuchOverload,
+            }
+        }
+    }.kernel;
+}
+
+/// A text key as the value it equals under the comparison rule, NULL when
+/// there is none, so a hash on the result matches what `=` matches.
+pub const textKeyKernel = keyKernel(textKeyAt);
+/// A number key as the value it equals exactly, NULL when the target holds
+/// none: a key past a decimal's range meets none of its values.
+pub const numberKeyKernel = keyKernel(numberKeyAt);
+/// A number key rounded down to the target's scale.
+pub const floorKeyKernel = keyKernel(RoundedKey(false).at);
+/// A number key rounded up to the target's scale.
+pub const ceilKeyKernel = keyKernel(RoundedKey(true).at);
 
 pub fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
     _ = out_type;

@@ -521,7 +521,7 @@ pub const StageSource = struct {
 /// Peel `q_in` down to the stage it reads through AliasRename, a column
 /// Project and Computes that only rename (a `col_ref` derived — the
 /// parser's hidden `__join_on_*` key columns) or convert one column
-/// (`to_*(col)` or `text_key:*(col)` — join-key type coercion). Null for anything else, a
+/// (`to_*(col)` or `key_*:*(col)` — join-key type coercion). Null for anything else, a
 /// probe-fused wrapper, or a MatScan with a slice-skip hint (it doesn't
 /// read every chunk).
 /// `reason`, when given, names the operator that stopped the peel on a null
