@@ -3539,14 +3539,20 @@ test "sql: a budget in the old GROUP BY plan-flip gap completes with the plan th
     const roomy = try runRollforward(allocator, 1 << 30);
     defer roomy.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 40), roomy.lines.len);
-    // With room, both GROUP BYs partition, and their worker memory is
-    // charged: about 116 MiB, against about 47 MiB uncharged.
-    try std.testing.expect(roomy.peak > 90 << 20);
 
     inline for (.{ 96 << 20, 80 << 20 }) |budget| {
         const run = try runRollforward(allocator, budget);
         defer run.deinit(allocator);
         try std.testing.expect(run.peak <= budget);
+        // With room, every GROUP BY partitions and charges its workers'
+        // memory, so the statement peaks above the plans a budget picks.
+        // Neither peak is a fixed number: by_cust's four partition tables
+        // add up only while their workers overlap, and a stage's result
+        // stays charged until a background thread frees it (issue #462).
+        // On 1 to 3 cores the roomy peak ran from 80 to 148 MiB and a
+        // budgeted one from 49 to 54 MiB (issue #446), so only the order is
+        // asserted.
+        try std.testing.expect(roomy.peak > run.peak);
         try std.testing.expectEqual(roomy.lines.len, run.lines.len);
         for (roomy.lines, run.lines) |want, got| try std.testing.expectEqualStrings(want, got);
     }
