@@ -49,10 +49,14 @@ jobs:
           # pin to the exact commit the ci run tested.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - name: Cache Zig ${{ env.ZIG_VERSION }} download
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}.tar.xz
+          key: zig-download-x86_64-linux-${{ env.ZIG_VERSION }}
+
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+        run: bash .github/scripts/install-zig.sh x86_64-linux
 
       - name: Install Bun
         run: |
