@@ -331,6 +331,13 @@ pub const Filter = struct {
         return self.upstream.tryFuseAggregate(group_cols, aggs);
     }
 
+    /// The sample describes the rows the filter reads; its survivors may
+    /// average another width, as `ColStat.avg_width` allows.
+    pub fn sampleWidths(self: *Filter, widths: []?u32) !void {
+        if (self.chain != null or widths.len != self.upstream.outputSchema().len) return;
+        try self.upstream.sampleWidths(widths);
+    }
+
     /// A scan-fused Filter is a pass-through — the buffers below already hold
     /// the filtered survivors, so stage adoption forwards. An unfused Filter
     /// must evaluate rows itself and cannot hand anything over.

@@ -205,6 +205,83 @@ pub const ReadSegment = struct {
         return .{ .bytes = raw, .encoding = encoding, .owned = raw };
     }
 
+    /// The string bytes one row group's block of a string column decodes to,
+    /// read without expanding a row. A cached block answers from its layout.
+    /// Otherwise the block's header is read first: a raw block's size gives
+    /// the count. A dict or FSST block is read into the cache (the scan that
+    /// follows reuses it) and its codes or recorded byte count give it.
+    pub fn stringBlockBytes(
+        self: ReadSegment,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        nullable: bool,
+        c: storage_cache.TableCache,
+    ) !u64 {
+        const rg = self.info.row_groups[row_group_idx];
+        const key = storage_cache.Key{
+            .table_uid = c.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = @intCast(row_group_idx),
+            .column_idx = @intCast(column_idx),
+        };
+        const entry = c.cache.acquire(key) orelse miss: {
+            var header: [format.column_block_header_size]u8 = undefined;
+            if (try self.file.readPositionalAll(self.io, &header, rg.col_offsets[column_idx]) != header.len) {
+                return format.Error.UnexpectedEof;
+            }
+            if (blockEncoding(&header, 0) == .raw) {
+                const flags = format.ColumnBlockFlags.fromByte(header[1]);
+                const framing = if (flags.has_nulls) column.bitmapBytes(rg.row_count) else 0;
+                const offsets = 4 + (@as(u64, rg.row_count) + 1) * 4;
+                const payload = format.readU32(header[4..8]);
+                if (payload < framing + offsets) return format.Error.CorruptColumnBlockHeader;
+                return payload - framing - offsets;
+            }
+            break :miss try self.fillCacheEntry(allocator, c.cache, key, rg, column_idx);
+        };
+        defer c.cache.release(entry);
+        const values = if (nullable) entry.bytes[column.bitmapBytes(rg.row_count)..] else entry.bytes;
+        return switch (entry.encoding) {
+            .raw => format.readU32(values[0..4]),
+            .dict => dictStringBytes(
+                allocator,
+                dictBlockOf(values, rg.row_count),
+                if (nullable) entry.bytes[0..column.bitmapBytes(rg.row_count)] else null,
+                rg.row_count,
+            ),
+            .fsst => (try fsstBlockOf(values, rg.row_count)).raw_byte_count,
+            .for_, .rle => format.Error.CorruptColumnBlockHeader,
+        };
+    }
+
+    /// Counts each code's rows, then weighs each by its value's length. A NULL
+    /// row carries placeholder code 0 but no bytes, as in a raw block.
+    fn dictStringBytes(allocator: Allocator, db: DictBlock, nulls: ?[]const u8, row_count: u32) !u64 {
+        const ndv: usize = db.ndv;
+        const lanes: usize = if (db.code_width == 4) 1 else CODE_COUNT_LANES;
+        const counts = try allocator.alloc(u32, lanes * ndv);
+        defer allocator.free(counts);
+        @memset(counts, 0);
+        switch (db.code_width) {
+            1 => countCodes(u8, CODE_COUNT_LANES, db.codes, row_count, ndv, counts),
+            2 => countCodes(u16, CODE_COUNT_LANES, db.codes, row_count, ndv, counts),
+            else => countCodes(u32, 1, db.codes, row_count, ndv, counts),
+        }
+        for (1..lanes) |lane| {
+            for (counts[0..ndv], counts[lane * ndv ..][0..ndv]) |*total, count| total.* += count;
+        }
+        if (nulls) |bm| for (bm, 0..) |valid_bits, byte| {
+            if (valid_bits == 0xFF) continue;
+            for (byte * 8..@min(byte * 8 + 8, row_count)) |row| {
+                if (!column.isValidBit(bm, row)) counts[db.rowCode(row)] -= 1;
+            }
+        };
+        var bytes: u64 = 0;
+        for (counts[0..ndv], 0..) |count, code| bytes += @as(u64, count) * db.dictValue(@intCast(code)).len;
+        return bytes;
+    }
+
     /// Read the raw on-disk bytes (header + payload) of one column's block in a
     /// row group via a single positioned read. The block ends where the next
     /// column's begins (or at the row group's end for the last column).
@@ -943,6 +1020,26 @@ fn decodeStringRaw(allocator: Allocator, raw: []const u8, row_count: u32) !Owned
     @memcpy(data, raw[cursor .. cursor + byte_count]);
 
     return .{ .offsets = offsets, .bytes = data };
+}
+
+/// Separate counters for adjacent rows: a clustered column repeats one code
+/// for long runs, and a single counter array would serialize every
+/// increment on the one before it.
+const CODE_COUNT_LANES: usize = 4;
+
+/// Adds each row's code to `counts`, which holds `lanes` arrays of `ndv`
+/// counters; a code's rows are the sum over the arrays.
+fn countCodes(comptime Code: type, comptime lanes: usize, codes: []const u8, row_count: usize, ndv: usize, counts: []u32) void {
+    const width = @sizeOf(Code);
+    var row: usize = 0;
+    while (row + lanes <= row_count) : (row += lanes) {
+        inline for (0..lanes) |lane| {
+            counts[lane * ndv + std.mem.readInt(Code, codes[(row + lane) * width ..][0..width], .little)] += 1;
+        }
+    }
+    while (row < row_count) : (row += 1) {
+        counts[std.mem.readInt(Code, codes[row * width ..][0..width], .little)] += 1;
+    }
 }
 
 /// A segment-local string dictionary block's regions, parsed in place over the

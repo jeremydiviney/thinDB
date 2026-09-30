@@ -293,6 +293,62 @@ test "stats: end-to-end Scan -> Filter -> GroupBy chain" {
     try std.testing.expectEqual(@as(u64, 1), rows);
 }
 
+test "sampled widths: a scan averages each string column's bytes over its row groups" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const sw_schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "k", .type = .int },
+            .{ .name = "s", .type = .string, .nullable = true },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    const t = try db.table("sw", sw_schema, .{ .order_key = &ok, .unique = true, .row_group_size = 4 });
+
+    // Three flushes of ten rows: row groups of 4, 4 and 2 rows per segment,
+    // few enough that the sample reads every one.
+    const letters = "abcdefghijklmnopqrstuvw";
+    var bytes: u64 = 0;
+    for (0..3) |flush| {
+        for (0..10) |j| {
+            const i = flush * 10 + j;
+            const value: ?[]const u8 = if (i % 4 == 0) null else letters[0 .. (i * 7) % letters.len];
+            if (value) |v| bytes += v.len;
+            try t.insert(&.{.{ .id = @as(i64, @intCast(i)), .k = @as(i32, @intCast(i)), .s = value }});
+        }
+        try t.flush();
+    }
+    const want: u32 = @intCast((bytes + 29) / 30);
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var widths = [_]?u32{ null, null, null };
+    try q.sampleWidths(&widths);
+    try std.testing.expectEqual([_]?u32{ null, null, want }, widths);
+
+    for (t.manifest.segments.items) |seg| {
+        const entry = try t.acquireSegment(seg.segment_id);
+        defer t.releaseSegment(entry);
+        try std.testing.expectEqual(entry.seg.info.row_groups.len, entry.string_bytes[2].len);
+        for (entry.string_bytes[2]) |rg_bytes| try std.testing.expect(rg_bytes != null);
+    }
+
+    var base = try thindb.scan(allocator, t);
+    var filtered = try base.filter(thindb.leafExpr("k", .gt, .{ .int = 3 }));
+    var projected = try filtered.project(&.{ "s", "k" });
+    defer projected.deinit();
+    var narrow = [_]?u32{ null, 7 };
+    try projected.sampleWidths(&narrow);
+    try std.testing.expectEqual([_]?u32{ want, 7 }, narrow);
+}
+
 // ---------------------------------------------------------------------------
 // Compute: provable per-column ndv + min/max for derived columns.
 // Seed: a ∈ {10,20,30} (ndv 3, [10,30]), b ∈ {100..600} (ndv 6, [100,600]).
