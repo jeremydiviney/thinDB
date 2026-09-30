@@ -2540,6 +2540,77 @@ test "topn: input smaller than limit+offset emits the whole sorted input" {
     }
 }
 
+test "topn: one oversized batch holds only the rows it can emit (issue #395)" {
+    const allocator = std.testing.allocator;
+    const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
+    const storage = @import("../storage/storage.zig");
+    const n: usize = 50_000;
+    const limit: usize = 10;
+    const offset: usize = 5;
+    const keys = try allocator.alloc(i64, n);
+    defer allocator.free(keys);
+    const ids = try allocator.alloc(i64, n);
+    defer allocator.free(ids);
+    const valid = try allocator.alloc(u8, (n + 7) / 8);
+    defer allocator.free(valid);
+    @memset(valid, 0);
+    var prng = std.Random.DefaultPrng.init(0x395);
+    const rnd = prng.random();
+    for (keys, ids, 0..) |*k, *id, i| {
+        k.* = rnd.intRangeAtMost(i64, 0, 999);
+        id.* = @intCast(i);
+        if (i % 97 != 0) storage.column.setValidBit(valid, i, true);
+    }
+    const schema = [_]types.Column{
+        .{ .name = "k", .type = .bigint, .nullable = true },
+        .{ .name = "id", .type = .bigint },
+    };
+    const views = [_]storage.ColumnView{
+        .{ .data = .{ .bigint = keys }, .nulls = valid },
+        .{ .data = .{ .bigint = ids }, .nulls = null },
+    };
+    const row_bytes = exec.memory.estimateRowBytes(&schema);
+
+    const Reference = struct {
+        keys: []const i64,
+        valid: []const u8,
+        desc: bool,
+
+        fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+            const av = storage.column.isValidBit(ctx.valid, a);
+            const bv = storage.column.isValidBit(ctx.valid, b);
+            if (av != bv) return av == ctx.desc;
+            if (av and ctx.keys[a] != ctx.keys[b]) return (ctx.keys[a] < ctx.keys[b]) != ctx.desc;
+            return a < b;
+        }
+    };
+    const order = try allocator.alloc(usize, n);
+    defer allocator.free(order);
+
+    // DESC puts NULL keys last; ASC puts them first, and more of them than
+    // are kept.
+    inline for (.{ true, false }) |desc| {
+        for (order, 0..) |*o, i| o.* = i;
+        std.sort.pdq(usize, order, Reference{ .keys = keys, .valid = valid, .desc = desc }, Reference.lessThan);
+
+        // Room for the kept rows only, far short of the batch.
+        var acct = exec.memory.MemoryAccountant.init(2 * (limit + offset) * row_bytes);
+        var source = try SingleBatchSource.create(allocator, .{ .schema = &schema, .values = &views, .row_count = n });
+        source.resources = &acct;
+        var q = try source.topN(&.{ .{ .col = "k", .desc = desc }, .{ .col = "id", .desc = false } }, limit, offset);
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        {
+            defer q.deinit();
+            while (try q.next()) |b| try got.appendSlice(allocator, b.values[1].data.bigint[0..b.row_count]);
+        }
+        try std.testing.expectEqual(limit, got.items.len);
+        for (order[offset .. offset + limit], got.items) |want, id| try std.testing.expectEqual(@as(i64, @intCast(want)), id);
+        try std.testing.expect(acct.peak_bytes <= (limit + offset) * row_bytes);
+        try std.testing.expectEqual(@as(usize, 0), acct.current_bytes);
+    }
+}
+
 // --------------------------------------------------------------------------
 // Scan-side in-place (fused) filter — eliminates the decode-copy. These prove
 // the fused path emits byte-identical survivors to a known-good expected set,
