@@ -2620,8 +2620,8 @@ pub const Parser = struct {
         }
         if (std.ascii.eqlIgnoreCase(name, "isnull") and args.len == 1) return try self.isNullValue(args[0]);
         if (std.ascii.eqlIgnoreCase(name, "timestampadd") and args.len == 3) {
-            // `TIMESTAMPADD(unit, n, x)` is `x + INTERVAL n unit`, so a
-            // DATE moved by hours becomes a DATETIME, as in MySQL.
+            // `TIMESTAMPADD(unit, n, x)` is `x + INTERVAL n unit`, and
+            // takes that step's range checks and result type.
             if (unitWord(args[0])) |word| if (intervalUnit(withoutTsiPrefix(word))) |unit| return try self.unitAddCall(unit, args[2], args[1]);
         }
         if (std.ascii.eqlIgnoreCase(name, "log") and args.len == 1) {

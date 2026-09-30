@@ -56,7 +56,7 @@ FROM TABLE(
   ORDER BY id
 )
 ORDER BY id;`} />
-  <p>The subquery's column names, order, types, and nullability must exactly match <code>Input</code>. <code>PARTITION BY</code> defines independent callback invocations; <code>ORDER BY</code> orders rows within each partition. Output fields define the downstream SQL schema at compile time.</p>
+  <p>The subquery's column names and order must exactly match <code>Input</code>, and a nullable column cannot feed a non-optional field. A column of another type converts to the declared type as an <code>INSERT</code> into a column of that type would: a <code>DATETIME</code> into a <code>tdb.Date</code> keeps its day, an <code>INT</code> into an <code>i64</code> widens, and text parses into a number or a date. A pair <code>INSERT</code> refuses, such as a number into a date or a date into a number, fails the call before it runs (<code>TableFnInputMismatch</code>); so does a value that fails its conversion, such as text that isn't a date or a number the field can't hold, when that row is read. <code>PARTITION BY</code> defines independent callback invocations; <code>ORDER BY</code> orders rows within each partition. Output fields define the downstream SQL schema at compile time.</p>
   <div class="table-scroll"><table><thead><tr><th>Execution mode</th><th>Call-site rule</th></tr></thead><tbody>
     <tr><td><code>.partitioned</code></td><td>Requires <code>PARTITION BY</code>.</td></tr>
     <tr><td><code>.global</code></td><td>Forbids <code>PARTITION BY</code>; receives one logical partition.</td></tr>

@@ -49,6 +49,7 @@ const ColumnView = @import("../storage/storage.zig").ColumnView;
 const Expr = expr_mod.Expr;
 const PredicateExpr = predicate_mod.PredicateExpr;
 const Derived = compute_mod.Derived;
+const TableFnExec = exec.table_fn.TableFnExec;
 const Scan = exec.Scan;
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -3522,6 +3523,11 @@ fn dispatchUnionTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, u: UnionT
     if (u.tvf.inputs.len != 1) return NoMatch;
     if (!try b.partitionMatchesRangeKeys(u.tvf.partition_by)) return NoMatch;
     const inputs = try tvfInputs(b, ent, ent.input_schemas[0].len);
+    // The union arm hands the kernel frame columns as they are; one that
+    // needs converting runs in the ordinary operator.
+    for (ent.input_schemas[0], inputs) |col, ci| {
+        if (!TableFnExec.inputTypeMatches(b.fb.cols.items[ci].type, col.type)) return NoMatch;
+    }
     const out = try b.a.alloc(Column, inputs.len);
     for (out, inputs) |*o, ci| o.* = b.fb.cols.items[ci];
     const filt = u.input_filter orelse return NoMatch;
@@ -3559,6 +3565,7 @@ fn dispatchTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, t: *const ir.O
         }
     }
 
+    try conformTvfInput(b, ent, t.partition_by, t.order_by);
     const pc = try b.classifyPartition(t.partition_by);
     switch (pc) {
         .range_exact => {
@@ -3575,6 +3582,49 @@ fn dispatchTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, t: *const ir.O
             if (ent.passthrough.len == 0) return NoMatch;
             try pushAlignedTvf(b, ent, extra_parts, t.args, false);
         },
+    }
+}
+
+/// Converts frame columns to the kernel's declared input-0 types by the
+/// rule the ordinary operator applies (`TableFnExec.inputBinding`), as one
+/// compute. A conversion that can fail on a value (the operator checks
+/// every batch), one INSERT makes row by row rather than by a cast, or one
+/// that would rewrite a range key or the route column stays with the
+/// ordinary operator. So does one that can put the call's keys out of the
+/// order the region sorted the supplied values in, by the operator's rule
+/// (`TableFnExec.keysReordered`).
+fn conformTvfInput(b: *Builder, ent: *const udf_mod.TableEntry, partition_by: []const []const u8, order_by: []const ir.SortSpec) !void {
+    var buf: [8]usize = undefined;
+    const keys = try b.rangeKeyIdxs(&buf);
+    const decl = ent.input_schemas[0];
+    var casts: std.ArrayListUnmanaged(Derived) = .empty;
+    const order_kept = try b.a.alloc(cast.OrderKept, decl.len);
+    for (decl, order_kept) |col, *kept| {
+        const idx = (b.fb.resolve(col.name) orelse return NoMatch).idx;
+        const have = b.fb.cols.items[idx];
+        kept.* = .strict;
+        switch (try TableFnExec.inputBinding(b.a, col.name, have.type, col.type)) {
+            .as_is => {},
+            .assigned, .refused => return NoMatch,
+            .cast => |c| {
+                if (c.can_drop) return NoMatch;
+                if (std.mem.indexOfScalar(usize, keys, idx) != null) return NoMatch;
+                if (std.mem.eql(u8, have.name, b.route_name)) return NoMatch;
+                kept.* = cast.preservesOrder(have.type, col.type);
+                try casts.append(b.a, .{ .name = col.name, .expr = c.expr });
+            },
+        }
+    }
+    if (casts.items.len == 0) return;
+    const key_idx = try b.a.alloc(usize, partition_by.len);
+    for (partition_by, key_idx) |name, *slot| slot.* = types.findColumn(decl, name) orelse return NoMatch;
+    const order_idx = try b.a.alloc(usize, order_by.len);
+    for (order_by, order_idx) |spec, *slot| slot.* = types.findColumn(decl, spec.col) orelse return NoMatch;
+    if (TableFnExec.keysReordered(order_kept, key_idx, order_idx)) return NoMatch;
+    try b.pushCompute(casts.items);
+    for (ent.input_schemas[0]) |col| {
+        const idx = (b.fb.resolve(col.name) orelse return NoMatch).idx;
+        if (!TableFnExec.inputTypeMatches(b.fb.cols.items[idx].type, col.type)) return NoMatch;
     }
 }
 

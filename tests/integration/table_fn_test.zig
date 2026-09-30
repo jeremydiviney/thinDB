@@ -1206,3 +1206,743 @@ test "table UDF borrow: operator binds contiguous stage stores zero-copy" {
     try std.testing.expectEqual(@as(usize, 3), tf.borrowed_bound);
     try expectRunningMap(&got);
 }
+
+// ---------------------------------------------------------------------------
+// Input conversion: a supplied column of another type reaches the kernel as
+// the declared type, converted as an INSERT into a column of that type
+// would convert it.
+// ---------------------------------------------------------------------------
+
+fn seedMonthly(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    try helpers.exec(allocator, db,
+        \\CREATE TABLE monthly (
+        \\  id BIGINT PRIMARY KEY,
+        \\  projectId INT,
+        \\  divisionId INT,
+        \\  customerNumber VARCHAR(32),
+        \\  d DATE,
+        \\  amount INT,
+        \\  exchangeRate DOUBLE,
+        \\  planId INT
+        \\)
+    );
+    try helpers.exec(allocator, db,
+        \\INSERT INTO monthly VALUES
+        \\  (1, 7, 3, 'Acme', '2026-02-20', 150, 1.0, 11),
+        \\  (2, 7, 3, 'Acme', '2026-01-15', 100, 1.0, 11),
+        \\  (3, 7, 3, 'Acme', '2026-03-03', 120, 1.0, 12),
+        \\  (4, 7, 3, 'Bolt', '2026-01-05', 50, 1.0, 21),
+        \\  (5, 7, 3, 'Bolt', '2026-02-11', 0, 1.0, 21)
+    );
+    const t = try db.openTable("monthly", .{});
+    try t.flush();
+}
+
+fn firstOfMonth(m: u8) i32 {
+    return tdb.Date.fromYmd(.{ .y = 2026, .m = m, .d = 1 }).days();
+}
+
+/// The declarations of a production up/down chain kernel, verbatim (spec
+/// flags, Args, Input, Carry, Output, passthrough, Computed). The kernel
+/// computes only enough to show the values and order it saw.
+const updown_shape = struct {
+    pub const spec = tdb.TableFnSpec{
+        .name = "updown_shape",
+        .execution = .either,
+        .row_aligned = true,
+    };
+
+    pub const Args = struct { comparisonMonths: i64 };
+
+    pub const Input = struct {
+        projectId: ?i32,
+        divisionId: ?i32,
+        customerNumberLC: ?[]const u8,
+        month: ?tdb.Date,
+        minDate: ?tdb.Date,
+        amount: ?i64,
+        originalAmount: ?i64,
+        exchangeRate: ?f64,
+        planId: ?i32,
+    };
+
+    pub const Carry = struct {
+        customerNumber: ?[]const u8,
+        customerName: ?[]const u8,
+        customerEmail: ?[]const u8,
+        customerNumberHash: ?[]const u8,
+        parentCustomerNumber: ?[]const u8,
+        parentCustomerName: ?[]const u8,
+        date: ?tdb.Date,
+        nonRecurringAmount: ?i64,
+        originalNonRecurringAmount: ?i64,
+        otherMrrAmount: ?i64,
+        originalOtherMrrAmount: ?i64,
+        currency: ?[]const u8,
+        integrationConfigId: ?i32,
+        hasAdjustment: ?i32,
+        childAddedToParentCount: ?i64,
+        childRemovedFromParentCount: ?i64,
+        childAddedPlanCount: ?i64,
+        childRemovedPlanCount: ?i64,
+        childUpCount: ?i64,
+        childDownCount: ?i64,
+        childAddedToParentAmount: ?i64,
+        childRemovedFromParentAmount: ?i64,
+        childAddedPlanAmount: ?i64,
+        childRemovedPlanAmount: ?i64,
+        childUpAmount: ?i64,
+        childDownAmount: ?i64,
+        crossSellCount: ?i64,
+        crossChurnCount: ?i64,
+        crossSellAmount: ?i64,
+        crossChurnAmount: ?i64,
+    };
+
+    pub const Output = struct {
+        projectId: ?i32,
+        divisionId: ?i32,
+        customerNumber: ?[]const u8,
+        customerNumberLC: ?[]const u8,
+        customerName: ?[]const u8,
+        customerEmail: ?[]const u8,
+        customerNumberHash: ?[]const u8,
+        parentCustomerNumber: ?[]const u8,
+        parentCustomerName: ?[]const u8,
+        date: ?tdb.Date,
+        minDate: ?tdb.Date,
+        month: ?tdb.Date,
+        amount: ?i64,
+        originalAmount: ?i64,
+        nonRecurringAmount: ?i64,
+        originalNonRecurringAmount: ?i64,
+        otherMrrAmount: ?i64,
+        originalOtherMrrAmount: ?i64,
+        currency: ?[]const u8,
+        integrationConfigId: ?i32,
+        exchangeRate: ?f64,
+        planId: ?i32,
+        hasAdjustment: ?i32,
+        lastAmount: ?i64,
+        lastOriginalAmount: ?i64,
+        lastPlanId: ?i32,
+        lastExchangeRate: ?f64,
+        childAddedToParentCount: ?i64,
+        childRemovedFromParentCount: ?i64,
+        childAddedPlanCount: ?i64,
+        childRemovedPlanCount: ?i64,
+        childUpCount: ?i64,
+        childDownCount: ?i64,
+        childAddedToParentAmount: ?i64,
+        childRemovedFromParentAmount: ?i64,
+        childAddedPlanAmount: ?i64,
+        childRemovedPlanAmount: ?i64,
+        childUpAmount: ?i64,
+        childDownAmount: ?i64,
+        crossSellCount: ?i64,
+        crossChurnCount: ?i64,
+        crossSellAmount: ?i64,
+        crossChurnAmount: ?i64,
+        diffAmount: ?i32,
+        fxChange: ?i32,
+        customerStartDate: ?tdb.Date,
+        upDown: []const u8,
+        activeChange: i32,
+        isActive: i64,
+    };
+
+    pub const passthrough = .{
+        "projectId",                   "divisionId",               "customerNumber",               "customerNumberLC",
+        "customerName",                "customerEmail",            "customerNumberHash",           "parentCustomerNumber",
+        "parentCustomerName",          "date",                     "minDate",                      "month",
+        "amount",                      "originalAmount",           "nonRecurringAmount",           "originalNonRecurringAmount",
+        "otherMrrAmount",              "originalOtherMrrAmount",   "currency",                     "integrationConfigId",
+        "exchangeRate",                "planId",                   "hasAdjustment",                "childAddedToParentCount",
+        "childRemovedFromParentCount", "childAddedPlanCount",      "childRemovedPlanCount",        "childUpCount",
+        "childDownCount",              "childAddedToParentAmount", "childRemovedFromParentAmount", "childAddedPlanAmount",
+        "childRemovedPlanAmount",      "childUpAmount",            "childDownAmount",              "crossSellCount",
+        "crossChurnCount",             "crossSellAmount",          "crossChurnAmount",
+    };
+
+    pub const Computed = struct {
+        lastAmount: ?i64,
+        lastOriginalAmount: ?i64,
+        lastPlanId: ?i32,
+        lastExchangeRate: ?f64,
+        diffAmount: ?i32,
+        fxChange: ?i32,
+        customerStartDate: ?tdb.Date,
+        upDown: []const u8,
+        activeChange: i32,
+        isActive: i64,
+    };
+
+    pub fn process(_: *tdb.Ctx, _: Args, p: tdb.Partition(Input), out: *tdb.Writer(Computed)) !void {
+        const months = p.col(.month);
+        const amounts = p.col(.amount);
+        const plans = p.col(.planId);
+        var last: ?i64 = null;
+        var last_plan: ?i32 = null;
+        for (0..p.len) |i| {
+            const amount = amounts.get(i);
+            const up_down: []const u8 = if (last == null) "new" else if ((amount orelse 0) > last.?) "up" else "down";
+            try out.row(.{
+                .lastAmount = last,
+                .lastOriginalAmount = last,
+                .lastPlanId = last_plan,
+                .lastExchangeRate = null,
+                .diffAmount = if (amount) |a| @intCast(a - (last orelse 0)) else null,
+                .fxChange = 0,
+                .customerStartDate = months.get(0),
+                .upDown = up_down,
+                .activeChange = 0,
+                .isActive = @intFromBool((amount orelse 0) > 0),
+            });
+            last = amount;
+            last_plan = plans.get(i);
+        }
+    }
+};
+
+const updown_input = updownInput("DATE_ADD(d, INTERVAL 1 - DAY(d) DAY)");
+
+/// The input a production up/down chain call supplies, with `month` as
+/// `month_expr` over `monthly.d`.
+fn updownInput(comptime month_expr: []const u8) []const u8 {
+    return "SELECT projectId, divisionId, LOWER(customerNumber) AS customerNumberLC, " ++
+        month_expr ++ " AS month, d AS minDate, " ++ updown_input_rest;
+}
+
+const updown_columns = "projectId, divisionId, customerNumberLC, month, minDate, amount, originalAmount, exchangeRate, planId, " ++
+    "customerNumber, customerName, customerEmail, customerNumberHash, parentCustomerNumber, parentCustomerName, date, " ++
+    "nonRecurringAmount, originalNonRecurringAmount, otherMrrAmount, originalOtherMrrAmount, currency, integrationConfigId, " ++
+    "hasAdjustment, childAddedToParentCount, childRemovedFromParentCount, childAddedPlanCount, childRemovedPlanCount, " ++
+    "childUpCount, childDownCount, childAddedToParentAmount, childRemovedFromParentAmount, childAddedPlanAmount, " ++
+    "childRemovedPlanAmount, childUpAmount, childDownAmount, crossSellCount, crossChurnCount, crossSellAmount, crossChurnAmount";
+
+const updown_input_rest =
+    \\       amount, amount AS originalAmount, exchangeRate, planId,
+    \\       customerNumber, customerNumber AS customerName, 'e' AS customerEmail,
+    \\       'h' AS customerNumberHash, customerNumber AS parentCustomerNumber,
+    \\       customerNumber AS parentCustomerName, d AS date,
+    \\       amount AS nonRecurringAmount, amount AS originalNonRecurringAmount,
+    \\       amount AS otherMrrAmount, amount AS originalOtherMrrAmount, 'USD' AS currency,
+    \\       planId AS integrationConfigId, 0 AS hasAdjustment,
+    \\       CAST(0 AS BIGINT) AS childAddedToParentCount, CAST(0 AS BIGINT) AS childRemovedFromParentCount,
+    \\       CAST(0 AS BIGINT) AS childAddedPlanCount, CAST(0 AS BIGINT) AS childRemovedPlanCount,
+    \\       CAST(0 AS BIGINT) AS childUpCount, CAST(0 AS BIGINT) AS childDownCount,
+    \\       CAST(0 AS BIGINT) AS childAddedToParentAmount, CAST(0 AS BIGINT) AS childRemovedFromParentAmount,
+    \\       CAST(0 AS BIGINT) AS childAddedPlanAmount, CAST(0 AS BIGINT) AS childRemovedPlanAmount,
+    \\       CAST(0 AS BIGINT) AS childUpAmount, CAST(0 AS BIGINT) AS childDownAmount,
+    \\       CAST(0 AS BIGINT) AS crossSellCount, CAST(0 AS BIGINT) AS crossChurnCount,
+    \\       CAST(0 AS BIGINT) AS crossSellAmount, CAST(0 AS BIGINT) AS crossChurnAmount
+    \\FROM monthly
+;
+
+test "table UDF input conversion: DATETIME month and INT amounts reach DATE and BIGINT inputs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedMonthly(allocator, db);
+    try db.registerTableFn(updown_shape);
+
+    // DATE_ADD on a DATE is a DATETIME; `month` is declared DATE. `amount`
+    // and the Carry amounts are INT, declared BIGINT.
+    var res = try run(allocator, db, "SELECT customerNumberLC, month, amount, nonRecurringAmount, lastAmount, customerStartDate, upDown " ++
+        "FROM TABLE(updown_shape((" ++ updown_input ++ "), 1) " ++
+        "PARTITION BY projectId, divisionId, customerNumberLC ORDER BY month) " ++
+        "ORDER BY customerNumberLC, month");
+    defer res.deinit();
+
+    const out_schema = res.outputSchema();
+    try std.testing.expectEqual(thindb.types.Type.date, out_schema[1].type);
+    try std.testing.expectEqual(thindb.types.Type.bigint, out_schema[2].type);
+
+    const Row = struct { lc: []const u8, month: i32, amount: i64, last: ?i64, up_down: []const u8 };
+    const want = [_]Row{
+        .{ .lc = "acme", .month = firstOfMonth(1), .amount = 100, .last = null, .up_down = "new" },
+        .{ .lc = "acme", .month = firstOfMonth(2), .amount = 150, .last = 100, .up_down = "up" },
+        .{ .lc = "acme", .month = firstOfMonth(3), .amount = 120, .last = 150, .up_down = "down" },
+        .{ .lc = "bolt", .month = firstOfMonth(1), .amount = 50, .last = null, .up_down = "new" },
+        .{ .lc = "bolt", .month = firstOfMonth(2), .amount = 0, .last = 50, .up_down = "down" },
+    };
+    var n: usize = 0;
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            const w = want[n];
+            n += 1;
+            try std.testing.expectEqualStrings(w.lc, batch.values[0].data.string.rowBytes(i));
+            try std.testing.expectEqual(w.month, batch.values[1].data.date[i]);
+            try std.testing.expectEqual(w.amount, batch.values[2].data.bigint[i]);
+            try std.testing.expectEqual(w.amount, batch.values[3].data.bigint[i]);
+            try std.testing.expectEqual(w.last, if (batch.values[4].isValid(i)) batch.values[4].data.bigint[i] else null);
+            // The kernel saw its partition ordered by the converted month.
+            try std.testing.expectEqual(firstOfMonth(1), batch.values[5].data.date[i]);
+            try std.testing.expectEqualStrings(w.up_down, batch.values[6].data.string.rowBytes(i));
+        }
+    }
+    try std.testing.expectEqual(want.len, n);
+}
+
+/// The table function operator a compiled statement runs, at its root or
+/// adopted by one of its stages.
+fn tableFnOf(q: thindb.exec.Query) ?*thindb.exec.table_fn.TableFnExec {
+    const TableFnExec = thindb.exec.table_fn.TableFnExec;
+    if (thindb.exec.queryAs(TableFnExec, q)) |tf| return tf;
+    const staged = thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, q) orelse return null;
+    if (thindb.exec.queryAs(TableFnExec, staged.inner)) |tf| return tf;
+    for (staged.set.stages.items) |stage| {
+        if (stage.adopt_table_fn) |tf| return tf;
+    }
+    return null;
+}
+
+test "table UDF input conversion: a DATETIME month converted to a DATE order key keeps the pre-ordered ride" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedMonthly(allocator, db);
+    try db.registerTableFn(updown_shape);
+
+    // A window CTE sorted by the call's keys feeds the call: its input
+    // arrives in (projectId, divisionId, customerNumberLC, month) order and
+    // the operator skips its sort. A DATETIME month keeps that order as its
+    // day (the last key), as a DATE month does; month text read as a DATE
+    // may not, so the operator sorts.
+    const variants = .{
+        .{ .month = "DATE_ADD(d, INTERVAL 1 - DAY(d) DAY)", .sorts = false },
+        .{ .month = "CAST(DATE_ADD(d, INTERVAL 1 - DAY(d) DAY) AS DATE)", .sorts = false },
+        .{ .month = "DATE_FORMAT(d, '%Y-%m-01')", .sorts = true },
+    };
+    const Row = struct { lc: []const u8, month: i32, amount: i64, last: ?i64, up_down: []const u8 };
+    const want = [_]Row{
+        .{ .lc = "acme", .month = firstOfMonth(1), .amount = 100, .last = null, .up_down = "new" },
+        .{ .lc = "acme", .month = firstOfMonth(2), .amount = 150, .last = 100, .up_down = "up" },
+        .{ .lc = "acme", .month = firstOfMonth(3), .amount = 120, .last = 150, .up_down = "down" },
+        .{ .lc = "bolt", .month = firstOfMonth(1), .amount = 50, .last = null, .up_down = "new" },
+        .{ .lc = "bolt", .month = firstOfMonth(2), .amount = 0, .last = 50, .up_down = "down" },
+    };
+    inline for (variants) |v| {
+        var res = try run(allocator, db, "WITH base AS (" ++ comptime updownInput(v.month) ++ "), " ++
+            "w AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY projectId, divisionId, customerNumberLC ORDER BY month) AS rn FROM base) " ++
+            "SELECT * FROM TABLE(updown_shape((SELECT " ++ updown_columns ++ " FROM w), 1) " ++
+            "PARTITION BY projectId, divisionId, customerNumberLC ORDER BY month)");
+        defer res.deinit();
+        const tf = tableFnOf(res.cq.query) orelse return error.TestExpectedTableFn;
+        try std.testing.expect(tf.input_ordered);
+        try std.testing.expectEqual(v.sorts, tf.keys_reordered);
+
+        const out_schema = res.outputSchema();
+        const lc_col = thindb.types.findColumn(out_schema, "customerNumberLC").?;
+        const month_col = thindb.types.findColumn(out_schema, "month").?;
+        const amount_col = thindb.types.findColumn(out_schema, "amount").?;
+        const last_col = thindb.types.findColumn(out_schema, "lastAmount").?;
+        const up_down_col = thindb.types.findColumn(out_schema, "upDown").?;
+        var seen = [_]bool{false} ** want.len;
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| {
+                const lc = batch.values[lc_col].data.string.rowBytes(i);
+                const month = batch.values[month_col].data.date[i];
+                const at = for (want, 0..) |w, wi| {
+                    if (std.mem.eql(u8, w.lc, lc) and w.month == month) break wi;
+                } else return error.TestUnexpectedRow;
+                try std.testing.expect(!seen[at]);
+                seen[at] = true;
+                try std.testing.expectEqual(want[at].amount, batch.values[amount_col].data.bigint[i]);
+                try std.testing.expectEqual(want[at].last, if (batch.values[last_col].isValid(i)) batch.values[last_col].data.bigint[i] else null);
+                try std.testing.expectEqualStrings(want[at].up_down, batch.values[up_down_col].data.string.rowBytes(i));
+            }
+        }
+        for (seen) |s| try std.testing.expect(s);
+    }
+}
+
+/// The input declarations of a production two-input expansion kernel,
+/// verbatim (spec, Args, Input, Input2); its output is cut down to a
+/// per-month tally, since only the input contract is under test.
+const expanded_shape = struct {
+    pub const spec = tdb.TableFnSpec{ .name = "expanded_shape", .execution = .either };
+
+    pub const Args = struct { comparisonMonths: i64, childCustomer: i64 };
+
+    pub const Input = struct {
+        projectId: ?i32,
+        divisionId: ?i32,
+        customerNumber: ?[]const u8,
+        customerName: ?[]const u8,
+        customerEmail: ?[]const u8,
+        customerNumberHash: ?[]const u8,
+        parentCustomerNumber: ?[]const u8,
+        parentCustomerName: ?[]const u8,
+        date: ?tdb.Date,
+        month: ?tdb.Date,
+        amount: ?i32,
+        originalAmount: ?i32,
+        nonRecurringAmount: ?i32,
+        originalNonRecurringAmount: ?i32,
+        otherMrrAmount: ?i32,
+        originalOtherMrrAmount: ?i32,
+        currency: ?[]const u8,
+        integrationConfigId: ?i32,
+        exchangeRate: ?f64,
+        planId: ?i32,
+        hasAdjustment: ?i32,
+        isActive: ?i64,
+        upDown: ?[]const u8,
+        diffAmount: ?i32,
+    };
+
+    pub const Input2 = struct {
+        projectId: ?i32,
+        divisionId: ?i32,
+        customerNumberLC: ?[]const u8,
+        month: ?tdb.Date,
+        planAmount: ?i64,
+    };
+
+    pub const Output = struct {
+        projectId: ?i32,
+        divisionId: ?i32,
+        month: ?tdb.Date,
+        rowCount: i64,
+        active: i64,
+        planTotal: i64,
+    };
+
+    pub fn process(_: *tdb.Ctx, _: Args, p: tdb.Partition(Input), plans: tdb.Partition(Input2), out: *tdb.Writer(Output)) !void {
+        const months = p.col(.month);
+        const active = p.col(.isActive);
+        const plan_months = plans.col(.month);
+        const plan_amounts = plans.col(.planAmount);
+        var i: usize = 0;
+        while (i < p.len) {
+            const month = months.get(i).?;
+            var rows: i64 = 0;
+            var n_active: i64 = 0;
+            while (i < p.len and months.get(i).?.eq(month)) : (i += 1) {
+                rows += 1;
+                n_active += active.get(i) orelse 0;
+            }
+            var total: i64 = 0;
+            for (0..plans.len) |j| {
+                if (plan_months.get(j).?.eq(month)) total += plan_amounts.get(j) orelse 0;
+            }
+            try out.row(.{
+                .projectId = p.col(.projectId).get(0),
+                .divisionId = p.col(.divisionId).get(0),
+                .month = month,
+                .rowCount = rows,
+                .active = n_active,
+                .planTotal = total,
+            });
+        }
+    }
+};
+
+test "table UDF input conversion: both inputs of a two-input call convert" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedMonthly(allocator, db);
+    try db.registerTableFn(expanded_shape);
+
+    // Input: DATETIME month into DATE, an INT CASE into BIGINT isActive.
+    // Input2: DATETIME month into DATE, INT planAmount into BIGINT.
+    var res = try run(allocator, db,
+        \\SELECT month, rowCount, active, planTotal
+        \\FROM TABLE(expanded_shape(
+        \\  (SELECT projectId, divisionId, customerNumber, customerNumber AS customerName, 'e' AS customerEmail,
+        \\          'h' AS customerNumberHash, customerNumber AS parentCustomerNumber,
+        \\          customerNumber AS parentCustomerName, d AS date,
+        \\          DATE_ADD(d, INTERVAL 1 - DAY(d) DAY) AS month,
+        \\          amount, amount AS originalAmount, amount AS nonRecurringAmount,
+        \\          amount AS originalNonRecurringAmount, amount AS otherMrrAmount,
+        \\          amount AS originalOtherMrrAmount, 'USD' AS currency, planId AS integrationConfigId,
+        \\          exchangeRate, planId, 0 AS hasAdjustment,
+        \\          CASE WHEN amount > 0 THEN 1 ELSE 0 END AS isActive, 'up' AS upDown, amount AS diffAmount
+        \\   FROM monthly),
+        \\  (SELECT projectId, divisionId, LOWER(customerNumber) AS customerNumberLC,
+        \\          DATE_ADD(d, INTERVAL 1 - DAY(d) DAY) AS month, amount AS planAmount
+        \\   FROM monthly),
+        \\  1, 0) PARTITION BY projectId, divisionId ORDER BY month)
+        \\ORDER BY month
+    );
+    defer res.deinit();
+
+    const want = [_][4]i64{
+        .{ firstOfMonth(1), 2, 2, 150 },
+        .{ firstOfMonth(2), 2, 1, 150 },
+        .{ firstOfMonth(3), 1, 1, 120 },
+    };
+    var n: usize = 0;
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            const w = want[n];
+            n += 1;
+            try std.testing.expectEqual(w[0], batch.values[0].data.date[i]);
+            try std.testing.expectEqual(w[1], batch.values[1].data.bigint[i]);
+            try std.testing.expectEqual(w[2], batch.values[2].data.bigint[i]);
+            try std.testing.expectEqual(w[3], batch.values[3].data.bigint[i]);
+        }
+    }
+    try std.testing.expectEqual(want.len, n);
+}
+
+const month_echo = struct {
+    pub const spec = tdb.TableFnSpec{ .name = "month_echo", .execution = .partitioned };
+    pub const Input = struct { customer: ?[]const u8, month: ?tdb.Date, amt: ?i64 };
+    pub const Output = Input;
+
+    pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+        var rows = p.iter();
+        while (rows.next()) |row| try out.row(row);
+    }
+};
+
+test "table UDF input conversion: date text converts and bad text fails the call" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedMonthly(allocator, db);
+    try db.registerTableFn(month_echo);
+
+    {
+        var res = try run(allocator, db,
+            \\SELECT customer, month FROM TABLE(month_echo((
+            \\  SELECT customerNumber AS customer, CAST(d AS VARCHAR(10)) AS month, CAST(amount AS BIGINT) AS amt FROM monthly
+            \\)) PARTITION BY customer ORDER BY month)
+            \\ORDER BY customer, month
+        );
+        defer res.deinit();
+        const want = [_]i32{
+            tdb.Date.fromYmd(.{ .y = 2026, .m = 1, .d = 15 }).days(),
+            tdb.Date.fromYmd(.{ .y = 2026, .m = 2, .d = 20 }).days(),
+            tdb.Date.fromYmd(.{ .y = 2026, .m = 3, .d = 3 }).days(),
+            tdb.Date.fromYmd(.{ .y = 2026, .m = 1, .d = 5 }).days(),
+            tdb.Date.fromYmd(.{ .y = 2026, .m = 2, .d = 11 }).days(),
+        };
+        var got: std.ArrayList(i32) = .empty;
+        defer got.deinit(allocator);
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| try got.append(allocator, batch.values[1].data.date[i]);
+        }
+        try std.testing.expectEqualSlices(i32, &want, got.items);
+    }
+    {
+        // An INSERT rejects 'not a date' for a DATE column; so does the call.
+        var res = try run(allocator, db,
+            \\SELECT customer, month FROM TABLE(month_echo((
+            \\  SELECT customerNumber AS customer,
+            \\         CASE WHEN id = 4 THEN 'not a date' ELSE CAST(d AS VARCHAR(10)) END AS month,
+            \\         CAST(amount AS BIGINT) AS amt
+            \\  FROM monthly
+            \\)) PARTITION BY customer ORDER BY month)
+        );
+        defer res.deinit();
+        try std.testing.expectError(thindb.exec.Error.TableFnInputMismatch, res.next());
+    }
+}
+
+test "table UDF input conversion: conversions the assignment rule refuses stay compile errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try register(db, .either);
+    try seedMonthly(allocator, db);
+    try db.registerTableFn(month_echo);
+
+    const cases = .{
+        // BIGINT into the DATE `month`.
+        "SELECT * FROM TABLE(month_echo((SELECT customerNumber AS customer, CAST(amount AS BIGINT) AS month, CAST(amount AS BIGINT) AS amt FROM monthly)) PARTITION BY customer)",
+        // DATE into the BIGINT `amt`.
+        "SELECT * FROM TABLE(month_echo((SELECT customerNumber AS customer, d AS month, d AS amt FROM monthly)) PARTITION BY customer)",
+        // A convertible type is still held to the NOT NULL declaration.
+        "SELECT * FROM TABLE(running_total((SELECT id, IF(g > 1, CAST(g AS SMALLINT), NULL) AS g, amt FROM t)) PARTITION BY g)",
+    };
+    inline for (cases) |sql| {
+        try helpers.expectRunError(allocator, db, sql, thindb.exec.Error.TableFnInputMismatch);
+    }
+}
+
+test "table UDF input conversion: numbers and number text convert as INSERT converts them" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try register(db, .either);
+
+    {
+        // Text into the INT `g`; a DOUBLE into the BIGINT `amt`, rounding
+        // half away from zero (10.5 -> 11).
+        var res = try run(allocator, db,
+            \\SELECT id, running FROM TABLE(running_total((
+            \\  SELECT id, CAST(g AS VARCHAR(4)) AS g, CAST(amt AS DOUBLE) + 0.5 AS amt FROM t
+            \\)) PARTITION BY g ORDER BY id)
+        );
+        defer res.deinit();
+        var map = try collectRunningById(allocator, &res);
+        defer map.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 5), map.count());
+        try std.testing.expectEqual(@as(?i64, 11), map.get(1));
+        try std.testing.expectEqual(@as(?i64, 32), map.get(2));
+        try std.testing.expectEqual(@as(?i64, 63), map.get(3));
+        try std.testing.expectEqual(@as(?i64, 41), map.get(4));
+        try std.testing.expectEqual(@as(?i64, 92), map.get(5));
+    }
+    {
+        // BIGINT into the INT `g`, every value in range.
+        var res = try run(allocator, db,
+            \\SELECT id, running FROM TABLE(running_total((
+            \\  SELECT id, CAST(g AS BIGINT) AS g, amt FROM t
+            \\)) PARTITION BY g ORDER BY id)
+        );
+        defer res.deinit();
+        var map = try collectRunningById(allocator, &res);
+        defer map.deinit(allocator);
+        try expectRunningMap(&map);
+    }
+    // A value INSERT refuses fails the call: past INT's range, and text
+    // that isn't a number.
+    inline for (.{
+        "CAST(g AS BIGINT) * 10000000000 AS g",
+        "CONCAT('x', CAST(g AS VARCHAR(4))) AS g",
+    }) |g| {
+        var res = try run(allocator, db, "SELECT id, running FROM TABLE(running_total((SELECT id, " ++ g ++ ", amt FROM t)) PARTITION BY g ORDER BY id)");
+        defer res.deinit();
+        try std.testing.expectError(thindb.exec.Error.TableFnInputMismatch, res.next());
+    }
+}
+
+test "table UDF borrow: a converted column drains while matching columns stay borrowed" {
+    const allocator = std.testing.allocator;
+
+    const stub = try allocator.create(BorrowStub);
+    stub.* = .{ .allocator = allocator };
+    const sq = thindb.exec.makeQuery(allocator, stub);
+
+    const set = try thindb.exec.mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(sq, null);
+    stage.want_contiguous = true;
+
+    const ms = try thindb.exec.mat_stage.MatScan.create(allocator, stage);
+    // `g` is INT upstream, declared BIGINT.
+    const wide_input = [_]thindb.Column{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "g", .type = .bigint },
+        .{ .name = "amt", .type = .bigint },
+    };
+    const entry = thindb.udf.TableEntry{
+        .name = "running_total",
+        .input_schemas = &.{&wide_input},
+        .output_schema = &output_cols,
+        .execution = .either,
+        .arg_types = &.{},
+        .row_aligned = false,
+        .ordered_output = false,
+        .broadcast_inputs = &.{},
+        .passthrough = &.{},
+        .kernel_input_cols = 3,
+        .process = runningTotal,
+        .user_data = null,
+    };
+    var q = try thindb.exec.table_fn.TableFnExec.create(
+        allocator,
+        &.{ms},
+        &entry,
+        &.{},
+        &.{"g"},
+        &.{.{ .col = "id" }},
+        1,
+    );
+    defer q.deinit();
+    const tf = thindb.exec.queryAs(thindb.exec.table_fn.TableFnExec, q).?;
+    tf.borrow_src = stage;
+    tf.borrow_map = &[_]?usize{ 0, 1, 2 };
+    stage.registerUse();
+
+    var got: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+    defer got.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try got.put(allocator, batch.values[0].data.bigint[i], batch.values[1].data.bigint[i]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), tf.borrowed_bound);
+    try expectRunningMap(&got);
+}
+
+fn runningEntry(comptime cols: []const thindb.Column) thindb.udf.TableEntry {
+    return .{
+        .name = "running_total",
+        .input_schemas = &.{cols},
+        .output_schema = &output_cols,
+        .execution = .either,
+        .arg_types = &.{},
+        .row_aligned = false,
+        .ordered_output = false,
+        .broadcast_inputs = &.{},
+        .passthrough = &.{},
+        .kernel_input_cols = 3,
+        .process = runningTotal,
+        .user_data = null,
+    };
+}
+
+/// Builds the operator over a fresh stub and drops it; on failure the stub
+/// is still the caller's to free.
+fn createOverStub(allocator: std.mem.Allocator, entry: *const thindb.udf.TableEntry) !void {
+    const stub = try allocator.create(BorrowStub);
+    stub.* = .{ .allocator = allocator };
+    var sq = thindb.exec.makeQuery(allocator, stub);
+    var q = thindb.exec.table_fn.TableFnExec.create(allocator, &.{sq}, entry, &.{}, &.{"g"}, &.{.{ .col = "id" }}, 1) catch |err| {
+        sq.deinit();
+        return err;
+    };
+    q.deinit();
+}
+
+test "table UDF input conversion: a failed create leaves the input to the caller" {
+    // `g` converts as it drains (INT into BIGINT) and `amt` through a
+    // Compute over the input (BIGINT into DECIMAL); every allocation either
+    // adds can fail without leaking or freeing the caller's input.
+    const converting = comptime runningEntry(&.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "g", .type = .bigint },
+        .{ .name = "amt", .type = .{ .decimal64 = .{ .p = 18, .s = 2 } } },
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, createOverStub, .{&converting});
+
+    // `g` converts but `amt` is refused (BIGINT into DATE).
+    const refused = comptime runningEntry(&.{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "g", .type = .bigint },
+        .{ .name = "amt", .type = .date },
+    });
+    try std.testing.expectError(thindb.exec.Error.TableFnInputMismatch, createOverStub(std.testing.allocator, &refused));
+}
