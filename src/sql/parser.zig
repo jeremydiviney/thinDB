@@ -789,6 +789,13 @@ pub const Parser = struct {
     /// Nesting depth of `parseStatement`: tells a recursive CTE body's own
     /// first operand from a subquery's.
     query_depth: u32 = 0,
+    /// Nesting depth of subqueries in expressions (EXISTS, IN, scalar),
+    /// whose names may read an enclosing query's columns.
+    expression_subquery_depth: u32 = 0,
+    /// Qualifiers of the ON columns the innermost expression subquery reads
+    /// from an enclosing query; each FROM clause checks the ones its ON
+    /// clauses add.
+    enclosing_on_qualifiers: std.ArrayList([]const u8) = .empty,
     /// The innermost SELECT being parsed is SELECT DISTINCT.
     select_distinct: bool = false,
     /// `WITH KEYED BY (...)` declaration for the current statement's CTE
@@ -902,6 +909,17 @@ pub const Parser = struct {
             if (registry.hasAggregateName(name)) return .udf;
         }
         return null;
+    }
+
+    /// A subquery in an expression, its opening parenthesis consumed.
+    pub fn parseExpressionSubquery(self: *Parser) ParseError!*ir.Op {
+        const enclosing_qualifiers = self.enclosing_on_qualifiers.items.len;
+        self.expression_subquery_depth += 1;
+        defer {
+            self.expression_subquery_depth -= 1;
+            self.enclosing_on_qualifiers.shrinkRetainingCapacity(enclosing_qualifiers);
+        }
+        return try self.parseStatement();
     }
 
     /// Whether `tag` opens a query: SELECT, WITH, and MySQL's VALUES and
@@ -3585,7 +3603,7 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.lparen);
             if (!self.startsQuery(self.cur.tag)) return ParseError.SqlExpectedSelect;
-            const source = try self.parseStatement();
+            const source = try self.parseExpressionSubquery();
             try self.expect(.rparen);
             return ir.Expr{ .exists_subquery = @ptrCast(source) };
         }
@@ -3713,7 +3731,7 @@ pub const Parser = struct {
                 // through the binary expression parser.
                 try self.advance();
                 if (self.startsQuery(self.cur.tag)) {
-                    const source = try self.parseStatement();
+                    const source = try self.parseExpressionSubquery();
                     try self.expect(.rparen);
                     return ir.Expr{ .scalar_subquery = @ptrCast(source) };
                 }
@@ -3915,9 +3933,11 @@ pub const Parser = struct {
     };
 
     fn parseFromClause(self: *Parser) ParseError!FromClause {
+        const enclosing_qualifiers = self.enclosing_on_qualifiers.items.len;
         const first = try self.parseFromTarget();
         if (!self.joinStartAhead() and self.cur.tag != .comma) {
             const inputs = try self.arena.dupe(ChainInput, &.{.{ .name = first.name, .op = first.op }});
+            try self.checkEnclosingOnQualifiers(enclosing_qualifiers, inputs);
             if (first.unaliased == .no) return .{ .op = first.op, .inputs = inputs };
             return .{ .op = first.op, .sole_unaliased_name = first.name, .inputs = inputs };
         }
@@ -3936,7 +3956,20 @@ pub const Parser = struct {
         }
         var inputs: std.ArrayList(ChainInput) = .empty;
         for (chains.items) |chain| try inputs.appendSlice(self.arena, chain.inputs);
+        try self.checkEnclosingOnQualifiers(enclosing_qualifiers, inputs.items);
         return .{ .op = root, .merged_star = try self.fromMergedStar(chains.items), .inputs = inputs.items };
+    }
+
+    /// Rejects an ON column read as an enclosing query's whose qualifier
+    /// names a relation of this FROM clause the ON can't see, as at the top
+    /// level (`FROM a, b JOIN c ON a.id = c.bid`): the name is the FROM's
+    /// before it is an enclosing query's.
+    fn checkEnclosingOnQualifiers(self: *Parser, since: usize, inputs: []const ChainInput) ParseError!void {
+        for (self.enclosing_on_qualifiers.items[since..]) |qualifier| {
+            for (inputs) |input| {
+                if (types.columnNameEql(qualifier, input.name)) return ParseError.SqlOnRefsUnknownTable;
+            }
+        }
     }
 
     /// `*` over the whole FROM clause when some chain merged columns: each
@@ -5178,7 +5211,7 @@ pub const Parser = struct {
                 self.cur = cur_start;
                 self.prev_end = prev_end_start;
                 self.predicate_derived.shrinkRetainingCapacity(derived_start);
-                return self.parseResidualOn(scope);
+                return self.parseResidualOn(scope, jtype);
             },
             else => err,
         };
@@ -5187,8 +5220,9 @@ pub const Parser = struct {
     /// A general ON condition: its top-level `left = right` column
     /// equalities key the join and the rest is its residual, which an inner
     /// join filters above itself and an outer join checks per candidate pair.
-    /// Every column must side with one input.
-    fn parseResidualOn(self: *Parser, scope: *JoinScope) ParseError!JoinOnPlan {
+    /// Every column must side with one input, or in a subquery read an
+    /// enclosing query.
+    fn parseResidualOn(self: *Parser, scope: *JoinScope, jtype: ir.JoinType) ParseError!JoinOnPlan {
         const cond = try self.parseConditionBody();
         for (cond.derived) |d| try self.checkResidualExpr(d.expr, scope, cond.derived);
         try self.checkResidualPredicate(cond.predicate, scope, cond.derived);
@@ -5199,9 +5233,15 @@ pub const Parser = struct {
         var left_derived: std.ArrayList(ir.Derived) = .empty;
         var right_derived: std.ArrayList(ir.Derived) = .empty;
         var hidden_left: std.ArrayList([]const u8) = .empty;
+        var left_filters: std.ArrayList(PredicateExpr) = .empty;
+        var right_filters: std.ArrayList(PredicateExpr) = .empty;
         var rest: std.ArrayList(PredicateExpr) = .empty;
         var synth_counter: usize = 0;
         for (conjuncts.items) |c| {
+            if (try self.enclosingSideFilter(c, scope, jtype, cond.derived)) |side| {
+                try (if (side == .left) &left_filters else &right_filters).append(self.arena, c);
+                continue;
+            }
             const key = try self.residualKeyColumns(c, scope, cond.derived) orelse {
                 try rest.append(self.arena, c);
                 continue;
@@ -5215,8 +5255,8 @@ pub const Parser = struct {
             .ranges = &.{},
             .left_derived = try left_derived.toOwnedSlice(self.arena),
             .right_derived = try right_derived.toOwnedSlice(self.arena),
-            .left_filter = null,
-            .right_filter = null,
+            .left_filter = try self.joinFilterFromParts(&left_filters),
+            .right_filter = try self.joinFilterFromParts(&right_filters),
             .hidden_left = try hidden_left.toOwnedSlice(self.arena),
             .residual = try self.joinFilterFromParts(&rest),
             .residual_derived = cond.derived,
@@ -5224,6 +5264,40 @@ pub const Parser = struct {
     }
 
     const ResidualKey = struct { left: []const u8, right: []const u8, null_safe: bool };
+
+    /// The input an outer join's conjunct filters before the join, when it
+    /// reads an enclosing query's column and nothing of the preserved input:
+    /// it holds or fails for a whole row of the other input, whatever row it
+    /// would pair with, so filtering that input keeps every preserved row
+    /// (`LEFT JOIN b ON a.id = b.id AND b.v = x.v`). One over a computed
+    /// operand stays in the residual, which computes it.
+    fn enclosingSideFilter(self: *Parser, c: PredicateExpr, scope: *JoinScope, jtype: ir.JoinType, derived: []const ir.Derived) ParseError!?JoinExprSide {
+        const filtered: JoinExprSide = switch (jtype) {
+            .left => .right,
+            .right => .left,
+            .inner, .full => return null,
+        };
+        if (!exec_predicate.kernelsOnly(c)) return null;
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        try exec_predicate.collectColumnNames(self.arena, &names, c);
+        var enclosing = false;
+        for (names.items) |name| {
+            if (derivedNamed(derived, name)) return null;
+            if (std.mem.indexOfScalar(u8, name, '.') == null) {
+                const columns = try self.joinInputColumns(scope);
+                if (columns.left == null or columns.right == null) return null;
+            }
+            const col = self.splitJoinCol(name, scope) catch |err| switch (err) {
+                ParseError.SqlOnRefsUnknownTable => {
+                    enclosing = true;
+                    continue;
+                },
+                else => return err,
+            };
+            if (col.side != filtered) return null;
+        }
+        return if (enclosing) filtered else null;
+    }
 
     /// The left and right columns a conjunct equates, when it is a column
     /// equality across the two inputs.
@@ -5275,15 +5349,24 @@ pub const Parser = struct {
         }
     }
 
-    /// The input a residual column reads, or null for an unqualified name
-    /// beside an input whose columns can't be listed: it resolves against
-    /// the joined output when the plan compiles, as a WHERE's does.
+    /// The input a residual column reads, or null for a name the plan
+    /// resolves when it compiles, as a WHERE's: an unqualified one beside an
+    /// input whose columns can't be listed, or, in a subquery, one neither
+    /// input has, which reads an enclosing query's column.
     fn residualColumnSide(self: *Parser, name: []const u8, scope: *JoinScope) ParseError!?JoinExprSide {
         if (std.mem.indexOfScalar(u8, name, '.') == null) {
             const columns = try self.joinInputColumns(scope);
             if (columns.left == null or columns.right == null) return null;
         }
-        return (try self.splitJoinCol(name, scope)).side;
+        const col = self.splitJoinCol(name, scope) catch |err| switch (err) {
+            ParseError.SqlOnRefsUnknownTable => {
+                if (self.expression_subquery_depth == 0) return err;
+                if (std.mem.indexOfScalar(u8, name, '.')) |dot| try self.enclosing_on_qualifiers.append(self.arena, name[0..dot]);
+                return null;
+            },
+            else => return err,
+        };
+        return col.side;
     }
 
     /// Rejects a residual column neither join input exposes; a derived

@@ -592,6 +592,86 @@ test "an outer join's ON correlated by OR, <> or terms over both rows matches th
     }
 }
 
+test "a subquery's join ON reads an enclosing query's columns" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Rows are DuckDB's. It rejects an enclosing column in an outer join's
+    // ON, so those rows read the column projected onto the preserved input.
+    const cases = .{
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.v = x.v) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 2, 3, 0, 4, 1, 5, 2 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u a JOIN vu b ON a.v = b.v AND a.id + b.id > x.k + 30) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 4, 2, 2, 3, 2, 4, 2, 5, 1 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u a JOIN ex_u b ON a.id = b.id AND x.v > 3) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 5, 2, 0, 3, 0, 4, 5, 5, 0 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.id = k) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 1, 2, 1, 3, 1, 4, 1, 5, 1 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u a JOIN ex_u b ON a.id = b.id JOIN ex_u c ON c.v = b.v AND c.id <> x.k) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 4, 2, 5, 3, 6, 4, 4, 5, 5 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM (SELECT id, v FROM ex_u) a JOIN ex_u b ON a.v = b.v AND b.id <> x.k WHERE a.id > x.k) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 3, 2, 3, 3, 3, 4, 1, 5, 0 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.v = x.v WHERE a.w <> 'a') ORDER BY x.id", &[_]?i64{ 2, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT a.v FROM ex_u a JOIN ex_u b ON a.v = b.v AND b.id > x.k) ORDER BY x.id", &[_]?i64{2} },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v NOT IN (SELECT a.v FROM ex_u a JOIN ex_u b ON a.v = b.v AND b.id > x.k WHERE a.v IS NOT NULL) ORDER BY x.id", &[_]?i64{ 1, 4, 5 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u z WHERE EXISTS (SELECT 1 FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.v = x.v AND a.id = z.id)) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 2, 3, 0, 4, 1, 5, 2 } },
+        .{ "SELECT x.v FROM ex_t x GROUP BY x.v HAVING EXISTS (SELECT 1 FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.v = x.v) ORDER BY x.v", &[_]?i64{ 2, 7 } },
+        .{ "SELECT x.id, z.id AS zid FROM ex_t x JOIN ex_u z ON z.v = x.v AND EXISTS (SELECT 1 FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.v = z.v AND a.id <> x.k) ORDER BY x.id, zid", &[_]?i64{ 2, 10, 2, 40, 4, 20, 5, 10, 5, 40 } },
+        .{ "SELECT x.id, (SELECT COUNT(b.id) FROM ex_u a LEFT JOIN ex_u b ON a.id = b.id AND b.v = x.v) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 2, 3, 0, 4, 1, 5, 2 } },
+        .{ "SELECT x.id, (SELECT COUNT(b.id) FROM ex_u a LEFT JOIN ex_u b ON a.id = b.id AND a.v = x.v) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 2, 3, 0, 4, 1, 5, 2 } },
+        .{ "SELECT x.id, (SELECT COUNT(b.id) FROM ex_u a LEFT JOIN ex_u b ON a.v = b.v AND a.id + b.id > x.k + 30) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 4, 2, 2, 3, 2, 4, 2, 5, 1 } },
+        .{ "SELECT x.id, (SELECT COUNT(*) + SUM(b.id) FROM ex_u a LEFT JOIN ex_u b ON a.v = b.v AND b.id > x.k) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 155, 2, 135, 3, 135, 4, 55, 5, null } },
+        .{ "SELECT x.id, (SELECT COUNT(*) FROM ex_u a LEFT JOIN ex_u b ON a.id = b.id AND b.v = x.v WHERE b.id IS NULL) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 5, 2, 3, 3, 5, 4, 4, 5, 3 } },
+        .{ "SELECT x.id FROM ex_t x WHERE NOT EXISTS (SELECT 1 FROM ex_u a LEFT JOIN ex_u b ON a.id = b.id AND b.v = x.v WHERE b.id IS NOT NULL) ORDER BY x.id", &[_]?i64{ 1, 3 } },
+        .{ "SELECT x.id, (SELECT COUNT(a.id) FROM ex_u a RIGHT JOIN ex_u b ON a.id = b.id AND a.v = x.v) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 0, 2, 2, 3, 0, 4, 1, 5, 2 } },
+        .{ "SELECT x.id, (SELECT COUNT(a.id) FROM ex_u a RIGHT JOIN ex_u b ON a.v = b.v AND a.id + b.id > x.k + 30) AS n FROM ex_t x ORDER BY x.id", &[_]?i64{ 1, 4, 2, 2, 3, 2, 4, 2, 5, 1 } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+
+    // A FULL JOIN would need every domain row on both inputs. An ON can't
+    // see a relation of its own FROM outside its join, and that name is the
+    // FROM's before it is an enclosing query's.
+    try helpers.expectRunError(allocator, db, "SELECT x.id, (SELECT COUNT(*) FROM ex_u a FULL JOIN ex_u b ON a.id = b.id AND b.v = x.v) AS n FROM ex_t x", error.UnsupportedCorrelatedSubquery);
+    try helpers.expectRunError(allocator, db, "SELECT x.id, (SELECT COUNT(*) FROM ex_u a JOIN ex_u b ON a.id = b.id AND zz.v = 1) AS n FROM ex_t x", error.UnsupportedCorrelatedSubquery);
+    const unseen = .{
+        "SELECT a.id FROM ex_u a JOIN ex_u b ON a.id = b.id AND zz.v = 1",
+        "SELECT a.id, (SELECT COUNT(*) FROM ex_u a, ex_u b JOIN ex_u c ON a.id = c.id) AS n FROM ex_t a",
+        "SELECT a.id, (SELECT COUNT(*) FROM ex_u b JOIN ex_u c ON a.k = c.id, ex_u a) AS n FROM ex_t a",
+        "SELECT a.id, (SELECT COUNT(*) FROM ex_u b LEFT JOIN ex_u c ON c.v = a.v JOIN ex_u a ON a.id = b.id) AS n FROM ex_t a",
+        "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT b.id FROM ex_u b JOIN ex_u c ON b.id = c.id AND c.v = d.v) d)",
+    };
+    inline for (unseen) |sql| try helpers.expectRunError(allocator, db, sql, error.SqlOnRefsUnknownTable);
+}
+
+test "correlated DELETE and UPDATE whose subquery's join ON reads the target row" {
+    const allocator = std.testing.allocator;
+    // Rows are DuckDB's. `np` is a copy of `ex_t` without a key, which the
+    // keyed statements filter in place.
+    const cases = .{
+        .{ "ex_t", "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.v = ex_t.v)", &[_]?i64{ 1, 5, 10, 3, null, 30 } },
+        .{ "np", "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u a JOIN ex_u b ON a.id = b.id AND b.v = np.v)", &[_]?i64{ 1, 5, 10, 3, null, 30 } },
+        .{ "ex_t", "UPDATE ex_t SET v = -2 WHERE ex_t.id < (SELECT COUNT(*) FROM ex_u a JOIN ex_u b ON a.v = b.v AND b.v = ex_t.v)", &[_]?i64{ 1, 5, 10, 2, -2, 20, 3, null, 30, 4, 7, 40, 5, 2, 50 } },
+        .{ "np", "UPDATE np SET v = -2 WHERE np.id < (SELECT COUNT(*) FROM ex_u a JOIN ex_u b ON a.v = b.v AND b.v = np.v)", &[_]?i64{ 1, 5, 10, 2, -2, 20, 3, null, 30, 4, 7, 40, 5, 2, 50 } },
+        .{ "ex_t", "DELETE FROM ex_t WHERE ex_t.id * 0 = (SELECT COUNT(b.id) FROM ex_u a LEFT JOIN ex_u b ON a.v = b.v AND b.id > ex_t.k)", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, null, 30, 4, 7, 40 } },
+        .{ "ex_t", "UPDATE ex_t SET v = -3 WHERE EXISTS (SELECT 1 FROM ex_u a LEFT JOIN ex_u b ON a.id = b.id AND b.v = ex_t.v WHERE b.id IS NULL AND a.v = 7)", &[_]?i64{ 1, -3, 10, 2, -3, 20, 3, -3, 30, 4, 7, 40, 5, -3, 50 } },
+    };
+    inline for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE np (id BIGINT, v INT, k INT)");
+        try exec(allocator, db, "INSERT INTO np SELECT id, v, k FROM ex_t");
+        try exec(allocator, db, case[1]);
+        expectCells(allocator, db, "SELECT id, v, k FROM " ++ case[0] ++ " ORDER BY id", case[2]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[1]});
+            return err;
+        };
+    }
+}
+
 test "correlated scalar over a CTE that shadows its table, keyed by an expression over the outer row" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
