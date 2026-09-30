@@ -32,17 +32,7 @@ jobs:
           key: zig-download-x86_64-linux-${{ env.ZIG_VERSION }}
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        env:
-          ZIG_ARCH_OS: x86_64-linux
-        run: |
-          archive="$RUNNER_TEMP/zig-$ZIG_ARCH_OS-$ZIG_VERSION.tar.xz"
-          # ziglang.org has served runners at ~57 KB/s: a transfer that stays
-          # under 500 KB/s for 30 s aborts and retries on a new connection.
-          [ -f "$archive" ] || curl -fL --retry 3 --retry-all-errors \
-            --speed-limit 500000 --speed-time 30 -o "$archive" \
-            "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_ARCH_OS-$ZIG_VERSION.tar.xz"
-          tar -xJf "$archive" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-$ZIG_ARCH_OS-$ZIG_VERSION" >> "$GITHUB_PATH"
+        run: bash .github/scripts/install-zig.sh x86_64-linux
 
       - name: zig fmt --check
         run: zig fmt --check src tests bench build.zig scripts
@@ -67,16 +57,8 @@ jobs:
           key: zig-download-x86_64-windows-${{ env.ZIG_VERSION }}
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        shell: pwsh
-        run: |
-          $archive = "$env:RUNNER_TEMP\zig-x86_64-windows-$env:ZIG_VERSION.zip"
-          if (-not (Test-Path $archive)) {
-            curl.exe -fL --retry 3 --retry-all-errors --speed-limit 500000 --speed-time 30 -o $archive `
-              "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          Expand-Archive $archive -DestinationPath "$env:RUNNER_TEMP"
-          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\zig-x86_64-windows-$env:ZIG_VERSION"
+        shell: bash
+        run: bash .github/scripts/install-zig.sh x86_64-windows
 
       - name: Cache zig build cache
         uses: actions/cache@v6
@@ -119,15 +101,7 @@ jobs:
           key: zig-download-${{ matrix.zig_arch_os }}-${{ env.ZIG_VERSION }}
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        env:
-          ZIG_ARCH_OS: ${{ matrix.zig_arch_os }}
-        run: |
-          archive="$RUNNER_TEMP/zig-$ZIG_ARCH_OS-$ZIG_VERSION.tar.xz"
-          [ -f "$archive" ] || curl -fL --retry 3 --retry-all-errors \
-            --speed-limit 500000 --speed-time 30 -o "$archive" \
-            "https://ziglang.org/download/$ZIG_VERSION/zig-$ZIG_ARCH_OS-$ZIG_VERSION.tar.xz"
-          tar -xJf "$archive" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-$ZIG_ARCH_OS-$ZIG_VERSION" >> "$GITHUB_PATH"
+        run: bash .github/scripts/install-zig.sh ${{ matrix.zig_arch_os }}
 
       - name: Cache zig build cache
         uses: actions/cache@v6
