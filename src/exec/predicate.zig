@@ -369,6 +369,9 @@ pub const CorrelatedScalar = struct {
     /// The aggregate over no rows, which an outer row whose key matched
     /// none compares with (COUNT's 0); null where that aggregate is NULL.
     missing: ?Value = null,
+    /// `rows` are in key order (`sortKeyed`) and stay so at the outer
+    /// columns' types (`keysSearchable`), so a lookup binary-searches them.
+    sorted: bool = false,
 };
 
 pub const CorrelatedRangeGroup = struct {
@@ -400,9 +403,13 @@ pub const CorrelatedRange = struct {
     outer_range_col_upper: ?[]const u8 = null,
     /// Upper-bound op for closed ranges. Either `.lt` or `.lte`.
     op_upper: ?PredicateOp = null,
-    /// One group per distinct equi-key tuple. Linear scan per outer
-    /// row in v1 — group count is expected to be small.
+    /// One group per distinct equi-key tuple of the inner's values. Two
+    /// can be equal at the outer columns' types (text `'07'` and `'7'`
+    /// against a number).
     groups: []const CorrelatedRangeGroup,
+    /// `groups` are in key order (`sortKeyed`) and stay so at the outer
+    /// columns' types (`keysSearchable`), so a lookup binary-searches them.
+    sorted: bool = false,
     /// `true` = NOT EXISTS — outer row passes iff no inner value
     /// satisfies the range op.
     negate: bool,
@@ -427,6 +434,9 @@ pub const CorrelatedSet = struct {
     negate: bool,
     /// Types of the inner columns, parallel to `outer_cols`.
     inner_types: []const types.Type,
+    /// `rows` are in tuple order (`sortKeyed`) and stay so at the outer
+    /// columns' types (`keysSearchable`), so a lookup binary-searches them.
+    sorted: bool = false,
 };
 
 /// Build a leaf predicate expression. Shorthand for `.{ .leaf = ... }`.
@@ -512,6 +522,7 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .rows = rows,
                 .negate = s.negate,
                 .inner_types = try out_arena.dupe(types.Type, s.inner_types),
+                .sorted = s.sorted,
             } };
         },
         .correlated_scalar => |s| blk: {
@@ -531,6 +542,7 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .value_type = s.value_type,
                 .key_types = try out_arena.dupe(types.Type, s.key_types),
                 .missing = if (s.missing) |m| try cloneValue(out_arena, m) else null,
+                .sorted = s.sorted,
             } };
         },
         .correlated_range => |s| blk: {
@@ -555,6 +567,7 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .negate = s.negate,
                 .key_types = try out_arena.dupe(types.Type, s.key_types),
                 .range_type = s.range_type,
+                .sorted = s.sorted,
             } };
         },
         .@"and" => |kids| blk: {
@@ -744,6 +757,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                 }
                 s.rows = rows[0..keep];
             }
+            s.sorted = keysSearchable([]const Value, s.rows, col_types);
         },
         // `.correlated_scalar` — outer_compared + outer_keys all exist;
         // keys come to the outer key columns' types like a set tuple.
@@ -765,6 +779,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                 }
                 s.rows = rows[0..keep];
             }
+            s.sorted = keysSearchable(CorrelatedScalarRow, s.rows, col_types);
         },
         // `.correlated_range` — outer_range_col + each outer_keys
         // entry must exist on the outer schema; group keys come to the
@@ -788,6 +803,7 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
                 }
                 s.groups = groups[0..keep];
             }
+            s.sorted = keysSearchable(CorrelatedRangeGroup, s.groups, col_types);
         },
         // `.leaf_var` must have been resolved by the pre-compile
         // pass. Reaching here means the resolver missed a node.
@@ -1495,9 +1511,9 @@ pub fn evaluatePredicate(
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
             evaluateTextAsNumberSetMask(batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
         },
-        .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
-        .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
-        .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out),
+        .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out, null),
+        .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out, null),
+        .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out, null),
         .leaf_var => return Error.PredicateTypeMismatch,
         .unknown => @memset(out, false),
     }
@@ -1602,9 +1618,9 @@ pub fn evaluateExprGuided(
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
             evaluateTextAsNumberSetMask(batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
         },
-        .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out),
-        .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out),
-        .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out),
+        .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out, active),
+        .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out, active),
+        .correlated_range => |s| try evaluateCorrelatedRangeMask(s, schema, batch, out, active),
         .leaf_var => return Error.PredicateTypeMismatch,
         .unknown => @memset(out, false),
     }
@@ -1612,8 +1628,12 @@ pub fn evaluateExprGuided(
 
 /// Per-row: build key from outer_keys, look up matching CorrelatedScalarRow,
 /// then compare outer_compared op row.value. A key that matched no row, NULL
-/// included, compares with `missing`, and fails without one.
-pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column, batch: anytype, out: []bool) !void {
+/// included, compares with `missing`, and fails without one. A row `active`
+/// excludes isn't looked up and fails. A key matching two rows is an
+/// `UnsupportedCorrelatedSubquery`: inner keys that differ but come to one
+/// outer value (text `'07'` and `'7'` against a number) split that value's
+/// inner rows between two aggregates, and neither is the subquery's value.
+pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column, batch: anytype, out: []bool, active: ?[]const bool) !void {
     const n_keys = s.outer_keys.len;
     var key_idx_buf: [16]usize = undefined;
     if (n_keys > key_idx_buf.len) return Error.PredicateTypeMismatch;
@@ -1627,7 +1647,12 @@ pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column,
 
     var i: usize = 0;
     while (i < batch.row_count) : (i += 1) {
-        // NULL on outer comparison column or any outer key → fails.
+        if (active) |a| {
+            if (!a[i]) {
+                out[i] = false;
+                continue;
+            }
+        }
         if (!cmp_view.isValid(i)) {
             out[i] = false;
             continue;
@@ -1639,22 +1664,11 @@ pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column,
                 break;
             }
         }
-
-        // Linear-scan rows for matching key.
-        var found_value: ?Value = null;
-        if (!any_null) for (s.rows) |row| {
-            var all_match = true;
-            for (key_idxs, row.key) |idx, ref_val| {
-                if (!cellMatchesValue(batch.values[idx], i, ref_val)) {
-                    all_match = false;
-                    break;
-                }
-            }
-            if (all_match) {
-                found_value = row.value;
-                break;
-            }
-        };
+        const found = if (any_null) null else findKeyed(CorrelatedScalarRow, s.rows, s.sorted, batch.values, key_idxs, i, 0);
+        if (found) |at| {
+            if (findKeyed(CorrelatedScalarRow, s.rows, s.sorted, batch.values, key_idxs, i, at + 1) != null) return Error.UnsupportedCorrelatedSubquery;
+        }
+        const found_value: ?Value = if (found) |at| s.rows[at].value else null;
         if (found_value orelse s.missing) |v| {
             out[i] = orderMatches(scalarOrder(cellScalar(cmp_view, cmp_type, i), valueScalar(v, decimalScale(s.value_type))), s.op);
         } else {
@@ -1703,16 +1717,19 @@ fn emptyStringMask(sv: anytype, want_empty: bool, n: usize, mask: []bool) void {
 
 /// Per-row range-correlation check. For each outer row:
 ///   1. Build the equi-key tuple from `outer_keys`. NULL in any key → no match.
-///   2. Linear-scan `groups` for the matching key tuple.
-///   3. Within that group, check whether any inner value satisfies
+///   2. Find the groups with that key tuple (`findKeyed`). Inner keys
+///      that differ can come to one outer value (text `'07'` and `'7'`
+///      against a number), so more than one group can match.
+///   3. Within those groups, check whether any inner value satisfies
 ///      `value op outer_range_value` (and the upper bound, when closed)
 ///      under the comparison rule, since the inner range column's type
 ///      needn't be the outer column's.
 ///   4. Apply `negate` (NOT EXISTS).
 ///
 /// Empty group / no matching group → no inner row matches → EXISTS
-/// false, NOT EXISTS true.
-pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, batch: anytype, out: []bool) !void {
+/// false, NOT EXISTS true. A row `active` excludes isn't looked up and
+/// fails.
+pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, batch: anytype, out: []bool, active: ?[]const bool) !void {
     const n_keys = s.outer_keys.len;
     var key_idx_buf: [16]usize = undefined;
     if (n_keys > key_idx_buf.len) return Error.PredicateTypeMismatch;
@@ -1736,6 +1753,12 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
 
     var i: usize = 0;
     while (i < batch.row_count) : (i += 1) {
+        if (active) |a| {
+            if (!a[i]) {
+                out[i] = false;
+                continue;
+            }
+        }
         // NULL on outer range col or any equi key → predicate fails
         // (no inner row can satisfy a NULL comparison).
         if (!range_view.isValid(i)) {
@@ -1760,30 +1783,16 @@ pub fn evaluateCorrelatedRangeMask(s: CorrelatedRange, schema: []const Column, b
             continue;
         }
 
-        // Locate the group whose key tuple matches this row.
-        var matched_group: ?CorrelatedRangeGroup = null;
-        for (s.groups) |g| {
-            var all_match = true;
-            for (key_idxs, g.key) |idx, ref_val| {
-                if (!cellMatchesValue(batch.values[idx], i, ref_val)) {
-                    all_match = false;
-                    break;
-                }
-            }
-            if (all_match) {
-                matched_group = g;
-                break;
-            }
+        const lower = cellScalar(range_view, schema[range_idx].type, i);
+        const upper: ?Scalar = if (range_upper_idx) |ui| cellScalar(batch.values[ui], schema[ui].type, i) else null;
+        var exists = false;
+        var from: usize = 0;
+        while (!exists) {
+            const at = findKeyed(CorrelatedRangeGroup, s.groups, s.sorted, batch.values, key_idxs, i, from) orelse break;
+            exists = try bounds.anyMatches(s.groups[at].values, lower, upper);
+            from = at + 1;
         }
-
-        if (matched_group) |g| {
-            const lower = cellScalar(range_view, schema[range_idx].type, i);
-            const upper: ?Scalar = if (range_upper_idx) |ui| cellScalar(batch.values[ui], schema[ui].type, i) else null;
-            const exists = try bounds.anyMatches(g.values, lower, upper);
-            out[i] = if (s.negate) !exists else exists;
-        } else {
-            out[i] = s.negate;
-        }
+        out[i] = if (s.negate) !exists else exists;
     }
 }
 
@@ -1838,9 +1847,10 @@ fn rangeValuesOrdered(value_type: types.Type, outer_type: types.Type) bool {
 }
 
 /// Per-row tuple lookup against a materialized correlated set.
-/// Assembles each row's outer-side tuple, linear-scans `rows` for a
-/// match. NULL in any outer col → the tuple can't match.
-pub fn evaluateCorrelatedSetMask(s: CorrelatedSet, schema: []const Column, batch: anytype, out: []bool) !void {
+/// Assembles each row's outer-side tuple and looks it up in `rows`
+/// (`findKeyed`). NULL in any outer col → the tuple can't match. A row
+/// `active` excludes isn't looked up and fails.
+pub fn evaluateCorrelatedSetMask(s: CorrelatedSet, schema: []const Column, batch: anytype, out: []bool, active: ?[]const bool) !void {
     const n_cols = s.outer_cols.len;
     if (n_cols == 0) return Error.PredicateTypeMismatch;
 
@@ -1853,6 +1863,12 @@ pub fn evaluateCorrelatedSetMask(s: CorrelatedSet, schema: []const Column, batch
 
     var i: usize = 0;
     while (i < batch.row_count) : (i += 1) {
+        if (active) |a| {
+            if (!a[i]) {
+                out[i] = false;
+                continue;
+            }
+        }
         // NULL in any outer col → no match possible.
         var any_null = false;
         for (col_idxs) |idx| {
@@ -1865,23 +1881,117 @@ pub fn evaluateCorrelatedSetMask(s: CorrelatedSet, schema: []const Column, batch
             out[i] = s.negate; // NULL → can't match; NOT IN passes, IN fails.
             continue;
         }
-        // Scan rows for a tuple match.
-        var found = false;
-        for (s.rows) |row| {
-            var all_match = true;
-            for (col_idxs, row) |idx, ref_val| {
-                if (!cellMatchesValue(batch.values[idx], i, ref_val)) {
-                    all_match = false;
-                    break;
-                }
-            }
-            if (all_match) {
-                found = true;
-                break;
-            }
-        }
+        const found = findKeyed([]const Value, s.rows, s.sorted, batch.values, col_idxs, i, 0) != null;
         out[i] = if (s.negate) !found else found;
     }
+}
+
+/// A materialized row's key tuple; a set's row is its own.
+fn rowKey(row: anytype) []const Value {
+    return switch (@TypeOf(row)) {
+        []const Value => row,
+        CorrelatedScalarRow, CorrelatedRangeGroup => row.key,
+        else => @compileError("no key tuple on " ++ @typeName(@TypeOf(row))),
+    };
+}
+
+fn keyTupleOrder(a: []const Value, b: []const Value) std.math.Order {
+    for (a, b) |x, y| {
+        const order = x.compare(y);
+        if (order != .eq) return order;
+    }
+    return .eq;
+}
+
+fn keyLessThan(comptime Row: type) fn (void, Row, Row) bool {
+    return struct {
+        fn lessThan(_: void, a: Row, b: Row) bool {
+            return keyTupleOrder(rowKey(a), rowKey(b)) == .lt;
+        }
+    }.lessThan;
+}
+
+/// Puts materialized correlated rows in key order, equal keys as they came,
+/// so a lookup can binary-search them. Each key position holds one type,
+/// the inner column's; `validateExpr` checks the order still holds once the
+/// keys come to the outer columns' types.
+pub fn sortKeyed(comptime Row: type, rows: []Row) void {
+    std.mem.sort(Row, rows, {}, keyLessThan(Row));
+}
+
+/// Whether `findKeyed` may binary-search the rows: their keys are in key
+/// order, and each value has its outer column's type, whose equal values
+/// are identical, so the order agrees with `cellMatchesValue`. Floats
+/// (NaN, -0.0) and JSON keep the scan, as does a number against a text
+/// column, which reads each row's text as a number.
+fn keysSearchable(comptime Row: type, rows: []const Row, col_types: []const types.Type) bool {
+    for (col_types) |ty| switch (ty) {
+        .float, .double, .json => return false,
+        else => {},
+    };
+    for (rows, 0..) |row, at| {
+        for (rowKey(row), col_types) |v, ty| {
+            if (std.meta.activeTag(v) != ValueTag.fromType(ty)) return false;
+        }
+        if (at > 0 and keyTupleOrder(rowKey(rows[at - 1]), rowKey(row)) == .gt) return false;
+    }
+    return true;
+}
+
+/// The first of `rows[from..]` whose key equals row `i`'s cells at
+/// `key_idxs`: a binary search when `sorted` (`keysSearchable`), so a
+/// lookup costs O(log rows), and otherwise a scan. Sorted rows put equal keys
+/// side by side, so the next match after one at `at` can only be `at + 1`.
+fn findKeyed(comptime Row: type, rows: []const Row, sorted: bool, values: []const ColumnView, key_idxs: []const usize, i: usize, from: usize) ?usize {
+    if (sorted) search: {
+        const at = if (from == 0) lowerBoundKeyed(Row, rows, values, key_idxs, i) orelse break :search else from;
+        if (at >= rows.len) return null;
+        const order = cellsKeyOrder(values, key_idxs, i, rowKey(rows[at])) orelse break :search;
+        return if (order == .eq) at else null;
+    }
+    for (rows[from..], from..) |row, at| {
+        for (key_idxs, rowKey(row)) |idx, ref| {
+            if (!cellMatchesValue(values[idx], i, ref)) break;
+        } else return at;
+    }
+    return null;
+}
+
+/// The first position whose key isn't below row `i`'s cells; null when a
+/// key value isn't of its cell's type, which only a scan compares.
+fn lowerBoundKeyed(comptime Row: type, rows: []const Row, values: []const ColumnView, key_idxs: []const usize, i: usize) ?usize {
+    var lo: usize = 0;
+    var hi: usize = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (cellsKeyOrder(values, key_idxs, i, rowKey(rows[mid])) orelse return null) {
+            .gt => lo = mid + 1,
+            .lt, .eq => hi = mid,
+        }
+    }
+    return lo;
+}
+
+fn cellsKeyOrder(values: []const ColumnView, key_idxs: []const usize, i: usize, key: []const Value) ?std.math.Order {
+    for (key_idxs, key) |idx, ref| {
+        const order = cellKeyOrder(values[idx], i, ref) orelse return null;
+        if (order != .eq) return order;
+    }
+    return .eq;
+}
+
+/// A cell against a key value of its own type, in `Value.compare` order;
+/// null for any other value.
+fn cellKeyOrder(view: ColumnView, idx: usize, ref: Value) ?std.math.Order {
+    return switch (view.data) {
+        inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid => |col, tag| {
+            if (std.meta.activeTag(ref) != @field(ValueTag, @tagName(tag))) return null;
+            return std.math.order(col[idx], @field(ref, @tagName(tag)));
+        },
+        .boolean => |col| if (ref == .boolean) std.math.order(@intFromBool(col[idx] != 0), @intFromBool(ref.boolean)) else null,
+        .varchar, .string, .char => |sv| if (ref == .text) std.mem.order(u8, sv.rowBytes(idx), ref.text) else null,
+        .float, .double, .json => null,
+    };
 }
 
 /// Equality check between a single cell of a ColumnView and a Value of the

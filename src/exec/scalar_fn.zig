@@ -1445,12 +1445,11 @@ pub const builtins = [_]ScalarFn{
     // range check. A month step clamps the day on a short destination month
     // (`2024-01-31 + 1 month → 2024-02-29`), and a result outside years
     // 0-9999 is NULL, as in StarRocks.
-    .{ .name = "date_add", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddDaysKernel },
-    .{ .name = "date_sub", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateSubDaysKernel },
-    .{ .name = "date_add_weeks", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddWeeksKernel },
-    .{ .name = "date_add_months", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddMonthsKernel },
-    .{ .name = "date_add_quarters", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddQuartersKernel },
-    .{ .name = "date_add_years", .arg_types = &.{ .date, .int }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateAddYearsKernel },
+    //
+    // Every step, TIMESTAMPADD's included, takes only a DATETIME. A DATE
+    // widens to its midnight, so a DATE stepped by any unit is a DATETIME,
+    // as in StarRocks (`DATE '2026-01-31' + INTERVAL 1 DAY` is
+    // `2026-02-01 00:00:00`).
     .{ .name = "date_add", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddDaysKernel },
     .{ .name = "date_sub", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeSubDaysKernel },
     .{ .name = "date_add_weeks", .arg_types = &.{ .datetime, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddWeeksKernel },
@@ -1466,6 +1465,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeKernel },
     .{ .name = "from_unixtime", .arg_types = &.{ .bigint, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeFormatKernel },
+    .{ .name = "from_unixtime", .arg_types = &.{ .bigint, .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeZoneKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .bigint, .kernel = date.dateDiffDateKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.dateDiffDatetimeKernel },
@@ -1480,8 +1480,7 @@ pub const builtins = [_]ScalarFn{
     // DATEs widen to DATETIMEs at midnight, which leaves every unit's
     // count unchanged.
     .{ .name = "timestampdiff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.timestampDiffKernel },
-    .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .date }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.timestampAddDateKernel },
-    .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .datetime }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.timestampAddDatetimeKernel },
+    .{ .name = "timestampadd", .arg_types = &.{ .string, .int, .datetime }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.timestampAddKernel },
     // --- date (expanded MySQL-style helpers) ---
     .{ .name = "dayname", .arg_types = &.{.date}, .return_type = .string, .kernel = date.daynameFromDateKernel },
     .{ .name = "dayname", .arg_types = &.{.datetime}, .return_type = .string, .kernel = date.daynameFromDatetimeKernel },

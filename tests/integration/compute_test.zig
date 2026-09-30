@@ -785,8 +785,8 @@ test "compute: kitchen sink — every registered scalar function asserts" {
         // --- date ---
         .{ .name = "minute_ts", .expr = try F.minute(aa, E.col("ts")) }, // 30
         .{ .name = "second_ts", .expr = try F.second(aa, E.col("ts")) }, // 0
-        .{ .name = "d_plus1", .expr = try F.dateAdd(aa, E.col("dt"), E.col("off1")) }, // 20590 days
-        .{ .name = "d_minus1", .expr = try F.dateSub(aa, E.col("dt"), E.col("off1")) }, // 20588 days
+        .{ .name = "d_plus1", .expr = try F.dateAdd(aa, E.col("dt"), E.col("off1")) }, // midnight of day 20590
+        .{ .name = "d_minus1", .expr = try F.dateSub(aa, E.col("dt"), E.col("off1")) }, // midnight of day 20588
         .{ .name = "ut", .expr = try F.unixTimestamp(aa, E.col("ts")) }, // 1779424200
         .{ .name = "fut", .expr = try F.fromUnixtime(aa, E.col("bi1")) }, // 10 * 1_000_000
 
@@ -839,8 +839,8 @@ test "compute: kitchen sink — every registered scalar function asserts" {
     try std.testing.expectEqual(@as(i64, 2), b.values[colIndex(out_schema, "mod_bi")].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 10), b.values[colIndex(out_schema, "greatest_bi")].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 4), b.values[colIndex(out_schema, "least_bi")].data.bigint[0]);
-    try std.testing.expectEqual(@as(i64, 20590), b.values[colIndex(out_schema, "d_plus1")].data.date[0]);
-    try std.testing.expectEqual(@as(i64, 20588), b.values[colIndex(out_schema, "d_minus1")].data.date[0]);
+    try std.testing.expectEqual(@as(i64, 20590 * std.time.us_per_day), b.values[colIndex(out_schema, "d_plus1")].data.datetime[0]);
+    try std.testing.expectEqual(@as(i64, 20588 * std.time.us_per_day), b.values[colIndex(out_schema, "d_minus1")].data.datetime[0]);
     try std.testing.expectEqual(@as(i64, 1_779_424_200), b.values[colIndex(out_schema, "ut")].data.bigint[0]);
     try std.testing.expectEqual(@as(i64, 10_000_000), b.values[colIndex(out_schema, "fut")].data.datetime[0]);
     try std.testing.expectEqual(@as(i64, 42), b.values[colIndex(out_schema, "ns_to_bi")].data.bigint[0]);

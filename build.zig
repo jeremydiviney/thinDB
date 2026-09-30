@@ -9,6 +9,10 @@ const std = @import("std");
 fn runTestStandalone(b: *std.Build, test_exe: *std.Build.Step.Compile) *std.Build.Step.Run {
     const run = std.Build.Step.Run.create(b, b.fmt("run {s}", .{test_exe.name}));
     run.addArtifactArg(test_exe);
+    // Named time zones read TZif files from TZDIR. Tests read the committed
+    // fixtures, so they see the same zones on every platform, including
+    // Windows, which has no zone files of its own.
+    run.setEnvironmentVariable("TZDIR", b.pathFromRoot("tests/fixtures/zoneinfo"));
     return run;
 }
 

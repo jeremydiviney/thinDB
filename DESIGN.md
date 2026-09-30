@@ -80,7 +80,10 @@ date, 0000-01-01 is a Saturday, `TO_DAYS('0000-01-01')` is 0 and
 `FROM_DAYS(59)` is 0000-02-29. MySQL counts year 0 as 365 days with no
 February 29, which moves its weekdays and day numbers before 0000-03-01 by
 one. Date arithmetic whose result leaves this range is NULL, as in
-StarRocks: `DATE_ADD('9999-12-31', INTERVAL 1 DAY)` is NULL. One deliberate
+StarRocks: `DATE_ADD('9999-12-31', INTERVAL 1 DAY)` is NULL. Date
+arithmetic returns a DATETIME, as in StarRocks: a DATE moves as its midnight,
+so `DATE '2026-01-31' + INTERVAL 1 MONTH` is 2026-02-28 00:00:00, and a
+DATETIME written into a DATE column lands as its day. One deliberate
 exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
 reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
 the day it is, so every reader agrees with the one calendar.
@@ -133,6 +136,45 @@ read it so, since its arguments meet at their common type instead. Typed
 literals (`DATE '2026-01-01'`) and
 INSERT … VALUES keep the strict `YYYY-MM-DD[ hh:mm:ss[.ffffff]]` form, and
 comparisons read text as MySQL does (below).
+
+A DATETIME carries no zone. CONVERT_TZ and FROM_UNIXTIME(n, format, zone)
+read a zone's text with one reader (`exec/time_zone.zig`). It accepts:
+- A fixed offset. That covers MySQL's `+H:MM` from -13:59 to +14:00, and
+  StarRocks' `+h`, `+hh`, `+hhmm`, `+hh:mm`, `+hhmmss` and `+hh:mm:ss` up
+  to 18 hours, bare or after `UTC`, `GMT` or `UT`. It also covers cctz's
+  `Fixed/UTC+hh:mm:ss`, `Z`, `CST` (+08:00, as StarRocks reads it), and
+  `SYSTEM` or `UTC` in any case, since thinDB's clock runs in UTC.
+- A tz database name (`America/New_York`), read from its TZif file (RFC
+  8536) under `TZDIR`, else /usr/share/zoneinfo, where cctz (and so
+  StarRocks) reads it. The file's changes give the offset through its last
+  one, and its footer's POSIX TZ rule gives it after that. A name is
+  `/`-separated parts of letters, digits, `_`, `-`, `+` and `.`, none empty
+  or starting with `.`, so no name leaves the directory. StarRocks also
+  takes `Asia/../Asia/Shanghai`. Whether case matters is up to the file
+  system: on Linux it does, as in StarRocks. A leap-second (`right/`) file,
+  or a footer the reader can't parse, is no zone. Windows has no zone files,
+  so there a name is known only under `TZDIR`. The tests set `TZDIR` to the
+  fixtures in tests/fixtures/zoneinfo, so every platform sees the same zones.
+
+Parsed zones are cached once per process and shared by every database, so a
+tzdata update takes effect when the process restarts. A spin lock guards the
+map only; files are read outside it, and when two threads load one zone at
+once, one copy is kept. Names that are no zone are cached too, up
+to 4096. A kernel remembers the previous row's zone, so a constant zone
+costs one lookup per batch.
+
+A local time that a change skips or repeats reads with the offset in effect
+before the change, as cctz's `pre` does. So 02:30 on New York's
+spring-forward day is 07:30 UTC, and 01:30 on its fall-back day is 05:30
+UTC. A zone the reader doesn't know makes CONVERT_TZ NULL, and FROM_UNIXTIME
+renders it as UTC, as in StarRocks. An empty zone is NULL in both.
+
+CONVERT_TZ converts every value, as StarRocks does. MySQL returns a value
+whose instant is outside 1970-01-01 00:00:01 to 3001-01-18 23:59:59 UTC
+unchanged. A result outside years 0 to 9999 is NULL, where StarRocks gives a
+value it can't print. FROM_UNIXTIME reads a count up to 9999-12-31 23:59:59
+UTC and gives NULL for a local time past that. StarRocks gives NULL for any
+count from 253402243200 on.
 
 Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
 after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
@@ -628,6 +670,8 @@ Join routing (`.algorithm = .auto`): opaque predicate → NLJ; pure single-range
 
 A key pair can be null-safe (`KeyPair.null_safe`): an ON conjunct `a <=> b` or `a IS NOT DISTINCT FROM b` across the two inputs keys the join like `a = b`, except that a NULL key matches a NULL key. SMJ drops NULL keys, so a join with a null-safe key never takes SMJ or the skew re-route. The hash join keeps NULL as a value of that key, NLJ compares it as one, and build-key scan hints skip a null-safe key whose build side holds a NULL. When a key's types differ and a conversion can turn a value into NULL, the pair also gets a plain key on both sides' null flags, so a converted NULL matches only a NULL. An outer join's preserved-side ON conditions fold into a plain key. When every key is null-safe, they fold into a constant key pair.
 
+A table function's input relation carries each declared input column by name and in order, and a nullable column can't feed a NOT NULL field. A column of another type converts to the declared type as an INSERT into a column of that type would (§9.8 `ValueOutOfRange`). The casts `cast.assignmentCastExpr` gives (text, DATE or DATETIME into DATE or DATETIME, a number or text into DECIMAL) run as a `Compute` over the input. The pairs an INSERT converts as its rows land (one number type into another, a number or date into text, text into a number) convert each drained batch with `cast.assignColumn`. When every type already matches, the call reads the input's columns without a copy, as before. A pair the rule refuses, such as a number into a DATE, is `TableFnInputMismatch` when the call is built. A value that fails its conversion, such as text that isn't a date or a number the field can't hold, is `TableFnInputMismatch` when its batch is drained, with a diagnostic line naming the column. A converted partition or order key is sorted again even when the input arrives ordered, since converting can reorder it.
+
 **Memtable scan**: every Scan also reads from the (potentially non-empty) memtable of the table. Memtable rows are processed identically to segment rows. This gives read-your-writes consistency.
 
 ### 6.3 Execution model
@@ -888,6 +932,11 @@ per range or over the complete shard.
 Passthrough TVF outputs use their declared string-family type even when the
 input uses another compatible string type. Borrowed views preserve the
 original bytes and NULL bitmap without copying or changing input columns.
+A TVF input whose type differs from its declaration converts in a region only
+through a cast between DATE and DATETIME, which can't drop a value, and only
+on a column that is neither a range key nor the routed column. Any other
+conversion (§6.2) leaves the query to ordinary execution, so both paths
+return the same rows and raise the same errors.
 Frame-replacing TVFs retain routed-key provenance only under their existing
 `ordered_output` contract: the call's partition columns must be present in
 the output and preserve their values. The compiler binds the route to that
@@ -994,6 +1043,27 @@ own values; any other scalar is grouped by its keys and LEFT JOINed back.
 A DELETE or UPDATE predicate and a join's ON take it first too; the rest of
 theirs is below.
 
+The rows a lookup probes are sorted by key when drained, so each outer row
+finds its key by binary search, in O(log rows) rather than a scan of every
+row. Validation brings the keys to the outer columns' types; where that
+leaves them out of order, as text against a number (`'10'` sorts before
+`'9'`), or the key is a float, double or JSON, the lookup scans instead. A
+lookup runs only for the rows the operator's cheaper conjuncts, which run
+first, left passing. Inner keys that differ can come to one outer
+value (text `'07'` and `'7'` against a number): a range lookup then reads
+every group with that key, and a keyed scalar raises
+`UnsupportedCorrelatedSubquery` for an outer row that finds two, since its
+inner rows were aggregated apart and neither value is the subquery's.
+
+A WHERE that ORs such ties where no one key covers all of them
+(`i.v = o.v + 1 OR i.k = o.k`) is keyed once per disjunct, the other
+conjuncts in each copy. A row passes the WHERE iff it passes some copy's,
+so EXISTS and IN hold iff they hold for some copy, and NOT EXISTS and NOT IN
+iff for none: the lookups are ORed, or for the negated forms ANDed. That
+holds only for a block that keeps or drops each row by itself, so one that
+groups or windows isn't split, and every disjunct must key, or the subquery
+goes to the domain whole.
+
 Domain. Any other correlated subquery in a filter or an expression is lifted
 onto its domain: the distinct combinations of the enclosing values it reads,
 drawn from the rows the enclosing operator reads. The subquery's FROM joins
@@ -1082,7 +1152,8 @@ the domain. Any other, such as a join, aggregate or window, is materialized
 once, charged to the statement's memory accountant, and read by both.
 
 A lifted join with neither a key nor a single range (only OR, `<>` or mixed
-terms) runs as a nested loop. It buffers the subquery's FROM rows and the
+terms, as a scalar tied by OR or an EXISTS one of whose ORed ties doesn't
+key) runs as a nested loop. It buffers the subquery's FROM rows and the
 domain rows, charged to the accountant (`MemoryBudgetExceeded` past the
 budget), and streams the pairs. The budget bounds those buffers, not the
 pair count: the time is |FROM| × |domain| pairs, about 50–70 million a
@@ -1413,6 +1484,7 @@ JoinUnsupportedType, JoinEmptyOnClause, JoinKeyTypeMismatch,
 JoinColumnNameCollision,
 MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 RecursiveCteDepthExceeded,
+TableFnExecutionMismatch, TableFnInputMismatch, TableFnOutputMismatch,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -1427,9 +1499,11 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
-`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side or an ON that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes or that assigns a correlated value (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
+`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side or an ON that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, a keyed scalar that finds two aggregates for one outer row (inner text keys `'07'` and `'7'` compared with the number 7), or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes or that assigns a correlated value (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
+
+`TableFnInputMismatch` means a table function's input relation doesn't fit its declared input (§6.2): a column is missing, extra, out of order, nullable where the field isn't, or of a type an INSERT into the declared type refuses, or a value failed its conversion. `TableFnExecutionMismatch` means the call's PARTITION BY contradicts the declared execution mode; `TableFnOutputMismatch` means the callback left its output columns of unequal length.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` or `__ctas_` prefix, which ALTER TABLE's swap and table builds use (§9.2, §8.2).
 

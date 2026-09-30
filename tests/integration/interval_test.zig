@@ -2,8 +2,8 @@
 //! arithmetic. Lowered at parse time to one kernel per unit (`date_add`,
 //! `date_add_weeks`, ... `date_add_micros`). Month/year add clamps the day
 //! on short destination months: `2024-01-31 + 1 month → 2024-02-29`. A DATE
-//! moved by a sub-day unit becomes a DATETIME, as in MySQL. A result outside
-//! years 0-9999 is NULL, as in StarRocks.
+//! moves as its midnight, so a DATE moved by any unit is a DATETIME, and a
+//! result outside years 0-9999 is NULL, as in StarRocks.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -18,6 +18,17 @@ fn collectDates(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i
     errdefer out.deinit(allocator);
     while (try q.next()) |batch| {
         for (batch.values[0].data.date[0..batch.row_count]) |v| try out.append(allocator, v);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn collectDatetimes(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]i64 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(i64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (batch.values[0].data.datetime[0..batch.row_count]) |v| try out.append(allocator, v);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -44,14 +55,13 @@ test "INTERVAL: DAY add and subtract" {
     var db = try setup(allocator, io, tmp.dir);
     defer db.close();
 
-    const plus = try collectDates(allocator, db, "SELECT d + INTERVAL '10' DAY AS r FROM t WHERE id = 1");
+    const plus = try collectDatetimes(allocator, db, "SELECT d + INTERVAL '10' DAY AS r FROM t WHERE id = 1");
     defer allocator.free(plus);
     try std.testing.expectEqual(@as(usize, 1), plus.len);
-    // 2024-01-15 + 10 days = 2024-01-25; daysToYmd-roundtrip checks below.
 
-    const minus = try collectDates(allocator, db, "SELECT d - INTERVAL '5' DAY AS r FROM t WHERE id = 1");
+    const minus = try collectDatetimes(allocator, db, "SELECT d - INTERVAL '5' DAY AS r FROM t WHERE id = 1");
     defer allocator.free(minus);
-    try std.testing.expectEqual(plus[0] - 15, minus[0]); // plus - 15 = minus
+    try std.testing.expectEqual(plus[0] - 15 * std.time.us_per_day, minus[0]);
 }
 
 test "INTERVAL: MONTH add with day-clamp on short month" {
@@ -63,9 +73,10 @@ test "INTERVAL: MONTH add with day-clamp on short month" {
     defer db.close();
 
     // 2024-01-31 + 1 month → 2024-02-29 (leap year: Feb has 29 days)
-    const r = try collectDates(allocator, db, "SELECT d + INTERVAL '1' MONTH AS r FROM t WHERE id = 2");
+    const r = try collectDatetimes(allocator, db, "SELECT d + INTERVAL '1' MONTH AS r FROM t WHERE id = 2");
     defer allocator.free(r);
-    // expected days = ymdToDays(2024, 2, 29) — assert via reverse.
+    // 2024-02-29 is day 19782 of the epoch; the DATE moved as its midnight.
+    try std.testing.expectEqualSlices(i64, &.{19782 * std.time.us_per_day}, r);
     var q = try runSql(allocator, db, "SELECT EXTRACT(YEAR FROM d + INTERVAL '1' MONTH) AS y, EXTRACT(MONTH FROM d + INTERVAL '1' MONTH) AS m, EXTRACT(DAY FROM d + INTERVAL '1' MONTH) AS dd FROM t WHERE id = 2");
     defer q.deinit();
     const batch = (try q.next()).?;
@@ -122,7 +133,7 @@ test "INTERVAL: unknown unit rejected at parse time" {
     try std.testing.expectError(thindb.sql.ParseError.SqlExpectedKeyword, err);
 }
 
-test "INTERVAL: DATETIME keeps its time of day, and hours, minutes and seconds move either type" {
+test "INTERVAL: DATETIME keeps its time of day, and a DATE moved by any unit is a DATETIME" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -141,9 +152,9 @@ test "INTERVAL: DATETIME keeps its time of day, and hours, minutes and seconds m
         .{ "ts - INTERVAL 90 MINUTE", .{ "2024-01-31 09:00:00", "2024-02-29 22:29:59" } },
         .{ "DATE_ADD(ts, INTERVAL 1 SECOND)", .{ "2024-01-31 10:30:01", "2024-03-01 00:00:00" } },
         .{ "d + INTERVAL 30 MINUTE", .{ "2024-01-31 00:30:00", "2024-02-29 00:30:00" } },
-        .{ "d + INTERVAL 1 DAY", .{ "2024-02-01", "2024-03-01" } },
+        .{ "d + INTERVAL 1 DAY", .{ "2024-02-01 00:00:00", "2024-03-01 00:00:00" } },
         .{ "TIMESTAMPADD(HOUR, 1, d)", .{ "2024-01-31 01:00:00", "2024-02-29 01:00:00" } },
-        .{ "TIMESTAMPADD(MONTH, 1, d)", .{ "2024-02-29", "2024-03-29" } },
+        .{ "TIMESTAMPADD(MONTH, 1, d)", .{ "2024-02-29 00:00:00", "2024-03-29 00:00:00" } },
     };
     inline for (text_cases) |c| {
         errdefer std.debug.print("case failed: {s}\n", .{c[0]});
@@ -178,18 +189,17 @@ test "INTERVAL: a result outside years 0-9999, or a count past INT, is NULL (iss
     try exec(allocator, db, "INSERT INTO edge VALUES (1, '9999-12-31', '9999-12-31 23:59:59', NULL, 1), " ++
         "(2, '0000-01-01', '0000-01-01 00:00:00', 1, -1), (3, '2026-01-31', '2026-01-31 10:00:00', -31, 3000000000)");
 
-    // Every expected value is StarRocks 4.0's, except that a DATE moved by
-    // days or more stays a DATE. A count past INT is NULL even where the
-    // move would land in range (row 3's 3000000000 microseconds).
+    // Every expected value is StarRocks 4.0's. A count past INT is NULL even
+    // where the move would land in range (row 3's 3000000000 microseconds).
     const cases = .{
-        .{ "d + INTERVAL 1 DAY", .{ null, "0000-01-02", "2026-02-01" } },
-        .{ "d - INTERVAL 1 DAY", .{ "9999-12-30", null, "2026-01-30" } },
-        .{ "DATE_SUB(d, n)", .{ "9999-12-30", "0000-01-02", null } },
-        .{ "ADDDATE(d, m)", .{ null, "0000-01-02", "2025-12-31" } },
-        .{ "d + INTERVAL 1 WEEK", .{ null, "0000-01-08", "2026-02-07" } },
-        .{ "d + INTERVAL 1 MONTH", .{ null, "0000-02-01", "2026-02-28" } },
-        .{ "d - INTERVAL 1 QUARTER", .{ "9999-09-30", null, "2025-10-31" } },
-        .{ "d + INTERVAL 1 YEAR", .{ null, "0001-01-01", "2027-01-31" } },
+        .{ "d + INTERVAL 1 DAY", .{ null, "0000-01-02 00:00:00", "2026-02-01 00:00:00" } },
+        .{ "d - INTERVAL 1 DAY", .{ "9999-12-30 00:00:00", null, "2026-01-30 00:00:00" } },
+        .{ "DATE_SUB(d, n)", .{ "9999-12-30 00:00:00", "0000-01-02 00:00:00", null } },
+        .{ "ADDDATE(d, m)", .{ null, "0000-01-02 00:00:00", "2025-12-31 00:00:00" } },
+        .{ "d + INTERVAL 1 WEEK", .{ null, "0000-01-08 00:00:00", "2026-02-07 00:00:00" } },
+        .{ "d + INTERVAL 1 MONTH", .{ null, "0000-02-01 00:00:00", "2026-02-28 00:00:00" } },
+        .{ "d - INTERVAL 1 QUARTER", .{ "9999-09-30 00:00:00", null, "2025-10-31 00:00:00" } },
+        .{ "d + INTERVAL 1 YEAR", .{ null, "0001-01-01 00:00:00", "2027-01-31 00:00:00" } },
         .{ "d + INTERVAL 2147483647 YEAR", .{ null, null, null } },
         .{ "d - INTERVAL '-2147483648' DAY", .{ null, null, null } },
         .{ "d + INTERVAL 24 HOUR", .{ null, "0000-01-02 00:00:00", "2026-02-01 00:00:00" } },
@@ -229,11 +239,11 @@ test "ADDDATE / SUBDATE are MySQL spellings of DATE_ADD / DATE_SUB" {
         .{ "SELECT ADDDATE(LAST_DAY(SUBDATE(d, INTERVAL 1 MONTH)), 1) AS r FROM t WHERE id = 1", "SELECT DATE_ADD(LAST_DAY(DATE_SUB(d, INTERVAL 1 MONTH)), 1) AS r FROM t WHERE id = 1" },
     };
     inline for (cases) |c| {
-        const alias = try collectDates(allocator, db, c[0]);
+        const alias = try collectDatetimes(allocator, db, c[0]);
         defer allocator.free(alias);
-        const canonical = try collectDates(allocator, db, c[1]);
+        const canonical = try collectDatetimes(allocator, db, c[1]);
         defer allocator.free(canonical);
-        try std.testing.expectEqualSlices(i32, canonical, alias);
+        try std.testing.expectEqualSlices(i64, canonical, alias);
     }
 }
 
@@ -280,16 +290,16 @@ test "INTERVAL: QUARTER is three months and WEEK is seven days" {
         .{ "SELECT ADDDATE(d, INTERVAL 1 QUARTER) AS r FROM t ORDER BY id", "SELECT DATE_ADD(d, INTERVAL 3 MONTH) AS r FROM t ORDER BY id" },
         .{
             "SELECT MAKEDATE(YEAR(d), 1) + INTERVAL QUARTER(d) QUARTER - INTERVAL 1 QUARTER AS r FROM t ORDER BY id",
-            "SELECT CAST(date_trunc('quarter', d) AS DATE) AS r FROM t ORDER BY id",
+            "SELECT date_trunc('quarter', d) AS r FROM t ORDER BY id",
         },
     };
     inline for (cases) |c| {
-        const got = try collectDates(allocator, db, c[0]);
+        const got = try collectDatetimes(allocator, db, c[0]);
         defer allocator.free(got);
-        const want = try collectDates(allocator, db, c[1]);
+        const want = try collectDatetimes(allocator, db, c[1]);
         defer allocator.free(want);
         try std.testing.expectEqual(@as(usize, 3), want.len);
-        try std.testing.expectEqualSlices(i32, want, got);
+        try std.testing.expectEqualSlices(i64, want, got);
     }
 }
 
@@ -305,14 +315,24 @@ test "date unit functions know WEEK and QUARTER and reject unknown units" {
     const date_cases = .{
         .{ "SELECT CAST(date_trunc('week', d) AS DATE) AS r FROM t ORDER BY id", [_]i32{ 19737, 19751, 19779 } },
         .{ "SELECT CAST(date_trunc('QUARTER', d) AS DATE) AS r FROM t ORDER BY id", [_]i32{ 19723, 19723, 19723 } },
-        .{ "SELECT TIMESTAMPADD(WEEK, 2, d) AS r FROM t ORDER BY id", [_]i32{ 19751, 19767, 19796 } },
-        .{ "SELECT TIMESTAMPADD(QUARTER, 1, d) AS r FROM t ORDER BY id", [_]i32{ 19828, 19843, 19872 } },
     };
     inline for (date_cases) |c| {
         const got = try collectDates(allocator, db, c[0]);
         defer allocator.free(got);
         const want: [3]i32 = c[1];
         try std.testing.expectEqualSlices(i32, &want, got);
+    }
+    // A DATE moved by TIMESTAMPADD is a DATETIME at the midnight of those days.
+    const day = std.time.us_per_day;
+    const datetime_cases = .{
+        .{ "SELECT TIMESTAMPADD(WEEK, 2, d) AS r FROM t ORDER BY id", [_]i64{ 19751 * day, 19767 * day, 19796 * day } },
+        .{ "SELECT TIMESTAMPADD(QUARTER, 1, d) AS r FROM t ORDER BY id", [_]i64{ 19828 * day, 19843 * day, 19872 * day } },
+    };
+    inline for (datetime_cases) |c| {
+        const got = try collectDatetimes(allocator, db, c[0]);
+        defer allocator.free(got);
+        const want: [3]i64 = c[1];
+        try std.testing.expectEqualSlices(i64, &want, got);
     }
     const int_cases = .{
         .{ "SELECT TIMESTAMPDIFF(WEEK, d, DATE '2024-06-30') AS r FROM t ORDER BY id", [_]i64{ 23, 21, 17 } },
@@ -1059,6 +1079,155 @@ test "FROM_UNIXTIME(n, format) renders as DATE_FORMAT does and reads its count a
     }
 }
 
+test "FROM_UNIXTIME(n, format, zone) renders local time in a named or fixed zone, as in StarRocks (issue #419)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // StarRocks 4.0's values, from constant-only SELECTs, plain and with the
+    // backend forced, unless a comment says otherwise. Named zones come from
+    // the TZif fixtures under tests/fixtures/zoneinfo (`build.zig` sets TZDIR).
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "1969-12-31 19:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "1970-01-01 08:00:00" },
+        // New York's 2026 spring-forward and fall-back instants, and 1970's.
+        .{ "1772953199, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-03-08 01:59:59" },
+        .{ "1772953200, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-03-08 03:00:00" },
+        .{ "1793512799, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-11-01 01:59:59" },
+        .{ "1793512800, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2026-11-01 01:00:00" },
+        .{ "9961199, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "1970-04-26 01:59:59" },
+        .{ "9961200, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "1970-04-26 03:00:00" },
+        // The file lists changes through 2037; later ones come from its footer
+        // rule.
+        .{ "2140668000, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2037-11-01 01:00:00" },
+        .{ "2152162800, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2038-03-14 03:00:00" },
+        .{ "2210241600, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2040-01-15 07:00:00" },
+        .{ "2224756800, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2040-07-01 08:00:00" },
+        .{ "4118126400, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "2100-07-01 08:00:00" },
+        // A half-hour daylight shift, south of the equator.
+        .{ "1767225600, '%Y-%m-%d %H:%i:%s', 'Australia/Lord_Howe'", "2026-01-01 11:00:00" },
+        .{ "1782000000, '%Y-%m-%d %H:%i:%s', 'Australia/Lord_Howe'", "2026-06-21 10:30:00" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', '+14:00'", "9999-12-31 21:59:59" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "9999-12-31 15:59:59" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "9999-12-31 02:59:59" },
+        .{ "253402243199, '%Y-%m-%d %H:%i:%s', '-14:00'", "9999-12-30 17:59:59" },
+        // StarRocks gives NULL for a count past 253402243199. thinDB reads a
+        // count to the end of its calendar, as the two-argument form does, and
+        // gives NULL for a local time past it.
+        .{ "253402300799, '%Y-%m-%d %H:%i:%s', 'UTC'", "9999-12-31 23:59:59" },
+        .{ "253402300799, '%Y-%m-%d %H:%i:%s', 'America/New_York'", "9999-12-31 18:59:59" },
+        .{ "253402300799, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", null },
+        .{ "-1, '%Y-%m-%d %H:%i:%s', 'UTC'", null },
+        .{ "NULL, '%Y-%m-%d %H:%i:%s', 'UTC'", null },
+        .{ "0, NULL, 'UTC'", null },
+        .{ "0, '%Y-%m-%d %H:%i:%s', NULL", null },
+        .{ "1.5, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "1970-01-01 08:00:01" },
+        .{ "1.7, '%Y-%m-%d %H:%i:%s', 'UTC'", "1970-01-01 00:00:01" },
+        .{ "'100', '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai'", "1970-01-01 08:01:40" },
+        .{ "0, '%Y-%m-%d', 'America/New_York'", "1969-12-31" },
+        .{ "0, '%r %W', 'America/New_York'", "07:00:00 PM Wednesday" },
+        .{ "0, '%f|%T', 'Asia/Shanghai'", "000000|08:00:00" },
+        .{ "0, '', 'Asia/Shanghai'", null },
+        .{ "0, 'x', 'Asia/Shanghai'", "x" },
+        .{ "0, 'yyyy-MM-dd HH:mm:ss', 'Asia/Shanghai'", "1970-01-01 08:00:00" },
+        // Fixed offsets.
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'utc'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Z'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'CST'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:00'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-08:00'", "1969-12-31 16:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+0800'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+1234'", "1970-01-01 12:34:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+8'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+080000'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:00:30'", "1970-01-01 08:00:30" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+05:45'", "1970-01-01 05:45:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+14:01'", "1970-01-01 14:01:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-13:59'", "1969-12-31 10:01:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-14:01'", "1969-12-31 09:59:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+18:00'", "1970-01-01 18:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '-18:00'", "1969-12-31 06:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC+8'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC-8'", "1969-12-31 16:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'GMT+18'", "1970-01-01 18:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UT+8'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC+08:00'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Fixed/UTC+08:00:00'", "1970-01-01 08:00:00" },
+        // A zone thinDB doesn't know renders as UTC; an empty one is NULL.
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'bogus'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', ''", null },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'America'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', ' America/New_York'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai '", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/Shanghai/'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '/Asia/Shanghai'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'cst'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'utc+8'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC0'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+24:00'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+18:01'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '08:00'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08-00'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+123'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+0860'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'UTC+8:00'", "1970-01-01 00:00:00" },
+        // thinDB alone. StarRocks reads `Asia/../Asia/Shanghai` as Shanghai, but
+        // thinDB refuses a name part that starts with `.`, so no name leaves the
+        // zone directory. `+8:00` and `+08:0030` are MySQL's offset spellings,
+        // which StarRocks renders as UTC. StarRocks reads `+08:60` as 09:00.
+        .{ "0, '%Y-%m-%d %H:%i:%s', 'Asia/../Asia/Shanghai'", "1970-01-01 00:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+8:00'", "1970-01-01 08:00:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:0030'", "1970-01-01 08:30:00" },
+        .{ "0, '%Y-%m-%d %H:%i:%s', '+08:60'", "1970-01-01 00:00:00" },
+    };
+    for (cases) |c| {
+        inline for (.{ "SELECT FROM_UNIXTIME({s})", "SELECT IF(RAND() < 2, FROM_UNIXTIME({s}), NULL)" }) |shape| {
+            const sql = try std.fmt.allocPrint(allocator, shape, .{c[0]});
+            defer allocator.free(sql);
+            errdefer std.debug.print("failed: {s}\n", .{sql});
+            const got = try helpers.collectStrings(allocator, db, sql);
+            defer helpers.freeStrings(allocator, got);
+            try std.testing.expectEqual(@as(usize, 1), got.len);
+            if (c[1]) |want| {
+                try std.testing.expect(got[0] != null);
+                try std.testing.expectEqualStrings(want, got[0].?);
+            } else try std.testing.expect(got[0] == null);
+        }
+    }
+
+    // A zone and a format per row; a row naming the previous row's zone
+    // reuses it.
+    try exec(allocator, db, "CREATE TABLE fz (id BIGINT PRIMARY KEY, n BIGINT, z VARCHAR(40), f VARCHAR(30))");
+    try exec(allocator, db, "INSERT INTO fz VALUES (1, 1772953200, 'America/New_York', '%Y-%m-%d %H:%i:%s'), " ++
+        "(2, 1793512800, 'America/New_York', NULL), (3, 1793512800, 'America/New_York', '%Y-%m-%d %H:%i:%s'), " ++
+        "(4, 0, 'Asia/Shanghai', '%Y-%m-%d %H:%i:%s'), (5, 0, 'bogus', '%Y-%m-%d %H:%i:%s'), (6, 0, '', '%Y-%m-%d %H:%i:%s'), " ++
+        "(7, 0, NULL, '%Y-%m-%d %H:%i:%s'), (8, 1782000000, 'Australia/Lord_Howe', '%Y-%m-%d %H:%i:%s'), (9, 0, '+05:45', '%H:%i'), " ++
+        "(10, NULL, 'UTC', '%Y-%m-%d %H:%i:%s')");
+    const column_cases = [_]struct { []const u8, [10]?[]const u8 }{
+        .{ "FROM_UNIXTIME(n, f, z)", .{ "2026-03-08 03:00:00", null, "2026-11-01 01:00:00", "1970-01-01 08:00:00", "1970-01-01 00:00:00", null, null, "2026-06-21 10:30:00", "05:45", null } },
+        .{ "FROM_UNIXTIME(n, '%Y-%m-%d %H:%i:%s', z)", .{ "2026-03-08 03:00:00", "2026-11-01 01:00:00", "2026-11-01 01:00:00", "1970-01-01 08:00:00", "1970-01-01 00:00:00", null, null, "2026-06-21 10:30:00", "1970-01-01 05:45:00", null } },
+        .{ "FROM_UNIXTIME(n, '%H:%i', 'America/New_York')", .{ "03:00", "01:00", "01:00", "19:00", "19:00", "19:00", "19:00", "20:00", "19:00", null } },
+    };
+    for (column_cases) |c| {
+        const sql = try std.fmt.allocPrint(allocator, "SELECT {s} FROM fz ORDER BY id", .{c[0]});
+        defer allocator.free(sql);
+        errdefer std.debug.print("failed: {s}\n", .{sql});
+        const got = try helpers.collectStrings(allocator, db, sql);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, g| {
+            if (want) |text| {
+                try std.testing.expect(g != null);
+                try std.testing.expectEqualStrings(text, g.?);
+            } else try std.testing.expect(g == null);
+        }
+    }
+}
+
 test "DATE_FORMAT, STR_TO_DATE and the week functions match MySQL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1167,12 +1336,12 @@ test "INTERVAL: a fractional amount rounds to whole units before the unit's fact
         .{ "d + INTERVAL '1.5' DAY", "d + INTERVAL 1 DAY" },
     };
     inline for (cases) |c| {
-        const got = try collectDates(allocator, db, "SELECT " ++ c[0] ++ " FROM t ORDER BY id");
+        const got = try collectDatetimes(allocator, db, "SELECT " ++ c[0] ++ " FROM t ORDER BY id");
         defer allocator.free(got);
-        const want = try collectDates(allocator, db, "SELECT " ++ c[1] ++ " FROM t ORDER BY id");
+        const want = try collectDatetimes(allocator, db, "SELECT " ++ c[1] ++ " FROM t ORDER BY id");
         defer allocator.free(want);
         errdefer std.debug.print("case: {s}\n", .{c[0]});
-        try std.testing.expectEqualSlices(i32, want, got);
+        try std.testing.expectEqualSlices(i64, want, got);
     }
 }
 
@@ -1186,11 +1355,11 @@ test "INTERVAL: an interval may lead a sum, but not a difference (issue #322)" {
     try exec(allocator, db, "INSERT INTO dt VALUES (1, '2024-01-31 10:30:00', '2024-01-31'), (2, '2024-02-29 23:59:59', '2024-02-29')");
 
     const text_cases = .{
-        .{ "INTERVAL 1 DAY + d", .{ "2024-02-01", "2024-03-01" } },
+        .{ "INTERVAL 1 DAY + d", .{ "2024-02-01 00:00:00", "2024-03-01 00:00:00" } },
         .{ "INTERVAL 1 MONTH + ts", .{ "2024-02-29 10:30:00", "2024-03-29 23:59:59" } },
         .{ "INTERVAL 30 MINUTE + d", .{ "2024-01-31 00:30:00", "2024-02-29 00:30:00" } },
         .{ "INTERVAL 1 DAY + d + INTERVAL 1 HOUR", .{ "2024-02-01 01:00:00", "2024-03-01 01:00:00" } },
-        .{ "INTERVAL 1 DAY + DATE '2024-01-02'", .{ "2024-01-03", "2024-01-03" } },
+        .{ "INTERVAL 1 DAY + DATE '2024-01-02'", .{ "2024-01-03 00:00:00", "2024-01-03 00:00:00" } },
     };
     inline for (text_cases) |c| {
         errdefer std.debug.print("case failed: {s}\n", .{c[0]});
@@ -1201,11 +1370,11 @@ test "INTERVAL: an interval may lead a sum, but not a difference (issue #322)" {
         try std.testing.expectEqualStrings(c[1][1], got[1].?);
     }
 
-    const dates = try collectDates(allocator, db, "SELECT INTERVAL 1 DAY + DATE '2024-01-02'");
-    defer allocator.free(dates);
-    const moved = try collectDates(allocator, db, "SELECT DATE '2024-01-02' + INTERVAL 1 DAY");
+    const leading = try collectDatetimes(allocator, db, "SELECT INTERVAL 1 DAY + DATE '2024-01-02'");
+    defer allocator.free(leading);
+    const moved = try collectDatetimes(allocator, db, "SELECT DATE '2024-01-02' + INTERVAL 1 DAY");
     defer allocator.free(moved);
-    try std.testing.expectEqualSlices(i32, moved, dates);
+    try std.testing.expectEqualSlices(i64, moved, leading);
 
     const ids = try helpers.collectBigints(allocator, db, "SELECT id FROM dt WHERE INTERVAL 1 DAY + d = '2024-03-01'");
     defer allocator.free(ids);
@@ -1215,4 +1384,97 @@ test "INTERVAL: an interval may lead a sum, but not a difference (issue #322)" {
     const interval_fn = try helpers.collectBigints(allocator, db, "SELECT INTERVAL(5, 1, 10)");
     defer allocator.free(interval_fn);
     try std.testing.expectEqualSlices(i64, &.{1}, interval_fn);
+}
+
+test "a DATE stepped by days, weeks, months, quarters or years is a DATETIME in every dialect, as in StarRocks (issue #414)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, '2026-01-31')");
+
+    const sources = .{ "d", "DATE '2026-01-31'", "IF(RAND() < 2, DATE '2026-01-31', NULL)" };
+    // Each step is its text before and after the DATE, and what StarRocks 4.0 prints.
+    const steps = .{
+        .{ "DATE_ADD(", ", INTERVAL 1 DAY)", "2026-02-01 00:00:00" },
+        .{ "DATE_ADD(", ", INTERVAL 1 WEEK)", "2026-02-07 00:00:00" },
+        .{ "DATE_ADD(", ", INTERVAL 1 MONTH)", "2026-02-28 00:00:00" },
+        .{ "DATE_ADD(", ", INTERVAL 1 QUARTER)", "2026-04-30 00:00:00" },
+        .{ "DATE_ADD(", ", INTERVAL 1 YEAR)", "2027-01-31 00:00:00" },
+        .{ "DATE_ADD(", ", INTERVAL 1 HOUR)", "2026-01-31 01:00:00" },
+        .{ "DATE_SUB(", ", INTERVAL 1 MONTH)", "2025-12-31 00:00:00" },
+        .{ "DATE_ADD(", ", 1)", "2026-02-01 00:00:00" },
+        .{ "DATE_SUB(", ", 1)", "2026-01-30 00:00:00" },
+        .{ "ADDDATE(", ", 1)", "2026-02-01 00:00:00" },
+        .{ "SUBDATE(", ", INTERVAL 1 YEAR)", "2025-01-31 00:00:00" },
+        .{ "", " + INTERVAL 1 MONTH", "2026-02-28 00:00:00" },
+        .{ "", " - INTERVAL 1 DAY", "2026-01-30 00:00:00" },
+        .{ "INTERVAL 1 DAY + ", "", "2026-02-01 00:00:00" },
+        .{ "TIMESTAMPADD(WEEK, 1, ", ")", "2026-02-07 00:00:00" },
+        .{ "TIMESTAMPADD(QUARTER, 1, ", ")", "2026-04-30 00:00:00" },
+        .{ "TIMESTAMPADD(IF(RAND() < 2, 'HOUR', 'DAY'), 1, ", ")", "2026-01-31 01:00:00" },
+        .{ "DAYS_ADD(", ", 1)", "2026-02-01 00:00:00" },
+        .{ "MONTHS_SUB(", ", 1)", "2025-12-31 00:00:00" },
+    };
+    inline for (steps) |s| {
+        inline for (sources) |src| {
+            const step = s[0] ++ src ++ s[1];
+            errdefer std.debug.print("step: {s}\n", .{step});
+            try expectTexts(allocator, db, "SELECT CAST(" ++ step ++ " AS CHAR) FROM t", &.{s[2]});
+            inline for (.{ thindb.types.Dialect.neutral, .mysql, .postgres }) |dialect| {
+                var q = try helpers.runSqlDialect(allocator, db, "SELECT " ++ step ++ " FROM t", dialect);
+                defer q.deinit();
+                try std.testing.expectEqual(thindb.types.TypeTag.datetime, std.meta.activeTag(q.outputSchema()[0].type));
+            }
+            var q = try helpers.runSqlMysqlSession(allocator, db, "SELECT " ++ step ++ " FROM t");
+            defer q.deinit();
+            try std.testing.expectEqual(thindb.types.TypeTag.datetime, std.meta.activeTag(q.outputSchema()[0].type));
+        }
+    }
+
+    const typed = .{
+        .{ "CONCAT(DATE_ADD(d, INTERVAL 1 MONTH), '|')", .string, "2026-02-28 00:00:00|" },
+        .{ "COALESCE(DATE_ADD(d, INTERVAL 1 DAY), DATE '2026-01-01')", .datetime, "" },
+        .{ "DATE(DATE_ADD(d, INTERVAL 1 MONTH))", .date, "" },
+        .{ "LAST_DAY(DATE_ADD(d, INTERVAL 1 MONTH))", .date, "" },
+        .{ "DATE_ADD(d, INTERVAL 1 DAY) = DATE '2026-02-01'", .boolean, "1" },
+        .{ "DATEDIFF(DATE_ADD(d, INTERVAL 1 MONTH), d)", .int, "28" },
+    };
+    inline for (typed) |c| {
+        errdefer std.debug.print("expr: {s}\n", .{c[0]});
+        var q = try runSql(allocator, db, "SELECT " ++ c[0] ++ " FROM t");
+        defer q.deinit();
+        try std.testing.expectEqual(@as(thindb.types.TypeTag, c[1]), std.meta.activeTag(q.outputSchema()[0].type));
+        if (c[2].len > 0) {
+            const got = try helpers.columnText(allocator, &q);
+            defer helpers.freeStrings(allocator, got);
+            try std.testing.expectEqualStrings(c[2], got[0].?);
+        }
+    }
+    try expectTexts(allocator, db, "SELECT CAST(COALESCE(DATE_ADD(d, INTERVAL 1 DAY), DATE '2026-01-01') AS CHAR) FROM t", &.{"2026-02-01 00:00:00"});
+    try expectTexts(allocator, db, "SELECT CAST(DATE(DATE_ADD(d, INTERVAL 1 MONTH)) AS CHAR) FROM t", &.{"2026-02-28"});
+    try expectTexts(allocator, db, "SELECT CAST(DATE_ADD(DATE '9999-12-31', INTERVAL 1 DAY) AS CHAR)", &.{null});
+    try expectTexts(
+        allocator,
+        db,
+        "SELECT CAST(v AS CHAR) FROM (SELECT DATE '2026-01-01' AS v UNION ALL SELECT DATE_ADD(d, INTERVAL 1 DAY) FROM t) u ORDER BY v",
+        &.{ "2026-01-01 00:00:00", "2026-02-01 00:00:00" },
+    );
+
+    try exec(allocator, db, "CREATE TABLE m AS SELECT id, DATE_ADD(d, INTERVAL 1 MONTH) AS next_month, DATE(DATE_ADD(d, INTERVAL 1 MONTH)) AS next_day FROM t");
+    const m = try db.openTable("m", .{});
+    try std.testing.expectEqual(thindb.Type{ .datetime = {} }, m.schema.columns[1].type);
+    try std.testing.expectEqual(thindb.Type{ .date = {} }, m.schema.columns[2].type);
+
+    // A DATETIME written into a DATE column lands as its day, as MySQL and
+    // StarRocks store it, so writing a stepped DATE back keeps working.
+    try exec(allocator, db, "CREATE TABLE w (id BIGINT PRIMARY KEY, d DATE)");
+    try exec(allocator, db, "INSERT INTO w VALUES (1, DATE_ADD(DATE '2026-01-31', INTERVAL 1 MONTH))");
+    try exec(allocator, db, "INSERT INTO w SELECT 2, DATE_ADD(d, INTERVAL 1 DAY) FROM t");
+    try exec(allocator, db, "INSERT INTO w VALUES (3, CAST('2026-03-04 05:06:07' AS DATETIME))");
+    try exec(allocator, db, "UPDATE w SET d = DATE_SUB(d, INTERVAL 1 YEAR) WHERE id = 2");
+    try exec(allocator, db, "INSERT INTO w VALUES (1, DATE '2000-01-01') ON DUPLICATE KEY UPDATE d = d + INTERVAL 1 WEEK");
+    try expectTexts(allocator, db, "SELECT CAST(d AS CHAR) FROM w ORDER BY id", &.{ "2026-03-07", "2025-02-01", "2026-03-04" });
 }
