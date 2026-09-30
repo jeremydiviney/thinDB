@@ -320,14 +320,12 @@ pub fn periodDiffKernel(allocator: Allocator, args: []const ColumnView, out: *Co
     }
 }
 
-/// 3001-01-18 23:59:59 UTC, the last second MySQL converts between zones.
-const MAX_ZONED_SECONDS: i64 = 32_536_771_199;
-
 /// CONVERT_TZ(dt, from, to), each zone as `time_zone.resolve` reads it; a
 /// zone thinDB doesn't know gives NULL, as in StarRocks and in a MySQL
-/// without time zone tables. A value whose UTC instant is outside what MySQL
-/// converts (1970-01-01 00:00:01 to 3001-01-18 23:59:59) comes back
-/// unchanged, as in MySQL.
+/// without time zone tables. Every value converts, as in StarRocks, where
+/// MySQL returns one whose UTC instant is outside 1970-01-01 00:00:01 to
+/// 3001-01-18 23:59:59 unchanged. A result outside years 0-9999 is NULL,
+/// where StarRocks gives a value it can't print.
 pub fn convertTzKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();
     const dts = args[0].data.datetime;
@@ -339,18 +337,17 @@ pub fn convertTzKernel(allocator: Allocator, args: []const ColumnView, out: *Col
         const valid = args[0].isValid(i) and args[1].isValid(i) and args[2].isValid(i);
         const from_zone = if (valid) try from_memo.zoneOf(from.rowBytes(i)) else null;
         const to_zone = if (valid) try to_memo.zoneOf(to.rowBytes(i)) else null;
-        const converted: ?i64 = if (from_zone != null and to_zone != null) convertZone(dts[i], from_zone.?, to_zone.?) else null;
+        const converted = if (from_zone != null and to_zone != null) convertZone(dts[i], from_zone.?, to_zone.?) else null;
         try out.data.datetime.append(allocator, converted orelse 0);
         try out.appendValidBit(allocator, base + i, converted != null);
     }
 }
 
-fn convertZone(local: i64, from: time_zone.Zone, to: time_zone.Zone) i64 {
+fn convertZone(local: i64, from: time_zone.Zone, to: time_zone.Zone) ?i64 {
     const local_seconds = @divFloor(local, std.time.us_per_s);
     const fraction = local - local_seconds * std.time.us_per_s;
     const utc_seconds = from.localToUtc(local_seconds);
-    if (utc_seconds < 1 or utc_seconds > MAX_ZONED_SECONDS) return local;
-    return (utc_seconds + to.offsetAt(utc_seconds)) * std.time.us_per_s + fraction;
+    return datetimeInRange((utc_seconds + to.offsetAt(utc_seconds)) * std.time.us_per_s + fraction);
 }
 
 /// A DATE moved by `n_months`, its day clamped to the destination month's

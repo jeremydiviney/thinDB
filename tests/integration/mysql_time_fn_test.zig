@@ -136,7 +136,7 @@ test "MySQL date and TIME functions over constants" {
         .{ "CONVERT_TZ('2026-01-01 00:00:00', '+05:30', '-08:00')", "2025-12-31 10:30:00" },
         // StarRocks: MySQL's offsets end at +14:00.
         .{ "CONVERT_TZ('2026-01-01 00:00:00', '+00:00', '+14:01')", "2026-01-01 14:01:00" },
-        .{ "CONVERT_TZ('1970-01-01 00:00:00', '+00:00', '+01:00')", "1970-01-01 00:00:00" },
+        .{ "CONVERT_TZ('1970-01-01 00:00:00', '+00:00', '+01:00')", "1970-01-01 01:00:00" },
         // A zone thinDB doesn't know is NULL, as in StarRocks and in a MySQL
         // without time zone tables.
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'Mars/Olympus_Mons', '+00:00')", null },
@@ -266,6 +266,28 @@ test "CONVERT_TZ reads named zones with their daylight rules, as StarRocks does 
         .{ "CONVERT_TZ('2026-11-01 05:30:00', 'UTC', 'America/New_York')", "2026-11-01 01:30:00" },
         .{ "CONVERT_TZ('2026-11-01 06:30:00', 'UTC', 'America/New_York')", "2026-11-01 01:30:00" },
         .{ "CONVERT_TZ('1969-12-31 20:00:00', 'America/New_York', 'UTC')", "1970-01-01 01:00:00" },
+        // Every instant converts, where MySQL returns a value outside
+        // 1970-01-01 00:00:01 to 3001-01-18 23:59:59 UTC unchanged. Before a
+        // zone's first change, its local mean time holds.
+        .{ "CONVERT_TZ('1970-01-01 00:00:00', 'UTC', 'America/New_York')", "1969-12-31 19:00:00" },
+        .{ "CONVERT_TZ('1970-01-01 00:00:00', 'UTC', '+08:00')", "1970-01-01 08:00:00" },
+        .{ "CONVERT_TZ('1969-12-31 23:59:59', 'UTC', '+00:00')", "1969-12-31 23:59:59" },
+        .{ "CONVERT_TZ('1960-01-01 00:00:00', 'UTC', 'America/New_York')", "1959-12-31 19:00:00" },
+        .{ "CONVERT_TZ('1960-07-01 12:00:00', 'UTC', 'America/New_York')", "1960-07-01 08:00:00" },
+        .{ "CONVERT_TZ('1960-07-01 08:00:00', 'America/New_York', 'UTC')", "1960-07-01 12:00:00" },
+        .{ "CONVERT_TZ('1900-01-01 12:00:00', 'UTC', 'America/New_York')", "1900-01-01 07:00:00" },
+        .{ "CONVERT_TZ('1900-01-01 12:00:00', 'UTC', 'Asia/Shanghai')", "1900-01-01 20:05:43" },
+        .{ "CONVERT_TZ('1900-01-01 12:00:00', 'Asia/Shanghai', 'UTC')", "1900-01-01 03:54:17" },
+        .{ "CONVERT_TZ('1000-03-01 00:00:00', 'Australia/Lord_Howe', 'UTC')", "1000-02-28 13:23:40" },
+        .{ "CONVERT_TZ('0001-01-01 00:00:00', 'UTC', 'America/New_York')", "0000-12-31 19:03:58" },
+        .{ "CONVERT_TZ('0000-01-01 10:00:00', 'UTC', 'America/New_York')", "0000-01-01 05:03:58" },
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', 'America/New_York', 'UTC')", "0000-01-01 04:56:02" },
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', 'UTC', '+08:00')", "0000-01-01 08:00:00" },
+        .{ "CONVERT_TZ('3001-01-19 00:00:00', 'UTC', '+08:00')", "3001-01-19 08:00:00" },
+        .{ "CONVERT_TZ('3001-01-19 00:00:00', 'UTC', 'America/New_York')", "3001-01-18 19:00:00" },
+        .{ "CONVERT_TZ('3001-07-01 12:00:00', 'UTC', 'America/New_York')", "3001-07-01 08:00:00" },
+        .{ "CONVERT_TZ('9999-07-01 12:00:00', 'UTC', 'America/New_York')", "9999-07-01 08:00:00" },
+        .{ "CONVERT_TZ('9999-12-31 23:00:00', '+08:00', 'UTC')", "9999-12-31 15:00:00" },
         // Fixed offsets MySQL doesn't read.
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'CST')", "2026-01-01 08:00:00" },
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'Z', 'Asia/Shanghai')", "2026-01-01 08:00:00" },
@@ -290,12 +312,16 @@ test "CONVERT_TZ reads named zones with their daylight rules, as StarRocks does 
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+0860')", null },
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', 'UTC+8:00')", null },
         // thinDB alone. StarRocks gives NULL for MySQL's `SYSTEM`, `utc` and
-        // `+8:00`, and converts outside MySQL's window: 1970-01-01 00:00 UTC is
-        // 1969-12-31 19:00 in New York.
+        // `+8:00`.
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'SYSTEM', 'Asia/Shanghai')", "2026-01-01 08:00:00" },
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'utc', 'Asia/Shanghai')", "2026-01-01 08:00:00" },
         .{ "CONVERT_TZ('2026-01-01 00:00:00', 'UTC', '+8:00')", "2026-01-01 08:00:00" },
-        .{ "CONVERT_TZ('1970-01-01 00:00:00', 'UTC', 'America/New_York')", "1970-01-01 00:00:00" },
+        // A result outside years 0-9999 is NULL, where StarRocks gives a value
+        // it can't print (`C601-07-16 19:03:58`, `:000-01-01 07:00:00`).
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', 'UTC', 'America/New_York')", null },
+        .{ "CONVERT_TZ('0000-01-01 00:00:00', '+08:00', 'UTC')", null },
+        .{ "CONVERT_TZ('9999-12-31 23:00:00', 'UTC', '+08:00')", null },
+        .{ "CONVERT_TZ('9999-12-31 20:00:00', 'America/New_York', 'UTC')", null },
     };
     inline for (cases) |c| {
         try expectText(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});

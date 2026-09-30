@@ -166,11 +166,12 @@ spring-forward day is 07:30 UTC, and 01:30 on its fall-back day is 05:30
 UTC. A zone the reader doesn't know makes CONVERT_TZ NULL, and FROM_UNIXTIME
 renders it as UTC, as in StarRocks. An empty zone is NULL in both.
 
-CONVERT_TZ keeps MySQL's window. A value whose instant is outside 1970-01-01
-00:00:01 to 3001-01-18 23:59:59 UTC comes back unchanged, where StarRocks
-converts it. FROM_UNIXTIME reads a count up to 9999-12-31 23:59:59 UTC and
-gives NULL for a local time past that. StarRocks gives NULL for any count
-from 253402243200 on.
+CONVERT_TZ converts every value, as StarRocks does. MySQL returns a value
+whose instant is outside 1970-01-01 00:00:01 to 3001-01-18 23:59:59 UTC
+unchanged. A result outside years 0 to 9999 is NULL, where StarRocks gives a
+value it can't print. FROM_UNIXTIME reads a count up to 9999-12-31 23:59:59
+UTC and gives NULL for a local time past that. StarRocks gives NULL for any
+count from 253402243200 on.
 
 Floats compare by value: `-0.0 = 0.0`, and every NaN is one value that sorts
 after `+inf`. GROUP BY, DISTINCT, joins, unique keys and zone-map pruning all
