@@ -94,7 +94,7 @@ for (const t of targets) {
   }
   const url = `https://ziglang.org/download/${zigVersion}/${name}`;
   console.log(`[toolchain] fetching ${url}`);
-  run("curl", ["-fL", "--retry", "3", "-o", t.toolchainArchive + ".part", url]);
+  run("curl", ["-fL", "--retry", "3", "--retry-all-errors", "--speed-limit", "500000", "--speed-time", "30", "-o", t.toolchainArchive + ".part", url]);
   run(IS_WINDOWS_HOST ? "cmd" : "mv", IS_WINDOWS_HOST
     ? ["/c", "move", "/y", t.toolchainArchive + ".part", t.toolchainArchive]
     : [t.toolchainArchive + ".part", t.toolchainArchive]);

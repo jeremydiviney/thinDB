@@ -51,8 +51,12 @@ jobs:
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
-          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          archive="$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          # A transfer that stays under 500 KB/s for 30 s aborts and retries.
+          curl -fL --retry 3 --retry-all-errors --speed-limit 500000 --speed-time 30 \
+            -o "$archive" "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
 
       - name: Install Bun
         run: |
