@@ -738,6 +738,61 @@ test "keyed region: TVF inputs convert to their declared types as in ordinary ex
     }
 }
 
+/// The call shape of a production up/down chain: `.either`, row-aligned,
+/// a DATE `month` order key, partitioned finer than the declared key.
+const month_chain = struct {
+    const tdb = thindb.tdb;
+    pub const spec = tdb.TableFnSpec{ .name = "month_chain", .execution = .either, .row_aligned = true };
+    pub const Input = struct { projectId: ?i64, custLC: ?[]const u8, month: ?tdb.Date, amount: ?i64 };
+    pub const Output = struct { projectId: ?i64, custLC: ?[]const u8, month: ?tdb.Date, amount: ?i64, lastAmount: ?i64, firstMonth: ?tdb.Date };
+    pub const Computed = struct { lastAmount: ?i64, firstMonth: ?tdb.Date };
+    pub const passthrough = .{ "projectId", "custLC", "month", "amount" };
+    pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Computed)) !void {
+        const months = p.col(.month);
+        const amounts = p.col(.amount);
+        var last: ?i64 = null;
+        for (0..p.len) |i| {
+            try out.row(.{ .lastAmount = last, .firstMonth = months.get(0) });
+            last = amounts.get(i);
+        }
+    }
+};
+
+test "keyed region: a DATETIME month converted to a DATE order key keeps the region" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try db.registerTableFn(month_chain);
+    {
+        var q = try helpers.runSql(allocator, db, "SELECT DATE_ADD(DATE '2025-12-01', INTERVAL 1 MONTH) AS m");
+        defer q.deinit();
+        try std.testing.expectEqual(thindb.types.Type.datetime, q.outputSchema()[0].type);
+    }
+    // The region sorts each range by the supplied month and converts it
+    // after: a DATETIME's day keeps that order, as a DATE month has it.
+    inline for (.{
+        "DATE_ADD(DATE '2025-12-01', INTERVAL month MONTH)",
+        "CAST(DATE_ADD(DATE '2025-12-01', INTERVAL month MONTH) AS DATE)",
+    }) |month| {
+        try expect_keyed_matches(allocator, db,
+            \\chain AS (
+            \\  SELECT * FROM TABLE(month_chain((
+            \\    SELECT projectId, custLC,
+        ++ " " ++ month ++ " AS month, " ++
+            \\amount FROM inv WHERE projectId >= 100
+            \\  )) PARTITION BY projectId, custLC ORDER BY month)
+            \\), w AS (
+            \\  SELECT projectId, custLC, month, amount, lastAmount, firstMonth,
+            \\    LAG(lastAmount) OVER (PARTITION BY custLC ORDER BY month, projectId) AS prior
+            \\  FROM chain
+            \\)
+            \\SELECT * FROM w ORDER BY projectId, custLC, month
+        , "prior");
+    }
+}
+
 test "keyed region: route provenance survives replacing TVFs and aggregation in one region" {
     const allocator = std.testing.allocator;
     const tdb = thindb.tdb;

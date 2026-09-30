@@ -124,9 +124,10 @@ pub const TableFnExec = struct {
     /// (a covered window-stage ride): skip the sort — identity permutation,
     /// adjacent-equal run boundaries.
     input_ordered: bool = false,
-    /// Input 0 converts a partition or order column, so `input_ordered`
-    /// (proven on the supplied values) doesn't carry over.
-    keys_converted: bool = false,
+    /// Input 0 converts a partition or order column in a way that can put
+    /// the converted keys out of the order `input_ordered` proved on the
+    /// supplied values (`cast.preservesOrder`).
+    keys_reordered: bool = false,
     /// Observability (tests + trace attribution): columns the last execute
     /// actually bound as borrowed views (0 = bind declined or no plan).
     borrowed_bound: usize = 0,
@@ -195,7 +196,7 @@ pub const TableFnExec = struct {
             for (conversions[0..conversions_built]) |c| c.deinit(allocator);
             allocator.free(conversions);
         }
-        var keys_converted = false;
+        var keys_reordered = false;
 
         // Per input: shape contract (exact column set, each type as declared
         // or converted to it, sound nullability) + key/order columns
@@ -221,20 +222,20 @@ pub const TableFnExec = struct {
             }
             const imap = try allocator.alloc(usize, decl_schema.len);
             errdefer allocator.free(imap);
-            const converted = try ca.alloc(bool, decl_schema.len);
+            const order_kept = try ca.alloc(cast.OrderKept, decl_schema.len);
             var casts: std.ArrayList(exec.Derived) = .empty;
             var checks: std.ArrayList(CastCheck) = .empty;
             var assigned: std.ArrayList(AssignedInput) = .empty;
-            for (decl_schema, imap, converted) |decl, *slot, *conv| {
+            for (decl_schema, imap, order_kept) |decl, *slot, *kept| {
                 const ui = types.findColumn(up_schema, decl.name) orelse {
                     std.debug.print("[table_fn] {s} input {d}: declared column '{s}' not supplied\n", .{ entry.name, i, decl.name });
                     return Error.TableFnInputMismatch;
                 };
                 const up = up_schema[ui];
                 slot.* = ui;
-                conv.* = true;
+                kept.* = cast.preservesOrder(up.type, decl.type);
                 switch (try inputBinding(ca, up.name, up.type, decl.type)) {
-                    .as_is => conv.* = false,
+                    .as_is => kept.* = .strict,
                     .cast => |c| {
                         slot.* = up_schema.len + casts.items.len;
                         if (c.can_drop) try checks.append(ca, .{ .source = ui, .cast = slot.*, .name = decl.name, .type = decl.type });
@@ -270,15 +271,7 @@ pub const TableFnExec = struct {
             if (!is_bcast) for (order_by, oidx) |spec, *slot| {
                 slot.* = types.findColumn(decl_schema, spec.col) orelse return Error.TableFnInputMismatch;
             };
-            // A pre-ordered ride proves the order of the supplied values;
-            // a conversion can merge or reorder keys (DATETIME → DATE,
-            // text).
-            if (i == 0) for (kidx) |k| {
-                keys_converted = keys_converted or converted[k];
-            };
-            if (i == 0) for (oidx) |k| {
-                keys_converted = keys_converted or converted[k];
-            };
+            if (i == 0) keys_reordered = keysReordered(order_kept, kidx, oidx);
             input_maps[i] = imap;
             key_idxs[i] = kidx;
             order_idxs[i] = oidx;
@@ -339,7 +332,7 @@ pub const TableFnExec = struct {
             .views = views,
             .col_stats = col_stats,
             .dop = @max(1, dop),
-            .keys_converted = keys_converted,
+            .keys_reordered = keys_reordered,
         };
         return makeQuery(allocator, self);
     }
@@ -683,7 +676,7 @@ pub const TableFnExec = struct {
         defer if (digests) |d| self.allocator.free(d);
         for (perm, 0..) |*p, i| p.* = @intCast(i);
         const have_keys = self.key_idx.len + self.order_idx.len > 0;
-        const pre_ordered = self.input_ordered and !self.keys_converted;
+        const pre_ordered = self.input_ordered and !self.keys_reordered;
         const identity_perm = pre_ordered or !have_keys;
         if (have_keys and !pre_ordered) {
             digests = try self.packedSort(input_views, perm);
@@ -2065,6 +2058,25 @@ pub const TableFnExec = struct {
         return if (cast.assignsByRule(have, declared)) .assigned else .refused;
     }
 
+    /// Whether rows sorted by their supplied `partition_by ++ order_by`
+    /// values can be out of order once the keys convert (`kept` per declared
+    /// column): a key converted out of order anywhere, or one whose values
+    /// can meet ahead of the last key, which leaves the keys after it
+    /// unordered where they meet. A value that fails to convert fails the
+    /// call, so no key turns NULL.
+    pub fn keysReordered(kept: []const cast.OrderKept, key_idx: []const usize, order_idx: []const usize) bool {
+        const n_keys = key_idx.len + order_idx.len;
+        for (0..n_keys) |pos| {
+            const col = if (pos < key_idx.len) key_idx[pos] else order_idx[pos - key_idx.len];
+            switch (kept[col]) {
+                .strict => {},
+                .merging => if (pos + 1 < n_keys) return true,
+                .none => return true,
+            }
+        }
+        return false;
+    }
+
     /// A droppable input cast: the supplied column and its converted slot,
     /// both upstream-output indices.
     const CastCheck = struct {
@@ -2647,4 +2659,24 @@ test "packed sort keys: NULL order values first ascending, last descending" {
     // Different partitions always order by digest, regardless of desc.
     const other = TableFnExec.PackedKey{ .digest = 9, .ord = 0, .ord_null = false, .row = 2 };
     try std.testing.expect(TableFnExec.PackCtx.less(desc, null_key, other));
+}
+
+test "keysReordered: a merging conversion keeps the order only as the last key" {
+    const Case = struct { kept: []const cast.OrderKept, key_idx: []const usize, order_idx: []const usize, reordered: bool };
+    const cases = [_]Case{
+        // PARTITION BY 0, 1 ORDER BY 2, the order key a DATETIME's day.
+        .{ .kept = &.{ .strict, .strict, .merging }, .key_idx = &.{ 0, 1 }, .order_idx = &.{2}, .reordered = false },
+        .{ .kept = &.{ .strict, .strict, .strict }, .key_idx = &.{ 0, 1 }, .order_idx = &.{2}, .reordered = false },
+        .{ .kept = &.{ .strict, .strict, .none }, .key_idx = &.{ 0, 1 }, .order_idx = &.{2}, .reordered = true },
+        // A merging partition key ahead of the order key.
+        .{ .kept = &.{ .merging, .strict, .strict }, .key_idx = &.{ 0, 1 }, .order_idx = &.{2}, .reordered = true },
+        .{ .kept = &.{ .strict, .merging, .strict }, .key_idx = &.{ 0, 1 }, .order_idx = &.{}, .reordered = false },
+        // A merging first order key ahead of a second.
+        .{ .kept = &.{ .strict, .merging, .strict }, .key_idx = &.{0}, .order_idx = &.{ 1, 2 }, .reordered = true },
+        // Columns off the keys don't count.
+        .{ .kept = &.{ .strict, .none, .merging }, .key_idx = &.{0}, .order_idx = &.{}, .reordered = false },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.reordered, TableFnExec.keysReordered(c.kept, c.key_idx, c.order_idx));
+    }
 }

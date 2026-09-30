@@ -1404,9 +1404,23 @@ const updown_shape = struct {
     }
 };
 
-const updown_input =
-    \\SELECT projectId, divisionId, LOWER(customerNumber) AS customerNumberLC,
-    \\       DATE_ADD(d, INTERVAL 1 - DAY(d) DAY) AS month, d AS minDate,
+const updown_input = updownInput("DATE_ADD(d, INTERVAL 1 - DAY(d) DAY)");
+
+/// The input a production up/down chain call supplies, with `month` as
+/// `month_expr` over `monthly.d`.
+fn updownInput(comptime month_expr: []const u8) []const u8 {
+    return "SELECT projectId, divisionId, LOWER(customerNumber) AS customerNumberLC, " ++
+        month_expr ++ " AS month, d AS minDate, " ++ updown_input_rest;
+}
+
+const updown_columns = "projectId, divisionId, customerNumberLC, month, minDate, amount, originalAmount, exchangeRate, planId, " ++
+    "customerNumber, customerName, customerEmail, customerNumberHash, parentCustomerNumber, parentCustomerName, date, " ++
+    "nonRecurringAmount, originalNonRecurringAmount, otherMrrAmount, originalOtherMrrAmount, currency, integrationConfigId, " ++
+    "hasAdjustment, childAddedToParentCount, childRemovedFromParentCount, childAddedPlanCount, childRemovedPlanCount, " ++
+    "childUpCount, childDownCount, childAddedToParentAmount, childRemovedFromParentAmount, childAddedPlanAmount, " ++
+    "childRemovedPlanAmount, childUpAmount, childDownAmount, crossSellCount, crossChurnCount, crossSellAmount, crossChurnAmount";
+
+const updown_input_rest =
     \\       amount, amount AS originalAmount, exchangeRate, planId,
     \\       customerNumber, customerNumber AS customerName, 'e' AS customerEmail,
     \\       'h' AS customerNumberHash, customerNumber AS parentCustomerNumber,
@@ -1472,6 +1486,83 @@ test "table UDF input conversion: DATETIME month and INT amounts reach DATE and 
         }
     }
     try std.testing.expectEqual(want.len, n);
+}
+
+/// The table function operator a compiled statement runs, at its root or
+/// adopted by one of its stages.
+fn tableFnOf(q: thindb.exec.Query) ?*thindb.exec.table_fn.TableFnExec {
+    const TableFnExec = thindb.exec.table_fn.TableFnExec;
+    if (thindb.exec.queryAs(TableFnExec, q)) |tf| return tf;
+    const staged = thindb.exec.queryAs(thindb.exec.mat_stage.StagedRoot, q) orelse return null;
+    if (thindb.exec.queryAs(TableFnExec, staged.inner)) |tf| return tf;
+    for (staged.set.stages.items) |stage| {
+        if (stage.adopt_table_fn) |tf| return tf;
+    }
+    return null;
+}
+
+test "table UDF input conversion: a DATETIME month converted to a DATE order key keeps the pre-ordered ride" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedMonthly(allocator, db);
+    try db.registerTableFn(updown_shape);
+
+    // A window CTE sorted by the call's keys feeds the call: its input
+    // arrives in (projectId, divisionId, customerNumberLC, month) order and
+    // the operator skips its sort. A DATETIME month keeps that order as its
+    // day (the last key), as a DATE month does; month text read as a DATE
+    // may not, so the operator sorts.
+    const variants = .{
+        .{ .month = "DATE_ADD(d, INTERVAL 1 - DAY(d) DAY)", .sorts = false },
+        .{ .month = "CAST(DATE_ADD(d, INTERVAL 1 - DAY(d) DAY) AS DATE)", .sorts = false },
+        .{ .month = "DATE_FORMAT(d, '%Y-%m-01')", .sorts = true },
+    };
+    const Row = struct { lc: []const u8, month: i32, amount: i64, last: ?i64, up_down: []const u8 };
+    const want = [_]Row{
+        .{ .lc = "acme", .month = firstOfMonth(1), .amount = 100, .last = null, .up_down = "new" },
+        .{ .lc = "acme", .month = firstOfMonth(2), .amount = 150, .last = 100, .up_down = "up" },
+        .{ .lc = "acme", .month = firstOfMonth(3), .amount = 120, .last = 150, .up_down = "down" },
+        .{ .lc = "bolt", .month = firstOfMonth(1), .amount = 50, .last = null, .up_down = "new" },
+        .{ .lc = "bolt", .month = firstOfMonth(2), .amount = 0, .last = 50, .up_down = "down" },
+    };
+    inline for (variants) |v| {
+        var res = try run(allocator, db, "WITH base AS (" ++ comptime updownInput(v.month) ++ "), " ++
+            "w AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY projectId, divisionId, customerNumberLC ORDER BY month) AS rn FROM base) " ++
+            "SELECT * FROM TABLE(updown_shape((SELECT " ++ updown_columns ++ " FROM w), 1) " ++
+            "PARTITION BY projectId, divisionId, customerNumberLC ORDER BY month)");
+        defer res.deinit();
+        const tf = tableFnOf(res.cq.query) orelse return error.TestExpectedTableFn;
+        try std.testing.expect(tf.input_ordered);
+        try std.testing.expectEqual(v.sorts, tf.keys_reordered);
+
+        const out_schema = res.outputSchema();
+        const lc_col = thindb.types.findColumn(out_schema, "customerNumberLC").?;
+        const month_col = thindb.types.findColumn(out_schema, "month").?;
+        const amount_col = thindb.types.findColumn(out_schema, "amount").?;
+        const last_col = thindb.types.findColumn(out_schema, "lastAmount").?;
+        const up_down_col = thindb.types.findColumn(out_schema, "upDown").?;
+        var seen = [_]bool{false} ** want.len;
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| {
+                const lc = batch.values[lc_col].data.string.rowBytes(i);
+                const month = batch.values[month_col].data.date[i];
+                const at = for (want, 0..) |w, wi| {
+                    if (std.mem.eql(u8, w.lc, lc) and w.month == month) break wi;
+                } else return error.TestUnexpectedRow;
+                try std.testing.expect(!seen[at]);
+                seen[at] = true;
+                try std.testing.expectEqual(want[at].amount, batch.values[amount_col].data.bigint[i]);
+                try std.testing.expectEqual(want[at].last, if (batch.values[last_col].isValid(i)) batch.values[last_col].data.bigint[i] else null);
+                try std.testing.expectEqualStrings(want[at].up_down, batch.values[up_down_col].data.string.rowBytes(i));
+            }
+        }
+        for (seen) |s| try std.testing.expect(s);
+    }
 }
 
 /// The input declarations of a production two-input expansion kernel,

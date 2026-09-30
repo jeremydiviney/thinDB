@@ -615,6 +615,67 @@ pub fn assignmentCastExpr(arena: Allocator, name: []const u8, from: Type, to: Ty
     return .{ .call = .{ .fn_name = fn_name, .args = args } };
 }
 
+/// How a conversion by the assignment rule keeps the order of the values it
+/// converts, with a value that fails to convert failing the write rather than
+/// turning NULL. `strict`: distinct values stay distinct and keep their order.
+/// `merging`: the order holds but distinct values can meet (a DATETIME's day,
+/// a rounded fraction), so rows sorted by more columns after this one lose
+/// their order where two of its values meet. `none`: the converted values can
+/// come out in another order (text read as a number, a number as text).
+pub const OrderKept = enum { none, merging, strict };
+
+pub fn preservesOrder(from: Type, to: Type) OrderKept {
+    if (from == .json or to == .json or from == .uuid or to == .uuid) {
+        return if (@as(TypeTag, from) == @as(TypeTag, to)) .strict else .none;
+    }
+    if (from.isString() or to.isString()) {
+        return if (from.isString() and to.isString()) .strict else .none;
+    }
+    if (to == .boolean) return if (from == .boolean) .strict else .none;
+    return switch (from) {
+        .date => switch (to) {
+            .date, .datetime => .strict,
+            else => .none,
+        },
+        .datetime => switch (to) {
+            .datetime => .strict,
+            .date => .merging,
+            else => .none,
+        },
+        .boolean, .tinyint, .smallint, .int, .bigint, .largeint => switch (to) {
+            .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => .strict,
+            .float => if (integerBits(from) <= std.math.floatMantissaBits(f32) + 1) .strict else .merging,
+            .double => if (integerBits(from) <= std.math.floatMantissaBits(f64) + 1) .strict else .merging,
+            else => .none,
+        },
+        .float, .double => switch (to) {
+            .double => .strict,
+            .float => if (from == .float) .strict else .merging,
+            .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => .merging,
+            else => .none,
+        },
+        .decimal64, .decimal128 => |spec| switch (to) {
+            .decimal64, .decimal128 => |target| if (target.s >= spec.s) .strict else .merging,
+            .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => .merging,
+            else => .none,
+        },
+        else => .none,
+    };
+}
+
+/// The bits of magnitude an integer (or boolean) type's values span.
+fn integerBits(t: Type) u16 {
+    return switch (t) {
+        .boolean => 1,
+        .tinyint => 7,
+        .smallint => 15,
+        .int => 31,
+        .bigint => 63,
+        .largeint => 127,
+        else => std.math.maxInt(u16),
+    };
+}
+
 /// Whether a column cast by `assignmentCastExpr` is NULL where its source
 /// had a value, as for text that isn't a number or a date. INSERT ... VALUES
 /// rejects such a value, so every other write does too rather than storing
@@ -917,4 +978,37 @@ test "assignment: a column converts row by row and keeps its NULLs" {
     try t.expect(!assignsByRule(.int, .int));
     try t.expect(!assignsByRule(.json, .int));
     try t.expect(!assignsByRule(.int, .{ .decimal64 = .{ .p = 6, .s = 2 } }));
+}
+
+test "preservesOrder: a DATETIME's day merges, a widening stays strict, text reorders" {
+    const dec_10_2: Type = .{ .decimal64 = .{ .p = 10, .s = 2 } };
+    const dec_12_4: Type = .{ .decimal64 = .{ .p = 12, .s = 4 } };
+    const cases = .{
+        .{ @as(Type, .datetime), @as(Type, .date), OrderKept.merging },
+        .{ @as(Type, .date), @as(Type, .datetime), OrderKept.strict },
+        .{ @as(Type, .int), @as(Type, .bigint), OrderKept.strict },
+        .{ @as(Type, .bigint), @as(Type, .smallint), OrderKept.strict },
+        .{ @as(Type, .boolean), @as(Type, .int), OrderKept.strict },
+        .{ @as(Type, .int), @as(Type, .double), OrderKept.strict },
+        .{ @as(Type, .bigint), @as(Type, .double), OrderKept.merging },
+        .{ @as(Type, .int), @as(Type, .float), OrderKept.merging },
+        .{ @as(Type, .smallint), @as(Type, .float), OrderKept.strict },
+        .{ @as(Type, .float), @as(Type, .double), OrderKept.strict },
+        .{ @as(Type, .double), @as(Type, .float), OrderKept.merging },
+        .{ @as(Type, .double), @as(Type, .bigint), OrderKept.merging },
+        .{ @as(Type, .int), dec_10_2, OrderKept.strict },
+        .{ dec_10_2, dec_12_4, OrderKept.strict },
+        .{ dec_12_4, dec_10_2, OrderKept.merging },
+        .{ dec_10_2, @as(Type, .int), OrderKept.merging },
+        .{ @as(Type, .{ .varchar = 8 }), @as(Type, .string), OrderKept.strict },
+        .{ @as(Type, .{ .varchar = 8 }), @as(Type, .int), OrderKept.none },
+        .{ @as(Type, .int), @as(Type, .{ .varchar = 8 }), OrderKept.none },
+        .{ @as(Type, .{ .varchar = 20 }), @as(Type, .date), OrderKept.none },
+        .{ @as(Type, .date), @as(Type, .{ .varchar = 20 }), OrderKept.none },
+        .{ @as(Type, .int), @as(Type, .boolean), OrderKept.none },
+        .{ @as(Type, .json), @as(Type, .{ .varchar = 8 }), OrderKept.none },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectEqual(c[2], preservesOrder(c[0], c[1]));
+    }
 }
