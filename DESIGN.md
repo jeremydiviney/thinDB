@@ -745,6 +745,21 @@ lookup builds through a chain of non-FULL joins. The check reuses stage buffers,
 retains parallel probing for nonempty inputs, and does not add a materialization
 boundary or choose a different join order or algorithm.
 
+A keyed GROUP BY whose keys aren't a sorted prefix of its input picks its plan
+(hash, partitioned hash, or sort then stream) by pricing each against the
+query's memory headroom. The price starts from the input's size: its row count
+times each column's width. A string column's width comes from the stage or
+realized buffer that measured it. Over a table scan nothing has, so the router
+samples the table (issue #397): 64 row groups spread evenly across the scan's
+segments, each counted once and kept on the segment's cached handle, so later
+plans read nothing. A raw block's header gives its string bytes without
+reading its body. A dict or FSST block is read through the block cache, which
+the scan that follows reuses, and counted from its codes or its recorded byte
+count. Filters, projections, renames and computes pass the request down for the
+columns they carry unchanged, so a filtered scan is priced at the width of the
+rows it reads. Nothing is stored on disk. Only a column no sample reaches is
+priced at the 32-byte guess.
+
 Parallel grouped aggregation initially reserves at most one 8,192-row batch's
 worth of groups per bucket and allocates its state slab only when rows arrive.
 This keeps small tables' setup allocations out of the workers' allocation
