@@ -50,6 +50,7 @@ const ir = @import("../ir/ir.zig");
 const sort_mod = @import("sort.zig");
 const SortSpec = sort_mod.SortSpec;
 
+const cast = @import("cast.zig");
 const exec = @import("exec.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
@@ -159,10 +160,10 @@ pub const TableFnExec = struct {
                 else => {},
             };
         };
-        for (call_args, args) |src, *dst| {
+        for (call_args, entry.arg_types, args) |src, want, *dst| {
             dst.* = if (src) |v| switch (v) {
                 .text => |t| Value{ .text = try allocator.dupe(u8, t) },
-                else => v,
+                else => cast.narrowIntegerArg(v, want),
             } else null;
             args_duped += 1;
         }

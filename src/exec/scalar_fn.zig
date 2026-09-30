@@ -336,7 +336,7 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
         if (std.ascii.eqlIgnoreCase(name, "hex"))
             return try buildDecFn(aa, name, arg_types, .string, dec.hexKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, INTEGER_ARG_FN))
-            return try buildDecFn(aa, name, arg_types, .bigint, dec.integerArgKernel, .propagates);
+            return try buildDecFn(aa, name, arg_types, .bigint, dec.integerArgKernel, .kernel_managed);
         return null;
     }
 
@@ -1077,8 +1077,10 @@ pub fn bitOperatorFn(op: BitOperator, dialect: types.Dialect) []const u8 {
 
 /// Internal: a double or decimal read as an integer argument, as MySQL reads
 /// one where a function takes an integer (`REPEAT('a', 2.5)`, `ELT(1.5e0,
-/// ...)`): a double rounds half to even (`common.doubleAsBigint`), a decimal
-/// half away from zero (`dec.integerArgAt`), clamped to the BIGINT range.
+/// ...)`): a double rounds half to even, a decimal half away from zero
+/// (`dec.integerArgAt`). A value past BIGINT is NULL, as it is in StarRocks,
+/// where MySQL clamps it; a narrower parameter narrows it further
+/// (`cast.narrowInt`), so `LEFT('abcdef', 1e15)` is NULL.
 pub const INTEGER_ARG_FN = "__integer_arg";
 
 /// The function that reads a `given` number as the integer `target`
@@ -1539,13 +1541,13 @@ pub const builtins = [_]ScalarFn{
     // isn't a number of the target's kind is NULL. Narrower integer
     // sources widen to bigint first through the implicit-cast ranking, so a
     // bigint overload covers them.
-    .{ .name = "to_tinyint", .arg_types = &.{.bigint}, .return_type = .tinyint, .null_strategy = .kernel_managed, .kernel = math.bigintToTinyintKernel },
+    .{ .name = "to_tinyint", .arg_types = &.{.bigint}, .return_type = .tinyint, .null_strategy = .kernel_managed, .kernel = cast.intNarrowKernel(i64, i8) },
     .{ .name = "to_tinyint", .arg_types = &.{.double}, .return_type = .tinyint, .null_strategy = .kernel_managed, .kernel = math.doubleToTinyintKernel },
     .{ .name = "to_tinyint", .arg_types = &.{.string}, .return_type = .tinyint, .null_strategy = .kernel_managed, .kernel = math.stringToTinyintKernel },
-    .{ .name = "to_smallint", .arg_types = &.{.bigint}, .return_type = .smallint, .null_strategy = .kernel_managed, .kernel = math.bigintToSmallintKernel },
+    .{ .name = "to_smallint", .arg_types = &.{.bigint}, .return_type = .smallint, .null_strategy = .kernel_managed, .kernel = cast.intNarrowKernel(i64, i16) },
     .{ .name = "to_smallint", .arg_types = &.{.double}, .return_type = .smallint, .null_strategy = .kernel_managed, .kernel = math.doubleToSmallintKernel },
     .{ .name = "to_smallint", .arg_types = &.{.string}, .return_type = .smallint, .null_strategy = .kernel_managed, .kernel = math.stringToSmallintKernel },
-    .{ .name = "to_int", .arg_types = &.{.bigint}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = math.bigintToIntKernel },
+    .{ .name = "to_int", .arg_types = &.{.bigint}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = cast.intNarrowKernel(i64, i32) },
     .{ .name = "to_int", .arg_types = &.{.double}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = math.doubleToIntKernel },
     .{ .name = "to_int", .arg_types = &.{.string}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = math.stringToIntKernel },
     .{ .name = "to_bigint", .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.doubleToBigintKernel },
@@ -1554,7 +1556,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_bigint", .arg_types = &.{.date}, .return_type = .bigint, .kernel = date.dateToBigintKernel },
     .{ .name = "to_int", .arg_types = &.{.date}, .return_type = .int, .kernel = date.dateToIntKernel },
     .{ .name = "to_bigint", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.datetimeToBigintKernel },
-    .{ .name = "to_bigint", .arg_types = &.{.largeint}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.largeintToBigintKernel },
+    .{ .name = "to_bigint", .arg_types = &.{.largeint}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = cast.intNarrowKernel(i128, i64) },
     .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.doubleToLargeintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.stringToLargeintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.date}, .return_type = .largeint, .kernel = date.dateToLargeintKernel },
@@ -1568,7 +1570,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = TEXT_AS_BIGINT_FN, .arg_types = &.{.json}, .return_type = .bigint, .kernel = math.textAsBigintKernel },
     // A double read where an integer parameter meets it (`argConversion`);
     // `resolveDecimal` takes a DECIMAL.
-    .{ .name = INTEGER_ARG_FN, .arg_types = &.{.double}, .return_type = .bigint, .kernel = math.doubleIntegerArgKernel },
+    .{ .name = INTEGER_ARG_FN, .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.doubleIntegerArgKernel },
     // date <-> datetime
     .{ .name = "to_date", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.datetimeToDateKernel },
     .{ .name = "to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },

@@ -7,6 +7,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const TypeTag = types.TypeTag;
 
+const cast = @import("cast.zig");
 const scalar_fn = @import("scalar_fn.zig");
 const resolve = scalar_fn.resolve;
 
@@ -92,7 +93,7 @@ test "scalar_fn: exact match short-circuits before cost calc" {
     try std.testing.expectEqual(@as(TypeTag, .bigint), @as(TypeTag, r.func.return_type));
 }
 
-test "scalar_fn: a wider integer argument narrows only when nothing widens" {
+test "scalar_fn: a wider integer argument narrows only when nothing widens, NULL where it doesn't fit" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -105,12 +106,19 @@ test "scalar_fn: a wider integer argument narrows only when nothing widens" {
     try std.testing.expectEqual(@as(TypeTag, .int), @as(TypeTag, r.func.arg_types[1]));
     const narrow = (r.arg_casts orelse return error.ExpectedCastPlan)[1] orelse return error.ExpectedCastPlan;
 
-    const src = [_]i64{ 7, std.math.maxInt(i64), std.math.minInt(i64) };
+    // Past INT the argument is NULL, as StarRocks narrows it (#450).
+    const src = [_]i64{ 7, std.math.maxInt(i32), std.math.maxInt(i32) + 1, std.math.minInt(i32), std.math.minInt(i32) - 1, std.math.maxInt(i64) };
     const args = [_]ColumnView{.{ .data = .{ .bigint = &src } }};
-    var out = try ColumnStore.init(allocator, .int, false);
+    try std.testing.expect(cast.argCastCanNull(.bigint, .int));
+    var out = try ColumnStore.init(allocator, .int, true);
     defer out.deinit(allocator);
     try narrow(allocator, &args, &out, src.len);
-    try std.testing.expectEqualSlices(i32, &.{ 7, std.math.maxInt(i32), std.math.minInt(i32) }, out.view().data.int);
+    const view = out.view();
+    const want = [_]?i32{ 7, std.math.maxInt(i32), null, std.math.minInt(i32), null, null };
+    for (want, 0..) |w, row| {
+        try std.testing.expectEqual(w != null, view.isValid(row));
+        if (w) |x| try std.testing.expectEqual(x, view.data.int[row]);
+    }
 
     // A widening overload still wins: bigint → double, not bigint → int.
     const s = (try resolve(aa, "sqrt", &.{.bigint})) orelse return error.NotFound;

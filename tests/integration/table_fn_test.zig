@@ -453,6 +453,57 @@ test "table UDF SDK: row iterator and at() match columnar access" {
     try std.testing.expectEqual(@as(i64, 150), batch.values[0].data.bigint[0]);
 }
 
+test "table UDF SDK: an integer argument binds narrowed to its declared type (issue #450)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const scaled_fn = struct {
+        pub const spec = tdb.TableFnSpec{ .name = "scaled_sum", .execution = .global };
+        pub const Args = struct { mult: i32, bonus: ?i16 };
+        pub const Input = struct { id: i64, g: i32, amt: i64 };
+        pub const Output = struct { total: i64, bonus: ?i64 };
+
+        pub fn process(ctx: *tdb.Ctx, args: Args, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+            _ = ctx;
+            var sum: i64 = 0;
+            for (p.col(.amt)) |amt| sum += amt;
+            try out.row(.{ .total = sum * args.mult, .bonus = if (args.bonus) |b| @as(i64, b) else null });
+        }
+    };
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try db.registerTableFn(scaled_fn);
+
+    // A value past the parameter's type is NULL, as a narrowed function
+    // argument is; an optional field takes it as null.
+    const cases = .{
+        .{ "2, 7", 300, @as(?i64, 7) },
+        .{ "-2147483648, 32767", -322122547200, @as(?i64, 32767) },
+        .{ "2, 32768", 300, @as(?i64, null) },
+        .{ "2, 170141183460469231731687303715884105727", 300, @as(?i64, null) },
+        .{ "2, NULL", 300, @as(?i64, null) },
+    };
+    inline for (cases) |c| {
+        var res = try run(allocator, db, "SELECT total, bonus FROM TABLE(scaled_sum((SELECT id, g, amt FROM t), " ++ c[0] ++ "))");
+        defer res.deinit();
+        const batch = (try res.next()).?;
+        try std.testing.expectEqual(@as(i64, c[1]), batch.values[0].data.bigint[0]);
+        const bonus: ?i64 = if (batch.values[1].isValid(0)) batch.values[1].data.bigint[0] else null;
+        try std.testing.expectEqual(c[2], bonus);
+    }
+
+    // A non-optional field has no value for NULL, written or narrowed.
+    inline for (.{ "2147483648, 7", "-2147483649, 7", "NULL, 7" }) |args| {
+        var res = try run(allocator, db, "SELECT total FROM TABLE(scaled_sum((SELECT id, g, amt FROM t), " ++ args ++ "))");
+        defer res.deinit();
+        try std.testing.expectError(error.TableFnInputMismatch, res.next());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // P3: co-partitioned multiple inputs.
 // ---------------------------------------------------------------------------

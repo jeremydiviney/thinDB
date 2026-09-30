@@ -33,6 +33,7 @@ const exec = @import("../exec/exec.zig");
 const engine_v2 = @import("../exec/engine_v2.zig");
 const region = @import("../exec/region_exec.zig");
 const compute_mod = @import("../exec/compute.zig");
+const cast = @import("../exec/cast.zig");
 const expr_mod = @import("../exec/expr.zig");
 const predicate_mod = @import("../exec/predicate.zig");
 const types = @import("../types.zig");
@@ -3529,7 +3530,7 @@ fn dispatchUnionTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, u: UnionT
         .spec = .{
             .process = ent.process,
             .user_data = ent.user_data,
-            .args = try cloneArgs(b, u.tvf.args),
+            .args = try cloneArgs(b, ent, u.tvf.args),
             .inputs = inputs,
             .out = out,
         },
@@ -3602,7 +3603,7 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, t: *const ir.Op.T
     try b.ops.append(a, .{ .tvf_grouped = .{ .spec = .{
         .process = ent.process,
         .user_data = ent.user_data,
-        .args = try cloneArgs(b, t.args),
+        .args = try cloneArgs(b, ent, t.args),
         .inputs = inputs,
         .out = out,
     } } });
@@ -5012,10 +5013,15 @@ fn dupExpr(a: Allocator, e: Expr) ![]Expr {
     return s;
 }
 
-fn cloneArgs(b: *Builder, args: []const ?Value) ![]const ?Value {
+/// The call's scalar arguments as the kernel takes them, bound as
+/// `TableFnExec.create` binds them: an integer narrowed to its declared type
+/// (`cast.narrowIntegerArg`). A call whose argument count doesn't match
+/// takes the plain engine, which reports it.
+fn cloneArgs(b: *Builder, ent: *const udf_mod.TableEntry, args: []const ?Value) ![]const ?Value {
+    if (args.len != ent.arg_types.len) return NoMatch;
     const out = try b.a.alloc(?Value, args.len);
-    for (args, out) |src, *dst| {
-        dst.* = if (src) |v| try b.cloneValue(v) else null;
+    for (args, ent.arg_types, out) |src, want, *dst| {
+        dst.* = if (src) |v| cast.narrowIntegerArg(try b.cloneValue(v), want) else null;
     }
     return out;
 }
@@ -5111,7 +5117,7 @@ fn pushAlignedTvf(
             .spec = .{
                 .process = ent.process,
                 .user_data = ent.user_data,
-                .args = try cloneArgs(b, args),
+                .args = try cloneArgs(b, ent, args),
                 .inputs = inputs,
                 .extra_parts = extra_parts,
                 .out = out,
@@ -5122,7 +5128,7 @@ fn pushAlignedTvf(
         try b.ops.append(a, .{ .tvf_aligned = .{
             .process = ent.process,
             .user_data = ent.user_data,
-            .args = try cloneArgs(b, args),
+            .args = try cloneArgs(b, ent, args),
             .inputs = inputs,
             .extra_parts = extra_parts,
             .out = out,

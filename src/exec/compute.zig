@@ -2265,7 +2265,7 @@ fn buildCallPlan(
         const buffers = try runtime_allocator.alloc(?ColumnStore, casts.len);
         @memset(buffers, null);
         cast_buffers = buffers;
-        for (casts, rr.func.arg_types, arg_plans, buffers) |k, declared, ap, *slot| {
+        for (casts, arg_types, rr.func.arg_types, arg_plans, buffers) |k, given, declared, ap, *slot| {
             if (k == null) {
                 slot.* = null;
                 continue;
@@ -2278,7 +2278,7 @@ fn buildCallPlan(
                 .call => true,
                 .case => |sub| sub.may_produce_null,
             };
-            slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable);
+            slot.* = try ColumnStore.init(runtime_allocator, declared, src_nullable or cast.argCastCanNull(given, declared));
         }
     }
 
@@ -2594,6 +2594,9 @@ fn fitsTemporalOverload(f: scalar_fn.ScalarFn, arg_plans: []const ArgPlan, arg_t
         if (fit.nulls and ap == .null_lit) continue;
         if (foldStringTag(@as(types.TypeTag, declared)) == foldStringTag(@as(types.TypeTag, given))) continue;
         if (cast.castCost(@as(types.TypeTag, given), @as(types.TypeTag, declared)) != null) continue;
+        // An integer argument meets its narrower parameter as the resolver
+        // lets it (`DATE_ADD('2026-01-01', INTERVAL n + 1 DAY)`).
+        if (cast.argNarrowingCost(@as(types.TypeTag, given), @as(types.TypeTag, declared)) != null) continue;
         const wanted = switch (declared) {
             .datetime => true,
             .date => text_meets_date,
@@ -2879,6 +2882,9 @@ fn callPlanNullable(plan: *CallPlan, up_schema: []const Column) bool {
         .absorbs, .kernel_managed, .zero_divisor => return true,
         .propagates => {},
     }
+    if (plan.arg_casts) |casts| for (casts, plan.arg_runtime_types, plan.func.arg_types) |k, given, declared| {
+        if (k != null and cast.argCastCanNull(given, declared)) return true;
+    };
     for (plan.args) |arg| switch (arg) {
         .col => |idx| if (up_schema[idx].nullable) return true,
         .lit => {},
