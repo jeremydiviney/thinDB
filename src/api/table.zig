@@ -1307,6 +1307,56 @@ pub const Table = struct {
         self.seg_handles.release(self.allocator, entry);
     }
 
+    /// Row groups `sampledStringWidth` reads per column. Tables are
+    /// clustered, so row groups' widths vary widely: in ClickBench's `hits`,
+    /// `URL` averages 27 to 480 B per row group around a mean of 90 B. One
+    /// row group can land anywhere in that range, and 16 spread evenly can
+    /// miss the mean by 40%; 64 spread evenly land within 14% of it
+    /// wherever the spacing starts.
+    const WIDTH_SAMPLE_ROW_GROUPS: u64 = 64;
+
+    /// Mean bytes per row of string column `col_idx` over `segs`, sampled
+    /// from `WIDTH_SAMPLE_ROW_GROUPS` row groups spread evenly over them, for
+    /// the GROUP BY router to price a table input it can't measure. A raw
+    /// block's header answers its sample; each sample stays on its segment's
+    /// handle, so later plans read nothing. Null when `segs` has no rows.
+    pub fn sampledStringWidth(
+        self: *Table,
+        scratch: Allocator,
+        segs: []const storage.ManifestEntry,
+        col_idx: usize,
+    ) !?u32 {
+        var total: u64 = 0;
+        for (segs) |s| total += s.row_group_count;
+        if (total == 0) return null;
+        const picks: u64 = @min(total, WIDTH_SAMPLE_ROW_GROUPS);
+        const nullable = self.schema.columns[col_idx].nullable;
+        var bytes: u64 = 0;
+        var rows: u64 = 0;
+        var seg_idx: usize = 0;
+        var seg_start: u64 = 0;
+        var entry: ?*storage.cache.SegmentHandles.Entry = null;
+        defer if (entry) |e| self.releaseSegment(e);
+        for (0..picks) |pick| {
+            const flat = (2 * pick + 1) * total / (2 * picks);
+            while (flat >= seg_start + segs[seg_idx].row_group_count) {
+                seg_start += segs[seg_idx].row_group_count;
+                seg_idx += 1;
+                if (entry) |e| self.releaseSegment(e);
+                entry = null;
+            }
+            const e = entry orelse try self.acquireSegment(segs[seg_idx].segment_id);
+            entry = e;
+            const rg_idx = flat - seg_start;
+            const row_groups = e.seg.info.row_groups;
+            if (rg_idx >= row_groups.len or col_idx >= row_groups[rg_idx].col_offsets.len) continue;
+            bytes += try self.seg_handles.rowGroupStringBytes(self.allocator, scratch, e, rg_idx, col_idx, nullable, self.cacheRef());
+            rows += row_groups[rg_idx].row_count;
+        }
+        if (rows == 0) return null;
+        return @intCast(@min(bytes / rows + @intFromBool(bytes % rows != 0), std.math.maxInt(u32)));
+    }
+
     /// The segment's tombstone list as a dupe owned by `allocator` (null =
     /// none). Cached file read; caller frees, same contract as
     /// `storage.tombstone.read`.

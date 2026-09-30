@@ -357,6 +357,14 @@ pub const VTable = struct {
     /// called before any `next()`; on success the producer keeps nothing to
     /// emit and its deinit skips the transferred buffers.
     takeOwnedChunks: *const fn (ptr: *anyopaque) anyerror!?OwnedChunks,
+    /// Plan-time string widths for the GROUP BY router (issue #397): set
+    /// `widths[i]` for each string output column `i` still null that traces
+    /// to a table column, to that column's mean bytes per row sampled from
+    /// its row groups (`Table.sampledStringWidth`). Only a table scan samples;
+    /// pass-through layers map their columns onto their upstream's, and
+    /// every other operator leaves `widths` as it is. Reads data, so it runs
+    /// only when the router prices a plan by its input's bytes.
+    sampleWidths: *const fn (ptr: *anyopaque, widths: []?u32) anyerror!void,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -622,6 +630,12 @@ pub const Query = struct {
     /// `VTable.takeOwnedChunks`.
     pub fn takeOwnedChunks(self: Query) !?OwnedChunks {
         return self.vtable.takeOwnedChunks(self.ptr);
+    }
+
+    /// Sample the string output columns whose `widths` entry is null. See
+    /// `VTable.sampleWidths`.
+    pub fn sampleWidths(self: Query, widths: []?u32) !void {
+        return self.vtable.sampleWidths(self.ptr, widths);
     }
 
     // ----- Combinators -----
@@ -927,6 +941,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.takeOwnedChunks();
         }
+        fn sampleWidthsWrap(ptr: *anyopaque, widths: []?u32) anyerror!void {
+            if (!@hasDecl(Op, "sampleWidths")) return;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.sampleWidths(widths);
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -948,6 +967,7 @@ fn OpWrapper(comptime Op: type) type {
             .setEmitProjection = setEmitProjectionWrap,
             .stableData = stableDataWrap,
             .takeOwnedChunks = takeOwnedChunksWrap,
+            .sampleWidths = sampleWidthsWrap,
         };
     };
 }

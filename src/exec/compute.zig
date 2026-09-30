@@ -732,6 +732,34 @@ pub const Compute = struct {
         return up;
     }
 
+    /// `VTable.sampleWidths` for the upstream columns this Compute passes
+    /// through and a rename's source; a computed value has no sample.
+    pub fn sampleWidths(self: *Compute, widths: []?u32) !void {
+        const in_width = self.in_width;
+        if (self.chain != null or widths.len != self.output_schema.len or self.upstream.outputSchema().len != in_width) return;
+        const up = try self.allocator.alloc(?u32, in_width);
+        defer self.allocator.free(up);
+        const passed = try self.allocator.alloc(bool, in_width);
+        defer self.allocator.free(passed);
+        @memset(passed, true);
+        for (self.derived_output_indices) |out_idx| {
+            if (out_idx < in_width) passed[out_idx] = false;
+        }
+        for (up, widths[0..in_width], passed) |*u, w, p| u.* = if (p) w else null;
+        try self.upstream.sampleWidths(up);
+        for (widths[0..in_width], up, passed) |*w, u, p| {
+            if (p and w.* == null) w.* = u;
+        }
+        for (self.derived, self.derived_output_indices) |d, out_idx| {
+            switch (d.kind) {
+                .rename => |rn| if (widths[out_idx] == null) {
+                    widths[out_idx] = up[rn.src_idx];
+                },
+                else => {},
+            }
+        }
+    }
+
     pub fn accountant(self: *Compute) ?*exec.memory.MemoryAccountant {
         return self.upstream.accountant();
     }

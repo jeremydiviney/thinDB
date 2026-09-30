@@ -25,10 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Cache Zig ${{ env.ZIG_VERSION }} download
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}.tar.xz
+          key: zig-download-x86_64-linux-${{ env.ZIG_VERSION }}
+
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+        run: bash .github/scripts/install-zig.sh x86_64-linux
 
       - name: zig fmt --check
         run: zig fmt --check src tests bench build.zig scripts
@@ -46,12 +50,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Cache Zig ${{ env.ZIG_VERSION }} download
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-x86_64-windows-${{ env.ZIG_VERSION }}.zip
+          key: zig-download-x86_64-windows-${{ env.ZIG_VERSION }}
+
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        shell: pwsh
-        run: |
-          curl.exe -fL "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip" -o "$env:RUNNER_TEMP\zig.zip"
-          Expand-Archive "$env:RUNNER_TEMP\zig.zip" -DestinationPath "$env:RUNNER_TEMP"
-          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\zig-x86_64-windows-$env:ZIG_VERSION"
+        shell: bash
+        run: bash .github/scripts/install-zig.sh x86_64-windows
 
       - name: Cache zig build cache
         uses: actions/cache@v6
@@ -87,10 +94,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Cache Zig ${{ env.ZIG_VERSION }} download
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-${{ matrix.zig_arch_os }}-${{ env.ZIG_VERSION }}.tar.xz
+          key: zig-download-${{ matrix.zig_arch_os }}-${{ env.ZIG_VERSION }}
+
       - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          curl -fL "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_arch_os }}-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-${{ matrix.zig_arch_os }}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+        run: bash .github/scripts/install-zig.sh ${{ matrix.zig_arch_os }}
 
       - name: Cache zig build cache
         uses: actions/cache@v6

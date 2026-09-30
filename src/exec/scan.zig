@@ -1557,6 +1557,16 @@ pub const Scan = struct {
         };
     }
 
+    /// `VTable.sampleWidths`: each string column this scan reads, sampled
+    /// from the segments it scans.
+    pub fn sampleWidths(self: *Scan, widths: []?u32) !void {
+        const n = @min(self.out_phys.len, widths.len);
+        for (self.out_phys[0..n], widths[0..n]) |phys, *w| {
+            if (w.* != null or !self.table.schema.columns[phys].type.isString()) continue;
+            w.* = try self.table.sampledStringWidth(self.allocator, self.segs, phys);
+        }
+    }
+
     fn scanIsGloballySorted(self: *Scan, segs: []const storage.ManifestEntry) bool {
         if (segs.len <= 1) return true;
         if (self.table.schema.order_key.len == 0) return false;

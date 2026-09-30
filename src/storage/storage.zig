@@ -991,6 +991,81 @@ test "dict block stores a lexicographically sorted dictionary" {
     }
 }
 
+test "stringBlockBytes counts the string bytes raw, dict and FSST blocks decode to" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "num", .type = .string, .nullable = true },
+            .{ .name = "tag", .type = .string, .nullable = true },
+            .{ .name = "url", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+        .compression = .lz4_fsst,
+    };
+    try schema.validate();
+
+    // `num` is short and distinct (raw), `tag` low-card (dict) and `url`
+    // long and distinct (FSST). A NULL `tag` row keeps a value the dict
+    // codes as 0, so counting it would add that value's bytes.
+    const n: usize = 2003;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const palette = [_][]const u8{ "red", "green", "blue", "magenta" };
+    var ids: [n]i64 = undefined;
+    var num_vals: [n][]const u8 = undefined;
+    var tag_vals: [n][]const u8 = undefined;
+    var url_vals: [n][]const u8 = undefined;
+    var bm: [column.bitmapBytes(n)]u8 = .{0} ** column.bitmapBytes(n);
+    var tag_bytes: u64 = 0;
+    for (0..n) |i| {
+        const valid = i % 5 != 0;
+        column.setValidBit(&bm, i, valid);
+        ids[i] = @intCast(i);
+        num_vals[i] = if (valid) try std.fmt.allocPrint(arena.allocator(), "{d}", .{i}) else "";
+        tag_vals[i] = palette[i % palette.len];
+        if (valid) tag_bytes += tag_vals[i].len;
+        url_vals[i] = try std.fmt.allocPrint(arena.allocator(), "https://example.com/products/category-{d}/item?id={d}&ref=search", .{ i % 13, i });
+    }
+    var num = try buildStringCol(allocator, &num_vals);
+    defer num.deinit(allocator);
+    var tag = try buildStringCol(allocator, &tag_vals);
+    defer tag.deinit(allocator);
+    var url = try buildStringCol(allocator, &url_vals);
+    defer url.deinit(allocator);
+    const columns = [_]ColumnView{ .{ .data = .{ .bigint = &ids } }, num.view(&bm), tag.view(&bm), url.view(null) };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "widths.dat", schema, 13, 0, n, &columns, &.{}, false, 1);
+    defer info.deinit(allocator);
+    var seg = try readSegment(allocator, io, tmp.dir, "widths.dat", schema);
+    defer seg.deinit();
+    try std.testing.expectEqual(format.Encoding.raw, try blockEncodingOf(allocator, &seg, 0, 1));
+    try std.testing.expectEqual(format.Encoding.dict, try blockEncodingOf(allocator, &seg, 0, 2));
+    try std.testing.expectEqual(format.Encoding.fsst, try blockEncodingOf(allocator, &seg, 0, 3));
+
+    var c = cache.Cache.init(allocator, 1 << 24);
+    defer c.deinit();
+    const tc = cache.TableCache{ .cache = &c, .table_uid = 0 };
+
+    // A raw block answers from its header and leaves the cache cold.
+    try std.testing.expectEqual(@as(u64, num.offsets[n]), try seg.stringBlockBytes(allocator, 0, 1, true, tc));
+    if (c.acquire(.{ .segment_id = 13, .row_group_idx = 0, .column_idx = 1 })) |e| {
+        c.release(e);
+        return error.TestUnexpectedResult;
+    }
+    var warm = try seg.borrowColumnBlock(allocator, 0, 1, tc);
+    warm.release(allocator, tc);
+    try std.testing.expectEqual(@as(u64, num.offsets[n]), try seg.stringBlockBytes(allocator, 0, 1, true, tc));
+
+    try std.testing.expectEqual(tag_bytes, try seg.stringBlockBytes(allocator, 0, 2, true, tc));
+    try std.testing.expectEqual(@as(u64, url.offsets[n]), try seg.stringBlockBytes(allocator, 0, 3, false, tc));
+}
+
 test {
     _ = column;
     _ = format;

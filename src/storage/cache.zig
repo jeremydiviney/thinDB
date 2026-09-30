@@ -576,6 +576,10 @@ pub const SegmentHandles = struct {
         tombs_loaded: bool = false,
         pins: u32 = 0,
         retired: bool = false,
+        /// Per column, the string bytes each row group's block decodes to,
+        /// kept as the GROUP BY router samples them (`rowGroupStringBytes`).
+        /// A column's list is allocated on its first sample.
+        string_bytes: [][]?u64 = &.{},
     };
 
     map: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
@@ -688,9 +692,56 @@ pub const SegmentHandles = struct {
         self.map.deinit(allocator);
     }
 
+    /// The string bytes row group `rg_idx`'s block of string column
+    /// `column_idx` decodes to (`ReadSegment.stringBlockBytes`), read on the
+    /// first ask and kept on the entry for every later one. Both indexes
+    /// must be in the segment's footer. `gpa` must be the table-lifetime
+    /// allocator that frees the entry; `scratch` holds only a block read on
+    /// a cache miss.
+    pub fn rowGroupStringBytes(
+        self: *SegmentHandles,
+        gpa: Allocator,
+        scratch: Allocator,
+        entry: *Entry,
+        rg_idx: usize,
+        column_idx: usize,
+        nullable: bool,
+        c: TableCache,
+    ) !u64 {
+        {
+            self.lockSpin();
+            defer self.lock.unlock();
+            if (column_idx < entry.string_bytes.len and entry.string_bytes[column_idx].len > 0) {
+                if (entry.string_bytes[column_idx][rg_idx]) |bytes| return bytes;
+            }
+        }
+        // Read outside the lock: planners racing on a cold row group both
+        // read it and keep the same count.
+        const bytes = try entry.seg.stringBlockBytes(scratch, rg_idx, column_idx, nullable, c);
+        const row_groups = entry.seg.info.row_groups;
+        self.lockSpin();
+        defer self.lock.unlock();
+        if (entry.string_bytes.len == 0) {
+            const columns = try gpa.alloc([]?u64, row_groups[rg_idx].col_offsets.len);
+            @memset(columns, &.{});
+            entry.string_bytes = columns;
+        }
+        if (entry.string_bytes[column_idx].len == 0) {
+            const per_row_group = try gpa.alloc(?u64, row_groups.len);
+            @memset(per_row_group, null);
+            entry.string_bytes[column_idx] = per_row_group;
+        }
+        entry.string_bytes[column_idx][rg_idx] = bytes;
+        return bytes;
+    }
+
     fn destroyEntry(allocator: Allocator, e: *Entry) void {
         e.seg.deinit();
         if (e.tombs) |t| allocator.free(t);
+        for (e.string_bytes) |per_row_group| {
+            if (per_row_group.len > 0) allocator.free(per_row_group);
+        }
+        if (e.string_bytes.len > 0) allocator.free(e.string_bytes);
         allocator.destroy(e);
     }
 };
