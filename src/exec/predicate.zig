@@ -366,6 +366,9 @@ pub const CorrelatedScalar = struct {
     value_type: types.Type,
     /// Types of the inner correlation key columns, parallel to `outer_keys`.
     key_types: []const types.Type,
+    /// The aggregate over no rows, which an outer row whose key matched
+    /// none compares with (COUNT's 0); null where that aggregate is NULL.
+    missing: ?Value = null,
 };
 
 pub const CorrelatedRangeGroup = struct {
@@ -527,6 +530,7 @@ pub fn deepClonePredicateRenamed(out_arena: std.mem.Allocator, p: PredicateExpr,
                 .rows = rows,
                 .value_type = s.value_type,
                 .key_types = try out_arena.dupe(types.Type, s.key_types),
+                .missing = if (s.missing) |m| try cloneValue(out_arena, m) else null,
             } };
         },
         .correlated_range => |s| blk: {
@@ -1607,7 +1611,8 @@ pub fn evaluateExprGuided(
 }
 
 /// Per-row: build key from outer_keys, look up matching CorrelatedScalarRow,
-/// then compare outer_compared op row.value. Missing key → row fails.
+/// then compare outer_compared op row.value. A key that matched no row, NULL
+/// included, compares with `missing`, and fails without one.
 pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column, batch: anytype, out: []bool) !void {
     const n_keys = s.outer_keys.len;
     var key_idx_buf: [16]usize = undefined;
@@ -1634,14 +1639,10 @@ pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column,
                 break;
             }
         }
-        if (any_null) {
-            out[i] = false;
-            continue;
-        }
 
         // Linear-scan rows for matching key.
         var found_value: ?Value = null;
-        for (s.rows) |row| {
+        if (!any_null) for (s.rows) |row| {
             var all_match = true;
             for (key_idxs, row.key) |idx, ref_val| {
                 if (!cellMatchesValue(batch.values[idx], i, ref_val)) {
@@ -1653,8 +1654,8 @@ pub fn evaluateCorrelatedScalarMask(s: CorrelatedScalar, schema: []const Column,
                 found_value = row.value;
                 break;
             }
-        }
-        if (found_value) |v| {
+        };
+        if (found_value orelse s.missing) |v| {
             out[i] = orderMatches(scalarOrder(cellScalar(cmp_view, cmp_type, i), valueScalar(v, decimalScale(s.value_type))), s.op);
         } else {
             out[i] = false;

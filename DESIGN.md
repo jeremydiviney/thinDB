@@ -990,8 +990,8 @@ outer side may be an expression over the outer row (`y.id = x.k + 10`),
 which the enclosing operator computes first. EXISTS, IN and a single
 aggregate compared in a WHERE become a lookup each outer row probes with its
 own values; any other scalar is grouped by its keys and LEFT JOINed back.
-This is the only strategy for a DELETE or UPDATE predicate and a join's ON,
-which have no input rows to join a result back to.
+A DELETE or UPDATE predicate and a join's ON take it first too; the rest of
+theirs is below.
 
 Domain. Any other correlated subquery in a filter or an expression is lifted
 onto its domain: the distinct combinations of the enclosing values it reads,
@@ -1001,8 +1001,10 @@ the domain. A WHERE conjunct comparing a FROM column with a domain value by
 other correlated term (under OR, reading both rows, `<>`) filters the joined
 pairs. Each GROUP BY and window partition also groups by the domain values,
 and a LIMIT keeps its rows per domain row, numbered in the ORDER BY under
-it. The result, keyed by the domain values, is LEFT JOINed back to the
-enclosing operator's rows:
+it. An aggregate without GROUP BY below the top of the block still yields a
+row for every domain row, over no rows where none reached it. The result,
+keyed by the domain values, is LEFT JOINed back to the enclosing operator's
+rows:
 
 - EXISTS and IN read whether a marker row matched. IN compares its columns
   with `=`.
@@ -1016,6 +1018,39 @@ and matches no inner row; the join back matches NULL to NULL, so its outer
 row still finds its domain row (a count of 0, a NULL scalar). NOT IN keeps
 thinDB's IN-set dialect on every path: NULLs among the subquery's values are
 skipped, and a NULL compared value never passes.
+
+A FROM that itself reads enclosing values, as a LATERAL derived table would,
+is lifted in place rather than joined. A relation that reads them carries the
+domain values through its own operators, its WHERE staying an ordinary
+filter over the domain rows it joined; a join between two such relations
+matches on them too, and a relation that reads none is crossed with the
+domain. A FULL JOIN with a side that reads them isn't lifted: its unmatched
+rows would need every domain row. A UNION inside the subquery lifts each
+arm the same way, an arm that reads nothing enclosing crossed with the
+domain so every domain row sees its rows. A `SELECT *` in a lifted block is
+first spelled out from the columns its relations carry; a star it can't
+spell out, such as one over a join whose columns share names, isn't lifted.
+
+An aggregate in a subquery whose arguments read only enclosing columns
+(`SUM(x.v)`) belongs to the enclosing query, as SQL scopes it. Before either
+strategy runs it moves there: into the enclosing GROUP BY, or a new global
+aggregate when the enclosing SELECT has none, and the subquery reads it as an
+enclosing value, keyed or lifted like any other. An expression over such
+aggregates and the subquery's own (`SUM(x.v) + COUNT(*)`) reads the
+subquery's one aggregate row, joined to every outer row. Nested in another
+aggregate, or beside an ungrouped outer column, it has no query to aggregate
+in, and the statement fails as it does in SQL.
+
+A DELETE or UPDATE whose predicate no keyed path takes lifts it over the
+target's own rows, as a SELECT whose domain is drawn from them, and writes
+the rows that SELECT keeps, found again by the target's primary key, as the
+multi-table form does. A target without a primary key has no sound row
+identity to find them by, so the statement raises
+`UnsupportedCorrelatedSubquery`. An outer join whose ON no keyed path takes
+numbers each input's rows once in a buffer. The pairs its keys and ranges
+match are the domain for the condition and the values it computes; the pairs
+the condition keeps, as number pairs, are what the outer join then matches
+on, so a row with no kept pair is still NULL-extended.
 
 The enclosing operator's conjuncts that read no subquery narrow the domain's
 source first. A source cheap and deterministic to run again (a base-table
@@ -1034,6 +1069,10 @@ KILL and a disconnect stop it promptly (§8.3).
 
 A shape neither strategy carries raises `UnsupportedCorrelatedSubquery`
 (§9.8); it is never compiled with an outer name bound to an inner column.
+Besides the ones above, a lifted scalar that returns an enclosing column
+as-is does, as does one returning an expression named by text that opens
+with the enclosing qualifier (`SELECT x.k + z.id`, whose name reads as a
+column of `x`).
 
 ---
 
@@ -1363,7 +1402,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
-`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): an enclosing column in the subquery's FROM (a derived table that reads it, as LATERAL would), an aggregate whose argument reads only enclosing columns (`SUM(x.v)` inside the subquery, which SQL aggregates in the enclosing query), a UNION inside the subquery that reads them, or, in a DELETE or UPDATE predicate or a join's ON, a correlation other than equalities and ranges on the subquery's own columns. A subquery correlated some other way also can't use `SELECT *`, or be an IN over an aggregate without GROUP BY. A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
+`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), a lifted scalar that returns an enclosing column as-is or an expression named by text that opens with the enclosing qualifier, an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 
