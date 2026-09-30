@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 
 const common = @import("scalar_fn_common.zig");
 const datefmt = @import("scalar_fn_datefmt.zig");
+const time_zone = @import("time_zone.zig");
 const ColumnView = common.ColumnView;
 const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
@@ -319,52 +320,37 @@ pub fn periodDiffKernel(allocator: Allocator, args: []const ColumnView, out: *Co
     }
 }
 
-/// A CONVERT_TZ zone as seconds east of UTC: an offset `+HH:MM` from -13:59
-/// to +14:00, `SYSTEM` (thinDB's clock runs in UTC) or `UTC`. Other named
-/// zones need MySQL's time zone tables, which thinDB doesn't carry: null,
-/// as in a MySQL without them.
-fn zoneOffsetSeconds(zone: []const u8) ?i64 {
-    if (std.ascii.eqlIgnoreCase(zone, "SYSTEM") or std.ascii.eqlIgnoreCase(zone, "UTC")) return 0;
-    if (zone.len < 4 or (zone[0] != '+' and zone[0] != '-')) return null;
-    var pos: usize = 1;
-    var hours: i64 = 0;
-    while (pos < zone.len and std.ascii.isDigit(zone[pos]) and hours < 100) : (pos += 1) hours = hours * 10 + (zone[pos] - '0');
-    if (pos + 1 >= zone.len or zone[pos] != ':') return null;
-    pos += 1;
-    var minutes: i64 = 0;
-    while (pos < zone.len and std.ascii.isDigit(zone[pos]) and minutes < 100) : (pos += 1) minutes = minutes * 10 + (zone[pos] - '0');
-    if (pos != zone.len or minutes > 59) return null;
-    const offset = (hours * 60 + minutes) * (if (zone[0] == '-') @as(i64, -60) else 60);
-    if (offset < -(13 * 3600 + 59 * 60) or offset > 14 * 3600) return null;
-    return offset;
-}
-
 /// 3001-01-18 23:59:59 UTC, the last second MySQL converts between zones.
 const MAX_ZONED_SECONDS: i64 = 32_536_771_199;
 
-/// CONVERT_TZ(dt, from, to). A value whose UTC instant is outside what
-/// MySQL converts (1970-01-01 00:00:01 to 3001-01-18 23:59:59) comes back
+/// CONVERT_TZ(dt, from, to), each zone as `time_zone.resolve` reads it; a
+/// zone thinDB doesn't know gives NULL, as in StarRocks and in a MySQL
+/// without time zone tables. A value whose UTC instant is outside what MySQL
+/// converts (1970-01-01 00:00:01 to 3001-01-18 23:59:59) comes back
 /// unchanged, as in MySQL.
 pub fn convertTzKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();
     const dts = args[0].data.datetime;
     const from = stringViewOf(args[1]);
     const to = stringViewOf(args[2]);
+    var from_memo: time_zone.Memo = .{};
+    var to_memo: time_zone.Memo = .{};
     for (0..row_count) |i| {
         const valid = args[0].isValid(i) and args[1].isValid(i) and args[2].isValid(i);
-        const from_offset = if (valid) zoneOffsetSeconds(from.rowBytes(i)) else null;
-        const to_offset = if (valid) zoneOffsetSeconds(to.rowBytes(i)) else null;
-        const converted: ?i64 = if (from_offset != null and to_offset != null) convertZone(dts[i], from_offset.?, to_offset.?) else null;
+        const from_zone = if (valid) try from_memo.zoneOf(from.rowBytes(i)) else null;
+        const to_zone = if (valid) try to_memo.zoneOf(to.rowBytes(i)) else null;
+        const converted: ?i64 = if (from_zone != null and to_zone != null) convertZone(dts[i], from_zone.?, to_zone.?) else null;
         try out.data.datetime.append(allocator, converted orelse 0);
         try out.appendValidBit(allocator, base + i, converted != null);
     }
 }
 
-fn convertZone(local: i64, from_offset: i64, to_offset: i64) i64 {
-    const utc = local -| from_offset * std.time.us_per_s;
-    const utc_seconds = @divFloor(utc, std.time.us_per_s);
+fn convertZone(local: i64, from: time_zone.Zone, to: time_zone.Zone) i64 {
+    const local_seconds = @divFloor(local, std.time.us_per_s);
+    const fraction = local - local_seconds * std.time.us_per_s;
+    const utc_seconds = from.localToUtc(local_seconds);
     if (utc_seconds < 1 or utc_seconds > MAX_ZONED_SECONDS) return local;
-    return utc + to_offset * std.time.us_per_s;
+    return (utc_seconds + to.offsetAt(utc_seconds)) * std.time.us_per_s + fraction;
 }
 
 /// A DATE moved by `n_months`, its day clamped to the destination month's
@@ -427,6 +413,32 @@ pub fn fromUnixtimeFormatKernel(allocator: Allocator, args: []const ColumnView, 
         const fmt = if (args[1].isValid(i)) formats.rowBytes(i) else null;
         try appendFormatted(allocator, out, &buf, base + i, unixMomentAt(args[0], i), fmt);
     }
+}
+
+/// FROM_UNIXTIME(n, format, zone): that moment's local time in `zone`
+/// (`time_zone.resolve`), as DATE_FORMAT renders it. As in StarRocks, a
+/// zone thinDB doesn't know renders as UTC and an empty one is NULL. A local
+/// time past 9999-12-31 23:59:59 is NULL, like a count past it.
+pub fn fromUnixtimeZoneKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    const formats = stringViewOf(args[1]);
+    const zones = stringViewOf(args[2]);
+    var memo: time_zone.Memo = .{};
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        const fmt = if (args[1].isValid(i)) formats.rowBytes(i) else null;
+        const zone_text = if (args[2].isValid(i)) zones.rowBytes(i) else "";
+        const moment = if (zone_text.len > 0) unixMomentAt(args[0], i) else null;
+        const local = if (moment) |m| try localMoment(&memo, zone_text, m) else null;
+        try appendFormatted(allocator, out, &buf, base + i, local, fmt);
+    }
+}
+
+fn localMoment(memo: *time_zone.Memo, zone_text: []const u8, utc_micros: i64) !?i64 {
+    const zone = (try memo.zoneOf(zone_text)) orelse time_zone.Zone.utc;
+    const local = utc_micros + zone.offsetAt(@divFloor(utc_micros, std.time.us_per_s)) * std.time.us_per_s;
+    return if (local > common.LAST_DATETIME_MICROS) null else local;
 }
 
 /// CAST(datetime AS date) — drop the time-of-day (floor to the day).
@@ -1250,7 +1262,7 @@ test "date arithmetic that leaves years 0-9999 is null, whatever its count" {
     inline for (datetimes) |c| try std.testing.expectEqual(@as(?i64, c[3]), addUnitToDatetime(c[0], c[1], c[2]));
 }
 
-test "periods, day numbers and zone offsets follow MySQL, and year 0 StarRocks" {
+test "periods and day numbers follow MySQL, and year 0 StarRocks" {
     const t = std.testing;
     // Every expected value is MySQL 8.4's, except day numbers before
     // 0000-03-01, which are StarRocks'.
@@ -1263,8 +1275,4 @@ test "periods, day numbers and zone offsets follow MySQL, and year 0 StarRocks" 
         try t.expectEqual(@as(?i64, c[3]), dayNumber(common.ymdToDays(c[0], c[1], c[2])));
     }
     try t.expectEqual(@as(?i64, null), dayNumber(common.ymdToDays(-1, 12, 31)));
-    inline for (.{ .{ "+14:00", 50_400 }, .{ "-13:59", -50_340 }, .{ "+5:30", 19_800 }, .{ "+05:3", 18_180 }, .{ "utc", 0 } }) |c| {
-        try t.expectEqual(@as(?i64, c[1]), zoneOffsetSeconds(c[0]));
-    }
-    inline for (.{ "+14:01", "-14:00", "+0530", "+05:60", "+1:00x", "Europe/Paris" }) |z| try t.expectEqual(@as(?i64, null), zoneOffsetSeconds(z));
 }

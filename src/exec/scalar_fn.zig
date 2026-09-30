@@ -1466,6 +1466,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeKernel },
     .{ .name = "from_unixtime", .arg_types = &.{ .bigint, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeFormatKernel },
+    .{ .name = "from_unixtime", .arg_types = &.{ .bigint, .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeZoneKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .date, .date }, .return_type = .bigint, .kernel = date.dateDiffDateKernel },
     .{ .name = "date_diff", .arg_types = &.{ .string, .datetime, .datetime }, .return_type = .bigint, .kernel = date.dateDiffDatetimeKernel },

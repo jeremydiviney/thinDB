@@ -1267,6 +1267,7 @@ test {
     _ = @import("scalar_fn_test.zig");
     _ = @import("scalar_fn_json.zig");
     _ = @import("scalar_fn_date.zig");
+    _ = @import("time_zone.zig");
     _ = @import("scalar_fn_time.zig");
     _ = @import("scalar_fn_inet.zig");
     _ = @import("json_binary.zig");
