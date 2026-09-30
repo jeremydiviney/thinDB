@@ -200,7 +200,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         try p.advance();
         try p.expect(.lparen);
         if (!p.startsQuery(p.cur.tag)) return PE.SqlExpectedSelect;
-        const source = try p.parseStatement();
+        const source = try p.parseExpressionSubquery();
         try p.expect(.rparen);
         return .{ .exists_subquery = @ptrCast(source) };
     }
@@ -694,7 +694,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         try p.advance();
         try p.expect(.lparen);
         if (p.startsQuery(p.cur.tag)) {
-            const source = try p.parseStatement();
+            const source = try p.parseExpressionSubquery();
             try p.expect(.rparen);
             return .{ .in_subquery = .{
                 .col = col_dup,
@@ -775,7 +775,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .lparen) {
         try p.advance();
         if (p.startsQuery(p.cur.tag)) {
-            const source = try p.parseStatement();
+            const source = try p.parseExpressionSubquery();
             try p.expect(.rparen);
             // `col > (SELECT ...) - 1`: the subquery is one operand of a
             // longer expression, compared like any other.
@@ -983,7 +983,7 @@ fn parseRowValuePredicate(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     try p.advance();
     try p.expect(.lparen);
     if (p.startsQuery(p.cur.tag)) {
-        const source = try p.parseStatement();
+        const source = try p.parseExpressionSubquery();
         try p.expect(.rparen);
         const cols = try p.arena.alloc([]const u8, lhs.len);
         for (lhs, cols) |element, *col| col.* = switch (element) {
