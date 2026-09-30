@@ -11,9 +11,12 @@
 //!
 //! Query ownership can retire before asynchronous frees finish. The ledger and
 //! its allocator wrappers survive until the final tracked allocation is freed.
+//! A free whose charge must end when the owner lets go, while the memory goes
+//! back in the background, collects its blocks in `DeferredFrees`.
 
 const std = @import("std");
 pub const BudgetAllocator = @import("util/budget_allocator.zig").BudgetAllocator;
+pub const DeferredFrees = @import("util/budget_allocator.zig").DeferredFrees;
 const affinity = @import("util/affinity.zig");
 const buffer_pool = @import("util/buffer_pool.zig");
 const huge_page = @import("util/huge_page.zig");
@@ -607,6 +610,38 @@ test "memory: retiring an owner keeps its allocator alive through the last free"
     try std.testing.expectEqual(@as(usize, 400), pool.inUse());
     alloc.free(bytes);
     try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+}
+
+test "memory: collected frees stop counting at once and return their memory on release" {
+    const a = std.testing.allocator;
+    var pool = MemoryPool.init(1 << 20);
+    const account = try a.create(MemoryAccountant);
+    account.* = MemoryAccountant.initWithPool(1 << 20, &pool);
+    account.trackAllocations(a);
+    defer account.releaseOwner(a);
+    const alloc = try account.executionAllocator();
+    const tiny = try alloc.alloc(u8, 8);
+    const large = try alloc.alloc(u64, 1000);
+    const elsewhere = try alloc.alloc(u64, 1000);
+    const Other = struct {
+        fn free(allocator: std.mem.Allocator, bytes: []u64) void {
+            allocator.free(bytes);
+        }
+    };
+
+    var frees: DeferredFrees = .{};
+    frees.collect();
+    const other = try std.Thread.spawn(.{}, Other.free, .{ alloc, elsewhere });
+    other.join();
+    alloc.free(tiny);
+    try std.testing.expect(frees.isEmpty());
+    alloc.free(large);
+    frees.stop();
+    try std.testing.expect(!frees.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), account.current_bytes);
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+    const background = try std.Thread.spawn(.{}, DeferredFrees.release, .{frees});
+    background.join();
 }
 
 test "memory: worker allocator charges the query once, even over an already-tracked fallback" {
