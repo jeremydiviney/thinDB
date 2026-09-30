@@ -59,9 +59,9 @@ else
     start=$((RANDOM % count))
     mirrors=$(printf '%s\n' "$mirrors" | awk -v s="$start" '{ m[NR - 1] = $0 } END { for (i = 0; i < NR; i++) print m[(s + i) % NR] }')
   fi
+  # The next mirror is the retry: one slow mirror costs 30 s, not more.
   for mirror in $mirrors; do
-    fetch "$mirror/$file?source=github-thindb-ci" --retry 1 --retry-all-errors \
-      --speed-limit 500000 --speed-time 30 && break
+    fetch "$mirror/$file?source=github-thindb-ci" --speed-limit 500000 --speed-time 30 && break
   done
   if [ ! -f "$file" ] && ! fetch "https://ziglang.org/download/$ZIG_VERSION/$file" --retry 3 --retry-all-errors; then
     echo "::error::could not download $file from any mirror or from ziglang.org"
