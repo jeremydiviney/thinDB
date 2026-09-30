@@ -17,6 +17,7 @@ const types_mod = @import("../types.zig");
 const rowloc = @import("rowloc.zig");
 const json_binary = @import("json_binary.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
+const StringBank = @import("../util/string_bank.zig").StringBank;
 const build_options = @import("build_options");
 const udf_mod = @import("../udf.zig");
 const ColumnView = storage_mod.ColumnView;
@@ -1763,14 +1764,16 @@ const PipeBucket = struct {
     // Bump arena for the per-group UDAF state blobs (freed wholesale at
     // reset/teardown; `destroyUdfStates` runs the UDAFs' own `destroy` first).
     udf_arena: std.heap.ArenaAllocator,
-    // Bump arena for the running-MIN/MAX bytes. A per-improvement `dupe` from a
-    // shared allocator scatters each group's current value across the heap, so
-    // reading it back for the next row's compare is a main-memory miss — the
-    // dominant cost of string MIN over millions of groups. Allocating from a
-    // contiguous arena keeps those values L2/L3-resident and drops the
-    // per-improvement `free` (superseded values are arena garbage, reclaimed
-    // wholesale at reset/teardown).
+    // Bump arena for the running-MIN/MAX bytes and the GROUP_CONCAT cells. A
+    // per-improvement `dupe` from a shared allocator scatters each group's
+    // current value across the heap, so reading it back for the next row's
+    // compare is a main-memory miss — the dominant cost of string MIN over
+    // millions of groups. Allocating from a contiguous arena keeps those
+    // values L2/L3-resident.
     str_arena: std.heap.ArenaAllocator,
+    // The running MIN/MAX copies, in `str_arena`: an improvement reuses the
+    // block of the value it replaces, so the bytes stay bounded by the groups.
+    str_bank: StringBank = .{},
     // One combined membership set per COUNT(DISTINCT) field. Indexed by the
     // aggregate's distinct_state_index; only the first `layout.distinct_slot_count`
     // are touched. Each holds (gid,value) keys for this bucket's groups.
@@ -1791,7 +1794,7 @@ const PipeBucket = struct {
     }
 
     fn fold_rows(self: *PipeBucket, allocator: Allocator, scratch: *GroupScratch, rows: GroupRows, input_rows: u64) !void {
-        try groupChunkRowsDirect(&self.table, &self.states, &self.str_states, &self.concat_states, &self.udf_states, self.udf_arena.allocator(), &self.distinct_sets, scratch, allocator, self.str_arena.allocator(), rows, self.expected_groups, input_rows, self.observed_input_rows, if (PROFILING) &self.allocation_profile else null);
+        try groupChunkRowsDirect(&self.table, &self.states, &self.str_states, &self.concat_states, &self.udf_states, self.udf_arena.allocator(), &self.distinct_sets, scratch, allocator, self.str_arena.allocator(), &self.str_bank, rows, self.expected_groups, input_rows, self.observed_input_rows, if (PROFILING) &self.allocation_profile else null);
         self.row_count += rows.len();
         if (rows.layout.has_weight) {
             var represented_rows: u64 = 0;
@@ -1981,6 +1984,7 @@ const PipeBucket = struct {
 
     fn freeStrBytes(self: *PipeBucket) void {
         _ = self.str_arena.reset(.free_all);
+        self.str_bank.reset();
     }
 
     // Run each initialized UDAF state's `destroy` (releasing heap the state
@@ -2279,6 +2283,37 @@ fn string_recycle_failure_fixture(allocator: Allocator) !void {
 
 test "string pipeline memory: shared recycle cap includes slack and releases rejected buffers on failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, string_recycle_failure_fixture, .{});
+}
+
+test "string MIN keeps one copy per group however many rows improve it" {
+    const allocator = std.testing.allocator;
+    const layout = STRING_MEMORY_TEST_LAYOUT;
+    const groups = 38;
+    const n = 200_000;
+    const pad = "x" ** 48;
+    var buf: [64]u8 = undefined;
+    var rows: GroupRows = .{};
+    defer rows.deinit(allocator);
+    try rows.resize(allocator, layout, n);
+    // Descending values of wandering lengths: every row improves its group.
+    for (0..n) |i| try rows.str.append(allocator, 1, i, 0, try std.fmt.bufPrint(&buf, "{d:0>9}{s}", .{ n - i, pad[0 .. (i * 7) % 49] }));
+
+    var str_states: std.ArrayListUnmanaged(StrAccRow) = .empty;
+    defer str_states.deinit(allocator);
+    try str_states.appendNTimes(allocator, [_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS, groups);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var bank: StringBank = .{};
+    var warm_capacity: usize = 0;
+    for (0..n) |i| {
+        try foldGroupStr(&str_states, &bank, arena.allocator(), i % groups, layout.aggregates, rows, i);
+        if (i == n / 4) warm_capacity = arena.queryCapacity();
+    }
+    try std.testing.expectEqual(warm_capacity, arena.queryCapacity());
+    for (str_states.items, 0..) |acc_row, g| {
+        const last = n - 1 - (n - 1 + groups - g) % groups;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d:0>9}{s}", .{ n - last, pad[0 .. (last * 7) % 49] }), acc_row[0].bytes);
+    }
 }
 
 test "string pipeline memory: recycle allowance leaves room in query and shared budgets" {
@@ -4732,6 +4767,7 @@ fn groupChunkRowsDirect(
     scratch: *GroupScratch,
     allocator: Allocator,
     str_arena: Allocator,
+    str_bank: *StringBank,
     rows: GroupRows,
     expected_groups: usize,
     input_rows: u64,
@@ -4773,10 +4809,10 @@ fn groupChunkRowsDirect(
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
     }
 }
 
@@ -4794,10 +4830,10 @@ fn hasStringResults(layout: GroupRowsLayout) bool {
 }
 
 // Fold one row's string MIN/MAX values into group `gid`'s side accumulators.
-// New extremes are dup'd from `str_arena` (a contiguous bump arena); a superseded
-// value is left as arena garbage rather than freed, so the compare reads of the
-// current value stay cache-local. Called only when the layout has string aggs.
-fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Allocator, gid: usize, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
+// A new extreme is copied into `str_bank`, over the block of the value it
+// replaces when that fits, so the compare reads of the current value stay
+// cache-local. Called only when the layout has string aggs.
+fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_bank: *StringBank, str_arena: Allocator, gid: usize, aggregates: []const GroupAggregateSpec, rows: GroupRows, row_idx: usize) !void {
     const k = rows.layout.str_columns.len;
     for (aggregates) |agg| {
         if (!agg.is_string) continue;
@@ -4807,12 +4843,12 @@ fn foldGroupStr(str_states: *std.ArrayListUnmanaged(StrAccRow), str_arena: Alloc
         const b = rows.str.get(k, row_idx, agg.str_input_index);
         const acc = &str_states.items[gid][agg.str_state_index];
         if (!acc.present) {
-            acc.bytes = try str_arena.dupe(u8, b);
+            acc.bytes = try str_bank.replace(str_arena, "", b);
             acc.present = true;
         } else {
             const cmp = json_binary.columnOrder(agg.is_json, b, acc.bytes);
             const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
-            if (is_better) acc.bytes = try str_arena.dupe(u8, b);
+            if (is_better) acc.bytes = try str_bank.replace(str_arena, acc.bytes, b);
         }
     }
 }
@@ -5000,6 +5036,7 @@ fn groupChunkRowsDirectKeys(
     udf_states: *std.ArrayListUnmanaged(UdfStateRow),
     udf_arena: Allocator,
     str_arena: Allocator,
+    str_bank: *StringBank,
     distinct_sets: *DistinctSlots,
     gids_buf: *std.ArrayListUnmanaged(u32),
     allocator: Allocator,
@@ -5054,7 +5091,7 @@ fn groupChunkRowsDirectKeys(
         }
     }
     if (!kernelizable) {
-        return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
+        return groupChunkRowsDirectKeysProgram(key_width, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, gids_buf, allocator, keys, key_hi, n, aggregates, rows, rowrefs);
     }
 
     // Keep the small-state and mixed-aggregate loops independent of the
@@ -5121,7 +5158,7 @@ fn groupChunkRowsDirectKeys(
         }
         if (has_str_fold) {
             var rr = r;
-            while (rr < run_end) : (rr += 1) try foldGroupStr(str_states, str_arena, gid, aggregates, rows, rr);
+            while (rr < run_end) : (rr += 1) try foldGroupStr(str_states, str_bank, str_arena, gid, aggregates, rows, rr);
         }
         if (has_concat) {
             var rr = r;
@@ -5164,6 +5201,7 @@ fn groupChunkRowsDirectKeysProgram(
     udf_states: *std.ArrayListUnmanaged(UdfStateRow),
     udf_arena: Allocator,
     str_arena: Allocator,
+    str_bank: *StringBank,
     distinct_sets: *DistinctSlots,
     gids_buf: *std.ArrayListUnmanaged(u32),
     allocator: Allocator,
@@ -5203,7 +5241,7 @@ fn groupChunkRowsDirectKeysProgram(
         // vary within the run).
         if (have_prev and key == prev_key) {
             try updateGroupStateProgram(states.ref(prev_gid), aggregates, rows, r);
-            if (has_str_fold) try foldGroupStr(str_states, str_arena, prev_gid, aggregates, rows, r);
+            if (has_str_fold) try foldGroupStr(str_states, str_bank, str_arena, prev_gid, aggregates, rows, r);
             if (has_concat) try foldGroupConcat(concat_states, str_arena, prev_gid, aggregates, rows, r);
             if (has_udf) try foldGroupUdf(udf_states, udf_arena, prev_gid, aggregates, rows, r, n);
             if (has_distinct) gids[r] = prev_gid;
@@ -5216,7 +5254,7 @@ fn groupChunkRowsDirectKeysProgram(
             table.commit(probe.slot, key, new_gid);
             if (has_str) {
                 str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
-                if (has_str_fold) try foldGroupStr(str_states, str_arena, new_gid, aggregates, rows, r);
+                if (has_str_fold) try foldGroupStr(str_states, str_bank, str_arena, new_gid, aggregates, rows, r);
             }
             if (has_concat) {
                 concat_states.appendAssumeCapacity([_]ConcatCell{.empty} ** MAX_GROUP_CONCAT_SLOTS);
@@ -5234,7 +5272,7 @@ fn groupChunkRowsDirectKeysProgram(
             continue;
         }
         try updateGroupStateProgram(states.ref(probe.gid), aggregates, rows, r);
-        if (has_str_fold) try foldGroupStr(str_states, str_arena, probe.gid, aggregates, rows, r);
+        if (has_str_fold) try foldGroupStr(str_states, str_bank, str_arena, probe.gid, aggregates, rows, r);
         if (has_concat) try foldGroupConcat(concat_states, str_arena, probe.gid, aggregates, rows, r);
         if (has_udf) try foldGroupUdf(udf_states, udf_arena, probe.gid, aggregates, rows, r, n);
         if (has_distinct) gids[r] = probe.gid;

@@ -1824,6 +1824,24 @@ test "PartitionedAggregate hash cores aggregate the input a round at a time" {
     _ = try testHashCorePeak(a, &input, &group_cols, &mixed_aggs, 1 << 40, 1 << 20, all);
 }
 
+test "PartitionedAggregate hash cores keep one MAX_BY payload per group however many rows improve it" {
+    const a = testing.allocator;
+    const group_cols = [_][]const u8{"k"};
+    // `o` ascends, so every row improves its group's MAX_BY(j, o). A copy
+    // kept per improving row would add about 11 MB over the extra 1.2M rows.
+    const aggs = [_]AggSpec{mixed_aggs[5]};
+    var peaks: [2]usize = undefined;
+    inline for (.{ 24, 96 }, 0..) |full_batches, i| {
+        const sizes = [_]usize{16384} ** full_batches ++ [_]usize{4099};
+        var input = try MixedInput.init(a, &sizes);
+        defer input.deinit(a);
+        const want = try testSerialLines(a, &input, &group_cols, &aggs);
+        defer testFreeLines(a, want);
+        peaks[i] = try testHashCorePeak(a, &input, &group_cols, &aggs, 1 << 40, 1 << 20, want);
+    }
+    try testing.expect(peaks[1] < peaks[0] + (1 << 20));
+}
+
 test "PartitionedAggregate keeps buffering once the first round's keys look near-unique" {
     const a = testing.allocator;
     const sizes = [_]usize{16384} ** 16;
