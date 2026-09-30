@@ -7,6 +7,8 @@
 //! a per-row tuple lookup. The inner FROM may be a table, CTE, view or
 //! derived table, and a column reference binds in the innermost query
 //! whose FROM has it, as SQL scopes names.
+//! A subquery correlated any other way joins its domain, the distinct
+//! outer values it reads (DESIGN.md §6.7).
 
 const std = @import("std");
 const thindb = @import("thindb");
