@@ -3549,8 +3549,9 @@ test "sql: a budget in the old GROUP BY plan-flip gap completes with the plan th
         // Neither peak is a fixed number: by_cust's four partition tables
         // add up only while their workers overlap, and a stage's result
         // stays charged until a background thread frees it (issue #462).
-        // On 3 cores the roomy peak ran from 89 to 147 MiB and a budgeted
-        // one from 49 to 54 MiB (issue #446), so only the order is asserted.
+        // On 1 to 3 cores the roomy peak ran from 80 to 148 MiB and a
+        // budgeted one from 49 to 54 MiB (issue #446), so only the order is
+        // asserted.
         try std.testing.expect(roomy.peak > run.peak);
         try std.testing.expectEqual(roomy.lines.len, run.lines.len);
         for (roomy.lines, run.lines) |want, got| try std.testing.expectEqualStrings(want, got);
