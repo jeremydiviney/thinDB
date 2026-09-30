@@ -52,6 +52,9 @@ const output_batch_rows: usize = 1024;
 /// Candidate pairs per residual evaluation.
 const residual_chunk_pairs: usize = 2048;
 
+/// Pairs between cancellation checks while the loop emits nothing.
+const cancel_check_pairs: usize = 1 << 16;
+
 /// Schema-only upstream for the residual's Compute, which only ever
 /// evaluates caller-supplied pair batches.
 const PairSchema = struct {
@@ -214,6 +217,7 @@ pub const NestedLoopJoin = struct {
     // Loop cursors. Outer: left row. Inner: right row.
     left_cursor: u32 = 0,
     right_cursor: u32 = 0,
+    pairs_unchecked: usize = 0,
 
     // Outer join state.
     join_type: join_mod.JoinType,
@@ -543,6 +547,7 @@ pub const NestedLoopJoin = struct {
             // NULL outer key: under inner semantics we skip silently;
             // under LEFT/FULL we still preserve the row by emitting
             // null-extended (NULL never matches anyone).
+            try self.countPairs(1);
             if (self.left_key_indices.len > 0 and self.outerHasNullKey()) {
                 if (preserve_left) {
                     try self.emitLeftOnlyRow(self.left_cursor);
@@ -557,6 +562,7 @@ pub const NestedLoopJoin = struct {
             }
 
             while (self.right_cursor < self.right_rows) : (self.right_cursor += 1) {
+                try self.countPairs(1);
                 if (self.right_key_indices.len > 0 and self.innerHasNullKey()) continue;
                 if (!self.passesEquiKeys()) continue;
                 if (!self.passesAllRanges()) continue;
@@ -646,8 +652,18 @@ pub const NestedLoopJoin = struct {
             }
             try self.evaluateResidualPairs(rs);
             if (self.output_rows > 0) return try self.flushOutput();
+            try self.countPairs(@max(rs.pairs, 1));
         }
         return null;
+    }
+
+    /// A stretch of pairs that emits nothing never returns to `Query.next`,
+    /// which is where KILL and disconnects are noticed, so it checks here.
+    fn countPairs(self: *NestedLoopJoin, n: usize) !void {
+        self.pairs_unchecked += n;
+        if (self.pairs_unchecked < cancel_check_pairs) return;
+        self.pairs_unchecked = 0;
+        if (self.left.accountant()) |a| try a.checkCancelled();
     }
 
     fn evaluateResidualPairs(self: *NestedLoopJoin, rs: *ResidualState) !void {

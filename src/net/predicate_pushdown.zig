@@ -210,14 +210,12 @@ fn pushFilterIntoJoin(ctx: Ctx, op: *ir.Op) anyerror!void {
     if (to_left.items.len == 0 and to_right.items.len == 0) return; // nothing moved
 
     if (to_left.items.len > 0) {
-        const nf = try ctx.arena.create(ir.Op);
-        nf.* = .{ .filter = .{ .predicate = try combine(ctx.arena, to_left.items), .upstream = join_op.join.left } };
+        const nf = try filterOver(ctx, join_op.join.left, to_left.items);
         join_op.join.left = nf;
         try walk(ctx, nf); // cascade deeper if that side is itself a join
     }
     if (to_right.items.len > 0) {
-        const nf = try ctx.arena.create(ir.Op);
-        nf.* = .{ .filter = .{ .predicate = try combine(ctx.arena, to_right.items), .upstream = join_op.join.right } };
+        const nf = try filterOver(ctx, join_op.join.right, to_right.items);
         join_op.join.right = nf;
         try walk(ctx, nf);
     }
@@ -325,6 +323,17 @@ fn splitConjuncts(arena: Allocator, pred: PredicateExpr) ![]const PredicateExpr 
         .@"and" => |kids| kids,
         else => try arena.dupe(PredicateExpr, &[_]PredicateExpr{pred}),
     };
+}
+
+/// `conjuncts` over `input`, ANDed into the filter `input` already is: a
+/// scan block reads one filter over its source, not a stack of them.
+fn filterOver(ctx: Ctx, input: *ir.Op, conjuncts: []const PredicateExpr) !*ir.Op {
+    const nf = try ctx.arena.create(ir.Op);
+    nf.* = if (input.* == .filter) .{ .filter = .{
+        .predicate = try combine(ctx.arena, try std.mem.concat(ctx.arena, PredicateExpr, &.{ try splitConjuncts(ctx.arena, input.filter.predicate), conjuncts })),
+        .upstream = input.filter.upstream,
+    } } else .{ .filter = .{ .predicate = try combine(ctx.arena, conjuncts), .upstream = input } };
+    return nf;
 }
 
 fn combine(arena: Allocator, conjuncts: []const PredicateExpr) !PredicateExpr {
@@ -609,6 +618,31 @@ test "predicate pushdown: an AND splits per side, cross-side conjunct stays" {
     try testing.expectEqualStrings("l.a", op.filter.upstream.join.left.*.filter.predicate.is_not_null);
     try testing.expect(op.filter.upstream.join.right.* == .filter);
     try testing.expectEqualStrings("r.c", op.filter.upstream.join.right.*.filter.predicate.is_not_null);
+}
+
+test "predicate pushdown: a conjunct pushed onto a filtered side joins that filter" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left_cols = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var left = ir.Op{ .filter = .{ .predicate = .{ .is_not_null = "l.b" }, .upstream = &left_cols } };
+    var right = testSelect(&.{ "r.c", "r.d" }, &dummy);
+    var join = testJoin(.left, &left, &right);
+    const conjuncts = [_]PredicateExpr{ .{ .is_not_null = "l.a" }, .{ .is_null = "r.c" } };
+    var op = ir.Op{ .filter = .{ .predicate = .{ .@"and" = &conjuncts }, .upstream = &join } };
+
+    try pushJoinFilters(a, null, .{}, &op);
+
+    try testing.expect(op == .filter);
+    const pushed = op.filter.upstream.join.left.*;
+    try testing.expect(pushed == .filter);
+    try testing.expect(pushed.filter.upstream == &left_cols);
+    try testing.expectEqual(@as(usize, 2), pushed.filter.predicate.@"and".len);
+    try testing.expectEqualStrings("l.b", pushed.filter.predicate.@"and"[0].is_not_null);
+    try testing.expectEqualStrings("l.a", pushed.filter.predicate.@"and"[1].is_not_null);
+    try testing.expectEqualStrings("l.b", left.filter.predicate.is_not_null);
 }
 
 test "predicate pushdown: filter sinks through a compute onto the join side" {

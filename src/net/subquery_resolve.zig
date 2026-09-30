@@ -43,6 +43,7 @@ const time_fn = @import("../exec/scalar_fn_time.zig");
 const storage = @import("../storage/storage.zig");
 
 const ir = @import("../ir/ir.zig");
+const parser = @import("../sql/parser.zig");
 
 const local = @import("local.zig");
 const wire_format = @import("wire_format.zig");
@@ -74,13 +75,13 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value, null),
         .delete_op => |*d| {
             if (d.source) |s| try resolveSubqueriesInOp(ctx, s);
-            if (d.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred, null);
             for (d.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
+            if (d.predicate) |*pred| d.derived = try resolveWithOuterValues(ctx, pred, d.derived);
         },
         .update_op => |*u| {
             if (u.source) |s| try resolveSubqueriesInOp(ctx, s);
-            if (u.predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred, null);
             for (u.derived) |*x| try resolveSubqueriesInExpr(ctx, @constCast(&x.expr), null);
+            if (u.predicate) |*pred| u.derived = try resolveWithOuterValues(ctx, pred, u.derived);
             for (u.assignments) |*a| try resolveSubqueriesInExpr(ctx, @constCast(&a.value), null);
         },
         .limit => |l| try resolveSubqueriesInOp(ctx, @constCast(l.upstream)),
@@ -89,13 +90,14 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .order_by => |o| try resolveSubqueriesInOp(ctx, @constCast(o.upstream)),
         .group_by => |g| try resolveSubqueriesInOp(ctx, @constCast(g.upstream)),
         .compute => |c| {
-            var lowered: LoweredScalars = .{};
-            for (c.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), &lowered);
+            // The input resolves first: a domain reads it as it will run.
             try resolveSubqueriesInOp(ctx, @constCast(c.upstream));
+            var lowered: LoweredScalars = .{ .domain = .{ .input = c.upstream } };
+            for (c.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), &lowered);
             if (lowered.any()) {
                 const compute = try newOp(ctx, .{ .compute = .{
                     .derived = c.derived,
-                    .upstream = try joinLoweredScalars(ctx, @constCast(c.upstream), lowered),
+                    .upstream = try joinLoweredScalars(ctx, lowered.domain.?.operatorInput(), lowered),
                 } });
                 op.* = .{ .exclude = .{ .columns = lowered.hidden.items, .upstream = compute } };
             }
@@ -104,7 +106,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
             if (j.extra_predicate) |*pred| try resolveSubqueriesInPredicate(ctx, pred, null);
             if (j.residual) |*res| {
                 for (res.derived) |*d| try resolveSubqueriesInExpr(ctx, @constCast(&d.expr), null);
-                try resolveSubqueriesInPredicate(ctx, &res.predicate, null);
+                res.derived = try resolveWithOuterValues(ctx, &res.predicate, res.derived);
             }
             try resolveSubqueriesInOp(ctx, @constCast(j.left));
             try resolveSubqueriesInOp(ctx, @constCast(j.right));
@@ -687,6 +689,13 @@ const Scope = struct {
             for (columns) |c| if (types.columnNameEql(types.unqualifiedName(c), ref)) return true;
         }
         return false;
+    }
+
+    /// Whether `ref` names a column of a relation the block reads, not one
+    /// it computes.
+    fn bindsRelation(self: Scope, ref: []const u8) bool {
+        for (self.derived) |name| if (types.columnNameEql(name, ref)) return false;
+        return self.binds(ref);
     }
 };
 
@@ -1382,17 +1391,28 @@ fn rebuildBlock(ctx: *CompileCtx, block: *const CorrelatedBlock, columns: []cons
     return try newOp(ctx, .{ .select = .{ .columns = columns, .upstream = cur } });
 }
 
-/// Decorrelate an EXISTS (`in_subquery` null) or IN subquery whose WHERE ties its
-/// rows to the outer row. The rewritten subquery runs once; its rows, keyed
-/// by the inner side of each correlation (IN's compared columns first),
-/// become a set each outer row probes. A correlation operand computed from
-/// the outer row alone goes to `lowered`, for the operator reading `pred`
-/// to compute below itself. False when the subquery isn't correlated that
-/// way, leaving it to the uncorrelated paths.
+/// Decorrelate an EXISTS (`in_subquery` null) or IN subquery that reads the
+/// outer row. One whose WHERE ties its rows to the outer row by equalities
+/// and ranges is keyed on its own columns (`resolveKeyedBlock`); any other
+/// is lifted onto its domain when `lowered` has one. A correlation operand
+/// computed from the outer row alone goes to `lowered`, for the operator
+/// reading `pred` to compute below itself. False leaves the subquery to the
+/// uncorrelated paths.
 fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const anyopaque, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !bool {
     const top: *const ir.Op = @ptrCast(@alignCast(source));
     const in_width: ?usize = if (in_subquery) |s| 1 + s.rest_cols.len else null;
-    const block = (try analyzeBlockCorrelation(ctx, top, in_width)) orelse return false;
+    if (try analyzeBlockCorrelation(ctx, top, in_width)) |block| {
+        if (try resolveKeyedBlock(ctx, pred, &block, negate, in_subquery, lowered)) return true;
+    }
+    const l = lowered orelse return false;
+    return try resolveDomainBlock(ctx, pred, top, negate, in_subquery, l);
+}
+
+/// The subquery without its correlations runs once; its rows, keyed by the
+/// inner side of each correlation (IN's compared columns first), become a
+/// set each outer row probes. False when that rewrite still reads the outer
+/// row, as through a subquery nested in it.
+fn resolveKeyedBlock(ctx: *CompileCtx, pred: *PredicateExpr, block: *const CorrelatedBlock, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !bool {
     if (block.one_row) {
         pred.* = .{ .always = !negate };
         return true;
@@ -1404,6 +1424,12 @@ fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const
     const aa = try ctx.subqueryArena();
     const n_in = block.selected.len;
     const inner_keys = try std.mem.concat(aa, []const u8, &.{ block.selected, block.info.inner_cols.items });
+    const bounds = if (ranges.len > 0) rangeBounds(ranges) else null;
+    const range_col: []const []const u8 = if (bounds) |b| try aa.dupe([]const u8, &.{b.lower.inner_col}) else &.{};
+    const rewritten = try rebuildBlock(ctx, block, try std.mem.concat(aa, []const u8, &.{ range_col, inner_keys }));
+    if (try readsFree(ctx, rewritten)) return false;
+    try prepareSubplan(ctx, rewritten);
+
     const outer_keys = try aa.alloc([]const u8, inner_keys.len);
     if (in_subquery) |s| {
         outer_keys[0] = try aa.dupe(u8, s.col);
@@ -1411,9 +1437,10 @@ fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const
     }
     for (block.info.outer_cols.items, outer_keys[n_in..]) |c, *dst| dst.* = try aa.dupe(u8, c);
 
-    if (ranges.len == 0) {
-        const rewritten = try rebuildBlock(ctx, &block, inner_keys);
-        try prepareSubplan(ctx, rewritten);
+    if (bounds) |b| {
+        const probe = try correlatedRange(ctx, rewritten, b, outer_keys, negate);
+        pred.* = try nullGuarded(aa, outer_keys[0..n_in], negate, probe);
+    } else {
         var q = try local.compileSubplan(ctx, rewritten);
         defer q.deinit();
         pred.* = try inTupleSet(aa, .{
@@ -1422,16 +1449,7 @@ fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const
             .negate = negate,
             .inner_types = try columnTypes(aa, q.outputSchema()[0..inner_keys.len]),
         }, n_in);
-        if (lowered) |l| try l.computeOuterValues(ctx, &block.info);
-        return true;
     }
-    const bounds = rangeBounds(ranges);
-    const range_col = [_][]const u8{bounds.lower.inner_col};
-    const columns = try std.mem.concat(aa, []const u8, &.{ &range_col, inner_keys });
-    const rewritten = try rebuildBlock(ctx, &block, columns);
-    try prepareSubplan(ctx, rewritten);
-    const probe = try correlatedRange(ctx, rewritten, bounds, outer_keys, negate);
-    pred.* = try nullGuarded(aa, outer_keys[0..n_in], negate, probe);
     if (lowered) |l| try l.computeOuterValues(ctx, &block.info);
     return true;
 }
@@ -1585,6 +1603,8 @@ fn valueLessThan(_: void, a: Value, b: Value) bool {
 /// A scalar subquery that is one global aggregate over its WHERE and FROM,
 /// with its WHERE conjuncts sorted into correlations and kept predicates.
 const ScalarAggregate = struct {
+    /// The global aggregate.
+    group: *const ir.Op,
     aggs: []const ir.AggSpec,
     /// Aggregate arguments computed per inner row (`SUM(qty * price)`).
     pre: []const ir.Derived,
@@ -1592,7 +1612,9 @@ const ScalarAggregate = struct {
     post: []const ir.Derived,
     /// The one column the subquery projects: an aggregate or a `post` name.
     selected: []const u8,
-    info: CorrelationInfo,
+    /// Null when the WHERE ties to the outer row other than by equalities
+    /// and ranges on its own columns.
+    info: ?CorrelationInfo,
 };
 
 fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAggregate {
@@ -1634,8 +1656,7 @@ fn analyzeScalarAggregate(ctx: *CompileCtx, source: *const anyopaque) !?ScalarAg
         pre = below.compute.derived;
         below = below.compute.upstream;
     }
-    const info = (try analyzeWhere(ctx, below)) orelse return null;
-    return .{ .aggs = gb.aggs, .pre = pre, .post = post, .selected = selected.?, .info = info };
+    return .{ .group = cur, .aggs = gb.aggs, .pre = pre, .post = post, .selected = selected.?, .info = try analyzeWhere(ctx, below) };
 }
 
 /// A scalar subquery that reads one inner row per outer row: a column or
@@ -1648,7 +1669,8 @@ const ScalarLookup = struct {
     order: []const ir.SortSpec,
     limit: ?ir.Op.Limit,
     selected: []const u8,
-    info: CorrelationInfo,
+    /// As `ScalarAggregate.info`.
+    info: ?CorrelationInfo,
 };
 
 fn analyzeScalarLookup(ctx: *CompileCtx, source: *const anyopaque) !?ScalarLookup {
@@ -1688,13 +1710,12 @@ fn analyzeScalarLookup(ctx: *CompileCtx, source: *const anyopaque) !?ScalarLooku
         }
     }
     std.mem.reverse([]const ir.Derived, computes.items);
-    const info = (try analyzeWhere(ctx, cur)) orelse return null;
     return .{
         .computes = computes.items,
         .order = order orelse &.{},
         .limit = limit,
         .selected = selected orelse return null,
-        .info = info,
+        .info = try analyzeWhere(ctx, cur),
     };
 }
 
@@ -1732,6 +1753,9 @@ const LoweredScalars = struct {
     outer_values: std.ArrayList(ir.Derived) = .empty,
     /// Join-side and value columns, dropped once the operator has read them.
     hidden: std.ArrayList([]const u8) = .empty,
+    /// The operator's input, which domains read; null where the operator
+    /// has no input to join (a DML statement's or a join's own predicate).
+    domain: ?DomainSource = null,
 
     /// Whether the operator reads anything computed or joined below it.
     fn any(self: *const LoweredScalars) bool {
@@ -1764,21 +1788,27 @@ fn conjunction(ctx: *CompileCtx, preds: []const PredicateExpr) !PredicateExpr {
 }
 
 /// Lower a correlated scalar subquery into `lowered`, returning the column
-/// its value reads as; null leaves any other shape to the other paths.
+/// its value reads as; null leaves it to the uncorrelated path. One keyed by
+/// equalities on its own columns groups by them; any other is lifted onto
+/// its domain.
 fn lowerCorrelatedScalar(ctx: *CompileCtx, source: *const anyopaque, lowered: *LoweredScalars) !?[]const u8 {
     if (try analyzeScalarAggregate(ctx, source)) |shape| {
-        if (!equiCorrelated(&shape.info)) return null;
-        return try lowerScalarAggregate(ctx, shape, lowered);
+        if (equiCorrelated(shape.info)) {
+            if (try lowerScalarAggregate(ctx, shape, &shape.info.?, lowered)) |value| return value;
+        }
+        return try lowerDomainAggregate(ctx, shape, lowered);
     }
     if (try analyzeScalarLookup(ctx, source)) |shape| {
-        if (!equiCorrelated(&shape.info)) return null;
-        return try lowerScalarLookup(ctx, shape, lowered);
+        if (equiCorrelated(shape.info)) {
+            if (try lowerScalarLookup(ctx, shape, &shape.info.?, lowered)) |value| return value;
+        }
     }
-    return null;
+    return try lowerDomainScalar(ctx, source, lowered);
 }
 
-fn equiCorrelated(info: *const CorrelationInfo) bool {
-    return info.outer_cols.items.len > 0 and info.range_corrs.items.len == 0;
+fn equiCorrelated(info: ?CorrelationInfo) bool {
+    const i = info orelse return false;
+    return i.outer_cols.items.len > 0 and i.range_corrs.items.len == 0;
 }
 
 fn groupByKeys(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []const ir.AggSpec, input: *ir.Op) !*ir.Op {
@@ -1789,29 +1819,55 @@ fn groupByKeys(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []const ir.
     } });
 }
 
-fn lowerScalarAggregate(ctx: *CompileCtx, shape: ScalarAggregate, lowered: *LoweredScalars) ![]const u8 {
+/// Null when the aggregate, keyed on its correlations, still reads the
+/// outer row.
+fn lowerScalarAggregate(ctx: *CompileCtx, shape: ScalarAggregate, info: *const CorrelationInfo, lowered: *LoweredScalars) !?[]const u8 {
     const na = ctx.nodeArena();
-    var inner = try keptRows(ctx, &shape.info);
+    var inner = try keptRows(ctx, info);
     if (shape.pre.len > 0) {
         inner = try newOp(ctx, .{ .compute = .{ .derived = shape.pre, .upstream = inner } });
     }
     const aggs = try na.dupe(ir.AggSpec, shape.aggs);
     for (aggs, 0..) |*a, j| a.as = try std.fmt.allocPrint(na, "__csq_a{d}", .{j});
-    const alias = try joinGroupedInner(ctx, &shape.info, aggs, try groupByKeys(ctx, &shape.info, aggs, inner), lowered);
+    const grouped = try groupByKeys(ctx, info, aggs, inner);
+    if (try readsFree(ctx, grouped)) return null;
+    return try aggregateValues(ctx, shape, try joinGroupedInner(ctx, info, aggs, grouped, lowered), lowered);
+}
 
+/// A scalar aggregate lifted onto its domain: grouped per domain row. A
+/// domain row no inner row reaches has no group, so its outer rows miss the
+/// join and read the aggregate over zero rows.
+fn lowerDomainAggregate(ctx: *CompileCtx, shape: ScalarAggregate, lowered: *LoweredScalars) !?[]const u8 {
+    const source = if (lowered.domain) |*d| d else return null;
+    const lifted = (try liftSubquery(ctx, shape.group, source, true, null)) orelse return null;
+    const na = ctx.nodeArena();
+    const values = try na.alloc([]const u8, shape.aggs.len);
+    const outputs = try na.alloc([]const u8, shape.aggs.len);
+    for (shape.aggs, values, outputs, 0..) |a, *value, *output, j| {
+        value.* = a.as;
+        output.* = try std.fmt.allocPrint(na, "__csq_a{d}", .{j});
+    }
+    const alias = try joinKeyed(ctx, lifted.rows, try domainKeys(ctx, lifted, &.{}, &.{}), values, outputs, lowered);
+    return try aggregateValues(ctx, shape, alias, lowered);
+}
+
+/// The aggregates joined under `alias` as each outer row reads them, then
+/// the subquery's expressions over them. Returns the selected one's column.
+fn aggregateValues(ctx: *CompileCtx, shape: ScalarAggregate, alias: []const u8, lowered: *LoweredScalars) ![]const u8 {
+    const na = ctx.nodeArena();
     // The subquery's own names for its aggregates and expressions, each
     // relabelled to the outer column that carries it.
-    const renames = try na.alloc(exec.predicate.ColRename, aggs.len + shape.post.len);
-    for (shape.aggs, aggs, 0..) |original, a, j| {
-        const joined = try std.fmt.allocPrint(na, "{s}.{s}", .{ alias, a.as });
+    const renames = try na.alloc(exec.predicate.ColRename, shape.aggs.len + shape.post.len);
+    for (shape.aggs, 0..) |a, j| {
+        const joined = try std.fmt.allocPrint(na, "{s}.__csq_a{d}", .{ alias, j });
         const value = try std.fmt.allocPrint(na, "{s}_a{d}", .{ alias, j });
-        renames[j] = .{ .from = original.as, .to = value };
+        renames[j] = .{ .from = a.as, .to = value };
         try lowered.hidden.append(na, joined);
         try lowered.hidden.append(na, value);
         try lowered.values.append(na, .{ .name = value, .expr = try missedJoinValue(ctx, a.func, joined) });
     }
-    for (shape.post, aggs.len..) |d, k| {
-        const value = try std.fmt.allocPrint(na, "{s}_p{d}", .{ alias, k - aggs.len });
+    for (shape.post, shape.aggs.len..) |d, k| {
+        const value = try std.fmt.allocPrint(na, "{s}_p{d}", .{ alias, k - shape.aggs.len });
         const expr = try exec.expr_mod.deepCloneRenamed(na, d.expr, renames[0..k]);
         renames[k] = .{ .from = d.name, .to = value };
         try lowered.hidden.append(na, value);
@@ -1821,21 +1877,48 @@ fn lowerScalarAggregate(ctx: *CompileCtx, shape: ScalarAggregate, lowered: *Lowe
 }
 
 /// Each key's inner rows, grouped to one row: the selected value and how
-/// many rows the key matched. Above the join the value reads through
-/// `single_row`, which fails the statement when an outer row's key
-/// matched more than one row, and reads NULL when it matched none.
-fn lowerScalarLookup(ctx: *CompileCtx, shape: ScalarLookup, lowered: *LoweredScalars) ![]const u8 {
-    const na = ctx.nodeArena();
-    var inner = try keptRows(ctx, &shape.info);
+/// many rows the key matched. Null when that grouping still reads the outer
+/// row.
+fn lowerScalarLookup(ctx: *CompileCtx, shape: ScalarLookup, info: *const CorrelationInfo, lowered: *LoweredScalars) !?[]const u8 {
+    var inner = try keptRows(ctx, info);
     for (shape.computes) |derived| {
         inner = try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = inner } });
     }
-    if (shape.limit) |limit| inner = try limitPerKey(ctx, &shape.info, shape.order, limit, inner);
-    const aggs = try na.alloc(ir.AggSpec, 2);
-    aggs[0] = .{ .func = .any_value, .col = shape.selected, .as = "__csq_a0" };
-    aggs[1] = .{ .func = .count, .col = null, .as = "__csq_a1" };
-    const alias = try joinGroupedInner(ctx, &shape.info, aggs, try groupByKeys(ctx, &shape.info, aggs, inner), lowered);
+    if (shape.limit) |limit| inner = try limitPerKey(ctx, info, shape.order, limit, inner);
+    const aggs = try lookupAggs(ctx, shape.selected);
+    const grouped = try groupByKeys(ctx, info, aggs, inner);
+    if (try readsFree(ctx, grouped)) return null;
+    return try singleRowValue(ctx, try joinGroupedInner(ctx, info, aggs, grouped, lowered), lowered);
+}
 
+/// Any other scalar subquery lifted onto its domain, its rows per domain
+/// row read as a lookup's are.
+fn lowerDomainScalar(ctx: *CompileCtx, source_op: *const anyopaque, lowered: *LoweredScalars) !?[]const u8 {
+    const source = if (lowered.domain) |*d| d else return null;
+    const lifted = (try liftSubquery(ctx, @ptrCast(@alignCast(source_op)), source, false, 1)) orelse return null;
+    const grouped = try newOp(ctx, .{ .group_by = .{
+        .group_cols = lifted.keys,
+        .aggs = try lookupAggs(ctx, lifted.selected[0]),
+        .upstream = lifted.rows,
+    } });
+    const values = [_][]const u8{ "__csq_a0", "__csq_a1" };
+    const alias = try joinKeyed(ctx, grouped, try domainKeys(ctx, lifted, &.{}, &.{}), &values, null, lowered);
+    return try singleRowValue(ctx, alias, lowered);
+}
+
+/// A lookup's value and how many rows its key matched.
+fn lookupAggs(ctx: *CompileCtx, selected: []const u8) ![]const ir.AggSpec {
+    const aggs = try ctx.nodeArena().alloc(ir.AggSpec, 2);
+    aggs[0] = .{ .func = .any_value, .col = selected, .as = "__csq_a0" };
+    aggs[1] = .{ .func = .count, .col = null, .as = "__csq_a1" };
+    return aggs;
+}
+
+/// The looked-up value above the join under `alias`, read through
+/// `single_row`, which fails the statement when an outer row's key matched
+/// more than one row, and reads NULL when it matched none.
+fn singleRowValue(ctx: *CompileCtx, alias: []const u8, lowered: *LoweredScalars) ![]const u8 {
+    const na = ctx.nodeArena();
     const args = try na.alloc(ir.Expr, 2);
     args[0] = .{ .col_ref = try std.fmt.allocPrint(na, "{s}.__csq_a1", .{alias}) };
     args[1] = .{ .col_ref = try std.fmt.allocPrint(na, "{s}.__csq_a0", .{alias}) };
@@ -1847,61 +1930,90 @@ fn lowerScalarLookup(ctx: *CompileCtx, shape: ScalarLookup, lowered: *LoweredSca
     return value;
 }
 
-/// The subquery's `ORDER BY ... LIMIT n OFFSET m` applied within each key:
-/// the key's rows numbered in that order, rows m+1 through m+n kept.
+/// The subquery's `ORDER BY ... LIMIT n OFFSET m` applied within each key.
 fn limitPerKey(ctx: *CompileCtx, info: *const CorrelationInfo, order: []const ir.SortSpec, limit: ir.Op.Limit, input: *ir.Op) !*ir.Op {
+    const rank = "__csq_rn";
+    return try rankFilter(ctx, rank, limit, try rankWithin(ctx, info.inner_cols.items, order, rank, input));
+}
+
+/// `input` with each row's number within its `keys`, in `order`, as `rank`.
+fn rankWithin(ctx: *CompileCtx, keys: []const []const u8, order: []const ir.SortSpec, rank: []const u8, input: *ir.Op) !*ir.Op {
     const na = ctx.nodeArena();
-    const rn = "__csq_rn";
     const specs = try na.alloc(ir.WindowSpec, 1);
     specs[0] = .{
-        .partition_by = try na.dupe([]const u8, info.inner_cols.items),
+        .partition_by = try na.dupe([]const u8, keys),
         .order_by = order,
         .frame = if (order.len > 0) ir.Frame.default_with_order else ir.Frame.default_no_order,
     };
     const calls = try na.alloc(ir.WindowCall, 1);
-    calls[0] = .{ .spec_idx = 0, .func = .row_number, .args = &.{}, .ignore_nulls = false, .output_name = rn };
-    const numbered = try newOp(ctx, .{ .window = .{ .specs = specs, .calls = calls, .upstream = input } });
+    calls[0] = .{ .spec_idx = 0, .func = .row_number, .args = &.{}, .ignore_nulls = false, .output_name = rank };
+    return try newOp(ctx, .{ .window = .{ .specs = specs, .calls = calls, .upstream = input } });
+}
 
+/// The rows `LIMIT n OFFSET m` keeps of each key's: those `rank` numbers
+/// m+1 through m+n.
+fn rankFilter(ctx: *CompileCtx, rank: []const u8, limit: ir.Op.Limit, input: *ir.Op) !*ir.Op {
     const max_rn: u64 = std.math.maxInt(i64);
     const first: i64 = @intCast(@min(limit.offset, max_rn));
     const last: i64 = @intCast(@min(limit.offset +| limit.n, max_rn));
-    const bounds = try na.alloc(PredicateExpr, 2);
-    bounds[0] = .{ .leaf = .{ .col = rn, .op = .gt, .val = .{ .bigint = first } } };
-    bounds[1] = .{ .leaf = .{ .col = rn, .op = .lte, .val = .{ .bigint = last } } };
-    return try newOp(ctx, .{ .filter = .{ .predicate = .{ .@"and" = bounds }, .upstream = numbered } });
+    const bounds = try ctx.nodeArena().alloc(PredicateExpr, 2);
+    bounds[0] = .{ .leaf = .{ .col = rank, .op = .gt, .val = .{ .bigint = first } } };
+    bounds[1] = .{ .leaf = .{ .col = rank, .op = .lte, .val = .{ .bigint = last } } };
+    return try newOp(ctx, .{ .filter = .{ .predicate = .{ .@"and" = bounds }, .upstream = input } });
 }
 
-/// LEFT JOIN target for `grouped` — the inner rows grouped by the
-/// correlation keys, one row per key — on those keys. Returns the alias
-/// the grouped columns read under.
+/// The keys a lowered subquery's grouped rows join the operator's rows on:
+/// each `inner` column meets the `outer` column beside it.
+const JoinKeys = struct {
+    inner: []const []const u8,
+    outer: []const []const u8,
+    /// Keys from this one on match NULL to NULL: a domain holds a NULL
+    /// outer value as a row of its own.
+    null_safe_from: usize,
+};
+
 fn joinGroupedInner(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []const ir.AggSpec, grouped: *ir.Op, lowered: *LoweredScalars) ![]const u8 {
+    const values = try ctx.nodeArena().alloc([]const u8, aggs.len);
+    for (aggs, values) |a, *value| value.* = a.as;
+    const keys = info.inner_cols.items;
+    const alias = try joinKeyed(ctx, grouped, .{ .inner = keys, .outer = info.outer_cols.items, .null_safe_from = keys.len }, values, null, lowered);
+    try lowered.computeOuterValues(ctx, info);
+    return alias;
+}
+
+/// LEFT JOIN target for `grouped` — the inner rows grouped to one row per
+/// key — on `keys`, carrying its `values` columns, renamed to `outputs`
+/// when given. Returns the alias the joined columns read under.
+fn joinKeyed(ctx: *CompileCtx, grouped: *ir.Op, keys: JoinKeys, values: []const []const u8, outputs: ?[]const []const u8, lowered: *LoweredScalars) ![]const u8 {
     const na = ctx.nodeArena();
     const alias = try std.fmt.allocPrint(na, "__csq{d}", .{ctx.lowered_scalars});
     ctx.lowered_scalars += 1;
-    var inner = grouped;
 
     // Output names no outer column shares, so a bare outer ref never
     // suffix-matches a join-side column.
-    const n_keys = info.inner_cols.items.len;
-    const columns = try na.alloc([]const u8, n_keys + aggs.len);
-    const outputs = try na.alloc(?[]const u8, n_keys + aggs.len);
+    const n_keys = keys.inner.len;
+    const columns = try na.alloc([]const u8, n_keys + values.len);
+    const names = try na.alloc(?[]const u8, n_keys + values.len);
     const on = try na.alloc(ir.JoinKeyPair, n_keys);
-    for (info.inner_cols.items, info.outer_cols.items, 0..) |inner_col, outer_col, i| {
+    for (keys.inner, keys.outer, 0..) |inner_col, outer_col, i| {
         columns[i] = inner_col;
-        outputs[i] = try std.fmt.allocPrint(na, "__csq_k{d}", .{i});
-        on[i] = .{ .left = outer_col, .right = try std.fmt.allocPrint(na, "{s}.__csq_k{d}", .{ alias, i }) };
+        names[i] = try std.fmt.allocPrint(na, "__csq_k{d}", .{i});
+        on[i] = .{
+            .left = outer_col,
+            .right = try std.fmt.allocPrint(na, "{s}.__csq_k{d}", .{ alias, i }),
+            .null_safe = i >= keys.null_safe_from,
+        };
         try lowered.hidden.append(na, on[i].right);
     }
-    for (aggs, n_keys..) |a, i| {
-        columns[i] = a.as;
-        outputs[i] = null;
+    for (values, n_keys..) |value, i| {
+        columns[i] = value;
+        names[i] = if (outputs) |o| o[i - n_keys] else null;
     }
-    inner = try newOp(ctx, .{ .select = .{ .columns = columns, .outputs = outputs, .upstream = inner } });
+    var inner = try newOp(ctx, .{ .select = .{ .columns = columns, .outputs = names, .upstream = grouped } });
     inner = try newOp(ctx, .{ .materialize = .{ .upstream = inner, .structural_cse = true } });
     const right = try newOp(ctx, .{ .alias = .{ .alias = alias, .upstream = inner } });
     try prepareSubplan(ctx, right);
     try lowered.joins.append(na, .{ .on = on, .right = right });
-    try lowered.computeOuterValues(ctx, info);
     return alias;
 }
 
@@ -1985,11 +2097,18 @@ fn lowerPredicateScalars(ctx: *CompileCtx, pred: *PredicateExpr, lowered: *Lower
 /// narrow the scan.
 fn resolveFilterSubqueries(ctx: *CompileCtx, op: *ir.Op) !void {
     const f = op.filter;
+    // The input resolves first: a domain reads it as it will run.
+    try resolveSubqueriesInOp(ctx, @constCast(f.upstream));
     const conjuncts = switch (f.predicate) {
         .@"and" => |children| try ctx.nodeArena().dupe(PredicateExpr, children),
         else => try ctx.nodeArena().dupe(PredicateExpr, &.{f.predicate}),
     };
-    var lowered: LoweredScalars = .{};
+    var narrowing: std.ArrayList(PredicateExpr) = .empty;
+    for (conjuncts) |c| if (!readsSubquery(c)) try narrowing.append(ctx.nodeArena(), c);
+    var lowered: LoweredScalars = .{ .domain = .{
+        .input = f.upstream,
+        .narrow = if (narrowing.items.len > 0) try conjunction(ctx, narrowing.items) else null,
+    } };
     var above: std.ArrayList(PredicateExpr) = .empty;
     var below: std.ArrayList(PredicateExpr) = .empty;
     for (conjuncts) |*c| {
@@ -2001,12 +2120,11 @@ fn resolveFilterSubqueries(ctx: *CompileCtx, op: *ir.Op) !void {
         const side = if (reads_lowered) &above else &below;
         try side.append(ctx.nodeArena(), c.*);
     }
-    try resolveSubqueriesInOp(ctx, @constCast(f.upstream));
     if (!lowered.any()) {
         op.filter.predicate = try conjunction(ctx, below.items);
         return;
     }
-    var input: *ir.Op = @constCast(f.upstream);
+    var input: *ir.Op = lowered.domain.?.operatorInput();
     if (below.items.len > 0) {
         input = try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, below.items), .upstream = input } });
     }
@@ -2027,7 +2145,7 @@ fn resolveFilterSubqueries(ctx: *CompileCtx, op: *ir.Op) !void {
 /// pred.* was rewritten.
 fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anytype) !bool {
     const shape = (try analyzeScalarAggregate(ctx, sq.source)) orelse return false;
-    const info = &shape.info;
+    const info = if (shape.info) |*i| i else return false;
     if (info.outer_cols.items.len == 0 or info.outer_values.items.len > 0) return false;
     if (shape.aggs.len != 1 or shape.pre.len > 0 or shape.post.len > 0) return false;
     // A range correlation can't key the aggregate: each outer row would
@@ -2081,4 +2199,781 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
         .key_types = try columnTypes(aa, schema[0..info.inner_cols.items.len]),
     } };
     return true;
+}
+
+// =============================================================================
+// Domain decorrelation: a correlated subquery no keyed path takes, lifted
+// onto the distinct enclosing values it reads.
+// =============================================================================
+
+const LiftError = error{ NotLiftable, BadRequest } || Allocator.Error;
+
+/// The rows an operator reads, which a lifted subquery's domain is drawn
+/// from. A source cheap and deterministic to run again is replayed for the
+/// domain; any other is materialized once and read by both.
+const DomainSource = struct {
+    input: *ir.Op,
+    /// The operator's conjuncts that read no subquery: a row they drop
+    /// never reads the subquery, so its values stay out of the domain.
+    narrow: ?PredicateExpr = null,
+    shared: ?*ir.Op = null,
+
+    fn rows(self: *DomainSource, ctx: *CompileCtx) !*ir.Op {
+        const base = if (self.shared) |shared|
+            shared
+        else if (replayable(ctx, self.input, 0))
+            try self.input.cloneTree(ctx.nodeArena())
+        else blk: {
+            const shared = try newOp(ctx, .{ .materialize = .{ .upstream = self.input } });
+            self.shared = shared;
+            break :blk shared;
+        };
+        const narrow = self.narrow orelse return base;
+        return try newOp(ctx, .{ .filter = .{ .predicate = narrow, .upstream = base } });
+    }
+
+    /// The operator's input: the shared buffer once the domain reads one.
+    fn operatorInput(self: *const DomainSource) *ir.Op {
+        return self.shared orelse self.input;
+    }
+
+    fn carries(self: *const DomainSource, ctx: *CompileCtx, names: []const []const u8) !bool {
+        const scope = try ScopeBuilder.build(ctx, try splitBlock(ctx, self.input), true);
+        for (names) |name| if (!scope.binds(name)) return false;
+        return true;
+    }
+};
+
+/// Whether running `op` twice yields the same rows cheaply: a scan under
+/// row-local operators, or a buffer already materialized.
+fn replayable(ctx: *CompileCtx, op: *const ir.Op, depth: u32) bool {
+    if (depth >= SCOPE_DEPTH_LIMIT) return false;
+    return switch (op.*) {
+        .scan, .single_row, .materialize => true,
+        .alias => |a| replayable(ctx, a.upstream, depth + 1),
+        .filter => |f| !readsSubquery(f.predicate) and replayable(ctx, f.upstream, depth + 1),
+        .select, .exclude => |p| replayable(ctx, p.upstream, depth + 1),
+        .compute => |c| {
+            for (c.derived) |d| if (!deterministic(ctx, d.expr)) return false;
+            return replayable(ctx, c.upstream, depth + 1);
+        },
+        else => false,
+    };
+}
+
+fn deterministic(ctx: *CompileCtx, e: ir.Expr) bool {
+    return switch (e) {
+        .col_ref, .lit, .null_lit, .var_ref => true,
+        .call => |c| {
+            if (volatileFn(ctx, c.fn_name)) return false;
+            for (c.args) |arg| if (!deterministic(ctx, arg)) return false;
+            return true;
+        },
+        .case => |cs| {
+            for (cs.operands) |o| if (!deterministic(ctx, o.expr)) return false;
+            for (cs.branches) |br| if (!deterministic(ctx, br.then)) return false;
+            if (cs.else_branch) |eb| return deterministic(ctx, eb.*);
+            return true;
+        },
+        .scalar_subquery, .exists_subquery => false,
+    };
+}
+
+fn readsSubquery(pred: PredicateExpr) bool {
+    return switch (pred) {
+        .scalar_subquery, .in_subquery, .exists_subquery => true,
+        .@"and", .@"or" => |children| for (children) |child| {
+            if (readsSubquery(child)) break true;
+        } else false,
+        .not => |child| readsSubquery(child.*),
+        else => false,
+    };
+}
+
+fn volatileFn(ctx: *CompileCtx, name: []const u8) bool {
+    if (parser.isNondeterministicFn(name) or std.mem.eql(u8, name, exec.scalar_fn.UUID_SHORT_FN)) return true;
+    for (exec.scalar_fn.overloadsOf(name)) |f| if (f.volatility == .@"volatile") return true;
+    const registry = ctx.udf_registry orelse return false;
+    for (registry.scalarEntries()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, name) and entry.volatility == .@"volatile") return true;
+    }
+    return false;
+}
+
+/// The names a block reads from enclosing queries, bound as SQL scopes
+/// them, each renamed (when `rename`) to the domain column that carries it.
+/// Copies the block's operators; its relations are left as they are, and
+/// one that reads an enclosing query is not liftable.
+const FreeNames = struct {
+    ctx: *CompileCtx,
+    rename: bool = true,
+    /// The domain's alias, made at the first free name.
+    domain: ?[]const u8 = null,
+    /// The block's scope and those of the blocks nested in it, innermost
+    /// last.
+    scopes: std.ArrayList(Scope) = .empty,
+    case_operands: []const exec.expr_mod.Expr.Operand = &.{},
+    /// Each free name, and the domain column it became.
+    free: std.ArrayList([]const u8) = .empty,
+    columns: std.ArrayList([]const u8) = .empty,
+    /// Names read so far, those free, and nested blocks entered.
+    reads: usize = 0,
+    free_reads: usize = 0,
+    nested_blocks: usize = 0,
+    /// Computed columns that read only free names, by scope depth.
+    outer_only: std.ArrayList(Computed) = .empty,
+    in_relation: bool = false,
+
+    const Computed = struct { depth: usize, name: []const u8 };
+
+    fn enter(self: *FreeNames, b: Block) LiftError!void {
+        if (self.scopes.items.len >= SCOPE_DEPTH_LIMIT) return error.NotLiftable;
+        try self.scopes.append(self.ctx.nodeArena(), try ScopeBuilder.build(self.ctx, b, true));
+    }
+
+    fn bound(self: *const FreeNames, ref: []const u8) bool {
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].binds(ref)) return true;
+        }
+        return false;
+    }
+
+    fn readName(self: *FreeNames, ref: []const u8) LiftError![]const u8 {
+        if (ref.len == 0 or exec.expr_mod.operandListed(self.case_operands, ref)) return ref;
+        self.reads += 1;
+        if (self.bound(ref)) return ref;
+        if (self.in_relation) return error.NotLiftable;
+        self.free_reads += 1;
+        for (self.free.items, 0..) |f, i| if (types.columnNameEql(f, ref)) return if (self.rename) self.columns.items[i] else ref;
+        const na = self.ctx.nodeArena();
+        try self.free.append(na, ref);
+        if (!self.rename) return ref;
+        const domain = self.domain orelse blk: {
+            const alias = try std.fmt.allocPrint(na, "__dom{d}", .{self.ctx.lowered_scalars});
+            self.ctx.lowered_scalars += 1;
+            self.domain = alias;
+            break :blk alias;
+        };
+        const column = try std.fmt.allocPrint(na, "{s}.__d{d}", .{ domain, self.columns.items.len });
+        try self.columns.append(na, column);
+        return column;
+    }
+
+    fn readNames(self: *FreeNames, refs: []const []const u8) LiftError![]const []const u8 {
+        const out = try self.ctx.nodeArena().alloc([]const u8, refs.len);
+        for (refs, out) |ref, *dst| dst.* = try self.readName(ref);
+        return out;
+    }
+
+    /// An aggregate's argument. One that reads only the enclosing row
+    /// aggregates in the enclosing query, which a lifted block can't.
+    fn aggArg(self: *FreeNames, col: []const u8) LiftError![]const u8 {
+        const depth = self.scopes.items.len;
+        for (self.outer_only.items) |c| if (c.depth == depth and types.columnNameEql(c.name, col)) return error.NotLiftable;
+        if (!self.bound(col)) return error.NotLiftable;
+        return col;
+    }
+
+    fn readPredicate(self: *FreeNames, pred: PredicateExpr) LiftError!PredicateExpr {
+        const na = self.ctx.nodeArena();
+        var out = pred;
+        switch (out) {
+            .leaf, .day_leaf, .text_as_number => |*l| l.col = try self.readName(l.col),
+            .leaf_col_col => |*c| {
+                c.left = try self.readName(c.left);
+                c.right = try self.readName(c.right);
+            },
+            .is_null, .is_not_null => |*col| col.* = try self.readName(col.*),
+            .like => |*l| l.col = try self.readName(l.col),
+            .in_set, .text_as_number_set => |*s| s.col = try self.readName(s.col),
+            .leaf_var => |*v| v.col = try self.readName(v.col),
+            .scalar_subquery => |*s| {
+                s.col = try self.readName(s.col);
+                s.source = try self.readNested(s.source);
+            },
+            .in_subquery => |*s| {
+                s.col = try self.readName(s.col);
+                s.rest_cols = try self.readNames(s.rest_cols);
+                s.source = try self.readNested(s.source);
+            },
+            .exists_subquery => |*source| source.* = try self.readNested(source.*),
+            .@"and", .@"or" => |*children| {
+                const copies = try na.alloc(PredicateExpr, children.len);
+                for (children.*, copies) |child, *dst| dst.* = try self.readPredicate(child);
+                children.* = copies;
+            },
+            .not => |*child| {
+                const copy = try na.create(PredicateExpr);
+                copy.* = try self.readPredicate(child.*.*);
+                child.* = copy;
+            },
+            .always, .unknown => {},
+            .correlated_set, .correlated_scalar, .correlated_range => return error.NotLiftable,
+        }
+        return out;
+    }
+
+    fn readExpr(self: *FreeNames, e: ir.Expr) LiftError!ir.Expr {
+        const na = self.ctx.nodeArena();
+        switch (e) {
+            .col_ref => |ref| return .{ .col_ref = try self.readName(ref) },
+            .lit, .null_lit, .var_ref => return e,
+            .call => |c| {
+                var copy = c;
+                const args = try na.alloc(ir.Expr, c.args.len);
+                for (c.args, args) |arg, *dst| dst.* = try self.readExpr(arg);
+                copy.args = args;
+                return .{ .call = copy };
+            },
+            .case => |cs| {
+                var copy = cs;
+                const operands = try na.dupe(exec.expr_mod.Expr.Operand, cs.operands);
+                for (operands) |*o| o.expr = try self.readExpr(o.expr);
+                copy.operands = operands;
+                const branches = try na.dupe(exec.expr_mod.Expr.Branch, cs.branches);
+                for (branches) |*br| {
+                    const enclosing = self.case_operands;
+                    self.case_operands = cs.operands;
+                    br.cond = try self.readPredicate(br.cond);
+                    self.case_operands = enclosing;
+                    br.then = try self.readExpr(br.then);
+                }
+                copy.branches = branches;
+                if (cs.else_branch) |eb| {
+                    const else_copy = try na.create(ir.Expr);
+                    else_copy.* = try self.readExpr(eb.*);
+                    copy.else_branch = else_copy;
+                }
+                return .{ .case = copy };
+            },
+            .scalar_subquery => |source| return .{ .scalar_subquery = try self.readNested(source) },
+            .exists_subquery => |source| return .{ .exists_subquery = try self.readNested(source) },
+        }
+    }
+
+    fn readNested(self: *FreeNames, source: *const anyopaque) LiftError!*ir.Op {
+        self.nested_blocks += 1;
+        return try self.readBlock(@ptrCast(@alignCast(source)));
+    }
+
+    /// A copy of the block under `top`, set operation arms each their own.
+    fn readBlock(self: *FreeNames, top: *const ir.Op) LiftError!*ir.Op {
+        if (top.* == .set_union) {
+            var u = top.set_union;
+            u.left = try self.readBlock(u.left);
+            u.right = try self.readBlock(u.right);
+            return try newOp(self.ctx, .{ .set_union = u });
+        }
+        const b = try splitBlock(self.ctx, top);
+        try self.enter(b);
+        const computed = self.outer_only.items.len;
+        try self.readRelation(b.from, 0);
+        var cur: *ir.Op = @constCast(b.from);
+        var i = b.chain.len;
+        while (i > 0) {
+            i -= 1;
+            const copy = try self.readOp(b.chain[i]);
+            relink(copy, cur);
+            cur = copy;
+        }
+        self.outer_only.shrinkRetainingCapacity(computed);
+        _ = self.scopes.pop();
+        return cur;
+    }
+
+    /// A relation the block reads: its names must all bind inside it.
+    fn readRelation(self: *FreeNames, op: *const ir.Op, depth: u32) LiftError!void {
+        if (depth >= SCOPE_DEPTH_LIMIT) return error.NotLiftable;
+        const enclosing = self.in_relation;
+        self.in_relation = true;
+        defer self.in_relation = enclosing;
+        switch (op.*) {
+            .scan, .file_scan, .single_row => {},
+            .alias => |a| try self.readRelation(a.upstream, depth + 1),
+            // A named boundary is a CTE, view or function: its own statement.
+            .materialize => |m| if (m.name == null) {
+                _ = try self.readBlock(m.upstream);
+            },
+            .table_fn => |t| for (t.inputs) |input| {
+                _ = try self.readBlock(input);
+            },
+            .set_union => _ = try self.readBlock(op),
+            .join => |j| {
+                for (j.on) |pair| {
+                    _ = try self.readName(pair.left);
+                    _ = try self.readName(pair.right);
+                }
+                for (j.ranges) |r| {
+                    _ = try self.readName(r.left);
+                    _ = try self.readName(r.right);
+                }
+                if (j.extra_predicate) |p| _ = try self.readPredicate(p);
+                if (j.residual) |r| {
+                    for (r.derived) |d| _ = try self.readExpr(d.expr);
+                    _ = try self.readPredicate(r.predicate);
+                }
+                try self.readRelation(j.left, depth + 1);
+                try self.readRelation(j.right, depth + 1);
+            },
+            else => if (blockUpstream(op) != null) {
+                _ = try self.readBlock(op);
+            } else return error.NotLiftable,
+        }
+    }
+
+    /// A copy of one of a block's operators over the same upstream, its
+    /// names renamed.
+    fn readOp(self: *FreeNames, o: *const ir.Op) LiftError!*ir.Op {
+        const na = self.ctx.nodeArena();
+        var copy = o.*;
+        switch (copy) {
+            .limit, .exclude => {},
+            .select => |*p| {
+                const columns = try na.alloc([]const u8, p.columns.len);
+                for (p.columns, columns) |col, *dst| dst.* = if (isStar(col)) col else try self.readName(col);
+                p.columns = columns;
+                try self.bindOutputs(p.*);
+            },
+            .order_by => |*ob| {
+                const specs = try na.dupe(ir.SortSpec, ob.specs);
+                for (specs) |*s| s.col = try self.readName(s.col);
+                ob.specs = specs;
+            },
+            .compute => |*c| {
+                const derived = try na.dupe(ir.Derived, c.derived);
+                for (derived) |*d| {
+                    const reads = self.reads;
+                    const free_reads = self.free_reads;
+                    const nested_blocks = self.nested_blocks;
+                    d.expr = try self.readExpr(d.expr);
+                    const free = self.free_reads - free_reads;
+                    if (free > 0 and free == self.reads - reads and self.nested_blocks == nested_blocks) {
+                        try self.outer_only.append(na, .{ .depth = self.scopes.items.len, .name = d.name });
+                    }
+                }
+                c.derived = derived;
+            },
+            .window => |*w| {
+                const specs = try na.dupe(ir.WindowSpec, w.specs);
+                for (specs) |*s| {
+                    s.partition_by = try self.readNames(s.partition_by);
+                    const order = try na.dupe(ir.SortSpec, s.order_by);
+                    for (order) |*o_spec| o_spec.col = try self.readName(o_spec.col);
+                    s.order_by = order;
+                }
+                const calls = try na.dupe(ir.WindowCall, w.calls);
+                for (calls) |*call| {
+                    const args = try na.alloc(ir.Expr, call.args.len);
+                    for (call.args, args) |arg, *dst| dst.* = try self.readExpr(arg);
+                    call.args = args;
+                }
+                w.specs = specs;
+                w.calls = calls;
+            },
+            .filter => |*f| f.predicate = try self.readPredicate(f.predicate),
+            .group_by => |*g| {
+                g.group_cols = try self.readNames(g.group_cols);
+                const aggs = try na.dupe(ir.AggSpec, g.aggs);
+                for (aggs) |*a| {
+                    if (a.col) |col| a.col = try self.aggArg(col);
+                    if (a.arg2_col) |col| a.arg2_col = try self.aggArg(col);
+                    for (a.udf_arg_cols) |col| _ = try self.aggArg(col);
+                }
+                g.aggs = aggs;
+            },
+            else => return error.NotLiftable,
+        }
+        return try newOp(self.ctx, copy);
+    }
+
+    /// A select's output names bind in the operators above it.
+    fn bindOutputs(self: *FreeNames, p: ir.Op.Project) !void {
+        const outputs = p.outputs orelse return;
+        const na = self.ctx.nodeArena();
+        const scope = &self.scopes.items[self.scopes.items.len - 1];
+        var derived: std.ArrayList([]const u8) = .empty;
+        try derived.appendSlice(na, scope.derived);
+        for (outputs) |output| if (output) |o| try derived.append(na, o);
+        scope.derived = derived.items;
+    }
+};
+
+fn relink(op: *ir.Op, upstream: *ir.Op) void {
+    switch (op.*) {
+        .limit => |*l| l.upstream = upstream,
+        .select, .exclude => |*p| p.upstream = upstream,
+        .order_by => |*o| o.upstream = upstream,
+        .compute => |*c| c.upstream = upstream,
+        .window => |*w| w.upstream = upstream,
+        .filter => |*f| f.upstream = upstream,
+        .group_by => |*g| g.upstream = upstream,
+        else => {},
+    }
+}
+
+/// The names `top` reads from enclosing queries; null when that can't be
+/// told.
+fn freeNamesOf(ctx: *CompileCtx, top: *const ir.Op) !?[]const []const u8 {
+    var names: FreeNames = .{ .ctx = ctx, .rename = false };
+    _ = names.readBlock(top) catch |err| switch (err) {
+        error.NotLiftable => return null,
+        else => |e| return e,
+    };
+    return names.free.items;
+}
+
+/// Whether a rewritten subplan still reads an enclosing query, as through
+/// a subquery nested in it. One that can't be told is left to the scope
+/// guard.
+fn readsFree(ctx: *CompileCtx, op: *const ir.Op) !bool {
+    const free = (try freeNamesOf(ctx, op)) orelse return false;
+    return free.len > 0;
+}
+
+/// A subquery lifted onto its domain: its rows for every domain row.
+const Lifted = struct {
+    rows: *ir.Op,
+    /// The domain columns the rows carry, one per free name.
+    keys: []const []const u8,
+    /// Those names as the enclosing query reads them.
+    outer: []const []const u8,
+    /// The columns the subquery projects.
+    selected: []const []const u8,
+};
+
+/// Null when the subquery reads no enclosing query, or when it does so in a
+/// way lifting can't carry: the uncorrelated paths take it. `width`, when
+/// given, is how many columns its consumer reads.
+fn liftSubquery(ctx: *CompileCtx, top: *const ir.Op, source: *DomainSource, global: bool, width: ?usize) !?Lifted {
+    return liftBlock(ctx, top, source, global, width) catch |err| switch (err) {
+        error.NotLiftable => null,
+        else => |e| e,
+    };
+}
+
+/// The block joined with its domain: the distinct combinations of the
+/// enclosing values it reads, each renamed to the domain column carrying it.
+/// WHERE conjuncts comparing a FROM column with a domain column become the
+/// join's keys and ranges; the others filter the pairs. Each grouping,
+/// window partition and LIMIT then applies within a domain row. A global
+/// aggregate lifts only as the top of a scalar aggregate (`global`), whose
+/// consumer reads a domain row with no group as the aggregate over none.
+fn liftBlock(ctx: *CompileCtx, top: *const ir.Op, source: *DomainSource, global: bool, width: ?usize) LiftError!Lifted {
+    if (top.* == .set_union) return error.NotLiftable;
+    const na = ctx.nodeArena();
+    const block = try splitBlock(ctx, top);
+    var names: FreeNames = .{ .ctx = ctx };
+    try names.enter(block);
+    try names.readRelation(block.from, 0);
+    const chain = try na.alloc(*ir.Op, block.chain.len);
+    var i = chain.len;
+    while (i > 0) {
+        i -= 1;
+        chain[i] = try names.readOp(block.chain[i]);
+    }
+    const outer = names.free.items;
+    const keys = names.columns.items;
+    if (outer.len == 0 or !liftable(chain, global)) return error.NotLiftable;
+    if (!try source.carries(ctx, outer)) return error.NotLiftable;
+    const selected = try selectedColumns(ctx, chain);
+    if (width) |w| {
+        if (selected.len == 0) return error.NotLiftable;
+        if (selected.len != w) return error.BadRequest;
+        for (selected) |s| for (keys) |key| if (types.columnNameEql(s, key)) return error.NotLiftable;
+    }
+
+    const alias = names.domain.?;
+    const scope = names.scopes.items[0];
+    var on: std.ArrayList(ir.JoinKeyPair) = .empty;
+    var ranges: std.ArrayList(ir.JoinRangePredicate) = .empty;
+    var kept: std.ArrayList(PredicateExpr) = .empty;
+    const keyed = try na.alloc(bool, keys.len);
+    @memset(keyed, false);
+    const where = whereIndex(chain);
+    if (where) |w| {
+        const pred = chain[w].filter.predicate;
+        const conjuncts = if (pred == .@"and") pred.@"and" else try na.dupe(PredicateExpr, &.{pred});
+        for (conjuncts) |c| {
+            if (domainCorrelation(c, scope, keys)) |corr| switch (corr.op) {
+                .eq => if (!keyed[corr.key]) {
+                    keyed[corr.key] = true;
+                    const twin = try std.fmt.allocPrint(na, "{s}.__j{d}", .{ alias, corr.key });
+                    try on.append(na, .{ .left = corr.from, .right = twin });
+                    continue;
+                },
+                .lt, .lte, .gt, .gte => {
+                    try ranges.append(na, .{ .left = corr.from, .op = corr.op, .right = keys[corr.key] });
+                    continue;
+                },
+                .neq => {},
+            };
+            try kept.append(na, c);
+        }
+    }
+
+    var cur = try newOp(ctx, .{ .join = .{
+        .algorithm = .auto,
+        .join_type = .inner,
+        .on = on.items,
+        .ranges = ranges.items,
+        .extra_predicate = null,
+        .skew_ratio_threshold = 0.3,
+        .skew_absolute_threshold = 20_000,
+        .skew_sample_interval = 10,
+        .left = try reuseInput(ctx, block.from),
+        .right = try domainRows(ctx, source, alias, outer, keyed),
+    } });
+    const rank = "__csq_rn";
+    var ranked = false;
+    i = chain.len;
+    while (i > 0) {
+        i -= 1;
+        const op = chain[i];
+        if (where != null and where.? == i) {
+            if (kept.items.len > 0) {
+                cur = try newOp(ctx, .{ .filter = .{ .predicate = try conjunction(ctx, kept.items), .upstream = cur } });
+            }
+            continue;
+        }
+        switch (op.*) {
+            .group_by => |*g| g.group_cols = try withKeys(ctx, g.group_cols, keys),
+            .window => |*w| {
+                const specs = try na.dupe(ir.WindowSpec, w.specs);
+                for (specs) |*s| s.partition_by = try withKeys(ctx, s.partition_by, keys);
+                w.specs = specs;
+            },
+            .order_by => |o| {
+                // Order matters only to the LIMIT above it, which then
+                // applies within each domain row.
+                if (limitIn(chain[0..i])) {
+                    cur = try rankWithin(ctx, keys, o.specs, rank, cur);
+                    ranked = true;
+                }
+                continue;
+            },
+            .limit => |l| {
+                if (!ranked) cur = try rankWithin(ctx, keys, &.{}, rank, cur);
+                cur = try rankFilter(ctx, rank, l, cur);
+                ranked = false;
+                continue;
+            },
+            .select => |*p| p.* = try selectKeys(ctx, p.*, keys, if (ranked) rank else null),
+            else => {},
+        }
+        relink(op, cur);
+        cur = op;
+    }
+    return .{ .rows = cur, .keys = keys, .outer = outer, .selected = selected };
+}
+
+/// Whether the lifted operators can each apply per domain row: no select
+/// expands a star, a global aggregate is only the top of a scalar
+/// aggregate, and one LIMIT at most, over one ORDER BY at most.
+fn liftable(chain: []const *ir.Op, global: bool) bool {
+    var limits: usize = 0;
+    var orders: usize = 0;
+    for (chain, 0..) |op, i| switch (op.*) {
+        .select => |p| for (p.columns) |col| if (isStar(col)) return false,
+        .group_by => |g| if (g.group_cols.len == 0 and !(global and i == 0)) return false,
+        .limit => limits += 1,
+        .order_by => if (limits > 0) {
+            orders += 1;
+        },
+        else => {},
+    };
+    return limits <= 1 and orders <= 1;
+}
+
+fn limitIn(chain: []const *ir.Op) bool {
+    for (chain) |op| if (op.* == .limit) return true;
+    return false;
+}
+
+/// The chain index of the block's WHERE: a filter with only computes and
+/// excludes between it and the FROM.
+fn whereIndex(chain: []const *ir.Op) ?usize {
+    var i = chain.len;
+    while (i > 0) {
+        i -= 1;
+        switch (chain[i].*) {
+            .compute, .exclude => continue,
+            .filter => return i,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// The columns the block's top select projects.
+fn selectedColumns(ctx: *CompileCtx, chain: []const *ir.Op) ![]const []const u8 {
+    for (chain) |op| switch (op.*) {
+        .limit, .order_by => continue,
+        .select => |p| {
+            const out = try ctx.nodeArena().alloc([]const u8, p.columns.len);
+            for (p.columns, out, 0..) |col, *dst, i| dst.* = if (p.outputs) |outs| outs[i] orelse col else col;
+            return out;
+        },
+        else => return &.{},
+    };
+    return &.{};
+}
+
+/// A WHERE conjunct comparing a column of the block's FROM with a domain
+/// column, read as `from op key`.
+const DomainCorrelation = struct {
+    from: []const u8,
+    op: exec.PredicateOp,
+    key: usize,
+};
+
+fn domainCorrelation(pred: PredicateExpr, scope: Scope, keys: []const []const u8) ?DomainCorrelation {
+    if (pred != .leaf_col_col) return null;
+    const lc = pred.leaf_col_col;
+    for (keys, 0..) |key, k| {
+        if (std.mem.eql(u8, lc.right, key) and scope.bindsRelation(lc.left)) return .{ .from = lc.left, .op = lc.op, .key = k };
+        if (std.mem.eql(u8, lc.left, key) and scope.bindsRelation(lc.right)) return .{ .from = lc.right, .op = flipRangeOp(lc.op), .key = k };
+    }
+    return null;
+}
+
+/// `columns` and each domain key it doesn't already hold.
+fn withKeys(ctx: *CompileCtx, columns: []const []const u8, keys: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(ctx.nodeArena(), columns);
+    for (keys) |key| {
+        for (columns) |col| {
+            if (types.columnNameEql(col, key)) break;
+        } else try out.append(ctx.nodeArena(), key);
+    }
+    return out.items;
+}
+
+/// A select that also passes the domain keys, and the rank a LIMIT above
+/// it still reads.
+fn selectKeys(ctx: *CompileCtx, p: ir.Op.Project, keys: []const []const u8, rank: ?[]const u8) !ir.Op.Project {
+    const na = ctx.nodeArena();
+    var columns: std.ArrayList([]const u8) = .empty;
+    var outputs: std.ArrayList(?[]const u8) = .empty;
+    var collide: std.ArrayList(bool) = .empty;
+    try columns.appendSlice(na, p.columns);
+    if (p.outputs) |outs| try outputs.appendSlice(na, outs) else try outputs.appendNTimes(na, null, p.columns.len);
+    if (p.replace_on_collision) |r| try collide.appendSlice(na, r);
+    const extra = if (rank) |r| try std.mem.concat(na, []const u8, &.{ keys, &.{r} }) else keys;
+    next: for (extra) |col| {
+        for (columns.items, outputs.items) |c, o| if (types.columnNameEql(o orelse c, col)) continue :next;
+        try columns.append(na, col);
+        try outputs.append(na, null);
+        if (p.replace_on_collision != null) try collide.append(na, false);
+    }
+    var out = p;
+    out.columns = columns.items;
+    out.outputs = outputs.items;
+    if (p.replace_on_collision != null) out.replace_on_collision = collide.items;
+    return out;
+}
+
+/// The domain: each distinct combination of the enclosing values `outer`
+/// in the operator's rows, as `alias.__d{i}`, with a twin `__j{i}` for each
+/// one a join key reads (the join drops its right key columns).
+fn domainRows(ctx: *CompileCtx, source: *DomainSource, alias: []const u8, outer: []const []const u8, keyed: []const bool) !*ir.Op {
+    const na = ctx.nodeArena();
+    const aggs = try na.alloc(ir.AggSpec, 1);
+    aggs[0] = .{ .func = .count, .col = null, .as = "__dom_rows" };
+    const distinct = try newOp(ctx, .{ .group_by = .{
+        .group_cols = outer,
+        .aggs = aggs,
+        .upstream = try source.rows(ctx),
+    } });
+    var columns: std.ArrayList([]const u8) = .empty;
+    var outputs: std.ArrayList(?[]const u8) = .empty;
+    for (outer, 0..) |name, i| {
+        try columns.append(na, name);
+        try outputs.append(na, try std.fmt.allocPrint(na, "__d{d}", .{i}));
+    }
+    for (outer, keyed, 0..) |name, k, i| if (k) {
+        try columns.append(na, name);
+        try outputs.append(na, try std.fmt.allocPrint(na, "__j{d}", .{i}));
+    };
+    const select = try newOp(ctx, .{ .select = .{ .columns = columns.items, .outputs = outputs.items, .upstream = distinct } });
+    return try newOp(ctx, .{ .alias = .{ .alias = alias, .upstream = select } });
+}
+
+/// The keys a lifted subquery's grouped rows join back on: `in_inner` (its
+/// columns an IN compares) meeting `in_outer`, then each domain column
+/// meeting the enclosing value it carries, NULL matching NULL.
+fn domainKeys(ctx: *CompileCtx, lifted: Lifted, in_inner: []const []const u8, in_outer: []const []const u8) !JoinKeys {
+    const na = ctx.nodeArena();
+    return .{
+        .inner = try std.mem.concat(na, []const u8, &.{ in_inner, lifted.keys }),
+        .outer = try std.mem.concat(na, []const u8, &.{ in_outer, lifted.outer }),
+        .null_safe_from = in_inner.len,
+    };
+}
+
+/// An EXISTS or IN subquery lifted onto the operator's domain, its rows
+/// grouped to one marker row per key (IN's compared columns, then the
+/// domain columns) and LEFT JOINed back: an outer row whose key found a
+/// marker has a match. False when there's no domain, or the subquery
+/// doesn't lift.
+fn resolveDomainBlock(ctx: *CompileCtx, pred: *PredicateExpr, top: *const ir.Op, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: *LoweredScalars) !bool {
+    const source = if (lowered.domain) |*d| d else return false;
+    const na = ctx.nodeArena();
+    var in_cols: []const []const u8 = &.{};
+    var body = top;
+    if (in_subquery) |s| {
+        in_cols = try std.mem.concat(na, []const u8, &.{ &.{s.col}, s.rest_cols });
+    } else {
+        body = try existenceBody(ctx, top);
+        if (body.* == .group_by and body.group_by.group_cols.len == 0) {
+            // A global aggregate has a row whatever the outer row.
+            const free = (try freeNamesOf(ctx, body)) orelse return false;
+            if (free.len == 0 or !try source.carries(ctx, free)) return false;
+            pred.* = .{ .always = !negate };
+            return true;
+        }
+    }
+    const width: ?usize = if (in_subquery != null) in_cols.len else null;
+    const lifted = (try liftSubquery(ctx, body, source, false, width)) orelse return false;
+    const compared: []const []const u8 = if (in_subquery != null) lifted.selected else &.{};
+    const aggs = try na.alloc(ir.AggSpec, 1);
+    aggs[0] = .{ .func = .count, .col = null, .as = "__csq_m" };
+    const grouped = try newOp(ctx, .{ .group_by = .{
+        .group_cols = try std.mem.concat(na, []const u8, &.{ compared, lifted.keys }),
+        .aggs = aggs,
+        .upstream = lifted.rows,
+    } });
+    const values = [_][]const u8{"__csq_m"};
+    const alias = try joinKeyed(ctx, grouped, try domainKeys(ctx, lifted, compared, in_cols), &values, null, lowered);
+    const marker = try std.fmt.allocPrint(na, "{s}.__csq_m", .{alias});
+    try lowered.hidden.append(na, marker);
+    const probe: PredicateExpr = if (negate) .{ .is_null = marker } else .{ .is_not_null = marker };
+    pred.* = try nullGuarded(na, in_cols, negate, probe);
+    return true;
+}
+
+/// The part of an EXISTS block whether any row exists depends on: what it
+/// computes above its last filter or grouping only shapes the rows, as
+/// does a LIMIT that keeps the first.
+fn existenceBody(ctx: *CompileCtx, top: *const ir.Op) !*const ir.Op {
+    var cur = top;
+    if (cur.* == .limit) {
+        const l = cur.limit;
+        if (l.offset != 0 or l.n == 0) return top;
+        cur = l.upstream;
+    }
+    const block = try splitBlock(ctx, cur);
+    for (block.chain) |op| if (op.* == .filter or op.* == .group_by) return op;
+    return block.from;
+}
+
+/// Resolve the predicate of a statement or a join, whose operator computes
+/// `derived` before reading it: correlation operands computed from the
+/// outer row alone join them.
+fn resolveWithOuterValues(ctx: *CompileCtx, pred: *PredicateExpr, derived: []const ir.Derived) ![]const ir.Derived {
+    var sink: LoweredScalars = .{};
+    try resolveSubqueriesInPredicate(ctx, pred, &sink);
+    if (sink.outer_values.items.len == 0) return derived;
+    return try std.mem.concat(ctx.nodeArena(), ir.Derived, &.{ derived, sink.outer_values.items });
 }
