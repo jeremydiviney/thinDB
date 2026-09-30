@@ -1043,6 +1043,17 @@ own values; any other scalar is grouped by its keys and LEFT JOINed back.
 A DELETE or UPDATE predicate and a join's ON take it first too; the rest of
 theirs is below.
 
+Both keyed forms group the inner rows by each key as its comparison with the
+outer value reads it. Text compared with a number, a DATE or a DATETIME is
+read as that type (§3.1), and texts that differ can read as one value
+(`'7'`, `'07'` and `'7.0'` are all 7). Grouped as written, an outer 7 would
+meet three groups: the join back would return its row three times, and the
+lookup would find three aggregates. So such a key is grouped, counted for a
+LIMIT, looked up and joined on its read value, and the rows that read as one value form one
+group, as the comparison makes them one. Any other key is grouped as written.
+Its comparison, if it converts at all, keeps distinct values distinct:
+numbers meet in a common type, and text meets text as text.
+
 Domain. Any other correlated subquery in a filter or an expression is lifted
 onto its domain: the distinct combinations of the enclosing values it reads,
 drawn from the rows the enclosing operator reads. The subquery's FROM joins
