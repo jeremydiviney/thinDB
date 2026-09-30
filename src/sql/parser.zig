@@ -538,6 +538,22 @@ const AggExprRef = struct {
     agg: ParsedAgg,
 };
 
+/// A statement's aggregate calls: the SELECT list's first, then the hidden
+/// ones HAVING, ORDER BY and expressions hoisted. A call equal to an earlier
+/// one reads that one's output, as each would otherwise keep the same state
+/// per group again.
+const AggCalls = struct {
+    names: []const []const u8,
+    aggs: []const ParsedAgg,
+    /// The earlier call each one repeats; null for each the GroupBy computes.
+    repeats: []const ?usize,
+    /// A repeated hidden call's name, read as the call it repeats.
+    renames: []const exec_predicate.ColRename,
+    /// A repeated SELECT item, which the final projection reads by its own
+    /// name, copied from the call it repeats.
+    copies: []const ir.Derived,
+};
+
 const ParsedAggCall = struct {
     default_name: []const u8,
     agg: ParsedAgg,
@@ -1438,27 +1454,19 @@ pub const Parser = struct {
             defer agg_cols.deinit(self.arena);
             var agg_arg2_cols: std.ArrayList(?[]const u8) = .empty;
             defer agg_arg2_cols.deinit(self.arena);
-            for (proj) |p| switch (p.kind) {
-                .agg => |a| try self.appendAggInputs(a, &derived_buf, &agg_cols, &agg_arg2_cols, &synth_counter),
-                else => {},
-            };
-            for (aggregate_expr_refs) |ref| {
-                try self.appendAggInputs(ref.agg, &derived_buf, &agg_cols, &agg_arg2_cols, &synth_counter);
+            const agg_calls = try self.statementAggCalls(proj, aggregate_expr_refs);
+            for (agg_calls.aggs, agg_calls.repeats) |a, repeat| {
+                if (repeat == null) try self.appendAggInputs(a, &derived_buf, &agg_cols, &agg_arg2_cols, &synth_counter);
             }
             if (derived_buf.items.len > 0) {
                 const derived_slice = try derived_buf.toOwnedSlice(self.arena);
                 root = try self.allocOp(.{ .compute = .{ .derived = derived_slice, .upstream = root } });
             }
 
-            // Build agg specs from the projection.
             var aggs_buf: std.ArrayList(ir.AggSpec) = .empty;
             var agg_i: usize = 0;
-            for (proj) |p| switch (p.kind) {
-                .agg => |a| try self.appendAggSpec(&aggs_buf, a, p.name, agg_cols.items, agg_arg2_cols.items, &agg_i),
-                else => {},
-            };
-            for (aggregate_expr_refs) |ref| {
-                try self.appendAggSpec(&aggs_buf, ref.agg, ref.name, agg_cols.items, agg_arg2_cols.items, &agg_i);
+            for (agg_calls.names, agg_calls.aggs, agg_calls.repeats) |name, a, repeat| {
+                if (repeat == null) try self.appendAggSpec(&aggs_buf, a, name, agg_cols.items, agg_arg2_cols.items, &agg_i);
             }
             // Drop collapsed keys from the grouping columns. Collapsed `.expr`
             // keys live in `group_cols` under their projection name; build the
@@ -1535,8 +1543,11 @@ pub const Parser = struct {
             // The projection's computed predicate operands over grouped output
             // come first, as the recomputed expressions may read them;
             // HAVING's computed operands follow, so they can read those keys.
-            if (post_group_pred_derived.len > 0 or collapsed_exprs.items.len > 0 or having_derived.len > 0) {
+            // A repeated SELECT aggregate's copy leads, as any of them may
+            // read it by its name.
+            if (agg_calls.copies.len > 0 or post_group_pred_derived.len > 0 or collapsed_exprs.items.len > 0 or having_derived.len > 0) {
                 try collapsed_exprs.insertSlice(self.arena, 0, post_group_pred_derived);
+                try collapsed_exprs.insertSlice(self.arena, 0, agg_calls.copies);
                 try collapsed_exprs.appendSlice(self.arena, having_derived);
                 const above = try collapsed_exprs.toOwnedSlice(self.arena);
                 root = try self.allocOp(.{ .compute = .{ .derived = above, .upstream = root } });
@@ -1577,6 +1588,10 @@ pub const Parser = struct {
             }
             // Apply ORDER BY on the grouped schema.
             root = try self.addOrderKeyComputes(root, order_anchors, order_keys);
+            if (agg_calls.renames.len > 0) {
+                root = try self.renameAboveGroup(root, group_op, agg_calls.renames);
+                if (pending_order_specs) |specs| pending_order_specs = try renamedSortSpecs(self.arena, specs, agg_calls.renames);
+            }
             var rename_floor: *const ir.Op = group_op;
             if (distinct and !distinct_as_group) {
                 if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, group_op, group_alias_renames);
@@ -1591,7 +1606,7 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            if (distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            if (distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or agg_calls.copies.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
             if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, rename_floor, group_alias_renames);
@@ -3035,6 +3050,62 @@ pub const Parser = struct {
         } else {
             try agg_arg2_cols.append(self.arena, a.arg2_col);
         }
+    }
+
+    fn statementAggCalls(self: *Parser, proj: []const ProjItem, refs: []const AggExprRef) ParseError!AggCalls {
+        var names: std.ArrayList([]const u8) = .empty;
+        var aggs: std.ArrayList(ParsedAgg) = .empty;
+        for (proj) |p| switch (p.kind) {
+            .agg => |a| {
+                try names.append(self.arena, p.name);
+                try aggs.append(self.arena, a);
+            },
+            else => {},
+        };
+        const selected = names.items.len;
+        for (refs) |ref| {
+            try names.append(self.arena, ref.name);
+            try aggs.append(self.arena, ref.agg);
+        }
+        const repeats = try self.arena.alloc(?usize, aggs.items.len);
+        var renames: std.ArrayList(exec_predicate.ColRename) = .empty;
+        var copies: std.ArrayList(ir.Derived) = .empty;
+        for (names.items, aggs.items, repeats, 0..) |name, a, *repeat, i| {
+            repeat.* = null;
+            if (!self.aggCallRepeatable(a)) continue;
+            const first = for (aggs.items[0..i], repeats[0..i], 0..) |earlier, earlier_repeat, j| {
+                if (earlier_repeat == null and sameAggCall(earlier, a)) break j;
+            } else continue;
+            repeat.* = first;
+            const first_name = names.items[first];
+            if (i >= selected) {
+                try renames.append(self.arena, .{ .from = name, .to = first_name });
+            } else if (!types.columnNameEql(name, first_name)) {
+                try copies.append(self.arena, .{ .name = name, .expr = .{ .col_ref = first_name } });
+            }
+        }
+        return .{
+            .names = names.items,
+            .aggs = aggs.items,
+            .repeats = repeats,
+            .renames = renames.items,
+            .copies = copies.items,
+        };
+    }
+
+    /// Whether a repeat of the call may read the call's first evaluation: a
+    /// volatile argument or aggregate UDF gives each call its own value.
+    fn aggCallRepeatable(self: *const Parser, a: ParsedAgg) bool {
+        if (a.func == .udf) {
+            const registry = self.udf_registry orelse return false;
+            const udf_name = a.udf_name orelse return false;
+            for (registry.aggregateEntries()) |entry| {
+                if (entry.volatility == .@"volatile" and std.ascii.eqlIgnoreCase(entry.name, udf_name)) return false;
+            }
+        }
+        if (a.arg_expr) |e| if (exec_compute.mayVary(e, self.udf_registry)) return false;
+        if (a.arg2_expr) |e| if (exec_compute.mayVary(e, self.udf_registry)) return false;
+        return true;
     }
 
     fn appendAggSpec(
@@ -8302,6 +8373,41 @@ fn renamedSortSpecs(arena: Allocator, specs: []const ir.SortSpec, renames: []con
     return out;
 }
 
+/// Whether two aggregate calls compute one value: the same function, its
+/// DISTINCT included, over equal arguments with equal parameters.
+/// Identifiers match case-insensitively, as the engine binds them.
+fn sameAggCall(a: ParsedAgg, b: ParsedAgg) bool {
+    if (a.func != b.func) return false;
+    if ((a.udf_name == null) != (b.udf_name == null)) return false;
+    if (a.udf_name) |name| if (!std.ascii.eqlIgnoreCase(name, b.udf_name.?)) return false;
+    if (a.udf_arg_cols.len != b.udf_arg_cols.len) return false;
+    for (a.udf_arg_cols, b.udf_arg_cols) |x, y| if (!types.columnNameEql(x, y)) return false;
+    if (!sameAggArg(aggArgExpr(a.col, a.arg_expr), aggArgExpr(b.col, b.arg_expr))) return false;
+    if (!sameAggArg(aggArgExpr(a.arg2_col, a.arg2_expr), aggArgExpr(b.arg2_col, b.arg2_expr))) return false;
+    return sameAggParams(a.params, b.params);
+}
+
+fn aggArgExpr(col: ?[]const u8, expr: ?ir.Expr) ?ir.Expr {
+    if (expr) |e| return e;
+    if (col) |c| return .{ .col_ref = c };
+    return null;
+}
+
+fn sameAggArg(a: ?ir.Expr, b: ?ir.Expr) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return exec_expr.eql(x, y);
+}
+
+fn sameAggParams(a: ir.AggParams, b: ir.AggParams) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .none => true,
+        .percentile => |fraction| fraction == b.percentile,
+        .concat => |c| c.distinct == b.concat.distinct and std.mem.eql(u8, c.separator, b.concat.separator),
+    };
+}
+
 fn combineJoinSides(a: JoinExprSide, b: JoinExprSide) JoinExprSide {
     if (a == .mixed or b == .mixed) return .mixed;
     if (a == .none) return b;
@@ -8429,6 +8535,51 @@ test "volatile expressions are never shared" {
     // Each RAND() is its own draw: two anchors, and `r` stays a call.
     try std.testing.expectEqual(@as(usize, 2), anchors.compute.derived.len);
     try std.testing.expect(scalars.compute.derived[0].expr == .call);
+}
+
+fn groupByForTest(op: *const ir.Op) ?ir.Op.GroupBy {
+    return switch (op.*) {
+        .group_by => |g| g,
+        .select => |p| groupByForTest(p.upstream),
+        .filter => |f| groupByForTest(f.upstream),
+        .order_by => |o| groupByForTest(o.upstream),
+        .compute => |c| groupByForTest(c.upstream),
+        .limit => |l| groupByForTest(l.upstream),
+        .window => |w| groupByForTest(w.upstream),
+        else => null,
+    };
+}
+
+test "equal aggregate calls compute one aggregate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const cases = .{
+        .{ .sql = "SELECT k, MIN(s), COUNT(*) FROM t GROUP BY k HAVING MIN(s) <> '' AND COUNT(*) > 1", .aggs = 2 },
+        .{ .sql = "SELECT k, COUNT(*) FROM t GROUP BY k HAVING min(S) <> '' AND count(*) > 1 AND MIN(s) < 'z'", .aggs = 2 },
+        .{ .sql = "SELECT k, SUM(v) / COUNT(*), COUNT(*) FROM t GROUP BY k", .aggs = 2 },
+        .{ .sql = "SELECT SUM(v) / COUNT(*), COUNT(*) FROM t HAVING SUM(V) > 0", .aggs = 2 },
+        .{ .sql = "SELECT k, SUM(v + 1) FROM t GROUP BY k ORDER BY SUM(V + 1) DESC LIMIT 2", .aggs = 1 },
+        .{ .sql = "SELECT k, COUNT(*) AS a, COUNT(*) AS b FROM t GROUP BY k ORDER BY b", .aggs = 1 },
+        .{ .sql = "SELECT k FROM t GROUP BY k HAVING COUNT(*) > 1 AND COUNT(*) < 9 ORDER BY COUNT(*)", .aggs = 1 },
+        .{ .sql = "SELECT k, COUNT(v), COUNT(DISTINCT v) FROM t GROUP BY k HAVING COUNT(DISTINCT v) > 1", .aggs = 2 },
+        .{ .sql = "SELECT k, GROUP_CONCAT(s) FROM t GROUP BY k HAVING GROUP_CONCAT(s SEPARATOR ';') <> ''", .aggs = 2 },
+        .{ .sql = "SELECT k, GROUP_CONCAT(s ORDER BY v) FROM t GROUP BY k HAVING GROUP_CONCAT(s ORDER BY v DESC) <> ''", .aggs = 2 },
+        .{ .sql = "SELECT k, GROUP_CONCAT(DISTINCT s) FROM t GROUP BY k HAVING GROUP_CONCAT(s) <> ''", .aggs = 2 },
+        .{ .sql = "SELECT k, GROUP_CONCAT(s ORDER BY v) FROM t GROUP BY k HAVING GROUP_CONCAT(S ORDER BY V) <> ''", .aggs = 1 },
+        .{ .sql = "SELECT k, PERCENTILE_CONT(v, 0.5) FROM t GROUP BY k HAVING PERCENTILE_CONT(v, 0.9) > 0", .aggs = 2 },
+        .{ .sql = "SELECT k, MEDIAN(v) FROM t GROUP BY k HAVING PERCENTILE_CONT(v, 0.5) > 0", .aggs = 1 },
+        .{ .sql = "SELECT k, SUM(v * RAND()) FROM t GROUP BY k HAVING SUM(v * RAND()) > 0", .aggs = 2 },
+        .{ .sql = "SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(w) > 0", .aggs = 2 },
+    };
+    inline for (cases) |c| {
+        const group = groupByForTest(try parse(aa, c.sql)) orelse return error.TestUnexpectedResult;
+        std.testing.expectEqual(@as(usize, c.aggs), group.aggs.len) catch |err| {
+            std.debug.print("aggregate count for: {s}\n", .{c.sql});
+            return err;
+        };
+    }
 }
 
 test "structural materialize CSE is limited to independent expansions" {
