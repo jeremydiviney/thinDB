@@ -994,6 +994,27 @@ own values; any other scalar is grouped by its keys and LEFT JOINed back.
 A DELETE or UPDATE predicate and a join's ON take it first too; the rest of
 theirs is below.
 
+The rows a lookup probes are sorted by key when drained, so each outer row
+finds its key by binary search, in O(log rows) rather than a scan of every
+row. Validation brings the keys to the outer columns' types; where that
+leaves them out of order, as text against a number (`'10'` sorts before
+`'9'`), or the key is a float, double or JSON, the lookup scans instead. A
+lookup runs only for the rows the operator's cheaper conjuncts, which run
+first, left passing. Inner keys that differ can come to one outer
+value (text `'07'` and `'7'` against a number): a range lookup then reads
+every group with that key, and a keyed scalar raises
+`UnsupportedCorrelatedSubquery` for an outer row that finds two, since its
+inner rows were aggregated apart and neither value is the subquery's.
+
+A WHERE that ORs such ties where no one key covers all of them
+(`i.v = o.v + 1 OR i.k = o.k`) is keyed once per disjunct, the other
+conjuncts in each copy. A row passes the WHERE iff it passes some copy's,
+so EXISTS and IN hold iff they hold for some copy, and NOT EXISTS and NOT IN
+iff for none: the lookups are ORed, or for the negated forms ANDed. That
+holds only for a block that keeps or drops each row by itself, so one that
+groups or windows isn't split, and every disjunct must key, or the subquery
+goes to the domain whole.
+
 Domain. Any other correlated subquery in a filter or an expression is lifted
 onto its domain: the distinct combinations of the enclosing values it reads,
 drawn from the rows the enclosing operator reads. The subquery's FROM joins
@@ -1413,7 +1434,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
-`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes or that assigns a correlated value (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
+`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, a keyed scalar that finds two aggregates for one outer row (inner text keys `'07'` and `'7'` compared with the number 7), or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes or that assigns a correlated value (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 
