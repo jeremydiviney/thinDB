@@ -572,6 +572,20 @@ fn keyConversionExpr(aa: Allocator, name: []const u8, conversion: KeyConversion)
     } };
 }
 
+/// The reading of column `name`, a key of type `key_type`, that an equality
+/// join with a key of type `other` compares, when that reading brings two
+/// distinct values to one: text read as a number or a temporal (`'07'` and
+/// `'7'` both read as 7). Null for any other key, whose conversion, if any,
+/// keeps distinct values distinct, so rows grouped by the key as written
+/// meet the other key's values one group each.
+pub fn mergingEqualityKeyReading(aa: Allocator, name: []const u8, key_type: Type, other: Type) !?exec.Expr {
+    if (predicate.comparisonKind(key_type) != .text) return null;
+    const other_kind = predicate.comparisonKind(other);
+    if (other_kind != .number and other_kind != .temporal) return null;
+    const conversion = joinKeyConversions(key_type, other, .equality).left orelse return null;
+    return try keyConversionExpr(aa, name, conversion);
+}
+
 /// Whether a join takes `left = right` as an equality key: after the
 /// conversions `normalizeJoinKeyTypes` lays over them, the keys share a type.
 pub fn equalityKeyTypesJoin(left: Type, right: Type) bool {

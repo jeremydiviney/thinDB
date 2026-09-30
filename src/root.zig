@@ -133,6 +133,7 @@ test {
     _ = @import("util/core_scheduler.zig");
     _ = @import("util/huge_page.zig");
     _ = @import("util/buffer_pool.zig");
+    _ = @import("util/string_bank.zig");
     _ = @import("util/fair_mutex.zig");
     _ = @import("util/reader_preferring_rwlock.zig");
     _ = @import("net/conn_registry.zig");

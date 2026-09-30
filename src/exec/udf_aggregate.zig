@@ -22,6 +22,7 @@ const Error = exec.Error;
 const aggregate_mod = @import("aggregate.zig");
 const AggSpec = aggregate_mod.AggSpec;
 const AccState = aggregate_mod.AccState;
+const StringBank = @import("../util/string_bank.zig").StringBank;
 const makeQuery = exec.makeQuery;
 
 const UdfAggPlan = struct {
@@ -56,6 +57,8 @@ const StateSlot = union(enum) {
 pub const UdfAggregate = struct {
     allocator: Allocator,
     state_arena: std.heap.ArenaAllocator,
+    /// The builtin states' string copies, in `state_arena`.
+    str_bank: StringBank = .{},
     upstream: Query,
     registry: *const udf_mod.UdfRegistry,
 
@@ -350,6 +353,7 @@ pub const UdfAggregate = struct {
                     };
                     try aggregate_mod.updateState(
                         self.state_arena.allocator(),
+                        &self.str_bank,
                         builtin_slot,
                         b.spec,
                         batch,
