@@ -459,7 +459,9 @@ pub fn inputTypesOf(comptime Mod: type) []const type {
 /// struct declaration (field order = call order). No decl = no args.
 pub fn argTypesFor(comptime Mod: type) []const types.Type {
     if (!@hasDecl(Mod, "Args")) return &.{};
-    comptime {
+    // Built in a comptime block and returned outside it, so a runtime
+    // caller (`Database.registerTableFn`) gets the static list.
+    const result = comptime blk: {
         const fields = @typeInfo(Mod.Args).@"struct".fields;
         var out: [fields.len]types.Type = undefined;
         for (fields, 0..) |f, i| {
@@ -470,19 +472,22 @@ pub fn argTypesFor(comptime Mod: type) []const types.Type {
             out[i] = columnTypeFor(T);
         }
         const frozen = out;
-        return &frozen;
-    }
+        break :blk &frozen;
+    };
+    return result;
 }
 
 /// Decode one raw call argument into the field type an `Args` struct
-/// declares. Argument count and type-family were validated at compile,
-/// so mismatches here are engine bugs, not user errors.
-fn argFromValue(comptime T: type, v: ?types.Value) T {
+/// declares. Argument count and type-family were validated at compile, and
+/// an integer arrives as its declared type (`cast.narrowIntegerArg`), so
+/// other mismatches here are engine bugs, not user errors. A NULL, written
+/// or an integer that didn't fit, has no value in a non-optional field.
+fn argFromValue(comptime T: type, v: ?types.Value) error{TableFnInputMismatch}!T {
     if (@typeInfo(T) == .optional) {
         const C = @typeInfo(T).optional.child;
-        return if (v == null) null else argFromValue(C, v);
+        return if (v == null) null else try argFromValue(C, v);
     }
-    const val = v.?;
+    const val = v orelse return error.TableFnInputMismatch;
     return switch (T) {
         i8, i16, i32, i64, i128 => switch (val) {
             .tinyint => |x| @intCast(x),
@@ -524,10 +529,10 @@ fn argFromValue(comptime T: type, v: ?types.Value) T {
     };
 }
 
-fn argsValueFor(comptime Mod: type, raw: []const ?types.Value) Mod.Args {
+fn argsValueFor(comptime Mod: type, raw: []const ?types.Value) error{TableFnInputMismatch}!Mod.Args {
     var out: Mod.Args = undefined;
     inline for (@typeInfo(Mod.Args).@"struct".fields, 0..) |f, i| {
-        @field(out, f.name) = argFromValue(f.type, raw[i]);
+        @field(out, f.name) = try argFromValue(f.type, raw[i]);
     }
     return out;
 }
@@ -698,7 +703,7 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
             var call: CallArgs = undefined;
             call.@"0" = &ctx;
             if (has_args) {
-                @field(call, "1") = argsValueFor(Mod, raw_ctx.args);
+                @field(call, "1") = try argsValueFor(Mod, raw_ctx.args);
             }
             inline for (inputs, 0..) |T, i| {
                 @field(call, std.fmt.comptimePrint("{d}", .{i + 1 + arg_ofs})) =

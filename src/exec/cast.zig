@@ -211,33 +211,94 @@ fn intRank(t: TypeTag) ?u32 {
     };
 }
 
-/// The kernel for an `argNarrowingCost` cast. Out-of-range values saturate,
-/// as an explicit `CAST(bigint AS INT)` does.
+/// The kernel for an `argNarrowingCost` cast: `intNarrowKernel`, so a value
+/// the parameter can't hold is NULL, as it is in StarRocks.
 pub fn argNarrowingKernelFor(from: TypeTag, to: TypeTag) ?CastKernel {
     return switch (from) {
         .smallint => switch (to) {
-            .tinyint => makeIntNarrow(i16, i8, .tinyint),
+            .tinyint => intNarrowKernel(i16, i8),
             else => null,
         },
         .int => switch (to) {
-            .tinyint => makeIntNarrow(i32, i8, .tinyint),
-            .smallint => makeIntNarrow(i32, i16, .smallint),
+            .tinyint => intNarrowKernel(i32, i8),
+            .smallint => intNarrowKernel(i32, i16),
             else => null,
         },
         .bigint => switch (to) {
-            .tinyint => makeIntNarrow(i64, i8, .tinyint),
-            .smallint => makeIntNarrow(i64, i16, .smallint),
-            .int => makeIntNarrow(i64, i32, .int),
+            .tinyint => intNarrowKernel(i64, i8),
+            .smallint => intNarrowKernel(i64, i16),
+            .int => intNarrowKernel(i64, i32),
             else => null,
         },
         .largeint => switch (to) {
-            .tinyint => makeIntNarrow(i128, i8, .tinyint),
-            .smallint => makeIntNarrow(i128, i16, .smallint),
-            .int => makeIntNarrow(i128, i32, .int),
-            .bigint => makeIntNarrow(i128, i64, .bigint),
+            .tinyint => intNarrowKernel(i128, i8),
+            .smallint => intNarrowKernel(i128, i16),
+            .int => intNarrowKernel(i128, i32),
+            .bigint => intNarrowKernel(i128, i64),
             else => null,
         },
         else => null,
+    };
+}
+
+/// Whether the argument cast `from → to` can make a value NULL, so its
+/// buffer and the call's result must be nullable: an integer narrowing
+/// (`argNarrowingKernelFor`).
+pub fn argCastCanNull(from: TypeTag, to: TypeTag) bool {
+    return argNarrowingCost(from, to) != null;
+}
+
+/// THE integer narrowing rule, StarRocks semantics in every dialect: an
+/// integer becomes a narrower integer type's value when it fits and NULL
+/// when it doesn't (`CAST(2147483648 AS INT)`, `LEFT(s, 4294967298)`, and in
+/// the MySQL dialect `CAST(~5 AS SIGNED)`, whose operand is 2^64 - 6).
+/// Explicit CASTs, arguments narrowed to their parameter, a double or
+/// decimal read as an integer argument (`scalar_fn.INTEGER_ARG_FN`) and a
+/// table function's scalar arguments all narrow by it. A write into a column
+/// raises instead (`assignNumber`), as StarRocks' strict INSERT fails.
+pub fn narrowInt(comptime T: type, x: anytype) ?T {
+    return std.math.cast(T, x);
+}
+
+/// The kernel narrowing a `FromT` integer column to `ToT` by `narrowInt`.
+/// It writes the NULLs, so `out` must be nullable. The explicit CAST
+/// overloads (`to_int(bigint)`, `to_bigint(largeint)`, ...) and
+/// `argNarrowingKernelFor` share it.
+pub fn intNarrowKernel(comptime FromT: type, comptime ToT: type) CastKernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const src = @field(args[0].data, @tagName(intTag(FromT)));
+            const dst = &@field(out.data, @tagName(intTag(ToT)));
+            const base = out.data.rowCount();
+            try dst.ensureUnusedCapacity(allocator, row_count);
+            for (0..row_count) |row| {
+                const v = if (args[0].isValid(row)) narrowInt(ToT, src[row]) else null;
+                dst.appendAssumeCapacity(v orelse 0);
+                try out.appendValidBit(allocator, base + row, v != null);
+            }
+        }
+    }.kernel;
+}
+
+/// A table function's integer literal argument as the integer type its
+/// parameter declares, by `narrowInt`: null when it doesn't fit. Any other
+/// value, or a parameter of another type, is returned as it is.
+pub fn narrowIntegerArg(v: types.Value, to: Type) ?types.Value {
+    const x: i128 = switch (v) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        .largeint => |x| x,
+        else => return v,
+    };
+    return switch (to) {
+        .tinyint => .{ .tinyint = narrowInt(i8, x) orelse return null },
+        .smallint => .{ .smallint = narrowInt(i16, x) orelse return null },
+        .int => .{ .int = narrowInt(i32, x) orelse return null },
+        .bigint => .{ .bigint = narrowInt(i64, x) orelse return null },
+        .largeint => .{ .largeint = x },
+        else => v,
     };
 }
 
@@ -586,7 +647,7 @@ fn copyValidityIfNullable(
 fn makeIntWiden(comptime FromT: type, comptime ToT: type, comptime to_tag: TypeTag) CastKernel {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-            const src = @field(args[0].data, @tagName(srcTag(FromT)));
+            const src = @field(args[0].data, @tagName(intTag(FromT)));
             const dst = &@field(out.data, @tagName(to_tag));
             var i: usize = 0;
             while (i < row_count) : (i += 1) try dst.append(allocator, @as(ToT, src[i]));
@@ -595,24 +656,10 @@ fn makeIntWiden(comptime FromT: type, comptime ToT: type, comptime to_tag: TypeT
     }.kernel;
 }
 
-fn makeIntNarrow(comptime FromT: type, comptime ToT: type, comptime to_tag: TypeTag) CastKernel {
-    return struct {
-        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-            const src = @field(args[0].data, @tagName(srcTag(FromT)));
-            const dst = &@field(out.data, @tagName(to_tag));
-            const lo: FromT = std.math.minInt(ToT);
-            const hi: FromT = std.math.maxInt(ToT);
-            var i: usize = 0;
-            while (i < row_count) : (i += 1) try dst.append(allocator, @as(ToT, @intCast(std.math.clamp(src[i], lo, hi))));
-            try copyValidityIfNullable(allocator, args[0], out, row_count);
-        }
-    }.kernel;
-}
-
 fn makeIntToFloat(comptime FromT: type, comptime ToT: type, comptime to_tag: TypeTag) CastKernel {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-            const src = @field(args[0].data, @tagName(srcTag(FromT)));
+            const src = @field(args[0].data, @tagName(intTag(FromT)));
             const dst = &@field(out.data, @tagName(to_tag));
             var i: usize = 0;
             while (i < row_count) : (i += 1) try dst.append(allocator, @as(ToT, @floatFromInt(src[i])));
@@ -672,16 +719,15 @@ fn makeDateToDatetime() CastKernel {
     }.kernel;
 }
 
-/// Map a Zig scalar type back to its TypeTag for @field lookups. Only
-/// needs to cover the source-side integer widths we cast FROM.
-fn srcTag(comptime T: type) TypeTag {
+/// An integer width's TypeTag, for @field lookups.
+fn intTag(comptime T: type) TypeTag {
     return switch (T) {
         i8 => .tinyint,
         i16 => .smallint,
         i32 => .int,
         i64 => .bigint,
         i128 => .largeint,
-        else => @compileError("srcTag: unsupported source type " ++ @typeName(T)),
+        else => @compileError("intTag: not an integer type " ++ @typeName(T)),
     };
 }
 
