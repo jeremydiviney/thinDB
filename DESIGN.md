@@ -1049,13 +1049,26 @@ row. Validation brings the keys to the outer columns' types; where that
 leaves them out of order, as text against a number (`'10'` sorts before
 `'9'`), or the key is a float, double or JSON, the lookup scans instead. A
 lookup runs only for the rows the operator's cheaper conjuncts, which run
-first, left passing. Inner keys that differ can come to one outer
-value (text `'07'` and `'7'` against a number): a range lookup then reads
-every group with that key, and a keyed scalar raises
-`UnsupportedCorrelatedSubquery` for an outer row that finds two, since its
-inner rows were aggregated apart and neither value is the subquery's.
+first, left passing.
 
-A WHERE that ORs such ties where no one key covers all of them
+Inner keys that differ can come to one outer value: text compared with a
+number, a DATE or a DATETIME is read as that type (§3.1), so `'7'`, `'07'`
+and `'7.0'` are all 7. A range lookup then reads every group with that key.
+The forms that aggregate (the keyed scalar lookup, and the scalar grouped and
+joined back) group the inner rows by each such key as the comparison reads
+it, so the rows that read as one value form one group, as the comparison
+makes them one. Grouped as written, an outer 7 would meet three groups: the
+join back would return its row three times, and the lookup would find three
+aggregates, none of them the subquery's. Such a key is grouped, counted for a
+LIMIT, looked up and joined on its read value. Any other key is grouped as
+written: its comparison, if it converts at all, keeps distinct values
+distinct, as numbers meeting in a common type and text meeting text do. A
+keyed scalar planned where the enclosing operator's rows aren't known (a
+join's extra predicate) can't read its keys' types, groups as written, and
+raises `UnsupportedCorrelatedSubquery` for an outer row that finds two
+groups rather than compare one.
+
+A WHERE that ORs equality and range ties where no one key covers all of them
 (`i.v = o.v + 1 OR i.k = o.k`) is keyed once per disjunct, the other
 conjuncts in each copy. A row passes the WHERE iff it passes some copy's,
 so EXISTS and IN hold iff they hold for some copy, and NOT EXISTS and NOT IN
@@ -1499,7 +1512,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
-`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side or an ON that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, a keyed scalar that finds two aggregates for one outer row (inner text keys `'07'` and `'7'` compared with the number 7), or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes or that assigns a correlated value (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
+`UnsupportedCorrelatedSubquery` means a subquery reads an enclosing query's columns in a form neither decorrelation strategy carries (§6.7): a FULL JOIN inside the subquery with a side or an ON that reads them, a `SELECT *` the lift can't spell out (a star over a join whose columns share names), an aggregate over only enclosing columns nested in another aggregate or beside an ungrouped outer column, a keyed scalar in a join's extra predicate that finds two aggregates for one outer row (inner text keys `'07'` and `'7'` compared with the number 7; elsewhere such keys group as one), or a DELETE or UPDATE on a target without a primary key whose predicate no keyed path takes or that assigns a correlated value (there's no sound row identity to write the rows it selects by). A subquery's names bind as SQL scopes them: a qualified name by its qualifier, whatever the inner relation is (table, view, CTE or derived table), and an unqualified one to the innermost block that has the column. A subquery correlated by equalities and ranges alone has its inner block materialized once without its correlation terms, which are then applied per outer row as lookup keys; any other is joined with the distinct enclosing values it reads. It is never compiled with an outer-qualified name left in it, since that name would bind to an inner column of the same bare name.
 
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 

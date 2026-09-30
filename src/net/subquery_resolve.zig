@@ -39,6 +39,7 @@ const exec = @import("../exec/exec.zig");
 const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
 const time_fn = @import("../exec/scalar_fn_time.zig");
+const join_mod = @import("../exec/join.zig");
 
 const storage = @import("../storage/storage.zig");
 
@@ -181,7 +182,7 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr, lowered:
                 .unknown;
         },
         .scalar_subquery => |sq| {
-            if (try maybeResolveCorrelatedScalar(ctx, pred, sq)) return;
+            if (try maybeResolveCorrelatedScalar(ctx, pred, sq, lowered)) return;
             if (lowered) |l| if (l.late_scalars) {
                 try lowerPredicateScalars(ctx, pred, l);
                 if (pred.* != .scalar_subquery) return;
@@ -1920,12 +1921,64 @@ fn equiCorrelated(info: ?CorrelationInfo) bool {
     return i.outer_cols.items.len > 0 and i.range_corrs.items.len == 0;
 }
 
-fn groupByKeys(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []const ir.AggSpec, input: *ir.Op) !*ir.Op {
+fn groupByKeys(ctx: *CompileCtx, keys: []const []const u8, aggs: []const ir.AggSpec, input: *ir.Op) !*ir.Op {
     return try newOp(ctx, .{ .group_by = .{
-        .group_cols = try ctx.nodeArena().dupe([]const u8, info.inner_cols.items),
+        .group_cols = try ctx.nodeArena().dupe([]const u8, keys),
         .aggs = aggs,
         .upstream = input,
     } });
+}
+
+/// The keys a keyed subquery groups its inner rows by, each meeting the
+/// outer key beside it in `info.outer_cols`, over the rows it groups.
+const GroupKeys = struct {
+    rows: *ir.Op,
+    inner: []const []const u8,
+};
+
+/// The inner rows grouped as the outer row compares them. An inner key its
+/// outer key reads as a number or a temporal, as text, brings distinct
+/// values to one (`'07'` and `'7'` to 7: `join.mergingEqualityKeyReading`);
+/// grouped as written, that outer value would meet two groups, each over
+/// part of its rows. Such a key groups by that reading instead. Any other
+/// key groups as written, as does every key when the enclosing operator's
+/// rows aren't in `lowered`.
+fn comparedGroupKeys(ctx: *CompileCtx, info: *const CorrelationInfo, rows: *ir.Op, lowered: ?*const LoweredScalars) !GroupKeys {
+    const na = ctx.nodeArena();
+    const written: GroupKeys = .{ .rows = rows, .inner = info.inner_cols.items };
+    const domain = (lowered orelse return written).domain orelse return written;
+    try prepareSubplan(ctx, rows);
+    const inner_types = try keyTypes(ctx, rows, info.inner_cols.items);
+    for (inner_types) |t| {
+        if (t != null and exec.predicate.comparisonKind(t.?) == .text) break;
+    } else return written;
+    var outer_rows = domain.input;
+    if (info.outer_values.items.len > 0) {
+        outer_rows = try newOp(ctx, .{ .compute = .{ .derived = info.outer_values.items, .upstream = outer_rows } });
+    }
+    const outer_types = try keyTypes(ctx, outer_rows, info.outer_cols.items);
+    const keys = try na.dupe([]const u8, info.inner_cols.items);
+    var readings: std.ArrayList(ir.Derived) = .empty;
+    for (keys, inner_types, outer_types) |*key, inner_type, outer_type| {
+        const reading = (try join_mod.mergingEqualityKeyReading(na, key.*, inner_type orelse continue, outer_type orelse continue)) orelse continue;
+        const name = try std.fmt.allocPrint(na, "__csq_g{d}", .{ctx.lowered_scalars});
+        ctx.lowered_scalars += 1;
+        try readings.append(na, .{ .name = name, .expr = reading });
+        key.* = name;
+    }
+    if (readings.items.len == 0) return written;
+    return .{ .rows = try newOp(ctx, .{ .compute = .{ .derived = readings.items, .upstream = rows } }), .inner = keys };
+}
+
+/// The type of each of `names` in `rows`' output, compiled; null for a name
+/// it doesn't carry.
+fn keyTypes(ctx: *CompileCtx, rows: *const ir.Op, names: []const []const u8) ![]const ?types.Type {
+    var q = try local.compileSubplan(ctx, rows);
+    defer q.deinit();
+    const schema = q.outputSchema();
+    const out = try ctx.nodeArena().alloc(?types.Type, names.len);
+    for (names, out) |name, *t| t.* = if (types.findColumn(schema, name)) |i| schema[i].type else null;
+    return out;
 }
 
 /// Null when the aggregate, keyed on its correlations, still reads the
@@ -1938,9 +1991,10 @@ fn lowerScalarAggregate(ctx: *CompileCtx, shape: ScalarAggregate, info: *const C
     }
     const aggs = try na.dupe(ir.AggSpec, shape.aggs);
     for (aggs, 0..) |*a, j| a.as = try std.fmt.allocPrint(na, "__csq_a{d}", .{j});
-    const grouped = try groupByKeys(ctx, info, aggs, inner);
-    if (try readsFree(ctx, grouped)) return null;
-    return try aggregateValues(ctx, shape, try joinGroupedInner(ctx, info, aggs, grouped, lowered), lowered);
+    if (try readsFree(ctx, try groupByKeys(ctx, info.inner_cols.items, aggs, inner))) return null;
+    const keys = try comparedGroupKeys(ctx, info, inner, lowered);
+    const grouped = try groupByKeys(ctx, keys.inner, aggs, keys.rows);
+    return try aggregateValues(ctx, shape, try joinGroupedInner(ctx, info, keys.inner, aggs, grouped, lowered), lowered);
 }
 
 /// A scalar aggregate lifted onto its domain: grouped per domain row. A
@@ -2004,19 +2058,26 @@ fn aggregateValues(ctx: *CompileCtx, shape: ScalarAggregate, alias: []const u8, 
     return exec.predicate.renameOf(renames, shape.selected);
 }
 
-/// Each key's inner rows, grouped to one row: the selected value and how
-/// many rows the key matched. Null when that grouping still reads the outer
-/// row.
+/// Each key's inner rows (`comparedGroupKeys`), limited within the key and
+/// grouped to one row: the selected value and how many rows the key
+/// matched. Null when that grouping still reads the outer row.
 fn lowerScalarLookup(ctx: *CompileCtx, shape: ScalarLookup, info: *const CorrelationInfo, lowered: *LoweredScalars) !?[]const u8 {
     var inner = try keptRows(ctx, info);
     for (shape.computes) |derived| {
         inner = try newOp(ctx, .{ .compute = .{ .derived = derived, .upstream = inner } });
     }
-    if (shape.limit) |limit| inner = try limitPerKey(ctx, info, shape.order, limit, inner);
     const aggs = try lookupAggs(ctx, shape.selected);
-    const grouped = try groupByKeys(ctx, info, aggs, inner);
-    if (try readsFree(ctx, grouped)) return null;
-    return try singleRowValue(ctx, try joinGroupedInner(ctx, info, aggs, grouped, lowered), lowered);
+    if (try readsFree(ctx, try limitedGroups(ctx, shape, info.inner_cols.items, aggs, inner))) return null;
+    const keys = try comparedGroupKeys(ctx, info, inner, lowered);
+    const grouped = try limitedGroups(ctx, shape, keys.inner, aggs, keys.rows);
+    return try singleRowValue(ctx, try joinGroupedInner(ctx, info, keys.inner, aggs, grouped, lowered), lowered);
+}
+
+/// `rows` grouped by `keys` into `aggs`, under the lookup's `LIMIT` within
+/// each key.
+fn limitedGroups(ctx: *CompileCtx, shape: ScalarLookup, keys: []const []const u8, aggs: []const ir.AggSpec, rows: *ir.Op) !*ir.Op {
+    const limited = if (shape.limit) |limit| try limitPerKey(ctx, keys, shape.order, limit, rows) else rows;
+    return try groupByKeys(ctx, keys, aggs, limited);
 }
 
 /// Any other scalar subquery lifted onto its domain, its rows per domain
@@ -2059,9 +2120,9 @@ fn singleRowValue(ctx: *CompileCtx, alias: []const u8, lowered: *LoweredScalars)
 }
 
 /// The subquery's `ORDER BY ... LIMIT n OFFSET m` applied within each key.
-fn limitPerKey(ctx: *CompileCtx, info: *const CorrelationInfo, order: []const ir.SortSpec, limit: ir.Op.Limit, input: *ir.Op) !*ir.Op {
+fn limitPerKey(ctx: *CompileCtx, keys: []const []const u8, order: []const ir.SortSpec, limit: ir.Op.Limit, input: *ir.Op) !*ir.Op {
     const rank = "__csq_rn";
-    return try rankFilter(ctx, rank, limit, try rankWithin(ctx, info.inner_cols.items, order, rank, input));
+    return try rankFilter(ctx, rank, limit, try rankWithin(ctx, keys, order, rank, input));
 }
 
 /// `input` with each row's number within its `keys`, in `order`, as `rank`.
@@ -2100,10 +2161,10 @@ const JoinKeys = struct {
     null_safe_from: usize,
 };
 
-fn joinGroupedInner(ctx: *CompileCtx, info: *const CorrelationInfo, aggs: []const ir.AggSpec, grouped: *ir.Op, lowered: *LoweredScalars) ![]const u8 {
+/// `grouped` joined on its `keys`, each meeting the outer key beside it.
+fn joinGroupedInner(ctx: *CompileCtx, info: *const CorrelationInfo, keys: []const []const u8, aggs: []const ir.AggSpec, grouped: *ir.Op, lowered: *LoweredScalars) ![]const u8 {
     const values = try ctx.nodeArena().alloc([]const u8, aggs.len);
     for (aggs, values) |a, *value| value.* = a.as;
-    const keys = info.inner_cols.items;
     const alias = try joinKeyed(ctx, grouped, .{ .inner = keys, .outer = info.outer_cols.items, .null_safe_from = keys.len }, values, null, lowered);
     try lowered.computeOuterValues(ctx, info);
     return alias;
@@ -2571,7 +2632,7 @@ fn scanAlias(op: *const ir.Op) ?[]const u8 {
 /// grouped by the correlation keys instead, its rows map each key to the
 /// aggregate the outer row compares with. Returns true when correlated and
 /// pred.* was rewritten.
-fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anytype) !bool {
+fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anytype, lowered: ?*const LoweredScalars) !bool {
     const shape = (try analyzeScalarAggregate(ctx, sq.source)) orelse return false;
     const info = if (shape.info) |*i| i else return false;
     if (info.outer_cols.items.len == 0 or info.outer_values.items.len > 0) return false;
@@ -2581,8 +2642,10 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
     if (info.range_corrs.items.len > 0) return false;
 
     const aa = try ctx.subqueryArena();
-    const gb_new = try groupByKeys(ctx, info, shape.aggs, try keptRows(ctx, info));
-    if (try readsFree(ctx, gb_new)) return false;
+    const kept = try keptRows(ctx, info);
+    if (try readsFree(ctx, try groupByKeys(ctx, info.inner_cols.items, shape.aggs, kept))) return false;
+    const keys = try comparedGroupKeys(ctx, info, kept, lowered);
+    const gb_new = try groupByKeys(ctx, keys.inner, shape.aggs, keys.rows);
     try prepareSubplan(ctx, gb_new);
 
     // Drain. Output schema is [inner_correlation_keys..., agg_value].

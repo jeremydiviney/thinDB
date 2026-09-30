@@ -797,6 +797,85 @@ test "correlated DELETE and UPDATE computing a correlated scalar no keyed path t
     inline for (cases) |case| try expectRowsAfter(allocator, case[0], "ex_t", case[1]);
 }
 
+fn setupTextKeys(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, io, dir, .{});
+    errdefer db.close();
+    try exec(allocator, db, "CREATE TABLE tk_t (id BIGINT PRIMARY KEY, n INT, d DATE, f DOUBLE, m DECIMAL(6,2), s VARCHAR(8))");
+    try exec(allocator, db, "CREATE TABLE tk_u (id BIGINT PRIMARY KEY, s VARCHAR(12), v INT)");
+    try exec(allocator, db, "CREATE TABLE tk_np (id BIGINT, n INT)");
+    try exec(allocator, db, "INSERT INTO tk_t VALUES (1, 7, '2024-01-07', 7.0, 7.00, '7'), (2, 8, '2024-01-08', 8.5, 8.50, '07'), (3, 9, '2024-01-09', 9.0, 9.00, 'x')");
+    try exec(allocator, db,
+        \\INSERT INTO tk_u VALUES (1, '7', 10), (2, '07', 20), (3, '7.0', 30), (4, '8', 40), (5, '7x', 50),
+        \\  (6, '2024-01-07', 60), (7, '2024-1-7', 70), (8, '8.5', 80), (9, '8.50', 90), (10, NULL, 100)
+    );
+    try exec(allocator, db, "INSERT INTO tk_np VALUES (1, 7), (2, 8), (3, 9)");
+    inline for (.{ "tk_t", "tk_u", "tk_np" }) |name| {
+        const t = try db.openTable(name, .{});
+        try t.flush();
+    }
+    return db;
+}
+
+test "a correlated scalar keyed by text against a number or a date meets one group per outer row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupTextKeys(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // '7', '07' and '7.0' all equal the outer 7, so they count as one group
+    // under the comparison's type. Rows are DuckDB's, comparing TRY_CAST of
+    // the text to the outer key's type.
+    const cases = .{
+        .{ "SELECT t.id, (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.n) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 3, 2, 1, 3, 0 } },
+        .{ "SELECT t.id, (SELECT SUM(u.v) FROM tk_u u WHERE u.s = t.n) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 60, 2, 40, 3, null } },
+        .{ "SELECT t.id FROM tk_t t WHERE (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.n) = 3 ORDER BY t.id", &[_]?i64{1} },
+        .{ "SELECT t.id FROM tk_t t WHERE t.id < (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.n) ORDER BY t.id", &[_]?i64{1} },
+        .{ "SELECT t.id, (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.n + 1) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 1, 2, 0, 3, 0 } },
+        .{ "SELECT t.id, (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.d) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 2, 2, 0, 3, 0 } },
+        .{ "SELECT t.id, (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.f) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 3, 2, 2, 3, 0 } },
+        .{ "SELECT t.id, (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.m) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 3, 2, 2, 3, 0 } },
+        .{ "SELECT t.id, (SELECT COUNT(*) FROM tk_u u WHERE u.s = t.s) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 1, 2, 1, 3, 0 } },
+        .{ "SELECT t.id, (SELECT u.v FROM tk_u u WHERE u.s = t.n ORDER BY u.v LIMIT 1) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 10, 2, 40, 3, null } },
+        .{ "SELECT t.id, (SELECT u.v FROM tk_u u WHERE u.s = t.n ORDER BY u.v DESC LIMIT 1 OFFSET 1) AS c FROM tk_t t ORDER BY t.id", &[_]?i64{ 1, 20, 2, null, 3, null } },
+        .{ "SELECT t.id, (SELECT u.v FROM tk_u u WHERE u.s = t.n) AS c FROM tk_t t WHERE t.id = 2", &[_]?i64{ 2, 40 } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+
+    var q = try runSql(allocator, db, "SELECT t.id, (SELECT u.v FROM tk_u u WHERE u.s = t.n) AS c FROM tk_t t");
+    defer q.deinit();
+    while (q.next()) |batch| {
+        if (batch == null) return error.TestUnexpectedSuccess;
+    } else |err| try std.testing.expectEqual(error.SubqueryMultipleRows, err);
+}
+
+test "correlated DELETE and UPDATE by a scalar keyed by text against a number write one group per target row" {
+    const allocator = std.testing.allocator;
+    // Rows are DuckDB's.
+    const cases = .{
+        .{ "UPDATE tk_t SET n = n + 100 WHERE (SELECT COUNT(*) FROM tk_u u WHERE u.s = tk_t.n) = 3", "SELECT id, n FROM tk_t ORDER BY id", &[_]?i64{ 1, 107, 2, 8, 3, 9 } },
+        .{ "UPDATE tk_np SET n = 0 WHERE 1 = (SELECT COUNT(*) FROM tk_u u WHERE u.s = tk_np.n)", "SELECT id, n FROM tk_np ORDER BY id", &[_]?i64{ 1, 7, 2, 0, 3, 9 } },
+        .{ "DELETE FROM tk_np WHERE (SELECT COUNT(*) FROM tk_u u WHERE u.s = tk_np.n) = 3", "SELECT id, n FROM tk_np ORDER BY id", &[_]?i64{ 2, 8, 3, 9 } },
+        .{ "UPDATE tk_t SET n = (SELECT SUM(u.v) FROM tk_u u WHERE u.s = tk_t.n)", "SELECT id, n FROM tk_t ORDER BY id", &[_]?i64{ 1, 60, 2, 40, 3, null } },
+    };
+    inline for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try setupTextKeys(allocator, std.testing.io, tmp.dir);
+        defer db.close();
+        try exec(allocator, db, case[0]);
+        expectCells(allocator, db, case[1], case[2]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
 fn setupKeys(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();
@@ -846,14 +925,26 @@ test "correlated lookups by key of each type, beside the outer query's other con
     }
 }
 
-test "a keyed correlated scalar whose outer value two inner keys come to fails rather than compare one group" {
+test "a keyed correlated scalar whose outer value several inner keys come to compares their one group" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try setupKeys(allocator, io, tmp.dir);
-    defer db.close();
-    try std.testing.expectError(error.UnsupportedCorrelatedSubquery, exec(allocator, db, "UPDATE ko SET v = -1 WHERE 1 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki)"));
-    try exec(allocator, db, "UPDATE ko SET v = -1 WHERE 1 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki AND i.ksn NOT LIKE '0%')");
-    try expectCells(allocator, db, "SELECT id, v FROM ko ORDER BY id", &.{ 1, -1, 2, -1, 3, 7, 4, -1, 5, 9, 6, -1 });
+    // `ksn` is text: '7' and '07' both equal the number 7, as '2' and
+    // '02' equal 2, so each outer value compares one group of all its rows.
+    // Rows are DuckDB's, `ksn` read as a number.
+    const cases = .{
+        .{ "UPDATE ko SET v = -1 WHERE 1 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki)", &[_]?i64{ 1, -1, 2, 2, 3, 7, 4, -1, 5, 9, 6, 4 } },
+        .{ "UPDATE ko SET v = -1 WHERE 2 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki)", &[_]?i64{ 1, 5, 2, -1, 3, 7, 4, null, 5, 9, 6, -1 } },
+        .{ "UPDATE ko SET v = -1 WHERE 1 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki AND i.ksn NOT LIKE '0%')", &[_]?i64{ 1, -1, 2, -1, 3, 7, 4, -1, 5, 9, 6, -1 } },
+        .{ "UPDATE ko SET v = (SELECT SUM(i.v) FROM kn i WHERE i.ksn = ko.ki)", &[_]?i64{ 1, 10, 2, 11, 3, null, 4, null, 5, 19, 6, 11 } },
+    };
+    inline for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try setupKeys(allocator, std.testing.io, tmp.dir);
+        defer db.close();
+        try exec(allocator, db, case[0]);
+        expectCells(allocator, db, "SELECT id, v FROM ko ORDER BY id", case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
 }
