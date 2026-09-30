@@ -490,11 +490,10 @@ test "correlated DELETE and UPDATE no keyed path takes write the rows found by t
     const allocator = std.testing.allocator;
     // Rows are DuckDB's.
     const cases = .{
-        .{ "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 30 OR y.v = ex_t.v)", &[_]?i64{ 3, null } },
+        .{ "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id - ex_t.k = 10 OR y.v = ex_t.v + 1)", &[_]?i64{ 5, 2 } },
         .{ "UPDATE ex_t SET v = v + 100 WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id <> ex_t.k AND y.v = ex_t.v)", &[_]?i64{ 1, 5, 2, 102, 3, null, 4, 107, 5, 102 } },
         .{ "DELETE FROM ex_t WHERE ex_t.v IN (SELECT y.v FROM ex_u y WHERE y.id <> ex_t.k)", &[_]?i64{ 1, 5, 3, null } },
         .{ "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id - ex_t.k = 10 AND y.v > ex_t.v)", &[_]?i64{ 2, 2, 3, null, 5, 2 } },
-        .{ "UPDATE ex_t SET v = -1 WHERE NOT EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 30 OR y.v = ex_t.v + 1)", &[_]?i64{ 1, 5, 2, 2, 3, -1, 4, -1, 5, -1 } },
         // A key no inner row has still counts zero rows.
         .{ "DELETE FROM ex_t WHERE ex_t.v * 0 = (SELECT COUNT(*) FROM ex_u y WHERE y.id = ex_t.k + 10)", &[_]?i64{ 1, 5, 2, 2, 3, null, 4, 7 } },
     };
@@ -511,6 +510,45 @@ test "correlated DELETE and UPDATE no keyed path takes write the rows found by t
     }
 }
 
+test "correlated EXISTS and IN whose WHERE ORs keyed ties probe one keyed set per disjunct" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, io, tmp.dir);
+    defer db.close();
+    // Rows are DuckDB's. The last two ORs hold a disjunct no key covers,
+    // so they lift onto the domain instead.
+    const cases = .{
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = x.k + 30 OR y.v = x.v) ORDER BY x.id", &[_]?i64{ 1, 2, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE NOT EXISTS (SELECT 1 FROM ex_u y WHERE y.id = x.k + 30 OR y.v = x.v + 1) ORDER BY x.id", &[_]?i64{ 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IN (SELECT y.v FROM ex_u y WHERE y.id = x.k + 20 OR (y.w = 'a' AND y.id = x.k)) ORDER BY x.id", &[_]?i64{2} },
+        .{ "SELECT x.id FROM ex_t x WHERE x.v IS NOT NULL AND x.v NOT IN (SELECT y.v FROM ex_u y WHERE (y.id = x.k OR y.id = x.k + 20) AND y.v IS NOT NULL) ORDER BY x.id", &[_]?i64{ 1, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = x.k + 40 OR y.v > x.v + 5 OR (y.w = 'c' AND y.id = x.k)) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE x.id > 1 AND EXISTS (SELECT 1 FROM ex_u y WHERE y.v = x.v + 5 OR y.id = x.k + 10) ORDER BY x.id", &[_]?i64{ 2, 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM (SELECT id, v, w FROM ex_u) y WHERE y.v = x.v OR y.id = x.k + 30) ORDER BY x.id", &[_]?i64{ 1, 2, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.v = x.v OR y.w = 'e') ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4, 5 } },
+        .{ "SELECT x.id FROM ex_t x WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id - x.k = 10 OR y.v = x.v + 1) ORDER BY x.id", &[_]?i64{ 1, 2, 3, 4 } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+    // Keyed per disjunct, they filter the target in place, with or without
+    // its key.
+    const writes = .{
+        .{ "DELETE FROM ex_t WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 30 OR y.v = ex_t.v)", "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = np.k + 30 OR y.v = np.v)", &[_]?i64{ 3, null, 30 } },
+        .{ "UPDATE ex_t SET v = -1 WHERE NOT EXISTS (SELECT 1 FROM ex_u y WHERE y.id = ex_t.k + 30 OR y.v = ex_t.v + 1)", "UPDATE np SET v = -1 WHERE NOT EXISTS (SELECT 1 FROM ex_u y WHERE y.id = np.k + 30 OR y.v = np.v + 1)", &[_]?i64{ 1, 5, 10, 2, 2, 20, 3, -1, 30, 4, -1, 40, 5, -1, 50 } },
+        .{ "UPDATE ex_t SET v = 0 WHERE ex_t.v IN (SELECT y.v FROM ex_u y WHERE y.id = ex_t.k OR y.id = ex_t.k + 20)", "UPDATE np SET v = 0 WHERE np.v IN (SELECT y.v FROM ex_u y WHERE y.id = np.k OR y.id = np.k + 20)", &[_]?i64{ 1, 5, 10, 2, 0, 20, 3, null, 30, 4, 7, 40, 5, 2, 50 } },
+    };
+    inline for (writes) |case| {
+        try expectRowsAfter(allocator, case[0], "ex_t", case[2]);
+        try expectRowsAfter(allocator, case[1], "np", case[2]);
+    }
+}
+
 test "correlated DELETE and UPDATE on a target without a primary key fail when no keyed path takes them" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -522,7 +560,7 @@ test "correlated DELETE and UPDATE on a target without a primary key fail when n
 
     // Without a key there's no sound row identity to write the found rows
     // by, so these fail, and a keyed one still runs.
-    try helpers.expectRunError(allocator, db, "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id = np.k OR y.v = np.v)", error.UnsupportedCorrelatedSubquery);
+    try helpers.expectRunError(allocator, db, "DELETE FROM np WHERE EXISTS (SELECT 1 FROM ex_u y WHERE y.id - np.k = 10 OR y.v = np.v)", error.UnsupportedCorrelatedSubquery);
     try helpers.expectRunError(allocator, db, "UPDATE np SET v = 0 WHERE np.v IN (SELECT y.v FROM ex_u y WHERE y.id <> np.k)", error.UnsupportedCorrelatedSubquery);
     try helpers.expectRunError(allocator, db, "UPDATE np SET v = 0 WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v = np.v) + 1 = 2", error.UnsupportedCorrelatedSubquery);
     try helpers.expectRunError(allocator, db, "DELETE FROM np WHERE (SELECT COUNT(*) FROM ex_u y WHERE y.v <> np.v) = 2", error.UnsupportedCorrelatedSubquery);
@@ -832,6 +870,79 @@ test "correlated DELETE and UPDATE by a scalar keyed by text against a number wr
         defer db.close();
         try exec(allocator, db, case[0]);
         expectCells(allocator, db, case[1], case[2]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+fn setupKeys(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, io, dir, .{});
+    errdefer db.close();
+    try exec(allocator, db, "CREATE TABLE ko (id BIGINT PRIMARY KEY, ki INT, ks VARCHAR(4), kd DATE, kdec DECIMAL(6,2), v INT)");
+    try exec(allocator, db, "CREATE TABLE kn (id BIGINT PRIMARY KEY, ki INT, ks VARCHAR(4), ksn VARCHAR(4), kd DATE, kdec DECIMAL(6,2), v INT)");
+    try exec(allocator, db, "INSERT INTO ko VALUES (1, 1, 'a', '2024-01-01', 1.50, 5), (2, 2, 'b', '2024-01-02', 2.00, 2), (3, NULL, NULL, NULL, NULL, 7), (4, 3, 'c', '2024-01-03', 3.25, NULL), (5, 7, 'b', '2024-01-01', 1.50, 9), (6, 2, 'a', '2024-01-05', 2.00, 4)");
+    try exec(allocator, db, "INSERT INTO kn VALUES (1, 2, 'b', '7', '2024-01-02', 2.00, 12), (2, 2, 'a', '07', '2024-01-01', 1.50, 1), (3, 1, 'a', '2', '2024-01-05', 3.25, 6), (4, NULL, NULL, NULL, NULL, NULL, 1), (5, 7, 'b', '1', '2024-01-01', 2.00, 10), (6, 7, 'c', '7', '2024-01-03', 1.50, 2), (7, 3, 'b', '02', '2024-01-02', 3.25, 5), (8, 1, 'd', '3', '2024-01-01', 1.50, NULL), (9, 2, 'b', '07', '2024-01-03', 2.00, 4)");
+    const t1 = try db.openTable("ko", .{});
+    try t1.flush();
+    const t2 = try db.openTable("kn", .{});
+    try t2.flush();
+    return db;
+}
+
+test "correlated lookups by key of each type, beside the outer query's other conjuncts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupKeys(allocator, io, tmp.dir);
+    defer db.close();
+    // `ksn` is text: '7' and '07' both equal the number 7, so an outer 7
+    // reads both of their groups. Rows are DuckDB's, `ksn` read as a number.
+    const cases = .{
+        .{ "SELECT o.id FROM ko o WHERE EXISTS (SELECT 1 FROM kn i WHERE i.ki = o.ki) ORDER BY o.id", &[_]?i64{ 1, 2, 4, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE EXISTS (SELECT 1 FROM kn i WHERE i.ks = o.ks AND i.kd = o.kd) ORDER BY o.id", &[_]?i64{ 1, 2, 4, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE EXISTS (SELECT 1 FROM kn i WHERE i.kdec = o.kdec) ORDER BY o.id", &[_]?i64{ 1, 2, 4, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE NOT EXISTS (SELECT 1 FROM kn i WHERE i.kd = o.kd) ORDER BY o.id", &[_]?i64{3} },
+        .{ "SELECT o.id FROM ko o WHERE o.ki IN (SELECT i.ki FROM kn i WHERE i.ks = o.ks) ORDER BY o.id", &[_]?i64{ 1, 2, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE o.v IS NOT NULL AND o.v NOT IN (SELECT i.v FROM kn i WHERE i.ki = o.ki AND i.v IS NOT NULL) ORDER BY o.id", &[_]?i64{ 1, 2, 3, 5 } },
+        .{ "SELECT o.id FROM ko o WHERE o.v > (SELECT AVG(i.v) FROM kn i WHERE i.ks = o.ks) ORDER BY o.id", &[_]?i64{ 1, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE 0 = (SELECT COUNT(*) FROM kn i WHERE i.kd = o.kd) ORDER BY o.id", &[_]?i64{3} },
+        .{ "SELECT o.id FROM ko o WHERE EXISTS (SELECT 1 FROM kn i WHERE i.ki = o.ki AND i.v > o.v) ORDER BY o.id", &[_]?i64{ 1, 2, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE EXISTS (SELECT 1 FROM kn i WHERE i.ksn = o.ki AND i.v > o.v) ORDER BY o.id", &[_]?i64{ 1, 2, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE NOT EXISTS (SELECT 1 FROM kn i WHERE i.ksn = o.ki AND i.v > o.v) ORDER BY o.id", &[_]?i64{ 3, 4 } },
+        .{ "SELECT o.id FROM ko o WHERE EXISTS (SELECT 1 FROM kn i WHERE i.ks = o.ks AND i.v >= o.v AND i.v <= o.v + 3) ORDER BY o.id", &[_]?i64{ 1, 2, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE EXISTS (SELECT 1 FROM kn i WHERE i.ksn = o.ki) ORDER BY o.id", &[_]?i64{ 1, 2, 4, 5, 6 } },
+        .{ "SELECT o.id FROM ko o WHERE o.id <= 2 AND EXISTS (SELECT 1 FROM kn i WHERE i.ki = o.ki) ORDER BY o.id", &[_]?i64{ 1, 2 } },
+        .{ "SELECT o.id FROM ko o WHERE o.id <= 2 OR EXISTS (SELECT 1 FROM kn i WHERE i.ks = o.ks AND i.v > 8) ORDER BY o.id", &[_]?i64{ 1, 2, 5 } },
+        .{ "SELECT o.id FROM ko o WHERE NOT (o.id > 2 AND EXISTS (SELECT 1 FROM kn i WHERE i.ki = o.ki)) ORDER BY o.id", &[_]?i64{ 1, 2, 3 } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+test "a keyed correlated scalar whose outer value several inner keys come to compares their one group" {
+    const allocator = std.testing.allocator;
+    // `ksn` is text: '7' and '07' both equal the number 7, as '2' and
+    // '02' equal 2, so each outer value compares one group of all its rows.
+    // Rows are DuckDB's, `ksn` read as a number.
+    const cases = .{
+        .{ "UPDATE ko SET v = -1 WHERE 1 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki)", &[_]?i64{ 1, -1, 2, 2, 3, 7, 4, -1, 5, 9, 6, 4 } },
+        .{ "UPDATE ko SET v = -1 WHERE 2 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki)", &[_]?i64{ 1, 5, 2, -1, 3, 7, 4, null, 5, 9, 6, -1 } },
+        .{ "UPDATE ko SET v = -1 WHERE 1 = (SELECT COUNT(*) FROM kn i WHERE i.ksn = ko.ki AND i.ksn NOT LIKE '0%')", &[_]?i64{ 1, -1, 2, -1, 3, 7, 4, -1, 5, 9, 6, -1 } },
+        .{ "UPDATE ko SET v = (SELECT SUM(i.v) FROM kn i WHERE i.ksn = ko.ki)", &[_]?i64{ 1, 10, 2, 11, 3, null, 4, null, 5, 19, 6, 11 } },
+    };
+    inline for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try setupKeys(allocator, std.testing.io, tmp.dir);
+        defer db.close();
+        try exec(allocator, db, case[0]);
+        expectCells(allocator, db, "SELECT id, v FROM ko ORDER BY id", case[1]) catch |err| {
             std.debug.print("failed: {s}\n", .{case[0]});
             return err;
         };

@@ -516,8 +516,9 @@ fn resolveRowIn(ctx: *CompileCtx, pred: *PredicateExpr, s: exec.predicate.InSubq
     }, width);
 }
 
-/// The inner's rows as `width`-value tuples; a tuple holding a NULL can
-/// never match, so it drops (the thinDB IN-set dialect).
+/// The inner's rows as `width`-value tuples in key order
+/// (`exec.predicate.sortKeyed`); a tuple holding a NULL can never match, so
+/// it drops (the thinDB IN-set dialect).
 fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize) ![]const []const Value {
     const aa = try ctx.subqueryArena();
     const acct = try ctx.queryAccountant();
@@ -535,7 +536,9 @@ fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize) ![]const []const Valu
             try rows.append(aa, tuple);
         }
     }
-    return try rows.toOwnedSlice(aa);
+    const owned = try rows.toOwnedSlice(aa);
+    exec.predicate.sortKeyed([]const Value, owned);
+    return owned;
 }
 
 /// A probe of a tuple set whose first `in_width` outer columns are an IN's
@@ -1448,33 +1451,46 @@ fn rebuildBlock(ctx: *CompileCtx, block: *const CorrelatedBlock, columns: []cons
 
 /// Decorrelate an EXISTS (`in_subquery` null) or IN subquery that reads the
 /// outer row. One whose WHERE ties its rows to the outer row by equalities
-/// and ranges is keyed on its own columns (`resolveKeyedBlock`); any other
-/// is lifted onto its domain when `lowered` has one. A correlation operand
-/// computed from the outer row alone goes to `lowered`, for the operator
-/// reading `pred` to compute below itself. False leaves the subquery to the
-/// uncorrelated paths.
+/// and ranges is keyed on its own columns (`planKeyedBlock`), as is each
+/// disjunct of one whose WHERE ORs such ties (`resolveDisjunctBlocks`); any
+/// other is lifted onto its domain when `lowered` has one. A correlation
+/// operand computed from the outer row alone goes to `lowered`, for the
+/// operator reading `pred` to compute below itself. False leaves the
+/// subquery to the uncorrelated paths.
 fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const anyopaque, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !bool {
     const top: *const ir.Op = @ptrCast(@alignCast(source));
     const in_width: ?usize = if (in_subquery) |s| 1 + s.rest_cols.len else null;
     if (try analyzeBlockCorrelation(ctx, top, in_width)) |block| {
-        if (try resolveKeyedBlock(ctx, pred, &block, negate, in_subquery, lowered)) return true;
+        if (try planKeyedBlock(ctx, &block, in_subquery, lowered)) |plan| {
+            pred.* = try runKeyedPlan(ctx, plan, negate, lowered);
+            return true;
+        }
     }
+    if (try resolveDisjunctBlocks(ctx, pred, top, negate, in_subquery, lowered)) return true;
     const l = lowered orelse return false;
     return try resolveDomainBlock(ctx, pred, top, negate, in_subquery, l);
 }
 
-/// The subquery without its correlations runs once; its rows, keyed by the
-/// inner side of each correlation (IN's compared columns first), become a
-/// set each outer row probes. False when that rewrite still reads the outer
-/// row, as through a subquery nested in it.
-fn resolveKeyedBlock(ctx: *CompileCtx, pred: *PredicateExpr, block: *const CorrelatedBlock, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !bool {
-    if (block.one_row) {
-        pred.* = .{ .always = !negate };
-        return true;
-    }
+/// A keyed block's subquery without its correlations, and the outer columns
+/// (IN's compared columns first) that probe its rows by the inner side of
+/// each correlation. `rewritten` is null for a block with one row for every
+/// outer row.
+const KeyedPlan = struct {
+    block: *const CorrelatedBlock,
+    rewritten: ?*ir.Op,
+    outer_keys: []const []const u8,
+    n_in: usize,
+    bounds: ?RangeBounds,
+};
+
+/// Null when the block can't be keyed: more ranges than one closed range, an
+/// outer value with no operator to compute it, or a rewrite that still reads
+/// the outer row, as through a subquery nested in it.
+fn planKeyedBlock(ctx: *CompileCtx, block: *const CorrelatedBlock, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !?KeyedPlan {
+    if (block.one_row) return .{ .block = block, .rewritten = null, .outer_keys = &.{}, .n_in = 0, .bounds = null };
     const ranges = block.info.range_corrs.items;
-    if (ranges.len > 2 or (ranges.len == 2 and !isClosedRange(ranges))) return false;
-    if (block.info.outer_values.items.len > 0 and lowered == null) return false;
+    if (ranges.len > 2 or (ranges.len == 2 and !isClosedRange(ranges))) return null;
+    if (block.info.outer_values.items.len > 0 and lowered == null) return null;
 
     const aa = try ctx.subqueryArena();
     const n_in = block.selected.len;
@@ -1482,8 +1498,7 @@ fn resolveKeyedBlock(ctx: *CompileCtx, pred: *PredicateExpr, block: *const Corre
     const bounds = if (ranges.len > 0) rangeBounds(ranges) else null;
     const range_col: []const []const u8 = if (bounds) |b| try aa.dupe([]const u8, &.{b.lower.inner_col}) else &.{};
     const rewritten = try rebuildBlock(ctx, block, try std.mem.concat(aa, []const u8, &.{ range_col, inner_keys }));
-    if (try readsFree(ctx, rewritten)) return false;
-    try prepareSubplan(ctx, rewritten);
+    if (try readsFree(ctx, rewritten)) return null;
 
     const outer_keys = try aa.alloc([]const u8, inner_keys.len);
     if (in_subquery) |s| {
@@ -1491,22 +1506,82 @@ fn resolveKeyedBlock(ctx: *CompileCtx, pred: *PredicateExpr, block: *const Corre
         for (s.rest_cols, outer_keys[1..n_in]) |c, *dst| dst.* = try aa.dupe(u8, c);
     }
     for (block.info.outer_cols.items, outer_keys[n_in..]) |c, *dst| dst.* = try aa.dupe(u8, c);
+    return .{ .block = block, .rewritten = rewritten, .outer_keys = outer_keys, .n_in = n_in, .bounds = bounds };
+}
 
-    if (bounds) |b| {
-        const probe = try correlatedRange(ctx, rewritten, b, outer_keys, negate);
-        pred.* = try nullGuarded(aa, outer_keys[0..n_in], negate, probe);
-    } else {
+/// Runs a keyed plan's subquery once: its rows become the set, or the
+/// ranges, each outer row probes.
+fn runKeyedPlan(ctx: *CompileCtx, plan: KeyedPlan, negate: bool, lowered: ?*LoweredScalars) !PredicateExpr {
+    const rewritten = plan.rewritten orelse return .{ .always = !negate };
+    try prepareSubplan(ctx, rewritten);
+    const aa = try ctx.subqueryArena();
+    const pred = if (plan.bounds) |b|
+        try nullGuarded(aa, plan.outer_keys[0..plan.n_in], negate, try correlatedRange(ctx, rewritten, b, plan.outer_keys, negate))
+    else blk: {
         var q = try local.compileSubplan(ctx, rewritten);
         defer q.deinit();
-        pred.* = try inTupleSet(aa, .{
-            .outer_cols = outer_keys,
-            .rows = try drainTuples(ctx, &q, inner_keys.len),
+        break :blk try inTupleSet(aa, .{
+            .outer_cols = plan.outer_keys,
+            .rows = try drainTuples(ctx, &q, plan.outer_keys.len),
             .negate = negate,
-            .inner_types = try columnTypes(aa, q.outputSchema()[0..inner_keys.len]),
-        }, n_in);
+            .inner_types = try columnTypes(aa, q.outputSchema()[0..plan.outer_keys.len]),
+        }, plan.n_in);
+    };
+    if (lowered) |l| try l.computeOuterValues(ctx, &plan.block.info);
+    return pred;
+}
+
+/// A subquery whose WHERE ORs ties to the outer row that no one key covers,
+/// as `i.v = o.v + 1 OR i.k = o.k`, as one keyed copy per disjunct. A row
+/// passes the WHERE iff it passes some copy's, so EXISTS and IN hold iff
+/// they hold for some copy, and NOT EXISTS and NOT IN iff for none. That
+/// needs a block that keeps or drops each row by itself, so one that groups
+/// or windows isn't split. False unless every copy is keyed.
+fn resolveDisjunctBlocks(ctx: *CompileCtx, pred: *PredicateExpr, top: *const ir.Op, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !bool {
+    const na = ctx.nodeArena();
+    const in_width: ?usize = if (in_subquery) |s| 1 + s.rest_cols.len else null;
+    const block = try splitBlock(ctx, top);
+    var where: ?usize = null;
+    for (block.chain, 0..) |op, i| switch (op.*) {
+        .group_by, .window => return false,
+        .filter => where = i,
+        else => {},
+    };
+    const w = where orelse return false;
+    const where_pred = block.chain[w].filter.predicate;
+    const conjuncts = if (where_pred == .@"and") where_pred.@"and" else try na.dupe(PredicateExpr, &.{where_pred});
+    for (conjuncts, 0..) |c, at| {
+        if (c != .@"or") continue;
+        const plans = try na.alloc(KeyedPlan, c.@"or".len);
+        const keyed = for (c.@"or", plans) |disjunct, *plan| {
+            const arm_where = try na.dupe(PredicateExpr, conjuncts);
+            arm_where[at] = disjunct;
+            const arm = try na.create(CorrelatedBlock);
+            arm.* = (try analyzeBlockCorrelation(ctx, try withWhere(ctx, block, w, .{ .@"and" = arm_where }), in_width)) orelse break false;
+            plan.* = (try planKeyedBlock(ctx, arm, in_subquery, lowered)) orelse break false;
+        } else true;
+        if (!keyed) continue;
+        const arms = try (try ctx.subqueryArena()).alloc(PredicateExpr, plans.len);
+        for (plans, arms) |plan, *arm| arm.* = try runKeyedPlan(ctx, plan, negate, lowered);
+        pred.* = if (negate) .{ .@"and" = arms } else .{ .@"or" = arms };
+        return true;
     }
-    if (lowered) |l| try l.computeOuterValues(ctx, &block.info);
-    return true;
+    return false;
+}
+
+/// A copy of `block`'s operators over its FROM, the filter at `where`
+/// reading `predicate` instead.
+fn withWhere(ctx: *CompileCtx, block: Block, where: usize, predicate: PredicateExpr) !*ir.Op {
+    var cur: *ir.Op = @constCast(block.from);
+    var i = block.chain.len;
+    while (i > 0) {
+        i -= 1;
+        const op = try newOp(ctx, block.chain[i].*);
+        if (i == where) op.filter.predicate = predicate;
+        relink(op, cur);
+        cur = op;
+    }
+    return cur;
 }
 
 /// Two range conjuncts form a closed BETWEEN-style range when they
@@ -1540,9 +1615,9 @@ fn rangeBounds(corrs: []const RangeCorr) RangeBounds {
 
 /// Drain a range-correlated subquery. `rewritten` projects the range's
 /// inner column, then the key columns `outer_keys` probe with; its rows are
-/// bucketed by key tuple, each bucket's range values sorted ascending. Per
-/// outer row the eval is then a single min/max compare for the open-ended
-/// case, or a bsearch for the closed BETWEEN case.
+/// bucketed by key tuple, the buckets in key order and each one's range
+/// values sorted ascending. Per outer row the eval is then a single min/max
+/// compare for the open-ended case, or a bsearch for the closed BETWEEN case.
 fn correlatedRange(ctx: *CompileCtx, rewritten: *ir.Op, bounds: RangeBounds, outer_keys: []const []const u8, negate: bool) !PredicateExpr {
     const aa = try ctx.subqueryArena();
     var q = try local.compileSubplan(ctx, rewritten);
@@ -1551,11 +1626,7 @@ fn correlatedRange(ctx: *CompileCtx, rewritten: *ir.Op, bounds: RangeBounds, out
     const n_keys = outer_keys.len;
 
     // First pass: drain into flat (key_tuple, range_value) rows.
-    const RowEntry = struct {
-        key: []Value,
-        value: Value,
-    };
-    var rows: std.ArrayList(RowEntry) = .empty;
+    var rows: std.ArrayList(exec.predicate.CorrelatedScalarRow) = .empty;
     defer rows.deinit(ctx.allocator);
 
     while (try q.next()) |batch| {
@@ -1587,43 +1658,22 @@ fn correlatedRange(ctx: *CompileCtx, rewritten: *ir.Op, bounds: RangeBounds, out
         }
     }
 
-    // Group rows by equi-key tuple. We materialize a parallel
-    // (keys, values_lists) pair: keys[i] is the i-th unique key
-    // tuple, values_lists[i] is its growing list of range values.
-    // The n_keys == 0 case (pure range, no equi correlation) collapses
-    // to a single group with an empty key.
-    var unique_keys: std.ArrayList([]Value) = .empty;
-    defer unique_keys.deinit(ctx.allocator);
-    var values_lists: std.ArrayList(std.ArrayList(Value)) = .empty;
-    defer {
-        for (values_lists.items) |*vl| vl.deinit(ctx.allocator);
-        values_lists.deinit(ctx.allocator);
+    // Rows in key order put each equi-key tuple's rows side by side, one
+    // group per run. The n_keys == 0 case (pure range, no equi
+    // correlation) collapses to a single group with an empty key.
+    exec.predicate.sortKeyed(exec.predicate.CorrelatedScalarRow, rows.items);
+    var groups: std.ArrayList(exec.predicate.CorrelatedRangeGroup) = .empty;
+    var start: usize = 0;
+    while (start < rows.items.len) {
+        var end = start + 1;
+        while (end < rows.items.len and keysEqual(rows.items[start].key, rows.items[end].key)) end += 1;
+        const values = try aa.alloc(Value, end - start);
+        for (rows.items[start..end], values) |row, *v| v.* = row.value;
+        std.sort.pdq(Value, values, {}, valueLessThan);
+        try groups.append(aa, .{ .key = rows.items[start].key, .values = values });
+        start = end;
     }
-
-    for (rows.items) |row| {
-        var bucket_idx: ?usize = null;
-        for (unique_keys.items, 0..) |k, gi| {
-            if (keysEqual(k, row.key)) {
-                bucket_idx = gi;
-                break;
-            }
-        }
-        if (bucket_idx == null) {
-            try unique_keys.append(ctx.allocator, row.key);
-            try values_lists.append(ctx.allocator, .empty);
-            bucket_idx = unique_keys.items.len - 1;
-        }
-        try values_lists.items[bucket_idx.?].append(ctx.allocator, row.value);
-    }
-
-    // Snapshot each bucket into the subquery arena, sorting along the way.
-    const groups_owned = try aa.alloc(exec.predicate.CorrelatedRangeGroup, unique_keys.items.len);
-    for (unique_keys.items, values_lists.items, groups_owned) |k, *vl, *out| {
-        std.sort.pdq(Value, vl.items, {}, valueLessThan);
-        const arena_vals = try aa.alloc(Value, vl.items.len);
-        @memcpy(arena_vals, vl.items);
-        out.* = .{ .key = k, .values = arena_vals };
-    }
+    const groups_owned = try groups.toOwnedSlice(aa);
 
     return .{ .correlated_range = .{
         .outer_keys = outer_keys,
@@ -2631,6 +2681,7 @@ fn maybeResolveCorrelatedScalar(ctx: *CompileCtx, pred: *PredicateExpr, sq: anyt
         }
     }
     const rows_owned = try rows.toOwnedSlice(aa);
+    exec.predicate.sortKeyed(exec.predicate.CorrelatedScalarRow, rows_owned);
 
     pred.* = .{ .correlated_scalar = .{
         .outer_compared = try aa.dupe(u8, sq.col),
