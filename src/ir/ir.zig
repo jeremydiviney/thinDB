@@ -43,6 +43,8 @@ pub const AggParams = exec_aggregate.AggParams;
 const exec_compute = @import("../exec/compute.zig");
 pub const Derived = exec_compute.Derived;
 
+const udf_mod = @import("../udf.zig");
+
 const exec_join = @import("../exec/join.zig");
 pub const JoinSpec = exec_join.Spec;
 pub const JoinKeyPair = exec_join.KeyPair;
@@ -60,6 +62,55 @@ pub const JoinResidual = struct {
 
 const exec_expr = @import("../exec/expr.zig");
 pub const Expr = exec_expr.Expr;
+
+/// An aggregate call as planning compares two: its function and parameters,
+/// and its arguments as expressions (the value, the secondary key, then a
+/// UDF's columns), null for an absent one.
+pub const AggCall = struct {
+    func: AggFunc,
+    udf_name: ?[]const u8 = null,
+    params: AggParams = .none,
+    args: []const ?Expr = &.{},
+};
+
+/// Whether two aggregate calls compute one value: the same function, its
+/// DISTINCT included, over equal arguments with equal parameters.
+/// Identifiers match case-insensitively, as the engine binds them, so each
+/// caller spells an argument the way its scope binds it.
+pub fn sameAggCall(a: AggCall, b: AggCall) bool {
+    if (a.func != b.func) return false;
+    if ((a.udf_name == null) != (b.udf_name == null)) return false;
+    if (a.udf_name) |name| if (!std.ascii.eqlIgnoreCase(name, b.udf_name.?)) return false;
+    if (a.args.len != b.args.len) return false;
+    for (a.args, b.args) |x, y| {
+        if ((x == null) != (y == null)) return false;
+        if (x) |e| if (!exec_expr.eql(e, y.?)) return false;
+    }
+    return sameAggParams(a.params, b.params);
+}
+
+/// Whether a call equal to `call` may read `call`'s value: a volatile
+/// argument or aggregate UDF gives each call its own.
+pub fn aggCallRepeatable(call: AggCall, registry: ?*const udf_mod.UdfRegistry) bool {
+    if (call.func == .udf) {
+        const r = registry orelse return false;
+        const name = call.udf_name orelse return false;
+        for (r.aggregateEntries()) |entry| {
+            if (entry.volatility == .@"volatile" and std.ascii.eqlIgnoreCase(entry.name, name)) return false;
+        }
+    }
+    for (call.args) |arg| if (arg) |e| if (exec_compute.mayVary(e, registry)) return false;
+    return true;
+}
+
+fn sameAggParams(a: AggParams, b: AggParams) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .none => true,
+        .percentile => |fraction| fraction == b.percentile,
+        .concat => |c| c.distinct == b.concat.distinct and std.mem.eql(u8, c.separator, b.concat.separator),
+    };
+}
 
 pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v5: create_table carries a table-compression byte.
