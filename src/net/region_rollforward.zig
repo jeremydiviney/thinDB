@@ -5089,6 +5089,9 @@ fn tvfInputs(b: *Builder, ent: *const udf_mod.TableEntry, count: usize) ![]const
 
 const DateWindow = struct { col: usize, lo: i64, hi: i64 };
 
+/// The window is compared against the column's raw values, so each bound is
+/// first placed against the column as the ordinary filter places it: a
+/// DATETIME bound on a DATE column becomes a day, not microseconds.
 fn dateWindow(p: PredicateExpr, b: *Builder) !DateWindow {
     if (p != .@"and" or p.@"and".len != 2) return NoMatch;
     var col: ?usize = null;
@@ -5096,10 +5099,10 @@ fn dateWindow(p: PredicateExpr, b: *Builder) !DateWindow {
     var hi: ?i64 = null;
     for (p.@"and") |k| {
         if (k != .leaf) return NoMatch;
-        const l = k.leaf;
-        const idx = (b.fb.resolve(l.col) orelse return NoMatch).idx;
+        const idx = (b.fb.resolve(k.leaf.col) orelse return NoMatch).idx;
         if (col != null and col.? != idx) return NoMatch;
         col = idx;
+        const l = placedLeaf(k.leaf, b.fb.cols.items[idx].type) orelse return NoMatch;
         const v = valueI64(l.val) orelse return NoMatch;
         switch (l.op) {
             .gte => lo = v,
@@ -5108,6 +5111,16 @@ fn dateWindow(p: PredicateExpr, b: *Builder) !DateWindow {
         }
     }
     return .{ .col = col orelse return NoMatch, .lo = lo orelse return NoMatch, .hi = hi orelse return NoMatch };
+}
+
+/// `l` as `predicate.validateExpr` places it against a column of `col_type`,
+/// its literal in the column's own type. Null when placing makes it anything
+/// but a leaf, or fails; the ordinary operator then runs the filter.
+fn placedLeaf(l: predicate_mod.Predicate, col_type: types.Type) ?predicate_mod.Predicate {
+    var placed: PredicateExpr = .{ .leaf = l };
+    const schema = [_]Column{.{ .name = l.col, .type = col_type }};
+    predicate_mod.validateExpr(&placed, &schema) catch return null;
+    return if (placed == .leaf) placed.leaf else null;
 }
 
 /// Build a broadcast TvfPartition from a drained block, columns mapped to
