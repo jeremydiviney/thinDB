@@ -506,13 +506,25 @@ const TestClient = struct {
 
     /// The rows of a result set whose column-count packet was already read.
     fn readResultRows(self: *TestClient, dest_arena: std.mem.Allocator, col_count_payload: []const u8) ![]const []const ?[]const u8 {
+        return (try self.readDefinedResult(dest_arena, col_count_payload)).rows;
+    }
+
+    const DefinedResult = struct {
+        /// Each column-definition packet's payload, as the server sent it.
+        definitions: []const []const u8,
+        rows: []const []const ?[]const u8,
+    };
+
+    /// `readResultRows`, with the column definitions that precede the rows.
+    fn readDefinedResult(self: *TestClient, dest_arena: std.mem.Allocator, col_count_payload: []const u8) !DefinedResult {
         var cursor: usize = 0;
         const col_count = try mysql_packet.readLenEncInt(col_count_payload, &cursor);
 
-        var i: u64 = 0;
-        while (i < col_count) : (i += 1) {
+        const definitions = try dest_arena.alloc([]const u8, @intCast(col_count));
+        for (definitions) |*definition| {
             const cd = try mysql_packet.readPacket(self.allocator, &self.reader.interface);
-            self.allocator.free(cd.payload);
+            defer self.allocator.free(cd.payload);
+            definition.* = try dest_arena.dupe(u8, cd.payload);
         }
 
         var rows: std.ArrayList([]const ?[]const u8) = .empty;
@@ -539,7 +551,7 @@ const TestClient = struct {
             const cells_slice = try cells.toOwnedSlice(dest_arena);
             try rows.append(dest_arena, cells_slice);
         }
-        return try rows.toOwnedSlice(dest_arena);
+        return .{ .definitions = definitions, .rows = try rows.toOwnedSlice(dest_arena) };
     }
 };
 
@@ -3699,6 +3711,178 @@ test "mysql wire: runtime errors carry MySQL's codes, and only parse errors are 
     defer arena.deinit();
     try std.testing.expectEqualStrings("19999", (try queryCell(&client, arena.allocator(), "SELECT max(id) FROM big")).?);
 
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
+/// A row-generating kernel for a `base UNION ALL TABLE(f(base))` arm: one row
+/// per call, its `v` in the kernel's own type `Generated` whatever the type
+/// of the column the union puts it under.
+fn UnionArm(comptime name: []const u8, comptime Source: type, comptime Generated: type, comptime value: Generated) type {
+    return struct {
+        const tdb = thindb.tdb;
+        pub const spec = tdb.TableFnSpec{ .name = name, .execution = .partitioned };
+        pub const Input = struct { custLC: ?[]const u8, seq: ?i64, v: ?Source };
+        pub const Output = struct { custLC: ?[]const u8, seq: ?i64, v: ?Generated };
+        pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+            if (p.len == 0) return;
+            const last = p.len - 1;
+            try out.row(.{
+                .custLC = p.col(.custLC).get(last),
+                .seq = (p.col(.seq).get(last) orelse 0) + 100,
+                .v = value,
+            });
+        }
+    };
+}
+
+const ColumnShape = struct { type_byte: u8, length: u32, decimals: u8 };
+
+fn columnShape(definition: []const u8) !ColumnShape {
+    // catalog, schema, table, org_table, name, org_name, the fixed fields'
+    // length (1) and charset (2); then column length (4), type (1), flags (2)
+    // and decimals (1).
+    var cursor: usize = 0;
+    for (0..6) |_| _ = try mysql_packet.readLenEncString(definition, &cursor);
+    cursor += 1 + 2;
+    if (cursor + 8 > definition.len) return error.MalformedResultSet;
+    return .{
+        .type_byte = definition[cursor + 4],
+        .length = std.mem.readInt(u32, definition[cursor..][0..4], .little),
+        .decimals = definition[cursor + 7],
+    };
+}
+
+fn definedResult(client: *TestClient, arena: std.mem.Allocator, sql_text: []const u8) !TestClient.DefinedResult {
+    try client.sendQuery(sql_text);
+    const head = try mysql_packet.readPacket(client.allocator, &client.reader.interface);
+    defer client.allocator.free(head.payload);
+    if (head.payload[0] == 0xFF) {
+        std.debug.print("{s} failed: {d} {s}\n", .{ sql_text, std.mem.readInt(u16, head.payload[1..3], .little), head.payload[9..] });
+        return error.TestUnexpectedResult;
+    }
+    return client.readDefinedResult(arena, head.payload);
+}
+
+// Issue #495. A statement reports one set of column definitions and rows
+// whether or not a keyed region runs it, on the first call and on the repeat
+// the region answers from its cache. Each `v` is a UNION ALL column whose
+// arms differ in type. Every column selected is nullable: a region reports
+// NOT NULL columns as nullable (issue #498), a difference these comparisons
+// would otherwise stop on.
+test "mysql wire: WITH KEYED BY reports the plain statement's column definitions and rows over a UNION ALL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+    const tdb = thindb.tdb;
+    inline for (.{
+        UnionArm("arm_text", []const u8, []const u8, "generated"),
+        UnionArm("arm_stamp", tdb.Date, tdb.DateTime, tdb.DateTime.fromMicros(1_772_366_400_000_000)),
+        UnionArm("arm_wider", i32, i64, 5_000_000_000),
+    }) |kernel| try catalog.registerTableUdf(tdb.descriptorFor(kernel));
+
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 69 } };
+    const server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer thread.join();
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main");
+
+    try expectQueryOk(&client,
+        \\CREATE TABLE pairs (
+        \\  id BIGINT PRIMARY KEY, custLC VARCHAR(32), seq BIGINT,
+        \\  code VARCHAR(8), label STRING, day DATE, at DATETIME,
+        \\  small INT, big BIGINT, price DECIMAL(10,2), wide DECIMAL(12,4)
+        \\)
+    );
+    try expectQueryOk(&client,
+        \\INSERT INTO pairs VALUES
+        \\ (1,'cust_0',1,'a','alpha','2025-11-30','2025-11-30 10:00:00',11,5000000001,1.25,1.1234),
+        \\ (2,'cust_0',2,'b','bravo','2025-12-01','2025-12-01 11:30:00',12,5000000002,2.50,2.2345),
+        \\ (3,'cust_0',3,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        \\ (4,'cust_1',4,'d','delta','2025-12-20','2025-12-20 13:00:00',14,5000000004,4.00,4.4567),
+        \\ (5,'cust_1',5,'e','echo','2026-02-28','2026-02-28 14:45:00',15,5000000005,5.25,5.5678),
+        \\ (6,'cust_1',9,'f','foxtrot','2026-03-01','2026-03-01 15:00:00',16,5000000006,6.50,6.6789),
+        \\ (7,'cust_2',7,'g','golf','2026-03-05','2026-03-05 16:00:00',17,5000000007,7.75,7.7891),
+        \\ (8,NULL,8,'h','hotel','2026-02-01','2026-02-01 17:00:00',18,5000000008,8.00,8.8912)
+    );
+
+    const function_arm =
+        \\base AS (
+        \\ SELECT custLC, seq, {s} AS v FROM pairs WHERE id > 0
+        \\), projected AS (
+        \\ SELECT custLC, seq, v FROM TABLE({s}((
+        \\   SELECT custLC, seq, v FROM base WHERE seq BETWEEN 2 AND 8
+        \\ )) PARTITION BY custLC ORDER BY seq)
+        \\), combined AS (
+        \\ SELECT * FROM base UNION ALL SELECT * FROM projected
+        \\), w AS (
+        \\ SELECT custLC, seq, v, LAG(seq) OVER (PARTITION BY custLC ORDER BY seq) AS prior FROM combined
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, seq
+    ;
+    const sql_arms =
+        \\base AS (
+        \\ SELECT custLC, seq, code, label, day, at, small, big, price, wide FROM pairs WHERE id > 0
+        \\), combined AS (
+        \\ SELECT custLC, seq, {s} AS v FROM base WHERE seq < 5
+        \\ UNION ALL
+        \\ SELECT custLC, seq, {s} AS v FROM base WHERE seq >= 5
+        \\), w AS (
+        \\ SELECT custLC, seq, v, LAG(seq) OVER (PARTITION BY custLC ORDER BY seq) AS prior FROM combined
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, seq
+    ;
+    const text: ColumnShape = .{ .type_byte = MYSQL_TYPE_VAR_STRING, .length = 65535, .decimals = 0 };
+    const key: ColumnShape = .{ .type_byte = MYSQL_TYPE_VAR_STRING, .length = 32 * 4, .decimals = 0 };
+    const stamp: ColumnShape = .{ .type_byte = MYSQL_TYPE_DATETIME, .length = 26, .decimals = 6 };
+    const wide_integer: ColumnShape = .{ .type_byte = MYSQL_TYPE_LONGLONG, .length = 20, .decimals = 0 };
+    const fine_decimal: ColumnShape = .{ .type_byte = MYSQL_TYPE_NEWDECIMAL, .length = 14, .decimals = 4 };
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    inline for (.{
+        // The kernels declare `custLC` STRING, so the union widens the key too.
+        .{ function_arm, "code", "arm_text", text, text },
+        .{ function_arm, "day", "arm_stamp", text, stamp },
+        .{ function_arm, "small", "arm_wider", text, wide_integer },
+        .{ sql_arms, "code", "label", key, text },
+        .{ sql_arms, "label", "code", key, text },
+        .{ sql_arms, "day", "at", key, stamp },
+        .{ sql_arms, "at", "day", key, stamp },
+        .{ sql_arms, "small", "big", key, wide_integer },
+        .{ sql_arms, "price", "wide", key, fine_decimal },
+        .{ sql_arms, "wide", "price", key, fine_decimal },
+    }) |case| {
+        const body = std.fmt.comptimePrint(case[0], .{ case[1], case[2] });
+        const plain = try definedResult(&client, arena, "WITH " ++ body);
+        try std.testing.expectEqual(@as(usize, 4), plain.definitions.len);
+        try std.testing.expectEqual(@as(ColumnShape, case[3]), try columnShape(plain.definitions[0]));
+        try std.testing.expectEqual(@as(ColumnShape, case[4]), try columnShape(plain.definitions[2]));
+        try std.testing.expect(plain.rows.len >= 8);
+        for (0..2) |_| {
+            const keyed = try definedResult(&client, arena, "WITH KEYED BY (custLC) " ++ body);
+            try std.testing.expectEqual(plain.definitions.len, keyed.definitions.len);
+            for (plain.definitions, keyed.definitions) |expected, actual| {
+                try std.testing.expectEqualSlices(u8, expected, actual);
+            }
+            try std.testing.expectEqual(plain.rows.len, keyed.rows.len);
+            for (plain.rows, keyed.rows) |expected_row, actual_row| {
+                for (expected_row, actual_row) |expected, actual| {
+                    try std.testing.expectEqual(expected == null, actual == null);
+                    if (expected) |cell| try std.testing.expectEqualStrings(cell, actual.?);
+                }
+            }
+        }
+    }
     try client.sendQuit();
     if (sctx.err) |e| return e;
 }
