@@ -12,7 +12,8 @@
 //! Query ownership can retire before asynchronous frees finish. The ledger and
 //! its allocator wrappers survive until the final tracked allocation is freed.
 //! A free whose charge must end when the owner lets go, while the memory goes
-//! back in the background, collects its blocks in `DeferredFrees`.
+//! back in the background, collects its blocks in `DeferredFrees`: the bytes
+//! leave the budget at once and the ledger stays alive until they are back.
 
 const std = @import("std");
 pub const BudgetAllocator = @import("util/budget_allocator.zig").BudgetAllocator;
@@ -157,6 +158,10 @@ pub const MemoryPool = struct {
 pub const MemoryAccountant = struct {
     budget: usize,
     current_bytes: usize = 0,
+    /// Freed bytes still on their way back to the allocator (`DeferredFrees`).
+    /// They no longer count against the budget, but the shared pool stays
+    /// charged and a released owner stays alive until they are back.
+    retired_bytes: usize = 0,
     /// Live bytes attributed to each `Source`, indexed by `@intFromEnum`.
     by_source: [source_count]usize = [_]usize{0} ** source_count,
     /// Shared cross-query pool this accountant draws from (null = per-query
@@ -236,7 +241,29 @@ pub const MemoryAccountant = struct {
     pub fn releaseAllocation(self: *MemoryAccountant, bytes: usize) void {
         self.lock();
         self.releaseLocked(.execution, bytes);
-        const destroy = self.current_bytes == 0 and self.owner_allocator != null;
+        const destroy = self.current_bytes == 0 and self.retired_bytes == 0 and self.owner_allocator != null;
+        self.reservation_lock.unlock();
+        if (destroy) self.destroyReleasedOwner();
+    }
+
+    /// The allocation's charge ends now, while its memory is still held.
+    pub fn retireAllocation(self: *MemoryAccountant, bytes: usize) void {
+        self.lock();
+        defer self.reservation_lock.unlock();
+        std.debug.assert(self.current_bytes >= bytes);
+        std.debug.assert(self.by_source[@intFromEnum(Source.execution)] >= bytes);
+        self.current_bytes -= bytes;
+        self.by_source[@intFromEnum(Source.execution)] -= bytes;
+        self.retired_bytes += bytes;
+    }
+
+    /// Retired memory is back with its allocator.
+    pub fn finishRetired(self: *MemoryAccountant, bytes: usize) void {
+        self.lock();
+        std.debug.assert(self.retired_bytes >= bytes);
+        self.retired_bytes -= bytes;
+        if (self.pool) |p| p.release(bytes);
+        const destroy = self.current_bytes == 0 and self.retired_bytes == 0 and self.owner_allocator != null;
         self.reservation_lock.unlock();
         if (destroy) self.destroyReleasedOwner();
     }
@@ -252,7 +279,7 @@ pub const MemoryAccountant = struct {
         self.lock();
         std.debug.assert(self.owner_allocator == null);
         self.owner_allocator = allocator;
-        const destroy = self.current_bytes == 0;
+        const destroy = self.current_bytes == 0 and self.retired_bytes == 0;
         self.reservation_lock.unlock();
         if (destroy) self.destroyReleasedOwner();
     }
@@ -352,7 +379,7 @@ pub const MemoryAccountant = struct {
         if (self.pool) |p| return p.inUse();
         self.lock();
         defer self.reservation_lock.unlock();
-        return self.current_bytes;
+        return self.current_bytes + self.retired_bytes;
     }
 
     /// True when this reading produced the statement's watchdog line.
@@ -612,7 +639,7 @@ test "memory: retiring an owner keeps its allocator alive through the last free"
     try std.testing.expectEqual(@as(usize, 0), pool.inUse());
 }
 
-test "memory: collected frees stop counting at once and return their memory on release" {
+test "memory: collected frees stop counting against the budget at once and leave the pool on release" {
     const a = std.testing.allocator;
     var pool = MemoryPool.init(1 << 20);
     const account = try a.create(MemoryAccountant);
@@ -620,9 +647,9 @@ test "memory: collected frees stop counting at once and return their memory on r
     account.trackAllocations(a);
     defer account.releaseOwner(a);
     const alloc = try account.executionAllocator();
-    const tiny = try alloc.alloc(u8, 8);
     const large = try alloc.alloc(u64, 1000);
     const elsewhere = try alloc.alloc(u64, 1000);
+    const untracked = try a.alloc(u64, 1000);
     const Other = struct {
         fn free(allocator: std.mem.Allocator, bytes: []u64) void {
             allocator.free(bytes);
@@ -633,15 +660,42 @@ test "memory: collected frees stop counting at once and return their memory on r
     frees.collect();
     const other = try std.Thread.spawn(.{}, Other.free, .{ alloc, elsewhere });
     other.join();
-    alloc.free(tiny);
+    a.free(untracked);
     try std.testing.expect(frees.isEmpty());
     alloc.free(large);
     frees.stop();
     try std.testing.expect(!frees.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), account.current_bytes);
-    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+    try std.testing.expectEqual(large.len * @sizeOf(u64), pool.inUse());
     const background = try std.Thread.spawn(.{}, DeferredFrees.release, .{frees});
     background.join();
+    try std.testing.expectEqual(@as(usize, 0), account.retired_bytes);
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+}
+
+test "memory: memory returned on detached threads keeps its released owner and gate lease until it is back" {
+    const a = std.testing.allocator;
+    var gate = @import("util/statement_gate.zig").StatementGate.init(a, std.testing.io);
+    defer gate.deinit();
+    var pool = MemoryPool.init(1 << 20);
+    const account = try a.create(MemoryAccountant);
+    account.* = MemoryAccountant.initWithPool(1 << 20, &pool);
+    account.trackAllocations(a);
+    try account.retainGate(&gate);
+    const alloc = try account.executionAllocator();
+    var blocks: [8][]u64 = undefined;
+    for (&blocks, 0..) |*block, i| block.* = try alloc.alloc(u64, 500 * (i + 1));
+
+    var frees = DeferredFrees.init(3);
+    frees.collect();
+    for (blocks) |block| alloc.free(block);
+    frees.stop();
+    try std.testing.expectEqual(@as(usize, 0), account.current_bytes);
+    try std.testing.expectEqual(@as(usize, 36 * 500 * @sizeOf(u64)), pool.inUse());
+    account.releaseOwner(a);
+    frees.releaseDetached();
+    gate.beginClose();
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
 }
 
 test "memory: worker allocator charges the query once, even over an already-tracked fallback" {
