@@ -768,6 +768,28 @@ pub const Compute = struct {
         }
     }
 
+    /// `VTable.sampleKeys` for keys this Compute passes through or renames;
+    /// a computed key has no sample.
+    pub fn sampleKeys(self: *Compute, cols: []const usize, sample: *exec.KeySample) !bool {
+        const in_width = self.in_width;
+        if (self.chain != null or self.upstream.outputSchema().len != in_width) return false;
+        const up = try self.allocator.alloc(usize, cols.len);
+        defer self.allocator.free(up);
+        for (cols, up) |c, *u| {
+            u.* = c;
+            for (self.derived, self.derived_output_indices) |d, out_idx| {
+                if (out_idx != c) continue;
+                switch (d.kind) {
+                    .rename => |rn| u.* = rn.src_idx,
+                    else => return false,
+                }
+                break;
+            }
+            if (u.* >= in_width) return false;
+        }
+        return self.upstream.sampleKeys(up, sample);
+    }
+
     pub fn accountant(self: *Compute) ?*exec.memory.MemoryAccountant {
         return self.upstream.accountant();
     }

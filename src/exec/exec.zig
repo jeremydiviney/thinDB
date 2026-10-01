@@ -365,6 +365,17 @@ pub const VTable = struct {
     /// operator leaves `widths` as it is. Reads data, so it runs only when
     /// the router prices a plan by its input's bytes.
     sampleWidths: *const fn (ptr: *anyopaque, widths: []SampledWidth) anyerror!void,
+    /// Plan-time key sample for the GROUP BY router (issue #478): add to
+    /// `sample` the values of output columns `cols` (one per `sample.keys`,
+    /// in order) over a sample of the rows this pipeline reads. True when
+    /// it sampled. False (the default) when it can't: a computed key, or an
+    /// operator that emits other rows than it reads (aggregate, join,
+    /// window); the caller then drops the sample. A table scan samples
+    /// runs of the row groups its hints keep, a materialized buffer runs of
+    /// its rows, within `keySampleBudget`; pass-through layers map the columns onto their upstream's, and a
+    /// filter's sample is of the rows it reads, whose tuples include its
+    /// survivors'. A union folds its arms' samples (`KeySample.mergeArm`).
+    sampleKeys: *const fn (ptr: *anyopaque, cols: []const usize, sample: *KeySample) anyerror!bool,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -536,6 +547,187 @@ pub fn avgWidth(payload: u64, rows: u64) ?u32 {
     if (rows == 0) return null;
     const mean = payload / rows + @intFromBool(payload % rows != 0);
     return @intCast(@min(mean, std.math.maxInt(u32)));
+}
+
+/// What `Query.sampleKeys` gathers for the GROUP BY router's group estimate
+/// over correlated keys (issue #478): the rows it read, and sketches of
+/// their key tuples and of each key.
+pub const KeySample = struct {
+    rows: u64 = 0,
+    /// Whether every row the source reads was sampled, so `tuple` counts
+    /// the input's own tuples.
+    complete: bool = true,
+    tuple: KeySketch = .{},
+    /// One sketch per key, in the order of the caller's key columns.
+    keys: []KeySketch,
+    /// The sampled source, for the router's trace.
+    source: []const u8 = "",
+
+    pub fn init(allocator: Allocator, key_count: usize) !KeySample {
+        const keys = try allocator.alloc(KeySketch, key_count);
+        @memset(keys, .{});
+        return .{ .keys = keys };
+    }
+
+    pub fn deinit(self: *KeySample, allocator: Allocator) void {
+        allocator.free(self.keys);
+        self.* = undefined;
+    }
+
+    /// Add rows `[lo, hi)` of `views`, one view per key in key order.
+    pub fn addRows(self: *KeySample, views: []const ColumnView, lo: usize, hi: usize) void {
+        std.debug.assert(views.len == self.keys.len);
+        var tuples: [KEY_SAMPLE_BLOCK_ROWS]u64 = undefined;
+        var start = lo;
+        while (start < hi) {
+            const n = @min(hi - start, KEY_SAMPLE_BLOCK_ROWS);
+            @memset(tuples[0..n], KEY_TUPLE_SEED);
+            for (views, self.keys) |view, *sketch| hashKeyBlock(view, start, tuples[0..n], sketch);
+            for (tuples[0..n]) |t| self.tuple.add(t);
+            start += n;
+        }
+        self.rows += hi - lo;
+    }
+
+    /// Fold in the sample of another union arm. The rows are the larger
+    /// arm's, not the sum: arms over the same table sample the same rows,
+    /// and counting them twice would pass the repeats off as the
+    /// multiplicity the router's guard asks for.
+    pub fn mergeArm(self: *KeySample, other: *const KeySample) void {
+        std.debug.assert(other.keys.len == self.keys.len);
+        self.rows = @max(self.rows, other.rows);
+        self.complete = self.complete and other.complete;
+        self.tuple.merge(&other.tuple);
+        for (self.keys, other.keys) |*k, *o| k.merge(o);
+    }
+};
+
+/// Row groups or buffer windows a key sample reads at most.
+pub const KEY_SAMPLE_PARTS: usize = 16;
+
+/// The part pick `pick` of `picks` reads out of `parts`: the middle of the
+/// pick's equal share, so the picks spread evenly over the parts.
+pub fn keySamplePart(parts: usize, pick: usize, picks: usize) usize {
+    return (2 * pick + 1) * parts / (2 * picks);
+}
+
+/// An input a key sample reads whole: one default row group's worth.
+pub const KEY_SAMPLE_MIN_ROWS: usize = 64 * 1024;
+
+/// Rows a key sample reads at most: `KEY_SAMPLE_PARTS` default row groups.
+pub const KEY_SAMPLE_MAX_ROWS: usize = KEY_SAMPLE_PARTS * KEY_SAMPLE_MIN_ROWS;
+
+/// Rows a key sample reads of an input of `rows`: all of them up to
+/// `KEY_SAMPLE_MIN_ROWS`, else a sixteenth of them, kept between that and
+/// `KEY_SAMPLE_MAX_ROWS`. Hashing a key tuple costs a few nanoseconds, a
+/// fair share of what aggregating its row costs, and the sample runs on one
+/// thread before a GROUP BY that may run on many: a sample of the whole of
+/// a mid-sized input would add much of the GROUP BY's own time, where a
+/// sixteenth adds a sliver.
+pub fn keySampleBudget(rows: usize) usize {
+    if (rows <= KEY_SAMPLE_MIN_ROWS) return rows;
+    return std.math.clamp(rows / 16, KEY_SAMPLE_MIN_ROWS, KEY_SAMPLE_MAX_ROWS);
+}
+
+pub const RowSpan = struct { lo: usize, hi: usize };
+
+/// The `window` rows around the middle of `[lo, hi)`, or all of them when
+/// they fit.
+pub fn keySampleWindow(lo: usize, hi: usize, window: usize) RowSpan {
+    if (hi - lo <= window) return .{ .lo = lo, .hi = hi };
+    const start = lo + (hi - lo - window) / 2;
+    return .{ .lo = start, .hi = start + window };
+}
+
+/// Feed `sample` from a buffer held in chunks: all of its rows when
+/// `keySampleBudget` takes them all, else a window of a sixteenth of the
+/// budget around the middle of each of `KEY_SAMPLE_PARTS` equal shares of
+/// its rows, across whatever chunks that window spans. A buffer's chunks
+/// are whatever its producer emitted, from a few rows to all of them, so
+/// windows over its rows bound the sample's cost where whole chunks would
+/// not. `buffer` gives `len()` chunks, chunk `i`'s `rows(i)`, and
+/// `views(i, out)`, its key columns.
+pub fn sampleBuffer(sample: *KeySample, buffer: anytype, views: []ColumnView) void {
+    var total: usize = 0;
+    for (0..buffer.len()) |i| total += buffer.rows(i);
+    const budget = keySampleBudget(total);
+    const parts: usize = if (budget == total) 1 else KEY_SAMPLE_PARTS;
+    if (parts > 1) sample.complete = false;
+    const share = struct {
+        fn window(rows: usize, n: usize, part: usize, window_rows: usize) RowSpan {
+            if (n == 1) return .{ .lo = 0, .hi = rows };
+            return keySampleWindow(part * rows / n, (part + 1) * rows / n, window_rows);
+        }
+    };
+    const window_rows = budget / parts;
+    var pick: usize = 0;
+    var win = share.window(total, parts, 0, window_rows);
+    var end: usize = 0;
+    for (0..buffer.len()) |i| {
+        const rows = buffer.rows(i);
+        if (rows == 0) continue;
+        const start = end;
+        end += rows;
+        if (pick == parts or win.lo >= end) continue;
+        buffer.views(i, views);
+        while (true) {
+            sample.addRows(views, @max(win.lo, start) - start, @min(win.hi, end) - start);
+            if (win.hi > end) break;
+            pick += 1;
+            if (pick == parts) break;
+            win = share.window(total, parts, pick, window_rows);
+            if (win.lo >= end) break;
+        }
+    }
+}
+
+const hll = @import("../util/hll.zig");
+/// A key sample's sketches. The router divides one count by another and
+/// scales the quotient up, so it takes four times the registers of a
+/// column's stored sketch for half the error (about 1.6%); a sample keeps
+/// only a few of them, briefly.
+const KeySketch = hll.Sketch(12);
+const KEY_SAMPLE_BLOCK_ROWS = 1024;
+const KEY_TUPLE_SEED: u64 = 0x2545F4914F6CDD1D;
+const NULL_KEY_HASH: u64 = 0x9E3779B97F4A7C15;
+
+/// The murmur3 finalizer: a bijection whose output bits each depend on
+/// every input bit, which HyperLogLog needs from its hashes. The offset
+/// keeps a zero key, common in data, off the zero hash HLL ranks highest.
+fn mixKey(x: u64) u64 {
+    var h = x +% NULL_KEY_HASH;
+    h = (h ^ (h >> 33)) *% 0xFF51AFD7ED558CCD;
+    h = (h ^ (h >> 33)) *% 0xC4CEB9FE1A85EC53;
+    return h ^ (h >> 33);
+}
+
+/// Hash rows `[start, start + tuples.len)` of `view` into `sketch`, and
+/// fold each into its row's tuple hash. Integers hash by value whatever
+/// their width, floats by their canonical bits, so union arms of other
+/// widths agree.
+fn hashKeyBlock(view: ColumnView, start: usize, tuples: []u64, sketch: *KeySketch) void {
+    switch (view.data) {
+        .varchar, .string, .char, .json => |sv| for (tuples, start..) |*t, r| {
+            const h = if (view.isValid(r)) std.hash.Wyhash.hash(0, sv.rowBytes(r)) else NULL_KEY_HASH;
+            sketch.add(h);
+            t.* = mixKey(t.* ^ h);
+        },
+        inline .float, .double => |s| for (tuples, start..) |*t, r| {
+            const h = if (view.isValid(r)) mixKey(types.canonicalFloatBits(s[r])) else NULL_KEY_HASH;
+            sketch.add(h);
+            t.* = mixKey(t.* ^ h);
+        },
+        inline .largeint, .decimal128, .uuid => |s| for (tuples, start..) |*t, r| {
+            const h = if (view.isValid(r)) std.hash.Wyhash.hash(0, std.mem.asBytes(&s[r])) else NULL_KEY_HASH;
+            sketch.add(h);
+            t.* = mixKey(t.* ^ h);
+        },
+        inline else => |s| for (tuples, start..) |*t, r| {
+            const h = if (view.isValid(r)) mixKey(@bitCast(@as(i64, s[r]))) else NULL_KEY_HASH;
+            sketch.add(h);
+            t.* = mixKey(t.* ^ h);
+        },
+    }
 }
 
 /// String payload bytes a view holds (0 for fixed-width data).
@@ -730,6 +922,11 @@ pub const Query = struct {
     /// `VTable.sampleWidths`.
     pub fn sampleWidths(self: Query, widths: []SampledWidth) !void {
         return self.vtable.sampleWidths(self.ptr, widths);
+    }
+
+    /// Sample key columns `cols` into `sample`. See `VTable.sampleKeys`.
+    pub fn sampleKeys(self: Query, cols: []const usize, sample: *KeySample) !bool {
+        return self.vtable.sampleKeys(self.ptr, cols, sample);
     }
 
     // ----- Combinators -----
@@ -1046,6 +1243,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.sampleWidths(widths);
         }
+        fn sampleKeysWrap(ptr: *anyopaque, cols: []const usize, sample: *KeySample) anyerror!bool {
+            if (!@hasDecl(Op, "sampleKeys")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.sampleKeys(cols, sample);
+        }
 
         const vt: VTable = .{
             .next = nextWrap,
@@ -1068,6 +1270,7 @@ fn OpWrapper(comptime Op: type) type {
             .stableData = stableDataWrap,
             .takeOwnedChunks = takeOwnedChunksWrap,
             .sampleWidths = sampleWidthsWrap,
+            .sampleKeys = sampleKeysWrap,
         };
     };
 }

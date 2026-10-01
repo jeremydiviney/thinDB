@@ -51,12 +51,14 @@ pub fn routeGroupBy(
     const st = upstream.stats();
     const partition_ok = partitionCandidate(st, upstream.outputSchema(), group_cols, aggs, top_k, emit_limit, partition_dop) and
         exec.force_group_by == .auto;
+    var sampled: ?u64 = null;
     if (group_cols.len > 0 and exec.force_group_by == .auto and !groupKeysSortedPrefix(st.sort_state, group_cols)) budgeted: {
         const account = upstream.accountant() orelse break :budgeted;
         const priced_cols = try allocator.alloc(exec.ColStat, upstream.outputSchema().len);
         defer allocator.free(priced_cols);
         const priced = try withSampledWidths(allocator, upstream, st, group_cols, aggs, priced_cols);
-        const needs = inputNeeds(upstream, priced, group_cols, aggs, emit_limit, partitioned_aggregate.partitionCount(partition_dop)) orelse break :budgeted;
+        sampled = try sampledGroups(allocator, upstream, st, group_cols);
+        const needs = inputNeeds(upstream, priced, group_cols, aggs, emit_limit, partitioned_aggregate.partitionCount(partition_dop), sampled) orelse break :budgeted;
         const headroom = account.headroom();
         if (trace) {
             traceNeeds(st.upper_rows, needs, headroom, partition_ok);
@@ -65,7 +67,7 @@ pub fn routeGroupBy(
                 "[gbroute]   realized input: {d} chunks, held={d} MiB, largest={d} MiB\n",
                 .{ r.owned.chunks.len, r.held_bytes >> 20, r.largest_chunk_bytes >> 20 },
             );
-            if (groupState(priced, upstream.outputSchema(), group_cols, aggs, emit_limit)) |gs| {
+            if (groupState(priced, upstream.outputSchema(), group_cols, aggs, emit_limit, sampled)) |gs| {
                 std.debug.print(
                     "[gbroute]   state: groups={d} slot={d} B group={d} B payload={d} B out={d}+{d} B sets={d} MiB; hash cores absorb={d} emit={d} MiB\n",
                     .{ gs.groups, gs.slot, gs.group, gs.payload, gs.out_fixed, gs.out_strings, gs.sets >> 20, needs.cores_absorb >> 20, needs.cores_emit >> 20 },
@@ -79,12 +81,12 @@ pub fn routeGroupBy(
         for (PLAN_ORDER) |plan| {
             if (!needs.admits(plan, partition_ok) or needs.of(plan) > headroom) continue;
             switch (plan) {
-                .radix => if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit)) |q| {
+                .radix => if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit, sampled)) |q| {
                     if (trace) std.debug.print("[gbroute]   -> radix\n", .{});
                     return q;
                 },
                 .partitioned => {
-                    const presize = presizeGroups(priced, upstream.outputSchema(), group_cols, aggs, headroom);
+                    const presize = presizeGroups(priced, upstream.outputSchema(), group_cols, aggs, headroom, sampled);
                     if (trace) std.debug.print("[gbroute]   -> partitioned (dop={d}, presize={d} groups)\n", .{ partition_dop, presize });
                     return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, partition_dop, .auto, presize);
                 },
@@ -105,7 +107,7 @@ pub fn routeGroupBy(
         if (trace) std.debug.print("[gbroute]   no plan fits; budget-blind route\n", .{});
     }
     if (try routeStreamGroupBy(allocator, upstream, group_cols, aggs, budget)) |q| return q;
-    if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit)) |q| return q;
+    if (try routeRadixGroupBy(upstream.*, group_cols, aggs, top_k, emit_limit, sampled)) |q| return q;
     if (partition_ok) {
         if (trace) std.debug.print("[gbroute]   -> partitioned (budget-blind, dop={d})\n", .{partition_dop});
         return partitioned_aggregate.PartitionedAggregate.create(allocator, worker_alloc, upstream.*, group_cols, aggs, partition_dop, .auto, 0);
@@ -330,12 +332,13 @@ pub fn inputNeeds(
     aggs: []const ir.AggSpec,
     emit_limit: ?u32,
     partitions: u64,
+    sampled: ?u64,
 ) ?PlanNeeds {
     const schema = upstream.outputSchema();
     const round = partitioned_aggregate.roundBytes(if (upstream.accountant()) |a| a.budget else null);
     const realized = exec.queryAs(RealizedInput, upstream.*) orelse
-        return planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions, round);
-    const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, realized.largest_chunk_rows, partitions, round) orelse return null;
+        return planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions, round, sampled);
+    const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, realized.largest_chunk_rows, partitions, round, sampled) orelse return null;
     return needs.consuming(realized.held_bytes, realized.largest_chunk_bytes);
 }
 
@@ -376,8 +379,9 @@ const SET_GROWTH: u64 = 2;
 const GUESSED_STRING_WIDTH: u64 = 32;
 
 /// Each keyed plan's estimated peak over an input described by `st` (row
-/// bound, key NDV bounds, measured string widths) and `schema`, read in
-/// batches of at most `batch_rows`:
+/// bound, key NDV bounds, measured string widths), `schema` and a key
+/// sample's group estimate when there is one (`sampled`, see
+/// `GroupState`), read in batches of at most `batch_rows`:
 ///   - input buffer B = rows × Σ column bytes (a string's width plus its
 ///     4-byte offset, a validity byte when nullable)
 ///   - radix's state S(w), for a table that also takes w rows of the
@@ -415,11 +419,12 @@ pub fn planNeeds(
     batch_rows: u64,
     partitions: u64,
     round_bytes: u64,
+    sampled: ?u64,
 ) ?PlanNeeds {
     const rows = st.upper_rows;
     const row_bytes = rowBytes(st, schema);
     const input = rows *| row_bytes;
-    const state = groupState(st, schema, group_cols, aggs, emit_limit) orelse return null;
+    const state = groupState(st, schema, group_cols, aggs, emit_limit, sampled) orelse return null;
     const index = rows *| @sizeOf(u32);
     const windows = @min(rows, partitions *| partitioned_aggregate.PARTITION_BATCH_ROWS);
     const streamed = state.bytes(@min(rows, batch_rows));
@@ -540,9 +545,9 @@ fn withSampledWidths(
 }
 
 /// The product of the keys' NDV bounds capped at the rows, or at the row
-/// origin's rows when every key comes from it (`exec.keyTupleBound`); null
-/// when a key's NDV is unknown.
-fn estimateGroups(st: exec.PipelineStats, schema: []const types.Column, group_cols: []const []const u8) ?u64 {
+/// origin's rows when every key comes from it (`exec.keyTupleBound`), and
+/// at `sampled` when given; null when a key's NDV is unknown.
+fn estimateGroups(st: exec.PipelineStats, schema: []const types.Column, group_cols: []const []const u8, sampled: ?u64) ?u64 {
     var product: u64 = 1;
     var from_row = true;
     for (group_cols) |gc| {
@@ -554,47 +559,187 @@ fn estimateGroups(st: exec.PipelineStats, schema: []const types.Column, group_co
             .unknown => return null,
         }
     }
-    return @min(product, @max(exec.keyTupleBound(st, from_row), 1));
+    const bound = @min(product, @max(exec.keyTupleBound(st, from_row), 1));
+    return @min(bound, sampled orelse bound);
+}
+
+/// Rows per value of the widest key a key sample must hold before the
+/// router trusts its tuples per value (issue #478). A sample that sees a
+/// key value once or twice can't tell a key with one partner from one
+/// with many it hasn't met yet.
+const KEY_SAMPLE_MIN_REPEATS: u64 = 4;
+
+/// The fewest groups a key sample may shrink: below that, radix's first
+/// table already holds them, and the sample would cost more than its
+/// estimate saves.
+const KEY_SAMPLE_MIN_GROUPS: u64 = 64 * 1024;
+
+/// What the router prices over a key sample's estimate (issue #478): a
+/// plan is priced for this many times the groups the sample estimates,
+/// capped at the keys' NDV product, so a sample that undercounts the
+/// groups by up to half still prices the groups the plan will hold.
+const SAMPLED_GROUPS_MARGIN: u64 = 2;
+
+/// The groups a key sample estimates for a multi-key GROUP BY whose NDV
+/// product overshoots (issue #478), or null to keep the product. The
+/// product treats the keys as independent; when one key nearly fixes the
+/// others (a user's search engine, an IP's region) it can overshoot the
+/// groups many times over. The sample counts key tuples per value of the
+/// widest key, and the estimate scales that by the widest key's NDV.
+///
+/// Sampled only when there is something to win: at least two keys, every
+/// key's NDV known, and a product past both twice the widest key's NDV and
+/// `KEY_SAMPLE_MIN_GROUPS`. A sample of the whole input counts its tuples
+/// outright. A partial one is trusted only when it saw each value of the
+/// widest key `KEY_SAMPLE_MIN_REPEATS` times on average, when its rows
+/// repeat their tuples at least twice on average (a sample whose tuples are
+/// mostly new has not seen enough of each key's partners to count them),
+/// and when it saw at least 1/`SAMPLED_GROUPS_MARGIN` of each widest value's
+/// rows on average (`coversWidestRows`).
+fn sampledGroups(
+    allocator: Allocator,
+    upstream: *Query,
+    st: exec.PipelineStats,
+    group_cols: []const []const u8,
+) !?u64 {
+    if (group_cols.len < 2) return null;
+    const schema = upstream.outputSchema();
+    const bound = estimateGroups(st, schema, group_cols, null) orelse return null;
+    const all_cols = try allocator.alloc(usize, group_cols.len);
+    defer allocator.free(all_cols);
+    var n_cols: usize = 0;
+    var widest: usize = 0;
+    var widest_ndv: u64 = 0;
+    var widest_name: []const u8 = "";
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse return null;
+        const ndv = st.column_stats[idx].ndv.exact;
+        // A key of one value and no NULLs (a constant, often computed)
+        // adds no tuples.
+        if (ndv <= 1 and !schema[idx].nullable) continue;
+        if (ndv > widest_ndv) {
+            widest = n_cols;
+            widest_ndv = ndv;
+            widest_name = gc;
+        }
+        all_cols[n_cols] = idx;
+        n_cols += 1;
+    }
+    if (n_cols < 2 or bound <= KEY_SAMPLE_MIN_GROUPS or bound / 2 <= widest_ndv) return null;
+    const cols = all_cols[0..n_cols];
+    const trace = getenv_gr("THINDB_TRACE_KEYSAMPLE") != null;
+    const started = exec.prof.nowTicks();
+    var sample = try exec.KeySample.init(allocator, cols.len);
+    defer sample.deinit(allocator);
+    const answered = try upstream.sampleKeys(cols, &sample);
+    const elapsed: u64 = @intCast(@max(exec.prof.nowTicks() - started, 0));
+    exec.prof.addPhase("plan.key_sample", elapsed);
+    const tuples = sample.tuple.estimate();
+    const widest_seen = sample.keys[widest].estimate();
+    const verdict: KeySampleVerdict = if (!answered)
+        .declined
+    else if (sample.complete)
+        .{ .estimate = @min(bound, @max(tuples, 1)) }
+    else if (widest_seen == 0 or sample.rows / widest_seen < KEY_SAMPLE_MIN_REPEATS)
+        .few_repeats
+    else if (!coversWidestRows(sample.rows, widest_seen, st.upper_rows, widest_ndv))
+        .shallow
+    else if (tuples > sample.rows / 2)
+        .saturated
+    else
+        .{ .estimate = @min(bound, @max(widest_ndv *| tuples / widest_seen, tuples, widest_ndv)) };
+    if (trace) traceKeySample(sample, widest_name, widest_ndv, widest_seen, st.upper_rows, bound, verdict, elapsed);
+    return switch (verdict) {
+        .estimate => |e| e,
+        else => null,
+    };
+}
+
+/// Whether a partial key sample saw, on average, at least
+/// 1/`SAMPLED_GROUPS_MARGIN` of the rows of each widest-key value it met:
+/// its rows per widest value seen against the input's rows per widest
+/// value, its coverage. Coverage is what keeps the estimate from
+/// undercounting. A sample of whole row groups or chunks holding a fraction
+/// f of the input's rows meets each of the input's tuples with a chance of
+/// at least about f, so its tuples divided by f overcount the input's. The
+/// estimate divides them by the share of widest values the sample saw
+/// instead, which is f over the coverage, so it counts at least the
+/// coverage times the input's tuples; at a coverage of 1/2, the margin
+/// still prices them all, however each value's partners are spread (one
+/// dominant partner and a long tail of rare ones included). A key whose
+/// values scatter over the input has a low coverage: the sample sees a few
+/// rows of each value and misses its rare partners.
+fn coversWidestRows(sample_rows: u64, widest_seen: u64, rows: u64, widest_ndv: u64) bool {
+    return @as(u128, sample_rows) * widest_ndv * SAMPLED_GROUPS_MARGIN >= @as(u128, rows) * widest_seen;
+}
+
+const KeySampleVerdict = union(enum) {
+    estimate: u64,
+    declined,
+    few_repeats,
+    shallow,
+    saturated,
+};
+
+fn traceKeySample(sample: exec.KeySample, widest: []const u8, widest_ndv: u64, widest_seen: u64, rows: u64, bound: u64, verdict: KeySampleVerdict, ticks: u64) void {
+    const per_value_sample = @as(f64, @floatFromInt(sample.rows)) / @as(f64, @floatFromInt(@max(widest_seen, 1)));
+    const per_value_input = @as(f64, @floatFromInt(rows)) / @as(f64, @floatFromInt(@max(widest_ndv, 1)));
+    std.debug.print(
+        "[keysample] source={s} keys={d} rows={d} complete={} tuples={d} widest={s} ndv={d} seen={d} coverage={d:.2} bound={d} took={d:.2} ms -> ",
+        .{ sample.source, sample.keys.len, sample.rows, sample.complete, sample.tuple.estimate(), widest, widest_ndv, widest_seen, per_value_sample / per_value_input, bound, exec.prof.ticksToMs(@intCast(ticks)) },
+    );
+    switch (verdict) {
+        .estimate => |e| std.debug.print("estimate={d}\n", .{e}),
+        else => std.debug.print("product ({s})\n", .{@tagName(verdict)}),
+    }
 }
 
 /// The groups the partitioned plan's hash cores size their tables for (issue
-/// #464): the keys' NDV estimate, or 0 without one, when the cores grow from
-/// empty. Capped at the groups whose slots `headroom` holds, so an
-/// estimate the budget can't hold never reserves past it.
+/// #464): the keys' NDV estimate, or a key sample's when there is one
+/// (`sampledGroups`), or 0 without either, when the cores grow from empty.
+/// Capped at the groups whose slots `headroom` holds, so an estimate the
+/// budget can't hold never reserves past it.
 fn presizeGroups(
     st: exec.PipelineStats,
     schema: []const types.Column,
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     headroom: u64,
+    sampled: ?u64,
 ) u64 {
-    const groups = estimateGroups(st, schema, group_cols) orelse return 0;
-    const state = groupState(st, schema, group_cols, aggs, null) orelse return 0;
+    const groups = estimateGroups(st, schema, group_cols, sampled) orelse return 0;
+    const state = groupState(st, schema, group_cols, aggs, null, sampled) orelse return 0;
     return @min(groups, headroom / (state.slot *| SLOTS_NUM / SLOTS_DEN));
 }
 
 /// The groups radix's table jumps to once it outgrows its first one (issue
-/// #476): the keys' NDV estimate, or 0 without one, when it doubles from a
-/// small table. Capped at the groups whose table and cells `headroom`
-/// holds: g groups take up to 8/3 g slots, and cells for 3/4 of those.
+/// #476): the keys' NDV estimate, or a key sample's when there is one
+/// (`sampledGroups`), or 0 without either, when it doubles from a small
+/// table. Capped at the groups whose table and cells `headroom` holds: g
+/// groups take up to 8/3 g slots, and cells for 3/4 of those.
 fn radixPresize(
     st: exec.PipelineStats,
     schema: []const types.Column,
     group_cols: []const []const u8,
     fp: exec.radix_aggregate.Footprint,
     headroom: u64,
+    sampled: ?u64,
 ) u64 {
-    const groups = estimateGroups(st, schema, group_cols) orelse return 0;
+    const groups = estimateGroups(st, schema, group_cols, sampled) orelse return 0;
     return @min(groups, headroom / (fp.slot *| SLOTS_NUM / SLOTS_DEN +| fp.cell *| 2));
 }
 
 /// A hash aggregate's state. `groups` is the product of the keys' NDV bounds
-/// capped at rows, or rows when any key's NDV is unknown; under a bare LIMIT
-/// whose aggregates keep bounded state the table stops at `emit_limit`
-/// groups plus an overflow group (the hash plan is the only one that takes
-/// a LIMIT).
+/// capped at rows, or rows when any key's NDV is unknown, or
+/// `SAMPLED_GROUPS_MARGIN` times a key sample's estimate when there is one
+/// and it is smaller; under a bare LIMIT whose aggregates keep bounded state
+/// the table stops at `emit_limit` groups plus an overflow group (the hash
+/// plan is the only one that takes a LIMIT).
 const GroupState = struct {
     groups: u64,
+    /// The groups radix's table jumps to from its first one
+    /// (`radixPresize`): a key sample's estimate, or `groups` without one.
+    jump: u64,
     /// A table slot: its hash and group id, the key slice, and every
     /// aggregate's cell.
     slot: u64,
@@ -627,17 +772,17 @@ const GroupState = struct {
     /// a cell for every group the table holds
     /// (`radix_aggregate.cellCapacity`) and scratch for the batch. While a
     /// grow moves the groups, it also holds the table and cells it
-    /// outgrew: its first table when it jumps from there to the estimate,
-    /// else the half it doubled from. It frees the table and scratch, then
+    /// outgrew: its first table when it jumps from there to `jump`, else
+    /// the half it doubled from. It frees the table and scratch, then
     /// emits every group into columns reserved to fit. Unbounded when radix
     /// can't carry the GROUP BY.
     fn bytes(self: GroupState, batch_rows: u64) u64 {
         const fp = self.radix orelse return std.math.maxInt(u64);
         const ra = exec.radix_aggregate;
         const slots = tableSlots(self.groups +| batch_rows);
-        const first_groups: u64 = if (self.estimated) @min(self.groups, ra.INITIAL_GROUPS) else ra.UNESTIMATED_GROUPS;
+        const first_groups: u64 = if (self.estimated) @min(self.jump, ra.INITIAL_GROUPS) else ra.UNESTIMATED_GROUPS;
         const first = tableSlots(first_groups);
-        const target = if (self.estimated) tableSlots(self.groups) else first;
+        const target = if (self.estimated) tableSlots(self.jump) else first;
         const outgrown: u64 = if (slots <= first) 0 else if (slots <= target) first else slots / 2;
         const cells: u64 = ra.cellCapacity(slots);
         const drain = (slots +| outgrown) *| fp.slot +| (cells +| ra.cellCapacity(outgrown)) *| fp.cell +| batch_rows *| BATCH_SCRATCH_BYTES;
@@ -681,6 +826,7 @@ fn groupState(
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     emit_limit: ?u32,
+    sampled: ?u64,
 ) ?GroupState {
     const rows = st.upper_rows;
     var slot: u64 = 16 + 16;
@@ -708,7 +854,7 @@ fn groupState(
             out_strings += width;
         }
     }
-    const estimate = estimateGroups(st, schema, group_cols);
+    const estimate = estimateGroups(st, schema, group_cols, if (sampled) |s| s *| SAMPLED_GROUPS_MARGIN else null);
     const all_groups = estimate orelse @max(rows, 1);
     const capped = emit_limit != null and exec.aggregate_op.aggsAllowGroupCap(aggs);
     const groups = if (capped) @min(all_groups, @as(u64, emit_limit.?) + 1) else all_groups;
@@ -763,6 +909,7 @@ fn groupState(
     }
     return .{
         .groups = groups,
+        .jump = @min(groups, sampled orelse groups),
         .slot = slot,
         .group = group,
         .payload = payload,
@@ -885,6 +1032,35 @@ pub const RealizedInput = struct {
             w.distinct = sampler.width();
         }
     }
+
+    /// `VTable.sampleKeys` over the rows still held (`exec.sampleBuffer`).
+    pub fn sampleKeys(self: *RealizedInput, cols: []const usize, sample: *exec.KeySample) !bool {
+        const schema = self.source.outputSchema();
+        for (cols) |c| if (c >= schema.len) return false;
+        const views = try self.allocator.alloc(storage.ColumnView, cols.len);
+        defer self.allocator.free(views);
+        exec.sampleBuffer(sample, HeldChunks{ .chunks = self.owned.chunks[self.freed..], .cols = cols }, views);
+        sample.complete = sample.complete and self.freed == 0;
+        sample.source = "realized input";
+        return true;
+    }
+
+    /// The chunks a realized input still holds, as `exec.sampleBuffer`
+    /// reads them.
+    const HeldChunks = struct {
+        chunks: []const exec.OwnedChunk,
+        cols: []const usize,
+
+        pub fn len(self: HeldChunks) usize {
+            return self.chunks.len;
+        }
+        pub fn rows(self: HeldChunks, i: usize) usize {
+            return self.chunks[i].rows;
+        }
+        pub fn views(self: HeldChunks, i: usize, out: []storage.ColumnView) void {
+            for (self.cols, out) |col, *v| v.* = self.chunks[i].stores[col].view();
+        }
+    };
 
     /// Takes `owned` whatever happens, and `source` on success (a drained
     /// pipeline, kept for its schema and sort order until deinit).
@@ -1020,12 +1196,15 @@ pub fn keySpaceCacheResident(
 /// cases; `--force-group-by radix` skips that gate (still requires the query to
 /// qualify structurally). Returns null to fall through to the hash
 /// `groupByTopK`; consumes `upstream` into the returned Query only on success.
+/// `sampled` is a key sample's group estimate (`sampledGroups`), which the
+/// table presizes to in place of the NDV product.
 pub fn routeRadixGroupBy(
     upstream: Query,
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     top_k: ?ir.Op.TopK,
     emit_limit: ?u32,
+    sampled: ?u64,
 ) !?Query {
     switch (exec.force_group_by) {
         .hash, .sort => return null,
@@ -1065,7 +1244,7 @@ pub fn routeRadixGroupBy(
         .{ .k = tk.k, .col = tk.keys[0].col, .desc = tk.keys[0].desc }
     else
         null;
-    return radixPresized(upstream, group_cols, aggs, rtk);
+    return radixPresized(upstream, group_cols, aggs, rtk, sampled);
 }
 
 /// A RadixAggregate over `upstream` sized by `radixPresize` against the
@@ -1076,11 +1255,12 @@ fn radixPresized(
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
     top_k: ?exec.radix_aggregate.TopK,
+    sampled: ?u64,
 ) !?Query {
     const schema = upstream.outputSchema();
     const headroom: u64 = if (upstream.accountant()) |a| a.headroom() else std.math.maxInt(u64);
     const presize = if (exec.radix_aggregate.footprint(schema, group_cols, aggs)) |fp|
-        radixPresize(upstream.stats(), schema, group_cols, fp, headroom)
+        radixPresize(upstream.stats(), schema, group_cols, fp, headroom, sampled)
     else
         0;
     if (getenv_gr("THINDB_TRACE_GBROUTE") != null) std.debug.print("[gbroute]   radix presize={d} groups\n", .{presize});
@@ -1369,7 +1549,7 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .avg_width = 100 },
         .{},
     } };
-    const needs = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 4, whole).?;
+    const needs = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 4, whole, null).?;
     const row_bytes = 24 + 105 + 8;
     const input = rows * row_bytes;
     // A slot holds the hash, group id, key slice and both aggregates' cells.
@@ -1378,7 +1558,7 @@ test "plan needs price the input buffer, the group state and measured widths" {
     // value's offset and validity, and the count, and the value's bytes
     // into a growing buffer. The sort cores still price both at the
     // per-row widths, and the string key leaves radix out.
-    const state = groupState(measured, &schema, &group_cols, &aggs, null).?;
+    const state = groupState(measured, &schema, &group_cols, &aggs, null, null).?;
     const cells = exec.aggregate_op.aggStateWidth(.max_by, schema[1].type, .bigint) + exec.aggregate_op.aggStateWidth(.count, null, null);
     try std.testing.expectEqual(16 + 16 + cells, state.slot);
     try std.testing.expectEqual((20 + 24) + (100 + 105) + 16, state.group);
@@ -1396,7 +1576,7 @@ test "plan needs price the input buffer, the group state and measured widths" {
     try std.testing.expectEqual(rows * (45 + 100 * 5 / 4), serial.output);
     try std.testing.expectEqual(serial.held + serial.output, needs.hash);
     // A streamed batch widens the tables and adds its scratch.
-    const batched = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4, whole).?;
+    const batched = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4, whole, null).?;
     const batched_serial = state.hashTables(1, 1000);
     try std.testing.expectEqual(batched_serial.held + batched_serial.output, batched.hash);
     try std.testing.expectEqual(serial.held + 1000 * BATCH_SCRATCH_BYTES, batched_serial.held);
@@ -1415,13 +1595,13 @@ test "plan needs price the input buffer, the group state and measured widths" {
     // Hash cores buffer a round of the input at a time: its bytes, plus the
     // batch that crosses it.
     const round_rows = 10_000_000 / row_bytes + 1000;
-    const rounded = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4, 10_000_000).?;
+    const rounded = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4, 10_000_000, null).?;
     const rounded_absorb = round_rows * row_bytes + 4 * round_rows + 2 * windows * row_bytes + cores.held;
     try std.testing.expectEqual(@max(rounded_absorb, emit), rounded.partitioned);
     try std.testing.expectEqual(needs.sort, rounded.sort);
     try std.testing.expectEqual(needs.partitioned_sort, rounded.partitioned_sort);
     // Windows past the input's rows hold only its rows.
-    const wide = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 16, whole).?;
+    const wide = planNeeds(measured, &schema, &group_cols, &aggs, null, 0, 16, whole, null).?;
     const wide_cores = state.hashTables(16, partitioned_aggregate.PARTITION_BATCH_ROWS);
     try std.testing.expectEqual(@max(input + 4 * rows + 2 * input + wide_cores.held, wide_cores.held + wide_cores.output), wide.partitioned);
     // An unknown key NDV prices a group per row, each copying out its key
@@ -1445,8 +1625,8 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .func = .max_by, .col = "v", .arg2_col = "t", .as = "u" },
         .{ .func = .any_value, .col = "v", .as = "w" },
     };
-    const heavy = planNeeds(measured, &schema, &group_cols, &heavy_aggs, null, 0, 4, whole).?;
-    const heavy_state = groupState(measured, &schema, &group_cols, &heavy_aggs, null).?;
+    const heavy = planNeeds(measured, &schema, &group_cols, &heavy_aggs, null, 0, 4, whole, null).?;
+    const heavy_state = groupState(measured, &schema, &group_cols, &heavy_aggs, null, null).?;
     const heavy_cores = heavy_state.hashTables(4, partitioned_aggregate.PARTITION_BATCH_ROWS);
     const heavy_hash_cores = @max(input + 4 * rows + 2 * windows * row_bytes + heavy_cores.held, heavy_cores.held + heavy_cores.output);
     try std.testing.expectEqual(2 * (input + 4 * rows) + heavy_state.groups * heavy_state.group * 3 / 2, heavy.partitioned_sort);
@@ -1485,9 +1665,9 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{ .avg_width = 100 },
         .{},
     } };
-    const few_state = groupState(few, &schema, &group_cols, &aggs, null).?;
+    const few_state = groupState(few, &schema, &group_cols, &aggs, null, null).?;
     try std.testing.expectEqual(@as(u64, 1000), few_state.groups);
-    const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null, 0, 4, whole).?;
+    const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null, 0, 4, whole, null).?;
     const few_serial = few_state.hashTables(1, 0);
     try std.testing.expectEqual(few_serial.held + few_serial.output, few_needs.hash);
     try std.testing.expectEqual(group_table.capacityFor(1000) * few_state.slot + 1000 * 120 * 4 / 3, few_serial.held);
@@ -1498,12 +1678,12 @@ test "plan needs price the input buffer, the group state and measured widths" {
     // A bare LIMIT over bounded aggregate state stops the hash table at the
     // limit plus an overflow group; MAX_BY's value is not bounded state.
     const count_only = [_]ir.AggSpec{.{ .func = .count, .col = null, .as = "c" }};
-    try std.testing.expectEqual(rows, groupState(measured, &schema, &group_cols, &count_only, null).?.groups);
-    try std.testing.expectEqual(@as(u64, 11), groupState(measured, &schema, &group_cols, &count_only, 10).?.groups);
-    try std.testing.expectEqual(needs.hash, planNeeds(measured, &schema, &group_cols, &aggs, 10, 0, 4, whole).?.hash);
+    try std.testing.expectEqual(rows, groupState(measured, &schema, &group_cols, &count_only, null, null).?.groups);
+    try std.testing.expectEqual(@as(u64, 11), groupState(measured, &schema, &group_cols, &count_only, 10, null).?.groups);
+    try std.testing.expectEqual(needs.hash, planNeeds(measured, &schema, &group_cols, &aggs, 10, 0, 4, whole, null).?.hash);
 
     // Unmeasured strings take the 32-byte guess.
-    const guessed = planNeeds(.{ .upper_rows = rows }, &schema, &group_cols, &aggs, null, 0, 4, whole).?;
+    const guessed = planNeeds(.{ .upper_rows = rows }, &schema, &group_cols, &aggs, null, 0, 4, whole, null).?;
     const guessed_input = rows * (36 + 37 + 8);
     try std.testing.expectEqual(guessed_input + guessed_input / 2 + 4 * rows, guessed.sort);
 
@@ -1520,12 +1700,12 @@ test "plan needs price the input buffer, the group state and measured widths" {
         .{},
         .{},
     } };
-    const small_sets = planNeeds(small_t, &schema, &group_cols, &distinct_aggs, null, 0, 4, whole).?.hash;
-    const all_sets = planNeeds(all_t, &schema, &group_cols, &distinct_aggs, null, 0, 4, whole).?.hash;
+    const small_sets = planNeeds(small_t, &schema, &group_cols, &distinct_aggs, null, 0, 4, whole, null).?.hash;
+    const all_sets = planNeeds(all_t, &schema, &group_cols, &distinct_aggs, null, 0, 4, whole, null).?.hash;
     try std.testing.expectEqual((rows - 10_000) * ((8 + 16) * 4 / 3 * SET_GROWTH), all_sets - small_sets);
 
     const missing = [_]ir.AggSpec{.{ .func = .max, .col = "nope", .as = "m" }};
-    try std.testing.expectEqual(@as(?PlanNeeds, null), planNeeds(measured, &schema, &group_cols, &missing, null, 0, 4, whole));
+    try std.testing.expectEqual(@as(?PlanNeeds, null), planNeeds(measured, &schema, &group_cols, &missing, null, 0, 4, whole, null));
 }
 
 test "a hash aggregate prices the strings a group keeps at their distinct width" {
@@ -1552,21 +1732,21 @@ test "a hash aggregate prices the strings a group keeps at their distinct width"
     // A lone string key: the arena copies it once per group, and the emit
     // reserves its bytes exactly.
     const one = [_][]const u8{"k"};
-    const plain = groupState(row_mean, &schema, &one, &aggs, null).?;
-    const keyed = groupState(sampled, &schema, &one, &aggs, null).?;
+    const plain = groupState(row_mean, &schema, &one, &aggs, null, null).?;
+    const keyed = groupState(sampled, &schema, &one, &aggs, null, null).?;
     try std.testing.expectEqual(9, plain.payload);
     try std.testing.expectEqual(65, keyed.payload);
     try std.testing.expectEqual(4 + 65 + 16, keyed.out_fixed);
     try std.testing.expectEqual(0, keyed.out_strings);
     try std.testing.expectEqual(plain.group, keyed.group);
-    const plain_needs = planNeeds(row_mean, &schema, &one, &aggs, null, 0, 4, whole).?;
-    const keyed_needs = planNeeds(sampled, &schema, &one, &aggs, null, 0, 4, whole).?;
+    const plain_needs = planNeeds(row_mean, &schema, &one, &aggs, null, 0, 4, whole, null).?;
+    const keyed_needs = planNeeds(sampled, &schema, &one, &aggs, null, 0, 4, whole, null).?;
     try std.testing.expectEqual(plain_needs.partitioned_sort, keyed_needs.partitioned_sort);
     try std.testing.expectEqual(50_000 * (65 - 9) * 4 / 3 + 50_000 * (65 - 9), keyed_needs.hash - plain_needs.hash);
     // Beside another key, each string key also frames its length, and the
     // emit appends its bytes into a growing buffer.
     const three = [_][]const u8{ "k", "j", "n" };
-    const multi = groupState(sampled, &schema, &three, &aggs, null).?;
+    const multi = groupState(sampled, &schema, &three, &aggs, null, null).?;
     try std.testing.expectEqual((4 + 65) + (4 + 12) + 8, multi.payload);
     try std.testing.expectEqual(4 + (4 + 1) + (8 + 0) + 16, multi.out_fixed);
     try std.testing.expectEqual(65 + 12, multi.out_strings);
@@ -1578,10 +1758,10 @@ test "a hash aggregate prices the strings a group keeps at their distinct width"
         .{ .func = .min, .col = "k", .as = "lo" },
         .{ .func = .max, .col = "j", .as = "hi" },
     };
-    const kept = groupState(sampled, &schema, &by_n, &kept_aggs, null).?;
+    const kept = groupState(sampled, &schema, &by_n, &kept_aggs, null, null).?;
     try std.testing.expectEqual(8 + 65 + 30, kept.payload);
     try std.testing.expectEqual(65 + 30, kept.out_strings);
-    try std.testing.expectEqual(groupState(row_mean, &schema, &by_n, &kept_aggs, null).?.group, kept.group);
+    try std.testing.expectEqual(groupState(row_mean, &schema, &by_n, &kept_aggs, null, null).?.group, kept.group);
 }
 
 test "radix prices the table, cells and output it allocates (issue #476)" {
@@ -1629,7 +1809,7 @@ test "radix prices the table, cells and output it allocates (issue #476)" {
         .{},
         .{},
     } };
-    const state = groupState(est, &schema, &keys, &aggs, null).?;
+    const state = groupState(est, &schema, &keys, &aggs, null, null).?;
     try std.testing.expect(state.estimated);
     const slots: u64 = 2 * 1024 * 1024;
     try std.testing.expectEqual(slots, group_table.capacityFor(1_000_000 + batch));
@@ -1637,13 +1817,13 @@ test "radix prices the table, cells and output it allocates (issue #476)" {
     const drain = (slots + first) * 16 + (slots / 4 * 3 + first / 4 * 3) * fp.cell + batch * BATCH_SCRATCH_BYTES;
     const emit = slots / 4 * 3 * fp.cell + 1_000_000 * fp.out + 2 * ((1_000_000 + 7) / 8);
     try std.testing.expectEqual(@max(drain, emit), state.bytes(batch));
-    try std.testing.expectEqual(state.bytes(batch), planNeeds(est, &schema, &keys, &aggs, null, batch, 4, whole).?.radix);
+    try std.testing.expectEqual(state.bytes(batch), planNeeds(est, &schema, &keys, &aggs, null, batch, 4, whole, null).?.radix);
     // A few groups stay in the first table.
-    const few = groupState(.{ .upper_rows = 1000, .column_stats = est.column_stats }, &schema, &keys, &aggs, null).?;
+    const few = groupState(.{ .upper_rows = 1000, .column_stats = est.column_stats }, &schema, &keys, &aggs, null, null).?;
     try std.testing.expectEqual(2048 * 16 + 1536 * fp.cell, few.bytes(0));
     // Without an estimate it prices a group per row, and doubles from a
     // small table, holding the half it doubled from beside the last one.
-    const blind = groupState(.{ .upper_rows = rows }, &schema, &keys, &aggs, null).?;
+    const blind = groupState(.{ .upper_rows = rows }, &schema, &keys, &aggs, null, null).?;
     try std.testing.expect(!blind.estimated);
     const blind_slots = group_table.capacityFor(rows + batch);
     try std.testing.expectEqual(
@@ -1651,8 +1831,8 @@ test "radix prices the table, cells and output it allocates (issue #476)" {
         blind.bytes(batch),
     );
     // Under a bare LIMIT it leaves the GROUP BY to the hash plan.
-    try std.testing.expectEqual(@as(?ra.Footprint, null), groupState(est, &schema, &keys, &aggs, 10).?.radix);
-    try std.testing.expect(!planNeeds(est, &schema, &keys, &aggs, 10, batch, 4, whole).?.admits(.radix, true));
+    try std.testing.expectEqual(@as(?ra.Footprint, null), groupState(est, &schema, &keys, &aggs, 10, null).?.radix);
+    try std.testing.expect(!planNeeds(est, &schema, &keys, &aggs, 10, batch, 4, whole, null).?.admits(.radix, true));
 }
 
 /// Batches of `batch_rows` rows of a BIGINT key and value, whose stats
@@ -1728,8 +1908,8 @@ fn testRadixRun(a: Allocator, keys: []const i64, values: []const i64, batch_rows
         .{ .func = .max, .col = "v", .as = "m" },
     };
     const up = exec.makeQuery(a, &src);
-    const price = planNeeds(up.stats(), up.outputSchema(), &group_cols, &aggs, null, batch_rows, 1, std.math.maxInt(u64)).?.radix;
-    var q = (try radixPresized(up, &group_cols, &aggs, null)).?;
+    const price = planNeeds(up.stats(), up.outputSchema(), &group_cols, &aggs, null, batch_rows, 1, std.math.maxInt(u64), null).?.radix;
+    var q = (try radixPresized(up, &group_cols, &aggs, null, null)).?;
     defer q.deinit();
     const held = account.current_bytes;
     var rows: std.ArrayList(RadixRow) = .empty;
@@ -1960,7 +2140,7 @@ fn testRouteRealized(a: Allocator, budget: usize, partition_dop: usize, blind: b
     var q = routed: {
         var up = try RealizedInput.create(tracked, exec.makeQuery(tracked, &drained), owned);
         errdefer up.deinit();
-        needs = inputNeeds(&up, up.stats(), &group_cols, &aggs, null, partitioned_aggregate.partitionCount(partition_dop)).?;
+        needs = inputNeeds(&up, up.stats(), &group_cols, &aggs, null, partitioned_aggregate.partitionCount(partition_dop), null).?;
         held = account.current_bytes;
         blind_hash_ok = groupKeysCardUnderLimit(up.stats(), up.outputSchema(), &group_cols, &aggs, budget);
         if (blind) break :routed try partitioned_aggregate.PartitionedAggregate.create(tracked, worker, up, &group_cols, &aggs, partition_dop, .auto, 0);
@@ -2098,4 +2278,161 @@ test "a proven cache-resident key space takes the hash plan, not the partitioned
     defer testFreeLines(a, lines);
     try std.testing.expectEqual(unknown.lines.len, lines.len);
     for (unknown.lines, lines) |p, h| try std.testing.expectEqualStrings(p, h);
+}
+
+/// Two BIGINT keys whose stats bound `upper_rows` rows and give each key's
+/// NDV, and whose key sample is the rows it holds: all of its input when
+/// `complete`, else a part of it.
+const TestKeySource = struct {
+    a: []const i64,
+    b: []const i64,
+    complete: bool,
+    col_stats: [2]exec.ColStat,
+    upper_rows: u64,
+    samples: usize = 0,
+
+    const schema = [_]types.Column{ .{ .name = "a", .type = .bigint }, .{ .name = "b", .type = .bigint } };
+
+    pub fn next(_: *TestKeySource) !?exec.Batch {
+        return null;
+    }
+    pub fn deinit(_: *TestKeySource) void {}
+    pub fn outputSchema(_: *TestKeySource) []const types.Column {
+        return &schema;
+    }
+    pub fn addPrune(_: *TestKeySource, _: exec.Predicate) !void {}
+    pub fn stats(self: *TestKeySource) exec.PipelineStats {
+        return .{ .upper_rows = self.upper_rows, .column_stats = &self.col_stats };
+    }
+    pub fn accountant(_: *TestKeySource) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *TestKeySource, out: *std.ArrayList(u8), alloc: Allocator, depth: usize) !void {
+        try exec.explainLine(out, alloc, depth, "TestKeySource");
+    }
+    pub fn sampleKeys(self: *TestKeySource, cols: []const usize, sample: *exec.KeySample) !bool {
+        self.samples += 1;
+        var views: [2]storage.ColumnView = undefined;
+        for (cols, views[0..cols.len]) |c, *v| v.* = .{ .data = .{ .bigint = if (c == 0) self.a else self.b } };
+        sample.addRows(views[0..cols.len], 0, self.a.len);
+        sample.complete = sample.complete and self.complete;
+        return true;
+    }
+};
+
+/// What `sampledGroups` estimates over `a`/`b`, with `upper_rows` rows and
+/// the keys' NDVs as their stats, and how many times it sampled.
+fn testSampledGroups(alloc: Allocator, a: []const i64, b: []const i64, complete: bool, ndv_a: u32, ndv_b: u32, upper_rows: u64, keys: []const []const u8) !struct { groups: ?u64, samples: usize } {
+    var src = TestKeySource{
+        .a = a,
+        .b = b,
+        .complete = complete,
+        .col_stats = .{ .{ .ndv = .{ .exact = ndv_a } }, .{ .ndv = .{ .exact = ndv_b } } },
+        .upper_rows = upper_rows,
+    };
+    var q = exec.makeQuery(alloc, &src);
+    const groups = try sampledGroups(alloc, &q, q.stats(), keys);
+    return .{ .groups = groups, .samples = src.samples };
+}
+
+test "a key sample estimates the groups of correlated keys, and declines when it can't tell (issue #478)" {
+    const alloc = std.testing.allocator;
+    const sample_rows = 160_000;
+    const a = try alloc.alloc(i64, sample_rows);
+    defer alloc.free(a);
+    const b = try alloc.alloc(i64, sample_rows);
+    defer alloc.free(b);
+    const keys = [_][]const u8{ "a", "b" };
+    // 100K values of `a` with 10 rows each, clustered, each with one `b` of
+    // 1000; the sample holds the first 16K of them. The NDV product caps
+    // at the million rows.
+    for (a, b, 0..) |*x, *y, i| {
+        x.* = @intCast(i / 10);
+        y.* = @mod(x.* * 7919, 1000);
+    }
+    const one_partner = try testSampledGroups(alloc, a, b, false, 100_000, 1000, 1_000_000, &keys);
+    try std.testing.expect(one_partner.groups.? >= 100_000 and one_partner.groups.? <= 115_000);
+
+    // Three partners each: three times the groups.
+    for (a, b, 0..) |x, *y, i| y.* = @mod(x * 7919 + @as(i64, @intCast(i % 3)), 1000);
+    const three = try testSampledGroups(alloc, a, b, false, 100_000, 1000, 1_000_000, &keys);
+    try std.testing.expect(three.groups.? >= 255_000 and three.groups.? <= 345_000);
+
+    // Each row its own partner: the sample is saturated with new tuples, so
+    // it can't tell how many partners it hasn't met.
+    for (b, 0..) |*y, i| y.* = @intCast(i % 10);
+    const saturated = try testSampledGroups(alloc, a, b, false, 100_000, 1000, 1_000_000, &keys);
+    try std.testing.expectEqual(@as(?u64, null), saturated.groups);
+    try std.testing.expectEqual(@as(usize, 1), saturated.samples);
+
+    // The same rows as the whole input: their tuples, counted outright.
+    const whole = try testSampledGroups(alloc, a, b, true, 16_000, 10, sample_rows, &keys);
+    try std.testing.expect(whole.groups.? >= 150_000 and whole.groups.? <= sample_rows);
+
+    // A key whose rows are scattered over the input: the sample sees each
+    // value about once, too few times to count its partners.
+    for (a, b, 0..) |*x, *y, i| {
+        x.* = @intCast(i);
+        y.* = @mod(x.* * 7919, 1000);
+    }
+    const scattered = try testSampledGroups(alloc, a, b, false, 1_000_000, 1000, 10_000_000, &keys);
+    try std.testing.expectEqual(@as(?u64, null), scattered.groups);
+    try std.testing.expectEqual(@as(usize, 1), scattered.samples);
+
+    // 10K values of `a` with 100 rows each, nine in ten of them on one
+    // dominant `b` and the rest on rare ones of 5K more: about 11 partners
+    // each, 110K groups in the million rows.
+    const skewed_b = struct {
+        fn of(x: i64, i: usize) i64 {
+            const rare = 1000 + @mod(@as(i64, @intCast(i)) * 7919, 4999);
+            return if (i / 7 % 10 == 0) rare else @mod(x * 7919, 1000);
+        }
+    };
+    // Scattered, the sample sees 16 of each value's 100 rows: enough repeats
+    // and few enough tuples to pass for under three partners each, but it
+    // saw too little of each value to have met its rare partners.
+    for (a, b, 0..) |*x, *y, i| {
+        x.* = @intCast(i % 10_000);
+        y.* = skewed_b.of(x.*, i);
+    }
+    const skewed_scattered = try testSampledGroups(alloc, a, b, false, 10_000, 6000, 1_000_000, &keys);
+    try std.testing.expectEqual(@as(?u64, null), skewed_scattered.groups);
+    try std.testing.expectEqual(@as(usize, 1), skewed_scattered.samples);
+    // Clustered, the sample sees all of the rows of the values it meets, and
+    // their rare partners with them.
+    for (a, b, 0..) |*x, *y, i| {
+        x.* = @intCast(i / 100);
+        y.* = skewed_b.of(x.*, i);
+    }
+    const skewed_clustered = try testSampledGroups(alloc, a, b, false, 10_000, 6000, 1_000_000, &keys);
+    try std.testing.expect(skewed_clustered.groups.? >= 100_000 and skewed_clustered.groups.? <= 120_000);
+
+    // Nothing to win, so no sample: one key, a product within twice the
+    // widest key's NDV, or one under radix's first table.
+    const one_key = try testSampledGroups(alloc, a, b, false, 100_000, 1000, 1_000_000, keys[0..1]);
+    try std.testing.expectEqual(@as(?u64, null), one_key.groups);
+    try std.testing.expectEqual(@as(usize, 0), one_key.samples);
+    const narrow = try testSampledGroups(alloc, a, b, false, 100_000, 2, 1_000_000, &keys);
+    try std.testing.expectEqual(@as(usize, 0), narrow.samples);
+    const small = try testSampledGroups(alloc, a, b, false, 1000, 60, 1_000_000, &keys);
+    try std.testing.expectEqual(@as(usize, 0), small.samples);
+}
+
+test "the router prices twice a key sample's groups and presizes radix to them (issue #478)" {
+    const schema = [_]types.Column{ .{ .name = "a", .type = .bigint }, .{ .name = "b", .type = .bigint } };
+    const keys = [_][]const u8{ "a", "b" };
+    const aggs = [_]ir.AggSpec{.{ .func = .count, .col = null, .as = "c" }};
+    const col_stats = [_]exec.ColStat{ .{ .ndv = .{ .exact = 100_000 } }, .{ .ndv = .{ .exact = 1000 } } };
+    const st = exec.PipelineStats{ .upper_rows = 1_000_000, .column_stats = &col_stats };
+    const product = groupState(st, &schema, &keys, &aggs, null, null).?;
+    try std.testing.expectEqual(@as(u64, 1_000_000), product.groups);
+    const sampled = groupState(st, &schema, &keys, &aggs, null, 100_000).?;
+    try std.testing.expectEqual(@as(u64, 200_000), sampled.groups);
+    try std.testing.expectEqual(@as(u64, 100_000), sampled.jump);
+    // Never past the product.
+    try std.testing.expectEqual(@as(u64, 1_000_000), groupState(st, &schema, &keys, &aggs, null, 900_000).?.groups);
+    const fp = sampled.radix.?;
+    try std.testing.expectEqual(@as(u64, 100_000), radixPresize(st, &schema, &keys, fp, std.math.maxInt(u64), 100_000));
+    try std.testing.expectEqual(@as(u64, 1_000_000), radixPresize(st, &schema, &keys, fp, std.math.maxInt(u64), null));
+    try std.testing.expect(sampled.bytes(SCAN_BATCH_ROWS) < product.bytes(SCAN_BATCH_ROWS));
 }

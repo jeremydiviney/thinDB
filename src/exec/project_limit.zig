@@ -173,6 +173,18 @@ pub const Project = struct {
         for (self.column_map, widths) |src, *w| w.* = w.orElse(up[src]);
     }
 
+    /// `VTable.sampleKeys` through `column_map`.
+    pub fn sampleKeys(self: *Project, cols: []const usize, sample: *exec.KeySample) !bool {
+        if (self.probe_fused) return false;
+        const up = try self.allocator.alloc(usize, cols.len);
+        defer self.allocator.free(up);
+        for (cols, up) |c, *u| {
+            if (c >= self.column_map.len) return false;
+            u.* = self.column_map[c];
+        }
+        return self.upstream.sampleKeys(up, sample);
+    }
+
     /// Stage adoption crosses a projection by permuting each chunk's store
     /// array per `column_map` (dropped columns free, in output order after).
     /// A duplicate source can't share store ownership — decline BEFORE taking

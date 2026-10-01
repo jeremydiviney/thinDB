@@ -826,6 +826,49 @@ every distinct row of both arms, but the groups it keeps are rows of the left
 arm, and for INTERSECT of the right arm too. Its output is bounded by those
 arms' distinct rows and their columns' NDVs.
 
+The product treats the keys as independent. When one key nearly fixes the
+others, such as a user's search engine or an IP's region, it overshoots the
+groups many times over. The GROUP BY router therefore also samples the key
+tuples where that can pay off: at least two keys, every key's NDV known, and a
+product past both twice the widest key's NDV and 65,536 groups. A key of one
+value and no NULLs is left out of the sample, since it adds no tuples. The
+sample reads an input of up to 65,536 rows whole, and otherwise a sixteenth of
+it, at least 65,536 rows and at most 16 times that. Hashing a key tuple costs a
+fair share of what aggregating its row does, and the sample runs on one thread
+before a GROUP BY that may run on many, so reading all of a mid-sized input
+would add much of the GROUP BY's own time. Over a table scan the sample is 16
+row groups spread over the ones the scan's hints keep, plus the memtable's
+first rows, each read for an equal share of the budget around its middle; over
+a stage or realized buffer it is a window around the middle of each sixteenth
+of its rows, across whatever chunks the producer emitted. It reads runs of
+contiguous rows because a table is clustered: a key's rows sit together, so a
+key value that recurs in the sample shows its partners. Filters, projections, renames and pass-through computes forward the
+request. A filter's sample is of the rows it reads, whose tuples include its
+survivors'. A union folds its arms' samples. It counts the larger arm's rows,
+not their sum, because arms over one table sample the same rows. A key that
+either arm casts declines the sample, as does a computed key or any operator
+that emits other rows than it reads. The sample sketches the key tuples and
+each key with 4,096-register HyperLogLogs. A sample of the whole input counts
+its tuples outright. A partial sample estimates the widest key's NDV times the
+sample's tuples per value of that key, and at least either count. It is
+trusted only when it saw each value of the widest key at least four times on
+average, its rows repeat their tuples at least twice, and it saw at least half
+of each widest value's rows on average; otherwise the product stands. That
+last fraction, the coverage, is the sample's rows per widest value seen over
+the input's rows per widest value. Whole row groups holding a fraction f of the
+rows meet each of the input's tuples with a chance of at least about f, and the
+estimate scales the tuples they meet by f over the coverage, so it counts at
+least the coverage times the input's tuples whatever the partners' spread. A
+key whose values scatter over the input has a low coverage: the sample meets
+each value's common partner but not its rare ones, and is declined however
+many repeats it saw. The estimate never exceeds the product, and it is not a
+bound. So the router prices each plan for twice the sampled groups, which the
+coverage of one half makes enough, while radix and the partitioned hash cores
+presize to the sampled groups, where a shortfall costs only a grow. The
+estimate never enters the propagated stats. Consumers that need an upper
+bound, such as an aggregate's own stats, the low-cardinality handler's gate
+and radix's cache-resident gate, keep the product.
+
 A keyed GROUP BY whose keys aren't a sorted prefix of its input picks its plan
 (hash, partitioned hash, or sort then stream) by pricing each against the
 query's memory headroom. The price starts from the input's size: its row count
