@@ -4660,3 +4660,112 @@ test "sql: readers of one source keep their own columns under their filters" {
         try std.testing.expectEqualStrings("0:000;1:007;2:014;", got.items);
     }
 }
+
+/// `dim`: one or two labels for each group of `wide` (two for the even
+/// groups, none for every fifth), so a join pairs rows unevenly; `dimu`: one
+/// label for every group, so every row of `wide` finds exactly one.
+fn seedDims(db: anytype) !void {
+    const Row = struct { g: i64, label: []const u8 };
+    const allocator = std.testing.allocator;
+    var labels: [2000][4]u8 = undefined;
+    var some: std.ArrayList(Row) = .empty;
+    defer some.deinit(allocator);
+    var every: std.ArrayList(Row) = .empty;
+    defer every.deinit(allocator);
+    for (0..1000) |g| {
+        const first = std.fmt.bufPrint(&labels[2 * g], "L{d:0>3}", .{g}) catch unreachable;
+        const second = std.fmt.bufPrint(&labels[2 * g + 1], "M{d:0>3}", .{g}) catch unreachable;
+        try every.append(allocator, .{ .g = @intCast(g), .label = first });
+        if (g % 5 == 4) continue;
+        try some.append(allocator, .{ .g = @intCast(g), .label = first });
+        if (g % 2 == 0) try some.append(allocator, .{ .g = @intCast(g), .label = second });
+    }
+    inline for (.{ .{ "dim", &some }, .{ "dimu", &every } }) |spec| {
+        const t = try db.table(spec[0], .{
+            .columns = &.{
+                .{ .name = "g", .type = .bigint },
+                .{ .name = "label", .type = .string },
+            },
+            .order_key = &.{"g"},
+            .unique = false,
+        }, .{ .order_key = &.{"g"}, .unique = false });
+        try t.insert(spec[1].items);
+        try t.flush();
+    }
+}
+
+/// Run `sql` to completion: each row's cells as text, a string as its length
+/// and its first six bytes.
+fn runCells(allocator: std.mem.Allocator, db: anytype, sql: []const u8, out: *std.ArrayList(u8)) !void {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            for (batch.values) |view| switch (view.data) {
+                .bigint => |values| try out.print(allocator, "{d},", .{values[row]}),
+                .string, .varchar, .char => |strings| {
+                    const bytes = strings.rowBytes(row);
+                    try out.print(allocator, "{d}:{s},", .{ bytes.len, bytes[0..@min(bytes.len, 6)] });
+                },
+                else => return error.UnexpectedColumnType,
+            };
+            try out.append(allocator, ';');
+        }
+    }
+}
+
+// Issue #492. A parallel scan with a fused filter releases each chunk's
+// row-group scratch when that chunk's drain ends. Every batch a chunk's
+// pipeline emitted must by then be a copy in the scan's own buffers: the
+// plain survivors, a join's rows probed inside the workers (gathered pairs,
+// probe columns passed through as views, a projection's remap between), a
+// computed column, and the groups of an aggregate fed by the join. Under the
+// testing allocator a freed row group is unmapped or overwritten, so a row
+// still read from it faults or differs from the serial plan's.
+test "sql: rows drained from a filtered parallel scan outlive its chunks' scratch" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "SELECT id, s FROM wide WHERE g < 3 AND s <> '' ORDER BY id",
+        "SELECT id, LEFT(s, 3) AS code, s FROM wide WHERE g < 3 AND s <> '' ORDER BY id",
+        "SELECT w.id, w.s, d.label FROM wide w JOIN dim d ON w.g = d.g WHERE w.g < 40 AND w.s <> '' ORDER BY w.id, d.label",
+        "SELECT w.id, w.s, d.label FROM wide w JOIN dimu d ON w.g = d.g WHERE w.g < 40 AND w.s <> '' ORDER BY w.id",
+        "SELECT x.t, x.i, d.label FROM (SELECT s AS t, id AS i, g AS k FROM wide WHERE g < 40 AND s <> '') x JOIN dim d ON x.k = d.g ORDER BY x.i, d.label",
+        "SELECT w.id, CONCAT(LEFT(w.s, 3), d.label) AS code FROM wide w JOIN dimu d ON w.g = d.g WHERE w.g < 40 AND w.s <> '' ORDER BY w.id",
+        "SELECT d.label, COUNT(*) AS n, MIN(w.s) AS m FROM wide w JOIN dim d ON w.g = d.g WHERE w.g < 40 AND w.s <> '' GROUP BY d.label ORDER BY d.label",
+    };
+    var serial: [cases.len]std.ArrayList(u8) = @splat(.empty);
+    defer for (&serial) |*rows| rows.deinit(allocator);
+    inline for (.{ 1, 4 }) |max_dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try openWide(allocator, tmp.dir, 1024, max_dop, 20_000);
+        defer db.close();
+        try seedDims(db);
+        for (cases, &serial) |sql, *want| {
+            errdefer std.debug.print("case: {s}\n", .{sql});
+            if (max_dop == 1) {
+                try runCells(allocator, db, sql, want);
+                try std.testing.expect(want.items.len > 0);
+                continue;
+            }
+            const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+            defer allocator.free(explain_sql);
+            var plan: std.ArrayList(u8) = .empty;
+            defer plan.deinit(allocator);
+            var pq = try runSql(allocator, db, explain_sql);
+            defer pq.deinit();
+            while (try pq.next()) |b| {
+                for (0..b.row_count) |i| {
+                    try plan.appendSlice(allocator, b.values[0].data.string.rowBytes(i));
+                    try plan.append(allocator, '\n');
+                }
+            }
+            errdefer std.debug.print("{s}", .{plan.items});
+            try std.testing.expect(std.mem.indexOf(u8, plan.items, "ParallelScan wide (DOP=4, materialize") != null);
+            var got: std.ArrayList(u8) = .empty;
+            defer got.deinit(allocator);
+            try runCells(allocator, db, sql, &got);
+            try std.testing.expectEqualStrings(want.items, got.items);
+        }
+    }
+}
