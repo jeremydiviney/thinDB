@@ -421,6 +421,70 @@ test "a subquery's aggregate over only outer columns aggregates in the outer que
     }
 }
 
+test "a subquery's outer aggregate equal to one the enclosing grouping already computes reads that one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Rows are DuckDB's. Each case also counts the aggregates of the
+    // enclosing grouping (by its keys) once the subqueries resolve. An
+    // inner relation named `x` keeps `SUM(x.v)` inside its subquery, and
+    // DISTINCT makes another call.
+    const cases = .{
+        .{ "SELECT x.k, SUM(x.v) AS a, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 5, 5, 20, 2, 2, 30, null, null, 40, 7, 7, 50, 2, 2 } },
+        .{ "SELECT x.k, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 20) AS t FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 5, 5, 20, 2, 2, 30, null, null, 40, 7, 7, 50, 2, 2 } },
+        .{ "SELECT k, SUM(v) AS a, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x GROUP BY k ORDER BY k", "k", 1, &[_]?i64{ 10, 5, 5, 20, 2, 2, 30, null, null, 40, 7, 7, 50, 2, 2 } },
+        .{ "SELECT x.k, SUM(x.v * 2) AS a, (SELECT SUM(x.v * 2) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 10, 10, 20, 4, 4, 30, null, null, 40, 14, 14, 50, 4, 4 } },
+        .{ "SELECT x.k, SUM(DISTINCT x.v) AS a, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 2, &[_]?i64{ 10, 5, 5, 20, 2, 2, 30, null, null, 40, 7, 7, 50, 2, 2 } },
+        .{ "SELECT x.k FROM ex_t x GROUP BY x.k HAVING (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) > 3 AND SUM(x.v) > 3 ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 40 } },
+        .{ "SELECT x.k, SUM(x.v) AS a, (SELECT SUM(x.v) FROM ex_u x WHERE x.id = 10) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 5, 2, 20, 2, 2, 30, null, 2, 40, 7, 2, 50, 2, 2 } },
+        .{ "SELECT x.k, SUM(x.v) AS v, (SELECT SUM(x.v) + MAX(y.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 5, 7, 20, 2, 4, 30, null, null, 40, 7, 9, 50, 2, 4 } },
+        .{ "SELECT x.k, SUM(x.v) AS a, (SELECT SUM(x.v) + COUNT(*) FROM ex_u y WHERE y.v > 2) AS s FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 5, 7, 20, 2, 4, 30, null, null, 40, 7, 9, 50, 2, 4 } },
+        .{ "SELECT SUM(x.v) AS a, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s FROM ex_t x", "", 1, &[_]?i64{ 16, 16 } },
+        .{ "SELECT (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 10) AS s, (SELECT SUM(x.v) FROM ex_u y WHERE y.id = 20) AS t FROM ex_t x", "", 1, &[_]?i64{ 16, 16 } },
+        .{ "SELECT x.k, MIN(x.v) AS a, (SELECT MIN(x.v) + MAX(y.v) FROM ex_u y WHERE y.id < 35) AS s, (SELECT MIN(x.v) FROM ex_u y WHERE y.id = x.k + 10) AS t FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 1, &[_]?i64{ 10, 5, 12, 5, 20, 2, 9, 2, 30, null, null, null, 40, 7, 14, 7, 50, 2, 9, null } },
+        .{ "SELECT x.k, COUNT(x.v) AS c, (SELECT COUNT(x.v) FROM ex_u y WHERE y.id = 10) AS s, (SELECT MAX(x.v) FROM ex_u y WHERE y.id = 10) AS m, MAX(x.v) AS mx FROM ex_t x GROUP BY x.k ORDER BY x.k", "x.k", 2, &[_]?i64{ 10, 1, 1, 5, 5, 20, 1, 1, 2, 2, 30, 0, 0, null, null, 40, 1, 1, 7, 7, 50, 1, 1, 2, 2 } },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, case[0], case[3]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+        const aggs = try groupingAggs(allocator, db, case[0], case[1]);
+        std.testing.expectEqual(@as(usize, case[2]), aggs) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+/// How many aggregates the grouping by `keys` computes once the statement's
+/// subqueries resolve, read off the resolved plan's EXPLAIN.
+fn groupingAggs(allocator: std.mem.Allocator, db: anytype, sql: []const u8, keys: []const u8) !usize {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cat = db.catalog.?;
+    const tables: thindb.net.SessionTables = .{ .catalog = cat, .session = .{ .current_db = db.name } };
+    const root = try thindb.sql.parseWithContext(aa, sql, .neutral, &cat.udfs, .{ .registry = &cat.sql_fns, .db = db.name, .views = &cat.views, .tables = tables.columns() });
+    var cq = try thindb.net.compile(allocator, db, root);
+    defer cq.deinit();
+    var plan: std.ArrayList(u8) = .empty;
+    try thindb.ir.explain(aa, &plan, root.*);
+    const head = try std.fmt.allocPrint(aa, "GroupBy keys=[{s}] aggs=[", .{keys});
+    var found: ?usize = null;
+    var lines = std.mem.splitScalar(u8, plan.items, '\n');
+    while (lines.next()) |line| {
+        const at = std.mem.indexOf(u8, line, head) orelse continue;
+        const aggs = std.mem.count(u8, line[at + head.len ..], " AS ");
+        if (found) |n| try std.testing.expectEqual(n, aggs);
+        found = aggs;
+    }
+    return found orelse error.TestUnexpectedResult;
+}
+
 test "correlated NOT IN lifted onto its domain skips NULLs in the set as the keyed paths do" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

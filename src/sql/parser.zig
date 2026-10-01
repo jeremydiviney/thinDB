@@ -3068,13 +3068,15 @@ pub const Parser = struct {
             try aggs.append(self.arena, ref.agg);
         }
         const repeats = try self.arena.alloc(?usize, aggs.items.len);
+        const calls = try self.arena.alloc(ir.AggCall, aggs.items.len);
+        for (aggs.items, calls) |a, *call| call.* = try parsedAggCall(self.arena, a);
         var renames: std.ArrayList(exec_predicate.ColRename) = .empty;
         var copies: std.ArrayList(ir.Derived) = .empty;
-        for (names.items, aggs.items, repeats, 0..) |name, a, *repeat, i| {
+        for (names.items, calls, repeats, 0..) |name, call, *repeat, i| {
             repeat.* = null;
-            if (!self.aggCallRepeatable(a)) continue;
-            const first = for (aggs.items[0..i], repeats[0..i], 0..) |earlier, earlier_repeat, j| {
-                if (earlier_repeat == null and sameAggCall(earlier, a)) break j;
+            if (!ir.aggCallRepeatable(call, self.udf_registry)) continue;
+            const first = for (calls[0..i], repeats[0..i], 0..) |earlier, earlier_repeat, j| {
+                if (earlier_repeat == null and ir.sameAggCall(earlier, call)) break j;
             } else continue;
             repeat.* = first;
             const first_name = names.items[first];
@@ -3091,21 +3093,6 @@ pub const Parser = struct {
             .renames = renames.items,
             .copies = copies.items,
         };
-    }
-
-    /// Whether a repeat of the call may read the call's first evaluation: a
-    /// volatile argument or aggregate UDF gives each call its own value.
-    fn aggCallRepeatable(self: *const Parser, a: ParsedAgg) bool {
-        if (a.func == .udf) {
-            const registry = self.udf_registry orelse return false;
-            const udf_name = a.udf_name orelse return false;
-            for (registry.aggregateEntries()) |entry| {
-                if (entry.volatility == .@"volatile" and std.ascii.eqlIgnoreCase(entry.name, udf_name)) return false;
-            }
-        }
-        if (a.arg_expr) |e| if (exec_compute.mayVary(e, self.udf_registry)) return false;
-        if (a.arg2_expr) |e| if (exec_compute.mayVary(e, self.udf_registry)) return false;
-        return true;
     }
 
     fn appendAggSpec(
@@ -8373,39 +8360,19 @@ fn renamedSortSpecs(arena: Allocator, specs: []const ir.SortSpec, renames: []con
     return out;
 }
 
-/// Whether two aggregate calls compute one value: the same function, its
-/// DISTINCT included, over equal arguments with equal parameters.
-/// Identifiers match case-insensitively, as the engine binds them.
-fn sameAggCall(a: ParsedAgg, b: ParsedAgg) bool {
-    if (a.func != b.func) return false;
-    if ((a.udf_name == null) != (b.udf_name == null)) return false;
-    if (a.udf_name) |name| if (!std.ascii.eqlIgnoreCase(name, b.udf_name.?)) return false;
-    if (a.udf_arg_cols.len != b.udf_arg_cols.len) return false;
-    for (a.udf_arg_cols, b.udf_arg_cols) |x, y| if (!types.columnNameEql(x, y)) return false;
-    if (!sameAggArg(aggArgExpr(a.col, a.arg_expr), aggArgExpr(b.col, b.arg_expr))) return false;
-    if (!sameAggArg(aggArgExpr(a.arg2_col, a.arg2_expr), aggArgExpr(b.arg2_col, b.arg2_expr))) return false;
-    return sameAggParams(a.params, b.params);
+/// The call as `ir.sameAggCall` compares it, its arguments as written.
+fn parsedAggCall(arena: Allocator, a: ParsedAgg) ParseError!ir.AggCall {
+    const args = try arena.alloc(?ir.Expr, 2 + a.udf_arg_cols.len);
+    args[0] = aggArgExpr(a.col, a.arg_expr);
+    args[1] = aggArgExpr(a.arg2_col, a.arg2_expr);
+    for (a.udf_arg_cols, args[2..]) |col, *arg| arg.* = .{ .col_ref = col };
+    return .{ .func = a.func, .udf_name = a.udf_name, .params = a.params, .args = args };
 }
 
 fn aggArgExpr(col: ?[]const u8, expr: ?ir.Expr) ?ir.Expr {
     if (expr) |e| return e;
     if (col) |c| return .{ .col_ref = c };
     return null;
-}
-
-fn sameAggArg(a: ?ir.Expr, b: ?ir.Expr) bool {
-    const x = a orelse return b == null;
-    const y = b orelse return false;
-    return exec_expr.eql(x, y);
-}
-
-fn sameAggParams(a: ir.AggParams, b: ir.AggParams) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .none => true,
-        .percentile => |fraction| fraction == b.percentile,
-        .concat => |c| c.distinct == b.concat.distinct and std.mem.eql(u8, c.separator, b.concat.separator),
-    };
 }
 
 fn combineJoinSides(a: JoinExprSide, b: JoinExprSide) JoinExprSide {
