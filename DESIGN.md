@@ -363,9 +363,23 @@ prints the same digits StarRocks does; StarRocks says DECIMAL(38,0) and lets
 its values run past 38 digits, which thinDB's decimals don't
 (`cast.commonType`). An integer cast to a narrower integer type is NULL
 where it doesn't fit, as in StarRocks and in every dialect (`cast.narrowInt`):
-a LARGEINT past BIGINT's range cast to BIGINT (`CAST(x AS SIGNED)`) is NULL,
-so the MySQL dialect's `CAST(~5 AS SIGNED)` is NULL, where MySQL keeps the 64
-bits and gives -6. `CAST(x AS UNSIGNED)` is still a signed BIGINT. An integer of any width, LARGEINT
+a LARGEINT past BIGINT's range cast to BIGINT is NULL. The one exception is
+MySQL's own cast spelling in the MySQL dialect, which reads a value past
+BIGINT as MySQL 8.4 does (`scalar_fn.integerSpellingCast`). An integer,
+integer text or DECIMAL with scale 0 (what an integer literal past BIGINT is
+here, where MySQL's is BIGINT UNSIGNED) keeps its 64 bits:
+`CAST(x AS SIGNED)` wraps [2^63, 2^64) into BIGINT by two's complement
+(`cast.mysqlSigned`), so `CAST(~5 AS SIGNED)` over the unsigned bit
+operators is -6 and `CAST(18446744073709551615 AS SIGNED)` is -1, and
+`CAST(x AS UNSIGNED)` reads those 64 bits unsigned into a LARGEINT
+(`cast.mysqlUnsigned`; `CAST(-1 AS UNSIGNED)` is 18446744073709551615). One
+past 64 bits is still NULL. A DOUBLE, FLOAT or DECIMAL with a fraction
+clamps instead, as MySQL does with a warning: SIGNED to BIGINT's range,
+UNSIGNED of a double to SIGNED's bits (`CAST(1e19 AS UNSIGNED)` is
+9223372036854775807) and of a decimal to [-2^63, 2^64 - 1], a negative value
+then read as its bits. The fraction is truncated, as every integer CAST here
+truncates, where MySQL rounds. Elsewhere `SIGNED` and `UNSIGNED` are
+`CAST AS BIGINT`. An integer of any width, LARGEINT
 included, becomes text digit for digit (`CAST(… AS CHAR)`, CONCAT and every
 other text context). The MySQL wire presents a LARGEINT column as BIGINT in a
 text result, and as DECIMAL(39, 0) in a prepared statement's binary result,
@@ -1482,9 +1496,13 @@ This is a staged-write protocol, not general SQL transactional isolation: reads 
 
 One thread-safe query resource context follows SQL physical operators and worker backends. Allocation wrappers charge requested live capacities, including variable-length payloads, hash state, sort permutations, and worker buffers, against per-query and shared limits. Estimates remain useful for planning, but do not enforce these limits. Rejected growth returns `MemoryBudgetExceeded`; there is no spill fallback yet.
 
+A refused allocation, like any other error, must reach the client as the statement's error. Run-once barriers (a shared stage's run, a table function's execution, a window's drain) remember the error of a failed run and return it on every later call. They never run again: the failed run has already consumed part of its pipeline, so a second run would return only the rows after the failure point, often none, as a complete result. A consumer that would read a stage's result in place (a table function or window borrowing its columns) propagates the stage's error. It never falls back to pulling the stage through a scan.
+
 Result buffers and metadata remain charged while owned. Retained region-pool capacity is charged when borrowed by a query and detached when returned to the separately capped pool. Asynchronous frees return reservations only when the corresponding storage is released. Allocator bookkeeping, allocator-internal rounding/freelists, parser/protocol buffers, database metadata/memtables, and the separate source cache are not an exact process-RSS ceiling.
 
 Worker-side scratch (stage, window and partition arenas, parallel-scan decode buffers, table-function and row-location scratch) comes from one seam, `memory.workerAllocator`. It draws from the process-wide retaining scratch pool and charges every block the query holds at its whole size class. Pooling saves the OS round trip between queries; it never takes a live block out of its query's budget. Idle pooled blocks are uncharged and bounded by the pool's own cap.
+
+Some stages are read in place by a join build, window or table function. Such a stage materializes one contiguous worker-allocated store per column. The serial fill grows each store from the rows that arrive, and each growth frees the buffer it outgrew. The parallel fill sizes each store once, from the exact totals it collects first. The stage's compile-time row bound is only a ceiling and never sizes these stores: it can be millions of rows over a result of a few.
 
 A watchdog compares process memory with what the budgets explain: resident memory minus the block cache, the idle scratch pool and all accounted query bytes. It samples at stage boundaries, at every 1/16 of the budget of accounted growth (64 MiB–1 GiB), and at statement end. When the gap passes max(2 GiB, budget/4) it logs one `[mem-watch]` line per statement, naming the statement and PROCESSLIST ids.
 

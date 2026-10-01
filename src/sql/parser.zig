@@ -3612,8 +3612,8 @@ pub const Parser = struct {
     fn parseCastTarget(self: *Parser, inner: ir.Expr) ParseError!ir.Expr {
         if (self.lex.dialect != .postgres and self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "time"))
             return try self.parseTimeCast(inner);
-        const ty = try self.parseCastType();
-        return try self.castExprToType(inner, ty);
+        if (try self.parseIntegerSpelling()) |spelling| return try self.integerSpellingExpr(inner, spelling);
+        return try self.castExprToType(inner, try parse_ddl.parseColumnType(self));
     }
 
     /// `TIME[(fsp)]` as a cast target: MySQL's TIME text, rounded to `fsp`
@@ -3636,21 +3636,31 @@ pub const Parser = struct {
         } };
     }
 
-    /// A CAST target is a column type plus MySQL's cast-only spellings
-    /// `SIGNED [INTEGER]` / `UNSIGNED [INTEGER]`, both a 64-bit integer here.
-    fn parseCastType(self: *Parser) ParseError!types.Type {
+    /// MySQL's cast-only targets `SIGNED [INTEGER]` / `UNSIGNED [INTEGER]`,
+    /// or null with the cursor unmoved on any other CAST target.
+    fn parseIntegerSpelling(self: *Parser) ParseError!?scalar_fn.IntegerSpelling {
+        if (self.cur.tag != .identifier) return null;
+        const spelling: scalar_fn.IntegerSpelling = if (std.ascii.eqlIgnoreCase(self.cur.text, "signed"))
+            .signed
+        else if (std.ascii.eqlIgnoreCase(self.cur.text, "unsigned"))
+            .unsigned
+        else
+            return null;
+        try self.advance();
         if (self.cur.tag == .identifier and
-            (std.ascii.eqlIgnoreCase(self.cur.text, "signed") or std.ascii.eqlIgnoreCase(self.cur.text, "unsigned")))
+            (std.ascii.eqlIgnoreCase(self.cur.text, "integer") or std.ascii.eqlIgnoreCase(self.cur.text, "int")))
         {
             try self.advance();
-            if (self.cur.tag == .identifier and
-                (std.ascii.eqlIgnoreCase(self.cur.text, "integer") or std.ascii.eqlIgnoreCase(self.cur.text, "int")))
-            {
-                try self.advance();
-            }
-            return .bigint;
         }
-        return try parse_ddl.parseColumnType(self);
+        return spelling;
+    }
+
+    /// `inner` cast to `spelling` as this dialect reads it
+    /// (`scalar_fn.integerSpellingCast`).
+    fn integerSpellingExpr(self: *Parser, inner: ir.Expr, spelling: scalar_fn.IntegerSpelling) ParseError!ir.Expr {
+        const lowered = scalar_fn.integerSpellingCast(spelling, self.lex.dialect);
+        if (inner == .null_lit) return ir.Expr{ .null_lit = lowered.result };
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, lowered.fn_name), .args = try self.arena.dupe(ir.Expr, &.{inner}) } };
     }
 
     fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
@@ -8405,6 +8415,11 @@ test "no scalar UDF can take a function that syntax lowers to" {
     for (EXTRACT_FIELDS ++ EXTRACT_COMPOUND_FNS) |name| try std.testing.expect(scalar_fn.isReservedScalarUdfName(name));
     for (std.enums.values(scalar_fn.BitOperator)) |op| {
         for (std.enums.values(types.Dialect)) |dialect| try std.testing.expect(scalar_fn.isReservedScalarUdfName(scalar_fn.bitOperatorFn(op, dialect)));
+    }
+    for (std.enums.values(scalar_fn.IntegerSpelling)) |spelling| {
+        for (std.enums.values(types.Dialect)) |dialect| {
+            try std.testing.expect(scalar_fn.isReservedScalarUdfName(scalar_fn.integerSpellingCast(spelling, dialect).fn_name));
+        }
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

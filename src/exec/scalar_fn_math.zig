@@ -12,6 +12,7 @@ const simd = @import("../util/simd.zig");
 const memory = @import("../memory.zig");
 const jb = @import("json_binary.zig");
 const dec = @import("scalar_fn_decimal.zig");
+const cast = @import("cast.zig");
 const Type = @import("../types.zig").Type;
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
@@ -689,6 +690,55 @@ pub const doubleToBigintKernel = IntCast(i64).from_double;
 pub const stringToBigintKernel = IntCast(i64).from_text;
 pub const doubleToLargeintKernel = IntCast(i128).from_double;
 pub const stringToLargeintKernel = IntCast(i128).from_text;
+
+/// The MySQL dialect's `CAST(x AS SIGNED)` and `CAST(x AS UNSIGNED)`
+/// (`cast.mysqlSigned`, `cast.mysqlUnsigned`) of a value `whole` reads as
+/// an integer, null when it isn't one. UNSIGNED is a LARGEINT.
+fn MysqlCast(comptime source: cast.MysqlCastSource, comptime whole: fn (ColumnView, usize) ?i128) type {
+    return struct {
+        const signed = convertOrNull("bigint", struct {
+            fn f(v: ColumnView, row: usize) ?i64 {
+                return cast.mysqlSigned(source, whole(v, row) orelse return null);
+            }
+        }.f);
+        const unsigned = convertOrNull("largeint", struct {
+            fn f(v: ColumnView, row: usize) ?i128 {
+                const bits = cast.mysqlUnsigned(source, whole(v, row) orelse return null) orelse return null;
+                return bits;
+            }
+        }.f);
+    };
+}
+
+fn largeintWhole(v: ColumnView, row: usize) ?i128 {
+    return v.data.largeint[row];
+}
+
+fn textWhole(v: ColumnView, row: usize) ?i128 {
+    return common.textInteger(stringViewOf(v).rowBytes(row));
+}
+
+/// A double truncated toward zero. One past i128 still clamps, so it is
+/// brought within it first.
+fn doubleWhole(v: ColumnView, row: usize) ?i128 {
+    const x = v.data.double[row];
+    if (!std.math.isFinite(x)) return null;
+    return truncatedInt(i128, std.math.clamp(x, -0x1p100, 0x1p100));
+}
+
+pub const largeintToMysqlSignedKernel = MysqlCast(.integer, largeintWhole).signed;
+pub const largeintToMysqlUnsignedKernel = MysqlCast(.integer, largeintWhole).unsigned;
+pub const stringToMysqlSignedKernel = MysqlCast(.integer, textWhole).signed;
+pub const stringToMysqlUnsignedKernel = MysqlCast(.integer, textWhole).unsigned;
+pub const doubleToMysqlSignedKernel = MysqlCast(.double, doubleWhole).signed;
+pub const doubleToMysqlUnsignedKernel = MysqlCast(.double, doubleWhole).unsigned;
+
+/// The MySQL dialect's `CAST(x AS UNSIGNED)` of a BIGINT: its 64 bits read
+/// unsigned (`cast.mysqlUnsigned`), so `CAST(-1 AS UNSIGNED)` is 2^64 - 1.
+pub fn bigintToMysqlUnsignedKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const dst = try reserveInts(i128, allocator, out, row_count);
+    for (dst, args[0].data.bigint[0..row_count]) |*d, x| d.* = @as(u64, @bitCast(x));
+}
 
 pub const stringToDoubleKernel = convertOrNull("double", struct {
     fn f(v: ColumnView, row: usize) ?f64 {

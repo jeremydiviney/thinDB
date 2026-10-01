@@ -1345,13 +1345,23 @@ pub const Scan = struct {
         }
     }
 
-    pub fn addPrune(self: *Scan, pred: Predicate) !void {
-        const col_idx = types.findColumn(self.table.schema.columns, pred.col) orelse return Error.ColumnNotFound;
+    pub fn addPrune(self: *Scan, raw: Predicate) !void {
+        const col_idx = types.findColumn(self.table.schema.columns, raw.col) orelse return Error.ColumnNotFound;
         // Drop hints for types whose `Stats` slot is `{0, 0}` — no usable
         // min/max. statsOverlapPredicate would conservatively return true
         // anyway, but skipping the append avoids the per-row-group work.
         const col_type = self.table.schema.columns[col_idx].type;
         if (!storage.format.typeHasStats(col_type) or !storage.format.bytesFollowComparison(col_type)) return;
+
+        // Stats hold the column's own values, so the literal is placed in
+        // the column's type first, as `tryFuseFilter` places the fused
+        // filter: a DATETIME bound on a DATE column is otherwise read as
+        // microseconds against days. A literal that won't place, or places
+        // as no comparison at all, drops the hint; the row filter decides.
+        var placed: PredicateExpr = .{ .leaf = raw };
+        predicate.validateExpr(&placed, self.table.schema.columns) catch return;
+        if (placed != .leaf) return;
+        const pred = placed.leaf;
 
         // Cross-leaf blank exclusion: prune hints are exactly the top-level
         // AND conjuncts, so a sibling hint on the same column that rules out

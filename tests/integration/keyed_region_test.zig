@@ -209,6 +209,44 @@ test "keyed region: filter below the block composes and matches mono" {
     try std.testing.expectEqualStrings(mono, keyed);
 }
 
+test "keyed region: a DATETIME bound on a DATE column prunes the entry scan in the column's type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE ev (id BIGINT PRIMARY KEY, custLC STRING, day DATE, amount BIGINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ev VALUES
+        \\ (1,'cust_0','2025-11-30',10),(2,'cust_0','2025-12-01',20),(3,'cust_0','2026-01-15',30),
+        \\ (4,'cust_1','2025-12-20',40),(5,'cust_1','2026-02-28',50),(6,NULL,'2026-01-10',60)
+    );
+    const ev = try db.openTable("ev", .{});
+    try ev.flush();
+    // Segment and row-group stats hold days; an unplaced DATETIME bound
+    // would read as microseconds and prune every row group.
+    inline for (.{
+        "day >= DATE_ADD('2025-12-01', INTERVAL 0 MONTH)",
+        "day >= DATE_ADD('2025-11-30 12:00:00', INTERVAL 0 DAY) AND day <= DATE_ADD('2026-02-28', INTERVAL 0 DAY)",
+        "day BETWEEN DATE_ADD('2026-02-01', INTERVAL -2 MONTH) AND DATE_ADD('2026-02-01', INTERVAL 0 MONTH)",
+    }) |cond| {
+        const body =
+            \\base AS (
+            \\ SELECT custLC, day, amount FROM ev WHERE
+        ++ " " ++ cond ++
+            \\
+            \\), w AS (
+            \\ SELECT custLC, day, amount, LAG(amount) OVER (PARTITION BY custLC ORDER BY day) AS prior FROM base
+            \\)
+            \\SELECT * FROM w ORDER BY custLC, day
+        ;
+        const mono = try runToText(allocator, db, "WITH " ++ body);
+        defer allocator.free(mono);
+        try std.testing.expect(std.mem.count(u8, mono, "\n") >= 4 + 3);
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
 test "keyed region: incompatible partition uses ordinary execution" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1724,4 +1762,83 @@ test "keyed region: SQL windows reenter regions around a global window CTE" {
     const table = try db.openTable("inv", .{});
     try table.flush();
     try expect_keyed_matches(allocator, db, body, "next_sum");
+}
+
+/// A row-generating kernel: one row per call, a month past the call's last
+/// input row, carrying the call's total.
+const project_month = struct {
+    const tdb = thindb.tdb;
+    pub const spec = tdb.TableFnSpec{ .name = "project_month", .execution = .partitioned };
+    pub const Input = struct { custLC: ?[]const u8, day: ?tdb.Date, amount: ?i64 };
+    pub const Output = Input;
+    pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+        if (p.len == 0) return;
+        const days = p.col(.day);
+        const amounts = p.col(.amount);
+        var total: i64 = 1_000_000;
+        for (0..p.len) |i| total += amounts.get(i) orelse 0;
+        const last_day = days.get(p.len - 1) orelse return;
+        try out.row(.{
+            .custLC = p.col(.custLC).get(p.len - 1),
+            .day = tdb.Date.fromDays(last_day.days() + 31),
+            .amount = total,
+        });
+    }
+};
+
+test "keyed region: a UNION ALL table-function arm reads its window bounds in the filtered column's type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try db.registerTableFn(project_month);
+    try helpers.exec(allocator, db, "CREATE TABLE ev (id BIGINT PRIMARY KEY, custLC STRING, day DATE, amount BIGINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ev VALUES
+        \\ (1,'cust_0','2025-11-30',10),(2,'cust_0','2025-12-01',20),(3,'cust_0','2026-01-15',30),
+        \\ (4,'cust_1','2025-12-20',40),(5,'cust_1','2026-02-28',50),(6,'cust_1','2026-03-01',60),
+        \\ (7,'cust_2','2026-03-05',70),(8,'cust_3','2026-02-01',80),(9,NULL,'2026-01-10',90)
+    );
+    const ev = try db.openTable("ev", .{});
+    try ev.flush();
+    {
+        var q = try helpers.runSql(allocator, db, "SELECT DATE_ADD('2026-02-01', INTERVAL -2 MONTH) AS lo");
+        defer q.deinit();
+        try std.testing.expectEqual(thindb.types.Type.datetime, q.outputSchema()[0].type);
+    }
+    // A DATETIME bound on the DATE column, at midnight and with a time of
+    // day (which excludes 2025-12-01), beside DATE bounds.
+    inline for (.{
+        "DATE_ADD('2026-02-01', INTERVAL -2 MONTH) AND LAST_DAY('2026-02-01')",
+        "DATE_ADD('2025-12-01 12:00:00', INTERVAL 0 DAY) AND DATE_ADD('2026-02-28', INTERVAL 0 DAY)",
+        "DATE '2025-12-01' AND DATE '2026-02-28'",
+    }) |window| {
+        const body =
+            \\base AS (
+            \\ SELECT custLC, day, amount FROM ev WHERE id > 0
+            \\), projected AS (
+            \\ SELECT custLC, day, amount FROM TABLE(project_month((
+            \\   SELECT custLC, day, amount FROM base WHERE day BETWEEN
+        ++ " " ++ window ++
+            \\
+            \\ )) PARTITION BY custLC ORDER BY day)
+            \\), combined AS (
+            \\ SELECT * FROM base
+            \\ UNION ALL
+            \\ SELECT * FROM projected
+            \\), w AS (
+            \\ SELECT custLC, day, amount, LAG(amount) OVER (PARTITION BY custLC ORDER BY day, amount) AS prior
+            \\ FROM combined
+            \\)
+            \\SELECT * FROM w ORDER BY custLC, day, amount
+        ;
+        {
+            var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+            defer query.deinit();
+            try std.testing.expectEqual(@as(usize, 1), regional_op_count(query.cq.query, .tvf_grouped));
+            while (try query.next()) |_| {}
+        }
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
 }

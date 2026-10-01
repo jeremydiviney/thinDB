@@ -209,12 +209,9 @@ test "cast: an integer that doesn't fit a narrower integer is NULL, cast or pass
         .{ .sql = "SELECT bitnot(IF(RAND() < 2, 1e100, NULL))", .expected = &.{NULL} },
         .{ .sql = "SELECT bit_shift_left(1, IF(RAND() < 2, 1e100, NULL))", .expected = &.{NULL} },
     };
-    // MySQL's spellings, where they parse: the BIGINT cast's names and
-    // INTERVAL arithmetic.
+    // MySQL's INTERVAL arithmetic, where it parses. Its SIGNED and UNSIGNED
+    // spellings have a test of their own.
     const mysql_cases = [_]Case{
-        .{ .sql = "SELECT CAST(l AS SIGNED) FROM nw ORDER BY id", .expected = &.{ "7", NULL, NULL, NULL } },
-        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('18446744073709551615' AS LARGEINT), NULL) AS SIGNED)", .expected = &.{NULL} },
-        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('18446744073709551615' AS LARGEINT), NULL) AS UNSIGNED)", .expected = &.{NULL} },
         // Text read as a date beside a count that narrows to INT.
         .{ .sql = "SELECT CAST(DATE_ADD('2020-01-31', INTERVAL id + 1 MONTH) AS CHAR) FROM nw ORDER BY id", .expected = &.{ "2020-03-31 00:00:00", "2020-04-30 00:00:00", "2020-05-31 00:00:00", "2020-06-30 00:00:00" } },
         .{ .sql = "SELECT CAST(DATE_ADD('2020-01-01', INTERVAL b DAY) AS CHAR) FROM nw ORDER BY id", .expected = &.{ "2020-01-08 00:00:00", NULL, NULL, NULL } },
@@ -230,6 +227,162 @@ test "cast: an integer that doesn't fit a narrower integer is NULL, cast or pass
                 };
             };
         }
+    }
+}
+
+/// A statement whose result in the MySQL dialect (a MySQL wire connection
+/// too) differs from the neutral and PG dialects'.
+const DialectCase = struct { sql: []const u8, mysql: []const []const u8, other: []const []const u8 };
+
+test "cast: MySQL's SIGNED and UNSIGNED keep an integer's 64 bits and clamp a fraction in the MySQL dialect alone (issue #479)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    // l and s hold 2^63-1, 2^63, 2^64-1, 2^64, -1, -2^63 and -2^63-1.
+    try helpers.exec(allocator, db, "CREATE TABLE sb (id INT NOT NULL, l LARGEINT NOT NULL, s VARCHAR(30) NOT NULL, b BIGINT NOT NULL, x DOUBLE NOT NULL, d DECIMAL(21,1) NOT NULL)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO sb VALUES
+        \\  (1, 9223372036854775807, '9223372036854775807', 5, 9.3e18, 18446744073709551615.5),
+        \\  (2, 9223372036854775808, '9223372036854775808', 0, 1e19, 9223372036854775808.4),
+        \\  (3, 18446744073709551615, '18446744073709551615', -1, 1.8446744073709552e19, 18446744073709551616.5),
+        \\  (4, 18446744073709551616, '18446744073709551616', 9223372036854775807, 2e19, -9223372036854775809.5),
+        \\  (5, -1, '-1', -9223372036854775808, -1e0, -0.4),
+        \\  (6, -9223372036854775808, '-9223372036854775808', 1, -9.3e18, 9223372036854775807.4),
+        \\  (7, -9223372036854775809, '-9223372036854775809', 2, 2.5e0, 18446744073709551614.4)
+    );
+    // MySQL 8.4.11 gives these for x and d, each column read from a derived
+    // table of the same values: a double or a decimal with a fraction clamps
+    // (with a warning) rather than wrapping.
+    const x_signed = &[_][]const u8{ "9223372036854775807", "9223372036854775807", "9223372036854775807", "9223372036854775807", "-1", "-9223372036854775808", "2" };
+    const x_unsigned = &[_][]const u8{ "9223372036854775807", "9223372036854775807", "9223372036854775807", "9223372036854775807", "18446744073709551615", "9223372036854775808", "2" };
+    const x_bigint = &[_][]const u8{ NULL, NULL, NULL, NULL, "-1", NULL, "2" };
+    const d_signed = &[_][]const u8{ "9223372036854775807", "9223372036854775807", "9223372036854775807", "-9223372036854775808", "0", "9223372036854775807", "9223372036854775807" };
+    const d_unsigned = &[_][]const u8{ "18446744073709551615", "9223372036854775808", "18446744073709551615", "9223372036854775808", "0", "9223372036854775807", "18446744073709551614" };
+    const d_bigint = &[_][]const u8{ NULL, NULL, NULL, NULL, "0", "9223372036854775807", NULL };
+    const signed_bits = &[_][]const u8{ "9223372036854775807", "-9223372036854775808", "-1", NULL, "-1", "-9223372036854775808", NULL };
+    const unsigned_bits = &[_][]const u8{ "9223372036854775807", "9223372036854775808", "18446744073709551615", NULL, "18446744073709551615", "9223372036854775808", NULL };
+    const in_bigint = &[_][]const u8{ "9223372036854775807", NULL, NULL, NULL, "-1", "-9223372036854775808", NULL };
+    const b_signed = &[_][]const u8{ "5", "0", "-1", "9223372036854775807", "-9223372036854775808", "1", "2" };
+    const b_unsigned = &[_][]const u8{ "5", "0", "18446744073709551615", "9223372036854775807", "9223372036854775808", "1", "2" };
+    const not_b_signed = &[_][]const u8{ "-6", "-1", "0", "-9223372036854775808", "9223372036854775807", "-2", "-3" };
+    const not_b_unsigned = &[_][]const u8{ "18446744073709551610", "18446744073709551615", "0", "9223372036854775808", "9223372036854775807", "18446744073709551614", "18446744073709551613" };
+    const cases = [_]DialectCase{
+        .{ .sql = "SELECT CAST(l AS SIGNED) FROM sb ORDER BY id", .mysql = signed_bits, .other = in_bigint },
+        .{ .sql = "SELECT CAST(l AS SIGNED INTEGER) FROM sb ORDER BY id", .mysql = signed_bits, .other = in_bigint },
+        .{ .sql = "SELECT CAST(s AS SIGNED) FROM sb ORDER BY id", .mysql = signed_bits, .other = in_bigint },
+        .{ .sql = "SELECT CAST(l AS UNSIGNED) FROM sb ORDER BY id", .mysql = unsigned_bits, .other = in_bigint },
+        .{ .sql = "SELECT CAST(l AS UNSIGNED INT) FROM sb ORDER BY id", .mysql = unsigned_bits, .other = in_bigint },
+        .{ .sql = "SELECT CAST(s AS UNSIGNED) FROM sb ORDER BY id", .mysql = unsigned_bits, .other = in_bigint },
+        .{ .sql = "SELECT CAST(l AS BIGINT) FROM sb ORDER BY id", .mysql = in_bigint, .other = in_bigint },
+        .{ .sql = "SELECT CAST(s AS BIGINT) FROM sb ORDER BY id", .mysql = in_bigint, .other = in_bigint },
+        .{ .sql = "SELECT CAST(b AS SIGNED) FROM sb ORDER BY id", .mysql = b_signed, .other = b_signed },
+        .{ .sql = "SELECT CAST(b AS UNSIGNED) FROM sb ORDER BY id", .mysql = b_unsigned, .other = b_signed },
+        .{ .sql = "SELECT CAST(~b AS SIGNED) FROM sb ORDER BY id", .mysql = not_b_signed, .other = not_b_signed },
+        .{ .sql = "SELECT CAST(~b AS UNSIGNED) FROM sb ORDER BY id", .mysql = not_b_unsigned, .other = not_b_signed },
+        // MySQL 8.4.11 gives each MySQL value from here through CONVERT, but
+        // for 2^64 and -2^63-1, which it clamps with a warning (past 64 bits
+        // stays StarRocks' NULL), and the LARGEINT casts it has no type for.
+        .{ .sql = "SELECT CAST(9223372036854775807 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT CAST(9223372036854775808 AS SIGNED)", .mysql = &.{"-9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(18446744073709551615 AS SIGNED)", .mysql = &.{"-1"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(18446744073709551616 AS SIGNED)", .mysql = &.{NULL}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(-1 AS SIGNED)", .mysql = &.{"-1"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(-9223372036854775808 AS SIGNED)", .mysql = &.{"-9223372036854775808"}, .other = &.{"-9223372036854775808"} },
+        .{ .sql = "SELECT CAST(-9223372036854775809 AS SIGNED)", .mysql = &.{NULL}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(9223372036854775807 AS UNSIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT CAST(9223372036854775808 AS UNSIGNED)", .mysql = &.{"9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(18446744073709551615 AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(18446744073709551616 AS UNSIGNED)", .mysql = &.{NULL}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(-1 AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(-9223372036854775808 AS UNSIGNED)", .mysql = &.{"9223372036854775808"}, .other = &.{"-9223372036854775808"} },
+        .{ .sql = "SELECT CAST(-9223372036854775809 AS UNSIGNED)", .mysql = &.{NULL}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('18446744073709551615' AS LARGEINT), NULL) AS SIGNED)", .mysql = &.{"-1"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(IF(RAND() < 2, CAST('18446744073709551615' AS LARGEINT), NULL) AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(~5 AS SIGNED)", .mysql = &.{"-6"}, .other = &.{"-6"} },
+        .{ .sql = "SELECT CAST(~5 AS UNSIGNED)", .mysql = &.{"18446744073709551610"}, .other = &.{"-6"} },
+        .{ .sql = "SELECT CAST(~0 AS SIGNED)", .mysql = &.{"-1"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(~0 AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(~9223372036854775807 AS SIGNED)", .mysql = &.{"-9223372036854775808"}, .other = &.{"-9223372036854775808"} },
+        .{ .sql = "SELECT CAST(~9223372036854775807 AS UNSIGNED)", .mysql = &.{"9223372036854775808"}, .other = &.{"-9223372036854775808"} },
+        .{ .sql = "SELECT CONVERT(~5, SIGNED)", .mysql = &.{"-6"}, .other = &.{"-6"} },
+        // The BIGINT spelling keeps StarRocks' NULL past BIGINT's range.
+        .{ .sql = "SELECT CAST(~5 AS BIGINT)", .mysql = &.{NULL}, .other = &.{"-6"} },
+        .{ .sql = "SELECT CAST(NULL AS UNSIGNED)", .mysql = &.{NULL}, .other = &.{NULL} },
+        // A DECIMAL with scale 0 wraps like the integer literal it stands for
+        // (MySQL clamps a DECIMAL(20,0) value, but its literal is BIGINT
+        // UNSIGNED).
+        .{ .sql = "SELECT CAST(CAST(18446744073709551615 AS DECIMAL(20,0)) AS SIGNED)", .mysql = &.{"-1"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(CAST(-1 AS DECIMAL(20,0)) AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(x AS SIGNED) FROM sb ORDER BY id", .mysql = x_signed, .other = x_bigint },
+        .{ .sql = "SELECT CAST(x AS UNSIGNED) FROM sb ORDER BY id", .mysql = x_unsigned, .other = x_bigint },
+        .{ .sql = "SELECT CAST(d AS SIGNED) FROM sb ORDER BY id", .mysql = d_signed, .other = d_bigint },
+        .{ .sql = "SELECT CAST(d AS UNSIGNED) FROM sb ORDER BY id", .mysql = d_unsigned, .other = d_bigint },
+        // Each MySQL value below was checked against MySQL 8.4.11. Its fraction
+        // is one MySQL's rounding and thinDB's truncation agree on.
+        .{ .sql = "SELECT CAST(9.3e18 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(1e19 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(1.8446744073709552e19 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(2e19 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(2.5e0 AS SIGNED)", .mysql = &.{"2"}, .other = &.{"2"} },
+        .{ .sql = "SELECT CAST(-2.5e0 AS SIGNED)", .mysql = &.{"-2"}, .other = &.{"-2"} },
+        .{ .sql = "SELECT CAST(9.3e18 AS UNSIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(1e19 AS UNSIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(2e19 AS UNSIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(-1e0 AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(-2.5e0 AS UNSIGNED)", .mysql = &.{"18446744073709551614"}, .other = &.{"-2"} },
+        .{ .sql = "SELECT CAST(-0.4e0 AS UNSIGNED)", .mysql = &.{"0"}, .other = &.{"0"} },
+        .{ .sql = "SELECT CAST(x AS SIGNED) FROM (SELECT -1e19 AS x) t", .mysql = &.{"-9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(x AS UNSIGNED) FROM (SELECT -1e19 AS x) t", .mysql = &.{"9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(x AS SIGNED) FROM (SELECT 1e300 AS x) t", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(x AS UNSIGNED) FROM (SELECT -1e300 AS x) t", .mysql = &.{"9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(18446744073709551615.5 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(9223372036854775808.5 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(9223372036854775807.5 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{"9223372036854775807"} },
+        .{ .sql = "SELECT CAST(18446744073709551616.5 AS SIGNED)", .mysql = &.{"9223372036854775807"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(-9223372036854775808.5 AS SIGNED)", .mysql = &.{"-9223372036854775808"}, .other = &.{"-9223372036854775808"} },
+        .{ .sql = "SELECT CAST(-9223372036854775809.5 AS SIGNED)", .mysql = &.{"-9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(-1.4 AS SIGNED)", .mysql = &.{"-1"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(18446744073709551615.5 AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(18446744073709551614.4 AS UNSIGNED)", .mysql = &.{"18446744073709551614"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(18446744073709551616.5 AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(9223372036854775808.4 AS UNSIGNED)", .mysql = &.{"9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(-9223372036854775809.5 AS UNSIGNED)", .mysql = &.{"9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST(-1.0 AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST(-0.4 AS UNSIGNED)", .mysql = &.{"0"}, .other = &.{"0"} },
+        .{ .sql = "SELECT CAST('9223372036854775808' AS SIGNED)", .mysql = &.{"-9223372036854775808"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST('18446744073709551615' AS SIGNED)", .mysql = &.{"-1"}, .other = &.{NULL} },
+        .{ .sql = "SELECT CAST('-1' AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{"-1"} },
+        .{ .sql = "SELECT CAST('18446744073709551615' AS UNSIGNED)", .mysql = &.{"18446744073709551615"}, .other = &.{NULL} },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("sb", .{})).flush();
+        for ([_]Run{ .neutral, .mysql, .postgres, .mysql_session }) |run| {
+            for (cases) |c| {
+                const expected = switch (run) {
+                    .mysql, .mysql_session => c.mysql,
+                    .neutral, .postgres => c.other,
+                };
+                expectRunTexts(allocator, db, run, .{ .sql = c.sql, .expected = expected }) catch |err| {
+                    std.debug.print("case failed ({s}, {t}): {s}\n", .{ @errorName(err), run, c.sql });
+                    return err;
+                };
+            }
+        }
+    }
+
+    const result_types = .{
+        .{ "SELECT CAST(b AS SIGNED) FROM sb", thindb.types.Dialect.mysql, thindb.types.Type.bigint },
+        .{ "SELECT CAST(b AS UNSIGNED) FROM sb", thindb.types.Dialect.mysql, thindb.types.Type.largeint },
+        .{ "SELECT CAST(NULL AS UNSIGNED)", thindb.types.Dialect.mysql, thindb.types.Type.largeint },
+        .{ "SELECT CAST(b AS UNSIGNED) FROM sb", thindb.types.Dialect.neutral, thindb.types.Type.bigint },
+        .{ "SELECT CAST(b AS UNSIGNED) FROM sb", thindb.types.Dialect.postgres, thindb.types.Type.bigint },
+    };
+    inline for (result_types) |c| {
+        var q = try helpers.runSqlDialect(allocator, db, c[0], c[1]);
+        defer q.deinit();
+        try std.testing.expectEqual(c[2], q.outputSchema()[0].type);
     }
 }
 

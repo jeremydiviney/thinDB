@@ -123,13 +123,18 @@ jobs:
             --latest \
             .dist/thindb-* .dist/SHA256SUMS
 
-      - name: Prune old automated builds (keep 10)
+      # Releases listed in .github/pinned-releases survive the prune: a
+      # downstream CI job or a rollback that downloads a fixed version would
+      # otherwise 404 once ten newer builds land.
+      - name: Prune old automated builds (keep 10 plus pinned)
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' .github/pinned-releases > "$RUNNER_TEMP/pinned"
           gh release list --limit 100 --json tagName --jq '.[].tagName' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | tail -n +11 \
+            | { grep -vxF -f "$RUNNER_TEMP/pinned" || true; } \
             | xargs -r -n1 -I{} gh release delete {} --yes --cleanup-tag
           # Retire the pre-semver build-<sha> releases entirely.
           gh release list --limit 100 --json tagName --jq '.[].tagName' \
