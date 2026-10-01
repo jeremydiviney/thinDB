@@ -333,7 +333,7 @@ pub const Filter = struct {
 
     /// The sample describes the rows the filter reads; its survivors may
     /// average another width, as `ColStat.avg_width` allows.
-    pub fn sampleWidths(self: *Filter, widths: []?u32) !void {
+    pub fn sampleWidths(self: *Filter, widths: []exec.SampledWidth) !void {
         if (self.chain != null or widths.len != self.upstream.outputSchema().len) return;
         try self.upstream.sampleWidths(widths);
     }

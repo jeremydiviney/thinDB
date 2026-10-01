@@ -72,6 +72,9 @@ pub const ByteGroupTable = struct {
     /// reaches a table that can hold every group without growing again.
     grow_target: usize = 0,
 
+    /// Unallocated; `init` it before the first probe.
+    pub const empty: ByteGroupTable = .{ .slots = &.{}, .mask = 0, .len = 0 };
+
     /// Build a table sized to hold `expected` groups under the load factor
     /// without growing. `expected == 0` yields a small initial table.
     pub fn init(allocator: Allocator, expected: usize) !ByteGroupTable {

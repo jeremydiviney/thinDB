@@ -760,6 +760,35 @@ columns they carry unchanged, so a filtered scan is priced at the width of the
 rows it reads. Nothing is stored on disk. Only a column no sample reaches is
 priced at the 32-byte guess.
 
+A hash aggregate keeps its group table, accumulator cells, per-group key list
+and batch scratch on the operator's tracked allocator, so a grow frees the
+array it outgrew and the accountant sees every byte. Its arena holds only the
+key copies, string values and complex states, which live until the emit
+(issue #464). When the router picks partitioned hash cores it hands each core
+its share of the estimated groups, capped at what the headroom could hold at
+8/3 slots a group. A core starts at no more than 65,536 groups and, on its
+first overflow, grows straight to that share instead of doubling up to it. A
+core's emitted columns become its partition's output without a copy, and the
+emit reserves every output column's rows, plus a lone string key's bytes, up
+front. The router prices a hash plan from what that layout holds. Each table
+is the power of two that its share of the groups plus one batch needs, times
+the slot width. The arena is each group's key and string payload with a third
+of slack. The output is each group's row, with a quarter of slack on string
+bytes. A partitioned plan peaks at the larger of absorbing a round (its chunk,
+the partitioned index, two windows and the tables) and emitting (the tables,
+the arena and every partition's output). A string key's payload is priced at
+its distinct width, not its row width, because a group copies its key once
+however many rows repeat it. Search phrases average 9 bytes a row, mostly the
+empty string, against 58 bytes a distinct value. A string MIN, MAX, ANY_VALUE,
+FIRST, LAST or MAX_BY keeps one of its group's values, priced at the wider of
+its column's row and distinct widths: under a skewed key most groups hold few
+rows, and the row average weighs their values by the big groups' rows instead.
+The width sample therefore also hashes up to 1,024 strided rows of each
+sampled row group's columns a group keeps, weighs each distinct value once,
+and caches the count on the segment's handle. A stage or realized buffer
+samples 65,536 rows of those columns on demand. Radix and the partitioned
+sort cores keep pricing at the row width.
+
 Parallel grouped aggregation initially reserves at most one 8,192-row batch's
 worth of groups per bucket and allocates its state slab only when rows arrive.
 This keeps small tables' setup allocations out of the workers' allocation

@@ -1696,28 +1696,28 @@ pub const ParallelScan = struct {
         return st;
     }
 
-    /// `VTable.sampleWidths` for a table source: its workers scan the same
-    /// segments, so the first one samples, through the fused compute and
-    /// the emit projection. A buffer source's stage measured its widths when
-    /// it ran, and a fused aggregate or join probe emits other rows.
-    pub fn sampleWidths(self: *ParallelScan, widths: []?u32) !void {
-        if (self.table == null or self.workers.len == 0 or self.agg_fused or self.probe_sink != null) return;
+    /// `VTable.sampleWidths`: the workers read the same source, so the
+    /// first one samples, through the fused compute and the emit
+    /// projection: a table source's segments, or a buffer source's stage,
+    /// which measured its row widths when it ran and samples distinct widths
+    /// on demand. A fused aggregate or join probe emits other rows.
+    pub fn sampleWidths(self: *ParallelScan, widths: []exec.SampledWidth) !void {
+        if (self.workers.len == 0 or self.agg_fused or self.probe_sink != null) return;
         const keep = self.emit_keep orelse return self.sampleSourceWidths(widths);
         if (keep.len != widths.len) return;
         const source_len = if (self.compute_fused) self.compute_q[0].outputSchema().len else self.workers[0].outputSchema().len;
-        const source = try self.allocator.alloc(?u32, source_len);
+        const source = try self.allocator.alloc(exec.SampledWidth, source_len);
         defer self.allocator.free(source);
-        @memset(source, null);
+        @memset(source, .{});
         for (keep, widths) |src, w| source[src] = w;
         try self.sampleSourceWidths(source);
         for (keep, widths) |src, *w| w.* = source[src];
     }
 
-    fn sampleSourceWidths(self: *ParallelScan, widths: []?u32) !void {
+    fn sampleSourceWidths(self: *ParallelScan, widths: []exec.SampledWidth) !void {
         if (self.compute_fused) return self.compute_q[0].sampleWidths(widths);
         switch (self.workers[0]) {
-            .segment => |s| try s.sampleWidths(widths),
-            .chunk => {},
+            inline else => |leaf| try leaf.sampleWidths(widths),
         }
     }
 

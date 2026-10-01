@@ -1307,7 +1307,7 @@ pub const Table = struct {
         self.seg_handles.release(self.allocator, entry);
     }
 
-    /// Row groups `sampledStringWidth` reads per column. Tables are
+    /// Row groups `sampledStringWidths` reads per column. Tables are
     /// clustered, so row groups' widths vary widely: in ClickBench's `hits`,
     /// `URL` averages 27 to 480 B per row group around a mean of 90 B. One
     /// row group can land anywhere in that range, and 16 spread evenly can
@@ -1315,24 +1315,29 @@ pub const Table = struct {
     /// wherever the spacing starts.
     const WIDTH_SAMPLE_ROW_GROUPS: u64 = 64;
 
-    /// Mean bytes per row of string column `col_idx` over `segs`, sampled
-    /// from `WIDTH_SAMPLE_ROW_GROUPS` row groups spread evenly over them, for
-    /// the GROUP BY router to price a table input it can't measure. A raw
-    /// block's header answers its sample; each sample stays on its segment's
-    /// handle, so later plans read nothing. Null when `segs` has no rows.
-    pub fn sampledStringWidth(
+    /// String column `col_idx`'s mean bytes per row and, when `distinct`,
+    /// per distinct value over `segs`, sampled from `WIDTH_SAMPLE_ROW_GROUPS`
+    /// row groups spread evenly over them, for the GROUP BY router to price
+    /// a table input it can't measure. A raw block's header answers its row
+    /// sample; the distinct sample reads the block through the cache, where
+    /// the scan that follows finds it. Each sample stays on its segment's
+    /// handle, so later plans read nothing. Widths stay null when `segs` has
+    /// no rows.
+    pub fn sampledStringWidths(
         self: *Table,
         scratch: Allocator,
         segs: []const storage.ManifestEntry,
         col_idx: usize,
-    ) !?u32 {
+        distinct: bool,
+    ) !exec.SampledWidth {
         var total: u64 = 0;
         for (segs) |s| total += s.row_group_count;
-        if (total == 0) return null;
+        if (total == 0) return .{};
         const picks: u64 = @min(total, WIDTH_SAMPLE_ROW_GROUPS);
-        const nullable = self.schema.columns[col_idx].nullable;
+        const col = self.schema.columns[col_idx];
         var bytes: u64 = 0;
         var rows: u64 = 0;
+        var distinct_sum: storage.cache.SegmentHandles.DistinctCount = .{ .bytes = 0, .values = 0 };
         var seg_idx: usize = 0;
         var seg_start: u64 = 0;
         var entry: ?*storage.cache.SegmentHandles.Entry = null;
@@ -1350,11 +1355,14 @@ pub const Table = struct {
             const rg_idx = flat - seg_start;
             const row_groups = e.seg.info.row_groups;
             if (rg_idx >= row_groups.len or col_idx >= row_groups[rg_idx].col_offsets.len) continue;
-            bytes += try self.seg_handles.rowGroupStringBytes(self.allocator, scratch, e, rg_idx, col_idx, nullable, self.cacheRef());
+            bytes += try self.seg_handles.rowGroupStringBytes(self.allocator, scratch, e, rg_idx, col_idx, col.nullable, self.cacheRef());
             rows += row_groups[rg_idx].row_count;
+            if (!distinct) continue;
+            const sampled = try self.seg_handles.rowGroupDistinctStrings(self.allocator, scratch, e, rg_idx, col_idx, col.nullable, self.cacheRef());
+            distinct_sum.bytes += sampled.bytes;
+            distinct_sum.values += sampled.values;
         }
-        if (rows == 0) return null;
-        return @intCast(@min(bytes / rows + @intFromBool(bytes % rows != 0), std.math.maxInt(u32)));
+        return .{ .row = exec.avgWidth(bytes, rows), .distinct = exec.avgWidth(distinct_sum.bytes, distinct_sum.values) };
     }
 
     /// The segment's tombstone list as a dupe owned by `allocator` (null =

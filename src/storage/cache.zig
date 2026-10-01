@@ -568,6 +568,7 @@ pub const SegmentHandles = struct {
     const segment_reader = @import("segment_reader.zig");
     const tombstone = @import("tombstone.zig");
     const types_mod = @import("../types.zig");
+    const column = @import("column.zig");
 
     pub const Entry = struct {
         segment_id: u64,
@@ -576,10 +577,23 @@ pub const SegmentHandles = struct {
         tombs_loaded: bool = false,
         pins: u32 = 0,
         retired: bool = false,
-        /// Per column, the string bytes each row group's block decodes to,
-        /// kept as the GROUP BY router samples them (`rowGroupStringBytes`).
-        /// A column's list is allocated on its first sample.
-        string_bytes: [][]?u64 = &.{},
+        /// Per column, what the GROUP BY router sampled from each row
+        /// group's block, kept for every later plan. A column's list is
+        /// allocated on its first sample.
+        string_samples: [][]StringSample = &.{},
+    };
+
+    /// One row group's block of a string column as the GROUP BY router
+    /// sampled it: the bytes it decodes to (`rowGroupStringBytes`) and its
+    /// sampled distinct values (`rowGroupDistinctStrings`).
+    pub const StringSample = struct {
+        bytes: ?u64 = null,
+        distinct: ?DistinctCount = null,
+    };
+
+    pub const DistinctCount = struct {
+        bytes: u64,
+        values: u64,
     };
 
     map: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
@@ -708,40 +722,73 @@ pub const SegmentHandles = struct {
         nullable: bool,
         c: TableCache,
     ) !u64 {
-        {
-            self.lockSpin();
-            defer self.lock.unlock();
-            if (column_idx < entry.string_bytes.len and entry.string_bytes[column_idx].len > 0) {
-                if (entry.string_bytes[column_idx][rg_idx]) |bytes| return bytes;
-            }
-        }
+        if (self.cachedSample(entry, rg_idx, column_idx).bytes) |bytes| return bytes;
         // Read outside the lock: planners racing on a cold row group both
         // read it and keep the same count.
         const bytes = try entry.seg.stringBlockBytes(scratch, rg_idx, column_idx, nullable, c);
-        const row_groups = entry.seg.info.row_groups;
         self.lockSpin();
         defer self.lock.unlock();
-        if (entry.string_bytes.len == 0) {
-            const columns = try gpa.alloc([]?u64, row_groups[rg_idx].col_offsets.len);
-            @memset(columns, &.{});
-            entry.string_bytes = columns;
-        }
-        if (entry.string_bytes[column_idx].len == 0) {
-            const per_row_group = try gpa.alloc(?u64, row_groups.len);
-            @memset(per_row_group, null);
-            entry.string_bytes[column_idx] = per_row_group;
-        }
-        entry.string_bytes[column_idx][rg_idx] = bytes;
+        (try sampleSlot(gpa, entry, rg_idx, column_idx)).bytes = bytes;
         return bytes;
+    }
+
+    /// The distinct values `ReadSegment.sampleDistinctStrings` samples from
+    /// row group `rg_idx`'s block of string column `column_idx`, deduped
+    /// within the block; sampled on the first ask and kept on the entry for
+    /// every later one. Same index and allocator contract as
+    /// `rowGroupStringBytes`; `scratch` also holds the dedupe set.
+    pub fn rowGroupDistinctStrings(
+        self: *SegmentHandles,
+        gpa: Allocator,
+        scratch: Allocator,
+        entry: *Entry,
+        rg_idx: usize,
+        column_idx: usize,
+        nullable: bool,
+        c: TableCache,
+    ) !DistinctCount {
+        if (self.cachedSample(entry, rg_idx, column_idx).distinct) |count| return count;
+        var sampler: column.DistinctWidthSampler = .{};
+        defer sampler.deinit(scratch);
+        try entry.seg.sampleDistinctStrings(scratch, rg_idx, column_idx, nullable, c, &sampler);
+        const count: DistinctCount = .{ .bytes = sampler.bytes, .values = sampler.values };
+        self.lockSpin();
+        defer self.lock.unlock();
+        (try sampleSlot(gpa, entry, rg_idx, column_idx)).distinct = count;
+        return count;
+    }
+
+    fn cachedSample(self: *SegmentHandles, entry: *Entry, rg_idx: usize, column_idx: usize) StringSample {
+        self.lockSpin();
+        defer self.lock.unlock();
+        if (column_idx >= entry.string_samples.len or entry.string_samples[column_idx].len == 0) return .{};
+        return entry.string_samples[column_idx][rg_idx];
+    }
+
+    /// The entry's sample slot for one row group's block, allocating the
+    /// per-column lists on first use. Caller holds `lock`.
+    fn sampleSlot(gpa: Allocator, entry: *Entry, rg_idx: usize, column_idx: usize) !*StringSample {
+        const row_groups = entry.seg.info.row_groups;
+        if (entry.string_samples.len == 0) {
+            const columns = try gpa.alloc([]StringSample, row_groups[rg_idx].col_offsets.len);
+            @memset(columns, &.{});
+            entry.string_samples = columns;
+        }
+        if (entry.string_samples[column_idx].len == 0) {
+            const per_row_group = try gpa.alloc(StringSample, row_groups.len);
+            @memset(per_row_group, .{});
+            entry.string_samples[column_idx] = per_row_group;
+        }
+        return &entry.string_samples[column_idx][rg_idx];
     }
 
     fn destroyEntry(allocator: Allocator, e: *Entry) void {
         e.seg.deinit();
         if (e.tombs) |t| allocator.free(t);
-        for (e.string_bytes) |per_row_group| {
+        for (e.string_samples) |per_row_group| {
             if (per_row_group.len > 0) allocator.free(per_row_group);
         }
-        if (e.string_bytes.len > 0) allocator.free(e.string_bytes);
+        if (e.string_samples.len > 0) allocator.free(e.string_samples);
         allocator.destroy(e);
     }
 };

@@ -357,14 +357,14 @@ pub const VTable = struct {
     /// called before any `next()`; on success the producer keeps nothing to
     /// emit and its deinit skips the transferred buffers.
     takeOwnedChunks: *const fn (ptr: *anyopaque) anyerror!?OwnedChunks,
-    /// Plan-time string widths for the GROUP BY router (issue #397): set
-    /// `widths[i]` for each string output column `i` still null that traces
-    /// to a table column, to that column's mean bytes per row sampled from
-    /// its row groups (`Table.sampledStringWidth`). Only a table scan samples;
-    /// pass-through layers map their columns onto their upstream's, and
-    /// every other operator leaves `widths` as it is. Reads data, so it runs
-    /// only when the router prices a plan by its input's bytes.
-    sampleWidths: *const fn (ptr: *anyopaque, widths: []?u32) anyerror!void,
+    /// Plan-time string widths for the GROUP BY router (issues #397, #464):
+    /// fill each null field of `widths[i]` for a string output column `i`
+    /// that traces to a table column, from that column's row groups
+    /// (`Table.sampledStringWidths`). Only a table scan samples; pass-through
+    /// layers map their columns onto their upstream's, and every other
+    /// operator leaves `widths` as it is. Reads data, so it runs only when
+    /// the router prices a plan by its input's bytes.
+    sampleWidths: *const fn (ptr: *anyopaque, widths: []SampledWidth) anyerror!void,
 };
 
 /// Write `depth` levels of indentation then a complete label line.
@@ -436,6 +436,41 @@ pub const ColStat = struct {
     /// not a bound: operators carry it through unchanged, so a filter's
     /// survivors may average differently. Null = not measured.
     avg_width: ?u32 = null,
+    /// Mean payload bytes per DISTINCT value of a string column, sampled
+    /// like `avg_width` (`storage.column.DistinctWidthSampler`). A GROUP BY
+    /// keeps one key copy per group, so it prices key bytes by this: a value
+    /// on most rows (an empty string) pulls `avg_width` far below it. Null =
+    /// not measured.
+    distinct_width: ?u32 = null,
+};
+
+/// The widths `Query.sampleWidths` measures for one string column: its
+/// `ColStat.avg_width` and `ColStat.distinct_width`.
+pub const SampledWidth = struct {
+    row: ?u32 = null,
+    distinct: ?u32 = null,
+    /// Whether the caller prices this column's distinct width (a GROUP BY
+    /// key). A producer samples `distinct` only when it is wanted: it reads
+    /// whole blocks, where `row` reads block headers.
+    distinct_wanted: bool = false,
+
+    pub fn complete(self: SampledWidth) bool {
+        return self.row != null and (self.distinct != null or !self.distinct_wanted);
+    }
+
+    pub fn wantsDistinct(self: SampledWidth) bool {
+        return self.distinct_wanted and self.distinct == null;
+    }
+
+    /// `self` with each null width taken from `other`, wanting what either
+    /// wants.
+    pub fn orElse(self: SampledWidth, other: SampledWidth) SampledWidth {
+        return .{
+            .row = self.row orelse other.row,
+            .distinct = self.distinct orelse other.distinct,
+            .distinct_wanted = self.distinct_wanted or other.distinct_wanted,
+        };
+    }
 };
 
 /// `ColStat.avg_width` for `payload` string bytes spread over `rows` rows,
@@ -632,9 +667,9 @@ pub const Query = struct {
         return self.vtable.takeOwnedChunks(self.ptr);
     }
 
-    /// Sample the string output columns whose `widths` entry is null. See
+    /// Sample the string output columns whose `widths` entry has a null field. See
     /// `VTable.sampleWidths`.
-    pub fn sampleWidths(self: Query, widths: []?u32) !void {
+    pub fn sampleWidths(self: Query, widths: []SampledWidth) !void {
         return self.vtable.sampleWidths(self.ptr, widths);
     }
 
@@ -941,7 +976,7 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.takeOwnedChunks();
         }
-        fn sampleWidthsWrap(ptr: *anyopaque, widths: []?u32) anyerror!void {
+        fn sampleWidthsWrap(ptr: *anyopaque, widths: []SampledWidth) anyerror!void {
             if (!@hasDecl(Op, "sampleWidths")) return;
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.sampleWidths(widths);
@@ -1157,8 +1192,11 @@ pub fn mergeUnionColStat(l: ColStat, r: ColStat) ColStat {
     };
     const min: ?i128 = if (l.min) |lm| (if (r.min) |rm| @min(lm, rm) else null) else null;
     const max: ?i128 = if (l.max) |lm| (if (r.max) |rm| @max(lm, rm) else null) else null;
-    const avg_width: ?u32 = if (l.avg_width) |lw| (if (r.avg_width) |rw| @max(lw, rw) else null) else null;
-    return .{ .ndv = ndv, .min = min, .max = max, .avg_width = avg_width };
+    return .{ .ndv = ndv, .min = min, .max = max, .avg_width = widerWidth(l.avg_width, r.avg_width), .distinct_width = widerWidth(l.distinct_width, r.distinct_width) };
+}
+
+fn widerWidth(l: ?u32, r: ?u32) ?u32 {
+    return if (l) |lw| (if (r) |rw| @max(lw, rw) else null) else null;
 }
 
 /// Build the per-column stats for a UNION ALL over two arms whose schemas align

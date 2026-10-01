@@ -80,6 +80,68 @@ pub const ColumnView = struct {
     }
 };
 
+/// Mean bytes per distinct value of a string column, estimated from sampled
+/// rows. Each value counts once however often it recurs, so a value on most
+/// rows (an empty string, a default) weighs no more than a value on one. A
+/// hash aggregate keeps one key copy per group, so this, not the per-row
+/// mean, prices its key bytes.
+pub const DistinctWidthSampler = struct {
+    seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    bytes: u64 = 0,
+    values: u64 = 0,
+
+    /// Rows sampled from one block: enough to see past a few heavy values,
+    /// few enough that planning stays cheap.
+    pub const ROWS_PER_BLOCK: u64 = 1024;
+    /// Rows sampled from a whole realized buffer, matching what a table's
+    /// width sample reads from its row groups.
+    pub const ROWS_PER_BUFFER: u64 = 64 * ROWS_PER_BLOCK;
+
+    pub fn deinit(self: *DistinctWidthSampler, allocator: std.mem.Allocator) void {
+        self.seen.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// The gap between sampled rows when `sample` rows are taken from `rows`.
+    pub fn stride(rows: u64, sample: u64) usize {
+        return @intCast(@max(1, rows / sample));
+    }
+
+    pub fn addHashed(self: *DistinctWidthSampler, allocator: std.mem.Allocator, hash: u64, len: usize) !void {
+        const gop = try self.seen.getOrPut(allocator, hash);
+        if (gop.found_existing) return;
+        self.bytes += len;
+        self.values += 1;
+    }
+
+    pub fn add(self: *DistinctWidthSampler, allocator: std.mem.Allocator, value: []const u8) !void {
+        return self.addHashed(allocator, std.hash.Wyhash.hash(0, value), value.len);
+    }
+
+    /// Samples rows `first`, `first + step`, ... of a string view, skipping
+    /// NULL rows, and returns where the next sample falls past the view's
+    /// end, so consecutive chunks keep one stride.
+    pub fn addStrided(self: *DistinctWidthSampler, allocator: std.mem.Allocator, view: ColumnView, first: usize, step: usize) !usize {
+        const sv = switch (view.data) {
+            .varchar, .string, .char, .json => |s| s,
+            else => return first -| view.rowCount(),
+        };
+        const rows = sv.rowCount();
+        var row = first;
+        while (row < rows) : (row += step) {
+            if (view.isValid(row)) try self.add(allocator, sv.rowBytes(row));
+        }
+        return row - rows;
+    }
+
+    /// Rounded-up mean; null when no value was sampled.
+    pub fn width(self: DistinctWidthSampler) ?u32 {
+        if (self.values == 0) return null;
+        const mean = self.bytes / self.values + @intFromBool(self.bytes % self.values != 0);
+        return @intCast(@min(mean, std.math.maxInt(u32)));
+    }
+};
+
 fn appendLittle(comptime T: type, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: T) !void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .little);
@@ -299,6 +361,30 @@ test "ColumnView.rowCount across variants" {
     const text_bytes = "helloworld";
     const sv = StringView{ .offsets = &offsets, .bytes = text_bytes };
     try std.testing.expectEqual(@as(usize, 2), (ColumnView{ .data = .{ .string = sv } }).rowCount());
+}
+
+test "DistinctWidthSampler weighs each distinct value once and keeps the stride across chunks" {
+    const a = std.testing.allocator;
+    const offsets = [_]u32{ 0, 0, 10, 10, 10, 30, 30 };
+    const bytes = "abcdefghij" ++ "klmnopqrstuvwxyz0123";
+    const sv = StringView{ .offsets = &offsets, .bytes = bytes };
+    const bm = [_]u8{0b0011_1111};
+
+    var all: DistinctWidthSampler = .{};
+    defer all.deinit(a);
+    try std.testing.expectEqual(@as(?u32, null), all.width());
+    try std.testing.expectEqual(@as(usize, 0), try all.addStrided(a, .{ .data = .{ .string = sv }, .nulls = &bm }, 0, 1));
+    try std.testing.expectEqual(@as(u64, 3), all.values);
+    try std.testing.expectEqual(@as(?u32, 10), all.width());
+
+    const null_bm = [_]u8{0b0011_1101};
+    var strided: DistinctWidthSampler = .{};
+    defer strided.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), try strided.addStrided(a, .{ .data = .{ .string = sv }, .nulls = &null_bm }, 1, 3));
+    try std.testing.expectEqual(@as(u64, 1), strided.values);
+    try std.testing.expectEqual(@as(?u32, 20), strided.width());
+    try std.testing.expectEqual(@as(usize, 64), DistinctWidthSampler.stride(65_536, DistinctWidthSampler.ROWS_PER_BLOCK));
+    try std.testing.expectEqual(@as(usize, 1), DistinctWidthSampler.stride(10, DistinctWidthSampler.ROWS_PER_BLOCK));
 }
 
 test "isValidBit reads the validity bitmap" {

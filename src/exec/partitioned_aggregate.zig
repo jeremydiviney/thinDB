@@ -400,7 +400,12 @@ pub const PartitionedAggregate = struct {
     core: Core,
     /// Unread chunk bytes that start a round (`roundBytes`).
     round_bytes: usize,
+    /// Groups each hash core sizes its table for up front; null without an
+    /// estimate.
+    core_groups: ?u64,
 
+    /// `expected_groups` is the caller's estimate of the whole input's
+    /// groups, 0 when it has none.
     pub fn create(
         allocator: Allocator,
         worker_alloc: Allocator,
@@ -409,6 +414,7 @@ pub const PartitionedAggregate = struct {
         aggs: []const AggSpec,
         n_parts_hint: usize,
         core: Core,
+        expected_groups: u64,
     ) !Query {
         // Not the retaining pool: its power-of-two classes would charge up to
         // twice each chunk's exact size, and a chunk lives until its
@@ -452,6 +458,8 @@ pub const PartitionedAggregate = struct {
             .sorted_stream = core == .sort,
             .core = core,
             .round_bytes = roundBytes(if (up.accountant()) |a| a.budget else null),
+            // The key hash spreads the groups evenly over the partitions.
+            .core_groups = if (expected_groups > 0) expected_groups / n_parts + @intFromBool(expected_groups % n_parts != 0) else null,
         };
         return exec.makeQuery(allocator, self);
     }
@@ -685,7 +693,7 @@ pub const PartitionedAggregate = struct {
         if (part.core) |core| return core;
         part.scan = try ChunkScan.init(self.worker_alloc, self, part_idx);
         const src = exec.makeQuery(self.worker_alloc, &part.scan.?);
-        part.core = aggregate.Aggregate.createOperator(self.worker_alloc, src, self.group_cols, self.aggs, null, null) catch |e| {
+        part.core = aggregate.Aggregate.createOperator(self.worker_alloc, src, self.group_cols, self.aggs, null, null, self.core_groups) catch |e| {
             part.scan.?.deinit();
             part.scan = null;
             return e;
@@ -729,6 +737,18 @@ pub const PartitionedAggregate = struct {
     /// 1.5x everything before it.
     fn runPartition(self: *PartitionedAggregate, part_idx: usize) !void {
         const part = &self.parts[part_idx];
+        if (!self.sorted_stream) {
+            const core = try self.openHashCore(part_idx);
+            // This run's deinit frees it from here on.
+            part.core = null;
+            defer core.deinit();
+            const out = try core.next();
+            // The core emits one batch; its stores become the partition's
+            // output instead of being copied while the core still holds them.
+            part.out_cols = core.takeOutput();
+            part.out_rows = if (out) |b| b.row_count else 0;
+            return;
+        }
         const alloc = self.worker_alloc;
         const up_schema = self.up.outputSchema();
 
@@ -780,11 +800,6 @@ pub const PartitionedAggregate = struct {
             }, SortCtx.lessThan);
             permuted_scan = try PermutedInputScan.init(alloc, up_schema, in_views, perm);
             break :blk try exec.makeQuery(alloc, &permuted_scan.?).streamGroupBy(self.group_cols, self.aggs);
-        } else if (!self.sorted_stream) blk: {
-            const core = try self.openHashCore(part_idx);
-            // This run's `agg.deinit()` frees it from here on.
-            part.core = null;
-            break :blk exec.makeQuery(alloc, core);
         } else blk: {
             chunk_scan = try ChunkScan.init(alloc, self, part_idx);
             const src = exec.makeQuery(alloc, &chunk_scan.?);
@@ -1127,7 +1142,7 @@ test "PartitionedAggregate matches serial aggregate on string key + MAX_BY" {
     };
 
     var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = N };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto, 0);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
         for (par_lines) |l| a.free(l);
@@ -1190,7 +1205,7 @@ test "PartitionedAggregate sort+stream core keeps a group's rows in input order"
     };
 
     var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto, 0);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
         for (par_lines) |line| a.free(line);
@@ -1250,7 +1265,7 @@ test "PartitionedAggregate near-unique direct sort matches serial aggregate" {
     };
 
     var scan_p = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan_p), &group_cols, &aggs, 4, .auto, 0);
     const par_lines = try testCollectSorted(a, &pa);
     defer {
         for (par_lines) |line| a.free(line);
@@ -1320,7 +1335,7 @@ test "PartitionedAggregate drains a partition in windows with exact NULL and dis
     };
 
     var scan = InputScan{ .schema = &schema, .source = &views, .views = &window, .rows = row_count };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan), &group_cols, &aggs, 4, .auto);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &scan), &group_cols, &aggs, 4, .auto, 0);
     defer pa.deinit();
     var seen: usize = 0;
     while (try pa.next()) |b| {
@@ -1667,7 +1682,7 @@ test "PartitionedAggregate over many odd-sized batches of strings, JSON and NULL
 
     var batch_views: [mixed_schema.len]ColumnView = undefined;
     var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
-    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &list_scan), &group_cols, &mixed_aggs, 4, .auto);
+    var pa = try PartitionedAggregate.create(a, a, exec.makeQuery(a, &list_scan), &group_cols, &mixed_aggs, 4, .auto, 0);
     const par_lines = try testCollectLines(a, &pa);
     defer testFreeLines(a, par_lines);
     pa.deinit();
@@ -1732,7 +1747,7 @@ test "PartitionedAggregate charges about the raw input bytes and frees the input
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;
     var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
-    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), &group_cols, aggs, n_parts, .auto);
+    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), &group_cols, aggs, n_parts, .auto, 0);
     var groups: usize = 0;
     groups += (try pa.next()).?.row_count;
     // Every partition has aggregated: only the outputs are still charged.
@@ -1763,8 +1778,9 @@ fn testSerialLines(a: Allocator, input: *MixedInput, group_cols: []const []const
 }
 
 /// Runs the partitioned aggregate over `input` under `budget`, in rounds of
-/// `round_bytes` when given, checks its rows against `expected` and that it
-/// kept its hash cores, and returns its accounted peak.
+/// `round_bytes` when given and with `group_estimate` groups (0: none),
+/// checks its rows against `expected` and that it kept its hash cores, and
+/// returns its accounted peak.
 fn testHashCorePeak(
     a: Allocator,
     input: *MixedInput,
@@ -1772,6 +1788,7 @@ fn testHashCorePeak(
     aggs: []const AggSpec,
     budget: usize,
     round_bytes: ?usize,
+    group_estimate: u64,
     expected: []const []u8,
 ) !usize {
     const account = try testTrackedAccountant(a, budget);
@@ -1779,7 +1796,7 @@ fn testHashCorePeak(
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;
     var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
-    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), group_cols, aggs, 2, .auto);
+    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), group_cols, aggs, 2, .auto, group_estimate);
     const lines = blk: {
         defer pa.deinit();
         const op = exec.queryAs(PartitionedAggregate, pa).?;
@@ -1811,9 +1828,9 @@ test "PartitionedAggregate hash cores aggregate the input a round at a time" {
     const light_aggs = [_]AggSpec{ mixed_aggs[0], mixed_aggs[4] };
     const light = try testSerialLines(a, &input, &group_cols, &light_aggs);
     defer testFreeLines(a, light);
-    const whole_peak = try testHashCorePeak(a, &input, &group_cols, &light_aggs, 1 << 40, null, light);
+    const whole_peak = try testHashCorePeak(a, &input, &group_cols, &light_aggs, 1 << 40, null, 0, light);
     try testing.expect(whole_peak > raw);
-    const round_peak = try testHashCorePeak(a, &input, &group_cols, &light_aggs, whole_peak, null, light);
+    const round_peak = try testHashCorePeak(a, &input, &group_cols, &light_aggs, whole_peak, null, 0, light);
     try testing.expect(round_peak + raw / 2 < whole_peak);
 
     // Rounds of 1 MiB carry every kind of aggregate state across about a
@@ -1821,7 +1838,7 @@ test "PartitionedAggregate hash cores aggregate the input a round at a time" {
     // the first round, and 38 keys over 1.6M rows keep the hash cores.
     const all = try testSerialLines(a, &input, &group_cols, &mixed_aggs);
     defer testFreeLines(a, all);
-    _ = try testHashCorePeak(a, &input, &group_cols, &mixed_aggs, 1 << 40, 1 << 20, all);
+    _ = try testHashCorePeak(a, &input, &group_cols, &mixed_aggs, 1 << 40, 1 << 20, 0, all);
 }
 
 test "PartitionedAggregate hash cores keep one MAX_BY payload per group however many rows improve it" {
@@ -1837,7 +1854,7 @@ test "PartitionedAggregate hash cores keep one MAX_BY payload per group however 
         defer input.deinit(a);
         const want = try testSerialLines(a, &input, &group_cols, &aggs);
         defer testFreeLines(a, want);
-        peaks[i] = try testHashCorePeak(a, &input, &group_cols, &aggs, 1 << 40, 1 << 20, want);
+        peaks[i] = try testHashCorePeak(a, &input, &group_cols, &aggs, 1 << 40, 1 << 20, 0, want);
     }
     try testing.expect(peaks[1] < peaks[0] + (1 << 20));
 }
@@ -1863,7 +1880,7 @@ test "PartitionedAggregate keeps buffering once the first round's keys look near
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;
     var list_scan = BatchListScan{ .batches = input.batches, .views = &batch_views };
-    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), &group_cols, &aggs, 2, .auto);
+    var pa = try PartitionedAggregate.create(tracked, a, exec.makeQuery(tracked, &list_scan), &group_cols, &aggs, 2, .auto, 0);
     const par_lines = blk: {
         defer pa.deinit();
         const lines = try testCollectLines(a, &pa);
@@ -1875,4 +1892,79 @@ test "PartitionedAggregate keeps buffering once the first round's keys look near
     try testing.expectEqual(input.rows, ser_lines.len);
     try testing.expectEqual(ser_lines.len, par_lines.len);
     for (par_lines, ser_lines) |p, s| try testing.expectEqualStrings(s, p);
+}
+
+test "PartitionedAggregate hash cores sized for any group estimate match the serial aggregate" {
+    const a = testing.allocator;
+    // Over 2 partitions the unique keys give each core more groups than its
+    // first table holds, so the estimates below start a core past its
+    // groups, grow it to the estimate in one step, or double it past an
+    // estimate that was short.
+    const sizes = [_]usize{16384} ** 13 ++ [_]usize{4099};
+    var input = try MixedInput.init(a, &sizes);
+    defer input.deinit(a);
+    // One heavy aggregate at most, so the unique keys keep the hash cores.
+    const light_aggs = [_]AggSpec{ mixed_aggs[0], mixed_aggs[1], mixed_aggs[3], mixed_aggs[4], mixed_aggs[6] };
+    const cases = .{
+        .{ .keys = &[_][]const u8{"o"}, .aggs = light_aggs[0..] },
+        .{ .keys = &[_][]const u8{ "s", "n" }, .aggs = light_aggs[0..] },
+        // COUNT(*) alone keeps its count in the int table's slots.
+        .{ .keys = &[_][]const u8{"o"}, .aggs = mixed_aggs[0..1] },
+        .{ .keys = &[_][]const u8{"k"}, .aggs = light_aggs[0..] },
+    };
+    inline for (cases) |c| {
+        const want = try testSerialLines(a, &input, c.keys, c.aggs);
+        defer testFreeLines(a, want);
+        const groups: u64 = want.len;
+        for ([_]u64{ 0, groups, groups / 8 + 1, groups * 2 }) |estimate| {
+            _ = try testHashCorePeak(a, &input, c.keys, c.aggs, 1 << 40, null, estimate, want);
+        }
+    }
+}
+
+/// The lines of one hash core over `input`, its state on `state_alloc` and
+/// sized for `expected_groups`, its lines on `a`.
+fn testCoreLines(
+    a: Allocator,
+    state_alloc: Allocator,
+    input: *MixedInput,
+    group_cols: []const []const u8,
+    aggs: []const AggSpec,
+    expected_groups: ?u64,
+) ![][]u8 {
+    var all_views: [mixed_schema.len]ColumnView = undefined;
+    for (&all_views, &input.all) |*v, *s| v.* = s.view();
+    var window: [mixed_schema.len]ColumnView = undefined;
+    var scan = InputScan{ .schema = &mixed_schema, .source = &all_views, .views = &window, .rows = input.rows, .batch_rows = 1024 };
+    const core = try aggregate.Aggregate.createOperator(state_alloc, exec.makeQuery(state_alloc, &scan), group_cols, aggs, null, null, expected_groups);
+    var q = exec.makeQuery(state_alloc, core);
+    defer q.deinit();
+    return testCollectLines(a, &q);
+}
+
+test "a hash core frees its tables, cells and key lists at any failed allocation" {
+    const a = testing.allocator;
+    const sizes = [_]usize{3000};
+    var input = try MixedInput.init(a, &sizes);
+    defer input.deinit(a);
+    const cases = .{
+        .{ .keys = &[_][]const u8{"k"}, .aggs = mixed_aggs[0..], .groups = null },
+        .{ .keys = &[_][]const u8{ "s", "n" }, .aggs = mixed_aggs[0..], .groups = 3000 },
+        .{ .keys = &[_][]const u8{"o"}, .aggs = mixed_aggs[0..], .groups = 3000 },
+        .{ .keys = &[_][]const u8{"o"}, .aggs = mixed_aggs[0..1], .groups = 3000 },
+    };
+    inline for (cases) |c| {
+        const want = try testCoreLines(a, a, &input, c.keys, c.aggs, c.groups);
+        defer testFreeLines(a, want);
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            if (testCoreLines(a, failing.allocator(), &input, c.keys, c.aggs, c.groups)) |lines| {
+                defer testFreeLines(a, lines);
+                try testing.expectEqual(want.len, lines.len);
+                for (lines, want) |line, w| try testing.expectEqualStrings(w, line);
+                if (!failing.has_induced_failure) break;
+            } else |err| try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }

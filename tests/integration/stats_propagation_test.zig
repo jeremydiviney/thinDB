@@ -293,7 +293,7 @@ test "stats: end-to-end Scan -> Filter -> GroupBy chain" {
     try std.testing.expectEqual(@as(u64, 1), rows);
 }
 
-test "sampled widths: a scan averages each string column's bytes over its row groups" {
+test "sampled widths: a scan averages each string column's bytes over its row groups and its distinct values" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -316,37 +316,57 @@ test "sampled widths: a scan averages each string column's bytes over its row gr
     // few enough that the sample reads every one.
     const letters = "abcdefghijklmnopqrstuvw";
     var bytes: u64 = 0;
+    var values: u64 = 0;
     for (0..3) |flush| {
         for (0..10) |j| {
             const i = flush * 10 + j;
             const value: ?[]const u8 = if (i % 4 == 0) null else letters[0 .. (i * 7) % letters.len];
-            if (value) |v| bytes += v.len;
+            if (value) |v| {
+                bytes += v.len;
+                values += 1;
+            }
             try t.insert(&.{.{ .id = @as(i64, @intCast(i)), .k = @as(i32, @intCast(i)), .s = value }});
         }
         try t.flush();
     }
     const want: u32 = @intCast((bytes + 29) / 30);
+    // No row group repeats a value, so each non-NULL row is a distinct value
+    // of its row group.
+    const want_distinct: u32 = @intCast((bytes + values - 1) / values);
+    const Width = thindb.exec.SampledWidth;
 
     var q = try thindb.scan(allocator, t);
     defer q.deinit();
-    var widths = [_]?u32{ null, null, null };
+    var widths = [_]Width{ .{}, .{}, .{} };
     try q.sampleWidths(&widths);
-    try std.testing.expectEqual([_]?u32{ null, null, want }, widths);
+    try std.testing.expectEqual([_]Width{ .{}, .{}, .{ .row = want } }, widths);
 
     for (t.manifest.segments.items) |seg| {
         const entry = try t.acquireSegment(seg.segment_id);
         defer t.releaseSegment(entry);
-        try std.testing.expectEqual(entry.seg.info.row_groups.len, entry.string_bytes[2].len);
-        for (entry.string_bytes[2]) |rg_bytes| try std.testing.expect(rg_bytes != null);
+        try std.testing.expectEqual(entry.seg.info.row_groups.len, entry.string_samples[2].len);
+        for (entry.string_samples[2]) |sample| {
+            try std.testing.expect(sample.bytes != null);
+            try std.testing.expect(sample.distinct == null);
+        }
+    }
+
+    var keyed = [_]Width{ .{}, .{}, .{ .distinct_wanted = true } };
+    try q.sampleWidths(&keyed);
+    try std.testing.expectEqual([_]Width{ .{}, .{}, .{ .row = want, .distinct = want_distinct, .distinct_wanted = true } }, keyed);
+    for (t.manifest.segments.items) |seg| {
+        const entry = try t.acquireSegment(seg.segment_id);
+        defer t.releaseSegment(entry);
+        for (entry.string_samples[2]) |sample| try std.testing.expect(sample.distinct != null);
     }
 
     var base = try thindb.scan(allocator, t);
     var filtered = try base.filter(thindb.leafExpr("k", .gt, .{ .int = 3 }));
     var projected = try filtered.project(&.{ "s", "k" });
     defer projected.deinit();
-    var narrow = [_]?u32{ null, 7 };
+    var narrow = [_]Width{ .{ .distinct_wanted = true }, .{ .row = 7 } };
     try projected.sampleWidths(&narrow);
-    try std.testing.expectEqual([_]?u32{ want, 7 }, narrow);
+    try std.testing.expectEqual([_]Width{ .{ .row = want, .distinct = want_distinct, .distinct_wanted = true }, .{ .row = 7 } }, narrow);
 }
 
 // ---------------------------------------------------------------------------

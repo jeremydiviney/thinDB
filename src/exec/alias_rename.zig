@@ -133,7 +133,7 @@ pub const AliasRename = struct {
         return self.upstream.takeOwnedChunks();
     }
 
-    pub fn sampleWidths(self: *AliasRename, widths: []?u32) !void {
+    pub fn sampleWidths(self: *AliasRename, widths: []exec.SampledWidth) !void {
         if (self.probe_fused or widths.len != self.upstream.outputSchema().len) return;
         try self.upstream.sampleWidths(widths);
     }
