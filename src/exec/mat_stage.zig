@@ -787,9 +787,22 @@ pub const Stage = struct {
     /// its 700MB contiguous copy in parallel instead of one serial append
     /// loop. Set by the staged compiler alongside `want_contiguous`.
     fill_dop: usize = 1,
+    /// Why the stage's run failed. Its pipeline is then partly drained, so
+    /// a second run would read on from where the failure stopped and
+    /// return the rest, often nothing, as the stage's whole result: every
+    /// later `ensureRun` returns this error instead.
+    run_error: ?anyerror = null,
 
     pub fn ensureRun(self: *Stage) anyerror!void {
         if (self.result != null) return;
+        if (self.run_error) |err| return err;
+        self.run() catch |err| {
+            self.run_error = err;
+            return err;
+        };
+    }
+
+    fn run(self: *Stage) anyerror!void {
         if (!self.query_alive) {
             std.debug.print("[stage] ensureRun after teardown: stage#{d} (result={})\n", .{ self.id, self.result != null });
             return error.UnsupportedQueryShape; // re-run after teardown: can't happen via MatScan
