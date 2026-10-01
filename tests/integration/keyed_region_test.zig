@@ -209,6 +209,44 @@ test "keyed region: filter below the block composes and matches mono" {
     try std.testing.expectEqualStrings(mono, keyed);
 }
 
+test "keyed region: a DATETIME bound on a DATE column prunes the entry scan in the column's type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE ev (id BIGINT PRIMARY KEY, custLC STRING, day DATE, amount BIGINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ev VALUES
+        \\ (1,'cust_0','2025-11-30',10),(2,'cust_0','2025-12-01',20),(3,'cust_0','2026-01-15',30),
+        \\ (4,'cust_1','2025-12-20',40),(5,'cust_1','2026-02-28',50),(6,NULL,'2026-01-10',60)
+    );
+    const ev = try db.openTable("ev", .{});
+    try ev.flush();
+    // Segment and row-group stats hold days; an unplaced DATETIME bound
+    // would read as microseconds and prune every row group.
+    inline for (.{
+        "day >= DATE_ADD('2025-12-01', INTERVAL 0 MONTH)",
+        "day >= DATE_ADD('2025-11-30 12:00:00', INTERVAL 0 DAY) AND day <= DATE_ADD('2026-02-28', INTERVAL 0 DAY)",
+        "day BETWEEN DATE_ADD('2026-02-01', INTERVAL -2 MONTH) AND DATE_ADD('2026-02-01', INTERVAL 0 MONTH)",
+    }) |cond| {
+        const body =
+            \\base AS (
+            \\ SELECT custLC, day, amount FROM ev WHERE
+        ++ " " ++ cond ++
+            \\
+            \\), w AS (
+            \\ SELECT custLC, day, amount, LAG(amount) OVER (PARTITION BY custLC ORDER BY day) AS prior FROM base
+            \\)
+            \\SELECT * FROM w ORDER BY custLC, day
+        ;
+        const mono = try runToText(allocator, db, "WITH " ++ body);
+        defer allocator.free(mono);
+        try std.testing.expect(std.mem.count(u8, mono, "\n") >= 4 + 3);
+        try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
 test "keyed region: incompatible partition uses ordinary execution" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
