@@ -108,6 +108,7 @@ fn run_to_text_checked(allocator: std.mem.Allocator, db: anytype, sql: []const u
                     .datetime => try out.print(allocator, "{d}", .{v.data.datetime[r]}),
                     .boolean => try out.print(allocator, "{d}", .{v.data.boolean[r]}),
                     .double => try out.print(allocator, "{d}", .{v.data.double[r]}),
+                    .decimal64 => try out.print(allocator, "{d}", .{v.data.decimal64[r]}),
                     .string => try out.appendSlice(allocator, v.data.string.rowBytes(r)),
                     .varchar => try out.appendSlice(allocator, v.data.varchar.rowBytes(r)),
                     .char => try out.appendSlice(allocator, v.data.char.rowBytes(r)),
@@ -1840,5 +1841,211 @@ test "keyed region: a UNION ALL table-function arm reads its window bounds in th
             while (try query.next()) |_| {}
         }
         try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
+/// A row-generating kernel for a `base UNION ALL TABLE(f(base))` arm, as a
+/// raw descriptor so its key and `v` columns can be declared in any type: one
+/// row per call, the call's last input row with `seq` moved past the table's
+/// and `v` written as `value` in the declared output type.
+fn union_arm(comptime name: []const u8, comptime key_type: thindb.Type, comptime frame_type: thindb.Type, comptime out_type: thindb.Type, comptime value: anytype) thindb.udf.TableUdf {
+    const kernel = struct {
+        const input = [_]thindb.Column{
+            .{ .name = "custLC", .type = key_type, .nullable = true },
+            .{ .name = "seq", .type = .bigint, .nullable = true },
+            .{ .name = "v", .type = frame_type, .nullable = true },
+        };
+        const output = [_]thindb.Column{
+            .{ .name = "custLC", .type = key_type, .nullable = true },
+            .{ .name = "seq", .type = .bigint, .nullable = true },
+            .{ .name = "v", .type = out_type, .nullable = true },
+        };
+
+        fn process(_: *const thindb.udf.TvfContext, parts: []const thindb.udf.TvfPartition, out: *thindb.udf.TvfOutput) !void {
+            const part = &parts[0];
+            if (part.row_count == 0) return;
+            const last = part.row_count - 1;
+            const alloc = out.allocator;
+            try thindb.engine.store.appendViewRange(alloc, out.columns[0], part.columns[0], last, last + 1);
+            const seq = out.columns[1];
+            try seq.data.bigint.append(alloc, part.columns[1].data.bigint[last] + 100);
+            try seq.appendValidBit(alloc, seq.rowCount() - 1, true);
+            const v = out.columns[2];
+            if (comptime out_type.isString()) {
+                switch (v.data) {
+                    .varchar, .string, .char, .json => |*text| try text.appendValue(alloc, value),
+                    else => return error.TableFnBadOutput,
+                }
+            } else {
+                if (std.meta.activeTag(v.data) != std.meta.activeTag(out_type)) return error.TableFnBadOutput;
+                try @field(v.data, @tagName(out_type)).append(alloc, value);
+            }
+            try v.appendValidBit(alloc, v.rowCount() - 1, true);
+        }
+    };
+    return .{
+        .name = name,
+        .input_schemas = &.{&kernel.input},
+        .output_schema = &kernel.output,
+        .execution = .partitioned,
+        .process = kernel.process,
+    };
+}
+
+/// `base UNION ALL` the rows `function` generates from it, in either arm
+/// order, under a window. `column` of `pairs` is the union's `v`.
+fn union_arm_body(comptime function: []const u8, comptime column: []const u8, comptime base_first: bool) []const u8 {
+    return "base AS (\n SELECT custLC, seq, " ++ column ++ " AS v FROM pairs WHERE id > 0\n" ++
+        "), projected AS (\n SELECT custLC, seq, v FROM TABLE(" ++ function ++ "((\n" ++
+        "   SELECT custLC, seq, v FROM base WHERE seq BETWEEN 2 AND 8\n" ++
+        " )) PARTITION BY custLC ORDER BY seq)\n), combined AS (\n" ++
+        (if (base_first) " SELECT * FROM base UNION ALL SELECT * FROM projected\n" else " SELECT * FROM projected UNION ALL SELECT * FROM base\n") ++
+        "), w AS (\n SELECT custLC, seq, v, LAG(seq) OVER (PARTITION BY custLC ORDER BY seq) AS prior FROM combined\n)\n" ++
+        "SELECT * FROM w ORDER BY custLC, seq";
+}
+
+fn setup_pairs(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    try helpers.exec(allocator, db,
+        \\CREATE TABLE pairs (
+        \\  id BIGINT PRIMARY KEY, custLC VARCHAR(32), seq BIGINT,
+        \\  code VARCHAR(8), label STRING, day DATE, at DATETIME,
+        \\  small INT, big BIGINT, price DECIMAL(10,2), wide DECIMAL(12,4)
+        \\)
+    );
+    try helpers.exec(allocator, db,
+        \\INSERT INTO pairs VALUES
+        \\ (1,'cust_0',1,'a','alpha','2025-11-30','2025-11-30 10:00:00',11,5000000001,1.25,1.1234),
+        \\ (2,'cust_0',2,'b','bravo','2025-12-01','2025-12-01 11:30:00',12,5000000002,2.50,2.2345),
+        \\ (3,'cust_0',3,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        \\ (4,'cust_1',4,'d','delta','2025-12-20','2025-12-20 13:00:00',14,5000000004,4.00,4.4567),
+        \\ (5,'cust_1',5,'e','echo','2026-02-28','2026-02-28 14:45:00',15,5000000005,5.25,5.5678),
+        \\ (6,'cust_1',9,'f','foxtrot','2026-03-01','2026-03-01 15:00:00',16,5000000006,6.50,6.6789),
+        \\ (7,'cust_2',7,'g','golf','2026-03-05','2026-03-05 16:00:00',17,5000000007,7.75,7.7891),
+        \\ (8,NULL,8,'h','hotel','2026-02-01','2026-02-01 17:00:00',18,5000000008,8.00,8.8912)
+    );
+    const pairs = try db.openTable("pairs", .{});
+    try pairs.flush();
+}
+
+/// The types both the plain and the keyed statement report for the union's
+/// key and its `v`.
+fn expect_union_types(allocator: std.mem.Allocator, db: *thindb.Database, comptime body: []const u8, key: thindb.Type, expected: thindb.Type) !void {
+    inline for (.{ "WITH ", "WITH KEYED BY (custLC) " }) |head| {
+        var query = try helpers.runSql(allocator, db, head ++ body);
+        defer query.deinit();
+        const schema = query.outputSchema();
+        try std.testing.expectEqual(key, schema[0].type);
+        try std.testing.expectEqual(expected, schema[2].type);
+        while (try query.next()) |_| {}
+    }
+}
+
+// Issue #495. The kernel's rows are a UNION ALL arm, so each column is the
+// union's result type whichever path runs it. NOT NULL columns are left out
+// of these tables: a region reports every column nullable (issue #498).
+test "keyed region: a UNION ALL table-function arm reports the union's text type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try setup_pairs(allocator, db);
+    inline for (.{
+        .{ "arm_text_string", "code", thindb.Type{ .string = {} }, thindb.Type{ .varchar = 8 }, thindb.Type{ .string = {} }, thindb.Type{ .string = {} } },
+        .{ "arm_text_bounded", "label", thindb.Type{ .varchar = 32 }, thindb.Type{ .string = {} }, thindb.Type{ .varchar = 32 }, thindb.Type{ .string = {} } },
+        .{ "arm_text_longer", "code", thindb.Type{ .varchar = 64 }, thindb.Type{ .varchar = 8 }, thindb.Type{ .varchar = 32 }, thindb.Type{ .varchar = 32 } },
+    }) |case| {
+        try db.registerTableUdf(union_arm(case[0], case[2], case[3], case[4], "generated"));
+        inline for (.{ true, false }) |base_first| {
+            const body = comptime union_arm_body(case[0], case[1], base_first);
+            {
+                var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ body);
+                defer query.deinit();
+                try std.testing.expectEqual(@as(usize, 1), regional_op_count(query.cq.query, .tvf_grouped));
+                while (try query.next()) |_| {}
+            }
+            try expect_union_types(allocator, db, body, case[2], case[5]);
+            // Run twice: the second is the cached program.
+            try expect_keyed_matches(allocator, db, body, "prior");
+        }
+    }
+}
+
+/// A kernel whose declared `v` the frame column meets only by converting:
+/// the frame's stores can't take its rows, so the keyed statement runs the
+/// union in the ordinary operator and returns what the plain one does.
+/// `generated` is the kernel's first row as the union returns it.
+fn expect_converting_arm(comptime name: []const u8, comptime column: []const u8, comptime frame_type: thindb.Type, comptime out_type: thindb.Type, comptime value: anytype, expected: thindb.Type, generated: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try setup_pairs(allocator, db);
+    // The key is declared as the table has it, so `v` is the only column the
+    // two arms disagree on.
+    const key: thindb.Type = .{ .varchar = 32 };
+    try db.registerTableUdf(union_arm(name, key, frame_type, out_type, value));
+    inline for (.{ true, false }) |base_first| {
+        const body = comptime union_arm_body(name, column, base_first);
+        try expect_union_types(allocator, db, body, key, expected);
+        const plain = try runToText(allocator, db, "WITH " ++ body);
+        defer allocator.free(plain);
+        try std.testing.expect(std.mem.indexOf(u8, plain, generated) != null);
+        try expect_fallback_matches(allocator, db, "custLC", body);
+    }
+}
+
+test "keyed region: a UNION ALL table-function arm declaring DATETIME over a DATE column runs in the ordinary operator" {
+    try expect_converting_arm("arm_stamp", "day", .date, .datetime, @as(i64, 1_772_366_400_000_000), .datetime, "cust_0|103|1772366400000000|3");
+}
+
+test "keyed region: a UNION ALL table-function arm declaring DATE over a DATETIME column runs in the ordinary operator" {
+    try expect_converting_arm("arm_day", "at", .datetime, .date, @as(i32, 20513), .datetime, "cust_0|103|1772323200000000|3");
+}
+
+test "keyed region: a UNION ALL table-function arm declaring BIGINT over an INT column runs in the ordinary operator" {
+    try expect_converting_arm("arm_wider", "small", .int, .bigint, @as(i64, 5_000_000_000), .bigint, "cust_0|103|5000000000|3");
+}
+
+test "keyed region: a UNION ALL table-function arm declaring INT over a BIGINT column runs in the ordinary operator" {
+    try expect_converting_arm("arm_narrower", "big", .bigint, .int, @as(i32, 7), .bigint, "cust_0|103|7|3");
+}
+
+test "keyed region: a UNION ALL table-function arm declaring DECIMAL(12,4) over a DECIMAL(10,2) column runs in the ordinary operator" {
+    try expect_converting_arm("arm_finer", "price", .{ .decimal64 = .{ .p = 10, .s = 2 } }, .{ .decimal64 = .{ .p = 12, .s = 4 } }, @as(i64, 12345), .{ .decimal64 = .{ .p = 12, .s = 4 } }, "cust_0|103|12345|3");
+}
+
+test "keyed region: a UNION ALL table-function arm declaring DECIMAL(10,2) over a DECIMAL(12,4) column runs in the ordinary operator" {
+    try expect_converting_arm("arm_coarser", "wide", .{ .decimal64 = .{ .p = 12, .s = 4 } }, .{ .decimal64 = .{ .p = 10, .s = 2 } }, @as(i64, 250), .{ .decimal64 = .{ .p = 12, .s = 4 } }, "cust_0|103|25000|3");
+}
+
+test "keyed region: SQL UNION ALL branches report the union's column types" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try setup_pairs(allocator, db);
+    inline for (.{
+        .{ "code", "label", thindb.Type{ .string = {} } },
+        .{ "price", "wide", thindb.Type{ .decimal64 = .{ .p = 12, .s = 4 } } },
+        .{ "day", "at", thindb.Type{ .datetime = {} } },
+        .{ "small", "big", thindb.Type{ .bigint = {} } },
+    }) |case| {
+        inline for (.{ .{ case[0], case[1] }, .{ case[1], case[0] } }) |arms| {
+            const body = "base AS (SELECT custLC, seq, code, label, day, at, small, big, price, wide FROM pairs WHERE id > 0), combined AS (" ++
+                " SELECT custLC, seq, " ++ arms[0] ++ " AS v FROM base WHERE seq < 5" ++
+                " UNION ALL SELECT custLC, seq, " ++ arms[1] ++ " AS v FROM base WHERE seq >= 5" ++
+                "), w AS (SELECT custLC, seq, v, LAG(seq) OVER (PARTITION BY custLC ORDER BY seq) AS prior FROM combined)" ++
+                " SELECT * FROM w ORDER BY custLC, seq";
+            inline for (.{ "WITH ", "WITH KEYED BY (custLC) " }) |head| {
+                var query = try helpers.runSql(allocator, db, head ++ body);
+                defer query.deinit();
+                try std.testing.expectEqual(case[2], query.outputSchema()[2].type);
+                while (try query.next()) |_| {}
+            }
+            try expect_keyed_matches(allocator, db, body, "prior");
+        }
     }
 }
