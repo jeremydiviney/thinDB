@@ -47,8 +47,8 @@ describe("pg errors", () => {
     }
     expect(caught).toBeDefined();
     if (caught === undefined) return;
-    // Server maps unknown parser errors to 42000 fallback.
-    expect(caught.code).toBe("42000");
+    // Parser errors are syntax_error, 42601.
+    expect(caught.code).toBe("42601");
   });
 
   test("DROP DATABASE that doesn't exist → 3D000", async () => {

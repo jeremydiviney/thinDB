@@ -3621,3 +3621,84 @@ test "mysql wire: the engine's own root directories are not databases" {
 
     for (markers) |marker| try tmp.dir.access(io, marker, .{});
 }
+
+/// The ERR packet a statement ends with, whether the server refuses it
+/// before any result set or fails it after the column definitions.
+fn expectStatementErr(client: *TestClient, sql_text: []const u8, code: u16, sqlstate: []const u8, message: ?[]const u8) !void {
+    const a = client.allocator;
+    try client.sendQuery(sql_text);
+    const first = try mysql_packet.readPacket(a, &client.reader.interface);
+    defer a.free(first.payload);
+    if (first.payload[0] == 0xFF) return expectErrPayload(sql_text, first.payload, code, sqlstate, message);
+    var cursor: usize = 0;
+    const col_count = try mysql_packet.readLenEncInt(first.payload, &cursor);
+    var i: u64 = 0;
+    while (i < col_count) : (i += 1) {
+        const column_def = try mysql_packet.readPacket(a, &client.reader.interface);
+        a.free(column_def.payload);
+    }
+    while (true) {
+        const pkt = try mysql_packet.readPacket(a, &client.reader.interface);
+        defer a.free(pkt.payload);
+        if (pkt.payload[0] == 0xFF) return expectErrPayload(sql_text, pkt.payload, code, sqlstate, message);
+        if (pkt.payload[0] == 0xFE) {
+            std.debug.print("{s} succeeded\n", .{sql_text});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn expectErrPayload(sql_text: []const u8, payload: []const u8, code: u16, sqlstate: []const u8, message: ?[]const u8) !void {
+    const got = std.mem.readInt(u16, payload[1..3], .little);
+    if (got != code) std.debug.print("{s}: {d} {s} {s}\n", .{ sql_text, got, payload[4..9], payload[9..] });
+    try std.testing.expectEqual(code, got);
+    try std.testing.expectEqualStrings(sqlstate, payload[4..9]);
+    if (message) |m| try std.testing.expectEqualStrings(m, payload[9..]);
+}
+
+test "mysql wire: runtime errors carry MySQL's codes, and only parse errors are 1064 (issue #490)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try thindb.Catalog.open(allocator, io, tmp.dir, .{
+        .query_memory_budget = 64 * 1024,
+        .row_group_size = 128,
+    });
+    defer catalog.close();
+    const db = try catalog.createDatabase("main");
+    const schema = thindb.TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.schema("public").?.table("big", schema, .{ .order_key = &ok, .unique = false, .row_group_size = 128 });
+    var id: i64 = 0;
+    while (id < 20_000) : (id += 1) try t.insert(&.{.{ .id = id }});
+    try t.flush();
+
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = test_port_base + 490 } };
+    const server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer thread.join();
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake("main__public");
+
+    try expectStatementErr(&client, "WAT IS THIS NOT SQL", 1064, "42000", null);
+    try expectStatementErr(&client, "SELECT FOUND_ROWS()", 1235, "42000", "SqlFoundRowsUnsupported");
+    try expectStatementErr(&client, "SELECT SLEEP(-1)", 1210, "HY000", "IncorrectArgumentsToSleep");
+    try expectStatementErr(&client, "SELECT id FROM big ORDER BY id DESC", 3170, "HY000", "MemoryBudgetExceeded");
+    try expectStatementErr(&client, "SELECT JSON_EXTRACT('{\"a\": 1}', 'a')", 1105, "HY000", null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("19999", (try queryCell(&client, arena.allocator(), "SELECT max(id) FROM big")).?);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
