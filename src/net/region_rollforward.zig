@@ -1918,6 +1918,7 @@ const Builder = struct {
             .call => |c| blk: {
                 if (c.args.len != 1) return null;
                 const known = std.ascii.eqlIgnoreCase(c.fn_name, "to_bigint") or
+                    std.mem.eql(u8, c.fn_name, exec.scalar_fn.MYSQL_SIGNED_FN) or
                     std.ascii.eqlIgnoreCase(c.fn_name, "to_int") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "to_smallint") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "to_double");
