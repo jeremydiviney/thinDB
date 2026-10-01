@@ -250,14 +250,25 @@ pub fn argCastCanNull(from: TypeTag, to: TypeTag) bool {
 
 /// THE integer narrowing rule, StarRocks semantics in every dialect: an
 /// integer becomes a narrower integer type's value when it fits and NULL
-/// when it doesn't (`CAST(2147483648 AS INT)`, `LEFT(s, 4294967298)`, and in
-/// the MySQL dialect `CAST(~5 AS SIGNED)`, whose operand is 2^64 - 6).
+/// when it doesn't (`CAST(2147483648 AS INT)`, `LEFT(s, 4294967298)`).
+/// The MySQL dialect's `CAST(x AS SIGNED)` alone reads by `signedBits`.
 /// Explicit CASTs, arguments narrowed to their parameter, a double or
 /// decimal read as an integer argument (`scalar_fn.INTEGER_ARG_FN`) and a
 /// table function's scalar arguments all narrow by it. A write into a column
 /// raises instead (`assignNumber`), as StarRocks' strict INSERT fails.
 pub fn narrowInt(comptime T: type, x: anytype) ?T {
     return std.math.cast(T, x);
+}
+
+/// The MySQL dialect's `CAST(x AS SIGNED)` of `x` read as an integer (a
+/// fraction truncated toward zero, as every integer CAST truncates): its low
+/// 64 bits as a BIGINT, so a value in [2^63, 2^64) wraps by two's complement,
+/// as MySQL reads a BIGINT UNSIGNED (`CAST(~5 AS SIGNED)` is -6, its bit
+/// operators being unsigned). A value past 64 bits is NULL, as `narrowInt`
+/// makes it.
+pub fn signedBits(x: i128) ?i64 {
+    if (x < std.math.minInt(i64) or x > std.math.maxInt(u64)) return null;
+    return @truncate(x);
 }
 
 /// The kernel narrowing a `FromT` integer column to `ToT` by `narrowInt`.
@@ -1011,4 +1022,20 @@ test "preservesOrder: a DATETIME's day merges, a widening stays strict, text reo
     inline for (cases) |c| {
         try std.testing.expectEqual(c[2], preservesOrder(c[0], c[1]));
     }
+}
+
+test "signedBits: 64 bits wrap into BIGINT, anything wider is NULL" {
+    const max_i64: i128 = std.math.maxInt(i64);
+    const min_i64: i128 = std.math.minInt(i64);
+    const cases = .{
+        .{ max_i64, @as(?i64, std.math.maxInt(i64)) },
+        .{ max_i64 + 1, @as(?i64, std.math.minInt(i64)) },
+        .{ std.math.maxInt(u64) - 5, @as(?i64, -6) },
+        .{ std.math.maxInt(u64), @as(?i64, -1) },
+        .{ std.math.maxInt(u64) + 1, @as(?i64, null) },
+        .{ -1, @as(?i64, -1) },
+        .{ min_i64, @as(?i64, std.math.minInt(i64)) },
+        .{ min_i64 - 1, @as(?i64, null) },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c[1], signedBits(c[0]));
 }

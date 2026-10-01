@@ -12,6 +12,7 @@ const simd = @import("../util/simd.zig");
 const memory = @import("../memory.zig");
 const jb = @import("json_binary.zig");
 const dec = @import("scalar_fn_decimal.zig");
+const cast = @import("cast.zig");
 const Type = @import("../types.zig").Type;
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
@@ -689,6 +690,32 @@ pub const doubleToBigintKernel = IntCast(i64).from_double;
 pub const stringToBigintKernel = IntCast(i64).from_text;
 pub const doubleToLargeintKernel = IntCast(i128).from_double;
 pub const stringToLargeintKernel = IntCast(i128).from_text;
+
+/// The MySQL dialect's `CAST(x AS SIGNED)` of a LARGEINT, a double or text,
+/// by `cast.signedBits`.
+pub const largeintToSignedBitsKernel = convertOrNull("bigint", struct {
+    fn f(v: ColumnView, row: usize) ?i64 {
+        return cast.signedBits(v.data.largeint[row]);
+    }
+}.f);
+pub const doubleToSignedBitsKernel = convertOrNull("bigint", struct {
+    fn f(v: ColumnView, row: usize) ?i64 {
+        return cast.signedBits(truncatedInt(i128, v.data.double[row]) orelse return null);
+    }
+}.f);
+pub const stringToSignedBitsKernel = convertOrNull("bigint", struct {
+    fn f(v: ColumnView, row: usize) ?i64 {
+        return cast.signedBits(common.textInteger(stringViewOf(v).rowBytes(row)) orelse return null);
+    }
+}.f);
+
+/// The MySQL dialect's `CAST(x AS UNSIGNED)` of `CAST(x AS SIGNED)`: its 64
+/// bits read unsigned, MySQL's BIGINT UNSIGNED held in a LARGEINT
+/// (`CAST(-1 AS UNSIGNED)` is 2^64 - 1).
+pub fn bigintToUnsignedBitsKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const dst = try reserveInts(i128, allocator, out, row_count);
+    for (dst, args[0].data.bigint[0..row_count]) |*d, x| d.* = @as(u64, @bitCast(x));
+}
 
 pub const stringToDoubleKernel = convertOrNull("double", struct {
     fn f(v: ColumnView, row: usize) ?f64 {

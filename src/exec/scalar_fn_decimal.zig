@@ -385,6 +385,20 @@ pub fn toIntKernel(allocator: Allocator, arg_types: []const Type, out_type: Type
     }
 }
 
+/// The MySQL dialect's `CAST(x AS SIGNED)` of a decimal: its whole part by
+/// `cast.signedBits`. `.kernel_managed`.
+pub fn toSignedBitsKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    const factor = pow10(scaleOf(arg_types[0]));
+    const base = out.data.rowCount();
+    try out.data.bigint.ensureUnusedCapacity(allocator, n);
+    for (0..n) |row| {
+        const bits: ?i64 = if (args[0].isValid(row)) cast.signedBits(@divTrunc(mantissaAt(args[0], row), factor)) else null;
+        out.data.bigint.appendAssumeCapacity(bits orelse 0);
+        try out.appendValidBit(allocator, base + row, bits != null);
+    }
+}
+
 /// Append `v` to an integer output, or 0 when it is null or outside the
 /// output's range; whether `v` was stored.
 fn appendIntFamily(allocator: Allocator, out: *ColumnStore, out_type: Type, v: ?i128) !bool {
