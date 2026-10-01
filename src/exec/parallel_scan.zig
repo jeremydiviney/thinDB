@@ -2447,9 +2447,11 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
         const sink = if (self.agg_fused) null else self.probe_sink;
         const remap: ?[]ColumnView = if (sink != null and self.probe_map_views.len > 0) self.probe_map_views[i] else null;
         drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, sink, i, remap, &self.wbufs[i], &self.werr[i]);
-        // The chunk's survivors are copied out and its leaf is exhausted;
-        // the leaf's decode buffers would otherwise sit beside every later
-        // chunk's and under whatever the consumer builds from the rows.
+        // No view into leaf i's scratch outlives its drain: each batch its
+        // pipeline emitted was deep-copied into `wbufs[i]` before the next
+        // pull, and a chunk is claimed once, so the leaf is not pulled again.
+        // A deferred probe+aggregate scan plans more pipelines than it has
+        // leaves, hence the bound.
         if (i < self.workers.len) self.workers[i].releaseScratch();
     }
 }
