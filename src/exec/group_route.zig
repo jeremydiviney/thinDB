@@ -65,10 +65,16 @@ pub fn routeGroupBy(
                 "[gbroute]   realized input: {d} chunks, held={d} MiB, largest={d} MiB\n",
                 .{ r.owned.chunks.len, r.held_bytes >> 20, r.largest_chunk_bytes >> 20 },
             );
-            if (groupState(priced, upstream.outputSchema(), group_cols, aggs, emit_limit)) |gs| std.debug.print(
-                "[gbroute]   state: groups={d} slot={d} B group={d} B payload={d} B out={d}+{d} B sets={d} MiB; hash cores absorb={d} emit={d} MiB\n",
-                .{ gs.groups, gs.slot, gs.group, gs.payload, gs.out_fixed, gs.out_strings, gs.sets >> 20, needs.cores_absorb >> 20, needs.cores_emit >> 20 },
-            );
+            if (groupState(priced, upstream.outputSchema(), group_cols, aggs, emit_limit)) |gs| {
+                std.debug.print(
+                    "[gbroute]   state: groups={d} slot={d} B group={d} B payload={d} B out={d}+{d} B sets={d} MiB; hash cores absorb={d} emit={d} MiB\n",
+                    .{ gs.groups, gs.slot, gs.group, gs.payload, gs.out_fixed, gs.out_strings, gs.sets >> 20, needs.cores_absorb >> 20, needs.cores_emit >> 20 },
+                );
+                if (gs.radix) |fp| std.debug.print(
+                    "[gbroute]   radix: slot={d} B cell={d} B out={d} B + {d} validity bits\n",
+                    .{ fp.slot, fp.cell, fp.out, fp.nullable_outs },
+                );
+            }
         }
         for (PLAN_ORDER) |plan| {
             if (!needs.admits(plan, partition_ok) or needs.of(plan) > headroom) continue;
@@ -278,7 +284,8 @@ pub const PlanNeeds = struct {
         return switch (plan) {
             .partitioned => partition_ok,
             .partitioned_sort => partition_ok and self.near_unique,
-            .radix, .hash, .sort => true,
+            .radix => self.radix != std.math.maxInt(u64),
+            .hash, .sort => true,
         };
     }
 
@@ -335,7 +342,7 @@ pub fn inputNeeds(
 /// Rows a table scan's batch carries: one row group at the default size.
 const SCAN_BATCH_ROWS: u64 = 64 * 1024;
 
-/// Radix's and the sort cores' slack over their live group bytes.
+/// The sort cores' slack over their live group bytes.
 const STATE_SLACK_NUM: u64 = 3;
 const STATE_SLACK_DEN: u64 = 2;
 
@@ -352,7 +359,7 @@ const OUTPUT_GROWTH_NUM: u64 = 5;
 const OUTPUT_GROWTH_DEN: u64 = 4;
 
 /// A group table's slots per entry it holds: the 0.75 load factor, rounded
-/// up to a power of two (radix's pricing, and the presize cap).
+/// up to a power of two (the presize caps).
 const SLOTS_NUM: u64 = 8;
 const SLOTS_DEN: u64 = 3;
 
@@ -373,8 +380,10 @@ const GUESSED_STRING_WIDTH: u64 = 32;
 /// batches of at most `batch_rows`:
 ///   - input buffer B = rows × Σ column bytes (a string's width plus its
 ///     4-byte offset, a validity byte when nullable)
-///   - group state S(w), for tables that also take w rows of the batches
-///     being inserted (`GroupState.bytes`); a hash aggregate's tables H(t, w),
+///   - radix's state S(w), for a table that also takes w rows of the
+///     batches being inserted (`GroupState.bytes`, issue #476): the larger
+///     of its drain, which holds its table, cells and batch scratch, and its
+///     emit, which holds its cells and output; a hash aggregate's tables H(t, w),
 ///     split over t tables that each take w rows at a time, beside its
 ///     arena, and its output O (`GroupState.hashTables`, issue #464)
 ///   - radix = S(batch_rows): it streams its input into its table
@@ -561,6 +570,21 @@ fn presizeGroups(
     return @min(groups, headroom / (state.slot *| SLOTS_NUM / SLOTS_DEN));
 }
 
+/// The groups radix's table jumps to once it outgrows its first one (issue
+/// #476): the keys' NDV estimate, or 0 without one, when it doubles from a
+/// small table. Capped at the groups whose table and cells `headroom`
+/// holds: g groups take up to 8/3 g slots, and cells for 3/4 of those.
+fn radixPresize(
+    st: exec.PipelineStats,
+    schema: []const types.Column,
+    group_cols: []const []const u8,
+    fp: exec.radix_aggregate.Footprint,
+    headroom: u64,
+) u64 {
+    const groups = estimateGroups(st, schema, group_cols) orelse return 0;
+    return @min(groups, headroom / (fp.slot *| SLOTS_NUM / SLOTS_DEN +| fp.cell *| 2));
+}
+
 /// A hash aggregate's state. `groups` is the product of the keys' NDV bounds
 /// capped at rows, or rows when any key's NDV is unknown; under a bare LIMIT
 /// whose aggregates keep bounded state the table stops at `emit_limit`
@@ -571,8 +595,8 @@ const GroupState = struct {
     /// A table slot: its hash and group id, the key slice, and every
     /// aggregate's cell.
     slot: u64,
-    /// Radix's and the sort cores' bytes per group: the key and string
-    /// payloads at their per-row widths, and the emitted row.
+    /// The sort cores' bytes per group: the key and string payloads at
+    /// their per-row widths, and the emitted row.
     group: u64,
     /// What a hash aggregate's arena copies per group: each key (a string
     /// key at its distinct width, `keyWidth`) and each string aggregate
@@ -587,14 +611,35 @@ const GroupState = struct {
     /// The per-group value sets of DISTINCT aggregates and the values
     /// GROUP_CONCAT / PERCENTILE keep.
     sets: u64,
+    /// What radix holds per slot, group and emitted row; null when it
+    /// can't carry the GROUP BY, or under a bare LIMIT, which it leaves to
+    /// the hash plan.
+    radix: ?exec.radix_aggregate.Footprint,
+    /// Whether `groups` comes from the keys' NDV, which radix sizes its
+    /// table to, rather than the rows.
+    estimated: bool,
 
-    /// Radix's state when its table also takes `batch_rows`: it grows its
-    /// table and cells to hold a whole batch before inserting it, and keeps
-    /// per-row scratch for it.
+    /// Radix's peak when its table also takes `batch_rows` (issue #476).
+    /// It grows its table to hold a whole batch before inserting it, keeps
+    /// a cell for every group the table holds
+    /// (`radix_aggregate.cellCapacity`) and scratch for the batch. While a
+    /// grow moves the groups, it also holds the table and cells it
+    /// outgrew: its first table when it jumps from there to the estimate,
+    /// else the half it doubled from. It frees the table and scratch, then
+    /// emits every group into columns reserved to fit. Unbounded when radix
+    /// can't carry the GROUP BY.
     fn bytes(self: GroupState, batch_rows: u64) u64 {
-        const slots = (self.groups +| batch_rows) *| SLOTS_NUM / SLOTS_DEN;
-        const live = slots *| self.slot +| self.groups *| self.group +| batch_rows *| BATCH_SCRATCH_BYTES;
-        return live *| STATE_SLACK_NUM / STATE_SLACK_DEN +| self.sets;
+        const fp = self.radix orelse return std.math.maxInt(u64);
+        const ra = exec.radix_aggregate;
+        const slots = tableSlots(self.groups +| batch_rows);
+        const first_groups: u64 = if (self.estimated) @min(self.groups, ra.INITIAL_GROUPS) else ra.UNESTIMATED_GROUPS;
+        const first = tableSlots(first_groups);
+        const target = if (self.estimated) tableSlots(self.groups) else first;
+        const outgrown: u64 = if (slots <= first) 0 else if (slots <= target) first else slots / 2;
+        const cells: u64 = ra.cellCapacity(slots);
+        const drain = (slots +| outgrown) *| fp.slot +| (cells +| ra.cellCapacity(outgrown)) *| fp.cell +| batch_rows *| BATCH_SCRATCH_BYTES;
+        const emit = cells *| fp.cell +| fp.output(self.groups);
+        return @max(drain, emit);
     }
 
     /// A hash aggregate's state split over `tables` tables (the
@@ -660,7 +705,8 @@ fn groupState(
             out_strings += width;
         }
     }
-    const all_groups = estimateGroups(st, schema, group_cols) orelse @max(rows, 1);
+    const estimate = estimateGroups(st, schema, group_cols);
+    const all_groups = estimate orelse @max(rows, 1);
     const capped = emit_limit != null and exec.aggregate_op.aggsAllowGroupCap(aggs);
     const groups = if (capped) @min(all_groups, @as(u64, emit_limit.?) + 1) else all_groups;
     var sets: u64 = 0;
@@ -712,7 +758,17 @@ fn groupState(
             },
         }
     }
-    return .{ .groups = groups, .slot = slot, .group = group, .payload = payload, .out_fixed = out_fixed, .out_strings = out_strings, .sets = sets };
+    return .{
+        .groups = groups,
+        .slot = slot,
+        .group = group,
+        .payload = payload,
+        .out_fixed = out_fixed,
+        .out_strings = out_strings,
+        .sets = sets,
+        .radix = if (emit_limit == null) exec.radix_aggregate.footprint(schema, group_cols, aggs) else null,
+        .estimated = estimate != null,
+    };
 }
 
 fn traceInput(st: exec.PipelineStats, priced: exec.PipelineStats, schema: []const types.Column) void {
@@ -729,11 +785,13 @@ fn traceInput(st: exec.PipelineStats, priced: exec.PipelineStats, schema: []cons
 
 fn traceNeeds(rows: u64, needs: PlanNeeds, headroom: usize, partition_ok: bool) void {
     const mib = 1024 * 1024;
+    const radix_ok = needs.admits(.radix, partition_ok);
+    const radix_na = if (radix_ok) "" else "(n/a)";
     const partitioned_na = if (needs.admits(.partitioned, partition_ok)) "" else "(n/a)";
     const sort_cores_na = if (needs.admits(.partitioned_sort, partition_ok)) "" else "(n/a)";
     std.debug.print(
-        "[gbroute] rows={d} headroom={d} MiB needs: radix={d} partitioned={d}{s} partitioned_sort={d}{s} hash={d} sort={d} MiB\n",
-        .{ rows, headroom / mib, needs.radix / mib, needs.partitioned / mib, partitioned_na, needs.partitioned_sort / mib, sort_cores_na, needs.hash / mib, needs.sort / mib },
+        "[gbroute] rows={d} headroom={d} MiB needs: radix={d}{s} partitioned={d}{s} partitioned_sort={d}{s} hash={d} sort={d} MiB\n",
+        .{ rows, headroom / mib, if (radix_ok) needs.radix / mib else 0, radix_na, needs.partitioned / mib, partitioned_na, needs.partitioned_sort / mib, sort_cores_na, needs.hash / mib, needs.sort / mib },
     );
 }
 
@@ -1004,10 +1062,28 @@ pub fn routeRadixGroupBy(
         .{ .k = tk.k, .col = tk.keys[0].col, .desc = tk.keys[0].desc }
     else
         null;
+    return radixPresized(upstream, group_cols, aggs, rtk);
+}
 
+/// A RadixAggregate over `upstream` sized by `radixPresize` against the
+/// statement's headroom, or null when radix can't carry the GROUP BY;
+/// consumes `upstream` only on success.
+fn radixPresized(
+    upstream: Query,
+    group_cols: []const []const u8,
+    aggs: []const ir.AggSpec,
+    top_k: ?exec.radix_aggregate.TopK,
+) !?Query {
+    const schema = upstream.outputSchema();
+    const headroom: u64 = if (upstream.accountant()) |a| a.headroom() else std.math.maxInt(u64);
+    const presize = if (exec.radix_aggregate.footprint(schema, group_cols, aggs)) |fp|
+        radixPresize(upstream.stats(), schema, group_cols, fp, headroom)
+    else
+        0;
+    if (getenv_gr("THINDB_TRACE_GBROUTE") != null) std.debug.print("[gbroute]   radix presize={d} groups\n", .{presize});
     // create declines (cleanly, without consuming upstream) when the key won't
     // pack into ≤128 bits or an aggregate isn't fixed-state — fall through.
-    return upstream.radixGroupBy(group_cols, aggs, rtk) catch |e| switch (e) {
+    return upstream.radixGroupBy(group_cols, aggs, top_k, presize) catch |e| switch (e) {
         error.UnsupportedOperatorForType, error.AggregateUnsupportedType => null,
         else => e,
     };
@@ -1294,7 +1370,8 @@ test "plan needs price the input buffer, the group state and measured widths" {
     // A hash aggregate's arena copies a group's key and MAX_BY value; its
     // row emits the key (reserved exactly, as the lone string key), the
     // value's offset and validity, and the count, and the value's bytes
-    // into a growing buffer. Radix still prices both at the per-row widths.
+    // into a growing buffer. The sort cores still price both at the
+    // per-row widths, and the string key leaves radix out.
     const state = groupState(measured, &schema, &group_cols, &aggs, null).?;
     const cells = exec.aggregate_op.aggStateWidth(.max_by, schema[1].type, .bigint) + exec.aggregate_op.aggStateWidth(.count, null, null);
     try std.testing.expectEqual(16 + 16 + cells, state.slot);
@@ -1303,7 +1380,8 @@ test "plan needs price the input buffer, the group state and measured widths" {
     try std.testing.expectEqual((4 + 20) + (4 + 1) + 16, state.out_fixed);
     try std.testing.expectEqual(100, state.out_strings);
     try std.testing.expectEqual(rows, state.groups);
-    try std.testing.expectEqual(state.bytes(0), needs.radix);
+    try std.testing.expectEqual(@as(?exec.radix_aggregate.Footprint, null), state.radix);
+    try std.testing.expect(!needs.admits(.radix, true));
     // The hash plan's one table is the power of two its groups need under
     // the 0.75 load; it holds the arena's copies and then the emitted rows.
     const serial = state.hashTables(1, 0);
@@ -1313,7 +1391,6 @@ test "plan needs price the input buffer, the group state and measured widths" {
     try std.testing.expectEqual(serial.held + serial.output, needs.hash);
     // A streamed batch widens the tables and adds its scratch.
     const batched = planNeeds(measured, &schema, &group_cols, &aggs, null, 1000, 4, whole).?;
-    try std.testing.expectEqual(state.bytes(1000), batched.radix);
     const batched_serial = state.hashTables(1, 1000);
     try std.testing.expectEqual(batched_serial.held + batched_serial.output, batched.hash);
     try std.testing.expectEqual(serial.held + 1000 * BATCH_SCRATCH_BYTES, batched_serial.held);
@@ -1405,7 +1482,6 @@ test "plan needs price the input buffer, the group state and measured widths" {
     const few_state = groupState(few, &schema, &group_cols, &aggs, null).?;
     try std.testing.expectEqual(@as(u64, 1000), few_state.groups);
     const few_needs = planNeeds(few, &schema, &group_cols, &aggs, null, 0, 4, whole).?;
-    try std.testing.expectEqual(few_state.bytes(0), few_needs.radix);
     const few_serial = few_state.hashTables(1, 0);
     try std.testing.expectEqual(few_serial.held + few_serial.output, few_needs.hash);
     try std.testing.expectEqual(group_table.capacityFor(1000) * few_state.slot + 1000 * 120 * 4 / 3, few_serial.held);
@@ -1479,7 +1555,6 @@ test "a hash aggregate prices the strings a group keeps at their distinct width"
     try std.testing.expectEqual(plain.group, keyed.group);
     const plain_needs = planNeeds(row_mean, &schema, &one, &aggs, null, 0, 4, whole).?;
     const keyed_needs = planNeeds(sampled, &schema, &one, &aggs, null, 0, 4, whole).?;
-    try std.testing.expectEqual(plain_needs.radix, keyed_needs.radix);
     try std.testing.expectEqual(plain_needs.partitioned_sort, keyed_needs.partitioned_sort);
     try std.testing.expectEqual(50_000 * (65 - 9) * 4 / 3 + 50_000 * (65 - 9), keyed_needs.hash - plain_needs.hash);
     // Beside another key, each string key also frames its length, and the
@@ -1491,7 +1566,7 @@ test "a hash aggregate prices the strings a group keeps at their distinct width"
     try std.testing.expectEqual(65 + 12, multi.out_strings);
     // A MIN or MAX keeps one of its group's values, priced at the wider of
     // its column's row and distinct widths: k's distinct width, j's row
-    // width. Radix and the sort cores still price them per row.
+    // width. The sort cores still price them per row.
     const by_n = [_][]const u8{"n"};
     const kept_aggs = [_]ir.AggSpec{
         .{ .func = .min, .col = "k", .as = "lo" },
@@ -1501,6 +1576,199 @@ test "a hash aggregate prices the strings a group keeps at their distinct width"
     try std.testing.expectEqual(8 + 65 + 30, kept.payload);
     try std.testing.expectEqual(65 + 30, kept.out_strings);
     try std.testing.expectEqual(groupState(row_mean, &schema, &by_n, &kept_aggs, null).?.group, kept.group);
+}
+
+test "radix prices the table, cells and output it allocates (issue #476)" {
+    const schema = [_]types.Column{
+        .{ .name = "k", .type = .bigint },
+        .{ .name = "e", .type = .smallint },
+        .{ .name = "v", .type = .int, .nullable = true },
+        .{ .name = "n", .type = .bigint, .nullable = true },
+        .{ .name = "t", .type = .string },
+    };
+    const keys = [_][]const u8{ "k", "e" };
+    const aggs = [_]ir.AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+        .{ .func = .max, .col = "v", .as = "m" },
+    };
+    const ra = exec.radix_aggregate;
+    // Its 80 key bits take the 16-byte slot. A group's cells hold its packed
+    // key, the count, the nullable SUM's i128 and seen flag, and MAX's value
+    // and present flag. It emits both keys, the count and SUM as BIGINT and
+    // MAX as INT, with validity for SUM and MAX.
+    const fp = ra.footprint(&schema, &keys, &aggs).?;
+    try std.testing.expectEqual(16, fp.slot);
+    try std.testing.expectEqual(16 + 8 * (1 + 3 + 2), fp.cell);
+    try std.testing.expectEqual(8 + 2 + 8 + 8 + 4, fp.out);
+    try std.testing.expectEqual(2, fp.nullable_outs);
+    // A nullable key, keys past 128 bits, a string key or a string MAX
+    // leave radix out.
+    try std.testing.expectEqual(@as(?ra.Footprint, null), ra.footprint(&schema, &.{"n"}, &aggs));
+    try std.testing.expectEqual(@as(?ra.Footprint, null), ra.footprint(&schema, &.{ "k", "k", "e" }, &aggs));
+    try std.testing.expectEqual(@as(?ra.Footprint, null), ra.footprint(&schema, &.{"t"}, &aggs));
+    try std.testing.expectEqual(@as(?ra.Footprint, null), ra.footprint(&schema, &keys, &.{.{ .func = .max, .col = "t", .as = "m" }}));
+
+    const rows: u64 = 10_000_000;
+    const batch: u64 = 64 * 1024;
+    const whole = std.math.maxInt(u64);
+    // An estimate of 1M groups: the first table takes 64Ki groups, then
+    // jumps to the 2Mi slots the estimate and a batch need, holding the
+    // first table and its cells while their groups move. The emit holds the
+    // cells beside the output.
+    const est = exec.PipelineStats{ .upper_rows = rows, .column_stats = &.{
+        .{ .ndv = .{ .exact = 1000 } },
+        .{ .ndv = .{ .exact = 1000 } },
+        .{},
+        .{},
+        .{},
+    } };
+    const state = groupState(est, &schema, &keys, &aggs, null).?;
+    try std.testing.expect(state.estimated);
+    const slots: u64 = 2 * 1024 * 1024;
+    try std.testing.expectEqual(slots, group_table.capacityFor(1_000_000 + batch));
+    const first: u64 = group_table.capacityFor(ra.INITIAL_GROUPS);
+    const drain = (slots + first) * 16 + (slots / 4 * 3 + first / 4 * 3) * fp.cell + batch * BATCH_SCRATCH_BYTES;
+    const emit = slots / 4 * 3 * fp.cell + 1_000_000 * fp.out + 2 * ((1_000_000 + 7) / 8);
+    try std.testing.expectEqual(@max(drain, emit), state.bytes(batch));
+    try std.testing.expectEqual(state.bytes(batch), planNeeds(est, &schema, &keys, &aggs, null, batch, 4, whole).?.radix);
+    // A few groups stay in the first table.
+    const few = groupState(.{ .upper_rows = 1000, .column_stats = est.column_stats }, &schema, &keys, &aggs, null).?;
+    try std.testing.expectEqual(2048 * 16 + 1536 * fp.cell, few.bytes(0));
+    // Without an estimate it prices a group per row, and doubles from a
+    // small table, holding the half it doubled from beside the last one.
+    const blind = groupState(.{ .upper_rows = rows }, &schema, &keys, &aggs, null).?;
+    try std.testing.expect(!blind.estimated);
+    const blind_slots = group_table.capacityFor(rows + batch);
+    try std.testing.expectEqual(
+        (blind_slots + blind_slots / 2) * 16 + (blind_slots / 4 * 3 + blind_slots / 8 * 3) * fp.cell + batch * BATCH_SCRATCH_BYTES,
+        blind.bytes(batch),
+    );
+    // Under a bare LIMIT it leaves the GROUP BY to the hash plan.
+    try std.testing.expectEqual(@as(?ra.Footprint, null), groupState(est, &schema, &keys, &aggs, 10).?.radix);
+    try std.testing.expect(!planNeeds(est, &schema, &keys, &aggs, 10, batch, 4, whole).?.admits(.radix, true));
+}
+
+/// Batches of `batch_rows` rows of a BIGINT key and value, whose stats
+/// bound the rows at `upper_rows` and give the key's NDV.
+const TestIntSource = struct {
+    keys: []const i64,
+    values: []const i64,
+    batch_rows: usize,
+    col_stats: [2]exec.ColStat,
+    upper_rows: u64,
+    account: *exec.memory.MemoryAccountant,
+    views: [2]storage.ColumnView = undefined,
+    pos: usize = 0,
+
+    const schema = [_]types.Column{ .{ .name = "k", .type = .bigint }, .{ .name = "v", .type = .bigint } };
+
+    pub fn next(self: *TestIntSource) !?exec.Batch {
+        if (self.pos == self.keys.len) return null;
+        const start = self.pos;
+        self.pos = @min(start + self.batch_rows, self.keys.len);
+        self.views[0] = .{ .data = .{ .bigint = self.keys[start..self.pos] } };
+        self.views[1] = .{ .data = .{ .bigint = self.values[start..self.pos] } };
+        return .{ .schema = &schema, .values = &self.views, .row_count = self.pos - start };
+    }
+    pub fn deinit(_: *TestIntSource) void {}
+    pub fn outputSchema(_: *TestIntSource) []const types.Column {
+        return &schema;
+    }
+    pub fn addPrune(_: *TestIntSource, _: exec.Predicate) !void {}
+    pub fn stats(self: *TestIntSource) exec.PipelineStats {
+        return .{ .upper_rows = self.upper_rows, .column_stats = &self.col_stats };
+    }
+    pub fn accountant(self: *TestIntSource) ?*exec.memory.MemoryAccountant {
+        return self.account;
+    }
+    pub fn explain(_: *TestIntSource, out: *std.ArrayList(u8), alloc: Allocator, depth: usize) !void {
+        try exec.explainLine(out, alloc, depth, "TestIntSource");
+    }
+};
+
+const RadixRow = struct { k: i64, c: i64, s: i64, m: i64 };
+
+fn radixRowLess(_: void, x: RadixRow, y: RadixRow) bool {
+    return x.k < y.k;
+}
+
+const RadixRun = struct {
+    /// Its rows, by key.
+    rows: []RadixRow,
+    /// What the router prices radix at.
+    price: u64,
+    /// The most radix held beyond what its creation left charged.
+    peak: usize,
+};
+
+/// COUNT, SUM and MAX by key over `keys`/`values` with radix sized as the
+/// router sizes it.
+fn testRadixRun(a: Allocator, keys: []const i64, values: []const i64, batch_rows: usize, ndv: ?u32, upper_rows: u64) !RadixRun {
+    const account = try testAccountant(a, 1 << 40);
+    defer account.releaseOwner(a);
+    var src = TestIntSource{
+        .keys = keys,
+        .values = values,
+        .batch_rows = batch_rows,
+        .col_stats = .{ .{ .ndv = if (ndv) |n| .{ .exact = n } else .unknown }, .{} },
+        .upper_rows = upper_rows,
+        .account = account,
+    };
+    const group_cols = [_][]const u8{"k"};
+    const aggs = [_]ir.AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+        .{ .func = .max, .col = "v", .as = "m" },
+    };
+    const up = exec.makeQuery(a, &src);
+    const price = planNeeds(up.stats(), up.outputSchema(), &group_cols, &aggs, null, batch_rows, 1, std.math.maxInt(u64)).?.radix;
+    var q = (try radixPresized(up, &group_cols, &aggs, null)).?;
+    defer q.deinit();
+    const held = account.current_bytes;
+    var rows: std.ArrayList(RadixRow) = .empty;
+    errdefer rows.deinit(a);
+    while (try q.next()) |b| {
+        const v = b.values;
+        for (0..b.row_count) |r| try rows.append(a, .{ .k = v[0].data.bigint[r], .c = v[1].data.bigint[r], .s = v[2].data.bigint[r], .m = v[3].data.bigint[r] });
+    }
+    std.mem.sort(RadixRow, rows.items, {}, radixRowLess);
+    return .{ .rows = try rows.toOwnedSlice(a), .price = price, .peak = account.peak_bytes - held };
+}
+
+test "radix holds what the router prices it at, sized to the estimate (issue #476)" {
+    const a = std.testing.allocator;
+    const n = 200_000;
+    const keys = try a.alloc(i64, n);
+    defer a.free(keys);
+    const values = try a.alloc(i64, n);
+    defer a.free(values);
+    for (keys, values, 0..) |*k, *v, i| {
+        k.* = @intCast(i * 7919 % 1_000_003);
+        v.* = @intCast(i % 1000);
+    }
+    // An exact estimate: the first batch outgrows the first table, which
+    // jumps straight to the estimate.
+    const exact = try testRadixRun(a, keys, values, n / 2, n, n);
+    defer a.free(exact.rows);
+    try std.testing.expectEqual(@as(usize, n), exact.rows.len);
+    for (exact.rows) |row| {
+        try std.testing.expectEqual(@as(i64, 1), row.c);
+        try std.testing.expectEqual(row.s, row.m);
+    }
+    try std.testing.expect(exact.peak <= exact.price);
+    try std.testing.expect(exact.price - exact.peak <= exact.peak / 4);
+    // Without one it doubles from a small table.
+    const blind = try testRadixRun(a, keys, values, n / 2, null, n);
+    defer a.free(blind.rows);
+    try std.testing.expect(blind.peak <= blind.price);
+    try std.testing.expectEqualSlices(RadixRow, exact.rows, blind.rows);
+    // A filter's bound ten times the groups its rows hold sizes the first
+    // table and its cells for that bound, as priced.
+    const over = try testRadixRun(a, keys[0..5000], values[0..5000], 5000, 50_000, 50_000);
+    defer a.free(over.rows);
+    try std.testing.expectEqual(@as(usize, 5000), over.rows.len);
+    try std.testing.expectEqual(over.price, over.peak);
 }
 
 const test_schema = [_]types.Column{

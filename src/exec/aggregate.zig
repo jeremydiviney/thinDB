@@ -4422,7 +4422,25 @@ pub const IntKeyField = struct {
 /// bit width. A narrower slot fits more entries per cache line, so the
 /// memory-bound probe moves fewer bytes. The 32/96/128 cutoffs match
 /// `group_table.IntKeyTable`'s three slot layouts.
-const IntKeyTier = enum { bits32, bits96, bits128 };
+pub const IntKeyTier = enum { bits32, bits96, bits128 };
+
+fn tierForBits(total: u16) ?IntKeyTier {
+    if (total > 128) return null;
+    return if (total <= 32) .bits32 else if (total <= 96) .bits96 else .bits128;
+}
+
+/// The tier `planIntKey` picks for native (uncoded) keys `group_cols` of
+/// `schema`, without building the layout; null where it declines.
+pub fn nativeIntKeyTier(schema: []const Column, group_cols: []const []const u8) ?IntKeyTier {
+    if (group_cols.len == 0) return null;
+    var total: u16 = 0;
+    for (group_cols) |name| {
+        const col = schema[types.findColumn(schema, name) orelse return null];
+        if (col.nullable) return null;
+        total += intKeyBits(col.type) orelse return null;
+    }
+    return tierForBits(total);
+}
 
 /// Decision + layout for the integer fast path. `fields` (column-order)
 /// reconstructs each group column on emit; `tier` selects the slot size of the
@@ -4470,7 +4488,7 @@ pub fn planIntKey(
         const b: u16 = if (coded) 32 else (intKeyBits(up_schema[ci].type) orelse return null);
         total += b;
     }
-    if (total > 128) return null;
+    const tier = tierForBits(total) orelse return null;
 
     const fields = try allocator.alloc(IntKeyField, group_col_indices.len);
     errdefer allocator.free(fields);
@@ -4484,7 +4502,6 @@ pub fn planIntKey(
         cd.* = if (coded and i < dicts.len) dicts[i] else null;
         offset += b;
     }
-    const tier: IntKeyTier = if (total <= 32) .bits32 else if (total <= 96) .bits96 else .bits128;
     return .{ .fields = fields, .tier = tier, .coded_dicts = cdicts };
 }
 

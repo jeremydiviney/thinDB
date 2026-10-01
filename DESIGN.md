@@ -809,8 +809,29 @@ row groups for each column a group keeps, weighs each distinct value once,
 and caches the count on the segment's handle. That reads fewer row groups
 than the row sample because a block's distinct values need its body
 decompressed, where a raw block's row bytes come from its header. A stage or
-realized buffer samples 65,536 rows of those columns on demand. Radix and the partitioned
+realized buffer samples 65,536 rows of those columns on demand. The partitioned
 sort cores keep pricing at the row width.
+
+Radix, the serial aggregate over a packed integer key with compact fixed-width
+states, keeps its group table, cells and batch scratch on the operator's
+tracked allocator as well, each allocated at its exact size, and frees each
+array it outgrows (issue #476). A group's cells are its packed key and its
+aggregates' state words. They are sized for every group the table holds under
+its 0.75 load factor, so they grow only when the table does. The router hands
+radix the keys' NDV estimate, capped at the groups whose table and cells the
+headroom could hold (8/3 slots and 2 cells a group); a forced radix route does
+the same. The table starts at no more than 65,536 groups and, on its first
+overflow, grows straight to the estimate. Without an estimate it starts at
+4,096 groups and doubles. Radix frees its table and scratch before it emits,
+and reserves its output columns' rows exactly. The router prices it from that
+layout. A slot is its key tier's width (8, 16 or 32 bytes); a cell is 16 bytes
+plus 8 per state word; an output row is its columns' widths, plus a validity
+bit per nullable column. The price is the larger of two phases. The drain
+holds the table that the estimate plus one batch needs, its cells, the batch
+scratch, and the table it outgrew, held while its groups move. The emit holds
+the cells and the output. Radix is priced only where it can run: a key of at
+most 128 bits with no nullable column, compact-state aggregates, and no bare
+LIMIT.
 
 Parallel grouped aggregation initially reserves at most one 8,192-row batch's
 worth of groups per bucket and allocates its state slab only when rows arrive.

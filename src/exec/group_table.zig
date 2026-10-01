@@ -189,6 +189,8 @@ pub fn IntKeyTable(comptime max_bits: u16) type {
         /// size reaches a table that can hold every group without growing again.
         grow_target: usize = 0,
 
+        pub const slot_bytes = @sizeOf(Slot);
+
         /// Hash a full-width `u128` key for this tier. Callers precompute it for
         /// the prefetch-pipelined probe; it must match `hashStored` (used by
         /// grow-rehash) for the same key bits, so both route through here.
