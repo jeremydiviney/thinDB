@@ -148,19 +148,66 @@ fn printInducedFailure(failing: *FailingAllocator, k: usize) void {
     std.debug.dumpStackTrace(&trace);
 }
 
+/// What a query gave its client: an error, or its rows as a count and a
+/// digest of their values that ignores their order.
+const Outcome = union(enum) {
+    failed,
+    rows: struct { count: u64, digest: u64 },
+};
+
+/// Runs `sql` to its end. The digest's scratch comes from the testing
+/// allocator, so it never takes an allocation number from `allocator`.
+fn queryOutcome(comptime run: anytype, allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) !Outcome {
+    var r = run(allocator, db, sql) catch return .failed;
+    defer r.deinit();
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(std.testing.allocator);
+    var count: u64 = 0;
+    var digest: u64 = 0;
+    while (r.next() catch return .failed) |batch| {
+        for (0..batch.row_count) |i| {
+            row.clearRetainingCapacity();
+            for (batch.values) |column| {
+                const valid = column.isValid(i);
+                try row.append(std.testing.allocator, @intFromBool(valid));
+                if (valid) try column.appendValueBytes(std.testing.allocator, &row, @intCast(i));
+            }
+            digest +%= std.hash.Wyhash.hash(0, row.items);
+            count += 1;
+        }
+    }
+    return .{ .rows = .{ .count = count, .digest = digest } };
+}
+
 /// Runs `sql` once per allocation it makes, failing that allocation, and
-/// checks each failed run gave back its gate lease and tracked memory.
+/// checks each failed run gave back its gate lease and tracked memory, and
+/// that the client saw an error or the rows the statement returns without
+/// a failure: never an empty or partial result in their place.
 fn expectEveryAllocationFailureClean(failing: *FailingAllocator, db: *thindb.Database, sql: []const u8) !void {
+    const expected = try queryOutcome(helpers.runSqlCtx, failing.allocator(), db, sql);
+    if (expected == .failed) {
+        std.debug.print("fails without an induced failure: {s}\n", .{sql});
+        return error.TestUnexpectedResult;
+    }
     var k: usize = 0;
     while (true) : (k += 1) {
-        const run = runFailingAt(failing, k, helpers.runSqlCtx, db, sql);
+        failing.fail_index.store(failing.alloc_index.load(.monotonic) + k, .monotonic);
+        failing.has_induced_failure.store(false, .monotonic);
+        const got = try queryOutcome(helpers.runSqlCtx, failing.allocator(), db, sql);
+        const induced = failing.has_induced_failure.load(.acquire);
+        failing.fail_index.store(std.math.maxInt(usize), .monotonic);
         waitGateIdle(db);
         expectGateIdle(db, sql) catch |err| {
             printInducedFailure(failing, k);
             return err;
         };
-        if (!run.induced) {
-            if (run.failed) {
+        if (got != .failed and !std.meta.eql(got, expected)) {
+            std.debug.print("a failed allocation changed the result instead of failing the statement: {s}\n", .{sql});
+            if (induced) printInducedFailure(failing, k);
+            return error.TestUnexpectedResult;
+        }
+        if (!induced) {
+            if (got == .failed) {
                 std.debug.print("fails without an induced failure: {s}\n", .{sql});
                 return error.TestUnexpectedResult;
             }
@@ -194,6 +241,32 @@ const running_total_input = [_]thindb.Column{
 const running_total_output = [_]thindb.Column{
     .{ .name = "id", .type = .bigint },
     .{ .name = "running", .type = .bigint },
+};
+
+/// A two-input table UDF: each row's amount times its group's scale from
+/// the second input, 0 when the group has none.
+fn scaledByGroup(
+    ctx: *const thindb.udf.TvfContext,
+    parts: []const thindb.udf.TvfPartition,
+    out: *thindb.udf.TvfOutput,
+) !void {
+    _ = ctx;
+    const rows = &parts[0];
+    const scales = &parts[1];
+    const scale: i64 = if (scales.row_count > 0) scales.columns[1].data.bigint[0] else 0;
+    for (0..rows.row_count) |i| {
+        try out.columns[0].data.bigint.append(out.allocator, rows.columns[0].data.bigint[i]);
+        try out.columns[1].data.bigint.append(out.allocator, rows.columns[2].data.bigint[i] * scale);
+    }
+}
+
+const scale_input = [_]thindb.Column{
+    .{ .name = "g", .type = .int, .nullable = true },
+    .{ .name = "k", .type = .bigint },
+};
+const scaled_output = [_]thindb.Column{
+    .{ .name = "id", .type = .bigint },
+    .{ .name = "v", .type = .bigint },
 };
 
 /// A row-aligned SDK table function whose string column rides through.
@@ -237,6 +310,13 @@ fn openCorpusDb(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, file_root
         .execution = .either,
         .process = runningTotal,
     });
+    try db.registerTableUdf(.{
+        .name = "scaled_by_group",
+        .input_schemas = &.{ &running_total_input, &scale_input },
+        .output_schema = &scaled_output,
+        .execution = .partitioned,
+        .process = scaledByGroup,
+    });
     try db.registerTableFn(previous_id);
     try helpers.exec(allocator, db, "CREATE FUNCTION oa_in(pg INT) RETURNS TABLE AS (SELECT id, s FROM oa WHERE g = pg)");
     return db;
@@ -256,6 +336,8 @@ const query_statements = [_][]const u8{
     "SELECT id FROM oa WHERE EXISTS (SELECT 1 FROM ob WHERE ob.g = oa.g)",
     "SELECT id, (SELECT MAX(g) FROM ob) AS m FROM oa",
     "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS r, SUM(d) OVER (PARTITION BY g) AS t FROM oa",
+    "WITH src AS (SELECT id, g, d FROM oa), w AS (SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS r FROM src) SELECT w.id, w.r, s.d FROM w JOIN src s ON s.id = w.id",
+    "WITH src AS (SELECT id, g, d FROM oa), w AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS r FROM src) SELECT id, r FROM w UNION ALL SELECT id, id FROM src",
     "SELECT id FROM oa UNION ALL SELECT id FROM ob ORDER BY 1",
     "SELECT g FROM oa UNION SELECT g FROM ob",
     "WITH c AS (SELECT g, COUNT(*) AS n FROM oa GROUP BY g) SELECT a.g, b.n FROM c a JOIN c b ON a.g = b.g",
@@ -270,6 +352,12 @@ const table_function_statements = [_][]const u8{
     "SELECT r.id, r.running, ob.s FROM TABLE(running_total((SELECT id, g, id * 10 AS amt FROM oa)) PARTITION BY g ORDER BY id) r JOIN ob ON r.id = ob.id",
     "WITH r AS (SELECT id, running FROM TABLE(running_total((SELECT id, g, id * 10 AS amt FROM oa)) PARTITION BY g ORDER BY id)) SELECT COUNT(*) AS n, MAX(running) AS m FROM r",
     "WITH src AS (SELECT id, g, id * 10 AS amt FROM oa) SELECT id, running FROM TABLE(running_total((SELECT id, g, amt FROM src)) PARTITION BY g ORDER BY id)",
+    // A shared stage the table function reads its input from in place.
+    "WITH src AS (SELECT id, g, id * 10 AS amt FROM oa), r AS (SELECT id, running FROM TABLE(running_total((SELECT id, g, amt FROM src)) PARTITION BY g ORDER BY id)) SELECT r.id, r.running, s.amt FROM r JOIN src s ON s.id = r.id",
+    "WITH src AS (SELECT id, g, id * 10 AS amt FROM oa), r AS (SELECT id, v FROM TABLE(scaled_by_group((SELECT id, g, amt FROM src), (SELECT g, id AS k FROM ob)) PARTITION BY g)) SELECT r.id, r.v, s.amt FROM r JOIN src s ON s.id = r.id",
+    // The table function runs the shared stage before anything else reads it.
+    "WITH src AS (SELECT id, g, id * 10 AS amt FROM oa), r AS (SELECT id, running FROM TABLE(running_total((SELECT id, g, amt FROM src)) PARTITION BY g ORDER BY id)) SELECT id, running FROM r UNION ALL SELECT id, amt FROM src",
+    "WITH src AS (SELECT id, g, id * 10 AS amt FROM oa), r AS (SELECT id, v FROM TABLE(scaled_by_group((SELECT id, g, amt FROM src), (SELECT g, id AS k FROM ob)) PARTITION BY g)) SELECT id, v FROM r UNION ALL SELECT id, amt FROM src",
     "SELECT id, s, prev FROM TABLE(previous_id((SELECT id, g, s FROM oa)) PARTITION BY g ORDER BY id)",
     "SELECT id, s FROM oa_in(1)",
     "SELECT f.id, ob.s FROM oa_in(2) f JOIN ob ON f.id = ob.id",

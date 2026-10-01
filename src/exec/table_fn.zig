@@ -98,6 +98,10 @@ pub const TableFnExec = struct {
     dop: usize,
     col_stats: []exec.ColStat,
     done: bool = false,
+    /// Why execution failed. Its inputs are then partly drained and its
+    /// output partial, so every later `next`, `ensureExecuted` and
+    /// `stats` reports the failure rather than that output.
+    run_error: ?anyerror = null,
     stats_ready: bool = false,
     /// Output stores handed to an adopting stage (mat_stage) — the stage
     /// owns their buffers now; deinit must not free them.
@@ -392,7 +396,7 @@ pub const TableFnExec = struct {
     /// int-family output columns. Downstream consumers that consult stats
     /// lazily (GROUP BY routing at first pull) see the exact numbers.
     pub fn stats(self: *TableFnExec) exec.PipelineStats {
-        if (!self.done) return .{ .upper_rows = std.math.maxInt(u64) };
+        if (!self.done or self.run_error != null) return .{ .upper_rows = std.math.maxInt(u64) };
         const n = self.output_cols[0].rowCount();
         if (!self.stats_ready) {
             self.computeOutputStats(n);
@@ -447,9 +451,11 @@ pub const TableFnExec = struct {
 
     pub fn next(self: *TableFnExec) !?Batch {
         std.debug.assert(!self.adopted_out);
-        if (self.done) return null;
-        self.done = true;
-        try self.execute();
+        if (self.done) {
+            if (self.run_error) |err| return err;
+            return null;
+        }
+        try self.executeOnce();
         if (self.output_cols[0].rowCount() == 0) return null;
         for (self.output_cols, 0..) |c, i| self.views[i] = c.view();
         return Batch{
@@ -472,9 +478,19 @@ pub const TableFnExec = struct {
     /// Run the whole pipeline without emitting (the adopting stage's
     /// barrier calls this instead of pulling `next()`).
     pub fn ensureExecuted(self: *TableFnExec) !void {
-        if (self.done) return;
+        if (self.done) {
+            if (self.run_error) |err| return err;
+            return;
+        }
+        try self.executeOnce();
+    }
+
+    fn executeOnce(self: *TableFnExec) anyerror!void {
         self.done = true;
-        try self.execute();
+        self.execute() catch |err| {
+            self.run_error = err;
+            return err;
+        };
     }
 
     /// Ownership handover for TVF-output-as-stage: the operator's output
@@ -518,7 +534,7 @@ pub const TableFnExec = struct {
         var borrow_rows: u64 = 0;
         var n_borrowed: usize = 0;
         if (self.borrow_src) |src| bind: {
-            src.ensureRun() catch break :bind;
+            try src.ensureRun();
             const res = src.result orelse break :bind;
             const ad = res.adopted orelse break :bind;
             // One contiguous store per column only — a slice-adopted result
@@ -941,7 +957,7 @@ pub const TableFnExec = struct {
             var n_borrowed: usize = 0;
             if (i < self.multi_borrow_srcs.len) {
                 if (self.multi_borrow_srcs[i]) |src| bind: {
-                    src.ensureRun() catch break :bind;
+                    try src.ensureRun();
                     const res = src.result orelse break :bind;
                     const ad = res.adopted orelse break :bind;
                     if (ad.stores.len != res.schema.len) break :bind;

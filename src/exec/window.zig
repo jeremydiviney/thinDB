@@ -76,6 +76,10 @@ pub const Window = struct {
 
     // Materialized state, built lazily on first `next()`.
     drained: bool = false,
+    /// Why the drain failed. The upstream is then partly consumed, so a
+    /// second drain would evaluate only the rows after the failure: every
+    /// later `next` and `ensureDrained` returns this error instead.
+    drain_error: ?anyerror = null,
     /// Bytes charged for the accumulated input; released + freed once all
     /// rows have been emitted (the input is no longer a dependency).
     reserved_bytes: usize = 0,
@@ -545,7 +549,12 @@ pub const Window = struct {
     /// Run the drain + evaluation without emitting (the adopting stage's
     /// barrier calls this instead of pulling `next()`).
     pub fn ensureDrained(self: *Window) !void {
-        if (!self.drained) try self.drainAndEvaluate();
+        if (self.drained) return;
+        if (self.drain_error) |err| return err;
+        self.drainAndEvaluate() catch |err| {
+            self.drain_error = err;
+            return err;
+        };
     }
 
     /// Regional callers own the complete partitions in this batch. Input
@@ -746,7 +755,7 @@ pub const Window = struct {
     }
 
     pub fn next(self: *Window) !?Batch {
-        if (!self.drained) try self.drainAndEvaluate();
+        try self.ensureDrained();
 
         const remaining = self.accumulated_rows - self.emit_offset;
         if (remaining == 0) {
@@ -972,7 +981,7 @@ pub const Window = struct {
         defer self.allocator.free(owned_buf);
         var borrow_expect: u64 = 0;
         if (self.borrow_src) |src| bind: {
-            src.ensureRun() catch break :bind;
+            try src.ensureRun();
             const res = src.result orelse break :bind;
             const ad = res.adopted orelse break :bind;
             // One contiguous store per column only — a slice-adopted result
