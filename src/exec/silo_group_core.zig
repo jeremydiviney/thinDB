@@ -2996,12 +2996,13 @@ fn heavyTeardownMain(task: *HeavyTeardownTask) void {
 // Take the queue/recycle state off the result path and zero it in `shared`
 // so the unwind path has nothing left to free. A tracked allocator frees it
 // here with the frees collected, so none of it counts against the budget once
-// this returns, and `lanes` detached threads return the memory. Otherwise
-// the whole teardown moves to a detached thread, and a failed spawn falls back
-// to freeing synchronously via the regular defer (returns false).
-fn scheduleHeavyTeardown(shared: *PipeShared, lanes: usize) bool {
+// this returns, and one detached thread returns the memory (spread over the
+// workers, the releases slowed the next query in A/B runs). Otherwise the
+// whole teardown moves to a detached thread, and a failed spawn falls back to
+// freeing synchronously via the regular defer (returns false).
+fn scheduleHeavyTeardown(shared: *PipeShared) bool {
     if (thindb.exec.memory.accountantOf(shared.allocator) != null) {
-        var frees = thindb.exec.memory.DeferredFrees.init(lanes);
+        var frees: thindb.exec.memory.DeferredFrees = .{};
         frees.collect();
         deinitRawQueues(shared);
         frees.stop();
@@ -3079,7 +3080,7 @@ test "heavy teardown stops charging the query before its memory is back" {
         try rows.resize(allocator, layout, 4096);
     }
 
-    try std.testing.expect(scheduleHeavyTeardown(&shared, 4));
+    try std.testing.expect(scheduleHeavyTeardown(&shared));
     const charged_on_return = account.current_bytes;
     account.releaseOwner(a);
     gate.beginClose();
@@ -6528,8 +6529,8 @@ pub const RunConfig = struct {
     // table's shared ddl_lock and keeps both until it has resolved the rowrefs
     // the run returns, which index this snapshot's segments and memtable.
     snapshot: Scan.Snapshot,
-    // Free the staging-chunk pools (gigabytes of recycled RawRows slabs) on
-    // detached threads after the result is built, instead of on the wire path.
+    // Free the staging-chunk pools (gigabytes of recycled RawRows slabs) on a
+    // detached thread after the result is built, instead of on the wire path.
     // Requires `allocator` to be thread-safe. A tracked one stops charging the
     // query before the run returns and keeps its accountant alive until the
     // memory is back; an untracked one must outlive the query. The engine sets
@@ -7217,7 +7218,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         );
     }
     pre_return_ticks = platform.nowTicks();
-    if (cfg.defer_heavy_teardown) heavy_teardown_scheduled = scheduleHeavyTeardown(&shared, n_workers);
+    if (cfg.defer_heavy_teardown) heavy_teardown_scheduled = scheduleHeavyTeardown(&shared);
 
     if (PROFILING and !cfg.quiet and cfg.no_profile) {
         std.debug.print(
