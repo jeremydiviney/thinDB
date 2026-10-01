@@ -163,16 +163,14 @@ pub const Project = struct {
     }
 
     /// `VTable.sampleWidths` through `column_map`.
-    pub fn sampleWidths(self: *Project, widths: []?u32) !void {
+    pub fn sampleWidths(self: *Project, widths: []exec.SampledWidth) !void {
         if (self.probe_fused or widths.len != self.column_map.len) return;
-        const up = try self.allocator.alloc(?u32, self.upstream.outputSchema().len);
+        const up = try self.allocator.alloc(exec.SampledWidth, self.upstream.outputSchema().len);
         defer self.allocator.free(up);
-        @memset(up, null);
-        for (self.column_map, widths) |src, w| {
-            if (w != null) up[src] = w;
-        }
+        @memset(up, .{});
+        for (self.column_map, widths) |src, w| up[src] = up[src].orElse(w);
         try self.upstream.sampleWidths(up);
-        for (self.column_map, widths) |src, *w| w.* = up[src];
+        for (self.column_map, widths) |src, *w| w.* = w.orElse(up[src]);
     }
 
     /// Stage adoption crosses a projection by permuting each chunk's store

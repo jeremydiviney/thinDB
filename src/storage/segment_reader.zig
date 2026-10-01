@@ -255,6 +255,75 @@ pub const ReadSegment = struct {
         };
     }
 
+    /// Feeds every sampled non-NULL value of one row group's block of a
+    /// string column to `sampler` (`DistinctWidthSampler.ROWS_PER_BLOCK`
+    /// rows at an even stride), touching only those rows: a raw block by its
+    /// offsets, read unaligned as a block past a validity bitmap lies, a dict
+    /// block by code, an FSST block decoded straight into the hash. The block
+    /// is read through the cache, where the scan that follows finds it.
+    pub fn sampleDistinctStrings(
+        self: ReadSegment,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        nullable: bool,
+        c: storage_cache.TableCache,
+        sampler: *column.DistinctWidthSampler,
+    ) !void {
+        const rows = self.info.row_groups[row_group_idx].row_count;
+        var block = try self.borrowColumnBlock(allocator, row_group_idx, column_idx, c);
+        defer block.release(allocator, c);
+        const step = column.DistinctWidthSampler.stride(rows, column.DistinctWidthSampler.ROWS_PER_BLOCK);
+        const nulls: ?[]const u8 = if (nullable) block.bytes[0..column.bitmapBytes(rows)] else null;
+        const values = if (nulls) |n| block.bytes[n.len..] else block.bytes;
+        switch (block.encoding) {
+            .raw => {
+                const offsets_len = (@as(usize, rows) + 1) * 4;
+                if (values.len < 4 + offsets_len) return format.Error.CorruptColumnBlockHeader;
+                const offsets = values[4..][0..offsets_len];
+                const payload = values[4 + offsets_len ..];
+                var row: usize = 0;
+                while (row < rows) : (row += step) {
+                    if (!column.isValidBit(nulls, row)) continue;
+                    const start = format.readU32(offsets[row * 4 ..][0..4]);
+                    const end = format.readU32(offsets[(row + 1) * 4 ..][0..4]);
+                    if (end < start or end > payload.len) return format.Error.CorruptColumnBlockHeader;
+                    try sampler.add(allocator, payload[start..end]);
+                }
+            },
+            .dict => {
+                const db = dictBlockOf(values, rows);
+                var row: usize = 0;
+                while (row < rows) : (row += step) {
+                    if (column.isValidBit(nulls, row)) try sampler.add(allocator, db.dictValue(db.rowCode(row)));
+                }
+            },
+            .fsst => {
+                const fb = try fsstBlockOf(values, rows);
+                var row: usize = 0;
+                while (row < rows) : (row += step) {
+                    if (!column.isValidBit(nulls, row)) continue;
+                    var digest: ValueDigest = .{};
+                    fb.table.decodeStream(fb.rowComp(row), &digest);
+                    try sampler.addHashed(allocator, digest.hasher.final(), digest.len);
+                }
+            },
+            .for_, .rle => return format.Error.CorruptColumnBlockHeader,
+        }
+    }
+
+    /// The hash and length `DistinctWidthSampler.add` would take from a
+    /// value, fed in decoded pieces.
+    const ValueDigest = struct {
+        hasher: std.hash.Wyhash = .init(0),
+        len: usize = 0,
+
+        pub fn update(self: *ValueDigest, bytes: []const u8) void {
+            self.hasher.update(bytes);
+            self.len += bytes.len;
+        }
+    };
+
     /// Counts each code's rows, then weighs each by its value's length. A NULL
     /// row carries placeholder code 0 but no bytes, as in a raw block.
     fn dictStringBytes(allocator: Allocator, db: DictBlock, nulls: ?[]const u8, row_count: u32) !u64 {

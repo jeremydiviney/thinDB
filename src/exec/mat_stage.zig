@@ -331,6 +331,26 @@ pub const MaterializedResult = struct {
         }
     }
 
+    /// Fill `widths[i].distinct` for each string column the caller wants
+    /// it for and nobody measured, sampling at one stride across the chunks.
+    /// Runs only when a GROUP BY above prices its keys, not with every stage.
+    fn sampleDistinctWidths(self: *const MaterializedResult, allocator: Allocator, widths: []exec.SampledWidth) !void {
+        if (widths.len != self.schema.len) return;
+        const Sampler = storage.column.DistinctWidthSampler;
+        const step = Sampler.stride(self.total_rows, Sampler.ROWS_PER_BUFFER);
+        for (self.schema, widths, 0..) |sc, *w, i| {
+            if (!sc.type.isString() or !w.wantsDistinct()) continue;
+            var sampler: Sampler = .{};
+            defer sampler.deinit(allocator);
+            var next_row: usize = 0;
+            for (self.chunks.items) |c| {
+                if (c.rows == 0) continue;
+                next_row = try sampler.addStrided(allocator, if (c.views.len > 0) c.views[i] else c.cols[i].view(), next_row, step);
+            }
+            w.distinct = sampler.width();
+        }
+    }
+
     /// Bytes held by a string-family column store; 0 for fixed-width.
     fn colStrBytes(col: *const engine.ColumnStore) usize {
         return switch (col.data) {
@@ -1399,6 +1419,13 @@ pub const MatScan = struct {
         };
     }
 
+    /// `VTable.sampleWidths`: the distinct widths a GROUP BY above wants,
+    /// from the stage's result once it has run.
+    pub fn sampleWidths(self: *MatScan, widths: []exec.SampledWidth) !void {
+        const res = self.stage.result orelse return;
+        try res.sampleDistinctWidths(self.allocator, widths);
+    }
+
     pub fn accountant(_: *MatScan) ?*exec.memory.MemoryAccountant {
         return null;
     }
@@ -1521,6 +1548,12 @@ pub const ChunkRangeScan = struct {
             .sort_state = self.stage.sort_state,
             .column_stats = self.stage.col_stats,
         };
+    }
+
+    /// `VTable.sampleWidths` over the whole result, which its stats
+    /// describe, not just this range.
+    pub fn sampleWidths(self: *ChunkRangeScan, widths: []exec.SampledWidth) !void {
+        try self.result.sampleDistinctWidths(self.allocator, widths);
     }
 
     pub fn addPrune(_: *ChunkRangeScan, _: exec.Predicate) !void {}

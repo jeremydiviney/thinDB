@@ -1559,11 +1559,11 @@ pub const Scan = struct {
 
     /// `VTable.sampleWidths`: each string column this scan reads, sampled
     /// from the segments it scans.
-    pub fn sampleWidths(self: *Scan, widths: []?u32) !void {
+    pub fn sampleWidths(self: *Scan, widths: []exec.SampledWidth) !void {
         const n = @min(self.out_phys.len, widths.len);
         for (self.out_phys[0..n], widths[0..n]) |phys, *w| {
-            if (w.* != null or !self.table.schema.columns[phys].type.isString()) continue;
-            w.* = try self.table.sampledStringWidth(self.allocator, self.segs, phys);
+            if (w.complete() or !self.table.schema.columns[phys].type.isString()) continue;
+            w.* = w.orElse(try self.table.sampledStringWidths(self.allocator, self.segs, phys, w.wantsDistinct()));
         }
     }
 
