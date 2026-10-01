@@ -980,6 +980,16 @@ fn scheduleWorkspaceTeardown(
         if (profile_ptr) |profile| profile.printTeardown(query_label, params.bucket_count);
         return exec.prof.nowTicks() - t0;
     }
+    // Collected here so the query is no longer charged once this returns; the
+    // detached threads only hand the memory back to the allocator.
+    if (exec.memory.accountantOf(allocator) != null) {
+        var frees = exec.memory.DeferredFrees.init(n_workers);
+        frees.collect();
+        workspace.deinit(allocator);
+        frees.stop();
+        frees.releaseDetached();
+        return exec.prof.nowTicks() - t0;
+    }
 
     const task = allocator.create(AsyncWorkspaceTeardownTask) catch {
         workspace.deinitParallel(allocator, n_workers, cpus, null);
@@ -1011,6 +1021,29 @@ fn scheduleWorkspaceTeardown(
     };
     thread.detach();
     return exec.prof.nowTicks() - t0;
+}
+
+test "workspace teardown stops charging the query before its memory is back" {
+    const a = std.testing.allocator;
+    var gate = @import("../util/statement_gate.zig").StatementGate.init(a, std.testing.io);
+    defer gate.deinit();
+    var pool = exec.memory.MemoryPool.init(64 << 20);
+    const account = try a.create(exec.memory.MemoryAccountant);
+    account.* = exec.memory.MemoryAccountant.initWithPool(64 << 20, &pool);
+    account.trackAllocations(a);
+    try account.retainGate(&gate);
+    const allocator = try account.executionAllocator();
+    var workspace: SiloCore.SiloGridWorkspace = .{};
+    try workspace.ensure(allocator, 4, 64, 256, 1024, &.{}, null);
+    try std.testing.expect(account.current_bytes > 0);
+
+    _ = scheduleWorkspaceTeardown(allocator, &workspace, 4, &.{}, .{}, "teardown test");
+    const charged_on_return = account.current_bytes;
+    account.releaseOwner(a);
+    gate.beginClose();
+    try std.testing.expectEqual(@as(usize, 0), charged_on_return);
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+    try std.testing.expectEqual(@as(usize, 0), workspace.parts.len);
 }
 
 fn asyncWorkspaceTeardown(task: *AsyncWorkspaceTeardownTask) void {

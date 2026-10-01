@@ -104,31 +104,64 @@ pub const BudgetAllocator = struct {
 
     fn freeFn(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *BudgetAllocator = @ptrCast(@alignCast(ctx));
-        if (!DeferredFrees.keep(self.child, bytes, alignment)) self.child.rawFree(bytes, alignment, ret_addr);
-        self.release(self.charge(bytes.len, alignment));
+        const bytes_charged = self.charge(bytes.len, alignment);
+        if (self.active) |accountant| if (DeferredFrees.keep(self.child, accountant, bytes, alignment, bytes_charged)) {
+            const previous = self.live_bytes.fetchSub(bytes_charged, .monotonic);
+            std.debug.assert(previous >= bytes_charged);
+            return;
+        };
+        self.child.rawFree(bytes, alignment, ret_addr);
+        self.release(bytes_charged);
     }
 };
 
 /// Splits a teardown's frees in two: the charge goes now, the memory later.
-/// While a thread collects, each tracked block it frees stops counting against
-/// its budget exactly as a direct free would, but the block joins this list
-/// instead of returning to the untracked child allocator. `release` returns
-/// the collected memory from any thread, so the slow part of a large free can
-/// run in the background without the budget depending on when it does.
-/// Untracked frees, and blocks too small to hold the list entry, are freed
-/// directly.
+/// While a thread collects, each block it frees through a `BudgetAllocator`
+/// with an accountant stops counting against that accountant's budget, as a
+/// direct free would, but is listed in one of `lane_count` lanes instead of
+/// returning to the child allocator. The accountant holds it as retired
+/// (`MemoryAccountant.retireAllocation`) until `release` or `releaseDetached`
+/// returns it, so the accountant, and the statement that owns it, outlive the
+/// memory however late that runs. The lists live outside the blocks, since
+/// writing into a block would fault in pages nothing ever touched. Untracked
+/// frees, and any the list cannot grow to hold, are freed directly.
 pub const DeferredFrees = struct {
-    head: ?*Block = null,
+    lanes: [MAX_LANES]Lane = [_]Lane{.{}} ** MAX_LANES,
+    lane_count: usize = 1,
 
-    /// Written over the start of each collected block.
-    const Block = struct {
-        next: ?*Block,
-        child: Allocator,
-        len: usize,
-        alignment: std.mem.Alignment,
+    pub const MAX_LANES = 16;
+
+    const Lane = struct {
+        chunks: ?*Chunk = null,
+        bytes: usize = 0,
     };
 
+    const Chunk = struct {
+        next: ?*Chunk,
+        len: usize = 0,
+        entries: [CHUNK_ENTRIES]Entry = undefined,
+
+        const CHUNK_ENTRIES = 256;
+    };
+
+    const Entry = struct {
+        memory: [*]u8,
+        len: usize,
+        alignment: std.mem.Alignment,
+        child: Allocator,
+        accountant: *MemoryAccountant,
+        charge: usize,
+    };
+
+    const list_allocator = std.heap.c_allocator;
+
     threadlocal var collecting: ?*DeferredFrees = null;
+
+    /// Collected blocks spread over `lanes` lanes by size, one per thread
+    /// that `releaseDetached` starts.
+    pub fn init(lanes: usize) DeferredFrees {
+        return .{ .lane_count = std.math.clamp(lanes, 1, MAX_LANES) };
+    }
 
     pub fn collect(self: *DeferredFrees) void {
         std.debug.assert(collecting == null);
@@ -141,25 +174,70 @@ pub const DeferredFrees = struct {
     }
 
     pub fn isEmpty(self: DeferredFrees) bool {
-        return self.head == null;
+        for (self.lanes[0..self.lane_count]) |lane| if (lane.chunks != null) return false;
+        return true;
     }
 
+    /// Returns the collected memory on this thread.
     pub fn release(self: DeferredFrees) void {
-        var next = self.head;
-        while (next) |block| {
-            const entry = block.*;
-            next = entry.next;
-            const memory: [*]u8 = @ptrCast(block);
-            entry.child.rawFree(memory[0..entry.len], entry.alignment, @returnAddress());
+        for (self.lanes[0..self.lane_count]) |lane| releaseLane(lane.chunks);
+    }
+
+    /// Returns each lane's memory on a thread of its own that nothing joins:
+    /// the accountants hold the bytes as retired until they are back.
+    pub fn releaseDetached(self: DeferredFrees) void {
+        for (self.lanes[0..self.lane_count]) |lane| {
+            const chunks = lane.chunks orelse continue;
+            if (std.Thread.spawn(.{}, releaseLane, .{chunks})) |thread| {
+                thread.detach();
+            } else |_| releaseLane(chunks);
         }
     }
 
-    fn keep(child: Allocator, memory: []u8, alignment: std.mem.Alignment) bool {
+    /// Hands each accountant its bytes back once per run of entries, after
+    /// the run's memory is freed.
+    fn releaseLane(first: ?*Chunk) void {
+        var next = first;
+        while (next) |chunk| {
+            next = chunk.next;
+            var run_accountant: ?*MemoryAccountant = null;
+            var run_bytes: usize = 0;
+            for (chunk.entries[0..chunk.len]) |entry| {
+                if (run_accountant != entry.accountant) {
+                    if (run_accountant) |accountant| accountant.finishRetired(run_bytes);
+                    run_accountant = entry.accountant;
+                    run_bytes = 0;
+                }
+                entry.child.rawFree(entry.memory[0..entry.len], entry.alignment, @returnAddress());
+                run_bytes += entry.charge;
+            }
+            if (run_accountant) |accountant| accountant.finishRetired(run_bytes);
+            list_allocator.destroy(chunk);
+        }
+    }
+
+    fn keep(child: Allocator, accountant: *MemoryAccountant, memory: []u8, alignment: std.mem.Alignment, charge: usize) bool {
         const self = collecting orelse return false;
-        if (memory.len < @sizeOf(Block) or !std.mem.isAligned(@intFromPtr(memory.ptr), @alignOf(Block))) return false;
-        const block: *Block = @ptrCast(@alignCast(memory.ptr));
-        block.* = .{ .next = self.head, .child = child, .len = memory.len, .alignment = alignment };
-        self.head = block;
+        const lane = self.lightestLane();
+        const chunk = if (lane.chunks) |chunk| if (chunk.len < Chunk.CHUNK_ENTRIES) chunk else null else null;
+        const open = chunk orelse blk: {
+            const fresh = list_allocator.create(Chunk) catch return false;
+            fresh.* = .{ .next = lane.chunks };
+            lane.chunks = fresh;
+            break :blk fresh;
+        };
+        accountant.retireAllocation(charge);
+        open.entries[open.len] = .{ .memory = memory.ptr, .len = memory.len, .alignment = alignment, .child = child, .accountant = accountant, .charge = charge };
+        open.len += 1;
+        lane.bytes += memory.len;
         return true;
+    }
+
+    fn lightestLane(self: *DeferredFrees) *Lane {
+        var lightest = &self.lanes[0];
+        for (self.lanes[1..self.lane_count]) |*lane| {
+            if (lane.bytes < lightest.bytes) lightest = lane;
+        }
+        return lightest;
     }
 };

@@ -2993,10 +2993,22 @@ fn heavyTeardownMain(task: *HeavyTeardownTask) void {
     allocator.destroy(task);
 }
 
-// Move the queue/recycle state onto a detached thread and zero it in `shared`
-// so the unwind path has nothing left to free. Any failure falls back to
-// freeing synchronously via the regular defer (returns false).
-fn scheduleHeavyTeardown(shared: *PipeShared) bool {
+// Take the queue/recycle state off the result path and zero it in `shared`
+// so the unwind path has nothing left to free. A tracked allocator frees it
+// here with the frees collected, so none of it counts against the budget once
+// this returns, and `lanes` detached threads return the memory. Otherwise
+// the whole teardown moves to a detached thread, and a failed spawn falls back
+// to freeing synchronously via the regular defer (returns false).
+fn scheduleHeavyTeardown(shared: *PipeShared, lanes: usize) bool {
+    if (thindb.exec.memory.accountantOf(shared.allocator) != null) {
+        var frees = thindb.exec.memory.DeferredFrees.init(lanes);
+        frees.collect();
+        deinitRawQueues(shared);
+        frees.stop();
+        frees.releaseDetached();
+        forgetRawQueues(shared);
+        return true;
+    }
     const task = shared.allocator.create(HeavyTeardownTask) catch return false;
     task.* = .{
         .allocator = shared.allocator,
@@ -3012,6 +3024,11 @@ fn scheduleHeavyTeardown(shared: *PipeShared) bool {
         return false;
     };
     thread.detach();
+    forgetRawQueues(shared);
+    return true;
+}
+
+fn forgetRawQueues(shared: *PipeShared) void {
     shared.raw_chunks = .empty;
     shared.raw_scan_queues = &.{};
     shared.raw_group_queues = &.{};
@@ -3019,7 +3036,56 @@ fn scheduleHeavyTeardown(shared: *PipeShared) bool {
     shared.raw_recycled_rows = .empty;
     shared.group_recycled_rows = .empty;
     shared.recycled_bytes = 0;
-    return true;
+}
+
+test "heavy teardown stops charging the query before its memory is back" {
+    const a = std.testing.allocator;
+    const memory = thindb.exec.memory;
+    var gate = @import("../util/statement_gate.zig").StatementGate.init(a, std.testing.io);
+    defer gate.deinit();
+    var pool = memory.MemoryPool.init(64 << 20);
+    const account = try a.create(memory.MemoryAccountant);
+    account.* = memory.MemoryAccountant.initWithPool(64 << 20, &pool);
+    account.trackAllocations(a);
+    try account.retainGate(&gate);
+    const allocator = try account.executionAllocator();
+    const layout: GroupRowsLayout = .{
+        .key_width = .u32,
+        .columns = &.{},
+        .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+        .has_weight = true,
+    };
+    var shared = PipeShared{
+        .allocator = allocator,
+        .buckets = &.{},
+        .bucket_count = 0,
+        .scan_threads = 4,
+        .group_rows_layout = layout,
+    };
+    shared.raw_scan_queues = try allocator.alloc(RawQueue, 4);
+    for (shared.raw_scan_queues) |*queue| queue.* = .{};
+    shared.raw_group_queues = try allocator.alloc(GroupQueue, 4);
+    for (shared.raw_group_queues) |*queue| queue.* = .{};
+    shared.stage_builders = try allocator.alloc(StageBucketBuilder, 4);
+    for (shared.stage_builders) |*builder| builder.* = .{};
+    for (0..32) |i| {
+        const chunk = try shared.raw_chunks.addOne(allocator);
+        chunk.* = .{ .rows = .{}, .owner_worker = i % 4 };
+        try chunk.rows.resize(allocator, layout, 4096);
+    }
+    for (0..8) |_| {
+        const rows = try shared.raw_recycled_rows.addOne(allocator);
+        rows.* = .{};
+        try rows.resize(allocator, layout, 4096);
+    }
+
+    try std.testing.expect(scheduleHeavyTeardown(&shared, 4));
+    const charged_on_return = account.current_bytes;
+    account.releaseOwner(a);
+    gate.beginClose();
+    try std.testing.expectEqual(@as(usize, 0), charged_on_return);
+    try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+    try std.testing.expectEqual(@as(usize, 0), shared.raw_chunks.items.len);
 }
 
 fn lockSpin(mutex: *std.atomic.Mutex) void {
@@ -6462,10 +6528,12 @@ pub const RunConfig = struct {
     // table's shared ddl_lock and keeps both until it has resolved the rowrefs
     // the run returns, which index this snapshot's segments and memtable.
     snapshot: Scan.Snapshot,
-    // Free the staging-chunk pools (gigabytes of recycled RawRows slabs) on a
-    // detached thread after the result is built, instead of on the wire path.
-    // Requires `allocator` to be thread-safe and to outlive the query — the
-    // engine sets this only for the fresh-workspace path (never the arena).
+    // Free the staging-chunk pools (gigabytes of recycled RawRows slabs) on
+    // detached threads after the result is built, instead of on the wire path.
+    // Requires `allocator` to be thread-safe. A tracked one stops charging the
+    // query before the run returns and keeps its accountant alive until the
+    // memory is back; an untracked one must outlive the query. The engine sets
+    // this only for the fresh-workspace path (never the arena).
     defer_heavy_teardown: bool = false,
     // String group-key columns the worker scans emit as key digests
     // (`Batch.hashed`) instead of materialized strings — hashed-key shapes
@@ -7149,7 +7217,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         );
     }
     pre_return_ticks = platform.nowTicks();
-    if (cfg.defer_heavy_teardown) heavy_teardown_scheduled = scheduleHeavyTeardown(&shared);
+    if (cfg.defer_heavy_teardown) heavy_teardown_scheduled = scheduleHeavyTeardown(&shared, n_workers);
 
     if (PROFILING and !cfg.quiet and cfg.no_profile) {
         std.debug.print(

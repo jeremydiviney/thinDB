@@ -1298,6 +1298,7 @@ test {
     _ = @import("zonemap_topn_test.zig");
     _ = @import("group_table.zig");
     _ = silo_group_core;
+    _ = v2_group_topn_engine;
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");
     _ = @import("concurrent_int_table.zig");
