@@ -218,8 +218,8 @@ test "createOverStage: parallel buffer scan preserves the row multiset" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.data.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
@@ -289,8 +289,8 @@ test "createOverStageOrdered: emission is the stage's exact row order" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.data.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
@@ -417,8 +417,8 @@ test "createOverStage: row-striped units keep every row and its validity bit" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.v.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
@@ -513,8 +513,8 @@ test "createOverStage + fused partial aggregate drains without corruption" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.kdata.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
