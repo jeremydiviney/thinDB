@@ -22,12 +22,24 @@
 //                      in a database of their own;
 //   --view-readers N   expand those views and functions from other
 //                      connections meanwhile.
+// And on many connections racing over one table's catalog entry, memtable
+// and segment handles, as a test runner's parallel slices do:
+//   --slices N  databases, each worked by a pool of connections at once;
+//   --pool M    connections per slice (default 16). Every one mixes point and
+//               INSERT ... SELECT writes, UPDATE, DELETE, CTAS, ALTER,
+//               TRUNCATE, DROP / CREATE and reads over the slice's shared
+//               tables. Every write keeps invariants a reader checks in one
+//               statement: ledger rows come in pairs summing to zero, keyed
+//               rows have unique keys, and every row's chk matches the rest
+//               of the row.
 // A killed write must leave all-or-nothing state: the client checks that on
 // a connection nobody kills, then starts its next cycle.
 //
 //   bun run bench/mysql/stress_ddl.ts --port 3307 --clients 6 --seconds 600
 //   bun run bench/mysql/stress_ddl.ts --port 3307 --pg-port 5433 --clients 6 \
 //     --killers 1 --readers 2 --pg-clients 2 --seconds 900
+//   bun run bench/mysql/stress_ddl.ts --port 3307 --clients 0 --slices 6 \
+//     --pool 16 --killers 1 --drop-writes 0.1 --seconds 1800
 
 import mysql, { type Connection } from "mysql2/promise";
 import net from "node:net";
@@ -51,6 +63,8 @@ const { values: args } = parseArgs({
     "view-churners": { type: "string", default: "0" },
     "view-readers": { type: "string", default: "0" },
     "drop-writes": { type: "string", default: "0" },
+    slices: { type: "string", default: "0" },
+    pool: { type: "string", default: "16" },
   },
 });
 
@@ -68,10 +82,21 @@ const dropWriteShare = Number(args["drop-writes"]);
 // insert, the doublings and their periodic counts, and the fixed tail.
 const stepsPerCycle = 19 + doublings + Math.ceil(doublings / 5);
 
+const sliceCount = Number(args.slices);
+const poolSize = Number(args.pool);
+
 class InvariantError extends Error {}
 class StallError extends Error {}
 // A kill aimed at this client ended its cycle; the next cycle starts over.
-class KilledError extends Error {}
+// `lost` = the connection is gone, not just its statement.
+class KilledError extends Error {
+  constructor(
+    message: string,
+    readonly lost: boolean,
+  ) {
+    super(message);
+  }
+}
 
 // A statement slower than this is reported as a stall: at these sizes every
 // step takes seconds, so minutes means the server is wedged.
@@ -106,6 +131,8 @@ const stats = {
   viewDdl: 0,
   viewReads: 0,
   expectedViewErrors: 0,
+  pool: { reads: 0, writes: 0, ddl: 0, doublings: 0, killed: 0, reconnects: 0, databaseDrops: 0, maxLedger: 0 },
+  expectedPoolErrors: new Map<string, number>(),
   tornReads: [] as string[],
   refusedConnects: 0,
   sqlErrors: new Map<string, number>(),
@@ -320,7 +347,7 @@ async function step(session: Session, sql: string, verify?: (conn: Connection) =
         await checker.end().catch(() => checker.destroy());
       }
     }
-    throw new KilledError(`${session.role}: ${sql.slice(0, 80)}`);
+    throw new KilledError(`${session.role}: ${sql.slice(0, 80)}`, lost);
   }
 }
 
@@ -338,9 +365,9 @@ async function expectCount(session: Session, table: string, expected: number, wh
 
 // Open a side connection, start a heavy query and drop the socket while it
 // runs: the server's disconnect path races the in-flight statement.
-async function abandonQuery(database: string): Promise<void> {
+async function abandonQuery(database: string, sql = HEAVY_JOIN): Promise<void> {
   const side = await connect(database);
-  const pending = side.query(HEAVY_JOIN).catch(() => undefined);
+  const pending = side.query(sql).catch(() => undefined);
   await Bun.sleep(Math.floor(random() * 50));
   side.destroy();
   // mysql2 may never settle a query whose socket was destroyed under it.
@@ -965,6 +992,353 @@ async function pgClient(id: number): Promise<void> {
   }
 }
 
+// Statements a pool connection runs before it rolls whether to drop its
+// socket under one of the next batch, as a client's cycle does.
+const POOL_ROUND = 20;
+// Concurrent doublings copy each other's rows, so the table is only doubled
+// below the cap, by a few connections at a time, and halved past the trim.
+const LEDGER_CAP = 262_144;
+const LEDGER_TRIM = 1_500_000;
+const MAX_DOUBLERS = 3;
+const SIDE_SLOTS = 4;
+const LEDGER_DDL = "CREATE TABLE IF NOT EXISTS ledger (pair BIGINT NOT NULL, amount BIGINT NOT NULL, chk BIGINT NOT NULL, note VARCHAR(8) NOT NULL)";
+const KEYED_DDL = "CREATE TABLE IF NOT EXISTS keyed (k BIGINT NOT NULL, v BIGINT NOT NULL, chk BIGINT NOT NULL, PRIMARY KEY (k))";
+const doublers = new Array<number>(sliceCount).fill(0);
+
+function poolDatabase(slice: number): string {
+  return `stress_p${slice}`;
+}
+
+// What the slice's other connections cause: a table, column or database one
+// of them just dropped, recreated or altered.
+const POOL_EXPECTED_ERRNOS = new Set([1146, 1049, 1046, 1050, 1054, 1007]);
+
+function isExpectedPoolError(err: unknown): boolean {
+  if (err instanceof InvariantError || err instanceof KilledError || err instanceof StallError) return false;
+  return POOL_EXPECTED_ERRNOS.has(errorFields(err).errno);
+}
+
+function notePoolError(err: unknown): void {
+  const { errno, message } = errorFields(err);
+  const key = `${errno} ${message.slice(0, 80)}`;
+  stats.expectedPoolErrors.set(key, (stats.expectedPoolErrors.get(key) ?? 0) + 1);
+}
+
+function ledgerCheck(table: string): string {
+  return `SELECT SUM(amount) AS total, COUNT(*) AS n, SUM(CASE WHEN chk = pair * 31 + amount THEN 0 ELSE 1 END) AS bad FROM ${table}`;
+}
+
+function keyedCheck(table: string): string {
+  return `SELECT COUNT(*) AS n, COUNT(DISTINCT k) AS keys, SUM(CASE WHEN chk = k * 7 + v THEN 0 ELSE 1 END) AS bad FROM ${table}`;
+}
+
+function assertLedger(rows: any[], table: string): void {
+  const row = rows[0] ?? {};
+  const total = Number(row.total ?? 0);
+  const n = Number(row.n ?? 0);
+  const bad = Number(row.bad ?? 0);
+  if (table === "ledger") stats.pool.maxLedger = Math.max(stats.pool.maxLedger, n);
+  if (total !== 0 || n % 2 !== 0 || bad !== 0) {
+    throw new InvariantError(`${table} has ${n} rows summing to ${total} with ${bad} bad checksums; pairs must sum to 0 and every chk match`);
+  }
+}
+
+function assertKeyed(rows: any[], table: string): void {
+  const row = rows[0] ?? {};
+  const n = Number(row.n ?? 0);
+  const keys = Number(row.keys ?? 0);
+  const bad = Number(row.bad ?? 0);
+  if (n !== keys || bad !== 0) throw new InvariantError(`${table} has ${n} rows over ${keys} keys with ${bad} bad checksums`);
+}
+
+function assertLedgerRows(rows: any[]): void {
+  for (const row of rows) {
+    if (Number(row.chk) !== Number(row.pair) * 31 + Number(row.amount)) throw new InvariantError(`ledger row ${JSON.stringify(row)} fails its checksum`);
+  }
+}
+
+function assertKeyedRows(rows: any[]): void {
+  if (rows.length > 1) throw new InvariantError(`keyed holds ${rows.length} rows for key ${rows[0].k}`);
+  for (const row of rows) {
+    if (Number(row.chk) !== Number(row.k) * 7 + Number(row.v)) throw new InvariantError(`keyed row ${JSON.stringify(row)} fails its checksum`);
+  }
+}
+
+// After a kill, on a connection nobody kills; another connection may have
+// dropped the table meanwhile.
+function verifyLedger(table: string): (conn: Connection) => Promise<void> {
+  return async (conn) => {
+    try {
+      assertLedger(await run(conn, ledgerCheck(table)), table);
+    } catch (err) {
+      if (!isExpectedPoolError(err)) throw err;
+    }
+  };
+}
+
+function verifyKeyed(table: string): (conn: Connection) => Promise<void> {
+  return async (conn) => {
+    try {
+      assertKeyed(await run(conn, keyedCheck(table)), table);
+    } catch (err) {
+      if (!isExpectedPoolError(err)) throw err;
+    }
+  };
+}
+
+async function ensureSlice(slice: number): Promise<void> {
+  const admin = await connect();
+  try {
+    await run(admin, `CREATE DATABASE IF NOT EXISTS ${poolDatabase(slice)}`);
+    await run(admin, `USE ${poolDatabase(slice)}__public`);
+    await run(admin, LEDGER_DDL);
+    await run(admin, KEYED_DDL);
+  } finally {
+    await admin.end().catch(() => admin.destroy());
+  }
+}
+
+const pairId = () => Math.floor(random() * 1_000_000);
+const keyId = () => Math.floor(random() * 100_000);
+const sideSlot = () => Math.floor(random() * SIDE_SLOTS);
+
+async function insertPairs(s: Session): Promise<void> {
+  const values: string[] = [];
+  for (let i = 1 + Math.floor(random() * 8); i > 0; i--) {
+    const pair = pairId();
+    const amount = 1 + Math.floor(random() * 1000);
+    values.push(`(${pair}, ${amount}, ${pair * 31 + amount}, 'i')`, `(${pair}, ${-amount}, ${pair * 31 - amount}, 'i')`);
+  }
+  await step(s, `INSERT INTO ledger (pair, amount, chk, note) VALUES ${values.join(", ")}`, verifyLedger("ledger"));
+}
+
+async function doubleLedger(s: Session, slice: number): Promise<void> {
+  if (doublers[slice] >= MAX_DOUBLERS) return insertPairs(s);
+  doublers[slice]++;
+  try {
+    const rows = await scalar(s, "SELECT COUNT(*) FROM ledger");
+    if (rows > LEDGER_TRIM) {
+      await step(s, `DELETE FROM ledger WHERE pair % 2 = ${Math.floor(random() * 2)}`, verifyLedger("ledger"));
+      return;
+    }
+    if (rows >= LEDGER_CAP) return;
+    const shift = 1_000_000 * (1 + Math.floor(random() * 1_000_000));
+    await step(s, `INSERT INTO ledger (pair, amount, chk, note) SELECT pair + ${shift}, amount, (pair + ${shift}) * 31 + amount, 'd' FROM ledger`, verifyLedger("ledger"));
+    stats.pool.doublings++;
+  } finally {
+    doublers[slice]--;
+  }
+}
+
+async function updateLedger(s: Session): Promise<void> {
+  const where = random() < 0.6 ? `pair = ${pairId()}` : `pair % 97 = ${Math.floor(random() * 97)}`;
+  // `chk = 62 * pair - chk` reads no column this statement assigns, so it
+  // holds whichever order the assignments are evaluated in.
+  await step(s, `UPDATE ledger SET amount = -amount, chk = 62 * pair - chk, note = 'u' WHERE ${where}`, verifyLedger("ledger"));
+}
+
+async function deleteLedger(s: Session): Promise<void> {
+  const where = random() < 0.6 ? `pair = ${pairId()}` : `pair % 211 = ${Math.floor(random() * 211)}`;
+  await step(s, `DELETE FROM ledger WHERE ${where}`, verifyLedger("ledger"));
+}
+
+async function insertKeyed(s: Session): Promise<void> {
+  const values: string[] = [];
+  for (let i = 1 + Math.floor(random() * 4); i > 0; i--) {
+    const k = keyId();
+    const v = Math.floor(random() * 1000);
+    values.push(`(${k}, ${v}, ${k * 7 + v})`);
+  }
+  await step(s, `INSERT INTO keyed (k, v, chk) VALUES ${values.join(", ")}`, verifyKeyed("keyed"));
+}
+
+async function copyKeyed(s: Session): Promise<void> {
+  const shift = 100_000 * (1 + Math.floor(random() * 1000));
+  await step(s, `INSERT INTO keyed (k, v, chk) SELECT k + ${shift}, v, (k + ${shift}) * 7 + v FROM keyed WHERE k < 100000`, verifyKeyed("keyed"));
+}
+
+async function ctasCopy(s: Session): Promise<void> {
+  const table = `copy_${sideSlot()}`;
+  await step(s, `DROP TABLE IF EXISTS ${table}`);
+  await step(s, `CREATE TABLE ${table} AS SELECT pair, amount, chk, note FROM ledger`, verifyLedger(table));
+}
+
+async function ctasSide(s: Session): Promise<void> {
+  const table = `side_${sideSlot()}`;
+  await step(s, `DROP TABLE IF EXISTS ${table}`);
+  await step(s, `CREATE TABLE ${table} AS SELECT k, v, chk FROM keyed`, verifyKeyed(table));
+}
+
+async function alterExtra(s: Session): Promise<void> {
+  const table = random() < 0.7 ? "ledger" : "keyed";
+  const verify = table === "ledger" ? verifyLedger(table) : verifyKeyed(table);
+  const change = random() < 0.5 ? "ADD COLUMN extra INT NULL" : "DROP COLUMN extra";
+  try {
+    await step(s, `ALTER TABLE ${table} ${change}`, verify);
+  } catch (err) {
+    // The column is already there, or already gone: another connection's ALTER got in first.
+    if (errorFields(err).errno !== 1064 || !/column|exist/i.test(errorFields(err).message)) throw err;
+    notePoolError(err);
+  }
+}
+
+async function truncateShared(s: Session): Promise<void> {
+  const roll = random();
+  const table = roll < 0.2 ? "ledger" : roll < 0.4 ? "keyed" : roll < 0.7 ? `copy_${sideSlot()}` : `side_${sideSlot()}`;
+  await step(s, `TRUNCATE TABLE ${table}`);
+}
+
+async function recreateShared(s: Session): Promise<void> {
+  if (random() < 0.5) {
+    await step(s, "DROP TABLE IF EXISTS ledger");
+    await step(s, LEDGER_DDL);
+  } else {
+    await step(s, "DROP TABLE IF EXISTS keyed");
+    await step(s, KEYED_DDL);
+  }
+}
+
+async function dropSlice(_s: Session, slice: number): Promise<void> {
+  const admin = await connect();
+  try {
+    await run(admin, `DROP DATABASE IF EXISTS ${poolDatabase(slice)}`);
+    stats.pool.databaseDrops++;
+  } finally {
+    await admin.end().catch(() => admin.destroy());
+  }
+  await ensureSlice(slice);
+}
+
+type PoolAction = { weight: number; kind: "reads" | "writes" | "ddl"; run: (s: Session, slice: number) => Promise<void> };
+
+const POOL_ACTIONS: PoolAction[] = [
+  { weight: 8, kind: "reads", run: async (s) => assertLedger(await step(s, ledgerCheck("ledger")), "ledger") },
+  { weight: 4, kind: "reads", run: async (s) => assertKeyed(await step(s, keyedCheck("keyed")), "keyed") },
+  {
+    weight: 2,
+    kind: "reads",
+    run: async (s) => {
+      const table = `copy_${sideSlot()}`;
+      assertLedger(await step(s, ledgerCheck(table)), table);
+    },
+  },
+  {
+    weight: 2,
+    kind: "reads",
+    run: async (s) => {
+      const table = `side_${sideSlot()}`;
+      assertKeyed(await step(s, keyedCheck(table)), table);
+    },
+  },
+  { weight: 5, kind: "reads", run: async (s) => assertLedgerRows(await step(s, `SELECT pair, amount, chk FROM ledger WHERE pair = ${pairId()}`)) },
+  { weight: 4, kind: "reads", run: async (s) => assertKeyedRows(await step(s, `SELECT k, v, chk FROM keyed WHERE k = ${keyId()}`)) },
+  { weight: 4, kind: "reads", run: async (s) => void (await step(s, "SELECT note, COUNT(*), SUM(amount) FROM ledger GROUP BY note ORDER BY note")) },
+  { weight: 3, kind: "reads", run: async (s) => void (await step(s, "SELECT COUNT(*) FROM ledger a JOIN keyed b ON a.pair = b.k")) },
+  { weight: 2, kind: "reads", run: async (s) => void (await step(s, "SELECT MAX(extra), COUNT(*) FROM ledger")) },
+  { weight: 2, kind: "reads", run: async (s) => void (await step(s, "SHOW TABLES")) },
+  { weight: 12, kind: "writes", run: insertPairs },
+  { weight: 8, kind: "writes", run: doubleLedger },
+  { weight: 5, kind: "writes", run: updateLedger },
+  { weight: 5, kind: "writes", run: deleteLedger },
+  { weight: 6, kind: "writes", run: insertKeyed },
+  {
+    weight: 3,
+    kind: "writes",
+    run: async (s) => void (await step(s, `UPDATE keyed SET v = v + 1, chk = chk + 1 WHERE k = ${keyId()}`, verifyKeyed("keyed"))),
+  },
+  { weight: 2, kind: "writes", run: async (s) => void (await step(s, `DELETE FROM keyed WHERE k % 50 = ${Math.floor(random() * 50)}`, verifyKeyed("keyed"))) },
+  { weight: 2, kind: "writes", run: copyKeyed },
+  {
+    weight: 1,
+    kind: "writes",
+    run: async (s) => {
+      await abandonQuery(s.database!, "SELECT COUNT(*) FROM ledger a JOIN ledger b ON a.pair = b.pair");
+    },
+  },
+  { weight: 2, kind: "ddl", run: ctasCopy },
+  { weight: 1, kind: "ddl", run: ctasSide },
+  { weight: 2, kind: "ddl", run: async (s) => void (await step(s, `DROP TABLE IF EXISTS ${random() < 0.5 ? "copy" : "side"}_${sideSlot()}`)) },
+  { weight: 0.5, kind: "ddl", run: async (s) => void (await step(s, `RENAME TABLE copy_${sideSlot()} TO copy_${sideSlot()}`)) },
+  { weight: 0.6, kind: "ddl", run: alterExtra },
+  { weight: 1, kind: "ddl", run: truncateShared },
+  { weight: 0.2, kind: "ddl", run: recreateShared },
+  { weight: 0.01, kind: "ddl", run: dropSlice },
+];
+const POOL_WEIGHT = POOL_ACTIONS.reduce((sum, action) => sum + action.weight, 0);
+
+function pickPoolAction(): PoolAction {
+  let roll = random() * POOL_WEIGHT;
+  for (const action of POOL_ACTIONS) {
+    roll -= action.weight;
+    if (roll < 0) return action;
+  }
+  return POOL_ACTIONS[0];
+}
+
+// One pooled connection of a slice: it keeps its connection across
+// statements and reconnects only when a kill or a dropped socket took it.
+async function poolWorker(slice: number, worker: number): Promise<void> {
+  const who = `pool s${slice}w${worker}`;
+  let session: Session | undefined;
+  while (Date.now() < deadline && !stats.serverDown) {
+    try {
+      if (!session) {
+        session = await open(who, `${poolDatabase(slice)}__public`);
+        stats.pool.reconnects++;
+      }
+      if (random() < dropWriteShare) session.dropAt = session.steps + Math.floor(random() * POOL_ROUND);
+      for (let i = 0; i < POOL_ROUND && Date.now() < deadline; i++) {
+        const action = pickPoolAction();
+        try {
+          await action.run(session, slice);
+          stats.pool[action.kind]++;
+        } catch (err) {
+          if (err instanceof KilledError) {
+            stats.pool.killed++;
+            if (!err.lost) continue;
+            await close(session);
+            session = undefined;
+            break;
+          }
+          if (!isExpectedPoolError(err)) throw err;
+          notePoolError(err);
+          const { errno } = errorFields(err);
+          if (errno === 1049 || errno === 1046) {
+            await ensureSlice(slice);
+            await close(session);
+            session = undefined;
+            break;
+          }
+          if (errno === 1146) {
+            await step(session, LEDGER_DDL);
+            await step(session, KEYED_DDL);
+          }
+        }
+      }
+    } catch (err) {
+      if (session) {
+        await close(session);
+        session = undefined;
+      }
+      if (err instanceof KilledError) {
+        stats.pool.killed++;
+        continue;
+      }
+      if (isExpectedPoolError(err)) {
+        notePoolError(err);
+        continue;
+      }
+      if (!(await recordError(who, err))) return;
+    }
+  }
+  if (session) await close(session);
+}
+
+async function poolSlice(slice: number): Promise<void> {
+  await ensureSlice(slice);
+  await Promise.all(Array.from({ length: poolSize }, (_, worker) => poolWorker(slice, worker)));
+}
+
 const started = Date.now();
 const progress = setInterval(() => {
   const errors = [...stats.sqlErrors.values()].reduce((a, b) => a + b, 0);
@@ -972,7 +1346,7 @@ const progress = setInterval(() => {
   console.error(
     `[${Math.round((Date.now() - started) / 1000)}s] cycles=${stats.cycles} killedCycles=${stats.killedCycles} statements=${stats.statements} abandoned=${stats.abandoned} droppedWrites=${stats.droppedWrites} ` +
       `kills=${k.query}q/${k.connection}c/${k.pgCancel}pc/${k.pgTerminate}pt/${k.cancelRequest}cr readerQueries=${stats.readerQueries} pgQueries=${stats.pgQueries} ` +
-      `viewDdl=${stats.viewDdl} viewReads=${stats.viewReads} errors=${errors}`,
+      `viewDdl=${stats.viewDdl} viewReads=${stats.viewReads} pool=${stats.pool.reads}r/${stats.pool.writes}w/${stats.pool.ddl}d ledger<=${stats.pool.maxLedger} errors=${errors}`,
   );
 }, 30_000);
 const count = (value: string | undefined) => Number(value ?? "0");
@@ -983,6 +1357,7 @@ await Promise.all([
   ...Array.from({ length: pgClientCount }, (_, i) => pgClient(i)),
   ...Array.from({ length: viewChurnerCount }, (_, i) => viewChurner(i)),
   ...Array.from({ length: viewReaderCount }, (_, i) => viewReader(i)),
+  ...Array.from({ length: sliceCount }, (_, i) => poolSlice(i)),
 ]);
 clearInterval(progress);
 
@@ -1010,6 +1385,9 @@ const summary = {
   viewDdl: stats.viewDdl,
   viewReads: stats.viewReads,
   expectedViewErrors: stats.expectedViewErrors,
+  slices: sliceCount,
+  pool: sliceCount > 0 ? { size: poolSize, ...stats.pool } : undefined,
+  expectedPoolErrors: Object.fromEntries(stats.expectedPoolErrors),
   tornReads: stats.tornReads.length,
   tornReadSamples: stats.tornReads.slice(0, 5),
   refusedConnects: stats.refusedConnects,
