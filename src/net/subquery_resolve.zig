@@ -3955,7 +3955,13 @@ fn hoistOuterAggregates(ctx: *CompileCtx, select: *ir.Op) !void {
     }
     if (!opsReadSubquery(eligible, grouped)) return;
 
-    var hoist: OuterAggregates = .{ .ctx = ctx, .scope = try ScopeBuilder.build(ctx, try splitBlock(ctx, input), true) };
+    const input_block = try splitBlock(ctx, input);
+    var hoist: OuterAggregates = .{
+        .ctx = ctx,
+        .scope = try ScopeBuilder.build(ctx, input_block, true),
+        .input_ops = input_block.chain,
+        .existing = if (grouped) cur.group_by.aggs else &.{},
+    };
     for (eligible) |o| switch (o.*) {
         .compute => |*c| {
             var derived: ?[]ir.Derived = null;
@@ -3970,6 +3976,12 @@ fn hoistOuterAggregates(ctx: *CompileCtx, select: *ir.Op) !void {
         },
         else => {},
     };
+    if (hoist.copies.items.len > 0) {
+        // The copies take fresh names: a subquery reading the enclosing
+        // aggregate's own name could bind it to one of its own columns.
+        const copies = try newOp(ctx, .{ .compute = .{ .derived = hoist.copies.items, .upstream = cur } });
+        relink(if (path.items.len > 0) path.items[path.items.len - 1] else select, copies);
+    }
     if (hoist.aggs.items.len == 0) return;
     var rows = input;
     if (hoist.args.items.len > 0) rows = try newOp(ctx, .{ .compute = .{ .derived = hoist.args.items, .upstream = rows } });
@@ -4017,10 +4029,25 @@ const OuterAggregates = struct {
     ctx: *CompileCtx,
     /// What the enclosing grouping's input binds.
     scope: Scope,
+    /// The enclosing grouping's input from the top down to its FROM.
+    input_ops: []const *const ir.Op,
+    /// The aggregates the enclosing grouping already computes.
+    existing: []const ir.AggSpec,
     /// The aggregates the enclosing grouping takes on, and the arguments
     /// they compute over its input.
     aggs: std.ArrayList(ir.AggSpec) = .empty,
     args: std.ArrayList(ir.Derived) = .empty,
+    /// A moved aggregate equal to one of `existing`, read under a fresh
+    /// name above the grouping.
+    copies: std.ArrayList(ir.Derived) = .empty,
+    /// The calls of `existing` and of `aggs`, as `ir.sameAggCall` compares
+    /// them.
+    existing_calls: ?[]const ir.AggCall = null,
+    calls: std.ArrayList(ir.AggCall) = .empty,
+    /// Each unambiguous unqualified column of the enclosing input, renamed
+    /// to its relation's qualified spelling, so that `v` and `x.v` compare
+    /// equal.
+    qualified: ?[]const Rename = null,
 
     const Rename = exec.predicate.ColRename;
 
@@ -4143,6 +4170,20 @@ const OuterAggregates = struct {
                 try kept.append(na, a);
                 continue;
             }
+            const call = try self.callOf(a, below);
+            if (try self.repeatOf(call)) |repeat| {
+                const to = switch (repeat) {
+                    .existing => |e| self.existing[e],
+                    .moved => |m| self.aggs.items[m],
+                };
+                try self.movedTo(a, to, below, &moved);
+                const name = switch (repeat) {
+                    .existing => |e| try self.copyOf(e),
+                    .moved => to.as,
+                };
+                try renames.append(na, .{ .from = a.as, .to = name });
+                continue;
+            }
             var spec = a;
             spec.as = try self.fresh("__oagg");
             if (a.col) |col| spec.col = try self.movedArg(col, below, &moved);
@@ -4151,6 +4192,7 @@ const OuterAggregates = struct {
             for (udf_args) |*col| col.* = try self.movedArg(col.*, below, &moved);
             spec.udf_arg_cols = udf_args;
             try self.aggs.append(na, spec);
+            try self.calls.append(na, call);
             try renames.append(na, .{ .from = a.as, .to = spec.as });
         }
 
@@ -4271,12 +4313,112 @@ const OuterAggregates = struct {
         return name;
     }
 
+    const Repeat = union(enum) {
+        /// An index into `existing`.
+        existing: usize,
+        /// An index into `aggs`.
+        moved: usize,
+    };
+
+    /// The aggregate the enclosing grouping already computes, or takes on
+    /// from an earlier subquery, that equals `call`.
+    fn repeatOf(self: *OuterAggregates, call: ir.AggCall) !?Repeat {
+        if (!ir.aggCallRepeatable(call, self.ctx.udf_registry)) return null;
+        for (try self.existingCalls(), 0..) |existing, e| if (ir.sameAggCall(existing, call)) return .{ .existing = e };
+        for (self.calls.items, 0..) |moved, m| if (ir.sameAggCall(moved, call)) return .{ .moved = m };
+        return null;
+    }
+
+    fn existingCalls(self: *OuterAggregates) ![]const ir.AggCall {
+        if (self.existing_calls) |calls| return calls;
+        const calls = try self.ctx.nodeArena().alloc(ir.AggCall, self.existing.len);
+        for (self.existing, calls) |a, *call| call.* = try self.callOf(a, &.{});
+        self.existing_calls = calls;
+        return calls;
+    }
+
+    /// `a`'s call over the enclosing grouping's input: each argument as the
+    /// expression it reads there, a column computed below the subquery's
+    /// grouping or in that input as its expression.
+    fn callOf(self: *OuterAggregates, a: ir.AggSpec, below: []const *const ir.Op) !ir.AggCall {
+        const args = try self.ctx.nodeArena().alloc(?ir.Expr, 2 + a.udf_arg_cols.len);
+        args[0] = try self.argExpr(a.col, below);
+        args[1] = try self.argExpr(a.arg2_col, below);
+        for (a.udf_arg_cols, args[2..]) |col, *arg| arg.* = try self.argExpr(col, below);
+        return .{ .func = a.func, .udf_name = a.udf_name, .params = a.params, .args = args };
+    }
+
+    fn argExpr(self: *OuterAggregates, col: ?[]const u8, below: []const *const ir.Op) !?ir.Expr {
+        const name = col orelse return null;
+        const computed = computedBelow(below, name) orelse computedBelow(self.input_ops, name);
+        const e: ir.Expr = if (computed) |d| d.expr else .{ .col_ref = name };
+        return try exec.expr_mod.deepCloneRenamed(self.ctx.nodeArena(), e, try self.qualifiedNames());
+    }
+
+    /// See `qualified`. A relation whose columns are unknown could bind any
+    /// unqualified name, so then none is renamed.
+    fn qualifiedNames(self: *OuterAggregates) ![]const Rename {
+        if (self.qualified) |renames| return renames;
+        const na = self.ctx.nodeArena();
+        var renames: std.ArrayList(Rename) = .empty;
+        const ranges = self.scope.ranges;
+        const known = for (ranges) |r| {
+            if (r.columns == null) break false;
+        } else true;
+        if (known) for (ranges) |r| {
+            const relation = r.name orelse continue;
+            for (r.columns.?) |c| {
+                const col = types.unqualifiedName(c);
+                if (listed(self.scope.derived, col) or rangesWithColumn(ranges, col) > 1) continue;
+                try renames.append(na, .{ .from = col, .to = try std.fmt.allocPrint(na, "{s}.{s}", .{ relation, col }) });
+            }
+        };
+        self.qualified = renames.items;
+        return renames.items;
+    }
+
+    /// Records each argument of `a` computed below the subquery's grouping
+    /// as moved to the argument of `to`, the equal aggregate `a` reads in
+    /// its place, so the subquery stops computing it.
+    fn movedTo(self: *OuterAggregates, a: ir.AggSpec, to: ir.AggSpec, below: []const *const ir.Op, moved: *std.ArrayList(Rename)) !void {
+        try self.movedArgTo(a.col, to.col, below, moved);
+        try self.movedArgTo(a.arg2_col, to.arg2_col, below, moved);
+        for (a.udf_arg_cols, to.udf_arg_cols) |col, to_col| try self.movedArgTo(col, to_col, below, moved);
+    }
+
+    fn movedArgTo(self: *OuterAggregates, col: ?[]const u8, to: ?[]const u8, below: []const *const ir.Op, moved: *std.ArrayList(Rename)) !void {
+        const d = computedBelow(below, col orelse return) orelse return;
+        if (renamedBy(moved.items, d.name)) return;
+        // Equal calls have their arguments in the same places.
+        try moved.append(self.ctx.nodeArena(), .{ .from = d.name, .to = to.? });
+    }
+
+    /// The fresh name a moved aggregate reads `existing[e]` by.
+    fn copyOf(self: *OuterAggregates, e: usize) ![]const u8 {
+        const as = self.existing[e].as;
+        for (self.copies.items) |d| if (std.mem.eql(u8, d.expr.col_ref, as)) return d.name;
+        const name = try self.fresh("__oagg");
+        try self.copies.append(self.ctx.nodeArena(), .{ .name = name, .expr = .{ .col_ref = as } });
+        return name;
+    }
+
     fn fresh(self: *OuterAggregates, prefix: []const u8) ![]const u8 {
         const name = try std.fmt.allocPrint(self.ctx.nodeArena(), "{s}{d}", .{ prefix, self.ctx.lowered_scalars });
         self.ctx.lowered_scalars += 1;
         return name;
     }
 };
+
+fn rangesWithColumn(ranges: []const Range, col: []const u8) usize {
+    var n: usize = 0;
+    for (ranges) |r| {
+        for (r.columns orelse continue) |c| if (types.columnNameEql(types.unqualifiedName(c), col)) {
+            n += 1;
+            break;
+        };
+    }
+    return n;
+}
 
 fn computedBelow(below: []const *const ir.Op, name: []const u8) ?ir.Derived {
     for (below) |op| if (op.* == .compute) {

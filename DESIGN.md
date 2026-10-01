@@ -446,6 +446,26 @@ its own state per group. On the 100M-row ClickBench table (6.2M groups) the
 pair above raised the statement's accounted peak from 10.0 GB to 13.9 GB
 (#466).
 
+A subquery's aggregate over only enclosing columns (`(SELECT SUM(x.v) FROM y
+...)`) moves into the enclosing grouping during subquery resolution, after
+parsing. That is the step where names bind, so it is where the call is known to
+be the enclosing query's. The move applies the same rule, through the shared
+`ir.sameAggCall` and `ir.aggCallRepeatable`, to the grouping's own aggregates
+and to those moved from earlier subqueries. An equal call reads the existing
+one instead of adding its own:
+
+- **Argument comparison:** an argument is compared as the expression it reads
+  over the grouping's input. A column computed below either grouping counts as
+  its expression.
+- **Column spelling:** an unambiguous unqualified column is spelled with its
+  relation's qualifier, so `SUM(v)` in the enclosing query equals `SUM(x.v)`
+  in a subquery.
+- **Fresh name:** an equal call that the grouping already computes is read
+  through a copy under a fresh name. The subquery could otherwise bind the
+  aggregate's own name to one of its own columns.
+
+#473 covers this.
+
 **Decimal precision/scale propagation**:
 
 | Operation | Result type |
