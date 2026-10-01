@@ -1546,7 +1546,7 @@ fn ckDrain(q: *texec.Query) !u64 {
 fn q32_real_radix(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     const q0 = texec.makeQuery(a, try Q32Source.create(a, d));
     const t0 = nowTicks();
-    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..], null) catch |e| {
+    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..], null, N) catch |e| {
         var qq = q0;
         qq.deinit();
         return e;
@@ -1562,7 +1562,7 @@ fn q32_real_radix(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
 fn q32_real_radix_topk(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     const q0 = texec.makeQuery(a, try Q32Source.create(a, d));
     const t0 = nowTicks();
-    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..], .{ .k = 10, .col = "c", .desc = true }) catch |e| {
+    var q = ra.RadixAggregate.create(a, q0, &.{ "WatchID", "ClientIP" }, q32_full_aggs[0..], .{ .k = 10, .col = "c", .desc = true }, N) catch |e| {
         var qq = q0;
         qq.deinit();
         return e;

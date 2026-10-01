@@ -729,8 +729,9 @@ pub const Query = struct {
     /// fixed-state aggregates only. A `top_k` hint (ORDER BY <agg> LIMIT k) emits
     /// only the k most-preferred groups; the downstream OrderBy+Limit still
     /// finalizes exact order. The router gates eligibility before calling.
-    pub fn radixGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("radix_aggregate.zig").TopK) !Query {
-        return @import("radix_aggregate.zig").RadixAggregate.create(try self.operatorAllocator(), self, group_cols, aggs, top_k);
+    /// `expected_groups` is its estimate of the groups, 0 when it has none.
+    pub fn radixGroupBy(self: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?@import("radix_aggregate.zig").TopK, expected_groups: u64) !Query {
+        return @import("radix_aggregate.zig").RadixAggregate.create(try self.operatorAllocator(), self, group_cols, aggs, top_k, expected_groups);
     }
 
     /// Parallel partition+lease grouped aggregation (high-card path). Same

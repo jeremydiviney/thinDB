@@ -1155,7 +1155,7 @@ test "aggregate: SUM(BIGINT) wraps identically on every aggregate path" {
         }
         {
             var base = try thindb.scan(allocator, t);
-            var q = try base.radixGroupBy(&.{"hk"}, &sum_v, null);
+            var q = try base.radixGroupBy(&.{"hk"}, &sum_v, null, 0);
             defer q.deinit();
             const got = try collectKeySums(allocator, &q);
             defer allocator.free(got);
@@ -1163,7 +1163,7 @@ test "aggregate: SUM(BIGINT) wraps identically on every aggregate path" {
         }
         {
             var base = try thindb.scan(allocator, t);
-            var q = try base.radixGroupBy(&.{"hk"}, &sum_v, .{ .k = 2, .col = "s", .desc = true });
+            var q = try base.radixGroupBy(&.{"hk"}, &sum_v, .{ .k = 2, .col = "s", .desc = true }, 0);
             defer q.deinit();
             const got = try collectKeySums(allocator, &q);
             defer allocator.free(got);

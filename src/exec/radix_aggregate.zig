@@ -109,9 +109,31 @@ fn welfordEligible(t: Type) bool {
     return t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double;
 }
 
+/// The compact state of aggregate `a` over input column `in_col` (null for
+/// COUNT(*)), or null when it has none: variable state, or a fixed-state
+/// shape this core doesn't cover (string/large MIN/MAX).
+fn compactKind(a: AggSpec, in_col: ?types.Column) ?CompactKind {
+    return switch (a.func) {
+        .count => .count,
+        .sum => blk: {
+            const nullable = in_col.?.nullable;
+            if (in_col.?.type.isFloat()) break :blk if (nullable) .sum_float_null else .sum_float;
+            break :blk if (nullable) .sum_int_null else .sum_int;
+        },
+        .avg => .avg,
+        .min, .max => blk: {
+            const t = in_col.?.type;
+            if (minMaxIntEligible(t)) break :blk if (a.func == .min) .min_int else .max_int;
+            if (t == .float or t == .double) break :blk if (a.func == .min) .min_float else .max_float;
+            break :blk null;
+        },
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => if (welfordEligible(in_col.?.type)) .welford else null,
+        else => null,
+    };
+}
+
 /// Plan the compact layout for `aggs`, or return null if any aggregate is not
-/// compact-eligible (variable-state, or a fixed-state shape this core doesn't
-/// cover — string/large MIN/MAX), in which case the caller falls back to the
+/// compact-eligible (`compactKind`), in which case the caller falls back to the
 /// generic `Aggregate`. `agg_col_idx` is the upstream column index per aggregate
 /// (null for COUNT(*)); `up_schema` supplies input types.
 pub fn planCompact(
@@ -124,38 +146,72 @@ pub fn planCompact(
     errdefer allocator.free(out);
     var w: usize = 0;
     for (aggs, agg_col_idx, out) |a, idx, *dst| {
-        // Null is not an error, so `errdefer` won't fire — free explicitly when
-        // declining so the partial allocation doesn't leak.
-        const decline = struct {
-            fn f(al: Allocator, buf: []CompactAgg) ?CompactLayout {
-                al.free(buf);
-                return null;
-            }
-        }.f;
-        const in_t: ?Type = if (idx) |i| up_schema[i].type else null;
-        const kind: CompactKind = switch (a.func) {
-            .count => .count,
-            .sum => blk: {
-                const nullable = up_schema[idx.?].nullable;
-                if (in_t.?.isFloat()) break :blk if (nullable) .sum_float_null else .sum_float;
-                break :blk if (nullable) .sum_int_null else .sum_int;
-            },
-            .avg => .avg,
-            .min, .max => blk: {
-                const t = in_t.?;
-                if (minMaxIntEligible(t)) break :blk if (a.func == .min) .min_int else .max_int;
-                if (t == .float or t == .double) break :blk if (a.func == .min) .min_float else .max_float;
-                return decline(allocator, out); // string / largeint / decimal128 MIN/MAX
-            },
-            .stddev_pop, .stddev_samp, .var_pop, .var_samp => if (welfordEligible(in_t.?)) .welford else return decline(allocator, out),
-            // count_distinct / percentile / group_concat → variable state.
-            else => return decline(allocator, out),
+        const kind = compactKind(a, if (idx) |i| up_schema[i] else null) orelse {
+            // Null is not an error, so `errdefer` won't fire.
+            allocator.free(out);
+            return null;
         };
         dst.* = .{ .kind = kind, .off = w, .col_idx = idx, .func = a.func };
         w += kind.words();
     }
     return .{ .aggs = out, .words = w };
 }
+
+/// The bytes radix holds per table slot, per group and per emitted row:
+/// what the GROUP BY router prices it with (`group_route.GroupState.bytes`).
+pub const Footprint = struct {
+    /// A group table slot: the packed key at its tier's width and a group id.
+    slot: u64,
+    /// A group's cells: its packed key and its aggregates' state words.
+    cell: u64,
+    /// A group's emitted fixed-width values.
+    out: u64,
+    /// Emitted columns that keep a validity bit per group.
+    nullable_outs: u64,
+
+    /// The emitted columns of `groups` groups.
+    pub fn output(self: Footprint, groups: u64) u64 {
+        return groups *| self.out +| self.nullable_outs *| ((groups +| 7) / 8);
+    }
+};
+
+/// Radix's footprint for this GROUP BY, or null when it can't carry it: a
+/// key that doesn't pack (`agg.planIntKey`) or an aggregate without compact
+/// state (`planCompact`).
+pub fn footprint(schema: []const types.Column, group_cols: []const []const u8, aggs: []const AggSpec) ?Footprint {
+    if (aggs.len == 0) return null;
+    const slot: u64 = switch (agg.nativeIntKeyTier(schema, group_cols) orelse return null) {
+        .bits32 => gt.IntKeyTable(32).slot_bytes,
+        .bits96 => gt.IntKeyTable(96).slot_bytes,
+        .bits128 => gt.IntKeyTable(128).slot_bytes,
+    };
+    var out: u64 = 0;
+    for (group_cols) |name| out += memory.estimateColumnBytes(schema[types.findColumn(schema, name).?].type);
+    var words: u64 = 0;
+    var nullable_outs: u64 = 0;
+    for (aggs) |a| {
+        const in_col: ?types.Column = if (a.col) |name| schema[types.findColumn(schema, name) orelse return null] else null;
+        words += (compactKind(a, in_col) orelse return null).words();
+        const out_t = agg.aggOutputTypeFor(a, if (in_col) |c| c.type else null) catch return null;
+        out += memory.estimateColumnBytes(out_t);
+        nullable_outs += @intFromBool(agg.aggOutputNullable(a.func));
+    }
+    return .{ .slot = slot, .cell = @sizeOf(u128) + 8 * words, .out = out, .nullable_outs = nullable_outs };
+}
+
+/// Groups radix's cells hold for a table of `slots` slots: every group it
+/// takes before its 0.75 load factor makes it grow.
+pub fn cellCapacity(slots: usize) usize {
+    return slots / 4 * 3;
+}
+
+/// Groups radix's first table takes when an estimate names more: it jumps
+/// to the estimate once it outgrows them.
+pub const INITIAL_GROUPS: usize = 1 << 16;
+
+/// Groups radix's first table takes without an estimate; it doubles from
+/// there.
+pub const UNESTIMATED_GROUPS: usize = 4096;
 
 /// Accumulate one batch into the compact `state`, given each row's resolved
 /// group id in `gids`. One pass per aggregate so the per-column ValueView type
@@ -510,8 +566,11 @@ fn topkBuildHeap(sel: []usize, ov: []OrderVal, desc: bool) void {
 /// (ORDER BY <agg> LIMIT k). Eligibility (int key ≤128 bits, fixed-state aggs)
 /// is the router's responsibility; `create` errors if the layouts don't apply.
 pub const RadixAggregate = struct {
+    /// Holds the group table, cells and batch scratch, each at the size it
+    /// needs and freed when outgrown, and the output. An arena kept every
+    /// outgrown array until the emit, and its geometric nodes left the newest
+    /// mostly empty (issue #476).
     allocator: Allocator,
-    arena: std.heap.ArenaAllocator,
     upstream: Query,
     group_col_indices: []usize,
     agg_col_indices: []?usize,
@@ -521,11 +580,15 @@ pub const RadixAggregate = struct {
     output_schema: []types.Column,
     output_columns: []ColumnStore,
     views: []ColumnView,
-    cap_groups: usize,
+    /// The groups the table jumps to once it outgrows its first one; 0
+    /// without an estimate.
+    expected_groups: u64,
     top_k: ?ResolvedTopK,
     done: bool = false,
 
-    pub fn create(allocator: Allocator, upstream: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?TopK) !Query {
+    /// `expected_groups` is the caller's estimate of the input's groups, 0
+    /// when it has none.
+    pub fn create(allocator: Allocator, upstream: Query, group_cols: []const []const u8, aggs: []const AggSpec, top_k: ?TopK, expected_groups: u64) !Query {
         if (aggs.len == 0) return Error.AggregateNoSpecs;
         const up_schema = upstream.outputSchema();
 
@@ -563,25 +626,6 @@ pub const RadixAggregate = struct {
         const views = try allocator.alloc(ColumnView, out_schema.len);
         errdefer allocator.free(views);
 
-        // Group-count estimate from upstream stats → presize (grow covers a miss).
-        const st = upstream.stats();
-        var est: u64 = 1;
-        var known = true;
-        for (gci) |ci| {
-            if (ci >= st.column_stats.len) {
-                known = false;
-                break;
-            }
-            switch (st.column_stats[ci].ndv) {
-                .exact => |nd| est *|= nd,
-                .unknown => {
-                    known = false;
-                    break;
-                },
-            }
-        }
-        const cap_groups: usize = if (known and est > 0) @intCast(@min(est, @max(st.upper_rows, 1))) else 4096;
-
         // Resolve the top-k hint: its order column must be one of the aggregate
         // outputs (a fixed-state numeric value). A group-column or unknown order
         // key leaves it unresolved → full emit (the router shouldn't route those).
@@ -598,7 +642,6 @@ pub const RadixAggregate = struct {
         const self = try allocator.create(RadixAggregate);
         self.* = .{
             .allocator = allocator,
-            .arena = std.heap.ArenaAllocator.init(allocator),
             .upstream = upstream,
             .group_col_indices = gci,
             .agg_col_indices = aci,
@@ -608,89 +651,108 @@ pub const RadixAggregate = struct {
             .output_schema = out_schema,
             .output_columns = out_cols,
             .views = views,
-            .cap_groups = @max(cap_groups, 256),
+            .expected_groups = expected_groups,
             .top_k = resolved_tk,
         };
         return makeQuery(allocator, self);
     }
 
+    /// Size the cells for every group a table of `slots` slots holds, exactly.
+    fn reserveCells(self: *RadixAggregate, gstate: *std.ArrayListUnmanaged(u64), gkeys: *std.ArrayListUnmanaged(u128), slots: usize) !void {
+        const groups = cellCapacity(slots);
+        try gkeys.ensureTotalCapacityPrecise(self.allocator, groups);
+        try gstate.ensureTotalCapacityPrecise(self.allocator, groups * self.compact.words);
+    }
+
     fn drainTier(self: *RadixAggregate, comptime Table: type, prof_on: bool) !void {
-        const aa = self.arena.allocator();
+        const ta = self.allocator;
         const words = self.compact.words;
         const layout = self.int_layout;
-        // Adaptive sizing (mirrors aggregate.zig #295): start modest and grow
-        // straight to the provable ceiling on the first overflow. `cap_groups`
-        // is a min(∏NDV, upper_rows) UPPER bound — a selective filter over a
-        // high-table-wide-NDV key (Q40/Q41) over-estimates it wildly, so presizing
-        // to it would allocate+fault a multi-million-slot table for a few-K-group
-        // result. Starting small keeps those cache-resident; true high-card (Q32)
-        // overflows once and jumps to the ceiling.
-        const ADAPTIVE_INITIAL: usize = 1 << 16;
-        const init_cap = @min(self.cap_groups, ADAPTIVE_INITIAL);
-        var table = try Table.init(aa, init_cap);
-        if (self.cap_groups > init_cap) table.grow_target = gt.capacityFor(self.cap_groups);
         var gstate: std.ArrayListUnmanaged(u64) = .empty;
+        defer gstate.deinit(ta);
         var gkeys: std.ArrayListUnmanaged(u128) = .empty;
-        try gstate.ensureTotalCapacity(aa, init_cap * words);
-        try gkeys.ensureTotalCapacity(aa, init_cap);
-        var kb: std.ArrayListUnmanaged(u128) = .empty;
-        var hb: std.ArrayListUnmanaged(u64) = .empty;
-        var gidbuf: std.ArrayListUnmanaged(u32) = .empty;
-        var n_groups: u32 = 0;
+        defer gkeys.deinit(ta);
         var rows: usize = 0;
         const t0 = if (prof_on) prof.nowTicks() else 0;
         var scan_ticks: i64 = 0;
         var group_ticks: i64 = 0;
 
-        while (true) {
-            const scan_t0 = if (prof_on) prof.nowTicks() else 0;
-            const maybe = try self.upstream.next();
-            if (prof_on) scan_ticks += prof.nowTicks() - scan_t0;
-            const batch = maybe orelse break;
-            const n = batch.row_count;
-            if (n == 0) continue;
+        // The table and batch scratch are freed at the end of this block,
+        // before the output is built.
+        const n_groups: u32 = drained: {
+            // Adaptive sizing (mirrors aggregate.zig #295): start modest and
+            // grow straight to the estimate on the first overflow. The
+            // estimate is a min(∏NDV, upper_rows) UPPER bound — a selective
+            // filter over a high-table-wide-NDV key (Q40/Q41) over-estimates
+            // it wildly, so presizing to it would allocate+fault a
+            // multi-million-slot table for a few-K-group result. Starting
+            // small keeps those cache-resident; true high-card (Q32)
+            // overflows once and jumps to the estimate.
+            const init_groups: usize = if (self.expected_groups == 0) UNESTIMATED_GROUPS else @intCast(@min(self.expected_groups, INITIAL_GROUPS));
+            var table = try Table.init(ta, init_groups);
+            defer table.deinit(ta);
+            if (self.expected_groups > init_groups) table.grow_target = gt.capacityFor(@intCast(self.expected_groups));
+            try self.reserveCells(&gstate, &gkeys, table.slots.len);
+            var kb: std.ArrayListUnmanaged(u128) = .empty;
+            defer kb.deinit(ta);
+            var hb: std.ArrayListUnmanaged(u64) = .empty;
+            defer hb.deinit(ta);
+            var gidbuf: std.ArrayListUnmanaged(u32) = .empty;
+            defer gidbuf.deinit(ta);
+            var n_groups: u32 = 0;
 
-            const group_t0 = if (prof_on) prof.nowTicks() else 0;
-            rows += n;
-            if (table.needsGrow(n)) {
-                try table.grow(aa, n);
-                try gstate.ensureTotalCapacity(aa, table.slots.len * words);
-                try gkeys.ensureTotalCapacity(aa, table.slots.len);
+            while (true) {
+                const scan_t0 = if (prof_on) prof.nowTicks() else 0;
+                const maybe = try self.upstream.next();
+                if (prof_on) scan_ticks += prof.nowTicks() - scan_t0;
+                const batch = maybe orelse break;
+                const n = batch.row_count;
+                if (n == 0) continue;
+
+                const group_t0 = if (prof_on) prof.nowTicks() else 0;
+                rows += n;
+                // After this the table holds every group the batch can add
+                // under its load factor, and so do the cells.
+                if (table.needsGrow(n)) {
+                    try table.grow(ta, n);
+                    try self.reserveCells(&gstate, &gkeys, table.slots.len);
+                }
+                try kb.ensureTotalCapacityPrecise(ta, n);
+                try hb.ensureTotalCapacityPrecise(ta, n);
+                try gidbuf.ensureTotalCapacityPrecise(ta, n);
+
+                kb.clearRetainingCapacity();
+                kb.appendNTimesAssumeCapacity(0, n);
+                for (self.group_col_indices, layout.fields) |ci, f| agg.orKeyColumn(kb.items[0..n], batch, ci, f);
+
+                hb.clearRetainingCapacity();
+                for (0..n) |j| hb.appendAssumeCapacity(Table.hashKey(kb.items[j]));
+
+                gidbuf.clearRetainingCapacity();
+                for (0..n) |j| {
+                    if (j + PREFETCH_DIST < n) @prefetch(table.slotAddr(table.bucketOf(hb.items[j + PREFETCH_DIST])), .{ .rw = .write, .locality = 1 });
+                    const p = table.getOrPut(hb.items[j], kb.items[j]);
+                    const g = if (p.found) p.gid else blk: {
+                        table.commit(p.slot, kb.items[j], n_groups);
+                        gkeys.appendAssumeCapacity(kb.items[j]);
+                        const base = @as(usize, n_groups) * words;
+                        gstate.items.len = base + words;
+                        @memset(gstate.items[base .. base + words], 0);
+                        const ng = n_groups;
+                        n_groups += 1;
+                        break :blk ng;
+                    };
+                    gidbuf.appendAssumeCapacity(g);
+                }
+                scatter(self.compact, gstate.items, gidbuf.items[0..n], batch);
+                if (prof_on) group_ticks += prof.nowTicks() - group_t0;
             }
-            try gstate.ensureUnusedCapacity(aa, n * words);
-            try gkeys.ensureUnusedCapacity(aa, n);
-            try kb.ensureTotalCapacity(aa, n);
-            try hb.ensureTotalCapacity(aa, n);
-            try gidbuf.ensureTotalCapacity(aa, n);
-
-            kb.clearRetainingCapacity();
-            kb.appendNTimesAssumeCapacity(0, n);
-            for (self.group_col_indices, layout.fields) |ci, f| agg.orKeyColumn(kb.items[0..n], batch, ci, f);
-
-            hb.clearRetainingCapacity();
-            for (0..n) |j| hb.appendAssumeCapacity(Table.hashKey(kb.items[j]));
-
-            gidbuf.clearRetainingCapacity();
-            for (0..n) |j| {
-                if (j + PREFETCH_DIST < n) @prefetch(table.slotAddr(table.bucketOf(hb.items[j + PREFETCH_DIST])), .{ .rw = .write, .locality = 1 });
-                const p = table.getOrPut(hb.items[j], kb.items[j]);
-                const g = if (p.found) p.gid else blk: {
-                    table.commit(p.slot, kb.items[j], n_groups);
-                    gkeys.appendAssumeCapacity(kb.items[j]);
-                    const base = @as(usize, n_groups) * words;
-                    gstate.items.len = base + words;
-                    @memset(gstate.items[base .. base + words], 0);
-                    const ng = n_groups;
-                    n_groups += 1;
-                    break :blk ng;
-                };
-                gidbuf.appendAssumeCapacity(g);
-            }
-            scatter(self.compact, gstate.items, gidbuf.items[0..n], batch);
-            if (prof_on) group_ticks += prof.nowTicks() - group_t0;
-        }
+            break :drained n_groups;
+        };
 
         const t1 = if (prof_on) prof.nowTicks() else 0;
+        const emitted: usize = if (self.top_k) |tk| @min(@as(usize, tk.k), n_groups) else n_groups;
+        for (self.output_columns) |*col| try col.reserveTotal(ta, emitted, 0);
         try self.emitGroups(gstate.items, gkeys.items[0..n_groups]);
         if (prof_on) {
             const t2 = prof.nowTicks();
@@ -732,9 +794,10 @@ pub const RadixAggregate = struct {
         };
         const k = @min(@as(usize, tk.k), gkeys.len);
         if (k == 0) return;
-        const aa = self.arena.allocator();
-        const sel = try aa.alloc(usize, k);
-        const ov = try aa.alloc(OrderVal, k);
+        const sel = try self.allocator.alloc(usize, k);
+        defer self.allocator.free(sel);
+        const ov = try self.allocator.alloc(OrderVal, k);
+        defer self.allocator.free(ov);
         var len: usize = 0;
         for (0..gkeys.len) |g| {
             const v = orderValOf(self.compact, gstate, g, tk.agg_idx, self.output_schema[self.group_col_indices.len + tk.agg_idx].type);
@@ -762,14 +825,12 @@ pub const RadixAggregate = struct {
             .bits96 => try self.drainTier(gt.IntKeyTable(96), prof_on),
             .bits128 => try self.drainTier(gt.IntKeyTable(128), prof_on),
         }
-        _ = self.arena.reset(.free_all); // group table/state no longer needed
         for (self.output_columns, 0..) |c, i| self.views[i] = c.view();
         return Batch{ .schema = self.output_schema, .values = self.views, .row_count = self.output_columns[0].rowCount() };
     }
 
     pub fn deinit(self: *RadixAggregate) void {
         self.upstream.deinit();
-        self.arena.deinit();
         for (self.output_columns) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_columns);
         self.allocator.free(self.views);
@@ -2191,7 +2252,7 @@ test "RadixAggregate matches the generic Aggregate (count/sum/avg/min/max)" {
         .{ .func = .max, .col = "v", .as = "mx" },
     };
 
-    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..], null);
+    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..], null, 0);
     defer qr.deinit();
     const rr = try collectDiffRows(ta, &qr);
     defer ta.free(rr);
@@ -2227,7 +2288,7 @@ test "RadixAggregate top-k emits only the k most-preferred groups" {
         .{ .func = .max, .col = "v", .as = "mx" },
     };
 
-    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..], .{ .k = 2, .col = "s", .desc = true });
+    var qr = try RadixAggregate.create(ta, makeQuery(ta, try TestSource.create(ta, &k, &v)), group_cols[0..], aggs[0..], .{ .k = 2, .col = "s", .desc = true }, 0);
     defer qr.deinit();
     const rr = try collectDiffRows(ta, &qr);
     defer ta.free(rr);
@@ -2237,6 +2298,66 @@ test "RadixAggregate top-k emits only the k most-preferred groups" {
     try std.testing.expectEqual(@as(i64, 100), rr[0].s);
     try std.testing.expectEqual(@as(i32, 4), rr[1].k); // g4, sum 80
     try std.testing.expectEqual(@as(i64, 80), rr[1].s);
+}
+
+/// RadixAggregate's rows over `k`/`v`, its state on `op_alloc`, its rows on `a`.
+fn testRadixRows(
+    a: Allocator,
+    op_alloc: Allocator,
+    k: []const i32,
+    v: []const i16,
+    group_cols: []const []const u8,
+    aggs: []const AggSpec,
+    top_k: ?TopK,
+    expected_groups: u64,
+) ![]DiffRow {
+    var up = makeQuery(op_alloc, try TestSource.create(op_alloc, k, v));
+    var q = RadixAggregate.create(op_alloc, up, group_cols, aggs, top_k, expected_groups) catch |err| {
+        up.deinit();
+        return err;
+    };
+    defer q.deinit();
+    return collectDiffRows(a, &q);
+}
+
+test "RadixAggregate frees its table, cells and scratch at any failed allocation" {
+    const ta = std.testing.allocator;
+    var k: [3000]i32 = undefined;
+    var v: [3000]i16 = undefined;
+    for (&k, &v, 0..) |*key, *value, i| {
+        key.* = @intCast(i * 7 % 1500);
+        value.* = @as(i16, @intCast(i % 200)) - 100;
+    }
+    const group_cols = [_][]const u8{"k"};
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+        .{ .func = .avg, .col = "v", .as = "a" },
+        .{ .func = .min, .col = "v", .as = "mn" },
+        .{ .func = .max, .col = "v", .as = "mx" },
+    };
+    // An estimate below the 1500 groups grows the table and cells several
+    // times; none, or the exact count, never grows them.
+    const cases = .{
+        .{ .groups = 0, .top_k = @as(?TopK, null) },
+        .{ .groups = 1500, .top_k = @as(?TopK, null) },
+        .{ .groups = 100, .top_k = @as(?TopK, null) },
+        .{ .groups = 100, .top_k = @as(?TopK, .{ .k = 3, .col = "s", .desc = true }) },
+    };
+    inline for (cases) |c| {
+        const want = try testRadixRows(ta, ta, &k, &v, &group_cols, &aggs, c.top_k, c.groups);
+        defer ta.free(want);
+        try std.testing.expectEqual(@as(usize, if (c.top_k != null) 3 else 1500), want.len);
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(ta, .{ .fail_index = fail_index });
+            if (testRadixRows(ta, failing.allocator(), &k, &v, &group_cols, &aggs, c.top_k, c.groups)) |rows| {
+                defer ta.free(rows);
+                try std.testing.expectEqualSlices(DiffRow, want, rows);
+                if (!failing.has_induced_failure) break;
+            } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
 
 test "RadixLeaseAggregate 32-bit partition key encoding round-trips signed and narrow keys" {
@@ -2682,7 +2803,7 @@ test "bench: RadixLeaseAggregate vs serial radix/generic (high-card)" {
     qg.deinit();
     std.debug.print("[bench] generic Aggregate : {d:8.1} ms  groups={d}\n", .{ rg.ms, rg.groups });
 
-    var qr = try RadixAggregate.create(ta, makeQuery(ta, try BenchSource.create(ta, k, v, 2048)), gc[0..], aggs[0..], null);
+    var qr = try RadixAggregate.create(ta, makeQuery(ta, try BenchSource.create(ta, k, v, 2048)), gc[0..], aggs[0..], null, 0);
     const rr = try benchDrain(&qr);
     qr.deinit();
     std.debug.print("[bench] serial  RadixAgg   : {d:8.1} ms  groups={d}\n", .{ rr.ms, rr.groups });
@@ -2701,7 +2822,7 @@ test "bench: RadixLeaseAggregate vs serial radix/generic (high-card)" {
     // Realistic ORDER BY <agg> DESC LIMIT 10 shape (Q32/33/34): emit is ~free
     // (10 rows), isolating partition + aggregate. force_buckets is still `nb`.
     const tk = TopK{ .k = 10, .col = "s", .desc = true };
-    var qrt = try RadixAggregate.create(ta, makeQuery(ta, try BenchSource.create(ta, k, v, 2048)), gc[0..], aggs[0..], tk);
+    var qrt = try RadixAggregate.create(ta, makeQuery(ta, try BenchSource.create(ta, k, v, 2048)), gc[0..], aggs[0..], tk, 0);
     const rrt = try benchDrain(&qrt);
     qrt.deinit();
     var qlt = try RadixLeaseAggregate.create(ta, makeQuery(ta, try BenchSource.create(ta, k, v, 2048)), gc[0..], aggs[0..], tk, dop);
