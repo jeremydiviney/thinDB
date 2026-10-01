@@ -539,19 +539,22 @@ fn withSampledWidths(
     return priced;
 }
 
-/// The product of the keys' NDV bounds capped at the rows; null when a key's
-/// NDV is unknown.
+/// The product of the keys' NDV bounds capped at the rows, or at the row
+/// origin's rows when every key comes from it (`exec.keyTupleBound`); null
+/// when a key's NDV is unknown.
 fn estimateGroups(st: exec.PipelineStats, schema: []const types.Column, group_cols: []const []const u8) ?u64 {
     var product: u64 = 1;
+    var from_row = true;
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc) orelse return null;
         if (idx >= st.column_stats.len) return null;
+        from_row = from_row and exec.fromRowOrigin(st, st.column_stats[idx]);
         switch (st.column_stats[idx].ndv) {
             .exact => |n| product *|= n,
             .unknown => return null,
         }
     }
-    return @min(product, @max(st.upper_rows, 1));
+    return @min(product, @max(exec.keyTupleBound(st, from_row), 1));
 }
 
 /// The groups the partitioned plan's hash cores size their tables for (issue
@@ -1233,20 +1236,23 @@ pub fn groupKeysCardUnderLimit(
     const max_groups = allowed / per_group;
 
     // Estimate the combined group count, clamped to the row-count ceiling.
-    const ceiling: u64 = st.upper_rows;
     var product: u64 = 1;
     var any_unknown = false;
+    var from_row = true;
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc).?;
         if (idx >= st.column_stats.len) {
             any_unknown = true;
+            from_row = false;
             continue;
         }
+        from_row = from_row and exec.fromRowOrigin(st, st.column_stats[idx]);
         switch (st.column_stats[idx].ndv) {
             .unknown => any_unknown = true,
             .exact => |nd| product *|= nd,
         }
     }
+    const ceiling = exec.keyTupleBound(st, from_row);
     const est: u64 = if (any_unknown) ceiling else @min(product, ceiling);
     if (exec.trace_group_by) traceGroupByDecision(st, schema, group_cols, per_group, est, max_groups);
     return est < max_groups;

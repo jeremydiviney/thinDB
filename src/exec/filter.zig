@@ -140,6 +140,8 @@ pub const Filter = struct {
     /// (proven upper bounds only). Empty when the upstream carries no
     /// full per-column array. Cached at create; borrowed by `stats()`.
     cached_stats: []const exec.ColStat = &.{},
+    /// The most rows the creator proves `expr` keeps (`createBounded`).
+    row_ceiling: u64 = std.math.maxInt(u64),
 
     /// Per-column accumulator. Mirrors the memtable's storage shape so the
     /// same view() helper applies.
@@ -173,6 +175,13 @@ pub const Filter = struct {
     rewritten_children: std.ArrayListUnmanaged([]PredicateExpr) = .empty,
 
     pub fn create(allocator: Allocator, upstream: Query, expr: PredicateExpr) !Query {
+        return createBounded(allocator, upstream, expr, null);
+    }
+
+    /// `create` for a filter whose creator proves more about the rows it
+    /// keeps than the predicate's stats show: an INTERSECT's kept groups
+    /// are rows of both arms. See `Bound`.
+    pub fn createBounded(allocator: Allocator, upstream: Query, expr: PredicateExpr, bound: ?Bound) !Query {
         const schema = upstream.outputSchema();
 
         // Validate first so integer-literal widening lands before the
@@ -237,8 +246,14 @@ pub const Filter = struct {
         // Computed after `validateExpr` so any integer-literal widening is
         // reflected in `self.expr`. The Scan-fusion offer below doesn't change
         // the OUTPUT this Filter represents, so the tightening holds either way.
-        self.cached_stats = try tightenStats(allocator, self.upstream.stats(), schema, self.expr);
+        const tightened = try tightenStats(allocator, self.upstream.stats(), schema, self.expr);
+        self.cached_stats = tightened;
         errdefer if (self.cached_stats.len > 0) allocator.free(@constCast(self.cached_stats));
+        if (bound) |b| {
+            self.row_ceiling = b.rows;
+            applyBound(tightened, b);
+        }
+        if (self.provenEmpty()) self.cached_stats = try emptyStats(allocator, tightened, schema.len);
 
         // Offer the full (validated) predicate to the upstream Scan for in-place
         // filtering. If it accepts, it emits compacted owned survivors and this
@@ -319,7 +334,31 @@ pub const Filter = struct {
     /// still evaluates its predicate over the upstream batch at runtime, so it
     /// needs those columns materialized — swallow the projection to keep them.
     pub fn setEmitProjection(self: *Filter, keep: []const []const u8) !void {
-        if (self.fused) try self.upstream.setEmitProjection(keep);
+        if (!self.fused) return;
+        try self.upstream.setEmitProjection(keep);
+        try self.realignCachedStats();
+    }
+
+    /// A fused Filter reports its upstream's live schema, which a projection
+    /// may have narrowed after the predicate tightened `cached_stats` in the
+    /// old layout. Positional stats would then describe other columns, so
+    /// they follow their columns by name.
+    fn realignCachedStats(self: *Filter) !void {
+        if (self.cached_stats.len == 0) return;
+        const live = self.upstream.outputSchema();
+        const up = self.upstream.stats();
+        const out = try self.allocator.alloc(exec.ColStat, live.len);
+        for (live, out, 0..) |col, *o, i| {
+            o.* = if (types.findColumn(self.schema, col.name)) |j|
+                self.cached_stats[j]
+            else if (up.column_stats.len == live.len)
+                up.column_stats[i]
+            else
+                .{};
+            if (self.provenEmpty()) o.ndv = .{ .exact = 0 };
+        }
+        self.allocator.free(@constCast(self.cached_stats));
+        self.cached_stats = out;
     }
 
     /// Forward a partial-aggregate fusion upstream only when this Filter is a
@@ -457,8 +496,9 @@ pub const Filter = struct {
         return ok;
     }
 
-    /// Filter only restricts rows — `upper_rows` is unchanged (a filter is
-    /// only provably ≤ input; we don't estimate a reduction). Sort state
+    /// Filter only restricts rows — `upper_rows` is the input's (a filter is
+    /// only provably ≤ input; we don't estimate a reduction), 0 when the
+    /// predicate is proven empty, and at most a creator's `Bound`. Sort state
     /// preserved (Filter doesn't reorder). Per-column stats are tightened by
     /// the predicate's proven bounds (see `tightenStats`), then capped at
     /// `upper_rows`.
@@ -466,13 +506,51 @@ pub const Filter = struct {
         // Chained: this operator no longer shapes the batches; the cached
         // per-column tightening would mis-index against the re-typed
         // upstream schema.
-        if (self.chain != null) return self.upstream.stats();
+        if (self.chain != null) {
+            var joined = self.upstream.stats();
+            joined.row_origin = null;
+            return joined;
+        }
         const up = self.upstream.stats();
         return .{
-            .upper_rows = up.upper_rows,
+            .upper_rows = if (self.provenEmpty()) 0 else @min(up.upper_rows, self.row_ceiling),
             .sort_state = up.sort_state,
             .column_stats = if (self.cached_stats.len > 0) self.cached_stats else up.column_stats,
+            .row_origin = up.row_origin,
         };
+    }
+
+    /// Stats simplification proved that no row passes: the filter emits
+    /// nothing, whatever its input's bounds (issue #478).
+    fn provenEmpty(self: *const Filter) bool {
+        return self.expr == .always and !self.expr.always;
+    }
+
+    /// What `createBounded`'s creator proves of the rows the predicate
+    /// keeps: at most `rows` of them, and for each of the leading columns
+    /// `column_stats` covers, values within that stat's NDV and range.
+    pub const Bound = struct {
+        rows: u64,
+        column_stats: []const exec.ColStat = &.{},
+    };
+
+    fn applyBound(out: []exec.ColStat, bound: Bound) void {
+        const n: usize = @min(out.len, bound.column_stats.len);
+        for (out[0..n], bound.column_stats[0..n]) |*o, b| {
+            o.ndv = exec.minCard(o.ndv, b.ndv);
+            if (b.min) |bm| o.min = if (o.min) |m| @max(m, bm) else bm;
+            if (b.max) |bm| o.max = if (o.max) |m| @min(m, bm) else bm;
+        }
+        exec.capColStats(out, bound.rows);
+    }
+
+    /// Stats of no rows: every column holds no value. Reuses `tightened`
+    /// when it already covers the schema.
+    fn emptyStats(allocator: Allocator, tightened: []exec.ColStat, width: usize) ![]exec.ColStat {
+        const out = if (tightened.len == width) tightened else try allocator.alloc(exec.ColStat, width);
+        if (tightened.len != width) @memset(out, .{});
+        for (out) |*s| s.ndv = .{ .exact = 0 };
+        return out;
     }
 
     pub fn accountant(self: *Filter) ?*exec.memory.MemoryAccountant {
@@ -701,7 +779,7 @@ fn tightenStats(
     up: exec.PipelineStats,
     schema: []const Column,
     expr: PredicateExpr,
-) ![]const exec.ColStat {
+) ![]exec.ColStat {
     if (up.column_stats.len != schema.len) return &.{};
 
     const out = try allocator.alloc(exec.ColStat, schema.len);

@@ -397,15 +397,17 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         const st = probe.stats();
         const probe_schema = probe.outputSchema();
         var product: u64 = 1;
+        var from_row = true;
         for (request.group_cols) |name| {
             const idx = types.findColumn(probe_schema, name) orelse return declineFree(allocator, aggs);
             if (idx >= st.column_stats.len) return declineFree(allocator, aggs);
+            from_row = from_row and exec.fromRowOrigin(st, st.column_stats[idx]);
             switch (st.column_stats[idx].ndv) {
                 .exact => |n| product *|= @max(n, 1),
                 .unknown => return declineFree(allocator, aggs),
             }
         }
-        est_groups = @max(@min(product, @max(st.upper_rows, 1)), 1);
+        est_groups = @max(@min(product, @max(exec.keyTupleBound(st, from_row), 1)), 1);
     }
     const state_stride: u64 = 8 + @as(u64, request.aggs.len) * 24;
     if (est_groups > GATE_GROUPS or est_groups * state_stride > GATE_STATE_BYTES) return declineFree(allocator, aggs);

@@ -137,12 +137,26 @@ fn computeColumnStats(
     memtable_rows: u64,
 ) ![]exec.ColStat {
     const stats = try allocator.alloc(exec.ColStat, out_phys.len);
-    errdefer allocator.free(stats);
+    fillColumnStats(stats, columns, segs, null, out_phys, memtable_rows);
+    return stats;
+}
+
+/// `computeColumnStats` into `stats`, over the segments `live` marks (every
+/// segment when null).
+fn fillColumnStats(
+    stats: []exec.ColStat,
+    columns: []const Column,
+    segs: []const storage.ManifestEntry,
+    live: ?[]const bool,
+    out_phys: []const usize,
+    memtable_rows: u64,
+) void {
     for (stats, 0..) |*stat, j| {
         const ci = out_phys[j];
         var merged: hll.Hll = .{};
         var have_sketch = false;
-        for (segs) |e| {
+        for (segs, 0..) |e, si| {
+            if (live) |l| if (!l[si]) continue;
             const off = ci * hll.m;
             if (e.column_sketches.len >= off + hll.m) {
                 const seg_sketch = hll.Hll.fromBytes(e.column_sketches[off .. off + hll.m]);
@@ -165,7 +179,8 @@ fn computeColumnStats(
         var min: ?i128 = null;
         var max: ?i128 = null;
         if (predicate.typeHasRange(columns[ci].type) and memtable_rows == 0) {
-            for (segs) |e| {
+            for (segs, 0..) |e, si| {
+                if (live) |l| if (!l[si]) continue;
                 if (e.column_stats.len <= ci) continue;
                 const cs = e.column_stats[ci];
                 min = if (min) |m| @min(m, cs.min) else cs.min;
@@ -175,7 +190,6 @@ fn computeColumnStats(
 
         stat.* = .{ .ndv = ndv, .min = min, .max = max };
     }
-    return stats;
 }
 
 /// Resolve the projection-pushdown column set to physical (table-order)
@@ -221,6 +235,16 @@ fn resolveOutPhys(
 /// costs more than coding saves (profiled on high-card URL), so the key stays
 /// on the normal materialized path.
 const dict_code_max_ndv: u32 = 65536;
+
+/// A pruned scan's stats: the rows of the row groups its hints keep, and
+/// column stats over the segments that keep any.
+const PrunedBounds = struct {
+    rows: u64 = 0,
+    /// One slot per projected column, like `Scan.cached_stats`.
+    stats: []exec.ColStat,
+    /// One slot per snapshot segment: whether any of its row groups survive.
+    live: []bool,
+};
 
 /// Process-wide FSST digest-fill accounting (--profile-ops). The fill runs on
 /// silo-grid worker threads whose thread-local oprof slots never reach the
@@ -424,6 +448,13 @@ pub const Scan = struct {
     /// memtable rows). Computed once at create; borrowed by `stats()`. One
     /// slot per projected column.
     cached_stats: []exec.ColStat = &.{},
+    /// `exec.snapshotId` of the segment set and memtable this scan reads.
+    snapshot_id: u64 = 0,
+    /// What this scan reads once prune hints skip segments or row groups
+    /// (issue #478). Allocated by the first hint; rebuilt by `stats()` while
+    /// `pruned_stale`.
+    pruned: ?PrunedBounds = null,
+    pruned_stale: bool = false,
 
     /// When non-null, `seg_skip[i] == true` means segment at manifest
     /// index `i` is excluded by a pushed-down predicate on the leading
@@ -762,6 +793,10 @@ pub const Scan = struct {
             memtable_row_count,
         );
         errdefer allocator.free(cached_stats);
+        const snapshot_id = exec.snapshotId(table.cache_uid, segs, memtable_row_count);
+        for (cached_stats, out_phys[0..cached_stats.len]) |*s, ci| {
+            s.origin = .{ .snapshot = snapshot_id, .column = @intCast(ci), .ndv = s.ndv };
+        }
 
         self.* = .{
             .allocator = allocator,
@@ -783,6 +818,7 @@ pub const Scan = struct {
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
             .cached_stats = cached_stats,
+            .snapshot_id = snapshot_id,
         };
 
         // Cache-aware scan sub-batch: size the per-emit row count from the
@@ -1037,6 +1073,10 @@ pub const Scan = struct {
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
+        if (self.pruned) |b| {
+            self.allocator.free(b.stats);
+            self.allocator.free(b.live);
+        }
         for (self.code_bufs) |*b| b.deinit(self.allocator);
         if (self.code_bufs.len > 0) self.allocator.free(self.code_bufs);
         if (self.coded_dicts_by_j.len > 0) self.allocator.free(self.coded_dicts_by_j);
@@ -1244,6 +1284,7 @@ pub const Scan = struct {
             self.allocator.free(values);
             return;
         }
+        try self.markPruned();
         try self.in_prunes.append(self.allocator, .{ .col_idx = col_idx, .values = values[0..n] });
     }
 
@@ -1337,6 +1378,7 @@ pub const Scan = struct {
         });
 
         try self.segmentPrunePass(col_idx, pred.op, pred.val, blanks_excluded);
+        try self.markPruned();
     }
 
     /// Segment-level pruning for one hint: mark segments whose manifest stats
@@ -1449,7 +1491,62 @@ pub const Scan = struct {
                 any_skipped = true;
             }
         }
-        if (any_skipped) self.seg_skip = skipped_buf;
+        if (any_skipped) {
+            self.seg_skip = skipped_buf;
+            try self.markPruned();
+        }
+    }
+
+    /// A hint landed: `stats()` rebuilds `pruned` on its next call. Built
+    /// there, not here, so a run of hints from one filter pays once, and a
+    /// parallel scan's other workers, whose stats nobody reads, never pay.
+    fn markPruned(self: *Scan) !void {
+        if (self.pruned == null) {
+            const col_stats = try self.allocator.alloc(exec.ColStat, self.cached_stats.len);
+            errdefer self.allocator.free(col_stats);
+            const live = try self.allocator.alloc(bool, self.segs.len);
+            self.pruned = .{ .stats = col_stats, .live = live };
+        }
+        self.pruned_stale = true;
+    }
+
+    fn prunedBounds(self: *Scan) ?*const PrunedBounds {
+        const b = if (self.pruned) |*p| p else return null;
+        if (self.pruned_stale) {
+            self.refreshPruned(b);
+            self.pruned_stale = false;
+        }
+        return b;
+    }
+
+    /// Stats that count only what the hints keep. The NDVs come from the
+    /// surviving segments' sketches, capped at the surviving rows; each
+    /// column keeps its whole-snapshot origin.
+    fn refreshPruned(self: *Scan, b: *PrunedBounds) void {
+        const hinted = self.prunes.items.len > 0 or self.in_prunes.items.len > 0;
+        var rows: u64 = self.memtable_row_count;
+        for (self.segs, b.live, 0..) |entry, *live, i| {
+            const skipped = if (self.seg_skip) |s| s[i] else false;
+            const kept: u64 = if (skipped) 0 else if (hinted) self.survivingSegmentRows(entry) else entry.row_count;
+            live.* = kept > 0;
+            rows += kept;
+        }
+        fillColumnStats(b.stats, self.table.schema.columns, self.segs, b.live, self.out_phys[0..b.stats.len], self.memtable_row_count);
+        for (b.stats, self.cached_stats) |*s, whole| s.origin = whole.origin;
+        exec.capColStats(b.stats, rows);
+        b.rows = rows;
+    }
+
+    /// Rows of `entry`'s row groups that `rowGroupCanMatch` keeps, or all of
+    /// its rows when its footer can't be read.
+    fn survivingSegmentRows(self: *const Scan, entry: storage.ManifestEntry) u64 {
+        const handle = self.table.acquireSegment(entry.segment_id) catch return entry.row_count;
+        defer self.table.releaseSegment(handle);
+        var kept: u64 = 0;
+        for (handle.seg.info.row_groups) |rg| {
+            if (self.rowGroupCanMatch(rg)) kept += rg.row_count;
+        }
+        return kept;
     }
 
     pub fn rowGroupCanMatch(self: *const Scan, rg: storage.RowGroupMeta) bool {
@@ -1526,7 +1623,8 @@ pub const Scan = struct {
     }
 
     /// Pre-execution stats: sum of segment row counts + the memtable
-    /// snapshot row count gives the exact upper bound.
+    /// snapshot row count gives the exact upper bound. Once prune hints skip
+    /// segments or row groups, only the surviving rows count (`pruned`).
     ///
     /// Sort state is the table's order key. `global` is true when the
     /// whole scan's output is guaranteed sorted by that key:
@@ -1543,17 +1641,20 @@ pub const Scan = struct {
         const segs = self.segs;
         var seg_rows: u64 = 0;
         for (segs) |s| seg_rows += s.row_count;
+        const snapshot_rows = seg_rows + self.memtable_row_count;
 
         const memtable_empty = self.memtable_row_count == 0;
         const global = memtable_empty and self.scanIsGloballySorted(segs);
+        const pruned = self.prunedBounds();
 
         return .{
-            .upper_rows = seg_rows + self.memtable_row_count,
+            .upper_rows = if (pruned) |b| b.rows else snapshot_rows,
             .sort_state = .{
                 .keys = self.table.schema.order_key,
                 .global = global,
             },
-            .column_stats = self.cached_stats,
+            .column_stats = if (pruned) |b| b.stats else self.cached_stats,
+            .row_origin = .{ .snapshot = self.snapshot_id, .rows = snapshot_rows },
         };
     }
 

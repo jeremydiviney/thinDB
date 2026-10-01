@@ -1690,8 +1690,11 @@ pub const ParallelScan = struct {
         // the exception: one chunk-scan per stage chunk, emitted in chunk
         // index order = the source's row order, so its claim stands.
         if (self.n_threads > 1 and !self.ordered) st.sort_state = .{};
+        // A fused aggregate's groups or a probe's joined rows are built from
+        // several source rows.
+        if (self.agg_fused or self.probe_sink != null) st.row_origin = null;
         if (self.out_col_stats.len > 0) {
-            return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats };
+            return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats, .row_origin = st.row_origin };
         }
         return st;
     }

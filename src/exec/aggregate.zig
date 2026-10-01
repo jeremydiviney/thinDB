@@ -1415,7 +1415,9 @@ pub const Aggregate = struct {
 
     /// Global aggregate (no group_cols): always emits exactly 1 row.
     /// Grouped aggregate: emits at most `min(∏ NDV(group keys), input rows)`
-    /// rows — the provable group-count bound (cached at create). Output
+    /// rows — the provable group-count bound (cached at create), and at most
+    /// the input's row-origin rows when every key comes from it
+    /// (`exec.keyTupleBound`). Output
     /// columns: group-key columns carry their input stats, aggregate outputs
     /// are bounded by the group count with unknown min/max. Sort state:
     /// hash-based aggregate destroys any prior sort.
@@ -1455,7 +1457,9 @@ pub const Aggregate = struct {
 
         var product: u64 = 1;
         var known = up.column_stats.len == up_schema.len;
+        var from_row = known;
         if (known) {
+            for (self.group_col_indices) |ci| from_row = from_row and exec.fromRowOrigin(up, up.column_stats[ci]);
             for (self.group_col_indices) |ci| {
                 switch (up.column_stats[ci].ndv) {
                     .exact => |nd| product *|= nd,
@@ -1466,7 +1470,8 @@ pub const Aggregate = struct {
                 }
             }
         }
-        const upper: u64 = if (known) @min(product, up.upper_rows) else up.upper_rows;
+        const rows = exec.keyTupleBound(up, from_row);
+        const upper: u64 = if (known) @min(product, rows) else rows;
         self.cached_upper_rows = upper;
 
         // Output column stats: group keys keep their input stats; aggregate

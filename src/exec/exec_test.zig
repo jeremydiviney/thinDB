@@ -3694,3 +3694,104 @@ test "join: empty fused stage filter skips every lookup in a join chain" {
         }
     }
 }
+
+const ColStat = exec.ColStat;
+const ColCard = exec.ColCard;
+const ColumnOrigin = exec.ColumnOrigin;
+
+test "union NDV: arms over one table column hold at most its NDV, other arms sum" {
+    const s1a: ColumnOrigin = .{ .snapshot = 1, .column = 0, .ndv = .{ .exact = 100 } };
+    const s1b: ColumnOrigin = .{ .snapshot = 1, .column = 1, .ndv = .{ .exact = 100 } };
+    const s2a: ColumnOrigin = .{ .snapshot = 2, .column = 0, .ndv = .{ .exact = 100 } };
+    const cases = .{
+        // Same column of one snapshot: the sum, capped at the column's NDV.
+        .{ .l = ColStat{ .ndv = .{ .exact = 80 }, .origin = s1a }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 60 }, .origin = s1a }, .r_rows = 1000, .ndv = ColCard{ .exact = 100 }, .origin = @as(?ColumnOrigin, s1a) },
+        .{ .l = ColStat{ .ndv = .{ .exact = 30 }, .origin = s1a }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 20 }, .origin = s1a }, .r_rows = 1000, .ndv = ColCard{ .exact = 50 }, .origin = @as(?ColumnOrigin, s1a) },
+        .{ .l = ColStat{ .ndv = .unknown, .origin = s1a }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 60 }, .origin = s1a }, .r_rows = 1000, .ndv = ColCard{ .exact = 100 }, .origin = @as(?ColumnOrigin, s1a) },
+        // Another column, another snapshot, or no origin: the plain sum.
+        .{ .l = ColStat{ .ndv = .{ .exact = 80 }, .origin = s1a }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 60 }, .origin = s1b }, .r_rows = 1000, .ndv = ColCard{ .exact = 140 }, .origin = @as(?ColumnOrigin, null) },
+        .{ .l = ColStat{ .ndv = .{ .exact = 80 }, .origin = s1a }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 60 }, .origin = s2a }, .r_rows = 1000, .ndv = ColCard{ .exact = 140 }, .origin = @as(?ColumnOrigin, null) },
+        .{ .l = ColStat{ .ndv = .{ .exact = 80 } }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 60 } }, .r_rows = 1000, .ndv = ColCard{ .exact = 140 }, .origin = @as(?ColumnOrigin, null) },
+        .{ .l = ColStat{ .ndv = .unknown, .origin = s1a }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 60 }, .origin = s2a }, .r_rows = 1000, .ndv = ColCard.unknown, .origin = @as(?ColumnOrigin, null) },
+        // An empty arm adds nothing: the other arm's stat stands.
+        .{ .l = ColStat{ .ndv = .{ .exact = 80 }, .origin = s1a }, .l_rows = 1000, .r = ColStat{ .ndv = .{ .exact = 60 }, .origin = s2a }, .r_rows = 0, .ndv = ColCard{ .exact = 80 }, .origin = @as(?ColumnOrigin, s1a) },
+        .{ .l = ColStat{ .ndv = .{ .exact = 80 }, .origin = s1a }, .l_rows = 0, .r = ColStat{ .ndv = .{ .exact = 60 }, .origin = s2a }, .r_rows = 1000, .ndv = ColCard{ .exact = 60 }, .origin = @as(?ColumnOrigin, s2a) },
+    };
+    inline for (cases) |c| {
+        const merged = exec.mergeUnionColStat(c.l, c.l_rows, c.r, c.r_rows);
+        try std.testing.expectEqual(c.ndv, merged.ndv);
+        try std.testing.expectEqual(c.origin, merged.origin);
+    }
+}
+
+test "union row origin: shared by arms over one snapshot, or the non-empty arm's" {
+    const s1: exec.RowOrigin = .{ .snapshot = 1, .rows = 100 };
+    const s2: exec.RowOrigin = .{ .snapshot = 2, .rows = 100 };
+    const cases = .{
+        .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 40, .row_origin = s1 }, .want = @as(?exec.RowOrigin, s1) },
+        .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 40, .row_origin = s2 }, .want = @as(?exec.RowOrigin, null) },
+        .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 40 }, .want = @as(?exec.RowOrigin, null) },
+        .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 0 }, .want = @as(?exec.RowOrigin, s1) },
+        .{ .l = exec.PipelineStats{ .upper_rows = 0, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 40, .row_origin = s2 }, .want = @as(?exec.RowOrigin, s2) },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c.want, exec.unionRowOrigin(c.l, c.r));
+}
+
+test "distinct row bound: key tuples from one snapshot's rows cap at its rows" {
+    const o0: ColumnOrigin = .{ .snapshot = 1, .column = 0, .ndv = .{ .exact = 50 } };
+    const o1: ColumnOrigin = .{ .snapshot = 1, .column = 1, .ndv = .{ .exact = 50 } };
+    const other: ColumnOrigin = .{ .snapshot = 9, .column = 0, .ndv = .{ .exact = 50 } };
+    const cols = [_]ColStat{
+        .{ .ndv = .{ .exact = 50 }, .origin = o0 },
+        .{ .ndv = .{ .exact = 50 }, .origin = o1 },
+        .{ .ndv = .{ .exact = 3 } },
+        .{ .ndv = .{ .exact = 50 }, .origin = other },
+        .{ .ndv = .unknown, .origin = o0 },
+    };
+    const union_of_two_arms: exec.PipelineStats = .{ .upper_rows = 200, .column_stats = &cols, .row_origin = .{ .snapshot = 1, .rows = 100 } };
+    const no_origin: exec.PipelineStats = .{ .upper_rows = 200, .column_stats = &cols };
+    const cases = .{
+        .{ .st = union_of_two_arms, .width = 1, .want = 50 },
+        .{ .st = union_of_two_arms, .width = 2, .want = 100 },
+        .{ .st = union_of_two_arms, .width = 3, .want = 200 },
+        .{ .st = union_of_two_arms, .width = 4, .want = 200 },
+        .{ .st = union_of_two_arms, .width = 5, .want = 200 },
+        .{ .st = no_origin, .width = 2, .want = 200 },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(@as(u64, c.want), exec.distinctRowBound(c.st, c.width));
+
+    var only_origin_keys = union_of_two_arms;
+    only_origin_keys.column_stats = &.{ cols[0], cols[4] };
+    try std.testing.expectEqual(@as(u64, 100), exec.distinctRowBound(only_origin_keys, 2));
+}
+
+test "INTERSECT / EXCEPT bound: at most the left arm's distinct rows, and the right's for INTERSECT" {
+    const left_cols = [_]ColStat{
+        .{ .ndv = .{ .exact = 10 }, .min = 0, .max = 9 },
+        .{ .ndv = .{ .exact = 20 } },
+    };
+    const right_cols = [_]ColStat{
+        .{ .ndv = .{ .exact = 5 }, .min = 5, .max = 30 },
+        .{ .ndv = .{ .exact = 50 } },
+    };
+    const left: exec.PipelineStats = .{ .upper_rows = 1000, .column_stats = &left_cols };
+    const right: exec.PipelineStats = .{ .upper_rows = 50, .column_stats = &right_cols };
+    const cases = .{
+        .{ .kind = exec.SubsetSetOp.except, .rows = 200, .ndv0 = 10, .min0 = 0, .max0 = 9, .ndv1 = 20 },
+        .{ .kind = exec.SubsetSetOp.intersect, .rows = 50, .ndv0 = 5, .min0 = 5, .max0 = 9, .ndv1 = 20 },
+    };
+    inline for (cases) |c| {
+        var out: [2]ColStat = undefined;
+        try std.testing.expectEqual(@as(u64, c.rows), exec.subsetSetOpBound(c.kind, left, right, &out));
+        try std.testing.expectEqual(ColCard{ .exact = c.ndv0 }, out[0].ndv);
+        try std.testing.expectEqual(@as(?i128, c.min0), out[0].min);
+        try std.testing.expectEqual(@as(?i128, c.max0), out[0].max);
+        try std.testing.expectEqual(ColCard{ .exact = c.ndv1 }, out[1].ndv);
+    }
+
+    var tiny_left = left;
+    tiny_left.upper_rows = 3;
+    var out: [2]ColStat = undefined;
+    try std.testing.expectEqual(@as(u64, 3), exec.subsetSetOpBound(.except, tiny_left, right, &out));
+    try std.testing.expectEqual(ColCard{ .exact = 3 }, out[0].ndv);
+}
