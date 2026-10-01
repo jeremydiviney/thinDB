@@ -127,10 +127,10 @@ pub const MaterializedResult = struct {
     /// Keyed-region exit graft: adopt N slice sinks' contiguous stores as
     /// this result's chunks, in slice order — a deterministic concat
     /// (disjoint key ranges in ascending slice order also preserve a
-    /// leading-slice-key sort). Takes full ownership: the sinks' store/arena
+    /// leading-slice-key sort). Takes full ownership: the sinks' store
     /// arrays are copied into one flat Adopted record and their top-level
-    /// arrays freed; the arena-backed column data frees with the result's
-    /// normal adopted sweep.
+    /// arrays freed; the column data frees with the result's normal adopted
+    /// sweep.
     pub const SliceKey = struct {
         col: []const u8,
         /// Ascending slice boundaries: slice i holds (bounds[i-1], bounds[i]],
@@ -143,20 +143,20 @@ pub const MaterializedResult = struct {
         const ncols = self.schema.len;
         const stores = try self.allocator.alloc(engine.ColumnStore, sinks.len * ncols);
         errdefer self.allocator.free(stores);
-        const arenas = try self.allocator.alloc(std.heap.ArenaAllocator, sinks.len * ncols);
-        errdefer self.allocator.free(arenas);
         const backed = try self.allocator.alloc(bool, sinks.len * ncols);
         errdefer self.allocator.free(backed);
+        // Every sink of one query draws from the same tracked worker
+        // allocator (wrappers are deduplicated per accountant).
+        var store_alloc: ?Allocator = null;
         for (sinks, 0..) |*sk, i| {
             const ad = sk.take();
             @memcpy(stores[i * ncols ..][0..ncols], ad.stores);
-            @memcpy(arenas[i * ncols ..][0..ncols], ad.arenas);
             @memcpy(backed[i * ncols ..][0..ncols], ad.arena_backed);
+            store_alloc = ad.store_alloc;
             sk.allocator.free(ad.stores);
-            sk.allocator.free(ad.arenas);
             sk.allocator.free(ad.arena_backed);
         }
-        self.adopted = .{ .stores = stores, .arenas = arenas, .arena_backed = backed };
+        self.adopted = .{ .stores = stores, .arenas = &.{}, .arena_backed = backed, .store_alloc = store_alloc };
         if (key) |k| self.sliced_key = k.col;
         for (sinks, 0..) |*sk, i| {
             const pstores = stores[i * ncols ..][0..ncols];
@@ -641,37 +641,38 @@ fn derivedIndexAt(c: *const exec.Compute, out_idx: usize) ?usize {
 }
 
 /// Accumulates a stage's pull-copied result as ONE contiguous store per
-/// column (adopted-style; per-column arenas so the sweep-free ownership
-/// story matches window adoption), for stages a downstream window wants to
-/// borrow from. Fixed-width buffers pre-reserve the stage's row bound.
+/// column (adopted-style), for stages a downstream join build, window or
+/// table function reads in place. Stores start empty and grow with what arrives: the stage's row
+/// bound is a compile-time ceiling that can be millions of rows over a
+/// result of a few. They come from the worker allocator rather than arenas,
+/// so each growth frees the buffer it outgrew instead of stranding it.
 pub const ContigSink = struct {
     allocator: Allocator,
+    store_alloc: Allocator,
     stores: []engine.ColumnStore,
-    arenas: []std.heap.ArenaAllocator,
     arena_backed: []bool,
     rows: u64 = 0,
     taken: bool = false,
 
-    pub fn init(allocator: Allocator, schema: []const Column, expect_rows: usize) !ContigSink {
+    pub fn init(allocator: Allocator, schema: []const Column) !ContigSink {
+        const store_alloc = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), std.heap.c_allocator);
         const stores = try allocator.alloc(engine.ColumnStore, schema.len);
         errdefer allocator.free(stores);
-        const arenas = try allocator.alloc(std.heap.ArenaAllocator, schema.len);
-        errdefer allocator.free(arenas);
         const arena_backed = try allocator.alloc(bool, schema.len);
         errdefer allocator.free(arena_backed);
-        @memset(arena_backed, true);
-        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), std.heap.c_allocator);
-        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
-        errdefer for (arenas) |*a| a.deinit();
-        for (schema, stores, arenas) |sc, *st, *ar| {
-            st.* = try engine.ColumnStore.initCapacity(ar.allocator(), sc.type, sc.nullable, expect_rows, 0);
+        @memset(arena_backed, false);
+        var built: usize = 0;
+        errdefer for (stores[0..built]) |*st| st.deinit(store_alloc);
+        for (schema, stores) |sc, *st| {
+            st.* = try engine.ColumnStore.init(store_alloc, sc.type, sc.nullable);
+            built += 1;
         }
-        return .{ .allocator = allocator, .stores = stores, .arenas = arenas, .arena_backed = arena_backed };
+        return .{ .allocator = allocator, .store_alloc = store_alloc, .stores = stores, .arena_backed = arena_backed };
     }
 
     pub fn append(self: *ContigSink, batch: exec.Batch) !void {
-        for (self.stores, self.arenas, 0..) |*st, *ar, ci| {
-            try engine.transform.appendAllColumn(ar.allocator(), batch.values[ci], st);
+        for (self.stores, 0..) |*st, ci| {
+            try engine.transform.appendAllColumn(self.store_alloc, batch.values[ci], st);
         }
         self.rows += batch.row_count;
     }
@@ -679,27 +680,26 @@ pub const ContigSink = struct {
     /// Size every store once for a fill whose totals are known up front.
     pub fn reserve(self: *ContigSink, rows: usize, str_bytes: []const u64) !void {
         const total: usize = @as(usize, @intCast(self.rows)) + rows;
-        for (self.stores, self.arenas, str_bytes) |*st, *ar, b| try st.reserveTotal(ar.allocator(), total, @intCast(b));
+        for (self.stores, str_bytes) |*st, b| try st.reserveTotal(self.store_alloc, total, @intCast(b));
     }
 
     /// Append only the picked rows — the scan-once partition router's gather.
     pub fn appendIndices(self: *ContigSink, batch: exec.Batch, indices: []const u32) !void {
-        for (self.stores, self.arenas, 0..) |*st, *ar, ci| {
-            try engine.transform.appendByIndices(ar.allocator(), batch.values[ci], indices, st);
+        for (self.stores, 0..) |*st, ci| {
+            try engine.transform.appendByIndices(self.store_alloc, batch.values[ci], indices, st);
         }
         self.rows += indices.len;
     }
 
     pub fn take(self: *ContigSink) MaterializedResult.Adopted {
         self.taken = true;
-        return .{ .stores = self.stores, .arenas = self.arenas, .arena_backed = self.arena_backed };
+        return .{ .stores = self.stores, .arenas = &.{}, .arena_backed = self.arena_backed, .store_alloc = self.store_alloc };
     }
 
     pub fn deinit(self: *ContigSink) void {
         if (self.taken) return;
-        for (self.arenas) |*a| a.deinit();
+        for (self.stores) |*st| st.deinit(self.store_alloc);
         self.allocator.free(self.stores);
-        self.allocator.free(self.arenas);
         self.allocator.free(self.arena_backed);
     }
 };
@@ -834,7 +834,7 @@ pub const Stage = struct {
                 ad.rows,
             );
         } else if (self.want_contiguous) {
-            var contig = try ContigSink.init(self.allocator, self.schema, self.expectedRowsHint());
+            var contig = try ContigSink.init(self.allocator, self.schema);
             errdefer contig.deinit();
             if (self.fill_dop > 1 and self.query.stableData()) {
                 try self.fillContigParallel(&contig, row_bytes, prof_on, &append_ticks);
@@ -969,7 +969,7 @@ pub const Stage = struct {
         for (batches.items, 0..) |b, bi| {
             for (0..ncols) |ci| {
                 preps[bi * ncols + ci] = try engine.transform.prepareAppend(
-                    contig.arenas[ci].allocator(),
+                    contig.store_alloc,
                     b.views[ci],
                     b.rows,
                     &contig.stores[ci],
@@ -1030,11 +1030,6 @@ pub const Stage = struct {
                 self.id, batches.items.len, total, n_workers,
             });
         }
-    }
-
-    fn expectedRowsHint(self: *const Stage) usize {
-        const cap: u64 = 1 << 22; // don't pre-reserve absurd compile-time bounds
-        return @intCast(@min(self.stats_upper_rows, cap));
     }
 
     fn releaseReserved(self: *Stage) void {

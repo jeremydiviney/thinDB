@@ -3653,6 +3653,60 @@ test "sql: a stage read by a later CTE and the root outlives the stages between"
     try std.testing.expectEqual([2]f64{ rows, 4 * amounts + 5 * rows }, run.rows[1]);
 }
 
+test "sql: a borrowed stage over a few rows of a large table holds those rows, not its row bound" {
+    const allocator = std.testing.allocator;
+    const rows = 400_000;
+    const Row = struct { id: i64, g: i64, amt: f64 };
+    const seed = try allocator.alloc(Row, rows);
+    defer allocator.free(seed);
+    for (seed, 0..) |*row, i| row.* = .{ .id = @intCast(i), .g = @intCast(i % 7), .amt = @floatFromInt(i % 1000) };
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
+            .query_memory_budget = 1 << 30,
+            .memory_budget = 1 << 30,
+            .auto_flush_secs = 0,
+            .max_dop = dop,
+        });
+        defer db.close();
+        const facts = try db.table("facts", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g", .type = .bigint },
+                .{ .name = "amt", .type = .double },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .unique = false });
+        try facts.insert(seed);
+        try facts.flush();
+
+        // A join building on `few`, or (above one thread) a window over it,
+        // reads its columns in place, so `few` materializes one contiguous
+        // store per column. Its compile-time row bound is the whole table,
+        // and its stores used to reserve that bound up front, peaking at 22
+        // to 26 MB for a stage that holds 400 rows.
+        const shapes = .{
+            \\WITH few AS (SELECT id, g, amt FROM facts WHERE amt = 5)
+            \\SELECT a.id, a.g, b.amt FROM few a JOIN few b ON a.id = b.id
+            ,
+            \\WITH few AS (SELECT id, g, amt FROM facts WHERE amt = 5),
+            \\w AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS r FROM few)
+            \\SELECT w.id, w.r, f.amt FROM w JOIN few f ON f.id = w.id
+            ,
+        };
+        inline for (shapes) |sql| {
+            var q = try runSql(allocator, db, sql);
+            defer q.deinit();
+            var n: usize = 0;
+            while (try q.next()) |b| n += b.row_count;
+            try std.testing.expectEqual(@as(usize, rows / 1000), n);
+            try std.testing.expect(q.cq.ctx.accountant.?.peak_bytes < rows * @sizeOf(Row));
+        }
+    }
+}
+
 test "sql: blocking paths release all actual capacity at teardown" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
