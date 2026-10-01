@@ -4526,3 +4526,137 @@ test "sql: a GROUP BY buffers only the columns its keys and aggregates read" {
         try std.testing.expect(peak < stage_peak + raw * 2 / 5);
     }
 }
+
+/// Run `sql`, whose columns are all BIGINT, to completion: its rows as
+/// `a,b;` text and the statement's charged peak.
+fn runBigints(allocator: std.mem.Allocator, db: anytype, sql: []const u8, out: *std.ArrayList(u8)) !usize {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            for (batch.values, 0..) |view, column| {
+                try out.print(allocator, "{s}{d}", .{ if (column == 0) "" else ",", view.data.bigint[row] });
+            }
+            try out.append(allocator, ';');
+        }
+    }
+    return q.cq.ctx.accountant.?.peak_bytes;
+}
+
+fn openWide(allocator: std.mem.Allocator, dir: std.Io.Dir, row_group_size: usize, max_dop: usize, rows: usize) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, std.testing.io, dir, .{
+        .query_memory_budget = 1 << 30,
+        .memory_budget = 1 << 30,
+        .auto_flush_secs = 0,
+        .max_dop = max_dop,
+        .row_group_size = row_group_size,
+    });
+    errdefer db.close();
+    try seedWide(db, rows);
+    return db;
+}
+
+/// A GROUP BY over a UNION ALL arm that reads `g` under a filter on the wide
+/// `s`. Every row passes the filter; the second arm is empty.
+const FILTER_ONLY_WIDE =
+    \\SELECT g, COUNT(*) AS c FROM (
+    \\  SELECT g FROM wide WHERE s <> ''
+    \\  UNION ALL
+    \\  SELECT g FROM wide WHERE id < 0
+    \\) t GROUP BY g ORDER BY g LIMIT 3
+;
+
+// Issue #492. A parallel scan with a fused filter copies its survivors into
+// its own buffers before it emits them. `s` is read by the filter alone, yet
+// every survivor's `s` was copied too: the projection above the filter never
+// told the scan what it reads. Small row groups keep the scan's per-chunk
+// scratch out of the measurement.
+test "sql: a filtered parallel scan copies only the columns read above its filter" {
+    const allocator = std.testing.allocator;
+    const rows = 100_000;
+    const raw = rows * WIDE_PAD;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openWide(allocator, tmp.dir, 512, 4, rows);
+    defer db.close();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    const peak = try runBigints(allocator, db, FILTER_ONLY_WIDE, &got);
+    try std.testing.expectEqualStrings("0,100;1,100;2,100;", got.items);
+    try std.testing.expect(peak < raw / 2);
+}
+
+// Issue #492. Each chunk of a parallel scan compacts a row group's survivors
+// into scratch of its own, here a row group of `s`. A chunk that had finished
+// draining kept that scratch until the statement ended, so the scan held a
+// row group for every chunk, four chunks to a thread, where it now holds one
+// for each thread still draining.
+test "sql: a parallel scan's chunk releases its row-group scratch once drained" {
+    const allocator = std.testing.allocator;
+    const rows = 100_000;
+    const raw = rows * WIDE_PAD;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openWide(allocator, tmp.dir, 4096, 4, rows);
+    defer db.close();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    const peak = try runBigints(allocator, db, FILTER_ONLY_WIDE, &got);
+    try std.testing.expectEqualStrings("0,100;1,100;2,100;", got.items);
+    try std.testing.expect(peak < raw / 2);
+}
+
+// Issue #492. Each scan narrows to what the projection above its own filter
+// reads, whatever another reader of the same table or stage keeps. `g` is
+// filtered on and projected in both arms, behind the filter-only `id` in the
+// second, so dropping `id` moves it; `s` is filtered on alone in the first
+// and read through a compute in the last statement. The
+// serial plan (one thread) and the parallel one return the same rows.
+test "sql: readers of one source keep their own columns under their filters" {
+    const allocator = std.testing.allocator;
+    const cases = .{
+        .{
+            .sql =
+            \\SELECT k, COUNT(*) AS c FROM (
+            \\  SELECT g AS k FROM wide WHERE s <> '' AND g < 3
+            \\  UNION ALL
+            \\  SELECT g AS k FROM wide WHERE id >= 1000 AND id < 3000 AND g <> 3
+            \\) t GROUP BY k ORDER BY k LIMIT 4
+            ,
+            .want = "0,22;1,22;2,22;4,2;",
+        },
+        .{
+            .sql =
+            \\WITH w AS MATERIALIZED (SELECT id, g, s FROM wide WHERE id < 5000)
+            \\SELECT k, COUNT(*) AS c FROM (
+            \\  SELECT g AS k FROM w WHERE s <> '' AND g < 2
+            \\  UNION ALL
+            \\  SELECT g AS k FROM w WHERE id >= 1000 AND id < 3000 AND g <> 3
+            \\) t GROUP BY k ORDER BY k LIMIT 4
+            ,
+            .want = "0,7;1,7;2,2;4,2;",
+        },
+    };
+    inline for (.{ 1, 4 }) |max_dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try openWide(allocator, tmp.dir, 1024, max_dop, 20_000);
+        defer db.close();
+        inline for (cases) |case| {
+            var got: std.ArrayList(u8) = .empty;
+            defer got.deinit(allocator);
+            _ = try runBigints(allocator, db, case.sql, &got);
+            try std.testing.expectEqualStrings(case.want, got.items);
+        }
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(allocator);
+        _ = try runWide(allocator, db,
+            \\SELECT g, MIN(code) AS m FROM (
+            \\  SELECT g, LEFT(s, 3) AS code FROM wide WHERE s <> '' AND g < 3
+            \\  UNION ALL
+            \\  SELECT g, LEFT(s, 3) AS code FROM wide WHERE s = '' AND g > 3
+            \\) t GROUP BY g ORDER BY g LIMIT 3
+        , &got);
+        try std.testing.expectEqualStrings("0:000;1:007;2:014;", got.items);
+    }
+}

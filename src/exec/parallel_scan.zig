@@ -616,6 +616,13 @@ const Leaf = union(enum) {
             .chunk => false,
         };
     }
+    /// Segment-only: a buffer leaf reads its stage's buffers in place.
+    fn releaseScratch(self: Leaf) void {
+        switch (self) {
+            .segment => |s| s.releaseScratch(),
+            .chunk => {},
+        }
+    }
     /// Segment-only: zone-map-surviving row groups for the DOP clamp. A buffer
     /// has no zone maps → null → the clamp keeps the full configured DOP.
     fn survivingWorkUnits(self: Leaf) ?usize {
@@ -1645,10 +1652,12 @@ pub const ParallelScan = struct {
     /// reaches here past a fused (pass-through) Filter; an unfused Filter
     /// swallows the projection before it reaches us. The round (stream) path
     /// of a scan without a compute emits the scan's already-pruned columns,
-    /// so there is nothing dead to drop.
+    /// so there is nothing dead to drop. A scan that has started emitting
+    /// keeps the columns its buffers were filled with, and one that probes a
+    /// join emits the join's rows, which `keep` does not name.
     pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
-        if (self.agg_fused) return;
-        if (self.compute_fused and self.mode == .unset and self.probe_sink == null and self.emit_keep == null) {
+        if (self.agg_fused or self.probe_sink != null or self.mode != .unset) return;
+        if (self.compute_fused and self.emit_keep == null) {
             const schema = self.compute_q[0].outputSchema();
             const all_present = for (keep) |name| {
                 if (types.findColumn(schema, name) == null) break false;
@@ -2438,6 +2447,10 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
         const sink = if (self.agg_fused) null else self.probe_sink;
         const remap: ?[]ColumnView = if (sink != null and self.probe_map_views.len > 0) self.probe_map_views[i] else null;
         drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, sink, i, remap, &self.wbufs[i], &self.werr[i]);
+        // The chunk's survivors are copied out and its leaf is exhausted;
+        // the leaf's decode buffers would otherwise sit beside every later
+        // chunk's and under whatever the consumer builds from the rows.
+        if (i < self.workers.len) self.workers[i].releaseScratch();
     }
 }
 
