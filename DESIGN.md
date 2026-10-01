@@ -800,6 +800,32 @@ lookup builds through a chain of non-FULL joins. The check reuses stage buffers,
 retains parallel probing for nonempty inputs, and does not add a materialization
 boundary or choose a different join order or algorithm.
 
+The group count those plans are priced and sized from is the product of the
+keys' NDVs, capped at the input's row bound. Both come from the stats every
+operator reports (`PipelineStats`), and both stay upper bounds (issue #478). A
+table scan reports its snapshot's rows and each column's merged segment sketch.
+Once a filter's prune hints skip segments or row groups, it reports only the
+surviving row groups' rows, and NDVs from the surviving segments' sketches. A
+filter whose predicate the column stats prove empty reports no rows and no
+values. When a consumer narrows the columns a scan-fused filter emits, the
+filter's tightened column stats follow their columns by name. A UNION ALL sums
+its arms' rows and NDVs, except where both arms read the same column of the
+same table snapshot. That column's NDV then caps the sum, because a value both
+arms hold counts once. An arm that reports no rows adds nothing to the union,
+so an operator reports 0 rows only when it proves it emits none; a group-topN
+without a LIMIT reports its table's rows. Each column carries that
+provenance (`ColStat.origin`) while operators only filter, project, rename,
+join or group it; anything that computes new values drops it. A scan also marks
+its rows as its snapshot's (`PipelineStats.row_origin`), and filters,
+projections, computes and limits keep the mark, while joins, aggregates and
+windows drop it. When every key of a grouping reads a column of the marked
+snapshot, each key tuple is one table row's, so the group count is also capped
+at the snapshot's rows: a UNION of two arms over one table can't have more
+distinct rows than the table. An INTERSECT's or EXCEPT's grouping still holds
+every distinct row of both arms, but the groups it keeps are rows of the left
+arm, and for INTERSECT of the right arm too. Its output is bounded by those
+arms' distinct rows and their columns' NDVs.
+
 A keyed GROUP BY whose keys aren't a sorted prefix of its input picks its plan
 (hash, partitioned hash, or sort then stream) by pricing each against the
 query's memory headroom. The price starts from the input's size: its row count

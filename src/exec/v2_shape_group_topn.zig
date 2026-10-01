@@ -388,6 +388,9 @@ const GroupTopNPipeline = struct {
     /// a batch. A serial emit fills `output_cols` and emits once.
     ranges: ?EmitRanges = null,
     range_cursor: usize = 0,
+    /// At most one group per table row, and at most `request.limit` when
+    /// set. A limit of 0 means no limit, so it bounds nothing.
+    upper_rows: u64,
 
     fn init(allocator: Allocator, table: *api.Table, request: Request, plan: ShapePlan) !GroupTopNPipeline {
         const owned_needed = if (request.needed) |needed| try allocator.dupe([]const u8, needed) else null;
@@ -427,6 +430,7 @@ const GroupTopNPipeline = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        const rows = tableRows(table);
         return .{
             .allocator = allocator,
             .table = table,
@@ -436,7 +440,16 @@ const GroupTopNPipeline = struct {
             .output_cols = output_cols,
             .views = views,
             .owned_needed = owned_needed,
+            .upper_rows = if (request.limit != 0) @min(rows, @as(u64, request.limit)) else rows,
         };
+    }
+
+    fn tableRows(table: *api.Table) u64 {
+        table.mutex.lockUncancelable(table.io);
+        defer table.mutex.unlock(table.io);
+        var rows: u64 = table.memtable.row_count;
+        for (table.manifest.segments.items) |entry| rows += entry.row_count;
+        return rows;
     }
 
     pub fn deinit(self: *GroupTopNPipeline) void {
@@ -458,7 +471,7 @@ const GroupTopNPipeline = struct {
     pub fn addPrune(_: *GroupTopNPipeline, _: exec.Predicate) !void {}
 
     pub fn stats(self: *GroupTopNPipeline) exec.PipelineStats {
-        return .{ .upper_rows = self.request.limit };
+        return .{ .upper_rows = self.upper_rows };
     }
 
     pub fn accountant(_: *GroupTopNPipeline) ?*exec.memory.MemoryAccountant {

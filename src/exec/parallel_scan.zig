@@ -218,8 +218,8 @@ test "createOverStage: parallel buffer scan preserves the row multiset" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.data.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
@@ -289,8 +289,8 @@ test "createOverStageOrdered: emission is the stage's exact row order" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.data.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
@@ -417,8 +417,8 @@ test "createOverStage: row-striped units keep every row and its validity bit" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.v.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
@@ -513,8 +513,8 @@ test "createOverStage + fused partial aggregate drains without corruption" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: predicate.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.kdata.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
@@ -1690,8 +1690,11 @@ pub const ParallelScan = struct {
         // the exception: one chunk-scan per stage chunk, emitted in chunk
         // index order = the source's row order, so its claim stands.
         if (self.n_threads > 1 and !self.ordered) st.sort_state = .{};
+        // A fused aggregate's groups or a probe's joined rows are built from
+        // several source rows.
+        if (self.agg_fused or self.probe_sink != null) st.row_origin = null;
         if (self.out_col_stats.len > 0) {
-            return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats };
+            return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats, .row_origin = st.row_origin };
         }
         return st;
     }

@@ -239,6 +239,7 @@ pub const Project = struct {
                 .global = up.sort_state.global,
             },
             .column_stats = self.cached_stats,
+            .row_origin = if (self.probe_fused) null else up.row_origin,
         };
     }
 
@@ -539,6 +540,7 @@ pub const Limit = struct {
             .upper_rows = @min(@as(u64, self.remaining), up.upper_rows),
             .sort_state = up.sort_state,
             .column_stats = if (self.cached_stats.len > 0) self.cached_stats else up.column_stats,
+            .row_origin = up.row_origin,
         };
     }
 

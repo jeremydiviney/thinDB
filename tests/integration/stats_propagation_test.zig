@@ -1214,3 +1214,178 @@ test "stats: grouped SUM(b) carries provable bounds per output" {
     try std.testing.expectEqual(@as(?i128, 600), s.column_stats[1].min);
     try std.testing.expectEqual(@as(?i128, 3600), s.column_stats[1].max);
 }
+
+fn exactNdv(c: ColCard) !u32 {
+    return switch (c) {
+        .exact => |n| n,
+        .unknown => error.TestUnexpectedResult,
+    };
+}
+
+test "stats: a filter the column stats prove empty emits no rows and no values (#478)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db); // c ∈ [100, 600]
+
+    const cases = .{
+        thindb.leafExpr("c", .gt, .{ .int = 700 }),
+        thindb.leafExpr("c", .lt, .{ .int = 0 }),
+        thindb.leafExpr("c", .eq, .{ .int = 999 }),
+    };
+    inline for (cases) |pred| {
+        const base = try thindb.scan(allocator, t);
+        var q = try base.filter(pred);
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, 0), s.upper_rows);
+        try std.testing.expectEqual(@as(usize, 2), s.column_stats.len);
+        for (s.column_stats) |cs| try std.testing.expectEqual(ColCard{ .exact = 0 }, cs.ndv);
+        try std.testing.expectEqual(@as(u64, 0), try drainCount(&q));
+    }
+}
+
+test "stats: a pruned scan counts only the row groups its hints keep (#478)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 2 });
+    defer db.close();
+    // Row groups by id: [1,2] [3,4] [10,11].
+    const t = try db.table("pr", pn_schema, pn_opts);
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .c = @as(i32, 100) },
+        .{ .id = @as(i64, 2), .c = @as(i32, 200) },
+        .{ .id = @as(i64, 3), .c = @as(i32, 300) },
+        .{ .id = @as(i64, 4), .c = @as(i32, 400) },
+        .{ .id = @as(i64, 10), .c = @as(i32, 500) },
+        .{ .id = @as(i64, 11), .c = @as(i32, 600) },
+    });
+    try t.flush();
+
+    const cases = .{
+        .{ .pred = thindb.leafExpr("id", .gte, .{ .int = 3 }), .rows = 4, .survivors = 4 },
+        .{ .pred = thindb.leafExpr("id", .eq, .{ .int = 2 }), .rows = 2, .survivors = 1 },
+        .{ .pred = thindb.leafExpr("id", .lt, .{ .int = 4 }), .rows = 4, .survivors = 3 },
+        // Inside the column's range, in no row group's: nothing survives.
+        .{ .pred = thindb.leafExpr("id", .eq, .{ .int = 7 }), .rows = 0, .survivors = 0 },
+    };
+    inline for (cases) |c| {
+        const base = try thindb.scan(allocator, t);
+        var q = try base.filter(c.pred);
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, c.rows), s.upper_rows);
+        for (s.column_stats) |cs| try std.testing.expect(try exactNdv(cs.ndv) <= c.rows);
+        try std.testing.expectEqual(@as(u64, 6), s.row_origin.?.rows);
+        try std.testing.expectEqual(@as(u64, c.survivors), try drainCount(&q));
+    }
+}
+
+test "stats: union arms over one table column hold at most its NDV, and key tuples at most its rows (#478)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db); // 6 rows; a {10,20,30}, b {100..600}
+
+    var one_arm = try thindb.scan(allocator, t);
+    const arm = one_arm.stats();
+    const arm_a = try exactNdv(arm.column_stats[1].ndv);
+    const arm_b = try exactNdv(arm.column_stats[2].ndv);
+    one_arm.deinit();
+
+    const u = try thindb.exec.SetUnion.create(allocator, try thindb.scan(allocator, t), try thindb.scan(allocator, t), true);
+    const s = u.stats();
+    try std.testing.expectEqual(@as(u64, 12), s.upper_rows);
+    try std.testing.expectEqual(arm_a, try exactNdv(s.column_stats[1].ndv));
+    try std.testing.expectEqual(arm_b, try exactNdv(s.column_stats[2].ndv));
+    try std.testing.expectEqual(@as(u64, 6), s.row_origin.?.rows);
+
+    // Every (a, b) tuple is one table row's: at most 6 groups, not 12.
+    var grouped = try u.groupBy(&.{ "a", "b" }, &.{.{ .func = .count, .as = "n" }});
+    defer grouped.deinit();
+    try std.testing.expectEqual(@as(u64, 6), grouped.stats().upper_rows);
+}
+
+test "stats: union arms over different columns or tables sum their NDVs (#478)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db); // a {10,20,30}, b {100..600}
+
+    var one_arm = try thindb.scan(allocator, t);
+    const arm = one_arm.stats();
+    const arm_a = try exactNdv(arm.column_stats[1].ndv);
+    const arm_b = try exactNdv(arm.column_stats[2].ndv);
+    one_arm.deinit();
+
+    // SELECT a ... UNION ALL SELECT b ...: a's and b's values are unrelated.
+    const left = try (try thindb.scan(allocator, t)).project(&.{"a"});
+    const right = try (try thindb.scan(allocator, t)).project(&.{"b"});
+    const u = try thindb.exec.SetUnion.create(allocator, left, right, true);
+    const s = u.stats();
+    try std.testing.expectEqual(arm_a + arm_b, try exactNdv(s.column_stats[0].ndv));
+    try std.testing.expect(s.column_stats[0].origin == null);
+    // Each row is one table row's, but its value comes from another column
+    // per arm: no tuple cap.
+    var grouped = try u.groupBy(&.{"a"}, &.{.{ .func = .count, .as = "n" }});
+    defer grouped.deinit();
+    try std.testing.expectEqual(@as(u64, @min(arm_a + arm_b, 12)), grouped.stats().upper_rows);
+}
+
+test "stats: a bounded filter keeps at most its creator's bound (#478)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    const bound_cols = [_]thindb.exec.ColStat{ .{}, .{ .ndv = .{ .exact = 2 }, .min = 20, .max = 40 } };
+    const base = try thindb.scan(allocator, t);
+    var q = try base.filterBounded(thindb.leafExpr("b", .gt, .{ .int = 150 }), .{ .rows = 4, .column_stats = &bound_cols });
+    defer q.deinit();
+    const s = q.stats();
+    try std.testing.expectEqual(@as(u64, 4), s.upper_rows);
+    try std.testing.expectEqual(ColCard{ .exact = 2 }, s.column_stats[1].ndv);
+    try std.testing.expectEqual(@as(?i128, 20), s.column_stats[1].min);
+    try std.testing.expectEqual(@as(?i128, 30), s.column_stats[1].max);
+    try std.testing.expect(try exactNdv(s.column_stats[2].ndv) <= 4);
+}
+
+test "stats: a scan-fused filter's stats follow the columns a consumer's projection keeps" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db); // a {10,20,30}, b {100..600}
+
+    const base = try thindb.exec.ParallelScan.create(allocator, t, null, null, 2);
+    var q = try base.filter(thindb.leafExpr("b", .gte, .{ .int = 300 }));
+    defer q.deinit();
+    try q.setEmitProjection(&.{ "a", "b" });
+
+    const live = q.outputSchema();
+    const s = q.stats();
+    try std.testing.expectEqual(live.len, s.column_stats.len);
+    try std.testing.expectEqualStrings("a", live[0].name);
+    try std.testing.expectEqual(@as(?i128, 10), s.column_stats[0].min);
+    try std.testing.expect(try exactNdv(s.column_stats[0].ndv) <= 3);
+    try std.testing.expectEqualStrings("b", live[1].name);
+    try std.testing.expectEqual(@as(?i128, 300), s.column_stats[1].min);
+    try std.testing.expectEqual(@as(?i128, 600), s.column_stats[1].max);
+    try std.testing.expectEqual(@as(u64, 4), try drainCount(&q));
+}

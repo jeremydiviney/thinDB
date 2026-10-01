@@ -701,7 +701,11 @@ pub const Compute = struct {
         // exactly right — dropping it starves downstream GROUP BY routing
         // of derived-key NDVs.
         if (self.chain) |cf| {
-            if (cf.inner != null) return self.upstream.stats();
+            if (cf.inner != null) {
+                var joined = self.upstream.stats();
+                joined.row_origin = null;
+                return joined;
+            }
         }
         var up = self.upstream.stats();
         const in_width = self.in_width;

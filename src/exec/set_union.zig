@@ -229,6 +229,7 @@ pub const SetUnion = struct {
             // Fused: cached_stats index the pre-fusion union schema, not the
             // join output the batches now carry.
             .column_stats = if (self.probe_sink != null) &.{} else self.cached_stats,
+            .row_origin = if (self.probe_sink != null) null else exec.unionRowOrigin(l, r),
         };
     }
 

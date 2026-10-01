@@ -442,7 +442,64 @@ pub const ColStat = struct {
     /// on most rows (an empty string) pulls `avg_width` far below it. Null =
     /// not measured.
     distinct_width: ?u32 = null,
+    /// The table column this column's values are drawn from. Null once an
+    /// operator computes new values. See `ColumnOrigin`.
+    origin: ?ColumnOrigin = null,
 };
+
+/// A column of one table snapshot. A column keeps it only while its values
+/// stay a subset of that column's: filters, projections, renames, joins and
+/// group keys copy their input's stat, and anything that computes new values
+/// builds a fresh one. Two union arms whose same-position columns name the
+/// same origin together hold at most `ndv` distinct values, where summing
+/// the arms' NDVs would count a shared value once per arm (issue #478).
+pub const ColumnOrigin = struct {
+    /// `snapshotId` of the table snapshot the column was scanned from.
+    snapshot: u64,
+    /// The column's index in that table's schema.
+    column: u32,
+    /// The column's distinct values over the whole snapshot.
+    ndv: ColCard,
+};
+
+/// Every output row is one row of a table snapshot, and every column whose
+/// `ColStat.origin` names that snapshot holds the row's own value. A key
+/// tuple of such columns is then a function of one row, so it takes at most
+/// `rows` distinct values however many rows are emitted, as in a UNION ALL
+/// of two arms over one table. Operators that build a row from several input
+/// rows (joins, aggregates, windows) don't pass it on.
+pub const RowOrigin = struct {
+    snapshot: u64,
+    /// The snapshot's rows.
+    rows: u64,
+};
+
+/// Identity of one table's snapshot: the same table at the same segment set
+/// and memtable size. Two scans that agree on it read the same rows.
+pub fn snapshotId(table_uid: u64, segments: []const storage.ManifestEntry, memtable_rows: u64) u64 {
+    var h = std.hash.Wyhash.init(table_uid);
+    h.update(std.mem.asBytes(&memtable_rows));
+    for (segments) |e| {
+        h.update(std.mem.asBytes(&e.segment_id));
+        h.update(std.mem.asBytes(&e.row_count));
+    }
+    return h.final();
+}
+
+/// Whether `stat` is the row's own value of a column of the snapshot
+/// `st.row_origin` names.
+pub fn fromRowOrigin(st: PipelineStats, stat: ColStat) bool {
+    const ro = st.row_origin orelse return false;
+    const o = stat.origin orelse return false;
+    return o.snapshot == ro.snapshot;
+}
+
+/// The most distinct key tuples `st`'s rows hold: its row bound, or its row
+/// origin's rows when every key column is `fromRowOrigin`.
+pub fn keyTupleBound(st: PipelineStats, keys_from_row_origin: bool) u64 {
+    if (keys_from_row_origin) if (st.row_origin) |ro| return @min(st.upper_rows, ro.rows);
+    return st.upper_rows;
+}
 
 /// The widths `Query.sampleWidths` measures for one string column: its
 /// `ColStat.avg_width` and `ColStat.distinct_width`.
@@ -523,6 +580,8 @@ pub const PipelineStats = struct {
     /// range), indexed by output schema column. Empty ⇒ no information (all
     /// columns unknown).
     column_stats: []const ColStat = &.{},
+    /// See `RowOrigin`. Null unless every operator below passes it on.
+    row_origin: ?RowOrigin = null,
 };
 
 pub const Query = struct {
@@ -677,6 +736,11 @@ pub const Query = struct {
 
     pub fn filter(self: Query, expr: predicate.PredicateExpr) !Query {
         return @import("filter.zig").Filter.create(try self.operatorAllocator(), self, expr);
+    }
+
+    /// `filter` whose kept rows the caller bounds further. See `Filter.Bound`.
+    pub fn filterBounded(self: Query, expr: predicate.PredicateExpr, bound: @import("filter.zig").Filter.Bound) !Query {
+        return @import("filter.zig").Filter.createBounded(try self.operatorAllocator(), self, expr, bound);
     }
 
     pub fn project(self: Query, columns: []const []const u8) !Query {
@@ -1178,22 +1242,54 @@ pub fn concatJoinStats(
 }
 
 /// Merge two same-position column stats across a UNION ALL (vertical row
-/// concatenation). NDV: the union holds at most `l + r` distinct values, so a
-/// known sum saturating-adds; an unknown on either side stays unknown. Range:
-/// the union spans both, so min/max widen to the outer bounds — but only when
-/// BOTH sides bound that end (a null on either side means that end is unbounded).
-/// Width: the union's mean lies between the sides', so the wider one covers it.
-pub fn mergeUnionColStat(l: ColStat, r: ColStat) ColStat {
-    const ndv: ColCard = switch (l.ndv) {
+/// concatenation) of arms bounded at `l_rows` and `r_rows` rows. An empty arm
+/// adds nothing, so the other arm's stat stands. NDV: the union holds at most
+/// `l + r` distinct values, and at most the origin column's when both arms
+/// draw from the same column of the same snapshot, where the sum would count
+/// a value both arms hold twice (issue #478). An unknown side stays unknown
+/// unless that origin bounds it. Range: the union spans both, so min/max
+/// widen to the outer bounds — but only when BOTH sides bound that end (a
+/// null on either side means that end is unbounded). Width: the union's mean
+/// lies between the sides', so the wider one covers it.
+pub fn mergeUnionColStat(l: ColStat, l_rows: u64, r: ColStat, r_rows: u64) ColStat {
+    if (r_rows == 0) return l;
+    if (l_rows == 0) return r;
+    const origin = sharedOrigin(l.origin, r.origin);
+    const summed: ColCard = switch (l.ndv) {
         .unknown => .unknown,
         .exact => |ln| switch (r.ndv) {
             .unknown => .unknown,
             .exact => |rn| .{ .exact = ln +| rn },
         },
     };
+    const ndv = if (origin) |o| minCard(summed, o.ndv) else summed;
     const min: ?i128 = if (l.min) |lm| (if (r.min) |rm| @min(lm, rm) else null) else null;
     const max: ?i128 = if (l.max) |lm| (if (r.max) |rm| @max(lm, rm) else null) else null;
-    return .{ .ndv = ndv, .min = min, .max = max, .avg_width = widerWidth(l.avg_width, r.avg_width), .distinct_width = widerWidth(l.distinct_width, r.distinct_width) };
+    return .{
+        .ndv = ndv,
+        .min = min,
+        .max = max,
+        .avg_width = widerWidth(l.avg_width, r.avg_width),
+        .distinct_width = widerWidth(l.distinct_width, r.distinct_width),
+        .origin = origin,
+    };
+}
+
+fn sharedOrigin(l: ?ColumnOrigin, r: ?ColumnOrigin) ?ColumnOrigin {
+    const lo = l orelse return null;
+    const ro = r orelse return null;
+    return if (lo.snapshot == ro.snapshot and lo.column == ro.column) lo else null;
+}
+
+/// The tighter of two distinct-value bounds.
+pub fn minCard(a: ColCard, b: ColCard) ColCard {
+    return switch (a) {
+        .unknown => b,
+        .exact => |x| switch (b) {
+            .unknown => a,
+            .exact => |y| .{ .exact = @min(x, y) },
+        },
+    };
 }
 
 fn widerWidth(l: ?u32, r: ?u32) ?u32 {
@@ -1209,19 +1305,86 @@ pub fn unionColStats(
     right: Query,
     output_len: usize,
 ) ![]const ColStat {
-    const ls = left.stats().column_stats;
-    const rs = right.stats().column_stats;
-    if (ls.len == 0 and rs.len == 0) return &.{};
-    const lr = left.stats().upper_rows;
-    const rr = right.stats().upper_rows;
-    const ceiling = lr +| rr;
+    const l = left.stats();
+    const r = right.stats();
+    if (l.column_stats.len == 0 and r.column_stats.len == 0) return &.{};
+    const ceiling = l.upper_rows +| r.upper_rows;
     const cc = try allocator.alloc(ColStat, output_len);
     for (cc, 0..) |*out, i| {
-        const lstat: ColStat = if (i < ls.len) ls[i] else .{};
-        const rstat: ColStat = if (i < rs.len) rs[i] else .{};
-        out.* = capColStat(mergeUnionColStat(lstat, rstat), ceiling);
+        const lstat: ColStat = if (i < l.column_stats.len) l.column_stats[i] else .{};
+        const rstat: ColStat = if (i < r.column_stats.len) r.column_stats[i] else .{};
+        out.* = capColStat(mergeUnionColStat(lstat, l.upper_rows, rstat, r.upper_rows), ceiling);
     }
     return cc;
+}
+
+/// A UNION ALL's row origin: the one both arms share, or the other arm's
+/// when one is empty.
+pub fn unionRowOrigin(l: PipelineStats, r: PipelineStats) ?RowOrigin {
+    if (r.upper_rows == 0) return l.row_origin;
+    if (l.upper_rows == 0) return r.row_origin;
+    const lo = l.row_origin orelse return null;
+    const ro = r.row_origin orelse return null;
+    return if (lo.snapshot == ro.snapshot) lo else null;
+}
+
+/// The most distinct rows the first `width` columns of `st` hold: the
+/// product of their NDVs when every one is known, capped at the key tuple
+/// bound.
+pub fn distinctRowBound(st: PipelineStats, width: usize) u64 {
+    var product: ?u64 = 1;
+    var from_row = width > 0;
+    for (0..width) |i| {
+        const stat: ColStat = if (i < st.column_stats.len) st.column_stats[i] else .{};
+        from_row = from_row and fromRowOrigin(st, stat);
+        product = switch (stat.ndv) {
+            .exact => |n| if (product) |p| p *| n else null,
+            .unknown => null,
+        };
+    }
+    const ceiling = keyTupleBound(st, from_row);
+    return if (product) |p| @min(p, ceiling) else ceiling;
+}
+
+/// The set operations that keep a subset of their left arm's distinct rows.
+pub const SubsetSetOp = enum { intersect, except };
+
+/// What an INTERSECT or EXCEPT over arms with stats `l` and `r` can return,
+/// for its first `out.len` columns: every row it keeps is a distinct row of
+/// the left arm, and for INTERSECT of the right arm too, so each column's
+/// values are a subset of the left arm's column (and the right's). Fills
+/// `out` and returns the row bound.
+pub fn subsetSetOpBound(kind: SubsetSetOp, l: PipelineStats, r: PipelineStats, out: []ColStat) u64 {
+    const rows = switch (kind) {
+        .except => distinctRowBound(l, out.len),
+        .intersect => @min(distinctRowBound(l, out.len), distinctRowBound(r, out.len)),
+    };
+    for (out, 0..) |*o, i| {
+        const ls: ColStat = if (i < l.column_stats.len) l.column_stats[i] else .{};
+        const rs: ColStat = if (i < r.column_stats.len) r.column_stats[i] else .{};
+        o.* = switch (kind) {
+            .except => ls,
+            .intersect => .{
+                .ndv = minCard(ls.ndv, rs.ndv),
+                .min = tighterEnd(ls.min, rs.min, .max),
+                .max = tighterEnd(ls.max, rs.max, .min),
+                .avg_width = ls.avg_width,
+                .distinct_width = ls.distinct_width,
+                .origin = ls.origin,
+            },
+        };
+        o.* = capColStat(o.*, rows);
+    }
+    return rows;
+}
+
+fn tighterEnd(a: ?i128, b: ?i128, pick: enum { min, max }) ?i128 {
+    const x = a orelse return b;
+    const y = b orelse return a;
+    return switch (pick) {
+        .min => @min(x, y),
+        .max => @max(x, y),
+    };
 }
 
 // ---------------------------------------------------------------------------

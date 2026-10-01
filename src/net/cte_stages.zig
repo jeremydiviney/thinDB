@@ -2027,6 +2027,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return jq;
         },
         .set_union => |u| {
+            var subset_bound: exec.Filter.Bound = .{ .rows = 0 };
             const unioned = blk: {
                 // SetUnion.create validates schema compatibility and does NOT
                 // consume its inputs on error — both sides need errdefers (the
@@ -2047,13 +2048,16 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 const t_op = exec.prof.nowTicks();
                 defer exec.prof.addPhase("compile.op.union", @intCast(exec.prof.nowTicks() - t_op));
                 try unifyUnionArmTypes(input, u, &left, &right);
-                if (u.kind != .@"union") try markSetOpSides(input, &left, &right);
+                if (u.kind != .@"union") {
+                    subset_bound = try subsetSetOpBound(input.node_arena, u.kind, left, right);
+                    try markSetOpSides(input, &left, &right);
+                }
                 break :blk try exec.SetUnion.create(input.allocator, left, right, true);
             };
             return switch (u.kind) {
                 .@"union" => if (u.all) unioned else distinctRows(input, unioned),
-                .intersect => setOpRows(input, unioned, try intersectKeep(input.node_arena)),
-                .except => setOpRows(input, unioned, sideLeaf(SETOP_MAX_SIDE, 0)),
+                .intersect => setOpRows(input, unioned, try intersectKeep(input.node_arena), subset_bound),
+                .except => setOpRows(input, unioned, sideLeaf(SETOP_MAX_SIDE, 0), subset_bound),
             };
         },
         else => return error.UnsupportedQueryShape,
@@ -2103,11 +2107,26 @@ fn markSetOpSides(input: engine_v2.CompileInput, left: *exec.Query, right: *exec
     }
 }
 
+/// What an INTERSECT / EXCEPT over the (untagged) arms can return: rows of
+/// the left arm, and for INTERSECT of the right one too. The grouping over
+/// the union still holds every distinct row of both arms; only the kept
+/// groups are bounded.
+fn subsetSetOpBound(arena: Allocator, kind: ir.SetKind, left: exec.Query, right: exec.Query) !exec.Filter.Bound {
+    const sub: exec.SubsetSetOp = switch (kind) {
+        .@"union" => return .{ .rows = std.math.maxInt(u64) },
+        .intersect => .intersect,
+        .except => .except,
+    };
+    const cols = try arena.alloc(exec.ColStat, left.outputSchema().len);
+    const rows = exec.subsetSetOpBound(sub, left.stats(), right.stats(), cols);
+    return .{ .rows = rows, .column_stats = cols };
+}
+
 /// INTERSECT / EXCEPT over the side-tagged unioned rows: group on every real
 /// column — NULLs and the key rules match SELECT DISTINCT's — keep the groups
 /// `keep` accepts from the smallest and largest side tag, then project the
-/// real columns.
-fn setOpRows(input: engine_v2.CompileInput, unioned: exec.Query, keep: exec.PredicateExpr) !exec.Query {
+/// real columns. `bound` is `subsetSetOpBound`'s.
+fn setOpRows(input: engine_v2.CompileInput, unioned: exec.Query, keep: exec.PredicateExpr, bound: exec.Filter.Bound) !exec.Query {
     var up = unioned;
     var grouped, const cols = blk: {
         errdefer up.deinit();
@@ -2133,7 +2152,7 @@ fn setOpRows(input: engine_v2.CompileInput, unioned: exec.Query, keep: exec.Pred
     };
     var kept = blk: {
         errdefer grouped.deinit();
-        break :blk try grouped.filter(keep);
+        break :blk try grouped.filterBounded(keep, bound);
     };
     errdefer kept.deinit();
     return kept.project(cols);
