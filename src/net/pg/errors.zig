@@ -15,13 +15,13 @@ pub const Mapped = struct {
 };
 
 /// Map any internal error to a (sqlstate, message) pair suitable for an
-/// ErrorResponse. Unrecognized errors fall through to `42000` with
-/// `@errorName(err)` as the message.
+/// ErrorResponse. Only the parser's own errors are `42601` syntax_error;
+/// unrecognized errors fall through to `XX000` internal_error with
+/// `@errorName(err)` as the message (issue #490).
 pub fn mapInternal(err: anyerror) Mapped {
     const name = @errorName(err);
     // COPY-specific errors get human-readable messages and the closest
-    // matching PG sqlstate; the parser/protocol errors share the
-    // "syntax error or access rule violation" 42000 family.
+    // matching PG sqlstate.
     if (std.mem.eql(u8, name, "SqlCopyFileNotSupported"))
         return .{ .sqlstate = "0A000".*, .message = "thinDB COPY supports only STDIN/STDOUT" };
     if (std.mem.eql(u8, name, "SqlCopyUnsupportedFormat"))
@@ -54,7 +54,11 @@ pub fn mapInternal(err: anyerror) Mapped {
         .subquery_multiple_rows => .{ .sqlstate = "21000".*, .message = "more than one row returned by a subquery used as an expression" },
         .recursion_depth_exceeded => .{ .sqlstate = "54000".*, .message = "recursive query aborted after 1001 iterations" },
         .invalid_temporal_literal => .{ .sqlstate = "22007".*, .message = predicate.takeInvalidTemporalMessage() orelse "invalid input syntax for type date or timestamp" },
-        .unknown => .{ .sqlstate = "42000".*, .message = name },
+        .wrong_arguments => .{ .sqlstate = "22023".*, .message = name },
+        .memory_budget_exceeded, .out_of_memory => .{ .sqlstate = "53200".*, .message = name },
+        .not_supported => .{ .sqlstate = "0A000".*, .message = name },
+        .syntax_error => .{ .sqlstate = "42601".*, .message = name },
+        .unknown => .{ .sqlstate = "XX000".*, .message = name },
     };
 }
 
@@ -118,8 +122,23 @@ test "mapInternal names the constant a DATETIME comparison rejected" {
     try std.testing.expectEqualStrings("Incorrect DATETIME value: 'abc'", m.message);
 }
 
-test "mapInternal falls back to 42000 with error name" {
+test "mapInternal gives runtime classes their SQLSTATE, and only parse errors 42601 (issue #490)" {
+    const cases = .{
+        .{ error.SqlExpectedFrom, "42601" },
+        .{ error.UnsupportedQueryShape, "0A000" },
+        .{ error.MemoryBudgetExceeded, "53200" },
+        .{ error.OutOfMemory, "53200" },
+        .{ error.TypeMismatch, "XX000" },
+    };
+    inline for (cases) |c| {
+        const m = mapInternal(c[0]);
+        try std.testing.expectEqualStrings(c[1], &m.sqlstate);
+        try std.testing.expectEqualStrings(@errorName(c[0]), m.message);
+    }
+}
+
+test "mapInternal falls back to XX000 with error name" {
     const m = mapInternal(error.NotARealThing);
-    try std.testing.expectEqualStrings("42000", &m.sqlstate);
+    try std.testing.expectEqualStrings("XX000", &m.sqlstate);
     try std.testing.expectEqualStrings("NotARealThing", m.message);
 }

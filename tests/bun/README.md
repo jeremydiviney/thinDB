@@ -47,7 +47,7 @@ temp data directory.
 |-------------------|-----------------------------------------------------------------------------------------------|
 | `basic.test.ts`   | Connect, `SELECT 1` (canned `?column?`), `SELECT version()`, `SELECT current_database()`.     |
 | `namespace.test.ts` | `pg_catalog.pg_database`, `CREATE DATABASE`, `pg_namespace`, `CREATE SCHEMA`, `SHOW server_version`, `SET search_path`. |
-| `errors.test.ts`  | Unknown table → `42P01`, syntax error → `42000`, `DROP DATABASE no_such_db` → `3D000`.        |
+| `errors.test.ts`  | Unknown table → `42P01`, syntax error → `42601`, `DROP DATABASE no_such_db` → `3D000`.        |
 | `pool.test.ts`    | `pg.Pool` with `max=4` runs 8 parallel queries; `DISCARD ALL` and `RESET ALL` round-trip.     |
 | `table.test.ts`   | Empty `pg_class` listing round-trips; `CREATE TABLE` / `INSERT` are `test.todo` (parser gap). |
 | `types.test.ts`   | All `test.todo` (depends on INSERT via SQL).                                                  |
