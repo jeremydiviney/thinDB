@@ -12,7 +12,10 @@
 //   --readers N     read other clients' tables while those clients run DDL;
 //   --pg-clients N  PostgreSQL-wire clients (needs --pg-port) that abandon
 //                   queries, send CancelRequests and pg_cancel_backend /
-//                   pg_terminate_backend stress connections of either wire.
+//                   pg_terminate_backend stress connections of either wire;
+//   --drop-writes P the share of cycles in which the client drops its own
+//                   socket in the middle of one of its statements, so the
+//                   server sees the disconnect while it runs a write or DDL.
 // And on view and SQL-function definitions, which the parser reads before its
 // statement holds a lease (#368):
 //   --view-churners N  replace, drop and recreate views and table functions
@@ -47,6 +50,7 @@ const { values: args } = parseArgs({
     "pg-clients": { type: "string", default: "0" },
     "view-churners": { type: "string", default: "0" },
     "view-readers": { type: "string", default: "0" },
+    "drop-writes": { type: "string", default: "0" },
   },
 });
 
@@ -59,6 +63,10 @@ if (pgClientCount > 0 && pgPort === 0) throw new Error("--pg-clients needs --pg-
 const viewChurnerCount = Number(args["view-churners"]);
 const viewReaderCount = Number(args["view-readers"]);
 if (viewReaderCount > 0 && viewChurnerCount === 0) throw new Error("--view-readers needs --view-churners");
+const dropWriteShare = Number(args["drop-writes"]);
+// The statements one cycle issues: three DROP IF EXISTS, CREATE, the seed
+// insert, the doublings and their periodic counts, and the fixed tail.
+const stepsPerCycle = 19 + doublings + Math.ceil(doublings / 5);
 
 class InvariantError extends Error {}
 class StallError extends Error {}
@@ -86,6 +94,7 @@ const stats = {
   killedCycles: 0,
   statements: 0,
   abandoned: 0,
+  droppedWrites: 0,
   kills: { query: 0, connection: 0, unknownId: 0, pgCancel: 0, pgTerminate: 0, cancelRequest: 0 },
   processListReads: 0,
   killedStatements: 0,
@@ -139,11 +148,13 @@ async function connect(database?: string): Promise<Connection> {
   return conn;
 }
 
-type Session = { conn: Connection; id: number; role: string; database?: string };
+// `dropAt` is the index of the statement whose socket the client drops
+// mid-flight, or -1 for none.
+type Session = { conn: Connection; id: number; role: string; database?: string; steps: number; dropAt: number };
 
 async function open(role: string, database?: string, canBeKilled = true): Promise<Session> {
   const conn = await connect(database);
-  const session = { conn, id: conn.threadId ?? 0, role, database };
+  const session = { conn, id: conn.threadId ?? 0, role, database, steps: 0, dropAt: -1 };
   if (canBeKilled) killable.set(session.id, role);
   return session;
 }
@@ -257,12 +268,41 @@ async function awaitGone(conn: Connection, id: number, role: string): Promise<vo
   }
 }
 
+class DroppedError extends Error {
+  readonly code = "PROTOCOL_CONNECTION_LOST";
+}
+
+// Start `sql`, then destroy the socket under it: the server's disconnect path
+// races its own in-flight statement. A statement that finishes first passes
+// the drop on to the next one.
+async function runThenDrop(session: Session, sql: string): Promise<any[]> {
+  const pending = run(session.conn, sql);
+  const settled = pending.then(
+    () => "done" as const,
+    () => "done" as const,
+  );
+  // Skewed short, so statements of a few milliseconds get dropped too.
+  const delayMs = Math.floor(random() ** 3 * 200);
+  const winner = await Promise.race([settled, Bun.sleep(delayMs).then(() => "drop" as const)]);
+  if (winner === "done") {
+    session.dropAt++;
+    return pending;
+  }
+  targeted.add(session.id);
+  session.conn.destroy();
+  stats.droppedWrites++;
+  // mysql2 may never settle a query whose socket was destroyed under it.
+  await withTimeout(settled, 5_000, "dropped statement").catch(() => undefined);
+  throw new DroppedError(`dropped the socket under ${sql.slice(0, 80)}`);
+}
+
 // Run one statement of a cycle. A kill aimed at this connection ends the
 // cycle, after `verify` confirms on a connection nobody kills that the
 // killed statement took effect entirely or not at all.
 async function step(session: Session, sql: string, verify?: (conn: Connection) => Promise<void>): Promise<any[]> {
+  const drop = session.steps++ === session.dropAt;
   try {
-    return await run(session.conn, sql);
+    return drop ? await runThenDrop(session, sql) : await run(session.conn, sql);
   } catch (err) {
     if (!(await isKill(err, session.id, session.role))) throw err;
     stats.killedStatements++;
@@ -325,6 +365,7 @@ async function cycle(client: number, cycleNo: number): Promise<void> {
   }
 
   const s = await open(`writer c${client}`, `${database}__public`);
+  if (random() < dropWriteShare) s.dropAt = Math.floor(random() * stepsPerCycle);
   try {
     for (const t of ["seq", "seq_copy", "seq_moved"]) await step(s, `DROP TABLE IF EXISTS ${t}`);
     await step(s, "CREATE TABLE seq (n BIGINT NOT NULL, v INT NOT NULL, s VARCHAR(32) NOT NULL, PRIMARY KEY (n))");
@@ -433,9 +474,10 @@ const READER_QUERIES = [
   "SELECT n, v FROM seq ORDER BY n DESC LIMIT 3",
   "SHOW TABLES",
 ];
-// Unknown table, database or column: the owner dropped or has not yet
-// created what the reader asked for.
-const READER_EXPECTED_ERRNOS = new Set([1146, 1049, 1054]);
+// Unknown table, database or column, or no database selected because the
+// reader's current one was dropped: the owner dropped or has not yet created
+// what the reader asked for.
+const READER_EXPECTED_ERRNOS = new Set([1146, 1049, 1054, 1046]);
 const READER_EXPECTED_SQLSTATES = new Set(["42P01", "3D000", "42703", "3F000"]);
 
 function isPowerOfTwo(n: number): boolean {
@@ -928,7 +970,7 @@ const progress = setInterval(() => {
   const errors = [...stats.sqlErrors.values()].reduce((a, b) => a + b, 0);
   const k = stats.kills;
   console.error(
-    `[${Math.round((Date.now() - started) / 1000)}s] cycles=${stats.cycles} killedCycles=${stats.killedCycles} statements=${stats.statements} abandoned=${stats.abandoned} ` +
+    `[${Math.round((Date.now() - started) / 1000)}s] cycles=${stats.cycles} killedCycles=${stats.killedCycles} statements=${stats.statements} abandoned=${stats.abandoned} droppedWrites=${stats.droppedWrites} ` +
       `kills=${k.query}q/${k.connection}c/${k.pgCancel}pc/${k.pgTerminate}pt/${k.cancelRequest}cr readerQueries=${stats.readerQueries} pgQueries=${stats.pgQueries} ` +
       `viewDdl=${stats.viewDdl} viewReads=${stats.viewReads} errors=${errors}`,
   );
@@ -956,6 +998,7 @@ const summary = {
   killedCycles: stats.killedCycles,
   statements: stats.statements,
   abandoned: stats.abandoned,
+  droppedWrites: stats.droppedWrites,
   kills: stats.kills,
   processListReads: stats.processListReads,
   killedStatements: stats.killedStatements,
