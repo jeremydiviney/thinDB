@@ -1724,6 +1724,26 @@ pub const ParallelScan = struct {
         }
     }
 
+    /// `VTable.sampleKeys`, as `sampleWidths`: the first worker samples the
+    /// shared source, through the fused compute and the emit projection.
+    pub fn sampleKeys(self: *ParallelScan, cols: []const usize, sample: *exec.KeySample) !bool {
+        if (self.workers.len == 0 or self.agg_fused or self.probe_sink != null) return false;
+        const source = try self.allocator.alloc(usize, cols.len);
+        defer self.allocator.free(source);
+        for (cols, source) |c, *s| {
+            const keep = self.emit_keep orelse {
+                s.* = c;
+                continue;
+            };
+            if (c >= keep.len) return false;
+            s.* = keep[c];
+        }
+        if (self.compute_fused) return self.compute_q[0].sampleKeys(source, sample);
+        return switch (self.workers[0]) {
+            inline else => |leaf| leaf.sampleKeys(source, sample),
+        };
+    }
+
     pub fn explain(self: *ParallelScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         var buf: [192]u8 = undefined;
         const tag = if (self.ordered) "ordered" else if (self.agg_fused) "materialize+partial-agg" else if (self.compute_fused) (if (self.materializesOnPull()) "materialize+compute" else "stream+compute") else if (self.workers.len == 0) "deferred" else if (self.workers[0].fusedActive()) "materialize" else "stream";

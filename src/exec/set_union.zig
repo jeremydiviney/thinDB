@@ -220,6 +220,22 @@ pub const SetUnion = struct {
         return self.left.stableData() and self.right.stableData();
     }
 
+    /// `VTable.sampleKeys`: each arm's sample folded into one
+    /// (`KeySample.mergeArm`). An arm that casts a key may hash its values
+    /// apart from the other arm's equal ones, so a cast key declines.
+    pub fn sampleKeys(self: *SetUnion, cols: []const usize, sample: *exec.KeySample) !bool {
+        if (self.probe_sink != null) return false;
+        for (cols) |c| {
+            if (c >= self.output_schema.len or self.left_casts[c] != null or self.right_casts[c] != null) return false;
+        }
+        if (!try self.left.sampleKeys(cols, sample)) return false;
+        var right = try exec.KeySample.init(self.allocator, cols.len);
+        defer right.deinit(self.allocator);
+        if (!try self.right.sampleKeys(cols, &right)) return false;
+        sample.mergeArm(&right);
+        return true;
+    }
+
     pub fn stats(self: *SetUnion) exec.PipelineStats {
         const l = self.left.stats();
         const r = self.right.stats();

@@ -138,6 +138,11 @@ pub const AliasRename = struct {
         try self.upstream.sampleWidths(widths);
     }
 
+    pub fn sampleKeys(self: *AliasRename, cols: []const usize, sample: *exec.KeySample) !bool {
+        if (self.probe_fused) return false;
+        return self.upstream.sampleKeys(cols, sample);
+    }
+
     pub fn stats(self: *AliasRename) exec.PipelineStats {
         return self.upstream.stats();
     }

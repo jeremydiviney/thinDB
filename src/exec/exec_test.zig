@@ -3795,3 +3795,57 @@ test "INTERSECT / EXCEPT bound: at most the left arm's distinct rows, and the ri
     try std.testing.expectEqual(@as(u64, 3), exec.subsetSetOpBound(.except, tiny_left, right, &out));
     try std.testing.expectEqual(ColCard{ .exact = 3 }, out[0].ndv);
 }
+
+/// One BIGINT key held in chunks of `sizes` rows: consecutive runs of
+/// `values`, or, with `restart`, each chunk from its start.
+const TestKeyBuffer = struct {
+    values: []const i64,
+    sizes: []const usize,
+    restart: bool,
+
+    const View = @import("../storage/storage.zig").ColumnView;
+
+    pub fn len(self: TestKeyBuffer) usize {
+        return self.sizes.len;
+    }
+    pub fn rows(self: TestKeyBuffer, i: usize) usize {
+        return self.sizes[i];
+    }
+    pub fn views(self: TestKeyBuffer, i: usize, out: []View) void {
+        var start: usize = 0;
+        if (!self.restart) {
+            for (self.sizes[0..i]) |s| start += s;
+        }
+        out[0] = .{ .data = .{ .bigint = self.values[start..][0..self.sizes[i]] } };
+    }
+};
+
+test "a key sample reads a small buffer whole, else a sixteenth of it in windows across its chunks (issue #478)" {
+    const alloc = std.testing.allocator;
+    const values = try alloc.alloc(i64, 2_000_000);
+    defer alloc.free(values);
+    for (values, 0..) |*v, i| v.* = @intCast(i);
+    const cases = .{
+        // Small chunks within a row group's worth: read whole.
+        .{ .sizes = &([_]usize{5000} ** 12), .restart = false, .rows = 60_000, .complete = true },
+        // Many small chunks past it: windows across them, some chunks empty.
+        .{ .sizes = &([_]usize{ 5000, 0 } ** 100), .restart = false, .rows = 16 * (exec.KEY_SAMPLE_MIN_ROWS / 16), .complete = false },
+        // One chunk of a mid-sized input: a sixteenth of it.
+        .{ .sizes = &[_]usize{2_000_000}, .restart = false, .rows = 16 * (2_000_000 / 16 / 16), .complete = false },
+        // A large input: no more than the cap. Its chunks repeat their keys.
+        .{ .sizes = &([_]usize{2_000_000} ** 10), .restart = true, .rows = exec.KEY_SAMPLE_MAX_ROWS, .complete = false },
+    };
+    inline for (cases) |c| {
+        var sample = try exec.KeySample.init(alloc, 1);
+        defer sample.deinit(alloc);
+        var views: [1]TestKeyBuffer.View = undefined;
+        exec.sampleBuffer(&sample, TestKeyBuffer{ .values = values, .sizes = c.sizes, .restart = c.restart }, &views);
+        try std.testing.expectEqual(@as(u64, c.rows), sample.rows);
+        try std.testing.expectEqual(c.complete, sample.complete);
+        // Every key is distinct, so a row read twice would show as fewer.
+        if (!c.restart) {
+            const seen = sample.keys[0].estimate();
+            try std.testing.expect(seen * 100 >= c.rows * 96 and seen * 100 <= c.rows * 104);
+        }
+    }
+}

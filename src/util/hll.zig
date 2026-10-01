@@ -15,63 +15,72 @@ const std = @import("std");
 pub const precision = 10;
 pub const m: usize = 1 << precision;
 
-pub const Hll = struct {
-    /// One register per bucket: the max observed `rho` (leading-zero rank).
-    registers: [m]u8 = [_]u8{0} ** m,
+/// The sketch segments store per column.
+pub const Hll = Sketch(precision);
 
-    pub fn add(self: *Hll, hash: u64) void {
-        const idx: usize = @intCast(hash >> (64 - precision));
-        // Remaining bits after the index; rho = position of the leftmost
-        // set bit (1-indexed). Shifting out the index bits leaves the
-        // significant bits at the top, so @clz counts them directly.
-        const w: u64 = hash << precision;
-        const rho: u8 = if (w == 0) (64 - precision + 1) else @intCast(@clz(w) + 1);
-        if (rho > self.registers[idx]) self.registers[idx] = rho;
-    }
+/// A sketch of `2^p` registers: standard error about 1.04 / sqrt(2^p).
+pub fn Sketch(comptime p: comptime_int) type {
+    return struct {
+        const Self = @This();
+        const registers_len: usize = 1 << p;
 
-    /// Merge `other` into `self` (register-wise max). Vectorized.
-    pub fn merge(self: *Hll, other: *const Hll) void {
-        const V = @Vector(32, u8);
-        var i: usize = 0;
-        while (i + 32 <= m) : (i += 32) {
-            const a: V = self.registers[i..][0..32].*;
-            const b: V = other.registers[i..][0..32].*;
-            self.registers[i..][0..32].* = @max(a, b);
+        /// One register per bucket: the max observed `rho` (leading-zero rank).
+        registers: [registers_len]u8 = [_]u8{0} ** registers_len,
+
+        pub fn add(self: *Self, hash: u64) void {
+            const idx: usize = @intCast(hash >> (64 - p));
+            // Remaining bits after the index; rho = position of the leftmost
+            // set bit (1-indexed). Shifting out the index bits leaves the
+            // significant bits at the top, so @clz counts them directly.
+            const w: u64 = hash << p;
+            const rho: u8 = if (w == 0) (64 - p + 1) else @intCast(@clz(w) + 1);
+            if (rho > self.registers[idx]) self.registers[idx] = rho;
         }
-        while (i < m) : (i += 1) {
-            if (other.registers[i] > self.registers[i]) self.registers[i] = other.registers[i];
-        }
-    }
 
-    pub fn estimate(self: *const Hll) u64 {
-        var sum: f64 = 0;
-        var zeros: usize = 0;
-        for (self.registers) |r| {
-            sum += 1.0 / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(r)));
-            if (r == 0) zeros += 1;
+        /// Merge `other` into `self` (register-wise max). Vectorized.
+        pub fn merge(self: *Self, other: *const Self) void {
+            const V = @Vector(32, u8);
+            var i: usize = 0;
+            while (i + 32 <= registers_len) : (i += 32) {
+                const a: V = self.registers[i..][0..32].*;
+                const b: V = other.registers[i..][0..32].*;
+                self.registers[i..][0..32].* = @max(a, b);
+            }
+            while (i < registers_len) : (i += 1) {
+                if (other.registers[i] > self.registers[i]) self.registers[i] = other.registers[i];
+            }
         }
-        const mf: f64 = @floatFromInt(m);
-        const alpha = 0.7213 / (1.0 + 1.079 / mf);
-        var e = alpha * mf * mf / sum;
-        // Small-range correction: linear counting when many registers are
-        // still zero (raw HLL is biased low for small cardinalities).
-        if (e <= 2.5 * mf and zeros > 0) {
-            e = mf * @log(mf / @as(f64, @floatFromInt(zeros)));
+
+        pub fn estimate(self: *const Self) u64 {
+            var sum: f64 = 0;
+            var zeros: usize = 0;
+            for (self.registers) |r| {
+                sum += 1.0 / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(r)));
+                if (r == 0) zeros += 1;
+            }
+            const mf: f64 = @floatFromInt(registers_len);
+            const alpha = 0.7213 / (1.0 + 1.079 / mf);
+            var e = alpha * mf * mf / sum;
+            // Small-range correction: linear counting when many registers are
+            // still zero (raw HLL is biased low for small cardinalities).
+            if (e <= 2.5 * mf and zeros > 0) {
+                e = mf * @log(mf / @as(f64, @floatFromInt(zeros)));
+            }
+            return @intFromFloat(@round(e));
         }
-        return @intFromFloat(@round(e));
-    }
 
-    pub fn bytes(self: *const Hll) []const u8 {
-        return &self.registers;
-    }
+        pub fn bytes(self: *const Self) []const u8 {
+            return &self.registers;
+        }
 
-    pub fn fromBytes(b: []const u8) Hll {
-        var h: Hll = .{};
-        const n = @min(b.len, m);
-        @memcpy(h.registers[0..n], b[0..n]);
-        return h;
-    }
-};
+        pub fn fromBytes(b: []const u8) Self {
+            var h: Self = .{};
+            const n = @min(b.len, registers_len);
+            @memcpy(h.registers[0..n], b[0..n]);
+            return h;
+        }
+    };
+}
 
 fn approxEq(actual: u64, expected: u64, rel: f64) bool {
     const a: f64 = @floatFromInt(actual);

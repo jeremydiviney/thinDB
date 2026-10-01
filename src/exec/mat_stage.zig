@@ -351,6 +351,32 @@ pub const MaterializedResult = struct {
         }
     }
 
+    /// `VTable.sampleKeys` over the result's rows (`exec.sampleBuffer`).
+    fn sampleKeys(self: *const MaterializedResult, allocator: Allocator, cols: []const usize, sample: *exec.KeySample) !bool {
+        for (cols) |c| if (c >= self.schema.len) return false;
+        const views = try allocator.alloc(ColumnView, cols.len);
+        defer allocator.free(views);
+        exec.sampleBuffer(sample, KeyChunks{ .chunks = self.chunks.items, .cols = cols }, views);
+        return true;
+    }
+
+    /// The result's chunks as `exec.sampleBuffer` reads them.
+    const KeyChunks = struct {
+        chunks: []const Chunk,
+        cols: []const usize,
+
+        pub fn len(self: KeyChunks) usize {
+            return self.chunks.len;
+        }
+        pub fn rows(self: KeyChunks, i: usize) usize {
+            return self.chunks[i].rows;
+        }
+        pub fn views(self: KeyChunks, i: usize, out: []ColumnView) void {
+            const c = self.chunks[i];
+            for (self.cols, out) |col, *v| v.* = if (c.views.len > 0) c.views[col] else c.cols[col].view();
+        }
+    };
+
     /// Bytes held by a string-family column store; 0 for fixed-width.
     fn colStrBytes(col: *const engine.ColumnStore) usize {
         return switch (col.data) {
@@ -1426,6 +1452,13 @@ pub const MatScan = struct {
         try res.sampleDistinctWidths(self.allocator, widths);
     }
 
+    /// `VTable.sampleKeys` over the stage's result once it has run.
+    pub fn sampleKeys(self: *MatScan, cols: []const usize, sample: *exec.KeySample) !bool {
+        const res = self.stage.result orelse return false;
+        sample.source = if (self.stage.name.len > 0) self.stage.name else "stage";
+        return res.sampleKeys(self.allocator, cols, sample);
+    }
+
     pub fn accountant(_: *MatScan) ?*exec.memory.MemoryAccountant {
         return null;
     }
@@ -1554,6 +1587,12 @@ pub const ChunkRangeScan = struct {
     /// describe, not just this range.
     pub fn sampleWidths(self: *ChunkRangeScan, widths: []exec.SampledWidth) !void {
         try self.result.sampleDistinctWidths(self.allocator, widths);
+    }
+
+    /// `VTable.sampleKeys` over the whole result, as `sampleWidths`.
+    pub fn sampleKeys(self: *ChunkRangeScan, cols: []const usize, sample: *exec.KeySample) !bool {
+        sample.source = if (self.stage.name.len > 0) self.stage.name else "stage";
+        return self.result.sampleKeys(self.allocator, cols, sample);
     }
 
     pub fn addPrune(_: *ChunkRangeScan, _: exec.Predicate) !void {}

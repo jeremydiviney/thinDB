@@ -377,6 +377,14 @@ pub const Filter = struct {
         try self.upstream.sampleWidths(widths);
     }
 
+    /// `VTable.sampleKeys`: the rows the filter reads, whose tuples include
+    /// its survivors'; a filter proven empty reads none.
+    pub fn sampleKeys(self: *Filter, cols: []const usize, sample: *exec.KeySample) !bool {
+        if (self.provenEmpty()) return true;
+        if (self.chain != null or self.schema.len != self.upstream.outputSchema().len) return false;
+        return self.upstream.sampleKeys(cols, sample);
+    }
+
     /// A scan-fused Filter is a pass-through — the buffers below already hold
     /// the filtered survivors, so stage adoption forwards. An unfused Filter
     /// must evaluate rows itself and cannot hand anything over.

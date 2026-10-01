@@ -1668,6 +1668,79 @@ pub const Scan = struct {
         }
     }
 
+    const RowGroupRef = struct { seg: usize, rg: usize };
+
+    /// `VTable.sampleKeys`: every row the hints keep when
+    /// `exec.keySampleBudget` takes them all, else `exec.KEY_SAMPLE_PARTS`
+    /// row groups spread evenly over the kept ones and the memtable's first
+    /// rows, each read for an equal share of the budget around its middle.
+    /// Runs of contiguous rows, because a table is clustered: a row group
+    /// holds runs of a key's rows, so a key value that recurs within the
+    /// sample shows how many partners it has. The decoded blocks stay in the
+    /// cache, where the scan finds them.
+    pub fn sampleKeys(self: *Scan, cols: []const usize, sample: *exec.KeySample) !bool {
+        if (cols.len == 0 or cols.len != sample.keys.len) return false;
+        const phys = try self.allocator.alloc(usize, cols.len);
+        defer self.allocator.free(phys);
+        for (cols, phys) |c, *p| {
+            if (c >= self.out_phys.len) return false;
+            p.* = self.out_phys[c];
+        }
+        sample.source = self.table.name;
+        var kept: std.ArrayList(RowGroupRef) = .empty;
+        defer kept.deinit(self.allocator);
+        var kept_rows: usize = 0;
+        for (self.segs, 0..) |entry, si| {
+            if (self.seg_skip) |s| if (s[si]) continue;
+            const handle = try self.table.acquireSegment(entry.segment_id);
+            defer self.table.releaseSegment(handle);
+            for (handle.seg.info.row_groups, 0..) |rg, ri| {
+                if (!self.rowGroupCanMatch(rg)) continue;
+                try kept.append(self.allocator, .{ .seg = si, .rg = ri });
+                kept_rows += rg.row_count;
+            }
+        }
+        const mem_total: usize = @intCast(self.memtable_row_count);
+        const total = kept_rows + mem_total;
+        const budget = exec.keySampleBudget(total);
+        const whole = budget == total;
+        const picks: usize = if (whole) kept.items.len else @min(kept.items.len, exec.KEY_SAMPLE_PARTS);
+        const window_rows = if (whole) total else budget / (picks + @intFromBool(mem_total > 0));
+        const views = try self.allocator.alloc(ColumnView, cols.len);
+        defer self.allocator.free(views);
+        const decoded = try self.allocator.alloc(storage.OwnedColumn, cols.len);
+        defer self.allocator.free(decoded);
+        var entry: ?*storage.cache.SegmentHandles.Entry = null;
+        var entry_seg: usize = 0;
+        defer if (entry) |e| self.table.releaseSegment(e);
+        for (0..picks) |pick| {
+            const ref = kept.items[exec.keySamplePart(kept.items.len, pick, picks)];
+            if (entry != null and entry_seg != ref.seg) {
+                self.table.releaseSegment(entry.?);
+                entry = null;
+            }
+            const e = entry orelse try self.table.acquireSegment(self.segs[ref.seg].segment_id);
+            entry = e;
+            entry_seg = ref.seg;
+            var n_decoded: usize = 0;
+            defer for (decoded[0..n_decoded]) |*d| d.deinit(self.allocator);
+            for (phys, decoded) |p, *d| {
+                d.* = try e.seg.decodeColumnMaybeCached(self.allocator, self.table.schema, ref.rg, p, self.table.cacheRef());
+                n_decoded += 1;
+            }
+            for (decoded, views) |d, *v| v.* = d.view();
+            const window = exec.keySampleWindow(0, e.seg.info.row_groups[ref.rg].row_count, window_rows);
+            sample.addRows(views, window.lo, window.hi);
+        }
+        const mem_rows = @min(mem_total, window_rows);
+        if (mem_rows > 0) {
+            for (phys, views) |p, *v| v.* = self.memtable_snap.columns[p].view();
+            sample.addRows(views, 0, mem_rows);
+        }
+        sample.complete = sample.complete and whole;
+        return true;
+    }
+
     fn scanIsGloballySorted(self: *Scan, segs: []const storage.ManifestEntry) bool {
         if (segs.len <= 1) return true;
         if (self.table.schema.order_key.len == 0) return false;

@@ -3653,6 +3653,68 @@ test "sql: a stage read by a later CTE and the root outlives the stages between"
     try std.testing.expectEqual([2]f64{ rows, 4 * amounts + 5 * rows }, run.rows[1]);
 }
 
+test "sql: a GROUP BY whose first key fixes the second sizes for its groups, not the key product (issue #478)" {
+    const allocator = std.testing.allocator;
+    const rows = 640_000;
+    const rows_per_user = 8;
+    const users = rows / rows_per_user;
+    const Row = struct { uid: i64, engine: i64, v: i64 };
+    const seed = try allocator.alloc(Row, rows);
+    defer allocator.free(seed);
+    var total: i64 = 0;
+    for (seed, 0..) |*row, i| {
+        const uid: i64 = @intCast(i / rows_per_user);
+        row.* = .{ .uid = uid, .engine = @mod(uid * 7919, 1000), .v = @intCast(i % 100) };
+        total += row.v;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
+        .query_memory_budget = 1 << 30,
+        .memory_budget = 1 << 30,
+        .auto_flush_secs = 0,
+        .max_dop = 1,
+        .row_group_size = 4096,
+    });
+    defer db.close();
+    const visits = try db.table("visits", .{
+        .columns = &.{
+            .{ .name = "uid", .type = .bigint },
+            .{ .name = "engine", .type = .bigint },
+            .{ .name = "v", .type = .bigint },
+        },
+        .order_key = &.{"uid"},
+        .unique = false,
+    }, .{ .order_key = &.{"uid"}, .unique = false });
+    try visits.insert(seed);
+    try visits.flush();
+
+    // Each user has one engine, so there are as many groups as users, while
+    // the keys' NDV product (80K users x 1000 engines) caps at the 640K
+    // rows. The router samples the keys: row groups of the table below a
+    // union whose other arm is proven empty, windows of a materialized
+    // stage's rows, and a union's keys past its constant column.
+    const shapes = .{
+        "WITH g AS (SELECT uid, engine, SUM(v) AS s FROM (SELECT uid, engine, v FROM visits UNION ALL SELECT uid, engine, v FROM visits WHERE v < 0) t GROUP BY uid, engine) SELECT COUNT(*) AS n, SUM(s) AS total FROM g",
+        "WITH t AS MATERIALIZED (SELECT uid, engine, v FROM visits), g AS (SELECT uid, engine, SUM(v) AS s FROM t GROUP BY uid, engine) SELECT COUNT(*) AS n, SUM(s) AS total FROM g",
+        "WITH g AS (SELECT uid, engine, 0 AS s FROM visits UNION SELECT uid, engine, 0 AS s FROM visits WHERE v < 0) SELECT COUNT(*) AS n, SUM(s) AS total FROM g",
+    };
+    const expected = [_][2]i64{ .{ users, total }, .{ users, total }, .{ users, 0 } };
+    var peaks: [shapes.len]usize = undefined;
+    inline for (shapes, expected, &peaks) |sql, want, *peak| {
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        const b = (try q.next()).?;
+        try std.testing.expectEqual(want, [2]i64{ b.values[0].data.bigint[0], b.values[1].data.bigint[0] });
+        peak.* = q.cq.ctx.accountant.?.peak_bytes;
+    }
+    // Over the stage, radix's table outgrows its first size on the first
+    // 64K-row chunk and jumps to its estimate. The product sent it to
+    // 2^20 slots and cells for 786K groups, 56 MiB, and the statement
+    // peaked at 85 MB; sized for the users, it peaks at 41 MB.
+    try std.testing.expect(peaks[1] < 4 * rows * @sizeOf(Row));
+}
+
 test "sql: blocking paths release all actual capacity at teardown" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
