@@ -1729,8 +1729,8 @@ test "ChunkRangeScan: disjoint stripes cover every row exactly once" {
             return &self.schema;
         }
         pub fn addPrune(_: *@This(), _: exec.Predicate) !void {}
-        pub fn stats(_: *@This()) exec.PipelineStats {
-            return .{ .upper_rows = 0, .sort_state = .{}, .column_stats = &.{} };
+        pub fn stats(self: *@This()) exec.PipelineStats {
+            return .{ .upper_rows = self.data.len, .sort_state = .{}, .column_stats = &.{} };
         }
         pub fn accountant(_: *@This()) ?*exec.memory.MemoryAccountant {
             return null;
