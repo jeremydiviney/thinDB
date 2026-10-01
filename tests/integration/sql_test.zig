@@ -3802,6 +3802,32 @@ test "sql: blocking paths release all actual capacity at teardown" {
     }
 }
 
+test "sql: a join that cannot share a stage's hash build gives back what the attempt took (issue #500)" {
+    // `ext` is text and `n` an integer, so each join converts its build key
+    // with a function the stage's shared build has no kernel for. The declined
+    // attempt kept its arena and column copies charged to the statement, and
+    // the statement's accountant held the gate lease Database.close waits on.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    try helpers.exec(allocator, db, "CREATE TABLE facts (id BIGINT PRIMARY KEY, n INT)");
+    try helpers.exec(allocator, db, "CREATE TABLE plans (id BIGINT PRIMARY KEY, ext VARCHAR(16))");
+    try helpers.exec(allocator, db, "INSERT INTO facts VALUES (1, 7), (2, 8), (3, 9)");
+    try helpers.exec(allocator, db, "INSERT INTO plans VALUES (1, '7'), (2, '8')");
+    const matched = try helpers.collectBigints(allocator, db,
+        \\WITH p AS (SELECT id, ext FROM plans)
+        \\SELECT COUNT(p1.id) + COUNT(p2.id) AS matched FROM facts f
+        \\LEFT JOIN p p1 ON p1.ext = f.n
+        \\LEFT JOIN p p2 ON p2.ext = f.n
+    );
+    defer allocator.free(matched);
+    try std.testing.expectEqualSlices(i64, &.{4}, matched);
+    // Checked before close, which would wait on a leaked lease forever.
+    try std.testing.expectEqual(@as(usize, 0), db.config.statement_gate.?.allocator_owners);
+    db.close();
+}
+
 test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
