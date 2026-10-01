@@ -1315,14 +1315,15 @@ pub const Table = struct {
     /// wherever the spacing starts.
     const WIDTH_SAMPLE_ROW_GROUPS: u64 = 64;
 
-    /// String column `col_idx`'s mean bytes per row and, when `distinct`,
-    /// per distinct value over `segs`, sampled from `WIDTH_SAMPLE_ROW_GROUPS`
-    /// row groups spread evenly over them, for the GROUP BY router to price
-    /// a table input it can't measure. A raw block's header answers its row
-    /// sample; the distinct sample reads the block through the cache, where
-    /// the scan that follows finds it. Each sample stays on its segment's
-    /// handle, so later plans read nothing. Widths stay null when `segs` has
-    /// no rows.
+    /// String column `col_idx`'s mean bytes per row over `segs`, sampled
+    /// from `WIDTH_SAMPLE_ROW_GROUPS` row groups spread evenly over them, and
+    /// when `distinct` its bytes per distinct value, sampled from
+    /// `DistinctWidthSampler.BLOCKS_PER_TABLE` of those picks spread evenly,
+    /// for the GROUP BY router to price a table input it can't measure. A raw
+    /// block's header answers its row sample; the distinct sample reads the
+    /// block through the cache, where the scan that follows finds it. Each
+    /// sample stays on its segment's handle, so later plans read nothing.
+    /// Widths stay null when `segs` has no rows.
     pub fn sampledStringWidths(
         self: *Table,
         scratch: Allocator,
@@ -1334,6 +1335,7 @@ pub const Table = struct {
         for (segs) |s| total += s.row_group_count;
         if (total == 0) return .{};
         const picks: u64 = @min(total, WIDTH_SAMPLE_ROW_GROUPS);
+        const distinct_picks: u64 = @min(picks, storage.column.DistinctWidthSampler.BLOCKS_PER_TABLE);
         const col = self.schema.columns[col_idx];
         var bytes: u64 = 0;
         var rows: u64 = 0;
@@ -1357,7 +1359,7 @@ pub const Table = struct {
             if (rg_idx >= row_groups.len or col_idx >= row_groups[rg_idx].col_offsets.len) continue;
             bytes += try self.seg_handles.rowGroupStringBytes(self.allocator, scratch, e, rg_idx, col_idx, col.nullable, self.cacheRef());
             rows += row_groups[rg_idx].row_count;
-            if (!distinct) continue;
+            if (!distinct or pick * distinct_picks % picks >= distinct_picks) continue;
             const sampled = try self.seg_handles.rowGroupDistinctStrings(self.allocator, scratch, e, rg_idx, col_idx, col.nullable, self.cacheRef());
             distinct_sum.bytes += sampled.bytes;
             distinct_sum.values += sampled.values;

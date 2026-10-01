@@ -310,10 +310,10 @@ test "sampled widths: a scan averages each string column's bytes over its row gr
         .order_key = &.{"id"},
         .unique = true,
     };
-    const t = try db.table("sw", sw_schema, .{ .order_key = &ok, .unique = true, .row_group_size = 4 });
+    const t = try db.table("sw", sw_schema, .{ .order_key = &ok, .unique = true, .row_group_size = 5 });
 
-    // Three flushes of ten rows: row groups of 4, 4 and 2 rows per segment,
-    // few enough that the sample reads every one.
+    // Three flushes of ten rows: two row groups of 5 rows per segment, few
+    // enough that both samples read every one.
     const letters = "abcdefghijklmnopqrstuvw";
     var bytes: u64 = 0;
     var values: u64 = 0;

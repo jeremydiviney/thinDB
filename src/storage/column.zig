@@ -90,12 +90,17 @@ pub const DistinctWidthSampler = struct {
     bytes: u64 = 0,
     values: u64 = 0,
 
-    /// Rows sampled from one block: enough to see past a few heavy values,
-    /// few enough that planning stays cheap.
-    pub const ROWS_PER_BLOCK: u64 = 1024;
+    /// Row groups a table's distinct sample reads per column. Reading a
+    /// block decompresses all of it, a few ms for a URL block of 64Ki
+    /// rows, where a raw block's row sample reads only its header, so the
+    /// distinct sample reads a quarter of the row sample's 64 row groups.
+    pub const BLOCKS_PER_TABLE: u64 = 16;
+    /// Rows sampled from one block: hashing them costs little next to
+    /// reading the block.
+    pub const ROWS_PER_BLOCK: u64 = 4096;
     /// Rows sampled from a whole realized buffer, matching what a table's
-    /// width sample reads from its row groups.
-    pub const ROWS_PER_BUFFER: u64 = 64 * ROWS_PER_BLOCK;
+    /// distinct sample reads.
+    pub const ROWS_PER_BUFFER: u64 = BLOCKS_PER_TABLE * ROWS_PER_BLOCK;
 
     pub fn deinit(self: *DistinctWidthSampler, allocator: std.mem.Allocator) void {
         self.seen.deinit(allocator);
@@ -383,7 +388,7 @@ test "DistinctWidthSampler weighs each distinct value once and keeps the stride 
     try std.testing.expectEqual(@as(usize, 1), try strided.addStrided(a, .{ .data = .{ .string = sv }, .nulls = &null_bm }, 1, 3));
     try std.testing.expectEqual(@as(u64, 1), strided.values);
     try std.testing.expectEqual(@as(?u32, 20), strided.width());
-    try std.testing.expectEqual(@as(usize, 64), DistinctWidthSampler.stride(65_536, DistinctWidthSampler.ROWS_PER_BLOCK));
+    try std.testing.expectEqual(@as(usize, 16), DistinctWidthSampler.stride(65_536, DistinctWidthSampler.ROWS_PER_BLOCK));
     try std.testing.expectEqual(@as(usize, 1), DistinctWidthSampler.stride(10, DistinctWidthSampler.ROWS_PER_BLOCK));
 }
 

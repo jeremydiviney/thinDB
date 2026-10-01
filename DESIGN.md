@@ -804,10 +804,12 @@ empty string, against 58 bytes a distinct value. A string MIN, MAX, ANY_VALUE,
 FIRST, LAST or MAX_BY keeps one of its group's values, priced at the wider of
 its column's row and distinct widths: under a skewed key most groups hold few
 rows, and the row average weighs their values by the big groups' rows instead.
-The width sample therefore also hashes up to 1,024 strided rows of each
-sampled row group's columns a group keeps, weighs each distinct value once,
-and caches the count on the segment's handle. A stage or realized buffer
-samples 65,536 rows of those columns on demand. Radix and the partitioned
+The width sample therefore also hashes 4,096 strided rows from 16 of its 64
+row groups for each column a group keeps, weighs each distinct value once,
+and caches the count on the segment's handle. That reads fewer row groups
+than the row sample because a block's distinct values need its body
+decompressed, where a raw block's row bytes come from its header. A stage or
+realized buffer samples 65,536 rows of those columns on demand. Radix and the partitioned
 sort cores keep pricing at the row width.
 
 Parallel grouped aggregation initially reserves at most one 8,192-row batch's
