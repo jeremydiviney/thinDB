@@ -14,10 +14,13 @@
 //! stages the same way. All `next()`/teardown calls happen on the single
 //! connection thread driving the root query, so stage state needs no locks.
 //!
-//! The result frees the moment its LAST consumer finishes draining it — on a
-//! background thread so the teardown overlaps the next stage's work — and
-//! the thread is joined at StageSet teardown so memory accounting stays
-//! deterministic (leak-checked tests included).
+//! The result frees the moment its LAST consumer finishes draining it. Under
+//! physical allocation tracking the free runs right there, so the result's
+//! bytes stop counting against the budget before the caller goes on, and only
+//! the return of the memory to its allocator runs on a background thread
+//! (`DeferredFrees`); an untracked result frees wholly in the background.
+//! Either way the slow part overlaps the next stage's work, and the thread is
+//! joined at StageSet teardown so leak checks stay deterministic.
 //!
 //! Chunks are sized for striping (`chunk_rows` ≈ one row group): a future
 //! parallel consumer claims chunk ranges exactly like segment row-group
@@ -1126,26 +1129,43 @@ pub const Stage = struct {
         _ = self.uses_total.fetchAdd(1, .monotonic);
     }
 
-    /// A consumer finished (fully drained or torn down). On the last one,
-    /// hand the chunks to a background free so the teardown overlaps the
-    /// next stage; the thread is joined in `deinit`. The budget is handed
-    /// back HERE (driving thread, before the async free) so accounting
-    /// stays deterministic for the caller.
+    /// A consumer finished (fully drained or torn down). On the last one the
+    /// result is freed (`freeResult`), so the budget no longer counts it
+    /// when this returns, and then the upstream it borrows from is released.
     pub fn releaseUse(self: *Stage) void {
         const done = self.uses_done.fetchAdd(1, .acq_rel) + 1;
         if (done < self.uses_total.load(.acquire)) return;
         const res = self.result orelse return;
         self.result = null;
         self.releaseReserved();
+        self.freeResult(res);
         if (self.pinned_upstream) |src| {
             self.pinned_upstream = null;
             src.releaseUse();
         }
-        if (std.Thread.spawn(.{}, freeResultThread, .{res})) |th| {
-            self.free_thread = th;
-        } else |_| {
-            freeResultThread(res);
+    }
+
+    /// Under physical tracking the result is freed on this thread with its
+    /// memory collected, so every tracked byte stops counting now whatever
+    /// the scheduler does next; a background thread returns the memory. An
+    /// untracked result has nothing to count and frees wholly in the
+    /// background. The thread is joined in `deinit`.
+    fn freeResult(self: *Stage, res: *MaterializedResult) void {
+        const tracked = if (self.accountant) |acct| acct.physical_tracking else false;
+        if (!tracked) {
+            if (std.Thread.spawn(.{}, destroyResult, .{res})) |th| {
+                self.free_thread = th;
+            } else |_| destroyResult(res);
+            return;
         }
+        var frees: exec.memory.DeferredFrees = .{};
+        frees.collect();
+        destroyResult(res);
+        frees.stop();
+        if (frees.isEmpty()) return;
+        if (std.Thread.spawn(.{}, exec.memory.DeferredFrees.release, .{frees})) |th| {
+            self.free_thread = th;
+        } else |_| frees.release();
     }
 
     /// Drop the compile pin once no block left to compile can bind this
@@ -1158,14 +1178,14 @@ pub const Stage = struct {
 
     pub fn deinit(self: *Stage) void {
         if (self.free_thread) |th| th.join();
-        if (self.result) |res| freeResultThread(res);
+        if (self.result) |res| destroyResult(res);
         self.releaseReserved();
         if (self.query_alive) self.query.deinit();
         self.allocator.destroy(self);
     }
 };
 
-fn freeResultThread(res: *MaterializedResult) void {
+fn destroyResult(res: *MaterializedResult) void {
     const allocator = res.allocator;
     res.deinitChunks();
     allocator.destroy(res);
@@ -1613,6 +1633,36 @@ test "stage captures pipeline stats and tightens them after the run" {
     try std.testing.expectEqual(@as(u64, 0), post.upper_rows);
     try std.testing.expectEqual(@as(u32, 0), post.column_stats[0].ndv.exact);
     try std.testing.expectEqualStrings("k", post.sort_state.keys[0]);
+}
+
+test "a tracked stage result stops counting against the budget when its last reader finishes" {
+    const a = std.testing.allocator;
+    const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
+    const account = try a.create(exec.memory.MemoryAccountant);
+    account.* = exec.memory.MemoryAccountant.init(64 << 20);
+    account.trackAllocations(a);
+    defer account.releaseOwner(a);
+    const tracked = try account.executionAllocator();
+
+    const n = chunk_rows * 2 + 500;
+    const data = try a.alloc(i64, n);
+    defer a.free(data);
+    for (data, 0..) |*d, i| d.* = @intCast(i);
+    const schema = [_]Column{.{ .name = "v", .type = .bigint }};
+    const views = [_]ColumnView{.{ .data = .{ .bigint = data }, .nulls = null }};
+
+    const set = try StageSet.create(tracked);
+    defer set.deinit();
+    const stage = try set.addStage(try SingleBatchSource.create(tracked, .{ .schema = &schema, .values = &views, .row_count = n }), account);
+    var scan = try MatScan.create(tracked, stage);
+    defer scan.deinit();
+    stage.releaseCompilePin();
+    const before_run = account.current_bytes;
+    var rows: usize = 0;
+    while (try scan.next()) |batch| rows += batch.row_count;
+    try std.testing.expectEqual(n, rows);
+    try std.testing.expect(account.peak_bytes >= before_run + n * @sizeOf(i64));
+    try std.testing.expect(account.current_bytes <= before_run);
 }
 
 test "ChunkRangeScan: disjoint stripes cover every row exactly once" {

@@ -425,6 +425,27 @@ and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry
 orders each distinct row by its first occurrence in that order, as MySQL does:
 by the key's least value ascending, its greatest descending.
 
+A statement computes each distinct aggregate call once. The SELECT list, HAVING,
+ORDER BY, window specs and post-aggregate expressions can all repeat a call:
+`SELECT k, MIN(s), COUNT(*) ... HAVING MIN(s) <> '' AND COUNT(*) > 1` runs two
+aggregates, not four. The parser applies the rule where it builds the GroupBy's
+aggregate list, so every route (V1 generic, V2 lowcard and silo, radix,
+partitioned, sorted, group-topN) sees the shorter list. A repeated call's
+references read the first call's output. A repeated SELECT item becomes a copy
+of it. Two calls are equal when all of these match:
+
+- the function, with DISTINCT counted as part of it;
+- the argument expressions, compared structurally, with identifiers matched
+  case-insensitively;
+- the parameters: the GROUP_CONCAT separator, DISTINCT and ORDER BY, and the
+  percentile fraction.
+
+A call with a volatile argument (`RAND()`, a volatile UDF) keeps its own
+evaluation, as does a volatile aggregate UDF. Each repeat would otherwise hold
+its own state per group. On the 100M-row ClickBench table (6.2M groups) the
+pair above raised the statement's accounted peak from 10.0 GB to 13.9 GB
+(#466).
+
 **Decimal precision/scale propagation**:
 
 | Operation | Result type |

@@ -7,6 +7,8 @@ const Allocator = std.mem.Allocator;
 /// the current query while its buffers are in use. Query-owned wrappers stay
 /// attached until their last allocation is freed. Each allocation is charged
 /// what it holds in the child (`buffer_pool.footprint`), not what was asked.
+/// A free on a thread collecting `DeferredFrees` drops the charge at once and
+/// leaves the memory to the collector.
 pub const BudgetAllocator = struct {
     child: Allocator,
     active: ?*MemoryAccountant = null,
@@ -102,7 +104,62 @@ pub const BudgetAllocator = struct {
 
     fn freeFn(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *BudgetAllocator = @ptrCast(@alignCast(ctx));
-        self.child.rawFree(bytes, alignment, ret_addr);
+        if (!DeferredFrees.keep(self.child, bytes, alignment)) self.child.rawFree(bytes, alignment, ret_addr);
         self.release(self.charge(bytes.len, alignment));
+    }
+};
+
+/// Splits a teardown's frees in two: the charge goes now, the memory later.
+/// While a thread collects, each tracked block it frees stops counting against
+/// its budget exactly as a direct free would, but the block joins this list
+/// instead of returning to the untracked child allocator. `release` returns
+/// the collected memory from any thread, so the slow part of a large free can
+/// run in the background without the budget depending on when it does.
+/// Untracked frees, and blocks too small to hold the list entry, are freed
+/// directly.
+pub const DeferredFrees = struct {
+    head: ?*Block = null,
+
+    /// Written over the start of each collected block.
+    const Block = struct {
+        next: ?*Block,
+        child: Allocator,
+        len: usize,
+        alignment: std.mem.Alignment,
+    };
+
+    threadlocal var collecting: ?*DeferredFrees = null;
+
+    pub fn collect(self: *DeferredFrees) void {
+        std.debug.assert(collecting == null);
+        collecting = self;
+    }
+
+    pub fn stop(self: *DeferredFrees) void {
+        std.debug.assert(collecting == self);
+        collecting = null;
+    }
+
+    pub fn isEmpty(self: DeferredFrees) bool {
+        return self.head == null;
+    }
+
+    pub fn release(self: DeferredFrees) void {
+        var next = self.head;
+        while (next) |block| {
+            const entry = block.*;
+            next = entry.next;
+            const memory: [*]u8 = @ptrCast(block);
+            entry.child.rawFree(memory[0..entry.len], entry.alignment, @returnAddress());
+        }
+    }
+
+    fn keep(child: Allocator, memory: []u8, alignment: std.mem.Alignment) bool {
+        const self = collecting orelse return false;
+        if (memory.len < @sizeOf(Block) or !std.mem.isAligned(@intFromPtr(memory.ptr), @alignOf(Block))) return false;
+        const block: *Block = @ptrCast(@alignCast(memory.ptr));
+        block.* = .{ .next = self.head, .child = child, .len = memory.len, .alignment = alignment };
+        self.head = block;
+        return true;
     }
 };
