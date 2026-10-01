@@ -385,18 +385,36 @@ pub fn toIntKernel(allocator: Allocator, arg_types: []const Type, out_type: Type
     }
 }
 
-/// The MySQL dialect's `CAST(x AS SIGNED)` of a decimal: its whole part by
-/// `cast.signedBits`. `.kernel_managed`.
-pub fn toSignedBitsKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
-    _ = out_type;
-    const factor = pow10(scaleOf(arg_types[0]));
-    const base = out.data.rowCount();
-    try out.data.bigint.ensureUnusedCapacity(allocator, n);
-    for (0..n) |row| {
-        const bits: ?i64 = if (args[0].isValid(row)) cast.signedBits(@divTrunc(mantissaAt(args[0], row), factor)) else null;
-        out.data.bigint.appendAssumeCapacity(bits orelse 0);
-        try out.appendValidBit(allocator, base + row, bits != null);
-    }
+/// The MySQL dialect's `CAST(x AS SIGNED)` (a BIGINT) and
+/// `CAST(x AS UNSIGNED)` (a LARGEINT) of a decimal's whole part
+/// (`cast.mysqlSigned`, `cast.mysqlUnsigned`). One with scale 0 reads as an
+/// integer, which an integer literal past BIGINT is in MySQL. `.kernel_managed`.
+pub const toMysqlSignedKernel = MysqlCastKernel(.signed).kernel;
+pub const toMysqlUnsignedKernel = MysqlCastKernel(.unsigned).kernel;
+
+fn MysqlCastKernel(comptime spelling: cast.IntegerSpelling) type {
+    return struct {
+        fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+            _ = out_type;
+            const scale = scaleOf(arg_types[0]);
+            const source: cast.MysqlCastSource = if (scale == 0) .integer else .decimal;
+            const factor = pow10(scale);
+            const dst = switch (spelling) {
+                .signed => &out.data.bigint,
+                .unsigned => &out.data.largeint,
+            };
+            const base = out.data.rowCount();
+            try dst.ensureUnusedCapacity(allocator, n);
+            for (0..n) |row| {
+                const v = if (!args[0].isValid(row)) null else switch (spelling) {
+                    .signed => cast.mysqlSigned(source, @divTrunc(mantissaAt(args[0], row), factor)),
+                    .unsigned => if (cast.mysqlUnsigned(source, @divTrunc(mantissaAt(args[0], row), factor))) |bits| @as(i128, bits) else null,
+                };
+                dst.appendAssumeCapacity(v orelse 0);
+                try out.appendValidBit(allocator, base + row, v != null);
+            }
+        }
+    };
 }
 
 /// Append `v` to an integer output, or 0 when it is null or outside the

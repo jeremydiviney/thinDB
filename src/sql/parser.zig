@@ -3660,11 +3660,7 @@ pub const Parser = struct {
     fn integerSpellingExpr(self: *Parser, inner: ir.Expr, spelling: scalar_fn.IntegerSpelling) ParseError!ir.Expr {
         const lowered = scalar_fn.integerSpellingCast(spelling, self.lex.dialect);
         if (inner == .null_lit) return ir.Expr{ .null_lit = lowered.result };
-        var expr = inner;
-        for (lowered.fns) |fn_name| {
-            expr = ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, fn_name), .args = try self.arena.dupe(ir.Expr, &.{expr}) } };
-        }
-        return expr;
+        return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, lowered.fn_name), .args = try self.arena.dupe(ir.Expr, &.{inner}) } };
     }
 
     fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
@@ -8422,7 +8418,7 @@ test "no scalar UDF can take a function that syntax lowers to" {
     }
     for (std.enums.values(scalar_fn.IntegerSpelling)) |spelling| {
         for (std.enums.values(types.Dialect)) |dialect| {
-            for (scalar_fn.integerSpellingCast(spelling, dialect).fns) |name| try std.testing.expect(scalar_fn.isReservedScalarUdfName(name));
+            try std.testing.expect(scalar_fn.isReservedScalarUdfName(scalar_fn.integerSpellingCast(spelling, dialect).fn_name));
         }
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

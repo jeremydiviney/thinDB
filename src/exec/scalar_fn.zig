@@ -320,7 +320,9 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
         if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float"))
             return try buildDecFn(aa, name, arg_types, .double, dec.toDoubleKernel, .propagates);
         if (std.mem.eql(u8, name, MYSQL_SIGNED_FN))
-            return try buildDecFn(aa, name, arg_types, .bigint, dec.toSignedBitsKernel, .kernel_managed);
+            return try buildDecFn(aa, name, arg_types, .bigint, dec.toMysqlSignedKernel, .kernel_managed);
+        if (std.mem.eql(u8, name, MYSQL_UNSIGNED_FN))
+            return try buildDecFn(aa, name, arg_types, .largeint, dec.toMysqlUnsignedKernel, .kernel_managed);
         if (intCastTarget(name)) |it|
             return try buildDecFn(aa, name, arg_types, it, dec.toIntKernel, .kernel_managed);
         if (std.ascii.eqlIgnoreCase(name, "to_string"))
@@ -857,7 +859,7 @@ fn hexLiteralAsKernel(allocator: Allocator, arg_types: []const Type, out_type: T
 /// any overload takes as text, except BIN's and CONV's number.
 pub fn readsNumberAt(registry: ?*const udf_mod.UdfRegistry, name: []const u8, arity: usize, i: usize) bool {
     if (intCastTarget(name) != null or std.mem.startsWith(u8, name, "to_decimal")) return true;
-    if (std.mem.eql(u8, name, MYSQL_SIGNED_FN)) return true;
+    if (std.mem.eql(u8, name, MYSQL_SIGNED_FN) or std.mem.eql(u8, name, MYSQL_UNSIGNED_FN)) return true;
     if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (resultValueArgsStart(name)) |start| if (i >= start) return false;
     if (i == 0 and readsNumberAsText(name)) return true;
@@ -1078,32 +1080,30 @@ pub fn bitOperatorFn(op: BitOperator, dialect: types.Dialect) []const u8 {
     };
 }
 
-/// MySQL's cast-only integer targets, `SIGNED [INTEGER]` and
-/// `UNSIGNED [INTEGER]`.
-pub const IntegerSpelling = enum { signed, unsigned };
+pub const IntegerSpelling = cast.IntegerSpelling;
 
-/// Internal: the MySQL dialect's `CAST(x AS SIGNED)`, which keeps a
-/// number's 64 bits (`cast.signedBits`), and `CAST(x AS UNSIGNED)` over
-/// it, which reads those bits unsigned.
+/// Internal: the MySQL dialect's `CAST(x AS SIGNED)` (`cast.mysqlSigned`)
+/// and `CAST(x AS UNSIGNED)` (`cast.mysqlUnsigned`).
 pub const MYSQL_SIGNED_FN = "__mysql_signed";
 pub const MYSQL_UNSIGNED_FN = "__mysql_unsigned";
 
-/// The functions a CAST to an integer spelling applies, innermost first,
-/// and the type it returns (a NULL literal's).
-pub const IntegerSpellingCast = struct { fns: []const []const u8, result: Type };
+/// The function a CAST to an integer spelling calls and the type it
+/// returns (a NULL literal's too).
+pub const IntegerSpellingCast = struct { fn_name: []const u8, result: Type };
 
 /// What a CAST to `spelling` lowers to in `dialect`, decided here alone.
-/// MySQL reads the value as 64 bits, so `SIGNED` wraps [2^63, 2^64) by two's
-/// complement (the unsigned bit operators' `CAST(~5 AS SIGNED)` is -6) and
-/// `UNSIGNED` is BIGINT UNSIGNED. Elsewhere both are `CAST AS BIGINT`, NULL
-/// past BIGINT's range as in StarRocks (`cast.narrowInt`).
+/// MySQL's read an integer as 64 bits, so `SIGNED` wraps [2^63, 2^64) by
+/// two's complement (the unsigned bit operators' `CAST(~5 AS SIGNED)` is -6)
+/// and `UNSIGNED` is a BIGINT UNSIGNED, held in a LARGEINT. Elsewhere both
+/// are `CAST AS BIGINT`, NULL past BIGINT's range as in StarRocks
+/// (`cast.narrowInt`).
 pub fn integerSpellingCast(spelling: IntegerSpelling, dialect: types.Dialect) IntegerSpellingCast {
     return switch (dialect) {
         .mysql => switch (spelling) {
-            .signed => .{ .fns = &.{MYSQL_SIGNED_FN}, .result = .bigint },
-            .unsigned => .{ .fns = &.{ MYSQL_SIGNED_FN, MYSQL_UNSIGNED_FN }, .result = .largeint },
+            .signed => .{ .fn_name = MYSQL_SIGNED_FN, .result = .bigint },
+            .unsigned => .{ .fn_name = MYSQL_UNSIGNED_FN, .result = .largeint },
         },
-        .neutral, .postgres => .{ .fns = &.{"to_bigint"}, .result = .bigint },
+        .neutral, .postgres => .{ .fn_name = "to_bigint", .result = .bigint },
     };
 }
 
@@ -1592,12 +1592,17 @@ pub const builtins = [_]ScalarFn{
     // decimal source resolves in `resolveDecimal`.
     .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.bigintIdentityKernel },
     .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.int}, .return_type = .bigint, .kernel = math.intToBigintKernel },
-    .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.doubleToSignedBitsKernel },
-    .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.stringToSignedBitsKernel },
+    .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.double}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.doubleToMysqlSignedKernel },
+    .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.stringToMysqlSignedKernel },
     .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.date}, .return_type = .bigint, .kernel = date.dateToBigintKernel },
     .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.datetimeToBigintKernel },
-    .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.largeint}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.largeintToSignedBitsKernel },
-    .{ .name = MYSQL_UNSIGNED_FN, .arg_types = &.{.bigint}, .return_type = .largeint, .kernel = math.bigintToUnsignedBitsKernel },
+    .{ .name = MYSQL_SIGNED_FN, .arg_types = &.{.largeint}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = math.largeintToMysqlSignedKernel },
+    .{ .name = MYSQL_UNSIGNED_FN, .arg_types = &.{.bigint}, .return_type = .largeint, .kernel = math.bigintToMysqlUnsignedKernel },
+    .{ .name = MYSQL_UNSIGNED_FN, .arg_types = &.{.double}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.doubleToMysqlUnsignedKernel },
+    .{ .name = MYSQL_UNSIGNED_FN, .arg_types = &.{.string}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.stringToMysqlUnsignedKernel },
+    .{ .name = MYSQL_UNSIGNED_FN, .arg_types = &.{.date}, .return_type = .largeint, .kernel = date.dateToLargeintKernel },
+    .{ .name = MYSQL_UNSIGNED_FN, .arg_types = &.{.datetime}, .return_type = .largeint, .kernel = date.datetimeToLargeintKernel },
+    .{ .name = MYSQL_UNSIGNED_FN, .arg_types = &.{.largeint}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.largeintToMysqlUnsignedKernel },
     .{ .name = "to_largeint", .arg_types = &.{.double}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.doubleToLargeintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.string}, .return_type = .largeint, .null_strategy = .kernel_managed, .kernel = math.stringToLargeintKernel },
     .{ .name = "to_largeint", .arg_types = &.{.date}, .return_type = .largeint, .kernel = date.dateToLargeintKernel },

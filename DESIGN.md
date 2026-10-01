@@ -364,18 +364,22 @@ its values run past 38 digits, which thinDB's decimals don't
 (`cast.commonType`). An integer cast to a narrower integer type is NULL
 where it doesn't fit, as in StarRocks and in every dialect (`cast.narrowInt`):
 a LARGEINT past BIGINT's range cast to BIGINT is NULL. The one exception is
-MySQL's own cast spelling in the MySQL dialect, which reads a value as 64
-bits as MySQL reads an integer (`scalar_fn.integerSpellingCast`):
-`CAST(x AS SIGNED)` wraps any value in [2^63, 2^64), a fraction truncated
-first, into BIGINT by two's complement (`cast.signedBits`), so
-`CAST(~5 AS SIGNED)` over the unsigned bit operators is -6, and
+MySQL's own cast spelling in the MySQL dialect, which reads a value past
+BIGINT as MySQL 8.4 does (`scalar_fn.integerSpellingCast`). An integer,
+integer text or DECIMAL with scale 0 (what an integer literal past BIGINT is
+here, where MySQL's is BIGINT UNSIGNED) keeps its 64 bits:
+`CAST(x AS SIGNED)` wraps [2^63, 2^64) into BIGINT by two's complement
+(`cast.mysqlSigned`), so `CAST(~5 AS SIGNED)` over the unsigned bit
+operators is -6 and `CAST(18446744073709551615 AS SIGNED)` is -1, and
 `CAST(x AS UNSIGNED)` reads those 64 bits unsigned into a LARGEINT
-(`CAST(-1 AS UNSIGNED)` is 18446744073709551615). A value past 64 bits is
-still NULL there. MySQL itself saturates a double or DECIMAL rather than
-wrapping it, but an integer literal past BIGINT is a DECIMAL here and BIGINT
-UNSIGNED there, so one rule for every number keeps
-`CAST(18446744073709551615 AS SIGNED)` at MySQL's -1. Elsewhere `SIGNED`
-and `UNSIGNED` are `CAST AS BIGINT`. An integer of any width, LARGEINT
+(`cast.mysqlUnsigned`; `CAST(-1 AS UNSIGNED)` is 18446744073709551615). One
+past 64 bits is still NULL. A DOUBLE, FLOAT or DECIMAL with a fraction
+clamps instead, as MySQL does with a warning: SIGNED to BIGINT's range,
+UNSIGNED of a double to SIGNED's bits (`CAST(1e19 AS UNSIGNED)` is
+9223372036854775807) and of a decimal to [-2^63, 2^64 - 1], a negative value
+then read as its bits. The fraction is truncated, as every integer CAST here
+truncates, where MySQL rounds. Elsewhere `SIGNED` and `UNSIGNED` are
+`CAST AS BIGINT`. An integer of any width, LARGEINT
 included, becomes text digit for digit (`CAST(… AS CHAR)`, CONCAT and every
 other text context). The MySQL wire presents a LARGEINT column as BIGINT in a
 text result, and as DECIMAL(39, 0) in a prepared statement's binary result,

@@ -251,7 +251,7 @@ pub fn argCastCanNull(from: TypeTag, to: TypeTag) bool {
 /// THE integer narrowing rule, StarRocks semantics in every dialect: an
 /// integer becomes a narrower integer type's value when it fits and NULL
 /// when it doesn't (`CAST(2147483648 AS INT)`, `LEFT(s, 4294967298)`).
-/// The MySQL dialect's `CAST(x AS SIGNED)` alone reads by `signedBits`.
+/// The MySQL dialect's `CAST(x AS SIGNED)` alone reads by `mysqlSigned`.
 /// Explicit CASTs, arguments narrowed to their parameter, a double or
 /// decimal read as an integer argument (`scalar_fn.INTEGER_ARG_FN`) and a
 /// table function's scalar arguments all narrow by it. A write into a column
@@ -260,15 +260,51 @@ pub fn narrowInt(comptime T: type, x: anytype) ?T {
     return std.math.cast(T, x);
 }
 
-/// The MySQL dialect's `CAST(x AS SIGNED)` of `x` read as an integer (a
-/// fraction truncated toward zero, as every integer CAST truncates): its low
-/// 64 bits as a BIGINT, so a value in [2^63, 2^64) wraps by two's complement,
-/// as MySQL reads a BIGINT UNSIGNED (`CAST(~5 AS SIGNED)` is -6, its bit
-/// operators being unsigned). A value past 64 bits is NULL, as `narrowInt`
-/// makes it.
-pub fn signedBits(x: i128) ?i64 {
-    if (x < std.math.minInt(i64) or x > std.math.maxInt(u64)) return null;
-    return @truncate(x);
+/// MySQL's cast-only integer targets, `SIGNED [INTEGER]` and
+/// `UNSIGNED [INTEGER]`.
+pub const IntegerSpelling = enum { signed, unsigned };
+
+/// What a value is to the MySQL dialect's `CAST(x AS SIGNED)` and
+/// `CAST(x AS UNSIGNED)` (`mysqlSigned`, `mysqlUnsigned`).
+pub const MysqlCastSource = enum {
+    /// Any integer type, integer text, or a DECIMAL with scale 0, which is
+    /// what an integer literal past BIGINT is here where MySQL's is a BIGINT
+    /// UNSIGNED.
+    integer,
+    /// A DOUBLE or FLOAT.
+    double,
+    /// A DECIMAL with a fraction.
+    decimal,
+};
+
+/// The MySQL dialect's `CAST(x AS SIGNED)` of `x`, read from `source` with
+/// its fraction already truncated toward zero, as every integer CAST here
+/// truncates (MySQL rounds). An integer keeps its low 64 bits, so [2^63,
+/// 2^64) wraps by two's complement as MySQL reads a BIGINT UNSIGNED
+/// (`CAST(~5 AS SIGNED)` is -6, its bit operators being unsigned), and one
+/// past 64 bits is NULL, as `narrowInt` makes it. A double or decimal clamps
+/// to BIGINT's range, as MySQL 8.4 clamps one with a warning.
+pub fn mysqlSigned(source: MysqlCastSource, x: i128) ?i64 {
+    return switch (source) {
+        .integer => if (x < std.math.minInt(i64) or x > std.math.maxInt(u64)) null else @as(i64, @truncate(x)),
+        .double, .decimal => @as(i64, @intCast(std.math.clamp(x, std.math.minInt(i64), std.math.maxInt(i64)))),
+    };
+}
+
+/// The MySQL dialect's `CAST(x AS UNSIGNED)`, a BIGINT UNSIGNED, of `x` read
+/// as `mysqlSigned` reads it. An integer or double is `mysqlSigned`'s 64
+/// bits read unsigned: `CAST(-1 AS UNSIGNED)` is 2^64 - 1, and a double past
+/// BIGINT is 2^63 - 1, as in MySQL 8.4. A decimal clamps to [-2^63, 2^64 - 1]
+/// instead, a negative one then read as its 64 bits, as MySQL 8.4 does.
+pub fn mysqlUnsigned(source: MysqlCastSource, x: i128) ?u64 {
+    switch (source) {
+        .integer, .double => return @bitCast(mysqlSigned(source, x) orelse return null),
+        .decimal => {
+            const clamped = std.math.clamp(x, std.math.minInt(i64), std.math.maxInt(u64));
+            if (clamped < 0) return @bitCast(@as(i64, @intCast(clamped)));
+            return @intCast(clamped);
+        },
+    }
 }
 
 /// The kernel narrowing a `FromT` integer column to `ToT` by `narrowInt`.
@@ -1024,18 +1060,31 @@ test "preservesOrder: a DATETIME's day merges, a widening stays strict, text reo
     }
 }
 
-test "signedBits: 64 bits wrap into BIGINT, anything wider is NULL" {
+test "mysqlSigned / mysqlUnsigned: an integer wraps its 64 bits, a double or decimal clamps" {
     const max_i64: i128 = std.math.maxInt(i64);
     const min_i64: i128 = std.math.minInt(i64);
+    const max_u64: i128 = std.math.maxInt(u64);
+    // source, x, SIGNED, UNSIGNED
     const cases = .{
-        .{ max_i64, @as(?i64, std.math.maxInt(i64)) },
-        .{ max_i64 + 1, @as(?i64, std.math.minInt(i64)) },
-        .{ std.math.maxInt(u64) - 5, @as(?i64, -6) },
-        .{ std.math.maxInt(u64), @as(?i64, -1) },
-        .{ std.math.maxInt(u64) + 1, @as(?i64, null) },
-        .{ -1, @as(?i64, -1) },
-        .{ min_i64, @as(?i64, std.math.minInt(i64)) },
-        .{ min_i64 - 1, @as(?i64, null) },
+        .{ MysqlCastSource.integer, max_i64, @as(?i64, std.math.maxInt(i64)), @as(?u64, std.math.maxInt(i64)) },
+        .{ MysqlCastSource.integer, max_i64 + 1, @as(?i64, std.math.minInt(i64)), @as(?u64, 1 << 63) },
+        .{ MysqlCastSource.integer, max_u64 - 5, @as(?i64, -6), @as(?u64, std.math.maxInt(u64) - 5) },
+        .{ MysqlCastSource.integer, max_u64, @as(?i64, -1), @as(?u64, std.math.maxInt(u64)) },
+        .{ MysqlCastSource.integer, max_u64 + 1, @as(?i64, null), @as(?u64, null) },
+        .{ MysqlCastSource.integer, -1, @as(?i64, -1), @as(?u64, std.math.maxInt(u64)) },
+        .{ MysqlCastSource.integer, min_i64, @as(?i64, std.math.minInt(i64)), @as(?u64, 1 << 63) },
+        .{ MysqlCastSource.integer, min_i64 - 1, @as(?i64, null), @as(?u64, null) },
+        .{ MysqlCastSource.double, max_i64 + 1, @as(?i64, std.math.maxInt(i64)), @as(?u64, std.math.maxInt(i64)) },
+        .{ MysqlCastSource.double, max_u64 + 1, @as(?i64, std.math.maxInt(i64)), @as(?u64, std.math.maxInt(i64)) },
+        .{ MysqlCastSource.double, -1, @as(?i64, -1), @as(?u64, std.math.maxInt(u64)) },
+        .{ MysqlCastSource.double, min_i64 - 1, @as(?i64, std.math.minInt(i64)), @as(?u64, 1 << 63) },
+        .{ MysqlCastSource.decimal, max_i64 + 1, @as(?i64, std.math.maxInt(i64)), @as(?u64, 1 << 63) },
+        .{ MysqlCastSource.decimal, max_u64 + 1, @as(?i64, std.math.maxInt(i64)), @as(?u64, std.math.maxInt(u64)) },
+        .{ MysqlCastSource.decimal, -1, @as(?i64, -1), @as(?u64, std.math.maxInt(u64)) },
+        .{ MysqlCastSource.decimal, min_i64 - 1, @as(?i64, std.math.minInt(i64)), @as(?u64, 1 << 63) },
     };
-    inline for (cases) |c| try std.testing.expectEqual(c[1], signedBits(c[0]));
+    inline for (cases) |c| {
+        try std.testing.expectEqual(c[2], mysqlSigned(c[0], c[1]));
+        try std.testing.expectEqual(c[3], mysqlUnsigned(c[0], c[1]));
+    }
 }
