@@ -452,6 +452,8 @@ pub const SharedJoinBuild = struct {
     null_safe_keys: u8,
     needs_chain: bool,
     arena: std.heap.ArenaAllocator,
+    /// The table's arrays (see `Join.table_arena`).
+    table_arena: BlockArena,
     /// Concatenated copy of a chunked result; empty when the result was
     /// contiguous and the views borrow it directly.
     copies: []engine.ColumnStore,
@@ -484,6 +486,7 @@ pub const SharedJoinBuild = struct {
         if (self.copies.len > 0) allocator.free(self.copies);
         for (self.cast_stores) |*c| c.deinit(allocator);
         if (self.cast_stores.len > 0) allocator.free(self.cast_stores);
+        self.table_arena.deinit();
         self.arena.deinit();
     }
 };
@@ -1106,6 +1109,8 @@ pub const Stage = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer if (!kept) arena.deinit();
         const aa = arena.allocator();
+        var table_arena = BlockArena.init(self.allocator);
+        defer if (!kept) table_arena.deinit();
         const views = try aa.alloc(ColumnView, res.schema.len);
         var copies: []engine.ColumnStore = &.{};
         try res.contiguousViews(views, &copies);
@@ -1138,7 +1143,7 @@ pub const Stage = struct {
         const bytes = join_mod.fastTableBytes(rows, needs_chain);
         if (self.accountant) |acct| try acct.reserve(.join_build, bytes);
         defer if (!kept) if (self.accountant) |acct| acct.release(.join_build, bytes);
-        const built = (try join_mod.buildFastTable(aa, self.allocator, key_views[0..keys.len], null_safe_keys, rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
+        const built = (try join_mod.buildFastTable(table_arena.allocator(), self.allocator, key_views[0..keys.len], null_safe_keys, rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
         const owned_casts = try aa.alloc(ColumnCast, casts.len);
         for (casts, owned_casts) |c, *o| o.* = .{ .col = c.col, .fn_name = try aa.dupe(u8, c.fn_name) };
         const owned_keys = try aa.alloc(KeySpec, keys.len);
@@ -1149,6 +1154,7 @@ pub const Stage = struct {
             .null_safe_keys = null_safe_keys,
             .needs_chain = needs_chain,
             .arena = arena,
+            .table_arena = table_arena,
             .copies = copies,
             .cast_stores = cast_stores,
             .views = views,
