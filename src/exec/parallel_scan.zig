@@ -171,6 +171,15 @@ const RGS_PER_THREAD: usize = 2;
 /// be the whole table — can't materialize).
 const Mode = enum { unset, round, materialize };
 
+/// Materialize mode drains in waves. Workers stop claiming chunks once the
+/// chunks finished in the wave hold this much; the consumer takes what is
+/// buffered, each buffer freed as the next is pulled, and the drain resumes.
+/// A filter that keeps most of a wide table would otherwise park every
+/// survivor in the buffers before the consumer reads its first row. A scan
+/// whose survivors fit under the bound drains in one wave. The bound is read
+/// between chunks, so a wave overshoots it by the chunks in flight.
+const DRAIN_WAVE_BYTES: usize = 256 << 20;
+
 /// One worker's fully-drained, deep-copied survivor set (materialize mode).
 /// `columns` are owned and allocated from the table's thread-safe allocator
 /// (workers run concurrently); freed in `deinit`.
@@ -740,6 +749,13 @@ pub const ParallelScan = struct {
     /// frees it and hands its bytes back to the budget.
     held: ?usize = null,
     reserved_bytes: usize = 0,
+    /// Chunks drained so far: `nextMaterialize` emits up to here, then runs
+    /// the next wave.
+    drained_chunks: usize = 0,
+    drain_wave_bytes: usize = DRAIN_WAVE_BYTES,
+    wave_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
+    prof_drain_ticks: i64 = 0,
+    prof_waves: usize = 0,
 
     // Fused projection Compute (set via tryFuseCompute): when present, each
     // worker drains `compute_q[i]` (a Compute over its ranged Scan) instead of
@@ -1733,10 +1749,20 @@ pub const ParallelScan = struct {
         // A fused aggregate's groups or a probe's joined rows are built from
         // several source rows.
         if (self.agg_fused or self.probe_sink != null) st.row_origin = null;
-        if (self.out_col_stats.len > 0) {
-            return .{ .upper_rows = st.upper_rows, .sort_state = st.sort_state, .column_stats = self.out_col_stats, .row_origin = st.row_origin };
-        }
+        st.buffered = self.waveBound(st.upper_rows);
+        if (self.out_col_stats.len > 0) st.column_stats = self.out_col_stats;
         return st;
+    }
+
+    /// What a wave of the fused-filter drain can hold when the consumer
+    /// pulls: the bound it stops claiming at, and a chunk for each thread
+    /// that was mid-chunk when it was reached. A partial aggregate hands up
+    /// groups and a probe joined rows, neither of them these rows.
+    fn waveBound(self: *const ParallelScan, upper_rows: u64) exec.Buffered {
+        if (self.agg_fused or self.probe_sink != null or self.workers.len == 0) return .{};
+        if (!self.materializesOnPull()) return .{};
+        const chunk_rows = upper_rows / self.workers.len + 1;
+        return .{ .rows = @min(upper_rows, chunk_rows *| self.n_threads), .bytes = self.drain_wave_bytes };
     }
 
     /// `VTable.sampleWidths`: the workers read the same source, so the
@@ -1877,6 +1903,8 @@ pub const ParallelScan = struct {
                 (self.compute_fused and !compute_streams);
             if (!force_mat) return null;
             self.mode = .materialize;
+            // The adopter keeps every chunk, so there is nothing to bound.
+            self.drain_wave_bytes = std.math.maxInt(usize);
             try self.runMaterialize();
         }
         if (self.mode != .materialize or self.emit_cursor != 0 or self.agg_fused) return null;
@@ -1948,17 +1976,12 @@ pub const ParallelScan = struct {
         }
     }
 
-    /// Fused-filter path: spawn workers 1..n-1 once (worker 0 inline), each
-    /// draining its entire slice to completion and deep-copying its survivors
-    /// into its own ColumnStores. One spawn+join for the whole scan instead of
-    /// one per sub-batch. Charges the merged survivor bytes against the query
-    /// budget after the join (single-threaded — the accountant isn't
-    /// thread-safe and workers never touch it).
+    /// Fused-filter path: set up one buffer per chunk and drain the first
+    /// wave.
     fn runMaterialize(self: *ParallelScan) !void {
         // Per-drainable buffers: a deferred leaf's agg pipelines were sized
         // to the PLANNED chunk bound, which can exceed the realized workers.
         const n = if (self.agg_fused) self.agg_q.len else if (self.compute_fused) self.compute_q.len else self.workers.len;
-        const ta = self.worker_alloc;
 
         const wbufs = try self.allocator.alloc(WorkerBuf, n);
         for (wbufs) |*wb| wb.* = .{};
@@ -1970,8 +1993,22 @@ pub const ParallelScan = struct {
             self.werr = try self.allocator.alloc(?anyerror, n);
         }
         for (self.werr) |*e| e.* = null;
-        @memset(self.thread_active, false);
         self.next_chunk.store(0, .monotonic);
+        try self.drainWave();
+    }
+
+    /// Drain chunks, in order from where the last wave stopped, until the
+    /// wave holds `drain_wave_bytes` or none are left: spawn workers 1..n-1
+    /// (worker 0 inline), each draining whole chunks and deep-copying their
+    /// survivors into the chunk's own ColumnStores. One spawn+join per wave
+    /// instead of one per sub-batch. Charges the wave's survivor bytes
+    /// against the query budget after the join (single-threaded — the
+    /// accountant isn't thread-safe and workers never touch it).
+    fn drainWave(self: *ParallelScan) !void {
+        const ta = self.worker_alloc;
+        const first = self.drained_chunks;
+        @memset(self.thread_active, false);
+        self.wave_bytes.store(0, .monotonic);
 
         const wall0 = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
 
@@ -1986,22 +2023,30 @@ pub const ParallelScan = struct {
         } else {
             self.workSteal(self.workers, ta);
         }
+        // Every claimed chunk was drained before its thread was joined, and
+        // claims are handed out in order.
+        self.drained_chunks = @min(self.next_chunk.load(.monotonic), self.wbufs.len);
+        const exhausted = self.drained_chunks == self.wbufs.len;
 
-        if (exec.prof.enabled) self.reportDrain(exec.prof.ticksToMs(exec.prof.nowTicks() - wall0));
+        if (exec.prof.enabled) {
+            self.prof_drain_ticks += @max(0, exec.prof.nowTicks() - wall0);
+            self.prof_waves += 1;
+            if (exhausted) self.reportDrain(exec.prof.ticksToMs(self.prof_drain_ticks));
+        }
 
         for (self.werr) |e| if (e) |err| return err;
 
         // The drain deep-copied every surviving batch into owned wbufs, so a
-        // buffer source is fully consumed HERE — release its stage use before
-        // reserving the copies, handing the stage's bytes back to the budget
-        // instead of pinning the source buffer until query teardown (which
-        // costs a whole stage of headroom on whale CTE chains).
-        self.releaseStageUse();
+        // buffer source is fully consumed once the last wave is in — release
+        // its stage use before reserving the copies, handing the stage's bytes
+        // back to the budget instead of pinning the source buffer until query
+        // teardown (which costs a whole stage of headroom on whale CTE chains).
+        if (exhausted) self.releaseStageUse();
 
         var total: usize = 0;
-        for (self.wbufs) |wb| total += wb.bytes;
+        for (self.wbufs[first..self.drained_chunks]) |wb| total += wb.bytes;
         if (self.acct) |a| try a.reserve(.materialize, total);
-        self.reserved_bytes = total;
+        self.reserved_bytes += total;
     }
 
     /// Threads actually worth spawning: the configured DOP clamped by the work
@@ -2023,8 +2068,9 @@ pub const ParallelScan = struct {
     /// remain, then join. Finer chunks + dynamic claiming balance work that
     /// static per-thread slices can't (survivor count ≠ bytes for filter/regex).
     fn workSteal(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
-        const eff = self.effectiveThreads();
-        self.eff_threads = eff;
+        const left = drainables.len - @min(self.next_chunk.load(.monotonic), drainables.len);
+        const eff = @max(@as(usize, 1), @min(self.effectiveThreads(), left));
+        self.eff_threads = @max(self.eff_threads, eff);
         var t: usize = 1;
         while (t < eff) : (t += 1) {
             if (std.Thread.spawn(.{}, stealLoop, .{ self, drainables, ta })) |th| {
@@ -2079,8 +2125,8 @@ pub const ParallelScan = struct {
             },
             .chunk => {},
         };
-        std.debug.print("[pscan] threads={d}(eff={d}) chunks={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
-            self.n_threads,                       self.eff_threads,                     self.workers.len,                                        drain_wall_ms, rows,
+        std.debug.print("[pscan] threads={d}(eff={d}) chunks={d} waves={d} drain_wall={d:.1}ms survivors={d} chunk_ms[min={d:.1} max={d:.1} mean={d:.1}]\n", .{
+            self.n_threads,                       self.eff_threads,                     self.workers.len,                                        self.prof_waves, drain_wall_ms, rows,
             exec.prof.ticksToMs(@intCast(min_t)), exec.prof.ticksToMs(@intCast(max_t)), exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
         });
         std.debug.print("[pscan] rowgroups: considered={d} scanned={d} pruned={d} ({d:.1}%)  rows_decoded={d}  busiest_worker_rgs={d}\n", .{
@@ -2169,15 +2215,18 @@ pub const ParallelScan = struct {
             self.freeWorkerBuf(&self.wbufs[i]);
             if (exec.prof.enabled) exec.prof.addPhase("pscan.emit.free_buffers", @intCast(exec.prof.nowTicks() - t_free));
         }
-        while (self.emit_cursor < self.wbufs.len) {
-            const wb = &self.wbufs[self.emit_cursor];
-            self.emit_cursor += 1;
-            if (wb.row_count == 0) continue;
-            self.held = self.emit_cursor - 1;
-            for (wb.columns, self.emit_views) |*c, *v| v.* = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.emit_views, .row_count = wb.row_count };
+        while (true) {
+            while (self.emit_cursor < self.drained_chunks) {
+                const wb = &self.wbufs[self.emit_cursor];
+                self.emit_cursor += 1;
+                if (wb.row_count == 0) continue;
+                self.held = self.emit_cursor - 1;
+                for (wb.columns, self.emit_views) |*c, *v| v.* = c.view();
+                return Batch{ .schema = self.out_schema, .values = self.emit_views, .row_count = wb.row_count };
+            }
+            if (self.drained_chunks == self.wbufs.len) return null;
+            try self.drainWave();
         }
-        return null;
     }
 
     /// Frees a buffer's column data and releases its share of the
@@ -2467,6 +2516,7 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
     var leased = false;
     defer if (leased) lease.release();
     while (true) {
+        if (self.wave_bytes.load(.monotonic) >= self.drain_wave_bytes) break;
         const i = self.next_chunk.fetchAdd(1, .monotonic);
         if (i >= drainables.len) break;
         if (!leased) {
@@ -2478,6 +2528,9 @@ fn stealLoop(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
         const sink = if (self.agg_fused) null else self.probe_sink;
         const remap: ?[]ColumnView = if (sink != null and self.probe_map_views.len > 0) self.probe_map_views[i] else null;
         drainWorker(drainables[i], ta, self.out_schema, self.emit_keep, sink, i, remap, &self.wbufs[i], &self.werr[i]);
+        var held: usize = 0;
+        for (self.wbufs[i].columns) |c| held += c.heldBytes();
+        _ = self.wave_bytes.fetchAdd(held, .monotonic);
         // No view into leaf i's scratch outlives its drain: each batch its
         // pipeline emitted was deep-copied into `wbufs[i]` before the next
         // pull, and a chunk is claimed once, so the leaf is not pulled again.

@@ -524,6 +524,9 @@ pub const Filter = struct {
             .sort_state = up.sort_state,
             .column_stats = if (self.cached_stats.len > 0) self.cached_stats else up.column_stats,
             .row_origin = up.row_origin,
+            // A proven-empty filter returns without pulling its upstream,
+            // which then never fills a buffer.
+            .buffered = if (self.provenEmpty()) .{} else up.buffered,
         };
     }
 
