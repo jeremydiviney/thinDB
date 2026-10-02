@@ -43,6 +43,8 @@ pub const Project = struct {
     /// Owns rename-rewritten derived exprs forwarded below in
     /// tryFuseCompute (the fused Compute borrows the trees).
     rewrite_arena: ?*std.heap.ArenaAllocator = null,
+    /// The upstream has been told which of its columns are read here.
+    reads_declared: bool = false,
 
     pub fn create(allocator: Allocator, upstream: Query, names: []const []const u8) !Query {
         return createNamed(allocator, upstream, names, null);
@@ -192,6 +194,7 @@ pub const Project = struct {
     /// schema; forward untouched.
     pub fn takeOwnedChunks(self: *Project) !?exec.OwnedChunks {
         if (self.probe_fused) return self.upstream.takeOwnedChunks();
+        try self.declareReads();
         for (self.column_map, 0..) |src, i| {
             for (self.column_map[i + 1 ..]) |other| {
                 if (src == other) return null;
@@ -422,7 +425,47 @@ pub const Project = struct {
         return self.upstream.tryFuseFilter(expr);
     }
 
+    /// Tell the upstream which of its columns this projection reads, so one
+    /// that buffers its output stops carrying the rest (a column a parallel
+    /// scan decoded only for its fused filter, issue #492). Deferred to the
+    /// first pull: an upstream that has narrowed its emission declines the
+    /// compute, filter and join-probe offers that still cross this operator
+    /// while the plan is being built. The upstream may shrink its schema, so
+    /// `column_map` re-resolves by name; a name the upstream carries twice
+    /// cannot be re-resolved, and such a projection declares nothing.
+    fn declareReads(self: *Project) !void {
+        if (self.reads_declared) return;
+        self.reads_declared = true;
+        if (self.probe_fused) return;
+        const up_schema = self.upstream.outputSchema();
+        const read = try self.allocator.alloc(bool, up_schema.len);
+        defer self.allocator.free(read);
+        @memset(read, false);
+        for (self.column_map) |src| {
+            if (types.findColumn(up_schema, up_schema[src].name) != src) return;
+            read[src] = true;
+        }
+        const names = try self.allocator.alloc([]const u8, up_schema.len);
+        defer self.allocator.free(names);
+        var n: usize = 0;
+        for (up_schema, read) |column, is_read| {
+            if (!is_read) continue;
+            names[n] = column.name;
+            n += 1;
+        }
+        if (n == up_schema.len) return;
+        try self.upstream.setEmitProjection(names[0..n]);
+        const narrowed = self.upstream.outputSchema();
+        if (narrowed.len == up_schema.len) return;
+        for (self.column_map) |*src| {
+            var at: usize = 0;
+            for (read[0..src.*]) |is_read| at += @intFromBool(is_read);
+            src.* = types.findColumn(narrowed, names[at]) orelse return Error.ColumnNotFound;
+        }
+    }
+
     pub fn next(self: *Project) !?Batch {
+        if (!self.reads_declared) try self.declareReads();
         const batch = (try self.upstream.next()) orelse return null;
         if (self.probe_fused) return batch;
         for (self.column_map, 0..) |src_idx, dst_idx| {

@@ -191,7 +191,7 @@ pub const Filter = struct {
         try predicate.validateExpr(&validated, schema);
 
         var rewritten: std.ArrayListUnmanaged([]PredicateExpr) = .empty;
-        errdefer rewritten.deinit(allocator);
+        errdefer freeRewritten(allocator, &rewritten);
         const simplified = try simplifyPredicate(
             allocator,
             &rewritten,
@@ -204,7 +204,7 @@ pub const Filter = struct {
         // columns it referenced are never scanned on its behalf; the upstream
         // becomes the query node directly.
         if (simplified == .always and simplified.always) {
-            rewritten.deinit(allocator);
+            freeRewritten(allocator, &rewritten);
             return upstream;
         }
 
@@ -269,8 +269,7 @@ pub const Filter = struct {
         var up = self.upstream;
         up.deinit();
         if (self.cached_stats.len > 0) self.allocator.free(@constCast(self.cached_stats));
-        for (self.rewritten_children.items) |slice| self.allocator.free(slice);
-        self.rewritten_children.deinit(self.allocator);
+        freeRewritten(self.allocator, &self.rewritten_children);
         for (self.filtered) |*c| c.deinit(self.allocator);
         self.allocator.free(self.filtered);
         self.allocator.free(self.views);
@@ -899,6 +898,14 @@ pub fn orderPredicate(
     stats: []const exec.ColStat,
 ) !PredicateExpr {
     return simplifyPredicate(allocator, rewritten, expr, schema, stats);
+}
+
+/// A level the pass rebuilt stays in `rewritten` when a level above it
+/// folds to a constant or fails, so the list is freed with its slices
+/// wherever it is dropped.
+fn freeRewritten(allocator: Allocator, rewritten: *std.ArrayListUnmanaged([]PredicateExpr)) void {
+    for (rewritten.items) |slice| allocator.free(slice);
+    rewritten.deinit(allocator);
 }
 
 fn simplifyPredicate(

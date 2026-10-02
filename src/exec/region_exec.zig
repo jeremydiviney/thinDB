@@ -1056,8 +1056,8 @@ pub const RegionOp = union(enum) {
     tvf_aligned: TvfSpec,
     /// Per-range TVF (partition = region-key group). `union_append` copies
     /// each range then lets the kernel append its rows at the group tail
-    /// (rf_estimates class; kernel output schema == frame schema up to the
-    /// `inputs` permutation — out store k targets frame column inputs[k]),
+    /// (rf_estimates class; kernel output k lands on frame column inputs[k],
+    /// which becomes the UNION ALL result of the two: `union_append_column`),
     /// so run-contiguity holds by construction. `aligned_append` calls the
     /// kernel per range and APPENDS its columns row-aligned (rf_updown
     /// class: a row-aligned passthrough kernel whose state assumes one
@@ -1094,6 +1094,38 @@ fn is_string_view_type(t: types.Type) bool {
     };
 }
 
+/// `v` under the tag of `t`, a type of `v`'s own representation. The text
+/// types share one layout, so a column held under one of them reads as
+/// another without a copy; any other column has one tag and is returned
+/// as it is.
+fn view_as(v: ColumnView, t: types.Type) ColumnView {
+    const strings = switch (v.data) {
+        .varchar, .string, .char, .json => |s| s,
+        else => return v,
+    };
+    return .{
+        .data = switch (t) {
+            .varchar => .{ .varchar = strings },
+            .string => .{ .string = strings },
+            .char => .{ .char = strings },
+            .json => .{ .json = strings },
+            else => unreachable, // Program.build pairs a text column only with a text type.
+        },
+        .nulls = v.nulls,
+    };
+}
+
+/// The frame column a union-append kernel output lands on, as the append
+/// leaves it: the UNION ALL result of the two by the ordinary operator's
+/// rule. The kernel writes its rows straight after the frame's own, so an
+/// arm that reaches the result type only through a conversion runs in the
+/// ordinary operator instead.
+pub fn union_append_column(frame: Column, appended: Column) !Column {
+    const plan = try set_union.plan_column(frame, appended);
+    if (plan.left_cast != null or plan.right_cast != null) return error.UnsupportedQueryShape;
+    return plan.column;
+}
+
 /// One TVF call site, resolved from a udf.TableEntry by the recognizer.
 /// `extra_parts` are prebuilt broadcast partitions (whole lookup tables),
 /// passed verbatim to every call — TVF ABI6.
@@ -1105,8 +1137,9 @@ pub const TvfSpec = struct {
     inputs: []const usize,
     extra_parts: []const udf_mod.TvfPartition = &.{},
     /// Kernel output columns (aligned: appended to the frame; grouped
-    /// replace: the new frame schema; grouped union_append: must equal the
-    /// frame schema — validated at build).
+    /// replace: the new frame schema; grouped union_append: each shares
+    /// the representation of the frame column it lands on — validated at
+    /// build).
     out: []const Column,
 };
 
@@ -1324,6 +1357,7 @@ pub const Program = struct {
                         }
                         const seen = try a.alloc(bool, in.len);
                         @memset(seen, false);
+                        const cols = try a.dupe(Column, in);
                         for (t.spec.out, t.spec.inputs) |o, ci| {
                             if (seen[ci]) {
                                 if (getenv("THINDB_REGION_TRACE") != null) {
@@ -1332,12 +1366,12 @@ pub const Program = struct {
                                 return error.UnsupportedQueryShape;
                             }
                             seen[ci] = true;
-                            if (!std.meta.eql(o.type, in[ci].type)) {
+                            cols[ci] = union_append_column(in[ci], o) catch {
                                 if (getenv("THINDB_REGION_TRACE") != null) {
-                                    std.debug.print("[region] union_append: type clash on frame col {d} '{s}' ({s} vs {s})\n", .{ ci, in[ci].name, @tagName(in[ci].type), @tagName(o.type) });
+                                    std.debug.print("[region] union_append: frame col {d} '{s}' ({s}) and the kernel's {s} meet only by converting\n", .{ ci, in[ci].name, @tagName(in[ci].type), @tagName(o.type) });
                                 }
                                 return error.UnsupportedQueryShape;
-                            }
+                            };
                         }
                         for (seen, in) |covered, in_col| {
                             if (!covered and !in_col.nullable) {
@@ -1347,7 +1381,7 @@ pub const Program = struct {
                                 return error.UnsupportedQueryShape;
                             }
                         }
-                        break :blk in;
+                        break :blk cols;
                     }
                     if (t.aligned_append) {
                         if (t.input_filter != null or t.spec.out.len == 0) {
@@ -1668,9 +1702,7 @@ pub const RegionWorker = struct {
                 },
                 .tvf_grouped => |t| blk: {
                     const in_schema = prog.schema_at[oi];
-                    const out_schema = if (t.union_append)
-                        in_schema
-                    else if (t.aligned_append)
+                    const out_schema = if (t.aligned_append)
                         prog.schema_at[oi + 1][in_schema.len..]
                     else
                         prog.schema_at[oi + 1];
@@ -1861,7 +1893,8 @@ pub const RegionWorker = struct {
 
     /// `start_op` > 0 when leading ops were pre-applied during consolidation
     /// (the union-append tail fusion): the shard data already carries their
-    /// output and the frame schema at start_op equals the entry schema.
+    /// output in the entry schema's stores, read here as the frame schema at
+    /// start_op types them.
     pub fn runShardFrom(self: *RegionWorker, sd: *const ShardData, out: []ColumnStore, start_op: usize) !void {
         if (sd.rows == 0) return;
         defer _ = self.scratch.reset(.retain_capacity);
@@ -1872,7 +1905,7 @@ pub const RegionWorker = struct {
             .rows = sd.rows,
             .ranges = sd.ranges.items,
         };
-        for (sd.cols, fr.views[0..fr.width]) |*c, *v| v.* = c.view();
+        for (sd.cols, fr.views[0..fr.width], self.prog.schema_at[start_op]) |*c, *v, col| v.* = view_as(c.view(), col.type);
 
         const tick_ops = self.op_ticks != null;
         for (self.prog.ops[start_op..], self.states[start_op..], start_op..) |op, *st, oi| {
@@ -1918,18 +1951,7 @@ pub const RegionWorker = struct {
                 },
                 .view_cols => |views| {
                     for (views) |view| {
-                        const source = fr.views[view.src];
-                        const strings = stringViewOf(source);
-                        fr.views[fr.width] = .{
-                            .data = switch (view.column.type) {
-                                .varchar => .{ .varchar = strings },
-                                .string => .{ .string = strings },
-                                .char => .{ .char = strings },
-                                .json => .{ .json = strings },
-                                else => unreachable, // Program.build validates the view types.
-                            },
-                            .nulls = source.nulls,
-                        };
+                        fr.views[fr.width] = view_as(fr.views[view.src], view.column.type);
                         fr.width += 1;
                     }
                 },
@@ -5628,6 +5650,120 @@ test "region program: tvf_grouped union_append with input filter" {
     try testing.expectEqual(@as(i64, 3), vv.data.bigint[5]);
     try testing.expectEqualStrings("b", stringViewOf(kv).rowBytes(6));
     try testing.expectEqual(@as(i64, 7), vv.data.bigint[6]);
+}
+
+test "region program: tvf_grouped union_append leaves each column as the union of the frame's and the kernel's" {
+    const alloc = testing.allocator;
+    const inputs = [_]usize{ 0, 1, 2 };
+    const emit_cols = [_]usize{ 0, 1, 2 };
+    const frame = [_]Column{
+        .{ .name = "k", .type = .{ .varchar = 8 }, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+
+    // Text shares one representation: the kernel's rows land as they are
+    // and the column reads as the union's type.
+    inline for (.{
+        .{ types.Type{ .string = {} }, types.Type{ .string = {} } },
+        .{ types.Type{ .varchar = 32 }, types.Type{ .varchar = 32 } },
+        .{ types.Type{ .varchar = 4 }, types.Type{ .varchar = 8 } },
+    }) |case| {
+        const declared = [_]Column{
+            .{ .name = "k", .type = case[0], .nullable = true },
+            .{ .name = "g", .type = .int, .nullable = true },
+            .{ .name = "v", .type = .bigint, .nullable = true },
+        };
+        const ops = [_]RegionOp{
+            .{ .tvf_grouped = .{
+                .spec = .{ .process = tKernelEstimate, .inputs = &inputs, .out = &declared },
+                .union_append = true,
+                .input_filter = .{ .col = 2, .lo = 10, .hi = 30 },
+            } },
+            .{ .emit = .{ .cols = &emit_cols } },
+        };
+        var prog = try Program.build(alloc, &frame, &ops, null);
+        defer prog.deinit();
+        try testing.expectEqual(case[1], prog.output_schema[0].type);
+
+        var sd = try tBuildShard(alloc, &frame);
+        defer sd.deinit(alloc);
+        var worker = try RegionWorker.init(alloc, &prog);
+        defer worker.deinit();
+        const out = try RegionWorker.initStores(alloc, prog.output_schema);
+        defer RegionWorker.freeStores(alloc, out);
+
+        // The kernel's rows appended in place during consolidation, then
+        // the program from op 1, as the fused tail runs it.
+        var fused = try tBuildShard(alloc, &frame);
+        defer fused.deinit(alloc);
+        fused.ranges.clearRetainingCapacity();
+        const tail = worker.fusedFirstTail().?;
+        try tail.run(tail.ctx, &fused, 0);
+        fused.rows = fused.cols[0].rowCount();
+        try fused.ranges.append(alloc, .{ 0, @intCast(fused.rows) });
+        const fused_out = try RegionWorker.initStores(alloc, prog.output_schema);
+        defer RegionWorker.freeStores(alloc, fused_out);
+        try worker.runShardFrom(&fused, fused_out, 1);
+        try testing.expectEqual(@as(usize, 7), fused_out[0].rowCount());
+        try testing.expectEqual(std.meta.activeTag(case[1]), std.meta.activeTag(fused_out[0].view().data));
+        try testing.expectEqualStrings("a", stringViewOf(fused_out[0].view()).rowBytes(6));
+        try testing.expectEqual(@as(i32, 99), fused_out[1].view().data.int[6]);
+
+        try worker.runShard(&sd, out);
+        try testing.expectEqual(@as(usize, 7), out[0].rowCount());
+        try testing.expectEqual(std.meta.activeTag(case[1]), std.meta.activeTag(out[0].view().data));
+        try testing.expectEqualStrings("a", stringViewOf(out[0].view()).rowBytes(5));
+        try testing.expectEqual(@as(i32, 99), out[1].view().data.int[5]);
+        try testing.expectEqualStrings("b", stringViewOf(out[0].view()).rowBytes(6));
+    }
+
+    // A kernel output the frame column meets only by converting has no
+    // place in the frame's stores: the ordinary operator runs the union.
+    inline for (.{
+        .{ types.Type{ .bigint = {} }, types.Type{ .bigint = {} } },
+        .{ types.Type{ .int = {} }, types.Type{ .int = {} } },
+        .{ types.Type{ .int = {} }, types.Type{ .datetime = {} } },
+        .{ types.Type{ .int = {} }, types.Type{ .decimal64 = .{ .p = 12, .s = 4 } } },
+    }) |case| {
+        const declared = [_]Column{
+            .{ .name = "k", .type = .string, .nullable = true },
+            .{ .name = "g", .type = case[0], .nullable = true },
+            .{ .name = "v", .type = case[1], .nullable = true },
+        };
+        const ops = [_]RegionOp{
+            .{ .tvf_grouped = .{
+                .spec = .{ .process = tKernelEstimate, .inputs = &inputs, .out = &declared },
+                .union_append = true,
+            } },
+            .{ .emit = .{ .cols = &emit_cols } },
+        };
+        try testing.expectError(error.UnsupportedQueryShape, Program.build(alloc, &frame, &ops, null));
+    }
+    const date_frame = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .date, .nullable = true },
+        .{ .name = "v", .type = .{ .decimal64 = .{ .p = 10, .s = 2 } }, .nullable = true },
+    };
+    inline for (.{
+        .{ types.Type{ .datetime = {} }, types.Type{ .decimal64 = .{ .p = 10, .s = 2 } } },
+        .{ types.Type{ .date = {} }, types.Type{ .decimal64 = .{ .p = 12, .s = 4 } } },
+        .{ types.Type{ .date = {} }, types.Type{ .decimal64 = .{ .p = 12, .s = 2 } } },
+    }) |case| {
+        const declared = [_]Column{
+            .{ .name = "k", .type = .string, .nullable = true },
+            .{ .name = "g", .type = case[0], .nullable = true },
+            .{ .name = "v", .type = case[1], .nullable = true },
+        };
+        const ops = [_]RegionOp{
+            .{ .tvf_grouped = .{
+                .spec = .{ .process = tKernelEstimate, .inputs = &inputs, .out = &declared },
+                .union_append = true,
+            } },
+            .{ .emit = .{ .cols = &emit_cols } },
+        };
+        try testing.expectError(error.UnsupportedQueryShape, Program.build(alloc, &date_frame, &ops, null));
+    }
 }
 
 fn tRunDriver(alloc: Allocator, n_threads: usize) !void {

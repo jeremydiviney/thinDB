@@ -3614,8 +3614,16 @@ fn dispatchUnionTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, u: UnionT
     for (ent.input_schemas[0], inputs) |col, ci| {
         if (!TableFnExec.inputTypeMatches(b.fb.cols.items[ci].type, col.type)) return NoMatch;
     }
+    if (ent.output_schema.len != inputs.len) return NoMatch;
+    // The appended rows are a UNION ALL arm in the kernel's declared output
+    // types, and the frame leaves the append as that union's result.
     const out = try b.a.alloc(Column, inputs.len);
-    for (out, inputs) |*o, ci| o.* = b.fb.cols.items[ci];
+    const unioned = try b.a.alloc(Column, inputs.len);
+    for (out, unioned, ent.output_schema, inputs) |*o, *result, declared, ci| {
+        const col = b.fb.cols.items[ci];
+        o.* = .{ .name = col.name, .type = declared.type, .nullable = declared.nullable };
+        result.* = region.union_append_column(col, o.*) catch return NoMatch;
+    }
     const filt = u.input_filter orelse return NoMatch;
     const win = try dateWindow(filt, b);
     try b.ops.append(b.a, .{ .tvf_grouped = .{
@@ -3629,6 +3637,7 @@ fn dispatchUnionTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, u: UnionT
         .union_append = true,
         .input_filter = .{ .col = win.col, .lo = win.lo, .hi = win.hi },
     } });
+    for (unioned, inputs) |result, ci| b.fb.cols.items[ci] = result;
 }
 
 /// Mid-stream TVF. Granularity is a kernel CONTRACT, decided by metadata:

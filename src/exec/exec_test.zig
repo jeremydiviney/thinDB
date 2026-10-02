@@ -3849,3 +3849,120 @@ test "a key sample reads a small buffer whole, else a sixteenth of it in windows
         }
     }
 }
+
+/// A source of BIGINT columns that honors `setEmitProjection` by keeping the
+/// named columns in the REVERSE of their order, so a consumer that reads by
+/// position after narrowing reads another column's values.
+const NarrowingSource = struct {
+    allocator: std.mem.Allocator,
+    schema: []types.Column,
+    views: []@import("../storage/storage.zig").ColumnView,
+    rows: usize,
+    emitted: bool = false,
+    declarations: usize = 0,
+    declared: [8][]const u8 = undefined,
+    declared_len: usize = 0,
+
+    fn create(allocator: std.mem.Allocator, names: []const []const u8, columns: []const []const i64) !Query {
+        const self = try allocator.create(NarrowingSource);
+        errdefer allocator.destroy(self);
+        const schema = try allocator.alloc(types.Column, names.len);
+        errdefer allocator.free(schema);
+        const views = try allocator.alloc(@import("../storage/storage.zig").ColumnView, names.len);
+        for (names, columns, schema, views) |name, values, *column, *view| {
+            column.* = .{ .name = name, .type = .bigint };
+            view.* = .{ .data = .{ .bigint = values }, .nulls = null };
+        }
+        self.* = .{ .allocator = allocator, .schema = schema, .views = views, .rows = columns[0].len };
+        return exec.makeQuery(allocator, self);
+    }
+
+    pub fn deinit(self: *NarrowingSource) void {
+        const allocator = self.allocator;
+        allocator.free(self.schema);
+        allocator.free(self.views);
+        allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *NarrowingSource) []const types.Column {
+        return self.schema;
+    }
+
+    pub fn addPrune(_: *NarrowingSource, _: exec.Predicate) !void {}
+
+    pub fn stats(self: *NarrowingSource) exec.PipelineStats {
+        return .{ .upper_rows = self.rows };
+    }
+
+    pub fn accountant(_: *NarrowingSource) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+
+    pub fn explain(_: *NarrowingSource, out: *std.ArrayList(u8), allocator: std.mem.Allocator, depth: usize) !void {
+        try exec.explainLine(out, allocator, depth, "NarrowingSource");
+    }
+
+    pub fn setEmitProjection(self: *NarrowingSource, keep: []const []const u8) !void {
+        self.declarations += 1;
+        self.declared_len = keep.len;
+        for (keep, self.declared[0..keep.len]) |name, *slot| slot.* = name;
+        const schema = try self.allocator.alloc(types.Column, keep.len);
+        errdefer self.allocator.free(schema);
+        const views = try self.allocator.alloc(@import("../storage/storage.zig").ColumnView, keep.len);
+        for (keep, 0..) |name, i| {
+            const src = types.findColumn(self.schema, name).?;
+            schema[keep.len - 1 - i] = self.schema[src];
+            views[keep.len - 1 - i] = self.views[src];
+        }
+        self.allocator.free(self.schema);
+        self.allocator.free(self.views);
+        self.schema = schema;
+        self.views = views;
+    }
+
+    pub fn next(self: *NarrowingSource) !?exec.Batch {
+        if (self.emitted) return null;
+        self.emitted = true;
+        return .{ .schema = self.schema, .values = self.views, .row_count = self.rows };
+    }
+};
+
+// Issue #492. A projection is what knows which of its upstream's columns are
+// read above it. It says so once, when it is first pulled: by then the plan
+// is built, and the fusion offers that cross a projection (a compute, a
+// filter, a join probe) have been made against the upstream's full output.
+test "Project declares the columns it reads to its upstream on the first pull" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "a", "b", "c", "d" };
+    const columns = [_][]const i64{ &.{ 1, 2 }, &.{ 10, 20 }, &.{ 100, 200 }, &.{ 1000, 2000 } };
+    const cases = .{
+        // A subset, reordered and repeated: declared once, in upstream order.
+        .{ .select = &[_][]const u8{ "d", "a", "d" }, .labels = &[_][]const u8{ "x", "y", "z" }, .declared = &[_][]const u8{ "a", "d" }, .want = &[_]i64{ 1000, 1, 1000 } },
+        // Every upstream column, reordered: nothing to drop, nothing declared.
+        .{ .select = &[_][]const u8{ "d", "c", "b", "a" }, .labels = &[_][]const u8{ "d", "c", "b", "a" }, .declared = &[_][]const u8{}, .want = &[_]i64{ 1000, 100, 10, 1 } },
+    };
+    inline for (cases) |case| {
+        var source = try NarrowingSource.create(allocator, &names, &columns);
+        const narrowing = exec.queryAs(NarrowingSource, source).?;
+        var q = source.projectNamed(case.select, case.labels) catch |err| {
+            source.deinit();
+            return err;
+        };
+        defer q.deinit();
+        try std.testing.expectEqual(@as(usize, 0), narrowing.declarations);
+
+        const batch = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.declared.len > 0)), narrowing.declarations);
+        try std.testing.expectEqual(case.declared.len, narrowing.declared_len);
+        for (case.declared, narrowing.declared[0..narrowing.declared_len]) |want, got| try std.testing.expectEqualStrings(want, got);
+        try std.testing.expectEqual(case.want.len, batch.values.len);
+        for (case.want, case.labels, batch.values, batch.schema) |want, label, view, column| {
+            try std.testing.expectEqualStrings(label, column.name);
+            try std.testing.expectEqual(want, view.data.bigint[0]);
+            try std.testing.expectEqual(want * 2, view.data.bigint[1]);
+        }
+
+        try std.testing.expectEqual(@as(?exec.Batch, null), try q.next());
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.declared.len > 0)), narrowing.declarations);
+    }
+}

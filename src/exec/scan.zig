@@ -3773,7 +3773,6 @@ pub const Scan = struct {
                 // borrow re-faults zeroed pages every scan `next()`.
                 const view = storage.segment_reader.expandFsstPooled(&block, self.table.cacheRef(), col_type, rg_count, flags) catch |e| {
                     block.release(self.allocator, self.table.cacheRef());
-                    for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                     return e;
                 };
                 blocks[j] = block;
@@ -3797,7 +3796,6 @@ pub const Scan = struct {
                     block.encoding,
                 ) catch |e| {
                     block.release(self.allocator, self.table.cacheRef());
-                    for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                     return e;
                 };
                 blocks[j] = block;
@@ -3989,6 +3987,32 @@ pub const Scan = struct {
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         self.borrow_blocks = try self.allocator.alloc(storage.ReadSegment.BorrowedBlock, self.out_phys.len);
         return self.borrow_blocks;
+    }
+
+    /// Hand back the buffers each pull refills: the decoded row group, the
+    /// compacted survivors, and the mask and sidecar scratch. They hold a
+    /// row group of every projected column at its largest, so a parallel
+    /// scan releases each chunk's as the chunk finishes draining rather than
+    /// keep them all until the statement ends (issue #492). A scan pulled
+    /// again allocates them afresh.
+    pub fn releaseScratch(self: *Scan) void {
+        self.releaseBatch();
+        self.releaseFilterDecoded();
+        if (self.filtered) |arr| {
+            for (arr) |*c| c.deinit(self.allocator);
+            self.allocator.free(arr);
+            self.filtered = null;
+        }
+        inline for (.{ &self.mask_buf, &self.mask_buf2, &self.mask_buf3 }) |mask| {
+            if (mask.len > 0) self.allocator.free(mask.*);
+            mask.* = &.{};
+        }
+        if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
+        self.survivor_rows = &.{};
+        for (self.code_bufs) |*b| b.clearAndFree(self.allocator);
+        for (self.hash_bufs) |*b| b.clearAndFree(self.allocator);
+        for (self.runs_v_bufs) |*b| b.clearAndFree(self.allocator);
+        for (self.runs_l_bufs) |*b| b.clearAndFree(self.allocator);
     }
 
     fn releaseBatch(self: *Scan) void {
