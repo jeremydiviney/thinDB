@@ -17,7 +17,8 @@
 //! big to retain. The free-list decision uses the same `(len, alignment)`
 //! predicate on alloc and free, so a block is always classified identically both
 //! ways. Retained bytes are capped; frees past the cap evict to the backing
-//! allocator instead of retaining.
+//! allocator instead of retaining. Idle blocks also go back on request
+//! (`reclaim`): the shared memory budget asks when live queries need the room.
 //!
 //! Thread-safety: workers allocate concurrently, so each size class carries its
 //! own spinlock (distinct sizes rarely contend). The pool is a process
@@ -96,6 +97,51 @@ pub const Pool = struct {
             cls.lock.unlock();
         }
         self.retained_bytes.store(0, .monotonic);
+    }
+
+    /// Hand idle blocks back to the backing allocator until `want` bytes are
+    /// gone or the free lists are empty; returns the bytes released. Largest
+    /// classes go first: they are the blocks a general allocator maps one by
+    /// one, so freeing them returns memory to the OS, where a small block
+    /// would only move to the allocator's own free list. The frees run
+    /// outside the class locks, so workers keep allocating meanwhile.
+    pub fn reclaim(self: *Pool, want: usize) usize {
+        var released: usize = 0;
+        var idx: usize = class_count;
+        while (idx > 0 and released < want) {
+            idx -= 1;
+            const sz = classSize(idx);
+            const cls = &self.classes[idx];
+            const limit = ((want - released) +| (sz - 1)) / sz;
+            cls.lock.lock();
+            const chain = cls.head;
+            var taken: usize = 0;
+            var last: ?*FreeNode = null;
+            var node = chain;
+            while (node) |n| {
+                if (taken == limit) break;
+                last = n;
+                node = n.next;
+                taken += 1;
+            }
+            cls.head = node;
+            cls.count -= taken;
+            cls.lock.unlock();
+            if (last) |l| l.next = null;
+            _ = self.retained_bytes.fetchSub(taken * sz, .monotonic);
+            _ = self.evictions.fetchAdd(taken, .monotonic);
+            _ = self.evicted_bytes.fetchAdd(taken * sz, .monotonic);
+            var freeing = chain;
+            var left = taken;
+            while (left > 0) : (left -= 1) {
+                const n = freeing.?;
+                freeing = n.next;
+                const buf: [*]u8 = @ptrCast(n);
+                self.backing.rawFree(buf[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), @returnAddress());
+            }
+            released += taken * sz;
+        }
+        return released;
     }
 
     pub fn allocator(self: *Pool) Allocator {
@@ -183,6 +229,10 @@ pub const Pool = struct {
             const base: [*]u8 = buf.ptr;
             return self.backing.rawFree(base[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
         }
+        // Counted before it is listed: a block another thread pops the moment
+        // it is listed is subtracted straight away, and a count that ran
+        // behind the lists would wrap below zero.
+        _ = self.retained_bytes.fetchAdd(sz, .monotonic);
         const node: *FreeNode = @ptrCast(@alignCast(buf.ptr));
         const cls = &self.classes[idx];
         cls.lock.lock();
@@ -190,7 +240,6 @@ pub const Pool = struct {
         cls.head = node;
         cls.count += 1;
         cls.lock.unlock();
-        _ = self.retained_bytes.fetchAdd(sz, .monotonic);
     }
 
     fn resizeImpl(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
@@ -291,6 +340,12 @@ pub fn globalRetainedBytes() usize {
     return g_pool.?.retained_bytes.load(.monotonic);
 }
 
+/// `Pool.reclaim` on the process-global pool; 0 before first use.
+pub fn globalReclaim(want: usize) usize {
+    if (!g_ready.load(.acquire)) return 0;
+    return g_pool.?.reclaim(want);
+}
+
 /// The allocator worker-side operators draw their large short-lived buffers
 /// from (per-worker decode buffers, partition arenas): the shared pool in
 /// production; `base` under `THINDB_NO_BUFPOOL=1` (an A/B without a
@@ -340,6 +395,92 @@ test "retention cap evicts instead of growing without bound" {
     const b = try a.alloc(u8, 100 * 1024);
     a.free(b);
     try std.testing.expectEqual(@as(usize, 0), pool.retained_bytes.load(.monotonic));
+}
+
+test "reclaim releases the largest idle blocks first and stops once the request is covered" {
+    var pool = Pool.init(std.testing.allocator, default_cap_bytes);
+    defer pool.drain();
+    const a = pool.allocator();
+    const kib: usize = 1024;
+
+    var small: [4][]u8 = undefined;
+    for (&small) |*b| b.* = try a.alloc(u8, 64 * kib);
+    var large: [3][]u8 = undefined;
+    for (&large) |*b| b.* = try a.alloc(u8, 1024 * kib);
+    for (small) |b| a.free(b);
+    for (large) |b| a.free(b);
+    try std.testing.expectEqual(4 * 64 * kib + 3 * 1024 * kib, pool.retained_bytes.load(.monotonic));
+
+    try std.testing.expectEqual(2 * 1024 * kib, pool.reclaim(1500 * kib));
+    try std.testing.expectEqual(4 * 64 * kib + 1024 * kib, pool.retained_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), pool.classes[20 - min_log2].count);
+    try std.testing.expectEqual(@as(usize, 4), pool.classes[0].count);
+
+    try std.testing.expectEqual(1024 * kib + 2 * 64 * kib, pool.reclaim(1100 * kib));
+    try std.testing.expectEqual(2 * 64 * kib, pool.reclaim(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(usize, 0), pool.retained_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), pool.reclaim(1));
+
+    const again = try a.alloc(u8, 1024 * kib);
+    @memset(again, 0xCD);
+    a.free(again);
+}
+
+test "reclaim alongside workers allocating and freeing keeps the free lists and the idle count in step" {
+    var pool = Pool.init(std.testing.allocator, default_cap_bytes);
+    defer pool.drain();
+    const a = pool.allocator();
+
+    const Worker = struct {
+        fn run(alloc: Allocator) void {
+            var i: usize = 0;
+            while (i < 300) : (i += 1) {
+                const n = 64 * 1024 + (i % 7) * 100 * 1024;
+                const buf = alloc.alloc(u8, n) catch return;
+                buf[0] = 1;
+                buf[n - 1] = 2;
+                alloc.free(buf);
+            }
+        }
+    };
+    const Reclaimer = struct {
+        fn run(p: *Pool, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                _ = p.reclaim(300 * 1024);
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+    const Sampler = struct {
+        fn run(p: *Pool, stop: *std.atomic.Value(bool), peak: *usize) void {
+            while (!stop.load(.acquire)) peak.* = @max(peak.*, p.retained_bytes.load(.monotonic));
+        }
+    };
+    const worker_count = 8;
+    var peak: usize = 0;
+    {
+        var stop = std.atomic.Value(bool).init(false);
+        const reclaimer = try std.Thread.spawn(.{}, Reclaimer.run, .{ &pool, &stop });
+        defer reclaimer.join();
+        defer stop.store(true, .release);
+        const sampler = try std.Thread.spawn(.{}, Sampler.run, .{ &pool, &stop, &peak });
+        defer sampler.join();
+        defer stop.store(true, .release);
+        var threads: [worker_count]std.Thread = undefined;
+        var started: usize = 0;
+        defer for (threads[0..started]) |t| t.join();
+        for (&threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, Worker.run, .{a});
+            started += 1;
+        }
+    }
+
+    var listed: usize = 0;
+    for (&pool.classes, 0..) |*cls, i| listed += cls.count * Pool.classSize(i);
+    try std.testing.expectEqual(listed, pool.retained_bytes.load(.monotonic));
+    // A count that ran behind the lists would have wrapped below zero for a
+    // moment, which reads as nearly all of the address space being idle.
+    try std.testing.expect(peak <= worker_count * Pool.classSize(class_count - 1));
 }
 
 test "ArrayList growth across the bypass/pool boundary stays consistent" {

@@ -300,6 +300,10 @@ const Cache = struct {
     rejected_fusions: [64]?RejectedFusion = @splat(null),
     clock: u64 = 0,
     max_retained_bytes: usize,
+    /// The idle programs' buffers, as the shared pool sees them: registered
+    /// with `shared` so they give way when live queries need the budget.
+    idle: exec.memory.IdleSource = .{ .idle_bytes_fn = idleBytesErased, .reclaim_fn = reclaimErased },
+    shared: ?*exec.memory.MemoryPool = null,
     /// In-flight background ctx destroys (eviction/invalidation) — a big
     /// pool frees seconds of allocator work, which must never sit on the
     /// incoming query's critical path. Database close waits for them.
@@ -325,8 +329,57 @@ const Cache = struct {
         _ = self.reaps_pending.fetchSub(1, .release);
     }
 
+    fn share(self: *Cache, pool: *exec.memory.MemoryPool) void {
+        self.shared = pool;
+        pool.registerIdle(&self.idle);
+    }
+
+    fn idleBytesErased(source: *exec.memory.IdleSource) usize {
+        const self: *Cache = @fieldParentPtr("idle", source);
+        self.mu.lock();
+        defer self.mu.unlock();
+        var total: usize = 0;
+        for (&self.entries) |*entry| {
+            if (entry.ctx != null and !entry.busy) total +|= entry.retained_bytes;
+        }
+        return total;
+    }
+
+    /// Evict idle programs, least recently used first, until `want` bytes
+    /// are on their way back. A program gives up all of its buffers or none:
+    /// the cache has no smaller unit.
+    fn reclaimErased(source: *exec.memory.IdleSource, want: usize) usize {
+        const self: *Cache = @fieldParentPtr("idle", source);
+        var evicted: [32]*Ctx = undefined;
+        var n: usize = 0;
+        var released: usize = 0;
+        self.mu.lock();
+        while (released < want) {
+            const entry = self.oldestIdle() orelse break;
+            evicted[n] = entry.ctx.?;
+            n += 1;
+            released +|= entry.retained_bytes;
+            entry.ctx = null;
+            entry.retained_bytes = 0;
+        }
+        self.mu.unlock();
+        for (evicted[0..n]) |ctx| self.destroyCtxAsync(ctx);
+        return released;
+    }
+
+    /// Caller holds `mu`.
+    fn oldestIdle(self: *Cache) ?*CacheEntry {
+        var oldest: ?*CacheEntry = null;
+        for (&self.entries) |*entry| {
+            if (entry.ctx == null or entry.busy) continue;
+            if (oldest == null or entry.used < oldest.?.used) oldest = entry;
+        }
+        return oldest;
+    }
+
     fn deinitErased(p: *anyopaque) void {
         const self: *Cache = @ptrCast(@alignCast(p));
+        if (self.shared) |pool| pool.unregisterIdle(&self.idle);
         while (self.reaps_pending.load(.acquire) != 0) {
             std.Thread.yield() catch {};
         }
@@ -399,12 +452,7 @@ const Cache = struct {
         var total: usize = 0;
         for (&self.entries) |*entry| total +|= entry.retained_bytes;
         while (total > self.max_retained_bytes) {
-            var oldest: ?*CacheEntry = null;
-            for (&self.entries) |*entry| {
-                if (entry.ctx == null or entry.busy) continue;
-                if (oldest == null or entry.used < oldest.?.used) oldest = entry;
-            }
-            const entry = oldest orelse break;
+            const entry = self.oldestIdle() orelse break;
             evicted[n] = entry.ctx.?;
             n += 1;
             total -|= entry.retained_bytes;
@@ -538,6 +586,42 @@ test "region cache combined byte budget includes program arenas and preserves st
     try std.testing.expectEqual(@as(?usize, 4), cache.boundary(17));
 }
 
+test "region cache yields idle programs to the shared pool, oldest first, and keeps a borrowed one" {
+    const allocator = std.testing.allocator;
+    const mib: usize = 1 << 20;
+    var shared = exec.memory.MemoryPool.init(256 * mib);
+    const cache = try allocator.create(Cache);
+    cache.* = .{ .alloc = allocator, .max_retained_bytes = std.math.maxInt(usize) };
+    cache.share(&shared);
+    defer Cache.deinitErased(cache);
+    var entries: [4]*CacheEntry = undefined;
+    for (&entries, 0..) |*slot, i| {
+        const ctx = try allocator.create(Ctx);
+        ctx.* = .{ .gpa = allocator, .arena = std.heap.ArenaAllocator.init(allocator), .pool = region.RegionPool.init(allocator, 0) };
+        slot.* = cache.publish(i, ctx).?;
+        _ = try ctx.arena.allocator().alloc(u8, mib);
+    }
+    try std.testing.expectEqual(@as(usize, 0), shared.idleBytes());
+    for (entries[0..3]) |entry| CacheEntry.releaseErased(entry);
+    const each = entries[0].retained_bytes;
+    try std.testing.expect(each >= mib);
+    try std.testing.expectEqual(3 * each, shared.idleBytes());
+
+    try std.testing.expectEqual(each, cache.idle.reclaim_fn(&cache.idle, 1));
+    try std.testing.expect(cache.checkout(0) == null);
+    try std.testing.expectEqual(2 * each, shared.idleBytes());
+
+    var statement = exec.memory.MemoryAccountant.initWithPool(256 * mib, &shared);
+    try statement.reserve(.sort, 255 * mib);
+    defer statement.release(.sort, 255 * mib);
+    try std.testing.expectEqual(@as(usize, 0), shared.idleBytes());
+    try std.testing.expect(cache.checkout(1) == null);
+    try std.testing.expect(cache.checkout(2) == null);
+    try std.testing.expect(entries[3].ctx != null);
+    CacheEntry.releaseErased(entries[3]);
+    try std.testing.expectEqual(each, shared.idleBytes());
+}
+
 test "region fusion rejections stay bounded and preserve recently reused entries" {
     var cache = Cache{ .alloc = std.testing.allocator, .max_retained_bytes = 0 };
     for (0..cache.rejected_fusions.len) |i| cache.remember_rejected_fusion(i);
@@ -625,6 +709,7 @@ fn cacheFor(db: anytype) ?*Cache {
     if (db.region_cache) |p| return @ptrCast(@alignCast(p));
     const c = db.allocator.create(Cache) catch return null;
     c.* = .{ .alloc = db.allocator, .max_retained_bytes = poolCapBytes() };
+    if (db.config.memory_pool) |pool| c.share(pool);
     db.region_cache = c;
     db.region_cache_deinit = Cache.deinitErased;
     return c;
