@@ -291,6 +291,30 @@ pub const PlanNeeds = struct {
         };
     }
 
+    /// The needs over an input that keeps `held` bytes of its rows buffered
+    /// ahead of the plan and frees them as the plan pulls (`exec.Buffered`).
+    /// Radix and hash stream the rows into their state while the buffers are
+    /// held, and hash cores absorb a round at a time beside them. The sorts
+    /// copy the input, so the buffers only stand in for the part of the copy
+    /// still to come.
+    pub fn buffering(self: PlanNeeds, held: u64) PlanNeeds {
+        const cores_absorb = self.cores_absorb +| held;
+        const hash_cores = @max(cores_absorb, self.cores_emit);
+        return .{
+            .radix = self.radix +| held,
+            .partitioned = if (self.may_sort) @max(hash_cores, self.partitioned_sort) else hash_cores,
+            .partitioned_sort = self.partitioned_sort,
+            .hash = self.hash +| held,
+            .sort = self.sort,
+            .hash_cores = hash_cores,
+            .cores_absorb = cores_absorb,
+            .cores_emit = self.cores_emit,
+            .round = self.round,
+            .may_sort = self.may_sort,
+            .near_unique = self.near_unique,
+        };
+    }
+
     /// The needs over an input that already holds `held` charged bytes and
     /// frees each of its chunks, none over `largest_chunk` bytes, once the
     /// plan pulls the next (`RealizedInput`). The partitioned plans and the
@@ -324,7 +348,8 @@ pub const PlanNeeds = struct {
 /// `planNeeds` for `upstream` described by `st` (its stats as the router
 /// prices them, `withSampledWidths`), with the partitioned plan split
 /// `partitions` ways; over a `RealizedInput`, the batches are its chunks and
-/// the copying plans are credited with the buffers their copy frees.
+/// the copying plans are credited with the buffers their copy frees. Any
+/// other input is priced with the rows it buffers ahead of the plan.
 pub fn inputNeeds(
     upstream: *Query,
     st: exec.PipelineStats,
@@ -336,10 +361,24 @@ pub fn inputNeeds(
 ) ?PlanNeeds {
     const schema = upstream.outputSchema();
     const round = partitioned_aggregate.roundBytes(if (upstream.accountant()) |a| a.budget else null);
-    const realized = exec.queryAs(RealizedInput, upstream.*) orelse
-        return planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions, round, sampled);
+    const realized = exec.queryAs(RealizedInput, upstream.*) orelse {
+        const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions, round, sampled) orelse return null;
+        return needs.buffering(bufferedBytes(st, schema));
+    };
     const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, realized.largest_chunk_rows, partitions, round, sampled) orelse return null;
     return needs.consuming(realized.held_bytes, realized.largest_chunk_bytes);
+}
+
+/// A buffered row's charge over its bytes: the buffers grow by doubling and
+/// are cut from the pool's power-of-two blocks (measured 1.7 to 1.9).
+const BUFFER_SLACK: u64 = 2;
+
+/// Bytes `st`'s operator keeps buffered ahead of its consumer
+/// (`exec.Buffered`), never more than everything it emits.
+fn bufferedBytes(st: exec.PipelineStats, schema: []const types.Column) u64 {
+    if (st.buffered.rows == 0) return 0;
+    const row = rowBytes(st, schema) *| BUFFER_SLACK;
+    return @min(st.upper_rows *| row, st.buffered.rows *| row +| st.buffered.bytes);
 }
 
 /// Rows a table scan's batch carries: one row group at the default size.
@@ -930,6 +969,7 @@ fn traceInput(st: exec.PipelineStats, priced: exec.PipelineStats, schema: []cons
         std.debug.print(" {s}={d} B {s}", .{ col.name, valueWidth(priced, schema, i), how });
         if (priced.column_stats[i].distinct_width) |w| std.debug.print(" (distinct {d} B)", .{w});
     }
+    if (st.buffered.rows > 0) std.debug.print(" buffered={d} MiB", .{bufferedBytes(priced, schema) >> 20});
     std.debug.print("\n", .{});
 }
 
@@ -1631,6 +1671,26 @@ test "plan needs price the input buffer, the group state and measured widths" {
     const heavy_hash_cores = @max(input + 4 * rows + 2 * windows * row_bytes + heavy_cores.held, heavy_cores.held + heavy_cores.output);
     try std.testing.expectEqual(2 * (input + 4 * rows) + heavy_state.groups * heavy_state.group * 3 / 2, heavy.partitioned_sort);
     try std.testing.expectEqual(@max(heavy_hash_cores, heavy.partitioned_sort), heavy.partitioned);
+
+    // Over an input that buffers rows ahead of the plan, the plans that
+    // stream them hold the buffers beside their state, and hash cores
+    // beside the round they absorb. The sorts' copies take the buffers'
+    // place.
+    const buffering = needs.buffering(5000);
+    try std.testing.expectEqual(needs.hash + 5000, buffering.hash);
+    try std.testing.expectEqual(needs.cores_absorb + 5000, buffering.cores_absorb);
+    try std.testing.expectEqual(needs.cores_emit, buffering.cores_emit);
+    try std.testing.expectEqual(@max(buffering.cores_absorb, needs.cores_emit), buffering.partitioned);
+    try std.testing.expectEqual(needs.sort, buffering.sort);
+    try std.testing.expectEqual(needs.partitioned_sort, buffering.partitioned_sort);
+    // The buffered bytes are the rows at twice their width plus the
+    // operator's own bound, capped at everything it emits.
+    var wave = measured;
+    wave.buffered = .{ .rows = rows / 4, .bytes = 1000 };
+    try std.testing.expectEqual(rows / 4 * row_bytes * 2 + 1000, bufferedBytes(wave, &schema));
+    wave.buffered = .{ .rows = rows, .bytes = 1000 };
+    try std.testing.expectEqual(rows * row_bytes * 2, bufferedBytes(wave, &schema));
+    try std.testing.expectEqual(@as(u64, 0), bufferedBytes(measured, &schema));
 
     // Over an input whose chunks are freed as the plan copies them, the
     // copying plans need what their copy and state add beyond the held

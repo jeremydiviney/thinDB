@@ -760,6 +760,18 @@ pub fn capColStats(stats: []ColStat, upper_rows: u64) void {
 }
 
 /// Pre-execution statistics about an operator's output.
+/// Rows an operator keeps in its own buffers while its consumer reads it,
+/// each buffer freed when the consumer pulls the next batch: a wave of a
+/// materializing parallel scan. `rows` bounds them before any filter, as
+/// `upper_rows` does, and `bytes` is what the operator buffers on top of
+/// them whatever a row weighs. A plan that streams its input into its own
+/// state holds these beside that state. A plan that copies its input holds
+/// them in place of the part of its copy still to come.
+pub const Buffered = struct {
+    rows: u64 = 0,
+    bytes: u64 = 0,
+};
+
 pub const PipelineStats = struct {
     /// Upper bound on the number of rows this operator will emit.
     /// Never null — for operators with selectivity (Filter), this is
@@ -774,6 +786,8 @@ pub const PipelineStats = struct {
     column_stats: []const ColStat = &.{},
     /// See `RowOrigin`. Null unless every operator below passes it on.
     row_origin: ?RowOrigin = null,
+    /// See `Buffered`. Nothing unless every operator below passes it on.
+    buffered: Buffered = .{},
 };
 
 pub const Query = struct {

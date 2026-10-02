@@ -936,6 +936,26 @@ the cells and the output. Radix is priced only where it can run: a key of at
 most 128 bits with no nullable column, compact-state aggregates, and no bare
 LIMIT.
 
+A parallel scan with a filter fused into its workers copies each chunk's
+survivors into a buffer of its own, and the consumer reads the buffers in chunk
+order, each freed when it pulls the next. The scan drains in waves (issue
+#492). Its workers stop claiming chunks once the chunks finished in the wave
+hold 256 MiB, the consumer takes what is buffered, and the drain resumes at
+the next chunk. So the scan holds that bound plus one chunk for each thread
+that was mid-chunk when it was reached, where it used to hold every survivor
+before the consumer read a row. A scan whose survivors fit under the bound
+drains in one wave. A stage that adopts the buffers keeps them all, so it takes
+every chunk in one wave. The scan reports a wave in its stats (`Buffered`): one
+chunk of its row bound per thread, and the 256 MiB. Filters, projections,
+renames, computes and LIMIT pass that on. A UNION ALL reports its larger
+arm's, because it drains the left arm before it pulls the right. The router
+adds those rows, at twice their width for the buffers' growth and block
+rounding, to the plans that stream their input into their own state: radix,
+hash, and the absorb phase of the partitioned hash cores. The sorts copy their
+input, so the buffers only stand in for the part of the copy still to come.
+The row bound is the scan's, before the filter, so a selective filter is
+priced above what it buffers.
+
 Parallel grouped aggregation initially reserves at most one 8,192-row batch's
 worth of groups per bucket and allocates its state slab only when rows arrive.
 This keeps small tables' setup allocations out of the workers' allocation
