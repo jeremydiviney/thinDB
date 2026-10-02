@@ -111,7 +111,7 @@ jobs:
           restore-keys: zig-cache-${{ matrix.name }}-${{ env.ZIG_VERSION }}-
 
       - name: Run test suite
-        run: zig build test
+        run: bash .github/scripts/test-watchdog.sh
 
       # The test suite exercises in-process servers only. This boots the real
       # binary and asserts SIGTERM produces a clean exit — the exact lifecycle
