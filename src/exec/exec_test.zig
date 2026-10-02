@@ -1404,6 +1404,17 @@ test "parallel scan: a filtered drain past its wave bound hands over what it has
             defer plain.deinit();
             try std.testing.expectEqual(exec.Buffered{}, plain.stats().buffered);
         }
+        // A filter the column's range proves empty never pulls the scan, so
+        // no wave is ever held behind it.
+        {
+            var base = try exec.ParallelScan.create(allocator, t, null, null, dop);
+            var q = try base.filter(leafExpr("id", .lt, .{ .bigint = 0 }));
+            defer q.deinit();
+            const st = q.stats();
+            try std.testing.expectEqual(@as(u64, 0), st.upper_rows);
+            try std.testing.expectEqual(exec.Buffered{}, st.buffered);
+            try std.testing.expect((try q.next()) == null);
+        }
         var one_wave: std.ArrayList(i64) = .empty;
         defer one_wave.deinit(allocator);
         var one_wave_charge: usize = 0;
