@@ -1357,6 +1357,102 @@ test "parallel scan: the next pull frees the materialized buffer the consumer wa
     }
 }
 
+test "parallel scan: a filtered drain past its wave bound hands over what it has and resumes" {
+    // A filter that keeps most of a table must not park every survivor in
+    // the scan's buffers before the consumer reads a row: once the buffered
+    // chunks pass the bound the workers stop claiming, the consumer takes
+    // those chunks, and the drain picks up at the next one. Same rows, same
+    // order as the one-wave drain.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "v", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    var next_id: i64 = 0;
+    for (0..4) |_| {
+        var rows: [100]struct { id: i64, v: i32 } = undefined;
+        for (&rows) |*r| {
+            r.id = next_id;
+            r.v = @intCast(@mod(next_id, 7));
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+    const survivors = 350;
+    const materialize = @intFromEnum(exec.memory.Source.materialize);
+
+    inline for (.{ 1, 4 }) |dop| {
+        // A scan with no filter streams, so it buffers nothing ahead of its
+        // consumer; a filtered one reports a wave: a chunk per thread on top
+        // of its bound.
+        {
+            var plain = try exec.ParallelScan.create(allocator, t, null, null, dop);
+            defer plain.deinit();
+            try std.testing.expectEqual(exec.Buffered{}, plain.stats().buffered);
+        }
+        var one_wave: std.ArrayList(i64) = .empty;
+        defer one_wave.deinit(allocator);
+        var one_wave_charge: usize = 0;
+        {
+            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
+            const ps = exec.queryAs(exec.ParallelScan, base).?;
+            var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 50 }));
+            defer q.deinit();
+            const st = q.stats();
+            try std.testing.expectEqual(@min(st.upper_rows, (st.upper_rows / ps.workers.len + 1) * ps.n_threads), st.buffered.rows);
+            try std.testing.expectEqual(@as(u64, ps.drain_wave_bytes), st.buffered.bytes);
+            try std.testing.expect(st.buffered.rows > 0);
+            while (try q.next()) |b| {
+                try std.testing.expectEqual(ps.wbufs.len, ps.drained_chunks);
+                one_wave_charge = @max(one_wave_charge, acct.by_source[materialize]);
+                try one_wave.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, survivors), one_wave.items.len);
+
+        var waves: std.ArrayList(i64) = .empty;
+        defer waves.deinit(allocator);
+        var acct = exec.memory.MemoryAccountant.init(64 << 20);
+        var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
+        const ps = exec.queryAs(exec.ParallelScan, base).?;
+        // Any chunk with a survivor ends its worker's wave.
+        ps.drain_wave_bytes = 1;
+        var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 50 }));
+        defer q.deinit();
+        var wave_charge: usize = 0;
+        var stops: usize = 0;
+        var drained: usize = 0;
+        while (try q.next()) |b| {
+            if (ps.drained_chunks != drained) {
+                drained = ps.drained_chunks;
+                stops += 1;
+            }
+            wave_charge = @max(wave_charge, acct.by_source[materialize]);
+            try waves.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        }
+        try std.testing.expectEqual(ps.wbufs.len, ps.drained_chunks);
+        try std.testing.expect(stops > 1);
+        try std.testing.expect(wave_charge < one_wave_charge);
+        try std.testing.expectEqual(@as(usize, 0), acct.by_source[materialize]);
+        try std.testing.expectEqualSlices(i64, one_wave.items, waves.items);
+    }
+}
+
 const SlotHolder = struct {
     sched: *core_scheduler.CoreScheduler,
     release: *std.atomic.Value(bool),

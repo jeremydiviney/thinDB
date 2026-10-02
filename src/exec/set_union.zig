@@ -246,6 +246,9 @@ pub const SetUnion = struct {
             // join output the batches now carry.
             .column_stats = if (self.probe_sink != null) &.{} else self.cached_stats,
             .row_origin = if (self.probe_sink != null) null else exec.unionRowOrigin(l, r),
+            // The left arm is drained before the right is first pulled, so
+            // only one arm's buffers are held at a time.
+            .buffered = if (self.probe_sink != null) .{} else if (l.buffered.rows >= r.buffered.rows) l.buffered else r.buffered,
         };
     }
 

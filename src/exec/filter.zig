@@ -524,6 +524,7 @@ pub const Filter = struct {
             .sort_state = up.sort_state,
             .column_stats = if (self.cached_stats.len > 0) self.cached_stats else up.column_stats,
             .row_origin = up.row_origin,
+            .buffered = up.buffered,
         };
     }
 
