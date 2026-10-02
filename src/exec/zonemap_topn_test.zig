@@ -1017,3 +1017,39 @@ test "zonemap fallback: nullable leading key returns null" {
     const z = try exec.zonemapTopN(allocator, t, null, probe, .{ .always = true }, specs, out, 2, 0, 4);
     try std.testing.expect(z == null);
 }
+
+test "zonemap fallback: a name that doesn't resolve returns null with nothing left allocated" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "k1", .type = .int },
+            .{ .name = "k2", .type = .int },
+            .{ .name = "w", .type = .bigint },
+        },
+        .order_key = &.{"k1"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 4 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k1"}, .row_group_size = 4 });
+    try t.insert(&.{.{ .k1 = @as(i32, 1), .k2 = @as(i32, 1), .w = @as(i64, 1) }});
+    try t.flush();
+
+    const out = &[_][]const u8{ "k1", "w" };
+    const cases = .{
+        // A later sort key the table doesn't have.
+        .{ .probe = &[_][]const u8{"k1"}, .specs = &[_]SortSpec{ .{ .col = "k1", .desc = false }, .{ .col = "gone", .desc = false } } },
+        // A probe column the table doesn't have.
+        .{ .probe = &[_][]const u8{ "k1", "gone" }, .specs = &[_]SortSpec{.{ .col = "k1", .desc = false }} },
+        // A sort key outside the probe set.
+        .{ .probe = &[_][]const u8{"k1"}, .specs = &[_]SortSpec{ .{ .col = "k1", .desc = false }, .{ .col = "k2", .desc = false } } },
+    };
+    inline for (cases) |c| {
+        const z = try exec.zonemapTopN(allocator, t, null, c.probe, .{ .always = true }, c.specs, out, 2, 0, 4);
+        try std.testing.expect(z == null);
+    }
+}

@@ -529,6 +529,7 @@ fn castStageColumn(
 ) !?engine.ColumnStore {
     const ov = (try exec.scalar_fn.resolve(aa, fn_name, &.{src_type})) orelse return null;
     if (ov.func.null_strategy != .propagates or ov.func.udf_kernel != null) return null;
+    if (ov.func.typed_kernel == null and ov.func.kernel == null) return null;
     var arg = src;
     var arg_buf: ?engine.ColumnStore = null;
     defer if (arg_buf) |*b| b.deinit(allocator);
@@ -547,7 +548,7 @@ fn castStageColumn(
         try tk(allocator, &.{src_type}, ov.func.return_type, &args, &out, rows);
     } else if (ov.func.kernel) |k| {
         try k(allocator, &args, &out, rows);
-    } else return null;
+    }
     try out.appendValidityRange(allocator, 0, arg.nulls, rows);
     return out;
 }
@@ -1097,24 +1098,28 @@ pub const Stage = struct {
         for (res.join_builds.items) |*jb| {
             if (jb.matches(keys, casts, null_safe_keys, needs_chain)) return jb.*;
         }
+        // A declined build (a null return) gives back what the attempt took,
+        // exactly as a failed one does: only a build the result keeps
+        // outlives this call.
+        var kept = false;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
+        defer if (!kept) arena.deinit();
         const aa = arena.allocator();
         const views = try aa.alloc(ColumnView, res.schema.len);
         var copies: []engine.ColumnStore = &.{};
         try res.contiguousViews(views, &copies);
-        errdefer {
+        defer if (!kept) {
             for (copies) |*c| c.deinit(self.allocator);
             if (copies.len > 0) self.allocator.free(copies);
-        }
+        };
         const rows: u32 = @intCast(res.total_rows);
         var cast_stores: []engine.ColumnStore = &.{};
         if (casts.len > 0) cast_stores = try self.allocator.alloc(engine.ColumnStore, casts.len);
         var casts_done: usize = 0;
-        errdefer {
+        defer if (!kept) {
             for (cast_stores[0..casts_done]) |*c| c.deinit(self.allocator);
             if (cast_stores.len > 0) self.allocator.free(cast_stores);
-        }
+        };
         for (casts, 0..) |cst, i| {
             if (cst.col >= res.schema.len) return null;
             cast_stores[i] = (try castStageColumn(self.allocator, aa, cst.fn_name, views[cst.col], res.schema[cst.col].type, rows)) orelse return null;
@@ -1131,9 +1136,8 @@ pub const Stage = struct {
         }
         const bytes = join_mod.fastTableBytes(rows, needs_chain);
         if (self.accountant) |acct| try acct.reserve(.join_build, bytes);
-        errdefer if (self.accountant) |acct| acct.release(.join_build, bytes);
+        defer if (!kept) if (self.accountant) |acct| acct.release(.join_build, bytes);
         const built = (try join_mod.buildFastTable(aa, self.allocator, key_views[0..keys.len], null_safe_keys, rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
-        self.join_build_reserved += bytes;
         const owned_casts = try aa.alloc(ColumnCast, casts.len);
         for (casts, owned_casts) |c, *o| o.* = .{ .col = c.col, .fn_name = try aa.dupe(u8, c.fn_name) };
         const owned_keys = try aa.alloc(KeySpec, keys.len);
@@ -1152,6 +1156,8 @@ pub const Stage = struct {
             .keys_unique = built.keys_unique,
         };
         try res.join_builds.append(self.allocator, jb);
+        self.join_build_reserved += bytes;
+        kept = true;
         return jb;
     }
 

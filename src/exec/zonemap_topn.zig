@@ -136,7 +136,7 @@ pub const ZonemapTopN = struct {
     /// Build a zonemap top-N plan, or null when the shape/leading-key isn't
     /// supported (caller falls back to `exec.lateScan`). Same parameter shape
     /// as `exec.lateScan`. `order_specs` MUST be non-empty. On a null return
-    /// NOTHING is allocated.
+    /// nothing stays allocated.
     pub fn create(
         allocator: Allocator,
         table: *Table,
@@ -160,11 +160,13 @@ pub const ZonemapTopN = struct {
         // Resolve every ORDER BY key + probe column to a physical index up
         // front; any unresolved name ⇒ bail (never risk a wrong plan). The
         // probe set is guaranteed to contain every key column by the caller,
-        // but we verify and map it explicitly.
+        // but we verify and map it explicitly. A bail is not an error, so
+        // these frees run on every exit that doesn't hand back a plan.
+        var built = false;
         const key_phys = try allocator.alloc(usize, order_specs.len);
-        errdefer allocator.free(key_phys);
+        defer if (!built) allocator.free(key_phys);
         const key_desc = try allocator.alloc(bool, order_specs.len);
-        errdefer allocator.free(key_desc);
+        defer if (!built) allocator.free(key_desc);
         for (order_specs, 0..) |sp, i| {
             key_phys[i] = types.findColumn(table.schema.columns, sp.col) orelse return null;
             key_desc[i] = sp.desc;
@@ -180,7 +182,7 @@ pub const ZonemapTopN = struct {
         }
 
         const probe_phys = try allocator.alloc(usize, probe_names.len);
-        errdefer allocator.free(probe_phys);
+        defer if (!built) allocator.free(probe_phys);
         for (probe_names, 0..) |nm, i| {
             probe_phys[i] = types.findColumn(table.schema.columns, nm) orelse return null;
         }
@@ -189,7 +191,7 @@ pub const ZonemapTopN = struct {
         // its value during filtering). The late-mat shape builder guarantees
         // this, but verify rather than trust.
         const key_probe_idx = try allocator.alloc(usize, order_specs.len);
-        errdefer allocator.free(key_probe_idx);
+        defer if (!built) allocator.free(key_probe_idx);
         for (key_phys, 0..) |phys, i| {
             key_probe_idx[i] = blk: {
                 for (probe_phys, 0..) |p, j| if (p == phys) break :blk j;
@@ -249,6 +251,7 @@ pub const ZonemapTopN = struct {
             .out_schema = late.outputSchema(),
         };
         self.main = try CandidateHeap.init(self, allocator);
+        built = true;
         return makeQuery(allocator, self);
     }
 
