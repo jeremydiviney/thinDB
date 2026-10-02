@@ -478,6 +478,129 @@ test "keyed region: broadcast joins honor pinned string keys" {
     , "extra");
 }
 
+// DATE_ADD over a DATE yields a DATETIME, so a previous-month lookup pairs a
+// DATETIME probe with a DATE build column: days against microseconds unless
+// the region meets them at midnight as ordinary execution does.
+test "keyed region: DATE and DATETIME join keys meet at midnight" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE mrr (id BIGINT PRIMARY KEY, custLC VARCHAR(32), month DATE, amount BIGINT)");
+    try helpers.exec(allocator, db, "CREATE TABLE mrr_at (id BIGINT PRIMARY KEY, custLC VARCHAR(32), at DATETIME, amount BIGINT)");
+    try helpers.exec(allocator, db, "CREATE TABLE cal (id INT PRIMARY KEY, month DATE, at DATETIME, label INT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO mrr VALUES
+        \\ (1,'cust_0','2025-10-01',10),(2,'cust_0','2025-11-01',20),(3,'cust_0','2026-01-01',30),
+        \\ (4,'cust_1','2025-11-01',40),(5,'cust_1','2025-12-01',50),(6,'cust_1','2026-01-01',60),
+        \\ (7,'cust_2','2025-12-01',70),(8,NULL,'2025-12-01',80),(9,'cust_3',NULL,90)
+    );
+    try helpers.exec(allocator, db,
+        \\INSERT INTO mrr_at VALUES
+        \\ (1,'cust_0','2025-11-01 00:00:00',11),(2,'cust_1','2025-12-01 06:00:00',12),
+        \\ (3,'cust_1','2026-01-01 00:00:00',13),(4,'cust_2','2025-12-01 00:00:00',14)
+    );
+    try helpers.exec(allocator, db,
+        \\INSERT INTO cal VALUES
+        \\ (1,'2025-09-01','2025-10-01 00:00:00',1),(2,'2025-10-01','2025-11-01 00:00:00',2),
+        \\ (3,'2025-11-01','2025-12-01 06:00:00',3),(4,'2025-12-01','2026-01-01 00:00:00',4)
+    );
+    inline for (.{ "mrr", "mrr_at", "cal" }) |name| {
+        const t = try db.openTable(name, .{});
+        try t.flush();
+    }
+
+    const base =
+        \\r AS (
+        \\ SELECT custLC, month, amount, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month) AS rn
+        \\ FROM mrr WHERE id > 0
+        \\), totals AS (
+        \\ SELECT custLC, month, amount FROM mrr WHERE id > 0
+        \\), totals_at AS (
+        \\ SELECT custLC, at, amount FROM mrr_at WHERE id > 0
+        \\), days AS (
+        \\ SELECT month, at, label FROM cal WHERE id > 0
+        \\), j AS (
+        \\ SELECT p.custLC, p.month, p.rn,
+    ;
+    const tail =
+        \\
+        \\)
+        \\SELECT * FROM j ORDER BY custLC, month
+    ;
+    inline for (.{
+        // Co-partitioned side, DATETIME probe against a DATE build.
+        .{ " x.amount AS v FROM r p", " LEFT JOIN totals x ON x.custLC = p.custLC AND x.month = DATE_ADD(p.month, INTERVAL -1 MONTH)" },
+        // Co-partitioned side, DATE probe against a DATETIME build with a row off midnight.
+        .{ " x.amount AS v FROM r p", " LEFT JOIN totals_at x ON x.custLC = p.custLC AND x.at = p.month" },
+        // Broadcast sides, single and composite keys, both directions.
+        .{ " x.label AS v FROM r p", " LEFT JOIN days x ON x.month = DATE_ADD(p.month, INTERVAL -1 MONTH)" },
+        .{ " x.label AS v FROM r p", " LEFT JOIN days x ON x.at = p.month" },
+        .{ " x.label AS v FROM r p", " LEFT JOIN days x ON x.at = p.month AND x.label = p.rn" },
+        .{ " x.label AS v FROM r p", " INNER JOIN days x ON x.at = p.month" },
+    }) |case| {
+        const body = base ++ case[0] ++ case[1] ++ tail;
+        const mono = try runToText(allocator, db, "WITH " ++ body);
+        defer allocator.free(mono);
+        try std.testing.expect(std.mem.count(u8, mono, "\n") > 2);
+        try expect_keyed_matches(allocator, db, body, "v");
+    }
+}
+
+// The exchange hashes each side's route cell bytes; an INT route key and a
+// BIGINT side column hold equal keys in different widths.
+test "keyed region: co-partitioned sides with differently typed route keys keep every match" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE narrow_keys (id BIGINT PRIMARY KEY, cust INT, month INT, amount BIGINT)");
+    try helpers.exec(allocator, db, "CREATE TABLE wide_keys (id BIGINT PRIMARY KEY, cust BIGINT, month INT, extra BIGINT)");
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(allocator);
+    try sql.appendSlice(allocator, "INSERT INTO narrow_keys VALUES ");
+    try wide.appendSlice(allocator, "INSERT INTO wide_keys VALUES ");
+    var id: i64 = 1;
+    for (0..40) |c| {
+        for (0..3) |m| {
+            if (id > 1) {
+                try sql.appendSlice(allocator, ",");
+                try wide.appendSlice(allocator, ",");
+            }
+            try sql.print(allocator, "({d},{d},{d},{d})", .{ id, c, m, id * 3 });
+            try wide.print(allocator, "({d},{d},{d},{d})", .{ id, c, m, id * 5 });
+            id += 1;
+        }
+    }
+    try helpers.exec(allocator, db, sql.items);
+    try helpers.exec(allocator, db, wide.items);
+    inline for (.{ "narrow_keys", "wide_keys" }) |name| {
+        const t = try db.openTable(name, .{});
+        try t.flush();
+    }
+    const body =
+        \\r AS (
+        \\ SELECT cust, month, amount, ROW_NUMBER() OVER (PARTITION BY cust ORDER BY month) AS rn
+        \\ FROM narrow_keys WHERE id > 0
+        \\), w AS (
+        \\ SELECT cust, month, extra FROM wide_keys WHERE id > 0
+        \\), j AS (
+        \\ SELECT p.cust, p.month, p.rn, x.extra AS v FROM r p
+        \\ LEFT JOIN w x ON x.cust = p.cust AND x.month = p.month
+        \\)
+        \\SELECT * FROM j ORDER BY cust, month
+    ;
+    const mono = try runToText(allocator, db, "WITH " ++ body);
+    defer allocator.free(mono);
+    const keyed = try run_to_text_checked(allocator, db, "WITH KEYED BY (cust) " ++ body, null, true);
+    defer allocator.free(keyed);
+    try std.testing.expectEqualStrings(mono, keyed);
+}
+
 // SUM(amount) for month 1 wraps past BIGINT max; both paths must wrap alike.
 test "keyed region: broadcast joins retain nullable wrapped BIGINT SUM payloads" {
     const allocator = std.testing.allocator;
