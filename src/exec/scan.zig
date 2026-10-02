@@ -3773,7 +3773,6 @@ pub const Scan = struct {
                 // borrow re-faults zeroed pages every scan `next()`.
                 const view = storage.segment_reader.expandFsstPooled(&block, self.table.cacheRef(), col_type, rg_count, flags) catch |e| {
                     block.release(self.allocator, self.table.cacheRef());
-                    for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                     return e;
                 };
                 blocks[j] = block;
@@ -3797,7 +3796,6 @@ pub const Scan = struct {
                     block.encoding,
                 ) catch |e| {
                     block.release(self.allocator, self.table.cacheRef());
-                    for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                     return e;
                 };
                 blocks[j] = block;

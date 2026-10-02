@@ -289,7 +289,8 @@ const previous_id = struct {
     }
 };
 
-/// Two small tables, one flushed with a memtable tail, plus a table UDF,
+/// Two small tables, one flushed with a memtable tail, a flushed table with
+/// enough rows that its integer and date columns are stored narrow, a table UDF,
 /// an SDK table function, a SQL inline function and a file for each reader.
 fn openCorpusDb(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, file_root: []const u8, max_dop: usize) !*thindb.Database {
     const io = std.testing.io;
@@ -303,6 +304,9 @@ fn openCorpusDb(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, file_root
     try (try db.openTable("oa", .{})).flush();
     try helpers.exec(allocator, db, "INSERT INTO oa VALUES (4, 2, 'd', 4.5, '2024-03-01')");
     try helpers.exec(allocator, db, "INSERT INTO ob VALUES (1, 1, 'x'), (2, 3, 'y'), (4, 2, 'z')");
+    try helpers.exec(allocator, db, "CREATE TABLE oe (id BIGINT PRIMARY KEY, g INT, n BIGINT, dt DATE)");
+    try helpers.exec(allocator, db, "INSERT INTO oe VALUES (1, 1, 10, '2024-01-01'), (2, 2, 20, '2024-01-02'), (3, 1, 30, '2024-01-03'), (4, 2, 40, '2024-01-04'), (5, 1, 50, '2024-01-05'), (6, 2, 60, '2024-01-06'), (7, 1, 70, '2024-01-07'), (8, 2, 80, '2024-01-08')");
+    try (try db.openTable("oe", .{})).flush();
     try db.registerTableUdf(.{
         .name = "running_total",
         .input_schemas = &.{&running_total_input},
@@ -324,6 +328,11 @@ fn openCorpusDb(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, file_root
 
 const query_statements = [_][]const u8{
     "SELECT id, s FROM oa WHERE g = 1",
+    // A level of the predicate is rebuilt before the level above it.
+    "SELECT id, g, dt FROM oa WHERE (g = 1 AND id > 1) OR dt > '2024-01-15'",
+    // A filter the scan evaluates over borrowed blocks, expanding each of
+    // the four narrow-encoded columns in turn.
+    "SELECT id, g, n, dt FROM oe WHERE (g = 1 AND id > 2) OR n > 60",
     "SELECT id * 2 AS x, UPPER(s) AS u, CASE WHEN d > 2 THEN 'hi' ELSE 'lo' END AS c FROM oa",
     "SELECT COUNT(*) AS n, SUM(d) AS sd, MIN(s) AS ms, MAX(dt) AS md FROM oa",
     "SELECT g, COUNT(*) AS n, AVG(d) AS a FROM oa GROUP BY g ORDER BY g",

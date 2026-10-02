@@ -952,6 +952,37 @@ test "recursive simplify: OR drops always-false disjunct, always-true disjunct a
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5, 6 }, ids);
 }
 
+// The AND arm is rebuilt (its conjuncts reordered into a new slice) before
+// the always-true arm folds the whole OR away; the dropped Filter must free
+// that slice, which the testing allocator checks.
+test "recursive simplify: an OR that folds to always-true frees the arm it rebuilt first" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seed(db);
+
+    const both = [_]thindb.exec.PredicateExpr{
+        thindb.leafExpr("a", .lt, .{ .int = 15 }),
+        thindb.leafExpr("b", .eq, .{ .int = 300 }),
+    };
+    const ors = [_]thindb.exec.PredicateExpr{
+        .{ .@"and" = &both },
+        thindb.leafExpr("id", .gte, .{ .bigint = 0 }),
+    };
+    var base = try thindb.scan(allocator, t);
+    const scan_ptr = base.ptr;
+    var q = try base.filter(.{ .@"or" = &ors });
+    defer q.deinit();
+
+    try std.testing.expectEqual(scan_ptr, q.ptr);
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5, 6 }, ids);
+}
+
 const like_schema = thindb.TableSchema{
     .columns = &.{
         .{ .name = "id", .type = .bigint },
