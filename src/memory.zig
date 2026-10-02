@@ -53,6 +53,7 @@ pub const Source = enum {
 const source_count = std.meta.fields(Source).len;
 
 pub const accountantOf = BudgetAllocator.accountantOf;
+pub const ownerOf = BudgetAllocator.ownerOf;
 
 pub fn checkCancelled(allocator: std.mem.Allocator) error{QueryCancelled}!void {
     if (accountantOf(allocator)) |a| try a.checkCancelled();
@@ -80,6 +81,21 @@ pub fn trackedBackend(child: std.mem.Allocator, accountant: ?*MemoryAccountant) 
 /// in use is charged to `accountant`.
 pub fn workerAllocator(accountant: ?*MemoryAccountant, fallback: std.mem.Allocator) !std.mem.Allocator {
     return trackedBackend(buffer_pool.workerAllocator(fallback), accountant);
+}
+
+/// `workerAllocator` for the buffers of an operator built on `allocator`.
+/// An operator built on a retained pool's allocator outlives the query that
+/// built it, so its buffers stay on that allocator, which the pool charges to
+/// each query in turn. A pooled block would stay charged to the first query
+/// and hold that query's accounting, and its shutdown lease, open for as
+/// long as the operator lives.
+pub fn workerAllocatorOf(allocator: std.mem.Allocator) !std.mem.Allocator {
+    return workerBackingOf(buffer_pool.workerAllocator(allocator), allocator);
+}
+
+fn workerBackingOf(pooled: std.mem.Allocator, allocator: std.mem.Allocator) !std.mem.Allocator {
+    if (BudgetAllocator.isRetained(allocator)) return allocator;
+    return trackedBackend(pooled, accountantOf(allocator));
 }
 
 pub fn allocationError(accountant: ?*MemoryAccountant, err: anytype) (@TypeOf(err) || Error) {
@@ -320,6 +336,7 @@ pub const MemoryAccountant = struct {
         errdefer parent.destroy(wrapper);
         wrapper.* = BudgetAllocator.init(child);
         wrapper.active = self;
+        wrapper.query_owned = true;
         try self.wrappers.append(parent, wrapper);
         return wrapper.allocator();
     }
@@ -761,6 +778,40 @@ test "memory: retained allocator charges each borrower and retains no query poin
     try std.testing.expectError(error.MemoryBudgetExceeded, retained.attach(&second));
     try std.testing.expect(retained.active == null);
     try std.testing.expectEqual(@as(usize, 0), second.current_bytes);
+}
+
+test "memory: a retained allocator has no owning query and backs its own worker buffers" {
+    const a = std.testing.allocator;
+    const account = try a.create(MemoryAccountant);
+    account.* = MemoryAccountant.init(1 << 20);
+    account.trackAllocations(a);
+    defer account.releaseOwner(a);
+    const owned = try account.executionAllocator();
+    try std.testing.expectEqual(@as(?*MemoryAccountant, account), ownerOf(owned));
+    try std.testing.expect(!BudgetAllocator.isRetained(owned));
+    try std.testing.expect(!BudgetAllocator.isRetained(a));
+
+    var retained = BudgetAllocator.init(a);
+    const alloc = retained.allocator();
+    try std.testing.expect(BudgetAllocator.isRetained(alloc));
+    try retained.attach(account);
+    try std.testing.expectEqual(@as(?*MemoryAccountant, account), accountantOf(alloc));
+    try std.testing.expectEqual(@as(?*MemoryAccountant, null), ownerOf(alloc));
+
+    // The pool is not the fallback in production; tests see the fallback.
+    var pool_buffer: [256]u8 = undefined;
+    var pool = std.heap.FixedBufferAllocator.init(&pool_buffer);
+    const backing = try workerBackingOf(pool.allocator(), alloc);
+    try std.testing.expectEqual(alloc.ptr, backing.ptr);
+    try std.testing.expectEqual(alloc.vtable, backing.vtable);
+    const bytes = try backing.alloc(u8, 64);
+    retained.detach();
+    try std.testing.expectEqual(@as(usize, 0), account.current_bytes);
+    backing.free(bytes);
+
+    const pooled = try workerBackingOf(pool.allocator(), owned);
+    try std.testing.expectEqual(@as(?*MemoryAccountant, account), ownerOf(pooled));
+    try std.testing.expect(pooled.ptr != owned.ptr);
 }
 
 test "memory: retiring an owner keeps its allocator alive through the last free" {

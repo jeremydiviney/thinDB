@@ -5,14 +5,19 @@ const Allocator = std.mem.Allocator;
 
 /// A retained pool keeps this wrapper alive between executions and attaches
 /// the current query while its buffers are in use. Query-owned wrappers stay
-/// attached until their last allocation is freed. Each allocation is charged
-/// what it holds in the child (`buffer_pool.footprint`), not what was asked.
+/// attached until their last allocation is freed. What is built on a retained
+/// wrapper outlives the query attached at the time, so it keeps neither that
+/// accountant nor anything charged to it (`ownerOf`, `isRetained`). Each
+/// allocation is charged what it holds in the child
+/// (`buffer_pool.footprint`), not what was asked.
 /// A free on a thread collecting `DeferredFrees` drops the charge at once and
 /// leaves the memory to the collector.
 pub const BudgetAllocator = struct {
     child: Allocator,
     active: ?*MemoryAccountant = null,
     live_bytes: std.atomic.Value(usize) = .init(0),
+    /// Set on the wrapper a query creates for itself (`wrapAllocator`).
+    query_owned: bool = false,
 
     pub fn init(child: Allocator) BudgetAllocator {
         return .{ .child = child };
@@ -34,10 +39,28 @@ pub const BudgetAllocator = struct {
         accountant.releaseAllocation(self.live_bytes.load(.monotonic));
     }
 
-    pub fn accountantOf(alloc: Allocator) ?*MemoryAccountant {
+    fn of(alloc: Allocator) ?*BudgetAllocator {
         if (alloc.vtable != &vtable) return null;
-        const self: *BudgetAllocator = @ptrCast(@alignCast(alloc.ptr));
+        return @ptrCast(@alignCast(alloc.ptr));
+    }
+
+    /// The query `alloc` is charged to right now.
+    pub fn accountantOf(alloc: Allocator) ?*MemoryAccountant {
+        const self = of(alloc) orelse return null;
         return self.active;
+    }
+
+    /// The query `alloc` belongs to for as long as the allocator lives: the
+    /// only accountant that may be kept past the current call. Null for a
+    /// retained wrapper, whose accountant is whichever query is running.
+    pub fn ownerOf(alloc: Allocator) ?*MemoryAccountant {
+        const self = of(alloc) orelse return null;
+        return if (self.query_owned) self.active else null;
+    }
+
+    pub fn isRetained(alloc: Allocator) bool {
+        const self = of(alloc) orelse return false;
+        return !self.query_owned;
     }
 
     const vtable: Allocator.VTable = .{

@@ -374,7 +374,7 @@ pub const Window = struct {
         // deinit — the arena sweep in evict()/deinit() reclaims everything.
         const acc_arenas = try allocator.alloc(BlockArena, input_schema.len);
         errdefer allocator.free(acc_arenas);
-        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), allocator);
+        const arena_backing = try exec.memory.workerAllocatorOf(allocator);
         for (acc_arenas) |*a| a.* = BlockArena.init(arena_backing);
         errdefer for (acc_arenas) |*a| a.deinit();
         const accumulated = try allocator.alloc(ColumnStore, input_schema.len);
@@ -599,7 +599,7 @@ pub const Window = struct {
         @memset(arena_backed, true);
         const arenas = try alloc.alloc(BlockArena, ncols);
         errdefer alloc.free(arenas);
-        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(alloc), alloc);
+        const arena_backing = try exec.memory.workerAllocatorOf(alloc);
         for (arenas) |*a| a.* = BlockArena.init(arena_backing);
         errdefer for (arenas) |*a| a.deinit();
 
@@ -703,7 +703,7 @@ pub const Window = struct {
         // Fallible work first, so the move below can't half-complete:
         // 1. String outputs → fresh arena-backed contiguous stores (their
         //    scratch slices borrow into `accumulated`, still alive here).
-        const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(alloc), alloc);
+        const arena_backing = try exec.memory.workerAllocatorOf(alloc);
         var str_built: usize = 0;
         errdefer for (arenas[nin .. nin + str_built]) |*a| a.deinit();
         {
