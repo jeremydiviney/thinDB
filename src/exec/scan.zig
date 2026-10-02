@@ -3991,6 +3991,32 @@ pub const Scan = struct {
         return self.borrow_blocks;
     }
 
+    /// Hand back the buffers each pull refills: the decoded row group, the
+    /// compacted survivors, and the mask and sidecar scratch. They hold a
+    /// row group of every projected column at its largest, so a parallel
+    /// scan releases each chunk's as the chunk finishes draining rather than
+    /// keep them all until the statement ends (issue #492). A scan pulled
+    /// again allocates them afresh.
+    pub fn releaseScratch(self: *Scan) void {
+        self.releaseBatch();
+        self.releaseFilterDecoded();
+        if (self.filtered) |arr| {
+            for (arr) |*c| c.deinit(self.allocator);
+            self.allocator.free(arr);
+            self.filtered = null;
+        }
+        inline for (.{ &self.mask_buf, &self.mask_buf2, &self.mask_buf3 }) |mask| {
+            if (mask.len > 0) self.allocator.free(mask.*);
+            mask.* = &.{};
+        }
+        if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
+        self.survivor_rows = &.{};
+        for (self.code_bufs) |*b| b.clearAndFree(self.allocator);
+        for (self.hash_bufs) |*b| b.clearAndFree(self.allocator);
+        for (self.runs_v_bufs) |*b| b.clearAndFree(self.allocator);
+        for (self.runs_l_bufs) |*b| b.clearAndFree(self.allocator);
+    }
+
     fn releaseBatch(self: *Scan) void {
         if (self.decoded_valid) {
             for (self.decoded) |*c| c.deinit(self.allocator);
