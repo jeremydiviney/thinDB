@@ -40,6 +40,7 @@ const predicate_mod = @import("predicate.zig");
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 const transform = @import("../engine/transform.zig");
+const BlockArena = @import("../util/block_arena.zig").BlockArena;
 
 const exec = @import("exec.zig");
 const Query = exec.Query;
@@ -89,11 +90,13 @@ pub const Window = struct {
     /// column ever makes. Two jobs: (a) the parallel drain's workers append
     /// different columns concurrently, and per-column arenas make those
     /// allocations race-free without a shared-allocator lock; (b) evict()
-    /// frees the whole input in one arena sweep per column. Backed by the
+    /// frees the whole input in one arena sweep per column. A block arena,
+    /// so a column that grows holds its own capacity and frees the buffer
+    /// it outgrew; a bump arena held the input at 2-4x its size. Backed by the
     /// (thread-safe) retaining pool charged to the query normally; by the
     /// operator's own allocator under tests so std.testing.allocator still
     /// audits the memory (the drain is serial there).
-    acc_arenas: []std.heap.ArenaAllocator,
+    acc_arenas: []BlockArena,
     output_columns: []ColumnStore, // window outputs (fixed-width types)
     /// Parallel scratch for string-typed outputs. `string_outputs[ci]`
     /// is `&.{}` when the call's output isn't a string type; otherwise
@@ -369,10 +372,10 @@ pub const Window = struct {
         // Every accumulated column's allocations flow through its own arena
         // (see the field doc); the stores themselves need no per-store
         // deinit — the arena sweep in evict()/deinit() reclaims everything.
-        const acc_arenas = try allocator.alloc(std.heap.ArenaAllocator, input_schema.len);
+        const acc_arenas = try allocator.alloc(BlockArena, input_schema.len);
         errdefer allocator.free(acc_arenas);
         const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), allocator);
-        for (acc_arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
+        for (acc_arenas) |*a| a.* = BlockArena.init(arena_backing);
         errdefer for (acc_arenas) |*a| a.deinit();
         const accumulated = try allocator.alloc(ColumnStore, input_schema.len);
         errdefer allocator.free(accumulated);
@@ -541,7 +544,7 @@ pub const Window = struct {
     /// allocator. All slices are the new owner's to free.
     pub const AdoptedBuffers = struct {
         stores: []ColumnStore,
-        arenas: []std.heap.ArenaAllocator,
+        arenas: []BlockArena,
         arena_backed: []bool,
         rows: u64,
     };
@@ -594,16 +597,16 @@ pub const Window = struct {
         const arena_backed = try alloc.alloc(bool, ncols);
         errdefer alloc.free(arena_backed);
         @memset(arena_backed, true);
-        const arenas = try alloc.alloc(std.heap.ArenaAllocator, ncols);
+        const arenas = try alloc.alloc(BlockArena, ncols);
         errdefer alloc.free(arenas);
         const arena_backing = try exec.memory.workerAllocator(exec.memory.accountantOf(alloc), alloc);
-        for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(arena_backing);
+        for (arenas) |*a| a.* = BlockArena.init(arena_backing);
         errdefer for (arenas) |*a| a.deinit();
 
         const Gather = struct {
             win: *Window,
             perm: []const u32,
-            arenas: []std.heap.ArenaAllocator,
+            arenas: []BlockArena,
             stores: []ColumnStore,
             cursor: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
             failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -626,7 +629,9 @@ pub const Window = struct {
                 const aa = g.arenas[ci].allocator();
                 var st = try ColumnStore.init(aa, w.schema[ci].type, w.schema[ci].nullable);
                 if (ci < nin) {
-                    try transform.appendByIndices(aa, w.accumulated[ci].view(), g.perm, &st);
+                    const src = w.accumulated[ci].view();
+                    try st.reserveTotal(aa, g.perm.len, stringBytes(src));
+                    try transform.appendByIndices(aa, src, g.perm, &st);
                 } else if (w.string_outputs[ci - nin].len > 0) {
                     const scratch = w.string_outputs[ci - nin];
                     for (g.perm, 0..) |r, out_row| {
@@ -638,6 +643,7 @@ pub const Window = struct {
                         try st.appendValidBit(aa, @intCast(out_row), scratch[r] != null);
                     }
                 } else {
+                    try st.reserveTotal(aa, g.perm.len, 0);
                     try transform.appendByIndices(aa, w.output_columns[ci - nin].view(), g.perm, &st);
                 }
                 g.stores[ci] = st;
@@ -691,7 +697,7 @@ pub const Window = struct {
         for (self.string_outputs) |s| {
             if (s.len > 0) n_str += 1;
         }
-        const arenas = try alloc.alloc(std.heap.ArenaAllocator, nin + n_str);
+        const arenas = try alloc.alloc(BlockArena, nin + n_str);
         errdefer alloc.free(arenas);
 
         // Fallible work first, so the move below can't half-complete:
@@ -704,7 +710,7 @@ pub const Window = struct {
             var ai: usize = nin;
             for (self.string_outputs, 0..) |scr, ci| {
                 if (scr.len == 0) continue;
-                arenas[ai] = std.heap.ArenaAllocator.init(arena_backing);
+                arenas[ai] = BlockArena.init(arena_backing);
                 str_built += 1;
                 const sa = arenas[ai].allocator();
                 var st = try ColumnStore.init(sa, self.schema[nin + ci].type, true);
@@ -2516,6 +2522,15 @@ fn preSizeColumn(allocator: Allocator, out: *ColumnStore, t: Type, n: usize) !vo
         const bytes_needed = (n + 7) / 8;
         try nb.appendNTimes(allocator, 0, bytes_needed); // 0 = NULL
     }
+}
+
+/// Bytes a string column's rows hold, 0 for any other type: what a gather
+/// of every row, in any order, lands in its destination.
+fn stringBytes(view: ColumnView) usize {
+    return switch (view.data) {
+        .varchar, .string, .char, .json => |sv| sv.offsets[sv.rowCount()] - sv.offsets[0],
+        else => 0,
+    };
 }
 
 /// Build a row range of a staged string-output ColumnStore from the

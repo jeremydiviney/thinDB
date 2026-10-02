@@ -58,6 +58,7 @@ const SortSpec = sort_mod.SortSpec;
 
 const cast = @import("cast.zig");
 const exec = @import("exec.zig");
+const BlockArena = @import("../util/block_arena.zig").BlockArena;
 const Query = exec.Query;
 const Batch = exec.Batch;
 const Error = exec.Error;
@@ -470,7 +471,7 @@ pub const TableFnExec = struct {
     /// new owner deinits each store with its (same-lineage) allocator.
     pub const AdoptedBuffers = struct {
         stores: []ColumnStore,
-        arenas: []std.heap.ArenaAllocator,
+        arenas: []BlockArena,
         arena_backed: []bool,
         rows: u64,
     };
@@ -504,7 +505,7 @@ pub const TableFnExec = struct {
         const arena_backed = try self.allocator.alloc(bool, self.output_cols.len);
         errdefer self.allocator.free(arena_backed);
         @memset(arena_backed, false);
-        const arenas = try self.allocator.alloc(std.heap.ArenaAllocator, 0);
+        const arenas = try self.allocator.alloc(BlockArena, 0);
         @memcpy(stores, self.output_cols);
         self.adopted_out = true;
         return .{

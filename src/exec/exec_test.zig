@@ -1550,6 +1550,75 @@ test "scan: a column only its fused filter reads is not gathered" {
     }
 }
 
+// A window keeps its input in one block arena per column, so a column holds
+// the buffers it is using and nothing else. A bump arena also kept every
+// buffer the column had outgrown, in nodes larger than the column asked for.
+test "window: an accumulated column holds only its live buffers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const ir = @import("../ir/ir.zig");
+    const Window = @import("window.zig").Window;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "tag", .type = .string, .nullable = true },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    const Row = struct { id: i64, tag: ?[]const u8, v: i32 };
+    const tags = [_]?[]const u8{ null, "", "red", "green", "blue" };
+    const total = 2000;
+    var next_id: i64 = 0;
+    for (0..20) |_| {
+        var rows: [100]Row = undefined;
+        for (&rows) |*r| {
+            r.* = .{ .id = next_id, .tag = tags[@intCast(@mod(next_id, 5))], .v = @intCast(@mod(next_id, 7)) };
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+
+    const base = try scan(allocator, t);
+    var q = try base.window(
+        &.{.{ .partition_by = &.{}, .order_by = &.{.{ .col = "id" }}, .frame = ir.Frame.default_with_order }},
+        &.{.{ .spec_idx = 0, .func = .row_number, .args = &.{}, .ignore_nulls = false, .output_name = "rn" }},
+        1,
+    );
+    defer q.deinit();
+    const win = exec.queryAs(Window, q).?;
+    try win.ensureDrained();
+    try std.testing.expectEqual(@as(u64, total), win.accumulated_rows);
+
+    for (win.accumulated, win.acc_arenas) |store, arena| {
+        try std.testing.expectEqual(@as(usize, total), store.rowCount());
+        try std.testing.expectEqual(store.heldBytes(), arena.queryCapacity());
+    }
+
+    var rows: usize = 0;
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            try std.testing.expectEqual(@as(i64, @intCast(rows + i)), batch.values[0].data.bigint[i]);
+            try std.testing.expectEqual(@as(i64, @intCast(rows + i + 1)), batch.values[3].data.bigint[i]);
+        }
+        rows += batch.row_count;
+    }
+    try std.testing.expectEqual(@as(usize, total), rows);
+}
+
 const SlotHolder = struct {
     sched: *core_scheduler.CoreScheduler,
     release: *std.atomic.Value(bool),
