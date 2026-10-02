@@ -1095,34 +1095,35 @@ test "CTE boundary: a materialized UNION stage reports the EXACT passed-through 
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
 
-    // Two CTE source tables, 5 rows each (id 1..5).
+    // Two CTE source tables, 5 rows each (id 1..5, a 10..50).
     const t1 = try db.table("c1", u2_schema, u2_opts);
     try t1.insert(&.{
-        .{ .id = @as(i64, 1), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 2), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 3), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 4), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 5), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 1), .a = @as(i32, 10), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 2), .a = @as(i32, 20), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 3), .a = @as(i32, 30), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 4), .a = @as(i32, 40), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 5), .a = @as(i32, 50), .b = @as(i32, 0) },
     });
     try t1.flush();
     const t2 = try db.table("c2", u2_schema, u2_opts);
     try t2.insert(&.{
-        .{ .id = @as(i64, 1), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 2), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 3), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 4), .a = @as(i32, 0), .b = @as(i32, 0) },
-        .{ .id = @as(i64, 5), .a = @as(i32, 0), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 1), .a = @as(i32, 10), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 2), .a = @as(i32, 20), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 3), .a = @as(i32, 30), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 4), .a = @as(i32, 40), .b = @as(i32, 0) },
+        .{ .id = @as(i64, 5), .a = @as(i32, 50), .b = @as(i32, 0) },
     });
     try t2.flush();
 
-    // CTE a = (c1 WHERE id > 3), CTE b = (c2 WHERE id > 3), each keeps exactly
+    // CTE a = (c1 WHERE a > 30), CTE b = (c2 WHERE a > 30), each keeps exactly
     // 2 rows — but a Filter can't know its selectivity up front, so its
     // upper_rows estimate stays at the input count (5). The union of the two
-    // therefore *estimates* 5 + 5 = 10.
+    // therefore *estimates* 5 + 5 = 10. (A range over the unique key `id`
+    // would bound the rows by the values it admits.)
     const s1 = try thindb.scan(allocator, t1);
-    const f1 = try s1.filter(thindb.leafExpr("id", .gt, .{ .bigint = 3 }));
+    const f1 = try s1.filter(thindb.leafExpr("a", .gt, .{ .int = 30 }));
     const s2 = try thindb.scan(allocator, t2);
-    const f2 = try s2.filter(thindb.leafExpr("id", .gt, .{ .bigint = 3 }));
+    const f2 = try s2.filter(thindb.leafExpr("a", .gt, .{ .int = 30 }));
     const u = try thindb.exec.SetUnion.create(allocator, f1, f2, true);
 
     // Stage the union = the next CTE's materialization boundary. `addStage`
@@ -1300,7 +1301,8 @@ test "stats: a pruned scan counts only the row groups its hints keep (#478)" {
 
     const cases = .{
         .{ .pred = thindb.leafExpr("id", .gte, .{ .int = 3 }), .rows = 4, .survivors = 4 },
-        .{ .pred = thindb.leafExpr("id", .eq, .{ .int = 2 }), .rows = 2, .survivors = 1 },
+        // One value of the unique key: one row, fewer than its row group's 2.
+        .{ .pred = thindb.leafExpr("id", .eq, .{ .int = 2 }), .rows = 1, .survivors = 1 },
         .{ .pred = thindb.leafExpr("id", .lt, .{ .int = 4 }), .rows = 4, .survivors = 3 },
         // Inside the column's range, in no row group's: nothing survives.
         .{ .pred = thindb.leafExpr("id", .eq, .{ .int = 7 }), .rows = 0, .survivors = 0 },
@@ -1315,6 +1317,72 @@ test "stats: a pruned scan counts only the row groups its hints keep (#478)" {
         try std.testing.expectEqual(@as(u64, 6), s.row_origin.?.rows);
         try std.testing.expectEqual(@as(u64, c.survivors), try drainCount(&q));
     }
+}
+
+test "stats: a filter over a unique key keeps one row per key value it admits (#530)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db); // id 1..6, c 100..600
+
+    const two_ids = [_]thindb.Value{ .{ .bigint = 2 }, .{ .bigint = 5 } };
+    const between = [_]thindb.exec.PredicateExpr{
+        thindb.leafExpr("id", .gte, .{ .bigint = 2 }),
+        thindb.leafExpr("id", .lte, .{ .bigint = 4 }),
+    };
+    const cases = .{
+        .{ .pred = thindb.leafExpr("id", .eq, .{ .bigint = 3 }), .rows = 1, .survivors = 1 },
+        .{ .pred = thindb.exec.PredicateExpr{ .in_set = .{ .col = "id", .values = &two_ids, .negate = false } }, .rows = 2, .survivors = 2 },
+        .{ .pred = thindb.exec.PredicateExpr{ .@"and" = &between }, .rows = 3, .survivors = 3 },
+        // A range over another column proves nothing about the row count.
+        .{ .pred = thindb.leafExpr("c", .lte, .{ .int = 300 }), .rows = 6, .survivors = 3 },
+    };
+    inline for (cases) |c| {
+        const base = try thindb.scan(allocator, t);
+        var q = try base.filter(c.pred);
+        defer q.deinit();
+        const s = q.stats();
+        try std.testing.expectEqual(@as(u64, c.rows), s.upper_rows);
+        for (s.column_stats) |cs| try std.testing.expect(try exactNdv(cs.ndv) <= c.rows);
+        try std.testing.expectEqual(@as(u64, c.survivors), try drainCount(&q));
+    }
+}
+
+test "stats: a key value repeats across UNION ALL arms or in a non-unique table (#530)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try seedNonNull(db);
+
+    // Both arms read the row with id 3, so the filter keeps it twice.
+    const u = try thindb.exec.SetUnion.create(allocator, try thindb.scan(allocator, t), try thindb.scan(allocator, t), true);
+    var twice = try u.filter(thindb.leafExpr("id", .eq, .{ .bigint = 3 }));
+    defer twice.deinit();
+    try std.testing.expect(twice.stats().upper_rows >= 2);
+    try std.testing.expectEqual(@as(u64, 2), try drainCount(&twice));
+
+    const dup_schema = thindb.TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "c", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const dup = try db.table("dup", dup_schema, .{ .order_key = &pn_ok });
+    try dup.insert(&.{
+        .{ .id = @as(i64, 3), .c = @as(i32, 1) },
+        .{ .id = @as(i64, 3), .c = @as(i32, 2) },
+        .{ .id = @as(i64, 4), .c = @as(i32, 3) },
+    });
+    try dup.flush();
+    var dups = try (try thindb.scan(allocator, dup)).filter(thindb.leafExpr("id", .eq, .{ .bigint = 3 }));
+    defer dups.deinit();
+    try std.testing.expect(dups.stats().upper_rows >= 2);
+    try std.testing.expectEqual(@as(u64, 2), try drainCount(&dups));
 }
 
 test "stats: union arms over one table column hold at most its NDV, and key tuples at most its rows (#478)" {

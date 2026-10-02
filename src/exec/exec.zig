@@ -483,6 +483,11 @@ pub const RowOrigin = struct {
     snapshot: u64,
     /// The snapshot's rows.
     rows: u64,
+    /// The snapshot column (its schema index) no two emitted rows share a
+    /// value of: a unique table's single-column NOT NULL key, while each
+    /// snapshot row is emitted at most once. A UNION ALL of two arms over
+    /// the snapshot can emit a row twice, so it drops this.
+    key_column: ?u32 = null,
 };
 
 /// Identity of one table's snapshot: the same table at the same segment set
@@ -503,6 +508,28 @@ pub fn fromRowOrigin(st: PipelineStats, stat: ColStat) bool {
     const ro = st.row_origin orelse return false;
     const o = stat.origin orelse return false;
     return o.snapshot == ro.snapshot;
+}
+
+/// The most rows `st` emits by its row origin's `key_column`: one per value
+/// the key's stat in `stats` allows, its NDV or the span of its range.
+/// `schema` types `stats`. Null when the rows carry no such key.
+pub fn keyedRowBound(st: PipelineStats, stats: []const ColStat, schema: []const Column) ?u64 {
+    const ro = st.row_origin orelse return null;
+    const key = ro.key_column orelse return null;
+    for (stats, schema[0..stats.len]) |s, col| {
+        const o = s.origin orelse continue;
+        if (o.snapshot != ro.snapshot or o.column != key) continue;
+        var bound: ?u64 = switch (s.ndv) {
+            .exact => |n| n,
+            .unknown => null,
+        };
+        if (predicate.typeHasRange(col.type)) if (s.min) |lo| if (s.max) |hi| {
+            const span: u64 = if (hi < lo) 0 else std.math.cast(u64, (hi -| lo) +| 1) orelse std.math.maxInt(u64);
+            bound = if (bound) |b| @min(b, span) else span;
+        };
+        return bound;
+    }
+    return null;
 }
 
 /// The most distinct key tuples `st`'s rows hold: its row bound, or its row
@@ -1542,7 +1569,8 @@ pub fn unionRowOrigin(l: PipelineStats, r: PipelineStats) ?RowOrigin {
     if (l.upper_rows == 0) return r.row_origin;
     const lo = l.row_origin orelse return null;
     const ro = r.row_origin orelse return null;
-    return if (lo.snapshot == ro.snapshot) lo else null;
+    if (lo.snapshot != ro.snapshot) return null;
+    return .{ .snapshot = lo.snapshot, .rows = lo.rows };
 }
 
 /// The most distinct rows the first `width` columns of `st` hold: the

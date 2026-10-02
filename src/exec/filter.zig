@@ -246,13 +246,21 @@ pub const Filter = struct {
         // Computed after `validateExpr` so any integer-literal widening is
         // reflected in `self.expr`. The Scan-fusion offer below doesn't change
         // the OUTPUT this Filter represents, so the tightening holds either way.
-        const tightened = try tightenStats(allocator, self.upstream.stats(), schema, self.expr);
+        const up_stats = self.upstream.stats();
+        const tightened = try tightenStats(allocator, up_stats, schema, self.expr);
         self.cached_stats = tightened;
         errdefer if (self.cached_stats.len > 0) allocator.free(@constCast(self.cached_stats));
         if (bound) |b| {
             self.row_ceiling = b.rows;
             applyBound(tightened, b);
         }
+        // A predicate over a unique key keeps one row per key value it
+        // admits: `id BETWEEN 1 AND 11` keeps at most 11 rows, however large
+        // the table.
+        if (exec.keyedRowBound(up_stats, tightened, schema)) |rows| if (rows < self.row_ceiling) {
+            self.row_ceiling = rows;
+            exec.capColStats(tightened, rows);
+        };
         if (self.provenEmpty()) self.cached_stats = try emptyStats(allocator, tightened, schema.len);
 
         // Offer the full (validated) predicate to the upstream Scan for in-place
@@ -505,7 +513,8 @@ pub const Filter = struct {
 
     /// Filter only restricts rows — `upper_rows` is the input's (a filter is
     /// only provably ≤ input; we don't estimate a reduction), 0 when the
-    /// predicate is proven empty, and at most a creator's `Bound`. Sort state
+    /// predicate is proven empty, and at most a creator's `Bound` or one row
+    /// per unique-key value the predicate admits. Sort state
     /// preserved (Filter doesn't reorder). Per-column stats are tightened by
     /// the predicate's proven bounds (see `tightenStats`), then capped at
     /// `upper_rows`.

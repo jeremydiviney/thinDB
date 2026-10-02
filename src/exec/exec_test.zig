@@ -4023,7 +4023,11 @@ test "union NDV: arms over one table column hold at most its NDV, other arms sum
 test "union row origin: shared by arms over one snapshot, or the non-empty arm's" {
     const s1: exec.RowOrigin = .{ .snapshot = 1, .rows = 100 };
     const s2: exec.RowOrigin = .{ .snapshot = 2, .rows = 100 };
+    // Two arms over one snapshot can both emit a row, so its key repeats.
+    const s1_keyed: exec.RowOrigin = .{ .snapshot = 1, .rows = 100, .key_column = 0 };
     const cases = .{
+        .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1_keyed }, .r = exec.PipelineStats{ .upper_rows = 40, .row_origin = s1_keyed }, .want = @as(?exec.RowOrigin, s1) },
+        .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1_keyed }, .r = exec.PipelineStats{ .upper_rows = 0 }, .want = @as(?exec.RowOrigin, s1_keyed) },
         .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 40, .row_origin = s1 }, .want = @as(?exec.RowOrigin, s1) },
         .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 40, .row_origin = s2 }, .want = @as(?exec.RowOrigin, null) },
         .{ .l = exec.PipelineStats{ .upper_rows = 100, .row_origin = s1 }, .r = exec.PipelineStats{ .upper_rows = 40 }, .want = @as(?exec.RowOrigin, null) },
