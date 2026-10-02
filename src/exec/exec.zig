@@ -1107,7 +1107,7 @@ pub fn makeQuery(allocator: Allocator, op: anytype) Query {
         .ptr = op,
         .vtable = &OpWrapper(Op).vt,
         .allocator = allocator,
-        .resources = memory.accountantOf(allocator) orelse (if (@hasDecl(Op, "accountant")) op.accountant() else null),
+        .resources = memory.ownerOf(allocator) orelse (if (@hasDecl(Op, "accountant")) op.accountant() else null),
         .probe_fusion_reachable = probe_fusion_reachable,
     };
 }

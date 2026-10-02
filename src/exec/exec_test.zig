@@ -1553,6 +1553,40 @@ test "scan: a column only its fused filter reads is not gathered" {
 // A window keeps its input in one block arena per column, so a column holds
 // the buffers it is using and nothing else. A bump arena also kept every
 // buffer the column had outgrown, in nodes larger than the column asked for.
+test "window: an instance built on a retained allocator leaves the building query nothing to wait for" {
+    const allocator = std.testing.allocator;
+    const memory = exec.memory;
+    const StatementGate = @import("../util/statement_gate.zig").StatementGate;
+    var gate = StatementGate.init(allocator, std.testing.io);
+    defer gate.deinit();
+
+    var retained = memory.BudgetAllocator.init(allocator);
+    const pool_alloc = retained.allocator();
+    const account = try allocator.create(memory.MemoryAccountant);
+    account.* = memory.MemoryAccountant.init(1 << 20);
+    account.trackAllocations(allocator);
+    var released = false;
+    defer if (!released) account.releaseOwner(allocator);
+    try account.retainGate(&gate);
+    try retained.attach(account);
+    defer retained.detach();
+
+    const schema = [_]types.Column{ .{ .name = "k", .type = .bigint }, .{ .name = "v", .type = .int } };
+    var src = try @import("single_batch.zig").SingleBatchSource.create(pool_alloc, .{ .schema = &schema, .values = &.{}, .row_count = 0 });
+    var q = blk: {
+        errdefer src.deinit();
+        break :blk try @import("window.zig").Window.create(pool_alloc, src, &.{}, &.{}, 1);
+    };
+    defer q.deinit();
+    try std.testing.expect(retained.live_bytes.load(.monotonic) > 0);
+
+    retained.detach();
+    released = true;
+    account.releaseOwner(allocator);
+    try std.testing.expectEqual(@as(usize, 0), gate.allocator_owners);
+    try std.testing.expectEqual(@as(?*memory.MemoryAccountant, null), q.accountant());
+}
+
 test "window: an accumulated column holds only its live buffers" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
