@@ -229,6 +229,10 @@ pub const Pool = struct {
             const base: [*]u8 = buf.ptr;
             return self.backing.rawFree(base[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
         }
+        // Counted before it is listed: a block another thread pops the moment
+        // it is listed is subtracted straight away, and a count that ran
+        // behind the lists would wrap below zero.
+        _ = self.retained_bytes.fetchAdd(sz, .monotonic);
         const node: *FreeNode = @ptrCast(@alignCast(buf.ptr));
         const cls = &self.classes[idx];
         cls.lock.lock();
@@ -236,7 +240,6 @@ pub const Pool = struct {
         cls.head = node;
         cls.count += 1;
         cls.lock.unlock();
-        _ = self.retained_bytes.fetchAdd(sz, .monotonic);
     }
 
     fn resizeImpl(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
@@ -448,26 +451,36 @@ test "reclaim alongside workers allocating and freeing keeps the free lists and 
             }
         }
     };
-    var stop = std.atomic.Value(bool).init(false);
-    const reclaimer = try std.Thread.spawn(.{}, Reclaimer.run, .{ &pool, &stop });
-    var threads: [8]std.Thread = undefined;
-    var started: usize = 0;
-    errdefer {
-        for (threads[0..started]) |t| t.join();
-        stop.store(true, .release);
-        reclaimer.join();
+    const Sampler = struct {
+        fn run(p: *Pool, stop: *std.atomic.Value(bool), peak: *usize) void {
+            while (!stop.load(.acquire)) peak.* = @max(peak.*, p.retained_bytes.load(.monotonic));
+        }
+    };
+    const worker_count = 8;
+    var peak: usize = 0;
+    {
+        var stop = std.atomic.Value(bool).init(false);
+        const reclaimer = try std.Thread.spawn(.{}, Reclaimer.run, .{ &pool, &stop });
+        defer reclaimer.join();
+        defer stop.store(true, .release);
+        const sampler = try std.Thread.spawn(.{}, Sampler.run, .{ &pool, &stop, &peak });
+        defer sampler.join();
+        defer stop.store(true, .release);
+        var threads: [worker_count]std.Thread = undefined;
+        var started: usize = 0;
+        defer for (threads[0..started]) |t| t.join();
+        for (&threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, Worker.run, .{a});
+            started += 1;
+        }
     }
-    for (&threads) |*t| {
-        t.* = try std.Thread.spawn(.{}, Worker.run, .{a});
-        started += 1;
-    }
-    for (threads) |t| t.join();
-    stop.store(true, .release);
-    reclaimer.join();
 
     var listed: usize = 0;
     for (&pool.classes, 0..) |*cls, i| listed += cls.count * Pool.classSize(i);
     try std.testing.expectEqual(listed, pool.retained_bytes.load(.monotonic));
+    // A count that ran behind the lists would have wrapped below zero for a
+    // moment, which reads as nearly all of the address space being idle.
+    try std.testing.expect(peak <= worker_count * Pool.classSize(class_count - 1));
 }
 
 test "ArrayList growth across the bypass/pool boundary stays consistent" {
