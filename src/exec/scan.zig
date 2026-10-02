@@ -360,6 +360,10 @@ pub const Scan = struct {
     /// `table.schema.columns` only when no projection AND not emitting loc.
     out_schema: []const Column,
     out_schema_owned: bool = false,
+    /// The owned schema `setEmitProjection` replaced. A fused Filter above
+    /// resolves names in the schema it was built over, so it stays until
+    /// `deinit`.
+    retired_schema: []const Column = &.{},
 
     /// Late-materialization mode: append a trailing hidden `__rowloc` BIGINT
     /// column carrying each row's physical location (see rowloc.zig). The
@@ -1110,6 +1114,7 @@ pub const Scan = struct {
         if (self.filter_decoded.len > 0) self.allocator.free(self.filter_decoded);
         self.allocator.free(self.out_phys);
         if (self.out_schema_owned) self.allocator.free(@constCast(self.out_schema));
+        if (self.retired_schema.len > 0) self.allocator.free(@constCast(self.retired_schema));
         // Drop our pinned memtable reference. If we held the last one and
         // the memtable was retired (a flush/delete swapped it out), it's
         // freed here.
@@ -1343,6 +1348,114 @@ pub const Scan = struct {
             for (self.filter_decoded) |*c| c.deinit(self.allocator);
             self.filter_decoded_valid = false;
         }
+    }
+
+    /// `VTable.setEmitProjection`: a consumer reports it reads only `keep`.
+    /// A projected column outside `keep` is then read by the fused filter
+    /// alone, so it becomes an eval-only column (`filter_phys`): viewed for
+    /// the mask and never gathered into `filtered` (issue #502). One the
+    /// filter does not read either is dropped. The output schema shrinks
+    /// with them, which holds only for a scan that has read nothing and
+    /// carries no per-column sidecar laid out for the wider schema.
+    pub fn setEmitProjection(self: *Scan, keep: []const []const u8) !void {
+        if (self.fused_filter == null or self.emit_loc or self.retired_schema.len != 0) return;
+        if (self.phase != .segments or self.rgs_considered != 0 or self.cur_segment != null or self.filtered != null) return;
+        if (self.n_coded != 0 or self.n_hashed != 0 or self.emit_runs) return;
+        if (self.coded_dicts_by_j.len != 0 or self.hash_cols_by_j.len != 0 or self.runs_v_bufs.len != 0) return;
+        const old_w = self.out_phys.len;
+        if (self.cached_stats.len != old_w) return;
+
+        const columns = self.table.schema.columns;
+        var refs: std.ArrayListUnmanaged(usize) = .empty;
+        defer refs.deinit(self.allocator);
+        try collectPredicateColumns(self.allocator, self.fused_filter.?, columns, &refs);
+        var kept: usize = 0;
+        var eval_only: usize = self.filter_phys.len;
+        for (self.out_phys, self.out_schema[0..old_w]) |phys, col| {
+            if (nameIn(keep, col.name)) {
+                kept += 1;
+            } else if (std.mem.indexOfScalar(usize, refs.items, phys) != null) {
+                eval_only += 1;
+            }
+        }
+        if (kept == 0 or kept == old_w) return;
+        // As `setupFilterEval`: the eval arrays exist only beside eval-only
+        // columns.
+        const eval_w = if (eval_only == 0) 0 else kept + eval_only;
+
+        const out_phys = try self.allocator.alloc(usize, kept);
+        errdefer self.allocator.free(out_phys);
+        const out_schema = try self.allocator.alloc(Column, kept);
+        errdefer self.allocator.free(out_schema);
+        const stats_buf = try self.allocator.alloc(exec.ColStat, kept);
+        errdefer self.allocator.free(stats_buf);
+        const decoded = try self.allocator.alloc(storage.OwnedColumn, kept);
+        errdefer self.allocator.free(decoded);
+        const views = try self.allocator.alloc(ColumnView, kept);
+        errdefer self.allocator.free(views);
+        const pruned_stats = try self.allocator.alloc(exec.ColStat, if (self.pruned != null) kept else 0);
+        errdefer self.allocator.free(pruned_stats);
+        const filter_phys = try self.allocator.alloc(usize, eval_only);
+        errdefer self.allocator.free(filter_phys);
+        const eval_schema = try self.allocator.alloc(Column, eval_w);
+        errdefer self.allocator.free(eval_schema);
+        const eval_views = try self.allocator.alloc(ColumnView, eval_w);
+        errdefer self.allocator.free(eval_views);
+        const filter_decoded = try self.allocator.alloc(storage.OwnedColumn, eval_only);
+
+        @memcpy(filter_phys[0..self.filter_phys.len], self.filter_phys);
+        var n: usize = 0;
+        var e: usize = self.filter_phys.len;
+        for (self.out_phys, self.out_schema[0..old_w], self.cached_stats) |phys, col, stat| {
+            if (nameIn(keep, col.name)) {
+                out_phys[n] = phys;
+                out_schema[n] = col;
+                stats_buf[n] = stat;
+                n += 1;
+            } else if (std.mem.indexOfScalar(usize, refs.items, phys) != null) {
+                filter_phys[e] = phys;
+                e += 1;
+            }
+        }
+        if (eval_w != 0) {
+            @memcpy(eval_schema[0..kept], out_schema);
+            for (filter_phys, eval_schema[kept..]) |phys, *col| col.* = columns[phys];
+        }
+
+        self.allocator.free(self.out_phys);
+        self.allocator.free(self.cached_stats);
+        self.allocator.free(self.decoded);
+        self.allocator.free(self.views);
+        if (self.pruned) |*b| {
+            self.allocator.free(b.stats);
+            b.stats = pruned_stats;
+            self.pruned_stale = true;
+        }
+        if (self.filter_phys.len > 0) self.allocator.free(self.filter_phys);
+        if (self.filter_eval_schema.len > 0) self.allocator.free(self.filter_eval_schema);
+        if (self.filter_eval_views.len > 0) self.allocator.free(self.filter_eval_views);
+        if (self.filter_decoded.len > 0) self.allocator.free(self.filter_decoded);
+        if (self.out_schema_owned) self.retired_schema = self.out_schema;
+        self.out_phys = out_phys;
+        self.out_schema = out_schema;
+        self.out_schema_owned = true;
+        self.cached_stats = stats_buf;
+        self.decoded = decoded;
+        self.views = views;
+        self.filter_phys = filter_phys;
+        self.filter_eval_schema = eval_schema;
+        self.filter_eval_views = eval_views;
+        self.filter_decoded = filter_decoded;
+        var row_bytes: usize = 0;
+        for (out_schema) |col| row_bytes += exec.memory.estimateColumnBytes(col.type);
+        self.sub_batch_rows = exec.autoScanBatch(row_bytes);
+    }
+
+    fn nameIn(names: []const []const u8, name: []const u8) bool {
+        for (names) |candidate| {
+            if (types.columnNameEql(candidate, name)) return true;
+        }
+        return false;
     }
 
     pub fn addPrune(self: *Scan, raw: Predicate) !void {
@@ -2364,32 +2477,41 @@ pub const Scan = struct {
         // can't be viewed (misalignment / big-endian).
         if (try self.tryBorrowViews(seg, rg_idx, rg_count)) |borrow| {
             defer for (borrow.blocks) |*b| b.release(self.allocator, self.table.cacheRef());
-            return self.evalAndCompactSegment(seg, rg_idx, rg_count, borrow.views, tomb_mask, expr, .{ .segment = rg_idx });
+            return self.evalAndCompactSegment(seg, rg_idx, rg_count, borrow.views, .borrowed, tomb_mask, expr, .{ .segment = rg_idx });
         }
 
         // Fallback: owned decode (as the non-fused path), then evaluate +
         // compact through the same kernel.
         const owned_views = try self.decodeOwnedViews(seg, rg_idx, rg_count);
         defer self.releaseDecoded();
-        return self.evalAndCompactSegment(seg, rg_idx, rg_count, owned_views, tomb_mask, expr, .{ .segment = rg_idx });
+        return self.evalAndCompactSegment(seg, rg_idx, rg_count, owned_views, .decode, tomb_mask, expr, .{ .segment = rg_idx });
     }
 
+    /// Where `evalAndCompactSegment` finds the eval-only columns' views:
+    /// already in `filter_eval_views` past the output columns (the borrow
+    /// path views them with the rest), or owned-decoded here.
+    const FilterViews = enum { borrowed, decode };
+
     /// Evaluate the fused predicate for one segment row group. When the filter
-    /// references unprojected columns (`filter_phys`), owned-decode those from
-    /// the same row group, present them to the evaluator alongside `out_views`,
-    /// and release them after — they never reach the output.
-    fn evalAndCompactSegment(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, out_views: []const ColumnView, tomb_mask: ?[]const bool, expr: PredicateExpr, loc: SurvivorLoc) !usize {
+    /// references unprojected columns (`filter_phys`), present them to the
+    /// evaluator alongside `out_views` — they never reach the output.
+    fn evalAndCompactSegment(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, out_views: []const ColumnView, filter_views: FilterViews, tomb_mask: ?[]const bool, expr: PredicateExpr, loc: SurvivorLoc) !usize {
         if (self.filter_phys.len == 0) {
             return self.evalAndCompact(out_views, self.out_schema, out_views.len, rg_count, tomb_mask, expr, loc);
         }
-        for (self.filter_phys, 0..) |phys, j| {
-            self.filter_decoded[j] = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
-        }
-        self.filter_decoded_valid = true;
-        defer self.releaseFilterDecoded();
         const oc = out_views.len;
+        if (filter_views == .decode) {
+            var decoded: usize = 0;
+            errdefer for (self.filter_decoded[0..decoded]) |*c| c.deinit(self.allocator);
+            for (self.filter_phys, 0..) |phys, j| {
+                self.filter_decoded[j] = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
+                decoded += 1;
+            }
+            self.filter_decoded_valid = true;
+            for (self.filter_decoded, 0..) |c, j| self.filter_eval_views[oc + j] = c.view();
+        }
+        defer self.releaseFilterDecoded();
         @memcpy(self.filter_eval_views[0..oc], out_views);
-        for (self.filter_decoded, 0..) |c, j| self.filter_eval_views[oc + j] = c.view();
         return self.evalAndCompact(self.filter_eval_views[0 .. oc + self.filter_phys.len], self.filter_eval_schema, oc, rg_count, tomb_mask, expr, loc);
     }
 
@@ -3747,75 +3869,87 @@ pub const Scan = struct {
         views: []ColumnView,
     };
 
+    const BorrowedColumn = struct {
+        block: storage.ReadSegment.BorrowedBlock,
+        view: ColumnView,
+    };
+
+    /// Borrow one column's cache block for a row group and view it typed. A
+    /// raw block views zero-copy in place; an FSST or narrow-encoded (FOR,
+    /// dict) block is expanded ONCE into a buffer its `BorrowedBlock` carries
+    /// and frees on release, so one encoded column never forces the raw ones
+    /// onto the owned-decode path. Null, with the pin released, when raw bytes
+    /// can't be viewed (misaligned / big-endian).
+    fn borrowColumn(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, phys: usize) !?BorrowedColumn {
+        const col_type = self.table.schema.columns[phys].type;
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+
+        if (block.encoding == .fsst) {
+            // The cache's recycled scratch pool: a fresh allocation per
+            // borrow re-faults zeroed pages every scan `next()`.
+            const view = storage.segment_reader.expandFsstPooled(&block, self.table.cacheRef(), col_type, rg_count, flags) catch |e| {
+                block.release(self.allocator, self.table.cacheRef());
+                return e;
+            };
+            return .{ .block = block, .view = view };
+        }
+
+        if (block.encoding != .raw) {
+            block.expanded = storage.segment_reader.decodeColumnPayload(
+                self.allocator,
+                col_type,
+                block.bytes,
+                rg_count,
+                flags,
+                block.encoding,
+            ) catch |e| {
+                block.release(self.allocator, self.table.cacheRef());
+                return e;
+            };
+            return .{ .block = block, .view = block.expanded.?.view() };
+        }
+
+        const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse {
+            block.release(self.allocator, self.table.cacheRef());
+            return null;
+        };
+        return .{ .block = block, .view = view };
+    }
+
     /// Try to build borrowed typed views over the cache blocks for every
-    /// projected column. Per-column: a raw block views zero-copy in place; a
-    /// FOR-encoded block is expanded ONCE into an owned native buffer carried by
-    /// its `BorrowedBlock` (so one FOR column never forces the raw columns onto
-    /// the owned-decode path). Returns null (after releasing any pins taken)
-    /// only when a column's bytes are neither viewable raw nor FOR (misaligned /
-    /// big-endian raw). The returned `blocks` / `views` alias `self`-owned
-    /// scratch (`borrow_blocks` / `views`); the caller must release the blocks
-    /// within the same `next()` call (which frees any FOR expansion buffers).
+    /// projected column and every eval-only one (`borrowColumn`). Returns
+    /// null, after releasing any pins taken, when a column can't be viewed.
+    /// The returned `blocks` cover both sets and `views` the projected
+    /// columns; the eval-only views sit in `filter_eval_views` past them.
+    /// All alias `self`-owned scratch, and the caller must release the
+    /// blocks within the same `next()` call (which frees any expansions).
     fn tryBorrowViews(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32) !?Borrow {
         const blocks = try self.ensureBorrowBlocks();
+        const out_w = self.out_phys.len;
 
         var got: usize = 0;
         errdefer for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
 
-        for (self.out_phys, 0..) |phys, j| {
-            const col_type = self.table.schema.columns[phys].type;
-            const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
-            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
-
-            if (block.encoding == .fsst) {
-                // FSST: expand once into the cache's recycled scratch pool
-                // (returned on `block.release`) — a fresh allocation per
-                // borrow re-faults zeroed pages every scan `next()`.
-                const view = storage.segment_reader.expandFsstPooled(&block, self.table.cacheRef(), col_type, rg_count, flags) catch |e| {
-                    block.release(self.allocator, self.table.cacheRef());
-                    return e;
-                };
-                blocks[j] = block;
-                self.views[j] = view;
-                got += 1;
-                continue;
-            }
-
-            if (block.encoding != .raw) {
-                // Narrow-encoded (FOR or dict): expand the codes once into a
-                // native buffer owned by the block; the view aliases that buffer
-                // and the expansion is freed on `block.release`. The raw columns
-                // alongside stay zero-copy — one narrow column never forces the
-                // whole row group onto the owned-decode path.
-                block.expanded = storage.segment_reader.decodeColumnPayload(
-                    self.allocator,
-                    col_type,
-                    block.bytes,
-                    rg_count,
-                    flags,
-                    block.encoding,
-                ) catch |e| {
-                    block.release(self.allocator, self.table.cacheRef());
-                    return e;
-                };
-                blocks[j] = block;
-                self.views[j] = block.expanded.?.view();
-                got += 1;
-                continue;
-            }
-
-            const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse {
-                // Misaligned / big-endian raw: release this block and abandon the
-                // fast path for the whole row group (release the rest too).
-                block.release(self.allocator, self.table.cacheRef());
+        for (self.out_phys) |phys| {
+            const col = (try self.borrowColumn(seg, rg_idx, rg_count, phys)) orelse {
                 for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
                 return null;
             };
-            blocks[j] = block;
-            self.views[j] = view;
+            blocks[got] = col.block;
+            self.views[got] = col.view;
             got += 1;
         }
-        return .{ .blocks = blocks[0..self.out_phys.len], .views = self.views[0..self.out_phys.len] };
+        for (self.filter_phys) |phys| {
+            const col = (try self.borrowColumn(seg, rg_idx, rg_count, phys)) orelse {
+                for (blocks[0..got]) |*b| b.release(self.allocator, self.table.cacheRef());
+                return null;
+            };
+            blocks[got] = col.block;
+            self.filter_eval_views[got] = col.view;
+            got += 1;
+        }
+        return .{ .blocks = blocks[0..got], .views = self.views[0..out_w] };
     }
 
     /// Owned-decode the projected columns of one row group into `self.decoded`
@@ -3983,9 +4117,11 @@ pub const Scan = struct {
     }
 
     fn ensureBorrowBlocks(self: *Scan) ![]storage.ReadSegment.BorrowedBlock {
-        if (self.borrow_blocks.len >= self.out_phys.len) return self.borrow_blocks;
+        const n = self.out_phys.len + self.filter_phys.len;
+        if (self.borrow_blocks.len >= n) return self.borrow_blocks;
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
-        self.borrow_blocks = try self.allocator.alloc(storage.ReadSegment.BorrowedBlock, self.out_phys.len);
+        self.borrow_blocks = &.{};
+        self.borrow_blocks = try self.allocator.alloc(storage.ReadSegment.BorrowedBlock, n);
         return self.borrow_blocks;
     }
 

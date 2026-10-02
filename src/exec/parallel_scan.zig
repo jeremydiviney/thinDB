@@ -616,6 +616,14 @@ const Leaf = union(enum) {
             .chunk => false,
         };
     }
+    /// Segment-only: a buffer leaf has no fused filter to read a column the
+    /// consumer does not.
+    fn setEmitProjection(self: Leaf, keep: []const []const u8) !void {
+        switch (self) {
+            .segment => |s| try s.setEmitProjection(keep),
+            .chunk => {},
+        }
+    }
     /// Segment-only: a buffer leaf reads its stage's buffers in place.
     fn releaseScratch(self: Leaf) void {
         switch (self) {
@@ -1645,16 +1653,18 @@ pub const ParallelScan = struct {
     /// compute, each worker's chain projects to `keep`: the compute passes
     /// through the columns its expressions read, and the materialize drain
     /// (or the owned chunks a realizing consumer takes) would deep-copy them
-    /// for the whole input (issue #390). Otherwise the materialize path drops
-    /// every other output column from the survivor deep-copy — they were
-    /// decoded purely to feed a fused filter (e.g. `URL` behind `URL<>''`)
-    /// and nothing above reads them. Safe because the forwarding chain only
-    /// reaches here past a fused (pass-through) Filter; an unfused Filter
-    /// swallows the projection before it reaches us. The round (stream) path
-    /// of a scan without a compute emits the scan's already-pruned columns,
-    /// so there is nothing dead to drop. A scan that has started emitting
-    /// keeps the columns its buffers were filled with, and one that probes a
-    /// join emits the join's rows, which `keep` does not name.
+    /// for the whole input (issue #390). Otherwise every other output column
+    /// was decoded purely to feed a fused filter (e.g. `URL` behind
+    /// `URL<>''`) and nothing above reads it: table-scan workers stop
+    /// gathering its survivors (`narrowWorkers`), and where they cannot, the
+    /// materialize path drops it from the survivor deep-copy. Safe because
+    /// the forwarding chain only reaches here past a fused (pass-through)
+    /// Filter; an unfused Filter swallows the projection before it reaches
+    /// us. The round (stream) path of a scan without a compute emits the
+    /// scan's already-pruned columns, so there is nothing dead to drop. A
+    /// scan that has started emitting keeps the columns its buffers were
+    /// filled with, and one that probes a join emits the join's rows, which
+    /// `keep` does not name.
     pub fn setEmitProjection(self: *ParallelScan, keep: []const []const u8) !void {
         if (self.agg_fused or self.probe_sink != null or self.mode != .unset) return;
         if (self.compute_fused and self.emit_keep == null) {
@@ -1669,7 +1679,28 @@ pub const ParallelScan = struct {
             }
         }
         if (!self.materializesOnPull()) return;
+        if (try self.narrowWorkers(keep)) return;
         try self.applyEmitProjection(keep);
+    }
+
+    /// Hand `keep` to the table-scan workers, which then view a column only
+    /// their fused filter reads for the mask and never gather its survivors
+    /// (`Scan.setEmitProjection`, issue #502). True when they narrowed: the
+    /// scan emits their schema, so every later offer resolves against what
+    /// the workers really produce. The workers of a scan that has not
+    /// started are configured alike, so the first one decides for all.
+    fn narrowWorkers(self: *ParallelScan, keep: []const []const u8) !bool {
+        if (self.table == null or self.compute_fused or self.owns_out_schema or self.emit_keep != null) return false;
+        const wide = self.workers[0].outputSchema().len;
+        try self.workers[0].setEmitProjection(keep);
+        const narrowed = self.workers[0].outputSchema();
+        if (narrowed.len == wide) return false;
+        for (self.workers[1..]) |w| {
+            try w.setEmitProjection(keep);
+            std.debug.assert(w.outputSchema().len == narrowed.len);
+        }
+        self.out_schema = narrowed;
+        return true;
     }
 
     fn baseStats(self: *ParallelScan) exec.PipelineStats {
