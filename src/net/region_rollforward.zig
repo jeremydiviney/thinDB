@@ -24,6 +24,12 @@
 //! updated per select/alias/group node) and deep-clones every captured
 //! expression, rewriting each col_ref to the unique frame-column name it
 //! resolves to at that point.
+//!
+//! Nullability discipline: the recognizer's frame says what the statement
+//! reports for each column, by the ordinary operators' own rules, and the
+//! region's output schema takes it from there. Whether a store inside the
+//! region carries a null bitmap is a separate matter, settled by the
+//! program and the columns the ops are given (issue #498).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -890,10 +896,11 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         }
         return NoMatch;
     }
-    for (scan_schema, want[0..scan_schema.len]) |src, w| {
+    if (ctx.entry_declared_null.len != scan_schema.len) return NoMatch;
+    for (scan_schema, want[0..scan_schema.len], ctx.entry_declared_null) |src, w, declared_null| {
         if (!std.ascii.eqlIgnoreCase(src.name, w.name)) return NoMatch;
         if (!std.meta.eql(src.type, w.type)) return NoMatch;
-        if (!w.nullable) return NoMatch; // entry cols are always forced nullable
+        if (src.nullable != declared_null) return NoMatch;
     }
     for (entry_derived, want[scan_schema.len..]) |d, w| {
         if (!std.ascii.eqlIgnoreCase(d.name, w.name)) return NoMatch;
@@ -1495,6 +1502,9 @@ const Ctx = struct {
     /// drift checks, the driver opts to replay, the data-versions of every
     /// table a compile-time drain consumed, and the kernel identities.
     entry_schema: []const Column = &.{},
+    /// What the scan declared for each of its columns when the program was
+    /// compiled: the nullability its output reports follows from these.
+    entry_declared_null: []const bool = &.{},
     opts: region.DriverOpts = undefined,
     declaration: ?DeclaredBoundary = null,
     keys: []const []const u8 = &.{},
@@ -1852,8 +1862,8 @@ const Builder = struct {
             const t = typed[base + i].type;
             if (foldConst(cl.expr, t)) |fv| {
                 const idx = b.fb.cols.items.len;
-                try b.fb.cols.append(b.a, .{ .name = cl.name, .type = t, .nullable = true });
-                try const_cols.append(b.a, b.fb.cols.items[idx]);
+                try b.fb.cols.append(b.a, .{ .name = cl.name, .type = t, .nullable = typed[base + i].nullable });
+                try const_cols.append(b.a, .{ .name = cl.name, .type = t, .nullable = true });
                 try const_vals.append(b.a, fv);
                 try b.bind_compute_output(src.name, idx, replaced[i]);
                 try b.const_idxs.append(b.a, idx);
@@ -2875,33 +2885,38 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     const scan_schema = sources[0].outputSchema();
     const entry_derived = try rename_entry_outputs(input.node_arena, scan_schema, pl.entry_derived);
     const entry_schema = try a.alloc(Column, scan_schema.len + pl.entry_derived.len);
-    for (scan_schema, entry_schema[0..scan_schema.len]) |src, *dst| {
+    const reports_null = try a.alloc(bool, entry_schema.len);
+    for (scan_schema, entry_schema[0..scan_schema.len], reports_null[0..scan_schema.len]) |src, *dst, *reported| {
         dst.* = src;
         dst.name = try a.dupe(u8, src.name);
-        // Every entry column is nullable: a union-append kernel NULL-pads
-        // whatever it doesn't cover, and which columns those are depends on
-        // the variant's projection (plans carries invoiceItemId the
-        // estimates kernel never writes). The all-valid bulk append keeps
-        // the bitmap cost negligible.
+        // Every entry column's store carries a bitmap: a union-append
+        // kernel NULL-pads whatever it doesn't cover, and which columns
+        // those are depends on the variant's projection (plans carries
+        // invoiceItemId the estimates kernel never writes). The all-valid
+        // bulk append keeps the bitmap cost negligible.
         dst.nullable = true;
+        reported.* = src.nullable;
     }
     const rowloc_entry: ?usize = if (pl.entry == .scan) scan_schema.len - 1 else null;
     if (pl.entry_derived.len > 0) {
-        // Engine-exact types for the scatter-time computes; forced nullable
-        // (kernel-appended rows NULL-pad every entry-derived column).
+        // Engine-exact types for the scatter-time computes; their stores
+        // carry a bitmap too (kernel-appended rows NULL-pad every
+        // entry-derived column).
         const typed = region.computeOutputSchema(qa, a, scan_schema, entry_derived, registry) catch return NoMatch;
         if (typed.len != scan_schema.len + pl.entry_derived.len) return NoMatch;
-        for (entry_derived, typed[scan_schema.len..], entry_schema[scan_schema.len..]) |d, t, *dst| {
+        for (entry_derived, typed[scan_schema.len..], entry_schema[scan_schema.len..], reports_null[scan_schema.len..]) |d, t, *dst, *reported| {
             dst.* = .{ .name = try a.dupe(u8, d.name), .type = t.type, .nullable = true };
+            reported.* = t.nullable;
         }
     }
-    for (entry_schema, 0..) |col, i| {
-        _ = try b.fb.addColNamed(col.name, col.type, col.nullable);
+    for (entry_schema, reports_null, 0..) |col, reported, i| {
+        _ = try b.fb.addColNamed(col.name, col.type, reported);
         if (i == rowloc_entry) continue;
         const visible_name = if (i < scan_schema.len) col.name else pl.entry_derived[i - scan_schema.len].name;
         try b.fb.setVis(visible_name, i);
     }
     ctx.entry_schema = entry_schema;
+    ctx.entry_declared_null = reports_null[0..scan_schema.len];
 
     traceMark("entry_schema", &tm);
     // Literal-pinned entry columns: an eq-literal conjunct in the scan
@@ -3113,12 +3128,15 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     traceMark("prog_build", &tm);
     // Emit-column NAMES for the stage schema: the program derives them from
     // the frame (canonical); patch to the SQL-visible names the query above
-    // resolves against.
+    // resolves against. The program also says which of its stores carry a
+    // bitmap, where the stage reports what the statement does. A column it
+    // reports NOT NULL is copied out without the bitmap.
     if (ctx.prog.output_schema.len != emit_names.len) return NoMatch;
     const patched = try a.alloc(Column, ctx.prog.output_schema.len);
-    for (ctx.prog.output_schema, emit_names, patched) |src, name, *dst| {
+    for (ctx.prog.output_schema, emit_names, emit_cols, patched) |src, name, col, *dst| {
         dst.* = src;
         dst.name = name;
+        dst.nullable = b.fb.cols.items[col].nullable;
     }
     ctx.prog.output_schema = patched;
 
@@ -3553,6 +3571,10 @@ fn dispatchUnionTvf(b: *Builder, registry: *const udf_mod.UdfRegistry, u: UnionT
         .input_filter = .{ .col = win.col, .lo = win.lo, .hi = win.hi },
     } });
     for (unioned, inputs) |result, ci| b.fb.cols.items[ci] = result;
+    // The kernel's rows are NULL in every frame column it does not write.
+    for (b.fb.cols.items, 0..) |*col, ci| {
+        if (std.mem.indexOfScalar(usize, inputs, ci) == null) col.nullable = true;
+    }
 }
 
 /// Mid-stream TVF. Granularity is a kernel CONTRACT, decided by metadata:
@@ -3671,7 +3693,7 @@ fn pushReplaceTvf(b: *Builder, ent: *const udf_mod.TableEntry, t: *const ir.Op.T
     b.fb.vis.clearRetainingCapacity();
     for (ent.output_schema, out) |src, o| {
         const idx = b.fb.cols.items.len;
-        try b.fb.cols.append(a, o);
+        try b.fb.cols.append(a, .{ .name = o.name, .type = o.type, .nullable = src.nullable });
         try b.fb.setVis(src.name, idx);
     }
     b.route_name = next_route;
@@ -3725,6 +3747,12 @@ fn dispatchWindow(b: *Builder, w: *const ir.WindowOp) anyerror!void {
         try b.fb.cols.append(b.a, col);
         try b.bind_compute_output(src.output_name, idx, prior);
     }
+}
+
+/// Whether a probe reports NULLs in a payload column: the join's rule for
+/// its right side.
+fn payload_reports_null(col: Column, inner: bool) bool {
+    return col.nullable or exec.join_op.outerNullable(if (inner) .inner else .left).right;
 }
 
 /// Region probes drop NULL keys, which a null-safe key matches.
@@ -3865,8 +3893,8 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
                 }
                 if (!referenced) continue;
             }
-            const idx = try b.fb.addCol(col.name, col.type, true);
-            try ccols.append(a, b.fb.cols.items[idx]);
+            const idx = try b.fb.addCol(col.name, col.type, payload_reports_null(col, inner));
+            try ccols.append(a, .{ .name = b.fb.cols.items[idx].name, .type = col.type, .nullable = true });
             try cvals.append(a, try valueAtRow(blk.stores[ci].view(), mi));
             try b.fb.setVis(if (ralias) |al| try visKeyFor(a, al, col.name) else col.name, idx);
         }
@@ -3925,7 +3953,7 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
         for (kept.items) |ri| {
             try region.appendViewRange(a, store, src, ri, ri + 1);
         }
-        const idx = try b.fb.addCol(col.name, col.type, true);
+        const idx = try b.fb.addCol(col.name, col.type, payload_reports_null(col, inner));
         try payloads.append(a, .{
             .name = b.fb.cols.items[idx].name,
             .view = store.view(),
@@ -4118,7 +4146,7 @@ fn pushKeyedBroadcast(
             }
             if (!referenced) continue;
         }
-        const idx = try b.fb.addCol(col.name, col.type, true);
+        const idx = try b.fb.addCol(col.name, col.type, payload_reports_null(col, inner));
         try payloads.append(a, .{
             .name = b.fb.cols.items[idx].name,
             .src = ci,
@@ -4696,7 +4724,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             // key — ambiguous for every later step.
             if (!qualified_ref) continue;
         }
-        const idx = try b.fb.addCol(col.name, col.type, true);
+        const idx = try b.fb.addCol(col.name, col.type, payload_reports_null(col, false));
         try payloads.append(a, .{
             .name = b.fb.cols.items[idx].name,
             .src = ci,
@@ -5212,7 +5240,7 @@ fn pushAlignedTvf(
     for (ent.output_schema, is_pass) |col, pass| {
         if (pass) continue;
         const idx = base + oi;
-        try b.fb.cols.append(a, out[oi]);
+        try b.fb.cols.append(a, .{ .name = out[oi].name, .type = out[oi].type, .nullable = col.nullable });
         try b.fb.setVis(col.name, idx);
         oi += 1;
     }
@@ -5225,6 +5253,10 @@ fn pushAlignedTvf(
             if (b.isConstIdx(source)) try b.const_idxs.append(a, idx);
             break :blk idx;
         };
+        // The column is reported as the kernel declares it. Its values are
+        // the source's, so a NOT NULL declaration cannot take a nullable
+        // source's NULLs away.
+        b.fb.cols.items[idx].nullable = declared.nullable or b.fb.cols.items[source].nullable;
         if (std.mem.eql(u8, b.fb.cols.items[source].name, b.route_name)) b.route_name = b.fb.cols.items[idx].name;
         try b.fb.setVis(declared.name, idx);
     }
@@ -5331,6 +5363,9 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     var new_consts: std.ArrayListUnmanaged(usize) = .empty;
     var new_pinned: std.ArrayListUnmanaged(PinnedCol) = .empty;
     var route_name: ?[]const u8 = null;
+    // What the ordinary aggregate reports for each output: a key as its
+    // input column, an aggregate by its function.
+    var reports_null: std.ArrayListUnmanaged(bool) = .empty;
 
     // Group keys first (constant within their sub-group → .first).
     for (g.group_cols) |gc| {
@@ -5340,6 +5375,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
         if (b.isConstIdx(e.idx)) try new_consts.append(a, out.items.len);
         if (b.pinnedName(gc)) |value| try new_pinned.append(a, .{ .name = gc, .val = value });
         try out.append(a, .{ .name = name, .kind = .{ .first = e.idx } });
+        try reports_null.append(a, b.fb.cols.items[e.idx].nullable);
         try new_vis.append(a, .{ .name = try a.dupe(u8, gc), .idx = new_vis.items.len });
     }
     const next_route = route_name orelse return NoMatch;
@@ -5371,6 +5407,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
             else => return NoMatch,
         };
         try out.append(a, .{ .name = try nameFor(b, spec.as), .kind = kind });
+        try reports_null.append(a, aggregate_mod.aggOutputNullable(spec.func));
         try new_vis.append(a, .{ .name = try a.dupe(u8, spec.as), .idx = new_vis.items.len });
     }
 
@@ -5386,7 +5423,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
     // .first/.max_by columns whose sources we know).
     const in_cols = b.fb.cols.items;
     var new_cols: std.ArrayListUnmanaged(Column) = .empty;
-    for (out.items) |o| {
+    for (out.items, reports_null.items) |o, reported| {
         const t: types.Type = switch (o.kind) {
             .first => |c| in_cols[c].type,
             .max_by => |mb| in_cols[mb.val].type,
@@ -5395,7 +5432,7 @@ fn pushGroupAgg(b: *Builder, g: *const ir.Op.GroupBy, required: []const usize, m
             .sum_large => .largeint,
             .sum_float => .double,
         };
-        try new_cols.append(a, .{ .name = o.name, .type = t, .nullable = true });
+        try new_cols.append(a, .{ .name = o.name, .type = t, .nullable = reported });
     }
     b.fb.cols = new_cols;
     b.fb.vis = new_vis;
