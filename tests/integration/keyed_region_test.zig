@@ -90,7 +90,7 @@ fn run_to_text_checked(allocator: std.mem.Allocator, db: anytype, sql: []const u
     const schema = q.outputSchema();
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    for (schema) |col| try out.print(allocator, "{s}:{any}\n", .{ col.name, col.type });
+    for (schema) |col| try out.print(allocator, "{s}:{any}{s}\n", .{ col.name, col.type, if (col.nullable) "" else " NOT NULL" });
     while (try q.next()) |batch| {
         for (0..batch.row_count) |r| {
             for (schema, 0..) |col, ci| {
@@ -1907,7 +1907,7 @@ fn union_arm_body(comptime function: []const u8, comptime column: []const u8, co
 fn setup_pairs(allocator: std.mem.Allocator, db: *thindb.Database) !void {
     try helpers.exec(allocator, db,
         \\CREATE TABLE pairs (
-        \\  id BIGINT PRIMARY KEY, custLC VARCHAR(32), seq BIGINT,
+        \\  id BIGINT PRIMARY KEY, custLC VARCHAR(32), seq BIGINT NOT NULL,
         \\  code VARCHAR(8), label STRING, day DATE, at DATETIME,
         \\  small INT, big BIGINT, price DECIMAL(10,2), wide DECIMAL(12,4)
         \\)
@@ -1941,8 +1941,8 @@ fn expect_union_types(allocator: std.mem.Allocator, db: *thindb.Database, compti
 }
 
 // Issue #495. The kernel's rows are a UNION ALL arm, so each column is the
-// union's result type whichever path runs it. NOT NULL columns are left out
-// of these tables: a region reports every column nullable (issue #498).
+// union's result type whichever path runs it. `seq` is NOT NULL in the
+// table and nullable in the kernel's declaration.
 test "keyed region: a UNION ALL table-function arm reports the union's text type" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2048,4 +2048,134 @@ test "keyed region: SQL UNION ALL branches report the union's column types" {
             try expect_keyed_matches(allocator, db, body, "prior");
         }
     }
+}
+
+// Issue #498. A region's stores carry null bitmaps wherever a NULL can be
+// appended, which says nothing about the values: the statement reports
+// each column as the ordinary operators do.
+fn setup_events(allocator: std.mem.Allocator, db: *thindb.Database) !void {
+    try helpers.exec(allocator, db,
+        \\CREATE TABLE ev (
+        \\  id BIGINT PRIMARY KEY, custLC VARCHAR(32) NOT NULL, day DATE NOT NULL,
+        \\  amount BIGINT NOT NULL, kind BIGINT NOT NULL, note VARCHAR(16)
+        \\)
+    );
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ev VALUES
+        \\ (1,'cust_0','2025-11-30',10,1,'first'),(2,'cust_0','2025-12-01',20,2,NULL),
+        \\ (3,'cust_0','2026-01-15',30,3,'third'),(4,'cust_1','2025-12-20',40,1,NULL),
+        \\ (5,'cust_1','2026-02-28',50,2,'fifth'),(6,'cust_1','2026-03-01',60,3,'sixth'),
+        \\ (7,'cust_2','2026-03-05',70,1,'seventh'),(8,'cust_3','2026-02-01',80,2,NULL)
+    );
+    const ev = try db.openTable("ev", .{});
+    try ev.flush();
+    // No row for kind 3: an inner join drops it, a left join keeps it.
+    try helpers.exec(allocator, db, "CREATE TABLE kinds (kind BIGINT PRIMARY KEY, label VARCHAR(8) NOT NULL, hint VARCHAR(8))");
+    try helpers.exec(allocator, db, "INSERT INTO kinds VALUES (1,'one','a'),(2,'two',NULL)");
+    const kinds = try db.openTable("kinds", .{});
+    try kinds.flush();
+}
+
+fn expect_nullable(allocator: std.mem.Allocator, db: *thindb.Database, comptime body: []const u8, expected: []const bool) !void {
+    inline for (.{ "WITH ", "WITH KEYED BY (custLC) " }) |head| {
+        var query = try helpers.runSql(allocator, db, head ++ body);
+        defer query.deinit();
+        const schema = query.outputSchema();
+        try std.testing.expectEqual(expected.len, schema.len);
+        for (schema, expected) |col, nullable| try std.testing.expectEqual(nullable, col.nullable);
+        while (try query.next()) |_| {}
+    }
+}
+
+test "keyed region: NOT NULL columns stay NOT NULL through a region" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try setup_events(allocator, db);
+    const body =
+        \\w AS (
+        \\  SELECT id, custLC, day, amount, note,
+        \\         LAG(amount) OVER (PARTITION BY custLC ORDER BY day, amount) AS prior
+        \\  FROM ev
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, day, amount
+    ;
+    try expect_nullable(allocator, db, body, &.{ false, false, false, false, true, true });
+    try expect_keyed_matches(allocator, db, body, "prior");
+}
+
+test "keyed region: computes, literals, aggregates, joins and unions report what the plain statement does" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    try setup_events(allocator, db);
+    const window = "), w AS (SELECT *, LAG(amount) OVER (PARTITION BY custLC ORDER BY day, amount) AS prior FROM c) SELECT * FROM w ORDER BY custLC, day, amount";
+    // Each shape names the region op that carries it.
+    inline for (.{
+        // A literal and a compute over NOT NULL inputs are NOT NULL; one
+        // over a nullable input is not. At the region's entry they are
+        // computed as the rows are scattered; above a window they are ops.
+        .{ "c AS (SELECT custLC, day, amount, 1 AS arm, amount * 2 AS twice, CONCAT(note, '!') AS loud FROM ev" ++ window, &[_]bool{ false, false, false, false, false, true, true }, .window },
+        .{ "r AS (SELECT custLC, day, amount, note, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY day, amount) AS rn FROM ev), " ++
+            "c AS (SELECT custLC, day, amount, 1 AS arm, rn + amount AS mixed, CONCAT(note, '!') AS loud FROM r" ++ window, &[_]bool{ false, false, false, false, false, true, true }, .const_cols },
+        // A group key is as its input, an aggregate by its function.
+        .{ "c AS (SELECT custLC, day, SUM(amount) AS amount, MAX(kind) AS top, ANY_VALUE(note) AS note FROM ev GROUP BY custLC, day" ++ window, &[_]bool{ false, false, true, true, true, true }, .group_agg },
+        // An inner join keeps the payload as declared; a left join makes
+        // it nullable.
+        .{ "c AS (SELECT e.custLC, e.day, e.amount, k.label, k.hint FROM ev e INNER JOIN kinds k ON e.kind = k.kind" ++ window, &[_]bool{ false, false, false, false, true, true }, .hash_probe },
+        .{ "c AS (SELECT e.custLC, e.day, e.amount, k.label, k.hint FROM ev e LEFT JOIN kinds k ON e.kind = k.kind" ++ window, &[_]bool{ false, false, false, true, true, true }, .hash_probe },
+        // A union column is nullable when either arm's is.
+        .{ "base AS (SELECT custLC, day, amount, kind FROM ev), " ++
+            "c AS (SELECT custLC, day, amount, kind AS tag FROM base WHERE amount < 40 UNION ALL SELECT custLC, day, amount, amount AS tag FROM base WHERE amount >= 40" ++ window, &[_]bool{ false, false, false, false, true }, .union_all },
+        .{ "base AS (SELECT custLC, day, amount, kind FROM ev), " ++
+            "c AS (SELECT custLC, day, amount, kind AS tag FROM base WHERE amount < 40 UNION ALL SELECT custLC, day, amount, NULLIF(amount, 50) AS tag FROM base WHERE amount >= 40" ++ window, &[_]bool{ false, false, false, true, true }, .union_all },
+    }) |case| {
+        {
+            var query = try helpers.runSql(allocator, db, "WITH KEYED BY (custLC) " ++ case[0]);
+            defer query.deinit();
+            try std.testing.expect(regional_op_count(query.cq.query, case[2]) != 0);
+            while (try query.next()) |_| {}
+        }
+        try expect_nullable(allocator, db, case[0], case[1]);
+        try expect_keyed_matches(allocator, db, case[0], "prior");
+    }
+}
+
+// The second run of a statement reuses the compiled program. One compiled
+// over a NOT NULL column copies it out without a bitmap, so it must not
+// outlive the column's declaration.
+test "keyed region: a cached program follows a column that became nullable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    const body =
+        \\w AS (
+        \\  SELECT custLC, seq, amount, LAG(seq) OVER (PARTITION BY custLC ORDER BY seq) AS prior
+        \\  FROM facts
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, seq
+    ;
+    try helpers.exec(allocator, db, "CREATE TABLE facts (seq BIGINT PRIMARY KEY, custLC VARCHAR(32) NOT NULL, amount BIGINT NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO facts VALUES (1,'cust_0',10),(2,'cust_0',20),(3,'cust_1',30)");
+    const declared = try db.openTable("facts", .{});
+    try declared.flush();
+    try expect_nullable(allocator, db, body, &.{ false, false, false, true });
+    try expect_keyed_matches(allocator, db, body, "prior");
+
+    try helpers.exec(allocator, db, "DROP TABLE facts");
+    try helpers.exec(allocator, db, "CREATE TABLE facts (seq BIGINT PRIMARY KEY, custLC VARCHAR(32) NOT NULL, amount BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO facts VALUES (1,'cust_0',10),(2,'cust_0',NULL),(3,'cust_1',NULL)");
+    const relaxed = try db.openTable("facts", .{});
+    try relaxed.flush();
+    try expect_nullable(allocator, db, body, &.{ false, false, true, true });
+    try expect_keyed_matches(allocator, db, body, "prior");
+    const keyed = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, "prior");
+    defer allocator.free(keyed);
+    try std.testing.expect(std.mem.indexOf(u8, keyed, "cust_0|2|~|1") != null);
 }

@@ -111,6 +111,18 @@ fn nullSafeKeyMask(null_safe: []const bool) u8 {
     return mask;
 }
 
+/// The sides whose columns a join reports nullable whatever they were
+/// declared: an outer join leaves the other side NULL on the rows it
+/// preserves without a match. An inner join keeps both as declared.
+pub fn outerNullable(join_type: JoinType) struct { left: bool, right: bool } {
+    return switch (join_type) {
+        .inner => .{ .left = false, .right = false },
+        .left => .{ .left = false, .right = true },
+        .right => .{ .left = true, .right = false },
+        .full => .{ .left = true, .right = true },
+    };
+}
+
 pub const JoinType = enum {
     inner,
     /// Preserve every left row. Right-side columns are NULL when no
@@ -1656,17 +1668,7 @@ pub const Join = struct {
             if (m) right_kept_count += 1;
         }
 
-        // Outer joins: the "other" side's columns become nullable in
-        // the output (unmatched preserved rows have NULL on the other
-        // side). Inner keeps original nullability.
-        const left_nullable_in_output = switch (spec.join_type) {
-            .inner, .left => false,
-            .right, .full => true,
-        };
-        const right_nullable_in_output = switch (spec.join_type) {
-            .inner, .right => false,
-            .left, .full => true,
-        };
+        const outer = outerNullable(spec.join_type);
 
         // Compose output schema: left columns + right columns minus
         // join keys. Refuse if any NON-KEY column name collides — the
@@ -1679,7 +1681,7 @@ pub const Join = struct {
         errdefer allocator.free(output_schema);
         for (left_schema[0..left_emit], 0..) |c, i| {
             output_schema[i] = c;
-            if (left_nullable_in_output) output_schema[i].nullable = true;
+            if (outer.left) output_schema[i].nullable = true;
         }
         var out_idx: usize = left_emit;
         for (right_schema, 0..) |c, i| {
@@ -1689,7 +1691,7 @@ pub const Join = struct {
                 if (types.columnNameEql(prior.name, c.name)) return Error.JoinColumnNameCollision;
             }
             output_schema[out_idx] = c;
-            if (right_nullable_in_output) output_schema[out_idx].nullable = true;
+            if (outer.right) output_schema[out_idx].nullable = true;
             out_idx += 1;
         }
 
