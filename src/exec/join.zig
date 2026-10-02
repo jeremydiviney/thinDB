@@ -51,6 +51,7 @@ const transform = @import("../engine/transform.zig");
 
 const cell_io = @import("cell_io.zig");
 const mat_stage = @import("mat_stage.zig");
+const BlockArena = @import("../util/block_arena.zig").BlockArena;
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
@@ -1333,6 +1334,11 @@ inline fn pushPair(
 pub const Join = struct {
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
+    /// The FastTable's arrays. Not `arena`: a bump arena sizes each new
+    /// node 1.5x above everything before it, so the chain array, asked for
+    /// after the slot arrays, took a node larger than the whole table and
+    /// the build was charged about 2.5x what it holds.
+    table_arena: BlockArena,
 
     left: Query,
     right: Query,
@@ -1738,6 +1744,7 @@ pub const Join = struct {
         self.* = .{
             .allocator = allocator,
             .arena = arena,
+            .table_arena = BlockArena.init(allocator),
             .left = left_in,
             .right = right_in,
             .join_type = spec.join_type,
@@ -1885,6 +1892,7 @@ pub const Join = struct {
         }
         if (self.matched_build) |*mb| mb.deinit(self.allocator);
         if (self.skew_detector) |det| det.deinit();
+        self.table_arena.deinit();
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -2480,7 +2488,7 @@ pub const Join = struct {
         const build_key_indices = if (self.build_is_left) self.left_key_indices else self.right_key_indices;
         var key_views: [MAX_FAST_KEYS]ColumnView = undefined;
         for (build_key_indices, 0..) |ki, i| key_views[i] = self.build_views[ki];
-        const built = (try buildFastTable(self.arena.allocator(), self.allocator, key_views[0..build_key_indices.len], nullSafeKeyMask(self.null_safe_keys), self.build_rows, self.join_type == .full, defaultBuildThreads())) orelse return;
+        const built = (try buildFastTable(self.table_arena.allocator(), self.allocator, key_views[0..build_key_indices.len], nullSafeKeyMask(self.null_safe_keys), self.build_rows, self.join_type == .full, defaultBuildThreads())) orelse return;
         self.fast_table = built.table;
         if (!built.keys_unique) self.build_keys_unique = false;
     }
@@ -3688,6 +3696,21 @@ test "join: FastTable build is identical with threaded digests" {
         try expectSameFastTable(serial, threaded);
         try std.testing.expect(!serial.keys_unique);
     }
+}
+
+test "join: a FastTable in a block arena holds exactly its arrays" {
+    const allocator = std.testing.allocator;
+    const n: u32 = PARALLEL_INSERT_MIN_ROWS + 99;
+    const vals = try allocator.alloc(i64, n);
+    defer allocator.free(vals);
+    for (vals, 0..) |*v, i| v.* = @intCast(i / 2);
+    const key = ColumnView{ .data = .{ .bigint = vals } };
+
+    var arena = BlockArena.init(allocator);
+    defer arena.deinit();
+    const built = (try buildFastTable(arena.allocator(), allocator, &.{key}, 0, n, false, 4)).?;
+    try std.testing.expect(!built.keys_unique);
+    try std.testing.expectEqual(fastTableBytes(n, false), arena.queryCapacity());
 }
 
 test "join: FastTable ranged parallel build finds every key" {
