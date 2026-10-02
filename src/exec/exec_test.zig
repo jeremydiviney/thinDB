@@ -1464,6 +1464,92 @@ test "parallel scan: a filtered drain past its wave bound hands over what it has
     }
 }
 
+// Issue #502. A column only the fused filter reads is viewed for the mask and
+// never gathered: once the projection above declares its reads, the scan
+// stops emitting it. `tag <> ''` takes the block-sourced filter, `tag IS NOT
+// NULL` the borrowed-view one; the memtable tail goes through neither.
+test "scan: a column only its fused filter reads is not gathered" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "tag", .type = .string, .nullable = true },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    const Row = struct { id: i64, tag: ?[]const u8, v: i32 };
+    const tags = [_]?[]const u8{ null, "", "red", "green", "blue" };
+    const total = 430;
+    var next_id: i64 = 0;
+    for (0..5) |part| {
+        var rows: [100]Row = undefined;
+        const n: usize = if (part < 4) 100 else 30;
+        for (rows[0..n]) |*r| {
+            r.* = .{ .id = next_id, .tag = tags[@intCast(@mod(next_id, 5))], .v = @intCast(@mod(next_id, 7)) };
+            next_id += 1;
+        }
+        try t.insert(rows[0..n]);
+        if (part < 4) try t.flush();
+    }
+
+    const cases = .{
+        .{ .expr = leafExpr("tag", .neq, .{ .text = "" }), .keeps_from = 2, .guided = true },
+        .{ .expr = exec.isNotNullExpr("tag"), .keeps_from = 1, .guided = false },
+    };
+    const projections = .{ &[_][]const u8{"id"}, &[_][]const u8{ "v", "id" } };
+
+    inline for (cases) |case| {
+        var want: std.ArrayList(i64) = .empty;
+        defer want.deinit(allocator);
+        for (0..total) |id| {
+            if (id % 5 >= case.keeps_from) try want.append(allocator, @intCast(id));
+        }
+        inline for (projections) |keep| {
+            inline for (.{ 0, 1, 4 }) |dop| {
+                var base = if (dop == 0) try scan(allocator, t) else try exec.ParallelScan.create(allocator, t, null, null, dop);
+                const leaf: *exec.Scan = if (dop == 0) exec.queryAs(exec.Scan, base).? else exec.queryAs(exec.ParallelScan, base).?.workers[0].segment;
+                var filtered = try base.filter(case.expr);
+                var q = try filtered.project(keep);
+                defer q.deinit();
+
+                var got: std.ArrayList(i64) = .empty;
+                defer got.deinit(allocator);
+                while (try q.next()) |b| {
+                    try std.testing.expectEqual(keep.len, b.values.len);
+                    const id_col = types.findColumn(b.schema, "id").?;
+                    const ids = b.values[id_col].data.bigint[0..b.row_count];
+                    if (keep.len == 2) {
+                        for (ids, b.values[0].data.int[0..b.row_count]) |id, v| try std.testing.expectEqual(@as(i32, @intCast(@mod(id, 7))), v);
+                    }
+                    try got.appendSlice(allocator, ids);
+                }
+                std.sort.pdq(i64, got.items, {}, std.sort.asc(i64));
+                try std.testing.expectEqualSlices(i64, want.items, got.items);
+
+                try std.testing.expectEqual(keep.len, leaf.out_phys.len);
+                try std.testing.expectEqualSlices(usize, &.{1}, leaf.filter_phys);
+                // A parallel worker has released its survivor buffers by now.
+                if (leaf.filtered) |gathered| try std.testing.expectEqual(keep.len, gathered.len);
+                try std.testing.expectEqual(case.guided, leaf.rgs_guided > 0);
+            }
+        }
+    }
+}
+
 const SlotHolder = struct {
     sched: *core_scheduler.CoreScheduler,
     release: *std.atomic.Value(bool),
