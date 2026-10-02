@@ -38,6 +38,7 @@ const project_limit = @import("project_limit.zig");
 const types = @import("../types.zig");
 const engine = @import("../engine/engine.zig");
 const storage = @import("../storage/storage.zig");
+const BlockArena = @import("../util/block_arena.zig").BlockArena;
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -80,7 +81,7 @@ pub const MaterializedResult = struct {
     /// allocator.
     pub const Adopted = struct {
         stores: []engine.ColumnStore,
-        arenas: []std.heap.ArenaAllocator,
+        arenas: []BlockArena,
         arena_backed: []bool,
         store_alloc: ?Allocator = null,
     };
@@ -204,7 +205,7 @@ pub const MaterializedResult = struct {
         const backed = try self.allocator.alloc(bool, oc.chunks.len * ncols);
         errdefer self.allocator.free(backed);
         @memset(backed, false);
-        const arenas = try self.allocator.alloc(std.heap.ArenaAllocator, 0);
+        const arenas = try self.allocator.alloc(BlockArena, 0);
         errdefer self.allocator.free(arenas);
 
         var added: u64 = 0;
