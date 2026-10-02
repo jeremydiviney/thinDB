@@ -5,14 +5,16 @@
 #
 # A runner whose job starves it loses contact with GitHub and takes the whole
 # log with it, and a test that only hangs runs to the job timeout and says
-# nothing. So past $TEST_WATCHDOG_SECONDS (default 1800; a green run takes
-# 10 to 15 minutes), or with under 1 GiB of memory left, this prints the
-# process table and every thread's stack in each test binary, then aborts the
-# binaries. `zig build` then reports the step with the output it captured,
-# which ends at the name of the test that was running.
+# nothing. So past $TEST_WATCHDOG_SECONDS, or with under 1 GiB of memory left,
+# this prints the process table and every thread's stack in each test binary,
+# then aborts the binaries. `zig build` then reports the step with the output
+# it captured, which ends at the name of the test that was running.
 set -uo pipefail
 
-limit_s=${TEST_WATCHDOG_SECONDS:-1800}
+# A green run takes 8 to 15 minutes on the Linux runners and over 30 on the
+# macOS one, where this limit at 1800 stopped a healthy run.
+if [ "$(uname)" = Darwin ]; then default_limit_s=3600; else default_limit_s=1800; fi
+limit_s=${TEST_WATCHDOG_SECONDS:-$default_limit_s}
 min_avail_kb=$((1024 * 1024))
 
 available_kb() {
