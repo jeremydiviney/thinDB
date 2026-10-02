@@ -423,6 +423,53 @@ test "reclaim releases the largest idle blocks first and stops once the request 
     a.free(again);
 }
 
+test "reclaim alongside workers allocating and freeing keeps the free lists and the idle count in step" {
+    var pool = Pool.init(std.testing.allocator, default_cap_bytes);
+    defer pool.drain();
+    const a = pool.allocator();
+
+    const Worker = struct {
+        fn run(alloc: Allocator) void {
+            var i: usize = 0;
+            while (i < 300) : (i += 1) {
+                const n = 64 * 1024 + (i % 7) * 100 * 1024;
+                const buf = alloc.alloc(u8, n) catch return;
+                buf[0] = 1;
+                buf[n - 1] = 2;
+                alloc.free(buf);
+            }
+        }
+    };
+    const Reclaimer = struct {
+        fn run(p: *Pool, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                _ = p.reclaim(300 * 1024);
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const reclaimer = try std.Thread.spawn(.{}, Reclaimer.run, .{ &pool, &stop });
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    errdefer {
+        for (threads[0..started]) |t| t.join();
+        stop.store(true, .release);
+        reclaimer.join();
+    }
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{a});
+        started += 1;
+    }
+    for (threads) |t| t.join();
+    stop.store(true, .release);
+    reclaimer.join();
+
+    var listed: usize = 0;
+    for (&pool.classes, 0..) |*cls, i| listed += cls.count * Pool.classSize(i);
+    try std.testing.expectEqual(listed, pool.retained_bytes.load(.monotonic));
+}
+
 test "ArrayList growth across the bypass/pool boundary stays consistent" {
     // The original integration crash: a small (bypass) buffer grown in place by
     // the backing across 64 KiB into pool range, then freed AS a pool block —
