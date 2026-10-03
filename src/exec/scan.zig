@@ -1777,8 +1777,18 @@ pub const Scan = struct {
                 .global = global,
             },
             .column_stats = if (pruned) |b| b.stats else self.cached_stats,
-            .row_origin = .{ .snapshot = self.snapshot_id, .rows = snapshot_rows },
+            .row_origin = .{ .snapshot = self.snapshot_id, .rows = snapshot_rows, .key_column = uniqueKeyColumn(self.table) },
         };
+    }
+
+    /// A unique table's single-column NOT NULL key: an insert resolves a
+    /// key already present last writer wins, so no two rows of a snapshot
+    /// share its value.
+    fn uniqueKeyColumn(table: *const Table) ?u32 {
+        if (!table.schema.unique or table.order_key_indices.len != 1) return null;
+        const ci = table.order_key_indices[0];
+        if (table.schema.columns[ci].nullable) return null;
+        return @intCast(ci);
     }
 
     /// `VTable.sampleWidths`: each string column this scan reads, sampled
