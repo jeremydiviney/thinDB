@@ -41,8 +41,6 @@ pub fn ticksToMs(ticks: i64, freq: i64) f64 {
 }
 
 const WinAffinity = if (builtin.os.tag == .windows) struct {
-    extern "kernel32" fn GetCurrentThread() callconv(.winapi) win.HANDLE;
-    extern "kernel32" fn SetThreadAffinityMask(hThread: win.HANDLE, mask: usize) callconv(.winapi) usize;
     extern "kernel32" fn GetLogicalProcessorInformation(buf: ?[*]LogicalProcInfo, len: *u32) callconv(.winapi) win.BOOL;
 } else struct {};
 
@@ -103,22 +101,4 @@ pub fn cpuLayout(allocator: Allocator) !CpuLayout {
         .order = try primaries.toOwnedSlice(allocator),
         .physical_count = physical_count,
     };
-}
-
-pub fn pinToCpu(cpu: usize) void {
-    switch (builtin.os.tag) {
-        .windows => {
-            if (cpu < @bitSizeOf(usize)) {
-                _ = WinAffinity.SetThreadAffinityMask(WinAffinity.GetCurrentThread(), @as(usize, 1) << @intCast(cpu));
-            }
-        },
-        .linux => {
-            var set: std.os.linux.cpu_set_t = @splat(0);
-            if (cpu < @bitSizeOf(std.os.linux.cpu_set_t)) {
-                set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
-                std.os.linux.sched_setaffinity(0, &set) catch {};
-            }
-        },
-        else => {},
-    }
 }

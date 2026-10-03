@@ -11,8 +11,13 @@
 //! The CoreScheduler only PINS on Windows (core_scheduler.PIN_THREADS): Linux
 //! child threads inherit the spawner's affinity mask, so pinning a thread that
 //! spawns workers traps them all on its core. pinCurrentThread/unpinCurrentThread
-//! keep their Linux arms for explicit child-side pinning (platform.pinToCpu-style
-//! callers that pin themselves at worker entry, which is inheritance-safe).
+//! keep their Linux arms for explicit child-side pinning (a worker that pins
+//! itself at entry, which is inheritance-safe).
+//!
+//! Only core leases pin. A thread held to one logical CPU waits out whatever
+//! else runs there, and every peer joined on it waits too: the group top-N
+//! workspace helpers, once pinned that way, stalled a 0.3 s operator for up to
+//! 5 s on an otherwise idle machine (#525).
 //!
 //! Mask model: a "core" is one physical core, identified by the bitmask of the
 //! logical CPUs that belong to it (1 bit non-SMT, 2 bits with hyperthreading).

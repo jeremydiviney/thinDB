@@ -2579,7 +2579,6 @@ pub const SiloGridWorkspace = struct {
                 .allocator = allocator,
                 .worker_index = i,
                 .worker_count = workers,
-                .cpu = if (cpus.len == 0) null else cpus[i % cpus.len],
                 .profile = profile,
             };
             threads[i] = std.Thread.spawn(.{}, workspaceDeinitWorker, .{&jobs[i]}) catch unreachable;
@@ -2677,7 +2676,6 @@ pub const SiloGridWorkspace = struct {
                 .allocator = allocator,
                 .worker_index = i,
                 .worker_count = workers,
-                .cpu = if (cpus.len == 0) null else cpus[i % cpus.len],
             };
             threads[i] = try std.Thread.spawn(.{}, workspaceResetWorker, .{&jobs[i]});
         }
@@ -2690,7 +2688,6 @@ const WorkspaceResetJob = struct {
     allocator: Allocator,
     worker_index: usize,
     worker_count: usize,
-    cpu: ?usize,
 };
 
 const WorkspaceDeinitJob = struct {
@@ -2698,13 +2695,11 @@ const WorkspaceDeinitJob = struct {
     allocator: Allocator,
     worker_index: usize,
     worker_count: usize,
-    cpu: ?usize,
     profile: ?*WorkspaceProfile = null,
 };
 
 fn workspaceDeinitWorker(job: *WorkspaceDeinitJob) void {
     const total_t0 = if (job.profile != null) platform.nowTicks() else 0;
-    if (job.cpu) |cpu| platform.pinToCpu(cpu);
     const part_t0 = if (job.profile != null) platform.nowTicks() else 0;
     var part_i = job.worker_index;
     while (part_i < job.workspace.parts.len) : (part_i += job.worker_count) {
@@ -2730,7 +2725,6 @@ fn workspaceDeinitWorker(job: *WorkspaceDeinitJob) void {
 }
 
 fn workspaceResetWorker(job: *WorkspaceResetJob) void {
-    if (job.cpu) |cpu| platform.pinToCpu(cpu);
     var part_i = job.worker_index;
     while (part_i < job.workspace.parts.len) : (part_i += job.worker_count) {
         resetWorkerParts(&job.workspace.parts[part_i], part_i);
@@ -2755,7 +2749,6 @@ const WorkspaceFreshInitJob = struct {
     expected_groups_per_bucket: usize,
     worker_index: usize,
     worker_count: usize,
-    cpu: ?usize,
     profile: ?*WorkspaceProfile = null,
     err: ?anyerror = null,
 };
@@ -2818,7 +2811,6 @@ fn initWorkspaceFreshParallel(
             .expected_groups_per_bucket = expected_groups_per_bucket,
             .worker_index = i,
             .worker_count = workers,
-            .cpu = if (cpus.len == 0) null else cpus[i % cpus.len],
             .profile = profile,
         };
         threads[i] = try std.Thread.spawn(.{}, workspaceFreshInitWorker, .{&jobs[i]});
@@ -2832,7 +2824,6 @@ fn initWorkspaceFreshParallel(
 
 fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
     const total_t0 = if (job.profile != null) platform.nowTicks() else 0;
-    if (job.cpu) |cpu| platform.pinToCpu(cpu);
 
     const part_t0 = if (job.profile != null) platform.nowTicks() else 0;
     if (job.worker_index < job.parts.len) {
