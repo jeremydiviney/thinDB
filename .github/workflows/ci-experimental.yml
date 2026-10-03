@@ -1,0 +1,71 @@
+name: ci-experimental
+
+# The same suite on Linux ARM64 and macOS Apple Silicon, on native runners.
+# They gate nothing until they prove green, so they live outside ci: release
+# chains on ci finishing, and a macOS run takes about twice as long as the
+# blocking jobs. Promote a target by moving its matrix entry into ci.yml.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-experimental-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test-unix:
+    name: test-${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            zig_arch_os: aarch64-linux
+          - name: macos-aarch64
+            runner: macos-latest
+            zig_arch_os: aarch64-macos
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Zig ${{ env.ZIG_VERSION }} download
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-${{ matrix.zig_arch_os }}-${{ env.ZIG_VERSION }}.tar.xz
+          key: zig-download-${{ matrix.zig_arch_os }}-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: bash .github/scripts/install-zig.sh ${{ matrix.zig_arch_os }}
+
+      - name: Cache zig build cache
+        uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-cache-${{ matrix.name }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: zig-cache-${{ matrix.name }}-${{ env.ZIG_VERSION }}-
+
+      - name: Run test suite
+        run: bash .github/scripts/test-watchdog.sh
+
+      - name: Server SIGTERM smoke
+        run: |
+          zig build
+          ./zig-out/bin/thindb-server --data-dir "$RUNNER_TEMP/smoke-db" \
+            --mysql-port 13311 --pg-port 0 --native-port 0 &
+          pid=$!
+          sleep 3
+          kill -0 "$pid"
+          kill -TERM "$pid"
+          for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || { echo "clean exit after SIGTERM"; exit 0; }
+            sleep 0.5
+          done
+          echo "::error::thindb-server did not exit within 10s of SIGTERM"
+          kill -9 "$pid"
+          exit 1

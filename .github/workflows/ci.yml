@@ -1,11 +1,11 @@
 name: ci
 
 # Test suite on every push to every branch (and PRs). Windows and Linux
-# x86-64 are blocking gates (suite green on both, 1373/1376, since the _xa
-# iterate fix). Linux ARM64 and macOS Apple Silicon run the same suite on
-# native runners but are non-blocking (experimental) until they prove green —
-# same promotion path Linux took. macOS Intel is build-only (runner class
-# retired by GitHub; least important target).
+# x86-64 are the blocking gates, and release chains on this workflow
+# finishing. Linux ARM64 and macOS Apple Silicon run the same suite in
+# ci-experimental.yml until they prove green, so their longer runs never
+# hold up a release. macOS Intel is build-only (runner class retired by
+# GitHub; least important target).
 
 on:
   push:
@@ -74,7 +74,6 @@ jobs:
     name: test-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
@@ -82,15 +81,6 @@ jobs:
           - name: linux-x86_64
             runner: ubuntu-latest
             zig_arch_os: x86_64-linux
-            experimental: false
-          - name: linux-aarch64
-            runner: ubuntu-24.04-arm
-            zig_arch_os: aarch64-linux
-            experimental: true
-          - name: macos-aarch64
-            runner: macos-latest
-            zig_arch_os: aarch64-macos
-            experimental: true
     steps:
       - uses: actions/checkout@v7
 
