@@ -848,21 +848,33 @@ pub fn isLeapYear(year: i32) bool {
     return @rem(year, 400) == 0;
 }
 
-test "daysToYmd round-trips ymdToDays and matches std decomposition" {
-    // Walk every day from 1970-01-01 through 9999-12-31; daysToYmd must be the
-    // exact inverse of ymdToDays and agree with std's (slow) year-by-year scan.
+test "daysToYmd round-trips ymdToDays and matches std's calendar" {
+    // Walk every day from 1970-01-01 through 9999-12-31 beside a calendar
+    // advanced a day at a time by std's month lengths; daysToYmd must agree
+    // with it and be the exact inverse of ymdToDays. (std's EpochDay scans
+    // year by year for each day, which took most of a minute here.)
+    var year: std.time.epoch.Year = 1970;
+    var month: u4 = 1;
+    var day: u5 = 1;
     var days: i32 = 0;
     const last = ymdToDays(9999, 12, 31);
     while (days <= last) : (days += 1) {
         const ymd = daysToYmd(days);
         try std.testing.expectEqual(days, ymdToDays(ymd.year, ymd.month, ymd.day));
+        try std.testing.expectEqual(@as(i32, year), ymd.year);
+        try std.testing.expectEqual(month, ymd.month);
+        try std.testing.expectEqual(day, ymd.day);
 
-        const u_days: u47 = @intCast(days);
-        const yd = (std.time.epoch.EpochDay{ .day = u_days }).calculateYearDay();
-        const md = yd.calculateMonthDay();
-        try std.testing.expectEqual(@as(i32, yd.year), ymd.year);
-        try std.testing.expectEqual(md.month.numeric(), ymd.month);
-        try std.testing.expectEqual(md.day_index + 1, ymd.day);
+        if (day < std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) {
+            day += 1;
+        } else if (month < 12) {
+            day = 1;
+            month += 1;
+        } else {
+            day = 1;
+            month = 1;
+            year += 1;
+        }
     }
 }
 

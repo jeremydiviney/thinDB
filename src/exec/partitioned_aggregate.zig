@@ -1622,9 +1622,8 @@ const BatchListScan = struct {
     }
 };
 
-fn testFormatRow(allocator: Allocator, b: Batch, row: usize) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+fn testFormatRow(allocator: Allocator, out: *std.ArrayList(u8), b: Batch, row: usize) !void {
+    out.clearRetainingCapacity();
     for (b.values, 0..) |v, ci| {
         if (ci > 0) try out.append(allocator, '|');
         if (!v.isValid(row)) {
@@ -1640,7 +1639,6 @@ fn testFormatRow(allocator: Allocator, b: Batch, row: usize) ![]u8 {
             else => try out.print(allocator, "{d}", .{testReadI128(v, row)}),
         }
     }
-    return out.toOwnedSlice(allocator);
 }
 
 fn testFreeLines(allocator: Allocator, lines: [][]u8) void {
@@ -1656,9 +1654,15 @@ fn testCollectLines(allocator: Allocator, q: *Query) ![][]u8 {
         for (lines.items) |line| allocator.free(line);
         lines.deinit(allocator);
     }
+    // One scratch buffer for every row and one exact copy per line: growing
+    // each line from empty cost several reallocations a row, and the testing
+    // allocator records a stack trace for each.
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
     while (try q.next()) |b| {
         for (0..b.row_count) |row| {
-            const line = try testFormatRow(allocator, b, row);
+            try testFormatRow(allocator, &scratch, b, row);
+            const line = try allocator.dupe(u8, scratch.items);
             errdefer allocator.free(line);
             try lines.append(allocator, line);
         }
