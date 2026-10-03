@@ -280,10 +280,16 @@ fn stringViewOf(v: ColumnView) storage.StringView {
 /// never routes on floats (bit-pattern hashing vs value equality); any
 /// other unhashable type degrades to one shard, which is correct, just
 /// unbalanced.
-fn routeKeyBytes(v: ColumnView, r: usize) []const u8 {
+/// Integers hash as their i64 value (through `wide`), so a side whose route
+/// column is stored at another width still co-locates every equal key.
+fn routeKeyBytes(v: ColumnView, r: usize, wide: *i64) []const u8 {
     return switch (v.data) {
         .varchar, .string, .char, .json => |s| s.rowBytes(r),
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
+        inline .tinyint, .smallint, .int, .bigint => |s| blk: {
+            wide.* = s[r];
+            break :blk std.mem.asBytes(wide);
+        },
+        inline .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
     };
 }
 
@@ -408,9 +414,10 @@ pub const Exchange = struct {
             const ex = self.ex;
             for (self.idx) |*l| l.clearRetainingCapacity();
             const kv = batch.values[ex.key_col];
+            var wide: i64 = undefined;
             for (0..batch.row_count) |r| {
                 if (keep) |k| if (!k[r]) continue;
-                const key: []const u8 = if (kv.isValid(r)) routeKeyBytes(kv, r) else "";
+                const key: []const u8 = if (kv.isValid(r)) routeKeyBytes(kv, r, &wide) else "";
                 const shard = std.hash.Wyhash.hash(HASH_SEED, key) % ex.n_shards;
                 try self.idx[shard].append(ex.alloc, @intCast(r));
             }
@@ -857,7 +864,23 @@ pub const StrInterner = std.StringHashMapUnmanaged(u32);
 /// text-build equi-join (the report table stores externalPlanId as int, the
 /// plan catalog as text) — build strings parse to i64; unparsable build
 /// rows can never match an int and drop from the map.
-pub const KeyedPairKind = enum { int, str, int_from_str_build };
+///
+/// `date_from_datetime_build` / `datetime_from_date_build`: a DATE meets a
+/// DATETIME as midnight of its day. Days and microseconds are different
+/// units, so the build value converts to the probe's (`buildKeyInProbeUnit`)
+/// and the probe side reads its column verbatim.
+pub const KeyedPairKind = enum { int, str, int_from_str_build, date_from_datetime_build, datetime_from_date_build };
+
+/// Integer build key `raw` in the unit the probe column compares in; null
+/// when no probe value can equal it (a DATETIME off midnight against a DATE
+/// probe, or a day count past the DATETIME range).
+pub fn buildKeyInProbeUnit(kind: KeyedPairKind, raw: i64) ?i64 {
+    return switch (kind) {
+        .int, .int_from_str_build, .str => raw,
+        .date_from_datetime_build => if (@mod(raw, std.time.us_per_day) == 0) @divExact(raw, std.time.us_per_day) else null,
+        .datetime_from_date_build => std.math.mul(i64, raw, std.time.us_per_day) catch null,
+    };
+}
 pub const KeyedPair = struct {
     /// Frame column (probe side).
     probe: usize,
@@ -1306,6 +1329,8 @@ pub const Program = struct {
                     for (k.pairs) |p| {
                         switch (p.kind) {
                             .int, .int_from_str_build => try requireIntFamily(in, p.probe),
+                            .date_from_datetime_build => if (in[try checkCol(in, p.probe)].type != .date) return error.UnsupportedQueryShape,
+                            .datetime_from_date_build => if (in[try checkCol(in, p.probe)].type != .datetime) return error.UnsupportedQueryShape,
                             .str => switch (in[try checkCol(in, p.probe)].type) {
                                 .varchar, .string, .char => {},
                                 else => return error.UnsupportedQueryShape,
@@ -2662,6 +2687,10 @@ pub const RegionWorker = struct {
                         const v = views[p.build];
                         switch (p.kind) {
                             .int => key[pi] = intAt(v, i) orelse continue :rows,
+                            .date_from_datetime_build, .datetime_from_date_build => {
+                                const raw = intAt(v, i) orelse continue :rows;
+                                key[pi] = buildKeyInProbeUnit(p.kind, raw) orelse continue :rows;
+                            },
                             .int_from_str_build => {
                                 if (!v.isValid(i)) continue :rows;
                                 const bytes = stringViewOf(v).rowBytes(i);
@@ -2701,7 +2730,7 @@ pub const RegionWorker = struct {
             for (k.pairs, 0..) |p, pi| {
                 const v = fr.views[p.probe];
                 switch (p.kind) {
-                    .int, .int_from_str_build => key[pi] = intAt(v, i) orelse {
+                    .int, .int_from_str_build, .date_from_datetime_build, .datetime_from_date_build => key[pi] = intAt(v, i) orelse {
                         ords[i] = NO_MATCH;
                         continue :rows;
                     },

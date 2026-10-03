@@ -3928,13 +3928,20 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
         for (live_right.items) |rci| {
             if (isStringFamilyType(blk.schema[rci].type)) needs_keyed = true;
         }
+        if (!needs_keyed) {
+            const probe = try b.resolveIdx(live_left.items[0]);
+            const pt = b.fb.cols.items[probe].type;
+            const bt = blk.schema[live_right.items[0]].type;
+            const kind = keyedPairKind(pt, bt) orelse {
+                sideTrace("broadcast integer probe needs compatible types: {s}, {s}", .{ @tagName(pt), @tagName(bt) });
+                return NoMatch;
+            };
+            // The integer map holds build words verbatim; a pair that
+            // converts units takes the keyed form.
+            needs_keyed = kind != .int;
+        }
         if (needs_keyed) {
             return pushKeyedBroadcast(b, ralias, blk, inner, live, pin_right.items, pin_vals.items, live_left.items, live_right.items, key_right);
-        }
-        const probe = try b.resolveIdx(live_left.items[0]);
-        if (!isIntFamilyType(b.fb.cols.items[probe].type) or !isIntFamilyType(blk.schema[live_right.items[0]].type)) {
-            sideTrace("broadcast integer probe needs compatible types: {s}, {s}", .{ @tagName(b.fb.cols.items[probe].type), @tagName(blk.schema[live_right.items[0]].type) });
-            return NoMatch;
         }
     }
 
@@ -4073,7 +4080,24 @@ fn pinMatches(v: ColumnView, i: usize, want: Value) !bool {
         else => {
             const got = i64At(v, i) orelse return false;
             const want_i = valueI64(want) orelse return NoMatch;
-            return got == want_i;
+            const kind: region.KeyedPairKind = switch (want) {
+                .date => switch (v.data) {
+                    .date => .int,
+                    .datetime => .date_from_datetime_build,
+                    else => return NoMatch,
+                },
+                .datetime => switch (v.data) {
+                    .datetime => .int,
+                    .date => .datetime_from_date_build,
+                    else => return NoMatch,
+                },
+                else => switch (v.data) {
+                    .date, .datetime => return NoMatch,
+                    else => .int,
+                },
+            };
+            const got_in_want_unit = region.buildKeyInProbeUnit(kind, got) orelse return false;
+            return got_in_want_unit == want_i;
         },
     }
 }
@@ -4112,13 +4136,7 @@ fn pushKeyedBroadcast(
         };
         const pt = b.fb.cols.items[probe].type;
         const bt = blk.schema[rci].type;
-        const kind: region.KeyedPairKind = if (isIntFamilyType(pt) and isIntFamilyType(bt))
-            .int
-        else if (isStringFamilyType(pt) and isStringFamilyType(bt))
-            .str
-        else if (isIntFamilyType(pt) and isStringFamilyType(bt))
-            .int_from_str_build
-        else {
+        const kind = keyedPairKind(pt, bt) orelse {
             sideTrace("broadcast pair '{s}' type mismatch ({s} vs {s})", .{ ln, @tagName(pt), @tagName(bt) });
             return NoMatch;
         };
@@ -4145,6 +4163,10 @@ fn pushKeyedBroadcast(
             const v = views[p.build];
             switch (p.kind) {
                 .int => key[pi] = i64At(v, i) orelse continue :rows,
+                .date_from_datetime_build, .datetime_from_date_build => {
+                    const raw = i64At(v, i) orelse continue :rows;
+                    key[pi] = region.buildKeyInProbeUnit(p.kind, raw) orelse continue :rows;
+                },
                 .int_from_str_build => {
                     const bytes = strBytesAt(v, i) orelse continue :rows;
                     key[pi] = std.fmt.parseInt(i64, bytes, 10) catch continue :rows;
@@ -4203,6 +4225,10 @@ fn pushKeyedBroadcast(
                 }
                 const key = switch (p.kind) {
                     .int => i64At(bv, i) orelse continue :rows,
+                    .date_from_datetime_build, .datetime_from_date_build => k: {
+                        const raw = i64At(bv, i) orelse continue :rows;
+                        break :k region.buildKeyInProbeUnit(p.kind, raw) orelse continue :rows;
+                    },
                     .int_from_str_build => k: {
                         const bytes = strBytesAt(bv, i) orelse continue :rows;
                         break :k std.fmt.parseInt(i64, bytes, 10) catch continue :rows;
@@ -4261,6 +4287,43 @@ fn pushKeyedBroadcast(
         .payload = payloads.items,
         .inner = inner,
     } });
+}
+
+/// How a probe/build ON pair compares in a keyed map; null when the region
+/// has no comparison for the two types and the join stays in ordinary
+/// execution, which converts the keys to a common type.
+fn keyedPairKind(probe: types.Type, build: types.Type) ?region.KeyedPairKind {
+    if (isIntegerType(probe) and isIntegerType(build)) return .int;
+    if (isStringFamilyType(probe) and isStringFamilyType(build)) return .str;
+    if (isIntegerType(probe) and isStringFamilyType(build)) return .int_from_str_build;
+    return switch (probe) {
+        .date => switch (build) {
+            .date => .int,
+            .datetime => .date_from_datetime_build,
+            else => null,
+        },
+        .datetime => switch (build) {
+            .datetime => .int,
+            .date => .datetime_from_date_build,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// Whether the exchange hashes equal keys of the two route column types to
+/// the same bytes (integers widen to i64, text hashes its bytes).
+fn sameRouteEncoding(frame: types.Type, side: types.Type) bool {
+    if (isIntegerType(frame) and isIntegerType(side)) return true;
+    if (isStringFamilyType(frame) and isStringFamilyType(side)) return true;
+    return std.meta.eql(frame, side);
+}
+
+fn isIntegerType(t: types.Type) bool {
+    return switch (t) {
+        .tinyint, .smallint, .int, .bigint => true,
+        else => false,
+    };
 }
 
 fn isIntFamilyType(t: types.Type) bool {
@@ -4729,6 +4792,15 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
 
     const spec = &b.ctx.side_specs.items[side_idx.?];
 
+    // Both exchanges hash their own route column's bytes; equal keys only
+    // land in one shard when the two columns encode them alike.
+    const frame_route_type = b.fb.cols.items[route_idx].type;
+    const side_route_type = spec.pre_schema[spec.key_col].type;
+    if (!sameRouteEncoding(frame_route_type, side_route_type)) {
+        sideTrace("route columns encode keys differently ({s} vs {s})", .{ @tagName(frame_route_type), @tagName(side_route_type) });
+        return NoMatch;
+    }
+
     // Key pairs: every ON pair keys the map (pinned pairs included — the
     // frame carries their column, constant or not).
     const pairs = try a.alloc(region.KeyedPair, j.on.len);
@@ -4742,13 +4814,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
         };
         const pt = b.fb.cols.items[probe].type;
         const bt = spec.schema[build].type;
-        const kind: region.KeyedPairKind = if (isIntFamilyType(pt) and isIntFamilyType(bt))
-            .int
-        else if (isStringFamilyType(pt) and isStringFamilyType(bt))
-            .str
-        else if (isIntFamilyType(pt) and isStringFamilyType(bt))
-            .int_from_str_build
-        else {
+        const kind = keyedPairKind(pt, bt) orelse {
             sideTrace("pair '{s}'/'{s}' type mismatch ({s} vs {s})", .{ pair.left, pair.right, @tagName(pt), @tagName(bt) });
             return NoMatch;
         };
