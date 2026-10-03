@@ -24,6 +24,7 @@ const store_mod = @import("../engine/store.zig");
 const ColumnStore = store_mod.ColumnStore;
 const exec = @import("exec.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
+const SlabArena = @import("../util/slab_arena.zig").SlabArena;
 const Batch = exec.Batch;
 const compute_mod = @import("compute.zig");
 const single_batch = @import("single_batch.zig");
@@ -38,6 +39,12 @@ const HASH_SEED: u64 = 0x9e3779b9;
 /// Bucket refs pack (worker, row) into a u32; buckets stay far below this.
 const REF_ROW_BITS = 24;
 const REF_ROW_MASK: u32 = (1 << REF_ROW_BITS) - 1;
+/// Buffers one ColumnStore can hold (validity, string offsets, bytes, wide
+/// offsets); each may need alignment padding inside a compacted slab.
+const MAX_BUFFERS_PER_STORE = 4;
+/// Growth history a worker's arena may hold before its buckets are worth a
+/// copy (`Exchange.compactWorker`).
+const COMPACT_MIN_SLACK: usize = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // Bulk column movement (typed loops; dispatch hoisted out of the row loop)
@@ -309,6 +316,64 @@ const Bucket = struct {
     rows: usize = 0,
     keys: std.ArrayListUnmanaged(RowKey) = .empty,
     order: std.ArrayListUnmanaged(u32) = .empty,
+    /// Rows the buffers were last sized to by `Exchange.compactWorker`.
+    compacted_rows: usize = 0,
+};
+
+/// Which scan worker takes which source. A worker's buckets grow to the
+/// rows of the sources it scans, so a warm pooled run hands each worker the
+/// sources it scanned on the previous run first: a run balanced like the
+/// last one fills every bucket to the size it was compacted to, and nothing
+/// grows or moves (#518). Before any run, sources go round-robin, which
+/// splits like-sized sources evenly. A worker out of its own sources takes
+/// what is left from the far end, where it least disturbs the others' lists.
+const SourceClaims = struct {
+    /// Worker that took source i on the latest run.
+    owner: []std.atomic.Value(u32) = &.{},
+    taken: []std.atomic.Value(bool) = &.{},
+    stolen: std.atomic.Value(usize) = .init(0),
+
+    fn begin(self: *SourceClaims, alloc: Allocator, n_sources: usize, n_workers: usize) !void {
+        if (self.owner.len != n_sources) {
+            self.deinit(alloc);
+            const owner = try alloc.alloc(std.atomic.Value(u32), n_sources);
+            errdefer alloc.free(owner);
+            self.taken = try alloc.alloc(std.atomic.Value(bool), n_sources);
+            self.owner = owner;
+            for (self.owner, 0..) |*o, i| o.* = .init(@intCast(i % n_workers));
+        }
+        @memset(self.taken, .init(false));
+        self.stolen = .init(0);
+    }
+
+    fn deinit(self: *SourceClaims, alloc: Allocator) void {
+        alloc.free(self.owner);
+        alloc.free(self.taken);
+        self.* = .{};
+    }
+
+    /// The next source for worker `w`, or null once every source is taken.
+    /// `cursor` is the worker's own position in its previous sources and
+    /// starts at 0.
+    fn next(self: *SourceClaims, w: u32, cursor: *usize) ?usize {
+        while (cursor.* < self.owner.len) {
+            const i = cursor.*;
+            cursor.* += 1;
+            if (self.owner[i].load(.monotonic) == w and self.take(i, w)) return i;
+        }
+        while (true) {
+            const k = self.stolen.fetchAdd(1, .monotonic);
+            if (k >= self.owner.len) return null;
+            const i = self.owner.len - 1 - k;
+            if (self.take(i, w)) return i;
+        }
+    }
+
+    fn take(self: *SourceClaims, i: usize, w: u32) bool {
+        if (self.taken[i].swap(true, .acq_rel)) return false;
+        self.owner[i].store(w, .monotonic);
+        return true;
+    }
 };
 
 pub const Exchange = struct {
@@ -322,8 +387,9 @@ pub const Exchange = struct {
     /// arenas see single-threaded use — and teardown of the exchange's
     /// multi-GB retained capacity collapses from ~10^5 individual frees to
     /// n_workers arena releases (the inline-teardown seconds the pool's
-    /// eviction path used to pay).
-    arenas: []std.heap.ArenaAllocator,
+    /// eviction path used to pay). After its scan a worker may move its
+    /// buckets into one exactly-sized slab (`compactWorker`).
+    arenas: []SlabArena,
     schema: []const Column,
     n_workers: usize,
     n_shards: usize,
@@ -331,6 +397,8 @@ pub const Exchange = struct {
     /// string-typed key column; composite keys hash-combine later.
     key_col: usize,
     buckets: []Bucket,
+    /// Kept across pooled runs, like the buckets it sizes.
+    claims: SourceClaims = .{},
 
     /// Single-threaded by contract: only scan worker `w` (which owns bucket
     /// row w exclusively) may allocate from arena w during ingress. Deferred
@@ -344,9 +412,9 @@ pub const Exchange = struct {
     }
 
     pub fn init(alloc: Allocator, schema: []const Column, n_workers: usize, n_shards: usize, key_col: usize) !Exchange {
-        const arenas = try alloc.alloc(std.heap.ArenaAllocator, n_workers);
+        const arenas = try alloc.alloc(SlabArena, n_workers);
         errdefer alloc.free(arenas);
-        for (arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(alloc);
+        for (arenas) |*ar| ar.* = SlabArena.init(alloc);
         errdefer for (arenas) |*ar| ar.deinit();
         const buckets = try alloc.alloc(Bucket, n_workers * n_shards);
         errdefer alloc.free(buckets);
@@ -373,6 +441,7 @@ pub const Exchange = struct {
         for (self.arenas) |*ar| ar.deinit();
         self.alloc.free(self.arenas);
         self.alloc.free(self.buckets);
+        self.claims.deinit(self.alloc);
     }
 
     /// Pool reuse: retain every bucket's capacity for the next run.
@@ -387,6 +456,80 @@ pub const Exchange = struct {
 
     fn bucket(self: *Exchange, w: usize, shard: usize) *Bucket {
         return &self.buckets[w * self.n_shards + shard];
+    }
+
+    /// Move worker `w`'s finished buckets into one slab, with room for
+    /// `n_sort` merge keys and the sort order per row, and drop the arena
+    /// that grew them. A bucket column that outgrows its buffer in an arena
+    /// leaves the old buffer there until the arena dies: across thousands of
+    /// buckets that held more than the buckets themselves, and it stayed
+    /// through the shard phase, where the statement peaks (#518).
+    ///
+    /// A bucket is sized to its rows when it has more than at its last
+    /// compaction, and keeps its capacity otherwise: a worker that scanned
+    /// fewer rows this run than its usual sources hold (`SourceClaims`)
+    /// fills its buckets back up on the next one, and sizing them down would
+    /// make that run regrow and copy them. Skipped when the arena holds
+    /// little beyond what the copy would.
+    pub fn compactWorker(self: *Exchange, w: usize, n_sort: usize) !void {
+        const row = self.buckets[w * self.n_shards ..][0..self.n_shards];
+        var slab_len: usize = 0;
+        // Sort scratch still to be reserved in this arena if it is kept.
+        var sort_growth: usize = 0;
+        for (row) |*b| {
+            const size = compactSize(b);
+            slab_len += b.cols.len * @sizeOf(ColumnStore) + @alignOf(ColumnStore);
+            for (b.cols) |c| {
+                slab_len += MAX_BUFFERS_PER_STORE * @alignOf(u128) + switch (size) {
+                    .rows => c.liveBytes(),
+                    .capacity => c.heldBytes(),
+                };
+            }
+            if (n_sort > 0 and b.rows > 0) {
+                slab_len += sortKeysLen(b, n_sort, size) * @sizeOf(RowKey) + sortOrderLen(b, size) * @sizeOf(u32) + @alignOf(RowKey) + @alignOf(u32);
+                sort_growth += (b.rows * n_sort -| b.keys.capacity) * @sizeOf(RowKey) + (b.rows -| b.order.capacity) * @sizeOf(u32);
+            }
+        }
+        if ((self.arenas[w].queryCapacity() + sort_growth) -| slab_len <= @max(slab_len / 8, COMPACT_MIN_SLACK)) return;
+
+        var slab = try SlabArena.initSlab(self.alloc, slab_len);
+        errdefer slab.deinit();
+        const sa = slab.allocator();
+        // Every bucket is rebuilt before any is swapped in: a failure part
+        // way leaves the exchange on the old arena.
+        const moved = try self.alloc.alloc(Bucket, row.len);
+        defer self.alloc.free(moved);
+        for (row, moved) |*b, *m| {
+            const size = compactSize(b);
+            const cols = try sa.alloc(ColumnStore, b.cols.len);
+            for (b.cols, cols) |c, *dst| dst.* = try c.cloneSized(sa, size);
+            m.* = .{ .cols = cols, .rows = b.rows, .compacted_rows = @max(b.rows, b.compacted_rows) };
+            if (n_sort > 0 and b.rows > 0) {
+                try m.keys.ensureTotalCapacityPrecise(sa, sortKeysLen(b, n_sort, size));
+                try m.order.ensureTotalCapacityPrecise(sa, sortOrderLen(b, size));
+            }
+        }
+        @memcpy(row, moved);
+        self.arenas[w].deinit();
+        self.arenas[w] = slab;
+    }
+
+    fn compactSize(b: *const Bucket) store_mod.CloneSize {
+        return if (b.rows > b.compacted_rows) .rows else .capacity;
+    }
+
+    fn sortKeysLen(b: *const Bucket, n_sort: usize, size: store_mod.CloneSize) usize {
+        return switch (size) {
+            .rows => b.rows * n_sort,
+            .capacity => @max(b.rows * n_sort, b.keys.capacity),
+        };
+    }
+
+    fn sortOrderLen(b: *const Bucket, size: store_mod.CloneSize) usize {
+        return switch (size) {
+            .rows => b.rows,
+            .capacity => @max(b.rows, b.order.capacity),
+        };
     }
 
     pub fn shardRows(self: *const Exchange, shard: usize) usize {
@@ -616,9 +759,9 @@ fn prepare_bucket_sort(ex: *Exchange, w: usize, shard: usize, n_sort: usize) !vo
     b.order.clearRetainingCapacity();
     const rows = b.rows;
     if (rows == 0) return;
-    try b.keys.ensureTotalCapacity(ex.workerAlloc(w), rows * n_sort);
+    try b.keys.ensureTotalCapacityPrecise(ex.workerAlloc(w), rows * n_sort);
     b.keys.items.len = rows * n_sort;
-    try b.order.ensureTotalCapacity(ex.workerAlloc(w), rows);
+    try b.order.ensureTotalCapacityPrecise(ex.workerAlloc(w), rows);
     b.order.items.len = rows;
 }
 
@@ -3363,25 +3506,24 @@ fn storeRetainedBytes(c: *const ColumnStore) usize {
 const ScanPhase = struct {
     ex: *Exchange,
     sources: []exec.Query,
-    next: std.atomic.Value(usize) = .init(0),
     entry_derived: []const compute_mod.Derived,
     scan_schema: []const Column,
     registry: ?*const udf_mod.UdfRegistry,
     sort_cols: []const OrderCol,
     defer_sort: bool = false,
     member_filters: []const MemberFilter = &.{},
-    /// Co-partitioned side tables: one exchange + claim counter each; side
-    /// buckets are never sorted (the probe map doesn't need order).
+    /// Co-partitioned side tables: one exchange each, with its own source
+    /// claims; side buckets are never sorted (the probe map doesn't need
+    /// order).
     sides: []SideScan,
     errs: []?anyerror,
     /// Per-worker phase ticks [source scan, entry compute, route+scatter,
-    /// bucket sort] (THINDB_REGION_TRACE only; null otherwise).
-    ticks: ?[][4]i64 = null,
+    /// compaction, bucket sort] (THINDB_REGION_TRACE only; null otherwise).
+    ticks: ?[][5]i64 = null,
 
     const SideScan = struct {
         ex: *Exchange,
         input: *const SideInput,
-        next: std.atomic.Value(usize) = .init(0),
     };
 
     fn worker(self: *ScanPhase, w: usize) void {
@@ -3407,11 +3549,11 @@ const ScanPhase = struct {
         var scratch_buf: std.ArrayListUnmanaged(bool) = .empty;
         defer scratch_buf.deinit(self.ex.alloc);
         const timed = self.ticks != null;
-        var tk: [4]i64 = .{ 0, 0, 0, 0 };
+        var tk: [5]i64 = @splat(0);
+        var cursor: usize = 0;
         while (true) {
             try exec.memory.checkCancelled(self.ex.alloc);
-            const i = self.next.fetchAdd(1, .monotonic);
-            if (i >= self.sources.len) break;
+            const i = self.ex.claims.next(@intCast(w), &cursor) orelse break;
             while (true) {
                 try exec.memory.checkCancelled(self.ex.alloc);
                 const t_scan = if (timed) exec.prof.nowTicks() else 0;
@@ -3445,18 +3587,23 @@ const ScanPhase = struct {
             if (side.input.entry_derived.len > 0) {
                 sinst = try makeComputeInstance(side.ex.alloc, side.input.scan_schema, side.input.entry_derived, self.registry);
             }
+            var side_cursor: usize = 0;
             while (true) {
                 try exec.memory.checkCancelled(self.ex.alloc);
-                const i = side.next.fetchAdd(1, .monotonic);
-                if (i >= side.input.sources.len) break;
+                const i = side.ex.claims.next(@intCast(w), &side_cursor) orelse break;
                 while (try side.input.sources[i].next()) |batch| {
                     const routed = if (sinst) |*ci| try ci.ptr.evalBatch(batch) else batch;
                     try swk.push(routed, null);
                 }
             }
         }
-        // This worker's buckets are complete — sort them here, where the
-        // work is balanced by input chunks, not by key skew.
+        // This worker's buckets are complete: drop their growth history
+        // before the shard phase, then sort them here, where the work is
+        // balanced by input chunks, not by key skew.
+        const t_compact = if (timed) exec.prof.nowTicks() else 0;
+        try self.ex.compactWorker(w, self.sort_cols.len);
+        for (self.sides) |*side| try side.ex.compactWorker(w, 0);
+        if (timed) tk[3] += exec.prof.nowTicks() - t_compact;
         const t_sort = if (timed) exec.prof.nowTicks() else 0;
         if (!self.defer_sort) {
             for (0..self.ex.n_shards) |s| {
@@ -3464,7 +3611,7 @@ const ScanPhase = struct {
                 try sortBucketKeys(self.ex, w, s, self.sort_cols);
             }
         }
-        if (timed) tk[3] += exec.prof.nowTicks() - t_sort;
+        if (timed) tk[4] += exec.prof.nowTicks() - t_sort;
         if (self.ticks) |t| t[w] = tk;
     }
 
@@ -3472,7 +3619,7 @@ const ScanPhase = struct {
     /// wall ≈ busiest; the gap to sum/threads is the load imbalance.
     fn printTrace(self: *const ScanPhase) void {
         const t = self.ticks orelse return;
-        var sum: [4]i64 = .{ 0, 0, 0, 0 };
+        var sum: [5]i64 = @splat(0);
         var busiest: i64 = 0;
         for (t) |wt| {
             var tot: i64 = 0;
@@ -3482,12 +3629,14 @@ const ScanPhase = struct {
             }
             busiest = @max(busiest, tot);
         }
-        std.debug.print("[region]   scan-phase cpu: scan={d:.0}ms compute={d:.0}ms scatter={d:.0}ms sort={d:.0}ms  busiest worker={d:.0}ms of {d} sources\n", .{
-            exec.prof.ticksToMs(sum[0]), exec.prof.ticksToMs(sum[1]), exec.prof.ticksToMs(sum[2]), exec.prof.ticksToMs(sum[3]), exec.prof.ticksToMs(busiest), self.sources.len,
+        std.debug.print("[region]   scan-phase cpu: scan={d:.0}ms compute={d:.0}ms scatter={d:.0}ms compact={d:.0}ms sort={d:.0}ms  busiest worker={d:.0}ms of {d} sources\n", .{
+            exec.prof.ticksToMs(sum[0]), exec.prof.ticksToMs(sum[1]), exec.prof.ticksToMs(sum[2]), exec.prof.ticksToMs(sum[3]), exec.prof.ticksToMs(sum[4]), exec.prof.ticksToMs(busiest), self.sources.len,
         });
         std.debug.print("[region]   scan-phase per-worker ms:", .{});
         for (t) |wt| {
-            std.debug.print(" {d:.0}", .{exec.prof.ticksToMs(wt[0] + wt[1] + wt[2] + wt[3])});
+            var tot: i64 = 0;
+            for (wt) |v| tot += v;
+            std.debug.print(" {d:.0}", .{exec.prof.ticksToMs(tot)});
         }
         std.debug.print("\n", .{});
     }
@@ -4256,12 +4405,14 @@ pub fn runRegionPooled(
 
     const side_scans = try alloc.alloc(ScanPhase.SideScan, sides.len);
     defer alloc.free(side_scans);
+    try ex.claims.begin(ex.alloc, sources.len, ex.n_workers);
     for (sides, pool.side_ex, side_scans) |*side, *sex, *ss| {
+        try sex.claims.begin(sex.alloc, side.sources.len, sex.n_workers);
         ss.* = .{ .ex = sex, .input = side };
     }
-    const scan_ticks: ?[][4]i64 = if (trace) try alloc.alloc([4]i64, opts.n_threads) else null;
+    const scan_ticks: ?[][5]i64 = if (trace) try alloc.alloc([5]i64, opts.n_threads) else null;
     defer if (scan_ticks) |t| alloc.free(t);
-    if (scan_ticks) |t| @memset(t, .{ 0, 0, 0, 0 });
+    if (scan_ticks) |t| @memset(t, @splat(0));
     // Few input streams cannot occupy all scan workers. Shard bins can
     // share their sort work once ingress has finished and buffers exist.
     const defer_sort = sources.len < opts.n_threads;
@@ -4334,6 +4485,12 @@ pub fn runRegionPooled(
         });
         scan_phase.printTrace();
         shard_phase.printTrace();
+        var held: usize = 0;
+        for (ex.arenas) |*ar| held += ar.queryCapacity();
+        for (pool.side_ex) |*sex| {
+            for (sex.arenas) |*ar| held += ar.queryCapacity();
+        }
+        std.debug.print("[region]   exchange arenas={d}MB\n", .{held >> 20});
         // Per-op CPU (summed across workers; wall ≈ sum / threads when
         // load-balanced). Consolidation reported the same way.
         var con: i64 = 0;
@@ -4877,6 +5034,152 @@ test "region exchange + ordered consolidation: multiset, order, group ranges" {
     try testing.expectEqual(@as(usize, 8), total_rows);
     try testing.expectEqual(@as(usize, 4), total_groups); // cust_a, cust_b, whale, NULL
     try testing.expectEqual(@as(i64, 360), sum_v);
+}
+
+fn tPushKeyedBatches(alloc: Allocator, ex: *Exchange, schema: []const Column, batches: usize, rows: usize) !void {
+    var wk = try ex.worker(0);
+    defer wk.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..batches) |b| {
+        var kc = try ColumnStore.init(alloc, .string, true);
+        defer kc.deinit(alloc);
+        var vc = try ColumnStore.init(alloc, .bigint, true);
+        defer vc.deinit(alloc);
+        for (0..rows) |r| {
+            const i = b * rows + r;
+            try tAppendStr(alloc, &kc, if (i % 11 == 0) null else try std.fmt.bufPrint(&buf, "key_{d}", .{i % 5000}));
+            try tAppendI64(alloc, &vc, if (i % 7 == 0) null else @intCast(i));
+        }
+        var views = [_]ColumnView{ kc.view(), vc.view() };
+        try wk.push(.{ .schema = schema, .values = &views, .row_count = rows }, null);
+    }
+}
+
+fn tBucketSums(ex: *const Exchange, sums: []i64, counts: []usize) void {
+    for (ex.buckets[0..ex.n_shards], sums, counts) |b, *s, *c| {
+        const v = b.cols[1].view();
+        s.* = 0;
+        for (0..b.rows) |i| {
+            if (v.isValid(i)) s.* += v.data.bigint[i];
+        }
+        c.* = b.rows;
+    }
+}
+
+test "region exchange: compaction keeps every row and drops the buckets' growth history" {
+    const alloc = testing.allocator;
+    const schema = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    const sort_cols = [_]OrderCol{ .{ .col = 0, .kind = .string }, .{ .col = 1, .kind = .int64 } };
+    var ex = try Exchange.init(alloc, &schema, 1, 8, 0);
+    defer ex.deinit();
+    var twin = try Exchange.init(alloc, &schema, 1, 8, 0);
+    defer twin.deinit();
+    try tPushKeyedBatches(alloc, &ex, &schema, 400, 1000);
+    try tPushKeyedBatches(alloc, &twin, &schema, 400, 1000);
+
+    try ex.compactWorker(0, sort_cols.len);
+    const held = ex.arenas[0].queryCapacity();
+    try testing.expectEqual(@as(usize, 0), ex.arenas[0].overflow.queryCapacity());
+    var sums: [8]i64 = undefined;
+    var counts: [8]usize = undefined;
+    var twin_sums: [8]i64 = undefined;
+    var twin_counts: [8]usize = undefined;
+    tBucketSums(&ex, &sums, &counts);
+    tBucketSums(&twin, &twin_sums, &twin_counts);
+    try testing.expectEqualSlices(i64, &twin_sums, &sums);
+    try testing.expectEqualSlices(usize, &twin_counts, &counts);
+
+    // The bucket sorts fill the room reserved for them; the shards come out
+    // row for row as the uncompacted twin's.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var total: usize = 0;
+    for (0..ex.n_shards) |s| {
+        var sd = ShardData{};
+        defer sd.deinit(alloc);
+        var twin_sd = ShardData{};
+        defer twin_sd.deinit(alloc);
+        _ = arena.reset(.retain_capacity);
+        try consolidateOrdered(&ex, s, &sort_cols, 1, &sd, arena.allocator());
+        try consolidateOrdered(&twin, s, &sort_cols, 1, &twin_sd, arena.allocator());
+        try testing.expectEqual(twin_sd.rows, sd.rows);
+        try testing.expectEqualSlices([2]u32, twin_sd.ranges.items, sd.ranges.items);
+        try testing.expectEqualSlices(i64, twin_sd.cols[1].data.bigint.items, sd.cols[1].data.bigint.items);
+        total += sd.rows;
+    }
+    try testing.expectEqual(@as(usize, 400 * 1000), total);
+    try testing.expectEqual(held, ex.arenas[0].queryCapacity());
+    try testing.expect(held < twin.arenas[0].queryCapacity());
+
+    // A warm run over the same rows fits the compacted buffers: no copy.
+    ex.clear();
+    try tPushKeyedBatches(alloc, &ex, &schema, 400, 1000);
+    try ex.compactWorker(0, sort_cols.len);
+    try testing.expectEqual(held, ex.arenas[0].queryCapacity());
+    tBucketSums(&ex, &sums, &counts);
+    try testing.expectEqualSlices(i64, &twin_sums, &sums);
+
+    // A warm run that outgrows the slab grows into the overflow; compacting
+    // sizes the grown buckets to their rows, and runs that fit them after
+    // that, the same or smaller, neither grow nor copy.
+    ex.clear();
+    try tPushKeyedBatches(alloc, &ex, &schema, 600, 1000);
+    try testing.expect(ex.arenas[0].overflow.queryCapacity() > 0);
+    try ex.compactWorker(0, sort_cols.len);
+    try testing.expectEqual(@as(usize, 0), ex.arenas[0].overflow.queryCapacity());
+    for (ex.buckets[0..ex.n_shards]) |b| try testing.expectEqual(b.cols[1].liveBytes(), b.cols[1].heldBytes());
+    const regrown = ex.arenas[0].queryCapacity();
+    inline for (.{ 600, 400 }) |batches| {
+        ex.clear();
+        try tPushKeyedBatches(alloc, &ex, &schema, batches, 1000);
+        try ex.compactWorker(0, sort_cols.len);
+        try testing.expectEqual(regrown, ex.arenas[0].queryCapacity());
+    }
+}
+
+test "source claims: a warm run hands each worker its previous sources first" {
+    const alloc = testing.allocator;
+    var claims: SourceClaims = .{};
+    defer claims.deinit(alloc);
+    var c0: usize = 0;
+    var c1: usize = 0;
+
+    // No previous run: round-robin, and worker 1 out of its own takes the
+    // last of worker 0's.
+    try claims.begin(alloc, 6, 2);
+    try testing.expectEqual(@as(?usize, 0), claims.next(0, &c0));
+    try testing.expectEqual(@as(?usize, 1), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, 3), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, 5), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, 4), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, 2), claims.next(0, &c0));
+    try testing.expectEqual(@as(?usize, null), claims.next(0, &c0));
+    try testing.expectEqual(@as(?usize, null), claims.next(1, &c1));
+
+    // Worker 0 scanned 0, 2 and worker 1 scanned 1, 3, 4, 5.
+    try claims.begin(alloc, 6, 2);
+    c0 = 0;
+    c1 = 0;
+    try testing.expectEqual(@as(?usize, 0), claims.next(0, &c0));
+    try testing.expectEqual(@as(?usize, 1), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, 2), claims.next(0, &c0));
+    // Out of its own, worker 0 takes the last of worker 1's.
+    try testing.expectEqual(@as(?usize, 5), claims.next(0, &c0));
+    try testing.expectEqual(@as(?usize, 3), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, 4), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, null), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, null), claims.next(0, &c0));
+
+    // Another source count starts round-robin again.
+    try claims.begin(alloc, 3, 2);
+    c0 = 0;
+    c1 = 0;
+    try testing.expectEqual(@as(?usize, 1), claims.next(1, &c1));
+    try testing.expectEqual(@as(?usize, 0), claims.next(0, &c0));
+    try testing.expectEqual(@as(?usize, 2), claims.next(0, &c0));
 }
 
 fn tAppendStr(alloc: Allocator, store: *ColumnStore, s: ?[]const u8) !void {
