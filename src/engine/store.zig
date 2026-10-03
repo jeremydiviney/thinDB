@@ -186,6 +186,15 @@ pub const StringStore = struct {
         self.bytes.shrinkRetainingCapacity(self.offsets.items[rows]);
     }
 
+    pub fn cloneSized(self: StringStore, allocator: Allocator, size: CloneSize) Allocator.Error!StringStore {
+        var offsets = try sizedCopy(u32, allocator, self.offsets, size);
+        errdefer offsets.deinit(allocator);
+        var bytes = try sizedCopy(u8, allocator, self.bytes, size);
+        errdefer bytes.deinit(allocator);
+        const wide: ?std.ArrayList(u64) = if (self.wide_offsets) |wo| try sizedCopy(u64, allocator, wo, size) else null;
+        return .{ .offsets = offsets, .bytes = bytes, .wide_offsets = wide };
+    }
+
     pub fn clear(self: *StringStore) void {
         self.bytes.clearRetainingCapacity();
         if (self.wide_offsets) |*wo| {
@@ -277,6 +286,30 @@ pub const ColumnStore = struct {
                 if (ss.wide_offsets) |wo| wo.capacity * @sizeOf(u64) else 0,
             inline else => |list| list.capacity * @sizeOf(std.meta.Elem(@TypeOf(list.items))),
         };
+    }
+
+    /// Bytes the store's rows occupy, spare capacity excluded.
+    pub fn liveBytes(self: ColumnStore) usize {
+        const validity = if (self.nulls) |n| n.items.len else 0;
+        return validity + switch (self.data) {
+            .varchar, .string, .char, .json => |ss| ss.offsets.items.len * @sizeOf(u32) + ss.bytes.items.len +
+                if (ss.wide_offsets) |wo| wo.items.len * @sizeOf(u64) else 0,
+            inline else => |list| list.items.len * @sizeOf(std.meta.Elem(@TypeOf(list.items))),
+        };
+    }
+
+    /// A copy in one allocation per buffer, for moving a finished store into
+    /// storage sized ahead of time: `liveBytes` in all with `.rows`,
+    /// `heldBytes` with `.capacity`.
+    pub fn cloneSized(self: ColumnStore, allocator: Allocator, size: CloneSize) Allocator.Error!ColumnStore {
+        var nulls: ?std.ArrayList(u8) = null;
+        if (self.nulls) |n| nulls = try sizedCopy(u8, allocator, n, size);
+        errdefer if (nulls) |*n| n.deinit(allocator);
+        const data: DataStore = switch (self.data) {
+            inline .varchar, .string, .char, .json => |ss, tag| @unionInit(DataStore, @tagName(tag), try ss.cloneSized(allocator, size)),
+            inline else => |list, tag| @unionInit(DataStore, @tagName(tag), try sizedCopy(std.meta.Elem(@TypeOf(list.items)), allocator, list, size)),
+        };
+        return .{ .data = data, .nulls = nulls };
     }
 
     pub fn clear(self: *ColumnStore) void {
@@ -500,6 +533,20 @@ pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start
         const base = dst.rowCount() - (end - start);
         try dst.appendValidityRangeFrom(alloc, base, v.nulls, start, end - start);
     }
+}
+
+/// How `ColumnStore.cloneSized` sizes each buffer of the copy: to the rows
+/// it holds, or to the source buffer's capacity.
+pub const CloneSize = enum { rows, capacity };
+
+fn sizedCopy(comptime T: type, allocator: Allocator, list: std.ArrayList(T), size: CloneSize) Allocator.Error!std.ArrayList(T) {
+    var copy: std.ArrayList(T) = .empty;
+    try copy.ensureTotalCapacityPrecise(allocator, switch (size) {
+        .rows => list.items.len,
+        .capacity => list.capacity,
+    });
+    copy.appendSliceAssumeCapacity(list.items);
+    return copy;
 }
 
 pub fn setBitRangeTrue(bytes: []u8, start: usize, n: usize) void {
@@ -840,4 +887,39 @@ test "truncate leaves a column as if the dropped rows were never appended" {
         try std.testing.expectEqualStrings(fresh.data.string.bytes.items, truncated.data.string.bytes.items);
         try std.testing.expectEqualSlices(u8, fresh.nulls.?.items, truncated.nulls.?.items);
     }
+}
+
+test "cloneSized holds liveBytes or heldBytes and stays appendable" {
+    const allocator = std.testing.allocator;
+    var text = try ColumnStore.init(allocator, .{ .string = {} }, true);
+    defer text.deinit(allocator);
+    var nums = try ColumnStore.init(allocator, .{ .bigint = {} }, false);
+    defer nums.deinit(allocator);
+    for (0..37) |i| {
+        try text.data.string.appendValue(allocator, if (i % 4 == 0) "" else "abc");
+        try text.appendValidBit(allocator, i, i % 5 != 2);
+        try nums.data.bigint.append(allocator, @intCast(i * 7));
+    }
+
+    inline for (.{ &text, &nums }) |src| {
+        var kept = try src.cloneSized(allocator, .capacity);
+        defer kept.deinit(allocator);
+        try std.testing.expectEqual(src.heldBytes(), kept.heldBytes());
+        try std.testing.expectEqual(src.liveBytes(), kept.liveBytes());
+        var copy = try src.cloneSized(allocator, .rows);
+        defer copy.deinit(allocator);
+        try std.testing.expectEqual(src.liveBytes(), copy.heldBytes());
+        try std.testing.expectEqual(src.rowCount(), copy.rowCount());
+        // Cleared the way a pooled bucket is.
+        copy.clear();
+        try std.testing.expectEqual(@as(usize, 0), copy.rowCount());
+    }
+    var copy = try text.cloneSized(allocator, .rows);
+    defer copy.deinit(allocator);
+    try std.testing.expectEqualSlices(u32, text.data.string.offsets.items, copy.data.string.offsets.items);
+    try std.testing.expectEqualStrings(text.data.string.bytes.items, copy.data.string.bytes.items);
+    try std.testing.expectEqualSlices(u8, text.nulls.?.items, copy.nulls.?.items);
+    try copy.data.string.appendValue(allocator, "grown");
+    try copy.appendValidBit(allocator, 37, true);
+    try std.testing.expectEqualStrings("grown", copy.data.string.view().rowBytes(37));
 }
