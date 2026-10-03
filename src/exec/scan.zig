@@ -665,6 +665,16 @@ pub const Scan = struct {
         };
     }
 
+    /// Take over the caller's shared `ddl_lock` on this scan's table and
+    /// release it at deinit. Scans built over one injected snapshot hold no
+    /// lock of their own; one of them adopting the lock their builder took
+    /// keeps a compaction from deleting the snapshot's segment files while
+    /// any of them still has to open one.
+    pub fn adoptDdlLock(self: *Scan) void {
+        std.debug.assert(!self.holds_ddl);
+        self.holds_ddl = true;
+    }
+
     pub fn captureSnapshot(table: *Table) Snapshot {
         // Count-only capture (no entry dupe) — for callers that read segment
         // entries under their own lock or not at all.

@@ -664,6 +664,35 @@ test "region fusion rejection fingerprints distinguish keys sharing and executio
     try std.testing.expect(first != hash_fusion_attempt(input, &anchor, &.{"key"}).?);
 }
 
+test "region chunk scans keep their table locked until the region frees them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try @import("../api/api.zig").Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    const t = try db.table("t", .{
+        .columns = &.{ .{ .name = "cust", .type = .{ .varchar = 32 } }, .{ .name = "v", .type = .bigint } },
+        .order_key = &.{"cust"},
+        .unique = false,
+    }, .{ .order_key = &.{"cust"} });
+    try t.insert(&.{ .{ .cust = "a", .v = @as(i64, 1) }, .{ .cust = "b", .v = @as(i64, 2) } });
+    try t.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const input = engine_v2.CompileInput{ .allocator = arena.allocator(), .node_arena = arena.allocator(), .catalog = db.owned_catalog.?, .session = .{} };
+    const filter = predicate_mod.leafExpr("v", .gte, .{ .bigint = 0 });
+    const built = [_]BuiltSources{
+        try buildScanSources(input, t, &.{}, filter, null, 4),
+        try buildOrderedSources(input, t, &.{}, filter, null, 4, "cust"),
+    };
+    // The chunks open their segments only when the region runs: until they
+    // are freed, a compaction must not delete the segments they snapshotted.
+    try std.testing.expectEqual(@as(usize, 2), t.ddl_lock.readers);
+    for (built) |bs| for (bs.sources) |*q| q.deinit();
+    try std.testing.expectEqual(@as(usize, 0), t.ddl_lock.readers);
+}
+
 test "region fusion rejection fingerprints exclude volatile calls and track immutable kernels" {
     const allocator = std.testing.allocator;
     const Kernels = struct {
@@ -4887,7 +4916,10 @@ fn buildScanSources(
 ) !BuiltSources {
     const qa = input.allocator;
     table.ddl_lock.lockSharedUncancelable(table.io);
-    defer table.ddl_lock.unlockShared(table.io);
+    // The chunks open their segments when the region runs, after this
+    // returns, so the first one adopts the lock until the region drops it.
+    var lock_held = true;
+    defer if (lock_held) table.ddl_lock.unlockShared(table.io);
     const snap = try Scan.captureSnapshotAlloc(table, qa);
     defer qa.free(snap.segments);
     var pin_held = true;
@@ -4926,6 +4958,10 @@ fn buildScanSources(
         sources[i] = exec.makeQuery(qa, s);
         scans[i] = s;
         built += 1;
+        if (i == 0) {
+            s.adoptDdlLock();
+            lock_held = false;
+        }
         const start = flatToCoord(lo, seg_start, snap.segment_count);
         const end = flatToCoord(hi, seg_start, snap.segment_count);
         s.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
@@ -5008,7 +5044,10 @@ fn buildOrderedSources(
 ) !BuiltSources {
     const qa = input.allocator;
     table.ddl_lock.lockSharedUncancelable(table.io);
-    defer table.ddl_lock.unlockShared(table.io);
+    // The chunks open their segments when the region runs, after this
+    // returns, so the first one adopts the lock until the region drops it.
+    var lock_held = true;
+    defer if (lock_held) table.ddl_lock.unlockShared(table.io);
     const snap = try Scan.captureSnapshotAlloc(table, qa);
     defer qa.free(snap.segments);
     var pin_held = true;
@@ -5110,6 +5149,10 @@ fn buildOrderedSources(
         const s = Scan.allocWithProjectionLoc(qa, table, input.accountant, scan_cols, true, snap) catch return NoMatch;
         sources[i] = exec.makeQuery(qa, s);
         built += 1;
+        if (i == 0) {
+            s.adoptDdlLock();
+            lock_held = false;
+        }
         for (prune_leaves) |l| s.addPrune(l) catch {};
         var conj: std.ArrayListUnmanaged(PredicateExpr) = .empty;
         try conj.append(qa, filter);
