@@ -10,12 +10,13 @@ name: release
 # always serves the newest build — the doc site links those directly and
 # never needs a rebuild.
 
-# Chained behind ci: a push to main runs the four-platform test matrix
-# first, and only a fully green ci run triggers the release build — a
-# commit that fails tests never publishes. workflow_dispatch remains for
-# on-demand bundle builds from ANY branch (Actions tab → release → Run
-# workflow): bundles upload as a workflow artifact, but a GitHub Release
-# is only ever published from main.
+# Chained behind ci: a push to main runs the blocking Windows and Linux
+# x86-64 suites first, and only a fully green ci run triggers the release
+# build — a commit that fails them never publishes. The experimental
+# targets (ci-experimental.yml) do not hold it up. workflow_dispatch
+# remains for on-demand bundle builds from ANY branch (Actions tab →
+# release → Run workflow): bundles upload as a workflow artifact, but a
+# GitHub Release is only ever published from main.
 
 on:
   workflow_run:
