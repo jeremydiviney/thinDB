@@ -477,6 +477,9 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const reaper_thread = try std.Thread.spawn(.{}, ReaperCtx.run, .{&reaper_ctx});
 
+    var release_ctx: HeapReleaseCtx = .{ .catalog = catalog, .io = io };
+    const release_thread = try std.Thread.spawn(.{}, HeapReleaseCtx.run, .{&release_ctx});
+
     waitForStop(io);
 
     for (listeners[0..n_listeners]) |*l| l.close();
@@ -486,6 +489,7 @@ pub fn main(init: std.process.Init) !u8 {
     flusher_thread.join();
     if (compactor_thread) |t| t.join();
     reaper_thread.join();
+    release_thread.join();
 
     try out_w.writeAll("thindb-server shutting down\n");
     try out_w.flush();
@@ -591,6 +595,33 @@ const ReaperCtx = struct {
             const now_ms: u64 = @intCast(@divTrunc(@max(now_ns, 0), std.time.ns_per_ms));
             _ = self.registry.reapStalledTransfers(self.io, now_ms, self.limits);
             _ = self.registry.cancelAbandonedQueries();
+        }
+    }
+};
+
+/// Idle heap release (#529). The server allocates through glibc, whose arenas
+/// keep what a finished statement freed resident until a later statement
+/// reuses it: after a full-data rollforward sweep, tens of GB that no budget
+/// counts. Once no large statement has run for six 5 s polls, the free pages
+/// go back to the system.
+const HeapReleaseCtx = struct {
+    catalog: *thindb.Catalog,
+    io: Io,
+
+    fn run(self: *HeapReleaseCtx) void {
+        const pool = self.catalog.config.memory_pool orelse return;
+        const poll: Io.Duration = .fromMilliseconds(5000);
+        var idle: thindb.memory.IdleRelease = .{ .quiet_checks_needed = 6 };
+        while (!stop_flag.load(.acquire)) {
+            Io.sleep(self.io, poll, .awake) catch return;
+            if (!idle.due(pool)) continue;
+            const start_ns = Io.Clock.awake.now(self.io).nanoseconds;
+            const released = pool.releaseFreeHeap() orelse continue;
+            const elapsed_ms = @divTrunc(Io.Clock.awake.now(self.io).nanoseconds - start_ns, std.time.ns_per_ms);
+            const mib = 1024 * 1024;
+            std.debug.print("[mem-release] server idle: resident {d} MiB -> {d} MiB in {d} ms\n", .{
+                released.before / mib, released.after / mib, elapsed_ms,
+            });
         }
     }
 };

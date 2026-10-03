@@ -232,6 +232,18 @@ pub fn processResidentBytes() ?u64 {
     }
 }
 
+/// Hand the C allocator's free pages back to the system. glibc keeps freed
+/// memory in per-thread arenas and shrinks an arena only from its top, so one
+/// live chunk keeps every free chunk below it resident; `malloc_trim(0)`
+/// releases the whole free pages of every arena. False when the process does
+/// not allocate through glibc or nothing was released.
+pub fn releaseFreeHeapPages() bool {
+    if (comptime !(builtin.os.tag == .linux and builtin.link_libc and builtin.abi.isGnu())) return false;
+    return malloc_trim(0) != 0;
+}
+
+extern "c" fn malloc_trim(pad: usize) c_int;
+
 /// The process's own cgroup and every ancestor, v2 first then the v1 memory
 /// controller: a systemd service's cap is written at
 /// /sys/fs/cgroup/system.slice/<unit>/memory.max, a slice cap one level up,
