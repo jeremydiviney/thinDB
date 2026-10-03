@@ -145,6 +145,7 @@ test {
     _ = @import("exec/mat_stage.zig");
     _ = @import("exec/table_fn.zig");
     _ = @import("net/cte_stages.zig");
+    _ = @import("net/region_rollforward.zig");
     _ = @import("exec/parallel_scan.zig");
     _ = @import("exec/region_exec.zig");
     _ = @import("exec/partitioned_aggregate.zig");
