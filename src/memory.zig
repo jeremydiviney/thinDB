@@ -119,6 +119,10 @@ pub const MemorySnapshot = struct {
     }
 };
 
+fn cacheBytes() u64 {
+    return @max(huge_page.g_slab_bytes.load(.monotonic), block_cache.g_cache_bytes.load(.monotonic));
+}
+
 /// Unaccounted memory that earns a watchdog line: 2 GiB, or a quarter of the
 /// per-query budget when that is larger.
 pub fn watchThreshold(budget: usize) usize {
@@ -179,6 +183,8 @@ fn idleSlack(budget: usize) usize {
 pub const MemoryPool = struct {
     budget: usize,
     used: std.atomic.Value(usize) = .init(0),
+    /// The highest `used` since the last `takeChargePeak`.
+    charge_peak: std.atomic.Value(usize) = .init(0),
     /// Numbers the statements whose accountants draw from this pool.
     statements: std.atomic.Value(u64) = .init(0),
     /// The process scratch pool's free lists, the first idle source of every
@@ -262,8 +268,17 @@ pub const MemoryPool = struct {
         while (true) {
             if (bytes > self.budget - cur) return false;
             const new = cur + bytes;
-            cur = self.used.cmpxchgWeak(cur, new, .monotonic, .monotonic) orelse return true;
+            cur = self.used.cmpxchgWeak(cur, new, .monotonic, .monotonic) orelse {
+                _ = self.charge_peak.fetchMax(new, .monotonic);
+                return true;
+            };
         }
+    }
+
+    /// The highest charge since the previous call, which starts the next
+    /// interval at the current charge.
+    pub fn takeChargePeak(self: *MemoryPool) usize {
+        return self.charge_peak.swap(self.inUse(), .monotonic);
     }
 
     pub fn release(self: *MemoryPool, bytes: usize) void {
@@ -273,6 +288,50 @@ pub const MemoryPool = struct {
 
     pub fn inUse(self: *const MemoryPool) usize {
         return self.used.load(.monotonic);
+    }
+
+    /// Hand the general allocator's free pages back to the system once the
+    /// memory no budget accounts for has passed the watch threshold. Pages a
+    /// finished statement freed otherwise stay resident inside the allocator
+    /// until a later statement reuses them. Null when nothing was released.
+    pub fn releaseFreeHeap(self: *MemoryPool) ?HeapRelease {
+        const before = affinity.processResidentBytes() orelse return null;
+        const snapshot: MemorySnapshot = .{ .resident = before, .cache = cacheBytes(), .retained = self.idleBytes(), .accounted = self.inUse() };
+        if (snapshot.unaccounted() < watchThreshold(self.budget)) return null;
+        if (!affinity.releaseFreeHeapPages()) return null;
+        return .{ .before = before, .after = affinity.processResidentBytes() orelse before };
+    }
+};
+
+/// Resident bytes around a `MemoryPool.releaseFreeHeap`.
+pub const HeapRelease = struct {
+    before: u64,
+    after: u64,
+};
+
+/// When a server gives its general allocator's free pages back: once per idle
+/// period, after a run of quiet checks. A check is quiet when the pool's
+/// charge stayed under one sampling step since the check before. Re-faulting
+/// released pages costs the next statement, so a release waits until large
+/// statements have stopped; small ones, like a stream of replicated writes,
+/// leave little behind and neither hold a release off nor start a new period.
+pub const IdleRelease = struct {
+    quiet_checks_needed: u32,
+    quiet_checks: u32 = 0,
+    released: bool = false,
+
+    /// One check; true when the pool should release now.
+    pub fn due(self: *IdleRelease, pool: *MemoryPool) bool {
+        if (pool.takeChargePeak() >= watchStep(pool.budget)) {
+            self.quiet_checks = 0;
+            self.released = false;
+            return false;
+        }
+        if (self.released) return false;
+        self.quiet_checks += 1;
+        if (self.quiet_checks < self.quiet_checks_needed) return false;
+        self.released = true;
+        return true;
     }
 };
 
@@ -509,7 +568,7 @@ pub const MemoryAccountant = struct {
     fn reading(self: *MemoryAccountant, resident: u64) MemorySnapshot {
         return .{
             .resident = resident,
-            .cache = @max(huge_page.g_slab_bytes.load(.monotonic), block_cache.g_cache_bytes.load(.monotonic)),
+            .cache = cacheBytes(),
             .retained = if (self.pool) |p| p.idleBytes() else buffer_pool.globalRetainedBytes(),
             .accounted = self.accountedEverywhere(),
         };
@@ -1155,6 +1214,33 @@ test "memory: statements drawing from one pool get distinct ids" {
     const second = MemoryAccountant.initWithPool(0, &pool);
     try std.testing.expectEqual(@as(u64, 1), first.statement_id);
     try std.testing.expectEqual(@as(u64, 2), second.statement_id);
+}
+
+test "memory: an idle release waits for quiet checks and fires once per idle period" {
+    var pool = MemoryPool.init(1 << 30);
+    const step = watchStep(pool.budget);
+    var idle: IdleRelease = .{ .quiet_checks_needed = 2 };
+    try std.testing.expect(!idle.due(&pool));
+    try std.testing.expect(idle.due(&pool));
+    try std.testing.expect(!idle.due(&pool));
+    // A charge of a sampling step since the last check begins a new idle
+    // period, even after it was released.
+    try std.testing.expect(pool.tryReserve(step));
+    pool.release(step);
+    try std.testing.expect(!idle.due(&pool));
+    try std.testing.expect(!idle.due(&pool));
+    try std.testing.expect(idle.due(&pool));
+    // One still held holds the release off until the check after it ends.
+    try std.testing.expect(pool.tryReserve(step));
+    try std.testing.expect(!idle.due(&pool));
+    pool.release(step);
+    try std.testing.expect(!idle.due(&pool));
+    try std.testing.expect(!idle.due(&pool));
+    try std.testing.expect(idle.due(&pool));
+    // A smaller charge starts no new period.
+    try std.testing.expect(pool.tryReserve(step - 1));
+    pool.release(step - 1);
+    try std.testing.expect(!idle.due(&pool));
 }
 
 test "memory: shared reservation rejects integer overflow" {
