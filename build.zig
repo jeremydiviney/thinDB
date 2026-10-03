@@ -6,13 +6,21 @@ const std = @import("std");
 /// binaries pass standalone every time — an unresolved upstream issue
 /// (ziggit.dev/t/6079 class: lingering threads interfere with the
 /// listen-mode stdin read). Revert to `addRunArtifact` when fixed.
-fn runTestStandalone(b: *std.Build, test_exe: *std.Build.Step.Compile) *std.Build.Step.Run {
+fn runTestStandalone(b: *std.Build, quiet: *std.Build.Step.Compile, test_exe: *std.Build.Step.Compile) *std.Build.Step.Run {
     const run = std.Build.Step.Run.create(b, b.fmt("run {s}", .{test_exe.name}));
+    run.addArtifactArg(quiet);
     run.addArtifactArg(test_exe);
     // Named time zones read TZif files from TZDIR. Tests read the committed
     // fixtures, so they see the same zones on every platform, including
     // Windows, which has no zone files of its own.
     run.setEnvironmentVariable("TZDIR", b.pathFromRoot("tests/fixtures/zoneinfo"));
+    // An inherited terminal holds the build runner's stderr lock for the whole
+    // run, so the test binaries ran one after another. Checking the exit code
+    // captures the output instead, and the binaries run in parallel; `quiet`
+    // prints a binary's log only when it fails. Side effects keep the run from
+    // being cached.
+    run.expectExitCode(0);
+    run.has_side_effects = true;
     return run;
 }
 
@@ -85,8 +93,15 @@ pub fn build(b: *std.Build) void {
 
     // ---- Unit tests: every `test` block in src/root.zig and its imports ----
     const test_filters = b.option([]const []const u8, "test-filter", "only run tests whose name contains this substring") orelse &.{};
+    const quiet = b.addExecutable(.{
+        .name = "run_test_quiet",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/run_test_quiet.zig"),
+            .target = b.graph.host,
+        }),
+    });
     const lib_tests = b.addTest(.{ .root_module = thindb_mod, .filters = test_filters });
-    const run_lib_tests = runTestStandalone(b, lib_tests);
+    const run_lib_tests = runTestStandalone(b, quiet, lib_tests);
 
     // ---- Integration tests: tests/integration/all.zig pulls in scenario files ----
     const integration_mod = b.createModule(.{
@@ -96,7 +111,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_mod.addImport("thindb", thindb_mod);
     const integration_tests = b.addTest(.{ .root_module = integration_mod, .filters = test_filters });
-    const run_integration_tests = runTestStandalone(b, integration_tests);
+    const run_integration_tests = runTestStandalone(b, quiet, integration_tests);
 
     // ---- Client/server integration tests: tests/integration_client/all.zig ----
     // Exercises the new thindb.local() / Connection / ClientQuery surface
@@ -110,7 +125,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_client_mod.addImport("thindb", thindb_mod);
     const integration_client_tests = b.addTest(.{ .root_module = integration_client_mod, .filters = test_filters });
-    const run_integration_client_tests = runTestStandalone(b, integration_client_tests);
+    const run_integration_client_tests = runTestStandalone(b, quiet, integration_client_tests);
 
     // ---- Server config-file parser tests (src/cmd/config.zig, pure std) ----
     const config_mod = b.createModule(.{
@@ -119,7 +134,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const config_tests = b.addTest(.{ .root_module = config_mod, .filters = test_filters });
-    const run_config_tests = runTestStandalone(b, config_tests);
+    const run_config_tests = runTestStandalone(b, quiet, config_tests);
 
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_lib_tests.step);
@@ -137,7 +152,7 @@ pub fn build(b: *std.Build) void {
     });
     v2_integration_mod.addImport("thindb", thindb_mod);
     const v2_integration_tests = b.addTest(.{ .root_module = v2_integration_mod, .filters = test_filters });
-    const run_v2_integration_tests = runTestStandalone(b, v2_integration_tests);
+    const run_v2_integration_tests = runTestStandalone(b, quiet, v2_integration_tests);
     const test_v2_step = b.step("test-v2", "Run V2-engine integration tests (default engine)");
     test_v2_step.dependOn(&run_v2_integration_tests.step);
     test_step.dependOn(&run_v2_integration_tests.step);

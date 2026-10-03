@@ -26,7 +26,9 @@ available_kb() {
 }
 
 test_pids() {
-  pgrep -f '\.zig-cache/o/[0-9a-f]+/test' || true
+  # The test binaries themselves, not run_test_quiet, which names one in its
+  # arguments and must outlive it to print the log.
+  pgrep -f '^[^ ]*\.zig-cache/o/[0-9a-f]+/test( |$)' || true
 }
 
 dump_stacks() {
