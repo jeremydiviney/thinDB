@@ -682,14 +682,19 @@ test "region chunk scans keep their table locked until the region frees them" {
     defer arena.deinit();
     const input = engine_v2.CompileInput{ .allocator = arena.allocator(), .node_arena = arena.allocator(), .catalog = db.owned_catalog.?, .session = .{} };
     const filter = predicate_mod.leafExpr("v", .gte, .{ .bigint = 0 });
-    const built = [_]BuiltSources{
-        try buildScanSources(input, t, &.{}, filter, null, 4),
-        try buildOrderedSources(input, t, &.{}, filter, null, 4, "cust"),
-    };
+    var built: [2]BuiltSources = undefined;
+    var live: usize = 0;
+    // Unfreed chunk scans keep `db.close` waiting: free them on a failed check too.
+    defer for (built[0..live]) |bs| for (bs.sources) |*q| q.deinit();
+    built[0] = try buildScanSources(input, t, &.{}, filter, null, 4);
+    live = 1;
+    built[1] = try buildOrderedSources(input, t, &.{}, filter, null, 4, "cust");
+    live = 2;
     // The chunks open their segments only when the region runs: until they
     // are freed, a compaction must not delete the segments they snapshotted.
     try std.testing.expectEqual(@as(usize, 2), t.ddl_lock.readers);
     for (built) |bs| for (bs.sources) |*q| q.deinit();
+    live = 0;
     try std.testing.expectEqual(@as(usize, 0), t.ddl_lock.readers);
 }
 
