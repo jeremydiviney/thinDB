@@ -170,3 +170,40 @@ test "LIKE: backslash escapes by default, ESCAPE names another character" {
         try std.testing.expectEqualSlices(i64, c[1], ids.items);
     }
 }
+
+test "LIKE: a pattern expression matches per row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE pt (id BIGINT PRIMARY KEY, s VARCHAR(16), pat VARCHAR(16))");
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO pt VALUES (1, 'apple', 'a%'), (2, 'banana', '%nan%'), (3, 'cherry', 'ch_rry'), (4, 'date', NULL), (5, NULL, '%'), (6, 'fig', 'g%')",
+    );
+
+    const cases = .{
+        .{ "SELECT id FROM t WHERE LOWER(name) LIKE LOWER('%ALPHA%') ORDER BY id", &[_]i64{ 1, 2 } },
+        .{ "SELECT id FROM t WHERE name LIKE CONCAT('%', 'mm', '%') ORDER BY id", &[_]i64{4} },
+        .{ "SELECT id FROM t WHERE name NOT LIKE LOWER('AL%') ORDER BY id", &[_]i64{ 3, 4 } },
+        .{ "SELECT id FROM t WHERE UPPER(name) LIKE UPPER('%ta') OR id = 5 ORDER BY id", &[_]i64{ 3, 5 } },
+        .{ "SELECT id FROM t WHERE name LIKE NULL ORDER BY id", &[_]i64{} },
+        .{ "SELECT id FROM t WHERE name NOT LIKE NULL ORDER BY id", &[_]i64{} },
+        .{
+            "WITH c AS (SELECT id, name FROM t WHERE id > 0 AND (LOWER(name) LIKE LOWER('%BET%') OR LOWER(name) LIKE LOWER('%MM%'))) SELECT id FROM c ORDER BY id",
+            &[_]i64{ 2, 3, 4 },
+        },
+        .{ "SELECT id FROM pt WHERE s LIKE pat ORDER BY id", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT id FROM pt WHERE s NOT LIKE pat ORDER BY id", &[_]i64{6} },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case failed: {s}\n", .{c[0]});
+        const ids = try collectBigints(allocator, db, c[0]);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, c[1], ids);
+    }
+    try helpers.expectRunError(allocator, db, "SELECT id FROM t WHERE name LIKE LOWER('A!%') ESCAPE '!'", error.SqlExpectedValue);
+}

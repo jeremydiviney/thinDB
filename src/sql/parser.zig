@@ -8425,7 +8425,7 @@ test "no scalar UDF can take a function that syntax lowers to" {
     defer arena.deinit();
     const cast_targets = [_]types.Type{ .int, .bigint, .smallint, .tinyint, .largeint, .float, .double, .boolean, .date, .datetime, .string, .json };
     for (cast_targets) |ty| try std.testing.expect(scalar_fn.isReservedScalarUdfName((try scalar_fn.castFnName(arena.allocator(), ty)).?));
-    inline for (.{ "ltrim_substring", "json_extract", "json_value", "regexp_like", "soundex", "str_to_time", scalar_fn.ORDER_KEY_FN }) |name| {
+    inline for (.{ "ltrim_substring", "json_extract", "json_value", "regexp_like", "like", "soundex", "str_to_time", scalar_fn.ORDER_KEY_FN }) |name| {
         try std.testing.expect(scalar_fn.isReservedScalarUdfName(name));
     }
     try std.testing.expect(!scalar_fn.isReservedScalarUdfName("score_bucket"));

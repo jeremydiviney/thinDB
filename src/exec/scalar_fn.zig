@@ -1250,6 +1250,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "regexp_replace", .arg_types = &.{ .string, .string, .string, .bigint, .bigint, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpReplaceKernel },
     .{ .name = "regexp_like", .arg_types = &.{ .string, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = string.regexpLikeKernel },
     .{ .name = "regexp_like", .arg_types = &.{ .string, .string, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = string.regexpLikeKernel },
+    .{ .name = "like", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.likeKernel },
     .{ .name = "regexp_substr", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
     .{ .name = "regexp_substr", .arg_types = &.{ .string, .string, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
     .{ .name = "regexp_substr", .arg_types = &.{ .string, .string, .bigint, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpSubstrKernel },
