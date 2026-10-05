@@ -651,22 +651,32 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         return try makeBetweenExpr(p, col_dup, lo, hi, negate_predicate);
     }
 
-    // LIKE 'pattern'  /  NOT LIKE 'pattern'
+    // LIKE pattern  /  NOT LIKE pattern. A string literal stays on the
+    // `.like` predicate, which scans evaluate against dictionaries and zone
+    // maps; any other pattern (`LOWER('%x%')`, a CONCAT, a column) matches
+    // per row through the `like` scalar.
     if (p.cur.tag == .kw_like) {
         try p.advance();
-        if (p.cur.tag != .string) return PE.SqlExpectedValue;
-        var pattern: []const u8 = try p.arena.dupe(u8, p.cur.value.string);
-        try p.advance();
+        const pattern = try p.parseScalar();
         try p.skipCollations();
+        var escape: ?[]const u8 = null;
         if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "escape")) {
             try p.advance();
-            if (p.cur.tag != .string) return PE.SqlExpectedValue;
-            const escape = p.cur.value.string;
-            if (escape.len > 1) return PE.SqlExpectedValue;
-            pattern = try likePatternWithEscape(p.arena, pattern, escape);
+            if (p.cur.tag != .string or p.cur.value.string.len > 1) return PE.SqlExpectedValue;
+            escape = try p.arena.dupe(u8, p.cur.value.string);
             try p.advance();
         }
-        var pe: PredicateExpr = .{ .like = .{ .col = col_dup, .pattern = pattern } };
+        var pe: PredicateExpr = switch (pattern) {
+            .lit => |v| switch (v) {
+                .text => |text| .{ .like = .{
+                    .col = col_dup,
+                    .pattern = if (escape) |e| try likePatternWithEscape(p.arena, text, e) else text,
+                } },
+                else => try makeLikeCallPredicate(p, col_dup, pattern, escape),
+            },
+            .null_lit => .unknown,
+            else => try makeLikeCallPredicate(p, col_dup, pattern, escape),
+        };
         if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
     }
@@ -1125,6 +1135,17 @@ pub fn unsignedTokenAhead(p: anytype) @TypeOf(p.*).Err!@TypeOf(p.cur) {
 pub fn inexactFractionAhead(p: anytype) @TypeOf(p.*).Err!bool {
     const tok = try unsignedTokenAhead(p);
     return tok.tag == .floating and !exec_expr.fractionFitsDouble(tok.text, tok.value.floating);
+}
+
+/// `col LIKE <expression>`: the `like` scalar reads the pattern per row with
+/// backslash as its escape, so only that ESCAPE character is accepted here.
+fn makeLikeCallPredicate(p: anytype, col: []const u8, pattern: ir.Expr, escape: ?[]const u8) @TypeOf(p.*).Err!PredicateExpr {
+    if (escape) |e| if (!std.mem.eql(u8, e, "\\")) return @TypeOf(p.*).Err.SqlExpectedValue;
+    const args = try p.arena.alloc(ir.Expr, 2);
+    args[0] = .{ .col_ref = col };
+    args[1] = pattern;
+    const call: ir.Expr = .{ .call = .{ .fn_name = try p.arena.dupe(u8, "like"), .args = args } };
+    return makeExprComparisonPredicate(p, call, .neq, .{ .lit = .{ .int = 0 } });
 }
 
 fn isComparisonToken(tag: anytype) bool {

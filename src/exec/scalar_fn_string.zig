@@ -13,6 +13,7 @@ const stringStoreOf = common.stringStoreOf;
 const Type = @import("../types.zig").Type;
 
 const regex = @import("../util/regex.zig");
+const predicate = @import("predicate.zig");
 
 // ---------------------------------------------------------------------------
 // Core string kernels (upper, lower, length, trims, reverse, concat,
@@ -995,6 +996,21 @@ pub fn splitPartKernel(allocator: Allocator, args: []const ColumnView, out: *Col
                 part -= 1;
             }
         }
+    }
+}
+
+/// `s LIKE pattern` for a pattern that isn't a literal (the parser keeps a
+/// literal pattern on the `.like` predicate). The pattern may differ per row;
+/// it compiles again only when it changes, so a constant one compiles once
+/// per batch.
+pub fn likeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const text = stringViewOf(args[0]);
+    const patterns = stringViewOf(args[1]);
+    var plan: ?predicate.LikePlan = null;
+    for (0..row_count) |i| {
+        const pattern = patterns.rowBytes(i);
+        if (plan == null or !std.mem.eql(u8, plan.?.pattern, pattern)) plan = predicate.compileLike(pattern);
+        try out.data.boolean.append(allocator, @intFromBool(plan.?.match(text.rowBytes(i))));
     }
 }
 
