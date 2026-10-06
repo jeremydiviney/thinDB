@@ -42,10 +42,13 @@ fn ordOf(i: usize) ?i64 {
     return @intCast((i * 7) % 11);
 }
 
+/// NULL on every thirteenth row and on row 47, group 2's greatest key, so
+/// that group's MAX_BY(lbl) is NULL although earlier rows carry a label.
 fn lblPresent(i: usize) bool {
-    return i % 13 != 0;
+    return i % 13 != 0 and i != 47;
 }
 
+/// NULL on every sixth row, which includes row 6, group 1's greatest key.
 fn viOf(i: usize) ?i32 {
     if (i % 6 == 0) return null;
     return @intCast(i * 3);
@@ -58,10 +61,9 @@ fn aStrPresent(i: usize) bool {
 }
 
 const Expected = struct {
-    /// Winning input row of MAX_BY(lbl, ord) / MAX_BY_KEY(lbl, ord).
+    /// Winning input row of every MAX_BY / MAX_BY_KEY over `ord`: the first
+    /// row with the greatest non-NULL key, whatever its value.
     mb_row: ?usize = null,
-    /// Winning input row of MAX_BY(v_i, ord).
-    mbi_row: ?usize = null,
     /// First row with a non-NULL a_str / v_i.
     av_str_row: ?usize = null,
     av_i_row: ?usize = null,
@@ -72,8 +74,7 @@ fn bruteForce() [GROUPS]Expected {
     for (0..ROWS) |i| {
         const e = &out[groupOf(i)];
         if (ordOf(i)) |k| {
-            if (lblPresent(i) and (e.mb_row == null or k > ordOf(e.mb_row.?).?)) e.mb_row = i;
-            if (viOf(i) != null and (e.mbi_row == null or k > ordOf(e.mbi_row.?).?)) e.mbi_row = i;
+            if (e.mb_row == null or k > ordOf(e.mb_row.?).?) e.mb_row = i;
         }
         if (e.av_str_row == null and aStrPresent(i)) e.av_str_row = i;
         if (e.av_i_row == null and viOf(i) != null) e.av_i_row = i;
@@ -251,11 +252,12 @@ test "narrow MAX_BY / MAX_BY_KEY / ANY_VALUE / FIRST cells match the wide path a
             const g: usize = @intCast(b.values[0].data.int[r]);
             const ex = expected[g];
             const mb_key: ?i64 = if (ex.mb_row) |i| ordOf(i).? else null;
-            try expectStrCell(b.values[1], r, ex.mb_row, "lbl-");
-            try expectStrCell(b.values[2], r, ex.mb_row, "lbl-");
+            const lbl_row: ?usize = if (ex.mb_row) |i| (if (lblPresent(i)) i else null) else null;
+            try expectStrCell(b.values[1], r, lbl_row, "lbl-");
+            try expectStrCell(b.values[2], r, lbl_row, "lbl-");
             try expectI64Cell(b.values[3], r, mb_key);
             try expectF64Cell(b.values[4], r, mb_key);
-            const mbi_val: ?i32 = if (ex.mbi_row) |i| viOf(i).? else null;
+            const mbi_val: ?i32 = if (ex.mb_row) |i| viOf(i) else null;
             try expectI32Cell(b.values[5], r, mbi_val);
             try expectI32Cell(b.values[6], r, mbi_val);
             try expectStrCell(b.values[7], r, ex.av_str_row, "a-");

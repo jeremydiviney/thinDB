@@ -411,6 +411,7 @@ test "keyed region: MAX_BY preserves computed ranking keys NULLs and extreme ord
         \\(4,'a',1,-5,NULL,NULL),
         \\(5,'a',2,NULL,5.0,'no-key'),
         \\(6,'a',2,1,NULL,NULL),
+        \\(9,'a',2,0,7.0,'mid'),
         \\(7,'b',1,-7,2.5,'only'),
         \\(8,NULL,1,-2,4.5,'null-group')
     );
