@@ -956,6 +956,66 @@ test "keyed region: a DATETIME month converted to a DATE order key keeps the reg
     }
 }
 
+/// A row-aligned kernel with a broadcast lookup keyed by a declared string.
+const broadcast_scale = struct {
+    const tdb = thindb.tdb;
+    pub const spec = tdb.TableFnSpec{ .name = "broadcast_scale", .execution = .either, .row_aligned = true, .broadcast_inputs = &.{1} };
+    pub const Input = struct { custLC: ?[]const u8, amount: ?i64 };
+    pub const Carry = struct { projectId: ?i64, month: ?i32 };
+    pub const Input2 = struct { code: ?[]const u8, mult: ?i64 };
+    pub const Output = struct { projectId: ?i64, custLC: ?[]const u8, month: ?i32, scaled: ?i64 };
+    pub const Computed = struct { scaled: ?i64 };
+    pub const passthrough = .{ "projectId", "custLC", "month" };
+    pub fn process(_: *tdb.Ctx, p: tdb.Partition(Input), scales: tdb.Partition(Input2), out: *tdb.Writer(Computed)) !void {
+        const codes = scales.col(.code);
+        const mults = scales.col(.mult);
+        var rows = p.iter();
+        while (rows.next()) |row| {
+            var mult: ?i64 = null;
+            if (row.custLC) |lc| {
+                for (0..scales.len) |i| {
+                    const code = codes.get(i) orelse continue;
+                    if (std.mem.eql(u8, code, lc)) mult = mults.get(i);
+                }
+            }
+            const amount = row.amount orelse {
+                try out.row(.{ .scaled = null });
+                continue;
+            };
+            try out.row(.{ .scaled = if (mult) |m| amount * m else null });
+        }
+    }
+};
+
+test "keyed region: broadcast inputs bind VARCHAR and TEXT columns to a declared string as in ordinary execution" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try db.registerTableFn(broadcast_scale);
+    try helpers.exec(allocator, db, "CREATE TABLE scale_varchar (code VARCHAR(16) PRIMARY KEY, mult BIGINT)");
+    try helpers.exec(allocator, db, "CREATE TABLE scale_text (id INT PRIMARY KEY, code TEXT, mult BIGINT)");
+    // cust_3 has no scale; cust_6 has a NULL one.
+    try helpers.exec(allocator, db, "INSERT INTO scale_varchar VALUES ('cust_0',2),('cust_1',3),('cust_2',4),('cust_4',6),('cust_5',7),('cust_6',NULL),('cust_7',9)");
+    try helpers.exec(allocator, db, "INSERT INTO scale_text VALUES (1,'cust_0',2),(2,'cust_1',3),(3,'cust_2',4),(4,'cust_4',6),(5,'cust_5',7),(6,'cust_6',NULL),(7,'cust_7',9)");
+    inline for (.{ "scale_varchar", "scale_text" }) |table| {
+        try expect_keyed_matches(allocator, db,
+            \\scaled AS (
+            \\  SELECT * FROM TABLE(broadcast_scale(
+            \\    (SELECT custLC, amount, projectId, month FROM inv WHERE projectId >= 100),
+        ++ " (SELECT code, mult FROM " ++ table ++ ")" ++
+            \\  ) PARTITION BY custLC)
+            \\), w AS (
+            \\  SELECT projectId, custLC, month, scaled,
+            \\    LAG(scaled) OVER (PARTITION BY custLC ORDER BY month, projectId) AS prior
+            \\  FROM scaled
+            \\)
+            \\SELECT * FROM w ORDER BY projectId, custLC, month
+        , "prior");
+    }
+}
+
 test "keyed region: route provenance survives replacing TVFs and aggregation in one region" {
     const allocator = std.testing.allocator;
     const tdb = thindb.tdb;
