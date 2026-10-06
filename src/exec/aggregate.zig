@@ -1008,8 +1008,10 @@ pub const Aggregate = struct {
     /// Propagated per-output-column stats: group-key columns carry their
     /// input stats; aggregate-output columns are bounded by the group count
     /// (≤ `upper_rows`) with unknown min/max. Computed at create from the
-    /// upstream stats; arena-owned, borrowed by `stats()`. Empty when the
-    /// upstream carries no per-column array.
+    /// upstream stats; owned by `allocator`, not the arena: `evict` frees the
+    /// arena before the emit, and an operator above may ask for stats after
+    /// that. Borrowed by `stats()`. Empty when the upstream carries no
+    /// per-column array.
     cached_stats: []const exec.ColStat = &.{},
     /// Provable upper bound on the output row (group) count, cached at create
     /// so `stats()` doesn't recompute the product. For a global aggregate
@@ -1170,6 +1172,7 @@ pub const Aggregate = struct {
         }
 
         try self.computeOutputStats(up_schema);
+        errdefer self.allocator.free(self.cached_stats);
 
         // No-GROUP-BY COUNT(DISTINCT int≤64): presize the membership set from
         // the value column's cardinality estimate (capped at PRESIZE_CAP) so the
@@ -1378,6 +1381,7 @@ pub const Aggregate = struct {
         self.allocator.free(self.cd);
         if (self.top_k) |r| self.allocator.free(r.keys);
         if (self.int_layout) |l| l.deinit(self.allocator);
+        self.allocator.free(self.cached_stats);
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -1448,7 +1452,7 @@ pub const Aggregate = struct {
     /// Called once at create. The group-count bound is the saturating
     /// product of the group keys' NDVs, clamped to the input row count; an
     /// unknown key NDV (or a missing per-column array) leaves only the row
-    /// ceiling. Output stats are arena-owned.
+    /// ceiling. Output stats are owned by `allocator` so they outlive `evict`.
     fn computeOutputStats(self: *Aggregate, up_schema: []const Column) !void {
         const up = self.upstream.stats();
 
@@ -1459,8 +1463,7 @@ pub const Aggregate = struct {
             // (COUNT(*) ∈ [0, rows], SUM ∈ [rows·lo, rows·hi], MIN/MAX inherit
             // the source column's range). Output schema here is the agg outputs
             // only (no group keys).
-            const aa = self.arena.allocator();
-            const out_stats = try aa.alloc(exec.ColStat, self.output_schema.len);
+            const out_stats = try self.allocator.alloc(exec.ColStat, self.output_schema.len);
             const have_up = up.column_stats.len == up_schema.len;
             for (self.aggs, self.agg_col_indices, self.output_schema, out_stats) |a, maybe_idx, oc, *s| {
                 const src: ?exec.ColStat = if (have_up) (if (maybe_idx) |idx| up.column_stats[idx] else null) else null;
@@ -1495,8 +1498,7 @@ pub const Aggregate = struct {
         // unknown. Skip when the upstream carries no full per-column array —
         // fabricating one would change the "empty ⇒ no info" contract.
         if (up.column_stats.len != up_schema.len) return;
-        const aa = self.arena.allocator();
-        const out_stats = try aa.alloc(exec.ColStat, self.output_schema.len);
+        const out_stats = try self.allocator.alloc(exec.ColStat, self.output_schema.len);
         for (self.group_col_indices, 0..) |ci, i| out_stats[i] = up.column_stats[ci];
         const agg_ndv: exec.ColCard = if (upper > std.math.maxInt(u32))
             .unknown
