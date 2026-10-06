@@ -16,6 +16,7 @@ const transform = @import("../engine/transform.zig");
 const exec = @import("exec.zig");
 const Batch = exec.Batch;
 const AggSpec = exec.AggSpec;
+const PoisonOnFree = @import("../util/poison_allocator.zig").PoisonOnFree;
 
 const ROWS: usize = 60;
 const GROUPS: usize = 5;
@@ -426,4 +427,35 @@ test "MAX_BY, MIN/MAX and LAST keep a state bounded by the groups when every row
         const large = try improvingPeak(a, 200_000, shape);
         try std.testing.expect(large < small + (1 << 20));
     }
+}
+
+test "an aggregate reports the same stats after it has emitted" {
+    const a = std.testing.allocator;
+    var full = try buildFixture(a);
+    defer for (&full) |*c| c.deinit(a);
+    // Memory the aggregate frees reads as poison, so stats left in it
+    // differ from the copy taken before the emit.
+    var poison: PoisonOnFree = .{ .child = a };
+    const pa = poison.allocator();
+
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .as = "n" },
+        .{ .func = .sum, .col = "v_i", .as = "total" },
+    };
+    const src = try Source.create(pa, &full);
+    const q = exec.makeQuery(pa, src);
+    var agg = q.groupBy(&.{}, &aggs) catch |e| {
+        var qq = q;
+        qq.deinit();
+        return e;
+    };
+    defer agg.deinit();
+
+    const before = try a.dupe(exec.ColStat, agg.stats().column_stats);
+    defer a.free(before);
+    try std.testing.expectEqual(aggs.len, before.len);
+    while (try agg.next()) |_| {}
+    // An operator above can ask again once this one has drained (a window
+    // checking its input's order).
+    try std.testing.expectEqualDeep(before, agg.stats().column_stats);
 }
