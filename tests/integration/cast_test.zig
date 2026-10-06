@@ -543,3 +543,59 @@ test "LARGEINT columns keep every digit through keys, aggregates, joins, ALTER a
         "170141183460469231731687303715884105727 1 -170141183460469231731687303715884105728",
     });
 }
+
+test "cast: FLOAT is 32-bit: the nearest f32, NULL past its range (issue #551)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setup(allocator, db);
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{
+        .{ .sql = "SELECT CAST(CAST(x AS FLOAT) AS CHAR) FROM ct WHERE id <= 5 ORDER BY id", .expected = &.{ "2.5", "-2.5", "1e20", NULL, "0" } },
+        .{ .sql = "SELECT CAST(CAST(d AS FLOAT) AS CHAR) FROM ct WHERE id <= 5 ORDER BY id", .expected = &.{ "2.5", "-2.5", "1.99", NULL, "0" } },
+        .{ .sql = "SELECT CAST(CAST(s AS FLOAT) AS CHAR) FROM ct ORDER BY id", .expected = &.{ "12", "5", "1.7", NULL, NULL, "1000", "10000000000", "-1.005", NULL, NULL } },
+        // A DECIMAL target reads an integer's f32; text would read the integer.
+        .{ .sql = "SELECT CAST(CAST(CAST(b AS FLOAT) AS DECIMAL(20,0)) AS CHAR) FROM ct WHERE id <= 4 ORDER BY id", .expected = &.{ "12", "10000000000", "-10000000000", NULL } },
+        .{ .sql = "SELECT CAST(CAST(CAST(16777217 AS FLOAT) AS DECIMAL(10,0)) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777216"} },
+        .{ .sql = "SELECT CAST(CAST('1.1691079661731327' AS FLOAT) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"1.1691079"} },
+        .{ .sql = "SELECT CAST(CAST(CAST('1e39' AS DOUBLE) AS FLOAT) AS CHAR) FROM ct WHERE id = 1", .expected = &.{NULL} },
+        // Arithmetic reads the f32 value as a DOUBLE, as StarRocks does.
+        .{ .sql = "SELECT CAST(SUM(CAST(x AS FLOAT) + 0.2) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"2.7"} },
+        .{ .sql = "SELECT CAST(SUM(f) AS CHAR) FROM (SELECT CAST(1.1 AS FLOAT) AS f FROM ct WHERE id = 1 UNION ALL SELECT CAST(2.2 AS FLOAT) FROM ct WHERE id = 1) t", .expected = &.{"3.3000000715255737"} },
+        // 1.000000055 rounds to 1 as an f32, so the product is 10000000, not 10000000.55.
+        .{ .sql = "SELECT CAST(ROUND(10000000 * CAST(1.000000055 AS FLOAT)) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"10000000"} },
+    });
+
+    var q = try helpers.runSqlCtx(allocator, db, "SELECT CAST(x AS FLOAT) AS f, IF(id = 1, CAST(x AS FLOAT), CAST(d AS FLOAT)) AS g FROM ct WHERE id = 1");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(f32, 2.5), batch.values[0].data.float[0]);
+    try std.testing.expectEqual(@as(f32, 2.5), batch.values[1].data.float[0]);
+}
+
+test "cast: an integer's FLOAT converted again converts the integer, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setup(allocator, db);
+
+    // b + 16777205 is 16777217 on row 1, which FLOAT holds as 16777216.
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{
+        .{ .sql = "SELECT CAST(33554434 / CAST(b + 16777205 AS FLOAT) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"2"} },
+        .{ .sql = "SELECT CAST(CAST(b + 16777205 AS FLOAT) * 1 AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777217"} },
+        .{ .sql = "SELECT CAST(CAST(CAST(b + 16777205 AS FLOAT) AS DOUBLE) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777217"} },
+        .{ .sql = "SELECT CAST(CAST(b + 16777205 AS FLOAT) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777217"} },
+        .{ .sql = "SELECT CAST(CASE WHEN id = 1 THEN CAST(b + 16777205 AS FLOAT) ELSE x END AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777217"} },
+        .{ .sql = "SELECT CAST(IF(id = 1, CAST(b + 16777205 AS FLOAT), x) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777217"} },
+        // A DOUBLE source, an aggregate, a decimal target and a FLOAT column keep the f32.
+        .{ .sql = "SELECT CAST(CAST(x / 3 AS FLOAT) * 3 AS CHAR) FROM ct WHERE id = 1", .expected = &.{"2.4999999403953552"} },
+        .{ .sql = "SELECT CAST(SUM(CAST(b + 16777205 AS FLOAT)) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777216"} },
+        .{ .sql = "SELECT CAST(CAST(CAST(b + 16777205 AS FLOAT) AS DECIMAL(10,0)) AS CHAR) FROM ct WHERE id = 1", .expected = &.{"16777216"} },
+        .{ .sql = "SELECT CAST(MAX(f * 1) AS CHAR) FROM (SELECT CAST(b + 16777205 AS FLOAT) AS f FROM ct WHERE id = 1) t", .expected = &.{"16777216"} },
+        .{ .sql = "WITH t AS (SELECT CAST(b + 16777205 AS FLOAT) AS f FROM ct WHERE id = 1) SELECT CAST(MAX(f * 1) AS CHAR) FROM t", .expected = &.{"16777216"} },
+    });
+}

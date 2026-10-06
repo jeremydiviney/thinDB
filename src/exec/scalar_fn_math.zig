@@ -603,6 +603,10 @@ pub fn doubleIdentityKernel(allocator: Allocator, args: []const ColumnView, out:
     while (i < row_count) : (i += 1) try out.data.double.append(allocator, s[i]);
 }
 
+pub fn floatIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try out.data.float.appendSlice(allocator, args[0].data.float[0..row_count]);
+}
+
 pub fn booleanIdentityKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const s = args[0].data.boolean;
     var i: usize = 0;
@@ -743,6 +747,25 @@ pub fn bigintToMysqlUnsignedKernel(allocator: Allocator, args: []const ColumnVie
 pub const stringToDoubleKernel = convertOrNull("double", struct {
     fn f(v: ColumnView, row: usize) ?f64 {
         return common.textDouble(stringViewOf(v).rowBytes(row));
+    }
+}.f);
+
+/// `x` as the nearest FLOAT, or null when it is past FLOAT's range.
+pub fn narrowFloat(x: f64) ?f32 {
+    const f: f32 = @floatCast(x);
+    if (std.math.isInf(f) and !std.math.isInf(x)) return null;
+    return f;
+}
+
+pub const doubleToFloatKernel = convertOrNull("float", struct {
+    fn f(v: ColumnView, row: usize) ?f32 {
+        return narrowFloat(v.data.double[row]);
+    }
+}.f);
+
+pub const stringToFloatKernel = convertOrNull("float", struct {
+    fn f(v: ColumnView, row: usize) ?f32 {
+        return narrowFloat(common.textDouble(stringViewOf(v).rowBytes(row)) orelse return null);
     }
 }.f);
 

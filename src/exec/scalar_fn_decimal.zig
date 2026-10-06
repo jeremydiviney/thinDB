@@ -372,6 +372,14 @@ pub fn toDoubleKernel(allocator: Allocator, arg_types: []const Type, out_type: T
     while (row < n) : (row += 1) try out.data.double.append(allocator, f64At(args[0], arg_types[0], row));
 }
 
+/// DECIMAL to FLOAT: the nearest f32 of its value; 38 digits stay inside
+/// FLOAT's range.
+pub fn toFloatKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = out_type;
+    var row: usize = 0;
+    while (row < n) : (row += 1) try out.data.float.append(allocator, @floatCast(f64At(args[0], arg_types[0], row)));
+}
+
 /// DECIMAL to an integer type: truncates toward zero, as StarRocks does; a
 /// value outside the target's range is NULL. `.kernel_managed`.
 pub fn toIntKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
