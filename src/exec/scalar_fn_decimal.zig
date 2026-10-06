@@ -7,7 +7,7 @@
 //! `TypedKernel` path (arg types + out type passed in) rather than the plain
 //! `Kernel` path.
 //!
-//! Result precision/scale follow DuckDB (DESIGN.md §3.4). Arithmetic is exact:
+//! Result precision/scale follow DESIGN.md §3.4. Arithmetic is exact:
 //! operands are aligned to a common scale in i128, and a result that overflows
 //! its declared precision raises `error.ArithmeticOverflow` (row-level), never
 //! silently truncates. Mixed decimal/integer promotes the integer to
@@ -128,7 +128,7 @@ pub fn decTypeFor(p_in: u8, s_in: u8) Type {
 
 pub const Op = enum { add, sub, mul, div, mod };
 
-/// Result `DecimalSpec` of `a <op> b` per DESIGN.md §3.4 (DuckDB rules).
+/// Result `DecimalSpec` of `a <op> b` per DESIGN.md §3.4.
 fn arithSpec(op: Op, a: DecimalSpec, b: DecimalSpec) DecimalSpec {
     return switch (op) {
         .add, .sub, .mod => blk: {
@@ -137,8 +137,20 @@ fn arithSpec(op: Op, a: DecimalSpec, b: DecimalSpec) DecimalSpec {
             break :blk .{ .p = @min(MAX_PRECISION, lead + s + 1), .s = s };
         },
         .mul => .{ .p = @min(MAX_PRECISION, a.p + b.p), .s = @min(MAX_PRECISION, a.s + b.s) },
-        .div => .{ .p = @min(MAX_PRECISION, a.p + b.s + 4), .s = a.s + 4 },
+        .div => blk: {
+            const s = quotientScale(a.s);
+            // The quotient's integer digits grow by the divisor's scale.
+            break :blk .{ .p = @min(MAX_PRECISION, a.p - a.s + b.s + s), .s = s };
+        },
     };
+}
+
+/// StarRocks' quotient scale, which only the dividend's scale decides: six
+/// more digits up to scale 12, then the dividend's own. ROUND over a quotient
+/// sees these digits, so `ROUND(int / rate)` matches StarRocks' integer.
+pub fn quotientScale(dividend_s: u8) u8 {
+    if (dividend_s <= 6) return dividend_s + 6;
+    return @max(dividend_s, 12);
 }
 
 /// Compute the result `Type` of an arithmetic op over the given arg types.
@@ -262,7 +274,7 @@ fn arithDecimal(
             },
             .div => blk: {
                 if (b == 0) break :blk 0;
-                // result scale sr = s0+4 ⇒ exponent sr+s1-s0 = s1+4 ≥ 0.
+                // quotientScale(s0) ≥ s0, so the exponent sr+s1-s0 is ≥ 0.
                 const scaled = try orErr(mulPow10(a, sr + s1 - s0), valid);
                 break :blk roundDiv(scaled, b);
             },
@@ -956,8 +968,10 @@ test "arithResultType follows DESIGN §3.4" {
     try std.testing.expectEqual(DecimalSpec{ .p = 13, .s = 4 }, arithResultType(.add, a, b).decimalSpec().?);
     // mul: p1+p2=18, s1+s2=6
     try std.testing.expectEqual(DecimalSpec{ .p = 18, .s = 6 }, arithResultType(.mul, a, b).decimalSpec().?);
-    // div: p1+s2+4=18, s1+4=6
-    try std.testing.expectEqual(DecimalSpec{ .p = 18, .s = 6 }, arithResultType(.div, a, b).decimalSpec().?);
+    // div: scale s1+6=8, precision p1-s1+s2+8=20
+    try std.testing.expectEqual(DecimalSpec{ .p = 20, .s = 8 }, arithResultType(.div, a, b).decimalSpec().?);
+    // an int dividend is DECIMAL(10,0): scale 0+6, precision 10+4+6=20
+    try std.testing.expectEqual(DecimalSpec{ .p = 20, .s = 6 }, arithResultType(.div, .int, b).decimalSpec().?);
     // mixed with int: int promotes to (10,0)
     try std.testing.expectEqual(DecimalSpec{ .p = 13, .s = 2 }, arithResultType(.add, a, .int).decimalSpec().?);
     // mixed with float collapses to double
@@ -980,4 +994,13 @@ test "textMantissa and formatDecimal round-trip" {
     try std.testing.expectEqualStrings("1.230000", formatDecimal(&buf, 1230000, 6));
     try std.testing.expectEqualStrings("-0.50", formatDecimal(&buf, -50, 2));
     try std.testing.expectEqualStrings("42", formatDecimal(&buf, 42, 0));
+}
+
+test "quotientScale follows the dividend's scale only" {
+    const cases = .{
+        .{ .s = 0, .expected = 6 },   .{ .s = 2, .expected = 8 },   .{ .s = 6, .expected = 12 },
+        .{ .s = 8, .expected = 12 },  .{ .s = 12, .expected = 12 }, .{ .s = 14, .expected = 14 },
+        .{ .s = 30, .expected = 30 },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(@as(u8, c.expected), quotientScale(c.s));
 }
