@@ -1036,3 +1036,51 @@ test "a value where a condition stands reads as CAST(x AS BOOLEAN) (issue #391)"
     try expectTexts(allocator, db, .mysql, "SELECT id FROM bc WHERE s || n ORDER BY id", &.{ "1", "2", "4", "5", "6", "9" });
     try expectTexts(allocator, db, .neutral, "SELECT s || 'x' FROM bc WHERE id = 2", &.{"1x"});
 }
+
+test "MAX_BY skips NULL keys, and the greatest key's row wins even when its value is NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE mb (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, o BIGINT, f DOUBLE, v BIGINT, s VARCHAR(16))");
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO mb (id, g, o, f, v, s) VALUES " ++
+            "(1,1,1,1.0,10,'a'), (2,1,2,2.0,NULL,NULL), " ++
+            "(3,2,1,1.0,7,'x'), (4,2,NULL,3.0,99,'zz'), " ++
+            "(5,3,NULL,1.0,5,'n'), " ++
+            "(6,4,1,1.0,NULL,NULL), (7,4,3,2.0,8,'late'), (8,4,2,9.0,NULL,NULL)",
+    );
+    const t = try db.openTable("mb", .{});
+    try t.flush();
+
+    // The BIGINT key takes the narrow aggregate cells, the DOUBLE key the wide ones.
+    {
+        var q = try runSql(allocator, db, "SELECT g, MAX_BY(v, o), MAX_BY(v, f) FROM mb GROUP BY g ORDER BY g");
+        defer q.deinit();
+        const cells = try helpers.collectIntCells(allocator, &q);
+        defer allocator.free(cells);
+        try std.testing.expectEqualSlices(?i64, &[_]?i64{ 1, null, null, 2, 7, 99, 3, null, 5, 4, 8, null }, cells);
+    }
+    const cases = .{
+        .{ "SELECT MAX_BY(s, o) AS m FROM mb GROUP BY g ORDER BY g", [_]?[]const u8{ null, "x", null, "late" } },
+        .{ "SELECT MAX_BY(s, f) AS m FROM mb GROUP BY g ORDER BY g", [_]?[]const u8{ null, "zz", "n", null } },
+        .{ "SELECT MAX_BY(s, o) AS m FROM mb", [_]?[]const u8{"late"} },
+        .{ "SELECT MAX_BY(s, f) AS m FROM mb", [_]?[]const u8{null} },
+        .{ "SELECT MAX_BY(v, f) AS m FROM mb", [_]?[]const u8{null} },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try helpers.columnText(allocator, &q);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(c[1].len, got.len);
+        for (c[1], got) |want, have| {
+            if (want) |w| try std.testing.expectEqualStrings(w, have orelse return error.TestUnexpectedResult) else try std.testing.expectEqual(@as(?[]u8, null), have);
+        }
+    }
+}

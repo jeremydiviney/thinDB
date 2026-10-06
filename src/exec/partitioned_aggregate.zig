@@ -1350,7 +1350,7 @@ test "PartitionedAggregate drains a partition in windows with exact NULL and dis
     try testing.expectEqual(@as(usize, group_count), seen);
 }
 
-test "two-phase max_by via max_by_key partials matches single-phase (NULL-value trap)" {
+test "two-phase max_by via max_by_key partials matches single-phase (NULL-value winner)" {
     const a = testing.allocator;
     const Aggregate = @import("aggregate.zig").Aggregate;
 
@@ -1360,10 +1360,10 @@ test "two-phase max_by via max_by_key partials matches single-phase (NULL-value 
         .{ .name = "ord", .type = .bigint, .nullable = true },
     };
 
-    // Chunk A carries g0's HIGHEST ord on a NULL-value row — a naive hidden
-    // MAX(ord) would carry ord 99 alongside chunk A's value "early" and beat
-    // chunk B's honest ("winner", 50) in the combine. max_by_key shares
-    // max_by's skip-if-either-NULL pair semantics, so A's pair is (early, 10).
+    // Chunk A carries g0's HIGHEST ord on a NULL-value row, so g0's MAX_BY is
+    // NULL. Chunk A's partial must carry that row whole, (NULL, 99), to beat
+    // chunk B's ("winner", 50) in the combine; a twin that skipped NULL values
+    // would carry (early, 10) and lose. g1's NULL-ord row is skipped.
     const Row = struct { k: []const u8, v: ?[]const u8, o: ?i64 };
     const chunk_a = [_]Row{
         .{ .k = "g0", .v = "early", .o = 10 },
@@ -1501,7 +1501,8 @@ test "two-phase max_by via max_by_key partials matches single-phase (NULL-value 
     try testing.expectEqual(@as(usize, 3), one_phase.len);
     try testing.expectEqual(one_phase.len, two_phase.len);
     for (two_phase, one_phase) |t, s| try testing.expectEqualStrings(s, t);
-    try testing.expectEqualStrings("g0|winner", two_phase[0]);
+    try testing.expectEqualStrings("g0|<NULL>", two_phase[0]);
+    try testing.expectEqualStrings("g1|b", two_phase[1]);
 }
 
 const mixed_schema = [_]Column{

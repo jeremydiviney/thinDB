@@ -84,12 +84,13 @@ pub const AggFunc = enum {
     any_value,
     first,
     last,
-    /// Return the value from the row whose second argument is maximal.
+    /// Return the value from the row whose second argument is maximal: rows
+    /// with a NULL second argument are skipped, a NULL value can win.
     max_by,
     /// Internal twin of max_by for two-phase partials: identical accumulation
-    /// (same skip-if-either-NULL pair semantics) but emits the winning KEY
-    /// (order value) instead of the value. Never produced by the parser;
-    /// producers must set `out_type_override` to the key column's type.
+    /// (it picks the same row) but emits the winning KEY (order value) instead
+    /// of the value. Never produced by the parser; producers must set
+    /// `out_type_override` to the key column's type.
     max_by_key,
     /// Bitwise aggregates over integer-family inputs.
     bit_and,
@@ -396,10 +397,13 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
     };
 }
 
+/// MAX_BY follows StarRocks: a row with a NULL key is skipped, and the
+/// greatest key's row wins even when its value is NULL, so the result is
+/// NULL then. Ties keep the first row.
 fn maxByUpdate(aa: Allocator, bank: *StringBank, s: *AccState, value_view: ColumnView, key_view: ColumnView, row_start: u32, row_end: u32) !void {
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
-        if (!value_view.isValid(r) or !key_view.isValid(r)) continue;
+        if (!key_view.isValid(r)) continue;
         if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
         try replaceMaxBy(bank, aa, s, value_view, key_view, r);
     }
@@ -408,33 +412,43 @@ fn maxByUpdate(aa: Allocator, bank: *StringBank, s: *AccState, value_view: Colum
 fn replaceMaxBy(bank: *StringBank, aa: Allocator, s: *AccState, value_view: ColumnView, key_view: ColumnView, row: u32) !void {
     const seen = s.max_by.seen;
     s.max_by.key = try replaceValueFromRow(bank, aa, if (seen) s.max_by.key else null, key_view, row);
-    s.max_by.value = try replaceValueFromRow(bank, aa, if (seen) s.max_by.value else null, value_view, row);
+    // A NULL winner hands its string copy back to the bank, so a group whose
+    // winner flips between NULL and text keeps one copy, not one per flip.
+    const held: ?types.Value = if (s.max_by.value == .text) s.max_by.value else null;
+    s.max_by.value_null = !value_view.isValid(row);
+    if (!s.max_by.value_null) {
+        s.max_by.value = try replaceValueFromRow(bank, aa, held, value_view, row);
+    } else if (held) |h| {
+        s.max_by.value = .{ .text = try bank.replace(aa, h.text, "") };
+    }
     s.max_by.seen = true;
 }
 
 /// Row loop of the narrow MAX_BY scatter, specialized per key slice type and
 /// payload kind (`vs`: a scalar slice, a `StringView`, or `{}` for
-/// MAX_BY_KEY). Same rules as `maxByUpdate`: a row with a NULL payload or a
-/// NULL key is skipped, a strictly greater key replaces the cell, ties keep
-/// the first.
+/// MAX_BY_KEY). Same rules as `maxByUpdate`: a row with a NULL key is
+/// skipped, a strictly greater key replaces the cell (a NULL value included),
+/// ties keep the first.
 fn maxByNarrowRows(bank: *StringBank, aa: Allocator, col: []MaxByNarrow, gids: []const u32, key_view: ColumnView, ks: anytype, value_view: ColumnView, vs: anytype) !void {
     const V = @TypeOf(vs);
     const key_nulls = key_view.nulls != null;
     const value_nulls = value_view.nulls != null;
     for (gids, 0..) |g, r| {
-        if (value_nulls and !value_view.isValid(r)) continue;
         if (key_nulls and !key_view.isValid(r)) continue;
         const k: i64 = ks[r];
         const s = &col[g];
         if (s.seen and k <= s.key) continue;
         s.key = k;
+        s.val_null = value_nulls and !value_view.isValid(r);
         if (V == storage.StringView) {
-            const bytes = vs.rowBytes(r);
+            // A NULL value is stored as an empty copy, so the cell's block
+            // goes back to the bank and `val` stays a valid previous copy.
+            const bytes = if (s.val_null) "" else vs.rowBytes(r);
             const old: []const u8 = if (s.seen) s.val.str[0..s.len] else "";
             s.val = .{ .str = (try bank.replace(aa, old, bytes)).ptr };
             s.len = @intCast(bytes.len);
         } else if (V != void) {
-            s.val = .{ .int = vs[r] };
+            s.val = .{ .int = if (s.val_null) 0 else vs[r] };
         }
         s.seen = true;
     }
@@ -647,6 +661,7 @@ const MaxByAcc = struct {
     seen: bool = false,
     key: types.Value = .{ .int = 0 },
     value: types.Value = .{ .int = 0 },
+    value_null: bool = false,
 };
 
 /// Types whose every value widens losslessly into an i64: the MAX_BY order
@@ -678,6 +693,7 @@ const MaxByNarrow = struct {
     val: NarrowVal = .{ .int = 0 },
     len: u32 = 0,
     seen: bool = false,
+    val_null: bool = false,
 };
 
 /// ANY_VALUE / FIRST cell: the first non-NULL payload, 16 B.
@@ -1807,7 +1823,7 @@ pub const Aggregate = struct {
         const col = self.agg_cols[ai].other;
         var r: u32 = 0;
         while (r < gids.len) : (r += 1) {
-            if (!value_view.isValid(r) or !key_view.isValid(r)) continue;
+            if (!key_view.isValid(r)) continue;
             const s = &col[gids[r]];
             if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
             try replaceMaxBy(&self.str_bank, aa, s, value_view, key_view, r);
@@ -2278,7 +2294,7 @@ pub const Aggregate = struct {
             .{ .int = 0 }
         else
             narrowValue(up_schema[self.agg_col_indices[ai].?].type, s.val, s.len);
-        return .{ .max_by = .{ .seen = true, .key = narrowScalarValue(key_t, s.key), .value = value } };
+        return .{ .max_by = .{ .seen = true, .key = narrowScalarValue(key_t, s.key), .value = value, .value_null = s.val_null } };
     }
 
     fn wrapValueNarrow(self: *Aggregate, ai: usize, s: ValueNarrow) AccState {
@@ -4264,7 +4280,7 @@ pub fn appendAccToColumn(
         },
         .max_by => {
             const v = state.max_by;
-            if (!v.seen) {
+            if (!v.seen or v.value_null) {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else try appendValueToColumn(allocator, col, out_type, v.value);

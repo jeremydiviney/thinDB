@@ -2471,7 +2471,7 @@ pub const RegionWorker = struct {
                     .min_int => |c| accumMinMax(false, cells.items, ord_of, fr.views[c], rng[0]),
                     .max_int => |c| accumMinMax(true, cells.items, ord_of, fr.views[c], rng[0]),
                     .max_str => |c| accumMaxStr(cells.items, ord_of, fr.views[c], rng[0]),
-                    .max_by => |mb| accumMaxBy(cells.items, ord_of, fr.views[mb.val], fr.views[mb.ord], rng[0]),
+                    .max_by => |mb| accumMaxBy(cells.items, ord_of, fr.views[mb.ord], rng[0]),
                 }
             }
 
@@ -4587,14 +4587,13 @@ fn accumMaxStr(cells: []AccCell, ord_of: []const u32, v: ColumnView, base: usize
     }
 }
 
-fn accumMaxBy(cells: []AccCell, ord_of: []const u32, val_v: ColumnView, ord_v: ColumnView, base: usize) void {
+fn accumMaxBy(cells: []AccCell, ord_of: []const u32, ord_v: ColumnView, base: usize) void {
     switch (ord_v.data) {
         inline .tinyint, .smallint, .int, .bigint, .date, .datetime => |vals| {
             for (ord_of, 0..) |gi, li| {
-                // Engine MAX_BY pair semantics: a row with a NULL VALUE or
-                // NULL key contributes nothing — the winner is the best-key
-                // row among rows where both are present.
-                if (!ord_v.isValid(base + li) or !val_v.isValid(base + li)) continue;
+                // Engine MAX_BY semantics: a NULL key contributes nothing; the
+                // best key's row wins even when its value is NULL.
+                if (!ord_v.isValid(base + li)) continue;
                 const o: i64 = vals[base + li];
                 const cell = &cells[gi];
                 if (!cell.seen or o > cell.i) {

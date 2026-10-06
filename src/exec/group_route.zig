@@ -1322,8 +1322,8 @@ fn radixPresized(
 /// Gated to combinable aggregates (COUNT/SUM/MIN/MAX/ANY_VALUE, plus
 /// MAX_BY via a hidden max_by_key partial) — global and grouped alike:
 /// post-#79 an empty chunk's GLOBAL partial emits COUNT=0 and NULL for
-/// everything else, and every combine function skips NULLs (max_by via its
-/// pair semantics), so empty partials can't poison the result. Cardinality
+/// everything else, and every combine function skips NULLs (max_by skips a
+/// partial whose ord is NULL), so empty partials can't poison the result. Cardinality
 /// gate mirrors routeParallelGroupBy: only proven-small key spaces — above
 /// the radix cache line the serial combine over ~unreduced partials loses.
 ///

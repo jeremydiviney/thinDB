@@ -14,10 +14,10 @@
 //!
 //! Combine correctness over "empty" partials: post-#79 a global aggregate
 //! over zero rows emits COUNT=0 and NULL for everything else, and every
-//! combine function skips NULLs (`max_by` skips a pair when EITHER side is
-//! NULL via its hidden ord twin), so a worker that saw no batches cannot
-//! poison the result — including the all-empty case, which combines back to
-//! the exact serial empty-input row.
+//! combine function skips NULLs (`max_by` skips a partial whose hidden ord
+//! twin is NULL), so a worker that saw no batches cannot poison the result —
+//! including the all-empty case, which combines back to the exact serial
+//! empty-input row.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -39,10 +39,11 @@ pub fn combinable(aggs: []const ir.AggSpec) bool {
 }
 
 /// Partial-phase specs: the originals plus one hidden `max_by_key` twin per
-/// `max_by` so its winning ord rides along for the combine. The twin shares
-/// max_by's skip-if-EITHER-NULL pair semantics — a plain MAX(ord) would count
-/// NULL-value rows and could carry an ord higher than its partial's value,
-/// poisoning the combine. Returns null when an ord column is missing.
+/// `max_by` so its winning ord rides along for the combine. The twin picks
+/// its row by max_by's rule, so it carries the ord of the very row whose
+/// value the partial emits — a NULL value included, which then competes in
+/// the combine as it would in one pass. Returns null when an ord column is
+/// missing.
 pub fn partialSpecs(arena: Allocator, up_schema: []const types.Column, aggs: []const ir.AggSpec) !?[]const ir.AggSpec {
     var n_hidden: usize = 0;
     for (aggs) |a| {
