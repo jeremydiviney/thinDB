@@ -101,7 +101,7 @@ test "decimal: + - * / scale propagation and NULL" {
     try std.testing.expectEqual(@as(?i64, null), got.items[2]);
 }
 
-test "decimal: division rounds to scale s1+4 (ties away from zero)" {
+test "decimal: division rounds to StarRocks' quotient scale (ties away from zero)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -109,14 +109,43 @@ test "decimal: division rounds to scale s1+4 (ties away from zero)" {
     defer db.close();
     try seed(allocator, db);
 
-    // a / q: a is DEC(16,6), q int -> p = 16+0+4 = 20 (>18, so decimal128),
-    // scale s1+4 = 10. 2.5/3 = 0.8333333333, 10.0/7 = 1.4285714286 (rounded).
+    // a / q: a is DEC(16,6), q int -> scale 6+6 = 12, p = 10+0+12 = 22
+    // (decimal128). 2.5/3 = 0.833333333333, 10.0/7 = 1.428571428571.
     var q = try runSql(allocator, db, "SELECT a / q AS d FROM d ORDER BY id");
     defer q.deinit();
     const got = try collectDecimal128(allocator, &q, 0);
     defer allocator.free(got);
-    try std.testing.expectEqual(@as(i128, 8_333_333_333), got[0]); // 0.8333333333
-    try std.testing.expectEqual(@as(i128, 14_285_714_286), got[1]); // 1.4285714286
+    try std.testing.expectEqualSlices(i128, &.{ 833_333_333_333, 1_428_571_428_571, 617_283_500_000 }, got);
+
+    // q / a: an integer dividend has scale 0 -> scale 6, p = 10+6+6 = 22.
+    var q2 = try runSql(allocator, db, "SELECT q / a AS d FROM d ORDER BY id");
+    defer q2.deinit();
+    const got2 = try collectDecimal128(allocator, &q2, 0);
+    defer allocator.free(got2);
+    try std.testing.expectEqualSlices(i128, &.{ 1_200_000, 700_000, 1_620_001 }, got2);
+
+    // a / b: the divisor's scale never changes the quotient's scale (12).
+    var q3 = try runSql(allocator, db, "SELECT a / b AS d FROM d WHERE b IS NOT NULL ORDER BY id");
+    defer q3.deinit();
+    const got3 = try collectDecimal128(allocator, &q3, 0);
+    defer allocator.free(got3);
+    try std.testing.expectEqualSlices(i128, &.{ 625_000_000_000, 3_333_333_333_333 }, got3);
+}
+
+test "decimal: ROUND over a quotient sees StarRocks' digits" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // 3953 / 0.855350 = 4621.4999707...: at scale 6 it is 4621.499971 and
+    // rounds to 4621; a scale-4 quotient (4621.5000) would round to 4622.
+    var q = try runSql(allocator, db, "SELECT CAST(ROUND(3953 / CAST(0.855350 AS DECIMAL(16,6))) AS INT) AS r");
+    defer q.deinit();
+    const got = try collectInt(allocator, &q, 0);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(i32, &.{4621}, got);
 }
 
 test "decimal: CAST to DOUBLE / INT and int CAST to DECIMAL" {
