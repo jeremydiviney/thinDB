@@ -154,17 +154,23 @@ pub fn parseIgnoreNulls(p: anytype) !bool {
     const PE = @TypeOf(p.*).Err;
     if (p.cur.tag == .kw_ignore) {
         try p.advance();
-        if (p.cur.tag != .kw_nulls) return PE.SqlExpectedKeyword;
+        if (!isNullsWord(p.cur)) return PE.SqlExpectedKeyword;
         try p.advance();
         return true;
     }
     if (p.cur.tag == .kw_respect) {
         try p.advance();
-        if (p.cur.tag != .kw_nulls) return PE.SqlExpectedKeyword;
+        if (!isNullsWord(p.cur)) return PE.SqlExpectedKeyword;
         try p.advance();
         return false;
     }
     return false;
+}
+
+/// NULLS is a word only after IGNORE / RESPECT or a sort key; elsewhere it is
+/// an ordinary name (`COUNT(*) AS nulls`), so the lexer leaves it an identifier.
+pub fn isNullsWord(tok: anytype) bool {
+    return tok.tag == .identifier and !tok.quoted and std.ascii.eqlIgnoreCase(tok.text, "nulls");
 }
 
 /// Parse what follows `OVER`. Two forms:

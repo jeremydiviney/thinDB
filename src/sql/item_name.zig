@@ -384,7 +384,7 @@ fn skipCallClauses(toks: []const Token, i: *usize) void {
             i.* = (closingParen(toks, i.* + 2) orelse return) + 1;
         } else if (isWord(tok, "filter") and i.* + 1 < toks.len and toks[i.* + 1].tag == .lparen) {
             i.* = (closingParen(toks, i.* + 1) orelse return) + 1;
-        } else if ((tok.tag == .kw_ignore or tok.tag == .kw_respect) and i.* + 1 < toks.len and toks[i.* + 1].tag == .kw_nulls) {
+        } else if ((tok.tag == .kw_ignore or tok.tag == .kw_respect) and i.* + 1 < toks.len and isWord(toks[i.* + 1], "nulls")) {
             i.* += 2;
         } else if (tok.tag == .kw_over and i.* + 1 < toks.len) {
             i.* = if (toks[i.* + 1].tag == .lparen) (closingParen(toks, i.* + 1) orelse return) + 1 else i.* + 2;

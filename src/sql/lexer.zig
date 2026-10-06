@@ -95,7 +95,6 @@ pub const TokenTag = enum {
     kw_row,
     kw_ignore,
     kw_respect,
-    kw_nulls,
     kw_qualify,
     kw_default,
     /// MySQL-style `AUTO_INCREMENT` column attribute. Lexed as a single
@@ -991,7 +990,6 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "row", .tag = .kw_row },
         .{ .name = "ignore", .tag = .kw_ignore },
         .{ .name = "respect", .tag = .kw_respect },
-        .{ .name = "nulls", .tag = .kw_nulls },
         .{ .name = "qualify", .tag = .kw_qualify },
         .{ .name = "default", .tag = .kw_default },
         .{ .name = "auto_increment", .tag = .kw_auto_increment },

@@ -1238,6 +1238,32 @@ test "sql: NULLS FIRST and NULLS LAST place NULL sort keys" {
     try helpers.expectRunError(allocator, db, "SELECT id FROM o ORDER BY qty NULLS", error.SqlExpectedKeyword);
 }
 
+test "sql: NULLS outside a sort key or IGNORE/RESPECT is an ordinary name" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE o (id BIGINT NOT NULL, nulls BIGINT, PRIMARY KEY (id))");
+    try helpers.exec(allocator, db, "INSERT INTO o VALUES (1, 5), (2, NULL), (3, 2), (4, 7), (5, NULL)");
+
+    const cases = .{
+        .{ "SELECT id FROM o ORDER BY nulls NULLS FIRST, id", &[_]i64{ 2, 5, 3, 1, 4 } },
+        .{ "SELECT COUNT(*) AS nulls FROM o WHERE nulls IS NULL", &[_]i64{2} },
+        .{ "SELECT nulls FROM (SELECT COUNT(*) nulls FROM o WHERE nulls IS NULL) AS c", &[_]i64{2} },
+        .{ "SELECT id, LAG(nulls) IGNORE NULLS OVER (ORDER BY id) AS nulls FROM o ORDER BY nulls NULLS FIRST, id", &[_]i64{ 1, 4, 2, 3, 5 } },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "sql: pg_type maps a well-known OID to its type name" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

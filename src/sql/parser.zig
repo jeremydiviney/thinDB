@@ -6762,7 +6762,7 @@ pub const Parser = struct {
 
     /// `NULLS FIRST` (true) / `NULLS LAST` (false) after a sort key.
     fn parseNullsPlacement(self: *Parser) ParseError!?bool {
-        if (self.cur.tag != .kw_nulls) return null;
+        if (!parse_window.isNullsWord(self.cur)) return null;
         try self.advance();
         if (self.cur.tag != .identifier) return ParseError.SqlExpectedKeyword;
         const first = if (std.ascii.eqlIgnoreCase(self.cur.text, "first"))
