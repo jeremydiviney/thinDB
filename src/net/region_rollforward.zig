@@ -2050,7 +2050,8 @@ const Builder = struct {
                     std.mem.eql(u8, c.fn_name, exec.scalar_fn.MYSQL_SIGNED_FN) or
                     std.ascii.eqlIgnoreCase(c.fn_name, "to_int") or
                     std.ascii.eqlIgnoreCase(c.fn_name, "to_smallint") or
-                    std.ascii.eqlIgnoreCase(c.fn_name, "to_double");
+                    std.ascii.eqlIgnoreCase(c.fn_name, "to_double") or
+                    std.ascii.eqlIgnoreCase(c.fn_name, "to_float");
                 if (!known) return null;
                 break :blk switch (c.args[0]) {
                     .null_lit => null,
@@ -2068,6 +2069,7 @@ const Builder = struct {
             .smallint => @as(?Value, .{ .smallint = std.math.cast(i16, iv) orelse return null }),
             .tinyint => @as(?Value, .{ .tinyint = std.math.cast(i8, iv) orelse return null }),
             .double => @as(?Value, .{ .double = @floatFromInt(iv) }),
+            .float => @as(?Value, .{ .float = @floatFromInt(iv) }),
             else => null,
         };
     }

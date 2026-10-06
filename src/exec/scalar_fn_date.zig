@@ -1037,12 +1037,22 @@ pub fn dateToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *
 
 /// A DATETIME as its number `YYYYMMDDHHMMSS.ffffff`.
 pub fn datetimeToDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    for (args[0].data.datetime[0..row_count]) |dt| {
-        const n = common.datetimeNumber(dt).m;
-        const whole: f64 = @floatFromInt(@divFloor(n, std.time.us_per_s));
-        const fraction: f64 = @floatFromInt(@mod(n, std.time.us_per_s));
-        try out.data.double.append(allocator, whole + fraction / std.time.us_per_s);
-    }
+    for (args[0].data.datetime[0..row_count]) |dt| try out.data.double.append(allocator, datetimeAsDouble(dt));
+}
+
+fn datetimeAsDouble(dt: i64) f64 {
+    const n = common.datetimeNumber(dt).m;
+    const whole: f64 = @floatFromInt(@divFloor(n, std.time.us_per_s));
+    const fraction: f64 = @floatFromInt(@mod(n, std.time.us_per_s));
+    return whole + fraction / std.time.us_per_s;
+}
+
+pub fn dateToFloatKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.date[0..row_count]) |d| try out.data.float.append(allocator, @floatFromInt(common.dateNumber(d)));
+}
+
+pub fn datetimeToFloatKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    for (args[0].data.datetime[0..row_count]) |dt| try out.data.float.append(allocator, @floatCast(datetimeAsDouble(dt)));
 }
 
 pub fn dateToStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

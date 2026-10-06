@@ -317,8 +317,10 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
     // Unary decimal functions (source must be decimal).
     if (arg_types.len == 1 and arg_types[0].isDecimal()) {
         const sp = arg_types[0].decimalSpec().?;
-        if (std.ascii.eqlIgnoreCase(name, "to_double") or std.ascii.eqlIgnoreCase(name, "to_float"))
+        if (std.ascii.eqlIgnoreCase(name, "to_double"))
             return try buildDecFn(aa, name, arg_types, .double, dec.toDoubleKernel, .propagates);
+        if (std.ascii.eqlIgnoreCase(name, "to_float"))
+            return try buildDecFn(aa, name, arg_types, .float, dec.toFloatKernel, .propagates);
         if (std.mem.eql(u8, name, MYSQL_SIGNED_FN))
             return try buildDecFn(aa, name, arg_types, .bigint, dec.toMysqlSignedKernel, .kernel_managed);
         if (std.mem.eql(u8, name, MYSQL_UNSIGNED_FN))
@@ -643,7 +645,6 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (keyFnParts(name) != null) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
     if (std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN) or std.mem.eql(u8, name, PG_TEXT_FN)) return true;
-    if (std.ascii.eqlIgnoreCase(name, "to_float")) return true;
     if (intArithOp(name) != null) return true;
     if (std.ascii.eqlIgnoreCase(name, "format")) return true;
     if (std.ascii.eqlIgnoreCase(name, "sec_to_time") or std.ascii.eqlIgnoreCase(name, "maketime")) return true;
@@ -727,7 +728,8 @@ pub fn castFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
         .smallint => "to_smallint",
         .tinyint => "to_tinyint",
         .largeint => "to_largeint",
-        .float, .double => "to_double",
+        .float => "to_float",
+        .double => "to_double",
         .boolean => "to_boolean",
         .date => "to_date",
         .datetime => "to_datetime",
@@ -1555,6 +1557,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_tinyint", .arg_types = &.{.tinyint}, .return_type = .tinyint, .kernel = math.tinyintIdentityKernel },
     .{ .name = "to_largeint", .arg_types = &.{.largeint}, .return_type = .largeint, .kernel = math.largeintIdentityKernel },
     .{ .name = "to_double", .arg_types = &.{.double}, .return_type = .double, .kernel = math.doubleIdentityKernel },
+    .{ .name = "to_float", .arg_types = &.{.float}, .return_type = .float, .kernel = math.floatIdentityKernel },
     .{ .name = "to_boolean", .arg_types = &.{.boolean}, .return_type = .boolean, .kernel = math.booleanIdentityKernel },
     .{ .name = "to_date", .arg_types = &.{.date}, .return_type = .date, .kernel = date.dateIdentityKernel },
     .{ .name = "to_datetime", .arg_types = &.{.datetime}, .return_type = .datetime, .kernel = date.datetimeIdentityKernel },
@@ -1611,6 +1614,13 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "to_double", .arg_types = &.{.string}, .return_type = .double, .null_strategy = .kernel_managed, .kernel = math.stringToDoubleKernel },
     .{ .name = "to_double", .arg_types = &.{.date}, .return_type = .double, .kernel = date.dateToDoubleKernel },
     .{ .name = "to_double", .arg_types = &.{.datetime}, .return_type = .double, .kernel = date.datetimeToDoubleKernel },
+    // FLOAT is 32-bit, as in StarRocks and MySQL: the cast rounds to the
+    // nearest f32, and a value past its range is NULL. Integers reach the
+    // .float overload through the implicit cast, BIGINT through .double.
+    .{ .name = "to_float", .arg_types = &.{.double}, .return_type = .float, .null_strategy = .kernel_managed, .kernel = math.doubleToFloatKernel },
+    .{ .name = "to_float", .arg_types = &.{.string}, .return_type = .float, .null_strategy = .kernel_managed, .kernel = math.stringToFloatKernel },
+    .{ .name = "to_float", .arg_types = &.{.date}, .return_type = .float, .kernel = date.dateToFloatKernel },
+    .{ .name = "to_float", .arg_types = &.{.datetime}, .return_type = .float, .kernel = date.datetimeToFloatKernel },
     .{ .name = "to_boolean", .arg_types = &.{.string}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = math.stringToBoolKernel },
     // Text or JSON read as a number where no CAST was written (`argConversion`).
     .{ .name = TEXT_AS_DOUBLE_FN, .arg_types = &.{.json}, .return_type = .double, .kernel = math.textAsDoubleKernel },

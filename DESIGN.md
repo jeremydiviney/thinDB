@@ -497,6 +497,8 @@ The quotient's scale is StarRocks'. Only the dividend's scale decides it, and an
 
 **A float function takes a decimal's value.** A function with only DOUBLE parameters, such as `POWER`, `SQRT`, `LN`, `EXP`, the trigonometric functions and `SIGN`, converts a DECIMAL argument to DOUBLE, as MySQL and StarRocks do. Functions with decimal overloads (`ROUND`, `FLOOR`, `CEIL`, `ABS`, `TRUNCATE`, `MOD`, `GREATEST`, `LEAST`) keep DECIMAL.
 
+**FLOAT is 32-bit.** `CAST(x AS FLOAT)` rounds to the nearest f32, as in StarRocks and MySQL, and a value past FLOAT's range is NULL. Arithmetic reads a FLOAT as the DOUBLE it holds, so `CAST(1.1 AS FLOAT) + 0` is 1.100000023841858. One exception follows StarRocks' planner, which rewrites `CAST(CAST(n AS FLOAT) AS DOUBLE)` to `CAST(n AS DOUBLE)`: an integer's FLOAT cast that converts again, to DOUBLE (arithmetic, `CAST(... AS DOUBLE)`, a CASE or IF branch beside a DOUBLE) or to text, converts the integer itself. So `amount / CAST(n AS FLOAT)` divides by `n` exactly. A DOUBLE, decimal or text source keeps its f32, as does a FLOAT column (a subquery's or CTE's output, an aggregate's input), and a DECIMAL target reads the f32. Comparisons and the functions StarRocks runs on FLOAT itself (`ABS`, `IFNULL` over FLOATs) don't follow StarRocks yet (#554).
+
 **`ROUND(x, n)` and `TRUNCATE(x, n)`** over DECIMAL(p,s) with a literal `n` below `s` return DECIMAL(p, max(n, 0)), as in MySQL and DuckDB. So `ROUND(1.005, 2)` is `1.01`, and a negative `n` rounds left of the point: `ROUND(15.5, -1)` is `20`. A place computed per row keeps DECIMAL(p,s), with the dropped digits zeroed.
 
 ---

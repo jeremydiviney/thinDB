@@ -1932,9 +1932,12 @@ fn retypeBranch(
     out_type: Type,
     udf_registry: ?*const udf_mod.UdfRegistry,
 ) PlanError!void {
-    if (src.* == .null_lit or widensByKernel(branchSrcType(src.*, up_schema), out_type)) return;
+    if (src.* == .null_lit) return;
+    const n: ?Expr = if (src.* == .call and out_type == .double) integerUnderFloatCast(e, src.call) else null;
+    const undone: ?Expr = if (n) |integer| try expr_mod.call(aa, "to_double", &.{integer}) else null;
+    if (undone == null and widensByKernel(branchSrcType(src.*, up_schema), out_type)) return;
     const name = try scalar_fn.castFnName(aa, out_type) orelse return Error.ComputeUnsupportedExpr;
-    const rebuilt = try buildBranchSrc(runtime_allocator, aa, .{ .call = .{ .fn_name = name, .args = try aa.dupe(Expr, &.{e}) } }, up_schema, udf_registry);
+    const rebuilt = try buildBranchSrc(runtime_allocator, aa, undone orelse .{ .call = .{ .fn_name = name, .args = try aa.dupe(Expr, &.{e}) } }, up_schema, udf_registry);
     freeBranchSrc(runtime_allocator, src.*);
     src.* = rebuilt;
 }
@@ -2315,6 +2318,11 @@ fn buildCallPlan(
         }
     }
     const rr = r orelse return Error.ComputeNoSuchOverload;
+    if (try floatCastsUndone(aa, c, rr, arg_plans, arg_types)) |rewritten| {
+        for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
+        built = 0;
+        return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
+    }
 
     // Cast scratch buffers (one per coerced arg).
     var cast_buffers: ?[]?ColumnStore = null;
@@ -2423,6 +2431,36 @@ fn nullifConstantPlaced(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan,
         return Expr{ .call = .{ .fn_name = c.fn_name, .args = args, .from_statement = c.from_statement } };
     }
     return null;
+}
+
+/// An integer's FLOAT cast that the call converts again, to DOUBLE (an
+/// implicit cast) or to text (`CAST(... AS CHAR)`), converts the integer
+/// itself instead (`integerUnderFloatCast`).
+fn floatCastsUndone(aa: Allocator, c: Expr.Call, rr: scalar_fn.ResolvedOverload, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
+    const as_text = std.ascii.eqlIgnoreCase(c.fn_name, "to_string");
+    var args: ?[]Expr = null;
+    for (arg_types, rr.func.arg_types, arg_plans, c.args, 0..) |given, declared, ap, arg, i| {
+        if (given != .float or ap != .call) continue;
+        const widened = declared == .double and rr.arg_casts != null and rr.arg_casts.?[i] != null;
+        if (!widened and !as_text) continue;
+        const n = integerUnderFloatCast(arg, ap.call) orelse continue;
+        const rewritten = args orelse try aa.dupe(Expr, c.args);
+        args = rewritten;
+        rewritten[i] = if (widened) try expr_mod.call(aa, "to_double", &.{n}) else n;
+    }
+    var undone = c;
+    undone.args = args orelse return null;
+    return Expr{ .call = undone };
+}
+
+/// The integer `n` of `e` = `CAST(n AS FLOAT)`. StarRocks' planner drops
+/// such a cast when the FLOAT converts again, to anything but a decimal:
+/// `amount / CAST(n AS FLOAT)` divides by `n` itself. A DOUBLE, decimal or
+/// text source keeps its f32, as does a FLOAT column.
+fn integerUnderFloatCast(e: Expr, plan: *const CallPlan) ?Expr {
+    if (e != .call or e.call.args.len != 1 or plan.arg_runtime_types.len != 1) return null;
+    if (!std.ascii.eqlIgnoreCase(e.call.fn_name, "to_float") or !plan.arg_runtime_types[0].isInteger()) return null;
+    return e.call.args[0];
 }
 
 /// A call no overload accepts as written, with its arguments converted so
