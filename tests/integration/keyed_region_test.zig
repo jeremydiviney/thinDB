@@ -309,10 +309,14 @@ test "keyed region: runs differing only in the entry scan's range share one prog
     ;
     var first: ?RegionProgram = null;
     var second: ?RegionProgram = null;
+    var again: ?RegionProgram = null;
     var pinned: ?RegionProgram = null;
     try keyed_range_run(allocator, db, plain, 100, '0', '3', &first);
     try keyed_range_run(allocator, db, plain, 100, '3', '8', &second);
     try std.testing.expectEqual(first.?, second.?);
+    // A repeated range comes back through its remembered boundary.
+    try keyed_range_run(allocator, db, plain, 100, '0', '3', &again);
+    try std.testing.expectEqual(first.?, again.?);
     // An equality pin is baked into the program, so it stays in the key.
     try keyed_range_run(allocator, db, plain, 101, '3', '8', &pinned);
     try std.testing.expect(pinned.? != first.?);

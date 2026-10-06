@@ -110,7 +110,11 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                 break :hint;
             };
             const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = selected_depth } else null;
-            if (buildRegion(input, anchor, keys, anchorHashes(input, anchor, keys), declaration)) |q| {
+            // A shared program remembers only its latest declaration, so
+            // another range's run can miss above and still hit here.
+            const bh = anchorHashes(input, anchor, keys);
+            if (tryCachedHashes(input, anchor, keys, bh, declaration)) |q| return .{ .anchor = anchor, .query = q };
+            if (buildRegion(input, anchor, keys, bh, declaration)) |q| {
                 if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] boundary hint rebuilt depth={d}\n", .{selected_depth});
                 return .{ .anchor = anchor, .query = q };
             } else |err| {
@@ -150,7 +154,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                     // recomputed hash would never match its own store.
                     const bh = anchorHashes(input, cur, keys);
                     const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = depth } else null;
-                    if (tryCachedAt(input, cur, keys, bh.shared, declaration) orelse tryCachedAt(input, cur, keys, bh.exact, declaration)) |q| {
+                    if (tryCachedHashes(input, cur, keys, bh, declaration)) |q| {
                         if (shape_hash) |shape| if (inputCache(input)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     }
@@ -922,6 +926,11 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
     // kernel/table versions and rebuilds scans against fresh snapshots.
     const query = tryCachedAt(input, anchor, keys, selected.anchor_hash, null) orelse return null;
     return .{ .anchor = anchor, .query = query };
+}
+
+fn tryCachedHashes(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, hashes: AnchorHashes, declaration: ?DeclaredBoundary) ?exec.Query {
+    return tryCachedAt(input, anchor, keys, hashes.shared, declaration) orelse
+        tryCachedAt(input, anchor, keys, hashes.exact, declaration);
 }
 
 fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
