@@ -5368,8 +5368,10 @@ fn blockPartition(b: *Builder, want: []const Column, blk: DrainedBlock) !udf_mod
     const views = try b.a.alloc(ColumnView, want.len);
     for (want, views) |col, *v| {
         const ci = types.findColumn(blk.schema, col.name) orelse return NoMatch;
-        if (!std.meta.eql(blk.schema[ci].type, col.type)) return NoMatch;
-        v.* = blk.stores[ci].view();
+        // The ordinary operator binds a string-family column to a declared
+        // string input as it is, under the declared tag.
+        if (!TableFnExec.inputTypeMatches(blk.schema[ci].type, col.type)) return NoMatch;
+        v.* = exec.mat_stage.MaterializedResult.presentAsSchemaType(blk.stores[ci].view(), col.type);
     }
     return .{ .columns = views, .row_count = blk.rows, .keys = &.{} };
 }
