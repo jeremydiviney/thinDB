@@ -487,9 +487,11 @@ one instead of adding its own:
 | `DECIMAL(p1, s1) + DECIMAL(p2, s2)` | `DECIMAL(max(p1-s1, p2-s2) + max(s1, s2) + 1, max(s1, s2))` |
 | `DECIMAL(p1, s1) - DECIMAL(p2, s2)` | same as `+` |
 | `DECIMAL(p1, s1) * DECIMAL(p2, s2)` | `DECIMAL(p1 + p2, s1 + s2)` |
-| `DECIMAL(p1, s1) / DECIMAL(p2, s2)` | `DECIMAL(p1 + s2 + 4, s1 + 4)` |
+| `DECIMAL(p1, s1) / DECIMAL(p2, s2)` | `DECIMAL(p1 - s1 + s2 + s, s)`, where `s` is `s1 + 6` up to `s1 = 6`, then `max(s1, 12)` |
 
 Result precisions exceeding 38 are clamped to 38, with overflow → error rather than truncation. Mixed decimal/integer arithmetic promotes the integer to decimal first.
+
+The quotient's scale is StarRocks'. Only the dividend's scale decides it, and an integer dividend counts as scale 0, so `7 / CAST(3 AS DECIMAL(16,6))` is 2.333333, and a DECIMAL(16,6) over any decimal has scale 12. MySQL adds 4 digits instead (`div_precision_increment`). A ROUND over a quotient sees those digits, so `ROUND(3953 / 0.855350)` is 4621 here and in StarRocks (4621.499971), where a 4-digit quotient (4621.5000) would round to 4622.
 
 **DOUBLE to DECIMAL** goes through the double's shortest round-trip digits (the digits it prints as), rounded half away from zero to the target scale. `1.005e0` is 1.005 although its binary value is just below it, so it lands on 1.01 at scale 2, as in MySQL. One rule (`scalar_fn_common.floatDigits`) covers every conversion: `CAST`, an INSERT of a float literal into a DECIMAL column, and a float literal compared with a decimal or integer column. Text written into a DECIMAL column rounds the same way, and a value past the column's precision is `ValueOutOfRange`.
 
