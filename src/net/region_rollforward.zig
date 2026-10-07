@@ -110,7 +110,11 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                 break :hint;
             };
             const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = selected_depth } else null;
-            if (buildRegion(input, anchor, keys, hashAnchor(anchor), declaration)) |q| {
+            // A shared program remembers only its latest declaration, so
+            // another range's run can miss above and still hit here.
+            const bh = anchorHashes(input, anchor, keys);
+            if (tryCachedHashes(input, anchor, keys, bh, declaration)) |q| return .{ .anchor = anchor, .query = q };
+            if (buildRegion(input, anchor, keys, bh, declaration)) |q| {
                 if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] boundary hint rebuilt depth={d}\n", .{selected_depth});
                 return .{ .anchor = anchor, .query = q };
             } else |err| {
@@ -148,9 +152,9 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                     // attempt and the store: recognize-time subtree drains
                     // can benignly rewrite IR (scalar resolution), and a
                     // recomputed hash would never match its own store.
-                    const bh = hashAnchor(cur);
+                    const bh = anchorHashes(input, cur, keys);
                     const declaration: ?DeclaredBoundary = if (declaration_hash) |hash| .{ .hash = hash, .depth = depth } else null;
-                    if (tryCachedAt(input, cur, keys, bh, declaration)) |q| {
+                    if (tryCachedHashes(input, cur, keys, bh, declaration)) |q| {
                         if (shape_hash) |shape| if (inputCache(input)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     }
@@ -924,6 +928,11 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
     return .{ .anchor = anchor, .query = query };
 }
 
+fn tryCachedHashes(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, hashes: AnchorHashes, declaration: ?DeclaredBoundary) ?exec.Query {
+    return tryCachedAt(input, anchor, keys, hashes.shared, declaration) orelse
+        tryCachedAt(input, anchor, keys, hashes.exact, declaration);
+}
+
 fn tryCachedAt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) ?exec.Query {
     const hash = anchor_hash orelse return null;
     const cache = inputCache(input) orelse return null;
@@ -1087,13 +1096,35 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
 
 fn hashAnchor(anchor: *const ir.Op) ?u64 {
     var h = std.hash.Wyhash.init(0x726567696f6e);
-    hashOp(&h, anchor) catch return null;
+    hashOp(&h, anchor, &.{}) catch return null;
     return h.final();
+}
+
+/// A boundary's cache keys. `exact` covers every literal. `shared` leaves
+/// out the entry scan filter's non-pin values, so runs that differ only in
+/// the rows they scan (a customer hash range, a date window) share one
+/// program; null when the entry has no filter to leave out.
+const AnchorHashes = struct {
+    exact: ?u64,
+    shared: ?u64 = null,
+    /// The filter ops `shared` leaves out. A build that bakes rows read
+    /// through them publishes under `exact` instead.
+    masked: []const *const ir.Op = &.{},
+};
+
+fn anchorHashes(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []const []const u8) AnchorHashes {
+    const exact = hashAnchor(anchor);
+    if (exact == null) return .{ .exact = null };
+    const pl = collectPipeline(input, anchor, keys, true) catch return .{ .exact = exact };
+    if (pl.entry_filter_ops.len == 0) return .{ .exact = exact };
+    var h = std.hash.Wyhash.init(0x7368617265);
+    hashOp(&h, anchor, pl.entry_filter_ops) catch return .{ .exact = exact };
+    return .{ .exact = exact, .shared = h.final(), .masked = pl.entry_filter_ops };
 }
 
 fn hash_declaration(input: engine_v2.CompileInput, top: *const ir.Op) ?u64 {
     var h = std.hash.Wyhash.init(0x6465636c617265);
-    hashOp(&h, top) catch return null;
+    hashOp(&h, top, &.{}) catch return null;
     // An outer candidate may resolve a data-dependent expression in shared
     // IR before declining. Cover its source tables even when the selected
     // inner program no longer references them after that resolution.
@@ -1235,7 +1266,10 @@ fn hostr(h: *std.hash.Wyhash, s: ?[]const u8) void {
     } else hu(h, 0);
 }
 
-fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
+/// `entry` lists the anchor's entry scan filters (`Pipeline.entry_filter_ops`):
+/// the program reads their values only through per-run scans, apart from
+/// equality pins, so the shared key hashes only their shape.
+fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) error{RegionUnhashable}!void {
     hu(h, @intFromEnum(std.meta.activeTag(op.*)));
     switch (op.*) {
         .scan => |s| {
@@ -1247,7 +1281,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
         .limit => |l| {
             hu(h, l.n);
             hu(h, l.offset);
-            try hashOp(h, l.upstream);
+            try hashOp(h, l.upstream, entry);
         },
         .select, .exclude => |p| {
             hu(h, p.columns.len);
@@ -1261,15 +1295,18 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                 for (rs) |r| hu(h, @intFromBool(r));
             } else hu(h, 0);
             hu(h, p.star_skip_trailing);
-            try hashOp(h, p.upstream);
+            try hashOp(h, p.upstream, entry);
         },
         .filter => |f| {
-            try hashPred(h, f.predicate);
-            try hashOp(h, f.upstream);
+            if (std.mem.indexOfScalar(*const ir.Op, entry, op) != null)
+                try hashEntryPred(h, f.predicate)
+            else
+                try hashPred(h, f.predicate);
+            try hashOp(h, f.upstream, entry);
         },
         .order_by => |o| {
             hashSorts(h, o.specs);
-            try hashOp(h, o.upstream);
+            try hashOp(h, o.upstream, entry);
         },
         .group_by => |g| {
             // top_k / emit_limit are post-decode planner hints; a group-by
@@ -1299,7 +1336,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                     },
                 }
             }
-            try hashOp(h, g.upstream);
+            try hashOp(h, g.upstream, entry);
         },
         .compute => |c| {
             hu(h, c.derived.len);
@@ -1307,7 +1344,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                 hstr(h, d.name);
                 try hashExpr(h, d.expr);
             }
-            try hashOp(h, c.upstream);
+            try hashOp(h, c.upstream, entry);
         },
         .join => |j| {
             hu(h, @intFromEnum(j.algorithm));
@@ -1336,8 +1373,8 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                 }
                 try hashPred(h, res.predicate);
             } else hu(h, 0);
-            try hashOp(h, j.left);
-            try hashOp(h, j.right);
+            try hashOp(h, j.left, entry);
+            try hashOp(h, j.right, entry);
         },
         .materialize => |m| {
             hu(h, @intFromBool(m.forced));
@@ -1345,7 +1382,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                 hu(h, keys.len + 1);
                 for (keys) |k| hstr(h, k);
             } else hu(h, 0);
-            try hashOp(h, m.upstream);
+            try hashOp(h, m.upstream, entry);
         },
         .window => |w| {
             hu(h, w.specs.len);
@@ -1366,17 +1403,17 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
                 hu(h, @intFromBool(c.ignore_nulls));
                 hstr(h, c.output_name);
             }
-            try hashOp(h, w.upstream);
+            try hashOp(h, w.upstream, entry);
         },
         .set_union => |u| {
             hu(h, @intFromBool(u.all));
             hu(h, @intFromEnum(u.kind));
-            try hashOp(h, u.left);
-            try hashOp(h, u.right);
+            try hashOp(h, u.left, entry);
+            try hashOp(h, u.right, entry);
         },
         .alias => |a| {
             hstr(h, a.alias);
-            try hashOp(h, a.upstream);
+            try hashOp(h, a.upstream, entry);
         },
         .table_fn => |t| {
             hstr(h, t.name);
@@ -1392,7 +1429,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op) error{RegionUnhashable}!void {
             hashSorts(h, t.order_by);
             hostr(h, t.alias);
             hu(h, t.inputs.len);
-            for (t.inputs) |inp| try hashOp(h, inp);
+            for (t.inputs) |inp| try hashOp(h, inp, entry);
         },
         .single_row => {},
         else => return Unhashable,
@@ -1471,13 +1508,44 @@ fn hashExpr(h: *std.hash.Wyhash, e: Expr) error{RegionUnhashable}!void {
 }
 
 fn hashPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void {
+    return hashPredValues(h, p, true);
+}
+
+/// The entry filter as a build consumes it: equality leaves under the
+/// top-level AND become pins, baked into the program (see the
+/// `prune_leaves` loop in build_region_attempt); every other value reaches
+/// only the per-run scan.
+fn hashEntryPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void {
+    switch (p) {
+        .leaf => |l| if (l.op == .eq) try hashPred(h, p) else try hashPredValues(h, p, false),
+        .@"and" => |kids| {
+            hu(h, @intFromEnum(std.meta.activeTag(p)));
+            hu(h, kids.len);
+            for (kids) |k| try hashEntryPred(h, k);
+        },
+        else => try hashPredValues(h, p, false),
+    }
+}
+
+fn hashLiteral(h: *std.hash.Wyhash, v: Value, values: bool) void {
+    if (values) hashValue(h, v) else hu(h, @intFromEnum(std.meta.activeTag(v)));
+}
+
+fn hashPredValues(h: *std.hash.Wyhash, p: PredicateExpr, values: bool) error{RegionUnhashable}!void {
+    // An AND with a constant-FALSE conjunct is FALSE whatever the other
+    // conjuncts hold (the folded `... AND 1=0` arm of a query variant).
+    if (predAlwaysFalse(p)) {
+        hu(h, @intFromEnum(std.meta.activeTag(PredicateExpr{ .always = false })));
+        hu(h, 0);
+        return;
+    }
     hu(h, @intFromEnum(std.meta.activeTag(p)));
     switch (p) {
         .leaf, .day_leaf, .text_as_number => |l| {
             hstr(h, l.col);
             hu(h, @intFromEnum(l.op));
             hu(h, @intFromBool(l.as_boolean));
-            hashValue(h, l.val);
+            hashLiteral(h, l.val, values);
         },
         .leaf_col_col => |l| {
             hstr(h, l.left);
@@ -1487,20 +1555,20 @@ fn hashPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!void 
         .is_null, .is_not_null => |c| hstr(h, c),
         .like => |l| {
             hstr(h, l.col);
-            hstr(h, l.pattern);
+            if (values) hstr(h, l.pattern);
         },
         .@"and", .@"or" => |kids| {
             hu(h, kids.len);
-            for (kids) |k| try hashPred(h, k);
+            for (kids) |k| try hashPredValues(h, k, values);
         },
-        .not => |k| try hashPred(h, k.*),
+        .not => |k| try hashPredValues(h, k.*, values),
         .always => |b| hu(h, @intFromBool(b)),
         .unknown => {},
         .in_set, .text_as_number_set => |s| {
             hstr(h, s.col);
             hu(h, @intFromBool(s.negate));
             hu(h, s.values.len);
-            for (s.values) |v| hashValue(h, v);
+            for (s.values) |v| hashLiteral(h, v, values);
         },
         else => return Unhashable,
     }
@@ -1684,6 +1752,10 @@ const Builder = struct {
     /// of a co-partitioned join must bind to it through an ON pair.
     route_name: []const u8 = &.{},
     order_aligned: bool = false,
+    /// `AnchorHashes.masked`. A build that drains or bakes a subtree reaching
+    /// one sets `entry_baked` and publishes under the exact key.
+    entry_masked: []const *const ir.Op = &.{},
+    entry_baked: bool = false,
     /// Side-table dedupe: the IR node each side spec was compiled from
     /// (ctc/ctl reference the SAME materialized CTE — one side, two probes).
     side_nodes: std.ArrayListUnmanaged(*const ir.Op) = .empty,
@@ -2153,7 +2225,40 @@ const DrainedBlock = struct {
     stores: []ColumnStore,
 };
 
+/// A subtree read at compile time keeps what it read in the program: when it
+/// reaches a masked entry filter, the shared key no longer describes it.
+fn noteBakedEntry(b: *Builder, node: *const ir.Op) void {
+    if (b.entry_masked.len == 0 or b.entry_baked) return;
+    if (reachesAny(node, b.entry_masked, 0)) b.entry_baked = true;
+}
+
+/// True when `node` or any op below it is in `targets`. An op this walk
+/// cannot see through counts as reaching them.
+fn reachesAny(node: *const ir.Op, targets: []const *const ir.Op, depth: usize) bool {
+    if (depth > 512) return true;
+    if (std.mem.indexOfScalar(*const ir.Op, targets, node) != null) return true;
+    return switch (node.*) {
+        .scan, .single_row => false,
+        .materialize => |m| reachesAny(m.upstream, targets, depth + 1),
+        .alias => |x| reachesAny(x.upstream, targets, depth + 1),
+        .select, .exclude => |p| reachesAny(p.upstream, targets, depth + 1),
+        .filter => |f| reachesAny(f.upstream, targets, depth + 1),
+        .group_by => |g| reachesAny(g.upstream, targets, depth + 1),
+        .compute => |c| reachesAny(c.upstream, targets, depth + 1),
+        .limit => |l| reachesAny(l.upstream, targets, depth + 1),
+        .order_by => |o| reachesAny(o.upstream, targets, depth + 1),
+        .window => |w| reachesAny(w.upstream, targets, depth + 1),
+        .join => |j| reachesAny(j.left, targets, depth + 1) or reachesAny(j.right, targets, depth + 1),
+        .set_union => |u| reachesAny(u.left, targets, depth + 1) or reachesAny(u.right, targets, depth + 1),
+        .table_fn => |t| for (t.inputs) |inp| {
+            if (reachesAny(inp, targets, depth + 1)) break true;
+        } else false,
+        else => true,
+    };
+}
+
 fn compileAndDrain(b: *Builder, node: *const ir.Op, drain: bool) !DrainedBlock {
+    noteBakedEntry(b, node);
     recordSubtreeVersions(b, node);
     // Side branches can share CTEs and window results. The ordinary stage
     // compiler must retain those boundaries even during region preparation.
@@ -2567,6 +2672,8 @@ const Pipeline = struct {
     /// during the scatter, before the exchange.
     entry_derived: []const Derived,
     entry_filter: PredicateExpr,
+    /// The filter ops `entry_filter` was built from.
+    entry_filter_ops: []const *const ir.Op = &.{},
     entry: union(enum) {
         scan: *const ir.Op.Scan,
         staged: *const ir.Op,
@@ -2588,6 +2695,8 @@ fn collectPipeline(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []
     const a = input.node_arena;
     if (anchor.* != .materialize) return NoMatch;
     var steps: std.ArrayListUnmanaged(Step) = .empty;
+    // The op behind each `.filt` step, by step index.
+    var filt_ops: std.ArrayListUnmanaged(struct { step: usize, op: *const ir.Op }) = .empty;
     var cur: *const ir.Op = anchor.materialize.upstream;
     var entry_root = cur;
     var structural_end: usize = 0;
@@ -2612,6 +2721,7 @@ fn collectPipeline(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []
                 cur = al.upstream;
             },
             .filter => |f| {
+                try filt_ops.append(a, .{ .step = steps.items.len, .op = cur });
                 try steps.append(a, .{ .filt = f.predicate });
                 cur = f.upstream;
             },
@@ -2713,12 +2823,17 @@ fn collectPipeline(input: engine_v2.CompileInput, anchor: *const ir.Op, keys: []
         filters.items[0]
     else
         .{ .@"and" = filters.items };
+    var entry_filter_ops: std.ArrayListUnmanaged(*const ir.Op) = .empty;
+    for (filt_ops.items) |f| {
+        if (f.step >= split) try entry_filter_ops.append(a, f.op);
+    }
 
     return .{
         .steps = steps.items[0..split],
         .entry_sel = entry_sel,
         .entry_derived = entry_derived.items,
         .entry_filter = entry_filter,
+        .entry_filter_ops = entry_filter_ops.items,
         .entry = .{ .scan = scan },
     };
 }
@@ -2860,7 +2975,7 @@ fn rename_entry_outputs(arena: Allocator, scan_schema: []const Column, derived: 
     return renamed;
 }
 
-fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary) anyerror!exec.Query {
+fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: AnchorHashes, declaration: ?DeclaredBoundary) anyerror!exec.Query {
     const pipeline = try collectPipeline(input, anchor, declared_keys, true);
     const fused = blk: {
         for (pipeline.steps) |step| if (step == .sql_union) break :blk true;
@@ -2879,16 +2994,16 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     };
 }
 
-fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: ?u64, declaration: ?DeclaredBoundary, union_fusion: bool, collected: ?Pipeline) anyerror!exec.Query {
+fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: AnchorHashes, declaration: ?DeclaredBoundary, union_fusion: bool, collected: ?Pipeline) anyerror!exec.Query {
     var tm: i64 = exec.prof.nowTicks();
     const registry = input.udf_registry orelse return NoMatch;
 
     // A cacheable build uses the DATABASE allocator for its ctx so the
     // entry can outlive this query/connection; otherwise query-lifetime.
-    if (anchor_hash == null and getenv("THINDB_REGION_TRACE") != null) {
+    if (anchor_hash.exact == null and getenv("THINDB_REGION_TRACE") != null) {
         std.debug.print("[region] anchor unhashable — never cached\n", .{});
     }
-    const cache: ?*Cache = if (anchor_hash != null) inputCache(input) else null;
+    const cache: ?*Cache = if (anchor_hash.exact != null) inputCache(input) else null;
     const gpa = if (cache != null) input.catalog.allocator else input.allocator;
     const qa = input.allocator;
     const ctx = try gpa.create(Ctx);
@@ -2905,7 +3020,7 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     for (declared_keys, keys) |key, *copy| copy.* = try a.dupe(u8, key);
     ctx.keys = keys;
 
-    var b = Builder{ .input = input, .ctx = ctx, .a = a, .fb = .{ .a = a } };
+    var b = Builder{ .input = input, .ctx = ctx, .a = a, .fb = .{ .a = a }, .entry_masked = anchor_hash.masked };
     var sides_owned = true;
     errdefer if (sides_owned) {
         for (b.side_sources.items) |srcs| {
@@ -2979,6 +3094,9 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     };
 
     b.order_aligned = order_aligned;
+    // Ordered programs keep the scan's interval layout (n_shards, iv_cost),
+    // which follows the entry range.
+    if (order_aligned) b.entry_baked = true;
     const bs = switch (pl.entry) {
         .staged => |root| blk: {
             recordSubtreeVersions(&b, root);
@@ -3318,10 +3436,11 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     // query teardown. Otherwise the op owns the ctx (one-shot).
     if (cache) |c| blk: {
         if (ctx.uncacheable) break :blk;
-        const entry = c.publish(anchor_hash.?, ctx) orelse break :blk;
+        const key = if (b.entry_baked) anchor_hash.exact.? else anchor_hash.shared orelse anchor_hash.exact.?;
+        const entry = c.publish(key, ctx) orelse break :blk;
         op.setOwnedCtx(entry, CacheEntry.releaseErased);
         if (getenv("THINDB_REGION_TRACE") != null) {
-            std.debug.print("[region] cache store ({x})\n", .{anchor_hash.?});
+            std.debug.print("[region] cache store ({x}{s})\n", .{ key, if (key == anchor_hash.shared) " shared" else "" });
         }
         return q;
     }
@@ -4519,6 +4638,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
     }
 
     if (side_idx == null) {
+        noteBakedEntry(b, j.right);
         const se = collectSideEntry(b.input.node_arena, j.right) catch |e| {
             sideTrace("right subtree not scan-shaped ({s})", .{@errorName(e)});
             return e;

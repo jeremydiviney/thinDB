@@ -73,6 +73,14 @@ fn run_to_text(allocator: std.mem.Allocator, db: anytype, sql: []const u8, regio
 }
 
 fn run_to_text_checked(allocator: std.mem.Allocator, db: anytype, sql: []const u8, region_column: ?[]const u8, require_region: bool) ![]u8 {
+    return run_to_text_program(allocator, db, sql, region_column, require_region, null);
+}
+
+const RegionProgram = *const thindb.exec.region_exec.Program;
+
+/// `program` receives the region's compiled program: the same one for runs
+/// that share a cached program.
+fn run_to_text_program(allocator: std.mem.Allocator, db: anytype, sql: []const u8, region_column: ?[]const u8, require_region: bool, program: ?*?RegionProgram) ![]u8 {
     var q = try helpers.runSql(allocator, db, sql);
     defer q.deinit();
     if (std.mem.indexOf(u8, sql, "KEYED BY") != null) {
@@ -83,7 +91,14 @@ fn run_to_text_checked(allocator: std.mem.Allocator, db: anytype, sql: []const u
             if (region_column) |name| {
                 if (thindb.types.findColumn(stage.schema, name) == null) continue;
             }
-            if (stage.is_keyed_region) region_found = true;
+            if (!stage.is_keyed_region) continue;
+            region_found = true;
+            if (program) |out| {
+                try std.testing.expect(stage.query_alive);
+                const op = thindb.exec.queryAs(thindb.exec.region_exec.RegionExecOp, stage.query) orelse
+                    return error.TestExpectedEqual;
+                out.* = op.prog;
+            }
         }
         try std.testing.expectEqual(require_region, region_found);
     }
@@ -245,6 +260,99 @@ test "keyed region: a DATETIME bound on a DATE column prunes the entry scan in t
         defer allocator.free(mono);
         try std.testing.expect(std.mem.count(u8, mono, "\n") >= 4 + 3);
         try expect_keyed_matches(allocator, db, body, "prior");
+    }
+}
+
+/// The keyed result of `body` with `{lo}`/`{hi}`/`{project}` filled in, after
+/// checking it against ordinary execution; `program` receives the region's
+/// compiled program.
+fn keyed_range_run(allocator: std.mem.Allocator, db: *thindb.Database, comptime body: []const u8, project: u32, lo: u8, hi: u8, program: *?RegionProgram) !void {
+    var buf: [2048]u8 = undefined;
+    var filled: std.Io.Writer = .fixed(&buf);
+    var rest: []const u8 = body;
+    while (std.mem.indexOfScalar(u8, rest, '{')) |open| {
+        const close = std.mem.indexOfScalarPos(u8, rest, open, '}').?;
+        try filled.writeAll(rest[0..open]);
+        const name = rest[open + 1 .. close];
+        if (std.mem.eql(u8, name, "lo")) try filled.print("'cust_{c}'", .{lo});
+        if (std.mem.eql(u8, name, "hi")) try filled.print("'cust_{c}'", .{hi});
+        if (std.mem.eql(u8, name, "project")) try filled.print("{d}", .{project});
+        rest = rest[close + 1 ..];
+    }
+    try filled.writeAll(rest);
+    const sql = filled.buffered();
+    var mono_buf: [2100]u8 = undefined;
+    const mono = try runToText(allocator, db, try std.fmt.bufPrint(&mono_buf, "WITH {s}", .{sql}));
+    defer allocator.free(mono);
+    var keyed_buf: [2100]u8 = undefined;
+    const keyed_sql = try std.fmt.bufPrint(&keyed_buf, "WITH KEYED BY (custLC) {s}", .{sql});
+    const keyed = try run_to_text_program(allocator, db, keyed_sql, "prior", true, program);
+    defer allocator.free(keyed);
+    try std.testing.expectEqualStrings(mono, keyed);
+}
+
+test "keyed region: runs differing only in the entry scan's range share one program" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const plain =
+        \\base AS (
+        \\  SELECT custLC, month, amount FROM inv
+        \\  WHERE projectId = {project} AND custLC >= {lo} AND custLC < {hi}
+        \\), w AS (
+        \\  SELECT custLC, month, amount, LAG(amount) OVER (PARTITION BY custLC ORDER BY month) AS prior FROM base
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, month
+    ;
+    var first: ?RegionProgram = null;
+    var second: ?RegionProgram = null;
+    var again: ?RegionProgram = null;
+    var pinned: ?RegionProgram = null;
+    try keyed_range_run(allocator, db, plain, 100, '0', '3', &first);
+    try keyed_range_run(allocator, db, plain, 100, '3', '8', &second);
+    try std.testing.expectEqual(first.?, second.?);
+    // A repeated range comes back through its remembered boundary.
+    try keyed_range_run(allocator, db, plain, 100, '0', '3', &again);
+    try std.testing.expectEqual(first.?, again.?);
+    // An equality pin is baked into the program, so it stays in the key.
+    try keyed_range_run(allocator, db, plain, 101, '3', '8', &pinned);
+    try std.testing.expect(pinned.? != first.?);
+
+    // Subtrees read at compile time — a co-partitioned side and a broadcast
+    // join — keep the rows of the range they read: no sharing.
+    inline for (.{
+        \\base AS (
+        \\  SELECT custLC, month, amount FROM inv
+        \\  WHERE projectId = {project} AND custLC >= {lo} AND custLC < {hi}
+        \\), tot AS (
+        \\  SELECT custLC, SUM(amount) AS total FROM base GROUP BY custLC
+        \\), w AS (
+        \\  SELECT b.custLC, b.month, b.amount, t.total,
+        \\         LAG(b.amount) OVER (PARTITION BY b.custLC ORDER BY b.month) AS prior
+        \\  FROM base b LEFT JOIN tot t ON b.custLC = t.custLC
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, month
+        ,
+        \\base AS (
+        \\  SELECT custLC, month, amount FROM inv
+        \\  WHERE projectId = {project} AND custLC >= {lo} AND custLC < {hi}
+        \\), mt AS (
+        \\  SELECT month, SUM(amount) AS mtotal FROM base GROUP BY month
+        \\), w AS (
+        \\  SELECT b.custLC, b.month, b.amount, m.mtotal,
+        \\         LAG(b.amount) OVER (PARTITION BY b.custLC ORDER BY b.month) AS prior
+        \\  FROM base b LEFT JOIN mt m ON b.month = m.month
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, month
+    }) |body| {
+        var a: ?RegionProgram = null;
+        var b: ?RegionProgram = null;
+        try keyed_range_run(allocator, db, body, 100, '0', '3', &a);
+        try keyed_range_run(allocator, db, body, 100, '3', '8', &b);
+        try std.testing.expect(a.? != b.?);
     }
 }
 
