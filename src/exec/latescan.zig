@@ -138,6 +138,10 @@ pub const LateScan = struct {
         return self.inner.addPrune(pred);
     }
 
+    pub fn addPruneSet(self: *LateScan, set: predicate.InSet) !void {
+        return self.inner.addPruneSet(set);
+    }
+
     /// At most k rows survive; the inner TopN/Limit already bounds that, and
     /// its stats carry the sort claim. Borrow them, but cap `upper_rows` at
     /// the inner bound and drop the (now-stripped) `__rowloc` from the

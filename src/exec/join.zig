@@ -821,6 +821,11 @@ pub fn fastTableBytes(n: usize, needs_chain: bool) usize {
 /// Rows per digest worker; a smaller build hashes on the calling thread.
 const DIGEST_ROWS_PER_WORKER: u32 = 262144;
 const MAX_DIGEST_WORKERS: usize = 16;
+
+/// A build key with at most this many distinct values is offered to the probe
+/// as a set as well as a range: the range over scattered keys spans nearly
+/// everything, the set skips what lies between them.
+const KEY_SET_MAX_VALUES: usize = 1024;
 /// Insert-loop prefetch distance in rows: enough independent slots in
 /// flight to cover a DRAM miss on the table.
 const INSERT_PREFETCH_DIST: u32 = 8;
@@ -1978,16 +1983,24 @@ pub const Join = struct {
         return try cs.process(cs.ctx, chunk, out);
     }
 
+    pub fn addPruneSet(self: *Join, set: predicate.InSet) !void {
+        return self.offerPrune(.{ .set = set });
+    }
+
     pub fn addPrune(self: *Join, pred: Predicate) !void {
+        return self.offerPrune(.{ .range = pred });
+    }
+
+    fn offerPrune(self: *Join, offer: exec.PruneOffer) !void {
         // Push pruning to both sides; each will only accept predicates
         // referencing its own columns (via the column-not-found check
         // in its addPrune). The other side silently ignores via the
         // existing error path.
-        self.left.addPrune(pred) catch |e| switch (e) {
+        offer.offerTo(&self.left, offer.column()) catch |e| switch (e) {
             error.ColumnNotFound => {},
             else => return e,
         };
-        self.right.addPrune(pred) catch |e| switch (e) {
+        offer.offerTo(&self.right, offer.column()) catch |e| switch (e) {
             error.ColumnNotFound => {},
             else => return e,
         };
@@ -2306,10 +2319,37 @@ pub const Join = struct {
             const hi = mx orelse continue;
             probe.addPrune(.{ .col = pname, .op = .gte, .val = lo }) catch continue;
             probe.addPrune(.{ .col = pname, .op = .lte, .val = hi }) catch {};
+            const set = self.buildKeySet(view) catch null;
+            if (set) |values| probe.addPruneSet(.{ .col = pname, .values = values, .negate = false }) catch {};
             if (jtrace) {
-                std.debug.print("[jf] build-key prune offered on '{s}' ({d} build rows)\n", .{ pname, self.build_rows });
+                std.debug.print("[jf] build-key prune offered on '{s}' ({d} build rows, set of {d})\n", .{ pname, self.build_rows, if (set) |values| values.len else 0 });
             }
         }
+    }
+
+    /// The distinct non-NULL values of a build key column, in the join's
+    /// arena (alive as long as the probe that borrows them), or null when
+    /// there are more than `KEY_SET_MAX_VALUES` or a value has no zone-map
+    /// order.
+    fn buildKeySet(self: *Join, view: ColumnView) !?[]const types.Value {
+        var seen: std.AutoHashMapUnmanaged(i128, void) = .empty;
+        defer seen.deinit(self.allocator);
+        try seen.ensureTotalCapacity(self.allocator, KEY_SET_MAX_VALUES + 1);
+        var values: std.ArrayListUnmanaged(types.Value) = .empty;
+        defer values.deinit(self.allocator);
+        var previous: ?i128 = null;
+        var row: usize = 0;
+        while (row < self.build_rows) : (row += 1) {
+            if (!view.isValid(row)) continue;
+            const value = keyValueAt(view, row) orelse return null;
+            const ordered = predicate.valueToRangeI128(value) orelse return null;
+            if (previous == ordered) continue;
+            previous = ordered;
+            if (seen.getOrPutAssumeCapacity(ordered).found_existing) continue;
+            if (seen.count() > KEY_SET_MAX_VALUES) return null;
+            try values.append(self.allocator, value);
+        }
+        return try self.arena.allocator().dupe(types.Value, values.items);
     }
 
     fn buildPhase(self: *Join) !void {

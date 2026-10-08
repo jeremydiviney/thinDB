@@ -612,6 +612,12 @@ const Leaf = union(enum) {
             inline else => |s| s.addPrune(pred),
         };
     }
+    fn addPruneSet(self: Leaf, set: predicate.InSet) !void {
+        return switch (self) {
+            .segment => |s| s.addPruneSet(set),
+            .chunk => {},
+        };
+    }
     fn explain(self: Leaf, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         return switch (self) {
             inline else => |s| s.explain(out, allocator, depth),
@@ -1283,6 +1289,10 @@ pub const ParallelScan = struct {
 
     pub fn addPrune(self: *ParallelScan, pred: predicate.Predicate) !void {
         for (self.workers) |w| try w.addPrune(pred);
+    }
+
+    pub fn addPruneSet(self: *ParallelScan, set: predicate.InSet) !void {
+        for (self.workers) |w| try w.addPruneSet(set);
     }
 
     pub fn tryFuseFilter(self: *ParallelScan, expr: predicate.PredicateExpr) !bool {
@@ -2441,6 +2451,10 @@ const ProbeChunkScan = struct {
 
     pub fn addPrune(self: *ProbeChunkScan, pred: predicate.Predicate) !void {
         return self.ps.workers[self.chunk].addPrune(pred);
+    }
+
+    pub fn addPruneSet(self: *ProbeChunkScan, set: predicate.InSet) !void {
+        return self.ps.workers[self.chunk].addPruneSet(set);
     }
 
     /// Join output cardinality is unknowable here; the partial Aggregate

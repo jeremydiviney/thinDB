@@ -656,8 +656,16 @@ pub const Compute = struct {
     }
 
     pub fn addPrune(self: *Compute, pred: Predicate) !void {
+        return self.offerPrune(.{ .range = pred });
+    }
+
+    pub fn addPruneSet(self: *Compute, set: exec.InSet) !void {
+        return self.offerPrune(.{ .set = set });
+    }
+
+    fn offerPrune(self: *Compute, offer: exec.PruneOffer) !void {
         if (self.chain != null) return;
-        const idx = types.findColumn(self.output_schema, pred.col) orelse return Error.ColumnNotFound;
+        const idx = types.findColumn(self.output_schema, offer.column()) orelse return Error.ColumnNotFound;
         var src_idx = idx;
         for (self.derived, self.derived_output_indices) |derived, out_idx| {
             if (out_idx != idx) continue;
@@ -667,9 +675,7 @@ pub const Compute = struct {
             }
             break;
         }
-        var rewritten = pred;
-        rewritten.col = self.upstream.outputSchema()[src_idx].name;
-        return self.upstream.addPrune(rewritten);
+        return offer.offerTo(&self.upstream, self.upstream.outputSchema()[src_idx].name);
     }
 
     /// Compute preserves row count (adds columns, doesn't drop rows).

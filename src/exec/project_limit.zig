@@ -152,11 +152,17 @@ pub const Project = struct {
     }
 
     pub fn addPrune(self: *Project, pred: Predicate) !void {
+        return self.offerPrune(.{ .range = pred });
+    }
+
+    pub fn addPruneSet(self: *Project, set: predicate.InSet) !void {
+        return self.offerPrune(.{ .set = set });
+    }
+
+    fn offerPrune(self: *Project, offer: exec.PruneOffer) !void {
         if (self.probe_fused) return;
-        const idx = types.findColumn(self.output_schema, pred.col) orelse return Error.ColumnNotFound;
-        var rewritten = pred;
-        rewritten.col = self.upstream.outputSchema()[self.column_map[idx]].name;
-        return self.upstream.addPrune(rewritten);
+        const idx = types.findColumn(self.output_schema, offer.column()) orelse return Error.ColumnNotFound;
+        return offer.offerTo(&self.upstream, self.upstream.outputSchema()[self.column_map[idx]].name);
     }
 
     /// Pure view remap — data buffers are the upstream's.

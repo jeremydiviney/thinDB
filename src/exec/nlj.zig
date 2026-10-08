@@ -444,12 +444,20 @@ pub const NestedLoopJoin = struct {
         return self.output_schema;
     }
 
+    pub fn addPruneSet(self: *NestedLoopJoin, set: predicate.InSet) !void {
+        return self.offerPrune(.{ .set = set });
+    }
+
     pub fn addPrune(self: *NestedLoopJoin, pred: Predicate) !void {
-        self.left.addPrune(pred) catch |e| switch (e) {
+        return self.offerPrune(.{ .range = pred });
+    }
+
+    fn offerPrune(self: *NestedLoopJoin, offer: exec.PruneOffer) !void {
+        offer.offerTo(&self.left, offer.column()) catch |e| switch (e) {
             error.ColumnNotFound => {},
             else => return e,
         };
-        self.right.addPrune(pred) catch |e| switch (e) {
+        offer.offerTo(&self.right, offer.column()) catch |e| switch (e) {
             error.ColumnNotFound => {},
             else => return e,
         };

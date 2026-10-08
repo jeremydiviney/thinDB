@@ -228,7 +228,11 @@ pub const UdfAggregate = struct {
     }
 
     pub fn addPrune(self: *UdfAggregate, pred: exec.Predicate) !void {
-        return exec.aggregate_op.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
+        return exec.aggregate_op.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .range = pred });
+    }
+
+    pub fn addPruneSet(self: *UdfAggregate, set: exec.InSet) !void {
+        return exec.aggregate_op.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
 
     pub fn stats(self: *UdfAggregate) exec.PipelineStats {

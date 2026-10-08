@@ -308,6 +308,10 @@ pub const Filter = struct {
         return self.upstream.addPrune(pred);
     }
 
+    pub fn addPruneSet(self: *Filter, set: predicate.InSet) !void {
+        return self.upstream.addPruneSet(set);
+    }
+
     /// A second filter layered above forwards straight through — two
     /// restrictions compose as AND regardless of order, so the lower one
     /// (often a scan-fused WHERE) can absorb the new predicate too and the

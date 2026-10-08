@@ -28,13 +28,11 @@ const predicate = @import("predicate.zig");
 const json_binary = @import("json_binary.zig");
 const Predicate = predicate.Predicate;
 
-pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices: []const usize, pred: Predicate) !void {
-    const idx = types.findColumn(schema, pred.col) orelse return Error.ColumnNotFound;
+pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices: []const usize, offer: exec.PruneOffer) !void {
+    const idx = types.findColumn(schema, offer.column()) orelse return Error.ColumnNotFound;
     // Aggregate output can shadow an input column without keeping its values.
     if (idx >= group_indices.len) return;
-    var rewritten = pred;
-    rewritten.col = upstream.outputSchema()[group_indices[idx]].name;
-    return upstream.addPrune(rewritten);
+    return offer.offerTo(upstream, upstream.outputSchema()[group_indices[idx]].name);
 }
 
 const simd = @import("../util/simd.zig");
@@ -1430,7 +1428,12 @@ pub const Aggregate = struct {
 
     pub fn addPrune(self: *Aggregate, pred: Predicate) !void {
         if (self.top_k != null or self.emit_limit != null) return;
-        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
+        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .range = pred });
+    }
+
+    pub fn addPruneSet(self: *Aggregate, set: predicate.InSet) !void {
+        if (self.top_k != null or self.emit_limit != null) return;
+        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
 
     /// Global aggregate (no group_cols): always emits exactly 1 row.
@@ -2786,7 +2789,11 @@ pub const SortedAggregate = struct {
     }
 
     pub fn addPrune(self: *SortedAggregate, pred: Predicate) !void {
-        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
+        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .range = pred });
+    }
+
+    pub fn addPruneSet(self: *SortedAggregate, set: predicate.InSet) !void {
+        return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
 
     pub fn stats(self: *SortedAggregate) exec.PipelineStats {
