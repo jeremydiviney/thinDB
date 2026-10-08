@@ -141,3 +141,80 @@ test "encoded machinery topn preserves nullable strings ties offset tombstones a
         try table.flush();
     }
 }
+
+test "tombstones in one row group keep the rest of the segment on the encoded paths" {
+    const allocator = std.testing.allocator;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 128 });
+        defer db.close();
+        try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, s VARCHAR(8) NOT NULL)");
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(allocator);
+        try sql.appendSlice(allocator, "INSERT INTO t VALUES ");
+        const groups = 5;
+        var counts = [_]i64{0} ** groups;
+        var sums = [_]i64{0} ** groups;
+        for (0..1024) |i| {
+            if (i != 0) try sql.append(allocator, ',');
+            const g = (i / 7) % groups;
+            try sql.print(allocator, "({d},{d},'k{d}')", .{ i, g, g });
+            // Rows 0-9 sit in row group 0 only and get deleted below.
+            if (i >= 10) {
+                counts[g] += 1;
+                sums[g] += @intCast(i);
+            }
+        }
+        try helpers.exec(allocator, db, sql.items);
+        const table = try db.openTable("t", .{});
+        try table.flush();
+        try helpers.exec(allocator, db, "DELETE FROM t WHERE id < 10");
+
+        const by_int = try helpers.collectBigints(allocator, db, "SELECT COUNT(*) FROM t GROUP BY g ORDER BY g");
+        defer allocator.free(by_int);
+        try std.testing.expectEqualSlices(i64, &counts, by_int);
+        const by_string = try helpers.collectBigints(allocator, db, "SELECT SUM(id) FROM t GROUP BY s ORDER BY s");
+        defer allocator.free(by_string);
+        try std.testing.expectEqualSlices(i64, &sums, by_string);
+        const total = try helpers.collectBigints(allocator, db, "SELECT SUM(g) FROM t");
+        defer allocator.free(total);
+        var expected_total: i64 = 0;
+        for (counts, 0..) |c, g| expected_total += c * @as(i64, @intCast(g));
+        try std.testing.expectEqualSlices(i64, &.{expected_total}, total);
+    }
+}
+
+test "a reader's shared tombstone list outlives the invalidation of a later DELETE" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = 128 });
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT NOT NULL)");
+    const table = try db.openTable("t", .{});
+    const Row = struct { id: i64, x: i64 };
+    var rows: [256]Row = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .id = @intCast(i), .x = @intCast(i) };
+    try table.insert(&rows);
+    try table.flush();
+
+    const entry = try table.acquireSegment(table.manifest.segments.items[0].segment_id);
+    defer table.releaseSegment(entry);
+    try std.testing.expect((try table.acquireSegmentTombstones(entry)) == null);
+
+    try helpers.exec(allocator, db, "DELETE FROM t WHERE id = 1");
+    const before = (try table.acquireSegmentTombstones(entry)).?;
+    try std.testing.expectEqualSlices(u32, &.{1}, before.rows);
+    const again = (try table.acquireSegmentTombstones(entry)).?;
+    try std.testing.expectEqual(before, again);
+    table.releaseSegmentTombstones(again);
+
+    try helpers.exec(allocator, db, "DELETE FROM t WHERE id = 2");
+    try std.testing.expectEqualSlices(u32, &.{1}, before.rows);
+    table.releaseSegmentTombstones(before);
+
+    const after = (try table.acquireSegmentTombstones(entry)).?;
+    defer table.releaseSegmentTombstones(after);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, after.rows);
+}
