@@ -47,6 +47,82 @@ pub fn forJobs(threads: usize, n_jobs: usize, ctx: anytype, comptime body: fn (@
     for (handles[0..nt]) |h| if (h) |th| th.join();
 }
 
+/// A counter idle helper threads wait on for their next unit of work. The
+/// publisher bumps it per hand-out (and once more to stop them); a helper
+/// spins, then yields, then parks on it, and a bump wakes a parked helper
+/// at once rather than at its next poll: a stop no longer waits out a sleep
+/// (a whole timer tick on Windows) before the helper can be joined.
+pub const WorkEpoch = struct {
+    value: std.atomic.Value(u32) = .init(0),
+    sleepers: std.atomic.Value(u32) = .init(0),
+
+    const SPINS: usize = 2048;
+    const YIELDS: usize = 2048;
+    /// Bounds a park only as a safeguard; a bump ends it.
+    const PARK_TIMEOUT_NS: u64 = 10 * std.time.ns_per_ms;
+
+    pub fn load(self: *const WorkEpoch) u32 {
+        return self.value.load(.acquire);
+    }
+
+    pub fn publish(self: *WorkEpoch) void {
+        _ = self.value.fetchAdd(1, .seq_cst);
+        if (self.sleepers.load(.seq_cst) == 0) return;
+        futexIo().futexWake(u32, &self.value.raw, std.math.maxInt(u32));
+    }
+
+    /// The first value past `seen`.
+    pub fn waitPast(self: *WorkEpoch, seen: u32) u32 {
+        var spins: usize = 0;
+        while (true) {
+            const now = self.value.load(.acquire);
+            if (now != seen) return now;
+            spins += 1;
+            if (spins < SPINS) {
+                std.atomic.spinLoopHint();
+            } else if (spins < SPINS + YIELDS) {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            } else {
+                self.park(seen);
+            }
+        }
+    }
+
+    fn park(self: *WorkEpoch, seen: u32) void {
+        // Announced before the futex reads the value, and `publish` bumps
+        // before it reads `sleepers`: either it sees this sleeper and wakes
+        // it, or the futex sees the bump and returns at once.
+        _ = self.sleepers.fetchAdd(1, .seq_cst);
+        defer _ = self.sleepers.fetchSub(1, .seq_cst);
+        futexIo().futexWaitTimeout(u32, &self.value.raw, seen, .{ .duration = .{
+            .raw = .fromNanoseconds(PARK_TIMEOUT_NS),
+            .clock = .awake,
+        } }) catch {};
+    }
+
+    /// Helpers are raw threads with no Io of their own; futex waits and
+    /// wakes hold no per-instance state, so the process-wide instance does.
+    fn futexIo() std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
+    }
+};
+
+test "WorkEpoch wakes a parked helper on publish" {
+    const Helper = struct {
+        fn run(epoch: *WorkEpoch, got: *std.atomic.Value(u32)) void {
+            got.store(epoch.waitPast(0), .release);
+        }
+    };
+    var epoch: WorkEpoch = .{};
+    var got = std.atomic.Value(u32).init(0);
+    const thread = try std.Thread.spawn(.{}, Helper.run, .{ &epoch, &got });
+    var spins: usize = 0;
+    while (epoch.sleepers.load(.acquire) == 0 and spins < 100_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    epoch.publish();
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 1), got.load(.acquire));
+}
+
 test "forRanges tiles the range once per worker and forJobs claims every job once" {
     const Sum = struct {
         hits: []u32,
