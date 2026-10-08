@@ -560,9 +560,12 @@ test "purgeTable frees one table's unpinned entries, leaves other tables and pin
 ///   - `clear` on ALTER/TRUNCATE/close (the parse is schema-dependent),
 ///   - `invalidateTombstones` when DELETE/UPDATE/UPSERT merges new tombstones.
 ///
-/// `tombstones` returns a caller-owned DUPE of the cached list, so readers
-/// keep today's ownership semantics and a concurrent invalidation can never
-/// free bytes a reader is still walking. Entries are pinned while a scan
+/// Readers share the cached tombstone list through `acquireTombstones`: a
+/// reference-counted, immutable list, so an invalidation can never free
+/// bytes a reader is still walking. Scans reopen a segment for every tile
+/// they claim; a per-open copy of a multi-MB list under `lock` serialized
+/// the whole worker fleet (#564). `tombstones` still returns a caller-owned
+/// dupe for callers that merge into it. Entries are pinned while a scan
 /// holds them; `retire` defers destruction to the last `release`.
 pub const SegmentHandles = struct {
     const segment_reader = @import("segment_reader.zig");
@@ -570,10 +573,23 @@ pub const SegmentHandles = struct {
     const types_mod = @import("../types.zig");
     const column = @import("column.zig");
 
+    /// A loaded, non-empty tombstone list. `refs` counts the entry's own
+    /// reference plus one per reader; the last `unref` frees it.
+    pub const Tombstones = struct {
+        rows: []const u32,
+        refs: std.atomic.Value(u32),
+
+        fn unref(self: *Tombstones, gpa: Allocator) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            gpa.free(self.rows);
+            gpa.destroy(self);
+        }
+    };
+
     pub const Entry = struct {
         segment_id: u64,
         seg: segment_reader.ReadSegment,
-        tombs: ?[]u32 = null,
+        tombs: ?*Tombstones = null,
         tombs_loaded: bool = false,
         pins: u32 = 0,
         retired: bool = false,
@@ -642,13 +658,37 @@ pub const SegmentHandles = struct {
         if (entry.retired and entry.pins == 0) destroyEntry(allocator, entry);
     }
 
-    /// The segment's tombstone row list as a caller-owned dupe (null = none).
-    /// The underlying file is read once and cached until `invalidateTombstones`.
-    /// `gpa` must be the table-lifetime allocator: the cached `entry.tombs`
-    /// outlives any query, and `invalidateTombstones`/`destroyEntry` free it
-    /// with that allocator. A query-scoped allocator here leaves a dangling
-    /// cache entry the compactor later frees (#136). `out_allocator` (typically
-    /// per-query) owns only the returned dupe.
+    /// The segment's tombstone list, shared (null = none, including an empty
+    /// file); pair with `releaseTombstones`. The file is read once and cached
+    /// until `invalidateTombstones`. `gpa` must be the table-lifetime
+    /// allocator: the cached list outlives any query and its last reference
+    /// can drop on any thread. A query-scoped allocator here leaves a dangling
+    /// cache entry the compactor later frees (#136).
+    pub fn acquireTombstones(
+        self: *SegmentHandles,
+        gpa: Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        entry: *Entry,
+    ) !?*Tombstones {
+        self.lockSpin();
+        defer self.lock.unlock();
+        if (!entry.tombs_loaded) {
+            entry.tombs = try loadTombstones(gpa, io, dir, entry.segment_id);
+            entry.tombs_loaded = true;
+        }
+        const t = entry.tombs orelse return null;
+        _ = t.refs.fetchAdd(1, .monotonic);
+        return t;
+    }
+
+    pub fn releaseTombstones(gpa: Allocator, t: *Tombstones) void {
+        t.unref(gpa);
+    }
+
+    /// The segment's tombstone row list as a caller-owned dupe (null = none),
+    /// for callers that merge into it. Same `gpa` contract as
+    /// `acquireTombstones`; `out_allocator` owns only the returned dupe.
     pub fn tombstones(
         self: *SegmentHandles,
         gpa: Allocator,
@@ -657,24 +697,32 @@ pub const SegmentHandles = struct {
         dir: std.Io.Dir,
         entry: *Entry,
     ) !?[]u32 {
-        self.lockSpin();
-        defer self.lock.unlock();
-        if (!entry.tombs_loaded) {
-            entry.tombs = try tombstone.read(gpa, io, dir, entry.segment_id);
-            entry.tombs_loaded = true;
+        const t = (try self.acquireTombstones(gpa, io, dir, entry)) orelse return null;
+        defer t.unref(gpa);
+        return try out_allocator.dupe(u32, t.rows);
+    }
+
+    fn loadTombstones(gpa: Allocator, io: std.Io, dir: std.Io.Dir, segment_id: u64) !?*Tombstones {
+        const rows = (try tombstone.read(gpa, io, dir, segment_id)) orelse return null;
+        if (rows.len == 0) {
+            gpa.free(rows);
+            return null;
         }
-        const t = entry.tombs orelse return null;
-        return try out_allocator.dupe(u32, t);
+        errdefer gpa.free(rows);
+        const t = try gpa.create(Tombstones);
+        t.* = .{ .rows = rows, .refs = .init(1) };
+        return t;
     }
 
     /// A tombstone merge wrote new offsets for `segment_id` — drop the cached
-    /// list so the next reader re-reads the file.
+    /// list so the next reader re-reads the file. Readers holding the old
+    /// list keep it until they release.
     pub fn invalidateTombstones(self: *SegmentHandles, allocator: Allocator, segment_id: u64) void {
         self.lockSpin();
         defer self.lock.unlock();
         _ = self.tombstone_generation.fetchAdd(1, .monotonic);
         const e = self.map.get(segment_id) orelse return;
-        if (e.tombs) |t| allocator.free(t);
+        if (e.tombs) |t| t.unref(allocator);
         e.tombs = null;
         e.tombs_loaded = false;
     }
@@ -784,7 +832,7 @@ pub const SegmentHandles = struct {
 
     fn destroyEntry(allocator: Allocator, e: *Entry) void {
         e.seg.deinit();
-        if (e.tombs) |t| allocator.free(t);
+        if (e.tombs) |t| t.unref(allocator);
         for (e.string_samples) |per_row_group| {
             if (per_row_group.len > 0) allocator.free(per_row_group);
         }

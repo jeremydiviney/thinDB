@@ -1374,6 +1374,16 @@ pub const Table = struct {
         return self.seg_handles.tombstones(self.allocator, allocator, self.io, self.segments_dir, entry);
     }
 
+    /// The segment's tombstone list, shared with every other reader (null =
+    /// none); pair with `releaseSegmentTombstones`.
+    pub fn acquireSegmentTombstones(self: *Table, entry: *storage.cache.SegmentHandles.Entry) !?*storage.cache.SegmentHandles.Tombstones {
+        return self.seg_handles.acquireTombstones(self.allocator, self.io, self.segments_dir, entry);
+    }
+
+    pub fn releaseSegmentTombstones(self: *Table, tombs: *storage.cache.SegmentHandles.Tombstones) void {
+        storage.cache.SegmentHandles.releaseTombstones(self.allocator, tombs);
+    }
+
     pub fn deleteSegmentFiles(self: *Table, seg_id: u64) !void {
         // Close any cached handle first — Windows refuses to delete open files.
         self.seg_handles.retire(self.allocator, seg_id);
