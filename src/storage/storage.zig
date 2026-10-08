@@ -693,6 +693,42 @@ test "forBlockOf parses base/width/codes (2B narrow accessor)" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 3, 1 }, fb.codes);
 }
 
+test "forInSetInto matches each code against the set at every width and alignment" {
+    const n = 300;
+    var prng = std.Random.DefaultPrng.init(0xf0f);
+    const rand = prng.random();
+    // Sets whose top code ends a bitmap byte (code 7, 65535), sets past the
+    // bitmap (binary search) and a set no code reaches.
+    const sets = [_][]const u64{ &.{7}, &.{ 0, 15, 200 }, &.{ 3, 65535 }, &.{ 1, 70000, 1 << 31 }, &.{ 100_000, 4_000_000_000 } };
+    var storage_bytes: [n * 4 + 1]u8 align(4) = undefined;
+    var mask: [n]bool = undefined;
+    inline for (.{ u8, u16, u32 }) |U| {
+        for ([_]usize{ 0, 1 }) |misalign| {
+            const codes = storage_bytes[misalign..][0 .. n * @sizeOf(U)];
+            var vals: [n]u64 = undefined;
+            for (&vals, 0..) |*v, i| {
+                // Every set member appears, plus neighbours of each.
+                const member = sets[i % sets.len][(i / sets.len) % sets[i % sets.len].len];
+                const pick: u64 = switch (i % 3) {
+                    0 => member,
+                    1 => member +% 1,
+                    else => rand.int(u64),
+                };
+                v.* = @as(U, @truncate(pick));
+                std.mem.writeInt(U, codes[i * @sizeOf(U) ..][0..@sizeOf(U)], @intCast(v.*), .little);
+            }
+            const fb = segment_reader.ForBlock{ .base = 0, .width = @sizeOf(U), .codes = codes };
+            for (sets) |set| {
+                segment_reader.forInSetInto(fb, set, n, &mask);
+                for (vals, mask) |v, got| {
+                    const want = std.mem.indexOfScalar(u64, set, v) != null;
+                    try std.testing.expectEqual(want, got);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // dict (segment-local string dictionary) encoding
 // ---------------------------------------------------------------------------

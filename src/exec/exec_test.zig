@@ -3199,6 +3199,113 @@ test "fused filter: guided IN-list, OR and NOT IN shapes stay block-sourced and 
     }
 }
 
+test "fused filter: numeric IN-lists over FOR and raw blocks match a per-row reference" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `small`, `mid` and `wide` carry 8-, 16- and 32-bit FOR codes; `big`
+    // spans the whole bigint range, which no FOR width covers.
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "small", .type = .int, .nullable = true },
+            .{ .name = "mid", .type = .int, .nullable = true },
+            .{ .name = "wide", .type = .bigint, .nullable = true },
+            .{ .name = "big", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    const Row = struct { id: i64, small: ?i32, mid: ?i32, wide: ?i64, big: i64 };
+    const rows = try allocator.alloc(Row, 4000);
+    defer allocator.free(rows);
+    var rng = std.Random.DefaultPrng.init(0x51ed);
+    const r = rng.random();
+    for (rows, 0..) |*row, i| {
+        const is_null = i % 7 == 3;
+        row.* = .{
+            .id = @intCast(i),
+            .small = if (is_null) null else 100 + r.intRangeAtMost(i32, 0, 200),
+            .mid = if (is_null) null else -1500 + r.intRangeAtMost(i32, 0, 3000),
+            .wide = if (is_null) null else r.intRangeAtMost(i64, 0, 5_000_000),
+            .big = r.int(i64),
+        };
+    }
+    try t.insert(rows);
+    try t.flush();
+
+    const small_vals = [_]types.Value{ .{ .int = 100 }, .{ .int = 150 }, .{ .int = 300 }, .{ .int = 99 }, .{ .int = 999 } };
+    var mid_vals: [12]types.Value = undefined;
+    for (&mid_vals, 0..) |*v, k| v.* = .{ .int = rows[k * 37].mid orelse 0 };
+    // Spread past the membership bitmap, then all within it.
+    var wide_vals: [9]types.Value = undefined;
+    for (&wide_vals, 0..) |*v, k| v.* = .{ .bigint = rows[k * 401 + 1].wide orelse 0 };
+    wide_vals[8] = .{ .bigint = 4_999_999 };
+    var narrow_vals: [6]types.Value = .{ .{ .bigint = 0 }, .{ .bigint = 7 }, .{ .bigint = 59_999 }, .{ .bigint = 0 }, .{ .bigint = 0 }, .{ .bigint = 0 } };
+    var narrow_len: usize = 3;
+    for (rows) |row| if (row.wide) |w| if (w < 60_000 and narrow_len < narrow_vals.len) {
+        narrow_vals[narrow_len] = .{ .bigint = w };
+        narrow_len += 1;
+    };
+    var big_vals: [10]types.Value = undefined;
+    for (&big_vals, 0..) |*v, k| v.* = .{ .bigint = rows[k * 311].big };
+    var small_arms: [small_vals.len]PredicateExpr = undefined;
+    for (&small_arms, small_vals) |*a, v| a.* = leafExpr("small", .eq, v);
+    var mid_arms: [mid_vals.len]PredicateExpr = undefined;
+    for (&mid_arms, mid_vals) |*a, v| a.* = leafExpr("mid", .eq, v);
+
+    const Case = struct { name: []const u8, expr: PredicateExpr, col: enum { small, mid, wide, big }, values: []const types.Value, negate: bool };
+    const cases = [_]Case{
+        .{ .name = "u8 codes, OR of leaves", .expr = .{ .@"or" = &small_arms }, .col = .small, .values = &small_vals, .negate = false },
+        .{ .name = "u8 codes, NOT IN", .expr = .{ .in_set = .{ .col = "small", .values = &small_vals, .negate = true } }, .col = .small, .values = &small_vals, .negate = true },
+        .{ .name = "u16 codes, OR of leaves", .expr = .{ .@"or" = &mid_arms }, .col = .mid, .values = &mid_vals, .negate = false },
+        .{ .name = "u32 codes, sorted lookup", .expr = .{ .in_set = .{ .col = "wide", .values = &wide_vals, .negate = false } }, .col = .wide, .values = &wide_vals, .negate = false },
+        .{ .name = "u32 codes, NOT IN", .expr = .{ .in_set = .{ .col = "wide", .values = &wide_vals, .negate = true } }, .col = .wide, .values = &wide_vals, .negate = true },
+        .{ .name = "u32 codes, bitmap", .expr = .{ .in_set = .{ .col = "wide", .values = narrow_vals[0..narrow_len], .negate = false } }, .col = .wide, .values = narrow_vals[0..narrow_len], .negate = false },
+        .{ .name = "raw bigint", .expr = .{ .in_set = .{ .col = "big", .values = &big_vals, .negate = false } }, .col = .big, .values = &big_vals, .negate = false },
+        .{ .name = "raw bigint, NOT IN", .expr = .{ .in_set = .{ .col = "big", .values = &big_vals, .negate = true } }, .col = .big, .values = &big_vals, .negate = true },
+    };
+
+    for (cases) |c| {
+        var base = try scan(allocator, t);
+        var q = try base.filter(c.expr);
+        defer q.deinit();
+        const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+        try std.testing.expect(filter_op.fused);
+
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        while (try q.next()) |b| try got.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        const s: *exec.Scan = @ptrCast(@alignCast(filter_op.upstream.ptr));
+        try std.testing.expect(s.rgs_guided > 0);
+
+        var want: std.ArrayList(i64) = .empty;
+        defer want.deinit(allocator);
+        for (rows) |row| {
+            const cell: ?i64 = switch (c.col) {
+                .small => if (row.small) |x| x else null,
+                .mid => if (row.mid) |x| x else null,
+                .wide => if (row.wide) |x| x else null,
+                .big => row.big,
+            };
+            const x = cell orelse continue;
+            var found = false;
+            for (c.values) |v| found = found or x == (if (v == .int) @as(i64, v.int) else v.bigint);
+            if (found != c.negate) try want.append(allocator, row.id);
+        }
+        std.testing.expectEqualSlices(i64, want.items, got.items) catch |err| {
+            std.debug.print("case: {s}\n", .{c.name});
+            return err;
+        };
+    }
+}
+
 // A table under a FROM alias (every join side) fuses its WHERE with the
 // qualified names; the block-sourced path must resolve them like the prune
 // hints do, or every row group decodes all projected columns in full.

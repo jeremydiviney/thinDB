@@ -745,6 +745,73 @@ fn forCompareWidth(comptime U: type, codes: []const u8, want: U, row_count: u32,
     }
 }
 
+/// Largest code an IN-list's FOR membership bitmap covers (8 KiB of bits).
+const FOR_IN_BITMAP_CODES: u64 = 1 << 16;
+
+/// `mask[i]` = whether row i's code is one of `set` (ascending, non-empty,
+/// already in the code domain) — one pass over the narrow codes however many
+/// literals the IN-list carries. Sets whose codes all sit below 2^16 test a
+/// bitmap; wider ones binary-search. NULLs are the caller's, as in
+/// `forCompareInto`.
+pub fn forInSetInto(fb: ForBlock, set: []const u64, row_count: u32, mask: []bool) void {
+    const top = set[set.len - 1];
+    var bitmap: [FOR_IN_BITMAP_CODES / 8]u8 = undefined;
+    const bits: ?[]const u8 = if (top < FOR_IN_BITMAP_CODES) blk: {
+        const used = bitmap[0 .. @as(usize, @intCast(top / 8)) + 1];
+        @memset(used, 0);
+        for (set) |c| used[@intCast(c / 8)] |= @as(u8, 1) << @intCast(c % 8);
+        break :blk used;
+    } else null;
+    switch (fb.width) {
+        1 => forInSetWidth(u8, fb.codes, set, bits, row_count, mask),
+        2 => forInSetWidth(u16, fb.codes, set, bits, row_count, mask),
+        4 => forInSetWidth(u32, fb.codes, set, bits, row_count, mask),
+        else => for (mask[0..row_count], 0..) |*m, i| {
+            m.* = codeInSet(readForCode(fb.codes, fb.width, i), set, bits);
+        },
+    }
+}
+
+fn forInSetWidth(comptime U: type, codes: []const u8, set: []const u64, bits: ?[]const u8, row_count: u32, mask: []bool) void {
+    const n: usize = row_count;
+    if (@sizeOf(U) == 1 or @intFromPtr(codes.ptr) % @alignOf(U) == 0) {
+        const typed: []const U = @as([*]const U, @ptrCast(@alignCast(codes.ptr)))[0..n];
+        if (bits) |b| {
+            for (typed, mask[0..n]) |c, *m| m.* = bitmapHas(b, c);
+        } else {
+            for (typed, mask[0..n]) |c, *m| m.* = sortedHas(set, c);
+        }
+        return;
+    }
+    for (mask[0..n], 0..) |*m, i| {
+        m.* = codeInSet(std.mem.readInt(U, codes[i * @sizeOf(U) ..][0..@sizeOf(U)], .little), set, bits);
+    }
+}
+
+fn codeInSet(code: u64, set: []const u64, bits: ?[]const u8) bool {
+    return if (bits) |b| bitmapHas(b, code) else sortedHas(set, code);
+}
+
+/// Branch-free: a code past the bitmap reads its last byte and masks the
+/// answer off.
+inline fn bitmapHas(bits: []const u8, code: u64) bool {
+    const limit: u64 = bits.len * 8;
+    const in_range = code < limit;
+    const at: usize = @intCast(@min(code, limit - 1));
+    return in_range and (bits[at / 8] >> @intCast(at % 8)) & 1 != 0;
+}
+
+fn sortedHas(sorted: []const u64, code: u64) bool {
+    var base: usize = 0;
+    var len = sorted.len;
+    while (len > 1) {
+        const half = len / 2;
+        if (sorted[base + half] <= code) base += half;
+        len -= half;
+    }
+    return sorted[base] == code;
+}
+
 fn cmpScalar(comptime U: type, a: U, b: U, op: simd_mod.CmpOp) bool {
     return switch (op) {
         .eq => a == b,
