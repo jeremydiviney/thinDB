@@ -326,8 +326,12 @@ pub const Scan = struct {
     /// parsed `ReadSegment`. Released (not closed) by `closeCurSegment`.
     cur_seg_entry: ?*storage.cache.SegmentHandles.Entry = null,
     cur_segment: ?*storage.ReadSegment = null,
-    /// Sorted, deduped tombstone offsets for the current segment (or null).
-    cur_segment_tomb: ?[]u32 = null,
+    /// The current segment's shared tombstone list (null = none); released
+    /// by `closeCurSegment`.
+    cur_segment_tombs: ?*storage.cache.SegmentHandles.Tombstones = null,
+    /// Sorted, deduped tombstone offsets for the current segment (or null);
+    /// aliases `cur_segment_tombs.rows`.
+    cur_segment_tomb: ?[]const u32 = null,
     /// Prefix sum: `cur_rg_first_row[k]` is the first row offset of row group k
     /// within the current segment.
     cur_rg_first_row: []u32 = &.{},
@@ -1143,10 +1147,11 @@ pub const Scan = struct {
             self.cur_seg_entry = null;
             self.cur_segment = null;
         }
-        if (self.cur_segment_tomb) |t| {
-            self.allocator.free(t);
-            self.cur_segment_tomb = null;
+        if (self.cur_segment_tombs) |t| {
+            self.table.releaseSegmentTombstones(t);
+            self.cur_segment_tombs = null;
         }
+        self.cur_segment_tomb = null;
         if (self.cur_rg_first_row.len > 0) {
             self.allocator.free(self.cur_rg_first_row);
             self.cur_rg_first_row = &.{};
@@ -2100,13 +2105,13 @@ pub const Scan = struct {
                 self.cur_seg_idx += 1;
                 continue;
             }
-            if (self.cur_segment_tomb != null) return false;
             const rg = seg.info.row_groups[self.cur_rg_idx];
             if (!self.rowGroupCanMatch(rg)) {
                 self.rgs_considered += 1;
                 self.cur_rg_idx += 1;
                 continue;
             }
+            if (self.rowGroupHasTombstones(self.cur_rg_first_row[self.cur_rg_idx], rg.row_count)) return false;
             const blocks = try self.ensureBorrowBlocks();
             var acquired: usize = 0;
             defer for (blocks[0..acquired]) |*block| block.release(self.allocator, self.table.cacheRef());
@@ -2237,15 +2242,16 @@ pub const Scan = struct {
                 // `releaseBatch` doesn't free these columns a second time.
                 self.decoded_valid = false;
             }
+            const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
+            // Sidecars ride only row groups no tombstone touches: the survivor
+            // compaction would desync them from the values.
+            const rg_clean = !self.rowGroupHasTombstones(rg_first, rg_count);
             // Phase 4.2: emit the gated key column as codes (sidecar) instead of
-            // materialized strings. Disabled when the segment has tombstones (the
-            // survivor compaction would desync the codes) or in late-mat mode.
-            const coding = self.n_coded > 0 and self.cur_segment_tomb == null and !self.emit_loc;
-            // Key-digest emit follows the same tombstone rule (the survivor
-            // compaction would desync the sidecar) but is late-mat compatible:
-            // the synthesized __rowloc column is exactly how the real key
-            // bytes come back at emit.
-            const hashing = self.n_hashed > 0 and self.cur_segment_tomb == null;
+            // materialized strings. Not in late-mat mode.
+            const coding = self.n_coded > 0 and rg_clean and !self.emit_loc;
+            // Key-digest emit is late-mat compatible: the synthesized __rowloc
+            // column is exactly how the real key bytes come back at emit.
+            const hashing = self.n_hashed > 0 and rg_clean;
             for (self.out_phys, 0..) |phys, j| {
                 if (coding and self.coded_dicts_by_j[j] != null) {
                     self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count, j);
@@ -2277,7 +2283,6 @@ pub const Scan = struct {
             }
             self.decoded_valid = true;
 
-            const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
             self.cur_rg_idx += 1;
 
             // Apply tombstones if any fall within this row group.
@@ -2316,7 +2321,7 @@ pub const Scan = struct {
                 return self.emitSub();
             }
             var runs_sidecar: ?[]const ?exec.RunsColumn = null;
-            if (self.emit_runs and self.cur_segment_tomb == null) {
+            if (self.emit_runs and rg_clean) {
                 runs_sidecar = try self.fillRunsSidecar(seg, self.cur_rg_idx - 1, rg_count);
             }
             return Batch{
@@ -2373,7 +2378,8 @@ pub const Scan = struct {
         self.cur_seg_entry = handle;
         self.cur_segment = &handle.seg;
         self.segments_opened += 1;
-        self.cur_segment_tomb = try self.table.segmentTombstones(self.allocator, handle);
+        self.cur_segment_tombs = try self.table.acquireSegmentTombstones(handle);
+        self.cur_segment_tomb = if (self.cur_segment_tombs) |t| t.rows else null;
         const rgs = self.cur_segment.?.info.row_groups;
         self.cur_rg_first_row = try self.allocator.alloc(u32, rgs.len);
         var running: u32 = 0;
@@ -3394,9 +3400,7 @@ pub const Scan = struct {
         // mask-based paths (FOR-guided / borrow / owned) handle the row group.
         if (self.emit_loc) return null;
         if (self.out_phys.len != 1) return null;
-        if (self.cur_segment_tomb) |t| {
-            if (t.len != 0) return null;
-        }
+        if (self.rowGroupHasTombstones(self.cur_rg_first_row[rg_idx], rg_count)) return null;
         const leaf = switch (expr) {
             .leaf => |l| l,
             else => return null,
@@ -4092,6 +4096,12 @@ pub const Scan = struct {
         self.filtered_coded = slots;
         self.filtered_hashed = hash_slots;
         return matched;
+    }
+
+    fn rowGroupHasTombstones(self: *const Scan, rg_first: u32, rg_count: u32) bool {
+        const tombs = self.cur_segment_tomb orelse return false;
+        const lo = std.sort.lowerBound(u32, tombs, rg_first, cmpU32);
+        return lo < tombs.len and tombs[lo] < rg_first + rg_count;
     }
 
     /// Build a keep-mask for tombstoned rows in `[rg_first, rg_first+rg_count)`,
