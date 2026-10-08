@@ -2702,12 +2702,7 @@ pub const Scan = struct {
         switch (leaf.op) {
             .eq, .neq, .lt, .lte, .gt, .gte => {},
         }
-        const pred_phys = blk: {
-            for (self.table.schema.columns, 0..) |col, phys| {
-                if (@import("../types.zig").columnNameEql(col.name, leaf.col)) break :blk phys;
-            }
-            return false;
-        };
+        const pred_phys = types.findColumn(self.table.schema.columns, leaf.col) orelse return false;
         const col_type = self.table.schema.columns[pred_phys].type;
         if (!storage.format.bytesFollowComparison(col_type)) return false;
 
@@ -2964,12 +2959,7 @@ pub const Scan = struct {
         active: ?[]const bool,
         out: []bool,
     ) !bool {
-        const pred_phys = blk: {
-            for (self.table.schema.columns, 0..) |col, phys| {
-                if (@import("../types.zig").columnNameEql(col.name, set.col)) break :blk phys;
-            }
-            return false;
-        };
+        const pred_phys = types.findColumn(self.table.schema.columns, set.col) orelse return false;
         const col_type = self.table.schema.columns[pred_phys].type;
         if (!storage.format.bytesFollowComparison(col_type)) return false;
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
@@ -3278,12 +3268,7 @@ pub const Scan = struct {
         active: ?[]const bool,
         out: []bool,
     ) !bool {
-        const pred_phys = blk: {
-            for (self.table.schema.columns, 0..) |col, phys| {
-                if (@import("../types.zig").columnNameEql(col.name, lp.col)) break :blk phys;
-            }
-            return false;
-        };
+        const pred_phys = types.findColumn(self.table.schema.columns, lp.col) orelse return false;
         const col_type = self.table.schema.columns[pred_phys].type;
         switch (col_type) {
             .varchar, .string, .char, .json => {},
@@ -3463,7 +3448,7 @@ pub const Scan = struct {
             else => return null,
         };
         const phys = self.out_phys[0];
-        if (!@import("../types.zig").columnNameEql(self.table.schema.columns[phys].name, leaf.col)) return null;
+        if (types.findColumn(self.table.schema.columns, leaf.col) != phys) return null;
         const col = self.table.schema.columns[phys];
         if (col.nullable) return null;
         switch (col.type) {

@@ -3199,6 +3199,78 @@ test "fused filter: guided IN-list, OR and NOT IN shapes stay block-sourced and 
     }
 }
 
+// A table under a FROM alias (every join side) fuses its WHERE with the
+// qualified names; the block-sourced path must resolve them like the prune
+// hints do, or every row group decodes all projected columns in full.
+test "fused filter: alias-qualified leaves stay block-sourced" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+            .{ .name = "ratio", .type = .double },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    const rows = [_]FuseRow{
+        .{ .id = 1, .qty = 10, .ratio = 1.5, .tag = "apple" },
+        .{ .id = 2, .qty = 20, .ratio = 2.5, .tag = "apricot" },
+        .{ .id = 3, .qty = 30, .ratio = 3.5, .tag = "banana" },
+        .{ .id = 4, .qty = 40, .ratio = 4.5, .tag = "blueberry" },
+        .{ .id = 5, .qty = 50, .ratio = 5.5, .tag = "cherry" },
+        .{ .id = 6, .qty = 60, .ratio = 6.5, .tag = "apex" },
+    };
+    inline for (rows) |r| {
+        try t.insert(&.{.{ .id = r.id, .qty = r.qty, .ratio = r.ratio, .tag = r.tag }});
+    }
+    try t.flush();
+
+    const in_ids = [_]types.Value{ .{ .bigint = 2 }, .{ .bigint = 3 }, .{ .bigint = 6 } };
+    const conjuncts = [_]PredicateExpr{
+        leafExpr("r.qty", .gte, .{ .int = 20 }),
+        leafExpr("r.tag", .neq, .{ .text = "banana" }),
+        .{ .in_set = .{ .col = "r.id", .values = &in_ids, .negate = false } },
+        .{ .like = .{ .col = "r.tag", .pattern = "ap%" } },
+    };
+
+    var base = try exec.AliasRename.create(allocator, try scan(allocator, t), "r");
+    var q = try base.filter(.{ .@"and" = &conjuncts });
+    defer q.deinit();
+
+    const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+    try std.testing.expect(filter_op.fused);
+
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(allocator);
+    var qty: std.ArrayList(i32) = .empty;
+    defer qty.deinit(allocator);
+    var ratio: std.ArrayList(f64) = .empty;
+    defer ratio.deinit(allocator);
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    var tag_off: std.ArrayList(usize) = .empty;
+    defer tag_off.deinit(allocator);
+    try collectFused(allocator, &q, &ids, &qty, &ratio, &tags, &tag_off);
+
+    const alias = exec.queryAs(exec.AliasRename, filter_op.upstream).?;
+    const s = exec.queryAs(exec.Scan, alias.upstream).?;
+    try std.testing.expect(s.rgs_guided > 0);
+
+    try std.testing.expectEqualSlices(i64, &.{ 2, 6 }, ids.items);
+    try std.testing.expectEqualSlices(i32, &.{ 20, 60 }, qty.items);
+    try std.testing.expectEqualSlices(u8, "apricotapex", tags.items);
+}
+
 test "fused filter: applies to unflushed memtable rows too" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
