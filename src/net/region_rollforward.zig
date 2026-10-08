@@ -87,7 +87,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                     if (m.region_keys != null) break :blk cur;
                     cur = m.upstream;
                 },
-                else => cur = region_spine_upstream(cur) orelse return null,
+                else => cur = boundary_upstream(cur) orelse return null,
             }
         }
         return null;
@@ -103,7 +103,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
     if (shape_hash) |shape| if (inputCache(input)) |cache| {
         if (cache.boundary(shape)) |selected_depth| hint: {
             var anchor = top;
-            for (0..selected_depth) |_| anchor = region_spine_upstream(anchor) orelse break :hint;
+            for (0..selected_depth) |_| anchor = boundary_upstream(anchor) orelse break :hint;
             if (anchor.* != .materialize) break :hint;
             verifyKeyContract(anchor, keys, 0) catch |err| {
                 if (err == error.OutOfMemory) return err;
@@ -178,13 +178,21 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                 }
                 cur = m.upstream;
             },
-            else => cur = region_spine_upstream(cur) orelse break,
+            else => cur = boundary_upstream(cur) orelse break,
         }
     }
     if (getenv("THINDB_REGION_TRACE") != null) {
         std.debug.print("[region] ordinary execution: {s}\n", .{if (any_conforming) "no supported region boundary" else "no compatible key boundary"});
     }
     return null;
+}
+
+/// The next node the boundary search visits. A UNION ALL whose branches
+/// both read one CTE continues at that CTE: the branches above it stay
+/// ordinary, and a region anchored there feeds every branch, so an
+/// unsupported branch above a shared input no longer hides the chain below.
+fn boundary_upstream(op: *const ir.Op) ?*const ir.Op {
+    return union_spine(op, 0);
 }
 
 fn region_spine_upstream(op: *const ir.Op) ?*const ir.Op {
@@ -916,7 +924,7 @@ fn try_cached_declaration(input: engine_v2.CompileInput, top: *const ir.Op, keys
         return null;
     };
     var anchor = top;
-    for (0..selected.depth) |_| anchor = region_spine_upstream(anchor) orelse return null;
+    for (0..selected.depth) |_| anchor = boundary_upstream(anchor) orelse return null;
     if (anchor.* != .materialize) return null;
     verifyKeyContract(anchor, keys, 0) catch return null;
     // Failed outer candidates can drain whole join inputs. The unchanged
