@@ -63,6 +63,13 @@ const GRID_CHUNK_ROWS: usize = 1024;
 const GRID_SCAN_TILE_RGS: usize = 16;
 const GRID_SCAN_COALESCE_TILES: usize = 1;
 const GRID_SCAN_YIELD_CHUNKS: usize = 16384;
+// An idle grid worker spins, then yields, then parks on `PipeShared.work_epoch`.
+// Parking bounds an idle worker's CPU to its wakeups; spinning burned a core
+// per worker for the whole statement. The timeout only bounds how long a
+// parked worker takes to notice a cancel.
+const GRID_IDLE_SPINS: usize = 256;
+const GRID_IDLE_YIELDS: usize = 8;
+const GRID_PARK_TIMEOUT_NS: u64 = std.time.ns_per_ms;
 const DEFAULT_ROUTE_BLOCK_ROWS: usize = 2048;
 const MAX_ROUTE_BLOCK_ROWS: usize = 2048;
 const AUTO_ROUTE_BLOCK_ROWS: usize = 0;
@@ -2073,12 +2080,42 @@ const PipeShared = struct {
     // peer to hand work to, a filled staging chunk folds straight into that
     // bucket rather than queueing for a stage pass that only copies it again.
     serial_fold_scratch: ?*GroupScratch = null,
+    // Without an Io, idle grid workers yield instead of parking.
+    io: ?std.Io = null,
+    // Bumped by anything that can hand a parked grid worker work: a queue
+    // publish (wakes one), or a transition every worker must observe — scan
+    // exhausted, all scans done, grouping drained, abort (wakes all). A
+    // worker that releases a lane needs no signal: it re-checks before parking.
+    work_epoch: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    parked_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     fn grouping_complete(self: *const PipeShared) bool {
         // Closing every producer makes the remaining row count monotone.
         // Its credits survive queue/builder hand-offs until group writes finish.
         return self.scans_done.load(.acquire) == self.scan_threads and
             self.pending_group_rows.load(.acquire) == 0;
+    }
+
+    fn signalWork(self: *PipeShared, waiters: u32) void {
+        _ = self.work_epoch.fetchAdd(1, .seq_cst);
+        if (self.parked_workers.load(.seq_cst) == 0) return;
+        const io = self.io orelse return;
+        io.futexWake(u32, &self.work_epoch.raw, waiters);
+    }
+
+    // `seen_epoch` must be read before the caller's last look for work, so a
+    // signal sent after that look makes the wait return at once.
+    fn parkUntilSignal(self: *PipeShared, seen_epoch: u32) void {
+        const io = self.io orelse {
+            std.Thread.yield() catch {};
+            return;
+        };
+        _ = self.parked_workers.fetchAdd(1, .seq_cst);
+        defer _ = self.parked_workers.fetchSub(1, .seq_cst);
+        io.futexWaitTimeout(u32, &self.work_epoch.raw, seen_epoch, .{ .duration = .{
+            .raw = .fromNanoseconds(GRID_PARK_TIMEOUT_NS),
+            .clock = .awake,
+        } }) catch {};
     }
 };
 
@@ -3246,6 +3283,7 @@ fn publishRawRowsToQueue(
     _ = queue.queued_rows_atomic.fetchAdd(row_count, .release);
     _ = queue.queued_chunks_atomic.fetchAdd(1, .release);
     queue.lock.unlock();
+    shared.signalWork(1);
 }
 
 fn publishGroupChunkToQueue(
@@ -3272,6 +3310,7 @@ fn publishGroupChunkToQueue(
     _ = queue.queued_rows_atomic.fetchAdd(row_count, .release);
     _ = queue.queued_chunks_atomic.fetchAdd(1, .release);
     queue.lock.unlock();
+    shared.signalWork(1);
 }
 
 fn popRawChunkBatchFromQueue(queue: *RawQueue, out: *[MAX_RAW_BATCH_CHUNKS]RawChunk, max_chunks_raw: usize, queue_lock_ticks: ?*i64) usize {
@@ -5775,6 +5814,7 @@ fn siloGridWorker(job: SiloGridJob) void {
         // Wake the peers so they stop waiting on coordination counters this
         // worker will never advance (e.g. its `scans_done` increment).
         job.shared.aborted.store(true, .release);
+        job.shared.signalWork(std.math.maxInt(u32));
     };
 }
 
@@ -6114,7 +6154,7 @@ fn drainRawDedicatedGroupLane(
     }
     // Failed folds retain their credit until the query aborts, so peers cannot
     // read partial aggregate states in the interval before abort is signalled.
-    _ = shared.pending_group_rows.fetchSub(total_rows, .release);
+    if (shared.pending_group_rows.fetchSub(total_rows, .release) == total_rows) shared.signalWork(std.math.maxInt(u32));
     return true;
 }
 
@@ -6332,6 +6372,7 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
         try markGridScanDone(job, marked_scan_done);
     }
     _ = job.shared.active_scan_jobs.fetchSub(1, .release);
+    if (job.shared.next_scan_rg.load(.acquire) >= job.shared.total_scan_rgs) job.shared.signalWork(std.math.maxInt(u32));
 }
 
 fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
@@ -6343,7 +6384,7 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
         }
         if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
-    _ = job.shared.scans_done.fetchAdd(1, .release);
+    if (job.shared.scans_done.fetchAdd(1, .release) + 1 == job.shared.scan_threads) job.shared.signalWork(std.math.maxInt(u32));
     marked_scan_done.* = true;
 }
 
@@ -6382,6 +6423,7 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
     var idle_spins: usize = 0;
 
     while (true) {
+        const seen_epoch = job.shared.work_epoch.load(.acquire);
         // A peer failed: stop scheduling and tear down (the failing worker's
         // error is already recorded; ours would just race it).
         if (job.shared.aborted.load(.acquire)) return;
@@ -6496,11 +6538,14 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
             const idle_t0 = if (job.profile) platform.nowTicks() else 0;
             job.local.sched_idle_loops += 1;
             idle_spins += 1;
-            if (idle_spins < 256) {
+            if (idle_spins < GRID_IDLE_SPINS) {
                 std.atomic.spinLoopHint();
-            } else {
+            } else if (idle_spins < GRID_IDLE_SPINS + GRID_IDLE_YIELDS) {
                 std.Thread.yield() catch {};
-                idle_spins = 0;
+            } else {
+                job.shared.parkUntilSignal(seen_epoch);
+                // Back from a park, a miss parks again without re-spinning.
+                idle_spins -= 1;
             }
             if (job.profile) job.idle_ticks.* += platform.nowTicks() - idle_t0;
             continue;
@@ -6885,6 +6930,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     var shared = PipeShared{
         .resources = resources,
         .allocator = allocator,
+        .io = table.io,
         .buckets = buckets,
         .bucket_count = bucket_count,
         .raw_scan_queues = raw_scan_queues,
