@@ -6614,6 +6614,8 @@ pub const RunConfig = struct {
     udf_registry: ?*const udf_mod.UdfRegistry = null,
     resources: ?*thindb.exec.memory.MemoryAccountant = null,
     filter_expr: ?thindb.exec.PredicateExpr = null,
+    /// Hints the consumer offered on scan columns, after the filter's own.
+    offered_prunes: Scan.OfferedPrunes = .{},
     shared_stage_builders: bool = false,
     no_profile: bool = false,
     quiet: bool = false,
@@ -6761,10 +6763,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // filter then spins ceil(surviving/RGS_PER_GRID_WORKER) workers instead of
     // the full DOP; an unfusable or absent filter keeps full DOP.
     var work_rgs: usize = total_rgs + (@as(usize, @intCast(snap.memtable_snap.row_count)) + 65535) / 65536;
-    if (cfg.filter_expr) |expr| {
-        if (applyScanFilterExpr(stats_scan, expr) catch false) {
-            if (stats_scan.survivingWorkUnits()) |surviving| work_rgs = surviving;
-        }
+    var hinted = false;
+    if (cfg.filter_expr) |expr| hinted = applyScanFilterExpr(stats_scan, expr) catch false;
+    if (try cfg.offered_prunes.apply(stats_scan)) hinted = true;
+    if (hinted) {
+        if (stats_scan.survivingWorkUnits()) |surviving| work_rgs = surviving;
     }
     const sized_workers = (work_rgs + RGS_PER_GRID_WORKER - 1) / RGS_PER_GRID_WORKER;
     const n_workers = @max(@as(usize, 1), @min(dop, @min(cpus.len, @max(sized_workers, 1))));
@@ -6995,6 +6998,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 _ = try applyScanFilterExpr(scans[i], expr);
             }
         }
+        _ = try cfg.offered_prunes.apply(scans[i]);
         for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         scans[i].setRange(0, 0, 0, 0, false);
     }

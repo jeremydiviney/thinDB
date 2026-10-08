@@ -579,6 +579,20 @@ pub const Scan = struct {
         values: []const Value,
     };
 
+    /// Hints offered to an operator that builds its scans later
+    /// (`Query.addPrune`, `Query.addPruneSet`), for each scan it builds.
+    pub const OfferedPrunes = struct {
+        ranges: []const Predicate = &.{},
+        sets: []const predicate.InSet = &.{},
+
+        /// Install the hints on `scan`; whether there were any.
+        pub fn apply(self: OfferedPrunes, scan: *Scan) !bool {
+            for (self.ranges) |pred| try scan.addPrune(pred);
+            for (self.sets) |set| try scan.addPruneSet(set);
+            return self.ranges.len + self.sets.len > 0;
+        }
+    };
+
     /// Standalone scan: mints + owns its own accountant from the table's
     /// configured budget. Used by the raw builder API and tests.
     pub fn create(allocator: Allocator, table: *Table) !Query {
@@ -1519,12 +1533,63 @@ pub const Scan = struct {
         try self.markPruned();
     }
 
+    /// `addPrune` for a set (`Query.addPruneSet`): skip the segments and row
+    /// groups whose [min, max] holds none of `set.values`. A value the scan's
+    /// own hints on the column rule out can't match, so it doesn't count: a
+    /// set disjoint from `col = v` skips everything.
+    pub fn addPruneSet(self: *Scan, set: predicate.InSet) !void {
+        if (set.negate) return;
+        const col_idx = types.findColumn(self.table.schema.columns, set.col) orelse return Error.ColumnNotFound;
+        const col_type = self.table.schema.columns[col_idx].type;
+        if (!storage.format.typeHasStats(col_type) or !storage.format.bytesFollowComparison(col_type)) return;
+
+        var kept: std.ArrayListUnmanaged(i128) = .empty;
+        defer kept.deinit(self.allocator);
+        values: for (set.values) |v| {
+            const value = predicate.valueToRangeI128(v) orelse return;
+            const point: storage.format.Stats = .{ .min = value, .max = value };
+            for (self.prunes.items) |h| {
+                if (h.col_idx == col_idx and !predicate.statsOverlapPredicateBlankAware(point, h.op, h.val, false)) continue :values;
+            }
+            for (self.in_prunes.items) |h| {
+                if (h.col_idx == col_idx and !setOverlaps(h.values, point)) continue :values;
+            }
+            try kept.append(self.allocator, value);
+        }
+        const values = try kept.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(values);
+        try self.in_prunes.ensureUnusedCapacity(self.allocator, 1);
+        try self.skipSegments(col_idx, @as([]const i128, values), setOverlaps);
+        self.in_prunes.appendAssumeCapacity(.{ .col_idx = col_idx, .values = values });
+        try self.markPruned();
+    }
+
+    /// Whether some value of `values` lies in `range`'s [min, max].
+    fn setOverlaps(values: []const i128, range: storage.format.Stats) bool {
+        for (values) |v| {
+            if (v >= range.min and v <= range.max) return true;
+        }
+        return false;
+    }
+
+    const RangeHint = struct { op: PredicateOp, val: Value, blanks_excluded: bool };
+
+    fn rangeOverlaps(hint: RangeHint, range: storage.format.Stats) bool {
+        return predicate.statsOverlapPredicateBlankAware(range, hint.op, hint.val, hint.blanks_excluded);
+    }
+
     /// Segment-level pruning for one hint: mark segments whose manifest stats
     /// can't match. The caller already proved this column's type has stats,
     /// so any manifest entry carrying per-column stats (v4+) has a valid slot
     /// at `col_idx`. Older manifests fall back to `leading_key_stats` when
     /// the predicate is on the leading order-key column.
     fn segmentPrunePass(self: *Scan, col_idx: usize, op: PredicateOp, val: Value, blanks_excluded: bool) !void {
+        const hint: RangeHint = .{ .op = op, .val = val, .blanks_excluded = blanks_excluded };
+        return self.skipSegments(col_idx, hint, rangeOverlaps);
+    }
+
+    /// Mark the segments whose stats on `col_idx` fail `overlaps(hint, stats)`.
+    fn skipSegments(self: *Scan, col_idx: usize, hint: anytype, comptime overlaps: fn (@TypeOf(hint), storage.format.Stats) bool) !void {
         const order_key_cols = self.table.order_key_indices;
         const is_leading = order_key_cols.len > 0 and order_key_cols[0] == col_idx;
         const segs = self.segs;
@@ -1537,7 +1602,7 @@ pub const Scan = struct {
                 break :blk null;
             };
             const lk = lk_opt orelse continue;
-            if (!predicate.statsOverlapPredicateBlankAware(lk, op, val, blanks_excluded)) {
+            if (!overlaps(hint, lk)) {
                 if (skipped_buf == null) {
                     const buf = try self.allocator.alloc(bool, self.segment_count);
                     @memset(buf, false);
@@ -1693,15 +1758,7 @@ pub const Scan = struct {
             if (!predicate.statsOverlapPredicateBlankAware(col_stats, hint.op, hint.val, hint.blanks_excluded)) return false;
         }
         for (self.in_prunes.items) |hint| {
-            const col_stats = rg.stats[hint.col_idx];
-            var any = false;
-            for (hint.values) |v| {
-                if (v >= col_stats.min and v <= col_stats.max) {
-                    any = true;
-                    break;
-                }
-            }
-            if (!any) return false;
+            if (!setOverlaps(hint.values, rg.stats[hint.col_idx])) return false;
         }
         return true;
     }

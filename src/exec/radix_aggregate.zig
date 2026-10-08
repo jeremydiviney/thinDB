@@ -847,7 +847,11 @@ pub const RadixAggregate = struct {
     }
     pub fn addPrune(self: *RadixAggregate, pred: predicate.Predicate) !void {
         if (self.top_k != null) return;
-        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
+        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .range = pred });
+    }
+    pub fn addPruneSet(self: *RadixAggregate, set: predicate.InSet) !void {
+        if (self.top_k != null) return;
+        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
     pub fn stats(self: *RadixAggregate) PipelineStats {
         return .{ .upper_rows = self.upstream.stats().upper_rows };
@@ -2151,7 +2155,11 @@ pub const RadixLeaseAggregate = struct {
     }
     pub fn addPrune(self: *RadixLeaseAggregate, pred: predicate.Predicate) !void {
         if (self.top_k != null) return;
-        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, pred);
+        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .range = pred });
+    }
+    pub fn addPruneSet(self: *RadixLeaseAggregate, set: predicate.InSet) !void {
+        if (self.top_k != null) return;
+        return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
     pub fn stats(self: *RadixLeaseAggregate) PipelineStats {
         return .{ .upper_rows = self.upstream.stats().upper_rows };

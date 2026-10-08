@@ -520,6 +520,8 @@ pub const RunRequest = struct {
     derived: []const exec.Derived = &.{},
     udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
     filter_expr: ?exec.PredicateExpr = null,
+    /// Hints the consumer offered on scan columns; every scan gets them.
+    offered_prunes: exec.Scan.OfferedPrunes = .{},
 };
 
 pub const Times = struct {
@@ -628,7 +630,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: SiloCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.offered_prunes, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -649,7 +651,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, &rows, &workspace);
+    try runHarness(allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.offered_prunes, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -715,6 +717,7 @@ fn runHarness(
     udf_registry: ?*const @import("../udf.zig").UdfRegistry,
     resources: ?*exec.memory.MemoryAccountant,
     filter_expr: ?exec.PredicateExpr,
+    offered_prunes: exec.Scan.OfferedPrunes,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
     workspace: *SiloCore.SiloGridWorkspace,
 ) !void {
@@ -922,6 +925,7 @@ fn runHarness(
         .udf_registry = udf_registry,
         .resources = resources,
         .filter_expr = filter_expr,
+        .offered_prunes = offered_prunes,
         .shared_stage_builders = params.shared_stage_builders,
         .no_profile = !params.worker_profile,
         .quiet = !params.worker_profile,

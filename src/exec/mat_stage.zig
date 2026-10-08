@@ -1845,6 +1845,10 @@ pub const StagedRoot = struct {
         return self.inner.addPrune(pred);
     }
 
+    pub fn addPruneSet(self: *StagedRoot, set: exec.InSet) !void {
+        return self.inner.addPruneSet(set);
+    }
+
     pub fn stats(self: *StagedRoot) exec.PipelineStats {
         return self.inner.stats();
     }

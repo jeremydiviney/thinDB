@@ -85,11 +85,17 @@ pub const AliasRename = struct {
     }
 
     pub fn addPrune(self: *AliasRename, pred: Predicate) !void {
+        return self.offerPrune(.{ .range = pred });
+    }
+
+    pub fn addPruneSet(self: *AliasRename, set: predicate.InSet) !void {
+        return self.offerPrune(.{ .set = set });
+    }
+
+    fn offerPrune(self: *AliasRename, offer: exec.PruneOffer) !void {
         if (self.probe_fused) return;
-        const idx = types.findColumn(self.output_schema, pred.col) orelse return error.ColumnNotFound;
-        var rewritten = pred;
-        rewritten.col = self.upstream.outputSchema()[idx].name;
-        return self.upstream.addPrune(rewritten);
+        const idx = types.findColumn(self.output_schema, offer.column()) orelse return error.ColumnNotFound;
+        return offer.offerTo(&self.upstream, self.upstream.outputSchema()[idx].name);
     }
 
     /// Forward fusion offers: the scan resolves qualified `alias.col`

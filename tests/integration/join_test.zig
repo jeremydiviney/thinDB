@@ -3121,3 +3121,63 @@ test "join: a general ON condition decides matching per pair" {
     try helpers.expectRunError(allocator, db, "SELECT COUNT(*) FROM t JOIN o ON t.id = x.tid", error.SqlOnRefsUnknownTable);
     try helpers.expectRunError(allocator, db, "SELECT COUNT(*) FROM t JOIN o ON t.id < x.tid", error.SqlOnRefsUnknownTable);
 }
+
+/// `dim`: five scattered keys `k` (3, 17, 40, 41, 77) with `c = k % 2`.
+/// `fact`: keys 0..99 in key order across many row groups, `20 * (k % 7 + 1)`
+/// rows of each, `c = k % 2`.
+fn openKeySetDb(allocator: std.mem.Allocator, dir: std.Io.Dir) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, std.testing.io, dir, .{ .max_dop = 4, .auto_flush_secs = 0 });
+    errdefer db.close();
+    const Row = struct { k: i64, c: i64 };
+    const keyed = thindb.TableSchema{
+        .columns = &.{ .{ .name = "k", .type = .bigint }, .{ .name = "c", .type = .bigint } },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const dim = try db.table("dim", keyed, .{ .order_key = &.{"k"}, .unique = false });
+    var dim_rows: [5]Row = undefined;
+    for (&dim_rows, [_]i64{ 3, 17, 40, 41, 77 }) |*row, k| row.* = .{ .k = k, .c = @mod(k, 2) };
+    try dim.insert(&dim_rows);
+    try dim.flush();
+
+    const fact = try db.table("fact", keyed, .{ .order_key = &.{"k"}, .unique = false, .row_group_size = 256 });
+    var fact_rows: std.ArrayList(Row) = .empty;
+    defer fact_rows.deinit(allocator);
+    for (0..100) |k| {
+        for (0..20 * (k % 7 + 1)) |_| try fact_rows.append(allocator, .{ .k = @intCast(k), .c = @intCast(k % 2) });
+    }
+    try fact.insert(fact_rows.items);
+    try fact.flush();
+    return db;
+}
+
+// Issue #565. An INNER join offers its build keys' few distinct values to the
+// probe side, through a GROUP BY on them, as a set that skips row groups. Only
+// probe rows the join can't match may go: a group under a LIMIT, or keyed on
+// an expression of the column, keeps every row.
+test "join: a small build key set prunes the probe side without changing results" {
+    const allocator = std.testing.allocator;
+    const helpers = @import("sql_helpers.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openKeySetDb(allocator, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k, COUNT(*) AS n FROM fact GROUP BY k) t ON t.k = e.k ORDER BY 1", &[_]i64{ 3080, 17080, 40120, 41140, 77020 } },
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k, c, COUNT(*) AS n FROM fact GROUP BY k, c) t ON t.k = e.k AND t.c = e.c ORDER BY 1", &[_]i64{ 3080, 17080, 40120, 41140, 77020 } },
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k, c, COUNT(*) AS n FROM fact WHERE k = 50 GROUP BY k, c) t ON t.k = e.k AND t.c = e.c ORDER BY 1", &[_]i64{} },
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k, c, COUNT(*) AS n FROM fact WHERE k = 40 GROUP BY k, c) t ON t.k = e.k AND t.c = e.c ORDER BY 1", &[_]i64{40120} },
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k, COUNT(*) AS n FROM fact GROUP BY k ORDER BY k LIMIT 10) t ON t.k = e.k ORDER BY 1", &[_]i64{3080} },
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k, c, COUNT(*) AS n FROM fact GROUP BY k, c ORDER BY k LIMIT 10) t ON t.k = e.k AND t.c = e.c ORDER BY 1", &[_]i64{3080} },
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k + 1 AS k1, COUNT(*) AS n FROM fact GROUP BY k + 1) t ON t.k1 = e.k ORDER BY 1", &[_]i64{ 3060, 17060, 40100, 41120, 77140 } },
+        .{ "SELECT e.k * 1000 + t.n FROM dim e JOIN (SELECT k + 1 AS k, c, COUNT(*) AS n FROM fact GROUP BY k + 1, c) t ON t.k = e.k ORDER BY 1", &[_]i64{ 3060, 17060, 40100, 41120, 77140 } },
+        .{ "SELECT COUNT(*) FROM dim e JOIN fact f ON f.k = e.k", &[_]i64{440} },
+    };
+    inline for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case[0]});
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}

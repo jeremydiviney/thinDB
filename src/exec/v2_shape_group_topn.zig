@@ -195,6 +195,7 @@ const ExecutionContext = struct {
     raw_group_chunk_rows: usize = DEFAULT_RAW_GROUP_CHUNK_ROWS,
     raw_batch_chunks: usize = DEFAULT_RAW_BATCH_CHUNKS,
     shared_stage_builders: bool = true,
+    offered_prunes: Scan.OfferedPrunes = .{},
     times: StageTimes = .{},
 };
 
@@ -391,6 +392,10 @@ const GroupTopNPipeline = struct {
     /// At most one group per table row, and at most `request.limit` when
     /// set. A limit of 0 means no limit, so it bounds nothing.
     upper_rows: u64,
+    /// Hints the consumer offered (`addPrune`, `addPruneSet`), on scan
+    /// columns, for the scans `execute` builds.
+    offered_ranges: std.ArrayListUnmanaged(exec.Predicate) = .empty,
+    offered_sets: std.ArrayListUnmanaged(exec.InSet) = .empty,
 
     fn init(allocator: Allocator, table: *api.Table, request: Request, plan: ShapePlan) !GroupTopNPipeline {
         const owned_needed = if (request.needed) |needed| try allocator.dupe([]const u8, needed) else null;
@@ -460,6 +465,8 @@ const GroupTopNPipeline = struct {
         self.allocator.free(self.output_schema);
         if (self.owned_needed) |n| self.allocator.free(n);
         if (self.plan.scan_base_columns.len > 0) self.allocator.free(self.plan.scan_base_columns);
+        self.offered_ranges.deinit(self.allocator);
+        self.offered_sets.deinit(self.allocator);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -468,7 +475,32 @@ const GroupTopNPipeline = struct {
         return self.output_schema;
     }
 
-    pub fn addPrune(_: *GroupTopNPipeline, _: exec.Predicate) !void {}
+    pub fn addPrune(self: *GroupTopNPipeline, pred: exec.Predicate) !void {
+        var hint = pred;
+        hint.col = (try self.groupKeySource(pred.col)) orelse return;
+        try self.offered_ranges.append(self.allocator, hint);
+    }
+
+    pub fn addPruneSet(self: *GroupTopNPipeline, set: exec.InSet) !void {
+        var hint = set;
+        hint.col = (try self.groupKeySource(set.col)) orelse return;
+        try self.offered_sets.append(self.allocator, hint);
+    }
+
+    /// The scan column behind group key `col`, when a hint on it may skip
+    /// input: with no LIMIT every group is emitted, so the input rows a
+    /// consumer won't use only make groups it won't use. Null for an
+    /// aggregate or computed key, or once the groups are built.
+    fn groupKeySource(self: *GroupTopNPipeline, col: []const u8) !?[]const u8 {
+        const idx = types.findColumn(self.output_schema, col) orelse return error.ColumnNotFound;
+        if (self.built or self.request.limit != 0 or self.request.offset != 0) return null;
+        if (idx >= self.plan.layout.part_count) return null;
+        const name = self.plan.layout.parts[idx].name;
+        for (self.plan.derived) |derived| {
+            if (types.columnNameEql(derived.name, name)) return null;
+        }
+        return name;
+    }
 
     pub fn stats(self: *GroupTopNPipeline) exec.PipelineStats {
         return .{ .upper_rows = self.upper_rows };
@@ -526,6 +558,7 @@ const GroupTopNPipeline = struct {
             self.allocator.free(snapshot.segments);
         }
         var ctx = try prepareExecution(self.allocator, table, snapshot, self.request, self.plan);
+        ctx.offered_prunes = .{ .ranges = self.offered_ranges.items, .sets = self.offered_sets.items };
         var rows = try runGroupTopNStage(&ctx);
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
@@ -675,6 +708,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
         .derived = ctx.plan.derived,
         .udf_registry = ctx.request.udf_registry,
         .filter_expr = ctx.request.where_filter,
+        .offered_prunes = ctx.offered_prunes,
     });
 
     ctx.times.run_core_ticks = exec.prof.nowTicks() - t0 - result.times.workspace_teardown_ticks;

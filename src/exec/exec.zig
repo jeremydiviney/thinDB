@@ -267,6 +267,10 @@ pub const VTable = struct {
     /// Operators that can act on hints (e.g. Scan) use them to skip row
     /// groups; others (Filter, Project, Limit) simply forward to upstream.
     addPrune: *const fn (ptr: *anyopaque, pred: predicate.Predicate) anyerror!void,
+    /// `addPrune` for a set: only rows whose `set.col` is one of
+    /// `set.values` are used. The values stay valid while the offering
+    /// operator lives. Operators without `addPruneSet` drop the hint.
+    addPruneSet: *const fn (ptr: *anyopaque, set: predicate.InSet) anyerror!void,
     /// Offer a full predicate to this operator for in-place evaluation. The
     /// Scan accepts (returns true) and applies the filter directly over its
     /// borrowed cache bytes, emitting compacted owned survivors. Every other
@@ -817,6 +821,35 @@ pub const PipelineStats = struct {
     buffered: Buffered = .{},
 };
 
+/// Either kind of prune hint, for an operator that hands both to its input
+/// under the same column mapping.
+pub const PruneOffer = union(enum) {
+    range: predicate.Predicate,
+    set: predicate.InSet,
+
+    pub fn column(self: PruneOffer) []const u8 {
+        return switch (self) {
+            inline else => |hint| hint.col,
+        };
+    }
+
+    /// Offer the hint to `input` under `col`, the input's name for it.
+    pub fn offerTo(self: PruneOffer, input: *Query, col: []const u8) !void {
+        switch (self) {
+            .range => |pred| {
+                var renamed = pred;
+                renamed.col = col;
+                return input.addPrune(renamed);
+            },
+            .set => |set| {
+                var renamed = set;
+                renamed.col = col;
+                return input.addPruneSet(renamed);
+            },
+        }
+    }
+};
+
 pub const Query = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -848,6 +881,10 @@ pub const Query = struct {
 
     pub fn addPrune(self: *Query, pred: predicate.Predicate) !void {
         return self.vtable.addPrune(self.ptr, pred);
+    }
+
+    pub fn addPruneSet(self: *Query, set: predicate.InSet) !void {
+        return self.vtable.addPruneSet(self.ptr, set);
     }
 
     /// Offer a join-probe sink for in-worker probing (see `ProbeSink`).
@@ -1207,6 +1244,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.addPrune(pred);
         }
+        fn addPruneSetWrap(ptr: *anyopaque, set: predicate.InSet) anyerror!void {
+            if (!@hasDecl(Op, "addPruneSet")) return;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.addPruneSet(set);
+        }
         fn tryFuseFilterWrap(ptr: *anyopaque, expr: predicate.PredicateExpr) anyerror!bool {
             if (!@hasDecl(Op, "tryFuseFilter")) return false;
             const o: *Op = @ptrCast(@alignCast(ptr));
@@ -1295,6 +1337,7 @@ fn OpWrapper(comptime Op: type) type {
             .deinit = deinitWrap,
             .outputSchema = outputSchemaWrap,
             .addPrune = addPruneWrap,
+            .addPruneSet = addPruneSetWrap,
             .tryFuseFilter = tryFuseFilterWrap,
             .tryFuseCompute = tryFuseComputeWrap,
             .tryFuseAggregate = tryFuseAggregateWrap,
@@ -1638,6 +1681,7 @@ fn tighterEnd(a: ?i128, b: ?i128, pick: enum { min, max }) ?i128 {
 
 pub const predicate = @import("predicate.zig");
 pub const Predicate = predicate.Predicate;
+pub const InSet = predicate.InSet;
 pub const PredicateOp = predicate.PredicateOp;
 pub const PredicateExpr = predicate.PredicateExpr;
 pub const leafExpr = predicate.leafExpr;

@@ -4266,3 +4266,81 @@ test "Project declares the columns it reads to its upstream on the first pull" {
         try std.testing.expectEqual(@as(usize, @intFromBool(case.declared.len > 0)), narrowing.declarations);
     }
 }
+
+/// `k` 0..39 in ten 4-row row groups: [0-3], [4-7], ..., [36-39].
+fn openRowGroupTable(allocator: std.mem.Allocator, dir: std.Io.Dir) !*api.Database {
+    const schema = types.TableSchema{
+        .columns = &.{.{ .name = "k", .type = .bigint }},
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const db = try api.Database.open(allocator, std.testing.io, dir, .{ .row_group_size = 4 });
+    errdefer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k"}, .row_group_size = 4 });
+    const Row = struct { k: i64 };
+    var rows: [40]Row = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{ .k = @intCast(i) };
+    try t.insert(&rows);
+    try t.flush();
+    return db;
+}
+
+/// Drain `q`: its `k` values and the row groups its scan decoded.
+fn drainKeys(allocator: std.mem.Allocator, q: *Query, scan_op: *exec.Scan, out: *std.ArrayList(i64)) !u64 {
+    while (try q.next()) |b| try out.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+    return scan_op.rgs_scanned;
+}
+
+test "scan: a pruning set skips the row groups that hold none of its values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openRowGroupTable(allocator, tmp.dir);
+    defer db.close();
+    const t = try db.openTable("t", .{});
+
+    var q = try scan(allocator, t);
+    defer q.deinit();
+    try q.addPruneSet(.{ .col = "k", .values = &.{ .{ .bigint = 22 }, .{ .bigint = 5 }, .{ .bigint = 23 } }, .negate = false });
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), try drainKeys(allocator, &q, exec.queryAs(exec.Scan, q).?, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 4, 5, 6, 7, 20, 21, 22, 23 }, keys.items);
+
+    // A negated set says nothing about which rows are used.
+    var all = try scan(allocator, t);
+    defer all.deinit();
+    try all.addPruneSet(.{ .col = "k", .values = &.{.{ .bigint = 5 }}, .negate = true });
+    keys.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u64, 10), try drainKeys(allocator, &all, exec.queryAs(exec.Scan, all).?, &keys));
+}
+
+test "scan: a pruning set counts only the values the scan's own filter can match" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openRowGroupTable(allocator, tmp.dir);
+    defer db.close();
+    const t = try db.openTable("t", .{});
+
+    // `k = 22` and a set without 22: no row group can hold a used row, even
+    // ones the set's values fall in.
+    var base = try scan(allocator, t);
+    const disjoint_scan = exec.queryAs(exec.Scan, base).?;
+    var disjoint = try base.filter(leafExpr("k", .eq, .{ .bigint = 22 }));
+    defer disjoint.deinit();
+    try disjoint.addPruneSet(.{ .col = "k", .values = &.{ .{ .bigint = 5 }, .{ .bigint = 21 } }, .negate = false });
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 0), try drainKeys(allocator, &disjoint, disjoint_scan, &keys));
+    try std.testing.expectEqual(@as(usize, 0), keys.items.len);
+
+    // `k IN (5, 22, 30)` and a set {22, 31}: only 22's row group is read.
+    var in_base = try scan(allocator, t);
+    const in_scan = exec.queryAs(exec.Scan, in_base).?;
+    var in_list = try in_base.filter(.{ .in_set = .{ .col = "k", .values = &.{ .{ .bigint = 5 }, .{ .bigint = 22 }, .{ .bigint = 30 } }, .negate = false } });
+    defer in_list.deinit();
+    try in_list.addPruneSet(.{ .col = "k", .values = &.{ .{ .bigint = 22 }, .{ .bigint = 31 } }, .negate = false });
+    try std.testing.expectEqual(@as(u64, 1), try drainKeys(allocator, &in_list, in_scan, &keys));
+    try std.testing.expectEqualSlices(i64, &.{22}, keys.items);
+}
