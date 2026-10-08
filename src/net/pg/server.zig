@@ -265,6 +265,8 @@ const SessionState = struct {
     /// START TRANSACTION and clear on COMMIT / ROLLBACK; thinDB doesn't
     /// enforce real transactions yet — bookkeeping only.
     in_transaction: bool = false,
+    /// `SET thindb_max_dop`; statements compile under it (`asSession`).
+    max_dop: u32 = 0,
     /// Pointer into the shared registry entry for this connection.
     /// Used to wire the cancel_flag into the in-flight CompiledQuery
     /// so a peer CancelRequest / pg_cancel_backend aborts at the
@@ -360,7 +362,23 @@ const SessionState = struct {
             .dialect = .postgres,
             .temp_namespace = self.temp_namespace,
             .connections = self.registry,
+            .max_dop = self.max_dop,
         };
+    }
+
+    /// The session one statement compiles under: the connection's, plus
+    /// what that statement's hints ask for.
+    fn statementSession(self: SessionState, hints: sql.StatementHints) Session {
+        var s = self.asSession();
+        s.statement_max_dop = hints.max_dop;
+        return s;
+    }
+
+    /// Keep what a finished statement changed on the connection: USE and
+    /// the session options it SET.
+    fn captureSettings(self: *SessionState, s: Session) !void {
+        try self.replaceDbSchema(s.current_db, s.current_schema);
+        self.max_dop = s.max_dop;
     }
 };
 
@@ -649,17 +667,18 @@ fn extended_handleExecute(
     const aa = arena.allocator();
 
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
-    const op = try sql.parseBoundWithContext(aa, portal.bound_sql, portal.bound_params, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
+    const parsed = try sql.parseHintedWithContext(aa, portal.bound_sql, portal.bound_params, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
+    const op = parsed.op;
 
     if (op.* == .batch) {
-        for (op.batch.statements) |stmt| {
+        for (op.batch.statements, parsed.hints) |stmt, hints| {
             if (stmt.* == .copy) return copy.Error.CopyMustBeSoleStatement;
-            try runExtendedStatement(allocator, w, catalog, session, stmt);
+            try runExtendedStatement(allocator, w, catalog, session, stmt, hints);
         }
         return;
     }
 
-    try runExtendedStatement(allocator, w, catalog, session, op);
+    try runExtendedStatement(allocator, w, catalog, session, op, parsed.hints[0]);
 }
 
 fn runExtendedStatement(
@@ -668,6 +687,7 @@ fn runExtendedStatement(
     catalog: *Catalog,
     session: *SessionState,
     op: *const ir.Op,
+    hints: sql.StatementHints,
 ) !void {
     if (op.* == .copy) return copy.Error.CopyMustBeSoleStatement;
     if (session.conn_state) |state| state.setCancelOnDisconnect(local.producesOnlyResult(op));
@@ -680,7 +700,7 @@ fn runExtendedStatement(
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileInStatementWithOptions(allocator, catalog, session.asSession(), op, .{
+    var compiled = try local.compileInStatementWithOptions(allocator, catalog, session.statementSession(hints), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
     });
@@ -689,7 +709,7 @@ fn runExtendedStatement(
     if (isSideEffectOp(op.*)) {
         _ = try compiled.next();
         const new_session = compiled.sessionValue();
-        try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
+        try session.captureSettings(new_session);
         switch (op.*) {
             .insert, .insert_select => {
                 var tag_buf: [48]u8 = undefined;
@@ -703,7 +723,7 @@ fn runExtendedStatement(
 
     const rows = try result.sendQueryResult(allocator, w, &compiled);
     const new_session = compiled.sessionValue();
-    try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
+    try session.captureSettings(new_session);
 
     var tag_buf: [40]u8 = undefined;
     const tag = try std.fmt.bufPrint(&tag_buf, "SELECT {d}", .{rows});
@@ -1116,7 +1136,8 @@ fn runEngineQuery(
     defer arena.deinit();
 
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
-    const op = try sql.parseWithContext(arena.allocator(), sql_text, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
+    const parsed = try sql.parseHintedWithContext(arena.allocator(), sql_text, &.{}, .postgres, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() });
+    const op = parsed.op;
 
     if (op.* == .batch) {
         // PG simple-Query protocol natively supports `;`-separated
@@ -1125,18 +1146,18 @@ fn runEngineQuery(
         // Per spec, if any statement errors the remaining ones are
         // skipped; we propagate the error to handleQuery which emits
         // ErrorResponse + ReadyForQuery.
-        for (op.batch.statements) |stmt| {
+        for (op.batch.statements, parsed.hints) |stmt, hints| {
             // COPY can't co-mingle with other statements — its wire
             // protocol takes over the connection until CopyDone.
             if (stmt.* == .copy) return copy.Error.CopyMustBeSoleStatement;
-            try runSingleStatement(allocator, w, r, catalog, session, stmt);
+            try runSingleStatement(allocator, w, r, catalog, session, stmt, hints);
         }
         return;
     }
 
     // COPY takes the connection over until CopyDone, so it runs alone.
     if (in_batch and op.* == .copy) return copy.Error.CopyMustBeSoleStatement;
-    try runSingleStatement(allocator, w, r, catalog, session, op);
+    try runSingleStatement(allocator, w, r, catalog, session, op, parsed.hints[0]);
 }
 
 /// Run + emit the response packets for ONE statement (RowDescription/
@@ -1150,6 +1171,7 @@ fn runSingleStatement(
     catalog: *Catalog,
     session: *SessionState,
     op: *const ir.Op,
+    hints: sql.StatementHints,
 ) !void {
     if (session.conn_state) |state| state.setCancelOnDisconnect(local.producesOnlyResult(op));
     defer if (session.conn_state) |state| state.setCancelOnDisconnect(false);
@@ -1165,7 +1187,7 @@ fn runSingleStatement(
         _ = try session.ensureTempNamespace();
     }
 
-    var compiled = try local.compileInStatementWithOptions(allocator, catalog, session.asSession(), op, .{
+    var compiled = try local.compileInStatementWithOptions(allocator, catalog, session.statementSession(hints), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
     });
@@ -1178,7 +1200,7 @@ fn runSingleStatement(
     if (isSideEffectOp(op.*)) {
         _ = try compiled.next();
         const new_session = compiled.sessionValue();
-        try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
+        try session.captureSettings(new_session);
         switch (op.*) {
             .insert, .insert_select => {
                 var tag_buf: [48]u8 = undefined;
@@ -1192,7 +1214,7 @@ fn runSingleStatement(
 
     const rows = try result.sendQueryResult(allocator, w, &compiled);
     const new_session = compiled.sessionValue();
-    try session.replaceDbSchema(new_session.current_db, new_session.current_schema);
+    try session.captureSettings(new_session);
 
     var tag_buf: [40]u8 = undefined;
     const tag = try std.fmt.bufPrint(&tag_buf, "SELECT {d}", .{rows});

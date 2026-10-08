@@ -37,8 +37,9 @@ pub const RunResult = struct {
 /// multi-statement batch (`SET @x = 1; SELECT ...`), the non-final
 /// statements are compiled + drained eagerly with the session
 /// threaded through, so user-defined variables persist into the
-/// final statement that the caller drains. Caller owns the returned
-/// `RunResult` and must `deinit` it.
+/// final statement that the caller drains. Each statement compiles
+/// under its own `/*+ ... */` hints, as on the wire. Caller owns the
+/// returned `RunResult` and must `deinit` it.
 pub fn runSql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !RunResult {
     return runSqlDialect(allocator, db, sql, .neutral);
 }
@@ -52,10 +53,11 @@ pub fn runSqlMysql(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !
 pub fn runSqlDialect(allocator: std.mem.Allocator, db: anytype, sql: []const u8, dialect: thindb.types.Dialect) !RunResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
-    const root = try thindb.sql.parseDialect(arena.allocator(), sql, dialect);
+    const parsed = try thindb.sql.parseHintedWithContext(arena.allocator(), sql, &.{}, dialect, null, null);
+    const root = parsed.op;
 
     if (root.* != .batch) {
-        const cq = try thindb.net.compile(allocator, db, root);
+        const cq = try thindb.net.compileWithSession(allocator, db, .{ .statement_max_dop = parsed.hints[0].max_dop }, root);
         return .{
             .arena = arena,
             .cq = cq,
@@ -69,12 +71,14 @@ pub fn runSqlDialect(allocator: std.mem.Allocator, db: anytype, sql: []const u8,
     var session: thindb.Session = .{};
     const stmts = root.batch.statements;
     if (stmts.len == 0) return error.EmptyBatch;
-    for (stmts[0 .. stmts.len - 1]) |stmt| {
+    for (stmts[0 .. stmts.len - 1], parsed.hints[0 .. stmts.len - 1]) |stmt, hints| {
+        session.statement_max_dop = hints.max_dop;
         var cq = try thindb.net.compileWithSession(allocator, db, session, stmt);
         while (try cq.next()) |_| {}
         session = cq.sessionValue();
         cq.deinit();
     }
+    session.statement_max_dop = parsed.hints[stmts.len - 1].max_dop;
     const final = try thindb.net.compileWithSession(allocator, db, session, stmts[stmts.len - 1]);
     return .{
         .arena = arena,

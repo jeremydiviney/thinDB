@@ -212,3 +212,97 @@ test "session var: a bare var is a projection item" {
     try expectVarItems(allocator, db, "SET @w = 5; SELECT @w + qty AS s FROM t WHERE id = 1", &.{"s"}, &.{15});
     try expectVarItems(allocator, db, "SELECT @never_set", &.{"@never_set"}, &.{null});
 }
+
+/// `par`: enough row groups for a filtered scan to run at the server's
+/// max_dop of 4.
+fn openParallel(allocator: std.mem.Allocator, dir: std.Io.Dir) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, std.testing.io, dir, .{
+        .auto_flush_secs = 0,
+        .max_dop = 4,
+        .row_group_size = 1024,
+    });
+    errdefer db.close();
+    const t = try db.table("par", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "g", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"}, .unique = false });
+    const Row = struct { id: i64, g: i64 };
+    const rows = try allocator.alloc(Row, 20_000);
+    defer allocator.free(rows);
+    for (rows, 0..) |*row, i| row.* = .{ .id = @intCast(i), .g = @intCast(i % 100) };
+    try t.insert(rows);
+    try t.flush();
+    return db;
+}
+
+const PARALLEL_SELECT = "SELECT id, g FROM par WHERE g < 3 ORDER BY id";
+
+/// Whether `sql`'s EXPLAIN (the last statement of a batch) scans `par` at
+/// `dop`.
+fn scansAtDop(allocator: std.mem.Allocator, db: anytype, sql: []const u8, dop: usize) !bool {
+    var q = try helpers.runSqlMysql(allocator, db, sql);
+    defer q.deinit();
+    var plan: std.ArrayList(u8) = .empty;
+    defer plan.deinit(allocator);
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            try plan.appendSlice(allocator, b.values[0].data.string.rowBytes(i));
+            try plan.append(allocator, '\n');
+        }
+    }
+    var want_buf: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "ParallelScan par (DOP={d},", .{dop});
+    const found = std.mem.indexOf(u8, plan.items, want) != null;
+    if (!found) std.debug.print("{s}\n{s}", .{ sql, plan.items });
+    return found;
+}
+
+test "session option: SET thindb_max_dop caps the parallelism of later statements" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openParallel(allocator, tmp.dir);
+    defer db.close();
+
+    try std.testing.expect(try scansAtDop(allocator, db, "EXPLAIN " ++ PARALLEL_SELECT, 4));
+    inline for (.{ "SET thindb_max_dop = 2", "SET SESSION thindb_max_dop = 2", "SET @@session.thindb_max_dop = 2" }) |set| {
+        try std.testing.expect(try scansAtDop(allocator, db, set ++ "; SELECT 1; EXPLAIN " ++ PARALLEL_SELECT, 2));
+    }
+    try std.testing.expect(try scansAtDop(allocator, db, "SET thindb_max_dop = 2; SET thindb_max_dop = DEFAULT; EXPLAIN " ++ PARALLEL_SELECT, 4));
+    try std.testing.expect(try scansAtDop(allocator, db, "SET thindb_max_dop = 64; EXPLAIN " ++ PARALLEL_SELECT, 4));
+    // A user variable of the same name is not the option.
+    try std.testing.expect(try scansAtDop(allocator, db, "SET @thindb_max_dop = 2; EXPLAIN " ++ PARALLEL_SELECT, 4));
+
+    var reduced = try helpers.runSqlMysql(allocator, db, "SET thindb_max_dop = 1; SELECT COUNT(*) FROM par WHERE g < 3");
+    defer reduced.deinit();
+    const b = (try reduced.next()).?;
+    try std.testing.expectEqual(@as(i64, 600), b.values[0].data.bigint[0]);
+}
+
+test "session option: a SET_VAR hint sets thindb_max_dop for its statement alone" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openParallel(allocator, tmp.dir);
+    defer db.close();
+
+    try std.testing.expect(try scansAtDop(allocator, db, "EXPLAIN SELECT /*+ SET_VAR(thindb_max_dop = 2) */ id, g FROM par WHERE g < 3 ORDER BY id", 2));
+    try std.testing.expect(try scansAtDop(allocator, db, "SELECT /*+ SET_VAR(thindb_max_dop = 2) */ 1; EXPLAIN " ++ PARALLEL_SELECT, 4));
+    try std.testing.expect(try scansAtDop(allocator, db, "SET thindb_max_dop = 2; EXPLAIN SELECT /*+ SET_VAR(thindb_max_dop = 3) */ id, g FROM par WHERE g < 3 ORDER BY id", 3));
+    try std.testing.expect(try scansAtDop(allocator, db, "SET thindb_max_dop = 2; EXPLAIN SELECT /*+ SET_VAR(thindb_max_dop = 0) */ id, g FROM par WHERE g < 3 ORDER BY id", 4));
+}
+
+test "session option: SET thindb_max_dop rejects a value that is not a count" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try std.testing.expectError(error.TypeMismatch, exec(allocator, db, "SET thindb_max_dop = -1"));
+    try std.testing.expectError(error.TypeMismatch, exec(allocator, db, "SET thindb_max_dop = 'four'"));
+}
