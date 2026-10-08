@@ -2025,6 +2025,8 @@ const IN_SET_LINEAR_MAX = 8;
 /// Fewest rows worth building a lookup set for: below this, scanning a long
 /// list per row costs about what sorting it would.
 const IN_SET_LOOKUP_MIN_ROWS = 32;
+/// Widest literal range a numeric IN-list tests through a bitmap (8 KiB).
+const IN_SET_BITMAP_SPAN = 1 << 16;
 
 /// A long `col = a OR col = b OR ...` (a literal IN list) through the set
 /// lookup of `evaluateInSetMask` rather than one pass per literal. Same
@@ -2051,16 +2053,17 @@ fn evaluateEqDisjunction(allocator: std.mem.Allocator, arms: []const PredicateEx
 /// Two-valued logic: NULL in the column never matches → IN false, NOT IN
 /// also false (consistent with the IN side).
 ///
-/// A long list is looked up per row (binary search over a sorted copy, or a
-/// hash set for text) so a DELETE/UPDATE with thousands of keys costs
-/// O(rows × log keys), not O(rows × keys) (#340).
+/// A numeric list is looked up per row (a bitmap over a narrow literal range,
+/// else a binary search over a sorted copy) and a long text list through a
+/// hash set, so neither a DELETE/UPDATE with thousands of keys (#340) nor a
+/// scan with a short list pays a branch per literal per row.
 pub fn evaluateInSetMask(allocator: std.mem.Allocator, view: ColumnView, values: []const Value, negate: bool, n: usize, mask: []bool) !void {
-    if (values.len > IN_SET_LINEAR_MAX and n >= IN_SET_LOOKUP_MIN_ROWS) {
+    if (n >= IN_SET_LOOKUP_MIN_ROWS) {
         switch (view.data) {
             inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid => |col, tag| {
-                return evalInSortedSet(allocator, @field(ValueTag, @tagName(tag)), view, col, values, negate, n, mask);
+                return evalInNumericSet(allocator, @field(ValueTag, @tagName(tag)), view, col, values, negate, n, mask);
             },
-            inline .varchar, .string, .char => |sv| return evalInTextHashSet(allocator, sv, view, values, negate, n, mask),
+            inline .varchar, .string, .char => |sv| if (values.len > IN_SET_LINEAR_MAX) return evalInTextHashSet(allocator, sv, view, values, negate, n, mask),
             // Float `==` (NaN, -0.0) and two-valued booleans stay on the scan,
             // as does JSON, whose equal values needn't share bytes.
             .float, .double, .boolean, .json => {},
@@ -2172,7 +2175,7 @@ fn evaluateTextAsNumberSetMask(view: ColumnView, col_type: types.Type, s: InSet,
 
 /// Same matching as the per-row scan: only values of the column's own tag
 /// can equal a cell.
-fn evalInSortedSet(
+fn evalInNumericSet(
     allocator: std.mem.Allocator,
     comptime tag: ValueTag,
     view: ColumnView,
@@ -2199,6 +2202,26 @@ fn evalInSortedSet(
     std.sort.pdq(T, set, {}, std.sort.asc(T));
     const lo = set[0];
     const hi = set[set.len - 1];
+    // Offsets from `lo` in the unsigned twin: a value below `lo` wraps past
+    // `span`, so one compare bounds both ends.
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const span: U = @bitCast(hi -% lo);
+    if (span < IN_SET_BITMAP_SPAN) {
+        var bitmap: [IN_SET_BITMAP_SPAN / 8]u8 = undefined;
+        const used = bitmap[0 .. @as(usize, @intCast(span / 8)) + 1];
+        @memset(used, 0);
+        for (set) |v| {
+            const off: usize = @intCast(@as(U, @bitCast(v -% lo)));
+            used[off / 8] |= @as(u8, 1) << @intCast(off % 8);
+        }
+        for (0..n) |i| {
+            const off: U = @bitCast(col[i] -% lo);
+            const at: usize = @intCast(@min(off, span));
+            const found = off <= span and (used[at / 8] >> @intCast(at % 8)) & 1 != 0;
+            mask[i] = view.isValid(i) and found != negate;
+        }
+        return;
+    }
     for (0..n) |i| {
         const x = col[i];
         const found = x >= lo and x <= hi and sortedContains(T, set, x);
@@ -3011,6 +3034,23 @@ test "evaluateInSetMask: set lookups agree with the per-row scan" {
                 }
                 for (row_counts) |rows| try expectInSetMaskMatchesScan(view, values[0..len], rows);
             }
+        }
+    }
+
+    // Literal ranges at the type's extremes, inside and past the bitmap's
+    // span: a value below the smallest literal must not wrap into it.
+    inline for (.{ .int, .bigint, .smallint, .tinyint, .largeint, .datetime, .decimal128, .uuid }) |tag| {
+        const T = @FieldType(Value, @tagName(tag));
+        const lo = std.math.minInt(T);
+        const hi = std.math.maxInt(T);
+        const pool = [_]T{ lo, lo + 1, lo + 3, 0, 1, 5, hi - 2, hi };
+        var col: [n]T = undefined;
+        for (&col) |*c| c.* = pool[rand.uintLessThan(usize, pool.len)];
+        const view: ColumnView = .{ .data = @unionInit(storage.column.ValueView, @tagName(tag), &col), .nulls = &nulls };
+        const sets = [_][]const T{ &.{ lo, lo + 3 }, &.{ hi - 2, hi }, &.{ 1, 5 }, &pool, &.{ lo, 0, hi } };
+        for (sets) |set| {
+            for (values[0..set.len], set) |*v, x| v.* = @unionInit(Value, @tagName(tag), x);
+            try expectInSetMaskMatchesScan(view, values[0..set.len], n);
         }
     }
 

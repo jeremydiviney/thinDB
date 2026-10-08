@@ -2970,8 +2970,10 @@ pub const Scan = struct {
     /// decode-everything path). Dict blocks test each distinct value once into
     /// a matched-codes bitset; FSST blocks compare in the compressed domain
     /// against the literals encoded under the block's own table; raw string
-    /// blocks compare over the zero-copy view; int/bigint FOR, RLE and raw
-    /// blocks OR the per-literal equality masks built by the leaf kernels.
+    /// blocks compare over the zero-copy view; int/bigint FOR blocks test
+    /// each row's code against the literals' codes and raw blocks test each
+    /// value against the literal set, one pass either way; RLE blocks OR the
+    /// per-literal equality masks of the run-aware leaf kernel.
     /// NULL rows clear to false under both IN and NOT IN (the dialect's
     /// NULL-skipping NOT IN, same as the generic evaluator). Returns false
     /// (no pins held) for shapes the narrow path can't evaluate.
@@ -3017,34 +3019,51 @@ pub const Scan = struct {
             else => return false,
         }
 
-        const scratch = try self.ensureMask3(rg_count);
-        @memset(out[0..rg_count], false);
-        for (set.values) |v| {
-            const want = predicate.valueToRangeI128(v) orelse continue;
-            switch (block.encoding) {
-                .for_ => {
-                    const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
-                    const col_stats = seg.info.row_groups[rg_idx].stats[pred_phys];
-                    if (col_stats.max < fv.block.base) return false;
-                    const span: u128 = @intCast(col_stats.max - fv.block.base);
-                    const plan = predicate.translateForLeaf(fv.block.base, span, .eq, v) orelse return false;
-                    switch (plan) {
-                        .none => continue,
-                        .all => @memset(scratch[0..rg_count], true),
-                        .compare => |cp| storage.segment_reader.forCompareInto(fv.block, cmpOpToSimd(cp.op), cp.code, rg_count, scratch[0..rg_count]),
+        switch (block.encoding) {
+            .for_ => {
+                const fv = storage.segment_reader.forViewOf(block.bytes, rg_count, flags);
+                const col_stats = seg.info.row_groups[rg_idx].stats[pred_phys];
+                if (col_stats.max < fv.block.base) return false;
+                const span: u128 = @intCast(col_stats.max - fv.block.base);
+                var stack_codes: [256]u64 = undefined;
+                const codes = if (set.values.len <= stack_codes.len) stack_codes[0..set.values.len] else try self.allocator.alloc(u64, set.values.len);
+                defer if (set.values.len > stack_codes.len) self.allocator.free(codes);
+                var len: usize = 0;
+                for (set.values) |v| {
+                    switch (predicate.translateForLeaf(fv.block.base, span, .eq, v) orelse return false) {
+                        .none => {},
+                        .all => return false,
+                        .compare => |cp| {
+                            codes[len] = cp.code;
+                            len += 1;
+                        },
                     }
-                },
-                .rle => {
-                    const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
+                }
+                if (len == 0) {
+                    @memset(out[0..rg_count], false);
+                } else {
+                    std.sort.pdq(u64, codes[0..len], {}, std.sort.asc(u64));
+                    storage.segment_reader.forInSetInto(fv.block, codes[0..len], rg_count, out[0..rg_count]);
+                }
+            },
+            .rle => {
+                const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
+                const scratch = try self.ensureMask3(rg_count);
+                @memset(out[0..rg_count], false);
+                for (set.values) |v| {
+                    const want = predicate.valueToRangeI128(v) orelse continue;
                     if (!rleCompareInto(rv.block, rg_count, .eq, want, scratch[0..rg_count])) return false;
-                },
-                else => {
-                    const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
-                    predicate.evaluateMaskWithPred(view, .{ .col = set.col, .op = .eq, .val = v }, rg_count, scratch[0..rg_count]) catch return false;
-                },
-            }
-            for (out[0..rg_count], scratch[0..rg_count]) |*m, hit| m.* = m.* or hit;
+                    for (out[0..rg_count], scratch[0..rg_count]) |*m, hit| m.* = m.* or hit;
+                }
+            },
+            else => {
+                const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
+                // Clears NULL rows under both IN and NOT IN itself.
+                try predicate.evaluateInSetMask(self.allocator, view, set.values, set.negate, rg_count, out[0..rg_count]);
+                return true;
+            },
         }
+
         if (set.negate) {
             for (out[0..rg_count]) |*m| m.* = !m.*;
         }
