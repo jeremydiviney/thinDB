@@ -423,6 +423,18 @@ pub const Session = struct {
     /// (information_schema.PROCESSLIST, pg_stat_activity) list. Null in
     /// embedded use, where those relations are empty.
     connections: ?*@import("../net/conn_registry.zig").Registry = null,
+    /// `SET thindb_max_dop = N`: the parallelism this connection's statements
+    /// run at, at most the server's max_dop. 0 = the server's max_dop.
+    max_dop: u32 = 0,
+    /// A statement's `/*+ SET_VAR(thindb_max_dop = N) */` hint, which takes
+    /// the place of `max_dop` for that statement alone.
+    statement_max_dop: ?u32 = null,
+
+    /// The cap a compile puts on parallelism, below the server's max_dop.
+    pub fn dopCap(self: Session) ?usize {
+        const requested = self.statement_max_dop orelse self.max_dop;
+        return if (requested == 0) null else requested;
+    }
 };
 
 /// Per-connection variable storage. Names and string values are

@@ -316,9 +316,11 @@ const SessionState = struct {
     /// statements on this connection so a `SET` is visible to a later
     /// query. Lazily allocated by the first SET (inside compileWithSession);
     /// the connection owns the lifetime (freed in `deinit`, reset on
-    /// COM_RESET_CONNECTION / COM_CHANGE_USER). `captureVars` copies the
+    /// COM_RESET_CONNECTION / COM_CHANGE_USER). `captureSettings` copies the
     /// pointer back after each statement compiles.
     vars: ?*SessionVars = null,
+    /// `SET thindb_max_dop`, kept like `vars`.
+    max_dop: u32 = 0,
     /// The XA branch xid started on this connection (between XA START and XA
     /// END). While set, DML is staged into that branch instead of executing.
     xa_active: ?[]const u8 = null,
@@ -355,17 +357,20 @@ const SessionState = struct {
     }
 
     /// Persist the user-variable map a just-compiled statement produced (the
-    /// pointer is stable — `CompiledQuery.deinit` deliberately doesn't free it),
-    /// so the next statement's `asSession` threads it back in.
-    fn captureVars(self: *SessionState, s: Session) void {
+    /// pointer is stable — `CompiledQuery.deinit` deliberately doesn't free it)
+    /// and the session options it SET, so the next statement's `asSession`
+    /// threads them back in.
+    fn captureSettings(self: *SessionState, s: Session) void {
         self.vars = s.vars;
+        self.max_dop = s.max_dop;
     }
 
-    /// Drop the connection's user variables, LAST_INSERT_ID() and ROW_COUNT()
-    /// (end of connection, or a reset).
+    /// Drop the connection's user variables, session options,
+    /// LAST_INSERT_ID() and ROW_COUNT() (end of connection, or a reset).
     fn resetVars(self: *SessionState) void {
         local.CompiledQuery.freeSessionVars(self.allocator, self.vars);
         self.vars = null;
+        self.max_dop = 0;
         self.last_insert_id = 0;
         self.row_count = -1;
     }
@@ -427,7 +432,16 @@ const SessionState = struct {
             .user = handshake.reported_user,
             .server_version = handshake.server_version,
             .connections = self.registry,
+            .max_dop = self.max_dop,
         };
+    }
+
+    /// The session one statement compiles under: the connection's, plus
+    /// what that statement's hints ask for.
+    fn statementSession(self: SessionState, hints: sql.StatementHints) Session {
+        var s = self.asSession();
+        s.statement_max_dop = hints.max_dop;
+        return s;
     }
 
     /// Keep what a finished statement leaves for ROW_COUNT() and
@@ -1080,6 +1094,7 @@ fn trySetThindbEnvVar(allocator: Allocator, payload: []const u8) !bool {
     const name = std.mem.trim(u8, rest[0..eq], " \t");
     const value = std.mem.trim(u8, rest[eq + 1 ..], " \t'\"");
     if (name.len == 0 or value.len == 0) return false;
+    if (ir.SessionOption.fromSqlName(name) != null) return false;
     try setProcessEnv(allocator, name, value);
     return true;
 }
@@ -3332,12 +3347,13 @@ fn runEngineQuery(
 
     const parse_start = profiler.start();
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
-    const op = sql.parseWithContext(arena.allocator(), payload, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
+    const parsed = sql.parseHintedWithContext(arena.allocator(), payload, &.{}, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
         profiler.recordSince(.query_parse, parse_start);
         const mapped = errors.mapInternal(err, "Parse error");
         try handshake.sendErrPacket(allocator, w, seq_id.*, mapped.code, mapped.sqlstate, @errorName(err));
         return;
     };
+    const op = parsed.op;
     profiler.recordSince(.query_parse, parse_start);
 
     if (op.* == .batch) {
@@ -3371,7 +3387,7 @@ fn runEngineQuery(
             const is_last = i + 1 == stmts.len;
             const base: u16 = session.transactionStatus();
             const extra: u16 = if (is_last) base else base | handshake.SERVER_MORE_RESULTS_EXISTS;
-            const ok = try runSingleStatement(allocator, w, catalog, session, stmts[i], seq_id, extra, profiler);
+            const ok = try runSingleStatement(allocator, w, catalog, session, stmts[i], parsed.hints[i], seq_id, extra, profiler);
             // An ERR terminates a multi-statement response; the client stops
             // reading there, so any further packets would desync the
             // connection permanently (Connector/J then NPEs on every
@@ -3382,7 +3398,7 @@ fn runEngineQuery(
         return;
     }
 
-    _ = try runSingleStatement(allocator, w, catalog, session, op, seq_id, session.transactionStatus(), profiler);
+    _ = try runSingleStatement(allocator, w, catalog, session, op, parsed.hints[0], seq_id, session.transactionStatus(), profiler);
 }
 
 fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -3603,6 +3619,7 @@ fn runSingleStatement(
     catalog: *Catalog,
     session: *SessionState,
     op: *const ir.Op,
+    hints: sql.StatementHints,
     seq_id: *u8,
     extra_status: u16,
     profiler: *MysqlProfiler,
@@ -3677,7 +3694,7 @@ fn runSingleStatement(
     const compile_start = profiler.start();
     var unbound: ?local.Unbound = null;
     defer if (unbound) |u| qalloc.free(u.name());
-    var compiled = local.compileInStatementWithOptions(qalloc, catalog, session.asSession(), op, .{
+    var compiled = local.compileInStatementWithOptions(qalloc, catalog, session.statementSession(hints), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
         .unbound = &unbound,
@@ -3707,7 +3724,7 @@ fn runSingleStatement(
         profiler.recordSince(.query_execute, exec_start);
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
-        session.captureVars(new_session);
+        session.captureSettings(new_session);
         session.recordOutcome(op.*, &compiled);
         applyTransactionVerb(session, op.*);
         const affected_rows = compiled.affectedRows();
@@ -3768,7 +3785,7 @@ fn runSingleStatement(
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
-    session.captureVars(new_session);
+    session.captureSettings(new_session);
     session.recordOutcome(op.*, &compiled);
     return true;
 }
@@ -3999,12 +4016,13 @@ fn handleStmtExecute(
 
     const parse_start = profiler.start();
     const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
-    const op = sql.parseBoundWithContext(arena_alloc, substituted.sql, substituted.params, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
+    const parsed = sql.parseHintedWithContext(arena_alloc, substituted.sql, substituted.params, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch |err| {
         profiler.recordSince(.stmt_execute_parse, parse_start);
         const mapped = errors.mapInternal(err, null);
         try handshake.sendErrPacket(allocator, w, seq_id, mapped.code, mapped.sqlstate, mapped.message);
         return;
     };
+    const op = parsed.op;
     profiler.recordSince(.stmt_execute_parse, parse_start);
     profiler.recordSqlKind(classifySqlKind(op.*));
 
@@ -4054,7 +4072,7 @@ fn handleStmtExecute(
     const compile_start = profiler.start();
     var unbound: ?local.Unbound = null;
     defer if (unbound) |u| allocator.free(u.name());
-    var compiled = local.compileInStatementWithOptions(allocator, catalog, session.asSession(), op, .{
+    var compiled = local.compileInStatementWithOptions(allocator, catalog, session.statementSession(parsed.hints[0]), op, .{
         .cancel_flag = if (session.conn_state) |state| &state.cancel_flag else null,
         .connection_id = if (session.conn_state) |state| state.backend_id else null,
         .unbound = &unbound,
@@ -4077,7 +4095,7 @@ fn handleStmtExecute(
         profiler.recordSince(.stmt_execute_engine, exec_start);
         const new_session = compiled.sessionValue();
         try session.replace(new_session.current_db, new_session.current_schema);
-        session.captureVars(new_session);
+        session.captureSettings(new_session);
         session.recordOutcome(op.*, &compiled);
         applyTransactionVerb(session, op.*);
         const affected_rows = compiled.affectedRows();
@@ -4156,7 +4174,7 @@ fn handleStmtExecute(
 
     const new_session = compiled.sessionValue();
     try session.replace(new_session.current_db, new_session.current_schema);
-    session.captureVars(new_session);
+    session.captureSettings(new_session);
     session.recordOutcome(op.*, &compiled);
 }
 

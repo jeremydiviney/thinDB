@@ -236,6 +236,9 @@ pub const Lexer = struct {
     /// `"..."` is an identifier on PG/neutral but a string literal on
     /// MySQL, and backtick identifiers are rejected on PG.
     dialect: types.Dialect = .neutral,
+    /// Body of the last `/*+ ... */` optimizer-hint comment skipped and not
+    /// yet taken by the parser.
+    hint: ?[]const u8 = null,
 
     pub fn init(arena: Allocator, src: []const u8) Lexer {
         return .{ .arena = arena, .src = src };
@@ -457,9 +460,12 @@ pub const Lexer = struct {
             }
             // /* block comment */
             if (ch == '/' and self.peekChar(1) == '*') {
+                const is_hint = self.peekChar(2) == '+';
                 self.pos += 2;
+                const body_start = self.pos;
                 while (self.pos + 1 < self.src.len) : (self.pos += 1) {
                     if (self.src[self.pos] == '*' and self.src[self.pos + 1] == '/') {
+                        if (is_hint) self.hint = self.src[body_start + 1 .. self.pos];
                         self.pos += 2;
                         break;
                     }

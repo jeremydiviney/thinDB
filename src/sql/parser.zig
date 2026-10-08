@@ -441,6 +441,32 @@ pub fn parseBoundWithContext(
     udf_registry: ?*const udf_mod.UdfRegistry,
     sql_fns: ?udf_mod.SqlFnCtx,
 ) ParseError!*ir.Op {
+    return (try parseHintedWithContext(arena, sql, bound_params, dialect, udf_registry, sql_fns)).op;
+}
+
+/// What a statement's `/*+ ... */` optimizer hints ask for.
+pub const StatementHints = struct {
+    /// `SET_VAR(thindb_max_dop = N)`; 0 asks for the server's max_dop.
+    max_dop: ?u32 = null,
+};
+
+/// A parse with each statement's hints, in statement order: one entry for a
+/// lone statement, one per statement of a batch.
+pub const HintedParse = struct {
+    op: *ir.Op,
+    hints: []const StatementHints,
+};
+
+/// `parseBoundWithContext` that also returns each statement's hints, for the
+/// wire layers that run statements under them.
+pub fn parseHintedWithContext(
+    arena: Allocator,
+    sql: []const u8,
+    bound_params: []const lexer_mod.BoundSpan,
+    dialect: types.Dialect,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+    sql_fns: ?udf_mod.SqlFnCtx,
+) ParseError!HintedParse {
     var lex = Lexer.init(arena, sql);
     lex.dialect = dialect;
     var parser = Parser{
@@ -463,6 +489,7 @@ pub fn parseBoundWithContext(
 
     var statements: std.ArrayList(*ir.Op) = .empty;
     defer statements.deinit(arena);
+    var hints: std.ArrayList(StatementHints) = .empty;
 
     while (true) {
         const op = try parser.parseStatement();
@@ -471,6 +498,10 @@ pub fn parseBoundWithContext(
         // per-statement.
         try parser.applyAutoMaterialize();
         try statements.append(arena, op);
+        try hints.append(arena, parser.statement_hints);
+        // Before the advance past `;`, which takes a hint written ahead of
+        // the next statement.
+        parser.statement_hints = .{};
         // Reset CTE state — each statement parses with a fresh scope.
         parser.ctes.clearRetainingCapacity();
         parser.region_keys = null;
@@ -485,11 +516,26 @@ pub fn parseBoundWithContext(
         if (!saw_sep) return ParseError.SqlTrailingTokens;
     }
 
-    if (statements.items.len == 1) return statements.items[0];
+    const statement_hints = try hints.toOwnedSlice(arena);
+    if (statements.items.len == 1) return .{ .op = statements.items[0], .hints = statement_hints };
 
     const owned = try arena.alloc(*ir.Op, statements.items.len);
     for (statements.items, 0..) |s, i| owned[i] = s;
-    return try parser.allocOp(.{ .batch = .{ .statements = owned } });
+    return .{ .op = try parser.allocOp(.{ .batch = .{ .statements = owned } }), .hints = statement_hints };
+}
+
+/// The thindb_max_dop a `SET_VAR(...)` hint sets, when that is what it sets.
+/// `lex` is just past the SET_VAR name.
+fn setVarHintMaxDop(lex: *Lexer) !?u32 {
+    if ((try lex.next()).tag != .lparen) return null;
+    const name = try lex.next();
+    if (name.tag != .identifier) return null;
+    if ((ir.SessionOption.fromSqlName(name.text) orelse return null) != .max_dop) return null;
+    if ((try lex.next()).tag != .eq) return null;
+    const value = try lex.next();
+    if (value.tag != .integer or value.value.integer < 0) return null;
+    if ((try lex.next()).tag != .rparen) return null;
+    return std.math.cast(u32, value.value.integer) orelse std.math.maxInt(u32);
 }
 
 /// Validate a SQL table-function body at CREATE time: parse it with every
@@ -872,10 +918,16 @@ pub const Parser = struct {
     /// The text of every string a bound parameter supplied. Filled before
     /// parsing starts; sub-parsers share it read-only.
     bound_texts: std.ArrayList([]const u8) = .empty,
+    /// What the hints of the statement being parsed ask for.
+    statement_hints: StatementHints = .{},
 
     pub fn advance(self: *Parser) ParseError!void {
         self.prev_end = self.lex.pos;
         self.cur = try self.lex.next();
+        if (self.lex.hint) |body| {
+            self.lex.hint = null;
+            self.takeHint(body);
+        }
         // SQL table-function expansion: inside a function body, parameter
         // identifiers resolve to the call's literal argument tokens. One
         // interception point makes parameters work anywhere an expression
@@ -6572,6 +6624,16 @@ pub const Parser = struct {
     /// literal, and `compileSetVar` requires the result to be a `.lit`.
     pub fn parseSetVar(self: *Parser) ParseError!*ir.Op {
         try self.expect(.kw_set);
+        if (try self.atSessionOption()) |option| {
+            try self.advance();
+            if (self.cur.tag != .eq and self.cur.tag != .kw_to) return ParseError.SqlExpectedToken;
+            try self.advance();
+            const value_expr: ir.Expr = if (self.cur.tag == .kw_default) default: {
+                try self.advance();
+                break :default .{ .lit = .{ .bigint = 0 } };
+            } else try self.parseScalar();
+            return try self.allocOp(.{ .set_var = .{ .name = option.sqlName(), .value = value_expr, .session_option = option } });
+        }
         if (self.cur.tag != .at_identifier) {
             if (self.lex.dialect != .mysql) return ParseError.SqlExpectedIdent;
             return try self.parseIgnoredSet();
@@ -6582,6 +6644,50 @@ pub const Parser = struct {
         try self.advance();
         const value_expr = try self.parseScalar();
         return try self.allocOp(.{ .set_var = .{ .name = name, .value = value_expr } });
+    }
+
+    /// A thinDB session option named after SET: `thindb_max_dop`, also
+    /// spelled `SESSION thindb_max_dop`, `@@thindb_max_dop` or
+    /// `@@session.thindb_max_dop`. Leaves `cur` on the name when it matches.
+    fn atSessionOption(self: *Parser) ParseError!?ir.SessionOption {
+        switch (self.cur.tag) {
+            .identifier => {
+                if (ir.SessionOption.fromSqlName(self.cur.text)) |option| return option;
+                if (!std.ascii.eqlIgnoreCase(self.cur.text, "session")) return null;
+                const saved_cur = self.cur;
+                const saved_pos = self.lex.pos;
+                const saved_prev_end = self.prev_end;
+                try self.advance();
+                if (self.cur.tag == .identifier) {
+                    if (ir.SessionOption.fromSqlName(self.cur.text)) |option| return option;
+                }
+                self.cur = saved_cur;
+                self.lex.pos = saved_pos;
+                self.prev_end = saved_prev_end;
+                return null;
+            },
+            .system_variable => {
+                const name = self.cur.text;
+                const scope = "session.";
+                const bare = if (std.ascii.startsWithIgnoreCase(name, scope)) name[scope.len..] else name;
+                return ir.SessionOption.fromSqlName(bare);
+            },
+            else => return null,
+        }
+    }
+
+    /// MySQL optimizer hints: `SET_VAR(thindb_max_dop = N)` sets this
+    /// statement's parallelism. A hint thinDB has no use for, or a malformed
+    /// one, is ignored, as MySQL ignores a hint it cannot apply.
+    fn takeHint(self: *Parser, body: []const u8) void {
+        var lex = Lexer.init(self.arena, body);
+        lex.dialect = self.lex.dialect;
+        while (true) {
+            const tok = lex.next() catch return;
+            if (tok.tag == .eof) return;
+            if (tok.tag != .identifier or !std.ascii.eqlIgnoreCase(tok.text, "set_var")) continue;
+            if (setVarHintMaxDop(&lex) catch return) |max_dop| self.statement_hints.max_dop = max_dop;
+        }
     }
 
     /// A MySQL SET of anything but a user variable (`SET NAMES utf8mb4`,
@@ -8609,4 +8715,51 @@ test "WITH KEYED BY marks CTE boundaries; a CTE named keyed still parses" {
     const undeclared_mat = firstMaterializeForTest(undeclared);
     try std.testing.expect(undeclared_mat != null);
     try std.testing.expect(undeclared_mat.?.materialize.region_keys == null);
+}
+
+test "SET thindb_max_dop parses as a session option in every spelling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    inline for (.{ "SET thindb_max_dop = 4", "SET THINDB_MAX_DOP TO 4", "SET SESSION thindb_max_dop = 4", "SET @@thindb_max_dop = 4", "SET @@session.thindb_max_dop = 4" }) |sql| {
+        const op = try parseDialect(aa, sql, .mysql);
+        try std.testing.expectEqual(ir.SessionOption.max_dop, op.set_var.session_option.?);
+        try std.testing.expectEqual(@as(i32, 4), op.set_var.value.lit.int);
+    }
+    const reset = try parseDialect(aa, "SET thindb_max_dop = DEFAULT", .neutral);
+    try std.testing.expectEqual(@as(i64, 0), reset.set_var.value.lit.bigint);
+
+    const user_var = try parseDialect(aa, "SET @thindb_max_dop = 4", .mysql);
+    try std.testing.expect(user_var.set_var.session_option == null);
+    const other = try parseDialect(aa, "SET SESSION sql_mode = ''", .mysql);
+    try std.testing.expect(other.* != .set_var);
+}
+
+test "SET_VAR(thindb_max_dop) hints apply to their own statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const batch = try parseHintedWithContext(aa,
+        \\SELECT /*+ SET_VAR(thindb_max_dop = 2) */ 1;
+        \\SELECT 2;
+        \\/*+ SET_VAR(THINDB_MAX_DOP=3) */ SELECT 3;
+        \\SELECT 4 /*+ NO_BKA(t) SET_VAR(thindb_max_dop = 5) */
+    , &.{}, .mysql, null, null);
+    try std.testing.expectEqual(@as(usize, 4), batch.hints.len);
+    try std.testing.expectEqual(@as(?u32, 2), batch.hints[0].max_dop);
+    try std.testing.expectEqual(@as(?u32, null), batch.hints[1].max_dop);
+    try std.testing.expectEqual(@as(?u32, 3), batch.hints[2].max_dop);
+    try std.testing.expectEqual(@as(?u32, 5), batch.hints[3].max_dop);
+
+    inline for (.{
+        "SELECT /*+ SET_VAR(thindb_max_dop = -1) SET_VAR(sort_buffer_size = 1) SET_VAR(thindb_max_dop) */ 1",
+        "SELECT '/*+ SET_VAR(thindb_max_dop = 2) */'",
+        "SELECT /* SET_VAR(thindb_max_dop = 2) */ 1",
+    }) |sql| {
+        const lone = try parseHintedWithContext(aa, sql, &.{}, .mysql, null, null);
+        try std.testing.expectEqual(@as(usize, 1), lone.hints.len);
+        try std.testing.expectEqual(@as(?u32, null), lone.hints[0].max_dop);
+    }
 }

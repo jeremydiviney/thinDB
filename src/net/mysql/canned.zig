@@ -60,14 +60,18 @@ pub const EmptyResultKind = enum {
 
 /// Returns null if `sql` is not a probe query we recognize.
 /// `current_schema` (possibly empty) is the value reported by DATABASE().
-/// True for `SET @name = ...` (a MySQL user-defined variable), false for
-/// system/session vars (`SET names ...`, `SET @@global.x`, `SET autocommit`).
-/// `lc` is the normalized-lowercased statement. A single leading `@` after the
-/// `SET ` keyword marks a user variable; `@@` marks a system variable.
-fn isUserVarSet(lc: []const u8) bool {
+/// True for a SET the engine runs: `SET @name = ...` (a MySQL user-defined
+/// variable) or a thinDB session option (`SET thindb_max_dop = 4`, also
+/// spelled with `SESSION`, `@@` or `@@session.`). False for the system and
+/// session vars thinDB has no counterpart for (`SET names ...`,
+/// `SET @@global.x`, `SET autocommit`). `lc` is the normalized-lowercased
+/// statement. A single leading `@` after the `SET ` keyword marks a user
+/// variable; `@@` marks a system variable.
+fn isEngineSet(lc: []const u8) bool {
     if (!std.mem.startsWith(u8, lc, "set ")) return false;
     const rest = std.mem.trimStart(u8, lc[4..], " \t");
-    return rest.len >= 1 and rest[0] == '@' and !(rest.len >= 2 and rest[1] == '@');
+    if (rest.len >= 1 and rest[0] == '@' and !(rest.len >= 2 and rest[1] == '@')) return true;
+    return sql_text.setsSessionOption(lc);
 }
 
 /// Column label for a canned `SELECT <expr>` reply. Real MySQL echoes the
@@ -101,7 +105,7 @@ pub fn match(
     // `SET @@session.x=y`) are no-ops we ack with OK. But `SET @user_var = ...`
     // is a real user-defined variable the engine must store — let it through to
     // the compile path so the value persists for later statements.
-    if ((std.mem.startsWith(u8, lc, "set ") or std.mem.eql(u8, lc, "set")) and !isUserVarSet(lc)) {
+    if ((std.mem.startsWith(u8, lc, "set ") or std.mem.eql(u8, lc, "set")) and !isEngineSet(lc)) {
         return Outcome{ .ok_packet = {} };
     }
 
@@ -299,6 +303,14 @@ test "canned lets user-variable SET through to the engine, swallows system vars"
     // System/session vars stay canned-OK.
     try std.testing.expect((try match(allocator, "SET NAMES utf8mb4", "")) != null);
     try std.testing.expect((try match(allocator, "SET @@session.sql_mode = ''", "")) != null);
+}
+
+test "canned lets thinDB session options through to the engine" {
+    const allocator = std.testing.allocator;
+    inline for (.{ "SET thindb_max_dop = 4", "SET THINDB_MAX_DOP=4", "SET SESSION thindb_max_dop = 4", "SET @@thindb_max_dop = 4", "SET @@session.thindb_max_dop = DEFAULT" }) |stmt| {
+        try std.testing.expect((try match(allocator, stmt, "")) == null);
+    }
+    try std.testing.expect((try match(allocator, "SET thindb_max_dops = 4", "")) != null);
 }
 
 test "canned accepts Workbench SHOW SESSION VARIABLES probe" {

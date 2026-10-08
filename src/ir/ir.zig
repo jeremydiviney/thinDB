@@ -715,6 +715,28 @@ pub const SetKind = enum(u8) {
 pub const SetVar = struct {
     name: []const u8,
     value: Expr,
+    /// Set for a thinDB session option (`SET thindb_max_dop = 4`); null for a
+    /// user variable (`SET @name = v`), whose name may be the same text.
+    session_option: ?SessionOption = null,
+};
+
+/// The session settings `SET thindb_<name> = v` changes.
+pub const SessionOption = enum {
+    max_dop,
+
+    pub fn sqlName(self: SessionOption) []const u8 {
+        return switch (self) {
+            .max_dop => "thindb_max_dop",
+        };
+    }
+
+    pub fn fromSqlName(name: []const u8) ?SessionOption {
+        inline for (@typeInfo(SessionOption).@"enum".fields) |field| {
+            const option: SessionOption = @enumFromInt(field.value);
+            if (std.ascii.eqlIgnoreCase(name, option.sqlName())) return option;
+        }
+        return null;
+    }
 };
 
 /// `DELETE FROM t [WHERE ...]` — bulk row-deletion against an
