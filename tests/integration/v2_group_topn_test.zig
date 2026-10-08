@@ -1557,10 +1557,19 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
         try checkKeyDistinct(allocator, db, rows, live, &c_pool, true, "", "V2 group-topN");
         try checkKeyDistinct(allocator, db, rows, live, &c_pool, true, " HAVING COUNT(*) > 0", "V2 group-topN");
 
-        try exec(allocator, db, "DELETE FROM gd WHERE id % 17 = 0");
+        // Tombstones in the first row groups only: their batches carry no
+        // sidecar, so the coded key and coded distinct input intern their
+        // bytes per row while the clean row groups arrive coded — both must
+        // land in one code space on every worker.
+        try exec(allocator, db, "DELETE FROM gd WHERE id % 17 = 0 AND id < 2000");
+        for (live, 0..) |*keep, i| keep.* = i < (batches - 1) * batch_rows and (i % 17 != 0 or i >= 2000);
+        try expected.compute(allocator, rows, live);
+        try checkGroupedDistinct(allocator, db, expected, "g", "", "lowcard");
+        try checkKeyDistinct(allocator, db, rows, live, &c_pool, false, "", "lowcard");
+
         try t.insert(rows[(batches - 1) * batch_rows ..]);
         // The DELETE ran before the memtable batch arrived.
-        for (live, 0..) |*keep, i| keep.* = i >= (batches - 1) * batch_rows or i % 17 != 0;
+        for (live, 0..) |*keep, i| keep.* = i >= (batches - 1) * batch_rows or i % 17 != 0 or i >= 2000;
         try expected.compute(allocator, rows, live);
         try checkGroupedDistinct(allocator, db, expected, "g", "", "lowcard");
         try checkGroupedDistinct(allocator, db, expected, "g", " HAVING COUNT(*) > 0", "lowcard");

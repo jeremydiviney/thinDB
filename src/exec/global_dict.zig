@@ -27,7 +27,8 @@ pub const GlobalDict = struct {
     owned: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Serializes `intern` when parallel scan workers share one dict (the V2
     /// low-card grouped handler): interning happens per segment-dict ENTRY per
-    /// row group — not per row — so the lock is cold and a spinlock suffices
+    /// row group, and row-at-a-time callers go through a per-thread `Memo` —
+    /// never once per row — so the lock is cold and a spinlock suffices
     /// (`Io.Mutex` would need an io handle intern's callers don't carry).
     /// `decode`/`lookup`/`count` stay unlocked and are only safe once all
     /// interning threads have joined.
@@ -88,6 +89,48 @@ pub const GlobalDict = struct {
     pub fn decode(self: GlobalDict, code: u32) []const u8 {
         return self.owned.items[code];
     }
+
+    /// One thread's front for `intern` on the row-at-a-time paths (raw, FSST
+    /// and tombstoned row groups, memtable rows). Interning every row straight
+    /// into a dict that parallel workers share takes the spinlock once per row
+    /// and the workers serialize on it: a two-group GROUP BY over 32M such rows
+    /// ran 6x slower on 16 workers than on one. The memo answers an adjacent
+    /// repeat, and any value this thread already interned, without the lock,
+    /// so the shared dict sees each distinct value once per thread. It keeps a
+    /// copy of every distinct value it has seen — bounded, since only provably
+    /// low-cardinality columns are coded.
+    pub const Memo = struct {
+        dict: *GlobalDict,
+        seen: std.StringHashMapUnmanaged(u32) = .empty,
+        last: ?struct { bytes: []const u8, code: u32 } = null,
+
+        pub fn init(dict: *GlobalDict) Memo {
+            return .{ .dict = dict };
+        }
+
+        pub fn deinit(self: *Memo, allocator: Allocator) void {
+            var it = self.seen.keyIterator();
+            while (it.next()) |k| allocator.free(@constCast(k.*));
+            self.seen.deinit(allocator);
+            self.* = undefined;
+        }
+
+        pub fn intern(self: *Memo, allocator: Allocator, s: []const u8) !u32 {
+            if (self.last) |last| {
+                if (std.mem.eql(u8, last.bytes, s)) return last.code;
+            }
+            const gop = try self.seen.getOrPut(allocator, s);
+            if (!gop.found_existing) {
+                errdefer _ = self.seen.remove(s);
+                const copy = try allocator.dupe(u8, s);
+                errdefer allocator.free(copy);
+                gop.value_ptr.* = try self.dict.intern(allocator, s);
+                gop.key_ptr.* = copy;
+            }
+            self.last = .{ .bytes = gop.key_ptr.*, .code = gop.value_ptr.* };
+            return gop.value_ptr.*;
+        }
+    };
 };
 
 /// A string column held as global codes instead of materialized bytes — the
@@ -166,6 +209,29 @@ test "intern owns its bytes (source can be freed)" {
     testing.allocator.free(src); // global dict must not alias this
     try testing.expectEqualStrings("ephemeral", gd.decode(code));
     try testing.expectEqual(@as(?u32, code), gd.lookup("ephemeral"));
+}
+
+test "Memo returns the shared dict's codes and owns its keys" {
+    var gd: GlobalDict = .{};
+    defer gd.deinit(testing.allocator);
+    const pre = try gd.intern(testing.allocator, "pre");
+
+    var memo_a: GlobalDict.Memo = .init(&gd);
+    defer memo_a.deinit(testing.allocator);
+    var memo_b: GlobalDict.Memo = .init(&gd);
+    defer memo_b.deinit(testing.allocator);
+
+    const rows = [_][]const u8{ "x", "x", "y", "x", "pre", "y", "y" };
+    for (rows) |row| {
+        const src = try testing.allocator.dupe(u8, row);
+        defer testing.allocator.free(src);
+        const a = try memo_a.intern(testing.allocator, src);
+        const b = try memo_b.intern(testing.allocator, src);
+        try testing.expectEqual(a, b);
+        try testing.expectEqualStrings(row, gd.decode(a));
+    }
+    try testing.expectEqual(pre, try memo_a.intern(testing.allocator, "pre"));
+    try testing.expectEqual(@as(u32, 3), gd.count());
 }
 
 /// Build a DictBlock in memory from a set of (already-sorted) distinct values,

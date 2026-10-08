@@ -37,7 +37,9 @@
 //! scalar merge (packed-key equality) and the distinct partitioning (same
 //! composite → same partition in every worker) both rely on. A batch without
 //! the sidecar (tombstoned row group, memtable rows, a scan that declined
-//! coding) falls back to interning each row's bytes into the same dict.
+//! coding) falls back to interning each row's bytes into the same dict,
+//! through a per-worker `GlobalDict.Memo` so the workers don't serialize on
+//! the dict's lock.
 //!
 //! COUNT(DISTINCT) takes integer, float (canonical bits), and string inputs.
 //! A string input that is itself codeable rides the same dict machinery as a
@@ -620,6 +622,10 @@ const WState = struct {
     keys_scratch: std.ArrayListUnmanaged(u64) = .empty,
     gids_scratch: std.ArrayListUnmanaged(u32) = .empty,
     codes_scratch: std.ArrayListUnmanaged(u32) = .empty,
+    // Intern memos for batches without the code sidecar, one per coded key
+    // part / coded COUNT(DISTINCT) input, created on first use.
+    key_memos: [MAX_KEYS]?GlobalDict.Memo = @splat(null),
+    distinct_memos: [MAX_AGGS]?GlobalDict.Memo = @splat(null),
 
     fn init(allocator: Allocator, expected_groups: usize, aggs: []const AggPlan, n_distinct: u16, dop_parts: usize) !WState {
         var self: WState = .{ .table = try GroupTable.init(allocator, expected_groups) };
@@ -648,6 +654,8 @@ const WState = struct {
         self.keys_scratch.deinit(allocator);
         self.gids_scratch.deinit(allocator);
         self.codes_scratch.deinit(allocator);
+        for (&self.key_memos) |*slot| if (slot.*) |*memo| memo.deinit(allocator);
+        for (&self.distinct_memos) |*slot| if (slot.*) |*memo| memo.deinit(allocator);
         self.counts.deinit(allocator);
         self.slots.deinit(allocator);
         self.ns.deinit(allocator);
@@ -754,13 +762,13 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
                 k.* |= @as(u64, code) << shift;
             }
         } else {
-            const dict = w.dicts[part_i].?;
+            const memo = memoFor(&w.state.key_memos[part_i], w.dicts[part_i].?);
             const sv = switch (batch.values[ci].data) {
                 .varchar, .string, .char, .json => |s| s,
                 else => return error.UnsupportedQueryShape,
             };
             for (keys, 0..) |*k, r| {
-                const code = try dict.intern(w.allocator, sv.rowBytes(r));
+                const code = try memo.intern(w.allocator, sv.rowBytes(r));
                 k.* |= @as(u64, code) << shift;
             }
         }
@@ -776,6 +784,11 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
         },
         else => return error.UnsupportedQueryShape,
     }
+}
+
+fn memoFor(slot: *?GlobalDict.Memo, dict: *GlobalDict) *GlobalDict.Memo {
+    if (slot.* == null) slot.* = .init(dict);
+    return &slot.*.?;
 }
 
 // The fold runs in passes so each inner loop is monomorphic: pass 0 packs
@@ -1068,7 +1081,7 @@ fn foldDistinctCoded(
 ) !void {
     const n = keys.len;
     const codes: []const u32 = if (sidecar) |cc| cc.codes[0..n] else blk: {
-        const dict = w.distinct_dicts[agg_i].?;
+        const memo = memoFor(&w.state.distinct_memos[agg_i], w.distinct_dicts[agg_i].?);
         const sv = switch (view.data) {
             .varchar, .string, .char, .json => |s| s,
             else => return error.UnsupportedQueryShape,
@@ -1076,7 +1089,7 @@ fn foldDistinctCoded(
         try w.state.codes_scratch.resize(w.allocator, n);
         const out = w.state.codes_scratch.items[0..n];
         for (out, 0..) |*c, r| {
-            c.* = if (view.isValid(r)) try dict.intern(w.allocator, sv.rowBytes(r)) else 0;
+            c.* = if (view.isValid(r)) try memo.intern(w.allocator, sv.rowBytes(r)) else 0;
         }
         break :blk out;
     };

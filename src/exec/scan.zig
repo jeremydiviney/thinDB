@@ -520,6 +520,10 @@ pub const Scan = struct {
     /// coded positions are used. Each emitted `CodedColumn` aliases its buffer
     /// (same per-`next()` lifetime as `views`). Freed in deinit.
     code_bufs: []std.ArrayListUnmanaged(u32) = &.{},
+    /// Per-projected-column intern memo in front of the coded position's
+    /// shared dict, for the row-at-a-time (non-dict block) paths. Allocated
+    /// with `coded_dicts_by_j`; freed in deinit.
+    code_memos: []?exec.GlobalDict.Memo = &.{},
     /// Sidecar slots (one per projected column), null except coded positions in
     /// a coded batch. Lazily allocated; freed in deinit.
     coded_slots: []?exec.CodedColumn = &.{},
@@ -943,7 +947,9 @@ pub const Scan = struct {
     pub fn setDictCodeColumn(self: *Scan, name: []const u8, dict: *exec.GlobalDict) bool {
         const j = self.codeColIdx(name) orelse return false;
         self.ensureCodedArrays() catch return false;
+        if (self.code_memos[j]) |*memo| memo.deinit(self.allocator);
         self.coded_dicts_by_j[j] = dict;
+        self.code_memos[j] = .init(dict);
         self.n_coded += 1;
         return true;
     }
@@ -952,7 +958,15 @@ pub const Scan = struct {
     /// commit when the packed group key turns out not to fit the int budget.
     pub fn clearDictCodeColumns(self: *Scan) void {
         for (self.coded_dicts_by_j) |*d| d.* = null;
+        self.deinitCodeMemos();
         self.n_coded = 0;
+    }
+
+    fn deinitCodeMemos(self: *Scan) void {
+        for (self.code_memos) |*slot| {
+            if (slot.*) |*memo| memo.deinit(self.allocator);
+            slot.* = null;
+        }
     }
 
     /// Mark the projected column `name` for key-digest emit (`Batch.hashed`).
@@ -1070,11 +1084,20 @@ pub const Scan = struct {
     fn ensureCodedArrays(self: *Scan) !void {
         if (self.coded_dicts_by_j.len == self.out_phys.len) return;
         const dicts = try self.allocator.alloc(?*exec.GlobalDict, self.out_phys.len);
+        errdefer self.allocator.free(dicts);
         for (dicts) |*d| d.* = null;
         const bufs = try self.allocator.alloc(std.ArrayListUnmanaged(u32), self.out_phys.len);
+        errdefer self.allocator.free(bufs);
         for (bufs) |*b| b.* = .empty;
+        const memos = try self.allocator.alloc(?exec.GlobalDict.Memo, self.out_phys.len);
+        for (memos) |*m| m.* = null;
         self.coded_dicts_by_j = dicts;
         self.code_bufs = bufs;
+        self.code_memos = memos;
+    }
+
+    fn codeMemo(self: *Scan, j: usize) *exec.GlobalDict.Memo {
+        return &self.code_memos[j].?;
     }
 
     /// The pinned memtable snapshot this scan reads from. `LateScan` reaches
@@ -1112,6 +1135,8 @@ pub const Scan = struct {
         for (self.code_bufs) |*b| b.deinit(self.allocator);
         if (self.code_bufs.len > 0) self.allocator.free(self.code_bufs);
         if (self.coded_dicts_by_j.len > 0) self.allocator.free(self.coded_dicts_by_j);
+        self.deinitCodeMemos();
+        if (self.code_memos.len > 0) self.allocator.free(self.code_memos);
         if (self.coded_slots.len > 0) self.allocator.free(self.coded_slots);
         for (self.hash_bufs) |*b| b.deinit(self.allocator);
         if (self.hash_bufs.len > 0) self.allocator.free(self.hash_bufs);
@@ -2031,8 +2056,7 @@ pub const Scan = struct {
             for (0..rg_count) |i| codes[i] = lut[db.rowCode(i)];
         } else if (block.encoding == .fsst) {
             // Per-row decode into a one-value scratch with the adjacent-run
-            // shortcut — no full-column expansion, and runs hit the
-            // spinlocked global dict once instead of per row.
+            // shortcut — no full-column expansion, and a run decodes once.
             const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             defer if (exec.prof.enabled) exec.prof.add("dict-code (fsst run intern)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
             const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
@@ -2046,7 +2070,7 @@ pub const Scan = struct {
                 if (i == 0 or !std.mem.eql(u8, prev_comp, comp)) {
                     try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
                     const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
-                    prev_code = try gdict.intern(self.allocator, scratch.items[0..n]);
+                    prev_code = try self.codeMemo(j).intern(self.allocator, scratch.items[0..n]);
                     prev_comp = comp;
                 }
                 codes[i] = prev_code;
@@ -2060,7 +2084,8 @@ pub const Scan = struct {
                 .varchar, .string, .char, .json => |s| s.view(),
                 else => unreachable,
             };
-            for (0..rg_count) |i| codes[i] = try gdict.intern(self.allocator, sv.rowBytes(i));
+            const memo = self.codeMemo(j);
+            for (0..rg_count) |i| codes[i] = try memo.intern(self.allocator, sv.rowBytes(i));
         }
         return self.emptyStringColumn(col_type, rg_count);
     }
@@ -3846,7 +3871,8 @@ pub const Scan = struct {
                 .varchar, .string, .char, .json => |s| s.view(),
                 else => unreachable,
             };
-            for (rows, codes) |row, *c| c.* = try gdict.intern(self.allocator, sv.rowBytes(row));
+            const memo = self.codeMemo(j);
+            for (rows, codes) |row, *c| c.* = try memo.intern(self.allocator, sv.rowBytes(row));
         }
     }
 
@@ -4098,9 +4124,10 @@ pub const Scan = struct {
                     .varchar, .string, .char, .json => |s| s,
                     else => unreachable,
                 };
+                const memo = self.codeMemo(j);
                 var k: usize = 0;
                 for (mask[0..n], 0..) |m, row| if (m) {
-                    codes[k] = try gdict.intern(self.allocator, sv.rowBytes(row));
+                    codes[k] = try memo.intern(self.allocator, sv.rowBytes(row));
                     k += 1;
                 };
                 try self.fillEmptyStrings(dst, matched);
