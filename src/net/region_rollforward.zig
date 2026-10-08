@@ -93,6 +93,8 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
         return null;
     };
     const keys = top.materialize.region_keys.?;
+    var ingress: IngressMemo = .{};
+    defer ingress.deinit(input.allocator);
     const shape_hash = hashAnchor(top);
     const declaration_hash = hash_declaration(input, top);
     if (try_cached_declaration(input, top, keys, declaration_hash)) |recognized| return recognized;
@@ -114,7 +116,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
             // another range's run can miss above and still hit here.
             const bh = anchorHashes(input, anchor, keys);
             if (tryCachedHashes(input, anchor, keys, bh, declaration)) |q| return .{ .anchor = anchor, .query = q };
-            if (buildRegion(input, anchor, keys, bh, declaration)) |q| {
+            if (buildRegion(input, anchor, keys, bh, declaration, &ingress)) |q| {
                 if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] boundary hint rebuilt depth={d}\n", .{selected_depth});
                 return .{ .anchor = anchor, .query = q };
             } else |err| {
@@ -158,7 +160,7 @@ pub fn compileDeclared(input: engine_v2.CompileInput, root: *const ir.Op) anyerr
                         if (shape_hash) |shape| if (inputCache(input)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     }
-                    if (buildRegion(input, cur, keys, bh, declaration)) |q| {
+                    if (buildRegion(input, cur, keys, bh, declaration, &ingress)) |q| {
                         if (shape_hash) |shape| if (inputCache(input)) |cache| cache.remember_boundary(shape, depth);
                         return .{ .anchor = cur, .query = q };
                     } else |e| {
@@ -2983,7 +2985,7 @@ fn rename_entry_outputs(arena: Allocator, scan_schema: []const Column, derived: 
     return renamed;
 }
 
-fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: AnchorHashes, declaration: ?DeclaredBoundary) anyerror!exec.Query {
+fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: AnchorHashes, declaration: ?DeclaredBoundary, ingress: *IngressMemo) anyerror!exec.Query {
     const pipeline = try collectPipeline(input, anchor, declared_keys, true);
     const fused = blk: {
         for (pipeline.steps) |step| if (step == .sql_union) break :blk true;
@@ -2993,16 +2995,16 @@ fn buildRegion(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_key
     const cache = if (rejection_hash != null) inputCache(input) else null;
     if (cache) |c| if (c.fusion_rejected(rejection_hash.?)) {
         if (getenv("THINDB_REGION_TRACE") != null) std.debug.print("[region] rejected fusion reused: staged fallback\n", .{});
-        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, null);
+        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, null, ingress);
     };
-    return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, true, pipeline) catch |err| {
+    return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, true, pipeline, ingress) catch |err| {
         if (err == error.OutOfMemory or !fused) return err;
         if (err == NoMatch) if (cache) |c| c.remember_rejected_fusion(rejection_hash.?);
-        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, null);
+        return build_region_attempt(input, anchor, declared_keys, anchor_hash, declaration, false, null, ingress);
     };
 }
 
-fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: AnchorHashes, declaration: ?DeclaredBoundary, union_fusion: bool, collected: ?Pipeline) anyerror!exec.Query {
+fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, declared_keys: []const []const u8, anchor_hash: AnchorHashes, declaration: ?DeclaredBoundary, union_fusion: bool, collected: ?Pipeline, ingress: *IngressMemo) anyerror!exec.Query {
     var tm: i64 = exec.prof.nowTicks();
     const registry = input.udf_registry orelse return NoMatch;
 
@@ -3108,6 +3110,7 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     const bs = switch (pl.entry) {
         .staged => |root| blk: {
             recordSubtreeVersions(&b, root);
+            if (ingress.take(root)) |compiled| break :blk try ingress_source(input.allocator, compiled);
             break :blk try build_staged_source(input, root, declared_keys);
         },
         .scan => if (order_aligned)
@@ -3123,7 +3126,11 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
     }
     var sources_owned = true; // RegionExecOp takes them over on create
     errdefer if (sources_owned) {
-        for (sources) |*q| q.deinit();
+        switch (pl.entry) {
+            // A later boundary over the same ingress reuses this compile.
+            .staged => |root| ingress.give(qa, root, sources[0]),
+            .scan => for (sources) |*q| q.deinit(),
+        }
         qa.free(sources);
     };
     traceMark("scan_build", &tm);
@@ -5093,6 +5100,43 @@ const BuiltSources = struct {
     /// drives the fused scan+exec LPT assignment.
     iv_rows: []u64 = &.{},
 };
+
+/// Staged ingress compiled during one boundary search, by subtree root.
+/// Boundaries above an ordinary ingress cut share it, so a declined
+/// attempt hands its compiled ingress to the next boundary instead of the
+/// next one compiling the subtree again (and repeating the region search
+/// inside it).
+const IngressMemo = struct {
+    queries: std.AutoHashMapUnmanaged(*const ir.Op, exec.Query) = .empty,
+
+    fn take(self: *IngressMemo, root: *const ir.Op) ?exec.Query {
+        const entry = self.queries.fetchRemove(root) orelse return null;
+        return entry.value;
+    }
+
+    fn give(self: *IngressMemo, allocator: Allocator, root: *const ir.Op, query: exec.Query) void {
+        self.queries.put(allocator, root, query) catch {
+            var dropped = query;
+            dropped.deinit();
+        };
+    }
+
+    fn deinit(self: *IngressMemo, allocator: Allocator) void {
+        var it = self.queries.valueIterator();
+        while (it.next()) |q| q.deinit();
+        self.queries.deinit(allocator);
+    }
+};
+
+fn ingress_source(allocator: Allocator, compiled: exec.Query) !BuiltSources {
+    const sources = allocator.alloc(exec.Query, 1) catch |err| {
+        var dropped = compiled;
+        dropped.deinit();
+        return err;
+    };
+    sources[0] = compiled;
+    return .{ .sources = sources, .total_rows = compiled.stats().upper_rows };
+}
 
 fn build_staged_source(input: engine_v2.CompileInput, root: *const ir.Op, keys: []const []const u8) !BuiltSources {
     const sources = try input.allocator.alloc(exec.Query, 1);
