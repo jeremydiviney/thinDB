@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const BoundSpan = @import("../sql/lexer.zig").BoundSpan;
+const SessionOption = @import("../ir/ir.zig").SessionOption;
 
 /// Per-protocol lexical knobs for `substituteWith`. Identifier quoting
 /// is the only divergence between PG and MySQL outside the actual
@@ -55,6 +56,23 @@ pub fn normalizeForCannedMatchKeepCase(sql: []const u8) []const u8 {
     var s = stripLeadingComments(std.mem.trim(u8, sql, " \t\r\n"));
     while (s.len > 0 and s[s.len - 1] == ';') s = std.mem.trim(u8, s[0 .. s.len - 1], " \t\r\n");
     return s;
+}
+
+/// Whether a canned-normalized statement SETs a thinDB session option
+/// (`set thindb_max_dop = 4`, also spelled with `session`, `@@` or
+/// `@@session.`). Both wires ack the SETs they have no counterpart for
+/// without running them; these the engine has to run.
+pub fn setsSessionOption(lc: []const u8) bool {
+    if (!std.mem.startsWith(u8, lc, "set ")) return false;
+    var rest = std.mem.trimStart(u8, lc[4..], " \t");
+    for ([_][]const u8{ "@@session.", "@@", "session " }) |scope| {
+        if (std.mem.startsWith(u8, rest, scope)) {
+            rest = std.mem.trimStart(u8, rest[scope.len..], " \t");
+            break;
+        }
+    }
+    const name_end = std.mem.indexOfAny(u8, rest, " \t=") orelse rest.len;
+    return SessionOption.fromSqlName(rest[0..name_end]) != null;
 }
 
 fn stripLeadingComments(sql: []const u8) []const u8 {

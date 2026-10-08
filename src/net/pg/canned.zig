@@ -84,6 +84,7 @@ pub fn match(
         if (schema.len > 0 and schema[0] != '$')
             return Probe{ .set_search_path = try allocator.dupe(u8, schema) };
     }
+    if (sql_text.setsSessionOption(lc)) return null;
     if (std.mem.startsWith(u8, lc, "set ") or std.mem.eql(u8, lc, "set"))
         return Probe{ .accept = "SET" };
     if (std.mem.eql(u8, lc, "begin") or std.mem.startsWith(u8, lc, "begin "))
@@ -167,6 +168,12 @@ test "match treats arbitrary SET as accept" {
         .accept => |tag| try std.testing.expectEqualStrings("SET", tag),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "match leaves thinDB session options to the engine" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect((try match(allocator, "SET thindb_max_dop TO 4", "main", "public")) == null);
+    try std.testing.expect((try match(allocator, "SET SESSION thindb_max_dop = 4", "main", "public")) == null);
 }
 
 test "match applies SET search_path to the first listed schema" {

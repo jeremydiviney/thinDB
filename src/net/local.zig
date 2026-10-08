@@ -1508,6 +1508,7 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
         .udf_registry = ctx.udf_registry,
         .node_arena = ctx.nodeArena(),
         .accountant = try ctx.queryAccountant(),
+        .dop_cap = session_cell.dopCap(),
     };
     // SELECT-shaped roots are the engine's: CTE / FROM-subquery boundaries,
     // pg_catalog virtual tables, and non-table leaves compile as (generic)
@@ -1543,6 +1544,7 @@ pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
             .udf_registry = ctx.udf_registry,
             .node_arena = ctx.nodeArena(),
             .accountant = try ctx.queryAccountant(),
+            .dop_cap = ctx.session.dopCap(),
         };
         if (cte_stages.needsStaging(op) or referencesPgCatalog(op, ctx.session.*)) {
             return try cte_stages.compileStaged(v2_input, op, &ctx.stage_count);
@@ -2350,6 +2352,12 @@ fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
         .null_lit => null,
         else => exec.expr_mod.literalValue(sv.value) orelse return Error.UnsupportedOp,
     };
+    if (sv.session_option) |option| {
+        switch (option) {
+            .max_dop => ctx.session.max_dop = try maxDopSetting(value),
+        }
+        return try EmptyOp.createWithCount(ctx.allocator, 0);
+    }
 
     // Lazily create the session's var map. Owned by the CompileCtx's
     // allocator so it outlives the statement.
@@ -2361,6 +2369,22 @@ fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
     try ctx.session.vars.?.set(sv.name, value);
 
     return try EmptyOp.createWithCount(ctx.allocator, 0);
+}
+
+/// `SET thindb_max_dop` takes a non-negative integer; 0, NULL and DEFAULT
+/// mean the server's max_dop.
+fn maxDopSetting(value: ?Value) Error!u32 {
+    const v = value orelse return 0;
+    const n: i128 = switch (v) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        .largeint => |x| x,
+        else => return Error.TypeMismatch,
+    };
+    if (n < 0) return Error.TypeMismatch;
+    return std.math.cast(u32, n) orelse std.math.maxInt(u32);
 }
 
 fn compileAdmin(ctx: *CompileCtx, a: ir.AdminOp) !Query {
