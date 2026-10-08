@@ -95,6 +95,9 @@ const Mode = enum { collect, mutate };
 
 const Ctx = struct {
     arena: Allocator,
+    /// Keyed by materialize BODY, not node: several materialize nodes can
+    /// wrap one body (NOT MATERIALIZED gives each reference its own node),
+    /// and narrowing that body must satisfy every one of their consumers.
     mats: std.AutoHashMapUnmanaged(*const ir.Op, *MatNeed) = .empty,
     /// Per-iteration guard: each materialize body walks once per pass so a
     /// diamond of shared CTEs stays linear (late-added names propagate on
@@ -105,8 +108,8 @@ const Ctx = struct {
     /// Trace only: why the current needed==null flow originated.
     null_reason: []const u8 = "root",
 
-    fn matNeed(self: *Ctx, op: *const ir.Op) ?*MatNeed {
-        const gop = self.mats.getOrPut(self.arena, op) catch return null;
+    fn matNeed(self: *Ctx, mat: *const ir.Op) ?*MatNeed {
+        const gop = self.mats.getOrPut(self.arena, mat.materialize.upstream) catch return null;
         if (!gop.found_existing) {
             const mn = self.arena.create(MatNeed) catch return null;
             mn.* = .{};
@@ -387,6 +390,20 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
                     return;
                 }
             }
+            // Splicing copies the upstream node into this slot. A materialize
+            // is shared by every reference to its CTE, so the copy would be a
+            // second node over the same body (a separate stage, or an inline
+            // re-run). Keep one derived instead, as select and group_by keep
+            // one item.
+            if (kept == 0 and c.derived.len > 0 and c.upstream.* == .materialize) {
+                keep.items[0] = true;
+                kept = 1;
+                if (!collectExpr(ctx.arena, c.derived[0].expr, &child)) {
+                    ctx.null_reason = "compute-expr";
+                    walk(ctx, c.upstream, null);
+                    return;
+                }
+            }
             if (ctx.mode == .mutate and kept < c.derived.len) {
                 if (kept == 0) {
                     // Every derived is dead: splice the node out entirely
@@ -568,8 +585,8 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
             }
             // One body visit per pass: shared consumers accumulate first,
             // the fixpoint loop carries growth inward on the next round.
-            if (ctx.visited.contains(op)) return;
-            ctx.visited.put(ctx.arena, op, {}) catch return;
+            if (ctx.visited.contains(m.upstream)) return;
+            ctx.visited.put(ctx.arena, m.upstream, {}) catch return;
             if (ctx.mode == .mutate and trace()) std.debug.print(
                 "[prune] mat body={s} all={} needed={d}\n",
                 .{ @tagName(m.upstream.*), mn.all, mn.set.map.count() },
@@ -873,6 +890,72 @@ test "shared materialize accumulates the union of its consumers' needs" {
     try testing.expectEqual(@as(usize, 2), body.select.columns.len);
     try testing.expectEqualStrings("a", body.select.columns[0]);
     try testing.expectEqualStrings("b", body.select.columns[1]);
+}
+
+test "materialize nodes over one body narrow it to the union of all their consumers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var base = scanOp();
+    var body = ir.Op{ .select = .{ .columns = &.{ "a", "b", "c" }, .upstream = &base } };
+    var mat_a = ir.Op{ .materialize = .{ .upstream = &body, .structural_cse = true } };
+    var mat_b = ir.Op{ .materialize = .{ .upstream = &body, .structural_cse = true } };
+    var reader_a = ir.Op{ .select = .{ .columns = &.{"a"}, .upstream = &mat_a } };
+    var reader_b = ir.Op{ .select = .{ .columns = &.{"b"}, .upstream = &mat_b } };
+    var joined = ir.Op{ .join = .{
+        .join_type = .inner,
+        .algorithm = .auto,
+        .on = &.{},
+        .ranges = &.{},
+        .extra_predicate = null,
+        .skew_ratio_threshold = 0,
+        .skew_absolute_threshold = 0,
+        .skew_sample_interval = 1,
+        .left = &reader_a,
+        .right = &reader_b,
+    } };
+    var outer = ir.Op{ .select = .{ .columns = &.{ "a", "b" }, .upstream = &joined } };
+    pruneDeadColumns(arena, &outer);
+    try testing.expectEqual(@as(usize, 2), body.select.columns.len);
+    try testing.expectEqualStrings("a", body.select.columns[0]);
+    try testing.expectEqualStrings("b", body.select.columns[1]);
+}
+
+test "a dead compute over a shared materialize keeps one derived rather than cloning the materialize" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var base = scanOp();
+    var body = ir.Op{ .select = .{ .columns = &.{ "a", "b", "c" }, .upstream = &base } };
+    var mat = ir.Op{ .materialize = .{ .upstream = &body } };
+    var reader_a = ir.Op{ .select = .{ .columns = &.{"a"}, .upstream = &mat } };
+    const derived = [_]ir.Derived{
+        .{ .name = "dead1", .expr = .{ .col_ref = "c" } },
+        .{ .name = "dead2", .expr = .{ .col_ref = "c" } },
+    };
+    var cmp = ir.Op{ .compute = .{ .derived = &derived, .upstream = &mat } };
+    var reader_b = ir.Op{ .select = .{ .columns = &.{"b"}, .upstream = &cmp } };
+    var joined = ir.Op{ .join = .{
+        .join_type = .inner,
+        .algorithm = .auto,
+        .on = &.{},
+        .ranges = &.{},
+        .extra_predicate = null,
+        .skew_ratio_threshold = 0,
+        .skew_absolute_threshold = 0,
+        .skew_sample_interval = 1,
+        .left = &reader_a,
+        .right = &reader_b,
+    } };
+    var outer = ir.Op{ .select = .{ .columns = &.{ "a", "b" }, .upstream = &joined } };
+    pruneDeadColumns(arena, &outer);
+    try testing.expect(cmp == .compute);
+    try testing.expectEqual(@as(usize, 1), cmp.compute.derived.len);
+    try testing.expectEqual(&mat, cmp.compute.upstream);
+    // The kept derived reads c, so the body keeps it beside a and b.
+    try testing.expectEqual(@as(usize, 3), body.select.columns.len);
 }
 
 test "union arms with mismatched select sequences are left whole" {

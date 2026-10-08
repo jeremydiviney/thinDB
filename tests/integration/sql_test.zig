@@ -3906,6 +3906,45 @@ test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)"
     try std.testing.expectEqual(@as(usize, 5), rows);
 }
 
+test "sql: a CTE whose consumers need different columns keeps every consumer's columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE r (k INT, a INT, b INT, w INT)");
+    try helpers.exec(allocator, db, "INSERT INTO r VALUES (1, 10, 1, 1), (1, 20, 2, 2), (2, 5, 3, 3)");
+
+    // The aggregate consumer needs only k and a once its unused SUM(a + b)
+    // is pruned; the join consumer still reads w.
+    {
+        var q = try runSql(allocator, db,
+            \\WITH src AS (SELECT k, a, b, w FROM r),
+            \\agg AS (SELECT k, SUM(a) AS s, SUM(a + b) AS unused FROM src GROUP BY k)
+            \\SELECT src.w * 1000 + agg.s AS v FROM src LEFT JOIN agg ON src.k = agg.k
+        );
+        defer q.deinit();
+        // src stays one shared stage for both consumers.
+        try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
+    }
+    const shared = try helpers.collectBigints(allocator, db,
+        \\WITH src AS (SELECT k, a, b, w FROM r),
+        \\agg AS (SELECT k, SUM(a) AS s, SUM(a + b) AS unused FROM src GROUP BY k)
+        \\SELECT src.w * 1000 + agg.s AS v FROM src LEFT JOIN agg ON src.k = agg.k ORDER BY v
+    );
+    defer allocator.free(shared);
+    try std.testing.expectEqualSlices(i64, &.{ 1030, 2030, 3005 }, shared);
+
+    const regenerated = try helpers.collectBigints(allocator, db,
+        \\WITH src AS NOT MATERIALIZED (SELECT k, a, w FROM r),
+        \\agg AS (SELECT k, SUM(a) AS s FROM src GROUP BY k)
+        \\SELECT src.w * 1000 + agg.s AS v FROM src LEFT JOIN agg ON src.k = agg.k ORDER BY v
+    );
+    defer allocator.free(regenerated);
+    try std.testing.expectEqualSlices(i64, &.{ 1030, 2030, 3005 }, regenerated);
+}
+
 test "sql: single-use CTE materializes (boundary semantics)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
