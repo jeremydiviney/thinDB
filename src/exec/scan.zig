@@ -1305,21 +1305,21 @@ pub const Scan = struct {
             }
         }
         if (!storage.format.typeHasStats(self.table.schema.columns[col_idx].type)) return;
-        var values = try self.allocator.alloc(i128, s.values.len);
+        if (s.values.len == 0) return;
+        const values = try self.allocator.alloc(i128, s.values.len);
         errdefer self.allocator.free(values);
-        var n: usize = 0;
-        for (s.values) |v| {
-            if (predicate.valueToRangeI128(v)) |iv| {
-                values[n] = iv;
-                n += 1;
-            }
+        // A value with no zone-map order may still equal rows (a fractional
+        // literal that is whole, a numeric string), so the set skips nothing
+        // unless every value has one.
+        for (s.values, values) |v, *ordered| {
+            ordered.* = predicate.valueToRangeI128(v) orelse {
+                self.allocator.free(values);
+                return;
+            };
         }
-        if (n == 0) {
-            self.allocator.free(values);
-            return;
-        }
+        try self.in_prunes.ensureUnusedCapacity(self.allocator, 1);
         try self.markPruned();
-        try self.in_prunes.append(self.allocator, .{ .col_idx = col_idx, .values = values[0..n] });
+        self.in_prunes.appendAssumeCapacity(.{ .col_idx = col_idx, .values = values });
     }
 
     /// Set up block-sourced evaluation for any predicate column not already in

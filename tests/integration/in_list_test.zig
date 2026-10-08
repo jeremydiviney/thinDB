@@ -119,3 +119,41 @@ test "in-list: fractional literals against an integer column follow MySQL semant
     defer allocator.free(gt_ids);
     try std.testing.expectEqualSlices(i64, &.{2}, gt_ids);
 }
+
+// An IN list prunes row groups by its values' zone-map order; literals of
+// another type than the column still match the rows they equal.
+test "in-list: literals of another type prune row groups without losing rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .auto_flush_secs = 0 });
+    defer db.close();
+
+    const schema = thindb.TableSchema{
+        .columns = &.{ .{ .name = "k", .type = .bigint }, .{ .name = "x", .type = .int } },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const t = try db.table("t", schema, .{ .order_key = &.{"k"}, .unique = false, .row_group_size = 4 });
+    const Row = struct { k: i64, x: i32 };
+    var rows: [40]Row = undefined;
+    for (&rows, 0..) |*row, k| row.* = .{ .k = @intCast(k), .x = @intCast(k) };
+    try t.insert(&rows);
+    try t.flush();
+
+    const cases = .{
+        .{ "SELECT k FROM t WHERE k IN (1, 22.0) ORDER BY k", &[_]i64{ 1, 22 } },
+        .{ "SELECT k FROM t WHERE k IN (1, '22') ORDER BY k", &[_]i64{ 1, 22 } },
+        .{ "SELECT k FROM t WHERE k IN (1.5, 22) ORDER BY k", &[_]i64{22} },
+        .{ "SELECT k FROM t WHERE x IN (1, 22.0) ORDER BY k", &[_]i64{ 1, 22 } },
+        .{ "SELECT k FROM t WHERE x IN (1, '22') ORDER BY k", &[_]i64{ 1, 22 } },
+        .{ "SELECT k FROM t WHERE x IN (1.5, 22) ORDER BY k", &[_]i64{22} },
+    };
+    inline for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case[0]});
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}
