@@ -261,9 +261,29 @@ test "table UDF: parallel partition execution matches serial (thread-safe alloca
         }
     }
 
+    // The drain copies its first rows serially, then fans out mid-stream.
+    thindb.exec.table_fn.drain_fan_out_rows_in_tests = 100;
+    defer thindb.exec.table_fn.drain_fan_out_rows_in_tests = 0;
+    var switched_ids: std.ArrayList(i64) = .empty;
+    defer switched_ids.deinit(allocator);
+    var switched_run: std.ArrayList(i64) = .empty;
+    defer switched_run.deinit(allocator);
+    {
+        var res = try run(allocator, db, sql);
+        defer res.deinit();
+        while (try res.next()) |batch| {
+            for (0..batch.row_count) |i| {
+                try switched_ids.append(allocator, batch.values[0].data.bigint[i]);
+                try switched_run.append(allocator, batch.values[1].data.bigint[i]);
+            }
+        }
+    }
+
     try std.testing.expectEqual(@as(usize, 512), serial_ids.items.len);
     try std.testing.expectEqualSlices(i64, serial_ids.items, par_ids.items);
     try std.testing.expectEqualSlices(i64, serial_run.items, par_run.items);
+    try std.testing.expectEqualSlices(i64, serial_ids.items, switched_ids.items);
+    try std.testing.expectEqualSlices(i64, serial_run.items, switched_run.items);
 }
 
 // ---------------------------------------------------------------------------

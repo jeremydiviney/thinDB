@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
+const parallel = @import("../util/parallel.zig");
 const Column = types.Column;
 const Type = types.Type;
 const Value = types.Value;
@@ -859,7 +860,7 @@ pub const Window = struct {
         n_tiles: usize = 0,
         n_units: usize = 0,
         mode: Mode = .prepare,
-        gen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        epoch: parallel.WorkEpoch = .{},
         unit_cursor: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         units_done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -869,25 +870,10 @@ pub const Window = struct {
         const Mode = enum { prepare, write };
 
         fn worker(pd: *ParDrain) void {
-            var seen: usize = 0;
+            var seen: u32 = 0;
             while (true) {
-                var spins: usize = 0;
-                while (pd.gen.load(.acquire) == seen) {
-                    if (pd.stop.load(.acquire)) return;
-                    spins += 1;
-                    if (spins < 2048) {
-                        std.atomic.spinLoopHint();
-                    } else if (spins < 4096) {
-                        std.Thread.yield() catch std.atomic.spinLoopHint();
-                    } else {
-                        // Long producer gaps (a nested blocking op below):
-                        // stop burning the core. The conn thread always
-                        // participates, so a late wake only means this
-                        // worker claims fewer units.
-                        sleepBriefly();
-                    }
-                }
-                seen = pd.gen.load(.acquire);
+                seen = pd.epoch.waitPast(seen);
+                if (pd.stop.load(.acquire)) return;
                 _ = pd.parked.fetchSub(1, .acq_rel);
                 pd.runUnits();
                 _ = pd.parked.fetchAdd(1, .acq_rel);
@@ -941,7 +927,7 @@ pub const Window = struct {
             pd.n_units = n_units;
             pd.unit_cursor.store(0, .release);
             pd.units_done.store(0, .release);
-            _ = pd.gen.fetchAdd(1, .release);
+            pd.epoch.publish();
             pd.runUnits();
             var spins: usize = 0;
             while (pd.units_done.load(.acquire) < n_units or
@@ -953,23 +939,14 @@ pub const Window = struct {
         }
     };
 
-    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
-
-    fn sleepBriefly() void {
-        switch (builtin.os.tag) {
-            .windows => Sleep(1),
-            .linux => {
-                const ts = [2]isize{ 0, std.time.ns_per_ms };
-                _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
-            },
-            else => std.Thread.yield() catch std.atomic.spinLoopHint(),
-        }
-    }
-
     /// Most drain-copy threads worth spawning: memcpy saturates memory
     /// bandwidth well below core count, and each thread only helps while
     /// there are unclaimed columns.
     const max_drain_workers: usize = 7;
+
+    /// Input rows before the drain spawns its copy helpers: below this the
+    /// serial copy finishes sooner than the helpers start and join.
+    const drain_fan_out_rows: usize = 32768;
 
     fn drainAndEvaluate(self: *Window) !void {
         // Drain upstream into accumulated. With dop > 1 the per-batch column
@@ -1018,19 +995,10 @@ pub const Window = struct {
         var workers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
         var n_workers: usize = 0;
         var max_tiles: usize = 1;
-        if (self.dop > 1 and ncols >= 2 and !builtin.is_test) {
-            const want = @min(@min(self.dop - 1, ncols - 1), max_drain_workers);
-            while (n_workers < want) {
-                workers[n_workers] = std.Thread.spawn(.{}, ParDrain.worker, .{&pd}) catch break;
-                n_workers += 1;
-            }
-            pd.parked.store(n_workers, .release);
-            max_tiles = (n_workers + 1) * 2;
-            pd.preps = try self.allocator.alloc(transform.PreparedAppend, ncols);
-            pd.bounds = try self.allocator.alloc(usize, max_tiles + 1);
-        }
+        var may_fan_out = self.dop > 1 and ncols >= 2 and !builtin.is_test;
         defer {
             pd.stop.store(true, .release);
+            pd.epoch.publish();
             for (workers[0..n_workers]) |maybe| if (maybe) |t| t.join();
             if (pd.preps.len > 0) self.allocator.free(pd.preps);
             if (pd.bounds.len > 0) self.allocator.free(pd.bounds);
@@ -1052,6 +1020,18 @@ pub const Window = struct {
             const b = batch.row_count * row_bytes;
             if (acc) |a| try a.reserve(.window, b);
             self.reserved_bytes += b;
+            if (may_fan_out and self.accumulated_rows + batch.row_count >= drain_fan_out_rows) {
+                may_fan_out = false;
+                const want = @min(@min(self.dop - 1, ncols - 1), max_drain_workers);
+                while (n_workers < want) {
+                    workers[n_workers] = std.Thread.spawn(.{}, ParDrain.worker, .{&pd}) catch break;
+                    n_workers += 1;
+                }
+                pd.parked.store(n_workers, .release);
+                max_tiles = (n_workers + 1) * 2;
+                pd.preps = try self.allocator.alloc(transform.PreparedAppend, ncols);
+                pd.bounds = try self.allocator.alloc(usize, max_tiles + 1);
+            }
             if (n_workers > 0) {
                 pd.batch = batch;
                 pd.runPhase(.prepare, owned.len, n_workers);

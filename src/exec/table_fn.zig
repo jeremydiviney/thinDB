@@ -41,6 +41,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
+const parallel = @import("../util/parallel.zig");
 const Column = types.Column;
 const Value = types.Value;
 
@@ -70,6 +71,10 @@ const Predicate = predicate.Predicate;
 /// Test hook: std.testing.allocator is single-threaded, so tests run the
 /// serial path unless they opt in with a thread-safe allocator of their own.
 pub var force_parallel_in_tests: bool = false;
+
+/// Test hook: input rows before a forced-parallel drain fans out, so a test
+/// can start it serial and switch mid-drain.
+pub var drain_fan_out_rows_in_tests: usize = 0;
 
 pub const TableFnExec = struct {
     allocator: Allocator,
@@ -600,21 +605,13 @@ pub const TableFnExec = struct {
         var max_tiles: usize = 1;
         defer {
             dp.stop.store(true, .release);
+            dp.epoch.publish();
             for (dworkers[0..n_dworkers]) |maybe| if (maybe) |t| t.join();
             if (dp.preps.len > 0) self.allocator.free(dp.preps);
             if (dp.bounds.len > 0) self.allocator.free(dp.bounds);
         }
-        if (self.dop > 1 and owned.len >= 2 and (!builtin.is_test or force_parallel_in_tests)) {
-            const want = @min(@min(self.dop - 1, owned.len - 1), max_drain_workers);
-            while (n_dworkers < want) {
-                dworkers[n_dworkers] = std.Thread.spawn(.{}, DrainPar.worker, .{&dp}) catch break;
-                n_dworkers += 1;
-            }
-            dp.parked.store(n_dworkers, .release);
-            max_tiles = (n_dworkers + 1) * 2;
-            dp.preps = try self.allocator.alloc(transform.PreparedAppend, n_cols);
-            dp.bounds = try self.allocator.alloc(usize, max_tiles + 1);
-        }
+        var may_fan_out = self.dop > 1 and owned.len >= 2 and (!builtin.is_test or force_parallel_in_tests);
+        const fan_out_rows: usize = if (force_parallel_in_tests) drain_fan_out_rows_in_tests else drain_fan_out_rows;
         const conv_views = try self.allocator.alloc(ColumnView, self.upstream.outputSchema().len);
         defer self.allocator.free(conv_views);
         const converts = self.conversions[0].assigned.len > 0;
@@ -622,6 +619,18 @@ pub const TableFnExec = struct {
         while (try self.upstream.next()) |pulled| {
             const batch = try self.convertBatch(0, pulled, conv_views);
             defer if (converts) self.releaseConverted(0, conv_views);
+            if (may_fan_out and accumulated + batch.row_count >= fan_out_rows) {
+                may_fan_out = false;
+                const want = @min(@min(self.dop - 1, owned.len - 1), max_drain_workers);
+                while (n_dworkers < want) {
+                    dworkers[n_dworkers] = std.Thread.spawn(.{}, DrainPar.worker, .{&dp}) catch break;
+                    n_dworkers += 1;
+                }
+                dp.parked.store(n_dworkers, .release);
+                max_tiles = (n_dworkers + 1) * 2;
+                dp.preps = try self.allocator.alloc(transform.PreparedAppend, n_cols);
+                dp.bounds = try self.allocator.alloc(usize, max_tiles + 1);
+            }
             if (n_dworkers > 0) {
                 dp.batch = batch;
                 dp.runPhase(.prepare, owned.len, n_dworkers);
@@ -1521,18 +1530,9 @@ pub const TableFnExec = struct {
     /// there are unclaimed columns.
     const max_drain_workers: usize = 7;
 
-    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
-
-    fn sleepBriefly() void {
-        switch (builtin.os.tag) {
-            .windows => Sleep(1),
-            .linux => {
-                const ts = [2]isize{ 0, std.time.ns_per_ms };
-                _ = std.os.linux.syscall2(.nanosleep, @intFromPtr(&ts), 0);
-            },
-            else => std.Thread.yield() catch std.atomic.spinLoopHint(),
-        }
-    }
+    /// Input rows before the drain spawns its copy helpers: below this the
+    /// serial copy finishes sooner than the helpers start and join.
+    const drain_fan_out_rows: usize = 32768;
 
     /// Two-phase parallel per-batch input copy — the window fused-drain
     /// protocol (#108) adapted to the TVF input drain. Each batch runs two
@@ -1557,7 +1557,7 @@ pub const TableFnExec = struct {
         n_tiles: usize = 0,
         n_units: usize = 0,
         mode: Mode = .prepare,
-        gen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        epoch: parallel.WorkEpoch = .{},
         unit_cursor: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         units_done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -1567,21 +1567,10 @@ pub const TableFnExec = struct {
         const Mode = enum { prepare, write };
 
         fn worker(dp: *DrainPar) void {
-            var seen: usize = 0;
+            var seen: u32 = 0;
             while (true) {
-                var spins: usize = 0;
-                while (dp.gen.load(.acquire) == seen) {
-                    if (dp.stop.load(.acquire)) return;
-                    spins += 1;
-                    if (spins < 2048) {
-                        std.atomic.spinLoopHint();
-                    } else if (spins < 4096) {
-                        std.Thread.yield() catch std.atomic.spinLoopHint();
-                    } else {
-                        sleepBriefly();
-                    }
-                }
-                seen = dp.gen.load(.acquire);
+                seen = dp.epoch.waitPast(seen);
+                if (dp.stop.load(.acquire)) return;
                 _ = dp.parked.fetchSub(1, .acq_rel);
                 dp.runUnits();
                 _ = dp.parked.fetchAdd(1, .acq_rel);
@@ -1634,7 +1623,7 @@ pub const TableFnExec = struct {
             dp.n_units = n_units;
             dp.unit_cursor.store(0, .release);
             dp.units_done.store(0, .release);
-            _ = dp.gen.fetchAdd(1, .release);
+            dp.epoch.publish();
             dp.runUnits();
             var spins: usize = 0;
             while (dp.units_done.load(.acquire) < n_units or
