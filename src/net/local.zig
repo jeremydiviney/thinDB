@@ -1466,6 +1466,13 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
     const t_push_join_filters = exec.prof.nowTicks();
     try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_join_filters", @intCast(exec.prof.nowTicks() - t_push_join_filters));
+    // Aggregate-through-cross-join: group each side of a pure cross join
+    // before the product when the aggregates read one side and ignore
+    // duplicates. Runs after the join filters land on their sides, which
+    // leaves a filtered spine's cross join directly under its GROUP BY.
+    const t_push_cross_aggs = exec.prof.nowTicks();
+    try predicate_pushdown.pushAggregatesThroughCrossJoins(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
+    exec.prof.addPhase("compile.push_cross_aggregates", @intCast(exec.prof.nowTicks() - t_push_cross_aggs));
     // Compute-through-union: split a Compute over UNION ALL into per-arm
     // computes so stage-backed arms parallelise the evaluation (terminal
     // compute push); the union'd operator itself has nothing to fuse into.
