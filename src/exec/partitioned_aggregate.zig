@@ -45,6 +45,7 @@ const storage = @import("../storage/storage.zig");
 const aggregate = @import("aggregate.zig");
 const ir = @import("../ir/ir.zig");
 const hll = @import("../util/hll.zig");
+const parallel = @import("../util/parallel.zig");
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -535,23 +536,21 @@ pub const PartitionedAggregate = struct {
         batch: Batch = undefined,
         slices: usize = 0,
         mode: Mode = .scatter,
-        gen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        epoch: parallel.WorkEpoch = .{},
         done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         const Mode = enum { scatter, absorb, aggregate };
 
+        /// Between phases a worker parks: while the conn thread pulls a
+        /// slow upstream, spinning or yielding here kept every worker's core
+        /// busy for the whole statement.
         fn workerMain(pool: *Pool, worker_idx: usize) void {
-            var seen: usize = 0;
+            var seen: u32 = 0;
             while (true) {
-                var spins: usize = 0;
-                while (pool.gen.load(.acquire) == seen) {
-                    if (pool.stop.load(.acquire)) return;
-                    spins += 1;
-                    if (spins < 4096) std.atomic.spinLoopHint() else std.Thread.yield() catch std.atomic.spinLoopHint();
-                }
-                seen = pool.gen.load(.acquire);
+                seen = pool.epoch.waitPast(seen);
+                if (pool.stop.load(.acquire)) return;
                 _ = pool.parked.fetchSub(1, .acq_rel);
                 pool.runPhase(worker_idx);
                 _ = pool.done.fetchAdd(1, .acq_rel);
@@ -574,7 +573,7 @@ pub const PartitionedAggregate = struct {
             const self = pool.owner;
             pool.mode = mode;
             pool.done.store(0, .release);
-            _ = pool.gen.fetchAdd(1, .release);
+            pool.epoch.publish();
             pool.runPhase(0);
             const want = self.n_parts - 1;
             var spins: usize = 0;
@@ -874,6 +873,7 @@ pub const PartitionedAggregate = struct {
         }
         defer {
             pool.stop.store(true, .release);
+            pool.epoch.publish();
             for (threads[1..self.n_parts]) |maybe| if (maybe) |th| th.join();
         }
         // Spawn failures degrade by folding every unit into the conn

@@ -143,6 +143,9 @@ test {
     _ = @import("net/xa_exec.zig");
     _ = @import("net/const_fold.zig");
     _ = @import("net/prune_columns.zig");
+    _ = @import("net/predicate_pushdown.zig");
+    _ = @import("net/partition_keys.zig");
+    _ = @import("net/sock_opts.zig");
     _ = @import("exec/affine_agg.zig");
     _ = @import("exec/mat_stage.zig");
     _ = @import("exec/table_fn.zig");
