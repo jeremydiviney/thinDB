@@ -1911,6 +1911,27 @@ test "keyed region: an unsupported UNION ALL branch leaves the CTE both branches
     , "rn");
 }
 
+test "keyed region: a join side recomputing the region's own input keeps its values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup_with_dop(allocator, std.testing.io, tmp.dir, 4);
+    defer db.close();
+    const body =
+        \\base AS (
+        \\ SELECT id, custLC, month, amount, ROW_NUMBER() OVER (PARTITION BY custLC ORDER BY month, id) AS rn FROM inv
+        \\), recalc AS (
+        \\ SELECT custLC, month, rn, SUM(amount) OVER (PARTITION BY custLC ORDER BY month, id ROWS UNBOUNDED PRECEDING) AS total
+        \\ FROM base
+        \\), merged AS (
+        \\ SELECT b.id, b.custLC, b.month, b.amount, b.rn, r.total FROM base b
+        \\ LEFT JOIN recalc r ON r.custLC = b.custLC AND r.rn = b.rn
+        \\)
+        \\SELECT * FROM merged ORDER BY custLC, month, id
+    ;
+    try expect_keyed_matches(allocator, db, body, "total");
+}
+
 test "keyed region: constant-empty SQL branches retain ordinary pruning and later regions" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
