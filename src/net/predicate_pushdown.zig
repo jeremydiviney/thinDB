@@ -12,6 +12,10 @@
 //! parallelise the evaluation via the terminal compute push where the union'd
 //! operator cannot.
 //!
+//! And rewrites `GroupBy(A × M)` whose aggregates read A alone and ignore
+//! duplicates into a product of per-side aggregates (see
+//! `pushAggregatesThroughCrossJoins`).
+//!
 //! This is a plan rewrite (allowed — see DESIGN.md "no RUNTIME optimization"),
 //! run once after subquery resolution and before any handler compiles the tree,
 //! so every execution path (generic, silo, staged-CTE, …) benefits uniformly.
@@ -36,6 +40,7 @@ const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
 const PredicateExpr = @import("../exec/predicate.zig").PredicateExpr;
+const expr_mod = @import("../exec/expr.zig");
 const local = @import("local.zig");
 const api = @import("../api/api.zig");
 
@@ -43,6 +48,9 @@ const Ctx = struct {
     arena: Allocator,
     catalog: ?*api.Catalog,
     session: api.Session,
+    /// A star projection lists its whole upstream rather than leaving the
+    /// node opaque: a superset of its columns, for passes that tolerate one.
+    expand_stars: bool = false,
 };
 
 var trace_push: bool = false;
@@ -279,7 +287,10 @@ fn collectColumns(ctx: Ctx, op: *const ir.Op, out: *std.ArrayListUnmanaged([]con
         .filter => |f| return collectColumns(ctx, f.upstream, out),
         .select => |p| {
             for (p.columns, 0..) |nm, i| {
-                if (isStar(nm)) return false; // can't enumerate without the upstream schema
+                if (isStar(nm)) {
+                    if (!ctx.expand_stars or !try collectColumns(ctx, p.upstream, out)) return false;
+                    continue;
+                }
                 const out_name = if (p.outputs) |o| (if (i < o.len) (o[i] orelse nm) else nm) else nm;
                 try out.append(ctx.arena, suffix(out_name));
             }
@@ -546,6 +557,221 @@ fn trySplitComputeOverUnion(
     // A nested union inside an arm splits further.
     try trySplitComputeOverUnion(ctx, lc, mat_refs);
     try trySplitComputeOverUnion(ctx, rc, mat_refs);
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate push through a cross join
+// ---------------------------------------------------------------------------
+
+/// Rewrite `GroupBy{KA ∪ KM}(A × M)` → `Project(GroupBy{KA}(A) × GroupBy{KM}(M))`
+/// when every aggregate reads A alone and ignores duplicate inputs (MIN, MAX,
+/// ANY_VALUE, COUNT(DISTINCT), …). Group (ka, km) of the product holds group
+/// ka's A rows once per M row keyed km: the same values repeated, so such an
+/// aggregate equals its value over group ka of A, and the group exists exactly
+/// when ka occurs in A and km in M. The product then joins |A| + |M|
+/// aggregated rows rather than aggregating |A|·|M| — the month-spine shape
+/// that fans each entity out over a calendar only to collapse it again.
+///
+/// Guards:
+///   - A pure cross join: no keys, ranges or predicates.
+///   - Both key sets non-empty: an empty KA would turn the product's
+///     zero groups over an empty A into a global aggregate's one row.
+///   - Every key, aggregate input and derived reference classifies to one
+///     side: its suffix is in that side's column set and not the other's.
+///     A star projection lists its whole upstream here — a superset, which
+///     only ever leaves a name unclassified or unresolvable on both sides.
+///   - A Compute between the join and the aggregate (computed keys or
+///     aggregate inputs) splits per side, each derived column reading one.
+///   - A star-free Project above the aggregate reads its output by name,
+///     through nothing but name-reading nodes. The Project the rewrite adds
+///     names a key as a SELECT does, bare (`e.k` outputs `k`), where the
+///     aggregate keeps its input's name (`e.k`), and the aggregate's names
+///     and column order are the result when nothing above re-projects them.
+/// The added Project restores the aggregate's output columns in order and
+/// drops the hidden count the key-only side carries.
+pub fn pushAggregatesThroughCrossJoins(arena: Allocator, catalog: ?*api.Catalog, session: api.Session, op: *ir.Op) anyerror!void {
+    trace_push = getenv("THINDB_TRACE_PUSHDOWN") != null;
+    const ctx = Ctx{ .arena = arena, .catalog = catalog, .session = session, .expand_stars = true };
+    var visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty;
+    try walkCrossAggregates(ctx, op, &visited, false);
+}
+
+/// `projected`: a star-free Project above `op` reads its output by name.
+fn walkCrossAggregates(ctx: Ctx, op: *ir.Op, visited: *std.AutoHashMapUnmanaged(*const ir.Op, void), projected: bool) anyerror!void {
+    switch (op.*) {
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .admin => {},
+        .delete_op => |d| if (d.source) |s| try walkCrossAggregates(ctx, s, visited, false),
+        .update_op => |u| if (u.source) |s| try walkCrossAggregates(ctx, s, visited, false),
+        .select => |p| {
+            const named = for (p.columns) |c| {
+                if (isStar(c)) break false;
+            } else true;
+            try walkCrossAggregates(ctx, @constCast(p.upstream), visited, named);
+        },
+        .limit => |l| try walkCrossAggregates(ctx, @constCast(l.upstream), visited, projected),
+        .order_by => |o| try walkCrossAggregates(ctx, @constCast(o.upstream), visited, projected),
+        .compute => |c| try walkCrossAggregates(ctx, @constCast(c.upstream), visited, projected),
+        .window => |w| try walkCrossAggregates(ctx, @constCast(w.upstream), visited, projected),
+        .filter => |f| try walkCrossAggregates(ctx, @constCast(f.upstream), visited, projected),
+        .exclude => |p| try walkCrossAggregates(ctx, @constCast(p.upstream), visited, false),
+        .table_fn => |t| for (t.inputs) |inp| try walkCrossAggregates(ctx, inp, visited, false),
+        .alias => |a| try walkCrossAggregates(ctx, @constCast(a.upstream), visited, false),
+        .explain => |e| try walkCrossAggregates(ctx, e.inner, visited, false),
+        .create_table_as => |c| try walkCrossAggregates(ctx, @constCast(c.source), visited, false),
+        .insert_select => |i| try walkCrossAggregates(ctx, @constCast(i.source), visited, false),
+        .batch => |b| for (b.statements) |s| try walkCrossAggregates(ctx, @constCast(s), visited, false),
+        .materialize => |m| {
+            // A recursive CTE's arms belong to its iteration driver.
+            if (m.recursion != null) return;
+            const gop = try visited.getOrPut(ctx.arena, op);
+            if (!gop.found_existing) try walkCrossAggregates(ctx, @constCast(m.upstream), visited, false);
+        },
+        .set_union => |u| {
+            try walkCrossAggregates(ctx, @constCast(u.left), visited, false);
+            try walkCrossAggregates(ctx, @constCast(u.right), visited, false);
+        },
+        .join => |j| {
+            try walkCrossAggregates(ctx, @constCast(j.left), visited, false);
+            try walkCrossAggregates(ctx, @constCast(j.right), visited, false);
+        },
+        .group_by => |g| {
+            try walkCrossAggregates(ctx, @constCast(g.upstream), visited, false);
+            if (projected) try trySplitAggregateOverCrossJoin(ctx, op);
+        },
+    }
+}
+
+const ColumnSets = [2]std.ArrayListUnmanaged([]const u8);
+
+fn trySplitAggregateOverCrossJoin(ctx: Ctx, op: *ir.Op) anyerror!void {
+    const g = op.group_by;
+    if (g.group_cols.len == 0 or g.top_k != null or g.emit_limit != null) return;
+    for (g.aggs) |a| if (!ignoresDuplicates(a)) return;
+    var join_op = g.upstream;
+    const pre: []const ir.Derived = if (join_op.* == .compute) blk: {
+        const derived = join_op.compute.derived;
+        join_op = join_op.compute.upstream;
+        break :blk derived;
+    } else &.{};
+    if (join_op.* != .join) return;
+    const j = join_op.join;
+    if (j.join_type != .inner or j.on.len != 0 or j.ranges.len != 0 or j.extra_predicate != null or j.residual != null) return;
+
+    var sides: ColumnSets = .{ .empty, .empty };
+    if (!(collectColumns(ctx, j.left, &sides[0]) catch false)) return;
+    if (!(collectColumns(ctx, j.right, &sides[1]) catch false)) return;
+
+    var side_derived: [2]std.ArrayListUnmanaged(ir.Derived) = .{ .empty, .empty };
+    for (pre) |d| {
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (!try collectExprRefs(ctx.arena, d.expr, &refs)) return;
+        var side: ?usize = null;
+        for (refs.items) |name| {
+            const s = sideOf(&sides, name) orelse return;
+            if (side != null and side.? != s) return;
+            side = s;
+        }
+        // A constant column has no side of its own to follow.
+        const s = side orelse return;
+        if (contains(sides[1 - s].items, suffix(d.name))) return;
+        try side_derived[s].append(ctx.arena, d);
+        try sides[s].append(ctx.arena, suffix(d.name));
+    }
+
+    var agg_side: ?usize = null;
+    for (g.aggs) |a| {
+        for ([_]?[]const u8{ a.col, a.arg2_col }) |maybe_name| {
+            const name = maybe_name orelse continue;
+            const s = sideOf(&sides, name) orelse return;
+            if (agg_side != null and agg_side.? != s) return;
+            agg_side = s;
+        }
+    }
+    const a_side = agg_side orelse return;
+
+    var keys: [2]std.ArrayListUnmanaged([]const u8) = .{ .empty, .empty };
+    for (g.group_cols) |name| {
+        const s = sideOf(&sides, name) orelse return;
+        try keys[s].append(ctx.arena, name);
+    }
+    if (keys[0].items.len == 0 or keys[1].items.len == 0) return;
+    if (trace_push) std.debug.print("[ppd]   group by {d}+{d} keys split over cross join, {d} aggregates on the {s} side\n", .{
+        keys[0].items.len, keys[1].items.len, g.aggs.len, if (a_side == 0) "left" else "right",
+    });
+
+    const inputs = [2]*ir.Op{ j.left, j.right };
+    var grouped: [2]*ir.Op = undefined;
+    for (&grouped, inputs, side_derived, keys, 0..) |*dst, input, derived, side_keys, s| {
+        var upstream = input;
+        if (derived.items.len > 0) {
+            upstream = try ctx.arena.create(ir.Op);
+            upstream.* = .{ .compute = .{ .derived = derived.items, .upstream = input } };
+        }
+        dst.* = try ctx.arena.create(ir.Op);
+        dst.*.* = .{ .group_by = .{
+            .group_cols = side_keys.items,
+            .aggs = if (s == a_side) g.aggs else &key_only_aggs,
+            .upstream = upstream,
+        } };
+    }
+    const product = try ctx.arena.create(ir.Op);
+    product.* = join_op.*;
+    product.join.left = grouped[0];
+    product.join.right = grouped[1];
+
+    const columns = try ctx.arena.alloc([]const u8, g.group_cols.len + g.aggs.len);
+    @memcpy(columns[0..g.group_cols.len], g.group_cols);
+    for (columns[g.group_cols.len..], g.aggs) |*dst, a| dst.* = a.as;
+    op.* = .{ .select = .{ .columns = columns, .upstream = product } };
+    // A chain of cross joins splits one product at a time.
+    try trySplitAggregateOverCrossJoin(ctx, grouped[a_side]);
+}
+
+/// A grouped core needs one aggregate; the key-only side's count is dropped
+/// by the Project above the product.
+const key_only_aggs = [_]ir.AggSpec{.{ .func = .count, .as = "__cross_key_rows" }};
+
+/// The side whose column set alone holds `name`'s suffix.
+fn sideOf(sides: *const ColumnSets, name: []const u8) ?usize {
+    const s = suffix(name);
+    const in_left = contains(sides[0].items, s);
+    const in_right = contains(sides[1].items, s);
+    if (in_left == in_right) return null;
+    return if (in_left) 0 else 1;
+}
+
+/// An aggregate whose value over a bag equals its value over the bag's
+/// distinct rows: repeating every input row leaves it unchanged.
+fn ignoresDuplicates(a: ir.AggSpec) bool {
+    if (a.col == null or a.udf_arg_cols.len != 0) return false;
+    return switch (a.func) {
+        .min, .max, .any_value, .bool_and, .bool_or, .bit_and, .bit_or, .unsigned_bit_and, .unsigned_bit_or, .max_by, .max_by_key, .count_distinct, .sum_distinct, .avg_distinct => true,
+        .count, .sum, .avg, .count_if, .first, .last, .bit_xor, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile, .group_concat, .udf => false,
+    };
+}
+
+/// Append every column `e` reads. Returns false for a subquery or session
+/// variable, whose reads no side owns.
+fn collectExprRefs(arena: Allocator, e: ir.Expr, out: *std.ArrayListUnmanaged([]const u8)) !bool {
+    switch (e) {
+        .col_ref => |name| try out.append(arena, name),
+        .lit, .null_lit => {},
+        .call => |c| for (c.args) |arg| {
+            if (!try collectExprRefs(arena, arg, out)) return false;
+        },
+        .case => |c| {
+            for (c.operands) |o| {
+                if (!try collectExprRefs(arena, o.expr, out)) return false;
+            }
+            for (c.branches) |b| {
+                try expr_mod.collectCaseConditionRefs(arena, out, c, b.cond);
+                if (!try collectExprRefs(arena, b.then, out)) return false;
+            }
+            if (c.else_branch) |eb| return collectExprRefs(arena, eb.*, out);
+        },
+        .scalar_subquery, .exists_subquery, .var_ref => return false,
+    }
+    return true;
 }
 
 const testing = std.testing;
@@ -829,4 +1055,162 @@ test "predicate pushdown: nullable-side predicate never crosses an outer join" {
     try testing.expect(op == .filter);
     try testing.expect(op.filter.upstream.* == .join);
     try testing.expect(op.filter.upstream.join.right.* == .select);
+}
+
+fn testCrossGroupBy(keys: []const []const u8, aggs: []const ir.AggSpec, upstream: *ir.Op) ir.Op {
+    return .{ .group_by = .{ .group_cols = keys, .aggs = aggs, .upstream = upstream } };
+}
+
+test "cross aggregate push: duplicate-insensitive aggregates group each side before the product" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var right = testSelect(&.{"r.c"}, &dummy);
+    var join = testJoin(.inner, &left, &right);
+    const aggs = [_]ir.AggSpec{
+        .{ .func = .max, .col = "l.b", .as = "mb" },
+        .{ .func = .count_distinct, .col = "l.b", .as = "nb" },
+    };
+    var op = testCrossGroupBy(&.{ "l.a", "r.c" }, &aggs, &join);
+    var top = testSelect(&.{ "nb", "l.a", "r.c", "mb" }, &op);
+
+    try pushAggregatesThroughCrossJoins(a, null, .{}, &top);
+
+    try testing.expect(op == .select);
+    const cols = op.select.columns;
+    try testing.expectEqual(@as(usize, 4), cols.len);
+    inline for (.{ "l.a", "r.c", "mb", "nb" }, 0..) |want, i| try testing.expectEqualStrings(want, cols[i]);
+    const product = op.select.upstream.join;
+    try testing.expect(product.left.* == .group_by and product.right.* == .group_by);
+    try testing.expectEqualStrings("l.a", product.left.group_by.group_cols[0]);
+    try testing.expectEqual(@as(usize, 2), product.left.group_by.aggs.len);
+    try testing.expectEqualStrings("r.c", product.right.group_by.group_cols[0]);
+    try testing.expect(product.left.group_by.upstream == &left);
+    try testing.expect(product.right.group_by.upstream == &right);
+}
+
+test "cross aggregate push: a pre-aggregate compute splits onto the sides it reads" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var right = testSelect(&.{"r.c"}, &dummy);
+    var join = testJoin(.inner, &left, &right);
+    const lower_args = [_]ir.Expr{.{ .col_ref = "l.a" }};
+    const next_args = [_]ir.Expr{ .{ .col_ref = "r.c" }, .{ .col_ref = "r.c" } };
+    const derived = [_]ir.Derived{
+        .{ .name = "la", .expr = .{ .call = .{ .fn_name = "lower", .args = &lower_args } } },
+        .{ .name = "cc", .expr = .{ .call = .{ .fn_name = "add", .args = &next_args } } },
+    };
+    var pre = ir.Op{ .compute = .{ .derived = &derived, .upstream = &join } };
+    const aggs = [_]ir.AggSpec{.{ .func = .min, .col = "l.b", .as = "lo" }};
+    var op = testCrossGroupBy(&.{ "la", "cc" }, &aggs, &pre);
+    const post_args = [_]ir.Expr{ .{ .col_ref = "lo" }, .{ .col_ref = "cc" } };
+    const post = [_]ir.Derived{.{ .name = "shifted", .expr = .{ .call = .{ .fn_name = "add", .args = &post_args } } }};
+    var above = ir.Op{ .compute = .{ .derived = &post, .upstream = &op } };
+    var top = testSelect(&.{ "la", "shifted" }, &above);
+
+    try pushAggregatesThroughCrossJoins(a, null, .{}, &top);
+
+    try testing.expect(op == .select);
+    const product = op.select.upstream.join;
+    const left_compute = product.left.group_by.upstream.compute;
+    const right_compute = product.right.group_by.upstream.compute;
+    try testing.expectEqualStrings("la", left_compute.derived[0].name);
+    try testing.expectEqualStrings("cc", right_compute.derived[0].name);
+    try testing.expect(left_compute.upstream == &left);
+    try testing.expect(right_compute.upstream == &right);
+}
+
+test "cross aggregate push: shapes the product changes stay as written" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var right = testSelect(&.{ "r.c", "r.d" }, &dummy);
+    var cross = testJoin(.inner, &left, &right);
+    var keyed = testJoin(.inner, &left, &right);
+    keyed.join.on = &.{.{ .left = "l.a", .right = "r.c" }};
+    var outer = testJoin(.left, &left, &right);
+
+    const max_b = [_]ir.AggSpec{.{ .func = .max, .col = "l.b", .as = "x" }};
+    const sum_b = [_]ir.AggSpec{.{ .func = .sum, .col = "l.b", .as = "x" }};
+    const count_rows = [_]ir.AggSpec{.{ .func = .count, .as = "x" }};
+    const both_sides = [_]ir.AggSpec{ .{ .func = .max, .col = "l.b", .as = "x" }, .{ .func = .max, .col = "r.d", .as = "y" } };
+    const cases = [_]struct { keys: []const []const u8, aggs: []const ir.AggSpec, join: *ir.Op }{
+        .{ .keys = &.{ "l.a", "r.c" }, .aggs = &sum_b, .join = &cross },
+        .{ .keys = &.{ "l.a", "r.c" }, .aggs = &count_rows, .join = &cross },
+        .{ .keys = &.{ "l.a", "r.c" }, .aggs = &both_sides, .join = &cross },
+        .{ .keys = &.{"l.a"}, .aggs = &max_b, .join = &cross },
+        .{ .keys = &.{ "l.a", "r.c" }, .aggs = &max_b, .join = &keyed },
+        .{ .keys = &.{ "l.a", "r.c" }, .aggs = &max_b, .join = &outer },
+        .{ .keys = &.{ "l.a", "zz" }, .aggs = &max_b, .join = &cross },
+    };
+    for (cases) |c| {
+        var op = testCrossGroupBy(c.keys, c.aggs, c.join);
+        var top = testSelect(&.{"x"}, &op);
+        try pushAggregatesThroughCrossJoins(a, null, .{}, &top);
+        try testing.expect(op == .group_by);
+        try testing.expect(op.group_by.upstream == c.join);
+    }
+}
+
+test "cross aggregate push: an aggregate whose own names reach the result stays as written" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var left = testSelect(&.{ "l.a", "l.b" }, &dummy);
+    var right = testSelect(&.{"r.c"}, &dummy);
+    var join = testJoin(.inner, &left, &right);
+    const aggs = [_]ir.AggSpec{.{ .func = .max, .col = "l.b", .as = "mb" }};
+
+    var bare = testCrossGroupBy(&.{ "l.a", "r.c" }, &aggs, &join);
+    try pushAggregatesThroughCrossJoins(a, null, .{}, &bare);
+    try testing.expect(bare == .group_by);
+
+    var starred = testCrossGroupBy(&.{ "l.a", "r.c" }, &aggs, &join);
+    var star = testSelect(&.{"*"}, &starred);
+    try pushAggregatesThroughCrossJoins(a, null, .{}, &star);
+    try testing.expect(starred == .group_by);
+
+    var aliased = testCrossGroupBy(&.{ "l.a", "r.c" }, &aggs, &join);
+    var derived_table = ir.Op{ .alias = .{ .alias = "g", .upstream = &aliased } };
+    var outer = testSelect(&.{ "g.mb", "g.a" }, &derived_table);
+    try pushAggregatesThroughCrossJoins(a, null, .{}, &outer);
+    try testing.expect(aliased == .group_by);
+}
+
+test "cross aggregate push: a chain of cross joins splits at every product" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var dummy: ir.Op = .single_row;
+    var x = testSelect(&.{ "x.a", "x.v" }, &dummy);
+    var y = testSelect(&.{"y.b"}, &dummy);
+    var z = testSelect(&.{"z.c"}, &dummy);
+    var inner = testJoin(.inner, &x, &y);
+    var outer = testJoin(.inner, &inner, &z);
+    const aggs = [_]ir.AggSpec{.{ .func = .max, .col = "x.v", .as = "mv" }};
+    var op = testCrossGroupBy(&.{ "x.a", "y.b", "z.c" }, &aggs, &outer);
+    var top = testSelect(&.{ "mv", "x.a", "y.b", "z.c" }, &op);
+
+    try pushAggregatesThroughCrossJoins(a, null, .{}, &top);
+
+    try testing.expect(op == .select);
+    const left = op.select.upstream.join.left;
+    try testing.expect(left.* == .select);
+    const inner_product = left.select.upstream.join;
+    try testing.expect(inner_product.left.group_by.upstream == &x);
+    try testing.expect(inner_product.right.group_by.upstream == &y);
+    try testing.expect(op.select.upstream.join.right.group_by.upstream == &z);
 }

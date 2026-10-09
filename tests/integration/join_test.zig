@@ -2893,6 +2893,94 @@ test "join: COUNT(*) over a nested-loop join that outputs no columns counts ever
     }
 }
 
+/// Every row as its cells joined by `|` (NULL spelled out), rows joined by
+/// newlines, after a header of the output column names.
+fn crossRowsText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]u8 {
+    const helpers = @import("sql_helpers.zig");
+    var q = try helpers.runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (q.outputSchema()) |col| try out.print(allocator, "{s}:{s} ", .{ col.name, @tagName(col.type) });
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            try out.append(allocator, '\n');
+            for (batch.values, 0..) |col, c| {
+                if (c > 0) try out.append(allocator, '|');
+                if (!col.isValid(row)) {
+                    try out.appendSlice(allocator, "NULL");
+                    continue;
+                }
+                switch (col.data) {
+                    .string, .varchar, .char => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
+                    inline .tinyint, .smallint, .int, .bigint, .largeint, .date => |s| try out.print(allocator, "{d}", .{s[row]}),
+                    .double => |s| try out.print(allocator, "{d:.3}", .{s[row]}),
+                    else => return error.TestUnexpectedType,
+                }
+            }
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "join: GROUP BY over a cross join groups each side first and keeps every group's values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE ent (id BIGINT PRIMARY KEY, grp VARCHAR(10), name VARCHAR(10), d DATE, v BIGINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ent VALUES (1, 'A', 'x', '2024-01-15', 5), (2, 'a', 'x', '2024-03-01', 7),
+        \\  (3, 'B', 'y', '2023-11-30', NULL), (4, NULL, 'z', '2024-02-29', 3), (5, NULL, 'z', '2024-05-31', 3)
+    );
+    // The spine repeats a value and holds a NULL: the key-only side groups.
+    try helpers.exec(allocator, db, "CREATE TABLE spine (n BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO spine VALUES (1), (2), (2), (3), (NULL), (0)");
+
+    // Each statement's `{s}` takes either nothing or a conjunct reading both
+    // sides that holds for every row: it keeps the product whole beneath the
+    // GROUP BY, the plan the rewrite replaces. The last statement's SELECT
+    // list is the GROUP BY's own output, which keeps its plan and names.
+    const cases = .{
+        .{ "SELECT LOWER(e.grp) AS k, s.n, MAX(e.v) AS mx, MIN(e.d) AS lo, ANY_VALUE(e.name) AS nm, COUNT(DISTINCT e.v) AS nv, MAX(e.v) + s.n AS bumped " ++
+            "FROM ent e CROSS JOIN spine s WHERE s.n > 0 {s} GROUP BY LOWER(e.grp), s.n ORDER BY k, s.n", 9, true },
+        .{ "SELECT e.grp AS g, s.n AS step, MAX(e.v) AS mx, MAX_BY(e.name, e.d) AS latest FROM ent e CROSS JOIN spine s WHERE e.id > 0 {s} GROUP BY e.grp, s.n ORDER BY g, step", 20, true },
+        .{ "SELECT s.n, e.id, MAX(s.n * 10) AS t FROM ent e CROSS JOIN spine s WHERE e.v > 4 {s} GROUP BY e.id, s.n ORDER BY e.id, s.n", 10, true },
+        .{ "SELECT s.n, e.grp, MIN(e.v) AS lo FROM ent e CROSS JOIN spine s WHERE s.n > 100 {s} GROUP BY e.grp, s.n", 0, true },
+        .{ "SELECT s.n, e.grp, MIN(e.v) AS lo FROM ent e CROSS JOIN spine s WHERE e.v > 100 {s} GROUP BY e.grp, s.n", 0, true },
+        .{ "SELECT e.grp, s.n, MAX(e.v) AS mx FROM ent e CROSS JOIN spine s WHERE s.n > 0 {s} GROUP BY e.grp, s.n ORDER BY e.grp, s.n", 12, false },
+    };
+    inline for (cases) |c| {
+        const sql = comptime std.fmt.comptimePrint(c[0], .{""});
+        const rewritten = try crossRowsText(allocator, db, sql);
+        defer allocator.free(rewritten);
+        const product = try crossRowsText(allocator, db, comptime std.fmt.comptimePrint(c[0], .{"AND (e.id > 0 OR s.n IS NULL)"}));
+        defer allocator.free(product);
+        try std.testing.expectEqualStrings(product, rewritten);
+        try std.testing.expectEqual(@as(usize, c[1]), std.mem.count(u8, rewritten, "\n"));
+        try std.testing.expectEqual(c[2], try groupsBeforeProduct(allocator, db, sql));
+    }
+}
+
+/// Whether the plan of `sql` aggregates below its nested-loop join.
+fn groupsBeforeProduct(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !bool {
+    const helpers = @import("sql_helpers.zig");
+    const explain = try std.mem.concat(allocator, u8, &.{ "EXPLAIN ", sql });
+    defer allocator.free(explain);
+    const lines = try helpers.collectStrings(allocator, db, explain);
+    defer helpers.freeStrings(allocator, lines);
+    var in_join = false;
+    for (lines) |maybe_line| {
+        const line = maybe_line orelse continue;
+        if (std.mem.indexOf(u8, line, "NestedLoopJoin") != null) in_join = true;
+        if (in_join and (std.mem.indexOf(u8, line, "Aggregate") != null or std.mem.indexOf(u8, line, "GroupBy") != null)) return true;
+    }
+    return false;
+}
+
 test "join: parenthesized ON conditions join like the bare conjuncts" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
