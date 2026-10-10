@@ -3869,15 +3869,29 @@ test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
     );
     defer q.deinit();
 
-    // NOT MATERIALIZED waives the materialization fence (PG semantics: the
-    // planner may fold/optimize freely). The structural CSE spots the
-    // byte-identical bodies and shares ONE stage between the join branches —
-    // same results, half the buffering of a per-reference copy.
-    try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
+    // A thin body is cheaper rescanned per reference than buffered: each
+    // join branch inlines its own copy, so nothing stages.
+    try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
 
     var rows: usize = 0;
     while (try q.next()) |b| rows += b.row_count;
     try std.testing.expectEqual(@as(usize, 5), rows);
+
+    // NOT MATERIALIZED waives the materialization fence (PG semantics: the
+    // planner may fold/optimize freely). For a body worth buffering, the
+    // structural CSE spots the byte-identical expansions and shares ONE stage
+    // between the join branches — same results, half the buffering of a
+    // per-reference copy.
+    var grouped = try runSql(allocator, db,
+        \\WITH big AS NOT MATERIALIZED (SELECT DISTINCT k FROM t WHERE k >= 200)
+        \\SELECT big.k FROM big JOIN big AS other ON big.k = other.k
+    );
+    defer grouped.deinit();
+    try std.testing.expectEqual(@as(u32, 1), grouped.cq.ctx.materialized.count() + grouped.cq.ctx.stage_count);
+
+    var grouped_rows: usize = 0;
+    while (try grouped.next()) |b| grouped_rows += b.row_count;
+    try std.testing.expectEqual(@as(usize, 2), grouped_rows);
 }
 
 test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)" {
@@ -3894,7 +3908,7 @@ test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)"
     // in a Materialize node, and compile should produce exactly ONE
     // buffer with two Readers sharing it.
     var q = try runSql(allocator, db,
-        \\WITH big AS (SELECT k FROM t WHERE k >= 200)
+        \\WITH big AS (SELECT DISTINCT k FROM t WHERE k >= 200)
         \\SELECT big.k FROM big JOIN big AS other ON big.k = other.k
     );
     defer q.deinit();
@@ -3903,7 +3917,50 @@ test "sql: auto-materialize wraps a CTE referenced twice (single shared buffer)"
 
     var rows: usize = 0;
     while (try q.next()) |b| rows += b.row_count;
-    try std.testing.expectEqual(@as(usize, 5), rows);
+    try std.testing.expectEqual(@as(usize, 2), rows);
+}
+
+test "sql: a thin CTE referenced twice gives each reference its own copy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    // Each reference filters differently; a shared buffer would hold the
+    // union of what both need, a per-reference copy only its own rows.
+    const sql =
+        \\WITH c AS (SELECT id, k, qty * 2 AS q2 FROM t WHERE qty >= 20)
+        \\SELECT a.id * 100 + b.id AS v FROM c a JOIN c b ON a.k = b.k
+        \\WHERE a.q2 >= 60 AND b.id < 5 ORDER BY v
+    ;
+    {
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
+    }
+    const unshared = try helpers.collectBigints(allocator, db, sql);
+    defer allocator.free(unshared);
+    try std.testing.expectEqualSlices(i64, &.{ 303, 304, 403, 404 }, unshared);
+
+    const buffered = try helpers.collectBigints(allocator, db,
+        \\WITH c AS MATERIALIZED (SELECT id, k, qty * 2 AS q2 FROM t WHERE qty >= 20)
+        \\SELECT a.id * 100 + b.id AS v FROM c a JOIN c b ON a.k = b.k
+        \\WHERE a.q2 >= 60 AND b.id < 5 ORDER BY v
+    );
+    defer allocator.free(buffered);
+    try std.testing.expectEqualSlices(i64, unshared, buffered);
+
+    // A body whose values differ per evaluation keeps one buffer, so every
+    // reference reads the same rows.
+    var volatile_q = try runSql(allocator, db,
+        \\WITH c AS (SELECT id, RAND() AS r FROM t)
+        \\SELECT COUNT(*) AS n FROM c a JOIN c b ON a.id = b.id WHERE a.r = b.r
+    );
+    defer volatile_q.deinit();
+    try std.testing.expectEqual(@as(u32, 1), volatile_q.cq.ctx.materialized.count() + volatile_q.cq.ctx.stage_count);
 }
 
 test "sql: a CTE whose consumers need different columns keeps every consumer's columns" {
@@ -3925,11 +3982,29 @@ test "sql: a CTE whose consumers need different columns keeps every consumer's c
             \\SELECT src.w * 1000 + agg.s AS v FROM src LEFT JOIN agg ON src.k = agg.k
         );
         defer q.deinit();
-        // src stays one shared stage for both consumers.
+        // A thin src gives each consumer its own copy.
+        try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
+    }
+    const unshared = try helpers.collectBigints(allocator, db,
+        \\WITH src AS (SELECT k, a, b, w FROM r),
+        \\agg AS (SELECT k, SUM(a) AS s, SUM(a + b) AS unused FROM src GROUP BY k)
+        \\SELECT src.w * 1000 + agg.s AS v FROM src LEFT JOIN agg ON src.k = agg.k ORDER BY v
+    );
+    defer allocator.free(unshared);
+    try std.testing.expectEqualSlices(i64, &.{ 1030, 2030, 3005 }, unshared);
+
+    {
+        var q = try runSql(allocator, db,
+            \\WITH src AS (SELECT k, a, b, w FROM r LIMIT 1000),
+            \\agg AS (SELECT k, SUM(a) AS s, SUM(a + b) AS unused FROM src GROUP BY k)
+            \\SELECT src.w * 1000 + agg.s AS v FROM src LEFT JOIN agg ON src.k = agg.k
+        );
+        defer q.deinit();
+        // A src worth buffering stays one shared stage for both consumers.
         try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
     }
     const shared = try helpers.collectBigints(allocator, db,
-        \\WITH src AS (SELECT k, a, b, w FROM r),
+        \\WITH src AS (SELECT k, a, b, w FROM r LIMIT 1000),
         \\agg AS (SELECT k, SUM(a) AS s, SUM(a + b) AS unused FROM src GROUP BY k)
         \\SELECT src.w * 1000 + agg.s AS v FROM src LEFT JOIN agg ON src.k = agg.k ORDER BY v
     );

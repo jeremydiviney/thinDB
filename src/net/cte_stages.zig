@@ -34,6 +34,7 @@ const types = @import("../types.zig");
 const join_mod = @import("../exec/join.zig");
 const cast = @import("../exec/cast.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
+const compute = @import("../exec/compute.zig");
 const udf = @import("../udf.zig");
 const recursive_cte = @import("recursive_cte.zig");
 
@@ -3138,4 +3139,147 @@ fn bodyFormsBarrier(op: *const ir.Op) bool {
             else => return false,
         }
     }
+}
+
+/// Pre-execution rewrite: every reference to a shared thin CTE gets its own
+/// copy of the body. A thin body re-reads a base table through repeatable
+/// row-at-a-time steps, so recomputing it per reference costs one scan,
+/// where sharing it costs that scan plus a buffer of every row any reader
+/// might want. Each copy compiles inline under its own reader, whose filters
+/// and projections then reach the scan. Runs before predicate pushdown.
+pub fn unshareThinCtes(allocator: Allocator, node_arena: Allocator, root: *ir.Op, registry: ?*const udf.UdfRegistry) Allocator.Error!void {
+    var refs: std.AutoHashMapUnmanaged(*const ir.Op, u32) = .empty;
+    defer refs.deinit(allocator);
+    try countReferences(allocator, root, &refs);
+    var visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty;
+    defer visited.deinit(allocator);
+    try unshareChildren(allocator, node_arena, root, &refs, &visited, registry);
+}
+
+/// Parent edges per `.materialize` node, each shared body walked once — the
+/// count the staged compiler's own reference count arrives at.
+fn countReferences(allocator: Allocator, op: *const ir.Op, refs: *std.AutoHashMapUnmanaged(*const ir.Op, u32)) Allocator.Error!void {
+    if (op.* == .materialize) {
+        const gop = try refs.getOrPut(allocator, op);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+            return;
+        }
+        gop.value_ptr.* = 1;
+    }
+    switch (op.*) {
+        inline else => |payload| {
+            const Payload = @TypeOf(payload);
+            if (@typeInfo(Payload) != .@"struct") return;
+            inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                const child = @field(payload, field.name);
+                if (field.type == *ir.Op) {
+                    try countReferences(allocator, child, refs);
+                } else if (field.type == ?*ir.Op) {
+                    if (child) |c| try countReferences(allocator, c, refs);
+                } else if (field.type == []const *ir.Op) {
+                    for (child) |c| try countReferences(allocator, c, refs);
+                }
+            }
+        },
+    }
+}
+
+fn unshareChildren(
+    allocator: Allocator,
+    node_arena: Allocator,
+    op: *ir.Op,
+    refs: *const std.AutoHashMapUnmanaged(*const ir.Op, u32),
+    visited: *std.AutoHashMapUnmanaged(*const ir.Op, void),
+    registry: ?*const udf.UdfRegistry,
+) Allocator.Error!void {
+    if (op.* == .materialize) {
+        const gop = try visited.getOrPut(allocator, op);
+        if (gop.found_existing) return;
+    }
+    switch (op.*) {
+        inline else => |*payload| {
+            const Payload = @TypeOf(payload.*);
+            if (@typeInfo(Payload) != .@"struct") return;
+            inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                const child = &@field(payload.*, field.name);
+                if (field.type == *ir.Op) {
+                    child.* = try unshareEdge(allocator, node_arena, child.*, refs, visited, registry);
+                } else if (field.type == ?*ir.Op) {
+                    if (child.*) |c| child.* = try unshareEdge(allocator, node_arena, c, refs, visited, registry);
+                } else if (field.type == []const *ir.Op) {
+                    const ops = try node_arena.dupe(*ir.Op, child.*);
+                    for (ops) |*c| c.* = try unshareEdge(allocator, node_arena, c.*, refs, visited, registry);
+                    child.* = ops;
+                }
+            }
+        },
+    }
+}
+
+/// The node this edge should reach: a private copy when it reaches a shared
+/// thin CTE, otherwise the node itself, its own edges rewritten.
+fn unshareEdge(
+    allocator: Allocator,
+    node_arena: Allocator,
+    target: *ir.Op,
+    refs: *const std.AutoHashMapUnmanaged(*const ir.Op, u32),
+    visited: *std.AutoHashMapUnmanaged(*const ir.Op, void),
+    registry: ?*const udf.UdfRegistry,
+) Allocator.Error!*ir.Op {
+    if (target.* == .materialize and unshareable(target, refs, registry)) {
+        const copy = try node_arena.create(ir.Op);
+        copy.* = target.*;
+        copy.materialize.upstream = try target.materialize.upstream.cloneTree(node_arena);
+        copy.materialize.structural_cse = false;
+        return copy;
+    }
+    try unshareChildren(allocator, node_arena, target, refs, visited, registry);
+    return target;
+}
+
+/// A thin body the staged compiler would otherwise buffer once: a shared CTE,
+/// or a boundary structural CSE would merge with an identical one.
+/// Explicitly materialized, recursive and KEYED BY bodies keep their buffer:
+/// the user asked for it, or an iteration or region reads it.
+fn unshareable(node: *const ir.Op, refs: *const std.AutoHashMapUnmanaged(*const ir.Op, u32), registry: ?*const udf.UdfRegistry) bool {
+    const m = node.materialize;
+    if (m.forced or m.recursion != null or m.region_keys != null) return false;
+    if (!m.structural_cse and (refs.get(node) orelse 1) < 2) return false;
+    return isThinBody(m.upstream, registry);
+}
+
+/// A base-table scan under nothing but projections, renames, filters and
+/// computes that give every evaluation the same value.
+fn isThinBody(op: *const ir.Op, registry: ?*const udf.UdfRegistry) bool {
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .scan => return true,
+            .select, .exclude => |p| cur = p.upstream,
+            .alias => |a| cur = a.upstream,
+            .filter => |f| {
+                if (!predicateRepeatable(f.predicate)) return false;
+                cur = f.upstream;
+            },
+            .compute => |c| {
+                for (c.derived) |d| if (compute.mayVary(d.expr, registry)) return false;
+                cur = c.upstream;
+            },
+            else => return false,
+        }
+    }
+}
+
+/// Subquery forms resolve to constant sets before this pass; one still
+/// standing would run once per copy.
+fn predicateRepeatable(p: PredicateExpr) bool {
+    return switch (p) {
+        .scalar_subquery, .exists_subquery, .in_subquery => false,
+        .@"and", .@"or" => |children| for (children) |child| {
+            if (!predicateRepeatable(child)) break false;
+        } else true,
+        .not => |child| predicateRepeatable(child.*),
+        else => true,
+    };
 }

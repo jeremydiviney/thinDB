@@ -1463,6 +1463,9 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
     // so the source is narrowed before the join runs. Pure plan rewrite shared
     // by every handler. Runs on resolved predicates (concrete leaves).
     if (ctx.cancel_flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
+    // Shared thin CTEs split per reference first, so each reader's filters
+    // can reach its own copy's scan.
+    try cte_stages.unshareThinCtes(allocator, ctx.nodeArena(), @constCast(root), ctx.udf_registry);
     const t_push_join_filters = exec.prof.nowTicks();
     try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_join_filters", @intCast(exec.prof.nowTicks() - t_push_join_filters));
