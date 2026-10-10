@@ -275,7 +275,7 @@ fn contains_keys(keys: []const []const u8, cols: []const []const u8) bool {
 // anchor IR subtree (post-fold, so folded dates/constants are captured). A
 // hit revalidates everything the program BAKED at recognize time — broadcast
 // and proof tables via a data-version fingerprint, kernel identity via
-// process pointers — then rebuilds only the scans against a fresh snapshot
+// registration ids — then rebuilds only the scans against a fresh snapshot
 // and reuses the compiled Program plus its RegionPool, so exchange buckets,
 // shard buffers, and op stores keep their capacities across queries.
 // ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ fn contains_keys(keys: []const []const u8, cols: []const []const u8) bool {
 const Unhashable = error.RegionUnhashable;
 
 const TableVersion = struct { name: []const u8, version: u64 };
-const KernelCheck = struct { name: []const u8, process: udf_mod.TvfProcess };
+const KernelCheck = struct { name: []const u8, registration: u64 };
 const DeclaredBoundary = struct { hash: u64, depth: usize };
 const BoundaryHint = struct { shape_hash: u64, depth: usize, used: u64 };
 const RejectedFusion = struct { hash: u64, used: u64 };
@@ -899,7 +899,7 @@ fn cacheValid(input: engine_v2.CompileInput, ctx: *Ctx) bool {
     const registry = input.udf_registry orelse return false;
     for (ctx.kernels.items) |k| {
         const e = registry.tableByName(k.name) orelse return false;
-        if (e.process != k.process) return false;
+        if (e.registration != k.registration) return false;
     }
     for (ctx.versions.items) |v| {
         const now = tableVersionOf(input, v.name) orelse return false;
@@ -5077,7 +5077,7 @@ fn recordKernel(b: *Builder, ent: *const udf_mod.TableEntry) !void {
     for (b.ctx.kernels.items) |k| {
         if (std.ascii.eqlIgnoreCase(k.name, ent.name)) return;
     }
-    try b.ctx.kernels.append(b.a, .{ .name = try b.a.dupe(u8, ent.name), .process = ent.process });
+    try b.ctx.kernels.append(b.a, .{ .name = try b.a.dupe(u8, ent.name), .registration = ent.registration });
 }
 
 // ---------------------------------------------------------------------------
