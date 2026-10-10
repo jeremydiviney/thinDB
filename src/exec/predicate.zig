@@ -1468,13 +1468,14 @@ pub fn evaluatePredicate(
                 @memset(out, true);
                 return;
             }
+            if (children.len > IN_SET_LINEAR_MAX) return evaluateWideJunction(allocator, .@"and", children, schema, batch, out);
             try evaluatePredicate(allocator, children[0], schema, batch, out);
             if (children.len == 1) return;
             const scratch = try allocator.alloc(bool, out.len);
             defer allocator.free(scratch);
             for (children[1..]) |child| {
                 try evaluatePredicate(allocator, child, schema, batch, scratch);
-                for (out, scratch) |*o, s| o.* = o.* and s;
+                simd.combineMaskInto(.@"and", out, scratch);
             }
         },
         .@"or" => |children| {
@@ -1482,14 +1483,14 @@ pub fn evaluatePredicate(
                 @memset(out, false);
                 return;
             }
-            if (try evaluateEqDisjunction(allocator, children, schema, batch, out)) return;
+            if (children.len > IN_SET_LINEAR_MAX) return evaluateWideJunction(allocator, .@"or", children, schema, batch, out);
             try evaluatePredicate(allocator, children[0], schema, batch, out);
             if (children.len == 1) return;
             const scratch = try allocator.alloc(bool, out.len);
             defer allocator.free(scratch);
             for (children[1..]) |child| {
                 try evaluatePredicate(allocator, child, schema, batch, scratch);
-                for (out, scratch) |*o, s| o.* = o.* or s;
+                simd.combineMaskInto(.@"or", out, scratch);
             }
         },
         .not => |child| {
@@ -1566,13 +1567,14 @@ pub fn evaluateExprGuided(
                 @memset(out, true);
                 return;
             }
+            if (children.len > IN_SET_LINEAR_MAX) return evaluateWideJunctionGuided(allocator, .@"and", children, schema, batch, out, active);
             try evaluateExprGuided(allocator, children[0], schema, batch, out, active);
             if (children.len == 1) return;
             const scratch = try allocator.alloc(bool, out.len);
             defer allocator.free(scratch);
             for (children[1..]) |child| {
                 try evaluateExprGuided(allocator, child, schema, batch, scratch, out);
-                for (out, scratch) |*o, s| o.* = o.* and s;
+                simd.combineMaskInto(.@"and", out, scratch);
             }
         },
         .@"or" => |children| {
@@ -1580,7 +1582,7 @@ pub fn evaluateExprGuided(
                 @memset(out, false);
                 return;
             }
-            if (try evaluateEqDisjunction(allocator, children, schema, batch, out)) return;
+            if (children.len > IN_SET_LINEAR_MAX) return evaluateWideJunctionGuided(allocator, .@"or", children, schema, batch, out, active);
             try evaluateExprGuided(allocator, children[0], schema, batch, out, active);
             if (children.len == 1) return;
             const scratch = try allocator.alloc(bool, out.len);
@@ -1593,11 +1595,9 @@ pub fn evaluateExprGuided(
             const still_open = try allocator.alloc(bool, out.len);
             defer allocator.free(still_open);
             for (children[1..]) |child| {
-                for (out, still_open, 0..) |o, *so, i| {
-                    so.* = (if (active) |act| act[i] else true) and !o;
-                }
+                simd.andNotMaskInto(still_open, active, out);
                 try evaluateExprGuided(allocator, child, schema, batch, scratch, still_open);
-                for (out, scratch) |*o, s| o.* = o.* or s;
+                simd.combineMaskInto(.@"or", out, scratch);
             }
         },
         .not => |child| {
@@ -2021,31 +2021,159 @@ fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
 }
 
 /// Longest IN list checked by scanning it per row.
-const IN_SET_LINEAR_MAX = 8;
+pub const IN_SET_LINEAR_MAX = 8;
 /// Fewest rows worth building a lookup set for: below this, scanning a long
 /// list per row costs about what sorting it would.
 const IN_SET_LOOKUP_MIN_ROWS = 32;
 /// Widest literal range a numeric IN-list tests through a bitmap (8 KiB).
 const IN_SET_BITMAP_SPAN = 1 << 16;
 
-/// A long `col = a OR col = b OR ...` (a literal IN list) through the set
-/// lookup of `evaluateInSetMask` rather than one pass per literal. Same
-/// answer: validation gave every literal the column's type, which is what the
-/// set compares, and a NULL row fails both. False when the lookup would not
-/// run, leaving the arms to the caller.
-fn evaluateEqDisjunction(allocator: std.mem.Allocator, arms: []const PredicateExpr, schema: []const Column, batch: anytype, out: []bool) !bool {
-    if (arms.len <= IN_SET_LINEAR_MAX or batch.row_count < IN_SET_LOOKUP_MIN_ROWS) return false;
-    const col = eqDisjunctionColumn(arms) orelse return false;
-    const view = batch.values[findCol(schema, col) orelse return Error.ColumnNotFound];
-    switch (view.data) {
-        .float, .double, .boolean => return false,
-        else => {},
+/// An AND or OR with more arms than an IN list scans linearly, which is
+/// where `foldSetArms` can fold one: the set lookups first, then each
+/// remaining arm. Out of line, leaving the recursive evaluator's few-armed
+/// junctions as small as they were.
+noinline fn evaluateWideJunction(allocator: std.mem.Allocator, comptime junction: Junction, children: []const PredicateExpr, schema: []const Column, batch: anytype, out: []bool) anyerror!void {
+    const fold = try foldSetArms(allocator, junction, children, schema, batch, out);
+    defer fold.deinit(allocator);
+    var rest = fold.rest;
+    if (!fold.folded) {
+        try evaluatePredicate(allocator, rest[0], schema, batch, out);
+        rest = rest[1..];
     }
-    const values = try allocator.alloc(Value, arms.len);
-    defer allocator.free(values);
-    for (arms, values) |arm, *v| v.* = arm.leaf.val;
-    try evaluateInSetMask(allocator, view, values, false, batch.row_count, out);
-    return true;
+    if (rest.len == 0) return;
+    const scratch = try allocator.alloc(bool, out.len);
+    defer allocator.free(scratch);
+    for (rest) |child| {
+        try evaluatePredicate(allocator, child, schema, batch, scratch);
+        simd.combineMaskInto(junction, out, scratch);
+    }
+}
+
+/// `evaluateWideJunction` for `evaluateExprGuided`, threading `active`
+/// the same way its few-armed AND and OR do.
+noinline fn evaluateWideJunctionGuided(allocator: std.mem.Allocator, comptime junction: Junction, children: []const PredicateExpr, schema: []const Column, batch: anytype, out: []bool, active: ?[]const bool) anyerror!void {
+    const fold = try foldSetArms(allocator, junction, children, schema, batch, out);
+    defer fold.deinit(allocator);
+    var rest = fold.rest;
+    if (!fold.folded) {
+        try evaluateExprGuided(allocator, rest[0], schema, batch, out, active);
+        rest = rest[1..];
+    }
+    if (rest.len == 0) return;
+    const scratch = try allocator.alloc(bool, out.len);
+    defer allocator.free(scratch);
+    switch (junction) {
+        .@"and" => for (rest) |child| {
+            try evaluateExprGuided(allocator, child, schema, batch, scratch, out);
+            simd.combineMaskInto(.@"and", out, scratch);
+        },
+        .@"or" => {
+            const still_open = try allocator.alloc(bool, out.len);
+            defer allocator.free(still_open);
+            for (rest) |child| {
+                simd.andNotMaskInto(still_open, active, out);
+                try evaluateExprGuided(allocator, child, schema, batch, scratch, still_open);
+                simd.combineMaskInto(.@"or", out, scratch);
+            }
+        },
+    }
+}
+
+/// What `foldSetArms` left of an OR's or an AND's arms.
+const SetArmFold = struct {
+    /// `out` holds the folded set lookups, ORed (OR) or ANDed (AND). False
+    /// when nothing folded, `rest` then being every arm.
+    folded: bool,
+    /// The arms still to evaluate one at a time.
+    rest: []const PredicateExpr,
+    owned: bool,
+
+    fn deinit(self: SetArmFold, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.rest);
+    }
+};
+
+pub const Junction = simd.MaskOp;
+
+/// The leaf operator a literal IN list spells under `junction`: `col IN
+/// (a, ...)` parses to an OR of `col = a`, `col NOT IN (a, ...)` to an AND
+/// of `col <> a`.
+pub fn setArmOp(comptime junction: Junction) PredicateOp {
+    return if (junction == .@"or") .eq else .neq;
+}
+
+/// An OR's `col = literal` arms (an AND's `col <> literal` arms) grouped by
+/// column, each column holding more than IN_SET_LINEAR_MAX of them matched
+/// once through the set lookup of `evaluateInSetMask` (negated under AND)
+/// rather than one pass per literal. The parser spells a literal
+/// `col [NOT] IN (a, b, ...)` as such arms, and `orderPredicate` splices it
+/// into any OR (AND) around it, so a long list costs one probe per row
+/// wherever it sits. Same answer: validation gave every literal the column's
+/// type, which is what the set compares, and a NULL row fails every arm and
+/// both set forms.
+fn foldSetArms(allocator: std.mem.Allocator, comptime junction: Junction, arms: []const PredicateExpr, schema: []const Column, batch: anytype, out: []bool) !SetArmFold {
+    const unfolded: SetArmFold = .{ .folded = false, .rest = arms, .owned = false };
+    if (arms.len <= IN_SET_LINEAR_MAX or batch.row_count < IN_SET_LOOKUP_MIN_ROWS) return unfolded;
+    const arm_cols = try allocator.alloc(?usize, arms.len);
+    defer allocator.free(arm_cols);
+    const counts = try allocator.alloc(usize, schema.len);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    var last_name: ?[]const u8 = null;
+    var last_col: ?usize = null;
+    for (arms, arm_cols) |arm, *col| {
+        col.* = null;
+        if (arm != .leaf or arm.leaf.op != setArmOp(junction) or arm.leaf.as_boolean) continue;
+        const name = arm.leaf.col;
+        // An IN list's arms share one column-name slice.
+        const same = if (last_name) |l| l.ptr == name.ptr and l.len == name.len else false;
+        if (!same) {
+            last_name = name;
+            const idx = findCol(schema, name) orelse return Error.ColumnNotFound;
+            last_col = switch (batch.values[idx].data) {
+                // Float equality (NaN, -0.0) and two-valued booleans keep their leaves.
+                .float, .double, .boolean => null,
+                else => idx,
+            };
+        }
+        col.* = last_col;
+        if (last_col) |idx| counts[idx] += 1;
+    }
+
+    const negate = junction == .@"and";
+    var folded = false;
+    var n_folded: usize = 0;
+    var values: std.ArrayListUnmanaged(Value) = .empty;
+    defer values.deinit(allocator);
+    var scratch: []bool = &.{};
+    defer if (scratch.len > 0) allocator.free(scratch);
+    for (counts, 0..) |count, idx| {
+        if (count <= IN_SET_LINEAR_MAX) continue;
+        values.clearRetainingCapacity();
+        try values.ensureTotalCapacity(allocator, count);
+        for (arms, arm_cols) |arm, col| {
+            if (col) |c| if (c == idx) values.appendAssumeCapacity(arm.leaf.val);
+        }
+        if (!folded) {
+            try evaluateInSetMask(allocator, batch.values[idx], values.items, negate, batch.row_count, out);
+        } else {
+            if (scratch.len == 0) scratch = try allocator.alloc(bool, out.len);
+            try evaluateInSetMask(allocator, batch.values[idx], values.items, negate, batch.row_count, scratch);
+            simd.combineMaskInto(junction, out, scratch);
+        }
+        folded = true;
+        n_folded += count;
+    }
+    if (!folded) return unfolded;
+
+    const rest = try allocator.alloc(PredicateExpr, arms.len - n_folded);
+    var at: usize = 0;
+    for (arms, arm_cols) |arm, col| {
+        if (col) |c| if (counts[c] > IN_SET_LINEAR_MAX) continue;
+        rest[at] = arm;
+        at += 1;
+    }
+    return .{ .folded = true, .rest = rest, .owned = true };
 }
 
 /// Per-row set-membership check. `negate=false` → IN, `true` → NOT IN.
@@ -3143,6 +3271,90 @@ test "an OR of equalities on one column matches as its arms do, NOT and all" {
     try t.expect(eqDisjunctionColumn(&mixed) == null);
     const two_columns = [_]PredicateExpr{ mixed[0], .{ .leaf = .{ .col = "score", .op = .eq, .val = .{ .double = 1 } } } };
     try t.expect(eqDisjunctionColumn(&two_columns) == null);
+}
+
+test "an OR's equality arms and an AND's inequality arms fold per column beside the rest" {
+    const t = std.testing;
+    var prng = std.Random.DefaultPrng.init(0x592);
+    const rand = prng.random();
+    const n = 200;
+    var nulls: [(n + 7) / 8]u8 = undefined;
+    rand.bytes(&nulls);
+    var ids: [n]i64 = undefined;
+    for (&ids) |*c| c.* = rand.intRangeAtMost(i64, -5, 300);
+    var scores: [n]f64 = undefined;
+    for (&scores) |*c| c.* = @floatFromInt(rand.intRangeAtMost(u8, 0, 20));
+    const words = [_][]const u8{ "", "a", "ab", "east", "west", "north", "south", "é", "x1", "x2", "x3", "x4" };
+    var offsets: [n + 1]u32 = undefined;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(t.allocator);
+    offsets[0] = 0;
+    for (1..n + 1) |i| {
+        try bytes.appendSlice(t.allocator, words[rand.uintLessThan(usize, words.len)]);
+        offsets[i] = @intCast(bytes.items.len);
+    }
+    const schema = [_]Column{
+        .{ .name = "id", .type = .bigint, .nullable = true },
+        .{ .name = "region", .type = .{ .varchar = 16 }, .nullable = true },
+        .{ .name = "score", .type = .double },
+    };
+    const views = [_]ColumnView{
+        .{ .data = .{ .bigint = &ids }, .nulls = &nulls },
+        .{ .data = .{ .varchar = .{ .offsets = &offsets, .bytes = bytes.items } }, .nulls = &nulls },
+        .{ .data = .{ .double = &scores } },
+    };
+
+    // Long lists on `id` and `region` (folded), a long list on the float
+    // `score` (kept as leaves), a short `region` list under the threshold,
+    // a range arm and a nested AND, interleaved.
+    const range_kids = [_]PredicateExpr{
+        .{ .leaf = .{ .col = "id", .op = .gt, .val = .{ .bigint = 250 } } },
+        .{ .leaf = .{ .col = "score", .op = .lt, .val = .{ .double = 3 } } },
+    };
+    for ([_]usize{ 0, 3, 9, 40 }) |id_len| {
+        for ([_]usize{ 0, 5, 12 }) |region_len| {
+            var arms: std.ArrayList(PredicateExpr) = .empty;
+            defer arms.deinit(t.allocator);
+            for (0..id_len) |_| try arms.append(t.allocator, .{ .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = rand.intRangeAtMost(i64, -10, 310) } } });
+            for (0..region_len) |_| try arms.append(t.allocator, .{ .leaf = .{ .col = "REGION", .op = .eq, .val = .{ .text = words[rand.uintLessThan(usize, words.len)] } } });
+            for (0..10) |_| try arms.append(t.allocator, .{ .leaf = .{ .col = "score", .op = .eq, .val = .{ .double = @floatFromInt(rand.intRangeAtMost(u8, 0, 25)) } } });
+            try arms.append(t.allocator, .{ .@"and" = &range_kids });
+            try arms.append(t.allocator, .{ .leaf = .{ .col = "id", .op = .lt, .val = .{ .bigint = 0 } } });
+            rand.shuffle(PredicateExpr, arms.items);
+            const any_arm: PredicateExpr = .{ .@"or" = arms.items };
+            // The NOT IN mirror: every equality as `<>`, under an AND.
+            const conjuncts = try t.allocator.dupe(PredicateExpr, arms.items);
+            defer t.allocator.free(conjuncts);
+            for (conjuncts) |*c| {
+                if (c.* == .leaf and c.leaf.op == .eq) c.leaf.op = .neq;
+            }
+            const all_of: PredicateExpr = .{ .@"and" = conjuncts };
+
+            for ([_]usize{ 31, 32, n }) |rows| {
+                const batch = .{ .values = &views, .row_count = rows };
+                var want: [n]bool = @splat(false);
+                var want_all: [n]bool = @splat(true);
+                var arm_mask: [n]bool = undefined;
+                for (arms.items) |arm| {
+                    try evaluatePredicate(t.allocator, arm, &schema, batch, arm_mask[0..rows]);
+                    for (want[0..rows], arm_mask[0..rows]) |*w, m| w.* = w.* or m;
+                }
+                for (conjuncts) |c| {
+                    try evaluatePredicate(t.allocator, c, &schema, batch, arm_mask[0..rows]);
+                    for (want_all[0..rows], arm_mask[0..rows]) |*w, m| w.* = w.* and m;
+                }
+                var got: [n]bool = undefined;
+                try evaluatePredicate(t.allocator, any_arm, &schema, batch, got[0..rows]);
+                try t.expectEqualSlices(bool, want[0..rows], got[0..rows]);
+                try evaluateExprGuided(t.allocator, any_arm, &schema, batch, got[0..rows], null);
+                try t.expectEqualSlices(bool, want[0..rows], got[0..rows]);
+                try evaluatePredicate(t.allocator, all_of, &schema, batch, got[0..rows]);
+                try t.expectEqualSlices(bool, want_all[0..rows], got[0..rows]);
+                try evaluateExprGuided(t.allocator, all_of, &schema, batch, got[0..rows], null);
+                try t.expectEqualSlices(bool, want_all[0..rows], got[0..rows]);
+            }
+        }
+    }
 }
 
 test "textNumber parses what StarRocks compares as a number" {
