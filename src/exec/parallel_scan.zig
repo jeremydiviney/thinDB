@@ -1231,10 +1231,7 @@ pub const ParallelScan = struct {
         }
         if (self.wbufs.len > 0) self.allocator.free(self.wbufs);
         if (self.emit_views.len > 0) self.allocator.free(self.emit_views);
-        if (self.probe_map_views.len > 0) {
-            for (self.probe_map_views) |s| self.allocator.free(s);
-            self.allocator.free(self.probe_map_views);
-        }
+        self.freeProbeMapViews(self.probe_map_views);
         for (self.pending_schema_qs.items) |*q| q.deinit();
         self.pending_schema_qs.deinit(self.allocator);
         for (self.pending_computes.items) |p| self.allocator.free(p.derived);
@@ -1487,23 +1484,35 @@ pub const ParallelScan = struct {
             if (trace_jf) std.debug.print("[jf]   ps decline: probe_map exceeds chunk schema ({d} cols)\n", .{self.out_schema.len});
             return false;
         }
-        if (sink.probe_map) |m| {
-            const slices = try self.allocator.alloc([]ColumnView, self.plannedChunks());
-            var built: usize = 0;
-            errdefer {
-                for (slices[0..built]) |s| self.allocator.free(s);
-                self.allocator.free(slices);
-            }
-            for (slices) |*s| {
-                s.* = try self.allocator.alloc(ColumnView, m.len);
-                built += 1;
-            }
-            self.probe_map_views = slices;
-        }
+        const map_views: [][]ColumnView = if (sink.probe_map) |m| try self.allocProbeMapViews(m.len) else &.{};
+        // The offerer declines and carries on when this fails, so a failed
+        // bind must leave the scan as it found it.
+        errdefer self.freeProbeMapViews(map_views);
         try sink.bind(sink.ctx, self.plannedChunks(), self.worker_alloc);
+        self.freeProbeMapViews(self.probe_map_views);
+        self.probe_map_views = map_views;
         self.probe_sink = sink;
         self.out_schema = sink.out_schema;
         return true;
+    }
+
+    fn allocProbeMapViews(self: *ParallelScan, width: usize) ![][]ColumnView {
+        const slices = try self.allocator.alloc([]ColumnView, self.plannedChunks());
+        var built: usize = 0;
+        errdefer {
+            for (slices[0..built]) |s| self.allocator.free(s);
+            self.allocator.free(slices);
+        }
+        for (slices) |*s| {
+            s.* = try self.allocator.alloc(ColumnView, width);
+            built += 1;
+        }
+        return slices;
+    }
+
+    fn freeProbeMapViews(self: *ParallelScan, slices: [][]ColumnView) void {
+        for (slices) |s| self.allocator.free(s);
+        if (slices.len > 0) self.allocator.free(slices);
     }
 
     pub fn probeFusionReachable(_: *const ParallelScan) bool {
