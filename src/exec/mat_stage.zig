@@ -388,9 +388,10 @@ pub const MaterializedResult = struct {
 
     /// One view per column spanning every row, presented as the schema
     /// types. Adopted results and single-chunk pull copies are contiguous
-    /// already; anything else is concatenated once into `copies`
-    /// (owned by the result's allocator, freed by the caller).
-    fn contiguousViews(self: *MaterializedResult, views: []ColumnView, copies: *[]engine.ColumnStore) !void {
+    /// already; anything else is concatenated once, on up to `threads`
+    /// workers, into `copies` (owned by the result's allocator, freed by the
+    /// caller).
+    fn contiguousViews(self: *MaterializedResult, views: []ColumnView, copies: *[]engine.ColumnStore, threads: usize) !void {
         if (self.adopted) |ad| {
             if (ad.stores.len == self.schema.len) {
                 for (ad.stores, self.schema, views) |*st, sc, *v| v.* = presentAsSchemaType(st.view(), sc.type);
@@ -408,13 +409,20 @@ pub const MaterializedResult = struct {
             st.* = try engine.ColumnStore.init(self.allocator, sc.type, sc.nullable);
             inited += 1;
         }
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var parts: std.ArrayListUnmanaged(FillPart) = .empty;
         for (self.chunks.items) |c| {
             if (c.rows == 0) continue;
-            for (stores, 0..) |*st, i| {
-                const src = if (c.views.len > 0) c.views[i] else c.cols[i].view();
-                try engine.transform.appendAllColumn(self.allocator, src, st);
-            }
+            const part_views = if (c.views.len > 0) c.views else blk: {
+                const vs = try a.alloc(ColumnView, c.cols.len);
+                for (c.cols, vs) |*col, *v| v.* = col.view();
+                break :blk vs;
+            };
+            try parts.append(a, .{ .views = part_views, .rows = c.rows });
         }
+        try fillContiguous(a, self.allocator, stores, parts.items, threads);
         for (stores, views) |*st, *v| v.* = st.view();
         copies.* = stores;
     }
@@ -519,10 +527,13 @@ pub const ColumnCast = struct {
 
 pub const MAX_STAGE_CASTS: usize = 8;
 
+const MAX_CAST_WORKERS: usize = 16;
+
 /// Evaluate `fn_name(src)` over every row of one stage column through the
-/// overload a Compute would pick, into a store owned by `allocator`. Null
-/// when the overload isn't a plain null-propagating kernel (the join then
-/// keeps its own build).
+/// overload a Compute would pick, into a store owned by `allocator`, on up
+/// to `threads` workers over 8-row-aligned row ranges. Null when the
+/// overload isn't a plain null-propagating kernel (the join then keeps its
+/// own build).
 fn castStageColumn(
     allocator: Allocator,
     aa: Allocator,
@@ -530,10 +541,63 @@ fn castStageColumn(
     src: ColumnView,
     src_type: types.Type,
     rows: usize,
+    threads: usize,
 ) !?engine.ColumnStore {
     const ov = (try exec.scalar_fn.resolve(aa, fn_name, &.{src_type})) orelse return null;
     if (ov.func.null_strategy != .propagates or ov.func.udf_kernel != null) return null;
     if (ov.func.typed_kernel == null and ov.func.kernel == null) return null;
+    const workers = @max(@as(usize, 1), @min(@min(threads, MAX_CAST_WORKERS), rows / FILL_ROWS_PER_WORKER));
+    if (workers == 1) return try castRows(allocator, ov, src_type, src, rows);
+
+    // Kernels allocate as they append, and `allocator` may be an arena, so
+    // each worker fills its own store from the thread-safe worker allocator;
+    // this thread concatenates them.
+    const CastJob = struct {
+        allocator: Allocator,
+        ov: exec.scalar_fn.ResolvedOverload,
+        src_type: types.Type,
+        src: ColumnView,
+        rows: usize,
+        out: ?engine.ColumnStore = null,
+        err: ?anyerror = null,
+        fn run(job: *@This()) void {
+            job.out = castRows(job.allocator, job.ov, job.src_type, job.src, job.rows) catch |err| {
+                job.err = err;
+                return;
+            };
+        }
+    };
+    const wa = try exec.memory.workerAllocator(exec.memory.accountantOf(allocator), std.heap.c_allocator);
+    var jobs: [MAX_CAST_WORKERS]CastJob = undefined;
+    for (jobs[0..workers], 0..) |*job, w| {
+        const lo = (w * rows / workers) & ~@as(usize, 7);
+        const hi = if (w + 1 == workers) rows else ((w + 1) * rows / workers) & ~@as(usize, 7);
+        job.* = .{ .allocator = wa, .ov = ov, .src_type = src_type, .src = engine.transform.subViewAligned(src, lo, hi - lo), .rows = hi - lo };
+    }
+    defer for (jobs[0..workers]) |*job| {
+        if (job.out) |*o| o.deinit(wa);
+    };
+    var handles: [MAX_CAST_WORKERS]?std.Thread = .{null} ** MAX_CAST_WORKERS;
+    for (1..workers) |w| handles[w] = std.Thread.spawn(.{}, CastJob.run, .{&jobs[w]}) catch null;
+    jobs[0].run();
+    for (1..workers) |w| {
+        if (handles[w]) |t| t.join() else jobs[w].run();
+    }
+    var bytes: usize = 0;
+    for (jobs[0..workers]) |*job| {
+        if (job.err) |err| return err;
+        bytes += MaterializedResult.colStrBytes(&job.out.?);
+    }
+    var out = try engine.ColumnStore.init(allocator, ov.func.return_type, true);
+    errdefer out.deinit(allocator);
+    try out.reserveTotal(allocator, rows, bytes);
+    for (jobs[0..workers]) |*job| try engine.transform.appendAllColumn(allocator, job.out.?.view(), &out);
+    return out;
+}
+
+/// `ov` over the first `rows` rows of `src`, into a store owned by
+/// `allocator`.
+fn castRows(allocator: Allocator, ov: exec.scalar_fn.ResolvedOverload, src_type: types.Type, src: ColumnView, rows: usize) !engine.ColumnStore {
     var arg = src;
     var arg_buf: ?engine.ColumnStore = null;
     defer if (arg_buf) |*b| b.deinit(allocator);
@@ -708,12 +772,6 @@ pub const ContigSink = struct {
         self.rows += batch.row_count;
     }
 
-    /// Size every store once for a fill whose totals are known up front.
-    pub fn reserve(self: *ContigSink, rows: usize, str_bytes: []const u64) !void {
-        const total: usize = @as(usize, @intCast(self.rows)) + rows;
-        for (self.stores, str_bytes) |*st, b| try st.reserveTotal(self.store_alloc, total, @intCast(b));
-    }
-
     /// Append only the picked rows — the scan-once partition router's gather.
     pub fn appendIndices(self: *ContigSink, batch: exec.Batch, indices: []const u32) !void {
         for (self.stores, 0..) |*st, ci| {
@@ -734,6 +792,87 @@ pub const ContigSink = struct {
         self.allocator.free(self.arena_backed);
     }
 };
+
+/// One batch's column views for `fillContiguous`.
+const FillPart = struct {
+    views: []const ColumnView,
+    rows: usize,
+};
+
+/// Rows below which another copy worker costs more than it saves.
+const FILL_ROWS_PER_WORKER: usize = 16 * 1024;
+
+/// Append `parts`, in order, to the empty `stores` (one per column): size
+/// each store once for the total, then copy on up to `threads` workers with
+/// positional writes, so only this thread allocates. Each worker owns an
+/// 8-row-aligned destination range, which may split a part, so no two share
+/// a validity byte. A string column that would overflow positional (u32
+/// offset) storage takes serial range appends instead.
+fn fillContiguous(scratch: Allocator, store_alloc: Allocator, stores: []engine.ColumnStore, parts: []const FillPart, threads: usize) !void {
+    const ncols = stores.len;
+    const str_bytes = try scratch.alloc(u64, ncols);
+    @memset(str_bytes, 0);
+    var total: usize = 0;
+    for (parts) |p| {
+        total += p.rows;
+        for (p.views, 0..) |v, ci| switch (v.data) {
+            .varchar, .string, .char, .json => |sv| str_bytes[ci] += sv.offsets[p.rows] - sv.offsets[0],
+            else => {},
+        };
+    }
+    if (total == 0) return;
+    for (str_bytes) |b| {
+        if (b <= std.math.maxInt(u32)) continue;
+        for (parts) |p| {
+            for (stores, p.views) |*st, v| try engine.transform.appendColumnRange(store_alloc, v, 0, p.rows, st);
+        }
+        return;
+    }
+
+    // Each (part, column) prepare below would otherwise regrow the store,
+    // and a source that emits many batches (a parallel group emit) regrew
+    // it many times: size each once for the total.
+    for (stores, str_bytes) |*st, b| try st.reserveTotal(store_alloc, total, @intCast(b));
+    const preps = try scratch.alloc(engine.transform.PreparedAppend, parts.len * ncols);
+    for (parts, 0..) |p, pi| {
+        for (0..ncols) |ci| {
+            preps[pi * ncols + ci] = try engine.transform.prepareAppend(store_alloc, p.views[ci], p.rows, &stores[ci]);
+        }
+    }
+
+    const Fill = struct {
+        parts: []const FillPart,
+        preps: []const engine.transform.PreparedAppend,
+        stores: []engine.ColumnStore,
+        ncols: usize,
+        fn run(f: *const @This(), lo: usize, hi: usize) void {
+            for (f.parts, 0..) |p, pi| {
+                const prep0 = f.preps[pi * f.ncols];
+                const base = prep0.base_row;
+                if (base >= hi) return;
+                if (base + p.rows <= lo) continue;
+                const from = @max(lo, base) - base;
+                const to = @min(hi, base + p.rows) - base;
+                for (0..f.ncols) |ci| {
+                    engine.transform.writeAppendSlice(p.views[ci], from, to, &f.stores[ci], f.preps[pi * f.ncols + ci]);
+                }
+            }
+        }
+    };
+    const fill = Fill{ .parts = parts, .preps = preps, .stores = stores, .ncols = ncols };
+    const n_workers = @max(@as(usize, 1), @min(threads, total / FILL_ROWS_PER_WORKER));
+    const cuts = try scratch.alloc(usize, n_workers + 1);
+    for (cuts[0..n_workers], 0..) |*c, w| c.* = (w * total / n_workers) & ~@as(usize, 7);
+    cuts[n_workers] = total;
+    const handles = try scratch.alloc(?std.Thread, n_workers);
+    for (handles[1..], 1..) |*h, w| {
+        h.* = std.Thread.spawn(.{}, Fill.run, .{ &fill, cuts[w], cuts[w + 1] }) catch null;
+    }
+    fill.run(cuts[0], cuts[1]);
+    for (handles[1..], 1..) |h, w| {
+        if (h) |t| t.join() else fill.run(cuts[w], cuts[w + 1]);
+    }
+}
 
 /// One materialization boundary: a compiled pipeline, run at most once, and
 /// its result's consumer accounting.
@@ -957,22 +1096,14 @@ pub const Stage = struct {
 
     /// Parallel contiguous fill over a stable-data pipeline: collect every
     /// batch's view structs (the DATA is stable until the pipeline tears
-    /// down — `Query.stableData`), size each (batch, column) destination
-    /// once, then fill disjoint batch ranges on `fill_dop` threads with
-    /// positional writes (no allocation). Worker cut points land only on
-    /// 8-row-aligned destination offsets so no two workers share a validity
-    /// byte. Falls back to the serial path when a string column would
-    /// overflow positional (u32-offset) storage.
+    /// down — `Query.stableData`), then fill on `fill_dop` threads
+    /// (`fillContiguous`).
     fn fillContigParallel(self: *Stage, contig: *ContigSink, row_bytes: usize, prof_on: bool, append_ticks: *i64) !void {
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
-        const ncols = self.schema.len;
 
-        const Collected = struct { views: []ColumnView, rows: usize };
-        var batches: std.ArrayListUnmanaged(Collected) = .empty;
-        const str_bytes = try a.alloc(u64, ncols);
-        @memset(str_bytes, 0);
+        var parts: std.ArrayListUnmanaged(FillPart) = .empty;
         var total: usize = 0;
         while (try self.query.next()) |batch| {
             if (self.accountant) |acct| {
@@ -981,97 +1112,18 @@ pub const Stage = struct {
                 self.reserved_bytes += bytes;
             }
             if (batch.row_count == 0) continue;
-            const vs = try a.alloc(ColumnView, batch.values.len);
-            @memcpy(vs, batch.values);
-            for (vs, 0..) |v, ci| switch (v.data) {
-                .varchar, .string, .char, .json => |sv| str_bytes[ci] += sv.offsets[batch.row_count] - sv.offsets[0],
-                else => {},
-            };
-            try batches.append(a, .{ .views = vs, .rows = batch.row_count });
+            try parts.append(a, .{ .views = try a.dupe(ColumnView, batch.values), .rows = batch.row_count });
             total += batch.row_count;
         }
         if (total == 0) return;
 
         const a0 = if (prof_on) exec.prof.nowTicks() else 0;
-        // Positional string writes need u32 offsets end to end; a column
-        // that would overflow falls back to the serial range appends.
-        for (str_bytes) |b| {
-            if (b > std.math.maxInt(u32)) {
-                for (batches.items) |b2| {
-                    try contig.append(.{ .schema = self.schema, .values = b2.views, .row_count = b2.rows });
-                }
-                if (prof_on) append_ticks.* += exec.prof.nowTicks() - a0;
-                return;
-            }
-        }
-
-        // Each (batch, column) prepare below would otherwise regrow the
-        // store, and a source that emits many batches (a parallel group
-        // emit) regrew it many times: size each once for the total.
-        try contig.reserve(total, str_bytes);
-        const preps = try a.alloc(engine.transform.PreparedAppend, batches.items.len * ncols);
-        for (batches.items, 0..) |b, bi| {
-            for (0..ncols) |ci| {
-                preps[bi * ncols + ci] = try engine.transform.prepareAppend(
-                    contig.store_alloc,
-                    b.views[ci],
-                    b.rows,
-                    &contig.stores[ci],
-                );
-            }
-        }
-
-        const Fill = struct {
-            batches: []const Collected,
-            preps: []const engine.transform.PreparedAppend,
-            stores: []engine.ColumnStore,
-            ncols: usize,
-            fn run(f: *const @This(), lo: usize, hi: usize) void {
-                for (f.batches[lo..hi], lo..) |b, bi| {
-                    for (0..f.ncols) |ci| {
-                        engine.transform.writeAppendSlice(b.views[ci], 0, b.rows, &f.stores[ci], f.preps[bi * f.ncols + ci]);
-                    }
-                }
-            }
-        };
-        const fill = Fill{ .batches = batches.items, .preps = preps, .stores = contig.stores, .ncols = ncols };
-
-        // Cut worker ranges only where the destination offset is 8-aligned
-        // (batch bases are cumulative row counts; preps[bi*ncols].base_row is
-        // the batch's base for every column alike).
-        const n_workers = @min(self.fill_dop, batches.items.len);
-        const cuts = try a.alloc(usize, n_workers + 1);
-        cuts[0] = 0;
-        var w: usize = 1;
-        var bi: usize = 1;
-        while (w < n_workers) : (w += 1) {
-            const target = w * total / n_workers;
-            while (bi < batches.items.len and
-                (preps[bi * ncols].base_row < target or preps[bi * ncols].base_row % 8 != 0)) : (bi += 1)
-            {}
-            cuts[w] = bi;
-        }
-        cuts[n_workers] = batches.items.len;
-
-        const threads = try a.alloc(?std.Thread, n_workers);
-        for (threads, 0..) |*t, i| {
-            if (cuts[i + 1] <= cuts[i]) {
-                t.* = null;
-                continue;
-            }
-            t.* = std.Thread.spawn(.{}, Fill.run, .{ &fill, cuts[i], cuts[i + 1] }) catch blk: {
-                fill.run(cuts[i], cuts[i + 1]);
-                break :blk null;
-            };
-        }
-        for (threads) |t| {
-            if (t) |th| th.join();
-        }
+        try fillContiguous(a, contig.store_alloc, contig.stores, parts.items, self.fill_dop);
         contig.rows = total;
         if (prof_on) {
             append_ticks.* += exec.prof.nowTicks() - a0;
-            std.debug.print("[stage-parfill] stage#{d} batches={d} rows={d} workers={d}\n", .{
-                self.id, batches.items.len, total, n_workers,
+            std.debug.print("[stage-parfill] stage#{d} batches={d} rows={d} threads={d}\n", .{
+                self.id, parts.items.len, total, self.fill_dop,
             });
         }
     }
@@ -1111,9 +1163,10 @@ pub const Stage = struct {
         const aa = arena.allocator();
         var table_arena = BlockArena.init(self.allocator);
         defer if (!kept) table_arena.deinit();
+        const threads = @max(self.fill_dop, join_mod.defaultBuildThreads());
         const views = try aa.alloc(ColumnView, res.schema.len);
         var copies: []engine.ColumnStore = &.{};
-        try res.contiguousViews(views, &copies);
+        try res.contiguousViews(views, &copies, threads);
         defer if (!kept) {
             for (copies) |*c| c.deinit(self.allocator);
             if (copies.len > 0) self.allocator.free(copies);
@@ -1128,7 +1181,7 @@ pub const Stage = struct {
         };
         for (casts, 0..) |cst, i| {
             if (cst.col >= res.schema.len) return null;
-            cast_stores[i] = (try castStageColumn(self.allocator, aa, cst.fn_name, views[cst.col], res.schema[cst.col].type, rows)) orelse return null;
+            cast_stores[i] = (try castStageColumn(self.allocator, aa, cst.fn_name, views[cst.col], res.schema[cst.col].type, rows, threads)) orelse return null;
             casts_done += 1;
         }
         var key_views: [join_mod.MAX_FAST_KEYS]ColumnView = undefined;
@@ -1143,7 +1196,7 @@ pub const Stage = struct {
         const bytes = join_mod.fastTableBytes(rows, needs_chain);
         if (self.accountant) |acct| try acct.reserve(.join_build, bytes);
         defer if (!kept) if (self.accountant) |acct| acct.release(.join_build, bytes);
-        const built = (try join_mod.buildFastTable(table_arena.allocator(), self.allocator, key_views[0..keys.len], null_safe_keys, rows, needs_chain, @max(self.fill_dop, join_mod.defaultBuildThreads()))) orelse return null;
+        const built = (try join_mod.buildFastTable(table_arena.allocator(), self.allocator, key_views[0..keys.len], null_safe_keys, rows, needs_chain, threads)) orelse return null;
         const owned_casts = try aa.alloc(ColumnCast, casts.len);
         for (casts, owned_casts) |c, *o| o.* = .{ .col = c.col, .fn_name = try aa.dupe(u8, c.fn_name) };
         const owned_keys = try aa.alloc(KeySpec, keys.len);
@@ -1862,3 +1915,102 @@ pub const StagedRoot = struct {
         try self.inner.explain(out, allocator, depth + 1);
     }
 };
+
+test "fillContiguous: parts split across workers land exactly as serial appends" {
+    const a = std.testing.allocator;
+    const schema = [_]Column{
+        .{ .name = "v", .type = .bigint, .nullable = true },
+        .{ .name = "s", .type = .string, .nullable = false },
+        .{ .name = "d", .type = .date, .nullable = true },
+    };
+    // Odd part sizes put part boundaries off the workers' 8-row cut points.
+    const sizes = [_]usize{ 5, 30_001, 3, 19_999, 13, 20_011 };
+    var part_stores: [sizes.len][schema.len]engine.ColumnStore = undefined;
+    var part_views: [sizes.len][schema.len]ColumnView = undefined;
+    var parts: [sizes.len]FillPart = undefined;
+    var built: usize = 0;
+    defer for (part_stores[0..built]) |*cols| {
+        for (cols) |*c| c.deinit(a);
+    };
+    var total: usize = 0;
+    for (sizes, 0..) |n, p| {
+        for (schema, &part_stores[p]) |sc, *c| c.* = try engine.ColumnStore.init(a, sc.type, sc.nullable);
+        built += 1;
+        var buf: [16]u8 = undefined;
+        for (0..n) |r| {
+            const g = total + r;
+            try part_stores[p][0].data.bigint.append(a, @intCast(g * 7));
+            try part_stores[p][0].appendValidBit(a, r, g % 5 != 0);
+            try part_stores[p][1].data.string.appendValue(a, try std.fmt.bufPrint(&buf, "s{d}", .{g}));
+            try part_stores[p][2].data.date.append(a, @intCast(g));
+            try part_stores[p][2].appendValidBit(a, r, g % 3 != 0);
+        }
+        total += n;
+        for (&part_stores[p], &part_views[p]) |*c, *v| v.* = c.view();
+        parts[p] = .{ .views = &part_views[p], .rows = n };
+    }
+
+    var serial: [schema.len]engine.ColumnStore = undefined;
+    var split: [schema.len]engine.ColumnStore = undefined;
+    for (schema, &serial, &split) |sc, *s, *q| {
+        s.* = try engine.ColumnStore.init(a, sc.type, sc.nullable);
+        q.* = try engine.ColumnStore.init(a, sc.type, sc.nullable);
+    }
+    defer for (&serial, &split) |*s, *q| {
+        s.deinit(a);
+        q.deinit(a);
+    };
+    for (parts) |p| {
+        for (&serial, p.views) |*s, v| try engine.transform.appendAllColumn(a, v, s);
+    }
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    try fillContiguous(scratch.allocator(), a, &split, &parts, 4);
+
+    for (&serial, &split) |*s, *q| {
+        const sv = s.view();
+        const qv = q.view();
+        try std.testing.expectEqual(total, q.rowCount());
+        for (0..total) |row| {
+            try std.testing.expectEqual(sv.isValid(row), qv.isValid(row));
+            try std.testing.expectEqual(std.math.Order.eq, engine.transform.compareViewValues(sv, row, qv, row));
+        }
+    }
+}
+
+test "castStageColumn: a cast split across workers matches one pass" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const n: usize = 70_001;
+
+    var dates = try engine.ColumnStore.init(a, .date, true);
+    defer dates.deinit(a);
+    var names = try engine.ColumnStore.init(a, .string, true);
+    defer names.deinit(a);
+    var buf: [16]u8 = undefined;
+    for (0..n) |r| {
+        try dates.data.date.append(a, @as(i32, @intCast(r)) * 3 - 40_000);
+        try dates.appendValidBit(a, r, r % 7 != 0);
+        try names.data.string.appendValue(a, try std.fmt.bufPrint(&buf, "name{d}", .{r}));
+        try names.appendValidBit(a, r, r % 11 != 0);
+    }
+
+    const cases = .{
+        .{ .fn_name = "last_day", .src = &dates, .src_type = types.Type.date },
+        .{ .fn_name = "upper", .src = &names, .src_type = types.Type.string },
+    };
+    inline for (cases) |c| {
+        var one = (try castStageColumn(a, arena.allocator(), c.fn_name, c.src.view(), c.src_type, n, 1)).?;
+        defer one.deinit(a);
+        var split = (try castStageColumn(a, arena.allocator(), c.fn_name, c.src.view(), c.src_type, n, 4)).?;
+        defer split.deinit(a);
+        const ov = one.view();
+        const sv = split.view();
+        try std.testing.expectEqual(n, split.rowCount());
+        for (0..n) |row| {
+            try std.testing.expectEqual(ov.isValid(row), sv.isValid(row));
+            if (ov.isValid(row)) try std.testing.expectEqual(std.math.Order.eq, engine.transform.compareViewValues(ov, row, sv, row));
+        }
+    }
+}
