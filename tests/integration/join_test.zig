@@ -3269,3 +3269,85 @@ test "join: a small build key set prunes the probe side without changing results
         try std.testing.expectEqualSlices(i64, case[1], got);
     }
 }
+
+test "join: a key pinned on one input filters the other input's key" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE fact (tenant INT NOT NULL, model VARCHAR(8) NOT NULL, k BIGINT NOT NULL, month DATE NOT NULL, amount BIGINT NOT NULL, PRIMARY KEY (tenant, model, k, month))");
+    try helpers.exec(allocator, db, "CREATE TABLE dim (tenant INT NOT NULL, model VARCHAR(8) NOT NULL, k BIGINT NOT NULL, since BIGINT NOT NULL, PRIMARY KEY (tenant, model, k))");
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "INSERT INTO fact VALUES ");
+    for (1..4) |tenant| for ([_][]const u8{ "x", "y" }) |model| for (1..4) |k| for ([_][]const u8{ "2026-08-01", "2026-09-01" }, 0..) |month, m| {
+        if (sql.items[sql.items.len - 1] == ')') try sql.append(allocator, ',');
+        try sql.print(allocator, "({d}, '{s}', {d}, '{s}', {d})", .{ tenant, model, k, month, tenant * 100 + k * 10 + m });
+    };
+    try helpers.exec(allocator, db, sql.items);
+    sql.clearRetainingCapacity();
+    try sql.appendSlice(allocator, "INSERT INTO dim VALUES ");
+    for (1..4) |tenant| for ([_][]const u8{ "x", "y" }) |model| for (1..5) |k| {
+        if (sql.items[sql.items.len - 1] == ')') try sql.append(allocator, ',');
+        try sql.print(allocator, "({d}, '{s}', {d}, {d})", .{ tenant, model, k, 2000 + k });
+    };
+    try helpers.exec(allocator, db, sql.items);
+
+    // Each case names the table whose scan should or shouldn't gain the
+    // other input's constant. A preserved side, a FULL join and a null-safe
+    // key never take one.
+    const cases = .{
+        .{
+            \\WITH scoped AS (SELECT tenant, model, k, month, amount FROM fact
+            \\  WHERE tenant = 2 AND model = 'x' AND month BETWEEN '2026-01-01' AND '2026-09-01' AND k <> 9),
+            \\latest AS (SELECT s.*, ROW_NUMBER() OVER (PARTITION BY tenant, model, k ORDER BY month DESC) AS rn FROM scoped s),
+            \\cur AS (SELECT * FROM latest WHERE rn = 1 AND month = '2026-09-01')
+            \\SELECT cur.k, cur.amount, SUM(s.amount) AS total, COUNT(d.k) AS dims FROM cur
+            \\LEFT JOIN scoped s ON s.tenant = cur.tenant AND s.model = cur.model AND s.k = cur.k
+            \\LEFT JOIN dim d ON d.tenant = cur.tenant AND d.model = cur.model AND d.k = cur.k
+            \\GROUP BY cur.k, cur.amount ORDER BY cur.k
+            ,
+            "\n1|211|421|2\n2|221|441|2\n3|231|461|2",
+            "dim",
+            true,
+        },
+        .{ "SELECT COUNT(*), SUM(d.since) FROM fact f JOIN dim d ON d.tenant = f.tenant AND d.k = f.k WHERE f.tenant = 3 AND f.k = 2", "\n8|16016", "dim", true },
+        .{ "SELECT COUNT(*), SUM(f.amount) FROM fact f JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k WHERE d.model = 'y' AND d.tenant = 1", "\n6|723", "fact", true },
+        .{ "SELECT COUNT(*), SUM(g.n) FROM (SELECT tenant, k, COUNT(*) AS n FROM fact WHERE tenant = 2 GROUP BY tenant, k) g JOIN dim d ON d.tenant = g.tenant AND d.k = g.k", "\n6|24", "dim", true },
+        .{ "SELECT COUNT(*), COUNT(d.k) FROM dim d RIGHT JOIN (SELECT * FROM fact WHERE tenant = 2 AND model = 'x') f ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k", "\n6|6", "dim", true },
+        .{ "SELECT COUNT(*), COUNT(f.k) FROM dim d LEFT JOIN (SELECT * FROM fact WHERE tenant = 2) f ON f.tenant = d.tenant AND f.k = d.k", "\n42|24", "dim", false },
+        .{ "SELECT COUNT(*), COUNT(d.k) FROM (SELECT * FROM dim WHERE tenant = 2) d RIGHT JOIN fact f ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k", "\n36|12", "fact", false },
+        .{ "SELECT COUNT(*), COUNT(f.k), COUNT(d.k) FROM (SELECT * FROM fact WHERE tenant = 2) f FULL JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k", "\n30|12|30", "dim", false },
+        .{ "SELECT COUNT(*) FROM (SELECT * FROM fact WHERE tenant = 2) f JOIN dim d ON d.tenant <=> f.tenant AND d.model = f.model AND d.k = f.k", "\n12", "dim", false },
+        .{ "SELECT COUNT(*), COUNT(f.k) FROM dim d LEFT JOIN fact f ON f.tenant = d.tenant AND f.model = d.model AND f.k = d.k WHERE f.tenant = 2", "\n12|12", "dim", true },
+        .{ "SELECT COUNT(*), COUNT(d.k) FROM fact f FULL JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k WHERE f.tenant = 2", "\n12|12", "dim", true },
+        .{ "SELECT COUNT(*) FROM dim d LEFT JOIN fact f ON f.tenant = d.tenant AND f.model = d.model AND f.k = d.k WHERE f.k IS NULL", "\n6", "dim", false },
+        .{ "SELECT COUNT(*), COUNT(f.k) FROM dim d LEFT JOIN fact f ON f.tenant = d.tenant AND f.model = d.model AND f.k = d.k WHERE f.tenant = 2 OR d.k = 4", "\n18|12", "dim", false },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        const text = try crossRowsText(allocator, db, c[0]);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings(c[1], text[std.mem.indexOfScalar(u8, text, '\n') orelse text.len ..]);
+        try std.testing.expectEqual(c[3], try scanFiltered(allocator, db, c[0], c[2]));
+    }
+}
+
+/// Whether the plan of `sql` filters its scan of `table`.
+fn scanFiltered(allocator: std.mem.Allocator, db: anytype, sql: []const u8, table: []const u8) !bool {
+    const helpers = @import("sql_helpers.zig");
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    const lines = try helpers.collectStrings(allocator, db, explain_sql);
+    defer helpers.freeStrings(allocator, lines);
+    const scan = try std.fmt.allocPrint(allocator, "Scan {s}", .{table});
+    defer allocator.free(scan);
+    for (lines, 0..) |line, i| {
+        if (!std.mem.startsWith(u8, std.mem.trim(u8, line orelse continue, " "), scan)) continue;
+        return i > 0 and std.mem.eql(u8, std.mem.trim(u8, lines[i - 1] orelse "", " "), "Filter");
+    }
+    return error.TestExpectedScan;
+}

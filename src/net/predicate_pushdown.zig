@@ -40,6 +40,7 @@ const Allocator = std.mem.Allocator;
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
 const PredicateExpr = @import("../exec/predicate.zig").PredicateExpr;
+const Predicate = @import("../exec/predicate.zig").Predicate;
 const expr_mod = @import("../exec/expr.zig");
 const local = @import("local.zig");
 const api = @import("../api/api.zig");
@@ -51,6 +52,8 @@ const Ctx = struct {
     /// A star projection lists its whole upstream rather than leaving the
     /// node opaque: a superset of its columns, for passes that tolerate one.
     expand_stars: bool = false,
+    /// The inputs each join had when its key constants last transferred.
+    transferred: ?*std.AutoHashMapUnmanaged(*const ir.Op, [2]*const ir.Op) = null,
 };
 
 var trace_push: bool = false;
@@ -61,7 +64,8 @@ extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// predicate slices (the compile-time node arena).
 pub fn pushJoinFilters(arena: Allocator, catalog: ?*api.Catalog, session: api.Session, op: *ir.Op) anyerror!void {
     trace_push = getenv("THINDB_TRACE_PUSHDOWN") != null;
-    const ctx = Ctx{ .arena = arena, .catalog = catalog, .session = session };
+    var transferred: std.AutoHashMapUnmanaged(*const ir.Op, [2]*const ir.Op) = .empty;
+    const ctx = Ctx{ .arena = arena, .catalog = catalog, .session = session, .transferred = &transferred };
     try walk(ctx, op);
 }
 
@@ -91,6 +95,7 @@ fn walk(ctx: Ctx, op: *ir.Op) anyerror!void {
         .join => |j| {
             try walk(ctx, @constCast(j.left));
             try walk(ctx, @constCast(j.right));
+            try transferKeyConstants(ctx, op, &.{});
         },
         .filter => |f| {
             try walk(ctx, @constCast(f.upstream));
@@ -190,6 +195,8 @@ fn rightPreserved(jt: ir.JoinType) bool {
 fn pushFilterIntoJoin(ctx: Ctx, op: *ir.Op) anyerror!void {
     const join_op = @constCast(op.filter.upstream);
     const jt = join_op.join.join_type;
+    const conjuncts = try splitConjuncts(ctx.arena, op.filter.predicate);
+    try transferKeyConstants(ctx, join_op, conjuncts);
 
     var left_cols: std.ArrayListUnmanaged([]const u8) = .empty;
     var right_cols: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -204,7 +211,6 @@ fn pushFilterIntoJoin(ctx: Ctx, op: *ir.Op) anyerror!void {
     var to_right: std.ArrayListUnmanaged(PredicateExpr) = .empty;
     var stay: std.ArrayListUnmanaged(PredicateExpr) = .empty;
 
-    const conjuncts = try splitConjuncts(ctx.arena, op.filter.predicate);
     for (conjuncts) |c| {
         const side = classify(ctx.arena, c, left_cols.items, right_cols.items, left_ok, right_ok, jt);
         if (trace_push) std.debug.print("[ppd]   conjunct tag={s} -> {s}\n", .{ @tagName(c), @tagName(side) });
@@ -227,6 +233,8 @@ fn pushFilterIntoJoin(ctx: Ctx, op: *ir.Op) anyerror!void {
         join_op.join.right = nf;
         try walk(ctx, nf);
     }
+    // The walk below this join ran before these conjuncts reached its inputs.
+    try transferKeyConstants(ctx, join_op, &.{});
 
     if (stay.items.len > 0) {
         op.* = .{ .filter = .{ .predicate = try combine(ctx.arena, stay.items), .upstream = join_op } };
@@ -396,6 +404,275 @@ fn collectPredCols(arena: Allocator, pred: PredicateExpr, out: *std.ArrayListUnm
         .scalar_subquery, .exists_subquery, .in_subquery, .correlated_set, .correlated_scalar, .correlated_range => return false,
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Join-key constant transfer
+// ---------------------------------------------------------------------------
+
+/// Copy an equality that pins one input's join key onto the other input's
+/// key: `l.k = 7` below the left input of `ON l.k = r.k` adds `r.k = 7` over
+/// the right input, which then prunes like any written filter. A row of the
+/// receiving input whose key differs could never match, so dropping it
+/// changes nothing on either side of an INNER join or on the nullable side
+/// of an outer join; a preserved side never receives one from below.
+///
+/// `above` is the filter right over the join. Every row it keeps has its
+/// pinned key, so it may give to either input under any join type: a row
+/// it would drop only ever matched rows the filter drops too, and only
+/// ever spared rows from null extension that the filter drops anyway.
+/// Null-safe keys stay out: `NULL <=> NULL` matches rows the constant would
+/// drop.
+fn transferKeyConstants(ctx: Ctx, op: *ir.Op, above: []const PredicateExpr) anyerror!void {
+    const j = &op.join;
+    const to_left_ok = j.join_type == .inner or j.join_type == .right;
+    const to_right_ok = j.join_type == .inner or j.join_type == .left;
+    // The walk revisits a shared CTE body once per reference, and a body's
+    // inputs only change by a new node on the edge: unchanged inputs hold
+    // the facts they held last time, which have already transferred.
+    const last = if (ctx.transferred) |seen| seen.get(op) else null;
+    const unchanged = if (last) |inputs| inputs[0] == j.left and inputs[1] == j.right else false;
+    const from_below = (to_left_ok or to_right_ok) and !unchanged;
+    if (!from_below and above.len == 0) return;
+
+    var to_left: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    var to_right: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    for (j.on) |pair| {
+        if (pair.null_safe) continue;
+        const l_name = visibleSource(j.left, pair.left);
+        const r_name = visibleSource(j.right, pair.right);
+        if (!from_below and !equatesColumn(above, l_name) and !equatesColumn(above, r_name)) continue;
+        const l = try keyFacts(ctx, j.left, pair.left) orelse continue;
+        const r = try keyFacts(ctx, j.right, pair.right) orelse continue;
+        if (!sameKeyType(l.col_type, r.col_type)) continue;
+        if (r.pin == null) if ((if (to_right_ok) l.pin else null) orelse try pinAbove(ctx, j, above, l_name, .left, l.col_type)) |pin| {
+            var derived = pin;
+            derived.col = r_name;
+            try to_right.append(ctx.arena, .{ .leaf = derived });
+        };
+        if (l.pin == null) if ((if (to_left_ok) r.pin else null) orelse try pinAbove(ctx, j, above, r_name, .right, r.col_type)) |pin| {
+            var derived = pin;
+            derived.col = l_name;
+            try to_left.append(ctx.arena, .{ .leaf = derived });
+        };
+    }
+    if (trace_push and to_left.items.len + to_right.items.len > 0) std.debug.print("[ppd]   key constants: to_left={d} to_right={d}\n", .{ to_left.items.len, to_right.items.len });
+    if (to_left.items.len > 0) {
+        const nf = try filterOver(ctx, j.left, to_left.items);
+        j.left = nf;
+        try walk(ctx, nf);
+    }
+    if (to_right.items.len > 0) {
+        const nf = try filterOver(ctx, j.right, to_right.items);
+        j.right = nf;
+        try walk(ctx, nf);
+    }
+    if (ctx.transferred) |seen| try seen.put(ctx.arena, op, .{ j.left, j.right });
+}
+
+/// A conjunct of `above` that pins column `name` of `j`'s `side` input.
+fn pinAbove(ctx: Ctx, j: *const ir.Op.Join, above: []const PredicateExpr, name: []const u8, side: Side, col_type: types.Type) anyerror!?Predicate {
+    const pin = pinOf(above, name, col_type) orelse return null;
+    const pin_side = try joinSideOf(ctx, j, pin.col) orelse return null;
+    return if (pin_side == side) pin else null;
+}
+
+/// What `keyFacts` proves about one column of an input.
+const KeyFacts = struct {
+    /// The base column's declared type.
+    col_type: types.Type,
+    /// A `col = literal` every row of the input satisfies, or NULL fails.
+    pin: ?Predicate,
+};
+
+/// Trace column `name` of `op` down to the table column it reads unchanged,
+/// collecting its type and any equality with a literal applied on the way.
+/// Null when the column is computed, aggregated, or can't be traced exactly.
+/// Filters, projections and renames, computes and windows (which add columns
+/// beside it), excludes, order by, limit, materialize and group-by keys pass a
+/// column through. A join passes the columns of its sides whose rows it
+/// keeps as they are: both sides of INNER, the left of LEFT, the right of
+/// RIGHT.
+fn keyFacts(ctx: Ctx, op: *const ir.Op, name: []const u8) anyerror!?KeyFacts {
+    switch (op.*) {
+        .scan => |s| {
+            if (types.splitQualifiedName(name)) |split| if (!namesQualifier(op, split.qualifier)) return null;
+            const cat = ctx.catalog orelse return null;
+            const t = local.resolveTable(cat, ctx.session, s.table) catch return null;
+            const idx = types.findColumn(t.schema.columns, name) orelse return null;
+            return .{ .col_type = t.schema.columns[idx].type, .pin = null };
+        },
+        .alias => |a| {
+            const bare = if (types.splitQualifiedName(name)) |split| blk: {
+                if (!types.columnNameEql(split.qualifier, a.alias)) return null;
+                break :blk split.bare;
+            } else name;
+            return keyFacts(ctx, a.upstream, bare);
+        },
+        .filter => |f| {
+            var facts = try keyFacts(ctx, f.upstream, name) orelse return null;
+            if (facts.pin == null) facts.pin = pinOf(try splitConjuncts(ctx.arena, f.predicate), name, facts.col_type);
+            return facts;
+        },
+        .order_by => |o| return keyFacts(ctx, o.upstream, name),
+        .limit => |l| return keyFacts(ctx, l.upstream, name),
+        .materialize => |m| return keyFacts(ctx, m.upstream, name),
+        .select => |p| {
+            var star = false;
+            for (p.columns, 0..) |nm, i| {
+                if (isStar(nm)) {
+                    star = true;
+                    continue;
+                }
+                const out_name = if (p.outputs) |o| (if (i < o.len) (o[i] orelse nm) else nm) else nm;
+                if (sameColumn(out_name, name)) return keyFacts(ctx, p.upstream, nm);
+            }
+            return if (star) keyFacts(ctx, p.upstream, name) else null;
+        },
+        .compute => |c| {
+            for (c.derived) |d| if (sameColumn(d.name, name)) {
+                return keyFacts(ctx, c.upstream, copiedColumn(c, d) orelse return null);
+            };
+            return keyFacts(ctx, c.upstream, name);
+        },
+        .window => |w| {
+            for (w.calls) |call| if (sameColumn(call.output_name, name)) return null;
+            return keyFacts(ctx, w.upstream, name);
+        },
+        .exclude => |p| {
+            for (p.columns) |nm| if (sameColumn(nm, name)) return null;
+            return keyFacts(ctx, p.upstream, name);
+        },
+        .group_by => |g| {
+            for (g.group_cols) |nm| if (sameColumn(nm, name)) return keyFacts(ctx, g.upstream, nm);
+            return null;
+        },
+        .join => |j| {
+            const side = try joinSideOf(ctx, &j, name) orelse return null;
+            const kept = switch (side) {
+                .left => j.join_type == .inner or j.join_type == .left,
+                .right => j.join_type == .inner or j.join_type == .right,
+                .stay => false,
+            };
+            if (!kept) return null;
+            return keyFacts(ctx, if (side == .left) j.left else j.right, name);
+        },
+        else => return null,
+    }
+}
+
+/// The column a derived column copies unchanged, when the compute keeps
+/// that column visible beside it: the parser's `__join_on_right_N` keys.
+fn copiedColumn(c: ir.Op.Compute, d: ir.Derived) ?[]const u8 {
+    if (d.expr != .col_ref) return null;
+    for (c.derived) |other| if (sameColumn(other.name, d.expr.col_ref)) return null;
+    return d.expr.col_ref;
+}
+
+/// A name for column `name` of `op` that a filter over `op` can sink
+/// through it with: the source of a copied key rather than the copy.
+fn visibleSource(op: *const ir.Op, name: []const u8) []const u8 {
+    if (op.* != .compute) return name;
+    for (op.compute.derived) |d| if (sameColumn(d.name, name)) return copiedColumn(op.compute, d) orelse name;
+    return name;
+}
+
+/// The input of `j` that provides column `name`: the one its qualifier names,
+/// or for a bare name the one input that has it. `.stay` when neither or both.
+fn joinSideOf(ctx: Ctx, j: *const ir.Op.Join, name: []const u8) anyerror!?Side {
+    if (types.splitQualifiedName(name)) |split| {
+        const in_l = namesQualifier(j.left, split.qualifier);
+        const in_r = namesQualifier(j.right, split.qualifier);
+        if (in_l == in_r) return null;
+        return if (in_l) .left else .right;
+    }
+    var left_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    var right_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (!try collectColumns(ctx, j.left, &left_cols) or !try collectColumns(ctx, j.right, &right_cols)) return null;
+    const in_l = contains(left_cols.items, name);
+    const in_r = contains(right_cols.items, name);
+    if (in_l == in_r) return null;
+    return if (in_l) .left else .right;
+}
+
+/// Whether `qualifier.col` names a column of `op`'s output: an alias over it
+/// or, without one, a table it scans.
+fn namesQualifier(op: *const ir.Op, qualifier: []const u8) bool {
+    return switch (op.*) {
+        .alias => |a| types.columnNameEql(a.alias, qualifier),
+        .scan => |s| types.columnNameEql(s.alias orelse s.table.name, qualifier),
+        .join => |j| namesQualifier(j.left, qualifier) or namesQualifier(j.right, qualifier),
+        .filter => |f| namesQualifier(f.upstream, qualifier),
+        .order_by => |o| namesQualifier(o.upstream, qualifier),
+        .limit => |l| namesQualifier(l.upstream, qualifier),
+        .materialize => |m| namesQualifier(m.upstream, qualifier),
+        .compute => |c| namesQualifier(c.upstream, qualifier),
+        .window => |w| namesQualifier(w.upstream, qualifier),
+        .exclude => |p| namesQualifier(p.upstream, qualifier),
+        else => false,
+    };
+}
+
+/// Two spellings of one column: equal bare names, and equal qualifiers when
+/// both have one.
+fn sameColumn(a: []const u8, b: []const u8) bool {
+    const sa = types.splitQualifiedName(a);
+    const sb = types.splitQualifiedName(b);
+    if (sa != null and sb != null and !types.columnNameEql(sa.?.qualifier, sb.?.qualifier)) return false;
+    return types.columnNameEql(suffix(a), suffix(b));
+}
+
+/// The first of `conjuncts`, or of an AND nested among them, that pins
+/// `name` to a literal its type stores exactly one way.
+fn pinOf(conjuncts: []const PredicateExpr, name: []const u8, col_type: types.Type) ?Predicate {
+    for (conjuncts) |c| {
+        if (c == .@"and") if (pinOf(c.@"and", name, col_type)) |p| return p;
+        if (c != .leaf) continue;
+        const p = c.leaf;
+        if (p.op != .eq or p.as_boolean or !sameColumn(p.col, name)) continue;
+        if (literalPinsColumn(col_type, p.val)) return p;
+    }
+    return null;
+}
+
+/// Whether a conjunct of `conjuncts`, or of an AND nested among them, is an
+/// equality on `name`.
+fn equatesColumn(conjuncts: []const PredicateExpr, name: []const u8) bool {
+    for (conjuncts) |c| switch (c) {
+        .@"and" => |kids| if (equatesColumn(kids, name)) return true,
+        .leaf => |p| if (p.op == .eq and sameColumn(p.col, name)) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Whether `col = lit` admits exactly one stored value, which an equi join
+/// matches only to that same value: integers against an integer literal,
+/// text against text, dates and datetimes against whatever they read. Float
+/// equality (NaN, -0.0), text read as a number, and the rest stay out.
+fn literalPinsColumn(col_type: types.Type, lit: types.Value) bool {
+    return switch (col_type) {
+        .tinyint, .smallint, .int, .bigint, .largeint => switch (lit) {
+            .tinyint, .smallint, .int, .bigint, .largeint => true,
+            else => false,
+        },
+        .varchar, .string, .char => lit == .text,
+        .date, .datetime => switch (lit) {
+            .text, .date, .datetime => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Key columns a pinned literal means the same thing on: the same type, or
+/// VARCHAR and STRING, which both compare their bytes. CHAR pairs only with
+/// CHAR, whose padding the other text types don't share.
+fn sameKeyType(a: types.Type, b: types.Type) bool {
+    const text_a = a == .varchar or a == .string;
+    const text_b = b == .varchar or b == .string;
+    if (text_a or text_b) return text_a and text_b;
+    return std.meta.activeTag(a) == std.meta.activeTag(b);
 }
 
 // ---------------------------------------------------------------------------
