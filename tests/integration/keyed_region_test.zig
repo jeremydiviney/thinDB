@@ -1124,6 +1124,70 @@ test "keyed region: broadcast inputs bind VARCHAR and TEXT columns to a declared
     }
 }
 
+/// Bakes the offset it was registered with into worker state on its first
+/// call — the shape of a kernel whose state derives from its own code, which
+/// a replaced function can change while loading at the same address.
+const registered_offset = struct {
+    const tdb = thindb.tdb;
+    pub const spec = tdb.TableFnSpec{ .name = "registered_offset", .execution = .either, .row_aligned = true };
+    pub const Input = struct { amount: ?i64 };
+    pub const Carry = struct { custLC: ?[]const u8, month: ?i32 };
+    pub const Output = struct { custLC: ?[]const u8, month: ?i32, shifted: ?i64 };
+    pub const Computed = struct { shifted: ?i64 };
+    pub const passthrough = .{ "custLC", "month" };
+    pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Computed)) !void {
+        const offset: *const i64 = if (ctx.worker_state.*) |state| @ptrCast(@alignCast(state)) else baked: {
+            const state = try ctx.worker_arena.create(i64);
+            state.* = @as(*const i64, @ptrCast(@alignCast(ctx.user_data.?))).*;
+            ctx.worker_state.* = state;
+            break :baked state;
+        };
+        var rows = p.iter();
+        while (rows.next()) |row| try out.row(.{ .shifted = if (row.amount) |amount| amount + offset.* else null });
+    }
+};
+
+test "keyed region: a re-registered table function never reuses the previous registration's cached state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    const body =
+        \\r AS (
+        \\ SELECT * FROM TABLE(registered_offset((
+        \\   SELECT amount, custLC, month FROM inv WHERE projectId = 100
+        \\ )) PARTITION BY custLC)
+        \\), w AS (
+        \\ SELECT custLC, month, shifted,
+        \\        LAG(shifted) OVER (PARTITION BY custLC ORDER BY month) AS prior
+        \\ FROM r
+        \\)
+        \\SELECT * FROM w ORDER BY custLC, month
+    ;
+    var descriptor = thindb.tdb.descriptorFor(registered_offset);
+    var first_offset: i64 = 1000;
+    descriptor.user_data = &first_offset;
+    try db.registerTableUdf(descriptor);
+    try expect_keyed_matches(allocator, db, body, "prior");
+    const first_mono = try runToText(allocator, db, "WITH " ++ body);
+    defer allocator.free(first_mono);
+
+    // Same process pointer, new registration: a CREATE OR REPLACE whose new
+    // library mapped where the old one was.
+    const catalog = (db.catalog orelse db.owned_catalog).?;
+    try std.testing.expect(catalog.udfs.dropTable("registered_offset"));
+    var second_offset: i64 = 2000;
+    descriptor.user_data = &second_offset;
+    try db.registerTableUdf(descriptor);
+    const mono = try runToText(allocator, db, "WITH " ++ body);
+    defer allocator.free(mono);
+    try std.testing.expect(!std.mem.eql(u8, first_mono, mono));
+    const keyed = try run_to_text(allocator, db, "WITH KEYED BY (custLC) " ++ body, "prior");
+    defer allocator.free(keyed);
+    try std.testing.expectEqualStrings(mono, keyed);
+}
+
 test "keyed region: route provenance survives replacing TVFs and aggregation in one region" {
     const allocator = std.testing.allocator;
     const tdb = thindb.tdb;
