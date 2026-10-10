@@ -22,6 +22,7 @@ const build_options = @import("build_options");
 const udf_mod = @import("../udf.zig");
 const ColumnView = storage_mod.ColumnView;
 const ColumnStore = @import("../engine/store.zig").ColumnStore;
+const RowGroupTiles = @import("rg_tiles.zig").RowGroupTiles;
 
 // Comptime master switch for the developer execution-trace profilers. False in
 // every production build (default), which makes every `PROFILING and …` gate
@@ -2067,7 +2068,7 @@ const PipeShared = struct {
     // of the survivors spinning forever waiting on a `scans_done` that the
     // failed worker never signalled.
     aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    next_scan_rg: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    scan_tiles: RowGroupTiles = .{},
     next_final_local_bucket: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     total_scan_rgs: usize = 0,
     local_reserve_per_bucket: usize = 0,
@@ -3694,16 +3695,6 @@ fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storag
     return key;
 }
 
-inline fn updateKeyHash(h: *std.hash.Wyhash, view: thindb.storage.ColumnView, typ: thindb.types.Type, row: usize) void {
-    switch (view.data) {
-        .string, .varchar, .char, .json => |sv| h.update(sv.rowBytes(row)),
-        else => {
-            const bits = readGenericKeyBits(view, typ, row) catch 0;
-            h.update(std.mem.asBytes(&bits));
-        },
-    }
-}
-
 // Hashed group identity for string / >128-bit keys: a 128-bit Wyhash digest
 // (two independent seeds → hi/lo) over the key columns. A STRING column
 // contributes its fixed 16-byte `stringKeyDigest` — taken from the scan's
@@ -3713,33 +3704,34 @@ inline fn updateKeyHash(h: *std.hash.Wyhash, view: thindb.storage.ColumnView, ty
 // values are recovered at emit via the row's carried __rowloc (late
 // materialization), so collisions — astronomically unlikely at 128 bits — are
 // the only correctness caveat.
+//
+// The per-column parts are packed into one buffer and digested in a single
+// pass (`stringKeyDigest` over the concatenation): streaming Wyhash fed the
+// same parts one by one produces the identical digest, but its per-update
+// buffering costs several times the hash itself on short parts — this runs
+// once per scanned row.
 fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storage.ColumnView, key_digests: []const ?[]const u128, row: usize) u128 {
-    var lo = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
-    var hi = std.hash.Wyhash.init(0xD1B54A32D192ED03);
+    var buf: [MAX_GENERIC_GROUP_KEYS * (1 + @sizeOf(u128))]u8 = undefined;
+    var len: usize = 0;
     for (layout.key_columns, 0..) |part, i| {
         if (part.nullable) {
             // The validity tag joins the digest; a NULL row's payload is
             // SKIPPED — its decoded bytes are an encoding artifact (FOR base /
             // dict entry 0) that may differ across batch sources, and all NULL
             // rows must land in one group.
-            const tag = [1]u8{@intFromBool(key_views[i].isValid(row))};
-            lo.update(&tag);
-            hi.update(&tag);
-            if (tag[0] == 0) continue;
+            const valid = key_views[i].isValid(row);
+            buf[len] = @intFromBool(valid);
+            len += 1;
+            if (!valid) continue;
         }
-        switch (key_views[i].data) {
-            .string, .varchar, .char, .json => |sv| {
-                const d: u128 = if (key_digests[i]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row));
-                lo.update(std.mem.asBytes(&d));
-                hi.update(std.mem.asBytes(&d));
-            },
-            else => {
-                updateKeyHash(&lo, key_views[i], part.typ, row);
-                updateKeyHash(&hi, key_views[i], part.typ, row);
-            },
-        }
+        const d: u128 = switch (key_views[i].data) {
+            .string, .varchar, .char, .json => |sv| if (key_digests[i]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row)),
+            else => readGenericKeyBits(key_views[i], part.typ, row) catch 0,
+        };
+        buf[len..][0..@sizeOf(u128)].* = @bitCast(d);
+        len += @sizeOf(u128);
     }
-    return (@as(u128, hi.final()) << 64) | @as(u128, lo.final());
+    return thindb.exec.stringKeyDigest(buf[0..len]);
 }
 
 fn applyScanFilterExpr(scan: *Scan, expr: thindb.exec.PredicateExpr) !bool {
@@ -5775,8 +5767,6 @@ const SiloGridJob = struct {
     worker_index: usize,
     worker_count: usize,
     chunk_rows: usize,
-    scan_tile_rgs: usize,
-    scan_coalesce_tiles: usize,
     group_lease_buckets: usize,
     group_lease_rows: u64,
     raw_group_mode: RawGroupMode,
@@ -6286,11 +6276,9 @@ fn finalizeUdfIntoRow(scratch: *UdfEmitScratch, row: *TopRow, bucket: *PipeBucke
 }
 
 fn claimScanTile(job: SiloGridJob) ?ScanTile {
-    const claim_rgs = job.scan_tile_rgs * job.scan_coalesce_tiles;
-    const lo = job.shared.next_scan_rg.fetchAdd(claim_rgs, .monotonic);
-    if (lo >= job.shared.total_scan_rgs) return null;
+    const tile = job.shared.scan_tiles.claim() orelse return null;
     _ = job.shared.active_scan_jobs.fetchAdd(1, .release);
-    return .{ .lo = lo, .hi = @min(lo + claim_rgs, job.shared.total_scan_rgs) };
+    return .{ .lo = tile.lo, .hi = tile.hi };
 }
 
 fn openGridScanTile(job: SiloGridJob, tile: ScanTile) void {
@@ -6372,7 +6360,7 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
         try markGridScanDone(job, marked_scan_done);
     }
     _ = job.shared.active_scan_jobs.fetchSub(1, .release);
-    if (job.shared.next_scan_rg.load(.acquire) >= job.shared.total_scan_rgs) job.shared.signalWork(std.math.maxInt(u32));
+    if (job.shared.scan_tiles.exhausted()) job.shared.signalWork(std.math.maxInt(u32));
 }
 
 fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
@@ -6430,8 +6418,8 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
         if (job.shared.resources) |a| try a.checkCancelled();
         job.local.sched_loops += 1;
         const decision_t0 = if (job.profile) platform.nowTicks() else 0;
-        const scan_claims_available = !scan_exhausted and job.shared.next_scan_rg.load(.acquire) < job.shared.total_scan_rgs;
-        const global_scan_finished = job.shared.next_scan_rg.load(.acquire) >= job.shared.total_scan_rgs and
+        const scan_claims_available = !scan_exhausted and !job.shared.scan_tiles.exhausted();
+        const global_scan_finished = job.shared.scan_tiles.exhausted() and
             job.shared.active_scan_jobs.load(.acquire) == 0;
         if (global_scan_finished and !marked_scan_done) {
             if (job.profile) job.local.sched_decision_ticks += platform.nowTicks() - decision_t0;
@@ -6747,7 +6735,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
 
     const scan_columns = cfg.scan_columns orelse &[_][]const u8{};
     const resources = cfg.resources orelse thindb.exec.memory.accountantOf(allocator);
-    const scan_allocator = try thindb.exec.memory.trackedBackend(table.allocator, resources);
+    // Worker scans' decode and digest buffers recycle through the process
+    // buffer pool, as ParallelScan's do: fresh ones each query cost page
+    // faults to fill and an OS release at teardown, ahead of the response.
+    const scan_allocator = try thindb.exec.memory.workerAllocator(resources, table.allocator);
     var stats_scan = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, false, snap);
     defer {
         const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
@@ -6759,14 +6750,21 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     // Right-size the worker fleet to the work that survives zone-map pruning:
     // fuse the filter into the stats scan (the same hint set every worker scan
-    // gets) and count via the shared `Scan.survivingWorkUnits`. A selective
-    // filter then spins ceil(surviving/RGS_PER_GRID_WORKER) workers instead of
-    // the full DOP; an unfusable or absent filter keeps full DOP.
-    var work_rgs: usize = total_rgs + (@as(usize, @intCast(snap.memtable_snap.row_count)) + 65535) / 65536;
+    // gets) and count the surviving row groups. A selective filter then spins
+    // ceil(surviving/RGS_PER_GRID_WORKER) workers instead of the full DOP; an
+    // unfusable or absent filter keeps full DOP. The same survival mask cuts
+    // the scan tiles, so every sized worker finds surviving work to claim.
+    const memtable_units = (@as(usize, @intCast(snap.memtable_snap.row_count)) + 65535) / 65536;
+    var work_rgs: usize = total_rgs + memtable_units;
     var hinted = false;
     if (cfg.filter_expr) |expr| hinted = applyScanFilterExpr(stats_scan, expr) catch false;
     if (try cfg.offered_prunes.apply(stats_scan)) hinted = true;
-    if (hinted) {
+    const surviving_mask: ?[]bool = if (hinted) stats_scan.survivingMask(allocator) else null;
+    defer if (surviving_mask) |m| allocator.free(m);
+    if (surviving_mask) |mask| {
+        work_rgs = memtable_units;
+        for (mask) |m| work_rgs += @intFromBool(m);
+    } else if (hinted) {
         if (stats_scan.survivingWorkUnits()) |surviving| work_rgs = surviving;
     }
     const sized_workers = (work_rgs + RGS_PER_GRID_WORKER - 1) / RGS_PER_GRID_WORKER;
@@ -6945,12 +6943,14 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .generic_filter_required = cfg.filter_expr != null,
         .scan_threads = n_workers,
         .total_scan_rgs = claim_total_rgs,
+        .scan_tiles = try RowGroupTiles.init(allocator, claim_total_rgs, surviving_mask, n_workers, scan_tile_rgs * scan_coalesce_tiles),
         .local_reserve_per_bucket = local_reserve_per_bucket,
         .route_block_rows = route_block_rows,
         .direct_final_local = direct_final_local,
         .local_parts = parts,
         .shared_scan_buffers = shared_scan_buffers_ptr,
     };
+    defer shared.scan_tiles.deinit(allocator);
     raw_queues_moved_to_shared = true;
     var serial_fold_scratch: GroupScratch = .{};
     defer serial_fold_scratch.deinit(allocator);
@@ -7055,8 +7055,6 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             .worker_index = i,
             .worker_count = n_workers,
             .chunk_rows = chunk_rows,
-            .scan_tile_rgs = scan_tile_rgs,
-            .scan_coalesce_tiles = scan_coalesce_tiles,
             .group_lease_buckets = cfg.group_lease_buckets,
             .group_lease_rows = cfg.group_lease_rows,
             .raw_group_mode = cfg.raw_group_mode,

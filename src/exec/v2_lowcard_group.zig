@@ -67,6 +67,7 @@ const compute = @import("compute.zig");
 const udf_mod = @import("../udf.zig");
 const json_binary = @import("json_binary.zig");
 const Scan = @import("scan.zig").Scan;
+const RowGroupTiles = @import("rg_tiles.zig").RowGroupTiles;
 const SiloCore = exec.silo_group_core;
 const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
@@ -680,7 +681,7 @@ const Worker = struct {
     seg_start: []const usize,
     segment_count: usize,
     total_rgs: usize,
-    next_rg: *std.atomic.Value(usize),
+    tiles: *RowGroupTiles,
     err: ?anyerror = null,
 };
 
@@ -716,12 +717,10 @@ fn workerRun(w: *Worker) !void {
         return;
     }
     while (true) {
-        const lo = w.next_rg.fetchAdd(TILE_RGS, .monotonic);
-        if (lo >= w.total_rgs) break;
-        const hi = @min(lo + TILE_RGS, w.total_rgs);
-        const start = flatToCoord(lo, w.seg_start, w.segment_count, w.total_rgs);
-        const end = flatToCoord(hi, w.seg_start, w.segment_count, w.total_rgs);
-        w.source.resetRange(start.seg, start.rg, end.seg, end.rg, hi == w.total_rgs);
+        const tile = w.tiles.claim() orelse break;
+        const start = flatToCoord(tile.lo, w.seg_start, w.segment_count, w.total_rgs);
+        const end = flatToCoord(tile.hi, w.seg_start, w.segment_count, w.total_rgs);
+        w.source.resetRange(start.seg, start.rg, end.seg, end.rg, tile.hi == w.total_rgs);
         try driveTile(w, &have_resolved);
     }
 }
@@ -1510,17 +1509,26 @@ const LowCardGroup = struct {
         // Right-size to the work that survives zone-map pruning, mirroring the
         // silo grid and ParallelScan: fuse the filter into a throwaway probe
         // scan (installing the same prune hints the worker scans get) and
-        // count via the shared `Scan.survivingWorkUnits` — one worker per two
-        // surviving row groups. Over-spawning costs more here than in the
-        // grid: every worker pre-zeroes its own est_groups-slot direct table
-        // plus its slice of distinct-set partitions.
+        // count the surviving row groups — one worker per two. Over-spawning
+        // costs more here than in the grid: every worker pre-zeroes its own
+        // est_groups-slot direct table plus its slice of distinct-set
+        // partitions. The same survival mask cuts the row-group tiles.
+        var surviving_mask: ?[]bool = null;
+        defer if (surviving_mask) |m| allocator.free(m);
         if (self.where_filter) |w| sized: {
             const probe = Scan.allocWithProjectionLoc(allocator, table, null, self.needed, false, snap) catch break :sized;
             defer probe.deinit();
             if (!(probe.tryFuseFilter(w) catch break :sized)) break :sized;
-            const surviving = probe.survivingWorkUnits() orelse break :sized;
+            surviving_mask = probe.survivingMask(allocator);
+            const surviving = if (surviving_mask) |mask| survived: {
+                var n = (@as(usize, @intCast(snap.memtable_snap.row_count)) + 65535) / 65536;
+                for (mask) |m| n += @intFromBool(m);
+                break :survived n;
+            } else probe.survivingWorkUnits() orelse break :sized;
             n_workers = @max(@as(usize, 1), @min(n_workers, @max((surviving + 1) / 2, 1)));
         }
+        var tiles = try RowGroupTiles.init(allocator, total_rgs, surviving_mask, n_workers, TILE_RGS);
+        defer tiles.deinit(allocator);
 
         const workers = try allocator.alloc(Worker, n_workers);
         defer allocator.free(workers);
@@ -1530,10 +1538,12 @@ const LowCardGroup = struct {
             w.state.deinit(allocator);
         };
 
-        var next_rg = std.atomic.Value(usize).init(0);
+        // Worker decode buffers recycle through the process buffer pool rather
+        // than paying page faults and an OS release every query.
+        const scan_allocator = try exec.memory.workerAllocatorOf(allocator);
         for (workers, 0..) |*w, i| {
             var source = try openScanSource(
-                allocator,
+                scan_allocator,
                 table,
                 self.needed,
                 self.where_filter,
@@ -1561,7 +1571,7 @@ const LowCardGroup = struct {
                 .seg_start = seg_start,
                 .segment_count = snap.segment_count,
                 .total_rgs = total_rgs,
-                .next_rg = &next_rg,
+                .tiles = &tiles,
             };
             built += 1;
         }
