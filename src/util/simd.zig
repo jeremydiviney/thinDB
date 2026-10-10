@@ -182,6 +182,79 @@ pub fn scalarOp(
     }
 }
 
+pub const MaskOp = enum { @"and", @"or" };
+
+/// `dst[i] = dst[i] <op> src[i]` over row masks, vectorized. A scalar
+/// `a and b` short-circuits into a branch that LLVM turns back into a vector
+/// op or not depending on the code around the loop, and on a mask that flips
+/// at random that branch mispredicts every other row. Bools are 0/1 bytes,
+/// which `&` and `|` keep 0/1.
+pub fn combineMaskInto(comptime op: MaskOp, dst: []bool, src: []const bool) void {
+    std.debug.assert(dst.len == src.len);
+    const d: []u8 = @ptrCast(dst);
+    const s: []const u8 = @ptrCast(src);
+    const N = comptime lanes(u8);
+    var i: usize = 0;
+    while (i + N <= d.len) : (i += N) {
+        const a: @Vector(N, u8) = d[i..][0..N].*;
+        const b: @Vector(N, u8) = s[i..][0..N].*;
+        d[i..][0..N].* = if (op == .@"and") a & b else a | b;
+    }
+    while (i < d.len) : (i += 1) d[i] = if (op == .@"and") d[i] & s[i] else d[i] | s[i];
+}
+
+/// `dst[i] = keep[i] and !drop[i]` (`!drop[i]` with no `keep`), vectorized
+/// for the reason `combineMaskInto` is.
+pub fn andNotMaskInto(dst: []bool, keep: ?[]const bool, drop: []const bool) void {
+    std.debug.assert(dst.len == drop.len);
+    const out: []u8 = @ptrCast(dst);
+    const d: []const u8 = @ptrCast(drop);
+    const N = comptime lanes(u8);
+    const ones: @Vector(N, u8) = @splat(1);
+    var i: usize = 0;
+    if (keep) |keep_rows| {
+        std.debug.assert(keep_rows.len == drop.len);
+        const k: []const u8 = @ptrCast(keep_rows);
+        while (i + N <= out.len) : (i += N) {
+            const kv: @Vector(N, u8) = k[i..][0..N].*;
+            const dv: @Vector(N, u8) = d[i..][0..N].*;
+            out[i..][0..N].* = kv & (dv ^ ones);
+        }
+        while (i < out.len) : (i += 1) out[i] = k[i] & (d[i] ^ 1);
+    } else {
+        while (i + N <= out.len) : (i += N) {
+            const dv: @Vector(N, u8) = d[i..][0..N].*;
+            out[i..][0..N].* = dv ^ ones;
+        }
+        while (i < out.len) : (i += 1) out[i] = d[i] ^ 1;
+    }
+}
+
+test "simd: combineMaskInto and andNotMaskInto match the scalar operators" {
+    const lengths = [_]usize{ 0, 1, 31, 32, 64, 65, 1000 };
+    for (lengths) |len| {
+        const a = try std.testing.allocator.alloc(bool, len);
+        defer std.testing.allocator.free(a);
+        const b = try std.testing.allocator.alloc(bool, len);
+        defer std.testing.allocator.free(b);
+        const dst = try std.testing.allocator.alloc(bool, len);
+        defer std.testing.allocator.free(dst);
+        for (a, b, 0..) |*x, *y, idx| {
+            x.* = (idx *% 7 +% 3) % 5 < 2;
+            y.* = (idx *% 11 +% 1) % 3 == 0;
+        }
+        inline for (.{ MaskOp.@"and", MaskOp.@"or" }) |op| {
+            @memcpy(dst, a);
+            combineMaskInto(op, dst, b);
+            for (a, b, dst) |x, y, got| try std.testing.expectEqual(if (op == .@"and") x and y else x or y, got);
+        }
+        andNotMaskInto(dst, a, b);
+        for (a, b, dst) |x, y, got| try std.testing.expectEqual(x and !y, got);
+        andNotMaskInto(dst, null, b);
+        for (b, dst) |y, got| try std.testing.expectEqual(!y, got);
+    }
+}
+
 test "simd: scalarOp matches widen-then-scalar reference" {
     const lengths = [_]usize{ 0, 1, 9, 16, 33, 777 };
     inline for (.{ .{ i16, i32 }, .{ i32, i32 }, .{ i32, i64 }, .{ f32, f64 }, .{ f64, f64 } }) |pair| {

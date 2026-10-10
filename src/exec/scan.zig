@@ -14,6 +14,7 @@ const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 const hll = @import("../util/hll.zig");
 const bloom_util = @import("../util/bloom.zig");
+const simd = @import("../util/simd.zig");
 const comparison = @import("../api/comparison.zig");
 
 const engine = @import("../engine/engine.zig");
@@ -416,6 +417,12 @@ pub const Scan = struct {
     /// Grown on demand; reused across `next()` calls; freed in `deinit`.
     mask_buf2: []bool = &.{},
     mask_buf3: []bool = &.{},
+    /// One column's equality literals out of a guided OR (`buildOrMask`),
+    /// gathered per row group into one IN-list evaluation.
+    or_set_values: std.ArrayListUnmanaged(Value) = .empty,
+    /// A long text IN list's literals (or their FSST encodings), probed by
+    /// hash rather than compared one by one.
+    text_in_set: std.StringHashMapUnmanaged(void) = .empty,
     /// The current row group's survivor row indices (`survivorRows`), shared
     /// by every projected column's gather.
     survivor_rows: []u32 = &.{},
@@ -1124,6 +1131,8 @@ pub const Scan = struct {
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
         if (self.mask_buf2.len > 0) self.allocator.free(self.mask_buf2);
         if (self.mask_buf3.len > 0) self.allocator.free(self.mask_buf3);
+        self.or_set_values.deinit(self.allocator);
+        self.text_in_set.deinit(self.allocator);
         if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
@@ -2655,33 +2664,39 @@ pub const Scan = struct {
                 // the whole AND (mixed shapes fall back).
                 for (children) |c| if (!guidedChildShape(c)) return null;
 
-                if (!try self.buildGuidedChild(seg, rg_idx, rg_count, children[0], null, mask[0..rg_count])) return null;
-                if (children.len > 1) {
-                    const scratch = try self.ensureMask2(rg_count);
-                    // Empty-mask early exit: conjuncts arrive selectivity-
-                    // ordered, so the leading leaf often kills the whole row
-                    // group — stop borrowing/evaluating the remaining columns'
-                    // blocks the moment no row survives. Sound for an AND: the
-                    // skipped leaves could only remove more rows.
-                    var live = blk: {
-                        for (mask[0..rg_count]) |m| {
-                            if (m) break :blk true;
+                // `col NOT IN (v1, ...)` parses to `col <> v` conjuncts: each
+                // column's run of them folds into one IN-list evaluation at
+                // its first conjunct.
+                var groups: [SET_FOLD_MAX_COLUMNS]SetArmGroup = undefined;
+                const n_groups = self.groupSetArms(.@"and", children, &groups);
+                var last: ?SetArmLookup = null;
+                var filled = false;
+                // Empty-mask early exit: conjuncts arrive selectivity-
+                // ordered, so the leading leaf often kills the whole row
+                // group — stop borrowing/evaluating the remaining columns'
+                // blocks the moment no row survives. Sound for an AND: the
+                // skipped leaves could only remove more rows.
+                var live = true;
+                for (children) |c| {
+                    if (!live) break;
+                    // Later children receive the accumulated mask: an
+                    // expensive leaf (LIKE over an FSST block) then
+                    // decodes/tests ONLY the rows still alive.
+                    const dest = if (filled) (try self.ensureMask2(rg_count))[0..rg_count] else mask[0..rg_count];
+                    const act: ?[]const bool = if (filled) mask[0..rg_count] else null;
+                    built: {
+                        if (groupOf(groups[0..n_groups], self.setArmColumn(.@"and", c, &last))) |g| {
+                            if (g.count >= 2) switch (g.state) {
+                                .folded => continue,
+                                .pending => if (try self.buildSetArmGroup(seg, rg_idx, rg_count, .@"and", children, g, act, dest)) break :built,
+                                .declined => {},
+                            };
                         }
-                        break :blk false;
-                    };
-                    for (children[1..]) |c| {
-                        if (!live) break;
-                        // Later children receive the accumulated mask: an
-                        // expensive leaf (LIKE over an FSST block) then
-                        // decodes/tests ONLY the rows still alive.
-                        if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, mask[0..rg_count], scratch[0..rg_count])) return null;
-                        var any = false;
-                        for (mask[0..rg_count], scratch[0..rg_count]) |*m, s| {
-                            m.* = m.* and s;
-                            any = any or m.*;
-                        }
-                        live = any;
+                        if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, act, dest)) return null;
                     }
+                    if (filled) simd.combineMaskInto(.@"and", mask[0..rg_count], dest);
+                    live = std.mem.indexOfScalar(bool, mask[0..rg_count], true) != null;
+                    filled = true;
                 }
             },
             else => return null,
@@ -2909,11 +2924,13 @@ pub const Scan = struct {
         }
     }
 
-    /// Evaluate an OR of guided arms into `out`. An OR of equality leaves on
-    /// one column (the parse of `col IN (v1, ...)`) folds into one IN-list
-    /// evaluation: one membership test per distinct dict value or one
-    /// compressed compare per row, instead of one full pass per literal.
-    /// Any other arm mix ORs the arms' masks through the third scratch mask.
+    /// Evaluate an OR of guided arms into `out`. The parser spells a literal
+    /// `col IN (v1, ...)` as equality arms on one column, and `orderPredicate`
+    /// splices it into any OR around it, so each column's equality arms fold
+    /// into one IN-list evaluation (one membership test per distinct dict
+    /// value or one set probe per row) instead of one full pass per literal.
+    /// A column the IN-list path declines, and every other arm, ORs its own
+    /// masks in through the third scratch mask.
     fn buildOrMask(
         self: *Scan,
         seg: *storage.ReadSegment,
@@ -2923,22 +2940,119 @@ pub const Scan = struct {
         active: ?[]const bool,
         out: []bool,
     ) !bool {
-        var vals: [64]Value = undefined;
-        const in_list_col = if (arms.len <= vals.len) predicate.eqDisjunctionColumn(arms) else null;
-        if (in_list_col) |col| {
-            for (arms, vals[0..arms.len]) |arm, *v| v.* = arm.leaf.val;
-            const set = predicate.InSet{ .col = col, .values = vals[0..arms.len], .negate = false };
-            if (try self.buildInSetMask(seg, rg_idx, rg_count, set, active, out)) return true;
+        var groups: [SET_FOLD_MAX_COLUMNS]SetArmGroup = undefined;
+        const n_groups = self.groupSetArms(.@"or", arms, &groups);
+
+        var filled = false;
+        for (groups[0..n_groups]) |*g| {
+            if (g.count < 2 and g.count != arms.len) continue;
+            const dest = if (filled) (try self.ensureMask3(rg_count))[0..rg_count] else out[0..rg_count];
+            if (!try self.buildSetArmGroup(seg, rg_idx, rg_count, .@"or", arms, g, active, dest)) continue;
+            if (filled) simd.combineMaskInto(.@"or", out[0..rg_count], dest);
+            filled = true;
         }
 
-        if (!try self.buildOrArm(seg, rg_idx, rg_count, arms[0], active, out)) return false;
-        if (arms.len == 1) return true;
-        const scratch = try self.ensureMask3(rg_count);
-        for (arms[1..]) |arm| {
-            if (!try self.buildOrArm(seg, rg_idx, rg_count, arm, active, scratch[0..rg_count])) return false;
-            for (out[0..rg_count], scratch[0..rg_count]) |*m, hit| m.* = m.* or hit;
+        var last: ?SetArmLookup = null;
+        for (arms) |arm| {
+            if (groupOf(groups[0..n_groups], self.setArmColumn(.@"or", arm, &last))) |g| {
+                if (g.state == .folded) continue;
+            }
+            const dest = if (filled) (try self.ensureMask3(rg_count))[0..rg_count] else out[0..rg_count];
+            if (!try self.buildOrArm(seg, rg_idx, rg_count, arm, active, dest)) return false;
+            if (filled) simd.combineMaskInto(.@"or", out[0..rg_count], dest);
+            filled = true;
         }
         return true;
+    }
+
+    /// Distinct columns `groupSetArms` groups arms for; arms on any further
+    /// column are evaluated one by one.
+    const SET_FOLD_MAX_COLUMNS = 16;
+
+    /// One column's literal IN-list arms under an OR (`col = v`) or an AND
+    /// (`col <> v`).
+    const SetArmGroup = struct {
+        phys: usize,
+        count: usize,
+        state: enum { pending, folded, declined },
+    };
+
+    /// The previous `setArmColumn` name lookup. An IN list's arms share one
+    /// column-name slice, so a run of them resolves the name once.
+    const SetArmLookup = struct {
+        name: []const u8,
+        phys: ?usize,
+    };
+
+    /// The table column a literal IN list's arm tests (`col = v` under an
+    /// OR, `col <> v` under an AND), or null for any other arm.
+    fn setArmColumn(self: *const Scan, comptime junction: predicate.Junction, arm: PredicateExpr, last: *?SetArmLookup) ?usize {
+        if (arm != .leaf or arm.leaf.op != predicate.setArmOp(junction) or arm.leaf.as_boolean) return null;
+        const name = arm.leaf.col;
+        if (last.*) |l| {
+            if (l.name.ptr == name.ptr and l.name.len == name.len) return l.phys;
+        }
+        const phys = types.findColumn(self.table.schema.columns, name);
+        last.* = .{ .name = name, .phys = phys };
+        return phys;
+    }
+
+    /// Count `arms`' IN-list arms per column into `groups`; returns how many
+    /// groups were filled.
+    fn groupSetArms(self: *const Scan, comptime junction: predicate.Junction, arms: []const PredicateExpr, groups: *[SET_FOLD_MAX_COLUMNS]SetArmGroup) usize {
+        var n_groups: usize = 0;
+        var last: ?SetArmLookup = null;
+        count_arms: for (arms) |arm| {
+            const phys = self.setArmColumn(junction, arm, &last) orelse continue;
+            for (groups[0..n_groups]) |*g| {
+                if (g.phys == phys) {
+                    g.count += 1;
+                    continue :count_arms;
+                }
+            }
+            if (n_groups == groups.len) continue;
+            groups[n_groups] = .{ .phys = phys, .count = 1, .state = .pending };
+            n_groups += 1;
+        }
+        return n_groups;
+    }
+
+    fn groupOf(groups: []SetArmGroup, phys: ?usize) ?*SetArmGroup {
+        const p = phys orelse return null;
+        for (groups) |*g| {
+            if (g.phys == p) return g;
+        }
+        return null;
+    }
+
+    /// Evaluate group `g`'s arms as one `col [NOT] IN (...)` into `out`,
+    /// recording whether the IN-list path took them.
+    fn buildSetArmGroup(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        rg_count: u32,
+        comptime junction: predicate.Junction,
+        arms: []const PredicateExpr,
+        g: *SetArmGroup,
+        active: ?[]const bool,
+        out: []bool,
+    ) !bool {
+        self.or_set_values.clearRetainingCapacity();
+        try self.or_set_values.ensureTotalCapacity(self.allocator, g.count);
+        var last: ?SetArmLookup = null;
+        for (arms) |arm| {
+            const phys = self.setArmColumn(junction, arm, &last) orelse continue;
+            if (phys == g.phys) self.or_set_values.appendAssumeCapacity(arm.leaf.val);
+        }
+        const set = predicate.InSet{
+            .col = self.table.schema.columns[g.phys].name,
+            .values = self.or_set_values.items,
+            .negate = junction == .@"and",
+        };
+        const built = try self.buildInSetMask(seg, rg_idx, rg_count, set, active, out);
+        g.state = if (built) .folded else .declined;
+        return built;
     }
 
     /// The arm shapes `guidedChildShape` admits under an OR, dispatched
@@ -2994,21 +3108,22 @@ pub const Scan = struct {
         defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
-            evalDictInSet(block, rg_count, flags, set.values, set.negate, out);
+            evalDictInSet(block, rg_count, flags, try self.textInSet(set.values), set.negate, out);
             return true;
         }
         switch (col_type) {
             .varchar, .string, .char, .json => {
                 if (block.encoding == .fsst) {
-                    return try evalFsstInSet(self.allocator, block.bytes, rg_count, flags, set.values, set.negate, active, out);
+                    return try self.evalFsstInSet(block.bytes, rg_count, flags, set.values, set.negate, active, out);
                 }
                 if (block.encoding != .raw) return false;
                 const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
+                const text_set = try self.textInSet(set.values);
                 switch (view.data) {
-                    .varchar => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
-                    .string => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
-                    .char => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
-                    .json => |sv| rawStringInSet(sv, view, rg_count, set.values, set.negate, active, out),
+                    .varchar => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
+                    .string => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
+                    .char => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
+                    .json => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
                     else => return false,
                 }
                 return true;
@@ -3048,13 +3163,16 @@ pub const Scan = struct {
             },
             .rle => {
                 const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
-                const scratch = try self.ensureMask3(rg_count);
-                @memset(out[0..rg_count], false);
+                var stack_wants: [256]i128 = undefined;
+                const wants = if (set.values.len <= stack_wants.len) stack_wants[0..set.values.len] else try self.allocator.alloc(i128, set.values.len);
+                defer if (set.values.len > stack_wants.len) self.allocator.free(wants);
+                var len: usize = 0;
                 for (set.values) |v| {
-                    const want = predicate.valueToRangeI128(v) orelse continue;
-                    if (!rleCompareInto(rv.block, rg_count, .eq, want, scratch[0..rg_count])) return false;
-                    for (out[0..rg_count], scratch[0..rg_count]) |*m, hit| m.* = m.* or hit;
+                    wants[len] = predicate.valueToRangeI128(v) orelse continue;
+                    len += 1;
                 }
+                std.sort.pdq(i128, wants[0..len], {}, std.sort.asc(i128));
+                if (!rleInSetInto(rv.block, rg_count, wants[0..len], out)) return false;
             },
             else => {
                 const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
@@ -3076,7 +3194,7 @@ pub const Scan = struct {
         return true;
     }
 
-    fn rawStringInSet(sv: anytype, view: anytype, rg_count: u32, values: []const Value, negate: bool, active: ?[]const bool, out: []bool) void {
+    fn rawStringInSet(sv: anytype, view: anytype, rg_count: u32, text_set: TextInSet, negate: bool, active: ?[]const bool, out: []bool) void {
         for (0..rg_count) |i| {
             if (active != null and !active.?[i]) {
                 out[i] = false;
@@ -3086,15 +3204,35 @@ pub const Scan = struct {
                 out[i] = false;
                 continue;
             }
-            out[i] = textInSet(sv.rowBytes(i), values) != negate;
+            out[i] = text_set.contains(sv.rowBytes(i)) != negate;
         }
     }
 
-    fn textInSet(cell: []const u8, values: []const Value) bool {
-        for (values) |v| {
-            if (v == .text and std.mem.eql(u8, v.text, cell)) return true;
+    /// An IN list's text literals: compared one by one while the list is
+    /// short, probed through a hash set once it is long.
+    const TextInSet = struct {
+        values: []const Value,
+        hashed: ?*const std.StringHashMapUnmanaged(void),
+
+        fn contains(self: TextInSet, cell: []const u8) bool {
+            if (self.hashed) |set| return set.contains(cell);
+            for (self.values) |v| {
+                if (v == .text and std.mem.eql(u8, v.text, cell)) return true;
+            }
+            return false;
         }
-        return false;
+    };
+
+    /// `values` as a `TextInSet`, hashed into `text_in_set` when long. The
+    /// set is valid until the next call.
+    fn textInSet(self: *Scan, values: []const Value) !TextInSet {
+        if (values.len <= predicate.IN_SET_LINEAR_MAX) return .{ .values = values, .hashed = null };
+        self.text_in_set.clearRetainingCapacity();
+        try self.text_in_set.ensureTotalCapacity(self.allocator, @intCast(values.len));
+        for (values) |v| {
+            if (v == .text) self.text_in_set.putAssumeCapacity(v.text, {});
+        }
+        return .{ .values = values, .hashed = &self.text_in_set };
     }
 
     /// IN-list over a DICT block: membership is decided once per distinct
@@ -3103,7 +3241,7 @@ pub const Scan = struct {
         block: storage.ReadSegment.BorrowedBlock,
         rg_count: u32,
         flags: storage.format.ColumnBlockFlags,
-        values: []const Value,
+        text_set: TextInSet,
         negate: bool,
         out: []bool,
     ) void {
@@ -3124,7 +3262,7 @@ pub const Scan = struct {
         @memset(matched[0..nbytes], 0);
         var c: u32 = 0;
         while (c < db.ndv) : (c += 1) {
-            if (textInSet(db.dictValue(c), values) != negate) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
+            if (text_set.contains(db.dictValue(c)) != negate) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
         }
 
         for (0..rg_count) |i| {
@@ -3140,9 +3278,10 @@ pub const Scan = struct {
     /// IN-list over an FSST block in the compressed domain: every text literal
     /// is encoded once under the block's table, then each live row's
     /// compressed slice is compared against those (equal plaintext <=> equal
-    /// compressed bytes under one table). No decode at all.
+    /// compressed bytes under one table), through a hash set of the encodings
+    /// once the list is long. No decode at all.
     fn evalFsstInSet(
-        allocator: Allocator,
+        self: *Scan,
         raw: []const u8,
         rg_count: u32,
         flags: storage.format.ColumnBlockFlags,
@@ -3151,6 +3290,7 @@ pub const Scan = struct {
         active: ?[]const bool,
         out: []bool,
     ) !bool {
+        const allocator = self.allocator;
         const fv = try storage.segment_reader.fsstViewOf(raw, rg_count, flags);
         var comp: std.ArrayListUnmanaged(u8) = .empty;
         defer comp.deinit(allocator);
@@ -3161,6 +3301,20 @@ pub const Scan = struct {
             try comp.ensureUnusedCapacity(allocator, storage.fsst.encodedSizeBound(v.text.len));
             fv.block.table.encodeAppend(v.text, &comp);
             try ends.append(allocator, comp.items.len);
+        }
+        if (ends.items.len > predicate.IN_SET_LINEAR_MAX) {
+            self.text_in_set.clearRetainingCapacity();
+            try self.text_in_set.ensureTotalCapacity(allocator, @intCast(ends.items.len));
+            var start: usize = 0;
+            for (ends.items) |end| {
+                self.text_in_set.putAssumeCapacity(comp.items[start..end], {});
+                start = end;
+            }
+            for (0..rg_count) |i| {
+                const live = (active == null or active.?[i]) and storage.column.isValidBit(fv.nulls, i);
+                out[i] = live and self.text_in_set.contains(fv.block.rowComp(i)) != negate;
+            }
+            return true;
         }
         for (0..rg_count) |i| {
             if (active != null and !active.?[i]) {
@@ -3469,6 +3623,33 @@ pub const Scan = struct {
         }
         if (pos < rg_count) @memset(out[pos..rg_count], false);
         return true;
+    }
+
+    /// `out[i]` = whether row i's value is one of `wants` (ascending): one
+    /// membership test per run however many literals the IN list carries.
+    /// NULLs are the caller's, as in `rleCompareInto`.
+    fn rleInSetInto(rb: storage.segment_reader.RleBlock, rg_count: u32, wants: []const i128, out: []bool) bool {
+        var pos: usize = 0;
+        switch (rb.value_width) {
+            inline 1, 2, 4, 8 => |W| {
+                const T = std.meta.Int(.signed, W * 8);
+                var run: usize = 0;
+                while (run < rb.n_runs and pos < rg_count) : (run += 1) {
+                    const v: i128 = std.mem.readInt(T, rb.values[run * W ..][0..W], .little);
+                    const len = @min(@as(usize, rb.runLength(run)), rg_count - pos);
+                    const hit = std.sort.binarySearch(i128, wants, v, orderI128) != null;
+                    @memset(out[pos .. pos + len], hit);
+                    pos += len;
+                }
+            },
+            else => return false,
+        }
+        if (pos < rg_count) @memset(out[pos..rg_count], false);
+        return true;
+    }
+
+    fn orderI128(key: i128, item: i128) std.math.Order {
+        return std.math.order(key, item);
     }
 
     /// Fused single-pass compare+gather: when the filter is a single comparison
@@ -4261,6 +4442,8 @@ pub const Scan = struct {
             if (mask.len > 0) self.allocator.free(mask.*);
             mask.* = &.{};
         }
+        self.or_set_values.clearAndFree(self.allocator);
+        self.text_in_set.clearAndFree(self.allocator);
         if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
         self.survivor_rows = &.{};
         for (self.code_bufs) |*b| b.clearAndFree(self.allocator);

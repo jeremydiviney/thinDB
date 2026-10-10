@@ -3306,6 +3306,207 @@ test "fused filter: numeric IN-lists over FOR and raw blocks match a per-row ref
     }
 }
 
+const InListRow = struct { id: i64, num: ?i32, run: i32, tag: ?[]const u8, url: []const u8, name: []const u8 };
+
+fn inListCell(row: InListRow, col: []const u8) ?types.Value {
+    if (std.mem.eql(u8, col, "num")) return if (row.num) |x| .{ .int = x } else null;
+    if (std.mem.eql(u8, col, "run")) return .{ .int = row.run };
+    if (std.mem.eql(u8, col, "tag")) return if (row.tag) |x| .{ .text = x } else null;
+    if (std.mem.eql(u8, col, "url")) return .{ .text = row.url };
+    if (std.mem.eql(u8, col, "name")) return .{ .text = row.name };
+    unreachable;
+}
+
+/// Per-row reference for the shapes `long and mixed IN lists` builds:
+/// `=` and `<>` leaves, prefix LIKEs, AND and OR. A NULL cell fails a leaf.
+fn inListRef(expr: PredicateExpr, row: InListRow) bool {
+    return switch (expr) {
+        .leaf => |l| blk: {
+            const cell = inListCell(row, l.col) orelse break :blk false;
+            const eq = switch (cell) {
+                .int => |x| x == l.val.int,
+                .text => |x| std.mem.eql(u8, x, l.val.text),
+                else => unreachable,
+            };
+            break :blk switch (l.op) {
+                .eq => eq,
+                .neq => !eq,
+                else => unreachable,
+            };
+        },
+        .like => |lp| blk: {
+            const cell = inListCell(row, lp.col) orelse break :blk false;
+            break :blk std.mem.startsWith(u8, cell.text, lp.pattern[0 .. lp.pattern.len - 1]);
+        },
+        .@"and" => |kids| for (kids) |k| {
+            if (!inListRef(k, row)) break false;
+        } else true,
+        .@"or" => |kids| for (kids) |k| {
+            if (inListRef(k, row)) break true;
+        } else false,
+        else => unreachable,
+    };
+}
+
+test "fused filter: long and mixed IN lists fold into one set lookup per column on every encoding" {
+    const storage = @import("../storage/storage.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `num` FOR, `run` RLE, `tag` dict, `url` FSST, `name` raw text.
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "num", .type = .int, .nullable = true },
+            .{ .name = "run", .type = .int },
+            .{ .name = "tag", .type = .string, .nullable = true },
+            .{ .name = "url", .type = .string },
+            .{ .name = "name", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+        .compression = .lz4_fsst,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true });
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first 4000 rows go to a segment; the last 200 stay in the memtable,
+    // where the generic evaluator matches them.
+    const n_seg = 4000;
+    const rows = try arena.alloc(InListRow, n_seg + 200);
+    for (rows, 0..) |*row, i| {
+        row.* = .{
+            .id = @intCast(i),
+            .num = if (i % 11 == 5) null else @intCast((i * 7919) % 3000),
+            .run = @intCast(i / 250),
+            .tag = if (i % 13 == 4) null else try std.fmt.allocPrint(arena, "tag-{d}", .{i % 40}),
+            .url = try std.fmt.allocPrint(arena, "https://example.com/catalog/items/{d}/detail?ref=campaign", .{i}),
+            .name = try std.fmt.allocPrint(arena, "n{d}", .{i}),
+        };
+    }
+    try t.insert(rows[0..n_seg]);
+    try t.flush();
+    try t.insert(rows[n_seg..]);
+
+    {
+        const seg_id = t.manifest.segments.items[0].segment_id;
+        var name_buf: [32]u8 = undefined;
+        const file_name = try api.Table.segmentFileName(&name_buf, seg_id);
+        var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
+        defer seg.deinit();
+        var cache = storage.cache.Cache.init(allocator, 1 << 22);
+        defer cache.deinit();
+        const tc = storage.cache.TableCache{ .cache = &cache, .table_uid = 0 };
+        const want = [_]storage.format.Encoding{ .for_, .rle, .dict, .fsst, .raw };
+        for (want, 1..) |enc, col| {
+            var block = try seg.borrowColumnBlock(allocator, 0, col, tc);
+            defer block.release(allocator, tc);
+            try std.testing.expectEqual(enc, block.encoding);
+        }
+    }
+
+    const Lists = struct {
+        fn ints(a: std.mem.Allocator, col: []const u8, count: usize, step: usize, modulus: usize) ![]PredicateExpr {
+            const arms = try a.alloc(PredicateExpr, count);
+            for (arms, 0..) |*arm, k| arm.* = leafExpr(col, .eq, .{ .int = @intCast((k * step) % modulus) });
+            return arms;
+        }
+        fn texts(a: std.mem.Allocator, col: []const u8, comptime fmt: []const u8, count: usize, step: usize) ![]PredicateExpr {
+            const arms = try a.alloc(PredicateExpr, count);
+            for (arms, 0..) |*arm, k| arm.* = leafExpr(col, .eq, .{ .text = try std.fmt.allocPrint(a, fmt, .{k * step}) });
+            return arms;
+        }
+        /// `col NOT IN (...)`: the list's arms as `<>` conjuncts.
+        fn notIn(a: std.mem.Allocator, arms: []const PredicateExpr) !PredicateExpr {
+            const kids = try a.alloc(PredicateExpr, arms.len);
+            for (kids, arms) |*kid, arm| kid.* = leafExpr(arm.leaf.col, .neq, arm.leaf.val);
+            return .{ .@"and" = kids };
+        }
+    };
+    const num_long = try Lists.ints(arena, "num", 150, 37, 3100);
+    const run_list = try Lists.ints(arena, "run", 12, 3, 40);
+    const tag_list = try Lists.texts(arena, "tag", "tag-{d}", 20, 3);
+    const url_list = try Lists.texts(arena, "url", "https://example.com/catalog/items/{d}/detail?ref=campaign", 30, 141);
+    const name_list = try Lists.texts(arena, "name", "n{d}", 25, 173);
+    const tag_short = try Lists.texts(arena, "tag", "tag-{d}", 10, 4);
+    const two_nums = try Lists.ints(arena, "num", 2, 1, 3000);
+
+    const with_like = try arena.alloc(PredicateExpr, 3);
+    with_like[0] = .{ .@"or" = num_long };
+    with_like[1] = .{ .@"or" = tag_short };
+    with_like[2] = .{ .like = .{ .col = "name", .pattern = "n1%" } };
+    const conj = try arena.alloc(PredicateExpr, 2);
+    conj[0] = leafExpr("run", .eq, .{ .int = 3 });
+    conj[1] = leafExpr("tag", .eq, .{ .text = "tag-5" });
+    const with_and = try arena.alloc(PredicateExpr, 2);
+    with_and[0] = .{ .@"or" = num_long };
+    with_and[1] = .{ .@"and" = conj };
+    const small_mix = try arena.alloc(PredicateExpr, 3);
+    small_mix[0] = two_nums[0];
+    small_mix[1] = two_nums[1];
+    small_mix[2] = .{ .like = .{ .col = "name", .pattern = "n2%" } };
+    const in_and = try arena.alloc(PredicateExpr, 2);
+    in_and[0] = leafExpr("run", .eq, .{ .int = 6 });
+    in_and[1] = .{ .@"or" = name_list };
+    const not_in_and = try arena.alloc(PredicateExpr, 3);
+    not_in_and[0] = try Lists.notIn(arena, num_long);
+    not_in_and[1] = leafExpr("run", .eq, .{ .int = 9 });
+    not_in_and[2] = try Lists.notIn(arena, tag_short);
+
+    const Case = struct { name: []const u8, expr: PredicateExpr, guided: bool };
+    const cases = [_]Case{
+        .{ .name = "FOR, 150 literals", .expr = .{ .@"or" = num_long }, .guided = true },
+        .{ .name = "RLE", .expr = .{ .@"or" = run_list }, .guided = true },
+        .{ .name = "dict, hashed", .expr = .{ .@"or" = tag_list }, .guided = true },
+        .{ .name = "FSST, hashed", .expr = .{ .@"or" = url_list }, .guided = true },
+        .{ .name = "raw text, hashed", .expr = .{ .@"or" = name_list }, .guided = true },
+        .{ .name = "two IN lists and a LIKE", .expr = .{ .@"or" = with_like }, .guided = true },
+        .{ .name = "two equalities and a LIKE", .expr = .{ .@"or" = small_mix }, .guided = true },
+        .{ .name = "IN list under AND", .expr = .{ .@"and" = in_and }, .guided = true },
+        .{ .name = "IN list OR an AND", .expr = .{ .@"or" = with_and }, .guided = false },
+        .{ .name = "FOR NOT IN, 150 literals", .expr = try Lists.notIn(arena, num_long), .guided = true },
+        .{ .name = "RLE NOT IN", .expr = try Lists.notIn(arena, run_list), .guided = true },
+        .{ .name = "dict NOT IN, hashed", .expr = try Lists.notIn(arena, tag_list), .guided = true },
+        .{ .name = "FSST NOT IN, hashed", .expr = try Lists.notIn(arena, url_list), .guided = true },
+        .{ .name = "raw text NOT IN, hashed", .expr = try Lists.notIn(arena, name_list), .guided = true },
+        .{ .name = "two NOT IN lists beside a leaf", .expr = .{ .@"and" = not_in_and }, .guided = true },
+    };
+
+    for (cases) |c| {
+        var base = try scan(allocator, t);
+        var q = try base.filter(c.expr);
+        defer q.deinit();
+        const filter_op: *exec.Filter = @ptrCast(@alignCast(q.ptr));
+        try std.testing.expect(filter_op.fused);
+
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        while (try q.next()) |b| try got.appendSlice(allocator, b.values[0].data.bigint[0..b.row_count]);
+        std.mem.sort(i64, got.items, {}, std.sort.asc(i64));
+
+        var want: std.ArrayList(i64) = .empty;
+        defer want.deinit(allocator);
+        for (rows) |row| {
+            if (inListRef(c.expr, row)) try want.append(allocator, row.id);
+        }
+        std.testing.expectEqualSlices(i64, want.items, got.items) catch |err| {
+            std.debug.print("case: {s}\n", .{c.name});
+            return err;
+        };
+        if (c.guided) {
+            const s: *exec.Scan = @ptrCast(@alignCast(filter_op.upstream.ptr));
+            try std.testing.expect(s.rgs_guided > 0);
+        }
+    }
+}
+
 // A table under a FROM alias (every join side) fuses its WHERE with the
 // qualified names; the block-sourced path must resolve them like the prune
 // hints do, or every row group decodes all projected columns in full.
