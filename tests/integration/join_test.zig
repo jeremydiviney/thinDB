@@ -3504,8 +3504,9 @@ test "join: a key both inputs pin to one literal leaves the join keys" {
     try helpers.exec(allocator, db, sql.items);
 
     // Each case runs beside a twin whose pins hide behind an expression, so
-    // no key there is provably constant: both must return the same rows. The
-    // count is the keys left on each join of the case, outermost first.
+    // no key there is provably constant: both must return the same columns
+    // and rows. The count is the keys left on each join of the case,
+    // outermost first.
     const cases = .{
         .{
             "SELECT f.k, f.amount, d.since FROM (SELECT * FROM fact WHERE tenant = 2 AND model = 'x') f JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k",
@@ -3530,6 +3531,11 @@ test "join: a key both inputs pin to one literal leaves the join keys" {
         .{
             "SELECT f.k, f.amount, d.k, d.since FROM (SELECT * FROM fact WHERE tenant = 1 AND model = 'x') f FULL JOIN (SELECT * FROM dim WHERE tenant = 1 AND model = 'x') d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k, d.k",
             "SELECT f.k, f.amount, d.k, d.since FROM (SELECT * FROM fact WHERE tenant + 0 = 1 AND CONCAT(model, '') = 'x') f FULL JOIN (SELECT * FROM dim WHERE tenant + 0 = 1 AND CONCAT(model, '') = 'x') d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k, d.k",
+            &[_]usize{1},
+        },
+        .{
+            "SELECT * FROM dim d JOIN (SELECT tenant, model, k, SUM(amount) AS total FROM fact WHERE tenant = 2 AND model = 'x' GROUP BY tenant, model, k) f ON f.tenant = d.tenant AND f.model = d.model AND f.k = d.k ORDER BY d.k",
+            "SELECT * FROM dim d JOIN (SELECT tenant, model, k, SUM(amount) AS total FROM fact WHERE tenant + 0 = 2 AND CONCAT(model, '') = 'x' GROUP BY tenant, model, k) f ON f.tenant = d.tenant AND f.model = d.model AND f.k = d.k ORDER BY d.k",
             &[_]usize{1},
         },
         .{
@@ -3561,7 +3567,7 @@ test "join: a key both inputs pin to one literal leaves the join keys" {
         defer allocator.free(got);
         const want = try crossRowsText(allocator, db, c[1]);
         defer allocator.free(want);
-        try std.testing.expectEqualStrings(want[std.mem.indexOfScalar(u8, want, '\n') orelse want.len ..], got[std.mem.indexOfScalar(u8, got, '\n') orelse got.len ..]);
+        try std.testing.expectEqualStrings(want, got);
         const keys = try joinKeyCounts(allocator, db, c[0]);
         defer allocator.free(keys);
         try std.testing.expectEqualSlices(usize, c[2], keys);

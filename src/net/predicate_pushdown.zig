@@ -511,12 +511,51 @@ fn dropJoinPinnedKeys(ctx: Ctx, j: *ir.Op.Join) anyerror!void {
     var kept: std.ArrayListUnmanaged(ir.JoinKeyPair) = .empty;
     for (j.on, 0..) |pair, i| {
         const last_left = kept.items.len == 0 and i == j.on.len - 1;
-        if (!last_left and !pair.null_safe and try pinnedAlike(ctx, j, pair)) continue;
+        if (!last_left and !pair.null_safe and try pinnedAlike(ctx, j, pair) and try dropKeyCopy(ctx, j, pair.right)) continue;
         try kept.append(ctx.arena, pair);
     }
     if (kept.items.len == j.on.len) return;
     if (trace_push) std.debug.print("[ppd]   pinned keys dropped: {d} of {d}\n", .{ j.on.len - kept.items.len, j.on.len });
     j.on = kept.items;
+}
+
+/// Remove the parser's `__join_on_right_N` copy that right key `name` reads.
+/// The join hides a right key from its output only while it is a key, so the
+/// copy of a dropped pair would surface in `SELECT *`. False, and the pair
+/// stays, when `name` is no such copy or anything besides the key reads it.
+fn dropKeyCopy(ctx: Ctx, j: *ir.Op.Join, name: []const u8) anyerror!bool {
+    if (!std.mem.startsWith(u8, name, "__join_on_right_")) return false;
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    var parent: ?*ir.Op = null;
+    var cur: *ir.Op = j.right;
+    while (true) {
+        const upstream = switch (cur.*) {
+            .filter => |f| blk: {
+                if (!collectPredCols(ctx.arena, f.predicate, &refs)) return false;
+                break :blk f.upstream;
+            },
+            .compute => |c| blk: {
+                var copy: ?usize = null;
+                for (c.derived, 0..) |d, i| {
+                    if (sameColumn(d.name, name)) {
+                        copy = i;
+                    } else if (!try collectExprRefs(ctx.arena, d.expr, &refs)) return false;
+                }
+                const at = copy orelse break :blk c.upstream;
+                if (contains(refs.items, name)) return false;
+                const rest = try std.mem.concat(ctx.arena, ir.Derived, &.{ c.derived[0..at], c.derived[at + 1 ..] });
+                if (rest.len > 0) {
+                    cur.compute.derived = rest;
+                } else if (parent) |p| {
+                    if (p.* == .filter) p.filter.upstream = c.upstream else p.compute.upstream = c.upstream;
+                } else j.right = @constCast(c.upstream);
+                return true;
+            },
+            else => return false,
+        };
+        parent = cur;
+        cur = @constCast(upstream);
+    }
 }
 
 fn pinnedAlike(ctx: Ctx, j: *const ir.Op.Join, pair: ir.JoinKeyPair) anyerror!bool {
