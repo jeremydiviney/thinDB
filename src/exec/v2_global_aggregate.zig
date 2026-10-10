@@ -36,6 +36,7 @@ const compute = @import("compute.zig");
 const udf_mod = @import("../udf.zig");
 const expr = @import("expr.zig");
 const Scan = @import("scan.zig").Scan;
+const RowGroupTiles = @import("rg_tiles.zig").RowGroupTiles;
 const SiloCore = exec.silo_group_core;
 const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
@@ -739,7 +740,7 @@ const Worker = struct {
     seg_start: []const usize,
     segment_count: usize,
     total_rgs: usize,
-    next_rg: *std.atomic.Value(usize),
+    tiles: *RowGroupTiles,
     err: ?anyerror = null,
 };
 
@@ -811,13 +812,11 @@ fn workerRun(w: *Worker) !void {
     }
     while (true) {
         try exec.memory.checkCancelled(w.allocator);
-        const lo = w.next_rg.fetchAdd(TILE_RGS, .monotonic);
-        if (lo >= w.total_rgs) break;
-        const hi = @min(lo + TILE_RGS, w.total_rgs);
-        const start = flatToCoord(lo, w.seg_start, w.segment_count, w.total_rgs);
-        const end = flatToCoord(hi, w.seg_start, w.segment_count, w.total_rgs);
+        const tile = w.tiles.claim() orelse break;
+        const start = flatToCoord(tile.lo, w.seg_start, w.segment_count, w.total_rgs);
+        const end = flatToCoord(tile.hi, w.seg_start, w.segment_count, w.total_rgs);
         // The final tile also drains the memtable (scan_memtable = true).
-        w.source.resetRange(start.seg, start.rg, end.seg, end.rg, hi == w.total_rgs);
+        w.source.resetRange(start.seg, start.rg, end.seg, end.rg, tile.hi == w.total_rgs);
         try driveTile(w, &have_resolved);
     }
 }
@@ -1375,8 +1374,8 @@ const GlobalAggregate = struct {
         self.row_count = 1;
     }
 
-    fn openScan(self: *GlobalAggregate, snap: ?Scan.Snapshot) !ScanSource {
-        return openScanSource(self.allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, snap, self.udf_registry);
+    fn openScan(self: *GlobalAggregate, allocator: Allocator, snap: ?Scan.Snapshot) !ScanSource {
+        return openScanSource(allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, snap, self.udf_registry);
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {
@@ -1384,7 +1383,7 @@ const GlobalAggregate = struct {
         // `finalizeDistinct` just reads back that single sub-table's count.
         var lane = try Lane.init(self.allocator, self.plans, 1);
         errdefer lane.deinit(self.allocator);
-        var source = try self.openScan(null);
+        var source = try self.openScan(self.allocator, null);
         defer source.deinit();
         try driveScan(&lane, self.plans, self.allocator, &source);
         lane.finalizeDistinct(self.plans);
@@ -1432,9 +1431,13 @@ const GlobalAggregate = struct {
             self.allocator.free(w.resolved);
         };
 
-        var next_rg = std.atomic.Value(usize).init(0);
+        var tiles: RowGroupTiles = .{};
+        defer tiles.deinit(self.allocator);
+        // Worker decode buffers recycle through the process buffer pool rather
+        // than paying page faults and an OS release every query.
+        const scan_allocator = try exec.memory.workerAllocatorOf(self.allocator);
         for (workers, 0..) |*w, i| {
-            var source = try self.openScan(snap);
+            var source = try self.openScan(scan_allocator, snap);
             errdefer source.deinit();
             var lane = try Lane.init(self.allocator, self.plans, n_workers);
             errdefer lane.deinit(self.allocator);
@@ -1450,9 +1453,16 @@ const GlobalAggregate = struct {
                 .seg_start = seg_start,
                 .segment_count = snap.segment_count,
                 .total_rgs = total_rgs,
-                .next_rg = &next_rg,
+                .tiles = &tiles,
             };
             built += 1;
+        }
+        // Every worker scan carries the same prune hints; cut the tiles over
+        // the row groups they leave.
+        {
+            const mask = workers[0].source.scan.survivingMask(self.allocator);
+            defer if (mask) |m| self.allocator.free(m);
+            tiles = try RowGroupTiles.init(self.allocator, total_rgs, mask, n_workers, TILE_RGS);
         }
         // All worker scans now hold their own memtable pins.
         snap.memtable_snap.release();

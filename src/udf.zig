@@ -260,6 +260,11 @@ pub const TableEntry = struct {
     kernel_input_cols: u32,
     process: TvfProcess,
     user_data: ?*anyopaque,
+    /// Unique per registration within its registry, from 1; 0 for entries
+    /// built directly rather than registered. A replaced function's new
+    /// library can load where the old one was, so its `process` pointer may
+    /// repeat — caches that retain kernel state key on this instead.
+    registration: u64 = 0,
 };
 
 /// A SQL inline table function: `CREATE FUNCTION f(a INT, ...) RETURNS
@@ -685,6 +690,7 @@ pub const UdfRegistry = struct {
     scalars: std.ArrayList(ScalarEntry) = .empty,
     aggregates: std.ArrayList(AggregateEntry) = .empty,
     tables: std.ArrayList(TableEntry) = .empty,
+    last_registration: u64 = 0,
 
     pub fn init(allocator: Allocator) UdfRegistry {
         return .{ .allocator = allocator };
@@ -812,7 +818,9 @@ pub const UdfRegistry = struct {
                 udf.kernel_input_cols,
             .process = udf.process,
             .user_data = udf.user_data,
+            .registration = self.last_registration + 1,
         });
+        self.last_registration += 1;
     }
 
     pub fn dropTable(self: *UdfRegistry, name: []const u8) bool {
