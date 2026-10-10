@@ -859,6 +859,44 @@ test "orderPredicate flattens parser-nested AND/OR chains" {
     for (or_ordered.@"or") |c| try std.testing.expect(c != .@"or");
 }
 
+test "orderPredicate orders by cost then pass-fraction, keeping ties in written order" {
+    const allocator = std.testing.allocator;
+    const schema = [_]Column{
+        .{ .name = "n", .type = .int },
+        .{ .name = "s", .type = .{ .varchar = 64 } },
+    };
+    const stats = [_]exec.ColStat{ .{ .ndv = .{ .exact = 10 } }, .{} };
+
+    const like_s: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%x%" } };
+    const s_eq: PredicateExpr = .{ .leaf = .{ .col = "s", .op = .eq, .val = .{ .text = "a" } } };
+    const n_neq: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .neq, .val = .{ .int = 1 } } };
+    const n_eq_2: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = 2 } } };
+    const n_eq_3: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = 3 } } };
+    const written = [_]PredicateExpr{ like_s, s_eq, n_neq, n_eq_2, n_eq_3 };
+
+    var rewritten: std.ArrayListUnmanaged([]PredicateExpr) = .empty;
+    defer {
+        for (rewritten.items) |s| allocator.free(s);
+        rewritten.deinit(allocator);
+    }
+
+    // AND: cheapest class first, most selective first within it.
+    const conj = try orderPredicate(allocator, &rewritten, .{ .@"and" = &written }, &schema, &stats);
+    try expectJunctionOrder(&.{ n_eq_2, n_eq_3, n_neq, s_eq, like_s }, conj.@"and");
+
+    // OR: cheapest class first, most likely TRUE first within it.
+    const disj = try orderPredicate(allocator, &rewritten, .{ .@"or" = &written }, &schema, &stats);
+    try expectJunctionOrder(&.{ n_neq, n_eq_2, n_eq_3, s_eq, like_s }, disj.@"or");
+}
+
+fn expectJunctionOrder(want: []const PredicateExpr, got: []const PredicateExpr) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        try std.testing.expectEqual(std.meta.activeTag(w), std.meta.activeTag(g));
+        if (w == .leaf) try std.testing.expectEqual(w.leaf, g.leaf);
+    }
+}
+
 /// Tighten the upstream per-column stats with the proven bounds a filter
 /// predicate guarantees. Only top-level AND conjuncts contribute (an OR/NOT
 /// branch proves nothing about any single column). For each contributing
@@ -1039,7 +1077,7 @@ fn simplifyPredicate(
             // Order conjuncts cheap+selective first, expensive last (commutative,
             // so results are unchanged) — owns the slice since the borrowed
             // `children` can't be reordered in place.
-            std.mem.sort(PredicateExpr, survivors.items, ConjunctSortCtx{ .schema = schema, .stats = stats }, ConjunctSortCtx.lessThan);
+            try sortByKey(allocator, survivors.items, schema, stats, .conjuncts);
             const owned = try survivors.toOwnedSlice(allocator);
             errdefer allocator.free(owned);
             try rewritten.append(allocator, owned);
@@ -1078,7 +1116,7 @@ fn simplifyPredicate(
             // Order disjuncts cheapest first, and within a cost class the
             // most-likely-TRUE first so the OR short-circuits early (the
             // evaluator skips already-satisfied rows in later disjuncts).
-            std.mem.sort(PredicateExpr, survivors.items, DisjunctSortCtx{ .schema = schema, .stats = stats }, DisjunctSortCtx.lessThan);
+            try sortByKey(allocator, survivors.items, schema, stats, .disjuncts);
             const owned = try survivors.toOwnedSlice(allocator);
             errdefer allocator.free(owned);
             try rewritten.append(allocator, owned);
@@ -1240,28 +1278,35 @@ fn colSelectivity(col: []const u8, schema: []const Column, stats: []const exec.C
     };
 }
 
-const ConjunctSortCtx = struct {
-    schema: []const Column,
-    stats: []const exec.ColStat,
-    fn lessThan(ctx: ConjunctSortCtx, a: PredicateExpr, b: PredicateExpr) bool {
-        const ka = conjunctKey(a, ctx.schema, ctx.stats);
-        const kb = conjunctKey(b, ctx.schema, ctx.stats);
-        if (ka.cost != kb.cost) return ka.cost < kb.cost;
-        return ka.sel < kb.sel;
+const KeyedPredicate = struct { key: ConjunctKey, expr: PredicateExpr };
+
+/// Conjuncts sort by cost, then most-selective first. Disjuncts sort by
+/// cost, then within a cost class the most-likely-TRUE (highest
+/// pass-fraction) first, so the OR is satisfied early and the evaluator's
+/// short-circuit skips already-true rows in the costlier later disjuncts.
+/// Both junctions are commutative, so order never changes results.
+const JunctionOrder = enum {
+    conjuncts,
+    disjuncts,
+
+    fn lessThan(order: JunctionOrder, a: KeyedPredicate, b: KeyedPredicate) bool {
+        if (a.key.cost != b.key.cost) return a.key.cost < b.key.cost;
+        return switch (order) {
+            .conjuncts => a.key.sel < b.key.sel,
+            .disjuncts => a.key.sel > b.key.sel,
+        };
     }
 };
 
-/// Disjunct ordering: cheapest first, then within a cost class the
-/// most-likely-TRUE (highest pass-fraction) first, so the OR is satisfied
-/// early and the evaluator's short-circuit skips already-true rows in the
-/// costlier later disjuncts. OR is commutative, so order never changes results.
-const DisjunctSortCtx = struct {
-    schema: []const Column,
-    stats: []const exec.ColStat,
-    fn lessThan(ctx: DisjunctSortCtx, a: PredicateExpr, b: PredicateExpr) bool {
-        const ka = conjunctKey(a, ctx.schema, ctx.stats);
-        const kb = conjunctKey(b, ctx.schema, ctx.stats);
-        if (ka.cost != kb.cost) return ka.cost < kb.cost;
-        return ka.sel > kb.sel;
-    }
-};
+/// Keys are computed once per item, not per comparison: a key resolves a
+/// column by name and a nested junction's key walks all of its children, so
+/// a comparator that computed them made a long IN list (one OR arm per
+/// literal) cost n log n name lookups, and every comparison of the AND
+/// above it walked the whole list again.
+fn sortByKey(allocator: Allocator, items: []PredicateExpr, schema: []const Column, stats: []const exec.ColStat, order: JunctionOrder) !void {
+    const keyed = try allocator.alloc(KeyedPredicate, items.len);
+    defer allocator.free(keyed);
+    for (items, keyed) |expr, *k| k.* = .{ .key = conjunctKey(expr, schema, stats), .expr = expr };
+    std.mem.sort(KeyedPredicate, keyed, order, JunctionOrder.lessThan);
+    for (items, keyed) |*expr, k| expr.* = k.expr;
+}
