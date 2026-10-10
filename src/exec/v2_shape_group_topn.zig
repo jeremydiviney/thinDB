@@ -396,6 +396,8 @@ const GroupTopNPipeline = struct {
     /// columns, for the scans `execute` builds.
     offered_ranges: std.ArrayListUnmanaged(exec.Predicate) = .empty,
     offered_sets: std.ArrayListUnmanaged(exec.InSet) = .empty,
+    /// `prunedTableRows`, once counted.
+    pruned_rows: ?u64 = null,
 
     fn init(allocator: Allocator, table: *api.Table, request: Request, plan: ShapePlan) !GroupTopNPipeline {
         const owned_needed = if (request.needed) |needed| try allocator.dupe([]const u8, needed) else null;
@@ -485,6 +487,36 @@ const GroupTopNPipeline = struct {
         var hint = set;
         hint.col = (try self.groupKeySource(set.col)) orelse return;
         try self.offered_sets.append(self.allocator, hint);
+    }
+
+    /// The rows `execute`'s scans read, when a row offer on `col` reaches
+    /// them (`groupKeySource`): its scans fuse the offered set.
+    pub fn rowSetTargetRows(self: *GroupTopNPipeline, col: []const u8) u64 {
+        _ = (self.groupKeySource(col) catch return 0) orelse return 0;
+        return self.prunedTableRows() catch 0;
+    }
+
+    /// The table rows the WHERE's and the offered hints keep, counted from
+    /// segment footers by a scan set up as `execute`'s are. Cached: the
+    /// count only steers whether a consumer offers a set.
+    fn prunedTableRows(self: *GroupTopNPipeline) !u64 {
+        if (self.pruned_rows) |rows| return rows;
+        const table = self.table;
+        table.ddl_lock.lockSharedUncancelable(table.io);
+        defer table.ddl_lock.unlockShared(table.io);
+        const snapshot = try Scan.captureSnapshotAlloc(table, self.allocator);
+        defer {
+            snapshot.memtable_snap.release();
+            self.allocator.free(snapshot.segments);
+        }
+        const scan = try Scan.allocWithProjectionLoc(self.allocator, table, null, null, false, snapshot);
+        defer scan.deinit();
+        if (self.request.where_filter) |expr| _ = try scan.tryFuseFilter(expr);
+        const offered: Scan.OfferedPrunes = .{ .ranges = self.offered_ranges.items, .sets = self.offered_sets.items };
+        _ = try offered.apply(scan);
+        const rows = scan.stats().upper_rows;
+        self.pruned_rows = rows;
+        return rows;
     }
 
     /// The scan column behind group key `col`, when a hint on it may skip

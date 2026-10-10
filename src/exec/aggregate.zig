@@ -35,6 +35,20 @@ pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices
     return offer.offerTo(upstream, upstream.outputSchema()[group_indices[idx]].name);
 }
 
+/// The upstream's name for group key `col` of a grouped aggregate; null
+/// for an aggregate output or a column the aggregate doesn't emit.
+pub fn group_input_name(upstream: Query, schema: []const Column, group_indices: []const usize, col: []const u8) ?[]const u8 {
+    const idx = types.findColumn(schema, col) orelse return null;
+    if (idx >= group_indices.len) return null;
+    return upstream.outputSchema()[group_indices[idx]].name;
+}
+
+/// `rowSetTargetRows` of an aggregate that emits every group: a row offer
+/// on a group key drops whole groups, so it filters the input on that key.
+pub fn group_row_set_target_rows(upstream: Query, schema: []const Column, group_indices: []const usize, col: []const u8) u64 {
+    return upstream.rowSetTargetRows(group_input_name(upstream, schema, group_indices, col) orelse return 0);
+}
+
 const simd = @import("../util/simd.zig");
 const StringBank = @import("../util/string_bank.zig").StringBank;
 const scalar_common = @import("scalar_fn_common.zig");
@@ -1436,6 +1450,11 @@ pub const Aggregate = struct {
         return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
 
+    pub fn rowSetTargetRows(self: *Aggregate, col: []const u8) u64 {
+        if (self.top_k != null or self.emit_limit != null) return 0;
+        return group_row_set_target_rows(self.upstream, self.output_schema, self.group_col_indices, col);
+    }
+
     /// Global aggregate (no group_cols): always emits exactly 1 row.
     /// Grouped aggregate: emits at most `min(∏ NDV(group keys), input rows)`
     /// rows — the provable group-count bound (cached at create), and at most
@@ -2794,6 +2813,10 @@ pub const SortedAggregate = struct {
 
     pub fn addPruneSet(self: *SortedAggregate, set: predicate.InSet) !void {
         return prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
+    }
+
+    pub fn rowSetTargetRows(self: *SortedAggregate, col: []const u8) u64 {
+        return group_row_set_target_rows(self.upstream, self.output_schema, self.group_col_indices, col);
     }
 
     pub fn stats(self: *SortedAggregate) exec.PipelineStats {

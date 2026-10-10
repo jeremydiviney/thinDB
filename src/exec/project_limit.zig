@@ -160,9 +160,21 @@ pub const Project = struct {
     }
 
     fn offerPrune(self: *Project, offer: exec.PruneOffer) !void {
-        if (self.probe_fused) return;
-        const idx = types.findColumn(self.output_schema, offer.column()) orelse return Error.ColumnNotFound;
-        return offer.offerTo(&self.upstream, self.upstream.outputSchema()[self.column_map[idx]].name);
+        return offer.offerTo(&self.upstream, (try self.inputColumnName(offer.column())) orelse return);
+    }
+
+    pub fn rowSetTargetRows(self: *Project, col: []const u8) u64 {
+        const name = (self.inputColumnName(col) catch return 0) orelse return 0;
+        return self.upstream.rowSetTargetRows(name);
+    }
+
+    /// The upstream's name for output column `col`. Probe-fused, the
+    /// upstream's live schema no longer lines up with `column_map`, so only
+    /// an unrenamed column still names its source.
+    pub fn inputColumnName(self: *Project, col: []const u8) error{ColumnNotFound}!?[]const u8 {
+        const idx = types.findColumn(self.output_schema, col) orelse return error.ColumnNotFound;
+        if (self.probe_fused) return if (self.owned_names == null) self.output_schema[idx].name else null;
+        return self.upstream.outputSchema()[self.column_map[idx]].name;
     }
 
     /// Pure view remap — data buffers are the upstream's.

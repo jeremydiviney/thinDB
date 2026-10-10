@@ -340,6 +340,10 @@ pub const Filter = struct {
         return self.upstream.addPruneSet(set);
     }
 
+    pub fn rowSetTargetRows(self: *Filter, col: []const u8) u64 {
+        return self.upstream.rowSetTargetRows(col);
+    }
+
     /// A second filter layered above forwards straight through — two
     /// restrictions compose as AND regardless of order, so the lower one
     /// (often a scan-fused WHERE) can absorb the new predicate too and the

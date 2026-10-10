@@ -187,6 +187,11 @@ pub const InSet = struct {
     /// Type of the subquery column the values were drained from; null for
     /// a literal list.
     value_type: ?types.Type = null,
+    /// As a prune offer (`Query.addPruneSet`): the offering consumer drops
+    /// every row whose value is not in `values`, NULL included, so a scan
+    /// may filter those rows out, not only skip row groups. Meaningless in
+    /// a predicate expression.
+    rows: bool = false,
 };
 
 /// The column an OR tests when every arm is `col = literal` on that one
