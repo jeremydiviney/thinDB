@@ -34,7 +34,9 @@ const types = @import("../types.zig");
 const join_mod = @import("../exec/join.zig");
 const cast = @import("../exec/cast.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
+const compute = @import("../exec/compute.zig");
 const udf = @import("../udf.zig");
+const api = @import("../api/api.zig");
 const recursive_cte = @import("recursive_cte.zig");
 
 const PredicateExpr = exec.predicate.PredicateExpr;
@@ -3138,4 +3140,218 @@ fn bodyFormsBarrier(op: *const ir.Op) bool {
             else => return false,
         }
     }
+}
+
+/// Pre-execution rewrite: every reference to a shared thin CTE gets its own
+/// copy of the body. A thin body reads one key range of a base table through
+/// repeatable row-at-a-time steps. Row-group pruning finds that range, so a
+/// copy rereads it for about what reading it once cost, where sharing it
+/// costs a buffer of every row in the range. Each copy compiles inline under
+/// its own reader, whose filters and projections then reach the scan. A body
+/// whose filters test rows inside the range stays shared: each copy would
+/// repeat that work. Runs before predicate pushdown.
+pub fn unshareThinCtes(
+    allocator: Allocator,
+    node_arena: Allocator,
+    catalog: *api.Catalog,
+    session: api.Session,
+    root: *ir.Op,
+    registry: ?*const udf.UdfRegistry,
+) Allocator.Error!void {
+    var u: Unshare = .{ .allocator = allocator, .node_arena = node_arena, .catalog = catalog, .session = session, .registry = registry };
+    defer u.refs.deinit(allocator);
+    defer u.visited.deinit(allocator);
+    try countReferences(allocator, root, &u.refs);
+    try unshareChildren(&u, root);
+}
+
+const Unshare = struct {
+    allocator: Allocator,
+    node_arena: Allocator,
+    catalog: *api.Catalog,
+    session: api.Session,
+    registry: ?*const udf.UdfRegistry,
+    refs: std.AutoHashMapUnmanaged(*const ir.Op, u32) = .empty,
+    visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty,
+};
+
+/// Parent edges per `.materialize` node, each shared body walked once — the
+/// count the staged compiler's own reference count arrives at.
+fn countReferences(allocator: Allocator, op: *const ir.Op, refs: *std.AutoHashMapUnmanaged(*const ir.Op, u32)) Allocator.Error!void {
+    if (op.* == .materialize) {
+        const gop = try refs.getOrPut(allocator, op);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+            return;
+        }
+        gop.value_ptr.* = 1;
+    }
+    switch (op.*) {
+        inline else => |payload| {
+            const Payload = @TypeOf(payload);
+            if (@typeInfo(Payload) != .@"struct") return;
+            inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                const child = @field(payload, field.name);
+                if (field.type == *ir.Op) {
+                    try countReferences(allocator, child, refs);
+                } else if (field.type == ?*ir.Op) {
+                    if (child) |c| try countReferences(allocator, c, refs);
+                } else if (field.type == []const *ir.Op) {
+                    for (child) |c| try countReferences(allocator, c, refs);
+                }
+            }
+        },
+    }
+}
+
+fn unshareChildren(u: *Unshare, op: *ir.Op) Allocator.Error!void {
+    if (op.* == .materialize) {
+        const gop = try u.visited.getOrPut(u.allocator, op);
+        if (gop.found_existing) return;
+    }
+    switch (op.*) {
+        inline else => |*payload| {
+            const Payload = @TypeOf(payload.*);
+            if (@typeInfo(Payload) != .@"struct") return;
+            inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                const child = &@field(payload.*, field.name);
+                if (field.type == *ir.Op) {
+                    child.* = try unshareEdge(u, child.*);
+                } else if (field.type == ?*ir.Op) {
+                    if (child.*) |c| child.* = try unshareEdge(u, c);
+                } else if (field.type == []const *ir.Op) {
+                    const ops = try u.node_arena.dupe(*ir.Op, child.*);
+                    for (ops) |*c| c.* = try unshareEdge(u, c.*);
+                    child.* = ops;
+                }
+            }
+        },
+    }
+}
+
+/// The node this edge should reach: a private copy when it reaches a shared
+/// thin CTE, otherwise the node itself, its own edges rewritten.
+fn unshareEdge(u: *Unshare, target: *ir.Op) Allocator.Error!*ir.Op {
+    if (target.* == .materialize and try unshareable(u, target)) {
+        const copy = try u.node_arena.create(ir.Op);
+        copy.* = target.*;
+        copy.materialize.upstream = try target.materialize.upstream.cloneTree(u.node_arena);
+        copy.materialize.structural_cse = false;
+        return copy;
+    }
+    try unshareChildren(u, target);
+    return target;
+}
+
+/// A thin body the staged compiler would otherwise buffer once: a shared CTE,
+/// or a boundary structural CSE would merge with an identical one.
+/// Explicitly materialized, recursive and KEYED BY bodies keep their buffer:
+/// the user asked for it, or an iteration or region reads it.
+fn unshareable(u: *const Unshare, node: *const ir.Op) Allocator.Error!bool {
+    const m = node.materialize;
+    if (m.forced or m.recursion != null or m.region_keys != null) return false;
+    if (!m.structural_cse and (u.refs.get(node) orelse 1) < 2) return false;
+    return isThinBody(u, m.upstream);
+}
+
+/// A base-table scan under nothing but projections, renames, filters and
+/// computes that give every evaluation the same value, whose filters sit on
+/// the scan and select a range of the table's order key.
+fn isThinBody(u: *const Unshare, op: *const ir.Op) Allocator.Error!bool {
+    var conjuncts: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    defer conjuncts.deinit(u.allocator);
+    var cur = op;
+    while (true) {
+        switch (cur.*) {
+            .scan => |s| {
+                const table = engine_v2.resolveTable(u.catalog, u.session, s.table) catch return false;
+                return selectsKeyRange(conjuncts.items, table.schema.order_key);
+            },
+            .alias => |a| cur = a.upstream,
+            .filter => |f| {
+                if (!predicateRepeatable(f.predicate)) return false;
+                try appendConjuncts(u.allocator, f.predicate, &conjuncts);
+                cur = f.upstream;
+            },
+            // A filter above a projection or compute may name its outputs
+            // rather than the table's columns.
+            .select, .exclude => |p| {
+                if (conjuncts.items.len > 0) return false;
+                cur = p.upstream;
+            },
+            .compute => |c| {
+                if (conjuncts.items.len > 0) return false;
+                for (c.derived) |d| if (compute.mayVary(d.expr, u.registry)) return false;
+                cur = c.upstream;
+            },
+            else => return false,
+        }
+    }
+}
+
+fn appendConjuncts(allocator: Allocator, p: PredicateExpr, out: *std.ArrayListUnmanaged(PredicateExpr)) Allocator.Error!void {
+    if (p == .@"and") {
+        for (p.@"and") |child| try appendConjuncts(allocator, child, out);
+        return;
+    }
+    try out.append(allocator, p);
+}
+
+/// Whether `conjuncts` only bound a prefix of `order_key`: equalities or IN
+/// lists on its leading columns, then range bounds on the next one at most.
+/// Segments store rows in key order, so row-group min/max prune the scan to
+/// the range and few rows outside it reach the filter.
+fn selectsKeyRange(conjuncts: []const PredicateExpr, order_key: []const []const u8) bool {
+    var prefix: usize = 0;
+    while (prefix < order_key.len and pinsKeyColumn(conjuncts, order_key[prefix])) prefix += 1;
+    for (conjuncts) |c| {
+        if (c == .always and c.always) continue;
+        const bound = keyBound(c) orelse return false;
+        const idx = keyColumnIndex(order_key, bound.col) orelse return false;
+        if (idx > prefix) return false;
+    }
+    return true;
+}
+
+const KeyBound = struct { col: []const u8, point: bool };
+
+/// The column `c` bounds and whether it pins it to points, for a comparison
+/// or IN list a zone map can prune by.
+fn keyBound(c: PredicateExpr) ?KeyBound {
+    return switch (c) {
+        .leaf => |p| if (p.as_boolean or p.op == .neq) null else .{ .col = p.col, .point = p.op == .eq },
+        .in_set => |s| if (s.negate) null else .{ .col = s.col, .point = true },
+        else => null,
+    };
+}
+
+fn pinsKeyColumn(conjuncts: []const PredicateExpr, key: []const u8) bool {
+    for (conjuncts) |c| {
+        const bound = keyBound(c) orelse continue;
+        if (bound.point and types.columnNameEql(bareName(bound.col), key)) return true;
+    }
+    return false;
+}
+
+fn keyColumnIndex(order_key: []const []const u8, name: []const u8) ?usize {
+    for (order_key, 0..) |key, i| if (types.columnNameEql(bareName(name), key)) return i;
+    return null;
+}
+
+/// A single-table body's qualifier can only name its own scan.
+fn bareName(name: []const u8) []const u8 {
+    return if (types.splitQualifiedName(name)) |split| split.bare else name;
+}
+
+/// Subquery forms resolve to constant sets before this pass; one still
+/// standing would run once per copy.
+fn predicateRepeatable(p: PredicateExpr) bool {
+    return switch (p) {
+        .scalar_subquery, .exists_subquery, .in_subquery => false,
+        .@"and", .@"or" => |children| for (children) |child| {
+            if (!predicateRepeatable(child)) break false;
+        } else true,
+        .not => |child| predicateRepeatable(child.*),
+        else => true,
+    };
 }
