@@ -3864,13 +3864,13 @@ test "sql: NOT MATERIALIZED regenerates the CTE per reference" {
     _ = try seedT(db);
 
     var q = try runSql(allocator, db,
-        \\WITH big AS NOT MATERIALIZED (SELECT k FROM t WHERE k >= 200)
+        \\WITH big AS NOT MATERIALIZED (SELECT k FROM t WHERE id >= 3)
         \\SELECT big.k FROM big JOIN big AS other ON big.k = other.k
     );
     defer q.deinit();
 
-    // A thin body is cheaper rescanned per reference than buffered: each
-    // join branch inlines its own copy, so nothing stages.
+    // A thin body over a key range is cheaper rescanned per reference than
+    // buffered: each join branch inlines its own copy, so nothing stages.
     try std.testing.expectEqual(@as(u32, 0), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
 
     var rows: usize = 0;
@@ -3932,7 +3932,7 @@ test "sql: a thin CTE referenced twice gives each reference its own copy" {
     // Each reference filters differently; a shared buffer would hold the
     // union of what both need, a per-reference copy only its own rows.
     const sql =
-        \\WITH c AS (SELECT id, k, qty * 2 AS q2 FROM t WHERE qty >= 20)
+        \\WITH c AS (SELECT id, k, qty * 2 AS q2 FROM t WHERE id >= 2)
         \\SELECT a.id * 100 + b.id AS v FROM c a JOIN c b ON a.k = b.k
         \\WHERE a.q2 >= 60 AND b.id < 5 ORDER BY v
     ;
@@ -3946,12 +3946,28 @@ test "sql: a thin CTE referenced twice gives each reference its own copy" {
     try std.testing.expectEqualSlices(i64, &.{ 303, 304, 403, 404 }, unshared);
 
     const buffered = try helpers.collectBigints(allocator, db,
-        \\WITH c AS MATERIALIZED (SELECT id, k, qty * 2 AS q2 FROM t WHERE qty >= 20)
+        \\WITH c AS MATERIALIZED (SELECT id, k, qty * 2 AS q2 FROM t WHERE id >= 2)
         \\SELECT a.id * 100 + b.id AS v FROM c a JOIN c b ON a.k = b.k
         \\WHERE a.q2 >= 60 AND b.id < 5 ORDER BY v
     );
     defer allocator.free(buffered);
     try std.testing.expectEqualSlices(i64, unshared, buffered);
+
+    // A body that tests rows on a column outside the key would repeat that
+    // test in every copy, so it keeps one buffer.
+    const non_key =
+        \\WITH c AS (SELECT id, k, qty * 2 AS q2 FROM t WHERE qty >= 20)
+        \\SELECT a.id * 100 + b.id AS v FROM c a JOIN c b ON a.k = b.k
+        \\WHERE a.q2 >= 60 AND b.id < 5 ORDER BY v
+    ;
+    {
+        var q = try runSql(allocator, db, non_key);
+        defer q.deinit();
+        try std.testing.expectEqual(@as(u32, 1), q.cq.ctx.materialized.count() + q.cq.ctx.stage_count);
+    }
+    const shared = try helpers.collectBigints(allocator, db, non_key);
+    defer allocator.free(shared);
+    try std.testing.expectEqualSlices(i64, unshared, shared);
 
     // A body whose values differ per evaluation keeps one buffer, so every
     // reference reads the same rows.
