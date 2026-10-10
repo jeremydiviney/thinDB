@@ -1652,7 +1652,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return exec.AliasRename.create(input.allocator, up, a.alias);
         },
         .filter => |f| {
-            if (filterableJoin(f.upstream) != null) {
+            if (treeJoin(f.upstream) != null) {
                 const t_op = exec.prof.nowTicks();
                 defer exec.prof.addPhase("compile.op.filtered_join_incl", @intCast(exec.prof.nowTicks() - t_op));
                 return compileFilteredJoin(input, f.predicate, f.upstream, map, block_root);
@@ -2752,7 +2752,8 @@ fn joinSpecOf(j: anytype, input: engine_v2.CompileInput) ir.JoinSpec {
 /// resurface as null-extended output: INNER both inputs, LEFT the left,
 /// RIGHT the right, FULL neither. A conjunct no input resolves — subquery,
 /// correlated or variable markers, an ambiguous or unknown column — stays
-/// in a filter above the whole tree (WHERE semantics).
+/// in a filter above the whole tree (WHERE semantics). A filter inside the
+/// tree is opened the same way, its conjuncts placed with these.
 fn compileFilteredJoin(
     input: engine_v2.CompileInput,
     pred: PredicateExpr,
@@ -2774,7 +2775,7 @@ fn compileFilteredJoin(
     var above: std.ArrayListUnmanaged(PredicateExpr) = .empty;
     defer above.deinit(allocator);
     for (conjuncts.items) |c| {
-        try (if (tree.span(c) != null) &placed else &above).append(allocator, c);
+        try (if (tree.span(c, tree.allLeaves()) != null) &placed else &above).append(allocator, c);
     }
 
     var joined = try tree.buildInput(top, true, 0, placed.items);
@@ -2793,6 +2794,16 @@ fn filterableJoin(op: *const ir.Op) ?*const ir.Op {
     };
 }
 
+/// `op` as a join tree a WHERE above it reaches into: a filterable join, or
+/// one under filters, which the tree opens like the join itself and whose
+/// conjuncts it places with the WHERE's (`JoinTree.buildInput`).
+fn treeJoin(op: *const ir.Op) ?*const ir.Op {
+    return switch (op.*) {
+        .filter => |f| treeJoin(f.upstream),
+        else => filterableJoin(op),
+    };
+}
+
 /// Whether a filter above the join may move into its left input — also the
 /// input a join may probe.
 fn pushesLeft(j: ir.Op.Join) bool {
@@ -2805,6 +2816,9 @@ fn pushesRight(j: ir.Op.Join) bool {
 
 /// The lowest and highest leaf of a `JoinTree` a conjunct reads.
 const LeafSpan = struct { lo: usize, hi: usize };
+
+/// The leaves `[first, end)` of one input of a `JoinTree`.
+const LeafRange = struct { first: usize, end: usize };
 
 const LeafColumn = struct { leaf: usize, column: types.Column };
 
@@ -2829,6 +2843,7 @@ const JoinTree = struct {
     }
 
     fn compileInputs(self: *JoinTree, op: *const ir.Op, pushable: bool, is_probe: bool) anyerror!void {
+        if (pushable and op.* == .filter and treeJoin(op) != null) return self.compileInputs(op.filter.upstream, true, is_probe);
         if (pushable) if (filterableJoin(op)) |join_op| {
             const j = join_op.join;
             try self.compileInputs(j.left, pushesLeft(j), pushesLeft(j));
@@ -2845,6 +2860,7 @@ const JoinTree = struct {
 
     /// How many leaves `compileInputs` compiled under `op`.
     fn leafCount(op: *const ir.Op, pushable: bool) usize {
+        if (pushable and op.* == .filter and treeJoin(op) != null) return leafCount(op.filter.upstream, true);
         if (pushable) if (filterableJoin(op)) |join_op| {
             const j = join_op.join;
             return leafCount(j.left, pushesLeft(j)) + leafCount(j.right, pushesRight(j));
@@ -2852,47 +2868,53 @@ const JoinTree = struct {
         return 1;
     }
 
-    /// Null when the conjunct reads no column, a column no single leaf
-    /// resolves, or a subquery, correlated or variable marker.
-    fn span(self: *const JoinTree, c: PredicateExpr) ?LeafSpan {
+    fn allLeaves(self: *const JoinTree) LeafRange {
+        return .{ .first = 0, .end = self.schemas.items.len };
+    }
+
+    /// Null when the conjunct reads no column, a column no single leaf of
+    /// `range` resolves, or a subquery, correlated or variable marker.
+    fn span(self: *const JoinTree, c: PredicateExpr, range: LeafRange) ?LeafSpan {
         var s: ?LeafSpan = null;
-        if (!self.noteConjunct(c, &s)) return null;
+        if (!self.noteConjunct(c, range, &s)) return null;
         return s;
     }
 
-    fn noteConjunct(self: *const JoinTree, e: PredicateExpr, s: *?LeafSpan) bool {
+    fn noteConjunct(self: *const JoinTree, e: PredicateExpr, range: LeafRange, s: *?LeafSpan) bool {
         switch (e) {
-            .leaf, .text_as_number => |lf| return self.noteColumn(lf.col, s),
-            .leaf_col_col => |lc| return self.noteColumn(lc.left, s) and self.noteColumn(lc.right, s),
-            .is_null, .is_not_null => |col| return self.noteColumn(col, s),
-            .like => |lp| return self.noteColumn(lp.col, s),
-            .in_set, .text_as_number_set => |set| return self.noteColumn(set.col, s),
+            .leaf, .text_as_number => |lf| return self.noteColumn(lf.col, range, s),
+            .leaf_col_col => |lc| return self.noteColumn(lc.left, range, s) and self.noteColumn(lc.right, range, s),
+            .is_null, .is_not_null => |col| return self.noteColumn(col, range, s),
+            .like => |lp| return self.noteColumn(lp.col, range, s),
+            .in_set, .text_as_number_set => |set| return self.noteColumn(set.col, range, s),
             .@"and", .@"or" => |children| {
-                for (children) |ch| if (!self.noteConjunct(ch, s)) return false;
+                for (children) |ch| if (!self.noteConjunct(ch, range, s)) return false;
                 return true;
             },
-            .not => |child| return self.noteConjunct(child.*, s),
+            .not => |child| return self.noteConjunct(child.*, range, s),
             .always => return true,
             else => return false,
         }
     }
 
-    fn noteColumn(self: *const JoinTree, name: []const u8, s: *?LeafSpan) bool {
-        const leaf = self.leafOf(name) orelse return false;
+    fn noteColumn(self: *const JoinTree, name: []const u8, range: LeafRange, s: *?LeafSpan) bool {
+        const leaf = self.leafOf(name, range) orelse return false;
         s.* = if (s.*) |prev| .{ .lo = @min(prev.lo, leaf), .hi = @max(prev.hi, leaf) } else .{ .lo = leaf, .hi = leaf };
         return true;
     }
 
-    /// The one leaf whose output has `name`. `findColumn`'s qualified-name
-    /// tail matching can hit several (`h.RegionID` tail-matches a bare
-    /// `RegionID` elsewhere): an exact-name match on exactly one of them
-    /// disambiguates, anything else is ambiguous.
-    fn leafOf(self: *const JoinTree, name: []const u8) ?usize {
+    /// The one leaf of `range` whose output has `name`. `findColumn`'s
+    /// qualified-name tail matching can hit several (`h.RegionID`
+    /// tail-matches a bare `RegionID` elsewhere): an exact-name match on
+    /// exactly one of them disambiguates, anything else is ambiguous. A
+    /// conjunct a range resolves resolves the same in every range inside it
+    /// that holds its leaves.
+    fn leafOf(self: *const JoinTree, name: []const u8, range: LeafRange) ?usize {
         var hits: usize = 0;
         var hit: usize = 0;
         var exact_hits: usize = 0;
         var exact_hit: usize = 0;
-        for (self.schemas.items, 0..) |schema, i| {
+        for (self.schemas.items[range.first..range.end], range.first..) |schema, i| {
             if (types.findColumn(schema, name) == null) continue;
             hits += 1;
             hit = i;
@@ -2906,8 +2928,8 @@ const JoinTree = struct {
         return null;
     }
 
-    fn column(self: *const JoinTree, name: []const u8) ?LeafColumn {
-        const leaf = self.leafOf(name) orelse return null;
+    fn column(self: *const JoinTree, name: []const u8, range: LeafRange) ?LeafColumn {
+        const leaf = self.leafOf(name, range) orelse return null;
         const schema = self.schemas.items[leaf];
         const idx = types.findColumn(schema, name) orelse return null;
         return .{ .leaf = leaf, .column = schema[idx] };
@@ -2916,6 +2938,7 @@ const JoinTree = struct {
     /// Builds the input `op`, whose leaves start at `first_leaf`, placing
     /// `conjuncts` (each reading only those leaves) at their lowest point.
     fn buildInput(self: *JoinTree, op: *const ir.Op, pushable: bool, first_leaf: usize, conjuncts: []const PredicateExpr) anyerror!exec.Query {
+        if (pushable and op.* == .filter and treeJoin(op) != null) return self.buildFiltered(op, first_leaf, conjuncts);
         if (pushable) if (filterableJoin(op)) |join_op| {
             var joined = try self.buildJoin(join_op, first_leaf, conjuncts);
             if (op.* != .exclude) return joined;
@@ -2931,11 +2954,46 @@ const JoinTree = struct {
         return leaf.filter(try combineConjuncts(self.input.node_arena, conjuncts));
     }
 
+    /// A filter inside the tree, such as one an earlier pass left over a
+    /// join input, filters only the rows of the leaves under it: each of its
+    /// conjuncts those leaves resolve is placed with `conjuncts`, as a WHERE
+    /// over that input would be, and the rest stay right above the input.
+    /// Without this the filter hides the joins below it, so a WHERE
+    /// conjunct on one of their inputs lands above all of them.
+    fn buildFiltered(self: *JoinTree, op: *const ir.Op, first_leaf: usize, conjuncts: []const PredicateExpr) anyerror!exec.Query {
+        const allocator = self.input.allocator;
+        const upstream = op.filter.upstream;
+        const range: LeafRange = .{ .first = first_leaf, .end = first_leaf + leafCount(upstream, true) };
+        var own: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer own.deinit(allocator);
+        try flattenConjuncts(allocator, op.filter.predicate, &own);
+
+        var placed: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer placed.deinit(allocator);
+        var kept: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer kept.deinit(allocator);
+        try placed.appendSlice(allocator, conjuncts);
+        own: for (own.items) |c| {
+            if (self.span(c, range) == null) {
+                try kept.append(allocator, c);
+                continue;
+            }
+            for (placed.items) |p| if (exec.predicate.eql(p, c)) continue :own;
+            try placed.append(allocator, c);
+        }
+
+        var built = try self.buildInput(upstream, true, first_leaf, placed.items);
+        if (kept.items.len == 0) return built;
+        errdefer built.deinit();
+        return built.filter(try combineConjuncts(self.input.node_arena, kept.items));
+    }
+
     fn buildJoin(self: *JoinTree, join_op: *const ir.Op, first_leaf: usize, conjuncts: []const PredicateExpr) anyerror!exec.Query {
         const j = join_op.join;
         const input = self.input;
         const allocator = input.allocator;
         const first_right = first_leaf + leafCount(j.left, pushesLeft(j));
+        const range: LeafRange = .{ .first = first_leaf, .end = first_right + leafCount(j.right, pushesRight(j)) };
 
         var to_left: std.ArrayListUnmanaged(PredicateExpr) = .empty;
         defer to_left.deinit(allocator);
@@ -2946,13 +3004,13 @@ const JoinTree = struct {
         var residual: std.ArrayListUnmanaged(PredicateExpr) = .empty;
         defer residual.deinit(allocator);
         for (conjuncts) |c| {
-            const s = self.span(c).?;
+            const s = self.span(c, range).?;
             if (s.hi < first_right and pushesLeft(j)) {
                 try to_left.append(allocator, c);
             } else if (s.lo >= first_right and pushesRight(j)) {
                 try to_right.append(allocator, c);
             } else if (j.join_type == .inner and s.lo < first_right and s.hi >= first_right) {
-                if (try self.whereKey(c, first_right, key_copies.items.len)) |key| {
+                if (try self.whereKey(c, range, first_right, key_copies.items.len)) |key| {
                     try keys.append(input.node_arena, key.pair);
                     try key_copies.append(input.node_arena, key.copy);
                 } else try residual.append(allocator, c);
@@ -2987,14 +3045,15 @@ const JoinTree = struct {
         return joined.filter(try combineConjuncts(input.node_arena, residual.items));
     }
 
-    /// `c` as a key of the join whose right leaves start at `first_right`:
+    /// `c` as a key of the join over the leaves `range` whose right leaves
+    /// start at `first_right`:
     /// an equality of a left and a right column whose types compare and make
     /// a join key. The key reads the right column through a hidden copy, as
     /// an ON clause's does, since the join drops its right keys.
-    fn whereKey(self: *const JoinTree, c: PredicateExpr, first_right: usize, copy_index: usize) !?WhereKey {
+    fn whereKey(self: *const JoinTree, c: PredicateExpr, range: LeafRange, first_right: usize, copy_index: usize) !?WhereKey {
         if (c != .leaf_col_col or c.leaf_col_col.op != .eq) return null;
-        const a = self.column(c.leaf_col_col.left) orelse return null;
-        const b = self.column(c.leaf_col_col.right) orelse return null;
+        const a = self.column(c.leaf_col_col.left, range) orelse return null;
+        const b = self.column(c.leaf_col_col.right, range) orelse return null;
         const left, const right = if (a.leaf < first_right and b.leaf >= first_right)
             .{ a.column, b.column }
         else if (b.leaf < first_right and a.leaf >= first_right)

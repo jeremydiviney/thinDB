@@ -3351,3 +3351,128 @@ fn scanFiltered(allocator: std.mem.Allocator, db: anytype, sql: []const u8, tabl
     }
     return error.TestExpectedScan;
 }
+
+test "join: a WHERE reaches the inputs of a join under a transferred key filter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE fact (t INT NOT NULL, k INT NOT NULL, d INT NOT NULL, v BIGINT NOT NULL)");
+    try helpers.exec(allocator, db, "CREATE TABLE starts (t INT NOT NULL, k INT NOT NULL, sd INT NOT NULL)");
+    try helpers.exec(allocator, db, "CREATE TABLE plans (t INT NOT NULL, k INT NOT NULL)");
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "INSERT INTO fact VALUES ");
+    for (1..4) |t| for (1..7) |k| for (1..11) |d| {
+        if (sql.items[sql.items.len - 1] == ')') try sql.append(allocator, ',');
+        try sql.print(allocator, "({d}, {d}, {d}, {d})", .{ t, k, d, t * 1000 + k * 10 + d });
+    };
+    try helpers.exec(allocator, db, sql.items);
+    sql.clearRetainingCapacity();
+    try sql.appendSlice(allocator, "INSERT INTO starts VALUES ");
+    for (1..4) |t| for (1..5) |k| {
+        if (sql.items[sql.items.len - 1] == ')') try sql.append(allocator, ',');
+        try sql.print(allocator, "({d}, {d}, {d})", .{ t, k, t + k });
+    };
+    try helpers.exec(allocator, db, sql.items);
+    try helpers.exec(allocator, db, "INSERT INTO plans VALUES (2, 1), (2, 2), (2, 3), (2, 5), (2, 5), (1, 4)");
+
+    // `plans` pins `t`, which transfers onto the input `fact ⋈ starts` as a
+    // filter that stays above that join: `t` names a column of both of its
+    // inputs, as it does of `plans`, so the WHERE stays above the outer join
+    // too. Its `fact` conjuncts must still reach `fact` through the filter,
+    // leaving above the inner join only the conjuncts that read `starts`.
+    const cases = .{
+        .{ "LEFT", "f.t = 2 AND f.d BETWEEN 3 AND 7", Cohort.inRange, 0 },
+        .{ "LEFT", "f.t = 2 AND f.d BETWEEN 3 AND 7 AND s.sd IS NULL", Cohort.inRangeUnstarted, 1 },
+        .{ "LEFT", "f.t = 2 AND (f.d > 8 OR s.sd = 4)", Cohort.lateOrFour, 1 },
+        .{ "LEFT", "f.t = 2 AND f.d BETWEEN 3 AND 7 AND f.d >= s.sd", Cohort.inRangeAfterStart, 1 },
+        .{ "INNER", "f.t = 2 AND f.d = s.sd", Cohort.onStart, 0 },
+    };
+    inline for (cases) |c| {
+        const query = std.fmt.comptimePrint(
+            \\SELECT f.k, COUNT(*), SUM(f.v), SUM(s.sd) FROM fact f
+            \\{s} JOIN (SELECT t, k, sd FROM starts WHERE t = 2) s ON s.t = f.t AND s.k = f.k
+            \\JOIN (SELECT t, k FROM plans WHERE t = 2 GROUP BY t, k) pm ON pm.t = f.t AND pm.k = f.k
+            \\WHERE {s} GROUP BY f.k ORDER BY f.k
+        , .{ c[0], c[1] });
+        errdefer std.debug.print("case: {s}\n", .{query});
+        const expected = try Cohort.expected(allocator, std.mem.eql(u8, c[0], "INNER"), c[2]);
+        defer allocator.free(expected);
+        const text = try crossRowsText(allocator, db, query);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings(expected, text[std.mem.indexOfScalar(u8, text, '\n') orelse text.len ..]);
+        try std.testing.expectEqual(@as(usize, c[3]), try filtersOverInnermostJoin(allocator, db, query));
+    }
+}
+
+/// The rows of the transferred-key-filter test, evaluated directly: `fact`
+/// rows of `t = 2` whose `k` has a plan, each with its `starts` row if any.
+const Cohort = struct {
+    fn inRange(d: i64, _: ?i64) bool {
+        return d >= 3 and d <= 7;
+    }
+    fn inRangeUnstarted(d: i64, sd: ?i64) bool {
+        return inRange(d, sd) and sd == null;
+    }
+    fn lateOrFour(d: i64, sd: ?i64) bool {
+        return d > 8 or sd == 4;
+    }
+    fn inRangeAfterStart(d: i64, sd: ?i64) bool {
+        return inRange(d, sd) and if (sd) |s| d >= s else false;
+    }
+    fn onStart(d: i64, sd: ?i64) bool {
+        return sd == d;
+    }
+
+    fn expected(allocator: std.mem.Allocator, inner: bool, keep: fn (i64, ?i64) bool) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        for ([_]i64{ 1, 2, 3, 5 }) |k| {
+            const sd: ?i64 = if (k <= 4) 2 + k else null;
+            if (inner and sd == null) continue;
+            var count: i64 = 0;
+            var sum_v: i64 = 0;
+            var sum_sd: ?i64 = null;
+            for (1..11) |d_index| {
+                const d: i64 = @intCast(d_index);
+                if (!keep(d, sd)) continue;
+                count += 1;
+                sum_v += 2000 + k * 10 + d;
+                if (sd) |s| sum_sd = (sum_sd orelse 0) + s;
+            }
+            if (count == 0) continue;
+            try out.print(allocator, "\n{d}|{d}|{d}|", .{ k, count, sum_v });
+            if (sum_sd) |s| try out.print(allocator, "{d}", .{s}) else try out.appendSlice(allocator, "NULL");
+        }
+        return out.toOwnedSlice(allocator);
+    }
+};
+
+/// How many filters the plan of `sql` stacks right above its innermost join.
+fn filtersOverInnermostJoin(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !usize {
+    const helpers = @import("sql_helpers.zig");
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    const lines = try helpers.collectStrings(allocator, db, explain_sql);
+    defer helpers.freeStrings(allocator, lines);
+    var innermost: ?usize = null;
+    var depth: usize = 0;
+    for (lines, 0..) |line, i| {
+        const text = line orelse continue;
+        const trimmed = std.mem.trimStart(u8, text, " ");
+        if (!std.mem.startsWith(u8, trimmed, "HashJoin")) continue;
+        const indent = text.len - trimmed.len;
+        if (innermost == null or indent > depth) {
+            innermost = i;
+            depth = indent;
+        }
+    }
+    var i = innermost orelse return error.TestExpectedJoin;
+    var filters: usize = 0;
+    while (i > 0 and std.mem.eql(u8, std.mem.trim(u8, lines[i - 1] orelse "", " "), "Filter")) : (i -= 1) filters += 1;
+    return filters;
+}
